@@ -109,37 +109,37 @@ def normalize_market(market: Optional[str]) -> str:
 # "no market" to "WRONG market" — strictly worse, because a wrong answer looks like an answer.
 #
 # So the minters additionally stamp `market_observed: true` on the token payload when, and only
-# when, the market came from the caller / request / seed row. The warm-handoff sink forwards
+# when, the market came from the CALLER / REQUEST — the buyer side. The warm-handoff sink forwards
 # `market` only for an OBSERVED one. A token minted before this existed carries no flag, reads as
 # unobserved, and leaves the gate inert for its remaining TTL — which is the safe direction.
+#
+# A SEED / CATALOG ROW'S `market` IS NOT AN OBSERVATION OF THE BUYER. It is the market the row is
+# LISTED in (and `external_product_seeds.market` is NOT NULL, so "the row names a market" was true
+# of every row). Worse, several lanes FILTER seeds by a defaulted "US" when the request named
+# none (`routes/agent_sdk_fixed` always does; `routes/agent_api` does for a market-less request),
+# so a row's "US" was frequently the default itself, laundered through a WHERE clause. A mint
+# site therefore passes `market_is_observed` the REQUEST's market only — never the row's. (Until
+# 2026-09-26 the seed lanes passed the row's market; see docs/runbooks/merchant_purchasability.md
+# "Market is never defaulted".)
 # ---------------------------------------------------------------------------------------------
 
 TOKEN_MARKET_OBSERVED_KEY = "market_observed"
 
-_ISO2_MARKET_RE = re.compile(r"^[A-Z]{2}$")
-
-
-def iso2_market(raw: Any) -> Optional[str]:
-    """ISO-3166 alpha-2, upper-cased — or ``None``. The ONE normaliser for this vocabulary.
-
-    ``"us"`` / ``"  sg  "`` -> ``"US"`` / ``"SG"``. ``"USA"``, ``""``, ``"U1"``, a non-string
-    -> ``None``: never truncated, never defaulted. Deliberately NOT `normalize_market`, which
-    serves ``"USA"`` as ``"USA"`` and ``None`` as ``"US"`` — that function answers "what do we
-    serve this click as", this one answers "is this a market code we can key a fact on".
-    """
-    if not isinstance(raw, str):
-        return None
-    candidate = raw.strip().upper()
-    return candidate if _ISO2_MARKET_RE.match(candidate) else None
+# THE ONE NORMALISER now lives in the leaf `utils.market_code` so the fact store, the sweep, the
+# ops route and the Reap rail can bind the SAME function without importing this module. It is
+# re-exported here unchanged (the same object), so every existing `from
+# services.outbound_links_service import iso2_market` keeps working.
+from utils.market_code import iso2_market  # noqa: E402,F401  (re-export; identity-asserted)
 
 
 def market_is_observed(*raws: Any) -> bool:
     """True when at least one of `raws` actually NAMED a market.
 
-    `raws` are the raw sources a mint site falls back through, in order — e.g.
-    ``market_is_observed(candidate.market, body.market)`` for a site whose served value is
-    ``candidate.market or body.market or "US"``. False means every source was empty and the
-    market about to be served is the ``"US"`` DEFAULT.
+    `raws` are the raw BUYER-SIDE sources (the caller's input, the request's market) — e.g.
+    ``market_is_observed(body.market)`` for a site whose served value is
+    ``candidate.market or body.market or "US"``. A seed / catalog row's `market` is NOT a
+    buyer-side source and must never be passed here (see MARKET PROVENANCE above). False means
+    the request named no market, whatever market is about to be served.
 
     This is PROVENANCE, not validity: ``"USA"`` was named by the caller, so it is observed —
     and is then rejected by `iso2_market` at the sink and counted as `none_invalid`. The two

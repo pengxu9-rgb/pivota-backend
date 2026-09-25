@@ -58,7 +58,9 @@ async def test_agent_api_load_external_seed_products_builds_without_allowlist_pr
 
     build_seen_allowed = []
 
-    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains=None, metrics_out=None):
+    async def fake_build_external_seed_product(
+        *, req, seed_row, allowed_domains=None, metrics_out=None, request_market=None
+    ):
         build_seen_allowed.append(list(allowed_domains or []))
         return {
             "id": seed_row.get("external_product_id"),
@@ -103,7 +105,9 @@ async def test_agent_api_load_external_seed_products_records_build_exceptions(
             return seed_rows
         return []
 
-    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains=None, metrics_out=None):
+    async def fake_build_external_seed_product(
+        *, req, seed_row, allowed_domains=None, metrics_out=None, request_market=None
+    ):
         raise ValueError("bad seed payload")
 
     monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
@@ -149,7 +153,9 @@ async def test_agent_api_load_external_seed_products_records_null_builder_result
             return seed_rows
         return []
 
-    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains=None, metrics_out=None):
+    async def fake_build_external_seed_product(
+        *, req, seed_row, allowed_domains=None, metrics_out=None, request_market=None
+    ):
         return None
 
     monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)
@@ -491,7 +497,9 @@ async def test_agent_api_load_external_seed_products_records_builder_exception_r
             return seed_rows
         return []
 
-    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains=None, metrics_out=None):
+    async def fake_build_external_seed_product(
+        *, req, seed_row, allowed_domains=None, metrics_out=None, request_market=None
+    ):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(agent_api_module.database, "fetch_all", fake_fetch_all)

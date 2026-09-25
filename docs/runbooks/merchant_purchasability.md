@@ -295,7 +295,8 @@ SELECT p.domain, p.market
 ```
 
 Note the join keys are the **normalised** ones (`normalize_domain` lowercases and strips one
-leading `www.`; `normalize_market` uppercases to two characters), so a population row spelled
+leading `www.`; `normalize_market` is the ISO-2 helper — upper-cased, exactly two letters, never
+truncated; see "Market is never defaulted"), so a population row spelled
 `www.Judydoll.com` will not join to the fact row `judydoll.com` unless you fold it as above.
 
 ### Forcing a re-check
@@ -502,7 +503,8 @@ the buyer**, and it was inert only while nothing keyed on it. Forwarding it to t
 judge a Japanese buyer against the **US** fact — the flowerbeauty false positive relocated from
 "no market" to "**wrong** market", which is worse, because a wrong answer looks like an answer.
 So each minter stamps `market_observed: true` on the token payload **only** when the market came
-from the caller / request / seed row (`services/outbound_links_service.market_is_observed`), and
+from the caller / the buyer's request (`services/outbound_links_service.market_is_observed`) —
+**never from the seed row** since 2026-09-26 (see "Market is never defaulted" below) — and
 nothing is ever substituted: not this process's egress country, not `SEED_MARKET`, not the
 gateway's `primaryMarket()`.
 
@@ -519,6 +521,51 @@ reads as unobserved and the gate stays inert for it until it ages out on its own
 Expect `warm_market=none_unobserved` to dominate for the first week and then fall as links turn
 over; if it does *not* fall, a minter is not learning the buyer's market and that is the thing to
 fix — never the gate.
+
+### Market is never defaulted
+
+**An unknown market is unknown.** On every path that feeds this gate, an attribution key or a
+purchase decision, a market that was never known is carried as NULL / absent — never as `"US"`,
+never as a truncation (`"USA"` is not `"US"`), and never as the market a seed or catalog row is
+*listed* in. The consumer then makes **no purchasability claim**: browse and links-out are
+untouched, a purchase is never offered on it. This is the same thing the gateway does with an
+unkeyable request.
+
+* **One helper.** `utils/market_code.iso2_market` is the only normaliser: strip, upper-case,
+  `^[A-Z]{2}$`, else `None`. `db/merchant_purchasability.normalize_market`,
+  `services/outbound_warm_handoff.click_market` and `services/outbound_links_service.iso2_market`
+  are the **same function object** (identity-asserted in
+  `tests/test_purchase_gate_market_not_defaulted.py`); the Tier B allowlist
+  (`services/tierb_cart_link_merchants.normalize_market`, its raising face) and the Reap rail's
+  shipping-country check call it. Until 2026-09-26 the fact store carried its own rule,
+  `str(v or "").strip().upper()[:2]`, which read `"USA"` as `"US"`.
+* **Consumers.** `is_purchasable`, `get_fact` and `list_facts` answer False / None / `[]` for an
+  unusable market **before** touching the database and **without a log line** (it is an expected
+  input, not an error — logging it would storm). `record_check` refuses the write. The ops route
+  now accepts a request with **no** `market` and answers `200` with `tier: "browse_only"`,
+  `reason: "market_unknown"`, `market: null`, `facts: []` (a present-but-invalid 2-character value
+  such as `U1` answers the same); a request that names a valid market gets exactly the previous
+  body plus `reason: null`. The sweep skips an allowlist row whose market is not ISO-2 and counts
+  it in `SweepReport.population_skipped_market_unknown` with one warning per run (both allowlist
+  tables CHECK their market column, so expect 0).
+* **Producers.** The `/r` mint sites derive `market_observed` from the **request's** market only.
+  The seed row's `market` (`external_product_seeds.market` is NOT NULL, so it always "named" one)
+  is where the card is listed, and on `routes/agent_sdk_fixed` the seed fetch is filtered on
+  `DEFAULT_EXTERNAL_SEED_MARKET`, so under the previous rule every click there was an "observed
+  US" click — a defaulted US laundered through a WHERE clause. The served `market` on the token
+  (rule row, allowlist, UTM, click event) is unchanged; only the provenance flag moved. A request
+  that names its market mints byte-identical tokens to before (pinned in the test above).
+* **Known remaining gap (unchanged on purpose).** On the seed lanes the token's `market` is the
+  *row's* listing market even when the request named a different one (request `SG`, row `US` →
+  token `market=US, market_observed=true`). Fixing that changes a token for a request that named
+  its market, which this change deliberately does not; it is the next thing to fix on the minter
+  side.
+
+**For the gateway (PIVOTA-Agent), no change made from this repo:** its `get_checkout` re-read
+carries no market today, so it cannot be keyed and keeps failing open; it must first carry a
+market carrier (the buyer's shipping country, or the market the session was created for) before
+the re-read can ask this route. Once it does, it may call this route with no `market` and will get
+the explicit `market_unknown` answer instead of a 422.
 
 ### Rolling back
 

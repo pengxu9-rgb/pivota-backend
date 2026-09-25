@@ -64,17 +64,30 @@ def _dest_params(payload: Dict[str, Any]) -> Dict[str, list]:
     return parse_qs(urlparse(payload["dest"]).query)
 
 
-async def _build(module, seed_row: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> Optional[Dict[str, Any]]:
+_NOT_PASSED = object()
+
+
+async def _build(
+    module,
+    seed_row: Dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    request_market: Any = _NOT_PASSED,
+) -> Optional[Dict[str, Any]]:
     # The referral-runtime readiness gate is DB-backed and not the subject
     # under test — stub it open so the token mint itself is exercised.
     async def _gate_open(row, **kwargs):
         return (False, None)
 
     monkeypatch.setattr(module, "should_block_external_referral_runtime", _gate_open)
+    # `request_market` is left OUT of the call unless a test names it, so the builder's own
+    # default is what the by-id lanes (which have no request market) actually exercise.
+    extra = {} if request_market is _NOT_PASSED else {"request_market": request_market}
     return await module._build_external_seed_product(
         req=_FakeReq(),
         seed_row=seed_row,
         allowed_domains=["brand.example"],
+        **extra,
     )
 
 
@@ -185,38 +198,60 @@ def test_gateway_identity_parses_double_colon_storage_form():
 
 
 # ---------------------------------------------------------------------------------------------
-# MARKET PROVENANCE (#2243). Both seed builders serve `seed_row["market"] or "US"`. The served
-# market is unchanged — but a DEFAULTED "US" is a placeholder, not a fact about the buyer, and
-# the warm-handoff lane now forwards an OBSERVED token market to the gateway's
-# merchant-purchasability gate. Stamping the flag on the default path would gate a non-US buyer
-# against the US fact: the flowerbeauty false positive moved from "no market" to "wrong market".
+# MARKET PROVENANCE (#2243, narrowed 2026-09-26). Both seed builders serve
+# `seed_row["market"] or "US"`, and the served market is unchanged. What may stamp
+# `market_observed` — the flag the warm-handoff lane reads before it keys the gateway's
+# merchant-purchasability gate on the token's market — is the REQUEST's market, never the seed
+# row's. The row's market is the market it is LISTED in: `external_product_seeds.market` is NOT
+# NULL, and `routes/agent_sdk_fixed` fetches with `market=DEFAULT_EXTERNAL_SEED_MARKET`, so under
+# the old rule every click on that lane was an "observed US" click — a defaulted US laundered
+# through a WHERE clause.
 # ---------------------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("module_path", ["routes.agent_api", "routes.agent_sdk_fixed"])
 @pytest.mark.asyncio
-async def test_seed_market_provenance_is_stamped_only_when_the_row_named_one(
+async def test_a_seed_rows_own_market_never_stamps_observed(
     module_path: str, monkeypatch: pytest.MonkeyPatch
 ):
+    """Market-less REQUEST -> never observed, whatever the row says (producer: NULL, never US)."""
     import importlib
 
     module = importlib.import_module(module_path)
 
-    observed = await _build(module, _seed_row(market="SG"), monkeypatch)
-    assert observed is not None
-    payload = _decode(observed["external_redirect_url"])
-    assert payload["market"] == "SG"
-    assert payload["market_observed"] is True, "a row that NAMES its market is observed"
-
-    for defaulted_market in (None, "", "   "):
-        product = await _build(module, _seed_row(market=defaulted_market), monkeypatch)
+    for row_market in ("SG", "US", None, "", "   "):
+        product = await _build(module, _seed_row(market=row_market), monkeypatch)
         assert product is not None
         payload = _decode(product["external_redirect_url"])
-        assert payload["market"] == "US", "the SERVED market keeps its default — unchanged"
-        assert "market_observed" not in payload, (
-            f"{module_path}: a DEFAULTED 'US' must not be stamped as observed "
-            f"(seed_row market={defaulted_market!r})"
+        assert payload["market"] == (row_market.strip() if row_market and row_market.strip() else "US"), (
+            "the SERVED market is untouched — row's market, else the US default"
         )
+        assert "market_observed" not in payload, (
+            f"{module_path}: a seed row's own market ({row_market!r}) is where it is LISTED, not "
+            "the buyer's — it must not stamp the token observed"
+        )
+    # The request lanes that have no market pass None / "" explicitly — same answer.
+    for request_market in (None, "", "   "):
+        product = await _build(
+            module, _seed_row(market="SG"), monkeypatch, request_market=request_market
+        )
+        assert "market_observed" not in _decode(product["external_redirect_url"])
+
+
+@pytest.mark.parametrize("module_path", ["routes.agent_api", "routes.agent_sdk_fixed"])
+@pytest.mark.asyncio
+async def test_a_request_that_names_its_market_stamps_observed(
+    module_path: str, monkeypatch: pytest.MonkeyPatch
+):
+    """Present REQUEST market -> observed; the token's `market` is still the served one."""
+    import importlib
+
+    module = importlib.import_module(module_path)
+
+    product = await _build(module, _seed_row(market="SG"), monkeypatch, request_market="sg")
+    payload = _decode(product["external_redirect_url"])
+    assert payload["market"] == "SG"
+    assert payload["market_observed"] is True
 
 
 @pytest.mark.parametrize("module_path", ["routes.agent_api", "routes.agent_sdk_fixed"])
@@ -224,8 +259,8 @@ async def test_seed_market_provenance_is_stamped_only_when_the_row_named_one(
 async def test_the_provenance_flag_changes_nothing_else_in_the_seed_token(
     module_path: str, monkeypatch: pytest.MonkeyPatch
 ):
-    """Snapshot: the only difference between a named-market mint and a defaulted one, other
-    than `market` itself, is the new key.
+    """Snapshot: the only difference between a mint for a request that named its market and one
+    for a request that did not is the `market_observed` key.
 
     The builder mints a FRESH click id per call, so both copies are normalised on that id
     before comparing — otherwise the comparison would be of two random uuids and would pass
@@ -244,10 +279,14 @@ async def test_the_provenance_flag_changes_nothing_else_in_the_seed_token(
         return eval(re.sub(re.escape(click_id), "CLICK_ID", blob))  # noqa: S307 — our own repr
 
     named = _normalised(
-        _decode((await _build(module, _seed_row(market="US"), monkeypatch))["external_redirect_url"])
+        _decode(
+            (await _build(module, _seed_row(market="US"), monkeypatch, request_market="US"))[
+                "external_redirect_url"
+            ]
+        )
     )
     defaulted = _normalised(
-        _decode((await _build(module, _seed_row(market=None), monkeypatch))["external_redirect_url"])
+        _decode((await _build(module, _seed_row(market="US"), monkeypatch))["external_redirect_url"])
     )
 
     assert named["dest"] == defaulted["dest"], "the destination must be untouched"

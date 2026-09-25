@@ -71,10 +71,17 @@ class PurchasabilityFact(BaseModel):
 
 class PurchasabilityResponse(BaseModel):
     domain: str
-    market: str
+    #: The ISO-2 market the answer is keyed on, or null when the request named no usable market
+    #: (then `reason == "market_unknown"`). NEVER a substituted "US".
+    market: Optional[str] = None
     #: What the DOOR would answer right now for this merchant x market. `purchase` only when a
     #: fresh positive fact exists FROM THE BUYER VANTAGE; every other state is `browse_only`.
     tier: str
+    #: Why `tier` is not `purchase` when the answer is structural rather than a fact: today the
+    #: only value is `market_unknown` — no market, so no purchasability claim is possible either
+    #: way (fail-open for browse / links-out, never a purchase). Null whenever a market was keyed,
+    #: so a keyed response differs from the pre-field one only by this one null key.
+    reason: Optional[str] = None
     #: THE GATEWAY CONTRACT. False means the backend is NOT refusing on this fact yet, so a
     #: consumer must keep its previous behaviour and treat `tier` as advisory. A gateway that
     #: acted on `tier` without reading this would turn the whole catalogue browse-only on the
@@ -96,7 +103,12 @@ def _iso(value: Any) -> Optional[str]:
 @router.get("/merchant-purchasability", response_model=PurchasabilityResponse)
 async def merchant_purchasability(
     domain: str = Query(..., min_length=3, max_length=253),
-    market: str = Query(..., min_length=2, max_length=2),
+    # OPTIONAL since the market-never-defaulted change: a caller that has no market (the gateway's
+    # `get_checkout` re-read, an escalation with no address country) gets an explicit
+    # `reason: market_unknown` answer instead of a 422 it would read as "backend down" and fail
+    # open on. A present value is still length-bounded; one that is not ISO-2 after strip+upper
+    # is also `market_unknown` — the same rule the fact store keys on, never a truncation.
+    market: Optional[str] = Query(None, min_length=2, max_length=2),
     # ADMIN JWT **OR** THE GATEWAY'S GOOGLE IDENTITY TOKEN. This is the only route in the
     # repo that accepts the second, and it is read-only. See utils/gateway_oidc_auth.py: the
     # OIDC path is DISABLED until both `OPS_GATEWAY_OIDC_AUDIENCE` and
@@ -118,10 +130,32 @@ async def merchant_purchasability(
     """
     normalized = purchasability.normalize_domain(domain)
     normalized_market = purchasability.normalize_market(market)
+    vantage = purchasability.buyer_vantage()
+
+    if normalized_market is None:
+        # NO MARKET, NO CLAIM — and no database read, no log line. `is_purchasable` answers False
+        # for the same input without asking the database; this says WHY, so an operator (or the
+        # gateway) can tell "unknown market" from "known market, no positive fact".
+        return PurchasabilityResponse(
+            domain=normalized,
+            market=None,
+            tier="browse_only",
+            reason=purchasability.MARKET_UNKNOWN,
+            enforced=purchasability.is_enforcement_enabled(),
+            buyer_vantage=vantage,
+            sweep_enabled=purchasability.is_sweep_enabled(),
+            ttl_hours=purchasability.ttl_hours(),
+            facts=[],
+            note=(
+                "market_unknown: the request named no ISO-2 market, so no purchasability claim "
+                "can be made either way. The market is never defaulted (not to US, not to "
+                "anything); the door answers browse_only for purchase and leaves browse and "
+                "links-out untouched."
+            ),
+        )
 
     rows = await purchasability.list_facts(normalized, normalized_market)
     purchasable = await purchasability.is_purchasable(normalized, normalized_market)
-    vantage = purchasability.buyer_vantage()
 
     facts = [
         PurchasabilityFact(

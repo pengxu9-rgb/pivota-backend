@@ -1648,3 +1648,167 @@ async def test_the_report_line_does_not_depend_on_the_root_logger(_db, monkeypat
     assert not any(m.startswith("merchant_purchasability_sweep: SweepReport(") for m in sink.messages), (
         "the report line propagated to root, i.e. it went through the module logger"
     )
+
+
+# ══ 5. THE MARKET IS NEVER DEFAULTED ══════════════════════════════════════════════════════════
+#
+# An unknown market is UNKNOWN. Every consumer of the fact answers "no purchasability claim" for
+# it — never "US", never a truncation, never positive — and says so without a database read or a
+# log line. Seeded with a FRESH POSITIVE US FACT in every case, so a consumer that substituted
+# "US" (mutant ii) or treated None as positive (mutant iii) answers True/purchase and fails.
+
+_UNKNOWN_MARKETS = [None, "", "   ", "USA", "U1", "u", 7]
+
+
+@pytest.mark.parametrize("market", _UNKNOWN_MARKETS)
+async def test_is_purchasable_answers_false_for_an_unknown_market_without_asking_the_db(
+    _db, monkeypatch, caplog, market
+):
+    import logging
+
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    assert await mp.is_purchasable("judydoll.com", "US") is True, "the premise: US is positive"
+
+    async def _no_db(*_a, **_k):
+        raise AssertionError("an unknown market must not reach the database")
+
+    monkeypatch.setattr(database, "fetch_one", _no_db)
+    monkeypatch.setattr(database, "fetch_all", _no_db)
+    caplog.set_level(logging.DEBUG, logger=mp.logger.name)
+    assert await mp.is_purchasable("judydoll.com", market) is False
+    assert await mp.is_purchasable("judydoll.com", market, now=datetime.now(timezone.utc)) is False
+    assert await mp.get_fact("judydoll.com", market) is None
+    assert await mp.list_facts("judydoll.com", market) == []
+    assert [r for r in caplog.records if r.name == mp.logger.name] == [], (
+        "an unknown market is an expected input, not an error: no log line (no storm)"
+    )
+
+
+@pytest.mark.parametrize("market", [None, "", "USA"])
+async def test_an_unknown_market_is_not_answered_with_the_us_fact_on_a_live_db(_db, market):
+    """The same rule with the database LIVE, so a consumer that substituted "US" would actually
+    find the positive US row and answer True — the previous test can only catch that through its
+    no-log assertion, because it makes the database refuse."""
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    assert await mp.is_purchasable("judydoll.com", market) is False
+    assert await mp.get_fact("judydoll.com", market) is None
+    assert await mp.list_facts("judydoll.com", market) == []
+
+
+@pytest.mark.parametrize("market", _UNKNOWN_MARKETS)
+async def test_record_check_refuses_to_write_under_an_unknown_market(_db, market):
+    """The writer side of the same rule: nothing is ever keyed on a defaulted or truncated
+    market. "USA" used to be written as "US"."""
+    assert await mp.record_check("judydoll.com", market, res("ELIGIBLE", card=True)) is None
+    count = await database.fetch_one(f"SELECT COUNT(*) AS n FROM {TABLE}")
+    assert int(dict(count)["n"]) == 0
+
+
+@pytest.mark.parametrize("spelled", ["us", " US ", "Us"])
+async def test_a_present_market_is_normalised_and_bound_on_both_sides(_db, spelled):
+    await mp.record_check("judydoll.com", spelled, res("ELIGIBLE", card=True))
+    assert (await _row())["market_country"] == "US"
+    assert await mp.is_purchasable("judydoll.com", spelled) is True
+    assert await mp.is_purchasable("judydoll.com", "US") is True
+
+
+@pytest.mark.parametrize("query", ["", "&market=U1"])
+async def test_the_ops_route_reports_market_unknown_for_a_missing_market(_db, ops_app, monkeypatch, query):
+    """No market -> tier browse_only with reason `market_unknown`, market null, no facts — even
+    though a fresh positive US fact exists. A 200 with a distinct reason, not a 422 the gateway
+    would read as "backend down" and fail open on."""
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    response = await ops_get(ops_app, f"/ops/merchant-purchasability?domain=judydoll.com{query}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["tier"] == "browse_only"
+    assert body["reason"] == "market_unknown" == mp.MARKET_UNKNOWN
+    assert body["market"] is None
+    assert body["facts"] == []
+    assert body["enforced"] is True
+
+
+async def test_the_ops_route_with_a_market_is_unchanged_apart_from_a_null_reason(_db, ops_app):
+    """Zero-diff for a keyed request: the only new key is `reason`, and it is null. PINNED
+    LITERALS — the key set and note below are main's response (2a590bb9c) plus `reason`."""
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=judydoll.com&market=us")).json()
+    assert set(body) == {
+        "domain", "market", "tier", "reason", "enforced", "buyer_vantage", "sweep_enabled",
+        "ttl_hours", "facts", "note",
+    }
+    assert body["reason"] is None
+    assert (body["domain"], body["market"], body["tier"]) == ("judydoll.com", "US", "purchase")
+    assert body["note"] == "a fresh positive fact from vantage 'worker'; the door may offer purchase"
+
+
+async def test_the_sweep_skips_and_counts_a_row_with_an_unusable_market(monkeypatch):
+    """DB-free: the two lanes are stubbed, so a value no allowlist table would accept ("USA",
+    None) can still be fed through the population builder. None is swept as US; each is
+    COUNTED; a lower-case market is normalised and swept."""
+
+    async def _variant_lane():
+        return [
+            {"merchant_domain": "nomarket.example", "market_country": None},
+            {"merchant_domain": "threeletter.example", "market_country": "USA"},
+            {"merchant_domain": "lower.example", "market_country": "sg"},
+        ]
+
+    async def _cart_lane(_statement):
+        return [{"domain": "blankmarket.example", "market": "  ", "variant_id": "1"}]
+
+    async def _nothing_due(*_a, **_k):
+        return []
+
+    async def _no_variant(_domain):
+        return None
+
+    monkeypatch.setattr(ledger, "list_enabled_merchant_markets", _variant_lane)
+    monkeypatch.setattr(sweep, "_rows", _cart_lane)
+    monkeypatch.setattr(sweep.facts, "list_due", _nothing_due)
+    monkeypatch.setattr(sweep, "_catalog_variant", _no_variant)
+
+    tally = {}
+    targets = await sweep.load_population(50, tally=tally)
+    assert [(t.domain, t.market) for t in targets] == [("lower.example", "SG")]
+    assert tally == {sweep.MARKET_UNKNOWN_TALLY: 3}
+
+
+async def test_the_sweep_report_carries_the_market_unknown_count_and_logs_it_once(monkeypatch):
+    async def _variant_lane():
+        return [
+            {"merchant_domain": "nomarket.example", "market_country": ""},
+            {"merchant_domain": "judydoll.com", "market_country": "US"},
+        ]
+
+    async def _cart_lane(_statement):
+        return []
+
+    async def _nothing_due(*_a, **_k):
+        return []
+
+    async def _no_variant(_domain):
+        return None
+
+    async def _no_write(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(ledger, "list_enabled_merchant_markets", _variant_lane)
+    monkeypatch.setattr(sweep, "_rows", _cart_lane)
+    monkeypatch.setattr(sweep.facts, "list_due", _nothing_due)
+    monkeypatch.setattr(sweep.facts, "record_check", _no_write)
+    monkeypatch.setattr(sweep, "_catalog_variant", _no_variant)
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+    with root_as_in_prod(), capture_pivota_stdout() as out:
+        report = await sweep.run_merchant_purchasability_sweep()
+    assert report.population_skipped_market_unknown == 1
+    assert report.population_skipped_unusable == 0
+    assert report.population == 1
+    assert {kwargs["market"] for _host, kwargs in fetcher.calls} == {"US"}
+    skipped = [line for line in pivota_lines(out) if "market is not an ISO-2 code" in line]
+    assert len(skipped) == 1, skipped
+    assert "nomarket" not in skipped[0] and "nomarket" not in repr(report)

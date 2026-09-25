@@ -487,8 +487,6 @@ def _buyer_address_for_client(buyer: ReapBuyer) -> Dict[str, Any]:
 
 # ── eligibility ──────────────────────────────────────────────────────────────────────────────
 
-_COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
-
 #: The sentinel that distinguishes the MERCHANT row from an OVERRIDE row. `''`, not NULL: see the
 #: header of db/migrations/226_reap_agentic_routes.sql for why a NULL here behaves differently on
 #: the two dialects and a value does not.
@@ -1794,8 +1792,12 @@ async def start_reap_purchase(
             if str(req.variant_key or "").strip()
             else None
         )
-        market_country = str(req.buyer.shipping_address.country or "").strip().upper()
-        if not _COUNTRY_RE.match(market_country):
+        # THE ONE MARKET RULE (`utils.market_code.iso2_market`, bound as the fact store's
+        # `normalize_market`): the same function the purchasability fact is keyed with, so the
+        # rail can never ask the gate about a market the fact store would have spelled differently.
+        # Unknown is refused here, never defaulted.
+        market_country = purchasability.normalize_market(req.buyer.shipping_address.country)
+        if market_country is None:
             raise svc.PurchaseRefused("invalid_address", "country must be two letters")
 
         agent_id = str(context.agent_id)
