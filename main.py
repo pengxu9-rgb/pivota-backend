@@ -380,10 +380,6 @@ from routes.merchant_citations import router as merchant_citations_router
 from routes.merchant_pdp import router as merchant_pdp_router
 from routes.product_quality_routes import router as product_quality_router
 from routes.product_enrichment_routes import router as product_enrichment_router
-if DEBUG_MODE:
-    from routes.create_test_agent import router as create_test_agent_router
-    from routes.debug_agent_key import router as debug_agent_key_router
-    from routes.debug_agents_table import router as debug_agents_table_router
 from routes.performance_optimization import router as performance_optimization_router
 if DEBUG_MODE:
     from routes.debug_usage_logs import router as debug_usage_logs_router
@@ -1444,10 +1440,6 @@ app.include_router(merchant_risk_router)  # Internal risk APIs (disputes/returns
 app.include_router(shopify_products_sync_router)  # Sync Shopify products into products_cache
 app.include_router(platform_products_sync_router)  # Sync non-Shopify platform products into products_cache/catalog
 app.include_router(product_enrichment_router)  # Internal product enrichment trigger
-if DEBUG_MODE:
-    app.include_router(create_test_agent_router)  # Create test agent account
-    app.include_router(debug_agent_key_router)  # Debug agent key
-    app.include_router(debug_agents_table_router)  # Debug agents table
 app.include_router(performance_optimization_router)  # Performance optimization
 app.include_router(quick_index_setup_router)  # Quick setup (no auth)
 if DEBUG_MODE:
