@@ -481,6 +481,15 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
+    # No trailing-slash redirect. Starlette's default answers `GET /reap/return/` with
+    # `307 Location: https://<Host header>/reap/return`, and the Host is whatever the client sent:
+    # the production edge forwards it unchanged (pivota-urlmap's default backend is this service,
+    # probed 2026-09-25 with SNI api.pivota.cc + `Host: evil.example` -> a Location on
+    # evil.example). Nothing depended on the redirect: 30 days of request logs show no 307 from
+    # this mechanism other than the reviewer's own probes. A toggled-slash path is now a plain 404.
+    # tests/test_no_host_reflecting_slash_redirect.py pins it. This knob covers app.router only:
+    # a sub-app mounted with app.mount() redirects on its own Router's knob (there is none today).
+    redirect_slashes=False,
 )
 
 

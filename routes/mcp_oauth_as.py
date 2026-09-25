@@ -290,9 +290,25 @@ async def resolve_buyer_subject(request: Request) -> Optional[str]:
         return None
 
 
+def _login_next_url(request: Request) -> str:
+    """The URL the login UI sends the buyer back to, on the CONFIGURED public host.
+
+    `str(request.url)` would put the request's Host header here, and the login UI round-trips
+    `next` verbatim (docs/agent-checkout/MCP_OAUTH_AS_SELF_HOSTED.md): with the production edge
+    forwarding any Host, that is an open redirect through the login page. Same defect class as
+    the app-wide trailing-slash redirect fixed alongside it (#2349). Path and query are the
+    request's own; the origin is never the client's.
+    """
+    from config.settings import resolve_public_api_base_url
+
+    base = resolve_public_api_base_url().rstrip("/")
+    query = request.url.query
+    return f"{base}{request.url.path}" + (f"?{query}" if query else "")
+
+
 def _login_redirect(request: Request) -> RedirectResponse:
     login_url = (os.getenv("MCP_OAUTH_AS_LOGIN_URL") or "").strip()
-    nxt = str(request.url)
+    nxt = _login_next_url(request)
     if not login_url:
         # no UI configured: tell the client to authenticate (cannot render a login here)
         return JSONResponse({"error": "login_required",
