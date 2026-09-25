@@ -4,10 +4,10 @@ Real-time metrics from agent_usage_logs table
 """
 from fastapi import APIRouter, Depends, Query, Request, Header, HTTPException
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from db.database import database
 from db.agents import resolve_agent_id_by_api_key
-from utils.auth import require_admin, decode_token
+from utils.auth import ADMIN_ROLES, require_admin, decode_token
 
 router = APIRouter(prefix="/agent/metrics", tags=["Agent Metrics"])
 
@@ -232,56 +232,43 @@ async def get_metrics_summary(
         }
 
 
-async def get_recent_activity(
-    request: Request,
-    limit: int = Query(5, ge=1, le=50),
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None, alias="x-api-key")
-) -> Dict[str, Any]:
+async def resolve_recent_activity_scope(
+    authorization: Optional[str],
+    x_api_key: Optional[str],
+    requested_agent_id: Optional[str],
+) -> Optional[str]:
+    """The agent_id whose agent_usage_logs rows the caller may read, or None for every agent.
+
+    Shared by /agent/metrics/recent and /agent/v1/metrics/recent. Both used to take `agent_id`
+    from the query string as the filter with no credential, and with neither it nor an x-api-key
+    they ran unfiltered, so an anonymous caller read every agent's calls.
+
+    - admin / super_admin JWT (ADMIN_ROLES, what require_admin admits): every agent, or the one
+      named by `agent_id`;
+    - agent JWT (its agent_id claim, the agent portal's session) or x-api-key (through
+      resolve_agent_id_by_api_key): that agent only; naming another agent is a 403;
+    - anything else: 401.
     """
-    Get recent agent activity - returns mock data for now
-    """
-    try:
-        # Resolve agent_id from JWT or X-API-Key
-        agent_id = None
-        if authorization and authorization.startswith("Bearer "):
-            try:
-                payload = decode_token(authorization.split(" ")[1])
-                agent_id = payload.get("agent_id")
-            except:
-                pass
-        if not agent_id and x_api_key:
-            agent_id = await resolve_agent_id_by_api_key(x_api_key)
-        if not agent_id:
-            raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
-        rows = await database.fetch_all(
-            """
-            SELECT id, endpoint, method, status_code, response_time_ms, timestamp
-            FROM agent_usage_logs
-            WHERE agent_id = :agent_id
-            ORDER BY timestamp DESC
-            LIMIT :limit
-            """,
-            {"agent_id": agent_id, "limit": limit}
-        )
-        activities = [
-            {
-                "id": str(r["id"]),
-                "method": r["method"],
-                "endpoint": r["endpoint"],
-                "status_code": r["status_code"],
-                "response_time_ms": r["response_time_ms"],
-                "timestamp": r["timestamp"].isoformat() if r["timestamp"] else None,
-            }
-            for r in rows
-        ]
-        return {"status": "success", "activities": activities, "total": len(activities)}
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e),
-            "activities": []
-        }
+    payload: Dict[str, Any] = {}
+    if authorization and authorization.startswith("Bearer "):
+        try:
+            payload = decode_token(authorization.split(" ", 1)[1]) or {}
+        except Exception:
+            payload = {}
+    if payload.get("role") in ADMIN_ROLES:
+        return requested_agent_id or None
+
+    caller_agent_id = payload.get("agent_id")
+    if not caller_agent_id and x_api_key:
+        try:
+            caller_agent_id = await resolve_agent_id_by_api_key(x_api_key)
+        except Exception:
+            caller_agent_id = None
+    if not caller_agent_id:
+        raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
+    if requested_agent_id and requested_agent_id != caller_agent_id:
+        raise HTTPException(status_code=403, detail="Cannot read another agent's activity")
+    return str(caller_agent_id)
 
 
 @router.get("/agents")
@@ -454,32 +441,19 @@ async def get_recent_activity(
     limit: int = Query(20, le=100),
     offset: int = Query(0, ge=0),
     agent_id: Optional[str] = None,
-    request: Request = None
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key")
 ) -> Dict[str, Any]:
     """
     Get recent API activity/calls
     Returns last N activities with details
     """
     try:
-        # Filter by agent if not admin
         agent_filter = ""
         params = {"limit": limit, "offset": offset}
 
-        # Optional filtering by agent
-        resolved_agent_id = agent_id
-        if not resolved_agent_id:
-            # Try to resolve from x-api-key header
-            api_key = request.headers.get("x-api-key") if request else None
-            if api_key:
-                # A presented key that does not resolve is a 401, never "no filter" (the unfiltered
-                # query would hand every agent's activity to the caller).
-                try:
-                    resolved_agent_id = await resolve_agent_id_by_api_key(api_key)
-                except Exception:
-                    resolved_agent_id = None
-                if not resolved_agent_id:
-                    raise HTTPException(status_code=401, detail="Invalid API key")
-
+        # None only for an admin reading every agent; see resolve_recent_activity_scope.
+        resolved_agent_id = await resolve_recent_activity_scope(authorization, x_api_key, agent_id)
         if resolved_agent_id:
             agent_filter = "WHERE agent_id = :agent_id"
             params["agent_id"] = resolved_agent_id
@@ -502,11 +476,13 @@ async def get_recent_activity(
             params
         )
         
-        # Format activities
+        # Format activities. agent_usage_logs.timestamp is timestamptz: a naive now() raised on the
+        # first row and the catch-all below answered an empty "success".
+        now = datetime.now(timezone.utc)
         formatted_activities = []
         for activity in activities:
             timestamp = activity["timestamp"]
-            time_diff = datetime.now() - timestamp
+            time_diff = now - timestamp
             
             if time_diff.days > 0:
                 time_ago = f"{time_diff.days} days ago"

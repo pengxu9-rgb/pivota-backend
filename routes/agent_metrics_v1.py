@@ -1,12 +1,13 @@
 """
 Agent Metrics aliases under /agent/v1/metrics for external agents and portals
 These mirror /agent/metrics endpoints and support x-api-key-based filtering.
+/recent reads only what routes.agent_metrics.resolve_recent_activity_scope lets the caller read.
 """
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from db.database import database
-from db.agents import resolve_agent_id_by_api_key
+from routes.agent_metrics import resolve_recent_activity_scope
 
 router = APIRouter(prefix="/agent/v1/metrics", tags=["Agent Metrics V1"])
 
@@ -110,25 +111,15 @@ async def get_recent_activity_v1(
     limit: int = Query(20, le=100),
     offset: int = Query(0, ge=0),
     agent_id: Optional[str] = None,
-    request: Request = None
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key")
 ) -> Dict[str, Any]:
     try:
         agent_filter = ""
         params = {"limit": limit, "offset": offset}
 
-        resolved_agent_id = agent_id
-        if not resolved_agent_id and request:
-            api_key = request.headers.get("x-api-key")
-            if api_key:
-                # A presented key that does not resolve is a 401, never "no filter": the unfiltered
-                # query below would return every agent's activity to an unauthenticated caller.
-                try:
-                    resolved_agent_id = await resolve_agent_id_by_api_key(api_key)
-                except Exception:
-                    resolved_agent_id = None
-                if not resolved_agent_id:
-                    raise HTTPException(status_code=401, detail="Invalid API key")
-
+        # Same caller rule as /agent/metrics/recent; None only for an admin reading every agent.
+        resolved_agent_id = await resolve_recent_activity_scope(authorization, x_api_key, agent_id)
         if resolved_agent_id:
             agent_filter = "WHERE agent_id = :agent_id"
             params["agent_id"] = resolved_agent_id
