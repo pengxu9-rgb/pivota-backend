@@ -86,7 +86,7 @@ def test_the_drain_payload_normalises_and_reaches_records_for_brand():
     assert normalized["max_pdp_inci_fetches"] == 60 and normalized["pdp_inci_budget_s"] == 900
 
 
-@pytest.mark.parametrize("bad", [0, -1, "900", True])
+@pytest.mark.parametrize("bad", [0, -1, "900", True, float("nan"), float("inf")])
 def test_a_bad_budget_is_refused(bad):
     with pytest.raises(ValueError, match="pdp_inci_budget_s"):
         normalize_curated_brand_payload({"domain": "a.com", "brand": "X", "pdp_inci_budget_s": bad})

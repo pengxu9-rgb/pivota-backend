@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence
@@ -116,8 +117,9 @@ def normalize_curated_brand_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"{name} must be a {'nonnegative' if name.startswith('max_pdp_') else 'positive'} integer")
         normalized[name] = value
     budget = payload.get("pdp_inci_budget_s")
-    if budget is not None and (isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0):
-        raise ValueError("pdp_inci_budget_s must be a positive number of seconds")
+    if budget is not None and (isinstance(budget, bool) or not isinstance(budget, (int, float))
+                               or not math.isfinite(budget) or budget <= 0):
+        raise ValueError("pdp_inci_budget_s must be a positive, finite number of seconds")
     normalized["pdp_inci_budget_s"] = budget
     return normalized
 
