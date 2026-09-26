@@ -880,3 +880,57 @@ def test_the_repair_script_imports_when_run_the_way_the_job_runs_it():
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert "--simulate" in proc.stdout
+
+
+def _load_repair_script(name: str):
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location(
+        name, pathlib.Path(__file__).resolve().parents[1] / "scripts/ops/refresh_seeds_with_unverified_variants.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_repair_walks_hosts_round_robin_not_one_store_at_a_time():
+    """A burst of one store's pages got Shopify's edge to refuse connections (216 rows unread)."""
+    script = _load_repair_script("repair_interleave")
+    rows = [{"id": f"a{i}", "domain": "a.com"} for i in range(3)] + [{"id": "b0", "domain": "b.com"}] + [
+        {"id": f"c{i}", "domain": "c.com"} for i in range(2)
+    ]
+    order = [r["id"] for r in script._interleave_hosts(rows)]
+    assert order == ["a0", "b0", "c0", "a1", "c1", "a2"]
+    assert sorted(order) == sorted(r["id"] for r in rows), "nothing dropped or duplicated"
+
+
+def test_unread_since_selects_only_attempts_that_did_not_read(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    script = _load_repair_script("repair_unread")
+    since = datetime(2026, 9, 26, 1, 0, tzinfo=timezone.utc)
+    later = since + timedelta(minutes=20)
+    rows = [
+        {"id": "read", "domain": "a.com", "last_crawl_attempt_at": later, "last_crawled_at": later},
+        {"id": "refused", "domain": "a.com", "last_crawl_attempt_at": later, "last_crawled_at": since - timedelta(days=1)},
+        {"id": "refused2", "domain": "a.com", "last_crawl_attempt_at": later, "last_crawled_at": None},
+        {"id": "never", "domain": "b.com", "last_crawl_attempt_at": later, "last_crawled_at": None},
+        {"id": "before_window", "domain": "b.com", "last_crawl_attempt_at": since - timedelta(hours=1), "last_crawled_at": None},
+        {"id": "no_attempt", "domain": "c.com", "last_crawl_attempt_at": None, "last_crawled_at": None},
+    ]
+
+    async def fetch_all(query, values=None):
+        return rows if "> 1" in query else []
+
+    monkeypatch.setattr(script.database, "fetch_all", fetch_all)
+    picked = asyncio.run(script._select("all", unread_since=since))
+    assert [r["id"] for r in picked] == ["refused", "never", "refused2"], "filtered, then interleaved"
+    assert script._parse_since("2026-09-26T01:00:00Z") == since
+
+    # And the flag reaches the selection through the real command line (dry run: no fetch).
+    monkeypatch.setattr(script.database, "connect", AsyncMock(return_value=None))
+    monkeypatch.setattr(script.database, "disconnect", AsyncMock(return_value=None))
+    args = script._parser().parse_args(["--cohort", "all", "--unread-since", "2026-09-26T01:00:00Z"])
+    summary = asyncio.run(script._run(args))
+    assert summary["mode"] == "dry_run" and summary["selected"] == 3
