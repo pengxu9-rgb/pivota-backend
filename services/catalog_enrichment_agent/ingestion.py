@@ -56,6 +56,7 @@ from services.seller_identity import (
 )
 from services.pdp_lifecycle import compute_lifecycle_stage
 from services.pdp_taxonomy import derive_taxonomy_v1
+from services.region_pricing import require_market_currency
 from services.strong_identifier import (
     MPN_CAPTURED_AS_BARCODE,
     NO_STRONG_IDENTIFIER,
@@ -783,6 +784,20 @@ def _currency_of(pdp_payload: Dict[str, Any]) -> str:
     return raw
 
 
+#: The market every external_product_seeds row this lane writes is stamped with, whatever market its
+#: OFFERS declare. external_product_seeds.market is a HARD serving partition (external_seed_search
+#: appends `market = :market`, every serving caller passes "US"), not a destination claim, and the
+#: multi-market storefronts ADR (section 3.4 item 3, open question 7) keeps it that way until the seed
+#: partition is decoupled from the offer market. So an acquisition-market row (AU/JP: stored, not
+#: served) gets a 'US'-partition seed carrying its TRUE price_currency (AUD/JPY) -- the SG shape
+#: (market 'US', currency 'SGD') -- because (a) primary readiness requires an attached seed per
+#: product, (b) once a USD sibling offer makes the product servable its seed must already sit in the
+#: served partition, and (c) a seed stamped 'AU' would be invisible to every US lane, which is the
+#: partition-hiding this constant exists to prevent. Serving is decided by the offer CURRENCY gate
+#: (index_pipeline_state has_serving_region_offer), never by the seed's market.
+SEED_PARTITION_MARKET = "US"
+
+
 def _build_seed_inserts(
     *,
     product_key: str,
@@ -1260,12 +1275,20 @@ def _build_offer_inserts(
     currency: Optional[str] = None,
     offer_type: Optional[str] = None,
     is_first_party: bool = False,
+    market: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """One catalog_offers row per validated offer. merchant_id resolves
     to the per-retailer synthetic id (see derive_merchant_id), which is
     what makes Phase 6 seller_count meaningful for the canonical
-    classification."""
+    classification.
+
+    `market`: the buyer market a writer DECLARES these offers are priced for (the retailer_ingest
+    job's; multi-market storefronts ADR section 3.4 item 3). Declared, it is stamped on every row
+    and the currency must be that market's (region_pricing.require_market_currency refuses anything
+    else, before a row exists). None -- every other lane -- binds nothing, exactly as before."""
     currency = _currency_of({"currency": currency})
+    if market is not None:
+        market = require_market_currency(market, currency)
     rows: List[Dict[str, Any]] = []
     seen_offer_ids: set = set()
     for offer in offers:
@@ -1299,9 +1322,9 @@ def _build_offer_inserts(
             ),
             # Persisted, not inferred at read time: the serving side selects on these and
             # cannot recover a seller identity the writer declined to record. `market` is
-            # deliberately NOT bound — catalog_offers.market is NOT NULL DEFAULT 'US'
-            # (db/catalog.py:300), so the column already stamps the serving partition and
-            # binding it would only add a way to write NULL into a NOT NULL column.
+            # bound ONLY when the caller declared one (below): catalog_offers.market is NOT
+            # NULL DEFAULT 'US' (db/catalog.py:300), and binding a value nobody declared
+            # would only add a way to write NULL into a NOT NULL column.
             "offer_type": offer_type,
             "is_first_party": is_first_party,
             "channel": "default",
@@ -1324,6 +1347,8 @@ def _build_offer_inserts(
                 "validated_at": offer.get("validated_at"),
             }),
         })
+        if market is not None:
+            rows[-1]["market"] = market
     return rows
 
 
@@ -1345,7 +1370,8 @@ def _domain_of(url: Optional[str]) -> Optional[str]:
         return None
 
 
-def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[str] = None,
+                            market: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Pure function: take one validated record and return the rows to
     INSERT/UPSERT for the canonical chain (merchants, products, skus,
     offers) plus the audit seed rows. Returns None for malformed
@@ -1435,6 +1461,7 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
         currency=_currency_of(pdp_payload),
         offer_type=seller_type["offer_type"],
         is_first_party=seller_type["is_first_party"],
+        market=market,
     )
     # Real variants ride beside the canonical SKU: one SKU + one offer each,
     # priced and stocked per variant, at the brand-direct destination.
@@ -1474,11 +1501,15 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
                 currency=_currency_of(pdp_payload),
                 offer_type=seller_type["offer_type"],
                 is_first_party=seller_type["is_first_party"],
+                market=market,
             ))
+    # The seed row keeps the SERVING PARTITION, never the offer's declared market: see
+    # SEED_PARTITION_MARKET. An acquisition-market (AU/JP) record lands here too.
     seed_rows = _build_seed_inserts(
         product_key=pdp_row["product_key"],
         pdp_payload=pdp_payload,
         offers=offers,
+        market=SEED_PARTITION_MARKET,
     )
     inci_row = _build_inci_row(
         product_key=pdp_row["product_key"],
@@ -1525,10 +1556,14 @@ def ingest_validated_jsonl(
     rows: Iterable[Dict[str, Any]],
     *,
     source_jsonl: Optional[str] = None,
+    market: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Drive ingest_validated_record across an iterable of records and
     return all five row collections plus skipped_count. Pure — no DB
     calls.
+
+    `market` (optional): the destination market the caller DECLARES for every offer (see
+    `_build_offer_inserts`); a record priced in another currency fails the whole plan.
 
     Returns a dict with keys: pdps, skus, merchants, offers, seeds,
     skipped. Lists are de-duped by their natural primary key so re-runs
@@ -1544,7 +1579,7 @@ def ingest_validated_jsonl(
     skipped = 0
     skipped_reasons: Dict[str, int] = {}
     for record in rows:
-        result = ingest_validated_record(record, source_jsonl=source_jsonl)
+        result = ingest_validated_record(record, source_jsonl=source_jsonl, market=market)
         if result is None:
             skipped += 1
             continue

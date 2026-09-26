@@ -96,6 +96,49 @@ def pricing_currency_for_region(region: str) -> str:
         ) from None
 
 
+#: Multi-market storefronts ADR Phase 2: markets whose offers are ACQUIRED (stored with their real market
+#: and currency, catalog_offers.market 'AU'/'JP') but never served. The retailer_ingest lane allowlists them
+#: (services/retailer_ingest/pipeline.py) and index_pipeline_state refuses to serve a product priced ONLY
+#: there (acquisition_only_priced_sql), whatever ENABLE_KBEAUTY_AGENT_DECISION_GATES says. One list, here.
+ACQUISITION_MARKETS = ("AU", "JP")
+
+
+def acquisition_market_offer_exists_sql(product_key_expr: str, *, alias: str = "co") -> str:
+    """``EXISTS`` a priced, unsuppressed offer DECLARED for an acquisition market (catalog_offers.market).
+
+    Only the retailer_ingest lane writes such a stamp (it declares its job's market; every other writer
+    leaves the column's DEFAULT 'US'), so this is FALSE for every row that existed before that lane wrote
+    an AU/JP job -- which is what makes the serving rule built on it a zero-change rule for them."""
+    markets = ", ".join(f"'{m}'" for m in ACQUISITION_MARKETS)
+    return priced_offer_exists_sql(
+        product_key_expr, alias=alias,
+        extra_predicate=f"upper(trim(coalesce({alias}.market, ''))) IN ({markets})",
+    )
+
+
+def require_market_currency(market: str, currency: Optional[str]) -> str:
+    """The ONE writer-side rule "currency = market": an offer declared for `market` must be priced
+    in that market's currency. Returns the canonical market code; raises ValueError otherwise.
+
+    For writers that DECLARE a destination market (multi-market storefronts ADR section 3.3: the
+    retailer_ingest lane stamps catalog_offers.market from its job, and the Shopify-Markets capture
+    writes market='US' siblings). Refusing here is the write-time half of ADR-024 Phase 0 item 2;
+    services/catalog_invariant_checks' market/currency disagreement is the same rule at rest.
+
+    Writers that never declare a market (every other lane: the column's DEFAULT 'US' is not a
+    declaration) do not call this -- the deliberate SG exception (market 'US', currency 'SGD',
+    because external_product_seeds.market is a hard serving partition) is one of them. An unknown
+    market or a missing currency is refused, never defaulted."""
+    normalized = normalize_region(market)
+    expected = pricing_currency_for_region(normalized)
+    got = str(currency or "").strip().upper()
+    if got != expected:
+        raise ValueError(
+            f"currency_market_mismatch: an offer for market {normalized} must be priced in {expected}, "
+            f"got {got or 'no currency'}")
+    return normalized
+
+
 def pricing_currency_for_region_or_none(region: str) -> Optional[str]:
     """Soft variant of ``pricing_currency_for_region``: None for an unmapped
     region instead of raising.
