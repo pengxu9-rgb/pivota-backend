@@ -34,6 +34,13 @@ _SUNSCREEN_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Shared vetoes for the lash/nail leaves below. A title naming another area is not a nail product
+# first. Spelled like _NON_FACE_AREAS further down -- `(?:eye\s?)?lash`, `(?:eye)?brows?` -- because a
+# bare `\blash\b` never matches "Eyelash" (review of #2364: "Eyelash Top Coat" and "Gel Remover for
+# Eyelash Extensions" both landed on nail leaves). `lip\w*` covers "lipstick", not just "lip".
+_AREA_VETO = r"lip\w*|(?:eye\s?)?lash(?:es)?|(?:eye)?brows?|mascara|eye\s?shadows?|eyeliners?|primers?"
+_OUTERWEAR = r"wool|cashmere|tweed|(?:wo)?men[\u2019']?s|trench|parka|jackets?|puffer|overcoats?|outerwear"
+
 # (category_label, taxonomy_path, regex). Order matters — more specific
 # patterns appear earlier; the first match wins.
 CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
@@ -76,40 +83,59 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(uv[-\s/]?led\s+(?:nail\s+)?lamp|nail\s+lamp|gel\s+lamp|nail\s+dryer|"
         r"electric\s+nail\s+file|nail\s+drill)\b",
         re.IGNORECASE)),
-    # ===== Nail products (Peng 2026-09-26: nails get leaves). =====
-    # The three paths are the ones prod rows and the gateway already use -- PIVOTA-Agent's
-    # queryUnderstanding browses `beauty/makeup/nails/nail-polish/` and keeps removers out of it.
-    # Before these, a nail product had NO honest leaf and fell to whatever noun it also carried:
-    # "Peel Off Nail Polish" -> exfoliant (peel/polish), a dip powder -> face powder, "Top Coat" ->
-    # a fashion coat; and a curated crawl with only_resolved_category dropped every lacquer
-    # (universalnailsupplies.com: 141 OPI products crawled, 5 planned, all 5 mis-filed dip powders).
-    # They sit ABOVE Brush, Cleanser, Exfoliant, Powder and Coat so first-match-wins reaches them,
-    # and each needs an explicit nail/cuticle/lacquer/dip/coat phrase -- never a bare "nail" (so
-    # "Nailed It Cleansing Balm" stays a cleanser) and never a bare "polish" (a face or body polish
-    # stays an exfoliant). A title that also names lips, lashes, brows or mascara is declined
-    # ("Lip Balm and Cuticle Balm", "Lash Base Coat"): it is not a nail product first.
+    # ===== Lash and nail products (Peng 2026-09-26: they get leaves). =====
+    # Before these, a false lash or a nail product had NO honest leaf and fell to whatever noun it
+    # also carried: "Peel Off Nail Polish" -> exfoliant (peel/polish), a dip powder -> face powder,
+    # "Top Coat" -> a fashion coat, "24 Nails" -> nothing. A curated crawl with only_resolved_category
+    # therefore dropped them all (universalnailsupplies.com: 141 OPI products crawled, 5 planned --
+    # the 5 mis-filed dip powders). The nail paths are the ones prod rows and the gateway already use
+    # (PIVOTA-Agent's queryUnderstanding browses `beauty/makeup/nails/nail-polish/` and keeps removers
+    # out of it); false lashes join the singular `eye/` tree where mascara and eyeliner live.
+    # They sit ABOVE Brush, Cleanser, Exfoliant, Powder, Mascara and Coat so first-match-wins reaches
+    # them. Each needs an explicit phrase -- never a bare "nail" ("Nailed It Cleansing Balm" stays a
+    # cleanser), never a bare "polish" (a face or body polish stays an exfoliant), never a bare
+    # "lash" (mascara, lash serums, lifts and curlers keep their homes). A title that also names
+    # another area is declined through the shared vetoes above ("Eyelash Top Coat", "Lipstick Top
+    # Coat", "Hand & Cuticle Cream" -- a hand product is hand care, as non_face_leaf says).
     # Remover BEFORE polish, and polish refuses a trailing "remover", so a remover product type
     # counts as ONE match in services/curated_brand_feed._pattern_matches, not an ambiguous two.
+    ("False Lashes", "beauty/makeup/eye/false-lashes", re.compile(
+        r"^(?!.*\b(?:mascara|serums?|lift(?:ing)?|curlers?|primers?|conditioners?|growth|tints?|"
+        r"perm|removers?|lip\w*)\b).*\b(?:"
+        r"(?:false|fake|faux|mink|magnetic|strip|individual|cluster|wispy)\s+(?:eye\s?)?lash(?:es)?"
+        r"|(?:eye\s?)?lash\s+(?:clusters?|wisps?|strips?|bands?|glue|adhesive)"
+        r"|falsies|falscara|wispies|faux\s+mink"
+        r")\b",
+        re.IGNORECASE | re.DOTALL)),
+    ("Press-On Nails", "beauty/makeup/nails/press-on-nails", re.compile(
+        r"^(?!.*\b(?:polish|lacquer|brush(?:es)?|files?|clippers?|drill|lamp|stickers?|wraps?|"
+        r"decals?|removers?|falsies|" + _AREA_VETO + r")\b).*\b(?:"
+        r"press[-\s]?on(?:\s+nails?)?"
+        r"|(?:false|fake|faux|artificial|acrylic|gel|glue[-\s]?on|stick[-\s]?on)\s+nails?"
+        r"|nail\s+tips?|\d+\s*(?:pcs?\s+)?nails"
+        r")\b",
+        re.IGNORECASE | re.DOTALL)),
     ("Nail Polish Remover", "beauty/makeup/nails/nail-polish-remover", re.compile(
-        r"^(?!.*\b(?:lips?|lash(?:es)?|mascara|brows?|makeup)\b).*"
+        r"^(?!.*\b(?:makeup|" + _AREA_VETO + r")\b).*"
         r"\b(?:(?:nail\s+)?(?:polish|lacquer|varnish|enamel)|gel(?:\s+polish)?|nail)\s+removers?\b",
         re.IGNORECASE | re.DOTALL)),
     ("Cuticle Care", "beauty/makeup/nails/cuticle-oil", re.compile(
-        r"^(?!.*\b(?:lips?|lash(?:es)?|mascara|brows?)\b).*"
+        r"^(?!.*\b(?:hands?|" + _AREA_VETO + r")\b).*"
         r"\bcuticle\s+(?:oils?|serums?|pens?|balms?|creams?|softeners?|treatments?|"
         r"revitali[sz]ers?|removers?)\b",
         re.IGNORECASE | re.DOTALL)),
-    # A hair "top coat" (a gloss/colour-seal treatment) names hair or scalp and is declined here.
+    # A hair "top coat" (a gloss/colour-seal treatment) names hair or scalp and is declined here, and
+    # so is an outerwear top coat ("Men's Wool Top Coat" stays a fashion coat -- see Coat below).
     # MEASURED 2026-09-26 over the 319 prod rows these patterns can touch: 110 re-classify, 109 are
     # nail products; the one miss, "Pureology Color Fanatic Top Coat 6.7 oz", names no hair word at
     # all. It stays on haircare/general because imagebeauty.com types it "Hair Color" (read from
     # the store 2026-09-26) and the product type is classified before the title -- which is also
     # why no hair-brand list is carried here.
     ("Nail Polish", "beauty/makeup/nails/nail-polish", re.compile(
-        r"^(?!.*\b(?:lips?|lash(?:es)?|mascara|brows?|hair|scalp)\b).*\b(?:"
+        r"^(?!.*\b(?:hair|scalp|" + _OUTERWEAR + r"|" + _AREA_VETO + r")\b).*\b(?:"
         r"nail\s+(?:polish(?:es)?|lacquers?|varnish(?:es)?|enamels?|colou?rs?|paints?)"
-        r"|gel\s+(?:nail\s+)?polish(?:es)?|gel\s+nail\s+colou?rs?"
-        r"|dip(?:ping)?\s+(?:powders?|systems?|liquids?)|nail\s+dip"
+        r"|gel\s+(?:nail\s+)?polish(?:es)?|gel\s+(?:nail\s+)?colou?rs?(?:\s+polish(?:es)?)?"
+        r"|dip(?:ping)?\s+(?:powders?|systems?|liquids?)|nail\s+dip|chrome\s+(?:nail\s+)?powders?"
         r"|(?:nail\s+)?(?:top|base)\s+coats?"
         r")\b(?!\s+removers?\b)",
         re.IGNORECASE | re.DOTALL)),
@@ -161,7 +187,8 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         # A "Nail Polish Remover Wipes" type is a nail remover, not a second match; a MAKEUP remover
         # wipe is still a cleanser, so only the nail/polish remover spellings are declined.
         r"cleansing milk|cleansing foam|cleansing gel|face wipes?|cleansing wipes?|"
-        r"(?<!polish\sremover\s)(?<!nail\sremover\s)wipes?|wash)\b",
+        # ...and "No-Wipe Top Coat" names no wipe at all.
+        r"(?<!polish\sremover\s)(?<!nail\sremover\s)(?<!gel\sremover\s)(?<!no-)(?<!no\s)wipes?|wash)\b",
         re.IGNORECASE)),
     # TONER GETS ITS OWN BUCKET, not a slot inside `treat/`. Two reasons, and they agree:
     #
@@ -236,7 +263,8 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
         # A NAIL or GEL polish is a nail product; a face/body/lip polish is still an exfoliant.
         r"\b(exfoliant|exfoliating|exfoliation|peel|peeling|peeling gel|peel pads?|"
-        r"scrub|(?<!nail\s)(?<!gel\s)polish)\b",
+        # ...and a COLOUR polish ("Gel Color Polish") or a polish REMOVER is not one either.
+        r"scrub|(?<!nail\s)(?<!gel\s)(?<!color\s)(?<!colour\s)polish(?!\s+removers?\b))\b",
         re.IGNORECASE)),
     ("Treatment", "beauty/skincare/treat/treatment", re.compile(
         r"\b(spot[-\s]?target(?:ing|ed)?|spot[-\s]?treatment|blemish|acne|"
@@ -272,7 +300,8 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     ("Powder", "beauty/makeup/face/powder", re.compile(
         # A DIP powder is a nail colour system, not a face powder.
-        r"\b((?<!dip\s)(?<!dipping\s)powder|setting powder|pressed powder|loose powder|"
+        # ...nor a NAIL / ACRYLIC powder, nor a "Powder Nail Color" (a nail store's dip shelf).
+        r"\b((?<!dip\s)(?<!dipping\s)(?<!nail\s)(?<!acrylic\s)powder(?!\s+nail\b)|setting powder|pressed powder|loose powder|"
         r"blurring powder|finishing powder)\b",
         re.IGNORECASE)),
     # Lip Gloss before Highlighter: "Gloss Bomb Universal Lip Luminizer" contains
@@ -358,8 +387,10 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(shorts|bermuda\s+shorts|denim\s+shorts|athletic\s+shorts)\b",
         re.IGNORECASE)),
     ("Coat", "fashion/apparel/outerwear/coat", re.compile(
-        # A nail TOP/BASE coat is a nail product, not outerwear.
-        r"\b((?<!top\s)(?<!base\s)coat|overcoat|trench\s+coat|peacoat|parka)\b",
+        # A nail TOP/BASE coat is a nail product, not outerwear -- unless the title says outerwear
+        # ("Men's Wool Top Coat"), which the Nail Polish pattern declines and this one keeps.
+        r"\b((?<!top\s)(?<!base\s)coat|overcoat|trench\s+coat|peacoat|parka)\b"
+        r"|^(?=.*\b(?:" + _OUTERWEAR + r")\b).*\b(?:top|base)\s+coats?\b",
         re.IGNORECASE)),
     ("Jacket", "fashion/apparel/outerwear/jacket", re.compile(
         r"\b(jacket|blazer|bomber|denim\s+jacket|windbreaker|puffer\s+jacket)\b",

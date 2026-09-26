@@ -182,10 +182,13 @@ def test_the_map_covers_the_measured_production_cohort():
     """117 distinct off-taxonomy paths were measured on prod 2026-09-09. Each is either aliased or
     declared a gap; a path in neither would be silently left broken by a map that claims to have
     considered it. The counts are pinned so that trimming the map is a visible decision."""
-    assert len(ALIASES) == 84, "alias count changed; re-measure before editing the expectation"
-    assert len(TAXONOMY_GAPS) == 30
-    # The three nail paths left the gap list on 2026-09-26 by becoming LEAVES, not by being dropped.
-    assert len(ALIASES) + len(TAXONOMY_GAPS) + len(NAIL_LEAVES) == 117
+    assert len(ALIASES) == 87, "alias count changed; re-measure before editing the expectation"
+    assert len(TAXONOMY_GAPS) == 29
+    # 2026-09-26: the three nail gaps became LEAVES (not dropped), and the `eyes/lashes` gap became
+    # an ALIAS of the new false-lash leaf, together with two spellings measured since 09-09
+    # (`eyes/false-lashes`, `eyes/false_lashes`) -- so 117 measured + 2 new sources.
+    measured_nail_leaves = NAIL_LEAVES - {"beauty/makeup/nails/press-on-nails"}
+    assert len(ALIASES) + len(TAXONOMY_GAPS) + len(measured_nail_leaves) == 117 + 2
     assert NAIL_LEAVES <= TAXONOMY_LEAVES
 
 
@@ -310,7 +313,9 @@ NAIL_LEAVES = frozenset({
     "beauty/makeup/nails/nail-polish",
     "beauty/makeup/nails/cuticle-oil",
     "beauty/makeup/nails/nail-polish-remover",
+    "beauty/makeup/nails/press-on-nails",
 })
+FALSE_LASHES = "beauty/makeup/eye/false-lashes"
 
 
 def test_the_nail_leaves_are_leaves_now():
@@ -318,7 +323,7 @@ def test_the_nail_leaves_are_leaves_now():
     leaves, resolve to themselves, pass the LLM validator, and are neither gaps nor aliases."""
     from services.category_classifier_llm import _validate_path
 
-    for path in NAIL_LEAVES:
+    for path in NAIL_LEAVES | {FALSE_LASHES}:
         assert path in TAXONOMY_LEAVES, path
         assert path not in TAXONOMY_GAPS, path
         assert path not in ALIASES, path
@@ -334,3 +339,13 @@ def test_the_nail_leaves_widen_only_the_nails_prefix():
     assert "beauty/makeup/nails" in LEAF_PARENTS
     assert "beauty/makeup" not in LEAF_PARENTS
     assert not has_category_door("beauty/makeup/manicure/polish")
+
+
+def test_the_plural_eyes_lash_spellings_alias_to_the_false_lash_leaf():
+    """`eyes/lashes` was a declared gap ("no false-lash leaf"); it and the two spellings measured
+    since are the plural-`eyes/` typo of the leaf. `eyes/lash` is NOT: that cohort is mascara."""
+    for path in ("beauty/makeup/eyes/lashes", "beauty/makeup/eyes/false-lashes",
+                 "beauty/makeup/eyes/false_lashes"):
+        assert resolve(path) == FALSE_LASHES, path
+        assert path not in TAXONOMY_GAPS, path
+    assert resolve("beauty/makeup/eyes/lash") == "beauty/makeup/eye/mascara"
