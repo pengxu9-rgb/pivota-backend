@@ -137,6 +137,18 @@ def test_lash_and_nail_products_reach_their_leaf(title, want):
     ("Kiss Press On Glue Nail Glue", None),
     ("Kiss Glue OFF Press On Fake Nails Remover", None),
     ("Kiss PowerFlex Maximum Speed Fake Nail Glue", None),
+    # a product FOR the glue-on line, and tool/care/kit words, decline the widened arm (review of #2377)
+    ("Kiss Nail Glue for Press On Glue Nails - 3g", None),
+    ("Gel X Nail Glue Gel for Press On Soft Gel Nails Extension", None),
+    ("Mini UV Lamp for Press On Soft Gel Nails", None),
+    ("Nail Dehydrator for Press On Gel Nails", None),
+    ("Adhesive Tabs for Press On Gel Nails, 240 pcs", None),
+    ("Press On Toenails Glue", None),
+    ("Top Coat for Press On Gel Nails", POLISH),
+    ("Kiss Press On Glue Nails - Top Coat", POLISH),
+    ("Press On Gel Nails Cuticle Oil", CUTICLE),
+    ("Press On Gel Nail Care Kit", "beauty/sets/gift-set"),
+    ("Kiss Core Press On Glue Nails Bundle - Core Must-Haves", "beauty/sets/gift-set"),
 ])
 def test_refusing_examples_keep_their_old_leaf(title, want):
     assert _path(title) == want

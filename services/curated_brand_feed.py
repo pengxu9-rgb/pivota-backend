@@ -2014,14 +2014,21 @@ _NAIL_AREA_TAGS = frozenset({"nail", "nails", "nail care", "nail styling", "fake
                              "pedicure", "nail polish", "nail color", "nail colour", "nail lacquer"})
 # One shelf, written as a path or a list: "COSMETICS - EYELASH - CLUSTERS", "Makeup > Nails", "Nails, KISS".
 _LASH_NAIL_TAG_SPLIT = re.compile(r"\s+-\s+|\s*[>,|/]\s*")
-# Not a lash or nail product at all: merch, cards, stickers, toys, displays, samples. (The lip door's
-# list, less "base" -- a base coat IS nail polish -- and less the lip-only words.)
+# Not a lash or nail product at all: merch, cards, stickers, toys, displays, samples, other audiences
+# (the lip door's list, less "base" -- a base coat IS nail polish -- and less the lip-only words) --
+# and a TOOL or ACCESSORY for one, which the lip door refuses through _LIP_ACCESSORY: "Individual Lash
+# Tweezers", "Press On Nails Cuticle Pusher", "Nail Polish Rack Holder" (review of #2377). It costs
+# KISS lashes that list an applicator in the box ("... | 12 Lash Clusters, With Mini Applicator"):
+# they stay unresolved, the safe side.
 _LASH_NAIL_NOT_A_PRODUCT = re.compile(
     r"\b(?:gift\s*cards?|e-?gift|cards?|posters?|stickers?|decals?|charms?|earrings?|jewel(?:ry|lery)|"
     r"necklaces?|pendants?|key\s*rings?|keyrings?|key\s*chains?|keychains?|lanyards?|magnets?|ornaments?|"
-    r"toys?|plush|dolls?|squish(?:y|ies)|pretend|candles?|tumblers?|mugs?|books?|e-?books?|dvd|"
+    r"toys?|plush|dolls?|squish(?:y|ies)|pretend|puzzles?|games?|costumes?|socks?|wall\s+art|art\s+prints?|"
+    r"dogs?|cats?|pets?|candles?|tumblers?|mugs?|books?|e-?books?|dvd|"
     r"displays?|stands?|empty|testers?|samples?|swatch(?:es)?|wholesale|bulk|gwp|promo(?:tional)?|"
-    r"bags?|pouch(?:es)?|cases?|organi[sz]ers?)\b", re.I)
+    r"bags?|pouch(?:es)?|cases?|organi[sz]ers?|storage|box(?:es)?|trays?|racks?|holders?|openers?|"
+    r"tweezers?|applicators?|pushers?|files?|buffers?|clippers?|cutters?|brush(?:es)?|prep|"
+    r"lamps?|dryers?|drills?)\b", re.I)
 
 
 def _explicit_lash_nail_title_leaf(*, product_type: Optional[str], title: Optional[str]) -> Optional[str]:

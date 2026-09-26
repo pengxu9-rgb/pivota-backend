@@ -76,9 +76,21 @@ def test_the_door_is_off_unless_the_job_asks(title, ptype, want):
     ("Kiss Glow-In-The-Dark Halloween Press On Fake Nail Art Stickers - Creepin | 3 Sheets", "Physical Products"),
     ("Kiss Glue OFF Press On Fake Nails Remover", "Physical Products"),
     ("Kiss Lash Glue Remover Pads | Pre-Soaked Oil Pads, 30 Pieces", "Physical Products"),
-    # not a product: merch, cards, cases
+    # not a product: merch, cards, cases, other audiences
     ("Kiss Press On Nails Gift Card", ""),
     ("False Eyelashes Storage Case", ""),
+    ("Nail Polish for Dogs", ""),
+    ("Nail Polish Socks", ""),
+    ("Nail Polish Wall Art Print", ""),
+    # a tool or accessory FOR a lash or nail product (review of #2377)
+    ("Individual Lash Tweezers", ""),
+    ("Falscara Tweezer Applicator", "Physical Products"),
+    ("Lash Cluster Storage Tray", ""),
+    ("Press On Nails Cuticle Pusher", ""),
+    ("Kiss Press On Nails File Buffer 2 Pack", ""),
+    ("Kiss imPRESS Press-On Manicure Prep Pads", ""),
+    ("Nail Polish Rack Holder", "Accessories"),
+    ("Nail Polish Bottle Opener", ""),
     # the merchant's shelf names ANOTHER family or a tool shelf
     ("Kiss Gel Fantasy Press On Glue Nails - Chase It", "Eye lashes"),
     ("Kiss Lash Couture Faux Mink False Eyelashes - Jubilee", "NAILS"),
@@ -115,8 +127,17 @@ def test_the_lip_door_is_not_widened():
 
 
 def test_the_confidence_is_distinct_from_every_other_writer():
-    assert DOOR not in {0.3, 0.7, 0.78, 0.8, 0.82, 0.85, 0.9, 0.95}
-    assert DOOR != feed.CATEGORY_CONFIDENCE_LIP_TITLE
+    """Read from the source, not a hand list: every CATEGORY_CONFIDENCE_* constant any writer declares."""
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parents[2]
+    declared = re.compile(r"^\s*(CATEGORY_CONFIDENCE_[A-Z_]+)\s*(?::[^=]*)?=\s*([0-9.]+)", re.M)
+    values = {}
+    for path in [*root.joinpath("services").rglob("*.py"), *root.joinpath("scripts").rglob("*.py")]:
+        for name, value in declared.findall(path.read_text(encoding="utf-8", errors="ignore")):
+            values.setdefault(float(value), set()).add(name)
+    assert values[DOOR] == {"CATEGORY_CONFIDENCE_LASH_NAIL_TITLE"}
+    assert len(values) >= 8  # the scan found the other writers (0.3 ... 1.0), not nothing
 
 
 def _record(title, ptype, handle):
