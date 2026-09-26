@@ -1902,3 +1902,96 @@ def test_a_whitespace_only_axis_name_is_not_published():
         v["option_name"] = "   "
     variants = json.loads(ing.ingest_validated_record(rec)["seeds"][0]["seed_data"])["variants"]
     assert [v["options"] for v in variants] == [[], []]
+
+
+# --- varchar(128) bounds (2026-09-26) ----------------------------------------------------------
+# catalog_products.source_product_id, catalog_skus.source_product_id and catalog_skus.source_variant_id
+# are varchar(128). KISS's real title below failed the PDP insert and 11 SKU inserts in prod, and 15
+# official rows with a 129-140 char product_key never got a canonical SKU (source_variant_id =
+# product_key did not fit).
+
+KISS_TOENAILS = (
+    "KISS",
+    "Kiss Professional Full Cover Press On Fake Toenails - Tippy Toes, 130 Toenails, "
+    "Includes Nail Glue, Solid White, Short Squoval Pedicure",
+)
+
+
+def _legacy_product_key(brand, product_name):
+    """The derivation every stored official key was minted with (prefix cut at 200)."""
+    import hashlib
+
+    canonical = canonical_product_name(brand, product_name)
+    digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:8]
+    return f"ext:{canonical[:200]}::{digest}"
+
+
+@pytest.mark.parametrize("brand,name", [
+    ("MAC", "Ruby Woo Matte Lipstick"),
+    ("X", "y" * 110),  # canonical of exactly 112 chars
+    ("", "z" * 114),   # canonical of exactly 114 chars: the last length that keeps its key
+])
+def test_a_key_that_fits_is_byte_identical_to_the_legacy_key(brand, name):
+    assert derive_product_key(brand, name) == _legacy_product_key(brand, name)
+
+
+def test_a_long_name_gets_a_bounded_key_with_the_digest_of_the_full_name():
+    key = derive_product_key(*KISS_TOENAILS)
+    legacy = _legacy_product_key(*KISS_TOENAILS)
+    assert len(legacy) > 128  # the defect, reproduced
+    assert len(key) == 128
+    # Same digest, same readable prefix: the new key is the legacy key with its name cut to 114.
+    assert key.rsplit("::", 1)[1] == legacy.rsplit("::", 1)[1]
+    assert legacy.startswith(key.rsplit("::", 1)[0])
+
+
+def test_two_long_names_sharing_a_prefix_get_different_keys():
+    a = derive_product_key("KISS", KISS_TOENAILS[1] + " Pink")
+    b = derive_product_key("KISS", KISS_TOENAILS[1] + " Blue")
+    assert a != b and len(a) == len(b) == 128
+
+
+def test_source_product_id_fits_and_is_unchanged_when_it_already_fit():
+    from services.catalog_enrichment_agent.ingestion import derive_source_product_id
+
+    assert derive_source_product_id("MAC", "Ruby Woo Matte Lipstick") == canonical_product_name(
+        "MAC", "Ruby Woo Matte Lipstick"
+    )
+    long_id = derive_source_product_id(*KISS_TOENAILS)
+    assert len(canonical_product_name(*KISS_TOENAILS)) > 128  # the defect, reproduced
+    assert len(long_id) == 128
+    assert derive_source_product_id(*KISS_TOENAILS) == long_id  # deterministic
+
+
+def test_the_kiss_toenails_record_fits_every_varchar_128_column():
+    record = _record(brand=KISS_TOENAILS[0], product_name=KISS_TOENAILS[1], source_domain="kissusa.com")
+    record["pdp"]["variants"] = [
+        {"variant_id": "50681431916829", "title": "Default Title", "price": "9.99"},
+        {"variant_id": "50681431916830", "title": "Pink", "price": "9.99"},
+    ]
+    result = ingest_validated_record(record)
+    assert result is not None
+    pdp, sku = result["pdp"], result["sku"]
+    assert len(pdp["product_key"]) <= 128
+    assert len(pdp["source_product_id"]) <= 128
+    assert len(sku["source_product_id"]) <= 128
+    assert len(sku["source_variant_id"]) <= 128
+    variant_rows = result["variant_skus"]
+    assert len(variant_rows) == 2  # the loop below must not pass vacuously
+    for row in variant_rows:
+        assert len(row["source_product_id"]) <= 128
+        assert len(row["source_variant_id"]) <= 128
+        assert row["source_product_id"] == pdp["source_product_id"]
+    assert sku["source_product_id"] == pdp["source_product_id"]
+
+
+def test_the_long_canonical_sku_is_still_a_restatement_to_the_money_guard():
+    """source_variant_id must stay EQUAL to product_key: that is the only bounded shape both
+    services.variant_identity and the gateway's isRestatedProductId read as product-derived."""
+    from services.variant_identity import PRODUCT_DERIVED, variant_id_provenance
+
+    record = _record(brand=KISS_TOENAILS[0], product_name=KISS_TOENAILS[1], source_domain="kissusa.com")
+    result = ingest_validated_record(record)
+    pdp, sku = result["pdp"], result["sku"]
+    assert sku["source_variant_id"] == pdp["product_key"]
+    assert variant_id_provenance(sku["source_variant_id"], product_key=pdp["product_key"]) == PRODUCT_DERIVED
