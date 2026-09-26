@@ -252,6 +252,10 @@ UPDATE catalog_products SET content_key = $2, updated_at = NOW()
 WHERE product_key = $1 AND content_key = $3 AND suppression_reason IS NULL
 """
 
+LEFT_BEHIND_SQL = """
+SELECT count(*) FROM catalog_products WHERE content_key = $1 AND suppression_reason IS NULL
+"""
+
 MOVE_GROUP_SQL = """
 UPDATE product_group_members SET product_group_id = $4, updated_at = NOW()
 WHERE merchant_id = $1 AND platform = $2 AND platform_product_id = $3 AND product_group_id = $5
@@ -410,6 +414,7 @@ async def apply_approved(
 
     applied: List[str] = []
     skipped: List[Tuple[str, str]] = []
+    vacated: set = set()
     async with conn.transaction():
         for p in proposals:
             if isinstance(p.get("evidence"), str):
@@ -431,6 +436,15 @@ async def apply_approved(
             )
             await conn.execute(MARK_APPLIED_SQL, p["proposal_id"], run_id)
             applied.append(p["proposal_id"])
+            if detail.get("attached"):
+                vacated.add(detail["from_content_key"])
+        # attach_membership post-check, after EVERY move of the run: a live row left on a content_key a
+        # listing moved off (one written since propose time, or a sibling skipped for drift) would pull the
+        # listing back on its next crawl and fail its store's job. Fail the run loudly, like suppress_dup.
+        for ck in sorted(vacated):
+            left = await conn.fetchval(LEFT_BEHIND_SQL, ck)
+            if left:
+                raise RuntimeError(f"post-check failed for run {run_id}: {left} live row(s) left on {ck}")
     return {"run_id": run_id, "applied": applied, "skipped": skipped}
 
 
@@ -454,7 +468,8 @@ async def revert_run(conn, run_id: str) -> Dict[str, Any]:
                 now = await conn.fetchrow(ATTACH_ROW_SQL, detail["attached"])
                 now_group = await conn.fetchval(
                     MEMBER_GROUP_SQL, detail["merchant_id"], detail["platform"], detail["source_product_id"])
-                if (not now or now["content_key"] != detail["to_content_key"]
+                if (not now or now["suppression_reason"] is not None
+                        or now["content_key"] != detail["to_content_key"]
                         or now_group != detail["to_product_group_id"]):
                     detached.append({**detail, "reverted": False, "why": "moved_since_run"})
                     continue

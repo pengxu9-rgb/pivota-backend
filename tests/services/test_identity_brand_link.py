@@ -27,9 +27,18 @@ GROUPS = {link.member_key(BRAND): "pg_brand", link.member_key(LISTING): "pg_list
 
 
 def _build(listings=None, families=None, groups=None):
-    return link.build_proposals(listings if listings is not None else [LISTING],
-                                families if families is not None else {BRAND_CK: [BRAND]},
-                                groups if groups is not None else GROUPS)
+    listings = listings if listings is not None else [LISTING]
+    groups = groups if groups is not None else GROUPS
+    on_key: Dict[str, List[str]] = {}
+    for r in listings:
+        on_key.setdefault(r.get("content_key"), []).append(r["product_key"])
+    sizes: Dict[str, int] = {}
+    for r in listings:
+        g = groups.get(link.member_key(r))
+        if g:
+            sizes[g] = sizes.get(g, 0) + 1
+    return link.build_proposals(listings, families if families is not None else {BRAND_CK: [BRAND]},
+                                groups, on_key, sizes)
 
 
 def test_a_brand_prefixed_listing_is_proposed_onto_the_brand_product():
@@ -125,6 +134,9 @@ class StateConn:
         return self.rows.get(args[0])
 
     async def fetchval(self, sql, *args):
+        if "SELECT count(*) FROM catalog_products WHERE content_key = $1" in " ".join(sql.split()):
+            return sum(1 for r in self.rows.values()
+                       if r["content_key"] == args[0] and r["suppression_reason"] is None)
         return self.groups.get((args[0], args[1], args[2]))
 
     async def execute(self, sql, *args):
@@ -324,3 +336,54 @@ async def test_a_revert_write_that_loses_a_race_aborts_the_revert():
     conn.execute = lost_race
     with pytest.raises(RuntimeError):
         await revert_run(conn, "R6")
+
+
+
+# --- re-review of #2390 -----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_lands_on_the_old_key_after_propose_aborts_the_run():
+    """Checked again INSIDE the apply transaction, after every move: a row written onto the old content_key
+    since propose time would pull the moved listing back on its next crawl."""
+    newcomer = {**LISTING, "product_key": "ext:retailer:" + "d" * 32, "source_product_id": "retailer:" + "d" * 32}
+    conn = _conn(rows=[LISTING, BRAND, newcomer])
+    with pytest.raises(RuntimeError, match="left on"):
+        await apply_approved(conn, run_id="R7", strategies=[link.STRATEGY])
+
+
+@pytest.mark.asyncio
+async def test_a_listing_suppressed_after_the_run_is_left_alone_by_revert():
+    conn = _conn()
+    await apply_approved(conn, run_id="R8", strategies=[link.STRATEGY])
+    conn.rows[LISTING["product_key"]]["suppression_reason"] = "d2_same_url_dup"
+    back = await revert_run(conn, "R8")
+    assert back["detached"][0]["reverted"] is False
+    assert conn.groups[("external_seed", "external_seed", LISTING["source_product_id"])] == "pg_brand"
+
+
+@pytest.mark.asyncio
+async def test_revert_needs_the_group_to_still_be_this_runs_too():
+    conn = _conn()
+    await apply_approved(conn, run_id="R9", strategies=[link.STRATEGY])
+    conn.groups[("external_seed", "external_seed", LISTING["source_product_id"])] = "pg_curated_later"
+    back = await revert_run(conn, "R9")
+    assert back["detached"][0]["reverted"] is False
+    assert conn.rows[LISTING["product_key"]]["content_key"] == BRAND_CK  # not half-reverted
+
+
+def test_the_listings_own_merchant_brand_row_is_joined_first():
+    """Tier-0e's order: the listing's merchant before an older row of another merchant."""
+    other = {**BRAND, "product_key": "prod::m_other::shopify::1", "merchant_id": "m_other",
+             "source_product_id": "1", "created_at": "2026-01-01"}
+    groups = {**GROUPS, link.member_key(other): "pg_other"}
+    [p], _ = _build(families={BRAND_CK: [other, BRAND]}, groups=groups)
+    assert p["keeper_product_key"] == BRAND["product_key"]
+
+
+def test_an_old_content_key_that_was_not_read_is_never_assumed_empty():
+    proposals, counts = link.build_proposals([LISTING], {BRAND_CK: [BRAND]}, GROUPS, {}, {"pg_listing": 1})
+    assert proposals == [] and counts == {"old_content_key_not_read": 1}
+    proposals, counts = link.build_proposals([LISTING], {BRAND_CK: [BRAND]}, GROUPS,
+                                             {LISTING_CK: [LISTING["product_key"]]}, {})
+    assert proposals == [] and counts == {"old_group_has_other_members": 1}  # an unread group size too

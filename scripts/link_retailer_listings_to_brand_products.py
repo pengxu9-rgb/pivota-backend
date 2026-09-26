@@ -42,6 +42,11 @@ from services.identity_resolution import (  # noqa: E402
     upsert_proposals,
 )
 
+REVERT_EVENT_SQL = """
+SELECT detail FROM identity_resolution_events WHERE run_id = $1 AND action = 'reverted'
+ORDER BY id DESC LIMIT 1
+"""
+
 PROPOSED_IDS_SQL = """
 SELECT proposal_id FROM identity_resolution_proposals
 WHERE strategy = $1 AND kind = 'attach_membership' AND status = 'proposed'
@@ -85,7 +90,13 @@ async def main(argv: List[str]) -> int:
     conn = await asyncpg.connect(os.environ["DATABASE_URL"], timeout=30, command_timeout=300)
     try:
         if args.refresh:
-            details = _details(await conn.fetch(RUN_EVENTS_SQL, args.refresh))
+            reverted = await conn.fetchrow(REVERT_EVENT_SQL, args.refresh)
+            if reverted:  # a reverted run: rebuild in the revert's order, from what the revert moved back
+                d = reverted["detail"]
+                d = json.loads(d or "{}") if isinstance(d, str) else dict(d or {})
+                details = [x for x in d.get("detached") or [] if x.get("attached")]
+            else:
+                details = _details(await conn.fetch(RUN_EVENTS_SQL, args.refresh))
             result = {"run_id": args.refresh, "refresh": await _refresh(details, STRATEGY)}
         elif args.revert:
             result = await revert_run(conn, args.revert)

@@ -59,8 +59,8 @@ def build_proposals(
     listings: Iterable[Mapping[str, Any]],
     families: Mapping[str, List[Mapping[str, Any]]],
     groups: Mapping[MemberKey, str],
-    from_family_keys: Optional[Mapping[str, List[str]]] = None,
-    group_sizes: Optional[Mapping[str, int]] = None,
+    from_family_keys: Mapping[str, List[str]],
+    group_sizes: Mapping[str, int],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Pure: one attach_membership proposal per listing that is the brand product under Tier-0e's rule.
 
@@ -71,9 +71,6 @@ def build_proposals(
     Otherwise the next crawl resolves the listing back to the row left behind (exact content_key tier),
     snaps its content_key back and has its group refused (review of the attach_membership PR)."""
     listings = list(listings)
-    from_family_keys = from_family_keys if from_family_keys is not None else {
-        r.get("content_key"): [r["product_key"]] for r in listings}
-    group_sizes = group_sizes if group_sizes is not None else {}
     candidates, counts = _candidates(listings, families, groups)
     moving = {c["listing"]["product_key"] for c in candidates}
     moving_by_group: Dict[str, int] = {}
@@ -82,11 +79,16 @@ def build_proposals(
     proposals: List[Dict[str, Any]] = []
     for c in candidates:
         row, keeper = c["listing"], c["keeper"]
-        left_behind = set(from_family_keys.get(row.get("content_key"), [row["product_key"]])) - moving
+        # A content_key missing from the map was not read: treat it as unknown, never as empty.
+        on_old_key = from_family_keys.get(row.get("content_key"))
+        if on_old_key is None:
+            counts["old_content_key_not_read"] = counts.get("old_content_key_not_read", 0) + 1
+            continue
+        left_behind = set(on_old_key) - moving
         if left_behind:
             counts["rows_left_on_old_content_key"] = counts.get("rows_left_on_old_content_key", 0) + 1
             continue
-        if group_sizes.get(c["from_group"], 1) > moving_by_group[c["from_group"]]:
+        if group_sizes.get(c["from_group"], 0) != moving_by_group[c["from_group"]]:
             counts["old_group_has_other_members"] = counts.get("old_group_has_other_members", 0) + 1
             continue
         proposals.append(new_proposal(
