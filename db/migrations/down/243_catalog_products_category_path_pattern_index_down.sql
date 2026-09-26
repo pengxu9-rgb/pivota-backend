@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_catalog_products_category_path_pattern;
