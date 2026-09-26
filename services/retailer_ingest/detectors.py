@@ -14,7 +14,9 @@ Each rule is measured, not imagined:
     written (186 store/currency cohorts, 39,514 offers): headandshoulders.com is the only one whose
     modal price is <= 2.00 at a modal share over 0.22, or whose <= 1.00 share is over 0.20 (next:
     timelybasket.com, 10/46 at 2.00 and 9/46 at 1.00).
-    honest.com's storefront carries 125 of 317 variants at 1.00, mostly diapers. -> placeholder_price_store.
+    honest.com's storefront carries 125 of 317 variants at 1.00, mostly diapers. -> placeholder_price_store,
+    judged over every record the crawl emitted for the job (already scoped to the job's vendors by
+    records_for_brand -- not the whole store), before exclusions or a category filter narrow it.
   * Rows the opt-in lip title door placed (#2257) are a per-row BLOCK: unattended, nothing but the
     title vouches for them (review of #2263: "Lipstick Poster" typed "Misc" reaches a lip leaf).
 
@@ -55,8 +57,8 @@ _SET_TITLE = re.compile(r"\b(?:sets?|kits?|bundles?|trio|(?:[2-9]|\d{2,})\s*-?\s
 _SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|g|oz|fl\.?\s*oz)\b", re.I)
 _PLACEHOLDER = re.compile(r"\b(?:test\s*product|dummy|do\s+not\s+buy|placeholder|sample\s+product)\b", re.I)
 
-# Store-level placeholder pricing (placeholder_price_store), judged over the WHOLE cohort passed to
-# detect(). Measured 2026-09-26 (see the module docstring): every threshold in the grid min 10-30 /
+# Store-level placeholder pricing (placeholder_price_store), judged over every record the crawl emitted
+# for the job (before exclusions and the category filter; see placeholder_price_store_verdict). Measured 2026-09-26 (see the module docstring): every threshold in the grid min 10-30 /
 # modal share 0.6-0.9 / modal ceiling 2-5 / <=1.00 share 0.2-0.4 held headandshoulders.com and nothing
 # else. The values below sit between the placeholder stores and the nearest legitimate ones.
 _STORE_MIN_VARIANTS = 20       # a smaller cohort is not evidence of a store-wide price
@@ -105,18 +107,19 @@ def _variant_prices(record: Dict[str, Any]) -> List[float]:
     return out or [round(p, 2) for p in _prices(record)]
 
 
-def _store_placeholder_flags(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """placeholder_price_store: the store prices its catalogue with a token, so no per-row price is real.
+def placeholder_price_store_verdict(population: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Does this population price its catalogue with a token? {"ceiling", "evidence"} or None.
 
-    A BLOCK per row whose prices are ALL at or below the placeholder price -- keyed like every row flag,
-    so an operator can accept a real $1 item or exclude rows. A row with any price above it is a real
-    product carrying a token-priced variant, and is not held by this rule."""
-    priced = [(record, _variant_prices(record)) for record in records]
-    priced = [(record, prices) for record, prices in priced if prices]
-    every = [p for _, prices in priced for p in prices]
+    `population` must be every record the CRAWL emitted for the job -- before exclude_handles and before
+    the category filter. Judged on the narrowed cohort instead, the verdict was released by the very
+    approval it should survive (review of #2371): excluding 6 of 25 $1 rows dropped the count under the
+    minimum and applied the other 19 unanswered, and an only_category lip slice of an all-$1 store kept
+    10 rows and applied them at $1. It is still NOT the whole store: records_for_brand's vendor filter
+    has already scoped the crawl to the job's brands."""
+    every = [p for record in population or [] if _pdp(record) for p in _variant_prices(record)]
     total = len(every)
     if total < _STORE_MIN_VARIANTS:
-        return []
+        return None
     counts: Dict[float, int] = {}
     for p in every:
         counts[p] = counts.get(p, 0) + 1
@@ -129,13 +132,29 @@ def _store_placeholder_flags(records: List[Dict[str, Any]]) -> List[Dict[str, An
     if token_n / total >= _STORE_TOKEN_SHARE:
         ceilings.append(_STORE_TOKEN_PRICE)
     if not ceilings:
+        return None
+    return {"ceiling": max(ceilings),
+            "evidence": (f"store-wide placeholder pricing: {modal_n}/{total} variants at {modal:.2f}, "
+                         f"{token_n}/{total} at or below {_STORE_TOKEN_PRICE:.2f}")}
+
+
+def placeholder_price_store_flags(records: Iterable[Dict[str, Any]],
+                                  verdict: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """placeholder_price_store: a BLOCK per row of `records` (the cohort being checked) whose prices are
+    ALL at or below the verdict's placeholder price -- keyed like every row flag, so an operator can accept
+    a real $1 item or exclude rows. A row with any price above it is a real product carrying a
+    token-priced variant, and is not held. An excluded row is not in `records`, so it gets no flag."""
+    if not verdict:
         return []
-    ceiling = max(ceilings)
-    evidence = (f"store-wide placeholder pricing: {modal_n}/{total} variants at {modal:.2f}, "
-                f"{token_n}/{total} at or below {_STORE_TOKEN_PRICE:.2f}")
-    return [_flag("placeholder_price_store", BLOCK, record,
-                  f"{evidence}; every price of this row is <= {ceiling:.2f} ({sorted(set(prices))[:4]})")
-            for record, prices in priced if max(prices) <= ceiling]
+    ceiling = verdict["ceiling"]
+    flags = []
+    for record in records or []:
+        prices = _variant_prices(record) if _pdp(record) else []
+        if prices and max(prices) <= ceiling:
+            flags.append(_flag("placeholder_price_store", BLOCK, record,
+                               f"{verdict['evidence']}; every price of this row is <= {ceiling:.2f} "
+                               f"({sorted(set(prices))[:4]})"))
+    return flags
 
 
 def _size_units(text: str) -> List[float]:
@@ -164,11 +183,18 @@ def _flag(rule: str, severity: str, record: Dict[str, Any], detail: str) -> Dict
     }
 
 
-def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True) -> List[Dict[str, Any]]:
-    """Per-row rules over each record, then (store_level) the rules judged over the whole cohort.
+_OWN = object()
 
-    `records` IS the cohort for the store-level rules: pass every row of the store, never a subset.
-    A caller re-checking a subset it already judged as part of the whole passes store_level=False."""
+
+def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True,
+           store_verdict: Any = _OWN) -> List[Dict[str, Any]]:
+    """Per-row rules over each record, then (store_level) placeholder_price_store on the rows of `records`.
+
+    The store verdict must be judged over every record the crawl emitted for the job
+    (placeholder_price_store_verdict), NOT over `records` once exclusions or a category filter narrowed
+    them: the pipeline computes it before narrowing and passes it as `store_verdict`. Omitted, it is
+    judged over `records` themselves -- correct only when they are the whole crawl. A caller re-checking
+    rows it already judged passes store_level=False."""
     from services.curated_brand_feed import CATEGORY_CONFIDENCE_LIP_TITLE, _NON_FACE_TITLE, _title_paths
 
     flags: List[Dict[str, Any]] = []
@@ -230,7 +256,8 @@ def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True) -> Li
             flags.append(_flag("placeholder_product", BLOCK, record,
                                f"looks like a test/placeholder row (prices {sorted(set(prices))[:4]})"))
     if store_level:
-        flags.extend(_store_placeholder_flags(cohort))
+        verdict = placeholder_price_store_verdict(cohort) if store_verdict is _OWN else store_verdict
+        flags.extend(placeholder_price_store_flags(cohort, verdict))
     return flags
 
 

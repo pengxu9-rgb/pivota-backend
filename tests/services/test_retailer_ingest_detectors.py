@@ -258,6 +258,24 @@ def test_the_minimum_count_boundary(n, held):
     assert bool(_held(detectors.detect(store([[1.0]] * n)))) is held
 
 
+@pytest.mark.parametrize("products,held", [
+    ([[1.0] * 5] * 5, True),        # 25 variants over 5 products: the minimum counts VARIANTS
+    ([[1.0] * 4] * 4 + [[1.0, 1.0, 1.0]], False),  # 19 variants over 5 products
+])
+def test_the_minimum_counts_variants_not_products(products, held):
+    assert bool(_held(detectors.detect(store(products)))) is held
+
+
+def test_a_verdict_judged_elsewhere_flags_only_the_rows_checked():
+    crawl = store([[1.0]] * 25)
+    verdict = detectors.placeholder_price_store_verdict(crawl)
+    assert verdict and verdict["ceiling"] == 1.0
+    kept = crawl[:5]  # 5 rows alone are under the minimum; the crawl's verdict still holds them
+    assert _held(detectors.detect(kept)) == set()
+    assert _held(detectors.detect(kept, store_verdict=verdict)) == {f"p{i}" for i in range(5)}
+    assert _held(detectors.detect(crawl, store_verdict=None)) == set()
+
+
 @pytest.mark.parametrize("price,token,rest,held", [
     (1.00, 30, 70, True),    # 0.30 at <= 1.00: holds
     (1.00, 29, 71, False),   # 0.29: does not
