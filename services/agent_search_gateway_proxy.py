@@ -220,6 +220,13 @@ async def search(
             detail = _query_too_long_detail(response)
             if detail is not None:
                 return None, "query_too_long", 400, detail
+        if status in (414, 431):
+            # The query rides in the URL: far past the limit it is refused by the gateway's HTTP server
+            # (URI / header too large) before the QUERY_TOO_LONG check can say what the limit is.
+            return None, "query_too_long", 400, {
+                "code": "QUERY_TOO_LONG",
+                "message": "The search query is too long.",
+            }
         # Preserve actionable caller and rate-limit errors, but do not expose upstream internals.
         return None, f"gateway_http_{status}", status if status in {400, 401, 403, 404, 422, 429, 503, 504} else 502, None
     try:

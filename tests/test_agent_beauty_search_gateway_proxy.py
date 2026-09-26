@@ -432,6 +432,14 @@ async def test_any_other_gateway_400_stays_opaque(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [414, 431])
+async def test_a_query_too_long_for_the_url_is_still_query_too_long(monkeypatch: pytest.MonkeyPatch, status) -> None:
+    _mock_client(monkeypatch, lambda r: httpx.Response(status, text=""))
+    result = await proxy.search(base_url="http://gw.test", query_items=[("query", "x")], headers={})
+    assert result == (None, "query_too_long", 400, {"code": "QUERY_TOO_LONG", "message": "The search query is too long."})
+
+
+@pytest.mark.asyncio
 async def test_only_known_query_too_long_fields_pass_through(monkeypatch: pytest.MonkeyPatch) -> None:
     hostile = {**QUERY_TOO_LONG_BODY, "stack": "at server.js:1", "message": "x" * 5000, "max_chars": True}
     _mock_client(monkeypatch, lambda r: httpx.Response(400, json=hostile))
@@ -445,6 +453,24 @@ async def test_a_too_long_query_reaches_the_caller_as_query_too_long(monkeypatch
     monkeypatch.setenv(proxy.FLAG, "on")
     _mock_client(monkeypatch, lambda r: httpx.Response(400, json=QUERY_TOO_LONG_BODY))
     resp = await _get(MEITU_QUERY)
+    assert resp.status_code == 400
+    assert local_calls == []
+    assert resp.json()["error"]["code"] == "QUERY_TOO_LONG"
+    assert resp.json()["error"]["max_chars"] == 500
+
+
+@pytest.mark.asyncio
+async def test_the_general_search_route_also_passes_query_too_long_through(
+    monkeypatch: pytest.MonkeyPatch, endpoint
+) -> None:
+    import routes.agent_sdk_fixed as sdk
+
+    local_calls, _ = endpoint
+    monkeypatch.setenv(proxy.FLAG, "on")
+    monkeypatch.setenv(proxy.AGENT_IDS_FLAG, "agent_meitu")
+    monkeypatch.setattr(sdk, "log_agent_request", AsyncMock(return_value=None))
+    _mock_client(monkeypatch, lambda r: httpx.Response(400, json=QUERY_TOO_LONG_BODY))
+    resp = await _get_general({"query": "x" * 501, "market": "SG", "search_all_merchants": "true", "limit": "20"})
     assert resp.status_code == 400
     assert local_calls == []
     assert resp.json()["error"]["code"] == "QUERY_TOO_LONG"
