@@ -1438,8 +1438,29 @@ def _brand_key(value: Optional[str]) -> str:
     differ by punctuation and spacing: `A'PIEU`/`Apieu`, `MISSHA US`/`Missha`.
     `_vendor_token` is left alone — it backs `filter_products_by_vendor`, where exact
     selection is the point and loose matching is the documented hazard.
+
+    "&" is read as "and" before stripping: us.sandandsky.com publishes both `Sand & Sky US`
+    and `Sand and Sky INT` (measured 2026-09-26), which stripped to `sandskyus` and
+    `sandandskyint` and so could never be one brand under any job brand.
     """
-    return "".join(c for c in str(value or "").casefold() if c.isalnum())
+    return "".join(c for c in str(value or "").casefold().replace("&", "and") if c.isalnum())
+
+
+# A FIRST host label that names a region or a storefront role, not the store: us.sandandsky.com,
+# us.frankbody.com, us.koraorganics.com (measured 2026-09-26), www./shop./store. hosts. The store's
+# own name is the next label. Not stripped when the next label is a public second level
+# (shop.com.sg's store label is "shop", not "com").
+_HOST_PREFIX_LABELS = frozenset({"www", "shop", "store", "us", "uk", "au", "ca", "eu", "int"})
+_PUBLIC_SECOND_LEVEL_LABELS = frozenset({"com", "co", "net", "org"})
+
+
+def _store_host_label(domain: Optional[str]) -> str:
+    """`_brand_key` of the label that names the store in `domain`, regional prefix skipped."""
+    labels = _clean_domain(domain or "").split(".")
+    while (len(labels) > 2 and labels[0] in _HOST_PREFIX_LABELS
+           and labels[1] not in _PUBLIC_SECOND_LEVEL_LABELS):
+        labels = labels[1:]
+    return _brand_key(labels[0])
 
 
 # MEASURED RENAMES that retailers still sell under the old and new names. In retailer mode a
@@ -1597,8 +1618,10 @@ def resolve_record_brand(
     # mutation — and is deliberately absent rather than kept as untested reassurance.
     if len(v) >= 3 and len(o) >= 3 and (v in o or o in v):
         return o_raw, "override_same_brand"
-    host_label = _brand_key(_clean_domain(domain or "").split(".")[0])
-    if host_label and len(v) >= 3 and (v in host_label or host_label in v):
+    # The same 3-char floor on the HOST label: without it the "us" of us.sandandsky.com matched
+    # every vendor containing "us" -- `Sand and Sky US` by coincidence, and equally `Lush`.
+    host_label = _store_host_label(domain)
+    if len(host_label) >= 3 and len(v) >= 3 and (v in host_label or host_label in v):
         # The vendor field is the STORE's name, not a brand — the override is the only
         # brand claim available and is what the operator came to assert. Measured:
         # metro.com.sg publishes `vendor: "Metro Singapore Departmental Store -
