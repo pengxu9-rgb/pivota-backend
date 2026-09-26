@@ -1969,6 +1969,97 @@ def _explicit_lip_title_leaf(*, product_type: Optional[str], title: Optional[str
     return leaf if lip_tag else None
 
 
+# A false-lash or nail product's own title, where the merchant type says nothing. Measured 2026-09-26:
+# kissusa.com types 1,395 of 1,464 products "Physical Products" (39 more blank), so its crawl kept 3
+# rows although 505 titles name exactly one lash or nail leaf; its stockists shelve the same products
+# as "EYELASHES", "Eye lashes", "COSMETICS - EYELASH - CLUSTERS", "NAILS", "Nail Styling",
+# "COSMETICS - NAILS - PRESS ONS" -- a lash/nail shelf no pattern reads as one leaf.
+#
+# The lip door's shape, for the lash and nail leaves only (the lip door stays lip-only): OFF unless a
+# job asks (options.lash_nail_title_evidence), fills ONLY a row everything else left unresolved, and
+# only when the title names ONE leaf and that leaf is a lash or nail leaf. Every row it places is held
+# per row by the detectors (placed_by_lash_nail_title) until someone accepts that row.
+_LASH_NAIL_TITLE_EVIDENCE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "lash_nail_title_evidence", default=False)
+
+
+@contextlib.contextmanager
+def lash_nail_title_evidence():
+    """Enable `_explicit_lash_nail_title_leaf` for the calls inside this block (and tasks they start)."""
+    token = _LASH_NAIL_TITLE_EVIDENCE.set(True)
+    try:
+        yield
+    finally:
+        _LASH_NAIL_TITLE_EVIDENCE.reset(token)
+
+
+# Distinct from every other writer's value (see CATEGORY_CONFIDENCE_LIP_TITLE), so a stored row this door
+# placed can be found without re-running it.
+CATEGORY_CONFIDENCE_LASH_NAIL_TITLE = 0.76
+_LASH_TITLE_LEAVES = frozenset({"beauty/makeup/eye/false-lashes"})
+_NAIL_TITLE_LEAVES = frozenset({"beauty/makeup/nails/nail-polish", "beauty/makeup/nails/nail-polish-remover",
+                                "beauty/makeup/nails/cuticle-oil", "beauty/makeup/nails/press-on-nails"})
+# Types that say nothing about which product this is. NOT the lip door's "lip care"/"lip color" types.
+# "accessories": shopstarbeauty.com shelves every KISS lash and nail there; the title must still name
+# one lash/nail leaf, which no hair clip or bag does.
+_LASH_NAIL_NEUTRAL_TAGS = frozenset({"beauty", "cosmetics", "cosmetic", "makeup", "make up", "misc",
+                                     "miscellaneous", "other", "others", "general", "default",
+                                     "physical products", "physical product", "accessories"})
+# Shelf words that name the lash (or nail) area and nothing more specific than the title does.
+_LASH_AREA_TAGS = frozenset({"lash", "lashes", "eyelash", "eyelashes", "eye lash", "eye lashes",
+                             "false lashes", "false eyelashes", "strip lashes", "strips", "lash clusters",
+                             "clusters"})
+_NAIL_AREA_TAGS = frozenset({"nail", "nails", "nail care", "nail styling", "fake nails", "false nails",
+                             "press ons", "press on nails", "press-on nails", "artificial nails", "manicure",
+                             "pedicure", "nail polish", "nail color", "nail colour", "nail lacquer"})
+# One shelf, written as a path or a list: "COSMETICS - EYELASH - CLUSTERS", "Makeup > Nails", "Nails, KISS".
+_LASH_NAIL_TAG_SPLIT = re.compile(r"\s+-\s+|\s*[>,|/]\s*")
+# Not a lash or nail product at all: merch, cards, stickers, toys, displays, samples, other audiences
+# (the lip door's list, less "base" -- a base coat IS nail polish -- and less the lip-only words) --
+# and a TOOL or ACCESSORY for one, which the lip door refuses through _LIP_ACCESSORY: "Individual Lash
+# Tweezers", "Press On Nails Cuticle Pusher", "Nail Polish Rack Holder" (review of #2377). It costs
+# KISS lashes that list an applicator in the box ("... | 12 Lash Clusters, With Mini Applicator"):
+# they stay unresolved, the safe side.
+_LASH_NAIL_NOT_A_PRODUCT = re.compile(
+    r"\b(?:gift\s*cards?|e-?gift|cards?|posters?|stickers?|decals?|charms?|earrings?|jewel(?:ry|lery)|"
+    r"necklaces?|pendants?|key\s*rings?|keyrings?|key\s*chains?|keychains?|lanyards?|magnets?|ornaments?|"
+    r"toys?|plush|dolls?|squish(?:y|ies)|pretend|puzzles?|games?|costumes?|socks?|wall\s+art|art\s+prints?|"
+    r"dogs?|cats?|pets?|candles?|tumblers?|mugs?|books?|e-?books?|dvd|"
+    r"displays?|stands?|empty|testers?|samples?|swatch(?:es)?|wholesale|bulk|gwp|promo(?:tional)?|"
+    r"bags?|pouch(?:es)?|cases?|organi[sz]ers?|storage|box(?:es)?|trays?|racks?|holders?|openers?|"
+    r"tweezers?|applicators?|pushers?|files?|buffers?|clippers?|cutters?|brush(?:es)?|prep|"
+    r"lamps?|dryers?|drills?)\b", re.I)
+
+
+def _explicit_lash_nail_title_leaf(*, product_type: Optional[str], title: Optional[str]) -> Optional[str]:
+    """The lash or nail leaf a title names outright, or None. The caller asks only for UNRESOLVED rows."""
+    if not _LASH_NAIL_TITLE_EVIDENCE.get():
+        return None
+    text = str(title or "")
+    named = _title_paths(text)
+    if len(named) != 1:
+        # Zero is no evidence; two is ambiguity ("Magnetic Eyeliner & False Eyelashes", "... Collection").
+        return None
+    leaf = next(iter(named))
+    if leaf in _LASH_TITLE_LEAVES:
+        area = _LASH_AREA_TAGS
+    elif leaf in _NAIL_TITLE_LEAVES:
+        area = _NAIL_AREA_TAGS
+    else:
+        return None
+    if _LASH_NAIL_NOT_A_PRODUCT.search(text):
+        return None
+    ptype = " ".join(str(product_type or "").casefold().split())
+    if not ptype:
+        return leaf
+    # Every tag of the merchant's shelf must be neutral or name THIS leaf's area: "Eye lashes" vouches for
+    # a lash, never for a nail; "BROW & LASH TOOLS", "NAIL TOOLS", "Hair Care" say something else.
+    tags = [t for t in _LASH_NAIL_TAG_SPLIT.split(ptype) if t]
+    if tags and all(t in _LASH_NAIL_NEUTRAL_TAGS or t in area for t in tags):
+        return leaf
+    return None
+
+
 def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag_path: str,
                       domain: Optional[str] = None) -> Tuple[str, float]:
     """Resolve, then refuse a FACE skincare leaf for a product that names another body area.
@@ -2001,7 +2092,8 @@ def _resolve_category(*, product_type: Optional[str], title: Optional[str], flag
 def _resolve_category_unguarded(*, product_type: Optional[str], title: Optional[str], flag_path: str,
                                 domain: Optional[str] = None) -> Tuple[str, float]:
     """Evidence policy, then -- ONLY where it left the product unresolved -- a measured host shelf,
-    then an explicit lip title (`_explicit_lip_title_leaf`).
+    then an explicit lip title (`_explicit_lip_title_leaf`), then an explicit lash/nail title
+    (`_explicit_lash_nail_title_leaf`).
 
     Structural no-regression: anything the evidence policy resolves to a leaf, and every
     deliberate refusal (""), is returned untouched. The measured shelf fills only a coarse
@@ -2023,6 +2115,9 @@ def _resolve_category_unguarded(*, product_type: Optional[str], title: Optional[
     leaf = _explicit_lip_title_leaf(product_type=product_type, title=title)
     if leaf:
         return leaf, CATEGORY_CONFIDENCE_LIP_TITLE
+    leaf = _explicit_lash_nail_title_leaf(product_type=product_type, title=title)
+    if leaf:
+        return leaf, CATEGORY_CONFIDENCE_LASH_NAIL_TITLE
     return path, confidence
 
 

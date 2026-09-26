@@ -130,6 +130,24 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"^(?!.*\b(?:polish|lacquer|removers?|" + _AREA_VETO + r")\b).*"
         r"\bpress[-\s]?on\s+(?:nails?|manicures?)\b(?!\s+(?:glue|stickers?|decals?|removers?)\b)",
         re.IGNORECASE | re.DOTALL)),
+    # KISS names its glue-on line "Press On (Fake) Glue Nails" / "Press On Soft Gel Nails" / "Press On
+    # Glue Toenails" (kissusa.com 2026-09-26: ~500 titles matched nothing), so up to three of those words
+    # may sit between "press on" and "(toe)nails". This arm is stricter than the one above: a product
+    # FOR the line ("Nail Glue for Press On Glue Nails", "UV Lamp for Press On Soft Gel Nails") and any
+    # tool, care, kit or bundle word anywhere decline it (review of #2377), so it widens the explicit
+    # phrase to KISS's line names without widening what the phrase above already forgives.
+    ("Press-On Nails", "beauty/makeup/nails/press-on-nails", re.compile(
+        r"^(?!.*\bfor\s+(?:\w+\s+){0,2}press[-\s]?on\b)"
+        r"(?!.*\b(?:polish|lacquer|removers?|(?<!no\s)glue\s+(?!(?:toe)?nails?\b)\w+|adhesives?|tabs?|coats?|oils?|"
+        r"primers?|dehydrators?|lamps?|files?|buffers?|clippers?|pushers?|tweezers?|care|prep|cuticles?|"
+        r"kits?|sets?|bundles?|stickers?|decals?|" + _AREA_VETO + r")\b).*"
+        r"\bpress[-\s]?on\s+(?:(?:fake|false|glue|soft|gel|acrylic)\s+){1,3}(?:(?:toe)?nails?|manicures?)\b"
+        r"(?!\s+(?:art\s+)?(?:glue|stickers?|decals?|removers?)\b)"
+        r"|^(?!.*\bfor\s+(?:\w+\s+){0,2}press[-\s]?on\b)"
+        r"(?!.*\b(?:polish|lacquer|removers?|(?<!no\s)glue|adhesives?|coats?|oils?|lamps?|files?|kits?|sets?|"
+        r"bundles?|care|cuticles?|" + _AREA_VETO + r")\b).*\bpress[-\s]?on\s+toenails?\b"
+        r"(?!\s+(?:art\s+)?(?:glue|stickers?|decals?|removers?)\b)",
+        re.IGNORECASE | re.DOTALL)),
     ("Press-On Nails", "beauty/makeup/nails/press-on-nails", re.compile(
         r"^(?!.*\b(?:polish|lacquer|coats?|powders?|liquids?|monomer|brush(?:es)?|files?|"
         r"clippers?|cutters?|drill|lamp|stickers?|wraps?|decals?|removers?|glue(?![-\s]?on)|care|cuticles?|oils?|"

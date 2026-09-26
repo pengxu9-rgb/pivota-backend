@@ -195,7 +195,8 @@ def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True,
     them: the pipeline computes it before narrowing and passes it as `store_verdict`. Omitted, it is
     judged over `records` themselves -- correct only when they are the whole crawl. A caller re-checking
     rows it already judged passes store_level=False."""
-    from services.curated_brand_feed import CATEGORY_CONFIDENCE_LIP_TITLE, _NON_FACE_TITLE, _title_paths
+    from services.curated_brand_feed import (CATEGORY_CONFIDENCE_LASH_NAIL_TITLE, CATEGORY_CONFIDENCE_LIP_TITLE,
+                                             _NON_FACE_TITLE, _title_paths)
 
     flags: List[Dict[str, Any]] = []
     cohort: List[Dict[str, Any]] = []
@@ -233,6 +234,16 @@ def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True,
                 flags.append(_flag("placed_by_lip_title", BLOCK, record,
                                    "category from the product's own title (--lip-title-evidence); "
                                    "no merchant type vouches for it -- accept this row to apply it"))
+
+        try:
+            lash_nail_door = abs(float(pdp.get("category_confidence")) - CATEGORY_CONFIDENCE_LASH_NAIL_TITLE) < 1e-6
+        except (TypeError, ValueError):
+            lash_nail_door = False
+        if lash_nail_door:
+            # The lip door's rule, for its lash/nail twin: only the title vouches for this row.
+            flags.append(_flag("placed_by_lash_nail_title", BLOCK, record,
+                               "category from the product's own title (options.lash_nail_title_evidence); "
+                               "no merchant type vouches for it -- accept this row to apply it"))
 
         # The title names one or more leaves and the row is filed under none of them: the merchant
         # type (or a measured shelf) and the product's own name disagree. "Essence Toner" on a

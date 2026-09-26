@@ -48,7 +48,8 @@ class _Stop(Exception):
 
 _OPTION_TYPES = {
     "vendors": list, "require_currency": str, "category_path": str, "only_category": str,
-    "only_resolved_category": bool, "lip_title_evidence": bool, "exclude_handles": list,
+    "only_resolved_category": bool, "lip_title_evidence": bool, "lash_nail_title_evidence": bool,
+    "exclude_handles": list,
     # Reviewer decision (Peng 2026-09-25): a bundle of different products the store filed on a
     # single-product shelf ("Cologne & Hand Cream Duo" under fragrance/perfume) is RE-FILED to the
     # gift-set shelf, not dropped -- shoppers look for gift sets; the harm was the shelf. These handles
@@ -578,7 +579,8 @@ def _require_acquisition_is_unserved(market: str) -> None:
 
 
 async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
-    from services.curated_brand_feed import CrawlIncomplete, lip_title_evidence, records_for_brand
+    from services.curated_brand_feed import (CrawlIncomplete, lash_nail_title_evidence, lip_title_evidence,
+                                             records_for_brand)
     import contextlib
 
     _require_acquisition_is_unserved(job_market(job.get("options")))
@@ -591,7 +593,12 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
                                           for k, v in job["options"]["brands"].items()}
     except ValueError as exc:  # e.g. an unknown source_role on a row written by another path
         raise _Stop("invalid_job", "failed", str(exc)) from exc
-    evidence = lip_title_evidence() if (job.get("options") or {}).get("lip_title_evidence") else contextlib.nullcontext()
+    options = job.get("options") or {}
+    evidence = contextlib.ExitStack()
+    if options.get("lip_title_evidence"):
+        evidence.enter_context(lip_title_evidence())
+    if options.get("lash_nail_title_evidence"):
+        evidence.enter_context(lash_nail_title_evidence())
     try:
         with evidence:
             if (job.get("options") or {}).get("source") == "affiliate_feed":
