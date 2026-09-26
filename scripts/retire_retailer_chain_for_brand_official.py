@@ -23,13 +23,15 @@ brand; the brand must own the host (`brand_owns_domain`, the same label-equality
 brand_official lane admits a store by). An `ext:retailer:` key is one listing on one host, so any
 other shape is one this script was not written for.
 
-ORDER. Run this AFTER the brand_official apply for the host has landed (its job is `done`), the
-reverse of retire_superseded_brand_keys (Peng 2026-09-26). Retiring first leaves the store with no live
-offers from the moment of retirement until the apply lands -- the drain queue, a held-flag approval and
-a 20-40 min apply -- whereas the overlap the other order allows is one duplicate seller inside a cluster
-that already exists. `--apply` therefore refuses unless a brand_official retailer_ingest job for the
-host is `done`: the chain is only superseded once something has superseded it. The post-commit refresh
-then rebuilds each cluster's view row with the brand-direct offer alone.
+ORDER. Run this BEFORE the brand_official apply -- the pipeline forces it. The ADR-008 brand-host guard
+(`_existing_brand_canonical_conflict`) finds an UNSUPPRESSED published row of the same brand on the same
+host under another merchant, i.e. exactly this chain (measured 2026-09-26: 131/131 and 97/97 of the
+rows it matched are this cohort, nothing else). The retailer_ingest dry run turns that into a
+`brand_host_guard` flag no approval can accept. The apply stage re-crawls and re-runs the guard live,
+so once this tombstone lands, approve the held job and its apply finds the guard clear. Approve right
+after retiring: from this write until the apply lands the store has no live offers here.
+`--apply` refuses unless a brand_official retailer_ingest job for the host exists (queued, apply_due,
+held or done) -- the chain is only retired for something that will supersede it.
 
 DRY-RUN BY DEFAULT. Nothing is written without --apply. Like every script that refreshes
 agent_pdp_view, the apply's post-commit refresh can issue DDL (see build_agent_pdp_view_row).
@@ -74,8 +76,7 @@ from services.offer_seller_identity import brand_owns_domain  # noqa: E402
 
 REASON = "retailer_chain_superseded_by_brand_official"
 RETAILER_KEY_PREFIX = "ext:retailer:"
-BRAND_OFFICIAL_JOB_STATUSES = ("queued", "apply_due", "held", "done")  # reported by the plan
-SUPERSEDED_STATUS = "done"  # required by --apply: see ORDER
+BRAND_OFFICIAL_JOB_STATUSES = ("queued", "apply_due", "held", "done")
 
 HOST_RETAILER_ROWS_SQL = """
 SELECT product_key, content_key, merchant_id, brand, title, source_domain,
@@ -244,10 +245,8 @@ async def _refresh_and_recompute(content_keys: List[str]) -> Dict[str, int]:
 async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
     if p["problems"]:
         raise SystemExit(f"refused, nothing written: {p['problems']}")
-    done = [j for j in p["brand_official_jobs"] if j.get("status") == SUPERSEDED_STATUS]
-    if not done:
-        raise SystemExit(f"refused, nothing written: no {SUPERSEDED_STATUS} brand_official job for {p['host']} has "
-                         f"superseded this chain yet ({[(j['id'], j['status']) for j in p['brand_official_jobs']]})")
+    if not p["brand_official_jobs"]:
+        raise SystemExit(f"refused, nothing written: no brand_official job for {p['host']} supersedes this chain")
     keys = p["live"]
     if not keys:
         print("nothing live to retire -- no write.")
@@ -256,7 +255,7 @@ async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
     at = datetime.now(timezone.utc).isoformat()
     metadata = json.dumps({
         "run_id": run_id, "reason": REASON, "pr": "pivota-backend#2362", "host": p["host"], "brand": p["brand"],
-        "superseded_by_jobs": [j["id"] for j in done],
+        "superseded_by_jobs": [j["id"] for j in p["brand_official_jobs"]],
         "note": "brand's own store written as a retailer listing chain; re-run as brand_official", "at": at,
     })
     # BEFORE-state first: a manifest written after the write cannot describe what it replaced.
