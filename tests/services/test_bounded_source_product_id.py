@@ -100,3 +100,13 @@ def test_long_names_stay_deterministic_and_distinct():
 @pytest.mark.parametrize("n", [SOURCE_PRODUCT_ID_MAX + 1, 300, 1000])
 def test_any_length_fits(n):
     assert len(bounded_source_product_id("b", "y" * n)) == SOURCE_PRODUCT_ID_MAX
+
+
+def test_a_key_of_exactly_128_still_restates_the_product_key():
+    """The boundary: a live key of exactly 128 chars fits the column, so it must stay byte-identical."""
+    from services.catalog_enrichment_agent.ingestion import canonical_sku_variant_id
+
+    key = "ext:" + "k" * (SOURCE_PRODUCT_ID_MAX - 14) + "::0123abcd"
+    assert len(key) == SOURCE_PRODUCT_ID_MAX
+    assert canonical_sku_variant_id(key, "spid") == key
+    assert canonical_sku_variant_id(key + "x", "spid") == "spid"
