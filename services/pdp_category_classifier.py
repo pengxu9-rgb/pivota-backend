@@ -584,6 +584,11 @@ _NON_FACE_AREAS = (
     ("body", re.compile(r"\bbody\b(?!\s+shop\b)", re.I), "beauty/body/care"),
     ("foot", re.compile(r"\b(?:foot|feet)\b", re.I), "beauty/body/care"),
     ("hair", re.compile(r"\b(?:hair|scalp)\b", re.I), "beauty/haircare/general"),
+    # A curl is hair. Measured in prod 2026-09-26: 9 curl creams ("Curl Cream 100ml", "The Homecurl
+    # Curl-Defining Cream", "Wave Boost Curl Cream") sat on moisturize/cream via the bare "cream"
+    # arm, while the Moroccanoil curl creams whose merchant said "hair" sat on haircare/general.
+    # "curling mascara" is untouched: makeup is not a face SKINCARE leaf, so this rule never runs.
+    ("curl", re.compile(r"\bcurl(?:s|y|ing)?\b", re.I), "beauty/haircare/general"),
     ("lash", re.compile(r"\b(?:eye\s?)?lash(?:es)?\b", re.I), None),
     ("brow", re.compile(r"\b(?:eye)?brows?\b", re.I), None),
     ("nail", re.compile(r"\b(?:nails?|cuticles?)\b", re.I), None),
