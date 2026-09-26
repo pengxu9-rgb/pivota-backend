@@ -41,6 +41,15 @@ def _path(text):
     ("GELement No-Wipe Top Coat", POLISH),               # was a cleanser via "wipe"
     ("Ridge Filling Base Coat", POLISH),
     ("Chrome Nail Powder Silver", POLISH),
+    ("Gel Nail Color", POLISH),                          # re-review: was press-on via "gel nails"
+    ("DND Gel Nail Color #123", POLISH),
+    ("Soak Off Gel Nail Base Coat", POLISH),
+    ("essie Cashmere Matte Nail Polish", POLISH),        # a shade name, not outerwear
+    ("OPI Nail Lacquer - Tweed Your Heart", POLISH),
+    ("essie Cashmere Matte Top Coat", POLISH),           # a nail finish word outranks the shade
+    ("Gel Polish Base Coat & Primer", POLISH),           # a NAIL primer
+    ("Cuticle Oil with Lipids", CUTICLE),                # "lipids" is not the lip area
+    ("Cuticle Oil for 100 Nails", CUTICLE),
     ("Soy Nail Polish Remover With Almond Essential Oil", REMOVER),
     ("Acetone-Free Nail Polish Remover", REMOVER),
     ("Nail Polish Remover Wipes", REMOVER),
@@ -48,8 +57,9 @@ def _path(text):
     ("Good as Gold Cuticle Serum Pen", CUTICLE),
     ("Kiss GoldFinger Snow Queen Limited Edition 24 Nails", PRESS_ON),   # was haircare/general
     ("Press On Nails Short Almond", PRESS_ON),
-    ("Acrylic Nails Kit", PRESS_ON),
     ("Nail Tips Clear 500pcs", PRESS_ON),
+    ("24 Pcs Press On Nails with Glue and Mini File", PRESS_ON),   # accessories listed
+    ("Press-On Nails with Jelly Glue Stickers", PRESS_ON),
     ("KISS Lash Couture Faux Mink Collection", LASHES),
     ("Ardell Wispies Natural Lashes", LASHES),
     ("KISS imPRESS Falsies Press-On Lashes", LASHES),    # lashes, not press-on nails
@@ -84,7 +94,8 @@ def test_lash_and_nail_products_reach_their_leaf(title, want):
     ("Hair Gloss Top Coat", "beauty/haircare/general"),
     # an outerwear top coat stays a coat, straight or curly apostrophe
     ("Men's Wool Top Coat", "fashion/apparel/outerwear/coat"),
-    ("Men’s Cashmere Top Coat", "fashion/apparel/outerwear/coat"),
+    ("Men’s Top Coat", "fashion/apparel/outerwear/coat"),       # the CURLY apostrophe alone
+    ("Women’s Cashmere Top Coat", "fashion/apparel/outerwear/coat"),
     # hand care beats cuticle care, as non_face_leaf rules for "Hand & Nail Cream"
     ("Hand & Cuticle Cream", "beauty/skincare/moisturize/cream"),
     # the narrowed neighbours keep their own rows
@@ -102,6 +113,16 @@ def test_lash_and_nail_products_reach_their_leaf(title, want):
     ("Lash Primer", "beauty/makeup/face/primer"),
     ("Eyelash Curler", None),
     ("Lash Glue Remover", None),
+    # Maybelline's "Falsies" is a mascara line, not false lashes
+    ("Falsies Surreal Extensions Waterproof", None),
+    # acrylic SYSTEMS and nail accessories are not press-on nails (re-review of #2364)
+    ("Acrylic Nails Kit", "beauty/sets/gift-set"),      # "kit", exactly as on main
+    ("Acrylic Nail Powder", None),
+    ("Acrylic Nail Liquid", None),
+    ("Nail Tip Cutter", None),
+    ("Nail Tip Glue", None),
+    ("Nail Tips & Tricks Guide", None),
+    ("10 Nails Care Tips", None),
 ])
 def test_refusing_examples_keep_their_old_leaf(title, want):
     assert _path(title) == want
@@ -110,7 +131,7 @@ def test_refusing_examples_keep_their_old_leaf(title, want):
 @pytest.mark.parametrize("product_type", [
     "Nail Polish", "Nail Lacquer", "Gel Polish", "Top Coat", "Base Coat", "Dip Powder",
     "Nail Polish Remover", "Nail Polish Remover Wipes", "Cuticle Oil", "Press-On Nails",
-    "False Lashes", "Lash Glue",
+    "False Lashes", "Lash Glue", "Gel Nail Color",
     # real merchant types on universalnailsupplies.com that the review found ambiguous
     "Powder Nail Color", "Aprés Gel Color Polish", "Polish Remover", "Acetone Polish Remover",
     "Gel Remover Wipes", "No-Wipe Top Coat",
@@ -134,3 +155,9 @@ def test_a_nail_query_browses_the_nails_prefix():
     assert category_path_prefix_for_query("press on nails") == "beauty/makeup/nails/"
     assert category_path_prefix_for_query("false lashes") == "beauty/makeup/eye/"
     assert category_path_prefix_for_query("face polish") == "beauty/skincare/treat/"
+
+
+def test_an_acrylic_shelf_is_not_press_on_nails():
+    """universalnailsupplies.com types 26 products "Acrylic Nails & Tips": 1 is tips, the rest are
+    acrylic powders and a top coat. The type alone must not file them all as press-on nails."""
+    assert _pattern_matches("Acrylic Nails & Tips") == 0

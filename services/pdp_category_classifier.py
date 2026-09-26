@@ -37,9 +37,20 @@ _SUNSCREEN_RE = re.compile(
 # Shared vetoes for the lash/nail leaves below. A title naming another area is not a nail product
 # first. Spelled like _NON_FACE_AREAS further down -- `(?:eye\s?)?lash`, `(?:eye)?brows?` -- because a
 # bare `\blash\b` never matches "Eyelash" (review of #2364: "Eyelash Top Coat" and "Gel Remover for
-# Eyelash Extensions" both landed on nail leaves). `lip\w*` covers "lipstick", not just "lip".
-_AREA_VETO = r"lip\w*|(?:eye\s?)?lash(?:es)?|(?:eye)?brows?|mascara|eye\s?shadows?|eyeliners?|primers?"
+# Eyelash Extensions" both landed on nail leaves). The lip family is spelled out rather than `lip\w*`,
+# which also caught "lipids" ("Cuticle Oil with Lipids"). PRIMER is not an area: a nail base coat
+# "& Primer" is a nail product, so primer is vetoed only on the coat arm, and only when no nail word
+# is present (_FACE_PRIMER).
+_AREA_VETO = (r"lips?|lip(?:sticks?|gloss(?:es)?|liners?|balms?|tints?|stains?|oils?)"
+              r"|(?:eye\s?)?lash(?:es)?|(?:eye)?brows?|mascara|eye\s?shadows?|eyeliners?")
+# A primer is face makeup unless the title also names the nail: "Base Coat Primer" -> face primer,
+# "Gel Polish Base Coat & Primer" -> nail polish.
+_FACE_PRIMER = r"(?!(?!.*\b(?:nails?|gel|polish|lacquer)\b).*\bprimers?\b)"
 _OUTERWEAR = r"wool|cashmere|tweed|(?:wo)?men[\u2019']?s|trench|parka|jackets?|puffer|overcoats?|outerwear"
+# Outerwear likewise, but a nail finish word outranks a shade name: "essie Cashmere Matte Top Coat" is
+# nail polish, "Men's Wool Top Coat" is a coat.
+_NAIL_CUE = r"nails?|gel|polish|lacquer|matte|quick[-\s]?dry|glossy|shine"
+_NOT_OUTERWEAR = r"(?!(?!.*\b(?:" + _NAIL_CUE + r")\b).*\b(?:" + _OUTERWEAR + r")\b)"
 
 # (category_label, taxonomy_path, regex). Order matters — more specific
 # patterns appear earlier; the first match wins.
@@ -104,14 +115,26 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"perm|removers?|lip\w*)\b).*\b(?:"
         r"(?:false|fake|faux|mink|magnetic|strip|individual|cluster|wispy)\s+(?:eye\s?)?lash(?:es)?"
         r"|(?:eye\s?)?lash\s+(?:clusters?|wisps?|strips?|bands?|glue|adhesive)"
-        r"|falsies|falscara|wispies|faux\s+mink"
+        # Bare "falsies" is also Maybelline's MASCARA line ("Falsies Surreal Extensions"), so only
+        # KISS's lash spellings count.
+        r"|(?:impress|kiss)\s+falsies|falsies\s+(?:press[-\s]?on|lash(?:es)?|clusters?)|falscara|wispies"
+        r"|faux\s+mink"
         r")\b",
         re.IGNORECASE | re.DOTALL)),
+    # Two entries, one path (_pattern_matches counts distinct PATHS, so a type matching both is still
+    # one match). The explicit "press-on nails" phrase wins even when the title lists its glue, file
+    # or stickers ("24 Pcs Press On Nails with Glue and Mini File"); the looser arms -- false/fake
+    # nails, nail tips, "24 Nails" -- decline any accessory, care or tool word. NOT gel/acrylic nails:
+    # "Gel Nail Color" is polish and an "Acrylic Nails & Tips" shelf is mostly powders (review).
     ("Press-On Nails", "beauty/makeup/nails/press-on-nails", re.compile(
-        r"^(?!.*\b(?:polish|lacquer|brush(?:es)?|files?|clippers?|drill|lamp|stickers?|wraps?|"
-        r"decals?|removers?|falsies|" + _AREA_VETO + r")\b).*\b(?:"
-        r"press[-\s]?on(?:\s+nails?)?"
-        r"|(?:false|fake|faux|artificial|acrylic|gel|glue[-\s]?on|stick[-\s]?on)\s+nails?"
+        r"^(?!.*\b(?:polish|lacquer|removers?|" + _AREA_VETO + r")\b).*"
+        r"\bpress[-\s]?on\s+(?:nails?|manicures?)\b",
+        re.IGNORECASE | re.DOTALL)),
+    ("Press-On Nails", "beauty/makeup/nails/press-on-nails", re.compile(
+        r"^(?!.*\b(?:polish|lacquer|colou?rs?|coats?|powders?|liquids?|monomer|brush(?:es)?|files?|"
+        r"clippers?|cutters?|drill|lamp|stickers?|wraps?|decals?|removers?|glue|care|cuticles?|oils?|"
+        r"tricks|guide|falsies|" + _AREA_VETO + r")\b).*\b(?:"
+        r"(?:false|fake|faux|artificial|glue[-\s]?on|stick[-\s]?on)\s+nails?"
         r"|nail\s+tips?|\d+\s*(?:pcs?\s+)?nails"
         r")\b",
         re.IGNORECASE | re.DOTALL)),
@@ -132,12 +155,18 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # the store 2026-09-26) and the product type is classified before the title -- which is also
     # why no hair-brand list is carried here.
     ("Nail Polish", "beauty/makeup/nails/nail-polish", re.compile(
-        r"^(?!.*\b(?:hair|scalp|" + _OUTERWEAR + r"|" + _AREA_VETO + r")\b).*\b(?:"
+        r"^(?!.*\b(?:hair|scalp|" + _AREA_VETO + r")\b).*\b(?:"
         r"nail\s+(?:polish(?:es)?|lacquers?|varnish(?:es)?|enamels?|colou?rs?|paints?)"
         r"|gel\s+(?:nail\s+)?polish(?:es)?|gel\s+(?:nail\s+)?colou?rs?(?:\s+polish(?:es)?)?"
         r"|dip(?:ping)?\s+(?:powders?|systems?|liquids?)|nail\s+dip|chrome\s+(?:nail\s+)?powders?"
-        r"|(?:nail\s+)?(?:top|base)\s+coats?"
         r")\b(?!\s+removers?\b)",
+        re.IGNORECASE | re.DOTALL)),
+    # The bare coat arm is its OWN entry (same path): only a bare "top/base coat" needs the outerwear
+    # and face-primer vetoes -- on the colour arms above they blocked shade names ("essie Cashmere
+    # Matte Nail Polish", "Tweed Your Heart"; review of #2364).
+    ("Nail Polish", "beauty/makeup/nails/nail-polish", re.compile(
+        r"^(?!.*\b(?:hair|scalp|" + _AREA_VETO + r")\b)" + _NOT_OUTERWEAR + _FACE_PRIMER +
+        r".*\b(?:nail\s+)?(?:top|base)\s+coats?\b(?!\s+removers?\b)",
         re.IGNORECASE | re.DOTALL)),
     # Hair-styling tools (VODANA cross-category, beauty x 3C). Negative lookahead
     # vetoes "flat iron spray" / "blow dry primer" / "curl styler cream"; no bare
@@ -390,8 +419,8 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         # A nail TOP/BASE coat is a nail product, not outerwear -- unless the title says outerwear
         # ("Men's Wool Top Coat"), which the Nail Polish pattern declines and this one keeps.
         r"\b((?<!top\s)(?<!base\s)coat|overcoat|trench\s+coat|peacoat|parka)\b"
-        r"|^(?=.*\b(?:" + _OUTERWEAR + r")\b).*\b(?:top|base)\s+coats?\b",
-        re.IGNORECASE)),
+        r"|^(?!.*\b(?:" + _NAIL_CUE + r")\b)(?=.*\b(?:" + _OUTERWEAR + r")\b).*\b(?:top|base)\s+coats?\b",
+        re.IGNORECASE | re.DOTALL)),
     ("Jacket", "fashion/apparel/outerwear/jacket", re.compile(
         r"\b(jacket|blazer|bomber|denim\s+jacket|windbreaker|puffer\s+jacket)\b",
         re.IGNORECASE)),
