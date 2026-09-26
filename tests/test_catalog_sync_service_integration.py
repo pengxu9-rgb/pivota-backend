@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from typing import Any, Dict, List
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -731,9 +733,19 @@ async def test_run_catalog_sync_job_marks_running_then_completes(
         "updated_at": datetime.now(timezone.utc),
     }
     updates = []
+    claims = []
 
     async def fake_get_catalog_sync_job(job_id: str):
         assert job_id == "job_123"
+        return dict(stored)
+
+    async def fake_claim(job_id: str):
+        # The real claim is a conditional UPDATE (pending -> running) that
+        # returns the row only to the winner; model exactly that.
+        claims.append(job_id)
+        if stored["status"] != "pending":
+            return None
+        stored["status"] = "running"
         return dict(stored)
 
     async def fake_upsert(_table, _pk_name, values):
@@ -747,14 +759,124 @@ async def test_run_catalog_sync_job_marks_running_then_completes(
         return {"products_ingested": 2, "skus_ingested": 2, "offers_ingested": 2}
 
     monkeypatch.setattr(module, "get_catalog_sync_job", fake_get_catalog_sync_job)
+    monkeypatch.setattr(module, "claim_catalog_sync_job", fake_claim)
     monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert)
     monkeypatch.setattr(module, "sync_products_cache_to_catalog", fake_sync_products_cache_to_catalog)
 
     result = await module.run_catalog_sync_job("job_123")
 
-    assert updates[0]["status"] == "running"
+    assert claims == ["job_123"]
+    assert stored["status"] == "running"
     assert result["job_id"] == "job_123"
     assert result["status"] == "running" or result["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_run_catalog_sync_job_logs_the_failure_it_only_records_in_the_row(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing ingest must say so in the LOGS, not only in
+    `catalog_sync_jobs.status`.
+
+    On 2026-08-29 a sync that wrote zero rows was invisible except as one
+    `status='failed'` row: this job was handed to a FastAPI BackgroundTask
+    (routes/merchant_store_connections.py), so it ran after the response was
+    sent, and re-raising is not a log line — the exception landed in the ASGI
+    server's handler, outside this service's logging, while the endpoint had
+    already answered `catalog_ingest_queued: true` with a 200. The runner moved
+    out of band since, but a `failed` row still says only THAT it failed.
+    """
+    stored = {
+        "job_id": "job_fail",
+        "merchant_id": "merch_1",
+        "connector": "shopify",
+        "mode": "reconcile",
+        "scope_json": {"platform": "shopify"},
+        "status": "pending",
+        "stats_json": {},
+    }
+    updates = []
+
+    async def fake_get_catalog_sync_job(job_id: str):
+        return dict(stored)
+
+    async def fake_claim(_job_id: str):
+        stored["status"] = "running"
+        return dict(stored)
+
+    async def fake_execute(query, values=None):
+        updates.append((str(query), dict(values or {})))
+
+    async def boom(**_kwargs):
+        raise RuntimeError(
+            'duplicate key value violates unique constraint "beauty_shades_pkey"'
+        )
+
+    monkeypatch.setattr(module, "get_catalog_sync_job", fake_get_catalog_sync_job)
+    monkeypatch.setattr(module, "claim_catalog_sync_job", fake_claim)
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    monkeypatch.setattr(module, "sync_products_cache_to_catalog", boom)
+
+    with caplog.at_level(logging.ERROR, logger=module.logger.name):
+        with pytest.raises(RuntimeError):
+            await module.run_catalog_sync_job("job_fail")
+
+    # The failure is recorded by a conditional UPDATE (see the runner), not by
+    # writing the claimed row back; the real statement is driven in
+    # tests/services/test_catalog_sync_job_claim.py.
+    query, values = updates[-1]
+    assert "SET status = 'failed'" in query and "AND status = 'running'" in query
+    assert values["job_id"] == "job_fail"
+    assert "beauty_shades_pkey" in values["error_message"]
+    failures = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert failures, "the job failed and logged nothing"
+    logged = failures[0].getMessage()
+    assert "job_fail" in logged and "merch_1" in logged, logged
+    assert "beauty_shades_pkey" in logged, logged
+    # logger.exception, not logger.error — without the traceback the log names
+    # the job but not the statement that broke it.
+    assert failures[0].exc_info is not None
+
+
+@pytest.mark.asyncio
+async def test_run_catalog_sync_job_does_not_re_run_a_job_it_did_not_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Losing the claim must not ingest a second time.
+
+    The drain tick and a request handler can both reach the same row. Without
+    the conditional claim, `run_catalog_sync_job` blind-wrote `status='running'`
+    and ingested regardless of who was already working on it.
+    """
+    stored = {
+        "job_id": "job_busy",
+        "merchant_id": "merch_1",
+        "connector": "shopify",
+        "mode": "reconcile",
+        "scope_json": {"platform": "shopify"},
+        "status": "running",
+    }
+    ingested = []
+
+    async def fake_get_catalog_sync_job(job_id: str):
+        return dict(stored)
+
+    async def fake_claim(_job_id: str):
+        return None  # somebody else holds it
+
+    async def fake_sync_products_cache_to_catalog(**kwargs):
+        ingested.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(module, "get_catalog_sync_job", fake_get_catalog_sync_job)
+    monkeypatch.setattr(module, "claim_catalog_sync_job", fake_claim)
+    monkeypatch.setattr(module, "sync_products_cache_to_catalog", fake_sync_products_cache_to_catalog)
+
+    result = await module.run_catalog_sync_job("job_busy")
+
+    assert ingested == [], "a job we did not claim was ingested anyway"
+    assert result["status"] == "running"
 
 
 @pytest.mark.asyncio

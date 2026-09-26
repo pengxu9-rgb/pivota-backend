@@ -33,25 +33,32 @@ name: Postgres Dialect Gate
 # are in no CI job either. That is a separate gap, not one this workflow closes.
 #
 # ── THE ONE GOTCHA ─────────────────────────────────────────────────────────────
-# `db/database.py` selects JSONB_TYPE from DATABASE_URL **at import time**. If
-# DATABASE_URL is not a Postgres URL before pytest imports anything, the modules
-# under test quietly bind generic JSON, the `pytestmark = skipif` in each gate
-# file skips the whole module, and this job goes GREEN having tested nothing.
+# If DATABASE_URL is not a Postgres URL before pytest imports anything, the
+# `pytestmark = skipif` in each gate file skips the whole module and this job
+# goes GREEN having tested nothing. (Until 2026-09-01 it was worse: db/database.py
+# also selected JSONB_TYPE from that URL at import time, so the modules under test
+# quietly bound generic JSON. JSONB_TYPE is now a compile-time variant, so the URL
+# no longer decides the column type — but it still decides whether anything RUNS.)
 # That silent-skip is the only way this gate can lie, so: the preflight step
 # asserts the URL took effect, and the assertion step requires zero skips AND at
 # least one executed test per discovered gate module — `tests > 0` alone is not
 # enough, because the SQLite ride-along below satisfies it on its own.
 #
-# ── AND ITS MIRROR ─────────────────────────────────────────────────────────────
-# The same import-time selection runs the OTHER way here. Because DATABASE_URL is
-# Postgres for this whole job, the JSONB->JSON shim (db/database.py) is skipped,
-# so any test that builds its own SQLite fixture BREAKS under this env:
+# ── AND ITS MIRROR — FIXED 2026-09-01, kept here as the reason for the shape ───
+# The same import-time selection USED TO run the OTHER way here. Because
+# DATABASE_URL is Postgres for this whole job, db/database.py took its
+# `if IS_POSTGRES:` branch and never registered the JSONB->JSON sqlite compiler
+# shim, so any test building its own SQLite fixture BROKE under this env:
 #   tests/test_pdp_content_depth.py, sqlite : 38 passed
 #   tests/test_pdp_content_depth.py, here   :  3 passed, 35 errors
 #     CompileError: SQLiteTypeCompiler can't render element of type JSONB
-# So do NOT add a SQLite-fixture suite to the ride-along list without checking it
-# under a Postgres URL first. tests/test_pdp_renderability.py is on the list
-# precisely because it was checked and passes either way.
+# db/database.py now declares `JSONB_TYPE = JSON().with_variant(JSONB,
+# "postgresql")` and registers the sqlite shims UNCONDITIONALLY, so the type is
+# chosen by the dialect doing the compiling rather than by DATABASE_URL. Both
+# lines above now read 38 passed (measured on PG 15).
+# Adding a SQLite-fixture suite to the ride-along list therefore no longer trips
+# on JSONB/UUID/ARRAY. Still check a new suite under a Postgres URL before adding
+# it — this class of breakage is fixed, not every possible one.
 #
 # ── ADDING A GATE FILE ─────────────────────────────────────────────────────────
 # Name it `tests/test_<something>_postgres.py` and it is picked up automatically.
@@ -111,6 +118,19 @@ on:
       - "core/**"
       - "db/migrations/**"
       - "tests/test_*_postgres.py"
+      # The subprocess entrypoint one stamping-backfill gate test runs `main()` through. It
+      # carries no `test_` prefix (pytest must not collect it), so the glob above misses it,
+      # and a PR touching only this file would not run the one test that executes it. The
+      # narrow-filter warning above, once more.
+      - "tests/backfill_variant_id_provenance_stamps_fault_driver.py"
+      # Same reason, for the Reap cart-link lane. Every case its Postgres gate runs lives in a
+      # shared, non-`test_` module that tests/test_reap_agentic_cart_link_postgres.py collects
+      # by `import *`, and that module imports the validator's accept/refuse table from
+      # tests/test_reap_cart_link.py, which the `_postgres` glob does not match either. A PR
+      # touching only one of these would otherwise skip the gate that runs them on Postgres.
+      - "tests/reap_cart_link_cases.py"
+      - "tests/test_reap_cart_link.py"
+      - "tests/integration/test_recovery_postgres.py"
       # The two files that can neuter this ENTIRE job, neither matched above.
       # tests/conftest.py pins DATABASE_URL — today conditionally, but making
       # that unconditional turns every gate file's `pytestmark` into a skip,
@@ -123,12 +143,29 @@ on:
       # needs its own entry or a change to it would not run its own gate.
       - "tests/test_pdp_renderability.py"
       - "tests/test_databases_textclause_params.py"
+      # Same reason, third ride-along: without its own entry, a PR touching only
+      # this file would not run the job that gives it its Postgres arm — and the
+      # Postgres arm is the half that tests the statements which actually ship.
+      - "tests/test_quality_backfill_partial_update.py"
+      - "tests/test_quality_backfill_enqueue_dedupe.py"
+      # tests/test_tierb_cart_link_eligibility_postgres.py IMPORTS its database cases from these
+      # two (so the storage rules and the mocked end-to-end job run on Postgres). Neither matches
+      # the `_postgres` glob, so a PR touching only them would not run the gate that runs them.
+      - "tests/test_tierb_cart_link_eligibility.py"
+      - "tests/test_tierb_cart_link_eligibility_job.py"
       - "requirements.txt"
       - "requirements-dev.txt"
       - ".github/workflows/postgres-dialect-gate.yml"
 
+# Cancel a SUPERSEDED run on a PR branch only. On main every push is a merge commit whose
+# gate result deploy-prod REQUIRES on that exact SHA (`require a green test sweep`): keying
+# the group on `github.ref` made two merges inside one gate window cancel the first commit's
+# gate, and deploy-prod then refused that deploy as "cancelled before it reached a verdict" --
+# #2115 (cancelled by #2112, 2026-09-07) and #2118 (cancelled by #2123 nine seconds later,
+# 2026-09-08), both green changes. Same key the Backend Test Sweep already uses: a PR number
+# on pull_request, the run id on push, so main runs never share a group.
 concurrency:
-  group: postgres-dialect-gate-${{ github.ref }}
+  group: postgres-dialect-gate-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -185,18 +222,35 @@ jobs:
           if not url.startswith(("postgresql://", "postgres://")):
               sys.exit(f"DATABASE_URL is not a Postgres URL: {url!r}")
 
-          # The import-time selection. If this is plain JSON, every module under
-          # test is bound to the wrong type and the gate proves nothing — which is
-          # precisely the state that let #1588 through, so fail here rather than
-          # pass a green run that tested SQLite semantics against a Postgres URL.
+          # What the modules under test will actually EMIT. If this rendered plain
+          # JSON, every module under test would be bound to the wrong type and the
+          # gate would prove nothing — precisely the state that let #1588 through,
+          # so fail here rather than pass a green run that tested SQLite semantics
+          # against a Postgres URL.
+          #
+          # This was an IDENTITY check (`JSONB_TYPE is JSONB`) while JSONB_TYPE was
+          # selected from DATABASE_URL at import time. It is now a compile-time
+          # variant, so identity is the wrong question — compile it and look. That
+          # is strictly stronger: it asserts the behaviour this gate depends on
+          # rather than the object that used to produce it.
           from db.database import IS_POSTGRES, JSONB_TYPE
-          from sqlalchemy.dialects.postgresql import JSONB
+          from sqlalchemy.dialects import postgresql, sqlite
 
           if not IS_POSTGRES:
               sys.exit("db.database.IS_POSTGRES is False — the URL did not take effect")
-          if JSONB_TYPE is not JSONB:
-              sys.exit(f"JSONB_TYPE is {JSONB_TYPE!r}, expected postgresql.JSONB")
-          print("preflight ok: IS_POSTGRES=True, JSONB_TYPE=postgresql.JSONB")
+
+          pg_ddl = JSONB_TYPE.compile(dialect=postgresql.dialect()).strip()
+          if pg_ddl.upper() != "JSONB":
+              sys.exit(f"JSONB_TYPE compiles to {pg_ddl!r} on postgresql, expected JSONB")
+
+          # The mirror, and the whole reason the variant exists: a Postgres
+          # DATABASE_URL must no longer break a suite that builds its own SQLite
+          # fixture. See "AND ITS MIRROR" in the header.
+          sqlite_ddl = JSONB_TYPE.compile(dialect=sqlite.dialect()).strip()
+          if sqlite_ddl.upper() != "JSON":
+              sys.exit(f"JSONB_TYPE compiles to {sqlite_ddl!r} on sqlite, expected JSON")
+
+          print(f"preflight ok: IS_POSTGRES=True, JSONB_TYPE -> {pg_ddl} (pg) / {sqlite_ddl} (sqlite)")
           PY
 
       - name: Discover gate files
@@ -236,7 +290,32 @@ jobs:
           # this job's path filter — and both known occurrences sat inside
           # `except Exception`, so the symptom was a silent wrong answer rather
           # than a 500 that CI or logs would ever surface.
-          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py; do
+          # test_quality_backfill_partial_update.py rides along because it is the
+          # only thing that executes db/product_quality_backfill_jobs.py's raw
+          # UPDATEs, and the half that ships is the Postgres half. Its statements
+          # are a dialect split -- `CAST(:errors_sample AS JSONB)` on Postgres, a
+          # bare bind on SQLite -- so running it only in backend-test-sweep (which
+          # sets no DATABASE_URL, hence SQLite) exercises the twin and never the
+          # production text. Demonstrated: reintroducing the "a None counter
+          # overwrites a live value" defect in the POSTGRES constant alone left
+          # the sweep, the -k "quality or backfill" selection AND this job's own
+          # PREPARE sweep all green -- PREPARE plans `SET x = $1` happily, and the
+          # SQLite twin is untouched. Renaming it to *_postgres.py is the wrong
+          # fix: backend-test-sweep --ignore-glob's that pattern, so it would swap
+          # the Postgres gap for a SQLite one, and the split needs BOTH sides.
+          # Checked SQLite-safe under this job's Postgres URL, against a jsonb
+          # column and a model-first json one. It DOES declare two skips now
+          # (`skipif(not IS_POSTGRES)`, on cases about asyncpg's datetime
+          # encoding), inert here because IS_POSTGRES is true — the preflight
+          # asserts that — so the zero-skip check below still holds.
+          # KEEP test_quality_backfill_partial_update.py LAST: one of its cases
+          # ALTERs the timestamp columns of product_quality_backfill_jobs and
+          # restores them, so a ride-along added after it would run while that
+          # switch is in flight. test_quality_backfill_enqueue_dedupe.py rides
+          # along for the same reason it exists: the cooldown lookup has a
+          # Postgres twin that is different text from the SQLite one, and its
+          # time-zone cases can only fail here.
+          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py tests/test_quality_backfill_enqueue_dedupe.py tests/test_quality_backfill_partial_update.py; do
             [ -e "$f" ] && files="$files $f"
           done
           echo "files=$files" >> "$GITHUB_OUTPUT"
@@ -325,10 +404,45 @@ jobs:
           print(f"gate modules executed: {', '.join(sorted(ran))}")
           PY
 
+      # AFTER the gate steps, deliberately. This step creates its own
+      # database and runs its own pytest; when it sat before the
+      # preflight/discover/execute/assert chain, a failure in it aborted
+      # the job before the gate those four steps exist to enforce had run
+      # at all — a red build that proves nothing about the dialect gate,
+      # and one whose message points somewhere else entirely. It keeps its
+      # own junit assertion (a skipped recovery test is still a failure).
+      - name: Recovery report JSONB to authenticated HTTP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PYDB'
+          import asyncio
+          import asyncpg
+          async def create_test_database():
+              connection = await asyncpg.connect(
+                  host="localhost", port=5432, user="postgres",
+                  password="postgres", database="postgres")
+              try:
+                  await connection.execute("CREATE DATABASE recovery_contract_test")
+              finally:
+                  await connection.close()
+          asyncio.run(create_test_database())
+          PYDB
+          RUN_RECOVERY_POSTGRES=1 \
+            DATABASE_URL=postgresql://postgres:postgres@localhost:5432/recovery_contract_test \
+            python -m pytest tests/integration/test_recovery_postgres.py -q --junitxml=pytest-recovery-postgres.xml
+          python - <<'PYTEST'
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse("pytest-recovery-postgres.xml").getroot().iter("testcase"))
+          assert cases and not any(c.find("skipped") is not None for c in cases), "Recovery PostgreSQL test did not execute"
+          PYTEST
+
       - name: Upload junit report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: postgres-dialect-gate-${{ github.run_id }}
-          path: pytest-postgres.xml
+          path: |
+            pytest-postgres.xml
+            pytest-recovery-postgres.xml
           retention-days: 14

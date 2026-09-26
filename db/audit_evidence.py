@@ -27,28 +27,34 @@ Phase 4 dual-write strategy:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import (
     ARRAY,
     Boolean, Column, DateTime, Index, Integer, Table, Text,
-    UniqueConstraint,
+    UniqueConstraint, and_, func, or_,
+    select as sa_select,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.sql import expression
 
 from db._ddl_guard import apply_ddl_statements
+from db.schema_guard import guarded_statements
 from db.database import database, metadata
 
 logger = logging.getLogger(__name__)
 
 
 # =====================================================================
-# Evidence type taxonomy. Validated at insert time; rows with an
-# unknown evidence_type are coerced to 'custom' + the original
-# value preserved in payload_jsonb._raw_type so we don't lose data.
+# Evidence type taxonomy. Validated at insert time. `custom` remains
+# available for intentionally free-form evidence, but unknown values are
+# rejected: silently coercing a newly introduced type makes it impossible to
+# query or render correctly.
 # =====================================================================
 
 EVIDENCE_TYPE_GROUNDING_CHUNK = "grounding_chunk"
@@ -56,6 +62,16 @@ EVIDENCE_TYPE_COMPETITOR_MENTION = "competitor_mention"
 EVIDENCE_TYPE_URL_MATCH = "url_match"
 EVIDENCE_TYPE_MISSING_SIGNAL = "missing_signal"
 EVIDENCE_TYPE_INDUSTRY_STAT = "industry_stat"
+EVIDENCE_TYPE_ACCEPTANCE_SIGNAL = "acceptance_signal"
+EVIDENCE_TYPE_COMMERCE_PLATFORM = "commerce_platform"
+EVIDENCE_TYPE_COMMERCE_CHECKOUT_ROUTE = "commerce_checkout_route"
+EVIDENCE_TYPE_COMMERCE_CARTABILITY = "commerce_cartability"
+EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION = (
+    "commerce_integration_authorization"
+)
+EVIDENCE_TYPE_COMMERCE_RETURN_POLICY = "commerce_return_policy"
+EVIDENCE_TYPE_COMMERCE_AFTER_SALES_REVIEW = "commerce_after_sales_review"
+EVIDENCE_TYPE_SELECTION_RESPONSE = "selection_response"
 EVIDENCE_TYPE_CUSTOM = "custom"
 
 VALID_EVIDENCE_TYPES = frozenset({
@@ -64,7 +80,15 @@ VALID_EVIDENCE_TYPES = frozenset({
     EVIDENCE_TYPE_URL_MATCH,
     EVIDENCE_TYPE_MISSING_SIGNAL,
     EVIDENCE_TYPE_INDUSTRY_STAT,
+    EVIDENCE_TYPE_ACCEPTANCE_SIGNAL,
+    EVIDENCE_TYPE_COMMERCE_PLATFORM,
+    EVIDENCE_TYPE_COMMERCE_CHECKOUT_ROUTE,
+    EVIDENCE_TYPE_COMMERCE_CARTABILITY,
+    EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION,
+    EVIDENCE_TYPE_COMMERCE_RETURN_POLICY,
+    EVIDENCE_TYPE_COMMERCE_AFTER_SALES_REVIEW,
     EVIDENCE_TYPE_CUSTOM,
+    EVIDENCE_TYPE_SELECTION_RESPONSE,
 })
 
 
@@ -136,6 +160,15 @@ VERIFIER_GSC_INDEXING_STATUS = "gsc_indexing_status"
 VERIFIER_PIVOTA_INTERNAL_RETRIEVAL = "pivota_internal_retrieval"
 VERIFIER_FRONTEND_AGENT_CITE = "frontend_agent_cite"
 VERIFIER_PUBLIC_LLM_CITATION = "public_llm_citation_movement"
+VERIFIER_UCP_PROBE = "ucp_probe"
+VERIFIER_COMMERCE_CHECKOUT_PROBE = "commerce_checkout_probe"
+
+# Route kinds for the Store Audit UCP lane. "ucp_discovery" is the public
+# intake's placeholder for a domain whose real MCP endpoint is not yet known;
+# the receipt path transitions it into a real "ucp" route and the reprobe
+# selector deliberately never picks placeholders up.
+ROUTE_KIND_UCP = "ucp"
+ROUTE_KIND_UCP_DISCOVERY = "ucp_discovery"
 
 VALID_VERIFIERS = frozenset({
     VERIFIER_PDP_RENDERS, VERIFIER_PDP_IN_SITEMAP,
@@ -143,6 +176,19 @@ VALID_VERIFIERS = frozenset({
     VERIFIER_PIVOTA_INTERNAL_RETRIEVAL,
     VERIFIER_FRONTEND_AGENT_CITE,
     VERIFIER_PUBLIC_LLM_CITATION,
+    VERIFIER_UCP_PROBE,
+    VERIFIER_COMMERCE_CHECKOUT_PROBE,
+})
+
+
+# Store Audit route evidence is intentionally a narrow vocabulary. Evidence
+# level describes the fact captured in evidence_items; verification status is
+# the existing verification_runs work-queue state machine below.
+EVIDENCE_LEVEL_DETECTED = "detected"
+EVIDENCE_LEVEL_TESTED = "tested"
+VALID_EVIDENCE_LEVELS = frozenset({
+    EVIDENCE_LEVEL_DETECTED,
+    EVIDENCE_LEVEL_TESTED,
 })
 
 
@@ -162,6 +208,47 @@ VERIFICATION_STATUS_FAILED = "failed"
 VERIFICATION_STATUS_EXHAUSTED_RETRIES = "exhausted_retries"
 VERIFICATION_STATUS_BLOCKED = "blocked"
 
+# ---------------------------------------------------------------------------
+# THE HONESTY STATES (P0 Tier-1 item 1).
+#
+# Everything above is a WORK-QUEUE lifecycle: it says what the runner did, not
+# what we know. That is why "we never checked" and "there is no row" are the
+# same thing today, and it is exactly how a projection reads absence as a pass —
+# the failure the migration judgment rates Critical. Each state below records a
+# DIFFERENT reason a check produced no verdict, so a reader can tell them apart
+# instead of inferring from silence:
+#
+#   unverified      — the check was never attempted. The state §23 leans on
+#                     hardest ("payment not attempted -> UNVERIFIED"), and the
+#                     one CONVERT SALES needs while its browser worker is
+#                     disarmed: the lane has produced NO production observation,
+#                     and that must be storable rather than absent.
+#   skipped         — deliberately not run for this subject (out of scope, gated
+#                     off, not applicable). A decision, not a failure.
+#   provider_failed — we attempted it and the upstream provider did not answer
+#                     usefully. Distinct from `blocked`, which means the
+#                     upstream is unavailable and a retry is pointless.
+#   unparseable     — the provider answered and we could not read the answer.
+#                     Ours to fix, not theirs; conflating it with
+#                     provider_failed sends the fix to the wrong team.
+#
+# All four are TERMINAL and none is reachable from `pending`: they describe a
+# check that will not be retried, and a row in one of them must never be claimed
+# by a worker. They are deliberately NOT added to VERIFICATION_ACTIVE.
+VERIFICATION_STATUS_UNVERIFIED = "unverified"
+VERIFICATION_STATUS_SKIPPED = "skipped"
+VERIFICATION_STATUS_PROVIDER_FAILED = "provider_failed"
+VERIFICATION_STATUS_UNPARSEABLE = "unparseable"
+
+# The states that mean "no verdict, and here is why" — as opposed to
+# `succeeded`, which is a verdict. A projection must never read any of these as
+# a pass. There is deliberately no "treat as success" set for these to be
+# a member of — the absence IS the contract.
+VERIFICATION_NO_VERDICT = frozenset({
+    VERIFICATION_STATUS_UNVERIFIED, VERIFICATION_STATUS_SKIPPED,
+    VERIFICATION_STATUS_PROVIDER_FAILED, VERIFICATION_STATUS_UNPARSEABLE,
+})
+
 VERIFICATION_ACTIVE = frozenset({
     VERIFICATION_STATUS_PENDING, VERIFICATION_STATUS_CLAIMED,
 })
@@ -169,7 +256,7 @@ VERIFICATION_TERMINAL = frozenset({
     VERIFICATION_STATUS_SUCCEEDED, VERIFICATION_STATUS_FAILED,
     VERIFICATION_STATUS_EXHAUSTED_RETRIES,
     VERIFICATION_STATUS_BLOCKED,
-})
+}) | VERIFICATION_NO_VERDICT
 
 VALID_VERIFICATION_TRANSITIONS: dict = {
     VERIFICATION_STATUS_PENDING: {VERIFICATION_STATUS_CLAIMED},
@@ -178,11 +265,21 @@ VALID_VERIFICATION_TRANSITIONS: dict = {
         VERIFICATION_STATUS_PENDING,
         VERIFICATION_STATUS_EXHAUSTED_RETRIES,
         VERIFICATION_STATUS_BLOCKED,
+        VERIFICATION_STATUS_UNVERIFIED, VERIFICATION_STATUS_SKIPPED,
+        VERIFICATION_STATUS_PROVIDER_FAILED, VERIFICATION_STATUS_UNPARSEABLE,
     },
     VERIFICATION_STATUS_SUCCEEDED: set(),
     VERIFICATION_STATUS_FAILED: set(),
     VERIFICATION_STATUS_EXHAUSTED_RETRIES: set(),
     VERIFICATION_STATUS_BLOCKED: set(),
+    # Terminal, and reachable only from `claimed` — a worker that took the row
+    # and learned it could not produce a verdict. NOT reachable from `pending`:
+    # a row nobody claimed has no finding to record, and allowing it would let
+    # an enqueue write its own conclusion.
+    VERIFICATION_STATUS_UNVERIFIED: set(),
+    VERIFICATION_STATUS_SKIPPED: set(),
+    VERIFICATION_STATUS_PROVIDER_FAILED: set(),
+    VERIFICATION_STATUS_UNPARSEABLE: set(),
 }
 
 
@@ -210,11 +307,18 @@ AUDIENCE_MERCHANT = "merchant"
 AUDIENCE_INTERNAL_OPS = "internal_ops"
 AUDIENCE_PIVOTA_PDP_FEED = "pivota_pdp_feed"
 AUDIENCE_FRONTEND_AGENT_FEED = "frontend_agent_feed"
+# C2. revenue_recovery: the merchant-facing three-stage funnel view.
+# public_anonymous: the ONLY projection an unauthenticated visitor may read,
+# deterministic tier only — see build_public_anonymous_projection for what
+# that excludes and why.
+AUDIENCE_REVENUE_RECOVERY = "revenue_recovery"
+AUDIENCE_PUBLIC_ANONYMOUS = "public_anonymous"
 
 VALID_AUDIENCES = frozenset({
     AUDIENCE_EMPLOYEE_BD, AUDIENCE_MERCHANT,
     AUDIENCE_INTERNAL_OPS, AUDIENCE_PIVOTA_PDP_FEED,
     AUDIENCE_FRONTEND_AGENT_FEED,
+    AUDIENCE_REVENUE_RECOVERY, AUDIENCE_PUBLIC_ANONYMOUS,
 })
 
 # P0-4: role-gated audience access. Merchant JWTs may only read the
@@ -234,7 +338,17 @@ VALID_AUDIENCES = frozenset({
 # follow-up PR can introduce role-aware dependencies; until then
 # the route returns 403 for any audience outside this allow list
 # and the projections stay merchant-invisible.
-MERCHANT_ALLOWED_AUDIENCES = frozenset({AUDIENCE_MERCHANT})
+# revenue_recovery joins it: same merchant, same run, a different arrangement
+# of what they may already read. public_anonymous does NOT need to be here — it
+# is readable WITHOUT auth, and a merchant reading it would only get less.
+MERCHANT_ALLOWED_AUDIENCES = frozenset({
+    AUDIENCE_MERCHANT, AUDIENCE_REVENUE_RECOVERY,
+})
+
+# C2: audiences an UNAUTHENTICATED caller may read. Exactly one, and it is an
+# allowlist for the same reason _SHARE_ALLOWED_TOP_KEYS is: a denylist on an
+# unauthenticated surface ships every future audience by default.
+PUBLIC_ALLOWED_AUDIENCES = frozenset({AUDIENCE_PUBLIC_ANONYMOUS})
 
 
 # =====================================================================
@@ -253,15 +367,45 @@ evidence_items = Table(
     # accretes on the cross-merchant product entity, not just the listing.
     Column("content_key", Text, nullable=True),
     Column("probe_run_id", UUID(as_uuid=False), nullable=True),
+    Column("execution_route_id", UUID(as_uuid=False), nullable=True),
     Column("evidence_type", Text, nullable=False),
+    Column("evidence_level", Text, nullable=True),
     Column("payload_jsonb", JSONB, nullable=False),
     Column("confidence", Integer, nullable=True),
     # P5.8.1: idempotency key — deterministic per (audit, item-sig);
     # paired with partial unique index for ON CONFLICT DO NOTHING.
     Column("idempotency_key", Text, nullable=True),
+    Column("expires_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Index("idx_evidence_items_audit_run", "audit_run_id", "created_at"),
     Index("idx_evidence_items_type", "evidence_type", "audit_run_id"),
+    extend_existing=True,
+)
+
+
+execution_routes = Table(
+    "execution_routes",
+    metadata,
+    Column("execution_route_id", UUID(as_uuid=False), primary_key=True),
+    Column("normalized_domain", Text, nullable=False),
+    Column("route_kind", Text, nullable=False),
+    Column("endpoint_normalized", Text, nullable=False),
+    # Nullable until a prospect converts; route identity is domain-based.
+    Column("merchant_id", Text, nullable=True),
+    Column("claimed_at", DateTime(timezone=True), nullable=True),
+    Column("profile_fingerprint", Text, nullable=True),
+    Column("last_audit_run_id", UUID(as_uuid=False), nullable=True),
+    Column("first_detected_at", DateTime(timezone=True), nullable=False),
+    Column("last_verified_at", DateTime(timezone=True), nullable=True),
+    Column("expires_at", DateTime(timezone=True), nullable=True),
+    Column("is_active", Boolean, nullable=False, server_default="true"),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "normalized_domain", "route_kind", "endpoint_normalized",
+        name="uq_execution_routes_domain_kind_endpoint",
+    ),
+    Index("idx_execution_routes_merchant", "merchant_id", "is_active"),
     extend_existing=True,
 )
 
@@ -321,6 +465,7 @@ verification_runs = Table(
     Column("audit_run_id", UUID(as_uuid=False), nullable=False),
     Column("merchant_id", Text, nullable=True),  # P5.8.7
     Column("product_key", Text, nullable=True),
+    Column("execution_route_id", UUID(as_uuid=False), nullable=True),
     Column("verifier_id", Text, nullable=False),
     Column("status", Text, nullable=False, server_default="pending"),
     Column("evidence_jsonb", JSONB, nullable=True),
@@ -381,6 +526,25 @@ citation_observations = Table(
     Column("is_competitor", Boolean, nullable=True),
     Column("evidence_url", Text, nullable=True),
     Column("content_key_basis", Text, nullable=False),
+    # B3 (migration 209) — where the answer sent the buyer.
+    # destination_rank: the host's zero-based position in THIS response's
+    # citation list. NULLABLE on purpose: a row deposited from a report written
+    # before B3 has no position, and NULL says that, where 0 would falsely claim
+    # "the answer's first citation".
+    Column("destination_rank", Integer, nullable=True),
+    # is_primary_destination: this host was selected as the ONE commerce
+    # destination of this response (services/primary_destination.py). At most one
+    # row per (audit_run_id, content_key, provider, query) may be true; a
+    # response that cited no place to buy has NO true row, which is the real
+    # "no actionable destination" outcome rather than a gap.
+    # NOT NULL + server_default false, and expression.false() rather than the
+    # string "false": SQLAlchemy renders a string Boolean default QUOTED, so
+    # SQLite would store the five-character word and every IS TRUE/IS FALSE
+    # downstream would read it wrong (see tests/model_schema.py).
+    Column(
+        "is_primary_destination", Boolean, nullable=False,
+        server_default=expression.false(),
+    ),
     Column("observed_at", DateTime(timezone=True), nullable=False),
     Column("idempotency_key", Text, nullable=False),
     extend_existing=True,
@@ -395,7 +559,38 @@ _DDL_READY = False
 _DDL_LOCK = asyncio.Lock()
 
 
-_DDL_STATEMENTS = [
+# Guarded on Postgres (db/schema_guard.guarded_statements). Bare, each ALTER took
+# its table's ACCESS EXCLUSIVE lock, and each index build its SHARE lock, BEFORE
+# finding the column or index already there, with no lock_timeout: the first call
+# of every process queued behind any open transaction on the table, and every
+# later reader and writer queued behind it. A guarded statement runs only while
+# its column or index is missing, and one that cannot get its lock within the
+# lock_timeout fails instead, so apply_ddl_statements retries it on a later pass.
+_DDL_STATEMENTS = guarded_statements([
+    # Store Audit Phase 1: domain-keyed routes. merchant_id is deliberately
+    # nullable because cold-start prospects are not merchants yet.
+    """
+    CREATE TABLE IF NOT EXISTS execution_routes (
+        execution_route_id UUID PRIMARY KEY,
+        normalized_domain TEXT NOT NULL,
+        route_kind TEXT NOT NULL,
+        endpoint_normalized TEXT NOT NULL,
+        merchant_id TEXT NULL,
+        claimed_at TIMESTAMPTZ NULL,
+        profile_fingerprint TEXT NULL,
+        last_audit_run_id UUID NULL,
+        first_detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_verified_at TIMESTAMPTZ NULL,
+        expires_at TIMESTAMPTZ NULL,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (normalized_domain, route_kind, endpoint_normalized)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_execution_routes_merchant "
+    "ON execution_routes (merchant_id, is_active) "
+    "WHERE merchant_id IS NOT NULL;",
     # evidence_items
     """
     CREATE TABLE IF NOT EXISTS evidence_items (
@@ -436,6 +631,8 @@ _DDL_STATEMENTS = [
         is_competitor     BOOLEAN NULL,
         evidence_url      TEXT NULL,
         content_key_basis TEXT NOT NULL,
+        destination_rank  INTEGER NULL,
+        is_primary_destination BOOLEAN NOT NULL DEFAULT FALSE,
         observed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         idempotency_key   TEXT NOT NULL
     );
@@ -446,6 +643,20 @@ _DDL_STATEMENTS = [
     "ON citation_observations (content_key, provider, observed_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_citation_observations_run "
     "ON citation_observations (audit_run_id);",
+    # B3 (migration 209): the CREATE TABLE above only carries these on a FRESH
+    # database. An existing citation_observations needs the ALTERs, and both
+    # halves must be present or the migration path and this backstop would build
+    # different schemas.
+    "ALTER TABLE citation_observations "
+    "ADD COLUMN IF NOT EXISTS destination_rank INTEGER NULL;",
+    "ALTER TABLE citation_observations "
+    "ADD COLUMN IF NOT EXISTS is_primary_destination BOOLEAN NOT NULL DEFAULT FALSE;",
+    # Reading the primary destinations of a run is the whole point of B3, and
+    # they are a small minority of rows — a partial index keeps that read off a
+    # full scan without paying for the false rows.
+    "CREATE INDEX IF NOT EXISTS idx_citation_observations_primary_destination "
+    "ON citation_observations (audit_run_id, cited_host) "
+    "WHERE is_primary_destination;",
 
     # readiness_findings
     """
@@ -547,6 +758,17 @@ _DDL_STATEMENTS = [
     "ADD COLUMN IF NOT EXISTS merchant_id TEXT;",
     "ALTER TABLE evidence_items "
     "ADD COLUMN IF NOT EXISTS idempotency_key TEXT;",
+    "ALTER TABLE evidence_items "
+    "ADD COLUMN IF NOT EXISTS execution_route_id UUID;",
+    "ALTER TABLE evidence_items "
+    "ADD COLUMN IF NOT EXISTS evidence_level TEXT;",
+    "ALTER TABLE evidence_items "
+    "ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;",
+    "ALTER TABLE execution_routes "
+    "ADD COLUMN IF NOT EXISTS last_audit_run_id UUID;",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_items_execution_route "
+    "ON evidence_items (execution_route_id, created_at) "
+    "WHERE execution_route_id IS NOT NULL;",
     "CREATE INDEX IF NOT EXISTS idx_evidence_items_merchant "
     "ON evidence_items (merchant_id, audit_run_id) "
     "WHERE merchant_id IS NOT NULL;",
@@ -583,10 +805,24 @@ _DDL_STATEMENTS = [
 
     "ALTER TABLE verification_runs "
     "ADD COLUMN IF NOT EXISTS merchant_id TEXT;",
+    "ALTER TABLE verification_runs "
+    "ADD COLUMN IF NOT EXISTS execution_route_id UUID;",
+    "CREATE INDEX IF NOT EXISTS idx_verification_runs_execution_route "
+    "ON verification_runs (execution_route_id, status, created_at) "
+    "WHERE execution_route_id IS NOT NULL;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_verification_runs_active_route_verifier "
+    "ON verification_runs (execution_route_id, verifier_id) "
+    "WHERE execution_route_id IS NOT NULL "
+    "AND status IN ('pending', 'claimed');",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_verification_runs_active_merchant_commerce_checkout "
+    "ON verification_runs (merchant_id, verifier_id) "
+    "WHERE merchant_id IS NOT NULL "
+    "AND verifier_id = 'commerce_checkout_probe' "
+    "AND status IN ('pending', 'claimed');",
     "CREATE INDEX IF NOT EXISTS idx_verification_runs_merchant "
     "ON verification_runs (merchant_id, audit_run_id) "
     "WHERE merchant_id IS NOT NULL;",
-]
+])
 
 
 async def ensure_audit_evidence_tables() -> None:
@@ -619,13 +855,456 @@ def _now_utc() -> datetime:
 
 
 # =====================================================================
-# Validation helpers — coerce unknown values rather than reject
+# Validation helpers — reject unknown taxonomy values
 # =====================================================================
 
+class UnknownAuditTaxonomyValue(ValueError):
+    """Raised before persistence for an unregistered evidence/verifier type."""
+
+
 def _coerce_evidence_type(t: str) -> str:
+    """Return a registered evidence type or reject an accidental new one.
+
+    `custom` remains an explicit, registered escape hatch. It is never the
+    fallback for a misspelled or unregistered type because that silently loses
+    the querying/rendering contract for that type.
+    """
     if t in VALID_EVIDENCE_TYPES:
         return t
-    return EVIDENCE_TYPE_CUSTOM
+    raise UnknownAuditTaxonomyValue(
+        "unregistered evidence_type: %r; add it to VALID_EVIDENCE_TYPES "
+        "before writing evidence" % (t,)
+    )
+
+
+def _require_known_verifier(verifier_id: str) -> str:
+    """Return a registered verifier id or reject it before queue insertion."""
+    if verifier_id in VALID_VERIFIERS:
+        return verifier_id
+    raise UnknownAuditTaxonomyValue(
+        "unregistered verifier_id: %r; add it to VALID_VERIFIERS "
+        "before enqueueing verification work" % (verifier_id,)
+    )
+
+
+def _validate_route_evidence(
+    *,
+    evidence_type: str,
+    execution_route_id: Optional[str],
+    evidence_level: Optional[str],
+    merchant_id: Optional[str],
+) -> None:
+    """Keep acceptance-signal rows queryable and semantically complete."""
+    if evidence_level is not None and evidence_level not in VALID_EVIDENCE_LEVELS:
+        raise UnknownAuditTaxonomyValue(
+            "unregistered evidence_level: %r; expected one of %s" % (
+                evidence_level, sorted(VALID_EVIDENCE_LEVELS),
+            )
+        )
+    if evidence_type == EVIDENCE_TYPE_ACCEPTANCE_SIGNAL:
+        if not execution_route_id:
+            raise ValueError(
+                "acceptance_signal evidence requires execution_route_id"
+            )
+        if evidence_level is None:
+            raise ValueError(
+                "acceptance_signal evidence requires evidence_level"
+            )
+        if merchant_id and merchant_id.startswith("prospect_"):
+            raise ValueError(
+                "acceptance_signal evidence must not use a synthetic "
+                "prospect merchant_id; link it through execution_route_id"
+            )
+
+
+def normalize_execution_route_identity(
+    *,
+    normalized_domain: str,
+    route_kind: str,
+    endpoint: str,
+) -> tuple[str, str, str]:
+    """Canonicalize the domain + kind + endpoint route identity.
+
+    The caller supplies the commerce domain deliberately: an endpoint may live
+    on a provider host (for example, a Shopify host) rather than the merchant
+    vanity domain. We therefore normalize both values but do not require their
+    hosts to match.
+    """
+    domain = (normalized_domain or "").strip().lower().rstrip(".")
+    if (
+        not domain
+        or "/" in domain
+        or ":" in domain
+        or any(char.isspace() for char in domain)
+    ):
+        raise ValueError("normalized_domain must be a lower-case host only")
+
+    kind = (route_kind or "").strip().lower()
+    if not kind or not all(char.isalnum() or char == "_" for char in kind):
+        raise ValueError("route_kind must use lower-case letters, digits, or _")
+
+    parsed = urlsplit((endpoint or "").strip())
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "endpoint must be an absolute HTTPS URL without credentials, "
+            "query, or fragment"
+        )
+    host = parsed.hostname.lower().rstrip(".")
+    if not host:
+        raise ValueError("endpoint must contain a host")
+    # Port 443 is semantically identical to no explicit port. Other ports are
+    # kept because they are part of the reachable endpoint identity.
+    netloc = host if parsed.port in (None, 443) else f"{host}:{parsed.port}"
+    path = parsed.path.rstrip("/") or "/"
+    endpoint_normalized = urlunsplit(("https", netloc, path, "", ""))
+    return domain, kind, endpoint_normalized
+
+
+def _validate_route_association_merchant_id(merchant_id: Optional[str]) -> None:
+    if merchant_id and merchant_id.startswith("prospect_"):
+        raise ValueError(
+            "execution routes must not be associated with a synthetic "
+            "prospect merchant_id; leave merchant_id NULL until conversion"
+        )
+
+
+async def upsert_execution_route(
+    *,
+    normalized_domain: str,
+    route_kind: str,
+    endpoint: str,
+    merchant_id: Optional[str] = None,
+    profile_fingerprint: Optional[str] = None,
+    audit_run_id: Optional[str] = None,
+    last_verified_at: Optional[datetime] = None,
+    expires_at: Optional[datetime] = None,
+    is_active: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Create or refresh one domain-keyed route without changing ownership.
+
+    The conflict target deliberately excludes merchant_id. If an existing route
+    is unclaimed, a caller must use claim_execution_route after completing its
+    ownership check; discovery must never opportunistically attach or reassign
+    it.
+    """
+    domain, kind, endpoint_normalized = normalize_execution_route_identity(
+        normalized_domain=normalized_domain,
+        route_kind=route_kind,
+        endpoint=endpoint,
+    )
+    _validate_route_association_merchant_id(merchant_id)
+    await ensure_audit_evidence_tables()
+    now = _now_utc()
+    route_id = str(uuid.uuid4())
+    try:
+        row = await database.fetch_one(
+            """
+            INSERT INTO execution_routes (
+                execution_route_id, normalized_domain, route_kind,
+                endpoint_normalized, merchant_id, claimed_at,
+                profile_fingerprint, last_audit_run_id, first_detected_at, last_verified_at,
+                expires_at, is_active, created_at, updated_at
+            ) VALUES (
+                :execution_route_id, :normalized_domain, :route_kind,
+                :endpoint_normalized, :merchant_id,
+                CASE WHEN CAST(:merchant_id AS text) IS NULL THEN NULL ELSE CAST(:now AS timestamptz) END,
+                :profile_fingerprint, :audit_run_id, :now, :last_verified_at,
+                :expires_at, :is_active, :now, :now
+            )
+            ON CONFLICT (normalized_domain, route_kind, endpoint_normalized)
+            DO UPDATE SET
+                profile_fingerprint = COALESCE(
+                    EXCLUDED.profile_fingerprint,
+                    execution_routes.profile_fingerprint
+                ),
+                last_audit_run_id = COALESCE(
+                    EXCLUDED.last_audit_run_id,
+                    execution_routes.last_audit_run_id
+                ),
+                last_verified_at = COALESCE(
+                    EXCLUDED.last_verified_at,
+                    execution_routes.last_verified_at
+                ),
+                expires_at = COALESCE(
+                    EXCLUDED.expires_at, execution_routes.expires_at
+                ),
+                is_active = EXCLUDED.is_active,
+                updated_at = EXCLUDED.updated_at
+            RETURNING execution_route_id, normalized_domain, route_kind,
+                      endpoint_normalized, merchant_id, claimed_at,
+                      profile_fingerprint, first_detected_at,
+                      last_audit_run_id, last_verified_at, expires_at, is_active
+            """,
+            {
+                "execution_route_id": route_id,
+                "normalized_domain": domain,
+                "route_kind": kind,
+                "endpoint_normalized": endpoint_normalized,
+                "merchant_id": merchant_id,
+                "profile_fingerprint": profile_fingerprint,
+                "audit_run_id": audit_run_id,
+                "last_verified_at": last_verified_at,
+                "expires_at": expires_at,
+                "is_active": bool(is_active),
+                "now": now,
+            },
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "upsert_execution_route failed domain=%s kind=%s: %s",
+            domain, kind, str(exc)[:200],
+        )
+        return None
+
+
+async def claim_execution_route(
+    *, execution_route_id: str, merchant_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Claim an unclaimed route, never reassigning one owned by another tenant.
+
+    The caller is responsible for performing the merchant/domain ownership
+    check before this durable write. A NULL result means the route is missing
+    or already belongs to a different merchant.
+    """
+    _validate_route_association_merchant_id(merchant_id)
+    if not execution_route_id or not merchant_id:
+        raise ValueError("execution_route_id and merchant_id are required")
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            """
+            UPDATE execution_routes
+               SET merchant_id = :merchant_id,
+                   claimed_at = COALESCE(claimed_at, :now),
+                   updated_at = :now
+             WHERE execution_route_id = :execution_route_id
+               AND (merchant_id IS NULL OR merchant_id = :merchant_id)
+            RETURNING execution_route_id, normalized_domain, route_kind,
+                      endpoint_normalized, merchant_id, claimed_at,
+                      profile_fingerprint, first_detected_at,
+                      last_audit_run_id, last_verified_at, expires_at, is_active
+            """,
+            {
+                "execution_route_id": execution_route_id,
+                "merchant_id": merchant_id,
+                "now": _now_utc(),
+            },
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "claim_execution_route failed route=%s merchant=%s: %s",
+            execution_route_id, merchant_id, str(exc)[:200],
+        )
+        return None
+
+
+async def fetch_execution_route(
+    *, execution_route_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Fetch one route for an authenticated internal crawl worker."""
+    if not execution_route_id:
+        return None
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            execution_routes.select().where(
+                execution_routes.c.execution_route_id == execution_route_id,
+                execution_routes.c.is_active.is_(True),
+            )
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_execution_route failed route=%s: %s",
+            execution_route_id, str(exc)[:200],
+        )
+        return None
+
+
+async def deactivate_execution_route(
+    *, execution_route_id: str, last_verified_at: datetime,
+) -> bool:
+    """Mark a formerly reachable route inactive after a clean no-route probe."""
+    if not execution_route_id:
+        return False
+    await ensure_audit_evidence_tables()
+    try:
+        result = await database.execute(
+            execution_routes.update()
+            .where(execution_routes.c.execution_route_id == execution_route_id)
+            .values(
+                is_active=False,
+                last_verified_at=last_verified_at,
+                updated_at=_now_utc(),
+            )
+        )
+        return result > 0 if isinstance(result, int) else True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "deactivate_execution_route failed route=%s: %s",
+            execution_route_id, str(exc)[:200],
+        )
+        return False
+
+
+def _clean_domain_kinds(
+    normalized_domain: str, route_kinds: Sequence[str],
+) -> Tuple[str, List[str]]:
+    domain = (normalized_domain or "").strip().lower().rstrip(".")
+    kinds = [k.strip().lower() for k in route_kinds if k and k.strip()]
+    return domain, kinds
+
+
+async def fetch_route_for_domain(
+    *,
+    normalized_domain: str,
+    route_kinds: Sequence[str],
+    include_inactive: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Fetch the freshest route for one domain across the given kinds.
+
+    Domain-keyed on purpose: the public intake and teaser lanes operate before
+    any merchant association exists, so merchant_id must play no part here.
+    include_inactive lets the teaser see a route that a clean "no UCP" probe
+    deactivated — that deactivation IS the negative result.
+    """
+    domain, kinds = _clean_domain_kinds(normalized_domain, route_kinds)
+    if not domain or not kinds:
+        return None
+    await ensure_audit_evidence_tables()
+    conditions = [
+        execution_routes.c.normalized_domain == domain,
+        execution_routes.c.route_kind.in_(kinds),
+    ]
+    if not include_inactive:
+        conditions.append(execution_routes.c.is_active.is_(True))
+    try:
+        row = await database.fetch_one(
+            execution_routes.select()
+            .where(*conditions)
+            .order_by(
+                execution_routes.c.last_verified_at.desc().nullslast(),
+                execution_routes.c.created_at.desc(),
+            )
+            .limit(1)
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_route_for_domain failed domain=%s: %s",
+            domain, str(exc)[:200],
+        )
+        return None
+
+
+async def fetch_latest_route_evidence_for_domain(
+    *, normalized_domain: str, evidence_type: str, route_kinds: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    """Latest evidence row of one type across a domain's routes, expired or
+    not, active or not.
+
+    Expiry stays a read-time decision (see migration 196); the caller compares
+    expires_at itself so stale-positive can be told apart from never-probed."""
+    domain, kinds = _clean_domain_kinds(normalized_domain, route_kinds)
+    if not domain or not kinds:
+        return None
+    await ensure_audit_evidence_tables()
+    try:
+        joined = evidence_items.join(
+            execution_routes,
+            evidence_items.c.execution_route_id
+            == execution_routes.c.execution_route_id,
+        )
+        row = await database.fetch_one(
+            sa_select(evidence_items)
+            .select_from(joined)
+            .where(
+                execution_routes.c.normalized_domain == domain,
+                execution_routes.c.route_kind.in_(kinds),
+                evidence_items.c.evidence_type
+                == _coerce_evidence_type(evidence_type),
+            )
+            .order_by(evidence_items.c.created_at.desc())
+            .limit(1)
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_latest_route_evidence_for_domain failed domain=%s: %s",
+            domain, str(exc)[:200],
+        )
+        return None
+
+
+async def fetch_latest_verification_for_domain(
+    *, normalized_domain: str, verifier_id: str, route_kinds: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    """Latest verification run (any status) across a domain's routes."""
+    domain, kinds = _clean_domain_kinds(normalized_domain, route_kinds)
+    if not domain or not kinds:
+        return None
+    _require_known_verifier(verifier_id)
+    await ensure_audit_evidence_tables()
+    try:
+        joined = verification_runs.join(
+            execution_routes,
+            verification_runs.c.execution_route_id
+            == execution_routes.c.execution_route_id,
+        )
+        row = await database.fetch_one(
+            sa_select(verification_runs)
+            .select_from(joined)
+            .where(
+                execution_routes.c.normalized_domain == domain,
+                execution_routes.c.route_kind.in_(kinds),
+                verification_runs.c.verifier_id == verifier_id,
+            )
+            .order_by(verification_runs.c.created_at.desc())
+            .limit(1)
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_latest_verification_for_domain failed domain=%s: %s",
+            domain, str(exc)[:200],
+        )
+        return None
+
+
+async def count_recent_intake_verifications(
+    *, idempotency_prefix: str, since: datetime,
+) -> int:
+    """Count verification runs minted by the public intake since a cutoff.
+
+    Used as a global daily budget: a prefixed idempotency key marks intake-born
+    runs. Fails closed (max int) so a broken count cannot unbound the lane."""
+    if not idempotency_prefix:
+        return 2**31
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            sa_select(func.count())
+            .select_from(verification_runs)
+            .where(
+                verification_runs.c.idempotency_key.like(f"{idempotency_prefix}%"),
+                verification_runs.c.created_at >= since,
+            )
+        )
+        return int(row[0]) if row else 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "count_recent_intake_verifications failed: %s", str(exc)[:200],
+        )
+        return 2**31
 
 
 def _coerce_severity(s: Optional[str]) -> str:
@@ -664,11 +1343,13 @@ async def insert_evidence_item(
     product_key: Optional[str] = None,
     content_key: Optional[str] = None,
     probe_run_id: Optional[str] = None,
+    execution_route_id: Optional[str] = None,
+    evidence_level: Optional[str] = None,
+    expires_at: Optional[datetime] = None,
     confidence: Optional[int] = None,
     idempotency_key: Optional[str] = None,
 ) -> Optional[str]:
-    """Best-effort write. Unknown evidence_type is coerced to
-    'custom' with the original value preserved in payload_jsonb.
+    """Best-effort database write after strict taxonomy validation.
 
     P5.8.1: merchant_id + idempotency_key plumbed through for
     two-layer tenancy + idempotent re-runs. When idempotency_key
@@ -677,14 +1358,18 @@ async def insert_evidence_item(
     CONFLICT — we catch + return the existing-row marker rather
     than the new uuid.
 
-    Returns the new evidence_id, or None on persistence failure /
-    idempotent skip.
+    Returns the new evidence_id (including the pre-existing id on an
+    idempotent replay), or None on a genuine persistence failure.
     """
-    await ensure_audit_evidence_tables()
     coerced_type = _coerce_evidence_type(evidence_type)
+    _validate_route_evidence(
+        evidence_type=coerced_type,
+        execution_route_id=execution_route_id,
+        evidence_level=evidence_level,
+        merchant_id=merchant_id,
+    )
+    await ensure_audit_evidence_tables()
     safe_payload = dict(payload or {})
-    if coerced_type == EVIDENCE_TYPE_CUSTOM and evidence_type != EVIDENCE_TYPE_CUSTOM:
-        safe_payload["_raw_type"] = evidence_type
     # Coerce UUID / datetime / Decimal at the JSONB write boundary
     # (mirrors upsert_projection's PR #477 fix). Builders sometimes
     # pass-through asyncpg-returned columns; without this, a single
@@ -700,31 +1385,104 @@ async def insert_evidence_item(
                 product_key=product_key,
                 content_key=content_key,
                 probe_run_id=probe_run_id,
+                execution_route_id=execution_route_id,
                 evidence_type=coerced_type,
+                evidence_level=evidence_level,
                 payload_jsonb=safe_payload,
                 confidence=(
                     int(confidence) if confidence is not None else None
                 ),
                 idempotency_key=idempotency_key,
+                expires_at=expires_at,
                 created_at=_now_utc(),
             )
         )
         return evidence_id
     except Exception as exc:  # noqa: BLE001
-        # ON CONFLICT (unique violation on idempotency_key) is the
-        # expected case on re-run. But genuine errors (JSONB
-        # encoder failures, FK violations, etc.) also land here —
-        # and on Railway prod, root logger filters at WARNING so
-        # logger.debug is invisible. Always log at WARNING; the
-        # caller distinguishes "deduped" from "failed" via the
-        # post-insert SELECT it already does.
+        # A retry can race a prior successful insert after the worker lost its
+        # response. Resolve that expected duplicate to the durable row so a
+        # caller can safely continue its terminal verifier transition.
+        if idempotency_key:
+            try:
+                existing = await database.fetch_one(
+                    evidence_items.select()
+                    .with_only_columns(evidence_items.c.evidence_id)
+                    .where(
+                        evidence_items.c.audit_run_id == audit_run_id,
+                        evidence_items.c.idempotency_key == idempotency_key,
+                    )
+                    .limit(1)
+                )
+                if existing is not None:
+                    return str(dict(existing).get("evidence_id") or existing[0])
+            except Exception as lookup_exc:  # noqa: BLE001
+                logger.warning(
+                    "insert_evidence_item duplicate lookup failed "
+                    "audit_run=%s key=%s: %s",
+                    audit_run_id, idempotency_key[:16], str(lookup_exc)[:200],
+                )
+        # The original exception may be a conflict or a real JSONB/FK error.
+        # Keep it visible at WARNING in production either way.
         logger.warning(
-            "insert_evidence_item idempotent-skip or failed "
+            "insert_evidence_item failed "
             "audit_run=%s type=%s key=%s: %s",
             audit_run_id, evidence_type,
             (idempotency_key or "")[:16], str(exc)[:200],
         )
         return None
+
+
+async def fetch_active_commerce_evidence(
+    *, merchant_id: str, now: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Read unexpired Store Audit commerce evidence for one merchant only."""
+    if not merchant_id:
+        return []
+    await ensure_audit_evidence_tables()
+    current = now or _now_utc()
+    rows = await database.fetch_all(
+        evidence_items.select()
+        .where(
+            evidence_items.c.merchant_id == merchant_id,
+            evidence_items.c.evidence_type.in_([
+                EVIDENCE_TYPE_COMMERCE_PLATFORM,
+                EVIDENCE_TYPE_COMMERCE_CHECKOUT_ROUTE,
+                EVIDENCE_TYPE_COMMERCE_CARTABILITY,
+                EVIDENCE_TYPE_COMMERCE_INTEGRATION_AUTHORIZATION,
+            ]),
+            evidence_items.c.expires_at > current,
+        )
+        .order_by(evidence_items.c.created_at.desc())
+    )
+    return [dict(row) for row in rows or []]
+
+
+async def has_in_flight_verification_for_merchant(
+    *, merchant_id: str, verifier_id: str,
+) -> bool:
+    """Whether a remote verifier already owns this merchant audit lane."""
+    if not merchant_id:
+        return False
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            verification_runs.select()
+            .with_only_columns(verification_runs.c.verify_id)
+            .where(
+                verification_runs.c.merchant_id == merchant_id,
+                verification_runs.c.verifier_id == verifier_id,
+                verification_runs.c.status.in_(list(VERIFICATION_ACTIVE)),
+            )
+            .limit(1)
+        )
+        return row is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "has_in_flight_verification_for_merchant failed merchant=%s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        # Fail closed: a transient lookup must not create a second merchant audit.
+        return True
 
 
 async def insert_citation_observation(
@@ -744,12 +1502,20 @@ async def insert_citation_observation(
     first_party: Optional[bool] = None,
     is_competitor: Optional[bool] = None,
     evidence_url: Optional[str] = None,
+    destination_rank: Optional[int] = None,
+    is_primary_destination: Optional[bool] = None,
     idempotency_key: Optional[str] = None,
 ) -> Optional[str]:
     """P0.2 best-effort write of one citation observation. Idempotent via the
     unique index on idempotency_key (a re-run of the same audit collapses to
     the same row). Returns observation_id, or None on failure / idempotent
-    skip — never raises, so it can't take down the audit lifecycle."""
+    skip — never raises, so it can't take down the audit lifecycle.
+
+    B3: `destination_rank` is the host's zero-based position in that response's
+    citation list (None when the source report predates B3);
+    `is_primary_destination` says this host was the ONE commerce destination of
+    the response. The column is NOT NULL, so a caller passing None means "not
+    primary" — an unknown here is a negative, never a null."""
     await ensure_audit_evidence_tables()
     observation_id = str(uuid.uuid4())
     try:
@@ -771,6 +1537,10 @@ async def insert_citation_observation(
                 is_competitor=is_competitor,
                 evidence_url=evidence_url,
                 content_key_basis=content_key_basis,
+                destination_rank=(
+                    None if destination_rank is None else int(destination_rank)
+                ),
+                is_primary_destination=bool(is_primary_destination),
                 observed_at=_now_utc(),
                 idempotency_key=idempotency_key,
             )
@@ -954,19 +1724,15 @@ async def insert_verification_run(
     audit_run_id: str,
     verifier_id: str,
     product_key: Optional[str] = None,
+    execution_route_id: Optional[str] = None,
     status: str = "pending",
     evidence_jsonb: Optional[Dict[str, Any]] = None,
     error_message: Optional[str] = None,
 ) -> Optional[str]:
     """Best-effort write. Phase 5 worker calls this when starting
     a verifier; subsequent transitions go through update_verification_run."""
+    _require_known_verifier(verifier_id)
     await ensure_audit_evidence_tables()
-    if verifier_id not in VALID_VERIFIERS:
-        logger.warning(
-            "insert_verification_run: unknown verifier_id %r "
-            "for audit_run=%s — inserting anyway",
-            verifier_id, audit_run_id,
-        )
     verify_id = str(uuid.uuid4())
     try:
         await database.execute(
@@ -974,6 +1740,7 @@ async def insert_verification_run(
                 verify_id=verify_id,
                 audit_run_id=audit_run_id,
                 product_key=product_key,
+                execution_route_id=execution_route_id,
                 verifier_id=verifier_id,
                 status=status,
                 # JSONB write boundary — coerce UUID/datetime/Decimal
@@ -1097,6 +1864,48 @@ async def list_evidence_for_run(
         )
         return []
     return [dict(r) for r in (rows or [])]
+
+
+async def fetch_latest_commerce_verification_for_merchant(
+    *, merchant_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Latest storefront browser journey for one merchant.
+
+    The merchant API needs the work-queue row even when a probe produced no
+    positive evidence. Reading only evidence_items would turn blocked, failed,
+    and still-running journeys into the same empty state.
+    """
+    if not merchant_id:
+        return None
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            verification_runs.select()
+            .where(
+                verification_runs.c.merchant_id == merchant_id,
+                verification_runs.c.verifier_id
+                == VERIFIER_COMMERCE_CHECKOUT_PROBE,
+            )
+            .order_by(verification_runs.c.created_at.desc())
+            .limit(1)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_latest_commerce_verification_for_merchant failed merchant=%s: %s",
+            merchant_id, str(exc)[:200],
+        )
+        return None
+    if not row:
+        return None
+    value = dict(row)
+    raw = value.get("evidence_jsonb")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            raw = None
+    value["evidence_jsonb"] = raw if isinstance(raw, dict) else {}
+    return value
 
 
 async def list_findings_for_run(
@@ -1242,12 +2051,48 @@ async def find_in_flight_verification_by_idempotency(
         return None
 
 
+async def has_in_flight_verification_for_route(
+    *, execution_route_id: str, verifier_id: str,
+) -> bool:
+    """Whether a route already has active work for this verifier.
+
+    Route re-probes are TTL-driven, so a date-bucketed idempotency key alone
+    is insufficient: a stale active job from yesterday must still prevent a
+    second job for the same endpoint today.
+    """
+    _require_known_verifier(verifier_id)
+    if not execution_route_id:
+        return False
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            verification_runs.select()
+            .with_only_columns(verification_runs.c.verify_id)
+            .where(
+                verification_runs.c.execution_route_id == execution_route_id,
+                verification_runs.c.verifier_id == verifier_id,
+                verification_runs.c.status.in_(list(VERIFICATION_ACTIVE)),
+            )
+            .limit(1)
+        )
+        return row is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "has_in_flight_verification_for_route failed route=%s: %s",
+            execution_route_id, str(exc)[:200],
+        )
+        # Fail closed: a transient lookup failure must not create duplicate
+        # external UCP traffic.
+        return True
+
+
 async def enqueue_verification_run(
     *,
     audit_run_id: str,
     verifier_id: str,
     merchant_id: Optional[str] = None,
     product_key: Optional[str] = None,
+    execution_route_id: Optional[str] = None,
     not_before: Optional[datetime] = None,
     max_retries: int = 2,
     idempotency_key: Optional[str] = None,
@@ -1256,13 +2101,8 @@ async def enqueue_verification_run(
     worker to claim. The enqueue path (P5.7 at audit completion)
     typically calls find_in_flight_verification_by_idempotency
     first to dedupe."""
+    _require_known_verifier(verifier_id)
     await ensure_audit_evidence_tables()
-    if verifier_id not in VALID_VERIFIERS:
-        logger.warning(
-            "enqueue_verification_run: unknown verifier_id %r "
-            "for audit_run=%s — inserting anyway",
-            verifier_id, audit_run_id,
-        )
     verify_id = str(uuid.uuid4())
     try:
         await database.execute(
@@ -1271,6 +2111,7 @@ async def enqueue_verification_run(
                 audit_run_id=audit_run_id,
                 merchant_id=merchant_id,
                 product_key=product_key,
+                execution_route_id=execution_route_id,
                 verifier_id=verifier_id,
                 status=VERIFICATION_STATUS_PENDING,
                 not_before=not_before,
@@ -1292,6 +2133,8 @@ async def claim_next_pending_verification(
     *,
     worker_id: str,
     lease_seconds: int = DEFAULT_VERIFICATION_LEASE_SECONDS,
+    verifier_id: Optional[str] = None,
+    exclude_remote_verifiers: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Atomically claim the oldest pending or stale-leased
     verification. Skips rows where not_before > NOW() (the citation
@@ -1314,6 +2157,14 @@ async def claim_next_pending_verification(
                FROM verification_runs
               WHERE status IN ('pending', 'claimed')
                 AND (
+                    CAST(:verifier_id AS text) IS NULL
+                 OR verifier_id = CAST(:verifier_id AS text)
+                )
+                AND (
+                    :exclude_remote_verifiers IS FALSE
+                    OR verifier_id NOT IN ('ucp_probe', 'commerce_checkout_probe')
+                )
+                AND (
                     claimed_until IS NULL
                  OR claimed_until < :now
                 )
@@ -1325,14 +2176,21 @@ async def claim_next_pending_verification(
               FOR UPDATE SKIP LOCKED
               LIMIT 1
          )
-        RETURNING verify_id, audit_run_id, product_key, verifier_id,
+        RETURNING verify_id, audit_run_id, merchant_id, product_key,
+                  execution_route_id, verifier_id,
                   retry_count, max_retries, idempotency_key,
                   created_at
     """
     try:
         row = await database.fetch_one(
             query,
-            {"worker_id": worker_id, "new_until": new_until, "now": now},
+            {
+                "worker_id": worker_id,
+                "new_until": new_until,
+                "now": now,
+                "verifier_id": verifier_id,
+                "exclude_remote_verifiers": bool(exclude_remote_verifiers),
+            },
         )
         if row is None:
             return None
@@ -1343,7 +2201,12 @@ async def claim_next_pending_verification(
                 str(d.get("audit_run_id"))
                 if d.get("audit_run_id") else None
             ),
+            "merchant_id": d.get("merchant_id"),
             "product_key": d.get("product_key"),
+            "execution_route_id": (
+                str(d.get("execution_route_id"))
+                if d.get("execution_route_id") else None
+            ),
             "verifier_id": d.get("verifier_id"),
             "retry_count": int(d.get("retry_count") or 0),
             "max_retries": int(d.get("max_retries") or 2),
@@ -1360,6 +2223,97 @@ async def claim_next_pending_verification(
             worker_id, str(exc)[:200],
         )
         return None
+
+
+async def get_claimed_verification_run(
+    *, verify_id: str, worker_id: str, verifier_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Return a verifier job only while its worker lease is valid.
+
+    Receipt endpoints use this before accepting a result from a remote worker.
+    It keeps the work-queue's claim boundary authoritative: knowing a UUID is
+    not enough to read or complete another worker's verification.
+    """
+    _require_known_verifier(verifier_id)
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            verification_runs.select().where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.verifier_id == verifier_id,
+                verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
+                verification_runs.c.claimed_by_worker == worker_id,
+                verification_runs.c.claimed_until > _now_utc(),
+            )
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "get_claimed_verification_run failed verify=%s: %s",
+            verify_id, str(exc)[:200],
+        )
+        return None
+
+
+async def get_verification_run_for_worker(
+    *, verify_id: str, worker_id: str, verifier_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Read one verifier row bound to its original worker identity.
+
+    This narrow lookup exists solely for idempotent receipt acknowledgement
+    after a network timeout: a terminal row still retains ``claimed_by_worker``
+    while a retryable failure clears it before returning to ``pending``.
+    """
+    _require_known_verifier(verifier_id)
+    await ensure_audit_evidence_tables()
+    try:
+        row = await database.fetch_one(
+            verification_runs.select().where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.verifier_id == verifier_id,
+                verification_runs.c.claimed_by_worker == worker_id,
+            )
+        )
+        return dict(row) if row else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "get_verification_run_for_worker failed verify=%s: %s",
+            verify_id, str(exc)[:200],
+        )
+        return None
+
+
+async def attach_execution_route_to_claimed_verification(
+    *, verify_id: str, worker_id: str, execution_route_id: str,
+) -> bool:
+    """Associate a discovered route before terminally completing a job.
+
+    The row must still be claimed by ``worker_id``. This makes the route
+    association subject to the same ownership check as the result transition.
+    """
+    await ensure_audit_evidence_tables()
+    now = _now_utc()
+    try:
+        result = await database.execute(
+            verification_runs.update()
+            .where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
+                verification_runs.c.claimed_by_worker == worker_id,
+                verification_runs.c.claimed_until > now,
+            )
+            .values(execution_route_id=execution_route_id)
+        )
+        if isinstance(result, int):
+            return result > 0
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "attach_execution_route_to_claimed_verification failed "
+            "verify=%s route=%s: %s",
+            verify_id, execution_route_id, str(exc)[:200],
+        )
+        return False
 
 
 async def mark_verification_succeeded(
@@ -1385,6 +2339,7 @@ async def mark_verification_succeeded(
                 verification_runs.c.verify_id == verify_id,
                 verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
                 verification_runs.c.claimed_by_worker == worker_id,
+                verification_runs.c.claimed_until > now,
             )
             .values(**values)
         )
@@ -1395,6 +2350,94 @@ async def mark_verification_succeeded(
         logger.warning(
             "mark_verification_succeeded failed for verify=%s: %s",
             verify_id, str(exc)[:200],
+        )
+        return False
+
+
+async def mark_verification_no_verdict(
+    *,
+    verify_id: str,
+    worker_id: str,
+    status: str,
+    reason: str,
+    evidence_jsonb: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Terminal "no verdict, and here is why" transition.
+
+    The four states exist so a reader can tell "we never checked" from "we
+    checked and it was fine" — but a constant nothing can write is not storable,
+    and until this function existed the vocabulary had no producer at all.
+
+    `reason` is REQUIRED and non-empty. The whole point of these states is that
+    the row explains itself; one written without a reason reproduces the silence
+    the states were added to remove, one column over. It is stored inside
+    evidence_jsonb rather than in a new column so this needs no migration.
+
+    Guarded on worker ownership exactly like the other terminal transitions, and
+    reachable ONLY from `claimed`: a worker took the row and learned it could not
+    produce a verdict. A row still `pending` has not been attempted, so nothing
+    yet knows it has no verdict — that is a different fact, and giving it this
+    state here would be a claim we cannot support.
+    """
+    await ensure_audit_evidence_tables()
+    if status not in VERIFICATION_NO_VERDICT:
+        # Refuse rather than coerce: silently writing `succeeded` for a caller
+        # that meant `unparseable` is precisely the pass-by-absence this whole
+        # item removes.
+        logger.warning(
+            "mark_verification_no_verdict refused status=%r for verify=%s "
+            "(expected one of %s)",
+            status, verify_id, sorted(VERIFICATION_NO_VERDICT),
+        )
+        return False
+    if not (reason or "").strip():
+        logger.warning(
+            "mark_verification_no_verdict refused an empty reason for "
+            "verify=%s status=%s", verify_id, status,
+        )
+        return False
+
+    now = _now_utc()
+    clean_reason = reason.strip()[:2000]
+    values: Dict[str, Any] = {
+        "status": status,
+        "completed_at": now,
+        "last_checked_at": now,
+        # The reason goes in error_message, NOT only in evidence_jsonb: the live
+        # ops rollup (scripts/diagnose_store_audit_lane.py) groups by
+        # (status, error_message), so a reason hidden in JSONB shows there as
+        # NULL — invisible on the one surface an operator actually reads.
+        # Truncated at 2000 to match every other free-text field in this module.
+        "error_message": clean_reason,
+    }
+    if evidence_jsonb is not None:
+        # Written ONLY when the caller supplies one, exactly like
+        # mark_verification_succeeded and _blocked. Building a payload
+        # unconditionally would REPLACE the column, so a row that had partial
+        # verifier output would lose it — the one semantic where this writer
+        # diverged from all three siblings, and it diverged toward data loss.
+        values["evidence_jsonb"] = _json_safe({
+            **evidence_jsonb,
+            "no_verdict_reason": clean_reason,
+        })
+    try:
+        result = await database.execute(
+            verification_runs.update()
+            .where(
+                verification_runs.c.verify_id == verify_id,
+                verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
+                verification_runs.c.claimed_by_worker == worker_id,
+                verification_runs.c.claimed_until > now,
+            )
+            .values(**values)
+        )
+        if isinstance(result, int):
+            return result > 0
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "mark_verification_no_verdict failed for verify=%s status=%s: %s",
+            verify_id, status, str(exc)[:200],
         )
         return False
 
@@ -1429,6 +2472,7 @@ async def mark_verification_blocked(
                 verification_runs.c.verify_id == verify_id,
                 verification_runs.c.status == VERIFICATION_STATUS_CLAIMED,
                 verification_runs.c.claimed_by_worker == worker_id,
+                verification_runs.c.claimed_until > now,
             )
             .values(**values)
         )
@@ -1489,6 +2533,7 @@ async def mark_verification_failed_with_retry(
          WHERE verify_id = :verify_id
            AND status = 'claimed'
            AND claimed_by_worker = :worker_id
+           AND claimed_until > :now
          RETURNING status
     """
     import json as _json
@@ -1608,3 +2653,193 @@ async def list_verifications_for_run(
         )
         return []
     return [dict(r) for r in (rows or [])]
+
+
+# =====================================================================
+# Store Audit lane diagnostics (admin-only reads)
+# =====================================================================
+
+
+async def fetch_verification_history_for_domain(
+    *,
+    normalized_domain: str,
+    verifier_id: str,
+    route_kinds: Sequence[str],
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Recent verification runs for a domain, WITH the failure reason.
+
+    fetch_latest_verification_for_domain answers the teaser's question ("is
+    there a fresh positive?") and deliberately carries none of the diagnosis.
+    This carries the diagnosis and nothing else: when a probe reports `blocked`,
+    the reason exists ONLY in verification_runs.error_message / evidence_jsonb,
+    the Cloud Run worker logs it nowhere (by design — it must never render
+    endpoints or receipt bodies), and Cloud SQL is private-IP only. Without this
+    the question "why did this store's probe fail?" is unanswerable from
+    outside the VPC, which is how four separate hypotheses got eliminated by
+    guesswork instead of by looking.
+
+    Raises nothing and returns [] on failure — but note the caller must NOT read
+    [] as "this domain has never been probed": the two are indistinguishable
+    here, and the endpoint says so in its response.
+    """
+    domain, kinds = _clean_domain_kinds(normalized_domain, route_kinds)
+    if not domain or not kinds:
+        return []
+    _require_known_verifier(verifier_id)
+    await ensure_audit_evidence_tables()
+    bounded = max(1, min(int(limit or 10), 50))
+    try:
+        joined = verification_runs.join(
+            execution_routes,
+            verification_runs.c.execution_route_id
+            == execution_routes.c.execution_route_id,
+        )
+        rows = await database.fetch_all(
+            sa_select(
+                verification_runs.c.verify_id,
+                verification_runs.c.audit_run_id,
+                verification_runs.c.status,
+                verification_runs.c.error_message,
+                verification_runs.c.evidence_jsonb,
+                verification_runs.c.retry_count,
+                verification_runs.c.max_retries,
+                verification_runs.c.product_key,
+                verification_runs.c.created_at,
+                verification_runs.c.completed_at,
+                verification_runs.c.claimed_by_worker,
+                execution_routes.c.execution_route_id,
+                execution_routes.c.route_kind,
+                execution_routes.c.endpoint_normalized,
+                execution_routes.c.is_active,
+                execution_routes.c.merchant_id.label("route_merchant_id"),
+            )
+            .select_from(joined)
+            .where(
+                and_(
+                    execution_routes.c.normalized_domain == domain,
+                    execution_routes.c.route_kind.in_(kinds),
+                    verification_runs.c.verifier_id == verifier_id,
+                )
+            )
+            .order_by(verification_runs.c.created_at.desc())
+            .limit(bounded)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fetch_verification_history_for_domain failed for %s: %s",
+            domain, str(exc)[:200],
+        )
+        return []
+    return [dict(r) for r in (rows or [])]
+
+
+async def summarize_ucp_route_merchant_coverage() -> Dict[str, int]:
+    """How many active UCP routes could ever reach the checkout-tested tier.
+
+    The tier needs a route whose domain some merchant has PROVEN is theirs
+    (merchant_official_domains, verified status + brand-bound source + not
+    dead). Nobody has been able to show that this join returns anything, and
+    the distinction matters: `variant_carried: 0` in the reprobe summary reads
+    identically whether the answer is "no merchant has claimed a probed domain"
+    or "the feature is broken". This separates them BEFORE the flag is flipped.
+
+    ONE RESIDUAL GAP, stated rather than hidden: this reproduces every
+    ASSOCIATION condition the gate applies, but not the last step — whether the
+    merchant's catalogue actually yields an in-stock Shopify variant
+    (select_probe_variant_gid). The number is therefore exact for "routes whose
+    merchant association qualifies" and an upper bound on routes that will
+    carry a variant. The endpoint's note says so.
+    """
+    from db.merchant_official_domains import (
+        ensure_merchant_official_domains_table,
+        merchant_official_domains,
+        LIVENESS_DEAD,
+        SOURCE_VERIFIED,
+        VERIFICATION_VERIFIED,
+    )
+
+    await ensure_audit_evidence_tables()
+    await ensure_merchant_official_domains_table()
+    out = {"active_ucp_routes": 0, "routes_with_proven_merchant": 0}
+    try:
+        total = await database.fetch_one(
+            sa_select(func.count())
+            .select_from(execution_routes)
+            .where(
+                and_(
+                    execution_routes.c.route_kind == ROUTE_KIND_UCP,
+                    execution_routes.c.is_active.is_(True),
+                )
+            )
+        )
+        # row[0], NOT row.values(): databases==0.7.0's sqlite Record is a bare
+        # Sequence with no .values(), so that spelling raised inside the try and
+        # this function answered "lookup FAILED" on every sqlite call — while
+        # asyncpg happens to carry the method (deprecated), so Postgres hid it.
+        out["active_ucp_routes"] = int(total[0] if total else 0)
+
+        # THE GATE IS NOT ONE PREDICATE, and an earlier cut counted as though it
+        # were. jobs/scheduled_ucp_reprobe_job also requires the domain resolve
+        # to exactly ONE merchant, that merchant to have exactly ONE proven
+        # domain (canonical_variants has no store key, so a two-storefront
+        # merchant is refused), and the route to carry a last_audit_run_id for
+        # list_due_ucp_routes to pick it up at all. Counting only the shared
+        # WHERE made `2` mean "the tier will fire twice" when the true answer
+        # was zero — the exact ambiguity this endpoint exists to remove.
+        proven = (
+            sa_select(
+                merchant_official_domains.c.domain.label("domain"),
+                merchant_official_domains.c.merchant_id.label("merchant_id"),
+            )
+            .where(
+                and_(
+                    merchant_official_domains.c.verification_status
+                    == VERIFICATION_VERIFIED,
+                    merchant_official_domains.c.source == SOURCE_VERIFIED,
+                    or_(
+                        merchant_official_domains.c.liveness_status.is_(None),
+                        merchant_official_domains.c.liveness_status != LIVENESS_DEAD,
+                    ),
+                )
+            )
+            .subquery()
+        )
+        sole_domain = (
+            sa_select(proven.c.domain.label("domain"))
+            .group_by(proven.c.domain)
+            .having(func.count(func.distinct(proven.c.merchant_id)) == 1)
+            .subquery()
+        )
+        sole_merchant = (
+            sa_select(proven.c.merchant_id.label("merchant_id"))
+            .group_by(proven.c.merchant_id)
+            .having(func.count(func.distinct(proven.c.domain)) == 1)
+            .subquery()
+        )
+        matched = await database.fetch_one(
+            sa_select(func.count(func.distinct(execution_routes.c.execution_route_id)))
+            .select_from(
+                execution_routes
+                .join(proven, proven.c.domain == execution_routes.c.normalized_domain)
+                .join(sole_domain, sole_domain.c.domain == proven.c.domain)
+                .join(
+                    sole_merchant,
+                    sole_merchant.c.merchant_id == proven.c.merchant_id,
+                )
+            )
+            .where(
+                and_(
+                    execution_routes.c.route_kind == ROUTE_KIND_UCP,
+                    execution_routes.c.is_active.is_(True),
+                    execution_routes.c.last_audit_run_id.isnot(None),
+                )
+            )
+        )
+        out["routes_with_proven_merchant"] = int(matched[0] if matched else 0)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "summarize_ucp_route_merchant_coverage failed: %s", str(exc)[:200]
+        )
+        return {"active_ucp_routes": -1, "routes_with_proven_merchant": -1}
+    return out

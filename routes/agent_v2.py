@@ -36,6 +36,7 @@ from services.psp_capabilities import get_psp_capabilities
 from services.quote_service import QuoteError, QuoteService
 from services.refund_observability import build_order_refund_tracking_payload
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
+from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 
 
 router = APIRouter(prefix="/agent/v2", tags=["agent-v2"])
@@ -67,11 +68,12 @@ class SearchProductsRequest(BaseModel):
     merchant_ids: Optional[List[str]] = None
     search_all_merchants: bool = False
     query: Optional[str] = None
+    market: Optional[str] = None
     category: Optional[str] = None
     catalog_surface: Optional[str] = None
     min_price: Optional[float] = None
     max_price: Optional[float] = None
-    in_stock_only: bool = True
+    in_stock_only: bool = False
     limit: int = Field(default=20, ge=1, le=200)
     offset: int = Field(default=0, ge=0)
     allow_external_seed: bool = True
@@ -344,11 +346,33 @@ def _shipping_summary_from_product(product: Dict[str, Any]) -> Dict[str, Any]:
     return summary
 
 
+def _product_offer_in_stock(product: Dict[str, Any]) -> Optional[bool]:
+    """The product-level stock an offer falls back to: a real boolean, None when unknown.
+
+    The external-seed builders (services/external_seed_stock.seed_stock_fields) serve
+    a seed with no stock claim of its own as `availability: "unknown"` and NO
+    `in_stock` key. The legacy default below read that as in stock. Unknown is
+    published as null, never folded into False (a sold-out claim) either; the
+    gateway's canonical flattener reads only a boolean and otherwise falls through.
+    Every other shape keeps the legacy default unchanged.
+    """
+    if (
+        product.get("in_stock") is None
+        and str(product.get("availability") or "").strip().lower() == "unknown"
+    ):
+        return None
+    return bool(product.get("in_stock", True))
+
+
 def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
     merchant_id = str(product.get("merchant_id") or "").strip()
     product_id = str(product.get("product_id") or product.get("id") or "").strip()
     variants = product.get("variants")
     normalized_variants: List[Dict[str, Any]] = []
+    # The raw variant behind each normalized one (None for the synthesized default),
+    # kept aside so its commerce facts price its own offer without widening the
+    # public `variants` shape.
+    raw_variants: List[Optional[Dict[str, Any]]] = []
     if isinstance(variants, list) and variants:
         for raw_variant in variants:
             if not isinstance(raw_variant, dict):
@@ -367,6 +391,7 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
                     "variant_attributes": _normalize_variant_attributes(raw_variant),
                 }
             )
+            raw_variants.append(raw_variant)
     else:
         normalized_variants.append(
             {
@@ -374,10 +399,65 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
                 "variant_attributes": {},
             }
         )
+        raw_variants.append(None)
+
+    # A row whose commerce facts need live verification (the external-seed builder
+    # in agent_api withholds price and stock on purpose) must stay UNKNOWN here.
+    # This used to print the withheld price as "0" and the withheld stock as
+    # in_stock: true, and drop the mark saying why -- measured on prod 2026-09-24,
+    # "Round Lab" served five rows at "0" whose seeds carry real prices, one of
+    # them out of stock. Keyed on ABSENCE / the explicit mark, never falsiness: a
+    # real 0.00 price and a real in_stock: false pass through unchanged.
+    verification = product.get("commerce_verification")
+    verification = dict(verification) if isinstance(verification, dict) else None
+    live_verification_required = bool(verification and verification.get("required") is True)
+    product_price = product.get("price")
+    product_currency = product.get("currency")
+    product_in_stock = _product_offer_in_stock(product)
+    product_inventory_quantity = product.get("inventory_quantity")
 
     offers: List[Dict[str, Any]] = []
-    for variant in normalized_variants:
+    for variant, raw_variant in zip(normalized_variants, raw_variants):
         variant_id = variant["variant_id"]
+        # Each offer is priced from ITS OWN variant; the product-level value is only
+        # the fallback for a variant that carries none. This used to price every
+        # offer from the product (= the first variant for external seeds) --
+        # measured 2026-09-24, eyurs.com Round Lab variants [2.5, 18.0] served as
+        # two offers both at "2.5". Currency travels with whichever price is used.
+        raw = raw_variant or {}
+        variant_price = raw.get("price")
+        if variant_price is not None and variant_price != "":
+            raw_price = variant_price
+            currency = raw.get("currency") or raw.get("price_currency") or product_currency
+        else:
+            raw_price = product_price
+            currency = product_currency
+        # Stock is read only from an explicit variant `in_stock` bool (the external
+        # seed builder's key). Internal StandardProductVariant rows carry
+        # `inventory_quantity` defaulting to 0 even when untracked, so it is not a
+        # stock claim on its own; the quantity travels with the in_stock it matches.
+        # Under an UNKNOWN product a variant's bool may be inherited, not observed
+        # (the seed builders default a no-signal variant to in stock), so it counts
+        # only when the variant carries a KNOWN availability of its own. "" and
+        # unrecognised strings are copied onto the variant too, so presence is not enough.
+        variant_in_stock = raw.get("in_stock")
+        own_stock_signal = isinstance(variant_in_stock, bool) and (
+            product_in_stock is not None
+            or normalize_availability(raw.get("availability")) in (IN_STOCK, OUT_OF_STOCK)
+        )
+        if own_stock_signal:
+            in_stock = variant_in_stock
+            inventory_quantity = raw.get("inventory_quantity", product_inventory_quantity)
+        else:
+            in_stock = product_in_stock
+            inventory_quantity = product_inventory_quantity
+        if live_verification_required:
+            # The mark wins over every per-variant fact too.
+            offer_price = None
+            in_stock = None
+            inventory_quantity = product_inventory_quantity
+        else:
+            offer_price = None if raw_price is None else _money_str(raw_price)
         offer_id = str(
             product.get("offer_id") or f"offer::{merchant_id or 'merchant_unknown'}::{variant_id}"
         )
@@ -387,11 +467,11 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
                 "merchant_id": merchant_id,
                 "variant_id": variant_id,
                 "merchant_sku": product.get("sku"),
-                "price": _money_str(product.get("price")),
-                "currency": product.get("currency") or "USD",
+                "price": offer_price,
+                "currency": currency or "USD",
                 "availability": {
-                    "in_stock": bool(product.get("in_stock", True)),
-                    "inventory_quantity": product.get("inventory_quantity"),
+                    "in_stock": in_stock,
+                    "inventory_quantity": inventory_quantity,
                 },
                 "shipping_summary": _shipping_summary_from_product(product),
                 "source_type": product.get("source") or "catalog_cache",
@@ -432,6 +512,9 @@ def _canonicalize_search_product(product: Dict[str, Any]) -> Dict[str, Any]:
             "source_type": product.get("source") or "catalog_cache",
             "freshness_ts": _utc_iso(product.get("cached_at") or product.get("updated_at")),
         },
+        # The gateway reads this mark (transport whitelist + shopping-agent price
+        # contract): PIVOTA-Agent tests/integration/invoke.find_products_multi_unverified_price.test.js.
+        **({"commerce_verification": verification} if verification is not None else {}),
     }
 
 
@@ -702,6 +785,7 @@ async def search_products_v2(
         min_price=body.min_price,
         max_price=body.max_price,
         in_stock_only=body.in_stock_only,
+        in_stock_filter_explicit="in_stock_only" in body.model_fields_set,
         limit=body.limit,
         offset=body.offset,
         allow_external_seed=body.allow_external_seed,
@@ -709,7 +793,11 @@ async def search_products_v2(
         allow_stale_cache=body.allow_stale_cache,
         external_seed_strategy=body.external_seed_strategy,
         fast_mode=body.fast_mode,
-        market=body.request_context.country if body.request_context and body.request_context.country else None,
+        market=body.market or (
+            body.request_context.country
+            if body.request_context and body.request_context.country
+            else None
+        ),
         psp=body.payment_context.psp if body.payment_context else None,
         payment_method_type=body.payment_context.payment_method_type if body.payment_context else None,
         card_network=body.payment_context.card_network if body.payment_context else None,

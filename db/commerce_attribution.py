@@ -49,6 +49,9 @@ surface_click_events = Table(
     Column("user_agent", Text, nullable=True),
     Column("ip", String(64), nullable=True),
     Column("context", JSONB_TYPE, nullable=True),
+    # Migration 239 (ADR-025 D1): when the click id was ISSUED to an agent. NULL = a legacy row
+    # first written by `/r` at click time. Written only by commerce_attribution_service.issue_clicks.
+    Column("issued_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
     Column("updated_at", DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False),
 )

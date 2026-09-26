@@ -1,104 +1,80 @@
 """
-Authentication and User Management Routes
-Supports the Lovable admin approval system
+Legacy authentication routes (`/auth/*`).
+
+Kept only for backward compatibility with older frontends that still call
+`/auth/signin`. Authentication is resolved against real datastores: the legacy
+`employees` table and the canonical `users` table. Preferred for new callers:
+`POST /api/auth/login`.
+
+The in-memory `users_db` / `user_roles_db` / `sessions_db` dev fixtures and the
+`/auth/signup` + `/auth/admin-token` endpoints they backed were removed: they let
+an anonymous caller mint a JWT with a self-chosen `role` (including "admin"),
+which satisfied every `require_admin` / `ADMIN_ROLES` check in the codebase.
+`main._guard_legacy_inmemory_auth_routes()` fails startup if they come back.
 """
 
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 import jwt
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timedelta
 import os
-# Supabase logic removed. Using in-memory store for development/testing.
 
 # Database import for employee authentication
+from config.platform import is_production
 from db.database import database
-from utils.auth import verify_password as verify_bcrypt_password
+from utils.auth import (
+    ADMIN_ROLES,
+    EMPLOYEE_STAFF_ROLES,
+    get_current_user as shared_get_current_user,
+    verify_password as verify_bcrypt_password,
+)
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 security = HTTPBearer()
+logger = logging.getLogger("auth_routes")
 
 # JWT Configuration - Import from config for consistency
-from config.settings import settings
-JWT_SECRET = settings.jwt_secret_key
+from config.settings import require_jwt_secret, settings
+# See utils/auth.py: read at use, not at import.
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
-DEMO_MERCHANT_IDS = {
-    "merchant@test.com": os.getenv("DEMO_MERCHANT_ID", "").strip(),
-} if settings.enable_internal_demo_fixtures and os.getenv("DEMO_MERCHANT_ID", "").strip() else {}
-
-# User Role Types
-from enum import Enum
-
-class UserRole(str, Enum):
-    EMPLOYEE = "employee"
-    AGENT = "agent"
-    MERCHANT = "merchant"
-    OPERATOR = "operator"
-    ADMIN = "admin"
+def _demo_merchant_ids() -> Dict[str, str]:
+    """Backfills merchant_id onto a real, password-verified users-table row
+    that has none set. Same two conjuncts as the demo_accounts lane above:
+    ENABLE_INTERNAL_DEMO_FIXTURES must be explicitly true, and the platform
+    must not resolve to production (config.platform fails CLOSED to
+    production on unlabeled managed hosts, and re-reads the environment on
+    every call). Note settings.enable_internal_demo_fixtures itself is a
+    field on the process-wide `settings` singleton resolved once at import,
+    so flipping ENABLE_INTERNAL_DEMO_FIXTURES on a running process still
+    requires a restart to take effect."""
+    if not settings.enable_internal_demo_fixtures:
+        return {}
+    if is_production():
+        logger.warning(
+            "[Auth] ENABLE_INTERNAL_DEMO_FIXTURES is set but the environment "
+            "resolves to production; demo merchant_id backfill stays disabled"
+        )
+        return {}
+    demo_merchant_id = os.getenv("DEMO_MERCHANT_ID", "").strip()
+    if not demo_merchant_id:
+        return {}
+    return {"merchant@test.com": demo_merchant_id}
 
 # Pydantic Models
-class UserSignup(BaseModel):
-    email: str
-    password: str
-    role: UserRole = UserRole.EMPLOYEE  # Default to employee role
-    full_name: Optional[str] = None
-
 class UserLogin(BaseModel):
     email: str
     password: str
 
-class UserProfile(BaseModel):
-    id: str
-    email: str
-    full_name: Optional[str] = None
-    avatar_url: Optional[str] = None
-    created_at: str
-
-class UserRoleInfo(BaseModel):
-    id: str
-    user_id: str
-    role: UserRole
-    approved: bool
-    approved_by: Optional[str] = None
-    approved_at: Optional[str] = None
-    created_at: str
-
-class PendingUser(BaseModel):
-    id: str
-    user_id: str
-    role: UserRole
-    approved: bool
-    email: str
-    full_name: Optional[str] = None
-    created_at: str
-
-class RoleUpdate(BaseModel):
-    role: UserRole
-
-class ApprovalUpdate(BaseModel):
-    approved: bool
-
-# In-memory storage for demo (replace with database in production)
-users_db = {}
-user_roles_db = {}
-sessions_db = {}
-
 def normalize_email(raw_email: str) -> str:
     """Normalize email so legacy auth uses the same lookup key as canonical auth."""
     return (raw_email or "").strip().lower()
-
-def hash_password(password: str) -> str:
-    """Hash password using SHA-256"""
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def verify_password(password: str, hashed: str) -> bool:
-    """Verify password against hash"""
-    return hash_password(password) == hashed
 
 def create_jwt_token(
     user_id: str,
@@ -117,37 +93,91 @@ def create_jwt_token(
     }
     if extra_claims:
         payload.update(extra_claims)
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode(payload, require_jwt_secret(), algorithm=JWT_ALGORITHM)
 
-def verify_jwt_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify JWT token and return user info"""
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user_id = payload.get("user_id")
-        role = payload.get("role")
-        
-        if not user_id or not role:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token"
-            )
-        
-        return {"user_id": user_id, "role": role}
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expired"
-        )
-    except jwt.InvalidTokenError:
+async def verify_jwt_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> Dict[str, Any]:
+    """Verify a bearer JWT and return the caller's claims.
+
+    THIS IS A THIN ADAPTER OVER THE SHARED VALIDATOR, NOT A SECOND ONE, and
+    that is the entire point of its existence.
+
+    It used to call `jwt.decode()` itself, with no `audience=` and no
+    `verify_aud` option. That is not the same as "does not check the
+    audience": PyJWT's `_validate_aud` raises
+    `InvalidAudienceError("Invalid audience")` -- an `InvalidTokenError`
+    subclass, so it landed in the generic handler below -- whenever the token
+    CARRIES an `aud` claim and the caller named none. Every token
+    `/api/auth/login` mints carries one; `routes.auth._claims_for_membership`
+    stamps `db.auth_identity.PORTAL_TO_AUDIENCE[membership_type]`
+    (employee-portal / merchant-portal / agent-portal) onto all of them. So
+    this function rejected, as malformed, every canonical portal token that
+    `utils.auth.get_current_user` accepts -- and `utils.auth.decode_token`
+    passes `options={"verify_aud": False}` precisely so it does not.
+
+    Live consequence, observed 2026-09-05 on api.pivota.cc: a valid
+    `super_admin` employee-portal token got
+    `401 {"code":"UNAUTHORIZED","message":"Invalid token"}` from
+    `GET /admin/cleanup/list-merchants`, while the same token answered 200 on
+    routes wired to the shared validator. Nine route modules depend on this
+    function (`admin_cleanup`, `admin_cleanup_rebuild`,
+    `admin_cleanup_duplicates`, `admin_simple_fix`, `admin_migrations`,
+    `admin_fix_merchant`, `init_orders_table`, `direct_db_check`,
+    `psp_overview_routes`) plus `/auth/me` and `/auth/signout` here; all of
+    them were reachable only with a legacy `/auth/signin` token, which is the
+    one issuer that stamps no `aud`.
+
+    Two validators that disagree about what a valid token is will always drift
+    apart again, so this one no longer decides. `utils.auth.get_current_user`
+    is the single answer; the only thing left here is the legacy RETURN SHAPE
+    (`user_id` guaranteed, alongside the full claim set) that `/auth/me` and
+    the nine modules above read.
+
+    Audience is deliberately still not enforced, exactly as the shared
+    validator does not enforce it. Binding a route to one portal is a
+    different, useful control, but it belongs in one place for the whole app
+    rather than being reintroduced here as a side effect -- which is how this
+    defect happened. Until then, a merchant-portal token reaching an admin
+    route is refused by the ROLE check (403), not mistaken for a forgery.
+    """
+    payload = await shared_get_current_user(credentials)
+
+    # `get_current_user` requires sub/email/role; the legacy contract here is
+    # user_id/role. The `sub` fallback and the 401 below are DEFENSIVE, not
+    # load-bearing: an audit checked all four live issuers (routes/auth.py:607
+    # and :1094, accounts_orders_api.py:797, agent_account.py:666) and every
+    # one stamps `user_id`, so no token in circulation reaches either branch.
+    # They stay because this function's contract is "user_id is always
+    # present", and a future issuer that fills only `sub` should be adapted
+    # here rather than 401'd on a route that never reads the claim.
+    user_id = payload.get("user_id") or payload.get("sub")
+    role = payload.get("role")
+    if not user_id or not role:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token"
         )
 
+    return {**payload, "user_id": user_id, "role": role}
+
 def require_admin(current_user: dict = Depends(verify_jwt_token)):
-    """Require admin role for access"""
-    if current_user["role"] != "admin":
+    """Require an admin role for access.
+
+    `ADMIN_ROLES`, not the literal "admin", and that is a fix rather than a
+    tidy-up: this was `current_user["role"] != "admin"`, which refused
+    `super_admin` -- the MOST privileged role in the system, and one the
+    employee portal issues (`routes.auth.EMPLOYEE_AUTH_ROLES`). Same defect
+    #2031 fixed across 88 list-literal guards, in a spelling (`!= "admin"`)
+    that the list-literal ratchet cannot match. `utils.auth.require_admin`,
+    the shared equivalent, has always admitted both.
+
+    Deliberately NOT widened to `EMPLOYEE_STAFF_ROLES`: the routes behind this
+    dependency delete merchants, run migrations and reset system state.
+    Admitting `super_admin` corrects an omission; admitting every staff role
+    would be a new grant.
+    """
+    if current_user["role"] not in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
@@ -156,44 +186,12 @@ def require_admin(current_user: dict = Depends(verify_jwt_token)):
 
 def require_employee(current_user: dict = Depends(verify_jwt_token)):
     """Require employee or admin role for access"""
-    if current_user["role"] not in ["admin", "employee"]:
+    if current_user["role"] not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Employee access required"
         )
     return current_user
-
-@router.post("/signup")
-async def signup(user_data: UserSignup):
-    """User signup with role selection (in-memory, no Supabase)."""
-    try:
-        normalized_email = normalize_email(user_data.email)
-
-        if normalized_email in users_db:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User already exists")
-        users_db[normalized_email] = {
-            "id": normalized_email,
-            "email": normalized_email,
-            "password_hash": hash_password(user_data.password),
-            "full_name": user_data.full_name or normalized_email,
-        }
-        user_roles_db[normalized_email] = {
-            "user_id": normalized_email,
-            "role": user_data.role.value,
-            "approved": True,
-            "created_at": datetime.utcnow().isoformat()
-        }
-        return {
-            "status": "success",
-            "message": "Account created",
-            "user_id": normalized_email,
-            "role": user_data.role.value,
-            "approved": True
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Signup failed: {str(e)}")
 
 @router.post("/signin")
 async def signin(login_data: UserLogin):
@@ -201,16 +199,24 @@ async def signin(login_data: UserLogin):
     Legacy signin endpoint kept for backward compatibility with older frontends.
 
     Supports:
-    - In-memory demo accounts (dev/testing)
     - Legacy `employees` table auth (SHA256 + static salt)
     - Canonical `users` table auth (bcrypt) as a fallback
+    - Hardcoded demo accounts, only when `ENABLE_INTERNAL_DEMO_FIXTURES=true`
+      AND the platform environment does not resolve to production
+
+    Every lane resolves the role from a datastore or a flag-gated fixture; no
+    lane ever honours a role supplied by the caller.
 
     Preferred for real accounts: `POST /api/auth/login`.
     """
     try:
         normalized_email = normalize_email(login_data.email)
         demo_accounts = {}
-        if settings.enable_internal_demo_fixtures:
+        # Demo fixtures mint role=admin JWTs, so the flag alone is not enough:
+        # the lane also refuses whenever the platform resolves to production
+        # (config.platform fails CLOSED to production on unlabeled managed
+        # hosts). Mirrors routes.auth._demo_employee_accounts().
+        if settings.enable_internal_demo_fixtures and not is_production():
             demo_merchant_id = os.getenv("DEMO_MERCHANT_ID", "").strip()
             demo_accounts = {
                 **(
@@ -228,20 +234,6 @@ async def signin(login_data: UserLogin):
                 "agent@test.com": {"password": "Admin123!", "role": "agent"},
                 "superadmin@pivota.com": {"password": "admin123", "role": "admin"},
             }
-        # In-memory users
-        if normalized_email in users_db:
-            stored = users_db[normalized_email]
-            if not verify_password(login_data.password, stored["password_hash"]):
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-            role_info = user_roles_db.get(normalized_email, {"role": "employee", "approved": True})
-            primary_role = role_info["role"]
-            token = create_jwt_token(normalized_email, primary_role, normalized_email)
-            return {
-                "status": "success",
-                "message": "Login successful",
-                "token": token,
-                "user": {"id": normalized_email, "email": normalized_email, "full_name": stored.get("full_name", normalized_email), "role": primary_role}
-            }
         # Legacy employees table (optional). If the table doesn't exist in the new DB,
         # swallow the error and fall back to demo accounts instead of returning 500.
         employee = None
@@ -258,7 +250,6 @@ async def signin(login_data: UserLogin):
             employee = None
         
         if employee:
-            import hashlib
             salt = "pivota_employee_salt_v1"
             hashed_input = hashlib.sha256(f"{login_data.password}{salt}".encode()).hexdigest()
             
@@ -313,7 +304,7 @@ async def signin(login_data: UserLogin):
 
             merchant_id = user_row.get("merchant_id")
             if user_row.get("role") == "merchant" and not merchant_id:
-                merchant_id = DEMO_MERCHANT_IDS.get(normalized_email)
+                merchant_id = _demo_merchant_ids().get(normalized_email)
             token = create_jwt_token(
                 user_row["email"],
                 user_row["role"],
@@ -383,7 +374,6 @@ async def signin(login_data: UserLogin):
                 
                 if not existing_agent:
                     # Create agent record with initial API key
-                    import secrets
                     api_key = f"ak_live_{secrets.token_hex(32)}"  # 64 hex chars
                     await database.execute(
                         """
@@ -409,7 +399,7 @@ async def signin(login_data: UserLogin):
                 # Don't fail login if agent creation fails
                 print(f"⚠️ Could not create agent record: {e}")
         
-        token = jwt.encode(token_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+        token = jwt.encode(token_payload, require_jwt_secret(), algorithm=JWT_ALGORITHM)
         
         user_data = {
             "id": normalized_email,
@@ -440,27 +430,23 @@ async def signin(login_data: UserLogin):
 
 @router.get("/me")
 async def get_current_user(current_user: dict = Depends(verify_jwt_token)):
-    """Get current user information (from JWT / in-memory)."""
+    """Get current user information, derived from the verified JWT.
+
+    `email` reads the `email` CLAIM, falling back to `user_id` only when the
+    token carries none. It used to be `user_id` unconditionally, which was
+    merely wrong-and-unreachable while this route rejected every canonical
+    portal token: now that the shared validator admits them, /auth/me would
+    answer a real employee-portal session with its numeric user id, or an
+    `identity_...` string, in the `email` field. Every live issuer stamps
+    `email` (routes/auth.py, and create_jwt_token above), so the fallback is
+    for legacy tokens only.
+    """
     try:
-        # If user exists in our memory store, provide richer info
-        stored = users_db.get(current_user["user_id"])
-        if stored:
-            return {
-                "status": "success",
-                "user": {
-                    "id": stored["id"],
-                    "email": stored["email"],
-                    "full_name": stored.get("full_name", stored["email"]),
-                    "role": user_roles_db.get(current_user["user_id"], {}).get("role", current_user["role"]),
-                    "created_at": user_roles_db.get(current_user["user_id"], {}).get("created_at", datetime.utcnow().isoformat()),
-                }
-            }
-        # Fallback to JWT-only info
         return {
             "status": "success",
             "user": {
                 "id": current_user["user_id"],
-                "email": current_user["user_id"],
+                "email": current_user.get("email") or current_user["user_id"],
                 "full_name": current_user["user_id"],
                 "role": current_user["role"],
                 "created_at": datetime.utcnow().isoformat()
@@ -470,70 +456,6 @@ async def get_current_user(current_user: dict = Depends(verify_jwt_token)):
         raise
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to get user info: {str(e)}")
-
-@router.get("/admin/users")
-async def get_pending_users(admin_user: dict = Depends(require_admin)):
-    """Get all users for admin management (admin only, in-memory)."""
-    try:
-        users_list: list[PendingUser] = []
-        for email, role_data in user_roles_db.items():
-            user = users_db.get(email, {"email": email, "full_name": email})
-            users_list.append(PendingUser(
-                id=email,
-                user_id=role_data["user_id"],
-                role=role_data["role"],
-                approved=role_data.get("approved", True),
-                email=user["email"],
-                full_name=user.get("full_name", user["email"]),
-                created_at=role_data.get("created_at", datetime.utcnow().isoformat())
-            ))
-        users_list.sort(key=lambda x: x.created_at, reverse=True)
-        return {"status": "success", "users": users_list}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to get users: {str(e)}")
-
-@router.post("/admin/users/{user_id}/approve")
-async def approve_user(
-    user_id: str,
-    approval_data: ApprovalUpdate,
-    admin_user: dict = Depends(require_admin)
-):
-    """Approve or reject user (admin only, in-memory)."""
-    try:
-        if user_id not in user_roles_db:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User role not found")
-        user_roles_db[user_id]["approved"] = approval_data.approved
-        return {
-            "status": "success",
-            "message": f"User {'approved' if approval_data.approved else 'rejected'}",
-            "user_id": user_id,
-            "approved": approval_data.approved
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to update approval: {str(e)}")
-
-@router.put("/admin/users/{user_id}/role")
-async def update_user_role(
-    user_id: str,
-    role_data: RoleUpdate,
-    admin_user: dict = Depends(require_admin)
-):
-    """Update user role (admin only, in-memory)."""
-    try:
-        if user_id not in user_roles_db:
-            # If not present, create default entry
-            user_roles_db[user_id] = {"user_id": user_id, "role": role_data.role.value if hasattr(role_data.role, 'value') else str(role_data.role), "approved": True, "created_at": datetime.utcnow().isoformat()}
-        else:
-            user_roles_db[user_id]["role"] = role_data.role.value if hasattr(role_data.role, 'value') else str(role_data.role)
-        return {"status": "success", "message": f"Role updated to {role_data.role}", "user_id": user_id, "role": role_data.role}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to update role: {str(e)}")
 
 @router.post("/signout")
 async def signout(current_user: dict = Depends(verify_jwt_token)):
@@ -560,12 +482,12 @@ async def test_auth_flow():
         "status": "success",
         "message": "Auth endpoints are accessible",
         "endpoints": {
-            "signup": "POST /auth/signup",
-            "signin": "POST /auth/signin", 
+            "signin": "POST /auth/signin",
             "me": "GET /auth/me (requires Authorization header)",
-            "admin_users": "GET /auth/admin/users (requires admin token)"
+            "signout": "POST /auth/signout (requires Authorization header)",
+            "register": "POST /api/auth/register",
         },
-        "note": "For /me and /admin/users, include Authorization: Bearer <token> header"
+        "note": "For /me and /signout, include Authorization: Bearer <token> header",
     }
 
 @router.get("/test-post")
@@ -606,29 +528,3 @@ async def test_post_minimal():
 async def test_post_simple_options():
     """Handle OPTIONS request for CORS"""
     return {"message": "OPTIONS handled"}
-
-@router.get("/admin-token")
-async def get_admin_test_token():
-    """
-    Generate a test admin JWT token for dashboard access
-    ⚠️ FOR DEVELOPMENT ONLY - Remove in production!
-    """
-    payload = {
-        "sub": "admin_superuser",  # Unique admin ID (JWT standard)
-        "user_id": "admin_superuser",  # Admin user ID
-        "email": "superadmin@pivota.com",  # Admin email
-        "role": "admin",  # Admin role
-        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
-        "iat": datetime.utcnow()
-    }
-    
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    
-    return {
-        "status": "success",
-        "token": token,
-        "expires_in": f"{JWT_EXPIRATION_HOURS} hours",
-        "user": "admin_superuser",
-        "role": "admin",
-        "note": "⚠️ This is a test endpoint. Remove in production!"
-    }

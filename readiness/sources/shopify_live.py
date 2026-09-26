@@ -20,6 +20,11 @@ from services.merchant_store_service import get_primary_store
 
 logger = logging.getLogger(__name__)
 
+# Mirrors `merchant_stores`' own active-status vocabulary
+# (services/store_lifecycle_service.ACTIVE_STORE_STATUSES). A store outside this
+# set is attached in name only and must not keep a catalog alive.
+_ATTACHED_STORE_STATUSES = frozenset({"active", "connected"})
+
 _POLICY_FIXTURE_PATH = Path(__file__).resolve().parents[1] / "fixtures" / "alpha_merchant_policies.json"
 
 
@@ -276,6 +281,59 @@ class ShopifyLiveMerchantSource:
         shopify_connected = bool(shop_domain and access_token)
         if not shopify_connected:
             merchant_blockers.append("shopify_configuration_missing")
+
+        # Does this merchant still have a storefront attached at all?
+        #
+        # `shopify_connected` cannot answer that. `_get_shopify_config_for_merchant`
+        # resolves credentials in three steps, and the FIRST is the merchant's own
+        # encrypted `connector_credentials` row — which NO detach path deletes
+        # (not the portal DELETE, not the app/uninstalled webhook, not the
+        # auto-disconnect job). So a merchant keeps returning a decryptable
+        # shop_domain + access_token long after their last store is gone, and
+        # `shopify_connected` stays True. Its third step also falls back to the
+        # GLOBAL settings/env Shopify credentials, which would have the same
+        # effect wherever those are configured.
+        #
+        # `get_primary_store` is the structural signal, but `is not None` is NOT
+        # the right test on it. Its merchant_stores leg does filter
+        # `status IN ('active','connected')`; its LEGACY leg
+        # (`get_merchant_active_stores`, services/merchant_store_service.py)
+        # does not — it appends a store dict whenever
+        # `merchant_onboarding.mcp_platform` is truthy and merely LABELS it
+        # `status='disconnected'` when `mcp_connected` is false.
+        #
+        # That distinction decides which detach paths this gate covers.
+        # `DELETE /merchant/integrations/store/{store_id}` — the portal's detach
+        # button — clears `mcp_platform = NULL` when the last store goes, so the
+        # legacy leg goes quiet and `is not None` would have sufficed. But the
+        # Shopify `app/uninstalled` webhook and the hourly auto-disconnect job
+        # both set `merchant_stores.status='disconnected'` and touch NO `mcp_*`
+        # column, leaving `mcp_platform` set forever. Those merchants would come
+        # back from `get_primary_store` as a non-None, 'disconnected' legacy
+        # store and sail straight through an `is not None` gate — the exact bug
+        # this function is here to fix, on the two paths a merchant is most
+        # likely to hit. So: require the store to actually be ACTIVE.
+        #
+        # This matters because the product cache is keyed on merchant_id +
+        # platform ALONE — no store_id — and readiness reads it with
+        # include_expired=True (`_load_runtime_cache_rows`). So every product a
+        # store ever synced stays readable forever after that store is detached:
+        # DELETE /merchant/integrations/store/{store_id} drops the merchant_stores
+        # row and nothing retires the cached rows. Readiness kept enumerating
+        # them and minting per-variant blockers (out_of_stock, inventory_stale,
+        # ...) for a store that no longer exists, which is what the merchant
+        # portal rendered as "historical issues" on the overview card and the
+        # product-optimization workspace.
+        #
+        # Detaching a store must retire its catalog from this report, not merely
+        # add one more merchant-level blocker alongside a full issue list.
+        store_status = str((store or {}).get("status") or "").strip().lower()
+        store_connected = store is not None and store_status in _ATTACHED_STORE_STATUSES
+        # An attached store AND usable credentials — the precondition for any
+        # capability that actually talks to the storefront.
+        storefront_live = store_connected and shopify_connected
+        if not store_connected:
+            merchant_blockers.append("store_connection_missing")
         if not policy:
             merchant_blockers.append("merchant_policy_missing")
             policy = {
@@ -288,11 +346,17 @@ class ShopifyLiveMerchantSource:
             }
 
         cached_rows: List[Dict[str, Any]] = []
-        try:
-            cached_rows = await _load_runtime_cache_rows(merchant_id)
-        except Exception:
-            merchant_warnings.append("products_cache_lookup_failed")
-            logger.warning("products_cache lookup failed for merchant=%s", merchant_id, exc_info=True)
+        if store_connected:
+            try:
+                cached_rows = await _load_runtime_cache_rows(merchant_id)
+            except Exception:
+                merchant_warnings.append("products_cache_lookup_failed")
+                logger.warning("products_cache lookup failed for merchant=%s", merchant_id, exc_info=True)
+        else:
+            audit_notes.append(
+                "No storefront is connected, so this report does not read the product cache. "
+                "Cached products from a detached store are not assessed."
+            )
 
         products: List[StandardProduct] = []
         product_diagnostics: Dict[str, Dict[str, Any]] = {}
@@ -335,7 +399,13 @@ class ShopifyLiveMerchantSource:
                         },
                     }
 
-        live_overlay_needed = bool(shopify_connected and (not products or _cached_rows_need_live_overlay(cached_rows, reference_time)))
+        # `store_connected` gates the overlay too: without it a merchant with no
+        # stores would still hit the live Admin API on the global env credentials.
+        live_overlay_needed = bool(
+            store_connected
+            and shopify_connected
+            and (not products or _cached_rows_need_live_overlay(cached_rows, reference_time))
+        )
         live_fetch_error: Optional[str] = None
         live_overlay_started_at: Optional[datetime] = None
         live_overlay_elapsed_ms: Optional[float] = None
@@ -412,7 +482,11 @@ class ShopifyLiveMerchantSource:
                 merchant_warnings.append("live_shopify_overlay_failed")
             audit_notes.append(f"Live Shopify catalog fetch failed: {live_fetch_error}")
 
-        if not products:
+        # "catalog_missing" means "you have a store but we cannot see its
+        # products" — an actionable sync problem. A merchant with no store at all
+        # already carries `store_connection_missing`; adding `catalog_missing`
+        # there would point them at a sync they have no store to run.
+        if not products and store_connected:
             merchant_blockers.append("catalog_missing")
 
         product_review_summaries: Dict[str, Dict[str, Any]] = {}
@@ -446,20 +520,26 @@ class ShopifyLiveMerchantSource:
             merchant_warnings.append("active_psp_configuration_missing")
 
         payment_capabilities = {
-            "merchant_native_checkout_supported": bool(shopify_connected and psp_config),
-            "merchant_platform_writeback_supported": bool(shopify_connected),
-            "ucp_checkout_supported": bool(shopify_connected and psp_config),
-            "acp_checkout_supported": bool(shopify_connected and psp_config),
+            # `store_connected and shopify_connected`, not credentials alone:
+            # surviving connector_credentials keep `shopify_connected` True after
+            # a detach, and a merchant with no storefront cannot execute checkout
+            # or write orders back to one. Leaving these on credentials alone is
+            # what made a detached merchant's card read "ready" beside a summary
+            # saying "blocked".
+            "merchant_native_checkout_supported": bool(storefront_live and psp_config),
+            "merchant_platform_writeback_supported": bool(storefront_live),
+            "ucp_checkout_supported": bool(storefront_live and psp_config),
+            "acp_checkout_supported": bool(storefront_live and psp_config),
             "payment_mode": "merchant_psp" if psp_config else "blocked",
             "psp_provider": (psp_config or {}).get("provider"),
             "psp_id": (psp_config or {}).get("psp_id"),
         }
 
         capability_status = {
-            "merchant_adapter": "ready" if shopify_connected else "blocked",
+            "merchant_adapter": "ready" if storefront_live else "blocked",
             "channel_export": "ready" if products else "blocked",
             "checkout": "ready" if payment_capabilities["merchant_native_checkout_supported"] else "blocked",
-            "order_sync": "ready" if shopify_connected else "blocked",
+            "order_sync": "ready" if storefront_live else "blocked",
             "reviews_confidence": "ready"
             if review_diagnostics.get("integration_status") == "ready" and review_diagnostics.get("products_with_reviews")
             else "partial"

@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import and_, func, or_, select, text
 
 from db.database import database
+from db.schema_guard import constraint_exists, guarded_ddl, guarded_statements
 from db.orders import orders as orders_table
 from db.reviews_center import buyer_review_user_subject, product_reviews, ugc_question_replies, ugc_questions
 from services.review_moderation_policy import assess_review_text_risk_with_deepseek, merge_moderation_risk_flags
@@ -55,55 +56,58 @@ async def ensure_ugc_tables_exist() -> None:
     try:
         await database.fetch_one(text("SELECT 1 FROM buyer_review_user_subject LIMIT 1"))
     except Exception:
-        await database.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS buyer_review_user_subject (
-                  id BIGSERIAL PRIMARY KEY,
-                  user_id TEXT NOT NULL,
-                  subject_type VARCHAR(32) NOT NULL,
-                  subject_id TEXT NOT NULL,
-                  order_id TEXT NULL,
-                  review_id BIGINT NOT NULL REFERENCES product_reviews(id) ON DELETE CASCADE,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-                CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_user
-                  ON buyer_review_user_subject(user_id);
-                CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_subject
-                  ON buyer_review_user_subject(subject_type, subject_id);
-                CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_order_id
-                  ON buyer_review_user_subject(order_id);
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_order
-                  ON buyer_review_user_subject(user_id, subject_type, subject_id, order_id);
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_legacy_null_order
-                  ON buyer_review_user_subject(user_id, subject_type, subject_id)
-                  WHERE order_id IS NULL;
-                """
+        # One execute() per statement: `databases` runs execute() as a prepared
+        # statement and Postgres refuses several commands in one ("cannot insert
+        # multiple commands into a prepared statement"), so these blocks, sent as
+        # one string, raised on every database still missing the table. CREATE
+        # TABLE passes through verbatim; the index builds are guarded as below.
+        for statement in guarded_statements([
+            """
+            CREATE TABLE IF NOT EXISTS buyer_review_user_subject (
+              id BIGSERIAL PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              subject_type VARCHAR(32) NOT NULL,
+              subject_id TEXT NOT NULL,
+              order_id TEXT NULL,
+              review_id BIGINT NOT NULL REFERENCES product_reviews(id) ON DELETE CASCADE,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
-        )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_user "
+            "ON buyer_review_user_subject(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_subject "
+            "ON buyer_review_user_subject(subject_type, subject_id)",
+            "CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_order_id "
+            "ON buyer_review_user_subject(order_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_order "
+            "ON buyer_review_user_subject(user_id, subject_type, subject_id, order_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_legacy_null_order "
+            "ON buyer_review_user_subject(user_id, subject_type, subject_id) "
+            "WHERE order_id IS NULL",
+        ]):
+            await database.execute(text(statement))
     # Backward-compatible in-place hardening for environments with old schema.
+    # Guarded (db/schema_guard.py): this runs on EVERY call, and bare the ALTERs took
+    # the table's ACCESS EXCLUSIVE lock (each index build its SHARE lock) with no
+    # lock_timeout even with nothing to change. Each now runs only while it is still
+    # needed; a lock timeout is one more failure the except below already absorbs.
     try:
-        await database.execute(text("ALTER TABLE buyer_review_user_subject ADD COLUMN IF NOT EXISTS order_id TEXT"))
-        await database.execute(text("ALTER TABLE buyer_review_user_subject DROP CONSTRAINT IF EXISTS ux_buyer_review_user_subject"))
-        await database.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_order_id "
-                "ON buyer_review_user_subject(order_id)"
-            )
-        )
-        await database.execute(
-            text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_order "
-                "ON buyer_review_user_subject(user_id, subject_type, subject_id, order_id)"
-            )
-        )
-        await database.execute(
-            text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_legacy_null_order "
-                "ON buyer_review_user_subject(user_id, subject_type, subject_id) "
-                "WHERE order_id IS NULL"
-            )
-        )
+        for statement in guarded_statements([
+            "ALTER TABLE buyer_review_user_subject ADD COLUMN IF NOT EXISTS order_id TEXT",
+            guarded_ddl(
+                "buyer_review_user_subject",
+                constraint_exists("buyer_review_user_subject", "ux_buyer_review_user_subject"),
+                "ALTER TABLE buyer_review_user_subject DROP CONSTRAINT IF EXISTS ux_buyer_review_user_subject;",
+            ),
+            "CREATE INDEX IF NOT EXISTS idx_buyer_review_user_subject_order_id "
+            "ON buyer_review_user_subject(order_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_order "
+            "ON buyer_review_user_subject(user_id, subject_type, subject_id, order_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_buyer_review_user_subject_legacy_null_order "
+            "ON buyer_review_user_subject(user_id, subject_type, subject_id) "
+            "WHERE order_id IS NULL",
+        ]):
+            await database.execute(text(statement))
     except Exception:
         # Best-effort only; callers can still proceed with degraded behavior.
         pass
@@ -111,55 +115,59 @@ async def ensure_ugc_tables_exist() -> None:
     try:
         await database.fetch_one(text("SELECT 1 FROM ugc_questions LIMIT 1"))
     except Exception:
-        await database.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS ugc_questions (
-                  id BIGSERIAL PRIMARY KEY,
-                  user_id TEXT NOT NULL,
-                  subject_type VARCHAR(32) NOT NULL,
-                  subject_id TEXT NOT NULL,
-                  question TEXT NOT NULL,
-                  risk_flags JSONB NULL,
-                  status VARCHAR(16) NOT NULL DEFAULT 'active',
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-                CREATE INDEX IF NOT EXISTS idx_ugc_questions_user_created
-                  ON ugc_questions(user_id, created_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_ugc_questions_subject_created
-                  ON ugc_questions(subject_type, subject_id, created_at DESC);
-                """
+        # One execute() per statement, as for buyer_review_user_subject above.
+        for statement in guarded_statements([
+            """
+            CREATE TABLE IF NOT EXISTS ugc_questions (
+              id BIGSERIAL PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              subject_type VARCHAR(32) NOT NULL,
+              subject_id TEXT NOT NULL,
+              question TEXT NOT NULL,
+              risk_flags JSONB NULL,
+              status VARCHAR(16) NOT NULL DEFAULT 'active',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
-        )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_ugc_questions_user_created "
+            "ON ugc_questions(user_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ugc_questions_subject_created "
+            "ON ugc_questions(subject_type, subject_id, created_at DESC)",
+        ]):
+            await database.execute(text(statement))
     try:
-        await database.execute(text("ALTER TABLE ugc_questions ADD COLUMN IF NOT EXISTS risk_flags JSONB"))
+        # Guarded, as above: bare, every call took the table's ACCESS EXCLUSIVE lock.
+        for statement in guarded_statements(["ALTER TABLE ugc_questions ADD COLUMN IF NOT EXISTS risk_flags JSONB"]):
+            await database.execute(text(statement))
     except Exception:
         pass
 
     try:
         await database.fetch_one(text("SELECT 1 FROM ugc_question_replies LIMIT 1"))
     except Exception:
-        await database.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS ugc_question_replies (
-                  id BIGSERIAL PRIMARY KEY,
-                  question_id BIGINT NOT NULL REFERENCES ugc_questions(id) ON DELETE CASCADE,
-                  user_id TEXT NOT NULL,
-                  body TEXT NOT NULL,
-                  risk_flags JSONB NULL,
-                  status VARCHAR(16) NOT NULL DEFAULT 'active',
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-                CREATE INDEX IF NOT EXISTS idx_ugc_question_replies_question_created
-                  ON ugc_question_replies(question_id, created_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_ugc_question_replies_user_created
-                  ON ugc_question_replies(user_id, created_at DESC);
-                """
+        # One execute() per statement, as for buyer_review_user_subject above.
+        for statement in guarded_statements([
+            """
+            CREATE TABLE IF NOT EXISTS ugc_question_replies (
+              id BIGSERIAL PRIMARY KEY,
+              question_id BIGINT NOT NULL REFERENCES ugc_questions(id) ON DELETE CASCADE,
+              user_id TEXT NOT NULL,
+              body TEXT NOT NULL,
+              risk_flags JSONB NULL,
+              status VARCHAR(16) NOT NULL DEFAULT 'active',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
-        )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_ugc_question_replies_question_created "
+            "ON ugc_question_replies(question_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ugc_question_replies_user_created "
+            "ON ugc_question_replies(user_id, created_at DESC)",
+        ]):
+            await database.execute(text(statement))
     try:
-        await database.execute(text("ALTER TABLE ugc_question_replies ADD COLUMN IF NOT EXISTS risk_flags JSONB"))
+        # Guarded, as above: bare, every call took the table's ACCESS EXCLUSIVE lock.
+        for statement in guarded_statements(["ALTER TABLE ugc_question_replies ADD COLUMN IF NOT EXISTS risk_flags JSONB"]):
+            await database.execute(text(statement))
     except Exception:
         pass
 

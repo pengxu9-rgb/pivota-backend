@@ -49,7 +49,10 @@ AI-readiness/optimization insights. It never writes to the store.
 
 ## Webhook Subscriptions (app-owned, declared in the app config)
 Delivered to `https://api.pivota.cc/webhooks/shopify/orders`:
+- orders/create
 - orders/paid
+- orders/cancelled
+- refunds/create
 - app/uninstalled
 
 GDPR/compliance topics delivered to `https://api.pivota.cc/webhooks/shopify/gdpr`:

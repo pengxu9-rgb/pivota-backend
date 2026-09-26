@@ -383,6 +383,13 @@ async def upsert_issuer(agent_id: str, reg: IssuerRegistration, *, jwks_ok: bool
         {"agent_id": agent_id, "issuer": reg.issuer},
     )
     if existing:
+        # Bind ONLY the names this statement uses: `databases` turns a str query into text() and
+        # calls .bindparams(**values), which raises ArgumentError on any key the SQL does not
+        # reference — so passing `params` whole (agent_id, issuer) 500'd every re-registration.
+        update_params = {
+            k: params[k]
+            for k in ("jwks_uri", "audience", "algs", "authorized_party", "required_scopes", "jwks_ok")
+        }
         await database.execute(
             """
             UPDATE agent_identity_issuers
@@ -393,7 +400,7 @@ async def upsert_issuer(agent_id: str, reg: IssuerRegistration, *, jwks_ok: bool
                 updated_at = NOW()
             WHERE id = :id
             """,
-            {**params, "id": dict(existing)["id"]},
+            {**update_params, "id": dict(existing)["id"]},
         )
     else:
         await database.execute(

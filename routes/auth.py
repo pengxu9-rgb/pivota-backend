@@ -10,11 +10,13 @@ import os
 import hashlib
 from datetime import datetime
 from textwrap import dedent
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, field_validator
 
+from config.platform import is_production
 from config.settings import settings
 from db.auth_identity import (
     PORTAL_TO_AUDIENCE,
@@ -28,10 +30,12 @@ from db.auth_identity import (
 )
 from db.database import database
 from utils.auth import (
+    ADMIN_ROLES,
     hash_password,
     verify_password,
     create_access_token,
     get_current_user,
+    optional_security,
     require_admin,
 )
 from utils.database_readiness import (
@@ -46,9 +50,28 @@ logger = logging.getLogger("auth_routes")
 EMPLOYEE_AUTH_ROLES = {"super_admin", "admin", "employee", "outsourced"}
 SUPPORTED_LOGIN_PORTALS = set(PORTAL_TO_MEMBERSHIP_TYPE)
 
-DEMO_MERCHANT_IDS = {
-    "merchant@test.com": os.getenv("DEMO_MERCHANT_ID", "").strip(),
-} if settings.enable_internal_demo_fixtures and os.getenv("DEMO_MERCHANT_ID", "").strip() else {}
+# Backfills merchant_id onto a real, password-verified users-table row that
+# has none set. Gated like _demo_employee_accounts() below: both conjuncts
+# are re-checked on every call rather than baked into a module-level dict at
+# import time, so a managed host that only resolves to production after
+# `is_production()` re-reads the environment (or a DEMO_MERCHANT_ID set after
+# import) still takes effect immediately. Note settings.enable_internal_demo_fixtures
+# itself does NOT re-read the environment per call — it's a field on the
+# process-wide `settings` singleton, resolved once at import — so flipping
+# ENABLE_INTERNAL_DEMO_FIXTURES on a running process still requires a restart.
+def _demo_merchant_ids() -> Dict[str, str]:
+    if not settings.enable_internal_demo_fixtures:
+        return {}
+    if is_production():
+        logger.warning(
+            "[Auth] ENABLE_INTERNAL_DEMO_FIXTURES is set but the environment "
+            "resolves to production; demo merchant_id backfill stays disabled"
+        )
+        return {}
+    demo_merchant_id = os.getenv("DEMO_MERCHANT_ID", "").strip()
+    if not demo_merchant_id:
+        return {}
+    return {"merchant@test.com": demo_merchant_id}
 
 # Backward-compat shim for tests and historical imports.
 # Some code/tests patch `routes.auth.require_admin_user`.
@@ -72,6 +95,49 @@ def _validate_role_value(value: str) -> str:
     if value not in valid_roles:
         raise ValueError(f'Invalid role. Must be one of: {", ".join(valid_roles)}')
     return value
+
+
+# Roles a caller is allowed to hand themselves at registration time. Everything
+# else in `_validate_role_value` is privileged -- `admin`/`super_admin` satisfy
+# `ADMIN_ROLES` and `require_admin`, and `employee`/`outsourced` satisfy
+# `require_employee` -- so those may only be granted by an authenticated admin.
+# `/api/auth/register` is mounted unauthenticated, so without this split an
+# anonymous caller could persist themselves an admin row and then log in.
+SELF_SERVICE_REGISTRATION_ROLES = frozenset({"merchant", "agent"})
+
+
+async def _optional_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+) -> Optional[Dict[str, Any]]:
+    """Resolve the caller when a Bearer token is present; None when anonymous.
+
+    A non-empty token that is presented must still be valid -- an unparseable or
+    expired one raises 401 rather than silently degrading to the anonymous path.
+    An EMPTY credential (`Authorization: Bearer `) is not a token at all:
+    `HTTPBearer(auto_error=False)` yields None for it, so it takes the anonymous
+    path. That is safe, because anonymous is the least-privileged caller here
+    and still cannot self-assign a privileged role.
+    """
+    if credentials is None:
+        return None
+    return await get_current_user(credentials)
+
+
+def _authorize_requested_role(role: str, caller: Optional[Dict[str, Any]]) -> None:
+    """Reject any privileged role that the caller is not an admin to grant."""
+    if role in SELF_SERVICE_REGISTRATION_ROLES:
+        return
+    if (caller or {}).get("role") in ADMIN_ROLES:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=(
+            f"Role '{role}' may only be granted by an authenticated admin. "
+            "Self-service registration accepts: "
+            + ", ".join(sorted(SELF_SERVICE_REGISTRATION_ROLES))
+            + "."
+        ),
+    )
 
 # Request/Response Models
 class RegisterRequest(BaseModel):
@@ -125,7 +191,17 @@ def _normalize_email(raw_email: str) -> str:
     return (raw_email or "").strip().lower()
 
 
-DEMO_EMPLOYEE_ACCOUNTS = {
+# Hardcoded demo employee logins for LOCAL DEVELOPMENT ONLY. These mint
+# role=admin JWTs, and an admin JWT now reaches /admin/payment-issuers (PSP
+# charge authority), so this lane must never be satisfiable in production.
+# Two independent gates, both checked at request time:
+#   1. ENABLE_INTERNAL_DEMO_FIXTURES must be explicitly true (off by default),
+#      the same flag that gates the /auth/signin demo lane.
+#   2. The resolved platform environment must not be production.
+#      config.platform fails CLOSED to production on a managed host it cannot
+#      classify, so an unlabeled deployment keeps this lane dark even with
+#      the flag set.
+_DEMO_EMPLOYEE_FIXTURES = {
     "employee@pivota.com": {
         "password": "Admin123!",
         "role": "admin",
@@ -137,6 +213,18 @@ DEMO_EMPLOYEE_ACCOUNTS = {
         "full_name": "Pivota Super Admin",
     },
 }
+
+
+def _demo_employee_accounts() -> Dict[str, Dict[str, str]]:
+    if not settings.enable_internal_demo_fixtures:
+        return {}
+    if is_production():
+        logger.warning(
+            "[Auth] ENABLE_INTERNAL_DEMO_FIXTURES is set but the environment "
+            "resolves to production; demo employee logins stay disabled"
+        )
+        return {}
+    return _DEMO_EMPLOYEE_FIXTURES
 
 _AUTH_DB_TIMEOUT_SECONDS = 5.0
 
@@ -377,7 +465,7 @@ async def _resolve_merchant_id_for_user(user: Optional[dict], email: str) -> Opt
         merchant_record = None
     if merchant_record:
         return str(merchant_record["merchant_id"])
-    return DEMO_MERCHANT_IDS.get(email)
+    return _demo_merchant_ids().get(email)
 
 
 def _fallback_membership(
@@ -430,11 +518,30 @@ def _claims_for_membership(membership: dict) -> dict:
     return claims
 
 
+def _is_non_staff_account_role(role: Optional[str]) -> bool:
+    """A users row owned by another portal (merchant, agent, buyer, ...).
+
+    Its password_hash is that account's password, never evidence of who holds
+    the employees row at the same address: a merchant can move its login email
+    onto an address without proving it owns the mailbox.
+    """
+    role = (role or "").strip().lower()
+    return bool(role) and role not in EMPLOYEE_AUTH_ROLES
+
+
 async def _sync_employee_auth_user(
     *,
     employee: dict,
     plain_password: Optional[str] = None,
-) -> None:
+) -> bool:
+    """Make the users row at the employee's address a staff login.
+
+    With `plain_password` (a password proven for the employee) the row is
+    upserted with that password. Without one, the existing row keeps its
+    password_hash, so it may only be promoted if it is already a staff row: a
+    merchant/agent row would become staff while still opening with the
+    merchant/agent's own password. Returns False when it refuses.
+    """
     password_hash = hash_password(plain_password) if plain_password else None
     values = {
         "email": _normalize_email(employee["email"]),
@@ -443,6 +550,34 @@ async def _sync_employee_auth_user(
         "role": employee["role"],
     }
     if not password_hash:
+        existing = _record_to_dict(
+            await _auth_fetch_one(
+                "SELECT role FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1",
+                {"email": values["email"]},
+            )
+        )
+        if existing and _is_non_staff_account_role(existing.get("role")):
+            logger.warning(
+                "[Auth] Refused to promote %s users row at %s to employee role %s "
+                "without a password proven for the employee",
+                existing.get("role"),
+                values["email"],
+                employee["role"],
+            )
+            await _safe_record_identity_event(
+                event_type="employee_promotion_refused",
+                email=values["email"],
+                details={
+                    "users_role": existing.get("role"),
+                    "employee_id": str(employee.get("employee_id") or ""),
+                    "reason": "password_not_proven_for_employee",
+                },
+            )
+            return False
+        # The same refusal in the statement itself, so a row that becomes
+        # non-staff between the read above and this write is not promoted. The
+        # role list is EMPLOYEE_AUTH_ROLES spelled as a literal (so the static
+        # PREPARE sweep can plan it); a test pins the two equal.
         await _auth_execute(
             """
             UPDATE users
@@ -451,6 +586,7 @@ async def _sync_employee_auth_user(
                 active = TRUE,
                 merchant_id = NULL
             WHERE LOWER(email) = LOWER(:email)
+              AND LOWER(COALESCE(role, '')) IN ('', 'admin', 'employee', 'outsourced', 'super_admin')
             """,
             values,
         )
@@ -481,6 +617,7 @@ async def _sync_employee_auth_user(
         credential_source="employee_login" if password_hash else None,
         source="employees_login_sync",
     )
+    return True
 
 
 def _build_employee_login_response(
@@ -551,7 +688,7 @@ async def _legacy_employee_login_response(normalized_email: str, password: str) 
                 role=str(employee_row["role"]),
             )
 
-    demo = DEMO_EMPLOYEE_ACCOUNTS.get(normalized_email)
+    demo = _demo_employee_accounts().get(normalized_email)
     if demo and password == demo["password"]:
         return _build_employee_login_response(
             user_id=normalized_email,
@@ -697,16 +834,22 @@ def _send_reset_password_email(email: str, reset_link: str) -> None:
         logger.warning("[Auth] Reset-password email send raised error=%s", type(exc).__name__)
 
 @router.post("/register", response_model=MessageResponse)
-async def register(data: RegisterRequest):
+async def register(
+    data: RegisterRequest,
+    caller: Optional[Dict[str, Any]] = Depends(_optional_current_user),
+):
     """
     Register a new user
-    
+
     - **email**: Valid email address
     - **password**: At least 8 characters, with uppercase, lowercase, and digit
     - **full_name**: Optional full name
-    - **role**: super_admin, admin, employee, outsourced, merchant, or agent (default: employee)
+    - **role**: `merchant` or `agent` for self-service registration. The
+      privileged roles (`super_admin`, `admin`, `employee`, `outsourced`) --
+      including the `employee` default -- require an admin Bearer token.
     """
     try:
+        _authorize_requested_role(data.role, caller)
         normalized_email = _normalize_email(data.email)
         # Check if user already exists
         query = "SELECT id FROM users WHERE email = :email"
@@ -824,6 +967,37 @@ async def login(data: LoginRequest):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password"
             )
+
+        # An employees row is matched by email alone. When the users row at that
+        # address belongs to another portal (a merchant can move its login email
+        # onto any free address without proving the mailbox), the password that
+        # just verified is that account's password, not the employee's. Unless
+        # the password is the employee's own, or this identity already holds an
+        # active employee membership, the employees row is not this caller's:
+        # log in as the account the password belongs to, and do not promote it.
+        if (
+            employee_identity
+            and user
+            and _is_non_staff_account_role(user_role)
+            and not _verify_legacy_employee_password(data.password, employee_identity)
+            and not await _safe_get_active_membership(normalized_email, "employee")
+        ):
+            logger.warning(
+                "[Auth] Ignoring employees row at %s for a %s login: password not proven for the employee",
+                normalized_email,
+                user_role,
+            )
+            await _safe_record_identity_event(
+                event_type="employee_promotion_refused",
+                email=normalized_email,
+                details={
+                    "users_role": user_role,
+                    "employee_id": str(employee_identity.get("employee_id") or ""),
+                    "reason": "password_not_proven_for_employee",
+                    "source": "login",
+                },
+            )
+            employee_identity = None
 
         # Check if user is active. An active employee row can repair a stale or
         # deactivated users row created by another portal.
@@ -1096,38 +1270,6 @@ async def test_auth():
             "login": "POST /api/auth/login",
             "me": "GET /api/auth/me (requires Authorization header)",
             "logout": "POST /api/auth/logout (requires Authorization header)"
-        },
-        "test_credentials": {
-            "super_admin": {
-                "email": "superadmin@pivota.com",
-                "password": "Admin123!",
-                "role": "super_admin"
-            },
-            "admin": {
-                "email": "admin@pivota.com",
-                "password": "Admin123!",
-                "role": "admin"
-            },
-            "employee": {
-                "email": "employee@pivota.com",
-                "password": "Admin123!",
-                "role": "employee"
-            },
-            "outsourced": {
-                "email": "outsourced@pivota.com",
-                "password": "Admin123!",
-                "role": "outsourced"
-            },
-            "merchant": {
-                "email": "merchant@test.com",
-                "password": "Admin123!",
-                "role": "merchant"
-            },
-            "agent": {
-                "email": "agent@test.com",
-                "password": "Admin123!",
-                "role": "agent"
-            }
         },
         "employee_roles": {
             "super_admin": "Complete control over the system",

@@ -187,7 +187,7 @@ class TestErrorHandlerMiddleware:
         assert error["message"] == "Product with ID 'test-123' not found"
         assert error["details"]["product_id"] == "test-123"
         # Live default (docs.pivota.cc has no DNS; no fabricated per-code path).
-        assert error["documentation_url"] == "https://api.pivota.cc/docs"
+        assert error["documentation_url"] == "https://api.pivota.cc/agent/docs/overview"
         
         # Check metadata
         assert "timestamp" in data["metadata"]
@@ -307,15 +307,21 @@ class TestErrorResponseConsistency:
 
 class TestErrorDocumentationUrl:
     """documentation_url must never point at a dead host (docs.pivota.cc has no
-    DNS — audited 2026-08-08). Default is the live Swagger page with NO
+    DNS — audited 2026-08-08). Default is a live, PUBLIC docs page with no
     fabricated per-code path; per-code links return only under an explicit
-    ERROR_DOCS_BASE_URL."""
+    ERROR_DOCS_BASE_URL.
 
-    def test_default_is_live_docs_page_without_per_code_path(self, monkeypatch):
+    It was the API's own Swagger page until that was closed in production — the
+    full internal route list is not something to serve anonymously. Every error
+    body carries this URL, so leaving it pointed at a now-404 page would have
+    re-created the dead-link defect this class exists to prevent. The curated
+    agent docs are public and a better destination anyway."""
+
+    def test_default_is_a_public_live_docs_page_without_per_code_path(self, monkeypatch):
         from utils.error_codes import error_documentation_url
 
         monkeypatch.delenv("ERROR_DOCS_BASE_URL", raising=False)
-        assert error_documentation_url("PRODUCT_NOT_FOUND") == "https://api.pivota.cc/docs"
+        assert error_documentation_url("PRODUCT_NOT_FOUND") == "https://api.pivota.cc/agent/docs/overview"
 
     def test_explicit_base_restores_per_code_links(self, monkeypatch):
         from utils.error_codes import error_documentation_url

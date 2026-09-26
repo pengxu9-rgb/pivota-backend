@@ -18,7 +18,9 @@ Scope, deliberately narrow:
     keying is unchanged, and an unresolvable domain leaves the seed alone
     (its seller_ref, right or wrong, is a question for its own lane).
 
-Writes are chunked (the Railway public proxy drops long statements), each
+Writes are chunked (the old Railway public proxy dropped long statements; the
+chunking is kept because it also bounds statement time and makes re-runs
+cheap), each
 chunk is a single UPDATE ... WHERE id = ANY(...) with the SAME target value,
 and re-running is a no-op for already-updated rows (converge, don't toggle).
 

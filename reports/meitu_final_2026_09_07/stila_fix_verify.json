@@ -1,0 +1,147 @@
+{
+ "ancestor_predicate_by_path": {
+  "error": "ArgumentError: This text() construct doesn't define a bound parameter named 'ql'"
+ },
+ "admitted_counts": [
+  {
+   "stila_rows": 6,
+   "all_rows": 190,
+   "all_products": 79
+  }
+ ],
+ "widening_only": [
+  {
+   "rows_added_by_ancestor_door": 140,
+   "products_added": 32,
+   "brands_added": 15
+  }
+ ],
+ "widening_brands": {
+  "error": "ArgumentError: This text() construct doesn't define a bound parameter named 'ql'"
+ },
+ "top_after_fix": [
+  {
+   "brand": "Stila Cosmetics",
+   "title": "Mini Stay All Day\u00ae Liquid Lipstick - Patina",
+   "category_path": "beauty/makeup",
+   "rank_score": 440
+  },
+  {
+   "brand": "Stila Cosmetics",
+   "title": "Stay All Day\u00ae Liquid Lipstick Shimmer & Sheer",
+   "category_path": "beauty/makeup",
+   "rank_score": 440
+  },
+  {
+   "brand": "Stila Cosmetics",
+   "title": "Stay All Day\u00ae Liquid Lipstick",
+   "category_path": "beauty/makeup",
+   "rank_score": 440
+  },
+  {
+   "brand": "Stila Cosmetics",
+   "title": "Mini Stay All Day\u00ae Liquid Lipstick",
+   "category_path": "beauty/makeup",
+   "rank_score": 440
+  },
+  {
+   "brand": "Stila Cosmetics",
+   "title": "Kisses Make Me Happy Stay All Day\u00ae Liquid Lipstick Duo ($48 Value)",
+   "category_path": "beauty/makeup",
+   "rank_score": 440
+  },
+  {
+   "brand": "Stila Cosmetics",
+   "title": "Stay All Day\u00ae Liquid Lipstick - Fiery",
+   "category_path": "beauty/makeup",
+   "rank_score": 440
+  },
+  {
+   "brand": "Clarins",
+   "title": "Lip Perfector Peptide-Plumping + Hydrating Lip Gloss",
+   "category_path": "beauty/makeup/lip/lip_gloss",
+   "rank_score": 350
+  },
+  {
+   "brand": "Clarins",
+   "title": "Lip Comfort Oil",
+   "category_path": "beauty/makeup/lip/lip_oil",
+   "rank_score": 350
+  },
+  {
+   "brand": "Clarins",
+   "title": "Joli Rouge Shine",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 350
+  },
+  {
+   "brand": "Clarins",
+   "title": "Joli Rouge",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 350
+  },
+  {
+   "brand": "Lord & Berry",
+   "title": "Timeless Kissproof Lipstick",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 350
+  },
+  {
+   "brand": "Lord & Berry",
+   "title": "Vogue Matte Lipstick",
+   "category_path": "beauty/makeup/lip/lipstick",
+   "rank_score": 350
+  },
+  {
+   "brand": "OILUJ",
+   "title": "OIL\u00d9J, \"Lip Life\"",
+   "category_path": "beauty/makeup/lip/balm",
+   "rank_score": 350
+  },
+  {
+   "brand": "Fenty Beauty",
+   "title": "Gloss Bomb Oil Luminizing Lip Oil 'N Gloss \u2014 Razzberry Jamz",
+   "category_path": "beauty/makeup/lip/lip-oil",
+   "rank_score": 350
+  },
+  {
+   "brand": "Fenty Beauty",
+   "title": "Gloss Bomb Oil Luminizing Lip Oil 'N Gloss \u2014 Miss Jellyfish",
+   "category_path": "beauty/makeup/lip/lip-oil",
+   "rank_score": 350
+  },
+  {
+   "brand": "Fenty Beauty",
+   "title": "Gloss Bomb Swirl Twisted Lip Luminizer \u2014 Fu$$y Chocolit",
+   "category_path": "beauty/makeup/lip/gloss",
+   "rank_score": 350
+  },
+  {
+   "brand": "Fenty Beauty",
+   "title": "Gloss Bomb Swirl Twisted Lip Luminizer \u2014 Fu$$y Chocolit",
+   "category_path": "beauty/makeup/lip/gloss",
+   "rank_score": 350
+  },
+  {
+   "brand": "fenty beauty",
+   "title": "Gloss Bomb Universal Lip Luminizer \u2014 Glass Slipper",
+   "category_path": "beauty/makeup/lip/gloss",
+   "rank_score": 350
+  },
+  {
+   "brand": "fenty beauty",
+   "title": "Gloss Bomb Universal Lip Luminizer \u2014 Glass Slipper",
+   "category_path": "beauty/makeup/lip/gloss",
+   "rank_score": 350
+  },
+  {
+   "brand": "fenty beauty",
+   "title": "Gloss Bomb Universal Lip Luminizer \u2014 Glass Slipper",
+   "category_path": "beauty/makeup/lip/gloss",
+   "rank_score": 350
+  }
+ ],
+ "anchor_match_after_glyph_fix": {
+  "error": "ArgumentError: This text() construct doesn't define a bound parameter named 'ql'"
+ }
+}

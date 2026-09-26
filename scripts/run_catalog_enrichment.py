@@ -173,15 +173,15 @@ async def _do_ingest(args: argparse.Namespace) -> int:
     )
     if not args.apply:
         if pdps:
-            logger.info("sample pdp row: %s", json.dumps({k: v for k, v in pdps[0].items() if k != "product_payload"}, ensure_ascii=False))
+            logger.info("sample pdp row: %s", json.dumps({k: v for k, v in pdps[0].items() if k != "product_payload"}, ensure_ascii=False, default=str))
         if skus:
-            logger.info("sample sku row: %s", json.dumps({k: v for k, v in skus[0].items() if k != "sku_payload"}, ensure_ascii=False))
+            logger.info("sample sku row: %s", json.dumps({k: v for k, v in skus[0].items() if k != "sku_payload"}, ensure_ascii=False, default=str))
         if merchants:
-            logger.info("sample merchant row: %s", json.dumps({k: v for k, v in merchants[0].items() if k != "metadata_json"}, ensure_ascii=False))
+            logger.info("sample merchant row: %s", json.dumps({k: v for k, v in merchants[0].items() if k != "metadata_json"}, ensure_ascii=False, default=str))
         if offers:
-            logger.info("sample offer row: %s", json.dumps({k: v for k, v in offers[0].items() if k != "offer_payload"}, ensure_ascii=False))
+            logger.info("sample offer row: %s", json.dumps({k: v for k, v in offers[0].items() if k != "offer_payload"}, ensure_ascii=False, default=str))
         if seeds:
-            logger.info("sample seed row: %s", json.dumps({k: v for k, v in seeds[0].items() if k != "seed_data"}, ensure_ascii=False))
+            logger.info("sample seed row: %s", json.dumps({k: v for k, v in seeds[0].items() if k != "seed_data"}, ensure_ascii=False, default=str))
         return 0
 
     # Apply mode — execute the plan via the shared FK-order executor

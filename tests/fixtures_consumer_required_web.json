@@ -1,0 +1,139 @@
+{
+  "query": "What are three fragrance-free moisturizers for sensitive skin available in the US? Include sources.",
+  "result": {
+    "scan_mode": "consumer_answer_test",
+    "provider": "chatgpt",
+    "runs_count": 1,
+    "failed_runs": 0,
+    "succeeded_runs": 1,
+    "error_reasons": [],
+    "scores": null,
+    "findings": [],
+    "usage": {
+      "input_tokens": 10526,
+      "output_tokens": 327,
+      "tokens_in": 10526,
+      "tokens_out": 327,
+      "latency_ms": 6656,
+      "cost_usd_estimate": 0.08744,
+      "cost_usd_estimate_min": 0.07244,
+      "cost_basis": "published_list_price_upper_bound_2026_09_09",
+      "cost_settled": false,
+      "cached_input_tokens": 0,
+      "web_search_requests": 1,
+      "failed_runs": 0,
+      "succeeded_runs": 1
+    },
+    "raw_runs": [
+      {
+        "query": "What are three fragrance-free moisturizers for sensitive skin available in the US? Include sources.",
+        "raw": "Three fragrance-free moisturizers for sensitive skin that are available in the U.S.:\n\n- Vanicream Daily Facial Moisturizer — Lightweight, non-comedogenic, and formulated specifically for sensitive skin. It contains hyaluronic acid, squalane, and five ceramides, with no fragrance, botanical extracts, or essential oils. ([vanicream.com](https://www.vanicream.com/product/vanicream-daily-facial-moisturizer?utm_source=openai))\n- CeraVe Moisturizing Cream — A richer face-and-body option for dry to very dry sensitive skin. It’s fragrance-free and contains ceramides, hyaluronic acid, petrolatum, and glycerin to support the skin barrier and retain moisture. ([africa.cerave.com](https://africa.cerave.com/en/sitecore/content/loreal/brandsites/cerave/americas/us/home/skincare/moisturizers/moisturizing-cream?utm_source=openai))\n- Aveeno Calm + Restore Oat Gel Moisturizer — A lightweight facial gel designed for sensitive skin. It uses prebiotic oat and feverfew and is fragrance-free; a good option if you prefer a lighter texture. ([aveeno.com](https://www.aveeno.com/products/calm-restore-oat-gel-moisturizer-sensitive-skin?utm_source=openai))\n\nFor very reactive skin, Vanicream is particularly straightforward because it also avoids essential oils and botanical extracts. For very dry skin, CeraVe's richer cream may be preferable.",
+        "parsed": null,
+        "evidence_kind": "consumer_answer",
+        "prompt_contract": "consumer_query_openai_web_required_v2",
+        "answer": {
+          "text": "Three fragrance-free moisturizers for sensitive skin that are available in the U.S.:\n\n- Vanicream Daily Facial Moisturizer — Lightweight, non-comedogenic, and formulated specifically for sensitive skin. It contains hyaluronic acid, squalane, and five ceramides, with no fragrance, botanical extracts, or essential oils. ([vanicream.com](https://www.vanicream.com/product/vanicream-daily-facial-moisturizer?utm_source=openai))\n- CeraVe Moisturizing Cream — A richer face-and-body option for dry to very dry sensitive skin. It’s fragrance-free and contains ceramides, hyaluronic acid, petrolatum, and glycerin to support the skin barrier and retain moisture. ([africa.cerave.com](https://africa.cerave.com/en/sitecore/content/loreal/brandsites/cerave/americas/us/home/skincare/moisturizers/moisturizing-cream?utm_source=openai))\n- Aveeno Calm + Restore Oat Gel Moisturizer — A lightweight facial gel designed for sensitive skin. It uses prebiotic oat and feverfew and is fragrance-free; a good option if you prefer a lighter texture. ([aveeno.com](https://www.aveeno.com/products/calm-restore-oat-gel-moisturizer-sensitive-skin?utm_source=openai))\n\nFor very reactive skin, Vanicream is particularly straightforward because it also avoids essential oils and botanical extracts. For very dry skin, CeraVe's richer cream may be preferable.",
+          "sha256": "af94ccc789560d64fe1b7a4c97bfa5906b4fcfb81e92ffff069e8b7356ba4787",
+          "complete": true,
+          "transport_complete": true,
+          "qualification": "cited_consumer_answer_v2",
+          "unknown_reason": null,
+          "finish_reason": "completed",
+          "status": "complete",
+          "provider": "chatgpt",
+          "model": "chat-latest",
+          "captured_at": "2026-09-10T02:04:21.791Z",
+          "execution": {
+            "model": "chat-latest",
+            "tool": "web_search_preview",
+            "tool_choice": "required",
+            "max_output_tokens": 900
+          },
+          "web_search_requests": 1,
+          "prompt_sha256": "59cb64ac3bfe07cd7597eee5094c47c58b5ceea5f718240039c703f3b85bd99f"
+        },
+        "grounding_chunks": [
+          "https://www.vanicream.com/product/vanicream-daily-facial-moisturizer?utm_source=openai",
+          "https://africa.cerave.com/en/sitecore/content/loreal/brandsites/cerave/americas/us/home/skincare/moisturizers/moisturizing-cream?utm_source=openai",
+          "https://www.aveeno.com/products/calm-restore-oat-gel-moisturizer-sensitive-skin?utm_source=openai"
+        ],
+        "grounding_sources": [
+          {
+            "uri": "https://www.vanicream.com/product/vanicream-daily-facial-moisturizer?utm_source=openai",
+            "title": "Vanicream™ Daily Facial Moisturizer for Sensitive Skin"
+          },
+          {
+            "uri": "https://africa.cerave.com/en/sitecore/content/loreal/brandsites/cerave/americas/us/home/skincare/moisturizers/moisturizing-cream?utm_source=openai",
+            "title": "Moisturizing Cream | Moisturizers | CeraVe"
+          },
+          {
+            "uri": "https://www.aveeno.com/products/calm-restore-oat-gel-moisturizer-sensitive-skin?utm_source=openai",
+            "title": "AVEENO Calm + Restore Oat Gel Moisturizer, Sensitive Skin | Aveeno®"
+          }
+        ],
+        "retrieved_sources": [
+          {
+            "uri": "https://www.aveeno.com/products/calm-restore-oat-gel-moisturizer-sensitive-skin",
+            "title": ""
+          },
+          {
+            "uri": "https://www.aveeno.com/products/calm-restore",
+            "title": ""
+          },
+          {
+            "uri": "https://www.aveeno.com/journal/sensitive-skin-your-daily-care",
+            "title": ""
+          },
+          {
+            "uri": "https://www.vanicream.com/product/vanicream-daily-facial-moisturizer",
+            "title": ""
+          },
+          {
+            "uri": "https://www.cerave.com/skincare/moisturizers/eczema-relief-moisturizing-cream",
+            "title": ""
+          },
+          {
+            "uri": "https://www.aveeno.com/products/skin-care/facial-moisturizer",
+            "title": ""
+          },
+          {
+            "uri": "https://www.vanicream.com/body-products",
+            "title": ""
+          },
+          {
+            "uri": "https://www.aveeno.com/products/discontinued-products/ultra-calming-nourishing-night-cream",
+            "title": ""
+          },
+          {
+            "uri": "https://africa.cerave.com/en/sitecore/content/loreal/brandsites/cerave/americas/us/home/skincare/moisturizers/moisturizing-cream",
+            "title": ""
+          },
+          {
+            "uri": "https://www.aveeno.com/oat-oasis",
+            "title": ""
+          },
+          {
+            "uri": "https://www.aveeno.com/products/aveeno-calm-restore-daily-moisturizer-mineral-sunscreen-broad-spectrum",
+            "title": ""
+          },
+          {
+            "uri": "https://www.aveeno.com/our-ingredients/oat",
+            "title": ""
+          },
+          {
+            "uri": "https://www.vanicream.com/product/vanicream-daily-facial-moisturizer?utm_source=openai",
+            "title": ""
+          },
+          {
+            "uri": "https://africa.cerave.com/en/sitecore/content/loreal/brandsites/cerave/americas/us/home/skincare/moisturizers/moisturizing-cream?utm_source=openai",
+            "title": ""
+          },
+          {
+            "uri": "https://www.aveeno.com/products/calm-restore-oat-gel-moisturizer-sensitive-skin?utm_source=openai",
+            "title": ""
+          }
+        ]
+      }
+    ]
+  }
+}

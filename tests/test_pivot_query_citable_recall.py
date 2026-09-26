@@ -405,20 +405,20 @@ async def test_flag_off_results_byte_identical_to_offer_backed_only(
 
 
 def test_citable_track_gets_no_ownership_or_offer_boost_in_sort():
-    """_sort_items gives an ordering boost only to catalog_track ==
-    'internal_merchant'. The citable lane uses catalog_track == 'citation'
-    precisely so it inherits NO such boost — it ranks by merit only. Conversely,
-    a buyable internal item must not get an ADDED ownership boost beyond what the
-    pre-ADR-008 sort already applied. Pin both with a same-merit comparison."""
+    """Source tracks do not receive ordering boosts in unified recall.
+
+    Citable, internal merchant, and external referral rows rank by the same
+    relevance and structural evidence. Commerce readiness remains response
+    metadata and is evaluated by the transaction path.
+    """
     import inspect
 
     src = inspect.getsource(module._sort_items)
-    # The only catalog_track boost in the sort is the pre-existing
-    # internal_merchant tie-break; no 'citation' boost was added.
-    assert "internal_merchant" in src
+    assert "internal_merchant" not in src, (
+        "the internal merchant track must not receive an ownership boost"
+    )
     assert "citation" not in src, (
-        "the citable track must NOT be special-cased in _sort_items — it ranks "
-        "by merit only (no boost)"
+        "the citable track must not be special-cased in _sort_items"
     )
 
 

@@ -266,3 +266,103 @@ def test_extract_from_html_prefers_expanded_product_details_over_short_jsonld_de
         "Glucoside Foaming Cleanser removes dirt and impurities.\n"
         "Salicylic Acid 2% Solution helps clear pores."
     )
+
+
+# --- a dead destination must not be able to masquerade as a cached one -------------------------
+
+def test_resolve_external_offer_defaults_to_returning_the_cache_on_a_dead_url(monkeypatch) -> None:
+    """The existing contract, pinned before it is opted out of.
+
+    Serving deliberately prefers a cached snapshot over nothing — one transient outage must not
+    blank the catalogue. Every pre-existing caller relies on that, so `raise_on_unavailable`
+    defaults to False and this behaviour is unchanged.
+    """
+    import asyncio
+
+    from services import external_offers_service as eos
+
+    cached = {"id": "eo_1", "market": "US", "canonical_url": "https://brand.com/products/x"}
+
+    async def fake_get_snapshot_row(_market, _hash):
+        return cached
+
+    async def fake_fetch_html(url, *, max_wait=None, observed=None):
+        raise eos.ExternalOfferUnavailable(status_code=404, url=url)
+
+    monkeypatch.setattr(eos, "_get_snapshot_row", fake_get_snapshot_row)
+    monkeypatch.setattr(eos, "_fetch_html", fake_fetch_html)
+    monkeypatch.setattr(eos, "_row_to_snapshot", lambda row: row)
+    monkeypatch.setattr(eos, "_is_stale", lambda _ts: True)
+
+    got = asyncio.run(
+        eos.resolve_external_offer(market="US", url="https://brand.com/products/x")
+    )
+    assert got is cached
+
+
+def test_resolve_external_offer_can_be_asked_to_surface_a_dead_url(monkeypatch) -> None:
+    """THE DEFECT THIS OPT-IN REMOVES.
+
+    `_refresh_external_seed_by_id` got the cached snapshot back, wrote it, and set
+    `updated_at = NOW()` — so fetching a 404 made the seed look FRESHER to the staleness gate.
+    A caller asking about the LINK rather than the CONTENT must hear the 404.
+    """
+    import asyncio
+
+    import pytest as _pytest
+
+    from services import external_offers_service as eos
+
+    cached = {"id": "eo_1", "market": "US"}
+
+    async def fake_get_snapshot_row(_market, _hash):
+        return cached
+
+    async def fake_fetch_html(url, *, max_wait=None, observed=None):
+        raise eos.ExternalOfferUnavailable(status_code=404, url=url, final_url=url)
+
+    monkeypatch.setattr(eos, "_get_snapshot_row", fake_get_snapshot_row)
+    monkeypatch.setattr(eos, "_fetch_html", fake_fetch_html)
+    monkeypatch.setattr(eos, "_row_to_snapshot", lambda row: row)
+    monkeypatch.setattr(eos, "_is_stale", lambda _ts: True)
+
+    with _pytest.raises(eos.ExternalOfferUnavailable) as caught:
+        asyncio.run(
+            eos.resolve_external_offer(
+                market="US", url="https://brand.com/products/x", raise_on_unavailable=True
+            )
+        )
+    assert caught.value.status_code == 404
+
+
+def test_a_transport_failure_still_falls_back_to_the_cache_even_when_asked_to_raise(
+    monkeypatch,
+) -> None:
+    """`raise_on_unavailable` is about the ORIGIN'S ANSWER, not about our own network.
+
+    A timeout says nothing about the product, so it keeps the old fallback — otherwise a flaky
+    link would break serving for every caller that opted in.
+    """
+    import asyncio
+
+    from services import external_offers_service as eos
+
+    cached = {"id": "eo_1", "market": "US"}
+
+    async def fake_get_snapshot_row(_market, _hash):
+        return cached
+
+    async def fake_fetch_html(url, *, max_wait=None, observed=None):
+        raise TimeoutError("connect timeout")
+
+    monkeypatch.setattr(eos, "_get_snapshot_row", fake_get_snapshot_row)
+    monkeypatch.setattr(eos, "_fetch_html", fake_fetch_html)
+    monkeypatch.setattr(eos, "_row_to_snapshot", lambda row: row)
+    monkeypatch.setattr(eos, "_is_stale", lambda _ts: True)
+
+    got = asyncio.run(
+        eos.resolve_external_offer(
+            market="US", url="https://brand.com/products/x", raise_on_unavailable=True
+        )
+    )
+    assert got is cached

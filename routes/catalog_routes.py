@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from models.catalog import (
     CatalogSyncJobCreateRequest,
@@ -18,15 +18,57 @@ from services.catalog_sync_service import (
     rebuild_beauty_verticals_for_merchant,
     reconcile_catalog_incentives_for_merchant,
     record_catalog_sync_event,
-    run_catalog_sync_job,
 )
-from services.shopify_products_sync import sync_shopify_products_for_merchant
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/catalog", tags=["catalog"])
+
+
+def _normalize_merchant_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _has_catalog_scope(merchant_id: str, current_user: Dict[str, Any]) -> bool:
+    """True when this caller may act on `merchant_id`.
+
+    Admins act on any merchant; everyone else only on the merchant named by
+    their own JWT claim. Same shape as the sibling catalog write in
+    `routes/universal_product_sync.py`.
+    """
+    if str(current_user.get("role") or "") in ADMIN_ROLES:
+        return True
+    caller_merchant_id = _normalize_merchant_id(current_user.get("merchant_id"))
+    # A token carrying no merchant_id claim must not match a blank requested
+    # id — without the truthiness guard, "" == "" would wave it through.
+    return bool(caller_merchant_id) and caller_merchant_id == _normalize_merchant_id(merchant_id)
+
+
+def _require_catalog_scope(merchant_id: str, current_user: Dict[str, Any]) -> str:
+    """Refuse catalog work aimed at a merchant the caller does not own.
+
+    `get_current_user` accepts ANY valid JWT of ANY role and is used here only
+    for a `requested_by` label, so without this check the `merchant_id` in the
+    path/body/query is simply whatever the caller typed. Two of these routes
+    reach `ingest_standard_products`, which writes `catalog_merchants`,
+    `catalog_products`, `catalog_skus` and `catalog_offers` for that id —
+    including ADR-009 `merch_obs_*` observed-seller ids that belong to no
+    tenant, and so are reachable by admins only.
+
+    Returns the NORMALIZED id, and every caller must use the return value
+    downstream. Authorizing a stripped value while passing the raw one on lets
+    a caller mint a `catalog_merchants` row keyed on "\xa0merch_owned\n" — the
+    id that was authorized must be the id that gets written.
+    """
+    normalized = _normalize_merchant_id(merchant_id)
+    if not _has_catalog_scope(normalized, current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="cannot run catalog jobs for another merchant",
+        )
+    return normalized
 
 
 def _requested_by(current_user: Dict[str, Any], explicit: Optional[str]) -> Optional[str]:
@@ -56,32 +98,12 @@ def _job_response(job: Dict[str, Any]) -> CatalogSyncJobResponse:
     )
 
 
-async def _run_catalog_job_background(
-    *,
-    job_id: str,
-    merchant_id: str,
-    connector: str,
-    limit: int,
-    force_refresh: bool,
-) -> None:
-    try:
-        if force_refresh and connector == "shopify":
-            await sync_shopify_products_for_merchant(
-                merchant_id=merchant_id,
-                limit=limit,
-                ingest_catalog=False,
-            )
-        await run_catalog_sync_job(job_id)
-    except Exception as exc:  # pragma: no cover - background task
-        logger.exception("Catalog job background execution failed job_id=%s merchant_id=%s err=%s", job_id, merchant_id, exc)
-
-
 @router.post("/sync/jobs", response_model=CatalogSyncJobResponse)
 async def create_sync_job(
     req: CatalogSyncJobCreateRequest,
-    background_tasks: BackgroundTasks,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> CatalogSyncJobResponse:
+    merchant_id = _require_catalog_scope(req.merchant_id, current_user)
     scope = {
         "platform": req.platform or req.connector,
         "limit": req.limit,
@@ -93,30 +115,33 @@ async def create_sync_job(
         scope.update(req.scope)
 
     job = await create_catalog_sync_job(
-        merchant_id=req.merchant_id,
+        merchant_id=merchant_id,
         connector=req.connector,
         mode=req.mode,
         scope=scope,
         requested_by=_requested_by(current_user, req.requested_by),
     )
-    background_tasks.add_task(
-        _run_catalog_job_background,
-        job_id=str(job.get("job_id") or ""),
-        merchant_id=req.merchant_id,
-        connector=req.connector,
-        limit=req.limit,
-        force_refresh=req.force_refresh,
-    )
+    # ENQUEUE ONLY — the job row above is the whole deliverable of this request.
+    # It used to be handed to FastAPI's `BackgroundTasks`, which runs after the
+    # response inside this API process: no retry, no supervision, and nothing
+    # survives a revision swap, so a dropped ingest left a `pending` row nobody
+    # would ever look at again while the caller had a 200 in hand. Both inputs
+    # the background task needed (`limit`, `force_refresh`) are already in
+    # `scope`, so the stored row now fully describes the work;
+    # `services.catalog_sync_drain.run_catalog_sync_drain_tick` runs it and the
+    # caller polls GET /v1/catalog/sync/jobs/{job_id} for the outcome.
     return _job_response(job)
 
 
 @router.get("/sync/jobs/{job_id}", response_model=CatalogSyncJobResponse)
 async def read_sync_job(
     job_id: str,
-    _: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> CatalogSyncJobResponse:
     job = await get_catalog_sync_job(job_id)
-    if not job:
+    # 404 rather than 403 on a scope miss: a 403 would confirm that the job id
+    # exists, turning this route into a job-id enumeration oracle.
+    if not job or not _has_catalog_scope(str(job.get("merchant_id") or ""), current_user):
         raise HTTPException(status_code=404, detail="Catalog sync job not found")
     return _job_response(job)
 
@@ -128,8 +153,9 @@ async def ingest_shopify_catalog_event(
     topic: Optional[str] = Query(default=None),
     source_ref: Optional[str] = Query(default=None),
     payload: Dict[str, Any] = Body(default_factory=dict),
-    _: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> CatalogWebhookIngestResponse:
+    merchant_id = _require_catalog_scope(merchant_id, current_user)
     event = await record_catalog_sync_event(
         merchant_id=merchant_id,
         connector="shopify",
@@ -152,13 +178,13 @@ async def ingest_shopify_catalog_event(
 @router.post("/reconcile/merchants/{merchant_id}", response_model=CatalogSyncJobResponse)
 async def reconcile_catalog_for_merchant(
     merchant_id: str,
-    background_tasks: BackgroundTasks,
     connector: str = Query(default="shopify"),
     platform: Optional[str] = Query(default="shopify"),
     limit: int = Query(default=500, ge=1, le=5000),
     force_refresh: bool = Query(default=True),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> CatalogSyncJobResponse:
+    merchant_id = _require_catalog_scope(merchant_id, current_user)
     job = await create_catalog_sync_job(
         merchant_id=merchant_id,
         connector=connector,
@@ -172,14 +198,9 @@ async def reconcile_catalog_for_merchant(
         },
         requested_by=_requested_by(current_user, None),
     )
-    background_tasks.add_task(
-        _run_catalog_job_background,
-        job_id=str(job.get("job_id") or ""),
-        merchant_id=merchant_id,
-        connector=connector,
-        limit=limit,
-        force_refresh=force_refresh,
-    )
+    # ENQUEUE ONLY — see the note in `create_sync_job` above. `scope` already
+    # carries platform/limit/force_refresh, so the drain tick can run this row
+    # without the request process staying alive to do it.
     return _job_response(job)
 
 
@@ -188,8 +209,9 @@ async def rebuild_beauty_verticals(
     merchant_id: str,
     platform: Optional[str] = Query(default="shopify"),
     limit: int = Query(default=1000, ge=1, le=10000),
-    _: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
+    merchant_id = _require_catalog_scope(merchant_id, current_user)
     return await rebuild_beauty_verticals_for_merchant(
         merchant_id=merchant_id,
         platform=platform,
@@ -201,8 +223,9 @@ async def rebuild_beauty_verticals(
 async def reconcile_incentives(
     merchant_id: str,
     req: IncentivesReconcileRequest,
-    _: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> IncentivesReconcileResponse:
+    merchant_id = _require_catalog_scope(merchant_id, current_user)
     result = await reconcile_catalog_incentives_for_merchant(
         merchant_id=merchant_id,
         payment_incentives=req.payment_incentives,

@@ -20,13 +20,21 @@ api_version = "2025-10"
   # webhooks; these app-owned subscriptions are its ONLY order-delivery path.
   # They deliver to the static endpoint that resolves the merchant from
   # X-Shopify-Shop-Domain (routes/webhook_routes.py POST /webhooks/shopify/orders).
+  #
+  # Every topic services/shopify_commerce_event_adapter.py maps into the
+  # canonical ledger must be listed here, or App Store installs never deliver
+  # it: until 2026-09-04 only orders/paid was, so orders/create,
+  # orders/cancelled and refunds/create were invisible for those merchants.
+  # tests/test_shopify_refund_webhook_subscription.py pins this list against
+  # the adapter. A change here takes effect only after `shopify app deploy`
+  # publishes a new app version; merging the file does nothing by itself.
   [[webhooks.subscriptions]]
   uri = "https://api.pivota.cc/webhooks/shopify/orders"
-  topics = [ "orders/paid", "app/uninstalled" ]
+  topics = [ "orders/create", "orders/paid", "orders/cancelled", "refunds/create", "app/uninstalled" ]
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_discounts,read_fulfillments,read_orders,read_products"
+scopes = "read_customer_events,read_discounts,read_fulfillments,read_orders,read_products,write_pixels"
 optional_scopes = [ ]
 # Managed install (legacy flow removed 2026-07-07): required for the app-owned
 # [[webhooks.subscriptions]] above — Shopify rejects app-specific webhooks under

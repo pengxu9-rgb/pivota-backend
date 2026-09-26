@@ -9,7 +9,7 @@ import re
 import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy import select
 
@@ -39,8 +39,10 @@ from db.merchant_onboarding import merchant_onboarding
 from db.products import products_cache
 from models.catalog import PaymentIncentiveInput
 from models.standard_product import StandardProduct, StandardProductVariant
+from services.beauty_field_authoring import product_usage_guide_id
 from services.catalog_identity import make_content_key
 from services.category_kind import resolve_category_kind
+from services.product_exposure_service import standard_variant_in_stock
 from services.vertical_profiles import (
     is_vertical_unresolved,
     normalize_category,
@@ -593,7 +595,21 @@ def _extract_raw_inci(metadata: Dict[str, Any], ingredient_ids: List[str]) -> Op
     return None
 
 
-def _extract_tutorial_assets(product: StandardProduct, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_tutorial_assets(product_key: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Child-row identities are derived from `product_key`, which is
+    merchant-scoped (`make_catalog_product_key`) — NOT from the platform's own
+    product id, which two merchants selling the same platform product share.
+
+    The rows are replaced by a DELETE scoped to this merchant's `product_key`,
+    so a key derived off the bare platform id made the second merchant's INSERT
+    collide with the FIRST merchant's surviving row: prod 2026-08-29,
+    `duplicate key value violates unique constraint "beauty_content_assets_pkey"`,
+    aborting the whole ingest transaction and leaving that merchant zero
+    catalog_products rows. A merchant-supplied `asset_id` is namespaced for the
+    same reason — two merchants carrying one platform product carry one
+    platform-supplied asset id too. `beauty_usage_guides.guide_id` already had
+    this shape and never collided; this is that shape.
+    """
     tutorials = _json_list(_extract_metadata_values(metadata, "tutorials", "tutorial_assets", "media_assets"))
     assets: List[Dict[str, Any]] = []
     for idx, item in enumerate(tutorials):
@@ -602,9 +618,14 @@ def _extract_tutorial_assets(product: StandardProduct, metadata: Dict[str, Any])
         url = str(item.get("url") or item.get("href") or "").strip()
         if not url:
             continue
+        declared_asset_id = str(item.get("asset_id") or "").strip()
         assets.append(
             {
-                "asset_id": item.get("asset_id") or _stable_key("beauty_asset", product.id, idx, url),
+                "asset_id": (
+                    _stable_key("beauty_asset", product_key, "declared", declared_asset_id)
+                    if declared_asset_id
+                    else _stable_key("beauty_asset", product_key, idx, url)
+                ),
                 "asset_type": str(item.get("asset_type") or item.get("type") or "tutorial"),
                 "title": item.get("title"),
                 "url": url,
@@ -616,7 +637,10 @@ def _extract_tutorial_assets(product: StandardProduct, metadata: Dict[str, Any])
     return assets
 
 
-def _extract_shades(product: StandardProduct, variant: StandardProductVariant) -> List[Dict[str, Any]]:
+def _extract_shades(product_key: str, variant: StandardProductVariant) -> List[Dict[str, Any]]:
+    """`product_key`, not `product.id` — see `_extract_tutorial_assets`. This is
+    the derivation that actually fired in prod on 2026-08-29
+    (`beauty_shades_pkey`)."""
     shades: List[Dict[str, Any]] = []
     labels = list(variant.visible_option_labels or [])
     for idx, label in enumerate(labels):
@@ -627,7 +651,7 @@ def _extract_shades(product: StandardProduct, variant: StandardProductVariant) -
             continue
         shades.append(
             {
-                "shade_id": _stable_key("beauty_shade", product.id, variant.variant_id or variant.id, shade_name),
+                "shade_id": _stable_key("beauty_shade", product_key, variant.variant_id or variant.id, shade_name),
                 "shade_name": shade_name,
                 "shade_code": None,
                 "shade_family": _shade_family_from_name(shade_name),
@@ -757,6 +781,160 @@ def _preserve_existing_scope(existing: Optional[Dict[str, Any]], payload: Dict[s
             payload[field] = existing.get(field)
 
 
+def _preserve_caller_declared_fields(
+    existing: Optional[Dict[str, Any]],
+    payload: Dict[str, Any],
+    fields: Sequence[str],
+) -> None:
+    """Caller-declared birth-only columns: written on INSERT, left alone on UPDATE.
+
+    Two differences from `_preserve_non_stale_suppression` /
+    `_preserve_existing_scope` above, both deliberate.
+
+    The field list comes from the CALL SITE rather than a module constant,
+    because the column at issue here — `status` — is a real, update-owned field
+    for most of the tables `_upsert_by_pk` serves (`catalog_sync_jobs`,
+    `catalog_sync_events` both move it on purpose). Only
+    `catalog_merchants.status` is owned by writers OUTSIDE this module, so only
+    that call site declares it. See `upsert_catalog_merchant`.
+
+    And it DELETES the key rather than writing the existing value back. Those two
+    are equivalent only if nothing else writes the column in between. Here
+    something does: `store_lifecycle_service` writes `catalog_merchants.status`
+    from lifecycle routes and from the hourly sweep, while a sync or an audit can
+    be mid-flight — and the audit path is not inside a transaction, so its window
+    between `_fetch_one_by_pk` and the UPDATE is wide. Writing the value back
+    would REVERT a lifecycle write that landed inside that window, which is a
+    smaller version of the exact bug this guard exists to fix. Dropping the
+    column from the UPDATE leaves the concurrent write standing.
+    """
+    if not existing:
+        return
+    for field in fields:
+        payload.pop(field, None)
+
+
+def _json_merge_expression(table: Any, column: str, patch: Dict[str, Any]) -> Any:
+    """A SERVER-SIDE shallow merge of `patch` into `table.column`, expressed as
+    the value of that column inside the UPDATE that carries it.
+
+    NOT a read-modify-write. `services/brand_claim_service.set_merchant_brand_direct`
+    already writes `catalog_merchants.metadata_json` this way and says why in its
+    own docstring: it stamps ONE key (`brand_relationship`) and must not disturb
+    the others, and reading the column then writing a whole dict back would
+    revert whatever landed in between (B2). The same reasoning applies in the
+    other direction here — this module stamps `ingested_from` and must not
+    disturb `brand_relationship`. Both writers therefore let the database do the
+    combining, and neither can lose the other's key regardless of interleaving.
+
+    Dialect-split because the two engines spell the same shallow merge
+    differently, and BOTH spellings must be server-side or the SQLite half of
+    the suite would be exercising a read-modify-write the production path does
+    not have:
+
+      * Postgres — `COALESCE(col, '{}') || patch`, with the patch bound as
+        `CAST(:param AS JSONB)`. NOT the cast-after-parameter form: SQLAlchemy's
+        text() parser would read the parameter name and the cast that follows it
+        as ONE parameter, and the bind would not resolve.
+        `tests/test_phase5_8_meta_invariants.py::test_no_param_double_colon_cast_in_raw_sql`
+        fails the build on that form — including, as this comment learned, when
+        it appears in a docstring quoting the form it warns against.
+      * SQLite — `json_patch(COALESCE(col, '{}'), patch)`.
+
+    The two agree for every patch this repo writes (flat, string-valued, no
+    nulls) but are not identical in general: RFC 7396 `json_patch` DELETES a key
+    whose patch value is null and merges nested objects RECURSIVELY, where `||`
+    stores the null and replaces a nested object wholesale. Production semantics
+    are Postgres', and are pinned by the Postgres gate in
+    `tests/test_catalog_merchant_metadata_merge_postgres.py` rather than by the
+    SQLite suite, which cannot see that difference.
+    """
+    from sqlalchemy import text as _sa_text
+
+    from db.database import IS_POSTGRES
+
+    qualified = f"{_table_debug_name(table)}.{column}"
+    param = f"_merge_{column}"
+    if IS_POSTGRES:
+        sql = (
+            f"COALESCE({qualified}, CAST('{{}}' AS JSONB)) "
+            f"|| CAST(:{param} AS JSONB)"
+        )
+    else:
+        sql = f"json_patch(COALESCE({qualified}, '{{}}'), :{param})"
+    return _sa_text(sql).bindparams(**{param: json.dumps(patch, default=str)})
+
+
+def _merge_caller_declared_json(
+    existing: Optional[Dict[str, Any]],
+    payload: Dict[str, Any],
+    table: Any,
+    fields: Sequence[str],
+) -> None:
+    """Caller-declared MULTI-OWNER JSON columns: written whole on INSERT, merged
+    key-by-key on UPDATE.
+
+    `catalog_merchants.metadata_json` is not one writer's column. It is a union
+    of independently-owned key namespaces:
+
+      * `brand_relationship` — `services/brand_claim_service.set_merchant_brand_direct`,
+        the result of a DNS/email ownership proof. It is the ONLY thing
+        `services/offer_classification.classify_offer_type` trusts to surface an
+        offer as brand-direct, and `services/pivot_query_service` reads it back
+        out on three serving paths (`bm.metadata_json->>'brand_relationship'`).
+      * `observed` / `minted_by` / `adr` / `brand_identity` / `seller_identity` —
+        `services/seller_identity.py`, stamped when an ADR-009 D2 observed
+        seller-of-record is minted.
+      * `ingested_from` — this module and `services/audit_index_intake.py`.
+
+    So a whole-column write from any one of them destroys the others. That is
+    the same defect PR #1857 fixed for `status` one column over, and it was live:
+    a URL audit (`{"ingested_from": "url_audit_intake"}`) or any
+    `ingest_standard_products` run (`{"ingested_from": <source_system>}`) REPLACED
+    the column outright, so the next catalog sync silently undid a verified brand
+    claim and a serving offer stopped being labelled brand-direct.
+
+    MERGE rather than the birth-only `preserve_on_update` treatment `status`
+    got, because the two columns differ in who owns them. `status` has exactly
+    one rightful owner outside this module, so dropping it from the UPDATE
+    restores the right answer. `metadata_json` has several, and this module
+    genuinely owns one of its keys — preserving the whole column would make
+    `ingested_from` unwritable on any row that already exists. Merging is the
+    treatment that lets every owner keep writing its own keys.
+
+    An empty patch is DROPPED from the UPDATE rather than merged: a caller with
+    nothing to say must not rewrite the column at all, and `metadata_json or {}`
+    at the call site turns "said nothing" into `{}`. On INSERT nothing happens
+    here, so `{}` still lands and a fresh row is born with an object rather than
+    NULL.
+
+    A payload value that is not a dict is also dropped rather than merged. No
+    caller does that today (the parameter is typed `Optional[Dict[str, Any]]`),
+    and dropping is the fail-safe reading: the alternative — falling back to a
+    whole-column write — would silently reintroduce exactly the clobber this
+    function exists to prevent.
+    """
+    if not existing:
+        return
+    for field in fields:
+        if field not in payload:
+            continue
+        value = payload[field]
+        if not isinstance(value, dict):
+            if value is not None:
+                logger.warning(
+                    "catalog upsert: %s.%s declared mergeable but got %s — "
+                    "dropping it from the UPDATE rather than clobbering",
+                    _table_debug_name(table), field, type(value).__name__,
+                )
+            payload.pop(field, None)
+            continue
+        if not value:
+            payload.pop(field, None)
+            continue
+        payload[field] = _json_merge_expression(table, field, value)
+
+
 async def _resolve_catalog_sku_key(
     *,
     merchant_id: str,
@@ -784,7 +962,14 @@ def _table_debug_name(table: Any) -> str:
     return str(getattr(table, "name", None) or type(table).__name__)
 
 
-async def _upsert_by_pk(table: Any, pk_name: str, values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+async def _upsert_by_pk(
+    table: Any,
+    pk_name: str,
+    values: Dict[str, Any],
+    *,
+    preserve_on_update: Sequence[str] = (),
+    merge_json_on_update: Sequence[str] = (),
+) -> Optional[Dict[str, Any]]:
     table_name = _table_debug_name(table)
     try:
         pk_value = values[pk_name]
@@ -792,6 +977,8 @@ async def _upsert_by_pk(table: Any, pk_name: str, values: Dict[str, Any]) -> Opt
         payload = dict(values)
         _preserve_non_stale_suppression(existing, payload)
         _preserve_existing_scope(existing, payload)
+        _preserve_caller_declared_fields(existing, payload, preserve_on_update)
+        _merge_caller_declared_json(existing, payload, table, merge_json_on_update)
         payload["updated_at"] = _utcnow()
         if existing:
             await database.execute(
@@ -819,19 +1006,53 @@ async def _replace_child_rows(table: Any, match_column: str, match_value: Any, r
     return count
 
 
-async def _replace_child_rows_multi(table: Any, where_clauses: List[Any], rows: Iterable[Dict[str, Any]]) -> int:
+async def _replace_child_rows_multi(
+    table: Any,
+    where_clauses: List[Any],
+    rows: Iterable[Dict[str, Any]],
+    *,
+    pk_name: str,
+) -> int:
+    """Replace one scope's child rows — DELETE the scope, then write `rows`.
+
+    The DELETE is scoped (this merchant's `product_key`); the write is keyed by
+    primary key, and those two scopes are not the same set. Two independent ways
+    a key can already be present when we go to write it, both of which used to
+    raise `UniqueViolation` out of a plain INSERT and abort the ENTIRE ingest
+    transaction — one bad child row cost the merchant every catalog_products row
+    in the run (prod 2026-08-29):
+
+      1. WITHIN this batch. One product can legitimately derive the same child
+         id twice. Two `platform_metadata.tutorials` entries carrying the same
+         merchant-declared `asset_id` hash to one `asset_id`; two variants with
+         no variant id of their own both fall back to `product_key` and hash to
+         one `shade_id` per shade name. Dedupe on the PK, last wins.
+
+         Product-level payloads collected once per VARIANT used to be the third
+         and loudest case here. They no longer are: `beauty_content_assets` and
+         `beauty_usage_guides` rows are derived once, outside the variant loop,
+         and written with a NULL `sku_key`. Deduping them was never enough on
+         its own — the survivor kept the LAST variant's `sku_key`, so a per-SKU
+         read found a product-level tutorial on one variant and no other.
+
+      2. OUTSIDE the delete scope. Every derivation is merchant-scoped now, so
+         this can only be residue written under an older, unscoped derivation.
+         Upsert rather than INSERT so that residue degrades to a row rewrite
+         instead of costing the merchant their whole catalog.
+
+    Returns the number of DISTINCT rows written, which is what the caller's
+    `*_upserted` stat means.
+    """
     stmt = table.delete()
     for clause in where_clauses:
         stmt = stmt.where(clause)
     await database.execute(stmt)
-    count = 0
+    deduped: Dict[Any, Dict[str, Any]] = {}
     for row in rows:
-        payload = dict(row)
-        payload.setdefault("created_at", _utcnow())
-        payload.setdefault("updated_at", _utcnow())
-        await database.execute(table.insert().values(**payload))
-        count += 1
-    return count
+        deduped[row.get(pk_name)] = dict(row)
+    for payload in deduped.values():
+        await _upsert_by_pk(table, pk_name, payload)
+    return len(deduped)
 
 
 async def _append_snapshot(table: Any, values: Dict[str, Any]) -> None:
@@ -1039,6 +1260,9 @@ async def _resolve_merchant_name(merchant_id: str) -> Optional[str]:
     return None
 
 
+MERCHANT_STATUS_ON_MINT = "active"
+
+
 async def upsert_catalog_merchant(
     *,
     merchant_id: str,
@@ -1047,13 +1271,66 @@ async def upsert_catalog_merchant(
     source_system: str,
     source_ref: Optional[str],
     metadata_json: Optional[Dict[str, Any]] = None,
-    status: str = "active",
+    status: Optional[str] = None,
 ) -> None:
-    # `status` defaults to 'active' so every existing caller (synced tenants,
-    # url_audit intake) is unchanged. Observed sellers minted at ingestion pass
-    # status='observed' (ADR-009 D2) — first-class but NOT servable as the public
-    # citation artifact until graduation (pivota_canonical_routes gates on
-    # status='active'). See services/seller_identity.py.
+    """Upsert the `catalog_merchants` row for `merchant_id`.
+
+    TWO of this row's columns are owned by writers OUTSIDE this module, and each
+    needs its own treatment on UPDATE. `status` is birth-only (below).
+    `metadata_json` is MERGED key-by-key rather than replaced, because it is a
+    union of several owners' key namespaces — see `_merge_caller_declared_json`
+    for which key belongs to whom and what the whole-column write destroyed.
+
+    `status=None` (the default) means "mint as 'active', but do NOT move an
+    existing row's status". This upsert applies its whole payload on UPDATE, so
+    while the default was the literal 'active' every content re-sync silently
+    re-activated the merchant — a clobber of a column this module does not own:
+
+      * `services/store_lifecycle_service.py` owns active <-> inactive, derived
+        from `merchant_stores`. PR #1852 made deleting your LAST store flip the
+        merchant to 'inactive' so it stops serving on public recall. That
+        transition is TERMINAL by construction: `reconcile_catalog_merchant_statuses`
+        drives off `SELECT DISTINCT merchant_id FROM merchant_stores`, so a
+        merchant with zero store rows is invisible to the hourly sweep and
+        nothing ever re-derives it. Every OTHER transition this clobber touched
+        was repaired within a tick; this one was not. Reproduced through
+        `services/audit_index_intake.py` (a URL audit from the merchant portal)
+        and through `ingest_standard_products`, both of which reach here with no
+        `status` argument: detach your last store -> 'inactive' -> run one audit
+        -> 'active' again, with zero `merchant_stores` rows.
+      * `services/seller_identity.py` mints crawl-observed sellers at
+        `status='observed'` (ADR-009 D2) — deliberately not servable as the
+        public citation artifact until graduation. The clobber graduated them
+        with no review, and that half WAS reachable: `routes/catalog_routes.py`
+        takes `merchant_id` from the request body (`POST /v1/catalog/sync/jobs`)
+        or the path (`POST /v1/catalog/reconcile/merchants/{merchant_id}`,
+        `POST /v1/catalog/verticals/beauty/rebuild/{merchant_id}`) under a bare
+        `Depends(get_current_user)` with NO tenant scoping, and each runs
+        through `run_catalog_sync_job` -> `sync_products_cache_to_catalog` ->
+        `ingest_standard_products`. Reproduced in review against an
+        `merch_obs_*` row with zero `products_cache` rows — the merchant upsert
+        runs BEFORE the product loop, so an empty payload clobbers just as well.
+
+        What IS true, and is the part worth keeping: observed ids never become
+        tenant identities (`merchants` mints `merch_<hex>` /
+        `merch_<platform>_<digest>`; the claim flow attaches to an existing
+        tenant rather than re-keying an observed row). That bounds who a
+        graduated seller can be, not who can trigger the graduation. An earlier
+        draft of this comment concluded "latent, not live" from the identity
+        separation alone — a clobber needs only that an id be PASSED, not that
+        the caller be authenticated as it. The unscoped `merchant_id` on those
+        three routes is a separate, pre-existing problem and is not fixed here.
+
+        Prior art in the sibling lane: `catalog_enrichment_agent/apply.py`
+        rule 3 refuses the clobbering upsert for its observed sellers on the
+        same principle ("this module does not own the column"), though its
+        hazard is the mirror image — a DOWNGRADE of a graduated merchant back to
+        'observed' — and its refusal covers only the `_ensure_only` subset.
+
+    Callers that legitimately move the column pass `status=` explicitly
+    (`seller_identity.ensure_observed_seller` / `ensure_observed_seller_of_record`),
+    and are unchanged: they only reach here for a row that does not exist yet.
+    """
     if not merchant_name:
         merchant_name = await _resolve_merchant_name(merchant_id)
     await _upsert_by_pk(
@@ -1063,11 +1340,20 @@ async def upsert_catalog_merchant(
             "merchant_id": merchant_id,
             "merchant_name": merchant_name,
             "primary_platform": primary_platform,
-            "status": status,
+            "status": status if status is not None else MERCHANT_STATUS_ON_MINT,
             "source_system": source_system,
             "source_ref": source_ref,
             "metadata_json": metadata_json or {},
         },
+        # Birth-only unless the caller named a status. On INSERT the payload
+        # value above lands; on UPDATE the existing row's status stands.
+        preserve_on_update=() if status is not None else ("status",),
+        # metadata_json is a UNION of independently-owned key namespaces, so a
+        # whole-column write here destroys the other owners' keys — the same
+        # defect as the status clobber above, one column over. Merged rather
+        # than preserved because this module does legitimately own one of its
+        # keys (`ingested_from`). See `_merge_caller_declared_json`.
+        merge_json_on_update=("metadata_json",),
     )
 
 
@@ -1549,6 +1835,12 @@ async def ingest_standard_products(
             )
 
             variants = _iter_variants(product)
+            # PRODUCT-level payloads, derived ONCE. `metadata` is the product's
+            # `platform_metadata`; it does not vary by variant, so deriving these
+            # inside the variant loop below only ever stamped product-level data
+            # with one variant's identity. See the write block after the loop.
+            how_to_use_text, how_to_use_steps = _extract_how_to_use(metadata)
+            tutorial_assets = _extract_tutorial_assets(product_key, metadata)
             beauty_usage_rows: List[Dict[str, Any]] = []
             beauty_shade_rows: List[Dict[str, Any]] = []
             beauty_asset_rows: List[Dict[str, Any]] = []
@@ -1616,7 +1908,24 @@ async def ingest_standard_products(
                 offer_id = make_catalog_offer_id(sku_key, "default", "internal_merchant")
                 list_price = compare_at if compare_at and variant_price and compare_at > variant_price else variant_price
                 merchant_effective_price = variant_price
-                availability = "in_stock" if (inventory_quantity or 0) > 0 else "out_of_stock"
+                # The gate's stock verdict for a variant, not quantity alone: an untracked or
+                # keep-selling Shopify variant is `available` at quantity 0, and the eligibility gate
+                # ships it (see standard_variant_in_stock). Writing it out_of_stock here made
+                # agent_pdp_view rank a sellable buy-here offer behind every retailer. `available`
+                # absent (legacy cache rows, non-Shopify adapters, the no-variant fallback) ->
+                # quantity, exactly as before. For a product with no variants the gate reads
+                # product.in_stock (quantity AND orderable) instead; that case is unchanged here, and
+                # a non-orderable product is written merchant_view_only below.
+                availability = (
+                    "in_stock"
+                    if standard_variant_in_stock(
+                        {
+                            "available": getattr(variant, "available", None),
+                            "inventory_quantity": inventory_quantity or 0,
+                        }
+                    )
+                    else "out_of_stock"
+                )
                 offer_mode = "merchant_checkout" if product.orderable is not False else "merchant_view_only"
 
                 offer_values = {
@@ -1795,24 +2104,10 @@ async def ingest_standard_products(
                         commerce_index_source_kind=(commerce_index_source or {}).get("field_source_kind"),
                     )
 
-                    how_to_use_text, steps = _extract_how_to_use(metadata)
-                    if how_to_use_text or steps:
-                        beauty_usage_rows.append(
-                            {
-                                "guide_id": _stable_key("beauty_usage", product_key, sku_key or "product"),
-                                "product_key": product_key,
-                                "sku_key": sku_key,
-                                "merchant_id": merchant_id,
-                                "how_to_use_text": how_to_use_text,
-                                "steps_json": steps,
-                                "frequency": str(metadata.get("usage_frequency") or "").strip() or None,
-                                "time_of_day": str(metadata.get("usage_time_of_day") or metadata.get("am_pm") or "").strip()
-                                or None,
-                                "application_order": _safe_int(metadata.get("application_order")),
-                                "warnings_json": _json_list(_extract_metadata_values(metadata, "warnings", "usage_warnings")),
-                                "evidence_refs_json": [source_ref] if source_ref else [],
-                            }
-                        )
+                    # The GUIDE row is product-level and is written after the
+                    # loop; this field fact is genuinely per-SKU (`entity_id` is
+                    # the sku_key), so it stays here — one fact per variant.
+                    if how_to_use_text or how_to_use_steps:
                         await _upsert_field_fact(
                             entity_type="sku",
                             entity_id=sku_key,
@@ -1820,7 +2115,7 @@ async def ingest_standard_products(
                             field_key="how_to_use",
                             source_system=source_system,
                             source_ref=source_ref,
-                            value={"text": how_to_use_text, "steps": steps},
+                            value={"text": how_to_use_text, "steps": how_to_use_steps},
                             fresh_until=_utcnow() + timedelta(days=30),
                             confidence=Decimal("0.8"),
                             merchant_id=merchant_id,
@@ -1836,18 +2131,7 @@ async def ingest_standard_products(
                                 "product_key": product_key,
                                 "merchant_id": merchant_id,
                             }
-                            for shade in _extract_shades(product, variant)
-                        ]
-                    )
-                    beauty_asset_rows.extend(
-                        [
-                            {
-                                **asset,
-                                "product_key": product_key,
-                                "sku_key": sku_key,
-                                "merchant_id": merchant_id,
-                            }
-                            for asset in _extract_tutorial_assets(product, metadata)
+                            for shade in _extract_shades(product_key, variant)
                         ]
                     )
                     beauty_compat_rows.extend(
@@ -1876,26 +2160,77 @@ async def ingest_standard_products(
                 )
                 stats["beauty_profiles_upserted"] += 1
 
+                # PRODUCT-level child rows, written ONCE with `sku_key = NULL`.
+                # NULL is this schema's product-level marker: `sku_key` is
+                # nullable on both tables (unlike `beauty_shades.sku_key`, which
+                # is NOT NULL and genuinely per-variant),
+                # `beauty_field_authoring` writes the merchant-authored
+                # how_to_use with a NULL sku_key, and
+                # `routes/merchant_products.py` joins guides on `sku_key IS
+                # NULL`.
+                #
+                # Collected inside the variant loop instead, product-level data
+                # took on a variant's identity and the two tables failed
+                # differently: the usage guide's id hashes `sku_key`, so it
+                # multiplied into one identical row per variant (and never
+                # matched that IS NULL join); the asset id hashes only
+                # `product_key`, so every variant offered the SAME id and
+                # `_replace_child_rows_multi` deduped them down to one row
+                # stamped with the LAST variant's sku_key — a per-SKU read then
+                # found the tutorial on that one variant and on no other.
+                if how_to_use_text or how_to_use_steps:
+                    beauty_usage_rows.append(
+                        {
+                            "guide_id": product_usage_guide_id(product_key),
+                            "product_key": product_key,
+                            "sku_key": None,
+                            "merchant_id": merchant_id,
+                            "how_to_use_text": how_to_use_text,
+                            "steps_json": how_to_use_steps,
+                            "frequency": str(metadata.get("usage_frequency") or "").strip() or None,
+                            "time_of_day": str(metadata.get("usage_time_of_day") or metadata.get("am_pm") or "").strip()
+                            or None,
+                            "application_order": _safe_int(metadata.get("application_order")),
+                            "warnings_json": _json_list(_extract_metadata_values(metadata, "warnings", "usage_warnings")),
+                            "evidence_refs_json": [source_ref] if source_ref else [],
+                        }
+                    )
+                beauty_asset_rows.extend(
+                    [
+                        {
+                            **asset,
+                            "product_key": product_key,
+                            "sku_key": None,
+                            "merchant_id": merchant_id,
+                        }
+                        for asset in tutorial_assets
+                    ]
+                )
+
                 stats["beauty_ingredient_rows_upserted"] += ingredient_row_upserts
                 stats["beauty_usage_guides_upserted"] += await _replace_child_rows_multi(
                     beauty_usage_guides,
                     [beauty_usage_guides.c.product_key == product_key],
                     beauty_usage_rows,
+                    pk_name="guide_id",
                 )
                 stats["beauty_shades_upserted"] += await _replace_child_rows_multi(
                     beauty_shades,
                     [beauty_shades.c.product_key == product_key],
                     beauty_shade_rows,
+                    pk_name="shade_id",
                 )
                 stats["beauty_content_assets_upserted"] += await _replace_child_rows_multi(
                     beauty_content_assets,
                     [beauty_content_assets.c.product_key == product_key],
                     beauty_asset_rows,
+                    pk_name="asset_id",
                 )
                 stats["beauty_compatibility_rules_upserted"] += await _replace_child_rows_multi(
                     beauty_compatibility_rules,
                     [beauty_compatibility_rules.c.product_key == product_key],
                     beauty_compat_rows,
+                    pk_name="compatibility_rule_id",
                 )
 
         if content_key:
@@ -2324,7 +2659,21 @@ async def create_catalog_sync_job(
     mode: str,
     scope: Optional[Dict[str, Any]] = None,
     requested_by: Optional[str] = None,
+    claimed: bool = False,
 ) -> Dict[str, Any]:
+    """Write a catalog sync job row.
+
+    `pending` by default: the row is ENQUEUED and
+    `services.catalog_sync_drain.run_catalog_sync_drain_tick` runs it.
+
+    `claimed=True` is for a caller that will run the job ITSELF, inline, via
+    `run_claimed_catalog_sync_job` (jobs/agentic_commerce_reconciliation). The
+    row is born `running`, so the drain tick never sees it `pending`: creating it
+    `pending` and claiming it afterwards would leave a window in which the tick
+    claims it first and the inline caller gets back a half-run row. If the
+    inline caller's process dies, the stale reaper recovers the row like any
+    other.
+    """
     job_id = _stable_key("catalog_job", merchant_id, connector, mode, uuid.uuid4().hex)
     row = {
         "job_id": job_id,
@@ -2332,11 +2681,11 @@ async def create_catalog_sync_job(
         "connector": connector,
         "mode": mode,
         "scope_json": scope or {},
-        "status": "pending",
+        "status": "running" if claimed else "pending",
         "requested_by": requested_by,
         "stats_json": {},
         "error_message": None,
-        "started_at": None,
+        "started_at": _utcnow() if claimed else None,
         "completed_at": None,
     }
     await _upsert_by_pk(catalog_sync_jobs, "job_id", row)
@@ -2346,6 +2695,220 @@ async def create_catalog_sync_job(
 
 async def get_catalog_sync_job(job_id: str) -> Optional[Dict[str, Any]]:
     return await _fetch_one_by_pk(catalog_sync_jobs, "job_id", job_id)
+
+
+# --- catalog_sync_jobs queue claims ----------------------------------------
+#
+# `catalog_sync_jobs` rows used to be driven ONLY by whoever created them —
+# inline in a request, or from a FastAPI BackgroundTask. Both die with the
+# process (a Cloud Run revision swap, a scale-down, an unhandled error inside
+# the task) and neither leaves anything behind that would retry, so a merchant's
+# ingest could vanish leaving the row `pending` (never started) or `running`
+# (started, never finished) forever. `run_catalog_sync_drain_tick` now drains the
+# queue out of band, which means several runners can see the same row: every
+# pending -> running transition below is therefore a CONDITIONAL update that
+# returns the row only to the caller that actually won it.
+#
+# CLOCK. Every timestamp this queue compares (`created_at`, `started_at`) is
+# written from `_utcnow()` and compared against `_utcnow()`, never against the
+# database clock. The columns are `timestamp without time zone`, so
+# CURRENT_TIMESTAMP lands in the SESSION time zone: UTC in production, but the
+# local zone on a developer's Postgres, where a server-clock `started_at`
+# compared to a UTC cutoff reads as hours in the future and the stale reaper
+# never fires. One clock on both sides is correct under any server setting.
+
+# A job still not finished this long after it was CREATED is failed instead of
+# requeued. The poison-pill bound: a job that reliably outlives the scheduler
+# deadline, or kills its process (OOM), would otherwise be requeued and re-run
+# forever — and every re-run is a full re-pull + ingest of that merchant.
+# Six hours is ~6 deadline-cut attempts or ~3 stale-reaper recoveries.
+CATALOG_SYNC_GIVE_UP_AFTER_SECONDS = 6 * 3600
+
+CATALOG_SYNC_GAVE_UP_ERROR = "catalog_sync_retry_window_exhausted"
+
+
+async def claim_catalog_sync_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically move ONE pending job to `running`.
+
+    Returns the claimed row, or None when the row does not exist or was already
+    claimed by someone else. The `AND status = 'pending'` is what makes this a
+    lock: a blind `UPDATE ... SET status='running'` (what `run_catalog_sync_job`
+    used to do) lets a request-inline runner and the drain tick both ingest the
+    same merchant concurrently. On Postgres a second concurrent UPDATE blocks on
+    the row lock, then re-evaluates the WHERE against the committed `running`
+    row and matches nothing.
+    """
+    row = await database.fetch_one(
+        """
+        UPDATE catalog_sync_jobs
+        SET status = 'running',
+            started_at = :now,
+            completed_at = NULL,
+            updated_at = :now,
+            error_message = NULL
+        WHERE job_id = :job_id
+          AND status = 'pending'
+        RETURNING *
+        """,
+        {"job_id": job_id, "now": _utcnow()},
+    )
+    return dict(row) if row is not None else None
+
+
+async def claim_next_catalog_sync_job() -> Optional[Dict[str, Any]]:
+    """Claim the OLDEST pending job, or None when there is nothing claimable.
+
+    Two statements, like `claim_next_quality_backfill_job` and
+    `db.platform_import_tasks.claim_next_import_task`: pick a candidate, then
+    claim it conditionally. A racing drainer that took the same candidate has
+    already moved it out of `pending`, so our claim returns None and this tick
+    simply ends; the next one picks again.
+
+    A merchant with a job already `running` is skipped. Two concurrent ingests
+    of ONE merchant's catalog race each other on the same child rows (the
+    2026-08-29 failure was a `beauty_shades_pkey` duplicate-key error), and a
+    second runner exists as soon as anything runs a job inline
+    (`jobs/agentic_commerce_reconciliation`) while this drain is live. Best-effort
+    under two concurrent drainers, which production does not run (the worker is
+    a single instance). One-directional for inline runs: the drain skips a
+    merchant whose inline row is `running` (born claimed), but an inline caller
+    does not check for a drain run already in flight.
+    """
+    queued = await database.fetch_one(
+        """
+        SELECT p.job_id
+        FROM catalog_sync_jobs p
+        WHERE p.status = 'pending'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM catalog_sync_jobs r
+              WHERE r.merchant_id = p.merchant_id
+                AND r.status = 'running'
+          )
+        ORDER BY p.created_at ASC, p.job_id ASC
+        LIMIT 1
+        """
+    )
+    if not queued:
+        return None
+    job_id = str(dict(queued).get("job_id") or "")
+    if not job_id:
+        return None
+    return await claim_catalog_sync_job(job_id)
+
+
+async def _requeue_or_give_up(job_id: str, *, reason: Optional[str]) -> str:
+    """Move ONE `running` job back to `pending` — or to `failed` once it is past
+    CATALOG_SYNC_GIVE_UP_AFTER_SECONDS since creation.
+
+    Returns "requeued", "gave_up", or "" when the row was not `running` (it
+    finished, or another path already moved it). Both UPDATEs re-assert
+    `status = 'running'`, so a run that completed between the caller's read and
+    this write is left alone.
+    """
+    now = _utcnow()
+    gave_up = await database.fetch_one(
+        """
+        UPDATE catalog_sync_jobs
+        SET status = 'failed',
+            error_message = :error_message,
+            completed_at = :now,
+            updated_at = :now
+        WHERE job_id = :job_id
+          AND status = 'running'
+          AND created_at < :give_up_before
+        RETURNING job_id, scope_json
+        """,
+        {
+            "job_id": job_id,
+            "now": now,
+            "error_message": CATALOG_SYNC_GAVE_UP_ERROR,
+            "give_up_before": now - timedelta(seconds=CATALOG_SYNC_GIVE_UP_AFTER_SECONDS),
+        },
+    )
+    if gave_up is not None:
+        logger.error(
+            "catalog_sync: job %s gave up after %ds of retries (reason=%s); marked failed",
+            job_id, CATALOG_SYNC_GIVE_UP_AFTER_SECONDS, reason,
+        )
+        await _settle_catalog_sync_event(
+            _json_dict(dict(gave_up).get("scope_json")),
+            status="failed",
+            error_message=CATALOG_SYNC_GAVE_UP_ERROR,
+        )
+        return "gave_up"
+
+    requeued = await database.fetch_one(
+        """
+        UPDATE catalog_sync_jobs
+        SET status = 'pending',
+            started_at = NULL,
+            completed_at = NULL,
+            updated_at = :now,
+            error_message = :error_message
+        WHERE job_id = :job_id
+          AND status = 'running'
+        RETURNING job_id
+        """,
+        {"job_id": job_id, "error_message": reason, "now": now},
+    )
+    return "requeued" if requeued is not None else ""
+
+
+async def requeue_catalog_sync_job(job_id: str) -> bool:
+    """Put ONE running job back to `pending` so a later tick re-runs it.
+
+    Used when a run is CANCELLED rather than failed — the scheduler bounds every
+    tick by a deadline and cancels it on expiry, and a CancelledError bypasses
+    the `except Exception -> status='failed'` path in `run_claimed_catalog_sync_job`.
+    Without this the row stays `running` until the stale reaper finds it. Same
+    shape as `db.product_quality_backfill_jobs.requeue_quality_backfill_job`.
+
+    True only when the row went back to `pending`; a job past the give-up window
+    is failed instead (False).
+    """
+    outcome = await _requeue_or_give_up(job_id, reason="cancelled_catalog_sync_job_requeued")
+    return outcome == "requeued"
+
+
+async def requeue_stale_catalog_sync_jobs(
+    *,
+    stale_after_seconds: int,
+    limit: int = 5,
+) -> int:
+    """Recover jobs stranded in `running` by a process that died mid-run.
+
+    This is the recovery the BackgroundTasks shape never had: a revision swap
+    killed the task, the row kept saying `running`, and nothing on any later
+    boot went looking for it. Returns how many rows went back to `pending`
+    (rows past the give-up window are failed and not counted).
+
+    There is no heartbeat, so the window is measured from the CLAIM and must
+    stay longer than any run the scheduler still permits — see
+    services.catalog_sync_drain.DEFAULT_STALE_AFTER_SECONDS.
+    """
+    cutoff = _utcnow() - timedelta(seconds=max(300, int(stale_after_seconds)))
+    rows = await database.fetch_all(
+        """
+        SELECT job_id
+        FROM catalog_sync_jobs
+        WHERE status = 'running'
+          AND started_at IS NOT NULL
+          AND started_at < :cutoff
+        ORDER BY started_at ASC
+        LIMIT :limit
+        """,
+        {"cutoff": cutoff, "limit": max(1, int(limit))},
+    )
+    requeued = 0
+    for row in rows or []:
+        outcome = await _requeue_or_give_up(
+            str(dict(row).get("job_id") or ""),
+            reason="stale_catalog_sync_job_requeued",
+        )
+        if outcome == "requeued":
+            requeued += 1
+    return requeued
 
 
 async def record_catalog_sync_event(
@@ -2444,28 +3007,79 @@ async def sync_products_cache_to_catalog(
     )
 
 
-async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
-    job = await get_catalog_sync_job(job_id)
-    if not job:
-        raise RuntimeError(f"Catalog sync job not found: {job_id}")
+async def _settle_catalog_sync_event(
+    scope: Dict[str, Any],
+    *,
+    status: str,
+    error_message: Optional[str] = None,
+) -> None:
+    """Close the `catalog_sync_events` row named by a job's scope, if any.
 
+    Best-effort: the catalog write already landed (or already failed), and an
+    event bookkeeping error must not change that outcome.
+    """
+    event_id = str(scope.get("catalog_sync_event_id") or "").strip()
+    if not event_id:
+        return
+    try:
+        await mark_catalog_sync_event_processed(
+            event_id, status=status, error_message=error_message,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "catalog_sync: could not mark event %s as %s", event_id, status, exc_info=True,
+        )
+
+
+async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
+    """Claim ONE pending catalog sync job and run it to completion.
+
+    The claim is atomic (`claim_catalog_sync_job`), so this is safe to call from
+    a request handler and from `run_catalog_sync_drain_tick` at the same time:
+    the loser gets the current row back and does NOT re-ingest. A job that is
+    not `pending` is therefore returned as-is rather than re-run.
+    """
+    claimed = await claim_catalog_sync_job(job_id)
+    if claimed is None:
+        existing = await get_catalog_sync_job(job_id)
+        if not existing:
+            raise RuntimeError(f"Catalog sync job not found: {job_id}")
+        logger.info(
+            "catalog_sync: job %s already claimed (status=%s); not re-running",
+            job_id, existing.get("status"),
+        )
+        return existing
+
+    return await run_claimed_catalog_sync_job(claimed)
+
+
+async def run_claimed_catalog_sync_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Run a job whose pending -> running claim the CALLER already won.
+
+    Split out so the drain tick, which claims with `claim_next_catalog_sync_job`,
+    does not have to claim a second time.
+    """
+    job_id = str(job.get("job_id") or "")
     scope = _json_dict(job.get("scope_json"))
     connector = str(job.get("connector") or "shopify")
     merchant_id = str(job.get("merchant_id") or "").strip()
     mode = str(job.get("mode") or "reconcile")
 
-    await _upsert_by_pk(
-        catalog_sync_jobs,
-        "job_id",
-        {
-            **job,
-            "status": "running",
-            "started_at": _utcnow(),
-            "error_message": None,
-        },
-    )
-
+    refresh_summary: Optional[Dict[str, Any]] = None
     try:
+        # `force_refresh` means "re-pull from the platform before ingesting", not
+        # just "ingest what products_cache already holds". It lives in the job's
+        # scope, so it runs for WHOEVER drains the row — this used to be done by
+        # the caller's BackgroundTask (routes/catalog_routes), which meant the
+        # stored job did not actually describe the work it stood for.
+        if bool(scope.get("force_refresh")) and connector == "shopify":
+            from services.shopify_products_sync import sync_shopify_products_for_merchant
+            refresh_summary = await sync_shopify_products_for_merchant(
+                merchant_id=merchant_id,
+                limit=int(scope.get("limit") or 500),
+                ingest_catalog=False,
+            )
+
         stats = await sync_products_cache_to_catalog(
             merchant_id=merchant_id,
             platform=str(scope.get("platform") or connector or "shopify"),
@@ -2483,23 +3097,31 @@ async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
         # serving-eligibility gate depend on it). Best-effort: never fail the
         # catalog sync on this hook.
         try:
-            from db.product_quality_backfill_jobs import create_quality_backfill_job
-            await create_quality_backfill_job(
+            from db.product_quality_backfill_jobs import enqueue_quality_backfill_if_needed
+            await enqueue_quality_backfill_if_needed(
                 merchant_id=merchant_id,
                 platform=str(scope.get("platform") or connector or "shopify"),
                 requested_by="catalog_sync_autodrain",
                 force_refresh=False,
                 missing_only=True,
+                # Scheduled reconciliation (jobs/agentic_commerce_reconciliation
+                # stamps scope.scheduled) is folded into a recent job; a job a
+                # person requested always enqueues.
+                unattended=bool(scope.get("scheduled")),
             )
         except Exception as exc:  # noqa: BLE001 - readiness hook is best-effort
             logger.warning(
                 "catalog_sync: quality-backfill enqueue failed merchant=%s: %s",
                 merchant_id, exc,
             )
+        # A webhook-triggered job carries the `catalog_sync_events` row that
+        # produced it. Closing that row used to be the background task's job, so
+        # a dropped task left the event `pending` forever — settle it HERE, where
+        # the work actually happens, for whichever runner drained the row.
+        await _settle_catalog_sync_event(scope, status="processed")
+
         updated = await get_catalog_sync_job(job_id)
-        if updated:
-            return updated
-        return {
+        result = updated or {
             "job_id": job_id,
             "merchant_id": merchant_id,
             "connector": connector,
@@ -2507,17 +3129,69 @@ async def run_catalog_sync_job(job_id: str) -> Dict[str, Any]:
             "status": "completed",
             "stats_json": stats,
         }
+        if refresh_summary is not None:
+            # Not persisted — handed back for an inline caller that reports it
+            # (jobs/agentic_commerce_reconciliation used to run this re-pull
+            # itself and return its summary).
+            result = {**result, "refresh": refresh_summary}
+        return result
+    except asyncio.CancelledError:
+        # Cancelled mid-run (scheduler run deadline, or the process going away):
+        # do NOT leave the row in `running`, where only the stale reaper would
+        # find it, hours later. Requeue best-effort (or give up, past the retry
+        # window), then let the cancellation propagate. Same shape as the
+        # quality-backfill drain.
+        try:
+            requeued = await requeue_catalog_sync_job(job_id)
+            logger.warning(
+                "catalog_sync: job %s cancelled mid-run; %s",
+                job_id, "requeued" if requeued else "not requeued (gave up or no longer running)",
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "catalog_sync: job %s cancelled; requeue failed", job_id, exc_info=True,
+            )
+        raise
     except Exception as exc:
-        await _upsert_by_pk(
-            catalog_sync_jobs,
-            "job_id",
-            {
-                **job,
-                "status": "failed",
-                "error_message": str(exc),
-                "completed_at": _utcnow(),
-            },
+        # Log BEFORE the re-raise, and log it HERE rather than leaving the
+        # traceback to whatever called us. On 2026-08-29 the ONLY trace of a
+        # sync that wrote zero rows was `catalog_sync_jobs.status='failed'`:
+        # this ran under a FastAPI BackgroundTask, so the re-raise landed in the
+        # ASGI server's handler — outside this service's structured logging, and
+        # after the caller had already been told `catalog_ingest_queued: true`
+        # with a 200. The runner is out of band now and the caller gets a
+        # pollable job_id, but the log line stays: a `failed` row still says
+        # only THAT it failed, never why.
+        logger.exception(
+            "catalog_sync: job FAILED job_id=%s merchant=%s connector=%s mode=%s err=%s",
+            job_id, merchant_id, connector, mode, exc,
         )
+        # A CONDITIONAL write of the three columns that change — never
+        # `_upsert_by_pk({**job, ...})`. `job` may be the raw `RETURNING *` row of
+        # a claim, and on databases 0.7.0 a raw statement runs no result
+        # processors: its JSONB columns come back as `str` (Postgres) and its
+        # datetimes as text (SQLite). Written back through the table, the
+        # Postgres JSONB bind re-encodes the str — `scope_json`/`stats_json`
+        # become JSON *strings* and the poll route's response model 500s on
+        # exactly the failed job it exists to report — and SQLite's DateTime
+        # rejects the text outright, leaving the row `running`. `status =
+        # 'running'` also keeps this from overwriting a row that is no longer
+        # this run's (already completed by the ingest, or requeued by the
+        # reaper and claimed again).
+        now = _utcnow()
+        await database.execute(
+            """
+            UPDATE catalog_sync_jobs
+            SET status = 'failed',
+                error_message = :error_message,
+                completed_at = :now,
+                updated_at = :now
+            WHERE job_id = :job_id
+              AND status = 'running'
+            """,
+            {"job_id": job_id, "error_message": str(exc), "now": now},
+        )
+        await _settle_catalog_sync_event(scope, status="failed", error_message=str(exc))
         raise
 
 

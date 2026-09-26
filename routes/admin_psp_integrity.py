@@ -4,14 +4,19 @@ Provides endpoints to check and fix psp_used/psp_id fields
 """
 import logging
 from datetime import datetime
-from fastapi import APIRouter, HTTPException
+from typing import Any, Dict
+
+from fastapi import APIRouter, Depends, HTTPException
 from db.database import database
+from utils.auth import require_admin
 
 router = APIRouter(prefix="/admin/psp", tags=["PSP Integrity"])
 logger = logging.getLogger(__name__)
 
 @router.get("/integrity-check")
-async def check_psp_data_integrity():
+async def check_psp_data_integrity(
+    current_user: Dict[str, Any] = Depends(require_admin),
+):
     """
     Check PSP field data integrity
     Returns detailed report on NULL values, case issues, and mismatches
@@ -152,7 +157,10 @@ async def check_psp_data_integrity():
 
 
 @router.post("/auto-heal")
-async def auto_heal_psp_data(dry_run: bool = True):
+async def auto_heal_psp_data(
+    dry_run: bool = True,
+    current_user: Dict[str, Any] = Depends(require_admin),
+):
     """
     Automatically fix PSP field issues
     
@@ -292,7 +300,9 @@ async def auto_heal_psp_data(dry_run: bool = True):
 
 
 @router.get("/specification")
-async def get_psp_field_specification():
+async def get_psp_field_specification(
+    current_user: Dict[str, Any] = Depends(require_admin),
+):
     """
     Returns the PSP field specification and standards
     """

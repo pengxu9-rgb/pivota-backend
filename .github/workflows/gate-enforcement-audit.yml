@@ -1,0 +1,96 @@
+name: Gate Enforcement Audit
+
+# WHO GUARDS THE THING NO PR CAN EDIT.
+#
+# lint.yml's entire design rests on `lint` being a REQUIRED status check: GitHub blocks a
+# required check that never reports, which is what makes deleting, renaming, matrixing or
+# path-filtering the job self-defeating instead of something a test has to anticipate.
+#
+# That setting lives in branch protection, outside the repository. No test in the tree can
+# read it, no PR can change it, and — this is the point — nothing in the tree can NOTICE it
+# being unset. Measured on 2026-09-10, the required contexts were `["CI Entrypoint"]` alone,
+# with 0 required approvals and no CODEOWNERS file. `CI Entrypoint` derives what it expects
+# from each workflow file ON THE PR HEAD, so it cannot pin anything a PR is free to rewrite.
+#
+# An unverified assumption about enforcement is precisely the class of defect this repository
+# keeps shipping: `npm run test:node` was never invoked by any workflow while 66 suite names
+# were counted as coverage; a Railway cron wrote `passed` ledger rows over an empty window for
+# two weeks while the graph build was down. "It is required" is a claim, and this checks it.
+#
+# THIS JOB FAILS LOUDLY WHEN IT CANNOT TELL. A check that skips when its credentials are
+# missing reports green over an unknown state, which is the same defect wearing a different
+# hat. If `administration: read` is insufficient here, the fix is to grant it or to delete
+# this workflow deliberately — not to let it degrade quietly.
+
+# ⚠️ NO `pull_request:` TRIGGER, DELIBERATELY, AND THIS WAS A REAL BUG NOT A PREFERENCE.
+# The first version also ran on PRs touching the gate, reasoning that removing lint.yml should
+# surface the question immediately. But `CI Entrypoint` — the ONE required check on main —
+# derives its expected set from every workflow with a matching `pull_request` trigger and treats
+# a failure as fatal. This job is DESIGNED to fail until GATE_AUDIT_TOKEN exists, so that
+# trigger turned an intended daily reminder into a hard merge block: it red-lit its own PR, and
+# would have made every future PR touching lint.yml, this file, or ruff.toml unmergeable —
+# including a PR trying to fix this workflow. A watchdog must not be able to block the thing it
+# watches. The daily schedule is the signal; it gates nothing, which is the correct severity.
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+# `administration: read` IS NOT A VALID GITHUB_TOKEN SCOPE, and naming it made GitHub reject
+# this whole workflow: the first version ran ZERO jobs and reported failure with no annotation.
+# Branch protection therefore cannot be read with the default token at all — it needs a PAT with
+# Administration: read, supplied as GATE_AUDIT_TOKEN.
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # No checkout: this job reads the GitHub API, not the tree.
+      - name: The lint gate must be a required status check
+        env:
+          GH_TOKEN: ${{ secrets.GATE_AUDIT_TOKEN }}
+        run: |
+          set -uo pipefail
+          branch=main
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::GATE_AUDIT_TOKEN is not set, so this audit cannot read branch"
+            echo "::error::protection and cannot tell whether the lint gate is enforced."
+            echo "::error::That is an UNKNOWN state, and reporting green over an unknown state"
+            echo "::error::is the exact defect this workflow exists to catch, so it fails."
+            echo "::error::Fix: add a fine-grained PAT with Administration: read as the repo"
+            echo "::error::secret GATE_AUDIT_TOKEN — or delete this workflow deliberately."
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/branches/${branch}/protection" > protection.json 2> api_err.txt; then
+            echo "::error::Cannot READ branch protection for ${branch}, so this audit cannot tell"
+            echo "::error::whether the lint gate is enforced. That is an unknown state, not a pass."
+            echo "::error::The token lacks Administration: read on this repo. Fix the PAT, or delete"
+            echo "::error::this workflow deliberately. Do not leave it skipping."
+            sed 's/^/  /' api_err.txt
+            exit 1
+          fi
+          contexts=$(python3 -c "
+          import json
+          d = json.load(open('protection.json'))
+          rsc = d.get('required_status_checks') or {}
+          print('\n'.join(rsc.get('contexts') or []))
+          ")
+          echo "required contexts on ${branch}:"
+          echo "${contexts}" | sed 's/^/  - /'
+          if ! echo "${contexts}" | grep -qx "lint"; then
+            echo "::error::\`lint\` is NOT a required status check on ${branch}."
+            echo "::error::lint.yml is then advisory: a PR can delete it, rename its job, give it"
+            echo "::error::a matrix or a paths filter, and nothing blocks — the required check"
+            echo "::error::simply stops being expected. Add \`lint\` to the required contexts."
+            exit 1
+          fi
+          echo "ok: \`lint\` is enforced on ${branch}"
+          # ⚠️ READS CLASSIC BRANCH PROTECTION ONLY. `main` is classic today (the /rulesets
+          # endpoint returns []), but if protection ever migrates to a ruleset this endpoint
+          # 404s and the job fails permanently WHILE the gate is actually fine — the inverse of
+          # its purpose, and the kind of stale detector this repo already has several of. The
+          # failure is loud and says this, so it degrades to a false alarm rather than a false
+          # green; extend it to /rulesets when that migration happens.

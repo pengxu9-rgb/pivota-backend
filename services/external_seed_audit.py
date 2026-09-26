@@ -5,6 +5,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from utils.availability_vocabulary import normalize_availability
 
 
 MARKET_LOCALE_SEGMENT = {
@@ -68,13 +69,17 @@ def normalize_currency(value: Any) -> str:
 
 
 def normalize_seed_availability(value: Any) -> Optional[str]:
+    """Canonicalise a seed availability string via the shared vocabulary.
+
+    Unrecognised values still pass through (lowercased, separators collapsed) so audit
+    output keeps reporting whatever the source actually said rather than erasing it.
+    """
     normalized = normalize_non_empty_string(value).lower()
     if not normalized:
         return None
-    if normalized in {"in stock", "instock", "in_stock", "available"}:
-        return "in_stock"
-    if normalized in {"out of stock", "outofstock", "out_of_stock", "oos", "sold out", "sold_out", "unavailable"}:
-        return "out_of_stock"
+    canonical = normalize_availability(normalized)
+    if canonical is not None:
+        return canonical
     return normalized.replace(" ", "_")
 
 
@@ -308,7 +313,52 @@ def get_canonical_url(row: Dict[str, Any], snapshot: Dict[str, Any], seed_data: 
 
 
 def get_last_extracted_at(row: Dict[str, Any], snapshot: Dict[str, Any]) -> str:
+    """When the seed's CONTENT was last extracted. Reporting only — see the warning.
+
+    ⚠️ NOT a freshness signal, and it was used as one for months. The `updated_at` fallback
+    means any writer — a PATCH from the console, a backfill, a refresh whose fetch 404'd and
+    fell back to the cached snapshot — makes this value newer without anyone having looked at
+    the page. Ask `get_last_destination_check_at` whether the LINK is still there.
+    """
     return normalize_non_empty_string(snapshot.get("extracted_at") or row.get("updated_at") or row.get("created_at"))
+
+
+def get_content_extracted_at(row: Dict[str, Any], snapshot: Dict[str, Any]) -> str:
+    """When the seed's CONTENT (price, availability, title) was last extracted from the page.
+
+    `get_last_extracted_at` minus the `updated_at` / `created_at` fallbacks, which is what made
+    that helper unusable as a gate. An empty string means no extraction has ever been recorded
+    and must be treated as a blocker, not as a pass.
+
+    THIS IS A DIFFERENT FACT FROM `get_last_destination_check_at`, and collapsing the two is a
+    mistake this module has already made once. A destination sweep proves the LINK resolves
+    without reading a single price; a content extraction proves the PRICE was read without
+    proving the link still resolves today. A gate that asks only one of them serves either a
+    dead link or a stale price.
+    """
+    return normalize_non_empty_string(snapshot.get("extracted_at"))
+
+
+def get_last_destination_check_at(row: Dict[str, Any]) -> str:
+    """When a fetch last REACHED THE ORIGIN for this seed's destination.
+
+    Deliberately has NO fallback. An empty string means "never verified", which is the honest
+    answer for every row until the destination sweep has run, and the readiness gate must
+    treat it as a blocker rather than as a pass — the previous shape
+    (`if extracted_dt is not None and ...`) let a missing observation read as a good one.
+    """
+    return normalize_non_empty_string(row.get("destination_checked_at"))
+
+
+def get_destination_verdict(row: Dict[str, Any]) -> str:
+    return normalize_non_empty_string(row.get("destination_verdict")).lower()
+
+
+def get_destination_failure_streak(row: Dict[str, Any]) -> int:
+    try:
+        return int(row.get("destination_failure_streak") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def get_primary_description(row: Dict[str, Any]) -> str:

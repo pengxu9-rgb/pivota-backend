@@ -43,7 +43,7 @@ currency code, and it comes out of this fixed map — never out of caller input.
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 from services.priced_offer_sql import priced_offer_exists_sql
 
@@ -96,6 +96,49 @@ def pricing_currency_for_region(region: str) -> str:
         ) from None
 
 
+#: Multi-market storefronts ADR Phase 2: markets whose offers are ACQUIRED (stored with their real market
+#: and currency, catalog_offers.market 'AU'/'JP') but never served. The retailer_ingest lane allowlists them
+#: (services/retailer_ingest/pipeline.py) and index_pipeline_state refuses to serve a product priced ONLY
+#: there (acquisition_only_priced_sql), whatever ENABLE_KBEAUTY_AGENT_DECISION_GATES says. One list, here.
+ACQUISITION_MARKETS = ("AU", "JP")
+
+
+def acquisition_market_offer_exists_sql(product_key_expr: str, *, alias: str = "co") -> str:
+    """``EXISTS`` a priced, unsuppressed offer DECLARED for an acquisition market (catalog_offers.market).
+
+    Only the retailer_ingest lane writes such a stamp (it declares its job's market; every other writer
+    leaves the column's DEFAULT 'US'), so this is FALSE for every row that existed before that lane wrote
+    an AU/JP job -- which is what makes the serving rule built on it a zero-change rule for them."""
+    markets = ", ".join(f"'{m}'" for m in ACQUISITION_MARKETS)
+    return priced_offer_exists_sql(
+        product_key_expr, alias=alias,
+        extra_predicate=f"upper(trim(coalesce({alias}.market, ''))) IN ({markets})",
+    )
+
+
+def require_market_currency(market: str, currency: Optional[str]) -> str:
+    """The ONE writer-side rule "currency = market": an offer declared for `market` must be priced
+    in that market's currency. Returns the canonical market code; raises ValueError otherwise.
+
+    For writers that DECLARE a destination market (multi-market storefronts ADR section 3.3: the
+    retailer_ingest lane stamps catalog_offers.market from its job, and the Shopify-Markets capture
+    writes market='US' siblings). Refusing here is the write-time half of ADR-024 Phase 0 item 2;
+    services/catalog_invariant_checks' market/currency disagreement is the same rule at rest.
+
+    Writers that never declare a market (every other lane: the column's DEFAULT 'US' is not a
+    declaration) do not call this -- the deliberate SG exception (market 'US', currency 'SGD',
+    because external_product_seeds.market is a hard serving partition) is one of them. An unknown
+    market or a missing currency is refused, never defaulted."""
+    normalized = normalize_region(market)
+    expected = pricing_currency_for_region(normalized)
+    got = str(currency or "").strip().upper()
+    if got != expected:
+        raise ValueError(
+            f"currency_market_mismatch: an offer for market {normalized} must be priced in {expected}, "
+            f"got {got or 'no currency'}")
+    return normalized
+
+
 def pricing_currency_for_region_or_none(region: str) -> Optional[str]:
     """Soft variant of ``pricing_currency_for_region``: None for an unmapped
     region instead of raising.
@@ -143,3 +186,47 @@ def has_offer_priced_for_region_sql(
         alias=alias,
         extra_predicate=region_currency_predicate(region, alias=alias),
     )
+
+
+def has_offer_priced_for_any_region_sql(
+    product_key_expr: str, regions: "Sequence[str]", *, alias: str = "co"
+) -> str:
+    """``EXISTS`` for ANY of `regions` — the OR of `has_offer_priced_for_region_sql`.
+
+    A DISJUNCTION OF MEMBERSHIP TESTS, still no conversion and still no comparison
+    of amounts across currencies (ADR-024 commitment 5). "This product has a real
+    price in a currency SOME region we serve expects" is the honest weakening of
+    "…in the currency the US expects"; it is not a claim that the row is buyable
+    from any particular one of them, which remains unmodelled (Phase 2b).
+
+    ONE region emits the byte-identical string `has_offer_priced_for_region_sql`
+    does — no wrapping parens, no `OR` — so a caller configured with the default
+    single region produces exactly the SQL it produced before this function
+    existed. Asserted in tests/test_region_pricing.py: the whole safety argument
+    for reading the region list from config is that the default cannot drift.
+
+    Duplicates are collapsed and order is preserved (so 'US,SG,US' is 'US,SG'),
+    because the emitted SQL is compared byte-for-byte in tests and an operator's
+    repeated entry must not change it. An empty `regions` RAISES: "serve no
+    region" is never what a caller meant, and silently emitting a predicate that
+    is false for every row would take the whole index dark.
+    """
+    ordered: list = []
+    for region in regions or []:
+        normalized = normalize_region(region)
+        # Validates membership as a side effect — an unknown region raises here
+        # rather than emitting a predicate that quietly matches nothing.
+        pricing_currency_for_region(normalized)
+        if normalized not in ordered:
+            ordered.append(normalized)
+    if not ordered:
+        raise ValueError(
+            "has_offer_priced_for_any_region_sql needs at least one region; "
+            "an empty list would emit a predicate false for every row."
+        )
+    if len(ordered) == 1:
+        return has_offer_priced_for_region_sql(product_key_expr, ordered[0], alias=alias)
+    return "(" + " OR ".join(
+        has_offer_priced_for_region_sql(product_key_expr, region, alias=alias)
+        for region in ordered
+    ) + ")"

@@ -146,7 +146,7 @@ Indexes and constraints:
 - SQLAlchemy metadata `index=True` columns create default `ix_orders_*` indexes for `merchant_id`, `status`, `payment_status`, `agent_id`, `agent_session_id`, `buyer_id`, `intent_id`, `agent_user_ref`, `agent_scoped_buyer_ref`, and `is_deleted`.
 - `006_psp_fields_constraints.sql` adds:
   - `check_psp_used_lowercase`: `psp_used IS NULL OR psp_used = LOWER(psp_used)`.
-  - `check_psp_used_valid_provider`: `psp_used IS NULL OR psp_used IN ('stripe','adyen','checkout','paypal','braintree')`.
+  - `check_psp_used_valid_provider`: `psp_used IS NULL OR psp_used IN ('stripe','adyen','checkout','paypal','braintree')`. **Widened by `242_orders_psp_used_valid_provider.sql`** — see below.
   - `check_psp_id_format`: `psp_id IS NULL OR psp_id ~* '^psp_[a-z0-9]+_[a-z0-9]{12}$'`.
   - `idx_orders_psp_used` on `(psp_used)`.
   - `idx_orders_psp_id` on `(psp_id)`.
@@ -154,6 +154,19 @@ Indexes and constraints:
   - `idx_orders_merchant_psp_used` on `(merchant_id, psp_used)`.
   - `idx_orders_psp_created_at` on `(psp_id, created_at DESC)`.
   - `idx_orders_psp_payment_status` on `(psp_used, payment_status)`.
+- `242_orders_psp_used_valid_provider.sql` replaces `check_psp_used_valid_provider` with a superset:
+  `psp_used IS NULL OR psp_used IN ('stripe','adyen','checkout','paypal','braintree','antom','protocol_deferred')`, `NOT VALID`.
+  006's five names were narrower than what the code writes. `orders.psp_used` is fed from
+  `merchant_psps.provider` (`routes/order_routes._resolve_active_order_psp` → `db.orders.create_order`),
+  and that column can carry `antom` (`SUPPORTED_CANONICAL_PSPS`); the deferred-payment lane writes
+  `protocol_deferred` (`routes/order_routes.CAPABILITY_DEFERRED_PSP_PROVIDER`). Both were refused,
+  so onboarding succeeded and every subsequent order creation 500'd — the same writer/reader
+  disagreement as the `psp_id` format defect. `NOT VALID` because production fast mode skips
+  `db/migrations/`, so on some databases this is an ADD rather than a widen and a validating ADD
+  would abort the boot. Twinned in `db/schema_guard.py` for exactly that reason, and applied by
+  `POST /admin/migrations/run/006-psp-constraints`, which previously re-narrowed it on every call.
+  `scripts/audit_unaccepted_psp_providers.py` reports the rows that block
+  `ALTER TABLE orders VALIDATE CONSTRAINT check_psp_used_valid_provider`.
 - `043_buyer_vault.sql` adds:
   - `idx_orders_buyer_created` on `(buyer_id, created_at DESC)`.
   - `idx_orders_agent_scoped_buyer_ref` on `(agent_id, agent_scoped_buyer_ref)`.
@@ -376,7 +389,7 @@ JSON/JSONB is used for payloads, flexible metadata, request/response snapshots, 
 
 Dialect handling:
 
-- `db/database.py` defines `JSONB_TYPE`: Postgres gets SQLAlchemy PostgreSQL `JSONB`; SQLite compiles JSONB/ARRAY to JSON for local dev/tests.
+- `db/database.py` defines `JSONB_TYPE` as `JSON().with_variant(JSONB, "postgresql")`: the compiling dialect picks the type, so Postgres gets `JSONB` and SQLite gets `JSON`. (It used to select from `DATABASE_URL` at import time; the sqlite `@compiles` shims for JSONB/UUID/ARRAY now register unconditionally, so a Postgres URL no longer leaves them unregistered.)
 - Some older SQLAlchemy modules use generic `JSON`, which compiles to Postgres `JSON`, not `JSONB`.
 - Runtime self-heal DDL sometimes adds missing `orders` JSON columns as `JSONB`, so live DB type can differ from metadata.
 

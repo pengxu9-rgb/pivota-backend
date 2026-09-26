@@ -47,7 +47,11 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: ci-entrypoint-${{ github.event.pull_request.number || github.ref }}
+  # `|| github.run_id`, not `|| github.ref`: on push to main the PR number is empty and every
+  # merge fell through to the one shared literal `refs/heads/main`, so main-branch runs were
+  # cancelled in pairs and main had no reliable entrypoint result per commit -- the same defect
+  # #2125 removed from the Postgres Dialect Gate.
+  group: ci-entrypoint-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:

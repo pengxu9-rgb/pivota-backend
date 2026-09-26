@@ -4,10 +4,19 @@ Allows running database migrations via API endpoint
 """
 import logging
 from pathlib import Path
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from utils.auth import require_admin_or_key
 from db.database import database
 
-router = APIRouter(prefix="/admin/migrations", tags=["Admin Migrations"])
+# AUTHENTICATION. Every route on this router was reachable with NO credentials
+# of any kind: no Depends, no header check, no role check. The guard is applied
+# at the ROUTER, not per-handler, so a route added here later inherits it
+# instead of having to remember it -- which is how this file got here.
+# require_admin_or_key accepts an X-ADMIN-KEY header or an admin/super_admin
+# JWT and fails closed (401) when neither is present.
+#
+# POST /admin/migrations/run/006-psp-constraints ran DDL anonymously.
+router = APIRouter(prefix="/admin/migrations", tags=["Admin Migrations"], dependencies=[Depends(require_admin_or_key)])
 logger = logging.getLogger(__name__)
 
 @router.post("/run/006-psp-constraints")
@@ -144,15 +153,31 @@ async def run_migration_006_psp_constraints(dry_run: bool = True):
                 })
             
             try:
-                # Valid provider constraint
+                # Valid provider constraint.
+                #
+                # The list here is migration 242's, NOT migration 006's. This
+                # endpoint DROPs and re-ADDs the constraint on every invocation,
+                # so while it carried 006's five names it silently RE-NARROWED a
+                # constraint that migration 242 and db/schema_guard.py had
+                # widened — undoing, at the click of an admin button, the fix for
+                # a defect whose whole shape is "the writer accepts what the
+                # reader refuses". 'antom' is a supported provider
+                # (SUPPORTED_CANONICAL_PSPS) and 'protocol_deferred' is the
+                # capability-gated deferred lane's sentinel; both are values this
+                # code writes to orders.psp_used.
+                #
+                # NOT VALID matches 242: this may be an ADD rather than a widen on
+                # a database where 006 never ran, and a validating ADD would scan
+                # rows written across years of an unconstrained vocabulary.
                 await database.execute("""
-                    ALTER TABLE orders 
+                    ALTER TABLE orders
                         DROP CONSTRAINT IF EXISTS check_psp_used_valid_provider
                 """)
                 await database.execute("""
-                    ALTER TABLE orders 
-                        ADD CONSTRAINT check_psp_used_valid_provider 
-                        CHECK (psp_used IS NULL OR psp_used IN ('stripe', 'adyen', 'checkout', 'paypal', 'braintree'))
+                    ALTER TABLE orders
+                        ADD CONSTRAINT check_psp_used_valid_provider
+                        CHECK (psp_used IS NULL OR psp_used IN ('stripe', 'adyen', 'checkout', 'paypal', 'braintree', 'antom', 'protocol_deferred'))
+                        NOT VALID
                 """)
                 results["steps"].append({
                     "step": "4b_add_valid_provider_constraint",

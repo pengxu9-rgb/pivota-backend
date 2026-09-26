@@ -1,6 +1,6 @@
 """Debug endpoint to check MCP data in database"""
 from fastapi import APIRouter, Depends, HTTPException
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 from db.database import database
 import logging
 
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 @router.get("/check-tables")
 async def check_mcp_tables(current_user: dict = Depends(get_current_user)):
     """Check what data exists in MCP-related tables"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -80,7 +80,7 @@ async def get_merchant_full_data(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all data for a specific merchant"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -141,7 +141,12 @@ async def get_merchant_full_data(
         raise HTTPException(status_code=500, detail=str(e))
 
 from fastapi import APIRouter, Depends, HTTPException
-from utils.auth import get_current_user
+# NOTE: this module's whole body appears TWICE; `router` is rebound here, so
+# main.py mounts THIS copy's routes and the ones above are dead. ADMIN_ROLES
+# is therefore imported on both sides -- the live guards below use it, and
+# relying on the dead copy's import to bind it would turn the obvious
+# de-duplication cleanup into a NameError on every admin route here.
+from utils.auth import ADMIN_ROLES, get_current_user
 from db.database import database
 import logging
 
@@ -151,7 +156,7 @@ logger = logging.getLogger(__name__)
 @router.get("/check-tables")
 async def check_mcp_tables(current_user: dict = Depends(get_current_user)):
     """Check what data exists in MCP-related tables"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:
@@ -221,7 +226,7 @@ async def get_merchant_full_data(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all data for a specific merchant"""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin only")
     
     try:

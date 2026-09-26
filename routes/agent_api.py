@@ -3,8 +3,12 @@ Agent 专用 API 路由
 为 AI Agent 提供优化的电商接口
 """
 
+from services.seed_variant_options import normalize_seed_variant_options
+from services import agent_search_gateway_proxy
+from config.settings import settings as _app_settings
 from services.merchant_store_service import get_merchant_active_stores, get_primary_store
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Header, Response, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any, Awaitable, Callable
 from decimal import Decimal
@@ -56,13 +60,25 @@ from services.outbound_links_service import (
     apply_utm,
     is_destination_domain_allowed,
     make_redirect_token,
+    request_market_observed,
+    TOKEN_MARKET_OBSERVED_KEY,
+)
+from services.external_seed_stock import (
+    seed_stock,
+    seed_stock_fields,
+    seed_variant_stock_fields,
 )
 from services.external_seed_search import (
+    EXTERNAL_SEED_SERVING_SELECT_LIST as _EXTERNAL_SEED_SERVING_SELECT_LIST,
     build_seed_quarantine_anti_join as _seed_quarantine_clause,
     dedupe_external_seed_rows,
     fetch_external_seed_rows,
 )
-from services.external_referral_readiness import should_block_external_referral_runtime
+from services.external_referral_readiness import (
+    external_referral_live_verification_reasons,
+    should_block_external_referral_runtime,
+)
+from services.offer_buyability import expected_currency_for_market
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -102,6 +118,7 @@ from observability.reliability_metrics import (
 )
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 import uuid
+from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 
 from routes.reviews_invitation_issuer import mint_invitations_from_paid_order
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
@@ -2824,7 +2841,12 @@ def _build_external_seed_cache_key(
     hard_rule_prune: bool = False,
     limit: int,
     page_offset: int = 0,
+    request_market_named: bool = True,
 ) -> str:
+    """`request_market_named=False` (the request named no market) appends ONE extra component
+    after the integer offset bucket. A key built for a named market always ENDS in that integer,
+    so no market value — however spelled — can produce the unnamed key; and a named request's key
+    is byte-identical to the key this function built before the flag existed."""
     normalized_query = _normalize_external_seed_cache_query(query)
     normalized_market = str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     normalized_strategy = str(strategy or "legacy").strip().lower() or "legacy"
@@ -2843,11 +2865,12 @@ def _build_external_seed_cache_key(
     limit_bucket = _external_seed_limit_bucket(limit)
     offset_bucket = max(0, int(page_offset or 0))
     prune_token = "prune1" if hard_rule_prune else "prune0"
-    return (
+    key = (
         f"{normalized_query}|{normalized_market}|{normalized_strategy}|{normalized_scope}|"
         f"{normalized_surface}|{normalized_semantic_class}|{expansion_hash}|{required_terms_hash}|"
         f"{prune_token}|{limit_bucket}|{offset_bucket}"
     )
+    return key if request_market_named else f"{key}|market_unnamed"
 
 
 def _get_cached_external_seed_products(cache_key: str) -> Optional[List[Dict[str, Any]]]:
@@ -2908,6 +2931,7 @@ def _schedule_external_seed_cache_refresh(
     cache_key: str,
     req: Request,
     query: Optional[str],
+    market: str,
     query_semantic_class: Optional[str],
     limit: int,
     page_offset: int,
@@ -2920,6 +2944,7 @@ def _schedule_external_seed_cache_refresh(
     brand_required_terms: Optional[List[str]],
     brand_prefer_terms: Optional[List[str]],
     brand_query_detected: bool,
+    request_market: Optional[str] = None,
 ) -> bool:
     existing = _EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT.get(cache_key)
     if existing is not None and not existing.done():
@@ -2931,6 +2956,7 @@ def _schedule_external_seed_cache_refresh(
             refreshed = await _load_external_seed_products_for_search(
                 req=req,
                 query=query,
+                market=market,
                 limit=limit,
                 page_offset=page_offset,
                 build_budget_ms=build_budget_ms,
@@ -2944,6 +2970,7 @@ def _schedule_external_seed_cache_refresh(
                 brand_prefer_terms=brand_prefer_terms,
                 brand_query_detected=brand_query_detected,
                 metrics_out=refresh_metrics,
+                request_market=request_market,
             )
             if _should_cache_external_seed_result(products=refreshed or [], metrics=refresh_metrics):
                 _put_cached_external_seed_products(cache_key, refreshed or [])
@@ -2960,6 +2987,7 @@ async def _load_external_seed_products_with_cache(
     *,
     req: Request,
     query: Optional[str],
+    market: Optional[str] = None,
     query_semantic_class: Optional[str],
     limit: int,
     build_budget_ms: Optional[int],
@@ -2976,6 +3004,7 @@ async def _load_external_seed_products_with_cache(
     brand_query_detected: bool = False,
     metrics_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
+    normalized_market = str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     metrics = metrics_out if isinstance(metrics_out, dict) else {}
     metrics.setdefault("executed", False)
     metrics.setdefault("skip_reason", "not_attempted")
@@ -3008,6 +3037,7 @@ async def _load_external_seed_products_with_cache(
         return await _load_external_seed_products_for_search(
             req=req,
             query=query,
+            market=normalized_market,
             limit=limit,
             page_offset=page_offset,
             build_budget_ms=build_budget_ms,
@@ -3021,6 +3051,7 @@ async def _load_external_seed_products_with_cache(
             brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
             metrics_out=metrics,
+            request_market=market,
         )
 
     is_first_screen = int(page_offset or 0) == 0
@@ -3030,6 +3061,7 @@ async def _load_external_seed_products_with_cache(
         return await _load_external_seed_products_for_search(
             req=req,
             query=query,
+            market=normalized_market,
             limit=limit,
             page_offset=page_offset,
             build_budget_ms=build_budget_ms,
@@ -3043,6 +3075,7 @@ async def _load_external_seed_products_with_cache(
             brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
             metrics_out=metrics,
+            request_market=market,
         )
 
     cache_scope = (
@@ -3050,9 +3083,18 @@ async def _load_external_seed_products_with_cache(
         if enable_broad_fallback
         else ("brand_strict" if brand_query_detected else "default")
     )
+    # THE CACHED PRODUCTS CARRY MINTED `/r` TOKENS, and a token's `market_observed` depends on
+    # whether THIS request named a market. A market-less request and a `market=US` request both
+    # serve the US partition, but only the second may stamp its tokens observed — so they must
+    # not share one entry, or whichever filled it first would decide for the other. The key is
+    # split ONLY for the market-less case: a request that names its market builds exactly the
+    # key it always did. The split is its OWN key component (see `_build_external_seed_cache_key`),
+    # not a suffix on the market, so no raw market — "us~unobserved" included — can collide
+    # with it.
     cache_key = _build_external_seed_cache_key(
         query=query,
-        market=DEFAULT_EXTERNAL_SEED_MARKET,
+        market=normalized_market,
+        request_market_named=request_market_observed(market),
         strategy=normalized_seed_strategy,
         surface=normalized_catalog_surface,
         scope=cache_scope,
@@ -3117,6 +3159,7 @@ async def _load_external_seed_products_with_cache(
                     cache_key=cache_key,
                     req=req,
                     query=query,
+                    market=normalized_market,
                     query_semantic_class=query_semantic_class,
                     limit=limit,
                     page_offset=page_offset,
@@ -3129,6 +3172,7 @@ async def _load_external_seed_products_with_cache(
                     brand_required_terms=normalized_brand_required_terms,
                     brand_prefer_terms=normalized_brand_prefer_terms,
                     brand_query_detected=brand_query_detected,
+                    request_market=market,
                 )
             )
         return cached_products[:limit]
@@ -3137,6 +3181,7 @@ async def _load_external_seed_products_with_cache(
     sync_rows = await _load_external_seed_products_for_search(
         req=req,
         query=query,
+        market=normalized_market,
         limit=limit,
         page_offset=page_offset,
         build_budget_ms=build_budget_ms,
@@ -3150,6 +3195,7 @@ async def _load_external_seed_products_with_cache(
         brand_prefer_terms=normalized_brand_prefer_terms,
         brand_query_detected=brand_query_detected,
         metrics_out=metrics,
+        request_market=market,
     )
     metrics["executed"] = True
     if sync_rows:
@@ -3167,6 +3213,7 @@ async def _load_external_seed_products_with_cache(
             cache_key=cache_key,
             req=req,
             query=query,
+            market=normalized_market,
             query_semantic_class=query_semantic_class,
             limit=limit,
             page_offset=page_offset,
@@ -3179,6 +3226,7 @@ async def _load_external_seed_products_with_cache(
             brand_required_terms=normalized_brand_required_terms,
             brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
+            request_market=market,
         )
     return sync_rows[:limit]
 
@@ -3329,6 +3377,7 @@ async def _search_products_fast_mode(
     allow_external_seed: bool,
     allow_stale_cache: bool,
     query_semantic_class: str = "default",
+    expected_currency: Optional[str] = None,
 ) -> Dict[str, Any]:
     normalized_seed_strategy = _normalize_external_seed_strategy(
         normalized_seed_strategy, fallback="legacy"
@@ -3458,13 +3507,13 @@ async def _search_products_fast_mode(
             continue
         seen_keys.add(key)
 
-        if in_stock_only and not _availability_to_in_stock(product.get("in_stock")):
-            continue
-
-        price = _safe_price_number(product.get("price"), 0.0)
-        if min_price is not None and price < float(min_price):
-            continue
-        if max_price is not None and price > float(max_price):
+        if not _passes_explicit_commerce_filters(
+            product,
+            in_stock_only=in_stock_only,
+            min_price=min_price,
+            max_price=max_price,
+            expected_currency=expected_currency,
+        ):
             continue
         if not _passes_category_filter_fast(product, normalized_category):
             continue
@@ -3536,15 +3585,77 @@ async def _search_products_fast_mode(
     }
 
 
-def _availability_to_in_stock(availability: Any) -> bool:
-    if availability is None:
+def _known_product_stock_state(product: Dict[str, Any]) -> Optional[bool]:
+    """Return a stock decision only when the row carries an explicit signal."""
+    verification = product.get("commerce_verification")
+    if isinstance(verification, dict) and verification.get("required") is True:
+        return None
+    # The normalized availability string comes from the live offer chain and
+    # takes precedence over the scrape-time boolean when they disagree.
+    for value in (product.get("availability"), product.get("in_stock")):
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            continue
+        raw = str(value).strip().lower()
+        if raw in {"true", "1", "yes", "in_stock", "in stock", "instock", "available"}:
+            return True
+        if raw in {
+            "false", "0", "no", "out_of_stock", "out of stock", "outofstock",
+            "sold_out", "sold out", "soldout", "unavailable", "discontinued",
+        }:
+            return False
+    return None
+
+
+def _known_product_price(
+    product: Dict[str, Any], *, expected_currency: Optional[str] = None
+) -> Optional[float]:
+    """Return a finite, currency-qualified price or preserve it as unknown."""
+    verification = product.get("commerce_verification")
+    if isinstance(verification, dict) and verification.get("required") is True:
+        return None
+    raw = product.get("price")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    sentinel = float("nan")
+    price = _safe_price_number(raw, sentinel)
+    if price != price or price in {float("inf"), float("-inf")}:
+        return None
+    currency = str(
+        product.get("currency")
+        or product.get("currency_code")
+        or product.get("price_currency")
+        or ""
+    ).strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        return None
+    if expected_currency and currency != str(expected_currency).strip().upper():
+        return None
+    return price
+
+
+def _passes_explicit_commerce_filters(
+    product: Dict[str, Any],
+    *,
+    in_stock_only: bool,
+    min_price: Optional[float],
+    max_price: Optional[float],
+    expected_currency: Optional[str] = None,
+) -> bool:
+    """Keep unknown commerce facts discoverable, but never claim a strict match."""
+    if in_stock_only and _known_product_stock_state(product) is not True:
+        return False
+    if min_price is None and max_price is None:
         return True
-    if isinstance(availability, bool):
-        return availability
-    raw = str(availability).strip().lower()
-    if not raw:
-        return True
-    return raw not in {"out_of_stock", "outofstock", "sold_out", "soldout", "unavailable"}
+    price = _known_product_price(product, expected_currency=expected_currency)
+    if price is None:
+        return False
+    if min_price is not None and price < float(min_price):
+        return False
+    if max_price is not None and price > float(max_price):
+        return False
+    return True
 
 
 def _request_base_url(req: Request) -> str:
@@ -3563,7 +3674,11 @@ async def _build_external_seed_product(
     seed_row: Dict[str, Any],
     allowed_domains: Optional[List[str]] = None,
     metrics_out: Optional[Dict[str, Any]] = None,
+    request_market: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """`request_market` is the BUYER-side market the request named, raw (before any default) —
+    the only thing that may stamp the token's `market_observed`. The seed row's own `market` is
+    serving state and is never read as the buyer's."""
     seed_id = str(seed_row.get("id") or "").strip()
     if not seed_id:
         _increment_external_seed_metric_reason(metrics_out, "missing_seed_id")
@@ -3674,7 +3789,7 @@ async def _build_external_seed_product(
         _increment_external_seed_metric_reason(metrics_out, "missing_external_product_id")
         return None
 
-    blocked, _gate_status = await should_block_external_referral_runtime(
+    blocked, gate_status = await should_block_external_referral_runtime(
         seed_row,
         matched_via="agent_api",
         allowed_domains=allowed_domains,
@@ -3682,6 +3797,8 @@ async def _build_external_seed_product(
     if blocked:
         _increment_external_seed_metric_reason(metrics_out, "blocked_referral_runtime")
         return None
+    live_verification_reasons = external_referral_live_verification_reasons(gate_status)
+    requires_live_verification = bool(live_verification_reasons)
 
     disclosure_text = (
         seed_row.get("disclosure_text")
@@ -3714,7 +3831,7 @@ async def _build_external_seed_product(
         new_click_id,
         normalize_surface,
     )
-    from services.outbound_links_service import append_referral_click_param
+    from services.outbound_links_service import REFERRAL_CLICK_PARAM, append_referral_click_param
     from services.seller_identity import anchor_merchant_from_product_key
 
     stable_click_id = new_click_id()
@@ -3753,6 +3870,20 @@ async def _build_external_seed_product(
         {
             "market": market,
             "tool": tool,
+            # OBSERVED ONLY FROM THE REQUEST, NEVER FROM THE SEED ROW. The row's market is the
+            # market it is LISTED in, and for a request that named no market the seed search
+            # filters on DEFAULT_EXTERNAL_SEED_MARKET ("US") — so the row's "US" was the default
+            # itself, laundered through a WHERE clause, and stamping it forwarded a defaulted
+            # US to the gateway's purchasability gate via the warm-handoff lane. The search
+            # lane passes the request's raw market; the by-id lanes have none. The row's raw
+            # market is passed only as `listing_market`, which can turn the flag OFF (a row with
+            # no market serves the US fallback) and never ON. See the MARKET PROVENANCE note in
+            # `services/outbound_links_service`.
+            **(
+                {TOKEN_MARKET_OBSERVED_KEY: True}
+                if request_market_observed(request_market, listing_market=seed_row.get("market"))
+                else {}
+            ),
             "dest": dest_with_utm,
             "ctx": _redirect_ctx,
         }
@@ -3768,6 +3899,11 @@ async def _build_external_seed_product(
         price = 0.0
 
     seed_variants = _seed_variants(seed_data)
+    # The seed's own claim (services/external_seed_stock). Not computed on the
+    # live-verification path, which withholds stock and serves no variants.
+    stock = (
+        None if requires_live_verification else seed_stock(seed_row, seed_data)
+    )
     variants: List[Dict[str, Any]] = []
     seen_variant_ids: set[str] = set()
     for idx, v in enumerate(seed_variants):
@@ -3788,12 +3924,19 @@ async def _build_external_seed_product(
             variant_price = price
 
         availability = v.get("availability")
-        in_stock = _availability_to_in_stock(availability)
         image_url = v.get("image_url") or v.get("image")
         if isinstance(image_url, str):
             image_url = image_url.strip() or None
         else:
             image_url = None
+
+        # The axis, carried through. This builder whitelists variant fields, so
+        # an axis written into the seed reached here and stopped. It is read
+        # through the shared normalizer because the column holds TWO shapes —
+        # a list of pairs from the enrichment lane, a {name: value} mapping from
+        # the employee CSV lane — and a list-only reader silently discards the
+        # axis the CSV lane already had.
+        options = normalize_seed_variant_options(v.get("options"))
 
         variants.append(
             {
@@ -3802,16 +3945,20 @@ async def _build_external_seed_product(
                 "title": v.get("title") or v.get("name") or f"Variant {idx + 1}",
                 "price": variant_price,
                 "currency": str(raw_currency or "USD").strip() or "USD",
-                "inventory_quantity": 999 if in_stock else 0,
-                "in_stock": in_stock,
-                **({"availability": availability} if availability is not None else {}),
+                **seed_variant_stock_fields(availability, stock),
                 **({"image_url": image_url} if image_url else {}),
+                **({"options": options} if options else {}),
             }
         )
         if len(variants) >= 30:
             break
 
-    if not variants:
+    stock_fields = seed_stock_fields(stock)
+    if requires_live_verification:
+        # Preserve recall without promoting stale or contradictory commerce
+        # facts. The merchant checkout/live quote path owns verification.
+        variants = []
+    elif not variants:
         variants = [
             {
                 "id": external_product_id,
@@ -3819,8 +3966,7 @@ async def _build_external_seed_product(
                 "title": "Default",
                 "price": price,
                 "currency": price_currency,
-                "inventory_quantity": 999,
-                "in_stock": True,
+                **stock_fields,
             }
         ]
 
@@ -3835,24 +3981,60 @@ async def _build_external_seed_product(
         "description": str(seed_data.get("description") or "") or "",
         **({"brand": brand} if brand else {}),
         **({"vendor": vendor} if vendor else {}),
-        "price": price,
-        "currency": price_currency,
+        **({"price": price, "currency": price_currency} if not requires_live_verification else {}),
         "image_url": image_url,
         "image_urls": image_urls,
-        "in_stock": True,
-        "inventory_quantity": 999,
+        **(
+            stock_fields
+            if not requires_live_verification
+            else {
+                "availability": "unknown",
+                "buyable": False,
+                "checkout_ready": False,
+            }
+        ),
         "product_type": product_type,
         **({"category": category} if category else {}),
         **({"tags": tags} if tags else {}),
         "source": "external_seed",
         **({"external_domain": str(seed_row.get("domain") or "").strip()} if str(seed_row.get("domain") or "").strip() else {}),
         **({"canonical_url": canonical_url} if canonical_url else {}),
-        "destination_url": destination_url,
-        "external_url": destination_url,
+        # ATTRIBUTED, not raw. `dest_with_utm` is exactly what the `/r` token above signs —
+        # UTM plus the referral click param — so an agent that drives checkout from this URL
+        # instead of following the redirect carries the SAME click id the redirect would have
+        # stamped. Until now the click id lived only inside the token and the card published
+        # the bare seed URL, so that lane generated revenue we could not see. `canonical_url`
+        # above stays raw for anyone who needs the plain product page.
+        "destination_url": dest_with_utm,
+        "external_url": dest_with_utm,
+        "tracking": {
+            "click_id": stable_click_id,
+            "param": REFERRAL_CLICK_PARAM,
+            "join_mode": "referral_only",
+        },
         "external_seed_id": seed_id,
         "external_redirect_url": external_redirect_url,
         "disclosure_text": str(disclosure_text or DEFAULT_DISCLOSURE_TEXT),
-        "seed_data": seed_data,
+        **({"seed_data": seed_data} if not requires_live_verification else {}),
+        "external_referral_status": {
+            "status": str(getattr(gate_status, "status", "") or "unknown"),
+            "gating_policy_version": str(
+                getattr(gate_status, "gating_policy_version", "") or "unknown"
+            ),
+            "blocker_anomaly_types": list(
+                getattr(gate_status, "blocker_anomaly_types", []) or []
+            ),
+            "review_anomaly_types": list(
+                getattr(gate_status, "review_anomaly_types", []) or []
+            ),
+        },
+        "commerce_verification": {
+            "required": requires_live_verification,
+            "status": "live_quote_required" if requires_live_verification else "catalog_facts_accepted",
+            "reasons": live_verification_reasons,
+            "price_trusted": not requires_live_verification,
+            "availability_trusted": not requires_live_verification,
+        },
         "variants": variants,
     }
 
@@ -3861,6 +4043,7 @@ async def _load_external_seed_products_for_search(
     *,
     req: Request,
     query: Optional[str],
+    market: Optional[str] = None,
     query_semantic_class: Optional[str] = None,
     limit: int,
     page_offset: int = 0,
@@ -3874,9 +4057,14 @@ async def _load_external_seed_products_for_search(
     brand_prefer_terms: Optional[List[str]] = None,
     brand_query_detected: bool = False,
     metrics_out: Optional[Dict[str, Any]] = None,
+    request_market: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Load employee-managed external products (unattached external seeds) and surface as first-class products.
+
+    `market` selects the seed partition (and is defaulted to DEFAULT_EXTERNAL_SEED_MARKET for
+    serving); `request_market` is the RAW market the buyer's request named, if any, and is the
+    only thing the minted `/r` token may stamp as observed.
     """
     metrics = metrics_out if isinstance(metrics_out, dict) else None
     if metrics is not None:
@@ -3915,6 +4103,7 @@ async def _load_external_seed_products_for_search(
     normalized_semantic_class = (
         str(query_semantic_class or "default").strip().lower() or "default"
     )
+    normalized_market = str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     normalized_expansion_terms = _normalize_external_seed_terms_for_cache(
         expansion_terms
         if expansion_terms is not None
@@ -3940,7 +4129,7 @@ async def _load_external_seed_products_for_search(
     )
     stage_a_result = await fetch_external_seed_rows(
         database=database,
-        market=DEFAULT_EXTERNAL_SEED_MARKET,
+        market=normalized_market,
         query=query,
         limit=limit,
         offset=max(0, int(page_offset or 0)),
@@ -3978,7 +4167,7 @@ async def _load_external_seed_products_for_search(
         stage_a_lean_rescue_attempted = True
         lean_rescue_result = await fetch_external_seed_rows(
             database=database,
-            market=DEFAULT_EXTERNAL_SEED_MARKET,
+            market=normalized_market,
             query=query,
             limit=limit,
             offset=max(0, int(page_offset or 0)),
@@ -4030,7 +4219,7 @@ async def _load_external_seed_products_for_search(
         )
         stage_b_result = await fetch_external_seed_rows(
             database=database,
-            market=DEFAULT_EXTERNAL_SEED_MARKET,
+            market=normalized_market,
             query=stage_b_query,
             limit=stage_b_limit,
             offset=0,
@@ -4116,7 +4305,7 @@ async def _load_external_seed_products_for_search(
         broad_limit = min(1000, max(int(limit or 20) * 4, 120))
         broad_fetch_result = await fetch_external_seed_rows(
             database=database,
-            market=None,
+            market=normalized_market,
             query=query,
             limit=broad_limit,
             offset=0,
@@ -4209,6 +4398,7 @@ async def _load_external_seed_products_for_search(
                     seed_row=seed_row,
                     allowed_domains=None,
                     metrics_out=task_metrics,
+                    request_market=request_market,
                 )
                 if metrics is not None:
                     _merge_external_seed_metric_bucket(
@@ -4281,14 +4471,7 @@ async def _load_external_seed_product_by_product_id(*, req: Request, product_id:
     try:
         row = await database.fetch_one(
             f"""
-            SELECT
-              id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
-              destination_url, canonical_url, domain, title, image_url,
-              price_amount, price_currency, availability,
-              seed_data,
-              status, notes, created_by_employee_id,
-              attached_product_key, attached_variant_id,
-              created_at, updated_at
+            SELECT {_EXTERNAL_SEED_SERVING_SELECT_LIST}
             FROM external_product_seeds
             WHERE status = 'active'
               AND attached_product_key IS NULL
@@ -4321,14 +4504,7 @@ async def _load_external_seed_product_by_product_id(*, req: Request, product_id:
             try:
                 row = await database.fetch_one(
                     f"""
-                    SELECT
-                      id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
-                      destination_url, canonical_url, domain, title, image_url,
-                      price_amount, price_currency, availability,
-                      seed_data,
-                      status, notes, created_by_employee_id,
-                      attached_product_key, attached_variant_id,
-                      created_at, updated_at
+                    SELECT {_EXTERNAL_SEED_SERVING_SELECT_LIST}
                     FROM external_product_seeds
                     WHERE status = 'active'
                       AND attached_product_key IS NULL
@@ -4861,6 +5037,7 @@ async def agent_search_products(
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     in_stock_only: bool = True,
+    in_stock_filter_explicit: Optional[bool] = None,
     limit: int = Query(default=20, ge=1),
     offset: int = Query(default=0, ge=0),
     allow_external_seed: bool = Query(default=True),
@@ -4888,6 +5065,16 @@ async def agent_search_products(
     - 分页支持
     - 相关度评分
     """
+    # Preserve whether the caller actually requested a hard stock filter.
+    # FastAPI's historical default is True, but omission is discovery intent
+    # and must not erase rows whose inventory still needs a live quote.
+    if in_stock_filter_explicit is None:
+        in_stock_filter_explicit = (
+            "in_stock_only" in req.query_params
+            or "inStockOnly" in req.query_params
+        )
+    in_stock_only = bool(in_stock_only and in_stock_filter_explicit)
+    expected_price_currency = expected_currency_for_market(market)
     started = time.perf_counter()
     auth_lookup_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_lookup_ms", 0) or 0))
     auth_total_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_total_ms", 0) or 0))
@@ -4952,6 +5139,10 @@ async def agent_search_products(
             external_seed_strategy,
             fallback="legacy",
         )
+        # Public recall is source-neutral. Keep the legacy query fields for
+        # compatibility, but they can no longer exclude external offers.
+        allow_external_seed = True
+        normalized_seed_strategy = "unified_relevance"
         normalized_catalog_surface = _normalize_catalog_surface(catalog_surface)
         retrieval_profile_hint = (
             normalized_catalog_surface if normalized_catalog_surface == CATALOG_SURFACE_BEAUTY else None
@@ -5055,6 +5246,8 @@ async def agent_search_products(
             and min_price is None
             and max_price is None
         )
+        if is_browse_mode and not merchant_id and not merchant_ids and search_all_merchants is True:
+            fast_mode_enabled = True
         requested_search_all_merchants = search_all_merchants is True
         requested_external_seed_only = bool(external_seed_only)
         merchant_scope_override_reason: Optional[str] = None
@@ -5090,6 +5283,7 @@ async def agent_search_products(
             and not merchant_id
             and not merchant_ids
             and (search_all_merchants is True)
+            and not allow_external_seed
         ):
             try:
                 allowed = (
@@ -5360,6 +5554,7 @@ async def agent_search_products(
                 allow_external_seed=allow_external_seed,
                 allow_stale_cache=allow_stale_cache,
                 query_semantic_class=query_semantic_class,
+                expected_currency=expected_price_currency,
             )
             paginated_products = list(fast_result["products"])
             fast_ranked_candidates = list(fast_result.get("ranked_candidates") or [])
@@ -5400,6 +5595,7 @@ async def agent_search_products(
                     external_seed_products = await _load_external_seed_products_with_cache(
                         req=req,
                         query=query,
+                        market=market,
                         query_semantic_class=query_semantic_class,
                         limit=ext_limit,
                         build_budget_ms=AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS,
@@ -5429,12 +5625,13 @@ async def agent_search_products(
                         key = f"{str(product.get('merchant_id') or '').strip()}::{str(product.get('product_id') or product.get('id') or '').strip()}"
                         if not key or key in seen_keys:
                             continue
-                        if in_stock_only and not _availability_to_in_stock(product.get("in_stock")):
-                            continue
-                        price = _safe_price_number(product.get("price"), 0.0)
-                        if min_price is not None and price < float(min_price):
-                            continue
-                        if max_price is not None and price > float(max_price):
+                        if not _passes_explicit_commerce_filters(
+                            product,
+                            in_stock_only=in_stock_only,
+                            min_price=min_price,
+                            max_price=max_price,
+                            expected_currency=expected_price_currency,
+                        ):
                             continue
                         if not _passes_category_filter_fast(product, normalized_category):
                             continue
@@ -5870,6 +6067,7 @@ async def agent_search_products(
                 external_seed_products = await _load_external_seed_products_with_cache(
                     req=req,
                     query=query,
+                    market=market,
                     query_semantic_class=query_semantic_class,
                     limit=external_seed_limit,
                     build_budget_ms=AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS,
@@ -5938,17 +6136,18 @@ async def agent_search_products(
                     )
                     if projection.get("agent_push_status") == AGENT_PUSH_STATUS_EXCLUDED:
                         continue
-                if in_stock_only and not product.get("in_stock", True):
-                    continue
                 if not _matches_catalog_surface(product, normalized_catalog_surface):
                     continue
                 if not _passes_retrieval_profile_filter(product, query_semantic_class):
                     continue
 
-                price = _safe_price_number(product.get("price", 0), 0.0)
-                if min_price and price < min_price:
-                    continue
-                if max_price and price > max_price:
+                if not _passes_explicit_commerce_filters(
+                    product,
+                    in_stock_only=in_stock_only,
+                    min_price=min_price,
+                    max_price=max_price,
+                    expected_currency=expected_price_currency,
+                ):
                     continue
 
                 product.setdefault("relevance_score", 1.0)
@@ -6147,17 +6346,18 @@ async def agent_search_products(
                 )
                 if projection.get("agent_push_status") == AGENT_PUSH_STATUS_EXCLUDED:
                     continue
-            if in_stock_only and not product.get("in_stock", True):
-                continue
             if not _matches_catalog_surface(product, normalized_catalog_surface):
                 continue
             if not _passes_retrieval_profile_filter(product, query_semantic_class):
                 continue
 
-            price = _safe_price_number(product.get("price", 0), 0.0)
-            if min_price and price < min_price:
-                continue
-            if max_price and price > max_price:
+            if not _passes_explicit_commerce_filters(
+                product,
+                in_stock_only=in_stock_only,
+                min_price=min_price,
+                max_price=max_price,
+                expected_currency=expected_price_currency,
+            ):
                 continue
 
             if normalized_category:
@@ -6725,7 +6925,99 @@ async def agent_search_products_beauty(
     """
     Beauty-only alias for agent product search.
     Forces catalog_surface=beauty while preserving existing search behavior.
+
+    Behind AGENT_BEAUTY_SEARCH_VIA_GATEWAY this is served by the gateway's implementation of the
+    same search (ADR-021: one external door) -- see services/agent_search_gateway_proxy.py.
+    Off (the default), nothing below the local call changes.
     """
+    in_stock_filter_explicit = (
+        "in_stock_only" in req.query_params
+        or "inStockOnly" in req.query_params
+    )
+    in_stock_only = bool(in_stock_only and in_stock_filter_explicit)
+    proxy_on, _proxy_reason = agent_search_gateway_proxy.enabled_for(
+        getattr(context, "agent_id", None), req.headers,
+    )
+    if _proxy_reason == "already_proxied":
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": {"code": "gateway_search_proxy_loop", "reason": "untrusted_proxy_hop"}},
+        )
+    if proxy_on:
+        if limit > 100 or offset % limit != 0:
+            return JSONResponse(
+                status_code=422,
+                content={"status": "error", "error": {"code": "gateway_pagination_unsupported"}},
+            )
+        # The public gateway search door does not enforce this backend's per-agent merchant ACL.
+        # Until it can carry a trusted scope, fail closed for restricted agents.
+        requested_merchants = ([merchant_id] if merchant_id else list(merchant_ids or []))
+        if any(not context.can_access_merchant(mid) for mid in requested_merchants):
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "error": {"code": "merchant_forbidden"}},
+            )
+        if getattr(context, "allowed_merchants", None) is not None:
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "error": {"code": "gateway_merchant_scope_unavailable"}},
+            )
+        proxy_started = time.perf_counter()
+        gateway_body, why, gateway_status = await agent_search_gateway_proxy.search(
+            base_url=_app_settings.pivota_agent_internal_url,
+            query_items=list(req.query_params.multi_items()),
+            headers=req.headers,
+        )
+        if gateway_body is not None:
+            envelope = agent_search_gateway_proxy.to_backend_envelope(
+                gateway_body,
+                limit=limit,
+                offset=offset,
+                query=query,
+                category=category,
+                min_price=min_price,
+                max_price=max_price,
+                in_stock_only=in_stock_only,
+                merchant_id=merchant_id,
+                merchant_ids=merchant_ids,
+            )
+            # The same per-caller request log and search metric the local path records, so usage
+            # accounting is unchanged -- under its own metric path, so proxied traffic is countable.
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id=merchant_id or "cross_merchant_search",
+            )
+            try:
+                record_catalog_search(
+                    mode="search_standard",
+                    path="gateway_proxy",
+                    result="ok" if envelope["products"] else "no_candidates",
+                    duration_seconds=max(0.0, time.perf_counter() - proxy_started),
+                )
+            except Exception:
+                pass
+            return envelope
+        background_tasks.add_task(
+            log_agent_request,
+            context=context,
+            status_code=gateway_status,
+            merchant_id=merchant_id or "cross_merchant_search",
+        )
+        try:
+            record_catalog_search(
+                mode="search_standard",
+                path="gateway_proxy",
+                result="error",
+                duration_seconds=max(0.0, time.perf_counter() - proxy_started),
+            )
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=gateway_status,
+            content={"status": "error", "error": {"code": "gateway_search_failed", "reason": why}},
+        )
     return await agent_search_products(
         req=req,
         background_tasks=background_tasks,
@@ -6738,6 +7030,7 @@ async def agent_search_products_beauty(
         min_price=min_price,
         max_price=max_price,
         in_stock_only=in_stock_only,
+        in_stock_filter_explicit=in_stock_filter_explicit,
         limit=limit,
         offset=offset,
         allow_external_seed=allow_external_seed,
@@ -7079,6 +7372,123 @@ async def agent_resolve_products(
             query="products_cache_by_alias",
         )
 
+    # Source 1c: the CATALOG lanes.
+    #
+    # products_cache above is a merchant-sync cache. The external_referral cohort
+    # is never written to it -- measured 2026-09-16: ZERO products_cache rows for
+    # merch_obs_88382424262f3e0f, whose catalog_skus rows carry the real Shopify
+    # variant ids. So resolve answered NO_CANDIDATES for every referral row, for
+    # every caller, by construction: the identity exists, in a table this endpoint
+    # never read. A partner hit it resolving a variant id they had just resolved
+    # successfully against the merchant's own storefront.
+    #
+    # Coverage this reaches (prod, serving-eligible): 17,447 catalog_skus rows with
+    # a non-empty source_variant_id across 9,108 distinct products.
+    #
+    # BOTH axes are restored, because a caller blocked on product_id is as stuck as
+    # one blocked on sku_id, and they are one defect: resolve read only the cache.
+    #
+    # The emitted platform_product_id is `source_product_id` and that is load-bearing,
+    # not a guess: the canonical-mapping lookup below joins
+    # product_group_members.platform_product_id, and every one of the 15,588 rows in
+    # that table stores source_product_id (zero carry a sig_/ext:/ck_ shape). Emitting
+    # the signature or the product_key here would resolve the candidate and then
+    # silently lose canonical_ref.
+    # Gated on `not candidates_by_key`, matching the alias lane and the search
+    # fallback below. Gating on `exact_cache_rows` alone ran this lane even when the
+    # ALIAS lane had already resolved, and its score 1.0 then overwrote that
+    # candidate's source -- two extra round-trips on a request that was already done.
+    if not candidates_by_key and (sku_aliases or product_aliases):
+        catalog_started = time.perf_counter()
+        catalog_rows: List[Dict[str, Any]] = []
+        try:
+            if sku_aliases:
+                rows = await asyncio.wait_for(
+                    database.fetch_all(
+                        """
+                        SELECT cp.source_product_id AS platform_product_id,
+                               cs.merchant_id,
+                               cs.platform,
+                               cp.title
+                        FROM catalog_skus cs
+                        JOIN catalog_products cp ON cp.product_key = cs.product_key
+                        WHERE (CAST(:merchant_id AS TEXT) IS NULL OR cs.merchant_id = CAST(:merchant_id AS TEXT))
+                          AND (cs.source_variant_id = ANY(:sku_aliases) OR cs.sku = ANY(:sku_aliases))
+                          AND COALESCE(cp.source_product_id, '') <> ''
+                          -- Suppressed/tombstoned rows are refused by every serving
+                          -- path, so resolving one hands the caller an id that
+                          -- get_product and get_offers will both decline.
+                          AND cs.suppressed_at IS NULL
+                          AND cp.suppressed_at IS NULL
+                        ORDER BY cp.product_key
+                        LIMIT 80
+                        """,
+                        {"merchant_id": merchant_id, "sku_aliases": sku_aliases},
+                    ),
+                    timeout=resolve_exact_sku_timeout_s,
+                )
+                catalog_rows.extend([dict(r) for r in (rows or [])])
+
+            if product_aliases and not catalog_rows:
+                rows = await asyncio.wait_for(
+                    database.fetch_all(
+                        """
+                        SELECT cp.source_product_id AS platform_product_id,
+                               cp.merchant_id,
+                               cp.platform,
+                               cp.title
+                        FROM catalog_products cp
+                        WHERE (CAST(:merchant_id AS TEXT) IS NULL OR cp.merchant_id = CAST(:merchant_id AS TEXT))
+                          AND (cp.pivota_signature_id = ANY(:pid_aliases)
+                               OR cp.source_product_id = ANY(:pid_aliases)
+                               OR cp.content_key = ANY(:pid_aliases)
+                               OR cp.product_key = ANY(:pid_aliases))
+                          AND COALESCE(cp.source_product_id, '') <> ''
+                          AND cp.suppressed_at IS NULL
+                        ORDER BY cp.product_key
+                        LIMIT 80
+                        """,
+                        {"merchant_id": merchant_id, "pid_aliases": product_aliases},
+                    ),
+                    timeout=resolve_exact_pid_timeout_s,
+                )
+                catalog_rows.extend([dict(r) for r in (rows or [])])
+
+            for row_data in catalog_rows:
+                _add_candidate(
+                    merchant=row_data.get("merchant_id"),
+                    platform=row_data.get("platform"),
+                    platform_product_id=row_data.get("platform_product_id"),
+                    title=row_data.get("title"),
+                    source="catalog_identity_exact",
+                    score=1.0,
+                )
+            _record_source(
+                source="catalog_identity_exact",
+                status="ok" if catalog_rows else "empty",
+                reason_code="ok" if catalog_rows else "no_candidates",
+                source_started=catalog_started,
+                row_count=len(catalog_rows),
+                query="catalog_skus_and_products_by_identity",
+            )
+        # NO asyncio.TimeoutError branch. The cache lanes route that same exception
+        # through `_classify_db_reason_code`, which calls it what it is -- a database
+        # query timeout. Reporting `upstream_timeout` here made the response's
+        # top-level reason `UPSTREAM_TIMEOUT` / `search_timeout`, because the
+        # `search_timed_out` check below matches on exactly that string. A caller
+        # would have been told the SEARCH timed out when search never ran.
+        except Exception as e:  # noqa: BLE001
+            # Never costs the turn: the search fallback below still runs, exactly as
+            # it does when the cache lanes fail.
+            _record_source(
+                source="catalog_identity_exact",
+                status="error",
+                reason_code=_classify_db_reason_code(e),
+                source_started=catalog_started,
+                error=type(e).__name__,
+                query="catalog_skus_and_products_by_identity",
+            )
+
     # Source 2/3: scoped/global search fallback.
     search_query = query_text or (product_aliases[0] if product_aliases else sku_aliases[0] if sku_aliases else "")
     search_timeout_s = 4.0
@@ -7113,6 +7523,7 @@ async def agent_resolve_products(
                         min_price=None,
                         max_price=None,
                         in_stock_only=True,
+                        in_stock_filter_explicit=True,
                         limit=max(20, min(80, limit * 3)),
                         offset=0,
                         context=context,
@@ -9336,7 +9747,6 @@ async def agent_confirm_payment(
         from services.agent_governance import agent_governance
         from routes.order_routes import (
             _resolve_order_psp_adapter,
-            create_shopify_order,
             finalize_authorized_payment_order,
             get_order,
             log_order_event,
@@ -9492,7 +9902,10 @@ async def agent_confirm_payment(
                 except Exception:
                     pass
 
-                background_tasks.add_task(create_shopify_order, order_id)
+                await enqueue_merchant_order_create(
+                    order_id=order_id,
+                    merchant_id=order["merchant_id"],
+                )
 
                 background_tasks.add_task(
                     log_agent_request,
@@ -9632,7 +10045,10 @@ async def agent_confirm_payment(
             logger.debug("decision funnel link scheduling failed", exc_info=True)
 
         if can_shopify_sync:
-            background_tasks.add_task(create_shopify_order, order_id)
+            await enqueue_merchant_order_create(
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+            )
 
         try:
             from services.agent_webhook_service import emit_agent_webhook_event
@@ -10311,6 +10727,10 @@ async def agent_cancel_order(
             raise HTTPException(status_code=500, detail="Failed to cancel order")
 
         try:
+            # Never imported: `log_order_event` lives in db/products.py:489. The enclosing
+            # try/except swallowed the NameError, so no order_cancelled event was ever logged.
+            from db.products import log_order_event
+
             await log_order_event(
                 event_type="order_cancelled",
                 order_id=order_id,

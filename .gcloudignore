@@ -17,3 +17,19 @@ infra/gcp/*.local.*
 .env
 .env.*
 external_seed
+# Dev-machine-only state. `.claude` holds harness-managed worktrees — full repo
+# copies (dozens on a dev machine). A manual `gcloud builds submit` would ship
+# them all into the image via `COPY . .`, and since #1906 the duplicate-
+# order_routes.py guard in main.py no longer crashes such a container at boot.
+# (`reports/` stays IN the image: it is tracked and read at runtime.)
+.claude
+.mypy_cache
+probe_out
+coverage
+artifacts
+.DS_Store
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+mvp_events.jsonl

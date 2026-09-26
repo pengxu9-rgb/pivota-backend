@@ -1,14 +1,23 @@
 """
 Admin endpoints to canonicalize merchant data (merge duplicates into a canonical merchant_id)
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from utils.auth import require_admin_or_key
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from db.database import database
 import logging
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/admin/merchants", tags=["admin-merchants"])
+# AUTHENTICATION. Every route on this router was reachable with NO credentials
+# of any kind: no Depends, no header check, no role check. The guard is applied
+# at the ROUTER, not per-handler, so a route added here later inherits it
+# instead of having to remember it -- which is how this file got here.
+# require_admin_or_key accepts an X-ADMIN-KEY header or an admin/super_admin
+# JWT and fails closed (401) when neither is present.
+#
+# POST /admin/merchants/canonicalize rewrote merchant identity anonymously.
+router = APIRouter(prefix="/admin/merchants", tags=["admin-merchants"], dependencies=[Depends(require_admin_or_key)])
 
 class CanonicalizeRequest(BaseModel):
     canonical_merchant_id: str = Field(..., description="The merchant_id to keep and merge data into")

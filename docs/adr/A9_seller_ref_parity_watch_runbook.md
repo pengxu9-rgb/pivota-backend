@@ -1,5 +1,11 @@
 # ADR-009 A9 — `seller_ref_missing` parity-week watch (runbook)
 
+> ⚠️ **Production is GCP Cloud Run (`pivota-prod`, `us-west1`) since 2026-08-22. Railway is the
+> ROLLBACK.** The `railway ssh` / `DATABASE_PUBLIC_URL` steps below read the ROLLBACK database, so
+> a parity check run as written measures the wrong platform. They were not translated by guesswork.
+> See [operating_on_gcp_production.md](../runbooks/operating_on_gcp_production.md).
+
+
 **Purpose.** Confirm the seller-of-record seeds backfill made the seller-keyed
 closure path total, so the **legacy closure fallbacks can be removed** without
 silently dropping attribution. Removal target (a later, separate packet):

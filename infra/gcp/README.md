@@ -362,7 +362,7 @@ Tracked from the review of this PR; none is covered by these scripts yet.
    cutover and the late-Sep launch. ENTERPRISE (not ENTERPRISE_PLUS) means maintenance is a real
    restart, so this is not cosmetic.
 9. **Cloud SQL connection budget — RESOLVED, measured.** `max_connections` raised 200 → 300.
-   Measured worst case 230/300 (headroom 70): web 20x6, gateway 20x5, worker 1x10, and
+   Measured worst case 230/300 (headroom 70): web 10x12, gateway 20x5, worker 1x10, and
    proof-issuer + acp contribute **0** because they mount no `DATABASE_URL` at all. Re-derive this
    from the live services (not from comments) whenever a service or a pool default changes.
 10. **Dependency pinning** — `requirements.txt` pins only a few packages, so rebuilding the same git
@@ -403,14 +403,60 @@ Tracked from the review of this PR; none is covered by these scripts yet.
 
 ## Gateway (PIVOTA-Agent) on Cloud Run
 
+**Shipping a code change (the normal path).** `CONFIG=preserve` is the default: it rolls the image
+forward and restamps `PIVOTA_COMMIT_SHA`, and rewrites no environment variable or secret mount. No
+Railway, no generated files.
+
+It does **not** leave the service SHAPE alone, and the difference matters mid-incident: `preserve`
+reasserts `--concurrency` / `--min-instances` / `--max-instances` on every run (prod: 80 / 2 / 20 -
+min and max are per-env constants, 80 is one default for both envs), so a bare deploy reverts a hand-set concurrency. Pass
+`CONCURRENCY_LIMIT=` / `MIN_INSTANCES=` / `MAX_INSTANCES=` to carry one through, and read the
+`shape:` line the script prints before it deploys to confirm each one was read — see **Deploy** in
+`docs/runbooks/operating_on_gcp_production.md`.
+
 ```bash
 # from a PIVOTA-Agent checkout
+SHA=$(git rev-parse HEAD)
 gcloud builds submit --config ../pivota-backend-gcp/infra/gcp/cloudbuild.gateway.yaml \
-  --project pivota-shared --substitutions=COMMIT_SHA=$(git rev-parse HEAD) .
+  --project pivota-shared --substitutions=COMMIT_SHA=$SHA .
+../pivota-backend-gcp/infra/gcp/deploy_gateway.sh prod $SHA
+```
+
+That builds a candidate at 0% traffic, probes its `/health` **from inside the VPC** (prod ingress is
+`internal-and-cloud-load-balancing`, so a probe from a laptop only ever gets Google's 404), promotes
+it, and sweeps stale candidate tags. Deploying by hand with `gcloud` skips all four — which is how
+three revisions ended up pinned at `minScale: 2` on old code and live secrets, and how one revision
+inherited the previous revision's `PIVOTA_COMMIT_SHA` and under-reported the deployed commit by 7.
+
+`COMMIT_SHA` is load-bearing **twice** in that build: it tags the image, and `--build-arg` bakes it
+into `/app/.image_commit_sha`, which PIVOTA-Agent's `src/config/platform.js` prefers over every env
+var. That is what makes the commit `/health` reports a property of the code instead of a claim about
+it — an env var can be overridden or left behind by a hand deploy; a file inside the image cannot.
+Omitting the substitution degrades rather than lies: the stamp bakes blank and the env chain takes
+over. When the two disagree the app reports the baked one and logs the mismatch with both values.
+
+**Changing configuration (`CONFIG=apply`) is a separate, deliberate operation**, and today it is
+only reachable for a service being built from scratch:
+
+```bash
 python3 ../pivota-backend-gcp/infra/gcp/port_railway_env.py \
   --railway-service PIVOTA-Agent --railway-env production --env staging --prefix gateway --apply
-../pivota-backend-gcp/infra/gcp/deploy_gateway.sh staging <sha>
+CONFIG=apply ../pivota-backend-gcp/infra/gcp/deploy_gateway.sh staging <sha>
 ```
+
+⚠️ **`port_railway_env.py` reads Railway, which was decommissioned at the 2026-08-22 cutover.** For
+an existing service `apply` is therefore not just unavailable but wrong: it would rewrite all 382 of
+the prod gateway's environment variables from the retired platform. Cloud Run is the source of truth
+now. A config change means editing the live service or reviving the generated files deliberately —
+never as a side effect of shipping a commit.
+
+⚠️ **`gcloud run services update` does not shift traffic.** It creates a new revision carrying the
+change and reports success, but a service that pins revisions keeps serving the old one — the spec
+reads the new value while the serving revision reads the old. That is how the partner-sandbox flags
+came out armed and inert on 2026-08-24. Follow any `services update` with
+`gcloud run services update-traffic gateway --region us-west1 --project pivota-prod --to-latest`,
+or confirm `status.traffic[].latestRevision` is already `true`. A deploy through
+`deploy_gateway.sh` ends in `--to-latest`, so it leaves the service unpinned.
 
 The gateway reuses **its own repo's root Dockerfile**. That is safe there because PIVOTA-Agent's
 Railway services pin `builder=RAILPACK` explicitly, so the Dockerfile is inert on Railway - unlike
@@ -708,6 +754,35 @@ in the cutover would notice if it disappeared.
   services get deleted by surprise.
 - Migrating it later means its own image, its own Cloud Run service, and a **seventh** certificate
   plus host rule on the LB. Keeping it off the cutover critical path is deliberate.
+
+## Edge rate limiting (Cloud Armor)
+
+`pivota-edge-protection` is attached to both backend services: per-IP 600 req/min, exceed → 429.
+Managed by `infra/gcp/setup_cloud_armor.sh prod`, which is idempotent.
+
+**It is in PREVIEW — it logs what it would deny and denies nothing.** Promote it only after
+reviewing a period that includes real partner traffic:
+
+```bash
+gcloud logging read 'resource.type="http_load_balancer"
+  AND jsonPayload.previewSecurityPolicy.outcome="DENY"' \
+  --project pivota-prod --freshness=24h --limit=50 \
+  --format="value(timestamp,httpRequest.remoteIp,httpRequest.requestUrl)"
+
+ENFORCE=1 infra/gcp/setup_cloud_armor.sh prod    # when the log is clean
+```
+
+Two things that will mislead you otherwise. **Policy changes take minutes to reach every edge** — a
+burst immediately after applying passes unthrottled and proves nothing (a 700-request test at +5min
+produced zero denials; the same test after propagation produced 889). And **`--enforce-on-key=IP`
+is not optional**: without an explicit key the counter can aggregate on the load balancer's own
+address, so a single abusive client would 429 everybody.
+
+Instant rollback, without deleting anything:
+
+```bash
+gcloud compute backend-services update pivota-bes-web --global --project pivota-prod --security-policy=""
+```
 
 ## Secret access is per-service for the gateway, project-wide for the rest
 

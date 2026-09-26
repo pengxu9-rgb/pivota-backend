@@ -14,9 +14,10 @@ import io
 import json
 import hashlib
 import logging
+import time
 import math
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 from urllib.parse import parse_qsl, urlencode, urlunparse
 from datetime import datetime, timezone, timedelta
 
@@ -25,19 +26,27 @@ from pydantic import BaseModel, Field
 import uuid
 
 from db._ddl_guard import apply_ddl_statements
+from db.schema_guard import guarded_statements, is_lock_timeout
 from db.database import database
 from db.products import products_cache
 from db.product_enrichment import get_enrichment, upsert_enrichment
 from models.standard_product import StandardProduct
 from utils.auth import get_current_employee, require_employee_permissions
 
-from services.external_offers_service import resolve_external_offer
+from services import external_seed_destination_liveness as destination_liveness
+from services.external_offers_service import (
+    ExternalOfferUnavailable,
+    resolve_external_offer,
+    seed_variants_from_evidence,
+)
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
     _is_domain_allowed,
     apply_utm,
     make_redirect_token,
+    request_market_observed,
+    TOKEN_MARKET_OBSERVED_KEY,
 )
 from services.seed_content_audit import audit_seed_data
 from services.external_seed_audit import (
@@ -68,6 +77,7 @@ from services.pci_kb_scope_review import (
 )
 from db.reviews_center import product_reviews
 from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key, build_sku_key
+from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 
 router = APIRouter(prefix="/employee/products", tags=["employee-products"])
 
@@ -96,7 +106,14 @@ _EXTERNAL_SEED_IMPORT_TASKS_TABLE_LOCK = asyncio.Lock()
 # `CREATE TABLE`/`CREATE INDEX ... IF NOT EXISTS` take the table lock BEFORE
 # evaluating IF NOT EXISTS. Inside the list they are paced by the guard's
 # cooldown and dropped from the retry set as soon as they succeed.
-_EXTERNAL_SEED_IMPORT_TASKS_DDL_STATEMENTS = [
+# Guarded on Postgres (db/schema_guard.guarded_statements). Bare, each ALTER took
+# its table's ACCESS EXCLUSIVE lock, and each index build its SHARE lock, BEFORE
+# finding the column or index already there, with no lock_timeout: the first call
+# of every process queued behind any open transaction on the table, and every
+# later reader and writer queued behind it. A guarded statement runs only while
+# its column or index is missing, and one that cannot get its lock within the
+# lock_timeout fails instead, so apply_ddl_statements retries it on a later pass.
+_EXTERNAL_SEED_IMPORT_TASKS_DDL_STATEMENTS = guarded_statements([
     """
     CREATE TABLE IF NOT EXISTS employee_external_seed_import_tasks (
       id TEXT PRIMARY KEY,
@@ -126,7 +143,7 @@ _EXTERNAL_SEED_IMPORT_TASKS_DDL_STATEMENTS = [
     "ALTER TABLE employee_external_seed_import_tasks ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;",
     "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_status ON employee_external_seed_import_tasks(status);",
     "CREATE INDEX IF NOT EXISTS idx_employee_external_seed_import_tasks_updated_at ON employee_external_seed_import_tasks(updated_at DESC);",
-]
+])
 
 _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY = False
 _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_LOCK = asyncio.Lock()
@@ -277,6 +294,20 @@ def _extract_product_summary(product_data: Dict[str, Any], platform_product_id: 
         "availability": availability,
     }
 
+async def _execute_heal(statement: str) -> bool:
+    """Run one guarded self-heal statement (db/schema_guard.py). False when it gave up on
+    its lock_timeout: the heal is deferred to a later call (the caller must not memoize),
+    where the bare statement would have waited on the lock. Any other failure raises."""
+    try:
+        await database.execute(statement)
+    except Exception as exc:
+        if not is_lock_timeout(exc):
+            raise
+        logger.warning("self-heal deferred to a later call: %s", exc)
+        return False
+    return True
+
+
 async def _ensure_external_seeds_table() -> None:
     """
     Minimal storage for employee-managed external seeds.
@@ -317,50 +348,106 @@ async def _ensure_external_seeds_table() -> None:
         );
         """
     )
+    # Guarded (db/schema_guard.py): bare, each ALTER below took the table's ACCESS EXCLUSIVE
+    # lock and each index build its SHARE lock with no lock_timeout, even with nothing to add,
+    # and every seed-serving read touches this table: the first call of every process (the
+    # external-referral refresh job's included) queued behind any open transaction on it, and
+    # every reader queued behind that. A guarded statement runs only while its column or index
+    # is missing; one that cannot get its lock in time is deferred (the table stays not-ready
+    # and a later call retries it) where the bare one waited. Any other failure raises as before.
+    deferred = False
+
     # Backfill new columns for older deployments (best-effort).
     try:
-        await database.execute(
+        for statement in guarded_statements([
             "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_data JSONB NOT NULL DEFAULT '{}'::jsonb;"
+        ]):
+            await database.execute(statement)
+    except Exception as exc:
+        if is_lock_timeout(exc):
+            # Busy, not unsupported: a TEXT column here would be permanent.
+            deferred = True
+            logger.warning("self-heal deferred to a later call: %s", exc)
+        else:
+            # In case the DB doesn't support JSONB (unlikely in prod), keep the table usable.
+            try:
+                await database.execute(
+                    "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_data TEXT;"
+                )
+            except Exception:
+                pass
+    for statement in guarded_statements([
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS utm_template TEXT;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS partner_type TEXT;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS disclosure_text TEXT;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS external_product_id TEXT;",
+        # Content freshness (migration 202 / schema_guard). THIS FUNCTION IS THE ONLY THING THAT
+        # CREATES THIS TABLE -- it is absent from SQLAlchemy metadata -- so a column declared in the
+        # migration and in schema_guard but NOT here does not exist on any database bootstrapped
+        # through this path. `ALTER TABLE IF EXISTS ... ADD COLUMN` in the guard is a silent no-op
+        # when the table is missing, and the selector references `last_crawl_attempt_at`
+        # unconditionally, so omitting it here is a hard error on first boot, not a degraded sort.
+        # Migration 200's columns were added here for exactly this reason; 202's belong here too.
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_crawled_at TIMESTAMPTZ;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_crawl_attempt_at TIMESTAMPTZ;",
+        # Destination liveness (migration 200 / schema_guard). The refresh below writes
+        # these on every completed fetch, so this table cannot be usable without them.
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_checked_at TIMESTAMPTZ;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_http_status INTEGER;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_verdict TEXT;",
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;",
+    ]):
+        deferred |= not await _execute_heal(statement)
+    # The CHECK and the two partial indexes travel WITH the columns. Migration 199 and
+    # db/schema_guard.py both create all four things; a table bootstrapped only through this
+    # runtime path used to get the columns and neither, which is a third and quietly different
+    # declaration of the same schema — and the one that decides whether an unknown verdict is
+    # rejected or silently stored.
+    try:
+        await database.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'ck_external_product_seeds_destination_verdict'
+                ) THEN
+                    ALTER TABLE external_product_seeds
+                        ADD CONSTRAINT ck_external_product_seeds_destination_verdict
+                        CHECK (
+                            destination_verdict IS NULL
+                            OR destination_verdict IN (
+                                'live',
+                                'live_delisted',
+                                'redirected_to_product',
+                                'redirected_off_product',
+                                'dead_404',
+                                'unverifiable'
+                            )
+                        );
+                END IF;
+            END $$;
+            """
         )
     except Exception:
-        # In case the DB doesn't support JSONB (unlikely in prod), keep the table usable.
-        try:
-            await database.execute(
-                "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_data TEXT;"
-            )
-        except Exception:
-            pass
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS utm_template TEXT;"
-    )
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS partner_type TEXT;"
-    )
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS disclosure_text TEXT;"
-    )
-    await database.execute(
-        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS external_product_id TEXT;"
-    )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_status ON external_product_seeds(status);"
-    )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_attached ON external_product_seeds(attached_product_key, attached_variant_id);"
-    )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_domain ON external_product_seeds(domain);"
-    )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_created_at ON external_product_seeds(created_at DESC);"
-    )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_external_product_id ON external_product_seeds(external_product_id);"
-    )
-    await database.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_external_product_seeds_active_unique ON external_product_seeds(market, tool, external_product_id) WHERE status = 'active' AND external_product_id IS NOT NULL;"
-    )
-    _EXTERNAL_SEEDS_TABLE_READY = True
+        # SQLite (the test harness) has no DO blocks and no pg_constraint. The vocabulary is
+        # additionally enforced in Python by `classify_destination`, which is the only producer.
+        pass
+    for statement in guarded_statements([
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_checked "
+        "ON external_product_seeds(destination_checked_at);",
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_destination_verdict "
+        "ON external_product_seeds(destination_verdict);",
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_status ON external_product_seeds(status);",
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_attached ON external_product_seeds(attached_product_key, attached_variant_id);",
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_domain ON external_product_seeds(domain);",
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_created_at ON external_product_seeds(created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_external_product_seeds_external_product_id ON external_product_seeds(external_product_id);",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_external_product_seeds_active_unique ON external_product_seeds(market, tool, external_product_id) WHERE status = 'active' AND external_product_id IS NOT NULL;",
+    ]):
+        deferred |= not await _execute_heal(statement)
+    if not deferred:
+        _EXTERNAL_SEEDS_TABLE_READY = True
 
 
 async def _ensure_external_seed_import_tasks_table() -> None:
@@ -414,13 +501,16 @@ async def _ensure_employee_pci_kb_scope_reviews_table() -> None:
             );
             """
         )
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_employee_pci_kb_scope_reviews_decision ON employee_pci_kb_scope_reviews(decision);"
-        )
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_employee_pci_kb_scope_reviews_reviewed_at ON employee_pci_kb_scope_reviews(reviewed_at DESC);"
-        )
-        _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY = True
+        # Guarded on Postgres: bare, each build took the table's SHARE lock with no
+        # lock_timeout even with the index there. One that times out on its lock
+        # leaves the table not-ready, so the next call retries it.
+        deferred = False
+        for statement in guarded_statements([
+            "CREATE INDEX IF NOT EXISTS idx_employee_pci_kb_scope_reviews_decision ON employee_pci_kb_scope_reviews(decision);",
+            "CREATE INDEX IF NOT EXISTS idx_employee_pci_kb_scope_reviews_reviewed_at ON employee_pci_kb_scope_reviews(reviewed_at DESC);",
+        ]):
+            deferred |= not await _execute_heal(statement)
+        _EMPLOYEE_PCI_KB_SCOPE_REVIEWS_TABLE_READY = not deferred
 
 
 async def _ensure_primary_offers_table() -> None:
@@ -440,12 +530,13 @@ async def _ensure_primary_offers_table() -> None:
         );
         """
     )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_employee_product_primary_offers_type ON employee_product_primary_offers(offer_type);"
-    )
-    await database.execute(
-        "CREATE INDEX IF NOT EXISTS idx_employee_product_primary_offers_updated ON employee_product_primary_offers(updated_at DESC);"
-    )
+    # Guarded on Postgres: this runs on every call, and bare each build took the
+    # table's SHARE lock with no lock_timeout even with the index there.
+    for statement in guarded_statements([
+        "CREATE INDEX IF NOT EXISTS idx_employee_product_primary_offers_type ON employee_product_primary_offers(offer_type);",
+        "CREATE INDEX IF NOT EXISTS idx_employee_product_primary_offers_updated ON employee_product_primary_offers(updated_at DESC);",
+    ]):
+        await _execute_heal(statement)
 
 
 def _stable_external_product_id(url: str) -> str:
@@ -1400,6 +1491,10 @@ async def _make_redirect_url(
         {
             "market": market,
             "tool": tool,
+            # `market` arrives here RAW (the seed row's / the request's own value), and is
+            # exactly what gets stamped — so its own emptiness is the provenance question.
+            # See the MARKET PROVENANCE note in `services/outbound_links_service`.
+            **({TOKEN_MARKET_OBSERVED_KEY: True} if request_market_observed(market) else {}),
             "dest": dest_with_utm,
             "ctx": ctx,
         }
@@ -1533,17 +1628,23 @@ def _normalize_seed_url_for_id(url: str) -> str:
 
 
 def _normalize_seed_availability(raw: Any) -> Optional[str]:
+    """Canonicalise a seed availability string, keeping this call site's passthrough contract.
+
+    The vocabulary itself now lives in utils.availability_vocabulary so every reader shares
+    one mapping — see that module for why four divergent copies was a defect. The PASSTHROUGH
+    for unrecognised values is preserved deliberately: the caller above treats a passthrough
+    value as "unknown" (leaves `available` as None), and collapsing those to None here would
+    instead make them read as AVAILABLE.
+    """
     if raw is None:
         return None
     s = str(raw).strip()
     if not s:
         return None
-    v = s.strip().lower()
-    if v in {"in stock", "in_stock", "instock"}:
-        return "in_stock"
-    if v in {"out of stock", "out_of_stock", "outofstock", "sold out", "sold_out", "unavailable"}:
-        return "out_of_stock"
-    return v.replace(" ", "_")
+    canonical = normalize_availability(s)
+    if canonical is not None:
+        return canonical
+    return s.lower().replace(" ", "_")
 
 
 _CURRENCY_TO_REFERRAL_MARKET = {
@@ -3703,9 +3804,7 @@ async def create_external_seed(
         raw_desc = evidence.get("description")
         if isinstance(raw_desc, str) and raw_desc.strip():
             snap_description = raw_desc.strip()
-        raw_variants = evidence.get("variants")
-        if isinstance(raw_variants, list) and raw_variants:
-            snap_variants = [v for v in raw_variants if isinstance(v, dict)]
+        snap_variants = seed_variants_from_evidence(evidence)
 
     match_url = canonical_url or dest
     existing_row = await database.fetch_one(
@@ -4330,10 +4429,529 @@ async def update_external_seed(
         f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
         updates,
     )
-    return {"status": "success"}
+
+    # An employee price edit has to reach the BUYER's surfaces, not just the seed.
+    # `_refresh_external_seed_by_id` already projects after a re-read; this manual
+    # edit path wrote external_product_seeds and stopped, so a corrected price sat
+    # in the seed while catalog_offers -- which the PDP and the serving gate read --
+    # kept the old one. Same split-brain, different door.
+    #
+    # Best-effort and post-write, exactly like the refresh path: the projection is
+    # a mirror, and failing to mirror must never fail the authorized edit the
+    # employee just made.
+    projected: Dict[str, int] = {}
+    if any(k in updates for k in ("price_amount", "price_currency", "availability")):
+        try:
+            projected = await _project_refreshed_seed_to_serving_surfaces(seed_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "employee seed edit: serving-surface projection failed for seed_id=%r",
+                seed_id, exc_info=True,
+            )
+
+    return {"status": "success", "projected": projected}
 
 
-async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
+def _destination_key(url: Optional[str]) -> Optional[Tuple[Any, ...]]:
+    text = str(url or "").strip().rstrip("/")
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text)
+        port = parts.port
+    except ValueError:
+        return (text,)
+    host = (parts.hostname or "").lower()
+    if not host:
+        return (text,)
+    if host.startswith("www."):
+        host = host[len("www."):]
+    return (parts.scheme.lower(), host, port, parts.path.rstrip("/"), parts.query, parts.fragment)
+
+
+def _same_destination(fetched: Optional[str], served: Optional[str]) -> bool:
+    """Is the URL this refresh fetched the same one the serving lane hands out?
+
+    Compared after trimming and dropping a trailing slash — the two columns are written by
+    different code paths and differ cosmetically far more often than they differ in substance.
+    The HOST is compared case-insensitively and without a leading `www.`: the refresh writes
+    `canonical_url` from the page it fetched, and a store whose canonical tag names `www.`
+    turned a bare-domain `destination_url` into a permanent mismatch -- every later refresh
+    was `not_read`, so the row could never be re-read again. Measured 2026-09-26: 200
+    gate-fresh seeds (all 182 dodoskin rows, 8 eyurs incl. the Round Lab sunscreen whose stale
+    16.0 started #2340). Everything else -- scheme, port, path, query, fragment -- is
+    deliberately NOT normalised: on a storefront a differing query string can select a
+    different variant, and a different path is a different product (fenty's canonical names a
+    sibling shade's handle), so treating those as the same URL would reintroduce exactly the
+    mis-attribution this guard exists to prevent.
+    """
+    a = _destination_key(fetched)
+    return a is not None and a == _destination_key(served)
+
+
+def _read_the_served_product(
+    row: Dict[str, Any], dest: Optional[str], observed: Dict[str, Any]
+) -> Tuple[Optional["destination_liveness.DestinationObservation"], bool]:
+    """(observation, did this fetch actually read the product page we serve?)
+
+    ONE RULE for the refresh and for anything that previews it
+    (`scripts/ops/refresh_seeds_with_unverified_variants.py --simulate`). The preview used to
+    fetch `canonical_url` and skip this check, so it reported writes the refresh then refused
+    (eyurs, fenty) -- a preview that disagrees with the thing it previews is worse than none.
+
+    `status_code is not None` ALONE IS NOT A READING, and three separate cases prove it:
+      * `from_cache` -- `_fetch_html` stamps `observed` BEFORE returning, so a failure after
+        the response (extractor, snapshot upsert, post-write re-read) hands back the CACHED
+        row with `status_code` set. `resolve_external_offer` now says so explicitly.
+      * `final_url` -- a 301 onto a collection, or onto a DIFFERENT product handle, answers
+        200 for a page that is not the one we serve. Only the verdict looks at where the
+        request ended; `_same_destination` compares two STORED urls and cannot see it.
+      * `bot_challenged` -- a cf-mitigated 200 is `unverifiable`, and the liveness writer
+        already refuses to stamp `destination_checked_at` for it. Anything claiming parity
+        with that column has to refuse for the same reason.
+    """
+    observation = None
+    if observed.get("status_code") is not None and _same_destination(
+        dest, destination_liveness.destination_of(row)
+    ):
+        observation = destination_liveness.classify_destination(
+            requested_url=str(dest),
+            status_code=int(observed["status_code"]),
+            final_url=observed.get("final_url"),
+            bot_challenged=bool(observed.get("bot_challenged")),
+        )
+    read = (
+        observation is not None
+        and observation.verdict == destination_liveness.VERDICT_LIVE
+        and not observed.get("from_cache")
+    )
+    return observation, read
+
+
+# A price reading that we actually STORED. `unavailable` means we read no price at all, and
+# each `skipped_*` means we read something and REFUSED it (a 0-price broken-offer shape, an
+# amount with no currency, a currency that disagrees with the stored one). In every refused
+# case the row keeps its PREVIOUS amount, so the number we quote was not re-read and must not
+# be described as freshly extracted. `unchanged` counts: we read the page and it still says
+# what we store.
+_PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE = frozenset({"applied", "filled", "unchanged"})
+
+# "unknown" is the producer's way of saying it saw nothing (see the availability note in
+# `_refresh_external_seed_by_id`); it is not an observation and never overwrites a known state.
+_NO_AVAILABILITY_OBSERVATION = frozenset({"", "unknown"})
+
+
+def _as_price(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    # NaN survives float() and then defeats every comparison downstream: `nan != prev`
+    # is True but `abs(nan - prev) >= 0.005` is False, so it would be written to a
+    # DOUBLE PRECISION column and reported "unchanged". Treat it as no reading.
+    return parsed if math.isfinite(parsed) else None
+
+
+def _seed_variant_key(variant: Dict[str, Any]) -> str:
+    """The id the serving builders key a stored variant by (agent_api/_build_external_seed_product)."""
+    return str(variant.get("variant_id") or variant.get("id") or variant.get("sku") or "").strip()
+
+
+# THE EXTRACTOR'S INVENTED ID FOR AN OFFER THAT HAS NONE (`_offer_variants_from_node`:
+# `f"offer_{idx + 1}"`). It is a POSITION, and seeds adopted from sku-less pages store it, so
+# matching on it pairs "the first offer on today's page" with "the first variant stored months
+# ago": a page now listing one id-less offer at 32 would rewrite a stored `offer_1` 30ml at 20
+# to 32 / in stock (review of #2340). A read offer keyed by one is never indexed for matching
+# in `_reconcile_seed_variants_with_read`; a match needs the id on both sides, so that one
+# exclusion also covers a stored `offer_N`.
+_POSITIONAL_OFFER_ID = re.compile(r"^offer_\d+$")
+
+
+def _seed_variant_identifiers(variant: Dict[str, Any]) -> List[str]:
+    """Every id a stored variant is known by, for matching against what a page listed.
+
+    WIDER than `_seed_variant_key` ON PURPOSE. The builders key a variant by `variant_id`
+    (a Shopify numeric id on most enrichment rows); the page's JSON-LD offer is keyed by
+    `_offer_variants_from_node`, which prefers `sku`, then productID/mpn/gtin13. Measured
+    2026-09-25: 3,700 of 3,728 stored multi-variant entries carry a `sku`, and matching on it
+    alone re-reads 383 of the 777 fresh multi-variant rows the variant-id match missed
+    (perfumania, bluemercury, holiholic). Each is still an exact equality on an identifier the
+    merchant issued, never a title or a position (see `_POSITIONAL_OFFER_ID`).
+    """
+    out: List[str] = []
+    for key in ("variant_id", "id", "sku", "sku_id", "barcode", "gtin13", "mpn"):
+        raw = variant.get(key)
+        if raw is None or isinstance(raw, (dict, list, bool)):
+            continue
+        text = str(raw).strip()
+        if text and text.lower() != "none" and text not in out:
+            out.append(text)
+    return out
+
+
+def _seed_variant_stored_price(variant: Dict[str, Any]) -> Any:
+    """The price the serving builders read off a stored variant, same precedence."""
+    raw = variant.get("price_amount")
+    if raw is None:
+        raw = variant.get("price") or variant.get("amount") or variant.get("value")
+    return raw
+
+
+_MISSING = object()
+
+
+def _census_prices(census: Dict[str, Any]) -> set:
+    return {
+        round(float(p), 2)
+        for p in list(census.get("exact_prices") or []) + list(census.get("data_attr_exact_prices") or [])
+        if _as_price(p) is not None
+    }
+
+
+def _census_states(census: Dict[str, Any]) -> set:
+    return {
+        normalize_availability(a)
+        for a in list(census.get("availabilities") or []) + list(census.get("data_attr_availabilities") or [])
+    }
+
+
+def _page_names_one_value(census: Dict[str, Any]) -> bool:
+    """Did the page list at most one distinct offer, in either variant source?
+
+    Only meaningful behind `census_ok` in the reconcile, which has already refused a census
+    that is aggregate, truncated, or hid data-attribute duplicates.
+    """
+    return max(int(census.get("offers") or 0), int(census.get("data_attr_skus") or 0)) <= 1
+
+
+def _reconcile_seed_variants_with_read(
+    stored: List[Dict[str, Any]],
+    read: List[Dict[str, Any]],
+    *,
+    product_amount: Optional[float],
+    product_currency: Optional[str],
+    product_availability: Optional[str],
+    census: Optional[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Write what this refresh re-read into the STORED variants the builders serve.
+
+    THE BUG THIS CLOSES. The refresh corrected the `price_amount`/`availability` columns and
+    stamped `snapshot.extracted_at`, but the serving builders price and stock every offer from
+    the stored variants -- which the refresh left alone. Prod 2026-09-25: eyurs Round Lab
+    sunscreen re-crawled to 17.0/in_stock, served 16.0/out-of-stock with `price_trusted: true`.
+
+    READ WHAT THE EXTRACTOR EMITS, NOT WHAT A PAGE CONTAINS. `_extract_jsonld_variants` keeps
+    the first offer per id and drops the rest, and an AggregateOffer arrives as one `offer_1`
+    at `lowPrice`; the product-level price is `offers[0]` or `lowPrice`. A first version of this
+    function guarded against duplicate ids and sibling sizes on the list it was handed, where
+    neither can appear, and rewrote a 50ml stored at 32 to the 30ml's 20 (review of #2340). The
+    extractor now marks each read variant (`price_exact`, `offer_aggregate`, `id_collided`) and
+    hands a `census` of the distinct offers; this function trusts nothing those do not vouch for.
+
+    WHAT COUNTS AS A RE-READ of a stored variant, and nothing else does:
+      * an UNAMBIGUOUS identifier match (see `_seed_variant_identifiers`: one read variant
+        carries the id, no other stored variant claims it, and the extractor saw no other offer
+        under that id) to an offer that is not an AggregateOffer. Its price is taken only when
+        it is that offer's own `price` (not a range bound), positive, finite, and in a
+        currency the offer itself states that matches the variant's; its stock whenever the
+        page stated one;
+      * or, when the seed stores exactly ONE variant, the product-level values the caller
+        re-read this run (`product_amount` is None unless the column price was re-read), when
+        the census shows they cannot belong to another variant: one distinct offer, or every
+        distinct offer agrees, with no range and nothing truncated.
+    No inference from a shared price: "every shade was 34 and the page says 35" does not say
+    what the other shades cost.
+
+    Returns (new variant list, report). The input list is not mutated. `not_re_read` lists
+    only variants that carry something the builders serve as a fact (a price, or an explicit
+    availability); a bare variant with neither inherits the product values and needs no read.
+    `replaced` records every field this call changed, before and after, per variant, so an
+    overwrite can be undone.
+    """
+    read_by_id: Dict[str, List[int]] = {}
+    read_variants = [rv for rv in (read or []) if isinstance(rv, dict)] if isinstance(census, dict) else []
+    for pos, rv in enumerate(read_variants):
+        key = _seed_variant_key(rv)
+        if key and not _POSITIONAL_OFFER_ID.match(key):
+            read_by_id.setdefault(key, []).append(pos)
+
+    # Which read offer each stored variant names, through ANY of its own identifiers. A read
+    # offer two stored variants both claim is ambiguous for both.
+    claims: List[Optional[int]] = []
+    claimants: Dict[int, int] = {}
+    for v in stored:
+        named = {
+            read_by_id[i][0]
+            for i in _seed_variant_identifiers(v)
+            if len(read_by_id.get(i) or []) == 1
+        }
+        pos = next(iter(named)) if len(named) == 1 else None
+        claims.append(pos)
+        if pos is not None:
+            claimants[pos] = claimants.get(pos, 0) + 1
+
+    product_cur = (str(product_currency or "").strip().upper() or None)
+    single = len(stored) == 1
+    census_ok = isinstance(census, dict) and not (
+        census.get("aggregate") or census.get("truncated") or census.get("data_attr_duplicate_ids")
+    )
+    single_takes_price = (
+        single
+        and product_amount is not None
+        and census_ok
+        and bool(census.get("product_price_exact"))
+        and not census.get("inexact")
+        and (_page_names_one_value(census) or _census_prices(census) == {round(product_amount, 2)})
+    )
+    single_takes_availability = (
+        single
+        and bool(product_availability)
+        and census_ok
+        and (
+            _page_names_one_value(census)
+            or _census_states(census) <= {normalize_availability(product_availability)}
+        )
+    )
+
+    out: List[Dict[str, Any]] = []
+    not_re_read: List[str] = []
+    replaced: List[Dict[str, Any]] = []
+    re_read = 0
+    for idx, original in enumerate(stored):
+        v = dict(original)
+        stored_amount = _as_price(_seed_variant_stored_price(v))
+        stored_avail = str(v.get("availability") or "").strip()
+        serves_a_fact = stored_amount is not None or stored_avail.lower() not in _NO_AVAILABILITY_OBSERVATION
+        stored_cur = (
+            str(v.get("price_currency") or v.get("currency") or "").strip().upper() or product_cur
+        )
+
+        new_amount: Optional[float] = None
+        new_cur: Optional[str] = None
+        new_avail: Optional[str] = None
+        pos = claims[idx]
+        if pos is not None and claimants.get(pos) == 1:
+            rv = read_variants[pos]
+            per_variant = not rv.get("id_collided") and not rv.get("offer_aggregate")
+            amount = _as_price(rv.get("price_amount"))
+            # The offer's OWN currency, never a fallback. The product-level currency reaching
+            # this function is the column's (`resolve_external_offer` fabricates USD when the
+            # page states none), so inheriting it would read "3600" off a geo-served page as
+            # $3,600 -- seen in the #2340 spot-check against a JPY-served sigmabeauty page.
+            cur = str(rv.get("price_currency") or "").strip().upper() or None
+            if (
+                per_variant
+                and rv.get("price_exact") is True
+                and amount is not None
+                and amount > 0
+                and cur
+                and (stored_cur is None or cur == stored_cur)
+            ):
+                new_amount, new_cur = amount, cur
+            avail = str(rv.get("availability") or "").strip()
+            if per_variant and avail.lower() not in _NO_AVAILABILITY_OBSERVATION:
+                new_avail = avail
+        if single_takes_price and new_amount is None:
+            new_amount, new_cur = product_amount, product_cur
+        if single_takes_availability and new_avail is None:
+            new_avail = product_availability
+
+        before = dict(v)
+        if new_amount is not None:
+            # Every stored copy of the price moves together. `price` sits beside `price_amount`
+            # on most enrichment rows and `external_seed_audit` falls back to it; a corrected
+            # `price_amount` next to a stale `price` hands a reader the contradiction back.
+            v["price_amount"] = new_amount
+            if "price" in v:
+                v["price"] = new_amount
+            if new_cur:
+                v["price_currency"] = new_cur
+                if "currency" in v:
+                    v["currency"] = new_cur
+        if new_avail is not None:
+            v["availability"] = new_avail
+            # Same for stock: the boolean and the audit's `stock` / `stock_status` fallbacks.
+            state = normalize_availability(new_avail)
+            if "in_stock" in v and state in (IN_STOCK, OUT_OF_STOCK):
+                v["in_stock"] = state == IN_STOCK
+            for twin in ("stock", "stock_status"):
+                if twin in v:
+                    v[twin] = new_avail
+        diff_keys = [k for k in v if before.get(k, _MISSING) != v[k]]
+        price_moved = new_amount is not None and (
+            stored_amount is None or abs(new_amount - stored_amount) >= 0.005
+        )
+        stock_moved = new_avail is not None and normalize_availability(new_avail) != normalize_availability(stored_avail)
+        if price_moved or stock_moved:
+            replaced.append(
+                {
+                    "variant_id": _seed_variant_key(v) or f"#{idx + 1}",
+                    "before": {k: before.get(k) for k in diff_keys},
+                    "after": {k: v[k] for k in diff_keys},
+                }
+            )
+
+        was_re_read = new_amount is not None if stored_amount is not None else new_avail is not None
+        if serves_a_fact:
+            if was_re_read:
+                re_read += 1
+            else:
+                not_re_read.append(_seed_variant_key(v) or f"#{idx + 1}")
+        out.append(v)
+
+    return out, {
+        "stored": len(stored),
+        "read": len(read_variants),
+        "census": "present" if isinstance(census, dict) else "absent",
+        "re_read": re_read,
+        "changed": len(replaced),
+        "replaced": replaced,
+        "not_re_read": not_re_read[:30],
+        "not_re_read_count": len(not_re_read),
+    }
+
+
+async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str, int]:
+    """Push a freshly re-read seed onto the surfaces a BUYER reads.
+
+    THE BUG THIS CLOSES. `_refresh_external_seed_by_id` writes `external_product_seeds` and
+    nothing else. The search/offers lane reads the seed, so it saw fresh prices — but the PDP
+    (`agent_pdp_view`, via `agent_pdp_view_assembler.fetch_offers_for_keys`) and the index's
+    `serving_eligible.has_price` gate both read `catalog_offers`, and NOTHING re-projected a
+    seed that was already mirrored. Measured on prod 2026-09-06: 1,321 of 5,316 live products
+    (25%) served a different price on the PDP than in search, 917 with a seed read inside 7 days.
+
+    GATED AS A WHOLE, and that is a correction. The first version relied on
+    `sync_offer_for_seed` self-gating on EXTERNAL_OFFER_DUAL_WRITE_ENABLED and left
+    `refresh_agent_pdp_view_for_seed` UNGATED — which has no flag of its own. With the flag off
+    that meant every refreshed seed (~2,000/night) still ran `build_agent_pdp_view_row`
+    (~1s/key; the reconciler caps ITSELF at 300 keys/6h for that reason), the agent_pdp_view
+    upsert and `recompute_serving_eligibility` — inside the sequential 3,300s crawl budget,
+    while `catalog_offers` stayed untouched. All of the cost, none of the fix, and it would have
+    made `stopped_early` near-certain, slowing rotation and making prices STALER. The claim
+    "inert until armed" has to be true of the whole helper, so the flag is now checked here.
+
+    Called for `unchanged` as well as `applied`/`filled` ON PURPOSE: re-projecting a price that
+    did not move is what makes the nightly rotation self-healing for rows that already drifted,
+    instead of needing a separate backfill pass.
+
+    Returns counters so the batch can tell "healed 2,000" from "healed 0" — `sync_offer_for_seed`
+    has seven statuses and six of them mean "did nothing" (`no_mirror_product` is expected to be
+    common: the mirror is insert-only and matches on `source_ref = seed_id`). Dropping that dict
+    is how a run that projected nothing would still have reported success.
+
+    Best-effort and non-raising, mirroring the `seed_data_writer` hooks it stands in for: the
+    seed row is the committed source of truth, so a projection failure must never turn a good
+    price read into a failed refresh.
+    """
+    counts: Dict[str, Any] = {
+        "attempted": 0, "projected": 0, "skipped": 0, "errored": 0, "seconds": 0.0,
+    }
+    if not seed_id:
+        return counts
+    _started = time.monotonic()
+    from services.external_offer_dual_write import dual_write_enabled
+
+    if not dual_write_enabled():
+        # Inert, and cheap: no offer write AND no view rebuild. See the gating note above.
+        return counts
+
+    counts["attempted"] = 1
+    try:
+        from services.external_offer_dual_write import sync_offer_for_seed
+
+        from services.external_offer_dual_write import (
+            OFFER_SYNC_ERROR_STATUSES,
+            OFFER_SYNC_WRITTEN_STATUSES,
+        )
+
+        outcome = await sync_offer_for_seed(seed_id)
+        status = str((outcome or {}).get("status") or "").strip().lower()
+        # Derived from the writer, never restated here. The first version guessed
+        # {"synced","inserted","updated","ok"} — three statuses it cannot emit — and the tests
+        # stubbed "ok", so the whole positive path was calibrated against a value production
+        # never produces.
+        if status in OFFER_SYNC_WRITTEN_STATUSES:
+            counts["projected"] = 1
+        elif status in OFFER_SYNC_ERROR_STATUSES:
+            # The writer swallowed an exception. That is an error, not a skip: a skip means
+            # "nothing to do", and counting a failed write as one hides it from the summary.
+            counts["errored"] = 1
+            counts["skip_" + (status or "unknown")] = 1
+        else:
+            counts["skipped"] = 1
+            counts["skip_" + (status or "unknown")] = 1
+    except Exception as exc:  # noqa: BLE001 - a cache write must not break the source of truth
+        counts["errored"] = 1
+        logger.warning(
+            "external seed refresh: catalog_offers projection failed seed_id=%s err=%s",
+            seed_id, str(exc)[:200],
+        )
+    try:
+        from services.seed_data_writer import refresh_agent_pdp_view_for_seed
+
+        # THE PDP HALF REPORTS ITS OWN OUTCOME. `projected` means the OFFER was written; the
+        # view rebuild used to fold into nothing -- a raising or silently no-op'ing refresh (no
+        # attached_product_key, no content_key) left `projected: 1` and no skip, so the surface
+        # this hook is named for could fail on every row while the summary read healed.
+        pdp = await refresh_agent_pdp_view_for_seed(
+            seed_id=seed_id, proposal_id=None, refresh_source="external_referral_refresh",
+        )
+        if pdp == "refreshed":
+            counts["pdp_refreshed"] = 1
+        else:
+            counts["pdp_skipped"] = 1
+            counts["pdp_skip_" + str(pdp or "unknown")] = 1
+    except Exception as exc:  # noqa: BLE001 - same isolation the assembler documents
+        counts["errored"] = 1
+        counts["pdp_errored"] = 1
+        logger.warning(
+            "external seed refresh: agent_pdp_view projection failed seed_id=%s err=%s",
+            seed_id, str(exc)[:200],
+        )
+    # Measured AFTER both surfaces: the PDP rebuild is the ~1s/key half.
+    counts["seconds"] = round(time.monotonic() - _started, 4)
+    return counts
+
+
+async def _stamp_crawl_attempt(seed_id: str) -> None:
+    """Record that we TRIED to re-read this seed, whatever the outcome.
+
+    THIS IS NOT A FRESHNESS SIGNAL and must never be read as one -- that is `last_crawled_at`,
+    which only a fetch that reached the origin may set. This column exists solely to order the
+    refresh QUEUE, and the two questions genuinely differ for the rows that matter most.
+
+    Without it the queue deadlocks on its own failures. `get_external_referral_refresh_candidate_seed_ids`
+    orders `last_crawled_at ASC NULLS FIRST`, and a seed that 404s, is bot-challenged, or is
+    disallowed by robots never gets stamped -- so it stays NULL, stays first, and is retried
+    every single run, forever, in front of the rows that could actually be corrected. On the
+    dead-PDP audit's own numbers (10.4% of measurable seeds already broken) that is most of a
+    nightly batch spent re-fetching URLs we have already proven are gone.
+
+    Advancing the attempt clock on a failure does NOT claim the price is fresh. It claims only
+    that we have already spent this round's request on this row, which is true.
+    """
+    await _execute_seed_data_stmt(
+        "UPDATE external_product_seeds SET last_crawl_attempt_at = NOW() WHERE id = :id",
+        {"id": seed_id},
+    )
+
+
+async def _refresh_external_seed_by_id(
+    seed_id: str, *, max_wait: Optional[float] = None
+) -> Dict[str, Any]:
+    """Re-read one seed's price/availability from the origin.
+
+    `max_wait` is the CALLER'S PATIENCE and the two callers want opposite things. The employee
+    route behind this is interactive: a human is waiting, so the default ceiling
+    (CRAWL_MAX_WAIT_SECONDS) is right and a throttled host should fail fast. The nightly batch
+    is not: it must pass 0 (unbounded) or `crawl_politeness` refuses any slot beyond ~10s,
+    which is most of the backoff curve, and every remaining row on that host burns in
+    milliseconds looking like the host was down. Passing it per-call rather than reading an
+    env var keeps one function honest for both.
+    """
     await _ensure_external_seeds_table()
     row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
     if not row:
@@ -4343,15 +4961,86 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     market = row.get("market")
     tool = row.get("tool")
     dest = row.get("destination_url")
+    # The host, resolved BEFORE any degraded return can fire. `domain` further down is read off
+    # the snapshot, which by definition does not exist on the paths that degrade — so the
+    # summary's `top_degraded_hosts` was structurally always {"unknown": N}. Prefer the seed's
+    # own column, fall back to the destination URL's netloc.
+    report_host = str(row.get("domain") or "").strip().lower()
+    if not report_host and dest:
+        try:
+            report_host = (urlparse(str(dest)).hostname or "").strip().lower()
+        except Exception:  # noqa: BLE001 - a malformed URL must not break the refresh
+            report_host = ""
     previous_canonical_url = row.get("canonical_url")
     if not dest:
+        # Stamp FIRST. The candidate query orders by `last_crawl_attempt_at ASC NULLS FIRST`,
+        # so a row that raises before the stamp keeps a null attempt time, heads the queue
+        # again tomorrow, and every night after — a permanent backlog that crowds out rows
+        # that could actually be read.
+        await _stamp_crawl_attempt(seed_id)
         raise HTTPException(status_code=400, detail="INVALID_URL")
 
+    # THE REFRESH USED TO BE BLIND TO A DEAD LINK, and worse than blind: `raise_for_status()`
+    # threw, `resolve_external_offer` caught it and returned the CACHED snapshot, this function
+    # wrote that snapshot and set `updated_at = NOW()` — so fetching a 404 made the row look
+    # FRESHER to the `stale_snapshot` gate. `raise_on_unavailable=True` is what stops that.
+    # `observed` carries the status and the FINAL url of the request that actually left, which
+    # is the only way to tell a product page from a 301 onto a collection.
+    # See docs/external-seed-dead-pdp-link-audit.md §4.2 and §5.2.
     snapshot = None
+    observed: Dict[str, Any] = {}
     try:
-        snapshot = await resolve_external_offer(market=market, url=dest, force_refresh=True)
+        snapshot = await resolve_external_offer(
+            market=market,
+            url=dest,
+            force_refresh=True,
+            raise_on_unavailable=True,
+            observed=observed,
+            max_wait=max_wait,
+        )
+    except ExternalOfferUnavailable as exc:
+        if not _same_destination(dest, destination_liveness.destination_of(row)):
+            # See the note at the success path: a verdict about a URL we do not serve is worse
+            # than no verdict at all.
+            await _stamp_crawl_attempt(seed_id)
+            return {
+                "status": "degraded",
+                "error": f"destination_unavailable: http {exc.status_code}",
+                "domain": report_host or None,
+                "destination_refresh": {"status": "not_observed", "reason": "not_the_served_url"},
+            }
+        observation = destination_liveness.classify_destination(
+            requested_url=dest,
+            status_code=exc.status_code,
+            final_url=exc.final_url,
+            bot_challenged=bool(observed.get("bot_challenged")),
+        )
+        destination_refresh = await destination_liveness.record_destination_observation(
+            seed_id, observation
+        )
+        # THIS PATH RECORDS, IT NEVER RETIRES. A refresh sees one URL and one status code;
+        # it has not read the brand's catalogue, so it cannot tell a deleted product from a
+        # WAF that answers 404 to an unfamiliar client. `record_destination_observation`
+        # enforces that (an uncorroborated verdict holds the streak), and the retirement call
+        # is deliberately absent here rather than left in behind a condition that cannot fire
+        # — an unreachable retirement reads like a live one to the next person.
+        # Retirement belongs to jobs/external_seed_destination_sweep, which has stage 1.
+        await _stamp_crawl_attempt(seed_id)
+        return {
+            "status": "degraded",
+            "error": f"destination_unavailable: http {exc.status_code}",
+            "domain": report_host or None,
+            "destination_refresh": destination_refresh,
+        }
     except Exception as exc:
-        return {"status": "degraded", "error": f"snapshot_failed: {str(exc)[:200]}"}
+        # We never reached the origin (timeout, TLS, DNS, robots). That is NOT evidence about
+        # the product, so no observation is recorded and the failure streak does not move.
+        await _stamp_crawl_attempt(seed_id)
+        return {
+            "status": "degraded",
+            "error": f"snapshot_failed: {str(exc)[:200]}",
+            "domain": report_host or None,
+        }
 
     canonical_url = getattr(snapshot, "canonical_url", None) if snapshot else None
     domain = getattr(snapshot, "domain", None) if snapshot else None
@@ -4364,6 +5053,7 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     snap_image_urls: list[str] = []
     snap_description: Optional[str] = None
     snap_variants: Optional[List[Dict[str, Any]]] = None
+    snap_variant_census: Optional[Dict[str, Any]] = None
     evidence = getattr(snapshot, "evidence", None)
     if isinstance(evidence, dict):
         raw_images = evidence.get("image_urls") or evidence.get("images")
@@ -4376,6 +5066,11 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         raw_variants = evidence.get("variants")
         if isinstance(raw_variants, list) and raw_variants:
             snap_variants = [v for v in raw_variants if isinstance(v, dict)]
+        if isinstance(evidence.get("variant_census"), dict):
+            snap_variant_census = evidence["variant_census"]
+    # The page's variants as a SEED would store them; `snap_variants` keeps the per-read
+    # provenance marks the reconcile below reads.
+    adoptable_variants = seed_variants_from_evidence(evidence)
 
     seed_data = _ensure_json_obj(row.get("seed_data"))
     seed_data.setdefault("snapshot", {})
@@ -4390,7 +5085,13 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             "price_amount": snap_price_amount,
             "price_currency": snap_price_currency,
             "availability": snap_availability,
-            "refreshed_at": _to_iso(getattr(snapshot, "fetched_at", None)) or None,
+            # `snapshot.fetched_at` DOES NOT EXIST. ExternalOfferSnapshot's fields are
+            # (..., last_checked_at, evidence, override_*) -- so this getattr has always
+            # returned None and this key has always been written as null. Nothing read it,
+            # which is why it went unnoticed; `extracted_at` below is the field the
+            # `stale_snapshot` gate actually reads. Use the real field, falling back to now.
+            "refreshed_at": _to_iso(getattr(snapshot, "last_checked_at", None))
+            or _to_iso(datetime.now(timezone.utc)),
         }
     )
     # Only overwrite curated fields if they are missing.
@@ -4413,21 +5114,21 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         seed_data["image_urls"] = snap_image_urls
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
-    if snap_variants:
+    if adoptable_variants:
         existing_variants = _seed_variants(seed_data)
         product_title = seed_data.get("title") or snap_title
-        if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=product_title):
-            seed_data["variants"] = snap_variants
+        if _should_overwrite_seed_variants(existing=existing_variants, incoming=adoptable_variants, product_title=product_title):
+            seed_data["variants"] = adoptable_variants
         elif _should_replace_seed_variant_content(
             existing=existing_variants,
-            incoming=snap_variants,
+            incoming=adoptable_variants,
             market=market,
             previous_canonical_url=previous_canonical_url,
             refreshed_canonical_url=canonical_url,
         ):
-            seed_data["variants"] = snap_variants
+            seed_data["variants"] = adoptable_variants
         elif not existing_variants:
-            seed_data["variants"] = snap_variants
+            seed_data["variants"] = adoptable_variants
 
     pending_row = dict(row)
     pending_row["seed_data"] = seed_data
@@ -4469,18 +5170,7 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     # reachable by a test. The statement below is asserted COALESCE-free for these
     # columns in tests/test_external_seed_refresh_price.py — the harness stubs the
     # executor, so without that assertion a re-COALESCE mutant stays green.
-    def _as_price(value: Any) -> Optional[float]:
-        if value is None:
-            return None
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError):
-            return None
-        # NaN survives float() and then defeats every comparison below: `nan != prev`
-        # is True but `abs(nan - prev) >= 0.005` is False, so it would be written to a
-        # DOUBLE PRECISION column and reported "unchanged". Treat it as no reading.
-        return parsed if math.isfinite(parsed) else None
-
+    # `_as_price` (module level) refuses NaN/inf as well as non-numbers; see its note.
     prev_amount = _as_price(row.get("price_amount"))
     prev_currency = (str(row.get("price_currency") or "").strip().upper() or None)
     fresh_amount = _as_price(snap_price_amount)
@@ -4542,7 +5232,6 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
     # Follow-up: give price a first-class override flag the refresh honours.
     # Availability: "unknown" is the producer's way of saying it saw nothing, so it is
     # NOT an observation and must never overwrite a known state (see the block above).
-    _NO_AVAILABILITY_OBSERVATION = {"", "unknown"}
     prev_availability = (str(row.get("availability") or "").strip() or None)
     _fresh_availability_raw = str(snap_availability or "").strip()
     fresh_availability = (
@@ -4576,6 +5265,101 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         "currency": next_currency,
     }
 
+    # HOISTED so the stamp and the liveness observation below are gated on ONE decision.
+    # Deriving "did we reach the origin" twice is the twin-implementation drift this file
+    # keeps paying for, and here the two copies would disagree about whether a row is fresh.
+    #
+    # REACHING THIS LINE IS NOT EVIDENCE OF A FETCH. `resolve_external_offer` honours
+    # `raise_on_unavailable` only in its `except ExternalOfferUnavailable` arm; a timeout, a
+    # TLS/DNS error, a `RobotsDisallowed` (a bare RuntimeError) or a failure inside the
+    # extractor all land in its generic `except Exception`, which returns the CACHED snapshot.
+    # The success path then runs normally. `observed["status_code"]` is the only proof that
+    # anything actually left the process -- and `_same_destination` is the only proof it went
+    # to the URL we serve rather than a legacy `destination_url` we do not.
+    # ONE CLASSIFICATION, read three times: the freshness stamp, the staleness gate, and the
+    # liveness verdict below all derive from THIS (see `_read_the_served_product` for why a
+    # status code alone is not a reading). `classify_destination` is pure, so hoisting it costs
+    # nothing and removes the twin-implementation drift this file keeps paying for.
+    served_url = destination_liveness.destination_of(row)
+    observation, read_the_served_product = _read_the_served_product(row, dest, observed)
+
+    # CLEAR THE BLOCKER THIS REFRESH IS THE RECOMMENDED FIX FOR.
+    #
+    # `stale_snapshot` (services/external_referral_readiness) is raised when the CONTENT is
+    # older than EXTERNAL_REFERRAL_STALE_DAYS, it is marked `auto_fixable: True`, and its
+    # `recommended_action` is literally "Refresh the seed snapshot". It reads
+    # `snapshot.extracted_at` via `get_content_extracted_at`, which has NO fallback by
+    # design -- and until now this function wrote only `snapshot.refreshed_at`. So the gate
+    # recommended an action that could not clear it, and `auto_fixable` was untrue: a seed
+    # could be refreshed successfully every night and stay blocked forever.
+    #
+    # GATED TWICE, because the failure mode of getting this wrong is the one this whole lane
+    # exists to prevent -- a stale price presented as freshly verified:
+    #   * `reached_served_origin` -- a cached-snapshot fallback (timeout, TLS, robots) runs
+    #     this same success path without contacting anyone, and must never clear a blocker;
+    #   * the price status -- we only claim an extraction when the amount we now STORE came
+    #     off the page. Refusing to write a reading and then calling the row fresh would
+    #     vouch for the previous price.
+    # A row we can never read a price from therefore stays blocked, which is the correct
+    # direction to be wrong in: it withholds a row rather than quoting a number we did not
+    # re-read.
+    #
+    # AND ON THE VARIANTS, because the builders serve those, not the columns. `_seed_primary_price`
+    # reads `seed_data.variants[]` first and every served variant carries its own price and stock,
+    # so a stamp over re-read COLUMNS vouched for variant values nobody re-read: the gate said
+    # healthy and the offer carried the old price with `price_trusted: true`. The reconcile below
+    # writes what was re-read into the variants in this same UPDATE. When a stored variant that
+    # carries a price or stock was NOT re-read (a multi-variant row whose page listed other ids
+    # or one offer), the row is not fresh -- and a stamp an earlier refresh left behind is
+    # REMOVED, since it made the same unearned claim. The gate then serves the row for recall
+    # with `live_quote_required` instead of quoting a sibling's stale price as trusted.
+    price_re_read = price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE
+    variant_refresh: Dict[str, Any] = {"status": "not_read"}
+    if read_the_served_product:
+        # THE LIST THE BUILDER SERVES, wherever it lives. `routes/agent_api._seed_variants` (and
+        # `services/external_seed_stock`) fall back to `snapshot.variants` when the seed has no
+        # top-level list; reconciling only the top level left that list stale AND stamped fresh.
+        served_container = (
+            seed_data["snapshot"]
+            if not isinstance(seed_data.get("variants"), list)
+            and isinstance(seed_data["snapshot"].get("variants"), list)
+            else seed_data
+        )
+        reconciled, variant_refresh = _reconcile_seed_variants_with_read(
+            [v for v in (served_container.get("variants") or []) if isinstance(v, dict)],
+            snap_variants or [],
+            product_amount=next_amount if price_re_read else None,
+            product_currency=next_currency,
+            product_availability=fresh_availability,
+            census=snap_variant_census,
+        )
+        if reconciled:
+            served_container["variants"] = reconciled
+        variant_refresh["served_from"] = "snapshot" if served_container is not seed_data else "seed_data"
+        if fresh_availability:
+            # The top-level copies are the same fact; see `services/external_seed_stock`.
+            seed_data["availability"] = fresh_availability
+            state = normalize_availability(fresh_availability)
+            if state in (IN_STOCK, OUT_OF_STOCK):
+                seed_data["in_stock"] = state == IN_STOCK
+        variant_refresh["status"] = (
+            "all_re_read" if not variant_refresh["not_re_read_count"] else "not_all_re_read"
+        )
+        seed_data["snapshot"]["variant_refresh"] = variant_refresh
+        # `variant_refresh` is rewritten every run, so the next no-change night would blank
+        # the before/after record of an overwrite. Keep the LAST run that wrote anything,
+        # bounded, until a later write replaces it.
+        if variant_refresh.get("replaced"):
+            seed_data["snapshot"]["variant_refresh_last_write"] = {
+                "at": _to_iso(datetime.now(timezone.utc)),
+                "replaced": variant_refresh["replaced"][:50],
+            }
+    if read_the_served_product and price_re_read:
+        if variant_refresh.get("not_re_read_count"):
+            seed_data["snapshot"].pop("extracted_at", None)
+        else:
+            seed_data["snapshot"]["extracted_at"] = _to_iso(datetime.now(timezone.utc))
+
     await _execute_seed_data_stmt(
         """
         UPDATE external_product_seeds
@@ -4587,11 +5371,26 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             price_currency = :price_currency,
             availability = :availability,
             seed_data = :seed_data,
-            updated_at = NOW()
+            updated_at = NOW(),
+            -- WE SPENT THIS ROUND'S REQUEST ON THIS ROW. Advances on every terminal outcome
+            -- (see _stamp_crawl_attempt), which is what keeps a permanently-dead seed from
+            -- sitting at the head of the queue forever. Orders the queue; proves nothing.
+            last_crawl_attempt_at = NOW(),
+            -- WE ACTUALLY READ THE PRICE, FROM THE URL WE SERVE. Gated on exactly the
+            -- predicate `destination_checked_at` is gated on, because it is the same claim
+            -- about the same fetch. A cached-snapshot fallback keeps the OLD value rather
+            -- than taking NOW() -- if it took NOW(), the hosts we can never read would be
+            -- stamped fresh on every run and sorted to the BACK of the queue permanently,
+            -- which is the starvation this column exists to remove, wearing a new hat.
+            last_crawled_at = CASE
+                WHEN CAST(:read_the_served_product AS BOOLEAN) THEN NOW()
+                ELSE last_crawled_at
+            END
         WHERE id = :id
         """,
         {
             "id": seed_id,
+            "read_the_served_product": bool(read_the_served_product),
             "canonical_url": canonical_url,
             "domain": domain,
             "title": snap_title,
@@ -4602,8 +5401,56 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
             "seed_data": _seed_data_payload(seed_data),
         },
     )
+
+    # THE FETCH REACHED THE ORIGIN, so it is an observation and it may stamp the liveness
+    # columns — the ONLY writer allowed to, which is what makes `destination_checked_at`
+    # answerable ("when did we last see this URL") where `updated_at` never was.
+    #
+    # Classified from `observed`, the real HTTP status and FINAL url, NOT from
+    # `snapshot.canonical_url`: the page's self-declared canonical can point at a sibling
+    # handle for perfectly live products, and a `redirected_off_product` verdict is one of the
+    # two that can eventually retire a seed. A guess must never be able to do that.
+    destination_refresh: Dict[str, Any] = {"status": "not_observed"}
+    # ONLY JUDGE THE URL WE ACTUALLY SERVE. This function fetches `destination_url`, but the
+    # readiness gate and the sweep both resolve a seed to `canonical_url or destination_url`
+    # — and this very function writes `canonical_url` from the fetched page a few lines up, so
+    # the two drift apart by design. Recording a verdict from the wrong one is how a seed whose
+    # served link is healthy gets marked dead because a legacy `destination_url` 404s.
+    # When they differ, the sweep observes the served URL; saying nothing here is correct.
+    # `served_url` and `observation` are the HOISTED values from above; recomputing them here
+    # is what would let the stamp and the verdict disagree.
+    if observed.get("status_code") is None:
+        # The fetch never reached the origin (or came from the snapshot cache), so there is
+        # nothing to record. Distinct from the case below, and the drift report says which.
+        destination_refresh = {"status": "not_observed", "reason": "no_origin_response"}
+    elif not _same_destination(dest, served_url):
+        destination_refresh = {"status": "not_observed", "reason": "not_the_served_url"}
+    else:
+        assert observation is not None  # same branch conditions as the hoist above
+        destination_refresh = await destination_liveness.record_destination_observation(
+            seed_id, observation
+        )
+        # THIS PATH RECORDS, IT NEVER RETIRES. A refresh sees one URL and one status code;
+        # it has not read the brand's catalogue, so it cannot tell a deleted product from a
+        # WAF that answers 404 to an unfamiliar client. `record_destination_observation`
+        # enforces that (an uncorroborated verdict holds the streak), and the retirement call
+        # is deliberately absent here rather than left in behind a condition that cannot fire
+        # — an unreachable retirement reads like a live one to the next person.
+        # Retirement belongs to jobs/external_seed_destination_sweep, which has stage 1.
+
+    # The seed is committed; now make the buyer-facing surfaces agree with it. See the helper
+    # for why this is gated on a price we actually re-read, and why `unchanged` is included.
+    projection: Dict[str, int] = {}
+    # BOTH conjuncts, matching the `extracted_at` stamp above. A cache-served fallback (a quarter
+    # of rows on 09-05) also yields `unchanged`, and projecting it would stamp
+    # catalog_offers.updated_at = NOW() on a row nobody re-read — claiming a freshness we did not
+    # earn, which is exactly what the projection exists to stop.
+    if read_the_served_product and price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE:
+        projection = await _project_refreshed_seed_to_serving_surfaces(seed_id)
+
     return {
         "status": "success",
+        "projection": projection,
         "seed_id": seed_id,
         "market": market,
         "tool": tool,
@@ -4611,11 +5458,26 @@ async def _refresh_external_seed_by_id(seed_id: str) -> Dict[str, Any]:
         "canonical_url": canonical_url,
         "domain": domain,
         "seed_data": seed_data,
+        # DID THIS "SUCCESS" ACTUALLY CONTACT THE ORIGIN? Often not, and the status alone
+        # cannot say. `resolve_external_offer` honours `raise_on_unavailable` ONLY in its
+        # `except ExternalOfferUnavailable` arm; anything else — a timeout, TLS, robots, and
+        # now a `CrawlDelayTooLong` skip — falls into its generic `except Exception`, which
+        # hands back the CACHED snapshot. This whole success path then runs having contacted
+        # nobody, and the batch counts the row as `refreshed`.
+        #
+        # The freshness guards already hold (`observed["status_code"] is None` withholds
+        # `last_crawled_at`, `destination_checked_at` and the verdict), so nothing is
+        # fabricated. What was missing is any signal an OPERATOR can see: a run in which a
+        # hostile robots.txt voided every row reported exactly like a complete one. Same
+        # reasoning as `stopped_early`/`skipped_for_budget` on the batch summary.
+        "snapshot_from_cache": bool(observed.get("from_cache")),
         # Drift report. The batch runner sums these so "we re-crawled N seeds" can
         # be stated as "N re-crawled, M prices actually moved" — the difference is
         # the whole point of the refresh existing.
         "price_refresh": price_refresh,
         "availability_refresh": availability_refresh,
+        "variant_refresh": variant_refresh,
+        "destination_refresh": destination_refresh,
         "attached_product_key": row.get("attached_product_key"),
         "attached_variant_id": row.get("attached_variant_id"),
         "disclosure_text": row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT,

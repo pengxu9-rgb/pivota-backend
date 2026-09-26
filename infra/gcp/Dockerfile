@@ -23,6 +23,24 @@ WORKDIR /app
 COPY --from=base /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=base /usr/local/bin /usr/local/bin
 COPY --chown=app:app . .
+
+# Stamp the commit INTO the image, so what /health reports is a property of the code rather than a
+# claim about it. Until now the only source was the PIVOTA_COMMIT_SHA env var set at deploy time,
+# which means any deploy that forgets it leaves the previous value in place: on 2026-08-23 a manual
+# `gcloud run deploy` rolled prod onto the eecb983b image while /health kept reporting b13b8a9b,
+# and the drift alarm - whose entire job is comparing that value to main - reasoned about the wrong
+# commit. A stale label that happens to MATCH main is worse still: the alarm goes green over
+# undeployed code.
+#
+# A file, not an ENV: `gcloud run deploy --set-env-vars/--update-env-vars` can override an image
+# ENV, so the guarantee would only hold until someone set that name. Nothing in a Cloud Run deploy
+# can rewrite a file inside the image.
+#
+# Empty when built without the arg (local `docker build`), and the env vars remain the fallback.
+ARG COMMIT_SHA=""
+RUN printf '%s' "$COMMIT_SHA" > /app/.image_commit_sha \
+    && chown app:app /app/.image_commit_sha
+
 USER app
 EXPOSE 8080
 # single uvicorn process: the `databases` pool is per-process and the app runs in-process

@@ -9,13 +9,14 @@ import os
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 import httpx
 
 from config.settings import resolve_public_api_base_url
 from db.database import database
+from db.schema_guard import guarded_statements, is_lock_timeout
 from db.startup_ddl import execute_ddl
 
 
@@ -234,7 +235,12 @@ def _next_retry_at(attempt_count: int) -> Optional[datetime]:
 
 _AGENT_WEBHOOK_DDL_READY = False
 
-_AGENT_WEBHOOK_DDL_STATEMENTS = (
+# Index builds guarded on Postgres (db/schema_guard.guarded_statements). Bare,
+# each took its table's SHARE lock BEFORE finding the index already there, with no
+# lock_timeout, so every boot queued behind any open writer of the deliveries table
+# and blocked every later writer behind it. One that cannot get its lock within
+# the lock_timeout is deferred to a later call (see the ensure function below).
+_AGENT_WEBHOOK_DDL_STATEMENTS = guarded_statements((
     """
     CREATE TABLE IF NOT EXISTS agent_webhook_configs (
         id SERIAL PRIMARY KEY,
@@ -302,7 +308,7 @@ _AGENT_WEBHOOK_DDL_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS idx_agent_webhook_managed_inbox_agent_received
     ON agent_webhook_managed_inbox_events(agent_id, received_at DESC)
     """,
-)
+))
 
 
 async def ensure_agent_webhook_tables() -> None:
@@ -318,9 +324,21 @@ async def ensure_agent_webhook_tables() -> None:
     global _AGENT_WEBHOOK_DDL_READY
     if _AGENT_WEBHOOK_DDL_READY:
         return
+    # A lock timeout (a guarded index build on a busy table) defers that build
+    # to a later call instead of failing the boot, which calls this unguarded
+    # by any try; nothing is memoized until every statement has run. Any other
+    # failure raises as before.
+    deferred = False
     for stmt in _AGENT_WEBHOOK_DDL_STATEMENTS:
-        await execute_ddl(stmt, db=database)
-    _AGENT_WEBHOOK_DDL_READY = True
+        try:
+            await execute_ddl(stmt, db=database)
+        except Exception as exc:
+            if not is_lock_timeout(exc):
+                raise
+            deferred = True
+            logger.warning("webhook DDL deferred to a later call: %s", exc)
+    if not deferred:
+        _AGENT_WEBHOOK_DDL_READY = True
 
 
 async def _sync_legacy_agent_webhook_url(agent_id: str, destination_url: Optional[str]) -> None:
@@ -1224,7 +1242,26 @@ async def rotate_signing_secret(agent_id: str) -> Dict[str, Any]:
     }
 
 
-async def process_due_retries(limit: int = 20) -> int:
+async def process_due_retries(
+    limit: int = 20,
+    *,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> int:
+    """Deliver every retry that is due, oldest first.
+
+    `should_stop` IS CHECKED BETWEEN DELIVERIES, and that is what makes shutdown bounded.
+    Without it the only stop check was at the top of `_retry_worker_loop`, so a shutdown
+    arriving mid-batch still had to sit through the rest of it: up to `limit` sequential
+    deliveries at DELIVERY_TIMEOUT_SECONDS each, which at the default is ~200s. That was
+    survivable only because `database.disconnect()` used to run first and blow the remaining
+    rows up; once the lifespan was reordered so the scheduler could drain against a live pool,
+    the accidental bound was gone and the real one had to be written down. Its stop is now also
+    wrapped in `asyncio.wait_for`, but cancelling a delivery mid-flight is the fallback -
+    stopping cleanly between them is the intent.
+
+    Nothing is lost by stopping early: an undelivered retry stays `retrying` with its
+    `next_retry_at` unchanged, so the next instance picks it up on its next poll.
+    """
     await ensure_agent_webhook_tables()
     rows = await database.fetch_all(
         """
@@ -1240,6 +1277,15 @@ async def process_due_retries(limit: int = 20) -> int:
     )
     processed = 0
     for row in rows:
+        if should_stop is not None and should_stop():
+            # `info`, not `warning`: with the stop check in place this is the ORDINARY
+            # shutdown path and the worker restarts 15-34 times a day. A warning per restart
+            # is the kind of noise that teaches people to skim the log.
+            logger.info(
+                "%s webhook retry worker stopping: %d delivered, %d left due for the next "
+                "instance.", "agent", processed, len(rows) - processed,
+            )
+            break
         try:
             await retry_delivery(str(row["agent_id"]), str(row["delivery_id"]))
             processed += 1
@@ -1252,7 +1298,7 @@ async def _retry_worker_loop(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         try:
             if getattr(database, "is_connected", False):
-                await process_due_retries(limit=20)
+                await process_due_retries(limit=20, should_stop=stop_event.is_set)
         except Exception as exc:
             logger.warning("Agent webhook retry worker iteration failed: %s", exc)
         try:
@@ -1273,13 +1319,49 @@ async def start_agent_webhook_retry_worker() -> None:
     _retry_worker_task = spawn_isolated(_retry_worker_loop(_retry_worker_stop), name="agent_webhook_retry_worker")
 
 
+# How long a shutdown may wait for the retry worker to finish its current iteration.
+#
+# SMALL, AND IT IS NOW THE FALLBACK RATHER THAN THE ONLY BOUND — but it must stay.
+#
+# `process_due_retries` checks the stop event BETWEEN deliveries, so the ordinary case is that
+# the loop notices and returns on its own well inside this window; the wait below then just
+# collects it. What this still covers is the stop that arrives DURING a delivery: `retry_delivery`
+# ends in an HTTP call with a 10.0s timeout and nothing interrupts it, so without this bound one
+# in-flight request is one full 10s — the entire Cloud Run grace — before the pool is closed.
+#
+# (Until the between-deliveries check existed, the event was only read at the TOP of
+# `_retry_worker_loop`, so this bound was covering a whole batch: up to twenty sequential
+# deliveries, ~200s. That is the shape this comment used to describe, and it is fixed — do not
+# read the improvement as a reason to drop the bound.)
+#
+# That used to be masked by accident: `database.disconnect()` ran BEFORE this, so the next
+# `database.*` call in the loop raised "DatabaseBackend is not running" and the remaining rows
+# failed in microseconds. Reordering the lifespan so the scheduler drains while the pool is
+# still open (which it must, or drained jobs cannot write) removed that accidental bound and
+# left a ~200s await in front of the disconnect, on `web` as well as `worker`. Found in review.
+#
+# There is nothing to lose by cutting a retry short: it is a RETRY, it stays due, and the next
+# instance picks it up. `asyncio.wait_for` cancels the task on timeout, so this is a real bound
+# and not just a log line.
+_STOP_TIMEOUT_SECONDS = 1.0
+
+
 async def stop_agent_webhook_retry_worker() -> None:
     global _retry_worker_task, _retry_worker_stop
     if _retry_worker_stop is not None:
         _retry_worker_stop.set()
-    if _retry_worker_task is not None:
+    task = _retry_worker_task
+    if task is not None:
         try:
-            await _retry_worker_task
+            await asyncio.wait_for(task, timeout=_STOP_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            # wait_for has already cancelled it; say so rather than letting a shutdown that
+            # cut work short look like a clean one.
+            logger.warning(
+                "%s: retry worker did not stop within %.1fs and was cancelled mid-iteration; "
+                "any unfinished retries stay due and the next instance will pick them up.",
+                __name__, _STOP_TIMEOUT_SECONDS,
+            )
         except Exception:
             pass
     _retry_worker_task = None

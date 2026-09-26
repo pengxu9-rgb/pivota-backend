@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ async def load_creators(
 ) -> Dict[str, Any]:
     """Bulk-upsert creators into the directory. The matcher picks them up
     immediately (category-indexed). Real creators only — no fabricated rows."""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     from services.creator_directory import upsert_creators
 

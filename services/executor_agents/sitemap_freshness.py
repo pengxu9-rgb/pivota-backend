@@ -26,6 +26,7 @@ from xml.etree import ElementTree as ET
 
 import httpx
 
+from services import crawl_politeness
 from services.executor_agents.base import (
     BaseExecutorAgent,
     ExecutorContext,
@@ -36,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 
 _SITEMAP_FETCH_TIMEOUT_S = 8.0
+# Named because the politeness gate must be asked about the SAME agent we then send.
+_SITEMAP_UA = "Pivota-SitemapMonitor/1.0"
 _SITEMAP_MAX_BYTES = 5_000_000
 
 # Cap evidence sample lists so the executor_runs.evidence_jsonb stays
@@ -105,9 +108,18 @@ async def _fetch_sitemap_urls_recursive(
             timeout=_SITEMAP_FETCH_TIMEOUT_S,
             follow_redirects=True,
         ) as client:
+            # Shared politeness gate — these requests leave from the same reserved NAT
+            # address as every other crawl lane, so a ban here takes all of them down.
+            # `max_wait=0`: batch work, so wait a backoff out rather than drop the domain.
+            await crawl_politeness.before_request(
+                sitemap_url, user_agent=_SITEMAP_UA, max_wait=0
+            )
             r = await client.get(
                 sitemap_url,
-                headers={"User-Agent": "Pivota-SitemapMonitor/1.0"},
+                headers={"User-Agent": _SITEMAP_UA},
+            )
+            crawl_politeness.note_response(
+                sitemap_url, r.status_code, retry_after=r.headers.get("retry-after")
             )
             if r.status_code != 200:
                 return [], f"http_{r.status_code}"
@@ -126,9 +138,18 @@ async def _fetch_sitemap_urls_recursive(
                 aggregated = [u for u in urls if not _is_child_sitemap(u)]
                 for child_url in child_indexes[:max_child_sitemaps]:
                     try:
+                        # Child indexes are the same host, so they queue behind the parent
+                        # rather than firing as a burst the moment it returns.
+                        await crawl_politeness.before_request(
+                            child_url, user_agent=_SITEMAP_UA, max_wait=0
+                        )
                         cr = await client.get(
                             child_url,
-                            headers={"User-Agent": "Pivota-SitemapMonitor/1.0"},
+                            headers={"User-Agent": _SITEMAP_UA},
+                        )
+                        crawl_politeness.note_response(
+                            child_url, cr.status_code,
+                            retry_after=cr.headers.get("retry-after"),
                         )
                         if cr.status_code == 200:
                             aggregated.extend(

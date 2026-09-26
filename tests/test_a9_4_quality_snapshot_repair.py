@@ -55,16 +55,11 @@ NEW = "merch_new"
 OLD = "external_seed"
 THIRD = "merch_third"
 
+# catalog_products is built from the MODEL via tests/model_schema.ensure_model_tables, not
+# hand-written here: a hand-written subset wins the create race when this module collects
+# first and poisons every neighbour that SELECTs a real column (source_domain, canonical_url,
+# title NOT NULL ...). See tests/model_schema.py for both failure directions.
 _SCHEMA = (
-    """
-    CREATE TABLE IF NOT EXISTS catalog_products (
-        product_key TEXT PRIMARY KEY,
-        content_key TEXT,
-        merchant_id TEXT,
-        platform TEXT,
-        source_product_id TEXT
-    )
-    """,
     """
     CREATE TABLE IF NOT EXISTS a9_4_backfill_checkpoint (
         phase TEXT,
@@ -101,6 +96,10 @@ async def _cleanup() -> None:
 @pytest.fixture()
 async def db():
     was_connected = await _connect_if_needed()
+    from db.catalog import catalog_products as cp_table
+    from tests.model_schema import ensure_model_tables
+
+    await ensure_model_tables([cp_table])
     for stmt in _SCHEMA:
         await database.execute(stmt)
     await _cleanup()
@@ -115,8 +114,8 @@ async def db():
 async def _product(name: str, *, merchant: str, spid: Optional[str] = None) -> None:
     await database.execute(
         "INSERT INTO catalog_products (product_key, content_key, merchant_id, platform,"
-        " source_product_id) VALUES (:pk, :ck, :m, 'shopify', :spid)",
-        {"pk": name, "ck": f"ck_{name}", "m": merchant, "spid": spid or f"sp_{name}"},
+        " source_product_id, title) VALUES (:pk, :ck, :m, 'shopify', :spid, :t)",
+        {"pk": name, "ck": f"ck_{name}", "m": merchant, "spid": spid or f"sp_{name}", "t": name},
     )
 
 

@@ -261,7 +261,7 @@ async def extract_source_content(url: str) -> Dict[str, Any]:
     js_url = product_json_url(url)
     if js_url:
         try:
-            raw, content_type = await _fetch_html(js_url)
+            raw, content_type = await _fetch_html(js_url, max_wait=0)
             if "json" in str(content_type).lower() or raw.lstrip().startswith("{"):
                 extracted = _extract_json_description(js_url, raw)
                 if extracted:
@@ -269,7 +269,7 @@ async def extract_source_content(url: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    html_text, content_type = await _fetch_html(url)
+    html_text, content_type = await _fetch_html(url, max_wait=0)
     if "html" not in str(content_type).lower() and "text" not in str(content_type).lower():
         raise ValueError(f"unsupported_content_type:{content_type}")
     extracted = _extract_from_html(url, html_text)

@@ -83,7 +83,7 @@ async def test_submission_only_uses_form_channel(monkeypatch):
 @pytest.mark.asyncio
 async def test_idempotent_returns_existing(monkeypatch):
     async def fake_find(*, merchant_id, lever, title):
-        return [{"task_id": "existing-o"}]
+        return [{"task_id": "existing-o", "evidence_jsonb": {"outreach": {"host": "goodhousekeeping.com", "query": "best collagen", "sku_key": None}}}]
 
     async def fake_record(**kw):
         raise AssertionError("should not create a new outreach record when one exists")
@@ -108,3 +108,21 @@ async def test_blank_host_or_query_rejected():
             _OutreachPitchBody(host="   ", query="best collagen"), merchant_id="m1"
         )
     assert exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_same_query_different_products_remain_separate(monkeypatch):
+    stored = []
+    async def find(**kw):
+        return [row for row in stored if row['title'] == kw['title']]
+    async def record(**kw):
+        task_id = f'task-{len(stored)}'
+        stored.append({'task_id': task_id, 'title': kw['title'], 'evidence_jsonb': kw['evidence']})
+        return task_id
+    monkeypatch.setattr('db.merchant_tasks.find_pending_supersede_candidates', find)
+    monkeypatch.setattr('db.merchant_tasks.record_task_created', record)
+    first = await mark_outreach_pitch_sent(_OutreachPitchBody(host='review.example', query='best mascara', sku_key='sku-a'), merchant_id='m1')
+    second = await mark_outreach_pitch_sent(_OutreachPitchBody(host='review.example', query='best mascara', sku_key='sku-b'), merchant_id='m1')
+    assert first['task_id'] != second['task_id']
+    replay = await mark_outreach_pitch_sent(_OutreachPitchBody(host='review.example', query='best mascara', sku_key='sku-b'), merchant_id='m1')
+    assert replay['task_id'] == second['task_id'] and len(stored) == 2

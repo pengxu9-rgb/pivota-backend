@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from routes.agent_auth import AgentContext, get_agent_context
 from db.checkout_intents import checkout_intents
 from db.database import IS_POSTGRES, database, engine, metadata
+from db.schema_guard import guarded_add_columns, guarded_index
 import uuid
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
 from db.buyer_vault import buyer_addresses, buyer_identity_links, hash_agent_user_ref
@@ -56,18 +57,30 @@ async def _ensure_checkout_intents_table() -> None:
     # Production Postgres: best-effort schema drift healing (older table missing columns).
     if not IS_POSTGRES:
         return
-    await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS agent_user_ref TEXT")
-    await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS order_id TEXT")
-    await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS requested_scopes JSONB")
-    await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS linked_buyer_id TEXT")
-    await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ")
-    await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS checkout_token_hash TEXT")
-    await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS prefill_read_count INTEGER NOT NULL DEFAULT 0")
-    await database.execute("ALTER TABLE checkout_intents ADD COLUMN IF NOT EXISTS prefill_last_read_at TIMESTAMPTZ")
-    await database.execute("CREATE INDEX IF NOT EXISTS idx_checkout_intents_agent_buyer ON checkout_intents(agent_id, buyer_ref)")
-    await database.execute("CREATE INDEX IF NOT EXISTS idx_checkout_intents_order_id ON checkout_intents(order_id)")
-    await database.execute("CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_at ON checkout_intents(expires_at)")
-    await database.execute("CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_used ON checkout_intents(expires_at, used_at)")
+    # Guarded (db/schema_guard.py): this runs after ANY failed insert or read, and bare
+    # each ALTER took the table's ACCESS EXCLUSIVE lock (each index its SHARE lock) with
+    # no lock_timeout, even with every column and index already there.
+    for statement in guarded_add_columns(
+        """
+        ALTER TABLE IF EXISTS checkout_intents
+          ADD COLUMN IF NOT EXISTS agent_user_ref TEXT,
+          ADD COLUMN IF NOT EXISTS order_id TEXT,
+          ADD COLUMN IF NOT EXISTS requested_scopes JSONB,
+          ADD COLUMN IF NOT EXISTS linked_buyer_id TEXT,
+          ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS checkout_token_hash TEXT,
+          ADD COLUMN IF NOT EXISTS prefill_read_count INTEGER NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS prefill_last_read_at TIMESTAMPTZ;
+        """
+    ):
+        await database.execute(statement)
+    for index in (
+        "CREATE INDEX IF NOT EXISTS idx_checkout_intents_agent_buyer ON checkout_intents(agent_id, buyer_ref)",
+        "CREATE INDEX IF NOT EXISTS idx_checkout_intents_order_id ON checkout_intents(order_id)",
+        "CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_at ON checkout_intents(expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_checkout_intents_expires_used ON checkout_intents(expires_at, used_at)",
+    ):
+        await database.execute(guarded_index(index))
 
 
 def _base64url_encode(data: bytes) -> str:

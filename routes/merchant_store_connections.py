@@ -7,13 +7,23 @@ from services.shopify_access_token_service import (
     exchange_shopify_client_credentials_token,
     resolve_shopify_admin_access_token,
 )
-from services.wix_connection import WixConnectionValidationError, validate_wix_catalog_access
+from services.wix_connection import (
+    WixConnectionValidationError,
+    find_wix_stores_by_instance_id,
+    is_wix_instance_id,
+    merge_wix_credential,
+    validate_wix_catalog_access,
+)
 from services.store_lifecycle_service import sync_catalog_merchant_status
+from services.shopify_domain import canonicalize_shop_domain, normalize_myshopify_domain
+from services.bigcommerce_event_adapter import SUPPORTED_BIGCOMMERCE_SCOPES
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Request, Query, Header
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, EmailStr, TypeAdapter, ValidationError
-from typing import Dict, Any, Optional
+from pydantic import BaseModel, EmailStr, Field, TypeAdapter, ValidationError
+from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
+import asyncio
 import logging
 import httpx
 import json
@@ -23,11 +33,29 @@ import hmac
 import os
 import re
 import secrets
-from urllib.parse import urlparse, urlencode
+from urllib.parse import quote, urlparse, urlencode
 
-from db.database import database
-from utils.auth import get_current_user, hash_password, verify_password as verify_bcrypt_password
+from db.database import IS_POSTGRES, database
+from db.schema_guard import guarded_statements
+from db.startup_ddl import _asyncpg_dsn, _connect_kwargs
+from utils.auth import (
+    MERCHANT_OR_ADMIN_ROLES,
+    MERCHANT_OR_EMPLOYEE_STAFF_ROLES,
+    can_access_merchant,
+    get_current_user,
+    hash_password,
+    verify_password as verify_bcrypt_password,
+)
 from config.settings import settings
+from config.settings import resolve_public_api_base_url
+from services.merchant_web_collector_service import (
+    MAX_ALLOWED_ORIGINS,
+    MAX_TOKEN_TTL_DAYS,
+    WebCollectorError,
+    issue_web_collector_token,
+    normalize_allowed_origins,
+    normalize_collector_origin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +67,14 @@ _SHOPIFY_OAUTH_REQUIRED_WEBHOOK_TOPICS = [
     "orders/updated",
     "orders/paid",
     "orders/cancelled",
+    # Refunds. services/shopify_commerce_event_adapter.py maps refunds/create
+    # into the canonical ledger (refund.created, and refund.succeeded per
+    # successful refund transaction), and routes/webhook_routes.py reconciles
+    # it operationally. Until 2026-09-04 no install path registered it, so
+    # Shopify refunds reached the ledger only for merchants who had run the
+    # verify flow. Every topic the adapter maps must be registered here;
+    # tests/test_shopify_refund_webhook_subscription.py pins that.
+    "refunds/create",
     "fulfillments/create",
     "fulfillments/update",
     "orders/fulfilled",
@@ -104,27 +140,14 @@ async def _create_storefront_access_token_best_effort(*, shop_domain: str, acces
         return None
 
 
-def _canonicalize_shop_domain(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    raw = value.strip()
-    if not raw:
-        return None
-    candidate = raw if "://" in raw else f"https://{raw}"
-    try:
-        parsed = urlparse(candidate)
-        host = (parsed.hostname or "").strip().lower()
-        return host or None
-    except Exception:
-        return raw.lower()
-
-
 def _validate_myshopify_domain(value: str) -> str:
-    shop = (_canonicalize_shop_domain(value) or "").strip().lower()
-    if not shop:
+    # The one place a 400 is the right answer: the caller's own input. Everywhere else the value is
+    # re-checked with normalize_myshopify_domain and FALLS BACK, because failing a merchant's
+    # install over an unexpected upstream response would be worse than the thing being prevented.
+    if not (canonicalize_shop_domain(value) or "").strip():
         raise HTTPException(status_code=400, detail="shop is required")
-    # Basic guard: allow only the canonical myshopify domain during OAuth.
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*\.myshopify\.com", shop):
+    shop = normalize_myshopify_domain(value)
+    if not shop:
         raise HTTPException(status_code=400, detail="shop must be a *.myshopify.com domain")
     return shop
 
@@ -246,7 +269,9 @@ _SHOPIFY_CLAIM_TOKEN_TTL_SECONDS = 60 * 60
 
 
 def _claim_signing_key() -> str:
-    return (settings.jwt_secret_key or "").strip()
+    from config.settings import require_jwt_secret
+
+    return (require_jwt_secret() or "").strip()
 
 
 def _b64url(data: bytes) -> str:
@@ -455,17 +480,41 @@ async def _ensure_shopify_oauth_tables() -> None:
         logger.warning("Shopify OAuth table bootstrap failed", exc_info=True)
         return
 
-    for ddl in (
+    # Guarded on Postgres (db/schema_guard.guarded_statements): this runs on every install
+    # and callback, and bare each ALTER took the table's ACCESS EXCLUSIVE lock with no
+    # lock_timeout even with the column there. A lock timeout lands in the except below.
+    for ddl in guarded_statements([
         "ALTER TABLE shopify_oauth_states ADD COLUMN IF NOT EXISTS install_source VARCHAR(50)",
         "ALTER TABLE shopify_oauth_states ADD COLUMN IF NOT EXISTS return_to TEXT",
         "ALTER TABLE shopify_oauth_states ADD COLUMN IF NOT EXISTS host TEXT",
-    ):
+    ]):
         try:
             await database.execute(ddl)
         except Exception:
             # Some local SQLite versions do not support ADD COLUMN IF NOT EXISTS.
             # Existing deployments with the old schema can still use the legacy JSON callback.
             logger.debug("Shopify OAuth state schema extension skipped: %s", ddl, exc_info=True)
+
+
+_SUPPORT_EMAIL_HEAL = guarded_statements(
+    ["ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS support_email TEXT"]
+)
+
+
+async def _ensure_support_email_column() -> None:
+    """Backward compatibility: the column may not exist on some deployments.
+
+    Guarded on Postgres (db/schema_guard.guarded_statements): both support-email routes
+    run this on every request, and bare it took merchant_stores' ACCESS EXCLUSIVE lock
+    with no lock_timeout even with the column there, queueing behind any open
+    transaction on the table while every store lookup queued behind it. Best-effort as
+    before: a failure (a lock timeout included) is swallowed and the next request retries.
+    """
+    for statement in _SUPPORT_EMAIL_HEAL:
+        try:
+            await database.execute(statement)
+        except Exception:
+            pass
 
 
 async def _insert_shopify_oauth_state(
@@ -728,13 +777,13 @@ async def shopify_oauth_start(
     Start Shopify OAuth install.
     Requires a Pivota JWT (merchant/employee/admin).
     """
-    if current_user.get("role") not in ["merchant", "employee", "admin", "super_admin"]:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
-    if current_user.get("role") == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only connect your own store")
 
     shop_domain = _validate_myshopify_domain(shop)
@@ -981,7 +1030,13 @@ async def _shopify_oauth_callback_impl(request: Request):
     if not isinstance(shop_info, dict):
         raise HTTPException(status_code=400, detail="Invalid Shopify shop response")
 
-    canonical_myshopify_domain = (shop_info.get("myshopify_domain") or shop_domain).strip().lower()
+    # `shop_domain` is already validated; `myshopify_domain` is whatever the upstream response
+    # carried, and it — not the validated input — is what gets PERSISTED and later turned back into
+    # an Admin API URL by this repo and by the gateway. Re-check it, and fall back to the validated
+    # input rather than failing the install.
+    canonical_myshopify_domain = (
+        normalize_myshopify_domain(shop_info.get("myshopify_domain")) or shop_domain
+    )
     shop_name = (shop_info.get("name") or canonical_myshopify_domain).strip()
     if stored_shop_domain and stored_shop_domain not in {canonical_myshopify_domain, shop_domain}:
         raise HTTPException(status_code=400, detail="OAuth shop mismatch (reason=shop_domain_mismatch)")
@@ -1251,20 +1306,29 @@ async def shopify_token_diagnostic(
     """
     Diagnostic: verify Shopify token validity and required scopes without leaking secrets.
     """
-    if current_user.get("role") not in ["merchant", "employee", "admin", "super_admin"]:
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
-    if current_user.get("role") == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only access your own merchant")
 
     store = await get_primary_store(target_merchant_id)
     if not store or (store.get("platform") or "").lower() != "shopify":
         raise HTTPException(status_code=400, detail="No Shopify store connected")
 
-    shop_domain = (store.get("domain") or store.get("shop_domain") or "").strip().lower()
+    # Same stored column, same Admin API URLs, same guard as verify_shopify_integration. This route
+    # is the sharper of the two: it returns the upstream status codes in a 200 body, so an unpinned
+    # host here is a read-back SSRF oracle rather than a blind one.
+    raw_domain = (store.get("domain") or store.get("shop_domain") or "")
+    shop_domain = normalize_myshopify_domain(raw_domain) or ""
+    if not shop_domain:
+        raise HTTPException(
+            status_code=400,
+            detail="Stored Shopify domain is not a *.myshopify.com host",
+        )
     access_token, token_meta = await resolve_shopify_admin_access_token(
         shop_domain=shop_domain,
         api_key_raw=store.get("api_key_raw") or store.get("api_key"),
@@ -1354,6 +1418,15 @@ class ConnectWixRequest(BaseModel):
     site_id: str
     api_key: str
     store_name: Optional[str] = None
+    # The id of the Pivota app INSTANCE on this Wix site. Wix webhooks are an
+    # app-level extension delivered to one static URL for every site that
+    # installed the app, and the delivery names its site only by `instanceId`
+    # (https://dev.wix.com/docs/build-apps/develop-your-app/api-integrations/events-and-webhooks/about-webhooks.md),
+    # so routes/wix_webhooks.py cannot resolve a store without it. Nothing
+    # persisted it before this: the API-key connect below never knew it, and
+    # the OAuth path is still a 501 stub. Optional, because catalog sync works
+    # without it — a store that omits it simply receives no telemetry.
+    instance_id: Optional[str] = None
 
 
 @router.get("/wix/oauth/start")
@@ -1369,7 +1442,15 @@ async def wix_oauth_start_stub(
       {"access_token": "<bearer token>", "site_id": "<wix site id>"}
     in merchant_stores.api_key.
     """
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != merchant_id:
+    # The one site in this module that had no role gate at all -- only the
+    # merchant comparison -- so an agent or a buyer reached the body. The body
+    # is an unconditional 501, so nothing was exposed; it is gated here for the
+    # same reason the rest of the file is spelled one way: the next person to
+    # implement this stub inherits the guard instead of having to notice its
+    # absence. Non-merchant, non-staff callers now get 403 rather than 501.
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if not can_access_merchant(current_user, merchant_id):
         raise HTTPException(status_code=403, detail="Can only connect your own store")
     raise HTTPException(
         status_code=501,
@@ -1407,6 +1488,307 @@ class ConnectWooCommerceRequest(BaseModel):
     store_url: str
     consumer_key: str
     consumer_secret: str
+    webhook_secret: Optional[str] = None
+
+
+def _woocommerce_webhook_callback_url(store_id: str) -> str:
+    base = str(
+        os.getenv("WOOCOMMERCE_WEBHOOK_BASE_URL")
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("PIVOTA_BACKEND_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+    parsed = urlparse(base)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Configure WOOCOMMERCE_WEBHOOK_BASE_URL or PUBLIC_BASE_URL "
+                "as an HTTPS origin"
+            ),
+        )
+    callback_url = f"{base}/webhooks/woocommerce/{quote(store_id, safe='')}"
+    if len(callback_url) > 2048:
+        raise HTTPException(status_code=503, detail="Webhook callback URL is too long")
+    return callback_url
+
+
+def _bigcommerce_webhook_callback_url(store_id: str) -> str:
+    base = str(
+        os.getenv("BIGCOMMERCE_WEBHOOK_BASE_URL")
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("PIVOTA_BACKEND_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+    parsed = urlparse(base)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Configure BIGCOMMERCE_WEBHOOK_BASE_URL or PUBLIC_BASE_URL "
+                "as an HTTPS origin"
+            ),
+        )
+    callback_url = f"{base}/webhooks/bigcommerce/{quote(store_id, safe='')}"
+    if len(callback_url) > 2048:
+        raise HTTPException(status_code=503, detail="Webhook callback URL is too long")
+    return callback_url
+
+
+def _squarespace_webhook_callback_url(store_id: str) -> str:
+    base = str(
+        os.getenv("SQUARESPACE_WEBHOOK_BASE_URL")
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("PIVOTA_BACKEND_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+    parsed = urlparse(base)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Configure SQUARESPACE_WEBHOOK_BASE_URL or PUBLIC_BASE_URL "
+                "as an HTTPS origin"
+            ),
+        )
+    callback_url = f"{base}/webhooks/squarespace/{quote(store_id, safe='')}"
+    if len(callback_url) > 2048:
+        raise HTTPException(status_code=503, detail="Webhook callback URL is too long")
+    return callback_url
+
+
+def _webflow_webhook_endpoint(store_id: str, url_secret: str) -> tuple[str, str]:
+    """The (prefix, URL) registered AT WEBFLOW, secret and all.
+
+    The per-store secret is a PATH SEGMENT, not a header, because Webflow does
+    not sign a webhook created with a Site API token — see
+    routes/webflow_webhooks.py. That makes this URL a credential: it is never
+    returned to a caller, and every logger THIS PROCESS writes redacts the
+    trailing segment through `middleware/structured_logging.py::redact_path` —
+    the app's structured access log, the rate limiter's ceiling warning, and
+    `uvicorn.access`, whose records go through
+    `UvicornAccessPathRedactionFilter` (installed in main.py at import). That
+    third one is not an app middleware: uvicorn writes the raw request line for
+    every response, and infra/gcp/Dockerfile starts it with neither
+    `--no-access-log` nor a `--log-config`, so it was the channel that kept
+    writing the secret verbatim after the two middlewares were fixed — and an
+    ASGITransport regression test cannot see it, because there is no uvicorn in
+    that loop.
+
+    ONE surface is left, and it is not reachable from here: the platform load
+    balancer's own `httpRequest.requestUrl` (and any proxy or APM in front of
+    this process), which records the full path regardless of what this
+    application logs. Nothing in this repo can redact that, and it is the honest
+    argument for configuring `WEBFLOW_CLIENT_SECRET` wherever an OAuth app
+    exists — Layer 2 demands a fresh signature over the body, which a URL
+    recovered from somebody else's access log does not provide.
+    """
+    base = str(
+        os.getenv("WEBFLOW_WEBHOOK_BASE_URL")
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("PIVOTA_BACKEND_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+    parsed = urlparse(base)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Configure WEBFLOW_WEBHOOK_BASE_URL or PUBLIC_BASE_URL "
+                "as an HTTPS origin"
+            ),
+        )
+    secret = str(url_secret or "").strip()
+    if not secret:
+        raise HTTPException(
+            status_code=503, detail="Webflow webhook secret was not provisioned"
+        )
+    # The PREFIX is `https://origin/webhooks/webflow/{store_id}/` — every URL of
+    # ours for this store, whatever secret it carries. `ensure` uses it to
+    # decide what "stale" means: anything at this prefix with a different secret
+    # is one of our own superseded endpoints and is removed, while anything else
+    # in the site's webhook list belongs to some other integration of the
+    # merchant's and is left alone.
+    prefix = f"{base}/webhooks/webflow/{quote(store_id, safe='')}/"
+    callback_url = f"{prefix}{quote(secret, safe='')}"
+    if len(callback_url) > 2048:
+        raise HTTPException(status_code=503, detail="Webhook callback URL is too long")
+    return prefix, callback_url
+
+
+def _bigcommerce_credentials(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    value = str(raw or "").strip()
+    if not value or not value.startswith("{"):
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _woocommerce_credentials(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    value = str(raw or "").strip()
+    if not value:
+        return {}
+    if ":" in value and not value.startswith("{"):
+        consumer_key, consumer_secret = value.split(":", 1)
+        return {
+            "consumer_key": consumer_key.strip(),
+            "consumer_secret": consumer_secret.strip(),
+        }
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+@asynccontextmanager
+async def _woocommerce_webhook_install_lock(store_id: str):
+    """Serialize one store without consuming the serving database pool."""
+
+    if not IS_POSTGRES:
+        yield
+        return
+    dsn = _asyncpg_dsn()
+    if not dsn:
+        raise HTTPException(
+            status_code=503,
+            detail="WooCommerce webhook installation lock is unavailable",
+        )
+    lock_name = f"woocommerce:webhook-install:{store_id}"
+    connection = None
+    try:
+        import asyncpg
+
+        connection = await asyncio.wait_for(
+            asyncpg.connect(dsn, **_connect_kwargs()),
+            timeout=5.0,
+        )
+        acquired = bool(
+            await asyncio.wait_for(
+                connection.fetchval(
+                    "SELECT pg_try_advisory_lock(hashtext($1))",
+                    lock_name,
+                ),
+                timeout=5.0,
+            )
+        )
+    except BaseException as exc:
+        if connection is not None:
+            try:
+                connection.terminate()
+            except Exception:
+                pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise HTTPException(
+            status_code=503,
+            detail="WooCommerce webhook installation lock is unavailable",
+        ) from exc
+    if not acquired:
+        try:
+            await asyncio.wait_for(connection.close(), timeout=5.0)
+        except Exception:
+            connection.terminate()
+        raise HTTPException(
+            status_code=409,
+            detail="WooCommerce webhook installation is already in progress",
+        )
+    try:
+        yield
+    finally:
+        try:
+            await asyncio.wait_for(
+                connection.execute(
+                    "SELECT pg_advisory_unlock(hashtext($1))",
+                    lock_name,
+                ),
+                timeout=5.0,
+            )
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                connection.terminate()
+                raise
+            logger.warning(
+                "WooCommerce webhook advisory unlock failed store_id=%s error=%s",
+                store_id,
+                str(exc)[:200],
+            )
+        try:
+            await asyncio.wait_for(connection.close(), timeout=5.0)
+        except BaseException as exc:
+            connection.terminate()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+
+
+_WOOCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
+_BIGCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
+_SQUARESPACE_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
+
+# One in-flight sweep per store. Two sweeps of the SAME store race on one
+# `reconciliation` cell: whichever merge lands last decides the cursor, so the
+# other run's pages are either re-read or, if it advanced further, skipped.
+# This is per-process, which is the honest bound — it stops the operator
+# double-click and the retry-on-timeout, not two replicas. The sweep's own
+# correctness under a genuinely concurrent merge is the transaction in
+# `merge_squarespace_credentials`, not this set.
+_SQUARESPACE_SWEEPS_IN_FLIGHT: set[str] = set()
+# A full sweep is `max_pages` (<=200) sequential upstream calls at a 15s
+# timeout each. The request must not outlive the proxy in front of it.
+SQUARESPACE_RECONCILE_TIMEOUT_SECONDS = 240.0
+
+_WEBFLOW_WEBHOOK_INSTALL_CONCURRENCY = asyncio.Semaphore(4)
+# One in-flight `ensure` per store. `ensure` mints or rotates the URL secret and
+# then registers it at Webflow, and two of them racing would register two
+# different URLs of which only the last-persisted secret authenticates: the
+# other store's webhook would 401 every delivery until someone re-ran ensure.
+# Per-process, which is the honest bound — it stops the operator double-click
+# and the retry-on-timeout, not two replicas.
+_WEBFLOW_ENSURES_IN_FLIGHT: set[str] = set()
+# One in-flight sweep per store, for the same reason as Squarespace: two sweeps
+# of one store race on one `reconciliation` cell and the loser's offsets are
+# either re-read or skipped depending on which merge landed last.
+_WEBFLOW_SWEEPS_IN_FLIGHT: set[str] = set()
+# Three lanes x `max_pages` sequential upstream calls at a 15s timeout each. The
+# request must not outlive the proxy in front of it.
+WEBFLOW_RECONCILE_TIMEOUT_SECONDS = 240.0
+WEBFLOW_ENSURE_TIMEOUT_SECONDS = 90.0
+
 
 
 class ConnectBigCommerceRequest(BaseModel):
@@ -1422,6 +1804,62 @@ class ConnectPrestaShopRequest(BaseModel):
     api_key: str
 
 
+class ConnectSquarespaceRequest(BaseModel):
+    """A Squarespace connection is a credential plus, optionally, an OAuth token.
+
+    `api_key` is the per-site Developer API key (Settings -> Developer API
+    Keys), which reaches the Orders API and nothing else. `oauth_access_token`
+    is accepted so a site connected through a Squarespace Developer Platform app
+    can also provision webhooks; without it the store is sweep-only and
+    `/webhooks/ensure` answers 409 `oauth_required`.
+
+    `oauth_refresh_token` and `oauth_expires_at` are PERSISTED BUT NOT YET USED:
+    a Developer-Platform access token is short-lived (assumed ~30 minutes) and
+    this repo has no refresh path, so reads fall back to the API key on 401
+    instead. Storing them now means the refresh, when it lands, does not need
+    every OAuth store to reconnect first. See the Residual gaps section of
+    docs/SQUARESPACE_TELEMETRY.md.
+    """
+
+    merchant_id: str = Field(min_length=1, max_length=128)
+    api_key: str = Field(min_length=1, max_length=512)
+    oauth_access_token: Optional[str] = Field(default=None, max_length=2048)
+    oauth_refresh_token: Optional[str] = Field(default=None, max_length=2048)
+    oauth_expires_at: Optional[str] = Field(default=None, max_length=64)
+    store_name: Optional[str] = Field(default=None, max_length=255)
+    domain: Optional[str] = Field(default=None, max_length=2048)
+
+
+class ConnectWebflowRequest(BaseModel):
+    """A Webflow connection is one Bearer token plus, optionally, the site.
+
+    `api_token` is either a Site API token (Site settings -> Apps &
+    integrations -> API access) or an OAuth App access token. Both reach the
+    same Data API v2 endpoints; they differ only in whether Webflow SIGNS the
+    webhook deliveries the token's webhooks produce, which is why the receiver
+    does not rely on a signature alone (routes/webflow_webhooks.py).
+
+    `site_id` is optional and resolved from `GET /v2/sites` when the token
+    reaches exactly one site. It is NOT guessed when the token reaches several:
+    binding the wrong site would file another shop's orders under this store,
+    and every sweep afterwards would keep doing it.
+    """
+
+    merchant_id: str = Field(min_length=1, max_length=128)
+    api_token: str = Field(min_length=1, max_length=2048)
+    site_id: Optional[str] = Field(default=None, max_length=64)
+    store_name: Optional[str] = Field(default=None, max_length=255)
+    domain: Optional[str] = Field(default=None, max_length=2048)
+
+
+class ConnectCustomStoreRequest(BaseModel):
+    merchant_id: str = Field(min_length=1, max_length=128)
+    store_url: str = Field(min_length=1, max_length=2048)
+    store_name: Optional[str] = Field(default=None, max_length=255)
+    allowed_origins: List[str] = Field(default_factory=list, max_length=MAX_ALLOWED_ORIGINS)
+    collector_token_ttl_days: int = Field(default=90, ge=1, le=MAX_TOKEN_TTL_DAYS)
+
+
 class UpdateStoreSupportEmailRequest(BaseModel):
     merchant_id: Optional[str] = None
     support_email: Optional[str] = None
@@ -1435,6 +1873,154 @@ class GetStoreSupportEmailResponse(BaseModel):
     effective_support_email: Optional[str] = None
 
 
+@router.post("/custom/connect")
+async def merchant_connect_custom_store(
+    request: ConnectCustomStoreRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Create a credential-free store scope for custom/headless telemetry."""
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
+
+    try:
+        storefront_origin = normalize_collector_origin(request.store_url)
+        origins = normalize_allowed_origins(
+            request.allowed_origins or [storefront_origin]
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if storefront_origin not in origins:
+        try:
+            origins = normalize_allowed_origins([storefront_origin, *origins])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    merchant_id = str(request.merchant_id).strip()
+    store_id = "store_custom_" + hashlib.sha256(
+        f"{merchant_id}\n{storefront_origin}".encode("utf-8")
+    ).hexdigest()[:24]
+    store_name = str(request.store_name or "").strip()[:255] or (
+        urlparse(storefront_origin).hostname or "Custom storefront"
+    )
+
+    # Provision before mutating the store so a missing signing secret fails
+    # closed without leaving a half-connected record.
+    try:
+        collector = issue_web_collector_token(
+            merchant_id=merchant_id,
+            store_id=store_id,
+            platform="custom",
+            allowed_origins=origins,
+            ttl_days=request.collector_token_ttl_days,
+        )
+    except WebCollectorError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    existing = await database.fetch_one(
+        """
+        SELECT store_id
+        FROM merchant_stores
+        WHERE merchant_id = :merchant_id
+          AND platform = 'custom'
+          AND domain = :domain
+        """,
+        {"merchant_id": merchant_id, "domain": storefront_origin},
+    )
+    if existing:
+        store_id = str(existing["store_id"])
+        # Reissue with the persisted ID in case this row predates deterministic IDs.
+        try:
+            collector = issue_web_collector_token(
+                merchant_id=merchant_id,
+                store_id=store_id,
+                platform="custom",
+                allowed_origins=origins,
+                ttl_days=request.collector_token_ttl_days,
+            )
+        except WebCollectorError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        await database.execute(
+            """
+            UPDATE merchant_stores
+            SET name = :name,
+                status = 'active',
+                connected_at = CURRENT_TIMESTAMP
+            WHERE store_id = :store_id
+              AND merchant_id = :merchant_id
+            """,
+            {
+                "store_id": store_id,
+                "merchant_id": merchant_id,
+                "name": store_name,
+            },
+        )
+        reused_existing = True
+    else:
+        await database.execute(
+            """
+            INSERT INTO merchant_stores
+                (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+            VALUES
+                (:store_id, :merchant_id, 'custom', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)
+            """,
+            {
+                "store_id": store_id,
+                "merchant_id": merchant_id,
+                "domain": storefront_origin,
+                "name": store_name,
+                "api_key": json.dumps(
+                    {"collector_only": True, "credential_version": 1},
+                    separators=(",", ":"),
+                ),
+            },
+        )
+        try:
+            await database.execute(
+                """
+                UPDATE merchant_stores
+                SET is_primary = TRUE
+                WHERE store_id = :store_id
+                  AND merchant_id = :merchant_id
+                  AND NOT EXISTS (
+                    SELECT 1 FROM merchant_stores
+                    WHERE merchant_id = :merchant_id
+                      AND store_id != :store_id
+                      AND is_primary = TRUE
+                      AND lower(COALESCE(status, '')) IN ('active', 'connected')
+                  )
+                """,
+                {"store_id": store_id, "merchant_id": merchant_id},
+            )
+        except Exception:
+            # Older local schemas can lack is_primary; connection remains valid.
+            pass
+        reused_existing = False
+
+    base_url = resolve_public_api_base_url().rstrip("/")
+    script_src = f"{base_url}/merchant-events/v1/collector.js"
+    install_snippet = (
+        f'<script async src="{script_src}" '
+        f'data-pivota-token="{collector["token"]}" '
+        'data-pivota-consent="pending"></script>'
+    )
+    return {
+        "status": "success",
+        "platform": "custom",
+        "merchant_id": merchant_id,
+        "store_id": store_id,
+        "storefront_origin": storefront_origin,
+        "allowed_origins": origins,
+        "reused_existing": reused_existing,
+        "collector_token": collector["token"],
+        "collector_token_expires_at": collector["expires_at"],
+        "collector_script_src": script_src,
+        "install_snippet": install_snippet,
+        "server_collector_path": "/merchant-events/v1/batch",
+    }
+
+
 @router.post("/shopify/connect")
 async def merchant_connect_shopify(
     request: ConnectShopifyRequest,
@@ -1442,19 +2028,23 @@ async def merchant_connect_shopify(
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their Shopify store"""
-    # Allow merchant, employee, or admin
-    if current_user["role"] not in ["merchant", "employee", "admin", "super_admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    # If merchant role, verify they can only connect their own store
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
-        # Validate shop domain and credentials
-        if not request.shop_domain or not request.shop_domain.strip():
-            raise HTTPException(status_code=400, detail="Shop domain is required")
+        # Validate shop domain and credentials.
+        #
+        # This used to check only that the string was non-empty, while the comment claimed to
+        # validate it. Everything below builds a URL from it and sends CREDENTIALS there: the
+        # client-credentials token exchange, and `GET https://<host>/admin/api/.../shop.json` with
+        # an Admin token. An authenticated merchant could therefore point this repo's egress at any
+        # host or port and read the outcome from the status echoed back in the 400 detail. The
+        # shape check is also a PRECONDITION for the myshopify_domain re-check further down, whose
+        # fallback is this value — falling back to an unvalidated host would defeat it.
+        shop_domain = _validate_myshopify_domain(request.shop_domain)
 
         provided_access_token = (request.access_token or "").strip()
         provided_client_id = (request.client_id or "").strip()
@@ -1475,7 +2065,7 @@ async def merchant_connect_shopify(
         exchanged_expires_in: Optional[int] = None
         if not effective_access_token:
             exchanged_token, exchanged_expires_in, exchange_error = await exchange_shopify_client_credentials_token(
-                shop_domain=request.shop_domain,
+                shop_domain=shop_domain,
                 client_id=provided_client_id,
                 client_secret=provided_client_secret,
             )
@@ -1487,7 +2077,7 @@ async def merchant_connect_shopify(
             effective_access_token = exchanged_token
 
         # Test Shopify API connection
-        test_url = f"https://{request.shop_domain}/admin/api/2025-10/shop.json"
+        test_url = f"https://{shop_domain}/admin/api/2025-10/shop.json"
         headers = {"X-Shopify-Access-Token": effective_access_token}
         
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1505,7 +2095,9 @@ async def merchant_connect_shopify(
             raise HTTPException(status_code=400, detail="Invalid Shopify response")
         
         shop_info = shop_data["shop"]
-        canonical_myshopify_domain = (shop_info.get("myshopify_domain") or request.shop_domain or "").strip().lower()
+        canonical_myshopify_domain = (
+            normalize_myshopify_domain(shop_info.get("myshopify_domain")) or shop_domain
+        )
         logger.info(f"✅ Shopify credentials verified for {canonical_myshopify_domain}")
 
         # Storefront token strategy:
@@ -1524,7 +2116,7 @@ async def merchant_connect_shopify(
                AND (domain = :domain_input OR domain = :domain_canonical)""",
             {
                 "merchant_id": request.merchant_id,
-                "domain_input": request.shop_domain,
+                "domain_input": shop_domain,
                 "domain_canonical": canonical_myshopify_domain,
             },
         )
@@ -1815,10 +2407,10 @@ async def merchant_verify_shopify_integration(
     - capability probes (Shopify Payments / Returns)
     Persists a snapshot to pcs_merchant_capabilities when available.
     """
-    if current_user["role"] not in ["merchant", "employee", "admin", "super_admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != request.merchant_id:
+    if not can_access_merchant(current_user, request.merchant_id):
         raise HTTPException(status_code=403, detail="Can only verify your own store")
 
     if not request.callback_base_url or not request.callback_base_url.strip():
@@ -1850,14 +2442,14 @@ async def list_shopify_webhook_events(
     Read-only debug: list latest ingested Shopify webhook events for a merchant.
     Does NOT return payload_json (to avoid leaking PII).
     """
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = merchant_id or current_user.get("merchant_id")
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
 
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only access your own merchant")
 
     safe_limit = max(1, min(int(limit or 20), 200))
@@ -1904,21 +2496,24 @@ async def list_shopify_webhook_events(
 @router.post("/shopify/products/sync")
 async def merchant_sync_shopify_products(
     request: ShopifySyncRequest,
-    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
     """
     Sync Shopify products for a merchant.
     Mirrors /merchant/integrations/shopify/sync so legacy front-ends keep working.
+
+    Takes no `BackgroundTasks`, deliberately: the catalog ingest this triggers is
+    ENQUEUED here and run by `services.catalog_sync_drain`, never in this
+    process after the response. See the enqueue block below.
     """
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = request.merchant_id or current_user.get("merchant_id")
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
 
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only sync your own store")
 
     store_row = await database.fetch_one(
@@ -1945,6 +2540,17 @@ async def merchant_sync_shopify_products(
             detail=f"Store is {store.get('status')}. Please reconnect your store."
         )
 
+    # Pinned here -- before the credential lookup and outside the try below, so the refusal costs no
+    # further work and is not reshaped by that block's broad handler. Both uses downstream build a
+    # URL from this: the token refresh POSTs client credentials to {domain}/admin/oauth/access_token,
+    # and fetch_products reads from the same host.
+    sync_shop_domain = normalize_myshopify_domain(store.get("domain")) or ""
+    if not sync_shop_domain:
+        raise HTTPException(
+            status_code=400,
+            detail="Stored Shopify domain is not a *.myshopify.com host",
+        )
+
     # Call Shopify adapter directly
     try:
         import json
@@ -1958,7 +2564,7 @@ async def merchant_sync_shopify_products(
         )
         api_key_raw = cred_row["api_key"] if cred_row else None
         access_token, token_meta = await resolve_shopify_admin_access_token(
-            shop_domain=store.get("domain"),
+            shop_domain=sync_shop_domain,
             api_key_raw=api_key_raw,
             store_id=str(store.get("store_id") or "").strip() or None,
         )
@@ -1983,7 +2589,7 @@ async def merchant_sync_shopify_products(
 
         while pages_fetched < max_pages:
             products, next_page, error = await ShopifyProductAdapter.fetch_products(
-                shop_domain=store["domain"],
+                shop_domain=sync_shop_domain,
                 access_token=access_token,
                 merchant_id=target_merchant_id,
                 limit=250,
@@ -2039,16 +2645,24 @@ async def merchant_sync_shopify_products(
 
         # Onboarding→audit readiness (WS-A.2): the sync above populated
         # products_cache. Ingest it into the catalog so the merchant's OWN sync
-        # action produces an auditable catalog — run_catalog_sync_job then
-        # enqueues the quality backfill (WS-A.1), so the merchant becomes
-        # v3-audit-ready without any admin/webhook step. Run as a BACKGROUND task
-        # to keep this response fast; best-effort so it never breaks the sync.
+        # action produces an auditable catalog — the ingest then enqueues the
+        # quality backfill (WS-A.1), so the merchant becomes v3-audit-ready
+        # without any admin/webhook step.
+        #
+        # ENQUEUE ONLY. This used to hand `run_catalog_sync_job` to FastAPI's
+        # `BackgroundTasks`, which runs the ingest in THIS process after the
+        # response has already gone out: nothing retried it, nothing survived a
+        # revision swap, and a failure surfaced only as
+        # `catalog_sync_jobs.status='failed'` in the database long after the
+        # caller had been told 200 / catalog_ingest_queued=true (2026-08-29: a
+        # second merchant's sync wrote zero catalog rows exactly this way).
+        # The pending row is now drained out of band by
+        # `services.catalog_sync_drain.run_catalog_sync_drain_tick`, and the
+        # caller gets the job_id so the OUTCOME is pollable rather than assumed.
         catalog_ingest_queued = False
+        catalog_ingest_job_id: Optional[str] = None
         try:
-            from services.catalog_sync_service import (
-                create_catalog_sync_job,
-                run_catalog_sync_job,
-            )
+            from services.catalog_sync_service import create_catalog_sync_job
             cjob = await create_catalog_sync_job(
                 merchant_id=target_merchant_id,
                 connector="shopify",
@@ -2056,8 +2670,8 @@ async def merchant_sync_shopify_products(
                 scope={"platform": "shopify"},
                 requested_by="merchant_products_sync",
             )
-            background_tasks.add_task(run_catalog_sync_job, cjob["job_id"])
-            catalog_ingest_queued = True
+            catalog_ingest_job_id = str(cjob.get("job_id") or "") or None
+            catalog_ingest_queued = catalog_ingest_job_id is not None
         except Exception as exc:  # noqa: BLE001 - readiness hook is best-effort
             logger.warning(
                 "merchant sync: catalog ingest enqueue failed merchant=%s: %s",
@@ -2072,7 +2686,14 @@ async def merchant_sync_shopify_products(
                 "store_domain": store["domain"],
                 "pages_fetched": pages_fetched,
                 "synced_at": datetime.now().isoformat(),
-                "catalog_ingest_queued": catalog_ingest_queued
+                # `queued` means a pending job row exists — NOT that the catalog
+                # was written. Poll catalog_ingest_status_url for the outcome.
+                "catalog_ingest_queued": catalog_ingest_queued,
+                "catalog_ingest_job_id": catalog_ingest_job_id,
+                "catalog_ingest_status_url": (
+                    f"/v1/catalog/sync/jobs/{catalog_ingest_job_id}"
+                    if catalog_ingest_job_id else None
+                ),
             }
         }
     except HTTPException:
@@ -2090,16 +2711,47 @@ async def merchant_connect_wix(
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their Wix store"""
-    # Allow merchant, employee, or admin
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    # If merchant role, verify they can only connect their own store
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
+        instance_id = str(request.instance_id or "").strip()
+        if instance_id:
+            # Shape-checked with the SAME predicate the receiver uses, so an
+            # id the receiver could never resolve is refused at the door
+            # rather than persisted and silently ignored — and so nothing
+            # carrying a SQL LIKE wildcard reaches the lookup below.
+            if not is_wix_instance_id(instance_id):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "WIX_INSTANCE_ID_INVALID",
+                        "message": "instance_id must be a Wix app instance id (8-64 chars, letters, digits and '-').",
+                    },
+                )
+            # `merchant_stores` has no uniqueness on the instance id, and
+            # `POST /webhooks/wix` resolves a store by nothing else. Without
+            # this check merchant B could type merchant A's instance id and
+            # start receiving A's signed order and refund events. First claim
+            # wins; the second is a 409.
+            claimed = await find_wix_stores_by_instance_id(database, instance_id)
+            foreign = [
+                row
+                for row in claimed
+                if str(row.get("merchant_id") or "") != str(request.merchant_id)
+            ]
+            if foreign:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "WIX_INSTANCE_ID_ALREADY_CLAIMED",
+                        "message": "That Wix app instance is already connected to another merchant.",
+                    },
+                )
+
         try:
             validation = await validate_wix_catalog_access(request.site_id, request.api_key)
         except WixConnectionValidationError as exc:
@@ -2112,28 +2764,49 @@ async def merchant_connect_wix(
         api_key = validation["api_key"]
 
         logger.info("Wix credentials verified for merchant=%s", request.merchant_id)
-        
+
         # Check if store already exists
         existing_store = await database.fetch_one(
-            """SELECT store_id FROM merchant_stores 
+            """SELECT store_id, api_key FROM merchant_stores
                WHERE merchant_id = :merchant_id AND platform = 'wix' AND domain = :site_id""",
             {"merchant_id": request.merchant_id, "site_id": site_id}
         )
-        
+
         if existing_store:
+            # `merge_wix_credential`, not a bare write: a reconnect that does
+            # not re-supply `instance_id` must not erase the one already
+            # stored, or the merchant's telemetry goes dark at their next
+            # credential rotation with no error anywhere. A store that never
+            # had a blob and is not opting into telemetry still gets the bare
+            # key, byte-identical to before.
+            stored_credential = merge_wix_credential(
+                dict(existing_store).get("api_key"),
+                api_key=api_key,
+                site_id=site_id,
+                instance_id=instance_id,
+            )
             # Update existing store
             await database.execute(
-                """UPDATE merchant_stores 
+                """UPDATE merchant_stores
                    SET api_key = :token, status = 'active', connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
-                {"store_id": existing_store["store_id"], "token": api_key}
+                {"store_id": existing_store["store_id"], "token": stored_credential}
             )
             store_id = existing_store["store_id"]
         else:
+            # Nothing stored yet: an instance id makes it the JSON blob every
+            # Wix reader in this repo already understands
+            # (`normalize_wix_api_key`, `extract_wix_site_id`,
+            # `adapters/wix_adapter.py::extract_wix_order_credentials` all read
+            # `api_key`/`site_id`/`instance_id` out of one); without one it is
+            # the bare key, exactly as before.
+            stored_credential = merge_wix_credential(
+                None, api_key=api_key, site_id=site_id, instance_id=instance_id
+            )
             # Insert new store
             store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
             await database.execute(
-                """INSERT INTO merchant_stores 
+                """INSERT INTO merchant_stores
                    (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
                    VALUES (:store_id, :merchant_id, 'wix', :site_id, :name, :token, 'active', CURRENT_TIMESTAMP)""",
                 {
@@ -2141,7 +2814,7 @@ async def merchant_connect_wix(
                     "merchant_id": request.merchant_id,
                     "site_id": site_id,
                     "name": request.store_name or f"Wix Store {site_id[:8]}",
-                    "token": api_key
+                    "token": stored_credential
                 }
             )
         
@@ -2170,12 +2843,11 @@ async def merchant_connect_woocommerce(
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their WooCommerce store"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
         if not request.store_url or not request.consumer_key or not request.consumer_secret:
@@ -2205,6 +2877,7 @@ async def merchant_connect_woocommerce(
             {
                 "consumer_key": request.consumer_key,
                 "consumer_secret": request.consumer_secret,
+                "webhook_secret": request.webhook_secret or request.consumer_secret,
             },
             separators=(",", ":"),
         )
@@ -2247,7 +2920,12 @@ async def merchant_connect_woocommerce(
         return {
             "status": "success",
             "message": "WooCommerce store connected successfully",
-            "store_id": store_id
+            "store_id": store_id,
+            "webhook_path": f"/webhooks/woocommerce/{store_id}",
+            "webhook_subscription_path": (
+                f"/integrations/woocommerce/{store_id}/webhooks/ensure"
+            ),
+            "required_webhook_topics": ["order.created", "order.updated"],
         }
         
     except HTTPException:
@@ -2259,18 +2937,83 @@ async def merchant_connect_woocommerce(
         raise HTTPException(status_code=500, detail=f"Failed to connect WooCommerce: {str(e)}")
 
 
+@router.post("/woocommerce/{store_id}/webhooks/ensure")
+async def ensure_woocommerce_webhooks(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    store = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = 'woocommerce'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Connected WooCommerce store not found")
+    store = dict(store)
+    # The owning merchant is a property of the ROW here: `store_id` is
+    # caller-supplied and the SELECT above keys on it alone.
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
+        raise HTTPException(status_code=403, detail="Can only manage your own store")
+
+    credentials = _woocommerce_credentials(store.get("api_key"))
+    consumer_key = str(credentials.get("consumer_key") or "").strip()
+    consumer_secret = str(credentials.get("consumer_secret") or "").strip()
+    webhook_secret = str(
+        credentials.get("webhook_secret") or consumer_secret
+    ).strip()
+    if not consumer_key or not consumer_secret or not webhook_secret:
+        raise HTTPException(status_code=409, detail="WooCommerce API credentials are incomplete")
+
+    from services.woocommerce_webhook_subscriptions import (
+        WooCommerceWebhookSubscriptionError,
+        ensure_woocommerce_subscriptions,
+    )
+
+    try:
+        async with asyncio.timeout(90.0):
+            async with _WOOCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY:
+                async with _woocommerce_webhook_install_lock(store_id):
+                    result = await ensure_woocommerce_subscriptions(
+                        store_url=str(store.get("domain") or ""),
+                        consumer_key=consumer_key,
+                        consumer_secret=consumer_secret,
+                        webhook_secret=webhook_secret,
+                        callback_url=_woocommerce_webhook_callback_url(store_id),
+                        topics=("order.created", "order.updated"),
+                    )
+    except WooCommerceWebhookSubscriptionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="WooCommerce webhook management request failed",
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="WooCommerce webhook installation timed out",
+        ) from exc
+    return {"status": "success", "store_id": store_id, **result}
+
+
 @router.post("/bigcommerce/connect")
 async def merchant_connect_bigcommerce(
     request: ConnectBigCommerceRequest,
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their BigCommerce store"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
         if not request.store_hash or not request.access_token:
@@ -2344,9 +3087,14 @@ async def merchant_connect_bigcommerce(
         return {
             "status": "success",
             "message": "BigCommerce store connected successfully",
-            "store_id": store_id
+            "store_id": store_id,
+            "webhook_path": f"/webhooks/bigcommerce/{store_id}",
+            "webhook_subscription_path": (
+                f"/integrations/bigcommerce/{store_id}/webhooks/ensure"
+            ),
+            "required_webhook_scopes": list(SUPPORTED_BIGCOMMERCE_SCOPES),
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -2356,18 +3104,1216 @@ async def merchant_connect_bigcommerce(
         raise HTTPException(status_code=500, detail=f"Failed to connect BigCommerce: {str(e)}")
 
 
+@router.post("/bigcommerce/{store_id}/webhooks/ensure")
+async def ensure_bigcommerce_webhooks(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Register (or re-sync) the BigCommerce hooks that feed the ledger.
+
+    BigCommerce does not sign deliveries, so the receiver's credential is a
+    per-store random secret carried in a header the hook itself declares. It is
+    minted here on first use, persisted into the store's credential JSON, and
+    NEVER returned: the response says which scopes and callback were installed,
+    nothing more.
+    """
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    store = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = 'bigcommerce'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Connected BigCommerce store not found")
+    store = dict(store)
+    # The owning merchant is a property of the ROW: `store_id` is
+    # caller-supplied and the SELECT above keys on it alone.
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
+        raise HTTPException(status_code=403, detail="Can only manage your own store")
+
+    credentials = _bigcommerce_credentials(store.get("api_key"))
+    store_hash = str(credentials.get("store_hash") or "").strip()
+    access_token = str(credentials.get("access_token") or "").strip()
+    if not store_hash or not access_token:
+        raise HTTPException(status_code=409, detail="BigCommerce API credentials are incomplete")
+
+    webhook_secret = str(credentials.get("webhook_secret") or "").strip()
+    minted_secret = not webhook_secret
+    if minted_secret:
+        webhook_secret = secrets.token_urlsafe(32)
+
+    from services.bigcommerce_webhook_subscriptions import (
+        BigCommerceWebhookSubscriptionError,
+        ensure_bigcommerce_subscriptions,
+    )
+
+    callback_url = _bigcommerce_webhook_callback_url(store_id)
+    if minted_secret:
+        # Persist BEFORE registering: a hook that carries a secret the
+        # receiver does not know would 401 every delivery.
+        await database.execute(
+            """
+            UPDATE merchant_stores
+            SET api_key = :api_key
+            WHERE store_id = :store_id
+            """,
+            {
+                "store_id": store_id,
+                "api_key": json.dumps(
+                    {**credentials, "webhook_secret": webhook_secret},
+                    separators=(",", ":"),
+                ),
+            },
+        )
+
+        # Two first-time calls can race: each mints its own secret and the
+        # last UPDATE wins. Hooks must carry the secret the RECEIVER holds, so
+        # re-read the row and register with whatever actually persisted; the
+        # loser's minted value is discarded, never registered.
+        persisted = await database.fetch_one(
+            "SELECT api_key FROM merchant_stores WHERE store_id = :store_id",
+            {"store_id": store_id},
+        )
+        persisted_secret = str(
+            _bigcommerce_credentials(dict(persisted).get("api_key") if persisted else None)
+            .get("webhook_secret")
+            or ""
+        ).strip()
+        if not persisted_secret:
+            raise HTTPException(
+                status_code=503, detail="BigCommerce webhook secret could not be persisted"
+            )
+        webhook_secret = persisted_secret
+    try:
+        async with asyncio.timeout(90.0):
+            async with _BIGCOMMERCE_WEBHOOK_INSTALL_CONCURRENCY:
+                result = await ensure_bigcommerce_subscriptions(
+                    store_hash=store_hash,
+                    access_token=access_token,
+                    client_id=credentials.get("client_id"),
+                    callback_url=callback_url,
+                    secret=webhook_secret,
+                    scopes=SUPPORTED_BIGCOMMERCE_SCOPES,
+                )
+    except BigCommerceWebhookSubscriptionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="BigCommerce webhook management request failed",
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="BigCommerce webhook installation timed out",
+        ) from exc
+    return {"status": "success", "store_id": store_id, **result}
+
+
+
+# ---------------------------------------------------------------------------
+# Squarespace. Two credential models that do NOT reach the same APIs: a per-site
+# Developer API key reads the Orders API, and only an OAuth app token can create
+# a webhook subscription. See docs/SQUARESPACE_TELEMETRY.md.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/squarespace/connect")
+async def merchant_connect_squarespace(
+    request: ConnectSquarespaceRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Connect a Squarespace site for commerce telemetry.
+
+    The API key is validated by calling `GET /1.0/authorization/website`, which
+    is also the BINDING step: the website id it returns is persisted and every
+    webhook delivery must name it. Without that binding a notification signed
+    with some other Squarespace site's subscription secret could not be
+    distinguished from this store's own.
+
+    The key is never logged, and a reconnect READ-MODIFY-WRITEs the credential
+    blob: the same cell holds the webhook secret (Pivota's only copy) and the
+    reconciliation cursor, and overwriting it is exactly the PrestaShop P1 where
+    re-entering a key silently disarmed a shop's telemetry.
+    """
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
+
+    from services import squarespace_connection as squarespace
+    from services.squarespace_connection import (
+        SquarespaceConnectionError,
+        serialize_squarespace_credentials,
+    )
+
+    api_key = request.api_key.strip()
+    oauth_access_token = (request.oauth_access_token or "").strip() or None
+    oauth_refresh_token = (request.oauth_refresh_token or "").strip() or None
+    oauth_expires_at = (request.oauth_expires_at or "").strip() or None
+    if not api_key:
+        raise HTTPException(status_code=400, detail="A Squarespace API key is required")
+
+    try:
+        # Validated with the credential that will be used for reads: when an
+        # OAuth token is supplied it is the one that also carries webhook
+        # subscriptions, so it is the identity worth proving.
+        website = await squarespace.fetch_squarespace_website(
+            oauth_access_token or api_key
+        )
+    except SquarespaceConnectionError as exc:
+        # The upstream status is part of the detail. That `GET
+        # /1.0/authorization/website` answers a per-site API key at all is an
+        # ASSUMED claim (docs/SQUARESPACE_TELEMETRY.md row 4); if it is wrong,
+        # a 404 here says so immediately, while a bare "connection failed"
+        # would look exactly like a mistyped key.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Squarespace connection failed: {exc}"
+                + (
+                    f" (upstream HTTP {exc.status_code})"
+                    if getattr(exc, "status_code", None)
+                    else ""
+                )
+            ),
+        ) from exc
+
+    website_id = str(website.get("id") or "").strip()
+    store_domain = (
+        (request.domain or "").strip()
+        or str(website.get("identifier") or "").strip()
+        or f"squarespace:{website_id}"
+    )
+    store_name = (
+        (request.store_name or "").strip()
+        or str(website.get("title") or "").strip()
+        or "Squarespace Store"
+    )
+
+    existing_store = await database.fetch_one(
+        """SELECT store_id, api_key FROM merchant_stores
+           WHERE merchant_id = :merchant_id AND platform = 'squarespace' AND domain = :domain""",
+        {"merchant_id": request.merchant_id, "domain": store_domain},
+    )
+
+    def _reconnect(preserved: dict) -> dict:
+        """The blob to persist, computed INSIDE the merge's critical section.
+
+        This runs under the same row lock as the read and the write, which is
+        the whole reason connect no longer hand-rolls its own read-modify-write:
+        two of them meant two critical sections over one cell, and a sweep's
+        cursor write landing between a connect's read and its write reverted
+        the merchant's new credential.
+        """
+        previous_website_id = str(preserved.get("website_id") or "").strip()
+        if previous_website_id and previous_website_id != website_id:
+            # The credential now belongs to a DIFFERENT site. Everything issued
+            # for or derived from the OLD site goes, and that INCLUDES the old
+            # OAuth token: it is preferred over the API key on every read, so
+            # leaving it behind makes the sweep keep listing the old site's
+            # orders and record them under the store that now represents the
+            # new one. The secret would authenticate deliveries the `websiteId`
+            # bind then rejects, and the cursor is a high-water mark over
+            # another site's orders. Everything else in the blob is preserved.
+            for stale in (
+                "webhook_secret",
+                "webhook_subscription_id",
+                "reconciliation",
+                "oauth_access_token",
+                "oauth_refresh_token",
+                "oauth_expires_at",
+            ):
+                preserved.pop(stale, None)
+        preserved.update({"api_key": api_key, "website_id": website_id})
+        if oauth_access_token:
+            preserved["oauth_access_token"] = oauth_access_token
+            if oauth_refresh_token:
+                preserved["oauth_refresh_token"] = oauth_refresh_token
+            if oauth_expires_at:
+                preserved["oauth_expires_at"] = oauth_expires_at
+        return preserved
+
+    if existing_store:
+        existing_store = dict(existing_store)
+        store_id = existing_store["store_id"]
+        persisted = await squarespace.merge_squarespace_credentials(
+            store_id=store_id,
+            mutate=_reconnect,
+            mark_connected=True,
+            db=database,
+        )
+    else:
+        store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
+        blob = {"api_key": api_key, "website_id": website_id}
+        if oauth_access_token:
+            blob["oauth_access_token"] = oauth_access_token
+            if oauth_refresh_token:
+                blob["oauth_refresh_token"] = oauth_refresh_token
+            if oauth_expires_at:
+                blob["oauth_expires_at"] = oauth_expires_at
+        persisted = dict(blob)
+        await database.execute(
+            """INSERT INTO merchant_stores
+               (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+               VALUES (:store_id, :merchant_id, 'squarespace', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)""",
+            {
+                "store_id": store_id,
+                "merchant_id": request.merchant_id,
+                "domain": store_domain,
+                "name": store_name,
+                "api_key": serialize_squarespace_credentials(blob),
+            },
+        )
+
+    logger.info(
+        "squarespace_connect store_id=%s merchant_id=%s website_id=%s oauth=%s",
+        store_id,
+        request.merchant_id,
+        website_id,
+        bool(oauth_access_token),
+    )
+    return {
+        "status": "success",
+        "message": "Squarespace store connected successfully",
+        "store_id": store_id,
+        "website_id": website_id,
+        "domain": store_domain,
+        # Read off the BLOB THAT PERSISTED, not off the request field. A
+        # reconnect that supplies no OAuth token still has webhooks if the
+        # stored one survived, and answering `sweep_only` there would tell the
+        # merchant their armed subscription is not armed.
+        "telemetry_mode": (
+            "webhook_and_sweep"
+            if str(persisted.get("oauth_access_token") or "").strip()
+            else "sweep_only"
+        ),
+        "webhook_path": f"/webhooks/squarespace/{store_id}",
+        "webhook_subscription_path": (
+            f"/integrations/squarespace/{store_id}/webhooks/ensure"
+        ),
+        "reconcile_path": f"/integrations/squarespace/{store_id}/reconcile",
+    }
+
+
+async def _squarespace_store_for_caller(store_id: str, current_user: dict) -> dict:
+    """The store row, with the role gate and the ROW's ownership check applied.
+
+    `store_id` is caller-supplied and the SELECT keys on it alone, so the owning
+    merchant is a property of the ROW and nothing in the request says who it is.
+    """
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    store = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = 'squarespace'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Connected Squarespace store not found")
+    store = dict(store)
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
+        raise HTTPException(status_code=403, detail="Can only manage your own store")
+    return store
+
+
+@router.post("/squarespace/{store_id}/webhooks/ensure")
+async def ensure_squarespace_webhooks(
+    store_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Create the Squarespace subscription that feeds `/webhooks/squarespace/{id}`.
+
+    Requires an OAuth access token on the store. The Webhook Subscriptions API
+    is a Developer-Platform surface and a per-site Developer API key cannot
+    create a subscription, so an API-key-only store is answered 409
+    `oauth_required` and pointed at the reconciliation sweep. Faking a
+    provisioning here would leave a store that reports telemetry as armed and
+    receives nothing.
+
+    The secret comes FROM Squarespace and is shown exactly once, which inverts
+    the BigCommerce lifecycle: it is persisted after the create, re-read to
+    learn whether this request's write won, and never returned or logged.
+    """
+    store = await _squarespace_store_for_caller(store_id, current_user)
+
+    from services.squarespace_connection import (
+        merge_squarespace_credentials,
+        parse_squarespace_credentials,
+    )
+    from services.squarespace_event_adapter import (
+        SQUARESPACE_ORDER_TOPICS,
+        SQUARESPACE_UNINSTALL_TOPIC,
+    )
+    from services.squarespace_webhook_subscriptions import (
+        SquarespaceWebhookSubscriptionError,
+        delete_squarespace_subscription,
+        ensure_squarespace_subscription,
+    )
+
+    credentials = parse_squarespace_credentials(store.get("api_key"))
+    oauth_access_token = str(credentials.get("oauth_access_token") or "").strip()
+    website_id = str(credentials.get("website_id") or "").strip()
+    if not oauth_access_token:
+        logger.info(
+            "squarespace_webhooks_ensure action=oauth_required store_id=%s "
+            "store_merchant_id=%s actor_role=%s actor_user_id=%s",
+            store_id,
+            store.get("merchant_id") or "-",
+            current_user.get("role") or "-",
+            current_user.get("sub") or "-",
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "oauth_required",
+                "message": (
+                    "Squarespace webhook subscriptions require an OAuth access "
+                    "token from a Squarespace Developer Platform app; a per-site "
+                    "Developer API key cannot create one. This store's telemetry "
+                    "runs through the reconciliation sweep instead: "
+                    f"POST /integrations/squarespace/{store_id}/reconcile."
+                ),
+                "store_id": store_id,
+                "reconcile_path": f"/integrations/squarespace/{store_id}/reconcile",
+            },
+        )
+    if not website_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Squarespace store has no website_id binding; reconnect it "
+                "so deliveries can be bound to the site they came from"
+            ),
+        )
+
+    callback_url = _squarespace_webhook_callback_url(store_id)
+    topics = list(SQUARESPACE_ORDER_TOPICS) + [SQUARESPACE_UNINSTALL_TOPIC]
+    try:
+        async with asyncio.timeout(90.0):
+            async with _SQUARESPACE_WEBHOOK_INSTALL_CONCURRENCY:
+                result = await ensure_squarespace_subscription(
+                    access_token=oauth_access_token,
+                    callback_url=callback_url,
+                    topics=topics,
+                )
+    except SquarespaceWebhookSubscriptionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail="Squarespace webhook management request failed"
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504, detail="Squarespace webhook installation timed out"
+        ) from exc
+
+    persisted = await merge_squarespace_credentials(
+        store_id=store_id,
+        updates={
+            "webhook_secret": result.secret,
+            "webhook_subscription_id": result.subscription_id,
+        },
+    )
+    persisted_secret = str(persisted.get("webhook_secret") or "").strip()
+    if not persisted_secret:
+        # The subscription is live and the receiver holds no secret for it:
+        # every delivery would 401. Undo the create rather than leave that.
+        await _discard_squarespace_subscription(
+            oauth_access_token, result.subscription_id, delete_squarespace_subscription
+        )
+        raise HTTPException(
+            status_code=503, detail="Squarespace webhook secret could not be persisted"
+        )
+    if not hmac.compare_digest(persisted_secret, result.secret):
+        # A concurrent ensure won the write. The receiver holds THAT secret, so
+        # this request's subscription can never authenticate; discard it and
+        # report the state that actually exists.
+        await _discard_squarespace_subscription(
+            oauth_access_token, result.subscription_id, delete_squarespace_subscription
+        )
+        # The same principal fields as `oauth_required` and `provisioned`. A
+        # lost race is the one outcome where a subscription was created and
+        # then deleted against Squarespace, so the audit trail needs to name
+        # who caused that as much as it does for the other two.
+        logger.info(
+            "squarespace_webhooks_ensure action=lost_race store_id=%s "
+            "store_merchant_id=%s actor_role=%s actor_user_id=%s "
+            "discarded_subscription_id=%s",
+            store_id,
+            store.get("merchant_id") or "-",
+            current_user.get("role") or "-",
+            current_user.get("sub") or "-",
+            result.subscription_id or "-",
+        )
+        return {
+            "status": "success",
+            "store_id": store_id,
+            "endpoint": callback_url,
+            "topics": topics,
+            "secret_provisioned": True,
+            "subscription_id": str(persisted.get("webhook_subscription_id") or ""),
+        }
+
+    logger.info(
+        "squarespace_webhooks_ensure action=provisioned store_id=%s "
+        "store_merchant_id=%s actor_role=%s actor_user_id=%s "
+        "subscription_id=%s replaced=%s",
+        store_id,
+        store.get("merchant_id") or "-",
+        current_user.get("role") or "-",
+        current_user.get("sub") or "-",
+        result.subscription_id or "-",
+        len(result.replaced_subscription_ids),
+    )
+    return {
+        "status": "success",
+        "store_id": store_id,
+        "endpoint": callback_url,
+        "topics": result.topics,
+        # The value itself is never returned and never logged: Pivota installs
+        # the subscription, so no human needs to see it.
+        "secret_provisioned": True,
+        "subscription_id": result.subscription_id,
+        "replaced_subscriptions": len(result.replaced_subscription_ids),
+    }
+
+
+async def _discard_squarespace_subscription(access_token, subscription_id, delete) -> None:
+    """Best-effort removal of a subscription whose secret we cannot use.
+
+    A failure here is logged and swallowed: the caller is already answering an
+    error (or reporting the winner's state), and raising a second failure over
+    the first would hide what actually happened.
+    """
+    try:
+        await delete(access_token=access_token, subscription_id=subscription_id)
+    except Exception:
+        logger.warning(
+            "squarespace_webhooks_ensure could not discard subscription_id=%s",
+            subscription_id or "-",
+        )
+
+
+@router.post("/squarespace/{store_id}/reconcile")
+async def run_squarespace_reconciliation(
+    store_id: str,
+    apply: bool = Query(default=True),
+    overlap_minutes: int = Query(default=30, ge=0, le=1440),
+    initial_lookback_days: int = Query(default=7, ge=1, le=90),
+    max_pages: int = Query(default=20, ge=1, le=200),
+    modified_before: Optional[str] = Query(default=None, max_length=64),
+    current_user: dict = Depends(get_current_user),
+):
+    """Run the Orders-API reconciliation sweep for one store, now.
+
+    This is the authenticated face of `scripts/sweep_squarespace_orders.py`.
+    Both exist because CI deploys no Cloud Run job for this lane and the
+    APScheduler lane runs on a service that is not deployed on merge — see the
+    scheduling section of docs/SQUARESPACE_TELEMETRY.md.
+
+    `modified_before` pins the window's end for ONE run: the operator escape
+    hatch over the automatic bisect, for digging a store out of a range the
+    page cap cannot read in one pass.
+
+    Two guards wrap the sweep, both because it is an unbounded outbound loop
+    over somebody else's API. A per-store lock answers 409 rather than letting
+    two sweeps of the same store interleave — they would race on the same
+    cursor cell, and the loser's pages would be re-read or skipped depending on
+    which merge landed last. The timeout bounds the request itself: a sweep
+    that pages 200 times against a slow upstream would otherwise hold the
+    connection until the proxy gives up, with no cursor written either way.
+    """
+    store = await _squarespace_store_for_caller(store_id, current_user)
+
+    from services.squarespace_order_sweep import (
+        SquarespaceSweepError,
+        sweep_squarespace_store,
+    )
+
+    resolved_store_id = str(store["store_id"])
+    # Check-and-add with no `await` between them, so this is atomic on the
+    # event loop without a lock of its own.
+    if resolved_store_id in _SQUARESPACE_SWEEPS_IN_FLIGHT:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "sweep_already_running",
+                "message": (
+                    "A Squarespace reconciliation sweep is already running for "
+                    "this store; wait for it to finish rather than racing it on "
+                    "the same cursor."
+                ),
+                "store_id": resolved_store_id,
+            },
+        )
+    _SQUARESPACE_SWEEPS_IN_FLIGHT.add(resolved_store_id)
+    try:
+        async with asyncio.timeout(SQUARESPACE_RECONCILE_TIMEOUT_SECONDS):
+            return await sweep_squarespace_store(
+                store_id=resolved_store_id,
+                apply=apply,
+                overlap_minutes=overlap_minutes,
+                initial_lookback_days=initial_lookback_days,
+                max_pages=max_pages,
+                modified_before=modified_before,
+            )
+    except SquarespaceSweepError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        # The cursor is untouched: the sweep persists it only after the whole
+        # page loop completes, so a timeout re-reads rather than skips.
+        raise HTTPException(
+            status_code=504, detail="Squarespace reconciliation sweep timed out"
+        ) from exc
+    finally:
+        _SQUARESPACE_SWEEPS_IN_FLIGHT.discard(resolved_store_id)
+
+# ---------------------------------------------------------------------------
+# Webflow. ONE Bearer token reaching the Data API v2; what differs between a
+# Site API token and an OAuth App token is only whether Webflow SIGNS the
+# deliveries. See docs/WEBFLOW_TELEMETRY.md.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/webflow/connect")
+async def merchant_connect_webflow(
+    request: ConnectWebflowRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Connect a Webflow site for commerce telemetry.
+
+    The token is validated by resolving the SITE it reaches, which is also the
+    BINDING step: `site_id` is persisted and every order read afterwards is
+    fetched from `/v2/sites/{site_id}/...`, so a token that later points
+    somewhere else cannot silently file another shop's orders under this store.
+
+    When no `site_id` is supplied the site is resolved only if the token reaches
+    exactly ONE. Zero or several is a 409 that lists the candidates: guessing
+    would bind the wrong shop, and the mistake would not be visible in any row
+    the sweep then wrote.
+
+    The token is never logged, and a reconnect READ-MODIFY-WRITEs the credential
+    blob rather than overwriting it — the same cell holds the URL secret that is
+    baked into the webhook registered AT WEBFLOW, and losing it leaves Webflow
+    delivering to a path this deployment can only answer 401 to.
+    """
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
+
+    from services import webflow_connection as webflow
+    from services.webflow_connection import (
+        WebflowConnectionError,
+        WebflowSiteAmbiguousError,
+        drop_site_scoped_keys,
+        parse_webflow_credentials,
+        serialize_webflow_credentials,
+    )
+
+    api_token = request.api_token.strip()
+    if not api_token:
+        raise HTTPException(status_code=400, detail="A Webflow API token is required")
+
+    try:
+        site = await webflow.resolve_webflow_site(
+            api_token, site_id=(request.site_id or "").strip() or None
+        )
+    except WebflowSiteAmbiguousError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "site_selection_required",
+                "message": str(exc),
+                # Ids and names only — enough to choose from, and nothing that
+                # describes another site's contents.
+                "sites": [
+                    {"id": row.get("id"), "displayName": row.get("displayName")}
+                    for row in exc.sites
+                ],
+            },
+        ) from exc
+    except WebflowConnectionError as exc:
+        # The upstream status is part of the detail. Several claims about the
+        # Data API here are ASSUMED (docs/WEBFLOW_TELEMETRY.md); if one is
+        # wrong, a 404 says "wrong endpoint" and a 401 says "wrong token" on the
+        # first attempt instead of after a support thread.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Webflow connection failed: {exc}"
+                + (
+                    f" (upstream HTTP {exc.status_code})"
+                    if getattr(exc, "status_code", None)
+                    else ""
+                )
+            ),
+        ) from exc
+
+    site_id = str(site.get("id") or "").strip()
+    site_name = str(site.get("displayName") or "").strip() or None
+    short_name = str(site.get("shortName") or "").strip()
+    store_domain = (
+        (request.domain or "").strip()
+        or (f"{short_name}.webflow.io" if short_name else "")
+        or f"webflow:{site_id}"
+    )
+    store_name = (request.store_name or "").strip() or site_name or "Webflow Store"
+
+    # THE SITE IS THE IDENTITY, NOT THE DOMAIN. `domain` is caller-supplied and
+    # otherwise merely derived from `shortName`, so keying the existing-store
+    # lookup on it alone means a second connect for the SAME site with a
+    # different explicit `domain` creates a SECOND store row bound to the same
+    # `site_id` — and then both stores sweep the same order list and the funnel
+    # counts that site's GMV twice, out of rows that are individually
+    # well-formed and impossible to flag downstream.
+    #
+    # So this store's own site binding is consulted first, and the domain lookup
+    # is the FALLBACK for a row that predates the binding (or was written by a
+    # path that never stored one). The site-bound branch cannot be replaced by a
+    # SQL `LIKE` on the blob: the credential cell is JSON and `site_id` is a key
+    # inside it, so the match is made in Python over this merchant's own
+    # Webflow rows, which is a handful.
+    existing_store = None
+    site_bound_rows = await database.fetch_all(
+        """SELECT store_id, domain, api_key FROM merchant_stores
+           WHERE merchant_id = :merchant_id AND platform = 'webflow'""",
+        {"merchant_id": request.merchant_id},
+    )
+    for row in site_bound_rows:
+        row = dict(row)
+        if str(
+            parse_webflow_credentials(row.get("api_key")).get("site_id") or ""
+        ).strip() == site_id:
+            existing_store = row
+            break
+    if existing_store is None:
+        existing_store = await database.fetch_one(
+            """SELECT store_id, domain, api_key FROM merchant_stores
+               WHERE merchant_id = :merchant_id AND platform = 'webflow'
+                 AND domain = :domain""",
+            {"merchant_id": request.merchant_id, "domain": store_domain},
+        )
+
+    def _reconnect(preserved: dict) -> dict:
+        """The blob to persist, computed INSIDE the merge's critical section.
+
+        Running here rather than in a second read-modify-write of its own is
+        what stops a sweep's cursor write landing between connect's read and its
+        write and reverting the merchant's new token.
+        """
+        previous_site_id = str(preserved.get("site_id") or "").strip()
+        if previous_site_id and previous_site_id != site_id:
+            # The token now belongs to a DIFFERENT site. EVERY credential and
+            # every piece of site-derived state goes — not just the derived
+            # half. The credential is the dangerous one: it is what every read
+            # uses, so a surviving old token keeps the sweep reading the old
+            # site and filing its orders under the store that now represents the
+            # new one. `drop_site_scoped_keys` drops the whole declared set, so
+            # a second credential added later cannot escape it.
+            drop_site_scoped_keys(preserved)
+        preserved.update({"api_token": api_token, "site_id": site_id})
+        if site_name:
+            preserved["site_name"] = site_name
+        return preserved
+
+    if existing_store:
+        existing_store = dict(existing_store)
+        store_id = existing_store["store_id"]
+        # The ROW's domain, not the request's. A reconnect matched on the site
+        # binding may carry a different `domain` argument, and answering with a
+        # value no row holds would tell the merchant a store exists under a name
+        # nothing can look up.
+        store_domain = str(existing_store.get("domain") or "").strip() or store_domain
+        persisted = await webflow.merge_webflow_credentials(
+            store_id=store_id,
+            mutate=_reconnect,
+            mark_connected=True,
+            db=database,
+        )
+    else:
+        store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
+        blob = {"api_token": api_token, "site_id": site_id}
+        if site_name:
+            blob["site_name"] = site_name
+        persisted = dict(blob)
+        await database.execute(
+            """INSERT INTO merchant_stores
+               (store_id, merchant_id, platform, domain, name, api_key, status, connected_at)
+               VALUES (:store_id, :merchant_id, 'webflow', :domain, :name, :api_key, 'active', CURRENT_TIMESTAMP)""",
+            {
+                "store_id": store_id,
+                "merchant_id": request.merchant_id,
+                "domain": store_domain,
+                "name": store_name,
+                "api_key": serialize_webflow_credentials(blob),
+            },
+        )
+
+    # The ACTOR, the same two fields every `webflow_webhooks_ensure` line
+    # carries. Connect is the more consequential of the two — it is what binds
+    # a store to a site, and a reconnect pointed at a different site DROPS the
+    # old credential and every piece of state derived from it — so an audit
+    # trail that names who ran the ensure but not who ran the connect names the
+    # wrong half. `can_access_merchant` admits staff roles as well as the
+    # merchant, so "the merchant id" does not identify the caller.
+    logger.info(
+        "webflow_connect store_id=%s merchant_id=%s site_id=%s "
+        "webhooks_provisioned=%s actor_role=%s actor_user_id=%s",
+        store_id,
+        request.merchant_id,
+        site_id,
+        bool(str(persisted.get("url_secret") or "").strip()),
+        current_user.get("role") or "-",
+        current_user.get("sub") or "-",
+    )
+    return {
+        "status": "success",
+        "message": "Webflow store connected successfully",
+        "store_id": store_id,
+        "site_id": site_id,
+        "site_name": site_name,
+        "domain": store_domain,
+        # Read off the blob THAT PERSISTED, not off the request: a reconnect to
+        # the SAME site keeps its provisioning, and answering "not provisioned"
+        # there would tell the merchant to re-run an ensure that would rotate a
+        # working secret for nothing.
+        "telemetry_mode": (
+            "webhook_and_sweep"
+            if str(persisted.get("url_secret") or "").strip()
+            else "sweep_only_until_provisioned"
+        ),
+        "webhook_provisioning_path": f"/integrations/webflow/{store_id}/webhooks/ensure",
+        "reconcile_path": f"/integrations/webflow/{store_id}/reconcile",
+    }
+
+
+async def _webflow_store_for_caller(store_id: str, current_user: dict) -> dict:
+    """The store row, with the role gate and the ROW's ownership check applied.
+
+    `store_id` is caller-supplied and the SELECT keys on it alone, so the owning
+    merchant is a property of the ROW and nothing in the request says who it is.
+    """
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    store = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = 'webflow'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Connected Webflow store not found")
+    store = dict(store)
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
+        raise HTTPException(status_code=403, detail="Can only manage your own store")
+    return store
+
+
+@router.post("/webflow/{store_id}/webhooks/ensure")
+async def ensure_webflow_webhooks_route(
+    store_id: str,
+    rotate: bool = Query(default=False),
+    current_user: dict = Depends(get_current_user),
+):
+    """Register the Webflow webhooks that feed `/webhooks/webflow/{id}/{secret}`.
+
+    THE ORDER OF THE TWO WRITES IS THE WHOLE DESIGN. The URL secret is minted
+    and PERSISTED first, then the webhook carrying it is registered at Webflow,
+    then the webhook ids are persisted. A failure after the first write leaves a
+    stored secret and no webhook — harmless ON FIRST PROVISIONING, and fixed by
+    re-running this. The opposite order would leave Webflow delivering to a URL
+    whose secret was never stored, and the receiver would answer 401 to every
+    delivery forever.
+
+    `rotate=true` mints a NEW secret, which changes the registered URL. In-flight
+    deliveries to the old URL will 401; Webflow retries them and the
+    reconciliation sweep recovers anything that never lands. Without `rotate`,
+    an existing secret is REUSED, so this is safe to re-run.
+
+    A ROTATION IS THE CASE WHERE "harmless" DOES NOT HOLD, because the store had
+    a WORKING webhook to lose: the live webhook still carries the old secret,
+    the new one is already persisted, and a 502/504 in between silences the
+    store until somebody re-runs this. So a registration failure during a
+    rotation restores the superseded secret (`_roll_back_rotation`). What that
+    cannot cover is the process dying between the two — documented as a residual
+    in docs/WEBFLOW_TELEMETRY.md rather than claimed away.
+
+    The secret is never returned, and NO logger this process writes holds it:
+    the app's structured access log, the rate limiter's ceiling warning and
+    `uvicorn.access` all pass the path through
+    `middleware/structured_logging.py::redact_path`. The load balancer's
+    `httpRequest.requestUrl` is the one surface left, and it is the reason to
+    configure `WEBFLOW_CLIENT_SECRET` — see `_webflow_webhook_endpoint`.
+    """
+    store = await _webflow_store_for_caller(store_id, current_user)
+
+    from services.webflow_connection import (
+        merge_webflow_credentials,
+        mint_url_secret,
+        parse_webflow_credentials,
+    )
+    from routes.webflow_webhooks import webflow_bytes_equal
+    from services.webflow_event_adapter import WEBFLOW_ORDER_TRIGGERS
+    from services.webflow_webhook_subscriptions import (
+        WebflowWebhookError,
+        WebflowWebhookScopeError,
+        delete_webflow_webhook,
+        ensure_webflow_webhooks,
+    )
+
+    credentials = parse_webflow_credentials(store.get("api_key"))
+    api_token = str(credentials.get("api_token") or "").strip()
+    site_id = str(credentials.get("site_id") or "").strip()
+    if not api_token:
+        raise HTTPException(
+            status_code=409,
+            detail="This Webflow store has no API token; reconnect it",
+        )
+    if not site_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Webflow store has no site_id binding; reconnect it so "
+                "orders can be read from the site they belong to"
+            ),
+        )
+
+    resolved_store_id = str(store["store_id"])
+    # Check-and-add with no `await` between them, so this is atomic on the event
+    # loop without a lock of its own. Two ensures racing would register two
+    # different URLs, and only the last-persisted secret authenticates.
+    if resolved_store_id in _WEBFLOW_ENSURES_IN_FLIGHT:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "ensure_already_running",
+                "message": (
+                    "A Webflow webhook provisioning run is already in flight for "
+                    "this store; wait for it rather than racing it on the same "
+                    "URL secret."
+                ),
+                "store_id": resolved_store_id,
+            },
+        )
+    _WEBFLOW_ENSURES_IN_FLIGHT.add(resolved_store_id)
+    try:
+        # The secret this run REPLACED, captured inside the merge's critical
+        # section, and empty unless a working one was actually superseded. It is
+        # what makes a failed ROTATION recoverable: see `_roll_back_rotation`.
+        superseded: dict = {}
+
+        def _mint(blob: dict) -> dict:
+            """Mint only when there is nothing usable, unless asked to rotate.
+
+            Reusing a working secret is what makes this endpoint idempotent, and
+            idempotence is what makes it safe to re-run after a partial failure.
+            """
+            current = str(blob.get("url_secret") or "").strip()
+            if rotate or not current:
+                if current:
+                    superseded["secret"] = current
+                blob["url_secret"] = mint_url_secret()
+            return blob
+
+        # `db=database` explicitly, the same as connect: this module's handle is
+        # the one the route's own reads go through, so the merge and the lookup
+        # can never end up talking to two different databases.
+        persisted = await merge_webflow_credentials(
+            store_id=resolved_store_id, mutate=_mint, db=database
+        )
+        url_secret = str(persisted.get("url_secret") or "").strip()
+        if not url_secret:
+            raise HTTPException(
+                status_code=503, detail="Webflow webhook secret could not be persisted"
+            )
+        prefix, callback_url = _webflow_webhook_endpoint(resolved_store_id, url_secret)
+        triggers = list(WEBFLOW_ORDER_TRIGGERS)
+
+        async def _roll_back_rotation() -> None:
+            """Put the SUPERSEDED secret back when a rotation could not register.
+
+            "A crash between persist and register is harmless" is true only on
+            FIRST provisioning, where the store had no working webhook to lose.
+            On a rotation it is the opposite: the live webhook still carries the
+            OLD secret, the new one is already persisted, and every delivery
+            401s until somebody re-runs this — the store goes silent and only
+            the sweep recovers it.
+
+            So a registration failure restores the secret Webflow is actually
+            delivering with. Guarded on the stored value still being the one
+            THIS run minted, so a concurrent writer is never clobbered by the
+            rollback, and swallowed on failure because the caller is already
+            answering an error.
+            """
+            previous = str(superseded.get("secret") or "").strip()
+            if not previous:
+                return
+
+            def _restore(blob: dict) -> dict:
+                # BYTES, through the receiver's own helper. `hmac.compare_digest`
+                # on `str` raises TypeError above code point 0x7F, and the
+                # stored value is whatever is in the blob — a hand-edited or
+                # migrated cell holding a non-ASCII string would turn this
+                # rollback into an unhandled 500 ON TOP of the failure it exists
+                # to repair, leaving the store silent with no secret restored. A
+                # mismatch is what it should be: a mismatch.
+                current = str(blob.get("url_secret") or "").strip()
+                if webflow_bytes_equal(current, url_secret):
+                    blob["url_secret"] = previous
+                return blob
+
+            try:
+                await merge_webflow_credentials(
+                    store_id=resolved_store_id, mutate=_restore, db=database
+                )
+                logger.info(
+                    "webflow_webhooks_ensure action=rotation_rolled_back store_id=%s "
+                    "store_merchant_id=%s actor_role=%s actor_user_id=%s",
+                    resolved_store_id,
+                    store.get("merchant_id") or "-",
+                    current_user.get("role") or "-",
+                    current_user.get("sub") or "-",
+                )
+            except Exception:
+                logger.warning(
+                    "webflow_webhooks_ensure could not roll back a failed rotation "
+                    "store_id=%s — the store's webhooks now carry a secret this "
+                    "deployment no longer holds and every delivery will 401 until "
+                    "ensure is re-run",
+                    resolved_store_id,
+                )
+
+        try:
+            async with asyncio.timeout(WEBFLOW_ENSURE_TIMEOUT_SECONDS):
+                async with _WEBFLOW_WEBHOOK_INSTALL_CONCURRENCY:
+                    result = await ensure_webflow_webhooks(
+                        api_token=api_token,
+                        site_id=site_id,
+                        callback_url=callback_url,
+                        trigger_types=triggers,
+                        store_path_prefix=prefix,
+                    )
+        except WebflowWebhookScopeError as exc:
+            await _roll_back_rotation()
+            logger.info(
+                "webflow_webhooks_ensure action=scope_required store_id=%s "
+                "store_merchant_id=%s actor_role=%s actor_user_id=%s",
+                resolved_store_id,
+                store.get("merchant_id") or "-",
+                current_user.get("role") or "-",
+                current_user.get("sub") or "-",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "scope_required",
+                    "message": str(exc),
+                    "required_scopes": list(WebflowWebhookScopeError.required_scopes),
+                    "store_id": resolved_store_id,
+                    "reconcile_path": f"/integrations/webflow/{resolved_store_id}/reconcile",
+                },
+            ) from exc
+        except WebflowWebhookError as exc:
+            await _roll_back_rotation()
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except httpx.HTTPError as exc:
+            await _roll_back_rotation()
+            raise HTTPException(
+                status_code=502, detail="Webflow webhook management request failed"
+            ) from exc
+        except TimeoutError as exc:
+            await _roll_back_rotation()
+            raise HTTPException(
+                status_code=504, detail="Webflow webhook installation timed out"
+            ) from exc
+
+        stored = await merge_webflow_credentials(
+            store_id=resolved_store_id,
+            updates={"webhook_ids": dict(result.webhook_ids)},
+            db=database,
+        )
+        stored_secret = str(stored.get("url_secret") or "").strip()
+        # BYTES, through the receiver's own helper, for the same reason as
+        # `_restore` above: a non-ASCII stored value must be a MISMATCH (which
+        # discards the webhooks and answers 409) rather than a TypeError, which
+        # would 500 with the webhooks left delivering into a wall.
+        if not webflow_bytes_equal(stored_secret, url_secret):
+            # Another writer replaced the secret between the two merges. The
+            # webhooks just registered carry a URL the receiver will now 401, so
+            # they are removed rather than left delivering into a wall.
+            discarded = sorted(
+                str(webhook_id) for webhook_id in result.webhook_ids.values()
+            )
+            for webhook_id in result.webhook_ids.values():
+                await _discard_webflow_webhook(
+                    api_token, webhook_id, delete_webflow_webhook
+                )
+            # The same principal fields as `scope_required` and `provisioned`,
+            # mirroring the Squarespace branch above. A lost race is the one
+            # outcome where webhooks were created at Webflow and then DELETED
+            # again, so the audit trail needs to name who caused that at least
+            # as much as it does for the outcomes that leave something behind.
+            logger.info(
+                "webflow_webhooks_ensure action=lost_race store_id=%s "
+                "store_merchant_id=%s actor_role=%s actor_user_id=%s "
+                "discarded_webhook_ids=%s",
+                resolved_store_id,
+                store.get("merchant_id") or "-",
+                current_user.get("role") or "-",
+                current_user.get("sub") or "-",
+                ",".join(discarded) or "-",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The Webflow URL secret changed while this provisioning ran; "
+                    "re-run it"
+                ),
+            )
+
+        logger.info(
+            "webflow_webhooks_ensure action=provisioned store_id=%s "
+            "store_merchant_id=%s actor_role=%s actor_user_id=%s rotated=%s "
+            "created=%s reused=%s removed=%s removal_failures=%s",
+            resolved_store_id,
+            store.get("merchant_id") or "-",
+            current_user.get("role") or "-",
+            current_user.get("sub") or "-",
+            bool(rotate),
+            ",".join(result.created_trigger_types) or "-",
+            ",".join(result.reused_trigger_types) or "-",
+            len(result.removed_webhook_ids),
+            result.stale_removal_failures,
+        )
+        return {
+            "status": "success",
+            "store_id": resolved_store_id,
+            "site_id": site_id,
+            # The URL itself carries the secret, so neither is returned.
+            "secret_provisioned": True,
+            "secret_rotated": bool(rotate),
+            "webhooks": [
+                {"trigger_type": trigger, "webhook_id": webhook_id}
+                for trigger, webhook_id in sorted(result.webhook_ids.items())
+            ],
+            "created": result.created_trigger_types,
+            "reused": result.reused_trigger_types,
+            "removed_stale": len(result.removed_webhook_ids),
+            "stale_removal_failures": result.stale_removal_failures,
+        }
+    finally:
+        _WEBFLOW_ENSURES_IN_FLIGHT.discard(resolved_store_id)
+
+
+async def _discard_webflow_webhook(api_token, webhook_id, delete) -> None:
+    """Best-effort removal of a webhook whose URL we cannot authenticate.
+
+    A failure here is logged and swallowed: the caller is already answering an
+    error, and raising a second failure over the first would hide what happened.
+    """
+    try:
+        await delete(api_token=api_token, webhook_id=webhook_id)
+    except Exception:
+        logger.warning(
+            "webflow_webhooks_ensure could not discard webhook_id=%s", webhook_id or "-"
+        )
+
+
+@router.post("/webflow/{store_id}/reconcile")
+async def run_webflow_reconciliation(
+    store_id: str,
+    apply: bool = Query(default=True),
+    overlap_minutes: int = Query(default=60, ge=0, le=10080),
+    max_pages: int = Query(default=10, ge=1, le=200),
+    page_limit: int = Query(default=100, ge=1, le=100),
+    lane: Optional[List[str]] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """Run the Orders-list reconciliation sweep for one store, now.
+
+    The authenticated face of `scripts/sweep_webflow_orders.py`. Both exist
+    because neither scheduling surface in this repo ships this lane on merge —
+    see the scheduling section of docs/WEBFLOW_TELEMETRY.md.
+
+    Two guards wrap the sweep, both because it is an unbounded outbound loop over
+    somebody else's API. A per-store lock answers 409 rather than letting two
+    sweeps of the same store interleave: they would race on the same
+    `reconciliation` cell, and the loser's offsets would be re-read or skipped
+    depending on which merge landed last. The timeout bounds the request itself,
+    so a sweep against a slow upstream cannot hold the connection until the proxy
+    gives up.
+    """
+    store = await _webflow_store_for_caller(store_id, current_user)
+
+    from services.webflow_order_sweep import WebflowSweepError, sweep_webflow_store
+
+    resolved_store_id = str(store["store_id"])
+    # Check-and-add with no `await` between them, so this is atomic on the event
+    # loop without a lock of its own.
+    if resolved_store_id in _WEBFLOW_SWEEPS_IN_FLIGHT:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "sweep_already_running",
+                "message": (
+                    "A Webflow reconciliation sweep is already running for this "
+                    "store; wait for it to finish rather than racing it on the "
+                    "same cursor."
+                ),
+                "store_id": resolved_store_id,
+            },
+        )
+    _WEBFLOW_SWEEPS_IN_FLIGHT.add(resolved_store_id)
+    try:
+        async with asyncio.timeout(WEBFLOW_RECONCILE_TIMEOUT_SECONDS):
+            return await sweep_webflow_store(
+                store_id=resolved_store_id,
+                apply=apply,
+                overlap_minutes=overlap_minutes,
+                max_pages=max_pages,
+                page_limit=page_limit,
+                lanes=lane,
+            )
+    except WebflowSweepError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        # The cursors are untouched: the sweep persists them only after the whole
+        # lane loop completes, so a timeout re-reads rather than skips.
+        raise HTTPException(
+            status_code=504, detail="Webflow reconciliation sweep timed out"
+        ) from exc
+    finally:
+        _WEBFLOW_SWEEPS_IN_FLIGHT.discard(resolved_store_id)
+
+
 @router.post("/prestashop/connect")
 async def merchant_connect_prestashop(
     request: ConnectPrestaShopRequest,
     current_user: dict = Depends(get_current_user)
 ):
     """Allow merchant to connect their PrestaShop store"""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    if current_user["role"] == "merchant":
-        if current_user.get("merchant_id") != request.merchant_id:
-            raise HTTPException(status_code=403, detail="Can only connect your own store")
+    if not can_access_merchant(current_user, request.merchant_id):
+        raise HTTPException(status_code=403, detail="Can only connect your own store")
     
     try:
         if not request.store_url or not request.api_key:
@@ -2393,25 +4339,50 @@ async def merchant_connect_prestashop(
         
         logger.info(f"✅ PrestaShop credentials verified for {request.store_url}")
         
-        # Check if store already exists
+        # Check if store already exists. `api_key` is SELECTed too, not just
+        # `store_id`: that cell is a credential BLOB once telemetry has been
+        # provisioned -- `{"api_key": ..., "webhook_secret": ...}` -- and the
+        # telemetry secret is the only copy Pivota has (the merchant holds the
+        # other, pasted into the module).
         existing_store = await database.fetch_one(
-            """SELECT store_id FROM merchant_stores 
+            """SELECT store_id, api_key FROM merchant_stores
                WHERE merchant_id = :merchant_id AND platform = 'prestashop' AND domain = :domain""",
             {"merchant_id": request.merchant_id, "domain": request.store_url}
         )
-        
+
         if existing_store:
-            # Update existing store
+            # Update existing store. READ-MODIFY-WRITE, not an overwrite: this
+            # UPDATE used to put the bare Webservice key over the whole cell,
+            # which destroyed the `webhook_secret`
+            # `ensure_prestashop_telemetry` had minted. After that the receiver
+            # answered every signed module delivery with 401, and the module --
+            # which cannot tell a rotated secret from an outage -- burned its
+            # 20-attempt budget and dropped the events. Reconnecting a shop is
+            # a routine thing to do; silently disarming its telemetry is not.
+            existing_store = dict(existing_store)
+            preserved = _prestashop_credentials(existing_store.get("api_key"))
+            preserved.pop("api_key", None)
+            stored_api_key = (
+                json.dumps({"api_key": request.api_key, **preserved}, separators=(",", ":"))
+                if preserved
+                # Nothing to preserve: keep the plain-string shape this column
+                # has always had for a store with no telemetry, so the generic
+                # `parse_api_key` readers see exactly what they see today.
+                else request.api_key
+            )
             await database.execute(
-                """UPDATE merchant_stores 
+                """UPDATE merchant_stores
                    SET api_key = :api_key, status = 'active', last_sync = CURRENT_TIMESTAMP,
                        connected_at = CURRENT_TIMESTAMP
                    WHERE store_id = :store_id""",
-                {"store_id": existing_store["store_id"], "api_key": request.api_key}
+                {"store_id": existing_store["store_id"], "api_key": stored_api_key}
             )
             store_id = existing_store["store_id"]
         else:
-            # Insert new store
+            # Insert new store. No telemetry secret can exist for a store row
+            # that does not exist yet, so the bare key is written as-is;
+            # `ensure_prestashop_telemetry` migrates the cell to the blob shape
+            # the first time it mints.
             store_id = f"store_{request.merchant_id[:8]}_{int(datetime.now().timestamp())}"
             await database.execute(
                 """INSERT INTO merchant_stores 
@@ -2441,20 +4412,213 @@ async def merchant_connect_prestashop(
         raise HTTPException(status_code=500, detail=f"Failed to connect PrestaShop: {str(e)}")
 
 
+class EnsurePrestaShopTelemetryRequest(BaseModel):
+    """Body of the PrestaShop telemetry provisioning call.
+
+    `rotate` is the only knob: it mints a NEW secret and returns it once,
+    which is what a merchant does after the old one leaked or after moving
+    the shop.
+    """
+
+    rotate: bool = False
+
+
+def _prestashop_credentials(raw: object) -> dict:
+    """The credential JSON in `merchant_stores.api_key`.
+
+    `merchant_connect_prestashop` persists the BARE Webservice key (a plain
+    string, not JSON), so a store connected before telemetry existed is
+    migrated here to `{"api_key": "<the bare key>"}` rather than having its
+    key destroyed by the secret write.
+    """
+    if isinstance(raw, dict):
+        return dict(raw)
+    value = str(raw or "").strip()
+    if not value:
+        return {}
+    if not value.startswith("{"):
+        return {"api_key": value}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"api_key": value}
+    return dict(parsed) if isinstance(parsed, dict) else {"api_key": value}
+
+
+def _prestashop_telemetry_endpoint(store_id: str) -> str:
+    return (
+        f"{resolve_public_api_base_url().rstrip('/')}"
+        f"/webhooks/prestashop/{quote(store_id, safe='')}"
+    )
+
+
+@router.post("/prestashop/{store_id}/telemetry/ensure")
+async def ensure_prestashop_telemetry(
+    store_id: str,
+    request: EnsurePrestaShopTelemetryRequest = Body(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """Mint the shared secret the PrestaShop module signs its batches with.
+
+    PrestaShop is the one platform where the secret has to reach a HUMAN:
+    there is no OAuth handshake and no webhook API to register a callback
+    through, so the merchant pastes this value into the module's configuration
+    page. That forces a different lifecycle from `ensure_bigcommerce_webhooks`,
+    which never returns its secret because the server installs the hooks
+    itself:
+
+    * the call that MINTS the secret returns it, exactly once;
+    * every later call returns `secret_provisioned: true` and no secret;
+    * `{"rotate": true}` mints a replacement and returns that one once.
+
+    A merchant who loses the value rotates; there is no read-back path, and
+    the secret is never logged.
+
+    Because the secret LEAVES the system here, the two paths that return one
+    (the first mint and a rotation) are held to `MERCHANT_OR_ADMIN_ROLES`, not
+    to the whole staff tier `can_access_merchant` waves through: every employee
+    role could otherwise mint a per-store signing credential for any merchant,
+    or rotate a live one and silently sever a shop's telemetry until a human
+    re-pastes it. The wider staff tier still reaches the read-only answer
+    (`secret_provisioned: true/false`). Every call is logged with the actor,
+    the target and what it did -- never the value.
+    """
+    if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    store = await database.fetch_one(
+        """
+        SELECT store_id, merchant_id, domain, api_key
+        FROM merchant_stores
+        WHERE store_id = :store_id
+          AND platform = 'prestashop'
+          AND lower(COALESCE(status, 'active')) IN ('active', 'connected')
+        """,
+        {"store_id": store_id},
+    )
+    if not store:
+        raise HTTPException(status_code=404, detail="Connected PrestaShop store not found")
+    store = dict(store)
+    # The owning merchant is a property of the ROW: `store_id` is
+    # caller-supplied and the SELECT above keys on it alone.
+    if not can_access_merchant(current_user, str(store.get("merchant_id") or "")):
+        raise HTTPException(status_code=403, detail="Can only manage your own store")
+
+    rotate = bool(request.rotate) if request is not None else False
+    credentials = _prestashop_credentials(store.get("api_key"))
+    existing_secret = str(credentials.get("webhook_secret") or "").strip()
+    endpoint = _prestashop_telemetry_endpoint(store_id)
+
+    def _audit(action: str) -> None:
+        """One line per call: who, which store, what happened.
+
+        This route mints, rotates and hands out a per-store SIGNING credential
+        and staff roles can reach any merchant's store, so a call that leaves
+        no trace is an untraceable credential event. The secret itself is
+        never an argument here -- `secret_provisioned` is a boolean.
+        """
+        logger.info(
+            "prestashop_telemetry_ensure action=%s store_id=%s store_merchant_id=%s "
+            "actor_role=%s actor_user_id=%s actor_merchant_id=%s rotate_requested=%s "
+            "secret_was_provisioned=%s",
+            action,
+            store_id,
+            store.get("merchant_id") or "-",
+            current_user.get("role") or "-",
+            current_user.get("sub") or "-",
+            current_user.get("merchant_id") or "-",
+            rotate,
+            bool(existing_secret),
+        )
+
+    # The secret-RETURNING paths are owner-or-admin only. Reading the state is
+    # not: an employee troubleshooting a shop may still ask whether it is
+    # provisioned, they just cannot cause a value to be handed out, and cannot
+    # rotate one -- a rotation is a silent telemetry outage for the shop until
+    # a human re-pastes the new value into the module.
+    if (rotate or not existing_secret) and current_user.get("role") not in MERCHANT_OR_ADMIN_ROLES:
+        _audit("denied_rotate" if rotate else "denied_mint")
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only the merchant or an admin may mint or rotate the "
+                "PrestaShop telemetry secret"
+            ),
+        )
+
+    if existing_secret and not rotate:
+        # The secret exists and this call did not mint it, so it is not ours to
+        # hand out again. Rotation is the only way back to a readable value.
+        _audit("noop")
+        return {
+            "status": "success",
+            "store_id": store_id,
+            "endpoint": endpoint,
+            "shop_url": store.get("domain"),
+            "secret_provisioned": True,
+        }
+
+    minted = secrets.token_urlsafe(32)
+    await database.execute(
+        """
+        UPDATE merchant_stores
+        SET api_key = :api_key
+        WHERE store_id = :store_id
+        """,
+        {
+            "store_id": store_id,
+            "api_key": json.dumps(
+                {**credentials, "webhook_secret": minted}, separators=(",", ":")
+            ),
+        },
+    )
+    # Two first-time calls (or two rotations) can race and the last UPDATE
+    # wins. The merchant must paste the secret the RECEIVER will hold, so
+    # re-read the row and return whatever actually persisted; the loser's
+    # minted value is discarded, never shown. `databases`+asyncpg reports no
+    # rowcount from an UPDATE, so the re-read is also the only proof the write
+    # landed at all.
+    persisted = await database.fetch_one(
+        "SELECT api_key FROM merchant_stores WHERE store_id = :store_id",
+        {"store_id": store_id},
+    )
+    persisted_secret = str(
+        _prestashop_credentials(dict(persisted).get("api_key") if persisted else None)
+        .get("webhook_secret")
+        or ""
+    ).strip()
+    if not persisted_secret:
+        _audit("mint_failed")
+        raise HTTPException(
+            status_code=503, detail="PrestaShop telemetry secret could not be persisted"
+        )
+    _audit("rotated" if existing_secret else "minted")
+    return {
+        "status": "success",
+        "store_id": store_id,
+        "endpoint": endpoint,
+        "shop_url": store.get("domain"),
+        # The ONE response that carries it. Nothing logs this value.
+        "secret": persisted_secret,
+        "secret_provisioned": True,
+        "rotated": bool(existing_secret),
+    }
+
+
+
 @router.post("/stores/support-email")
 async def merchant_update_store_support_email(
     request: UpdateStoreSupportEmailRequest,
     current_user: dict = Depends(get_current_user),
 ):
     """Allow merchant to set a support email for review invitations."""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = request.merchant_id or current_user.get("merchant_id")
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
 
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only update your own store")
 
     support_email = (request.support_email or "").strip() or None
@@ -2464,11 +4628,7 @@ async def merchant_update_store_support_email(
         except ValidationError:
             raise HTTPException(status_code=400, detail="Invalid support_email")
 
-    # Backward compatibility: column may not exist on some deployments.
-    try:
-        await database.execute("ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS support_email TEXT")
-    except Exception:
-        pass
+    await _ensure_support_email_column()
 
     store_row = await database.fetch_one(
         """
@@ -2503,20 +4663,16 @@ async def merchant_get_store_support_email(
     current_user: dict = Depends(get_current_user),
 ):
     """Get the current (and effective) support email used for review invitations."""
-    if current_user["role"] not in ["merchant", "employee", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     target_merchant_id = (merchant_id or "").strip() or (current_user.get("merchant_id") or "").strip()
     if not target_merchant_id:
         raise HTTPException(status_code=400, detail="merchant_id is required")
-    if current_user["role"] == "merchant" and current_user.get("merchant_id") != target_merchant_id:
+    if not can_access_merchant(current_user, target_merchant_id):
         raise HTTPException(status_code=403, detail="Can only view your own store")
 
-    # Backward compatibility: column may not exist on some deployments.
-    try:
-        await database.execute("ALTER TABLE merchant_stores ADD COLUMN IF NOT EXISTS support_email TEXT")
-    except Exception:
-        pass
+    await _ensure_support_email_column()
 
     store_row = await database.fetch_one(
         """

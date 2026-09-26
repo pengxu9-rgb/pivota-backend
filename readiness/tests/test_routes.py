@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pytest
 from fastapi import FastAPI
@@ -89,7 +90,11 @@ def _build_test_client(monkeypatch, *, psp_enabled: bool, include_error_handler:
     from readiness import order_sync as readiness_order_sync
     from routes.readiness_internal import router as readiness_router
 
-    readiness_order_sync._default_journal = InMemoryReadinessJournal()
+    # monkeypatch, not a bare assignment: a direct write replaces the module-level
+    # DatabaseReadinessJournal for the REST OF THE PYTEST PROCESS. Harmless only
+    # while file order keeps a later reader from seeing it -- and un-quarantining
+    # this file is exactly the kind of change that alters what runs after it.
+    monkeypatch.setattr(readiness_order_sync, "_default_journal", InMemoryReadinessJournal())
     app = FastAPI()
     if include_error_handler:
         app.add_middleware(ErrorHandlerMiddleware)
@@ -174,6 +179,7 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
         blocked_only: bool = False,
         low_quality_only: bool = False,
         sort_by: str = "default",
+        segment: str = "all",
     ):
         assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
         assert force_refresh is False
@@ -187,6 +193,7 @@ def test_merchant_readiness_optimization_route_returns_payload(monkeypatch):
         assert blocked_only is False
         assert low_quality_only is False
         assert sort_by == "default"
+        assert segment == "all"
         return MerchantReadinessOptimizationPayload.model_validate(
             {
                 "plan": {
@@ -348,6 +355,7 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
         blocked_only: bool = False,
         low_quality_only: bool = False,
         sort_by: str = "default",
+        segment: str = "all",
     ):
         assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
         assert force_refresh is True
@@ -360,6 +368,9 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
         assert blocked_only is False
         assert low_quality_only is False
         assert sort_by == "default"
+        # A NON-default value, sent by the request below: asserting "all" here
+        # would pass whether or not the route forwards the field at all.
+        assert segment == "in_store"
         return MerchantReadinessOptimizationPayload.model_validate(
             {
                 "plan": {
@@ -410,7 +421,7 @@ def test_merchant_readiness_refresh_route_returns_latest_plan(monkeypatch):
 
     response = route_client.post(
         "/merchant/readiness/actions/refresh",
-        json={"scope": "merchant", "reason": "manual"},
+        json={"scope": "merchant", "reason": "manual", "segment": "in_store"},
     )
 
     assert response.status_code == 200
@@ -439,6 +450,7 @@ def test_merchant_readiness_optimization_route_forwards_page_params(monkeypatch)
         blocked_only: bool = False,
         low_quality_only: bool = False,
         sort_by: str = "default",
+        segment: str = "all",
     ):
         assert merchant_id == DEFAULT_ALPHA_MERCHANT_ID
         assert force_refresh is False
@@ -451,6 +463,7 @@ def test_merchant_readiness_optimization_route_forwards_page_params(monkeypatch)
         assert blocked_only is True
         assert low_quality_only is True
         assert sort_by == "cq_desc"
+        assert segment == "fix_here"
         return MerchantReadinessOptimizationPayload.model_validate(
             {
                 "plan": {
@@ -520,6 +533,7 @@ def test_merchant_readiness_optimization_route_forwards_page_params(monkeypatch)
             "blocked_only": "true",
             "low_quality_only": "true",
             "sort_by": "cq_desc",
+            "segment": "fix_here",
         },
     )
 
@@ -2044,16 +2058,30 @@ async def _exercise_readiness_payment_intent_probe(
     merchant_id: str,
     allowlist: str,
     test_psp_probe: bool,
+    probe_enabled: Optional[str] = "1",
+    psp_mode: str = "stripe_checkout",
 ):
     from adapters.psp_adapter import PaymentIntent
     from readiness import order_sync as readiness_order_sync
     from readiness import service as readiness_service
 
-    monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", "1")
+    # `probe_enabled` and `psp_mode` are parameters, not constants: each of the
+    # three conjuncts in _resolve_checkout_live_readiness_requirement needs to be
+    # varied on its own, or a mutant that deletes one of them survives the suite.
+    #
+    # probe_enabled=None means the var is ABSENT, not present-and-empty. The
+    # distinction is load-bearing: os.getenv's default argument is only consulted
+    # when the name is unset, so a caller that setenv()s "" tests the empty-token
+    # path and leaves the default itself unpinned -- a fail-open default of "1"
+    # would survive. Deleting the name is the only way to reach it.
+    if probe_enabled is None:
+        monkeypatch.delenv("ALLOW_TEST_PSP_PROBE", raising=False)
+    else:
+        monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", probe_enabled)
     monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", allowlist)
 
     journal = InMemoryReadinessJournal()
-    readiness_order_sync._default_journal = journal
+    monkeypatch.setattr(readiness_order_sync, "_default_journal", journal)
     checkout = await journal.create_checkout_session(
         merchant_id=merchant_id,
         channel="ucp",
@@ -2143,7 +2171,7 @@ async def _exercise_readiness_payment_intent_probe(
         merchant_id,
         checkout.checkout_id,
         preferred_psps=["stripe"],
-        psp_mode="stripe_checkout",
+        psp_mode=psp_mode,
         test_psp_probe=test_psp_probe,
     )
     return result, create_calls
@@ -2178,6 +2206,144 @@ async def test_readiness_payment_intent_non_allowlisted_test_probe_fails_closed(
     detail = exc.value.args[0]
     assert detail["code"] == "PAYMENT_FAILED"
     assert "live readiness required" in detail["message"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_payment_intent_probe_fails_closed_when_master_switch_off(monkeypatch):
+    """ALLOW_TEST_PSP_PROBE off must keep live-readiness ENFORCED.
+
+    This is the default-OFF kill switch. Everything else about the request is
+    sanctioned -- allowlisted merchant, explicit probe request -- so this test
+    isolates the env-flag conjunct and nothing else.
+    """
+    with pytest.raises(ValueError) as exc:
+        await _exercise_readiness_payment_intent_probe(
+            monkeypatch,
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            allowlist=f"merch_other, {DEFAULT_ALPHA_MERCHANT_ID}",
+            test_psp_probe=True,
+            probe_enabled="0",
+        )
+
+    detail = exc.value.args[0]
+    assert detail["code"] == "PAYMENT_FAILED"
+    assert "live readiness required" in detail["message"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_payment_intent_probe_fails_closed_when_switch_unset(monkeypatch):
+    """An ABSENT ALLOW_TEST_PSP_PROBE is not a permissive one: the default is OFF.
+
+    Distinct from the "0" test above, which exercises the token check. This one
+    pins os.getenv's DEFAULT argument, reachable only when the name is unset --
+    flipping that default to "1" makes the probe fail OPEN on any host that never
+    set the variable, which is every host by design.
+    """
+    with pytest.raises(ValueError) as exc:
+        await _exercise_readiness_payment_intent_probe(
+            monkeypatch,
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            allowlist=f"merch_other, {DEFAULT_ALPHA_MERCHANT_ID}",
+            test_psp_probe=True,
+            probe_enabled=None,
+        )
+
+    detail = exc.value.args[0]
+    assert detail["code"] == "PAYMENT_FAILED"
+    assert "live readiness required" in detail["message"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_payment_intent_without_explicit_probe_request_enforces_live_readiness(monkeypatch):
+    """No explicit probe request => enforcement stays on, even for an allowlisted merchant.
+
+    The switch is ON and the merchant IS allowlisted here, so being allowlisted
+    must not by itself relax live-readiness -- the caller has to ask.
+    """
+    with pytest.raises(ValueError) as exc:
+        await _exercise_readiness_payment_intent_probe(
+            monkeypatch,
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            allowlist=f"merch_other, {DEFAULT_ALPHA_MERCHANT_ID}",
+            test_psp_probe=False,
+            probe_enabled="1",
+            psp_mode="stripe_checkout",
+        )
+
+    detail = exc.value.args[0]
+    assert detail["code"] == "PAYMENT_FAILED"
+    assert "live readiness required" in detail["message"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_payment_intent_probe_psp_mode_token_is_an_explicit_request(monkeypatch):
+    """psp_mode=test_psp_probe is the other spelling of an explicit probe request."""
+    result, create_calls = await _exercise_readiness_payment_intent_probe(
+        monkeypatch,
+        merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+        allowlist=DEFAULT_ALPHA_MERCHANT_ID,
+        test_psp_probe=False,
+        probe_enabled="1",
+        psp_mode="test_psp_probe",
+    )
+
+    assert result["payment_intent_id"] == "pi_alpha_probe_1"
+    assert create_calls[0]["enforce_live_readiness"] is False
+
+
+@pytest.mark.asyncio
+async def test_readiness_probe_gate_reads_the_canonical_order_routes_helpers(monkeypatch):
+    """readiness must not re-fork the two env readers it once duplicated.
+
+    Patching the CANONICAL helpers in routes.order_routes has to change the
+    readiness lane's decision. If readiness reintroduces private copies, these
+    patches stop reaching it and the assertions below fail -- which is the point:
+    this pins the wiring, not just the behavior.
+    """
+    from readiness import service as readiness_service
+    from routes import order_routes
+
+    monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", "1")
+    monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", DEFAULT_ALPHA_MERCHANT_ID)
+
+    # Sanity: with the real canonical helpers, this request is granted the bypass.
+    assert (
+        readiness_service._resolve_checkout_live_readiness_requirement(
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            psp_mode="stripe_checkout",
+            test_psp_probe=True,
+        )
+        is False
+    )
+
+    monkeypatch.setattr(order_routes, "_test_psp_probe_enabled", lambda: False)
+    assert (
+        readiness_service._resolve_checkout_live_readiness_requirement(
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            psp_mode="stripe_checkout",
+            test_psp_probe=True,
+        )
+        is True
+    ), (
+        "patching routes.order_routes did not change the readiness decision: the ALLOW_TEST_PSP_PROBE\n"
+        "reader must be resolved from the canonical module at CALL time, not copied or "
+        "bound at import"
+    )
+
+    monkeypatch.setattr(order_routes, "_test_psp_probe_enabled", lambda: True)
+    monkeypatch.setattr(order_routes, "_test_psp_probe_merchants", lambda: {"merch_someone_else"})
+    assert (
+        readiness_service._resolve_checkout_live_readiness_requirement(
+            merchant_id=DEFAULT_ALPHA_MERCHANT_ID,
+            psp_mode="stripe_checkout",
+            test_psp_probe=True,
+        )
+        is True
+    ), (
+        "patching routes.order_routes did not change the readiness decision: the TEST_PSP_PROBE_MERCHANTS\n"
+        "reader must be resolved from the canonical module at CALL time, not copied or "
+        "bound at import"
+    )
 
 
 def test_payment_status_sync_requires_existing_payment_intent(monkeypatch):
@@ -2971,3 +3137,245 @@ def test_order_sync_replay_reconciles_cancelled_order_state(monkeypatch):
     assert sync_2_json["replayed"] is True
     event_types = [event["event_type"] for event in sync_2_json["events"]]
     assert "merchant_cancellation_observed" in event_types
+
+
+def test_refund_defers_an_unwritable_transaction_mirror_to_the_durable_queue(monkeypatch):
+    """This surface answers 200 with the refusal embedded and has no retrier of
+    its own, so `ensure_external_refund_transaction_best_effort` refusing to
+    write (it cannot read the existing list, so it cannot rule out a duplicate)
+    would otherwise mean the refund is never mirrored to the merchant at all."""
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import service as readiness_service
+    import db.merchant_order_sync_jobs as sync_jobs
+
+    order_state = {
+        "order_id": "ORD_ALPHA_REFUND_DEFER",
+        "shopify_order_id": None,
+        "status": "paid",
+        "payment_status": "paid",
+        "payment_intent_id": "pi_alpha_refund_defer",
+        "client_secret": "cs_alpha_refund_defer",
+        "psp_used": "stripe",
+        "store_id": "st_alpha",
+        "metadata": {"shopify_parent_transaction_id": 1444},
+        "total": 29.0,
+        "currency": "USD",
+        "total_refunded": 0,
+    }
+    enqueued = []
+
+    async def fake_create_order(_order_data):
+        return "ORD_ALPHA_REFUND_DEFER"
+
+    async def fake_get_order(_order_id: str):
+        return dict(order_state)
+
+    async def fake_update_fulfillment_info(order_id: str, shopify_order_id=None, **_kwargs):
+        order_state["shopify_order_id"] = shopify_order_id
+        return True
+
+    async def fake_create_shopify_order_for_checkout(**_kwargs):
+        return {
+            "ok": True,
+            "shopify_order_id": "9001777555",
+            "shopify_order_name": "#1775",
+            "shopify_order_url": "https://alpha-beauty-demo.myshopify.com/admin/orders/9001777555",
+        }
+
+    async def fake_create_refund(*, order_id: str, amount: float, reason: str,
+                                 source: str, created_by: str, idempotency_key=None):
+        order_state["status"] = "refunded"
+        order_state["payment_status"] = "refunded"
+        order_state["total_refunded"] = 29.0
+        return {
+            "status": "success",
+            "refund_id": "REF_ALPHA_DEFER",
+            "psp_refund_id": "re_alpha_defer",
+        }
+
+    async def refuses_to_write(**_kwargs):
+        # Shopify 429 on GET /transactions.json: the list is unreadable, so the
+        # writer cannot rule out a duplicate and declines.
+        return {"ok": False, "skipped": True, "retryable": True,
+                "reason": "transaction_list_unavailable"}
+
+    async def fake_enqueue(**kwargs):
+        enqueued.append(kwargs)
+        return "job-deferred-1"
+
+    async def fake_log_order_event(**_kwargs):
+        return None
+
+    monkeypatch.setattr(readiness_service, "create_order", fake_create_order)
+    monkeypatch.setattr(readiness_service, "get_order", fake_get_order)
+    monkeypatch.setattr(readiness_service, "update_fulfillment_info", fake_update_fulfillment_info)
+    monkeypatch.setattr(readiness_service, "_create_shopify_order_for_checkout", fake_create_shopify_order_for_checkout)
+    monkeypatch.setattr(readiness_service.refund_service, "create_refund", fake_create_refund)
+    monkeypatch.setattr(readiness_service, "ensure_external_refund_transaction_best_effort", refuses_to_write)
+    monkeypatch.setattr(sync_jobs, "enqueue_merchant_order_sync_job", fake_enqueue)
+    monkeypatch.setattr(readiness_service, "log_order_event", fake_log_order_event)
+
+    checkout = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout",
+        json={
+            "variant_id": "431000000001",
+            "quantity": 1,
+            "idempotency_key": "idem-alpha-refund-defer",
+            "buyer_email": "buyer@example.com",
+            "customer_name": "Alpha Buyer",
+            "shipping_address": {
+                "name": "Alpha Buyer",
+                "address_line1": "1 Orchard Road",
+                "city": "Singapore",
+                "postal_code": "238823",
+                "country": "SG",
+            },
+        },
+    )
+    checkout_id = checkout.json()["checkout_id"]
+
+    client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync/{checkout_id}",
+        json={"replay": False},
+    )
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/{checkout_id}/refund",
+        json={"reason": "operator_canary_refund"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    # `.get()` deliberately: if the deferral stops happening these must fail on
+    # the assertion below, not on a KeyError before it is reached.
+    assert len(enqueued) == 1, "the unwritable mirror was not handed to the queue"
+    assert body["transaction_sync"].get("deferred_to_queue") is True
+    assert body["transaction_sync"].get("deferred_job_id") == "job-deferred-1"
+
+    job = enqueued[0]
+    assert job["op"] == sync_jobs.OP_REFUND_SYNC
+    # Namespaced so this producer can never collide with refund_api's key for
+    # the same refund — that surface does NOT set skip_cancel, and whichever
+    # lost ON CONFLICT would have its payload silently discarded.
+    assert job["dedupe_key"] == "txn:re_alpha_defer"
+    # Carried, or the writer's fallback rejects an authorization-kind parent and
+    # the job soft-skips to `done` having written nothing.
+    assert job["payload"]["parent_transaction_id"] == 1444
+    # This surface mirrors the transaction only; cancelling the merchant order
+    # is the refund_api flow's business.
+    assert job["payload"]["skip_cancel"] is True
+    assert job["payload"]["shopify_order_id"] == "9001777555"
+    assert job["payload"]["store_id"] == "st_alpha"
+
+
+def test_refund_reports_a_failed_deferral_instead_of_claiming_it_queued(monkeypatch):
+    """`enqueue_merchant_order_sync_job` returns None on a persistence failure
+    and never raises. Claiming `deferred_to_queue: True` there puts "deferred"
+    in a durable order event for work that was lost."""
+    client = _build_test_client(monkeypatch, psp_enabled=True)
+
+    from readiness import service as readiness_service
+    import db.merchant_order_sync_jobs as sync_jobs
+
+    order_state = {
+        "order_id": "ORD_ALPHA_REFUND_LOST",
+        "shopify_order_id": None,
+        "status": "paid",
+        "payment_status": "paid",
+        "payment_intent_id": "pi_alpha_refund_lost",
+        "client_secret": "cs_alpha_refund_lost",
+        # Empty on purpose: the payload must fall back to payment_psp_used, or
+        # the writer short-circuits and the job completes having written nothing.
+        "psp_used": "",
+        "metadata": {"shopify_parent_transaction_id": 1444},
+        "total": 29.0,
+        "currency": "USD",
+        "total_refunded": 0,
+    }
+    enqueued = []
+
+    async def fake_create_order(_order_data):
+        return "ORD_ALPHA_REFUND_LOST"
+
+    async def fake_get_order(_order_id: str):
+        return dict(order_state)
+
+    async def fake_update_fulfillment_info(order_id: str, shopify_order_id=None, **_kwargs):
+        order_state["shopify_order_id"] = shopify_order_id
+        return True
+
+    async def fake_create_shopify_order_for_checkout(**_kwargs):
+        return {
+            "ok": True,
+            "shopify_order_id": "9001777666",
+            "shopify_order_name": "#1776",
+            "shopify_order_url": "https://alpha-beauty-demo.myshopify.com/admin/orders/9001777666",
+        }
+
+    async def fake_create_refund(*, order_id: str, amount: float, reason: str,
+                                 source: str, created_by: str, idempotency_key=None):
+        order_state["status"] = "refunded"
+        order_state["payment_status"] = "refunded"
+        order_state["total_refunded"] = 29.0
+        return {"status": "success", "refund_id": "REF_LOST",
+                "psp_refund_id": "re_alpha_lost"}
+
+    async def refuses_to_write(**_kwargs):
+        return {"ok": False, "skipped": True, "retryable": True,
+                "reason": "transaction_list_unavailable"}
+
+    async def enqueue_fails(**kwargs):
+        enqueued.append(kwargs)
+        return None
+
+    async def fake_log_order_event(**_kwargs):
+        return None
+
+    monkeypatch.setattr(readiness_service, "create_order", fake_create_order)
+    monkeypatch.setattr(readiness_service, "get_order", fake_get_order)
+    monkeypatch.setattr(readiness_service, "update_fulfillment_info", fake_update_fulfillment_info)
+    monkeypatch.setattr(readiness_service, "_create_shopify_order_for_checkout", fake_create_shopify_order_for_checkout)
+    monkeypatch.setattr(readiness_service.refund_service, "create_refund", fake_create_refund)
+    monkeypatch.setattr(readiness_service, "ensure_external_refund_transaction_best_effort", refuses_to_write)
+    monkeypatch.setattr(sync_jobs, "enqueue_merchant_order_sync_job", enqueue_fails)
+    monkeypatch.setattr(readiness_service, "log_order_event", fake_log_order_event)
+
+    checkout = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout",
+        json={
+            "variant_id": "431000000001",
+            "quantity": 1,
+            "idempotency_key": "idem-alpha-refund-lost",
+            "buyer_email": "buyer@example.com",
+            "customer_name": "Alpha Buyer",
+            "shipping_address": {
+                "name": "Alpha Buyer",
+                "address_line1": "1 Orchard Road",
+                "city": "Singapore",
+                "postal_code": "238823",
+                "country": "SG",
+            },
+        },
+    )
+    checkout_id = checkout.json()["checkout_id"]
+    client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/order-sync/{checkout_id}",
+        json={"replay": False},
+    )
+    response = client.post(
+        f"/internal/readiness/merchants/{DEFAULT_ALPHA_MERCHANT_ID}/checkout-sessions/{checkout_id}/refund",
+        json={"reason": "operator_canary_refund"},
+    )
+
+    assert response.status_code == 200
+    sync = response.json()["transaction_sync"]
+    assert sync.get("deferred_to_queue") is False
+    assert sync.get("deferred_enqueue_failed") is True
+
+    assert len(enqueued) == 1
+    # NOTE: the `payment_psp_used` fallback on the same payload line is NOT
+    # covered here — this checkout path never populates that key, so the
+    # fallback cannot be reached from this harness. Named rather than asserted,
+    # because a test that pins the first disjunct would look like coverage of
+    # the second.
+    assert enqueued[0]["payload"]["psp_used"] is None

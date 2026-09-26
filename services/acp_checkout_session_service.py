@@ -93,6 +93,7 @@ from typing import Any, Dict, List, Optional
 from config.settings import settings
 from db.acp_checkout_sessions import acp_checkout_sessions
 from db.database import IS_POSTGRES, database, engine, metadata
+from db.schema_guard import guarded_add_columns, guarded_index
 from utils.money import to_minor_units
 from services.commerce_attribution_service import (
     PVT_CLICK_ID,
@@ -255,29 +256,37 @@ async def _ensure_acp_checkout_sessions_table() -> None:
             )
             """
         )
-        await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS agent_id TEXT")
-        await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS completion JSONB")
-        await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS idempotency_key TEXT")
-        await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS order_id TEXT")
-        await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ")
-        await database.execute("ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ")
+        # Guarded (db/schema_guard.py): this runs after ANY failed session write,
+        # and bare each ALTER took the table's ACCESS EXCLUSIVE lock (each index
+        # its SHARE lock) with no lock_timeout, even with nothing to add.
+        for statement in guarded_add_columns(
+            """
+            ALTER TABLE IF EXISTS acp_checkout_sessions
+              ADD COLUMN IF NOT EXISTS agent_id TEXT,
+              ADD COLUMN IF NOT EXISTS completion JSONB,
+              ADD COLUMN IF NOT EXISTS idempotency_key TEXT,
+              ADD COLUMN IF NOT EXISTS order_id TEXT,
+              ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ,
+              ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
+              ADD COLUMN IF NOT EXISTS capture_attempt INTEGER NOT NULL DEFAULT 0,
+              ADD COLUMN IF NOT EXISTS psp_idempotency_key TEXT;
+            """
+        ):
+            await database.execute(statement)
         await database.execute(
-            "ALTER TABLE acp_checkout_sessions "
-            "ADD COLUMN IF NOT EXISTS capture_attempt INTEGER NOT NULL DEFAULT 0"
-        )
-        await database.execute(
-            "ALTER TABLE acp_checkout_sessions ADD COLUMN IF NOT EXISTS psp_idempotency_key TEXT"
-        )
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_acp_checkout_sessions_merchant_created "
-            "ON acp_checkout_sessions (merchant_id, created_at)"
+            guarded_index(
+                "CREATE INDEX IF NOT EXISTS idx_acp_checkout_sessions_merchant_created "
+                "ON acp_checkout_sessions (merchant_id, created_at)"
+            )
         )
         # Plain lookup index, deliberately NOT unique — cross-session key reuse
         # is answered 409 BEFORE any charge; a unique index would abort the
         # completion write only AFTER the charge (retry-recharge wedge).
         await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_acp_checkout_sessions_merchant_idem "
-            "ON acp_checkout_sessions (merchant_id, idempotency_key)"
+            guarded_index(
+                "CREATE INDEX IF NOT EXISTS idx_acp_checkout_sessions_merchant_idem "
+                "ON acp_checkout_sessions (merchant_id, idempotency_key)"
+            )
         )
 
     try:

@@ -23,6 +23,7 @@ class _VerifAccessors:
 
     def __init__(self, claim_payload: Optional[Dict[str, Any]]):
         self.claim_payload = claim_payload
+        self.claim_kwargs: List[Dict[str, Any]] = []
         self.succeeded: List[Dict[str, Any]] = []
         self.blocked: List[Dict[str, Any]] = []
         self.failed_with_retry: List[Dict[str, Any]] = []
@@ -30,7 +31,8 @@ class _VerifAccessors:
         # (re-enqueue) or "exhausted_retries" (terminal).
         self.failed_returns: str = "pending"
 
-    async def claim_next_pending_verification(self, *, worker_id):
+    async def claim_next_pending_verification(self, *, worker_id, **_kwargs):
+        self.claim_kwargs.append({"worker_id": worker_id, **_kwargs})
         return self.claim_payload
 
     async def mark_verification_succeeded(
@@ -123,6 +125,18 @@ async def test_no_op_when_queue_empty(monkeypatch):
     assert accessors.succeeded == []
     assert accessors.blocked == []
     assert accessors.failed_with_retry == []
+    assert accessors.claim_kwargs == [{
+        "worker_id": accessors.claim_kwargs[0]["worker_id"],
+        "exclude_remote_verifiers": True,
+    }]
+
+
+def test_generic_worker_excludes_every_remote_store_audit_verifier():
+    from services import verification_run_worker as worker
+
+    assert worker._EXTERNAL_DISPATCH_VERIFIERS == {
+        "ucp_probe", "commerce_checkout_probe",
+    }
 
 
 @pytest.mark.asyncio

@@ -455,6 +455,7 @@ class StandardProductVariant(BaseModel):
     price: float  # 价格
     compare_at_price: Optional[float] = None  # 划线价
     inventory_quantity: int = 0  # 库存
+    available: Optional[bool] = None  # 平台变体可售性；无库存追踪或允许超卖时可为 True
     weight: Optional[float] = None
     weight_unit: Optional[str] = None  # kg, lb, g, oz
     options: Optional[Dict[str, str]] = None  # {"Size": "Small", "Color": "Red"}

@@ -9,6 +9,7 @@ from sqlalchemy import Boolean, Column, DateTime, String, Table
 from sqlalchemy.sql import func
 
 from db.database import database, metadata
+from db.schema_guard import guarded_statements
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,13 @@ async def ensure_merchant_portal_preferences_table() -> None:
             return
 
         try:
-            statements = [
+            # Guarded on Postgres (db/schema_guard.guarded_statements): bare, each
+            # ALTER took the table's ACCESS EXCLUSIVE lock with no lock_timeout,
+            # even with nothing to add, so the first call of every process queued
+            # behind any open transaction on the table and stalled every later one
+            # behind it. A guarded statement that cannot get its lock in time
+            # raises, which this pass already treats as "not ready, retry later".
+            statements = guarded_statements([
                 """
                 CREATE TABLE IF NOT EXISTS merchant_portal_preferences (
                   merchant_id VARCHAR(50) PRIMARY KEY,
@@ -91,7 +98,7 @@ async def ensure_merchant_portal_preferences_table() -> None:
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS executor_auto_execute BOOLEAN NOT NULL DEFAULT TRUE;",
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
                 "ALTER TABLE merchant_portal_preferences ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
-            ]
+            ])
             for statement in statements:
                 await database.execute(statement)
         except Exception as exc:

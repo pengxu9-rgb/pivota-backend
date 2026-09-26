@@ -337,6 +337,10 @@ async def enqueue_audit_identity_review(
                 module_key="identity",
                 status="needs_review",
                 priority="normal",
+                # Must be explicit: the Table's `default=False` is Python-side, and
+                # `databases` never evaluates it — it binds NULL, which the NOT NULL
+                # column rejects (tests/test_audit_identity_review_enqueue_postgres.py).
+                qa_sample=False,
                 checklist={
                     "source": "audit_intake",
                     "audit_product_key": fields.get("product_key"),
@@ -434,18 +438,54 @@ def audit_brand_fragmentation_guard_enabled(merchant_id: Optional[str] = None) -
     return True
 
 
+def brand_host_guard_key(fields: Dict[str, Any]) -> tuple:
+    """The (brand, host) the brand-host guard binds for these fields; either may be ''.
+
+    One definition, used by the finder below AND by the curated dry run's
+    prediction (scripts/onboard_curated_brands.py --check-brand-host-guard), so
+    the preview groups rows exactly the way the guard will look them up."""
+    brand = str(fields.get("brand") or "").strip()
+    host = str(fields.get("source_domain") or "").strip() or _host(fields.get("canonical_url"))
+    return brand, host
+
+
+def host_url_pattern(host: str) -> str:
+    """A Postgres regex matching a URL on `host` or any subdomain of it, any scheme, port or path.
+
+    The finder used `canonical_url ILIKE '%host%'`, a substring: `palacebeauty.com` matched every
+    `shoppalacebeauty.com` URL, so a multi-brand ingest of palacebeauty.com was told its O HUI rows
+    conflict with another store's O HUI (2026-09-25, 25 rows at risk). This anchors on the URL
+    authority and on whole DNS labels: `www.x.com` and `us.x.com` are still the site `x.com` (the
+    substring caught them, and a brand split across merchants there is what ADR-008 guards), while
+    `shopx.com`, `x.com.evil.io` and `x.com` named only in a path or query are not.
+
+    A host carrying a scheme (`https://shop.x.com`, as WooCommerce store domains are stored and passed
+    as source_domain) is reduced to its hostname first; used raw it could never match a URL.
+    Every non-alphanumeric character is backslash-escaped: in an ARE that is always a literal."""
+    raw = str(host or "").strip()
+    try:
+        bare = _host(raw if "://" in raw else ("https:" + raw if raw.startswith("//") else "https://" + raw))
+    except ValueError:  # urlparse refuses '[', ']' and some separators; source_domain is free text
+        bare = ""
+    escaped = "".join(ch if ch.isalnum() else "\\" + ch for ch in (bare or raw).lower())
+    return rf"^https?://([^/?#@]*\.)?{escaped}([:/?#]|$)"
+
+
 async def _existing_brand_canonical_conflict(
-    merchant_id: str, fields: Dict[str, Any]
+    merchant_id: str, fields: Dict[str, Any], *, database: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """Return an existing PUBLISHED canonical row for the SAME brand + host under a
     DIFFERENT merchant, or None. Conservative (case-insensitive exact brand + host
     match, published-only) to keep false-positives near-zero — a false skip would
-    drop a legitimately new brand's seed."""
-    brand = str(fields.get("brand") or "").strip()
-    host = str(fields.get("source_domain") or "").strip() or _host(fields.get("canonical_url"))
+    drop a legitimately new brand's seed.
+
+    `database` defaults to the process pool; a caller may pass a read-only handle
+    (one `fetch_one`) — the curated dry run does, to predict this guard's skips."""
+    brand, host = brand_host_guard_key(fields)
     if not brand or not host:
         return None
-    from db.database import database
+    if database is None:
+        from db.database import database
 
     row = await database.fetch_one(
         """
@@ -453,7 +493,7 @@ async def _existing_brand_canonical_conflict(
         FROM catalog_products
         WHERE lower(btrim(brand)) = lower(btrim(:brand))
           AND merchant_id <> :merchant_id
-          AND (source_domain = :host OR canonical_url ILIKE :host_like)
+          AND (source_domain = :host OR canonical_url ~* :host_url_re)
           AND (pivota_signature_id IS NOT NULL OR merchant_id = 'external_seed')
           AND suppression_reason IS NULL
         LIMIT 1
@@ -462,7 +502,7 @@ async def _existing_brand_canonical_conflict(
             "brand": brand,
             "merchant_id": merchant_id,
             "host": host,
-            "host_like": f"%{host}%",
+            "host_url_re": host_url_pattern(host),
         },
     )
     return dict(row) if row else None
@@ -636,8 +676,14 @@ async def upsert_audited_sku_to_index(
     # (indexable + status='active'). URL-tier merchants have no synced storefront,
     # so no catalog_merchants row exists — without one the seed's canonical PDP
     # would 404 even once it's index_eligible. Upsert a minimal, indexable row
-    # (indexable defaults true; status='active' is set by upsert_catalog_merchant)
-    # so the citation read resolves. Best-effort — never break the seed.
+    # (indexable defaults true; a NEW row is minted status='active') so the
+    # citation read resolves. Best-effort — never break the seed.
+    #
+    # Deliberately passes NO `status`: an audit is a content signal, not a
+    # lifecycle one. `catalog_merchants.status` is owned by
+    # services/store_lifecycle_service.py, and re-asserting 'active' here undid
+    # the one transition that has no reconciliation backstop — the merchant who
+    # detached their LAST store (PR #1852). See upsert_catalog_merchant.
     try:
         from services.catalog_sync_service import upsert_catalog_merchant
 

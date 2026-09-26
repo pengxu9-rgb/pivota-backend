@@ -12,7 +12,11 @@ from databases import Database
 from db.orders import get_order, update_order
 from db.database import database as db
 from adapters.psp_adapter import get_psp_adapter
-from services.commerce_attribution_service import attach_refund_to_attribution_edge
+from services.commerce_attribution_service import (
+    apply_refund_total_rows,
+    emit_refund_total_event,
+)
+from services.gmv_aggregation_service import recompute_days_for_edges
 from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     fetch_active_runtime_merchant_psp,
@@ -57,6 +61,7 @@ class RefundService:
             timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             idempotency_key = f"{order_id}_{amount}_{timestamp_ms}"
         
+        attribution_rows = []
         try:
             # Start transaction with row lock
             async with self.db.transaction():
@@ -116,11 +121,36 @@ class RefundService:
                         amount=amount
                     )
                     try:
-                        await attach_refund_to_attribution_edge(
-                            order_id=order_id,
-                            refund_id=refund_id,
-                            amount=amount,
-                        )
+                        # The edge UPDATE only. Its event and the rollup recompute
+                        # are best-effort writes that swallow a failed statement,
+                        # which would leave this transaction aborted and lose the
+                        # refund record, so they run after commit, below.
+                        #
+                        # The order's total AFTER this refund, as a ceiling, not
+                        # this refund's amount: Stripe reports the same refund
+                        # again under ch_ and re_ ids, and those webhooks raise
+                        # the edge to the same total instead of adding to it.
+                        # Computed from the row locked FOR UPDATE above, exactly as
+                        # _update_refund_success wrote it, rather than read back:
+                        # one more statement here is one more way to abort this
+                        # transaction and lose the refund record.
+                        #
+                        # In its OWN savepoint (a nested transaction): a failed
+                        # statement here, such as dispute_amount_cents missing
+                        # because the schema_guard heal did not run, would
+                        # otherwise abort this whole transaction. The PSP has
+                        # already refunded, so that would lose refund_records and
+                        # total_refunded. With the savepoint, only the edge write
+                        # is rolled back.
+                        async with self.db.transaction():
+                            attribution_rows = await apply_refund_total_rows(
+                                order_id=order_id,
+                                refund_id=refund_id,
+                                total_refunded=(
+                                    Decimal(str(order.get("total_refunded") or "0"))
+                                    + Decimal(str(amount))
+                                ),
+                            )
                     except Exception as attribution_exc:
                         logger.warning(
                             "Failed to attach refund attribution edge for %s: %s",
@@ -128,7 +158,7 @@ class RefundService:
                             attribution_exc,
                         )
                     
-                    return {
+                    result = {
                         "status": "success",
                         "refund_id": refund_id,
                         "psp_refund_id": psp_result["refund_id"],
@@ -155,6 +185,19 @@ class RefundService:
         except Exception as e:
             logger.error(f"Refund creation failed: {e}")
             raise
+
+        # Committed. Only the success branch reaches here.
+        if attribution_rows:
+            try:
+                await emit_refund_total_event(
+                    attribution_rows, order_id=order_id, refund_id=refund_id
+                )
+            except Exception as event_exc:
+                logger.warning(
+                    "Failed to emit refund attribution event for %s: %s", refund_id, event_exc
+                )
+            await recompute_days_for_edges(attribution_rows)  # never raises
+        return result
     
     async def _check_existing_refund(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
         """Check if refund with this idempotency key already exists"""

@@ -1,5 +1,14 @@
 # Stage 1 — Shadow-Mode Rollout
 
+> ⚠️ **Production is GCP Cloud Run (`pivota-prod`, `us-west1`) since 2026-08-22. Railway is the
+> ROLLBACK.** The `railway ...` commands below have NOT been rewritten — they were left as-is
+> rather than translated by guesswork, because the procedures here were never re-verified against
+> GCP. Running one changes the platform nobody is served from: the incident continues while the
+> dial reads as turned. Translate with
+> [operating_on_gcp_production.md](../../runbooks/operating_on_gcp_production.md) before acting, or treat this
+> document as a historical record of how the Railway rollout was done.
+
+
 Stage 1 turns on the parts of v1.3 that observe and aggregate, but not the parts that move money. Runs against real shopping-agent and creator-agent traffic for a minimum of 3 days before promoting to Stage 2 (the historical-edge backfill).
 
 Pre-req: Stage 0 complete. Production on commit ≥ `73d4631`. Migration 121 verified applied.

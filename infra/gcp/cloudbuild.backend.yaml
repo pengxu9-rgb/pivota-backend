@@ -16,6 +16,9 @@ steps:
            '-t', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${COMMIT_SHA}',
            '-t', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:latest',
            '--build-arg', 'BUILDKIT_INLINE_CACHE=1',
+           # Stamps /app/.image_commit_sha inside the image - see the Dockerfile for why the
+           # deploy-time env var alone was not enough.
+           '--build-arg', 'COMMIT_SHA=${COMMIT_SHA}',
            '.']
 images:
   - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${COMMIT_SHA}'

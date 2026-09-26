@@ -241,6 +241,31 @@ local tooling sandbox, not a GCP grant.
 Staging was returned to exactly its prior state — 3 databases, both schedulers `PAUSED`,
 `AUDIT_WORKER_ENABLED=false`, service `ready=True`.
 
+## The retired platform is not inert until you stop its in-process timers
+
+Moving DNS stops *inbound* traffic. It does not stop code already running on the old platform.
+
+Two instances of this, three days apart, both writing to a database nobody was reading:
+
+- **GCP, 2026-08-22** — stale tagged Cloud Run revisions stayed alive (`min-instances >= 1`) pinned
+  to the secret version they booted with, and one kept writing to the *retired* database for hours
+  after the DSN was repointed. Fixed by sweeping stale tags; `deploy_backend.sh` now does it
+  automatically.
+- **Railway, 2026-08-25** — the old gateway kept running `pdp_identity_auto_resolve` on a
+  30-minute `setInterval` with `dry_run=false`, ~200 rows a tick, **~25,000 rows over three days**.
+  Fixed with `PDP_IDENTITY_AUTO_RESOLVE_ENABLED=false` **plus a restart**.
+
+**The distinction that matters:** a *scheduler* is visible — Cloud Scheduler jobs, Railway crons,
+things with a UI and a state you can list. A `setInterval` inside a long-lived process is invisible,
+survives the DNS flip, and nothing alerts on it. When retiring a platform, grep the retired
+service's own logs for periodic messages rather than assuming the absence of inbound traffic means
+the absence of work.
+
+**And a variable change is not a running-container change.** `railway variables --set` (and
+`--skip-deploys` especially) updates the stored value while the process keeps its old environment.
+Redeploy or restart, then verify by waiting past the next scheduled tick — not by re-reading the
+variable, which will happily show you the new value while the old one is still in effect.
+
 ## Rollback
 
 **Re-pausing the Scheduler triggers is part of rollback and was previously missing.** Rolling back

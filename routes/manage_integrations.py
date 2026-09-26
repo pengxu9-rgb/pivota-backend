@@ -7,6 +7,7 @@ from services.merchant_psp_config_service import (
     persist_canonical_merchant_psp,
 )
 from services.store_lifecycle_service import sync_catalog_merchant_status
+from readiness.summary import invalidate_readiness_optimization_cache
 import json
 import httpx
 
@@ -143,7 +144,31 @@ async def delete_store(
         # Public recall gates on catalog_merchants.status; nothing used to write
         # it, so a merchant who disconnected their last store kept serving on
         # search (#1648). Re-derived from the stores that remain. Never raises.
-        await sync_catalog_merchant_status(merchant_id, reason="store_disconnected")
+        #
+        # `last_store_removed=True` because this route HARD-DELETES the row.
+        # Without it, deleting a merchant's last store leaves zero rows, which
+        # `derive_merchant_status` reads as "never had a storefront — don't
+        # touch it" (the guard that keeps this rule off the ~471 crawl-observed
+        # brands). The merchant then kept status='active' and kept serving.
+        # This route deletes a store at ANY status, so the deleted row may well
+        # have been the merchant's only 'active' one.
+        await sync_catalog_merchant_status(
+            merchant_id,
+            reason="store_disconnected",
+            last_store_removed=True,
+        )
+
+        # The readiness snapshot and optimization payloads are process-local
+        # caches with a 300s TTL that no store-lifecycle path used to touch, so
+        # the overview card and the product-optimization workspace kept serving
+        # the pre-detach issue counts for up to five minutes after the store was
+        # gone. (`invalidate_readiness_optimization_cache` invalidates the
+        # snapshot cache underneath it too.) Best-effort: a merchant must not
+        # get a 500 on detach because an in-memory cache refused to clear.
+        try:
+            invalidate_readiness_optimization_cache(merchant_id)
+        except Exception:
+            pass
 
         return {
             "status": "success",

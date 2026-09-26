@@ -28,12 +28,25 @@ LIPSTICK_FIXTURES = [
     "Glossier Generation G Sheer Lipstick",
     "Pat McGrath MatteTrance Lipstick",
     "Rare Beauty Stay Vulnerable Lip Color",
-    "Pixi Glow-y Lip Oil",
-    "Kylie Precision Pout Lip Liner",
-    "Tom Ford Gloss Luxe",
-    "Fenty Gloss Bomb Stix High-Shine Gloss Stick",
     "Kylie Rosy Radiance Lip Combo",
     "Pixi Lip Duo - Choose Your Shades",
+]
+
+# Lip subtypes. These four titles used to live in LIPSTICK_FIXTURES because the
+# Lipstick regex was a lip catch-all. They moved here — not deleted — when the
+# dedicated Lip Gloss / Lip Oil / Lip Liner / Lip Tint patterns landed ahead of
+# Lipstick, so each keeps its coverage under the label it now resolves to.
+LIP_GLOSS_FIXTURES = [
+    "Tom Ford Gloss Luxe",
+    "Fenty Gloss Bomb Stix High-Shine Gloss Stick",
+]
+
+LIP_OIL_FIXTURES = [
+    "Pixi Glow-y Lip Oil",
+]
+
+LIP_LINER_FIXTURES = [
+    "Kylie Precision Pout Lip Liner",
 ]
 
 FOUNDATION_FIXTURES = [
@@ -145,6 +158,9 @@ TREATMENT_FIXTURES = [
     "Murad Retinol Youth Renewal Night Treatment",
     "Pixi Spot Stickers Trio",
     "Peace Out Acne Stickers",
+    # Acne / blemish patches are Acne Treatments (Google 5976, Shopify), not masks.
+    "Hero Cosmetics Mighty Pimple Patch",
+    "Anua Ultra-Thin Spot Cover Patch",
 ]
 
 FACE_OIL_FIXTURES = [
@@ -171,10 +187,8 @@ MASK_FIXTURES = [
     "Mediheal Tea Tree Essential Sheet Mask",
     "Laneige Water Sleeping Mask",
     "Innisfree Super Volcanic Pore Clay Mask",
-    "Hero Cosmetics Mighty Pimple Patch",
     "Pixi LipPatch",
     "Summer Fridays Jet Lag Mask",
-    "Anua Ultra-Thin Spot Cover Patch",
     "Patyka Patchs Lift Regard 360°",
 ]
 
@@ -243,6 +257,72 @@ def test_lipstick_resolves(title: str) -> None:
     assert hit[1] == "beauty/makeup/lip/lipstick"
 
 
+@pytest.mark.parametrize("title", LIP_GLOSS_FIXTURES)
+def test_lip_gloss_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[0] == "Lip Gloss"
+    assert hit[1] == "beauty/makeup/lip/gloss"
+
+
+@pytest.mark.parametrize("title", LIP_OIL_FIXTURES)
+def test_lip_oil_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[0] == "Lip Oil"
+    assert hit[1] == "beauty/makeup/lip/oil"
+
+
+@pytest.mark.parametrize("title", LIP_LINER_FIXTURES)
+def test_lip_liner_resolves(title: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[0] == "Lip Liner"
+    assert hit[1] == "beauty/makeup/lip/liner"
+
+
+# Ordering regressions. Each of these is a title where an EARLIER pattern used
+# to swallow a more specific later one. They are asserted as (title -> path)
+# pairs rather than added to a *_FIXTURES list because what is under test is the
+# ORDER of CATEGORY_PATTERNS, not the vocabulary of any single pattern.
+PATTERN_ORDER_FIXTURES = [
+    # "essence" is a Serum token, but it must not outrank a real mask/exfoliant/
+    # treatment/oil FORM noun that appears alongside it.
+    ("Real Rice Essence Sheet Mask 10 Pack", "beauty/skincare/treat/mask"),
+    ("Mediheal Essence Mask Sheet Tea Tree", "beauty/skincare/treat/mask"),
+    ("Snail Essence Sleeping Mask", "beauty/skincare/treat/mask"),
+    ("Acne Care Essence Spot Patch 18ct", "beauty/skincare/treat/treatment"),
+    ("Some By Mi Miracle Essence Peeling Gel", "beauty/skincare/treat/exfoliant"),
+    ("Blemish Essence Spot Treatment Gel", "beauty/skincare/treat/treatment"),
+    ("Lavender Essence Body Oil", "beauty/skincare/moisturize/oil"),
+    # ...and a bare product-line "Mask" must not outrank the real form noun.
+    # This is the title a3940018 set out to fix; its own message says Serum
+    # should catch it on "essence".
+    ("Missha Mask Fit Tone Up Essence", "beauty/skincare/treat/serum"),
+    # A base-makeup product carrying an SPF claim is foundation, not sunscreen.
+    ("Pro Filt'r Soft Matte Longwear Foundation Broad Spectrum SPF 50+",
+     "beauty/makeup/face/foundation"),
+    ("Maybelline Dream BB Cream SPF 30", "beauty/makeup/face/foundation"),
+    ("Erborian CC Cream SPF 50", "beauty/makeup/face/foundation"),
+    ("Cushion Foundation Refill SPF 50+", "beauty/makeup/face/foundation"),
+    ("Glow Skin Tint SPF 30", "beauty/makeup/face/foundation"),
+    # ...but "foundation" as a MODIFIER must not outrank primer/cleanser.
+    ("Smashbox Photo Finish Foundation Primer", "beauty/makeup/face/primer"),
+    ("Pore Filling Foundation Primer 30ml", "beauty/makeup/face/primer"),
+    ("Foundation Cleansing Balm", "beauty/skincare/cleanse/cleanser"),
+    # A real sunscreen is untouched by the lookahead that makes the above work.
+    ("Supergoop Unseen Sunscreen SPF 40", "beauty/skincare/sun/sunscreen"),
+    ("Bioderma Photoderm Nude Touch SPF 50+", "beauty/skincare/sun/sunscreen"),
+]
+
+
+@pytest.mark.parametrize("title,expected_path", PATTERN_ORDER_FIXTURES)
+def test_pattern_order_resolves(title: str, expected_path: str) -> None:
+    hit = classify(title)
+    assert hit is not None, f"no classification for {title!r}"
+    assert hit[1] == expected_path, f"{title!r} -> {hit[1]!r}, expected {expected_path!r}"
+
+
 @pytest.mark.parametrize("title", FOUNDATION_FIXTURES)
 def test_foundation_resolves(title: str) -> None:
     hit = classify(title)
@@ -301,10 +381,23 @@ def test_serum_resolves(title: str) -> None:
 
 @pytest.mark.parametrize("title", TONER_FIXTURES)
 def test_toner_resolves(title: str) -> None:
+    """`tone/toner`, NOT `treat/toner`. Google Product Taxonomy 5976 and Shopify hb-3-2-9-17 both
+    make `Toners & Astringents` a direct child of Skin Care — a peer of cleansers, moisturizers and
+    treatments, never nested inside a treatments node. It also matches PIVOTA-Agent, which has
+    declared `tone/toner` canonical since 2026-08-04 because folding toner into `treat/` recreates
+    the serum+mask+exfoliant bucket behind the 2026-07-31 junk recall."""
     hit = classify(title)
     assert hit is not None
     assert hit[0] == "Toner"
-    assert hit[1] == "beauty/skincare/treat/toner"
+    assert hit[1] == "beauty/skincare/tone/toner"
+
+
+def test_toner_does_not_land_in_the_broad_treat_bucket() -> None:
+    """The control. `treat/` holds serum, mask, exfoliant and treatment; a toner joining them is
+    the exact regression this leaf exists to prevent, and it is invisible from the toner test alone
+    (both paths are 4 segments under skincare)."""
+    hit = classify("I'm From Rice Toner")
+    assert hit is not None and not hit[1].startswith("beauty/skincare/treat/")
 
 
 @pytest.mark.parametrize("title", TREATMENT_FIXTURES)
@@ -329,6 +422,42 @@ def test_tanning_resolves(title: str) -> None:
     assert hit is not None
     assert hit[0] == "Tanning"
     assert hit[1] == "beauty/body/tanning"
+
+
+# An acne patch named by its qualifier is a treatment, including the plural that the Mask
+# pattern's generic "patches" arm would otherwise reach first.
+@pytest.mark.parametrize("title", [
+    "Hero Cosmetics Mighty Pimple Patches 36ct",
+    "COSRX Acne Pimple Master Patch",
+    "Acne Patch Hydrocolloid 24 Patches",
+    "Starface Blemish Patches Hydro-Stars",
+    "NEOGEN Dermalogy A-Clear Soothing Clear Spot Patch",
+    "Soft Shield Pimple Patch",
+    "Spot Cover Patches 60ea",
+])
+def test_an_acne_patch_is_a_treatment_not_a_mask(title: str) -> None:
+    assert classify(title) == ("Treatment", "beauty/skincare/treat/treatment")
+
+
+# ...and only those. Eye patches, lip patches and a bare "patches" keep the mask leaf.
+@pytest.mark.parametrize("title", [
+    "Beauty of Joseon Revive Under Eye Patch",
+    "Hydrogel Eye Patches 60pcs",
+    "Dark Spot Eye Patch",
+    "Pixi LipPatch",
+    "Collagen Lip Patch",
+    "Gold Patches 30 Pairs",
+    "Patyka Patchs Lift Regard 360°",
+])
+def test_a_non_acne_patch_stays_a_mask(title: str) -> None:
+    assert classify(title) == ("Mask", "beauty/skincare/treat/mask")
+
+
+def test_moving_acne_patches_does_not_move_the_recall_prefix() -> None:
+    # Recall binds the PARENT of the leaf; mask and treatment share treat/.
+    from services.pdp_category_classifier import category_path_prefix_for_query
+    for query in ("pimple patch", "spot patch", "acne patch", "eye patch"):
+        assert category_path_prefix_for_query(query) == "beauty/skincare/treat/"
 
 
 @pytest.mark.parametrize("title", MASK_FIXTURES)
@@ -557,3 +686,213 @@ def test_fold_handles_none_variants() -> None:
     assert result is not None
     (label, _path), _, _ = result
     assert label == "Foundation"
+
+
+# --- --include-shallow: the widened mode -----------------------------------------------------
+
+def test_depth_counts_segments_and_treats_blank_as_zero():
+    from scripts.backfill_pdp_category_path import _depth
+    assert _depth(None) == 0
+    assert _depth("") == 0
+    assert _depth("beauty") == 1
+    assert _depth("beauty/makeup") == 2
+    assert _depth("beauty/makeup/lip/lipstick") == 4
+
+
+def test_classification_inputs_drop_the_echo_of_the_stored_leaf():
+    """category/product_type are derived from category_path's leaf by the ingest writer, so on a
+    shallow row they echo the value being replaced. resolve_path_from_row tries category FIRST, so
+    feeding the echo back would let the bad path re-derive itself and short-circuit the title."""
+    from scripts.backfill_pdp_category_path import _classification_inputs
+    cat, ptype = _classification_inputs({
+        "category_path": "beauty/makeup", "category": "makeup",
+        "product_type": "Makeup", "title": "Retro Matte Lipstick"})
+    assert cat is None
+    assert ptype is None  # matched case-insensitively
+
+
+def test_classification_inputs_keep_what_the_merchant_actually_said():
+    """Only an exact echo is dropped. A real merchant product_type is the most authoritative
+    signal available and must survive."""
+    from scripts.backfill_pdp_category_path import _classification_inputs
+    cat, ptype = _classification_inputs({
+        "category_path": "beauty/makeup", "category": "makeup",
+        "product_type": "Lipstick", "title": "Retro Matte"})
+    assert cat is None
+    assert ptype == "Lipstick"
+
+
+async def _drive_fetch(monkeypatch, *, include_shallow):
+    """Capture the SQL and params _fetch_batch actually hands the driver.
+
+    The previous version of this test read the SOURCE TEXT of _fetch_batch and asserted strings
+    were present. It passed against a build whose DEFAULT path raised ArgumentError before any SQL
+    ran, because a bound parameter (:max_depth) was supplied that the default predicate never
+    references — and routes/admin_catalog_debug.py calls that default path over HTTP. Source
+    inspection cannot see a query/params mismatch; driving the call can.
+    """
+    import scripts.backfill_pdp_category_path as bf
+    seen = {}
+
+    async def fake_fetch_all(query, values=None):
+        seen["query"] = str(query)
+        seen["values"] = dict(values or {})
+        return []
+
+    monkeypatch.setattr(bf.database, "fetch_all", fake_fetch_all)
+    await bf._fetch_batch(10, None, include_shallow=include_shallow)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_default_mode_binds_only_what_the_predicate_uses(monkeypatch):
+    """Regression: every :placeholder in the SQL must exist in params, and vice versa.
+    SQLAlchemy's text().bindparams() raises on an extra one, which crashed the default path."""
+    import re
+    seen = await _drive_fetch(monkeypatch, include_shallow=False)
+    placeholders = set(re.findall(r":([a-z_]+)", seen["query"]))
+    assert placeholders == set(seen["values"]), (placeholders, set(seen["values"]))
+    assert "max_depth" not in seen["values"]
+    assert "category_path IS NULL" in seen["query"]
+    assert "POSITION('/' IN category_path) = 0" in seen["query"]
+
+
+@pytest.mark.asyncio
+async def test_shallow_mode_binds_its_own_placeholder(monkeypatch):
+    import re
+    seen = await _drive_fetch(monkeypatch, include_shallow=True)
+    placeholders = set(re.findall(r":([a-z_]+)", seen["query"]))
+    assert placeholders == set(seen["values"]), (placeholders, set(seen["values"]))
+    assert seen["values"]["max_depth"] >= 1
+
+
+def test_two_segment_leaves_are_routable_and_must_not_be_rewritten():
+    """`depth < 3` was the wrong rule: these are LEAVES that prefix recall reaches."""
+    from scripts.backfill_pdp_category_path import _is_interior_node
+    assert _is_interior_node("fashion/shoes") is False
+    assert _is_interior_node("electronics/ereader") is False
+    # ...while a genuine interior node is not routable, whatever its depth
+    assert _is_interior_node("beauty/makeup") is True
+    assert _is_interior_node("beauty/makeup/lip") is True
+    assert _is_interior_node("beauty") is True
+    assert _is_interior_node(None) is True
+    # a full leaf is left alone
+    assert _is_interior_node("beauty/makeup/lip/lipstick") is False
+
+
+@pytest.mark.asyncio
+async def test_apply_update_reports_whether_the_write_landed(monkeypatch):
+    """RETURNING exists so the caller can tell a landed write from a declined one — `databases`
+    over asyncpg reports no rowcount. A previous cut discarded the return value, leaving `matched`
+    counting intentions and `declined_by_guard` a hard-coded 0: a fabricated number, worse than
+    no number."""
+    import scripts.backfill_pdp_category_path as bf
+    captured = {}
+
+    async def fake_fetch_val(query, values=None):
+        captured["query"] = str(query)
+        return captured["result"]
+
+    monkeypatch.setattr(bf.database, "fetch_val", fake_fetch_val)
+
+    captured["result"] = "ext:some-product"
+    assert await bf._apply_update("k", "beauty/makeup/lip/lipstick") is True
+    assert "RETURNING" in captured["query"].upper()
+
+    captured["result"] = None          # guard declined: row changed, or not actually deeper
+    assert await bf._apply_update("k", "beauty/makeup/lip/lipstick") is False
+
+
+def test_unrecognised_paths_are_not_reported_as_already_routable():
+    """A path absent from the taxonomy is skipped, but calling it 'already routable' asserts
+    something we cannot know."""
+    from scripts.backfill_pdp_category_path import _is_interior_node, _TAXONOMY_PATHS
+    assert "beauty/bogus" not in _TAXONOMY_PATHS
+    assert _is_interior_node("beauty/bogus") is False   # skipped, never rewritten
+    assert "fashion/shoes" in _TAXONOMY_PATHS           # a genuine leaf
+
+
+@pytest.mark.asyncio
+async def test_declined_writes_are_counted_by_the_runner(monkeypatch):
+    """Testing _apply_update alone is not enough: the bug was the CALL SITE discarding its return,
+    which left declined_by_guard a hard-coded 0 while matched counted intentions. Drive the runner
+    with a DB that always declines and assert the report tells the truth."""
+    import scripts.backfill_pdp_category_path as bf
+
+    row = {
+        "product_key": "ext:brand-retro-matte-lipstick::abc",
+        "pivota_signature_id": "sig_x",
+        "brand": "MAC",
+        "category": None,
+        "category_path": "beauty/makeup",
+        "product_type": None,
+        "title": "Retro Matte Lipstick",
+    }
+    batches = [[row], []]
+
+    async def fake_fetch_all(query, values=None):
+        return batches.pop(0) if batches else []
+
+    async def fake_fetch_val(query, values=None):
+        return None  # the guard declines every write
+
+    monkeypatch.setattr(bf.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(bf.database, "fetch_val", fake_fetch_val)
+    monkeypatch.setattr(bf.database, "is_connected", True, raising=False)
+
+    report = await bf.run_category_path_backfill(include_shallow=True, dry_run=False)
+    assert report["declined_by_guard"] == 1, report
+    assert report["matched"] == 0, report
+
+
+@pytest.mark.asyncio
+async def test_landed_writes_are_counted_as_matched(monkeypatch):
+    """The control: same path, but the DB accepts. Without this, the test above would also pass
+    against an implementation that counted nothing at all."""
+    import scripts.backfill_pdp_category_path as bf
+
+    row = {
+        "product_key": "ext:brand-retro-matte-lipstick::abc",
+        "pivota_signature_id": "sig_x",
+        "brand": "MAC",
+        "category": None,
+        "category_path": "beauty/makeup",
+        "product_type": None,
+        "title": "Retro Matte Lipstick",
+    }
+    batches = [[row], []]
+
+    async def fake_fetch_all(query, values=None):
+        return batches.pop(0) if batches else []
+
+    async def fake_fetch_val(query, values=None):
+        return row["product_key"]  # the write lands
+
+    monkeypatch.setattr(bf.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(bf.database, "fetch_val", fake_fetch_val)
+    monkeypatch.setattr(bf.database, "is_connected", True, raising=False)
+
+    report = await bf.run_category_path_backfill(include_shallow=True, dry_run=False)
+    assert report["matched"] == 1, report
+    assert report["declined_by_guard"] == 0, report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before,ptype,changed", [
+    ("beauty/makeup", "Moisturizer", 1),
+    ("beauty/makeup", "Lipstick", 0),
+    ("beauty", "Lipstick", 0),
+    ("beauty/makeup", "Handbag", 1),
+])
+async def test_dry_run_reports_sibling_category_moves(monkeypatch, before, ptype, changed):
+    import scripts.backfill_pdp_category_path as bf
+    batches = [[{"product_key": "k", "category_path": before,
+                 "product_type": ptype, "title": "Opaque product"}], []]
+    async def fetch(*args, **kwargs):
+        return batches.pop(0) if batches else []
+    monkeypatch.setattr(bf.database, "fetch_all", fetch)
+    monkeypatch.setattr(bf.database, "is_connected", True, raising=False)
+    report = await bf.run_category_path_backfill(include_shallow=True, dry_run=True)
+    assert report["matched"] == 1
+    assert report["branch_changes"] == changed
+    assert len(report["branch_change_samples"]) == changed

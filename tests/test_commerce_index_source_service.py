@@ -9,6 +9,10 @@ def test_source_id_normalizes_legacy_antom_to_ucp() -> None:
     )
 
 
+def test_source_timestamps_are_naive_utc_for_v2_timestamp_columns() -> None:
+    assert module._utcnow().tzinfo is None
+
+
 @pytest.mark.asyncio
 async def test_active_catalog_source_records_authority_and_refresh_policy(monkeypatch) -> None:
     writes = []
@@ -60,6 +64,32 @@ async def test_antom_catalog_stays_pending_until_a_feed_adapter_exists() -> None
             provider="antom_catalog",
             status="active",
             consent_ref="antom-catalog-agreement:abc",
+        )
+
+
+@pytest.mark.asyncio
+async def test_public_web_is_active_evidence_only_without_merchant_consent(monkeypatch) -> None:
+    async def fake_execute(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(module.database, "execute", fake_execute)
+    result = await module.register_commerce_index_source(
+        merchant_id="agent_seed::brand",
+        provider="public_web",
+        status="active",
+        source_metadata={"base_url": "https://brand.example", "crawl_policy": {"evidence_only": True, "robots_checked": True}},
+    )
+    assert result["integration_layer"] == "evidence"
+    assert result["capabilities_json"]["catalog_pull"] is False
+    assert result["refresh_policy_json"]["catalog_refresh"] == "forbidden"
+
+
+@pytest.mark.asyncio
+async def test_public_web_requires_robots_checked() -> None:
+    with pytest.raises(ValueError, match="robots_checked"):
+        await module.register_commerce_index_source(
+            merchant_id="agent_seed::brand", provider="public_web", status="active",
+            source_metadata={"base_url": "https://brand.example", "crawl_policy": {"evidence_only": True}},
         )
 
 

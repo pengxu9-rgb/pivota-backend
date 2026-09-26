@@ -8,6 +8,7 @@ from sqlalchemy import Column, DateTime, String, Table, Text
 from sqlalchemy.dialects.postgresql import JSONB
 
 from db.database import database, metadata
+from db.schema_guard import guarded_add_columns, guarded_index
 from db.startup_ddl import execute_ddl
 from utils.logger import logger
 
@@ -74,13 +75,26 @@ async def ensure_quotes_table() -> None:
               notes TEXT
             );
             """,
-            "ALTER TABLE quotes ADD COLUMN IF NOT EXISTS quote_hash_sha256 CHAR(64);",
-            "ALTER TABLE quotes ADD COLUMN IF NOT EXISTS consumed_order_id VARCHAR(64);",
-            "CREATE INDEX IF NOT EXISTS idx_quotes_merchant_id ON quotes(merchant_id);",
-            "CREATE INDEX IF NOT EXISTS idx_quotes_status ON quotes(status);",
-            "CREATE INDEX IF NOT EXISTS idx_quotes_expires_at ON quotes(expires_at);",
-            "CREATE INDEX IF NOT EXISTS idx_quotes_request_fingerprint ON quotes(request_fingerprint);",
-            "CREATE INDEX IF NOT EXISTS idx_quotes_consumed_order_id ON quotes(consumed_order_id);",
+            # Guarded (db/schema_guard.py): bare, the first quote of every process
+            # took the table's ACCESS EXCLUSIVE lock (each index its SHARE lock)
+            # with no lock_timeout, even with every column and index already there.
+            *guarded_add_columns(
+                """
+                ALTER TABLE IF EXISTS quotes
+                  ADD COLUMN IF NOT EXISTS quote_hash_sha256 CHAR(64),
+                  ADD COLUMN IF NOT EXISTS consumed_order_id VARCHAR(64);
+                """
+            ),
+            *(
+                guarded_index(index)
+                for index in (
+                    "CREATE INDEX IF NOT EXISTS idx_quotes_merchant_id ON quotes(merchant_id);",
+                    "CREATE INDEX IF NOT EXISTS idx_quotes_status ON quotes(status);",
+                    "CREATE INDEX IF NOT EXISTS idx_quotes_expires_at ON quotes(expires_at);",
+                    "CREATE INDEX IF NOT EXISTS idx_quotes_request_fingerprint ON quotes(request_fingerprint);",
+                    "CREATE INDEX IF NOT EXISTS idx_quotes_consumed_order_id ON quotes(consumed_order_id);",
+                )
+            ),
         ]
         for stmt in statements:
             # A concurrent session may win the CREATE ... IF NOT EXISTS race;

@@ -1004,3 +1004,94 @@ async def test_recompute_no_ping_without_transition(monkeypatch) -> None:
     finally:
         await _cleanup()
         await _disconnect_if_needed(was_connected)
+
+
+# ── Multi-market storefronts ADR Phase 2: acquisition-market rows never serve (review of #2358, D3) ──
+
+def _decision_gates(monkeypatch, on: bool) -> None:
+    import services.agent_decision_gates as gates
+
+    monkeypatch.setattr(svc, "agent_decision_gates_enabled", lambda: on)
+    monkeypatch.setattr(gates, "agent_decision_gates_enabled", lambda: on)
+    monkeypatch.setattr(gates, "evidence_gates_enabled", lambda: False)
+
+
+async def _restamp_offer(ids: Dict[str, str], currency: str, market: str) -> None:
+    await database.execute(
+        "UPDATE catalog_offers SET currency = :cur, market = :mkt WHERE product_key = :pk",
+        {"cur": currency, "mkt": market, "pk": ids["product_key"]},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate_on", [False, True])
+@pytest.mark.parametrize("currency,market", [("AUD", "AU"), ("JPY", "JP"), ("AUD", "au")])
+async def test_a_row_priced_only_in_an_acquisition_market_never_serves_whatever_the_flag(
+    monkeypatch, gate_on, currency, market
+) -> None:
+    """A recompute in ANY process -- ENABLE_KBEAUTY_AGENT_DECISION_GATES off included -- keeps an AU/JP row
+    the retailer_ingest lane stored off the serving surface. has_price is currency-blind, so before this rule
+    a flag-off recompute served it."""
+    _decision_gates(monkeypatch, gate_on)
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product(f"acq_{currency}_{market}_{int(gate_on)}".lower())
+        await _restamp_offer(ids, currency, market)
+        assert await svc.recompute_serving_eligibility(ids["content_key"], reason="unit") is False
+        row = await _ips_row(ids["content_key"])
+        assert not row["serving_eligible"]
+        assert row["blocker_code"] == "no_us_offer"
+        assert "acquisition market" in row["blocker_detail"]  # the flag-independent rule decided it
+        assert bool(row["index_eligible"]) is True  # the offer-free citation floor is untouched
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate_on", [False, True])
+async def test_an_acquisition_row_with_a_usd_sibling_serves(monkeypatch, gate_on) -> None:
+    """The operator's step 2: a shopify_markets USD/US sibling beside the AUD/AU base offer makes it servable."""
+    _decision_gates(monkeypatch, gate_on)
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product(f"acq_sib_{int(gate_on)}")
+        await _restamp_offer(ids, "AUD", "AU")
+        await database.execute(
+            "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, list_price, currency, market)"
+            " VALUES (:o, :s, :pk, :m, 14.99, 'USD', 'US')",
+            {"o": f"offer_sib_{ids['product_key']}", "s": f"sku_{ids['product_key']}", "pk": ids["product_key"],
+             "m": ids["merchant_id"]},
+        )
+        assert await svc.recompute_serving_eligibility(ids["content_key"], reason="unit") is True
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate_on", [False, True])
+@pytest.mark.parametrize("currency", ["USD", "GBP", "SGD", "JPY", "INR"])
+async def test_the_acquisition_rule_changes_nothing_for_rows_without_an_acquisition_stamp(
+    monkeypatch, gate_on, currency
+) -> None:
+    """ZERO CHANGE for every row that exists today: all are stamped 'US' (the column default), including the
+    GBP/EUR/JPY no_us_offer residue and the SG rows (market 'US', currency 'SGD'). Their eligibility with the
+    rule equals their eligibility with it removed, flag on and flag off -- the rule is NOT
+    has_serving_region_offer made unconditional."""
+    _decision_gates(monkeypatch, gate_on)
+    was_connected = await _prepare_db()
+    try:
+        ids = await _insert_product(f"zero_{currency}_{int(gate_on)}".lower())
+        await _restamp_offer(ids, currency, "US")
+        with_rule = await svc.recompute_serving_eligibility(ids["content_key"], reason="unit")
+        with_rule_row = await _ips_row(ids["content_key"])
+        monkeypatch.setattr(svc, "_acquisition_only_priced", lambda row: False)
+        without_rule = await svc.recompute_serving_eligibility(ids["content_key"], reason="unit")
+        without_rule_row = await _ips_row(ids["content_key"])
+        assert (with_rule, with_rule_row["blocker_code"]) == (without_rule, without_rule_row["blocker_code"])
+        # ...and the verdict is today's: flag off serves any priced row; flag on serves USD only (US default).
+        assert with_rule is (currency == "USD" or not gate_on)
+    finally:
+        await _cleanup()
+        await _disconnect_if_needed(was_connected)

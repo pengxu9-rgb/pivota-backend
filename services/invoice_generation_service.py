@@ -11,6 +11,7 @@ import stripe
 
 from config.settings import settings
 from db.database import database
+from db.schema_guard import constraint_differs, guarded_add_columns, guarded_ddl, is_lock_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -143,10 +144,14 @@ INSERT INTO invoices (
 )
 """
 
+# Only a not-yet-finalized invoice moves to 'finalizing'. auto_advance can finalize
+# and charge it before this runs, so a webhook may already have written paid or
+# payment_failed: never pull an invoice back from a later state.
 _MARK_INVOICE_FINALIZING_QUERY = """
 UPDATE invoices
 SET status = 'finalizing'
 WHERE stripe_invoice_id = :stripe_invoice_id
+  AND status IN ('draft', 'finalizing')
 """
 
 _SELECT_INVOICE_DISPUTE_QUERY = """
@@ -204,29 +209,55 @@ SET status = 'applied',
 WHERE id = :invoice_dispute_id
 """
 
+def _recheck(table: str, name: str, check: str, definition: str) -> str:
+    """The DROP + ADD pair that resets `table`'s CHECK `name` to `check`, run only while
+    the constraint is not already exactly `definition` (its pg_get_constraintdef()), in
+    one transaction so the table is never seen without it."""
+    return guarded_ddl(
+        table,
+        constraint_differs(table, name, definition),
+        f"ALTER TABLE IF EXISTS {table} DROP CONSTRAINT IF EXISTS {name};\n"
+        f"ALTER TABLE IF EXISTS {table} ADD CONSTRAINT {name} CHECK ({check});",
+    )
+
+
+# Guarded (db/schema_guard.py). Bare, each of these took its table's ACCESS EXCLUSIVE
+# lock with no lock_timeout on the first billing call of every process, even with
+# nothing to change, and each CHECK was dropped, committed, then re-added with a
+# validating scan. Each now runs only while it is still needed, and one that cannot
+# get its lock in time fails fast (see _ensure_invoice_generation_schema).
 _SCHEMA_GUARD_STATEMENTS = (
-    "ALTER TABLE IF EXISTS invoices ADD COLUMN IF NOT EXISTS billing_run_id BIGINT",
-    "ALTER TABLE IF EXISTS invoices ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT",
-    "ALTER TABLE IF EXISTS billing_run_items ADD COLUMN IF NOT EXISTS voided_at TIMESTAMPTZ",
-    (
-        "ALTER TABLE IF EXISTS invoice_disputes "
-        "ADD COLUMN IF NOT EXISTS disputed_line_items_jsonb JSONB NOT NULL DEFAULT '[]'::jsonb"
+    *guarded_add_columns(
+        """
+        ALTER TABLE IF EXISTS invoices ADD COLUMN IF NOT EXISTS billing_run_id BIGINT;
+        ALTER TABLE IF EXISTS invoices ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+        ALTER TABLE IF EXISTS billing_run_items ADD COLUMN IF NOT EXISTS voided_at TIMESTAMPTZ;
+        ALTER TABLE IF EXISTS invoice_disputes
+          ADD COLUMN IF NOT EXISTS disputed_line_items_jsonb JSONB NOT NULL DEFAULT '[]'::jsonb;
+        """
     ),
-    "ALTER TABLE IF EXISTS invoices DROP CONSTRAINT IF EXISTS ck_invoices_status",
-    (
-        "ALTER TABLE IF EXISTS invoices ADD CONSTRAINT ck_invoices_status CHECK ("
+    _recheck(
+        "invoices",
+        "ck_invoices_status",
         "status IN ('draft', 'finalizing', 'finalized', 'paid', 'failed', "
-        "'payment_failed', 'void', 'uncollectible'))"
+        "'payment_failed', 'void', 'uncollectible')",
+        "CHECK ((status = ANY (ARRAY['draft'::text, 'finalizing'::text, 'finalized'::text, "
+        "'paid'::text, 'failed'::text, 'payment_failed'::text, 'void'::text, "
+        "'uncollectible'::text])))",
     ),
-    "ALTER TABLE IF EXISTS invoice_disputes DROP CONSTRAINT IF EXISTS ck_invoice_disputes_status",
-    (
-        "ALTER TABLE IF EXISTS invoice_disputes ADD CONSTRAINT ck_invoice_disputes_status CHECK ("
-        "status IN ('open', 'under_review', 'applied', 'resolved', 'rejected', 'cancelled'))"
+    _recheck(
+        "invoice_disputes",
+        "ck_invoice_disputes_status",
+        "status IN ('open', 'under_review', 'applied', 'resolved', 'rejected', 'cancelled')",
+        "CHECK ((status = ANY (ARRAY['open'::text, 'under_review'::text, 'applied'::text, "
+        "'resolved'::text, 'rejected'::text, 'cancelled'::text])))",
     ),
-    "ALTER TABLE IF EXISTS invoice_disputes DROP CONSTRAINT IF EXISTS ck_invoice_disputes_resolved_status",
-    (
-        "ALTER TABLE IF EXISTS invoice_disputes ADD CONSTRAINT ck_invoice_disputes_resolved_status CHECK ("
-        "resolved_at IS NULL OR status IN ('applied', 'resolved', 'rejected', 'cancelled'))"
+    _recheck(
+        "invoice_disputes",
+        "ck_invoice_disputes_resolved_status",
+        "resolved_at IS NULL OR status IN ('applied', 'resolved', 'rejected', 'cancelled')",
+        "CHECK (((resolved_at IS NULL) OR (status = ANY (ARRAY['applied'::text, "
+        "'resolved'::text, 'rejected'::text, 'cancelled'::text]))))",
     ),
 )
 
@@ -311,7 +342,12 @@ async def _ensure_invoice_generation_schema() -> None:
     for statement in _SCHEMA_GUARD_STATEMENTS:
         try:
             await database.execute(statement)
-        except Exception:
+        except Exception as exc:
+            if is_lock_timeout(exc):
+                # Busy, not broken: a later call retries instead of this process never.
+                _SCHEMA_GUARD_ATTEMPTED = False
+                logger.warning("Invoice generation schema guard deferred a statement: %s", exc)
+                continue
             logger.debug("Invoice generation schema guard skipped statement: %s", statement, exc_info=True)
 
 
@@ -483,6 +519,26 @@ async def generate_merchant_invoice(
 
     try:
         async with database.transaction():
+            # Hold every billed day's rollup lock (shared) for the whole write, and read the rows
+            # to bill UNDER it. A refund's re-roll takes the same lock exclusively, so it either
+            # lands before this read or waits for the invoices row and then leaves the day as billed
+            # (gmv_aggregation_service._aggregate_for_date). The read above only decides whether
+            # there is anything to bill; this one is what gets billed.
+            from services.gmv_aggregation_service import lock_billing_days
+
+            await lock_billing_days(period_start, period_end, db=database)
+            rows = await database.fetch_all(
+                _GMV_ROWS_QUERY,
+                {
+                    "merchant_id": merchant_id,
+                    "period_start": period_start,
+                    "period_end": period_end,
+                },
+            )
+            if not rows:
+                return None
+            total_cents = sum(_as_int(_get(row, "take_amount_cents")) for row in rows)
+
             invoice = await asyncio.to_thread(
                 stripe_client.v1.invoices.create,
                 params={

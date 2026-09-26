@@ -10,8 +10,10 @@ This applies migration 139's predicate (tombstone the redundant external_seed
 mirror when a live first-party sibling shares the content_key — reason
 `cross_merchant_redundant_external_seed`, seeds deliberately untouched, same
 as the 50-row precedent) narrowed to exactly these four keys, plus run-id
-metadata for revert. Migration 139 itself never re-ran for these (Railway
-skips db/migrations/ — only schema_guard-encoded steps execute on deploy).
+metadata for revert. Migration 139 itself never re-ran for these (production
+startup skips db/migrations/ — only schema_guard-encoded steps execute on
+deploy; that is the app's boot path, not a Railway quirk, and it is still true
+on Cloud Run).
 
 The 5th twin group from the review (anuko, url_audit sibling) is expressly
 EXCLUDED: an audit row never wins serving, so the seed row there is the real
@@ -129,7 +131,7 @@ async def _run(apply: bool) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,    formatter_class=argparse.RawDescriptionHelpFormatter,)
     parser.add_argument("--apply", action="store_true",
                         help="Write the suppressions (default is dry-run)")
     args = parser.parse_args()

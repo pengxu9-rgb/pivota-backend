@@ -19,7 +19,7 @@ class TestCORS:
         response = client.options(
             "/agent/v1/products/search",
             headers={
-                "Origin": "https://app.pivota.cc",
+                "Origin": "https://agents.pivota.cc",
                 "Access-Control-Request-Method": "GET",
                 "Access-Control-Request-Headers": "X-API-Key"
             }
@@ -34,7 +34,7 @@ class TestCORS:
         response = client.get(
             "/health",
             headers={
-                "Origin": "https://app.pivota.cc"
+                "Origin": "https://agents.pivota.cc"
             }
         )
         

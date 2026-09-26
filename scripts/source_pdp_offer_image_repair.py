@@ -749,7 +749,7 @@ async def probe_one(
         "need_image": not bool(row.get("has_image")),
     }
     try:
-        html, content_type = await _fetch_html(url)
+        html, content_type = await _fetch_html(url, max_wait=0)
     except Exception as exc:  # noqa: BLE001
         return {**base, "status": "fetch_failed", "error": str(exc)[:200]}
 

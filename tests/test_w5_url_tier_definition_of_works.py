@@ -423,6 +423,15 @@ def _patch_synthetic_worker(monkeypatch, *, submit_flag: bool, seed_rows):
 
     monkeypatch.setattr(worker, "_record_final_report_fields", _final)
 
+    # This test isolates URL indexing and already replaces report persistence.
+    # Projection persistence now has a strict read-back gate; keep that external
+    # DB boundary explicit rather than accidentally hitting an empty SQLite DB.
+    async def _recovery(**kw):
+        state['recovery_persisted'] = state.get('recovery_persisted', 0) + 1
+        return {}, {'projections_built': 6, 'projections_failed': 0, 'readback_mismatches': 0}
+    monkeypatch.setattr(worker, '_persist_url_recovery', _recovery)
+
+
     async def _cost(**kw):
         return {}
 
@@ -461,6 +470,7 @@ async def test_end_to_end_synthetic_run_submits_seed_url_when_flag_on(monkeypatc
 
     processed = await process_one_audit_run()
     assert processed is True
+    assert state["recovery_persisted"] == 1
     assert ("verifying", "completed") in state["transitions"]
 
     # materializing dispatched exactly the URL-tier set in dispatch_only mode.
@@ -489,6 +499,7 @@ async def test_end_to_end_synthetic_run_inert_when_flag_off(monkeypatch):
 
     processed = await process_one_audit_run()
     assert processed is True
+    assert state["recovery_persisted"] == 1
     assert ("verifying", "completed") in state["transitions"]
     assert state["submitted"] == []  # inert
 

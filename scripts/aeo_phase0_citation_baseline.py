@@ -99,9 +99,12 @@ Read-only: no DB writes, no feature flags, no merchant credit metering.
 
 Usage:
 
-  cd /Users/pengchydan/dev/PIVOTA-Agent
-  export PROMOTIONS_ADMIN_KEY="$(railway variables --kv \
-      | grep -m1 '^PROMOTIONS_ADMIN_KEY=' | cut -d= -f2-)"
+  # Runs LOCALLY (it calls public LLM endpoints and the public API); it needs
+  # only the admin key, which lives in Secret Manager. Most of this project's
+  # secrets carry an `env-` prefix - check the real name rather than trusting one
+  # written down: `gcloud secrets list --project pivota-prod | grep PROMOTIONS`.
+  export PROMOTIONS_ADMIN_KEY="$(gcloud secrets versions access latest \\
+      --secret=env-PROMOTIONS_ADMIN_KEY --project pivota-prod)"
   python3 /path/to/pivota-backend/scripts/aeo_phase0_citation_baseline.py \
       --output ~/dev/AEO_PHASE0_BASELINE_$(date +%F).md \
       --json-output /tmp/aeo_phase0_$(date +%F).json
@@ -135,7 +138,19 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple  # Tuple: batch grouping key
 
-DEFAULT_AGENT_URL = "https://pivota-agent-production.up.railway.app"
+# Production is Cloud Run behind gateway.pivota.cc. Route verified 2026-08-25: an
+# unauthenticated POST to PROBE_PATH there returns 401, i.e. present and
+# authenticating, not 404.
+#
+# This used to default to pivota-agent-production.up.railway.app. That host is now
+# GONE - 404 on every path including PROBE_PATH, with `x-railway-fallback: true`
+# from Railway's edge, meaning no service is bound to the domain - so the old
+# default did not merely measure the rollback, it could not complete a run at all.
+# It DID answer 200 earlier the same day, which is the point: a rollback host's
+# liveness is perishable, and while it lives, defaulting to it yields a citation
+# baseline that looks valid and describes a platform nobody is served from.
+# Re-probe before citing either state.
+DEFAULT_AGENT_URL = "https://gateway.pivota.cc"
 PROBE_PATH = "/internal/agent-center/llm-probe"
 
 # `HARD_MAX_RUNS` in src/internal/agentCenterLlmProbe.js. Requests asking for
@@ -880,9 +895,8 @@ def render_markdown(payload: Dict[str, Any], agg: Dict[str, Any], meta: Dict[str
     out.append("## Method (so this is re-runnable)")
     out.append("")
     out.append("```")
-    out.append("cd /Users/pengchydan/dev/PIVOTA-Agent")
-    out.append("export PROMOTIONS_ADMIN_KEY=\"$(railway variables --kv \\")
-    out.append("    | grep -m1 '^PROMOTIONS_ADMIN_KEY=' | cut -d= -f2-)\"")
+    out.append("export PROMOTIONS_ADMIN_KEY=\"$(gcloud secrets versions access latest \\")
+    out.append("    --secret=env-PROMOTIONS_ADMIN_KEY --project pivota-prod)\"")
     out.append("python3 <pivota-backend>/scripts/aeo_phase0_citation_baseline.py \\")
     out.append("    --output ~/dev/AEO_PHASE0_BASELINE_$(date +%F).md \\")
     out.append("    --json-output /tmp/aeo_phase0_$(date +%F).json")

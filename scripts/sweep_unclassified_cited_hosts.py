@@ -75,17 +75,28 @@ OPERATOR CADENCE
 ----------------
 Run after each audit batch, or weekly if audits trickle in:
 
+  This is a LOCAL script: it reads prod, then writes proposal JSON into your
+  working copy for you to review and PR. So it needs a DSN rather than a place to
+  run. Production is Cloud Run (pivota-prod/us-west1) on Cloud SQL; the Railway
+  public proxy it used to read is the ROLLBACK's database, and a queue computed
+  there proposes registry entries for hosts nobody is served from.
+
   cd /Users/pengchydan/dev/pivota-backend
-  railway run -- .venv/bin/python scripts/sweep_unclassified_cited_hosts.py \
-      --database-url "$DATABASE_PUBLIC_URL?sslmode=require" \
+  DB="$(gcloud secrets versions access latest --secret=DATABASE_URL --project pivota-prod)"
+  .venv/bin/python scripts/sweep_unclassified_cited_hosts.py \\
+      --database-url "$DB" \\
       --min-merchants 2
 
-  Connection notes (verified 2026-07-14 — this is the part that wastes an hour
+  (`DATABASE_URL` is one of the few secrets WITHOUT the `env-` prefix. Confirm
+  the name against the running service rather than trusting this line:
+  `gcloud run services describe web --project pivota-prod --region us-west1
+  --format=json` and read the secretKeyRef.)
+
+  Connection notes (the 2026-07-14 originals, still the part that wastes an hour
   if you get it wrong):
-    * Read over the PUBLIC proxy DSN, with `?sslmode=require`. asyncpg parses the
-      DSN with libpq semantics, so `require` encrypts the connection without
-      demanding a verifiable CA chain — which the proxy's self-signed chain
-      cannot provide.
+    * Keep whatever sslmode the DSN carries. asyncpg parses the DSN with libpq
+      semantics, so `require` encrypts the connection without demanding a
+      verifiable CA chain — which a self-signed proxy chain cannot provide.
     * The script connects with asyncpg directly rather than through
       `db.database`. That pool turns `sslmode=require` into FULL certificate
       verification, which the proxy fails — and it fails by hanging on pool
@@ -103,8 +114,8 @@ queue — that is the loop closing.
 Offline / no-DB usage — iterate on the heuristics without re-reading prod. Dump
 OUTSIDE the repo: the reports are large (61 MB for 174 runs) and hold prod data.
 
-  railway run -- .venv/bin/python scripts/sweep_unclassified_cited_hosts.py \
-      --database-url "$DATABASE_PUBLIC_URL?sslmode=require" \
+  .venv/bin/python scripts/sweep_unclassified_cited_hosts.py \\
+      --database-url "$DB" \\
       --dump-runs /tmp/audit_reports_dump.json              # one DB read
   .venv/bin/python scripts/sweep_unclassified_cited_hosts.py \
       --input-json /tmp/audit_reports_dump.json             # re-run offline

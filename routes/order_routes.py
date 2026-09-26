@@ -31,8 +31,10 @@ from db.orders import (
 )
 from db.orders import orders as orders_table
 from db.merchant_onboarding import get_merchant_onboarding
+from services.store_lifecycle_service import SUPPRESSED_ONBOARDING_STATUSES
 from db.products import log_order_event
 from db.database import database, IS_POSTGRES
+from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from utils.auth import require_admin, require_admin_or_key, get_current_user
 from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import create_payment_with_failover
@@ -51,6 +53,7 @@ from services.merchant_capability_gate import (
     capability_gate_permits_order_create,
 )
 from services.commerce_attribution_service import (
+    PIVOTA_ORDER_ID_NOTE_ATTR,
     PVT_CLICK_ID,
     PVT_PRODUCT_ID,
     PVT_PROMPT_CLUSTER,
@@ -534,6 +537,142 @@ def _test_psp_probe_merchants() -> set:
     return {m.strip().lower() for m in raw.split(",") if m.strip()}
 
 
+async def _merchant_active_psp_is_test_mode(merchant_id: Optional[str]) -> bool:
+    """True only when EVERY active processor for this merchant normalises to TEST.
+
+    Uses the repo's canonical `normalize_psp_environment`, which knows each provider's real key
+    shapes (stripe sk_/pk_live_, checkout sk_sbox_, adyen live_/test_, antom sandbox) and — crucially
+    — treats a key prefix as STRONGER evidence than the persisted `environment` column, returning
+    "unknown" when it cannot tell. Hand-rolling a stripe-only prefix check here silently graded an
+    adyen row holding `live_…` (and a checkout row holding `pk_live_…`, and a stripe row whose only
+    credential is in provider_config) as test-mode.
+
+    Fails CLOSED on: any row that is not "test", no rows at all, or any error. "unknown" is not
+    test — an unrecognised credential must never earn a test-mode bypass.
+    """
+    merchant = str(merchant_id or "").strip()
+    if not merchant:
+        return False
+    try:
+        from services.merchant_psp_config_service import (
+            fetch_active_merchant_psps,
+            normalize_psp_environment,
+        )
+
+        rows = await fetch_active_merchant_psps(merchant_id=merchant)
+    except Exception:
+        return False
+    if not rows:
+        return False
+    for row in rows:
+        record = row if isinstance(row, dict) else {}
+        provider = record.get("provider")
+        environment = record.get("environment")
+        # The RAW config, deliberately not `normalize_provider_config`: that helper SANITISES
+        # (for stripe it returns only mode/account_id/public_key/webhook_*), so it cannot see the
+        # secret this check exists to grade. It may be stored as a JSON string.
+        raw_config = record.get("provider_config")
+        if isinstance(raw_config, str):
+            try:
+                raw_config = json.loads(raw_config)
+            except Exception:
+                raw_config = None
+        config = raw_config if isinstance(raw_config, dict) else {}
+
+        # Non-Stripe credentials frequently live only in provider_config, so the primary key must
+        # look there too or the row is graded on a credential that does not exist.
+        candidates = [
+            record.get("runtime_secret_key"),
+            record.get("secret_key"),
+            record.get("api_key"),
+            config.get("secret_key"),
+            config.get("api_key"),
+            config.get("public_key"),
+        ]
+        primary_key = next((str(c) for c in candidates if str(c or "").strip()), "")
+        if normalize_psp_environment(provider, primary_key, environment) != "test":
+            return False
+        # Belt: no VISIBLE credential on the row may look live. `environment` is deliberately not
+        # passed here, so only the key prefix speaks — this catches a live secret hiding in
+        # provider_config behind an `environment` column that claims test.
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            if value and normalize_psp_environment(provider, value, None) == "live":
+                return False
+    return True
+
+
+# Fulfilment switches the Stripe webhook and the payment reconcile sweep read off ORDER metadata to
+# skip creating the merchant's platform (Shopify) order. Only the server may set them: the ops
+# canary writes them itself through db.orders.create_order. Order metadata on the create endpoint
+# is caller-supplied (the agent gateway forwards it verbatim), so an honoured caller value would
+# let any API caller get a PAID order that is never pushed to the merchant.
+_SERVER_ONLY_ORDER_METADATA_KEYS = ("ops_canary", "skip_platform_order_creation")
+
+
+def _strip_server_only_order_metadata(metadata: Dict[str, Any], *, merchant_id: Optional[str]) -> None:
+    dropped = [key for key in _SERVER_ONLY_ORDER_METADATA_KEYS if key in metadata]
+    for key in dropped:
+        metadata.pop(key, None)
+    if dropped:
+        logger.warning(
+            "[OrderRoutes] dropped server-only order metadata keys %s from a caller-supplied "
+            "order for merchant=%s",
+            dropped,
+            str(merchant_id or "").strip(),
+        )
+
+
+async def _apply_server_granted_test_psp_stamp(
+    metadata: Optional[Dict[str, Any]], merchant_id: Optional[str]
+) -> bool:
+    """Stamp an allowlisted probe merchant's order server-side, so the bypass no longer depends on
+    the CALLER remembering a URL parameter.
+
+    Why: a TEST processor is refused unless the order carries `allow_test_psp_surfaces`, and the
+    checkout page only sets that from a URL parameter. A buyer arriving through PDP -> add to bag
+    -> cart -> Checkout carries none, so payment always died "All PSPs blocked: stripe: Processor
+    is configured for test, not live" on a merchant explicitly allowlisted for the probe (observed
+    in production 2026-08-29: ORD_9F4C24E73705231D unstamped failed, ORD_50C00A24BEADFA78 stamped
+    paid — same merchant, same env).
+
+    This does not widen containment. The stamp was never a secret: order metadata is caller-supplied
+    and forwarded verbatim, so any caller could already set it for any merchant, and the gate has
+    always ignored it unless {ALLOW_TEST_PSP_PROBE on} + {merchant allowlisted}. What changes is
+    that the server now writes the stamp itself, gated additionally on the merchant's processors
+    ACTUALLY being test-mode — a guard the caller-supplied stamp never had.
+
+    Writing the stamp (rather than special-casing the gate) keeps every downstream reader —
+    `_resolve_order_live_readiness_requirement`, the payment SDK, and the Stripe webhook livemode
+    exemption — working on exactly the semantics they were reviewed under.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    # An explicit request to ENFORCE live readiness is the stricter choice and always wins.
+    if _coerce_metadata_bool(metadata.get("enforce_live_readiness")) is True:
+        return False
+    # Already permitted via a caller stamp — nothing to add.
+    if _resolve_order_live_readiness_requirement(metadata, merchant_id) is False:
+        return False
+    if not _test_psp_probe_enabled():
+        return False
+    if str(merchant_id or "").strip().lower() not in _test_psp_probe_merchants():
+        return False
+    if not await _merchant_active_psp_is_test_mode(merchant_id):
+        return False
+    metadata["allow_test_psp_surfaces"] = True
+    # Overwrite, never trust: this field is caller-supplied like the rest of order metadata, so a
+    # caller could otherwise forge "server_allowlist" on an order the server refused to stamp and
+    # make an incident review unable to tell the two apart.
+    metadata["test_psp_surfaces_granted_by"] = "server_allowlist"
+    logger.warning(
+        "[OrderRoutes] test-PSP bypass GRANTED server-side merchant=%s "
+        "(ALLOW_TEST_PSP_PROBE on, merchant allowlisted, all active processors normalise to test)",
+        str(merchant_id or "").strip(),
+    )
+    return True
+
+
 def _resolve_order_live_readiness_requirement(
     metadata: Optional[Dict[str, Any]], merchant_id: Optional[str] = None
 ) -> bool:
@@ -573,11 +712,36 @@ def _resolve_order_live_readiness_requirement(
 # see docs/protocol_checkout_capability_canary_runbook.md). Kept as a recognizable,
 # non-empty value so the downstream psp_type/psp_id validation passes without ever
 # resolving a real PSP adapter.
+# Both values below are written to `orders` (psp_used and psp_id), which enforces
+# CHECK check_psp_used_valid_provider and CHECK check_psp_id_format
+# (db/migrations/006_psp_fields_constraints.sql). Neither used to satisfy its
+# constraint, so this whole lane could not create a single order: turning
+# AGENT_CHECKOUT_CAPABILITY_GATE on would have 500'd every order it was meant to
+# enable, for exactly the merchants it targets. The flag is default-off, so it was
+# latent rather than live — the same silent writer/reader disagreement as the
+# psp_id-format defect fixed in 20f4542c, one env var away.
+#
+# 'protocol_deferred' is admitted by the widened list in migration 242.
 CAPABILITY_DEFERRED_PSP_PROVIDER = "protocol_deferred"
 
 
 def _capability_deferred_psp_id(merchant_id: str) -> str:
-    return f"{str(merchant_id or '').strip()}:protocol_deferred"
+    """A deferred-lane psp_id `orders` will accept.
+
+    check_psp_id_format is `^psp_[a-z0-9]+_[a-z0-9]{12}$`. This used to return
+    `f"{merchant_id}:protocol_deferred"` — a colon, no `psp_` prefix, no 12-char
+    suffix — which the CHECK refuses outright.
+
+    Still deterministic per merchant (the old value was, and a stable id keeps a
+    retry from minting a second identity for the same deferred order), still
+    recognisable as deferred, and still resolves to NO merchant_psps row, which is
+    the point: `_resolve_order_psp_adapter` finds nothing and refuses, so this id
+    can never select a real PSP adapter. The digest is hex, so it satisfies the
+    `[a-z0-9]{12}` class by construction; a collision between merchants is
+    harmless because nothing looks the value up.
+    """
+    digest = hashlib.sha256(str(merchant_id or "").strip().encode("utf-8")).hexdigest()
+    return f"psp_deferred_{digest[:12]}"
 
 
 async def _resolve_active_order_psp(
@@ -2188,8 +2352,16 @@ def _build_shopify_discount_order_annotations(
     order_id: str,
     pricing_quote_meta: Dict[str, Any],
 ) -> Tuple[List[str], List[Dict[str, str]]]:
+    # The Pivota order id is stamped on EVERY written-back order, quote or no
+    # quote. It is what lets the Shopify orders/* webhook recognise this order
+    # as Pivota-originated from its own body and emit the same canonical
+    # `pivota:<order id>` order_ref the Stripe bridge does — without it, the
+    # same purchase counts its GMV twice, once per namespace. It used to be
+    # built only alongside discount annotations, so a plain order carried no
+    # marker at all.
+    order_marker = [{"name": PIVOTA_ORDER_ID_NOTE_ATTR, "value": str(order_id)}]
     if not isinstance(pricing_quote_meta, dict) or not pricing_quote_meta:
-        return [], []
+        return [], order_marker
 
     tags: List[str] = []
     note_attributes: List[Dict[str, str]] = []
@@ -2215,7 +2387,7 @@ def _build_shopify_discount_order_annotations(
         note_attributes.append({"name": "pivota_payment_offer_evidence_hash", "value": payment_offer_hash})
 
     # Keep a stable cross-system join key even if the quote id is absent on a legacy row.
-    note_attributes.append({"name": "pivota_order_id", "value": str(order_id)})
+    note_attributes.extend(order_marker)
     return tags, note_attributes
 
 
@@ -3327,6 +3499,128 @@ async def _count_paid_merchant_order_failed_best_effort(
     return {"count": count, "available": True, "sampled": len(rows) >= 1000}
 
 
+# A page must not fire on work that is still in flight. EVERY dispatch path
+# marks the order paid BEFORE the merchant-order sync is dispatched, and the sync
+# then runs asynchronously — so a perfectly healthy order matches every other
+# conjunct below for as long as that sync takes (an advisory lock plus a platform
+# Admin API round trip, longer under rate-limit backoff). Without a floor this
+# counter has a positive resting value on any merchant with a nonzero order rate,
+# and `page_if_greater_than_zero_for_live_merchants` becomes unsatisfiable by
+# construction.
+#
+# 300s deliberately EXCEEDS the 120s used by the automated recovery lanes
+# (services/payment_reconcile and
+# jobs/agentic_commerce_reconciliation.reconcile_paid_orders_missing_merchant_order),
+# so recovery gets first crack at an order before a human is woken for it.
+_PAID_MISSING_MERCHANT_ORDER_MIN_AGE_SECONDS = 300
+
+# The fallback path's sample window. See the comment at its use site: a count
+# taken from a truncated window can be a confident zero.
+_PAID_MISSING_MERCHANT_ORDER_SAMPLE_LIMIT = 1000
+
+
+def _order_effective_timestamp(order: Dict[str, Any]) -> Optional[datetime]:
+    """`paid_at` if present, else `created_at`, normalized to naive UTC.
+
+    Returns None when neither is readable; callers treat that as "old enough to
+    count", because for a paging signal a missed page is worse than an early one.
+    """
+    raw = order.get("paid_at") or order.get("created_at")
+    if isinstance(raw, datetime):
+        value = raw
+    elif isinstance(raw, str):
+        try:
+            value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:  # noqa: BLE001
+            return None
+    else:
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+async def _count_paid_orders_missing_merchant_order_best_effort(
+    *,
+    merchant_id: Optional[str],
+) -> Dict[str, Any]:
+    """Paid orders with no merchant-platform order, REGARDLESS of any marker.
+
+    `_count_paid_merchant_order_failed_best_effort` requires
+    `metadata -> 'merchant_order' ->> 'status' = 'paid_merchant_order_failed'`.
+    That marker is written only by `_mark_merchant_order_sync_failed_best_effort`
+    — i.e. only when the sync attempt RAN and FAILED. A
+    `background_tasks.add_task` that died with the API process (Cloud Run
+    revision swap, scale-down) writes no marker at all, so the marker-based count
+    is structurally blind to it. Measured against prod on 2026-09-01: 33 such
+    orders, of which only 4 carried the marker.
+
+    This is the count to page on. The marker-based one narrows to attempts that
+    were observed to fail, which is a strict subset.
+
+    The `platform_order_id` conjunct mirrors `_get_linked_platform_order`: an
+    order synced to WooCommerce/Wix/BigCommerce records its id in metadata and
+    leaves `shopify_order_id` empty, so counting on `shopify_order_id` alone
+    would page on orders the merchant already received.
+    """
+    if IS_POSTGRES:
+        sql = """
+            SELECT COUNT(*) AS count
+            FROM orders
+            WHERE COALESCE(is_deleted, false) = false
+              AND payment_status = 'paid'
+              AND COALESCE(shopify_order_id, '') = ''
+              AND COALESCE(metadata -> 'merchant_order' ->> 'platform_order_id', '') = ''
+              AND COALESCE(paid_at, created_at)
+                  <= (NOW() - (:min_age_seconds * INTERVAL '1 second'))
+        """
+        values: Dict[str, Any] = {
+            "min_age_seconds": int(_PAID_MISSING_MERCHANT_ORDER_MIN_AGE_SECONDS),
+        }
+        if merchant_id:
+            sql += " AND merchant_id = :merchant_id"
+            values["merchant_id"] = merchant_id
+        result = await _count_sql_best_effort(sql, values)
+        if result.get("available"):
+            return result
+
+    limit = _PAID_MISSING_MERCHANT_ORDER_SAMPLE_LIMIT
+    try:
+        rows = await _fetch_paid_orders_missing_merchant_order(
+            merchant_id=merchant_id, limit=limit
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"count": None, "available": False, "error": str(exc)[:300]}
+
+    if len(rows) >= limit:
+        # `_fetch_paid_orders_missing_merchant_order` orders by created_at DESC,
+        # clamps at `limit`, and does NOT exclude linked platform orders in SQL —
+        # that filtering happens below, in Python. So a merchant with more than
+        # `limit` recent already-delivered orders pushes the genuinely missing
+        # ones out of the window and this path would report a confident 0.
+        # Report unknown instead: for a paging signal a false all-clear is the
+        # worst answer available.
+        return {
+            "count": None,
+            "available": False,
+            "error": f"sample window of {limit} exhausted; count is not trustworthy",
+        }
+
+    cutoff = datetime.utcnow() - timedelta(
+        seconds=_PAID_MISSING_MERCHANT_ORDER_MIN_AGE_SECONDS
+    )
+    count = 0
+    for order in rows:
+        if _get_linked_platform_order(order):
+            continue
+        stamp = _order_effective_timestamp(order)
+        if stamp is not None and stamp > cutoff:
+            # Still inside the sync window; not yet evidence of anything.
+            continue
+        count += 1
+    return {"count": count, "available": True}
+
+
 # ============================================================================
 # 订单创建（Agent 调用）
 # ============================================================================
@@ -3390,6 +3684,35 @@ async def create_new_order(
             raise merchant
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found")
+
+        # A rejected merchant must not take new orders. Registration
+        # auto-approves everyone, so rejection is the only lever an employee
+        # has, and until now it reached neither this path nor public serving —
+        # order creation checked that the merchant EXISTED and nothing else.
+        # Checked here because `merchant` is already loaded — no extra query —
+        # and because this handler is the convergence point for the agent order
+        # surfaces. An earlier version of this comment said "both order entry
+        # points" and named agent_v2 as calling this directly; both halves were
+        # wrong. There are several entrants and the hop is indirect:
+        # agent_v2 -> routes/agent_api.agent_create_order -> here, with
+        # agent_commerce, agent_checkout_intents (ACP complete) and the
+        # agent_shop_gateway proxy arriving the same way.
+        #
+        # It is NOT the only way to create an order in this codebase, and this
+        # gate does not claim to be. See the PR for the paths that reach a
+        # charge without passing here.
+        merchant_status = str(merchant.get("status") or "").strip().lower()
+        if merchant_status in SUPPRESSED_ONBOARDING_STATUSES:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "MERCHANT_NOT_ACCEPTING_ORDERS",
+                    "message": (
+                        "This merchant is not currently able to accept orders."
+                    ),
+                    "merchant_id": order_request.merchant_id,
+                },
+            )
 
         if _is_checkout_ui_order_create(order_request.metadata) and not order_request.quote_id:
             raise HTTPException(
@@ -3836,6 +4159,7 @@ async def create_new_order(
         
         # 合并订单元数据并记录促销信息（如果有）
         order_metadata: Dict[str, Any] = dict(order_request.metadata or {})
+        _strip_server_only_order_metadata(order_metadata, merchant_id=order_request.merchant_id)
         if getattr(order_request, "idempotency_key", None):
             order_metadata.setdefault("idempotency_key", str(order_request.idempotency_key))
         if getattr(order_request, "selected_payment_offer_id", None):
@@ -3938,6 +4262,7 @@ async def create_new_order(
 
         order_metadata["amounts_source"] = "quote_snapshot" if pricing_quote_meta else "legacy_incomplete"
         persisted_order_items = _build_persisted_order_items(order_request.items, pricing_quote_meta)
+        await _apply_server_granted_test_psp_stamp(order_metadata, order_request.merchant_id)
         enforce_live_readiness = _resolve_order_live_readiness_requirement(order_metadata, merchant_id=order_request.merchant_id)
         _t = time.perf_counter()
         explicit_preferred_provider = await _ensure_explicit_preferred_psp_available(
@@ -4640,20 +4965,13 @@ async def confirm_payment(
                 }
             )
             
-            # 后台任务：创建 Shopify 订单
-            async def create_shopify_order_task():
-                """创建 Shopify 订单通知商户发货"""
-                try:
-                    logger.info(f"Creating Shopify order for {payment_request.order_id}")
-                    success = await create_shopify_order(payment_request.order_id)
-                    if success:
-                        logger.info(f"Shopify order created successfully for {payment_request.order_id}")
-                    else:
-                        logger.error(f"Failed to create Shopify order for {payment_request.order_id}")
-                except Exception as e:
-                    logger.error(f"Error in Shopify order creation task: {e}")
-            
-            background_tasks.add_task(create_shopify_order_task)
+            # Durable enqueue — replaces `background_tasks.add_task`, which ran
+            # after the response in this process, with no retry, and died with a
+            # Cloud Run revision swap while the buyer was already charged.
+            await enqueue_merchant_order_create(
+                order_id=payment_request.order_id,
+                merchant_id=str(order.get("merchant_id") or ""),
+            )
 
             # Legacy Phase 5.5/6 merchant→agent commission system was deprecated
             # 2026-05-23. See docs/monetization/LEGACY_COMMISSION_SYSTEM_AUDIT.md.
@@ -4703,6 +5021,9 @@ async def get_transaction_safety_metrics(
     paid_merchant_order_failed_metric = await _count_paid_merchant_order_failed_best_effort(
         merchant_id=merchant_id,
     )
+    paid_missing_merchant_order_metric = await _count_paid_orders_missing_merchant_order_best_effort(
+        merchant_id=merchant_id,
+    )
     merchant_order_retry_success_event_metric = await _count_order_events_best_effort(
         event_type="merchant_order_retry_success",
         merchant_id=merchant_id,
@@ -4713,7 +5034,11 @@ async def get_transaction_safety_metrics(
     )
 
     metrics = {
-        # Active unresolved risk: paid Pivota orders that still lack a merchant-platform order.
+        # Active unresolved risk: paid Pivota orders that still lack a merchant-platform
+        # order. This is the complete figure — page on it.
+        "paid_missing_merchant_order_count": paid_missing_merchant_order_metric,
+        # Strict SUBSET of the above: only orders whose sync attempt ran and failed
+        # (a marker was written). Blind to a background task that died with the process.
         "paid_merchant_order_failed_count": paid_merchant_order_failed_metric,
         "paid_merchant_order_failed_active_count": dict(paid_merchant_order_failed_metric),
         # Historical event counters. These do not imply an active unresolved order.
@@ -4769,7 +5094,8 @@ async def get_transaction_safety_metrics(
         "merchant_id": merchant_id,
         "metrics": metrics,
         "alert_recommendations": {
-            "paid_merchant_order_failed_count": "page_if_greater_than_zero_for_live_merchants",
+            "paid_missing_merchant_order_count": "page_if_greater_than_zero_for_live_merchants",
+            "paid_merchant_order_failed_count": "subset_of_paid_missing_merchant_order_count_observed_failures_only_page_on_paid_missing_merchant_order_count",
             "paid_merchant_order_failed_active_count": "same_as_paid_merchant_order_failed_count_current_unresolved_risk",
             "merchant_order_retry_failed_count": "historical_event_count_not_page_by_itself_check_paid_merchant_order_failed_active_count",
             "merchant_order_retry_failed_event_count": "historical_event_count_not_page_by_itself_check_paid_merchant_order_failed_active_count",
@@ -4782,6 +5108,7 @@ async def get_transaction_safety_metrics(
         },
         "metric_semantics": {
             "active_unresolved_risk": [
+                "paid_missing_merchant_order_count",
                 "paid_merchant_order_failed_count",
                 "paid_merchant_order_failed_active_count",
                 "payment_capture_failed_count",
@@ -5412,6 +5739,14 @@ async def create_woocommerce_order(order_id: str) -> bool:
                     "payment_method": "pivota_external",
                     "payment_method_title": "Pivota External Payment",
                     "customer_note": f"Pivota Order ID: {order_id}",
+                    # Machine-readable twin of the customer_note above: the
+                    # WooCommerce webhook adapter reads it to emit the same
+                    # canonical `pivota:<order id>` order_ref the Stripe bridge
+                    # does, instead of a second `woocommerce:<native id>`
+                    # identity for the same purchase.
+                    "meta_data": [
+                        {"key": PIVOTA_ORDER_ID_NOTE_ATTR, "value": str(order_id)}
+                    ],
                     "billing": billing_address,
                     "shipping": shipping_address,
                     "line_items": line_items,

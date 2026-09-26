@@ -12,10 +12,20 @@ ALLOWED_FILES = {
     "scripts/smoke_pdp_governance_production.py",
     "tests/test_public_api_base_url.py",
     "tests/test_legacy_backend_url_guard.py",
+    # A post-cutover SECURITY AUDIT that reports the legacy host as a finding — it names the
+    # URL in order to say it must not be used, and even documents this guard. The guard exists
+    # to stop the old backend reappearing in runtime config, not to stop us writing about it.
+    # Added because it turned main red: the audit landed in #1826 without an entry here.
+    "docs/security/POST_CUTOVER_AUDIT_2026-08-22.md",
 }
 
 SKIP_DIRS = {
     ".git",
+    # `.claude` holds harness-managed worktrees (full repo copies) on dev
+    # machines only — each copy's config/settings.py etc. sits at a rel path
+    # not in ALLOWED_FILES, so every worktree fails the guard; same scanning
+    # problem the duplicate-order_routes.py guard in main.py had before #1906.
+    ".claude",
     ".mypy_cache",
     ".pytest_cache",
     "__pycache__",

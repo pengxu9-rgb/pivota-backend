@@ -19,7 +19,11 @@ Passive by design — it does not enqueue runs, so it never spends metered audit
 its own (active pair-enqueue is a deliberate follow-up needing a run budget).
 
 Reuses audit_delta's basis + score extraction so the canary and the merchant-facing
-delta can never disagree about "same basis" or "what the scores were".
+delta can never disagree about "same basis" or "what the scores were". That reuse
+is why this module reads `audit_basis` rows: "same basis" is now the FULL basis
+(model, official-domain set, tier mix, market), and audit_delta answers "unknown"
+without both runs' recorded rows — so a canary that did not fetch them would
+compare nothing at all, quietly, with its negative tests still green.
 """
 from __future__ import annotations
 
@@ -50,19 +54,40 @@ def _hours_between(a: Any, b: Any) -> Optional[float]:
 
 
 def stability_delta(
-    current_report: Dict[str, Any], prior_report: Dict[str, Any]
+    current_report: Dict[str, Any],
+    prior_report: Dict[str, Any],
+    *,
+    current_basis: Optional[Dict[str, Any]] = None,
+    prior_basis: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Pure: |Δ| per score between two runs, but ONLY when they share a measurement
-    basis (same pinned prompt set). Returns None when not comparable — different or
-    unknown basis (which also covers "the two runs were different SKUs", since their
-    prompt_set_ids differ), or no overlapping scores. Else
-    {deltas, max_delta, breach, basis_id}.
+    basis. Returns None when not comparable — a different or unknown pinned set
+    (which also covers "the two runs were different SKUs", since their
+    prompt_set_ids differ), a diverged RUN-LEVEL basis, or no overlapping scores.
+    Else {deltas, max_delta, breach, basis_id}.
+
+    THE TWO RUNS' RECORDED BASES ARE REQUIRED, not optional colour. Comparability
+    is now the full basis — model, official-domain set, tier mix, market — and
+    `measurement_basis_between` answers `None` when either side is missing, so a
+    caller that passes nothing gets `None` for every pair and this canary is
+    INERT while its own negative tests stay green. That is the failure mode this
+    signature exists to make visible: the fetch lives in
+    :func:`_bases_by_run_id`, :func:`_stability_pairs` threads it through, and
+    `test_pairs_without_bases_yield_nothing` pins the empty result so a dropped
+    fetch is a red test rather than a quiet page that never comes.
+
+    Requiring the full basis is also what the canary MEANS. It pages on residual
+    noise between two runs measured the same way; a model swap between them
+    explains the delta, so paging on it would be a false alarm about our own
+    measurement stability.
     """
     from services import audit_delta as ad
 
     cur_primary = ad._primary_report(current_report)
     pri_primary = ad._primary_report(prior_report)
-    basis = ad._measurement_basis(current_report, prior_report, cur_primary, pri_primary)
+    basis = ad.measurement_basis_between(
+        current_report, prior_report, current_basis, prior_basis
+    )
     if basis.get("same") is not True:
         return None
 
@@ -84,18 +109,72 @@ def stability_delta(
     }
 
 
-def _stability_pairs(rows: List[Dict[str, Any]], allow: set) -> List[Dict[str, Any]]:
-    """Pure: from window-scoped completed runs (grouped by merchant, newest-first),
-    form the comparable pair per merchant and evaluate stability. Only the two most
-    recent runs per merchant are considered; the pair must share a basis AND fall
-    within STABILITY_WINDOW_HOURS. Returns one result row per merchant that yielded
-    a genuine comparable pair (skips insufficient / not-comparable / too-far-apart)."""
+def _group_by_merchant(
+    rows: List[Dict[str, Any]], allow: set
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Window-scoped rows grouped by merchant, order preserved (newest-first).
+
+    Shared by :func:`_candidate_run_ids` and :func:`_stability_pairs` so the two
+    can never disagree about WHICH runs form a pair — a basis fetched for a run
+    the pairing does not use, or missing for one it does, would silently mute
+    the canary.
+    """
     by_merchant: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows or []:
         mid = r.get("merchant_id")
         if not mid or (allow and mid not in allow):
             continue
         by_merchant.setdefault(mid, []).append(r)
+    return by_merchant
+
+
+def _candidate_run_ids(rows: List[Dict[str, Any]], allow: set) -> List[str]:
+    """The run ids that can form a pair — the two most recent per merchant.
+
+    Bounded on purpose: the basis fetch is one query per id, and only these can
+    ever reach `stability_delta`.
+    """
+    out: List[str] = []
+    for runs in _group_by_merchant(rows, allow).values():
+        if len(runs) < 2:
+            continue
+        for r in runs[:2]:
+            rid = r.get("run_id")
+            if rid and rid not in out:
+                out.append(str(rid))
+    return out
+
+
+async def _bases_by_run_id(run_ids: List[str]) -> Dict[str, Any]:
+    """`{run_id: recorded basis or None}`. Best-effort per id: a lookup failure
+    mutes that ONE pair (its basis is unknown, so it is not comparable), never
+    the scan."""
+    from db.audit_basis import get_basis_for_run
+
+    out: Dict[str, Any] = {}
+    for rid in run_ids:
+        try:
+            out[rid] = await get_basis_for_run(rid)
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning("stability canary basis read failed for %s: %s", rid, str(exc)[:200])
+            out[rid] = None
+    return out
+
+
+def _stability_pairs(
+    rows: List[Dict[str, Any]], allow: set, bases: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Pure: from window-scoped completed runs (grouped by merchant, newest-first),
+    form the comparable pair per merchant and evaluate stability. Only the two most
+    recent runs per merchant are considered; the pair must share a basis AND fall
+    within STABILITY_WINDOW_HOURS. Returns one result row per merchant that yielded
+    a genuine comparable pair (skips insufficient / not-comparable / too-far-apart).
+
+    ``bases`` is `{run_id: recorded basis}` from :func:`_bases_by_run_id` — the
+    two runs' comparability evidence. Still pure: the caller does the reading.
+    """
+    bases = bases or {}
+    by_merchant = _group_by_merchant(rows, allow)
 
     out: List[Dict[str, Any]] = []
     for mid, runs in by_merchant.items():
@@ -105,7 +184,12 @@ def _stability_pairs(rows: List[Dict[str, Any]], allow: set) -> List[Dict[str, A
         gap_h = _hours_between(a.get("requested_at"), b.get("requested_at"))
         if gap_h is not None and gap_h > STABILITY_WINDOW_HOURS:
             continue  # comparable basis but time-separated → real trend, not a canary pair
-        result = stability_delta(a.get("report_jsonb") or {}, b.get("report_jsonb") or {})
+        result = stability_delta(
+            a.get("report_jsonb") or {},
+            b.get("report_jsonb") or {},
+            current_basis=bases.get(str(a.get("run_id") or "")),
+            prior_basis=bases.get(str(b.get("run_id") or "")),
+        )
         if result is None:
             continue  # different/unknown basis → not a comparable pair
         out.append({
@@ -129,7 +213,11 @@ async def run_stability_canary() -> Dict[str, Any]:
         logger.warning("stability canary scan failed: %s", str(exc)[:200])
         return {"error": str(exc)[:200]}
 
-    results = _stability_pairs(rows, set(_configured_merchants()))
+    allow = set(_configured_merchants())
+    # The pair's comparability evidence. Without it every pair reads as
+    # not-comparable and the canary never fires — see stability_delta.
+    bases = await _bases_by_run_id(_candidate_run_ids(rows, allow))
+    results = _stability_pairs(rows, allow, bases)
     for res in results:
         if res.get("status") != "breach":
             continue

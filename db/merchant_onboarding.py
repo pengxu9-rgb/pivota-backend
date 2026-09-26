@@ -6,6 +6,7 @@ Handles merchant registration, KYC verification, PSP setup, and API key issuance
 from sqlalchemy import Table, Column, Integer, String, DateTime, Boolean, Text, JSON, Float
 from sqlalchemy.sql import func
 from db.database import JSONB_TYPE, metadata, database
+from db.schema_guard import column_is_not_null, guarded_add_columns, guarded_ddl, is_lock_timeout
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 import secrets
@@ -68,7 +69,8 @@ _operating_mode_backstop_done = False
 async def ensure_operating_mode_column() -> None:
     """Backstop DDL for declared merchant mode (migration 164).
 
-    Prod skips the migration runner (applied via railway ssh / admin), so mirror
+    Prod skips the migration runner — a property of the app's boot path, not of
+    any one platform, and still true on Cloud Run — so mirror
     the repo's inline `ADD COLUMN IF NOT EXISTS` pattern (see
     update_platform_profile) to make signup self-heal: relax store_url NOT NULL
     and ensure the operating_mode discriminator exists. Idempotent + run-once
@@ -77,27 +79,42 @@ async def ensure_operating_mode_column() -> None:
     global _operating_mode_backstop_done
     if _operating_mode_backstop_done:
         return
+    # Guarded (db/schema_guard.py): bare, each of these took merchant_onboarding's
+    # ACCESS EXCLUSIVE lock with no lock_timeout on the first signup of every
+    # process, even with nothing to change. Each now runs only while it is still
+    # needed. One that times out on its lock is retried on the next signup
+    # instead of never in this process; any other failure is skipped as before.
+    deferred = False
     try:
         await database.execute(
-            "ALTER TABLE merchant_onboarding ALTER COLUMN store_url DROP NOT NULL"
+            guarded_ddl(
+                "merchant_onboarding",
+                column_is_not_null("merchant_onboarding", "store_url"),
+                "ALTER TABLE merchant_onboarding ALTER COLUMN store_url DROP NOT NULL;",
+            )
         )
     except Exception as e:  # pragma: no cover - already nullable / perms
+        deferred |= is_lock_timeout(e)
         print(f"⚠️ operating_mode backstop (store_url DROP NOT NULL) skipped: {e}")
     try:
-        await database.execute(
+        for statement in guarded_add_columns(
             "ALTER TABLE merchant_onboarding "
             "ADD COLUMN IF NOT EXISTS operating_mode VARCHAR(32) NOT NULL DEFAULT 'storefront'"
-        )
+        ):
+            await database.execute(statement)
     except Exception as e:  # pragma: no cover - already exists / perms
+        deferred |= is_lock_timeout(e)
         print(f"⚠️ operating_mode backstop (ADD COLUMN) skipped: {e}")
     try:
-        await database.execute(
+        for statement in guarded_add_columns(
             "ALTER TABLE merchant_onboarding "
             "ADD COLUMN IF NOT EXISTS signup_source VARCHAR(64)"
-        )
+        ):
+            await database.execute(statement)
     except Exception as e:  # pragma: no cover - already exists / perms / sqlite
+        deferred |= is_lock_timeout(e)
         print(f"⚠️ signup_source backstop (ADD COLUMN) skipped: {e}")
-    _operating_mode_backstop_done = True
+    _operating_mode_backstop_done = not deferred
 
 
 async def create_merchant_onboarding(merchant_data: Dict[str, Any]) -> str:
@@ -138,6 +155,20 @@ async def update_kyc_status(merchant_id: str, status: str, reason: Optional[str]
         "status": status,
         "updated_at": datetime.now()
     }
+    if status != "approved":
+        # `auto_approved` records that the AUTOMATIC path approved this merchant.
+        # It was set True at signup and never cleared, while the one gate that
+        # reads status — the PSP setup check in
+        # routes/merchant_onboarding_routes.py — passes when EITHER the status is
+        # approved OR auto_approved is set. Since registration auto-approves
+        # everyone, every merchant carried auto_approved=True, so rejecting one
+        # left it able to connect a payment provider exactly as before. Rejection
+        # was a no-op at the only place it was checked.
+        #
+        # Not restored on a later approval: an admin approving a rejected
+        # merchant is a manual decision, not an automatic one, and the gate
+        # passes on status alone.
+        update_data["auto_approved"] = False
     if status == "approved":
         update_data["verified_at"] = datetime.now()
         # Clear rejection reason on approval unless explicitly provided
@@ -242,10 +273,11 @@ async def get_all_merchant_onboardings(status: Optional[str] = None, include_del
 async def soft_delete_merchant_onboarding(merchant_id: str) -> bool:
     """Soft delete onboarding merchant by setting status='deleted' and removing user account"""
     # 1. Soft delete merchant onboarding record
-    query = merchant_onboarding.update().where(
-        merchant_onboarding.c.merchant_id == merchant_id
-    ).values(status="deleted", updated_at=datetime.now())
-    await database.execute(query)
+    # Through update_kyc_status, not a direct write. Setting status here on its
+    # own left `auto_approved` True, and the PSP gate passes on that flag — so a
+    # soft-deleted merchant could still connect a payment provider. The
+    # rejection path had exactly this bug; this is the same door one table over.
+    await update_kyc_status(merchant_id, "deleted")
     
     # 2. Also delete the user account to allow re-registration with same email
     try:
@@ -311,13 +343,18 @@ async def update_platform_profile(merchant_id: str, profile: Dict[str, Any]) -> 
     import json
     
     try:
-        # Ensure platform_profile column exists (Platform Onboarding v2)
-        await database.execute(
+        # Ensure platform_profile column exists (Platform Onboarding v2). Guarded
+        # (db/schema_guard.py): this runs on every profile update, and bare it took
+        # merchant_onboarding's ACCESS EXCLUSIVE lock with no lock_timeout even with
+        # the column there. A lock timeout (column missing, table busy) returns False
+        # like any other failure here.
+        for statement in guarded_add_columns(
             """
             ALTER TABLE merchant_onboarding
             ADD COLUMN IF NOT EXISTS platform_profile JSONB
             """
-        )
+        ):
+            await database.execute(statement)
 
         query = """
             UPDATE merchant_onboarding 

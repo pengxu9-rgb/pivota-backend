@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from typing import Any, Dict, List
 
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import ADMIN_ROLES, get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ class MigrationResponse(BaseModel):
 @router.post("/run-152-agent-pdp-evidence", response_model=MigrationResponse)
 async def run_migration_152(current_user: dict = Depends(get_current_user)) -> MigrationResponse:
     """Apply migration 152: agent_pdp_view.evidence_profile + required_disclaimers."""
-    if current_user.get("role") != "admin":
+    if current_user.get("role") not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
 
     steps: List[str] = []

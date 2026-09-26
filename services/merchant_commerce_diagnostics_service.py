@@ -54,6 +54,12 @@ async def build_merchant_commerce_funnel_issues(
 
     interaction_by_id = {str(row.get("interaction_id")): row for row in interactions if row.get("interaction_id")}
     click_by_id = {str(row.get("click_id")): row for row in click_rows if row.get("click_id")}
+    # ADR-025 D1: a row is written when its link is ISSUED. One nobody has followed yet is an
+    # offer, not a click, so it is not a click-quality problem; edges still join to it above.
+    followed_click_rows = [
+        row for row in click_rows
+        if int(row.get("click_count") or 0) > 0 or int(row.get("impression_count") or 0) > 0
+    ]
 
     buckets: Dict[str, Dict[str, Any]] = defaultdict(
         lambda: {
@@ -105,7 +111,7 @@ async def build_merchant_commerce_funnel_issues(
             },
         )
 
-    for row in click_rows:
+    for row in followed_click_rows:
         if not _normalize_text(row.get("canonical_variant_id")):
             add_issue(
                 "MISSING_INFO",
@@ -197,7 +203,7 @@ async def build_merchant_commerce_funnel_issues(
         "summary": {
             "interaction_count": len(interaction_by_id),
             "listing_rows_total": len(listing_rows),
-            "click_rows_total": len(click_rows),
+            "click_rows_total": len(followed_click_rows),
             "edge_rows_total": len(edge_rows),
         },
     }

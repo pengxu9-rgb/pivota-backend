@@ -4,14 +4,14 @@
 from fastapi import APIRouter, HTTPException, Depends
 from typing import Dict, Any
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
 from utils.logger import logger
 
 router = APIRouter(prefix="/admin/commission", tags=["Admin Commission Fix"])
 
 async def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
     """Require admin or employee role"""
-    if current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Admin or employee access required")
     return current_user
 

@@ -52,7 +52,9 @@ async def test_brand_query_strict_nonempty_but_irrelevant_triggers_broad_fallbac
         AsyncMock(return_value=["example.com"]),
     )
 
-    async def fake_build_external_seed_product(*, req, seed_row, allowed_domains=None, metrics_out=None):
+    async def fake_build_external_seed_product(
+        *, req, seed_row, allowed_domains=None, metrics_out=None, request_market=None
+    ):
         return {
             "product_id": str(seed_row.get("id") or ""),
             "id": str(seed_row.get("id") or ""),

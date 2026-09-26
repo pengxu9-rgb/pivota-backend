@@ -229,6 +229,15 @@ async def _record_probe_telemetry(
                     )
             except Exception:  # noqa: BLE001
                 pass  # cost is nice-to-have; row still records
+        if isinstance(usage, dict) and usage.get("cost_basis") in (
+            "published_list_price_upper_bound_2026_09_09", "unknown_model_pricing",
+        ):
+            # Gateway's versioned estimate already includes cache and search.
+            # Preserve unknown pricing as NULL, never add a second surcharge.
+            import math
+            estimate = usage.get("cost_usd_estimate")
+            cost_usd = (float(estimate) if type(estimate) in (int, float)
+                        and math.isfinite(estimate) and estimate >= 0 else None)
         await record_probe_run(
             provider=provider,
             scan_mode=scan_mode,

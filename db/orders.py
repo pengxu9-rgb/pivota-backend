@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import json
 
 from sqlalchemy import Table, Column, Integer, String, Text, DateTime, JSON, Numeric, Boolean
 from sqlalchemy.sql import func
@@ -13,7 +14,13 @@ import secrets
 import os
 from sqlalchemy import text
 
-from db.database import metadata, database
+from db.database import IS_POSTGRES, metadata, database
+from db.schema_guard import (
+    column_is_not_null,
+    column_type_differs,
+    guarded_add_columns,
+    guarded_ddl,
+)
 
 
 # ============================================================================
@@ -104,6 +111,13 @@ async def _ensure_client_secret_storage_allows_long_values() -> None:
     Older environments still carry `VARCHAR(500)`, which truncates Adyen sessions
     and makes client-owned confirmation surfaces invalid. We self-heal to `TEXT`
     once and keep the call best-effort.
+
+    Guarded (db/schema_guard.py): bare, the first long secret of every process
+    took ACCESS EXCLUSIVE on `orders` for an ALTER COLUMN TYPE with no
+    lock_timeout, queued behind any open transaction on the table with every
+    checkout queued behind it, although the column has long been TEXT. Now each
+    statement runs only while needed, under a 500ms lock_timeout; the process
+    retries on a later call until both have succeeded.
     """
     global _client_secret_storage_ready
 
@@ -113,29 +127,39 @@ async def _ensure_client_secret_storage_allows_long_values() -> None:
     async with _client_secret_storage_lock:
         if _client_secret_storage_ready:
             return
-        try:
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE orders
-                    ADD COLUMN IF NOT EXISTS client_secret TEXT
-                    """
-                )
-            )
-        except Exception:
-            pass
-        try:
-            await database.execute(
-                text(
-                    """
-                    ALTER TABLE orders
-                    ALTER COLUMN client_secret TYPE TEXT
-                    """
-                )
-            )
-        except Exception:
-            pass
-        _client_secret_storage_ready = True
+        if not IS_POSTGRES:
+            # Neither statement exists in SQLite; both always failed there.
+            _client_secret_storage_ready = True
+            return
+        healed = True
+        for statement in (
+            *guarded_add_columns(
+                "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS client_secret TEXT;"
+            ),
+            guarded_ddl(
+                "orders",
+                column_type_differs("orders", ("client_secret",), "text"),
+                "ALTER TABLE orders ALTER COLUMN client_secret TYPE TEXT;",
+            ),
+        ):
+            try:
+                await database.execute(statement)
+            except Exception:
+                healed = False
+        _client_secret_storage_ready = healed
+
+
+async def _heal_orders(sql: str) -> None:
+    """Run one of the error-path heals below guarded (db/schema_guard.py).
+
+    They fire on almost any failed insert or read (the triggers match a bare
+    substring such as "total" or "amount"), and bare each one took ACCESS
+    EXCLUSIVE on `orders` with no lock_timeout. Guarded, one whose column is
+    already there reads the catalog and takes no lock. A failure raises, as the
+    bare statement's did.
+    """
+    for statement in guarded_add_columns(sql):
+        await database.execute(statement)
 
 async def create_order(order_data: Dict[str, Any]) -> str:
     """创建新订单"""
@@ -156,106 +180,90 @@ async def create_order(order_data: Dict[str, Any]) -> str:
             from sqlalchemy import text
             if "column \"shipping_address\" of relation \"orders\" does not exist" in err or "shipping_address" in err:
                 # Add missing columns defensively
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS shipping_address JSONB;
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS shipping_address JSONB;"
+                )
             if "column \"items\" of relation \"orders\" does not exist" in err or " column \"items\"" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS items JSONB;
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS items JSONB;"
+                )
             if "column \"client_secret\" of relation \"orders\" does not exist" in err or "client_secret" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS client_secret TEXT;
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS client_secret TEXT;"
+                )
             if "column \"subtotal\" of relation \"orders\" does not exist" in err or "subtotal" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS subtotal NUMERIC(10,2);
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS subtotal NUMERIC(10,2);"
+                )
             if "column \"discount_total\" of relation \"orders\" does not exist" in err or "discount_total" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders
-                    ADD COLUMN IF NOT EXISTS discount_total NUMERIC(10,2) DEFAULT 0;
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS discount_total NUMERIC(10,2) DEFAULT 0;"
+                )
             if "column \"tax\" of relation \"orders\" does not exist" in err or "tax" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS tax NUMERIC(10,2);
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS tax NUMERIC(10,2);"
+                )
             if "column \"total\" of relation \"orders\" does not exist" in err or "total" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS total NUMERIC(10,2);
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS total NUMERIC(10,2);"
+                )
             if "column \"total_refunded\" of relation \"orders\" does not exist" in err or "total_refunded" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders
-                    ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;"
+                )
             if "column \"shipping_fee\" of relation \"orders\" does not exist" in err or "shipping_fee" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS shipping_fee NUMERIC(10,2);
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS shipping_fee NUMERIC(10,2);"
+                )
             if "column \"payment_status\" of relation \"orders\" does not exist" in err or "payment_status" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS payment_status VARCHAR(50);
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS payment_status VARCHAR(50);"
+                )
             if "column \"agent_id\" of relation \"orders\" does not exist" in err or "agent_id" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS agent_id VARCHAR(50);
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS agent_id VARCHAR(50);"
+                )
             if "column \"agent_session_id\" of relation \"orders\" does not exist" in err or "agent_session_id" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS agent_session_id VARCHAR(100);
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS agent_session_id VARCHAR(100);"
+                )
             if "column \"is_deleted\" of relation \"orders\" does not exist" in err or "is_deleted" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE;
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE;"
+                )
             if "column \"metadata\" of relation \"orders\" does not exist" in err or "metadata" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS metadata JSONB;
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS metadata JSONB;"
+                )
             if "column \"buyer_id\" of relation \"orders\" does not exist" in err or "buyer_id" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders
-                    ADD COLUMN IF NOT EXISTS buyer_id VARCHAR(50);
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS buyer_id VARCHAR(50);"
+                )
             if "column \"intent_id\" of relation \"orders\" does not exist" in err or "intent_id" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders
-                    ADD COLUMN IF NOT EXISTS intent_id VARCHAR(80);
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS intent_id VARCHAR(80);"
+                )
             if "column \"agent_user_ref\" of relation \"orders\" does not exist" in err or "agent_user_ref" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders
-                    ADD COLUMN IF NOT EXISTS agent_user_ref VARCHAR(255);
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS agent_user_ref VARCHAR(255);"
+                )
             if "column \"agent_scoped_buyer_ref\" of relation \"orders\" does not exist" in err or "agent_scoped_buyer_ref" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders
-                    ADD COLUMN IF NOT EXISTS agent_scoped_buyer_ref VARCHAR(128);
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS agent_scoped_buyer_ref VARCHAR(128);"
+                )
             if "column \"psp_used\" of relation \"orders\" does not exist" in err or "psp_used" in err or "Unconsumed column names: psp_used" in err:
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ADD COLUMN IF NOT EXISTS psp_used VARCHAR(50);
-                """))
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS psp_used VARCHAR(50);"
+                )
             if "null value in column \"amount\"" in err or "amount" in err:
                 # Drop NOT NULL constraint on amount column (we use total instead)
-                await database.execute(text("""
-                    ALTER TABLE orders 
-                    ALTER COLUMN amount DROP NOT NULL;
-                """))
+                await database.execute(
+                    guarded_ddl(
+                        "orders",
+                        column_is_not_null("orders", "amount"),
+                        "ALTER TABLE orders ALTER COLUMN amount DROP NOT NULL;",
+                    )
+                )
             # Retry the insert once after migration
             await database.execute(query)
             return order_id
@@ -280,8 +288,8 @@ async def get_order(order_id: str) -> Optional[Dict[str, Any]]:
             try:
                 from sqlalchemy import text
 
-                await database.execute(
-                    text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;")
+                await _heal_orders(
+                    "ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;"
                 )
                 result = await database.fetch_one(query)
             except Exception:
@@ -430,8 +438,23 @@ async def get_orders_by_customer(customer_email: str, limit: int = 50) -> List[D
     return [dict(r) for r in results]
 
 
+def _coerce_metadata_obj(value: Any) -> Dict[str, Any]:
+    """`orders.metadata` as a dict. Read through a raw TEXT query, asyncpg hands the JSON column
+    back as a `str` (no JSON codec is registered, and must not be: it double-encodes writes); only
+    a SQLAlchemy-typed select decodes it. Non-object / unparseable -> {}."""
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 async def update_order_status(
-    order_id: str, 
+    order_id: str,
     status: str, 
     **additional_fields
 ) -> bool:
@@ -460,9 +483,7 @@ async def update_order_status(
     if isinstance(update_data.get("metadata"), dict):
         existing_metadata = {}
         try:
-            existing_raw = before["metadata"] if before else None
-            if isinstance(existing_raw, dict):
-                existing_metadata = dict(existing_raw)
+            existing_metadata = _coerce_metadata_obj(before["metadata"] if before else None)
         except Exception:
             existing_metadata = {}
         # Metadata updates are additive by default. This prevents webhook/aftercare
@@ -728,6 +749,13 @@ async def update_fulfillment_info(
                 ful = str((row["fulfillment_status"] if row else "") or "").strip().lower()
                 merchant_id = str((row["merchant_id"] if row else "") or "").strip()
                 if paid and merchant_id and ful in {"shipped", "delivered"}:
+                    # Imported HERE, not at module scope: db/ -> services/ is a cycle. The name
+                    # was simply never imported, so every paid+shipped order raised NameError into
+                    # the enclosing except and no invitation was ever enqueued from this path.
+                    from services.reviews_invitation_send_jobs_service import (
+                        enqueue_invitation_send_job_from_order,
+                    )
+
                     await enqueue_invitation_send_job_from_order(
                         merchant_id=merchant_id,
                         order_id=order_id,
@@ -765,14 +793,29 @@ async def mark_order_shipped(
     if not ok:
         return False
     row = await database.fetch_one(
-        "SELECT merchant_id FROM orders WHERE order_id = :order_id LIMIT 1",
+        "SELECT merchant_id, payment_status FROM orders WHERE order_id = :order_id LIMIT 1",
         {"order_id": order_id},
     )
 
     # Best-effort invitation scheduling: enqueue a job for a worker service to send the email.
     try:
         merchant_id = str((row["merchant_id"] if row else "") or "").strip()
-        if merchant_id:
+        # PAID, like the two sibling sites. This one never checked, and it did not matter while
+        # the enqueue was dead — the missing import above meant every call raised NameError into
+        # the `except` below. Making the site live without the check would have let a merchant
+        # shipping an UNPAID order queue an invitation job. Two gates downstream still refuse it
+        # (`buyer_submit_enabled()` defaults off, and `_order_is_paid` 403s at send time), so the
+        # worst case was a junk pending row — but a site that relies on a downstream refusal is
+        # not guarded, it is lucky, and its two siblings guard it here.
+        paid = str((row["payment_status"] if row else "") or "").strip().lower() == "paid"
+        if paid and merchant_id:
+            # Same local import as the two sites above — db/ -> services/ is a cycle at module
+            # scope. This one was missing too, so the `except Exception: pass` below swallowed a
+            # NameError on every call and no invitation was ever enqueued from this path either.
+            from services.reviews_invitation_send_jobs_service import (
+                enqueue_invitation_send_job_from_order,
+            )
+
             await enqueue_invitation_send_job_from_order(
                 merchant_id=merchant_id,
                 order_id=order_id,

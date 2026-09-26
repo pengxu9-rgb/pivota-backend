@@ -1,5 +1,14 @@
 # Celestial Pivot Multi Release Runbook
 
+> ⚠️ **Production is GCP Cloud Run (`pivota-prod`, `us-west1`) since 2026-08-22. Railway is the
+> ROLLBACK.** The `railway ...` commands below have NOT been rewritten — they were left as-is
+> rather than translated by guesswork, because the procedures here were never re-verified against
+> GCP. Running one changes the platform nobody is served from: the incident continues while the
+> dial reads as turned. Translate with
+> [operating_on_gcp_production.md](../runbooks/operating_on_gcp_production.md) before acting, or treat this
+> document as a historical record of how the Railway rollout was done.
+
+
 ## Scope
 - Production target: `find_products_multi`
 - Serve canary model: `stage by source`
@@ -313,6 +322,15 @@ Bundle integration:
 ## Commerce Channels Signoff
 Run this after the all-sources observation window is green and production is stable.
 This signoff is intentionally direct and merchant-specific; it supplements the corpus-based release bundle instead of replacing it.
+
+Required auth:
+- admin/super_admin JWT for every `/v1/catalog/*` route (`ADMIN_JWT` below). These
+  routes are tenant-scoped: a non-admin token may only name the `merchant_id` in
+  its own `merchant_id` claim, so ADR-009 `merch_obs_*` observed-seller ids —
+  which no tenant token carries — are reachable by admins only.
+  This applies to `scripts/run_commerce_channels_signoff_batch.py` too, which fans
+  one `--header` set across every merchant case — so the batch run needs an admin
+  token for ALL cases, not just the single-merchant block below.
 
 ```bash
 ADMIN_JWT="$(python3 scripts/mint_employee_jwt.py \

@@ -4,10 +4,10 @@ Real-time metrics from agent_usage_logs table
 """
 from fastapi import APIRouter, Depends, Query, Request, Header, HTTPException
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from db.database import database
-from db.agents import resolve_agent_id_by_api_key
-from utils.auth import require_admin, decode_token
+from db.agents import resolve_active_agent_id, resolve_agent_id_by_api_key
+from utils.auth import ADMIN_ROLES, require_admin, decode_token
 
 router = APIRouter(prefix="/agent/metrics", tags=["Agent Metrics"])
 
@@ -38,7 +38,7 @@ async def get_metrics_summary(
                 role = payload.get("role")
                 if role in ["super_admin", "admin", "employee", "outsourced"]:
                     employee_context = True
-                agent_id = payload.get("agent_id")
+                agent_id = await resolve_active_agent_id(payload.get("agent_id"))
             except:
                 pass
         if not agent_id and x_api_key:
@@ -232,56 +232,45 @@ async def get_metrics_summary(
         }
 
 
-async def get_recent_activity(
-    request: Request,
-    limit: int = Query(5, ge=1, le=50),
-    authorization: Optional[str] = Header(None),
-    x_api_key: Optional[str] = Header(None, alias="x-api-key")
-) -> Dict[str, Any]:
+async def resolve_recent_activity_scope(
+    authorization: Optional[str],
+    x_api_key: Optional[str],
+    requested_agent_id: Optional[str],
+) -> Optional[str]:
+    """The agent_id whose agent_usage_logs rows the caller may read, or None for every agent.
+
+    Shared by /agent/metrics/recent and /agent/v1/metrics/recent. Both used to take `agent_id`
+    from the query string as the filter with no credential, and with neither it nor an x-api-key
+    they ran unfiltered, so an anonymous caller read every agent's calls.
+
+    - admin / super_admin JWT (ADMIN_ROLES, what require_admin admits): every agent, or the one
+      named by `agent_id`;
+    - agent JWT (its agent_id claim, the agent portal's session, through resolve_active_agent_id)
+      or x-api-key (through resolve_agent_id_by_api_key), of an ACTIVE agent: that agent only;
+      naming another agent is a 403;
+    - anything else: 401.
     """
-    Get recent agent activity - returns mock data for now
-    """
-    try:
-        # Resolve agent_id from JWT or X-API-Key
-        agent_id = None
-        if authorization and authorization.startswith("Bearer "):
-            try:
-                payload = decode_token(authorization.split(" ")[1])
-                agent_id = payload.get("agent_id")
-            except:
-                pass
-        if not agent_id and x_api_key:
-            agent_id = await resolve_agent_id_by_api_key(x_api_key)
-        if not agent_id:
-            raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
-        rows = await database.fetch_all(
-            """
-            SELECT id, endpoint, method, status_code, response_time_ms, timestamp
-            FROM agent_usage_logs
-            WHERE agent_id = :agent_id
-            ORDER BY timestamp DESC
-            LIMIT :limit
-            """,
-            {"agent_id": agent_id, "limit": limit}
-        )
-        activities = [
-            {
-                "id": str(r["id"]),
-                "method": r["method"],
-                "endpoint": r["endpoint"],
-                "status_code": r["status_code"],
-                "response_time_ms": r["response_time_ms"],
-                "timestamp": r["timestamp"].isoformat() if r["timestamp"] else None,
-            }
-            for r in rows
-        ]
-        return {"status": "success", "activities": activities, "total": len(activities)}
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e),
-            "activities": []
-        }
+    payload: Dict[str, Any] = {}
+    if authorization and authorization.startswith("Bearer "):
+        try:
+            payload = decode_token(authorization.split(" ", 1)[1]) or {}
+        except Exception:
+            payload = {}
+    if payload.get("role") in ADMIN_ROLES:
+        return requested_agent_id or None
+
+    # The claim proves who the caller was at login, not that the agent is still active.
+    caller_agent_id = await resolve_active_agent_id(payload.get("agent_id"))
+    if not caller_agent_id and x_api_key:
+        try:
+            caller_agent_id = await resolve_agent_id_by_api_key(x_api_key)
+        except Exception:
+            caller_agent_id = None
+    if not caller_agent_id:
+        raise HTTPException(status_code=401, detail="Missing or invalid agent credentials")
+    if requested_agent_id and requested_agent_id != caller_agent_id:
+        raise HTTPException(status_code=403, detail="Cannot read another agent's activity")
+    return str(caller_agent_id)
 
 
 @router.get("/agents")
@@ -289,6 +278,9 @@ async def get_agent_metrics(current_user: dict = Depends(require_admin)) -> Dict
     """
     Get per-agent usage metrics
     """
+    # agents has agent_name / owner_email / is_active (db/agents.py); this read name, company and
+    # status, which it does not have, so every call answered {"status": "error"}. A NULL is_active
+    # is active, the same as the auth door (routes/agent_auth.py).
     try:
         last_24h = datetime.now() - timedelta(hours=24)
         
@@ -296,9 +288,8 @@ async def get_agent_metrics(current_user: dict = Depends(require_admin)) -> Dict
             """
             SELECT 
                 a.agent_id,
-                a.name,
-                a.company,
-                a.status,
+                a.agent_name,
+                a.owner_email,
                 COUNT(l.id) as request_count,
                 AVG(l.response_time_ms) as avg_response_time,
                 SUM(CASE WHEN l.status_code < 400 THEN 1 ELSE 0 END)::float / 
@@ -307,8 +298,8 @@ async def get_agent_metrics(current_user: dict = Depends(require_admin)) -> Dict
             FROM agents a
             LEFT JOIN agent_usage_logs l ON a.agent_id = l.agent_id 
                 AND l.timestamp >= :since
-            WHERE a.status = 'active'
-            GROUP BY a.agent_id, a.name, a.company, a.status
+            WHERE a.is_active IS NOT FALSE
+            GROUP BY a.agent_id, a.agent_name, a.owner_email
             ORDER BY request_count DESC
             """,
             {"since": last_24h}
@@ -318,9 +309,9 @@ async def get_agent_metrics(current_user: dict = Depends(require_admin)) -> Dict
             "agents": [
                 {
                     "agent_id": row["agent_id"],
-                    "name": row["name"],
-                    "company": row["company"],
-                    "status": row["status"],
+                    "name": row["agent_name"],
+                    "owner_email": row["owner_email"],
+                    "status": "active",
                     "metrics_24h": {
                         "request_count": row["request_count"],
                         "avg_response_time_ms": round(float(row["avg_response_time"] or 0), 2),
@@ -355,7 +346,7 @@ async def get_metrics_timeline(
         if authorization and authorization.startswith("Bearer "):
             try:
                 payload = decode_token(authorization.split(" ")[1])
-                agent_id = payload.get("agent_id")
+                agent_id = await resolve_active_agent_id(payload.get("agent_id"))
             except:
                 pass
         if not agent_id and x_api_key:
@@ -395,6 +386,8 @@ async def get_metrics_timeline(
             "timestamp": datetime.now().isoformat()
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "status": "error",
@@ -452,32 +445,19 @@ async def get_recent_activity(
     limit: int = Query(20, le=100),
     offset: int = Query(0, ge=0),
     agent_id: Optional[str] = None,
-    request: Request = None
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key")
 ) -> Dict[str, Any]:
     """
     Get recent API activity/calls
     Returns last N activities with details
     """
     try:
-        # Filter by agent if not admin
         agent_filter = ""
         params = {"limit": limit, "offset": offset}
 
-        # Optional filtering by agent
-        resolved_agent_id = agent_id
-        if not resolved_agent_id:
-            # Try to resolve from x-api-key header
-            api_key = request.headers.get("x-api-key") if request else None
-            if api_key:
-                # A presented key that does not resolve is a 401, never "no filter" (the unfiltered
-                # query would hand every agent's activity to the caller).
-                try:
-                    resolved_agent_id = await resolve_agent_id_by_api_key(api_key)
-                except Exception:
-                    resolved_agent_id = None
-                if not resolved_agent_id:
-                    raise HTTPException(status_code=401, detail="Invalid API key")
-
+        # None only for an admin reading every agent; see resolve_recent_activity_scope.
+        resolved_agent_id = await resolve_recent_activity_scope(authorization, x_api_key, agent_id)
         if resolved_agent_id:
             agent_filter = "WHERE agent_id = :agent_id"
             params["agent_id"] = resolved_agent_id
@@ -500,26 +480,31 @@ async def get_recent_activity(
             params
         )
         
-        # Format activities
+        # Format activities. agent_usage_logs.timestamp is timestamptz: a naive now() raised on the
+        # first row and the catch-all below answered an empty "success". status_code and timestamp
+        # are nullable, and one row that raised here emptied the whole list the same way.
+        now = datetime.now(timezone.utc)
         formatted_activities = []
         for activity in activities:
             timestamp = activity["timestamp"]
-            time_diff = datetime.now() - timestamp
-            
-            if time_diff.days > 0:
-                time_ago = f"{time_diff.days} days ago"
-            elif time_diff.seconds > 3600:
-                time_ago = f"{time_diff.seconds // 3600} hours ago"
-            elif time_diff.seconds > 60:
-                time_ago = f"{time_diff.seconds // 60} minutes ago"
-            else:
-                time_ago = "Just now"
+            status_code = activity["status_code"]
+            time_ago = None
+            if timestamp is not None:
+                time_diff = now - timestamp
+                if time_diff.days > 0:
+                    time_ago = f"{time_diff.days} days ago"
+                elif time_diff.seconds > 3600:
+                    time_ago = f"{time_diff.seconds // 3600} hours ago"
+                elif time_diff.seconds > 60:
+                    time_ago = f"{time_diff.seconds // 60} minutes ago"
+                else:
+                    time_ago = "Just now"
             
             # Determine activity type from endpoint
             endpoint = activity["endpoint"]
             if "/orders" in endpoint:
                 activity_type = "order"
-                action = "Order Completed" if activity["status_code"] < 300 else "Order Failed"
+                action = "Order Completed" if status_code is not None and status_code < 300 else "Order Failed"
             elif "/catalog/search" in endpoint or "/products" in endpoint:
                 activity_type = "search"
                 action = "Product Search"
@@ -533,14 +518,25 @@ async def get_recent_activity(
                 activity_type = "api"
                 action = f"{activity['method']} {endpoint}"
             
+            # The raw row fields and an ISO timestamp are what the agent portal renders
+            # (pivota-agents-portal: dashboard + LogsPage read method / endpoint / status_code /
+            # response_time_ms and parse `timestamp` as a date), the same fields
+            # /agent/v1/metrics/recent serves. `timestamp` used to be the relative string, now
+            # `time_ago`; nothing read it.
             formatted_activities.append({
                 "id": str(activity["id"]),
+                "agent_id": activity["agent_id"],
+                "method": activity["method"],
+                "endpoint": endpoint,
+                "status_code": status_code,
+                "response_time_ms": activity["response_time_ms"],
+                "timestamp": timestamp.isoformat() if timestamp is not None else None,
+                "time_ago": time_ago,
                 "type": activity_type,
                 "action": action,
-                "description": f"{activity['method']} {endpoint} → {activity['status_code']}",
+                "description": f"{activity['method']} {endpoint} → {status_code}",
                 "response_time": activity["response_time_ms"],
-                "timestamp": time_ago,
-                "status": "success" if activity["status_code"] < 400 else "error"
+                "status": "success" if status_code is not None and status_code < 400 else "error"
             })
         
         return {

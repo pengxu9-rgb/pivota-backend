@@ -1,0 +1,353 @@
+"""
+An external seed's product-level stock claim is the seed's own, not a constant.
+
+THE DEFECT. Both routed seed builders hard-coded `in_stock: True,
+inventory_quantity: 999` for every seed whose catalog facts the referral gate
+accepts, whatever `external_product_seeds.availability` said. agent_v2 publishes
+that boolean as `offers[].availability.in_stock`, and the gateway lets a boolean
+`in_stock` outrank every other stock signal, so a seed stored `out_of_stock` was
+advertised in stock.
+
+UNKNOWN IS NOT IN STOCK. The builders' old `_availability_to_in_stock` read an
+absent value as in stock. The rule now lives in `services/external_seed_stock`,
+reads every value through the shared availability vocabulary, and serves an
+unknown claim as `availability: "unknown"` with NO boolean — the shape the
+live-verification branch already serves. A variant with no signal of its own
+inherits a KNOWN product claim; with an unknown product it gets no boolean.
+
+A CONTRADICTED COLUMN SILENCES THE VARIANTS. The nightly refresh re-reads the
+column from the page but rewrites stored variants only sometimes, so when the
+two disagree the variants are the likelier-stale side (27 live seeds on
+2026-09-25, served an in-stock variant under an out_of_stock column).
+
+Parametrised over both builders: `routes/agent_sdk_fixed.py` holds a second
+copy and both are routed.
+"""
+
+from __future__ import annotations
+
+import importlib
+from typing import Any, Dict, List, Optional
+
+import pytest
+
+
+class _FakeReq:
+    base_url = "https://api.pivota.cc/"
+
+
+_MODULES = ["routes.agent_api", "routes.agent_sdk_fixed"]
+
+
+def _seed_row(
+    *,
+    availability: Any,
+    variants: Optional[List[Dict[str, Any]]] = None,
+    seed_data_extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    seed_data: Dict[str, Any] = {
+        "brand": "Round Lab",
+        "title": "Round Lab Sheet Mask Sampler 9pc",
+        "variants": variants or [],
+    }
+    seed_data.update(seed_data_extra or {})
+    return {
+        "id": "seed:catalog_enrichment_agent_v1:85dd4c56da58a259",
+        "external_product_id": "round-lab:85dd4c56da58a259",
+        "market": "US",
+        "title": "Round Lab Sheet Mask Sampler 9pc",
+        "price_amount": 18.0,
+        "price_currency": "USD",
+        "availability": availability,
+        "destination_url": "https://roundlab.com/products/sheet-mask-sampler",
+        "canonical_url": "https://roundlab.com/products/sheet-mask-sampler",
+        "domain": "roundlab.com",
+        "status": "active",
+        "seed_data": seed_data,
+    }
+
+
+def _variant(vid: str, availability: Any) -> Dict[str, Any]:
+    return {
+        "variant_id": vid,
+        "title": f"Variant {vid}",
+        "price_amount": 18.0,
+        "price_currency": "USD",
+        "availability": availability,
+    }
+
+
+async def _build(
+    module_path: str,
+    seed_row: Dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    live_verification: bool = False,
+) -> Dict[str, Any]:
+    module = importlib.import_module(module_path)
+    status = None
+    if live_verification:
+        status = type(
+            "GateStatus",
+            (),
+            {
+                "status": "blocked",
+                "gating_policy_version": "external_referral_v1",
+                # What the round-lab seed actually carried in prod on 2026-09-25.
+                "blocker_anomaly_types": ["destination_never_verified", "stale_snapshot"],
+                "review_anomaly_types": [],
+            },
+        )()
+
+    async def _gate(row, **kwargs):
+        return (False, status)
+
+    monkeypatch.setattr(module, "should_block_external_referral_runtime", _gate)
+    product = await module._build_external_seed_product(
+        req=_FakeReq(), seed_row=seed_row, allowed_domains=["roundlab.com"],
+    )
+    assert product is not None, f"{module_path} builder returned None"
+    assert product["commerce_verification"]["required"] is live_verification
+    return product
+
+
+def _stock(d: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: d[k] for k in ("in_stock", "inventory_quantity", "availability") if k in d}
+
+
+OUT = {"in_stock": False, "inventory_quantity": 0, "availability": "out_of_stock"}
+IN = {"in_stock": True, "inventory_quantity": 999}
+UNKNOWN = {"availability": "unknown"}
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.asyncio
+async def test_an_out_of_stock_seed_is_not_advertised_in_stock(module_path, monkeypatch):
+    seed = _seed_row(
+        availability="out_of_stock",
+        variants=[_variant("1", "out_of_stock"), _variant("2", "out_of_stock")],
+    )
+    product = await _build(module_path, seed, monkeypatch)
+    assert _stock(product) == OUT
+    assert [v["in_stock"] for v in product["variants"]] == [False, False]
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.asyncio
+async def test_the_synthesised_default_variant_carries_the_same_claim(module_path, monkeypatch):
+    product = await _build(module_path, _seed_row(availability="out_of_stock"), monkeypatch)
+    assert _stock(product) == OUT
+    assert len(product["variants"]) == 1
+    assert _stock(product["variants"][0]) == OUT
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.asyncio
+async def test_an_in_stock_seed_keeps_todays_shape(module_path, monkeypatch):
+    seed = _seed_row(availability="in_stock", variants=[_variant("1", "in_stock")])
+    product = await _build(module_path, seed, monkeypatch)
+    # No `availability` key added: the 10,636 in-stock seeds serve byte-identical stock fields.
+    assert _stock(product) == IN
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.asyncio
+async def test_a_seed_with_no_stock_signal_is_unknown_not_in_stock(module_path, monkeypatch):
+    product = await _build(module_path, _seed_row(availability=None), monkeypatch)
+    assert _stock(product) == UNKNOWN
+    assert "in_stock" not in product
+    assert _stock(product["variants"][0]) == UNKNOWN
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.parametrize(
+    "variant_availability, expected",
+    [
+        (["out of stock", "Sold Out"], OUT),
+        (["in stock", "out_of_stock"], IN),
+        # One variant unclassifiable: not every variant is known out, so no claim.
+        (["out_of_stock", None], UNKNOWN),
+    ],
+)
+@pytest.mark.asyncio
+async def test_without_a_column_the_explicit_variants_decide(
+    module_path, variant_availability, expected, monkeypatch
+):
+    seed = _seed_row(
+        availability="",
+        variants=[_variant(str(i), a) for i, a in enumerate(variant_availability)],
+    )
+    product = await _build(module_path, seed, monkeypatch)
+    assert _stock(product) == expected
+    if expected == UNKNOWN:
+        # A variant with no signal of an unknown product: no boolean, not in stock.
+        assert _stock(product["variants"][1]) == UNKNOWN
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.parametrize(
+    "column, variant_availability",
+    [
+        ("out_of_stock", ["out_of_stock", "in_stock"]),
+        ("in_stock", ["out_of_stock", "out_of_stock"]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_column_the_variants_contradict_is_unknown(
+    module_path, column, variant_availability, monkeypatch
+):
+    seed = _seed_row(
+        availability=column,
+        variants=[_variant(str(i), a) for i, a in enumerate(variant_availability)],
+    )
+    product = await _build(module_path, seed, monkeypatch)
+    assert _stock(product) == UNKNOWN
+    # The variants are withheld too, not served on their own (likely stale) signals.
+    assert [_stock(v) for v in product["variants"]] == [UNKNOWN] * len(variant_availability)
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.parametrize(
+    "seed_data_extra, variants",
+    [
+        # roundlab.com eps_0a5f2785ba840d9fb02ce4b4 as served 2026-09-25: the refresh
+        # re-read the page (column + snapshot out) but left the ingest-time variant and
+        # seed_data.availability at in_stock.
+        (
+            {"availability": "in_stock", "snapshot": {"availability": "out_of_stock"}},
+            [_variant("1", "in_stock")],
+        ),
+        # k-touch.us: one shade out, the rest in, column out.
+        (
+            {"availability": "out_of_stock", "snapshot": {"availability": "out_of_stock"}},
+            [_variant("1", "out_of_stock"), _variant("2", "in_stock"), _variant("3", "in_stock")],
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_stale_in_stock_variant_under_an_out_of_stock_column_is_not_served_in_stock(
+    module_path, seed_data_extra, variants, monkeypatch
+):
+    seed = _seed_row(availability="out_of_stock", variants=variants, seed_data_extra=seed_data_extra)
+    product = await _build(module_path, seed, monkeypatch)
+    assert _stock(product) == UNKNOWN
+    served = product["variants"]
+    assert served, "variants are still listed"
+    assert not any(v.get("in_stock") is True for v in served)
+    assert all(_stock(v) == UNKNOWN for v in served)
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"availability": "sold out"},
+        {"snapshot": {"availability": "out_of_stock"}},
+    ],
+)
+@pytest.mark.asyncio
+async def test_seed_data_availability_is_the_last_fallback(module_path, extra, monkeypatch):
+    product = await _build(
+        module_path, _seed_row(availability=None, seed_data_extra=extra), monkeypatch
+    )
+    assert _stock(product) == OUT
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.asyncio
+async def test_the_live_verification_branch_still_withholds_stock(module_path, monkeypatch):
+    seed = _seed_row(
+        availability="in_stock", variants=[_variant("1", "in_stock")]
+    )
+    product = await _build(module_path, seed, monkeypatch, live_verification=True)
+    assert _stock(product) == UNKNOWN
+    assert product["buyable"] is False
+    assert product["checkout_ready"] is False
+    assert product["variants"] == []
+
+
+@pytest.mark.asyncio
+async def test_in_stock_only_and_agent_v2_read_the_seeds_own_claim(monkeypatch):
+    import routes.agent_api as agent_api
+    from routes.agent_v2 import _canonicalize_search_product
+
+    def _passes(product):
+        return agent_api._passes_explicit_commerce_filters(
+            product, in_stock_only=True, min_price=None, max_price=None
+        )
+
+    out = await _build(
+        "routes.agent_api", _seed_row(availability="out_of_stock"), monkeypatch
+    )
+    in_ = await _build("routes.agent_api", _seed_row(availability="in_stock"), monkeypatch)
+    unknown = await _build("routes.agent_api", _seed_row(availability=None), monkeypatch)
+
+    assert _passes(out) is False
+    assert _passes(in_) is True
+    # Unknown stays discoverable without in_stock_only, but never claims a strict match.
+    assert _passes(unknown) is False
+
+    assert [o["availability"]["in_stock"] for o in _canonicalize_search_product(out)["offers"]] == [False]
+    assert [o["availability"]["in_stock"] for o in _canonicalize_search_product(in_)["offers"]] == [True]
+    # Was a KNOWN GAP (agent_v2 defaulted the missing `in_stock` to True); flipped
+    # deliberately: unknown is published as null, never True and never False. Consumer
+    # audit + gateway run: tests/test_agent_v2_unknown_seed_stock_is_null.py.
+    assert [o["availability"]["in_stock"] for o in _canonicalize_search_product(unknown)["offers"]] == [None]
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.asyncio
+async def test_a_variant_with_no_signal_inherits_the_product_claim(module_path, monkeypatch):
+    seed = _seed_row(
+        availability="out_of_stock",
+        variants=[_variant("1", None), _variant("2", "")],
+    )
+    product = await _build(module_path, seed, monkeypatch)
+    assert _stock(product) == OUT
+    # The gateway's offer card reads the VARIANT's in_stock before the product's.
+    assert [(v["in_stock"], v["inventory_quantity"]) for v in product["variants"]] == [
+        (False, 0),
+        (False, 0),
+    ]
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.asyncio
+async def test_a_variants_own_explicit_signal_beats_the_product_claim(module_path, monkeypatch):
+    # "out of stock" with a space read as IN stock under the old variant parser.
+    seed = _seed_row(
+        availability="in_stock",
+        variants=[_variant("1", "in stock"), _variant("2", "out of stock")],
+    )
+    product = await _build(module_path, seed, monkeypatch)
+    assert _stock(product) == IN
+    assert [v["in_stock"] for v in product["variants"]] == [True, False]
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.parametrize("column", ["https://schema.org/OutOfStock", "OOS", "Sold Out"])
+@pytest.mark.asyncio
+async def test_any_out_of_stock_spelling_the_shared_vocabulary_knows(module_path, column, monkeypatch):
+    product = await _build(module_path, _seed_row(availability=column), monkeypatch)
+    assert _stock(product) == OUT
+
+
+@pytest.mark.parametrize("module_path", _MODULES)
+@pytest.mark.asyncio
+async def test_snapshot_only_variants_give_both_lanes_the_same_claim(module_path, monkeypatch):
+    # agent_sdk_fixed's own variant reader has no snapshot fallback; the claim must not
+    # depend on which routed builder served the seed.
+    seed = _seed_row(
+        availability="out_of_stock",
+        seed_data_extra={"variants": None, "snapshot": {"variants": [_variant("1", "in_stock")]}},
+    )
+    product = await _build(module_path, seed, monkeypatch)
+    assert _stock(product) == UNKNOWN
+
+
+@pytest.mark.parametrize("availability", ["in_stock", "out_of_stock", None])
+def test_the_live_verification_path_gives_no_variant_a_boolean(availability):
+    from services.external_seed_stock import seed_variant_stock_fields
+
+    # stock=None is the live-verification path: nothing stored is trusted.
+    assert seed_variant_stock_fields(availability, None) == UNKNOWN

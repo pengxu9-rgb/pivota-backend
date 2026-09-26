@@ -11,7 +11,7 @@ from decimal import Decimal
 import json
 
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
 
 # Initialize router
 router = APIRouter(
@@ -70,7 +70,7 @@ async def get_revenue_policies(
     [Phase 5] Get all revenue split policies for this agent
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
@@ -120,7 +120,7 @@ async def create_revenue_policy(
     
     Note: Only employees/admins can create revenue policies for security
     """
-    if current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Only employees can create revenue policies")
     
     try:
@@ -221,7 +221,7 @@ async def get_agent_earnings(
     [Phase 5] Get earnings summary for agent
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
@@ -269,7 +269,7 @@ async def get_revenue_logs(
     [Phase 5] Get revenue transaction logs
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
@@ -326,7 +326,7 @@ async def get_settlement_history(
     [Phase 5] Get settlement batch history
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
@@ -390,7 +390,7 @@ async def set_revenue_expectations(
     """[Phase 5.5] Set agent revenue expectations"""
     
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:
@@ -418,7 +418,7 @@ async def get_revenue_expectations(
     """[Phase 5.5] Get agent revenue expectations"""
     
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in ["admin", "employee"]:
+    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
     
     try:

@@ -203,7 +203,15 @@ async def test_run_settlement_skips_legacy_payout_path_when_v2_flag_on(
     async def fake_fetch_all(query, params=None):
         return [{"channel_partner_id": 7}]
 
-    fake_db = type("FakeDB", (), {"fetch_all": staticmethod(fake_fetch_all)})
+    completions: list[dict] = []
+
+    async def fake_execute(query, params=None):
+        # run_settlement's last write: the run's settlement completion marker (ADR-025 D5).
+        assert "partner_settlement_completions" in str(query)
+        completions.append(dict(params or {}))
+
+    fake_db = type("FakeDB", (), {"fetch_all": staticmethod(fake_fetch_all),
+                                  "execute": staticmethod(fake_execute)})
 
     async def fake_compute_v2(*a, **kw):
         calls["compute_v2"] += 1
@@ -257,6 +265,8 @@ async def test_run_settlement_skips_legacy_payout_path_when_v2_flag_on(
         "debit": 0,
         "create_payout": 0,
     }, f"v2 path leaked into legacy payout calls: {calls}"
+    # The v2 path skips payouts with `continue`, but still records completion after the loop.
+    assert completions == [{"billing_run_id": 101, "partner_ids": "[7]", "engine": "v2"}]
 
     # Reset + flag OFF: v1.3 path runs unchanged
     for k in calls:

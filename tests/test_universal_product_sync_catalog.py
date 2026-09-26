@@ -121,3 +121,28 @@ def test_universal_sync_rejects_payment_only_source_before_catalog_fetch(monkeyp
     assert payload["status"] == "unsupported"
     assert payload["products_synced"] == 0
     assert "payment-orchestration" in payload["message"]
+
+
+def test_universal_sync_skips_stale_cleanup_when_page_guard_truncates(monkeypatch):
+    client = _client(monkeypatch, {"products_ingested": 20})
+    state = {"page": 0, "cleanup_calls": 0}
+
+    async def paginated_fetch(**_kwargs):
+        state["page"] += 1
+        return [_standard_product(f"prod_{state['page']}")], f"cursor_{state['page']}", None
+
+    async def track_cleanup(**_kwargs):
+        state["cleanup_calls"] += 1
+        return 0
+
+    monkeypatch.setattr(module, "fetch_merchant_products", paginated_fetch)
+    monkeypatch.setattr(module, "delete_missing_products_from_cache", track_cleanup)
+
+    response = client.post(
+        "/products/sync-universal/",
+        json={"merchant_id": "merch_1", "platform": "wix", "limit": 50},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["products_synced"] == 20
+    assert state == {"page": 20, "cleanup_calls": 0}

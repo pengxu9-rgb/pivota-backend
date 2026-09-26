@@ -1,5 +1,14 @@
 # Fashion metafield pipeline — staging validation runbook
 
+> ⚠️ **Production is GCP Cloud Run (`pivota-prod`, `us-west1`) since 2026-08-22. Railway is the
+> ROLLBACK.** The `railway ...` commands below have NOT been rewritten — they were left as-is
+> rather than translated by guesswork, because the procedures here were never re-verified against
+> GCP. Running one changes the platform nobody is served from: the incident continues while the
+> dial reads as turned. Translate with
+> [operating_on_gcp_production.md](../runbooks/operating_on_gcp_production.md) before acting, or treat this
+> document as a historical record of how the Railway rollout was done.
+
+
 **Pipeline owner:** catalog enrichment (Phase O-5b)
 **Last verified:** —
 

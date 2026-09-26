@@ -25,20 +25,26 @@ CONTRACT
 * Every accessor takes an optional ``env`` mapping, so callers that already
   accept an injected environment (``utils.startup_mode``) keep their signature.
 * Precedence:  explicit ``PIVOTA_*``  →  Railway  →  Cloud Run  →  local.
-* FAIL CLOSED: if we are demonstrably on a managed platform (``K_SERVICE`` set,
-  or a Railway *deployment* marker set — see ``_RAILWAY_DEPLOYMENT_KEYS``, which
-  deliberately excludes the CLI's auth variables) but the environment cannot be resolved to
+* FAIL CLOSED: if we are demonstrably on a managed platform (a Cloud Run
+  marker set — ``K_*`` on a *service*, ``CLOUD_RUN_JOB``/``CLOUD_RUN_EXECUTION``
+  inside a *Job*, see ``_CLOUD_RUN_KEYS`` — or a Railway *deployment* marker
+  set, see ``_RAILWAY_DEPLOYMENT_KEYS``, which deliberately excludes the CLI's
+  auth variables) but the environment cannot be resolved to
   production/staging, :func:`platform_env` returns ``"production"`` and logs
   loudly.  The safest wrong answer is "this is production": demo/fabrication/
   insecure paths stay OFF and prod-only money/queue paths stay ON.
 * :func:`require_platform_env` is called at app startup and *raises* in that
   same situation, so a misconfigured Cloud Run revision dies at boot rather
-  than serving half-guarded traffic.  Local dev and tests (no ``K_SERVICE``, no
-  ``RAILWAY_*``) resolve to ``"development"`` and never raise.
+  than serving half-guarded traffic.  Local dev and tests (no ``K_*``, no
+  ``CLOUD_RUN_*``, no ``RAILWAY_*``) resolve to ``"development"`` and never
+  raise.
 
-Cloud Run does NOT inject a git commit sha.  It must be supplied at deploy time
-as ``PIVOTA_COMMIT_SHA`` (``COMMIT_SHA`` / ``SOURCE_VERSION`` are also honoured
-because Cloud Build and buildpacks set those).
+Cloud Run does NOT inject a git commit sha.  The image stamps it at BUILD time
+into ``/app/.image_commit_sha`` (see ``infra/gcp/Dockerfile``) and that wins,
+because it is a property of the code rather than a claim made about it at deploy
+time.  ``PIVOTA_COMMIT_SHA`` (and ``COMMIT_SHA`` / ``SOURCE_VERSION``, which
+Cloud Build and buildpacks set) remain the fallback for images built without the
+build arg, and for local runs.
 """
 
 from __future__ import annotations
@@ -69,6 +75,7 @@ __all__ = [
     "is_staging",
     "is_development",
     "is_deployed",
+    "pytest_bypass_allowed",
     "service_name",
     "service_id",
     "project_id",
@@ -145,8 +152,47 @@ _RAILWAY_DEPLOYMENT_KEYS = (
     "RAILWAY_PROJECT_ID",
     "RAILWAY_DEPLOYMENT_ID",
 )
-# Cloud Run injects K_SERVICE / K_REVISION / K_CONFIGURATION on every revision.
-_CLOUD_RUN_KEYS = ("K_SERVICE", "K_REVISION", "K_CONFIGURATION")
+# Cloud Run injects K_SERVICE / K_REVISION / K_CONFIGURATION on every revision
+# of a *service*.
+_CLOUD_RUN_SERVICE_KEYS = ("K_SERVICE", "K_REVISION", "K_CONFIGURATION")
+
+# Cloud Run **Jobs** are a different product and get NONE of the K_* variables.
+# A Jobs-blind allowlist therefore resolved every job container to "local" with
+# is_deployed() False — on a genuinely managed host. Live-confirmed 2026-08-26
+# by probing the running prod `content-canonical-election` job, whose entire
+# environment was CLOUD_RUN_EXECUTION, CLOUD_RUN_JOB, CLOUD_RUN_TASK_ATTEMPT,
+# CLOUD_RUN_TASK_COUNT, CLOUD_RUN_TASK_INDEX plus our own PIVOTA_* settings.
+# The prod jobs all set PIVOTA_ENV=production so is_production() still caught
+# them, but a STAGING job answered False to BOTH is_deployed() and
+# is_production(): every gate written on either one failed open there.
+#
+# ⚠️ ALLOWLIST, NOT A `CLOUD_RUN` PREFIX SCAN — same discipline, and the same
+# reason, as _RAILWAY_DEPLOYMENT_KEYS above.
+#
+# CLOUD_RUN_JOB is the job's name; CLOUD_RUN_EXECUTION is this execution's.
+# Cloud Run injects both into every task of every execution, so they are the
+# Jobs-side analogues of K_SERVICE / K_REVISION: the identity of the managed
+# thing running us.
+#
+# Excluded on purpose:
+#   CLOUD_RUN_TASK_INDEX, CLOUD_RUN_TASK_COUNT, CLOUD_RUN_TASK_ATTEMPT — these
+#       describe the SHARD and the RETRY of the work, not the host executing
+#       it. That is the same distinction that keeps RAILWAY_GIT_* out of the
+#       Railway list: a property of the work is not proof of the platform. They
+#       are also precisely what a local fan-out harness or a docker-compose
+#       worker matrix exports to simulate "task 3 of 5", so honouring them
+#       would let a developer shell answer "am I deployed" — the failure this
+#       module's allowlists exist to prevent. And CLOUD_RUN_TASK_INDEX's
+#       ordinary value on a single-task job is the string "0", which is truthy
+#       here but reads as absent to a human and to any int() coercion: not a
+#       signal to hinge a security gate on.
+#
+# Nothing genuinely deployed loses its identity by the exclusion: every task of
+# every execution carries both CLOUD_RUN_JOB and CLOUD_RUN_EXECUTION.
+_CLOUD_RUN_JOB_KEYS = ("CLOUD_RUN_JOB", "CLOUD_RUN_EXECUTION")
+
+#: Every marker that proves Cloud Run — service or job — is executing us.
+_CLOUD_RUN_KEYS = _CLOUD_RUN_SERVICE_KEYS + _CLOUD_RUN_JOB_KEYS
 
 # Loud-but-not-per-request: the fail-closed path logs once per distinct
 # signature.  This memoises LOGGING ONLY — the resolved value is always
@@ -168,6 +214,31 @@ def _get(env: Optional[Mapping[str, str]], key: str) -> str:
     return (_mapping(env).get(key) or "").strip()
 
 
+#: Written by ``infra/gcp/Dockerfile`` at build time.  Module-level so tests can point it
+#: somewhere writable.
+_IMAGE_COMMIT_SHA_FILE = "/app/.image_commit_sha"
+_UNREAD = object()
+_image_commit_sha_cache: Any = _UNREAD
+
+
+def _baked_commit_sha() -> Optional[str]:
+    """The commit stamped into the image, or ``None`` outside a stamped image.
+
+    Cached: this is read on every ``/health``, and the file cannot change without the
+    process being replaced along with it.  Tests reset ``_image_commit_sha_cache``.
+    """
+    global _image_commit_sha_cache
+    if _image_commit_sha_cache is _UNREAD:
+        try:
+            with open(_IMAGE_COMMIT_SHA_FILE, "r", encoding="utf-8") as handle:
+                _image_commit_sha_cache = handle.read().strip() or None
+        except OSError:
+            # Not running from a stamped image - local dev, tests, or an image built
+            # without the build arg. The env-var fallback covers those.
+            _image_commit_sha_cache = None
+    return _image_commit_sha_cache
+
+
 def _first(env: Optional[Mapping[str, str]], *keys: str) -> Optional[str]:
     for key in keys:
         value = _get(env, key)
@@ -187,6 +258,14 @@ def _on_railway(env: Optional[Mapping[str, str]] = None) -> bool:
 
 
 def _on_cloud_run(env: Optional[Mapping[str, str]] = None) -> bool:
+    """True on a Cloud Run *service* revision OR inside a Cloud Run *Job* task.
+
+    Explicit allowlist, not a ``CLOUD_RUN``/``K_`` prefix scan — see the
+    comments on :data:`_CLOUD_RUN_JOB_KEYS` and
+    :data:`_RAILWAY_DEPLOYMENT_KEYS`. The two families are disjoint: a service
+    gets ``K_*`` and no ``CLOUD_RUN_*``; a job gets ``CLOUD_RUN_*`` and no
+    ``K_*``.
+    """
     return any(_get(env, key) for key in _CLOUD_RUN_KEYS)
 
 
@@ -274,14 +353,20 @@ def _resolve_env(env: Optional[Mapping[str, str]] = None) -> tuple:
             "unresolved:%s:%s:%s" % (explicit_raw, railway_raw, platform_name(env)),
             (
                 "platform: environment could NOT be resolved on a managed host "
-                "(platform=%s PIVOTA_ENV=%r RAILWAY_ENVIRONMENT=%r K_SERVICE=%r). "
-                "FAILING CLOSED to 'production' so guards stay armed. Set "
-                "PIVOTA_ENV=production|staging on this revision."
+                "(platform=%s PIVOTA_ENV=%r RAILWAY_ENVIRONMENT=%r "
+                "cloud_run_marker=%r). FAILING CLOSED to 'production' so guards "
+                "stay armed. Set PIVOTA_ENV=production|staging on this "
+                "revision or job."
             ),
             platform_name(env),
             explicit_raw,
             railway_raw,
-            _get(env, "K_SERVICE") or None,
+            # NOT K_SERVICE: a Cloud Run *Job* has no K_* at all, so naming it
+            # here printed None on exactly the hosts this line is diagnosing.
+            # Report KEY=value, not a bare value: "content-canonical-election"
+            # alone does not say whether a Service or a Job produced it, which
+            # is the single most useful bit when reading this line.
+            _cloud_run_marker(env),
         )
         return PRODUCTION, "fail_closed", explicit_raw or railway_raw
 
@@ -295,6 +380,88 @@ def platform_env(env: Optional[Mapping[str, str]] = None) -> PlatformEnv:
 
 def is_production(env: Optional[Mapping[str, str]] = None) -> bool:
     return platform_env(env) == PRODUCTION
+
+
+def pytest_bypass_allowed(
+    env: Optional[Mapping[str, str]] = None, *, bypass_name: str = "a test-only bypass"
+) -> bool:
+    """True only inside an actual pytest run on an UNMANAGED host.
+
+    Several call sites short-circuit auth/durability checks whenever
+    ``PYTEST_CURRENT_TEST`` is set, to let the unit-test suite run without
+    real credentials or a real database. ``PYTEST_CURRENT_TEST`` is only ever
+    set by pytest itself, but it is just an environment variable — a debug
+    image built from a test stage, a copied ``.env``, or a misconfigured
+    smoke harness could still leak it into a real server process. A bypass
+    gated on this variable alone would then be live on a real server.
+
+    Centralizing the check here means the deployment conjunct can't be
+    forgotten at a new call site the way it was for the bypasses fixed in
+    PR #1893 (see also the demo login lanes fixed in PR #1889).
+
+    ``is_deployed()`` — not ``is_production()``: this is the same distinction
+    pinned in :func:`utils.runtime_safety.is_production_runtime` and in the
+    comment above ``_shopify_prod_runtime`` in ``routes/webhook_routes.py``.
+    A test-only bypass is not a staging feature. Staging runs a restored
+    production snapshot and real third-party credentials, so a leaked
+    ``PYTEST_CURRENT_TEST`` on a staging revision still hands anyone who
+    knows ``test-token`` a ``role=admin`` session, and anyone who knows
+    ``test-agent-key`` an agent context with ``allowed_merchants=None`` and
+    no rate/quota enforcement. Gating on ``is_production()`` alone left every
+    staging revision — and every ``PIVOTA_ENV=development`` revision — armed.
+
+    ``is_production()`` is kept as a second conjunct rather than replaced:
+    ``is_deployed()`` is not a superset of it. ``PIVOTA_ENV=production`` with
+    no platform markers resolves to production while ``platform_name()``
+    stays ``"local"``.
+
+    This costs the suite nothing: no CI workflow sets ``RAILWAY_*``, ``K_*``,
+    ``CLOUD_RUN_*`` or ``PIVOTA_ENV``, so ``platform_name()`` is ``"local"``
+    both in CI and on a developer laptop.
+
+    NOT closed by this check: a bare container with no platform markers at
+    all (``docker run`` of a test-stage image) is environmentally
+    indistinguishable from a laptop running pytest — it injects nothing for
+    ``is_deployed()`` to read. That residual case needs a signal outside the
+    environment, not a different environment predicate.
+
+    ⚠️ That is the only residual case *given a complete marker allowlist*, and
+    the completeness is the load-bearing half. It is not a property of the
+    predicate; it is a property of :data:`_CLOUD_RUN_KEYS` and
+    :data:`_RAILWAY_DEPLOYMENT_KEYS` being kept current. This docstring
+    previously called the bare container the only case outright, and that was
+    provably wrong when written: Cloud Run **Jobs** inject
+    ``CLOUD_RUN_JOB``/``CLOUD_RUN_EXECUTION`` and none of ``K_*``, so every job
+    container read as ``local``, and a STAGING job was armed exactly like the
+    bare container while running on a genuinely managed host. Confirmed by
+    probing the live prod ``content-canonical-election`` job on 2026-08-26;
+    closed by adding :data:`_CLOUD_RUN_JOB_KEYS`. The correct reading of "every
+    marker ``is_deployed()`` reads is injected by the managed host" is that it
+    says nothing about the converse — a managed host can inject a family this
+    module has never heard of. A new managed surface re-opens the same hole,
+    and the fix is another allowlist entry, not a different predicate.
+    """
+    if not _get(env, "PYTEST_CURRENT_TEST"):
+        return False
+    if is_deployed(env) or is_production(env):
+        # Deliberately NOT _warn_once-memoised, unlike the fail-closed
+        # resolution path. That one fires per-call for a misconfiguration and
+        # would be per-request noise. This one fires only when someone
+        # presents a test credential to a deployed server, which is a
+        # per-attempt security event — collapsing repeats would hide the
+        # volume of an attack. It cannot become steady-state noise: on a
+        # correctly configured deployment PYTEST_CURRENT_TEST is never set,
+        # so this line never runs at all.
+        logger.warning(
+            "[Platform] PYTEST_CURRENT_TEST is set but this process is on a "
+            "managed host or resolves to production (platform=%s, env=%s); "
+            "%s stays disabled",
+            platform_name(env),
+            platform_env(env),
+            bypass_name,
+        )
+        return False
+    return True
 
 
 def is_staging(env: Optional[Mapping[str, str]] = None) -> bool:
@@ -320,8 +487,34 @@ def raw_environment_label(env: Optional[Mapping[str, str]] = None) -> Optional[s
     )
 
 
+def _cloud_run_marker(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """``KEY=value`` for whichever Cloud Run marker is present, for diagnostics.
+
+    Purely a log/diagnostic helper — nothing gates on it.
+    """
+    for key in _CLOUD_RUN_KEYS:
+        value = _get(env, key)
+        if value:
+            return "%s=%s" % (key, value)
+    return None
+
+
 def service_name(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
-    return _first(env, "PIVOTA_SERVICE_NAME", "RAILWAY_SERVICE_NAME", "K_SERVICE")
+    """Human name of this workload.  ``CLOUD_RUN_JOB`` is the Jobs analogue of
+    ``K_SERVICE`` and is read here as a VALUE — every job also sets
+    ``PIVOTA_SERVICE_NAME``, so today this fallback is INERT in every live job:
+    no job entrypoint reaches this function at all (they touch ``config.platform``
+    only through ``db.database``, which imports ``is_deployed`` alone). It is here
+    so that a future job which does call it — or one created without
+    ``PIVOTA_SERVICE_NAME`` — gets its name rather than ``None``. Do not justify
+    it with health payloads or audit metadata: no job process serves either."""
+    return _first(
+        env,
+        "PIVOTA_SERVICE_NAME",
+        "RAILWAY_SERVICE_NAME",
+        "K_SERVICE",
+        "CLOUD_RUN_JOB",
+    )
 
 
 def service_id(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
@@ -337,12 +530,22 @@ def project_id(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
 def commit_sha(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
     """Build commit.
 
-    Cloud Run injects nothing here — ``PIVOTA_COMMIT_SHA`` must be baked in at
-    deploy time.  ``COMMIT_SHA`` (Cloud Build substitution) and
+    Prefers the sha stamped into the image at build time.  It outranks every env
+    var deliberately: the env var is set by whoever deploys, so a deploy that
+    forgets it reports the PREVIOUS commit while running the new code — which is
+    exactly what happened on 2026-08-23, and it fed the prod-drift alarm a commit
+    that was not the one serving traffic.  The stamped file cannot disagree with
+    the code it ships beside.
+
+    Cloud Run injects nothing here, so images built without the build arg fall
+    back to ``PIVOTA_COMMIT_SHA``.  ``COMMIT_SHA`` (Cloud Build substitution) and
     ``SOURCE_VERSION`` (buildpacks) are accepted as conventional aliases.
     ``GIT_COMMIT_SHA`` / ``VERCEL_GIT_COMMIT_SHA`` are pre-existing fallbacks
     kept so ``/version`` behaves exactly as before.
     """
+    baked = _baked_commit_sha()
+    if baked:
+        return baked
     return _first(
         env,
         "PIVOTA_COMMIT_SHA",
@@ -355,9 +558,14 @@ def commit_sha(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
 
 
 def deployment_id(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
-    """Unique id for this rollout: Railway deployment id, Cloud Run revision."""
+    """Unique id for this rollout: Railway deployment id, Cloud Run revision,
+    or — inside a Cloud Run Job, which has no revision — this execution."""
     return _first(
-        env, "PIVOTA_DEPLOYMENT_ID", "RAILWAY_DEPLOYMENT_ID", "K_REVISION"
+        env,
+        "PIVOTA_DEPLOYMENT_ID",
+        "RAILWAY_DEPLOYMENT_ID",
+        "K_REVISION",
+        "CLOUD_RUN_EXECUTION",
     )
 
 
@@ -386,21 +594,30 @@ def require_platform_env(env: Optional[Mapping[str, str]] = None) -> PlatformEnv
     """Assert the environment is knowable.  Call once, at app startup.
 
     Raises ``RuntimeError`` when we are on a managed platform whose environment
-    cannot be resolved — a Cloud Run revision deployed without ``PIVOTA_ENV``.
-    Dying at boot is strictly better than serving traffic with every
-    prod-vs-staging guard resolved by a fail-closed guess.
+    cannot be resolved — a Cloud Run revision or Job deployed without
+    ``PIVOTA_ENV``. Dying at boot is strictly better than serving traffic with
+    every prod-vs-staging guard resolved by a fail-closed guess.
 
-    Local development and the test suite (no ``K_SERVICE``, no ``RAILWAY_*``)
-    resolve to ``development`` and never raise.
+    Local development and the test suite (no ``K_*``, no ``CLOUD_RUN_*``, no
+    ``RAILWAY_*``) resolve to ``development`` and never raise.
     """
     resolved, source, raw = _resolve_env(env)
     if source == "fail_closed":
         raise RuntimeError(
             "platform: cannot resolve the deployment environment on a managed "
-            "host (platform=%s PIVOTA_ENV=%r RAILWAY_ENVIRONMENT=%r). Set "
-            "PIVOTA_ENV=production|staging|development on this revision. "
+            "host (platform=%s PIVOTA_ENV=%r RAILWAY_ENVIRONMENT=%r "
+            "cloud_run_marker=%s). Set "
+            "PIVOTA_ENV=production|staging|development on this revision or job. "
             "Refusing to boot: every prod guard would otherwise run on a "
             "fail-closed guess."
-            % (platform_name(env), raw, _get(env, "RAILWAY_ENVIRONMENT") or None)
+            % (
+                platform_name(env),
+                raw,
+                _get(env, "RAILWAY_ENVIRONMENT") or None,
+                # This message is the twin of the _resolve_env warning above and
+                # had the same Cloud Run blindness: it named only RAILWAY_*, so
+                # on the Jobs host it was diagnosing it printed nothing useful.
+                _cloud_run_marker(env),
+            )
         )
     return resolved  # type: ignore[return-value]

@@ -576,20 +576,42 @@ class PrestaShopAdapter:
         return urls
     
     async def register_module(self) -> Dict[str, Any]:
-        """Register Pivota module in PrestaShop"""
-        # PrestaShop modules need to be installed via FTP/Admin
-        # This is just a placeholder for module configuration
+        """Where the real telemetry module lives and how it is installed.
+
+        PrestaShop has no API that installs a module: the merchant uploads it
+        in the back office. The module Pivota ships is in the repo at
+        `integrations/prestashop-module/pivotatelemetry/`; the secret it signs
+        with is minted by
+        `POST /integrations/prestashop/{store_id}/telemetry/ensure`.
+        See docs/PRESTASHOP_TELEMETRY.md.
+        """
         return {
             'success': True,
-            'message': 'Please install Pivota module via PrestaShop admin panel',
-            'module_download': 'https://pivota.cc/downloads/prestashop-module.zip'
+            'message': (
+                'Install the Pivota telemetry module from the PrestaShop back '
+                'office (Modules > Upload a module), then paste the endpoint, '
+                'store id and secret into its configuration page.'
+            ),
+            'module_source': 'integrations/prestashop-module/pivotatelemetry/',
+            'provisioning_path': '/integrations/prestashop/{store_id}/telemetry/ensure',
         }
-    
+
     def validate_webhook(self, headers: Dict[str, str], body: bytes) -> bool:
-        """Validate PrestaShop webhook"""
-        # PrestaShop doesn't have built-in webhook signatures
-        # Module should implement custom validation
-        return True
+        """RETIRED. Never call this; it used to return True unconditionally.
+
+        PrestaShop sends no webhooks of its own, so there was nothing for this
+        stub to verify — and returning True for every input is a fail-open
+        authenticator that any caller could have been wired to by mistake. The
+        real verifier is `routes/prestashop_webhooks.py::_verify_signature`,
+        which checks a per-store HMAC over `timestamp + "." + body` from the
+        module Pivota ships. It raises rather than returning False so a caller
+        cannot mistake a refusal for a signature that merely did not match.
+        """
+        raise NotImplementedError(
+            "PrestaShopAdapter.validate_webhook is retired; PrestaShop module "
+            "deliveries are verified by routes/prestashop_webhooks.py "
+            "(per-store HMAC over timestamp + '.' + body)"
+        )
 
 
 

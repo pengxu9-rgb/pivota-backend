@@ -22,10 +22,29 @@ from services.category_classifier_llm import (  # noqa: E402
     _invalidate_cache_for_tests,
 )
 from services.pdp_category_classifier import (  # noqa: E402
+    fold_category_from_variants,
     fold_category_with_llm_fallback,
     CATEGORY_SOURCE_MERCHANT,
     CATEGORY_SOURCE_VARIANT,
 )
+
+
+def _assert_regex_misses(**fields) -> None:
+    """Assert the PREMISE of a regex-miss test, not just its conclusion.
+
+    These tests are only meaningful while CATEGORY_PATTERNS does NOT match
+    the fixture. When the electronics patterns landed they turned the old
+    "Sony WH-1000XM5" / "Wireless Headphones" fixture into a regex HIT, and
+    both tests then failed on a downstream assertion — `source` came back
+    'merchant_payload' — which reads as a bug in the LLM wrapper rather than
+    as a stale fixture. Asserting the premise up front makes the next pattern
+    that swallows this fixture say so directly.
+    """
+    hit = fold_category_from_variants(variants=None, **fields)
+    assert hit is None, (
+        f"fixture {fields!r} is no longer a regex miss (matched {hit!r}); "
+        "pick a title/product_type CATEGORY_PATTERNS does not classify"
+    )
 
 
 def _enable_flag(monkeypatch):
@@ -183,15 +202,14 @@ async def test_regex_hit_does_not_call_llm(monkeypatch):
 @pytest.mark.asyncio
 async def test_regex_miss_falls_back_to_llm(monkeypatch):
     _enable_flag(monkeypatch)
-    _install_llm(monkeypatch, {"label": "Headphones", "path": "electronics/audio/headphones", "confidence": 0.92})
-    # "Sony WH-1000XM5" doesn't match any beauty/fashion regex
-    result = await fold_category_with_llm_fallback(
-        title="Sony WH-1000XM5", product_type="Wireless Headphones",
-    )
+    _install_llm(monkeypatch, {"label": "Thermostat", "path": "electronics/home/thermostat", "confidence": 0.92})
+    fields = dict(title="Ecobee Smart Thermostat Premium", product_type="Smart Thermostat")
+    _assert_regex_misses(category=None, **fields)
+    result = await fold_category_with_llm_fallback(**fields)
     assert result is not None
     (label, path), source, confidence = result
-    assert label == "Headphones"
-    assert path == "electronics/audio/headphones"
+    assert label == "Thermostat"
+    assert path == "electronics/home/thermostat"
     assert source == CATEGORY_SOURCE_LLM
     assert confidence == 0.92
 
@@ -212,6 +230,7 @@ async def test_llm_not_invoked_when_flag_off_even_on_regex_miss(monkeypatch):
         called["n"] += 1
         return None
     monkeypatch.setattr(cc, "_call_deepseek_classify", _fake)
-    result = await fold_category_with_llm_fallback(title="Sony Headphones")
+    _assert_regex_misses(category=None, product_type=None, title="Ecobee Smart Thermostat Premium")
+    result = await fold_category_with_llm_fallback(title="Ecobee Smart Thermostat Premium")
     assert result is None
     assert called["n"] == 0

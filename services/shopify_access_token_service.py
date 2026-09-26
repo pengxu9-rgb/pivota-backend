@@ -9,6 +9,7 @@ import httpx
 
 from db.database import database
 from services.shopify_transactions_service import extract_shopify_access_token
+from services.shopify_domain import normalize_myshopify_domain
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,20 @@ async def exchange_shopify_client_credentials_token(
 
     if not normalized_domain:
         return None, None, "shop_domain_missing"
+
+    # THE CHOKEPOINT. This is the only place in the repo that POSTs client_id + client_secret, and
+    # those credentials mint tokens for EVERY shop the app is installed on -- strictly worse than
+    # the per-shop token the rest of this sweep protects. `_normalize_shop_domain` above only strips
+    # a scheme; it lets any host through, so every caller of resolve_shopify_admin_access_token that
+    # passes a raw merchant_stores.domain sent the app's client secret wherever that row pointed.
+    #
+    # Refusing HERE rather than at ~27 call sites, and refusing by RETURNING because that is this
+    # function's existing failure channel -- callers read the reason out of `meta["refresh_error"]`
+    # and carry on with whatever token they already had.
+    pinned = normalize_myshopify_domain(normalized_domain)
+    if not pinned:
+        return None, None, "shop_domain_not_myshopify"
+    normalized_domain = pinned
     if not cid or not csec:
         return None, None, "client_credentials_missing"
 

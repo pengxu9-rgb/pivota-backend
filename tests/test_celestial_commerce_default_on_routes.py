@@ -421,6 +421,14 @@ def test_agent_commerce_checkout_route_returns_public_checkout_contract(monkeypa
     )
 
     assert response.status_code == 200
+    # Every agent-commerce ledger write is stamped as the first-party verified
+    # issuer: get_agent_context authenticated the agent's own credential.
+    assert recorded, "the checkout must write to the ledger"
+    assert {call["write_path"] for call in recorded} == {"agent_commerce_api"}
+    assert {call["authority"] for call in recorded} == {"pivota"}
+    assert {call["agent_identity_confidence"] for call in recorded} == {"verified"}
+    assert all(call["metadata"]["agent_identity_confidence"] == "verified" for call in recorded)
+    assert all(call["metadata"]["agent_id"] == call["actor_id"] for call in recorded)
     payload = response.json()
     assert payload["checkout_id"] == "ord_1"
     assert payload["payment_url"] == "https://checkout.example.com/ord_1"
@@ -446,7 +454,8 @@ def test_agent_commerce_payment_intent_route_reads_existing_order_action(monkeyp
         assert order_id == "ord_1"
         return {"order_id": "ord_1", "merchant_id": "merch_1", "client_secret": "pi_secret_123", "payment_status": "awaiting_payment"}
 
-    async def fake_find_interaction(_order_id: str):
+    async def fake_find_interaction(_order_id: str, *, merchant_id: str):
+        assert merchant_id == "merch_1"
         return {"interaction_id": "int_1", "surface": "agent_v2_commerce"}
 
     async def fake_store(_merchant_id: str):
@@ -489,7 +498,8 @@ def test_agent_commerce_returns_route_reports_pending_for_wix(monkeypatch: pytes
     async def fake_store(_merchant_id: str):
         return {"platform": "wix"}
 
-    async def fake_find_interaction(_order_id: str):
+    async def fake_find_interaction(_order_id: str, *, merchant_id: str):
+        assert merchant_id == "merch_1"
         return {"interaction_id": "int_1", "surface": "agent_v2_commerce"}
 
     async def fake_record_event(**_kwargs):

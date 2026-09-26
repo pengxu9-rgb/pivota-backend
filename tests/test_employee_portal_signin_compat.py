@@ -18,10 +18,6 @@ def test_auth_signin_accepts_users_table_when_employees_missing(monkeypatch):
     app.include_router(auth_routes_module.router)
     client = TestClient(app)
 
-    auth_routes_module.users_db.clear()
-    auth_routes_module.user_roles_db.clear()
-    auth_routes_module.sessions_db.clear()
-
     password = "Admin123!"
     user_record = {
         "id": 123,

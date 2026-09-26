@@ -1,10 +1,11 @@
 """Extended Merchant API Routes for Dashboard Features"""
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Query, Response
 from typing import Dict, Any, Optional, List
-from utils.auth import get_current_user
+from utils.auth import MERCHANT_OR_ADMIN_ROLES, get_current_user
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from db.database import database
+from db.schema_guard import guarded_statements
 from db.orders import get_order, mark_order_shipped
 from db.products import log_order_event
 from services.refund_service import refund_service
@@ -218,7 +219,11 @@ async def _ensure_refund_tables_best_effort() -> None:
     Best-effort: do not raise on failures (keeps merchant UI stable during partial deploys).
     """
     try:
-        await database.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded DECIMAL(10,2) DEFAULT 0")
+        # Guarded (db/schema_guard.py): see the definition below, which is the one that runs.
+        for statement in guarded_statements(
+            ["ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded DECIMAL(10,2) DEFAULT 0"]
+        ):
+            await database.execute(statement)
     except Exception:
         return
 
@@ -248,8 +253,11 @@ async def _ensure_refund_tables_best_effort() -> None:
             )
             """
         )
-        await database.execute("CREATE INDEX IF NOT EXISTS idx_order_refunds ON refund_records (order_id, created_at DESC)")
-        await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_refunds ON refund_records (merchant_id, created_at DESC)")
+        for statement in guarded_statements([
+            "CREATE INDEX IF NOT EXISTS idx_order_refunds ON refund_records (order_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_merchant_refunds ON refund_records (merchant_id, created_at DESC)",
+        ]):
+            await database.execute(statement)
     except Exception:
         return
 
@@ -598,8 +606,15 @@ async def _ensure_refund_tables_best_effort() -> None:
     Best-effort defensive DDL for refund tables/columns.
     Production should normally rely on SQL migrations, but the migration runner can be best-effort.
     """
+    # Guarded (db/schema_guard.py): this runs on EVERY refund call, and bare the ALTER took
+    # ACCESS EXCLUSIVE on orders (every checkout's table) with no lock_timeout even with the
+    # column there, and each index build its table's SHARE lock. Each now runs only while
+    # it is still needed; a lock timeout is one more failure these excepts already absorb.
     try:
-        await database.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;")
+        for statement in guarded_statements(
+            ["ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_refunded NUMERIC(10,2) DEFAULT 0;"]
+        ):
+            await database.execute(statement)
     except Exception:
         pass
 
@@ -652,13 +667,14 @@ async def _ensure_refund_tables_best_effort() -> None:
         pass
 
     try:
-        await database.execute("CREATE INDEX IF NOT EXISTS idx_merchant_refunds ON refund_records (merchant_id, created_at DESC);")
-        await database.execute("CREATE INDEX IF NOT EXISTS idx_order_refunds ON refund_records (order_id, created_at DESC);")
-        await database.execute("CREATE INDEX IF NOT EXISTS idx_idempotency ON refund_records (idempotency_key);")
-        await database.execute("CREATE INDEX IF NOT EXISTS idx_platform_refund ON refund_records (platform_type, platform_refund_id);")
-        await database.execute(
-            "CREATE INDEX IF NOT EXISTS idx_retry_queue_next ON refund_retry_queue (next_retry_at) WHERE retry_count < max_retries;"
-        )
+        for statement in guarded_statements([
+            "CREATE INDEX IF NOT EXISTS idx_merchant_refunds ON refund_records (merchant_id, created_at DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_order_refunds ON refund_records (order_id, created_at DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_idempotency ON refund_records (idempotency_key);",
+            "CREATE INDEX IF NOT EXISTS idx_platform_refund ON refund_records (platform_type, platform_refund_id);",
+            "CREATE INDEX IF NOT EXISTS idx_retry_queue_next ON refund_retry_queue (next_retry_at) WHERE retry_count < max_retries;",
+        ]):
+            await database.execute(statement)
     except Exception:
         pass
 
@@ -1305,6 +1321,66 @@ async def get_readiness_job(
     except JobNotFoundError:
         raise HTTPException(status_code=404, detail={"code": "OPTIMIZATION_JOB_NOT_FOUND", "message": "Job not found."})
 
+
+async def _login_email_claimed_by(new_email: str, merchant_id: str) -> Optional[str]:
+    """Which principal already holds `new_email`, or None if it is free.
+
+    A merchant's login email is not verified when it changes, so every table the
+    login flow resolves an address against has to be checked here, not only
+    users/auth_identities. /api/auth/login trusts an `employees` row matched by
+    email (and promotes the users row at that address to staff), resolves an
+    agent by agents.owner_email/email, and resolves a merchant by
+    merchant_onboarding.contact_email. Moving a merchant login onto any of those
+    addresses hands the merchant that principal's identity.
+
+    `new_email` is already normalized (trimmed, lowercased). A check that cannot
+    run fails closed: it raises rather than letting the change through.
+    """
+    from routes.agent_management import _agent_email_columns
+
+    checks = [
+        ("users", "SELECT id FROM users WHERE LOWER(email) = :email LIMIT 1"),
+        (
+            "auth_identities",
+            "SELECT identity_id FROM auth_identities WHERE email_normalized = :email LIMIT 1",
+        ),
+        # Any status: an inactive employee can be reactivated after the merchant
+        # has moved onto the address.
+        ("employees", "SELECT employee_id FROM employees WHERE LOWER(TRIM(email)) = :email LIMIT 1"),
+    ]
+    try:
+        # owner_email always; agents.email only where the live table has it.
+        # An empty answer means the probe could not reach the table at all.
+        agent_columns = await _agent_email_columns()
+        if not agent_columns:
+            raise RuntimeError("agents email columns could not be probed")
+        for name in agent_columns:
+            # `name` is one of agent_management._CANDIDATE_EMAIL_COLUMNS, never input.
+            checks.append(
+                (f"agents.{name}", f"SELECT agent_id FROM agents WHERE LOWER(TRIM({name})) = :email LIMIT 1")
+            )
+        for label, query in checks:
+            if await database.fetch_one(query, {"email": new_email}):
+                return label
+        other_merchant = await database.fetch_one(
+            """
+            SELECT merchant_id FROM merchant_onboarding
+            WHERE LOWER(TRIM(contact_email)) = :email AND merchant_id <> :merchant_id
+            LIMIT 1
+            """,
+            {"email": new_email, "merchant_id": merchant_id},
+        )
+        if other_merchant and str(other_merchant["merchant_id"]) != str(merchant_id):
+            return "merchant_onboarding"
+    except Exception as exc:
+        logger.error("[MerchantProfile] Login-email availability check failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Could not verify that this email is available; try again later",
+        )
+    return None
+
+
 @router.put("/merchant/profile")
 async def update_merchant_profile(
     profile_data: Dict[str, Any] = Body(...),
@@ -1351,15 +1427,16 @@ async def update_merchant_profile(
         except Exception:
             raise HTTPException(status_code=422, detail="Invalid email address")
 
-        existing_user = await database.fetch_one(
-            "SELECT id FROM users WHERE LOWER(email) = :email LIMIT 1",
-            {"email": new_email},
-        )
-        existing_identity = await database.fetch_one(
-            "SELECT identity_id FROM auth_identities WHERE email_normalized = :email LIMIT 1",
-            {"email": new_email},
-        )
-        if existing_user or existing_identity:
+        claimed_by = await _login_email_claimed_by(new_email, merchant_id)
+        if claimed_by:
+            # One message for every kind of claim: the caller learns only that
+            # the address is unavailable, not whether it is staff or an agent.
+            logger.warning(
+                "[MerchantProfile] Refused login-email change for merchant %s: "
+                "address is held by %s",
+                merchant_id,
+                claimed_by,
+            )
             raise HTTPException(
                 status_code=409,
                 detail="An account with this email already exists",
@@ -1508,6 +1585,7 @@ async def sync_shopify_products(
         #    This prevents browser net::ERR_CONNECTION_CLOSED due to proxy/request timeouts.
         from services.platform_import_service import schedule_import_task
         from jobs.catalog_import_worker import process_import_task_by_id
+        from db.platform_import_tasks import STALE_RUNNING_AFTER_SECONDS
 
         # De-dupe: if there's already an active Shopify import task, return it instead of
         # creating another. This prevents "Sync" button spam from spawning concurrent jobs.
@@ -1534,6 +1612,25 @@ async def sync_shopify_products(
             # If a task is stuck in `running` (e.g., process restarted mid-sync),
             # allow it to be recovered automatically by flipping it back to
             # retry_scheduled so the background worker can pick it up again.
+            #
+            # The window is STALE_RUNNING_AFTER_SECONDS, shared with the
+            # catalog_import_stale_reaper tick. It was 5 minutes, and widening it
+            # is a deliberate trade, not a cleanup.
+            #
+            # What makes any window safe here is the per-page heartbeat below
+            # (_process_import_task_record writes status="running" after every
+            # page, refreshing updated_at), so this measures time since the last
+            # page, not since the claim. 5 minutes was survivable while this
+            # endpoint was the ONLY runner: a premature flip just re-ran the
+            # import. It is not survivable now that catalog_import_drain_tick can
+            # claim the row 30s later — that hands a still-live import to a
+            # second runner, the exact double-run the atomic claim prevents. One
+            # slow page (30s HTTP timeout, retries, 250 upserts) is well within
+            # 5 minutes of wall clock but not within 15.
+            #
+            # The cost is real and accepted: a merchant whose import genuinely
+            # died now waits 15 minutes for this button to recover it rather than
+            # 5, and the reaper is no faster (same cutoff, 300s tick).
             if existing_status == "running":
                 updated_at = existing_task.get("updated_at")
                 try:
@@ -1541,7 +1638,9 @@ async def sync_shopify_products(
                     # updated_at from DB might be naive; treat as UTC.
                     if isinstance(updated_at, datetime) and updated_at.tzinfo is None:
                         updated_at = updated_at.replace(tzinfo=timezone.utc)
-                    if isinstance(updated_at, datetime) and now - updated_at > timedelta(minutes=5):
+                    if isinstance(updated_at, datetime) and now - updated_at > timedelta(
+                        seconds=STALE_RUNNING_AFTER_SECONDS
+                    ):
                         await database.execute(
                             """
                             UPDATE platform_import_tasks
@@ -1550,6 +1649,7 @@ async def sync_shopify_products(
                                 error = 'stale_running_recovered',
                                 updated_at = NOW()
                             WHERE id = :task_id
+                              AND status = 'running'
                             """,
                             {"task_id": existing_task_id},
                         )
@@ -1586,8 +1686,14 @@ async def sync_shopify_products(
             connector="shopify",
         )
 
-        # Kick off processing in the background (best effort). If a dedicated worker is running,
-        # it can also pick up the pending task later.
+        # Kick off processing in the background (best effort) — KEPT deliberately
+        # now that catalog_import_drain_tick exists, because it is what makes the
+        # Sync button feel immediate instead of up to 30s late. It is no longer
+        # the only runner, and it is no longer load-bearing: it is not retried
+        # and dies with the process on a revision swap, and the drain tick picks
+        # up whatever it drops. Both paths go through the same atomic claim, so
+        # the two firing together cannot import the same catalog twice — the
+        # loser gets `task_not_ready`.
         background_tasks.add_task(process_import_task_by_id, task_id)
 
         logger.info(
@@ -2073,6 +2179,28 @@ async def connect_psp(
     """Connect a PSP provider"""
     if current_user["role"] != "merchant":
         raise HTTPException(status_code=403, detail="Not authorized")
+
+    # A rejected merchant must not connect a payment provider. The gate in
+    # merchant_onboarding_routes' PSP setup route is NOT the only door, despite
+    # a comment there that used to say so: this route takes the merchant_id
+    # from the caller's own session and had no onboarding-status check of any
+    # kind, so a rejected merchant — who can still log in — connected a PSP
+    # here exactly as before.
+    from db.merchant_onboarding import get_merchant_onboarding
+    from services.store_lifecycle_service import SUPPRESSED_ONBOARDING_STATUSES
+
+    _merchant_id = current_user.get("merchant_id")
+    _onboarding = await get_merchant_onboarding(_merchant_id) if _merchant_id else None
+    if _onboarding and str(_onboarding.get("status") or "").strip().lower() in (
+        SUPPRESSED_ONBOARDING_STATUSES
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Merchant account is {_onboarding.get('status')}. "
+                "Only approved merchants can connect a payment provider."
+            ),
+        )
     
     merchant_id = await get_merchant_id_from_user(current_user)
     provider = str(psp_data.get("provider", "")).strip().lower()
@@ -2340,7 +2468,7 @@ async def get_order_detail(
     current_user: dict = Depends(get_current_user)
 ):
     """Get order details"""
-    if current_user["role"] not in ["merchant", "admin"]:
+    if current_user["role"] not in MERCHANT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     merchant_id = await get_merchant_id_from_user(current_user)

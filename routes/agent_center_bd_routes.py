@@ -34,6 +34,7 @@ risk that took backend down already).
 
 from __future__ import annotations
 
+from typing import List
 import logging
 from typing import Any, Dict, Optional
 
@@ -1209,7 +1210,7 @@ async def bd_list_tasks(
 
 
 class _BdTaskStatusUpdate(BaseModel):
-    status: str = Field(..., pattern="^(pending|in_progress|done|failed)$")
+    status: str = Field(..., pattern="^(pending|in_progress|done|failed|ready_for_retest|verifying|verified|regressed)$")
     assigned_to_human: Optional[str] = Field(None, max_length=200)
     evidence: Optional[Dict[str, Any]] = None
 

@@ -33,6 +33,7 @@ from services.outbound_warm_handoff import (
     memo_get,
     memo_set,
     resolve_warm_handoff,
+    warm_market_decision,
 )
 
 
@@ -192,6 +193,23 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
     # the substitution-rate instrument.
     # (HEAD needs no handling here: the route is GET-only, so HEAD is a side-effect-free 405
     # at the framework layer — no warm attempt, no cart, no click log.)
+    #
+    # CONTRACT NOTE — this lane can falsify an answer we ALREADY SENT. `offers.resolve`
+    # returns `cart_prefilled` on external offers (routes/agent_shop_gateway.py), computed
+    # at RESOLVE time from the same resolve_cart_permalink that chose `dest`. A `false`
+    # there is a positive claim to the agent — "this link lands on a product page, the buyer
+    # picks the variant" — and eligibility below fires on exactly that cold population, so a
+    # warm upgrade would make that already-sent `false` wrong with no way to correct it.
+    # (`true` is unaffected: this lane only ever BUILDS a cart.)
+    #
+    # Handled on the CLAIM side, not here: _cart_prefilled_claim asks
+    # could_upgrade_at_click_time and answers `null` rather than a `false` this lane could
+    # contradict. The upgrade itself is deliberately unsuppressed — the buyer gets the better
+    # landing either way. So the rules below are now load-bearing for an agent-facing
+    # contract as well as for the redirect: CHANGING THEM CHANGES WHAT WE PROMISE. Widening
+    # the brand allowlist still invalidates `false` answers on tokens minted before the
+    # widening and still inside their 7-day TTL — that tail is not closed. See
+    # docs/runbooks/outbound_warm_handoff_rollout.md.
     warm_redirect_url: Optional[str] = None
     if settings.outbound_warm_handoff_enabled:
         # The WHOLE lane is throw-guarded: an unexpected error anywhere in eligibility,
@@ -202,17 +220,42 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
                 dest=dest,
                 user_agent=req.headers.get("user-agent"),
                 token=token,
+                # The signed ctx carries `join_mode`, so a dest that is ALREADY a prefilled
+                # cart is knocked out (`already_cart`) instead of being rebuilt from a
+                # request that carries no product identity.
+                ctx=payload.get("ctx") if isinstance(payload.get("ctx"), dict) else {},
                 settings=settings,
             )
             if eligible:
+                # THE CLICK'S OWN MARKET, and only when the token says the minter OBSERVED it.
+                # The token's top-level `market` selected the outbound rule and the domain
+                # allowlist for THIS click, so an observed one is exactly the vantage the
+                # gateway's purchasability gate must key on. But every minter defaults an
+                # unknown market to "US", so a bare `market` can be a PLACEHOLDER — and
+                # forwarding a placeholder gates a non-US buyer against the US fact, which is
+                # the flowerbeauty false positive moved from "no market" to "wrong market".
+                # `market_observed` separates the two; the decision itself is made at the sink
+                # (`warm_market_decision`) so a caller cannot widen it. Never this process's
+                # egress country and never SEED_MARKET. An un-forwarded market sends no key at
+                # all and is counted on the click event ctx below, as `none_unobserved` (a
+                # defaulted market, or a token older than the flag) or `none_invalid` (a market
+                # was named and is not ISO-2) — the gateway keeps its previous behaviour for
+                # both.
+                market_code, market_reason = warm_market_decision(
+                    payload.get("market"), payload.get("market_observed")
+                )
                 # Per-token memo: agent-platform prefetch + the real human click build ONE
-                # cart, and the human click 302s instantly off the memo.
+                # cart, and the human click 302s instantly off the memo. The memo is keyed on
+                # the token, and the market travels ON the token, so two markets can never
+                # share one memoed cart.
                 hit, resolved = memo_get(token)
                 if not hit:
                     resolved = await resolve_warm_handoff(
                         dest=dest,
                         ctx=payload.get("ctx") if isinstance(payload.get("ctx"), dict) else {},
                         settings=settings,
+                        market=payload.get("market"),
+                        market_observed=payload.get("market_observed"),
                     )
                     memo_set(token, resolved)
                 if resolved and resolved.get("continue_url"):
@@ -220,6 +263,15 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
                     warm_ctx = {"handoff": "warm", "warm_reason": "ok"}
                 else:
                     warm_ctx = {"handoff": "cold", "warm_reason": "unresolved"}
+                # The gate-keying instrument, on the SAME click-event ctx as handoff /
+                # warm_reason: the ISO-2 code the gate was keyed on, or WHY it was not keyed
+                # (`none_unobserved` / `none_invalid`). Two reasons, not one, because they
+                # need different fixes — an unobserved market is a MINTER that never learned
+                # the buyer's market, an invalid one is a caller sending a bad code — and one
+                # bucket would hide whichever is smaller. Counting them here is what stops the
+                # un-gated population being invisible. Literals and country codes only, never
+                # a buyer identifier.
+                warm_ctx["warm_market"] = market_reason
             else:
                 warm_ctx = {"handoff": "cold", "warm_reason": reason}
             ctx_out = dict(payload.get("ctx")) if isinstance(payload.get("ctx"), dict) else {}
