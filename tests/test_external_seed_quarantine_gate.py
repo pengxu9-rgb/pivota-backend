@@ -299,9 +299,11 @@ class _SqliteBackedDatabase:
         )
         for sid, domain, title in seeds:
             self._conn.execute(
+                # USD: a seed priced in another currency (or none) is never served to a US read
+                # -- tests/test_external_seed_serving_currency.py -- and would read as quarantined.
                 "INSERT INTO external_product_seeds (id, external_product_id, domain, title,"
-                " status, market, seed_data, destination_url, created_at, updated_at)"
-                " VALUES (?,?,?,?,'active','US','{}','https://x/y','2026-01-01','2026-01-01')",
+                " status, market, price_currency, seed_data, destination_url, created_at, updated_at)"
+                " VALUES (?,?,?,?,'active','US','USD','{}','https://x/y','2026-01-01','2026-01-01')",
                 (sid, sid, domain, title),
             )
         for q in quarantines:
