@@ -1,4 +1,4 @@
-"""Tier-0b': a retailer listing whose title only adds the brand's name joins the brand's own product.
+"""Tier-0e: a NEW retailer listing whose title only adds the brand's name joins the brand's own product.
 
 Measured 2026-09-26 on prod: 51 live retailer listings are the brand store's product with the brand
 name prefixed ("Missha Artemisia Calming Ampoule" at koolseoul.com / ohlolly.com, "Artemisia Calming
@@ -46,8 +46,13 @@ def family(monkeypatch: pytest.MonkeyPatch, quiet):  # noqa: F811
     return by_key
 
 
-async def _resolve(title, *, brand=BRAND, door=ii.DOOR_CATALOG_ENRICHMENT, product_key=RETAILER_KEY, gtin=None):
+RETAILER_SPID = "retailer:0f0e0d0c0b0a09080706050403020100"  # apply passes the listing's own source_product_id
+
+
+async def _resolve(title, *, brand=BRAND, door=ii.DOOR_CATALOG_ENRICHMENT, product_key=RETAILER_KEY, gtin=None,
+                   source_product_id=RETAILER_SPID):
     return await ii.resolve_or_attach_content_identity(brand, title, gtin=gtin, door=door,
+                                                       source_product_id=source_product_id,
                                                        merchant_ctx=_ctx(product_key))
 
 
@@ -143,3 +148,62 @@ def test_the_stripped_key_is_the_brand_families_key():
     assert ii._brand_stripped_content_key("Missha", "[MISSHA] Artemisia Calming Ampoule") == BRAND_CK
     assert ii._brand_stripped_content_key("Missha", "Artemisia Calming Ampoule") is None
     assert ii._brand_stripped_content_key(None, "Missha X") is None
+
+
+# --- re-crawls: an EXISTING listing never moves (review of #2386) ------------------------------------
+
+
+def _memberships(monkeypatch, by_spid):
+    async def existing(row):
+        return by_spid.get(str(row.get("source_product_id") or ""))
+    monkeypatch.setattr(ii, "_existing_pg_for_listing", existing)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title,brand", [
+    ("Missha Artemisia Calming Ampoule", BRAND),        # a listing crawled before this tier existed
+    ("ROUNDLAB Artemisia Calming Ampoule", "Round Lab"),  # re-run under a respelled brand
+])
+async def test_a_listing_that_already_has_a_group_is_never_moved(family, monkeypatch, title, brand):
+    """_ensure_primary_retailer_group never overwrites membership: a different target group fails the
+    whole store job (apply_refused), on every re-run. Relinking existing listings is attach_membership's job."""
+    family[make_content_key(brand, "Artemisia Calming Ampoule")] = [{**BRAND_ROW, "brand": brand}]
+    _memberships(monkeypatch, {RETAILER_SPID: "pg_old_singleton"})
+    out = await _resolve(title, brand=brand)
+    assert out["content_key"] not in {BRAND_CK, make_content_key(brand, "Artemisia Calming Ampoule")}
+    assert out["evidence"].get("reason") != "error"
+
+
+@pytest.mark.asyncio
+async def test_a_membership_lookup_failure_is_treated_as_existing(family, monkeypatch):
+    async def boom(row):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(ii, "_existing_pg_for_listing", boom)
+    assert await ii._listing_has_membership(_ctx(), RETAILER_SPID) is True
+    assert await ii._listing_has_membership(_ctx(), None) is True
+
+
+@pytest.mark.asyncio
+async def test_a_drifted_listing_still_matches_its_own_row_by_url_first(family, monkeypatch):
+    """Tier-0c (canonical_url) runs before 0e: a re-crawled listing whose title drifted keeps its own row."""
+    own_ck = make_content_key(BRAND, "Missha Artemisia Calming Ampoule 50ml")
+    own = {**BRAND_ROW, "product_key": RETAILER_KEY, "source_product_id": RETAILER_SPID,
+           "canonical_url": "https://koolseoul.com/products/artemisia-ampoule", "content_key": own_ck}
+
+    async def by_url(fragment):
+        return [own]
+    monkeypatch.setattr(ii, "_candidates_by_canonical_url", by_url)
+    out = await ii.resolve_or_attach_content_identity(
+        BRAND, "Missha Artemisia Calming Ampoule", source_product_id=RETAILER_SPID,
+        canonical_url="https://koolseoul.com/products/artemisia-ampoule",
+        door=ii.DOOR_CATALOG_ENRICHMENT, merchant_ctx=_ctx())
+    assert out["content_key"] == own_ck
+
+
+@pytest.mark.asyncio
+async def test_a_new_listing_joins_the_brand_products_own_group(family, monkeypatch):
+    """The brand's product may sit in a curated multi-member group: the listing joins THAT group."""
+    _memberships(monkeypatch, {BRAND_ROW["source_product_id"]: "pg_brand_curated"})
+    out = await _resolve("Missha Artemisia Calming Ampoule")
+    assert (out["action"], out["content_key"], out["product_group_id"]) == (
+        ii.ACTION_ATTACH, BRAND_CK, "pg_brand_curated")

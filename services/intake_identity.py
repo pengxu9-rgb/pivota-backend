@@ -403,8 +403,21 @@ def _is_retailer_listing_key(product_key: Optional[str]) -> bool:
 
 
 def _is_retailer_listing_ctx(door: str, ctx: Dict[str, Any]) -> bool:
-    """Tier-0b' runs only for a retailer-lane listing at the crawl door."""
+    """Tier-0e runs only for a retailer-lane listing at the crawl door."""
     return door == DOOR_CATALOG_ENRICHMENT and _is_retailer_listing_key(ctx.get("product_key"))
+
+
+async def _listing_has_membership(ctx: Dict[str, Any], source_product_id: Optional[str]) -> bool:
+    """True when this listing already belongs to a product group -- a re-crawl, or any doubt."""
+    if not source_product_id:
+        return True
+    try:
+        return bool(await _existing_pg_for_listing({
+            "merchant_id": ctx.get("merchant_id"), "platform": ctx.get("platform"),
+            "source_product_id": source_product_id,
+        }))
+    except Exception:  # noqa: BLE001 -- unsure means existing: never risk a group move
+        return True
 
 
 def _brand_stripped_content_key(brand: Optional[str], title: Optional[str]) -> Optional[str]:
@@ -574,35 +587,6 @@ async def resolve_or_attach_content_identity(
                 gtin=gtin14, attach=_attach_info(row, merchant_id),
             )
 
-        # -- Tier-0b': a retailer LISTING whose title only prefixes the brand's name
-        # ("Missha Artemisia Calming Ampoule" at a retailer, "Artemisia Calming
-        # Ampoule" on misshaus.com). The brand prefix never changes which product
-        # this is, so the brand-stripped title's family key is tried -- and
-        # attached ONLY when that family already holds a non-retailer row (the
-        # brand's own product), so a listing joins the brand's product as another
-        # seller instead of minting a second product. Sizes are NOT stripped
-        # (normalize_title: sizes are identity). Measured 2026-09-26: 51 live
-        # retailer listings are the brand store's product under this rule.
-        stripped = _brand_stripped_content_key(brand, title) if _is_retailer_listing_ctx(door, ctx) else None
-        if stripped:
-            family = await _rows_by_content_key(stripped, merchant_id)
-            known_gtins = {r.get("gtin") for r in family if r.get("gtin")}
-            brand_row = next((r for r in family if not _is_retailer_listing_key(r.get("product_key"))), None)
-            if brand_row is not None and not (gtin14 and known_gtins and gtin14 not in known_gtins):
-                ck = brand_row.get("content_key") or stripped
-                return await _finish(
-                    action=ACTION_ATTACH, content_key=ck,
-                    product_group_id=await _attach_pg(brand_row, ck, strict=strict_pg),
-                    matcher="brand_prefix_title", door=door, merchant_ctx=ctx,
-                    detail={
-                        **_base_detail(),
-                        "matched_product_key": brand_row.get("product_key"),
-                        "stripped_content_key": stripped,
-                        "deposit_basis": _deposit_basis(brand, title, gtin, ck),
-                    },
-                    gtin=gtin14, attach=_attach_info(brand_row, merchant_id),
-                )
-
         # -- Tier-0c: canonical_url exact (the ER gate's matcher, unchanged:
         # unique normalized-equality hit or nothing).
         if canonical_url:
@@ -681,6 +665,45 @@ async def resolve_or_attach_content_identity(
                         },
                         gtin=gtin14, attach=_attach_info(row, merchant_id),
                     )
+
+        # -- Tier-0e: a retailer LISTING whose title only prefixes the brand's name
+        # ("Missha Artemisia Calming Ampoule" at a retailer, "Artemisia Calming
+        # Ampoule" on misshaus.com). The brand prefix never changes which product
+        # this is, so the brand-stripped title's family key is tried -- and
+        # attached ONLY when that family already holds a non-retailer row (the
+        # brand's own product), so a listing joins the brand's product as another
+        # seller instead of minting a second product. Sizes are NOT stripped
+        # (normalize_title: sizes are identity). Measured 2026-09-26: 51 live
+        # retailer listings are the brand store's product under this rule.
+        #
+        # LAST among the exact tiers, and only for a listing with NO group membership yet (review of
+        # #2386): an existing listing must keep matching its own row through canonical_url /
+        # source_product_id even when its title or brand spelling drifted, and its membership is never
+        # overwritten (_ensure_primary_retailer_group refuses a different group, which fails the whole
+        # store job). Moving existing listings onto the brand's product is the identity engine's
+        # attach_membership, not a crawl. The brand row is always among _rows_by_content_key's first 5:
+        # it is older than every listing attached to it (created_at ASC).
+        stripped = (_brand_stripped_content_key(brand, title)
+                    if _is_retailer_listing_ctx(door, ctx)
+                    and not await _listing_has_membership(ctx, source_product_id) else None)
+        if stripped:
+            family = await _rows_by_content_key(stripped, merchant_id)
+            known_gtins = {r.get("gtin") for r in family if r.get("gtin")}
+            brand_row = next((r for r in family if not _is_retailer_listing_key(r.get("product_key"))), None)
+            if brand_row is not None and not (gtin14 and known_gtins and gtin14 not in known_gtins):
+                ck = brand_row.get("content_key") or stripped
+                return await _finish(
+                    action=ACTION_ATTACH, content_key=ck,
+                    product_group_id=await _attach_pg(brand_row, ck, strict=strict_pg),
+                    matcher="brand_prefix_title", door=door, merchant_ctx=ctx,
+                    detail={
+                        **_base_detail(),
+                        "matched_product_key": brand_row.get("product_key"),
+                        "stripped_content_key": stripped,
+                        "deposit_basis": _deposit_basis(brand, title, gtin, ck),
+                    },
+                    gtin=gtin14, attach=_attach_info(brand_row, merchant_id),
+                )
 
         # -- No exact match → ADR-008 / P1.4 brand-fragmentation guard, now
         # uniform across ALL five doors (extends the guard to doors 3/4).
