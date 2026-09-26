@@ -2083,6 +2083,9 @@ def shopify_product_to_record(
     currency: Optional[str] = None,
     source_role: str = "brand_official",
     retailer_name: Optional[str] = None,
+    # A sub-brand the product's OWN title names (see title_brand_for); wins over the vendor-derived
+    # brand, because it is product-level evidence and the vendor is the umbrella label.
+    title_brand: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
     (`{pdp, offers}`). Returns None if it lacks a title/handle (not actionable).
@@ -2130,6 +2133,8 @@ def shopify_product_to_record(
         official_family = _retailer_brand_family("".join(c for c in str(brand or "").casefold() if c.isalnum()))
         if official_family is not None:
             brand = RETAILER_BRAND_CANONICAL[official_family]
+    if title_brand:
+        brand = title_brand
     brand = str(brand or "").strip()
     if not brand:
         return None
@@ -2533,6 +2538,23 @@ class CurrencyNotProven(RuntimeError):
     """
 
 
+def title_brand_for(title: Optional[str], prefixes: Optional[Mapping[str, str]]) -> Optional[str]:
+    """The sub-brand a title names by starting with one of `prefixes` (casefolded, whitespace
+    collapsed; the longest prefix wins, so "Red by Kiss" beats "Red"). None when none applies.
+
+    For UMBRELLA vendors only (options.title_brands): "Kiss New York" files Red by Kiss hair brushes
+    and KISS GoldFinger nails under one label. validate_options refuses a brand its prefix does not
+    name, so this can respell to what the title already says, never relabel."""
+    if not prefixes or not title:
+        return None
+    folded = " ".join(str(title).split()).casefold()
+    for prefix in sorted(prefixes, key=len, reverse=True):
+        key = " ".join(str(prefix).split()).casefold()
+        if key and (folded == key or folded.startswith(key + " ") or folded.startswith(key + "-")):
+            return prefixes[prefix]
+    return None
+
+
 def _vendor_token(value: Optional[str]) -> str:
     """Comparison form of a Shopify `vendor` string: casefolded, whitespace collapsed.
 
@@ -2586,6 +2608,7 @@ async def records_for_brand(
     brand: Optional[str] = None,
     collection_handles: Optional[Sequence[str]] = None,
     brand_by_vendor: Optional[Mapping[str, str]] = None,
+    brand_by_title_prefix: Optional[Mapping[str, str]] = None,
     max_products: int = 500,
     base_listings_only: bool = False,
     # Emit the merchant's OWN variants for products that are natively multi-variant
@@ -2749,6 +2772,7 @@ async def records_for_brand(
             # by the same resolve_record_brand rule a single-brand job's `brand` gets.
             p, domain=domain, category_path=category_path,
             brand_override=(brand_by_vendor or {}).get(_vendor_token(p.get("vendor")), brand),
+            title_brand=title_brand_for(p.get("title"), brand_by_title_prefix),
             emit_variants=base_listings_only,
             emit_native_variants=emit_real_variants,
             currency=locale.get("currency"),

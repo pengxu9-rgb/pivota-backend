@@ -79,6 +79,12 @@ _OPTION_TYPES = {
     # override each row keeps the STORE's spelling, and normalize_brand keeps punctuation, so "Dr. Jart+"
     # at one store and "Dr.Jart+" everywhere else become two brands (review of #2301).
     "brands": dict,
+    # multi_brand only: {title prefix: sub-brand} for an UMBRELLA vendor that files several lines under
+    # one label -- wigtypes.com / beautyofnewyork.com list "Red by Kiss HH65 Edge Boar Brush" and "Kiss
+    # GoldFinger ... 24 Nails" under vendor "Kiss New York". A product whose title starts with a key
+    # takes that key's brand. The brand must be NAMED in its prefix (letters and digits contained), so
+    # this reads the product's own title, never relabels into a brand the product does not name.
+    "title_brands": dict,
     # The buyer market this cohort's offers are priced FOR (ISO-3166-1 alpha-2; absent = DEFAULT_MARKET).
     # It decides the currency the store must prove (require_currency defaults to the market's) and what
     # the readback checks every offer is stamped. Multi-market storefronts ADR, Phase 1.
@@ -207,6 +213,18 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         if ignored:
             raise ValueError(f"options.brands can only respell a vendor (same letters and digits); "
                              f"these would be ignored: {ignored}")
+    if "title_brands" in options:
+        title_brands = options["title_brands"]
+        if not options.get("multi_brand"):
+            raise ValueError("options.title_brands is only meaningful with options.multi_brand")
+        alnum = lambda v: "".join(c for c in str(v).casefold() if c.isalnum())
+        if not isinstance(title_brands, dict) or not title_brands or not all(
+                isinstance(k, str) and isinstance(v, str) and len(alnum(k)) >= 4 and alnum(v)
+                for k, v in title_brands.items()):
+            raise ValueError("options.title_brands must map title prefixes (4+ letters) to brand names")
+        unnamed = sorted(k for k, v in title_brands.items() if alnum(v) not in alnum(k))
+        if unnamed:
+            raise ValueError(f"options.title_brands: each brand must be named in its title prefix: {unnamed}")
     if "collections" in options:
         from services.curated_brand_feed import valid_collection_handle
         if source != "storefront" or not options["collections"] or not all(
@@ -528,6 +546,9 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
         if (job.get("options") or {}).get("multi_brand"):
             payload["brand_by_vendor"] = {" ".join(k.split()).casefold(): " ".join(v.split())
                                           for k, v in job["options"]["brands"].items()}
+            if job["options"].get("title_brands"):
+                payload["brand_by_title_prefix"] = {" ".join(k.split()).casefold(): " ".join(v.split())
+                                                    for k, v in job["options"]["title_brands"].items()}
     except ValueError as exc:  # e.g. an unknown source_role on a row written by another path
         raise _Stop("invalid_job", "failed", str(exc)) from exc
     evidence = lip_title_evidence() if (job.get("options") or {}).get("lip_title_evidence") else contextlib.nullcontext()
