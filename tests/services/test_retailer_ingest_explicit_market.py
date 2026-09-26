@@ -59,9 +59,10 @@ def test_market_us_in_any_case_is_us(given):
     assert o["market"] == "US" and pipeline.job_currency(o) == "USD"
 
 
-@pytest.mark.parametrize("market", ["AU", "JP", "SG", "GB"])
+@pytest.mark.parametrize("market", ["SG", "GB", "KR", "CA"])
 def test_a_real_market_that_is_not_allowlisted_yet_is_refused(market):
-    # AU/JP ARE in region_pricing: only the ingest allowlist refuses them.
+    # These ARE in region_pricing: only the ingest allowlist refuses them. (AU/JP joined the allowlist as
+    # acquisition markets in Phase 2: tests/services/test_retailer_ingest_markets_phase2.py.)
     with pytest.raises(ValueError, match="not an ingest market yet"):
         pipeline.validate_options({"vendors": ["X"], "market": market})
 
@@ -85,9 +86,9 @@ def test_require_currency_must_be_the_markets(currency):
         pipeline.validate_options({"vendors": ["X"], "market": "US", "require_currency": currency})
 
 
-async def test_an_au_job_is_refused_before_any_crawl(env):  # noqa: F811
+async def test_a_market_outside_the_allowlist_is_refused_before_any_crawl(env):  # noqa: F811
     env.crawl_error = AssertionError("must not crawl")
-    out = await pipeline.run_stage(job(market="AU", require_currency="AUD"), db=env.db)
+    out = await pipeline.run_stage(job(market="SG", require_currency="SGD"), db=env.db)
     assert (out["status"], out["outcome"]) == ("failed", "invalid_job")
     assert "not an ingest market yet" in out["reason"]
 
@@ -138,7 +139,8 @@ def test_require_currency_usd_stays_part_of_the_scope_as_it_always_was():
 
 
 def test_the_ledger_default_market_is_the_pipelines():
-    assert pipeline.DEFAULT_MARKET == "US" and pipeline.INGEST_MARKETS == ("US",)
+    # db.retailer_ingest.scope_key folds a literal "US" into "absent": it must be the pipeline's default.
+    assert pipeline.DEFAULT_MARKET == "US" and pipeline.DEFAULT_MARKET in pipeline.INGEST_MARKETS
 
 
 # ------------------------------------------------------------------ 2. readback market invariant
@@ -465,7 +467,7 @@ def test_a_brand_official_plan_stamps_whose_copy_it_is():
 
 @pytest.mark.parametrize("batch", [False, True])
 async def test_an_off_market_store_attaches_offers_but_keeps_the_canonical_copy(quiet_writer, batch):
-    # AU is refused by validate_options today; the guard is exercised directly, as Phase 2 will reach it.
+    # Exercised directly; tests/services/test_retailer_ingest_markets_phase2.py reaches it through an AU job.
     plan = _plan("frankbody.com")
     db = _Catalog([_stored(plan, "us.frankbody.com")])
     counts = await writer.apply_ingest_plan(plan, batch_label="t", db=db, batch=batch, market="AU")

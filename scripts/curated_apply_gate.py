@@ -235,8 +235,16 @@ def evaluate_apply_log(text: str, *, domain: str | None = None) -> dict:
         # The report must be for the host this runner applied — a stale or mis-pointed log must not
         # pass on another host's clean run.
         want = _host(f"https://{domain}")
-        hosts = {_host(p.get("canonical_url")) for p in products}
-        if not products or hosts != {want}:
+        # One exception, recorded by the apply itself: a product whose canonical copy ANOTHER brand-official
+        # storefront owns, which this (off-canonical-market) apply attached offers to without taking over
+        # (apply._guard_canonical_owner; multi-market storefronts ADR 3.4 item 4). Its canonical_url is the
+        # owner's by design. Only for a product the report lists as kept FOR THIS HOST under THAT owner.
+        kept = {str(r.get("product_key")): _host(f"https://{r.get('owner')}")
+                for r in (applied.get("canonical_owner_kept") or []) if isinstance(r, dict)
+                and _host(f"https://{r.get('writer')}") == want}
+        hosts = {_host(p.get("canonical_url")) for p in products
+                 if kept.get(str(p.get("product_key"))) != _host(p.get("canonical_url"))}
+        if not products or not hosts <= {want}:
             reasons.append("report_for_another_host")
 
     return {

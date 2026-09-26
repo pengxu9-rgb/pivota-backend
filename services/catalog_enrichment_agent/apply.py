@@ -376,6 +376,48 @@ _OFFER_UPSERT_SQL = """
                       updated_at = NOW()
                     """
 
+def _offer_upsert_sql_with_market(sql: str) -> str:
+    """`_OFFER_UPSERT_SQL` with `market` as an INSERT column: the statement for offer rows whose
+    writer DECLARED a destination market (ingestion._build_offer_inserts(market=...); the
+    retailer_ingest lane, multi-market storefronts ADR section 3.4 item 3).
+
+    Derived from the one statement rather than spelled twice, so the two can never drift, and
+    refused unless it changed exactly the two places it must. `market` is written on INSERT only,
+    like `currency`: ON CONFLICT refreshes neither, so a re-ingest never restamps an existing row's
+    market (the SG rows' deliberate 'US' stays put, and a legacy row this plan collides with keeps
+    its stamp -- the retailer_ingest readback then reports the disagreement instead of hiding it).
+    Rows that declare no market keep using `_OFFER_UPSERT_SQL` itself, byte for byte."""
+    cols_old = "offer_type, is_first_party,\n"
+    vals_old = ":offer_type, :is_first_party,\n"
+    if sql.count(cols_old) != 1 or sql.count(vals_old) != 1:
+        raise RuntimeError("_OFFER_UPSERT_SQL changed shape; update _offer_upsert_sql_with_market")
+    return (sql.replace(cols_old, "offer_type, is_first_party, market,\n")
+               .replace(vals_old, ":offer_type, :is_first_party, :market,\n"))
+
+
+_OFFER_UPSERT_MARKET_SQL = _offer_upsert_sql_with_market(_OFFER_UPSERT_SQL)
+
+
+def _offer_sql_for(row: Dict[str, Any]) -> str:
+    """The upsert for one offer row: with `market` only when its writer declared one."""
+    return _OFFER_UPSERT_MARKET_SQL if row.get("market") is not None else _OFFER_UPSERT_SQL
+
+
+def _refuse_offer_market_currency_mismatch(plan: Dict[str, Any]) -> None:
+    """Currency = market at the write chokepoint, before ANY row of the plan is written: an offer
+    row that declares a market must be priced in that market's currency (region_pricing.
+    require_market_currency, the same rule ingestion applies when it builds the row). A plan built
+    or edited anywhere else cannot reach the table with USD money stamped 'AU'. Raises ValueError."""
+    from services.region_pricing import require_market_currency
+
+    for offer in plan.get("offers") or []:
+        if offer.get("market") is not None:
+            try:
+                require_market_currency(offer["market"], offer.get("currency"))
+            except ValueError as exc:
+                raise ValueError(f"offer {offer.get('offer_id')}: {exc}") from None
+
+
 def _with_offer_write_defaults(rows: list) -> list:
     """Guarantee every bind `_OFFER_UPSERT_SQL` names, for rows built elsewhere.
 
@@ -1713,8 +1755,10 @@ async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any
 #: collide) WITHOUT overwriting that copy. Without this guard such an apply re-points the row's
 #: source_domain / canonical_url / payload at itself and re-labels its INCI.
 #:
-#: DORMANT while retailer_ingest allows only US (= the canonical market for every brand): a second
-#: storefront in the SAME market is deliberately not guarded (review of #2353). Keeping the owner's
+#: LIVE since the ADR's Phase 2: a retailer_ingest job for an acquisition market (AU/JP) is off the
+#: canonical market for every brand, so frankbody.com's AU crawl attaches AUD offers under
+#: us.frankbody.com's copy. A second storefront in the SAME market is deliberately not guarded
+#: (review of #2353). Keeping the owner's
 #: canonical_url there makes the apply gate read back another host's URL (report_for_another_host)
 #: and fail the job after its offers were written, on every retry.
 DEFAULT_CANONICAL_MARKET = "US"
@@ -1912,6 +1956,7 @@ async def _apply_ingest_plan(
     byte-for-byte the legacy per-row path for every existing caller."""
     from db.database import database as _global_db
 
+    _refuse_offer_market_currency_mismatch(plan)  # pure: before the connection, before any write
     database = db or _global_db
     if not getattr(database, "is_connected", False):
         await database.connect()
@@ -2038,7 +2083,7 @@ async def _apply_ingest_plan(
                 # succeeded, while `counts` went on reporting them as written. The
                 # nested transaction rolls back this offer alone.
                 async with database.transaction():
-                    await database.execute(_OFFER_UPSERT_SQL, offer)
+                    await database.execute(_offer_sql_for(offer), offer)
                 counts["offers"] += 1
                 audit.record_applied(1)
             except Exception as exc:  # noqa: BLE001
@@ -2225,9 +2270,16 @@ async def _apply_ingest_plan_batched(
     if skip_reasons:
         audit.record_skips(skip_reasons)
         counts["offers_skipped"] = sum(skip_reasons.values())
-    applied_offers, offers_insert_skipped, _osr = await bulk_upsert(
-        database, _OFFER_UPSERT_SQL, _with_offer_write_defaults(accepted_offers), label="offers"
-    )
+    # One statement per bind shape: rows whose writer declared a market carry the `market` bind,
+    # the rest do not (a multi-row VALUES needs one column list). A plan normally has one shape.
+    offer_rows = _with_offer_write_defaults(accepted_offers)
+    applied_offers = offers_insert_skipped = 0
+    for sql in (_OFFER_UPSERT_SQL, _OFFER_UPSERT_MARKET_SQL):
+        shaped = [r for r in offer_rows if _offer_sql_for(r) is sql]
+        if shaped:
+            applied, skipped, _osr = await bulk_upsert(database, sql, shaped, label="offers")
+            applied_offers += applied
+            offers_insert_skipped += skipped
     counts["offers"] = applied_offers
     counts["offers_skipped_insert"] = offers_insert_skipped
     audit.record_applied(applied_offers)

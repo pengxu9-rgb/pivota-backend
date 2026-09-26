@@ -4,9 +4,18 @@ Each JSONL row: {"domain": "k-touch.us", "brand": "3CE", "vendors": ["3CE"],
                  "options": {"lip_title_evidence": true, "only_category": "beauty/makeup/lip"},
                  "priority": 10}
 `vendors` is required (a retailer cohort is selected by vendor). Everything else in `options` is
-optional: market (ISO alpha-2, default US; US is the only market allowed yet), require_currency
-(default and only allowed value: the market's currency, USD for US), category_path, only_category,
-only_resolved_category, lip_title_evidence, exclude_handles, max_scan_products, max_products, retailer_name.
+optional: market (ISO alpha-2, default US; allowed US, and AU/JP as acquisition markets whose rows are
+stored but not served), require_currency (default and only allowed value: the market's currency, USD for
+US, AUD for AU, JPY for JP), source (storefront | affiliate_feed | shopify_markets), category_path,
+only_category, only_resolved_category, lip_title_evidence, exclude_handles, max_scan_products,
+max_products, retailer_name.
+
+A Shopify-Markets brand store (AUD base, quotes USD to US buyers) is TWO jobs, in this order:
+  1. {"domain": "gotoskincare.com", "brand": "Go-To", "vendors": ["Go-To"],
+      "options": {"source_role": "brand_official", "market": "AU"}}      -- base-currency crawl, AUD rows
+  2. {"domain": "gotoskincare.com", "brand": "Go-To", "vendors": ["Go-To"],
+      "options": {"source_role": "brand_official", "source": "shopify_markets"}}  -- USD siblings
+Queue 2 only after 1 is done: the capture prices only products 1 already wrote.
 
 Re-enqueueing a cohort that already has an open job is a no-op (reported as `exists`).
 Needs DATABASE_URL: run it through scripts/ops/run_oneoff_job.sh.
@@ -59,10 +68,9 @@ def _row_to_job(row: Dict[str, Any]) -> Dict[str, Any]:
     validate_options(options)  # the same check the drain runs before any crawl
     # ...and the same payload normalization it runs (source_role values, retailer_name only for a
     # retailer): a row the drain would refuse at crawl time is refused here, by the same function.
-    from services.catalog_onboard_worker import normalize_curated_brand_payload
-    from services.retailer_ingest.pipeline import _feed_payload, _Stop
+    from services.retailer_ingest.pipeline import _Stop, ingest_payload
     try:
-        normalize_curated_brand_payload(_feed_payload({"domain": domain, "brand": brand, "options": options}))
+        ingest_payload({"domain": domain, "brand": brand, "options": options})
     except _Stop as exc:
         raise ValueError(exc.reason) from None
     if options.get("source_role") == "brand_official":

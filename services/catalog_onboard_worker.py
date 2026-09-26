@@ -47,13 +47,20 @@ def _as_dict(payload: Any) -> Dict[str, Any]:
 
 # ---- enqueue (sources) -------------------------------------------------------
 
-def normalize_curated_brand_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_curated_brand_payload(payload: Dict[str, Any], *,
+                                    markets: Sequence[str] = ("US",)) -> Dict[str, Any]:
     """Validate the effective crawl contract before enqueue AND before execution.
 
     Existing queued rows predate these controls, so the execution boundary must
     validate too. The Path-C seed writer currently owns the US serving partition;
     accepting a different market here would claim a capability it does not have.
     Currency is independent of that partition and is never inferred from it.
+
+    `markets`: the markets the CALLER can write truthfully. The default is US only, because this
+    queue's own drain (`_process_curated_brand`) stamps no market on its offers. The retailer_ingest
+    lane passes its INGEST_MARKETS (US plus the AU/JP acquisition markets of the multi-market
+    storefronts ADR, Phase 2): it declares the job's market on every offer it writes
+    (ingestion._build_offer_inserts(market=...)) and keeps the seed partition at US.
     """
     if not isinstance(payload, dict):
         raise ValueError("curated brand payload must be an object")
@@ -67,8 +74,10 @@ def normalize_curated_brand_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "." not in domain or any(c.isspace() for c in domain):
         raise ValueError("domain must be a valid storefront host")
     market = str(payload.get("market") or "US").strip().upper()
-    if market != "US":
-        raise ValueError("curated onboarding supports market US only; use a market-aware ingest lane")
+    if market not in {str(m).strip().upper() for m in markets}:
+        if tuple(markets) == ("US",):
+            raise ValueError("curated onboarding supports market US only; use a market-aware ingest lane")
+        raise ValueError(f"market {market} is not one of {sorted(markets)}")
     if (payload.get("only_vendors") is not None or payload.get("retailer_name")) and not payload.get("source_role"):
         raise ValueError("vendor-filtered or retailer-named onboarding requires explicit source_role (retailer or brand_official)")
     role = payload.get("source_role", "brand_official")

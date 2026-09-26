@@ -226,6 +226,35 @@ def test_the_report_must_be_for_the_host_this_runner_applied():
     assert "report_for_another_host" in empty["reasons"]
 
 
+def _owned_elsewhere(kept):
+    """The first product's canonical_url is us.eyurs.com's: another brand-official storefront owns that copy,
+    and an off-canonical-market apply keeps it (apply._guard_canonical_owner, multi-market storefronts ADR
+    Phase 2). `kept` is the apply's own record of that (owner, writer), or None when it recorded nothing."""
+    def mutate(report):
+        first = report["applied"]["primary_readiness"]["products"][0]
+        first["canonical_url"] = "https://us.eyurs.com/products/x"
+        if kept is not None:
+            owner, writer = kept
+            report["applied"]["canonical_owner_kept"] = [
+                {"product_key": first["product_key"], "owner": owner, "writer": writer, "market": "AU"}]
+    return _with_post_apply(mutate)
+
+
+def test_a_product_the_apply_kept_under_its_owner_is_this_hosts_report():
+    assert evaluate_apply_log(_owned_elsewhere(("us.eyurs.com", "eyurs.com")), domain="eyurs.com")["ok"] is True
+    assert evaluate_apply_log(_owned_elsewhere(("us.eyurs.com", "www.eyurs.com")), domain="eyurs.com")["ok"] is True
+
+
+@pytest.mark.parametrize("kept", [
+    None,                                   # another host's URL the apply never said it kept
+    ("us.eyurs.com", "ohlolly.com"),        # kept, but by ANOTHER host's apply: a stale or mis-pointed log
+    ("somewhere-else.com", "eyurs.com"),    # the URL is not the owner the apply recorded
+])
+def test_only_a_product_kept_for_this_host_under_that_owner_is_excused(kept):
+    verdict = evaluate_apply_log(_owned_elsewhere(kept), domain="eyurs.com")
+    assert verdict["ok"] is False and "report_for_another_host" in verdict["reasons"]
+
+
 def test_skus_explained_by_natural_key_dedupe_are_not_missing():
     """Mirrors `require_primary_apply`: fewer SKUs than planned is acceptable ONLY up to the number
     explicitly deduplicated on the natural key. The producer returns `applied` for this run; a gate

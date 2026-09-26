@@ -55,8 +55,11 @@ _OPTION_TYPES = {
     "refile_to_sets": list,
     "accepted_flags": list, "max_scan_products": int, "max_products": int,
     "max_pdp_identity_fetches": int, "max_pdp_inci_fetches": int, "retailer_name": str, "notes": str,
-    # "storefront" (default: crawl the retailer's /products.json) or "affiliate_feed" (the network's
-    # product datafeed; services/retailer_ingest/affiliate_feed.py) -- for stores that block crawlers.
+    # "storefront" (default: crawl the retailer's /products.json), "affiliate_feed" (the network's
+    # product datafeed; services/retailer_ingest/affiliate_feed.py) -- for stores that block crawlers --
+    # or "shopify_markets" (services/retailer_ingest/shopify_markets.py: USD SIBLING offers, read inside
+    # a US-localized session whose /cart.js proves USD, for products a base-currency crawl of the same
+    # storefront already wrote; multi-market storefronts ADR Phase 2).
     "source": str, "feed": dict,
     # Whose store this is: "retailer" (default) or "brand_official" (the brand's own storefront, the
     # ADR-001 canonical anchor). services.catalog_onboard_worker.normalize_curated_brand_payload owns
@@ -80,15 +83,22 @@ _OPTION_TYPES = {
     # the readback checks every offer is stamped. Multi-market storefronts ADR, Phase 1.
     "market": str,
 }
-SOURCES = ("storefront", "affiliate_feed")
+SOURCES = ("storefront", "affiliate_feed", "shopify_markets")
+MARKETS_SOURCE = "shopify_markets"
 DEFAULT_MARKET = "US"
-#: The markets a job may name. US ONLY in this phase: every offer this lane writes is stamped
-#: catalog_offers.market 'US' (catalog_enrichment_agent.ingestion) and normalize_curated_brand_payload
-#: refuses any other market, so an AU or JP job today would crawl an AUD/JPY store and then have
-#: nowhere truthful to put it. AU/JP become ACQUISITION markets (rows stored, not served) in the
-#: multi-market storefronts ADR's Phase 2, and served markets in its Phase 3 -- each is one entry here
-#: plus that phase's writer change, never this list alone.
-INGEST_MARKETS = ("US",)
+#: The markets a job may name. Every offer this lane writes is stamped catalog_offers.market = the
+#: job's market and must be priced in that market's currency (ingestion._build_offer_inserts(market=),
+#: region_pricing.require_market_currency): the declared-destination semantics ADR-024 reserves for a
+#: writer that declares one. normalize_curated_brand_payload accepts exactly this list from this lane.
+INGEST_MARKETS = ("US", "AU", "JP")
+#: Multi-market storefronts ADR Phase 2 (approved by Peng 2026-09-26): ACQUISITION markets. A job for
+#: one crawls the storefront's base currency (AUD/JPY) and stores its rows truthfully (market 'AU',
+#: currency 'AUD'); they are NOT served, because serving gates on the offer's currency against the
+#: served regions (index_pipeline_state has_serving_region_offer, PIVOTA_SERVING_PRICING_REGIONS = US,SG)
+#: and the agent-decision gate blocks them as no_us_offer. They become servable only when a USD sibling
+#: lands (a source=shopify_markets job) or when the market itself is served (the ADR's Phase 3, a config
+#: change plus the seed-partition decision -- never this list alone).
+ACQUISITION_MARKETS = ("AU", "JP")
 _ISO_ALPHA2 = re.compile(r"[A-Z]{2}")
 #: Tier B (storefront_tier_b) needs the store's /meta.json name to start with the brand. A brand shorter
 #: than this (letters and digits) is too common a prefix to be evidence ("ZA Cosmetics" may be anyone's),
@@ -225,9 +235,24 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         if not _ISO_ALPHA2.fullmatch(market):
             raise ValueError(f"options.market must be an ISO-3166-1 alpha-2 code, got {options['market']!r}")
         if market not in INGEST_MARKETS:
-            raise ValueError(f"options.market {market} is not an ingest market yet (allowed: {list(INGEST_MARKETS)}); "
-                             f"AU/JP arrive with the multi-market storefronts ADR's Phase 2/3")
+            raise ValueError(f"options.market {market} is not an ingest market yet (allowed: {list(INGEST_MARKETS)})")
         options["market"] = market  # "us" and "US" are one cohort (db.retailer_ingest.scope_key agrees)
+    if source == MARKETS_SOURCE:
+        if options.get("source_role") != "brand_official":
+            # Brand stores first (Peng 2026-09-26). Retailers (kokorojapanstore, kiokii) follow in a later
+            # PR: their sibling offers would need the retailer seller identity and review this lane has not
+            # built for a captured price.
+            raise ValueError("options.source = shopify_markets supports only source_role = brand_official "
+                             "(retailers follow later)")
+        if job_market(options) != DEFAULT_MARKET:
+            # The capture proves a US session (/cart.js reports USD) and writes market 'US' siblings. It is
+            # never the way to price a store for AU/JP: that is its base-currency crawl.
+            raise ValueError(f"options.source = shopify_markets captures the {DEFAULT_MARKET} market only")
+    elif job_market(options) in ACQUISITION_MARKETS and source != "storefront":
+        # An acquisition job is the BASE-CURRENCY crawl of a storefront (ADR Phase 2, operator step 1):
+        # the rows a shopify_markets capture later prices in USD. A feed has no such storefront.
+        raise ValueError(f"options.market {job_market(options)} (an acquisition market) supports only "
+                         f"options.source = storefront")
     # The currency is the MARKET's, never a second free choice: the /products.json crawl sees only the
     # store's base currency, so "base currency = the market's currency" is the one honest rule for it
     # (ADR section 3.3). Given, it must say the same; absent, it is derived.
@@ -248,6 +273,18 @@ def job_currency(options: Optional[Dict[str, Any]]) -> str:
     validate_options refuses a require_currency that says anything else."""
     from services.region_pricing import pricing_currency_for_region
     return pricing_currency_for_region(job_market(options))
+
+
+def job_source(options: Optional[Dict[str, Any]]) -> str:
+    """The job's source: options.source, else "storefront" (validate_options refuses anything else)."""
+    return (options or {}).get("source") or "storefront"
+
+
+def ingest_payload(job: Dict[str, Any]) -> Dict[str, Any]:
+    """The crawl payload, normalized by the ONE payload validator with this lane's market allowlist.
+    Enqueue runs exactly this, so a row the drain would refuse at crawl time is refused there too."""
+    from services.catalog_onboard_worker import normalize_curated_brand_payload
+    return normalize_curated_brand_payload(_feed_payload(job), markets=INGEST_MARKETS)
 
 
 def _tokens(value: Any) -> List[str]:
@@ -375,8 +412,9 @@ def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
         "source_role": o.get("source_role") or "retailer", "retailer_name": o.get("retailer_name"),
         "only_vendors": list(o["vendors"]),
         # The market's currency (validate_options has refused any other require_currency), and the market
-        # itself, which normalize_curated_brand_payload refuses unless it is US -- a second lock on the
-        # INGEST_MARKETS allowlist, owned by the writer that stamps the offers.
+        # itself, which normalize_curated_brand_payload refuses unless it is in the INGEST_MARKETS this
+        # lane hands it (ingest_payload) -- a second lock on the allowlist; the curated onboard queue,
+        # which stamps no market on its offers, still gets US only.
         "require_currency": job_currency(o), "market": job_market(o), "emit_real_variants": True,
         "enrich_missing_gtin": True, "max_products": int(o.get("max_products") or 200),
         "max_scan_products": int(o.get("max_scan_products") or 20000),
@@ -435,13 +473,41 @@ async def _affiliate_records(job: Dict[str, Any], payload: Dict[str, Any]) -> Li
     return batch
 
 
+def _throttled(job: Dict[str, Any], stage: str, reason: str, *,
+               checks: Optional[Dict[str, Any]] = None) -> _Stop:
+    """A 429/5xx/timeout: back off and retry the SAME stage later, spending an attempt; once the retry
+    budget is spent the job fails. The host is never asked faster than crawl_politeness allows."""
+    attempts = int(job.get("attempts") or 0) + 1
+    if attempts >= int(job.get("max_attempts") or 6):
+        return _Stop("crawl_throttled", "failed", f"retry budget spent: {reason}", count_attempt=True,
+                     checks=checks)
+    return _Stop("crawl_throttled", "queued" if stage == DRY_RUN else "apply_due", f"throttled, retry later: {reason}",
+                 next_run_at=ledger.backoff_until(attempts - 1), count_attempt=True, checks=checks)
+
+
+def _require_acquisition_is_unserved(market: str) -> None:
+    """An acquisition-market job writes rows priced in a currency no served region expects, and the ONE
+    thing that keeps such a priced row off the serving surface is the agent-decision gate's no_us_offer
+    blocker (services/agent_decision_gates; index_pipeline_state recomputes it in THIS process when the
+    apply materializes readiness). With that gate off, index_pipeline_state serves any priced row, so an
+    AUD row would be served to US buyers. Refuse before any crawl rather than find out at readback."""
+    if market not in ACQUISITION_MARKETS:
+        return
+    from services.agent_decision_gates import agent_decision_gates_enabled
+    if not agent_decision_gates_enabled():
+        raise _Stop("acquisition_unguarded", "failed",
+                    f"market {market} is an acquisition market (rows stored, not served), but "
+                    f"ENABLE_KBEAUTY_AGENT_DECISION_GATES is off in this process: nothing would stop its "
+                    f"{market} rows from serving. Turn the gate on for the job, then re-queue.")
+
+
 async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
-    from services.catalog_onboard_worker import normalize_curated_brand_payload
     from services.curated_brand_feed import CrawlIncomplete, lip_title_evidence, records_for_brand
     import contextlib
 
+    _require_acquisition_is_unserved(job_market(job.get("options")))
     try:
-        payload = normalize_curated_brand_payload(_feed_payload(job))
+        payload = ingest_payload(job)
         if (job.get("options") or {}).get("collections"):
             payload["collection_handles"] = list(job["options"]["collections"])
         if (job.get("options") or {}).get("multi_brand"):
@@ -466,13 +532,7 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
                       "whichever the reason names")
             raise _Stop("crawl_capped", "failed", f"crawl capped: {reason} -- {advice}, or cancel the job") from exc
         if _transient(crawl):
-            attempts = int(job.get("attempts") or 0) + 1
-            if attempts >= int(job.get("max_attempts") or 6):
-                raise _Stop("crawl_throttled", "failed", f"retry budget spent: {crawl.get('reason')}",
-                            count_attempt=True) from exc
-            raise _Stop("crawl_throttled", "queued" if stage == DRY_RUN else "apply_due",
-                        f"throttled, retry later: {crawl.get('reason')}",
-                        next_run_at=ledger.backoff_until(attempts - 1), count_attempt=True) from exc
+            raise _throttled(job, stage, str(crawl.get("reason"))) from exc
         raise _Stop("crawl_failed", "failed", f"crawl failed: {crawl.get('reason')}") from exc
     report = getattr(records, "crawl_report", None)
     if not isinstance(report, dict) or report.get("status") != "complete":
@@ -609,7 +669,9 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
                         checks=checks)
     checks["kept"] = len(records)
 
-    plan = ingest_validated_jsonl(records)
+    # Every offer is DECLARED for the job's market (catalog_offers.market) and must be priced in its
+    # currency; the seed rows keep the US serving partition (ingestion.SEED_PARTITION_MARKET).
+    plan = ingest_validated_jsonl(records, market=market)
     inspection = inspect_primary_plan(plan)
     checks["plan"] = {k: inspection.get(k) for k in ("status", "reasons", "planned", "unresolved_category_count")}
     if inspection.get("reasons"):
@@ -657,22 +719,59 @@ BACKEND_RECALL_LIFECYCLE_STAGES = ("validated", "published")
 #: low quality score, not a core product) -- services/index_pipeline_state_service.py. A readback notes these;
 #: any other blocker on an applied row fails the job.
 INDEX_CONTENT_REFUSALS = ("low_quality", "no_image", "short_description", "non_core_product")
+#: services/agent_decision_gates.BLOCKER_NO_US_OFFER: the blocker an acquisition-market row is EXPECTED to
+#: carry (priced, but in a currency no served region expects). Spelled here to keep that import lazy.
+_NO_US_OFFER = "no_us_offer"
+
+
+def _storefront_hosts(domain: Optional[str]) -> List[str]:
+    """The spellings of one storefront host an offer's source_domain may carry (www. is noise)."""
+    host = str(domain or "").strip().lower().rstrip(".").removeprefix("www.")
+    return [host, f"www.{host}"] if host else []
 
 
 async def _readback(product_keys: List[str], currency: str, db: Any,
-                    planned_images: Optional[Dict[str, bool]] = None, *, market: str = DEFAULT_MARKET) -> Dict[str, Any]:
+                    planned_images: Optional[Dict[str, bool]] = None, *, market: str = DEFAULT_MARKET,
+                    domain: Optional[str] = None) -> Dict[str, Any]:
     """Did what the gate says landed actually land servable? One row per applied product.
 
-    Every live offer of the product must be in the job's currency AND stamped the job's market
-    (catalog_offers.market): currency = market, always (multi-market storefronts ADR section 3.3).
-    SG rows are the one deliberate exception in the catalog -- stored market 'US', currency 'SGD',
-    because external_product_seeds.market is a hard serving partition (curated_brand_feed.
-    fetch_shopify_shop_locale) -- and this lane never writes them: INGEST_MARKETS is US only and the
-    crawl refuses a non-USD store for a US job."""
+    Every live offer the job's STOREFRONT (`domain`) holds on the product must be in the job's currency
+    AND stamped the job's market (catalog_offers.market): currency = market, always (multi-market
+    storefronts ADR section 3.3). Scoped to the storefront because a product legitimately carries other
+    storefronts' offers in other markets -- the Frank Body product holds us.frankbody.com's USD/US offer
+    AND frankbody.com's AUD/AU one -- and neither job may fail over the other's. `domain=None` counts
+    every offer of the product (a caller with no storefront). SG rows (market 'US', currency 'SGD',
+    because external_product_seeds.market is a hard serving partition) are never written by this lane:
+    SG is not an INGEST_MARKET.
+
+    ACQUISITION markets (AU/JP): the rows must land STORED and NOT SERVED. A row the index blocks as
+    no_us_offer -- the last rung of its ladder, reached only when every content gate passed -- with its
+    own priced offer and a resolved identity is the expected outcome, noted as `acquisition_not_served`.
+    A row that reads back SERVED must owe it to an offer priced for a served region on its content_key
+    (another storefront's USD offer, or a shopify_markets sibling); a served acquisition row without one
+    is the leak this lane must never cause, and fails the job."""
     if not product_keys:
         return {"ok": False, "reason": "no product keys to read back", "notes": [], "rows": []}
     from services.index_pipeline_state_service import _RESOLVED_PDP_SCOPES
     from services.priced_offer_sql import priced_offer_exists_sql
+    hosts = _storefront_hosts(domain)
+    scoped = " AND lower(o.source_domain) = ANY(:hosts)" if hosts else ""
+    acquisition = market in ACQUISITION_MARKETS
+    served_priced = ""
+    if acquisition:
+        from services.index_pipeline_state_service import serving_pricing_regions
+        from services.region_pricing import has_offer_priced_for_any_region_sql
+        served_priced = (""",
+               -- The leak detector: index_pipeline_state is per CONTENT_KEY, so the offer that makes a
+               -- served acquisition row legitimate may hang off a sibling product of the same content_key.
+               EXISTS (SELECT 1 FROM catalog_products cp WHERE cp.content_key = p.content_key
+                         AND cp.suppressed_at IS NULL
+                         AND """ + has_offer_priced_for_any_region_sql("cp.product_key", serving_pricing_regions())
+                         + """) AS content_served_region_priced""")
+    values: Dict[str, Any] = {"keys": list(product_keys), "currency": currency, "market": market,
+                              "resolved_scopes": sorted(_RESOLVED_PDP_SCOPES)}
+    if hosts:
+        values["hosts"] = hosts
     rows = await db.fetch_all(
         """
         SELECT p.product_key, p.category_path, coalesce(ips.serving_eligible, false) AS serving,
@@ -686,16 +785,16 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
                    SELECT 1 FROM product_group_members pgm WHERE pgm.merchant_id = p.merchant_id
                      AND pgm.platform = p.platform AND pgm.platform_product_id = p.source_product_id)) AS row_identity,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
-                  AND o.suppressed_at IS NULL) AS offers,
+                  AND o.suppressed_at IS NULL""" + scoped + """) AS offers,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
-                  AND o.suppressed_at IS NULL AND o.currency = :currency) AS offers_in_currency,
+                  AND o.suppressed_at IS NULL""" + scoped + """ AND o.currency = :currency) AS offers_in_currency,
                (SELECT count(*) FROM catalog_offers o WHERE o.product_key = p.product_key
-                  AND o.suppressed_at IS NULL AND upper(o.market) = :market) AS offers_in_market
+                  AND o.suppressed_at IS NULL""" + scoped + """ AND upper(o.market) = :market) AS offers_in_market"""
+        + served_priced + """
         FROM catalog_products p LEFT JOIN index_pipeline_state ips USING (content_key)
         WHERE p.product_key = ANY(:keys)
         """,
-        {"keys": list(product_keys), "currency": currency, "market": market,
-         "resolved_scopes": sorted(_RESOLVED_PDP_SCOPES)},
+        values,
     )
     out = [dict(r) for r in rows]
     problems, notes = [], []
@@ -717,14 +816,23 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
             # when THIS product's own row shows a priced offer and a resolved identity, and an image this plan
             # wrote actually landed (apply overwrites image_url, so a missing one is ours).
             wrote_image = bool((planned_images or {}).get(r["product_key"]))
-            if (r.get("blocker_code") in INDEX_CONTENT_REFUSALS and r.get("row_priced") and r.get("row_identity")
-                    and not (wrote_image and not r.get("row_image"))):
+            own_row_whole = (r.get("row_priced") and r.get("row_identity")
+                             and not (wrote_image and not r.get("row_image")))
+            if acquisition and r.get("blocker_code") == _NO_US_OFFER and own_row_whole:
+                notes.append({"product_key": r["product_key"], "kind": "acquisition_not_served",
+                              "note": f"stored, not served: {market} is an acquisition market and its "
+                                      f"{currency} offer is priced for no served region (no_us_offer)"})
+            elif r.get("blocker_code") in INDEX_CONTENT_REFUSALS and own_row_whole:
                 notes.append({"product_key": r["product_key"], "kind": "index_refused",
                               "note": f"not served: the index refused it on content ({r.get('blocker_code')}"
                                       f"{': ' + str(r.get('blocker_detail'))[:160] if r.get('blocker_detail') else ''})"})
             else:
                 problems.append({"product_key": r["product_key"],
                                  "problem": f"not serving-eligible (blocker {r.get('blocker_code') or 'unknown'})"})
+        elif acquisition and not r.get("content_served_region_priced"):
+            problems.append({"product_key": r["product_key"],
+                             "problem": f"served, but no offer on its content_key is priced for a served region: "
+                                        f"a {market} acquisition row must never serve on its {currency} offer"})
         # Recorded, never a failure: the agent door (gateway) serves on serving-eligibility alone, while
         # backend global recall admits only BACKEND_RECALL_LIFECYCLE_STAGES (or NULL). Measured
         # 2026-09-24: 14 of 28 O HUI rows at buybeautykorea.com landed `candidate` (no taxonomy signal:
@@ -823,6 +931,8 @@ async def _run_stage(job: Dict[str, Any], *, db: Any, deadline: Optional[float] 
     # Seconds per phase: crawl_s, check_s (every stage), write_lock_wait_s, write_s, readback_s (apply).
     timings: Dict[str, float] = {}
     try:
+        if job_source(job.get("options")) == MARKETS_SOURCE:
+            return await _run_markets_stage(job, run_id, stage, timings, result, db=db, deadline=deadline)
         with _timed(timings, "crawl_s"):
             records = await _crawl(job, stage)
         with _timed(timings, "check_s"):
@@ -880,16 +990,12 @@ async def _write_not_started(job: Dict[str, Any], outcome: str, why: str, *, db:
                  count_attempt=False)
 
 
-async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summary: Dict[str, Any],
-                 timings: Dict[str, float], *, db: Any, deadline: Optional[float] = None) -> Dict[str, Any]:
-    from scripts.curated_apply_gate import evaluate_apply_log
-    from services.catalog_enrichment_agent.apply import apply_ingest_plan
-    from services.catalog_enrichment_agent.primary_ingestion import require_primary_apply, require_primary_plan
-
-    plan = result["plan"]
-    preflight = require_primary_plan(plan)
+async def _write_lock_wait_s(job: Dict[str, Any], deadline: Optional[float], timings: Dict[str, float], *,
+                             db: Any) -> float:
+    """How long an apply may wait for the catalog write lock: at most WRITE_LOCK_WAIT_S, and never so long
+    that less than WRITE_MARGIN_S of the task is left for the write itself (then nothing is written and
+    the job goes back to apply_due)."""
     waiting = time.monotonic()
-    # Wait no longer than leaves WRITE_MARGIN_S of the task for the write itself.
     wait_s = float(WRITE_LOCK_WAIT_S)
     if deadline is not None:
         wait_s = min(wait_s, deadline - waiting - WRITE_MARGIN_S)
@@ -899,6 +1005,19 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
             job, "write_lock_busy",
             f"no time left in this execution for the catalog write ({deadline - waiting:.0f}s left, "
             f"{WRITE_MARGIN_S}s needed)", db=db)
+    return wait_s
+
+
+async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summary: Dict[str, Any],
+                 timings: Dict[str, float], *, db: Any, deadline: Optional[float] = None) -> Dict[str, Any]:
+    from scripts.curated_apply_gate import evaluate_apply_log
+    from services.catalog_enrichment_agent.apply import apply_ingest_plan
+    from services.catalog_enrichment_agent.primary_ingestion import require_primary_apply, require_primary_plan
+
+    plan = result["plan"]
+    preflight = require_primary_plan(plan)
+    wait_s = await _write_lock_wait_s(job, deadline, timings, db=db)
+    waiting = time.monotonic()
     try:
         # The ONLY catalog write of the stage, and the only part serialized across lanes: the crawl and
         # checks above ran unlocked. The lock is released when this block exits, however it exits.
@@ -938,6 +1057,7 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
     currency, market = job_currency(job.get("options")), job_market(job.get("options"))
     with _timed(timings, "readback_s"):
         readback = await _readback(gate.get("product_keys") or [], currency, db, market=market,
+                                   domain=job["domain"],
                                    planned_images={p.get("product_key"): bool(p.get("image_url"))
                                                    for p in plan.get("pdps") or []})
     ok = bool(gate.get("ok")) and readback["ok"]
@@ -946,9 +1066,87 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
                             db=db)
     kinds = [n.get("kind") for n in readback.get("notes") or []]
     said = [f"{kinds.count(k)} {label}" for k, label in (("outside_backend_recall", "row(s) outside backend global recall"),
-                                                          ("index_refused", "row(s) refused by the index content gate"))
+                                                          ("index_refused", "row(s) refused by the index content gate"),
+                                                          ("acquisition_not_served", "row(s) stored, not served "
+                                                                                     "(acquisition market)"))
             if kinds.count(k)]
     reason = ("; ".join(["applied and verified", *said]) if ok else
               f"{outcome}: gate {gate.get('reasons')}; readback {readback.get('problems')}")
     await _move(job, status="done" if ok else "failed", run_id=run_id, reason=reason, db=db)
+    return {"job_id": job["id"], "stage": APPLY, "outcome": outcome, "status": "done" if ok else "failed"}
+
+
+async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timings: Dict[str, float],
+                             result: Dict[str, Any], *, db: Any, deadline: Optional[float] = None) -> Dict[str, Any]:
+    """One stage of a source=shopify_markets job (services/retailer_ingest/shopify_markets.py).
+
+    Same shape as a crawl job: the dry run proves the US session and reads every price, writing
+    nothing; a clean dry run is applied automatically (Peng's policy); the apply RE-proves the session,
+    re-reads every price, and only then writes the USD siblings under the catalog write lock, republishes
+    the touched content_keys and reads them back. A store that does not confirm USD is a clean refusal
+    (status `nothing`, the reason and the evidence on the run), never a crash; a block fails the job as
+    unverifiable; a 429/5xx backs off like a throttled crawl."""
+    from services.retailer_ingest import shopify_markets as markets
+
+    o = job.get("options") or {}
+    try:
+        validate_options(dict(o))
+    except ValueError as exc:
+        raise _Stop("invalid_job", "failed", str(exc)) from exc
+    try:
+        with _timed(timings, "crawl_s"):
+            capture = await markets.capture(job, db=db, max_products=int(o.get("max_products") or 200))
+    except markets.MarketsRefused as refused:
+        if refused.transient:
+            raise _throttled(job, stage, refused.reason, checks=refused.checks) from refused
+        raise _Stop(refused.outcome, refused.status, refused.reason, checks=refused.checks) from refused
+    checks = result["checks"] = capture["checks"]
+    checks["timings"] = timings
+    planned = capture["planned"]
+    summary = {"crawl": checks.get("markets_capture"), "plan": {"planned": len(planned)}, "checks": checks,
+               "flags": []}
+    if not planned:
+        raise _Stop("nothing_to_capture", "nothing",
+                    f"the US session was proven but no base offer has a sellable USD price "
+                    f"({checks['markets_capture'].get('skipped')})", checks=checks)
+    if stage == DRY_RUN:
+        await ledger.finish_run(run_id, outcome="clean", **summary, db=db)
+        await _move(job, status="apply_due", run_id=run_id, reason=f"US session proven, {len(planned)} USD "
+                    f"sibling offer(s) planned; apply due", next_run_at=datetime.now(timezone.utc), db=db)
+        return {"job_id": job["id"], "stage": stage, "outcome": "clean", "status": "apply_due"}
+
+    checks.setdefault("catalog_write", ledger.CATALOG_WRITE_NOT_STARTED)
+    wait_s = await _write_lock_wait_s(job, deadline, timings, db=db)
+    waiting = time.monotonic()
+    try:
+        async with ledger.catalog_write_lock(wait_s=wait_s, poll_s=WRITE_LOCK_POLL_S) as waited:
+            timings["write_lock_wait_s"] = round(waited, 3)
+            await ledger.mark_write_started(run_id, db=db)
+            checks["catalog_write"] = ledger.CATALOG_WRITE_STARTED
+            with _timed(timings, "write_s"):
+                wrote = await markets.write_siblings(planned, db=db)
+                failed = await markets.republish(
+                    sorted({r["content_key"] for r in wrote["written"] if r.get("content_key")}), db=db)
+    except CatalogWriteLockBusy as busy:
+        timings["write_lock_wait_s"] = round(time.monotonic() - waiting, 3)
+        raise await _write_not_started(
+            job, "write_lock_busy", f"catalog write lock busy for {busy.waited_s:.0f}s (another apply is writing)",
+            db=db) from busy
+    except CatalogWriteLockUnavailable as unavailable:
+        timings["write_lock_wait_s"] = round(time.monotonic() - waiting, 3)
+        raise await _write_not_started(
+            job, "write_lock_unavailable", f"catalog write lock unavailable ({unavailable.error_type})", db=db
+        ) from unavailable
+    applied = {"written": len(wrote["written"]), "not_written": len(wrote["not_written"]),
+               "refused": wrote["refused"], "republish_failed": len(failed)}
+    with _timed(timings, "readback_s"):
+        readback = await markets.readback(wrote["written"], db=db, republish_failed=failed)
+    ok = readback["ok"]
+    outcome = "applied" if ok else "readback_failed"
+    await ledger.finish_run(run_id, outcome=outcome, **summary, applied=applied, readback=readback, db=db)
+    reason = (f"applied and verified: {applied['written']} USD sibling offer(s), "
+              f"{readback.get('served_content_keys', 0)} content_key(s) serving"
+              + (f"; {applied['not_written']} not written" if applied["not_written"] else "")
+              if ok else f"{outcome}: {readback.get('problems')}")
+    await _move(job, status="done" if ok else "failed", run_id=run_id, reason=reason[:2000], db=db)
     return {"job_id": job["id"], "stage": APPLY, "outcome": outcome, "status": "done" if ok else "failed"}
