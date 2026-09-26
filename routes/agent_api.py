@@ -6963,7 +6963,7 @@ async def agent_search_products_beauty(
                 content={"status": "error", "error": {"code": "gateway_merchant_scope_unavailable"}},
             )
         proxy_started = time.perf_counter()
-        gateway_body, why, gateway_status = await agent_search_gateway_proxy.search(
+        gateway_body, why, gateway_status, gateway_error = await agent_search_gateway_proxy.search(
             base_url=_app_settings.pivota_agent_internal_url,
             query_items=list(req.query_params.multi_items()),
             headers=req.headers,
@@ -7016,7 +7016,7 @@ async def agent_search_products_beauty(
             pass
         return JSONResponse(
             status_code=gateway_status,
-            content={"status": "error", "error": {"code": "gateway_search_failed", "reason": why}},
+            content=agent_search_gateway_proxy.error_content(why, gateway_error),
         )
     return await agent_search_products(
         req=req,

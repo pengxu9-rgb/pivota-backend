@@ -1131,7 +1131,7 @@ async def search_products(
                 status_code=403,
                 content={"status": "error", "error": {"code": "gateway_merchant_scope_unavailable"}},
             )
-        gateway_body, why, gateway_status = await agent_search_gateway_proxy.search(
+        gateway_body, why, gateway_status, gateway_error = await agent_search_gateway_proxy.search(
             base_url=_app_settings.pivota_agent_internal_url,
             query_items=list(req.query_params.multi_items()),
             headers=req.headers,
@@ -1146,7 +1146,7 @@ async def search_products(
         if gateway_body is None:
             return JSONResponse(
                 status_code=gateway_status,
-                content={"status": "error", "error": {"code": "gateway_search_failed", "reason": why}},
+                content=agent_search_gateway_proxy.error_content(why, gateway_error),
             )
         return agent_search_gateway_proxy.to_backend_envelope(
             gateway_body,

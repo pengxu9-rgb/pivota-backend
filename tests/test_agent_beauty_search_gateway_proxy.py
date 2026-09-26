@@ -159,7 +159,7 @@ def _mock_client(monkeypatch: pytest.MonkeyPatch, handler) -> List[httpx.Request
 ])
 async def test_every_failure_is_returned_as_a_reason_never_raised(monkeypatch: pytest.MonkeyPatch, handler, reason, status) -> None:
     _mock_client(monkeypatch, handler)
-    assert await proxy.search(base_url="http://gw.test", query_items=[("query", "x")], headers={}) == (None, reason, status)
+    assert await proxy.search(base_url="http://gw.test", query_items=[("query", "x")], headers={}) == (None, reason, status, None)
 
 
 @pytest.mark.asyncio
@@ -178,7 +178,7 @@ async def test_gateway_failed_decision_without_error_is_a_valid_empty_result(
         base_url="http://gw.test",
         query_items=[("query", "JUNG SAEM MOOL")],
         headers={},
-    ) == (body, "ok", 200)
+    ) == (body, "ok", 200, None)
 
 
 # --- the endpoint, end to end ------------------------------------------------------------
@@ -386,6 +386,69 @@ async def test_a_failed_forward_returns_a_visible_error_without_local_recall(mon
     assert resp.status_code == 503
     assert local_calls == []
     assert resp.json()["error"] == {"code": "gateway_search_failed", "reason": "gateway_http_503"}
+
+
+QUERY_TOO_LONG_BODY = {
+    "error": "QUERY_TOO_LONG",
+    "message": "The search query is 501 characters; the limit is 500.",
+    "field": "search.query",
+    "max_chars": 500,
+    "length": 501,
+    "metadata": {"orchestrator_path": "external_invoke_route"},
+}
+
+
+@pytest.mark.asyncio
+async def test_the_gateway_query_length_rejection_passes_through_with_its_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The one gateway error a caller can fix by itself: it must keep its code and limit, not become
+    # an opaque gateway_http_400.
+    _mock_client(monkeypatch, lambda r: httpx.Response(400, json=QUERY_TOO_LONG_BODY))
+    body, why, status, error = await proxy.search(base_url="http://gw.test", query_items=[("query", "x")], headers={})
+    assert (body, why, status) == (None, "query_too_long", 400)
+    assert error == {
+        "code": "QUERY_TOO_LONG",
+        "message": "The search query is 501 characters; the limit is 500.",
+        "field": "search.query",
+        "max_chars": 500,
+        "length": 501,
+    }
+    assert proxy.error_content(why, error) == {"status": "error", "error": error}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gateway_body", [
+    {"error": "INVALID_REQUEST", "details": {"secret": "x"}},
+    {"error": {"code": "QUERY_TOO_LONG"}},
+    ["QUERY_TOO_LONG"],
+])
+async def test_any_other_gateway_400_stays_opaque(monkeypatch: pytest.MonkeyPatch, gateway_body) -> None:
+    _mock_client(monkeypatch, lambda r: httpx.Response(400, json=gateway_body))
+    result = await proxy.search(base_url="http://gw.test", query_items=[("query", "x")], headers={})
+    assert result == (None, "gateway_http_400", 400, None)
+    assert proxy.error_content("gateway_http_400", None) == {
+        "status": "error",
+        "error": {"code": "gateway_search_failed", "reason": "gateway_http_400"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_only_known_query_too_long_fields_pass_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    hostile = {**QUERY_TOO_LONG_BODY, "stack": "at server.js:1", "message": "x" * 5000, "max_chars": True}
+    _mock_client(monkeypatch, lambda r: httpx.Response(400, json=hostile))
+    _, _, _, error = await proxy.search(base_url="http://gw.test", query_items=[("query", "x")], headers={})
+    assert error == {"code": "QUERY_TOO_LONG", "field": "search.query", "length": 501}
+
+
+@pytest.mark.asyncio
+async def test_a_too_long_query_reaches_the_caller_as_query_too_long(monkeypatch: pytest.MonkeyPatch, endpoint) -> None:
+    local_calls, _ = endpoint
+    monkeypatch.setenv(proxy.FLAG, "on")
+    _mock_client(monkeypatch, lambda r: httpx.Response(400, json=QUERY_TOO_LONG_BODY))
+    resp = await _get(MEITU_QUERY)
+    assert resp.status_code == 400
+    assert local_calls == []
+    assert resp.json()["error"]["code"] == "QUERY_TOO_LONG"
+    assert resp.json()["error"]["max_chars"] == 500
 
 
 @pytest.mark.asyncio

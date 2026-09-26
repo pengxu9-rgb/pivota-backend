@@ -164,14 +164,45 @@ def to_backend_envelope(
     }
 
 
+# The gateway rejects a search query over its length limit with 400 QUERY_TOO_LONG and says what the
+# limit is. That is the one gateway error a caller can act on by itself (shorten the query), so its code
+# and these fields pass through; every other gateway failure stays an opaque gateway_search_failed.
+_QUERY_TOO_LONG_FIELDS = ("message", "field", "max_chars", "length")
+
+
+def _query_too_long_detail(response: httpx.Response) -> Optional[Dict[str, Any]]:
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict) or body.get("error") != "QUERY_TOO_LONG":
+        return None
+    detail: Dict[str, Any] = {"code": "QUERY_TOO_LONG"}
+    for key in _QUERY_TOO_LONG_FIELDS:
+        value = body.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) or (isinstance(value, str) and len(value) <= 200):
+            detail[key] = value
+    return detail
+
+
+def error_content(reason: str, gateway_error: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The caller-facing error body for a failed proxied search."""
+    if gateway_error:
+        return {"status": "error", "error": dict(gateway_error)}
+    return {"status": "error", "error": {"code": "gateway_search_failed", "reason": reason}}
+
+
 async def search(
     *,
     base_url: str,
     query_items: List[Tuple[str, str]],
     headers: Mapping[str, str],
     catalog_surface: Optional[str] = "beauty",
-) -> Tuple[Optional[Dict[str, Any]], str, int]:
-    """Forward once. Return body, safe reason and caller-facing HTTP status; never raise."""
+) -> Tuple[Optional[Dict[str, Any]], str, int, Optional[Dict[str, Any]]]:
+    """Forward once. Return body, safe reason, caller-facing HTTP status and the gateway error a caller
+    may see (only QUERY_TOO_LONG; else None); never raise."""
     url = f"{str(base_url).rstrip('/')}{GATEWAY_PATH}"
     try:
         response = await _get_client().get(
@@ -180,19 +211,23 @@ async def search(
             headers=gateway_headers(headers),
         )
     except httpx.TimeoutException:
-        return None, "gateway_timeout", 504
+        return None, "gateway_timeout", 504, None
     except httpx.RequestError:
-        return None, "gateway_unavailable", 503
+        return None, "gateway_unavailable", 503, None
     if response.status_code != 200:
         status = response.status_code
+        if status == 400:
+            detail = _query_too_long_detail(response)
+            if detail is not None:
+                return None, "query_too_long", 400, detail
         # Preserve actionable caller and rate-limit errors, but do not expose upstream internals.
-        return None, f"gateway_http_{status}", status if status in {400, 401, 403, 404, 422, 429, 503, 504} else 502
+        return None, f"gateway_http_{status}", status if status in {400, 401, 403, 404, 422, 429, 503, 504} else 502, None
     try:
         body = response.json()
     except Exception:
-        return None, "gateway_invalid_json", 502
+        return None, "gateway_invalid_json", 502, None
     if not isinstance(body, dict) or not isinstance(body.get("products"), list):
-        return None, "gateway_unexpected_shape", 502
+        return None, "gateway_unexpected_shape", 502, None
     gateway_status = str(body.get("status", "success")).lower()
     # The gateway uses ``status=failed`` with HTTP 200 for a resolved, empty
     # search decision (for example, no candidates in the selected market). It
@@ -200,5 +235,5 @@ async def search(
     # explicit application errors visible while preserving empty-result HTTP
     # semantics for callers of the backend compatibility door.
     if gateway_status in {"error", "failed"} and body.get("error") is not None:
-        return None, "gateway_failed_response", 502
-    return body, "ok", 200
+        return None, "gateway_failed_response", 502, None
+    return body, "ok", 200, None
