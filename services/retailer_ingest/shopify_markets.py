@@ -32,14 +32,18 @@ POLITENESS. Same UA and the same per-host gate as the /products.json crawl (serv
 per-host interval, robots.txt, 429/503 backoff). A 429/5xx stops the stage and retries it later on the
 lane's backoff, like a throttled crawl. A 403, a non-JSON answer where JSON is due (a bot wall), or a
 redirect to another host is UNVERIFIABLE: the job fails with that reason, nothing is written, and
-nothing is retried or worked around. The two SESSION endpoints (/localization, /cart.js) are paced and
-backed off through the same gate but not robots-checked. The exemption is exactly those two paths, is
-recorded on every run, and is PENDING THE OWNER'S DECISION. What Shopify publishes (Help Center, "Editing
-robots.txt.liquid", checked 2026-09-26, "some of the key entries", not a complete list) is
-`Disallow: /cart/` -- with the slash, which a prefix match does NOT apply to `/cart.js` -- and no
-`/localization` rule; the template itself only renders `robots.default_groups`, whose full rule list is
-not published. So whether a given store's rendered robots.txt blocks either path is unknown here and was
-not probed.
+nothing is retried or worked around.
+
+ROBOTS.TXT IS OBEYED FOR EVERY PATH, the two session endpoints included (Peng's standing rule: never scrape
+around a crawler block). Every request goes through crawl_politeness.before_request -- the crawl's own
+parser, cache and fail-open policy (a robots.txt that 404s, 5xxs or times out is "no restrictions"; only an
+explicit Disallow blocks) -- with no special case. And BEFORE the first request to the store, the capture
+asks the same gate about SESSION_PATHS (/localization, /cart.js): if the store disallows either for our user
+agent, the capture is refused whole (status `nothing`, reason `robots_disallowed:<path>`, no sibling
+offers), because without both there is no proof of a USD session at all. On a store serving Shopify's
+published default this costs nothing: the Help Center ("Editing robots.txt.liquid", 2026-09-26, "some of
+the key entries") lists `Disallow: /cart/` -- with the slash, which does not match `/cart.js` -- and no
+`/localization` rule.
 """
 
 from __future__ import annotations
@@ -66,8 +70,9 @@ BASE_SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
 #: Re-verify the session every N product reads (the script's value): a decayed localization cookie
 #: would silently relabel base-currency prices as USD, the #1636/#1642 defect class.
 SESSION_RECHECK_EVERY = 25
-#: The robots.txt exemption described in the module docstring: these paths and no others.
-SESSION_PATHS_NOT_ROBOTS_CHECKED = ("/localization", "/cart.js")
+#: The paths the USD-session proof cannot do without. robots.txt is asked about them before the first
+#: request to the store; a Disallow on either refuses the capture (module docstring, ROBOTS.TXT).
+SESSION_PATHS = ("/localization", "/cart.js")
 HTTP_TIMEOUT_S = 20.0
 #: Tests replace this with an httpx.MockTransport; None is the real network.
 HTTP_TRANSPORT = None
@@ -217,12 +222,9 @@ class _Session:
         from services.curated_brand_feed import _UA
         url = f"https://{self.host}{path}"
         try:
-            if path.split("?")[0] in SESSION_PATHS_NOT_ROBOTS_CHECKED:
-                await self.polite.await_slot(url, user_agent=_UA, max_wait=0)
-            else:
-                await self.polite.before_request(url, user_agent=_UA, max_wait=0)
+            await self.polite.before_request(url, user_agent=_UA, max_wait=0)
         except RobotsDisallowed as exc:
-            raise self._refuse("robots_disallowed", "failed", f"{path}: {exc}") from exc
+            raise self._refuse("robots_disallowed", "nothing", _robots_refusal(path, self.host)) from exc
         except CrawlPaced as exc:  # CrawlDelayTooLong: the host asks for less than we can
             raise self._refuse("crawl_paced", "failed", f"{path}: {exc}") from exc
         import httpx
@@ -264,6 +266,23 @@ class _Session:
         _code, cart = await self.json("/cart.js")
         currency = cart.get("currency") if isinstance(cart, dict) else None
         return currency if isinstance(currency, str) else None
+
+
+def _robots_refusal(path: str, host: str) -> str:
+    """The recorded reason for a capture refused by robots.txt: `robots_disallowed:<path>` first, so the
+    ledger names exactly which path the store forbids."""
+    return (f"robots_disallowed:{path} -- {host}'s robots.txt disallows it for our user agent; the capture "
+            f"obeys robots.txt and never works around it, so no US offer is captured")
+
+
+async def _require_session_paths_allowed(polite: Any, host: str, evidence: Dict[str, Any]) -> None:
+    """Ask robots.txt about every SESSION_PATH before the first request to the store (the same gate, parser
+    and cache every other request uses). A Disallow on either refuses the whole capture."""
+    from services.curated_brand_feed import _UA
+    for path in SESSION_PATHS:
+        if not await polite.robots_allows(f"https://{host}{path}", user_agent=_UA):
+            evidence["robots"]["disallowed"] = path
+            raise MarketsRefused("robots_disallowed", "nothing", _robots_refusal(path, host))
 
 
 def _first_sellable(variants: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
@@ -345,7 +364,7 @@ async def capture(job: Dict[str, Any], *, db: Any, max_products: int, polite: An
 
     host = _host(job["domain"])
     evidence: Dict[str, Any] = {"source": SOURCE, "market": CAPTURE_MARKET, "host": host,
-                                "robots_not_checked": list(SESSION_PATHS_NOT_ROBOTS_CHECKED)}
+                                "robots": {"session_paths_checked": list(SESSION_PATHS)}}
     checks: Dict[str, Any] = {"markets_capture": evidence}
 
     def refused(exc: MarketsRefused) -> MarketsRefused:
@@ -379,6 +398,8 @@ async def capture(job: Dict[str, Any], *, db: Any, max_products: int, polite: An
                                  transport=transport if transport is not None else HTTP_TRANSPORT) as client:
         session = _Session(client, host, polite if polite is not None else crawl_politeness, evidence)
         try:
+            # 0. robots.txt: both session paths allowed, or no request to the store at all.
+            await _require_session_paths_allowed(session.polite, host, evidence)
             # 1. The store's own reach and base currency.
             from services.storefront_currency import parse_meta
             resp = await session.request("GET", "/meta.json", expect_json=True)

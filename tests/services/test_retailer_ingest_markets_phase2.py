@@ -509,19 +509,22 @@ class Store:
 
 
 class Polite:
-    """crawl_politeness as the capture must call it: every request gated, every answer noted."""
+    """crawl_politeness as the capture must call it: every request gated (robots + pacing), every answer
+    noted. It has no await_slot on purpose: nothing may take the pacing without the robots check."""
 
     def __init__(self, disallow=()):
         self.calls, self.disallow = [], set(disallow)
+
+    async def robots_allows(self, url, *, user_agent):
+        path = urlsplit(url).path
+        self.calls.append(("robots", path))
+        return path not in self.disallow
 
     async def before_request(self, url, *, user_agent, max_wait):
         path = urlsplit(url).path
         self.calls.append(("robots+slot", path))
         if path in self.disallow:
             raise RobotsDisallowed(f"robots.txt disallows {url}")
-
-    async def await_slot(self, url, *, user_agent, max_wait):
-        self.calls.append(("slot", urlsplit(url).path))
 
     def note_response(self, url, status_code, *, retry_after=None):
         self.calls.append(("note", urlsplit(url).path, status_code))
@@ -566,7 +569,7 @@ async def test_a_proven_us_session_prices_every_base_offer_in_usd():
     ev = out["checks"]["markets_capture"]
     assert (ev["cart_currency"], ev["localization_status"], ev["storefront"]["ships_to_countries"]) == (
         "USD", 302, ["AU", "NZ", "US"])
-    assert ev["robots_not_checked"] == ["/localization", "/cart.js"]
+    assert ev["robots"] == {"session_paths_checked": ["/localization", "/cart.js"]}
     payload = json.loads(out["planned"][0]["offer_payload"])
     assert payload["cart_currency"] == "USD" and payload["base_currency"] == "AUD"
 
@@ -690,20 +693,113 @@ async def test_the_session_is_re_checked_every_n_products(monkeypatch):
     assert out["checks"]["markets_capture"]["session_rechecks"] == 2
 
 
-async def test_every_request_goes_through_the_crawl_gate_and_only_session_paths_skip_robots():
+async def test_every_request_is_robots_checked_and_paced_with_no_special_case():
     polite = Polite()
     store = Store()
     await _capture(store, polite=polite)
-    gated = [c[1] for c in polite.calls if c[0] in ("slot", "robots+slot")]
-    assert gated == [p for _m, p in store.paths()]
-    assert {c[1] for c in polite.calls if c[0] == "slot"} == {"/localization", "/cart.js"}
+    gated = [c[1] for c in polite.calls if c[0] == "robots+slot"]
+    assert gated == [p for _m, p in store.paths()]  # every request, the session endpoints included
+    assert {"/localization", "/cart.js"} <= set(gated)
     assert len([c for c in polite.calls if c[0] == "note"]) == len(gated)
+    # ...and robots was asked about both session paths before the first request to the store.
+    first = polite.calls.index(("robots+slot", "/meta.json"))
+    assert [c for c in polite.calls[:first] if c[0] == "robots"] == [("robots", "/localization"), ("robots", "/cart.js")]
+
+
+@pytest.mark.parametrize("path", ["/localization", "/cart.js"])
+async def test_a_store_that_disallows_a_session_path_is_refused_before_any_request(path):
+    store = Store()
+    with pytest.raises(markets.MarketsRefused) as refused:
+        await _capture(store, polite=Polite(disallow={path}))
+    r = refused.value
+    assert (r.outcome, r.status, r.transient) == ("robots_disallowed", "nothing", False)
+    assert r.reason.startswith(f"robots_disallowed:{path} ")
+    assert r.checks["markets_capture"]["robots"]["disallowed"] == path
+    assert store.log == []  # not one request to the store, least of all to the disallowed path
 
 
 async def test_a_robots_disallowed_product_read_is_refused():
     with pytest.raises(markets.MarketsRefused) as refused:
         await _capture(Store(), polite=Polite(disallow={"/products/face-hero.js"}))
-    assert refused.value.outcome == "robots_disallowed"
+    assert (refused.value.outcome, refused.value.status) == ("robots_disallowed", "nothing")
+    assert refused.value.reason.startswith("robots_disallowed:/products/face-hero.js ")
+
+
+# ---- the same, through the REAL crawl gate: crawl_politeness's own parser, cache and fail-open policy
+
+@pytest.fixture
+def real_gate(monkeypatch):
+    """crawl_politeness itself, fed robots.txt through its ROBOTS_TRANSPORT_FACTORY seam."""
+    from services import crawl_politeness
+
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "true")
+    crawl_politeness.reset_for_tests()
+    served = {}
+
+    def robots(request):
+        served.setdefault("hits", 0)
+        served["hits"] += 1
+        answer = served["answer"]
+        if isinstance(answer, Exception):
+            raise answer
+        status, body = answer
+        return httpx.Response(status, text=body, headers={"content-type": "text/plain"})
+    token = crawl_politeness.ROBOTS_TRANSPORT_FACTORY.set(lambda: httpx.MockTransport(robots))
+    yield served
+    crawl_politeness.ROBOTS_TRANSPORT_FACTORY.reset(token)
+    crawl_politeness.reset_for_tests()
+
+
+#: The entries Shopify's Help Center lists as its default's "key entries" (2026-09-26), verbatim.
+SHOPIFY_DEFAULT_KEY_ENTRIES = """User-agent: *
+Disallow: /admin
+Disallow: /cart/
+Disallow: /checkout
+Disallow: /checkouts/
+Disallow: /account
+Disallow: /orders
+Disallow: /collections/*+*
+Disallow: /collections/*sort_by*
+"""
+
+
+async def _real_capture(store):
+    return await markets.capture(markets_job(), db=CandidatesDB(base_rows()), max_products=200,
+                                 transport=httpx.MockTransport(store.handler))
+
+
+@pytest.mark.parametrize("path", ["/cart.js", "/localization"])
+@pytest.mark.parametrize("agent", ["*", "PivotaCommerceIndex"])
+async def test_the_real_gate_refuses_a_disallowed_session_path(real_gate, path, agent):
+    real_gate["answer"] = (200, f"User-agent: {agent}\nDisallow: {path}\n")
+    store = Store()
+    with pytest.raises(markets.MarketsRefused) as refused:
+        await _real_capture(store)
+    assert (refused.value.outcome, refused.value.status) == ("robots_disallowed", "nothing")
+    assert refused.value.reason.startswith(f"robots_disallowed:{path} ") and store.log == []
+
+
+async def test_shopify_default_cart_rule_does_not_block_cart_js(real_gate):
+    """`Disallow: /cart/` (the published default, WITH the slash) is not a prefix of /cart.js."""
+    real_gate["answer"] = (200, SHOPIFY_DEFAULT_KEY_ENTRIES)
+    store = Store()
+    out = await _real_capture(store)
+    assert len(out["planned"]) == 5 and ("GET", "/cart.js") in store.paths()
+    assert real_gate["hits"] == 1  # one robots.txt fetch, then the gate's cache
+
+
+async def test_another_agents_disallow_is_not_ours(real_gate):
+    real_gate["answer"] = (200, "User-agent: Googlebot\nDisallow: /cart.js\nDisallow: /localization\n")
+    assert len((await _real_capture(Store()))["planned"]) == 5
+
+
+@pytest.mark.parametrize("answer", [(404, "not found"), (503, "unavailable"), httpx.ConnectError("refused")])
+async def test_a_robots_fetch_failure_is_what_the_crawl_gate_does_everywhere_fail_open(real_gate, answer):
+    """crawl_politeness caches a robots.txt it could not read (404, 5xx, a transport error) as "no
+    restrictions" for every path of every lane; the capture neither tightens nor loosens that."""
+    real_gate["answer"] = answer
+    assert len((await _real_capture(Store()))["planned"]) == 5
 
 
 async def test_only_this_brands_rows_on_this_host_in_the_stores_base_currency_are_captured():
@@ -1064,6 +1160,22 @@ async def test_stored_au_rows_stay_unservable_when_a_flag_off_process_recomputes
     for ck in {p["content_key"] for plan, _market in applied for p in plan["pdps"]}:
         verdict = catalog.verdict(ck)
         assert (verdict["serving_eligible"], verdict["blocker_code"]) == (False, gates.BLOCKER_NO_US_OFFER)
+
+
+@pytest.mark.parametrize("path", ["/cart.js", "/localization"])
+async def test_a_robots_refusal_leaves_the_base_job_done_and_writes_no_sibling(two_jobs, monkeypatch, path):
+    env, catalog, applied, store = two_jobs
+    await pipeline.run_stage(au_job(), db=catalog)
+    assert (await pipeline.run_stage(au_job("apply_due"), db=catalog))["status"] == "done"
+    au_done = env.ledger.transitions[-1]
+    monkeypatch.setattr(markets, "crawl_politeness", Polite(disallow={path}))
+    out = await pipeline.run_stage(markets_job(), db=catalog)
+    assert (out["status"], out["outcome"]) == ("nothing", "robots_disallowed")
+    run = list(env.ledger.runs.values())[-1]
+    assert run["error"].startswith(f"robots_disallowed:{path} ")
+    assert run["checks"]["markets_capture"]["robots"]["disallowed"] == path
+    assert catalog.offers("market = 'US'") == [] and store.log == []
+    assert au_done["status"] == "done" and len(catalog.offers("market = 'AU'")) == 5  # untouched
 
 
 async def test_the_capture_refusal_writes_nothing_and_records_why(two_jobs, monkeypatch):
