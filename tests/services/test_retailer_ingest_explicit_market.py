@@ -395,6 +395,42 @@ def test_tier_b_refuses_a_letter_used_as_a_separator(brand, name):
     assert tier_b["name_is_one_store_name"] is False and tier_b["passed"] is False
 
 
+# One per TIER_B_TRADEMARK_MARKS entry: NFKC folds each into letters glued to the word before
+# ("Mario Badescu™" -> "badescutm"), which failed the brand prefix; each reads as "®" instead.
+@pytest.mark.parametrize("brand,name", [
+    ("Mario Badescu", "Mario Badescu™"), ("Mario Badescu", "Mario Badescu™ Skin Care"),
+    ("Sukin", "Sukin℠ USA"), ("Sukin", "SukinⓇ USA"), ("Sukin", "Sukin🄬 USA"), ("Sukin", "Sukin🄫 USA"),
+    ("Sukin", "Sukin🅪 USA"), ("Sukin", "Sukin🅫 USA"), ("Sukin", "Sukin🅬 USA"), ("Sukin", "Sukin℗ USA"),
+    ("Sukin", "Sukinⓡ USA"), ("Sukin", "SukinⒸ USA"), ("Sukin", "Sukinⓒ USA"), ("Sukin", "Sukin🅁 USA"),
+    ("Sukin", "Sukin™USA"),                       # glued on both sides
+    ("Mario Badescu™", "Mario Badescu USA"),      # the brand side reads it the same way
+    ("Bio-Oil", "Bio™Oil US"),
+])
+def test_a_trademark_mark_on_the_brand_is_not_a_hold(brand, name):
+    tier_b = pipeline.storefront_tier_b(brand, _us(name), "US")
+    assert tier_b["name_starts_with_brand"] is True and tier_b["passed"] is True
+
+
+@pytest.mark.parametrize("name,failed", [
+    ("Sukin ™ Beauty Bay", "name_is_one_store_name"),   # standing alone, it separates like "®"
+    ("Sukin ℠ Beauty Bay", "name_is_one_store_name"),
+    ("Sukin™ | Beauty Bay", "name_is_one_store_name"),
+    ("Sukin™ Stockist USA", "name_has_no_reseller_token"),
+    ("Sukin™ by Adore Beauty", "name_has_no_reseller_token"),
+])
+def test_a_trademark_mark_does_not_hide_a_second_store(name, failed):
+    tier_b = pipeline.storefront_tier_b("Sukin", _us(name), "US")
+    assert tier_b[failed] is False and tier_b["passed"] is False
+
+
+def test_the_brands_own_mark_is_read_as_a_joiner_not_a_split():
+    # The brand side folds marks too: "Foo℗Bar" is one name, so it grants no split point that would let
+    # "Foo | Bar" through (read unfolded, ℗ is a split and it would).
+    tier_b = pipeline.storefront_tier_b("Foo℗Bar", _us("Foo | Bar"), "US")
+    assert tier_b["name_starts_with_brand"] is True
+    assert tier_b["name_is_one_store_name"] is False and tier_b["passed"] is False
+
+
 def test_a_second_name_is_held_with_the_reason_in_the_flag():
     # Measured 2026-09-26: a retailer in the prod ledger names itself this way. (On its own host,
     # kbeautymakeup.com, Tier A would decide first; the name is what is under test here.)
