@@ -339,3 +339,50 @@ def test_japanesetaste_mixed_shelves_stay_unmeasured(ptype, title):
 def test_japanesetaste_shelves_mean_nothing_on_another_host(domain):
     title = "Anessa Perfect UV Sunscreen Skincare Milk NA SPF50+ 2 fl oz"
     assert resolve(JT_SUN, title, domain) == evidence_only(JT_SUN, title)
+
+
+# us.shop.minetanbodyskin.com, read 2026-09-26 (every product: 181). House shelf names ("Mine Foam")
+# name no pattern family, so MineTan's self-tanners resolved nowhere. Titles are the real ones.
+MT = "us.shop.minetanbodyskin.com"
+TANNING = "beauty/body/tanning"
+
+
+@pytest.mark.parametrize("ptype,title", [
+    ("Mine Foam", "Wonder Tan Self Tan Foam"),
+    ("Mine Foam", "Coconut Water Self Tan Foam"),
+    ("Mine Foam", "Ultra Dark Self Tan Foam"),
+    # A title that names no leaf at all: the shelf is the only evidence, and it was read.
+    ("Mine Tan Gellies", "Invisible Glow Gradual Hydrating Tan Gelly"),
+    ("Mine Tan Gellies", "Invisible Glow Super Dark Hydrating Tan Gelly"),
+])
+def test_minetan_measured_shelves_resolve_its_self_tanners(ptype, title):
+    assert evidence_only(ptype, title)[0] == "beauty"  # unresolved before the shelf was read
+    assert resolve(ptype, title, MT) == (TANNING, MEASURED)
+
+
+def test_minetan_shelf_match_ignores_case_and_spacing():
+    assert resolve("MINE  foam", "Olive Self Tan Foam", MT) == (TANNING, MEASURED)
+
+
+def test_minetan_shelves_belong_to_its_own_host_only():
+    # The same house shelf name elsewhere (its AU store, any retailer) was not read.
+    assert resolve("Mine Foam", "Wonder Tan Self Tan Foam", "minetanbodyskin.com")[0] == "beauty"
+    assert resolve("Mine Foam", "Wonder Tan Self Tan Foam", "au.shop.minetanbodyskin.com")[0] == "beauty"
+
+
+def test_a_cleanser_title_on_the_foam_shelf_steps_it_aside():
+    # Real row from the store's mixed "Mine Body" shelf: a tan REMOVER. Were it filed under "Mine
+    # Foam", its title names the cleanser leaf, so the shelf must not claim it as a self-tanner.
+    assert resolve("Mine Foam", "Tan Eraser Cleansing Foam", MT)[0] != TANNING
+
+
+@pytest.mark.parametrize("ptype,title", [
+    # "Mine Body" is the left-out shelf the title check can NOT save: these two real rows name no leaf,
+    # so adding the shelf would file an applicator mitt and a body butter as self-tanners. ("Mine Face"
+    # and "Mine Bronze Babe" are left out too, but their titles name toner/serum/highlighter/gift-set,
+    # so the title check already steps those shelves aside; a test there would guard nothing.)
+    ("Mine Body", "Bronze On Applicator Mitt"),
+    ("Mine Body", "Glow Butter"),
+])
+def test_minetan_mixed_body_shelf_stays_out_of_the_table(ptype, title):
+    assert resolve(ptype, title, MT)[0] != TANNING
