@@ -336,26 +336,29 @@ def test_suppressed_product_is_excluded_from_the_sample(pg_engine):
 
 
 @pytest.mark.parametrize(
-    "reason, suppressed_at",
+    "reason, suppressed_at, sampled",
     [
-        ("brand_attribution_key_supersede", None),
-        (None, "2026-09-12T00:00:00Z"),
+        # suppressed_at is the serving gate's column: a set timestamp excludes the seed.
+        (None, "2026-09-12T00:00:00Z", 1),
+        ("brand_attribution_key_supersede", "2026-09-12T00:00:00Z", 1),
+        # A label alone is NOT suppression (catalog_invariant_checks: "CLEAN to every serving gate"); revert
+        # scripts leave one on a product they re-serve, and the scorecard must keep sampling that product.
+        ("brand_attribution_key_supersede", None, 2),
     ],
-    ids=["reason_only", "suppressed_at_only"],
+    ids=["suppressed_at_only", "both", "reason_label_only_is_still_sampled"],
 )
-def test_either_suppression_column_excludes(pg_engine, reason, suppressed_at):
-    """Prod holds both columns together today; either one alone still means the
-    product was deliberately withdrawn."""
+def test_only_suppressed_at_excludes_a_seed(pg_engine, reason, suppressed_at, sampled):
+    """The exclusion follows the serving gate (suppressed_at), not the suppression_reason label."""
     d = _P + "supp-one-col.test"
     with pg_engine.begin() as conn:
         _reset(conn)
         _product(conn, _P + "pk-live1", description=_DESC, image_url=_IMG)
         _product(conn, _P + "pk-half", description=_DESC, image_url=_IMG,
                  suppression_reason=reason, suppressed_at=suppressed_at,
-                 offer_suppression_reason="product_suppressed")
+                 offer_suppression_reason="product_suppressed" if suppressed_at else None)
         _seed(conn, _P + "s-live1", d, seed_data=_snapshot_shaped(), attached=_P + "pk-live1")
         _seed(conn, _P + "s-half", d, seed_data=_snapshot_shaped(), attached=_P + "pk-half")
-        assert _score(conn, d)["total"] == 1
+        assert _score(conn, d)["total"] == sampled
 
 
 def test_unsuppressed_product_with_suppressed_offers_still_counts_as_unpriced(pg_engine):

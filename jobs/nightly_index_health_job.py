@@ -169,8 +169,11 @@ async def _release_job_lock() -> None:
 #     'regression' and blocked every row of those domains.
 #
 # SUPPRESSED PRODUCTS ARE NOT IN THE SAMPLE. A seed whose attached
-# catalog_products row is suppressed (suppressed_at or suppression_reason set,
-# e.g. step5_same_merchant_same_url_dup) has its offers suppressed with it
+# catalog_products row is suppressed (suppressed_at set -- the serving gate's
+# column; suppression_reason is only a label, and two revert paths deliberately
+# leave a stale label on a product they re-serve, see
+# services/catalog_invariant_checks.py; e.g. step5_same_merchant_same_url_dup)
+# has its offers suppressed with it
 # (catalog_offers.suppression_reason = 'product_suppressed'), so the price EXISTS
 # below can never find one. That is a deliberate editorial withdrawal, not an
 # extractor failing to read a price: counted, it put www.tomfordbeauty.com
@@ -205,7 +208,6 @@ WITH seeds_in_window AS (
         ON cp.product_key = eps.attached_product_key
     WHERE eos.last_checked_at > NOW() - INTERVAL '72 hours'
       AND cp.suppressed_at IS NULL
-      AND cp.suppression_reason IS NULL
 )
 SELECT
     s.domain,
