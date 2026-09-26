@@ -321,9 +321,20 @@ TIER_B_SEPARATOR_CATEGORIES = frozenset({"Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po
 #: Punctuation that joins a name rather than splitting it, when attached to a word: "Head & Shoulders",
 #: "Karen's", "Kiehl‘s", "e.l.f.", "Dr. Jart+", "BondiBoost.com", "Sukin® USA". Standing alone between
 #: spaces, every one but "&" is a separator ("Sukin + Beauty Bay"; "&" reads as "and", which is no
-#: separator either). The name is NFKC-folded first, so "™" is already "TM" (and "Sukin™ USA" fails
-#: the prefix, as before).
+#: separator either).
 TIER_B_NAME_JOINERS = frozenset("&'’‘.+!#®©")
+#: Trademark marks NFKC folds into LETTERS glued to the word before ("Mario Badescu™" -> "badescutm",
+#: which failed the brand prefix). Each reads as "®" instead, before any folding: attached, it joins
+#: ("Sukin™ USA" is "Sukin USA"); standing alone it separates like any joiner ("Sukin ™ Beauty Bay").
+#: ™ ℠, circled/squared R and C (Ⓡ 🄬 🄫), the raised MC/MD/MR marks (🅪 🅫 🅬), and ℗.
+TIER_B_TRADEMARK_MARKS = "™℠Ⓡ🄬🄫🅪🅫🅬℗"
+
+
+def _tier_b_folded(value: Any) -> str:
+    """`value` as Tier B reads it: every TIER_B_TRADEMARK_MARKS as "®", then NFKC-folded."""
+    import unicodedata
+    text = "".join("®" if ch in TIER_B_TRADEMARK_MARKS else ch for ch in str(value or ""))
+    return unicodedata.normalize("NFKC", text)
 _WORD_HYPHENS = frozenset("-‐")  # NFKC folds the non-breaking U+2011 into U+2010
 #: Bars that Unicode files as LETTERS (so no category catches them), separators anywhere: "ǀ" "ǁ".
 TIER_B_LETTER_SEPARATORS = frozenset("ǀǁ")
@@ -383,9 +394,8 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
     resells, and a US-shipping USD store alone proves nothing about whose it is."""
     from services.region_pricing import pricing_currency_for_region_or_none
     sf = storefront if isinstance(storefront, dict) else {}
-    import unicodedata
-    want = _tokens(brand)
-    raw = _tier_b_name_text(unicodedata.normalize("NFKC", str(sf.get("name") or "")).replace("@", " at "))
+    want = _tokens(_tier_b_folded(brand))
+    raw = _tier_b_name_text(_tier_b_folded(sf.get("name")).replace("@", " at "))
     name = _tokens(raw)
     starts = len("".join(want)) >= TIER_B_MIN_BRAND_CHARS and name[:len(want)] == want
     rest = name[len(want):] if starts else name
@@ -397,7 +407,7 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
         "name_starts_with_brand": starts,
         "name_has_no_reseller_token": bool(name) and not (set(rest) & TIER_B_RESELLER_TOKENS),
         "name_is_one_store_name": bool(name) and _name_split_points(raw) <= _name_split_points(
-            _tier_b_name_text(unicodedata.normalize("NFKC", str(brand or "")))),
+            _tier_b_name_text(_tier_b_folded(brand))),
         "ships_to_market": isinstance(ships, list) and market in ships,
         "currency_is_market_currency": bool(expected) and sf.get("currency") == expected,
     }
