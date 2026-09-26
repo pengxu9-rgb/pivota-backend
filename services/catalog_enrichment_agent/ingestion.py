@@ -159,16 +159,48 @@ def canonical_product_name(brand: Optional[str], product_name: Optional[str]) ->
     return norm or "unknown"
 
 
+#: The canonical SKU stores `source_variant_id = product_key` (the restatement both money guards --
+#: services.variant_identity and the gateway's isRestatedProductId -- recognise only by EQUALITY or
+#: prefix), and catalog_skus.source_variant_id is varchar(128). A product_key longer than that can
+#: never get its canonical SKU: measured 2026-09-26, all 15 official-lane rows with a 129-140 char
+#: key had none, and none was servable.
+PRODUCT_KEY_MAX = 128
+
+
 def derive_product_key(brand: Optional[str], product_name: Optional[str]) -> str:
-    """Stable product_key derived from (brand, product_name). Uses a
-    deterministic hash to bound the length to the catalog_products
-    VARCHAR(255) limit while preserving readability of the prefix.
-    Format: 'ext:<canonical>::<8-char-hash>'."""
+    """Stable product_key derived from (brand, product_name).
+    Format: 'ext:<canonical prefix>::<8-char sha1 of the FULL canonical>'.
+
+    Bounded to PRODUCT_KEY_MAX. A canonical name of up to 114 chars yields exactly the key it always
+    did; a longer one keeps its first 114 chars and the same digest, so the key is still
+    deterministic and two long names sharing a prefix still differ by digest."""
     canonical = canonical_product_name(brand, product_name)
     digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:8]
-    # Truncate canonical prefix to keep total length sensible.
-    prefix = canonical[:200]
-    return f"ext:{prefix}::{digest}"
+    prefix_budget = PRODUCT_KEY_MAX - len("ext:") - len("::") - len(digest)
+    return f"ext:{canonical[:prefix_budget]}::{digest}"
+
+
+#: `catalog_products.source_product_id` and `catalog_skus.source_product_id` are varchar(128) in
+#: prod (product_key / sku_key are 255). The official lane stored the unbounded canonical name
+#: there, so on 2026-09-26 KISS's 150-170 char titles ("kiss-kiss-professional-full-cover-press-on-
+#: fake-toenails-tippy-toes-130-toenails-includes-nail-glue-...") failed the PDP insert and 11 SKU
+#: inserts with "value too long for type character varying(128)", and the batch rolled back.
+SOURCE_PRODUCT_ID_MAX = 128
+
+
+def derive_source_product_id(brand: Optional[str], product_name: Optional[str]) -> str:
+    """The official lane's stored source_product_id: the canonical name, bounded to the column.
+
+    A name that fits is returned unchanged, so every existing row keeps its id (every stored one
+    fits -- longer ones never landed). A longer one keeps a readable prefix and ends in the same
+    8-char hash of the FULL canonical name that derive_product_key uses, so it is deterministic
+    across re-runs and two long names that share a prefix still differ. The ONE derivation for
+    every column that stores it -- the PDP row and both SKU builders -- so they cannot disagree."""
+    canonical = canonical_product_name(brand, product_name)
+    if len(canonical) <= SOURCE_PRODUCT_ID_MAX:
+        return canonical
+    digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:8]
+    return f"{canonical[:SOURCE_PRODUCT_ID_MAX - len(digest) - 2]}::{digest}"
 
 
 # Hosts whose product URLs name the product in the QUERY, not the path. Measured 2026-09-23:
@@ -372,10 +404,9 @@ VARIANT_SKU_INFIX = "::v:"
 MAX_SEED_VARIANTS = 100
 
 
-# catalog_skus.sku_key is VARCHAR(255) and product_key alone can reach 214 chars
-# (derive_product_key: 'ext:' + canonical[:200] + '::' + 8 hex), so the variant
-# suffix has to fit in what is left rather than assume the 11 chars '::canonical'
-# always did. A token that would overflow is hashed, which keeps the key stable
+# catalog_skus.sku_key is VARCHAR(255). derive_product_key now bounds product_key to
+# PRODUCT_KEY_MAX (128), but keys minted by other writers are not bound by it, so the
+# variant suffix still has to fit in what is left rather than assume it always does. A token that would overflow is hashed, which keeps the key stable
 # across re-runs (the whole point of deriving it from the merchant's variant id).
 _SKU_KEY_MAX = 255
 #: `catalog_skus.source_variant_id` is varchar(128). The id a row STORES is the
@@ -499,7 +530,7 @@ def _build_variant_sku_inserts(
             "product_key": product_key,
             "merchant_id": seller["merchant_id"],
             "platform": SYNTHETIC_PLATFORM,
-            "source_product_id": canonical_product_name(pdp_payload["brand"], pdp_payload["product_name"]),
+            "source_product_id": derive_source_product_id(pdp_payload["brand"], pdp_payload["product_name"]),
             "source_variant_id": stored_vid,
             "source_domain": pdp_payload.get("source_domain") or None,
             "sku": str(v.get("sku") or "").strip() or None,
@@ -559,7 +590,7 @@ def _build_pdp_insert(
     """Construct the catalog_products row dict that the runner will
     INSERT. The product_key is deterministic so re-runs UPSERT cleanly."""
     product_key = derive_product_key(pdp_payload["brand"], pdp_payload["product_name"])
-    source_product_id = canonical_product_name(
+    source_product_id = derive_source_product_id(
         pdp_payload["brand"],
         pdp_payload["product_name"],
     )
@@ -1163,7 +1194,7 @@ def _build_sku_insert(
         # source_variant_id derivations are untouched storage tokens.
         "merchant_id": seller["merchant_id"],
         "platform": SYNTHETIC_PLATFORM,
-        "source_product_id": canonical_product_name(
+        "source_product_id": derive_source_product_id(
             pdp_payload["brand"], pdp_payload["product_name"]
         ),
         # The identity index is `idx_catalog_skus_source_identity_v2`
