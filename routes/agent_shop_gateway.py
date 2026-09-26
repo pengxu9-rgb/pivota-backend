@@ -33,7 +33,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
@@ -95,7 +95,7 @@ from services.outbound_links_service import (
     REFERRAL_CLICK_PARAM,
     SHOPIFY_CART_CLICK_ATTRIBUTE,
     make_redirect_token,
-    market_is_observed,
+    request_market_observed,
     TOKEN_MARKET_OBSERVED_KEY,
     normalize_shop_host,
     parse_redirect_token_verified,
@@ -2984,8 +2984,22 @@ class MultiSearchFilters(BaseModel):
         alias="commerceSurface",
         description="Serving surface eligibility policy (agent_api | ucp | acp)",
     )
+    # The market the BUYER's request named, raw — the gateway sends it here
+    # (`firstNonEmptyString(search?.market, metadata?.market)`), and before this field existed the
+    # model silently dropped it. PROVENANCE ONLY: read by `_request_market_for_multi` to decide
+    # `market_observed` on minted `/r` tokens; it filters and serves nothing. `exclude=True` keeps
+    # it out of every `model_dump`, so no cache key or forwarded body changes because of it.
+    market: Optional[str] = Field(None, exclude=True, description="Buyer market, provenance only")
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("market", mode="before")
+    @classmethod
+    def _market_is_a_string_or_unnamed(cls, value: Any) -> Optional[str]:
+        """TOLERANT, like the model was before the field existed (it silently ignored the key): a
+        non-string `search.market` (5, [], ["US"], {...}, true) is UNNAMED, never a validation
+        error inside the handler. Validity is the sink's question (`iso2_market`), not this one."""
+        return value if isinstance(value, str) else None
 
 
 class UserIntent(BaseModel):
@@ -4820,7 +4834,7 @@ async def _handle_offers_resolve(
                     # row's would forward a listing market to the purchasability gate as the
                     # buyer's. With a hint the SQL admits only `market = hint` or `'*'`, so this
                     # is True exactly when it was before.
-                    market_observed=market_is_observed(market_hint),
+                    market_observed=request_market_observed(market_hint),
                     tool=used_tool,
                     destination_url=str(canonical_url or destination_url),
                     utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
@@ -6039,7 +6053,7 @@ async def _handle_offers_resolve(
             # "nothing matched".
             redirect_url = await _make_external_redirect_url(
                 market=market_hint or "US",
-                market_observed=market_is_observed(market_hint),
+                market_observed=request_market_observed(market_hint),
                 tool=tool_hint or "offers.resolve",
                 destination_url=destination,
                 utm_template=None,
@@ -6945,7 +6959,7 @@ async def _attach_connected_product_redirects(
                     # WITHOUT a market, so `used_market` is the "US" default. Threaded from
                     # the parameter anyway, so a caller that starts naming one is observed
                     # without a second change here.
-                    market_observed=market_is_observed(market),
+                    market_observed=request_market_observed(market),
                     tool=used_tool,
                     destination_url=dest,
                     utm_template=None,
@@ -9635,7 +9649,7 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
             # (the gateway's own contract: "the per-candidate market / tool describe the SEED
             # ROW"), i.e. the market the card is LISTED in — never an observation of the buyer.
             # With `body.market` present this is True exactly when it was before.
-            market_observed=market_is_observed(body.market),
+            market_observed=request_market_observed(body.market),
             tool=tool,
             destination_url=destination_url,
             utm_template=candidate.utm_template,
@@ -9697,15 +9711,22 @@ async def external_seed_links_endpoint(
     return await mint_external_seed_links(body)
 
 
-def _request_market_from_metadata(request_metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+def _request_market_for_multi(
+    payload: Optional["FindProductsMultiPayload"], request_metadata: Optional[Dict[str, Any]]
+) -> Optional[str]:
     """The market the BUYER'S REQUEST named on the find_products_multi lanes, raw, or None.
 
-    `metadata.market` is the only market carrier this request has (the gateway reads the same
-    field: `search.market || metadata.market`). It is PROVENANCE ONLY — the input to
-    `market_is_observed` for a minted `/r` token — and is never defaulted: a request that named
-    no market mints tokens the warm-handoff lane will not key the purchasability gate on. A seed
-    row's own `market` is the market the row is LISTED in and is deliberately not consulted.
+    `payload.search.market` FIRST, then `metadata.market` — the same order the gateway builds its
+    own body in (`firstNonEmptyString(search?.market, metadata?.market)`). It is PROVENANCE ONLY —
+    the input to `request_market_observed` for a minted `/r` token — and is never defaulted: a
+    request that named no market mints tokens the warm-handoff lane will not key the
+    purchasability gate on. A seed row's own `market` is the market the row is LISTED in; it is
+    never read here.
     """
+    search = getattr(payload, "search", None)
+    raw = getattr(search, "market", None)
+    if isinstance(raw, str) and raw.strip():
+        return raw
     if not isinstance(request_metadata, dict):
         return None
     raw = request_metadata.get("market")
@@ -9741,7 +9762,13 @@ def _normalize_prefetched_external_seed_candidates(
 
 async def _build_prefetched_external_seed_wrappers(
     request_metadata: Optional[Dict[str, Any]],
+    *,
+    request_market: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    """`request_market` is the raw market the buyer's request named (the find_products_multi
+    handler passes `_request_market_for_multi`); absent, it is read from `metadata.market`."""
+    if request_market is None:
+        request_market = _request_market_for_multi(None, request_metadata)
     candidates = _normalize_prefetched_external_seed_candidates(request_metadata)
     if not candidates:
         return []
@@ -9795,23 +9822,30 @@ async def _build_prefetched_external_seed_wrappers(
             ),
         )
         if not redirect_url:
+            # PROVENANCE. The served `market` above is the CANDIDATE's (a seed row the caller
+            # handed us — where it is LISTED), else the US fallback. So the flag may be stamped
+            # only when the REQUEST named a market AND the candidate names the SAME one: a
+            # candidate with no market serves the US fallback (never observed), and a candidate
+            # listed elsewhere serves a market the buyer did not name (never observed).
+            observed = request_market_observed(
+                request_market, listing_market=candidate.get("market"), require_same=True
+            )
             # ADR-009 D3: seller_ref/seed_kind ride in the token ctx, so a cache
             # hit must not reuse a redirect built for a different seller. Include
-            # them in the key (cheap — read from the already-loaded row).
+            # them in the key (cheap — read from the already-loaded row). The provenance flag
+            # is in the key too: two candidates that serve the same market can differ in it.
             redirect_cache_key = "||".join([
                 market, tool, destination_url, str(utm_template or ""),
                 str(redirect_identity.get("seller_ref") or ""),
                 str(redirect_identity.get("seed_kind") or ""),
+                "observed" if observed else "unobserved",
             ])
             if redirect_cache_key in redirect_cache:
                 redirect_url = redirect_cache[redirect_cache_key]
             else:
                 redirect_url = await _make_external_redirect_url(
                     market=market,
-                    # The REQUEST's market, never the candidate's: a prefetched candidate is a
-                    # seed row the caller handed us, and its `market` is the market it is
-                    # LISTED in. See `_request_market_from_metadata`.
-                    market_observed=market_is_observed(_request_market_from_metadata(request_metadata)),
+                    market_observed=observed,
                     tool=tool,
                     destination_url=destination_url,
                     utm_template=utm_template,
@@ -10505,6 +10539,9 @@ async def _handle_find_products_multi_inner(
     from db.database import database
 
     filters = payload.search
+    # The BUYER's market, raw (search.market, then metadata.market), or None. Provenance only —
+    # it decides `market_observed` on the seed-lane `/r` tokens below and serves nothing.
+    buyer_request_market = _request_market_for_multi(payload, request_metadata)
     user_ctx = payload.user
     creator_meta = payload.metadata or None
     # Prefer top-level metadata for creator context when provided by caller.
@@ -12161,8 +12198,16 @@ async def _handle_find_products_multi_inner(
                     offer_variant_id=getattr(candidate, "variant_id", None),
                 ),
             )
+            # PROVENANCE: the REQUEST's market turns the flag on, never the row's (this lane
+            # fetches seeds with `market=None`, so the row's market is only where it is LISTED).
+            # The row's raw market can only turn it OFF: a row with no market serves the US
+            # fallback above. See `_request_market_for_multi`.
+            observed = request_market_observed(
+                buyer_request_market, listing_market=row_dict.get("market")
+            )
             # ADR-009 D3: include seller_ref/seed_kind in the cache key so a cache
-            # hit never reuses a redirect built for a different seller.
+            # hit never reuses a redirect built for a different seller. The provenance flag is
+            # in the key too: two rows that serve the same market can differ in it.
             redirect_cache_key = "||".join(
                 [
                     market,
@@ -12171,6 +12216,7 @@ async def _handle_find_products_multi_inner(
                     str(utm_template or ""),
                     str(redirect_identity.get("seller_ref") or ""),
                     str(redirect_identity.get("seed_kind") or ""),
+                    "observed" if observed else "unobserved",
                 ]
             )
             if redirect_cache_key in external_redirect_cache:
@@ -12178,10 +12224,7 @@ async def _handle_find_products_multi_inner(
             else:
                 redirect_url = await _make_external_redirect_url(
                     market=market,
-                    # The REQUEST's market, never the row's: this lane fetches seeds with
-                    # `market=None` (every market), so the row's market is only where it is
-                    # LISTED. See `_request_market_from_metadata`.
-                    market_observed=market_is_observed(_request_market_from_metadata(request_metadata)),
+                    market_observed=observed,
                     tool=tool,
                     destination_url=dest,
                     utm_template=utm_template,
@@ -12252,7 +12295,7 @@ async def _handle_find_products_multi_inner(
         prefetched_external_seed_wrappers = []
         if semantic_external_seed_fallback_allowed:
             prefetched_external_seed_wrappers = await _build_prefetched_external_seed_wrappers(
-                request_metadata
+                request_metadata, request_market=buyer_request_market
             )
         elif external_seed_skip_reason is None:
             external_seed_skip_reason = "semantic_class_blocked"
@@ -13985,6 +14028,8 @@ async def _handle_find_products_multi_inner(
                     page=filters.page,
                     limit=limit,
                     in_stock_only=filters.in_stock_only,
+                    # Carried so the retry's minted tokens keep the request's provenance.
+                    market=filters.market,
                 ),
                 user=payload.user,
                 metadata=payload.metadata,

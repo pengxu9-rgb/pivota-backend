@@ -60,7 +60,7 @@ from services.outbound_links_service import (
     apply_utm,
     is_destination_domain_allowed,
     make_redirect_token,
-    market_is_observed,
+    request_market_observed,
     TOKEN_MARKET_OBSERVED_KEY,
 )
 from services.external_seed_stock import (
@@ -2841,7 +2841,12 @@ def _build_external_seed_cache_key(
     hard_rule_prune: bool = False,
     limit: int,
     page_offset: int = 0,
+    request_market_named: bool = True,
 ) -> str:
+    """`request_market_named=False` (the request named no market) appends ONE extra component
+    after the integer offset bucket. A key built for a named market always ENDS in that integer,
+    so no market value — however spelled — can produce the unnamed key; and a named request's key
+    is byte-identical to the key this function built before the flag existed."""
     normalized_query = _normalize_external_seed_cache_query(query)
     normalized_market = str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     normalized_strategy = str(strategy or "legacy").strip().lower() or "legacy"
@@ -2860,11 +2865,12 @@ def _build_external_seed_cache_key(
     limit_bucket = _external_seed_limit_bucket(limit)
     offset_bucket = max(0, int(page_offset or 0))
     prune_token = "prune1" if hard_rule_prune else "prune0"
-    return (
+    key = (
         f"{normalized_query}|{normalized_market}|{normalized_strategy}|{normalized_scope}|"
         f"{normalized_surface}|{normalized_semantic_class}|{expansion_hash}|{required_terms_hash}|"
         f"{prune_token}|{limit_bucket}|{offset_bucket}"
     )
+    return key if request_market_named else f"{key}|market_unnamed"
 
 
 def _get_cached_external_seed_products(cache_key: str) -> Optional[List[Dict[str, Any]]]:
@@ -3082,13 +3088,13 @@ async def _load_external_seed_products_with_cache(
     # serve the US partition, but only the second may stamp its tokens observed — so they must
     # not share one entry, or whichever filled it first would decide for the other. The key is
     # split ONLY for the market-less case: a request that names its market builds exactly the
-    # key it always did.
-    cache_market = (
-        normalized_market if market_is_observed(market) else f"{normalized_market}~unobserved"
-    )
+    # key it always did. The split is its OWN key component (see `_build_external_seed_cache_key`),
+    # not a suffix on the market, so no raw market — "us~unobserved" included — can collide
+    # with it.
     cache_key = _build_external_seed_cache_key(
         query=query,
-        market=cache_market,
+        market=normalized_market,
+        request_market_named=request_market_observed(market),
         strategy=normalized_seed_strategy,
         surface=normalized_catalog_surface,
         scope=cache_scope,
@@ -3869,11 +3875,13 @@ async def _build_external_seed_product(
             # filters on DEFAULT_EXTERNAL_SEED_MARKET ("US") — so the row's "US" was the default
             # itself, laundered through a WHERE clause, and stamping it forwarded a defaulted
             # US to the gateway's purchasability gate via the warm-handoff lane. The search
-            # lane passes the request's raw market; the by-id lanes have none. See the MARKET
-            # PROVENANCE note in `services/outbound_links_service`.
+            # lane passes the request's raw market; the by-id lanes have none. The row's raw
+            # market is passed only as `listing_market`, which can turn the flag OFF (a row with
+            # no market serves the US fallback) and never ON. See the MARKET PROVENANCE note in
+            # `services/outbound_links_service`.
             **(
                 {TOKEN_MARKET_OBSERVED_KEY: True}
-                if market_is_observed(request_market)
+                if request_market_observed(request_market, listing_market=seed_row.get("market"))
                 else {}
             ),
             "dest": dest_with_utm,

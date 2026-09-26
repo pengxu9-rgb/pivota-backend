@@ -106,9 +106,10 @@ async def merchant_purchasability(
     # OPTIONAL since the market-never-defaulted change: a caller that has no market (the gateway's
     # `get_checkout` re-read, an escalation with no address country) gets an explicit
     # `reason: market_unknown` answer instead of a 422 it would read as "backend down" and fail
-    # open on. A present value is still length-bounded; one that is not ISO-2 after strip+upper
-    # is also `market_unknown` — the same rule the fact store keys on, never a truncation.
-    market: Optional[str] = Query(None, min_length=2, max_length=2),
+    # open on. ANY string is accepted and put through the one helper: `" us"` is US, and `""`,
+    # `"USA"`, `"U1"` are `market_unknown` — the same rule the fact store keys on, never a
+    # truncation and never a 422 the caller would read as an outage.
+    market: Optional[str] = Query(None),
     # ADMIN JWT **OR** THE GATEWAY'S GOOGLE IDENTITY TOKEN. This is the only route in the
     # repo that accepts the second, and it is read-only. See utils/gateway_oidc_auth.py: the
     # OIDC path is DISABLED until both `OPS_GATEWAY_OIDC_AUDIENCE` and
