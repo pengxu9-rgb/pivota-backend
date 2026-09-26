@@ -16,29 +16,39 @@ hosted page; this script prints that page's URL and never opens it. Pivota never
 
 `run` is `purchase` then `poll`; both exist separately. `--dry-run` on `purchase`/`poll`/`run`
 swaps Reap for an in-process fake (no network, no key) and posts the purchase through the real
-app in-process — it is how this script is validated. `serve --dry-run` boots the app with a
-placeholder key so the HTTP path can be rehearsed without the sandbox key.
+app in-process — it is how this script is validated. `serve` itself never holds the real key
+(it never calls Reap), so `serve` + `purchase` + `poll --dry-run` rehearses the HTTP path without
+the sandbox key.
 
 ── WHAT IT REFUSES ──────────────────────────────────────────────────────────────────────────
 
   * any DATABASE_URL that is not a SQLite FILE or a Postgres on localhost / 127.0.0.1 / ::1
     (`check_local_database_url`). A dotted host, a private IP, userinfo in front of a remote host,
     a `?host=` override, a multi-host list and a host-less URL (which libpq would resolve from
-    PGHOST) are all refused.
+    PGHOST), and an authority with more than one `@` are all refused. Every catalog/ledger WRITER
+    in this file re-checks the URL `db.database` actually bound (`_bound_database_url_check`) as
+    its first statement, so the guard sits in the write path, not only in the CLI.
   * any REAP_API_BASE_URL that is not exactly the sandbox host (`check_sandbox_base_url`).
   * egress to any host but the sandbox from the poll process: every httpx client the Reap client
     builds goes through `_RecordingTransport`, which refuses other hosts.
 
 ── CREDENTIALS ──────────────────────────────────────────────────────────────────────────────
 
-The Reap key is LOADED at runtime from `~/.config/pivota/reap_sandbox.env` (or $REAP_SANDBOX_ENV)
-by `_load_env`, copied from scripts/reap_agentic_sandbox_probe.py. It is never printed, never
-written to the state file, and the Authorization header is redacted in the JSON call log. The
+The Reap key is LOADED at runtime, by `poll`/`run` ONLY, from `~/.config/pivota/reap_sandbox.env`
+(or $REAP_SANDBOX_ENV) by `_load_env_file`, adapted from scripts/reap_agentic_sandbox_probe.py.
+The file is the ONLY source: a `REAP_API_KEY` exported in the shell makes every command refuse,
+and an env file whose base URL is not the sandbox has its key refused. `serve` gets a
+placeholder. The key is never printed, never written to the state file, and the Authorization
+header is redacted in the JSON call log. The
 agent API key and buyer JWT that `seed` prints are LOCAL test credentials for a local database.
 
 The environment of `serve` and of this process is built from an ALLOWLIST (`_harness_env`), not
-inherited: a shell that happens to export a production DATABASE_URL, REDIS_URL, SENTRY_DSN or a
-Cloud Run marker does not leak it into the local run.
+inherited, and this process's own `os.environ` is CLEARED before it is replaced: a shell that
+exports a production DATABASE_URL, REDIS_URL, SENTRY_DSN, a Cloud Run marker or libpq's
+PGHOST/PGHOSTADDR/PGSERVICE (which psycopg2 honours even beside host=localhost) leaks none of it.
+
+State files: the state dir is 0700 and must be ours; every file is written 0600 via a temp file
+and a rename; the SQLite file is created 0600 before anything writes to it.
 
 See docs/runbooks/reap_agentic_purchase.md, "Local end-to-end run against the sandbox".
 """
@@ -54,7 +64,6 @@ import os
 import re
 import secrets
 import sys
-import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -83,8 +92,53 @@ _POSTGRES_SCHEMES = frozenset({"postgresql", "postgres"})
 #: authority says localhost connect somewhere else.
 _HOST_OVERRIDE_PARAMS = frozenset({"host", "hostaddr", "service", "port"})
 
-DEFAULT_STATE_DIR = Path(tempfile.gettempdir()) / "pivota-reap-local-e2e"
+#: Under `$TMPDIR` (per-user on macOS). With TMPDIR unset the harness REFUSES rather than fall
+#: back to a shared `/tmp`; pass `--state-dir`.
+STATE_DIR_NAME = "pivota-reap-local-e2e"
 DEFAULT_ENV_FILE = "~/.config/pivota/reap_sandbox.env"
+
+#: THE refusal table for `check_local_database_url`: ONE list, owned here. The harness's tests
+#: parametrize over it, and the ADR-011 catalog tripwire probes ALL of it before it exempts this
+#: script's catalog fixture write — so a URL added here is enforced in both places at once.
+REFUSED_DATABASE_URLS = (
+    ("postgresql://10.25.0.2/pivota", "private ip"),
+    ("postgresql://10.25.0.2:5432/pivota", "private ip with port"),
+    ("postgresql://db.internal/pivota", "a dotted hostname"),
+    ("postgresql://localhost.localdomain/pivota", "a dotted hostname that starts with localhost"),
+    ("postgresql://127.0.0.1.nip.io/pivota", "a dotted hostname that starts with 127.0.0.1"),
+    ("postgresql://local/pivota", "a substring of an allowed host"),
+    ("postgresql://pivota:pw@34.120.1.9:5432/pivota", "prod-looking cloud sql ip"),
+    ("postgresql://pivota:secret@prod-db.pivota.cc/pivota", "prod-looking hostname"),
+    ("postgresql://localhost@10.25.0.2/pivota", "userinfo that says localhost, remote host"),
+    ("postgresql://localhost:pw@10.25.0.2/pivota", "userinfo:password, remote host"),
+    ("postgresql://a@10.25.0.2@localhost/pivota", "two @ in the authority"),
+    ("postgresql://u:p@x@localhost/pivota", "two @ in the authority, localhost last"),
+    ("postgresql://localhost:5432,10.25.0.2/pivota", "multi-host list led by localhost"),
+    ("postgresql://localhost,10.25.0.2/pivota", "multi-host list without ports"),
+    ("postgresql://localhost/pivota?host=10.25.0.2", "a ?host= override"),
+    ("postgresql://localhost/pivota?hostaddr=10.25.0.2", "a ?hostaddr= override"),
+    ("postgresql://localhost/pivota?service=prod", "a ?service= override"),
+    ("postgresql://localhost/pivota?HOST=10.25.0.2", "an upper-case ?HOST= override"),
+    ("postgresql:///pivota", "no host: libpq would read PGHOST"),
+    ("postgresql://:5432/pivota", "an empty host with a port"),
+    ("postgresql://localhost:notaport/pivota", "malformed port"),
+    ("sqlite://evilhost/x.db", "sqlite with an authority"),
+    ("sqlite+aiosqlite:///:memory:", "in-memory sqlite"),
+    ("sqlite:///", "sqlite with no file"),
+    ("mysql://localhost/pivota", "unsupported scheme"),
+    ("", "empty"),
+)
+ACCEPTED_DATABASE_URLS = (
+    "sqlite+aiosqlite:////tmp/x/local.db",
+    "sqlite:///relative.db",
+    "sqlite+aiosqlite:///./pivota.db",
+    "postgresql://localhost/pivota_local",
+    "postgresql://LOCALHOST:5432/pivota_local",
+    "postgresql://127.0.0.1/pivota_local",
+    "postgresql://[::1]:5432/pivota_local",
+    "postgres://me:pw@localhost/pivota_local",
+    "postgresql://me@127.0.0.1:5433/pivota_local?sslmode=disable",
+)
 DRY_RUN_PLACEHOLDER_KEY = "dry-run-placeholder-not-a-reap-key"
 
 JWT_ISSUER = "https://local-e2e.pivota.test"
@@ -156,6 +210,10 @@ def check_local_database_url(raw: Any) -> str:
     except ValueError:
         raise HarnessRefused("DATABASE_URL does not parse as a URL") from None
     scheme = parts.scheme.lower()
+    if parts.netloc.count("@") > 1:
+        # `a@b@host`: urlsplit takes the LAST `@`, other parsers the first. Where parsers
+        # disagree about which host a URL names, fail closed rather than pick one.
+        raise HarnessRefused("DATABASE_URL has more than one '@' in its authority")
 
     if scheme in _SQLITE_SCHEMES:
         if parts.netloc:
@@ -227,10 +285,15 @@ def check_sandbox_base_url(raw: Any) -> str:
 # ── credentials: loaded, never printed ───────────────────────────────────────────────────────
 
 
-def _load_env() -> Dict[str, str]:
-    """Copied from scripts/reap_agentic_sandbox_probe.py::_load_env (that script is not on main).
-    REAP_* from the environment win; the file only fills gaps. Values are never printed."""
-    env = {k: v for k, v in os.environ.items() if k.startswith("REAP_")}
+def _load_env_file() -> Dict[str, str]:
+    """The sandbox env file, and ONLY the file. Values are never printed.
+
+    Adapted from scripts/reap_agentic_sandbox_probe.py::_load_env (not on main), with one
+    deliberate difference: the probe let a shell `REAP_*` win over the file. Here the file is the
+    only source of a key — a `REAP_API_KEY` exported in a shell is of unknown provenance (it may be
+    a production key), and `main` refuses to run while one is set rather than ignore it.
+    """
+    env: Dict[str, str] = {}
     path = Path(os.environ.get("REAP_SANDBOX_ENV") or DEFAULT_ENV_FILE).expanduser()
     if path.exists():
         for line in path.read_text().splitlines():
@@ -307,7 +370,7 @@ def _apply_env(env: Mapping[str, str]) -> None:
 
 
 def _serve_env_keys_for_display(env: Mapping[str, str]) -> List[str]:
-    return [f"{k}={'<loaded, never printed>' if k == 'REAP_API_KEY' else v}"
+    return [f"{k}={'<never printed>' if k == 'REAP_API_KEY' else v}"
             for k, v in sorted(env.items()) if k not in _ENV_PASSTHROUGH]
 
 
@@ -315,10 +378,90 @@ def _serve_env_keys_for_display(env: Mapping[str, str]) -> List[str]:
 
 
 def _write_private(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
+    """0600, written to a fresh temp file beside `path` and RENAMED over it.
+
+    The temp file is opened `O_CREAT|O_EXCL|O_NOFOLLOW`, so it cannot be a pre-planted file or a
+    symlink; `os.replace` then swaps the directory entry, so a symlink planted AT `path` is
+    replaced, never followed. The file is never visible with wider bits or partial content.
+    """
+    directory = path.parent
+    tmp = directory / f".{path.name}.{secrets.token_hex(6)}.tmp"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise
+
+
+def _resolve_state_dir(raw: Optional[str], environ: Optional[Mapping[str, str]] = None) -> Path:
+    """`--state-dir` as an ABSOLUTE path, or `$TMPDIR/pivota-reap-local-e2e`. With neither, refuse:
+    the only other default is a shared `/tmp`, where another user can pre-create the directory."""
+    environ = os.environ if environ is None else environ
+    if raw:
+        return Path(os.path.abspath(os.path.expanduser(raw)))
+    tmpdir = (environ.get("TMPDIR") or "").strip()
+    if not tmpdir:
+        raise HarnessRefused(
+            "TMPDIR is unset, so the default state dir would be a shared /tmp; pass --state-dir"
+        )
+    return Path(os.path.abspath(tmpdir)) / STATE_DIR_NAME
+
+
+def _ensure_state_dir(path: Path, *, create: bool) -> Path:
+    """The state dir must be a real directory, OURS, and mode 0700. Created 0700 when `create`;
+    an existing one owned by someone else, a symlink, or one with group/other bits is refused."""
+    if create and not os.path.lexists(str(path)):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.mkdir(str(path), 0o700)
+    try:
+        st = os.lstat(str(path))
+    except FileNotFoundError:
+        raise HarnessRefused(f"state dir {path} does not exist; run `seed` first") from None
+    import stat as _stat
+
+    if not _stat.S_ISDIR(st.st_mode):
+        raise HarnessRefused(f"state dir {path} is not a directory (or is a symlink)")
+    if st.st_uid != os.getuid():
+        raise HarnessRefused(f"state dir {path} is owned by uid {st.st_uid}, not you")
+    if st.st_mode & 0o077:
+        raise HarnessRefused(
+            f"state dir {path} has mode {oct(st.st_mode & 0o777)}; it must be 0700"
+        )
+    return path
+
+
+def _sqlite_file(database_url: str) -> Optional[Path]:
+    match = re.match(r"^sqlite(?:\+aiosqlite)?:///(.+)$", database_url)
+    return Path(match.group(1)) if match else None
+
+
+def _absolutize_sqlite_url(database_url: Optional[str]) -> Optional[str]:
+    """A relative SQLite path made absolute NOW, before the harness `chdir`s to the repo root —
+    otherwise `sqlite:///local.db` would silently name a different file after the chdir."""
+    if not database_url:
+        return database_url
+    match = re.match(r"^(sqlite(?:\+aiosqlite)?):///(.+)$", database_url)
+    if not match or match.group(2).startswith("/") or match.group(2).startswith(":memory:"):
+        return database_url
+    return f"{match.group(1)}:///{os.path.abspath(match.group(2))}"
+
+
+def _precreate_sqlite_file(database_url: str) -> None:
+    """Create the SQLite file 0600 BEFORE anything writes to it (O_CREAT|O_EXCL|O_NOFOLLOW when
+    new); an existing one must be a regular file and is chmodded 0600."""
+    path = _sqlite_file(database_url)
+    if path is None:
+        return
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+    except FileExistsError:
+        if os.path.islink(str(path)) or not os.path.isfile(str(path)):
+            raise HarnessRefused(f"{path} exists and is not a regular file") from None
     os.chmod(str(path), 0o600)
 
 
@@ -411,6 +554,7 @@ async def build_schema() -> None:
     """The schema the way the app builds it at boot: `metadata.create_all` over every table `main`
     registers, then the schema-guard self-heal (which is what creates the reap_agentic_* tables —
     production skips db/migrations)."""
+    _bound_database_url_check()  # IN the write path: DDL follows
     import main  # noqa: F401 — registers every Table on `metadata`
     from db.database import engine, metadata
     from db.schema_guard import ensure_required_schema_light
@@ -424,7 +568,13 @@ async def seed_rows(state_dir: Path, opts: Mapping[str, Any]) -> Dict[str, Any]:
 
     Idempotent per key: rows this harness owns are deleted by their keys before insert, so a
     second `seed` on a Postgres database replaces them rather than colliding.
+
+    THE GUARD IS THE FIRST STATEMENT, not the caller's job. This function writes catalog_products
+    through the process-global `database`; the ADR-011 tripwire exempts this file from the
+    five-door rule only because the write itself refuses a non-local binding. A caller that
+    forgot the CLI's checks still cannot make it write anywhere else.
     """
+    _bound_database_url_check()
     from db.database import database
     from db.agents import create_agent
     from db.buyer_vault import hash_agent_user_ref
@@ -530,7 +680,7 @@ async def seed_rows(state_dir: Path, opts: Mapping[str, Any]) -> Dict[str, Any]:
 
     pem, jwks = _new_signing_key()
     _write_private(state_dir / "signing_key.pem", pem)
-    (state_dir / "jwks.json").write_text(json.dumps(jwks, indent=2), encoding="utf-8")
+    _write_private(state_dir / "jwks.json", json.dumps(jwks, indent=2))
 
     state: Dict[str, Any] = {
         "seeded_at": datetime.now(timezone.utc).isoformat(),
@@ -934,6 +1084,8 @@ async def post_purchase(
     up in `agents`, the JWT is verified against the JWKS `seed` wrote."""
     import httpx
 
+    if in_process:
+        _bound_database_url_check()  # the in-process app writes the ledger
     body = purchase_body(state, opts)
     headers = _purchase_headers(state_dir, state)
     if in_process:
@@ -1014,6 +1166,7 @@ async def poll_until_terminal(
     import routes.agent_commerce_reap as routes_reap
     import services.reap_agentic_client as rc
 
+    _bound_database_url_check()  # every tick writes the ledger (and, on completion, the edge)
     started = time.monotonic()
     transitions: List[Dict[str, Any]] = []
     last_state: Optional[str] = None
@@ -1141,15 +1294,13 @@ def _resolve_base(args) -> str:
 
 
 def _resolve_reap(args, *, need_key: bool) -> tuple:
-    """(base, key). The key is loaded only by the two commands that need it: `serve` (the route
-    is dark without a configured client) and `poll` (the only process that calls Reap). A dry
-    run never reads the env file."""
+    """(base, key). ONLY `poll`/`run` load the real key, and only from the env file: `serve`
+    never calls Reap (the routes write the ledger; the scheduler registers no jobs), so it gets
+    the placeholder, which is enough to arm the route. A dry run never reads the env file."""
     base = _resolve_base(args)
-    if getattr(args, "dry_run", False):
+    if getattr(args, "dry_run", False) or not need_key:
         return base, DRY_RUN_PLACEHOLDER_KEY
-    if not need_key:
-        return base, None
-    loaded = _load_env()
+    loaded = _load_env_file()
     for name in ("REAP_API_BASE_URL", "REAP_API_BASE"):
         if loaded.get(name):
             try:
@@ -1157,20 +1308,26 @@ def _resolve_reap(args, *, need_key: bool) -> tuple:
             except HarnessRefused:
                 # The key sitting next to a non-sandbox base may not be a sandbox key.
                 raise HarnessRefused(
-                    f"{name} in the environment / env file is not the sandbox; refusing to use "
-                    "the key that came with it"
+                    f"{name} in the env file is not the sandbox; refusing to use the key that "
+                    "came with it"
                 ) from None
     key = (loaded.get("REAP_API_KEY") or "").strip()
     if not key:
         raise HarnessRefused(
-            f"REAP_API_KEY not found in the environment or {DEFAULT_ENV_FILE} "
-            "(or $REAP_SANDBOX_ENV). Use --dry-run to exercise the harness without it."
+            f"REAP_API_KEY not found in {DEFAULT_ENV_FILE} (or $REAP_SANDBOX_ENV). "
+            "Use --dry-run to exercise the harness without it."
         )
     return base, key
 
 
 def _prepare_process(args, database_url: str, base: str, key: Optional[str]) -> Dict[str, str]:
+    """Replace this process's environment and chdir to the repo. EVERY check runs BEFORE the
+    first mutation, so a refusal leaves the caller's environment and cwd exactly as they were."""
     state_dir = Path(args.state_dir)
+    if not state_dir.is_absolute():
+        raise HarnessRefused("internal: the state dir must be absolute before the chdir")
+    database_url = check_local_database_url(database_url)
+    base = check_sandbox_base_url(base)
     env = _harness_env(database_url=database_url, reap_base_url=base, reap_api_key=key,
                        state_dir=state_dir)
     _apply_env(env)
@@ -1182,11 +1339,8 @@ def _prepare_process(args, database_url: str, base: str, key: Optional[str]) -> 
 
 def cmd_seed(args) -> int:
     state_dir = Path(args.state_dir)
-    if args.reset and state_dir.exists():
-        for name in ("local.db", "state.json", "jwks.json", "signing_key.pem"):
-            with contextlib.suppress(FileNotFoundError):
-                (state_dir / name).unlink()
-    state_dir.mkdir(parents=True, exist_ok=True)
+    # EVERY REFUSAL BEFORE THE FIRST FILESYSTEM EFFECT. `--reset` deletes files; a refused URL
+    # must not cost the operator their state dir.
     database_url = check_local_database_url(args.database_url or _default_database_url(state_dir))
     try:
         price = Decimal(str(args.price))
@@ -1195,13 +1349,22 @@ def cmd_seed(args) -> int:
     if price <= 0 or price.as_tuple().exponent < -2:
         raise HarnessRefused("--price must be positive with at most two decimals")
     base = _resolve_base(args)
-    _prepare_process(args, database_url, base, DRY_RUN_PLACEHOLDER_KEY)
-
     enrollment = (args.seed_enrollment or "").strip() or None
     if enrollment:
+        # `services.reap_agentic_client` does not import `db.database`, so this cannot bind the
+        # database before `_prepare_process` has set DATABASE_URL.
+        sys.path.insert(0, str(REPO_ROOT))
         import services.reap_agentic_client as rc
 
         enrollment = _load_steps_module()._checked_id(rc, enrollment, what="enrollment", uuid=True)
+
+    _ensure_state_dir(state_dir, create=True)
+    if args.reset:
+        for name in ("local.db", "state.json", "jwks.json", "signing_key.pem"):
+            with contextlib.suppress(FileNotFoundError):
+                (state_dir / name).unlink()
+    _precreate_sqlite_file(database_url)
+    _prepare_process(args, database_url, base, DRY_RUN_PLACEHOLDER_KEY)
 
     opts = {
         "database_url": database_url,
@@ -1256,25 +1419,35 @@ def cmd_seed(args) -> int:
     return 0
 
 
-def cmd_serve(args) -> int:
-    state_dir = Path(args.state_dir)
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def serve_command(args) -> tuple:
+    """(argv, env) for `serve`, with every refusal made. Split from `cmd_serve` so the refusals
+    and the environment can be tested without exec'ing uvicorn."""
+    state_dir = _ensure_state_dir(Path(args.state_dir), create=False)
     state = _load_state(state_dir)
     database_url = _resolve_database_url(args, state)
-    base, key = _resolve_reap(args, need_key=True)
-    if args.host not in ("127.0.0.1", "localhost", "::1"):
-        raise HarnessRefused("serve binds loopback only")
+    # NEVER the real key: `serve` makes no Reap call. See `_resolve_reap`.
+    base, key = _resolve_reap(args, need_key=False)
+    if args.host not in _LOOPBACK_HOSTS:
+        raise HarnessRefused(f"serve binds loopback only ({', '.join(_LOOPBACK_HOSTS)})")
     env = _harness_env(database_url=database_url, reap_base_url=base, reap_api_key=key,
                        state_dir=state_dir)
+    argv = [sys.executable, "-m", "uvicorn", "main:app", "--host", args.host,
+            "--port", str(args.port)]
+    return argv, env
+
+
+def cmd_serve(args) -> int:
+    argv, env = serve_command(args)
     print("serve: environment (allowlisted; nothing else from your shell is passed through)")
     for line in _serve_env_keys_for_display(env):
         print(f"  {line}")
-    if args.dry_run:
-        print("  (dry run: REAP_API_KEY is a placeholder; `serve` makes no Reap call anyway)")
+    print("  (REAP_API_KEY is a placeholder: `serve` never calls Reap; only `poll` loads the key)")
     print(f"\nuvicorn main:app on http://{args.host}:{args.port}  (Ctrl-C to stop)\n")
     sys.stdout.flush()
     os.chdir(str(REPO_ROOT))
-    argv = [sys.executable, "-m", "uvicorn", "main:app", "--host", args.host,
-            "--port", str(args.port)]
     os.execve(sys.executable, argv, env)
     return 0  # pragma: no cover
 
@@ -1310,9 +1483,7 @@ async def _poll(args, state_dir: Path, state: Mapping[str, Any], purchase_id: st
                 key: str) -> Dict[str, Any]:
     import httpx
 
-    log_path = Path(args.reap_log) if args.reap_log else Path.cwd() / (
-        f"reap_local_e2e_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
-    )
+    log_path = Path(args.reap_log)  # made absolute by `main`, before the chdir
     log = CallLog(log_path, key)
     if args.dry_run:
         fake = FakeReapSandbox(state)
@@ -1332,13 +1503,13 @@ async def _poll(args, state_dir: Path, state: Mapping[str, Any], purchase_id: st
 
 
 def _run_common(args, *, do_purchase: bool, do_poll: bool) -> int:
-    state_dir = Path(args.state_dir)
+    state_dir = _ensure_state_dir(Path(args.state_dir), create=False)
     state = _load_state(state_dir)
     database_url = _resolve_database_url(args, state)
     base, key = _resolve_reap(args, need_key=do_poll)
     _prepare_process(args, database_url, base, key)
-    if key and not args.dry_run:
-        print(f"REAP_API_KEY : loaded (value never printed); base {base}")
+    if do_poll and not args.dry_run:
+        print(f"REAP_API_KEY : loaded from the env file (value never printed); base {base}")
 
     async def _go() -> int:
         from db.database import database
@@ -1360,9 +1531,8 @@ def _run_common(args, *, do_purchase: bool, do_poll: bool) -> int:
             print(f"\n{result['reap_calls']} Reap call(s) recorded, Authorization redacted: "
                   f"{result['reap_log']}")
             if args.result_json:
-                Path(args.result_json).write_text(
-                    json.dumps(result, indent=2, default=str), encoding="utf-8"
-                )
+                _write_private(Path(args.result_json),
+                               json.dumps(result, indent=2, default=str))
             return 0 if result.get("state") == "completed" else 4
         finally:
             await database.disconnect()
@@ -1389,9 +1559,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR),
-                        help=f"where the SQLite file, state.json and the JWKS live "
-                             f"(default {DEFAULT_STATE_DIR})")
+    common.add_argument("--state-dir", default=None,
+                        help=f"where the SQLite file, state.json and the JWKS live (0700; "
+                             f"default $TMPDIR/{STATE_DIR_NAME}; refused if TMPDIR is unset)")
     common.add_argument("--database-url",
                         help="a LOCAL database; default sqlite+aiosqlite:///<state-dir>/local.db. "
                              "Postgres on localhost/127.0.0.1/::1 only.")
@@ -1424,8 +1594,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = sub.add_parser("serve", parents=[common], help="run uvicorn on loopback")
     serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--dry-run", action="store_true",
-                       help="placeholder REAP_API_KEY; the env file is not read")
     serve.set_defaults(func=cmd_serve)
 
     def _purchase_args(p):
@@ -1462,12 +1630,31 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _absolutize_paths(args, environ: Mapping[str, str]) -> None:
+    """Every path the operator typed, made absolute against THEIR cwd, before anything chdirs."""
+    args.state_dir = str(_resolve_state_dir(args.state_dir, environ))
+    args.database_url = _absolutize_sqlite_url(args.database_url)
+    if hasattr(args, "reap_log"):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        args.reap_log = os.path.abspath(args.reap_log or f"reap_local_e2e_{stamp}.json")
+    if getattr(args, "result_json", None):
+        args.result_json = os.path.abspath(args.result_json)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     if getattr(args, "fast", False) and not getattr(args, "dry_run", False):
         print("REFUSED: --fast is a dry-run option; the real run keeps the real cadence.")
         return 2
     try:
+        if os.environ.get("REAP_API_KEY"):
+            # A key exported in a shell has no provenance; it may be a production key. It is
+            # never used, and it is not silently ignored either.
+            raise HarnessRefused(
+                "REAP_API_KEY is set in your shell. This harness takes the key ONLY from "
+                f"{DEFAULT_ENV_FILE} (or $REAP_SANDBOX_ENV); unset it and re-run"
+            )
+        _absolutize_paths(args, os.environ)
         return int(args.func(args))
     except HarnessRefused as exc:
         print(f"REFUSED: {exc}")
