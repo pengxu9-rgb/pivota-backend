@@ -326,8 +326,9 @@ TIER_B_NAME_JOINERS = frozenset("&'’‘.+!#®©")
 #: Trademark marks NFKC folds into LETTERS glued to the word before ("Mario Badescu™" -> "badescutm",
 #: which failed the brand prefix). Each reads as "®" instead, before any folding: attached, it joins
 #: ("Sukin™ USA" is "Sukin USA"); standing alone it separates like any joiner ("Sukin ™ Beauty Bay").
-#: ™ ℠, circled/squared R and C (Ⓡ 🄬 🄫), the raised MC/MD/MR marks (🅪 🅫 🅬), and ℗.
-TIER_B_TRADEMARK_MARKS = "™℠Ⓡ🄬🄫🅪🅫🅬℗"
+#: ™ ℠; circled R and C (Ⓡ ⓡ Ⓒ ⓒ), circled italic R and C (🄬 🄫), squared R (🅁); the raised MC/MD/MR
+#: marks (🅪 🅫 🅬). And ℗, which NFKC leaves alone but which is a mark like © (attached, it was a split).
+TIER_B_TRADEMARK_MARKS = "™℠ⓇⓡⒸⓒ🄬🄫🅁🅪🅫🅬℗"
 
 
 def _tier_b_folded(value: Any) -> str:
@@ -335,6 +336,8 @@ def _tier_b_folded(value: Any) -> str:
     import unicodedata
     text = "".join("®" if ch in TIER_B_TRADEMARK_MARKS else ch for ch in str(value or ""))
     return unicodedata.normalize("NFKC", text)
+
+
 _WORD_HYPHENS = frozenset("-‐")  # NFKC folds the non-breaking U+2011 into U+2010
 #: Bars that Unicode files as LETTERS (so no category catches them), separators anywhere: "ǀ" "ǁ".
 TIER_B_LETTER_SEPARATORS = frozenset("ǀǁ")

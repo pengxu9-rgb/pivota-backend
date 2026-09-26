@@ -401,6 +401,7 @@ def test_tier_b_refuses_a_letter_used_as_a_separator(brand, name):
     ("Mario Badescu", "Mario Badescu™"), ("Mario Badescu", "Mario Badescu™ Skin Care"),
     ("Sukin", "Sukin℠ USA"), ("Sukin", "SukinⓇ USA"), ("Sukin", "Sukin🄬 USA"), ("Sukin", "Sukin🄫 USA"),
     ("Sukin", "Sukin🅪 USA"), ("Sukin", "Sukin🅫 USA"), ("Sukin", "Sukin🅬 USA"), ("Sukin", "Sukin℗ USA"),
+    ("Sukin", "Sukinⓡ USA"), ("Sukin", "SukinⒸ USA"), ("Sukin", "Sukinⓒ USA"), ("Sukin", "Sukin🅁 USA"),
     ("Sukin", "Sukin™USA"),                       # glued on both sides
     ("Mario Badescu™", "Mario Badescu USA"),      # the brand side reads it the same way
     ("Bio-Oil", "Bio™Oil US"),
@@ -420,6 +421,14 @@ def test_a_trademark_mark_on_the_brand_is_not_a_hold(brand, name):
 def test_a_trademark_mark_does_not_hide_a_second_store(name, failed):
     tier_b = pipeline.storefront_tier_b("Sukin", _us(name), "US")
     assert tier_b[failed] is False and tier_b["passed"] is False
+
+
+def test_the_brands_own_mark_is_read_as_a_joiner_not_a_split():
+    # The brand side folds marks too: "Foo℗Bar" is one name, so it grants no split point that would let
+    # "Foo | Bar" through (read unfolded, ℗ is a split and it would).
+    tier_b = pipeline.storefront_tier_b("Foo℗Bar", _us("Foo | Bar"), "US")
+    assert tier_b["name_starts_with_brand"] is True
+    assert tier_b["name_is_one_store_name"] is False and tier_b["passed"] is False
 
 
 def test_a_second_name_is_held_with_the_reason_in_the_flag():
