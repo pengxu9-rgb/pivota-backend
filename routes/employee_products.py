@@ -4528,6 +4528,40 @@ def _read_the_served_product(
     return observation, read
 
 
+def _next_served_canonical(
+    row: Dict[str, Any],
+    dest: Optional[str],
+    observed_canonical: Optional[str],
+    observed_domain: Optional[str],
+    *,
+    read_the_served_product: bool,
+) -> Tuple[Optional[str], Optional[str]]:
+    """The (canonical_url, domain) a refresh may store: the page's canonical, or what is stored.
+
+    `canonical_url` IS THE SERVED URL (`destination_of` reads it first), so writing it decides
+    which page every later refresh, liveness sweep and readiness gate looks at. The refresh used
+    to write the page's self-declared canonical on EVERY attempt -- including cache fallbacks
+    that read nothing -- and a canonical tag is the store's claim, not ours: fentybeauty's shade
+    pages name a sibling shade (`...-470` -> `...-340`), pourri.com moved hosts, a US seed gets
+    a `/fr-fr/` canonical. Once stored, `_same_destination(dest, served)` fails and the row can
+    never be re-read. Measured 2026-09-26 over 21,664 active seeds: 581 canonicals name a
+    different product handle (fentybeauty 501), 524 the same handle on another host / locale /
+    query.
+
+    So the page's canonical is taken ONLY when this fetch read the served product AND it is
+    still the same destination as the seed's `destination_url` (`_same_destination`: host case
+    and one leading `www.` forgiven, nothing else). That keeps the invariant every later
+    refresh needs -- the served URL is readable from `destination_url` -- by construction.
+    Otherwise the stored pair stands. `snapshot.canonical_url` still records what the page said.
+    """
+    stored = (row.get("canonical_url"), row.get("domain"))
+    if not read_the_served_product or not observed_canonical:
+        return stored
+    if not _same_destination(dest, observed_canonical):
+        return stored
+    return observed_canonical, (observed_domain or row.get("domain"))
+
+
 # A price reading that we actually STORED. `unavailable` means we read no price at all, and
 # each `skipped_*` means we read something and REFUSED it (a 0-price broken-offer shape, an
 # amount with no currency, a currency that disagrees with the stored one). In every refused
@@ -5360,6 +5394,14 @@ async def _refresh_external_seed_by_id(
         else:
             seed_data["snapshot"]["extracted_at"] = _to_iso(datetime.now(timezone.utc))
 
+    served_canonical, served_domain = _next_served_canonical(
+        row,
+        dest,
+        canonical_url,
+        domain,
+        read_the_served_product=read_the_served_product,
+    )
+
     await _execute_seed_data_stmt(
         """
         UPDATE external_product_seeds
@@ -5391,8 +5433,8 @@ async def _refresh_external_seed_by_id(
         {
             "id": seed_id,
             "read_the_served_product": bool(read_the_served_product),
-            "canonical_url": canonical_url,
-            "domain": domain,
+            "canonical_url": served_canonical,
+            "domain": served_domain,
             "title": snap_title,
             "image_url": snap_image_url,
             "price_amount": next_amount,
@@ -5455,7 +5497,8 @@ async def _refresh_external_seed_by_id(
         "market": market,
         "tool": tool,
         "dest": dest,
-        "canonical_url": canonical_url,
+        # THE URL WE SERVE, not the page's claim: the refresh route mints its redirect from it.
+        "canonical_url": served_canonical,
         "domain": domain,
         "seed_data": seed_data,
         # DID THIS "SUCCESS" ACTUALLY CONTACT THE ORIGIN? Often not, and the status alone
