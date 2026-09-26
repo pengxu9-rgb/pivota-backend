@@ -8,6 +8,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from services import market_telemetry
+from services.region_pricing import normalize_region, pricing_currency_for_region_or_none
 
 
 _EXTERNAL_SEED_QUERY_STOPWORDS = {
@@ -400,6 +401,37 @@ def build_seed_quarantine_anti_join() -> str:
     )
 
 
+#: The market a seed read serves when its caller names none. A find_products_multi request that
+#: names no market is answered as a US request everywhere else on this door (market_telemetry's
+#: `market_resolved` is "US" with `market_source` "defaulted"; the seed partition default is
+#: routes/agent_api.DEFAULT_EXTERNAL_SEED_MARKET), so the seed lanes default the same way.
+DEFAULT_SEED_SERVING_MARKET = "US"
+
+
+def seed_serving_currency(serving_market: Optional[str]) -> Optional[str]:
+    """The currency a seed row must be priced in to be SERVED to `serving_market`, or None.
+
+    Peng 2026-09-26: a seed priced in another currency is a wrong result for the buyer, and the
+    fallback lanes must not show it. "currency = market" is region_pricing's rule
+    (REGION_PRICING_CURRENCY, the table require_market_currency enforces on writers); this is the
+    same table read on the SERVING side, never a second spelling of it.
+
+    `external_product_seeds.market` is not that market: SG (SGD) rows are stored in the 'US'
+    partition on purpose, and the multi lane binds no partition at all. So the partition cannot
+    stand in for the currency -- the row's own `price_currency` has to be read.
+
+    None means the market has no known currency (e.g. 'DE', 'EU-DE'): nothing can be shown to be
+    priced for it, so the caller serves no seed at all rather than guessing one.
+    """
+    return pricing_currency_for_region_or_none(normalize_region(serving_market) or DEFAULT_SEED_SERVING_MARKET)
+
+
+# The conjunct, spelled exactly as region_pricing.region_currency_predicate spells it for
+# catalog_offers: padded / lower-case codes normalise, and a NULL or blank price_currency is ''
+# and never equal -- an unknown currency is REFUSED, not assumed to be the market's.
+SEED_SERVING_CURRENCY_CLAUSE = "upper(trim(coalesce(price_currency, ''))) = :serving_currency"
+
+
 def _database_supports_statement_timeout(database: Any) -> bool:
     db_url = getattr(database, "url", None)
     if db_url is None:
@@ -425,7 +457,12 @@ async def fetch_external_seed_rows(
     include_total_count: bool = True,
     fast_multiterm: bool = False,
     lean_where_min_tokens: Optional[int] = None,
+    serving_market: Optional[str] = None,
 ) -> Dict[str, Any]:
+    # `market` is the storage PARTITION to read (None = every partition); `serving_market` is the
+    # market the BUYER is served in, and decides the currency every returned row must be priced
+    # in (seed_serving_currency). It defaults to `market`, then to DEFAULT_SEED_SERVING_MARKET --
+    # a caller that reads no partition (the find_products_multi lane) passes the request's market.
     # For queries at/above lean_where_min_tokens tokens, restrict the WHERE to the
     # cheap inline columns (no seed_data->recall JSON arms) so a broad many-token
     # OR can't detoast thousands of rows and blow the stage-A timeout. Below the
@@ -450,6 +487,20 @@ async def fetch_external_seed_rows(
     if normalized_market:
         where.append("market = :market")
         values["market"] = normalized_market
+    serving_currency = seed_serving_currency(normalize_region(serving_market) or normalized_market)
+    if serving_currency is None:
+        # No currency is known for the buyer's market, so no seed can be shown to be priced for
+        # it. Serve none rather than every currency at once.
+        return {
+            "rows": [],
+            "total_count": 0,
+            "query_ms": 0,
+            "query_timeout": False,
+            "table_missing": False,
+            "serving_currency_unknown": True,
+        }
+    where.append(SEED_SERVING_CURRENCY_CLAUSE)
+    values["serving_currency"] = serving_currency
     text_clause, text_values = build_external_seed_text_clause(
         raw_query=query,
         include_seed_data_text_match=include_seed_data_text_match,

@@ -9717,11 +9717,12 @@ def _request_market_for_multi(
     """The market the BUYER'S REQUEST named on the find_products_multi lanes, raw, or None.
 
     `payload.search.market` FIRST, then `metadata.market` — the same order the gateway builds its
-    own body in (`firstNonEmptyString(search?.market, metadata?.market)`). It is PROVENANCE ONLY —
-    the input to `request_market_observed` for a minted `/r` token — and is never defaulted: a
-    request that named no market mints tokens the warm-handoff lane will not key the
-    purchasability gate on. A seed row's own `market` is the market the row is LISTED in; it is
-    never read here.
+    own body in (`firstNonEmptyString(search?.market, metadata?.market)`). It is the input to
+    `request_market_observed` for a minted `/r` token, and is never defaulted HERE: a request that
+    named no market mints tokens the warm-handoff lane will not key the purchasability gate on.
+    It is also the seed lane's `serving_market` -- the currency a served seed must be priced in --
+    and there `fetch_external_seed_rows` answers a None as a US request. A seed row's own `market`
+    is the market the row is LISTED in; it is never read here.
     """
     search = getattr(payload, "search", None)
     raw = getattr(search, "market", None)
@@ -12052,6 +12053,9 @@ async def _handle_find_products_multi_inner(
             stage_a_result = await fetch_external_seed_rows(
                 database=database,
                 market=None,
+                # No partition, but the BUYER's market still decides the currency a served seed
+                # must be priced in: an SGD / JPY seed is a wrong answer to a US request.
+                serving_market=buyer_request_market,
                 query=q_ascii or q_lower,
                 limit=seed_limit,
                 offset=0,
@@ -12087,6 +12091,7 @@ async def _handle_find_products_multi_inner(
                 stage_b_result = await fetch_external_seed_rows(
                     database=database,
                     market=None,
+                    serving_market=buyer_request_market,
                     query=q_ascii or q_lower,
                     limit=seed_limit,
                     offset=0,
