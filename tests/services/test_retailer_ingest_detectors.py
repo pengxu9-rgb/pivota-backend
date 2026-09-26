@@ -146,3 +146,162 @@ def test_a_single_unit_count_is_not_a_set():
     assert "set_filed_as_single_product" not in rules(detectors.detect([rec]))
     two = record("3CE Velvet Lip Tint 2pcs", "LIP TINT", "two-pcs", body="<p>Velvet colour for lips.</p>")
     assert "set_filed_as_single_product" in rules(detectors.detect([two]))
+
+
+# ------------------------------------------------------------------ placeholder_price_store (2026-09-26)
+# headandshoulders.com priced all 120 storefront variants at 1.00 and the drain applied 74 PDPs at $1.00:
+# $1.00 clears the per-row rule. The signal is store-wide, so the rule is judged over the whole cohort.
+
+def store(prices_per_product, *, domain="headandshoulders.com"):
+    """One real-producer record per product, each carrying the given variant prices (>= 1.00: the feed
+    drops a variant under MIN_SELLABLE_PRICE, so a sub-dollar row is built by `hand_record`)."""
+    out = []
+    for i, prices in enumerate(prices_per_product):
+        handle = f"p{i}"
+        rec = feed.shopify_product_to_record(
+            {"id": 7_000_000 + i, "vendor": "Brand", "title": f"Moisture Shampoo {i}", "handle": handle,
+             "product_type": "Shampoo", "body_html": "<p>A shampoo.</p>", "images": [],
+             "variants": [{"id": 40_000_000_000 + i * 100 + j, "price": f"{p:.2f}", "available": True,
+                           "title": f"Size {j}"} for j, p in enumerate(prices)]},
+            domain=domain, category_path="beauty", brand_override="Brand", currency="USD",
+            source_role="brand_official", emit_native_variants=True,
+        )
+        assert rec is not None and len(rec["pdp"]["variants"]) == len(prices), (prices, rec)
+        out.append(rec)
+    return out
+
+
+def hand_record(handle, prices):
+    """The producer's shape (pdp.variants + one offer at the first variant's price), for prices the
+    Shopify feed would drop before detect() sees them."""
+    return {"pdp": {"product_name": f"Item {handle}", "brand": "Brand", "category_path": "beauty/haircare/shampoo",
+                    "variants": [{"variant_id": f"{handle}-{j}", "price": p} for j, p in enumerate(prices)]},
+            "offers": [{"canonical_url": f"https://example.com/products/{handle}", "price": prices[0]}]}
+
+
+def test_the_hand_record_matches_the_producers_shape():
+    [real] = store([[12.0, 14.0]])
+    fake = hand_record("p0", [12.0, 14.0])
+    assert detectors._variant_prices(real) == detectors._variant_prices(fake) == [12.0, 14.0]
+    assert detectors._handle(real) == detectors._handle(fake) == "p0"
+
+
+def _varied(n, start=5.0):
+    return [round(start + 0.37 * i, 2) for i in range(n)]
+
+
+def _held(flags):
+    return {f["handle"] for f in flags if f["rule"] == "placeholder_price_store" and f["severity"] == detectors.BLOCK}
+
+
+@pytest.mark.parametrize("name,records,expect_held", [
+    # HOLD: headandshoulders.com, 2026-09-26 -- 120 variants all at 1.00.
+    ("120 all at 1.00", lambda: store([[1.0]] * 120), set(range(120))),
+    # HOLD: honest.com's shape -- 317 variants, 125 at 1.00 (0.39 <= 1.00 share).
+    ("317 with 125 at 1.00", lambda: store([[1.0]] * 125 + [[v] for v in _varied(192)]), set(range(125))),
+    # HOLD: a 0.99 token (built by hand: the feed drops sub-dollar variants).
+    ("50 all at 0.99", lambda: [hand_record(f"p{i}", [0.99]) for i in range(50)], set(range(50))),
+    # DO NOT HOLD: under the minimum count (the per-row rule still owns <= 0.5).
+    ("15 all at 1.00", lambda: store([[1.0]] * 15), set()),
+    # DO NOT HOLD: a flat-priced legitimate store -- its modal price is above 2.00.
+    ("200 with 190 at 10.00", lambda: store([[10.0]] * 190 + [[v] for v in _varied(10, 20.0)]), set()),
+    # DO NOT HOLD: 20 of 300 at 1.00 is under the <= 1.00 share.
+    ("300 with 20 at 1.00", lambda: store([[1.0]] * 20 + [[v] for v in _varied(280)]), set()),
+])
+def test_store_level_placeholder_pricing(name, records, expect_held):
+    flags = detectors.detect(records())
+    assert _held(flags) == {f"p{i}" for i in expect_held}, name
+
+
+def test_only_rows_whose_every_price_is_the_placeholder_are_held():
+    # 40 variants at 1.00 of 100 (0.40: the store holds) -- but 30 of them ride on real products whose
+    # other variants are real prices. Those products are not held; the ten all-1.00 rows are.
+    real_with_token = [[1.0, 1.0, 1.0, 24.0, 26.0, 28.0]] * 10   # 30 at 1.00, 30 real
+    all_token = [[1.0]] * 10                                       # 10 at 1.00
+    rest = [[v] for v in _varied(30, 30.0)]
+    flags = detectors.detect(store(real_with_token + all_token + rest))
+    assert _held(flags) == {f"p{i}" for i in range(10, 20)}
+
+
+def test_a_store_whose_one_price_rows_are_only_variants_of_real_products_holds_no_row():
+    # Every 1.00 is a variant beside a real price (0.67 at 1.00: the store holds) -- nothing is
+    # placeholder-only, so no row is held.
+    flags = detectors.detect(store([[1.0, 1.0, 19.0]] * 30))
+    assert _held(flags) == set()
+
+
+def test_the_flag_names_the_store_evidence_and_is_keyed_per_row():
+    flags = [f for f in detectors.detect(store([[1.0]] * 120)) if f["rule"] == "placeholder_price_store"]
+    assert flags[0]["key"] == "placeholder_price_store:p0"
+    assert "120/120 variants at 1.00" in flags[0]["detail"]
+    assert len({f["key"] for f in flags}) == 120
+    # an operator accepts a specific real $1 item; the rest still hold
+    left = detectors.blocking(flags, accepted=["placeholder_price_store:p7"])
+    assert len(left) == 119 and "placeholder_price_store:p7" not in {f["key"] for f in left}
+
+
+def test_a_modal_placeholder_at_two_dollars_holds_and_the_per_row_rule_is_untouched():
+    recs = store([[2.0]] * 40 + [[v] for v in _varied(5, 30.0)])  # 40/45 = 0.89 at 2.00
+    flags = detectors.detect(recs)
+    assert _held(flags) == {f"p{i}" for i in range(40)}
+    assert "placeholder_product" not in rules(flags)  # 2.00 was never a per-row placeholder
+
+
+def test_a_subset_recheck_does_not_judge_the_store():
+    recs = store([[1.0]] * 30)
+    assert _held(detectors.detect(recs, store_level=False)) == set()
+    assert len(_held(detectors.detect(recs))) == 30
+
+
+@pytest.mark.parametrize("n,held", [(19, False), (20, True)])
+def test_the_minimum_count_boundary(n, held):
+    assert bool(_held(detectors.detect(store([[1.0]] * n)))) is held
+
+
+@pytest.mark.parametrize("products,held", [
+    ([[1.0] * 5] * 5, True),        # 25 variants over 5 products: the minimum counts VARIANTS
+    ([[1.0] * 4] * 4 + [[1.0, 1.0, 1.0]], False),  # 19 variants over 5 products
+])
+def test_the_minimum_counts_variants_not_products(products, held):
+    assert bool(_held(detectors.detect(store(products)))) is held
+
+
+def test_a_verdict_judged_elsewhere_flags_only_the_rows_checked():
+    crawl = store([[1.0]] * 25)
+    verdict = detectors.placeholder_price_store_verdict(crawl)
+    assert verdict and verdict["ceiling"] == 1.0
+    kept = crawl[:5]  # 5 rows alone are under the minimum; the crawl's verdict still holds them
+    assert _held(detectors.detect(kept)) == set()
+    assert _held(detectors.detect(kept, store_verdict=verdict)) == {f"p{i}" for i in range(5)}
+    assert _held(detectors.detect(crawl, store_verdict=None)) == set()
+
+
+@pytest.mark.parametrize("price,token,rest,held", [
+    (1.00, 30, 70, True),    # 0.30 at <= 1.00: holds
+    (1.00, 29, 71, False),   # 0.29: does not
+    (1.01, 30, 70, False),   # 1.01 is a price, not the token
+])
+def test_the_token_share_boundary(price, token, rest, held):
+    flags = detectors.detect(store([[price]] * token + [[v] for v in _varied(rest)]))
+    assert bool(_held(flags)) is held
+
+
+def test_a_sub_dollar_modal_store_holds_its_one_dollar_rows_too():
+    # 80 at 0.99 (the modal placeholder) and 20 at 1.00: both are token prices, every row holds.
+    recs = [hand_record(f"p{i}", [0.99]) for i in range(80)] + [hand_record(f"p{i}", [1.0]) for i in range(80, 100)]
+    assert _held(detectors.detect(recs)) == {f"p{i}" for i in range(100)}
+
+
+def test_the_evidence_names_the_token_price_when_the_mode_ties():
+    flags = [f for f in detectors.detect(store([[1.0]] * 25 + [[30.0]] * 25)) if f["rule"] == "placeholder_price_store"]
+    assert len(flags) == 25 and "25/50 variants at 1.00" in flags[0]["detail"]
+
+
+@pytest.mark.parametrize("price,modal,rest,held", [
+    (2.00, 80, 20, True),    # 0.80 at 2.00: holds
+    (2.00, 79, 21, False),   # 0.79: does not
+    (2.01, 90, 10, False),   # a modal price over 2.00 is a real price list
+])
+def test_the_modal_share_and_ceiling_boundaries(price, modal, rest, held):
+    flags = detectors.detect(store([[price]] * modal + [[v] for v in _varied(rest, 30.0)]))
+    assert bool(_held(flags)) is held

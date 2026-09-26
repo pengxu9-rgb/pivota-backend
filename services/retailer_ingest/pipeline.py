@@ -633,6 +633,12 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
 
     o = job.get("options") or {}
     checks: Dict[str, Any] = {"crawl": getattr(records, "crawl_report", None), "selected": len(records)}
+    # Judged BEFORE exclude_handles and the category filter narrow the cohort: judged after, excluding some
+    # flagged rows (or an only_category slice) dropped the store under the minimum and applied the rest
+    # unanswered (review of #2371). Rows are flagged later, only those still in the cohort.
+    store_verdict = detectors.placeholder_price_store_verdict(records)
+    if store_verdict:
+        checks["placeholder_price_store"] = store_verdict
     flags: List[Dict[str, Any]] = []
     market = job_market(o)
     storefront = (checks["crawl"] or {}).get("storefront") if isinstance(checks["crawl"], dict) else None
@@ -702,12 +708,14 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
             flags.append({"key": name, "rule": name, "severity": detectors.BLOCK, "acceptable": False,
                           "detail": json.dumps(report, default=str)[:600]})
 
-    row_flags = detectors.detect(records)
+    row_flags = detectors.detect(records, store_verdict=store_verdict)
     if refiled:
         # Judge each re-filed row on BOTH shelves: the rules keyed on the store's shelf (lip size, lip
         # copy, the lip title door) cannot fire on the gift-set shelf, and a re-file must not hide them.
+        # Per-row rules only: placeholder_price_store already flagged these rows above (a re-file changes
+        # the shelf, never the price), and the re-filed handful is not a store (20 $1 sets must not read as one).
         seen = {f["key"] for f in row_flags}
-        row_flags += [f for f in detectors.detect(refiled_as_filed) if f["key"] not in seen]
+        row_flags += [f for f in detectors.detect(refiled_as_filed, store_level=False) if f["key"] not in seen]
         answered = [f for f in row_flags if f.get("handle") in refiled and f.get("rule") in REFILE_RESOLVES_RULES]
         row_flags = [f for f in row_flags if f not in answered]
         checks["refile_resolved_flags"] = sorted(f["key"] for f in answered)

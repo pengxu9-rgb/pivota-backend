@@ -1363,6 +1363,80 @@ async def test_a_refile_answers_only_the_set_flags_not_the_others(sets_env):
     assert {f["rule"] for f in _last_run(sets_env)["flags"]} == {"placeholder_product"}
 
 
+async def test_a_store_that_prices_everything_at_one_dollar_holds_row_by_row(sets_env):
+    """headandshoulders.com, 2026-09-26: every variant at 1.00, applied unflagged. It holds now, one flag per
+    row, and accepting a row's key releases exactly that row's flag."""
+    sets_env.products = [product(f"3CE Velvet Cream {i}", "Moisturizer", f"velvet-cream-{i}", price="1.00")
+                         for i in range(25)]
+    out = await pipeline.run_stage(job("apply_due"), db=sets_env.db)
+    assert out["status"] == "held" and sets_env.applied == []
+    flags = _last_run(sets_env)["flags"]
+    assert {f["rule"] for f in flags} == {"placeholder_price_store"}
+    assert sorted(f["key"] for f in flags) == sorted(f"placeholder_price_store:velvet-cream-{i}" for i in range(25))
+    assert "25/25 variants at 1.00" in flags[0]["detail"]
+    out = await pipeline.run_stage(job("apply_due", accepted_flags=[f["key"] for f in flags]), db=sets_env.db)
+    assert out["status"] == "done"
+
+
+def _token_store(n_token, n_real):
+    return ([product(f"3CE Velvet Cream {i}", "Moisturizer", f"token-{i}", price="1.00") for i in range(n_token)]
+            + [product(f"3CE Velvet Cream R{i}", "Moisturizer", f"real-{i}", price=f"{20 + i}.00")
+               for i in range(n_real)])
+
+
+def _store_flag_keys(env):
+    return sorted(f["key"] for f in _last_run(env)["flags"] if f["rule"] == "placeholder_price_store")
+
+
+@pytest.mark.parametrize("n_token,n_real,excluded", [
+    (60, 140, 1),   # review of #2371, repro A: excluding token-0 released the other 59
+    (25, 0, 6),     # repro B: excluding 6 of 25 dropped the store under the minimum
+    (125, 92, 100), # honest.com's shape at the approve route's 100-entry cap: 25/217 once narrowed
+])
+async def test_excluding_some_placeholder_rows_does_not_release_the_rest(sets_env, n_token, n_real, excluded):
+    """The verdict is judged over the crawl, before exclude_handles narrows the cohort."""
+    sets_env.products = _token_store(n_token, n_real)
+    out = await pipeline.run_stage(
+        job("apply_due", exclude_handles=[f"token-{i}" for i in range(excluded)]), db=sets_env.db)
+    assert out["status"] == "held" and sets_env.applied == []
+    assert _store_flag_keys(sets_env) == sorted(f"placeholder_price_store:token-{i}"
+                                                for i in range(excluded, n_token))
+
+
+async def test_excluding_every_placeholder_row_lets_the_store_apply(sets_env):
+    sets_env.products = _token_store(60, 140)
+    out = await pipeline.run_stage(job("apply_due", exclude_handles=[f"token-{i}" for i in range(60)]),
+                                   db=sets_env.db)
+    assert out["status"] == "done", _last_run(sets_env)["flags"]
+    applied = {p["canonical_url"].rsplit("/", 1)[-1] for p in sets_env.applied[0]["pdps"]}
+    assert applied == {f"real-{i}" for i in range(140)}
+
+
+async def test_a_category_slice_of_a_placeholder_store_still_holds_its_rows(sets_env):
+    """50/50 at $1; an only_category lip pass keeps 10 rows -- under the minimum on its own."""
+    sets_env.products = ([product(f"3CE Velvet Lipstick {i}", "Lipstick", f"lip-{i}", price="1.00") for i in range(10)]
+                         + [product(f"3CE Velvet Cream {i}", "Moisturizer", f"cream-{i}", price="1.00")
+                            for i in range(40)])
+    out = await pipeline.run_stage(job("apply_due", only_category="beauty/makeup/lip"), db=sets_env.db)
+    assert out["status"] == "held" and sets_env.applied == []
+    assert _store_flag_keys(sets_env) == sorted(f"placeholder_price_store:lip-{i}" for i in range(10))
+    assert "50/50 variants at 1.00" in next(f["detail"] for f in _last_run(sets_env)["flags"]
+                                          if f["rule"] == "placeholder_price_store")
+
+
+async def test_a_refiled_subset_is_not_judged_as_a_store_of_its_own(sets_env):
+    # The whole cohort is 20 of 120 at 1.00 (0.17): not a placeholder store. The 20 re-filed $1 sets alone
+    # would read as one (20/20) if the re-file re-check judged the store again.
+    sets_env.products = ([product(f"3CE Velvet Cream {i}", "Moisturizer", f"velvet-cream-{i}", price=f"{20 + i}.00")
+                          for i in range(100)]
+                         + [product(f"3CE Cream Gift Set {i}", "Moisturizer", f"cream-gift-set-{i}", price="1.00")
+                            for i in range(20)])
+    out = await pipeline.run_stage(
+        job("apply_due", refile_to_sets=[f"cream-gift-set-{i}" for i in range(20)]), db=sets_env.db)
+    assert "placeholder_price_store" not in {f["rule"] for f in _last_run(sets_env)["flags"]}
+    assert out["status"] == "done", _last_run(sets_env)["flags"]
+
+
 async def test_a_refile_the_store_no_longer_carries_blocks_until_accepted(sets_env):
     sets_env.products = [product("3CE Velvet Cream", "Moisturizer", "velvet-cream")]
     out = await pipeline.run_stage(job("apply_due", refile_to_sets=["gone-set"]), db=sets_env.db)
