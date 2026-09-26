@@ -215,3 +215,52 @@ def test_the_mirror_files_a_new_nail_polish_on_the_nail_leaf():
     meta = resolve_mirror_category_metadata(category=None, product_type="Nail Polish",
                                             title="Add Blueberry Smoothie - Deep Lilac")
     assert meta["category_path"] == "beauty/makeup/nails/nail-polish"
+
+
+# 2026-09-26: the 9 live curl creams filed on a face leaf (title verbatim, stored path). Every one
+# came through the bare "cream" arm of the Moisturizer pattern.
+CURL_CREAMS_ON_A_FACE_LEAF = [
+    ("Curl Cream 100ml", "beauty/skincare/moisturize/cream"),
+    ("Curl Cream 100ml - Barber", "beauty/skincare/moisturize/cream"),
+    ("Curl Defining Cream", "beauty/skincare/moisturize/cream"),
+    ("Parkjun Beautilab LPP Ceramide Hard Curl Cream", "beauty/skincare/moisturize/cream"),
+    ("Parkjun Beautilab LPP Ceramide Soft Curl Cream", "beauty/skincare/moisturize/cream"),
+    ("The Homecurl Curl-Defining Cream", "beauty/skincare/moisturize/cream"),
+    ("The Homecurl Curl-Defining Cream Deluxe Sample", "beauty/skincare/moisturize/cream"),
+    ("Wave Boost Curl Cream 150ml", "beauty/skincare/moisturize/cream"),
+    # Stored on the bare skincare root by the enrichment agent; the regex answer was the same face leaf.
+    ("Multi Texture Curl Cream", "beauty/skincare"),
+]
+
+
+@pytest.mark.parametrize("title,stored", CURL_CREAMS_ON_A_FACE_LEAF)
+def test_a_curl_cream_is_hair_care(title, stored):
+    assert classify(title)[1] == "beauty/skincare/moisturize/cream"  # the defect, reproduced
+    assert rp(title) == HAIR
+
+
+def test_the_mirror_fold_files_a_curl_cream_under_hair_care():
+    # fold_category_from_variants is what the seed mirror calls on INSERT.
+    from services.pdp_category_classifier import fold_category_from_variants
+
+    hit = fold_category_from_variants(category=None, product_type=None, title="Curl Cream 100ml")
+    assert hit is not None and hit[0] == HAIR
+
+
+@pytest.mark.parametrize("title,want", [
+    # Merchant-filed siblings already on haircare/general keep the same answer from the title alone.
+    ("Moroccanoil Curl Defining Cream 250 mL", HAIR),
+    ("Moroccanoil Intense Curl Cream 10.2 OZ", HAIR),
+    ("Curly Hair Cream", HAIR),
+    # No curl word: a face cream stays a face cream.
+    ("Radian-C Cream", ("Moisturizer", "beauty/skincare/moisturize/cream")),
+    # The face is named too: the face answer stands, as for "Face & Body Lotion".
+    ("Curl Friendly Face Cream", ("Moisturizer", "beauty/skincare/moisturize/cream")),
+])
+def test_curl_rule_boundaries(title, want):
+    assert rp(title) == want
+
+
+def test_curling_mascara_is_not_a_face_skincare_leaf_so_the_curl_rule_never_runs():
+    hit = rp("Lash Curling Mascara")
+    assert hit is not None and "haircare" not in hit[1] and not hit[1].startswith("beauty/skincare/")
