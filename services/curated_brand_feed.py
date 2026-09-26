@@ -290,6 +290,22 @@ async def fetch_shopify_shop_locale(
     return {"currency": cur if _ISO_CURRENCY.match(cur) else None}
 
 
+def shop_storefront_identity(domain: str) -> Optional[Dict[str, Any]]:
+    """WHICH store the crawl read, from the /meta.json `fetch_shopify_shop_locale` just fetched (the
+    per-host cache: no second request). {name, myshopify_domain, currency, ships_to_countries}, or
+    None when nothing was proven for this host.
+
+    Recorded on the crawl report so a retailer_ingest run says which Shopify store it crawled
+    (`us.frankbody.com` is `letsbefrankusa`, a separate store from `frankbody.com`'s `letsbefrank`)
+    and where it ships; the lane's brand-official Tier B rule reads it. Evidence only: it never
+    changes what the crawl accepts or refuses, and none of it is stamped on a row (see the
+    `country` note above -- `ships_to_countries` is fulfilment reach, not a market)."""
+    meta = storefront_currency.cached_meta(_clean_domain(domain))
+    if not isinstance(meta, dict):
+        return None
+    return {k: meta.get(k) for k in ("name", "myshopify_domain", "currency", "ships_to_countries")}
+
+
 class CrawlIncomplete(RuntimeError):
     """A bounded scan did not establish a complete catalog; never ingest its prefix.
 
@@ -2771,4 +2787,7 @@ async def records_for_brand(
         report["inci_enrichment"] = inci_report
     if report is not None and identity_report is not None:
         report["gtin_recovery"] = identity_report
+    storefront = shop_storefront_identity(domain)
+    if report is not None and storefront is not None:
+        report["storefront"] = storefront
     return CuratedRecordBatch(records, crawl_report=report)

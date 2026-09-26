@@ -75,10 +75,16 @@ async def _product(db, key, *, content_key, image=True, scope="multi_merchant_ca
         {"k": key, "img": "https://cdn.example/i.jpg" if image else None, "scope": scope, "ck": content_key})
 
 
-async def _offer(db, key, *, price=18.0):
+async def _offer(db, key, *, price=18.0, market=None, suffix=""):
+    if market is None:  # the column's own default ('US'), as every writer of this lane leaves it
+        await db.execute(
+            "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, merchant_effective_price)"
+            " VALUES (:o, :k, :k, 'rbq_m', 'USD', :p)", {"o": PREFIX + "o-" + key + suffix, "k": key, "p": price})
+        return
     await db.execute(
-        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, merchant_effective_price)"
-        " VALUES (:o, :k, :k, 'rbq_m', 'USD', :p)", {"o": PREFIX + "o-" + key, "k": key, "p": price})
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, merchant_effective_price,"
+        " market) VALUES (:o, :k, :k, 'rbq_m', 'USD', :p, :m)",
+        {"o": PREFIX + "o-" + key + suffix, "k": key, "p": price, "m": market})
 
 
 async def _ips(db, content_key, *, blocker="low_quality", serving=False):
@@ -153,3 +159,19 @@ async def test_identity_resolved_by_group_membership_on_the_products_own_source_
     assert not (await _readback([key], "USD", db, planned_images={key: True}))["ok"]
     await _member(db, key)                         # this product's own membership resolves it
     assert (await _readback([key], "USD", db, planned_images={key: True}))["ok"]
+
+
+async def test_every_offer_must_be_stamped_the_jobs_market(db):
+    """Multi-market storefronts ADR Phase 1: currency = market, read back per offer. A USD offer stamped
+    another market is a problem; the column default ('US') and a lower-case 'us' are the US market."""
+    from services.retailer_ingest.pipeline import _readback
+    key, ck = PREFIX + "mkt", PREFIX + "ck-mkt"
+    await _product(db, key, content_key=ck)
+    await _offer(db, key)
+    await _offer(db, key, market="us", suffix="-lower")
+    await _ips(db, ck, blocker=None, serving=True)
+    ok = await _readback([key], "USD", db, planned_images={key: True})
+    assert ok["ok"], ok["problems"]
+    await _offer(db, key, market="GB", suffix="-gb")
+    out = await _readback([key], "USD", db, planned_images={key: True})
+    assert out["problems"] == [{"product_key": key, "problem": "offers 3, stamped market US: 2"}]

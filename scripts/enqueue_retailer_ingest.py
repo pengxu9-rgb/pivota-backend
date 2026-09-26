@@ -4,8 +4,9 @@ Each JSONL row: {"domain": "k-touch.us", "brand": "3CE", "vendors": ["3CE"],
                  "options": {"lip_title_evidence": true, "only_category": "beauty/makeup/lip"},
                  "priority": 10}
 `vendors` is required (a retailer cohort is selected by vendor). Everything else in `options` is
-optional: require_currency (default USD), category_path, only_category, only_resolved_category,
-lip_title_evidence, exclude_handles, max_scan_products, max_products, retailer_name.
+optional: market (ISO alpha-2, default US; US is the only market allowed yet), require_currency
+(default and only allowed value: the market's currency, USD for US), category_path, only_category,
+only_resolved_category, lip_title_evidence, exclude_handles, max_scan_products, max_products, retailer_name.
 
 Re-enqueueing a cohort that already has an open job is a no-op (reported as `exists`).
 Needs DATABASE_URL: run it through scripts/ops/run_oneoff_job.sh.

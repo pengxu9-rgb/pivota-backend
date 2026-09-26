@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -62,8 +62,29 @@ def plausible_domain(host: Optional[str]) -> bool:
     return bool(h) and "." in h and not any(c.isspace() for c in h)
 
 
+_COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
+#: ISO-3166-1 has 249 codes; a merchant-controlled list longer than this is not a country list.
+MAX_SHIPS_TO_COUNTRIES = 300
+
+
+def _ships_to(value: Any) -> Optional[List[str]]:
+    """`ships_to_countries` as sorted, de-duplicated ISO alpha-2 codes; None when absent or not a
+    list (unknown, never "ships nowhere"). Entries that are not two letters are dropped."""
+    if not isinstance(value, list):
+        return None
+    codes = {str(c).strip().upper() for c in value[:MAX_SHIPS_TO_COUNTRIES] if isinstance(c, str)}
+    return sorted(c for c in codes if _COUNTRY_RE.match(c))
+
+
 def parse_meta(raw: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Pull {currency, country, domain, name} out of a Shopify /meta.json body."""
+    """Pull {currency, country, domain, name, myshopify_domain, ships_to_countries} out of a
+    Shopify /meta.json body.
+
+    `myshopify_domain` is the STORE's identity (two hosts with one myshopify domain are one store;
+    different ones are separate stores with separate catalogs and currencies) and
+    `ships_to_countries` is its own declared fulfilment reach. Both are recorded on retailer_ingest
+    runs and read by its brand-official Tier B rule (services/retailer_ingest/pipeline.py); like
+    `country`, neither is ever stamped on a row as a market."""
     if not raw:
         return None
     try:
@@ -80,7 +101,18 @@ def parse_meta(raw: Optional[str]) -> Optional[Dict[str, Any]]:
         "country": str(data.get("country") or "").strip().upper() or None,
         "domain": str(data.get("domain") or "").strip().lower() or None,
         "name": str(data.get("name") or "").strip() or None,
+        "myshopify_domain": str(data.get("myshopify_domain") or "").strip().lower() or None,
+        "ships_to_countries": _ships_to(data.get("ships_to_countries")),
     }
+
+
+def cached_meta(domain: Optional[str]) -> Optional[Dict[str, Any]]:
+    """What `fetch_storefront_meta` last proved for this host in this process, WITHOUT fetching.
+
+    For a caller that has just fetched through its own transport (the curated crawl's politeness
+    gated fetch) and wants more of the same answer than the currency it asked for: a second fetch
+    would be a second request to the merchant for data already in hand. None when nothing is cached."""
+    return _CACHE.get(normalize_domain(domain))
 
 
 def clear_cache() -> None:
