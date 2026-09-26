@@ -111,6 +111,31 @@ def test_store_or_supplier_vendor_cannot_become_operator_brand(vendor, host):
                                       source_role="retailer", brand_override="Elizabeth Arden")
 
 
+# The store's name sits BEHIND a regional/role first label. Measured 2026-09-26: us.mcobeauty.com and
+# us.inikaorganic.com were crawled as retailers and passed only because "us" is under the 3-char floor.
+@pytest.mark.parametrize("vendor,host", [("MCoBeauty US", "us.mcobeauty.com"), ("MCoBeauty", "us.mcobeauty.com"),
+    ("INIKA Organic", "us.inikaorganic.com"), ("Image Beauty", "www.imagebeauty.com"),
+    ("Beautylish Exclusives", "shop.beautylish.com")])
+def test_store_vendor_behind_a_regional_or_role_prefix_cannot_become_operator_brand(vendor, host):
+    raw = product()
+    raw["vendor"] = vendor
+    with pytest.raises(ValueError, match="retailer_maker_unproven"):
+        feed.shopify_product_to_record(raw, domain=host, category_path="beauty", currency="USD",
+                                      source_role="retailer", brand_override=vendor)
+
+
+# The other side: makers stocked behind a prefix (www.imagebeauty.com's measured cohort), a public second
+# level that is not skipped (shop.com.sg's store label is "shop"), and the floor on the store label.
+@pytest.mark.parametrize("vendor,host", [("AMIKA", "www.imagebeauty.com"), ("MOROCCANOIL", "www.imagebeauty.com"),
+    ("Comfort Zone", "shop.com.sg"), ("CQ Skin", "www.cq.com")])
+def test_real_maker_behind_a_regional_or_role_prefix_still_passes(vendor, host):
+    raw = product()
+    raw["vendor"] = vendor
+    mapped = feed.shopify_product_to_record(raw, domain=host, category_path="beauty", currency="USD",
+                                          source_role="retailer")
+    assert mapped["pdp"]["brand"] == vendor
+
+
 @pytest.mark.parametrize("vendor", ["珂润", "설화수", "3CE", "A'PIEU Plus"])
 def test_real_distinct_vendor_cannot_be_overridden(vendor):
     raw = product()

@@ -2103,7 +2103,11 @@ def shopify_product_to_record(
     if source_role == "retailer":
         vendor = str(product.get("vendor") or "").strip()
         vendor_key = "".join(c for c in vendor.casefold() if c.isalnum())
-        host_label = _brand_key(host.split(".")[0])
+        # The STORE's label, regional prefix skipped: the first label of us.mcobeauty.com is "us",
+        # under the floor, so `MCoBeauty US` passed as maker evidence on the brand's own store --
+        # 495 offers (and 323 on us.inikaorganic.com) written as retailer stock, measured 2026-09-26,
+        # while dhccare.com's `DHC Care` was refused. A brand's own store runs as brand_official.
+        host_label = _store_host_label(host)
         if (not _looks_like_a_brand_name(vendor) or not vendor_key
                 or (len(host_label) >= 3 and host_label in vendor_key)):
             raise ValueError(f"{host}: retailer_maker_unproven: vendor {vendor!r} is not maker evidence")
