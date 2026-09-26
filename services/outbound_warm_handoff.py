@@ -25,7 +25,7 @@ import re
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 
@@ -84,7 +84,8 @@ BOT_UA_MARKERS: Tuple[str, ...] = (
     "googleother",
 )
 
-_HANDLE_RE = re.compile(r"/products/([a-z0-9][a-z0-9\-_.]*)", re.IGNORECASE)
+# THE WHOLE `/products/<handle>` SEGMENT, percent-decoded (see `extract_product_handle`).
+_HANDLE_RE = re.compile(r"/products/([^/?#]+)", re.IGNORECASE)
 
 # THE BUYER MARKET FOR THE PURCHASABILITY GATE.
 #
@@ -263,12 +264,26 @@ def rollout_bucket(token: str, pct: int) -> bool:
 
 
 def extract_product_handle(dest: str) -> Optional[str]:
+    """The Shopify product handle in a `/products/<handle>` URL: the whole segment, decoded.
+
+    THIS USED TO BE ASCII-ONLY (`[a-z0-9][a-z0-9-_.]*`), and a Japanese or trademarked handle is
+    neither. `luafee.jp/products/qoo10-luafee-オードパルファム…` came out as `qoo10-luafee-` --
+    the same "handle" as every other qoo10-luafee product, so the liveness classifier called a
+    redirect to a DIFFERENT product `live` -- and `celimax.jp/products/オイルコントロール…` came
+    out as None, "not product-shaped", so the seed refresh could never read it and the sweep
+    skipped it. The redirect lands on the percent-encoded form (`%E3%82%AA…`) of the same
+    handle, hence the decode. Measured 2026-09-26 over 44,731 active seed URLs: 44,361
+    unchanged, 221 truncated -> full, 149 None -> handle, 0 other differences.
+    Callers compare it `.lower()`-ed; the warm handoff sends it as the product handle.
+    """
     try:
         path = urlparse(str(dest or "")).path or ""
     except Exception:
         return None
     match = _HANDLE_RE.search(path)
-    return match.group(1) if match else None
+    if not match:
+        return None
+    return unquote(match.group(1)).strip() or None
 
 
 def is_already_cart_join(ctx: Optional[Dict[str, Any]]) -> bool:
