@@ -188,3 +188,82 @@ def test_an_acrylic_shelf_is_not_press_on_nails():
     """universalnailsupplies.com types 26 products "Acrylic Nails & Tips": 1 is tips, the rest are
     acrylic powders and a top coat. The type alone must not file them all as press-on nails."""
     assert _pattern_matches("Acrylic Nails & Tips") == 0
+
+
+# "Brush-On" names how a glue or powder is applied, not a brush. Live store titles 2026-09-26
+# (kissusa.com, unitedbeautysupply.com, shopbeautydepot.com) that sat on beauty/tools/brush. A nail
+# glue has no leaf of its own, so None is the honest answer; the rows below are what each title falls
+# through to once Brush lets go -- a first cut that only exempted "brush-on" sent the PowerFlex glues
+# to exfoliant ("Applies Like Polish") and DUO's lash glues to gift-set (the brand "Duo").
+@pytest.mark.parametrize("title,want", [
+    ("Kiss InstaGlue Brush On Nail Glue", None),
+    ("Kiss InstaGlue Brush - On Nail Glue", None),                  # feed spacing around the hyphen
+    ("Kiss VitaBond Brush-On Nail Glue 2-Pack | Nail Adhesive, Press-On Glue, Pink Tint, "
+     "Infused with Vitamins A and E", None),
+    ("KISS Powerflex Brush-On Nail Glue, Professional Clear Instant False Nail Adhesive - BGL506", None),
+    ("Kiss PowerFlex Brush-On Nail Glue 3-Pack | Nail Adhesive, Press-On Glue, Applies Like Polish, "
+     "Lasting Wear", None),
+    ("Kiss PowerFlex Brush-On Fake Nail Glue - 0.17 oz. | Nail Adhesive, Press-On Glue, "
+     "Applies Like Polish, Lasting Wear", None),
+    ("Walker Tape: Ultra-Hold - 0.5oz. Brush-On", None),            # a wig/lace adhesive
+    ("Duo Brush On Striplash Adhesive", LASHES),                    # DUO's one-word "Striplash"
+    ("DUO Striplash Adhesive 0.25 oz (7g) - Clear & Dark Professional Eyelash Glue", LASHES),
+    ("Duo: Brush-On Dark Adhesive with Vitamins", LASHES),          # the brand heads the title
+    ("Striplash Adhesive Clear", LASHES),                           # the one-word spelling, no brand
+    ("DUO Brush On Strip Lash Adhesive Clear 0.18 oz", LASHES),
+    ("Anessa Perfect UV Brush-on Powder", "beauty/makeup/face/powder"),
+    ("Anessa Perfect UV Sunscreen Brush On Powder Makeup SPF50+", "beauty/skincare/sun/sunscreen"),
+    ("Kiss Brush-On Gel Nail Kit | 48 White & Natural French Tips, Gel Manicure", "beauty/sets/gift-set"),
+    ("Kiss Press On Glue Nail Tool Bundle - VitaBond Brush-On Nail Glue + Glue OFF Remover",
+     "beauty/sets/gift-set"),
+])
+def test_a_brush_on_applicator_is_not_a_brush(title, want):
+    assert _path(title) == want
+
+
+@pytest.mark.parametrize("title,want", [
+    # a real brush is still a brush, including one whose next word merely starts with "on"
+    ("Kabuki Brush", "beauty/tools/brush"),
+    ("Acrylic Nail Brush", "beauty/tools/brush"),
+    ("Brush Online Exclusive", "beauty/tools/brush"),
+    ("Foundation Brush - On Sale", "beauty/tools/brush"),
+    ("Brush Onyx Handle", "beauty/tools/brush"),
+    # a real polish is still an exfoliant; only the simile "like polish" is declined
+    ("Body Polish", "beauty/skincare/treat/exfoliant"),
+    ("Lip Polish Scrub", "beauty/skincare/treat/exfoliant"),
+    ("Polish Like a Pro Face Scrub", "beauty/skincare/treat/exfoliant"),
+    # a "Duo" that is a two-piece set, anywhere but heading a longer title, is still a gift set
+    ("Snail Mucin Eye Care Duo", "beauty/sets/gift-set"),
+    ("Lash Slick Duo", "beauty/sets/gift-set"),
+    ("Duo", "beauty/sets/gift-set"),
+    ("Kiss Colors & Care Edge Fixer Duo Bundle", "beauty/sets/gift-set"),
+    # a DUO title with no adhesive, or a DUO remover, is not false lashes
+    ("Duo Lash Adhesive Remover", None),
+    ("Duo Eyeshadow Palette", "beauty/makeup/eye/eyeshadow"),
+    ("Duo Glitter Pouch", None),
+    # a two-pack of lash-EXTENSION glue ("Adhesive Duo") is not the DUO brand
+    ("Nourishing Lash Extension Adhesive Duo", "beauty/sets/gift-set"),
+    ("Edge Fixer Duo: Lace Adhesive Spray", "beauty/sets/gift-set"),
+])
+def test_what_brush_on_titles_fall_through_to_stays_narrow(title, want):
+    assert _path(title) == want
+
+
+@pytest.mark.parametrize("title", [
+    # the False Lashes rule and the DUO brand no longer ALSO read as a brush or a gift set
+    "Duo Brush On Striplash Adhesive",
+    "DUO Brush On Strip Lash Adhesive Clear 0.18 oz",
+    "Duo: Individual Lash Adhesive Clear",
+    "Kiss i-Envy Waterproof Super Strong Hold Brush-On Eyelash Adhesive",
+])
+def test_a_brush_on_lash_adhesive_is_one_match_in_the_curated_resolver(title):
+    assert _pattern_matches(title) == 1, title
+
+
+@pytest.mark.parametrize("title", [
+    "Kiss InstaGlue Brush On Nail Glue",
+    "Kiss PowerFlex Brush-On Nail Glue 2-Pack | Nail Adhesive, Press-On Glue, Applies Like Polish",
+    "Walker Tape: Extreme Hold - 0.5oz. Brush-On",
+])
+def test_a_brush_on_nail_or_wig_glue_matches_no_leaf(title):
+    assert _pattern_matches(title) == 0, title
