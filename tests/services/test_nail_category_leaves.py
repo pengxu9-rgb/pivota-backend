@@ -68,6 +68,15 @@ def _path(text):
     ("Kiss Salon X-tend Color Press On Soft Gel Nails - Brick Road", PRESS_ON),
     ("Kiss Gel Fantasy Press On Glue Toenails - Chase It", PRESS_ON),
     ("Impress Design No Glue Fake Press On Toenails - Sweet as Honey", PRESS_ON),
+    # the nails stay the head noun: a glue listed after them, or a glue that qualifies them
+    ("Jelly Glue Press On Nails 24pcs", PRESS_ON),
+    ("Press On Nails, No Glue Needed", PRESS_ON),
+    ("Press On Nails - Glue Included", PRESS_ON),
+    ("Press On Nails & Glue", PRESS_ON),
+    ("Glue-On Press On Nails 24pcs", PRESS_ON),
+    ("Short Press On Nails for Women", PRESS_ON),        # "for" AFTER the phrase
+    ("Kiss Professional Full Cover Press On Fake Nails - Absolutes | 140 Nails, Includes Nail Glue",
+     PRESS_ON),
     ("KISS Lash Couture Faux Mink Collection", LASHES),
     ("Ardell Wispies Natural Lashes", LASHES),
     ("KISS imPRESS Falsies Press-On Lashes", LASHES),    # lashes, not press-on nails
@@ -149,9 +158,30 @@ def test_lash_and_nail_products_reach_their_leaf(title, want):
     ("Press On Gel Nails Cuticle Oil", CUTICLE),
     ("Press On Gel Nail Care Kit", "beauty/sets/gift-set"),
     ("Kiss Core Press On Glue Nails Bundle - Core Must-Haves", "beauty/sets/gift-set"),
+    # ...and the explicit "press on nails" arm no longer forgives a glue, adhesive or lamp that is
+    # the head noun, a glue named right after the phrase, or a product FOR the nails (kissusa.com
+    # 2026-09-26: the first two were press-on on main)
+    ("Kiss Salon X-tend LED Gel Adhesive | Clear, Press On Nail Gel Glue", None),
+    ("Kiss Salon X-tend Pro LED Lamp | White, Soft Gel Press On Nail Curing Light", None),
+    ("Kiss Nail Glue for Press On Nails", None),
+    ("Press On Nail Gel Glue 10g", None),                # only the glue after the phrase refuses
+    ("Press On Nails Nail Glue 3g", None),
+    ("Press On Nails Strong Hold Glue", None),            # only the end of the title refuses
+    ("Press On Nail Adhesive Tabs", None),
+    ("Nail Adhesive, Press On Nails", None),
+    ("Gel Glue - Press On Nails", None),
+    ("Nail Glue with Applicator, Press On Nails", None),
+    ("Nail Dehydrator for Press On Nails", None),
+    ("UV Lamp for Press On Nails", None),
 ])
 def test_refusing_examples_keep_their_old_leaf(title, want):
     assert _path(title) == want
+
+
+def test_a_brush_on_glue_is_not_press_on_nails():
+    """Asserted as "not press-on" only: "brush" anywhere still reaches the Brush tool leaf, a gap of
+    that rule and not of this one."""
+    assert _path("Press On Nails Brush-On Glue 5g") != PRESS_ON
 
 
 @pytest.mark.parametrize("product_type", [
