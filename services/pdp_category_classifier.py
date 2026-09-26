@@ -115,11 +115,20 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"perm|removers?|lip\w*)\b).*\b(?:"
         r"(?:false|fake|faux|mink|magnetic|strip|individual|cluster|wispy)\s+(?:eye\s?)?lash(?:es)?"
         r"|(?:eye\s?)?lash\s+(?:clusters?|wisps?|strips?|bands?|glue|adhesive)"
+        # DUO spells its strip-lash glue as one word: "Duo Brush On Striplash Adhesive".
+        r"|striplash(?:es)?"
         # Bare "falsies" is also Maybelline's MASCARA line ("Falsies Surreal Extensions"), so only
         # KISS's lash spellings count.
         r"|(?:impress|kiss)\s+falsies|falsies\s+(?:press[-\s]?on|lash(?:es)?|clusters?)|falscara|wispies"
         r"|faux\s+mink"
         r")\b",
+        re.IGNORECASE | re.DOTALL)),
+    # DUO is a lash-adhesive brand, and its own titles do not always say "lash": "Duo: Brush-On Dark
+    # Adhesive with Vitamins" (shopbeautydepot.com 2026-09-26) was a makeup brush via "Brush-On".
+    # Only a title the brand HEADS counts ("Lash Extension Adhesive Duo" is a two-pack, not the brand),
+    # and a DUO remover is not an adhesive.
+    ("False Lashes", "beauty/makeup/eye/false-lashes", re.compile(
+        r"^duo\b(?!.*\bremovers?\b).*\badhesives?\b",
         re.IGNORECASE | re.DOTALL)),
     # Two entries, one path (_pattern_matches counts distinct PATHS, so a type matching both is still
     # one match). The explicit "press-on nails" phrase wins even when the title lists its glue, file
@@ -207,8 +216,12 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     ("Brush Pouch", "beauty/tools/brush-accessory", re.compile(
         r"\b(brush bag|brush pouch|brush case|brush holder|brush roll)\b",
         re.IGNORECASE)),
+    # "Brush-On" / "Brush On" names how a GLUE or powder is applied, not a brush: a nail glue, a lash or
+    # wig adhesive and a sunscreen powder all landed here (kissusa.com, unitedbeautysupply.com,
+    # shopbeautydepot.com 2026-09-26). What they fall through to is narrowed too: Exfoliant declines
+    # "Applies Like Polish", Gift Set declines the DUO brand, and DUO's lash glues reach False Lashes.
     ("Brush", "beauty/tools/brush", re.compile(
-        r"\b(brush|makeup brush|foundation brush|powder brush|blush brush|shader brush|kabuki)\b",
+        r"\b(brush(?![-\s]+on\b)|makeup brush|foundation brush|powder brush|blush brush|shader brush|kabuki)\b",
         re.IGNORECASE)),
     ("Shampoo", "beauty/haircare/shampoo", re.compile(
         r"\b(shampoo|dry shampoo|clarifying shampoo)\b", re.IGNORECASE)),
@@ -311,7 +324,8 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         # A NAIL or GEL polish is a nail product; a face/body/lip polish is still an exfoliant.
         r"\b(exfoliant|exfoliating|exfoliation|peel|peeling|peeling gel|peel pads?|"
         # ...and a COLOUR polish ("Gel Color Polish") or a polish REMOVER is not one either.
-        r"scrub|(?<!nail\s)(?<!gel\s)(?<!color\s)(?<!colour\s)polish(?!\s+removers?\b))\b",
+        # ...and "Applies Like Polish" (KISS's brush-on nail glues) is a simile, not a polish.
+        r"scrub|(?<!nail\s)(?<!gel\s)(?<!color\s)(?<!colour\s)(?<!like\s)polish(?!\s+removers?\b))\b",
         re.IGNORECASE)),
     ("Treatment", "beauty/skincare/treat/treatment", re.compile(
         r"\b(spot[-\s]?target(?:ing|ed)?|spot[-\s]?treatment|blemish|acne|"
@@ -518,9 +532,11 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     ("Bluetooth Speaker", "electronics/audio/speaker", re.compile(
         r"\b(bluetooth\s+speaker|wireless\s+speaker|portable\s+speaker|smart\s+speaker)\b",
         re.IGNORECASE)),
+    # A "Duo" that HEADS a title and names more is the DUO lash-adhesive brand ("Duo: Brush-On Dark
+    # Adhesive", "DUO Striplash Adhesive"), not a two-piece set; a bare "Duo" type is still a set.
     ("Gift Set", "beauty/sets/gift-set", re.compile(
         r"\b(skincare set|skin care set|gift set|holiday edition|routine|bundle|"
-        r"essentials set|essentials|care set|duo|kit|collection|set)\b",
+        r"essentials set|essentials|care set|(?<!^)duo|^duo$|kit|collection|set)\b",
         re.IGNORECASE)),
 ]
 
