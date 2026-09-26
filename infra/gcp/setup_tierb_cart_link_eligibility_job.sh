@@ -87,7 +87,7 @@ verb=create; have "$GCLOUD" run jobs describe "$JOB" --region "$REGION" && verb=
   --labels "env=$ENV,managed-by=infra-gcp,lane=tierb-cart-link" \
   --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
   --set-env-vars "$ENV_VARS" \
-  --command python --args "-m,jobs.tierb_cart_link_eligibility,--budget-seconds,1200" --quiet
+  --command python --args="-m,jobs.tierb_cart_link_eligibility,--budget-seconds,1200" --quiet
 
 echo "== trigger: $TRIGGER ($SCHEDULE UTC)"
 URI="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT/jobs/$JOB:run"
