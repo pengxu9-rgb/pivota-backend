@@ -96,11 +96,14 @@ async def test_titles_that_are_not_the_brand_product_mint(family, title):
 @pytest.mark.asyncio
 async def test_the_brand_must_be_a_whole_word(family):
     """"MAC" is a prefix of "Macaron": without the word boundary this would join MAC's "Aron Lip Balm"."""
-    ck = make_content_key("MAC", "aron lip balm")
-    family[ck] = [{**BRAND_ROW, "brand": "MAC", "title": "Aron Lip Balm", "content_key": ck,
-                   "product_key": "ext:mac-aron-lip-balm::1"}]
+    wrong = set()
+    for rest in ("aron lip balm", "ron lip balm"):  # whichever tail a boundary-less strip would leave
+        ck = make_content_key("MAC", rest)
+        family[ck] = [{**BRAND_ROW, "brand": "MAC", "title": rest.title(), "content_key": ck,
+                       "product_key": "ext:mac-" + rest.replace(" ", "-") + "::1"}]
+        wrong.add(ck)
     out = await _resolve("Macaron Lip Balm", brand="MAC")
-    assert out["content_key"] != ck and out["evidence"].get("reason") != "error"
+    assert out["content_key"] not in wrong and out["evidence"].get("reason") != "error"
 
 
 @pytest.mark.asyncio
