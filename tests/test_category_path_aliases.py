@@ -58,7 +58,7 @@ def test_resolve_refuses_a_genuine_gap():
     """THE OTHER CONTROL, and the more important one. There is no honest leaf for a nail polish;
     filing it under a blush would make it findable by the WRONG query, which is louder than not
     being findable at all. These must stay off-taxonomy and stay counted."""
-    for path in ("beauty/makeup/nails/nail-polish", "wellness/supplements",
+    for path in ("beauty/accessories/pouch", "wellness/supplements",
                  "beauty/oral-care/toothpaste", "home/fragrance/candle"):
         assert resolve(path) is None, path
 
@@ -114,7 +114,10 @@ def test_the_llm_validator_rejects_a_shape_valid_invention_UNDER_AN_INDEXED_ROOT
     from services.category_classifier_llm import _validate_path
 
     assert _validate_path("beauty/skincare/treat/toner") == "beauty/skincare/tone/toner"
-    assert _validate_path("beauty/makeup/nails/nail-polish") is None
+    # A plausible nail path outside every leaf family. (`nails/nail-polish` is a leaf since
+    # 2026-09-26 and is accepted -- see test_the_nail_leaves_are_leaves_now; a sibling under
+    # `beauty/makeup/nails/` is inside that family's browse prefix, like any other family's.)
+    assert _validate_path("beauty/makeup/manicure/polish") is None
 
 
 def test_the_llm_validator_does_NOT_police_roots_recall_does_not_index():
@@ -179,9 +182,14 @@ def test_the_map_covers_the_measured_production_cohort():
     """117 distinct off-taxonomy paths were measured on prod 2026-09-09. Each is either aliased or
     declared a gap; a path in neither would be silently left broken by a map that claims to have
     considered it. The counts are pinned so that trimming the map is a visible decision."""
-    assert len(ALIASES) == 84, "alias count changed; re-measure before editing the expectation"
-    assert len(TAXONOMY_GAPS) == 33
-    assert len(ALIASES) + len(TAXONOMY_GAPS) == 117
+    assert len(ALIASES) == 87, "alias count changed; re-measure before editing the expectation"
+    assert len(TAXONOMY_GAPS) == 29
+    # 2026-09-26: the three nail gaps became LEAVES (not dropped), and the `eyes/lashes` gap became
+    # an ALIAS of the new false-lash leaf, together with two spellings measured since 09-09
+    # (`eyes/false-lashes`, `eyes/false_lashes`) -- so 117 measured + 2 new sources.
+    measured_nail_leaves = NAIL_LEAVES - {"beauty/makeup/nails/press-on-nails"}
+    assert len(ALIASES) + len(TAXONOMY_GAPS) + len(measured_nail_leaves) == 117 + 2
+    assert NAIL_LEAVES <= TAXONOMY_LEAVES
 
 
 @pytest.mark.parametrize(
@@ -195,7 +203,7 @@ def test_the_map_covers_the_measured_production_cohort():
 )
 def test_the_biggest_cohorts_are_each_decided(path, rows):
     """Named individually so the four largest cannot fall out of the map unnoticed."""
-    assert path in ALIASES or path in TAXONOMY_GAPS, (path, rows)
+    assert path in ALIASES or path in TAXONOMY_GAPS or path in TAXONOMY_LEAVES, (path, rows)
 
 
 # --- the cross-repo constraint this map violated in production ---------------------------------
@@ -258,8 +266,10 @@ def test_declaring_them_did_not_widen_any_query_prefix():
             "%s is a query prefix; every path under it is now 'reachable' and invisible to the "
             "off-taxonomy check" % parent
         )
-    assert not has_category_door("beauty/makeup/nails/nail-polish")
     assert not has_category_door("beauty/makeup/lips/lip-gloss")
+    # nails/nail-polish HAS a door since 2026-09-26 -- as a 4-segment leaf of its own, whose parent
+    # prefix is `beauty/makeup/nails/`, not by widening `beauty/makeup/` (asserted above).
+    assert has_category_door("beauty/makeup/nails/nail-polish")
 
 
 def test_the_collision_check_ACTUALLY_FIRES_on_a_colliding_map():
@@ -295,3 +305,47 @@ def test_the_vendored_distinct_list_is_not_EMPTY_or_TRUNCATED():
         "beauty/skincare/oil",
     ):
         assert path in INTENTIONALLY_DISTINCT, path
+
+
+# --- the nail leaves (Peng 2026-09-26) -----------------------------------------------------------
+
+NAIL_LEAVES = frozenset({
+    "beauty/makeup/nails/nail-polish",
+    "beauty/makeup/nails/cuticle-oil",
+    "beauty/makeup/nails/nail-polish-remover",
+    "beauty/makeup/nails/press-on-nails",
+})
+FALSE_LASHES = "beauty/makeup/eye/false-lashes"
+
+
+def test_the_nail_leaves_are_leaves_now():
+    """They were declared gaps ("no nail-colour leaf"); the classifier now carries them, so they are
+    leaves, resolve to themselves, pass the LLM validator, and are neither gaps nor aliases."""
+    from services.category_classifier_llm import _validate_path
+
+    for path in NAIL_LEAVES | {FALSE_LASHES}:
+        assert path in TAXONOMY_LEAVES, path
+        assert path not in TAXONOMY_GAPS, path
+        assert path not in ALIASES, path
+        assert resolve(path) == path, path
+        assert _validate_path(path) == path, path
+
+
+def test_the_nail_leaves_widen_only_the_nails_prefix():
+    """The control: a leaf's PARENT becomes a browse prefix. For these that is `beauty/makeup/nails`
+    and nothing wider -- the over-broadening that keeps the 3-segment set paths as gaps."""
+    from services.category_path_aliases import LEAF_PARENTS
+
+    assert "beauty/makeup/nails" in LEAF_PARENTS
+    assert "beauty/makeup" not in LEAF_PARENTS
+    assert not has_category_door("beauty/makeup/manicure/polish")
+
+
+def test_the_plural_eyes_lash_spellings_alias_to_the_false_lash_leaf():
+    """`eyes/lashes` was a declared gap ("no false-lash leaf"); it and the two spellings measured
+    since are the plural-`eyes/` typo of the leaf. `eyes/lash` is NOT: that cohort is mascara."""
+    for path in ("beauty/makeup/eyes/lashes", "beauty/makeup/eyes/false-lashes",
+                 "beauty/makeup/eyes/false_lashes"):
+        assert resolve(path) == FALSE_LASHES, path
+        assert path not in TAXONOMY_GAPS, path
+    assert resolve("beauty/makeup/eyes/lash") == "beauty/makeup/eye/mascara"

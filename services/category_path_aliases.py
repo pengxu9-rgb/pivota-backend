@@ -163,6 +163,11 @@ _alias("beauty/makeup/lip/oil", "beauty/makeup/lips/lip_oil")
 _alias("beauty/makeup/eye/eyeliner", "beauty/makeup/eyes/eyeliner")
 _alias("beauty/makeup/eye/brow", "beauty/makeup/eyebrow")
 _alias("beauty/makeup/eye/mascara", "beauty/makeup/eyes/lash")
+# False lashes got a leaf on 2026-09-26 (Peng). `eyes/lashes` was a declared gap ("no false-lash
+# leaf"); it and the two spellings measured since (Sigma's `eyes/false-lashes`, `eyes/false_lashes`)
+# are the plural-`eyes/` typo of the one leaf. NOT `eyes/lash` above: that cohort is mascara.
+_alias("beauty/makeup/eye/false-lashes", "beauty/makeup/eyes/lashes", "beauty/makeup/eyes/false-lashes",
+       "beauty/makeup/eyes/false_lashes")
 _alias("beauty/makeup/face/foundation", "beauty/makeup/base")
 _alias("beauty/tools/sponge", "beauty/makeup/tools/sponge")
 
@@ -258,9 +263,10 @@ TAXONOMY_GAPS: Dict[str, str] = {
     "beauty/skincare/hand/cream": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; do not fold into moisturize/",
     "beauty/skincare/moisturizer/balm": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; do not fold into moisturize/",
     "beauty/skincare/oil": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; do not fold into moisturize/oil",
-    "beauty/makeup/nails/nail-polish": "no nail-colour leaf (devices/nail is a device)",
-    "beauty/makeup/nails/cuticle-oil": "no nail-colour leaf",
-    "beauty/makeup/nails/nail-polish-remover": "no nail-colour leaf",
+    # beauty/makeup/nails/{nail-polish,cuticle-oil,nail-polish-remover} were gaps here until
+    # 2026-09-26 (Peng: "add the nail category"). They are LEAVES now -- CATEGORY_PATTERNS carries
+    # them -- 4 segments deep, so their browse prefix is `beauty/makeup/nails/`, never the whole of
+    # `beauty/makeup/` (the over-broadening the set paths below would cause).
     "wellness/supplements": "no wellness root",
     "beauty/accessories/makeup-bag": "no accessories leaf",
     "beauty/accessories": "no accessories leaf",
@@ -279,7 +285,6 @@ TAXONOMY_GAPS: Dict[str, str] = {
     "beauty/spa/body_treatment": "a SERVICE, not a product",
     "beauty/aromatherapy/pen": "no aromatherapy leaf",
     "beauty/makeup/setting-spray": "no setting-spray leaf; face/powder is a different product",
-    "beauty/makeup/eyes/lashes": "no false-lash leaf",
     "beauty/skincare/tools": "tools/* are brushes and sponges only",
     "beauty/skincare/tools/gua-sha": "tools/* are brushes and sponges only",
     "beauty/skincare/tools/exfoliator": "tools/* are brushes and sponges only",
