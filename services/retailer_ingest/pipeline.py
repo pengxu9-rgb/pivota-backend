@@ -261,8 +261,8 @@ def _tokens(value: Any) -> List[str]:
 #: A /meta.json name with one of these tokens AFTER the brand is a store that SELLS the brand, never the
 #: brand's own ("Sukin Stockist USA", "Sukin Beauty Warehouse"). "at" is the listing-title shape
 #: ("Sukin | Shop Sukin at Beauty Bay"); "@" in the name reads as "at" (NFKC first, so the full-width
-#: "＠" does too). Only the words after the brand
-#: count: a brand's own name may hold one ("Chemist Confessions USA").
+#: "＠" does too). Only the words after the brand count: a brand's own name may hold one
+#: ("Chemist Confessions USA").
 TIER_B_RESELLER_TOKENS = frozenset({
     "stockist", "stockists", "distributor", "distributors", "distribution", "distributions", "pharmacy",
     "pharmacies", "chemist", "chemists", "retailer", "retailers", "outlet", "outlets", "wholesale",
