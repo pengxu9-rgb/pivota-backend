@@ -26,6 +26,9 @@ from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
 from services.retailer_ingest import pipeline
 from tests.services.test_retailer_ingest_pipeline import env, job  # noqa: F401 -- the state-machine fixture
 
+_REAL_APPLY = writer.apply_ingest_plan  # the env fixture replaces both with fakes; one test needs the real ones
+from services.catalog_enrichment_agent.primary_ingestion import require_primary_apply as _REAL_REQUIRE_APPLY  # noqa: E402
+
 SUKIN_US = {"name": "Sukin Naturals USA", "myshopify_domain": "sukin-naturals-dev.myshopify.com",
             "currency": "USD", "ships_to_countries": ["US"]}
 BALI_US = {"name": "Bali Body US", "myshopify_domain": "bali-body-u-s.myshopify.com",
@@ -257,11 +260,20 @@ async def test_the_run_records_which_store_it_crawled(env, monkeypatch):  # noqa
 
 # ------------------------------------------------------------------ 4. Tier B
 
+def _us(name):
+    return {"name": name, "currency": "USD", "ships_to_countries": ["US"]}
+
+
 @pytest.mark.parametrize("domain,brand,storefront", [
+    # Measured prod /meta.json names (2026-09-26); each host fails Tier A.
     ("sukinnaturals.com", "Sukin", SUKIN_US),
     ("us.balibodyco.com", "Bali Body", BALI_US),
-    ("us.shop.minetanbodyskin.com", "MineTan", {"name": "MineTan USA", "currency": "USD", "ships_to_countries": ["US"]}),
-    ("dhccare.com", "DHC", {"name": "DHC Skincare", "currency": "USD", "ships_to_countries": ["US"]}),
+    ("moogoousa.com", "MooGoo", _us("MooGoo USA")),
+    ("ecotan.com", "Eco By Sonya", _us("Eco By Sonya USA")),
+    ("esmiskin.com", "esmi", _us("esmi Skin")),
+    ("us.shop.minetanbodyskin.com", "MineTan", _us("MineTan USA")),
+    ("dhccare.com", "DHC", _us("DHC Skincare")),
+    ("esteelauderusa.com", "Estée Lauder", _us("Estee Lauder US")),  # accent-folded, mid-word
 ])
 def test_tier_b_accepts_the_measured_us_stores(domain, brand, storefront):
     assert pipeline.brand_official_domain_flags(domain, [brand])  # Tier A alone holds every one of them
@@ -269,16 +281,35 @@ def test_tier_b_accepts_the_measured_us_stores(domain, brand, storefront):
     assert flags == []
     got = evidence["brands"][brand.casefold()]
     assert got["tier"] == "B" and got["name"] == storefront["name"]
-    assert got["name_contains_brand"] and got["ships_to_market"] and got["currency_is_market_currency"]
+    assert got["name_starts_with_brand"] and got["name_has_no_reseller_token"]
+    assert got["ships_to_market"] and got["currency_is_market_currency"]
+
+
+@pytest.mark.parametrize("domain,brand,name,failed", [
+    # Containment passed all of these (review of #2353): the brand must be the name's FIRST tokens.
+    ("karensbeautyshop.com", "REN", "Karen's Beauty Shop", "name_starts_with_brand"),
+    ("tulanepharmacy.com", "Tula", "Tulane Pharmacy", "name_starts_with_brand"),
+    ("selfcaresupply.com", "e.l.f.", "Self Care Supply Co", "name_starts_with_brand"),
+    ("sukinny.com", "Sukin", "Sukinny USA", "name_starts_with_brand"),             # a longer first word
+    ("naturalsusa.com", "Sukin", "Naturals by Sukin USA", "name_starts_with_brand"),  # brand not first
+    # Leading with the brand is not enough when the name says it resells it.
+    ("sukinstockistusa.com", "Sukin", "Sukin Stockist USA", "name_has_no_reseller_token"),
+    ("sukinoutlet.com", "Sukin", "Sukin Outlet", "name_has_no_reseller_token"),
+    ("sukinwholesale.com", "Sukin", "Sukin Wholesale Distribution", "name_has_no_reseller_token"),
+])
+def test_tier_b_refuses_a_name_that_does_not_lead_with_the_brand_or_resells_it(domain, brand, name, failed):
+    tier_b = pipeline.storefront_tier_b(brand, _us(name), "US")
+    assert tier_b[failed] is False and tier_b["passed"] is False
+    assert pipeline.brand_official_domain_flags(domain, [brand], storefront=_us(name))
 
 
 @pytest.mark.parametrize("storefront,failed", [
-    ({**SUKIN_US, "name": "Naturals USA"}, "name_contains_brand"),                          # name lacks the brand
-    ({**SUKIN_US, "name": None}, "name_contains_brand"),
+    ({**SUKIN_US, "name": "Naturals USA"}, "name_starts_with_brand"),                       # name lacks the brand
+    ({**SUKIN_US, "name": None}, "name_starts_with_brand"),
     ({**SUKIN_US, "ships_to_countries": ["AU", "NF"]}, "ships_to_market"),                   # the AU home store's reach
     ({**SUKIN_US, "ships_to_countries": None}, "ships_to_market"),                           # reach unknown
     ({**SUKIN_US, "currency": "AUD"}, "currency_is_market_currency"),                        # AUD base, even shipping US
-    (None, "name_contains_brand"),                                                           # no /meta.json read
+    (None, "name_starts_with_brand"),                                                        # no /meta.json read
 ])
 def test_tier_b_holds_unless_every_conjunct_holds(storefront, failed):
     flags, evidence = pipeline.brand_official_domain_review("sukinnaturals.com", ["Sukin"], storefront=storefront)
@@ -290,9 +321,8 @@ def test_tier_b_holds_unless_every_conjunct_holds(storefront, failed):
 
 
 def test_a_brand_too_short_to_be_evidence_is_held():
-    storefront = {"name": "ZA Cosmetics USA", "currency": "USD", "ships_to_countries": ["US"]}
-    assert pipeline.brand_official_domain_flags("zacosmeticsusa.com", ["ZA"], storefront=storefront)
-    assert not pipeline.brand_official_domain_flags("zacosmeticsusa.com", ["ZAC"], storefront=storefront)
+    assert pipeline.brand_official_domain_flags("zacosmeticsusa.com", ["ZA"], storefront=_us("ZA Cosmetics USA"))
+    assert not pipeline.brand_official_domain_flags("zacosmeticsusa.com", ["ZAC"], storefront=_us("ZAC Cosmetics USA"))
 
 
 def test_a_known_retailer_that_names_the_brand_is_still_refused():
@@ -434,24 +464,51 @@ def test_a_brand_official_plan_stamps_whose_copy_it_is():
 
 
 @pytest.mark.parametrize("batch", [False, True])
-async def test_a_second_brand_official_host_attaches_offers_but_keeps_the_owners_copy(quiet_writer, batch):
-    plan = _plan("us.frankbody.com")
-    db = _Catalog([_stored(plan, "frankbody.com")])
-    counts = await writer.apply_ingest_plan(plan, batch_label="t", db=db, batch=batch)
+async def test_an_off_market_store_attaches_offers_but_keeps_the_canonical_copy(quiet_writer, batch):
+    # AU is refused by validate_options today; the guard is exercised directly, as Phase 2 will reach it.
+    plan = _plan("frankbody.com")
+    db = _Catalog([_stored(plan, "us.frankbody.com")])
+    counts = await writer.apply_ingest_plan(plan, batch_label="t", db=db, batch=batch, market="AU")
     (pdp,) = db.written("catalog_products")
-    assert pdp["source_domain"] == "frankbody.com"
-    assert pdp["canonical_url"] == "https://frankbody.com/products/original-coffee-scrub"
-    assert pdp["image_url"] == "https://cdn.frankbody.com/scrub.jpg"
+    assert pdp["source_domain"] == "us.frankbody.com"
+    assert pdp["canonical_url"] == "https://us.frankbody.com/products/original-coffee-scrub"
+    assert pdp["image_url"] == "https://cdn.us.frankbody.com/scrub.jpg"
     assert json.loads(pdp["product_payload"])["enrichment_meta"] == {"agent_version": "x", "source_role": "brand_official"}
-    # ...while the second store's offer still lands, on the same product.
+    # ...while the AU store's offer still lands, on the same product.
     (offer,) = db.written("catalog_offers")
-    assert offer["product_key"] == plan["pdps"][0]["product_key"] and offer["source_domain"] == "us.frankbody.com"
-    assert quiet_writer == []  # its INCI would have re-labelled the owner's
+    assert offer["product_key"] == plan["pdps"][0]["product_key"] and offer["source_domain"] == "frankbody.com"
+    assert quiet_writer == []  # its INCI would have re-labelled the canonical copy's
     assert counts["pdps"] == 1 and counts["offers"] == 1
     assert counts["pdps_offer_only_canonical_owner"] == 1 and counts["incis_skipped_canonical_owner"] == 1
-    assert counts["canonical_owner_kept"] == [{"product_key": plan["pdps"][0]["product_key"], "owner": "frankbody.com",
-                                               "writer": "us.frankbody.com", "reason": "owned_by_another_storefront"}]
-    assert plan["pdps"][0]["source_domain"] == "us.frankbody.com"  # the caller's plan is not rewritten
+    assert counts["canonical_owner_kept"] == [{"product_key": plan["pdps"][0]["product_key"],
+                                               "owner": "us.frankbody.com", "writer": "frankbody.com", "market": "AU"}]
+    assert plan["pdps"][0]["source_domain"] == "frankbody.com"  # the caller's plan is not rewritten
+
+
+@pytest.mark.parametrize("batch", [False, True])
+async def test_a_canonical_market_apply_is_never_guarded(quiet_writer, batch):
+    """Review of #2353: in the canonical market (US, the only market this phase allows) a second brand
+    store writes the row as it always did -- keeping the first owner's canonical_url there made the apply
+    gate see another host's URL and fail the job after its writes. No lookup, nothing in the report."""
+    plan = _plan("us.frankbody.com")
+    db = _Catalog([_stored(plan, "frankbody.com")])
+    counts = await writer.apply_ingest_plan(plan, batch_label="t", db=db, batch=batch, market="US")
+    assert db.owner_lookups == 0
+    (pdp,) = db.written("catalog_products")
+    assert pdp["source_domain"] == "us.frankbody.com"
+    assert pdp["canonical_url"] == "https://us.frankbody.com/products/original-coffee-scrub"
+    assert len(quiet_writer) == 1
+    assert not {k for k in counts if "canonical" in k}
+
+
+async def test_the_guard_acts_only_off_the_canonical_market():
+    plan = _plan("frankbody.com")
+    owned = _Catalog([_stored(plan, "us.frankbody.com")])
+    same, counts = await writer._guard_canonical_owner(plan, owned, market="US")
+    assert same is plan and counts == {} and owned.owner_lookups == 0
+    guarded, counts = await writer._guard_canonical_owner(plan, owned, market="AU")
+    assert guarded["pdps"][0]["source_domain"] == "us.frankbody.com" and counts["pdps_offer_only_canonical_owner"] == 1
+    assert writer.canonical_market("Frank Body") == "US"
 
 
 @pytest.mark.parametrize("batch", [False, True])
@@ -466,22 +523,22 @@ async def test_the_first_brand_official_store_creates_the_row_as_before(quiet_wr
     assert not {k for k in counts if "canonical" in k}  # nothing to say, nothing added to the report
 
 
-@pytest.mark.parametrize("stored_domain", ["us.frankbody.com", "www.us.frankbody.com", "US.FrankBody.com"])
-async def test_the_owning_store_re_crawled_still_refreshes_its_row(quiet_writer, stored_domain):
-    plan = _plan("us.frankbody.com")
-    stored = {**_stored(plan, stored_domain), "canonical_url": "https://us.frankbody.com/products/old-handle"}
+@pytest.mark.parametrize("stored_domain", ["frankbody.com", "www.frankbody.com", "FrankBody.com"])
+async def test_the_owning_store_re_crawled_off_market_still_refreshes_its_row(quiet_writer, stored_domain):
+    plan = _plan("frankbody.com")
+    stored = {**_stored(plan, stored_domain), "canonical_url": "https://frankbody.com/products/old-handle"}
     db = _Catalog([stored])
-    await writer.apply_ingest_plan(plan, batch_label="t", db=db)
+    await writer.apply_ingest_plan(plan, batch_label="t", db=db, market="AU")
     (pdp,) = db.written("catalog_products")
-    assert pdp["canonical_url"] == "https://us.frankbody.com/products/original-coffee-scrub"
+    assert pdp["canonical_url"] == "https://frankbody.com/products/original-coffee-scrub"
     assert len(quiet_writer) == 1
 
 
 async def test_a_legacy_row_on_the_brands_own_domain_is_owned_even_without_the_stamp(quiet_writer):
-    plan = _plan("us.frankbody.com")
-    db = _Catalog([_stored(plan, "frankbody.com", source_role=None)])
-    await writer.apply_ingest_plan(plan, batch_label="t", db=db)
-    assert db.written("catalog_products")[0]["source_domain"] == "frankbody.com"
+    plan = _plan("frankbody.com")
+    db = _Catalog([_stored(plan, "us.frankbody.com", source_role=None)])
+    await writer.apply_ingest_plan(plan, batch_label="t", db=db, market="AU")
+    assert db.written("catalog_products")[0]["source_domain"] == "us.frankbody.com"
 
 
 @pytest.mark.parametrize("stored_domain,source_role", [
@@ -490,10 +547,10 @@ async def test_a_legacy_row_on_the_brands_own_domain_is_owned_even_without_the_s
     ("ulta.com", "retailer"),
 ])
 async def test_a_row_no_brand_official_store_owns_is_taken_by_the_brands_store(quiet_writer, stored_domain, source_role):
-    plan = _plan("us.frankbody.com")
+    plan = _plan("frankbody.com")
     db = _Catalog([_stored(plan, stored_domain, source_role=source_role)])
-    await writer.apply_ingest_plan(plan, batch_label="t", db=db)
-    assert db.written("catalog_products")[0]["source_domain"] == "us.frankbody.com"
+    await writer.apply_ingest_plan(plan, batch_label="t", db=db, market="AU")
+    assert db.written("catalog_products")[0]["source_domain"] == "frankbody.com"
 
 
 async def test_a_legacy_row_on_a_known_retailer_named_like_its_brand_has_no_owner(quiet_writer):
@@ -501,28 +558,64 @@ async def test_a_legacy_row_on_a_known_retailer_named_like_its_brand_has_no_owne
     listing, not a brand storefront's copy: the brand's store may take the row over."""
     plan = _plan("sephoracollection.com", brand="Sephora")
     db = _Catalog([_stored(plan, "sephora.com", source_role=None, brand="Sephora")])
-    await writer.apply_ingest_plan(plan, batch_label="t", db=db)
+    await writer.apply_ingest_plan(plan, batch_label="t", db=db, market="AU")
     assert db.written("catalog_products")[0]["source_domain"] == "sephoracollection.com"
 
 
 async def test_a_retailer_apply_is_unaffected(quiet_writer):
     plan = _plan("ulta.com", role="retailer")
     db = _Catalog([_stored(plan, "frankbody.com")])  # even with a brand-owned row under its key
-    counts = await writer.apply_ingest_plan(plan, batch_label="t", db=db)
+    counts = await writer.apply_ingest_plan(plan, batch_label="t", db=db, market="AU")
     assert db.owner_lookups == 0
     assert db.written("catalog_products")[0]["source_domain"] == "ulta.com"
     assert not {k for k in counts if "canonical" in k}
 
 
-async def test_an_off_market_store_is_offer_only_and_an_off_market_create_is_flagged():
+async def test_an_off_market_create_is_flagged():
     plan = _plan("frankbody.com")
-    owned = _Catalog([_stored(plan, "us.frankbody.com")])
-    guarded, counts = await writer._guard_canonical_owner(plan, owned, market="AU")
-    assert guarded["pdps"][0]["source_domain"] == "us.frankbody.com"
-    assert counts["canonical_owner_kept"][0]["reason"] == "off_market"
     fresh, counts = await writer._guard_canonical_owner(plan, _Catalog(), market="AU")
     assert fresh is plan and counts == {"canonical_created_off_market": 1}
-    assert writer.canonical_market("Frank Body") == "US"
+
+
+class _AppliedCatalog(_Catalog):
+    """_Catalog plus the post-apply readback: every applied product reads back served and priced."""
+
+    async def fetch_all(self, query, values=None):
+        if "offers_in_market" in query:
+            return [{"product_key": k, "category_path": "beauty/makeup/lip/tint", "serving": True,
+                     "pipeline_stage": "public_indexed", "lifecycle": "published", "offers": 1,
+                     "offers_in_currency": 1, "offers_in_market": 1} for k in values["keys"]]
+        return await super().fetch_all(query, values)
+
+
+async def test_a_us_job_over_rows_another_brand_host_holds_ends_done(env, monkeypatch, quiet_writer):  # noqa: F811
+    """Review of #2353 (P0): the job's products already exist under a DIFFERENT Tier-A host of the same
+    brand (frankbody.com). The REAL apply, primary-apply report and apply gate (evaluate_apply_log,
+    domain = the job's host) must pass: the gate refuses a readiness report whose canonical_urls name
+    another host, so a guard that kept frankbody.com's URL here failed the job after its writes."""
+    from services.catalog_enrichment_agent import primary_ingestion as pi, primary_readiness as pr
+
+    monkeypatch.setattr(writer, "apply_ingest_plan", _REAL_APPLY)
+    monkeypatch.setattr(pi, "require_primary_apply", _REAL_REQUIRE_APPLY)
+    j = _crawl_with(env, monkeypatch, None, domain="us.frankbody.com", brand="Frank Body")
+    j["status"] = "apply_due"
+    records = await feed.records_for_brand()
+    key = ingest_validated_jsonl(list(records))["pdps"][0]["product_key"]
+    db = _AppliedCatalog([{"product_key": key, "brand": "Frank Body", "source_domain": "frankbody.com",
+                           "canonical_url": "https://frankbody.com/products/velvet-lip-tint",
+                           "image_url": "https://cdn.example/i.jpg",
+                           "product_payload": json.dumps({"enrichment_meta": {"agent_version": "x"}})}])
+
+    async def readiness(plan, *, db):
+        # materialize_primary_readiness reads canonical_url back from the persisted row (_SOURCE_SQL).
+        written = {r["product_key"]: r for r in db.written("catalog_products")}
+        return {"status": "complete", "products": [
+            {"product_key": k, "canonical_url": written[k]["canonical_url"]} for k in sorted(written)]}
+    monkeypatch.setattr(pr, "materialize_primary_readiness", readiness)
+
+    out = await pipeline.run_stage(j, db=db)
+    assert (out["status"], out["outcome"]) == ("done", "applied"), env.ledger.transitions[-1]
+    assert db.written("catalog_products")[0]["canonical_url"].startswith("https://us.frankbody.com/")
 
 
 async def test_the_pipeline_hands_the_jobs_market_to_the_apply(env, monkeypatch):  # noqa: F811

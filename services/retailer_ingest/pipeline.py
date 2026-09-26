@@ -90,9 +90,9 @@ DEFAULT_MARKET = "US"
 #: plus that phase's writer change, never this list alone.
 INGEST_MARKETS = ("US",)
 _ISO_ALPHA2 = re.compile(r"[A-Z]{2}")
-#: Tier B (brand_official_domain_flags) matches the brand inside the store's /meta.json name after
-#: collapsing both to letters and digits. A brand shorter than this collapses to a string too common to
-#: be evidence ("ZA" is inside "BAZAAR"), so such a brand needs Tier A or a human, as before.
+#: Tier B (storefront_tier_b) needs the store's /meta.json name to start with the brand. A brand shorter
+#: than this (letters and digits) is too common a prefix to be evidence ("ZA Cosmetics" may be anyone's),
+#: so such a brand needs Tier A or a human, as before.
 TIER_B_MIN_BRAND_CHARS = 3
 #: The one shelf a reviewed set is re-filed to: canonical in both taxonomies (pivota-backend
 #: category_path_aliases, PIVOTA-Agent beautyTaxonomy.js `gift_set`).
@@ -250,33 +250,50 @@ def job_currency(options: Optional[Dict[str, Any]]) -> str:
     return pricing_currency_for_region(job_market(options))
 
 
-def _fold(value: Any) -> str:
-    """Casefolded letters and digits only: "Bali Body US" -> "balibodyus"."""
-    return "".join(c for c in str(value or "").casefold() if c.isalnum())
+def _tokens(value: Any) -> List[str]:
+    """Accent-folded, casefolded alphanumeric tokens: "Eco By Sonya USA" -> [eco, by, sonya, usa],
+    "e.l.f." -> [e, l, f], "Karen's" -> [karen, s]."""
+    import unicodedata
+    text = "".join(c for c in unicodedata.normalize("NFKD", str(value or "")) if not unicodedata.combining(c))
+    return "".join(c if c.isalnum() else " " for c in text.casefold()).split()
+
+
+#: A /meta.json name with one of these tokens is a store that SELLS the brand, never the brand's own
+#: ("Sukin Stockist USA"), however it starts.
+TIER_B_RESELLER_TOKENS = frozenset({
+    "stockist", "stockists", "distributor", "distributors", "distribution", "distributions", "pharmacy",
+    "chemist", "retailer", "outlet", "wholesale"})
 
 
 def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: str) -> Dict[str, Any]:
     """Tier B of the brand-official evidence ladder (multi-market storefronts ADR section 3.2): the
-    store's own /meta.json names the brand, ships to the job's market, and prices in that market's
-    currency. {"passed": bool, <each conjunct>: bool, + what was read}.
+    store's own /meta.json name STARTS with the brand, the store ships to the job's market, and prices
+    in that market's currency. {"passed": bool, <each conjunct>: bool, + what was read}.
 
-    CONJUNCTIVE on purpose: a name alone would pass a distributor's store that names the brand it
-    resells ("Sukin Stockist"), and a US-shipping USD store alone proves nothing about whose it is.
-    Measured positives (2026-09-26): "Sukin Naturals USA" (sukinnaturals.com), "Bali Body US"
-    (us.balibodyco.com), "MineTan USA", "DHC Skincare" -- each USD, ships_to [US]."""
+    The name rule is a token-boundary PREFIX, not containment: containment passed "REN" in "Karen's
+    Beauty Shop", "Tula" in "Tulane Pharmacy" and "e.l.f." in "Self Care Supply Co" (review of #2353).
+    The brand's tokens must be the name's first tokens, the name must carry no reseller token, and the
+    folded brand must be at least TIER_B_MIN_BRAND_CHARS long. Measured positives (prod /meta.json,
+    2026-09-26): "Sukin Naturals USA", "Bali Body US", "MooGoo USA", "Eco By Sonya USA", "esmi Skin",
+    "MineTan USA" -- each USD, ships_to [US].
+
+    CONJUNCTIVE on purpose: a name alone would pass a distributor's store that leads with the brand it
+    resells, and a US-shipping USD store alone proves nothing about whose it is."""
     from services.region_pricing import pricing_currency_for_region_or_none
     sf = storefront if isinstance(storefront, dict) else {}
-    want = _fold(brand)
+    want, name = _tokens(brand), _tokens(sf.get("name"))
     ships = sf.get("ships_to_countries")
     expected = pricing_currency_for_region_or_none(market)
     out: Dict[str, Any] = {
         "name": sf.get("name"), "myshopify_domain": sf.get("myshopify_domain"), "currency": sf.get("currency"),
         "market": market,
-        "name_contains_brand": len(want) >= TIER_B_MIN_BRAND_CHARS and want in _fold(sf.get("name")),
+        "name_starts_with_brand": len("".join(want)) >= TIER_B_MIN_BRAND_CHARS and name[:len(want)] == want,
+        "name_has_no_reseller_token": bool(name) and not (set(name) & TIER_B_RESELLER_TOKENS),
         "ships_to_market": isinstance(ships, list) and market in ships,
         "currency_is_market_currency": bool(expected) and sf.get("currency") == expected,
     }
-    out["passed"] = bool(out["name_contains_brand"] and out["ships_to_market"] and out["currency_is_market_currency"])
+    out["passed"] = bool(out["name_starts_with_brand"] and out["name_has_no_reseller_token"]
+                         and out["ships_to_market"] and out["currency_is_market_currency"])
     return out
 
 
@@ -337,8 +354,9 @@ def brand_official_domain_review(domain: str, brands: List[str], *, storefront: 
         flags.setdefault(key, {
             "key": key, "rule": "brand_official_domain_unproven", "severity": detectors.BLOCK,
             "detail": f"the domain name of {domain} is not the brand {brand!r}, and its /meta.json does not "
-                      f"prove it for {market} (name {tier_b['name']!r} names the brand: "
-                      f"{tier_b['name_contains_brand']}, ships to {market}: {tier_b['ships_to_market']}, "
+                      f"prove it for {market} (name {tier_b['name']!r} starts with the brand: "
+                      f"{tier_b['name_starts_with_brand']}, no reseller word: {tier_b['name_has_no_reseller_token']}, "
+                      f"ships to {market}: {tier_b['ships_to_market']}, "
                       f"{tier_b['currency']!r} is {market}'s currency: {tier_b['currency_is_market_currency']}); "
                       f"accept this key only if {domain} is {brand}'s own store (its rows become {brand}'s "
                       f"canonical rows)"})
