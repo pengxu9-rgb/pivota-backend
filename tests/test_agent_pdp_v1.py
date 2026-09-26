@@ -521,6 +521,20 @@ def test_an_unknown_signature_is_404_after_one_resolve(monkeypatch) -> None:
     assert len(db.calls) == 2
 
 
+def test_the_fallback_reads_with_the_same_gate_as_the_direct_lookup(monkeypatch) -> None:
+    """INDEX_ELIGIBLE_READ is ON in prod: an index-eligible, not serving-eligible product reached through a
+    stale sig is served exactly as it would be through its current id, and refused with the flag off."""
+    monkeypatch.setenv("INDEX_ELIGIBLE_READ", "true")
+    client, db = _client(monkeypatch, [_row()], sig_to_content_key={STALE_SIG: CK_A},
+                         serving_eligible_by_content_key={CK_A: False}, index_eligible_by_content_key={CK_A: True})
+    assert client.get(f"/api/agent/pdp/{STALE_SIG}").status_code == 200
+    assert "ips.index_eligible = TRUE" in db.calls[-1]["query"]
+    monkeypatch.delenv("INDEX_ELIGIBLE_READ", raising=False)
+    client, db = _client(monkeypatch, [_row()], sig_to_content_key={STALE_SIG: CK_A},
+                         serving_eligible_by_content_key={CK_A: False}, index_eligible_by_content_key={CK_A: True})
+    assert client.get(f"/api/agent/pdp/{STALE_SIG}").status_code == 404
+
+
 def test_the_signature_resolve_skips_tombstoned_rows() -> None:
     sql = " ".join(agent_pdp_v1.SIG_RESOLVE_SQL.split())
     assert "cp.suppressed_at IS NULL" in sql and "cp.content_key IS NOT NULL" in sql

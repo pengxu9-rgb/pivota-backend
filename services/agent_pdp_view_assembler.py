@@ -336,7 +336,7 @@ def _is_brand_store_row(row: Dict[str, Any]) -> bool:
     # take the product off serving, or serve it unsigned, never outranks a retailer's (review #2384).
     if len(str(row.get("description") or "").strip()) < MIN_DESCRIPTION_LENGTH:
         return False
-    if not row.get("image_url") or not row.get("pivota_signature_id"):
+    if not str(row.get("image_url") or "").strip() or not row.get("pivota_signature_id"):
         return False
     from services.offer_seller_identity import brand_owns_domain, host_from_url, is_known_retailer, normalize_host
 

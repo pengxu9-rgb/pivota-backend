@@ -60,6 +60,7 @@ def test_a_brand_store_proven_by_its_domain_alone_wins():
     # whole product off serving, and an unsigned winner loses the served id
     _row("ext:westman-atelier-lip-brush::56", host="westman-atelier.com", description="Brand serum.", bd=True),
     _row("ext:westman-atelier-lip-brush::57", host="westman-atelier.com", bd=True, image=None),
+    _row("ext:westman-atelier-lip-brush::59", host="westman-atelier.com", bd=True, image="  "),
     _row("ext:westman-atelier-lip-brush::58", host="westman-atelier.com", bd=True, sig=None),
     # a known retailer host never counts as the brand's store, whatever its offers say
     _row("ext:westman-atelier-lip-brush::55", host="sephora.com", bd=True),
