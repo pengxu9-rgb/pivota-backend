@@ -557,7 +557,13 @@ def test_refresh_external_seed_replaces_stale_localized_description_and_variants
     assert res.json()["status"] == "success"
 
     seed_data = stored_row["seed_data"]
-    assert stored_row["canonical_url"] == "https://theordinary.com/en-us/uv-filters-spf-45-serum-100720.html"
+    # THE SERVED URL STAYS THE ONE THE BUYER IS SENT TO. This used to assert the page's `/en-us/`
+    # canonical was stored -- but the click is minted from `destination_url` (still `/de-de/`),
+    # so the seed then served one page, sent buyers to another, and the refresh (which fetches
+    # `destination_url`) could never read it again. Correcting a seed's locale has to move
+    # `destination_url`; see `_next_served_canonical`. The page's claim is still recorded:
+    assert stored_row["canonical_url"] == "https://theordinary.com/de-de/uv-filters-spf-45-serum-100720.html"
+    assert seed_data["snapshot"]["canonical_url"] == "https://theordinary.com/en-us/uv-filters-spf-45-serum-100720.html"
     assert seed_data["description"] == "A lightweight SPF 45 sunscreen serum that protects and hydrates."
     assert seed_data["variants"][0]["description"] == "A lightweight SPF 45 sunscreen serum that protects and hydrates."
 
