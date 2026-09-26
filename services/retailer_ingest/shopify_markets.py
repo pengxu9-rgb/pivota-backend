@@ -33,9 +33,13 @@ per-host interval, robots.txt, 429/503 backoff). A 429/5xx stops the stage and r
 lane's backoff, like a throttled crawl. A 403, a non-JSON answer where JSON is due (a bot wall), or a
 redirect to another host is UNVERIFIABLE: the job fails with that reason, nothing is written, and
 nothing is retried or worked around. The two SESSION endpoints (/localization, /cart.js) are paced and
-backed off through the same gate but not robots-checked -- Shopify's default robots.txt disallows
-`/cart`, which is written for indexers and would make the approved evidence (a cart that reports USD)
-impossible to read at all; the exemption is exactly those two paths and is recorded on every run.
+backed off through the same gate but not robots-checked. The exemption is exactly those two paths, is
+recorded on every run, and is PENDING THE OWNER'S DECISION. What Shopify publishes (Help Center, "Editing
+robots.txt.liquid", checked 2026-09-26, "some of the key entries", not a complete list) is
+`Disallow: /cart/` -- with the slash, which a prefix match does NOT apply to `/cart.js` -- and no
+`/localization` rule; the template itself only renders `robots.default_groups`, whose full rule list is
+not published. So whether a given store's rendered robots.txt blocks either path is unknown here and was
+not probed.
 """
 
 from __future__ import annotations

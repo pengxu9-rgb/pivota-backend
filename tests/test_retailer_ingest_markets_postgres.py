@@ -230,9 +230,19 @@ async def test_an_acquisition_readback_on_postgres(db):
     await _product(db, key, content_key=ck)
     await _offer(db, PREFIX + "acq-aud", key)
     await _offer(db, PREFIX + "acq-us-store", key, currency="USD", market="US", host="mkt-gate-us.example")
+    # A shopify_markets USD sibling on THIS host (review of #2358, D1): the capture's, not the crawl's.
+    await _offer(db, PREFIX + "acq-sibling", key, currency="USD", market="US",
+                 source_system="shopify_markets_us_localization")
+    await db.execute("UPDATE catalog_offers SET suppressed_at = NOW() WHERE offer_id = :o",
+                     {"o": PREFIX + "acq-sibling"})  # suppressed here, so the leak case below stays a leak
+    await _offer(db, PREFIX + "acq-sibling-live", key, currency="USD", market="US",
+                 source_system="shopify_markets_us_localization", host="www." + HOST)
+    await db.execute("UPDATE catalog_offers SET merchant_effective_price = 0, list_price = 0 WHERE offer_id = :o",
+                     {"o": PREFIX + "acq-sibling-live"})  # live but unpriced: counted by the scope, never serving
     await _ips(db, ck, blocker="no_us_offer", serving=False)
     stored = await _readback([key], "AUD", db, market="AU", domain=HOST, planned_images={key: True})
-    assert stored["ok"], stored["problems"]  # the other storefront's USD offer is not this job's
+    assert stored["ok"], stored["problems"]  # neither the other storefront's offer nor the sibling is this job's
+    assert stored["rows"][0]["offers"] == 1
     assert [n["kind"] for n in stored["notes"]] == ["acquisition_not_served"]
     # Served: legitimate here, because the content_key carries a USD offer (the US store's).
     await _ips(db, ck, blocker="none", serving=True)

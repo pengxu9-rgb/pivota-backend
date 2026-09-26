@@ -1766,7 +1766,10 @@ DEFAULT_CANONICAL_MARKET = "US"
 #: What an offer-only apply keeps from the stored row. Each is filled from the plan only when the
 #: stored value is blank. (title and description are not in _PDP_UPSERT_SQL's DO UPDATE at all.)
 CANONICAL_OWNER_COLUMNS = ("source_domain", "canonical_url", "image_url", "product_payload")
-#: Rows named in counts["canonical_owner_kept"]; the count itself is always complete.
+#: Rows named in counts["canonical_owner_kept"], a DISPLAY sample; the count itself is always complete, and
+#: so is counts["canonical_owner_kept_by_host"], the per-(owner, writer) tally the apply gate decides on
+#: (scripts/curated_apply_gate.py). Never decide anything on the sample: a brand whose US store owns more
+#: than this many products would fail its AU apply after the writes (review of #2358, D2).
 CANONICAL_OWNER_KEPT_CAP = 50
 
 _CANONICAL_OWNER_SQL = """
@@ -1890,6 +1893,11 @@ async def _guard_canonical_owner(
     counts["pdps_offer_only_canonical_owner"] = len(kept)
     counts["incis_skipped_canonical_owner"] = len(incis) - len(plan["incis"])
     counts["canonical_owner_kept"] = kept[:CANONICAL_OWNER_KEPT_CAP]
+    tally: Dict[tuple, int] = {}
+    for k in kept:
+        tally[(k["owner"], k["writer"])] = tally.get((k["owner"], k["writer"]), 0) + 1
+    counts["canonical_owner_kept_by_host"] = [{"owner": o, "writer": w, "count": n}
+                                              for (o, w), n in sorted(tally.items())]
     logger.warning("apply_ingest_plan: %d product(s) applied offer-only, their canonical copy kept with its "
                    "owning storefront: %s", len(kept), kept[:CANONICAL_OWNER_KEPT_CAP])
     return plan, counts

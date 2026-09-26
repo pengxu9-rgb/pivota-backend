@@ -195,13 +195,14 @@ def _priced_for(con, product_key, regions):
     return bool(con.execute(sql, (product_key,)).fetchone()[0])
 
 
-def _classify(has_serving_region_offer):
+def _classify(has_serving_region_offer, has_acquisition_market_offer=None):
     """The index's REAL verdict for a content-complete row (services/index_pipeline_state_service)."""
     row = {"content_key": "ck", "sync_status": "live", "pdp_sync_status": "live", "pdp_title": "Face Hero",
            "seed_title": "Face Hero", "pdp_description": "x" * 200, "image_url": "https://cdn/x.jpg",
            "content_quality_score": 90.0, "has_price": True, "has_us_offer": has_serving_region_offer,
            "has_serving_region_offer": has_serving_region_offer, "product_group_id": "pg",
-           "category_path": "beauty/skincare/face-oil"}
+           "category_path": "beauty/skincare/face-oil",
+           "has_acquisition_market_offer": has_acquisition_market_offer}
     return ips._classify_product(row, set())
 
 
@@ -351,6 +352,10 @@ async def test_the_readback_counts_only_the_jobs_storefronts_offers():
     await pipeline._readback(["p1"], "AUD", db, market="AU", domain="www.GoToSkincare.com")
     assert db.values["hosts"] == ["gotoskincare.com", "www.gotoskincare.com"]
     assert db.sql.count("lower(o.source_domain) = ANY(:hosts)") == 3
+    # ...and to the offers THIS lane writes there: a shopify_markets sibling on the same host is not the
+    # crawl's (review of #2358, D1).
+    assert db.sql.count("o.source_system = :lane_source_system") == 3
+    assert db.values["lane_source_system"] == "catalog_enrichment_agent_v1" != markets.SOURCE_SYSTEM
     unscoped = _RB()
     await pipeline._readback(["p1"], "AUD", unscoped, market="AU")
     assert "hosts" not in unscoped.values and ":hosts" not in unscoped.sql
@@ -368,32 +373,35 @@ async def test_the_apply_reads_back_the_jobs_own_storefront(env, monkeypatch):  
     assert seen == ["k-touch.us"]
 
 
-async def test_an_au_job_over_a_product_the_us_store_owns_attaches_offers_and_ends_done(
-        env, monkeypatch, quiet_writer, gates_on):  # noqa: F811
+@pytest.mark.parametrize("owned", [1, writer.CANONICAL_OWNER_KEPT_CAP + 1])
+async def test_an_au_job_over_products_the_us_store_owns_attaches_offers_and_ends_done(
+        env, monkeypatch, quiet_writer, gates_on, owned):  # noqa: F811
     """frankbody.com (AU home store) after us.frankbody.com (the US store, canonical owner): the REAL apply
     keeps us.frankbody.com's copy (the canonical-owner guard, live for AU), writes the AUD offers stamped
-    AU, and the REAL apply gate accepts a readiness report whose canonical_url is the owner's because the
-    apply recorded it as kept for THIS host. Without that, the gate failed the job after its writes."""
+    AU, and the REAL apply gate accepts a readiness report whose canonical_urls are the owner's because the
+    apply tallied them as kept for THIS host. Without that, the gate failed the job after its writes -- and
+    with the gate reading the 50-row display sample, it still did at 51 products (review of #2358, D2)."""
     from services.catalog_enrichment_agent import primary_ingestion as pi, primary_readiness as pr
     from tests.services.test_retailer_ingest_explicit_market import _REAL_APPLY, _REAL_REQUIRE_APPLY
 
     monkeypatch.setattr(writer, "apply_ingest_plan", _REAL_APPLY)
     monkeypatch.setattr(pi, "require_primary_apply", _REAL_REQUIRE_APPLY)
-    scrub = feed.shopify_product_to_record(
-        {"id": 8101, "vendor": "Frank Body", "title": "Original Coffee Scrub 200g", "handle": "original-coffee-scrub",
-         "product_type": "Scrub", "body_html": "<p>A coffee scrub that polishes rough skin.</p>",
-         "images": [{"src": "https://cdn.shopify.com/fb/scrub.jpg"}],
-         "variants": [{"id": 44810200000001, "price": "24.95", "available": True, "sku": "OCS200"}]},
+    scrubs = [feed.shopify_product_to_record(
+        {"id": 8101 + i, "vendor": "Frank Body", "title": f"Original Coffee Scrub No {i} 200g",
+         "handle": f"original-coffee-scrub-{i}", "product_type": "Scrub",
+         "body_html": "<p>A coffee scrub that polishes rough skin.</p>",
+         "images": [{"src": f"https://cdn.shopify.com/fb/scrub-{i}.jpg"}],
+         "variants": [{"id": 44810200000001 + i, "price": "24.95", "available": True, "sku": f"OCS{i}"}]},
         domain="frankbody.com", category_path="beauty", brand_override="Frank Body", currency="AUD",
-        source_role="brand_official", emit_native_variants=True)
+        source_role="brand_official", emit_native_variants=True) for i in range(owned)]
 
     async def crawl(**kw):
-        batch = feed.ShopifyProductBatch([scrub], scanned_products=1, pages=1)
+        batch = feed.ShopifyProductBatch(scrubs, scanned_products=owned, pages=1)
         batch.crawl_report["storefront"] = {"name": "Frank Body", "myshopify_domain": "letsbefrank.myshopify.com",
                                             "currency": "AUD", "ships_to_countries": ["AU", "NZ"]}
         return batch
     monkeypatch.setattr(feed, "records_for_brand", crawl)
-    key = ingest_validated_jsonl([scrub])["pdps"][0]["product_key"]
+    keys = [p["product_key"] for p in ingest_validated_jsonl(scrubs)["pdps"]]
 
     class Owned(_Catalog):
         async def fetch_all(self, query, values=None):
@@ -405,9 +413,10 @@ async def test_an_au_job_over_a_product_the_us_store_owns_attaches_offers_and_en
                         for k in values["keys"]]
             return await super().fetch_all(query, values)
     db = Owned([{"product_key": key, "brand": "Frank Body", "source_domain": "us.frankbody.com",
-                 "canonical_url": "https://us.frankbody.com/products/original-coffee-scrub",
+                 "canonical_url": f"https://us.frankbody.com/products/scrub-{i}",
                  "image_url": "https://cdn.shopify.com/fbus/scrub.jpg",
-                 "product_payload": json.dumps({"enrichment_meta": {"source_role": "brand_official"}})}])
+                 "product_payload": json.dumps({"enrichment_meta": {"source_role": "brand_official"}})}
+                for i, key in enumerate(keys)])
 
     async def readiness(plan, *, db):
         written = {r["product_key"]: r for r in db.written("catalog_products")}
@@ -419,7 +428,8 @@ async def test_an_au_job_over_a_product_the_us_store_owns_attaches_offers_and_en
          "max_attempts": 6, "options": {"vendors": ["Frank Body"], "source_role": "brand_official", "market": "AU"}}
     out = await pipeline.run_stage(j, db=db)
     assert (out["status"], out["outcome"]) == ("done", "applied"), env.ledger.transitions[-1]
-    assert db.written("catalog_products")[0]["canonical_url"].startswith("https://us.frankbody.com/")
+    assert len(db.written("catalog_products")) == owned
+    assert all(r["canonical_url"].startswith("https://us.frankbody.com/") for r in db.written("catalog_products"))
     assert {(o["market"], o["currency"], o["source_domain"]) for o in db.written("catalog_offers")} == {
         ("AU", "AUD", "frankbody.com")}
 
@@ -842,8 +852,8 @@ class SqliteCatalog:
             self.con.execute("INSERT OR REPLACE INTO catalog_skus VALUES (?,?,?,NULL,NULL)",
                              (s["sku_key"], s["product_key"], s["source_variant_id"]))
         for o in plan["offers"]:
-            self.con.execute(
-                "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, offer_type, is_first_party,"
+            self.con.execute(  # a re-run of the crawl UPSERTS its own rows, as _OFFER_UPSERT_SQL does
+                "INSERT OR REPLACE INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, offer_type, is_first_party,"
                 " market, currency, list_price, merchant_effective_price, source_system, source_ref, source_domain,"
                 " offer_payload) VALUES (?,?,?,?,?,?,coalesce(?, 'US'),?,?,?,?,?,?,?)",
                 (o["offer_id"], o["sku_key"], o["product_key"], o["merchant_id"], o["offer_type"], o["is_first_party"],
@@ -859,16 +869,26 @@ class SqliteCatalog:
         return any(row[0] for row in self.con.execute(sql, (content_key,)))
 
     def verdict(self, content_key):
-        return _classify(self.priced_for(content_key, ips.serving_pricing_regions()))
+        acquisition = any(r[0] for r in self.con.execute(
+            f"SELECT {ips._HAS_ACQUISITION_MARKET_OFFER_EXISTS} FROM catalog_products cp WHERE cp.content_key = ?",
+            (content_key,)))
+        return _classify(self.priced_for(content_key, ips.serving_pricing_regions()), acquisition)
 
-    def _hosts_clause(self, values):
-        hosts = values.get("hosts")
-        return (" AND lower(o.source_domain) IN (%s)" % ",".join("?" * len(hosts)), list(hosts)) if hosts else ("", [])
+    def _scope_clause(self, sql, values):
+        """The readback's storefront scope, translated clause for clause from what the real SQL says."""
+        clause, args = "", []
+        if ":hosts" in sql:
+            clause += " AND lower(o.source_domain) IN (%s)" % ",".join("?" * len(values["hosts"]))
+            args += list(values["hosts"])
+        if ":lane_source_system" in sql:
+            clause += " AND o.source_system = ?"
+            args.append(values["lane_source_system"])
+        return clause, args
 
     async def fetch_all(self, sql, values):
         if "offers_in_market" in sql:  # the crawl job's readback
             out = []
-            clause, hosts = self._hosts_clause(values)
+            clause, hosts = self._scope_clause(sql, values)
             for key in values["keys"]:
                 p = self.con.execute("SELECT * FROM catalog_products WHERE product_key = ?", (key,)).fetchone()
                 v = self.verdict(p["content_key"])
@@ -1015,6 +1035,35 @@ async def test_an_aud_base_store_becomes_us_servable_only_through_its_usd_siblin
     for ck in content_keys:  # serving-eligible for the US, and only through the USD siblings
         assert catalog.verdict(ck)["serving_eligible"] is True
         assert catalog.priced_for(ck, ["US"]) and not catalog.priced_for(ck, ["SG"])
+
+
+async def test_the_runbook_re_runs_base_capture_base_capture_and_every_run_ends_done(two_jobs):
+    """Review of #2358 (D1): the storefront's AU crawl must stay re-runnable after its USD siblings exist on
+    the same host. Its readback counts the offers IT wrote there, not the capture's siblings."""
+    env, catalog, applied, store = two_jobs
+
+    async def both(make):
+        assert (await pipeline.run_stage(make(), db=catalog))["status"] == "apply_due"
+        out = await pipeline.run_stage(make("apply_due"), db=catalog)
+        assert (out["status"], out["outcome"]) == ("done", "applied"), env.ledger.transitions[-1]
+
+    await both(au_job)
+    await both(markets_job)
+    await both(au_job)        # the refresh: 5 AUD/AU base offers + 5 USD/US siblings on gotoskincare.com
+    await both(markets_job)   # and the capture refreshes its siblings in place
+    assert len(catalog.offers("market = 'AU'")) == 5 and len(catalog.offers("market = 'US'")) == 5
+
+
+async def test_stored_au_rows_stay_unservable_when_a_flag_off_process_recomputes_them(two_jobs, monkeypatch):
+    """Review of #2358 (D3): the stored AU rows, recomputed by a process with the agent-decision gate OFF."""
+    env, catalog, applied, store = two_jobs
+    await pipeline.run_stage(au_job(), db=catalog)
+    await pipeline.run_stage(au_job("apply_due"), db=catalog)
+    monkeypatch.setattr(gates, "agent_decision_gates_enabled", lambda: False)
+    monkeypatch.setattr(ips, "agent_decision_gates_enabled", lambda: False)
+    for ck in {p["content_key"] for plan, _market in applied for p in plan["pdps"]}:
+        verdict = catalog.verdict(ck)
+        assert (verdict["serving_eligible"], verdict["blocker_code"]) == (False, gates.BLOCKER_NO_US_OFFER)
 
 
 async def test_the_capture_refusal_writes_nothing_and_records_why(two_jobs, monkeypatch):

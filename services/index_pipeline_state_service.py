@@ -26,6 +26,7 @@ from services.agent_decision_gates import (
 from services.category_path_aliases import resolve as resolve_category_path
 from services.priced_offer_sql import priced_offer_exists_sql
 from services.region_pricing import (
+    acquisition_market_offer_exists_sql,
     has_offer_priced_for_any_region_sql,
     has_offer_priced_for_region_sql,
 )
@@ -451,6 +452,18 @@ def _classify_product(
             f"category_path {row.get('category_path')!r} does not resolve to a taxonomy LEAF; "
             "a row that has not been categorised cannot be retrieved by category"
         )
+    elif _acquisition_only_priced(row):
+        # NOT flag-gated, unlike the branch below. A product priced only in an acquisition market (AU/JP
+        # rows the retailer_ingest lane stores but must never serve) would otherwise be served by any
+        # process that recomputes this row with ENABLE_KBEAUTY_AGENT_DECISION_GATES off, because
+        # has_price above is currency-blind. Same code as the agent gate, so every reader of
+        # `no_us_offer` (the lane's readback, dashboards) keeps meaning "priced for no served region".
+        blocker_code = "no_us_offer"
+        blocker_detail = (
+            "priced only in an acquisition market (catalog_offers.market in "
+            "region_pricing.ACQUISITION_MARKETS) and in no currency a served region expects; "
+            "enforced whatever ENABLE_KBEAUTY_AGENT_DECISION_GATES says"
+        )
     elif agent_decision_gates_enabled():
         # Additive agent-decision-grade gates (PR4), only after all PDP gates
         # pass. Flag-gated, so default behavior is unchanged. Picked up by the
@@ -595,6 +608,20 @@ def _state_rank(state: Dict[str, Any]) -> tuple:
     )
 
 
+def _acquisition_only_priced(row: Dict[str, Any]) -> bool:
+    """True for a product whose priced offers include one DECLARED for an acquisition market (AU/JP) and
+    none in a currency a served region expects: stored, never served (multi-market storefronts ADR Phase 2).
+
+    NARROW ON PURPOSE. It needs `has_acquisition_market_offer`, which only a retailer_ingest AU/JP job can
+    make TRUE, so every row that existed before that lane wrote one -- the GBP/EUR/JPY no_us_offer residue
+    stamped market 'US' included -- classifies exactly as before, flag on or off. It is NOT
+    has_serving_region_offer made unconditional. A row computed by a query that lacks the column (None)
+    is left alone."""
+    if not row.get("has_acquisition_market_offer"):
+        return False
+    return not row.get("has_serving_region_offer", row.get("has_us_offer"))
+
+
 def _select_content_key_state(states: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Select one deterministic index state for a content_key group."""
     if not states:
@@ -674,6 +701,10 @@ _HAS_SERVING_REGION_OFFER_EXISTS = has_offer_priced_for_any_region_sql(
     "cp.product_key", serving_pricing_regions()
 )
 
+# A priced offer DECLARED for an acquisition market (AU/JP; multi-market storefronts ADR Phase 2). Read by
+# _acquisition_only_priced, the one serving rule that does NOT wait for ENABLE_KBEAUTY_AGENT_DECISION_GATES.
+_HAS_ACQUISITION_MARKET_OFFER_EXISTS = acquisition_market_offer_exists_sql("cp.product_key")
+
 _ELIGIBILITY_COLUMNS = f"""
     cp.content_key,
     cp.product_key,
@@ -733,6 +764,9 @@ _ELIGIBILITY_COLUMNS = f"""
     -- meaningful stored fact, and overloading its name with a configurable answer
     -- is how a column starts lying.
     {_HAS_SERVING_REGION_OFFER_EXISTS}      AS has_serving_region_offer,
+    -- An offer stamped for an acquisition market (AU/JP). FALSE for every row no retailer_ingest
+    -- AU/JP job has written: see _acquisition_only_priced.
+    {_HAS_ACQUISITION_MARKET_OFFER_EXISTS}      AS has_acquisition_market_offer,
     -- Category concern list (skin concern for skincare, hair concern for
     -- haircare); both read the shared concerns_json. The category-attributes
     -- gate selects which category_kind this blocks for.
@@ -941,6 +975,7 @@ SELECT
     -- concerns/actives are computed only on the Postgres path.
     {_HAS_US_OFFER_EXISTS} AS has_us_offer,
     {_HAS_SERVING_REGION_OFFER_EXISTS} AS has_serving_region_offer,
+    {_HAS_ACQUISITION_MARKET_OFFER_EXISTS} AS has_acquisition_market_offer,
     NULL AS has_category_concern,
     NULL AS has_key_actives,
     EXISTS (

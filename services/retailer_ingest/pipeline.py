@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from db import retailer_ingest as ledger
 from db.retailer_ingest import CatalogWriteLockBusy, CatalogWriteLockUnavailable
+from services.region_pricing import ACQUISITION_MARKETS
 from services.retailer_ingest import detectors
 from utils.logger import logger  # prod keeps this logger's output; plain module loggers' INFO is dropped
 
@@ -94,11 +95,13 @@ INGEST_MARKETS = ("US", "AU", "JP")
 #: Multi-market storefronts ADR Phase 2 (approved by Peng 2026-09-26): ACQUISITION markets. A job for
 #: one crawls the storefront's base currency (AUD/JPY) and stores its rows truthfully (market 'AU',
 #: currency 'AUD'); they are NOT served, because serving gates on the offer's currency against the
-#: served regions (index_pipeline_state has_serving_region_offer, PIVOTA_SERVING_PRICING_REGIONS = US,SG)
-#: and the agent-decision gate blocks them as no_us_offer. They become servable only when a USD sibling
+#: served regions (index_pipeline_state has_serving_region_offer, PIVOTA_SERVING_PRICING_REGIONS = US,SG):
+#: index_pipeline_state blocks a product priced only here as no_us_offer whatever
+#: ENABLE_KBEAUTY_AGENT_DECISION_GATES says (_acquisition_only_priced), and the agent-decision gate does too
+#: when it is on. They become servable only when a USD sibling
 #: lands (a source=shopify_markets job) or when the market itself is served (the ADR's Phase 3, a config
 #: change plus the seed-partition decision -- never this list alone).
-ACQUISITION_MARKETS = ("AU", "JP")
+#: (region_pricing.ACQUISITION_MARKETS, imported above: index_pipeline_state reads the same list.)
 _ISO_ALPHA2 = re.compile(r"[A-Z]{2}")
 #: Tier B (storefront_tier_b) needs the store's /meta.json name to start with the brand. A brand shorter
 #: than this (letters and digits) is too common a prefix to be evidence ("ZA Cosmetics" may be anyone's),
@@ -486,19 +489,22 @@ def _throttled(job: Dict[str, Any], stage: str, reason: str, *,
 
 
 def _require_acquisition_is_unserved(market: str) -> None:
-    """An acquisition-market job writes rows priced in a currency no served region expects, and the ONE
-    thing that keeps such a priced row off the serving surface is the agent-decision gate's no_us_offer
-    blocker (services/agent_decision_gates; index_pipeline_state recomputes it in THIS process when the
-    apply materializes readiness). With that gate off, index_pipeline_state serves any priced row, so an
-    AUD row would be served to US buyers. Refuse before any crawl rather than find out at readback."""
+    """An acquisition-market job writes rows priced in a currency no served region expects. TWO locks keep
+    them off the serving surface, and this job requires both: index_pipeline_state's acquisition rule
+    (`_acquisition_only_priced`, enforced in every process whatever the flag says -- the lock that holds
+    when some other process recomputes the row) and the agent-decision gate's no_us_offer blocker
+    (ENABLE_KBEAUTY_AGENT_DECISION_GATES; index_pipeline_state recomputes it in THIS process when the
+    apply materializes readiness). A job process with the gate off is misconfigured for this lane: refuse
+    before any crawl rather than run on one lock."""
     if market not in ACQUISITION_MARKETS:
         return
     from services.agent_decision_gates import agent_decision_gates_enabled
     if not agent_decision_gates_enabled():
         raise _Stop("acquisition_unguarded", "failed",
                     f"market {market} is an acquisition market (rows stored, not served), but "
-                    f"ENABLE_KBEAUTY_AGENT_DECISION_GATES is off in this process: nothing would stop its "
-                    f"{market} rows from serving. Turn the gate on for the job, then re-queue.")
+                    f"ENABLE_KBEAUTY_AGENT_DECISION_GATES is off in this process: only the index's "
+                    f"acquisition rule would keep its {market} rows from serving. Turn the gate on for the "
+                    f"job, then re-queue.")
 
 
 async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
@@ -739,8 +745,12 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
     AND stamped the job's market (catalog_offers.market): currency = market, always (multi-market
     storefronts ADR section 3.3). Scoped to the storefront because a product legitimately carries other
     storefronts' offers in other markets -- the Frank Body product holds us.frankbody.com's USD/US offer
-    AND frankbody.com's AUD/AU one -- and neither job may fail over the other's. `domain=None` counts
-    every offer of the product (a caller with no storefront). SG rows (market 'US', currency 'SGD',
+    AND frankbody.com's AUD/AU one -- and neither job may fail over the other's. And scoped to the offers
+    THIS LANE writes there (source_system = ingestion.AGENT_VERSION): a shopify_markets capture writes its
+    USD/US siblings on the SAME host (services/retailer_ingest/shopify_markets.py, source_system
+    shopify_markets_us_localization), as did the older scripts/capture_us_market_offers.py, so a re-run of
+    the storefront's AU crawl would otherwise count them as its own and fail after every write (review of
+    #2358, D1). `domain=None` counts every offer of the product (a caller with no storefront). SG rows (market 'US', currency 'SGD',
     because external_product_seeds.market is a hard serving partition) are never written by this lane:
     SG is not an INGEST_MARKET.
 
@@ -754,8 +764,10 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
         return {"ok": False, "reason": "no product keys to read back", "notes": [], "rows": []}
     from services.index_pipeline_state_service import _RESOLVED_PDP_SCOPES
     from services.priced_offer_sql import priced_offer_exists_sql
+    from services.catalog_enrichment_agent.ingestion import AGENT_VERSION
     hosts = _storefront_hosts(domain)
-    scoped = " AND lower(o.source_domain) = ANY(:hosts)" if hosts else ""
+    scoped = (" AND lower(o.source_domain) = ANY(:hosts) AND o.source_system = :lane_source_system"
+              if hosts else "")
     acquisition = market in ACQUISITION_MARKETS
     served_priced = ""
     if acquisition:
@@ -772,6 +784,7 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
                               "resolved_scopes": sorted(_RESOLVED_PDP_SCOPES)}
     if hosts:
         values["hosts"] = hosts
+        values["lane_source_system"] = AGENT_VERSION
     rows = await db.fetch_all(
         """
         SELECT p.product_key, p.category_path, coalesce(ips.serving_eligible, false) AS serving,

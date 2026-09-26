@@ -96,6 +96,26 @@ def pricing_currency_for_region(region: str) -> str:
         ) from None
 
 
+#: Multi-market storefronts ADR Phase 2: markets whose offers are ACQUIRED (stored with their real market
+#: and currency, catalog_offers.market 'AU'/'JP') but never served. The retailer_ingest lane allowlists them
+#: (services/retailer_ingest/pipeline.py) and index_pipeline_state refuses to serve a product priced ONLY
+#: there (acquisition_only_priced_sql), whatever ENABLE_KBEAUTY_AGENT_DECISION_GATES says. One list, here.
+ACQUISITION_MARKETS = ("AU", "JP")
+
+
+def acquisition_market_offer_exists_sql(product_key_expr: str, *, alias: str = "co") -> str:
+    """``EXISTS`` a priced, unsuppressed offer DECLARED for an acquisition market (catalog_offers.market).
+
+    Only the retailer_ingest lane writes such a stamp (it declares its job's market; every other writer
+    leaves the column's DEFAULT 'US'), so this is FALSE for every row that existed before that lane wrote
+    an AU/JP job -- which is what makes the serving rule built on it a zero-change rule for them."""
+    markets = ", ".join(f"'{m}'" for m in ACQUISITION_MARKETS)
+    return priced_offer_exists_sql(
+        product_key_expr, alias=alias,
+        extra_predicate=f"upper(trim(coalesce({alias}.market, ''))) IN ({markets})",
+    )
+
+
 def require_market_currency(market: str, currency: Optional[str]) -> str:
     """The ONE writer-side rule "currency = market": an offer declared for `market` must be priced
     in that market's currency. Returns the canonical market code; raises ValueError otherwise.

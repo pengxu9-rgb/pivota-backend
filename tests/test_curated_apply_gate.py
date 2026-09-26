@@ -226,31 +226,51 @@ def test_the_report_must_be_for_the_host_this_runner_applied():
     assert "report_for_another_host" in empty["reasons"]
 
 
-def _owned_elsewhere(kept):
-    """The first product's canonical_url is us.eyurs.com's: another brand-official storefront owns that copy,
-    and an off-canonical-market apply keeps it (apply._guard_canonical_owner, multi-market storefronts ADR
-    Phase 2). `kept` is the apply's own record of that (owner, writer), or None when it recorded nothing."""
+def _owned_elsewhere(kept, *, owned=1, sample=None):
+    """`owned` products whose canonical_url is us.eyurs.com's: another brand-official storefront owns those
+    copies, and an off-canonical-market apply keeps them (apply._guard_canonical_owner, multi-market
+    storefronts ADR Phase 2). `kept` is the apply's own complete tally of that as (owner, writer, count), or
+    None when it recorded nothing; `sample` rows go in canonical_owner_kept, the 50-row display list."""
     def mutate(report):
-        first = report["applied"]["primary_readiness"]["products"][0]
-        first["canonical_url"] = "https://us.eyurs.com/products/x"
+        products = report["applied"]["primary_readiness"]["products"]
+        template = dict(products[0])
+        extra = [dict(template, product_key=f"{template['product_key']}-owned-{i}") for i in range(owned)]
+        for p in extra:
+            p["canonical_url"] = "https://us.eyurs.com/products/x"
+        products.extend(extra)
+        report["applied"]["canonical_owner_kept"] = [
+            {"product_key": p["product_key"], "owner": "us.eyurs.com", "writer": "eyurs.com", "market": "AU"}
+            for p in extra[:owned if sample is None else sample]]
         if kept is not None:
-            owner, writer = kept
-            report["applied"]["canonical_owner_kept"] = [
-                {"product_key": first["product_key"], "owner": owner, "writer": writer, "market": "AU"}]
+            owner, writer, count = kept
+            report["applied"]["canonical_owner_kept_by_host"] = [{"owner": owner, "writer": writer, "count": count}]
     return _with_post_apply(mutate)
 
 
-def test_a_product_the_apply_kept_under_its_owner_is_this_hosts_report():
-    assert evaluate_apply_log(_owned_elsewhere(("us.eyurs.com", "eyurs.com")), domain="eyurs.com")["ok"] is True
-    assert evaluate_apply_log(_owned_elsewhere(("us.eyurs.com", "www.eyurs.com")), domain="eyurs.com")["ok"] is True
+def test_products_the_apply_kept_under_their_owner_are_this_hosts_report():
+    assert evaluate_apply_log(_owned_elsewhere(("us.eyurs.com", "eyurs.com", 1)), domain="eyurs.com")["ok"] is True
+    assert evaluate_apply_log(_owned_elsewhere(("us.eyurs.com", "www.eyurs.com", 1)), domain="eyurs.com")["ok"] is True
+
+
+def test_the_gate_decides_on_the_complete_tally_not_the_50_row_sample():
+    """Review of #2358 (D2): an AU crawl of a brand whose US store owns 51+ products listed only 50 in the
+    display sample, and the gate failed the job after its writes."""
+    from services.catalog_enrichment_agent.apply import CANONICAL_OWNER_KEPT_CAP
+    many = CANONICAL_OWNER_KEPT_CAP + 1
+    text = _owned_elsewhere(("us.eyurs.com", "eyurs.com", many), owned=many, sample=CANONICAL_OWNER_KEPT_CAP)
+    assert evaluate_apply_log(text, domain="eyurs.com")["ok"] is True
+    short = _owned_elsewhere(("us.eyurs.com", "eyurs.com", many - 1), owned=many, sample=CANONICAL_OWNER_KEPT_CAP)
+    verdict = evaluate_apply_log(short, domain="eyurs.com")
+    assert verdict["ok"] is False and "report_for_another_host" in verdict["reasons"]
 
 
 @pytest.mark.parametrize("kept", [
-    None,                                   # another host's URL the apply never said it kept
-    ("us.eyurs.com", "ohlolly.com"),        # kept, but by ANOTHER host's apply: a stale or mis-pointed log
-    ("somewhere-else.com", "eyurs.com"),    # the URL is not the owner the apply recorded
+    None,                                       # another host's URL the apply never tallied (the sample alone)
+    ("us.eyurs.com", "ohlolly.com", 1),         # kept, but by ANOTHER host's apply: a stale or mis-pointed log
+    ("somewhere-else.com", "eyurs.com", 1),     # the URL is not the owner the apply recorded
+    ("us.eyurs.com", "eyurs.com", 0),           # the apply kept none there
 ])
-def test_only_a_product_kept_for_this_host_under_that_owner_is_excused(kept):
+def test_only_products_kept_for_this_host_under_that_owner_are_excused(kept):
     verdict = evaluate_apply_log(_owned_elsewhere(kept), domain="eyurs.com")
     assert verdict["ok"] is False and "report_for_another_host" in verdict["reasons"]
 
