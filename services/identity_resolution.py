@@ -78,7 +78,22 @@ def new_proposal(
             raise ValueError("keeper must be one of subject_product_keys")
         if len(set(subject_product_keys)) < 2:
             raise ValueError("suppress_dup needs at least two subject rows")
+    if kind == "attach_membership":
+        # ONE listing joins the keeper's product (content_key + product group); nothing is suppressed.
+        if not keeper_product_key:
+            raise ValueError("attach_membership requires a keeper_product_key (the product joined)")
+        if len(set(subject_product_keys)) != 2 or keeper_product_key not in set(subject_product_keys):
+            raise ValueError("attach_membership subjects are exactly [listing, keeper]")
+        needed = {"listing_product_key", "from_content_key", "from_product_group_id", "to_product_group_id"}
+        if not needed <= set(evidence or {}):
+            raise ValueError(f"attach_membership evidence needs {sorted(needed)}")
     fp = member_fingerprint(subject_product_keys)
+    if kind == "attach_membership":
+        # The move itself is the subject: a listing that drifted (new content_key or group) mints a NEW
+        # proposal instead of deduping onto a stale one the drift guard would skip forever.
+        ev = evidence or {}
+        fp = member_fingerprint([*subject_product_keys, *(f"{k}={ev[k]}" for k in (
+            "from_content_key", "from_product_group_id", "to_product_group_id"))])
     pkey = proposal_key(strategy, merchant_id, content_key, fp)
     return {
         "proposal_id": "irp_" + hashlib.sha256(pkey.encode("utf-8")).hexdigest()[:32],
@@ -219,6 +234,34 @@ RETURNING proposal_id
 """
 
 
+# attach_membership: every write is conditional on the value captured at propose time, so a row that
+# moved since (a re-crawl, another run) is left alone -- and revert moves back only what still holds
+# the value this run wrote.
+ATTACH_ROW_SQL = """
+SELECT product_key, merchant_id, platform, source_product_id, content_key, suppression_reason
+FROM catalog_products WHERE product_key = $1
+"""
+
+MEMBER_GROUP_SQL = """
+SELECT product_group_id FROM product_group_members
+WHERE merchant_id = $1 AND platform = $2 AND platform_product_id = $3
+"""
+
+MOVE_CONTENT_KEY_SQL = """
+UPDATE catalog_products SET content_key = $2, updated_at = NOW()
+WHERE product_key = $1 AND content_key = $3 AND suppression_reason IS NULL
+"""
+
+LEFT_BEHIND_SQL = """
+SELECT count(*) FROM catalog_products WHERE content_key = $1 AND suppression_reason IS NULL
+"""
+
+MOVE_GROUP_SQL = """
+UPDATE product_group_members SET product_group_id = $4, updated_at = NOW()
+WHERE merchant_id = $1 AND platform = $2 AND platform_product_id = $3 AND product_group_id = $5
+"""
+
+
 def _now_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -306,6 +349,55 @@ async def _apply_suppress_dup(conn, p: Dict[str, Any], run_id: str) -> Dict[str,
             "deactivated_seed_ids": seed_ids, "keeper": keeper}
 
 
+def _rowcount(result: Any) -> int:
+    try:
+        return int(str(result).split()[-1] or 0)
+    except (ValueError, IndexError):
+        return 0
+
+
+async def _apply_attach_membership(conn, p: Dict[str, Any], run_id: str) -> Dict[str, Any]:
+    """One attach_membership proposal: the listing takes the keeper's content_key and product group.
+
+    Drift guard: the listing must still carry the content_key and group captured at propose time, and
+    the keeper must still be live on the proposal's content_key in the recorded group. Anything else
+    is skipped (left approved), never forced."""
+    ev = p.get("evidence") or {}
+    listing_key, keeper = ev["listing_product_key"], p["keeper_product_key"]
+    listing = await conn.fetchrow(ATTACH_ROW_SQL, listing_key)
+    target = await conn.fetchrow(ATTACH_ROW_SQL, keeper)
+    if not listing or listing["suppression_reason"] is not None:
+        return {"skipped": "listing_not_live"}
+    if not target or target["suppression_reason"] is not None:
+        return {"skipped": "keeper_not_live"}
+    if listing["content_key"] != ev["from_content_key"]:
+        return {"skipped": "listing_content_key_drift"}
+    if target["content_key"] != p["content_key"]:
+        return {"skipped": "keeper_content_key_drift"}
+    listing_group = await conn.fetchval(
+        MEMBER_GROUP_SQL, listing["merchant_id"], listing["platform"], listing["source_product_id"])
+    keeper_group = await conn.fetchval(
+        MEMBER_GROUP_SQL, target["merchant_id"], target["platform"], target["source_product_id"])
+    if listing_group != ev["from_product_group_id"]:
+        return {"skipped": "listing_group_drift"}
+    if keeper_group != ev["to_product_group_id"]:
+        return {"skipped": "keeper_group_drift"}
+
+    moved_ck = _rowcount(await conn.execute(
+        MOVE_CONTENT_KEY_SQL, listing_key, p["content_key"], ev["from_content_key"]))
+    moved_pg = _rowcount(await conn.execute(
+        MOVE_GROUP_SQL, listing["merchant_id"], listing["platform"], listing["source_product_id"],
+        ev["to_product_group_id"], ev["from_product_group_id"]))
+    if moved_ck != 1 or moved_pg != 1:
+        raise RuntimeError(f"attach_membership {p['proposal_id']}: moved content_key={moved_ck} group={moved_pg}")
+    return {"attached": listing_key, "keeper": keeper,
+            "merchant_id": listing["merchant_id"], "platform": listing["platform"],
+            "source_product_id": listing["source_product_id"],
+            "from_content_key": ev["from_content_key"], "to_content_key": p["content_key"],
+            "from_product_group_id": ev["from_product_group_id"],
+            "to_product_group_id": ev["to_product_group_id"]}
+
+
 async def apply_approved(
     conn,
     *,
@@ -322,12 +414,15 @@ async def apply_approved(
 
     applied: List[str] = []
     skipped: List[Tuple[str, str]] = []
+    vacated: set = set()
     async with conn.transaction():
         for p in proposals:
             if isinstance(p.get("evidence"), str):
                 p["evidence"] = json.loads(p["evidence"] or "{}")
             if p["kind"] == "suppress_dup":
                 detail = await _apply_suppress_dup(conn, p, run_id)
+            elif p["kind"] == "attach_membership":
+                detail = await _apply_attach_membership(conn, p, run_id)
             elif p["kind"] == "label_only":
                 detail = {"labeled": True}
             else:
@@ -341,6 +436,15 @@ async def apply_approved(
             )
             await conn.execute(MARK_APPLIED_SQL, p["proposal_id"], run_id)
             applied.append(p["proposal_id"])
+            if detail.get("attached"):
+                vacated.add(detail["from_content_key"])
+        # attach_membership post-check, after EVERY move of the run: a live row left on a content_key a
+        # listing moved off (one written since propose time, or a sibling skipped for drift) would pull the
+        # listing back on its next crawl and fail its store's job. Fail the run loudly, like suppress_dup.
+        for ck in sorted(vacated):
+            left = await conn.fetchval(LEFT_BEHIND_SQL, ck)
+            if left:
+                raise RuntimeError(f"post-check failed for run {run_id}: {left} live row(s) left on {ck}")
     return {"run_id": run_id, "applied": applied, "skipped": skipped}
 
 
@@ -352,11 +456,32 @@ async def revert_run(conn, run_id: str) -> Dict[str, Any]:
         rows = await conn.fetch(REVERT_ROWS_SQL, run_id)
         restored = [r["product_key"] for r in rows]
         seed_ids: List[str] = []
+        detached: List[Dict[str, Any]] = []
         for ev in await conn.fetch(RUN_EVENTS_SQL, run_id):
             detail = ev["detail"]
             if isinstance(detail, str):
                 detail = json.loads(detail or "{}")
             seed_ids.extend(detail.get("deactivated_seed_ids") or [])
+            if detail.get("attached"):
+                # All or nothing per listing: move back only when BOTH still hold this run's values,
+                # else leave the listing where something else has since put it.
+                now = await conn.fetchrow(ATTACH_ROW_SQL, detail["attached"])
+                now_group = await conn.fetchval(
+                    MEMBER_GROUP_SQL, detail["merchant_id"], detail["platform"], detail["source_product_id"])
+                if (not now or now["suppression_reason"] is not None
+                        or now["content_key"] != detail["to_content_key"]
+                        or now_group != detail["to_product_group_id"]):
+                    detached.append({**detail, "reverted": False, "why": "moved_since_run"})
+                    continue
+                ck = _rowcount(await conn.execute(
+                    MOVE_CONTENT_KEY_SQL, detail["attached"], detail["from_content_key"],
+                    detail["to_content_key"]))
+                pg = _rowcount(await conn.execute(
+                    MOVE_GROUP_SQL, detail["merchant_id"], detail["platform"], detail["source_product_id"],
+                    detail["from_product_group_id"], detail["to_product_group_id"]))
+                if ck != 1 or pg != 1:
+                    raise RuntimeError(f"revert {run_id}: {detail['attached']} moved content_key={ck} group={pg}")
+                detached.append({**detail, "reverted": True})
         reactivated = []
         if seed_ids:
             reactivated = [
@@ -367,7 +492,9 @@ async def revert_run(conn, run_id: str) -> Dict[str, Any]:
         ]
         await conn.execute(
             INSERT_EVENT_SQL, None, "reverted", run_id,
-            json.dumps({"restored_rows": restored, "reactivated_seeds": reactivated}),
+            json.dumps({"restored_rows": restored, "reactivated_seeds": reactivated,
+                        "detached": detached}),
         )
     return {"run_id": run_id, "restored_rows": restored,
-            "reactivated_seeds": reactivated, "proposals_reverted": reverted}
+            "reactivated_seeds": reactivated, "proposals_reverted": reverted,
+            "detached": detached}
