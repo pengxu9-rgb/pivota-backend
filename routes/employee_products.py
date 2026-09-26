@@ -17,7 +17,7 @@ import logging
 import time
 import math
 import re
-from urllib.parse import urlparse, urlsplit
+from urllib.parse import urlparse
 from urllib.parse import parse_qsl, urlencode, urlunparse
 from datetime import datetime, timezone, timedelta
 
@@ -34,6 +34,7 @@ from models.standard_product import StandardProduct
 from utils.auth import get_current_employee, require_employee_permissions
 
 from services import external_seed_destination_liveness as destination_liveness
+from services import seed_served_url
 from services.external_offers_service import (
     ExternalOfferUnavailable,
     resolve_external_offer,
@@ -2185,6 +2186,9 @@ async def _run_external_seed_import_task(
             "updated": result.updated,
             "errors_count": len(result.errors or []),
             "seed_ids_count": len(result.seedIds or []),
+            # The task table has no warnings column; `stats` is returned by the task view.
+            "warnings_count": len(result.warnings or []),
+            "warnings": list(result.warnings or [])[:200],
         }
 
         await database.execute(
@@ -2256,6 +2260,7 @@ async def get_external_seed_import_task(
             "created": int(data.get("created_count") or 0),
             "updated": int(data.get("updated_count") or 0),
             "errors": [str(x) for x in _ensure_json_list(data.get("errors")) if str(x)],
+            "warnings": [str(x) for x in _ensure_json_list(_ensure_json_obj(data.get("stats")).get("warnings")) if str(x)],
             "seedIds": [str(x) for x in _ensure_json_list(data.get("seed_ids")) if str(x)],
             "error": data.get("error"),
             "stats": _ensure_json_obj(data.get("stats")),
@@ -2780,6 +2785,12 @@ async def _import_external_seeds_csv_text(
                 canonical_url = str(row.get("canonical_url") or row.get("canonicalUrl") or "").strip() or None
                 if canonical_url:
                     canonical_url = _normalize_seed_url_for_id(_require_http_url(canonical_url))
+                # IDENTITY IS NOT THE SERVED URL. `external_product_id` has always been derived
+                # from the operator's canonical when one is given, and re-imports find their row
+                # by it; deriving it from the replacement below changed the id of every existing
+                # seed whose CSV canonical was not its destination (review of #2374).
+                id_basis_url = canonical_url or dest
+                if canonical_url:
                     # An operator-supplied canonical is kept only when it is this row's
                     # destination (`_canonical_for_destination`); otherwise the row would serve
                     # one page, send buyers to `destination_url`, and never refresh again.
@@ -2794,7 +2805,8 @@ async def _import_external_seeds_csv_text(
                 except Exception:
                     domain = None
 
-                external_product_id = str(row.get("external_product_id") or "").strip() or _stable_external_product_id(canonical_url or dest)
+                explicit_external_product_id = str(row.get("external_product_id") or "").strip()
+                external_product_id = explicit_external_product_id or _stable_external_product_id(id_basis_url)
                 if not external_product_id:
                     raise ValueError("MISSING_EXTERNAL_PRODUCT_ID")
 
@@ -2867,7 +2879,10 @@ async def _import_external_seeds_csv_text(
 
                     update_values: Dict[str, Any] = {
                         "id": seed_id,
-                        "external_product_id": external_product_id,
+                        # An existing seed keeps its identity unless the CSV names one outright.
+                        "external_product_id": explicit_external_product_id
+                        or existing.get("external_product_id")
+                        or external_product_id,
                         "destination_url": dest,
                         "canonical_url": canonical_url_update,
                         "domain": domain_update,
@@ -3835,7 +3850,12 @@ async def create_external_seed(
         snap_variants = seed_variants_from_evidence(evidence)
 
     match_url = canonical_url or dest
-    existing_row = await database.fetch_one(
+    # THE SEED THIS CREATION UPDATES IS ONE WHOSE OWN DESTINATION IS `dest`. A row can still
+    # carry a poisoned canonical (another shade's URL, written by the old refresh) until
+    # `reset_unreadable_canonical_urls.py` runs; matching on that canonical alone would rewrite
+    # the other shade's seed. Candidates are found broadly, then kept only if their
+    # `destination_url` is this destination (`_same_destination`).
+    candidate_rows = await database.fetch_all(
         """
         SELECT *
         FROM external_product_seeds
@@ -3844,9 +3864,13 @@ async def create_external_seed(
           AND tool = :tool
           AND (canonical_url IN (:match_url, :dest) OR destination_url IN (:match_url, :dest))
         ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
+        LIMIT 20
         """,
         {"market": market, "tool": tool, "match_url": match_url, "dest": dest},
+    )
+    existing_row = next(
+        (r for r in candidate_rows if _same_destination(dest, dict(r).get("destination_url"))),
+        None,
     )
 
     # Merge: employee-provided fields override snapshot-derived values.
@@ -4011,7 +4035,9 @@ async def create_external_seed(
               AND status = 'active'
               AND market = :market
               AND tool = :tool
-              AND (canonical_url IN (:match_url, :dest) OR destination_url IN (:match_url, :dest))
+              -- Only seeds for THIS destination; never one matched through a canonical
+              -- (a poisoned canonical would disable another shade's seed).
+              AND destination_url IN (:match_url, :dest)
             """,
             {
                 "id": seed_id,
@@ -4483,41 +4509,9 @@ async def update_external_seed(
     return {"status": "success", "projected": projected}
 
 
-def _destination_key(url: Optional[str]) -> Optional[Tuple[Any, ...]]:
-    text = str(url or "").strip().rstrip("/")
-    if not text:
-        return None
-    try:
-        parts = urlsplit(text)
-        port = parts.port
-    except ValueError:
-        return (text,)
-    host = (parts.hostname or "").lower()
-    if not host:
-        return (text,)
-    if host.startswith("www."):
-        host = host[len("www."):]
-    return (parts.scheme.lower(), host, port, parts.path.rstrip("/"), parts.query, parts.fragment)
-
-
-def _same_destination(fetched: Optional[str], served: Optional[str]) -> bool:
-    """Is the URL this refresh fetched the same one the serving lane hands out?
-
-    Compared after trimming and dropping a trailing slash — the two columns are written by
-    different code paths and differ cosmetically far more often than they differ in substance.
-    The HOST is compared case-insensitively and without a leading `www.`: the refresh writes
-    `canonical_url` from the page it fetched, and a store whose canonical tag names `www.`
-    turned a bare-domain `destination_url` into a permanent mismatch -- every later refresh
-    was `not_read`, so the row could never be re-read again. Measured 2026-09-26: 200
-    gate-fresh seeds (all 182 dodoskin rows, 8 eyurs incl. the Round Lab sunscreen whose stale
-    16.0 started #2340). Everything else -- scheme, port, path, query, fragment -- is
-    deliberately NOT normalised: on a storefront a differing query string can select a
-    different variant, and a different path is a different product (fenty's canonical names a
-    sibling shade's handle), so treating those as the same URL would reintroduce exactly the
-    mis-attribution this guard exists to prevent.
-    """
-    a = _destination_key(fetched)
-    return a is not None and a == _destination_key(served)
+# ONE RULE, in services/seed_served_url (the enrichment agent's seed upsert uses it too).
+_destination_key = seed_served_url.destination_key
+_same_destination = seed_served_url.same_destination
 
 
 def _read_the_served_product(
@@ -4559,23 +4553,7 @@ def _read_the_served_product(
     return observation, read
 
 
-def _canonical_for_destination(dest: Optional[str], *candidates: Optional[str]) -> Optional[str]:
-    """The canonical_url to store beside `dest`: the first candidate that IS `dest`, else `dest`.
-
-    For the writers that set `destination_url` in the same statement (seed creation, CSV import)
-    and for the preview that shows what creation would store. `canonical_url` is the served URL
-    (`destination_of` reads it first) and the click is minted from `destination_url`, so any
-    stored canonical that is not the same destination (`_same_destination`) makes the seed serve
-    one page and send buyers to another, and locks it out of every refresh. Candidates are the
-    page's canonical tag, an operator-supplied value, or the row's existing canonical -- each a
-    claim to be checked, not a value to trust. Same rule the refresh applies in
-    `_next_served_canonical`, minus the read requirement: these writers store `dest` itself.
-    """
-    for candidate in candidates:
-        text = str(candidate or "").strip()
-        if text and _same_destination(dest, text):
-            return text
-    return dest
+_canonical_for_destination = seed_served_url.canonical_for_destination
 
 
 def _next_served_canonical(
@@ -5455,8 +5433,14 @@ async def _refresh_external_seed_by_id(
     await _execute_seed_data_stmt(
         """
         UPDATE external_product_seeds
-        SET canonical_url = :canonical_url,
-            domain = :domain,
+        -- THE SERVED URL MOVES ONLY FROM WHAT THIS REFRESH READ. Both CASEs test the row's
+        -- canonical as it was before this statement (Postgres evaluates SET against the old
+        -- row), so a concurrent writer -- `scripts/ops/reset_unreadable_canonical_urls.py` -- that
+        -- changed it after our read is never undone by writing our stale copy back.
+        SET canonical_url = CASE WHEN canonical_url IS NOT DISTINCT FROM :read_canonical_url
+                                 THEN :canonical_url ELSE canonical_url END,
+            domain = CASE WHEN canonical_url IS NOT DISTINCT FROM :read_canonical_url
+                          THEN :domain ELSE domain END,
             title = COALESCE(title, :title),
             image_url = COALESCE(image_url, :image_url),
             price_amount = :price_amount,
@@ -5483,6 +5467,7 @@ async def _refresh_external_seed_by_id(
         {
             "id": seed_id,
             "read_the_served_product": bool(read_the_served_product),
+            "read_canonical_url": row.get("canonical_url"),
             "canonical_url": served_canonical,
             "domain": served_domain,
             "title": snap_title,

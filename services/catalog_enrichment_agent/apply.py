@@ -22,7 +22,8 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from services.catalog_enrichment_agent.bulk_writer import bulk_upsert
-from services.catalog_enrichment_agent.ingestion import AGENT_VERSION, derive_offer_id
+from services.catalog_enrichment_agent.ingestion import AGENT_VERSION, _domain_of, derive_offer_id
+from services.seed_served_url import canonical_for_destination
 from services.catalog_offer_writer_guard import (
     WriterAuditAccumulator,
     guard_catalog_offer_rows,
@@ -494,6 +495,31 @@ _SEED_UPSERT_SQL = """
                   seed_kind = COALESCE(EXCLUDED.seed_kind, external_product_seeds.seed_kind),
                   updated_at = NOW()
                 """
+
+
+def _seed_with_served_canonical(seed: Dict[str, Any]) -> Dict[str, Any]:
+    """The plan's seed row with a `canonical_url` that IS its `destination_url`, or the row as is.
+
+    `canonical_url` is the served URL (`destination_of` reads it first) and `_SEED_UPSERT_SQL`
+    overwrites it -- and `destination_url` -- on every re-apply. A plan offer whose canonical
+    names another page (a sibling shade, another host or locale) would make the seed serve one
+    page, send buyers to `destination_url`, and never be re-read by the seed refresh. Applied at
+    the WRITE, not in the plan builder, so a stored plan replayed later gets the same rule.
+    Same rule as seed creation and CSV import (`services.seed_served_url`). When the canonical
+    is replaced, `domain` follows it the way the builder derives it (`_domain_of`).
+    """
+    dest = seed.get("destination_url")
+    canonical = seed.get("canonical_url")
+    if not canonical or not dest:
+        return seed
+    served = canonical_for_destination(dest, canonical)
+    if served == canonical:
+        return seed
+    logger.warning(
+        "enrichment seed %s: canonical_url %s is not its destination; storing %s",
+        seed.get("id"), canonical, served,
+    )
+    return {**seed, "canonical_url": served, "domain": _domain_of(served)}
 
 
 async def _derive_seed_seller_for_plan_row(seed: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
@@ -2109,6 +2135,7 @@ async def _apply_ingest_plan(
             # synthetic `pk_<hash>` (no tenant anchor) → these resolve CROSS to an
             # observed seller. NULL only when unmintable (derive logs loudly) —
             # never assumed 'self'.
+            seed = _seed_with_served_canonical(seed)
             seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(seed)
             await database.execute(
                 _SEED_UPSERT_SQL,
@@ -2298,6 +2325,7 @@ async def _apply_ingest_plan_batched(
     # 5. external_product_seeds — per-row seller derivation (ADR-009 D3), then bulk.
     seed_rows = []
     for seed in seeds:
+        seed = _seed_with_served_canonical(seed)
         try:
             seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(seed)
         except Exception as exc:  # noqa: BLE001 — same skip semantics as the per-row

@@ -185,11 +185,16 @@ def _seed_row(
     }
 
 
+_CAPTURED_SQL: List[Any] = []
+
+
 def _refresh(monkeypatch: pytest.MonkeyPatch, row: Dict[str, Any], page, *, reached: bool = True):
     """Drive the real refresh; return (result, the persisted row)."""
     import routes.employee_products as mod
 
     stored = copy.deepcopy(row)
+    captured_sql = _CAPTURED_SQL
+    captured_sql.clear()
 
     async def fake_fetch_one(_q, values=None):
         return stored if values and values.get("id") == stored["id"] else None
@@ -200,7 +205,10 @@ def _refresh(monkeypatch: pytest.MonkeyPatch, row: Dict[str, Any], page, *, reac
         persisted = json.loads(json.dumps(values, default=str))
         if isinstance(persisted.get("seed_data"), str):
             persisted["seed_data"] = json.loads(persisted["seed_data"])
-        stored.update({k: v for k, v in persisted.items() if k not in ("id", "read_the_served_product")})
+        stored.update(
+            {k: v for k, v in persisted.items() if k not in ("id", "read_the_served_product", "read_canonical_url")}
+        )
+        captured_sql.append((_query, persisted))
 
     async def resolve(*, observed=None, **_kwargs):
         if observed is not None:
@@ -1058,8 +1066,13 @@ def test_the_canonical_reset_is_a_dry_run_unless_applied_and_never_overwrites_a_
     assert dry["mode"] == "dry_run" and dry["selected"] == 2 and writes == []
     assert dry["by_category"] == {"different_product": 1, "same_product_elsewhere": 1}
 
+    assert dry["served_id_pinned"] == 2, "neither row carries seed_data.external_product_id"
+
     applied = asyncio.run(script._run(script._parser().parse_args(["--apply"])))
     assert (applied["reset"], applied["skipped_changed_since_read"]) == (1, 1)
+    assert writes[0]["served_id"] == script.served_external_product_id(
+        "https://fentybeauty.com/products/f-340", "https://fentybeauty.com/products/f-470"
+    )
     assert [w["id"] for w in writes] == ["a", "c"]
     for w in writes:
         assert "canonical_url = destination_url" in w["sql"] and "AND canonical_url = :old" in w["sql"]
@@ -1079,3 +1092,33 @@ def test_the_canonical_reset_script_runs_the_way_the_job_runs_it():
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert "--apply" in proc.stdout
+
+
+def test_the_refresh_moves_the_served_url_only_from_what_it_read(monkeypatch):
+    """A concurrent reset (`reset_unreadable_canonical_urls.py`) may change canonical_url between
+    this refresh's read and its write; the UPDATE must not write the stale copy back."""
+    www = DEST.replace("://", "://www.")
+    row = _canonical_row()
+    row["canonical_url"] = www  # what the refresh reads; still the same destination
+    result, _ = _refresh(monkeypatch, row, _page([_offer(17, IN, sku="RL")]))  # page says DEST
+
+    (sql, values), = [(q, v) for q, v in _CAPTURED_SQL if "UPDATE external_product_seeds" in q]
+    assert "canonical_url IS NOT DISTINCT FROM :read_canonical_url" in sql
+    assert "THEN :canonical_url ELSE canonical_url END" in sql
+    assert "THEN :domain ELSE domain END" in sql
+    assert values["canonical_url"] == DEST, "this read does move the served URL"
+    assert values["read_canonical_url"] == www, "...but only if the row still holds what was read"
+
+
+def test_the_reset_pins_the_id_the_gateway_serves_today():
+    """agent_shop_gateway serves ext_ + sha256(canonical_url or destination_url) for a seed with no
+    seed_data.external_product_id; the reset must not change it (review of #2374, note c)."""
+    import routes.agent_shop_gateway as gateway
+
+    script = _load_reset_script("reset_served_id")
+    sibling, dest = "https://fentybeauty.com/products/f-340", "https://fentybeauty.com/products/f-470"
+    assert script.served_external_product_id(sibling, dest) == gateway._stable_external_product_id(sibling)
+    assert script.served_external_product_id(None, dest) == gateway._stable_external_product_id(dest)
+    sql = script._RESET_SQL
+    assert "'{external_product_id}'" in sql and "THEN to_jsonb(CAST(:served_id AS TEXT))" in sql
+    assert "ELSE seed_data::jsonb->'external_product_id' END" in sql, "an existing id is never replaced"

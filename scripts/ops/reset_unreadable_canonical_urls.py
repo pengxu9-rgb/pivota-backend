@@ -19,6 +19,12 @@ reset can be undone. It writes the database but fetches nothing, so it needs no 
     scripts/ops/run_oneoff_job.sh scripts/ops/reset_unreadable_canonical_urls.py --apply
 
 `--category` narrows to one class (default: all three).
+
+THE SERVED PRODUCT ID IS PINNED. `routes/agent_shop_gateway` serves `seed_data.external_product_id`
+and, when a seed has none, `ext_` + sha256(canonical_url or destination_url) -- so resetting the
+canonical would change that seed's served id. `--apply` writes the id the gateway serves TODAY
+into `seed_data.external_product_id` where it is missing (same UPDATE), and the dry run counts
+those rows as `served_id_pinned`.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import hashlib
 import json
 import os
 import sys
@@ -56,7 +63,8 @@ def classify(destination_url: Optional[str], canonical_url: Optional[str]) -> Op
 async def _select(categories: List[str]) -> List[Dict[str, Any]]:
     rows = await database.fetch_all(
         """
-        SELECT id, domain, destination_url, canonical_url
+        SELECT id, domain, destination_url, canonical_url,
+               COALESCE(seed_data->>'external_product_id', '') AS seed_external_product_id
         FROM external_product_seeds
         WHERE status = 'active' AND canonical_url IS NOT NULL AND destination_url IS NOT NULL
         ORDER BY domain, id
@@ -71,13 +79,29 @@ async def _select(categories: List[str]) -> List[Dict[str, Any]]:
     return out
 
 
+def served_external_product_id(canonical_url: Optional[str], destination_url: Optional[str]) -> str:
+    """The id `agent_shop_gateway` serves for a seed with no `seed_data.external_product_id`."""
+    url = str(canonical_url or destination_url or "").strip()
+    return "ext_" + hashlib.sha256(url.encode("utf-8")).hexdigest()[:24] if url else ""
+
+
 _RESET_SQL = """
 UPDATE external_product_seeds
 SET canonical_url = destination_url,
     seed_data = jsonb_set(
-        COALESCE(seed_data::jsonb, '{}'::jsonb),
-        '{canonical_reset}',
-        jsonb_build_object('from', CAST(:old AS TEXT), 'at', CAST(:at AS TEXT))
+        jsonb_set(
+            COALESCE(seed_data::jsonb, '{}'::jsonb),
+            '{canonical_reset}',
+            jsonb_build_object(
+                'from', CAST(:old AS TEXT),
+                'at', CAST(:at AS TEXT),
+                'pinned_external_product_id', CAST(:served_id AS TEXT)
+            )
+        ),
+        '{external_product_id}',
+        CASE WHEN COALESCE(seed_data::jsonb->>'external_product_id', '') = ''
+             THEN to_jsonb(CAST(:served_id AS TEXT))
+             ELSE seed_data::jsonb->'external_product_id' END
     ),
     updated_at = NOW()
 WHERE id = :id AND canonical_url = :old
@@ -94,6 +118,9 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
             "mode": "apply" if args.apply else "dry_run",
             "selected": len(rows),
             "by_category": dict(collections.Counter(r["category"] for r in rows)),
+            # Seeds with no seed_data.external_product_id: the gateway serves an id hashed from
+            # canonical_url, which --apply pins (see the module docstring).
+            "served_id_pinned": sum(1 for r in rows if not r.get("seed_external_product_id")),
             "top_domains": collections.Counter(r["domain"] for r in rows).most_common(15),
             "samples": [
                 {"id": r["id"], "category": r["category"], "destination": r["destination_url"], "canonical": r["canonical_url"]}
@@ -106,8 +133,10 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
         # Bound, not formatted in SQL: a `HH24:MI:SS` literal would parse as binds `:MI`/`:SS`.
         at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         for r in rows:
+            served_id = served_external_product_id(r["canonical_url"], r["destination_url"])
             result = await database.fetch_one(
-                _RESET_SQL + " RETURNING id", {"id": r["id"], "old": r["canonical_url"], "at": at}
+                _RESET_SQL + " RETURNING id",
+                {"id": r["id"], "old": r["canonical_url"], "at": at, "served_id": served_id},
             )
             if result:
                 reset += 1
