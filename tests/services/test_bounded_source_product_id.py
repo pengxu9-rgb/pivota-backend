@@ -14,6 +14,7 @@ from services.catalog_enrichment_agent.ingestion import (
     SOURCE_PRODUCT_ID_MAX,
     bounded_source_product_id,
     canonical_product_name,
+    derive_product_key,
     ingest_validated_record,
 )
 
@@ -45,6 +46,40 @@ def test_the_kiss_title_that_failed_now_fits_every_column():
     assert all(len(x) <= SOURCE_PRODUCT_ID_MAX for x in sku_ids)
     assert set(sku_ids) == {pdp_id}  # the product and every SKU agree on the id
     assert all(len(v["source_variant_id"]) <= SOURCE_PRODUCT_ID_MAX for v in plan["variant_skus"])
+    # review of #2391: the canonical SKU's source_variant_id restated the 148-char product_key
+    assert len(plan["pdp"]["product_key"]) > SOURCE_PRODUCT_ID_MAX
+    assert len(plan["sku"]["source_variant_id"]) <= SOURCE_PRODUCT_ID_MAX
+    assert plan["sku"]["source_variant_id"] == pdp_id
+
+
+# A product_key that fits but whose name is 115-128 chars: the canonical SKU failed with NO
+# source_product_id overflow at all (e.g. live kissusa.com "Kiss Haunt Halloween ... Glow In The Dark").
+MID = ("Kiss Haunt Halloween Press On Fake Glue Nails - Midnight Makeover | French Design, Black & White, "
+       "Medium, Almond, Glow In The Dark")
+
+
+def test_a_key_over_the_column_restates_the_source_id_and_stays_product_derived():
+    from services.agent_pdp_view_assembler import aggregate_variants
+    from services.outbound_links_service import extract_shopify_numeric_variant_id
+    from services.variant_identity import PRODUCT_DERIVED, variant_id_provenance
+
+    assert SOURCE_PRODUCT_ID_MAX < len(derive_product_key("KISS", MID)) and \
+        len(canonical_product_name("KISS", MID)) <= SOURCE_PRODUCT_ID_MAX
+    plan = ingest_validated_record(_kiss_record(MID), source_jsonl="kissusa.jsonl")
+    sku = plan["sku"]
+    assert len(sku["source_variant_id"]) <= SOURCE_PRODUCT_ID_MAX
+    assert sku["source_variant_id"] == plan["pdp"]["source_product_id"]
+    # never a real variant: product-derived, dropped as the placeholder, not a Shopify cart id
+    assert variant_id_provenance(sku["source_variant_id"], product_id=sku["source_product_id"],
+                                 product_key=sku["product_key"]) == PRODUCT_DERIVED
+    variants, _ = aggregate_variants([sku], plan["pdp"]["source_product_id"])
+    assert variants == []
+    assert extract_shopify_numeric_variant_id(sku["source_variant_id"]) is None
+
+
+def test_a_key_that_fits_keeps_restating_the_product_key():
+    plan = ingest_validated_record(_kiss_record("Kiss Gel Fantasy Press On Glue Nails - Chase It"), source_jsonl="x")
+    assert plan["sku"]["source_variant_id"] == plan["pdp"]["product_key"]
 
 
 def test_short_names_are_byte_identical_so_no_stored_row_moves():

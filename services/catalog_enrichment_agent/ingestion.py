@@ -178,6 +178,13 @@ def bounded_source_product_id(brand: Optional[str], product_name: Optional[str])
     return f"{canonical[:SOURCE_PRODUCT_ID_MAX - 9]}-{digest}"
 
 
+def canonical_sku_variant_id(product_key: str, source_product_id: str) -> str:
+    """The canonical ("the product is the variant") SKU's source_variant_id: the product_key, as every
+    writer spells it -- unless the key cannot fit the column, where the bounded source_product_id is
+    the restatement instead (see _build_sku_insert)."""
+    return product_key if len(product_key) <= SOURCE_PRODUCT_ID_MAX else source_product_id
+
+
 def derive_product_key(brand: Optional[str], product_name: Optional[str]) -> str:
     """Stable product_key derived from (brand, product_name). Uses a
     deterministic hash to bound the length to the catalog_products
@@ -1199,7 +1206,16 @@ def _build_sku_insert(
         # it. The mirror lane spells its canonical row the same way
         # (scripts/mirror_external_seeds_to_catalog_products), so the two
         # converge on one row rather than two rival spellings of one product.
-        "source_variant_id": product_key,
+        #
+        # EXCEPT where product_key cannot fit the VARCHAR(128) column (derive_product_key reaches 214):
+        # there the INSERT failed, dropping the canonical SKU and its offer and failing the store job
+        # as partial (15 live brand rows had no canonical SKU, 2026-09-26). Such a SKU restates the
+        # (bounded) source_product_id instead -- still PRODUCT_DERIVED to variant_id_provenance, dropped
+        # as the singleton placeholder by agent_pdp_view_assembler.aggregate_variants (svid == spid, so
+        # never published as a variant for the gateway's guard to judge), and never a Shopify numeric
+        # id for a cart. Every key that fits is byte-identical to before.
+        "source_variant_id": canonical_sku_variant_id(
+            product_key, bounded_source_product_id(pdp_payload["brand"], pdp_payload["product_name"])),
         "source_domain": pdp_payload.get("source_domain") or None,
         "sku": None,
         "barcode": strong_identifier.value if strong_identifier else None,
