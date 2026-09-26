@@ -304,6 +304,14 @@ def test_tier_b_accepts_the_measured_us_stores(domain, brand, storefront):
     ("beautybay.shop", "Sukin", "Sukin | Shop Sukin at Beauty Bay", "name_has_no_reseller_token"),
     ("adorebeauty.shop", "Sukin", "Sukin @ Adore Beauty", "name_has_no_reseller_token"),
     ("adorebeauty.store", "Sukin", "Sukin @Adore Beauty", "name_has_no_reseller_token"),
+    ("adorebeauty.jp", "Sukin", "Sukin ＠ Adore Beauty", "name_has_no_reseller_token"),        # full-width @
+    ("adorebeauty.au", "Sukin", "Sukin\ufe6bAdore Beauty", "name_has_no_reseller_token"),      # small @
+    ("sukinretailers.com", "Sukin", "Sukin Retailers USA", "name_has_no_reseller_token"),
+    ("sukinoutlets.com", "Sukin", "Sukin Outlets", "name_has_no_reseller_token"),
+    ("sukinchemists.com", "Sukin", "Sukin Chemists", "name_has_no_reseller_token"),
+    ("sukinpharmacies.com", "Sukin", "Sukin Pharmacies", "name_has_no_reseller_token"),
+    ("sukinwholesaler.com", "Sukin", "Sukin Wholesaler", "name_has_no_reseller_token"),
+    ("sukinwholesalers.com", "Sukin", "Sukin Wholesalers", "name_has_no_reseller_token"),
     ("ccpharmacy.com", "Chemist Confessions", "Chemist Confessions Pharmacy", "name_has_no_reseller_token"),
 ])
 def test_tier_b_refuses_a_name_that_does_not_lead_with_the_brand_or_resells_it(domain, brand, name, failed):

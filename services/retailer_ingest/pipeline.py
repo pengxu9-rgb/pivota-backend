@@ -260,11 +260,13 @@ def _tokens(value: Any) -> List[str]:
 
 #: A /meta.json name with one of these tokens AFTER the brand is a store that SELLS the brand, never the
 #: brand's own ("Sukin Stockist USA", "Sukin Beauty Warehouse"). "at" is the listing-title shape
-#: ("Sukin | Shop Sukin at Beauty Bay"); "@" in the name reads as "at". Only the words after the brand
+#: ("Sukin | Shop Sukin at Beauty Bay"); "@" in the name reads as "at" (NFKC first, so the full-width
+#: "＠" does too). Only the words after the brand
 #: count: a brand's own name may hold one ("Chemist Confessions USA").
 TIER_B_RESELLER_TOKENS = frozenset({
     "stockist", "stockists", "distributor", "distributors", "distribution", "distributions", "pharmacy",
-    "chemist", "retailer", "outlet", "wholesale", "warehouse", "warehouses", "at"})
+    "pharmacies", "chemist", "chemists", "retailer", "retailers", "outlet", "outlets", "wholesale",
+    "wholesaler", "wholesalers", "warehouse", "warehouses", "at"})
 
 
 def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: str) -> Dict[str, Any]:
@@ -284,7 +286,9 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
     resells, and a US-shipping USD store alone proves nothing about whose it is."""
     from services.region_pricing import pricing_currency_for_region_or_none
     sf = storefront if isinstance(storefront, dict) else {}
-    want, name = _tokens(brand), _tokens(str(sf.get("name") or "").replace("@", " at "))
+    import unicodedata
+    want = _tokens(brand)
+    name = _tokens(unicodedata.normalize("NFKC", str(sf.get("name") or "")).replace("@", " at "))
     starts = len("".join(want)) >= TIER_B_MIN_BRAND_CHARS and name[:len(want)] == want
     rest = name[len(want):] if starts else name
     ships = sf.get("ships_to_countries")
