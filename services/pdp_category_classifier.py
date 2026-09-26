@@ -128,11 +128,11 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # "Gel Nail Color" is polish and an "Acrylic Nails & Tips" shelf is mostly powders (review).
     ("Press-On Nails", "beauty/makeup/nails/press-on-nails", re.compile(
         r"^(?!.*\b(?:polish|lacquer|removers?|" + _AREA_VETO + r")\b).*"
-        r"\bpress[-\s]?on\s+(?:nails?|manicures?)\b",
+        r"\bpress[-\s]?on\s+(?:nails?|manicures?)\b(?!\s+(?:glue|stickers?|decals?|removers?)\b)",
         re.IGNORECASE | re.DOTALL)),
     ("Press-On Nails", "beauty/makeup/nails/press-on-nails", re.compile(
-        r"^(?!.*\b(?:polish|lacquer|colou?rs?|coats?|powders?|liquids?|monomer|brush(?:es)?|files?|"
-        r"clippers?|cutters?|drill|lamp|stickers?|wraps?|decals?|removers?|glue|care|cuticles?|oils?|"
+        r"^(?!.*\b(?:polish|lacquer|coats?|powders?|liquids?|monomer|brush(?:es)?|files?|"
+        r"clippers?|cutters?|drill|lamp|stickers?|wraps?|decals?|removers?|glue(?![-\s]?on)|care|cuticles?|oils?|"
         r"tricks|guide|falsies|" + _AREA_VETO + r")\b).*\b(?:"
         r"(?:false|fake|faux|artificial|glue[-\s]?on|stick[-\s]?on)\s+nails?"
         r"|nail\s+tips?|\d+\s*(?:pcs?\s+)?nails"
@@ -314,8 +314,11 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     ("Tanning", "beauty/body/tanning", re.compile(
         r"\b(self[-\s]?tan|self[-\s]?tanning|sunless tan|gradual tanning|gradualglow)\b",
         re.IGNORECASE)),
+    # A nail "Base Coat & Primer" is nail polish (above); declining the nail cue here keeps it ONE match
+    # as a merchant type in _pattern_matches (third review of #2364).
     ("Primer", "beauty/makeup/face/primer", re.compile(
-        r"\b(primer|pore prep|pore[-\s]?filling)\b", re.IGNORECASE)),
+        r"^(?!.*\b(?:nails?|gel|polish|lacquer)\b).*\b(primer|pore prep|pore[-\s]?filling)\b",
+        re.IGNORECASE | re.DOTALL)),
     ("Concealer", "beauty/makeup/face/concealer", re.compile(
         r"\b(concealer|corrector|correcting skinstick|skinstick|skin stick|"
         r"eye brightener|bright fix)\b",

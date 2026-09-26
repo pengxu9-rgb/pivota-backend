@@ -60,6 +60,8 @@ def _path(text):
     ("Nail Tips Clear 500pcs", PRESS_ON),
     ("24 Pcs Press On Nails with Glue and Mini File", PRESS_ON),   # accessories listed
     ("Press-On Nails with Jelly Glue Stickers", PRESS_ON),
+    ("Glue On Nails 24pcs", PRESS_ON),                   # third review: "glue" vetoed "glue-on"
+    ("False Nails Nude Color 24pcs", PRESS_ON),
     ("KISS Lash Couture Faux Mink Collection", LASHES),
     ("Ardell Wispies Natural Lashes", LASHES),
     ("KISS imPRESS Falsies Press-On Lashes", LASHES),    # lashes, not press-on nails
@@ -123,6 +125,8 @@ def test_lash_and_nail_products_reach_their_leaf(title, want):
     ("Nail Tip Glue", None),
     ("Nail Tips & Tricks Guide", None),
     ("10 Nails Care Tips", None),
+    ("Press On Nail Glue", None),                        # an accessory named after the product
+    ("Press-On Nail Stickers", None),
 ])
 def test_refusing_examples_keep_their_old_leaf(title, want):
     assert _path(title) == want
@@ -132,6 +136,7 @@ def test_refusing_examples_keep_their_old_leaf(title, want):
     "Nail Polish", "Nail Lacquer", "Gel Polish", "Top Coat", "Base Coat", "Dip Powder",
     "Nail Polish Remover", "Nail Polish Remover Wipes", "Cuticle Oil", "Press-On Nails",
     "False Lashes", "Lash Glue", "Gel Nail Color",
+    "Gel Polish Base Coat & Primer", "UV Gel Base Coat and Primer",   # nail, not face primer
     # real merchant types on universalnailsupplies.com that the review found ambiguous
     "Powder Nail Color", "Aprés Gel Color Polish", "Polish Remover", "Acetone Polish Remover",
     "Gel Remover Wipes", "No-Wipe Top Coat",
