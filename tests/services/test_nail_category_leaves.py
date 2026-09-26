@@ -75,6 +75,14 @@ def _path(text):
     ("Press On Nails & Glue", PRESS_ON),
     ("Glue-On Press On Nails 24pcs", PRESS_ON),
     ("Short Press On Nails for Women", PRESS_ON),        # "for" AFTER the phrase
+    # a glue or lamp further after the phrase is an accessory or a design name (review of #2382)
+    ("Press On Nails Jelly Glue", PRESS_ON),
+    ("Press On Nails Jelly Glue, 24pcs", PRESS_ON),     # the segment scan stops at "press on"
+    ("Press On Nails Strong Hold Glue", PRESS_ON),
+    ("Glamnetic Press On Nails Lava Lamp", PRESS_ON),
+    ("Press On Nails Nail Glue Included", PRESS_ON),
+    ("Press On Nails Gel Glue Included", PRESS_ON),
+    ("Glue/Adhesive-Free Press On Nails", PRESS_ON),
     ("Kiss Professional Full Cover Press On Fake Nails - Absolutes | 140 Nails, Includes Nail Glue",
      PRESS_ON),
     ("KISS Lash Couture Faux Mink Collection", LASHES),
@@ -166,11 +174,17 @@ def test_lash_and_nail_products_reach_their_leaf(title, want):
     ("Kiss Nail Glue for Press On Nails", None),
     ("Press On Nail Gel Glue 10g", None),                # only the glue after the phrase refuses
     ("Press On Nails Nail Glue 3g", None),
-    ("Press On Nails Strong Hold Glue", None),            # only the end of the title refuses
     ("Press On Nail Adhesive Tabs", None),
     ("Nail Adhesive, Press On Nails", None),
+    # one per separator that ends the first segment
     ("Gel Glue - Press On Nails", None),
-    ("Nail Glue with Applicator, Press On Nails", None),
+    ("Nail Glue \u2013 Press On Nails", None),
+    ("Nail Glue \u2014 Press On Nails", None),
+    ("Nail Glue (3g) Press On Nails", None),
+    ("Nail Glue & Press On Nails", None),
+    ("Nail Glue and Press On Nails", None),
+    ("Nail Glue with 24 Press On Nails", None),
+    ("Nail Glue for Extra Long Wear Press On Nails", None),   # past the "for" refusal's 2 words
     ("Nail Dehydrator for Press On Nails", None),
     ("UV Lamp for Press On Nails", None),
 ])
@@ -179,8 +193,10 @@ def test_refusing_examples_keep_their_old_leaf(title, want):
 
 
 def test_a_brush_on_glue_is_not_press_on_nails():
-    """Asserted as "not press-on" only: "brush" anywhere still reaches the Brush tool leaf, a gap of
-    that rule and not of this one."""
+    """Asserted as "not press-on" only: the Brush rule files any "brush", "Brush-On" included, under
+    the brush tool leaf ("Kiss Brush-On Nail Glue" is a brush on main too). That is the Brush rule's
+    gap: exempting "brush-on" there moves 21 store titles, several to worse leaves (measured on
+    kissusa/unitedbeautysupply/shopbeautydepot 2026-09-26), so it is left to its own change."""
     assert _path("Press On Nails Brush-On Glue 5g") != PRESS_ON
 
 

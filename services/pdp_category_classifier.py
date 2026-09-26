@@ -43,13 +43,12 @@ _SUNSCREEN_RE = re.compile(
 # is present (_FACE_PRIMER).
 _AREA_VETO = (r"lips?|lip(?:sticks?|gloss(?:es)?|liners?|balms?|tints?|stains?|oils?)"
               r"|(?:eye\s?)?lash(?:es)?|(?:eye)?brows?|mascara|eye\s?shadows?|eyeliners?")
-# Where a title's first segment -- the phrase that names the product -- ends: end of text, a
-# separator ("|", ",", " - ", "(" ...) or a preposition/conjunction. "Kiss Nail Glue for ..." ->
-# "Kiss Nail Glue"; "24 Pcs Press On Nails with Glue" -> "24 Pcs Press On Nails". It carries no
-# leading \s*: a pattern that re-tests it at every position scans each whitespace run again from
-# every space in it (20,000 spaces took 2.6s).
-_SEGMENT_END = (r"(?:$|[|,:;(/+&\u2013\u2014]|-(?=\s)"
-                r"|\b(?:for|with|and|plus|includ(?:es?|ing))\b)")
+# Where a title's first segment -- the phrase that names the product -- ends: a separator ("|",
+# ",", " - ", "(" ...) or a preposition/conjunction. "Kiss Nail Glue for ..." -> "Kiss Nail Glue";
+# "Nail Glue & Press On Nails" -> "Nail Glue". It carries no leading \s*: a pattern that re-tests
+# it at every position scans each whitespace run again from every space in it (20,000 spaces took
+# 2.6s).
+_SEGMENT_END = r"(?:[|,(&\u2013\u2014]|-(?=\s)|\b(?:for|with|and)\b)"
 # A primer is face makeup unless the title also names the nail: "Base Coat Primer" -> face primer,
 # "Gel Polish Base Coat & Primer" -> nail polish.
 _FACE_PRIMER = r"(?!(?!.*\b(?:nails?|gel|polish|lacquer)\b).*\bprimers?\b)"
@@ -135,18 +134,20 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # "Gel Nail Color" is polish and an "Acrylic Nails & Tips" shelf is mostly powders (review).
     # The forgiveness holds only while the NAILS are the head noun. Declined (kissusa.com 2026-09-26):
     # a product FOR them ("Kiss Nail Glue for Press On Nails", as the stricter arm below), a glue,
-    # adhesive or lamp that ends the title's first segment -- the text before its first separator,
-    # preposition or conjunction ("Kiss Salon X-tend LED Gel Adhesive | Clear, Press On Nail Gel
-    # Glue", "Kiss Salon X-tend Pro LED Lamp | White, Soft Gel Press On Nail Curing Light") -- and a
-    # glue named right after the phrase ("Press On Nail Gel Glue 10g", "... Nails Brush-On Glue").
-    # "24 Pcs Press On Nails with Glue and Mini File" and "Jelly Glue Press On Nails" keep "Nails"
-    # as the head noun and stay.
+    # adhesive or lamp that ends the title's first segment BEFORE the phrase ("Kiss Salon X-tend LED
+    # Gel Adhesive | Clear, Press On Nail Gel Glue", "Kiss Salon X-tend Pro LED Lamp | White, Soft
+    # Gel Press On Nail Curing Light"), and a glue named right after the phrase unless it is
+    # "included" ("Press On Nail Gel Glue 10g", "... Nails Brush-On Glue"). A glue or lamp further
+    # AFTER the phrase is a listed accessory or a design name, and the phrase wins ("24 Pcs Press On
+    # Nails with Glue and Mini File", "Press On Nails Jelly Glue", "... Nails Lava Lamp"), as it
+    # does when the glue qualifies the nails ("Jelly Glue Press On Nails").
     ("Press-On Nails", "beauty/makeup/nails/press-on-nails", re.compile(
         r"^(?!.*\bfor\s+(?:\w+\s+){0,2}press[-\s]?on\b)"
-        r"(?!(?:(?!" + _SEGMENT_END + r").)*?\b(?:glue|adhesives?|lamps?)\s*" + _SEGMENT_END + r")"
+        r"(?!(?:(?!" + _SEGMENT_END + r"|\bpress[-\s]?on\b).)*?\b(?:glue|adhesives?|lamps?)\s*" + _SEGMENT_END + r")"
         r"(?!.*\b(?:polish|lacquer|removers?|" + _AREA_VETO + r")\b).*"
         r"\bpress[-\s]?on\s+(?:nails?|manicures?)\b"
-        r"(?!\s+(?:(?:gel|brush[-\s]?on|nail)\s+)?(?:glue|adhesives?|stickers?|decals?|removers?)\b)",
+        r"(?!\s+(?:(?:gel|brush[-\s]?on|nail)\s+)?(?:glue|adhesives?|stickers?|decals?|removers?)\b"
+        r"(?!\s+included\b))",
         re.IGNORECASE | re.DOTALL)),
     # KISS names its glue-on line "Press On (Fake) Glue Nails" / "Press On Soft Gel Nails" / "Press On
     # Glue Toenails" (kissusa.com 2026-09-26: ~500 titles matched nothing), so up to three of those words
