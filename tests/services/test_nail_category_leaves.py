@@ -62,6 +62,12 @@ def _path(text):
     ("Press-On Nails with Jelly Glue Stickers", PRESS_ON),
     ("Glue On Nails 24pcs", PRESS_ON),                   # third review: "glue" vetoed "glue-on"
     ("False Nails Nude Color 24pcs", PRESS_ON),
+    # KISS's glue-on line (kissusa.com 2026-09-26: ~500 of these titles matched nothing)
+    ("Kiss Voguish Fantasy Press On Glue Nails - Brunch Date", PRESS_ON),
+    ("Kiss Core French Press On Fake Glue Nails - If You Dare", PRESS_ON),
+    ("Kiss Salon X-tend Color Press On Soft Gel Nails - Brick Road", PRESS_ON),
+    ("Kiss Gel Fantasy Press On Glue Toenails - Chase It", PRESS_ON),
+    ("Impress Design No Glue Fake Press On Toenails - Sweet as Honey", PRESS_ON),
     ("KISS Lash Couture Faux Mink Collection", LASHES),
     ("Ardell Wispies Natural Lashes", LASHES),
     ("KISS imPRESS Falsies Press-On Lashes", LASHES),    # lashes, not press-on nails
@@ -127,6 +133,10 @@ def test_lash_and_nail_products_reach_their_leaf(title, want):
     ("10 Nails Care Tips", None),
     ("Press On Nail Glue", None),                        # an accessory named after the product
     ("Press-On Nail Stickers", None),
+    ("Kiss Glow-In-The-Dark Halloween Press On Fake Nail Art Stickers - Creepin", None),
+    ("Kiss Press On Glue Nail Glue", None),
+    ("Kiss Glue OFF Press On Fake Nails Remover", None),
+    ("Kiss PowerFlex Maximum Speed Fake Nail Glue", None),
 ])
 def test_refusing_examples_keep_their_old_leaf(title, want):
     assert _path(title) == want

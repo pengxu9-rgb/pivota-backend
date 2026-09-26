@@ -128,7 +128,12 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # "Gel Nail Color" is polish and an "Acrylic Nails & Tips" shelf is mostly powders (review).
     ("Press-On Nails", "beauty/makeup/nails/press-on-nails", re.compile(
         r"^(?!.*\b(?:polish|lacquer|removers?|" + _AREA_VETO + r")\b).*"
-        r"\bpress[-\s]?on\s+(?:nails?|manicures?)\b(?!\s+(?:glue|stickers?|decals?|removers?)\b)",
+        # KISS names its glue-on line "Press On (Fake) Glue Nails" / "Press On Soft Gel Nails" /
+        # "Press On Glue Toenails" (kissusa.com 2026-09-26: ~500 titles matched nothing), so up to three
+        # of those words may sit between "press on" and "nails"; "Press On Fake Nail Art Stickers" and
+        # "Press On Glue Nail Glue" are still declined by the lookahead.
+        r"\bpress[-\s]?on\s+(?:(?:fake|false|glue|soft|gel|acrylic)\s+){0,3}(?:(?:toe)?nails?|manicures?)\b"
+        r"(?!\s+(?:art\s+)?(?:glue|stickers?|decals?|removers?)\b)",
         re.IGNORECASE | re.DOTALL)),
     ("Press-On Nails", "beauty/makeup/nails/press-on-nails", re.compile(
         r"^(?!.*\b(?:polish|lacquer|coats?|powders?|liquids?|monomer|brush(?:es)?|files?|"

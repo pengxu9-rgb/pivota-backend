@@ -34,6 +34,8 @@ TONE_UP = ("3CE - TONE UP TINT 40ml", "LIP TINT", "3ce-tone-up-tint-40ml",
            "designed to help improve the appearance of dull skin while creating a brighter complexion.</p>")
 LIPSTICK_NO_TYPE = ("3CE - Soft Matte Lipstick 3.5g", "", "soft-matte")
 PALETTE = ("3CE - New Take Eyeshadow Palette", "", "new-take")
+LASHES_CATCH_ALL_TYPE = ("Kiss Lash Couture Faux Mink False Eyelashes - Jubilee | 1 Pair, Strip Lashes, 10mm",
+                         "Physical Products", "jubilee", "<p>Lightweight faux mink strip lashes.</p>")
 
 
 class LockServer:
@@ -278,6 +280,18 @@ async def test_the_lip_title_option_reaches_the_crawl(env):
                                        accepted_flags=["placed_by_lip_title:soft-matte"]), db=env.db)
     assert out["status"] == "done"
     assert feed._LIP_TITLE_EVIDENCE.get() is False  # scoped to the stage
+
+
+async def test_the_lash_nail_title_option_reaches_the_crawl(env):
+    """kissusa.com types its lashes "Physical Products": only the opt-in title door places them."""
+    env.rows = [LASHES_CATCH_ALL_TYPE]
+    assert (await pipeline.run_stage(job(only_category="beauty/makeup/eye"), db=env.db))["status"] == "nothing"
+    out = await pipeline.run_stage(job(only_category="beauty/makeup/eye", lash_nail_title_evidence=True), db=env.db)
+    assert out["status"] == "held"  # the door placed it: held until that row is accepted
+    assert feed._LASH_NAIL_TITLE_EVIDENCE.get() is False  # scoped to the stage
+    # the two doors are independent switches: the lip door alone places no lash row
+    out = await pipeline.run_stage(job(only_category="beauty/makeup/eye", lip_title_evidence=True), db=env.db)
+    assert out["status"] == "nothing"
 
 
 @pytest.mark.parametrize("lifecycle,noted", [("candidate", True), ("draft", True), (None, False),
