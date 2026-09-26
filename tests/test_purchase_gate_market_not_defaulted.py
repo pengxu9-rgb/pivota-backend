@@ -461,6 +461,67 @@ async def _multi_card_tokens(monkeypatch, rows, *, search_market=None, meta_mark
     return [_decode(c["external_redirect_url"]) for c in ordered if c]
 
 
+@pytest.mark.parametrize("bad", [5, [], ["US"], {"x": 1}, True, 1.5])
+async def test_a_non_string_search_market_is_unnamed_not_an_error(monkeypatch, bad):
+    """Review L2: before `MultiSearchFilters.market` existed the model silently ignored the key; a
+    non-string value must still be tolerated (treated as UNNAMED), never a ValidationError — which
+    inside the /invoke handler would be a 500 for a direct caller."""
+    import routes.agent_shop_gateway as gw
+
+    payload = gw.FindProductsMultiPayload(
+        **gw._normalize_find_products_multi_payload({"search": {"query": "x", "market": bad}})
+    )
+    assert payload.search.market is None
+    token = await _multi_card_token(monkeypatch, search_market=bad)
+    assert token["market"] == "US"
+    assert "market_observed" not in token
+
+
+async def test_find_products_multi_fragrance_retry_keeps_the_request_market(monkeypatch):
+    """Review L1: the fragrance semantic retry rebuilds `MultiSearchFilters`; it must carry
+    `search.market`, or the retry's minted tokens lose the request's provenance. Driven end to end:
+    the first pass finds nothing for "perfume", the retry's expanded query finds the seed row."""
+    import routes.agent_shop_gateway as gw
+
+    monkeypatch.setattr(gw, "SEARCH_FRAGRANCE_SEMANTIC_RETRY", True)
+    retry_query = gw._build_fragrance_semantic_retry_query("perfume")
+    row = dict(_MULTI_ROW, title="Eau de Parfum", seed_data={"brand": "Maison"})
+    seen_queries: List[Any] = []
+
+    async def fake_fetch_all(query: str, values=None):
+        # One merchant with nothing to sell, so the handler does not take its "no merchants and
+        # no seeds" early return and reaches the retry with an empty first pass.
+        if "FROM merchant_onboarding" in str(query):
+            return [{"merchant_id": "merch_empty", "business_name": "Empty"}]
+        return []
+
+    async def fake_rows(**kwargs):
+        seen_queries.append(kwargs.get("query"))
+        rows = [row] if kwargs.get("query") == retry_query else []
+        return {"rows": rows, "query_timeout": False, "query_ms": 1, "total_count": len(rows)}
+
+    monkeypatch.setattr(gw.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gw, "MULTI_SEARCH_ENABLE_BASE_MERCHANT_FANOUT", True)
+    monkeypatch.setattr(gw, "fetch_external_seed_rows", fake_rows)
+
+    async def run(search_market):
+        search: Dict[str, Any] = {"query": "perfume", "page": 1, "limit": 10, "in_stock_only": False}
+        if search_market is not None:
+            search["market"] = search_market
+        payload = gw.FindProductsMultiPayload(**gw._normalize_find_products_multi_payload({"search": search}))
+        result = await gw._handle_find_products_multi(payload, {"source": "creator-agent-ui"}, gw.BackgroundTasks())
+        assert (result.get("metadata") or {}).get("semantic_retry_applied") is True, result.get("metadata")
+        cards = [p for p in result.get("products") or [] if p.get("source") == "external_seed"]
+        assert len(cards) == 1, cards
+        return _decode(cards[0]["external_redirect_url"])
+
+    named = await run("SG")
+    assert retry_query in seen_queries, "the premise: the retry ran and found the row"
+    assert named["market_observed"] is True, "the retry must keep search.market"
+    unnamed = await run(None)
+    assert "market_observed" not in unnamed
+
+
 async def test_find_products_multi_two_rows_serving_the_same_market_keep_their_own_provenance(monkeypatch):
     """Same destination, one row listed "US" and one with no market: both serve "US", only the
     first is observed for a US request. The flag is in the per-request redirect cache key."""

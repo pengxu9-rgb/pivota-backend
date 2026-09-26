@@ -33,7 +33,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
@@ -2992,6 +2992,14 @@ class MultiSearchFilters(BaseModel):
     market: Optional[str] = Field(None, exclude=True, description="Buyer market, provenance only")
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("market", mode="before")
+    @classmethod
+    def _market_is_a_string_or_unnamed(cls, value: Any) -> Optional[str]:
+        """TOLERANT, like the model was before the field existed (it silently ignored the key): a
+        non-string `search.market` (5, [], ["US"], {...}, true) is UNNAMED, never a validation
+        error inside the handler. Validity is the sink's question (`iso2_market`), not this one."""
+        return value if isinstance(value, str) else None
 
 
 class UserIntent(BaseModel):
