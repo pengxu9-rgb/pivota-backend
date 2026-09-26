@@ -285,7 +285,7 @@ def test_tier_b_accepts_the_measured_us_stores(domain, brand, storefront):
     assert flags == []
     got = evidence["brands"][brand.casefold()]
     assert got["tier"] == "B" and got["name"] == storefront["name"]
-    assert got["name_starts_with_brand"] and got["name_has_no_reseller_token"]
+    assert got["name_starts_with_brand"] and got["name_has_no_reseller_token"] and got["name_is_one_store_name"]
     assert got["ships_to_market"] and got["currency_is_market_currency"]
 
 
@@ -337,6 +337,68 @@ def test_tier_b_holds_unless_every_conjunct_holds(storefront, failed):
     assert flags[0]["severity"] == "block" and "acceptable" not in flags[0]
     tier_b = evidence["brands"]["sukin"]["tier_b"]
     assert evidence["brands"]["sukin"]["tier"] is None and tier_b[failed] is False and tier_b["passed"] is False
+
+
+@pytest.mark.parametrize("brand,name", [
+    ("Sukin", "Sukin by Adore Beauty"),
+    ("Sukin", "Sukin Naturals by Adore Beauty"),
+    ("Sukin", "Sukin from Adore Beauty"),
+    ("Sukin", "Sukin FROM Adore Beauty"),
+])
+def test_tier_b_refuses_a_name_that_says_who_sells_the_brand(brand, name):
+    tier_b = pipeline.storefront_tier_b(brand, _us(name), "US")
+    assert tier_b["name_has_no_reseller_token"] is False and tier_b["passed"] is False
+
+
+# Each separator on its own, so dropping any one from TIER_B_NAME_SEPARATOR fails a case.
+@pytest.mark.parametrize("name", [
+    "Sukin | Beauty Bay", "Sukin ¦ Beauty Bay", "Sukin – Adore Beauty", "Sukin — Adore Beauty",
+    "Sukin: Adore Beauty", "Sukin • Beauty Bay", "Sukin · Beauty Bay", "Sukin » Beauty Bay",
+    "Sukin › Beauty Bay", "Sukin / Adore Beauty", "Sukin \\ Adore Beauty", "Sukin - Adore Beauty",
+    "Sukin｜Beauty Bay",          # full-width bar, NFKC-folded to "|"
+    "Sukin–Adore Beauty",         # an unspaced dash is still a separator
+    "Sukin Naturals USA | Official Store",  # a tagline is held too: nothing tells it from a retailer
+])
+def test_tier_b_refuses_a_name_that_splits_into_a_second_name(name):
+    tier_b = pipeline.storefront_tier_b("Sukin", _us(name), "US")
+    assert tier_b["name_starts_with_brand"] is True and tier_b["name_has_no_reseller_token"] is True
+    assert tier_b["name_is_one_store_name"] is False and tier_b["passed"] is False
+
+
+def test_a_second_name_is_held_with_the_reason_in_the_flag():
+    # Measured 2026-09-26: a retailer in the prod ledger names itself this way. (On its own host,
+    # kbeautymakeup.com, Tier A would decide first; the name is what is under test here.)
+    name = "K-Beauty Makeup | Authentic Korean Beauty Makeup and Skincare Products"
+    flags, evidence = pipeline.brand_official_domain_review(
+        "authentickbeauty.com", ["K-Beauty Makeup"], storefront=_us(name), market="US")
+    assert [f["key"] for f in flags] == ["brand_official_domain_unproven:authentickbeauty.com:k-beauty makeup"]
+    assert "no second name after a separator: False" in flags[0]["detail"]
+    assert evidence["brands"]["k-beauty makeup"]["tier_b"]["name_is_one_store_name"] is False
+
+
+@pytest.mark.parametrize("brand,name", [
+    ("MooGoo", "MooGoo Skin-Care USA"),   # an unspaced hyphen joins words, it does not split a name
+    ("K-Beauty Makeup", "K-Beauty Makeup"),
+    ("19/99 Beauty", "19/99 Beauty USA"),  # the brand's own separator is not a second name
+    ("Sukin", "Sukin Naturals USA |"),     # nothing after the separator
+])
+def test_a_separator_that_starts_no_second_name_is_not_a_refusal(brand, name):
+    assert pipeline.storefront_tier_b(brand, _us(name), "US")["passed"] is True
+
+
+def test_the_brand_may_carry_its_separator_but_no_more():
+    assert pipeline.storefront_tier_b("19/99 Beauty", _us("19/99 Beauty | Beauty Bay"), "US")["passed"] is False
+
+
+@pytest.mark.parametrize("brand,name", [
+    # The brand-official /meta.json names in the prod retailer-ingest ledger (fetched 2026-09-26).
+    ("BondiBoost", "BondiBoost.com"), ("Bondi Sands", "Bondi Sands USA "), ("DHC", "DHC Skincare"),
+    ("esmi", "esmi Skin"), ("FANCL", "FANCL USA"), ("Head & Shoulders", "Head & Shoulders"),
+    ("Hero Cosmetics", "Hero Cosmetics"), ("Jurlique", "Jurlique US"), ("Kayali", "KAYALI"),
+    ("Lanolips", "Lanolips USA Store"), ("MooGoo", "MooGoo USA"),
+])
+def test_every_brand_store_name_in_the_ledger_still_passes_tier_b(brand, name):
+    assert pipeline.storefront_tier_b(brand, _us(name), "US")["passed"] is True
 
 
 def test_a_reseller_word_inside_the_brands_own_name_is_not_a_refusal():

@@ -299,14 +299,25 @@ def _tokens(value: Any) -> List[str]:
 
 
 #: A /meta.json name with one of these tokens AFTER the brand is a store that SELLS the brand, never the
-#: brand's own ("Sukin Stockist USA", "Sukin Beauty Warehouse"). "at" is the listing-title shape
-#: ("Sukin | Shop Sukin at Beauty Bay"); "@" in the name reads as "at" (NFKC first, so the full-width
-#: "＠" does too). Only the words after the brand count: a brand's own name may hold one
-#: ("Chemist Confessions USA").
+#: brand's own ("Sukin Stockist USA", "Sukin Beauty Warehouse"). "at", "by" and "from" name the store
+#: that sells it ("Sukin | Shop Sukin at Beauty Bay", "Sukin by Adore Beauty", "Sukin from Adore
+#: Beauty"); "@" in the name reads as "at" (NFKC first, so the full-width "＠" does too). Only the words
+#: after the brand count: a brand's own name may hold one ("Chemist Confessions USA", "Eco By Sonya USA").
 TIER_B_RESELLER_TOKENS = frozenset({
     "stockist", "stockists", "distributor", "distributors", "distribution", "distributions", "pharmacy",
     "pharmacies", "chemist", "chemists", "retailer", "retailers", "outlet", "outlets", "wholesale",
-    "wholesaler", "wholesalers", "warehouse", "warehouses", "at"})
+    "wholesaler", "wholesalers", "warehouse", "warehouses", "at", "by", "from"})
+#: A separator splits a /meta.json name into a second name ("Sukin | Beauty Bay", "Sukin - Adore
+#: Beauty"), and nothing tells a retailer's name from a tagline there, so a name with more segments than
+#: the brand's own is not evidence. A hyphen counts only when spaced ("K-Beauty" is one word). Measured
+#: 2026-09-26 on the /meta.json names of the 77 stores in the prod retailer-ingest ledger: 0 of the 13
+#: brand stores has one; a retailer does ("K-Beauty Makeup | Authentic Korean Beauty Makeup and ...").
+TIER_B_NAME_SEPARATOR = re.compile(r"[|¦–—:•·»›/\\]|\s-\s")
+
+
+def _segments(text: str) -> int:
+    """How many non-empty parts TIER_B_NAME_SEPARATOR splits `text` into."""
+    return sum(1 for part in TIER_B_NAME_SEPARATOR.split(text) if _tokens(part))
 
 
 def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: str) -> Dict[str, Any]:
@@ -317,8 +328,9 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
     The name rule is a token-boundary PREFIX, not containment: containment passed "REN" in "Karen's
     Beauty Shop", "Tula" in "Tulane Pharmacy" and "e.l.f." in "Self Care Supply Co" (review of #2353).
     The brand's tokens must be the name's first tokens, the words after them must carry no reseller
-    token (TIER_B_RESELLER_TOKENS: "Sukin Beauty Warehouse", "Sukin | Shop Sukin at Beauty Bay"), and
-    the folded brand must be at least TIER_B_MIN_BRAND_CHARS long. Measured positives (prod /meta.json,
+    token (TIER_B_RESELLER_TOKENS: "Sukin Beauty Warehouse", "Sukin by Adore Beauty"), the name must not
+    split into a second name (TIER_B_NAME_SEPARATOR: "Sukin | Beauty Bay"), and the folded brand must
+    be at least TIER_B_MIN_BRAND_CHARS long. Measured positives (prod /meta.json,
     2026-09-26): "Sukin Naturals USA", "Bali Body US", "MooGoo USA", "Eco By Sonya USA", "esmi Skin",
     "MineTan USA" -- each USD, ships_to [US].
 
@@ -328,7 +340,8 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
     sf = storefront if isinstance(storefront, dict) else {}
     import unicodedata
     want = _tokens(brand)
-    name = _tokens(unicodedata.normalize("NFKC", str(sf.get("name") or "")).replace("@", " at "))
+    raw = unicodedata.normalize("NFKC", str(sf.get("name") or "")).replace("@", " at ")
+    name = _tokens(raw)
     starts = len("".join(want)) >= TIER_B_MIN_BRAND_CHARS and name[:len(want)] == want
     rest = name[len(want):] if starts else name
     ships = sf.get("ships_to_countries")
@@ -338,10 +351,13 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
         "market": market,
         "name_starts_with_brand": starts,
         "name_has_no_reseller_token": bool(name) and not (set(rest) & TIER_B_RESELLER_TOKENS),
+        "name_is_one_store_name": bool(name) and _segments(raw) <= max(1, _segments(
+            unicodedata.normalize("NFKC", str(brand or "")))),
         "ships_to_market": isinstance(ships, list) and market in ships,
         "currency_is_market_currency": bool(expected) and sf.get("currency") == expected,
     }
     out["passed"] = bool(out["name_starts_with_brand"] and out["name_has_no_reseller_token"]
+                         and out["name_is_one_store_name"]
                          and out["ships_to_market"] and out["currency_is_market_currency"])
     return out
 
@@ -405,6 +421,7 @@ def brand_official_domain_review(domain: str, brands: List[str], *, storefront: 
             "detail": f"the domain name of {domain} is not the brand {brand!r}, and its /meta.json does not "
                       f"prove it for {market} (name {tier_b['name']!r} starts with the brand: "
                       f"{tier_b['name_starts_with_brand']}, no reseller word: {tier_b['name_has_no_reseller_token']}, "
+                      f"no second name after a separator: {tier_b['name_is_one_store_name']}, "
                       f"ships to {market}: {tier_b['ships_to_market']}, "
                       f"{tier_b['currency']!r} is {market}'s currency: {tier_b['currency_is_market_currency']}); "
                       f"accept this key only if {domain} is {brand}'s own store (its rows become {brand}'s "
