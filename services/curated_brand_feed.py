@@ -1788,8 +1788,8 @@ _MEASURED_HOST_PRODUCT_TYPES = {
     # "Self Tan Body Mousse" on these shelves would be set aside (unresolved, never mislabelled); and a
     # title naming no leaf ("Glow Butter") would take the shelf's leaf. Re-read before trusting again.
     # The shelves read and LEFT OUT, each mixing classes:
-    #   "Mine Body" (5): a blending brush, an applicator mitt, a tan-remover foam and a body butter.
-    #     The mitt and the butter name no leaf, so the title check could not stop them.
+    #   "Mine Body" (5): a blending brush, an applicator mitt, a tan-remover foam, a body butter and a
+    #     gradual tan lotion. The mitt and the butter name no leaf, so the title check could not stop them.
     #   "Mine Face" (5): facial tan mists, bronzing drops, a bronzing serum and highlighter glow drops.
     #     Titles set 4 of 5 aside (toner/serum/highlighter); the shelf would add one row, so not worth it.
     #   "Mine Bronze Babe" (2): a home spray-tan machine kit (equipment; its title names gift-set).
@@ -1834,7 +1834,8 @@ def _measured_host_type_leaf(*, domain: Optional[str], product_type: Optional[st
     # shelf, and the product's own title outranks it. A title naming no leaf does not.
     if named and leaf not in named:
         return None
-    # Every measured shelf is FACE (or lip) care. A title naming another body area is a different
+    # Measured shelves are FACE (or lip) care, except MineTan's two tanning shelves (whose 16 titles
+    # name no other body area, so this veto is inert there). A title naming another body area is a different
     # product the patterns cannot see: measured on eyurs' own "Moisturizers" shelf, a "Hand & Nail
     # Cream" and a "Body Lotion"; a future "Argan Oil Hair Mask" on "Masks" would otherwise become a
     # facial mask, and a "Lip & Body Balm" is not only a lip balm.
