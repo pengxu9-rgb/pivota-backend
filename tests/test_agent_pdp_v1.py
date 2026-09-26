@@ -95,8 +95,10 @@ class FakeAgentPdpDatabase:
         serving_eligible_by_content_key: Optional[Dict[str, bool]] = None,
         index_eligible_by_content_key: Optional[Dict[str, bool]] = None,
         citations_by_content_key: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        sig_to_content_key: Optional[Dict[str, str]] = None,
     ) -> None:
         self.rows = rows
+        self.sig_to_content_key = sig_to_content_key or {}
         self.ext_id_to_content_key = ext_id_to_content_key or {}
         self.serving_eligible_by_content_key = serving_eligible_by_content_key
         self.index_eligible_by_content_key = index_eligible_by_content_key or {}
@@ -129,6 +131,11 @@ class FakeAgentPdpDatabase:
         query_text = str(query)
         self.calls.append({"query": query_text, "values": dict(values or {})})
         params = values or {}
+
+        # stale-signature resolution path (catalog_products -> content_key)
+        if "FROM catalog_products cp" in query_text and "cp.pivota_signature_id = :id" in query_text:
+            ck = self.sig_to_content_key.get(str(params.get("id") or ""))
+            return {"content_key": ck} if ck else None
 
         # ext_* resolution path (different bind name + JOIN shape)
         if "FROM external_product_seeds eps" in query_text:
@@ -175,6 +182,7 @@ def _client(
     serving_eligible_by_content_key: Optional[Dict[str, bool]] = None,
     index_eligible_by_content_key: Optional[Dict[str, bool]] = None,
     citations_by_content_key: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    sig_to_content_key: Optional[Dict[str, str]] = None,
 ):
     db = FakeAgentPdpDatabase(
         rows,
@@ -182,6 +190,7 @@ def _client(
         serving_eligible_by_content_key=serving_eligible_by_content_key,
         index_eligible_by_content_key=index_eligible_by_content_key,
         citations_by_content_key=citations_by_content_key,
+        sig_to_content_key=sig_to_content_key,
     )
     monkeypatch.setattr(agent_pdp_v1, "database", db)
     app = FastAPI()
@@ -474,6 +483,48 @@ def test_get_agent_pdp_resolves_ext_id_via_external_product_seeds(monkeypatch) -
     assert db.calls[0]["values"] == {"ext_id": "ext_xyz123"}
     assert "WHERE apv.content_key = :id" in db.calls[1]["query"]
     assert db.calls[1]["values"] == {"id": CK_A}
+
+
+STALE_SIG = "sig_" + "e" * 32  # a retailer listing's sig: no longer its content_key's served row
+
+
+def test_a_stale_signature_resolves_to_its_products_served_row(monkeypatch) -> None:
+    """#2384: the canonical pick moved from a retailer listing to the brand store's row, so the APV's
+    sig changed; a link to the listing's old sig still names a live catalog row and must still serve."""
+    client, db = _client(monkeypatch, [_row()], sig_to_content_key={STALE_SIG: CK_A})
+
+    response = client.get(f"/api/agent/pdp/{STALE_SIG}")
+
+    assert response.status_code == 200
+    assert _canonical_product(response.json())["content_key"] == CK_A
+    assert [c["values"] for c in db.calls] == [{"id": STALE_SIG}, {"id": STALE_SIG}, {"id": CK_A}]
+    assert "WHERE apv.pivota_signature_id = :id" in db.calls[0]["query"]  # the direct lookup first
+    assert "FROM catalog_products cp" in db.calls[1]["query"]
+    assert "WHERE apv.content_key = :id" in db.calls[2]["query"]
+
+
+def test_a_served_signature_never_runs_the_fallback(monkeypatch) -> None:
+    client, db = _client(monkeypatch, [_row()], sig_to_content_key={SIG_A: CK_A})
+    assert client.get(f"/api/agent/pdp/{SIG_A}").status_code == 200
+    assert len(db.calls) == 1
+
+
+def test_a_stale_signature_of_an_unservable_product_is_still_404(monkeypatch) -> None:
+    client, db = _client(monkeypatch, [_row()], sig_to_content_key={STALE_SIG: CK_A},
+                         serving_eligible_by_content_key={CK_A: False})
+    assert client.get(f"/api/agent/pdp/{STALE_SIG}").status_code == 404
+
+
+def test_an_unknown_signature_is_404_after_one_resolve(monkeypatch) -> None:
+    client, db = _client(monkeypatch, [_row()])
+    assert client.get("/api/agent/pdp/sig_" + "f" * 32).status_code == 404
+    assert len(db.calls) == 2
+
+
+def test_the_signature_resolve_skips_tombstoned_rows() -> None:
+    sql = " ".join(agent_pdp_v1.SIG_RESOLVE_SQL.split())
+    assert "cp.suppressed_at IS NULL" in sql and "cp.content_key IS NOT NULL" in sql
+    assert "WHERE cp.pivota_signature_id = :id" in sql
 
 
 def test_get_agent_pdp_unresolvable_ext_id_returns_404(monkeypatch) -> None:

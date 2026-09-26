@@ -13,14 +13,19 @@ import pytest
 from services.agent_pdp_view_assembler import fetch_products_for_key, pick_canonical
 
 
-def _row(product_key, *, host, brand="Westman Atelier", description="Brand copy.", bd=False, primary=True,
-         sig="sig_" + "a" * 32, platform="external_seed"):
+BRAND_COPY = "A soft, dense brush that presses cream products into the skin for a seamless finish."
+RETAILER_COPY = "Westman Atelier's spot check brush, sold here with free shipping over fifty dollars."
+
+
+def _row(product_key, *, host, brand="Westman Atelier", description=BRAND_COPY, bd=False, primary=True,
+         sig="sig_" + "a" * 32, platform="external_seed", image="https://cdn.example/i.jpg"):
     return {"product_key": product_key, "source_domain": host, "brand": brand, "description": description,
             "has_brand_direct_offer": bd, "group_is_primary": primary, "pivota_signature_id": sig,
-            "platform": platform, "canonical_url": f"https://{host}/products/x" if host else None}
+            "platform": platform, "canonical_url": f"https://{host}/products/x" if host else None,
+            "image_url": image}
 
 
-RETAILER = _row("ext:retailer:3296a977c4bfa327fb14c92fa14", host="edeniowa.com", description="Retailer copy.")
+RETAILER = _row("ext:retailer:3296a977c4bfa327fb14c92fa14", host="edeniowa.com", description=RETAILER_COPY)
 BRAND = _row("ext:westman-atelier-spot-check-brush::38", host="westman-atelier.com", bd=True)
 
 
@@ -51,6 +56,11 @@ def test_a_brand_store_proven_by_its_domain_alone_wins():
          description="", bd=True),
     _row("prod::external_seed::external_seed::chas", host="charlottetilbury.com", brand="Charlotte Tilbury",
          description="   ", bd=True),
+    # the serving gate would refuse it (review #2384): a winner under 50 chars or without an image takes the
+    # whole product off serving, and an unsigned winner loses the served id
+    _row("ext:westman-atelier-lip-brush::56", host="westman-atelier.com", description="Brand serum.", bd=True),
+    _row("ext:westman-atelier-lip-brush::57", host="westman-atelier.com", bd=True, image=None),
+    _row("ext:westman-atelier-lip-brush::58", host="westman-atelier.com", bd=True, sig=None),
     # a known retailer host never counts as the brand's store, whatever its offers say
     _row("ext:westman-atelier-lip-brush::55", host="sephora.com", bd=True),
     # an audit seed is never a brand-store row
@@ -60,7 +70,7 @@ def test_a_brand_store_proven_by_its_domain_alone_wins():
 ])
 def test_rows_that_are_not_the_brand_store_keep_todays_order(other):
     retailer = _row("ext:retailer:0000", host="bluemercury.com", brand=other.get("brand"),
-                    description="Retailer copy.")
+                    description=RETAILER_COPY)
     assert pick_canonical([other, retailer]) is retailer
 
 
@@ -91,6 +101,6 @@ async def test_the_loader_selects_the_fields_the_rule_reads():
     db = _FakeDB()
     await fetch_products_for_key("ck_x", db=db)
     assert "cp.source_domain" in db.sql and "cp.canonical_url" in db.sql and "cp.brand" in db.sql
-    assert "cp.description" in db.sql
+    assert "cp.description" in db.sql and "cp.image_url" in db.sql and "cp.pivota_signature_id" in db.sql
     assert "offer_type = 'brand_direct'" in db.sql and "o.suppressed_at IS NULL" in db.sql
     assert "AS has_brand_direct_offer" in db.sql

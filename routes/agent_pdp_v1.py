@@ -341,6 +341,21 @@ EXT_RESOLVE_SQL = """
 """
 
 
+# A signature that is no longer the served row's (its content_key's canonical pick moved to another
+# member -- e.g. the brand store's row now outranks a retailer listing, #2384 -- or the listing was
+# re-keyed onto the brand's product) still names a live catalog row: resolve it to that row's
+# content_key and serve the product, as ext_* ids already are. Run ONLY after the direct lookup
+# misses, so the served path stays one indexed SELECT; idx_catalog_products_pivota_signature (071).
+SIG_RESOLVE_SQL = """
+    SELECT cp.content_key
+    FROM catalog_products cp
+    WHERE cp.pivota_signature_id = :id
+      AND cp.suppressed_at IS NULL
+      AND cp.content_key IS NOT NULL
+    LIMIT 1
+"""
+
+
 def _coerce_json(value: Any) -> Any:
     if isinstance(value, str):
         try:
@@ -613,6 +628,16 @@ async def get_agent_pdp(id: str, request: Request) -> Dict[str, Any]:
         )
 
     row = await database.fetch_one(query, {"id": lookup_id})
+    if not row and _is_pivota_signature_id(lookup_id):
+        resolved = await database.fetch_one(SIG_RESOLVE_SQL, {"id": lookup_id})
+        resolved_content_key = str(dict(resolved).get("content_key") or "") if resolved else ""
+        ck_query = _query_for_id(
+            resolved_content_key,
+            bypass_serving_eligibility=bypass_serving_eligibility,
+            index_eligible_read=index_eligible_read,
+        ) if resolved_content_key else None
+        if ck_query is not None:
+            row = await database.fetch_one(ck_query, {"id": resolved_content_key})
     if not row:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

@@ -321,14 +321,22 @@ def _is_brand_store_row(row: Dict[str, Any]) -> bool:
 
     Evidence is what the ingest pipeline already decided about the seller: a brand_direct offer on
     this row (Tier A or B proven at ingest, e.g. saiehello.com for Saie), or a host that IS the
-    brand's domain -- and never a known retailer host. A row without a description never wins here:
-    it would replace a retailer's copy with nothing. Rows missing these fields (callers that do not
+    brand's domain -- and never a known retailer host. A row the serving gate would refuse (description
+    under MIN_DESCRIPTION_LENGTH, no image) or without a signature never wins here: it would take the
+    product off serving or serve it unsigned. Rows missing these fields (callers that do not
     load them) are simply not brand-store rows, so their order is unchanged. (A url_audit seed needs
     no test here: pick_canonical ranks it last before this rule is consulted.)
     """
     if _is_retailer_listing(row):
         return False
-    if not str(row.get("description") or "").strip():
+    from services.index_pipeline_state_service import MIN_DESCRIPTION_LENGTH
+
+    # The serving gate's own bar (index_pipeline_state_service: no_image / short_description), plus
+    # a signature: the winner supplies the served id and canonical URL, so a brand row that would
+    # take the product off serving, or serve it unsigned, never outranks a retailer's (review #2384).
+    if len(str(row.get("description") or "").strip()) < MIN_DESCRIPTION_LENGTH:
+        return False
+    if not row.get("image_url") or not row.get("pivota_signature_id"):
         return False
     from services.offer_seller_identity import brand_owns_domain, host_from_url, is_known_retailer, normalize_host
 
