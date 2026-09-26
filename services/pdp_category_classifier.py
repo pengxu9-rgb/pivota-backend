@@ -148,10 +148,14 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"bundles?|care|cuticles?|" + _AREA_VETO + r")\b).*\bpress[-\s]?on\s+toenails?\b"
         r"(?!\s+(?:art\s+)?(?:glue|stickers?|decals?|removers?)\b)",
         re.IGNORECASE | re.DOTALL)),
+    # The loosest arm. Like the two above it refuses a product FOR the nails ("Nail Dehydrator for
+    # Fake Nails") and the adhesive, tab, prep and curing words the stricter arm refuses ("Nail
+    # Adhesive for False Nails", "Adhesive Tabs for False Nails" were press-on before this).
     ("Press-On Nails", "beauty/makeup/nails/press-on-nails", re.compile(
-        r"^(?!.*\b(?:polish|lacquer|coats?|powders?|liquids?|monomer|brush(?:es)?|files?|"
-        r"clippers?|cutters?|drill|lamp|stickers?|wraps?|decals?|removers?|glue(?![-\s]?on)|care|cuticles?|oils?|"
-        r"tricks|guide|falsies|" + _AREA_VETO + r")\b).*\b(?:"
+        r"^(?!.*\bfor\s+(?:\w+\s+){0,2}(?:false|fake|faux|artificial)\s+nails?\b)"
+        r"(?!.*\b(?:polish|lacquer|coats?|powders?|liquids?|monomer|brush(?:es)?|files?|"
+        r"clippers?|cutters?|drill|lamps?|stickers?|wraps?|decals?|removers?|glue(?![-\s]?on)|adhesives?|"
+        r"tabs?|dehydrators?|primers?|care|cuticles?|oils?|tricks|guide|falsies|" + _AREA_VETO + r")\b).*\b(?:"
         r"(?:false|fake|faux|artificial|glue[-\s]?on|stick[-\s]?on)\s+nails?"
         r"|nail\s+tips?|\d+\s*(?:pcs?\s+)?nails"
         r")\b",
