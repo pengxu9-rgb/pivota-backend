@@ -40,6 +40,8 @@ os.environ.setdefault(
 )
 
 
+import threading
+
 import pytest
 
 # Session-end hooks that stop aiosqlite workers stranded by a closed event loop
@@ -50,6 +52,47 @@ from thread_exit_guard import (  # noqa: E402,F401
     pytest_terminal_summary,
     pytest_unconfigure,
 )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_aiosqlite_worker_thread_dies_or_outlives_the_session():
+    """Fail the session if an aiosqlite worker thread died or is still running.
+
+    Every aiosqlite connection runs a NON-daemon worker thread. The sweep job
+    hung after printing its summary (runs 35872378808 and 35871915582,
+    2026-09-23) until the 25-minute timeout, with 10-17 of these threads per
+    run logged dying on "Event loop is closed": a TestClient request's loop
+    closed while a background task's sqlite checkout was still connecting.
+    `db.database` now makes that checkout wait for its worker. This proves it
+    holds for the whole suite: a dead worker is the leak itself, and a live one
+    at the end is what keeps the interpreter from exiting.
+
+    Chains `threading.excepthook` rather than replacing it, so pytest still
+    reports each thread exception as a warning on the test it surfaced in.
+    """
+    died: list = []
+    previous_hook = threading.excepthook
+
+    def _record(args):
+        if args.thread is not None and "_connection_worker_thread" in args.thread.name:
+            died.append(args.thread.name)
+        previous_hook(args)
+
+    threading.excepthook = _record
+    yield
+    threading.excepthook = previous_hook
+
+    alive = [t for t in threading.enumerate() if "_connection_worker_thread" in t.name]
+    for thread in alive:
+        thread.join(timeout=1.0)  # one finishing its last close is not a leak
+    alive = [t.name for t in alive if t.is_alive()]
+    assert not died and not alive, (
+        f"{len(died)} aiosqlite worker thread(s) died with an unhandled exception and "
+        f"{len(alive)} are still running after the session: {sorted(died + alive)[:10]}. "
+        "Something closed an event loop while an aiosqlite connection on it was still "
+        "open or connecting — see _install_sqlite_checkout_waits_for_its_worker in "
+        "db/database.py."
+    )
 
 
 @pytest.fixture(autouse=True)
