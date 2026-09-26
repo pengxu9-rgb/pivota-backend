@@ -60,9 +60,11 @@ Blocker codes (first failing check wins):
 Design notes:
   - Batch-paginated: 500 products per batch, cursor on content_key.
   - Per-batch data fetched via a single LATERAL JOIN query (one round trip per batch).
-  - Regression domains fetched once per run, not per batch.
+  - Domain scorecard computation runs FIRST, before the batches: the batch is
+    the only thing that clears an extractor_regression blocker, so it has to
+    classify against tonight's verdict, not yesterday's.
+  - Regression domains fetched once per run (after scoring), not per batch.
   - Bulk upserted to index_pipeline_state via execute_many.
-  - Domain scorecard computation runs after all batches complete.
   - A second-pass UPDATE applies extractor_regression blocker.
   - Best-effort per-batch: errors are caught and logged, job continues.
   - Advisory lock prevents double-runs from cron misfire stacking.
@@ -150,21 +152,60 @@ async def _release_job_lock() -> None:
 # Domain extractor scorecards
 # ---------------------------------------------------------------------------
 
+# Two seed shapes feed this scorecard, and it must score each on its own terms
+# or it reports a change of SHAPE as a regression of the EXTRACTOR:
+#
+#   * snapshot-shaped seeds (the crawler lane) carry seed_data.snapshot with
+#     title/description/image_url. They are scored by EXACTLY the expressions
+#     this query always used: none of the fallbacks below is consulted for a seed
+#     that has a snapshot object, so a crawler that starts writing empty
+#     descriptions still trips, even when the attached catalog row kept its old
+#     copy.
+#   * flat seeds (the retailer-ingest / catalog_enrichment_agent_v1 lane) carry
+#     title, image_urls (a LIST) and variants, and never a description. Their
+#     description lives on the attached catalog_products row. Scored the old way
+#     they measure 0.0 on description and image; on 2026-09-26 that put
+#     koolseoul.com (147/147 seeds flat), thisisbeauty.us and k-touch.us into
+#     'regression' and blocked every row of those domains.
+#
+# SUPPRESSED PRODUCTS ARE NOT IN THE SAMPLE. A seed whose attached
+# catalog_products row is suppressed (suppressed_at or suppression_reason set,
+# e.g. step5_same_merchant_same_url_dup) has its offers suppressed with it
+# (catalog_offers.suppression_reason = 'product_suppressed'), so the price EXISTS
+# below can never find one. That is a deliberate editorial withdrawal, not an
+# extractor failing to read a price: counted, it put www.tomfordbeauty.com
+# (92/159 seeds suppressed), sigmabeauty.com, www.skin1004.com, misshaus.com,
+# www.innbeautyproject.com and judydoll.com into 'regression'. Measured on prod
+# 2026-09-26 over all 5,187 in-window seeds: 182 attached products suppressed,
+# suppressed_at and suppression_reason set together on every one, and the 182
+# seeds whose offers are ALL suppressed are exactly those 182. So the
+# product-level test loses nothing against today's data; an offer-level
+# "all offers suppressed" test would additionally hide a product whose offers
+# were suppressed one by one (orphan_no_sku, duplicate_offer), which is the kind
+# of price-pipeline damage this scorecard exists to see. A seed with no attached
+# product (LEFT JOIN miss) stays in the sample, as before.
 _SCORECARD_QUERY = """
 WITH seeds_in_window AS (
     -- Dedupe to one row per (domain, seed). Without DISTINCT, a seed with N
     -- offer snapshots in the window would be counted N times, skewing
-    -- coverage rates and triggering false regressions.
+    -- coverage rates and triggering false regressions. catalog_products is
+    -- keyed by product_key, so the LEFT JOIN adds at most one row per seed.
     SELECT DISTINCT
         eos.domain,
         eps.id          AS seed_id,
         eps.title       AS seed_title_top,
         eps.seed_data   AS seed_data,
-        eps.attached_product_key
+        eps.attached_product_key,
+        cp.description  AS product_description,
+        cp.image_url    AS product_image_url
     FROM external_offer_snapshots eos
     JOIN external_product_seeds eps
         ON eps.canonical_url = eos.canonical_url
+    LEFT JOIN catalog_products cp
+        ON cp.product_key = eps.attached_product_key
     WHERE eos.last_checked_at > NOW() - INTERVAL '72 hours'
+      AND cp.suppressed_at IS NULL
+      AND cp.suppression_reason IS NULL
 )
 SELECT
     s.domain,
@@ -175,16 +216,25 @@ SELECT
             nullif(s.seed_title_top, ''),
             nullif(s.seed_data->>'title', '')
         )) > 0 THEN 1 END) AS has_title,
-    -- Description: snapshot.description → seed_data.description (>=10 chars)
+    -- Description (>=10 chars): snapshot.description → seed_data.description
+    -- → (flat seeds only) the attached catalog_products.description
     COUNT(CASE WHEN length(coalesce(
             nullif(s.seed_data->'snapshot'->>'description', ''),
-            nullif(s.seed_data->>'description', '')
+            nullif(s.seed_data->>'description', ''),
+            CASE WHEN jsonb_typeof(s.seed_data->'snapshot') IS DISTINCT FROM 'object'
+                 THEN nullif(s.product_description, '') END
         )) >= 10 THEN 1 END) AS has_description,
     -- Image: snapshot.image_url → seed_data.image_url → first images[]
+    -- → (flat seeds only) first image_urls[] → catalog_products.image_url
     COUNT(CASE WHEN length(coalesce(
             nullif(s.seed_data->'snapshot'->>'image_url', ''),
             nullif(s.seed_data->>'image_url', ''),
-            nullif(s.seed_data->'images'->>0, '')
+            nullif(s.seed_data->'images'->>0, ''),
+            CASE WHEN jsonb_typeof(s.seed_data->'snapshot') IS DISTINCT FROM 'object'
+                 THEN coalesce(
+                     nullif(s.seed_data->'image_urls'->>0, ''),
+                     nullif(s.product_image_url, '')
+                 ) END
         )) > 0 THEN 1 END) AS has_image,
     -- Price: EXISTS on catalog_offers — never multiplies the seed count
     COUNT(CASE WHEN EXISTS (
@@ -604,7 +654,42 @@ async def run_nightly_index_health() -> Dict[str, Any]:
         return summary
 
     try:
-        # 2. Fetch regression domains once per run (used in per-product classification)
+        # 2. Score the domain extractors FIRST, then read the regression set.
+        #
+        # ORDER IS THE RECOVERY PATH. The batch below re-derives every live
+        # row's blocker from `regression_domains`, and nothing else in this job
+        # ever clears an 'extractor_regression' blocker. When the scorecard ran
+        # AFTER the batch, the batch classified against YESTERDAY's alert
+        # states: a domain that recovered tonight was re-blocked by tonight's
+        # batch and only released by tomorrow's, a full extra day off the
+        # shelf per false alarm. Scoring first costs nothing — the scorecard
+        # reads seeds, snapshots, catalog_offers and catalog_products'
+        # description / image_url / suppression columns, none of which this job
+        # writes (the graduation ladder writes only readiness_tier) — and
+        # makes a recovery take effect in the same
+        # run that detects it. A NEW regression is still applied in the same
+        # run too, by the classifier and by _REGRESSION_BLOCKER_UPDATE (step 7).
+        try:
+            scorecard_summary = await _compute_domain_extractor_scorecards()
+            summary["domain_baselines_updated"] = scorecard_summary.get(
+                "domains_scored", 0
+            )
+            summary["regression_domains"] = scorecard_summary.get(
+                "domains_regressed", 0
+            )
+            summary["recovered_domains"] = scorecard_summary.get(
+                "domains_recovered", 0
+            )
+            if scorecard_summary.get("errors"):
+                summary["errors"].extend(scorecard_summary["errors"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "nightly_index_health: scorecard computation failed: %s", exc
+            )
+            summary["errors"].append(f"scorecards: {exc!r}")
+
+        # 3. Fetch regression domains once per run (used in per-product
+        # classification) — AFTER scoring, so this is tonight's verdict.
         try:
             regression_rows = await database.fetch_all(
                 "SELECT domain FROM domain_extractor_baselines "
@@ -619,9 +704,11 @@ async def run_nightly_index_health() -> Dict[str, Any]:
             )
             regression_domains = set()
 
-        # IndexNow: eligibility SNAPSHOT taken before any mutation in this run.
-        # Diffed against a second snapshot after ALL mutations (batch upserts,
-        # orphan delete, stale invalidation, scorecards, regression blocker), so
+        # IndexNow: eligibility SNAPSHOT taken before any mutation of
+        # index_pipeline_state in this run (the scorecard above writes only
+        # domain_extractor_baselines). Diffed against a second snapshot after
+        # ALL mutations (batch upserts, orphan delete, stale invalidation,
+        # regression blocker), so
         # every demotion path this job owns is covered — a per-batch tally
         # missed three of them (_STALE_INVALIDATION_UPDATE, _ORPHAN_DELETE and
         # _REGRESSION_BLOCKER_UPDATE never pass through batch_states, and the
@@ -631,7 +718,7 @@ async def run_nightly_index_health() -> Dict[str, Any]:
         # Snapshot-diff makes both classes structurally impossible.
         eligibility_before = await _snapshot_serving_eligibility()
 
-        # 3. Cursor-paginated batch loop
+        # 4. Cursor-paginated batch loop
         cursor = ""  # empty string sorts before all content_keys (VARCHAR)
         stage_counts: Dict[str, int] = {}
         total_processed = 0
@@ -736,7 +823,7 @@ async def run_nightly_index_health() -> Dict[str, Any]:
         summary["graduation_enabled"] = graduation_enabled
         summary["graduated_rows"] = graduated_count
 
-        # 4. Orphan invalidation: catalog_products rows can be hard-deleted by
+        # 5. Orphan invalidation: catalog_products rows can be hard-deleted by
         # the Shopify catalog source prune. An IPS row whose catalog product
         # no longer exists must be removed — the live-only batch query above
         # never touches it, so without this it would stay serving_eligible=TRUE
@@ -773,7 +860,7 @@ async def run_nightly_index_health() -> Dict[str, Any]:
             summary["errors"].append(f"orphan_invalidation: {exc!r}")
         summary["orphans_deleted"] = orphans_deleted
 
-        # 5. Stale-product invalidation: any IPS row whose catalog_products
+        # 6. Stale-product invalidation: any IPS row whose catalog_products
         # row is no longer 'live' must be demoted (was the P0 risk where a
         # previously-eligible product could linger as eligible after archival).
         try:
@@ -784,28 +871,13 @@ async def run_nightly_index_health() -> Dict[str, Any]:
             )
             summary["errors"].append(f"stale_invalidation: {exc!r}")
 
-        # 6. Compute domain extractor scorecards
-        try:
-            scorecard_summary = await _compute_domain_extractor_scorecards()
-            summary["domain_baselines_updated"] = scorecard_summary.get(
-                "domains_scored", 0
-            )
-            summary["regression_domains"] = scorecard_summary.get(
-                "domains_regressed", 0
-            )
-            summary["recovered_domains"] = scorecard_summary.get(
-                "domains_recovered", 0
-            )
-            if scorecard_summary.get("errors"):
-                summary["errors"].extend(scorecard_summary["errors"])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "nightly_index_health: scorecard computation failed: %s", exc
-            )
-            summary["errors"].append(f"scorecards: {exc!r}")
-
         # 7. Second-pass UPDATE: apply extractor_regression blocker
-        # (only runs if any regression domains exist after scorecard update)
+        # (only runs if any regression domains exist after scorecard update).
+        # It matches on external_offer_snapshots.domain verbatim, while the
+        # classifier matches the www-stripped catalog canonical_url host, so
+        # this pass is what blocks a 'www.'-keyed domain. It only ever SETS the
+        # blocker; clearing is the batch's job (step 4), which is why scoring
+        # has to run before the batch (step 2).
         try:
             regression_count_row = await database.fetch_one(
                 "SELECT COUNT(*) AS n FROM domain_extractor_baselines "

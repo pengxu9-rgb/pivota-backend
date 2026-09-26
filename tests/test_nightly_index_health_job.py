@@ -906,3 +906,93 @@ def _fake_submit(sink):
         sink.append(list(urls))
         return True
     return _submit
+
+
+# ---------------------------------------------------------------------------
+# Recovery path: a domain that recovers tonight is released TONIGHT
+# ---------------------------------------------------------------------------
+
+
+class _FakeNightlyDb:
+    """Just enough of `db.database.database` to drive run_nightly_index_health.
+
+    `alert_states` is the domain_extractor_baselines table; the fake scorecard
+    in the test rewrites it the way _compute_domain_extractor_scorecards would.
+    Every regression-set read answers from it AT THE TIME OF THE READ, so the
+    test observes which verdict the batch actually classified against.
+    """
+
+    url = "sqlite://"  # no advisory lock
+
+    def __init__(self, alert_states, batch_rows):
+        self.alert_states = dict(alert_states)
+        self.batch_rows = batch_rows
+        self.upserts: list = []
+        self.executed: list = []
+
+    def _regressed(self):
+        return [{"domain": d} for d, s in self.alert_states.items() if s == "regression"]
+
+    async def fetch_all(self, query, values=None):
+        from jobs.nightly_index_health_job import _BATCH_QUERY, _ELIGIBILITY_SNAPSHOT_SQL
+
+        if "alert_state = 'regression'" in query:
+            return self._regressed()
+        if query == _BATCH_QUERY:
+            return self.batch_rows if (values or {}).get("cursor") == "" else []
+        if query == _ELIGIBILITY_SNAPSHOT_SQL:
+            return []
+        raise AssertionError(f"unexpected fetch_all: {query[:80]!r}")
+
+    async def fetch_one(self, query, values=None):
+        if "alert_state = 'regression'" in query:
+            return {"n": len(self._regressed())}
+        return {"n": 0}
+
+    async def execute(self, query, values=None):
+        self.executed.append(query)
+
+    async def execute_many(self, query, values):
+        self.upserts.extend(values)
+
+
+async def _noop_indexnow(before, summary):
+    return None
+
+
+@pytest.mark.asyncio
+async def test_domain_recovered_tonight_is_released_by_tonights_batch(monkeypatch) -> None:
+    """The batch is the ONLY thing that clears an extractor_regression blocker
+    (_REGRESSION_BLOCKER_UPDATE only ever sets it). It must classify against the
+    verdict the scorecard reaches in the SAME run: when scoring ran after the
+    batch, every recovered domain stayed blocked for one more night."""
+    import db.database
+    import jobs.nightly_index_health_job as job
+
+    fake = _FakeNightlyDb(
+        alert_states={"koolseoul.com": "regression", "still-bad.com": "regression"},
+        batch_rows=[
+            _full_row(content_key="ck_recovered", canonical_url="https://koolseoul.com/p/a"),
+            _full_row(content_key="ck_still_bad", canonical_url="https://still-bad.com/p/b"),
+        ],
+    )
+
+    async def _fake_scorecards():
+        fake.alert_states["koolseoul.com"] = "ok"  # tonight's verdict: recovered
+        return {"domains_scored": 2, "domains_regressed": 1, "domains_recovered": 1, "errors": []}
+
+    monkeypatch.setattr(db.database, "database", fake)
+    monkeypatch.setattr(job, "_compute_domain_extractor_scorecards", _fake_scorecards)
+    monkeypatch.setattr(job, "_submit_indexnow_transitions", _noop_indexnow)
+
+    summary = await job.run_nightly_index_health()
+
+    by_key = {s["content_key"]: s for s in fake.upserts}
+    assert by_key["ck_recovered"]["blocker_code"] == "none"
+    assert by_key["ck_recovered"]["serving_eligible"] is True
+    # A domain still in regression stays blocked in the same run...
+    assert by_key["ck_still_bad"]["blocker_code"] == "extractor_regression"
+    assert by_key["ck_still_bad"]["serving_eligible"] is False
+    assert summary["recovered_domains"] == 1
+    # ...and the second pass still runs for it.
+    assert job._REGRESSION_BLOCKER_UPDATE in fake.executed
