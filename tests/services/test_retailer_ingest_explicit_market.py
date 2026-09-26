@@ -325,6 +325,7 @@ def test_tier_b_refuses_a_name_that_does_not_lead_with_the_brand_or_resells_it(d
 @pytest.mark.parametrize("storefront,failed", [
     ({**SUKIN_US, "name": "Naturals USA"}, "name_starts_with_brand"),                       # name lacks the brand
     ({**SUKIN_US, "name": None}, "name_starts_with_brand"),
+    ({**SUKIN_US, "name": "Sukin Naturals | Adore Beauty"}, "name_is_one_store_name"),
     ({**SUKIN_US, "ships_to_countries": ["AU", "NF"]}, "ships_to_market"),                   # the AU home store's reach
     ({**SUKIN_US, "ships_to_countries": None}, "ships_to_market"),                           # reach unknown
     ({**SUKIN_US, "currency": "AUD"}, "currency_is_market_currency"),                        # AUD base, even shipping US
@@ -350,14 +351,23 @@ def test_tier_b_refuses_a_name_that_says_who_sells_the_brand(brand, name):
     assert tier_b["name_has_no_reseller_token"] is False and tier_b["passed"] is False
 
 
-# Each separator on its own, so dropping any one from TIER_B_NAME_SEPARATOR fails a case.
+# At least one name per separator category, so dropping any one from TIER_B_SEPARATOR_CATEGORIES fails.
 @pytest.mark.parametrize("name", [
-    "Sukin | Beauty Bay", "Sukin ¦ Beauty Bay", "Sukin – Adore Beauty", "Sukin — Adore Beauty",
-    "Sukin: Adore Beauty", "Sukin • Beauty Bay", "Sukin · Beauty Bay", "Sukin » Beauty Bay",
-    "Sukin › Beauty Bay", "Sukin / Adore Beauty", "Sukin \\ Adore Beauty", "Sukin - Adore Beauty",
-    "Sukin｜Beauty Bay",          # full-width bar, NFKC-folded to "|"
-    "Sukin–Adore Beauty",         # an unspaced dash is still a separator
-    "Sukin Naturals USA | Official Store",  # a tagline is held too: nothing tells it from a retailer
+    "Sukin | Beauty Bay", "Sukin ¦ Beauty Bay", "Sukin: Adore Beauty", "Sukin • Beauty Bay",     # Po, So
+    "Sukin · Beauty Bay", "Sukin / Adore Beauty", "Sukin \\ Adore Beauty", "Sukin; Adore Beauty",  # Po
+    "Sukin – Adore Beauty", "Sukin — Adore Beauty", "Sukin - Adore Beauty", "Sukin ‒ Adore Beauty",  # Pd
+    "Sukin ― Adore Beauty", "Sukin -- Adore Beauty", "Sukin -Adore Beauty", "Sukin- Adore Beauty",  # Pd
+    "Sukin–Adore Beauty",         # an unspaced DASH is still a separator; only a hyphen joins words
+    "Sukin\u200b-\u200bAdore Beauty",   # a hyphen between zero-width spaces is not inside a word
+    "Sukin » Beauty Bay", "Sukin « Beauty Bay",                                     # Pf, Pi
+    "Sukin (Adore Beauty)", "Sukin) Adore Beauty",                                  # Ps, Pe
+    "Sukin_Adore Beauty",                                                           # Pc
+    "Sukin ∣ Adore Beauty", "Sukin − Adore Beauty", "Sukin > Adore Beauty",         # Sm
+    "Sukin │ Adore Beauty", "Sukin ● Adore Beauty",                                 # So
+    "Sukin・Adore Beauty", "Sukin ･ Adore Beauty",   # katakana middle dot, and its half-width form (NFKC)
+    "Sukin ǀ Adore Beauty",                          # U+01C0, a bar Unicode files as a letter
+    "Sukin｜Beauty Bay",                             # full-width bar, NFKC-folded to "|"
+    "Sukin Naturals USA | Official Store",           # a tagline is held too: nothing tells it from a retailer
 ])
 def test_tier_b_refuses_a_name_that_splits_into_a_second_name(name):
     tier_b = pipeline.storefront_tier_b("Sukin", _us(name), "US")
@@ -378,20 +388,44 @@ def test_a_second_name_is_held_with_the_reason_in_the_flag():
 
 @pytest.mark.parametrize("brand,name", [
     ("MooGoo", "MooGoo Skin-Care USA"),   # an unspaced hyphen joins words, it does not split a name
+    ("MooGoo", "MooGoo Skin‐Care USA"),   # U+2010, and U+2011 (NFKC-folded to it)
+    ("MooGoo", "MooGoo Skin‑Care USA"),
     ("K-Beauty Makeup", "K-Beauty Makeup"),
     ("19/99 Beauty", "19/99 Beauty USA"),  # the brand's own separator is not a second name
+    ("19／99 Beauty", "19/99 Beauty USA"),  # ... read NFKC-folded on the brand side too
+    ("L:A Bruket", "L:A Bruket US"),
+    ("M·A·C Cosmetics", "M·A·C Cosmetics US"),
     ("Sukin", "Sukin Naturals USA |"),     # nothing after the separator
+    # TIER_B_NAME_JOINERS, one each:
+    ("Head & Shoulders", "Head & Shoulders"), ("Bali Body", "Bali Body & Co USA"), ("Sukin", "Sukin's Naturals"), ("Sukin", "Sukin’s Naturals"),
+    ("Sukin", "Sukin Naturals Pty. Ltd."), ("Sukin", "Sukin+ US"),
+    ("Sukin", "Sukin! USA"), ("Sukin", "Sukin #1 USA"), ("Sukin", "Sukin® USA"), ("Sukin", "Sukin© USA"),
+    ("I'm From", "I'm From USA"),          # "from" inside the brand's own name
 ])
 def test_a_separator_that_starts_no_second_name_is_not_a_refusal(brand, name):
     assert pipeline.storefront_tier_b(brand, _us(name), "US")["passed"] is True
 
 
-def test_the_brand_may_carry_its_separator_but_no_more():
-    assert pipeline.storefront_tier_b("19/99 Beauty", _us("19/99 Beauty | Beauty Bay"), "US")["passed"] is False
+@pytest.mark.parametrize("brand,name", [
+    # A brand's own separator allows a split only WHERE the brand splits (review of #2373: counting
+    # splits let the name spend the brand's allowance after it).
+    ("19/99 Beauty", "19/99 Beauty | Beauty Bay"),
+    ("19/99 Beauty", "19 99 Beauty | Beauty Bay"),
+    ("19/99 Beauty", "19-99 Beauty | Beauty Bay"),
+    ("ma:nyo", "ma-nyo | Stylevana"),
+    ("L:A Bruket", "L A Bruket | Beauty Bay"),
+    ("K–Beauty", "K-Beauty | Beauty Bay"),
+    ("M·A·C Cosmetics", "M.A.C Cosmetics | Beauty Bay | Official"),
+])
+def test_the_brand_may_carry_its_separator_but_no_other(brand, name):
+    tier_b = pipeline.storefront_tier_b(brand, _us(name), "US")
+    assert tier_b["name_starts_with_brand"] is True
+    assert tier_b["name_is_one_store_name"] is False and tier_b["passed"] is False
 
 
 @pytest.mark.parametrize("brand,name", [
-    # The brand-official /meta.json names in the prod retailer-ingest ledger (fetched 2026-09-26).
+    # The brand-official /meta.json names in the prod retailer-ingest ledger (fetched 2026-09-26). _us()
+    # supplies USD + ships [US], so this pins the NAME conjuncts only (Kayali's store is AED in prod).
     ("BondiBoost", "BondiBoost.com"), ("Bondi Sands", "Bondi Sands USA "), ("DHC", "DHC Skincare"),
     ("esmi", "esmi Skin"), ("FANCL", "FANCL USA"), ("Head & Shoulders", "Head & Shoulders"),
     ("Hero Cosmetics", "Hero Cosmetics"), ("Jurlique", "Jurlique US"), ("Kayali", "KAYALI"),

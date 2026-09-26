@@ -308,16 +308,43 @@ TIER_B_RESELLER_TOKENS = frozenset({
     "pharmacies", "chemist", "chemists", "retailer", "retailers", "outlet", "outlets", "wholesale",
     "wholesaler", "wholesalers", "warehouse", "warehouses", "at", "by", "from"})
 #: A separator splits a /meta.json name into a second name ("Sukin | Beauty Bay", "Sukin - Adore
-#: Beauty"), and nothing tells a retailer's name from a tagline there, so a name with more segments than
-#: the brand's own is not evidence. A hyphen counts only when spaced ("K-Beauty" is one word). Measured
-#: 2026-09-26 on the /meta.json names of the 77 stores in the prod retailer-ingest ledger: 0 of the 13
-#: brand stores has one; a retailer does ("K-Beauty Makeup | Authentic Korean Beauty Makeup and ...").
-TIER_B_NAME_SEPARATOR = re.compile(r"[|¦–—:•·»›/\\]|\s-\s")
+#: Beauty"), and nothing tells a retailer's name from a tagline there, so a name may split only where the
+#: brand's own name does. A separator is any punctuation or math/other symbol (by Unicode category, so
+#: look-alikes such as "∣", "│", "‒", "−", "・" count too, review of #2373) except TIER_B_NAME_JOINERS,
+#: and except a hyphen between two letters/digits ("K-Beauty" is one word; a dash like "–" always
+#: splits). Measured 2026-09-26 on the /meta.json names of the 77 stores in the prod retailer-ingest
+#: ledger: 0 of the 13 brand stores has one; a retailer does ("K-Beauty Makeup | Authentic Korean ...").
+TIER_B_SEPARATOR_CATEGORIES = frozenset({"Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po", "Sm", "So"})
+#: Punctuation that joins a name rather than splitting it: "Head & Shoulders", "Karen's", "e.l.f.",
+#: "Dr. Jart+", "BondiBoost.com", "Sukin® USA". (The name is NFKC-folded first: "™" is "TM" by then.)
+TIER_B_NAME_JOINERS = frozenset("&'’.+!#®©")
+_WORD_HYPHENS = frozenset("-‐")  # NFKC folds the non-breaking U+2011 into U+2010
+#: Bars that Unicode files as LETTERS (so no category catches them): U+01C0 "ǀ".
+TIER_B_LETTER_SEPARATORS = frozenset("ǀ")
 
 
-def _segments(text: str) -> int:
-    """How many non-empty parts TIER_B_NAME_SEPARATOR splits `text` into."""
-    return sum(1 for part in TIER_B_NAME_SEPARATOR.split(text) if _tokens(part))
+def _name_split_points(text: str) -> set:
+    """The token indices at which a separator (see TIER_B_SEPARATOR_CATEGORIES) splits `text` into two
+    non-empty parts: "Sukin Naturals | Beauty Bay" -> {2}, "19/99 Beauty" -> {1}, "Sukin USA |" -> {}."""
+    import unicodedata
+    parts, current = [], []
+    for i, ch in enumerate(text):
+        separator = ch in TIER_B_LETTER_SEPARATORS or (
+            unicodedata.category(ch) in TIER_B_SEPARATOR_CATEGORIES and ch not in TIER_B_NAME_JOINERS
+            and not (ch in _WORD_HYPHENS and 0 < i < len(text) - 1
+                     and text[i - 1].isalnum() and text[i + 1].isalnum()))
+        if separator:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    points, count = set(), 0
+    for tokens in (t for t in map(_tokens, parts) if t):
+        if count:
+            points.add(count)
+        count += len(tokens)
+    return points
 
 
 def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: str) -> Dict[str, Any]:
@@ -329,7 +356,7 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
     Beauty Shop", "Tula" in "Tulane Pharmacy" and "e.l.f." in "Self Care Supply Co" (review of #2353).
     The brand's tokens must be the name's first tokens, the words after them must carry no reseller
     token (TIER_B_RESELLER_TOKENS: "Sukin Beauty Warehouse", "Sukin by Adore Beauty"), the name must not
-    split into a second name (TIER_B_NAME_SEPARATOR: "Sukin | Beauty Bay"), and the folded brand must
+    split into a second name (TIER_B_SEPARATOR_CATEGORIES: "Sukin | Beauty Bay"), and the folded brand must
     be at least TIER_B_MIN_BRAND_CHARS long. Measured positives (prod /meta.json,
     2026-09-26): "Sukin Naturals USA", "Bali Body US", "MooGoo USA", "Eco By Sonya USA", "esmi Skin",
     "MineTan USA" -- each USD, ships_to [US].
@@ -351,8 +378,8 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
         "market": market,
         "name_starts_with_brand": starts,
         "name_has_no_reseller_token": bool(name) and not (set(rest) & TIER_B_RESELLER_TOKENS),
-        "name_is_one_store_name": bool(name) and _segments(raw) <= max(1, _segments(
-            unicodedata.normalize("NFKC", str(brand or "")))),
+        "name_is_one_store_name": bool(name) and _name_split_points(raw) <= _name_split_points(
+            unicodedata.normalize("NFKC", str(brand or ""))),
         "ships_to_market": isinstance(ships, list) and market in ships,
         "currency_is_market_currency": bool(expected) and sf.get("currency") == expected,
     }
