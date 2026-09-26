@@ -345,6 +345,8 @@ def test_tier_b_holds_unless_every_conjunct_holds(storefront, failed):
     ("Sukin", "Sukin Naturals by Adore Beauty"),
     ("Sukin", "Sukin from Adore Beauty"),
     ("Sukin", "Sukin FROM Adore Beauty"),
+    ("Sukin", "Sukin Beauty Supply"),
+    ("Sukin", "Sukin Supplies USA"),
 ])
 def test_tier_b_refuses_a_name_that_says_who_sells_the_brand(brand, name):
     tier_b = pipeline.storefront_tier_b(brand, _us(name), "US")
@@ -419,6 +421,7 @@ def test_a_second_name_is_held_with_the_reason_in_the_flag():
     ("Sukin", "Sukin Naturals Pty. Ltd."), ("Sukin", "Sukin+ US"),
     ("Sukin", "Sukin! USA"), ("Sukin", "Sukin #1 USA"), ("Sukin", "Sukin® USA"), ("Sukin", "Sukin© USA"),
     ("I'm From", "I'm From USA"),          # "from" inside the brand's own name
+    ("Supply Skincare", "Supply Skincare USA"),  # ... and "supply"
     ("Sukin", "Sukin‘s Naturals"),         # U+2018, autocorrect's apostrophe
     ("コーセー", "コーセー USA"),            # ー inside a word is a letter
     ("R + Co", "R + Co US"),               # a free-standing joiner the brand has too

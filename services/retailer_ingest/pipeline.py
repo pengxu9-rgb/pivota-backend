@@ -299,14 +299,16 @@ def _tokens(value: Any) -> List[str]:
 
 
 #: A /meta.json name with one of these tokens AFTER the brand is a store that SELLS the brand, never the
-#: brand's own ("Sukin Stockist USA", "Sukin Beauty Warehouse"). "at", "by" and "from" name the store
-#: that sells it ("Sukin | Shop Sukin at Beauty Bay", "Sukin by Adore Beauty", "Sukin from Adore
-#: Beauty"); "@" in the name reads as "at" (NFKC first, so the full-width "＠" does too). Only the words
-#: after the brand count: a brand's own name may hold one ("Chemist Confessions USA", "Eco By Sonya USA").
+#: brand's own ("Sukin Stockist USA", "Sukin Beauty Warehouse", "Sukin Beauty Supply" -- "supply" is on
+#: a retailer in the prod ledger, "Beauty Exchange Beauty Supply", and on no brand store). "at", "by"
+#: and "from" name the store that sells it ("Sukin | Shop Sukin at Beauty Bay", "Sukin by Adore
+#: Beauty", "Sukin from Adore Beauty"); "@" in the name reads as "at" (NFKC first, so the full-width
+#: "＠" does too). Only the words after the brand count: a brand's own name may hold one ("Chemist
+#: Confessions USA", "Eco By Sonya USA").
 TIER_B_RESELLER_TOKENS = frozenset({
     "stockist", "stockists", "distributor", "distributors", "distribution", "distributions", "pharmacy",
     "pharmacies", "chemist", "chemists", "retailer", "retailers", "outlet", "outlets", "wholesale",
-    "wholesaler", "wholesalers", "warehouse", "warehouses", "at", "by", "from"})
+    "wholesaler", "wholesalers", "warehouse", "warehouses", "supply", "supplies", "at", "by", "from"})
 #: A separator splits a /meta.json name into a second name ("Sukin | Beauty Bay", "Sukin - Adore
 #: Beauty"), and nothing tells a retailer's name from a tagline there, so a name may split only where the
 #: brand's own name does. A separator is any punctuation or math/other symbol (by Unicode category, so
