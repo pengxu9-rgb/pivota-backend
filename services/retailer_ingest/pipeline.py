@@ -314,13 +314,29 @@ TIER_B_RESELLER_TOKENS = frozenset({
 #: and except a hyphen between two letters/digits ("K-Beauty" is one word; a dash like "–" always
 #: splits). Measured 2026-09-26 on the /meta.json names of the 77 stores in the prod retailer-ingest
 #: ledger: 0 of the 13 brand stores has one; a retailer does ("K-Beauty Makeup | Authentic Korean ...").
-TIER_B_SEPARATOR_CATEGORIES = frozenset({"Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po", "Sm", "So"})
-#: Punctuation that joins a name rather than splitting it: "Head & Shoulders", "Karen's", "e.l.f.",
-#: "Dr. Jart+", "BondiBoost.com", "Sukin® USA". (The name is NFKC-folded first: "™" is "TM" by then.)
-TIER_B_NAME_JOINERS = frozenset("&'’.+!#®©")
+TIER_B_SEPARATOR_CATEGORIES = frozenset({"Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po", "Sk", "Sm", "So"})
+#: Punctuation that joins a name rather than splitting it, when attached to a word: "Head & Shoulders",
+#: "Karen's", "Kiehl‘s", "e.l.f.", "Dr. Jart+", "BondiBoost.com", "Sukin® USA". Standing alone between
+#: spaces, every one but "&" is a separator ("Sukin + Beauty Bay"; "&" reads as "and", which is no
+#: separator either). The name is NFKC-folded first, so "™" is already "TM" (and "Sukin™ USA" fails
+#: the prefix, as before).
+TIER_B_NAME_JOINERS = frozenset("&'’‘.+!#®©")
 _WORD_HYPHENS = frozenset("-‐")  # NFKC folds the non-breaking U+2011 into U+2010
-#: Bars that Unicode files as LETTERS (so no category catches them): U+01C0 "ǀ".
-TIER_B_LETTER_SEPARATORS = frozenset("ǀ")
+#: Bars that Unicode files as LETTERS (so no category catches them), separators anywhere: "ǀ" "ǁ".
+TIER_B_LETTER_SEPARATORS = frozenset("ǀǁ")
+#: Letters used as a dash or bar in JP/KR names ("Sukin ー 公式", "설화수 ㅣ 공식몰"), after NFKC: ー
+#: (and half-width ｰ), 丨 (and ⼁), Hangul ㅡ/ㅣ (folded to U+1173/U+1175). Separators only as a
+#: word of their own: inside a word they are letters ("コーセー").
+TIER_B_DASH_LETTERS = "ー丨\u1173\u1175"
+_STANDALONE_SEPARATOR = re.compile(
+    "(?<!\\S)[" + TIER_B_DASH_LETTERS + re.escape("".join(sorted(TIER_B_NAME_JOINERS - {"&"}))) + "]+(?!\\S)")
+
+
+def _tier_b_name_text(text: str) -> str:
+    """`text` (already NFKC-folded) with every letter-shaped or free-standing separator rewritten as
+    "|", so the name's tokens and its split points are read from the same string."""
+    text = "".join(" | " if ch in TIER_B_LETTER_SEPARATORS else ch for ch in text)
+    return _STANDALONE_SEPARATOR.sub("|", text)
 
 
 def _name_split_points(text: str) -> set:
@@ -329,10 +345,9 @@ def _name_split_points(text: str) -> set:
     import unicodedata
     parts, current = [], []
     for i, ch in enumerate(text):
-        separator = ch in TIER_B_LETTER_SEPARATORS or (
-            unicodedata.category(ch) in TIER_B_SEPARATOR_CATEGORIES and ch not in TIER_B_NAME_JOINERS
-            and not (ch in _WORD_HYPHENS and 0 < i < len(text) - 1
-                     and text[i - 1].isalnum() and text[i + 1].isalnum()))
+        separator = (unicodedata.category(ch) in TIER_B_SEPARATOR_CATEGORIES and ch not in TIER_B_NAME_JOINERS
+                     and not (ch in _WORD_HYPHENS and 0 < i < len(text) - 1
+                              and text[i - 1].isalnum() and text[i + 1].isalnum()))
         if separator:
             parts.append("".join(current))
             current = []
@@ -367,7 +382,7 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
     sf = storefront if isinstance(storefront, dict) else {}
     import unicodedata
     want = _tokens(brand)
-    raw = unicodedata.normalize("NFKC", str(sf.get("name") or "")).replace("@", " at ")
+    raw = _tier_b_name_text(unicodedata.normalize("NFKC", str(sf.get("name") or "")).replace("@", " at "))
     name = _tokens(raw)
     starts = len("".join(want)) >= TIER_B_MIN_BRAND_CHARS and name[:len(want)] == want
     rest = name[len(want):] if starts else name
@@ -379,7 +394,7 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
         "name_starts_with_brand": starts,
         "name_has_no_reseller_token": bool(name) and not (set(rest) & TIER_B_RESELLER_TOKENS),
         "name_is_one_store_name": bool(name) and _name_split_points(raw) <= _name_split_points(
-            unicodedata.normalize("NFKC", str(brand or ""))),
+            _tier_b_name_text(unicodedata.normalize("NFKC", str(brand or "")))),
         "ships_to_market": isinstance(ships, list) and market in ships,
         "currency_is_market_currency": bool(expected) and sf.get("currency") == expected,
     }

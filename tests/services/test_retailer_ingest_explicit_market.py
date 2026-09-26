@@ -367,11 +367,29 @@ def test_tier_b_refuses_a_name_that_says_who_sells_the_brand(brand, name):
     "Sukin・Adore Beauty", "Sukin ･ Adore Beauty",   # katakana middle dot, and its half-width form (NFKC)
     "Sukin ǀ Adore Beauty",                          # U+01C0, a bar Unicode files as a letter
     "Sukin｜Beauty Bay",                             # full-width bar, NFKC-folded to "|"
+    "Sukin ǁ Adore Beauty",                          # U+01C1, also a letter
+    "Sukin ^ Adore Beauty", "Sukin ꞉ Adore Beauty", "Sukin ˗ Adore Beauty",   # Sk
+    # A joiner standing alone between spaces is a separator, one per TIER_B_NAME_JOINERS entry but "&":
+    "Sukin + Beauty Bay", "Sukin ++ Beauty Bay", "Sukin . Beauty Bay", "Sukin ! Beauty Bay",
+    "Sukin # Beauty Bay", "Sukin ® Beauty Bay", "Sukin © Beauty Bay", "Sukin ' Beauty Bay",
+    "Sukin ’ Beauty Bay", "Sukin ‘ Beauty Bay",
     "Sukin Naturals USA | Official Store",           # a tagline is held too: nothing tells it from a retailer
 ])
 def test_tier_b_refuses_a_name_that_splits_into_a_second_name(name):
     tier_b = pipeline.storefront_tier_b("Sukin", _us(name), "US")
     assert tier_b["name_starts_with_brand"] is True and tier_b["name_has_no_reseller_token"] is True
+    assert tier_b["name_is_one_store_name"] is False and tier_b["passed"] is False
+
+
+@pytest.mark.parametrize("brand,name", [
+    # Letters used as a dash or bar in JP/KR names, as a word of their own (review of #2373).
+    ("Sukin", "Sukin ー 公式"), ("Sukin", "Sukin ｰ Adore Beauty"),          # ー, half-width ｰ
+    ("Sukin", "Sukin 丨 Adore Beauty"), ("Sukin", "Sukin ⼁ Adore Beauty"),   # 丨, radical ⼁
+    ("설화수", "설화수 ㅣ 공식몰"), ("설화수", "설화수 ㅡ 공식몰"),              # Hangul ㅣ / ㅡ
+])
+def test_tier_b_refuses_a_letter_used_as_a_separator(brand, name):
+    tier_b = pipeline.storefront_tier_b(brand, _us(name), "US")
+    assert tier_b["name_starts_with_brand"] is True
     assert tier_b["name_is_one_store_name"] is False and tier_b["passed"] is False
 
 
@@ -401,6 +419,11 @@ def test_a_second_name_is_held_with_the_reason_in_the_flag():
     ("Sukin", "Sukin Naturals Pty. Ltd."), ("Sukin", "Sukin+ US"),
     ("Sukin", "Sukin! USA"), ("Sukin", "Sukin #1 USA"), ("Sukin", "Sukin® USA"), ("Sukin", "Sukin© USA"),
     ("I'm From", "I'm From USA"),          # "from" inside the brand's own name
+    ("Sukin", "Sukin‘s Naturals"),         # U+2018, autocorrect's apostrophe
+    ("コーセー", "コーセー USA"),            # ー inside a word is a letter
+    ("R + Co", "R + Co US"),               # a free-standing joiner the brand has too
+    ("L:A Bruket", "L A Bruket US"),       # a name may leave out a split the brand has
+    ("19/99 Beauty", "19 99 Beauty USA"),
 ])
 def test_a_separator_that_starts_no_second_name_is_not_a_refusal(brand, name):
     assert pipeline.storefront_tier_b(brand, _us(name), "US")["passed"] is True
@@ -416,6 +439,7 @@ def test_a_separator_that_starts_no_second_name_is_not_a_refusal(brand, name):
     ("L:A Bruket", "L A Bruket | Beauty Bay"),
     ("K–Beauty", "K-Beauty | Beauty Bay"),
     ("M·A·C Cosmetics", "M.A.C Cosmetics | Beauty Bay | Official"),
+    ("Dr﹒Jart+", "Dr | Jart+ Beauty"),  # the brand's "﹒" is NFKC "." -- a joiner, not a split
 ])
 def test_the_brand_may_carry_its_separator_but_no_other(brand, name):
     tier_b = pipeline.storefront_tier_b(brand, _us(name), "US")
