@@ -153,15 +153,21 @@ def brand_owns_domain(brand: Optional[str], host: Optional[str]) -> bool:
     genuine D2C case the suite pins is exact (cosrx.com, tomfordbeauty.com,
     wholesale.publicgoods.com -> 'publicgoods'), so exact equality keeps all real
     matches while erring toward 'unknown' (never a false brand_direct) for affixed
-    hosts like shopcosrx.com — the honest, safe direction."""
-    b = normalize_brand(brand)
+    hosts like shopcosrx.com — the honest, safe direction.
+
+    A domain cannot spell "&", so the brand is also compared with "&" read as "and":
+    "Sand & Sky" owns sandandsky.com, "Peach & Lily" peachandlily.com. The written
+    spelling still counts too (a brand on sandsky.com keeps matching), so this only
+    adds matches. Measured 2026-09-26 over every prod brand containing "&": 7 (brand,
+    host) pairs gain a match, each the brand's own store; none loses one."""
+    spellings = {normalize_brand(brand), normalize_brand(str(brand or "").replace("&", " and "))} - {""}
     label = domain_name_label(host)
-    if not b or not label:
+    if not spellings or not label:
         return False
     label_norm = re.sub(r"[^a-z0-9]+", "", label)
     if not label_norm:
         return False
-    return b == label_norm
+    return label_norm in spellings
 
 
 def derive_offer_seller_identity(

@@ -502,6 +502,12 @@ def test_tier_a_is_unchanged_and_needs_no_storefront():
     assert flags == [] and evidence["brands"] == {"frank body": {"tier": "A"}}
 
 
+def test_tier_a_reads_an_ampersand_as_and():
+    """rij_1d030e67 (2026-09-26) held on one flag: "Sand & Sky" failed Tier A on its own store."""
+    flags, evidence = pipeline.brand_official_domain_review("us.sandandsky.com", ["Sand & Sky"])
+    assert flags == [] and evidence["brands"] == {"sand & sky": {"tier": "A"}}
+
+
 def test_tier_b_is_judged_against_the_jobs_market():
     au_home = {"name": "Sukin Naturals", "currency": "AUD", "ships_to_countries": ["AU", "NF"]}
     assert pipeline.storefront_tier_b("Sukin", au_home, "AU")["passed"] is True
