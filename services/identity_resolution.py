@@ -88,6 +88,12 @@ def new_proposal(
         if not needed <= set(evidence or {}):
             raise ValueError(f"attach_membership evidence needs {sorted(needed)}")
     fp = member_fingerprint(subject_product_keys)
+    if kind == "attach_membership":
+        # The move itself is the subject: a listing that drifted (new content_key or group) mints a NEW
+        # proposal instead of deduping onto a stale one the drift guard would skip forever.
+        ev = evidence or {}
+        fp = member_fingerprint([*subject_product_keys, *(f"{k}={ev[k]}" for k in (
+            "from_content_key", "from_product_group_id", "to_product_group_id"))])
     pkey = proposal_key(strategy, merchant_id, content_key, fp)
     return {
         "proposal_id": "irp_" + hashlib.sha256(pkey.encode("utf-8")).hexdigest()[:32],
@@ -443,14 +449,24 @@ async def revert_run(conn, run_id: str) -> Dict[str, Any]:
                 detail = json.loads(detail or "{}")
             seed_ids.extend(detail.get("deactivated_seed_ids") or [])
             if detail.get("attached"):
-                # Move back only what still holds the value this run wrote.
+                # All or nothing per listing: move back only when BOTH still hold this run's values,
+                # else leave the listing where something else has since put it.
+                now = await conn.fetchrow(ATTACH_ROW_SQL, detail["attached"])
+                now_group = await conn.fetchval(
+                    MEMBER_GROUP_SQL, detail["merchant_id"], detail["platform"], detail["source_product_id"])
+                if (not now or now["content_key"] != detail["to_content_key"]
+                        or now_group != detail["to_product_group_id"]):
+                    detached.append({**detail, "reverted": False, "why": "moved_since_run"})
+                    continue
                 ck = _rowcount(await conn.execute(
                     MOVE_CONTENT_KEY_SQL, detail["attached"], detail["from_content_key"],
                     detail["to_content_key"]))
                 pg = _rowcount(await conn.execute(
                     MOVE_GROUP_SQL, detail["merchant_id"], detail["platform"], detail["source_product_id"],
                     detail["from_product_group_id"], detail["to_product_group_id"]))
-                detached.append({**detail, "reverted_content_key": ck == 1, "reverted_group": pg == 1})
+                if ck != 1 or pg != 1:
+                    raise RuntimeError(f"revert {run_id}: {detail['attached']} moved content_key={ck} group={pg}")
+                detached.append({**detail, "reverted": True})
         reactivated = []
         if seed_ids:
             reactivated = [

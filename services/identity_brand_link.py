@@ -31,6 +31,16 @@ FROM catalog_products
 WHERE content_key = ANY($1::text[]) AND suppression_reason IS NULL
 """
 
+FROM_FAMILIES_SQL = """
+SELECT product_key, content_key FROM catalog_products
+WHERE content_key = ANY($1::text[]) AND suppression_reason IS NULL
+"""
+
+GROUP_SIZES_SQL = """
+SELECT product_group_id, count(*) AS n FROM product_group_members
+WHERE product_group_id = ANY($1::text[]) GROUP BY product_group_id
+"""
+
 MEMBERSHIPS_SQL = """
 SELECT merchant_id, platform, platform_product_id, product_group_id
 FROM product_group_members
@@ -49,10 +59,57 @@ def build_proposals(
     listings: Iterable[Mapping[str, Any]],
     families: Mapping[str, List[Mapping[str, Any]]],
     groups: Mapping[MemberKey, str],
+    from_family_keys: Optional[Mapping[str, List[str]]] = None,
+    group_sizes: Optional[Mapping[str, int]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Pure: one attach_membership proposal per listing that is the brand product under Tier-0e's rule.
-    `families` maps a brand-stripped content_key to its live rows; `groups` maps a member to its group."""
+
+    `families` maps a brand-stripped content_key to its live rows; `groups` maps a member to its group.
+    `from_family_keys` maps each listing's CURRENT content_key to every live product_key on it, and
+    `group_sizes` each group to its member count: a listing moves only if nothing stays behind -- every
+    live row on its content_key moves with it in this batch and its group holds only moving listings.
+    Otherwise the next crawl resolves the listing back to the row left behind (exact content_key tier),
+    snaps its content_key back and has its group refused (review of the attach_membership PR)."""
+    listings = list(listings)
+    from_family_keys = from_family_keys if from_family_keys is not None else {
+        r.get("content_key"): [r["product_key"]] for r in listings}
+    group_sizes = group_sizes if group_sizes is not None else {}
+    candidates, counts = _candidates(listings, families, groups)
+    moving = {c["listing"]["product_key"] for c in candidates}
+    moving_by_group: Dict[str, int] = {}
+    for c in candidates:
+        moving_by_group[c["from_group"]] = moving_by_group.get(c["from_group"], 0) + 1
     proposals: List[Dict[str, Any]] = []
+    for c in candidates:
+        row, keeper = c["listing"], c["keeper"]
+        left_behind = set(from_family_keys.get(row.get("content_key"), [row["product_key"]])) - moving
+        if left_behind:
+            counts["rows_left_on_old_content_key"] = counts.get("rows_left_on_old_content_key", 0) + 1
+            continue
+        if group_sizes.get(c["from_group"], 1) > moving_by_group[c["from_group"]]:
+            counts["old_group_has_other_members"] = counts.get("old_group_has_other_members", 0) + 1
+            continue
+        proposals.append(new_proposal(
+            kind="attach_membership", strategy=STRATEGY,
+            subject_product_keys=[row["product_key"], keeper["product_key"]],
+            keeper_product_key=keeper["product_key"], merchant_id=row.get("merchant_id"),
+            content_key=c["to_content_key"], confidence=0.9,
+            evidence={"listing_product_key": row["product_key"], "listing_title": row.get("title"),
+                      "brand": row.get("brand"), "from_content_key": row.get("content_key"),
+                      "from_product_group_id": c["from_group"], "to_product_group_id": c["to_group"],
+                      "rule": "leading whole-word brand stripped; sizes kept"},
+        ))
+        counts["proposed"] = counts.get("proposed", 0) + 1
+    return proposals, counts
+
+
+def _candidates(
+    listings: List[Mapping[str, Any]],
+    families: Mapping[str, List[Mapping[str, Any]]],
+    groups: Mapping[MemberKey, str],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Per-listing rule (Tier-0e's): which brand product each listing would join, before batch rules."""
+    out: List[Dict[str, Any]] = []
     counts: Dict[str, int] = {}
 
     def skip(reason: str) -> None:
@@ -70,8 +127,10 @@ def build_proposals(
             skip("already_on_family")
             continue
         family = list(families.get(stripped) or [])
+        # Tier-0e's order (_rows_by_content_key): the listing's own merchant first, then oldest.
         brand_rows = sorted((r for r in family if not _is_retailer_listing_key(r.get("product_key"))),
-                            key=lambda r: (str(r.get("created_at") or ""), str(r.get("product_key"))))
+                            key=lambda r: (r.get("merchant_id") != row.get("merchant_id"),
+                                           str(r.get("created_at") or ""), str(r.get("product_key"))))
         if not brand_rows:
             skip("no_brand_product")
             continue
@@ -88,18 +147,9 @@ def build_proposals(
         if from_group == to_group:
             skip("already_in_group")
             continue
-        proposals.append(new_proposal(
-            kind="attach_membership", strategy=STRATEGY,
-            subject_product_keys=[row["product_key"], keeper["product_key"]],
-            keeper_product_key=keeper["product_key"], merchant_id=row.get("merchant_id"),
-            content_key=keeper.get("content_key") or stripped, confidence=0.9,
-            evidence={"listing_product_key": row["product_key"], "listing_title": row.get("title"),
-                      "brand": row.get("brand"), "from_content_key": row.get("content_key"),
-                      "from_product_group_id": from_group, "to_product_group_id": to_group,
-                      "rule": "leading whole-word brand stripped; sizes kept"},
-        ))
-        skip("proposed")
-    return proposals, counts
+        out.append({"listing": row, "keeper": keeper, "from_group": from_group, "to_group": to_group,
+                    "to_content_key": keeper.get("content_key") or stripped})
+    return out, counts
 
 
 async def load_and_build(conn) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
@@ -111,13 +161,19 @@ async def load_and_build(conn) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     if stripped:
         for r in await conn.fetch(FAMILIES_SQL, stripped):
             families.setdefault(r["content_key"], []).append(dict(r))
-    spids = sorted({str(r.get("source_product_id") or "") for r in listings}
-                   | {str(r.get("source_product_id") or "") for fam in families.values() for r in fam} - {""})
+    spids = sorted(({str(r.get("source_product_id") or "") for r in listings}
+                    | {str(r.get("source_product_id") or "") for fam in families.values() for r in fam}) - {""})
     groups: Dict[MemberKey, str] = {}
     if spids:
         for r in await conn.fetch(MEMBERSHIPS_SQL, spids):
             groups[member_key(dict(r))] = r["product_group_id"]
-    return build_proposals(listings, families, groups)
+    from_cks = sorted({str(r.get("content_key")) for r in listings if r.get("content_key")})
+    from_family_keys: Dict[str, List[str]] = {}
+    for r in await conn.fetch(FROM_FAMILIES_SQL, from_cks):
+        from_family_keys.setdefault(r["content_key"], []).append(r["product_key"])
+    group_ids = sorted(set(groups.values()))
+    group_sizes = {r["product_group_id"]: int(r["n"]) for r in await conn.fetch(GROUP_SIZES_SQL, group_ids)}
+    return build_proposals(listings, families, groups, from_family_keys, group_sizes)
 
 
 async def refresh_after_move(details: Iterable[Mapping[str, Any]], *, source: str,
@@ -130,9 +186,15 @@ async def refresh_after_move(details: Iterable[Mapping[str, Any]], *, source: st
 
     out = {"refreshed": 0, "reaped": 0, "recomputed": 0, "errors": 0}
     for d in details:
+        if d.get("reverted") is False:  # a revert that left this listing alone touched neither view
+            continue
         # Both sides, after an apply AND after a revert: each content_key gained or lost a member. A
         # content_key left with no catalog row builds nothing and has its view reaped.
-        for ck in dict.fromkeys(k for k in (d.get("to_content_key"), d.get("from_content_key")) if k):
+        # The side that LOST the listing first: its view may still carry the listing's signature, which
+        # agent_pdp_view indexes uniquely, so the gaining side's rebuild must come after it is reaped/rebuilt.
+        lost_first = ((d.get("to_content_key"), d.get("from_content_key")) if d.get("reverted") else
+                      (d.get("from_content_key"), d.get("to_content_key")))
+        for ck in dict.fromkeys(k for k in lost_first if k):
             try:
                 out["refreshed"] += int(bool(await refresh_agent_pdp_view_for_content_key(
                     ck, refresh_source=source, db=db)))

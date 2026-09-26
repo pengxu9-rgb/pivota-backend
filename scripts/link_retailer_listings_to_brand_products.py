@@ -11,8 +11,14 @@ See services/identity_brand_link.py for the rule. Each step is explicit; nothing
     python -m scripts.link_retailer_listings_to_brand_products --approve --by "<who>"
   Apply the approved ones (drift-guarded, one transaction), then rebuild the touched views:
     python -m scripts.link_retailer_listings_to_brand_products --apply
-  Undo a run (moves back only what still holds this run's values), then rebuild the views:
+  Undo a run (per listing, only when both its content_key and group still hold this run's values),
+  then rebuild the views:
     python -m scripts.link_retailer_listings_to_brand_products --revert <run_id>
+  Re-run only the view rebuild for an applied run (after a counted refresh error):
+    python -m scripts.link_retailer_listings_to_brand_products --refresh <run_id>
+
+Apply only once PR #2384 is live: a moved listing stays is_primary (as every grouped retailer listing
+is), and #2384's brand-store rank is what keeps the brand's own row the served canonical in its group.
 
 Needs DATABASE_URL: run it through scripts/ops/run_oneoff_job.sh.
 """
@@ -68,6 +74,7 @@ async def main(argv: List[str]) -> int:
     mode.add_argument("--approve", action="store_true")
     mode.add_argument("--apply", action="store_true")
     mode.add_argument("--revert", metavar="RUN_ID")
+    mode.add_argument("--refresh", metavar="RUN_ID")
     ap.add_argument("--by", help="who approves (with --approve)")
     args = ap.parse_args(argv)
     if args.approve and not (args.by or "").strip():
@@ -77,7 +84,10 @@ async def main(argv: List[str]) -> int:
 
     conn = await asyncpg.connect(os.environ["DATABASE_URL"], timeout=30, command_timeout=300)
     try:
-        if args.revert:
+        if args.refresh:
+            details = _details(await conn.fetch(RUN_EVENTS_SQL, args.refresh))
+            result = {"run_id": args.refresh, "refresh": await _refresh(details, STRATEGY)}
+        elif args.revert:
             result = await revert_run(conn, args.revert)
             result["refresh"] = await _refresh(result.get("detached") or [], f"{STRATEGY}_revert")
         elif args.apply:

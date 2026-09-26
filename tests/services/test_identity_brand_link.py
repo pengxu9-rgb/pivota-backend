@@ -176,7 +176,7 @@ async def test_apply_moves_the_listing_and_revert_moves_it_back():
     assert conn.rows[LISTING["product_key"]]["content_key"] == LISTING_CK
     assert conn.groups[("external_seed", "external_seed", LISTING["source_product_id"])] == "pg_listing"
     [d] = back["detached"]
-    assert d["reverted_content_key"] and d["reverted_group"]
+    assert d["reverted"] is True
 
 
 @pytest.mark.asyncio
@@ -206,7 +206,9 @@ async def test_revert_leaves_a_listing_that_moved_again_alone():
     conn.rows[LISTING["product_key"]]["content_key"] = "ck_later"  # something re-keyed it after the run
     back = await revert_run(conn, "R3")
     assert conn.rows[LISTING["product_key"]]["content_key"] == "ck_later"
-    assert back["detached"][0]["reverted_content_key"] is False
+    # all or nothing: the group is NOT moved back alone either
+    assert conn.groups[("external_seed", "external_seed", LISTING["source_product_id"])] == "pg_brand"
+    assert back["detached"][0]["reverted"] is False
 
 
 @pytest.mark.asyncio
@@ -243,5 +245,82 @@ async def test_the_refresh_rebuilds_both_sides_and_counts_failures(monkeypatch):
     out = await link.refresh_after_move(
         [{"to_content_key": BRAND_CK, "from_content_key": LISTING_CK},
          {"to_content_key": "ck_boom", "from_content_key": LISTING_CK}], source="t")
-    assert seen["refresh"] == [BRAND_CK, LISTING_CK, "ck_boom", LISTING_CK]
+    # the side that LOST the listing first (its view may hold the listing's unique signature)
+    assert seen["refresh"] == [LISTING_CK, BRAND_CK, LISTING_CK, "ck_boom"]
     assert out == {"refreshed": 1, "reaped": 2, "recomputed": 3, "errors": 1}
+    seen["refresh"].clear()
+    await link.refresh_after_move([{"to_content_key": BRAND_CK, "from_content_key": LISTING_CK, "reverted": True},
+                                   {"to_content_key": "ck_x", "from_content_key": "ck_y", "reverted": False}],
+                                  source="t")
+    assert seen["refresh"] == [BRAND_CK, LISTING_CK]  # a revert: the brand side lost it; a skipped one: nothing
+
+
+# --- review of the attach_membership PR ---------------------------------------------------------------
+
+
+def test_nothing_may_stay_behind_on_the_old_content_key():
+    """A row left on the listing's old content_key would pull it back on the next crawl (exact tier) and
+    fail the store job on the group; so a listing moves only with every row on that key."""
+    sibling = {**LISTING, "product_key": "ext:retailer:" + "c" * 32, "source_product_id": "retailer:" + "c" * 32}
+    groups = {**GROUPS, link.member_key(sibling): "pg_listing"}
+    both = {LISTING_CK: [LISTING["product_key"], sibling["product_key"]]}
+    proposals, counts = link.build_proposals([LISTING, sibling], {BRAND_CK: [BRAND]}, groups, both,
+                                             {"pg_listing": 2})
+    assert len(proposals) == 2 and counts == {"proposed": 2}          # they move together
+    stuck = {**sibling, "gtin": "08809643069999"}
+    proposals, counts = link.build_proposals([LISTING, stuck], {BRAND_CK: [{**BRAND, "gtin": "08809643062982"}]},
+                                             groups, both, {"pg_listing": 2})
+    assert proposals == [] and counts["rows_left_on_old_content_key"] == 1   # one can't move -> neither does
+    store_row = {LISTING_CK: [LISTING["product_key"], "ext:cocomo-missha-artemisia::1"]}  # not a listing at all
+    assert link.build_proposals([LISTING], {BRAND_CK: [BRAND]}, GROUPS, store_row, {})[1] == \
+        {"rows_left_on_old_content_key": 1}
+
+
+def test_a_group_with_other_members_is_not_emptied_of_one():
+    proposals, counts = link.build_proposals([LISTING], {BRAND_CK: [BRAND]}, GROUPS,
+                                             {LISTING_CK: [LISTING["product_key"]]}, {"pg_listing": 3})
+    assert proposals == [] and counts == {"old_group_has_other_members": 1}
+
+
+def test_a_drifted_move_mints_a_new_proposal():
+    [a], _ = _build()
+    [b], _ = _build(groups={**GROUPS, link.member_key(LISTING): "pg_listing_v2"})
+    assert a["proposal_key"] != b["proposal_key"]
+    assert _build()[0][0]["proposal_key"] == a["proposal_key"]  # an unchanged move dedupes
+
+
+def test_the_move_sql_is_conditional_on_what_propose_time_saw():
+    from services import identity_resolution as ir
+    ck = " ".join(ir.MOVE_CONTENT_KEY_SQL.split())
+    pg = " ".join(ir.MOVE_GROUP_SQL.split())
+    assert "WHERE product_key = $1 AND content_key = $3 AND suppression_reason IS NULL" in ck
+    assert "AND product_group_id = $5" in pg
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_touches_no_row_aborts_the_run():
+    conn = _conn()
+
+    async def lost_race(sql, *args):
+        if " ".join(sql.split()).startswith("UPDATE product_group_members"):
+            return "UPDATE 0"
+        return await StateConn.execute(conn, sql, *args)
+    conn.execute = lost_race
+    with pytest.raises(RuntimeError):
+        await apply_approved(conn, run_id="R5", strategies=[link.STRATEGY])
+
+
+@pytest.mark.asyncio
+async def test_a_revert_write_that_loses_a_race_aborts_the_revert():
+    """The pre-check passed but the conditional write touched nothing: roll the whole revert back."""
+    conn = _conn()
+    await apply_approved(conn, run_id="R6", strategies=[link.STRATEGY])
+    real = conn.execute
+
+    async def lost_race(sql, *args):
+        if " ".join(sql.split()).startswith("UPDATE product_group_members"):
+            return "UPDATE 0"
+        return await real(sql, *args)
+    conn.execute = lost_race
+    with pytest.raises(RuntimeError):
+        await revert_run(conn, "R6")
