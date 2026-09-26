@@ -11,8 +11,9 @@ crawled in retailer mode and passed `retailer_maker_unproven` only because their
 "us", sat under the 3-char floor (#2362 closed that). So their rows were written as a RETAILER's
 listings: `ext:retailer:` product keys, offers under `agent_seed::retailer::<host>`, reseller INCI
 authority. The brand_official re-run writes CANONICAL keys and `apply_ingest_plan` upserts on
-product_key, so it has no way to retire the retailer chain: without this step the store is served
-twice, once as a retailer of its own products.
+product_key, so it has no way to retire the retailer chain. `make_content_key` hashes only (brand, title,
+GTIN), so both rows of a product share one cluster: without this step the store is listed as TWO sellers
+of its own product, one of them labelled a retailer, and the seller count is inflated by one.
 
 THE COHORT IS WHAT THE HOST WROTE AS A RETAILER, proven from both sides, or nothing is written:
   * the `ext:retailer:` rows whose source_domain is the host, and
@@ -22,10 +23,13 @@ brand; the brand must own the host (`brand_owns_domain`, the same label-equality
 brand_official lane admits a store by). An `ext:retailer:` key is one listing on one host, so any
 other shape is one this script was not written for.
 
-ORDER. Run this BEFORE the brand_official apply, as retire_superseded_brand_keys does: the two key
-sets are disjoint, and retiring first means the store is never served both ways at once. `--apply`
-also refuses unless a brand_official retailer_ingest job for the host exists (queued, apply_due,
-held or done) -- the chain is only superseded if something supersedes it.
+ORDER. Run this AFTER the brand_official apply for the host has landed (its job is `done`), the
+reverse of retire_superseded_brand_keys (Peng 2026-09-26). Retiring first leaves the store with no live
+offers from the moment of retirement until the apply lands -- the drain queue, a held-flag approval and
+a 20-40 min apply -- whereas the overlap the other order allows is one duplicate seller inside a cluster
+that already exists. `--apply` therefore refuses unless a brand_official retailer_ingest job for the
+host is `done`: the chain is only superseded once something has superseded it. The post-commit refresh
+then rebuilds each cluster's view row with the brand-direct offer alone.
 
 DRY-RUN BY DEFAULT. Nothing is written without --apply. Like every script that refreshes
 agent_pdp_view, the apply's post-commit refresh can issue DDL (see build_agent_pdp_view_row).
@@ -70,7 +74,8 @@ from services.offer_seller_identity import brand_owns_domain  # noqa: E402
 
 REASON = "retailer_chain_superseded_by_brand_official"
 RETAILER_KEY_PREFIX = "ext:retailer:"
-BRAND_OFFICIAL_JOB_STATUSES = ("queued", "apply_due", "held", "done")
+BRAND_OFFICIAL_JOB_STATUSES = ("queued", "apply_due", "held", "done")  # reported by the plan
+SUPERSEDED_STATUS = "done"  # required by --apply: see ORDER
 
 HOST_RETAILER_ROWS_SQL = """
 SELECT product_key, content_key, merchant_id, brand, title, source_domain,
@@ -239,8 +244,10 @@ async def _refresh_and_recompute(content_keys: List[str]) -> Dict[str, int]:
 async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
     if p["problems"]:
         raise SystemExit(f"refused, nothing written: {p['problems']}")
-    if not p["brand_official_jobs"]:
-        raise SystemExit(f"refused, nothing written: no brand_official job for {p['host']} supersedes this chain")
+    done = [j for j in p["brand_official_jobs"] if j.get("status") == SUPERSEDED_STATUS]
+    if not done:
+        raise SystemExit(f"refused, nothing written: no {SUPERSEDED_STATUS} brand_official job for {p['host']} has "
+                         f"superseded this chain yet ({[(j['id'], j['status']) for j in p['brand_official_jobs']]})")
     keys = p["live"]
     if not keys:
         print("nothing live to retire -- no write.")
@@ -249,7 +256,7 @@ async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
     at = datetime.now(timezone.utc).isoformat()
     metadata = json.dumps({
         "run_id": run_id, "reason": REASON, "pr": "pivota-backend#2362", "host": p["host"], "brand": p["brand"],
-        "superseded_by_jobs": [j["id"] for j in p["brand_official_jobs"]],
+        "superseded_by_jobs": [j["id"] for j in done],
         "note": "brand's own store written as a retailer listing chain; re-run as brand_official", "at": at,
     })
     # BEFORE-state first: a manifest written after the write cannot describe what it replaced.

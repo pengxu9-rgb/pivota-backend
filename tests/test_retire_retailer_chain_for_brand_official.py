@@ -109,8 +109,11 @@ def test_the_same_reason_from_another_lane_is_not_the_cascade_stamp():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("problems,jobs,why", [
-    (["foreign_offers: x"], [{"id": "rij_1", "status": "held"}], "foreign_offers"),
-    ([], [], "no brand_official job"),
+    (["foreign_offers: x"], [{"id": "rij_1", "status": "done"}], "foreign_offers"),
+    ([], [], "no done brand_official job"),
+    # Apply-then-retire: a job that has not landed yet does not supersede anything, and retiring
+    # ahead of it would leave the store with no live offers until it does.
+    ([], [{"id": "rij_1", "status": "held"}, {"id": "rij_2", "status": "apply_due"}], "no done brand_official job"),
 ])
 async def test_apply_refuses_before_writing_anything(tmp_path, problems, jobs, why):
     rows, keys, offers = clean()
