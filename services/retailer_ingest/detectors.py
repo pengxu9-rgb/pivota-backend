@@ -8,6 +8,13 @@ Each rule is measured, not imagined:
     pasted description. -> lip_row_copy_not_about_lips.
   * 2026-09-09 limecrime.com: a literal `TEST Product` priced $999,999,999.00 in /products.json.
     -> placeholder_product.
+  * 2026-09-26 headandshoulders.com: a "where to buy" brand site pricing EVERY storefront variant at
+    1.00 (120 of 120). The drain applied 74 PDPs / 152 offers at $1.00 unflagged: $1.00 clears the
+    per-row rule, and the signal is store-wide. Measured the same day over every store this lane has
+    written (186 store/currency cohorts, 39,514 offers): headandshoulders.com is the only one whose
+    modal price is <= 2.00 at a modal share over 0.22, or whose <= 1.00 share is over 0.20 (next:
+    timelybasket.com, 10/46 at 2.00 and 9/46 at 1.00).
+    honest.com's storefront carries 125 of 317 variants at 1.00, mostly diapers. -> placeholder_price_store.
   * Rows the opt-in lip title door placed (#2257) are a per-row BLOCK: unattended, nothing but the
     title vouches for them (review of #2263: "Lipstick Poster" typed "Misc" reaches a lip leaf).
 
@@ -48,6 +55,16 @@ _SET_TITLE = re.compile(r"\b(?:sets?|kits?|bundles?|trio|(?:[2-9]|\d{2,})\s*-?\s
 _SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|g|oz|fl\.?\s*oz)\b", re.I)
 _PLACEHOLDER = re.compile(r"\b(?:test\s*product|dummy|do\s+not\s+buy|placeholder|sample\s+product)\b", re.I)
 
+# Store-level placeholder pricing (placeholder_price_store), judged over the WHOLE cohort passed to
+# detect(). Measured 2026-09-26 (see the module docstring): every threshold in the grid min 10-30 /
+# modal share 0.6-0.9 / modal ceiling 2-5 / <=1.00 share 0.2-0.4 held headandshoulders.com and nothing
+# else. The values below sit between the placeholder stores and the nearest legitimate ones.
+_STORE_MIN_VARIANTS = 20       # a smaller cohort is not evidence of a store-wide price
+_STORE_MODAL_SHARE = 0.80      # headandshoulders.com 1.00; max legitimate store with a mode <= 2.00: 0.217
+_STORE_MODAL_CEILING = 2.00    # a flat $10 / $23 store (biodance.com 0.53 at 23.00) is a real price list
+_STORE_TOKEN_PRICE = 1.00      # the "see store" token price
+_STORE_TOKEN_SHARE = 0.30      # honest.com 0.39-0.40; max legitimate: timelybasket.com 0.196
+
 
 def _pdp(record: Any) -> Dict[str, Any]:
     pdp = record.get("pdp") if isinstance(record, dict) else None
@@ -76,6 +93,51 @@ def _prices(record: Dict[str, Any]) -> List[float]:
     return out
 
 
+def _variant_prices(record: Dict[str, Any]) -> List[float]:
+    """Every variant's own price (pdp.variants, one per sellable storefront variant), rounded to the
+    cent; the offer prices when the record carries no variants."""
+    out = []
+    for variant in _pdp(record).get("variants") or []:
+        try:
+            out.append(round(float((variant or {}).get("price")), 2))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return out or [round(p, 2) for p in _prices(record)]
+
+
+def _store_placeholder_flags(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """placeholder_price_store: the store prices its catalogue with a token, so no per-row price is real.
+
+    A BLOCK per row whose prices are ALL at or below the placeholder price -- keyed like every row flag,
+    so an operator can accept a real $1 item or exclude rows. A row with any price above it is a real
+    product carrying a token-priced variant, and is not held by this rule."""
+    priced = [(record, _variant_prices(record)) for record in records]
+    priced = [(record, prices) for record, prices in priced if prices]
+    every = [p for _, prices in priced for p in prices]
+    total = len(every)
+    if total < _STORE_MIN_VARIANTS:
+        return []
+    counts: Dict[float, int] = {}
+    for p in every:
+        counts[p] = counts.get(p, 0) + 1
+    # Ties go to the LOWER price: the placeholder is the cheap one.
+    modal, modal_n = min(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    token_n = sum(1 for p in every if p <= _STORE_TOKEN_PRICE)
+    ceilings = []
+    if modal_n / total >= _STORE_MODAL_SHARE and modal <= _STORE_MODAL_CEILING:
+        ceilings.append(modal)
+    if token_n / total >= _STORE_TOKEN_SHARE:
+        ceilings.append(_STORE_TOKEN_PRICE)
+    if not ceilings:
+        return []
+    ceiling = max(ceilings)
+    evidence = (f"store-wide placeholder pricing: {modal_n}/{total} variants at {modal:.2f}, "
+                f"{token_n}/{total} at or below {_STORE_TOKEN_PRICE:.2f}")
+    return [_flag("placeholder_price_store", BLOCK, record,
+                  f"{evidence}; every price of this row is <= {ceiling:.2f} ({sorted(set(prices))[:4]})")
+            for record, prices in priced if max(prices) <= ceiling]
+
+
 def _size_units(text: str) -> List[float]:
     """Sizes normalised to ml/g (oz x 28.35 is close enough for a 20 cut)."""
     sizes = []
@@ -102,14 +164,20 @@ def _flag(rule: str, severity: str, record: Dict[str, Any], detail: str) -> Dict
     }
 
 
-def detect(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True) -> List[Dict[str, Any]]:
+    """Per-row rules over each record, then (store_level) the rules judged over the whole cohort.
+
+    `records` IS the cohort for the store-level rules: pass every row of the store, never a subset.
+    A caller re-checking a subset it already judged as part of the whole passes store_level=False."""
     from services.curated_brand_feed import CATEGORY_CONFIDENCE_LIP_TITLE, _NON_FACE_TITLE, _title_paths
 
     flags: List[Dict[str, Any]] = []
+    cohort: List[Dict[str, Any]] = []
     for record in records or []:
         pdp = _pdp(record)
         if not pdp:
             continue
+        cohort.append(record)
         title = str(pdp.get("product_name") or pdp.get("title") or "")
         category = str(pdp.get("category_path") or "")
         copy = str(pdp.get("attribute_summary") or "")
@@ -161,6 +229,8 @@ def detect(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 or any(p <= 0.5 or p >= 1000 for p in prices)):
             flags.append(_flag("placeholder_product", BLOCK, record,
                                f"looks like a test/placeholder row (prices {sorted(set(prices))[:4]})"))
+    if store_level:
+        flags.extend(_store_placeholder_flags(cohort))
     return flags
 
 

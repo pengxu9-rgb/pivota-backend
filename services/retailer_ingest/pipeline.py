@@ -706,8 +706,10 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     if refiled:
         # Judge each re-filed row on BOTH shelves: the rules keyed on the store's shelf (lip size, lip
         # copy, the lip title door) cannot fire on the gift-set shelf, and a re-file must not hide them.
+        # Per-row rules only: the store-level rules already judged these rows as part of the whole cohort
+        # above, and the re-filed handful is not a store (22 re-filed $1 sets must not read as one).
         seen = {f["key"] for f in row_flags}
-        row_flags += [f for f in detectors.detect(refiled_as_filed) if f["key"] not in seen]
+        row_flags += [f for f in detectors.detect(refiled_as_filed, store_level=False) if f["key"] not in seen]
         answered = [f for f in row_flags if f.get("handle") in refiled and f.get("rule") in REFILE_RESOLVES_RULES]
         row_flags = [f for f in row_flags if f not in answered]
         checks["refile_resolved_flags"] = sorted(f["key"] for f in answered)
