@@ -159,6 +159,25 @@ def canonical_product_name(brand: Optional[str], product_name: Optional[str]) ->
     return norm or "unknown"
 
 
+#: catalog_products / catalog_skus.source_product_id is VARCHAR(128) (migration 058).
+SOURCE_PRODUCT_ID_MAX = 128
+
+
+def bounded_source_product_id(brand: Optional[str], product_name: Optional[str]) -> str:
+    """`canonical_product_name`, bounded to the column: byte-identical up to 128 chars, and past it the
+    first 119 chars plus "-" and 8 hex of the full name's sha1 (still deterministic, still distinct).
+
+    Measured 2026-09-26: kissusa.com's "Kiss Professional Full Cover Press On Fake Toenails - Tippy Toes
+    | 130 Toenails, Includes Nail Glue, Solid, White, Short, Squoval, Pedicure" slugs to 134 chars; its
+    insert failed on the column, and one missing product marked the whole 362-product store job partial.
+    No stored row changes: a longer id could never have been written."""
+    canonical = canonical_product_name(brand, product_name)
+    if len(canonical) <= SOURCE_PRODUCT_ID_MAX:
+        return canonical
+    digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:8]
+    return f"{canonical[:SOURCE_PRODUCT_ID_MAX - 9]}-{digest}"
+
+
 def derive_product_key(brand: Optional[str], product_name: Optional[str]) -> str:
     """Stable product_key derived from (brand, product_name). Uses a
     deterministic hash to bound the length to the catalog_products
@@ -499,7 +518,7 @@ def _build_variant_sku_inserts(
             "product_key": product_key,
             "merchant_id": seller["merchant_id"],
             "platform": SYNTHETIC_PLATFORM,
-            "source_product_id": canonical_product_name(pdp_payload["brand"], pdp_payload["product_name"]),
+            "source_product_id": bounded_source_product_id(pdp_payload["brand"], pdp_payload["product_name"]),
             "source_variant_id": stored_vid,
             "source_domain": pdp_payload.get("source_domain") or None,
             "sku": str(v.get("sku") or "").strip() or None,
@@ -559,7 +578,7 @@ def _build_pdp_insert(
     """Construct the catalog_products row dict that the runner will
     INSERT. The product_key is deterministic so re-runs UPSERT cleanly."""
     product_key = derive_product_key(pdp_payload["brand"], pdp_payload["product_name"])
-    source_product_id = canonical_product_name(
+    source_product_id = bounded_source_product_id(
         pdp_payload["brand"],
         pdp_payload["product_name"],
     )
@@ -1163,7 +1182,7 @@ def _build_sku_insert(
         # source_variant_id derivations are untouched storage tokens.
         "merchant_id": seller["merchant_id"],
         "platform": SYNTHETIC_PLATFORM,
-        "source_product_id": canonical_product_name(
+        "source_product_id": bounded_source_product_id(
             pdp_payload["brand"], pdp_payload["product_name"]
         ),
         # The identity index is `idx_catalog_skus_source_identity_v2`
