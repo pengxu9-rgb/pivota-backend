@@ -185,11 +185,16 @@ def _seed_row(
     }
 
 
+_CAPTURED_SQL: List[Any] = []
+
+
 def _refresh(monkeypatch: pytest.MonkeyPatch, row: Dict[str, Any], page, *, reached: bool = True):
     """Drive the real refresh; return (result, the persisted row)."""
     import routes.employee_products as mod
 
     stored = copy.deepcopy(row)
+    captured_sql = _CAPTURED_SQL
+    captured_sql.clear()
 
     async def fake_fetch_one(_q, values=None):
         return stored if values and values.get("id") == stored["id"] else None
@@ -200,7 +205,10 @@ def _refresh(monkeypatch: pytest.MonkeyPatch, row: Dict[str, Any], page, *, reac
         persisted = json.loads(json.dumps(values, default=str))
         if isinstance(persisted.get("seed_data"), str):
             persisted["seed_data"] = json.loads(persisted["seed_data"])
-        stored.update({k: v for k, v in persisted.items() if k not in ("id", "read_the_served_product")})
+        stored.update(
+            {k: v for k, v in persisted.items() if k not in ("id", "read_the_served_product", "read_canonical_url")}
+        )
+        captured_sql.append((_query, persisted))
 
     async def resolve(*, observed=None, **_kwargs):
         if observed is not None:
@@ -934,3 +942,183 @@ def test_unread_since_selects_only_attempts_that_did_not_read(monkeypatch):
     args = script._parser().parse_args(["--cohort", "all", "--unread-since", "2026-09-26T01:00:00Z"])
     summary = asyncio.run(script._run(args))
     assert summary["mode"] == "dry_run" and summary["selected"] == 3
+
+
+# ----------------------------------------------------------------- canonical_url is the served URL
+
+
+def _canonical_row() -> Dict[str, Any]:
+    return _seed_row(variants=[_variant("1", 16.0, "out_of_stock")], price=16.0, availability="out_of_stock")
+
+
+def test_a_read_page_naming_a_sibling_shade_does_not_move_the_served_url(monkeypatch):
+    """fentybeauty: the `...-470` page declares `...-340` canonical. Storing it made every later
+    refresh `not_read` (581 active seeds, 501 fenty, locked out on 2026-09-26)."""
+    sibling = DEST + "-other-shade"
+    page = _page([_offer(17, IN, sku="RL")])
+    page.canonical_url = sibling
+    first, stored = _refresh(monkeypatch, _canonical_row(), page)
+
+    assert first["variant_refresh"]["status"] == "all_re_read", "this fetch did read the product"
+    assert stored["canonical_url"] == DEST, "the page's claim did not replace the served URL"
+    assert first["canonical_url"] == DEST
+    assert stored["seed_data"]["snapshot"]["canonical_url"] == sibling, "what the page said is still recorded"
+
+    second, _ = _refresh(monkeypatch, stored, page)
+    assert second["variant_refresh"]["status"] == "all_re_read", "and the row stays readable"
+
+
+def test_a_read_page_whose_canonical_is_the_same_destination_is_taken(monkeypatch):
+    www = DEST.replace("://", "://www.")
+    page = _page([_offer(17, IN, sku="RL")])
+    page.canonical_url = www
+    page.domain = "www.eyurs.com"
+    result, stored = _refresh(monkeypatch, _canonical_row(), page)
+
+    assert (stored["canonical_url"], stored["domain"]) == (www, "www.eyurs.com")
+    assert result["canonical_url"] == www
+
+
+def test_an_attempt_that_read_nothing_never_writes_the_served_url(monkeypatch):
+    """The cache fallback (timeout, TLS, robots, a refused connection) wrote the cached page's
+    canonical too -- that is how fenty 5feb456c98ca0346's served URL changed at 01:18Z with no read."""
+    page = _page([_offer(17, IN, sku="RL")])
+    page.canonical_url = DEST.replace("://", "://www.")
+    page.domain = "www.eyurs.com"
+    _, stored = _refresh(monkeypatch, _canonical_row(), page, reached=False)
+
+    assert (stored["canonical_url"], stored["domain"]) == (DEST, "eyurs.com")
+
+
+@pytest.mark.parametrize(
+    "read,observed,expected",
+    [
+        (True, DEST.replace("://", "://www."), DEST.replace("://", "://www.")),
+        (True, DEST + "/", DEST + "/"),
+        (True, DEST + "-other-shade", "STORED"),
+        (True, DEST.replace("eyurs.com", "eyurs.jp"), "STORED"),
+        (True, DEST + "?variant=2", "STORED"),
+        (True, None, "STORED"),
+        (False, DEST.replace("://", "://www."), "STORED"),
+    ],
+)
+def test_next_served_canonical_takes_only_a_read_same_destination(read, observed, expected):
+    from routes.employee_products import _next_served_canonical
+
+    row = {"canonical_url": "https://stored.example/products/x", "domain": "stored.example"}
+    got = _next_served_canonical(row, DEST, observed, "observed.example", read_the_served_product=read)
+    if expected == "STORED":
+        assert got == ("https://stored.example/products/x", "stored.example")
+    else:
+        assert got == (expected, "observed.example")
+
+
+def _load_reset_script(name: str):
+    import importlib.util
+    import pathlib
+
+    spec = importlib.util.spec_from_file_location(
+        name, pathlib.Path(__file__).resolve().parents[1] / "scripts/ops/reset_unreadable_canonical_urls.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "dest,canonical,expected",
+    [
+        ("https://fentybeauty.com/products/foundation-470", "https://fentybeauty.com/products/foundation-340", "different_product"),
+        ("https://poopourri.com/products/purrfectly-bamboo", "https://pourri.com/products/purrfectly-bamboo", "same_product_elsewhere"),
+        ("https://x.com/products/a", "https://www.x.com/fr-fr/products/a", "same_product_elsewhere"),
+        ("https://x.com/products/a", "https://x.com/products/a?variant=2", "same_product_elsewhere"),
+        ("https://x.com/p/123", "https://x.com/p/456", "no_handle"),
+        ("https://x.com/products/a", "https://www.x.com/products/a/", None),
+        ("https://x.com/products/a", None, None),
+    ],
+)
+def test_the_canonical_reset_classifies_only_unreadable_canonicals(dest, canonical, expected):
+    assert _load_reset_script("reset_classify").classify(dest, canonical) == expected
+
+
+def test_the_canonical_reset_is_a_dry_run_unless_applied_and_never_overwrites_a_newer_value(monkeypatch):
+    script = _load_reset_script("reset_apply")
+    rows = [
+        {"id": "a", "domain": "fentybeauty.com", "destination_url": "https://fentybeauty.com/products/f-470", "canonical_url": "https://fentybeauty.com/products/f-340"},
+        {"id": "b", "domain": "x.com", "destination_url": "https://x.com/products/a", "canonical_url": "https://www.x.com/products/a"},
+        {"id": "c", "domain": "pourri.com", "destination_url": "https://poopourri.com/products/p", "canonical_url": "https://pourri.com/products/p"},
+    ]
+    writes: List[Dict[str, Any]] = []
+
+    async def fetch_all(query, values=None):
+        return rows
+
+    async def fetch_one(query, values=None):
+        writes.append({"sql": query, **values})
+        return None if values["id"] == "c" else {"id": values["id"]}  # "c" moved since it was read
+
+    monkeypatch.setattr(script.database, "connect", AsyncMock(return_value=None))
+    monkeypatch.setattr(script.database, "disconnect", AsyncMock(return_value=None))
+    monkeypatch.setattr(script.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(script.database, "fetch_one", fetch_one)
+
+    dry = asyncio.run(script._run(script._parser().parse_args([])))
+    assert dry["mode"] == "dry_run" and dry["selected"] == 2 and writes == []
+    assert dry["by_category"] == {"different_product": 1, "same_product_elsewhere": 1}
+
+    assert dry["served_id_pinned"] == 2, "neither row carries seed_data.external_product_id"
+
+    applied = asyncio.run(script._run(script._parser().parse_args(["--apply"])))
+    assert (applied["reset"], applied["skipped_changed_since_read"]) == (1, 1)
+    assert writes[0]["served_id"] == script.served_external_product_id(
+        "https://fentybeauty.com/products/f-340", "https://fentybeauty.com/products/f-470"
+    )
+    assert [w["id"] for w in writes] == ["a", "c"]
+    for w in writes:
+        assert "canonical_url = destination_url" in w["sql"] and "AND canonical_url = :old" in w["sql"]
+        assert ":MI" not in w["sql"], "no time format literal the bind parser would eat"
+    assert writes[0]["old"] == "https://fentybeauty.com/products/f-340", "the undo value is the stored canonical"
+
+
+def test_the_canonical_reset_script_runs_the_way_the_job_runs_it():
+    import pathlib
+    import subprocess
+    import sys
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [sys.executable, str(root / "scripts/ops/reset_unreadable_canonical_urls.py"), "--help"],
+        cwd=str(root / "scripts"), capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "--apply" in proc.stdout
+
+
+def test_the_refresh_moves_the_served_url_only_from_what_it_read(monkeypatch):
+    """A concurrent reset (`reset_unreadable_canonical_urls.py`) may change canonical_url between
+    this refresh's read and its write; the UPDATE must not write the stale copy back."""
+    www = DEST.replace("://", "://www.")
+    row = _canonical_row()
+    row["canonical_url"] = www  # what the refresh reads; still the same destination
+    result, _ = _refresh(monkeypatch, row, _page([_offer(17, IN, sku="RL")]))  # page says DEST
+
+    (sql, values), = [(q, v) for q, v in _CAPTURED_SQL if "UPDATE external_product_seeds" in q]
+    assert "canonical_url IS NOT DISTINCT FROM :read_canonical_url" in sql
+    assert "THEN :canonical_url ELSE canonical_url END" in sql
+    assert "THEN :domain ELSE domain END" in sql
+    assert values["canonical_url"] == DEST, "this read does move the served URL"
+    assert values["read_canonical_url"] == www, "...but only if the row still holds what was read"
+
+
+def test_the_reset_pins_the_id_the_gateway_serves_today():
+    """agent_shop_gateway serves ext_ + sha256(canonical_url or destination_url) for a seed with no
+    seed_data.external_product_id; the reset must not change it (review of #2374, note c)."""
+    import routes.agent_shop_gateway as gateway
+
+    script = _load_reset_script("reset_served_id")
+    sibling, dest = "https://fentybeauty.com/products/f-340", "https://fentybeauty.com/products/f-470"
+    assert script.served_external_product_id(sibling, dest) == gateway._stable_external_product_id(sibling)
+    assert script.served_external_product_id(None, dest) == gateway._stable_external_product_id(dest)
+    sql = script._RESET_SQL
+    assert "'{external_product_id}'" in sql and "THEN to_jsonb(CAST(:served_id AS TEXT))" in sql
+    assert "ELSE seed_data::jsonb->'external_product_id' END" in sql, "an existing id is never replaced"
