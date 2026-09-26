@@ -860,3 +860,23 @@ def test_the_preview_reads_exactly_the_rows_the_refresh_reads(monkeypatch, canon
     assert fetched == [DEST], "the preview fetches the url the refresh fetches"
     assert (preview.get("status") != "not_read") is expect_read
     assert (refreshed["seed_data"]["variants"][0]["price_amount"] == 17.0) is expect_read
+
+
+def test_the_repair_script_imports_when_run_the_way_the_job_runs_it():
+    """run_oneoff_job.sh runs `python scripts/ops/<script>.py`; loading it from inside pytest
+    (repo root already on sys.path) cannot see a missing root-path line. A subprocess from a
+    directory that is NOT the repo root can."""
+    import pathlib
+    import subprocess
+    import sys
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [sys.executable, str(root / "scripts/ops/refresh_seeds_with_unverified_variants.py"), "--help"],
+        cwd=str(root / "scripts"),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "--simulate" in proc.stdout

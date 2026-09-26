@@ -43,9 +43,16 @@ import argparse
 import asyncio
 import collections
 import json
+import os
+import sys
 from typing import Any, Dict, List
 
-from db.database import database
+# `python scripts/ops/<this>.py` puts scripts/ops/ on sys.path, not the repo root, so the
+# first run through run_oneoff_job.sh died on `No module named 'db'` before touching anything.
+# Same line as the other scripts/ops entry points.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from db.database import database  # noqa: E402
 
 _FRESH = """
   status = 'active'
