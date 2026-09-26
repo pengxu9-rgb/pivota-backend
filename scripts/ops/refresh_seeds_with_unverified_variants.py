@@ -26,6 +26,10 @@ THREE MODES, in the order to run them:
     SUBNET=pivota-crawl scripts/ops/run_oneoff_job.sh \
         scripts/ops/refresh_seeds_with_unverified_variants.py --cohort drift --apply
 
+`--unread-since <ISO time>` narrows any mode to rows attempted since then whose attempt did not
+read the page -- the re-run for rows a throttled host refused. Every mode walks the rows
+round-robin across domains (see `_interleave_hosts`).
+
 `--simulate` fetches the same URL the refresh does and applies the refresh's own "did we read
 the served product" rule (`_read_the_served_product`); a row it cannot read is `not_read`,
 exactly as `--apply` would leave it. It approximates only the column decision (a positive
@@ -45,7 +49,8 @@ import collections
 import json
 import os
 import sys
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 # `python scripts/ops/<this>.py` puts scripts/ops/ on sys.path, not the repo root, so the
 # first run through run_oneoff_job.sh died on `No module named 'db'` before touching anything.
@@ -63,7 +68,7 @@ _FRESH = """
 
 # ONE variant, and the column (what the refresh re-read) disagrees with it on a KNOWN value.
 _DRIFT_SQL = f"""
-SELECT id, domain FROM external_product_seeds
+SELECT id, domain, last_crawl_attempt_at, last_crawled_at FROM external_product_seeds
 WHERE {_FRESH}
   AND jsonb_array_length(seed_data->'variants') = 1
   AND (
@@ -82,20 +87,57 @@ ORDER BY domain, id
 """
 
 _MULTI_SQL = f"""
-SELECT id, domain FROM external_product_seeds
+SELECT id, domain, last_crawl_attempt_at, last_crawled_at FROM external_product_seeds
 WHERE {_FRESH}
   AND jsonb_array_length(seed_data->'variants') > 1
 ORDER BY domain, id
 """
 
 
-async def _select(cohort: str) -> List[Dict[str, Any]]:
+async def _select(cohort: str, *, unread_since: Optional[datetime] = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if cohort in ("drift", "all"):
         rows += [dict(r) | {"cohort": "drift"} for r in await database.fetch_all(_DRIFT_SQL)]
     if cohort in ("multi", "all"):
         rows += [dict(r) | {"cohort": "multi"} for r in await database.fetch_all(_MULTI_SQL)]
-    return rows
+    if unread_since is not None:
+        rows = [r for r in rows if _attempted_but_not_read(r, unread_since)]
+    return _interleave_hosts(rows)
+
+
+def _attempted_but_not_read(row: Dict[str, Any], since: datetime) -> bool:
+    """Attempted at or after `since`, and that attempt did not read the page.
+
+    The refresh stamps `last_crawl_attempt_at` on every outcome and `last_crawled_at` only when
+    it read the served product, both NOW() in one UPDATE, so an unread attempt leaves
+    `last_crawled_at` older than the attempt (or NULL).
+    """
+    attempt = row.get("last_crawl_attempt_at")
+    crawled = row.get("last_crawled_at")
+    return attempt is not None and attempt >= since and (crawled is None or crawled < attempt)
+
+
+def _interleave_hosts(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Round-robin across domains, keeping each domain's own order.
+
+    THE FIRST RUNS WENT DOMAIN BY DOMAIN, and Shopify's edge throttled each store after a burst:
+    2026-09-26 perfumania read 38 pages back to back and then refused 17 connections in a row,
+    bluemercury 22 then 27, holiholic 63 then 7 -- 216 rows unread, while one page on each of
+    the ten worst hosts, probed singly from the same egress hours later, fetched fine. `crawl_politeness` spaces one host at 1/s and backs off
+    only on 429/503; a refused connection is neither, so a burst kept knocking. The nightly job
+    never saw this because its queue (least recently attempted first) is already interleaved.
+    """
+    by_domain: Dict[str, List[Dict[str, Any]]] = collections.OrderedDict()
+    for row in rows:
+        by_domain.setdefault(str(row.get("domain") or ""), []).append(row)
+    queues = [collections.deque(v) for v in by_domain.values()]
+    out: List[Dict[str, Any]] = []
+    while queues:
+        for q in list(queues):
+            out.append(q.popleft())
+            if not q:
+                queues.remove(q)
+    return out
 
 
 async def _simulate(row_id: str) -> Dict[str, Any]:
@@ -145,7 +187,7 @@ async def _simulate(row_id: str) -> Dict[str, Any]:
 async def _run(args: argparse.Namespace) -> Dict[str, Any]:
     await database.connect()
     try:
-        rows = await _select(args.cohort)
+        rows = await _select(args.cohort, unread_since=args.unread_since)
         if args.limit:
             rows = rows[: args.limit]
         summary: Dict[str, Any] = {
@@ -198,14 +240,29 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
         await database.disconnect()
 
 
-def main() -> int:
+def _parse_since(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--cohort", choices=("drift", "multi", "all"), default="drift")
     parser.add_argument("--limit", type=int, default=0, help="0 = every selected row")
+    parser.add_argument(
+        "--unread-since",
+        type=_parse_since,
+        default=None,
+        help="ISO time: only rows attempted since then whose attempt did not read the page",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--simulate", action="store_true", help="FETCH, reconcile in memory, write nothing")
     mode.add_argument("--apply", action="store_true", help="FETCH and WRITE; default is a dry run")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = _parser().parse_args()
     print(json.dumps(asyncio.run(_run(args)), ensure_ascii=False, indent=2, default=str))
     return 0
 
