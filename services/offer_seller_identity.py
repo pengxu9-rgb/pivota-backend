@@ -44,6 +44,10 @@ DEFAULT_KNOWN_RETAILER_DOMAINS = (
     # Dept-store / marketplace beauty retailers (added Fix Plan C read-review):
     "selfridges.com", "harrods.com", "spacenk.com",
     "coupang.com", "gmarket.co.kr",
+    # UK/AU beauty retailers that stock brands' own lines (review of #2359: each would otherwise reach
+    # retailer-ingest Tier B, where a /meta.json naming a brand is the only thing between it and
+    # overwriting that brand's canonical rows).
+    "beautybay.com", "adorebeauty.com.au", "chemistwarehouse.com.au",
 )
 
 _MULTI_LEVEL_TLDS = frozenset({

@@ -361,6 +361,19 @@ def test_a_known_retailer_that_names_the_brand_is_still_refused():
     assert evidence == {"domain": "sephora.com", "known_retailer": True}
 
 
+@pytest.mark.parametrize("domain,storefront,market", [
+    ("beautybay.com", {"name": "Sukin Naturals UK", "currency": "USD", "ships_to_countries": ["US"]}, "US"),
+    ("adorebeauty.com.au", {"name": "Sukin Naturals", "currency": "AUD", "ships_to_countries": ["AU"]}, "AU"),
+    ("chemistwarehouse.com.au", {"name": "Sukin Naturals", "currency": "AUD", "ships_to_countries": ["AU"]}, "AU"),
+])
+def test_a_retailer_whose_meta_would_pass_tier_b_is_refused(domain, storefront, market):
+    # The /meta.json alone would admit the store; only the known-retailer list stops it.
+    assert pipeline.storefront_tier_b("Sukin", storefront, market)["passed"] is True
+    flags, evidence = pipeline.brand_official_domain_review(domain, ["Sukin"], storefront=storefront, market=market)
+    assert [(f["rule"], f["acceptable"]) for f in flags] == [("brand_official_on_a_retailer", False)]
+    assert evidence == {"domain": domain, "known_retailer": True}
+
+
 def test_tier_a_is_unchanged_and_needs_no_storefront():
     flags, evidence = pipeline.brand_official_domain_review("us.frankbody.com", ["Frank Body"])
     assert flags == [] and evidence["brands"] == {"frank body": {"tier": "A"}}

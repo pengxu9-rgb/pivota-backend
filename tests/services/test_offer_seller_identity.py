@@ -77,6 +77,11 @@ def test_domains_match(a, b, expected):
     ("spacenk.com", True),
     ("coupang.com", True),
     ("gmarket.co.kr", True),
+    # UK/AU beauty retailers added after the review of #2359.
+    ("beautybay.com", True),
+    ("www.beautybay.com", True),
+    ("adorebeauty.com.au", True),
+    ("chemistwarehouse.com.au", True),
     ("fentybeauty.com", False),
     ("notulta.com", False),
 ])
