@@ -6,9 +6,13 @@ patterns keep only the noun they recognise: a merchant type "Nail Polish" matche
 pattern through "polish", so 52 live nail polishes sat on beauty/skincare/treat/exfoliant.
 
 On 2026-09-23 the 188 rows with an honest leaf were moved (body care / hair care). The other 60
--- nail polishes, lash and brow serums -- have NO leaf; clearing them would have been undone by
+-- nail polishes, lash and brow serums -- had NO leaf; clearing them would have been undone by
 the next backfill run, which re-derived the same face leaf. The rule now lives in
 `non_face_leaf`, shared with the curated resolver, and returns NO answer for them.
+
+2026-09-26: nail products got leaves (beauty/makeup/nails/*, Peng). A nail polish now resolves to
+`beauty/makeup/nails/nail-polish` -- still never to a face leaf, which is what these tests guard.
+Lash and brow serums still have no leaf and still get no answer.
 
 Measured 2026-09-23 over all 11,531 live prod rows: 415 classify differently, every one names a
 non-face area; 0 changes elsewhere, 0 in merchant sync.
@@ -18,6 +22,7 @@ import pytest
 from services.pdp_category_classifier import classify, non_face_leaf, resolve_path_from_row
 
 BODY = ("Body Care", "beauty/body/care")
+POLISH = ("Nail Polish", "beauty/makeup/nails/nail-polish")
 HAIR = ("Hair Care", "beauty/haircare/general")
 
 
@@ -27,9 +32,6 @@ def rp(title, product_type=None, category=None):
 
 # Real live rows that were HELD on 2026-09-23 (title, merchant product_type, stored face leaf).
 @pytest.mark.parametrize("title,ptype,was", [
-    ("Add Blueberry Smoothie - Deep Lilac", "Nail Polish", "beauty/skincare/treat/exfoliant"),
-    ("MN36 Cosmic Cutie: Chrome Bronze Peel Off Nail Polish", "Nail Polish", "beauty/skincare/treat/exfoliant"),
-    ("Rainbow Mani Magic Set", "Nail Polish Set", "beauty/skincare/treat/exfoliant"),
     ("Large Lash Serum", None, "beauty/skincare/treat/serum"),
     ("Perfect Lash Serum 8ml", "Lash Serum", "beauty/skincare/treat/serum"),
     ("Pink Enriched Eyelash Serum", "Eyelash Serum", "beauty/skincare/treat/serum"),
@@ -41,6 +43,17 @@ def test_the_held_rows_get_no_answer(title, ptype, was):
     if was:
         assert old[1] == was  # the defect, reproduced
     assert rp(title, ptype) is None
+
+
+@pytest.mark.parametrize("title,ptype", [
+    ("Add Blueberry Smoothie - Deep Lilac", "Nail Polish"),
+    ("MN36 Cosmic Cutie: Chrome Bronze Peel Off Nail Polish", "Nail Polish"),
+    ("Rainbow Mani Magic Set", "Nail Polish Set"),
+])
+def test_the_held_nail_polishes_get_the_nail_leaf(title, ptype):
+    """Held 2026-09-23 on beauty/skincare/treat/exfoliant; since 2026-09-26 the nail leaf."""
+    assert rp(title, ptype) == POLISH
+    assert "exfoliant" not in rp(title, ptype)[1]
 
 
 @pytest.mark.parametrize("title,ptype,category,want", [
@@ -92,25 +105,37 @@ def test_the_curated_resolver_and_the_regex_writers_share_one_rule():
 
 def test_the_variant_fold_is_guarded_too():
     from services.pdp_category_classifier import fold_category_from_variants
-    assert fold_category_from_variants(category=None, product_type="Nail Polish",
-                                       title="Deep Lilac", variants=None) is None
+    assert fold_category_from_variants(category=None, product_type="Lash Serum",
+                                       title="Perfect Lash Serum", variants=None) is None
+    (hit, _source, _conf) = fold_category_from_variants(category=None, product_type="Nail Polish",
+                                                        title="Deep Lilac", variants=None)
+    assert hit == POLISH
 
 
 @pytest.mark.parametrize("ptype,title,variants", [
     # A refused product-level answer ends the fold: the variant's own words lack the area.
     ("Lash Serum", "Perfect Lash Serum", [{"title": "Serum 8ml"}]),
-    ("Nail Polish", "Deep Lilac", [{"title": "Polish"}]),
-    ("Nail Polish", "Chrome Nail Polish", [{"title": "Top Coat + Cuticle Oil"}]),   # not a fashion coat
     ("Lash Serum", "Perfect Lash Serum", [{"title": "8ml", "platform_metadata": {"product_type": "Serum"}}]),
     # No product-level hit, but the variant's face-leaf hit is judged on the product's words too.
     (None, "Perfect Lash Booster", [{"title": "Serum"}]),
-    (None, "Deep Lilac", [{"title": "Nail Polish"}]),
     # ...and a refused variant ends the fold too, rather than trying the next variant's noun.
     (None, "Perfect Lash Booster", [{"title": "Serum"}, {"title": "Top Coat"}]),
 ])
 def test_a_variant_cannot_bring_the_refused_face_leaf_back(ptype, title, variants):
     from services.pdp_category_classifier import fold_category_from_variants
     assert fold_category_from_variants(category=None, product_type=ptype, title=title, variants=variants) is None
+
+
+@pytest.mark.parametrize("ptype,title,variants", [
+    ("Nail Polish", "Deep Lilac", [{"title": "Polish"}]),
+    ("Nail Polish", "Chrome Nail Polish", [{"title": "Top Coat + Cuticle Oil"}]),   # not a fashion coat
+    (None, "Deep Lilac", [{"title": "Nail Polish"}]),
+])
+def test_a_nail_polish_folds_to_the_nail_leaf_never_a_face_or_fashion_one(ptype, title, variants):
+    from services.pdp_category_classifier import fold_category_from_variants
+    (hit, _source, _conf) = fold_category_from_variants(category=None, product_type=ptype, title=title,
+                                                        variants=variants)
+    assert hit == POLISH
 
 
 def test_a_variant_face_answer_for_a_face_product_is_unchanged():
@@ -123,7 +148,8 @@ def test_a_variant_face_answer_for_a_face_product_is_unchanged():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("title,ptype,llm_path,want", [
     ("Perfect Lash Serum", "Lash Serum", "beauty/skincare/treat/serum", None),
-    ("Deep Lilac", "Nail Polish", "beauty/skincare/treat/exfoliant", None),
+    # The regex answers first now (the nail leaf), so the LLM's face answer is never consulted.
+    ("Deep Lilac", "Nail Polish", "beauty/skincare/treat/exfoliant", "beauty/makeup/nails/nail-polish"),
     ("Silky Body Butter", None, "beauty/skincare/moisturize/cream", "beauty/body/care"),
     ("Glow No. 3", None, "beauty/skincare/treat/serum", "beauty/skincare/treat/serum"),
 ])
@@ -143,8 +169,9 @@ async def test_the_llm_answer_is_guarded_too(monkeypatch, title, ptype, llm_path
 
 
 @pytest.mark.asyncio
-async def test_the_backfill_leaves_a_nail_polish_unmatched_and_writes_nothing(monkeypatch):
-    """The point of the change: a cleared nail polish is not re-filed under exfoliant."""
+async def test_the_backfill_files_a_nail_polish_on_the_nail_leaf_not_exfoliant(monkeypatch):
+    """The point of the 2026-09-23 change: a cleared nail polish is not re-filed under exfoliant.
+    Since 2026-09-26 it has a leaf of its own, so the backfill files it THERE."""
     import scripts.backfill_pdp_category_path as bf
     row = {"product_key": "k-nail", "category": None, "category_path": None, "brand": "Miss Nella",
            "product_type": "Nail Polish", "title": "Chrome Bronze Peel Off Nail Polish"}
@@ -162,8 +189,9 @@ async def test_the_backfill_leaves_a_nail_polish_unmatched_and_writes_nothing(mo
     monkeypatch.setattr(bf.database, "fetch_val", fetch_val)
     monkeypatch.setattr(bf.database, "is_connected", True, raising=False)
     report = await bf.run_category_path_backfill(dry_run=False)
-    assert report["matched"] == 0 and report["unmatched"] == 1, report
-    assert writes == []
+    assert report["matched"] == 1 and report["unmatched"] == 0, report
+    assert report["matched_by_path"] == {"beauty/makeup/nails/nail-polish": 1}, report
+    assert not any("exfoliant" in str(w) for w in writes), writes
 
 
 @pytest.mark.asyncio
@@ -182,8 +210,8 @@ async def test_the_backfill_files_a_body_wash_as_body_care(monkeypatch):
     assert report["matched_by_path"] == {"beauty/body/care": 1}, report
 
 
-def test_the_mirror_leaves_a_new_nail_polish_uncategorised():
+def test_the_mirror_files_a_new_nail_polish_on_the_nail_leaf():
     from scripts.mirror_external_seeds_to_catalog_products import resolve_mirror_category_metadata
     meta = resolve_mirror_category_metadata(category=None, product_type="Nail Polish",
                                             title="Add Blueberry Smoothie - Deep Lilac")
-    assert meta["category_path"] is None
+    assert meta["category_path"] == "beauty/makeup/nails/nail-polish"

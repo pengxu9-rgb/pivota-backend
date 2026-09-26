@@ -76,6 +76,43 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(uv[-\s/]?led\s+(?:nail\s+)?lamp|nail\s+lamp|gel\s+lamp|nail\s+dryer|"
         r"electric\s+nail\s+file|nail\s+drill)\b",
         re.IGNORECASE)),
+    # ===== Nail products (Peng 2026-09-26: nails get leaves). =====
+    # The three paths are the ones prod rows and the gateway already use -- PIVOTA-Agent's
+    # queryUnderstanding browses `beauty/makeup/nails/nail-polish/` and keeps removers out of it.
+    # Before these, a nail product had NO honest leaf and fell to whatever noun it also carried:
+    # "Peel Off Nail Polish" -> exfoliant (peel/polish), a dip powder -> face powder, "Top Coat" ->
+    # a fashion coat; and a curated crawl with only_resolved_category dropped every lacquer
+    # (universalnailsupplies.com: 141 OPI products crawled, 5 planned, all 5 mis-filed dip powders).
+    # They sit ABOVE Brush, Cleanser, Exfoliant, Powder and Coat so first-match-wins reaches them,
+    # and each needs an explicit nail/cuticle/lacquer/dip/coat phrase -- never a bare "nail" (so
+    # "Nailed It Cleansing Balm" stays a cleanser) and never a bare "polish" (a face or body polish
+    # stays an exfoliant). A title that also names lips, lashes, brows or mascara is declined
+    # ("Lip Balm and Cuticle Balm", "Lash Base Coat"): it is not a nail product first.
+    # Remover BEFORE polish, and polish refuses a trailing "remover", so a remover product type
+    # counts as ONE match in services/curated_brand_feed._pattern_matches, not an ambiguous two.
+    ("Nail Polish Remover", "beauty/makeup/nails/nail-polish-remover", re.compile(
+        r"^(?!.*\b(?:lips?|lash(?:es)?|mascara|brows?|makeup)\b).*"
+        r"\b(?:(?:nail\s+)?(?:polish|lacquer|varnish|enamel)|gel(?:\s+polish)?|nail)\s+removers?\b",
+        re.IGNORECASE | re.DOTALL)),
+    ("Cuticle Care", "beauty/makeup/nails/cuticle-oil", re.compile(
+        r"^(?!.*\b(?:lips?|lash(?:es)?|mascara|brows?)\b).*"
+        r"\bcuticle\s+(?:oils?|serums?|pens?|balms?|creams?|softeners?|treatments?|"
+        r"revitali[sz]ers?|removers?)\b",
+        re.IGNORECASE | re.DOTALL)),
+    # A hair "top coat" (a gloss/colour-seal treatment) names hair or scalp and is declined here.
+    # MEASURED 2026-09-26 over the 319 prod rows these patterns can touch: 110 re-classify, 109 are
+    # nail products; the one miss, "Pureology Color Fanatic Top Coat 6.7 oz", names no hair word at
+    # all. It stays on haircare/general because imagebeauty.com types it "Hair Color" (read from
+    # the store 2026-09-26) and the product type is classified before the title -- which is also
+    # why no hair-brand list is carried here.
+    ("Nail Polish", "beauty/makeup/nails/nail-polish", re.compile(
+        r"^(?!.*\b(?:lips?|lash(?:es)?|mascara|brows?|hair|scalp)\b).*\b(?:"
+        r"nail\s+(?:polish(?:es)?|lacquers?|varnish(?:es)?|enamels?|colou?rs?|paints?)"
+        r"|gel\s+(?:nail\s+)?polish(?:es)?|gel\s+nail\s+colou?rs?"
+        r"|dip(?:ping)?\s+(?:powders?|systems?|liquids?)|nail\s+dip"
+        r"|(?:nail\s+)?(?:top|base)\s+coats?"
+        r")\b(?!\s+removers?\b)",
+        re.IGNORECASE | re.DOTALL)),
     # Hair-styling tools (VODANA cross-category, beauty x 3C). Negative lookahead
     # vetoes "flat iron spray" / "blow dry primer" / "curl styler cream"; no bare
     # "brush"/"hair"/"styler"; bare "straightener" survives only under the veto;
@@ -121,7 +158,10 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         re.IGNORECASE)),
     ("Cleanser", "beauty/skincare/cleanse/cleanser", re.compile(
         r"\b(cleanser|cleansing|face wash|facial wash|"
-        r"cleansing milk|cleansing foam|cleansing gel|face wipes?|cleansing wipes?|wipes?|wash)\b",
+        # A "Nail Polish Remover Wipes" type is a nail remover, not a second match; a MAKEUP remover
+        # wipe is still a cleanser, so only the nail/polish remover spellings are declined.
+        r"cleansing milk|cleansing foam|cleansing gel|face wipes?|cleansing wipes?|"
+        r"(?<!polish\sremover\s)(?<!nail\sremover\s)wipes?|wash)\b",
         re.IGNORECASE)),
     # TONER GETS ITS OWN BUCKET, not a slot inside `treat/`. Two reasons, and they agree:
     #
@@ -194,8 +234,9 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"patchs|(?<!\bpimple\s)(?<!\bspot\s)(?<!\bspot\scover\s)(?<!\bacne\s)(?<!\bblemish\s)patches|lip\s?patch)\b",
         re.IGNORECASE)),
     ("Exfoliant", "beauty/skincare/treat/exfoliant", re.compile(
+        # A NAIL or GEL polish is a nail product; a face/body/lip polish is still an exfoliant.
         r"\b(exfoliant|exfoliating|exfoliation|peel|peeling|peeling gel|peel pads?|"
-        r"scrub|polish)\b",
+        r"scrub|(?<!nail\s)(?<!gel\s)polish)\b",
         re.IGNORECASE)),
     ("Treatment", "beauty/skincare/treat/treatment", re.compile(
         r"\b(spot[-\s]?target(?:ing|ed)?|spot[-\s]?treatment|blemish|acne|"
@@ -230,7 +271,8 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"foundation\s+stick|cushion\s+foundation)\b",
         re.IGNORECASE)),
     ("Powder", "beauty/makeup/face/powder", re.compile(
-        r"\b(powder|setting powder|pressed powder|loose powder|"
+        # A DIP powder is a nail colour system, not a face powder.
+        r"\b((?<!dip\s)(?<!dipping\s)powder|setting powder|pressed powder|loose powder|"
         r"blurring powder|finishing powder)\b",
         re.IGNORECASE)),
     # Lip Gloss before Highlighter: "Gloss Bomb Universal Lip Luminizer" contains
@@ -316,7 +358,8 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"\b(shorts|bermuda\s+shorts|denim\s+shorts|athletic\s+shorts)\b",
         re.IGNORECASE)),
     ("Coat", "fashion/apparel/outerwear/coat", re.compile(
-        r"\b(coat|overcoat|trench\s+coat|peacoat|parka)\b",
+        # A nail TOP/BASE coat is a nail product, not outerwear.
+        r"\b((?<!top\s)(?<!base\s)coat|overcoat|trench\s+coat|peacoat|parka)\b",
         re.IGNORECASE)),
     ("Jacket", "fashion/apparel/outerwear/jacket", re.compile(
         r"\b(jacket|blazer|bomber|denim\s+jacket|windbreaker|puffer\s+jacket)\b",

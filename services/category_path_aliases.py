@@ -258,9 +258,10 @@ TAXONOMY_GAPS: Dict[str, str] = {
     "beauty/skincare/hand/cream": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; do not fold into moisturize/",
     "beauty/skincare/moisturizer/balm": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; do not fold into moisturize/",
     "beauty/skincare/oil": "INTENTIONALLY_DISTINCT in PIVOTA-Agent; do not fold into moisturize/oil",
-    "beauty/makeup/nails/nail-polish": "no nail-colour leaf (devices/nail is a device)",
-    "beauty/makeup/nails/cuticle-oil": "no nail-colour leaf",
-    "beauty/makeup/nails/nail-polish-remover": "no nail-colour leaf",
+    # beauty/makeup/nails/{nail-polish,cuticle-oil,nail-polish-remover} were gaps here until
+    # 2026-09-26 (Peng: "add the nail category"). They are LEAVES now -- CATEGORY_PATTERNS carries
+    # them -- 4 segments deep, so their browse prefix is `beauty/makeup/nails/`, never the whole of
+    # `beauty/makeup/` (the over-broadening the set paths below would cause).
     "wellness/supplements": "no wellness root",
     "beauty/accessories/makeup-bag": "no accessories leaf",
     "beauty/accessories": "no accessories leaf",
