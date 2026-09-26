@@ -1518,6 +1518,13 @@ RETAILER_BRAND_SPELLINGS = {
     "skii": "skii", "skⅱ": "skii",
     # AU: the brand's own store says "Lük Beautifood"; five US retailers say "Luk Beautifood".
     "lukbeautifood": "lukbeautifood", "lükbeautifood": "lukbeautifood",
+    # wet n wild's own store (www.wetnwildbeauty.com, read 2026-09-26) files 500 of its 580 products
+    # under the CORPORATE vendor "Markwins WNW" (Markwins Beauty Brands owns wet n wild; WNW = wet n
+    # wild) and the other 80 under "wet n wild Beauty". Without this family a brand_official crawl
+    # branded 500 products "Markwins WNW" and the domain review held the job (the store's name does
+    # not start with "Markwins WNW"). Markwins' OTHER labels (e.g. "Markwins Physicians Formula") are
+    # deliberately not listed: only the WNW code names this brand.
+    "wetnwild": "wetnwild", "wetnwildbeauty": "wetnwild", "markwinswnw": "wetnwild",
 }
 # The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
 # --brand. content_key is
@@ -1556,6 +1563,8 @@ RETAILER_BRAND_CANONICAL = {
     "visee": "Visée",
     "fiancee": "Fiancée",
     "skii": "SK-II",
+    # The brand's own lowercase spelling, as on wetnwildbeauty.com.
+    "wetnwild": "wet n wild",
     "lukbeautifood": "Lük Beautifood",
 }
 
