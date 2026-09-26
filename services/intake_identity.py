@@ -681,11 +681,13 @@ async def resolve_or_attach_content_identity(
         # source_product_id even when its title or brand spelling drifted, and its membership is never
         # overwritten (_ensure_primary_retailer_group refuses a different group, which fails the whole
         # store job). Moving existing listings onto the brand's product is the identity engine's
-        # attach_membership, not a crawl. The brand row is always among _rows_by_content_key's first 5:
-        # it is older than every listing attached to it (created_at ASC).
-        stripped = (_brand_stripped_content_key(brand, title)
-                    if _is_retailer_listing_ctx(door, ctx)
-                    and not await _listing_has_membership(ctx, source_product_id) else None)
+        # attach_membership, not a crawl. _rows_by_content_key returns 5 rows, the caller's merchant first,
+        # then oldest: crawl-lane brand rows and listings share one synthetic merchant, so the brand row --
+        # older than every listing attached to it -- stays in view; a family with 5+ older same-merchant
+        # rows could hide it, and then this tier simply does not attach (today's behaviour).
+        stripped = _brand_stripped_content_key(brand, title) if _is_retailer_listing_ctx(door, ctx) else None
+        if stripped and await _listing_has_membership(ctx, source_product_id):
+            stripped = None  # the membership lookup runs only for a title that strips at all
         if stripped:
             family = await _rows_by_content_key(stripped, merchant_id)
             known_gtins = {r.get("gtin") for r in family if r.get("gtin")}
