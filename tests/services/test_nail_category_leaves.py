@@ -234,3 +234,50 @@ def test_an_acrylic_shelf_is_not_press_on_nails():
     """universalnailsupplies.com types 26 products "Acrylic Nails & Tips": 1 is tips, the rest are
     acrylic powders and a top coat. The type alone must not file them all as press-on nails."""
     assert _pattern_matches("Acrylic Nails & Tips") == 0
+
+
+# The loosest press-on arm (false/fake nails, nail tips, "24 Nails") in line with the two above it:
+# a product FOR the nails and an adhesive, tab, dehydrator, primer or lamp decline it. On main every
+# title below was press-on; none of them names a nail you wear. MEASURED 2026-09-26: 0 of 10,545
+# titles change (kissusa, unitedbeautysupply, shopbeautydepot /products.json + the nail corpora).
+@pytest.mark.parametrize("title", [
+    # the three that prompted the change
+    "Nail Adhesive for False Nails",
+    "Adhesive Tabs for False Nails",
+    "Nail Dehydrator for Fake Nails",
+    # "for ... (false|fake|faux|artificial) nails" alone refuses these: no veto word in them
+    "Rhinestones for False Nails",
+    "Nail Prep Pads for Fake Nails",
+    "Nail Charms for Faux Nails",
+    "Storage Case for Artificial Nails",
+    "Nail Charms for Long Coffin Fake Nails",           # two words between "for" and the nails
+    "Rhinestones for Fake Nail Art",                    # singular "nail"
+    # each new veto word alone, singular and plural
+    "False Nail Adhesive 3g",
+    "Fake Nail Adhesives 2-Pack",
+    "False Nails Sticky Tab Sheet",
+    "Fake Nail Jelly Tabs 240pcs",
+    "Fake Nail Dehydrator 15ml",
+    "False Nail Dehydrators 2-Pack",
+    "False Nail Primer",
+    "False Nail Primers",
+    "Fake Nails LED Lamps",                             # the singular "lamp" was already vetoed
+])
+def test_a_product_for_false_nails_is_not_press_on_nails(title):
+    assert _path(title) is None
+
+
+@pytest.mark.parametrize("title", [
+    "Glue On Nails 24pcs",
+    "False Nails Nude Color 24pcs",
+    "Nail Tips Clear 500pcs",
+    "Kiss GoldFinger Snow Queen Limited Edition 24 Nails",
+    # "for" that does not lead to false/fake nails is who the nails are for
+    "Fake Nails for Women 24pcs",
+    "Artificial Nails for Kids",
+    "Short Coffin False Nails for Daily Wear",
+    # the veto words are whole words: "Primrose" is not a primer
+    "Faux Nails Primrose Pink 24pcs",
+])
+def test_false_nails_themselves_stay_press_on(title):
+    assert _path(title) == PRESS_ON
