@@ -116,6 +116,13 @@ async def fetch_products_for_key(content_key: str, *, db: Any = None) -> List[Di
           cp.size_guide_confidence,
           cp.rating_value,
           cp.rating_count,
+          cp.source_domain,
+          -- pick_canonical's brand-store rule: the ingest pipeline's own seller verdict for this row
+          EXISTS (
+            SELECT 1 FROM catalog_offers o
+            WHERE o.product_key = cp.product_key AND o.suppressed_at IS NULL
+              AND o.offer_type = 'brand_direct'
+          ) AS has_brand_direct_offer,
           pgm.product_group_id,
           pgm.is_primary AS group_is_primary
         FROM catalog_products cp
@@ -301,11 +308,49 @@ def coalesce_first(*values: Any) -> Any:
     return None
 
 
+_RETAILER_LISTING_KEY_PREFIX = "ext:retailer:"
+
+
+def _is_retailer_listing(row: Dict[str, Any]) -> bool:
+    """A retailer-lane listing: one store's page for a product (ingestion's retailer_listing_identity)."""
+    return str(row.get("product_key") or "").startswith(_RETAILER_LISTING_KEY_PREFIX)
+
+
+def _is_brand_store_row(row: Dict[str, Any]) -> bool:
+    """The brand's own store's copy of the product, with content to serve.
+
+    Evidence is what the ingest pipeline already decided about the seller: a brand_direct offer on
+    this row (Tier A or B proven at ingest, e.g. saiehello.com for Saie), or a host that IS the
+    brand's domain -- and never a known retailer host. A row without a description never wins here:
+    it would replace a retailer's copy with nothing. Rows missing these fields (callers that do not
+    load them) are simply not brand-store rows, so their order is unchanged. (A url_audit seed needs
+    no test here: pick_canonical ranks it last before this rule is consulted.)
+    """
+    if _is_retailer_listing(row):
+        return False
+    if not str(row.get("description") or "").strip():
+        return False
+    from services.offer_seller_identity import brand_owns_domain, host_from_url, is_known_retailer, normalize_host
+
+    host = normalize_host(row.get("source_domain")) or host_from_url(row.get("canonical_url"))
+    if not host or is_known_retailer(host):
+        return False
+    return bool(row.get("has_brand_direct_offer")) or brand_owns_domain(row.get("brand"), host)
+
+
 def pick_canonical(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Deterministic canonical-row pick.
 
     Tiebreak ladder:
       0. platform != 'url_audit'  (a real row always beats an observed audit seed)
+      0b. ONLY where the content_key also holds a retailer-lane listing: the brand's own store's
+          row (`_is_brand_store_row`) first. ADR-001 precedence -- brand-official content over a
+          reseller's -- which the ladder below ignored: every member is primary and signed, so the
+          lowest product_key decided, and "ext:retailer:..." beat every brand slug sorting after
+          "r" (measured 2026-09-26: 49 of 75 mixed content_keys served a retailer's copy while the
+          brand's own store row -- westman-atelier.com, naturium.com, tomfordbeauty.com,
+          saiehello.com -- sat beside it). Groups without a retailer listing are ordered exactly
+          as before.
       1. product_group_members.is_primary = true  (multi-seller canonical)
       2. catalog_products.pivota_signature_id is set  (indexed surface)
       3. lowest product_key ASC  (stable hash-derived ordering)
@@ -319,11 +364,14 @@ def pick_canonical(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     content_key has ONLY audit seeds (the common case — a competitor/arbitrary URL
     the merchant audited), it isn't served anyway (no index_pipeline_state row).
     """
-    def key(r: Dict[str, Any]) -> Tuple[int, int, int, str]:
+    mixed_with_retailer = any(_is_retailer_listing(r) for r in rows)
+
+    def key(r: Dict[str, Any]) -> Tuple[int, int, int, int, str]:
         audit_rank = 1 if r.get("platform") == "url_audit" else 0
+        brand_rank = (0 if _is_brand_store_row(r) else 1) if mixed_with_retailer else 0
         primary_rank = 0 if r.get("group_is_primary") else 1
         sig_rank = 0 if r.get("pivota_signature_id") else 1
-        return (audit_rank, primary_rank, sig_rank, r.get("product_key") or "")
+        return (audit_rank, brand_rank, primary_rank, sig_rank, r.get("product_key") or "")
 
     return sorted(rows, key=key)[0]
 
