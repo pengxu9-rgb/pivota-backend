@@ -114,9 +114,23 @@ def test_is_known_retailer_csv_extendable():
     # Affixed brand host now resolves conservatively to unknown (was True); the
     # honest under-claim direction. Documented, not a silent regression.
     ("COSRX", "shopcosrx.com", False),
+    # A domain cannot spell "&": the brand's "&" is also read as "and" (prod pairs, 2026-09-26).
+    ("Sand & Sky", "us.sandandsky.com", True),
+    ("Peach & Lily", "peachandlily.com", True),
+    ("Terra & Co.", "terraandco.com", True),
+    # ...and the written spelling still counts, so no match is lost.
+    ("Sand & Sky", "sandsky.com", True),
+    # Still exact label equality: "and" does not open a substring door.
+    ("Sand & Sky", "sandandskyshop.com", False),
+    ("Sand & Sky", "sand.com", False),
 ])
 def test_brand_owns_domain(brand, host, expected):
     assert brand_owns_domain(brand, host) is expected
+
+
+def test_an_ampersand_brand_on_its_own_store_is_brand_direct():
+    r = derive_offer_seller_identity(domain="lordandberry.com", brand="Lord & Berry")
+    assert r["offer_type"] == "brand_direct" and r["rule"] == "brand_in_domain"
 
 
 def test_official_domain_match_brand_direct():
