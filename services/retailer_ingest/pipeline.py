@@ -258,11 +258,13 @@ def _tokens(value: Any) -> List[str]:
     return "".join(c if c.isalnum() else " " for c in text.casefold()).split()
 
 
-#: A /meta.json name with one of these tokens is a store that SELLS the brand, never the brand's own
-#: ("Sukin Stockist USA"), however it starts.
+#: A /meta.json name with one of these tokens AFTER the brand is a store that SELLS the brand, never the
+#: brand's own ("Sukin Stockist USA", "Sukin Beauty Warehouse"). "at" is the listing-title shape
+#: ("Sukin | Shop Sukin at Beauty Bay"); "@" in the name reads as "at". Only the words after the brand
+#: count: a brand's own name may hold one ("Chemist Confessions USA").
 TIER_B_RESELLER_TOKENS = frozenset({
     "stockist", "stockists", "distributor", "distributors", "distribution", "distributions", "pharmacy",
-    "chemist", "retailer", "outlet", "wholesale"})
+    "chemist", "retailer", "outlet", "wholesale", "warehouse", "warehouses", "at"})
 
 
 def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: str) -> Dict[str, Any]:
@@ -272,8 +274,9 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
 
     The name rule is a token-boundary PREFIX, not containment: containment passed "REN" in "Karen's
     Beauty Shop", "Tula" in "Tulane Pharmacy" and "e.l.f." in "Self Care Supply Co" (review of #2353).
-    The brand's tokens must be the name's first tokens, the name must carry no reseller token, and the
-    folded brand must be at least TIER_B_MIN_BRAND_CHARS long. Measured positives (prod /meta.json,
+    The brand's tokens must be the name's first tokens, the words after them must carry no reseller
+    token (TIER_B_RESELLER_TOKENS: "Sukin Beauty Warehouse", "Sukin | Shop Sukin at Beauty Bay"), and
+    the folded brand must be at least TIER_B_MIN_BRAND_CHARS long. Measured positives (prod /meta.json,
     2026-09-26): "Sukin Naturals USA", "Bali Body US", "MooGoo USA", "Eco By Sonya USA", "esmi Skin",
     "MineTan USA" -- each USD, ships_to [US].
 
@@ -281,14 +284,16 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
     resells, and a US-shipping USD store alone proves nothing about whose it is."""
     from services.region_pricing import pricing_currency_for_region_or_none
     sf = storefront if isinstance(storefront, dict) else {}
-    want, name = _tokens(brand), _tokens(sf.get("name"))
+    want, name = _tokens(brand), _tokens(str(sf.get("name") or "").replace("@", " at "))
+    starts = len("".join(want)) >= TIER_B_MIN_BRAND_CHARS and name[:len(want)] == want
+    rest = name[len(want):] if starts else name
     ships = sf.get("ships_to_countries")
     expected = pricing_currency_for_region_or_none(market)
     out: Dict[str, Any] = {
         "name": sf.get("name"), "myshopify_domain": sf.get("myshopify_domain"), "currency": sf.get("currency"),
         "market": market,
-        "name_starts_with_brand": len("".join(want)) >= TIER_B_MIN_BRAND_CHARS and name[:len(want)] == want,
-        "name_has_no_reseller_token": bool(name) and not (set(name) & TIER_B_RESELLER_TOKENS),
+        "name_starts_with_brand": starts,
+        "name_has_no_reseller_token": bool(name) and not (set(rest) & TIER_B_RESELLER_TOKENS),
         "ships_to_market": isinstance(ships, list) and market in ships,
         "currency_is_market_currency": bool(expected) and sf.get("currency") == expected,
     }

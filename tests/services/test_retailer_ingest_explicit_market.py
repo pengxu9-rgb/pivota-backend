@@ -274,6 +274,8 @@ def _us(name):
     ("us.shop.minetanbodyskin.com", "MineTan", _us("MineTan USA")),
     ("dhccare.com", "DHC", _us("DHC Skincare")),
     ("esteelauderusa.com", "Estée Lauder", _us("Estee Lauder US")),  # accent-folded, mid-word
+    ("elfcosmetics.com", "e.l.f.", _us("e.l.f. Cosmetics")),
+    ("koseusa.com", "Kosé", _us("KOSE USA")),
 ])
 def test_tier_b_accepts_the_measured_us_stores(domain, brand, storefront):
     assert pipeline.brand_official_domain_flags(domain, [brand])  # Tier A alone holds every one of them
@@ -296,6 +298,13 @@ def test_tier_b_accepts_the_measured_us_stores(domain, brand, storefront):
     ("sukinstockistusa.com", "Sukin", "Sukin Stockist USA", "name_has_no_reseller_token"),
     ("sukinoutlet.com", "Sukin", "Sukin Outlet", "name_has_no_reseller_token"),
     ("sukinwholesale.com", "Sukin", "Sukin Wholesale Distribution", "name_has_no_reseller_token"),
+    # Re-review of #2353: a store named for where it sells the brand.
+    ("sukinbeautywarehouse.com", "Sukin", "Sukin Beauty Warehouse", "name_has_no_reseller_token"),
+    ("sukinwarehouses.com", "Sukin", "Sukin Warehouses", "name_has_no_reseller_token"),
+    ("beautybay.shop", "Sukin", "Sukin | Shop Sukin at Beauty Bay", "name_has_no_reseller_token"),
+    ("adorebeauty.shop", "Sukin", "Sukin @ Adore Beauty", "name_has_no_reseller_token"),
+    ("adorebeauty.store", "Sukin", "Sukin @Adore Beauty", "name_has_no_reseller_token"),
+    ("ccpharmacy.com", "Chemist Confessions", "Chemist Confessions Pharmacy", "name_has_no_reseller_token"),
 ])
 def test_tier_b_refuses_a_name_that_does_not_lead_with_the_brand_or_resells_it(domain, brand, name, failed):
     tier_b = pipeline.storefront_tier_b(brand, _us(name), "US")
@@ -318,6 +327,16 @@ def test_tier_b_holds_unless_every_conjunct_holds(storefront, failed):
     assert flags[0]["severity"] == "block" and "acceptable" not in flags[0]
     tier_b = evidence["brands"]["sukin"]["tier_b"]
     assert evidence["brands"]["sukin"]["tier"] is None and tier_b[failed] is False and tier_b["passed"] is False
+
+
+def test_a_reseller_word_inside_the_brands_own_name_is_not_a_refusal():
+    # Only the words AFTER the brand can say the store resells it: Chemist Confessions is a brand.
+    flags, evidence = pipeline.brand_official_domain_review(
+        "ccskin.com", ["Chemist Confessions"], storefront=_us("Chemist Confessions USA"), market="US")
+    assert flags == [] and evidence["brands"]["chemist confessions"]["tier"] == "B"
+    # A name that does not lead with the brand is read whole, so the held flag's detail stays true.
+    tier_b = pipeline.storefront_tier_b("Sukin", _us("Pharmacy Sukin USA"), "US")
+    assert tier_b["name_starts_with_brand"] is False and tier_b["name_has_no_reseller_token"] is False
 
 
 def test_a_brand_too_short_to_be_evidence_is_held():
@@ -509,6 +528,25 @@ async def test_the_guard_acts_only_off_the_canonical_market():
     guarded, counts = await writer._guard_canonical_owner(plan, owned, market="AU")
     assert guarded["pdps"][0]["source_domain"] == "us.frankbody.com" and counts["pdps_offer_only_canonical_owner"] == 1
     assert writer.canonical_market("Frank Body") == "US"
+
+
+@pytest.mark.parametrize("market", ["us", "Us", " US "])
+async def test_the_guard_reads_the_market_case_blind(market):
+    # "us" IS the canonical market: a lowercase caller must not switch the guard on for a US job.
+    plan = _plan("frankbody.com")
+    owned = _Catalog([_stored(plan, "us.frankbody.com")])
+    same, counts = await writer._guard_canonical_owner(plan, owned, market=market)
+    assert same is plan and counts == {} and owned.owner_lookups == 0
+    guarded, counts = await writer._guard_canonical_owner(plan, owned, market="au")  # and off-market still acts
+    assert counts["pdps_offer_only_canonical_owner"] == 1
+
+
+async def test_the_guard_reads_the_canonical_market_case_blind(monkeypatch):
+    monkeypatch.setattr(writer, "canonical_market", lambda brand: "us")
+    plan = _plan("frankbody.com")
+    owned = _Catalog([_stored(plan, "us.frankbody.com")])
+    same, counts = await writer._guard_canonical_owner(plan, owned, market="US")
+    assert same is plan and counts == {} and owned.owner_lookups == 0
 
 
 @pytest.mark.parametrize("batch", [False, True])

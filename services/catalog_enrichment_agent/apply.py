@@ -1801,8 +1801,10 @@ async def _guard_canonical_owner(
     to say about reports exactly what it did before."""
     counts: Dict[str, Any] = {}
     pdps = plan.get("pdps") or []
+    # Case-blind on both sides: "us" is the US market (pipeline.validate_options and scope_key agree).
+    job_market = str(market or "").strip().upper()
     planned = {str(p.get("product_key")): p for p in pdps
-               if _is_brand_official_pdp(p) and market != canonical_market(p.get("brand"))}
+               if _is_brand_official_pdp(p) and job_market != canonical_market(p.get("brand")).strip().upper()}
     if not planned:
         return plan, counts
     rows = await database.fetch_all(_CANONICAL_OWNER_SQL, {"keys": sorted(planned)})
