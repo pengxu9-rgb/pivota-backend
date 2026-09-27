@@ -551,17 +551,47 @@ def test_first_party_hard_gates_still_block_regardless_of_identity():
 # ---- OVERRIDES --------------------------------------------------------------
 
 
-def test_active_force_exact_group_override_forces_approved_confidence_1():
+# c1.v0.9: force_exact_group GROUPS (the identity graph applies it) but does not
+# approve identity. Mirrors tests/catalog_trust_policy.node.test.cjs in PIVOTA-Agent.
+def test_active_force_exact_group_no_longer_approves_a_review_required_listing():
     trust = call(
         identity=approved_identity(
-            identity_status="review_required", identity_confidence=0.2
+            identity_status="review_required", review_required=True, identity_confidence=0.54
         ),
         override={"id": "ov_99", "action_type": "force_exact_group", "active": True},
     )
-    assert trust["identity_status"] == "approved"
-    assert trust["identity_confidence"] == 1.0
-    assert trust["serving_decision"] == "public"
+    assert trust["identity_status"] == "review_required"
+    assert trust["identity_confidence"] == 0.54
+    assert trust["serving_decision"] == "shadow"
+    assert REASON_CODES.IDENTITY_REVIEW_REQUIRED_LIVE_READ in trust["serving_reason_codes"]
     assert trust["manual_override_id"] == "ov_99"
+
+
+def test_active_force_exact_group_on_approved_live_listing_uses_its_own_identity():
+    trust = call(
+        identity=approved_identity(identity_confidence=0.8),
+        override={"id": "ov_98", "action_type": "force_exact_group", "active": True},
+    )
+    assert trust["identity_status"] == "approved"
+    assert trust["identity_confidence"] == 0.8
+    assert trust["serving_decision"] == "public"
+    # the group the identity graph assigned is still what trust reports
+    assert trust["matched_sellable_item_group_id"] == "sig_1c7611cfd2520d64ad08f3c36b2ef016"
+
+
+def test_active_force_exact_group_no_longer_lifts_live_read_off_cross_seed_out_of_shadow():
+    # The 12 approved rows of the 2026-09-27 measurement: a retailer-sourced
+    # observed seller ('cross'), approved but live_read_enabled=False. Before
+    # c1.v0.9 the override set live_read=True and served them public.
+    trust = call_observed_seller(
+        product=observed_seller_product(seed_kind="cross"),
+        identity=approved_identity(
+            source_listing_ref="merch_obs_8887b6c53f029191:ext_4242", live_read_enabled=False
+        ),
+        override={"id": "ov_97", "action_type": "force_exact_group", "active": True},
+    )
+    assert trust["serving_decision"] == "shadow"
+    assert REASON_CODES.IDENTITY_LIVE_READ_DISABLED in trust["serving_reason_codes"]
 
 
 def test_active_force_review_required_override_degrades_to_shadow():
@@ -884,8 +914,12 @@ def test_policy_version_is_pinned_to_the_node_twin():
     (b) add the same tri-state gate to catalogTrustPolicy.js, immediately after
     its index gate. Ship only this bump and the twin keeps re-deriving those 4
     price-less PDPs 'public' on its next identity event for them.
+
+    c1.v0.8 -> c1.v0.9 on 2026-09-27: force_exact_group became grouping-only in
+    _derive_identity. Measured 29 prod rows 'public' -> 'shadow'. Merge THIS one
+    first; the PIVOTA-Agent twin follows.
     """
-    assert POLICY_VERSION == "c1.v0.8"
+    assert POLICY_VERSION == "c1.v0.9"
 
 
 # ---- TEST/DEMO MERCHANT GATE (2026-07-27) -----------------------------------
