@@ -470,6 +470,114 @@ def test_offers_resolve_recovers_external_seed_by_internal_identity_after_store_
     assert body["resolution_mode"] == "exact_match"
 
 
+def _identity_seed_row(seed_id: str, currency, domain: str) -> dict:
+    return {
+        "id": seed_id,
+        "external_product_id": f"ext_{seed_id}",
+        "market": "US",
+        "tool": "*",
+        "destination_url": f"https://{domain}/products/great-barrier-relief",
+        "canonical_url": f"https://{domain}/products/great-barrier-relief",
+        "domain": domain,
+        "title": "Great Barrier Relief",
+        "price_amount": 32.0,
+        "price_currency": currency,
+        "availability": "in_stock",
+        "utm_template": None,
+        "attached_product_key": None,
+        "attached_variant_id": None,
+        "seed_data": {
+            "snapshot": dict(_VERIFIED_CONTENT),
+            "brand": "KraveBeauty",
+            "variants": [
+                {"variant_id": "external_standard", "price_amount": 32.0,
+                 "price_currency": currency, "availability": "in_stock"}
+            ],
+        },
+        "status": "active",
+        **_VERIFIED_DESTINATION,
+    }
+
+
+# Peng 2026-09-26: a fallback in the wrong currency is a wrong result. The identity retry finds a
+# seed BY TITLE -- one the buyer never held -- so it is a fallback, and it serves only a seed
+# priced in the buyer market's currency (the #2389 rule). The fake evaluates the currency
+# conjunct the way Postgres would, so dropping it from the SQL serves the SGD / JPY / NULL rows.
+@pytest.mark.parametrize(
+    ("market", "served_currency"),
+    [(None, "USD"), ("US", "USD"), ("us ", "USD"), ("SG", "SGD"), ("DE", None)],
+)
+def test_offers_resolve_identity_retry_serves_only_the_buyer_market_currency(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, market, served_currency
+) -> None:
+    import routes.agent_shop_gateway as gateway
+    from services.external_seed_search import SEED_SERVING_CURRENCY_CLAUSE
+
+    rows = [
+        _identity_seed_row("eps_usd", "USD", "kravebeauty.com"),
+        _identity_seed_row("eps_sgd", "SGD", "jsmbeauty.sg"),
+        _identity_seed_row("eps_jpy", "JPY", "kravebeauty.jp"),
+        _identity_seed_row("eps_null", None, "nullbeauty.com"),
+        _identity_seed_row("eps_blank", " ", "blankbeauty.com"),
+    ]
+    identity_calls = []
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q and "identity_title_0" in q:
+            identity_calls.append(dict(values or {}))
+            if SEED_SERVING_CURRENCY_CLAUSE.replace(":serving_currency", "") not in q:
+                return rows
+            wanted = values["serving_currency"]
+            return [r for r in rows if str(r["price_currency"] or "").strip().upper() == wanted]
+        if "FROM external_product_seeds" in q:
+            raise asyncio.TimeoutError()
+        if "FROM products_cache" in q:
+            return [
+                {
+                    "merchant_id": "merch_new",
+                    "platform": "shopify",
+                    "platform_product_id": "prod_new_gbr",
+                    "product_data": {
+                        "id": "prod_new_gbr",
+                        "title": "KraveBeauty Great Barrier Relief",
+                        "brand": "KraveBeauty",
+                        "currency": "USD",
+                        "price": 28.0,
+                        "inventory_quantity": 10,
+                        "variants": [{"id": "variant_new_standard", "price": 28.0, "inventory_quantity": 10}],
+                        "merchant_name": "KraveBeauty",
+                    },
+                }
+            ]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=identity"))
+
+    payload = {"product": {"product_id": "prod_new_gbr"}, "limit": 10, "tool": "*"}
+    if market is not None:
+        payload["market"] = market
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve", "payload": payload, "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    external = [o for o in (res.json().get("offers") or []) if o.get("purchase_route") == "affiliate_outbound"]
+    served_seeds = sorted(o["source"]["external_product_id"] for o in external)
+    if served_currency is None:
+        # A market with no known currency: the retry never queries and serves no seed at all.
+        assert identity_calls == []
+        assert served_seeds == []
+    else:
+        assert [c["serving_currency"] for c in identity_calls] == [served_currency]
+        assert served_seeds == [f"ext_eps_{served_currency.lower()}"]
+
+
 @pytest.mark.parametrize("commerce_surface", [None, "agent_api"])
 def test_offers_resolve_external_only_product_serves_on_explicit_surface(
     monkeypatch: pytest.MonkeyPatch, client: TestClient, commerce_surface

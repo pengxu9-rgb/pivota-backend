@@ -60,8 +60,10 @@ from services.test_merchant_policy import (
 )
 from services.external_seed_stock import seed_stock, seed_variant_stock_fields
 from services.external_seed_search import (
+    SEED_SERVING_CURRENCY_CLAUSE,
     build_seed_quarantine_anti_join as _seed_quarantine_clause,
     fetch_external_seed_rows,
+    seed_serving_currency,
 )
 from services.pivot_query_service import (
     _category_brand_anchor_terms,
@@ -4308,11 +4310,20 @@ async def _handle_offers_resolve(
         title_terms, brand_terms = _external_identity_terms_from_product_payloads(product_payloads)
         if not title_terms:
             return []
+        # A title match is a FALLBACK: it finds a seed the buyer never held, by name. Peng
+        # 2026-09-26: a fallback in another currency is a wrong result, so it serves only a seed
+        # priced in the buyer's market currency -- the same rule, table and conjunct as
+        # fetch_external_seed_rows (#2389). No market = US; a market with no known currency gets
+        # no seed; a NULL/blank price_currency never matches.
+        serving_currency = seed_serving_currency(market_hint)
+        if serving_currency is None:
+            return []
 
         params: Dict[str, Any] = {
             "limit": attached_seed_limit,
             "market": market_hint,
             "tool": tool_hint,
+            "serving_currency": serving_currency,
         }
         title_clauses: List[str] = []
         for idx, term in enumerate(title_terms):
@@ -4351,6 +4362,7 @@ async def _handle_offers_resolve(
                 WHERE status = 'active'
                   AND (CAST(:market AS TEXT) IS NULL OR market = CAST(:market AS TEXT) OR market = '*')
                   AND (CAST(:tool AS TEXT) IS NULL OR tool = CAST(:tool AS TEXT) OR tool = '*')
+                  AND {SEED_SERVING_CURRENCY_CLAUSE}
                   AND ({' OR '.join(title_clauses)})
                   {_seed_quarantine_clause()}
                   AND {brand_clause}
