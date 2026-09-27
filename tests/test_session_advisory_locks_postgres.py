@@ -16,7 +16,8 @@ The fixes differ on purpose:
     holds the lock. Pinning the outer one instead would have CHANGED prod behaviour: a second
     caller would return True at once, before the first create had succeeded or failed.
   * scheduled audit + materialization: the lock is held on a DEDICATED connection
-    (db/session_advisory_lock.py). Pinning the pool connection would not do for the audit: the
+    (db/session_advisory_lock.py), and both fail CLOSED when it cannot be checked (both used
+    to fail open). Pinning the pool connection would not do for the audit: the
     three concurrent audits of one tick are child tasks of one context and share its databases
     Connection, so they would share one Postgres session, and a session lock is re-entrant --
     `test_two_audits_of_one_merchant_in_one_tick_run_once` fails under a pin.
@@ -330,6 +331,30 @@ async def test_two_audits_of_one_merchant_in_one_tick_run_once(audit_job, monkey
     assert ran == [merchant_id], f"the merchant was audited {len(ran)} times in one tick"
     assert (out["succeeded"], out["skipped"]) == (1, 1)
     assert await _another_session_can_take(audit_job._advisory_lock_id_for_merchant(merchant_id))
+
+
+async def test_an_audit_that_cannot_check_the_lock_is_not_run(audit_job, monkeypatch):
+    """It used to fail OPEN (audit unlocked), and a double audit bills the merchant twice. The
+    merchant is still due at the next daily tick; `error` puts it in the tick's errored count."""
+    import db.session_advisory_lock as lock_module
+
+    ran: list = []
+
+    async def audit_body(**kwargs):
+        ran.append(kwargs["due"]["merchant_id"])
+        return {**kwargs["summary"], "status": "succeeded"}
+
+    async def refused():
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(audit_job, "_re_audit_merchant_locked", audit_body)
+    monkeypatch.setattr(lock_module, "_open_connection", refused)
+
+    out = await audit_job._re_audit_merchant(
+        {"merchant_id": f"merch_{uuid.uuid4().hex[:8]}", "cadence_days": 7, "last_audit_run_id": "run-old"}
+    )
+    assert out["status"] == "error" and "lock unavailable" in out["reason"]
+    assert ran == []
 
 
 # ---------------------------------------------------------------------------------------------

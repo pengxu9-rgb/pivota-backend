@@ -225,6 +225,11 @@ async def _try_acquire_scheduler_lock(
     context and share its databases Connection, as do the probes each audit
     gathers (see db/session_advisory_lock.py).
 
+    Fails CLOSED: when the lock cannot be checked this raises
+    `AdvisoryLockUnavailable` and the merchant is not audited this tick (it is
+    still due at the next daily tick). It used to fail open, and a double audit
+    bills the merchant's credits twice.
+
     Returns (True, None) on non-Postgres backends (SQLite tests) — those
     are single-pod by definition, no leader-election needed.
     """
@@ -235,22 +240,12 @@ async def _try_acquire_scheduler_lock(
         # Assume single-pod (test / sqlite) and proceed.
         return True, None
     lock = DedicatedSessionAdvisoryLock(_advisory_lock_id_for_merchant(merchant_id))
-    try:
-        return await lock.try_acquire(), lock
-    except AdvisoryLockUnavailable as exc:
-        logger.warning(
-            "scheduled_audit_job: advisory-lock attempt failed for "
-            "merchant_id=%s (treating as unlocked to fail open): %s",
-            merchant_id, str(exc)[:200],
-        )
-        # Fail open — we'd rather double-audit than block all
-        # scheduled audits on a transient lock-system failure.
-        return True, None
+    return await lock.try_acquire(), lock
 
 
 async def _release_scheduler_lock(lock: Optional[DedicatedSessionAdvisoryLock]) -> None:
     """Release the per-merchant advisory lock by closing its connection.
-    Idempotent; a None holder (non-Postgres, fail-open) is a no-op."""
+    Idempotent; a None holder (non-Postgres) is a no-op."""
     if lock is not None:
         await lock.release()
 
@@ -281,7 +276,19 @@ async def _re_audit_merchant(due: Dict[str, Any]) -> Dict[str, Any]:
     # ("Multiple API pods can all pick the same due merchant at
     # 03:00 UTC and run duplicate audits"). Lock is released in the
     # finally below regardless of audit outcome.
-    locked, lock = await _try_acquire_scheduler_lock(merchant_id)
+    try:
+        locked, lock = await _try_acquire_scheduler_lock(merchant_id)
+    except AdvisoryLockUnavailable as exc:
+        logger.warning(
+            "scheduled_audit_job: advisory-lock attempt failed for "
+            "merchant_id=%s; not auditing this tick (fail closed): %s",
+            merchant_id, str(exc)[:200],
+        )
+        summary["status"] = "error"
+        summary["reason"] = (
+            "scheduler advisory lock unavailable; not audited this tick"
+        )
+        return summary
     if not locked:
         summary["reason"] = (
             "another pod holds the scheduler advisory lock; skipped"
