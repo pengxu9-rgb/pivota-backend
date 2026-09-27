@@ -41,6 +41,12 @@ positive fact from the vantage named by MERCHANT_PURCHASABILITY_BUYER_VANTAGE (d
 which an operator must set to match the buyer/partner egress. A positive fact from any OTHER
 vantage is evidence for a human, never permission for the door.
 
+`worker` IS A HISTORICAL NAME. Since the sweep moved to its own Cloud Run Job on the crawl subnet
+(2026-09-27) it names OUR CRAWL EGRESS (pivota-crawl, NAT 34.82.199.35) — not the worker service,
+and never the payment NAT the worker leaves from. The name was kept so the existing rows, the
+door's default and prod's unset dial all stay valid with no migration; the evidence is in
+jobs/merchant_purchasability_sweep.py ("VANTAGE").
+
 ── DRIVER NOTES (the same ones db/tierb_cart_link_eligibility.py documents) ─────────────────
 
   * `execute()` of an INSERT/UPDATE returns no rowcount on Postgres, so each write is
@@ -91,7 +97,9 @@ logger = logging.getLogger(__name__)
 
 TABLE = "merchant_purchasability"
 
-#: The vantage the sweep runs from by default: the worker service's own egress.
+#: The vantage the sweep's direct checks are recorded under. HISTORICAL NAME: it means OUR CRAWL
+#: EGRESS (the sweep's Cloud Run Job on subnet pivota-crawl), not the worker service — see the
+#: module header. Renaming it would orphan every row and move the door's default.
 WORKER_VANTAGE = "worker"
 #: The vantage a configured VANTAGE_PROXY_URL check is recorded under.
 PROXY_VANTAGE = "proxy"
@@ -169,17 +177,18 @@ def is_enforcement_enabled() -> bool:
 
     ── WHY THIS IS TWO DIALS AND NOT ONE ──────────────────────────────────────────────────────
 
-    It was one, and one was a bug. `services.audit_scheduler._add_job` registers every job only
-    on the production WORKER (`_queue_worker_enabled()`), and a normal backend deploy does not
-    ship the worker. So a single dial armed on the backend would switch the consumers on while
-    the sweep that feeds them never ran anywhere: `is_purchasable` would find no fact for any
+    It was one, and one was a bug. The sweep runs only inside its own Cloud Run Job (it was a
+    worker-only scheduler job until 2026-09-27, with the same property), and a backend deploy
+    neither creates nor arms that job. So a single dial armed on the backend would switch the
+    consumers on while the sweep that feeds them never ran anywhere: `is_purchasable` would find no fact for any
     merchant and the rail would answer a permanent 409 `merchant_not_purchasable` for the entire
     catalogue, with no way to fix it short of unsetting the dial again.
 
     Split, the arming ORDER becomes expressible, and it is the only safe one:
 
-        1. MERCHANT_PURCHASABILITY_SWEEP_ENABLED on, ON THE WORKER.
-        2. Wait for one full pass over the population (batch x interval; see the runbook).
+        1. MERCHANT_PURCHASABILITY_SWEEP_ENABLED on, ON THE SWEEP'S CLOUD RUN JOB
+           (infra/gcp/setup_merchant_purchasability_sweep_job.sh ... --enable).
+        2. Wait for one full pass over the population (batch x runs; see the runbook).
         3. Verify coverage merchant by merchant through GET /ops/merchant-purchasability.
         4. MERCHANT_PURCHASABILITY_ENFORCE on.
 
@@ -190,8 +199,8 @@ def is_enforcement_enabled() -> bool:
 
 
 def buyer_vantage() -> str:
-    """The vantage `is_purchasable` demands a positive fact FROM. Defaults to the worker's own
-    egress, which is honest but is NOT the buyer's: an operator whose partner pays from another
+    """The vantage `is_purchasable` demands a positive fact FROM. Defaults to `worker` — our crawl
+    egress, where the sweep's job runs — which is honest but is NOT the buyer's: an operator whose partner pays from another
     network must set this to that vantage and configure it, or the answer describes us."""
     return ((os.getenv("MERCHANT_PURCHASABILITY_BUYER_VANTAGE") or "").strip() or WORKER_VANTAGE)[:32]
 

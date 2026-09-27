@@ -60,15 +60,13 @@ Job registration happens at start-up time. Currently registers:
   claim due rows and take ONE state-machine step on each. Dormant unless
   REAP_AGENTIC_ENABLED is set AND the Reap client is configured — the gate is
   inside the job, so registering it here is inert.
-- `merchant_purchasability_sweep` — every
-  MERCHANT_PURCHASABILITY_INTERVAL_SECONDS (default 3600), renders the landed
-  checkout of a bounded batch of merchant x market rows from the two Reap
-  eligibility allowlists and records whether that checkout offers a CARD and at
-  what price (jobs/merchant_purchasability_sweep). A merchant carries a purchase
-  affordance only while it holds a fresh POSITIVE fact; "unverifiable" is not
-  positive. Dormant unless MERCHANT_PURCHASABILITY_SWEEP_ENABLED is set — the gate is
-  inside the job, so registering it here is inert. It must stay dormant by
-  default because every check creates an abandoned checkout on a live store.
+- `merchant_purchasability_sweep` is deliberately NOT registered here (it was until
+  2026-09-27). It renders merchant checkouts, and every job in this module runs
+  on the `worker`, whose egress is the default NAT — the address payment
+  partners allowlist; and an interval job here restarts its clock on every
+  worker deploy, which with ~hourly merges starved it (one report in four hours
+  measured on 2026-09-27). It is a Cloud Run Job on the crawl subnet instead:
+  infra/gcp/setup_merchant_purchasability_sweep_job.sh. Do not add it back.
 
 Best-effort: scheduler init failure logs a warning but does not crash
 the API. The audit endpoints still work; only the cron is degraded.
@@ -125,6 +123,9 @@ _JOB_RUN_DEADLINES = {
     # INLINE (gather of 3, each routinely >15 min): 4h.
     "daily_audit_check": 14400,
     "nightly_index_health": 7200,
+    # Mostly a one-read no-op; when it does re-run the job it is the same ~5 min
+    # run as nightly_index_health, so the same backstop.
+    "nightly_index_health_catch_up": 7200,
     "outcome_aggregation_daily": 7200,
     "catalog_invariant_sweep": 7200,
     "identity_reconcile_sweep": 7200,
@@ -254,29 +255,6 @@ _JOB_RUN_DEADLINES = {
     # try/finally that releases every claim on CancelledError, so a cut run
     # strands no leases and the next tick simply re-claims what it did not reach.
     "reap_agentic_purchase_poll": 600,
-    # Merchant purchasability sweep. Like the poller above, the job carries its
-    # OWN wall-clock budget (MERCHANT_PURCHASABILITY_BUDGET_SECONDS, default 600)
-    # which stops it STARTING a new merchant; a merchant already in flight runs to
-    # completion, so a run can legitimately exceed the budget by one merchant's
-    # worth of fetches. This deadline must therefore sit above budget + that one
-    # merchant.
-    #
-    # ONE MERCHANT'S WORST CASE, re-derived from the preflight's own bounds rather
-    # than guessed: REQUEST_TIMEOUT_S is 30 s and a check makes at most
-    # MAX_CATALOG_PAGES (20) catalog reads plus MAX_REDIRECT_HOPS (10) permalink
-    # hops. That is a 900 s ceiling per vantage on paper — but, exactly as the
-    # reap note above records, the preflight hands httpx a BARE FLOAT timeout,
-    # which httpx spreads across connect, read, write AND pool as that value
-    # EACH, so the strict bound is ~4x that again. A realistic worst case is far
-    # smaller (a whole check measured in seconds on three live merchants), and
-    # this deadline is a backstop against a WEDGE, not a promise that a batch
-    # completes: 600 + 300 = 900, and a cut run strands nothing, because this job
-    # holds no leases and writes each fact as it goes. The next tick simply
-    # re-reads the due list, which is least-recently-checked first.
-    #
-    # WITH VANTAGE_PROXY_URL SET EACH MERCHANT IS CHECKED TWICE, so raise this
-    # with the budget if a second vantage is configured on a large population.
-    "merchant_purchasability_sweep": 900,
 }
 
 
@@ -452,6 +430,28 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
+        # Same-day catch-up for nightly_index_health. This schedule lives in
+        # memory, so a redeploy that cancels the 04:00 run mid-flight (2026-09-23,
+        # 2026-09-27; see db/scheduler_job_slots.py) used to lose it until the
+        # next day: the new instance's cron is already past 04:00. The first tick
+        # comes ~90s after boot, which is exactly the redeploy case. By then the
+        # old instance has been shut down and its lock released. After that it
+        # ticks every 10 minutes and re-runs the job only when today's slot has
+        # no completed run. The job's advisory lock covers that decision, so it
+        # never overlaps a run in flight here or on another instance.
+        from datetime import datetime as _dt_cu, timedelta as _td_cu, timezone as _tz_cu
+        from jobs.nightly_index_health_job import run_nightly_index_health_catch_up
+        _add_job(
+            run_nightly_index_health_catch_up,
+            "interval",
+            minutes=10,
+            next_run_time=_dt_cu.now(_tz_cu.utc) + _td_cu(seconds=90),
+            id="nightly_index_health_catch_up",
+            replace_existing=True,
+            misfire_grace_time=600,
+            coalesce=True,
+        )
+
         # Orphan card revocation: kill cards that exist at the issuer but that we refused to
         # accept because the constraints came back unconfirmed or contradicted. Runs HOURLY, not
         # daily, and that is the point — an orphan may be an uncapped, unlocked card, so the
@@ -543,43 +543,6 @@ async def start_scheduler() -> None:
             replace_existing=True,
             max_instances=1,
             misfire_grace_time=_reap_agentic_interval,
-            coalesce=True,
-        )
-
-        # Merchant purchasability sweep (WP6): the only thing that gathers the
-        # POSITIVE fact a merchant x market row needs before the door may offer to
-        # buy from it. It renders the landed checkout and reads the checkout's own
-        # payment accept-list; nothing else in this system looks at whether a
-        # merchant takes a CARD, which is how flowerbeauty.com came to be served
-        # as purchasable with a PayPal-only checkout.
-        #
-        # OFF BY DEFAULT and the gate is INSIDE the job
-        # (MERCHANT_PURCHASABILITY_SWEEP_ENABLED), exactly like reap_agentic_purchase_poll
-        # above: registering it here is inert, so deploying this contacts no
-        # merchant, and arming it needs an env var rather than a scheduler restart.
-        # A SECOND gate here would be a second thing to keep in step with the first.
-        #
-        # DORMANT-BY-DEFAULT MATTERS MORE HERE THAN ON MOST JOBS: every check this
-        # job makes CREATES AN ABANDONED CHECKOUT on a live merchant's store.
-        #
-        # `max_instances=1` is explicit rather than inherited: two overlapping runs
-        # would sweep the same least-recently-checked merchants and double that
-        # side effect. `misfire_grace_time` is one interval — a tick that missed
-        # its slot has nothing to catch up on, because the next tick re-reads the
-        # due list and sees everything the skipped one would have.
-        from jobs.merchant_purchasability_sweep import (
-            job_interval_seconds as _purchasability_interval_seconds,
-            run_merchant_purchasability_sweep,
-        )
-        _purchasability_interval = _purchasability_interval_seconds()
-        _add_job(
-            run_merchant_purchasability_sweep,
-            "interval",
-            seconds=_purchasability_interval,
-            id="merchant_purchasability_sweep",
-            replace_existing=True,
-            max_instances=1,
-            misfire_grace_time=_purchasability_interval,
             coalesce=True,
         )
 

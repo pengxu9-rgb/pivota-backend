@@ -6,7 +6,28 @@ the LOOP and its BOUNDS. Nothing here decides anything.
 
     services/shopify_cart_link_preflight.preflight  the one thing that touches a merchant.
     db/merchant_purchasability.record_check         the one thing that writes a fact.
-    services/audit_scheduler                        registers `merchant_purchasability_sweep`.
+    python -m jobs.merchant_purchasability_sweep    runs ONE sweep and exits (see `main`).
+    infra/gcp/setup_merchant_purchasability_sweep_job.sh
+                                                    provisions that as a Cloud Run Job + an
+                                                    hourly Cloud Scheduler trigger on pivota-crawl.
+
+── WHERE IT RUNS: THE CRAWL EGRESS, NEVER THE PAYMENT NAT ───────────────────────────────────
+
+Until 2026-09-27 this was a `services/audit_scheduler` interval job on the `worker` service. Two
+measured problems moved it out:
+
+  * THE WORKER'S EGRESS IS THE DEFAULT NAT (8.231.167.230), THE ADDRESS PAYMENT PARTNERS
+    ALLOWLIST. Every check renders a merchant checkout from it; NAT port exhaustion is per-IP, and
+    ~50 requests over 37 Cloudflare-fronted domains in ~1 minute once tripped a cross-domain,
+    IP-level 429 for ~15 minutes (infra/gcp/setup_tierb_cart_link_eligibility_job.sh). With the
+    population growing from 2 to ~37 merchants that stops being hypothetical.
+  * AN INTERVAL JOB ON A SERVICE THAT REDEPLOYS HOURLY STARVES. Every on-merge worker deploy
+    restarts APScheduler's interval clock; on 2026-09-27 the 3600 s tick was pre-empted three
+    times in four hours (worker revisions 02:10, 04:03, 04:21) and one report landed.
+
+It is now a standalone Cloud Run Job on subnet `pivota-crawl` (NAT 34.82.199.35), fired by Cloud
+Scheduler — a cron trigger no deploy resets. `services/audit_scheduler` must NEVER register it
+again; tests/test_merchant_purchasability.py holds that from the live registry.
 
 ── THE POPULATION, AND WHY IT IS THIS ONE ───────────────────────────────────────────────────
 
@@ -43,24 +64,51 @@ we hold one, so that a drift is a statement about our index and not about an unr
 poller, gating the whole run is correct here, because this job has no sweep that must keep
 running while the rail is off. It holds no PII, expires nothing and promises nothing to a buyer;
 with the dial off it should touch no merchant at all, because every fetch it makes CREATES AN
-ABANDONED CHECKOUT on that merchant's store. Registering it in the scheduler is therefore inert,
-exactly like `reap_agentic_purchase_poll`, and arming it needs an env var rather than a redeploy.
+ABANDONED CHECKOUT on that merchant's store. Provisioning the job dark is therefore inert,
+exactly like the Tier B job's gate: the setup script sets the dial on the JOB (`--enable`), and
+an execution started by hand against a dark job exits 0 having contacted nobody.
 
 IT IS A DIFFERENT DIAL FROM THE CONSUMERS' (`MERCHANT_PURCHASABILITY_ENFORCE`), and that is not
-tidiness. `services.audit_scheduler._add_job` registers jobs ONLY on the production worker, and a
-normal backend deploy does not ship the worker — so one shared dial, armed on the backend, would
-switch the refusals on while this job never ran anywhere, and every merchant in the catalogue
-would answer a permanent 409. Sweep first, verify coverage, enforce second: see
+tidiness. The sweep runs only inside its own Cloud Run Job, and a backend deploy neither creates,
+re-images nor arms that job — so one shared dial, armed on `web`, would switch the refusals on
+while this job never ran anywhere, and every merchant in the catalogue would answer a permanent
+409. Sweep first, verify coverage, enforce second: see
 `db.merchant_purchasability.is_enforcement_enabled` and the runbook.
 
 ── VANTAGE ──────────────────────────────────────────────────────────────────────────────────
 
-Every check runs from the worker's own egress and is recorded under vantage `worker`. When
-`VANTAGE_PROXY_URL` is set the same merchant is ALSO checked through that HTTPS proxy and
+Every direct check is recorded under vantage `worker` (`facts.WORKER_VANTAGE`). SINCE THE MOVE TO
+THE CRAWL SUBNET "worker" MEANS "OUR CRAWL EGRESS" (pivota-crawl, NAT 34.82.199.35), not the
+worker service and not the payment NAT. The name was kept ON PURPOSE, and it is the only choice
+that needs no data migration and no door change:
+
+  * `is_purchasable` reads the vantage named by MERCHANT_PURCHASABILITY_BUYER_VANTAGE, which is
+    UNSET on prod `web` (so `worker`) while MERCHANT_PURCHASABILITY_ENFORCE=1 there (read
+    2026-09-27). A new vantage name would need that dial moved on `web` AND a complete crawl pass
+    under the new name first, or every merchant reads browse_only and the Reap rail answers 409;
+    and the old `worker` rows would linger in the ops read until somebody deleted them.
+  * Under the same name the crawl job's upserts land on the SAME primary-key rows. A positive
+    window carries over and is refreshed by the first run; a merchant the crawl egress cannot
+    verify keeps its window (rule 3 in db/merchant_purchasability.py) and ages out over the TTL,
+    so a reachability regression shows as `unverifiable` in the report with 72 h to act on it.
+  * Neither of our egresses is the buyer's — the Reap partner pays from its own network — so the
+    old name was never "the buyer vantage" either; renaming would buy no truth. And the crawl
+    egress is the one merchant storefronts are known to answer: the Tier B lane's ELIGIBLE rows —
+    the cart-link half of this population, and most of its merchants — were observed FROM
+    pivota-crawl, by the Tier B job that runs there.
+
+When `VANTAGE_PROXY_URL` is set the same merchant is ALSO checked through that HTTPS proxy and
 recorded under vantage `proxy`, so a buyer-market vantage can be configured without code.
 REACHABILITY IS EGRESS-DEPENDENT and that is measured, not assumed: judydoll.com resets direct
-TCP from one of our egresses while answering through another. `is_purchasable` reads only the
-vantage named by MERCHANT_PURCHASABILITY_BUYER_VANTAGE, which must match the buyer's.
+TCP from one of our egresses while answering through another.
+
+── PACING ───────────────────────────────────────────────────────────────────────────────────
+
+Every request of a run — every merchant, every vantage — goes through ONE `RequestPacer`, the
+Tier B job's: request STARTS are at least `MIN_REQUEST_INTERVAL_S` (1.5 s) apart, the same floor
+that job holds on the same crawl address. Before, only merchants were spaced (the pause dial) and
+one merchant's catalog pages and permalink hops went back to back. The pause dial still applies,
+between merchants, on top.
 
 ── PII ──────────────────────────────────────────────────────────────────────────────────────
 
@@ -71,8 +119,10 @@ there is no buyer anywhere on this path to log or store.
 ── WHAT ONE RUN COSTS A MERCHANT ────────────────────────────────────────────────────────────
 
 One abandoned Shopify checkout per merchant per vantage, the same side effect every UCP probe
-already has. That is why the batch is bounded, the run is budgeted, and the due list is
-least-recently-checked first: a merchant is swept once per TTL window, not once per tick.
+already has. That is why the batch is bounded, the run is budgeted, and the population is
+least-recently-checked first. NOTE the ordering is a rotation, not a TTL filter: a population no
+larger than the batch is checked IN FULL on every run. The per-merchant arithmetic is in
+docs/runbooks/merchant_purchasability.md ("Politeness").
 """
 
 from __future__ import annotations
@@ -100,6 +150,9 @@ from services.shopify_cart_link_preflight import (
     PreflightResult,
     preflight,
 )
+# THE Tier B job's pacer, not a second one: both jobs share the crawl address, and one spacing
+# rule for it is the point. See "PACING" above.
+from jobs.tierb_cart_link_eligibility import MIN_REQUEST_INTERVAL_S, PacedTransport, RequestPacer
 from utils.logger import logger as operator_logger
 
 logger = logging.getLogger(__name__)
@@ -118,10 +171,14 @@ logger = logging.getLogger(__name__)
 # uvicorn access-log redaction path — see main.install_uvicorn_access_log_redaction.
 
 __all__ = [
+    "EXIT_OK",
+    "EXIT_POPULATION_UNREADABLE",
+    "EXIT_ERRORS",
     "SweepReport",
+    "exit_code_for",
     "is_enabled",
-    "job_interval_seconds",
     "load_population",
+    "main",
     "run_merchant_purchasability_sweep",
 ]
 
@@ -140,16 +197,13 @@ class _Dial:
 #: Read PER RUN, never cached at import. The rail's own switch is not here: it is a boolean and
 #: `is_enabled()` is its one authoritative reader.
 DIALS: Dict[str, _Dial] = {
-    # Registration-time only: the interval `_add_job` is given. A change needs a restart, which
-    # is why it is the one dial not read inside the run. Hourly by default — the TTL is 72h, so
-    # this is 72 chances to refresh a fact before it expires.
-    "interval_seconds": _Dial("MERCHANT_PURCHASABILITY_INTERVAL_SECONDS", 3600, 60, 86400),
     # Merchants per run. Each one is a full redirect chain plus up to 20 catalog pages, and each
     # leaves an abandoned checkout behind, so this is a politeness bound as much as a time bound.
     "batch": _Dial("MERCHANT_PURCHASABILITY_BATCH", 20, 1, 200),
     # Wall-clock budget for one run. It stops the job STARTING a new merchant; a merchant already
     # in flight runs to completion, so a run can exceed this by one merchant's worth of fetches.
-    # The entry in `_JOB_RUN_DEADLINES` is sized as budget + that one merchant.
+    # The Cloud Run task timeout in infra/gcp/setup_merchant_purchasability_sweep_job.sh is sized
+    # as budget + that one merchant, and that script pins this dial so the two cannot drift.
     "budget_seconds": _Dial("MERCHANT_PURCHASABILITY_BUDGET_SECONDS", 600, 30, 3600),
     # Seconds to wait between merchants. One store at a time, unhurried: this rail has no
     # latency requirement and a burst of checkout creations against one platform does not help us.
@@ -196,17 +250,13 @@ def is_enabled() -> bool:
     DELEGATED to `db.merchant_purchasability.is_sweep_enabled` rather than re-read here, so the
     dial has one authoritative reader. It is a DIFFERENT dial from the one the consumers read
     (`MERCHANT_PURCHASABILITY_ENFORCE`), and that separation is the whole point: this job runs
-    only on the worker, so arming enforcement without first arming and completing a sweep would
-    refuse every merchant in the catalogue. See `is_enforcement_enabled` for the arming order.
+    only in its own Cloud Run Job, so arming enforcement without first arming and completing a
+    sweep would refuse every merchant in the catalogue. See `is_enforcement_enabled` for the
+    arming order.
 
     Read per run and NOTHING caches or shortcuts around it: with it off this job must touch no
     merchant, because every check it makes creates an abandoned checkout on a live store."""
     return facts.is_sweep_enabled()
-
-
-def job_interval_seconds() -> int:
-    """The registration interval. Read ONCE, by `services.audit_scheduler.start_scheduler`."""
-    return _env_int(DIALS["interval_seconds"])
 
 
 def proxy_url() -> Optional[str]:
@@ -290,14 +340,10 @@ class Target:
 
 
 async def _rows(statement: str) -> List[Dict[str, Any]]:
-    """One population query, failing SOFT. A lane whose table does not exist on this database
-    (SQLite dev, a partially migrated environment) contributes nothing rather than ending the
-    sweep — the other lane is still worth sweeping."""
-    try:
-        return [dict(r) for r in await database.fetch_all(statement)]
-    except Exception:  # noqa: BLE001
-        logger.warning("merchant_purchasability_sweep: a population lane could not be read")
-        return []
+    """One population query. RAISES on a read failure; `load_population` is what fails soft,
+    and it COUNTS the lane it could not read (`UNREADABLE_TALLY`) so the difference between "this
+    lane is empty" and "this lane could not be read" reaches the report and the exit code."""
+    return [dict(r) for r in await database.fetch_all(statement)]
 
 
 def _population_key(value: Any) -> str:
@@ -328,6 +374,14 @@ UNUSABLE_TALLY = "population_skipped_unusable"
 #: 2026-09-26, silently swept under a truncated market).
 MARKET_UNKNOWN_TALLY = "population_skipped_market_unknown"
 
+#: The `SweepReport` count of population LANES (of the two allowlists) whose read raised. The run
+#: still sweeps whatever the other lane returned — one unreadable table should not stop the
+#: merchants the other one names from being refreshed — but the population is incomplete, and
+#: `exit_code_for` turns any non-zero count into a FAILED job execution. Before this count the
+#: two lanes failed soft and silently: a database that answered nothing produced
+#: `population=0 ... errors=0`, which read as a clean run.
+UNREADABLE_TALLY = "population_unreadable"
+
 
 async def load_population(
     limit: int, *, tally: Optional[Dict[str, int]] = None
@@ -337,6 +391,8 @@ async def load_population(
     `tally`, when given, has `UNUSABLE_TALLY` incremented once per allowlist ROW whose domain is
     not a bare host name and was therefore left out. Counted rather than silently dropped: such a
     row is an operator typo that makes a merchant unbuyable, and the run report is where it shows.
+    `MARKET_UNKNOWN_TALLY` counts the same way for a market, and `UNREADABLE_TALLY` once per
+    LANE whose read raised (that lane then contributes nothing; the other is still swept).
 
     The two lanes are unioned on (domain, market). WHERE THEY OVERLAP THE CART LANE WINS the
     variant, because its `variant_id` was confirmed available on the storefront for that market
@@ -367,11 +423,25 @@ async def load_population(
             return None
         return (key_domain, key_market)
 
-    for row in await ledger.list_enabled_merchant_markets():
+    # FAIL SOFT PER LANE, BUT COUNTED. See UNREADABLE_TALLY. `strict=True` because the ledger's
+    # default form swallows the error into an empty list, which is exactly the ambiguity the
+    # count exists to remove.
+    async def _lane(read: Callable[[], Any], name: str) -> List[Dict[str, Any]]:
+        try:
+            return list(await read())
+        except Exception as exc:  # noqa: BLE001 — never BaseException; cancellation travels
+            _count(UNREADABLE_TALLY)
+            logger.warning(
+                "merchant_purchasability_sweep: the %s population lane could not be read "
+                "(error_type=%s)", name, type(exc).__name__,
+            )
+            return []
+
+    for row in await _lane(lambda: ledger.list_enabled_merchant_markets(strict=True), "variant"):
         key = _key(row.get("merchant_domain"), row.get("market_country"))
         if key is not None:
             merged.setdefault(key, None)
-    for row in await _rows(_CART_LANE_SQL):
+    for row in await _lane(lambda: _rows(_CART_LANE_SQL), "cart-link"):
         key = _key(row.get("domain"), row.get("market"))
         variant = str(row.get("variant_id") or "").strip() or None
         if key is not None and (variant or key not in merged):
@@ -449,6 +519,10 @@ class SweepReport:
     #: market is never defaulted or truncated, so such a row is not swept; see
     #: `MARKET_UNKNOWN_TALLY`.
     population_skipped_market_unknown: int = 0
+    #: Population lanes (0..2) whose read RAISED, or 1 when the population could not be built at
+    #: all. Non-zero means this run swept an incomplete population; the CLI exits
+    #: EXIT_POPULATION_UNREADABLE for it. See `UNREADABLE_TALLY`.
+    population_unreadable: int = 0
     checked: int = 0
     positive: int = 0
     negative: int = 0
@@ -461,8 +535,9 @@ class SweepReport:
 
 
 _COUNTS = (
-    "population", "population_skipped_unusable", "population_skipped_market_unknown", "checked",
-    "positive", "negative", "unverifiable", "written", "abandoned_budget", "errors", "skipped_disabled",
+    "population", "population_skipped_unusable", "population_skipped_market_unknown",
+    "population_unreadable", "checked", "positive", "negative", "unverifiable", "written",
+    "abandoned_budget", "errors", "skipped_disabled",
 )
 
 #: Indirected so a test can make the budget elapse without sleeping. MONOTONIC: the budget must
@@ -472,6 +547,21 @@ _monotonic: Callable[[], float] = time.monotonic
 #: The one thing that touches a merchant. Indirected so tests inject a fake fetcher and no test
 #: ever opens a socket — the rail's autouse forbid-httpx fixture would fail them if they did.
 _preflight = preflight
+
+
+def _new_pacer() -> RequestPacer:
+    """ONE pacer per run, shared by every merchant and every vantage. Indirected so a test can
+    hand in a fake clock and sleep and prove the spacing without waiting."""
+    return RequestPacer(MIN_REQUEST_INTERVAL_S)
+
+
+def _inner_transport(via: Optional[str]) -> httpx.AsyncBaseTransport:
+    """The real transport under the pacer. `via` is the proxy vantage's URL, or None for the
+    direct (crawl-egress) vantage. Passing our own transport switches off httpx's environment-
+    proxy lookup, so a process HTTPS proxy (an operator's laptop) is honoured here explicitly for
+    the direct vantage, exactly as before. Indirected so a test can mount a mock transport."""
+    proxy = via or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
+    return httpx.AsyncHTTPTransport(proxy=proxy)
 
 
 def _click_id() -> str:
@@ -499,12 +589,13 @@ async def _check_one(
     )
 
 
-async def run_merchant_purchasability_sweep(*, worker_id: Optional[str] = None) -> SweepReport:
-    """One sweep tick. Returns a `SweepReport` and never raises for anything a merchant did.
+async def run_merchant_purchasability_sweep() -> SweepReport:
+    """One sweep. Returns a `SweepReport` and never raises for anything a merchant did.
 
-    It DOES raise `asyncio.CancelledError`, on purpose: `except Exception`, never
-    `except BaseException`, so a cancellation keeps travelling and the scheduler's run deadline
-    can actually cut a wedged run.
+    It DOES let `asyncio.CancelledError` through: `except Exception`, never `except BaseException`,
+    so a caller that cancels (a test, an embedding event loop) actually stops it. The job's hard
+    stop is NOT a cancellation — Cloud Run's task timeout kills the container — which is why the
+    budget, not the timeout, is meant to end a run (see the setup script).
     """
     started = _monotonic()
     counts = {name: 0 for name in _COUNTS}
@@ -534,9 +625,18 @@ async def run_merchant_purchasability_sweep(*, worker_id: Optional[str] = None) 
         targets = await load_population(batch, tally=tally)
     except Exception:  # noqa: BLE001 — a population read must not end the run with a traceback
         counts["errors"] += 1
+        counts["population_unreadable"] = max(1, tally.get(UNREADABLE_TALLY, 0))
         logger.exception("merchant_purchasability_sweep: the population could not be built")
-        return _report()
+        report = _report()
+        operator_logger.info("merchant_purchasability_sweep: %s", report)
+        return report
     counts["population"] = len(targets)
+    counts["population_unreadable"] = tally.get(UNREADABLE_TALLY, 0)
+    if counts["population_unreadable"]:
+        operator_logger.warning(
+            "merchant_purchasability_sweep: %d population lane(s) could not be read; this run's "
+            "population is incomplete", counts["population_unreadable"],
+        )
     counts["population_skipped_unusable"] = tally.get(UNUSABLE_TALLY, 0)
     if counts["population_skipped_unusable"]:
         # ONCE PER RUN, BY COUNT. Not the domains: the report rule is counts only, and the
@@ -558,6 +658,7 @@ async def run_merchant_purchasability_sweep(*, worker_id: Optional[str] = None) 
         vantages.append((facts.PROXY_VANTAGE, proxy))
 
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+    pacer = _new_pacer()
     for target in targets:
         if _budget_spent():
             # Stop STARTING merchants. The rest are picked up next tick, least-recently-checked
@@ -569,10 +670,10 @@ async def run_merchant_purchasability_sweep(*, worker_id: Optional[str] = None) 
             # PER-MERCHANT, PER-VANTAGE try/except. One store that hangs, 403s or returns
             # something nobody has classified must not end the batch behind it.
             try:
-                client_kwargs: Dict[str, Any] = {"headers": headers, "timeout": REQUEST_TIMEOUT_S}
-                if via:
-                    client_kwargs["proxy"] = via
-                async with httpx.AsyncClient(**client_kwargs) as client:
+                transport = PacedTransport(_inner_transport(via), pacer)
+                async with httpx.AsyncClient(
+                    headers=headers, timeout=REQUEST_TIMEOUT_S, transport=transport
+                ) as client:
                     result = await _check_one(target, vantage=vantage, client=client)
             except Exception as exc:  # noqa: BLE001 — never BaseException; see the docstring
                 counts["errors"] += 1
@@ -618,3 +719,86 @@ async def run_merchant_purchasability_sweep(*, worker_id: Optional[str] = None) 
     # top of the module for why it cannot go through `logger`.
     operator_logger.info("merchant_purchasability_sweep: %s", report)
     return report
+
+
+# ── CLI: the Cloud Run Job's entry point ───────────────────────────────────────────────────
+#
+# `python -m jobs.merchant_purchasability_sweep` runs ONE sweep and exits; Cloud Scheduler is the
+# clock (infra/gcp/setup_merchant_purchasability_sweep_job.sh). The exit code is the verdict of
+# the execution: non-zero fails it and trips the "Cloud Run job failing" alert, and the job has
+# --max-retries 0, so a failed run is not re-run (a re-run is another round of abandoned
+# checkouts; a human decides).
+
+#: Done. Includes a run with the gate off (nobody contacted), a run whose population was empty,
+#: and a run the budget cut short — the rest are first in line next hour.
+EXIT_OK = 0
+#: A population lane could not be read, the population could not be built at all, or the database
+#: could not be connected to (nothing was read). The run swept whatever it could read, but a
+#: merchant on an unread allowlist was not refreshed, and with MERCHANT_PURCHASABILITY_ENFORCE on
+#: its fact is ageing out towards a 409. (Python also exits 1 on an uncaught traceback; the log
+#: tells the cases apart, and every one of them means "the population was not read".)
+EXIT_POPULATION_UNREADABLE = 1
+#: The population was read, but at least one check raised or one fact could not be written —
+#: `SweepReport.errors`, "the only count that should page anyone" (the runbook). Numbered like
+#: the Tier B job's EXIT_RECORD_FAILED.
+EXIT_ERRORS = 4
+
+
+def exit_code_for(report: SweepReport) -> int:
+    """The execution's exit code, from the report alone. An unreadable population outranks
+    per-merchant errors: it is the one that says the run did not see what it had to."""
+    if report.population_unreadable:
+        return EXIT_POPULATION_UNREADABLE
+    if report.errors:
+        return EXIT_ERRORS
+    return EXIT_OK
+
+
+async def amain() -> int:
+    """One sweep against the process database, then its exit code. `main` minus the event loop,
+    so a test can drive the CLI's whole path on the test's own loop and connection.
+
+    With the gate off the database is never connected: the run returns `skipped_disabled=1`
+    before it would read anything, and a dark job must not even open a connection."""
+    if not is_enabled():
+        return exit_code_for(await run_merchant_purchasability_sweep())
+    connected_here = not database.is_connected
+    if connected_here:
+        try:
+            await database.connect()
+        except Exception as exc:  # noqa: BLE001 — mapped to an exit code, not a traceback
+            operator_logger.error(
+                "merchant_purchasability_sweep: could not connect to the database (error_type=%s); "
+                "no population was read", type(exc).__name__,
+            )
+            return EXIT_POPULATION_UNREADABLE
+    try:
+        report = await run_merchant_purchasability_sweep()
+    finally:
+        if connected_here:
+            try:
+                await database.disconnect()
+            except Exception as exc:  # noqa: BLE001 — the run's verdict is already decided
+                logger.warning(
+                    "merchant_purchasability_sweep: disconnect failed (error_type=%s)",
+                    type(exc).__name__,
+                )
+    return exit_code_for(report)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """No options: every knob is an env dial (DIALS, read per run), which the setup script pins
+    on the job. `--help` still works, so an operator can ask."""
+    import argparse  # noqa: PLC0415 — only the CLI needs it
+
+    argparse.ArgumentParser(
+        prog="python -m jobs.merchant_purchasability_sweep",
+        description="Run ONE merchant purchasability sweep and exit "
+        f"({EXIT_OK}=ok, {EXIT_POPULATION_UNREADABLE}=population unreadable, "
+        f"{EXIT_ERRORS}=a check or a write failed).",
+    ).parse_args(argv)
+    return asyncio.run(amain())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

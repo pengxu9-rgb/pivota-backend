@@ -496,7 +496,11 @@ jobs:
           # there since ee1c63453) against the 3,675 floor (cap 4,043) -- tripped on the push run with every test
           # PASSING, so the deploy gate refused #2378. Re-floated within the printed window (3,693..4,062) at the
           # same ~97%-of-measured: 3,940, ~122 of deletion headroom, cap 4,334.
-          SUBTREES = {'tests.services': 3940, 'readiness.tests': 120}
+          # tests.services: 4,506 executed on 2026-09-27 at 486c322b1 (#2383-#2404 added ~440 tests there since
+          # 11b4d843e) against the 3,940 floor (cap 4,334) -- tripped on the push run with every test PASSING, so
+          # the deploy gate refused #2402. Re-floated within the printed window (4,097..4,506) at the same
+          # ~97%-of-measured: 4,370, ~136 of deletion headroom, cap 4,807.
+          SUBTREES = {'tests.services': 4370, 'readiness.tests': 120}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:
