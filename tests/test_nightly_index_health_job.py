@@ -1004,3 +1004,114 @@ async def test_domain_recovered_tonight_is_released_by_tonights_batch(monkeypatc
     assert summary["recovered_domains"] == 1
     # ...and the second pass still runs for it.
     assert job._REGRESSION_BLOCKER_UPDATE in fake.executed
+
+
+# ---------------------------------------------------------------------------
+# Scorecard: a baseline measured by an older scorecard is replaced once
+# ---------------------------------------------------------------------------
+
+_FULL = {"title": 1.0, "description": 1.0, "image_url": 1.0, "price": 1.0}
+
+
+class _FakeScorecardDb:
+    """The scorecard's three statements: the sample, the baseline read, the upsert."""
+
+    def __init__(self, sample, baselines):
+        self.sample = sample
+        self.baselines = baselines
+        self.upserts: list = []
+
+    async def fetch_all(self, query, values=None):
+        from jobs.nightly_index_health_job import _BASELINE_FETCH_QUERY, _SCORECARD_QUERY
+
+        if query == _SCORECARD_QUERY:
+            return self.sample
+        if query == _BASELINE_FETCH_QUERY:
+            return [b for b in self.baselines if b["domain"] in values["domains"]]
+        raise AssertionError(f"unexpected fetch_all: {query[:80]!r}")
+
+    async def execute_many(self, query, values):
+        self.upserts.extend(values)
+
+
+def _sample(domain, total, priced):
+    return {"domain": domain, "total": total, "has_title": total,
+            "has_description": total, "has_image": total, "has_price": priced}
+
+
+def _prior(domain, price, *, version, alert_state="ok"):
+    return {
+        "domain": domain,
+        "baseline_coverage": json.dumps(dict(_FULL, price=price)),
+        "current_coverage": json.dumps(dict(_FULL, price=price)),
+        "alert_state": alert_state,
+        "baseline_set_at": datetime(2026, 8, 29, tzinfo=timezone.utc),
+        "scorecard_version": version,
+    }
+
+
+async def _run_scorecard(monkeypatch, sample, baselines):
+    import db.database
+    import jobs.nightly_index_health_job as job
+
+    fake = _FakeScorecardDb(sample, baselines)
+    monkeypatch.setattr(db.database, "database", fake)
+    summary = await job._compute_domain_extractor_scorecards()
+    return summary, {u["domain"]: u for u in fake.upserts}
+
+
+@pytest.mark.asyncio
+async def test_ok_domain_with_an_older_scorecard_baseline_is_rebaselined(monkeypatch) -> None:
+    """www.catkin.com, prod 2026-09-27: price baseline 0.0833, counted by v1 from
+    inactive duplicate seeds. Every active seed is priced. A domain that stays
+    'ok' never moves its baseline, so without a re-baseline a price drop there
+    could never register."""
+    from jobs.nightly_index_health_job import SCORECARD_VERSION
+
+    summary, up = await _run_scorecard(
+        monkeypatch,
+        [_sample("catkin.test", 6, 6), _sample("legacy.test", 5, 5)],
+        [_prior("catkin.test", 0.0833, version="scorecard_v1"),
+         _prior("legacy.test", 0.0, version=None)],
+    )
+    for domain in ("catkin.test", "legacy.test"):
+        row = up[domain]
+        assert row["alert_state"] == "ok"
+        assert json.loads(row["baseline_coverage"])["price"] == 1.0
+        assert row["baseline_set_at"] > datetime(2026, 9, 1, tzinfo=timezone.utc)
+        assert row["scorecard_version"] == SCORECARD_VERSION
+    assert summary["domains_rebaselined"] == 2
+    assert summary["domains_recovered"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ok_domain_on_the_current_scorecard_keeps_its_baseline(monkeypatch) -> None:
+    from jobs.nightly_index_health_job import SCORECARD_VERSION
+
+    summary, up = await _run_scorecard(
+        monkeypatch,
+        [_sample("steady.test", 10, 10)],
+        [_prior("steady.test", 0.95, version=SCORECARD_VERSION)],
+    )
+    row = up["steady.test"]
+    assert row["alert_state"] == "ok"
+    assert json.loads(row["baseline_coverage"])["price"] == 0.95
+    assert row["baseline_set_at"] == datetime(2026, 8, 29, tzinfo=timezone.utc)
+    assert summary["domains_rebaselined"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("priced, expected", [(70, "regression"), (85, "degraded")])
+async def test_a_version_change_does_not_absorb_a_drop(monkeypatch, priced, expected) -> None:
+    """The re-baseline is reached only on an 'ok' verdict: a domain whose price
+    fell 0.30 (or 0.15) against its old baseline is flagged against that baseline,
+    not re-baselined onto the broken number."""
+    summary, up = await _run_scorecard(
+        monkeypatch,
+        [_sample("broke.test", 100, priced)],
+        [_prior("broke.test", 1.0, version="scorecard_v1")],
+    )
+    row = up["broke.test"]
+    assert row["alert_state"] == expected
+    assert json.loads(row["baseline_coverage"])["price"] == 1.0
+    assert summary["domains_rebaselined"] == 0

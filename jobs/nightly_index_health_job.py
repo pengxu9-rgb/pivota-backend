@@ -104,7 +104,26 @@ from services.index_pipeline_state_service import (
 
 logger = logging.getLogger(__name__)
 
-SCORECARD_VERSION = "scorecard_v1"
+# BUMP THIS WHENEVER _SCORECARD_QUERY CHANGES WHAT IT COUNTS. A domain that
+# stays 'ok' keeps its baseline forever (only 'new' and a recovery set one), so
+# a baseline measured by an older query outlives the query. An 'ok' domain
+# whose stored scorecard_version differs is re-baselined the next time it is
+# scored; see _compute_domain_extractor_scorecards.
+#   v1: every in-window seed. #2392 (2026-09-26) excluded suppressed attached
+#       products and added the flat-seed fallbacks without a bump.
+#   v2: active seeds only.
+# Measured prod 2026-09-27: 24 of 221 baselines hold a field below 0.8, and 23
+# of them were last scored before #2392. athiscosmetics.com price 0.0,
+# www.catkin.com 0.08, judydoll.com 0.11 and joocyee.com 0.14 were counted
+# from inactive duplicate seeds and wrong-brand suppressed products. Every
+# active catkin/judydoll/joocyee seed is priced. On such a baseline a price
+# drop can never register.
+# The re-baseline only runs on an 'ok' verdict, so it protects in ONE direction:
+# a new query that measures structurally LOWER turns the old baseline into a
+# standing 'regression' that never recovers. Before a bump, score prod with the
+# new query against the stored baselines and confirm no verdict changes (v2:
+# 0 of 168 domains changed, 2026-09-27).
+SCORECARD_VERSION = "scorecard_v2"
 
 TRACKED_FIELDS = ["title", "description", "image_url", "price"]
 DEGRADED_THRESHOLD = 0.10    # coverage drop > 10% → 'degraded'
@@ -224,6 +243,12 @@ async def _release_job_lock() -> None:
 # were suppressed one by one (orphan_no_sku, duplicate_offer), which is the kind
 # of price-pipeline damage this scorecard exists to see. A seed with no attached
 # product (LEFT JOIN miss) stays in the sample, as before.
+#
+# INACTIVE SEEDS ARE NOT IN THE SAMPLE either. A superseded or duplicate seed is
+# deactivated and keeps its canonical_url, so it still joins to the snapshot the
+# live seed's refresh writes, and it is not served. Counted, the 22 inactive
+# unattached catkin.com seeds and the inactive step5 duplicates on judydoll.com
+# and joocyee.com scored as unpriced (prod 2026-09-27).
 _SCORECARD_QUERY = """
 WITH seeds_in_window AS (
     -- Dedupe to one row per (domain, seed). Without DISTINCT, a seed with N
@@ -244,6 +269,7 @@ WITH seeds_in_window AS (
     LEFT JOIN catalog_products cp
         ON cp.product_key = eps.attached_product_key
     WHERE eos.last_checked_at > NOW() - INTERVAL '72 hours'
+      AND eps.status = 'active'
       AND cp.suppressed_at IS NULL
 )
 SELECT
@@ -291,7 +317,8 @@ LIMIT 500
 """
 
 _BASELINE_FETCH_QUERY = """
-SELECT domain, baseline_coverage, current_coverage, alert_state, baseline_set_at
+SELECT domain, baseline_coverage, current_coverage, alert_state, baseline_set_at,
+       scorecard_version
 FROM domain_extractor_baselines
 WHERE domain = ANY(:domains)
 """
@@ -417,6 +444,7 @@ async def _compute_domain_extractor_scorecards() -> Dict[str, Any]:
         "domains_scored": 0,
         "domains_regressed": 0,
         "domains_recovered": 0,
+        "domains_rebaselined": 0,
         "errors": [],
     }
 
@@ -504,6 +532,16 @@ async def _compute_domain_extractor_scorecards() -> Dict[str, Any]:
                 new_baseline = current_coverage
                 baseline_set_at = now
                 summary["domains_recovered"] += 1
+            elif prior.get("scorecard_version") != SCORECARD_VERSION:
+                # An older scorecard measured this baseline (see
+                # SCORECARD_VERSION). Only an 'ok' verdict gets here, so no
+                # field is down DEGRADED_THRESHOLD against the old baseline (as
+                # computed in float: an exact 0.10 drop reads 0.0999...):
+                # tonight's coverage replaces it. A degraded or regression domain keeps
+                # its old baseline until it recovers, which resets it anyway.
+                new_baseline = current_coverage
+                baseline_set_at = now
+                summary["domains_rebaselined"] += 1
             else:
                 new_baseline = prior_baseline if prior_baseline else current_coverage
                 baseline_set_at = prior["baseline_set_at"] if prior else now
@@ -787,6 +825,7 @@ async def _run_on_pinned_connection(*, catch_up: bool) -> Dict[str, Any]:
         "domain_baselines_updated": 0,
         "regression_domains": 0,
         "recovered_domains": 0,
+        "rebaselined_domains": 0,
         "batch_errors": 0,
         "errors": [],
     }
@@ -836,6 +875,9 @@ async def _run_on_pinned_connection(*, catch_up: bool) -> Dict[str, Any]:
             )
             summary["recovered_domains"] = scorecard_summary.get(
                 "domains_recovered", 0
+            )
+            summary["rebaselined_domains"] = scorecard_summary.get(
+                "domains_rebaselined", 0
             )
             if scorecard_summary.get("errors"):
                 summary["errors"].extend(scorecard_summary["errors"])

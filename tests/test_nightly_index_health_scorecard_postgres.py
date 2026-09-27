@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -62,6 +63,10 @@ ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS suppression_reason text;
 ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS suppressed_at timestamptz
 """
 
+# domain_extractor_baselines has no SQLAlchemy model either; it is built from
+# the migration that ships it (CREATE ... IF NOT EXISTS throughout).
+_BASELINES_MIGRATION = "099_domain_extractor_baselines.sql"
+
 _DESC = "A lightweight gel cream that hydrates for 72 hours."  # >= 10 chars
 _IMG = "https://cdn.example.test/p.jpg"
 
@@ -73,6 +78,7 @@ def pg_engine():
     from sqlalchemy import create_engine, text
 
     from db.database import metadata
+    from db.sql_migrations import split_statements
 
     engine = create_engine(DATABASE_URL)
     metadata.create_all(
@@ -87,6 +93,13 @@ def pg_engine():
     with engine.begin() as conn:
         for stmt in filter(None, (s.strip() for s in _LIGHTWEIGHT_DDL.split(";"))):
             conn.execute(text(stmt))
+        # A raw cursor with no parameters: the file's comments hold literal "%".
+        cursor = conn.connection.cursor()
+        for stmt in split_statements(
+            (Path(__file__).resolve().parents[1] / "db" / "migrations" / _BASELINES_MIGRATION).read_text()
+        ):
+            cursor.execute(stmt)
+        cursor.close()
         _reset(conn)
     yield engine
     with engine.begin() as conn:
@@ -101,6 +114,7 @@ def _reset(conn):
     conn.execute(text("DELETE FROM external_product_seeds WHERE id LIKE :p"), {"p": _P + "%"})
     conn.execute(text("DELETE FROM catalog_offers WHERE offer_id LIKE :p"), {"p": _P + "%"})
     conn.execute(text("DELETE FROM catalog_products WHERE product_key LIKE :p"), {"p": _P + "%"})
+    conn.execute(text("DELETE FROM domain_extractor_baselines WHERE domain LIKE :p"), {"p": _P + "%"})
 
 
 def _product(conn, pk, *, description=None, image_url=None, suppressed=False,
@@ -144,7 +158,7 @@ def _product(conn, pk, *, description=None, image_url=None, suppressed=False,
 
 
 def _seed(conn, sid, domain, *, seed_data, attached=None, title="Seed title",
-          snapshots=1, hours_ago=1):
+          snapshots=1, hours_ago=1, status="active"):
     """An external_product_seeds row and `snapshots` offer snapshots of its URL."""
     from sqlalchemy import text
 
@@ -154,9 +168,10 @@ def _seed(conn, sid, domain, *, seed_data, attached=None, title="Seed title",
             "INSERT INTO external_product_seeds "
             "(id, market, tool, destination_url, canonical_url, title, seed_data, "
             " status, attached_product_key) "
-            "VALUES (:id, 'US', '*', :url, :url, :title, CAST(:sd AS jsonb), 'active', :apk)"
+            "VALUES (:id, 'US', '*', :url, :url, :title, CAST(:sd AS jsonb), :status, :apk)"
         ),
-        {"id": sid, "url": url, "title": title, "sd": json.dumps(seed_data), "apk": attached},
+        {"id": sid, "url": url, "title": title, "sd": json.dumps(seed_data), "apk": attached,
+         "status": status},
     )
     for i in range(snapshots):
         conn.execute(
@@ -409,3 +424,72 @@ def test_seed_checked_outside_the_window_is_not_sampled(pg_engine):
         _product(conn, _P + "pk-old", description=_DESC, image_url=_IMG)
         _seed(conn, _P + "s-old", d, seed_data=_flat(), attached=_P + "pk-old", hours_ago=73)
         assert _score(conn, d) is None
+
+
+def test_inactive_seed_is_not_sampled(pg_engine):
+    """A deactivated duplicate keeps its canonical_url, so it joins to the snapshot
+    the live seed's refresh writes. It is not served: www.catkin.com's 22 inactive
+    unattached seeds scored as unpriced next to 1 active priced seed (prod
+    2026-09-27)."""
+    d = _P + "inactive.test"
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        _product(conn, _P + "pk-live", description=_DESC, image_url=_IMG)
+        _seed(conn, _P + "s-live", d, seed_data=_flat(), attached=_P + "pk-live")
+        _seed(conn, _P + "s-dead-unatt", d, seed_data=_snapshot_shaped(), attached=None,
+              status="inactive")
+        assert _score(conn, d) == {
+            "total": 1, "has_title": 1, "has_description": 1, "has_image": 1, "has_price": 1,
+        }
+
+
+def test_baseline_fetch_returns_the_scorecard_version(pg_engine):
+    """The re-baseline compares the stored scorecard_version with SCORECARD_VERSION.
+    If the fetch stopped selecting it, every 'ok' domain would read as an older
+    scorecard and be re-baselined every night, and a slow decline would never
+    add up to a regression."""
+    from sqlalchemy import text
+
+    from jobs.nightly_index_health_job import _BASELINE_FETCH_QUERY, SCORECARD_VERSION
+
+    d = _P + "version.test"
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        conn.execute(
+            text("INSERT INTO domain_extractor_baselines (domain, alert_state, scorecard_version) "
+                 "VALUES (:d, 'ok', :v)"),
+            {"d": d, "v": SCORECARD_VERSION},
+        )
+        rows = [dict(r) for r in conn.execute(text(_BASELINE_FETCH_QUERY), {"domains": [d]}).mappings()]
+        assert [r["scorecard_version"] for r in rows] == [SCORECARD_VERSION]
+
+
+def test_upsert_stamps_the_current_scorecard_version(pg_engine):
+    """The other half of the version check: if the upsert stopped writing
+    scorecard_version on conflict, a v1 row would stay v1 and be re-baselined
+    every night."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy import text
+
+    from jobs.nightly_index_health_job import (
+        _BASELINE_FETCH_QUERY, _BASELINE_UPSERT_QUERY, SCORECARD_VERSION,
+    )
+
+    d = _P + "upsert.test"
+    now = datetime.now(timezone.utc)
+    cov = json.dumps({"title": 1.0, "description": 1.0, "image_url": 1.0, "price": 1.0})
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        conn.execute(
+            text("INSERT INTO domain_extractor_baselines (domain, alert_state, scorecard_version) "
+                 "VALUES (:d, 'ok', 'scorecard_v1')"),
+            {"d": d},
+        )
+        conn.execute(text(_BASELINE_UPSERT_QUERY), {
+            "domain": d, "baseline_coverage": cov, "current_coverage": cov, "sample_size": 5,
+            "alert_state": "ok", "regression_details": "[]", "scorecard_version": SCORECARD_VERSION,
+            "last_scored_at": now, "baseline_set_at": now,
+        })
+        rows = [dict(r) for r in conn.execute(text(_BASELINE_FETCH_QUERY), {"domains": [d]}).mappings()]
+        assert [r["scorecard_version"] for r in rows] == [SCORECARD_VERSION]
