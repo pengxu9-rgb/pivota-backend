@@ -305,3 +305,66 @@ def test_the_evidence_names_the_token_price_when_the_mode_ties():
 def test_the_modal_share_and_ceiling_boundaries(price, modal, rest, held):
     flags = detectors.detect(store([[price]] * modal + [[v] for v in _varied(rest, 30.0)]))
     assert bool(_held(flags)) is held
+
+
+# ------------------------------------------------------------------ set false positives (2026-09-27)
+# Held on the US top-100 re-runs: stilacosmetics.com "Smudge & Set" (the verb "set" in a product-line
+# name) and tartecosmetics.com gift sets whose titles name what is inside them.
+
+def _on(rec, category_prefix):
+    assert rec is not None and rec["pdp"]["category_path"].startswith(category_prefix), rec and rec["pdp"]
+    return rec
+
+
+@pytest.mark.parametrize("title,ptype", [
+    ("Stay All Day® Smudge & Set™ Waterproof Gel Eye Liner", "Eyeliner"),
+    ("Mini Bake & Set Setting Powder Translucent 2.6g", "Setting Powder"),
+    ("Plump Shot™ Peptide Prep & Set Mist", "Face Mist"),
+    ("ICD Set & Stay Makeup Spray 80 mL", "Face Primer"),
+    ("Smooth and Set Loose Powder", "Setting Powder"),
+    ("tfit Translucent Set Finishing Powder 7g", "Setting Powder"),
+    ("Cloud Set Loose Powder – Translucent Peachy", "Setting Powder"),
+])
+def test_the_verb_set_in_a_product_line_name_is_not_a_set(title, ptype):
+    rec = _on(record(title, ptype, title.lower().replace(" ", "-")), "beauty/")
+    assert not rec["pdp"]["category_path"].startswith("beauty/sets/")
+    assert "set_filed_as_single_product" not in rules(detectors.detect([rec])), title
+
+
+@pytest.mark.parametrize("title", [
+    "Hydrating Toner & Emulsion Set",                   # "&" not beside "Set"
+    "Hydrating Toner Set + Free Gift",                  # "+" beside "Set" is a bundle
+    "Glow Toner Set +Refill",
+    "Hydrating Toner + Set of Cotton Pads",             # "+" BEFORE "Set" is a bundle too
+    "Travel Prime & Set Duo",                           # the verb, but the title names a pack
+    "Mini Prime & Set Pouch",
+    "Translucent Set Finishing Powder Brush Special Set",  # one verb, one real set
+    "Glow Toner Sticker Set &",                         # "&" with nothing after it
+    "Glow Toner Set",
+])
+def test_a_real_set_beside_the_verb_exemption_is_still_held(title):
+    rec = _on(record(title, "Toner", title.lower().replace(" ", "-")), "beauty/skincare/tone/")
+    assert "set_filed_as_single_product" in rules(detectors.detect([rec]), detectors.BLOCK), title
+
+
+@pytest.mark.parametrize("title", [
+    "Glow Pot Eyeshadow & Brush",                       # tartecosmetics.com, 2026-09-27
+    "CC Undereye Corrector + FREE Tubing Mascara",
+    "1025 Dokdo Toner 200ml + Dokdo Lotion 200ml",
+    "Niacinamide 20 Serum (5ea)",
+    "Acne Attack Trio Serum",
+    "IOPE Super Vital Cream 50ml Essence 48ml",         # names two leaves
+])
+def test_a_set_on_the_sets_shelf_may_name_what_is_inside_it(title):
+    rec = _on(record(title, "Gift Set", title.lower().replace(" ", "-")), "beauty/sets/")
+    assert "title_contradicts_category" not in rules(detectors.detect([rec])), title
+
+
+@pytest.mark.parametrize("title", [
+    "AHC Renew Age Total Reset Cream 50ml",             # koolseoul types it "Skincare Set"
+    "Rosee Sib Jang Saeng Cheon Ji Hyang Essence 45Ml",
+    "Skin Setting Tone Up Sun Base SPF50+ PA+++",       # "+" of SPF/PA is not a join
+])
+def test_a_single_product_the_store_types_as_a_set_is_still_held(title):
+    rec = _on(record(title, "Skincare Set", title.lower().replace(" ", "-")), "beauty/sets/")
+    assert "title_contradicts_category" in rules(detectors.detect([rec]), detectors.BLOCK), title

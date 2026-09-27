@@ -33,6 +33,7 @@ BLOCK = "block"
 INFO = "info"
 
 _LIP_PREFIX = "beauty/makeup/lip/"
+_SETS_PREFIX = "beauty/sets/"
 
 # A lip product's own copy talks about lips. Measured 2026-09-23 on the 10 lip products applied by
 # hand plus the k-touch.us tone-up cream: every real one mentions lips; the tone-up cream's copy
@@ -52,6 +53,27 @@ _AREA_LEAF = re.compile(r"^beauty/(?:body|haircare)/")
 # "1ea" -- how Korean retailers label single items) is a single product.
 _SET_TITLE = re.compile(r"\b(?:sets?|kits?|bundles?|trio|(?:[2-9]|\d{2,})\s*-?\s*(?:pcs?|pieces?|ea)|special\s+edition|"
                         r"duo\s+edition|double\s+edition|\d+\s*x\s*\d+\s*(?:ml|g))\b", re.I)
+# "Set" the VERB, in a product-line name: held 2026-09-27 on stilacosmetics.com "Stay All Day® Smudge &
+# Set™ Waterproof Gel Eye Liner". Measured over 283,801 titles on 86 stores (reports/*/catalogs): the verb
+# sits in an "X & Set" / "Set & X" pair ("Bake & Set", "Prep & Set Mist", "Set & Stay Makeup Spray") or
+# names what it is right after ("Set Finishing Powder", "Cloud Set Loose Powder", "Curl Set Lotion").
+# Only "&"/"and": "+" beside "Set" is a bundle ("Set + Free Gift", "Set +Refill", "Primer + Set Duo").
+# Not adjacent is not a verb: "Toner & Emulsion Set", "Brow & Lash Set" stay sets.
+_VERB_SET_BEFORE = re.compile(r"\w[\w'’]*[™®]*\s*(?:&|\band)\s*$", re.I)
+_VERB_SET_AFTER = re.compile(r"^[™®]*(?:\s*(?:&|and\b)\s*\w|\s+(?:powder|spray|mist|gel|lotion|essence|"
+                             r"finishing|setting|fixer|translucent|loose|pressed)\b)", re.I)
+# ...unless the title also names a pack of products: "Prime & Set Duo", "Mini Prime & Set Pouch".
+_PACK_WORD = re.compile(r"\b(?:duos?|pouch|vault|collection|gift|value)\b", re.I)
+# A title that shows it is a set: it names two beauty leaves, or joins or counts products. On the sets
+# shelf only such a title may name a leaf other than the shelf. Measured 2026-09-27 over the 81 rows of
+# reports/*/catalogs that the real producer files under beauty/sets/ AND whose title names another leaf:
+# 67 are sets ("Toner 200ml + Lotion 200ml", "Acne Attack Trio", "Serum (5ea)", "Regimen"); the other 14
+# are single products a store TYPES as a set and still hold -- koolseoul "Skincare Set": "AHC Renew Age
+# Total Reset Cream 50ml"; shoppalacebeauty "Gift Set": "Rosee ... Essence 45Ml". A "+" beside a digit or
+# another "+" is SPF/PA ("SPF50+ PA+++"), not a join.
+_SET_EVIDENCE = re.compile(r"(?<![\d+])\+(?!\+)|&|\band\b|\bwith\b|\b(?:duos?|trios?|quads?|packs?|package|box|"
+                           r"regimen|system|collection|variety|routine|basket|vials|edition|"
+                           r"(?:[2-9]|\d{2,})\s*(?:ea|types|kinds))\b|\bx\s*\d|\d\s*[x×*]\s*\d|\b\d+\s*x\b", re.I)
 
 # A lip product ships in a few ml/g (balm tins reach ~15-18 g); 20+ is a face or body format.
 _SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|g|oz|fl\.?\s*oz)\b", re.I)
@@ -168,6 +190,16 @@ def _size_units(text: str) -> List[float]:
     return sizes
 
 
+def _names_a_set(title: str) -> bool:
+    """_SET_TITLE, except a "set" that is the verb of a product-line name (see _VERB_SET_BEFORE)."""
+    for m in _SET_TITLE.finditer(title):
+        verb = (m.group(0).lower() == "set" and not _PACK_WORD.search(title)
+                and bool(_VERB_SET_BEFORE.search(title[:m.start()]) or _VERB_SET_AFTER.search(title[m.end():])))
+        if not verb:
+            return True
+    return False
+
+
 def _flag(rule: str, severity: str, record: Dict[str, Any], detail: str) -> Dict[str, Any]:
     pdp = _pdp(record)
     handle = _handle(record)
@@ -252,11 +284,18 @@ def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True,
         # Exempt only what the non-face rule moved on purpose: an area leaf whose OWN title names that
         # area ("Hand Cream" -> body/care). A "Vitamin C Serum" typed "Hair" is still a contradiction.
         moved_by_area_rule = bool(_AREA_LEAF.match(category) and _NON_FACE_TITLE.search(title))
-        if category and named and category not in named and not moved_by_area_rule:
+        # A set's title names what is IN it ("Glow Pot Eyeshadow & Brush" on beauty/sets): held 20 of
+        # tartecosmetics.com's 23 title flags 2026-09-27. Only a title that shows it is a set: a single
+        # product the store types "Skincare Set" is still a contradiction (_SET_EVIDENCE).
+        on_sets_shelf = category.startswith(_SETS_PREFIX)
+        set_named_by_title = on_sets_shelf and (
+            len([p for p in named if p.startswith("beauty/")]) >= 2
+            or bool(_SET_TITLE.search(title)) or bool(_SET_EVIDENCE.search(title)))
+        if category and named and category not in named and not moved_by_area_rule and not set_named_by_title:
             flags.append(_flag("title_contradicts_category", BLOCK, record,
                                f"filed under {category}; the title names {sorted(named)}"))
 
-        if category and not category.startswith("beauty/sets/") and _SET_TITLE.search(title):
+        if category and not on_sets_shelf and _names_a_set(title):
             flags.append(_flag("set_filed_as_single_product", BLOCK, record,
                                f"the title names a set/multi-pack but it is filed under {category}"))
 
