@@ -334,8 +334,6 @@ def _flags(title, ptype, category_prefix="beauty/"):
     # "Set" + what it is -- one per noun, with no pair to lean on
     ("Forever Set Powder", "Setting Powder"),
     ("Dewy Set Spray Primer", "Face Primer"),
-    ("Cloud Set Mist Primer", "Face Primer"),
-    ("Clear Set Gel Primer", "Face Primer"),
     ("Curl Set Lotion Primer", "Face Primer"),
     ("Curl Set Essence Primer", "Face Primer"),
     ("tfit Translucent Set Finishing Powder 7g", "Setting Powder"),
@@ -343,7 +341,11 @@ def _flags(title, ptype, category_prefix="beauty/"):
     ("Hold Set Fixer Primer", "Face Primer"),
     ("Neutral Set Translucent Powder", "Setting Powder"),
     ("Cloud Set Loose Powder – Translucent Peachy", "Setting Powder"),
+    ("Cloud Set™ Loose Powder", "Setting Powder"),                           # a mark glued to "Set"
     ("Kett Set Pressed Powder", "Setting Powder"),
+    ("Set Powder Brush", "Setting Powder"),              # a brush FOR setting powder
+    ("Hydrating Set and Stay Spray", "Setting Powder"),
+    ("Set and Forget Mascara", "Setting Powder"),        # a product noun two words after the join
 ])
 def test_the_verb_set_in_a_product_line_name_is_not_a_set(title, ptype):
     assert "set_filed_as_single_product" not in _flags(title, ptype), title
@@ -361,6 +363,11 @@ def test_the_verb_set_in_a_product_line_name_is_not_a_set(title, ptype):
     ("Translucent Set Finishing Powder Brush Special Set", "Setting Powder"),  # one verb, one real set
     ("Travel Kit Bake & Set Powder", "Setting Powder"),  # a real set BEFORE the verb
     ("Makeup Kit Powder", "Setting Powder"),            # only "set" can be the verb, not "kit"
+    ("Glow Kit Powder", "Setting Powder"),
+    ("Glow [Mini] Set Powder", "Setting Powder"),       # a bracketed set word
+    ("Smudge & Set Eyeliner & Mascara", "Eyeliner"),     # a product joined after it
+    ("Luxe Set & Mini Mirror", "Setting Powder"),        # a tool two words after the join
+    ("Lip Set & Go", "Setting Powder"),                 # an area word before "Set"
     ("Glow Toner Sticker Set &", "Toner"),              # "&" with nothing after it
     ("Glow Toner Set", "Toner"),
     ("Toner Set Essence 50ml", "Toner"),                # a product noun before "Set"
@@ -369,6 +376,18 @@ def test_the_verb_set_in_a_product_line_name_is_not_a_set(title, ptype):
     ("Brush Set & Bag", "Face Primer"),
     ("Sheet Mask Set and Eye Patch", "Toner"),
     ("Starter Set Lotion + Cream", "Toner"),
+    # a set word before "Set" (review of bbadf0343)
+    ("Starter Set Essence", "Essence"),
+    ("Discovery Set Essence Toner", "Toner"),
+    ("Trial Set Mist Toner", "Toner"),
+    ("Hair Care Set Spray", "Hair Spray"),
+    ("Mini Set Powder", "Setting Powder"),
+    ("Holiday Set & Mirror Powder", "Setting Powder"),
+    ("Travel Set Powder and Puff", "Setting Powder"),
+    ("Glow Set Gel Cleanser", "Cleanser"),              # "gel" is not a setting noun
+    # a tool joined after it
+    ("Smudge & Set Eyeliner & Sharpener", "Eyeliner"),
+    ("Bake & Set Powder + Puff", "Setting Powder"),
 ])
 def test_a_real_set_beside_the_verb_exemption_is_still_held(title, ptype):
     rec = _on(record(title, ptype, title.lower().replace(" ", "-")), "beauty/")
@@ -395,7 +414,12 @@ def test_a_real_set_beside_the_verb_exemption_is_still_held(title, ptype):
     "Hydrating Serum Duo",
     "Acne Control Serum Regimen",
     "Clear Skin Serum System",
-    "Glow Serum Collection",
+    "Glow Serum Sample Pack",
+    "Glow Serum Double Pack",
+    "Glow Serum Value Pack",
+    "Glow Serum Discovery Pack",
+    "Serum + Glow Cream",                               # "+" joins even a one-word part
+    "Glow Serum Gift Box",
     "Deep Mask Variety Pack",
     "Harvest Gift Basket Body Wash Cleanser",
     "Cleanse & Calm 3-Step Serum",
@@ -415,6 +439,17 @@ def test_a_set_on_the_sets_shelf_may_name_what_is_inside_it(title):
     "Cica+ Soothing Cream",                             # "+" glued to a word
     "Sun Serum SPF50+ Moisture Cream",                  # SPF "+" between two leaf words
     "Glow Eyeshadow Quad",                              # one palette
+    "Daily Moisturizer with SPF 30",                    # "with SPF" is a feature (review of bbadf0343)
+    "Tinted Moisturizer with Sunscreen SPF 30",
+    "Lip Balm with SPF 15",
+    "1-Step Exfoliating Peel Pad",                      # a count of 1
+    "Hydrating Serum 1 Pack",
+    "Hair & Body Wash",                                 # one noun shared by two modifiers
+    "Day & Night Cream",
+    "Shampoo & Conditioner 2-in-1",                     # one product named twice
+    "Toner and Essence in One",
+    "Hydrating Toner and Rich Essence 2-in-1",
+    "Anti-Aging System Serum",                          # "system" naming a line, not a kit
     "Moisture Cream 1 x 50ml",                          # a count of 1
     "[Gift Recommendation] Layered Perfume",            # "gift" alone is not a gift set
     "COGIT Sun Block Cooling UV Protection Hoodie UPF50+ 爽壁+ 全脸防护",  # CJK "+"; not beauty at all
@@ -426,3 +461,16 @@ def test_a_single_product_the_store_types_as_a_set_is_still_held(title):
 
 def test_a_set_title_on_the_sets_shelf_is_not_a_set_filed_as_one_product():
     assert "set_filed_as_single_product" not in _flags("Glow Toner Set", "Gift Set", "beauty/sets/")
+
+
+@pytest.mark.parametrize("word", ["Starter", "Discovery", "Trial", "Travel", "Holiday", "Mini", "Minis", "Sample",
+                                  "Bestseller", "Best-Sellers", "Care", "Makeup", "Skincare",
+                                  "Beauty", "Deluxe", "Festive", "Lip", "Lips", "Eye", "Eyes", "Brow", "Brows",
+                                  "Lash", "Lashes", "Face", "Nail", "Nails", "Body", "Skin"])
+def test_a_set_word_before_set_makes_it_the_noun(word):
+    assert "set_filed_as_single_product" in _flags(f"Glow {word} Set Powder", "Setting Powder")
+
+
+@pytest.mark.parametrize("tool", ["Puff", "Puffs", "Sharpener", "Mirror", "Bag", "Case", "Pouches", "Sponge", "Applicator"])
+def test_a_tool_joined_after_the_verb_set_is_a_second_item(tool):
+    assert "set_filed_as_single_product" in _flags(f"Bake & Set Powder + {tool}", "Setting Powder")

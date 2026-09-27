@@ -59,29 +59,37 @@ _SET_TITLE = re.compile(r"\b(?:sets?|kits?|bundles?|trio|(?:[2-9]|\d{2,})\s*-?\s
 # names what it is right after ("Set Finishing Powder", "Cloud Set Loose Powder", "Curl Set Lotion").
 # The verb's partner is never a product noun (_title_paths names no leaf for Smudge/Bake/Stay/Keep); a
 # product noun beside "Set" makes it the noun: "Toner Set Essence", "Serum Set & Cream", "Starter Set Lotion
-# + Cream". "+" beside "Set" is a bundle ("Set + Free Gift", "Primer + Set Spray").
+# + Cream". So does a set word ("Starter Set Essence", "Travel Set Powder") or a tool joined after it ("Set
+# Powder + Puff", "Set & Mini Mirror"), or an area word ("Lip Set & Go"). "+" beside "Set" is a bundle ("Set + Free Gift", "Primer + Set Spray").
 _VERB_SET_BEFORE = re.compile(r"\w[\w'’]*[™®]*\s*(?:&|\band)\s*$", re.I)
-_VERB_SET_AFTER = re.compile(r"^(?:\s*(?:&|and\b)\s*\w|\s+(?:powder|spray|mist|gel|lotion|essence|"
+_VERB_SET_AFTER = re.compile(r"^(?:\s*(?:&|and\b)\s*\w|\s+(?:powder|spray|lotion|essence|"
                              r"finishing|setting|fixer|translucent|loose|pressed)\b)", re.I)
-_WORD_BEFORE = re.compile(r"([^\W\d_][\w'’]*)[™®]*\s*$")
-_JOINED_WORD = re.compile(r"(?:&|\band\b|\bwith\b|\+)\s*([^\W\d_][\w'’]*)", re.I)
+_SET_WORD = re.compile(r"^(?:starter|discovery|trial|travel|holiday|mini|minis|sample|best-?sellers?|care|"
+                       r"makeup|skincare|beauty|deluxe|festive|lips?|eyes?|brows?|lash(?:es)?|face|nails?|body|skin)$", re.I)
+_JOINED_WORD = re.compile(r"(?:&|\band\b|\bwith\b|\+)\s*([^\W\d_][\w'’]*)(?:\s+([^\W\d_][\w'’]*))?", re.I)
+_TOOL_WORD = re.compile(r"^(?:puffs?|sharpeners?|mirrors?|bags?|cases?|pouch(?:es)?|sponges?|applicators?)$", re.I)
 # ...and never when the title also names a pack of products: "Prime & Set Duo", "Mini Prime & Set Pouch".
 _PACK_WORD = re.compile(r"\b(?:duos?|pouch|vault|collection|gift|value)\b", re.I)
 # On the sets shelf a title may name a leaf other than the shelf only when it shows it IS a set: a pack or
 # count word, a free gift/refill, or a join with a product noun on two sides of it (_joined_products).
-# ("Duo"/"Trio" titles need no word here: the classifier files them to the gift-set leaf itself. "Quad" is
-# one palette, not a set.)
+# ("Duo", "Trio", "Collection", "Essentials", "Routine" need no word here: the classifier files those titles to
+# the gift-set leaf itself. "Quad" is one palette, not a set.)
 # Measured 2026-09-27 over the rows of reports/*/catalogs the real producer files under beauty/sets/ whose
 # title names another leaf -- see the PR for the table. Single products a store TYPES as a set still hold:
 # koolseoul "Skincare Set": "AHC Renew Age Total Reset Cream 50ml", "Julyme ... Perfume Hair Oil 30ml" (two
 # leaves, one product); image118 files a UV hoodie ("爽壁+") under gift sets.
-_SET_PACK = re.compile(r"\b(?:regimen|system|collection|(?:sample|variety|double|value|"
-                       r"discovery)\s+pack|gift\s+(?:set|box|basket)|\d\s*-?\s*step|"
+_SET_PACK = re.compile(r"\b(?:regimen|system(?![\w\s-]*\b(?:serum|cream|toner|cleanser|essence|lotion|mask|oil)\b)|"
+                       r"(?:sample|variety|double|value|discovery)\s+pack|gift\s+(?:box|basket)|"
+                       r"(?:[2-9]|\d{2,})\s*-?\s*step|"
                        r"(?:[2-9]|\d{2,})\s*-?\s*(?:packs?|types|kinds|vials))\b|\+\s*(?:free|refill)\b", re.I)
 # A join between products. "+" only with a space, "(" or a size before it: not "Cica+ Cream", "SPF50+",
 # "PA+++" or a CJK "爽壁+"; "and"/"with"/"&" are joins only between product nouns ("Plump and Glow Cream",
 # "Cream with Ceramides" are one product).
 _JOIN = re.compile(r"&|\band\b|\bwith\b|(?:(?<=\s)|(?<=\()|(?<=\dml)|(?<=\dg)|(?<=\doz))\+", re.I)
+# ...and not a feature: "Moisturizer with SPF 30", "Tinted Moisturizer with Sunscreen SPF 30".
+_WITH_SPF = re.compile(r"\bwith\s+(?:broad[\s-]*spectrum\s+)?(?:sun\s*screen(?:\s+spf\s*\d*\+*)?|spf\s*\d*\+*)", re.I)
+# One product named twice: "Shampoo & Conditioner 2-in-1", "Toner and Essence in One".
+_IN_ONE = re.compile(r"\b(?:\d\s*-?\s*in\s*-?\s*\d|(?:all\s*-?\s*)?in\s*-?\s*one)\b", re.I)
 
 # A lip product ships in a few ml/g (balm tins reach ~15-18 g); 20+ is a face or body format.
 _SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|g|oz|fl\.?\s*oz)\b", re.I)
@@ -209,10 +217,14 @@ def _set_is_the_verb(title: str, m: "re.Match") -> bool:
     before, after = title[:m.start()], title[m.end():].lstrip("™®")
     if before.rstrip().endswith("+") or after.lstrip().startswith("+"):
         return False
-    prev = _WORD_BEFORE.search(before)
-    if prev and _beauty_leaves(prev.group(1)):
+    words = before.split()
+    prev = words[-1].strip("™®()[],.:;-–") if words else ""
+    if prev and (_beauty_leaves(prev) or _SET_WORD.match(prev)):
         return False
-    if any(_beauty_leaves(j.group(1)) for j in _JOINED_WORD.finditer(after)):
+    # The word joined after it names a product or tool ("& Cream", "+ Puff"); the one after that only a tool
+    # ("& Mini Mirror") -- "Set and Forget Mascara", "Set and Keep Hair Spray" are one product.
+    if any(_beauty_leaves(j.group(1)) or _TOOL_WORD.match(j.group(1)) or _TOOL_WORD.match(j.group(2) or "")
+           for j in _JOINED_WORD.finditer(after)):
         return False
     return bool(_VERB_SET_BEFORE.search(before) or _VERB_SET_AFTER.search(after))
 
@@ -223,8 +235,22 @@ def _names_a_set(title: str) -> bool:
 
 
 def _joined_products(title: str) -> int:
-    """How many of the title's joined parts name a beauty leaf ("Toner 200ml + Lotion 200ml" -> 2)."""
-    return sum(1 for part in _JOIN.split(title) if _beauty_leaves(part))
+    """How many of the title's joined parts name a beauty leaf ("Toner 200ml + Lotion 200ml" -> 2).
+
+    A single word before "&"/"and"/"with" shares the noun after it ("Hair & Body Wash", "Day & Night Cream"):
+    it is a modifier, not a product. "+" joins products whatever their length ("Serum + Cream")."""
+    if _IN_ONE.search(title):
+        return 0
+    title = _WITH_SPF.sub(" ", title)
+    count, start = 0, 0
+    for j in list(_JOIN.finditer(title)) + [None]:
+        part = title[start:j.start() if j else len(title)]
+        modifier = j is not None and j.group(0) != "+" and len(part.split()) < 2
+        if not modifier and _beauty_leaves(part):
+            count += 1
+        if j:
+            start = j.end()
+    return count
 
 
 def _title_shows_a_set(title: str) -> bool:
