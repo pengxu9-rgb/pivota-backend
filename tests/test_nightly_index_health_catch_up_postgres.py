@@ -11,8 +11,10 @@ every 10 minutes, on whichever instance is up), so the lock now has to be real.
 
 The redeploy is the real one: a real AsyncIOScheduler fires the job through the real
 `wrap_job`, and the real `audit_scheduler.stop_scheduler` cancels it while it is parked
-mid-batch. `run_isolated` then adopts it as a zombie and terminates its DB connection, which
-is what releases the lock server-side.
+mid-batch. The cancelled run unwinds through its own `finally` (unlock, then the pool's reset
+on release), which is what frees the lock. `run_isolated` also tries to terminate a zombie's
+connection, but on py3.11 that lookup misses (the task runs in a COPY of the context it
+inspects), so nothing here relies on it.
 
 Every test runs in its own `nihcu_<hex>` schema (the slot ledger is created there), so
 nothing here can collide with the tables other gate files build in the shared database.
@@ -55,7 +57,7 @@ def _asyncpg_dsn() -> str:
 class _HybridDb:
     """The job's own catalog SQL is scripted (it needs the whole catalog schema); the lock,
     the slot ledger, its DDL and `connection()` go to the REAL Postgres `Database`, as do
-    `url` and the `_connection_context` run_isolated reaches for to terminate a zombie."""
+    `url` and `_connection_context`."""
 
     def __init__(self, real, *, park_at_cursor=None):
         import jobs.nightly_index_health_job as job

@@ -118,12 +118,17 @@ BATCH_SIZE = 500
 JOB_ID = "nightly_index_health"
 SLOT_HOUR_UTC = 4
 
-# Catch-up stops re-running a slot after this many attempts. A full run takes
-# ~5 minutes (measured 2026-09-26/27) and a redeploy kill needs a deploy to land
-# inside that window, so six attempts all failing is not bad luck: it is a run
-# that dies by itself (an OOM, a deadline), and re-running it every 10 minutes
-# for the rest of the day would only repeat the damage.
+# Catch-up stops re-running a slot after this many attempts. Two causes use them
+# up: redeploy kills, and a run that dies by itself (an OOM that takes the whole
+# worker down, a deadline). A full run takes ~5 minutes (measured 2026-09-26/27)
+# and deploys averaged ~9/day over 25 days, so even a burst of merges rarely
+# kills six runs in a row, while re-running a self-killing job all day would
+# repeat its damage (an OOM restarts the worker, taking every other job with it).
 CATCH_UP_MAX_ATTEMPTS = 6
+
+# Slots this process has already raised the attempts-exhausted ERROR for, so it
+# fires once per slot rather than on every 10-minute tick for the rest of the day.
+_EXHAUSTED_SLOTS_LOGGED: Set[str] = set()
 
 # Stable signed-int64 advisory lock id for this job.
 # Derived from the job name so it never collides with per-merchant locks.
@@ -694,8 +699,13 @@ async def _run(*, catch_up: bool) -> Dict[str, Any]:
     # after a successful pg_try_advisory_lock), so it never stopped two runs at
     # once. Inside this block every nested `database.*` call in this task reuses
     # the one raw connection, so the lock is held until `_release_job_lock` — or
-    # until the connection dies, which releases it server-side: a redeploy
-    # closing the pool, or run_isolated terminating a zombie's connection.
+    # until the session ends. On a redeploy the cancelled run unwinds through
+    # that `finally` (and the pool's reset on release runs pg_advisory_unlock_all
+    # anyway); if the process dies instead, Postgres drops the session. A run
+    # that will NOT unwind (a zombie hung on a dead socket) keeps the lock until
+    # the process exits: run_isolated's connection terminate does not reach it
+    # today, so every catch-up tick then logs "lock held" at WARNING until the
+    # next deploy replaces the process.
     async with database.connection():
         return await _run_on_pinned_connection(catch_up=catch_up)
 
@@ -723,12 +733,14 @@ async def _claim_slot(
                 return False
             attempts = int((state or {}).get("attempts") or 0)
             if attempts >= CATCH_UP_MAX_ATTEMPTS:
-                logger.error(
-                    "nightly_index_health: slot %s has %d attempts and none "
-                    "completed; catch-up has stopped re-running it. The next "
-                    "04:00 UTC run is unaffected.",
-                    slot_date, attempts,
-                )
+                if slot_date not in _EXHAUSTED_SLOTS_LOGGED:
+                    _EXHAUSTED_SLOTS_LOGGED.add(slot_date)
+                    logger.error(
+                        "nightly_index_health: slot %s has %d attempts and none "
+                        "completed; catch-up has stopped re-running it. The next "
+                        "04:00 UTC run is unaffected.",
+                        slot_date, attempts,
+                    )
                 summary["skipped"] = True
                 summary["skip_reason"] = "attempts_exhausted"
                 return False
@@ -781,9 +793,13 @@ async def _run_on_pinned_connection(*, catch_up: bool) -> Dict[str, Any]:
 
     # 1. Acquire job-level advisory lock
     if not await _try_acquire_job_lock():
-        logger.info(
-            "nightly_index_health: another instance holds the advisory lock; "
-            "skipping this run"
+        # WARNING: with a real lock this is no longer routine noise. It means a
+        # run is in flight (normal, at most once a day for a catch-up tick) or a
+        # wedged run is holding the lock (every tick, until the process goes),
+        # and prod drops INFO.
+        logger.warning(
+            "nightly_index_health: another run holds the advisory lock; "
+            "skipping this %s run", "catch-up" if catch_up else "scheduled",
         )
         summary["skipped"] = True
         summary["skip_reason"] = "lock_held"
@@ -1041,9 +1057,23 @@ async def _run_on_pinned_connection(*, catch_up: bool) -> Dict[str, Any]:
         # whole signal catch-up reads. IndexNow below is not part of it: a re-run
         # could not re-send the killed run's pings anyway (its before-snapshot is
         # taken after them).
+        #
+        # A batch error ends the reclassify loop early (a statement timeout on
+        # one page leaves every later key unclassified, the same damage as a
+        # kill), so such a run is NOT recorded as done: catch-up retries it,
+        # bounded by CATCH_UP_MAX_ATTEMPTS.
         try:
-            await scheduler_job_slots.record_completion(JOB_ID, slot_date, _utcnow())
-            summary["slot_completed"] = True
+            if summary["batch_errors"]:
+                logger.warning(
+                    "nightly_index_health: %d batch error(s); slot %s left "
+                    "incomplete so catch-up retries it",
+                    summary["batch_errors"], slot_date,
+                )
+            else:
+                await scheduler_job_slots.record_completion(
+                    JOB_ID, slot_date, _utcnow(),
+                )
+                summary["slot_completed"] = True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "nightly_index_health: could not record slot %s as completed "

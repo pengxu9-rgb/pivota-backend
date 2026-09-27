@@ -41,10 +41,13 @@ class _HybridDb:
     Batches are pages of `batch_size` content keys. When `park_at_cursor` is set, the batch
     fetch for that cursor parks until `release` is set: that is where the redeploy lands."""
 
-    def __init__(self, real, *, batch_size: int = 2, park_at_cursor=None):
+    def __init__(self, real, *, batch_size: int = 2, park_at_cursor=None, park_on_execute=None,
+                 fail_batch_at_cursor=None):
         self.real = real
         self.batch_size = batch_size
         self.park_at_cursor = park_at_cursor
+        self.park_on_execute = park_on_execute
+        self.fail_batch_at_cursor = fail_batch_at_cursor
         self.parked = asyncio.Event()
         self.release = asyncio.Event()
         self.upserted: list = []
@@ -72,6 +75,9 @@ class _HybridDb:
             if cursor == self.park_at_cursor and not self.release.is_set():
                 self.parked.set()
                 await self.release.wait()
+            if cursor == self.fail_batch_at_cursor:
+                self.fail_batch_at_cursor = None  # a transient failure: once
+                raise TimeoutError("canceling statement due to statement timeout")
             after = [k for k in KEYS if k > cursor][: self.batch_size]
             return [_full_row(content_key=k) for k in after]
         if self._job_sql(query):
@@ -89,6 +95,9 @@ class _HybridDb:
 
     async def execute(self, query, values=None):
         if self._job_sql(query):
+            if query == self.park_on_execute and not self.release.is_set():
+                self.parked.set()
+                await self.release.wait()
             self.executed.append(query)
             return None
         return await self.real.execute(query, values)
@@ -145,6 +154,7 @@ def _install(monkeypatch, hybrid):
     monkeypatch.setattr(db.database, "database", hybrid)
     monkeypatch.setattr(ddl_guard, "_state", {})
     monkeypatch.setattr(slots, "_DDL_READY", False)
+    monkeypatch.setattr(job, "_EXHAUSTED_SLOTS_LOGGED", set())
     monkeypatch.setattr(job, "BATCH_SIZE", hybrid.batch_size)
     monkeypatch.setattr(job, "_compute_domain_extractor_scorecards", _no_scorecards)
     monkeypatch.setattr(job, "_snapshot_serving_eligibility", _no_snapshot)
@@ -258,6 +268,65 @@ async def test_the_killed_run_is_not_recorded_as_complete_even_after_it_unwinds(
     assert (await _ledger(real_db))["completed_at"] is None
 
 
+async def test_a_run_killed_during_the_passes_after_the_batch_is_also_caught_up(
+    monkeypatch, runner, real_db, clock,
+):
+    """Every batch done, killed in the orphan delete: the passes after the batch are part of
+    the run, so the slot must still read as unfinished (the 09-27 run lost exactly these)."""
+    hybrid = _HybridDb(real_db, park_on_execute=job._ORPHAN_DELETE)
+    _install(monkeypatch, hybrid)
+    await _kill_mid_batch_by_redeploy(monkeypatch, runner, hybrid)
+
+    assert hybrid.upserted == KEYS  # the whole batch landed...
+    assert job._STALE_INVALIDATION_UPDATE not in hybrid.executed  # ...the passes did not
+    assert (await _ledger(real_db)) == {"attempts": 1, "completed_at": None}
+
+    hybrid.release.set()
+    clock["t"] = CRON_FIRES_AT + timedelta(minutes=12)
+    runner.wrap_job("nightly_index_health_catch_up", job.run_nightly_index_health_catch_up,
+                    deadline_seconds=7200)
+    out = await _run_now(runner, "nightly_index_health_catch_up")
+    assert out["result"]["slot_completed"] is True, out
+    assert job._STALE_INVALIDATION_UPDATE in hybrid.executed
+    assert (await _ledger(real_db))["attempts"] == 2
+
+
+async def test_a_run_cut_short_by_a_batch_error_is_not_recorded_as_done(monkeypatch, runner, real_db, clock):
+    """A statement timeout on one page ends the reclassify loop early; every later key is
+    left unclassified, which is the same damage as a kill."""
+    hybrid = _HybridDb(real_db, fail_batch_at_cursor="ck_b")
+    _install(monkeypatch, hybrid)
+
+    first = await job.run_nightly_index_health()
+    assert first["batch_errors"] == 1 and not first.get("slot_completed")
+    assert hybrid.upserted == ["ck_a", "ck_b"]
+    assert (await _ledger(real_db))["completed_at"] is None
+
+    clock["t"] = CRON_FIRES_AT + timedelta(minutes=10)
+    out = await job.run_nightly_index_health_catch_up()
+    assert out["slot_completed"] is True and hybrid.upserted[2:] == KEYS
+
+
+async def test_the_lock_fails_closed(monkeypatch, runner, real_db, clock):
+    """A lock query that errors must skip the run, not run it unlocked: catch-up retries
+    within 10 minutes, so failing open would only buy a chance of two runs at once."""
+
+    class _LockErrors(_HybridDb):
+        url = "postgresql://prod.invalid/pivota"  # take the real lock branch
+
+        async def fetch_one(self, query, values=None):
+            if "pg_try_advisory_lock" in query:
+                raise ConnectionError("lock query failed")
+            return await super().fetch_one(query, values)
+
+    hybrid = _LockErrors(real_db)
+    _install(monkeypatch, hybrid)
+    for entry in (job.run_nightly_index_health, job.run_nightly_index_health_catch_up):
+        out = await entry()
+        assert out["skip_reason"] == "lock_held", out
+    assert hybrid.batch_fetches == 0 and hybrid.upserted == []
+
+
 # ── the decision catch-up makes ──────────────────────────────────────────────────────
 
 
@@ -314,6 +383,9 @@ async def test_catch_up_stops_after_the_attempt_cap(monkeypatch, runner, real_db
     assert out["skip_reason"] == "attempts_exhausted"
     assert hybrid.upserted == [] and hybrid.batch_fetches == 0
     assert any("catch-up has stopped" in r.getMessage() for r in caplog.records)
+    # ...once per slot, not on every 10-minute tick for the rest of the day.
+    await job.run_nightly_index_health_catch_up()
+    assert sum("catch-up has stopped" in r.getMessage() for r in caplog.records) == 1
 
     # One below the cap still runs.
     await real_db.execute("UPDATE scheduler_job_slots SET attempts = attempts - 1")
