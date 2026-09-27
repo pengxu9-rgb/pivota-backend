@@ -59,6 +59,19 @@ def test_the_brow_word_is_exempt_only_on_a_brow_shelf():
     assert unresolved(resolve("Eyebrow", "brow & body glow oil", "tartecosmetics.com"))
 
 
+@pytest.mark.parametrize("ptype,title", [
+    # review of #2403: a shelf's tools, and a second product, are not its formula (constructed)
+    ("Eyebrow", "brow spoolie"),
+    ("Eyebrow", "brow shaping razors"),
+    ("Face Tool", "sculpting gua sha"),
+    ("Face Tool", "Amazonian clay facial roller"),
+    ("Face Tool", "eyelash curler"),
+    ("Lip Plump", "maracuja juicy lip plump & liner"),
+])
+def test_a_shelf_does_not_take_its_tools_or_a_second_product(ptype, title):
+    assert unresolved(resolve(ptype, title, "tartecosmetics.com"))
+
+
 @pytest.mark.parametrize("domain", ["sephora.com", "", None, "eyurs.com"])
 def test_the_brand_store_shelves_mean_nothing_elsewhere(domain):
     assert unresolved(resolve("Eyebrow", "busy gal BROWS tinted brow gel", domain))
@@ -73,6 +86,7 @@ def test_the_brand_store_shelves_mean_nothing_elsewhere(domain):
     ("Eyeshadow Brush", "double-ended shadow & liner brush"),
     ("Eyeliner Brush", "eye definer line & smudge brush"),
     ("Foundation Brush", "the buffer™ brush"),
+    ("Foundation Brush", "shape tape™ cream foundation brush"),    # a texture word is the brush's use
     ("Eyeshadow Brush, Cheek Brush", "glow pot eye & cheek brush"),
 ])
 def test_a_brush_type_with_a_brush_title_is_a_brush(ptype, title):
@@ -87,9 +101,23 @@ def test_a_brush_type_with_a_brush_title_is_a_brush(ptype, title):
     ("Foundation Brush", "Serum Foundation with Brush"),                  # constructed
     ("Concealer Brush", "Brush-On Concealer"),                            # constructed
     ("Hair Brush", "Flex Gentle Brush"),                                  # sokoglam: a hairbrush
+    # review of #2403 (constructed): a formula before any joiner, a skincare formula, a nail tool
+    ("Concealer Brush", "face card never declines CC undereye & mini brush"),
+    ("Eyeliner Brush", "Gel Eyeliner + Angled Brush"),
+    ("Eyeshadow Brush", "Eyeshadow Palette & Blending Brush"),
+    ("Concealer Brush", "Concealer, Brush"),
+    ("Concealer Brush", "Concealer - Brush"),
+    ("Concealer Brush", "Concealer & Brush 12"),
+    ("Powder Brush", "Sunforgettable Mineral Sunscreen Brush"),
+    ("Gel Polish Brush", "Gel Polish Brush"),
+    ("Dip Powder Brush", "Dip Powder Brush"),
+    ("Nail Polish Brush", "the buffer™ brush"),              # only the TYPE names nails
+    ("Foundation Brush", "nail polish brush"),               # only the TITLE names nails
+    # the type's head noun must be the tool: a two-formula type is not a brush type
+    ("Concealer, Foundation", "the buffer™ brush"),
 ])
 def test_a_brush_type_does_not_make_everything_on_it_a_brush(ptype, title):
-    assert resolve(ptype, title, "tartecosmetics.com")[0] != BRUSH
+    assert unresolved(resolve(ptype, title, "tartecosmetics.com"))
 
 
 # --- head-noun title rule on measured hosts ---------------------------------------------------
@@ -106,13 +134,48 @@ def test_a_brush_type_does_not_make_everything_on_it_a_brush(ptype, title):
     ("stilacosmetics.com", "Sale", "Stay All Day® Waterproof Liquid Eye Liner - Micro Tip", "beauty/makeup/eye/eyeliner"),
     ("stilacosmetics.com", "Eye Products", "HUGE™ Extreme Lash Mascara", "beauty/makeup/eye/mascara"),
     ("stilacosmetics.com", "new", "All About The Blur Blurring & Smoothing Primer", "beauty/makeup/face/primer"),
+    ("tower28beauty.com", "", "Mini MakeWaves Mascara in Jet", "beauty/makeup/eye/mascara"),
+    ("tower28beauty.com", "", "MakeWaves Mascara in Warm Blush", "beauty/makeup/eye/mascara"),  # shade cut
+    ("tower28beauty.com", "", "SOS Eye Cream", "beauty/skincare/moisturize/cream"),            # constructed
 ])
 def test_the_head_noun_names_the_product_on_a_measured_title_host(domain, ptype, title, want):
     assert resolve(ptype, title, domain) == (want, HEAD)
 
 
-def test_the_body_area_rule_still_applies_after_the_head_noun():
-    assert resolve("", "SOS Rescue + Relief Body Wash Treatment", "tower28beauty.com")[0] == "beauty/body/care"
+@pytest.mark.parametrize("domain,ptype,title", [
+    # review of #2403: the head of the whole title is not the product
+    ("stilacosmetics.com", "Sale", "Convertible Color™ Dual Lip & Cheek Cream"),
+    ("stilacosmetics.com", "Sale", "Stay All Day® Foundation & Concealer"),
+    ("stilacosmetics.com", "Sale", "Calligraphy Lip Stain in Michelle (Warm Blush)"),
+    ("stilacosmetics.com", "", "Free Mini HUGE Extreme Lash Mascara"),
+    ("tower28beauty.com", "", "SOS Rescue + Relief Body Wash Treatment"),
+    ("tower28beauty.com", "", "MakeWaves Lash Primer"),
+    ("tower28beauty.com", "", "ShineOn Lip Primer"),
+    ("tower28beauty.com", "", "GetSet Brow Powder"),
+    ("tower28beauty.com", "", "SuperDew Body Highlighter"),
+    ("tower28beauty.com", "", "ShineOn Lip Oil Case"),
+    ("tower28beauty.com", "", "Eyeliner Pencil Sharpener"),
+    ("tower28beauty.com", "", "Mascara Remover"),
+    ("tower28beauty.com", "", "ShineOn Lip Gloss + OneLiner Lip Liner"),
+    ("tower28beauty.com", "", "BeachPlease Blush Tee"),
+    ("tower28beauty.com", "", "MakeWaves Mascara Tote Bag"),
+    ("tower28beauty.com", "", "SOS Hair Claw Clip"),
+    ("tower28beauty.com", "", "BeachPlease Blush Sweater"),   # a fashion head no accessory word names
+    ("tower28beauty.com", "", "The Sunset Sweater"),          # ...and one naming no beauty leaf at all
+    ("tower28beauty.com", "", "SOS Serum Glow Foundation"),   # a texture word NOT right before the head
+])
+def test_the_head_noun_rule_refuses_another_area_accessories_merch_and_two_products(domain, ptype, title):
+    assert feed._measured_host_title_leaf(domain=domain, product_type=ptype, title=title) is None
+    assert unresolved(resolve(ptype, title, domain))
+
+
+def test_the_head_noun_rule_leaves_lip_rows_to_the_lip_door_and_its_hold():
+    title = "ShineOn Lip Gloss in Pistachio"
+    assert feed._measured_host_title_leaf(domain="tower28beauty.com", product_type="", title=title) is None
+    assert unresolved(resolve("", title, "tower28beauty.com"))                  # door off: as on main
+    with feed.lip_title_evidence():
+        assert resolve("", title, "tower28beauty.com") == ("beauty/makeup/lip/gloss",
+                                                            feed.CATEGORY_CONFIDENCE_LIP_TITLE)  # held per row
 
 
 @pytest.mark.parametrize("ptype,title", [
@@ -131,10 +194,16 @@ def test_the_head_noun_rule_refuses_sets_samples_merch_and_unlisted_types(ptype,
     assert unresolved(resolve(ptype, title, "tower28beauty.com" if ptype != "Hidden" else "stilacosmetics.com"))
 
 
-def test_two_leaves_ending_together_are_a_tie_not_a_head():
-    # constructed: "Lip Serum" is the lip balm (lip care) AND the serum pattern, both ending at "Serum"
+def test_two_leaves_ending_together_are_a_tie_not_a_head(monkeypatch):
+    import re
+    from services import pdp_category_classifier as clf
+    patterns = [("A", "beauty/makeup/face/blush", re.compile(r"\b(glow)\b", re.I)),
+                ("B", "beauty/makeup/face/highlighter", re.compile(r"\b(glow)\b", re.I))]
+    monkeypatch.setattr(clf, "CATEGORY_PATTERNS", patterns)
+    assert feed._measured_host_title_leaf(domain="tower28beauty.com", product_type="", title="Super Glow") is None
+    monkeypatch.setattr(clf, "CATEGORY_PATTERNS", patterns[:1])
     assert feed._measured_host_title_leaf(domain="tower28beauty.com", product_type="",
-                                          title="ShineOn Lip Serum") is None
+                                          title="Super Glow") == "beauty/makeup/face/blush"
 
 
 @pytest.mark.parametrize("domain", ["sephora.com", "tartecosmetics.com", "", None])

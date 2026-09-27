@@ -1672,9 +1672,32 @@ _TOOL_FORMULA_CONTEXT = re.compile(r"[+&/]|\b(?:and|with|includes?|including|for
 # Cheek Brush"), the type names the tool, and "&" inside the title joins two uses of one brush
 # ("double-ended shadow & liner brush"). Still refused: a formula SOLD WITH a brush ("CC undereye &
 # brush", "Foundation with Brush") -- the brush is then the second thing, not the product.
-_TOOL_TYPE_FORMULA_CONTEXT = re.compile(
-    r"(?:[+&/]|\band\b)\s*(?:an?\s+)?brush(?:es)?\s*$|\b(?:with|includes?|including|for|using|built[- ]in)\b|"
-    r"brush[- ]on", re.I)
+_TOOL_TYPE_FORMULA_CONTEXT = re.compile(r"\b(?:with|includes?|including|for|using|built[- ]in)\b|brush[- ]on", re.I)
+# ...and a title split at a joiner is a brush only when no part BEFORE the last names a product:
+# "Gel Eyeliner + Angled Brush", "CC undereye & mini brush", "Concealer, Brush" are a formula and a
+# brush (review of #2403).
+_TOOL_TITLE_JOINER = re.compile(r"\s*(?:[+&/,]|\s-\s|\band\b)\s*", re.I)
+# The leaves a makeup brush's own name may carry: its use ("concealer brush") and texture words
+# ("cream foundation brush", "serum foundation brush"). Not skincare formulas ("Sunscreen Brush" is a
+# sunscreen dispensed through a brush) and not nails (a "Gel Polish Brush" is not a makeup tool).
+# formula nouns no leaf pattern reads on their own ("CC undereye & brush")
+_BRUSH_TITLE_FORMULA_WORDS = re.compile(r"\b(?:cc|bb|creams?|serums?|oils?|balms?|sticks?|palettes?|gloss|liquids?|"
+                                        r"tints?|stains?|minis?)\b", re.I)
+
+
+def _is_makeup_brush_title(title: str) -> bool:
+    from services.pdp_category_classifier import CATEGORY_PATTERNS
+    parts = [x for x in _TOOL_TITLE_JOINER.split(title) if x.strip()]
+    if not parts or not _TOOL_NOUN_SUFFIX.search(parts[-1]) or _TOOL_TYPE_FORMULA_CONTEXT.search(title):
+        return False
+    for part in parts[:-1]:
+        if (_BRUSH_TITLE_FORMULA_WORDS.search(part)
+                or any(pattern.search(part) for _label, _path, pattern in CATEGORY_PATTERNS)):
+            return False
+    named = {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(title)}
+    return all(path == "beauty/tools/brush" or path in _TEXTURE_LEAVES
+               or (path.startswith("beauty/makeup/") and not path.startswith("beauty/makeup/nails/"))
+               for path in named)
 
 
 # Direct product nouns, not a general title classifier. These two families
@@ -1836,8 +1859,10 @@ _MEASURED_HOST_PRODUCT_TYPES = {
     # swapped ("Blush" on an eyeliner, "Eye Liner" on a cheek duo); those rows are REFUSED by
     # `_title_contradicts_product_type` and a shelf never fills a refusal.
     #   "Brows" (2): a brow pencil and a waterproof brow colour.
-    #   "Lip Care" (2): a lip balm, and an enzyme lip exfoliator -- lip care, as the house rule files a
-    #     lip scrub (`explicit_types` above: "lip scrub" -> balm).
+    #   "Lip Care" (2): a lip balm, and "Buff & Blur Lip Enzyme Exfoliator" -- which the lip shelves'
+    #     multi-use rule sets aside for its "&" (the safe side; a lip scrub would otherwise be a balm).
+    #     KNOWN FORWARD RISK: a gloss moved onto this shelf ("Plumping Lip Glaze" sits on "Lip Gloss/Oil"
+    #     today) names no leaf and would become a balm. Re-read before trusting the shelf again.
     # LEFT OUT: "Complexion" (8: lip & cheek sticks, a sponge, a correcting palette, a primer, a
     # foundation-and-concealer), "Lip Products" (stains, a balm and a bundle).
     "stilacosmetics.com": {
@@ -1890,12 +1915,23 @@ def _measured_host_type_leaf(*, domain: Optional[str], product_type: Optional[st
         return None
     # A lip shelf holds lip products; one that also names the cheek or eyes is two products in one
     # (tarte's "lip & cheek shift" on its "Lip Plump" shelf). The lip title door's own area rule.
-    if leaf.startswith(_LIP_LEAF_PREFIX) and _LIP_OTHER_AREA.search(str(title or "")):
+    if leaf.startswith(_LIP_LEAF_PREFIX) and (_LIP_OTHER_AREA.search(str(title or ""))
+                                            or _LIP_MULTI_USE.search(str(title or ""))):
+        return None  # ...or two lip products ("lip plump & liner")
+    # A makeup shelf's tool or accessory is not its formula ("spoolie", "brow shaping razors" on a brow
+    # shelf), and a sponge shelf holds sponges and puffs, not every face tool (gua sha, rollers, curlers).
+    if leaf.startswith("beauty/makeup/") and _SHELF_TOOL_WORDS.search(str(title or "")):
+        return None
+    required = _SHELF_REQUIRES.get(leaf)
+    if required and not required.search(str(title or "")):
         return None
     return leaf
 
 
 _SHELF_OWN_AREA = {"beauty/makeup/eye/brow": re.compile(r"\b(?:eye)?brows?\b", re.I)}
+_SHELF_TOOL_WORDS = re.compile(r"\b(?:spoolies?|razors?|tweezers?|scissors|stencils?|sharpeners?|brush(?:es)?|"
+                               r"curlers?|cases?|mirrors?|applicators?)\b", re.I)
+_SHELF_REQUIRES = {"beauty/tools/sponge": re.compile(r"\b(?:sponges?|puffs?|blenders?)\b", re.I)}
 
 
 # A MEASURED host whose products carry no usable merchant type (blank, or a house shelf such as
@@ -1903,15 +1939,25 @@ _SHELF_OWN_AREA = {"beauty/makeup/eye/brow": re.compile(r"\b(?:eye)?brows?\b", r
 # Foundation" is a foundation, "BeachPlease Cream Blush" a blush, "SOS Recovery Cream" a cream.
 # NOT a general title classifier: only these hosts, only these types, each read product by product;
 # on any other host the head noun is no evidence (PR #2158: "Powder Kiss Lipstick", "Strobe Cream").
-# Refused, and left unresolved: a title naming no leaf, two leaves ending at the same place, any set /
-# bundle / duo / palette (the set shelf's business), and anything the lip door already calls not a
-# product (samples, cards, socks, keychains).
+# Read on the product NAME only: a shade or variant suffix is cut first (" in Michelle (Warm Blush)",
+# " - Last Chance Shades", ": Two Colors"), so a shade word is never the head. Refused, and left
+# unresolved (review of #2403, each a real or plausible title on these hosts):
+#   * no leaf; two leaves ending at the same place; a head outside makeup/skincare (merch: "Blush Tee");
+#   * a LIP head: the lip title door owns lip rows, with its accessory / multi-use vetoes and its
+#     per-row hold (placed_by_lip_title) -- this rule never places a lip row around that hold;
+#   * two products in one name: any second leaf, unless it is a texture word right before the head
+#     ("Serum Foundation", "Cream Blush", "Matte Powder Blush" -- not "Foundation & Concealer");
+#   * an area the head's leaf does not belong to ("Lash Primer", "Brow Powder", "Body Highlighter",
+#     "Lip & Cheek Cream");
+#   * sets / bundles / duos / palettes, accessories (case, sharpener, remover, bag, clip), giveaways
+#     ("Free Mini ..."), and anything the lip door calls not a product (samples, cards, socks).
 _MEASURED_TITLE_HOST_TYPES = {
     # Read 2026-09-27, every product (64). 45 have a blank type: the SOS skincare line, MakeWaves
     # mascara, GoGo eyeshadow, GetSet powders and blush, cream blush / bronzer / contour, SuperDew
     # highlighter; samples, merch (a claw clip, socks, a crewneck, a keychain), a gift card and sets.
     # "Foundations & Concealers" (4) holds a foundation, a concealer, its sample and a tinted SPF --
     # four titles that each name their own leaf.
+    # Its lip rows (ShineOn, LipSoftie, OneLiner) are NOT placed here: lip heads are the lip door's.
     "tower28beauty.com": frozenset({"", "foundations & concealers"}),
     # Read 2026-09-27, every product (131). The blank / "Sale" / "new" / "Eye Products" rows are
     # eyeliners, liquid eyeshadows, a primer, a mascara and bundles; the "Hidden" free minis are not
@@ -1922,28 +1968,67 @@ _MEASURED_TITLE_HOST_TYPES = {
 CATEGORY_CONFIDENCE_MEASURED_HOST_TITLE = 0.81
 
 
+# The product name ends where a shade / variant / edition suffix starts.
+_TITLE_VARIANT_SUFFIX = re.compile(r"\s+(?:in|-|\u2013|\u2014)\s+|\s*[(:|]")
+# Texture words that name a leaf of their own but only describe the head right after them.
+_TEXTURE_LEAVES = frozenset({"beauty/skincare/moisturize/cream", "beauty/skincare/treat/serum",
+                             "beauty/makeup/face/powder", "beauty/skincare/moisturize/oil"})
+_TITLE_AREA_WORDS = {
+    "lip": re.compile(r"\blips?\b", re.I),
+    "cheek": re.compile(r"\bcheeks?\b", re.I),
+    "eye": re.compile(r"\b(?:eyes?|eyelids?|lids?|under[\s-]?eyes?)\b", re.I),
+    "lash": re.compile(r"\b(?:eye)?lash(?:es)?\b", re.I),
+    "brow": re.compile(r"\b(?:eye)?brows?\b", re.I),
+    "other": re.compile(r"\b(?:body|hair|scalp|nails?|cuticles?|hands?|feet|foot|neck|decollet[ae]ge|beard|legs?)\b", re.I),
+}
+# the areas a head leaf may name; anything else is another product (or two)
+_HEAD_AREAS = (
+    ("beauty/makeup/eye/mascara", {"lash", "eye"}),
+    ("beauty/makeup/eye/brow", {"brow"}),
+    ("beauty/makeup/eye/", {"eye"}),
+    ("beauty/makeup/face/concealer", {"eye"}),
+    ("beauty/makeup/face/", set()),
+    ("beauty/skincare/", {"eye"}),
+)
+_TITLE_ACCESSORY_OR_GIVEAWAY = re.compile(
+    r"\b(?:free|gwp|brush(?:es)?|sharpeners?|applicators?|cases?|holders?|pouch(?:es)?|mirrors?|removers?|"
+    r"wipes?|organi[sz]ers?|bags?|totes?|clips?|tees?|t-?shirts?|shirts?|hoodies?|crewnecks?|sweatshirts?|"
+    r"hats?|caps?|refills?)\b", re.I)
+
+
 def _measured_host_title_leaf(*, domain: Optional[str], product_type: Optional[str],
                               title: Optional[str]) -> Optional[str]:
-    """The head-noun leaf of this product's title, on a measured title host only; else None."""
+    """The head-noun leaf of this product's name, on a measured title host only; else None."""
     host = _clean_domain(domain or "").lower()
     host = host[4:] if host.startswith("www.") else host
     ptype = " ".join(str(product_type or "").casefold().split())
     if ptype not in _MEASURED_TITLE_HOST_TYPES.get(host, frozenset()):
         return None
     text = str(title or "")
-    if _LIP_SET.search(text) or _LIP_NOT_A_PRODUCT.search(text):
+    if _LIP_SET.search(text) or _LIP_NOT_A_PRODUCT.search(text) or _TITLE_ACCESSORY_OR_GIVEAWAY.search(text):
         return None
+    name = _TITLE_VARIANT_SUFFIX.split(text, maxsplit=1)[0]
     from services.pdp_category_classifier import CATEGORY_PATTERNS
-    ends: Dict[str, int] = {}
+    spans: Dict[str, Tuple[int, int]] = {}
     for _label, path, pattern in CATEGORY_PATTERNS:
-        if path.startswith("beauty/"):
-            for m in pattern.finditer(text):
-                ends[path] = max(ends.get(path, -1), m.end())
-    if not ends or "beauty/sets/gift-set" in ends:
+        for m in pattern.finditer(name):
+            if path not in spans or m.end() > spans[path][1]:
+                start = m.start(1) if m.lastindex and m.start(1) >= 0 else m.start()
+                spans[path] = (start, m.end())
+    if not spans:
         return None
-    last = max(ends.values())
-    heads = [path for path, end in ends.items() if end == last]
-    return heads[0] if len(heads) == 1 else None
+    # the leaf whose match ends last; a tie, like a named gift set, is a second leaf and refused below
+    head = max(spans, key=lambda path: spans[path][1])
+    if not head.startswith(("beauty/makeup/", "beauty/skincare/")) or head.startswith(_LIP_LEAF_PREFIX):
+        return None
+    head_start = spans[head][0]
+    for path, (_start, end) in spans.items():
+        if path != head and not (path in _TEXTURE_LEAVES and not name[end:head_start].strip()):
+            return None
+    allowed = next(areas for prefix, areas in _HEAD_AREAS if head.startswith(prefix))
+    if any(pattern.search(name) for area, pattern in _TITLE_AREA_WORDS.items() if area not in allowed):
+        return None
+    return head
 
 
 # A lip product's own title, where the merchant type says nothing. Measured 2026-09-23 on the
@@ -2269,12 +2354,13 @@ def _resolve_category_by_evidence(*, product_type: Optional[str], title: Optiona
         # holds sponges and a twist tool; their titles do not end in brush, so they stay unresolved.
         # Only a brush FOR makeup: every other family the type names must be a makeup leaf. sokoglam's
         # "Hair Brush" names haircare -- a hairbrush is not a beauty/tools/brush (makeup applicators).
+        # Nail types sit under beauty/makeup/nails but a "Gel Polish Brush" is not a makeup tool.
         from services.pdp_category_classifier import CATEGORY_PATTERNS
         type_uses = {path for _label, path, pattern in CATEGORY_PATTERNS
                      if pattern.search(str(product_type or "")) and path != "beauty/tools/brush"}
-        if (_TOOL_NOUN_SUFFIX.search(ptype) and _TOOL_NOUN_SUFFIX.search(str(title or ""))
-                and not _TOOL_TYPE_FORMULA_CONTEXT.search(str(title or ""))
-                and type_uses and all(path.startswith("beauty/makeup/") for path in type_uses)):
+        if (_TOOL_NOUN_SUFFIX.search(ptype) and _is_makeup_brush_title(str(title or ""))
+                and all(path.startswith("beauty/makeup/") and not path.startswith("beauty/makeup/nails/")
+                        for path in type_uses)):
             return accept("beauty/tools/brush", CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
         return fallback, CATEGORY_CONFIDENCE_FEED_DEFAULT
     if ptype in _GENERIC_LIP_TYPES:
