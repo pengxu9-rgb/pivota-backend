@@ -297,6 +297,8 @@ class _SqliteBackedDatabase:
             "CREATE TABLE catalog_source_quarantine (quarantine_id INTEGER, match_type TEXT,"
             " match_value TEXT, state TEXT, expires_at TEXT)"
         )
+        # The suppressed-product anti-join's table (SEED_SUPPRESSED_PRODUCT_ANTI_JOIN).
+        self._conn.execute("CREATE TABLE catalog_products (product_key TEXT, suppressed_at TEXT)")
         for sid, domain, title in seeds:
             self._conn.execute(
                 # USD: a seed priced in another currency (or none) is never served to a US read

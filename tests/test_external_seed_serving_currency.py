@@ -56,6 +56,8 @@ class _SqliteSeeds:
             "CREATE TABLE catalog_source_quarantine (quarantine_id INTEGER, match_type TEXT,"
             " match_value TEXT, state TEXT, expires_at TEXT)"
         )
+        # The suppressed-product anti-join's table (SEED_SUPPRESSED_PRODUCT_ANTI_JOIN).
+        self._conn.execute("CREATE TABLE catalog_products (product_key TEXT, suppressed_at TEXT)")
         for sid, market, currency in seeds:
             self._conn.execute(
                 "INSERT INTO external_product_seeds (id, external_product_id, domain, title, status,"

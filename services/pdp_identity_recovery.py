@@ -912,6 +912,10 @@ async def fetch_attached_external_seed_group_rows(*, limit: int, offset: int) ->
             AND NULLIF(BTRIM(COALESCE(eps.external_product_id, '')), '') IS NOT NULL
             AND NULLIF(BTRIM(COALESCE(eps.attached_product_key, '')), '') IS NOT NULL
             AND eps.attached_product_key LIKE 'prod::%'
+            -- A withdrawn product is not grown a seller: its seed as a group member would be
+            -- served as another merchant's offer on any live sibling's PDP. 682 active seeds
+            -- attach to suppressed products in prod (2026-09-27).
+            AND cp.suppressed_at IS NULL
           ORDER BY eps.updated_at DESC NULLS LAST, eps.created_at DESC NULLS LAST, eps.id ASC
           LIMIT :limit OFFSET :offset
         )

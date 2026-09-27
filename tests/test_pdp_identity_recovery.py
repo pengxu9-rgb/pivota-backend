@@ -436,3 +436,53 @@ def test_classify_identity_lane_live_approved_when_group_and_live() -> None:
     )
 
     assert lane["identity_lane"] == IDENTITY_LANE_LIVE_APPROVED
+
+
+def test_attached_external_seed_group_rows_skip_a_suppressed_product(monkeypatch) -> None:
+    """Executes fetch_attached_external_seed_group_rows' SQL (SQLite; BTRIM -> TRIM).
+
+    A seed whose attached product is suppressed must not be proposed as a product_group_members
+    row: once applied, it is served as another merchant's offer on a live sibling's PDP.
+    """
+    import asyncio
+    import re
+    import sqlite3
+
+    import services.pdp_identity_recovery as module
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE external_product_seeds (id TEXT, external_product_id TEXT, title TEXT,"
+        " attached_product_key TEXT, domain TEXT, status TEXT, updated_at TEXT, created_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE catalog_products (product_key TEXT, merchant_id TEXT, platform TEXT,"
+        " source_product_id TEXT, title TEXT, brand TEXT, suppressed_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE product_group_members (product_group_id TEXT, merchant_id TEXT,"
+        " platform TEXT, platform_product_id TEXT)"
+    )
+    for n, suppressed in ((1, "2026-07-18"), (2, None)):
+        key = f"prod::m::shopify::{n}"
+        conn.execute(
+            "INSERT INTO external_product_seeds VALUES (?, ?, 't', ?, 'x.com', 'active', '2026-09-01', '2026-09-01')",
+            (f"eps_{n}", f"ext_{n}", key),
+        )
+        conn.execute(
+            "INSERT INTO catalog_products VALUES (?, 'm', 'shopify', ?, 't', 'b', ?)",
+            (key, str(n), suppressed),
+        )
+        conn.execute("INSERT INTO product_group_members VALUES (?, 'm', 'shopify', ?)", (f"pg_{n}", str(n)))
+
+    async def fetch_all(query, values=None):
+        values = values or {}
+        sql = str(query).replace("BTRIM(", "TRIM(")
+        ordered = re.findall(r"(?<![:\w]):(\w+)", sql)
+        cur = conn.execute(re.sub(r"(?<![:\w]):\w+", "?", sql), [values[k] for k in ordered])
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    monkeypatch.setattr(module.database, "fetch_all", fetch_all)
+    rows = asyncio.run(module.fetch_attached_external_seed_group_rows(limit=50, offset=0))
+    assert [r["id"] for r in rows] == ["eps_2"]
