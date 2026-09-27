@@ -71,9 +71,10 @@ _SET_WORD = re.compile(r"^(?:starter|discovery|trial|travel|holiday|mini|minis|s
 # "Eyeliner Black & Brown".
 _JOIN_WORD = re.compile(r"&|\band\b|\bwith\b|\+", re.I)
 # ...and never when the title also names a pack: "Prime & Set Duo", "Mini Prime & Set Pouch", "Gel Eye Liner
-# 2 Pack", "Setting Powder (Pack of 2)", "Set Powder Loose Twin Pack", "Loose Powder 2ct".
-_PACK_WORD = re.compile(r"\b(?:duos?|pouch|vault|collection|gift|value|twin|(?:[2-9]|\d{2,})\s*-?\s*(?:packs?|ct)|"
-                        r"pack\s+of\s+\d+|x\s*[2-9])\b", re.I)
+# 2 Pack", "Setting Powder (Pack of 2)", "Set Powder Loose Twin Pack", "Loose Powder 2ct", "2 Count", "(2 pk)",
+# "Double Pack", "2 Units", "2 Bottles".
+_PACK_WORD = re.compile(r"\b(?:duos?|pouch|vault|collection|gift|value|twin|double\s+pack|"
+                        r"(?:[2-9]|\d{2,})\s*-?\s*(?:packs?|pk|ct|count|units?|bottles?)|pack\s+of\s+\d+|x\s*[2-9])\b", re.I)
 # On the sets shelf a title may name a leaf other than the shelf only when it shows it IS a set, by STRONG
 # evidence alone: a pack or count word, a free gift/refill, or products joined by "+". "&"/"and"/"with" are
 # not evidence ("Hair & Body Shampoo", "Cream with Ceramides", "Face and Body Wash" are one product): a real set

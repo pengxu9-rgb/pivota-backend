@@ -391,6 +391,12 @@ def test_the_verb_set_in_a_product_line_name_is_not_a_set(title, ptype):
     ("Kett Set Powder Loose Twin Pack", "Setting Powder"),
     ("Smooth & Set Loose Powder 2ct", "Setting Powder"),
     ("Bake & Set Powder x2", "Setting Powder"),
+    ("Stay All Day Smudge & Set Waterproof Gel Eye Liner 2 Count", "Eyeliner"),  # review of d042640af
+    ("Smudge & Set Gel Eye Liner 2pk", "Eyeliner"),
+    ("Bake & Set Setting Powder (2 pk)", "Setting Powder"),
+    ("Smooth & Set Loose Powder Double Pack", "Setting Powder"),
+    ("Smooth & Set Loose Powder 2 Units", "Setting Powder"),
+    ("Curl Set Lotion 200ml 2 Bottles", "Face Primer"),
     ("Lip Set & Go", "Setting Powder"),                 # an area word before "Set"
     ("Glow Toner Sticker Set &", "Toner"),              # "&" with nothing after it
     ("Glow Toner Set", "Toner"),
@@ -503,6 +509,7 @@ def test_a_set_on_the_sets_shelf_may_name_what_is_inside_it(title):
     "Hydrating Toner 200ml + Lotion",                   # only one side sized
     "Silk Hair 100ml + Body Shampoo 200ml",             # sized, but "Hair" alone is an area, not a product
     "Sun Serum 30ml SPF50+ Moisture Cream 50ml",        # sized both sides, but the "+" is SPF's
+    "Concealer 12 + Foundation 045",                    # shade numbers are not sizes
 ])
 def test_a_single_product_the_store_types_as_a_set_is_still_held(title):
     rec = _on(record(title, "Skincare Set", title.lower().replace(" ", "-")), "beauty/sets/")
