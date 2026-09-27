@@ -11,7 +11,8 @@ THE RULES UNDER TEST, from db/merchant_purchasability.py's docstring:
   * TWO consecutive negatives demote; one does not; one positive resets;
   * `is_purchasable` requires a positive fact FROM THE BUYER VANTAGE, within the TTL;
   * the sweep is dark until MERCHANT_PURCHASABILITY_SWEEP_ENABLED is set, the consumers until
-    MERCHANT_PURCHASABILITY_ENFORCE is — two dials, because the job runs only on the worker.
+    MERCHANT_PURCHASABILITY_ENFORCE is — two dials, because the job runs only in its own Cloud
+    Run Job on the crawl subnet, never on the worker scheduler (section 4).
 
 Every rule has an ACCEPT and a REFUSE half. The detector tests run against RECORDED FIXTURES of
 three live checkouts — see tests/fixtures/merchant_purchasability/README.md for how they were
@@ -99,7 +100,7 @@ def _dial_off(monkeypatch):
         "MERCHANT_PURCHASABILITY_TTL_HOURS",
         "MERCHANT_PURCHASABILITY_BUYER_VANTAGE", "VANTAGE_PROXY_URL",
         "MERCHANT_PURCHASABILITY_BATCH", "MERCHANT_PURCHASABILITY_BUDGET_SECONDS",
-        "MERCHANT_PURCHASABILITY_PAUSE_MS", "MERCHANT_PURCHASABILITY_INTERVAL_SECONDS",
+        "MERCHANT_PURCHASABILITY_PAUSE_MS",
     ):
         monkeypatch.delenv(name, raising=False)
     sweep._reset_dial_warnings()
@@ -944,7 +945,7 @@ async def test_the_job_passes_check_card_and_never_a_buyer(_db, monkeypatch, _po
 
 async def test_the_job_holds_a_wall_clock_budget(_db, monkeypatch, _population):
     """The budget stops it STARTING a merchant. Without one, a slow batch would run past the
-    scheduler's run deadline and be cut mid-store, every tick."""
+    job's Cloud Run task timeout and be cut mid-store, every run."""
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_BUDGET_SECONDS", "30")
@@ -1170,7 +1171,13 @@ async def test_the_two_dials_are_reported_independently(_db, ops_app, monkeypatc
     assert seen == {(False, False), (False, True), (True, False), (True, True)}
 
 
-# ══ 4. REGISTRATION ════════════════════════════════════════════════════════════════════════
+# ══ 4. WHERE IT RUNS: a Cloud Run Job on the crawl subnet, never the worker scheduler ════════
+#
+# Until 2026-09-27 the sweep was a `services.audit_scheduler` interval job, which ran it on the
+# `worker` — whose egress is the default NAT, the address payment partners allowlist — and
+# restarted its clock on every worker deploy. It is now `python -m jobs.merchant_purchasability_sweep`
+# in a Cloud Run Job on pivota-crawl (infra/gcp/setup_merchant_purchasability_sweep_job.sh; the
+# script itself is exercised by tests/test_setup_merchant_purchasability_sweep_job.py).
 
 
 class _RecordingScheduler:
@@ -1190,14 +1197,10 @@ class _RecordingScheduler:
         return []
 
 
-async def test_the_job_is_actually_registered_and_wrapped_and_bounded(monkeypatch):
-    """FROM THE LIVE REGISTRY, not from a grep of the source.
-
-    A source-text assertion survives an undefined binding: rename
-    `run_merchant_purchasability_sweep` in the job module and the registration raises a
-    NameError at boot while the grep still finds the string and reports green. This calls
-    `start_scheduler` and reads what it handed the scheduler.
-    """
+async def test_the_worker_scheduler_never_runs_the_sweep(monkeypatch):
+    """FROM THE LIVE REGISTRY, not only from the source: no registered job is the sweep, under
+    its old id or any other — a re-registration under a new id would still render checkouts from
+    the payment NAT. The source half catches an import that would re-introduce it."""
     import services.audit_scheduler as sched
 
     for key in ("AUDIT_WORKER_ENABLED", "RAILWAY_SERVICE_NAME", "RAILWAY_ENVIRONMENT"):
@@ -1209,39 +1212,307 @@ async def test_the_job_is_actually_registered_and_wrapped_and_bounded(monkeypatc
 
     await sched.start_scheduler()
     assert sched._BOOT_ERROR is None, sched._BOOT_ERROR
+    assert len(recorder.added) > 20, "precondition: the recorder saw the real registration pass"
 
-    registered = {jid: (fn, kwargs) for jid, fn, kwargs in recorder.added}
-    assert "merchant_purchasability_sweep" in registered, (
-        "the sweep is not registered — a boot-time NameError or a deleted _add_job call would "
-        "look exactly like this, and a source grep would not"
-    )
-    func, kwargs = registered["merchant_purchasability_sweep"]
-    assert getattr(func, "__wrapped_job_id__", None) == "merchant_purchasability_sweep", (
-        "registered without the isolating wrapper: it would share the startup Connection"
-    )
-    assert kwargs["max_instances"] == 1, "two overlapping runs double the abandoned checkouts"
-    assert kwargs["seconds"] == sweep.job_interval_seconds()
-
-    deadline = sched.run_deadline_for("merchant_purchasability_sweep")
-    assert deadline == sched._JOB_RUN_DEADLINES["merchant_purchasability_sweep"]
-    assert deadline > sweep.DIALS["budget_seconds"].default, (
-        "the deadline must sit above the job's own budget plus one merchant"
-    )
-    assert "merchant_purchasability_sweep" in (sched.__doc__ or ""), "the docstring job list"
-
-
-def test_the_registration_is_worker_only_and_the_runbook_says_so():
-    """`_add_job` is gated on `_queue_worker_enabled()`, so a normal backend deploy ships the
-    consumers but NOT the fact-gathering. That is the whole reason the dial is split, and an
-    operator has to know it before arming."""
-    import services.audit_scheduler as sched
+    ids = {jid for jid, _fn, _k in recorder.added}
+    assert "merchant_purchasability_sweep" not in ids
+    swept = [
+        jid for jid, fn, _k in recorder.added
+        if getattr(fn, "__wrapped__", fn) is sweep.run_merchant_purchasability_sweep
+        or getattr(fn, "__module__", "") == sweep.__name__
+        or getattr(getattr(fn, "__wrapped__", None), "__module__", "") == sweep.__name__
+    ]
+    assert swept == [], f"the sweep is registered on the worker scheduler as {swept}"
+    assert "merchant_purchasability_sweep" not in sched._JOB_RUN_DEADLINES
 
     source = pathlib.Path(sched.__file__).read_text()
-    assert "if worker_enabled:" in source
+    assert "jobs.merchant_purchasability_sweep" not in source
+    assert "run_merchant_purchasability_sweep" not in source
+
+
+def test_the_runbook_names_the_crawl_job_and_both_dials():
+    """An operator arms this from the runbook, so the runbook must say where the sweep runs now
+    and how it is armed — and still name both dials, whose ORDER is the outage."""
     runbook = (pathlib.Path(__file__).parent.parent / "docs" / "runbooks"
-               / "merchant_purchasability.md").read_text().lower()
-    assert "worker" in runbook and "merchant_purchasability_sweep_enabled" in runbook
-    assert "merchant_purchasability_enforce" in runbook
+               / "merchant_purchasability.md").read_text()
+    assert "infra/gcp/setup_merchant_purchasability_sweep_job.sh" in runbook
+    assert "pivota-crawl" in runbook
+    assert "MERCHANT_PURCHASABILITY_SWEEP_ENABLED" in runbook
+    assert "MERCHANT_PURCHASABILITY_ENFORCE" in runbook
+    section_9 = runbook.split("## 9.")[1].split("## 10.")[0]
+    # §9's proof of a run is the JOB's execution and its report line — the worker's
+    # /__scheduler_health no longer lists the sweep at all.
+    assert "gcloud run jobs executions list --job merchant-purchasability-sweep" in section_9
+    assert "SweepReport(" in section_9 and "population_unreadable" in section_9
+    assert "7 0-1,5-23 * * *" in section_9, "the schedule the script provisions"
+
+
+# ── the CLI: `python -m jobs.merchant_purchasability_sweep` runs ONE sweep and exits ──────────
+
+
+async def test_the_cli_runs_one_sweep_over_the_population_and_exits_0(_db, monkeypatch, _population):
+    """`amain` is the CLI's whole path minus the event loop: gate, connection handling, ONE run,
+    exit code. Driven here over the real two-lane population."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+    with capture_pivota_stdout() as out:
+        assert await sweep.amain() == sweep.EXIT_OK == 0
+    assert sorted(host for host, _ in fetcher.calls) == ["flowerbeauty.com", "judydoll.com"], (
+        "ONE sweep: each merchant exactly once"
+    )
+    proof = [line for line in pivota_lines(out) if _PROOF_LINE.fullmatch(line)]
+    assert len(proof) == 1 and "population_unreadable=0" in proof[0], pivota_lines(out)
+    assert await mp.is_purchasable("judydoll.com", "US") is True
+
+
+async def test_the_cli_exits_1_when_a_population_lane_cannot_be_read(_db, monkeypatch, _population):
+    """A lane that raises is COUNTED, the other lane is still swept, and the execution FAILS.
+    Before the count the lanes failed soft and silently, so a database that answered nothing
+    produced a green `population=0 errors=0` run."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+    real_fetch_all = database.fetch_all
+
+    async def _cart_lane_down(query, *a, **k):
+        if query is sweep._CART_LANE_SQL:
+            raise RuntimeError("relation tierb_cart_link_eligibility is unavailable")
+        return await real_fetch_all(query, *a, **k)
+
+    monkeypatch.setattr(database, "fetch_all", _cart_lane_down)
+    with capture_pivota_stdout() as out:
+        assert await sweep.amain() == sweep.EXIT_POPULATION_UNREADABLE == 1
+    assert [host for host, _ in fetcher.calls] == ["flowerbeauty.com"], (
+        "the readable (variant) lane is still swept"
+    )
+    assert any("1 population lane(s) could not be read" in line for line in pivota_lines(out))
+    assert any("population_unreadable=1" in line for line in pivota_lines(out))
+
+
+async def test_the_variant_lane_failure_is_counted_not_swallowed(_db, monkeypatch, _population):
+    """The variant lane reads through the LEDGER's helper, whose default form swallows a failure
+    into `[]`. The sweep asks for `strict=True`; a revert to the soft form reads a dead table as
+    an empty allowlist, and this test sees `population_unreadable == 0`."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+    real_fetch_all = database.fetch_all
+
+    async def _variant_lane_down(query, *a, **k):
+        if query is ledger._ENABLED_MERCHANT_MARKETS_SQL:
+            raise RuntimeError("relation reap_agentic_eligibility is unavailable")
+        return await real_fetch_all(query, *a, **k)
+
+    monkeypatch.setattr(database, "fetch_all", _variant_lane_down)
+    assert await ledger.list_enabled_merchant_markets() == [], "the default form stays soft"
+    with pytest.raises(RuntimeError):
+        await ledger.list_enabled_merchant_markets(strict=True)
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.population_unreadable == 1
+    assert [host for host, _ in fetcher.calls] == ["judydoll.com"], "the cart lane is still swept"
+    assert sweep.exit_code_for(report) == sweep.EXIT_POPULATION_UNREADABLE
+
+
+async def test_the_cli_exits_1_when_the_population_cannot_be_built(_db, monkeypatch):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("the population query died")
+
+    monkeypatch.setattr(sweep, "load_population", _boom)
+    with capture_pivota_stdout() as out:
+        assert await sweep.amain() == sweep.EXIT_POPULATION_UNREADABLE
+    assert fetcher.calls == []
+    assert any(_PROOF_LINE.fullmatch(line) and "population_unreadable=1" in line
+               for line in pivota_lines(out)), "the report line still lands on the failed run"
+
+
+async def test_the_cli_exits_4_when_a_check_raises(_db, monkeypatch, _population):
+    """`errors` — "the only count that should page anyone" — fails the execution too, but the
+    population was read, so it is told apart from an unreadable one."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+
+    def _raise(_host, _kwargs):
+        raise RuntimeError("a store nobody has classified")
+
+    monkeypatch.setattr(sweep, "_preflight", _Fetcher({"judydoll.com": _raise}))
+    assert await sweep.amain() == sweep.EXIT_ERRORS == 4
+
+
+def test_exit_code_for_ranks_an_unreadable_population_above_errors():
+    assert sweep.exit_code_for(sweep.SweepReport()) == 0
+    assert sweep.exit_code_for(sweep.SweepReport(skipped_disabled=1)) == 0
+    assert sweep.exit_code_for(sweep.SweepReport(abandoned_budget=5)) == 0
+    assert sweep.exit_code_for(sweep.SweepReport(errors=2)) == 4
+    assert sweep.exit_code_for(sweep.SweepReport(errors=2, population_unreadable=1)) == 1
+
+
+class _FakeDatabase:
+    """Stands in for the sweep's `database` so the CLI's connection handling is seen DISCONNECTED
+    — the state a job process starts in — whatever the shared test connection is doing. (The
+    Postgres gate runs these cases in one process, where the real one may well be connected, and
+    `amain` would then correctly skip connect() and prove nothing.)"""
+
+    def __init__(self, *, connect_error=None):
+        self.is_connected = False
+        self.events = []
+        self._connect_error = connect_error
+
+    async def connect(self):
+        self.events.append("connect")
+        if self._connect_error is not None:
+            raise self._connect_error
+        self.is_connected = True
+
+    async def disconnect(self):
+        self.events.append("disconnect")
+        self.is_connected = False
+
+
+async def test_the_cli_with_the_gate_off_contacts_nobody_and_never_connects(monkeypatch):
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+    fake = _FakeDatabase()
+    monkeypatch.setattr(sweep, "database", fake)
+    assert await sweep.amain() == sweep.EXIT_OK
+    assert fetcher.calls == [] and fake.events == [], "a dark job must not open a connection"
+
+
+async def test_the_cli_connects_runs_once_and_disconnects_with_the_gate_on(monkeypatch):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    fake = _FakeDatabase()
+    monkeypatch.setattr(sweep, "database", fake)
+
+    async def _one_run():
+        fake.events.append("run")
+        return sweep.SweepReport(population=1, checked=1, written=1)
+
+    monkeypatch.setattr(sweep, "run_merchant_purchasability_sweep", _one_run)
+    assert await sweep.amain() == sweep.EXIT_OK
+    assert fake.events == ["connect", "run", "disconnect"]
+
+
+async def test_the_cli_exits_1_without_a_traceback_when_the_database_is_unreachable(monkeypatch):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    fake = _FakeDatabase(connect_error=OSError("connection refused"))
+    monkeypatch.setattr(sweep, "database", fake)
+
+    async def _must_not_run():  # pragma: no cover - reached only by a regression
+        raise AssertionError("nothing may run without a connection")
+
+    monkeypatch.setattr(sweep, "run_merchant_purchasability_sweep", _must_not_run)
+    with root_as_in_prod(), capture_pivota_stdout() as out:
+        assert await sweep.amain() == sweep.EXIT_POPULATION_UNREADABLE
+    assert fake.events == ["connect"]
+    assert any("could not connect to the database (error_type=OSError)" in line
+               for line in pivota_lines(out)), pivota_lines(out)
+
+
+def test_the_proxy_vantage_really_leaves_through_its_proxy(monkeypatch):
+    """Every run-level test mounts a mock transport, so this is the one place the REAL
+    `_inner_transport` is looked at. A version that dropped `via` would send the `proxy`
+    vantage's checks out of the crawl egress and still record them as `proxy` — a mislabelled
+    fact the door trusts whenever MERCHANT_PURCHASABILITY_BUYER_VANTAGE=proxy."""
+    import httpcore
+
+    for name in ("HTTPS_PROXY", "https_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    via = sweep._inner_transport("http://vantage-proxy.example:3128")
+    assert isinstance(via._pool, httpcore.AsyncHTTPProxy)
+    assert (via._pool._proxy_url.host, via._pool._proxy_url.port) == (b"vantage-proxy.example", 3128)
+
+    direct = sweep._inner_transport(None)
+    assert not isinstance(direct._pool, httpcore.AsyncHTTPProxy), "the crawl-egress vantage is direct"
+
+    # An operator's process proxy is honoured for the DIRECT vantage only; `via` always wins.
+    monkeypatch.setenv("HTTPS_PROXY", "http://laptop-proxy.example:8080")
+    assert sweep._inner_transport(None)._pool._proxy_url.host == b"laptop-proxy.example"
+    assert sweep._inner_transport("http://vantage-proxy.example:3128")._pool._proxy_url.host == (
+        b"vantage-proxy.example"
+    )
+
+
+def test_main_returns_what_amain_returns(monkeypatch):
+    """`main` is `asyncio.run(amain())` behind an option-less parser; its return value is the
+    process exit status (`raise SystemExit(main())`)."""
+    for code in (0, 1, 4):
+        async def _amain(code=code):
+            return code
+
+        monkeypatch.setattr(sweep, "amain", _amain)
+        assert sweep.main([]) == code
+    with pytest.raises(SystemExit) as exc:
+        sweep.main(["--budget-seconds", "1"])
+    assert exc.value.code == 2, "no options: a knob belongs in the job's env, not its args"
+
+
+def test_python_dash_m_is_the_entry_point_the_job_runs():
+    """The Cloud Run Job runs exactly `python -m jobs.merchant_purchasability_sweep`. Run that, in
+    a child process, with the gate off: exit 0, the disabled line on stdout, nobody contacted.
+    A module without its `__main__` block would exit 0 here too — hence the stdout assertion."""
+    import subprocess
+
+    env = {k: v for k, v in os.environ.items() if k != "MERCHANT_PURCHASABILITY_SWEEP_ENABLED"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "jobs.merchant_purchasability_sweep"],
+        cwd=str(pathlib.Path(__file__).resolve().parent.parent),
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "merchant_purchasability_sweep: disabled; no merchant was contacted" in proc.stdout, (
+        proc.stdout[-2000:], proc.stderr[-2000:]
+    )
+
+
+async def test_every_request_of_a_run_goes_through_one_pacer(_db, monkeypatch, _population):
+    """The crawl address is shared with the Tier B job and the other crawlers, so request STARTS
+    are spaced >= MIN_REQUEST_INTERVAL_S across the WHOLE run — across merchants, not just within
+    one. Driven with a fake clock through the real client construction; the fake preflight makes
+    three requests per merchant, as a real one (catalog page + permalink hops) would."""
+    from jobs.tierb_cart_link_eligibility import MIN_REQUEST_INTERVAL_S, RequestPacer
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    clock = {"t": 1000.0}
+
+    async def _sleep(seconds):
+        clock["t"] += seconds
+
+    pacers = []
+
+    def _pacer():
+        pacers.append(RequestPacer(MIN_REQUEST_INTERVAL_S, clock=lambda: clock["t"], sleep=_sleep))
+        return pacers[-1]
+
+    seen = []
+
+    def _answer(request):
+        seen.append((clock["t"], request.url.host))
+        return httpx.Response(200, text="ok")
+
+    monkeypatch.setattr(sweep, "_new_pacer", _pacer)
+    monkeypatch.setattr(sweep, "_inner_transport", lambda via: httpx.MockTransport(_answer))
+
+    async def _three_requests(host, **kwargs):
+        for path in ("/products.json", "/cart/1:1", "/checkouts/cn/T"):
+            await kwargs["client"].get(f"https://{host}{path}")
+        return res("ELIGIBLE", card=True, host=host)
+
+    monkeypatch.setattr(sweep, "_preflight", _three_requests)
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.checked == 2 and report.errors == 0
+    assert len(pacers) == 1, "ONE pacer per run, shared by every merchant"
+    assert len(seen) == 6 and {host for _, host in seen} == {"judydoll.com", "flowerbeauty.com"}
+    starts = [t for t, _ in seen]
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    assert min(gaps) >= MIN_REQUEST_INTERVAL_S, gaps
 
 
 async def test_check_card_defaults_off_behaviourally_not_just_in_the_signature(monkeypatch):
@@ -1760,7 +2031,7 @@ async def test_the_sweep_skips_and_counts_a_row_with_an_unusable_market(monkeypa
     None) can still be fed through the population builder. None is swept as US; each is
     COUNTED; a lower-case market is normalised and swept."""
 
-    async def _variant_lane():
+    async def _variant_lane(**_k):
         return [
             {"merchant_domain": "nomarket.example", "market_country": None},
             {"merchant_domain": "threeletter.example", "market_country": "USA"},
@@ -1788,7 +2059,7 @@ async def test_the_sweep_skips_and_counts_a_row_with_an_unusable_market(monkeypa
 
 
 async def test_the_sweep_report_carries_the_market_unknown_count_and_logs_it_once(monkeypatch):
-    async def _variant_lane():
+    async def _variant_lane(**_k):
         return [
             {"merchant_domain": "nomarket.example", "market_country": ""},
             {"merchant_domain": "judydoll.com", "market_country": "US"},
