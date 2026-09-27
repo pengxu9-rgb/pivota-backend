@@ -307,8 +307,10 @@ SELECT merchant_domain, market_country, vantage, verdict, card_available,
 ```
 
 ```sql
--- NEVER CHECKED. The population is the UNION of the two Reap allowlists at merchant grain;
--- a merchant absent from both cannot be bought from, so a fact about it would gate nothing.
+-- NEVER CHECKED. The population is the UNION of the two Reap allowlists at merchant grain,
+-- plus the connected Shopify stores (see "The connected-store lane" below). An approximation
+-- of `load_population` in SQL: the connected half here skips the EU/UK refusal and the
+-- `normalize_shop_host` fold of a URL-spelled domain.
 WITH population AS (
     SELECT lower(merchant_domain) AS domain, upper(market_country) AS market
       FROM reap_agentic_eligibility
@@ -317,6 +319,20 @@ WITH population AS (
     SELECT lower(shop_domain) AS domain, upper(market) AS market
       FROM tierb_cart_link_eligibility
      WHERE verdict = 'ELIGIBLE'
+    UNION
+    SELECT lower(s.domain), upper(trim(o.region))
+      FROM merchant_stores s JOIN merchant_onboarding o ON o.merchant_id = s.merchant_id
+     WHERE s.status IN ('active', 'connected') AND lower(s.platform) = 'shopify'
+       AND COALESCE(s.domain, '') <> '' AND upper(trim(o.region)) ~ '^[A-Z]{2}$'
+       AND EXISTS (SELECT 1 FROM products_cache pc WHERE pc.merchant_id = s.merchant_id)
+    UNION
+    SELECT lower(o.mcp_shop_domain), upper(trim(o.region))
+      FROM merchant_onboarding o
+     WHERE lower(COALESCE(o.mcp_platform, '')) = 'shopify' AND COALESCE(o.mcp_shop_domain, '') <> ''
+       AND upper(trim(o.region)) ~ '^[A-Z]{2}$'
+       AND NOT EXISTS (SELECT 1 FROM merchant_stores s WHERE s.merchant_id = o.merchant_id
+                          AND s.status IN ('active', 'connected'))
+       AND EXISTS (SELECT 1 FROM products_cache pc WHERE pc.merchant_id = o.merchant_id)
 )
 SELECT p.domain, p.market
   FROM population p
@@ -451,10 +467,41 @@ goes, and the next hour starts with whoever was not reached.
 `VANTAGE_PROXY_URL` is deliberately not set on the job: a second vantage doubles every merchant's
 checks, and these numbers are for one.
 
+### The connected-store lane (2026-09-28)
+
+The fact has a second consumer: the product-card cart gate mints a connected Shopify card's
+prefilled cart only on a fresh positive fact for the cart's host × the buyer's market. Connected
+stores are in neither Reap allowlist, so before this lane they were never checked, and under
+`MERCHANT_PURCHASABILITY_ENFORCE` their cards could never carry a cart. `load_population` now
+unions a third lane (`_CONNECTED_LANE_SQL`):
+
+* **Store.** The same store `get_merchant_active_stores` hands the card lane: a live
+  (`active` / `connected`) `merchant_stores` row, or else the legacy `merchant_onboarding.mcp_*`
+  store (which the card lane uses whatever `mcp_connected` says). Shopify only, and only for a
+  merchant with at least one `products_cache` row, since a store that serves no card makes a fact
+  that gates nothing.
+* **Host.** `normalize_shop_host(domain)`, the host `shopify_cart_base_url` builds the card's cart
+  on.
+* **Market.** The merchant's declared `merchant_onboarding.region`, only when it is an ISO-2
+  country. `EU` and `UK` are refused, and so is anything that is not two letters (`APAC`,
+  `shopify`, `Other`, NULL). Refused rows are counted in `population_skipped_market_unknown`;
+  they are never defaulted. A wrong region costs one abandoned checkout and a negative fact,
+  which is the same answer as no fact.
+
+Measured 2026-09-28: `region` is US ×40, `shopify` ×12, APAC ×6, CA ×3, Other ×1, NULL ×1. The lane
+adds **2 targets** (`ijaqit-v9.myshopify.com` from two live store rows, `i9j3i0-kj.myshopify.com`
+legacy, both US). It also adds **+3 to `population_skipped_market_unknown` on every run**: three
+legacy stores whose region reads `shopify`, two of them `pivota-review-demo*` rigs. That count is
+expected and is not an alert.
+
+**To give a connected store a cart in another market,** set its onboarding `region` to that
+country. One region per merchant is all this lane reads.
+
 ### Politeness: ~40 merchants, hourly
 
 The population is the union of the two Reap allowlists at merchant grain: 2 merchants until
-2026-09-27, ~37–40 once the Tier B ELIGIBLE rows (since 03:30Z that day) are included.
+2026-09-27, ~37–40 once the Tier B ELIGIBLE rows (since 03:30Z that day) are included. The
+connected-store lane added 2 more on 2026-09-28.
 
 * **Per request.** Every request of a run — every merchant, every vantage — passes one pacer:
   request **starts ≥ 1.5 s apart** (the Tier B job's `MIN_REQUEST_INTERVAL_S`, on the same

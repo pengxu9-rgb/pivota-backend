@@ -45,12 +45,36 @@ Surveyed 2026-09-22. There is NO single merchant x market table in this repo. Th
   * `tierb_cart_link_eligibility` — the CART-LINK lane's allowlist, keyed (shop_domain, market),
     and it already carries a confirmed `variant_id`.
 
-THE POPULATION IS THE UNION OF THE TWO REAP ALLOWLISTS, AT MERCHANT GRAIN. Those two are
-EXACTLY what `routes/agent_commerce_reap.py` consults before it will start a purchase — the
-variant lane through `_eligibility`, the cart-link lane through `is_cart_link_eligible` — and
-nothing else in this repo can make the door offer to buy. It is therefore the smallest set that
-covers what the agent door can recommend for purchase. A merchant absent from both cannot be
-bought from, so a fact about it would gate nothing.
+THE POPULATION IS THE UNION OF THE TWO REAP ALLOWLISTS, AT MERCHANT GRAIN, PLUS THE CONNECTED
+SHOPIFY STORES. The two allowlists are EXACTLY what `routes/agent_commerce_reap.py` consults
+before it will start a purchase — the variant lane through `_eligibility`, the cart-link lane
+through `is_cart_link_eligible` — and nothing else in this repo can make the door offer to buy.
+
+The third lane exists because the fact gained a second consumer. The product-card cart gate
+(`routes/agent_shop_gateway._CartPurchasabilityGate`, on `_attach_connected_product_redirects`)
+mints a connected Shopify card's prefilled cart only on a fresh positive fact for the cart's host
+x the buyer's market. A connected store is in neither allowlist, so without this lane it was
+never checked and, under enforcement, its cards could never carry a cart again.
+
+  * THE STORE is the one `services.merchant_store_service.get_merchant_active_stores` hands the
+    card lane: a live (`active`/`connected`) `merchant_stores` row, else the merchant's legacy
+    `merchant_onboarding.mcp_shop_domain` — Shopify only, since Wix / WooCommerce cards never
+    mint a cart and the preflight is Shopify-only — and only for a merchant with a cached
+    product, because a store that serves no card makes a fact that gates nothing.
+  * THE HOST is `normalize_shop_host(domain)` — the function `shopify_cart_base_url` builds the
+    card's cart on — then the same `_population_key` every lane goes through.
+  * THE MARKET is the merchant's declared `merchant_onboarding.region`, and ONLY when it is an
+    ISO-2 country: the column is a free-text signup field whose own comment says "US, EU,
+    APAC", so "EU" (two letters, not a country) and "UK" (Shopify's code is GB) are refused
+    with "APAC" and counted as `population_skipped_market_unknown` — never defaulted, never
+    mapped. Declared, not measured: a store that cannot sell there comes back negative or
+    unverifiable, which is the answer an absent fact already gives, so a wrong region can
+    only cost one abandoned checkout, never open a cart.
+
+  Measured 2026-09-28: `region` reads US 40, "shopify" 12, APAC 6, CA 3, Other 1, NULL 1 across
+  merchant_onboarding. The lane admits two hosts today — ijaqit-v9.myshopify.com (two live store
+  rows) and i9j3i0-kj.myshopify.com (legacy), both US — and counts the three legacy stores whose
+  region reads "shopify" as market-unknown.
 
 One representative variant per merchant x market: the Tier B row's confirmed `variant_id` when we
 have one, else our catalog's variant for that domain, else NONE — and with none the preflight
@@ -144,6 +168,10 @@ from db.database import database
 # the purchase request with and `tierb_cart_link_eligibility` keys its rows by. See
 # `_population_key` for how it is used here.
 from services.tierb_cart_link_merchants import canonical_merchant_domain
+# THE host a connected Shopify card's cart permalink is built on (`shopify_cart_base_url` reduces
+# the connected store domain with it), so a connected-store fact is keyed on the host the card
+# gate asks about. See `_CONNECTED_LANE_SQL`.
+from services.outbound_links_service import normalize_shop_host
 from services.shopify_cart_link_preflight import (
     REQUEST_TIMEOUT_S,
     USER_AGENT,
@@ -281,6 +309,46 @@ SELECT shop_domain AS domain, market AS market, variant_id
  WHERE verdict = 'ELIGIBLE'
 """
 
+#: The CONNECTED-STORE lane: the Shopify store domain the card lane would build a cart on, per
+#: merchant, with the merchant's declared region. The two halves are
+#: `services.merchant_store_service.get_merchant_active_stores`, branch for branch: its live
+#: `merchant_stores` rows, else — only for a merchant with NO live row of any platform — the
+#: legacy `merchant_onboarding.mcp_*` store, which it returns whatever `mcp_connected` says and
+#: `_attach_connected_product_redirects` uses without reading status. An empty domain is dropped
+#: here because the card lane drops it too. The host and market rules are in the module docstring.
+#:
+#: ONLY A MERCHANT WITH A CACHED PRODUCT: the card lane stamps cards built from `products_cache`,
+#: so a store with none serves no card, a fact about it gates nothing, and checking it would only
+#: leave an abandoned checkout behind.
+_CONNECTED_LANE_SQL = """
+SELECT s.domain AS domain, o.region AS region
+  FROM merchant_stores s
+  JOIN merchant_onboarding o ON o.merchant_id = s.merchant_id
+ WHERE s.status IN ('active', 'connected')
+   AND lower(s.platform) = 'shopify'
+   AND COALESCE(s.domain, '') <> ''
+   AND EXISTS (SELECT 1 FROM products_cache pc WHERE pc.merchant_id = s.merchant_id)
+UNION ALL
+SELECT o.mcp_shop_domain AS domain, o.region AS region
+  FROM merchant_onboarding o
+ WHERE lower(COALESCE(o.mcp_platform, '')) = 'shopify'
+   AND COALESCE(o.mcp_shop_domain, '') <> ''
+   AND NOT EXISTS (SELECT 1 FROM merchant_stores s
+                    WHERE s.merchant_id = o.merchant_id AND s.status IN ('active', 'connected'))
+   AND EXISTS (SELECT 1 FROM products_cache pc WHERE pc.merchant_id = o.merchant_id)
+"""
+
+#: Two-letter values of `merchant_onboarding.region` that are NOT countries a buyer can be in:
+#: "EU" is on the signup form's own list, and "UK" is how people spell GB. Anything else that
+#: passes `facts.normalize_market` is taken as the country it names.
+_REGION_NOT_A_COUNTRY = frozenset({"EU", "UK"})
+
+
+def _connected_market(region: Any) -> Optional[str]:
+    """A connected store's declared region as a market, or None (skipped and counted)."""
+    market = facts.normalize_market(region)
+    return None if market in _REGION_NOT_A_COUNTRY else market
+
 #: `source_domain` IS FOLDED, BY THE ROUTE'S EXPRESSION, CHARACTER FOR CHARACTER. `:domain` is a
 #: population key, which is already canonical (lower case, one leading `www.` removed); the
 #: Shopify sync writes `source_domain` as Shopify's `shop_domain`, which in production is
@@ -374,9 +442,10 @@ UNUSABLE_TALLY = "population_skipped_unusable"
 #: 2026-09-26, silently swept under a truncated market).
 MARKET_UNKNOWN_TALLY = "population_skipped_market_unknown"
 
-#: The `SweepReport` count of population LANES (of the two allowlists) whose read raised. The run
-#: still sweeps whatever the other lane returned — one unreadable table should not stop the
-#: merchants the other one names from being refreshed — but the population is incomplete, and
+#: The `SweepReport` count of population LANES (the two allowlists and the connected stores) whose
+#: read raised. The run still sweeps whatever the other lanes returned — one unreadable table
+#: should not stop the merchants the others name from being refreshed — but the population is
+#: incomplete, and
 #: `exit_code_for` turns any non-zero count into a FAILED job execution. Before this count the
 #: two lanes failed soft and silently: a database that answered nothing produced
 #: `population=0 ... errors=0`, which read as a clean run.
@@ -394,9 +463,10 @@ async def load_population(
     `MARKET_UNKNOWN_TALLY` counts the same way for a market, and `UNREADABLE_TALLY` once per
     LANE whose read raised (that lane then contributes nothing; the other is still swept).
 
-    The two lanes are unioned on (domain, market). WHERE THEY OVERLAP THE CART LANE WINS the
+    The three lanes are unioned on (domain, market). WHERE THEY OVERLAP THE CART LANE WINS the
     variant, because its `variant_id` was confirmed available on the storefront for that market
-    by the Tier B job — a stronger fact than anything the catalog holds.
+    by the Tier B job — a stronger fact than anything the catalog holds. The connected-store
+    lane carries no variant of its own.
     """
     merged: Dict[Tuple[str, str], Optional[str]] = {}
     # THE VARIANT LANE'S SET COMES FROM THE LANE ITSELF, not from a second copy of its predicate
@@ -446,6 +516,10 @@ async def load_population(
         variant = str(row.get("variant_id") or "").strip() or None
         if key is not None and (variant or key not in merged):
             merged[key] = variant
+    for row in await _lane(lambda: _rows(_CONNECTED_LANE_SQL), "connected-store"):
+        key = _key(normalize_shop_host(row.get("domain")), _connected_market(row.get("region")))
+        if key is not None:
+            merged.setdefault(key, None)
 
     # Least-recently-checked FIRST, and never-checked first of all — ordered before the catalog
     # lookups so that a big population does not spend its budget pricing merchants this run will

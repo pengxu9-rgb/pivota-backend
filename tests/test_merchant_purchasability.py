@@ -1650,6 +1650,31 @@ def test_the_checkout_tier_surface_gates_on_enforce_and_not_on_the_sweep_dial():
     assert "purchasability.is_sweep_enabled()" not in source
 
 
+async def _ensure_connected_tables() -> None:
+    """`merchant_onboarding` and `products_cache` from the repo's own metadata; `merchant_stores`
+    from main.py's startup DDL, which is the only place it is defined (its columns this job reads
+    are store_id / merchant_id / platform / name / domain / status)."""
+    import sqlalchemy
+    from db.database import metadata
+    from db.merchant_onboarding import merchant_onboarding
+    from db.products import products_cache
+
+    url = (os.getenv("DATABASE_URL") or "").replace("sqlite+aiosqlite://", "sqlite://").replace(
+        "postgresql+asyncpg://", "postgresql://"
+    )
+    engine = sqlalchemy.create_engine(url)
+    metadata.create_all(engine, tables=[merchant_onboarding, products_cache], checkfirst=True)
+    engine.dispose()
+    await database.execute(
+        "CREATE TABLE IF NOT EXISTS merchant_stores ("
+        "store_id VARCHAR(50) PRIMARY KEY, merchant_id VARCHAR(50) NOT NULL, "
+        "platform VARCHAR(50) NOT NULL, name VARCHAR(255) NOT NULL, domain VARCHAR(255), "
+        "api_key TEXT, status VARCHAR(50) DEFAULT 'connected', "
+        "connected_at TIMESTAMP WITH TIME ZONE, created_at TIMESTAMP WITH TIME ZONE "
+        "DEFAULT CURRENT_TIMESTAMP)"
+    )
+
+
 @pytest.fixture
 async def _population(_db):
     """The two Reap allowlists, minimally shaped. Built here rather than through a factory so the
@@ -1684,9 +1709,16 @@ async def _population(_db):
         "INSERT INTO tierb_cart_link_eligibility (shop_domain, market, verdict, variant_id, "
         "checked_at) VALUES ('luafee.com', 'US', 'NOT_ACCEPTING_ORDERS', '1', CURRENT_TIMESTAMP)"
     )
+    # The CONNECTED-STORE lane's tables, present and EMPTY, so the population above is exactly
+    # the two allowlists' and that lane reads (not fails to read) nothing. `_connected` fills it.
+    await _ensure_connected_tables()
+    await database.execute("DELETE FROM merchant_stores")
+    await database.execute("DELETE FROM merchant_onboarding")
     yield
     await database.execute("DELETE FROM reap_agentic_eligibility")
     await database.execute("DELETE FROM tierb_cart_link_eligibility")
+    await database.execute("DELETE FROM merchant_stores")
+    await database.execute("DELETE FROM merchant_onboarding")
 
 
 # ══ the sweep's catalog hint is matched canonically ═══════════════════════════════════════
@@ -2038,7 +2070,10 @@ async def test_the_sweep_skips_and_counts_a_row_with_an_unusable_market(monkeypa
             {"merchant_domain": "lower.example", "market_country": "sg"},
         ]
 
-    async def _cart_lane(_statement):
+    async def _cart_lane(statement):
+        # The CART lane only: `_rows` also reads the connected-store lane, which has no rows here.
+        if statement is not sweep._CART_LANE_SQL:
+            return []
         return [{"domain": "blankmarket.example", "market": "  ", "variant_id": "1"}]
 
     async def _nothing_due(*_a, **_k):
@@ -2095,3 +2130,166 @@ async def test_the_sweep_report_carries_the_market_unknown_count_and_logs_it_onc
     skipped = [line for line in pivota_lines(out) if "market is not an ISO-2 code" in line]
     assert len(skipped) == 1, skipped
     assert "nomarket" not in skipped[0] and "nomarket" not in repr(report)
+
+
+# ══ the CONNECTED-STORE lane ═══════════════════════════════════════════════════════════════
+#
+# The product-card cart gate asks this fact for a connected Shopify card's cart host x the buyer's
+# market. Connected stores are in neither Reap allowlist, so until this lane they were never
+# swept and — under enforcement — their cards could never carry a cart. The lane mirrors
+# `services.merchant_store_service.get_merchant_active_stores` (live store rows, else the legacy
+# onboarding store) and keys each store on the host the card's cart is built on x the merchant's
+# declared region, which is used ONLY when it is an ISO-2 country.
+
+_CONNECTED_MERCHANTS = (
+    # merchant_id, region, has a cached product
+    ("m_conn", "us", True),
+    ("m_conn_twin", "US", True),        # a second live row on the SAME store host
+    ("m_url", "US", True),              # domain stored as a URL
+    ("m_wix", "US", True),              # Wix: never a cart, never swept
+    ("m_eu", "EU", True),               # two letters, not a country
+    ("m_apac", "APAC", True),
+    ("m_label", "shopify", True),       # the prod junk value
+    ("m_noregion", None, True),
+    ("m_noproducts", "US", False),      # serves no card
+    ("m_down", "US", True),             # its only store row is disconnected
+    ("m_legacy", "CA", True),           # legacy onboarding store, no live row
+    ("m_legacy_dead", "US", True),      # legacy store, mcp_connected FALSE — still the card's
+    ("m_legacy_shadowed", "US", True),  # legacy store AND a live (Wix) row: the live row wins
+    ("m_legacy_empty", "US", False),    # legacy store that serves no card
+)
+
+_CONNECTED_STORES = (
+    # store_id, merchant_id, platform, domain, status
+    ("st_conn", "m_conn", "shopify", "Conn-Store.myshopify.com", "active"),
+    ("st_twin", "m_conn_twin", "Shopify", "conn-store.myshopify.com", "connected"),
+    ("st_url", "m_url", "shopify", "https://url-store.myshopify.com/", "active"),
+    ("st_wix", "m_wix", "wix", "wix-store.example", "active"),
+    ("st_eu", "m_eu", "shopify", "eu-store.myshopify.com", "active"),
+    ("st_apac", "m_apac", "shopify", "apac-store.myshopify.com", "active"),
+    ("st_label", "m_label", "shopify", "label-store.myshopify.com", "active"),
+    ("st_noregion", "m_noregion", "shopify", "noregion-store.myshopify.com", "active"),
+    ("st_noproducts", "m_noproducts", "shopify", "empty-store.myshopify.com", "active"),
+    ("st_down", "m_down", "shopify", "down-store.myshopify.com", "disconnected"),
+    ("st_shadow", "m_legacy_shadowed", "wix", "shadow-wix.example", "active"),
+)
+
+_LEGACY_STORES = {
+    # merchant_id -> (mcp_platform, mcp_shop_domain, mcp_connected)
+    "m_legacy": ("shopify", "legacy-store.myshopify.com", True),
+    "m_legacy_dead": ("Shopify", "legacy-dead.myshopify.com", False),
+    "m_legacy_shadowed": ("shopify", "legacy-shadowed.myshopify.com", True),
+    "m_legacy_empty": ("shopify", "legacy-empty.myshopify.com", True),
+}
+
+#: Exactly what the lane must admit, beside the two allowlists' judydoll.com / flowerbeauty.com.
+_CONNECTED_EXPECTED = {
+    ("conn-store.myshopify.com", "US"),
+    ("url-store.myshopify.com", "US"),
+    ("legacy-store.myshopify.com", "CA"),
+    ("legacy-dead.myshopify.com", "US"),
+}
+
+
+@pytest.fixture
+async def _connected(_population):
+    for merchant_id, region, _has_product in _CONNECTED_MERCHANTS:
+        platform, shop_domain, connected = _LEGACY_STORES.get(merchant_id, (None, None, False))
+        await database.execute(
+            "INSERT INTO merchant_onboarding (merchant_id, business_name, contact_email, region, "
+            "mcp_platform, mcp_shop_domain, mcp_connected) VALUES (:m, :n, :e, :r, :p, :d, :c)",
+            {"m": merchant_id, "n": f"{merchant_id} store", "e": f"{merchant_id}.owner.example",
+             "r": region, "p": platform, "d": shop_domain, "c": connected},
+        )
+    for store_id, merchant_id, platform, domain, status in _CONNECTED_STORES:
+        await database.execute(
+            "INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain, status) "
+            "VALUES (:s, :m, :p, :n, :d, :st)",
+            {"s": store_id, "m": merchant_id, "p": platform, "n": store_id, "d": domain, "st": status},
+        )
+    with_products = [m for m, _r, has in _CONNECTED_MERCHANTS if has]
+    for merchant_id in with_products:
+        await database.execute(
+            "INSERT INTO products_cache (merchant_id, platform, platform_product_id, product_data, "
+            "expires_at) VALUES (:m, 'shopify', :pid, :data, CURRENT_TIMESTAMP)",
+            {"m": merchant_id, "pid": f"p_{merchant_id}", "data": json.dumps({"id": "1"})},
+        )
+    yield
+    for merchant_id in with_products:
+        await database.execute("DELETE FROM products_cache WHERE merchant_id = :m", {"m": merchant_id})
+
+
+async def test_the_population_adds_the_connected_shopify_stores(_db, _connected):
+    tally: dict = {}
+    targets = await sweep.load_population(50, tally=tally)
+    keys = {(t.domain, t.market) for t in targets}
+    assert keys == {("judydoll.com", "US"), ("flowerbeauty.com", "US")} | _CONNECTED_EXPECTED
+    assert len(targets) == len(keys), "two live rows on one host are ONE merchant x market"
+    # EU, APAC, "shopify" and NULL — each skipped and COUNTED, never defaulted to US.
+    assert tally == {sweep.MARKET_UNKNOWN_TALLY: 4}
+    assert all(t.variant_id is None for t in targets if (t.domain, t.market) in _CONNECTED_EXPECTED), (
+        "the connected lane carries no variant; the preflight picks one for the market"
+    )
+
+
+async def test_a_connected_store_is_keyed_on_the_host_its_cart_is_built_on(_db, _connected):
+    """The card gate asks the fact for `normalize_domain(<cart host>)`, and the connected card's
+    cart host is `shopify_cart_base_url(shop_domain=<store domain>)`. A population key spelled
+    any other way writes a fact the gate never reads."""
+    from services.outbound_links_service import shopify_cart_base_url
+
+    targets = {t.domain for t in await sweep.load_population(50)}
+    for _sid, _mid, platform, domain, status in _CONNECTED_STORES:
+        if platform.lower() != "shopify" or status == "disconnected":
+            continue
+        cart_host = mp.normalize_domain(shopify_cart_base_url(shop_domain=domain, variant_id="1"))
+        if cart_host in {"conn-store.myshopify.com", "url-store.myshopify.com"}:
+            assert cart_host in targets, domain
+
+
+async def test_a_swept_connected_store_answers_the_card_gate(_db, monkeypatch, _connected):
+    """End to end: an armed sweep checks the connected host and `is_purchasable` — the one read
+    the card gate makes — answers True for it in its declared market, and only there."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "1")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+
+    report = await sweep.run_merchant_purchasability_sweep()
+    swept = {(host, kwargs["market"]) for host, kwargs in fetcher.calls}
+    assert _CONNECTED_EXPECTED <= swept
+    assert report.population_skipped_market_unknown == 4
+    assert report.population_unreadable == 0
+    assert await mp.is_purchasable("conn-store.myshopify.com", "US") is True
+    assert await mp.is_purchasable("conn-store.myshopify.com", "CA") is False
+    assert await mp.is_purchasable("eu-store.myshopify.com", "US") is False, "never swept"
+
+
+async def test_the_connected_lane_failure_is_counted_and_the_allowlists_still_swept(
+    _db, monkeypatch, _connected
+):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+    real_fetch_all = database.fetch_all
+
+    async def _connected_lane_down(query, *a, **k):
+        if query is sweep._CONNECTED_LANE_SQL:
+            raise RuntimeError("relation merchant_stores is unavailable")
+        return await real_fetch_all(query, *a, **k)
+
+    monkeypatch.setattr(database, "fetch_all", _connected_lane_down)
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.population_unreadable == 1
+    assert sorted(host for host, _ in fetcher.calls) == ["flowerbeauty.com", "judydoll.com"]
+    assert sweep.exit_code_for(report) == sweep.EXIT_POPULATION_UNREADABLE
+
+
+@pytest.mark.parametrize("region, market", [
+    ("US", "US"), (" ca ", "CA"), ("sg", "SG"),
+    ("EU", None), ("eu", None), ("UK", None),
+    ("APAC", None), ("shopify", None), ("Other", None), ("USA", None), ("", None), (None, None),
+])
+def test_only_a_region_that_names_a_country_becomes_a_market(region, market):
+    assert sweep._connected_market(region) == market

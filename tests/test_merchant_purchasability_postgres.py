@@ -64,6 +64,8 @@ if _IS_PG:
         # The sweep's catalog-hint case (`www.`-spelled Shopify product), which needs the catalog
         # tables: the fixture builds them from the repo's own metadata and deletes its own rows.
         _www_catalog,
+        # The connected-store lane's rows (merchant_stores / merchant_onboarding / products_cache).
+        _connected,
         page,
         res,
     )
