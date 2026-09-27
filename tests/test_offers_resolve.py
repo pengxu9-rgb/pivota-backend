@@ -578,6 +578,64 @@ def test_offers_resolve_identity_retry_serves_only_the_buyer_market_currency(
         assert served_seeds == [f"ext_eps_{served_currency.lower()}"]
 
 
+# Peng 2026-09-27: "treat market-less offers.resolve callers as US too". The fuzzy ref (title / url /
+# seed_data LIKE on the product id) is a fallback that can surface a seed the buyer never held, so it
+# gets #2389's rule: no market = US = USD, SG = SGD, NULL/blank never, an unknown market gets no
+# fuzzy seed and the query is not run. The fake evaluates the conjunct the way Postgres would.
+@pytest.mark.parametrize(
+    ("market", "served_currency"),
+    [(None, "USD"), ("US", "USD"), ("SG", "SGD"), ("DE", None)],
+)
+def test_offers_resolve_fuzzy_ref_serves_only_the_buyer_market_currency(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, market, served_currency
+) -> None:
+    import routes.agent_shop_gateway as gateway
+    from services.external_seed_search import SEED_SERVING_CURRENCY_CLAUSE
+
+    rows = [
+        _identity_seed_row("eps_usd", "USD", "kravebeauty.com"),
+        _identity_seed_row("eps_sgd", "SGD", "jsmbeauty.sg"),
+        _identity_seed_row("eps_jpy", "JPY", "kravebeauty.jp"),
+        _identity_seed_row("eps_null", None, "nullbeauty.com"),
+        _identity_seed_row("eps_blank", " ", "blankbeauty.com"),
+    ]
+    fuzzy_calls = []
+
+    async def fake_fetch_all(query: str, values=None):
+        q = str(query)
+        if "FROM external_product_seeds" in q and "pid_like_0" in q:
+            fuzzy_calls.append(dict(values or {}))
+            if SEED_SERVING_CURRENCY_CLAUSE.replace(":serving_currency", "") not in q:
+                return rows
+            wanted = values["serving_currency"]
+            return [r for r in rows if str(r["price_currency"] or "").strip().upper() == wanted]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "_make_external_redirect_url", AsyncMock(return_value="https://example.com/r?token=fuzzy"))
+
+    payload = {"product": {"product_id": "great-barrier-relief"}, "limit": 10, "tool": "*"}
+    if market is not None:
+        payload["market"] = market
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve", "payload": payload, "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200
+    external = [o for o in (res.json().get("offers") or []) if o.get("purchase_route") == "affiliate_outbound"]
+    served_seeds = sorted(o["source"]["external_product_id"] for o in external)
+    if served_currency is None:
+        assert fuzzy_calls == []
+        assert served_seeds == []
+    else:
+        assert [c["serving_currency"] for c in fuzzy_calls] == [served_currency]
+        assert served_seeds == [f"ext_eps_{served_currency.lower()}"]
+
+
 @pytest.mark.parametrize("commerce_surface", [None, "agent_api"])
 def test_offers_resolve_external_only_product_serves_on_explicit_surface(
     monkeypatch: pytest.MonkeyPatch, client: TestClient, commerce_surface

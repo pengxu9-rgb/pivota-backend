@@ -5278,7 +5278,15 @@ async def _handle_offers_resolve(
                 },
             }
 
-        if not seed_rows:
+        # The fuzzy ref is a FALLBACK (title / url / seed_data LIKE): it finds seeds the buyer may
+        # never have held. Peng 2026-09-27: a caller that names no market is a US buyer here too
+        # (the UCP get_offers tool sends none), so it gets only seeds priced in the buyer market's
+        # currency -- #2389's rule, function and conjunct, as the identity retry above. A market
+        # with no known currency gets no fuzzy seed; NULL/blank price_currency never matches.
+        fuzzy_serving_currency = seed_serving_currency(market_hint)
+        if not seed_rows and fuzzy_serving_currency is not None:
+            where_clauses.append(SEED_SERVING_CURRENCY_CLAUSE)
+            params["serving_currency"] = fuzzy_serving_currency
             seed_rows = await asyncio.wait_for(
                 database.fetch_all(
                     f"""
