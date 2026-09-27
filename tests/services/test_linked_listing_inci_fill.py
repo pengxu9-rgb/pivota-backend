@@ -59,6 +59,8 @@ def test_the_candidate_query_only_fills_an_empty_served_brand_row():
     assert "w.product_key NOT LIKE 'ext:retailer:%'" in sql and "r.product_key LIKE 'ext:retailer:%'" in sql
     assert "NOT EXISTS (SELECT 1 FROM beauty_sku_ingredients own WHERE own.product_key = w.product_key" in sql
     assert "w.suppressed_at IS NULL" in sql and "r.suppressed_at IS NULL" in sql
+    assert "AND w.content_key = apv.content_key" in sql       # an orphan view row cannot pick the target
+    assert "AND w.platform = 'external_seed'" in sql          # never a connected merchant's synced row
 
 
 def test_the_fill_rank_can_never_replace_the_brands_own_inci_and_is_replaced_by_it():
@@ -69,10 +71,12 @@ def test_the_fill_rank_can_never_replace_the_brands_own_inci_and_is_replaced_by_
 
 
 class _DB:
-    def __init__(self, rows):
-        self.rows = rows
+    def __init__(self, rows, own_inci=False):
+        self.rows, self.own_inci = rows, own_inci
 
     async def fetch_all(self, sql, values=None):
+        if "WHERE product_key = :pk" in sql:  # OWN_INCI_SQL, the write-time re-check
+            return [{"?column?": 1}] if self.own_inci else []
         return self.rows
 
 
@@ -83,24 +87,60 @@ async def test_fill_writes_through_the_intake_at_reseller_rank_only_when_applied
 
     async def intake(pk, raw, source, *, db, dry_run):
         calls.append({"pk": pk, "source": source, "dry_run": dry_run})
-        return {"status": "ok", "written_skus": [] if dry_run else ["s1"], "skipped_outranked_skus": [],
+        # the real intake reports the would-write skus on a dry run too (canonical_inci_intake)
+        return {"status": "ok", "written_skus": ["s1"], "skipped_outranked_skus": [],
                 "serving_eligible": None if dry_run else True}
 
     monkeypatch.setattr(fill_mod, "ingest_canonical_inci", intake)
     out = await fill_mod.fill(_DB([_row("ext:retailer:a")]), apply=apply)
     assert calls == [{"pk": BRAND, "source": INCI_SOURCE_RESELLER, "dry_run": not apply}]
     assert out["counts"] == {"fill": 1} and "raw_inci" not in out["fills"][0]
-    assert out["fills"][0]["written_skus"] == (1 if apply else 0)
+    assert out["fills"][0]["written_skus"] == 1
+
+
+@pytest.mark.asyncio
+async def test_inci_that_appeared_after_planning_is_never_written_over(monkeypatch):
+    """The planning query's NOT EXISTS is not the only guard: the intake lets reseller rank write over any
+    rank-1 source, so the brand's own INCI is re-checked at the moment of the write."""
+    calls = []
+
+    async def intake(*a, **k):
+        calls.append(a)
+        return {"status": "ok", "written_skus": ["s1"]}
+
+    monkeypatch.setattr(fill_mod, "ingest_canonical_inci", intake)
+    out = await fill_mod.fill(_DB([_row("ext:retailer:a")], own_inci=True), apply=True)
+    assert calls == [] and out["fills"] == [] and out["counts"]["brand_has_inci_at_write"] == 1
 
 
 @pytest.mark.parametrize("category", ["beauty/tools/brush", "beauty/devices/nail", "beauty/makeup/eye/false-lashes",
                                       "beauty/makeup/nails/press-on-nails", "beauty/sets/gift-set", "", None,
-                                      "fashion/apparel/tops"])
+                                      "fashion/apparel/tops",
+                                      # review of #2395: exact coarse values and prod alias spellings
+                                      "beauty/tools", "beauty/devices", "beauty/sets", "beauty/tools/",
+                                      "beauty/makeup/eyes/lashes", "beauty/makeup/eyes/false_lashes",
+                                      "beauty/makeup/tools/sponge", "beauty/skincare/tools/gua-sha",
+                                      "beauty/accessories/makeup-bag", "beauty/skincare/sets",
+                                      "beauty/oral-care/teeth-whitening-devices",
+                                      # alias-only: no telltale segment until folded (category_path_aliases)
+                                      "beauty/skincare/bundle", "beauty/mystery-box"])
 def test_a_product_without_a_formula_is_never_given_one(category):
     """Measured: shoprescuespa.com's 3-item 'INCI' for Westman Atelier's brushes is a materials list."""
-    brush = "Synthetic Fibers, Wood, Aluminum"
-    fills, counts = fill_mod.plan_fills([_row("ext:retailer:a", raw=brush, category=category)])
+    fills, counts = fill_mod.plan_fills([_row("ext:retailer:a", category=category)])
     assert fills == [] and counts == {"category_has_no_formula": 1}
+
+
+@pytest.mark.parametrize("raw", [
+    "Synthetic Fibers, Wood, Aluminum",                    # a brush's materials on a coarse "beauty/makeup" row
+    "Key ingredients: Niacinamide, Hyaluronic Acid",       # a label, not the list
+    "Made in Korea, Cruelty free, Vegan",                  # claims
+    "Water, Glycerin, Niacinamide, Panthenol",             # four: under the minimum
+    # long enough, but benefit copy (the crawl lane's prose filter)
+    "Boosts hydration, soothes redness, brightens tone, reduces pores, helps the barrier",
+])
+def test_a_label_claims_or_materials_list_is_not_an_inci(raw):
+    fills, counts = fill_mod.plan_fills([_row("ext:retailer:a", raw=raw, category="beauty/makeup")])
+    assert fills == [] and counts == {"no_valid_listing_inci": 1}
 
 
 @pytest.mark.parametrize("category", ["beauty/makeup/face/concealer", "beauty/haircare/general",

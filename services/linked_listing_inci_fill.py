@@ -26,8 +26,34 @@ RETAILER_LISTING_PREFIX = "ext:retailer:"
 # Categories whose products have no formula: an "INCI" copied onto them is a materials list (a retailer's
 # "Synthetic fibres, Wood, Aluminium" on a Westman Atelier brush, measured 2026-09-27), and a gift set's
 # list belongs to none of its products. Fills are refused here; so is a product with no category.
-NO_FORMULA_PREFIXES = ("beauty/tools/", "beauty/devices/", "beauty/makeup/eye/false-lashes",
-                       "beauty/makeup/nails/press-on-nails", "beauty/sets/")
+# Matched on path SEGMENTS of the stored path and of its alias-folded leaf, so "beauty/tools",
+# "beauty/makeup/tools/sponge", "beauty/makeup/eyes/lashes" and "beauty/skincare/sets" are all refused
+# (review of #2395).
+NO_FORMULA_SEGMENTS = frozenset({"tools", "devices", "sets", "gift-set", "accessories", "false-lashes",
+                                 "lashes", "false_lashes", "press-on-nails", "teeth-whitening-devices"})
+#: A retailer "INCI" shorter than this is a label or a materials list, not a formula
+#: ("Key ingredients: Niacinamide, Hyaluronic Acid", "Synthetic Fibers, Wood, Aluminum").
+MIN_INGREDIENTS = 5
+
+
+def _has_formula(category_path: Any) -> bool:
+    from services.category_path_aliases import resolve
+
+    raw = str(category_path or "").strip().lower()
+    if not raw.startswith("beauty"):
+        return False
+    for path in (raw, str(resolve(raw) or "").lower()):
+        if NO_FORMULA_SEGMENTS & set(path.split("/")):
+            return False
+    return True
+
+
+def _is_fillable_inci(raw_inci: Any) -> bool:
+    """The shared INCI bar (canonical intake), the crawl lane's prose/label filter, and a minimum length."""
+    from services.crawled_inci_ingest import _is_skippable_inci
+
+    text = str(raw_inci or "")
+    return is_valid_inci(text) and not _is_skippable_inci(text) and len(_ingredients(text)) >= MIN_INGREDIENTS
 
 # One row per (served brand product, linked retailer listing that carries INCI), for brand products with
 # no INCI of their own. The served row is agent_pdp_view's signature, so a group a retailer still serves
@@ -37,14 +63,22 @@ SELECT w.product_key AS brand_product_key, w.content_key, w.source_domain AS bra
        w.category_path AS brand_category_path,
        r.product_key AS listing_product_key, r.source_domain AS listing_host, i.raw_inci
 FROM agent_pdp_view apv
-JOIN catalog_products w ON w.pivota_signature_id = apv.pivota_signature_id
+JOIN catalog_products w ON w.pivota_signature_id = apv.pivota_signature_id AND w.content_key = apv.content_key
 JOIN catalog_products r ON r.content_key = w.content_key
 JOIN beauty_sku_ingredients i ON i.product_key = r.product_key
 WHERE w.product_key NOT LIKE 'ext:retailer:%' AND w.suppressed_at IS NULL
+  -- crawl-lane rows only: a connected merchant's own sync rewrites its INCI without precedence
+  -- (catalog_sync_service), so a fill there would flap and show a retailer's list as the merchant's
+  AND w.platform = 'external_seed'
   AND r.product_key LIKE 'ext:retailer:%' AND r.suppressed_at IS NULL
   AND coalesce(trim(i.raw_inci), '') <> ''
   AND NOT EXISTS (SELECT 1 FROM beauty_sku_ingredients own
                   WHERE own.product_key = w.product_key AND coalesce(trim(own.raw_inci), '') <> '')
+"""
+
+
+OWN_INCI_SQL = """
+SELECT 1 FROM beauty_sku_ingredients WHERE product_key = :pk AND coalesce(trim(raw_inci), '') <> '' LIMIT 1
 """
 
 
@@ -66,11 +100,10 @@ def plan_fills(rows: Iterable[Mapping[str, Any]]) -> Tuple[List[Dict[str, Any]],
         counts[reason] = counts.get(reason, 0) + 1
 
     for pk, cands in sorted(by_product.items()):
-        category = str(cands[0].get("brand_category_path") or "").strip().lower()
-        if not category.startswith("beauty/") or category.startswith(NO_FORMULA_PREFIXES):
+        if not _has_formula(cands[0].get("brand_category_path")):
             note("category_has_no_formula")
             continue
-        valid = [c for c in cands if is_valid_inci(c.get("raw_inci"))]
+        valid = [c for c in cands if _is_fillable_inci(c.get("raw_inci"))]
         if not valid:
             note("no_valid_listing_inci")
             continue
@@ -93,6 +126,13 @@ async def fill(db: Any, *, apply: bool) -> Dict[str, Any]:
     fills, counts = plan_fills(rows)
     results = []
     for f in fills:
+        # Re-checked at write time, not only in the planning query: canonical_inci_intake lets a
+        # reseller_listing write over any rank-1 source (pdp_crawl, shopify_products_sync), so the
+        # "brand has no INCI" rule must hold at the moment of the write (review of #2395).
+        own = await db.fetch_all(OWN_INCI_SQL, {"pk": f["brand_product_key"]})
+        if own:
+            counts["brand_has_inci_at_write"] = counts.get("brand_has_inci_at_write", 0) + 1
+            continue
         out = await ingest_canonical_inci(f["brand_product_key"], f["raw_inci"], INCI_SOURCE_RESELLER,
                                           db=db, dry_run=not apply)
         results.append({**{k: v for k, v in f.items() if k != "raw_inci"},
