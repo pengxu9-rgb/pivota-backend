@@ -22,7 +22,8 @@ brand; the brand must own the host (`brand_owns_domain`, the same label-equality
 brand_official lane admits a store by). An `ext:retailer:` key is one listing on one host, so any
 other shape is one this script was not written for.
 
-ORDER. Run this BEFORE the brand_official apply, as retire_superseded_brand_keys does: the two key
+ORDER. Run this BEFORE the brand_official apply (retire_superseded_brand_keys now runs AFTER its
+re-onboard, review of #2397 -- this script keeps its own order): the two key
 sets are disjoint, and retiring first means the store is never served both ways at once. `--apply`
 also refuses unless a brand_official retailer_ingest job for the host exists (queued, apply_due,
 held or done) -- the chain is only superseded if something supersedes it.

@@ -104,3 +104,219 @@ def test_a_jsonb_value_is_bound_as_text_however_the_driver_returned_it():
     assert _as_json_text('{"a": 1}') == '{"a": 1}'
     assert _as_json_text({"run_id": "x", "n": 2}) == '{"run_id": "x", "n": 2}'
     assert _as_json_text([1, 2]) == "[1, 2]"
+
+
+@pytest.fixture
+def tarte(monkeypatch):
+    """tartecosmetics.com, 2026-09-27: one crawl wrote 176 rows as "Tarte" and 73 as "Tarte Cosmetics"
+    (vendor spellings), no title in common. Re-run as "Tarte", every row resolves to "Tarte"."""
+    feed = [
+        _product("tarte", "Shape Tape Concealer", "shape-tape"),
+        _product("Tarte Cosmetics", "Maracuja Juicy Lip Balm", "juicy-lip"),
+        _product("Tarte Cosmetics", "Amazonian Clay Blush", "clay-blush"),
+    ]
+
+    async def fake_fetch(domain, *, max_products=500, timeout_s=15.0):
+        return feed
+
+    async def fake_locale(domain, **kw):
+        return {"currency": "USD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", fake_locale)
+    return feed
+
+
+@pytest.mark.asyncio
+async def test_without_the_stale_spelling_a_respelled_store_retires_nothing(tarte):
+    """The Sand & Sky case: re-run brand == record brand, so derive(brand) == derive(record brand)."""
+    assert await build_cohort("tartecosmetics.com", "Tarte", "beauty") == []
+
+
+@pytest.mark.asyncio
+async def test_the_stale_spelling_maps_each_old_key_to_its_new_one(tarte):
+    cohort = await build_cohort("tartecosmetics.com", "Tarte", "beauty", stale_brand="Tarte Cosmetics")
+    assert {c["title"] for c in cohort} == {"Shape Tape Concealer", "Maracuja Juicy Lip Balm", "Amazonian Clay Blush"}
+    for c in cohort:
+        assert c["brand"] == "Tarte"
+        assert c["stale_key"] == derive_product_key("Tarte Cosmetics", c["title"])
+        assert c["new_key"] == derive_product_key("Tarte", c["title"])
+    # Only the 73 rows actually written as "Tarte Cosmetics" exist under a stale key in prod; `plan` retires
+    # present keys only, so "Shape Tape Concealer" (stored as "Tarte") is never touched.
+
+
+def test_the_cli_takes_the_stale_spelling():
+    import scripts.retire_superseded_brand_keys as tool
+    captured = {}
+
+    async def fake_run(a):
+        captured.update(vars(a))
+        return 0
+
+    orig = tool.run
+    tool.run = fake_run
+    try:
+        tool.main(["--domain", "stilacosmetics.com", "--brand", "Stila", "--stale-brand", "Stila Cosmetics",
+                   "--category", "beauty"])
+    finally:
+        tool.run = orig
+    assert captured["stale_brand"] == "Stila Cosmetics" and captured["brand"] == "Stila"
+
+
+# --- review of #2397: retire only what the re-run actually rewrote, and only this store's rows ---------
+
+from scripts.retire_superseded_brand_keys import select_retirable  # noqa: E402
+
+_C = [{"stale_key": f"old{i}", "new_key": f"new{i}", "brand": "Stila", "title": f"T{i}"} for i in range(5)]
+
+
+def _rows(**over):
+    base = {f"old{i}": {"product_key": f"old{i}", "source_domain": "stilacosmetics.com", "suppression_reason": None}
+            for i in range(5)}
+    for k, v in over.items():
+        base[k] = {**base[k], **v}
+    return base
+
+
+def test_a_stale_key_is_retired_only_once_its_new_key_is_live():
+    """Measured: 72 of stilacosmetics.com's 125 records were unresolved, and the drain drops those; retiring
+    their stale keys first would have hidden the products."""
+    out = select_retirable(_C, _rows(), new_live={"new0", "new1"}, domain="stilacosmetics.com")
+    assert [c["stale_key"] for c in out["live"]] == ["old0", "old1"]
+    assert [c["stale_key"] for c in out["waiting_for_new_key"]] == ["old2", "old3", "old4"]
+
+
+def test_another_sources_row_under_the_same_key_is_never_retired():
+    rows = _rows(old0={"source_domain": "someretailer.com"}, old1={"source_domain": None})
+    out = select_retirable(_C, rows, new_live={f"new{i}" for i in range(5)}, domain="www.stilacosmetics.com")
+    assert {c["stale_key"] for c in out["foreign"]} == {"old0", "old1"}
+    assert {c["stale_key"] for c in out["live"]} == {"old2", "old3", "old4"}   # www. is the same store
+
+
+def test_absent_and_already_suppressed_keys_are_left_alone():
+    rows = _rows(old0={"suppression_reason": "x"})
+    del rows["old1"]
+    out = select_retirable(_C, rows, new_live={f"new{i}" for i in range(5)}, domain="stilacosmetics.com")
+    assert {c["stale_key"] for c in out["live"]} == {"old2", "old3", "old4"}
+    assert {c["stale_key"] for c in out["present"]} == {"old0", "old2", "old3", "old4"}
+
+
+def test_the_old_order_is_an_explicit_choice():
+    out = select_retirable(_C, _rows(), new_live=set(), domain="stilacosmetics.com", before_rewrite=True)
+    assert len(out["live"]) == 5 and out["waiting_for_new_key"] == []
+
+
+def test_the_cli_plumbs_both_flags_into_the_plan(monkeypatch):
+    import scripts.retire_superseded_brand_keys as tool
+    seen = {}
+
+    async def fake_plan(domain, brand, category, stale_brand=None, *, before_rewrite=False):
+        seen.update(domain=domain, brand=brand, stale_brand=stale_brand, before_rewrite=before_rewrite)
+        return {"domain": domain, "brand_override": brand, "stale_brand": stale_brand, "cohort": [], "present": [],
+                "live": [], "already_new": [], "seeds": [], "active_seeds": [], "offers": []}
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(tool, "plan", fake_plan)
+    monkeypatch.setattr(tool.database, "connect", noop)
+    monkeypatch.setattr(tool.database, "disconnect", noop)
+    assert tool.main(["--domain", "stilacosmetics.com", "--brand", "Stila", "--stale-brand", "Stila Cosmetics",
+                      "--category", "beauty"]) == 0
+    assert seen == {"domain": "stilacosmetics.com", "brand": "Stila", "stale_brand": "Stila Cosmetics",
+                    "before_rewrite": False}
+
+
+@pytest.mark.asyncio
+async def test_plan_passes_the_stale_spelling_to_the_cohort(monkeypatch):
+    import scripts.retire_superseded_brand_keys as tool
+    seen = {}
+
+    async def fake_cohort(domain, brand, category_path, stale_brand=None):
+        seen["stale_brand"] = stale_brand
+        return []
+
+    async def fetch_all(sql, values=None):
+        return []
+
+    async def cascade(keys, apply=False):
+        return []
+
+    monkeypatch.setattr(tool, "build_cohort", fake_cohort)
+    monkeypatch.setattr(tool.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(tool, "cascade_for_suppressed_product_keys", cascade)
+    p = await tool.plan("tartecosmetics.com", "Tarte", "beauty", "Tarte Cosmetics")
+    assert seen["stale_brand"] == "Tarte Cosmetics" and p["stale_brand"] == "Tarte Cosmetics"
+
+
+def test_the_cli_plumbs_the_old_order_flag(monkeypatch):
+    import scripts.retire_superseded_brand_keys as tool
+    seen = {}
+
+    async def fake_plan(domain, brand, category, stale_brand=None, *, before_rewrite=False):
+        seen["before_rewrite"] = before_rewrite
+        return {"domain": domain, "brand_override": brand, "stale_brand": stale_brand, "cohort": [], "present": [],
+                "live": [], "already_new": [], "seeds": [], "active_seeds": [], "offers": []}
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(tool, "plan", fake_plan)
+    monkeypatch.setattr(tool.database, "connect", noop)
+    monkeypatch.setattr(tool.database, "disconnect", noop)
+    tool.main(["--domain", "x.com", "--brand", "X", "--before-rewrite"])
+    assert seen["before_rewrite"] is True
+
+
+def _plan_env(monkeypatch, *, new_rows):
+    """plan() against a fake DB: two stale rows on the store, new keys as given; seeds/offers recorded."""
+    import scripts.retire_superseded_brand_keys as tool
+    cohort = [{"stale_key": "old0", "new_key": "new0", "brand": "Stila", "title": "A"},
+              {"stale_key": "old1", "new_key": "new1", "brand": "Stila", "title": "B"}]
+    stale_rows = [{"product_key": k, "source_domain": "stilacosmetics.com", "suppression_reason": None,
+                   "suppressed_at": None, "suppression_metadata": None, "merchant_id": "m", "brand": "Stila Cosmetics",
+                   "title": t} for k, t in (("old0", "A"), ("old1", "B"))]
+    asked = {"seeds": None, "offers": None}
+
+    async def fake_cohort(*a, **k):
+        return cohort
+
+    async def fetch_all(sql, values=None):
+        keys = (values or {}).get("keys") or []
+        if "external_product_seeds" in sql:
+            asked["seeds"] = list(keys)
+            return [{"id": f"seed_{k}", "status": "active"} for k in keys]
+        if keys and keys[0].startswith("old"):
+            return [r for r in stale_rows if r["product_key"] in keys]
+        return [r for r in new_rows if r["product_key"] in keys]
+
+    async def cascade(keys, apply=False):
+        asked["offers"] = list(keys)
+        return [f"off_{k}" for k in keys]
+
+    monkeypatch.setattr(tool, "build_cohort", fake_cohort)
+    monkeypatch.setattr(tool.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(tool, "cascade_for_suppressed_product_keys", cascade)
+    return tool, asked
+
+
+@pytest.mark.asyncio
+async def test_plan_retires_only_rewritten_keys_and_scopes_seeds_and_offers_to_them(monkeypatch):
+    new_rows = [
+        {"product_key": "new0", "source_domain": "www.stilacosmetics.com", "suppression_reason": None},  # rewritten
+        {"product_key": "new1", "source_domain": "stilacosmetics.com", "suppression_reason": "x"},        # suppressed
+    ]
+    tool, asked = _plan_env(monkeypatch, new_rows=new_rows)
+    p = await tool.plan("stilacosmetics.com", "Stila", "beauty", "Stila Cosmetics")
+    assert [c["stale_key"] for c in p["live"]] == ["old0"]
+    assert [c["stale_key"] for c in p["waiting_for_new_key"]] == ["old1"]
+    assert asked["seeds"] == ["old0"] and asked["offers"] == ["old0"]
+    assert [s["id"] for s in p["active_seeds"]] == ["seed_old0"]
+
+
+@pytest.mark.asyncio
+async def test_another_sources_new_key_does_not_count_as_the_rewrite(monkeypatch):
+    new_rows = [{"product_key": "new0", "source_domain": "someretailer.com", "suppression_reason": None}]
+    tool, asked = _plan_env(monkeypatch, new_rows=new_rows)
+    p = await tool.plan("stilacosmetics.com", "Stila", "beauty", "Stila Cosmetics")
+    assert p["live"] == [] and len(p["waiting_for_new_key"]) == 2 and p["seeds"] == [] and p["offers"] == []

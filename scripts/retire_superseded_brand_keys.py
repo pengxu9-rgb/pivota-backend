@@ -20,7 +20,13 @@ THE COHORT IS RE-DERIVED, NEVER PASSED IN. It comes from `records_for_brand` —
 call the re-onboard makes — so the set retired here cannot drift from the set superseded
 there. A key whose brand the fix did NOT move is not in the cohort by construction.
 
-ORDER. Run this BEFORE the re-onboard. The two key sets are disjoint, so a suppressed
+ORDER. Run this AFTER the re-onboard has applied: a stale key is retired only once its NEW key is
+live (review of #2397 -- the drain's re-run drops unresolved rows, excluded handles and refused plan
+rows, and a job can sit held for review; measured 2026-09-27, 72 of stilacosmetics.com's 125 records
+were unresolved, so retiring first would have hidden them). Both rows of a pair serving for a while is
+the status quo; a missing product is not. --before-rewrite restores the old order explicitly.
+
+(Formerly: run this BEFORE the re-onboard.) The two key sets are disjoint, so a suppressed
 stale SKU cannot collide with a new one (`_SKU_SUPPRESSED_IDENTITY_SQL` guards on a
 matching `product_key`, and ours differ) — but retiring first means the storefront is
 never simultaneously serving both rows of a pair.
@@ -35,6 +41,10 @@ DRY-RUN BY DEFAULT. Nothing is written without --apply.
   DATABASE_URL=... python3 scripts/retire_superseded_brand_keys.py \
       --domain misshaus.com --brand Missha --category beauty/skincare \
       --apply --manifest /tmp/retire_misshaus.json
+
+  # a store written under another spelling and re-run under the canonical one:
+  DATABASE_URL=... python3 scripts/retire_superseded_brand_keys.py \
+      --domain tartecosmetics.com --brand Tarte --stale-brand "Tarte Cosmetics" --category beauty
 
   # 3. undo the whole run
   DATABASE_URL=... python3 scripts/retire_superseded_brand_keys.py \
@@ -67,7 +77,7 @@ from services.curated_brand_feed import records_for_brand  # noqa: E402
 REASON = "brand_attribution_key_supersede"
 
 LIVE_ROWS_SQL = """
-SELECT product_key, merchant_id, brand, title, suppression_reason, suppressed_at,
+SELECT product_key, merchant_id, brand, title, source_domain, suppression_reason, suppressed_at,
        suppression_metadata
 FROM catalog_products
 WHERE product_key = ANY(:keys)
@@ -115,11 +125,19 @@ def _as_json_text(value: Any) -> Optional[str]:
     return json.dumps(value)
 
 
-async def build_cohort(domain: str, brand: str, category_path: str) -> List[Dict[str, Any]]:
+async def build_cohort(domain: str, brand: str, category_path: str,
+                       stale_brand: Optional[str] = None) -> List[Dict[str, Any]]:
     """(stale_key, new_key, brand, title) for every record the fix re-keyed.
 
     `emit_real_variants=True` mirrors the re-onboard invocation; it does not affect the
     key, but keeping the two calls identical is what makes the cohorts provably the same.
+
+    `stale_brand`: the spelling the OLD rows were written under, when it is not the re-run's brand. A
+    store once written as "Tarte Cosmetics" / "Stila Cosmetics" / "Tower 28 Beauty" and re-run as
+    "Tarte" / "Stila" / "Tower 28" moves every key from derive(stale_brand, title) to
+    derive(record brand, title); without it the stale key is derived from the re-run's own brand and
+    the cohort comes back empty (the Sand & Sky case, 2026-09-26). Keys that were never written under
+    the stale spelling are simply absent from catalog_products, and `plan` never retires an absent key.
     """
     recs = await records_for_brand(
         domain=domain, category_path=category_path, brand=brand, emit_real_variants=True
@@ -128,25 +146,55 @@ async def build_cohort(domain: str, brand: str, category_path: str) -> List[Dict
     for rec in recs:
         pdp = rec.get("pdp") or {}
         title, new_brand = pdp.get("product_name"), pdp.get("brand")
-        stale, new = derive_product_key(brand, title), derive_product_key(new_brand, title)
+        stale, new = derive_product_key(stale_brand or brand, title), derive_product_key(new_brand, title)
         if stale and new and stale != new:
             out.append({"stale_key": stale, "new_key": new, "brand": new_brand, "title": title})
     return out
 
 
-async def plan(domain: str, brand: str, category_path: str) -> Dict[str, Any]:
-    cohort = await build_cohort(domain, brand, category_path)
+def _host(value: Optional[str]) -> str:
+    return str(value or "").strip().lower().removeprefix("www.")
+
+
+def select_retirable(cohort: List[Dict[str, Any]], rows: Dict[str, Dict[str, Any]], new_live: set,
+                     domain: str, *, before_rewrite: bool = False) -> Dict[str, List[Dict[str, Any]]]:
+    """Pure: split the cohort into what may be tombstoned and why the rest may not.
+
+    A stale key is retirable only when it is present and live, owned by THIS store (derive_product_key
+    hashes (brand, title) only, so the same key can belong to another source -- never touch it), and,
+    unless before_rewrite, its new key is already live (the re-run actually wrote the product)."""
+    host = _host(domain)
+    present = [c for c in cohort if c["stale_key"] in rows]
+    live = [c for c in present if not rows[c["stale_key"]].get("suppression_reason")]
+    foreign = [c for c in live if _host(rows[c["stale_key"]].get("source_domain")) != host]
+    own = [c for c in live if c not in foreign]
+    waiting = [] if before_rewrite else [c for c in own if c["new_key"] not in new_live]
+    retire = [c for c in own if c not in waiting]
+    return {"present": present, "live": retire, "foreign": foreign, "waiting_for_new_key": waiting}
+
+
+async def plan(domain: str, brand: str, category_path: str,
+               stale_brand: Optional[str] = None, *, before_rewrite: bool = False) -> Dict[str, Any]:
+    cohort = await build_cohort(domain, brand, category_path, stale_brand)
     stale_keys = [c["stale_key"] for c in cohort]
     new_keys = [c["new_key"] for c in cohort]
     rows = {r["product_key"]: dict(r) for r in await database.fetch_all(LIVE_ROWS_SQL, {"keys": stale_keys})}
-    already_new = {r["product_key"] for r in await database.fetch_all(LIVE_ROWS_SQL, {"keys": new_keys})}
-    seeds = [dict(r) for r in await database.fetch_all(SEEDS_FOR_KEYS_SQL, {"keys": stale_keys})]
-    offers = await cascade_for_suppressed_product_keys(stale_keys, apply=False)
-
-    present = [c for c in cohort if c["stale_key"] in rows]
-    live = [c for c in present if not rows[c["stale_key"]].get("suppression_reason")]
+    new_rows = [dict(r) for r in await database.fetch_all(LIVE_ROWS_SQL, {"keys": new_keys})]
+    already_new = {r["product_key"] for r in new_rows}
+    # A new key counts only when THIS store's re-run wrote it (live, own source_domain): another source's row
+    # under the same (brand, title) key proves nothing about the re-run (re-review of #2397).
+    new_live = {r["product_key"] for r in new_rows
+                if not r.get("suppression_reason") and _host(r.get("source_domain")) == _host(domain)}
+    split = select_retirable(cohort, rows, new_live, domain, before_rewrite=before_rewrite)
+    present, live = split["present"], split["live"]
+    # Seeds and offers for the keys this run will actually retire -- never a waiting or foreign key, so the
+    # plan's counts are true and revert's manifest names only seeds this run deactivates.
+    retire_keys = [c["stale_key"] for c in live]
+    seeds = [dict(r) for r in await database.fetch_all(SEEDS_FOR_KEYS_SQL, {"keys": retire_keys})] if retire_keys else []
+    offers = await cascade_for_suppressed_product_keys(retire_keys, apply=False) if retire_keys else []
     return {
-        "domain": domain, "brand_override": brand, "category_path": category_path,
+        "foreign": split["foreign"], "waiting_for_new_key": split["waiting_for_new_key"],
+        "domain": domain, "brand_override": brand, "category_path": category_path, "stale_brand": stale_brand,
         "cohort": cohort, "rows": rows, "present": present, "live": live,
         "already_new": sorted(already_new), "seeds": seeds,
         "active_seeds": [s for s in seeds if str(s.get("status") or "").lower() == "active"],
@@ -156,9 +204,13 @@ async def plan(domain: str, brand: str, category_path: str) -> Dict[str, Any]:
 
 def print_plan(p: Dict[str, Any]) -> None:
     print(f"domain            : {p['domain']}  (brand override {p['brand_override']!r})")
-    print(f"re-keyed by #2173 : {len(p['cohort'])}")
+    if p.get("stale_brand"):
+        print(f"stale spelling    : {p['stale_brand']!r}  (old rows' keys derive from it)")
+    print(f"re-keyed          : {len(p['cohort'])}")
     print(f"  present in catalog_products : {len(p['present'])}")
     print(f"  LIVE (would be tombstoned)  : {len(p['live'])}")
+    print(f"  WAITING (new key not live)  : {len(p.get('waiting_for_new_key') or [])}  -- never retired")
+    print(f"  FOREIGN (another source)    : {len(p.get('foreign') or [])}  -- never retired")
     print(f"  already suppressed          : {len(p['present']) - len(p['live'])}")
     print(f"  absent from catalog         : {len(p['cohort']) - len(p['present'])}")
     print(f"seeds attached    : {len(p['seeds'])}  (active, would deactivate: {len(p['active_seeds'])})")
@@ -179,15 +231,19 @@ async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
         return {}
     run_id = f"retire_{uuid.uuid4().hex[:12]}"
     metadata = json.dumps({
-        "run_id": run_id, "reason": REASON, "pr": "pivota-backend#2173",
-        "domain": p["domain"], "brand_override": p["brand_override"],
-        "note": "product_key superseded when the brand override stopped relabelling a sibling brand",
+        "run_id": run_id, "reason": REASON,
+        "pr": "pivota-backend#2173" if not p.get("stale_brand") else "stale-brand re-key",
+        "domain": p["domain"], "brand_override": p["brand_override"], "stale_brand": p.get("stale_brand"),
+        "note": ("product_key superseded when the brand override stopped relabelling a sibling brand"
+                 if not p.get("stale_brand") else
+                 f"product_key superseded: rows written as {p['stale_brand']!r} re-run as {p['brand_override']!r}"),
         "at": datetime.now(timezone.utc).isoformat(),
     })
     # BEFORE-state first: a manifest written after the write cannot describe what it replaced.
     manifest = {
         "run_id": run_id, "reason": REASON, "domain": p["domain"],
         "brand_override": p["brand_override"], "category_path": p["category_path"],
+        "stale_brand": p.get("stale_brand"),
         "at": datetime.now(timezone.utc).isoformat(),
         "products": [
             {
@@ -251,7 +307,8 @@ async def run(args: argparse.Namespace) -> int:
         if args.command == "revert":
             await revert(args.manifest)
             return 0
-        p = await plan(args.domain, args.brand, args.category)
+        p = await plan(args.domain, args.brand, args.category, args.stale_brand,
+                       before_rewrite=args.before_rewrite)
         print_plan(p)
         if not args.apply:
             print("\nDRY-RUN — re-run with --apply (and --manifest) to tombstone.")
@@ -271,6 +328,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--domain")
     p.add_argument("--brand")
     p.add_argument("--category", default="beauty/skincare")
+    p.add_argument("--before-rewrite", dest="before_rewrite", action="store_true",
+                   help="retire stale keys even when their new key is not live yet (the old order)")
+    p.add_argument("--stale-brand", dest="stale_brand",
+                   help="the spelling the OLD rows were written under, when the re-run uses another")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--manifest")
     a = p.parse_args(argv)
