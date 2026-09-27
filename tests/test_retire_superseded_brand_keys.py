@@ -266,3 +266,57 @@ def test_the_cli_plumbs_the_old_order_flag(monkeypatch):
     monkeypatch.setattr(tool.database, "disconnect", noop)
     tool.main(["--domain", "x.com", "--brand", "X", "--before-rewrite"])
     assert seen["before_rewrite"] is True
+
+
+def _plan_env(monkeypatch, *, new_rows):
+    """plan() against a fake DB: two stale rows on the store, new keys as given; seeds/offers recorded."""
+    import scripts.retire_superseded_brand_keys as tool
+    cohort = [{"stale_key": "old0", "new_key": "new0", "brand": "Stila", "title": "A"},
+              {"stale_key": "old1", "new_key": "new1", "brand": "Stila", "title": "B"}]
+    stale_rows = [{"product_key": k, "source_domain": "stilacosmetics.com", "suppression_reason": None,
+                   "suppressed_at": None, "suppression_metadata": None, "merchant_id": "m", "brand": "Stila Cosmetics",
+                   "title": t} for k, t in (("old0", "A"), ("old1", "B"))]
+    asked = {"seeds": None, "offers": None}
+
+    async def fake_cohort(*a, **k):
+        return cohort
+
+    async def fetch_all(sql, values=None):
+        keys = (values or {}).get("keys") or []
+        if "external_product_seeds" in sql:
+            asked["seeds"] = list(keys)
+            return [{"id": f"seed_{k}", "status": "active"} for k in keys]
+        if keys and keys[0].startswith("old"):
+            return [r for r in stale_rows if r["product_key"] in keys]
+        return [r for r in new_rows if r["product_key"] in keys]
+
+    async def cascade(keys, apply=False):
+        asked["offers"] = list(keys)
+        return [f"off_{k}" for k in keys]
+
+    monkeypatch.setattr(tool, "build_cohort", fake_cohort)
+    monkeypatch.setattr(tool.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(tool, "cascade_for_suppressed_product_keys", cascade)
+    return tool, asked
+
+
+@pytest.mark.asyncio
+async def test_plan_retires_only_rewritten_keys_and_scopes_seeds_and_offers_to_them(monkeypatch):
+    new_rows = [
+        {"product_key": "new0", "source_domain": "www.stilacosmetics.com", "suppression_reason": None},  # rewritten
+        {"product_key": "new1", "source_domain": "stilacosmetics.com", "suppression_reason": "x"},        # suppressed
+    ]
+    tool, asked = _plan_env(monkeypatch, new_rows=new_rows)
+    p = await tool.plan("stilacosmetics.com", "Stila", "beauty", "Stila Cosmetics")
+    assert [c["stale_key"] for c in p["live"]] == ["old0"]
+    assert [c["stale_key"] for c in p["waiting_for_new_key"]] == ["old1"]
+    assert asked["seeds"] == ["old0"] and asked["offers"] == ["old0"]
+    assert [s["id"] for s in p["active_seeds"]] == ["seed_old0"]
+
+
+@pytest.mark.asyncio
+async def test_another_sources_new_key_does_not_count_as_the_rewrite(monkeypatch):
+    new_rows = [{"product_key": "new0", "source_domain": "someretailer.com", "suppression_reason": None}]
+    tool, asked = _plan_env(monkeypatch, new_rows=new_rows)
+    p = await tool.plan("stilacosmetics.com", "Stila", "beauty", "Stila Cosmetics")
+    assert p["live"] == [] and len(p["waiting_for_new_key"]) == 2 and p["seeds"] == [] and p["offers"] == []

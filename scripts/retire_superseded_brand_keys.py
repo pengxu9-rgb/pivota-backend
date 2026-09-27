@@ -179,14 +179,19 @@ async def plan(domain: str, brand: str, category_path: str,
     stale_keys = [c["stale_key"] for c in cohort]
     new_keys = [c["new_key"] for c in cohort]
     rows = {r["product_key"]: dict(r) for r in await database.fetch_all(LIVE_ROWS_SQL, {"keys": stale_keys})}
-    already_new = {r["product_key"] for r in await database.fetch_all(LIVE_ROWS_SQL, {"keys": new_keys})}
-    seeds = [dict(r) for r in await database.fetch_all(SEEDS_FOR_KEYS_SQL, {"keys": stale_keys})]
-    offers = await cascade_for_suppressed_product_keys(stale_keys, apply=False)
-
-    new_live = {r["product_key"] for r in await database.fetch_all(LIVE_ROWS_SQL, {"keys": new_keys})
-                if not dict(r).get("suppression_reason")}
+    new_rows = [dict(r) for r in await database.fetch_all(LIVE_ROWS_SQL, {"keys": new_keys})]
+    already_new = {r["product_key"] for r in new_rows}
+    # A new key counts only when THIS store's re-run wrote it (live, own source_domain): another source's row
+    # under the same (brand, title) key proves nothing about the re-run (re-review of #2397).
+    new_live = {r["product_key"] for r in new_rows
+                if not r.get("suppression_reason") and _host(r.get("source_domain")) == _host(domain)}
     split = select_retirable(cohort, rows, new_live, domain, before_rewrite=before_rewrite)
     present, live = split["present"], split["live"]
+    # Seeds and offers for the keys this run will actually retire -- never a waiting or foreign key, so the
+    # plan's counts are true and revert's manifest names only seeds this run deactivates.
+    retire_keys = [c["stale_key"] for c in live]
+    seeds = [dict(r) for r in await database.fetch_all(SEEDS_FOR_KEYS_SQL, {"keys": retire_keys})] if retire_keys else []
+    offers = await cascade_for_suppressed_product_keys(retire_keys, apply=False) if retire_keys else []
     return {
         "foreign": split["foreign"], "waiting_for_new_key": split["waiting_for_new_key"],
         "domain": domain, "brand_override": brand, "category_path": category_path, "stale_brand": stale_brand,
