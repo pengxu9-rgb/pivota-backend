@@ -61,6 +61,8 @@ def test_the_candidate_query_only_fills_an_empty_served_brand_row():
     assert "w.suppressed_at IS NULL" in sql and "r.suppressed_at IS NULL" in sql
     assert "AND w.content_key = apv.content_key" in sql       # an orphan view row cannot pick the target
     assert "AND w.platform = 'external_seed'" in sql          # never a connected merchant's synced row
+    own = " ".join(fill_mod.OWN_INCI_SQL.split())
+    assert "WHERE product_key = :pk AND coalesce(trim(raw_inci), '') <> ''" in own
 
 
 def test_the_fill_rank_can_never_replace_the_brands_own_inci_and_is_replaced_by_it():
@@ -123,7 +125,11 @@ async def test_inci_that_appeared_after_planning_is_never_written_over(monkeypat
                                       "beauty/accessories/makeup-bag", "beauty/skincare/sets",
                                       "beauty/oral-care/teeth-whitening-devices",
                                       # alias-only: no telltale segment until folded (category_path_aliases)
-                                      "beauty/skincare/bundle", "beauty/mystery-box"])
+                                      "beauty/skincare/bundle", "beauty/mystery-box",
+                                      # re-review: words inside a segment, and a non-beauty prefix
+                                      "beauty/accessory/soap_dish", "beauty/bath/accessory/soap-saver",
+                                      "beauty/travel/toiletry-bag", "beauty/travel/organizer",
+                                      "beauty/skincare/sunscreen/refillable-case", "beautyfoo"])
 def test_a_product_without_a_formula_is_never_given_one(category):
     """Measured: shoprescuespa.com's 3-item 'INCI' for Westman Atelier's brushes is a materials list."""
     fills, counts = fill_mod.plan_fills([_row("ext:retailer:a", category=category)])
@@ -137,6 +143,8 @@ def test_a_product_without_a_formula_is_never_given_one(category):
     "Water, Glycerin, Niacinamide, Panthenol",             # four: under the minimum
     # long enough, but benefit copy (the crawl lane's prose filter)
     "Boosts hydration, soothes redness, brightens tone, reduces pores, helps the barrier",
+    "Key Ingredients: Niacinamide, Hyaluronic Acid, Panthenol, Allantoin, Ceramide NP",
+    "Vegan, Cruelty free, Paraben free, Sulfate free, Fragrance free",
 ])
 def test_a_label_claims_or_materials_list_is_not_an_inci(raw):
     fills, counts = fill_mod.plan_fills([_row("ext:retailer:a", raw=raw, category="beauty/makeup")])

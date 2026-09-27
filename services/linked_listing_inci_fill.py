@@ -16,6 +16,7 @@ Rules -- a fill only ever lands in an empty slot:
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 from services.beauty_enrichment import parse_inci
@@ -31,6 +32,14 @@ RETAILER_LISTING_PREFIX = "ext:retailer:"
 # (review of #2395).
 NO_FORMULA_SEGMENTS = frozenset({"tools", "devices", "sets", "gift-set", "accessories", "false-lashes",
                                  "lashes", "false_lashes", "press-on-nails", "teeth-whitening-devices"})
+# ...and WORDS inside a segment ("soap_dish", "refillable-case", "toiletry-bag"; re-review of #2395).
+NO_FORMULA_WORDS = frozenset({"tool", "tools", "device", "devices", "set", "sets", "accessory", "accessories",
+                              "lash", "lashes", "travel", "case", "bag", "organizer", "dish", "saver", "brush",
+                              "sponge", "applicator", "press"})
+#: A highlights label or a free-from claims list is not the full ingredient list.
+_LABEL_OR_CLAIMS_RE = re.compile(r"\bkey\s+ingredients?\b|\bhero\s+ingredients?\b|\bcruelty[\s-]*free\b|"
+                                 r"\b(?:paraben|sulfate|sulphate|fragrance|silicone|alcohol)[\s-]*free\b|\bvegan\b",
+                                 re.IGNORECASE)
 #: A retailer "INCI" shorter than this is a label or a materials list, not a formula
 #: ("Key ingredients: Niacinamide, Hyaluronic Acid", "Synthetic Fibers, Wood, Aluminum").
 MIN_INGREDIENTS = 5
@@ -40,10 +49,13 @@ def _has_formula(category_path: Any) -> bool:
     from services.category_path_aliases import resolve
 
     raw = str(category_path or "").strip().lower()
-    if not raw.startswith("beauty"):
+    if not raw.startswith("beauty/"):
         return False
     for path in (raw, str(resolve(raw) or "").lower()):
-        if NO_FORMULA_SEGMENTS & set(path.split("/")):
+        segments = [x for x in path.split("/") if x]
+        if NO_FORMULA_SEGMENTS & set(segments):
+            return False
+        if NO_FORMULA_WORDS & {w for seg in segments[1:] for w in re.split(r"[-_]", seg)}:
             return False
     return True
 
@@ -53,6 +65,8 @@ def _is_fillable_inci(raw_inci: Any) -> bool:
     from services.crawled_inci_ingest import _is_skippable_inci
 
     text = str(raw_inci or "")
+    if _LABEL_OR_CLAIMS_RE.search(text):
+        return False
     return is_valid_inci(text) and not _is_skippable_inci(text) and len(_ingredients(text)) >= MIN_INGREDIENTS
 
 # One row per (served brand product, linked retailer listing that carries INCI), for brand products with
