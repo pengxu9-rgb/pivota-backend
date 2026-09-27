@@ -112,6 +112,12 @@ def test_a_brush_type_with_a_brush_title_is_a_brush(ptype, title):
     ("Gel Polish Brush", "Gel Polish Brush"),
     ("Dip Powder Brush", "Dip Powder Brush"),
     ("Nail Polish Brush", "the buffer™ brush"),              # only the TYPE names nails
+    # re-review of #2403: a formula and a bare brush
+    ("Eyeliner Brush", "Gel Liner & Brush"),
+    ("Eyeliner Brush", "Gel Liner + Angled Brush"),
+    ("Eyeliner Brush", "Brow Pomade & Brush"),
+    ("Eyeshadow Brush", "Loose Pigment & Brush"),
+    ("Concealer Brush", "Concealer Plus Brush"),
     ("Foundation Brush", "nail polish brush"),               # only the TITLE names nails
     # the type's head noun must be the tool: a two-formula type is not a brush type
     ("Concealer, Foundation", "the buffer™ brush"),
@@ -162,6 +168,17 @@ def test_the_head_noun_names_the_product_on_a_measured_title_host(domain, ptype,
     ("tower28beauty.com", "", "SOS Hair Claw Clip"),
     ("tower28beauty.com", "", "BeachPlease Blush Sweater"),   # a fashion head no accessory word names
     ("tower28beauty.com", "", "The Sunset Sweater"),          # ...and one naming no beauty leaf at all
+    # re-review of #2403: another area in the suffix, a wand
+    ("tower28beauty.com", "", "SuperDew Highlighter (Face & Body)"),
+    ("tower28beauty.com", "", "SuperDew Highlighter - Body Edition"),
+    ("tower28beauty.com", "", "BeachPlease Cream Blush (Lip + Cheek)"),
+    ("tower28beauty.com", "", "MakeWaves Mascara Wand"),
+    # a leaf with no area row is refused, never raised (nails, lashes)
+    ("tower28beauty.com", "", "Gel Nail Polish"),
+    ("stilacosmetics.com", "Sale", "Stay All Day Top Coat"),
+    ("tower28beauty.com", "", "Press On Nails"),
+    ("tower28beauty.com", "", "Cuticle Oil Pen"),
+    ("stilacosmetics.com", "Eye Products", "Dip Powder"),
     ("tower28beauty.com", "", "SOS Serum Glow Foundation"),   # a texture word NOT right before the head
 ])
 def test_the_head_noun_rule_refuses_another_area_accessories_merch_and_two_products(domain, ptype, title):
@@ -217,6 +234,19 @@ def test_a_refusal_and_a_resolved_row_are_never_touched():
     assert resolve("Blush", "Stay All Day® Chroma-Flash Liquid Eye Liner", "stilacosmetics.com")[0] == ""
     # A merchant type that names its class resolves at merchant confidence, not the head-noun rule's.
     assert resolve("Mascara", "MakeWaves® Mascara", "tower28beauty.com")[1] == feed.CATEGORY_CONFIDENCE_MERCHANT_TYPE
+
+
+def test_every_head_the_rule_can_pick_has_an_area_row_or_is_refused():
+    from services.pdp_category_classifier import CATEGORY_PATTERNS
+    for _label, path, _pattern in CATEGORY_PATTERNS:
+        if path.startswith(("beauty/makeup/", "beauty/skincare/")) and not path.startswith(feed._LIP_LEAF_PREFIX):
+            rows = [areas for prefix, areas in feed._HEAD_AREAS if path.startswith(prefix)]
+            assert rows or path.startswith(("beauty/makeup/nails/",)) or "lash" in path, path
+
+
+def test_a_lip_shelf_keeps_a_balm_named_after_a_mirror_or_an_applicator():
+    assert resolve("Lip Balms", "Mirror Glow Lip Balm", "sokoglam.com")[0] == "beauty/makeup/lip/balm"
+    assert resolve("Lip Balms", "Lip Balm with Applicator", "sokoglam.com")[0] == "beauty/makeup/lip/balm"
 
 
 def test_the_new_confidences_are_no_other_writers_value():

@@ -1676,7 +1676,13 @@ _TOOL_TYPE_FORMULA_CONTEXT = re.compile(r"\b(?:with|includes?|including|for|usin
 # ...and a title split at a joiner is a brush only when no part BEFORE the last names a product:
 # "Gel Eyeliner + Angled Brush", "CC undereye & mini brush", "Concealer, Brush" are a formula and a
 # brush (review of #2403).
-_TOOL_TITLE_JOINER = re.compile(r"\s*(?:[+&/,]|\s-\s|\band\b)\s*", re.I)
+_TOOL_TITLE_JOINER = re.compile(r"\s*(?:[+&/,]|\s-\s|\band\b|\bplus\b)\s*", re.I)
+# ...and after a joiner the brush must say what it is FOR ("liner brush", "buff concealer brush",
+# "cheek brush"), or "Gel Liner & Brush" / "Pomade + Angled Brush" is a formula and a bare brush.
+_BRUSH_USE_WORDS = re.compile(
+    r"\b(?:liner|shadow|shader|crease|smudge|smudger|blend(?:ing|er)?|buff(?:ing|er)?|detail(?:ing)?|cheek|eyes?|"
+    r"lips?|brows?|face|contour(?:ing)?|sculpt(?:ing)?|highlight(?:ing|er)?|powder|foundation|concealer|"
+    r"corrector|blush|bronz(?:er|ing)|kabuki|fan|stippl(?:e|ing)|complexion|setting|precision)\b", re.I)
 # The leaves a makeup brush's own name may carry: its use ("concealer brush") and texture words
 # ("cream foundation brush", "serum foundation brush"). Not skincare formulas ("Sunscreen Brush" is a
 # sunscreen dispensed through a brush) and not nails (a "Gel Polish Brush" is not a makeup tool).
@@ -1689,6 +1695,8 @@ def _is_makeup_brush_title(title: str) -> bool:
     from services.pdp_category_classifier import CATEGORY_PATTERNS
     parts = [x for x in _TOOL_TITLE_JOINER.split(title) if x.strip()]
     if not parts or not _TOOL_NOUN_SUFFIX.search(parts[-1]) or _TOOL_TYPE_FORMULA_CONTEXT.search(title):
+        return False
+    if len(parts) > 1 and not _BRUSH_USE_WORDS.search(_TOOL_NOUN_SUFFIX.sub(" ", parts[-1])):
         return False
     for part in parts[:-1]:
         if (_BRUSH_TITLE_FORMULA_WORDS.search(part)
@@ -1930,7 +1938,7 @@ def _measured_host_type_leaf(*, domain: Optional[str], product_type: Optional[st
 
 _SHELF_OWN_AREA = {"beauty/makeup/eye/brow": re.compile(r"\b(?:eye)?brows?\b", re.I)}
 _SHELF_TOOL_WORDS = re.compile(r"\b(?:spoolies?|razors?|tweezers?|scissors|stencils?|sharpeners?|brush(?:es)?|"
-                               r"curlers?|cases?|mirrors?|applicators?)\b", re.I)
+                               r"curlers?|cases?)\b", re.I)
 _SHELF_REQUIRES = {"beauty/tools/sponge": re.compile(r"\b(?:sponges?|puffs?|blenders?)\b", re.I)}
 
 
@@ -1993,7 +2001,7 @@ _HEAD_AREAS = (
 _TITLE_ACCESSORY_OR_GIVEAWAY = re.compile(
     r"\b(?:free|gwp|brush(?:es)?|sharpeners?|applicators?|cases?|holders?|pouch(?:es)?|mirrors?|removers?|"
     r"wipes?|organi[sz]ers?|bags?|totes?|clips?|tees?|t-?shirts?|shirts?|hoodies?|crewnecks?|sweatshirts?|"
-    r"hats?|caps?|refills?)\b", re.I)
+    r"hats?|caps?|refills?|wands?)\b", re.I)
 
 
 def _measured_host_title_leaf(*, domain: Optional[str], product_type: Optional[str],
@@ -2025,8 +2033,11 @@ def _measured_host_title_leaf(*, domain: Optional[str], product_type: Optional[s
     for path, (_start, end) in spans.items():
         if path != head and not (path in _TEXTURE_LEAVES and not name[end:head_start].strip()):
             return None
-    allowed = next(areas for prefix, areas in _HEAD_AREAS if head.startswith(prefix))
-    if any(pattern.search(name) for area, pattern in _TITLE_AREA_WORDS.items() if area not in allowed):
+    allowed = next((areas for prefix, areas in _HEAD_AREAS if head.startswith(prefix)), None)
+    if allowed is None:
+        return None  # a leaf with no area row (nails, lashes...) is not this rule's to place
+    # over the WHOLE title: a suffix can name another area ("Highlighter (Face & Body)")
+    if any(pattern.search(text) for area, pattern in _TITLE_AREA_WORDS.items() if area not in allowed):
         return None
     return head
 
