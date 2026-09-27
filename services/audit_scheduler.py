@@ -28,6 +28,9 @@ Job registration happens at start-up time. Currently registers:
   cadence than executor worker because verifiers are not latency-
   critical.
 - `verification_run_lease_reaper` — fires every 60 seconds.
+- `nightly_index_health` — 04:00 UTC, jobs/nightly_index_health_job. Paired with
+  `nightly_index_health_catchup` every 10 minutes, which re-runs a slot that has
+  no completed run in scheduled_job_completions (a deploy cut it mid-run).
 - `external_seed_catalog_materialization` — fires every 15 minutes,
   materializes newly crawled external_product_seeds into guarded catalog
   mirrors without public-serving promotion.
@@ -125,6 +128,9 @@ _JOB_RUN_DEADLINES = {
     # INLINE (gather of 3, each routinely >15 min): 4h.
     "daily_audit_check": 14400,
     "nightly_index_health": 7200,
+    # Runs the whole nightly job inline when its slot was cut (a worker deploy
+    # mid-run); an idle tick is one primary-key read. Same bound as the job.
+    "nightly_index_health_catchup": 7200,
     "outcome_aggregation_daily": 7200,
     "catalog_invariant_sweep": 7200,
     "identity_reconcile_sweep": 7200,
@@ -449,6 +455,23 @@ async def start_scheduler() -> None:
             id="nightly_index_health",
             replace_existing=True,
             misfire_grace_time=3600,
+            coalesce=True,
+        )
+
+        # The worker is rolled on every merge, and a shutdown cancels a run in
+        # flight; this in-memory store never re-fires the 04:00 slot that was cut
+        # (2 of ~30 nights, 2026-09-23 and 09-27). The catch-up re-runs a slot
+        # with no completed-run marker, 10+ min after it fired, under the job's
+        # own advisory lock. Idle ticks are a single-row read.
+        from jobs.nightly_index_health_job import run_nightly_index_health_catchup
+        _add_job(
+            run_nightly_index_health_catchup,
+            "interval",
+            minutes=10,
+            id="nightly_index_health_catchup",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=600,
             coalesce=True,
         )
 

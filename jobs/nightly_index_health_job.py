@@ -68,6 +68,10 @@ Design notes:
   - A second-pass UPDATE applies extractor_regression blocker.
   - Best-effort per-batch: errors are caught and logged, job continues.
   - Advisory lock prevents double-runs from cron misfire stacking.
+  - A run that reaches the end records its cron slot in scheduled_job_completions;
+    `run_nightly_index_health_catchup` (every 10 min) re-runs a slot that has no
+    completed run — a worker deploy near 04:00 cancels the run in flight and the
+    new revision's scheduler never re-fires the slot it cut.
 """
 
 from __future__ import annotations
@@ -75,7 +79,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from services.index_pipeline_state_service import (
@@ -104,6 +108,19 @@ DEGRADED_THRESHOLD = 0.10    # coverage drop > 10% → 'degraded'
 REGRESSION_THRESHOLD = 0.20  # coverage drop > 20% → 'regression'
 MIN_DOMAIN_SAMPLE = 5        # minimum products per domain for scoring
 BATCH_SIZE = 500
+
+# The cron slot services/audit_scheduler.py registers this job at (UTC).
+JOB_ID = "nightly_index_health"
+SLOT_HOUR = 4
+SLOT_MINUTE = 0
+
+# The catch-up leaves a slot alone for this long after it fires, so it never races
+# the scheduled run it is backing up (that run takes ~5 min on prod's ~23.5k keys).
+CATCHUP_MIN_DELAY = timedelta(minutes=10)
+# Real (not lock-skipped) catch-up runs per slot per process. Bounds the one bad
+# case: a run that completes but cannot write its marker would otherwise repeat
+# every catch-up tick until the next slot.
+CATCHUP_MAX_RUNS_PER_SLOT = 3
 
 # Stable signed-int64 advisory lock id for this job.
 # Derived from the job name so it never collides with per-merchant locks.
@@ -621,6 +638,34 @@ async def _submit_indexnow_transitions(
 
 
 # ---------------------------------------------------------------------------
+# Cron slot bookkeeping
+# ---------------------------------------------------------------------------
+
+def latest_slot(now: datetime) -> datetime:
+    """The most recent SLOT_HOUR:SLOT_MINUTE UTC at or before `now` — the slot a
+    run started at `now` covers, and the slot that should have run by `now`."""
+    now = now.astimezone(timezone.utc)
+    slot = now.replace(hour=SLOT_HOUR, minute=SLOT_MINUTE, second=0, microsecond=0)
+    if slot > now:
+        slot -= timedelta(days=1)
+    return slot
+
+
+async def _record_slot_completed(slot: datetime, summary: Dict[str, Any]) -> None:
+    from db.scheduled_job_completions import record_completion
+    try:
+        await record_completion(JOB_ID, slot)
+    except Exception as exc:  # noqa: BLE001
+        # The consolidation itself is done; the cost of a lost marker is a
+        # redundant catch-up run (bounded by CATCHUP_MAX_RUNS_PER_SLOT).
+        logger.warning(
+            "nightly_index_health: could not record slot %s as completed: %s",
+            slot.isoformat(), exc,
+        )
+        summary["errors"].append(f"record_completion: {exc!r}")
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -896,6 +941,11 @@ async def run_nightly_index_health() -> Dict[str, Any]:
             )
             summary["errors"].append(f"regression_blocker_update: {exc!r}")
 
+        # 8. Every pass above has run: this slot is done. Recorded while the lock
+        # is still held, and only here — a run cancelled anywhere above (a worker
+        # deploy) never reaches it, which is what the catch-up keys on.
+        await _record_slot_completed(latest_slot(run_start), summary)
+
     finally:
         await _release_job_lock()
 
@@ -921,3 +971,91 @@ async def run_nightly_index_health() -> Dict[str, Any]:
         len(summary["errors"]),
     )
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Catch-up for a slot whose run never finished
+# ---------------------------------------------------------------------------
+
+# slot -> real catch-up runs this process made for it. Only the current slot is kept.
+_CATCHUP_RUNS: Dict[datetime, int] = {}
+
+
+def _scheduled_run_in_flight() -> bool:
+    from services.scheduler_job_runner import registry_snapshot
+    return bool((registry_snapshot().get(JOB_ID) or {}).get("running"))
+
+
+async def run_nightly_index_health_catchup(
+    *, now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Re-run the nightly consolidation when its latest slot has no completed run.
+
+    The worker is redeployed on every merge to main, and APScheduler's in-memory
+    store does not re-fire a cron slot a shutdown cut: the new revision schedules
+    the NEXT 04:00. So a deploy landing while the ~5-minute run is in flight
+    (09-23 and 09-27 in the last 30 days) loses the whole night's consolidation
+    for the keys the batch had not reached. This tick, registered every 10 min,
+    closes that: the run records its slot only when every pass finished, and a
+    slot older than CATCHUP_MIN_DELAY without that record is run again.
+
+    Safe to fire anywhere, any number of times: the run is the same idempotent
+    recompute the 04:00 tick does and takes the same advisory lock, so a run
+    still in flight on another revision makes this one skip (and not count as an
+    attempt), and the next tick looks again.
+    """
+    now = now or datetime.now(timezone.utc)
+    slot = latest_slot(now)
+    out: Dict[str, Any] = {"slot": slot.isoformat()}
+
+    if now < slot + CATCHUP_MIN_DELAY:
+        out["action"] = "waiting_for_scheduled_run"
+        return out
+    if _scheduled_run_in_flight():
+        out["action"] = "scheduled_run_in_flight"
+        return out
+
+    from db.scheduled_job_completions import last_completed_slot
+    try:
+        last = await last_completed_slot(JOB_ID)
+    except Exception as exc:  # noqa: BLE001
+        # Cannot tell whether the slot ran: do nothing. Guessing "missed" would
+        # re-run the full job every tick for as long as the read keeps failing.
+        logger.warning("nightly_index_health catch-up: marker read failed: %s", exc)
+        out["action"] = "marker_unreadable"
+        return out
+    out["last_completed_slot"] = last.isoformat() if last else None
+    if last is not None and last >= slot:
+        out["action"] = "up_to_date"
+        return out
+
+    runs = _CATCHUP_RUNS.get(slot, 0)
+    if runs >= CATCHUP_MAX_RUNS_PER_SLOT:
+        out["action"] = "run_cap_reached"
+        return out
+
+    logger.warning(
+        "nightly_index_health catch-up: slot %s has no completed run (last "
+        "completed slot: %s); running it now (catch-up run %d/%d this process)",
+        slot.isoformat(), out["last_completed_slot"], runs + 1,
+        CATCHUP_MAX_RUNS_PER_SLOT,
+    )
+    summary = await run_nightly_index_health()
+    if summary.get("skipped"):
+        out["action"] = "skipped_lock_held"
+        return out
+
+    _CATCHUP_RUNS.clear()
+    _CATCHUP_RUNS[slot] = runs + 1
+    # WARNING, not INFO: prod drops INFO from module loggers, and this line is
+    # the only trace that a lost slot was recovered.
+    logger.warning(
+        "nightly_index_health catch-up: slot %s re-run finished in %ss — "
+        "processed=%d eligible=%d errors=%d",
+        slot.isoformat(), summary.get("duration_seconds"),
+        summary.get("total_processed", 0), summary.get("eligible_count", 0),
+        len(summary.get("errors") or []),
+    )
+    out["action"] = "ran"
+    out["summary"] = summary
+    return out
