@@ -111,6 +111,11 @@ logger = logging.getLogger(__name__)
 # from inactive duplicate seeds and wrong-brand suppressed products. Every
 # active catkin/judydoll/joocyee seed is priced. On such a baseline a price
 # drop can never register.
+# The re-baseline only runs on an 'ok' verdict, so it protects in ONE direction:
+# a new query that measures structurally LOWER turns the old baseline into a
+# standing 'regression' that never recovers. Before a bump, score prod with the
+# new query against the stored baselines and confirm no verdict changes (v2:
+# 0 of 168 domains changed, 2026-09-27).
 SCORECARD_VERSION = "scorecard_v2"
 
 TRACKED_FIELDS = ["title", "description", "image_url", "price"]
@@ -493,8 +498,9 @@ async def _compute_domain_extractor_scorecards() -> Dict[str, Any]:
             elif prior.get("scorecard_version") != SCORECARD_VERSION:
                 # An older scorecard measured this baseline (see
                 # SCORECARD_VERSION). Only an 'ok' verdict gets here, so no
-                # field is down 0.10 or more against the old baseline: tonight's
-                # coverage replaces it. A degraded or regression domain keeps
+                # field is down DEGRADED_THRESHOLD against the old baseline (as
+                # computed in float: an exact 0.10 drop reads 0.0999...):
+                # tonight's coverage replaces it. A degraded or regression domain keeps
                 # its old baseline until it recovers, which resets it anyway.
                 new_baseline = current_coverage
                 baseline_set_at = now

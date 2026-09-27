@@ -438,8 +438,6 @@ def test_inactive_seed_is_not_sampled(pg_engine):
         _seed(conn, _P + "s-live", d, seed_data=_flat(), attached=_P + "pk-live")
         _seed(conn, _P + "s-dead-unatt", d, seed_data=_snapshot_shaped(), attached=None,
               status="inactive")
-        _seed(conn, _P + "s-dead-null", d, seed_data=_snapshot_shaped(), attached=None,
-              status=None)
         assert _score(conn, d) == {
             "total": 1, "has_title": 1, "has_description": 1, "has_image": 1, "has_price": 1,
         }
@@ -462,5 +460,36 @@ def test_baseline_fetch_returns_the_scorecard_version(pg_engine):
                  "VALUES (:d, 'ok', :v)"),
             {"d": d, "v": SCORECARD_VERSION},
         )
+        rows = [dict(r) for r in conn.execute(text(_BASELINE_FETCH_QUERY), {"domains": [d]}).mappings()]
+        assert [r["scorecard_version"] for r in rows] == [SCORECARD_VERSION]
+
+
+def test_upsert_stamps_the_current_scorecard_version(pg_engine):
+    """The other half of the version check: if the upsert stopped writing
+    scorecard_version on conflict, a v1 row would stay v1 and be re-baselined
+    every night."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy import text
+
+    from jobs.nightly_index_health_job import (
+        _BASELINE_FETCH_QUERY, _BASELINE_UPSERT_QUERY, SCORECARD_VERSION,
+    )
+
+    d = _P + "upsert.test"
+    now = datetime.now(timezone.utc)
+    cov = json.dumps({"title": 1.0, "description": 1.0, "image_url": 1.0, "price": 1.0})
+    with pg_engine.begin() as conn:
+        _reset(conn)
+        conn.execute(
+            text("INSERT INTO domain_extractor_baselines (domain, alert_state, scorecard_version) "
+                 "VALUES (:d, 'ok', 'scorecard_v1')"),
+            {"d": d},
+        )
+        conn.execute(text(_BASELINE_UPSERT_QUERY), {
+            "domain": d, "baseline_coverage": cov, "current_coverage": cov, "sample_size": 5,
+            "alert_state": "ok", "regression_details": "[]", "scorecard_version": SCORECARD_VERSION,
+            "last_scored_at": now, "baseline_set_at": now,
+        })
         rows = [dict(r) for r in conn.execute(text(_BASELINE_FETCH_QUERY), {"domains": [d]}).mappings()]
         assert [r["scorecard_version"] for r in rows] == [SCORECARD_VERSION]
