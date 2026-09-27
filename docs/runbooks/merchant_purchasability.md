@@ -170,7 +170,7 @@ arrival).
 | variable | default | bounds | what it does |
 |---|---|---|---|
 | `MERCHANT_PURCHASABILITY_SWEEP_ENABLED` | **unset = off** | truthy allowlist: `1`, `true`, `on`, `yes` (case/space-insensitive) | **DIAL 1 of 2** (`db.merchant_purchasability.is_sweep_enabled`). Gates the sweep JOB and nothing else. Off = the job contacts no merchant, which matters because every check creates an abandoned checkout on a live store. **Set this on the WORKER service** |
-| `MERCHANT_PURCHASABILITY_ENFORCE` | **unset = off** | same truthy allowlist | **DIAL 2 of 2** (`db.merchant_purchasability.is_enforcement_enabled`). Gates the CONSUMERS and nothing else: the Reap route's `merchant_not_purchasable` refusal and the checkout tier's downgrade. Off = a missing fact refuses nothing. Also the `enforced` field the gateway reads |
+| `MERCHANT_PURCHASABILITY_ENFORCE` | **unset = off** | same truthy allowlist | **DIAL 2 of 2** (`db.merchant_purchasability.is_enforcement_enabled`). Gates the CONSUMERS and nothing else: the Reap route's `merchant_not_purchasable` refusal, the checkout tier's downgrade, and the offers.resolve cart mint (a browse-only merchant is minted a `referral_only` PDP instead of a prefilled cart — see "The offers.resolve mint" in §9). Off = a missing fact refuses nothing. Also the `enforced` field the gateway reads |
 | `MERCHANT_PURCHASABILITY_TTL_HOURS` | `72` | `1`–`720` | how long one positive fact stays positive. 720 h is 30 days; past that "fresh" is not a word that means anything |
 | `MERCHANT_PURCHASABILITY_BUYER_VANTAGE` | `worker` | any string, truncated to 32 chars | the vantage `is_purchasable` demands a positive fact **FROM**. See §6 — this is the dial that decides whose question the gate is answering |
 | `VANTAGE_PROXY_URL` | **unset** | must start `http://` or `https://`, else ignored | when set, every merchant is ALSO checked through that proxy and recorded under vantage `proxy`. Anything else is ignored rather than handed to httpx, which would raise inside the run |
@@ -605,6 +605,40 @@ carries no market today, so it cannot be keyed and keeps failing open; it must f
 market carrier (the buyer's shipping country, or the market the session was created for) before
 the re-read can ask this route. Once it does, it may call this route with no `market` and will get
 the explicit `market_unknown` answer instead of a 422.
+
+### The offers.resolve mint (2026-09-27)
+
+`offers.resolve` mints an `/r` link per external-seed offer, and where it can build a Shopify cart
+permalink the link lands the buyer **in a prefilled cart** (`join_mode: cart_permalink`). The
+warm-handoff click lane deliberately skips a cart join (`is_already_cart_join`), so nothing between
+the mint and the buyer ever asked this fact — a merchant the Reap rail refuses was still handed out
+as a one-click cart. Measured on prod 2026-09-27: 432 active-seed offers mint a cart, **358 of them
+(47 of 53 hosts) with no positive fact in any market**.
+
+Under `MERCHANT_PURCHASABILITY_ENFORCE` the mint (`routes/agent_shop_gateway._CartPurchasabilityGate`)
+now asks first, with **this route's semantics**:
+
+| state | cart? | DB read |
+|---|---|---|
+| dial off | kept — byte-identical token and payload | none |
+| dial on, request names no ISO-2 market (`market_unknown`) | **declined** | none |
+| dial on, `is_purchasable(cart host, request market)` true | kept | one per host per request |
+| dial on, anything else (no row, expired, wrong vantage, DB error) | **declined** | one per host per request |
+
+A decline removes the **cart**, never the offer: `execution_spec.cart_url` / `variant_id` null,
+`rail: referral`, `tracking.join_mode: referral_only`, `cart_prefilled: false`, and the `/r` hop
+signs the attributed PDP. The token ctx carries `purchasability_tier: browse_only`, and
+`evaluate_warm_eligibility` knocks such a token out (`warm_reason=purchase_declined`) — otherwise
+the warm lane would rebuild the refused cart at click time. The key is absent on every other
+token.
+
+The market is the **request's** (`payload.market`), never the seed row's listing market and never
+the `or "US"` serving default. So a market-less caller (the UCP `get_offers` tool today) loses its
+carts even on merchants that are positive for US — the same answer the gateway's own gate gives.
+
+**Not yet covered:** the product-card lanes that mint the same seeds' cart links
+(`mint_external_seed_links`, `_build_prefetched_external_seed_wrappers`, find_products_multi seed
+cards, `_attach_connected_product_redirects`) still mint carts without asking.
 
 ### Rolling back
 

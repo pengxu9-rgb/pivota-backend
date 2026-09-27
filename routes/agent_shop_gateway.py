@@ -37,7 +37,12 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
-from services.outbound_warm_handoff import could_upgrade_at_click_time
+from services.outbound_warm_handoff import (
+    PURCHASABILITY_BROWSE_ONLY,
+    PURCHASABILITY_TIER_KEY,
+    could_upgrade_at_click_time,
+)
+import db.merchant_purchasability as merchant_purchasability
 from services.offer_buyability import (
     OFFER_UNAVAILABLE_AVAILABILITIES,
     availability_is_known_unavailable,
@@ -4517,6 +4522,10 @@ async def _handle_offers_resolve(
     # per call would re-ask for product keys the previous call already loaded. It holds only a
     # memo and counters; every lookup failure inside it answers "no id", never a wrong one.
     _handover_resolver = HandoverVariantResolver()
+    # ONE purchasability gate for the WHOLE request, for the same reason: its memo is per host,
+    # and its dial is read once. Keyed on the REQUEST's market (`market_hint`), never a row's —
+    # the same provenance `market_observed` below is decided by.
+    _cart_purchasability = _CartPurchasabilityGate(market_hint)
 
     async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
         # ONE statement for every product key this batch is about to hand over, BEFORE the
@@ -4825,6 +4834,25 @@ async def _handle_offers_resolve(
                         redirect_identity = dict(redirect_identity)
                         redirect_identity["cart_variant_id"] = None
 
+                # MERCHANT PURCHASABILITY — would this cart land a buyer on a store the fact
+                # says cannot take their card in this market? Asked on the cart the mint WOULD
+                # build (the same `resolve_cart_permalink` it calls, on the same inputs), so a
+                # referral-only offer never asks. A decline takes the preflight's road — null
+                # the cart id, so the mint, the published spec and `cart_prefilled` all follow
+                # from the one value — and is signed into the token so the warm lane cannot
+                # rebuild the cart at click time. See `_CartPurchasabilityGate`.
+                _purchasability_tier: Optional[str] = None
+                _would_be_cart = resolve_cart_permalink(
+                    destination_url=str(canonical_url or destination_url),
+                    shop_domain=redirect_identity.get("shop_domain"),
+                    platform=redirect_identity.get("platform"),
+                    cart_variant_id=redirect_identity.get("cart_variant_id"),
+                )
+                if _would_be_cart and not await _cart_purchasability.allows_cart(_would_be_cart):
+                    _purchasability_tier = PURCHASABILITY_BROWSE_ONLY
+                    redirect_identity = dict(redirect_identity)
+                    redirect_identity["cart_variant_id"] = None
+
                 # COUNTED AFTER THE GATE, not before it. Its comment defines it as "how many
                 # hand-overs actually got a cart"; counted at `_cart_vid` above it also counted
                 # the ones this very request then withdrew, so the number contradicted its own
@@ -4858,6 +4886,7 @@ async def _handle_offers_resolve(
                         "source": "offers.resolve",
                         **({"skuId": sku_id} if sku_id else {}),
                         **({"productId": product_id} if product_id else {}),
+                        **({PURCHASABILITY_TIER_KEY: _purchasability_tier} if _purchasability_tier else {}),
                     },
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
@@ -4914,6 +4943,7 @@ async def _handle_offers_resolve(
                     # The link we JUST minted, so the resolve-time rollout bucket is computed
                     # from the very token the click will carry.
                     redirect_url=redirect_url,
+                    purchasability_tier=_purchasability_tier,
                 )
 
                 offer_spec = {
@@ -6377,7 +6407,11 @@ async def _handle_offers_resolve(
             _coverage["preflight_degraded_to_referral"],
             _coverage["preflight_answered_fraction"],
         ) if _coverage else ""
-    ) + handover_coverage_message(_handover_fields)
+    ) + handover_coverage_message(_handover_fields) + (
+        " purchasability asked=%d declined=%d" % (
+            _cart_purchasability.stats["asked"], _cart_purchasability.stats["declined"],
+        ) if _cart_purchasability.stats["declined"] or _cart_purchasability.stats["asked"] else ""
+    )
     logger.info(
         _summary_msg,
         extra={
@@ -9054,11 +9088,70 @@ def _redirect_token_from_url(redirect_url: str) -> str:
     return ""
 
 
+class _CartPurchasabilityGate:
+    """MAY THIS RESOLVE HAND THE BUYER A PREFILLED CART ON THIS MERCHANT? One per request.
+
+    WHY. The Reap rail refuses a merchant with no fresh positive purchasability fact
+    (`db.merchant_purchasability`, under MERCHANT_PURCHASABILITY_ENFORCE), but offers.resolve
+    kept minting `cart_permalink` `/r` links for the same merchant — and the warm-handoff lane
+    skips the gateway's gate for a cart join (`is_already_cart_join`), so the buyer landed
+    straight in the prefilled cart of a store we had measured as unable to take their card.
+    Measured 2026-09-27 on prod: 432 active-seed offers mint a cart, 358 of them (47 of 53
+    hosts) with no positive fact in any market. The gateway's own gate (PIVOTA-Agent #2308)
+    strips these only when armed and only on get_offers/annotate; this is the door that mints.
+
+    THE SAME SEMANTICS AS THE OPS ROUTE (`GET /ops/merchant-purchasability`), which is the
+    gateway's contract, so the two cannot answer differently for one merchant x market:
+      * dial OFF -> every cart is allowed. That route says `enforced: false` and its consumers
+        keep their previous behaviour; so does this. Nothing is asked, nothing changes.
+      * dial ON, no usable request market -> declined, WITHOUT a database read. The route's
+        `reason: market_unknown`, `tier: browse_only`. The market is never defaulted: the
+        `used_market` a seed row is served under is its LISTING market, and an `or "US"`
+        placeholder would gate a non-US buyer against the US fact.
+      * dial ON, market known -> `is_purchasable`, the function the route and the rail call.
+        It fails CLOSED on a database error, and so does this.
+    A decline FAILS OPEN FOR LINKS-OUT: it removes the cart, never the offer. The buyer still
+    gets the attributed PDP through the same `/r` hop — the route's "leaves browse and
+    links-out untouched".
+
+    KEYED ON THE CART'S HOST — the host `resolve_cart_permalink` would build the cart on, which
+    is the host the buyer would land on and the one the gateway reads first
+    (`execution_spec.cart_url`). Asked only where a cart would exist, and once per host per
+    request, so a referral-only resolve (the majority) never touches the fact table.
+    """
+
+    def __init__(self, request_market: Any) -> None:
+        # Read ONCE, so one request cannot straddle a dial flip and serve two answers.
+        self.enforced = merchant_purchasability.is_enforcement_enabled()
+        self.market = merchant_purchasability.normalize_market(request_market)
+        self._memo: Dict[str, bool] = {}
+        self.stats: Dict[str, int] = {"asked": 0, "declined": 0}
+
+    async def allows_cart(self, cart_base_url: str) -> bool:
+        if not self.enforced:
+            return True
+        allowed = False
+        if self.market is not None:
+            host = merchant_purchasability.normalize_domain(cart_base_url)
+            if host not in self._memo:
+                self.stats["asked"] += 1
+                self._memo[host] = await merchant_purchasability.is_purchasable(host, self.market)
+            allowed = self._memo[host]
+        if not allowed:
+            self.stats["declined"] += 1
+        return allowed
+
+
 def _cart_prefilled_claim(
     *,
     cart_url: Optional[str],
     destination_url: str,
     redirect_url: str,
+    # Set when the purchasability fact declined this offer's cart. The mint signed the same
+    # value into the token, and the warm lane knocks such a token out, so `False` becomes
+    # provable where it would otherwise be `None`. Defaulted because omitting it errs SAFE:
+    # the claim stays `None` ("unknown"), never a wrong `False`.
+    purchasability_tier: Optional[str] = None,
 ) -> Optional[bool]:
     """TRI-STATE: True = prefilled cart, False = bare PDP, None = we cannot promise either.
 
@@ -9125,8 +9218,12 @@ def _cart_prefilled_claim(
         # EXACT, not conservative: this line is unreachable unless `if cart_url` above fell
         # through, and the mint stamps `join_mode` from that same `cart_url` decision — so the
         # token for this branch provably carries `referral_only`, and the already-a-cart
-        # knockout provably cannot fire on it.
-        ctx={"join_mode": "referral_only"},
+        # knockout provably cannot fire on it. The purchasability tier is the value the caller
+        # also handed the mint, so it is in that token's ctx too.
+        ctx={
+            "join_mode": "referral_only",
+            **({PURCHASABILITY_TIER_KEY: purchasability_tier} if purchasability_tier else {}),
+        },
         settings=settings,
     ):
         return None
