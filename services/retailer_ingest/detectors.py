@@ -70,8 +70,10 @@ _SET_WORD = re.compile(r"^(?:starter|discovery|trial|travel|holiday|mini|minis|s
 # Anything joined after the verb (beyond its own pair) is a second item: "Eyeliner & Sharpener", "Powder + Puff",
 # "Eyeliner Black & Brown".
 _JOIN_WORD = re.compile(r"&|\band\b|\bwith\b|\+", re.I)
-# ...and never when the title also names a pack of products: "Prime & Set Duo", "Mini Prime & Set Pouch".
-_PACK_WORD = re.compile(r"\b(?:duos?|pouch|vault|collection|gift|value)\b", re.I)
+# ...and never when the title also names a pack: "Prime & Set Duo", "Mini Prime & Set Pouch", "Gel Eye Liner
+# 2 Pack", "Setting Powder (Pack of 2)", "Set Powder Loose Twin Pack", "Loose Powder 2ct".
+_PACK_WORD = re.compile(r"\b(?:duos?|pouch|vault|collection|gift|value|twin|(?:[2-9]|\d{2,})\s*-?\s*(?:packs?|ct)|"
+                        r"pack\s+of\s+\d+|x\s*[2-9])\b", re.I)
 # On the sets shelf a title may name a leaf other than the shelf only when it shows it IS a set, by STRONG
 # evidence alone: a pack or count word, a free gift/refill, or products joined by "+". "&"/"and"/"with" are
 # not evidence ("Hair & Body Shampoo", "Cream with Ceramides", "Face and Body Wash" are one product): a real set
@@ -84,13 +86,17 @@ _PACK_WORD = re.compile(r"\b(?:duos?|pouch|vault|collection|gift|value)\b", re.I
 # leaves, one product); image118 files a UV hoodie ("爽壁+") under gift sets.
 _SET_PACK = re.compile(r"\b(?:regimen|system(?=\s*(?:$|[-–(,|]|for\b))|"
                        r"(?:sample|variety|double|value|discovery)\s+pack|gift\s+(?:box|basket)|"
-                       r"(?:[2-9]|\d{2,})\s*-?\s*step|"
-                       r"(?:[2-9]|\d{2,})\s*-?\s*(?:packs?|types|kinds|vials))\b|\+\s*(?:free|refill)\b", re.I)
+                       r"(?:[2-9]|\d{2,})\s*-?\s*(?:packs?|vials))\b|\+\s*(?:free|refill)\b", re.I)
+# ("N types/kinds" is a pick-one variant and "N-step" a single mask far more often than a set -- measured
+# 3 sets vs 171 / 116 single-shelf rows, review of accfb44cb -- so neither is evidence.)
 # "+" joining products: only with a space, "(" or a size before it -- not "Cica+ Cream", "SPF50+", "PA+++" or a
 # CJK "爽壁+". ("System" is a kit only at the end or before "for ...": not "Acne Treatment System Gel".)
 _PLUS_JOIN = re.compile(r"(?:(?<=\s)|(?<=\()|(?<=\dml)|(?<=\dg)|(?<=\doz))\+", re.I)
 # "Hair"/"Scalp" alone name this leaf: an area word, not a product ("Hair + Body Shampoo").
 _AREA_ONLY_LEAVES = frozenset({"beauty/haircare/general"})
+# ...and each joined part carries its own size or count ("Toner 200ml + Lotion 200ml"): "Concealer + Foundation",
+# "Sunscreen + Primer" name one hybrid product.
+_PART_SIZE = re.compile(r"\d+(?:\.\d+)?\s*(?:ml|g|oz|fl\.?\s*oz|l|ea|pcs?|pads?|sheets?|ct|capsules?)\b", re.I)
 
 # A lip product ships in a few ml/g (balm tins reach ~15-18 g); 20+ is a face or body format.
 _SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(ml|g|oz|fl\.?\s*oz)\b", re.I)
@@ -236,8 +242,9 @@ def _names_a_set(title: str) -> bool:
 
 
 def _joined_products(title: str) -> int:
-    """How many "+"-joined parts of the title name a product ("Toner 200ml + Lotion 200ml" -> 2)."""
-    return sum(1 for part in _PLUS_JOIN.split(title) if _beauty_leaves(part) - _AREA_ONLY_LEAVES)
+    """How many "+"-joined parts of the title name a sized product ("Toner 200ml + Lotion 200ml" -> 2)."""
+    return sum(1 for part in _PLUS_JOIN.split(title)
+               if _beauty_leaves(part) - _AREA_ONLY_LEAVES and _PART_SIZE.search(part))
 
 
 def _title_shows_a_set(title: str) -> bool:

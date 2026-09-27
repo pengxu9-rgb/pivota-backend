@@ -385,6 +385,12 @@ def test_the_verb_set_in_a_product_line_name_is_not_a_set(title, ptype):
     ("Serum Set Powder", "Setting Powder"),             # a product noun before "Set" + a setting noun
     ("Cloud Set Powder & Puff", "Setting Powder"),      # a join after "Set" + a setting noun
     ("Cloud Set Powder with Puff", "Setting Powder"),
+    # a multi-pack beside the verb (review of accfb44cb)
+    ("Smudge & Set Gel Eye Liner 2 Pack", "Eyeliner"),
+    ("Bake & Set Setting Powder (Pack of 2)", "Setting Powder"),
+    ("Kett Set Powder Loose Twin Pack", "Setting Powder"),
+    ("Smooth & Set Loose Powder 2ct", "Setting Powder"),
+    ("Bake & Set Powder x2", "Setting Powder"),
     ("Lip Set & Go", "Setting Powder"),                 # an area word before "Set"
     ("Glow Toner Sticker Set &", "Toner"),              # "&" with nothing after it
     ("Glow Toner Set", "Toner"),
@@ -416,15 +422,13 @@ def test_a_real_set_beside_the_verb_exemption_is_still_held(title, ptype):
 @pytest.mark.parametrize("title", [
     "1025 Dokdo Toner 200ml + Dokdo Lotion 200ml",      # " + "
     "Repair Cream 100ml+Essence 50ml",                  # "+" after a size
-    "Hydrating Serum (+Collagen Jelly Cream)",          # "(+"
+    "Hydrating Serum 30ml (+Collagen Jelly Cream 50ml)",  # "(+"
     "CC Undereye Corrector + FREE Tubing Mascara",      # "+ free"
     "Cushion Foundation 15g + Refill",                  # "+ refill"
     "Hydrating Serum 30ml + Free Pouch",                # "+ free", partner not a product noun
-    "Enzyme Cleansing Powder 5kinds",
     "Niacinamide 20 Serum (5ea)",                       # a count (_SET_TITLE)
     "Niacinamide Serum 2 Pack",
     "Scent Exploration Perfume (10 Vials)",
-    "Soy Nut Line 2 Types (Cream/Toner)",
     "Acne Attack Serum Trio",
     "Hydrating Serum Duo",
     "Acne Control Serum Regimen",
@@ -435,11 +439,10 @@ def test_a_real_set_beside_the_verb_exemption_is_still_held(title, ptype):
     "Glow Serum Double Pack",
     "Glow Serum Value Pack",
     "Glow Serum Discovery Pack",
-    "Serum + Glow Cream",                               # "+" joins even a one-word part
+    "Serum 30ml + Glow Cream 50ml",                     # "+" joins even a one-word part, when both are sized
     "Glow Serum Gift Box",
     "Deep Mask Variety Pack",
     "Harvest Gift Basket Body Wash Cleanser",
-    "Cleanse & Calm 3-Step Serum",
 ])
 def test_a_set_on_the_sets_shelf_may_name_what_is_inside_it(title):
     assert "title_contradicts_category" not in _flags(title, "Gift Set", "beauty/sets/"), title
@@ -486,6 +489,20 @@ def test_a_set_on_the_sets_shelf_may_name_what_is_inside_it(title):
     "[Medi-Peel] Peptide 9 Volume And Tension Tox Cream Pro",
     "Milbon Serum with Natural oil Hair Treatment",
     "Philip B Nordic Wood Hair + Body Shampoo",         # "+" beside an area word, not a product
+    # review of accfb44cb: weak evidence stays for a reviewer
+    "LADOR Perfumed Hair Oil 80ml (5types)",            # "N types": a pick-one variant
+    "Scentlier Perfume Hand Cream 50ml (4types)",
+    "Soy Nut Line 2 Types (Cream/Toner)",               # a real set, held: one click
+    "Enzyme Cleansing Powder 5kinds",
+    "celimax 2-Step Gel Mask 1ea",                      # "N-step": one mask
+    "CNP 2- Step Greenery Calming Ampule Mask 1 Sheet",
+    "Cleanse & Calm 3-Step Serum",
+    "OneBase Concealer + Foundation 045",               # "+" in a hybrid's name: no size on each side
+    "SUN PREP Sunscreen + Primer",
+    "Serum + Glow Cream",
+    "Hydrating Toner 200ml + Lotion",                   # only one side sized
+    "Silk Hair 100ml + Body Shampoo 200ml",             # sized, but "Hair" alone is an area, not a product
+    "Sun Serum 30ml SPF50+ Moisture Cream 50ml",        # sized both sides, but the "+" is SPF's
 ])
 def test_a_single_product_the_store_types_as_a_set_is_still_held(title):
     rec = _on(record(title, "Skincare Set", title.lower().replace(" ", "-")), "beauty/sets/")
