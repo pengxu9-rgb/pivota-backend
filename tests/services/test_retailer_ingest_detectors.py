@@ -146,6 +146,10 @@ def test_a_single_unit_count_is_not_a_set():
     assert "set_filed_as_single_product" not in rules(detectors.detect([rec]))
     two = record("3CE Velvet Lip Tint 2pcs", "LIP TINT", "two-pcs", body="<p>Velvet colour for lips.</p>")
     assert "set_filed_as_single_product" in rules(detectors.detect([two]))
+    one_x = record("Moisture Cream 1 x 50ml", "Cream", "one-x", body="<p>A cream.</p>")
+    assert "set_filed_as_single_product" not in rules(detectors.detect([one_x]))
+    two_x = record("Moisture Cream 2 x 50ml", "Cream", "two-x", body="<p>A cream.</p>")
+    assert "set_filed_as_single_product" in rules(detectors.detect([two_x]))
 
 
 # ------------------------------------------------------------------ placeholder_price_store (2026-09-26)
@@ -305,3 +309,242 @@ def test_the_evidence_names_the_token_price_when_the_mode_ties():
 def test_the_modal_share_and_ceiling_boundaries(price, modal, rest, held):
     flags = detectors.detect(store([[price]] * modal + [[v] for v in _varied(rest, 30.0)]))
     assert bool(_held(flags)) is held
+
+
+# ------------------------------------------------------------------ set false positives (2026-09-27)
+# Held on the US top-100 re-runs: stilacosmetics.com "Smudge & Set" (the verb "set" in a product-line
+# name) and tartecosmetics.com gift sets whose titles name what is inside them. Every refusing case below
+# is held on main and must stay held (review of #2402).
+
+def _on(rec, category_prefix):
+    assert rec is not None and (rec["pdp"]["category_path"] or "").startswith(category_prefix), rec and rec["pdp"]
+    return rec
+
+
+def _flags(title, ptype, category_prefix="beauty/"):
+    return rules(detectors.detect([_on(record(title, ptype, title.lower().replace(" ", "-")), category_prefix)]))
+
+
+@pytest.mark.parametrize("title,ptype", [
+    ("Stay All Day® Smudge & Set™ Waterproof Gel Eye Liner", "Eyeliner"),   # X & Set
+    ("Smooth and Set Loose Powder", "Setting Powder"),                        # X and Set
+    ("ICD Set & Stay Makeup Spray 80 mL", "Face Primer"),                     # Set & X
+    ("Super Hold Set and Keep Spray Primer", "Face Primer"),                  # Set and X
+    ("Super Hold Set and Keep Primer", "Face Primer"),
+    ("Shape and Set Brow Primer", "Face Primer"),                             # X and Set, no noun after
+    # "Set" + what it is -- one per noun, with no pair to lean on
+    ("Forever Set Powder", "Setting Powder"),
+    ("Dewy Set Spray Primer", "Face Primer"),
+    ("Curl Set Lotion Primer", "Face Primer"),
+    ("Curl Set Essence Primer", "Face Primer"),
+    ("tfit Translucent Set Finishing Powder 7g", "Setting Powder"),
+    ("All Set Setting Powder", "Setting Powder"),
+    ("Hold Set Fixer Primer", "Face Primer"),
+    ("Neutral Set Translucent Powder", "Setting Powder"),
+    ("Cloud Set Loose Powder – Translucent Peachy", "Setting Powder"),
+    ("Cloud Set™ Loose Powder", "Setting Powder"),                           # a mark glued to "Set"
+    ("Kett Set Pressed Powder", "Setting Powder"),
+    ("Set Powder Brush", "Setting Powder"),              # a brush FOR setting powder
+    ("Hydrating Set and Stay Spray", "Setting Powder"),
+])
+def test_the_verb_set_in_a_product_line_name_is_not_a_set(title, ptype):
+    assert "set_filed_as_single_product" not in _flags(title, ptype), title
+
+
+@pytest.mark.parametrize("title,ptype", [
+    ("Hydrating Toner & Emulsion Set", "Toner"),        # "&" not beside "Set"
+    ("Hydrating Toner Set + Free Gift", "Toner"),       # "+" beside "Set" is a bundle
+    ("Glow Toner Set +Refill", "Toner"),
+    ("Hydrating Toner + Set of Cotton Pads", "Toner"),
+    ("Primer + Set Spray", "Face Primer"),              # "+" before, even with a finish noun after
+    ("Bake & Set + Refill", "Setting Powder"),          # "+" after, partner not a product noun
+    ("Travel Prime & Set Duo", "Face Primer"),          # the verb, but the title names a pack
+    ("Mini Prime & Set Pouch", "Face Primer"),
+    ("Translucent Set Finishing Powder Brush Special Set", "Setting Powder"),  # one verb, one real set
+    ("Travel Kit Bake & Set Powder", "Setting Powder"),  # a real set BEFORE the verb
+    ("Makeup Kit Powder", "Setting Powder"),            # only "set" can be the verb, not "kit"
+    ("Glow Kit Powder", "Setting Powder"),
+    ("Glow [Mini] Set Powder", "Setting Powder"),       # a bracketed set word
+    ("Smudge & Set Eyeliner & Mascara", "Eyeliner"),     # a product joined after it
+    ("Luxe Set & Mini Mirror", "Setting Powder"),        # a tool two words after the join
+    ("Smudge & Set Eyeliner and Mini Mascara", "Eyeliner"),  # a product two words after the join
+    ("Bake & Set Powder & Beauty Blender", "Setting Powder"),
+    ("Set and Forget Mascara", "Setting Powder"),        # "forget" is not a verb the corpus pairs with Set
+    # partners that are not verbs (review of 763dc7c40, inputs3)
+    ("Vitamin C Set & Save", "Serum"),
+    ("Anti-Aging Set & More", "Serum"),
+    ("Summer Set & Tote", "Serum"),
+    ("Spa Set & Headband", "Face Mask"),
+    ("Luxury Set & Keychain", "Serum"),
+    ("Cleanse & Set", "Cleanser"),
+    ("Whitening Set Essence", "Essence"),               # lotion/essence only after "curl"/"dry"
+    ("Moisture Set Lotion", "Lotion"),
+    ("Men's Set Lotion", "Lotion"),
+    ("Smudge & Set Eyeliner Black & Brown", "Eyeliner"),  # anything joined after the verb
+    ("Set & Stay Spray & Brush", "Face Primer"),        # a join after the "Set & X" pair
+    ("Serum Set Powder", "Setting Powder"),             # a product noun before "Set" + a setting noun
+    ("Cloud Set Powder & Puff", "Setting Powder"),      # a join after "Set" + a setting noun
+    ("Cloud Set Powder with Puff", "Setting Powder"),
+    # a multi-pack beside the verb (review of accfb44cb)
+    ("Smudge & Set Gel Eye Liner 2 Pack", "Eyeliner"),
+    ("Bake & Set Setting Powder (Pack of 2)", "Setting Powder"),
+    ("Kett Set Powder Loose Twin Pack", "Setting Powder"),
+    ("Smooth & Set Loose Powder 2ct", "Setting Powder"),
+    ("Bake & Set Powder x2", "Setting Powder"),
+    ("Stay All Day Smudge & Set Waterproof Gel Eye Liner 2 Count", "Eyeliner"),  # review of d042640af
+    ("Smudge & Set Gel Eye Liner 2pk", "Eyeliner"),
+    ("Bake & Set Setting Powder (2 pk)", "Setting Powder"),
+    ("Smooth & Set Loose Powder Double Pack", "Setting Powder"),
+    ("Smooth & Set Loose Powder 2 Units", "Setting Powder"),
+    ("Curl Set Lotion 200ml 2 Bottles", "Face Primer"),
+    ("Lip Set & Go", "Setting Powder"),                 # an area word before "Set"
+    ("Glow Toner Sticker Set &", "Toner"),              # "&" with nothing after it
+    ("Glow Toner Set", "Toner"),
+    ("Toner Set Essence 50ml", "Toner"),                # a product noun before "Set"
+    ("Makeup Set & Brush", "Face Primer"),              # a product noun joined after it
+    ("Serum Set & Cream", "Toner"),
+    ("Brush Set & Bag", "Face Primer"),
+    ("Sheet Mask Set and Eye Patch", "Toner"),
+    ("Starter Set Lotion + Cream", "Toner"),
+    # a set word before "Set" (review of bbadf0343)
+    ("Starter Set Essence", "Essence"),
+    ("Discovery Set Essence Toner", "Toner"),
+    ("Trial Set Mist Toner", "Toner"),
+    ("Hair Care Set Spray", "Hair Spray"),
+    ("Mini Set Powder", "Setting Powder"),
+    ("Holiday Set & Mirror Powder", "Setting Powder"),
+    ("Travel Set Powder and Puff", "Setting Powder"),
+    ("Glow Set Gel Cleanser", "Cleanser"),              # "gel" is not a setting noun
+    # a tool joined after it
+    ("Smudge & Set Eyeliner & Sharpener", "Eyeliner"),
+    ("Bake & Set Powder + Puff", "Setting Powder"),
+])
+def test_a_real_set_beside_the_verb_exemption_is_still_held(title, ptype):
+    rec = _on(record(title, ptype, title.lower().replace(" ", "-")), "beauty/")
+    assert not rec["pdp"]["category_path"].startswith("beauty/sets/")
+    assert "set_filed_as_single_product" in rules(detectors.detect([rec]), detectors.BLOCK), title
+
+
+@pytest.mark.parametrize("title", [
+    "1025 Dokdo Toner 200ml + Dokdo Lotion 200ml",      # " + "
+    "Repair Cream 100ml+Essence 50ml",                  # "+" after a size
+    "Hydrating Serum 30ml (+Collagen Jelly Cream 50ml)",  # "(+"
+    "CC Undereye Corrector + FREE Tubing Mascara",      # "+ free"
+    "Cushion Foundation 15g + Refill",                  # "+ refill"
+    "Hydrating Serum 30ml + Free Pouch",                # "+ free", partner not a product noun
+    "Niacinamide 20 Serum (5ea)",                       # a count (_SET_TITLE)
+    "Niacinamide Serum 2 Pack",
+    "Scent Exploration Perfume (10 Vials)",
+    "Acne Attack Serum Trio",
+    "Hydrating Serum Duo",
+    "Acne Control Serum Regimen",
+    "Clear Skin Serum System",
+    "Spa Serum System for Acne Prone Skin",
+    "Clear Serum System - Travel Size",
+    "Glow Serum Sample Pack",
+    "Glow Serum Double Pack",
+    "Glow Serum Value Pack",
+    "Glow Serum Discovery Pack",
+    "Serum 30ml + Glow Cream 50ml",                     # "+" joins even a one-word part, when both are sized
+    "Glow Serum Gift Box",
+    "Deep Mask Variety Pack",
+    "Harvest Gift Basket Body Wash Cleanser",
+])
+def test_a_set_on_the_sets_shelf_may_name_what_is_inside_it(title):
+    assert "title_contradicts_category" not in _flags(title, "Gift Set", "beauty/sets/"), title
+
+
+@pytest.mark.parametrize("title", [
+    "AHC Renew Age Total Reset Cream 50ml",             # koolseoul types it "Skincare Set"
+    "Rosee Sib Jang Saeng Cheon Ji Hyang Essence 45Ml",
+    "Skin Setting Tone Up Sun Base SPF50+ PA+++",       # "+" of SPF/PA is not a join
+    "Julyme Damage Care Perfume Hair Oil 30ml (Sunset Freesia)",  # two leaves, one product
+    "Pyunkang Yul Essence Toner",
+    "Hydrating Cream with Ceramides 50ml",              # "with" an ingredient
+    "Plump and Glow Cream",                             # "and" between adjectives
+    "Cica+ Soothing Cream",                             # "+" glued to a word
+    "Sun Serum SPF50+ Moisture Cream",                  # SPF "+" between two leaf words
+    "Glow Eyeshadow Quad",                              # one palette
+    "Daily Moisturizer with SPF 30",                    # "with SPF" is a feature (review of bbadf0343)
+    "Tinted Moisturizer with Sunscreen SPF 30",
+    "Lip Balm with SPF 15",
+    "1-Step Exfoliating Peel Pad",                      # a count of 1
+    "Hydrating Serum 1 Pack",
+    "Hair & Body Wash",                                 # one noun shared by two modifiers
+    "Day & Night Cream",
+    "Shampoo & Conditioner 2-in-1",                     # one product named twice
+    "Toner and Essence in One",
+    "Hydrating Toner and Rich Essence 2-in-1",
+    "Anti-Aging System Serum",                          # "system" naming a line, not a kit
+    "Acne Treatment System Gel",
+    "Moisture Cream 1 x 50ml",                          # a count of 1
+    "[Gift Recommendation] Layered Perfume",            # "gift" alone is not a gift set
+    "COGIT Sun Block Cooling UV Protection Hoodie UPF50+ 爽壁+ 全脸防护",  # CJK "+"; not beauty at all
+    # "&"/"and"/"with" are not set evidence (review of 763dc7c40): real sets joined only by them stay for a
+    # reviewer, because the same words join a single product's name. Real titles from reports/*/catalogs:
+    "Glow Pot Eyeshadow & Brush",                       # tartecosmetics.com set: held, one click
+    "Vitamin Serum with Mini Brush",
+    "Philip B Nordic Wood Hair & Body Shampoo 11.8 oz",
+    "Kylie Jenner Vanilla Dew Hair & Body Mist 236ml",
+    "Klorane Shampoo with Nettle For Oily Hair",
+    "Dr.Groot Shampoo For Thinning & Weak Hair 180ml",
+    "Bosley Hair & Scalp Conditioner",
+    "YUNJAC Hydrating & Soothing Toner With Baeknyoncho Extract & Ujildu Water",
+    "Momori Hair Cream for Dry & Damaged Hair",
+    "Face Reality Acne Face and Body Wash",
+    "[Medi-Peel] Peptide 9 Volume And Tension Tox Cream Pro",
+    "Milbon Serum with Natural oil Hair Treatment",
+    "Philip B Nordic Wood Hair + Body Shampoo",         # "+" beside an area word, not a product
+    # review of accfb44cb: weak evidence stays for a reviewer
+    "LADOR Perfumed Hair Oil 80ml (5types)",            # "N types": a pick-one variant
+    "Scentlier Perfume Hand Cream 50ml (4types)",
+    "Soy Nut Line 2 Types (Cream/Toner)",               # a real set, held: one click
+    "Enzyme Cleansing Powder 5kinds",
+    "celimax 2-Step Gel Mask 1ea",                      # "N-step": one mask
+    "CNP 2- Step Greenery Calming Ampule Mask 1 Sheet",
+    "Cleanse & Calm 3-Step Serum",
+    "OneBase Concealer + Foundation 045",               # "+" in a hybrid's name: no size on each side
+    "SUN PREP Sunscreen + Primer",
+    "Serum + Glow Cream",
+    "Hydrating Toner 200ml + Lotion",                   # only one side sized
+    "Silk Hair 100ml + Body Shampoo 200ml",             # sized, but "Hair" alone is an area, not a product
+    "Sun Serum 30ml SPF50+ Moisture Cream 50ml",        # sized both sides, but the "+" is SPF's
+    "Concealer 12 + Foundation 045",                    # shade numbers are not sizes
+])
+def test_a_single_product_the_store_types_as_a_set_is_still_held(title):
+    rec = _on(record(title, "Skincare Set", title.lower().replace(" ", "-")), "beauty/sets/")
+    assert "title_contradicts_category" in rules(detectors.detect([rec]), detectors.BLOCK), title
+
+
+def test_a_set_title_on_the_sets_shelf_is_not_a_set_filed_as_one_product():
+    assert "set_filed_as_single_product" not in _flags("Glow Toner Set", "Gift Set", "beauty/sets/")
+
+
+@pytest.mark.parametrize("word", ["Starter", "Discovery", "Trial", "Travel", "Holiday", "Mini", "Minis", "Sample",
+                                  "Bestseller", "Best-Sellers", "Care", "Makeup", "Skincare",
+                                  "Beauty", "Deluxe", "Festive", "Lip", "Lips", "Eye", "Eyes", "Brow", "Brows",
+                                  "Lash", "Lashes", "Face", "Nail", "Nails", "Body", "Skin"])
+def test_a_set_word_before_set_makes_it_the_noun(word):
+    assert "set_filed_as_single_product" in _flags(f"Glow {word} Set Powder", "Setting Powder")
+
+
+@pytest.mark.parametrize("tool", ["Puff", "Puffs", "Sharpener", "Mirror", "Bag", "Case", "Pouches", "Sponge", "Applicator"])
+def test_a_tool_joined_after_the_verb_set_is_a_second_item(tool):
+    assert "set_filed_as_single_product" in _flags(f"Bake & Set Powder + {tool}", "Setting Powder")
+
+
+@pytest.mark.parametrize("verb", ["Prime", "Mist", "Smooth", "Smudge", "Bake", "Perfect", "Twist", "Brighten", "Prep",
+                                  "Shape", "Spray", "Grip", "Blow"])
+def test_each_corpus_verb_before_set(verb):
+    assert "set_filed_as_single_product" not in _flags(f"Stay All Day {verb} & Set Gel Eye Liner", "Eyeliner"), verb
+
+
+@pytest.mark.parametrize("verb", ["Protect", "Keep", "Wave", "Correct", "Stay", "Flow"])
+def test_each_corpus_verb_after_set(verb):
+    assert "set_filed_as_single_product" not in _flags(f"Hold Set & {verb} Primer", "Face Primer"), verb
+
+
+@pytest.mark.parametrize("title,held", [("Curl Set Lotion Primer", False), ("Quick Dry Set Lotion Primer", False),
+                                        ("Glow Set Lotion Primer", True), ("Curls Set Essence Primer", False)])
+def test_set_lotion_is_the_verb_only_after_a_hair_word(title, held):
+    assert ("set_filed_as_single_product" in _flags(title, "Face Primer")) is held, title
