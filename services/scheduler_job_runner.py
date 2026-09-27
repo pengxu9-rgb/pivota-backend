@@ -163,10 +163,18 @@ def _state(
 
 def _spawn_in_new_context(coro: Awaitable[Any], name: Optional[str]):
     """(task, context) — the context is kept so a zombie's own DB connection
-    can be found and terminated (see `_terminate_run_connection`)."""
+    can be found and terminated (see `_terminate_run_connection`).
+
+    The task must run IN `ctx`, hence `context=ctx`. The previous
+    `ctx.run(loop.create_task, coro)` looked equivalent and was not:
+    `Task.__init__` without `context=` runs the coroutine in `copy_context()`
+    of whatever is current — a COPY of `ctx` — so every ContextVar the run set
+    (the `databases` 0.7.0 Connection included) landed in the copy, `ctx`
+    stayed empty, and no zombie's connection was ever terminated.
+    """
     loop = asyncio.get_running_loop()
     ctx = contextvars.Context()
-    task = ctx.run(loop.create_task, coro)
+    task = loop.create_task(coro, context=ctx)
     if name:
         try:
             task.set_name(name)
@@ -181,8 +189,13 @@ def _terminate_run_connection(ctx: contextvars.Context, task: asyncio.Task) -> b
     A run cancelled mid-command puts asyncpg into its cancelling state; the
     pool release then waits for the original socket to answer, which on a dead
     socket is forever — so an abandoned run would hold one of `max_size` pool
-    slots permanently. Terminating the raw connection makes asyncpg raise
-    inside the zombie (unwinding it) and lets the pool discard the holder.
+    slots permanently. Terminating the raw connection returns the holder to
+    the pool (asyncpg's `_release_on_close`) and ends the server session, and
+    with it any session state (advisory locks, an open transaction). A zombie
+    waiting on a statement's reply is woken with ConnectionDoesNotExistError
+    and unwinds; one already parked on the cancel acknowledgement stays parked
+    — asyncpg never resolves that waiter on connection loss, and it is not
+    reachable from Python — a leaked task that holds no slot and no session.
     Reaches into `databases` internals (0.7.0 ContextVar / 0.9.0 per-task map)
     and asyncpg's `Connection.terminate()`; every step is guarded — a miss
     just leaves the pre-existing leak.
@@ -195,10 +208,8 @@ def _terminate_run_connection(ctx: contextvars.Context, task: asyncio.Task) -> b
     try:
         cv = getattr(database, "_connection_context", None)  # databases 0.7.0
         if cv is not None:
-            try:
-                conn = ctx.run(cv.get)
-            except LookupError:
-                conn = None
+            # Read, never enter: `ctx.run` raises if the context is entered.
+            conn = ctx.get(cv)
         if conn is None:
             cmap = getattr(database, "_connection_map", None)  # databases >= 0.8
             if cmap is not None:
@@ -245,10 +256,13 @@ async def run_isolated(
     * Raises -> records `error` and re-raises (APScheduler logs it as before).
     * Exceeds `deadline_seconds` -> the run is cancelled; if it does not finish
       within `cancel_grace_seconds` it is ABANDONED (kept in the registry as a
-      zombie), and `JobDeadlineExceeded` is raised either way so the outcome is
-      visible in the scheduler's job log. The job's slot is free again, so its
-      next tick runs.
-    * The wrapper itself being cancelled (scheduler shutdown) cancels the run.
+      zombie, its DB connection terminated), and `JobDeadlineExceeded` is
+      raised either way so the outcome is visible in the scheduler's job log.
+      The job's slot is free again, so its next tick runs.
+    * The wrapper itself being cancelled (scheduler shutdown) cancels the run
+      and adopts it as a zombie; its DB connection is terminated only if it is
+      still alive `cancel_grace_seconds` later, so a run that unwinds keeps
+      its connection for its own cancellation cleanup.
     """
     st = _state(job_id, deadline_seconds, cancel_grace_seconds)
     task, ctx = _spawn_in_new_context(func(*args, **kwargs), f"job:{job_id}")
@@ -270,22 +284,50 @@ async def run_isolated(
             st.last_error_type = None
             st.last_error = None
 
-    def _adopt_as_zombie(reason: str) -> None:
+    def _terminate_if_still_alive(reason: str, waited_s: float) -> None:
+        if task.done():
+            return  # it unwound within its grace, cleanup included
+        terminated = _terminate_run_connection(ctx, task)
+        logger.error(
+            "scheduler job %r: zombie run still alive %gs after it was cancelled (%s)%s. "
+            "(issue #1754 wedge class)",
+            job_id, waited_s, reason,
+            "; its DB connection was terminated" if terminated
+            else "; it holds no DB connection of its own to terminate",
+        )
+
+    def _adopt_as_zombie(reason: str, *, grace_left_s: float = 0.0) -> None:
         # The run is being abandoned while (possibly) still alive: keep it
         # visible and cancellable, never let its exception go unretrieved,
         # and cut its DB connection so it cannot hold a pool slot forever.
+        #
+        # `grace_left_s` > 0 when the run was cancelled just now (the wrapper
+        # was cancelled — every redeploy with a run in flight) and has not yet
+        # had a chance to unwind: its own `except CancelledError` cleanup
+        # (e.g. the quality backfill requeueing its row, a lock release) needs
+        # the connection. So the terminate waits out the same grace the
+        # deadline path gives, and fires only if the run is still alive then.
         task.add_done_callback(_swallow_task_result)
-        if not task.done():
-            st.zombie_count += 1
-            st.zombies.add(task)
-            terminated = _terminate_run_connection(ctx, task)
-            logger.error(
-                "scheduler job %r: run ABANDONED as a zombie (%s)%s — it stays visible "
-                "on /__scheduler_health and reachable via cancel-running. "
-                "(issue #1754 wedge class)",
-                job_id, reason,
-                "; its DB connection was terminated" if terminated else "",
+        if task.done():
+            return
+        st.zombie_count += 1
+        st.zombies.add(task)
+        if grace_left_s > 0:
+            asyncio.get_running_loop().call_later(
+                grace_left_s, _terminate_if_still_alive, reason, cancel_grace_seconds,
             )
+            detail = "; its DB connection will be terminated if it has not unwound within %gs" % grace_left_s
+        else:
+            detail = (
+                "; its DB connection was terminated" if _terminate_run_connection(ctx, task)
+                else "; it holds no DB connection of its own to terminate"
+            )
+        logger.error(
+            "scheduler job %r: run ABANDONED as a zombie (%s)%s — it stays visible "
+            "on /__scheduler_health and reachable via cancel-running. "
+            "(issue #1754 wedge class)",
+            job_id, reason, detail,
+        )
 
     try:
         done, _pending = await asyncio.wait({task}, timeout=deadline_seconds)
@@ -296,7 +338,8 @@ async def run_isolated(
         task.cancel()
         st.runs_cancelled += 1
         _finish("cancelled")
-        _adopt_as_zombie("wrapper cancelled while the run was in flight")
+        _adopt_as_zombie("wrapper cancelled while the run was in flight",
+                         grace_left_s=cancel_grace_seconds)
         raise
 
     if task in done:
@@ -318,12 +361,16 @@ async def run_isolated(
 
     # ---- deadline exceeded ----
     task.cancel()
+    cancelled_at = time.monotonic()
     try:
         done2, _ = await asyncio.wait({task}, timeout=cancel_grace_seconds)
     except asyncio.CancelledError:
         st.runs_cancelled += 1
         _finish("cancelled")
-        _adopt_as_zombie("wrapper cancelled during the grace window")
+        _adopt_as_zombie(
+            "wrapper cancelled during the grace window",
+            grace_left_s=cancel_grace_seconds - (time.monotonic() - cancelled_at),
+        )
         raise
     zombie = task not in done2
     st.runs_deadline_exceeded += 1
@@ -433,7 +480,7 @@ def active_tasks() -> set:
     scheduler down. ZOMBIES ARE DELIBERATELY EXCLUDED: a zombie is a run that already
     missed its deadline and refused to unwind, so waiting on one would burn the whole
     drain budget on the single task least likely to finish — and it has already been
-    accounted for, logged, and had its DB connection terminated.
+    accounted for and logged, and its DB connection is terminated if it outlives its cancel grace.
 
     NOT excluded, and worth knowing: a run that has passed its deadline and is inside its
     cancel-grace window is still in `active` (run_isolated pops it only in `_finish`), so

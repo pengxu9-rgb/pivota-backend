@@ -1624,7 +1624,8 @@ async def stop_scheduler() -> None:
     WHY IT IS WORTH DOING AT ALL. Since 2026-09-06 the worker is rolled on every push to main
     (15-34 merges/day), so this path now runs constantly rather than at a human's pace. Every
     cancelled in-flight run takes `run_isolated`'s wrapper-cancelled branch, which adopts it
-    as a ZOMBIE: an ERROR log naming the #1754 wedge class, plus a terminated DB connection.
+    as a ZOMBIE: an ERROR log naming the #1754 wedge class, plus its DB connection terminated
+    if it has not unwound within its cancel grace.
     Those are the right responses to a run that would not unwind; they are noise for an
     ordinary redeploy, and repeated dozens of times a day they teach people to ignore an
     error that elsewhere means something is genuinely stuck. THAT is the benefit, and it is
