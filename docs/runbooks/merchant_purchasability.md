@@ -1,16 +1,23 @@
 # Merchant purchasability — the fact, the sweep, the gate (WP6)
 
 `db/merchant_purchasability.py` (the rule and the only writer), `jobs/merchant_purchasability_sweep.py`
-(the loop and its bounds), `services/shopify_cart_link_preflight.py` (the detector),
-`routes/merchant_purchasability_ops.py` (the operator read), migration
-`db/migrations/231_merchant_purchasability.sql` (the table).
+(the loop and its bounds, and the job's CLI), `services/shopify_cart_link_preflight.py` (the
+detector), `routes/merchant_purchasability_ops.py` (the operator read), migration
+`db/migrations/231_merchant_purchasability.sql` (the table),
+`infra/gcp/setup_merchant_purchasability_sweep_job.sh` (the job and its trigger).
 
 This rail is **dark by default**, behind **two** dials. `MERCHANT_PURCHASABILITY_SWEEP_ENABLED`
-(the job) and `MERCHANT_PURCHASABILITY_ENFORCE` (the consumers) are both unset: the scheduler job
-is registered but inert, and `routes/agent_commerce_reap.py` does not consult the fact at all.
+(the job) and `MERCHANT_PURCHASABILITY_ENFORCE` (the consumers) are both unset in the code's
+defaults: the sweep's Cloud Run Job is provisioned dark (gate false, trigger paused), and
+`routes/agent_commerce_reap.py` does not consult the fact at all.
 
-**They are two dials because the sweep runs only on the WORKER and the normal backend deploy does
-not ship the worker.** One shared dial, armed on the backend, would switch the refusals on while
+**The sweep is a Cloud Run Job, `merchant-purchasability-sweep`, on the crawl subnet
+`pivota-crawl` (NAT 34.82.199.35), fired hourly by Cloud Scheduler.** It is not a
+`services/audit_scheduler` job any more (it was until 2026-09-27): the worker's egress is the
+payment-partner-allowlisted NAT, and every worker deploy restarted its interval clock. See §9.
+
+**They are two dials because the sweep runs only in that job, and no backend deploy creates,
+re-images or arms it.** One shared dial, armed on the backend, would switch the refusals on while
 nothing gathered facts anywhere — a permanent 409 on every merchant in the catalogue. Arm them in
 the order in §9, never together.
 
@@ -169,24 +176,27 @@ arrival).
 
 | variable | default | bounds | what it does |
 |---|---|---|---|
-| `MERCHANT_PURCHASABILITY_SWEEP_ENABLED` | **unset = off** | truthy allowlist: `1`, `true`, `on`, `yes` (case/space-insensitive) | **DIAL 1 of 2** (`db.merchant_purchasability.is_sweep_enabled`). Gates the sweep JOB and nothing else. Off = the job contacts no merchant, which matters because every check creates an abandoned checkout on a live store. **Set this on the WORKER service** |
+| `MERCHANT_PURCHASABILITY_SWEEP_ENABLED` | **unset = off** | truthy allowlist: `1`, `true`, `on`, `yes` (case/space-insensitive) | **DIAL 1 of 2** (`db.merchant_purchasability.is_sweep_enabled`). Gates the sweep JOB and nothing else. Off = the job contacts no merchant, which matters because every check creates an abandoned checkout on a live store. **Set on the sweep's Cloud Run Job by `setup_merchant_purchasability_sweep_job.sh` — `--enable` sets it true, a run without the flag sets it false.** A value on `web` or `worker` does nothing to the sweep (on `web` it only feeds the ops route's informational `sweep_enabled`) |
 | `MERCHANT_PURCHASABILITY_ENFORCE` | **unset = off** | same truthy allowlist | **DIAL 2 of 2** (`db.merchant_purchasability.is_enforcement_enabled`). Gates the CONSUMERS and nothing else: the Reap route's `merchant_not_purchasable` refusal and the checkout tier's downgrade. Off = a missing fact refuses nothing. Also the `enforced` field the gateway reads |
 | `MERCHANT_PURCHASABILITY_TTL_HOURS` | `72` | `1`–`720` | how long one positive fact stays positive. 720 h is 30 days; past that "fresh" is not a word that means anything |
 | `MERCHANT_PURCHASABILITY_BUYER_VANTAGE` | `worker` | any string, truncated to 32 chars | the vantage `is_purchasable` demands a positive fact **FROM**. See §6 — this is the dial that decides whose question the gate is answering |
 | `VANTAGE_PROXY_URL` | **unset** | must start `http://` or `https://`, else ignored | when set, every merchant is ALSO checked through that proxy and recorded under vantage `proxy`. Anything else is ignored rather than handed to httpx, which would raise inside the run |
-| `MERCHANT_PURCHASABILITY_INTERVAL_SECONDS` | `3600` | `60`–`86400` | the scheduler `interval` trigger **and** `misfire_grace_time`. **Registration-time only** — a change needs a restart. Hourly against a 72 h TTL is 72 chances to refresh a fact before it expires |
-| `MERCHANT_PURCHASABILITY_BATCH` | `20` | `1`–`200` | merchants per run. Each is a full redirect chain plus up to 20 catalog pages, and each leaves an abandoned checkout behind — this is a politeness bound as much as a time bound |
-| `MERCHANT_PURCHASABILITY_BUDGET_SECONDS` | `600` | `30`–`3600` | wall-clock budget for one run. It stops the job **STARTING** a new merchant; one already in flight runs to completion, so a run can exceed this by one merchant's worth of fetches. The scheduler's run deadline for `merchant_purchasability_sweep` is **900 s** |
+| `MERCHANT_PURCHASABILITY_BATCH` | `20` (**pinned on the job** by the setup script) | `1`–`200` | merchants per run. Each is a full redirect chain plus up to 20 catalog pages, and each leaves an abandoned checkout behind — this is a politeness bound as much as a time bound |
+| `MERCHANT_PURCHASABILITY_BUDGET_SECONDS` | `600` (**pinned on the job** by the setup script) | `30`–`3600` | wall-clock budget for one run. It stops the job **STARTING** a new merchant; one already in flight runs to completion, so a run can exceed this by one merchant's worth of fetches. The job's Cloud Run **task timeout is 1200 s** (budget + one merchant, doubled); change the two together, in the script |
 | `MERCHANT_PURCHASABILITY_PAUSE_MS` | `1500` | `0`–`60000` | seconds (in ms) to wait between merchants. One store at a time, unhurried: this rail has no latency requirement and a burst of checkout creations against one platform does not help us |
 
 Two things are deliberately **not** dials: `DEMOTE_AFTER_FAILURES` (2) and the card-brand set.
+Nor is the cadence any more: `MERCHANT_PURCHASABILITY_INTERVAL_SECONDS` was the scheduler
+interval and is **no longer read** — the schedule is the Cloud Scheduler trigger's cron, in the
+setup script. A value left on the `worker` service is inert and may be removed. The request pacing
+(≥ 1.5 s between request starts across the run) is not a dial either: it is the Tier B job's
+`MIN_REQUEST_INTERVAL_S` floor, shared on purpose.
 
-**Why the dial is split.** It was one dial, and one was a bug.
-`services.audit_scheduler._add_job` registers every job only when
-`_queue_worker_enabled()` is true — prod and staging share one Postgres, so only the production
-worker may run singleton crons — and **the normal backend deploy does not ship the worker** (see
-`project_scheduler_lane_runs_on_undeployed_worker_2026_09_02`). A single dial set on the backend
-would therefore arm the refusals while the sweep that feeds them never ran anywhere:
+**Why the dial is split.** It was one dial, and one was a bug. The sweep ran only on the
+production worker then (`_add_job` registers nothing unless `_queue_worker_enabled()`), and it
+runs only in its own Cloud Run Job now — in neither case does a backend deploy start it. A single
+dial set on the backend would therefore arm the refusals while the sweep that feeds them never
+ran anywhere:
 `is_purchasable` finds no fact for any merchant, and the Reap rail answers a permanent 409
 `merchant_not_purchasable` for the entire catalogue until somebody unsets the variable again.
 
@@ -200,7 +210,7 @@ would therefore arm the refusals while the sweep that feeds them never ran anywh
   through another (3/3).**
 * **A human could not open flowerbeauty.com from his browser at all, while our machine could.**
 
-A fact gathered from the worker's egress is a fact about **the worker's egress**. That is why
+A fact gathered from one egress is a fact about **that egress**. That is why
 `vantage` is part of the primary key rather than a label, and why `is_purchasable` requires a
 positive fact **from the vantage named by `MERCHANT_PURCHASABILITY_BUYER_VANTAGE`** (default
 `worker`). A positive fact from any OTHER vantage is evidence for a human, never permission for the
@@ -208,15 +218,38 @@ door.
 
 > **THE BUYER VANTAGE MUST MATCH THE BUYER/PARTNER EGRESS**, or the gate is answering a question
 > nobody asked. The default `worker` is honest — it names where we actually looked — but it is not
-> the buyer's egress unless your buyer pays from the worker's network. Set it, and configure that
+> the buyer's egress unless your buyer pays from our crawl network. Set it, and configure that
 > vantage, before you arm the rail.
+
+### `worker` now means OUR CRAWL EGRESS
+
+Since 2026-09-27 the sweep runs in a Cloud Run Job on `pivota-crawl`, so vantage `worker` names
+**the crawl egress (NAT 34.82.199.35)** — not the worker service, and never the payment NAT
+(8.231.167.230) the worker leaves from. The name was kept deliberately; the alternative was a new
+vantage (say `crawl`) with `MERCHANT_PURCHASABILITY_BUYER_VANTAGE` switched to it. Measured on
+2026-09-27: prod `web` has `MERCHANT_PURCHASABILITY_ENFORCE=1` and **no**
+`MERCHANT_PURCHASABILITY_BUYER_VANTAGE`, so the door reads `worker`. Therefore:
+
+| | keep `worker` (chosen) | new vantage + switch the buyer dial |
+|---|---|---|
+| door change | none | set the dial on `web` |
+| data | the job upserts the **same** PK rows; positive windows carry over | every merchant needs a first positive under the new name **before** the dial moves, or it reads `browse_only` and the Reap rail answers 409 (enforcement is on); the old `worker` rows linger until deleted |
+| a merchant the crawl egress cannot verify | keeps its window (rule 3) and ages out over 72 h — visible as `unverifiable` in the report, with time to act | refused from the moment the dial moves |
+| truthfulness | neither egress is the buyer's (Reap pays from its own network), so the new name buys no truth | same |
+
+And the crawl egress is the one storefronts are known to answer: the Tier B cart-link lane's
+ELIGIBLE rows — most of this population — were observed from `pivota-crawl` by the Tier B job;
+`setup_scheduler.sh` records that a storefront crawl from anywhere else is answered with a
+Cloudflare challenge by most brand hosts. If a reachability difference shows up anyway, it shows
+up as `unverifiable` counts first (§9, "Proof of a run"), never as a demotion.
 
 Setting `VANTAGE_PROXY_URL` adds a second vantage, `proxy`, recorded under the same
 (domain, market) key. **It costs one more abandoned checkout per merchant per run** — that is the
 whole price, and it is why the proxy vantage is opt-in rather than always on.
 
 `GET /ops/merchant-purchasability` reports `buyer_vantage` next to the rows for exactly this
-reason: a reader who looks only at `card_available` will be misled by a positive fact from the
+reason (its `sweep_enabled` field reads `web`'s own copy of the sweep dial, **not** the job's gate —
+the job's gate is `gcloud run jobs describe merchant-purchasability-sweep`): a reader who looks only at `card_available` will be misled by a positive fact from the
 wrong vantage. The route's `tier` field is computed through `is_purchasable` — the same function the
 rail calls — so it is the answer; the rows are only the evidence.
 
@@ -315,8 +348,8 @@ truncated; see "Market is never defaulted"), so a population row spelled
   ```
 
   This removes the row from `list_due`, so `_staleness` sorts that merchant as never-checked and
-  the next tick picks it first. **It also deletes the positive window immediately**: until that
-  tick completes, `is_purchasable` answers False and — with the dial on — the Reap rail refuses
+  the next run picks it first (or execute the job by hand: §9). **It also deletes the positive
+  window immediately**: until that run completes, `is_purchasable` answers False and — with the dial on — the Reap rail refuses
   `merchant_not_purchasable` for that merchant. Delete to *unstick* a merchant, never to "refresh"
   a healthy one.
 
@@ -362,36 +395,132 @@ host, path and click id survive and buyer values do not.
 
 ## 9. Turning it on, and rolling back
 
-The sweep runs **only on the worker service** — `_add_job` registers nothing unless
-`services.audit_scheduler._queue_worker_enabled()` is true, because prod and staging share one
-Postgres. The normal backend deploy does not ship the worker; see
-`project_scheduler_lane_runs_on_undeployed_worker_2026_09_02`. **This is why there are two dials,
-and it is why their order is not negotiable.**
+**The sweep runs only in its Cloud Run Job**, `merchant-purchasability-sweep`, on subnet
+`pivota-crawl`, provisioned by the operator with
+`infra/gcp/setup_merchant_purchasability_sweep_job.sh`. CI does not run that script, and **no
+backend deploy re-images the job**: it runs the `<backend-tag>` it was last given until the script
+is re-run with a newer one. **This is why there are two dials, and it is why their order is not
+negotiable.**
 
-### The arming order
+### The egress rule
 
-1. **Deploy dark.** Both dials unset. The job touches no merchant and
-   `routes/agent_commerce_reap.py` does not consult the fact.
-2. **Set the vantage first.** `MERCHANT_PURCHASABILITY_BUYER_VANTAGE` — and, if that is not the
-   worker's own egress, `VANTAGE_PROXY_URL` — **before** either dial. See §6. Arming with the
+**The sweep must only ever run from `pivota-crawl` (NAT 34.82.199.35).** Never from `worker`,
+`web` or a job on the `default` subnet: their egress is 8.231.167.230, **the address payment
+partners allowlist**, and every check renders a merchant checkout. NAT port exhaustion is per-IP;
+~50 requests over 37 Cloudflare-fronted domains in ~1 minute once tripped a cross-domain, IP-level
+429 for ~15 minutes (`docs/runbooks/tierb_cart_link_eligibility.md`). That is why this is a
+standalone job and **not** an `audit_scheduler` entry — `tests/test_merchant_purchasability.py`
+fails if the worker scheduler ever registers it again. The second reason is cadence: an interval
+job on the worker restarts its clock on every deploy, and on 2026-09-27 (worker revisions 02:10,
+04:03, 04:21) one report landed in four hours. A Cloud Scheduler cron is reset by nothing.
+
+### The job
+
+| | |
+|---|---|
+| Job | `merchant-purchasability-sweep`: `python -m jobs.merchant_purchasability_sweep` — ONE sweep, then exit |
+| Trigger | `merchant-purchasability-sweep-cron`, `7 0-1,4-23 * * *` UTC — :07 past every hour except 02 and 03 (22 runs a day) |
+| Egress | `--network default --subnet pivota-crawl --vpc-egress all-traffic` |
+| Bounds | `--max-retries 0`, `--task-timeout 1200s`; `MERCHANT_PURCHASABILITY_BUDGET_SECONDS=600` and `MERCHANT_PURCHASABILITY_BATCH=20` pinned on the job |
+| Gate | `MERCHANT_PURCHASABILITY_SWEEP_ENABLED` on the job: `false` without `--enable`, `true` with it |
+| Identity | `sa-worker@<project>` (Secret Manager access to `DATABASE_URL`; `run.invoker` for Scheduler) |
+
+**Why that schedule.** Neighbours on the crawl address: the store-audit probes every 5 minutes
+and `retailer-ingest-drain` every 10 (stages of 4–12 minutes, so no minute is drain-free);
+`external-seed-destination-sweep` at 02:20 (task timeout 3600 s, done by 03:20); and
+`tierb-cart-link-eligibility` at 03:30 (task timeout 1800 s, done by 04:00), **which checks the same
+merchants**. `:07` never coincides with a 5- or 10-minute start. A run is over by `:27` at the
+latest, so 01:07 ends before 02:20 and 04:07 starts after the Tier B job's hard stop; 02:07 and
+03:07 are skipped so the sweep never shares the address with either daily crawl. The 01:07 → 04:07
+gap is three hours against a 72 h TTL. Two executions of this job cannot overlap: 1200 s < 3600 s
+(Cloud Run jobs have no `max_instances`; the spacing stands in for the scheduler's old
+`max_instances=1`).
+
+**Why that task timeout.** The budget stops the job STARTING a merchant; one in flight finishes.
+One merchant's realistic worst case is ~300 s (the preflight returns at its first transport
+failure; a slow-but-answering store is at most 20 catalog pages + 10 permalink hops, each start
+≥ 1.5 s apart). 600 + 300 was the old scheduler deadline; 1200 doubles the allowance so the budget,
+not Cloud Run, ends a run. A cut run strands nothing — each fact is one upsert, written as it goes.
+`VANTAGE_PROXY_URL` is deliberately not set on the job: a second vantage doubles every merchant's
+checks, and these numbers are for one.
+
+### Politeness: ~40 merchants, hourly
+
+The population is the union of the two Reap allowlists at merchant grain: 2 merchants until
+2026-09-27, ~37–40 once the Tier B ELIGIBLE rows (since 03:30Z that day) are included.
+
+* **Per request.** Every request of a run — every merchant, every vantage — passes one pacer:
+  request **starts ≥ 1.5 s apart** (the Tier B job's `MIN_REQUEST_INTERVAL_S`, on the same
+  address), one merchant at a time, plus the 1.5 s pause between merchants. Peak rate from this job
+  is therefore **≤ 40 requests/minute**, the same ceiling the Tier B job was given after the 429
+  incident (~50 requests/minute across 37 domains). Before this job existed the sweep spaced only
+  merchants, and one merchant's pages and hops went back to back.
+* **Per run.** At most `BATCH` = 20 merchants. A merchant is ~1 catalog page (250 products; the
+  Tier B rows carry a confirmed variant) + ~2–3 permalink hops ≈ **3–5 requests**, bounded at 30.
+  So a run is **~60–100 requests over ~2–4 minutes** (≥ 1.5 s × requests + 1.5 s × 20 pauses), well
+  inside the 600 s budget — the budget binds only on a pathological store.
+* **Per hour, from the crawl address.** One run: ~60–100 requests, then nothing until the next
+  `:07`. Against the drain and the probes that share the address, that is a small, spaced addition.
+* **Per merchant.** The population is ordered least-recently-checked first, and the batch is a
+  **rotation, not a TTL filter**: with *P* merchants each is checked `22 × min(1, 20 / P)` times a
+  day. At P = 40 that is **~11 checks, i.e. ~11 abandoned checkouts per merchant per day** (plus one
+  from the daily Tier B job); at P ≤ 20 it is 22. For comparison, the worker was running the
+  sweep at a 900 s interval on 2026-09-27 — 96 checks per merchant per day for the 2 merchants
+  then in the population. Lower `BATCH` in the script to cut the per-merchant count once P > 20.
+* **Freshness.** A merchant is re-checked every ~2 h at P = 40, against a 72 h TTL; two consecutive
+  negatives (the demotion rule) therefore land within ~4 h of a merchant turning its card off.
+
+### Cutting over from the worker (one time, 2026-09-27 onwards)
+
+On 2026-09-27 prod ran the sweep on the worker (`MERCHANT_PURCHASABILITY_SWEEP_ENABLED=1`,
+`MERCHANT_PURCHASABILITY_INTERVAL_SECONDS=900` on `worker`) with `MERCHANT_PURCHASABILITY_ENFORCE=1`
+on `web`. **Enforcement is on, so the facts must not lapse.** Order:
+
+1. **Merge.** The on-merge deploy ships a worker without the registration: the payment-NAT sweep
+   stops. The facts it wrote stay positive for 72 h from their last check — that is the window for
+   steps 2–4. Do them the same day.
+2. **Provision dark** with the merged commit's tag and check the job looks right (subnet, gate
+   false, trigger paused):
+   ```sh
+   infra/gcp/setup_merchant_purchasability_sweep_job.sh prod <backend-tag>
+   ```
+3. **Arm:**
+   ```sh
+   infra/gcp/setup_merchant_purchasability_sweep_job.sh prod <backend-tag> --enable
+   ```
+   Optionally run once now instead of waiting for `:07`:
+   `gcloud run jobs execute merchant-purchasability-sweep --region us-west1 --project pivota-prod --wait`.
+4. **Prove it** (next subsection): an execution succeeded, its `SweepReport` line has `checked > 0`,
+   `population_unreadable=0`, `errors=0`, and `checked_at` on the facts has moved.
+5. **Tidy the worker** (optional, any time after 1): `MERCHANT_PURCHASABILITY_SWEEP_ENABLED` and
+   `MERCHANT_PURCHASABILITY_INTERVAL_SECONDS` on `worker` are now inert.
+
+**Never run the old and the new together.** If a worker revision that still registers the sweep
+is serving (a rollback past this change), unset `MERCHANT_PURCHASABILITY_SWEEP_ENABLED` on `worker`
+before arming the job — two sweeps double the abandoned checkouts, and one of them is on the
+payment NAT.
+
+### The arming order (a fresh environment)
+
+1. **Deploy dark.** Both dials unset; provision the job without `--enable`. The job touches no
+   merchant and `routes/agent_commerce_reap.py` does not consult the fact.
+2. **Set the vantage first.** `MERCHANT_PURCHASABILITY_BUYER_VANTAGE` — and, if that is not our
+   crawl egress, `VANTAGE_PROXY_URL` on the job — **before** either dial. See §6. Arming with the
    wrong vantage gates on a fact about a network the buyer does not pay from.
-3. **`MERCHANT_PURCHASABILITY_SWEEP_ENABLED=1`, ON THE WORKER.** Nothing is refused yet. The job
-   begins gathering facts on its next tick; no redeploy and no scheduler restart.
-4. **Wait for one full pass over the population.** At the defaults that is
-   `ceil(population / MERCHANT_PURCHASABILITY_BATCH)` ticks, i.e. `ceil(population / 20)` hours
-   at the hourly interval. Watch the sweep's counts-only report:
-   `population / checked / positive / negative / unverifiable / written / abandoned_budget /
-   errors / skipped_disabled / duration_ms`. A pass is complete when `checked` has covered
-   `population` across ticks. **`errors` is the only count that should page anyone**; a high
-   `unverifiable` is not an error, it is the egress telling you something, and §6 is where to look.
-   Where to read it, and what counts as proof of a run, is the next subsection.
+3. **Arm the job** — `setup_merchant_purchasability_sweep_job.sh <env> <backend-tag> --enable`.
+   Nothing is refused yet. The job gathers facts from its next run.
+4. **Wait for one full pass over the population.** `ceil(population / 20)` runs, i.e. that many
+   hours (skipping 02 and 03 UTC). A pass is complete when `checked` has covered `population`
+   across runs. **`errors` and `population_unreadable` are the counts that should page anyone**
+   (both fail the execution); a high `unverifiable` is not an error, it is the egress telling you
+   something, and §6 is where to look.
 5. **Verify coverage merchant by merchant** through
    `GET /ops/merchant-purchasability?domain=…&market=…`. Every merchant you expect to be
    purchasable must read `"tier": "purchase"`. If one stays `browse_only`, the response's `note`
    names the three candidate reasons — a positive row under a DIFFERENT vantage, an expired
    window, or two consecutive negatives — and §7's demotion query tells you which. **Do not skip
    this step:** it is the only thing standing between step 6 and a 409 on a live merchant.
-6. **`MERCHANT_PURCHASABILITY_ENFORCE=1`.** Only now does a missing fact refuse a purchase.
+6. **`MERCHANT_PURCHASABILITY_ENFORCE=1`** on `web`. Only now does a missing fact refuse a purchase.
 
 7. **AUTH: the two OIDC envs, ON THE BACKEND FIRST** — `OPS_GATEWAY_OIDC_AUDIENCE` and
    `OPS_GATEWAY_SERVICE_ACCOUNTS`. Both or neither. See §10.
@@ -406,49 +535,70 @@ and it is why their order is not negotiable.**
 
 > **Arming these in the other order is the outage.** With `ENFORCE` on and no facts gathered,
 > every merchant reads `browse_only` and the Reap rail refuses `merchant_not_purchasable` (409)
-> for all of them. Because the job is worker-only, setting `SWEEP_ENABLED` on the backend does
-> not fix it — the sweep is not running there at all.
+> for all of them. Setting `SWEEP_ENABLED` on `web` or `worker` does not fix it — the sweep runs
+> only in its job, and only the setup script's `--enable` arms that.
 >
 > Steps 7–8 are independent of 1–6 and may be done at any point, but the **order between them**
 > is not optional, and for the same reason in reverse: gateway-first is silent. See §10.
 
-### Proof of a run, and where the report line lands
+### Proof of a run: the job's execution, and the `SweepReport` line
 
-**`/__scheduler_health` is the authoritative proof that the sweep ran.** On the worker,
-`runs.merchant_purchasability_sweep` carries `runs_started / runs_ok / runs_failed /
-runs_deadline_exceeded`, `last_started_at`, `last_finished_at`, `last_duration_ms` and
-`last_outcome`; `runs_ok` going up by one per interval is a run, whatever the logs say. The log
-line is the **content** of a run, not the evidence that it happened.
+**The authoritative proof is a SUCCEEDED execution of the job.** (`/__scheduler_health` on the
+worker no longer lists the sweep at all.)
 
-The per-run report lands on the **worker's stdout** (Cloud Logging, the worker service, severity
-INFO) as one line in `utils.logger`'s format:
-
-```
-[2026-09-23 09:43:20,118] INFO - merchant_purchasability_sweep: SweepReport(population=20, population_skipped_unusable=0, population_skipped_market_unknown=0, checked=20, positive=14, negative=2, unverifiable=4, written=20, abandoned_budget=0, errors=0, skipped_disabled=0, duration_ms=48213)
+```sh
+gcloud run jobs executions list --job merchant-purchasability-sweep \
+  --region us-west1 --project pivota-prod --limit 5
 ```
 
-(The line as measured on 2026-09-23 had no `population_skipped_market_unknown` — the field was
-added on 2026-09-26, after `population_skipped_unusable`; the sample above shows the current
-shape with that run's counts.)
+One execution per scheduled hour; the exit code is the run's verdict, and a non-zero one fails the
+execution and trips the "Cloud Run job failing" alert:
 
-With the dial off the run logs, at the same place and level,
-`merchant_purchasability_sweep: disabled; no merchant was contacted` and returns
-`skipped_disabled=1` — at the hourly interval that line is the sign the worker is still ticking
-while the rail is disarmed. A skipped allowlist row (a `merchant_domain` that is not a bare host
-name, §7's census query) logs once per run, as a count, at WARNING on the same channel.
+| Exit | Meaning | Do |
+|---|---|---|
+| 0 | done — including a dark run (gate off, nobody contacted), an empty population, and a run the budget cut short (the rest are first next hour) | nothing |
+| 1 | a population lane could not be read (`population_unreadable > 0`), or the population could not be built at all. Whatever *was* read was still swept | read the log's `population lane(s) could not be read` line and the WARNING before it (it names the lane and the error type); with `ENFORCE` on, merchants on the unread allowlist are ageing towards a 409 |
+| 4 | the population was read, but a check raised or a fact could not be written (`errors > 0`) | read the job log; the per-check lines carry the vantage and the error type, never the merchant |
 
-**Why this is spelled out.** Measured 2026-09-23: `/__scheduler_health` showed `runs_ok=1` at
-08:43:20Z on worker-00167-pjr and Cloud Logging held **zero** `merchant_purchasability_sweep:`
-lines. The report went through the module logger (`logging.getLogger(__name__)`), and nothing in
-this process configures the root logger — `middleware/structured_logging.py` configures only the
-`structured_logs` logger, uvicorn only `uvicorn.*` — so root sits at Python's default WARNING and
-a module logger's INFO is dropped at the logger. The only INFO that reaches prod is the `pivota`
-logger in `utils/logger.py` (own INFO level, own stdout handler, `propagate=False`), which is the
-channel the report, the disabled line and the skip line now use. **Do not "fix" a missing line by
-configuring root**: that floods prod with INFO from every module and changes the uvicorn
-access-log redaction path (`main.install_uvicorn_access_log_redaction`). Everything else this job
-logs — dial warnings, per-check errors — stays on the module logger, where WARNING and above
-still land. The same applies to `jobs/reap_agentic_purchase_poll.py`'s
+`--max-retries 0`: a failed execution is not re-run automatically (a re-run is another round of
+abandoned checkouts); the next hour's run is the retry.
+
+**The content of a run** is one line on the job's stdout, in `utils.logger`'s format (Cloud
+Logging → Cloud Run Jobs → `merchant-purchasability-sweep`, severity INFO):
+
+```
+[2026-09-23 09:43:20,118] INFO - merchant_purchasability_sweep: SweepReport(population=20, population_skipped_unusable=0, population_skipped_market_unknown=0, population_unreadable=0, checked=20, positive=14, negative=2, unverifiable=4, written=20, abandoned_budget=0, errors=0, skipped_disabled=0, duration_ms=48213)
+```
+
+```sh
+gcloud logging read 'resource.type="cloud_run_job"
+  AND resource.labels.job_name="merchant-purchasability-sweep"
+  AND textPayload:"merchant_purchasability_sweep: SweepReport("' \
+  --project pivota-prod --freshness 6h --limit 10 --format 'value(timestamp,textPayload)'
+```
+
+(The sample's counts are illustrative; its shape is current. `population_skipped_market_unknown`
+was added on 2026-09-26 and `population_unreadable` on 2026-09-27; the line is emitted on a run
+whose population could not be built too.) Read it as: `population` merchants taken this run
+(≤ `BATCH`); `checked` fetched; `positive / negative / unverifiable` partition `checked`;
+`written` facts upserted; `abandoned_budget` not started because the budget ran out. With the
+gate off the run logs `merchant_purchasability_sweep: disabled; no merchant was contacted` and
+exits 0. A skipped allowlist row (a `merchant_domain` that is not a bare host name, §7's census
+query; or a non-ISO-2 market) logs once per run, as a count, at WARNING on the same channel.
+
+**Why the line goes through `utils.logger`.** Measured 2026-09-23 on the worker:
+`/__scheduler_health` showed `runs_ok=1` and Cloud Logging held **zero**
+`merchant_purchasability_sweep:` lines. The report went through the module logger
+(`logging.getLogger(__name__)`), and nothing in the process configures the root logger —
+`middleware/structured_logging.py` configures only the `structured_logs` logger, uvicorn only
+`uvicorn.*` — so root sits at Python's default WARNING and a module logger's INFO is dropped at the
+logger. The only INFO that reaches prod is the `pivota` logger in `utils/logger.py` (own INFO
+level, own stdout handler, `propagate=False`), which is the channel the report, the disabled line
+and the skip lines use; it lands the same way from the job. **Do not "fix" a missing line by
+configuring root**: that floods INFO from every module (and in `web`, changes the uvicorn
+access-log redaction path, `main.install_uvicorn_access_log_redaction`). Everything else this job
+logs — dial warnings, per-check errors, the lane-failure detail — stays on the module logger, where
+WARNING and above still land (stderr). The same applies to `jobs/reap_agentic_purchase_poll.py`'s
 `reap_agentic_poll: PollReport(...)` line, which had 155 ok runs and zero lines the same day.
 
 A test cannot see this through `caplog`, which hangs its handler on root and turns the level
@@ -616,11 +766,18 @@ the explicit `market_unknown` answer instead of a 422.
   `false`, which tells the gateway to fall back to its previous behaviour;
 * the sweep **keeps running** and keeps the facts fresh, so re-arming later needs no second wait.
 
-Unset `MERCHANT_PURCHASABILITY_SWEEP_ENABLED` as well to stop contacting merchants; the sweep then
-returns `skipped_disabled=1` and logs `merchant_purchasability_sweep: disabled; no merchant was
-contacted` each tick (see "Proof of a run" above). Unsetting only the sweep dial while leaving `ENFORCE` on is the
-misordered state again — the facts age out through the TTL and merchants silently become
-`browse_only` one by one.
+To stop contacting merchants as well, **disarm the job**: re-run the setup script **without**
+`--enable` (gate false on the job, trigger paused). A dark job started by hand exits 0 and logs
+`merchant_purchasability_sweep: disabled; no merchant was contacted` (see "Proof of a run"
+above). Setting the dial on `web` or `worker` does nothing to the job. Disarming the job while
+leaving `ENFORCE` on is the misordered state again — the facts age out through the TTL and
+merchants silently become `browse_only` one by one.
+
+**Rolling back the MOVE itself** (the crawl egress turns out to be worse than the payment NAT for
+some merchant — the report's `unverifiable` climbs and §7 shows it): do not re-register the
+worker job by hand. Revert this change's `services/audit_scheduler.py` hunk and deploy, and disarm
+the job first, so the two never run together; the facts keep their windows through the switch
+(same vantage name, same rows) — and remember the payment-NAT reasons it left.
 
 Nothing needs to be un-migrated and no row needs deleting: stale facts are simply not read. The
 rows stay, and they are still readable through the ops route (which is not gated on the dial), so

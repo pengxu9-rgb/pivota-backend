@@ -2931,16 +2931,22 @@ SELECT DISTINCT merchant_domain, market_country
 """
 
 
-async def list_enabled_merchant_markets() -> List[Dict[str, Any]]:
+async def list_enabled_merchant_markets(*, strict: bool = False) -> List[Dict[str, Any]]:
     """The variant lane's merchant x market set, as `[{"merchant_domain", "market_country"}]`.
 
     Fails SOFT (empty list) when the table is absent — a SQLite dev database or a partially
     migrated environment contributes nothing rather than ending a caller's sweep.
+
+    `strict=True` RAISES instead. An empty list and an unreadable table are different answers,
+    and a caller that must report the difference (the purchasability sweep's Cloud Run job exits
+    non-zero on an unreadable population) cannot recover it from the soft form.
     """
     try:
         rows = await database.fetch_all(
             _ENABLED_MERCHANT_MARKETS_SQL, {"merchant_row": ELIGIBILITY_MERCHANT_ROW}
         )
     except Exception:  # noqa: BLE001 - see the docstring
+        if strict:
+            raise
         return []
     return [dict(r) for r in rows]
