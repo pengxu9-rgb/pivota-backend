@@ -67,7 +67,12 @@ Design notes:
   - Bulk upserted to index_pipeline_state via execute_many.
   - A second-pass UPDATE applies extractor_regression blocker.
   - Best-effort per-batch: errors are caught and logged, job continues.
-  - Advisory lock prevents double-runs from cron misfire stacking.
+  - Advisory lock prevents two runs at once (two instances during a deploy
+    overlap, or the 04:00 cron and a catch-up tick). It is held on a connection
+    pinned for the whole run; see `_run`.
+  - A run killed before its last step (a worker redeploy cancels it; see
+    db/scheduler_job_slots.py) is re-run the same day by
+    `run_nightly_index_health_catch_up`, registered every 10 minutes.
 """
 
 from __future__ import annotations
@@ -77,6 +82,8 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
+
+from db import scheduler_job_slots
 
 from services.index_pipeline_state_service import (
     CONSOLIDATION_VERSION,
@@ -105,6 +112,24 @@ REGRESSION_THRESHOLD = 0.20  # coverage drop > 20% → 'regression'
 MIN_DOMAIN_SAMPLE = 5        # minimum products per domain for scoring
 BATCH_SIZE = 500
 
+# The scheduler job id, and the UTC slot its cron fires at. Must match the
+# `nightly_index_health` registration in services/audit_scheduler.py (hour=4,
+# minute=0); tests/test_nightly_index_health_catch_up.py pins the two together.
+JOB_ID = "nightly_index_health"
+SLOT_HOUR_UTC = 4
+
+# Catch-up stops re-running a slot after this many attempts. Three causes use
+# them up: redeploy kills, a batch fetch that keeps failing, and a run that dies by itself (an OOM that takes the whole
+# worker down, a deadline). A full run takes ~5 minutes (measured 2026-09-26/27)
+# and deploys averaged ~9/day over 25 days, so even a burst of merges rarely
+# kills six runs in a row, while re-running a self-killing job all day would
+# repeat its damage (an OOM restarts the worker, taking every other job with it).
+CATCH_UP_MAX_ATTEMPTS = 6
+
+# Slots this process has already raised the attempts-exhausted ERROR for, so it
+# fires once per slot rather than on every 10-minute tick for the rest of the day.
+_EXHAUSTED_SLOTS_LOGGED: Set[str] = set()
+
 # Stable signed-int64 advisory lock id for this job.
 # Derived from the job name so it never collides with per-merchant locks.
 _JOB_LOCK_ID: int = int.from_bytes(
@@ -119,6 +144,15 @@ _JOB_LOCK_ID: int = int.from_bytes(
 # ---------------------------------------------------------------------------
 
 async def _try_acquire_job_lock() -> bool:
+    """Take the job's session-level advisory lock on the CALLER'S PINNED
+    connection (see `_run`). Unpinned, the lock is released the moment it is
+    taken: every `database.*` call hands its raw connection back to the pool,
+    and asyncpg's reset on release runs `pg_advisory_unlock_all()`.
+
+    Fails CLOSED on a lock error. It used to fail open ("better to double-run
+    than block"); now that a skipped run is retried by the catch-up tick within
+    10 minutes, failing open buys nothing and risks two runs at once.
+    """
     from db.database import database
     db_url = str(getattr(database, "url", "") or "")
     if not db_url.startswith(("postgres://", "postgresql://")):
@@ -130,8 +164,11 @@ async def _try_acquire_job_lock() -> bool:
         )
         return bool(row and row["got"])
     except Exception as exc:  # noqa: BLE001
-        logger.warning("nightly_index_health: advisory lock attempt failed: %s", exc)
-        return True  # fail open — better to double-run than block
+        logger.warning(
+            "nightly_index_health: advisory lock attempt failed, skipping this "
+            "run (catch-up retries it): %s", exc,
+        )
+        return False
 
 
 async def _release_job_lock() -> None:
@@ -625,16 +662,124 @@ async def _submit_indexnow_transitions(
 # ---------------------------------------------------------------------------
 
 async def run_nightly_index_health() -> Dict[str, Any]:
-    """Entry point called by APScheduler at 04:00 UTC.
+    """Entry point called by APScheduler at 04:00 UTC (and by an operator's
+    run-now). Runs unconditionally, whatever the slot ledger says.
 
     Returns a summary dict for logging. Never raises — all errors are
     caught, logged, and included in the summary.
     """
+    return await _run(catch_up=False)
+
+
+async def run_nightly_index_health_catch_up() -> Dict[str, Any]:
+    """Entry point called by APScheduler every 10 minutes (and ~90s after boot).
+
+    Re-runs the job when the current 04:00 UTC slot has no completed run: the
+    04:00 run was cancelled by a redeploy (2026-09-23, 2026-09-27), the instance
+    that should have fired it was not up at 04:00, or it lost the lock to an
+    instance that was then killed. A no-op otherwise — one lock round-trip and
+    one ledger read. Decides under the job lock, so it can never overlap a
+    running 04:00 run, and never repeats one that finished.
+    """
+    return await _run(catch_up=True)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+async def _run(*, catch_up: bool) -> Dict[str, Any]:
     from db.database import database
 
-    run_start = datetime.now(timezone.utc)
+    # PIN ONE CONNECTION FOR THE WHOLE RUN. The advisory lock is session-level,
+    # and on databases 0.7.0 each `database.*` call outside a connection block
+    # acquires a pool connection and releases it again, and asyncpg's reset on
+    # release runs pg_advisory_unlock_all(). Unpinned, the lock taken below was
+    # released the instant it was granted (measured: 0 advisory locks held right
+    # after a successful pg_try_advisory_lock), so it never stopped two runs at
+    # once. Inside this block every nested `database.*` call in this task reuses
+    # the one raw connection, so the lock is held until `_release_job_lock` — or
+    # until the session ends. On a redeploy the cancelled run unwinds through
+    # that `finally` (and the pool's reset on release runs pg_advisory_unlock_all
+    # anyway); if the process dies instead, Postgres drops the session. A run
+    # that will NOT unwind (a zombie hung on a dead socket) keeps the lock until
+    # the process exits: run_isolated's connection terminate does not reach it
+    # today, so every catch-up tick then logs "lock held" at WARNING until the
+    # next deploy replaces the process.
+    async with database.connection():
+        return await _run_on_pinned_connection(catch_up=catch_up)
+
+
+async def _claim_slot(
+    slot_date: str, run_start: datetime, *, catch_up: bool, summary: Dict[str, Any],
+) -> bool:
+    """Under the job lock: decide whether this run goes ahead, and count it.
+
+    Scheduled (catch_up=False): always goes ahead; the ledger is best-effort.
+    Catch-up: goes ahead only when the slot has no completed run and fewer than
+    CATCH_UP_MAX_ATTEMPTS attempts. It fails CLOSED on any ledger error — an
+    unreadable ledger cannot show a finished run, so failing open would re-run
+    the whole job every 10 minutes.
+    """
+    try:
+        ready = await scheduler_job_slots.ensure_scheduler_job_slots_table()
+        if catch_up:
+            if not ready:
+                raise RuntimeError("scheduler_job_slots table is not available")
+            state = await scheduler_job_slots.read_slot(JOB_ID, slot_date)
+            if state is not None and state.get("completed_at") is not None:
+                summary["skipped"] = True
+                summary["skip_reason"] = "already_completed"
+                return False
+            attempts = int((state or {}).get("attempts") or 0)
+            if attempts >= CATCH_UP_MAX_ATTEMPTS:
+                if slot_date not in _EXHAUSTED_SLOTS_LOGGED:
+                    _EXHAUSTED_SLOTS_LOGGED.add(slot_date)
+                    logger.error(
+                        "nightly_index_health: slot %s has %d attempts and none "
+                        "completed; catch-up has stopped re-running it. The next "
+                        "04:00 UTC run is unaffected.",
+                        slot_date, attempts,
+                    )
+                summary["skipped"] = True
+                summary["skip_reason"] = "attempts_exhausted"
+                return False
+            # WARNING, not info: prod drops INFO from module loggers, and this
+            # line is the evidence that a killed run was recovered.
+            logger.warning(
+                "nightly_index_health: catch-up: slot %s has %d attempt(s) and no "
+                "completed run; running it now",
+                slot_date, attempts,
+            )
+        summary["attempt"] = await scheduler_job_slots.record_attempt(
+            JOB_ID, slot_date, run_start,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if catch_up:
+            logger.warning(
+                "nightly_index_health: catch-up skipped, slot ledger unavailable: %s",
+                exc,
+            )
+            summary["skipped"] = True
+            summary["skip_reason"] = "ledger_unavailable"
+            return False
+        logger.warning(
+            "nightly_index_health: could not record the attempt in the slot "
+            "ledger (the run continues): %s", exc,
+        )
+        summary["errors"].append(f"slot_ledger_attempt: {exc!r}")
+    return True
+
+
+async def _run_on_pinned_connection(*, catch_up: bool) -> Dict[str, Any]:
+    from db.database import database
+
+    run_start = _utcnow()
+    slot_date = scheduler_job_slots.slot_for(run_start, hour=SLOT_HOUR_UTC)
     summary: Dict[str, Any] = {
         "run_start": run_start.isoformat(),
+        "slot_date": slot_date,
+        "catch_up": catch_up,
         "consolidation_version": CONSOLIDATION_VERSION,
         "total_processed": 0,
         "eligible_count": 0,
@@ -648,14 +793,24 @@ async def run_nightly_index_health() -> Dict[str, Any]:
 
     # 1. Acquire job-level advisory lock
     if not await _try_acquire_job_lock():
-        logger.info(
-            "nightly_index_health: another instance holds the advisory lock; "
-            "skipping this run"
+        # WARNING: with a real lock this is no longer routine noise. It means a
+        # run is in flight (normal, at most once a day for a catch-up tick) or a
+        # wedged run is holding the lock (every tick, until the process goes),
+        # and prod drops INFO.
+        logger.warning(
+            "nightly_index_health: another run holds the advisory lock; "
+            "skipping this %s run", "catch-up" if catch_up else "scheduled",
         )
         summary["skipped"] = True
+        summary["skip_reason"] = "lock_held"
         return summary
 
     try:
+        if not await _claim_slot(
+            slot_date, run_start, catch_up=catch_up, summary=summary,
+        ):
+            return summary
+
         # 2. Score the domain extractors FIRST, then read the regression set.
         #
         # ORDER IS THE RECOVERY PATH. The batch below re-derives every live
@@ -747,6 +902,9 @@ async def run_nightly_index_health() -> Dict[str, Any]:
                 )
                 summary["batch_errors"] += 1
                 summary["errors"].append(f"batch_fetch cursor={cursor!r}: {exc!r}")
+                # Every key after `cursor` goes unclassified: this run did not
+                # finish its work (step 8 leaves the slot open).
+                summary["batch_fetch_failed"] = True
                 break
 
             if not rows:
@@ -896,6 +1054,38 @@ async def run_nightly_index_health() -> Dict[str, Any]:
             )
             summary["errors"].append(f"regression_blocker_update: {exc!r}")
 
+        # 8. Record the slot as done, still under the lock, so a catch-up tick
+        # can never see this run's work finished but not recorded and repeat it.
+        # A run cancelled at any earlier await never gets here, and that is the
+        # whole signal catch-up reads. IndexNow below is not part of it: a re-run
+        # could not re-send the killed run's pings anyway (its before-snapshot is
+        # taken after them).
+        #
+        # A failed batch FETCH ends the reclassify loop early (a statement
+        # timeout on one page leaves every later key unclassified, the same
+        # damage as a kill), so that run is NOT recorded as done: catch-up
+        # retries it, bounded by CATCH_UP_MAX_ATTEMPTS. A failed UPSERT does not
+        # end the loop (every other page is still written) and is likely
+        # data-dependent, so it would recur on every re-run: that run is still
+        # recorded as done, and the error stays in the summary.
+        try:
+            if summary.get("batch_fetch_failed"):
+                logger.warning(
+                    "nightly_index_health: a batch fetch failed; slot %s left "
+                    "incomplete so catch-up retries it", slot_date,
+                )
+            else:
+                await scheduler_job_slots.record_completion(
+                    JOB_ID, slot_date, _utcnow(),
+                )
+                summary["slot_completed"] = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "nightly_index_health: could not record slot %s as completed "
+                "(catch-up may re-run it): %s", slot_date, exc,
+            )
+            summary["errors"].append(f"slot_ledger_completion: {exc!r}")
+
     finally:
         await _release_job_lock()
 
@@ -910,9 +1100,11 @@ async def run_nightly_index_health() -> Dict[str, Any]:
     summary["run_end"] = run_end.isoformat()
     summary["duration_seconds"] = round(duration_s, 1)
 
-    logger.info(
-        "nightly_index_health: completed in %.1fs — "
+    # A catch-up run logs at WARNING so its outcome survives prod's INFO filter.
+    (logger.warning if catch_up else logger.info)(
+        "nightly_index_health: %scompleted in %.1fs — "
         "processed=%d eligible=%d stages=%s regression_domains=%d errors=%d",
+        "catch-up run for slot %s " % slot_date if catch_up else "",
         duration_s,
         summary["total_processed"],
         summary["eligible_count"],

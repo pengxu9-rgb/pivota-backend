@@ -123,6 +123,9 @@ _JOB_RUN_DEADLINES = {
     # INLINE (gather of 3, each routinely >15 min): 4h.
     "daily_audit_check": 14400,
     "nightly_index_health": 7200,
+    # Mostly a one-read no-op; when it does re-run the job it is the same ~5 min
+    # run as nightly_index_health, so the same backstop.
+    "nightly_index_health_catch_up": 7200,
     "outcome_aggregation_daily": 7200,
     "catalog_invariant_sweep": 7200,
     "identity_reconcile_sweep": 7200,
@@ -424,6 +427,28 @@ async def start_scheduler() -> None:
             id="nightly_index_health",
             replace_existing=True,
             misfire_grace_time=3600,
+            coalesce=True,
+        )
+
+        # Same-day catch-up for nightly_index_health. This schedule lives in
+        # memory, so a redeploy that cancels the 04:00 run mid-flight (2026-09-23,
+        # 2026-09-27; see db/scheduler_job_slots.py) used to lose it until the
+        # next day: the new instance's cron is already past 04:00. The first tick
+        # comes ~90s after boot, which is exactly the redeploy case. By then the
+        # old instance has been shut down and its lock released. After that it
+        # ticks every 10 minutes and re-runs the job only when today's slot has
+        # no completed run. The job's advisory lock covers that decision, so it
+        # never overlaps a run in flight here or on another instance.
+        from datetime import datetime as _dt_cu, timedelta as _td_cu, timezone as _tz_cu
+        from jobs.nightly_index_health_job import run_nightly_index_health_catch_up
+        _add_job(
+            run_nightly_index_health_catch_up,
+            "interval",
+            minutes=10,
+            next_run_time=_dt_cu.now(_tz_cu.utc) + _td_cu(seconds=90),
+            id="nightly_index_health_catch_up",
+            replace_existing=True,
+            misfire_grace_time=600,
             coalesce=True,
         )
 

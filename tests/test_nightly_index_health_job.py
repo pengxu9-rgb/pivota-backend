@@ -947,10 +947,18 @@ class _FakeNightlyDb:
     async def fetch_one(self, query, values=None):
         if "alert_state = 'regression'" in query:
             return {"n": len(self._regressed())}
+        if "scheduler_job_slots" in query:
+            return {"attempts": 1}  # the slot ledger's RETURNING attempts
         return {"n": 0}
 
     async def execute(self, query, values=None):
         self.executed.append(query)
+
+    def connection(self):
+        # The run pins one connection for its advisory lock; nothing to pin here.
+        import contextlib
+
+        return contextlib.nullcontext()
 
     async def execute_many(self, query, values):
         self.upserts.extend(values)
