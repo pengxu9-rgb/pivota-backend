@@ -307,6 +307,24 @@ async def test_a_run_cut_short_by_a_batch_error_is_not_recorded_as_done(monkeypa
     assert out["slot_completed"] is True and hybrid.upserted[2:] == KEYS
 
 
+async def test_an_upsert_error_still_completes_the_slot(monkeypatch, runner, real_db, clock):
+    """An upsert failure does not end the loop, and a data-dependent one would recur on every
+    re-run: leaving the slot open would burn all six attempts on the 2-vCPU primary."""
+    hybrid = _HybridDb(real_db)
+    _install(monkeypatch, hybrid)
+
+    async def _bad_page(query, values):
+        if any(v["content_key"] == "ck_c" for v in values):
+            raise ValueError("invalid byte sequence for encoding UTF8: 0x00")
+        hybrid.upserted.extend(v["content_key"] for v in values)
+
+    monkeypatch.setattr(hybrid, "execute_many", _bad_page)
+    out = await job.run_nightly_index_health()
+    assert out["batch_errors"] == 1 and out["slot_completed"] is True
+    assert hybrid.upserted == ["ck_a", "ck_b", "ck_e"]  # the loop went on past the bad page
+    assert (await _ledger(real_db))["completed_at"] is not None
+
+
 async def test_the_lock_fails_closed(monkeypatch, runner, real_db, clock):
     """A lock query that errors must skip the run, not run it unlocked: catch-up retries
     within 10 minutes, so failing open would only buy a chance of two runs at once."""

@@ -118,8 +118,8 @@ BATCH_SIZE = 500
 JOB_ID = "nightly_index_health"
 SLOT_HOUR_UTC = 4
 
-# Catch-up stops re-running a slot after this many attempts. Two causes use them
-# up: redeploy kills, and a run that dies by itself (an OOM that takes the whole
+# Catch-up stops re-running a slot after this many attempts. Three causes use
+# them up: redeploy kills, a batch fetch that keeps failing, and a run that dies by itself (an OOM that takes the whole
 # worker down, a deadline). A full run takes ~5 minutes (measured 2026-09-26/27)
 # and deploys averaged ~9/day over 25 days, so even a burst of merges rarely
 # kills six runs in a row, while re-running a self-killing job all day would
@@ -902,6 +902,9 @@ async def _run_on_pinned_connection(*, catch_up: bool) -> Dict[str, Any]:
                 )
                 summary["batch_errors"] += 1
                 summary["errors"].append(f"batch_fetch cursor={cursor!r}: {exc!r}")
+                # Every key after `cursor` goes unclassified: this run did not
+                # finish its work (step 8 leaves the slot open).
+                summary["batch_fetch_failed"] = True
                 break
 
             if not rows:
@@ -1058,16 +1061,18 @@ async def _run_on_pinned_connection(*, catch_up: bool) -> Dict[str, Any]:
         # could not re-send the killed run's pings anyway (its before-snapshot is
         # taken after them).
         #
-        # A batch error ends the reclassify loop early (a statement timeout on
-        # one page leaves every later key unclassified, the same damage as a
-        # kill), so such a run is NOT recorded as done: catch-up retries it,
-        # bounded by CATCH_UP_MAX_ATTEMPTS.
+        # A failed batch FETCH ends the reclassify loop early (a statement
+        # timeout on one page leaves every later key unclassified, the same
+        # damage as a kill), so that run is NOT recorded as done: catch-up
+        # retries it, bounded by CATCH_UP_MAX_ATTEMPTS. A failed UPSERT does not
+        # end the loop (every other page is still written) and is likely
+        # data-dependent, so it would recur on every re-run: that run is still
+        # recorded as done, and the error stays in the summary.
         try:
-            if summary["batch_errors"]:
+            if summary.get("batch_fetch_failed"):
                 logger.warning(
-                    "nightly_index_health: %d batch error(s); slot %s left "
-                    "incomplete so catch-up retries it",
-                    summary["batch_errors"], slot_date,
+                    "nightly_index_health: a batch fetch failed; slot %s left "
+                    "incomplete so catch-up retries it", slot_date,
                 )
             else:
                 await scheduler_job_slots.record_completion(
