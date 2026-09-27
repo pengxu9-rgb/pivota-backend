@@ -36,11 +36,11 @@ _TRIPPED_GUARD = {
 }
 
 
-async def _true() -> bool:
-    return True
+async def _acquired():
+    return True, None
 
 
-async def _noop() -> None:
+async def _noop(_lock) -> None:
     return None
 
 
@@ -79,7 +79,7 @@ def _stub_tick(monkeypatch, *, missing, schema=None, inserted=5, sig=55, guard=N
         }
 
     monkeypatch.setenv(ENV_ENABLED, "true")
-    monkeypatch.setattr(job_module, "_try_acquire_materialization_lock", lambda: _true())
+    monkeypatch.setattr(job_module, "_try_acquire_materialization_lock", _acquired)
     monkeypatch.setattr(job_module, "_release_materialization_lock", _noop)
     monkeypatch.setattr(mirror_module, "_required_schema", fake_schema)
     monkeypatch.setattr(mirror_module, "count_missing_catalog_mirrors", fake_missing)
@@ -112,7 +112,7 @@ async def test_materialization_job_disabled_does_not_apply(monkeypatch) -> None:
 async def test_materialization_job_no_missing_rows_skips_apply(monkeypatch) -> None:
     released = False
 
-    async def fake_release() -> None:
+    async def fake_release(_lock) -> None:
         nonlocal released
         released = True
 
@@ -276,7 +276,7 @@ async def test_tick_counts_missing_through_the_cheap_chain(monkeypatch) -> None:
         return 0
 
     monkeypatch.setenv(ENV_ENABLED, "true")
-    monkeypatch.setattr(job_module, "_try_acquire_materialization_lock", lambda: _true())
+    monkeypatch.setattr(job_module, "_try_acquire_materialization_lock", _acquired)
     monkeypatch.setattr(job_module, "_release_materialization_lock", _noop)
 
     async def fake_schema():
@@ -328,7 +328,7 @@ async def test_lock_is_released_when_apply_raises(monkeypatch) -> None:
     not strand it and wedge every future tick behind `lock_not_acquired`."""
     released = False
 
-    async def fake_release() -> None:
+    async def fake_release(_lock) -> None:
         nonlocal released
         released = True
 

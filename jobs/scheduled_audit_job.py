@@ -30,9 +30,11 @@ import asyncio
 import os
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.sql import select
+
+from db.session_advisory_lock import AdvisoryLockUnavailable, DedicatedSessionAdvisoryLock
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +205,9 @@ def _advisory_lock_id_for_merchant(merchant_id: str) -> int:
     return raw
 
 
-async def _try_acquire_scheduler_lock(merchant_id: str) -> bool:
+async def _try_acquire_scheduler_lock(
+    merchant_id: str,
+) -> Tuple[bool, Optional[DedicatedSessionAdvisoryLock]]:
     """P1-5: leader-election for per-merchant scheduled audits.
 
     pg_try_advisory_lock is non-blocking: returns true if THIS
@@ -211,7 +215,17 @@ async def _try_acquire_scheduler_lock(merchant_id: str) -> bool:
     Two pods racing at 03:00 UTC on the same due merchant: one wins,
     the other returns False and skips.
 
-    Returns False on non-Postgres backends (SQLite tests) — those
+    The lock lives on a DEDICATED connection (the returned holder) until
+    `_release_scheduler_lock` closes it. It used to be a bare
+    `database.fetch_one`, whose pool connection went straight back to the
+    pool, where asyncpg's reset ran `pg_advisory_unlock_all()`: the lock was
+    released the instant it was granted, so it never kept two pods apart.
+    Pinning the pool connection instead would be wrong here: the three
+    concurrent audits in `run_scheduled_audits` are child tasks of one
+    context and share its databases Connection, as do the probes each audit
+    gathers (see db/session_advisory_lock.py).
+
+    Returns (True, None) on non-Postgres backends (SQLite tests) — those
     are single-pod by definition, no leader-election needed.
     """
     from db.database import database
@@ -219,14 +233,11 @@ async def _try_acquire_scheduler_lock(merchant_id: str) -> bool:
     if not db_url.startswith(("postgres://", "postgresql://")):
         # Non-Postgres backend — no advisory-lock semantics.
         # Assume single-pod (test / sqlite) and proceed.
-        return True
+        return True, None
+    lock = DedicatedSessionAdvisoryLock(_advisory_lock_id_for_merchant(merchant_id))
     try:
-        row = await database.fetch_one(
-            "SELECT pg_try_advisory_lock(:lock_id) AS got",
-            {"lock_id": _advisory_lock_id_for_merchant(merchant_id)},
-        )
-        return bool(row and row["got"])
-    except Exception as exc:  # noqa: BLE001
+        return await lock.try_acquire(), lock
+    except AdvisoryLockUnavailable as exc:
         logger.warning(
             "scheduled_audit_job: advisory-lock attempt failed for "
             "merchant_id=%s (treating as unlocked to fail open): %s",
@@ -234,26 +245,14 @@ async def _try_acquire_scheduler_lock(merchant_id: str) -> bool:
         )
         # Fail open — we'd rather double-audit than block all
         # scheduled audits on a transient lock-system failure.
-        return True
+        return True, None
 
 
-async def _release_scheduler_lock(merchant_id: str) -> None:
-    """Release the per-merchant advisory lock. Idempotent — Postgres
-    silently ignores releases for locks not held."""
-    from db.database import database
-    db_url = str(getattr(database, "url", "") or "")
-    if not db_url.startswith(("postgres://", "postgresql://")):
-        return
-    try:
-        await database.execute(
-            "SELECT pg_advisory_unlock(:lock_id)",
-            {"lock_id": _advisory_lock_id_for_merchant(merchant_id)},
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "scheduled_audit_job: advisory-unlock failed for "
-            "merchant_id=%s: %s", merchant_id, str(exc)[:200],
-        )
+async def _release_scheduler_lock(lock: Optional[DedicatedSessionAdvisoryLock]) -> None:
+    """Release the per-merchant advisory lock by closing its connection.
+    Idempotent; a None holder (non-Postgres, fail-open) is a no-op."""
+    if lock is not None:
+        await lock.release()
 
 
 async def _re_audit_merchant(due: Dict[str, Any]) -> Dict[str, Any]:
@@ -282,7 +281,7 @@ async def _re_audit_merchant(due: Dict[str, Any]) -> Dict[str, Any]:
     # ("Multiple API pods can all pick the same due merchant at
     # 03:00 UTC and run duplicate audits"). Lock is released in the
     # finally below regardless of audit outcome.
-    locked = await _try_acquire_scheduler_lock(merchant_id)
+    locked, lock = await _try_acquire_scheduler_lock(merchant_id)
     if not locked:
         summary["reason"] = (
             "another pod holds the scheduler advisory lock; skipped"
@@ -300,7 +299,7 @@ async def _re_audit_merchant(due: Dict[str, Any]) -> Dict[str, Any]:
             run_brand_report=run_brand_report,
         )
     finally:
-        await _release_scheduler_lock(merchant_id)
+        await _release_scheduler_lock(lock)
 
 
 async def _re_audit_merchant_locked(
