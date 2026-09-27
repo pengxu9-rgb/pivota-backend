@@ -104,7 +104,7 @@ def test_dark_by_default_the_job_is_created_on_the_crawl_subnet_gated_off_and_pa
     assert "VANTAGE_PROXY_URL" not in env, "a second vantage doubles every check; the timeout is for one"
 
     trigger = _one(calls, "scheduler", "jobs", "create", "http", "merchant-purchasability-sweep-cron")
-    assert _flag(trigger, "--schedule") == "7 0-1,4-23 * * *"
+    assert _flag(trigger, "--schedule") == "7 0-1,5-23 * * *"
     assert _flag(trigger, "--time-zone") == "Etc/UTC"
     assert _flag(trigger, "--uri").endswith(
         "/namespaces/pivota-prod/jobs/merchant-purchasability-sweep:run")
@@ -182,8 +182,18 @@ def _cron_starts(expr: str) -> List[int]:
     return [h * 60 + int(minute) for h in hours]
 
 
-def _windows(expr: str, timeout_s: int) -> List[Tuple[int, int]]:
-    return [(start, start + -(-timeout_s // 60)) for start in _cron_starts(expr)]
+def _windows(expr: str, timeout_s: int, max_retries: int = 0) -> List[Tuple[int, int]]:
+    """start .. the latest a run can still be going: every attempt may use its whole timeout,
+    and Cloud Run starts a retry as soon as an attempt fails."""
+    span_min = -(-timeout_s * (max_retries + 1) // 60)
+    return [(start, start + span_min) for start in _cron_starts(expr)]
+
+
+def _last_int(pattern: str, text: str) -> int:
+    """The LAST occurrence wins, as it does on a gcloud line where an override follows a default."""
+    found = re.findall(pattern, text)
+    assert found, pattern
+    return int(found[-1])
 
 
 def _overlaps(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
@@ -193,7 +203,9 @@ def _overlaps(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
 def test_the_schedule_never_overlaps_the_daily_crawls_on_the_same_address(tmp_path):
     """Read the neighbours from THEIR scripts, so moving one of them re-runs this check: the Tier B
     job (same merchants, same address) and the external-seed destination sweep. Each window is
-    start .. start + task timeout, the longest a run can last."""
+    start .. start + task timeout x (max-retries + 1), the longest a run can last — the
+    external-seed sweep inherits mkcrawljob's `--max-retries 1`, which the first version of this
+    schedule missed (its retry can run to 04:20)."""
     _proc, calls = _run(tmp_path, "prod", TAG)
     job = _one(calls, "run", "jobs", "create", "merchant-purchasability-sweep")
     trigger = _one(calls, "scheduler", "jobs", "create", "http", "merchant-purchasability-sweep-cron")
@@ -203,16 +215,25 @@ def test_the_schedule_never_overlaps_the_daily_crawls_on_the_same_address(tmp_pa
 
     tierb = TIERB_SCRIPT.read_text()
     tierb_cron = re.search(r'^SCHEDULE="([^"]+)"', tierb, re.M).group(1)
-    tierb_timeout = int(re.search(r"--task-timeout (\d+)s", tierb).group(1))
+    tierb_timeout = _last_int(r"--task-timeout (\d+)s", tierb)
+    tierb_retries = _last_int(r"--max-retries (\d+)", tierb)
 
     sched = SCHEDULER_SCRIPT.read_text()
     seed_cron = re.search(
         r'sched external-seed-destination-sweep-cron "([^"]+)"', sched).group(1)
+    # mkcrawljob's defaults, then the job's own overrides (passed after them, so they win).
+    helper = sched[sched.index("mkcrawljob(){"):]
+    helper = helper[: helper.index("\n}\n")]
     seed_block = sched[sched.index("mkcrawljob external-seed-destination-sweep"):]
-    seed_timeout = int(re.search(r"--task-timeout (\d+)s", seed_block).group(1))
+    seed_block = seed_block[: seed_block.index("\nelse")]
+    seed_timeout = _last_int(r"--task-timeout (\d+)s", helper + seed_block)
+    seed_retries = _last_int(r"--max-retries (\d+)", helper + seed_block)
+    assert seed_retries >= 1, "precondition: this is the retry the first schedule missed"
 
-    for name, theirs in (("tierb-cart-link-eligibility", _windows(tierb_cron, tierb_timeout)),
-                         ("external-seed-destination-sweep", _windows(seed_cron, seed_timeout))):
+    for name, theirs in (
+        ("tierb-cart-link-eligibility", _windows(tierb_cron, tierb_timeout, tierb_retries)),
+        ("external-seed-destination-sweep", _windows(seed_cron, seed_timeout, seed_retries)),
+    ):
         clashes = [(a, b) for a in ours for b in theirs if _overlaps(a, b)]
         assert clashes == [], f"overlaps {name}: {clashes}"
 

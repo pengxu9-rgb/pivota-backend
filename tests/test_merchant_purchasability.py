@@ -1244,7 +1244,7 @@ def test_the_runbook_names_the_crawl_job_and_both_dials():
     # /__scheduler_health no longer lists the sweep at all.
     assert "gcloud run jobs executions list --job merchant-purchasability-sweep" in section_9
     assert "SweepReport(" in section_9 and "population_unreadable" in section_9
-    assert "7 0-1,4-23 * * *" in section_9, "the schedule the script provisions"
+    assert "7 0-1,5-23 * * *" in section_9, "the schedule the script provisions"
 
 
 # ── the CLI: `python -m jobs.merchant_purchasability_sweep` runs ONE sweep and exits ──────────
@@ -1354,16 +1354,89 @@ def test_exit_code_for_ranks_an_unreadable_population_above_errors():
     assert sweep.exit_code_for(sweep.SweepReport(errors=2, population_unreadable=1)) == 1
 
 
+class _FakeDatabase:
+    """Stands in for the sweep's `database` so the CLI's connection handling is seen DISCONNECTED
+    — the state a job process starts in — whatever the shared test connection is doing. (The
+    Postgres gate runs these cases in one process, where the real one may well be connected, and
+    `amain` would then correctly skip connect() and prove nothing.)"""
+
+    def __init__(self, *, connect_error=None):
+        self.is_connected = False
+        self.events = []
+        self._connect_error = connect_error
+
+    async def connect(self):
+        self.events.append("connect")
+        if self._connect_error is not None:
+            raise self._connect_error
+        self.is_connected = True
+
+    async def disconnect(self):
+        self.events.append("disconnect")
+        self.is_connected = False
+
+
 async def test_the_cli_with_the_gate_off_contacts_nobody_and_never_connects(monkeypatch):
     fetcher = _Fetcher({})
     monkeypatch.setattr(sweep, "_preflight", fetcher)
-
-    async def _no_connect(*_a, **_k):  # pragma: no cover - reached only by a regression
-        raise AssertionError("a dark job must not open a database connection")
-
-    monkeypatch.setattr(database, "connect", _no_connect)
+    fake = _FakeDatabase()
+    monkeypatch.setattr(sweep, "database", fake)
     assert await sweep.amain() == sweep.EXIT_OK
-    assert fetcher.calls == []
+    assert fetcher.calls == [] and fake.events == [], "a dark job must not open a connection"
+
+
+async def test_the_cli_connects_runs_once_and_disconnects_with_the_gate_on(monkeypatch):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    fake = _FakeDatabase()
+    monkeypatch.setattr(sweep, "database", fake)
+
+    async def _one_run():
+        fake.events.append("run")
+        return sweep.SweepReport(population=1, checked=1, written=1)
+
+    monkeypatch.setattr(sweep, "run_merchant_purchasability_sweep", _one_run)
+    assert await sweep.amain() == sweep.EXIT_OK
+    assert fake.events == ["connect", "run", "disconnect"]
+
+
+async def test_the_cli_exits_1_without_a_traceback_when_the_database_is_unreachable(monkeypatch):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    fake = _FakeDatabase(connect_error=OSError("connection refused"))
+    monkeypatch.setattr(sweep, "database", fake)
+
+    async def _must_not_run():  # pragma: no cover - reached only by a regression
+        raise AssertionError("nothing may run without a connection")
+
+    monkeypatch.setattr(sweep, "run_merchant_purchasability_sweep", _must_not_run)
+    with root_as_in_prod(), capture_pivota_stdout() as out:
+        assert await sweep.amain() == sweep.EXIT_POPULATION_UNREADABLE
+    assert fake.events == ["connect"]
+    assert any("could not connect to the database (error_type=OSError)" in line
+               for line in pivota_lines(out)), pivota_lines(out)
+
+
+def test_the_proxy_vantage_really_leaves_through_its_proxy(monkeypatch):
+    """Every run-level test mounts a mock transport, so this is the one place the REAL
+    `_inner_transport` is looked at. A version that dropped `via` would send the `proxy`
+    vantage's checks out of the crawl egress and still record them as `proxy` — a mislabelled
+    fact the door trusts whenever MERCHANT_PURCHASABILITY_BUYER_VANTAGE=proxy."""
+    import httpcore
+
+    for name in ("HTTPS_PROXY", "https_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    via = sweep._inner_transport("http://vantage-proxy.example:3128")
+    assert isinstance(via._pool, httpcore.AsyncHTTPProxy)
+    assert (via._pool._proxy_url.host, via._pool._proxy_url.port) == (b"vantage-proxy.example", 3128)
+
+    direct = sweep._inner_transport(None)
+    assert not isinstance(direct._pool, httpcore.AsyncHTTPProxy), "the crawl-egress vantage is direct"
+
+    # An operator's process proxy is honoured for the DIRECT vantage only; `via` always wins.
+    monkeypatch.setenv("HTTPS_PROXY", "http://laptop-proxy.example:8080")
+    assert sweep._inner_transport(None)._pool._proxy_url.host == b"laptop-proxy.example"
+    assert sweep._inner_transport("http://vantage-proxy.example:3128")._pool._proxy_url.host == (
+        b"vantage-proxy.example"
+    )
 
 
 def test_main_returns_what_amain_returns(monkeypatch):

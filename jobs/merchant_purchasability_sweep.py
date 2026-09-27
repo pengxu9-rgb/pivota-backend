@@ -589,12 +589,13 @@ async def _check_one(
     )
 
 
-async def run_merchant_purchasability_sweep(*, worker_id: Optional[str] = None) -> SweepReport:
-    """One sweep tick. Returns a `SweepReport` and never raises for anything a merchant did.
+async def run_merchant_purchasability_sweep() -> SweepReport:
+    """One sweep. Returns a `SweepReport` and never raises for anything a merchant did.
 
-    It DOES raise `asyncio.CancelledError`, on purpose: `except Exception`, never
-    `except BaseException`, so a cancellation keeps travelling and the scheduler's run deadline
-    can actually cut a wedged run.
+    It DOES let `asyncio.CancelledError` through: `except Exception`, never `except BaseException`,
+    so a caller that cancels (a test, an embedding event loop) actually stops it. The job's hard
+    stop is NOT a cancellation — Cloud Run's task timeout kills the container — which is why the
+    budget, not the timeout, is meant to end a run (see the setup script).
     """
     started = _monotonic()
     counts = {name: 0 for name in _COUNTS}
@@ -731,9 +732,11 @@ async def run_merchant_purchasability_sweep(*, worker_id: Optional[str] = None) 
 #: Done. Includes a run with the gate off (nobody contacted), a run whose population was empty,
 #: and a run the budget cut short — the rest are first in line next hour.
 EXIT_OK = 0
-#: A population lane could not be read (or the population could not be built at all). The run
-#: swept whatever it could read, but a merchant on the unread allowlist was not refreshed, and
-#: with MERCHANT_PURCHASABILITY_ENFORCE on its fact is ageing out towards a 409.
+#: A population lane could not be read, the population could not be built at all, or the database
+#: could not be connected to (nothing was read). The run swept whatever it could read, but a
+#: merchant on an unread allowlist was not refreshed, and with MERCHANT_PURCHASABILITY_ENFORCE on
+#: its fact is ageing out towards a 409. (Python also exits 1 on an uncaught traceback; the log
+#: tells the cases apart, and every one of them means "the population was not read".)
 EXIT_POPULATION_UNREADABLE = 1
 #: The population was read, but at least one check raised or one fact could not be written —
 #: `SweepReport.errors`, "the only count that should page anyone" (the runbook). Numbered like
@@ -761,12 +764,25 @@ async def amain() -> int:
         return exit_code_for(await run_merchant_purchasability_sweep())
     connected_here = not database.is_connected
     if connected_here:
-        await database.connect()
+        try:
+            await database.connect()
+        except Exception as exc:  # noqa: BLE001 — mapped to an exit code, not a traceback
+            operator_logger.error(
+                "merchant_purchasability_sweep: could not connect to the database (error_type=%s); "
+                "no population was read", type(exc).__name__,
+            )
+            return EXIT_POPULATION_UNREADABLE
     try:
         report = await run_merchant_purchasability_sweep()
     finally:
         if connected_here:
-            await database.disconnect()
+            try:
+                await database.disconnect()
+            except Exception as exc:  # noqa: BLE001 — the run's verdict is already decided
+                logger.warning(
+                    "merchant_purchasability_sweep: disconnect failed (error_type=%s)",
+                    type(exc).__name__,
+                )
     return exit_code_for(report)
 
 

@@ -40,21 +40,25 @@
 # merchant (another round of checkouts, another burst on the crawl address); the next hourly run
 # is soon enough, or a human decides.
 #
-# SCHEDULE: minute 07 of every hour EXCEPT 02 and 03 UTC (22 runs a day). Neighbours on the crawl
-# address:
+# SCHEDULE: minute 07 of every hour EXCEPT 02, 03 and 04 UTC (21 runs a day). Neighbours on the
+# crawl address, each as its LONGEST possible window (task timeout x (max-retries + 1)):
 #   * store-audit-ucp-probe / store-audit-commerce-probe  every 5 min (:00, :05, ...), small;
 #   * retailer-ingest-drain                               every 10 min (:00, :10, ...), stages of
-#                                                         4-12 min, so no minute is drain-free;
-#   * external-seed-destination-sweep                     02:20 daily, task-timeout 3600s -> 03:20;
-#   * tierb-cart-link-eligibility                         03:30 daily, task-timeout 1800s -> 04:00,
-#                                                         and it checks THE SAME merchants.
+#                                                         up to ~60 min, so no minute is drain-free;
+#   * external-seed-destination-sweep                     02:20 daily, task-timeout 3600s AND
+#                                                         mkcrawljob's --max-retries 1 -> 04:20;
+#   * tierb-cart-link-eligibility                         03:30 daily, task-timeout 1800s, no
+#                                                         retry -> 04:00; it checks THE SAME merchants.
 # :07 is not a multiple of 5, so a run never starts on the same minute as the probe and drain
 # bursts. A run is over by :27 at the latest (task-timeout 1200s), so 01:07 ends before 02:20 and
-# 04:07 starts after the Tier B job's hard stop; skipping 02:07 and 03:07 keeps the sweep off both
-# daily crawls entirely. The 01:07 -> 04:07 gap is three hours against a 72 h fact TTL.
-# Two executions of THIS job can never overlap: task-timeout 1200s < the 3600s spacing (Cloud Run
-# has no max-instances for jobs; the spacing is what stands in for the scheduler's old
-# max_instances=1).
+# 05:07 starts after the external-seed sweep's retry could have ended; 02:07, 03:07 and 04:07 would
+# each share the address with a daily crawl. The 01:07 -> 05:07 gap is four hours against a 72 h
+# fact TTL. tests/test_setup_merchant_purchasability_sweep_job.py re-derives these windows from the
+# neighbours' own scripts, retries included.
+# Two scheduled executions of THIS job can never overlap: task-timeout 1200s < the 3600s spacing
+# (Cloud Run has no max-instances for jobs; the spacing is what stands in for the scheduler's old
+# max_instances=1). A HAND execution can overlap a scheduled one — see the runbook before running
+# `gcloud run jobs execute` within 20 minutes of :07.
 set -euo pipefail
 
 ENV="${1:-}"; BACKEND_TAG="${2:-}"; FLAG="${3:-}"
@@ -74,7 +78,7 @@ esac
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; SHARED=pivota-shared
 JOB=merchant-purchasability-sweep
 TRIGGER=merchant-purchasability-sweep-cron
-SCHEDULE="7 0-1,4-23 * * *"
+SCHEDULE="7 0-1,5-23 * * *"
 SUBNET=pivota-crawl
 # The sweep's own dials, PINNED here because the task timeout below is derived from them. A re-run
 # of this script resets them; tune them here, not with `gcloud run jobs update`.
@@ -110,9 +114,11 @@ verb=create; have "$GCLOUD" run jobs describe "$JOB" --region "$REGION" && verb=
 # task-timeout 1200s = the 600 s budget + 600 s for the ONE merchant a budget cannot stop (the
 # budget stops the job STARTING a merchant; one in flight runs to completion). That merchant's
 # realistic worst case is ~300 s — the preflight returns at its first transport failure, and a
-# slow-but-answering store is at most 20 catalog pages + 10 permalink hops, now >= 1.5 s apart —
-# which is what the old scheduler deadline (600 + 300 = 900) allowed; this doubles it, so the
-# budget, not Cloud Run, is what stops a run. A cut run strands nothing: each fact is one upsert,
+# store answers a catalog page or two plus 2-3 permalink hops, now >= 1.5 s apart — which is what
+# the old scheduler deadline (600 + 300 = 900) allowed; this doubles it, so the budget, not Cloud
+# Run, is what stops a run on anything but a pathological store. It is NOT a bound: a store could
+# in principle make every one of 20 catalog pages and the permalink redirect up to 10 times, at
+# 30 s a request. Such a run is killed at 1200 s, fails the execution, and strands nothing. A cut run strands nothing: each fact is one upsert,
 # written as it goes, and the next hour starts with whoever was not reached.
 # --args= in the EQUALS form: the value starts with a dash, and `--args "-m,..."` is parsed by
 # gcloud as a second flag ("argument --args: expected one argument") — #2367, the Tier B job's
@@ -135,7 +141,7 @@ verb=create; have "$GCLOUD" scheduler jobs describe "$TRIGGER" --location "$REGI
 if [ "$ENABLED" = true ]; then
   "$GCLOUD" scheduler jobs resume "$TRIGGER" --location "$REGION" --quiet \
     || { echo "FAILED to resume $TRIGGER" >&2; exit 1; }
-  echo "ARMED: $JOB runs at :07 past every hour except 02 and 03 UTC, with the gate on."
+  echo "ARMED: $JOB runs at :07 past every hour except 02, 03 and 04 UTC, with the gate on."
 else
   "$GCLOUD" scheduler jobs pause "$TRIGGER" --location "$REGION" --quiet \
     || { echo "FAILED to pause $TRIGGER - it may be LIVE" >&2; exit 1; }
