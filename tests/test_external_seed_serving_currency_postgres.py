@@ -11,7 +11,7 @@ the quarantine anti-join and the recall text clause.
 
 ISOLATION. The dialect gate runs every file against ONE database, so this file never touches
 `public`: it creates a per-process scratch schema, applies the REAL migrations there (the table
-under test is 044 + 169 + 200, the anti-join's table is 134) through a connection whose
+under test is 044 + 169 + 200, the anti-joins' tables are 134 and 058 + 135) through a connection whose
 search_path is that schema ALONE, and drops it at teardown.
 """
 
@@ -36,6 +36,9 @@ _TABLE_MIGRATIONS = (
     "169_external_product_seeds_seller_ref.sql",
     "200_external_seed_destination_liveness.sql",
     "134_catalog_source_quarantine.sql",
+    # catalog_products + its suppressed_at: the suppressed-product anti-join's table.
+    "058_catalog_core.sql",
+    "135_catalog_product_sku_stale_suppression.sql",
 )
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 _SCHEMA = f"seed_serving_currency_test_{os.getpid()}"
@@ -184,3 +187,28 @@ async def test_the_quarantine_anti_join_still_composes(scoped_db):
     result = await _fetch(scoped_db, market=None)
     assert _ids(result) == ["us_usd_padded"]
     assert result["total_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_seed_on_a_suppressed_product_is_refused_on_the_prod_path(scoped_db):
+    """SEED_SUPPRESSED_PRODUCT_ANTI_JOIN inside the SET LOCAL transaction, against the real
+    VARCHAR(255) product_key and TIMESTAMPTZ suppressed_at. Page and count alike."""
+    await _load(scoped_db)
+    for key, suppressed in (("prod::withdrawn", True), ("prod::live", False)):
+        await scoped_db.execute(
+            "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id,"
+            " title, suppressed_at) VALUES (:k, 'm', 'shopify', :k, 't',"
+            " CASE WHEN :s THEN CURRENT_TIMESTAMP ELSE NULL END)",
+            {"k": key, "s": suppressed},
+        )
+    await scoped_db.execute(
+        "UPDATE external_product_seeds SET attached_product_key = 'prod::withdrawn' WHERE id = 'us_usd'"
+    )
+    await scoped_db.execute(
+        "UPDATE external_product_seeds SET attached_product_key = 'prod::live' WHERE id = 'us_usd_padded'"
+    )
+    for shape in ({}, {"query": "hydrating serum", "lean_where_min_tokens": 2, "fast_multiterm": True}):
+        result = await _fetch(scoped_db, market=None, **shape)
+        assert result["query_timeout"] is False and result["table_missing"] is False
+        assert _ids(result) == ["us_usd_padded"]
+        assert result["total_count"] == 1

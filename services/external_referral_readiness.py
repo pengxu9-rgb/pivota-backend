@@ -32,6 +32,7 @@ from services.external_seed_destination_liveness import (
     RETIREMENT_STREAK,
 )
 from services import crawl_politeness
+from services.external_seed_search import SEED_SUPPRESSED_PRODUCT_ANTI_JOIN
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
@@ -1666,14 +1667,21 @@ async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> 
     `updated_at` is kept only as a tiebreak beneath the real signal, so rows that share a
     `last_crawled_at` (notably the NULL cohort — today, all of them) still come out in a
     stable, sensible order rather than whatever the index happens to return.
+
+    A seed attached to a SUPPRESSED catalog product is not a candidate: the seed lane no longer
+    serves it (SEED_SUPPRESSED_PRODUCT_ANTI_JOIN), so a request spent keeping its price honest is
+    a request spent on nothing. Measured prod 2026-09-27: 682 active seeds attach to suppressed
+    products. Lifting the suppression (suppressed_at back to NULL) returns the seed to the queue,
+    and its stale `last_crawl_attempt_at` puts it near the head.
     """
     normalized_limit = max(1, min(int(limit or 500), 5000))
     attached_rows = await database.fetch_all(
-        """
+        f"""
         SELECT id
         FROM external_product_seeds
         WHERE status = 'active'
           AND attached_product_key IS NOT NULL
+        {SEED_SUPPRESSED_PRODUCT_ANTI_JOIN}
         ORDER BY last_crawl_attempt_at ASC NULLS FIRST, last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
         LIMIT :limit
         """,

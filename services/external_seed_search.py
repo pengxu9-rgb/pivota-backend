@@ -285,7 +285,7 @@ def build_external_seed_prefer_terms_rank_sql(
 
 
 def _is_missing_external_seed_table(exc: Exception) -> bool:
-    """Missing-table classifier for this query's tables — now BOTH of them.
+    """Missing-table classifier for this query's tables — all three of them.
 
     The quarantine anti-join makes `catalog_source_quarantine` a hard dependency
     of every seed-search route. Matching only on `external_product_seeds` meant a
@@ -297,9 +297,12 @@ def _is_missing_external_seed_table(exc: Exception) -> bool:
     Prod is unaffected (134 is applied, 15 quarantines live), but prod runs with
     SKIP_HEAVY_STARTUP_INIT=true and manual psql migrations, so a fresh staging
     DB is exactly the case that would have hit this.
+
+    `catalog_products` joined the list with the suppressed-product anti-join
+    (SEED_SUPPRESSED_PRODUCT_ANTI_JOIN), for the same reason.
     """
     msg = str(exc or "")
-    names = ("external_product_seeds", "catalog_source_quarantine")
+    names = ("external_product_seeds", "catalog_source_quarantine", "catalog_products")
     # NOT a bare `"relation" in msg`: that also matched
     # `permission denied for relation catalog_source_quarantine`, which would be
     # reported as table_missing and returned as an empty result — a silent total
@@ -399,6 +402,39 @@ def build_seed_quarantine_anti_join() -> str:
         row_source_system_expr="NULL",
         row_source_ref_expr="NULL",
     )
+
+
+#: A seed attached to a WITHDRAWN catalog product is not served. `catalog_products.suppressed_at`
+#: is THE gate column (#1648): every catalog serving surface reads it. This lane never joined
+#: catalog_products, so the withdrawal stopped at the catalog and the product's seed kept serving
+#: it. Measured prod 2026-09-27: 682 active seeds attached to suppressed products, 334 of them past
+#: the quarantine anti-join and priced USD (athiscosmetics.com 140 wrong_brand_namesake,
+#: vmintree.in 108, headandshoulders.com 76 placeholder_price_store, ownist.com 4, ...). "athis",
+#: "head and shoulders" and "mintree" each returned 50/50 suppressed seeds on stage A.
+#:
+#: UNCORRELATED, so Postgres hashes the suppressed keys once instead of probing catalog_products_pkey
+#: once per matched seed. EXPLAIN ANALYZE on prod 2026-09-27, correlated NOT EXISTS -> this form:
+#: unfiltered count 448 -> 126 ms (none: 105), "serum" page 78 -> 62 ms, "vitamin c serum" 1,182 ->
+#: 428 ms, refresh queue 97 -> 23 ms (none: 16). The price is a fixed ~5-10 ms to build the set
+#: (a bitmap scan of idx_catalog_products_suppressed, 4,648 rows), visible only on tiny queries.
+#: The set must fit hash memory (work_mem 4MB in prod) or Postgres falls back to a linear scan
+#: per row; at 4,648 short keys that is far off, but re-measure if suppressions grow ~10x. Same
+#: trade the quarantine anti-join made (services/source_quarantine.build_quarantine_anti_join_sql).
+#:
+#: `IS NULL OR NOT IN`: an UNATTACHED seed is kept (NOT IN on a NULL is NULL, never TRUE), and so is
+#: a seed whose key names no catalog row -- this gate withdraws what the catalog withdrew, it does
+#: not require an attachment. `product_key` is the primary key, so the subquery holds no NULL and
+#: NOT IN cannot silently exclude every row; the IS NOT NULL is there so that stays true by
+#: construction. Portable SQL -- the suite that executes it runs on SQLite.
+SEED_SUPPRESSED_PRODUCT_ANTI_JOIN = """
+AND (
+  external_product_seeds.attached_product_key IS NULL
+  OR external_product_seeds.attached_product_key NOT IN (
+    SELECT seed_cp.product_key FROM catalog_products seed_cp
+    WHERE seed_cp.suppressed_at IS NOT NULL AND seed_cp.product_key IS NOT NULL
+  )
+)
+"""
 
 
 #: The market a seed read serves when its caller names none. A find_products_multi request that
@@ -538,7 +574,9 @@ async def fetch_external_seed_rows(
     # Applied to BOTH statements. A quarantine clause on the page query but not
     # the count would make total_count advertise rows the page cannot contain —
     # the caller then pages into a tail that is permanently empty.
+    # The suppressed-product anti-join likewise.
     quarantine_clause = build_seed_quarantine_anti_join()
+    suppression_clause = SEED_SUPPRESSED_PRODUCT_ANTI_JOIN
 
     query_sql = f"""
                 SELECT
@@ -547,6 +585,7 @@ async def fetch_external_seed_rows(
                 FROM external_product_seeds
                 WHERE {" AND ".join(where)}
                 {quarantine_clause}
+                {suppression_clause}
                 ORDER BY brand_term_hit DESC, created_at DESC, id DESC
                 LIMIT :limit OFFSET :offset
                 """
@@ -555,6 +594,7 @@ async def fetch_external_seed_rows(
                 FROM external_product_seeds
                 WHERE {" AND ".join(where)}
                 {quarantine_clause}
+                {suppression_clause}
                 """
     count_values: Dict[str, Any] = {
         k: v for k, v in values.items() if k not in {"limit", "offset"}
