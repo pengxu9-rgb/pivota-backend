@@ -104,3 +104,60 @@ def test_a_jsonb_value_is_bound_as_text_however_the_driver_returned_it():
     assert _as_json_text('{"a": 1}') == '{"a": 1}'
     assert _as_json_text({"run_id": "x", "n": 2}) == '{"run_id": "x", "n": 2}'
     assert _as_json_text([1, 2]) == "[1, 2]"
+
+
+@pytest.fixture
+def tarte(monkeypatch):
+    """tartecosmetics.com, 2026-09-27: one crawl wrote 176 rows as "Tarte" and 73 as "Tarte Cosmetics"
+    (vendor spellings), no title in common. Re-run as "Tarte", every row resolves to "Tarte"."""
+    feed = [
+        _product("tarte", "Shape Tape Concealer", "shape-tape"),
+        _product("Tarte Cosmetics", "Maracuja Juicy Lip Balm", "juicy-lip"),
+        _product("Tarte Cosmetics", "Amazonian Clay Blush", "clay-blush"),
+    ]
+
+    async def fake_fetch(domain, *, max_products=500, timeout_s=15.0):
+        return feed
+
+    async def fake_locale(domain, **kw):
+        return {"currency": "USD"}
+
+    monkeypatch.setattr(cbf, "fetch_shopify_products", fake_fetch)
+    monkeypatch.setattr(cbf, "fetch_shopify_shop_locale", fake_locale)
+    return feed
+
+
+@pytest.mark.asyncio
+async def test_without_the_stale_spelling_a_respelled_store_retires_nothing(tarte):
+    """The Sand & Sky case: re-run brand == record brand, so derive(brand) == derive(record brand)."""
+    assert await build_cohort("tartecosmetics.com", "Tarte", "beauty") == []
+
+
+@pytest.mark.asyncio
+async def test_the_stale_spelling_maps_each_old_key_to_its_new_one(tarte):
+    cohort = await build_cohort("tartecosmetics.com", "Tarte", "beauty", stale_brand="Tarte Cosmetics")
+    assert {c["title"] for c in cohort} == {"Shape Tape Concealer", "Maracuja Juicy Lip Balm", "Amazonian Clay Blush"}
+    for c in cohort:
+        assert c["brand"] == "Tarte"
+        assert c["stale_key"] == derive_product_key("Tarte Cosmetics", c["title"])
+        assert c["new_key"] == derive_product_key("Tarte", c["title"])
+    # Only the 73 rows actually written as "Tarte Cosmetics" exist under a stale key in prod; `plan` retires
+    # present keys only, so "Shape Tape Concealer" (stored as "Tarte") is never touched.
+
+
+def test_the_cli_takes_the_stale_spelling():
+    import scripts.retire_superseded_brand_keys as tool
+    captured = {}
+
+    async def fake_run(a):
+        captured.update(vars(a))
+        return 0
+
+    orig = tool.run
+    tool.run = fake_run
+    try:
+        tool.main(["--domain", "stilacosmetics.com", "--brand", "Stila", "--stale-brand", "Stila Cosmetics",
+                   "--category", "beauty"])
+    finally:
+        tool.run = orig
+    assert captured["stale_brand"] == "Stila Cosmetics" and captured["brand"] == "Stila"

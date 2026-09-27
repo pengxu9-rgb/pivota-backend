@@ -36,6 +36,10 @@ DRY-RUN BY DEFAULT. Nothing is written without --apply.
       --domain misshaus.com --brand Missha --category beauty/skincare \
       --apply --manifest /tmp/retire_misshaus.json
 
+  # a store written under another spelling and re-run under the canonical one:
+  DATABASE_URL=... python3 scripts/retire_superseded_brand_keys.py \
+      --domain tartecosmetics.com --brand Tarte --stale-brand "Tarte Cosmetics" --category beauty
+
   # 3. undo the whole run
   DATABASE_URL=... python3 scripts/retire_superseded_brand_keys.py \
       revert --manifest /tmp/retire_misshaus.json
@@ -115,11 +119,19 @@ def _as_json_text(value: Any) -> Optional[str]:
     return json.dumps(value)
 
 
-async def build_cohort(domain: str, brand: str, category_path: str) -> List[Dict[str, Any]]:
+async def build_cohort(domain: str, brand: str, category_path: str,
+                       stale_brand: Optional[str] = None) -> List[Dict[str, Any]]:
     """(stale_key, new_key, brand, title) for every record the fix re-keyed.
 
     `emit_real_variants=True` mirrors the re-onboard invocation; it does not affect the
     key, but keeping the two calls identical is what makes the cohorts provably the same.
+
+    `stale_brand`: the spelling the OLD rows were written under, when it is not the re-run's brand. A
+    store once written as "Tarte Cosmetics" / "Stila Cosmetics" / "Tower 28 Beauty" and re-run as
+    "Tarte" / "Stila" / "Tower 28" moves every key from derive(stale_brand, title) to
+    derive(record brand, title); without it the stale key is derived from the re-run's own brand and
+    the cohort comes back empty (the Sand & Sky case, 2026-09-26). Keys that were never written under
+    the stale spelling are simply absent from catalog_products, and `plan` never retires an absent key.
     """
     recs = await records_for_brand(
         domain=domain, category_path=category_path, brand=brand, emit_real_variants=True
@@ -128,14 +140,15 @@ async def build_cohort(domain: str, brand: str, category_path: str) -> List[Dict
     for rec in recs:
         pdp = rec.get("pdp") or {}
         title, new_brand = pdp.get("product_name"), pdp.get("brand")
-        stale, new = derive_product_key(brand, title), derive_product_key(new_brand, title)
+        stale, new = derive_product_key(stale_brand or brand, title), derive_product_key(new_brand, title)
         if stale and new and stale != new:
             out.append({"stale_key": stale, "new_key": new, "brand": new_brand, "title": title})
     return out
 
 
-async def plan(domain: str, brand: str, category_path: str) -> Dict[str, Any]:
-    cohort = await build_cohort(domain, brand, category_path)
+async def plan(domain: str, brand: str, category_path: str,
+               stale_brand: Optional[str] = None) -> Dict[str, Any]:
+    cohort = await build_cohort(domain, brand, category_path, stale_brand)
     stale_keys = [c["stale_key"] for c in cohort]
     new_keys = [c["new_key"] for c in cohort]
     rows = {r["product_key"]: dict(r) for r in await database.fetch_all(LIVE_ROWS_SQL, {"keys": stale_keys})}
@@ -146,7 +159,7 @@ async def plan(domain: str, brand: str, category_path: str) -> Dict[str, Any]:
     present = [c for c in cohort if c["stale_key"] in rows]
     live = [c for c in present if not rows[c["stale_key"]].get("suppression_reason")]
     return {
-        "domain": domain, "brand_override": brand, "category_path": category_path,
+        "domain": domain, "brand_override": brand, "category_path": category_path, "stale_brand": stale_brand,
         "cohort": cohort, "rows": rows, "present": present, "live": live,
         "already_new": sorted(already_new), "seeds": seeds,
         "active_seeds": [s for s in seeds if str(s.get("status") or "").lower() == "active"],
@@ -156,6 +169,8 @@ async def plan(domain: str, brand: str, category_path: str) -> Dict[str, Any]:
 
 def print_plan(p: Dict[str, Any]) -> None:
     print(f"domain            : {p['domain']}  (brand override {p['brand_override']!r})")
+    if p.get("stale_brand"):
+        print(f"stale spelling    : {p['stale_brand']!r}  (old rows' keys derive from it)")
     print(f"re-keyed by #2173 : {len(p['cohort'])}")
     print(f"  present in catalog_products : {len(p['present'])}")
     print(f"  LIVE (would be tombstoned)  : {len(p['live'])}")
@@ -179,15 +194,19 @@ async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
         return {}
     run_id = f"retire_{uuid.uuid4().hex[:12]}"
     metadata = json.dumps({
-        "run_id": run_id, "reason": REASON, "pr": "pivota-backend#2173",
-        "domain": p["domain"], "brand_override": p["brand_override"],
-        "note": "product_key superseded when the brand override stopped relabelling a sibling brand",
+        "run_id": run_id, "reason": REASON,
+        "pr": "pivota-backend#2173" if not p.get("stale_brand") else "stale-brand re-key",
+        "domain": p["domain"], "brand_override": p["brand_override"], "stale_brand": p.get("stale_brand"),
+        "note": ("product_key superseded when the brand override stopped relabelling a sibling brand"
+                 if not p.get("stale_brand") else
+                 f"product_key superseded: rows written as {p['stale_brand']!r} re-run as {p['brand_override']!r}"),
         "at": datetime.now(timezone.utc).isoformat(),
     })
     # BEFORE-state first: a manifest written after the write cannot describe what it replaced.
     manifest = {
         "run_id": run_id, "reason": REASON, "domain": p["domain"],
         "brand_override": p["brand_override"], "category_path": p["category_path"],
+        "stale_brand": p.get("stale_brand"),
         "at": datetime.now(timezone.utc).isoformat(),
         "products": [
             {
@@ -251,7 +270,7 @@ async def run(args: argparse.Namespace) -> int:
         if args.command == "revert":
             await revert(args.manifest)
             return 0
-        p = await plan(args.domain, args.brand, args.category)
+        p = await plan(args.domain, args.brand, args.category, args.stale_brand)
         print_plan(p)
         if not args.apply:
             print("\nDRY-RUN — re-run with --apply (and --manifest) to tombstone.")
@@ -271,6 +290,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--domain")
     p.add_argument("--brand")
     p.add_argument("--category", default="beauty/skincare")
+    p.add_argument("--stale-brand", dest="stale_brand",
+                   help="the spelling the OLD rows were written under, when the re-run uses another")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--manifest")
     a = p.parse_args(argv)
