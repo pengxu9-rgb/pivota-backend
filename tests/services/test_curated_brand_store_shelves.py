@@ -118,6 +118,12 @@ def test_a_brush_type_with_a_brush_title_is_a_brush(ptype, title):
     ("Eyeliner Brush", "Brow Pomade & Brush"),
     ("Eyeshadow Brush", "Loose Pigment & Brush"),
     ("Concealer Brush", "Concealer Plus Brush"),
+    # third review: a kit whose brush names its use
+    ("Eyeliner Brush", "Gel Liner & Liner Brush"),
+    ("Eyebrow Brush, Eyeliner Brush", "Brow Pomade & Brow Brush"),
+    ("Eyeliner Brush", "Kohl & Smudge Brush"),
+    ("Eyeshadow Brush", "Loose Pigment & Shadow Brush"),
+    ("Eyeshadow Brush", "Glitter Glue & Eye Brush"),
     ("Foundation Brush", "nail polish brush"),               # only the TITLE names nails
     # the type's head noun must be the tool: a two-formula type is not a brush type
     ("Concealer, Foundation", "the buffer™ brush"),
@@ -256,3 +262,15 @@ def test_the_new_confidences_are_no_other_writers_value():
               feed.CATEGORY_CONFIDENCE_EXPLICIT_TITLE, feed.CATEGORY_CONFIDENCE_FEED_DEFAULT, SHELF,
               feed.CATEGORY_CONFIDENCE_LIP_TITLE, feed.CATEGORY_CONFIDENCE_LASH_NAIL_TITLE}
     assert HEAD not in others
+
+
+@pytest.mark.parametrize("ptype,title,domain", [
+    ("Concealer Brush", "Blush" + " " * 20000 + "Cream", "tartecosmetics.com"),
+    ("", "Blush" + " " * 20000 + "Cream", "tower28beauty.com"),
+    ("", " " * 20000, "stilacosmetics.com"),
+])
+def test_a_long_whitespace_run_resolves_in_linear_time(ptype, title, domain):
+    import time
+    started = time.perf_counter()
+    resolve(ptype, title, domain)
+    assert time.perf_counter() - started < 0.5  # quadratic took 4-36s (third review of #2403)

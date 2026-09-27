@@ -1688,11 +1688,14 @@ _BRUSH_USE_WORDS = re.compile(
 # sunscreen dispensed through a brush) and not nails (a "Gel Polish Brush" is not a makeup tool).
 # formula nouns no leaf pattern reads on their own ("CC undereye & brush")
 _BRUSH_TITLE_FORMULA_WORDS = re.compile(r"\b(?:cc|bb|creams?|serums?|oils?|balms?|sticks?|palettes?|gloss|liquids?|"
-                                        r"tints?|stains?|minis?)\b", re.I)
+                                        r"tints?|stains?|minis?|gels?|pomades?|kohls?|pigments?|glue|wax|mousse|putty)\b", re.I)
 
 
 def _is_makeup_brush_title(title: str) -> bool:
     from services.pdp_category_classifier import CATEGORY_PATTERNS
+    # one space between words: a leading \s* retried across a long whitespace run is quadratic
+    # (re-review of #2403: 10,000 spaces took 9.7s; the classifier fixed the same bug the same way)
+    title = " ".join(title.split())
     parts = [x for x in _TOOL_TITLE_JOINER.split(title) if x.strip()]
     if not parts or not _TOOL_NOUN_SUFFIX.search(parts[-1]) or _TOOL_TYPE_FORMULA_CONTEXT.search(title):
         return False
@@ -2012,7 +2015,7 @@ def _measured_host_title_leaf(*, domain: Optional[str], product_type: Optional[s
     ptype = " ".join(str(product_type or "").casefold().split())
     if ptype not in _MEASURED_TITLE_HOST_TYPES.get(host, frozenset()):
         return None
-    text = str(title or "")
+    text = " ".join(str(title or "").split())  # see _is_makeup_brush_title: no quadratic split
     if _LIP_SET.search(text) or _LIP_NOT_A_PRODUCT.search(text) or _TITLE_ACCESSORY_OR_GIVEAWAY.search(text):
         return None
     name = _TITLE_VARIANT_SUFFIX.split(text, maxsplit=1)[0]
