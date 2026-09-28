@@ -104,6 +104,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -171,8 +172,9 @@ def is_enabled() -> bool:
 
 #: The CART-LINK lane's own dial (Tier B: a Shopify cart permalink Reap quotes as received).
 #: Default OFF, the same strict allowlist parse, read at call time. It is IN ADDITION to
-#: `REAP_AGENTIC_ENABLED`, never instead of it: a cart-link purchase needs both, plus a client
-#: that knows Reap's field name (`rc.supports_cart_link_quote()`).
+#: `REAP_AGENTIC_ENABLED`, never instead of it: a cart-link purchase needs both. Since the
+#: 2026-09-28 spec the client builds Reap's published `externalCheckout` body, so these two dials
+#: are the ONLY things that arm the lane.
 #:
 #: IT IS ALSO A KILL SWITCH FOR ROWS IN FLIGHT, and that is a decision rather than a side
 #: effect. `advance` re-reads it on every cart-link step BEFORE a quote exists ('resolving',
@@ -836,10 +838,19 @@ class QuoteCheck:
     subtotal_minor: Optional[int] = None
     shipping_minor: Optional[int] = None
     tax_minor: Optional[int] = None
+    #: The total of Reap's `discounts[]` lines as a NON-NEGATIVE magnitude in minor units
+    #: (Reap sends `-2.09`; this is `209`). Only ever non-None on a quote that was requested WITH
+    #: an offer code; it is evidence of what Reap took off, never an input to the charge -- the
+    #: charge is `finalAmount`, which is `total_minor`.
+    discount_minor: Optional[int] = None
 
 
 def verify_quote(
-    payload: Any, row: Mapping[str, Any], *, variant_id: Optional[str] = None
+    payload: Any,
+    row: Mapping[str, Any],
+    *,
+    variant_id: Optional[str] = None,
+    offer_code_sent: bool = False,
 ) -> QuoteCheck:
     """Does this quote describe the purchase we opened, at the price we opened it at?
 
@@ -874,19 +885,30 @@ def verify_quote(
         numbers describe the same merchant's line item; a cent of drift is a different price, not
         a rounding artifact. → `price_changed` / `quote_items_subtotal_mismatch`.
 
-    (c) THE TOTAL RECONCILES. `finalAmount == itemsSubtotal + shipping + tax`, within
+    (c) THE TOTAL RECONCILES. `finalAmount == itemsSubtotal + shipping + tax - discounts`, within
         `QUOTE_RECONCILE_TOLERANCE_MINOR`. This is what catches a total that does not follow from
-        the four components it names. → `price_changed` / `quote_total_not_reconciled`.
+        the components it names. → `price_changed` / `quote_total_not_reconciled`.
+
+        TAX IS ADDED ONLY WHEN IT IS NOT ALREADY IN THE PRICES. `tax.includedInPrices: true`
+        (live jsmbeauty.sg quote, 2026-09-28: items 30 + shipping 4 = final 34 SGD, tax 2.48
+        "included") means the tax line is a disclosure, not a component; adding it would refuse
+        every tax-inclusive market's quote as `quote_total_not_reconciled`. Only a literal `true`
+        excludes it — absent, false or anything else is added, as before.
 
         IT DOES NOT, ON ITS OWN, CATCH A DISCOUNT OR A CHARGE. The breakdown also carries
         `discounts` and `additionalCharges`, whose shapes we have not seen populated. A
         discount can move `finalAmount` AND a component together, or a charge can come with a
         total that still reconciles, and either passes (c). So (g) refuses them outright.
 
-    (g) NO ADJUSTMENTS WE CANNOT READ. `amountBreakdown.discounts` / `additionalCharges` must be
-        absent, null or `[]` (live quotes, 2026-09-18, carried `[]`). A non-empty list, or any
-        other value, is `price_unverifiable` / `quote_adjustments_unsupported`. This fails closed
-        until their shape is known.
+    (g) NO ADJUSTMENTS WE DID NOT ASK FOR. `additionalCharges` must be absent, null or `[]`
+        always. `discounts` must be too UNLESS the quote was requested with an offer code
+        (`offer_code_sent`): then each line must be `{name: str, amount: {amount <= 0, currency =
+        the row's}}` (live PEACHIE20 on judydoll.com, 2026-09-28:
+        `[{name: "Offer code", amount: {amount: -2.09, currency: USD}}]`), and their magnitudes
+        are summed into `discount_minor` and taken off in (c). A discount on a quote we sent no
+        code for, a positive "discount" (a charge by another name), or a malformed line is
+        `price_unverifiable` / `quote_adjustments_unsupported`. We NEVER compute a discount: the
+        charge is Reap's `finalAmount`, and the lines are only checked to reconcile with it.
 
     (h) THE SHIPPING OPTIONS AGREE WITH THE BREAKDOWN, when a non-empty list is present. If any
         option is `selected: true`, EXACTLY ONE may be, and its price must equal
@@ -1007,16 +1029,20 @@ def verify_quote(
         # against, and NEVER passed on as None.
         return QuoteCheck(False, "price_unverifiable", "quote_amounts_unreadable")
 
-    # (g) — adjustments we cannot read. Fail closed until their shape is known.
-    for adjustment in ("discounts", "additionalCharges"):
-        value = breakdown.get(adjustment)
-        if value is not None and value != []:
-            return QuoteCheck(False, "price_unverifiable", "quote_adjustments_unsupported")
+    # (g) — adjustments we did not ask for. Fail closed.
+    charges = breakdown.get("additionalCharges")
+    if charges is not None and charges != []:
+        return QuoteCheck(False, "price_unverifiable", "quote_adjustments_unsupported")
+    discount_minor = _discount_minor(breakdown.get("discounts"), currency)
+    if discount_minor is None or (discount_minor and not offer_code_sent):
+        return QuoteCheck(False, "price_unverifiable", "quote_adjustments_unsupported")
 
     if subtotal_minor != unit * quantity:
         return QuoteCheck(False, "price_changed", "quote_items_subtotal_mismatch")
 
-    reconstructed = subtotal_minor + shipping_minor + tax_minor
+    # (c) — tax is a component only when it is not already inside the prices.
+    tax_component = 0 if tax_block.get("includedInPrices") is True else tax_minor
+    reconstructed = subtotal_minor + shipping_minor + tax_component - discount_minor
     if abs(total_minor - reconstructed) > QUOTE_RECONCILE_TOLERANCE_MINOR:
         return QuoteCheck(False, "price_changed", "quote_total_not_reconciled")
 
@@ -1033,7 +1059,37 @@ def verify_quote(
         subtotal_minor=subtotal_minor,
         shipping_minor=shipping_minor,
         tax_minor=tax_minor,
+        discount_minor=discount_minor if offer_code_sent else None,
     )
+
+
+def _discount_minor(value: Any, currency: str) -> Optional[int]:
+    """The summed MAGNITUDE of `amountBreakdown.discounts` in minor units, or None if any line is
+    unreadable. Absent, null and `[]` are 0.
+
+    A line is `{name: <non-empty str>, amount: {amount: <= 0, currency: <row currency>}}`.
+    Reap sends a discount as a NEGATIVE amount; a positive one is refused (None), because an
+    "adjustment" that raises the price is a charge, and (g) refuses charges.
+    """
+    if value is None or value == []:
+        return 0
+    if not isinstance(value, list):
+        return None
+    total = 0
+    for line in value:
+        if not isinstance(line, dict):
+            return None
+        name = line.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return None
+        money = _money(line.get("amount"))
+        if money is None or money[1] != currency or money[0] > 0:
+            return None
+        magnitude = _component_minor(-money[0], currency)
+        if magnitude is None:
+            return None
+        total += magnitude
+    return total
 
 
 def _single_variant_verdict(resolution: Any, row: Mapping[str, Any]) -> Optional[str]:
@@ -1053,7 +1109,9 @@ def _single_variant_verdict(resolution: Any, row: Mapping[str, Any]) -> Optional
     return None
 
 
-def verify_cart_link_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
+def verify_cart_link_quote(
+    payload: Any, row: Mapping[str, Any], *, offer_code_sent: bool = False
+) -> QuoteCheck:
     """Does this CART-LINK quote describe the purchase we opened, at our price, with shipping?
 
     Four checks, in this order, and then every amount check `verify_quote` makes:
@@ -1116,7 +1174,7 @@ def verify_cart_link_quote(payload: Any, row: Mapping[str, Any]) -> QuoteCheck:
     ):
         return QuoteCheck(False, "no_shipping_option", "quote_no_shipping_option")
 
-    return verify_quote(data, row, variant_id=None)
+    return verify_quote(data, row, variant_id=None, offer_code_sent=offer_code_sent)
 
 
 def _shipping_reconciles(options: Sequence[Any], shipping_minor: int, currency: str) -> bool:
@@ -1209,15 +1267,20 @@ async def start_purchase(
     return_url: str,
     cart_link: Optional[CartLinkItem] = None,
     consent_version: Optional[str] = None,
+    offer_code: Optional[str] = None,
 ) -> str:
     """Open a purchase in 'resolving' and return its id. MAKES NO PARTNER CALL.
 
     EXACTLY ONE OF `row` (a catalog row the resolver turns into a Reap variant) and `cart_link`
     (a Shopify cart permalink Reap quotes as received — see `CartLinkItem`). A `row` call is the
     path every caller before the cart-link lane takes, and it is unchanged. A `cart_link` call
-    additionally needs `REAP_AGENTIC_CART_LINK_ENABLED` and `rc.supports_cart_link_quote()`, and
-    refuses with its own codes (`cart_link_disabled`, `cart_link_quote_unsupported`,
-    `cart_link_refused`) before anything else about it is looked at.
+    additionally needs `REAP_AGENTIC_CART_LINK_ENABLED`, and refuses with its own codes
+    (`cart_link_disabled`, `cart_link_refused`) before anything else about it is looked at.
+
+    `offer_code` (either lane) is the buyer's own code, checked by `rc.validate_offer_code` —
+    the one rule the route and the ledger also call — and STORED on the row, because the quote
+    is made by a poller in another process. `invalid_offer_code` when it cannot be sent at all.
+    Whether Reap accepted it is decided at the quote; see `_quote_with_offer_code`.
 
     `consent_version` IS REQUIRED ON EVERY LANE (`consent_required` otherwise), and it is
     STORED ON THE PURCHASE ROW. It used to be the cart-link lane's requirement alone, checked
@@ -1261,13 +1324,6 @@ async def start_purchase(
         )
     if not rc.is_configured():
         raise PurchaseRefused("rail_unconfigured", "the Reap client has no base URL or key")
-    if cart_link is not None and not rc.supports_cart_link_quote():
-        # Reap has not published the quote field for a cart permalink. Refused here rather than
-        # at the first quote so no row — and no copy of the buyer's address — exists for a
-        # purchase that cannot be quoted.
-        raise PurchaseRefused(
-            "cart_link_quote_unsupported", "the Reap client has no cart-link quote field yet"
-        )
 
     # 2. OWNERSHIP. The ledger refuses a blank agent_id / agent_user_ref_hash too; this is the
     #    earlier, better-worded copy, and `buyer_ref` is checked here because the ledger's own
@@ -1284,6 +1340,7 @@ async def start_purchase(
     #     eligible or an item is in our catalogue. The cart-link lane re-checks it together with
     #     the minted identity, which is its own extra requirement.
     consent = _require_consent_version(consent_version)
+    code = _validated_offer_code(offer_code)
 
     if cart_link is not None:
         if row is not None:
@@ -1298,6 +1355,7 @@ async def start_purchase(
             quantity=quantity,
             click_id=click_id,
             return_url=return_url,
+            offer_code=code,
         )
 
     # 3. THE ROW.
@@ -1397,6 +1455,7 @@ async def start_purchase(
             # request, so the two stores agree at open time. `consented_at` is left to the
             # ledger, which stamps `now()` whenever a version is given.
             consent_version=consent,
+            offer_code=code,
             # The whitelisted output, not the caller's dict.
             shipping_address=dict(shipping),
             buyer_email=email,
@@ -1525,6 +1584,15 @@ def _validated_buyer(buyer: Any) -> Tuple[str, Dict[str, str]]:
     return email, dict(shipping)
 
 
+def _validated_offer_code(offer_code: Any) -> Optional[str]:
+    """`rc.validate_offer_code`, mapped to this module's one exception type. The client's message
+    names the rule that failed and never the code."""
+    try:
+        return rc.validate_offer_code(offer_code)
+    except rc.ReapRequestError as exc:
+        raise PurchaseRefused("invalid_offer_code", str(exc)) from None
+
+
 def _validated_return_url(return_url: Any) -> str:
     """The return URL through the client's validator: https, no userinfo, an allowlisted host.
 
@@ -1551,6 +1619,7 @@ async def _start_cart_link_purchase(
     quantity: Any,
     click_id: Optional[str],
     return_url: Any,
+    offer_code: Optional[str] = None,
 ) -> str:
     """The cart-link half of `start_purchase`. The dials and ownership are already checked.
 
@@ -1651,6 +1720,7 @@ async def _start_cart_link_purchase(
             market_country=market_country,
             # mig 233, same as the variant lane: the validated tag this call was made under.
             consent_version=consent,
+            offer_code=offer_code,
             shipping_address=shipping,
             buyer_email=email,
             item_source="cart_link",
@@ -1701,17 +1771,14 @@ def _cart_link_verdict(row: Mapping[str, Any]) -> Optional[Tuple[str, str]]:
     """None when a cart-link row may take its next PRE-CHECKOUT step; else
     `(refusal_reason, last_error_code)`.
 
-    RE-CHECKED ON EVERY STEP, NOT TRUSTED FROM THE CREATE. The dials can be turned off, the
-    client can lose its field name in a rollback, and a row can be written by something that is
-    not `start_purchase`. So before each quote-side step: both dials, the client's support, and
-    the stored URL through the same validator against the STORED click id, merchant and market —
+    RE-CHECKED ON EVERY STEP, NOT TRUSTED FROM THE CREATE. The dials can be turned off and a row
+    can be written by something that is not `start_purchase`. So before each quote-side step:
+    both dials, and the stored URL through the same validator against the STORED click id, merchant and market —
     which is what makes "the row's click id is the one in the URL" true at the moment the URL is
     about to leave for Reap, not only at the moment it was written.
     """
     if not (is_enabled() and is_cart_link_enabled()):
         return "cart_link_disabled", "cart_link_disabled"
-    if not rc.supports_cart_link_quote():
-        return "cart_link_quote_unsupported", "cart_link_quote_unsupported"
     reason = cart_link_refusal(
         row.get("cart_url"),
         click_id=row.get("click_id"),
@@ -2165,6 +2232,137 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
     return await _release(row, worker_id, error_code="unknown_enrollment_status")
 
 
+# ── the quote, with the buyer's offer code ──────────────────────────────────────────────────
+
+#: THE WHOLE 'quoting' STEP'S WALL-CLOCK BUDGET, in seconds. Not a new number: it is the "worst
+#: realistic 'quoting' step" that `jobs/reap_agentic_purchase_poll.py` derives (resolve 100 +
+#: quote 35 + checkout 35) and sizes the lease floor (180) against. An offer code can add a
+#: SECOND quote to the step -- a refused code costs ~15.5 s at Reap (full merchant round trip,
+#: measured 2026-09-28) and a quote 12-20.5 s -- so both quote calls are fitted INSIDE this one
+#: budget instead of stacking another 35 s on top of it and walking the step past the lease.
+QUOTING_STEP_BUDGET_S = 170.0
+
+#: What is held back from that budget for `rc.create_checkout`, which follows the quote in the
+#: same step and has its own 35 s read timeout (`rc._QUOTE_TIMEOUT_S`, the slow-path bound).
+CHECKOUT_RESERVE_S = 35.0
+
+#: The least time worth spending on a quote call. Above the slowest quote measured (20.5 s,
+#: 2026-09-28): a call given less would most likely time out, and a timed-out quote is a request
+#: against a merchant's commerce layer that bought nothing. Below this, the retry without the
+#: code is NOT made (see `_quote_with_offer_code`).
+MIN_QUOTE_BUDGET_S = 22.0
+
+
+def _monotonic() -> float:
+    """The step clock. A function so tests can move it without sleeping."""
+    return time.monotonic()
+
+
+#: Quote rejections that END the purchase as `refused` -- a fact about this cart, this buyer or
+#: this merchant that re-quoting will not change -- mapped to our `refusal_reason`. Anything
+#: classified but not here (`request_rejected`, `payments_not_enabled`, idempotency codes) is
+#: `failed` with the classified code; `quote_temporarily_unavailable` is released and retried.
+_QUOTE_REFUSAL_KINDS: Dict[str, str] = {
+    "checkout_url_invalid": "cart_link_rejected",
+    "card_payment_unavailable": "card_payment_unavailable",
+    "quote_unfulfillable": "quote_unfulfillable",
+    "variant_unavailable": "variant_unavailable",
+    "offer_code_invalid": "offer_code_rejected",
+    "offer_code_expired": "offer_code_rejected",
+}
+
+#: `offer_code_outcome` values this module writes. The ledger holds the same set.
+OFFER_CODE_OUTCOMES = ("applied", "no_discount", "dropped_invalid", "dropped_expired")
+
+
+def _code_and_timeout(code: Optional[str], timeout: Optional[float]) -> Dict[str, Any]:
+    """The quote call's optional keywords, present only when set: a purchase with no code makes
+    EXACTLY the call it made before offer codes existed (the client's per-path timeout)."""
+    kwargs: Dict[str, Any] = {}
+    if code is not None:
+        kwargs["offer_code"] = code
+    if timeout is not None:
+        kwargs["timeout_seconds"] = timeout
+    return kwargs
+
+
+@dataclass(frozen=True)
+class _QuoteAttempt:
+    """The quote response `_checkout_from_quote` should read, and what happened to the code.
+
+    `offer_code_sent` says whether THAT response was requested with the code (so its discount
+    lines may be accepted); `outcome` is `dropped_invalid` / `dropped_expired` when the code was
+    refused and the response is the re-quote without it, else None (the verdict decides
+    `applied` / `no_discount`).
+    """
+
+    response: Any
+    offer_code_sent: bool
+    outcome: Optional[str] = None
+
+
+async def _quote_with_offer_code(
+    row: Mapping[str, Any],
+    worker_id: str,
+    call: Any,
+    offer_code: Optional[str],
+    deadline: float,
+) -> Any:
+    """Quote once with the buyer's code; if Reap refuses THE CODE, quote once more without it.
+
+    Returns a `_QuoteAttempt`, or an `AdvanceResult` when the step has already ended here (a lost
+    claim, no budget left). `call(code, timeout)` is the lane's quote call.
+
+    ONLY OFFER_CODE_INVALID / OFFER_CODE_EXPIRED TRIGGER THE RETRY (`rc.OFFER_CODE_REJECTION_KINDS`).
+    Every other failure -- a transport error, a refused cart, an unfulfillable address, a 503 --
+    is returned as-is for the normal mapping: re-quoting without the code would not change it,
+    and would spend another ~20 s at the merchant to learn so.
+
+    BOTH CALLS FIT ONE DEADLINE. `deadline` is the step's (`QUOTING_STEP_BUDGET_S` from the
+    step's start, less `CHECKOUT_RESERVE_S`). Each call is given `min(slow-path bound, what is
+    left)`, and the retry is REFUSED -- `refused` / `offer_code_rejected` -- when what is left is
+    under `MIN_QUOTE_BUDGET_S`. The buyer is told their code was refused and nothing was charged;
+    a new purchase without the code starts with a full budget. Releasing instead would re-send
+    the same refused code on the next poll, forever.
+
+    With no code this is exactly the call the lanes made before: same `_still_ours` re-read, no
+    explicit timeout (the client's per-path default).
+    """
+    if offer_code is None:
+        if await _still_ours(row, worker_id) is None:
+            return _lost(row)
+        return _QuoteAttempt(await call(None, None), offer_code_sent=False)
+
+    remaining = deadline - _monotonic()
+    if remaining < MIN_QUOTE_BUDGET_S:
+        # Only reachable on the variant lane after a pathologically slow resolve. Nothing was
+        # sent; the next poll starts a fresh step with a fresh budget.
+        return await _release(row, worker_id, error_code="quote_budget_exhausted")
+    if await _still_ours(row, worker_id) is None:
+        return _lost(row)
+    first = await call(offer_code, min(rc._QUOTE_TIMEOUT_S, remaining))
+    rejection = rc.classify_quote_rejection(first)
+    if rejection is None or not rejection.offer_code_rejected:
+        return _QuoteAttempt(first, offer_code_sent=True)
+
+    outcome = "dropped_expired" if rejection.kind == "offer_code_expired" else "dropped_invalid"
+    remaining = deadline - _monotonic()
+    if remaining < MIN_QUOTE_BUDGET_S:
+        return await _move(
+            row, worker_id, ["quoting"], "refused",
+            refusal_reason="offer_code_rejected",
+            last_error_code=_error_code(f"{rejection.kind}:no_retry_budget"),
+        )
+    if await _still_ours(row, worker_id) is None:
+        return _lost(row)
+    logger.info(
+        "reap_agentic: offer code refused (%s); re-quoting without it purchase=%s",
+        rejection.kind, row.get("id"),
+    )
+    second = await call(None, min(rc._QUOTE_TIMEOUT_S, remaining))
+    return _QuoteAttempt(second, offer_code_sent=False, outcome=outcome)
+
+
 async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult:
     """quoting → awaiting_approval | refused | failed.
 
@@ -2178,6 +2376,7 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
     against a handle nobody has checked since, which is how a buyer is charged for a variant that
     is no longer the one we priced.
     """
+    deadline = _monotonic() + QUOTING_STEP_BUDGET_S - CHECKOUT_RESERVE_S
     guarded = await _still_ours(row, worker_id)
     if guarded is None:
         return _lost(row)
@@ -2198,8 +2397,20 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
             row, worker_id, ["quoting"], "failed", last_error_code="partner_id_malformed"
         )
 
+    try:
+        offer_code = rc.validate_offer_code(row.get("offer_code"))
+    except rc.ReapRequestError:
+        # `start_purchase` and the ledger both ran this rule before the row existed, so a row
+        # that fails it here was written by something else. Refused before any partner call.
+        return await _move(
+            row, worker_id, ["quoting"], "refused",
+            refusal_reason="invalid_offer_code", last_error_code="offer_code_malformed",
+        )
+
     if _is_cart_link(row):
-        return await _quote_cart_link(row, worker_id, active, partner_enrollment)
+        return await _quote_cart_link(
+            row, worker_id, active, partner_enrollment, offer_code=offer_code, deadline=deadline
+        )
 
     resolution = await rc.resolve_our_row(**_resolution_inputs(row))
     queries = list(getattr(resolution, "queries_tried", None) or [])
@@ -2218,25 +2429,35 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
                 refusal_reason=verdict, queries_tried=queries,
             )
 
-    if await _still_ours(row, worker_id) is None:
-        return _lost(row)
-    quote = await rc.request_quote(
-        items=[{"variantId": resolution.variant_id, "quantity": int(row.get("quantity") or 1)}],
-        email=row.get("buyer_email"),
-        shipping_address=row.get("shipping_address"),
-    )
+    item_evidence = {
+        "reap_product_id": _cap(resolution.product_id),
+        "reap_variant_id": _cap(resolution.variant_id),
+        "queries_tried": queries,
+    }
+
+    def _call(code: Optional[str], timeout: Optional[float]) -> Any:
+        return rc.request_quote(
+            items=[{"variantId": resolution.variant_id,
+                    "quantity": int(row.get("quantity") or 1)}],
+            email=row.get("buyer_email"),
+            shipping_address=row.get("shipping_address"),
+            **_code_and_timeout(code, timeout),
+        )
+
+    attempt = await _quote_with_offer_code(row, worker_id, _call, offer_code, deadline)
+    if isinstance(attempt, AdvanceResult):
+        return attempt
     return await _checkout_from_quote(
         row,
         worker_id,
         active,
         partner_enrollment,
-        quote,
-        item_evidence={
-            "reap_product_id": _cap(resolution.product_id),
-            "reap_variant_id": _cap(resolution.variant_id),
-            "queries_tried": queries,
-        },
-        check=lambda data: verify_quote(data, row, variant_id=resolution.variant_id),
+        attempt.response,
+        item_evidence=item_evidence,
+        check=lambda data: verify_quote(
+            data, row, variant_id=resolution.variant_id, offer_code_sent=attempt.offer_code_sent
+        ),
+        offer_code_outcome=attempt.outcome,
     )
 
 
@@ -2245,6 +2466,9 @@ async def _quote_cart_link(
     worker_id: str,
     active: Mapping[str, Any],
     partner_enrollment: str,
+    *,
+    offer_code: Optional[str] = None,
+    deadline: Optional[float] = None,
 ) -> AdvanceResult:
     """'quoting' for a CART-LINK row: re-check the row, quote the URL, then the shared tail.
 
@@ -2261,31 +2485,41 @@ async def _quote_cart_link(
             refusal_reason=verdict[0], last_error_code=verdict[1],
         )
 
-    if await _still_ours(row, worker_id) is None:
-        return _lost(row)
-    try:
-        quote = await rc.request_cart_link_quote(
+    def _call(code: Optional[str], timeout: Optional[float]) -> Any:
+        return rc.request_cart_link_quote(
             cart_url=row.get("cart_url"),
             email=row.get("buyer_email"),
             shipping_address=row.get("shipping_address"),
+            **_code_and_timeout(code, timeout),
+        )
+
+    try:
+        attempt = await _quote_with_offer_code(
+            row, worker_id, _call, offer_code,
+            deadline if deadline is not None else _monotonic() + QUOTING_STEP_BUDGET_S,
         )
     except rc.ReapRequestError as exc:
-        # Raised BEFORE egress by the body builder. Its own code when it has one (the field name
-        # went away between the verdict above and here); a generic one otherwise. `str(exc)` is
-        # not used: the builder's messages carry no values, but nothing on this path needs one.
+        # Raised BEFORE egress by the body builder. Its own code when it has one; a generic one
+        # otherwise. `str(exc)` is not used: the builder's messages carry no values, but nothing
+        # on this path needs one.
         code = str(getattr(exc, "code", "") or "cart_link_quote_unbuildable")
         return await _move(
             row, worker_id, ["quoting"], "refused",
             refusal_reason=_cap(code), last_error_code=_error_code(code),
         )
+    if isinstance(attempt, AdvanceResult):
+        return attempt
     return await _checkout_from_quote(
         row,
         worker_id,
         active,
         partner_enrollment,
-        quote,
+        attempt.response,
         item_evidence={},
-        check=lambda data: verify_cart_link_quote(data, row),
+        check=lambda data: verify_cart_link_quote(
+            data, row, offer_code_sent=attempt.offer_code_sent
+        ),
+        offer_code_outcome=attempt.outcome,
     )
 
 
@@ -2298,6 +2532,7 @@ async def _checkout_from_quote(
     *,
     item_evidence: Mapping[str, Any],
     check: Any,
+    offer_code_outcome: Optional[str] = None,
 ) -> AdvanceResult:
     """The tail of 'quoting', shared by both item sources: from a quote response to a checkout.
 
@@ -2306,20 +2541,46 @@ async def _checkout_from_quote(
     mapping, the quote id rules, the expiry check, the checkout create and every evidence write
     on the way out — is ONE body, moved here unchanged from `_step_quoting`.
     """
+    # What the buyer's offer code came to, written on EVERY exit below (a refused or failed
+    # purchase whose code was dropped still says so). Absent when no code was sent.
+    code_evidence: Dict[str, Any] = (
+        {"offer_code_outcome": offer_code_outcome} if offer_code_outcome else {}
+    )
     if not quote.ok:
         code = str(quote.error or "quote_failed")
         if _is_transport(code):
             return await _release(row, worker_id, error_code=code, transport=True)
+        rejection = rc.classify_quote_rejection(quote)
+        if rejection is not None and rejection.retryable:
+            # 503 QUOTE_TEMPORARILY_UNAVAILABLE: Reap's own "try again in a moment". Given the
+            # lease back on Reap's schedule (Retry-After, recorded by the client and bounded
+            # there), never slept on inside the step, and never read as the non-UCP 503 below.
+            return await _release(
+                row, worker_id, error_code=rejection.error_code,
+                transport=rejection.retry_after_seconds is None,
+                seconds=(max(1, rejection.retry_after_seconds)
+                         if rejection.retry_after_seconds is not None else None),
+            )
+        if rejection is not None and rejection.kind in _QUOTE_REFUSAL_KINDS:
+            return await _move(
+                row, worker_id, ["quoting"], "refused",
+                refusal_reason=_QUOTE_REFUSAL_KINDS[rejection.kind],
+                last_error_code=_error_code(rejection.error_code), **code_evidence,
+            )
         if quote.status == 503 or quote.merchant_probably_not_completable:
             # Measured on nine merchants: the two that 503 on a quote are the two that are not
             # UCP merchants. n=2, so this is recorded as a refusal on THIS purchase and is never
             # used to suppress the merchant.
             return await _move(
                 row, worker_id, ["quoting"], "refused",
-                refusal_reason="merchant_not_completable", last_error_code=_error_code(code),
+                refusal_reason="merchant_not_completable",
+                last_error_code=_error_code(rejection.error_code if rejection else code),
+                **code_evidence,
             )
         return await _move(
-            row, worker_id, ["quoting"], "failed", last_error_code=_error_code(code)
+            row, worker_id, ["quoting"], "failed",
+            last_error_code=_error_code(rejection.error_code if rejection else code),
+            **code_evidence,
         )
 
     raw_quote_id = str(quote.data.get("id") or "").strip()
@@ -2343,6 +2604,7 @@ async def _checkout_from_quote(
         # re-enrolled since has a different active row, and a purchase pointing at the old one
         # names a card that did not pay for it.
         "enrollment_id": str(active["id"]),
+        **code_evidence,
     }
 
     # THE QUOTE IS THE NUMBER THAT DECIDES THE CHARGE, so it is checked before anything is
@@ -2361,6 +2623,13 @@ async def _checkout_from_quote(
         shipping_minor=verdict.shipping_minor,
         tax_minor=verdict.tax_minor,
     )
+    if verdict.discount_minor is not None:
+        # A code was SENT and Reap priced it. `applied` when Reap returned discount lines,
+        # `no_discount` when it accepted the code and took nothing off (a code for another
+        # product, a minimum not met) -- the buyer is told either way. The amount charged is
+        # still `quoted_total_minor`, which is Reap's `finalAmount`.
+        evidence["discount_minor"] = verdict.discount_minor
+        evidence["offer_code_outcome"] = "applied" if verdict.discount_minor else "no_discount"
 
     # P2-9: a quote we already know is dead must not become a checkout. `reap_quote_expires_at`
     # was previously written and never read. Compared against this process's clock, which is the
@@ -2383,6 +2652,15 @@ async def _checkout_from_quote(
         # Both spellings are read, because the partner moved the field without moving the
         # version and a client that reads one of them is a client that stops classifying.
         top = str(checkout.error_code or "")
+        if top in rc.TEMPORARY_UNAVAILABLE_CODES:
+            # 503 CHECKOUT_TEMPORARILY_UNAVAILABLE (2026-09-28 spec): nothing was created. Same
+            # answer as an expired quote -- give the lease back, on Reap's Retry-After when it
+            # sent one, and let the next step re-quote -- never a terminal failure over a blip.
+            wait = checkout.retry_after_seconds
+            return await _release(
+                row, worker_id, error_code=_error_code(top),
+                transport=wait is None, seconds=max(1, wait) if wait is not None else None,
+            )
         if "QUOTE_EXPIRED" in (detail, top):
             # The partner's word for what the P2-9 pre-check above catches on our clock: the
             # quote died between the quote and the create. Same answer as the pre-check -- give

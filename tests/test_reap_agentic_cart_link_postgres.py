@@ -412,6 +412,8 @@ async def test_two_connections_creating_cart_link_purchases_on_one_click_leave_o
             # way: the test executes the module's real SQL, not a paraphrase that could drift.
             "consent_version": "terms-2026-09",
             "consented_at": datetime.now(timezone.utc),
+            # mig 246, same reason: the INSERT names the buyer's offer code.
+            "offer_code": None,
             "item_source": "cart_link", "cart_url": CART_URL,
         }
         return [values[name] for name in order]

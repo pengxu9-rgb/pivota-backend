@@ -128,6 +128,12 @@ from services.reap_webhooks import major_to_minor
 # RECEIVED; see `create_purchase`.
 from services.reap_cart_link import cart_link_refusal, validate_cart_link
 
+# The offer-code rule (mig 246). The client owns it because it is the PARTNER's field shape, and
+# it imports nothing from db/ (stdlib, `services.reap_cart_link`, `utils.logger`), so this cannot
+# cycle. Imported rather than re-implemented: the route, the service and this module call the
+# same function object, pinned by identity in the tests.
+from services.reap_agentic_client import ReapRequestError, validate_offer_code
+
 # `get_purchase_internal`, `get_enrollment_internal` AND `get_enrollment_by_reap_id` are
 # deliberately ABSENT. The first two are the unscoped, unredacted reads and their names say so.
 #
@@ -293,7 +299,17 @@ _TRANSITION_FIELDS: Sequence[str] = (
     "next_poll_at",
     "shipping_address",
     "buyer_email",
+    # mig 246: what the buyer's offer code came to at the quote, and what Reap took off. Written
+    # by the 'quoting' step, never by create. `offer_code` itself is NOT here: it is the buyer's
+    # input, stated once at create like the consent tag, and no poller step may revise it.
+    "offer_code_outcome",
+    "discount_minor",
 )
+
+#: `offer_code_outcome` values (mig 246). The same set as
+#: `services.reap_agentic_purchase.OFFER_CODE_OUTCOMES`, written out here because the ledger does
+#: not import the service; `test_the_offer_code_outcomes_agree` pins the two equal.
+OFFER_CODE_OUTCOMES = frozenset({"applied", "no_discount", "dropped_invalid", "dropped_expired"})
 
 # Columns stored as jsonb on Postgres / TEXT-holding-JSON on SQLite. Encoded on the way in,
 # decoded on the way out — see properties 2 and 3.
@@ -836,6 +852,12 @@ def _is_unique_violation(exc: BaseException) -> bool:
 # the argument that beats "keep the allowlist minimal" here and does not beat it for
 # `market_country`: an echoed catalog hint tells the owner nothing they did not send; a consent
 # tag tells them which of several versions was in force, which they may well not know.
+#
+# HERE, AND WHY — offer_code, offer_code_outcome, discount_minor (mig 246). The outcome is the
+# point: a code Reap refused is DROPPED and the purchase re-quoted without it, and the buyer must
+# be told that before they approve a price that is not the one they expected. The code is echoed
+# beside it so "dropped" names which code; it is the buyer's own input, not PII and not ours.
+# `discount_minor` is what Reap took off, next to the totals it explains.
 PUBLIC_PURCHASE_COLUMNS = (
     "id",
     "state",
@@ -861,6 +883,9 @@ PUBLIC_PURCHASE_COLUMNS = (
     "last_error_code",
     "consent_version",
     "consented_at",
+    "offer_code",
+    "offer_code_outcome",
+    "discount_minor",
     "created_at",
     "updated_at",
     "terminal_at",
@@ -903,7 +928,7 @@ _INSERT_PURCHASE_SQL = """
         brand, category, quantity, currency, our_price_minor, click_id, return_url,
         queries_tried, next_poll_at, shipping_address, buyer_email,
         accept_variant_labels, also_accept_domains, market_country,
-        consent_version, consented_at
+        consent_version, consented_at, offer_code
     ) VALUES (
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
         :merchant_domain, :product_key, :variant_key, :product_name, :variant_title,
@@ -913,7 +938,7 @@ _INSERT_PURCHASE_SQL = """
         :buyer_email,
         CAST(:accept_variant_labels AS JSONB), CAST(:also_accept_domains AS JSONB),
         :market_country,
-        :consent_version, :consented_at
+        :consent_version, :consented_at, :offer_code
     )
     RETURNING *
 """
@@ -925,7 +950,7 @@ _INSERT_PURCHASE_SQL_SQLITE = """
         brand, category, quantity, currency, our_price_minor, click_id, return_url,
         queries_tried, next_poll_at, shipping_address, buyer_email,
         accept_variant_labels, also_accept_domains, market_country,
-        consent_version, consented_at
+        consent_version, consented_at, offer_code
     ) VALUES (
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
         :merchant_domain, :product_key, :variant_key, :product_name, :variant_title,
@@ -933,7 +958,7 @@ _INSERT_PURCHASE_SQL_SQLITE = """
         :queries_tried, COALESCE(:next_poll_at, CURRENT_TIMESTAMP), :shipping_address,
         :buyer_email,
         :accept_variant_labels, :also_accept_domains, :market_country,
-        :consent_version, :consented_at
+        :consent_version, :consented_at, :offer_code
     )
     RETURNING *
 """
@@ -960,7 +985,7 @@ _INSERT_CART_LINK_PURCHASE_SQL = """
         brand, category, quantity, currency, our_price_minor, click_id, return_url,
         queries_tried, next_poll_at, shipping_address, buyer_email,
         accept_variant_labels, also_accept_domains, market_country,
-        consent_version, consented_at,
+        consent_version, consented_at, offer_code,
         item_source, cart_url
     ) VALUES (
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
@@ -971,7 +996,7 @@ _INSERT_CART_LINK_PURCHASE_SQL = """
         :buyer_email,
         CAST(:accept_variant_labels AS JSONB), CAST(:also_accept_domains AS JSONB),
         :market_country,
-        :consent_version, :consented_at,
+        :consent_version, :consented_at, :offer_code,
         :item_source, :cart_url
     )
     RETURNING *
@@ -984,7 +1009,7 @@ _INSERT_CART_LINK_PURCHASE_SQL_SQLITE = """
         brand, category, quantity, currency, our_price_minor, click_id, return_url,
         queries_tried, next_poll_at, shipping_address, buyer_email,
         accept_variant_labels, also_accept_domains, market_country,
-        consent_version, consented_at,
+        consent_version, consented_at, offer_code,
         item_source, cart_url
     ) VALUES (
         :id, :buyer_ref, :agent_id, :agent_user_ref_hash, :enrollment_id, :state,
@@ -993,7 +1018,7 @@ _INSERT_CART_LINK_PURCHASE_SQL_SQLITE = """
         :queries_tried, COALESCE(:next_poll_at, CURRENT_TIMESTAMP), :shipping_address,
         :buyer_email,
         :accept_variant_labels, :also_accept_domains, :market_country,
-        :consent_version, :consented_at,
+        :consent_version, :consented_at, :offer_code,
         :item_source, :cart_url
     )
     RETURNING *
@@ -1054,6 +1079,7 @@ async def create_purchase(
     consented_at: Optional[datetime] = None,
     item_source: str = "reap_variant",
     cart_url: Optional[str] = None,
+    offer_code: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Open a purchase, always in 'resolving'. `buyer_ref` is the OPAQUE reference we send Reap
     as owner.id — never the global buyer id, which must not leave this system.
@@ -1165,6 +1191,12 @@ async def create_purchase(
     # buyer's address and email with no consent evidence and nothing scheduled to terminate it.
     consent = require_consent_version(consent_version)
     consented = _require_consented_at(consented_at, consent_version=consent)
+    # mig 246. THE SAME FUNCTION OBJECT the route and the service call -- one rule. Raises a
+    # ValueError here (the ledger's one refusal type) rather than the client's request error.
+    try:
+        code = validate_offer_code(offer_code)
+    except ReapRequestError as exc:
+        raise ValueError(str(exc)) from None
     stored_cart_url = _require_item_source(
         item_source,
         cart_url,
@@ -1201,6 +1233,7 @@ async def create_purchase(
         "market_country": country,
         "consent_version": consent,
         "consented_at": _bind_dt(consented),
+        "offer_code": code,
     }
     # THE BRANCH IS AT THE CALL SITE, not `sql = A if IS_POSTGRES else B` one line up. Both
     # forms read the same; only this one is visible to tests/test_repo_sql_prepare_postgres.py,
@@ -1371,6 +1404,8 @@ _TRANSITION_SQL = """
            final_total_minor = COALESCE(:final_total_minor, final_total_minor),
            shipping_minor = COALESCE(:shipping_minor, shipping_minor),
            tax_minor = COALESCE(:tax_minor, tax_minor),
+           offer_code_outcome = COALESCE(:offer_code_outcome, offer_code_outcome),
+           discount_minor = COALESCE(:discount_minor, discount_minor),
            hosted_url = COALESCE(:hosted_url, hosted_url),
            hosted_url_expires_at = COALESCE(:hosted_url_expires_at, hosted_url_expires_at),
            refusal_reason = COALESCE(:refusal_reason, refusal_reason),
@@ -1422,6 +1457,8 @@ _TRANSITION_SQL_SQLITE = """
            final_total_minor = COALESCE(:final_total_minor, final_total_minor),
            shipping_minor = COALESCE(:shipping_minor, shipping_minor),
            tax_minor = COALESCE(:tax_minor, tax_minor),
+           offer_code_outcome = COALESCE(:offer_code_outcome, offer_code_outcome),
+           discount_minor = COALESCE(:discount_minor, discount_minor),
            hosted_url = COALESCE(:hosted_url, hosted_url),
            hosted_url_expires_at = COALESCE(:hosted_url_expires_at, hosted_url_expires_at),
            refusal_reason = COALESCE(:refusal_reason, refusal_reason),
@@ -1535,6 +1572,14 @@ async def transition(
     unknown = [key for key in fields if key not in _TRANSITION_FIELDS]
     if unknown:
         raise TypeError(f"transition() got unexpected field(s): {', '.join(sorted(unknown))}")
+    outcome = fields.get("offer_code_outcome")
+    if outcome is not None and outcome not in OFFER_CODE_OUTCOMES:
+        raise ValueError("offer_code_outcome is not a known outcome")
+    discount = fields.get("discount_minor")
+    if discount is not None and (
+        isinstance(discount, bool) or not isinstance(discount, int) or discount < 0
+    ):
+        raise ValueError("discount_minor must be a non-negative int")
 
     if holder is not None:
         _require_worker_id(holder, "holder")

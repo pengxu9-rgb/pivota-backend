@@ -551,6 +551,9 @@ _EXPECTED_PUBLIC_COLUMNS = {
     # partition test below forces the choice, and the allowlist's whole design is that a new
     # column is invisible until somebody writes it into both lists.
     "consent_version", "consented_at",
+    # mig 246. The buyer's OWN offer code, what it came to (a code Reap refused is dropped and
+    # the buyer must be told before approving), and what Reap took off. Not PII.
+    "offer_code", "offer_code_outcome", "discount_minor",
 }
 _EXPECTED_NEVER_PUBLIC = {
     "buyer_ref", "agent_id", "agent_user_ref_hash", "buyer_email", "shipping_address",
@@ -3011,9 +3014,12 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
         "cart_url",
         "consent_version",
         "consented_at",
+        "offer_code",
+        "offer_code_outcome",
+        "discount_minor",
     }, (
-        "the heal added something other than the three mig-225, two mig-229 and two mig-233 "
-        "columns"
+        "the heal added something other than the three mig-225, two mig-229, two mig-233 and "
+        "three mig-246 columns"
     )
 
     # And the rail works on the healed table.

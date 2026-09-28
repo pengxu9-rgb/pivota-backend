@@ -534,16 +534,17 @@ async def test_an_unconfigured_client_is_as_absent_as_a_dial_that_is_off(client,
         assert _error(resp) == "not_available_on_this_rail"
 
 
-async def test_cart_link_stays_dark_when_its_dial_or_partner_field_is_missing(client, monkeypatch):
+async def test_cart_link_stays_dark_when_its_dial_is_off(client, monkeypatch):
+    """The lane dial is the ONLY cart-link switch since the client builds Reap's published
+    `externalCheckout` body (2026-09-28); off, unset, empty or misspelt is the rail's 404."""
     await _seed_tierb_shopify_item()
     await _seed_tierb_verdict()
     body = _body(item_source="cart_link")
-    for dial, field in ((None, "fakeCartUrl"), ("1", None)):
+    for dial in (None, "", "0", "ture"):
         if dial is None:
             monkeypatch.delenv("REAP_AGENTIC_CART_LINK_ENABLED", raising=False)
         else:
             monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", dial)
-        monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", field)
         response = await client.post(f"{BASE}/purchases", json=body)
         assert response.status_code == 404
         assert _error(response) == "not_available_on_this_rail"
@@ -553,7 +554,6 @@ async def test_cart_link_stays_dark_when_its_dial_or_partner_field_is_missing(cl
 async def test_cart_link_needs_a_fresh_tierb_verdict_before_minting_a_buyer(client, monkeypatch):
     await _seed_tierb_shopify_item()
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
-    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "fakeCartUrl")
     for verdict, age in ((None, 0), ("LOGIN_REQUIRED", 0), ("ELIGIBLE", 49)):
         if verdict is not None:
             await database.execute("DELETE FROM tierb_cart_link_eligibility")
@@ -569,7 +569,6 @@ async def test_cart_link_route_builds_server_priced_item_and_owned_click(client,
     await _seed_tierb_shopify_item()
     await _seed_tierb_verdict()
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
-    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "fakeCartUrl")
     # These unrecognised client fields are ignored, not used as price, item, or attribution.
     response = await client.post(f"{BASE}/purchases", json=_body(
         item_source="cart_link", our_price_minor=1, cart_url="https://evil.example/cart/1:1",
@@ -601,7 +600,6 @@ async def test_cart_link_refuses_a_non_numeric_catalog_variant(client, monkeypat
     await _seed_catalog()  # synthetic source_variant_id='v1' is not a Shopify id
     await _seed_tierb_verdict()
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
-    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "fakeCartUrl")
     response = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link"))
     assert response.status_code == 409
     assert _error(response) == "row_variant_unverified"
@@ -658,7 +656,6 @@ async def test_cart_link_mirrored_seed_requires_product_bound_storefront_variant
     )
     await _seed_tierb_verdict()
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
-    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "fakeCartUrl")
     response = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link"))
     assert response.status_code == expected, response.text
     if expected == 202:
@@ -1811,6 +1808,7 @@ async def test_the_totals_are_one_object_with_one_spelling_each(client):
         "final_total_minor": None,
         "shipping_minor": 100,
         "tax_minor": 150,
+        "discount_minor": None,
     }
     for key in ("currency", "our_price_minor", "quoted_total_minor", "tax_minor"):
         assert key not in body
@@ -2873,7 +2871,6 @@ async def test_the_cart_link_lane_keeps_the_host_it_was_given(client, monkeypatc
     )
     await _seed_tierb_verdict()  # keyed `brand.example`; its reader folds the `www.` itself
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
-    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "fakeCartUrl")
     resp = await client.post(
         f"{BASE}/purchases",
         json=_body(item_source="cart_link", merchant_domain="www.brand.example"),
@@ -2909,3 +2906,64 @@ async def test_the_sql_fold_agrees_with_the_python_canonicaliser():
     ):
         folded = await database.fetch_val(f"SELECT {expression}", {"h": host})
         assert folded == routes_reap.canonical_merchant_domain(host), host
+
+
+# ── offer codes (2026-09-28) ─────────────────────────────────────────────────────────────────
+
+
+async def test_an_offer_code_is_forwarded_stored_and_read_back(client):
+    await _seed_all()
+    created = await client.post(f"{BASE}/purchases", json=_body(offer_code="peachie20"))
+    assert created.status_code == 202, created.text
+    purchase_id = created.json()["purchase_id"]
+    assert (await _purchase_row(purchase_id))["offer_code"] == "peachie20"  # case kept
+    body = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
+    assert body["offer_code"] == "peachie20" and body["offer_code_outcome"] is None
+    assert body["totals"]["discount_minor"] is None
+
+
+async def test_no_offer_code_stores_none(client):
+    purchase_id = await _open(client)
+    assert (await _purchase_row(purchase_id))["offer_code"] is None
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "x" * 129, "A\u0000B", "SAVE\n10"])
+async def test_an_unsendable_offer_code_is_refused_at_the_edge_before_any_write(client, bad):
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body(offer_code=bad))
+    assert resp.status_code == 400
+    assert _error(resp) == "invalid_offer_code"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_a_non_string_offer_code_is_a_malformed_body(client):
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body(offer_code=20))
+    assert resp.status_code == 400 and _error(resp) == "invalid_request"
+
+
+async def test_the_offer_code_is_part_of_what_an_idempotency_key_is_for(client):
+    """A retry that adds or changes a code can change the price the buyer approves, so it is a
+    different purchase -- and a retry with the SAME code replays."""
+    await _seed_all()
+    first = await client.post(f"{BASE}/purchases",
+                              json=_body(idempotency_key="k-code", offer_code="SAVE10"))
+    assert first.status_code == 202
+    replay = await client.post(f"{BASE}/purchases",
+                               json=_body(idempotency_key="k-code", offer_code="SAVE10"))
+    assert replay.status_code == 202
+    assert replay.json()["purchase_id"] == first.json()["purchase_id"]
+    for other in ("SAVE20", None):
+        payload = _body(idempotency_key="k-code")
+        if other is not None:
+            payload["offer_code"] = other
+        resp = await client.post(f"{BASE}/purchases", json=payload)
+        assert resp.status_code == 409 and _error(resp) == "idempotency_conflict"
+
+
+def test_a_request_without_a_code_keeps_its_old_hash():
+    """Existing idempotency keys keep their meaning across this rollout."""
+    facts = dict(merchant_domain="m.example", product_key="p", variant_key="v", quantity=1,
+                 email="a@b.co", shipping_address={"city": "X"}, return_url="https://r")
+    assert routes_reap._request_hash(**facts) == routes_reap._request_hash(**facts, offer_code=None)
+    assert routes_reap._request_hash(**facts) != routes_reap._request_hash(**facts, offer_code="X")

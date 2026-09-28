@@ -24,8 +24,7 @@ WHAT IS REAL: the ledger, the schema (self-heal on SQLite — the thing producti
 migrations on Postgres, with the self-heal compared against them in the Postgres collector), the
 validator, the client's pure builders. WHAT IS FAKE: every client call that would reach the
 network, plus the attribution hook. `httpx.AsyncClient` raises if anything reaches for it.
-`rc.CART_LINK_QUOTE_FIELD` is set to a deliberately FAKE name — Reap has not published the real
-one, and a test must not look like it knows it.
+The cart-link body is Reap's published `externalCheckout` shape (2026-09-28 spec).
 """
 
 from __future__ import annotations
@@ -65,11 +64,9 @@ MIGRATIONS = (
     # cases open would fail on an UndefinedColumn. See
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
+    MIGRATIONS_DIR / "246_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
 )
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
-
-#: A name Reap has NOT published — chosen so it can never be mistaken for the real one.
-FAKE_FIELD = "pivotaTestOnlyCartUrl"
 
 SHOP = "judydoll.com"
 CLICK = "clk_9b1c3dcd4a854e26a5c8a295"
@@ -244,7 +241,6 @@ def cartlink_env(monkeypatch):
     monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
     monkeypatch.delenv("REAP_RETURN_URL_HOSTS", raising=False)
     monkeypatch.delenv("REAP_API_TIMEOUT_SECONDS", raising=False)
-    monkeypatch.setattr(rc, "CART_LINK_QUOTE_FIELD", FAKE_FIELD)
 
 
 @pytest.fixture(autouse=True)
@@ -806,45 +802,22 @@ async def test_a_reap_variant_create_still_works_on_a_database_without_the_229_c
 # ══ 3. CLIENT: the builder and the transport, without the wire name ══════════════════════════
 
 
-def test_the_shipped_field_name_is_unset():
-    """The spec has not published it; the module must not guess. Read from the SOURCE, because
-    the autouse fixture patches the attribute for every other test."""
+def test_the_flat_field_seam_is_gone():
+    """The seam that waited for ONE unpublished field name is replaced by the published nested
+    shape; nothing but the two env dials arms the lane."""
     source = Path(rc.__file__).read_text()
-    assert re.search(r"^CART_LINK_QUOTE_FIELD: Optional\[str\] = None$", source, re.M)
+    assert "CART_LINK_QUOTE_FIELD" not in source
+    assert not hasattr(rc, "supports_cart_link_quote")
 
 
-def test_supports_is_false_while_the_field_is_unset(monkeypatch):
-    monkeypatch.setattr(rc, "CART_LINK_QUOTE_FIELD", None)
-    assert rc.supports_cart_link_quote() is False
-    monkeypatch.setattr(rc, "CART_LINK_QUOTE_FIELD", FAKE_FIELD)
-    assert rc.supports_cart_link_quote() is True
-
-
-@pytest.mark.parametrize("bad", ["", "email", "items", "shippingAddress", "cart url", "1x", 7])
-def test_an_unusable_field_name_is_unsupported(monkeypatch, bad):
-    monkeypatch.setattr(rc, "CART_LINK_QUOTE_FIELD", bad)
-    assert rc.supports_cart_link_quote() is False
-    with pytest.raises(rc.CartLinkQuoteUnsupported):
-        rc.build_cart_link_quote_request(cart_url=CART_URL, email=EMAIL, shipping_address=ADDRESS)
-
-
-def test_the_builder_raises_the_request_error_with_its_code_while_unset(monkeypatch):
-    monkeypatch.setattr(rc, "CART_LINK_QUOTE_FIELD", None)
-    with pytest.raises(rc.ReapRequestError) as caught:
-        rc.build_cart_link_quote_request(cart_url=CART_URL, email=EMAIL, shipping_address=ADDRESS)
-    assert isinstance(caught.value, rc.CartLinkQuoteUnsupported)
-    assert caught.value.code == "cart_link_quote_unsupported"
-    assert str(caught.value).startswith("cart_link_quote_unsupported")
-
-
-def test_the_builder_puts_the_url_under_the_field_and_keeps_the_published_buyer_shape():
+def test_the_builder_sends_external_checkout_and_keeps_the_published_buyer_shape():
     body = rc.build_cart_link_quote_request(
         cart_url=CART_URL,
         email=EMAIL,
         shipping_address={**ADDRESS, "dateOfBirth": "1990-01-01"},
     )
-    assert set(body) == {FAKE_FIELD, "email", "shippingAddress"}
-    assert body[FAKE_FIELD] == CART_URL
+    assert set(body) == {"externalCheckout", "email", "shippingAddress"}
+    assert body["externalCheckout"] == {"merchantDomain": SHOP, "checkoutUrl": CART_URL}
     assert body["email"] == EMAIL
     # The SAME whitelist the variant quote uses — the extra key is dropped, not forwarded.
     assert body["shippingAddress"] == rc.build_shipping_address(ADDRESS)
@@ -940,7 +913,7 @@ async def test_the_cart_link_quote_rides_request_quotes_own_transport(wire, monk
     assert set(cart["headers"]) == set(variant["headers"])
     assert cart["headers"]["Idempotency-Key"].startswith("pivota-quotes-")
     assert cart["headers"]["Reap-Version"] == variant["headers"]["Reap-Version"]
-    assert cart["body"][FAKE_FIELD] == CART_URL
+    assert cart["body"]["externalCheckout"]["checkoutUrl"] == CART_URL
 
 
 async def test_the_cart_link_idempotency_key_is_stable_and_body_derived(wire, monkeypatch):
@@ -957,10 +930,9 @@ async def test_a_503_on_a_cart_link_quote_is_marked_not_completable(wire):
     assert not got.ok and got.merchant_probably_not_completable
 
 
-async def test_nothing_reaches_the_wire_while_the_field_is_unset(wire, monkeypatch):
-    monkeypatch.setattr(rc, "CART_LINK_QUOTE_FIELD", None)
-    with pytest.raises(rc.CartLinkQuoteUnsupported):
-        await rc.request_cart_link_quote(cart_url=CART_URL, email=EMAIL, shipping_address=ADDRESS)
+async def test_nothing_reaches_the_wire_when_the_builder_refuses(wire):
+    with pytest.raises(rc.ReapRequestError):
+        await rc.request_cart_link_quote(cart_url=PREFILL_LINK, email=EMAIL, shipping_address=ADDRESS)
     assert wire.calls == []
 
 
@@ -1006,7 +978,6 @@ def test_the_lane_dial_defaults_off(monkeypatch):
 async def test_the_lane_dial_does_not_gate_the_variant_lane(monkeypatch):
     """CONTROL: turning the cart-link dial off must not touch a reap_variant purchase."""
     monkeypatch.delenv("REAP_AGENTIC_CART_LINK_ENABLED", raising=False)
-    monkeypatch.setattr(rc, "CART_LINK_QUOTE_FIELD", None)
     purchase_id = await start(
         cart_link=None,
         row=svc.PurchaseRow(
@@ -1018,14 +989,6 @@ async def test_the_lane_dial_does_not_gate_the_variant_lane(monkeypatch):
     )
     row = await get(purchase_id)
     assert row["item_source"] == "reap_variant" and row["cart_url"] is None
-
-
-async def test_an_unsupported_client_refuses_before_any_write(monkeypatch):
-    monkeypatch.setattr(rc, "CART_LINK_QUOTE_FIELD", None)
-    with pytest.raises(svc.PurchaseRefused) as caught:
-        await start()
-    assert caught.value.reason == "cart_link_quote_unsupported"
-    assert await count() == 0
 
 
 async def test_an_unconfigured_client_still_refuses_first_as_unconfigured(monkeypatch):
@@ -1273,8 +1236,8 @@ async def test_a_transport_failure_on_the_quote_releases_and_retries(reap, attri
 @pytest.mark.parametrize(
     "exc,reason",
     [
-        (rc.CartLinkQuoteUnsupported("cart_link_quote_unsupported: gone"),
-         "cart_link_quote_unsupported"),
+        (rc.OfferCodeInvalid("offer_code must contain a non-whitespace character"),
+         "offer_code_malformed"),
         (rc.ReapRequestError("a cart-link quote needs a shipping address"),
          "cart_link_quote_unbuildable"),
     ],
@@ -1329,14 +1292,6 @@ async def test_a_dial_turned_off_refuses_a_quoting_row_before_any_quote(
     assert reap.named("request_cart_link_quote") == []
 
 
-async def test_a_field_name_lost_mid_flight_refuses_a_quoting_row(reap, attribution, monkeypatch):
-    purchase_id = await to_quoting(reap)
-    monkeypatch.setattr(rc, "CART_LINK_QUOTE_FIELD", None)
-    moved = await step(purchase_id)
-    assert moved.state == "refused" and moved.refusal_reason == "cart_link_quote_unsupported"
-    assert reap.named("request_cart_link_quote") == []
-
-
 async def test_a_dial_turned_off_after_the_checkout_exists_never_abandons_it(
     reap, attribution, monkeypatch
 ):
@@ -1344,7 +1299,6 @@ async def test_a_dial_turned_off_after_the_checkout_exists_never_abandons_it(
     purchase_id = await to_quoting(reap)
     assert (await step(purchase_id)).state == "awaiting_approval"
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "0")
-    monkeypatch.setattr(rc, "CART_LINK_QUOTE_FIELD", None)
     assert (await step(purchase_id)).state == "completed"
     assert len(attribution.calls) == 1
 
@@ -2612,3 +2566,283 @@ async def test_the_variant_lane_is_unchanged_at_the_service():
         )
     assert excinfo.value.reason == "consent_required"
     assert await count() == before
+
+
+# ══ OFFER CODES AND THE 2026-09-28 QUOTE ERRORS ═════════════════════════════════════════════
+#
+# The buyer's code is stored at start, sent on the quote, and -- if Reap refuses THE CODE --
+# dropped for ONE re-quote without it, inside one step budget. Reap's `finalAmount` is always the
+# charge; the discount lines are only checked to reconcile with it.
+
+CODE = "PEACHIE20"
+
+
+def discounted_quote(discount=-2.09, final=31.11):
+    """The live PEACHIE20 shape (judydoll.com, sg.sandbox, 2026-09-28) on this fixture's price:
+    items 28.20 + shipping 5.00 - 2.09 = 31.11 USD."""
+    quote = cart_quote()
+    quote["amountBreakdown"]["discounts"] = [
+        {"name": "Offer code", "amount": {"amount": discount, "currency": "USD"}}]
+    quote["amountBreakdown"]["finalAmount"] = {"amount": final, "currency": "USD"}
+    return quote
+
+
+def rejected(code, *, reason=None, status=400, retry_after=None) -> rc.ReapResponse:
+    """A failed quote EXACTLY as the client hands it over after `_error_codes` read the body."""
+    return rc.ReapResponse(ok=False, status=status, error=f"reap_status_{status}",
+                           error_code=code, error_detail_reason=reason,
+                           retry_after_seconds=retry_after,
+                           merchant_probably_not_completable=(
+                               status == 503 and code not in rc.TEMPORARY_UNAVAILABLE_CODES))
+
+
+async def to_quoting_with_code(code=CODE) -> str:
+    await active_enrollment()
+    purchase_id = await start(offer_code=code)
+    moved = await step(purchase_id)
+    assert moved.state == "quoting", moved
+    return purchase_id
+
+
+class Clock:
+    """`svc._monotonic`, moved by the fake partner as each call 'takes' time."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = Clock()
+    monkeypatch.setattr(svc, "_monotonic", fake)
+    return fake
+
+
+def taking(clock, seconds, answer):
+    def _call(**kwargs):
+        clock.now += seconds
+        return answer
+    return _call
+
+
+async def test_an_offer_code_is_stored_sent_and_its_discount_recorded(reap, attribution, clock):
+    purchase_id = await to_quoting_with_code()
+    assert (await get(purchase_id))["offer_code"] == CODE
+    reap.request_cart_link_quote = ok(discounted_quote())
+    moved = await step(purchase_id)
+    assert moved.state == "awaiting_approval", moved
+    (call,) = reap.named("request_cart_link_quote")
+    assert call["offer_code"] == CODE
+    assert 0 < call["timeout_seconds"] <= rc._QUOTE_TIMEOUT_S
+    row = await get(purchase_id)
+    assert (row["offer_code_outcome"], row["discount_minor"], row["quoted_total_minor"]) == (
+        "applied", 209, 3111)
+    view = ledger.public_purchase_view(row)
+    assert (view["offer_code"], view["offer_code_outcome"], view["discount_minor"]) == (
+        CODE, "applied", 209)
+
+
+async def test_a_code_reap_accepts_without_taking_anything_off_is_no_discount(
+    reap, attribution, clock
+):
+    purchase_id = await to_quoting_with_code()
+    reap.request_cart_link_quote = ok(cart_quote())
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    row = await get(purchase_id)
+    assert (row["offer_code_outcome"], row["discount_minor"]) == ("no_discount", 0)
+
+
+@pytest.mark.parametrize("code,outcome", [
+    ("OFFER_CODE_INVALID", "dropped_invalid"),
+    ("OFFER_CODE_EXPIRED", "dropped_expired"),
+])
+async def test_a_refused_code_is_dropped_and_the_cart_requoted_once_without_it(
+    reap, attribution, clock, code, outcome
+):
+    purchase_id = await to_quoting_with_code()
+    reap.request_cart_link_quote = [taking(clock, 15.5, rejected(code)), ok(cart_quote())]
+    moved = await step(purchase_id)
+    assert moved.state == "awaiting_approval", moved
+    first, second = reap.named("request_cart_link_quote")
+    assert first["offer_code"] == CODE
+    assert "offer_code" not in second
+    # Same cart, same buyer: only the code differs between the two requests.
+    assert {k: v for k, v in first.items() if k not in ("offer_code", "timeout_seconds")} == \
+        {k: v for k, v in second.items() if k != "timeout_seconds"}
+    row = await get(purchase_id)
+    assert row["offer_code_outcome"] == outcome and row["discount_minor"] is None
+    assert row["quoted_total_minor"] == 3320  # Reap's finalAmount, never a number we computed
+    assert ledger.public_purchase_view(row)["offer_code_outcome"] == outcome
+
+
+@pytest.mark.parametrize("answer", [
+    rejected("QUOTE_UNFULFILLABLE", reason="ITEMS_UNSHIPPABLE"),
+    rejected("CHECKOUT_URL_INVALID", reason="MERCHANT_CONTEXT_UNVERIFIED"),
+    rejected("AGENTIC_REQUEST_REJECTED"),
+    rejected("CARD_PAYMENT_UNAVAILABLE"),
+    rejected("AGENTIC_SERVICE_UNAVAILABLE", status=503),
+    rejected("QUOTE_TEMPORARILY_UNAVAILABLE", status=503, retry_after=30),
+    rejected(None),
+    rc.ReapResponse(ok=False, error="transport_error:ReadTimeout"),
+])
+async def test_only_an_offer_code_rejection_triggers_the_requote(reap, attribution, clock, answer):
+    purchase_id = await to_quoting_with_code()
+    reap.request_cart_link_quote = answer
+    await step(purchase_id)
+    assert len(reap.named("request_cart_link_quote")) == 1
+
+
+async def test_no_requote_when_the_budget_cannot_cover_one(reap, attribution, clock):
+    """135 s of quote budget (170 less the checkout reserve). A refused code that took 115 s
+    leaves 20 -- under MIN_QUOTE_BUDGET_S -- so the retry is refused, not squeezed."""
+    purchase_id = await to_quoting_with_code()
+    reap.request_cart_link_quote = [taking(clock, 115.0, rejected("OFFER_CODE_INVALID")),
+                                    ok(cart_quote())]
+    moved = await step(purchase_id)
+    assert moved.state == "refused" and moved.refusal_reason == "offer_code_rejected"
+    assert len(reap.named("request_cart_link_quote")) == 1
+    row = await get(purchase_id)
+    assert row["last_error_code"] == "offer_code_invalid:no_retry_budget"
+    assert row["buyer_email"] is None and "create_checkout" not in reap.sequence()
+
+
+async def test_the_requote_is_given_what_is_left_of_the_budget(reap, attribution, clock):
+    purchase_id = await to_quoting_with_code()
+    reap.request_cart_link_quote = [taking(clock, 110.0, rejected("OFFER_CODE_EXPIRED")),
+                                    ok(cart_quote())]
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    first, second = reap.named("request_cart_link_quote")
+    assert first["timeout_seconds"] == rc._QUOTE_TIMEOUT_S
+    budget = svc.QUOTING_STEP_BUDGET_S - svc.CHECKOUT_RESERVE_S
+    assert second["timeout_seconds"] == pytest.approx(budget - 110.0)
+    assert second["timeout_seconds"] >= svc.MIN_QUOTE_BUDGET_S
+
+
+async def test_a_purchase_without_a_code_makes_exactly_the_old_call(reap, attribution):
+    purchase_id = await to_quoting(reap)
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    (call,) = reap.named("request_cart_link_quote")
+    assert "offer_code" not in call and "timeout_seconds" not in call
+    row = await get(purchase_id)
+    assert (row["offer_code"], row["offer_code_outcome"], row["discount_minor"]) == (None,) * 3
+
+
+async def test_a_discount_on_a_quote_we_sent_no_code_for_is_refused(reap, attribution):
+    purchase_id = await to_quoting(reap)
+    reap.request_cart_link_quote = ok(discounted_quote())
+    moved = await step(purchase_id)
+    assert moved.state == "refused" and moved.refusal_reason == "price_unverifiable"
+    assert (await get(purchase_id))["last_error_code"] == "quote_adjustments_unsupported"
+
+
+async def test_a_discount_on_the_requote_without_the_code_is_refused(reap, attribution, clock):
+    purchase_id = await to_quoting_with_code()
+    reap.request_cart_link_quote = [rejected("OFFER_CODE_INVALID"), ok(discounted_quote())]
+    moved = await step(purchase_id)
+    assert moved.state == "refused" and moved.refusal_reason == "price_unverifiable"
+    row = await get(purchase_id)
+    assert row["offer_code_outcome"] == "dropped_invalid"  # written on the refusal too
+
+
+@pytest.mark.parametrize("quote", [
+    discounted_quote(discount=2.09, final=35.29),            # a positive "discount" is a charge
+    discounted_quote(final=33.20),                            # lines that do not reconcile
+])
+async def test_a_discount_that_does_not_reconcile_is_refused(reap, attribution, clock, quote):
+    purchase_id = await to_quoting_with_code()
+    reap.request_cart_link_quote = ok(quote)
+    moved = await step(purchase_id)
+    assert moved.state == "refused", moved
+    assert "create_checkout" not in reap.sequence()
+
+
+@pytest.mark.parametrize("answer,reason,code", [
+    (rejected("QUOTE_UNFULFILLABLE", reason="ITEMS_UNSHIPPABLE"),
+     "quote_unfulfillable", "quote_unfulfillable:items_unshippable"),
+    (rejected("CHECKOUT_URL_INVALID", reason="MERCHANT_CONTEXT_UNVERIFIED"),
+     "cart_link_rejected", "checkout_url_invalid:merchant_context_unverified"),
+    (rejected("CARD_PAYMENT_UNAVAILABLE"), "card_payment_unavailable", "card_payment_unavailable"),
+    (rejected("VARIANT_UNAVAILABLE", status=409), "variant_unavailable", "variant_unavailable"),
+])
+async def test_each_quote_refusal_code_ends_the_purchase_with_its_own_name(
+    reap, attribution, answer, reason, code
+):
+    purchase_id = await to_quoting(reap)
+    reap.request_cart_link_quote = answer
+    moved = await step(purchase_id)
+    assert moved.state == "refused" and moved.refusal_reason == reason
+    row = await get(purchase_id)
+    assert row["last_error_code"] == code and row["buyer_email"] is None
+
+
+async def test_a_rejected_request_fails_with_its_code_not_a_bare_status(reap, attribution):
+    """The live merchantDomain-mismatch shape. Unreachable from our builder, but named."""
+    purchase_id = await to_quoting(reap)
+    reap.request_cart_link_quote = rejected("AGENTIC_REQUEST_REJECTED")
+    moved = await step(purchase_id)
+    assert moved.state == "failed"
+    assert (await get(purchase_id))["last_error_code"] == "request_rejected"
+
+
+async def test_quote_temporarily_unavailable_is_released_on_reaps_schedule(reap, attribution):
+    purchase_id = await to_quoting(reap)
+    reap.request_cart_link_quote = rejected("QUOTE_TEMPORARILY_UNAVAILABLE", status=503,
+                                            retry_after=42)
+    moved = await step(purchase_id)
+    assert moved.outcome == "released" and moved.state == "quoting"
+    assert moved.last_error_code == "quote_temporarily_unavailable"
+    assert moved.next_poll_in_seconds == 42
+
+
+async def test_checkout_temporarily_unavailable_is_released_not_failed(reap, attribution):
+    purchase_id = await to_quoting(reap)
+    reap.create_checkout = rc.ReapResponse(
+        ok=False, status=503, error="reap_status_503",
+        error_code="CHECKOUT_TEMPORARILY_UNAVAILABLE", retry_after_seconds=9)
+    moved = await step(purchase_id)
+    assert moved.outcome == "released" and moved.state == "quoting"
+    assert moved.next_poll_in_seconds == 9
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "x" * 129, "A\x00B"])
+async def test_an_unsendable_code_is_refused_before_any_write(bad):
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        await start(offer_code=bad)
+    assert caught.value.reason == "invalid_offer_code"
+    assert await count() == 0
+
+
+async def test_a_128_character_code_is_stored_as_given():
+    code = " Mixed" + "x" * 121 + " "
+    assert len(code) == 128
+    purchase_id = await start(offer_code=code)
+    assert (await get(purchase_id))["offer_code"] == code
+
+
+def test_one_offer_code_rule_one_function():
+    import routes.agent_commerce_reap as routes_reap
+
+    assert ledger.validate_offer_code is rc.validate_offer_code
+    assert routes_reap.rc.validate_offer_code is rc.validate_offer_code
+    assert svc.rc.validate_offer_code is rc.validate_offer_code
+    assert set(svc.OFFER_CODE_OUTCOMES) == set(ledger.OFFER_CODE_OUTCOMES)
+
+
+async def test_the_ledger_refuses_what_the_service_would_never_write():
+    with pytest.raises(ValueError):
+        await mk_cart_row(offer_code="")
+    row = await mk_cart_row(offer_code=CODE)
+    with pytest.raises(ValueError):
+        await ledger.transition(row["id"], from_states=["resolving"], to_state="quoting",
+                                offer_code_outcome="half_applied")
+    with pytest.raises(ValueError):
+        await ledger.transition(row["id"], from_states=["resolving"], to_state="quoting",
+                                discount_minor=-1)
+
+
+def test_offer_code_is_create_only_and_its_outcome_is_a_transition_field():
+    assert "offer_code" not in ledger._TRANSITION_FIELDS
+    assert {"offer_code_outcome", "discount_minor"} <= set(ledger._TRANSITION_FIELDS)

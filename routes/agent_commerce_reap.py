@@ -180,6 +180,11 @@ _REFUSAL_STATUS: Dict[str, int] = {
     "invalid_address": 400,
     "invalid_return_url": 400,
     "currency_unsupported": 400,
+    # An offer code Reap's field cannot carry (empty, whitespace only, over 128 characters, a
+    # control character). Checked by `rc.validate_offer_code`, the one rule the service and the
+    # ledger also call. A code that is well-formed but that REAP refuses is not this: the
+    # purchase goes ahead without it and says so (`offer_code_outcome`).
+    "invalid_offer_code": 400,
     # The buyer did not agree to anything. 400 AND NOT 401/403: the caller CAN fix this by
     # editing the request — it is a missing field, not a missing credential — and a 401 would
     # send a door that already holds a valid user token off to re-authenticate, which would
@@ -461,6 +466,21 @@ class StartPurchaseRequest(BaseModel):
     #: door can send what it already sends to the other commerce routes without a 422, and so
     #: that the day there is somewhere to put it, the field is already the one callers use.
     click_context: Optional[Dict[str, Any]] = None
+    #: The buyer's own offer (coupon) code, optional, either lane. Validated by the handler
+    #: through `rc.validate_offer_code` rather than by a pydantic constraint here, so a bad one
+    #: answers `invalid_offer_code` instead of a generic `invalid_request`, and so the rule has
+    #: one owner. Sent to Reap AS GIVEN; if Reap refuses it the purchase is re-quoted without it
+    #: and `offer_code_outcome` on the purchase says `dropped_invalid` / `dropped_expired`.
+    offer_code: Optional[str] = None
+
+
+def _offer_code(value: Any) -> Optional[str]:
+    """`rc.validate_offer_code` at the edge, as a `PurchaseRefused`. The SAME function object the
+    service and the ledger call -- one rule, one function; pinned by identity in the tests."""
+    try:
+        return rc.validate_offer_code(value)
+    except rc.ReapRequestError:
+        raise svc.PurchaseRefused("invalid_offer_code")
 
 
 def _buyer_address_for_client(buyer: ReapBuyer) -> Dict[str, Any]:
@@ -1372,6 +1392,7 @@ def _request_hash(
     shipping_address: Mapping[str, Any],
     return_url: str,
     item_source: str = "reap_variant",
+    offer_code: Optional[str] = None,
 ) -> str:
     """A stable fingerprint of the fields that DECIDE this purchase.
 
@@ -1408,6 +1429,11 @@ def _request_hash(
     }
     if item_source != "reap_variant":
         facts["item_source"] = item_source
+    # Only when present, for the same reason as `item_source`: a request with no code keeps the
+    # hash it always had, and a retry that ADDS or CHANGES a code is a different purchase (it
+    # can change the price the buyer approves), so it must not replay the first one.
+    if offer_code is not None:
+        facts["offer_code"] = offer_code
     canonical = json.dumps(
         facts,
         sort_keys=True,
@@ -1550,6 +1576,9 @@ _TOTAL_KEYS = (
     "final_total_minor",
     "shipping_minor",
     "tax_minor",
+    # mig 246: what Reap's offer-code discount took off, as evidence beside the total it
+    # explains. `quoted_total_minor` is already net of it -- it is Reap's `finalAmount`.
+    "discount_minor",
 )
 
 
@@ -1743,9 +1772,7 @@ async def start_reap_purchase(
 
         # The cart-link lane has two further dark gates. Decide them before consent or any
         # merchant/catalog read so a disabled lane is the same 404 fallback as the base rail.
-        if req.item_source == "cart_link" and (
-            not svc.is_cart_link_enabled() or not rc.supports_cart_link_quote()
-        ):
+        if req.item_source == "cart_link" and not svc.is_cart_link_enabled():
             raise svc.PurchaseRefused("not_available_on_this_rail")
 
         # ── CONSENT, AND WHERE IT SITS IN THE ORDER ──────────────────────────────────────────
@@ -1763,6 +1790,9 @@ async def start_reap_purchase(
         # purchase opened, and must not be able to learn — by the shape of the refusal — which
         # merchants we have enabled or what is in our catalogue.
         consent_version = _consent_version(req.buyer.consent_version)
+        # After consent, before anything is read or hashed: a code that cannot be sent is a
+        # malformed request, and it is part of what the idempotency key is a key FOR.
+        offer_code = _offer_code(req.offer_code)
 
         # EVERY ROUTE-OWNED IDENTIFIER THROUGH ONE CHECKPOINT, before any of them can reach a
         # bind. `.lower()` after the check rather than before: the check is about what the string
@@ -1826,6 +1856,7 @@ async def start_reap_purchase(
             shipping_address=shipping_address,
             return_url=return_url,
             item_source=req.item_source,
+            offer_code=offer_code,
         )
 
         if idempotency_key:
@@ -1983,6 +2014,7 @@ async def start_reap_purchase(
             # with another caller's.
             click_id=click_id,
             return_url=return_url,
+            offer_code=offer_code,
         )
 
         if idempotency_key:
