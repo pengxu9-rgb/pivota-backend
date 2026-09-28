@@ -13,8 +13,9 @@ _cursor = ""
 # DORMANT BY DEFAULT — same posture as ENABLE_IDENTITY_RECONCILE_SWEEP and
 # merchant_order_create_reconcile in services/audit_scheduler.py, and for the
 # same reason. audit_scheduler registers this tick every 6h on any worker with
-# worker_enabled, the prod worker deploys, and staging shares the prod
-# Postgres. Its first run seeds `merchant_official_domains` rows for EVERY
+# worker_enabled, and the prod worker deploys on its own. (This also said
+# staging shares the prod Postgres; true on Railway, not on GCP — staging has
+# its own instance, infra/gcp/README.md.) Its first run seeds `merchant_official_domains` rows for EVERY
 # merchant in the catalog — and `official_domains` is a comparability field
 # (db.audit_basis.COMPARABILITY_FIELDS), so seeding moves attribution and
 # turns the next re-audit of every merchant into a non-comparable pair.

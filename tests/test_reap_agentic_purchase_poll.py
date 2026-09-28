@@ -845,8 +845,8 @@ async def test_the_budget_stops_the_batch_mid_way_and_gives_the_rest_back(monkey
 
 async def test_the_budget_also_stops_a_sweep_that_keeps_finding_work(monkeypatch, reap):
     """FIX F5. The iteration cap alone let a real backlog issue 20 statements per sweep with the
-    budget already spent — measured at 40 across the two sweeps, against a Postgres prod and
-    staging share, after which the run had nothing left for the work it exists to do."""
+    budget already spent — measured at 40 across the two sweeps, against the live Postgres,
+    after which the run had nothing left for the work it exists to do."""
     clock = _Clock(monkeypatch)
     calls = []
 
@@ -1682,8 +1682,9 @@ async def test_the_job_has_a_run_deadline_above_its_budget_plus_the_slowest_step
 
 
 async def test_the_job_is_not_registered_when_the_queue_worker_gate_is_false(monkeypatch):
-    """Prod and staging SHARE one Postgres and the claim has no environment filter, so a staging
-    service running this would poach production purchases — and this one spends a buyer's card."""
+    """The claim has no environment filter and this job spends a buyer's card, so it runs only
+    where the queue-worker gate says so. (Written when prod and staging shared one Postgres and a
+    staging service would have poached production purchases; each now has its own instance.)"""
     sched, rec = await _start_scheduler(monkeypatch, RAILWAY_SERVICE_NAME="web-staging")
     assert rec.added == []
 

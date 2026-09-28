@@ -1123,7 +1123,7 @@ async def test_the_expire_sweep_never_touches_an_approved_purchase_on_postgres()
 
 
 async def test_expire_is_bounded_by_limit_on_postgres():
-    """Prod and staging share one Postgres. An unbounded UPDATE on first arming locks every
+    """Prod's Postgres serves live traffic. An unbounded UPDATE on first arming locks every
     qualifying row at once."""
     import db.reap_agentic_ledger as ledger
 

@@ -245,7 +245,7 @@ DIALS: Dict[str, _Dial] = {
 }
 
 #: Rows per bulk-sweep statement. Not a dial: the ledger caps `limit` at 500 and the reason the
-#: sweeps are bounded at all is a lock window on a Postgres prod and staging SHARE — that is a
+#: sweeps are bounded at all is a lock window on prod's Postgres under live traffic — that is a
 #: property of the deployment, not something an operator should be tuning from an env var.
 SWEEP_BATCH = 200
 
@@ -488,7 +488,7 @@ async def _sweep_until_drained(
 
     THE BUDGET CHECK IS FIX F5 AND IT IS NOT COSMETIC. Without it the cap was the only bound, so
     a backlog could run 20 statements here and 20 more in the next sweep — measured at 40
-    statements issued with the budget already spent, against a Postgres prod and staging share,
+    statements issued with the budget already spent, against the live Postgres,
     after which the run had nothing left for the work it exists to do. The cap still stands
     behind it: the budget bounds a REAL backlog, the cap bounds a sweep that has stopped
     converging.

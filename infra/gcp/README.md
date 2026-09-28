@@ -94,6 +94,14 @@ at the repo root because that is the build context root.
 | service accounts | `sa-backend`, `sa-gateway`, `sa-worker` @ `pivota-prod.iam.gserviceaccount.com` |
 | secrets | `pivota-db-password`, `DATABASE_URL`, `REDIS_URL` |
 
+**Staging has its OWN Postgres, not a database on this instance.** `pivota-staging:us-west1:pivota-pg`
+— POSTGRES_17, `db-custom-1-3840`, ZONAL, private IP `10.122.0.3`. The staging `web` and `worker`
+services read `pivota-staging`'s own `DATABASE_URL` secret, whose host and database name both
+differ from prod's (verified 2026-09-29). Comments older than the GCP cutover that say "prod and
+staging share one Postgres" describe the Railway era (`postgres-xmr6`) and are not true here. The
+pre-flight that survives: before arming any worker, confirm its `DATABASE_URL` host is its own
+project's instance — a staging service handed prod's URL would recreate the shared-DB hazard.
+
 **`8.231.167.230` is the address to give Antom and Adyen for IP allowlisting.** It is a reserved
 static address, so it survives NAT/router/instance changes. Staging's equivalent is
 `136.66.216.216` — do not hand that one to a partner.

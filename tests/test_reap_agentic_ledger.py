@@ -1312,7 +1312,7 @@ async def test_fail_exhausted_takes_a_row_at_EXACTLY_max_attempts():
 
 
 async def test_expire_is_bounded_by_limit_and_the_caller_loops():
-    """Prod and staging share one Postgres. An unbounded UPDATE on first arming — when the whole
+    """Prod's Postgres serves live traffic. An unbounded UPDATE on first arming — when the whole
     backlog qualifies at once — locks every matching row simultaneously."""
     ids = []
     for index in range(7):

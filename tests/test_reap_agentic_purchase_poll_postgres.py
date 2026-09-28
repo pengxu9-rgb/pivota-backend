@@ -10,7 +10,7 @@ here is the set of properties whose truth depends on the ENGINE:
      INTERLEAVING — databases==0.7.0 serialises everything onto one connection there, so it
      cannot say anything about two POD PROCESSES. Here a second worker runs on its own asyncpg
      connection and commits, which is the deployment this job actually has: the worker service
-     may be scaled past one replica, and prod and staging share one Postgres.
+     may be scaled past one replica, and its replicas share one Postgres.
 
   2. THE JOB'S OWN STATEMENT PLANS. `_LEFTOVER_CLAIMS_SQL` is the only SQL this package adds, and
      an unplannable statement on a live path is the #1588 shape this repo has already paid for.

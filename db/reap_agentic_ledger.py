@@ -2007,7 +2007,7 @@ async def requeue_stale_claims(*, lease_seconds: int = 300, limit: int = 50) -> 
 # from `transition` in a loop, because a loop is N round trips with N chances to be interrupted
 # halfway, and the half that gets skipped is the PII.
 #
-# THEY ARE BOUNDED, AND THE BOUND IS NOT COSMETIC. Prod and staging share one Postgres. An
+# THEY ARE BOUNDED, AND THE BOUND IS NOT COSMETIC. Prod's Postgres serves live traffic. An
 # unbounded UPDATE on first arming — when the whole backlog qualifies at once — is a lock window
 # over every matching row at the same time. `WHERE id IN (SELECT ... ORDER BY ... LIMIT :limit)`
 # is the shape the requeue already uses; both return the ids they moved, so the caller loops
@@ -2246,8 +2246,8 @@ async def expire_overdue_purchases(
     `state_entered_at` moves only when the STATE moves, which is a clock the poller cannot reset.
 
     BOUNDED. At most `limit` rows per call; loop until fewer than `limit` come back. An unbounded
-    UPDATE on first arming locks every qualifying row at once, on a Postgres that prod and
-    staging share.
+    UPDATE on first arming locks every qualifying row at once, on a Postgres serving live
+    traffic.
 
     UNFENCED, AND THE POLLER MUST KNOW IT. This is a bulk terminal write that takes no `holder`,
     so it can terminate a purchase a live worker currently holds the lease on. That is deliberate
