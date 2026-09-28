@@ -429,3 +429,33 @@ async def test_the_plan_prints_the_kept_count_and_counts_suppressed_rows_not_pre
     assert "NEW NOT SERVING (old served): 1  -- never retired" in out
     assert "WAITING (new key not live)  : 1" in out
     assert "already suppressed          : 0" in out
+
+
+# --- the store scope is an exact host match: a subdomain or look-alike host is another source -----------
+# Mutation sweep of #2424: `!=` / `==` on _host() rewritten to a substring test survived every test above.
+# Hosts on both sides of a substring test: ones that CONTAIN the store's host and ones CONTAINED IN it.
+
+_LOOKALIKES = ["shop.stilacosmetics.com", "stilacosmetics.com.evil.io", "notstilacosmetics.com",
+               "cosmetics.com", "stilacosmetics.co"]
+
+
+@pytest.mark.parametrize("lookalike", _LOOKALIKES)
+def test_a_lookalike_hosts_stale_row_is_foreign_never_retired(lookalike):
+    rows = _rows(old0={"source_domain": lookalike}, old1={"source_domain": "www.stilacosmetics.com"})
+    out = select_retirable(_C[:2], rows, new_live=_ALL_NEW, domain="stilacosmetics.com", serving=set())
+    assert _keys(out, "foreign") == ["old0"]
+    assert _keys(out, "live") == ["old1"]   # www. is the same store
+
+
+@pytest.mark.parametrize("lookalike", _LOOKALIKES)
+@pytest.mark.asyncio
+async def test_a_lookalike_hosts_new_row_does_not_count_as_the_rewrite(monkeypatch, lookalike):
+    new_rows = [{"product_key": "new0", "source_domain": lookalike, "suppression_reason": None,
+                 "content_key": "ck_new0"},
+                {"product_key": "new1", "source_domain": "www.stilacosmetics.com", "suppression_reason": None,
+                 "content_key": "ck_new1"}]
+    tool, asked = _plan_env(monkeypatch, new_rows=new_rows)
+    p = await tool.plan("stilacosmetics.com", "Stila", "beauty", "Stila Cosmetics")
+    assert [c["stale_key"] for c in p["waiting_for_new_key"]] == ["old0"]
+    assert [c["stale_key"] for c in p["live"]] == ["old1"]   # www. is the same store
+    assert asked["seeds"] == ["old1"] and asked["offers"] == ["old1"]
