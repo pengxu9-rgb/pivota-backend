@@ -138,7 +138,7 @@ jobs:
     name: require a green test sweep on this commit
     runs-on: ubuntu-latest
     # Above the DEADLINE below, so the script's own diagnostic prints before GitHub kills the job.
-    timeout-minutes: 35
+    timeout-minutes: 55
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -222,10 +222,11 @@ jobs:
               "neutral": "the run finished without reporting a verdict",
           }
 
-          # Above both required workflows' `timeout-minutes` (15 each) plus runner queueing. A hung
+          # Above both required workflows' `timeout-minutes` (sweep 40, dialect gate 25 as of
+          # 2026-09-28) plus runner queueing. A hung
           # sweep is killed by its own timeout and arrives here as a blocking conclusion long
           # before this fires; this deadline is for the run that NEVER STARTS.
-          DEADLINE_MINUTES = 30
+          DEADLINE_MINUTES = 50
           POLL_SECONDS = 20
 
           if not re.fullmatch(r"[0-9a-f]{40}", SHA or ""):
