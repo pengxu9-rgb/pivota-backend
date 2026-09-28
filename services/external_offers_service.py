@@ -1829,6 +1829,10 @@ async def resolve_external_offer(
             "provider": extracted.get("evidence_provider") or "manual",
             "fetchedAt": now.isoformat(),
             "snapshotId": (existing or {}).get("id") or rid,
+            # Where the currency came from, as the seed refresh's canonical-offer projection
+            # (#2416) reads it: it projects only "page". There is no `market_default` any more:
+            # an unread currency voids the amount (`snapshot_price_fields`).
+            "price_currency_source": "page" if currency else "unread",
         }
         description = extracted.get("description")
         if isinstance(description, str) and description.strip():
@@ -1836,9 +1840,6 @@ async def resolve_external_offer(
         evidence.update(evidence_variant_fields(extracted))
         if price_read:
             evidence["price_read"] = price_read
-        # Spelled as #2416's canonical-offer projection reads it (it projects only a "page"
-        # currency). There is no `market_default` any more: an unread currency voids the amount.
-        evidence["price_currency_source"] = "page" if currency else "unread"
         image_urls = extracted.get("image_urls") or []
         if isinstance(image_urls, list):
             cleaned = [str(u).strip() for u in image_urls if isinstance(u, str) and str(u).strip()]

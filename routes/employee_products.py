@@ -4497,9 +4497,23 @@ async def update_external_seed(
     # a mirror, and failing to mirror must never fail the authorized edit the
     # employee just made.
     projected: Dict[str, int] = {}
+    # THE PRICE IS THE EMPLOYEE'S ONLY WHEN THIS EDIT CHANGED IT. An availability-only edit still
+    # projects (the mirror offer carries availability), but must not let the attached lane stamp
+    # the seed's unverified price onto the canonical's listing rows as fresh.
+    row_dict = dict(row)
+    price_edited = (
+        "price_amount" in updates
+        and _as_price(updates["price_amount"]) != _as_price(row_dict.get("price_amount"))
+    ) or (
+        "price_currency" in updates
+        and str(updates["price_currency"] or "").strip().upper()
+        != str(row_dict.get("price_currency") or "").strip().upper()
+    )
     if any(k in updates for k in ("price_amount", "price_currency", "availability")):
         try:
-            projected = await _project_refreshed_seed_to_serving_surfaces(seed_id)
+            projected = await _project_refreshed_seed_to_serving_surfaces(
+                seed_id, price_source="employee_edit" if price_edited else None
+            )
         except Exception:  # noqa: BLE001
             logger.warning(
                 "employee seed edit: serving-surface projection failed for seed_id=%r",
@@ -4875,7 +4889,9 @@ def _reconcile_seed_variants_with_read(
     }
 
 
-async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str, int]:
+async def _project_refreshed_seed_to_serving_surfaces(
+    seed_id: str, *, price_source: Optional[str] = None, currency_read: bool = False
+) -> Dict[str, int]:
     """Push a freshly re-read seed onto the surfaces a BUYER reads.
 
     THE BUG THIS CLOSES. `_refresh_external_seed_by_id` writes `external_product_seeds` and
@@ -4899,10 +4915,11 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
     did not move is what makes the nightly rotation self-healing for rows that already drifted,
     instead of needing a separate backfill pass.
 
-    Returns counters so the batch can tell "healed 2,000" from "healed 0" — `sync_offer_for_seed`
-    has seven statuses and six of them mean "did nothing" (`no_mirror_product` is expected to be
-    common: the mirror is insert-only and matches on `source_ref = seed_id`). Dropping that dict
-    is how a run that projected nothing would still have reported success.
+    Returns counters so the batch can tell "healed 2,000" from "healed 0" — only `synced` means
+    `sync_offer_for_seed` wrote a row; `wrote_mirror` / `wrote_attached` say which one. A skip in
+    OFFER_SYNC_STRUCTURAL_SKIP_STATUSES (no offer row this seed may touch) is one the batch does
+    not count as a projection that failed to write.
+    Dropping that dict is how a run that projected nothing would still have reported success.
 
     Best-effort and non-raising, mirroring the `seed_data_writer` hooks it stands in for: the
     seed row is the committed source of truth, so a projection failure must never turn a good
@@ -4929,7 +4946,13 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
             OFFER_SYNC_WRITTEN_STATUSES,
         )
 
-        outcome = await sync_offer_for_seed(seed_id)
+        # `price_source` is the caller vouching for the seed's price: `refresh` (a re-read, with
+        # `currency_read` saying the page named the currency) or `employee_edit` (the PATCH changed
+        # the price). None -- an availability-only edit -- keeps the attached lane off, so a price
+        # nobody re-read is never stamped fresh on the canonical's listing rows.
+        outcome = await sync_offer_for_seed(
+            seed_id, attached_price_source=price_source, currency_read=currency_read
+        )
         status = str((outcome or {}).get("status") or "").strip().lower()
         # Derived from the writer, never restated here. The first version guessed
         # {"synced","inserted","updated","ok"} — three statuses it cannot emit — and the tests
@@ -4937,6 +4960,9 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
         # never produces.
         if status in OFFER_SYNC_WRITTEN_STATUSES:
             counts["projected"] = 1
+            # Which offer row: the seed's mirror product, or the attached canonical's offer for
+            # the listing the seed reads. The summary reports the split.
+            counts["wrote_" + str((outcome or {}).get("target") or "mirror")] = 1
         elif status in OFFER_SYNC_ERROR_STATUSES:
             # The writer swallowed an exception. That is an error, not a skip: a skip means
             # "nothing to do", and counting a failed write as one hides it from the summary.
@@ -4944,7 +4970,15 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
             counts["skip_" + (status or "unknown")] = 1
         else:
             counts["skipped"] = 1
+            # A status in OFFER_SYNC_STRUCTURAL_SKIP_STATUSES (nothing this writer may touch) is
+            # left out of "should have written" by the batch, which reads it off this key.
             counts["skip_" + (status or "unknown")] = 1
+        # Per-row refusals inside the attached lane (a variant the page did not re-read, a row in
+        # another currency), reported whether or not a sibling row was written.
+        offer_skips = (outcome or {}).get("offer_skips")
+        if isinstance(offer_skips, dict):
+            for reason, n in offer_skips.items():
+                counts["offer_skip_" + str(reason)] = int(n or 0)
     except Exception as exc:  # noqa: BLE001 - a cache write must not break the source of truth
         counts["errored"] = 1
         logger.warning(
@@ -5539,7 +5573,14 @@ async def _refresh_external_seed_by_id(
     # catalog_offers.updated_at = NOW() on a row nobody re-read — claiming a freshness we did not
     # earn, which is exactly what the projection exists to stop.
     if read_the_served_product and price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE:
-        projection = await _project_refreshed_seed_to_serving_surfaces(seed_id)
+        projection = await _project_refreshed_seed_to_serving_surfaces(
+            seed_id,
+            price_source="refresh",
+            # The reader substitutes the market's currency when the page names none; that is not
+            # a reading, and the attached lane refuses it (external_offers_service).
+            currency_read=isinstance(evidence, dict)
+            and evidence.get("price_currency_source") == "page",
+        )
 
     return {
         "status": "success",

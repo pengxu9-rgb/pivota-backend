@@ -670,21 +670,35 @@ async def is_purchasable(domain: Any, market: Any, *, now: Optional[datetime] = 
     return False
 
 
-async def list_due(limit: int = 50, *, vantage: str = WORKER_VANTAGE) -> List[Dict[str, Any]]:
+#: The most rows `list_due` returns. The sweep reads the WHOLE vantage to order its rotation, and
+#: a row cut off by this bound reads there as never-checked, so it is sized far above the table
+#: (one row per merchant x market x vantage ever checked).
+LIST_DUE_MAX = 5000
+
+
+async def list_due(
+    limit: int = 50, *, vantage: str = WORKER_VANTAGE, strict: bool = False
+) -> List[Dict[str, Any]]:
     """Existing rows for one vantage, least-recently-checked first. Bounded by `limit`.
 
     This lists what we ALREADY HOLD; it is not the population. The sweep's population comes from
-    the two Reap eligibility allowlists (see jobs/merchant_purchasability_sweep.py), because a
-    merchant that has never been checked has no row here to be listed.
+    its lanes (see jobs/merchant_purchasability_sweep.py), because a merchant that has never been
+    checked has no row here to be listed.
+
+    `strict=True` RAISES on a read failure instead of answering []. The sweep orders its rotation
+    by this list, and an empty answer from a failed read is indistinguishable from "nothing was
+    ever checked" — which would sweep the same keys every run. The default stays fail-soft.
     """
     try:
-        bound = max(1, min(int(limit), 500))
+        bound = max(1, min(int(limit), LIST_DUE_MAX))
     except (TypeError, ValueError):
         bound = 50
     statement = _SELECT_DUE_SQL if IS_POSTGRES else _SELECT_DUE_SQL_SQLITE
     try:
         records = await database.fetch_all(statement, {"vantage": str(vantage)[:32], "limit": bound})
     except Exception:  # noqa: BLE001
+        if strict:
+            raise
         logger.exception("merchant_purchasability: list_due failed")
         return []
     return [_row(r) for r in records]

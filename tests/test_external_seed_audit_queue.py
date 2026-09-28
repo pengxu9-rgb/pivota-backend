@@ -709,3 +709,47 @@ def test_refresh_external_seed_preserves_manual_description_override_when_seed_r
     assert seed_data.get("manual_overrides", {}).get("description") == (
         "A complete regimen that targets breakouts, blemishes, and the look of congestion."
     )
+
+
+@pytest.mark.parametrize(
+    "edit,expected_source",
+    [
+        ({"availability": "out_of_stock"}, None),     # stock only: the price is not the employee's
+        ({"price_amount": 30.0}, "employee_edit"),
+        ({"price_amount": 28.0}, None),               # re-sent unchanged
+        ({"price_currency": "usd"}, None),            # case only
+        ({"price_currency": "CAD"}, "employee_edit"),
+    ],
+)
+def test_an_edit_vouches_for_the_price_only_when_it_changed_the_price(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, edit, expected_source
+) -> None:
+    """Controller review of #2416: an availability-only PATCH projected the seed's unverified
+    price onto the canonical's listing rows as fresh. The attached lane opens only for an edit
+    that moved the price or currency; the mirror projection still runs for the others."""
+    import routes.employee_products as employee_products_module
+
+    stored_row = _seed_row(price_amount=28.0, price_currency="USD")
+    calls = []
+
+    async def fake_fetch_one(_query: str, values=None):
+        if values and values.get("id") == stored_row["id"]:
+            return stored_row
+        return None
+
+    async def fake_project(seed_id, **kwargs):
+        calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(employee_products_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", AsyncMock(return_value=None))
+    monkeypatch.setattr(employee_products_module, "_project_refreshed_seed_to_serving_surfaces", fake_project)
+
+    res = client.patch(
+        f"/employee/products/external-seeds/{stored_row['id']}",
+        headers={"Authorization": "Bearer test-token"},
+        json=edit,
+    )
+    assert res.status_code == 200, res.text
+    assert calls == [{"price_source": expected_source}]

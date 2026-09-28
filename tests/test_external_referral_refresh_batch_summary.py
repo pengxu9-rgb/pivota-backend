@@ -343,3 +343,91 @@ def test_a_starved_budget_stop_is_degraded_end_to_end(monkeypatch):
     ))
     assert summary["stopped_early"] is True and summary["budget_reach"] == 0.9
     assert summary["status"] == "success", "a steady-state budget stop stays green"
+
+
+# ------------------------------------------- a structural skip is not a failed projection...
+
+
+def _structural(price="applied", status="no_mirror_product"):
+    row = _ok(price=price, projected=0)
+    row["projection"].update({"skipped": 1, "skip_" + status: 1})
+    return row
+
+
+def _should_have_written(price="applied", status="seed_missing"):
+    row = _ok(price=price, projected=0)
+    row["projection"].update({"skipped": 1, "skip_" + status: 1})
+    return row
+
+
+def _wrote(target="attached", price="applied"):
+    row = _ok(price=price)
+    row["projection"]["wrote_" + target] = 1
+    return row
+
+
+def test_a_minority_of_structural_skips_beside_attached_writes_is_healthy(monkeypatch):
+    """The catalogue's shape: 26 of 19,808 served attached seeds have no listing row."""
+    summary = _run(monkeypatch, [_structural()] + [_wrote() for _ in range(9)], limit=20)
+    assert summary["projection_structural_skips"] == 1
+    assert summary["projection_writes"] == {"attached": 9}
+    assert summary["projection_skips"] == {"no_mirror_product": 1}
+    assert summary["status"] == "success"
+
+
+def test_the_listing_skips_count_as_structural(monkeypatch):
+    rows = [_structural(status="no_listing_offer"), _structural(status="listing_offer_suppressed")]
+    summary = _run(monkeypatch, rows + [_wrote() for _ in range(8)], limit=20)
+    assert summary["projection_structural_skips"] == 2
+    assert summary["status"] == "success"
+
+
+def test_projections_that_should_write_and_write_nothing_still_degrade(monkeypatch):
+    """Structural skips leave the denominator; the rest still have to land something while
+    prices move."""
+    rows = [_structural() for _ in range(1)] + [_should_have_written() for _ in range(9)]
+    summary = _run(monkeypatch, rows, limit=20)
+    assert summary["projections_written"] == 0
+    assert summary["status"] == "degraded"
+
+
+def test_the_09_27_night_is_not_success(monkeypatch):
+    """...but it is not green either. 2,220 structural skips, 0 written, 16 prices moved: with
+    the attached lane in place a night like that means the lane did not run (controller
+    review of #2416). Mostly structural with no attached write degrades."""
+    rows = [_structural() for _ in range(3)] + [_structural("unchanged") for _ in range(7)]
+    summary = _run(monkeypatch, rows, limit=20)
+    assert summary["projection_structural_skips"] == 10 and summary["projections_written"] == 0
+    assert summary["status"] == "degraded"
+
+
+def test_a_mirror_only_night_with_structural_skips_over_the_share_degrades(monkeypatch):
+    """Mirror writes do not stand in for the attached lane: 09-27's skips were ext: seeds."""
+    rows = [_structural() for _ in range(3)] + [_wrote("mirror") for _ in range(7)]
+    summary = _run(monkeypatch, rows, limit=20)
+    assert summary["projection_writes"] == {"mirror": 7}
+    assert summary["status"] == "degraded"
+
+
+def test_the_structural_share_rule_directly(monkeypatch):
+    from services.external_offer_dual_write import OFFER_SYNC_STRUCTURAL_SKIP_STATUSES
+
+    assert OFFER_SYNC_STRUCTURAL_SKIP_STATUSES == {
+        "no_mirror_product", "no_listing_offer", "listing_offer_suppressed",
+    }
+    base = dict(failed=0, stopped_early=False, attempted_count=10, origin_reads=10,
+                price_changes=3, projections_attempted=10)
+    # 20% structural, no attached write: at the bound, healthy (the mirror wrote the rest).
+    assert err.batch_run_status(**base, projections_written=8, projections_structural_skips=2) == "success"
+    # 30%: over it.
+    assert err.batch_run_status(**base, projections_written=7, projections_structural_skips=3) == "degraded"
+    # One attached write clears it.
+    assert err.batch_run_status(**base, projections_written=7, projections_structural_skips=3,
+                                projections_written_attached=1) == "success"
+    # The knob: >= 1 disables the share rule.
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MAX_STRUCTURAL_SHARE", "1")
+    assert err.batch_run_status(**base, projections_written=0, projections_structural_skips=10) == "success"
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MAX_STRUCTURAL_SHARE", "0.2")
+    # Still degraded when what should have written wrote nothing, whatever the share.
+    assert err.batch_run_status(**base, projections_written=0, projections_structural_skips=1,
+                                projections_written_attached=0) == "degraded"

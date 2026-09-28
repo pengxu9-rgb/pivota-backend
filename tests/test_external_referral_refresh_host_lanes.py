@@ -50,7 +50,7 @@ def _drive(
     *,
     concurrency: Optional[int] = None,
     answers: Optional[Dict[str, List[Any]]] = None,
-    unreachable_trip: str = "",
+    unreachable_trip: str = "5",
     budget_seconds: Optional[float] = None,
     delay: float = 0.0,
 ):
@@ -193,6 +193,27 @@ def test_the_sample_error_carries_no_url(monkeypatch: pytest.MonkeyPatch) -> Non
               "error": "snapshot_failed: ConnectError for https://u.com/products/x?utm=1 refused"}
     summary, _trace, _ = _drive(monkeypatch, ["u.com"], concurrency=1, answers={"u.com": [answer]})
     assert summary["unreachable_host_errors"] == {"u.com": "snapshot_failed: ConnectError for <url> refused"}
+
+
+def test_the_default_trip_does_not_stop_a_flaky_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ichibanm.com, census 2026-09-28: ~55% of rows read, failures interleaved, 2,284 served
+    seeds. The default (20) must keep reading it; five-in-a-row happens by chance on such a host."""
+    pattern = [_no_answer("i.com")] * 6 + [_ok()] + [_no_answer("i.com")] * 7 + [_ok()]
+    summary, trace, _ = _drive(
+        monkeypatch, ["i.com"] * len(pattern), concurrency=1, unreachable_trip="",
+        answers={"i.com": pattern},
+    )
+    assert summary["host_unreachable_trip"] == 20
+    assert len(trace["started"]) == len(pattern)
+    assert summary["skipped_for_unreachable_host"] == 0
+
+
+def test_the_default_trip_still_stops_a_dead_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary, trace, _ = _drive(
+        monkeypatch, ["dead.com"] * 30, concurrency=1, unreachable_trip="",
+        answers={"dead.com": [_no_answer("dead.com")] * 30},
+    )
+    assert len(trace["started"]) == 20 and summary["unreachable_host_skips"] == {"dead.com": 10}
 
 
 def test_timeouts_count_as_no_answer(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -45,18 +45,80 @@ Surveyed 2026-09-22. There is NO single merchant x market table in this repo. Th
   * `tierb_cart_link_eligibility` — the CART-LINK lane's allowlist, keyed (shop_domain, market),
     and it already carries a confirmed `variant_id`.
 
-THE POPULATION IS THE UNION OF THE TWO REAP ALLOWLISTS, AT MERCHANT GRAIN. Those two are
-EXACTLY what `routes/agent_commerce_reap.py` consults before it will start a purchase — the
-variant lane through `_eligibility`, the cart-link lane through `is_cart_link_eligible` — and
-nothing else in this repo can make the door offer to buy. It is therefore the smallest set that
-covers what the agent door can recommend for purchase. A merchant absent from both cannot be
-bought from, so a fact about it would gate nothing.
+THE POPULATION IS THE UNION OF THE TWO REAP ALLOWLISTS, AT MERCHANT GRAIN, PLUS THE CONNECTED
+SHOPIFY STORES, PLUS EVERY HOST THE CART MINTER BUILDS A SEED CART ON (`collect_population`). The
+two allowlists are EXACTLY what `routes/agent_commerce_reap.py` consults before it will start a
+purchase — the variant lane through `_eligibility`, the cart-link lane through
+`is_cart_link_eligible` — and nothing else in this repo can make the door offer to buy.
+
+The third lane exists because the fact gained a second consumer. The product-card cart gate
+(`routes/agent_shop_gateway._CartPurchasabilityGate`, on `_attach_connected_product_redirects`)
+mints a connected Shopify card's prefilled cart only on a fresh positive fact for the cart's host
+x the buyer's market. A connected store is in neither allowlist, so without this lane it was
+never checked and, under enforcement, its cards could never carry a cart again.
+
+  * THE STORE is the one `services.merchant_store_service.get_merchant_active_stores` hands the
+    card lane: a live (`active`/`connected`) `merchant_stores` row, else the merchant's legacy
+    `merchant_onboarding.mcp_shop_domain` — Shopify only, since Wix / WooCommerce cards never
+    mint a cart and the preflight is Shopify-only — and only for a merchant with a cached
+    product, because a store that serves no card makes a fact that gates nothing.
+  * THE HOST is `normalize_shop_host(domain)` — the function `shopify_cart_base_url` builds the
+    card's cart on — then the same `_population_key` every lane goes through.
+  * THE MARKET is the merchant's declared `merchant_onboarding.region`, and ONLY when it is an
+    ISO-2 country: the column is a free-text signup field whose own comment says "US, EU,
+    APAC", so "EU" (two letters, not a country) and "UK" (Shopify's code is GB) are refused
+    with "APAC" and counted as `population_skipped_market_unknown` — never defaulted, never
+    mapped. Declared, not measured: a store that cannot sell there comes back negative or
+    unverifiable, which is the answer an absent fact already gives, so a wrong region can
+    only cost one abandoned checkout, never open a cart.
+
+  Measured 2026-09-28: `region` reads US 40, "shopify" 12, APAC 6, CA 3, Other 1, NULL 1 across
+  merchant_onboarding. The lane admits two hosts today — ijaqit-v9.myshopify.com (two live store
+  rows) and i9j3i0-kj.myshopify.com (legacy), both US — and counts the three legacy stores whose
+  region reads "shopify" as market-unknown.
+
+THE FOURTH LANE IS THE CART MINTER ITSELF. The same card gate, and `offers.resolve`, mint an
+EXTERNAL SEED's prefilled cart only on a fresh positive fact for the cart host x the buyer's
+market. The #2407 census found 432 cart offers on 53 hosts, 358 of them on 47 hosts nobody had
+ever checked, and the census was a floor (see `_cart_mint_lane`). So the population now includes
+every host the cart minter WOULD build a cart on, computed BY THE MINTER'S OWN FUNCTIONS over every
+active seed — `_external_seed_redirect_identity`, `HandoverVariantResolver.choose` and
+`resolve_cart_permalink` in routes/agent_shop_gateway, the chain every seed lane runs — and never
+by a predicate restated here, so the population cannot be narrower than what mints a cart.
+tests/test_merchant_purchasability.py drives the real mint endpoint over the same rows and holds
+that every cart host it mints is in the population.
+
+  * THE HOST is `facts.normalize_domain(<cart base url>)`, which is what
+    `_CartPurchasabilityGate.allows_cart` asks the fact for.
+  * THE MARKET is the seed row's `market`, the market it is listed and served in (every cart seed
+    in the census was US). The gate asks the BUYER's market, which the population cannot know; a
+    buyer in another market gets no cart, which is the answer no fact already gives. Never
+    defaulted: a seed with no ISO-2 market is counted in `population_skipped_market_unknown`.
+  * SCANNED AT MOST ONCE A DAY. The scan reads every active seed on the prod primary, so it runs
+    on the first sweep of each 05:00Z slot and the other runs read the cached result
+    (db/merchant_purchasability_cart_mint_scans.py); see `_cart_mint_population` for how a
+    failed scan falls back without paging every hour.
+  * NO VARIANT. The seed's cart variant is not confirmed available the way a Tier B variant is, so
+    where the Tier B lane confirmed one IT STILL WINS, and elsewhere the catalog hint or the
+    preflight's own pick is used, exactly as for the connected lane.
+
+Wix and WooCommerce connected stores stay out on purpose: no card lane mints a cart for them
+(`_attach_connected_product_redirects` gives only Shopify a `shop_domain`), and the preflight is
+Shopify-only, so a check could only ever come back unverifiable.
 
 One representative variant per merchant x market: the Tier B row's confirmed `variant_id` when we
-have one, else our catalog's variant for that domain, else NONE — and with none the preflight
-picks the storefront's first available variant itself, reading availability with
-`?country=<market>` pinned. The expected price is OUR indexed unit price for that variant when
-we hold one, so that a drift is a statement about our index and not about an unrelated SKU.
+have one, else — FOR A KEY A REAP LANE NAMES — our catalog's variant for that domain, else NONE,
+and with none the preflight picks the storefront's first available variant itself, reading
+availability with `?country=<market>` pinned. The expected price is OUR indexed unit price for
+that variant when we hold one, so that a drift is a statement about our index and not about an
+unrelated SKU.
+
+The catalog hint is for the REAP lanes only, because only the Reap rail buys the variant our
+index names. A key only the connected-store or cart-mint lane names gets NONE: its fact answers
+"does this store's checkout take a card in this market", and a hinted id that is stale or not a
+Shopify variant id at all (the shortest `source_variant_id` on a seed host can be a SKU) turns
+that into VARIANT_GONE — a CONFIRMED NEGATIVE that demotes the store — or INVALID_INPUT, which
+can never become positive. Either would block the very carts that lane exists to open.
 
 ── THE GATE IS INSIDE THE JOB ───────────────────────────────────────────────────────────────
 
@@ -121,8 +183,10 @@ there is no buyer anywhere on this path to log or store.
 One abandoned Shopify checkout per merchant per vantage, the same side effect every UCP probe
 already has. That is why the batch is bounded, the run is budgeted, and the population is
 least-recently-checked first. NOTE the ordering is a rotation, not a TTL filter: a population no
-larger than the batch is checked IN FULL on every run. The per-merchant arithmetic is in
-docs/runbooks/merchant_purchasability.md ("Politeness").
+larger than the batch is checked IN FULL on every run, and a larger one is covered every
+ceil(population_total / batch) runs, never-checked merchants first. The per-merchant and
+freshness arithmetic is in docs/runbooks/merchant_purchasability.md ("Politeness" and
+"Capacity").
 """
 
 from __future__ import annotations
@@ -133,17 +197,23 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
 import db.merchant_purchasability as facts
+import db.merchant_purchasability_cart_mint_scans as mint_scans
 import db.reap_agentic_ledger as ledger
 from db.database import database
 # THE ONE merchant-host canonicaliser — the same function `routes/agent_commerce_reap` validates
 # the purchase request with and `tierb_cart_link_eligibility` keys its rows by. See
 # `_population_key` for how it is used here.
 from services.tierb_cart_link_merchants import canonical_merchant_domain
+# THE host a connected Shopify card's cart permalink is built on (`shopify_cart_base_url` reduces
+# the connected store domain with it), so a connected-store fact is keyed on the host the card
+# gate asks about. See `_CONNECTED_LANE_SQL`.
+from services.outbound_links_service import normalize_shop_host
 from services.shopify_cart_link_preflight import (
     REQUEST_TIMEOUT_S,
     USER_AGENT,
@@ -177,7 +247,9 @@ __all__ = [
     "SweepReport",
     "exit_code_for",
     "is_enabled",
+    "collect_population",
     "load_population",
+    "merge_lanes",
     "main",
     "run_merchant_purchasability_sweep",
 ]
@@ -281,6 +353,348 @@ SELECT shop_domain AS domain, market AS market, variant_id
  WHERE verdict = 'ELIGIBLE'
 """
 
+#: The CONNECTED-STORE lane: the Shopify store domain the card lane would build a cart on, per
+#: merchant, with the merchant's declared region. The two halves are
+#: `services.merchant_store_service.get_merchant_active_stores`, branch for branch: its live
+#: `merchant_stores` rows, else — only for a merchant with NO live row of any platform — the
+#: legacy `merchant_onboarding.mcp_*` store, which it returns whatever `mcp_connected` says and
+#: `_attach_connected_product_redirects` uses without reading status. An empty domain is dropped
+#: here because the card lane drops it too. The host and market rules are in the module docstring.
+#:
+#: ONLY A MERCHANT WITH A CACHED PRODUCT: the card lane stamps cards built from `products_cache`,
+#: so a store with none serves no card, a fact about it gates nothing, and checking it would only
+#: leave an abandoned checkout behind.
+_CONNECTED_LANE_SQL = """
+SELECT s.domain AS domain, o.region AS region
+  FROM merchant_stores s
+  JOIN merchant_onboarding o ON o.merchant_id = s.merchant_id
+ WHERE s.status IN ('active', 'connected')
+   AND lower(s.platform) = 'shopify'
+   AND COALESCE(s.domain, '') <> ''
+   AND EXISTS (SELECT 1 FROM products_cache pc WHERE pc.merchant_id = s.merchant_id)
+UNION ALL
+SELECT o.mcp_shop_domain AS domain, o.region AS region
+  FROM merchant_onboarding o
+ WHERE lower(COALESCE(o.mcp_platform, '')) = 'shopify'
+   AND COALESCE(o.mcp_shop_domain, '') <> ''
+   AND NOT EXISTS (SELECT 1 FROM merchant_stores s
+                    WHERE s.merchant_id = o.merchant_id AND s.status IN ('active', 'connected'))
+   AND EXISTS (SELECT 1 FROM products_cache pc WHERE pc.merchant_id = o.merchant_id)
+"""
+
+#: Two-letter values of `merchant_onboarding.region` that are NOT countries a buyer can be in:
+#: "EU" is on the signup form's own list, and "UK" is how people spell GB. Anything else that
+#: passes `facts.normalize_market` is taken as the country it names.
+_REGION_NOT_A_COUNTRY = frozenset({"EU", "UK"})
+
+
+def _connected_market(region: Any) -> Optional[str]:
+    """A connected store's declared region as a market, or None (skipped and counted)."""
+    market = facts.normalize_market(region)
+    return None if market in _REGION_NOT_A_COUNTRY else market
+
+
+#: The CART-MINT lane's read: every ACTIVE seed (the only status any seed lane serves), keyset
+#: paged on the primary key, carrying exactly the columns the minter's identity chain reads.
+#: Deliberately NO predicate beyond `status`: anything narrower would be a restatement of when a
+#: cart is built, and the point of this lane is that the minter decides that.
+_SEED_PAGE_SQL = """
+SELECT id, domain, market, attached_product_key, attached_variant_id, external_product_id,
+       destination_url, canonical_url, seller_ref, seed_kind, seed_data
+  FROM external_product_seeds
+ WHERE status = 'active'
+   AND id > :after
+ ORDER BY id
+ LIMIT :page_rows
+"""
+
+#: Rows per page, and the product keys one `HandoverVariantResolver` is primed with. ONE
+#: RESOLVER PER PAGE, sized to the page: a resolver stops priming at `max_keys` (default 400),
+#: and past that every product key answers `not_primed` — no catalog variant, so no cart on the
+#: evidence branch. The #2407 census ran ONE resolver over all 23,854 seeds and so resolved at
+#: most 400 product keys; its 432 cart offers / 53 hosts are a floor, not the population.
+_SEED_PAGE_ROWS = 500
+#: A pause between pages, so an hourly full scan of the seed table is a trickle on the 2-vCPU
+#: primary rather than a burst. Indirected so tests run it at 0.
+_SEED_PAGE_PAUSE_S = 0.1
+#: The resolver's lookup timeout for this lane. The serving default (0.5 s) bounds a BUYER's
+#: request; nobody waits here, and a lookup that times out is a catalog variant we did not see,
+#: i.e. a cart host silently missing from the population (it is counted, see below).
+_SEED_HANDOVER_TIMEOUT_S = 20.0
+#: Wall-clock bound on the whole scan, so a slow database cannot spend the run's budget before
+#: the first merchant is checked. Stopping early leaves the lane INCOMPLETE, and that is counted.
+_SEED_LANE_BUDGET_S = 300.0
+
+#: The resolver outcomes that mean "the catalog was not consulted", as opposed to "consulted and
+#: it named no variant". Either one can hide a cart the minter WOULD build with a fresh lookup.
+_HANDOVER_NOT_CONSULTED = ("handover_lookup_failed", "handover_not_primed")
+
+
+@dataclass
+class CartMintLane:
+    """What the cart-mint lane read. COUNTS and host keys; no seed ids, no URLs.
+
+    `hosts` maps (normalised cart host, the seed row's raw `market`) to the number of seeds that
+    mint a cart there; the key is validated by `load_population`'s one `_key` rule like every
+    other lane's. `complete` is False when the scan stopped early or a catalog lookup failed —
+    the lane then under-reports, and `load_population` counts it as unreadable."""
+
+    hosts: Dict[Tuple[str, str], int]
+    seeds_scanned: int = 0
+    cart_seeds: int = 0
+    complete: bool = True
+    incomplete_reason: str = ""
+    #: The scan's wall clock. It is spent from the run's budget, so it is logged every run.
+    elapsed_ms: int = 0
+
+
+def _seed_cart_hosts(gw: Any, resolver: Any, row: Dict[str, Any]) -> set:
+    """Every host the cart minter would build a prefilled cart on for ONE seed row.
+
+    THE MINTER'S OWN CHAIN — `HandoverVariantResolver.choose`, `_external_seed_redirect_identity`,
+    `resolve_cart_permalink` — called over the UNION of the inputs its lanes differ on, so this is
+    never narrower than any one of them:
+      * every stored variant, PLUS THE EMPTY VARIANT. offers.resolve falls back to `[{}]`, and a
+        card the gateway built may carry no variant id at all. The empty variant is also what
+        makes the `named_variant_id` difference between the lanes irrelevant here: a name can
+        only REFUSE a hand-over that the empty variant (no name, no claim) resolves anyway — a
+        sole catalog row, or the seed's own stamp — while an exact match resolves whatever the
+        claim. So `choose` is called in the card lanes' form, without it; the host a cart is
+        built on never depends on which variant the cart names;
+      * the product id from the row, from the snapshot, and none at all (the lanes read one or
+        the other, and a gateway-built card may carry none); it decides whether a seed stamp
+        that restates the product id is refused, and with none nothing is refused;
+      * both destination spellings (offers.resolve hands `resolve_cart_permalink` the canonical
+        URL, the card lanes the destination URL). The host depends on it only when the seed
+        carries no shop domain at all.
+    A seed with no http(s) URL mints no link in any lane, so it is skipped.
+    """
+    seed_data = gw._ensure_seed_data_obj(row.get("seed_data"))
+    destination_url = str(row.get("destination_url") or seed_data.get("destination_url") or "")
+    canonical_url = str(row.get("canonical_url") or seed_data.get("canonical_url") or destination_url)
+    dests = [u for u in dict.fromkeys((canonical_url, destination_url)) if u.startswith(("http://", "https://"))]
+    if not dests:
+        return set()
+    product_key = gw._handover_product_key(row, seed_data)
+    product_ids = [*dict.fromkeys(
+        str(p).strip() for p in (row.get("external_product_id"), seed_data.get("external_product_id"))
+        if p is not None and str(p).strip()
+    ), None]
+    hosts: set = set()
+    for variant in [*gw._seed_variants(seed_data), {}]:
+        offer_variant_id = gw._seed_offer_variant_id(variant) or None
+        for product_id in product_ids:
+            handover = resolver.choose(
+                product_key=product_key, product_id=product_id, seed_data=seed_data,
+                offer_variant_id=offer_variant_id,
+            )
+            identity = gw._external_seed_redirect_identity(
+                row=row, seed_data=seed_data, offer_variant_id=offer_variant_id, handover=handover,
+            )
+            for dest in dests:
+                cart = gw.resolve_cart_permalink(
+                    destination_url=dest,
+                    shop_domain=identity.get("shop_domain"),
+                    platform=identity.get("platform"),
+                    cart_variant_id=identity.get("cart_variant_id"),
+                )
+                if cart:
+                    # THE GATE'S KEY: `_CartPurchasabilityGate.allows_cart` asks the fact for
+                    # `normalize_domain(cart_base_url)`.
+                    hosts.add(facts.normalize_domain(cart))
+    hosts.discard("")
+    return hosts
+
+
+async def _cart_mint_lane() -> CartMintLane:
+    """Every (cart host, seed market) the cart minter would build a prefilled cart on.
+
+    RAISES if a page cannot be read (`load_population` fails the lane soft and counts it). A
+    catalog lookup that failed or never ran, or a scan cut short by `_SEED_LANE_BUDGET_S`, does
+    not raise: what was found is kept and `complete` is set False, which is counted too.
+    """
+    # Imported HERE, not at module import: the route module is large, and a failure to import it
+    # must be this lane's counted failure, not a job that cannot start.
+    import routes.agent_shop_gateway as gw
+    from services.handover_variant_identity import HandoverVariantResolver
+
+    lane = CartMintLane(hosts={})
+    started = _monotonic()
+    after = ""
+    while True:
+        if (_monotonic() - started) >= _SEED_LANE_BUDGET_S:
+            lane.complete, lane.incomplete_reason = False, "budget"
+            break
+        records = await database.fetch_all(
+            _SEED_PAGE_SQL, {"after": after, "page_rows": _SEED_PAGE_ROWS}
+        )
+        if not records:
+            break
+        rows = []
+        for record in records:
+            row = dict(gw._row_to_dict(record))
+            row["seed_data"] = gw._ensure_seed_data_obj(row.get("seed_data"))
+            rows.append(row)
+        after = str(rows[-1]["id"])
+        resolver = HandoverVariantResolver(
+            timeout_s=_SEED_HANDOVER_TIMEOUT_S, max_keys=max(1, len(rows))
+        )
+        await resolver.prime(gw._handover_product_key(row, row["seed_data"]) for row in rows)
+        for row in rows:
+            lane.seeds_scanned += 1
+            hosts = _seed_cart_hosts(gw, resolver, row)
+            if hosts:
+                lane.cart_seeds += 1
+            market = str(row.get("market") or "")
+            for host in hosts:
+                lane.hosts[(host, market)] = lane.hosts.get((host, market), 0) + 1
+        if any(resolver.stats.get(name) for name in _HANDOVER_NOT_CONSULTED):
+            lane.complete, lane.incomplete_reason = False, "catalog_lookup"
+        if len(records) < _SEED_PAGE_ROWS:
+            break
+        if _SEED_PAGE_PAUSE_S:
+            await asyncio.sleep(_SEED_PAGE_PAUSE_S)
+    lane.elapsed_ms = int((_monotonic() - started) * 1000)
+    return lane
+
+
+# ── the cart-mint lane is scanned at most ONCE A DAY ─────────────────────────────────────────
+#
+# A scan reads every active seed's `seed_data` on the 2-vCPU prod primary, and the sweep runs 21
+# times a day; database load there caused serving timeouts on 2026-09-26/27. So a scan runs on
+# the first sweep of each UTC day's 05:00 slot (05:07, after the nightly crawls that share the
+# database and the crawl address: see the setup script) and every other run reads the last
+# complete scan from db/merchant_purchasability_cart_mint_scans.py. The seed table changes by
+# nightly refresh and ingest, so a day-old population misses at most one day of new cart hosts —
+# which a missing fact already answers safely (no cart).
+#
+# A FAILED OR INCOMPLETE SCAN DOES NOT PAGE EVERY HOUR. It is recorded, retried no sooner than
+# `_SCAN_RETRY_S` later, and meanwhile the last complete scan is used as long as it is no older
+# than `_SCAN_MAX_AGE_S` (whatever the failed scan did find is added to it). Only when there is
+# no complete scan that young is the lane counted unreadable (exit 1): the population can then be
+# missing hosts that have minted carts for days.
+#
+# AN UNREADABLE CACHE MEANS NO SCAN. If the table cannot be created or read, the lane cannot tell
+# whether it scanned today, and scanning anyway would turn a broken table into an hourly full
+# scan — the load this cache exists to prevent. It is counted unreadable instead.
+
+#: The UTC hour whose slot a scan belongs to; a complete scan at or after the latest one is fresh.
+_SCAN_SLOT_HOUR_UTC = 5
+#: The least time between two scan ATTEMPTS after one failed or came back incomplete.
+_SCAN_RETRY_S = 6 * 3600
+#: The oldest complete scan a run may fall back to without counting the lane unreadable. The
+#: fact TTL: past it, hosts minting carts since then may have no fact at all.
+_SCAN_MAX_AGE_S = 72 * 3600
+
+#: Indirected so tests move the clock across a slot without sleeping. An AWARE UTC datetime: it is
+#: written as `scanned_at`, and a naive one binds as local wall time under asyncpg.
+_utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc)  # noqa: E731
+
+#: The `SweepReport` count (added to `errors`) of scans whose result could not be written to the
+#: cache. The run still sweeps what it scanned, but the next run will scan again.
+CACHE_WRITE_FAILED_TALLY = "cart_mint_cache_write_failed"
+
+
+class CartMintCacheUnavailable(RuntimeError):
+    """The scan cache could not be created or read, so no scan was attempted (see above)."""
+
+
+@dataclass
+class CartMintPopulation:
+    """The cart-mint lane as a run uses it: `lane` is what to sweep, `source` where it came from
+    ("scan", "cache", or "cache+partial-scan"), `age_s` the age of the scan it rests on (0 for
+    this run's own), and `usable` False when it must be counted unreadable."""
+
+    lane: CartMintLane
+    source: str
+    age_s: int
+    usable: bool
+    reason: str = ""
+    cache_write_failed: bool = False
+
+
+def _scan_slot_start(now: datetime) -> datetime:
+    """The latest `_SCAN_SLOT_HOUR_UTC`:00 UTC at or before `now`."""
+    start = now.replace(hour=_SCAN_SLOT_HOUR_UTC, minute=0, second=0, microsecond=0)
+    return start if start <= now else start - timedelta(days=1)
+
+
+def _from_scan_row(row: Dict[str, Any]) -> CartMintLane:
+    return CartMintLane(
+        hosts=dict(row["hosts"]), seeds_scanned=int(row.get("seeds_scanned") or 0),
+        cart_seeds=int(row.get("cart_seeds") or 0), complete=True,
+        elapsed_ms=int(row.get("elapsed_ms") or 0),
+    )
+
+
+async def _cart_mint_population(*, fresh_scan: bool = False) -> CartMintPopulation:
+    """The cart-mint lane under the once-a-day policy above. `fresh_scan=True` (the census) scans
+    now and neither reads nor writes the cache. RAISES `CartMintCacheUnavailable` (no scan was
+    attempted) or, with `fresh_scan`, whatever the scan raised."""
+    if fresh_scan:
+        lane = await _cart_mint_lane()
+        return CartMintPopulation(lane, "scan", 0, lane.complete, lane.incomplete_reason)
+
+    try:
+        ready = await mint_scans.ensure_table()
+        cached = await mint_scans.latest(complete_only=True) if ready else None
+        last = await mint_scans.latest(complete_only=False) if ready else None
+    except Exception as exc:  # noqa: BLE001
+        raise CartMintCacheUnavailable(type(exc).__name__) from exc
+    if not ready:
+        raise CartMintCacheUnavailable("table_not_ready")
+
+    now = _utcnow()
+    if cached is not None and cached["scanned_at"] >= _scan_slot_start(now):
+        return CartMintPopulation(
+            _from_scan_row(cached), "cache", int((now - cached["scanned_at"]).total_seconds()), True
+        )
+
+    lane: Optional[CartMintLane] = None
+    reason = ""
+    write_failed = False
+    backing_off = (
+        last is not None and not last["complete"]
+        and (now - last["scanned_at"]).total_seconds() < _SCAN_RETRY_S
+    )
+    if backing_off:
+        reason = "retry_backoff"
+    else:
+        try:
+            lane = await _cart_mint_lane()
+            reason = lane.incomplete_reason
+        except Exception as exc:  # noqa: BLE001 — recorded and counted below, never a traceback
+            reason = f"error:{type(exc).__name__}"
+        try:
+            await mint_scans.record(
+                scan_id=f"cms_{uuid.uuid4().hex[:16]}", scanned_at=now,
+                complete=bool(lane is not None and lane.complete), reason=reason,
+                seeds_scanned=lane.seeds_scanned if lane else 0,
+                cart_seeds=lane.cart_seeds if lane else 0,
+                elapsed_ms=lane.elapsed_ms if lane else 0,
+                hosts=lane.hosts if lane else {},
+            )
+        except Exception as exc:  # noqa: BLE001
+            write_failed = True
+            logger.warning(
+                "merchant_purchasability_sweep: the cart-mint scan could not be cached "
+                "(error_type=%s); the next run will scan again", type(exc).__name__,
+            )
+        if lane is not None and lane.complete:
+            return CartMintPopulation(lane, "scan", 0, True, "", write_failed)
+
+    # Today's scan failed, came back incomplete, or is backing off: the last complete scan, plus
+    # whatever a partial scan found. Counted unreadable only when that scan is too old to trust.
+    hosts: Dict[Tuple[str, str], int] = dict(cached["hosts"]) if cached is not None else {}
+    for key, seeds in (lane.hosts.items() if lane is not None else ()):
+        hosts[key] = max(hosts.get(key, 0), seeds)
+    base = _from_scan_row(cached) if cached is not None else CartMintLane(hosts={}, complete=False)
+    base.hosts = hosts
+    age_s = int((now - cached["scanned_at"]).total_seconds()) if cached is not None else -1
+    usable = cached is not None and age_s <= _SCAN_MAX_AGE_S
+    source = "cache+partial-scan" if lane is not None and lane.hosts else "cache"
+    return CartMintPopulation(base, source, age_s, usable, reason, write_failed)
+
 #: `source_domain` IS FOLDED, BY THE ROUTE'S EXPRESSION, CHARACTER FOR CHARACTER. `:domain` is a
 #: population key, which is already canonical (lower case, one leading `www.` removed); the
 #: Shopify sync writes `source_domain` as Shopify's `shop_domain`, which in production is
@@ -374,36 +788,55 @@ UNUSABLE_TALLY = "population_skipped_unusable"
 #: 2026-09-26, silently swept under a truncated market).
 MARKET_UNKNOWN_TALLY = "population_skipped_market_unknown"
 
-#: The `SweepReport` count of population LANES (of the two allowlists) whose read raised. The run
-#: still sweeps whatever the other lane returned — one unreadable table should not stop the
-#: merchants the other one names from being refreshed — but the population is incomplete, and
-#: `exit_code_for` turns any non-zero count into a FAILED job execution. Before this count the
-#: two lanes failed soft and silently: a database that answered nothing produced
-#: `population=0 ... errors=0`, which read as a clean run.
+#: The `SweepReport` count of population reads that failed: once per LANE (the two allowlists, the
+#: connected stores, the cart minter) whose read raised or — the cart-mint lane only — came back
+#: incomplete, and once when the staleness read (`facts.list_due`) raised. The run still sweeps
+#: whatever the other lanes returned — one unreadable table should not stop the merchants the
+#: others name from being refreshed — but the population is incomplete (or, for the staleness
+#: read, its rotation order is), and `exit_code_for` turns any non-zero count into a FAILED job
+#: execution. Before this count the lanes failed soft and silently: a database that answered
+#: nothing produced `population=0 ... errors=0`, which read as a clean run.
 UNREADABLE_TALLY = "population_unreadable"
 
+#: `SweepReport` sizes, handed back through `load_population(sizes=...)`: the deduped union of
+#: every lane BEFORE the batch bound, and how many of those have no fact row from our vantage. With a population
+#: larger than the batch these are what tell an operator whether the rotation keeps up with the
+#: TTL (see "Capacity" in the runbook); `population` alone is capped at the batch.
+TOTAL_TALLY = "population_total"
+NEVER_CHECKED_TALLY = "population_never_checked"
+#: And the age, in minutes, of the cart-mint scan the run used (0 = scanned this run; -1 = none).
+CART_MINT_AGE_TALLY = "cart_mint_population_age_min"
 
-async def load_population(
-    limit: int, *, tally: Optional[Dict[str, int]] = None
-) -> List[Target]:
-    """The merchant x market set to sweep, bounded and deduped.
+#: The lanes, in the order they are unioned. Only the cart-link lane carries a variant, and
+#: `merge_lanes` never replaces a variant with None, so the Tier B lane's CONFIRMED variant lands
+#: on a key whichever other lanes also name it.
+LANES = ("variant", "cart-link", "connected-store", "cart-mint")
 
-    `tally`, when given, has `UNUSABLE_TALLY` incremented once per allowlist ROW whose domain is
-    not a bare host name and was therefore left out. Counted rather than silently dropped: such a
-    row is an operator typo that makes a merchant unbuyable, and the run report is where it shows.
-    `MARKET_UNKNOWN_TALLY` counts the same way for a market, and `UNREADABLE_TALLY` once per
-    LANE whose read raised (that lane then contributes nothing; the other is still swept).
 
-    The two lanes are unioned on (domain, market). WHERE THEY OVERLAP THE CART LANE WINS the
-    variant, because its `variant_id` was confirmed available on the storefront for that market
-    by the Tier B job — a stronger fact than anything the catalog holds.
+async def collect_population(
+    *,
+    tally: Optional[Dict[str, int]] = None,
+    cart_mint: Optional[Dict[str, Any]] = None,
+    fresh_cart_mint_scan: bool = False,
+) -> Dict[str, Dict[Tuple[str, str], Optional[str]]]:
+    """Every lane's admitted (domain, market) keys, by lane name, each with its variant.
+
+    `tally`, when given, has `UNUSABLE_TALLY` incremented once per lane ROW whose domain is not a
+    bare host name and was therefore left out. Counted rather than silently dropped: such a row
+    is an operator typo that makes a merchant unbuyable, and the run report is where it shows.
+    `MARKET_UNKNOWN_TALLY` counts the same way for a market, and `UNREADABLE_TALLY` once per LANE
+    whose read raised or came back incomplete (a lane that raised contributes nothing; the others
+    are still swept).
+
+    `cart_mint`, when given, receives the cart-mint lane's counts (`seeds_scanned`, `cart_seeds`,
+    `complete`, `source`, `age_s`, and `seeds_by_key` — seeds per admitted key). The cart-mint lane
+    follows the once-a-day scan policy (`_cart_mint_population`); `fresh_cart_mint_scan=True`
+    scans now and touches no cache, which is what the read-only census does. This function is the
+    ONE place the population is decided: the sweep and scripts/merchant_purchasability_census.py
+    both read it.
     """
-    merged: Dict[Tuple[str, str], Optional[str]] = {}
-    # THE VARIANT LANE'S SET COMES FROM THE LANE ITSELF, not from a second copy of its predicate
-    # written here. `routes/agent_commerce_reap` decides eligibility with the same sentinel this
-    # helper filters on, so the population cannot be narrower than what the door accepts — which
-    # it was, until a reviewer measured a merchant the route admitted and the sweep never visited
-    # (the sweep additionally required `variant_key = ''`; the route never has).
+    lanes: Dict[str, Dict[Tuple[str, str], Optional[str]]] = {name: {} for name in LANES}
+
     def _count(name: str) -> None:
         if tally is not None:
             tally[name] = tally.get(name, 0) + 1
@@ -426,33 +859,142 @@ async def load_population(
     # FAIL SOFT PER LANE, BUT COUNTED. See UNREADABLE_TALLY. `strict=True` because the ledger's
     # default form swallows the error into an empty list, which is exactly the ambiguity the
     # count exists to remove.
-    async def _lane(read: Callable[[], Any], name: str) -> List[Dict[str, Any]]:
+    async def _lane(read: Callable[[], Any], name: str) -> Any:
         try:
-            return list(await read())
+            return await read()
         except Exception as exc:  # noqa: BLE001 — never BaseException; cancellation travels
             _count(UNREADABLE_TALLY)
             logger.warning(
                 "merchant_purchasability_sweep: the %s population lane could not be read "
                 "(error_type=%s)", name, type(exc).__name__,
             )
-            return []
+            return None
 
-    for row in await _lane(lambda: ledger.list_enabled_merchant_markets(strict=True), "variant"):
+    # THE VARIANT LANE'S SET COMES FROM THE LANE ITSELF, not from a second copy of its predicate
+    # written here. `routes/agent_commerce_reap` decides eligibility with the same sentinel this
+    # helper filters on, so the population cannot be narrower than what the door accepts — which
+    # it was, until a reviewer measured a merchant the route admitted and the sweep never visited
+    # (the sweep additionally required `variant_key = ''`; the route never has).
+    for row in await _lane(lambda: ledger.list_enabled_merchant_markets(strict=True), "variant") or []:
         key = _key(row.get("merchant_domain"), row.get("market_country"))
         if key is not None:
-            merged.setdefault(key, None)
-    for row in await _lane(lambda: _rows(_CART_LANE_SQL), "cart-link"):
+            lanes["variant"].setdefault(key, None)
+    for row in await _lane(lambda: _rows(_CART_LANE_SQL), "cart-link") or []:
         key = _key(row.get("domain"), row.get("market"))
         variant = str(row.get("variant_id") or "").strip() or None
-        if key is not None and (variant or key not in merged):
-            merged[key] = variant
+        if key is not None and (variant or key not in lanes["cart-link"]):
+            lanes["cart-link"][key] = variant
+    for row in await _lane(lambda: _rows(_CONNECTED_LANE_SQL), "connected-store") or []:
+        key = _key(normalize_shop_host(row.get("domain")), _connected_market(row.get("region")))
+        if key is not None:
+            lanes["connected-store"].setdefault(key, None)
+
+    population: Optional[CartMintPopulation] = await _lane(
+        lambda: _cart_mint_population(fresh_scan=fresh_cart_mint_scan), "cart-mint"
+    )
+    minted: Optional[CartMintLane] = population.lane if population is not None else None
+    if population is not None:
+        if population.cache_write_failed:
+            _count(CACHE_WRITE_FAILED_TALLY)
+        if not population.usable:
+            # Under-reports with nothing young enough to stand in: a catalog lookup it could not
+            # make, a scan the lane budget cut short, or a scan that raised, and no complete scan
+            # within `_SCAN_MAX_AGE_S`. Counted like a read that raised; what WAS found is swept.
+            _count(UNREADABLE_TALLY)
+            logger.warning(
+                "merchant_purchasability_sweep: the cart-mint population lane is incomplete "
+                "(reason=%s)", population.reason,
+            )
+        elif population.reason:
+            # Today's scan failed or is backing off, and a young-enough scan stands in: logged,
+            # NOT counted, so a slow database does not fail (and page) every run of the day.
+            operator_logger.warning(
+                "merchant_purchasability_sweep: today's cart-mint scan did not complete "
+                "(reason=%s); using the scan from %d min ago", population.reason,
+                population.age_s // 60,
+            )
+    if minted is not None:
+        seeds_by_key: Dict[Tuple[str, str], int] = {}
+        for (host, market), seeds in sorted(minted.hosts.items()):
+            key = _key(host, market)
+            if key is not None:
+                lanes["cart-mint"].setdefault(key, None)
+                seeds_by_key[key] = seeds_by_key.get(key, 0) + seeds
+        operator_logger.info(
+            "merchant_purchasability_sweep: cart-mint lane: source=%s age_min=%d seeds_scanned=%d "
+            "cart_seeds=%d keys=%d complete=%s elapsed_ms=%d", population.source,
+            population.age_s // 60 if population.age_s >= 0 else -1, minted.seeds_scanned,
+            minted.cart_seeds, len(lanes["cart-mint"]), minted.complete, minted.elapsed_ms,
+        )
+        if cart_mint is not None:
+            cart_mint.update(
+                seeds_scanned=minted.seeds_scanned, cart_seeds=minted.cart_seeds,
+                complete=population.usable and minted.complete, incomplete_reason=population.reason,
+                source=population.source, age_s=population.age_s,
+                elapsed_ms=minted.elapsed_ms, seeds_by_key=seeds_by_key,
+            )
+    return lanes
+
+
+def merge_lanes(
+    lanes: Dict[str, Dict[Tuple[str, str], Optional[str]]]
+) -> Dict[Tuple[str, str], Optional[str]]:
+    """The union on (domain, market). WHERE LANES OVERLAP THE CART-LINK LANE WINS the variant,
+    because its `variant_id` was confirmed available on the storefront for that market by the
+    Tier B job — a stronger fact than anything the catalog holds. No other lane carries one."""
+    merged: Dict[Tuple[str, str], Optional[str]] = {}
+    for name in LANES:
+        for key, variant in lanes.get(name, {}).items():
+            if variant or key not in merged:
+                merged[key] = variant
+    return merged
+
+
+async def load_population(
+    limit: int,
+    *,
+    tally: Optional[Dict[str, int]] = None,
+    sizes: Optional[Dict[str, int]] = None,
+) -> List[Target]:
+    """The merchant x market set to sweep THIS RUN: `collect_population`'s union, least recently
+    checked first, bounded by `limit`, with each target's variant and price hint.
+
+    `tally` receives `collect_population`'s counts, plus one `UNREADABLE_TALLY` if the staleness
+    read fails (the run then sweeps in key order). `sizes` receives `TOTAL_TALLY` and
+    `NEVER_CHECKED_TALLY`.
+    """
+    cart_mint: Dict[str, Any] = {}
+    lanes = await collect_population(tally=tally, cart_mint=cart_mint)
+    if sizes is not None:
+        age_s = cart_mint.get("age_s")
+        sizes[CART_MINT_AGE_TALLY] = int(age_s) // 60 if isinstance(age_s, int) and age_s >= 0 else -1
+    merged = merge_lanes(lanes)
+    # The keys that may take the catalog's variant hint: see "One representative variant" in the
+    # module docstring.
+    reap_keys = set(lanes["variant"]) | set(lanes["cart-link"])
 
     # Least-recently-checked FIRST, and never-checked first of all — ordered before the catalog
     # lookups so that a big population does not spend its budget pricing merchants this run will
     # not reach. Sorted in Python against what `list_due` reports rather than in SQL, because the
-    # population comes from two OTHER tables and cannot be joined to this one portably.
+    # population comes from OTHER tables and cannot be joined to this one portably.
+    #
+    # THIS ORDER IS WHAT KEEPS A POPULATION LARGER THAN THE BATCH FRESH: each run takes the
+    # `limit` stalest keys, so every key is re-checked once every ceil(total / limit) runs. It is
+    # also why a failed staleness read is COUNTED: `list_due` used to swallow it into [], every
+    # key then read as never-checked, and the run would sweep the alphabetically-first `limit`
+    # keys every hour while the rest aged out of the TTL, with nothing in the report.
     seen: Dict[Tuple[str, str], Any] = {}
-    for row in await facts.list_due(500, vantage=facts.WORKER_VANTAGE):
+    try:
+        due = await facts.list_due(facts.LIST_DUE_MAX, vantage=facts.WORKER_VANTAGE, strict=True)
+    except Exception as exc:  # noqa: BLE001
+        due = []
+        if tally is not None:
+            tally[UNREADABLE_TALLY] = tally.get(UNREADABLE_TALLY, 0) + 1
+        logger.warning(
+            "merchant_purchasability_sweep: the staleness read failed; this run sweeps in key "
+            "order (error_type=%s)", type(exc).__name__,
+        )
+    for row in due:
         key = (str(row.get("merchant_domain") or ""), str(row.get("market_country") or ""))
         seen[key] = row.get("checked_at")
 
@@ -463,10 +1005,13 @@ async def load_population(
         return (1, checked.isoformat()) if checked is not None else (0, "")
 
     ordered = sorted(merged.items(), key=lambda item: (_staleness(item[0]), item[0]))
+    if sizes is not None:
+        sizes[TOTAL_TALLY] = len(ordered)
+        sizes[NEVER_CHECKED_TALLY] = sum(1 for key, _ in ordered if key not in seen)
 
     targets: List[Target] = []
     for (domain, market), variant in ordered[: max(1, int(limit))]:
-        if variant is None:
+        if variant is None and (domain, market) in reap_keys:
             variant = await _catalog_variant(domain)
         price_minor, currency = await _catalog_price(domain, variant) if variant else (None, None)
         targets.append(Target(domain, market, variant, price_minor, currency))
@@ -519,10 +1064,24 @@ class SweepReport:
     #: market is never defaulted or truncated, so such a row is not swept; see
     #: `MARKET_UNKNOWN_TALLY`.
     population_skipped_market_unknown: int = 0
-    #: Population lanes (0..2) whose read RAISED, or 1 when the population could not be built at
-    #: all. Non-zero means this run swept an incomplete population; the CLI exits
-    #: EXIT_POPULATION_UNREADABLE for it. See `UNREADABLE_TALLY`.
+    #: Population reads (the four lanes and the staleness read, 0..5) that RAISED or, for the
+    #: cart-mint lane, came back incomplete; or 1 when the population could not be built at all.
+    #: Non-zero means this run swept an incomplete population (or in the wrong order); the CLI
+    #: exits EXIT_POPULATION_UNREADABLE for it. See `UNREADABLE_TALLY`.
     population_unreadable: int = 0
+    #: The deduped union of every lane BEFORE the batch bound (`population` is capped at the
+    #: batch). A run covers `population` of these; all of them are covered every
+    #: ceil(population_total / batch) runs.
+    population_total: int = 0
+    #: Of `population_total`, how many have no fact row from our vantage yet. They are swept
+    #: first; after the first full rotation this should read ~0, and a key that STAYS here is one
+    #: the rotation is not reaching.
+    population_never_checked: int = 0
+    #: Minutes since the cart-mint scan this run used was taken: 0 when this run scanned, up to
+    #: ~24 h on a normal day, -1 when there was none. Above ~1,440 today's scan failed and an
+    #: older one stands in (see `_cart_mint_population`); above 4,320 the lane is counted
+    #: unreadable.
+    cart_mint_population_age_min: int = -1
     checked: int = 0
     positive: int = 0
     negative: int = 0
@@ -536,8 +1095,10 @@ class SweepReport:
 
 _COUNTS = (
     "population", "population_skipped_unusable", "population_skipped_market_unknown",
-    "population_unreadable", "checked", "positive", "negative", "unverifiable", "written",
-    "abandoned_budget", "errors", "skipped_disabled",
+    "population_unreadable", "population_total", "population_never_checked",
+    "cart_mint_population_age_min", "checked",
+    "positive", "negative", "unverifiable", "written", "abandoned_budget", "errors",
+    "skipped_disabled",
 )
 
 #: Indirected so a test can make the budget elapse without sleeping. MONOTONIC: the budget must
@@ -599,6 +1160,7 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
     """
     started = _monotonic()
     counts = {name: 0 for name in _COUNTS}
+    counts["cart_mint_population_age_min"] = -1
 
     def _report() -> SweepReport:
         return SweepReport(duration_ms=int((_monotonic() - started) * 1000), **counts)
@@ -621,8 +1183,9 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
     pause_s = _env_int(DIALS["pause_ms"]) / 1000.0
 
     tally: Dict[str, int] = {}
+    sizes: Dict[str, int] = {}
     try:
-        targets = await load_population(batch, tally=tally)
+        targets = await load_population(batch, tally=tally, sizes=sizes)
     except Exception:  # noqa: BLE001 — a population read must not end the run with a traceback
         counts["errors"] += 1
         counts["population_unreadable"] = max(1, tally.get(UNREADABLE_TALLY, 0))
@@ -632,6 +1195,12 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
         return report
     counts["population"] = len(targets)
     counts["population_unreadable"] = tally.get(UNREADABLE_TALLY, 0)
+    counts["population_total"] = sizes.get(TOTAL_TALLY, 0)
+    counts["population_never_checked"] = sizes.get(NEVER_CHECKED_TALLY, 0)
+    counts["cart_mint_population_age_min"] = sizes.get(CART_MINT_AGE_TALLY, -1)
+    # A scan that could not be cached means the next run scans the seed table again: an ERROR
+    # (exit 4), because left alone it is exactly the hourly load the cache exists to prevent.
+    counts["errors"] += tally.get(CACHE_WRITE_FAILED_TALLY, 0)
     if counts["population_unreadable"]:
         operator_logger.warning(
             "merchant_purchasability_sweep: %d population lane(s) could not be read; this run's "
