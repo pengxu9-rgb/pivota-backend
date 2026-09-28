@@ -2174,3 +2174,33 @@ def _leaves_no_rows_behind():
         f"and the next file asserts these are empty. Clean in the _db fixture's teardown, not "
         f"only in its setup."
     )
+
+
+async def test_a_key_past_its_window_is_replaced_so_the_next_retry_replays_on_postgres(client):
+    """R3 (#2425 re-review), the production dialect: the claim's upsert replaces a row older than
+    the window, so the retry after it replays instead of opening another purchase."""
+    await _seed_all()
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pg-k-old"))
+    assert first.status_code == 202
+    await database.execute(
+        "UPDATE reap_agentic_purchase_keys SET created_at = now() - interval '25 hours' "
+        "WHERE idempotency_key = 'pg-k-old'")
+    second = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pg-k-old"))
+    assert second.status_code == 202
+    assert second.json()["purchase_id"] != first.json()["purchase_id"]
+    third = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pg-k-old"))
+    assert third.json()["purchase_id"] == second.json()["purchase_id"]
+    fourth = await client.post(
+        f"{BASE}/purchases", json=_body(idempotency_key="pg-k-old", quantity=2))
+    assert _error(fourth) == "idempotency_conflict"
+
+
+async def test_merchant_disabled_under_a_key_writes_no_key_row_on_postgres(client):
+    """R4, the production dialect."""
+    await _seed_catalog()
+    await _seed_link()
+    await _seed_eligibility(enabled=False)
+    resp = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pg-k-off"))
+    assert _error(resp) == "merchant_disabled"
+    assert await database.fetch_val(
+        "SELECT COUNT(*) FROM reap_agentic_purchase_keys WHERE idempotency_key = 'pg-k-off'") == 0

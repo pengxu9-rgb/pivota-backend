@@ -123,7 +123,7 @@ import services.reap_agentic_client as rc
 import services.reap_agentic_purchase as svc
 from db.buyer_vault import hash_agent_user_ref, mint_pairwise_buyer_ref
 from db.commerce_attribution import surface_click_events
-from db.database import database
+from db.database import IS_POSTGRES, database
 from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
@@ -1516,9 +1516,11 @@ async def _replayed_purchase_id(
     if created is not None:
         age = (_now() - created).total_seconds()
         if age > _IDEMPOTENCY_WINDOW_SECONDS:
-            # OUTSIDE THE WINDOW THE KEY IS FORGOTTEN, and that includes the conflict check: the
-            # row is about to be replaced, and refusing a caller for disagreeing with a
-            # fingerprint we are no longer honouring would be the worst of both rules.
+            # OUTSIDE THE WINDOW THE KEY IS FORGOTTEN, and that includes the conflict check:
+            # refusing a caller for disagreeing with a fingerprint we are no longer honouring
+            # would be the worst of both rules. The stale row IS replaced -- by this request's own
+            # claim, `_write_idempotency_key`'s upsert -- so the NEXT retry replays the new
+            # purchase rather than opening yet another one.
             return None
     stored_hash = str(record.get("request_hash") or "")
     if stored_hash and stored_hash != request_hash:
@@ -1565,24 +1567,74 @@ async def _tombstone_idempotency_key(
     if reason not in _TOMBSTONED_REFUSALS:
         return
     try:
-        await database.execute(
-            """
-            INSERT INTO reap_agentic_purchase_keys (
-                agent_id, agent_user_ref_hash, idempotency_key, purchase_id, request_hash
-            ) VALUES (
-                :agent_id, :agent_user_ref_hash, :idempotency_key, :purchase_id, :request_hash
-            )
-            """,
-            {
-                "agent_id": agent_id,
-                "agent_user_ref_hash": agent_user_ref_hash,
-                "idempotency_key": idempotency_key,
-                "purchase_id": f"{_REFUSED_KEY_PREFIX}{reason}",
-                "request_hash": request_hash,
-            },
+        await _write_idempotency_key(
+            agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash,
+            idempotency_key=idempotency_key, purchase_id=f"{_REFUSED_KEY_PREFIX}{reason}",
+            request_hash=request_hash,
         )
     except Exception:  # noqa: BLE001
         pass
+
+
+# THE KEY ROW IS AN UPSERT THAT ONLY REPLACES A STALE ROW (review of #2425, R3). A key is honoured for
+# `_IDEMPOTENCY_WINDOW_SECONDS`; after that `_replayed_purchase_id` ignores the row -- and a plain INSERT then
+# hit the primary key, the loser path re-read the stale row as "nothing", and the row was NEVER replaced: the
+# key had lost idempotency for good, and every retry opened another purchase. Now a row older than the window
+# is overwritten in the same statement (`DO UPDATE ... WHERE created_at < cutoff`), and a live row is left
+# alone (the WHERE is false, no row is returned, the caller re-reads the winner). One statement per dialect,
+# module-level so the PREPARE sweep sees them; SQLite has had UPSERT with a WHERE since 3.24.
+_WRITE_KEY_SQL = """
+    INSERT INTO reap_agentic_purchase_keys (
+        agent_id, agent_user_ref_hash, idempotency_key, purchase_id, request_hash
+    ) VALUES (
+        :agent_id, :agent_user_ref_hash, :idempotency_key, :purchase_id, :request_hash
+    )
+    ON CONFLICT (agent_id, agent_user_ref_hash, idempotency_key) DO UPDATE
+       SET purchase_id = EXCLUDED.purchase_id,
+           request_hash = EXCLUDED.request_hash,
+           created_at = now()
+     WHERE reap_agentic_purchase_keys.created_at
+           < now() - (CAST(:window_seconds AS INTEGER) * INTERVAL '1 second')
+    RETURNING purchase_id
+"""
+
+_WRITE_KEY_SQL_SQLITE = """
+    INSERT INTO reap_agentic_purchase_keys (
+        agent_id, agent_user_ref_hash, idempotency_key, purchase_id, request_hash
+    ) VALUES (
+        :agent_id, :agent_user_ref_hash, :idempotency_key, :purchase_id, :request_hash
+    )
+    ON CONFLICT (agent_id, agent_user_ref_hash, idempotency_key) DO UPDATE
+       SET purchase_id = excluded.purchase_id,
+           request_hash = excluded.request_hash,
+           created_at = CURRENT_TIMESTAMP
+     WHERE reap_agentic_purchase_keys.created_at < datetime('now', :window_modifier)
+    RETURNING purchase_id
+"""
+
+
+async def _write_idempotency_key(
+    *, agent_id: str, agent_user_ref_hash: str, idempotency_key: str, purchase_id: str,
+    request_hash: str,
+) -> bool:
+    """Land this key row -- fresh, or over a row past the window. True when it landed."""
+    values = {
+        "agent_id": agent_id,
+        "agent_user_ref_hash": agent_user_ref_hash,
+        "idempotency_key": idempotency_key,
+        "purchase_id": purchase_id,
+        "request_hash": request_hash,
+    }
+    if IS_POSTGRES:
+        row = await database.fetch_one(
+            _WRITE_KEY_SQL, {**values, "window_seconds": _IDEMPOTENCY_WINDOW_SECONDS}
+        )
+    else:
+        row = await database.fetch_one(
+            _WRITE_KEY_SQL_SQLITE,
+            {**values, "window_modifier": f"-{_IDEMPOTENCY_WINDOW_SECONDS} seconds"},
+        )
+    return row is not None
 
 
 async def _claim_idempotency_key(
@@ -1603,25 +1655,14 @@ async def _claim_idempotency_key(
     key behind whenever `start_purchase` refuses.
     """
     try:
-        await database.execute(
-            """
-            INSERT INTO reap_agentic_purchase_keys (
-                agent_id, agent_user_ref_hash, idempotency_key, purchase_id, request_hash
-            ) VALUES (
-                :agent_id, :agent_user_ref_hash, :idempotency_key, :purchase_id, :request_hash
-            )
-            """,
-            {
-                "agent_id": agent_id,
-                "agent_user_ref_hash": agent_user_ref_hash,
-                "idempotency_key": idempotency_key,
-                "purchase_id": purchase_id,
-                "request_hash": request_hash,
-            },
+        landed = await _write_idempotency_key(
+            agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash,
+            idempotency_key=idempotency_key, purchase_id=purchase_id, request_hash=request_hash,
         )
-        return purchase_id
     except Exception:  # noqa: BLE001
-        pass
+        landed = False
+    if landed:
+        return purchase_id
 
     # THE LOSER RE-READS, AND THE RE-READ CAN REFUSE. Two concurrent requests with one key and
     # two different bodies race here: the winner's hash lands, and this call raises
@@ -2135,13 +2176,22 @@ async def start_reap_purchase(
         )
 
         if idempotency_key:
-            winner = await _claim_idempotency_key(
-                agent_id=agent_id,
-                agent_user_ref_hash=agent_user_ref_hash,
-                idempotency_key=idempotency_key,
-                purchase_id=purchase_id,
-                request_hash=request_hash,
-            )
+            try:
+                winner = await _claim_idempotency_key(
+                    agent_id=agent_id,
+                    agent_user_ref_hash=agent_user_ref_hash,
+                    idempotency_key=idempotency_key,
+                    purchase_id=purchase_id,
+                    request_hash=request_hash,
+                )
+            except svc.PurchaseRefused:
+                # THE LOSER'S RE-READ REFUSED: a concurrent request with this key landed a different
+                # body (`idempotency_conflict`) or a refusal tombstone (`merchant_not_eligible`)
+                # first. The purchase THIS request just opened is then nobody's -- terminate it
+                # (its PII goes with the terminal write) before the refusal is answered, exactly as
+                # a lost race with a winner is terminated below.
+                await _abandon_duplicate(purchase_id)
+                raise
             if winner != purchase_id:
                 await _abandon_duplicate(purchase_id)
                 purchase_id = winner
