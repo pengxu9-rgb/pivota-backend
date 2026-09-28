@@ -111,6 +111,19 @@ def host_backoff_tripped(consecutive_blocks: int, trip: int) -> bool:
     return trip > 0 and int(consecutive_blocks or 0) >= trip
 
 
+_MAX_STRUCTURAL_SHARE_DEFAULT = 0.2
+
+
+def _max_structural_share() -> float:
+    """Above this share of attempted projections, structural skips with no attached write degrade
+    the run. EXTERNAL_REFERRAL_REFRESH_MAX_STRUCTURAL_SHARE; >= 1 disables the rule."""
+    raw = (os.getenv("EXTERNAL_REFERRAL_REFRESH_MAX_STRUCTURAL_SHARE") or "").strip()
+    try:
+        return float(raw) if raw else _MAX_STRUCTURAL_SHARE_DEFAULT
+    except ValueError:
+        return _MAX_STRUCTURAL_SHARE_DEFAULT
+
+
 def batch_run_status(
     *,
     failed: int,
@@ -122,6 +135,7 @@ def batch_run_status(
     projections_written: int = 0,
     projections_errored: int = 0,
     projections_structural_skips: int = 0,
+    projections_written_attached: int = 0,
     candidate_count: int = 0,
     skipped_for_budget: int = 0,
 ) -> str:
@@ -163,6 +177,18 @@ def batch_run_status(
     # nothing broken, and a job that fails every night hides the night something does break.
     projections_expected = max(0, projections_attempted - max(0, projections_structural_skips))
     if price_changes and projections_expected and projections_written == 0:
+        return "degraded"
+    # ...BUT A NIGHT THAT IS MOSTLY STRUCTURAL AND WROTE NO CANONICAL OFFER IS NOT HEALTHY EITHER.
+    # Since the attached lane exists, 19,782 of 19,808 served attached seeds have a listing row to
+    # write (2026-09-28), so a structural skip is the exception. A run where they dominate and the
+    # attached lane wrote nothing is 09-27 again (2,220 skips, 0 writes, 16 prices moved): the lane
+    # did not run, or the queue holds only rows it cannot reach. Without this, the rule above
+    # would report that night as success.
+    if (
+        projections_attempted
+        and projections_written_attached == 0
+        and max(0, projections_structural_skips) / projections_attempted > _max_structural_share()
+    ):
         return "degraded"
     # Every projection that was attempted raised. Distinct from the rule above: prices may
     # not have moved (so `price_changes` is 0) and the writer may still have blown up on
@@ -2045,6 +2071,7 @@ async def run_external_referral_refresh_batch(
             projections_written=proj_written,
             projections_errored=proj_errored,
             projections_structural_skips=proj_structural,
+            projections_written_attached=int(proj_writes.get("attached") or 0),
             candidate_count=len(candidate_seed_ids),
             skipped_for_budget=skipped_for_budget,
         ),

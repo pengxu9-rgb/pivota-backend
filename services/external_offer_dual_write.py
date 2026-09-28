@@ -65,7 +65,7 @@ OFFER_MODE = "redirect"
 # returns exactly one of: no_seed_id, disabled, seed_missing, no_external_product_id,
 # no_mirror_product, synced, error -- and, for an attached seed with no mirror
 # (`sync_attached_listing_offers`): no_listing_offer, listing_offer_suppressed,
-# ambiguous_listing_seller, listing_offer_not_written. Only `synced` means a row was written; its
+# ambiguous_listing_seller, currency_not_read, listing_offer_not_written. Only `synced` means a row was written; its
 # `target` says which (`mirror` or `attached`).
 #
 # This exists because the refresh hook first hardcoded {"synced","inserted","updated","ok"} —
@@ -367,8 +367,41 @@ _SEED_OFFER_COLUMNS = (
 # currency it already declares, so this lane can never create or move a market/currency pair (the
 # at-rest check in services/catalog_invariant_checks owns rows that disagree). A seed read in USD
 # never lands on a GBP row -- 17 served product-level rows are exactly that and are refused.
+#
+# WHO MAY ASK, and what each source vouches for (`ATTACHED_PRICE_SOURCES`):
+#   * `refresh`: the nightly/per-seed refresh, after a fetch that read the served product and
+#     re-read its price. Every row is priced, the variants only when all were re-read. It must
+#     also have READ the currency: `resolve_external_offer` substitutes the market's currency
+#     when the page names none (`evidence.price_currency_source == 'market_default'`), and a
+#     refresh of a USD seed would then accept a KRW number as dollars. Refused whole.
+#   * `employee_edit`: an employee changed the price or currency on the PATCH route. Only the
+#     product-level row moves; the variants in the seed are whatever the last refresh left, so
+#     they are not the employee's claim.
+# Anyone else (seed_data_writer's merge, the mirror reconciler) rewrites seed_data without a
+# price read and never reaches this lane: `updated_at = NOW()` would claim a read nobody made.
+#
+# PRICE SANITY. This lane writes the PDP's price, and the read that feeds it is lossy:
+# `external_offers_service._parse_price` keeps digits and dots only, so a page's "28,80" becomes
+# 2880. A refresh-sourced price outside [current / R, current * R] of the row it would replace
+# (R = EXTERNAL_OFFER_PROJECTION_MAX_PRICE_RATIO, default 3) is refused, counted and logged for a
+# human. An employee's edit is not bounded: correcting exactly such a 100x row is what it is for.
+ATTACHED_PRICE_SOURCES = frozenset({"refresh", "employee_edit"})
+_DEFAULT_MAX_PRICE_RATIO = 3.0
+
+
+def max_price_ratio() -> float:
+    raw = (os.getenv("EXTERNAL_OFFER_PROJECTION_MAX_PRICE_RATIO") or "").strip()
+    try:
+        value = float(raw) if raw else _DEFAULT_MAX_PRICE_RATIO
+    except ValueError:
+        return _DEFAULT_MAX_PRICE_RATIO
+    # A ratio at or under 1 would refuse every change; treat it as a typo, not a policy.
+    return value if value > 1 else _DEFAULT_MAX_PRICE_RATIO
+
+
 ATTACHED_LISTING_OFFERS_SQL = """
 SELECT o.offer_id, o.sku_key, o.merchant_id, o.currency, o.source_ref,
+       o.list_price, o.merchant_effective_price,
        o.offer_payload ->> 'destination_url' AS payload_destination_url,
        o.offer_payload ->> 'external_seed_id' AS payload_seed_id,
        o.suppressed_at IS NOT NULL AS suppressed,
@@ -429,33 +462,49 @@ def is_listing_offer(offer: Dict[str, Any], seed: Dict[str, Any]) -> bool:
     )
 
 
+def _current_price(offer: Dict[str, Any]) -> Optional[float]:
+    for key in ("merchant_effective_price", "list_price"):
+        price = _positive_price(offer.get(key))
+        if price is not None:
+            return price
+    return None
+
+
 def plan_attached_listing_offer_writes(
-    seed: Dict[str, Any], offers: list
+    seed: Dict[str, Any], offers: list, *, source: str = "refresh", currency_read: bool = False,
+    max_ratio: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Pure: which of the canonical's offer rows take which price. No IO, so every refusal is
     testable on the rows the SELECT returns.
 
-    Returns {"status", "writes": [{offer_id, price, currency}], "skips": {reason: n}}. Status is
-    `no_listing_offer` / `listing_offer_suppressed` (nothing this seed may write: structural),
-    `ambiguous_listing_seller`, or `planned` (possibly with zero writes; the caller reports why).
+    Returns {"status", "writes": [{offer_id, price, currency}], "skips": {reason: n},
+    "refused": [row detail for review]}. Status is `no_listing_offer` / `listing_offer_suppressed`
+    (nothing this seed may write: structural), `ambiguous_listing_seller`, `currency_not_read`,
+    or `planned` (possibly with zero writes; the caller reports why).
     """
     from services.catalog_enrichment_agent.ingestion import variant_own_price
 
     product_key = str(seed.get("attached_product_key") or "")
     listing = [o for o in offers if is_listing_offer(o, seed)]
     if not listing:
-        return {"status": "no_listing_offer", "writes": [], "skips": {}}
+        return {"status": "no_listing_offer", "writes": [], "skips": {}, "refused": []}
     live = [o for o in listing if not o.get("suppressed")]
     if not live:
-        return {"status": "listing_offer_suppressed", "writes": [], "skips": {}}
+        return {"status": "listing_offer_suppressed", "writes": [], "skips": {}, "refused": []}
     sellers = {str(o.get("merchant_id") or "") for o in live}
     if len(sellers) != 1 or "" in sellers or "external_seed" in sellers:
         # One listing is one seller. Rows that disagree (or name ADR-009's banned bucket) are not
         # a row this lane can vouch for.
-        return {"status": "ambiguous_listing_seller", "writes": [], "skips": {}}
+        return {"status": "ambiguous_listing_seller", "writes": [], "skips": {}, "refused": []}
+    if source == "refresh" and not currency_read:
+        # The page named no currency and the reader filled in the market's. Not a reading.
+        return {"status": "currency_not_read", "writes": [], "skips": {}, "refused": []}
 
+    ratio = max_ratio if max_ratio is not None else max_price_ratio()
     currency = str(seed.get("price_currency") or "").strip().upper()
-    all_variants_re_read = str(seed.get("variant_refresh_status") or "") == "all_re_read"
+    all_variants_re_read = (
+        source == "refresh" and str(seed.get("variant_refresh_status") or "") == "all_re_read"
+    )
     variant_prices: Dict[str, Optional[float]] = {}
     for variant in _served_seed_variants(seed):
         vid = str(variant.get("variant_id") or variant.get("id") or "").strip()[:128]
@@ -463,6 +512,7 @@ def plan_attached_listing_offer_writes(
             variant_prices.setdefault(vid, variant_own_price(variant))
 
     writes = []
+    refused = []
     skips: Dict[str, int] = {}
 
     def _skip(reason: str) -> None:
@@ -483,14 +533,20 @@ def plan_attached_listing_offer_writes(
                 _skip("variant_not_on_seed")
                 continue
             if not all_variants_re_read:
-                _skip("variant_not_re_read")
+                _skip("variant_not_re_read" if source == "refresh" else "variant_not_edited")
                 continue
             price = variant_prices[vid]
             if price is None:
                 _skip("no_variant_price")
                 continue
+        current = _current_price(offer)
+        if source == "refresh" and current is not None and not (current / ratio <= price <= current * ratio):
+            _skip("price_ratio_out_of_bounds")
+            refused.append({"offer_id": offer["offer_id"], "sku_key": offer.get("sku_key"),
+                            "current": current, "read": price, "currency": currency})
+            continue
         writes.append({"offer_id": offer["offer_id"], "price": price, "currency": currency})
-    return {"status": "planned", "writes": writes, "skips": skips}
+    return {"status": "planned", "writes": writes, "skips": skips, "refused": refused}
 
 
 def _positive_price(value: Any) -> Optional[float]:
@@ -501,8 +557,10 @@ def _positive_price(value: Any) -> Optional[float]:
     return price if price is not None and price > 0 else None
 
 
-async def sync_attached_listing_offers(seed: Dict[str, Any]) -> Dict[str, Any]:
-    """Write a re-read seed's price onto its listing's offer rows on the attached canonical.
+async def sync_attached_listing_offers(
+    seed: Dict[str, Any], *, source: str, currency_read: bool = False
+) -> Dict[str, Any]:
+    """Write a seed's vouched price onto its listing's offer rows on the attached canonical.
 
     `synced` (target `attached`) when at least one row was written. Otherwise the plan's status,
     or `listing_offer_not_written` with the per-row reasons. Raises nothing the caller does not
@@ -510,7 +568,25 @@ async def sync_attached_listing_offers(seed: Dict[str, Any]) -> Dict[str, Any]:
     seed_id = seed.get("id")
     product_key = str(seed.get("attached_product_key") or "")
     rows = await database.fetch_all(ATTACHED_LISTING_OFFERS_SQL, {"product_key": product_key})
-    plan = plan_attached_listing_offer_writes(seed, [dict(r) for r in rows or []])
+    plan = plan_attached_listing_offer_writes(
+        seed, [dict(r) for r in rows or []], source=source, currency_read=currency_read
+    )
+    if plan["status"] == "currency_not_read":
+        logger.warning({
+            "event": "external_offer_attached_refused",
+            "reason": "currency_not_read",
+            "seed_id": seed_id,
+            "product_key": product_key,
+        })
+    for refused in plan.get("refused") or []:
+        # WARNING, not INFO: prod drops module-logger INFO. One line per refused row, for review.
+        logger.warning({
+            "event": "external_offer_attached_refused",
+            "reason": "price_ratio_out_of_bounds",
+            "seed_id": seed_id,
+            "product_key": product_key,
+            **refused,
+        })
     if plan["status"] != "planned":
         return {"seed_id": seed_id, "status": plan["status"], "product_key": product_key}
     written = 0
@@ -535,7 +611,7 @@ async def sync_attached_listing_offers(seed: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def sync_offer_for_seed(
-    seed_id: str, *, project_attached_listing: bool = False
+    seed_id: str, *, attached_price_source: Optional[str] = None, currency_read: bool = False
 ) -> Dict[str, Any]:
     """Re-project one external seed's catalog_offers row from its current state.
 
@@ -547,12 +623,13 @@ async def sync_offer_for_seed(
     its listing's existing rows on the canonical (`sync_attached_listing_offers`).
     Returns a small status dict.
 
-    `project_attached_listing` is the caller vouching that the seed's price is
-    CURRENT: re-read from the served page this run, or set by an authorized
-    edit (`routes/employee_products._project_refreshed_seed_to_serving_surfaces`
-    is both). The attached lane stamps the listing's rows `updated_at = NOW()`,
-    and a caller that merely rewrote seed_data (seed_data_writer's merge, the
-    mirror reconciler) would claim a freshness nobody earned, so those keep the
+    `attached_price_source` is the caller vouching that the seed's price is
+    CURRENT, and how: `refresh` (re-read from the served page this run;
+    `currency_read` says the page named the currency) or `employee_edit` (an
+    employee set the price). See ATTACHED_PRICE_SOURCES. The attached lane
+    stamps the listing's rows `updated_at = NOW()`, and a caller that merely
+    rewrote seed_data (seed_data_writer's merge, the mirror reconciler) would
+    claim a freshness nobody earned, so those pass nothing and keep the
     mirror-only behaviour: `no_mirror_product` for an attached seed.
     """
     if not seed_id:
@@ -574,11 +651,13 @@ async def sync_offer_for_seed(
 
         mirror = await resolve_mirror_product(seed_id)
         if not mirror:
-            if project_attached_listing and seed.get("attached_product_key"):
+            if attached_price_source in ATTACHED_PRICE_SOURCES and seed.get("attached_product_key"):
                 # Attached to a canonical another lane built (the enrichment agent's `ext:`
                 # products): there is no mirror to upsert, but the canonical carries this
                 # listing's offer rows, and those are what the PDP reads.
-                return await sync_attached_listing_offers(seed)
+                return await sync_attached_listing_offers(
+                    seed, source=attached_price_source, currency_read=currency_read
+                )
             # The mirror hasn't materialized this seed's product yet (or under a
             # different provenance); the batch job owns product creation. Skip.
             return {"seed_id": seed_id, "status": "no_mirror_product"}

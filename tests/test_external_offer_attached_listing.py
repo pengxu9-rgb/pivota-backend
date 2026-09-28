@@ -49,8 +49,10 @@ def _seed(**over) -> Dict[str, Any]:
 
 
 def _offer(offer_id, *, sku=None, vid=None, currency="USD", merchant=SELLER, source_ref=DEST,
-           payload_dest=DEST, payload_seed=None, suppressed=False) -> Dict[str, Any]:
+           payload_dest=DEST, payload_seed=None, suppressed=False, price=25.0) -> Dict[str, Any]:
     return {
+        "list_price": price,
+        "merchant_effective_price": price,
         "offer_id": offer_id,
         "sku_key": sku or f"{PK}::canonical",
         "merchant_id": merchant,
@@ -63,8 +65,10 @@ def _offer(offer_id, *, sku=None, vid=None, currency="USD", merchant=SELLER, sou
     }
 
 
-def _plan(seed, offers):
-    return mod.plan_attached_listing_offer_writes(seed, offers)
+def _plan(seed, offers, *, source="refresh", currency_read=True):
+    return mod.plan_attached_listing_offer_writes(
+        seed, offers, source=source, currency_read=currency_read, max_ratio=3.0
+    )
 
 
 def test_the_product_level_row_takes_the_seed_price():
@@ -201,21 +205,24 @@ class FakeDB:
         self.executed.append(str(sql))
 
 
-def _sync(monkeypatch, fake, *, vouched=True) -> Dict[str, Any]:
+def _sync(monkeypatch, fake, *, source="refresh", currency_read=True) -> Dict[str, Any]:
     monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
     monkeypatch.setattr(mod, "database", fake)
-    return asyncio.run(mod.sync_offer_for_seed(fake.seed["id"], project_attached_listing=vouched))
+    return asyncio.run(mod.sync_offer_for_seed(
+        fake.seed["id"], attached_price_source=source, currency_read=currency_read
+    ))
 
 
 def test_a_caller_that_did_not_re_read_the_price_never_stamps_the_listing(monkeypatch):
     """seed_data_writer's merge and the mirror reconciler rewrite a seed without reading its
     price. `updated_at = NOW()` on the canonical's row would claim a read nobody made."""
     fake = FakeDB(seed=_seed(), offers=[_offer("of_canon")])
-    assert _sync(monkeypatch, fake, vouched=False)["status"] == "no_mirror_product"
+    assert _sync(monkeypatch, fake, source=None)["status"] == "no_mirror_product"
+    assert _sync(monkeypatch, fake, source="seed_data_merge")["status"] == "no_mirror_product"
     assert fake.updates == []
 
 
-def test_the_refresh_hook_vouches_for_the_price(monkeypatch):
+def test_the_refresh_hook_passes_the_price_source_through(monkeypatch):
     import routes.employee_products as ep
 
     seen = {}
@@ -230,8 +237,13 @@ def test_the_refresh_hook_vouches_for_the_price(monkeypatch):
     monkeypatch.setattr("services.external_offer_dual_write.dual_write_enabled", lambda: True)
     monkeypatch.setattr("services.external_offer_dual_write.sync_offer_for_seed", fake_sync)
     monkeypatch.setattr("services.seed_data_writer.refresh_agent_pdp_view_for_seed", fake_pdp)
+    asyncio.run(ep._project_refreshed_seed_to_serving_surfaces(
+        "eps_1", price_source="refresh", currency_read=True))
+    assert seen == {"attached_price_source": "refresh", "currency_read": True}
+    seen.clear()
     asyncio.run(ep._project_refreshed_seed_to_serving_surfaces("eps_1"))
-    assert seen == {"project_attached_listing": True}
+    assert seen == {"attached_price_source": None, "currency_read": False}, (
+        "a caller that names no price source must not open the attached lane")
 
 
 def test_an_attached_seed_without_a_mirror_writes_its_listing_row(monkeypatch):
@@ -297,3 +309,70 @@ def test_the_refresh_hook_reports_the_attached_write_and_row_skips(monkeypatch):
     counts = asyncio.run(ep._project_refreshed_seed_to_serving_surfaces("eps_1"))
     assert counts["projected"] == 1 and counts["wrote_attached"] == 1
     assert counts["offer_skip_variant_not_re_read"] == 2
+
+
+# ------------------------------------------------------------------ price sanity (controller review)
+
+
+def test_a_refresh_read_the_currency_of_which_was_defaulted_writes_nothing():
+    """`resolve_external_offer` stores the market's currency when the page names none."""
+    plan = _plan(_seed(), [_offer("of_canon")], currency_read=False)
+    assert plan["status"] == "currency_not_read" and plan["writes"] == []
+    assert "currency_not_read" not in mod.OFFER_SYNC_STRUCTURAL_SKIP_STATUSES
+
+
+def test_a_comma_decimal_misread_is_refused_and_reported_not_written():
+    """`_parse_price` keeps digits and dots: a page's "28,80" arrives as 2880."""
+    plan = _plan(_seed(price_amount=2880.0, seed_variants=None), [_offer("of_canon", price=28.8)])
+    assert plan["writes"] == [] and plan["skips"] == {"price_ratio_out_of_bounds": 1}
+    assert plan["refused"] == [{"offer_id": "of_canon", "sku_key": f"{PK}::canonical",
+                                "current": 28.8, "read": 2880.0, "currency": "USD"}]
+
+
+@pytest.mark.parametrize("current,read,ok", [
+    (30.0, 90.0, True), (30.0, 10.0, True),      # the bound is inclusive
+    (30.0, 90.5, False), (30.0, 9.9, False),
+    (None, 500.0, True),                          # nothing to compare against: first price
+])
+def test_the_ratio_bound(current, read, ok):
+    offer = _offer("of_canon", price=current)
+    plan = _plan(_seed(price_amount=read, seed_variants=None), [offer])
+    assert bool(plan["writes"]) is ok
+
+
+def test_the_ratio_bound_applies_to_variant_rows_too():
+    offers = [_offer("of_v2", sku=f"{PK}::v:47761881301180", vid="47761881301180", price=3.8)]
+    plan = _plan(_seed(), offers)
+    assert plan["writes"] == [] and plan["skips"] == {"price_ratio_out_of_bounds": 1}
+
+
+def test_an_employee_edit_is_not_bounded_and_moves_only_the_product_row():
+    """Correcting a 100x row is exactly what the edit is for; the seed's variants are the last
+    refresh's, not the employee's claim."""
+    offers = [_offer("of_canon", price=2880.0),
+              _offer("of_v1", sku=f"{PK}::v:47761881301179", vid="47761881301179")]
+    plan = _plan(_seed(price_amount=28.8), offers, source="employee_edit", currency_read=False)
+    assert plan["writes"] == [{"offer_id": "of_canon", "price": 28.8, "currency": "USD"}]
+    assert plan["skips"] == {"variant_not_edited": 1}
+
+
+def test_refused_rows_are_logged_for_review(monkeypatch, caplog):
+    import logging
+
+    fake = FakeDB(seed=_seed(price_amount=2880.0, seed_variants=None),
+                  offers=[_offer("of_canon", price=28.8)])
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        result = _sync(monkeypatch, fake)
+    assert result["status"] == "listing_offer_not_written"
+    assert result["offer_skips"] == {"price_ratio_out_of_bounds": 1}
+    assert fake.updates == []
+    assert any("price_ratio_out_of_bounds" in str(r.msg) and "of_canon" in str(r.msg)
+               for r in caplog.records)
+
+
+def test_the_ratio_env_knob_refuses_nonsense(monkeypatch):
+    monkeypatch.setenv("EXTERNAL_OFFER_PROJECTION_MAX_PRICE_RATIO", "5")
+    assert mod.max_price_ratio() == 5.0
+    for bad in ("0.5", "1", "abc"):
+        monkeypatch.setenv("EXTERNAL_OFFER_PROJECTION_MAX_PRICE_RATIO", bad)
+        assert mod.max_price_ratio() == 3.0

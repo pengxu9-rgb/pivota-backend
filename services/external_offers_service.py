@@ -1689,6 +1689,10 @@ async def resolve_external_offer(
 
         currency = (extracted.get("price_currency") or "").strip().upper() or None
         amount = extracted.get("price_amount")
+        # WHERE THE CURRENCY CAME FROM, recorded because the next line fabricates one: a page that
+        # names none is stored in the market's currency, indistinguishable from a reading. The
+        # seed refresh's canonical-offer projection refuses a `market_default` read.
+        currency_source = "page" if currency is not None else "market_default"
         if currency is None:
             currency = "JPY" if market_norm == "JP" else "USD"
 
@@ -1699,6 +1703,7 @@ async def resolve_external_offer(
             "provider": extracted.get("evidence_provider") or "manual",
             "fetchedAt": now.isoformat(),
             "snapshotId": (existing or {}).get("id") or rid,
+            "price_currency_source": currency_source,
         }
         description = extracted.get("description")
         if isinstance(description, str) and description.strip():
