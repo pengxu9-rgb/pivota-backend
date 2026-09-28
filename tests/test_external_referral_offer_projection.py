@@ -517,8 +517,8 @@ def test_an_invalid_url_seed_is_stamped_before_it_is_refused(monkeypatch):
 
 
 def test_the_refresh_vouches_for_its_price_and_says_whether_it_read_the_currency(monkeypatch):
-    """`resolve_external_offer` fills in the market's currency when a page names none, and
-    records which it was. The refresh must pass that through: the canonical-offer projection
+    """`resolve_external_offer` records whether it read the currency (`page`); snapshots written
+    before it stopped filling in the market's currency say `market_default`. The refresh must pass that through: the canonical-offer projection
     refuses a price whose currency it did not read."""
     calls: List[Dict[str, Any]] = []
     _drive_refresh(monkeypatch, stored_price=28.0, fresh_price=31.0,

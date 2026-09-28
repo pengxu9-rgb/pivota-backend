@@ -33,6 +33,7 @@ from services.external_offers_service import (
     _extract_from_html,
     _extract_jsonld_variants_with_census,
     evidence_variant_fields,
+    snapshot_price_fields,
 )
 
 DEST = "https://eyurs.com/products/round-lab-birch-juice-moisturizing-sunscreen"
@@ -89,17 +90,22 @@ def _page(offers: Any = None, *, html: Optional[str] = None) -> SimpleNamespace:
     """What `resolve_external_offer` hands the refresh for this page (ExternalOfferSnapshot's
     real field set; see test_refresh_clears_stale_snapshot)."""
     extracted = _extract_from_html(DEST, html if html is not None else _html(offers))
+    # resolve_external_offer's own pairing (it used to default USD here, as the producer did).
+    amount, currency, price_read = snapshot_price_fields(extracted)
     return SimpleNamespace(
         canonical_url=DEST,
         domain="eyurs.com",
         title=extracted.get("title"),
         image_url=extracted.get("image_url"),
-        price_amount=extracted.get("price_amount"),
-        # resolve_external_offer's own defaulting, reproduced: USD for a US market.
-        price_currency=(extracted.get("price_currency") or "USD"),
+        price_amount=amount,
+        price_currency=currency,
         availability=extracted.get("availability") or "unknown",
         last_checked_at=_NOW,
-        evidence={"provider": extracted.get("evidence_provider"), **evidence_variant_fields(extracted)},
+        evidence={
+            "provider": extracted.get("evidence_provider"),
+            **evidence_variant_fields(extracted),
+            "price_read": price_read,
+        },
     )
 
 

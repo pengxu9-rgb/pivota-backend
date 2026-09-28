@@ -371,18 +371,22 @@ _SEED_OFFER_COLUMNS = (
 # WHO MAY ASK, and what each source vouches for (`ATTACHED_PRICE_SOURCES`):
 #   * `refresh`: the nightly/per-seed refresh, after a fetch that read the served product and
 #     re-read its price. Every row is priced, the variants only when all were re-read. It must
-#     also have READ the currency: `resolve_external_offer` substitutes the market's currency
-#     when the page names none (`evidence.price_currency_source == 'market_default'`), and a
-#     refresh of a USD seed would then accept a KRW number as dollars. Refused whole.
+#     also have READ the currency (`evidence.price_currency_source == 'page'`).
+#     `resolve_external_offer` used to substitute the market's currency when the page named
+#     none ('market_default'), and a refresh of a USD seed then accepted a KRW number as
+#     dollars. It now stores no price at all ('unread'); older snapshots still carry
+#     'market_default'. Anything but 'page' is refused whole.
 #   * `employee_edit`: an employee changed the price or currency on the PATCH route. Only the
 #     product-level row moves; the variants in the seed are whatever the last refresh left, so
 #     they are not the employee's claim.
 # Anyone else (seed_data_writer's merge, the mirror reconciler) rewrites seed_data without a
 # price read and never reaches this lane: `updated_at = NOW()` would claim a read nobody made.
 #
-# PRICE SANITY. This lane writes the PDP's price, and the read that feeds it is lossy:
-# `external_offers_service._parse_price` keeps digits and dots only, so a page's "28,80" becomes
-# 2880. A refresh-sourced price outside [current / R, current * R] of the row it would replace
+# PRICE SANITY. This lane writes the PDP's price, and the read that feeds it was lossy: the old
+# `_parse_price` kept digits and dots only, so a page's "28,80" became 2880 (utils/crawled_price
+# now reads it right or refuses it). The band stays as a backstop -- and it also means a row
+# ALREADY holding such a 100x price refuses the corrected read; that is a correction-pass job,
+# not the refresh's. A refresh-sourced price outside [current / R, current * R] of the row it would replace
 # (R = EXTERNAL_OFFER_PROJECTION_MAX_PRICE_RATIO, default 3) is refused, counted and logged for a
 # human. An employee's edit is not bounded: correcting exactly such a 100x row is what it is for.
 ATTACHED_PRICE_SOURCES = frozenset({"refresh", "employee_edit"})

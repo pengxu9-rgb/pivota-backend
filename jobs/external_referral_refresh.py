@@ -92,6 +92,25 @@ async def run_daily_external_referral_refresh(
     )
 
 
+PRICE_REFRESH_KEYS = (
+    "price_changed",
+    "price_unchanged",
+    "price_filled",
+    "price_unavailable",
+    "price_skipped_non_positive",
+    "price_skipped_incomplete_pair",
+    "price_skipped_currency_mismatch",
+    "price_skipped_unreadable",
+    "price_unreadable_reasons",
+    "price_unreadable_top_hosts",
+)
+
+
+def price_refresh_line(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """The run's price outcomes, as the one `PRICE_REFRESH` log line carries them."""
+    return {key: summary.get(key) for key in PRICE_REFRESH_KEYS}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Refresh active external referral seeds for runtime gating.")
     parser.add_argument("--limit", type=int, default=500, help="Maximum number of referral seeds to refresh")
@@ -137,6 +156,10 @@ def main() -> int:
 
     summary = asyncio.run(_run())
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+    # ONE LINE, PREFIXED, for the price outcomes. The dump above is multi-line (one log entry per
+    # line in Cloud Logging) and the logger.info below is dropped in prod (root at WARNING), so
+    # neither can be filtered for a night's price counts. The prefix keeps it textPayload.
+    print("PRICE_REFRESH " + json.dumps(price_refresh_line(summary), separators=(",", ":"), default=str))
     logger.info("external referral refresh completed", extra={"summary": summary})
     # EXIT CODE FOLLOWS THE SUMMARY. This used to `return 0` unconditionally, so Cloud Run
     # showed a green tick over every run — including nights that stopped on budget with 659

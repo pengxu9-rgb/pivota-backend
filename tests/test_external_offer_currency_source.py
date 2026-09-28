@@ -1,10 +1,11 @@
-"""`resolve_external_offer` says whether the stored currency was READ or filled in.
+"""`resolve_external_offer` says whether the stored currency was READ.
 
-When the page names no currency the reader stores the market's (`"JPY" if JP else "USD"`), and
-nothing downstream could tell that from a reading: a Korean page priced ₩24,000 arrives as 24000
+It used to store the market's currency (`"JPY" if JP else "USD"`) when the page named none, and
+nothing downstream could tell that from a reading: a Korean page priced ₩24,000 arrived as 24000
 USD. The seed refresh's canonical-offer projection refuses a price whose currency was not read
 (services/external_offer_dual_write, controller review of #2416), so the snapshot evidence records
-`price_currency_source`: `page` or `market_default`.
+`price_currency_source`: `page` or `unread`. An unread currency is no longer filled in at all: the
+amount is dropped with it (see tests/test_crawled_price_locale.py).
 """
 
 from __future__ import annotations
@@ -16,15 +17,15 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    "extracted_currency,market,stored,source",
+    "extracted_currency,market,stored,amount,source",
     [
-        ("sgd", "US", "SGD", "page"),
-        (None, "US", "USD", "market_default"),
-        ("", "JP", "JPY", "market_default"),
+        ("sgd", "US", "SGD", 24000.0, "page"),
+        (None, "US", None, None, "unread"),
+        ("", "JP", None, None, "unread"),
     ],
 )
 def test_the_snapshot_records_where_its_currency_came_from(
-    monkeypatch: pytest.MonkeyPatch, extracted_currency, market, stored, source
+    monkeypatch: pytest.MonkeyPatch, extracted_currency, market, stored, amount, source
 ) -> None:
     import services.external_offers_service as svc
 
@@ -53,4 +54,5 @@ def test_the_snapshot_records_where_its_currency_came_from(
         ))
     assert writes, "the snapshot insert never ran"
     assert writes[-1]["price_currency"] == stored
+    assert writes[-1]["price_amount"] == amount
     assert writes[-1]["evidence"]["price_currency_source"] == source
