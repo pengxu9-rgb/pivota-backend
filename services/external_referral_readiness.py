@@ -121,6 +121,7 @@ def batch_run_status(
     projections_attempted: int = 0,
     projections_written: int = 0,
     projections_errored: int = 0,
+    projections_structural_skips: int = 0,
     candidate_count: int = 0,
     skipped_for_budget: int = 0,
 ) -> str:
@@ -155,7 +156,13 @@ def batch_run_status(
     # drifting from the seed, which is the whole defect this hook exists to close. Silent
     # before, because the outcome dicts were discarded — `no_mirror_product` x2,000 and
     # `synced` x2,000 read identically.
-    if price_changes and projections_attempted and projections_written == 0:
+    #
+    # Judged on the projections that SHOULD write. A structural skip (the seed has no offer row
+    # the writer may touch: OFFER_SYNC_STRUCTURAL_SKIP_STATUSES) is the catalogue's shape, not a
+    # failed write. Counting them made 09-27 exit 1 on `no_mirror_product` 2,220/2,220 with
+    # nothing broken, and a job that fails every night hides the night something does break.
+    projections_expected = max(0, projections_attempted - max(0, projections_structural_skips))
+    if price_changes and projections_expected and projections_written == 0:
         return "degraded"
     # Every projection that was attempted raised. Distinct from the rule above: prices may
     # not have moved (so `price_changes` is 0) and the writer may still have blown up on
@@ -1838,6 +1845,9 @@ async def run_external_referral_refresh_batch(
     proj_errored = 0
     proj_seconds = 0.0
     proj_skips: Dict[str, int] = {}
+    proj_structural = 0
+    proj_writes: Dict[str, int] = {}
+    proj_offer_skips: Dict[str, int] = {}
     pdp_refreshed = 0
     pdp_errored = 0
     pdp_skips: Dict[str, int] = {}
@@ -1930,6 +1940,7 @@ async def run_external_referral_refresh_batch(
                     proj_written += int(proj.get("projected") or 0)
                     proj_errored += int(proj.get("errored") or 0)
                     proj_seconds += float(proj.get("seconds") or 0.0)
+                    proj_structural += int(proj.get("structural_skip") or 0)
                     pdp_refreshed += int(proj.get("pdp_refreshed") or 0)
                     pdp_errored += int(proj.get("pdp_errored") or 0)
                     for _k, _v in proj.items():
@@ -1937,6 +1948,11 @@ async def run_external_referral_refresh_batch(
                             _bump(pdp_skips, _k[len("pdp_skip_"):])
                         elif _k.startswith("skip_"):
                             _bump(proj_skips, _k[5:])
+                        elif _k.startswith("wrote_"):
+                            _bump(proj_writes, _k[len("wrote_"):])
+                        elif _k.startswith("offer_skip_"):
+                            _key = _k[len("offer_skip_"):]
+                            proj_offer_skips[_key] = proj_offer_skips.get(_key, 0) + int(_v or 0)
                 availability = result.get("availability_refresh")
                 if isinstance(availability, dict) and availability.get("status") == "applied":
                     availability_changed += 1
@@ -2023,6 +2039,7 @@ async def run_external_referral_refresh_batch(
             projections_attempted=proj_attempted,
             projections_written=proj_written,
             projections_errored=proj_errored,
+            projections_structural_skips=proj_structural,
             candidate_count=len(candidate_seed_ids),
             skipped_for_budget=skipped_for_budget,
         ),
@@ -2039,6 +2056,15 @@ async def run_external_referral_refresh_batch(
         # means the OFFER landed, and the view rebuild can silently no-op or fail independently.
         "projections_errored": proj_errored,
         "projection_skips": dict(sorted(proj_skips.items(), key=lambda kv: -kv[1])[:8]),
+        # Skips with no offer row to write (a subset of `projection_skips`). The status rule
+        # judges `projections_attempted - projection_structural_skips`, the ones that should write.
+        "projection_structural_skips": proj_structural,
+        # Written rows by target: `mirror` (the seed's mirror product) or `attached` (the
+        # canonical's offer for the seed's listing).
+        "projection_writes": dict(sorted(proj_writes.items())),
+        # Offer ROWS the attached lane refused, by reason (a seed can write its product-level row
+        # and refuse a variant the page did not list).
+        "projection_offer_skips": dict(sorted(proj_offer_skips.items(), key=lambda kv: -kv[1])[:8]),
         "pdp_refreshed": pdp_refreshed,
         "pdp_errored": pdp_errored,
         "pdp_skips": dict(sorted(pdp_skips.items(), key=lambda kv: -kv[1])[:8]),

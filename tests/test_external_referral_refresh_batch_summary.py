@@ -343,3 +343,71 @@ def test_a_starved_budget_stop_is_degraded_end_to_end(monkeypatch):
     ))
     assert summary["stopped_early"] is True and summary["budget_reach"] == 0.9
     assert summary["status"] == "success", "a steady-state budget stop stays green"
+
+
+# ------------------------------------------- a structural skip is not a failed projection
+
+
+def _structural(price="applied", status="no_mirror_product"):
+    row = _ok(price=price, projected=0)
+    row["projection"].update({"skipped": 1, "skip_" + status: 1, "structural_skip": 1})
+    return row
+
+
+def _should_have_written(price="applied", status="seed_missing"):
+    row = _ok(price=price, projected=0)
+    row["projection"].update({"skipped": 1, "skip_" + status: 1})
+    return row
+
+
+def test_a_night_of_only_structural_skips_is_not_degraded(monkeypatch):
+    """09-27: 2,220 origin reads, 16 prices moved, `no_mirror_product` 2,220/2,220, exit 1.
+    Nothing was broken: none of those seeds had an offer row the writer may touch."""
+    summary = _run(monkeypatch, [_structural() for _ in range(3)] + [_structural("unchanged")])
+    assert summary["projections_attempted"] == 4
+    assert summary["projections_written"] == 0
+    assert summary["projection_structural_skips"] == 4
+    assert summary["projection_skips"] == {"no_mirror_product": 4}
+    assert summary["status"] == "success"
+
+
+def test_the_listing_offer_skip_is_structural_too(monkeypatch):
+    summary = _run(monkeypatch, [_structural(status="no_listing_offer") for _ in range(2)])
+    assert summary["projection_structural_skips"] == 2
+    assert summary["status"] == "success"
+
+
+def test_projections_that_should_write_and_write_nothing_still_degrade(monkeypatch):
+    """The rule survives for the rows it was written for: structural skips leave the
+    denominator, the rest still have to land something while prices move."""
+    rows = [_structural() for _ in range(5)] + [_should_have_written(), _should_have_written("unchanged")]
+    summary = _run(monkeypatch, rows)
+    assert summary["projection_structural_skips"] == 5
+    assert summary["projections_written"] == 0
+    assert summary["status"] == "degraded"
+
+
+def test_one_write_among_structural_skips_is_healthy(monkeypatch):
+    written = _ok()
+    written["projection"]["wrote_attached"] = 1
+    summary = _run(monkeypatch, [_structural() for _ in range(5)] + [written])
+    assert summary["projections_written"] == 1
+    assert summary["projection_writes"] == {"attached": 1}
+    assert summary["status"] == "success"
+
+
+def test_the_structural_set_is_the_writers(monkeypatch):
+    """Named by the writer, never restated here (the same trap as OFFER_SYNC_WRITTEN_STATUSES)."""
+    from services.external_offer_dual_write import OFFER_SYNC_STRUCTURAL_SKIP_STATUSES
+
+    assert OFFER_SYNC_STRUCTURAL_SKIP_STATUSES == {
+        "no_mirror_product", "no_listing_offer", "listing_offer_suppressed",
+    }
+    assert err.batch_run_status(
+        failed=0, stopped_early=False, attempted_count=10, origin_reads=10, price_changes=3,
+        projections_attempted=10, projections_written=0, projections_structural_skips=10,
+    ) == "success"
+    assert err.batch_run_status(
+        failed=0, stopped_early=False, attempted_count=10, origin_reads=10, price_changes=3,
+        projections_attempted=10, projections_written=0, projections_structural_skips=9,
+    ) == "degraded"

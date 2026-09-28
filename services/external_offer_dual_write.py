@@ -63,7 +63,10 @@ OFFER_MODE = "redirect"
 
 # THE WRITER'S OWN VOCABULARY, exported so a consumer never has to guess it. `sync_offer_for_seed`
 # returns exactly one of: no_seed_id, disabled, seed_missing, no_external_product_id,
-# no_mirror_product, synced, error. Only `synced` means a row was written.
+# no_mirror_product, synced, error -- and, for an attached seed with no mirror
+# (`sync_attached_listing_offers`): no_listing_offer, listing_offer_suppressed,
+# ambiguous_listing_seller, listing_offer_not_written. Only `synced` means a row was written; its
+# `target` says which (`mirror` or `attached`).
 #
 # This exists because the refresh hook first hardcoded {"synced","inserted","updated","ok"} —
 # three of which this function cannot emit, and "ok" is what its own tests stubbed. Deleting
@@ -71,6 +74,14 @@ OFFER_MODE = "redirect"
 # landing, degrading the run and failing the job nightly. Import these instead of restating them.
 OFFER_SYNC_WRITTEN_STATUSES = frozenset({"synced"})
 OFFER_SYNC_ERROR_STATUSES = frozenset({"error"})
+# NOTHING TO WRITE, AND NOTHING WRONG. The seed has no offer row this writer may touch: no mirror
+# product (unattached, not materialised yet) or, for an attached seed, no live offer on the
+# canonical for the listing it reads (none, or every one suppressed by a human or a quarantine). A night of these is the shape of the catalogue, not a failed write, so
+# the batch leaves them out of "a projection that should have written wrote nothing" -- on 09-27
+# `no_mirror_product` 2,220/2,220 failed the job while every one of them was this.
+OFFER_SYNC_STRUCTURAL_SKIP_STATUSES = frozenset(
+    {"no_mirror_product", "no_listing_offer", "listing_offer_suppressed"}
+)
 OFFER_CHANNEL = "external_referral"
 OFFER_SOURCE_SYSTEM = "external_product_seeds_mirror_v1"
 OFFER_PRICE_CONFIDENCE = Decimal("0.6")
@@ -320,8 +331,207 @@ async def upsert_catalog_offer_from_seed_row(
 
 _SEED_OFFER_COLUMNS = (
     "id, external_product_id, destination_url, canonical_url, domain, "
-    "price_amount, price_currency, availability, market"
+    "price_amount, price_currency, availability, market, attached_product_key, "
+    # Only what the attached lane reads of seed_data, never the whole document.
+    "seed_data -> 'variants' AS seed_variants, "
+    "seed_data -> 'snapshot' -> 'variants' AS snapshot_variants, "
+    "seed_data -> 'snapshot' -> 'variant_refresh' ->> 'status' AS variant_refresh_status"
 )
+
+# ── the attached lane ────────────────────────────────────────────────────────────────────────────
+#
+# THE GAP. `sync_offer_for_seed` found a seed's offer only through its MIRROR product
+# (catalog_products.source_ref = seed id). The 13,114 served seeds the enrichment agent attached to
+# its own `ext:` canonical have none -- that product's source_ref is the agent's -- so every
+# refresh of them ended `no_mirror_product` (09-27: 2,220 of 2,220 origin reads) while the canonical
+# kept the price the agent captured at ingest. The PDP (`agent_pdp_view`) and the serving price
+# gate read that row. PIVOTA-Agent #2215 is one of them: seed S$28.80 re-read, offer S$28.20 served.
+#
+# THE ROWS. A price belongs to a LISTING (one seller's page), not to a product and not to a seller:
+# one seller can list 30 ml and 50 ml on two URLs of the same canonical. So the rows this seed may
+# write are the canonical's offers for the seed's own destination -- `source_ref` is the listing URL
+# (enrichment, `ingestion._build_offer_inserts`) or the seed id (the mirror and the variant
+# backfill), and `offer_payload` carries the same pair. Measured 2026-09-28 over 19,808 served
+# attached seeds: 19,782 have such rows and 26 have none; 18,278 have exactly one product-level
+# (`<pk>::canonical`) row. Seller keying (ADR-009 D1: offer = product x seller) is the row's own:
+# product_key, merchant_id, offer_id and sku_key are never written, only the price on rows that
+# already name this listing, and a listing whose rows disagree on the seller writes nothing.
+#
+# WHICH PRICE. The product-level row takes the seed's price; a variant row takes the seed variant's
+# OWN price (`ingestion.variant_own_price`, never the product's), matched on the merchant's variant
+# id (`catalog_skus.source_variant_id`), and only when the refresh re-read every stored variant
+# (`snapshot.variant_refresh.status == 'all_re_read'`). A sibling the page did not list keeps its
+# row and its clock.
+#
+# CURRENCY = MARKET. Nothing here writes `currency` or `market`: a row takes a number only in the
+# currency it already declares, so this lane can never create or move a market/currency pair (the
+# at-rest check in services/catalog_invariant_checks owns rows that disagree). A seed read in USD
+# never lands on a GBP row -- 17 served product-level rows are exactly that and are refused.
+ATTACHED_LISTING_OFFERS_SQL = """
+SELECT o.offer_id, o.sku_key, o.merchant_id, o.currency, o.source_ref,
+       o.offer_payload ->> 'destination_url' AS payload_destination_url,
+       o.offer_payload ->> 'external_seed_id' AS payload_seed_id,
+       o.suppressed_at IS NOT NULL AS suppressed,
+       sk.source_variant_id
+FROM catalog_offers o
+LEFT JOIN catalog_skus sk ON sk.sku_key = o.sku_key
+WHERE o.product_key = :product_key
+"""
+
+# Guarded on what the row was when read: a concurrent writer that moved the currency or suppressed
+# the offer since wins, and the UPDATE matches nothing.
+ATTACHED_LISTING_OFFER_UPDATE_SQL = """
+UPDATE catalog_offers
+SET list_price = :price,
+    merchant_effective_price = :price,
+    estimated_best_price = :price,
+    updated_at = NOW()
+WHERE offer_id = :offer_id
+  AND upper(trim(coalesce(currency, ''))) = :currency
+  AND suppressed_at IS NULL
+RETURNING offer_id
+"""
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, (str, bytes)):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return None
+    return value
+
+
+def _served_seed_variants(seed: Dict[str, Any]) -> list:
+    """The variant list the builder serves: top-level `variants`, else `snapshot.variants`
+    (the same container rule the refresh reconciles, routes/employee_products)."""
+    top = _json_value(seed.get("seed_variants"))
+    if isinstance(top, list):
+        return [v for v in top if isinstance(v, dict)]
+    snap = _json_value(seed.get("snapshot_variants"))
+    if isinstance(snap, list):
+        return [v for v in snap if isinstance(v, dict)]
+    return []
+
+
+def is_listing_offer(offer: Dict[str, Any], seed: Dict[str, Any]) -> bool:
+    """Is this canonical offer row the seed's own listing? An exact id or a same-destination URL
+    (services/seed_served_url, the refresh's own rule), never a host or a seller alone."""
+    from services.seed_served_url import same_destination
+
+    seed_id = str(seed.get("id") or "")
+    if seed_id and seed_id in (offer.get("source_ref"), offer.get("payload_seed_id")):
+        return True
+    dest = seed.get("destination_url")
+    return bool(dest) and any(
+        candidate and same_destination(candidate, dest)
+        for candidate in (offer.get("source_ref"), offer.get("payload_destination_url"))
+    )
+
+
+def plan_attached_listing_offer_writes(
+    seed: Dict[str, Any], offers: list
+) -> Dict[str, Any]:
+    """Pure: which of the canonical's offer rows take which price. No IO, so every refusal is
+    testable on the rows the SELECT returns.
+
+    Returns {"status", "writes": [{offer_id, price, currency}], "skips": {reason: n}}. Status is
+    `no_listing_offer` / `listing_offer_suppressed` (nothing this seed may write: structural),
+    `ambiguous_listing_seller`, or `planned` (possibly with zero writes; the caller reports why).
+    """
+    from services.catalog_enrichment_agent.ingestion import variant_own_price
+
+    product_key = str(seed.get("attached_product_key") or "")
+    listing = [o for o in offers if is_listing_offer(o, seed)]
+    if not listing:
+        return {"status": "no_listing_offer", "writes": [], "skips": {}}
+    live = [o for o in listing if not o.get("suppressed")]
+    if not live:
+        return {"status": "listing_offer_suppressed", "writes": [], "skips": {}}
+    sellers = {str(o.get("merchant_id") or "") for o in live}
+    if len(sellers) != 1 or "" in sellers or "external_seed" in sellers:
+        # One listing is one seller. Rows that disagree (or name ADR-009's banned bucket) are not
+        # a row this lane can vouch for.
+        return {"status": "ambiguous_listing_seller", "writes": [], "skips": {}}
+
+    currency = str(seed.get("price_currency") or "").strip().upper()
+    all_variants_re_read = str(seed.get("variant_refresh_status") or "") == "all_re_read"
+    variant_prices: Dict[str, Optional[float]] = {}
+    for variant in _served_seed_variants(seed):
+        vid = str(variant.get("variant_id") or variant.get("id") or "").strip()[:128]
+        if vid:
+            variant_prices.setdefault(vid, variant_own_price(variant))
+
+    writes = []
+    skips: Dict[str, int] = {}
+
+    def _skip(reason: str) -> None:
+        skips[reason] = skips.get(reason, 0) + 1
+
+    for offer in live:
+        if not currency or str(offer.get("currency") or "").strip().upper() != currency:
+            _skip("currency_mismatch")
+            continue
+        if offer.get("sku_key") == f"{product_key}{SKU_SUFFIX}":
+            price = _positive_price(seed.get("price_amount"))
+            if price is None:
+                _skip("no_seed_price")
+                continue
+        else:
+            vid = str(offer.get("source_variant_id") or "").strip()
+            if not vid or vid not in variant_prices:
+                _skip("variant_not_on_seed")
+                continue
+            if not all_variants_re_read:
+                _skip("variant_not_re_read")
+                continue
+            price = variant_prices[vid]
+            if price is None:
+                _skip("no_variant_price")
+                continue
+        writes.append({"offer_id": offer["offer_id"], "price": price, "currency": currency})
+    return {"status": "planned", "writes": writes, "skips": skips}
+
+
+def _positive_price(value: Any) -> Optional[float]:
+    try:
+        price = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    return price if price is not None and price > 0 else None
+
+
+async def sync_attached_listing_offers(seed: Dict[str, Any]) -> Dict[str, Any]:
+    """Write a re-read seed's price onto its listing's offer rows on the attached canonical.
+
+    `synced` (target `attached`) when at least one row was written. Otherwise the plan's status,
+    or `listing_offer_not_written` with the per-row reasons. Raises nothing the caller does not
+    already catch (`sync_offer_for_seed`)."""
+    seed_id = seed.get("id")
+    product_key = str(seed.get("attached_product_key") or "")
+    rows = await database.fetch_all(ATTACHED_LISTING_OFFERS_SQL, {"product_key": product_key})
+    plan = plan_attached_listing_offer_writes(seed, [dict(r) for r in rows or []])
+    if plan["status"] != "planned":
+        return {"seed_id": seed_id, "status": plan["status"], "product_key": product_key}
+    written = 0
+    skips = dict(plan["skips"])
+    for write in plan["writes"]:
+        # RETURNING, because `execute` reports no row count: a row the guard no longer matches
+        # (currency moved, offer suppressed since the read) is a skip, not a write.
+        if await database.fetch_one(ATTACHED_LISTING_OFFER_UPDATE_SQL, write):
+            written += 1
+        else:
+            skips["changed_since_read"] = skips.get("changed_since_read", 0) + 1
+    result = {
+        "seed_id": seed_id,
+        "product_key": product_key,
+        "target": "attached",
+        "offers_written": written,
+        "offer_skips": skips,
+    }
+    if written:
+        return {**result, "status": "synced"}
+    return {**result, "status": "listing_offer_not_written"}
 
 
 async def sync_offer_for_seed(seed_id: str) -> Dict[str, Any]:
@@ -329,8 +539,11 @@ async def sync_offer_for_seed(seed_id: str) -> Dict[str, Any]:
 
     Best-effort + idempotent + NEVER raises — it rides on seed-write paths and
     must not break them. No-op (skipped) when the flag is off, the seed is gone,
-    it has no external_product_id, or its mirror product doesn't exist yet (the
-    materialization job owns product creation). Returns a small status dict.
+    it has no external_product_id, or it has neither a mirror product (the
+    materialization job owns product creation) nor an attached canonical. A seed
+    with a mirror upserts the mirror's offer; an attached seed without one prices
+    its listing's existing rows on the canonical (`sync_attached_listing_offers`).
+    Returns a small status dict.
     """
     if not seed_id:
         return {"seed_id": seed_id, "status": "no_seed_id"}
@@ -351,6 +564,11 @@ async def sync_offer_for_seed(seed_id: str) -> Dict[str, Any]:
 
         mirror = await resolve_mirror_product(seed_id)
         if not mirror:
+            if seed.get("attached_product_key"):
+                # Attached to a canonical another lane built (the enrichment agent's `ext:`
+                # products): there is no mirror to upsert, but the canonical carries this
+                # listing's offer rows, and those are what the PDP reads.
+                return await sync_attached_listing_offers(seed)
             # The mirror hasn't materialized this seed's product yet (or under a
             # different provenance); the batch job owns product creation. Skip.
             return {"seed_id": seed_id, "status": "no_mirror_product"}
@@ -359,7 +577,7 @@ async def sync_offer_for_seed(seed_id: str) -> Dict[str, Any]:
         await upsert_catalog_offer_from_seed_row(
             product_key, seed, merchant_id=mirror["merchant_id"]
         )
-        return {"seed_id": seed_id, "status": "synced", "product_key": product_key}
+        return {"seed_id": seed_id, "status": "synced", "product_key": product_key, "target": "mirror"}
     except Exception as exc:  # noqa: BLE001
         logger.warning({
             "event": "external_offer_dual_write_failed",
