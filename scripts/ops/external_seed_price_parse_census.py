@@ -52,9 +52,16 @@ RUN IT (it fetches nothing, so no crawl subnet):
 
     bash scripts/ops/run_price_parse_census.sh
 
-Output: a text report, then `CENSUS_JSON {...}` and `SUSPECTS_JSON [...]` lines (prefixed so they
-stay textPayload). SUSPECTS_JSON is the candidate list a correction pass would start from; it is
-not a manifest and nothing reads it automatically.
+Output: a text report, then `CENSUS_JSON {...}`, `SUSPECTS_JSON [...]` and `CURRENCY_SAMPLE_JSON
+[...]` lines (prefixed so they stay textPayload). SUSPECTS_JSON is the candidate list a correction
+pass would start from; it is not a manifest and nothing reads it automatically.
+
+WHICH PAGES NAME NO CURRENCY is not in the database, and it is the number that sizes what the
+no-default rule stalls (those rows now get `skipped_unreadable`). CURRENCY_SAMPLE_JSON lists, per
+host x market, the served default-shaped rows, the offers on their attached products in that
+currency, and up to SAMPLE_PER_HOST destination URLs. Save the line's JSON to a file and run
+scripts/ops/external_seed_currency_probe.py on it: it re-reads those pages (no database) and
+estimates, per host, how many rows and offers are on pages that name no currency.
 """
 
 from __future__ import annotations
@@ -79,6 +86,10 @@ X100_BAND = (60.0, 160.0)
 DIV1000_BAND = (1 / 1600.0, 1 / 600.0)
 OUTLIER_RATIO = 8.0
 TOP_HOSTS = 40
+# The per-host URL sample for scripts/ops/external_seed_currency_probe.py. One log entry holds it,
+# and Cloud Logging caps an entry at 256 KB.
+SAMPLE_PER_HOST = 3
+MAX_SAMPLE_HOSTS = 400
 MAX_SUSPECTS_LISTED = 300
 APPLICATION_NAME = "external_seed_price_parse_census"
 
@@ -247,15 +258,14 @@ SEED_EXTRA_COLUMNS = """
     WHERE jsonb_typeof(v) = 'object') AS variant_prices,
 """
 
-# Offers on the attached products, excluding the synthetic merchant whose offers were projected
-# from these very seeds. The key list is bound, never interpolated.
+# Offers on the attached products. As PEERS, the synthetic `external_seed` merchant's are skipped
+# (they were projected from these very seeds); as OFFERS A SEED'S READ FEEDS, all are counted.
+# The key list is bound, never interpolated.
 OFFERS_SQL = """
-SELECT product_key, upper(trim(coalesce(currency, ''))) AS currency,
+SELECT product_key, merchant_id, upper(trim(coalesce(currency, ''))) AS currency,
        coalesce(merchant_effective_price, list_price) AS price
 FROM catalog_offers
 WHERE product_key = ANY($1::text[])
-  AND merchant_id <> 'external_seed'
-  AND coalesce(merchant_effective_price, list_price) > 0
 """
 
 GUARD_SQL = f"""
@@ -294,8 +304,8 @@ def summarise(
     classify,
     parse,
     zero_decimal: Iterable[str],
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Every census number, and the suspect list, from fetched rows. Pure."""
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Every census number, the suspect list and the per-host currency sample. Pure."""
     zero_decimal = frozenset(zero_decimal)
     facts = []
     for row in rows:
@@ -314,10 +324,13 @@ def summarise(
         if title:
             by_title[(title, f["currency"])].append((f["id"], f["host"], f["amount"]))
     offer_prices: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+    offer_count: Counter = Counter()
     for o in offers:
+        offer_count[(o["product_key"], o.get("currency") or "")] += 1
         price = _num(o.get("price"))
-        if price and price > 0:
+        if price and price > 0 and o.get("merchant_id") != "external_seed":
             offer_prices[(o["product_key"], o.get("currency") or "")].append(price)
+    sample_urls: Dict[Tuple[str, str], List[str]] = defaultdict(list)
 
     host_market: Dict[Tuple[str, str], Counter] = defaultdict(Counter)
     totals: Counter = Counter()
@@ -367,6 +380,16 @@ def summarise(
         if strong:
             counts["suspect"] += 1
             totals["suspect"] += 1
+        if "default_shaped" in cflags:
+            # THE ROWS THE NO-DEFAULT RULE CAN STALL: a page that names no currency now gets
+            # `skipped_unreadable` where it used to be `applied` in the invented currency. Which of
+            # these pages name none is not in the database; CURRENCY_SAMPLE_JSON feeds the probe.
+            attached_offers = offer_count[(f["attached_key"], f["currency"])] if f.get("attached_key") else 0
+            counts["default_shaped_attached_offers"] += attached_offers
+            totals["default_shaped_attached_offers"] += attached_offers
+            urls = sample_urls[key]
+            if len(urls) < SAMPLE_PER_HOST and f.get("destination_url"):
+                urls.append(str(f["destination_url"]))
         likely_invented = "contradicted" in cflags or "tld_mismatch" in cflags
         if likely_invented:
             counts["currency_likely_invented"] += 1
@@ -395,14 +418,29 @@ def summarise(
     for (_h, m), c in host_market.items():
         by_market[m].update(c)
     suspects.sort(key=lambda s: (s["host"], s["id"]))
+    sample = sorted(
+        (
+            {
+                "host": h, "market": m, "served": int(c["served"]),
+                "default_shaped": int(c["default_shaped"]),
+                "default_shaped_attached_offers": int(c["default_shaped_attached_offers"]),
+                "urls": sample_urls[(h, m)],
+            }
+            for (h, m), c in host_market.items()
+            if c["default_shaped"]
+        ),
+        key=lambda d: (-d["default_shaped"], d["host"], d["market"]),
+    )
     summary = {
         "totals": {k: int(v) for k, v in sorted(totals.items())},
         "by_market": {m: {k: int(v) for k, v in sorted(c.items())} for m, c in sorted(by_market.items())},
         "top_hosts": hosts,
         "suspects_listed": min(len(suspects), MAX_SUSPECTS_LISTED),
         "suspects_total": len(suspects),
+        "currency_sample_hosts": min(len(sample), MAX_SAMPLE_HOSTS),
+        "currency_sample_hosts_total": len(sample),
     }
-    return summary, suspects[:MAX_SUSPECTS_LISTED]
+    return summary, suspects[:MAX_SUSPECTS_LISTED], sample[:MAX_SAMPLE_HOSTS]
 
 
 def render(summary: Dict[str, Any]) -> List[str]:
@@ -418,7 +456,7 @@ def render(summary: Dict[str, Any]) -> List[str]:
     return lines
 
 
-async def collect(conn: Any) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+async def collect(conn: Any) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """One READ ONLY transaction on an open asyncpg connection, then summarise."""
     from services.crawl_politeness import host_of
     from services.external_seed_search import seed_serving_currency
@@ -451,13 +489,14 @@ async def _main() -> int:
     dsn = os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://")
     conn = await asyncpg.connect(dsn)
     try:
-        summary, suspects = await collect(conn)
+        summary, suspects, sample = await collect(conn)
     finally:
         await conn.close()
     for line in render(summary):
         print(line)
     print("CENSUS_JSON " + json.dumps(summary, default=str, separators=(",", ":")))
     print("SUSPECTS_JSON " + json.dumps(suspects, default=str, separators=(",", ":")))
+    print("CURRENCY_SAMPLE_JSON " + json.dumps(sample, default=str, separators=(",", ":")))
     return 0
 
 

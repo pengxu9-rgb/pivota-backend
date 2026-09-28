@@ -1971,6 +1971,7 @@ async def run_external_referral_refresh_batch(
     # reason, so a rising count points at the signal the extractor is missing.
     price_skipped_unreadable = 0
     price_unreadable_reasons: Dict[str, int] = {}
+    price_unreadable_hosts: Dict[str, int] = {}
     availability_changed = 0
     # Hosts the run stopped asking because they did not answer at all (connection refused or
     # reset, timeout, DNS, TLS), with how many of their rows it passed over. Kept apart from the
@@ -2027,6 +2028,7 @@ async def run_external_referral_refresh_batch(
                     price_skipped_unreadable += 1
                     reason = str(price.get("reason") or "unknown")
                     price_unreadable_reasons[reason] = price_unreadable_reasons.get(reason, 0) + 1
+                    price_unreadable_hosts[host or "unknown"] = price_unreadable_hosts.get(host or "unknown", 0) + 1
                 elif price_status == "unavailable":
                     price_unavailable += 1
                 proj = result.get("projection")
@@ -2369,6 +2371,11 @@ async def run_external_referral_refresh_batch(
         "price_skipped_non_positive": price_skipped_non_positive,
         "price_skipped_unreadable": price_skipped_unreadable,
         "price_unreadable_reasons": price_unreadable_reasons,
+        # Which hosts' pages the extractor would not price, so night one says WHERE (a host whose
+        # pages name no currency shows up here every night until it is looked at).
+        "price_unreadable_top_hosts": dict(
+            sorted(price_unreadable_hosts.items(), key=lambda kv: (-kv[1], kv[0]))[:25]
+        ),
         "availability_changed": availability_changed,
         "errors": errors[:20],
     }

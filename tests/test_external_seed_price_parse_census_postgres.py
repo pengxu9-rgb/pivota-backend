@@ -210,20 +210,35 @@ async def test_the_census_runs_read_only_on_postgres(scoped_db):
                 seed_data={"price": "49,90 €"})
     # A US-partition seed on a .de host with a USD price and no variant currency: likely invented.
     await _seed(db, "usd_de", host="d.example.de", market="US", price=28.8, currency="USD", title="mask")
-    # Served in JP, read right.
-    await _seed(db, "jp_ok", host="e.example.jp", market="JP", price=2400.0, currency="JPY", title="lotion")
+    # ...three more on the same host: the probe sample keeps at most SAMPLE_PER_HOST of its URLs.
+    for i in (2, 3, 4):
+        await _seed(db, f"usd_de_{i}", host="d.example.de", market="US", price=20.0 + i, currency="USD",
+                    title=f"mask {i}")
+    # Served in JP, read right -- but JPY is also what the old code invented for a JP page with no
+    # currency, so it is default-shaped: the probe has to look. Its product has one JPY offer (fed
+    # by its read) and one USD offer (not).
+    await db.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title)"
+        " VALUES ('p_jp', 'm', 'p', 'p_jp', 't')"
+    )
+    await _seed(db, "jp_ok", host="e.example.jp", market="JP", price=2400.0, currency="JPY", title="lotion",
+                attached="p_jp")
+    await db.execute(
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, merchant_effective_price)"
+        " VALUES ('o3', 'k3', 'p_jp', 'm', 'JPY', 2400), ('o4', 'k4', 'p_jp', 'm2', 'USD', 20)"
+    )
     # Not served (the market has no currency: DE), so not counted at all.
     await _seed(db, "de_unserved", host="f.example.de", market="DE", price=2880.0, title="gel")
 
     census = _census()
     conn = await asyncpg.connect(_url(), server_settings={"search_path": _SCHEMA})
     try:
-        summary, suspects = await census.collect(conn)
+        summary, suspects, sample = await census.collect(conn)
     finally:
         await conn.close()
 
     by_id = {s["id"]: s for s in suspects}
-    assert set(by_id) == {"eu_bad", "eu_bad_twin", "att_bad", "raw_bad", "usd_de"}
+    assert set(by_id) == {"eu_bad", "eu_bad_twin", "att_bad", "raw_bad", "usd_de", "usd_de_2", "usd_de_3", "usd_de_4"}
     assert by_id["eu_bad"]["peers"] == 1 and by_id["eu_bad"]["peer_median"] == 29.0
     assert {"variant_x100", "peer_x100"} <= set(by_id["eu_bad"]["flags"])
     assert by_id["eu_bad"]["variant_median"] == 28.8
@@ -234,13 +249,24 @@ async def test_the_census_runs_read_only_on_postgres(scoped_db):
     assert {"default_shaped", "tld_mismatch", "uncorroborated"} <= set(by_id["usd_de"]["flags"])
 
     totals = summary["totals"]
-    assert totals["served"] == 8
+    assert totals["served"] == 11
     assert totals["suspect"] == 4
-    assert totals["currency_likely_invented"] == 1
+    assert totals["currency_likely_invented"] == 4
     assert summary["by_market"]["FR"]["suspect"] == 4
     assert "DE" not in summary["by_market"]
     assert (summary["top_hosts"][0]["host"], summary["top_hosts"][0]["suspect"]) == ("beaute.example.de", 2)
     assert "beaute.example.de" in "\n".join(census.render(summary))
+
+    de_urls = sample[0].pop("urls")
+    assert len(de_urls) == census.SAMPLE_PER_HOST == 3
+    assert set(de_urls) <= {f"https://d.example.de/products/{i}" for i in ("usd_de", "usd_de_2", "usd_de_3", "usd_de_4")}
+    assert sample == [
+        {"host": "d.example.de", "market": "US", "served": 4, "default_shaped": 4,
+         "default_shaped_attached_offers": 0},
+        {"host": "e.example.jp", "market": "JP", "served": 1, "default_shaped": 1,
+         "default_shaped_attached_offers": 1, "urls": ["https://e.example.jp/products/jp_ok"]},
+    ]
+    assert totals["default_shaped"] == 5 and totals["default_shaped_attached_offers"] == 1
 
 
 @needs_pg

@@ -89,8 +89,12 @@ CASES = [
     # ...refused when the hint names THIS separator as the decimal: three decimals is no price
     ("1.234", "USD", ".", None, AMBIGUOUS_SEPARATOR),
     ("1,234", "EUR", ",", None, AMBIGUOUS_SEPARATOR),
-    # ...unless the currency really has three decimals
+    # ...unless the currency really has three decimals, or the third decimal is padding
     ("1.234", "KWD", ".", 1.234, PARSED),
+    ("28.000", "USD", ".", 28.0, PARSED),  # a USD page's zero-padded price
+    ("1.230", "USD", ".", 1.23, PARSED),
+    ("1,000", "EUR", ",", 1.0, PARSED),
+    ("28.000", None, None, None, AMBIGUOUS_SEPARATOR),  # padding or thousands: no hint, no read
     # a glyph and the page hint disagree -> no agreed signal -> refused
     ("¥2,400", "CNY", ",", None, AMBIGUOUS_SEPARATOR),
     # the structure wins over a hint when the structure decides
@@ -277,6 +281,13 @@ def test_the_shopify_money_format_decides_an_ambiguous_price() -> None:
     assert out["price_amount"] == pytest.approx(1234.0)
 
 
+def test_an_unambiguous_currency_is_a_signal_on_its_own() -> None:
+    assert _extract(_page(og_price="1,234", og_currency="USD"))["price_amount"] == pytest.approx(1234.0)
+    assert _extract(_page(og_price="1.234", og_currency="SEK"))["price_amount"] == pytest.approx(1234.0)
+    # EUR says nothing, so the same text is refused
+    assert _extract(_page(og_price="1,234", og_currency="EUR"))["price_amount"] is None
+
+
 def test_og_locale_is_a_signal_too() -> None:
     out = _extract(_page(og_locale="fr_FR", og_price="2.400", og_currency="EUR"))
     assert out["price_amount"] == pytest.approx(2400.0)
@@ -302,6 +313,11 @@ def test_a_json_ld_number_is_not_re_read_as_text() -> None:
     assert out["price_amount"] == pytest.approx(1.234)
     out = _extract(_page(lang="de", jsonld=_product(28.8)))
     assert out["price_amount"] == pytest.approx(28.8)
+    # the case where it matters: on a `,` page the TEXT "1.234" is refused (spec vs page), the
+    # NUMBER 1.234 is simply 1.234
+    out = _extract(_page(lang="de", jsonld=_product(1.234)))
+    assert out["price_amount"] == pytest.approx(1.234)
+    assert _extract(_page(lang="de", jsonld=_product("1.234")))["price_amount"] is None
 
 
 def test_a_json_ld_comma_price_reads_right_and_so_do_its_variants() -> None:
@@ -324,8 +340,10 @@ def test_a_refused_variant_price_is_counted_and_not_exact() -> None:
 
 def test_the_page_signals_reach_the_variant_prices_too() -> None:
     """The refresh writes per-variant prices from this list, so they need the same signals."""
-    out = _extract(_page(lang="de", jsonld=_product("1.234")))
-    assert [v["price_amount"] for v in out["variants"]] == [pytest.approx(1234.0)]
+    # Without the page's `de`, JSON-LD's own "." rule alone would read this as 28.00.
+    out = _extract(_page(lang="de", jsonld=_product("28.000")))
+    assert out["variants"][0]["price_amount"] is None
+    assert out["variant_census"]["price_refused"] == 1
     skus = [{"id": "a", "size": "30 ml", "price_with_currency_code": "1.234 EUR"}]
     out = _extract(_page(lang="de", data_attr=skus))
     assert out["variants"][0]["price_amount"] == pytest.approx(1234.0)
@@ -345,6 +363,22 @@ def test_offer_and_meta_currencies_are_read_not_passed_through() -> None:
 def test_a_minus_sign_before_the_number_is_negative_not_positive() -> None:
     assert parse_crawled_price("\u221228,80").status == NEGATIVE
     assert parse_crawled_price("EUR -28,80").status == NEGATIVE
+
+
+def test_json_ld_is_read_by_its_spec_and_must_agree_with_the_page() -> None:
+    """schema.org: JSON-LD `price` uses "." as the decimal point. On a `,`-locale page the spec
+    and the page disagree about "28.000" (28.00 by the spec, 28000 by the page), so it is refused;
+    reading it by the page alone would put a 28 EUR serum at 28000."""
+    de = _extract(_page(lang="de", jsonld=_product("28.000")))
+    assert de["price_amount"] is None
+    assert de["price_read"]["status"] == AMBIGUOUS_SEPARATOR
+    us = _extract(_page(lang="en", jsonld=_product("28.000", "USD")))
+    assert us["price_amount"] == pytest.approx(28.0)
+    # a meta tag carries the shop's own format, so the page's locale alone decides it
+    meta = _extract(_page(lang="de", og_price="1.234", og_currency="EUR"))
+    assert meta["price_amount"] == pytest.approx(1234.0)
+    # structure still wins for JSON-LD text that breaks the spec unambiguously
+    assert _extract(_page(lang="de", jsonld=_product("28,80")))["price_amount"] == pytest.approx(28.8)
 
 
 def test_a_refused_json_ld_price_falls_back_to_the_meta_tag() -> None:
@@ -552,7 +586,8 @@ def test_the_batch_counts_unreadable_prices_by_reason(monkeypatch: pytest.Monkey
     ]
     ids = [f"eps_{i}" for i in range(len(rows))]
     monkeypatch.setattr(err, "get_external_referral_refresh_candidate_seed_ids", lambda *a, **k: asyncio.sleep(0, result=ids))
-    monkeypatch.setattr(err, "_fetch_refresh_candidate_hosts", lambda _ids: asyncio.sleep(0, result={}))
+    hosts = {"eps_0": "a.example.de", "eps_1": "b.example.com", "eps_2": "b.example.com", "eps_3": "c.example"}
+    monkeypatch.setattr(err, "_fetch_refresh_candidate_hosts", lambda _ids: asyncio.sleep(0, result=hosts))
     scripted = dict(zip(ids, rows))
 
     async def fake_refresh(seed_id, **kwargs):
@@ -562,6 +597,31 @@ def test_the_batch_counts_unreadable_prices_by_reason(monkeypatch: pytest.Monkey
     assert summary["price_skipped_unreadable"] == 3
     assert summary["price_unreadable_reasons"] == {AMBIGUOUS_SEPARATOR: 1, "currency_unread": 2}
     assert summary["price_unavailable"] == 1
+    assert list(summary["price_unreadable_top_hosts"].items()) == [("b.example.com", 2), ("a.example.de", 1)]
+
+
+def test_the_job_prints_one_prefixed_price_line(monkeypatch, capsys):
+    """Night one must be observable: the summary dump is multi-line and module INFO is dropped
+    in prod, so the price outcomes get one `PRICE_REFRESH {json}` line (textPayload)."""
+    import jobs.external_referral_refresh as job
+
+    summary = {
+        "status": "success", "price_changed": 4, "price_skipped_unreadable": 3,
+        "price_unreadable_reasons": {"currency_unread": 3},
+        "price_unreadable_top_hosts": {"b.example.com": 3}, "unrelated": "x",
+    }
+    monkeypatch.setattr(job, "run_daily_external_referral_refresh", lambda **kwargs: asyncio.sleep(0, result=summary))
+    monkeypatch.setattr(job.database, "connect", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(job.database, "disconnect", lambda: asyncio.sleep(0))
+    monkeypatch.setattr("sys.argv", ["external_referral_refresh", "--limit", "1"])
+    assert job.main() == 0
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("PRICE_REFRESH ")]
+    assert len(lines) == 1
+    line = json.loads(lines[0][len("PRICE_REFRESH "):])
+    assert line["price_skipped_unreadable"] == 3
+    assert line["price_unreadable_reasons"] == {"currency_unread": 3}
+    assert line["price_unreadable_top_hosts"] == {"b.example.com": 3}
+    assert line["price_changed"] == 4 and "unrelated" not in line
 
 
 # --------------------------------------------------------------------------------------------

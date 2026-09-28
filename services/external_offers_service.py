@@ -174,8 +174,14 @@ class PriceSignals:
     money_format: Optional[str] = None
     locale: Optional[str] = None
 
-    def hint_for(self, currency: Optional[str]) -> Optional[str]:
-        return agreed_hint((self.money_format, self.locale, decimal_hint_from_currency(currency)))
+    def hint_for(self, currency: Optional[str], *, jsonld: bool = False) -> Optional[str]:
+        # JSON-LD adds the schema.org rule ("use '.' ... to indicate a decimal point") as one
+        # more signal that must agree. Without it, a German page's spec-conforming `"28.000"`
+        # would read as 28000 on the page's `,` locale; with it, the two disagree and it is
+        # refused. Meta tags get no such signal: EU themes print the shop's own format there.
+        return agreed_hint(
+            (self.money_format, self.locale, decimal_hint_from_currency(currency), "." if jsonld else None)
+        )
 
 
 NO_SIGNALS = PriceSignals()
@@ -195,7 +201,9 @@ def _page_price_signals(p: "_MetaParser", html: str) -> PriceSignals:
     return PriceSignals(money_format=agreed_hint(formats), locale=agreed_hint(locales))
 
 
-def _read_price(raw: Any, currency: Optional[str], signals: PriceSignals) -> Tuple[Optional[float], str]:
+def _read_price(
+    raw: Any, currency: Optional[str], signals: PriceSignals, *, jsonld: bool = False
+) -> Tuple[Optional[float], str]:
     """(amount, status) for one crawled price, read with the page's own separator signals.
 
     Replaces `_parse_price`, which kept digits and dots and dropped everything else: "28,80"
@@ -203,7 +211,7 @@ def _read_price(raw: Any, currency: Optional[str], signals: PriceSignals) -> Tup
     """
     if not _has_price_raw(raw):
         return None, "empty"
-    read = parse_crawled_price(raw, currency=currency, decimal_hint=signals.hint_for(currency))
+    read = parse_crawled_price(raw, currency=currency, decimal_hint=signals.hint_for(currency, jsonld=jsonld))
     return read.amount, read.status
 
 
@@ -520,7 +528,7 @@ def _offer_variants_from_node(
                 title = size_like
 
         price_raw, currency = _offer_price_and_currency(offer)
-        price_amount, price_status = _read_price(price_raw, currency, signals)
+        price_amount, price_status = _read_price(price_raw, currency, signals, jsonld=True)
         availability_raw = offer.get("availability") or item.get("availability")
         availability = _availability_from_raw(str(availability_raw)) if availability_raw else "unknown"
 
@@ -1491,13 +1499,13 @@ def _read_product_price(
         attempts.append(("meta", meta_price, meta_currency or jsonld.get("currency")))
     first_refusal: Optional[Dict[str, Any]] = None
     for source, raw, cur in attempts:
-        amount, status = _read_price(raw, cur, signals)
+        amount, status = _read_price(raw, cur, signals, jsonld=source == "jsonld")
         outcome = {
             "amount": amount,
             "source": source,
             "raw": str(raw)[:64],
             "status": status,
-            "decimal_hint": signals.hint_for(cur),
+            "decimal_hint": signals.hint_for(cur, jsonld=source == "jsonld"),
         }
         # `amount` falsy, not None: as the old `_parse_price(jsonld) or _parse_price(meta)` did, a
         # 0 falls through to the meta tag and, with nothing after it, is no amount at all (a 0 is

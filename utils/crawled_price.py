@@ -15,7 +15,9 @@ and by the page's signals only when it does not:
     reading.
   * one kind, once, followed by exactly three digits ("1,234", "2.400"): AMBIGUOUS. It is a
     group separator for a zero-decimal currency (JPY, KRW, ...), and otherwise only a
-    `decimal_hint` decides it. With no hint, or with signals that disagree, it is REFUSED.
+    `decimal_hint` decides it. With no hint, or with signals that disagree, it is REFUSED. When
+    the hint names it the DECIMAL separator, it is read only for a three-decimal currency or a
+    zero-padded price ("28.000" -> 28.00).
 
 Spaces, NBSP, narrow NBSP, thin spaces and apostrophes are group separators only when three
 digits follow ("2 400,00", "1'234.56"). A text holding two numbers ("28,80 EUR / 100 ml",
@@ -205,9 +207,10 @@ def parse_crawled_price(
         elif code in ZERO_DECIMAL_CURRENCIES:
             decimal_sep = ""
         elif decimal_hint == sep:
-            # The page says this separator is the decimal one, and three decimals is a price only
-            # in a three-decimal currency. Anywhere else the hint and the text disagree.
-            if code not in THREE_DECIMAL_CURRENCIES:
+            # The page says this separator is the decimal one. Three decimals is a price in a
+            # three-decimal currency, or a two-decimal price padded with a zero ("28.000" on a
+            # USD page is 28.00). Anything else ("1.234" on that page) disagrees with the hint.
+            if code not in THREE_DECIMAL_CURRENCIES and not token.endswith("0"):
                 return PriceRead(None, AMBIGUOUS_SEPARATOR)
             decimal_sep = sep
         elif decimal_hint in (".", ","):
