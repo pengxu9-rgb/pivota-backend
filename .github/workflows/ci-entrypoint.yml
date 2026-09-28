@@ -60,7 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     # Generous: it waits for the slowest real gate. The sweep is ~2min, the
     # audit gate longer. Well under the cost of a gate that cannot block.
-    timeout-minutes: 40
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
         with:
@@ -322,7 +322,7 @@ jobs:
           # `timed out waiting` and HARD-BLOCK a PR whose gate then passes. The
           # durable fix is to give those gates an explicit `timeout-minutes`,
           # not to keep raising this number toward 360.
-          DEADLINE = time.time() + 35 * 60
+          DEADLINE = time.time() + 50 * 60
           while True:
               runs = [r for doc in gh_json(f'repos/{REPO}/commits/{SHA}/check-runs?per_page=100')
                       for r in doc.get('check_runs', [])]

@@ -154,7 +154,10 @@ jobs:
     # #2213's sweep took 12m30s; #2214's larger suite hit the 15m job timeout
     # before finishing. Keep the full suite and its floor checks, with room for
     # the added cart-link cases and runner variance.
-    timeout-minutes: 25
+    # 2026-09-28: green runs took 18-23 min with several PRs in flight, and #2421
+    # and #2434 were cancelled at 25 (79% and 95% done, no failures). A cancelled
+    # sweep on main also blocks deploy-prod, which gates on it.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
