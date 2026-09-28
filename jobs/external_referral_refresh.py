@@ -19,7 +19,15 @@ only when someone rebuilds and updates the job.
 
 Usage:
 
-    python3 -m jobs.external_referral_refresh --limit 500 [--budget-seconds 3300]
+    python3 -m jobs.external_referral_refresh --limit 500 [--budget-seconds 3300] [--host-concurrency 4]
+
+COVERAGE, measured 2026-09-27 (image 8f7605b1e, serial): 3,282 rows in 3,300s, 2,220 origin
+reads, a ~12-day cycle over ~23.8k active seeds. The launch target is every SERVED seed re-read
+within 3 days. Three levers, all in this job: the queue puts served, stale seeds first and skips
+suppressed, quarantined and retired ones (`get_external_referral_refresh_candidate_seed_ids`); a
+host that gives no answer five rows in a row stops costing rows (`_host_unreachable_trip`); and
+`--host-concurrency` reads several hosts at once while each host still sees one request at a
+time, paced by `crawl_politeness` as before.
 """
 from __future__ import annotations
 
@@ -71,12 +79,16 @@ async def _refresh_unbounded(seed_id: str) -> Dict[str, Any]:
 
 
 async def run_daily_external_referral_refresh(
-    *, limit: int = 500, budget_seconds: Optional[float] = None
+    *,
+    limit: int = 500,
+    budget_seconds: Optional[float] = None,
+    host_concurrency: Optional[int] = None,
 ) -> Dict[str, Any]:
     return await run_external_referral_refresh_batch(
         refresh_seed_by_id=_refresh_unbounded,
         limit=limit,
         budget_seconds=budget_seconds,
+        host_concurrency=host_concurrency,
     )
 
 
@@ -94,6 +106,15 @@ def main() -> int:
             "0 disables it."
         ),
     )
+    parser.add_argument(
+        "--host-concurrency",
+        type=int,
+        default=None,
+        help=(
+            "Hosts read at once, never two rows of one host at a time (1 = serial). Defaults to "
+            "EXTERNAL_REFERRAL_REFRESH_HOST_CONCURRENCY, then 1. Clamped to [1, 8]."
+        ),
+    )
     args = parser.parse_args()
 
     # THE POOL DOES NOT EXIST UNTIL SOMEONE OPENS IT. Inside the API process the lifespan hook
@@ -107,7 +128,9 @@ def main() -> int:
         await database.connect()
         try:
             return await run_daily_external_referral_refresh(
-                limit=args.limit, budget_seconds=args.budget_seconds
+                limit=args.limit,
+                budget_seconds=args.budget_seconds,
+                host_concurrency=args.host_concurrency,
             )
         finally:
             await database.disconnect()
