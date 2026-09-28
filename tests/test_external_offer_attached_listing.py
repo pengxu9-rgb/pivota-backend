@@ -201,10 +201,37 @@ class FakeDB:
         self.executed.append(str(sql))
 
 
-def _sync(monkeypatch, fake) -> Dict[str, Any]:
+def _sync(monkeypatch, fake, *, vouched=True) -> Dict[str, Any]:
     monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
     monkeypatch.setattr(mod, "database", fake)
-    return asyncio.run(mod.sync_offer_for_seed(fake.seed["id"]))
+    return asyncio.run(mod.sync_offer_for_seed(fake.seed["id"], project_attached_listing=vouched))
+
+
+def test_a_caller_that_did_not_re_read_the_price_never_stamps_the_listing(monkeypatch):
+    """seed_data_writer's merge and the mirror reconciler rewrite a seed without reading its
+    price. `updated_at = NOW()` on the canonical's row would claim a read nobody made."""
+    fake = FakeDB(seed=_seed(), offers=[_offer("of_canon")])
+    assert _sync(monkeypatch, fake, vouched=False)["status"] == "no_mirror_product"
+    assert fake.updates == []
+
+
+def test_the_refresh_hook_vouches_for_the_price(monkeypatch):
+    import routes.employee_products as ep
+
+    seen = {}
+
+    async def fake_sync(seed_id, **kwargs):
+        seen.update(kwargs)
+        return {"status": "synced", "target": "attached"}
+
+    async def fake_pdp(**kwargs):
+        return "refreshed"
+
+    monkeypatch.setattr("services.external_offer_dual_write.dual_write_enabled", lambda: True)
+    monkeypatch.setattr("services.external_offer_dual_write.sync_offer_for_seed", fake_sync)
+    monkeypatch.setattr("services.seed_data_writer.refresh_agent_pdp_view_for_seed", fake_pdp)
+    asyncio.run(ep._project_refreshed_seed_to_serving_surfaces("eps_1"))
+    assert seen == {"project_attached_listing": True}
 
 
 def test_an_attached_seed_without_a_mirror_writes_its_listing_row(monkeypatch):
@@ -257,7 +284,7 @@ def test_the_refresh_hook_reports_the_attached_write_and_row_skips(monkeypatch):
     """Through the real helper the refresh calls, so the counters are the ones the batch sums."""
     import routes.employee_products as ep
 
-    async def fake_sync(seed_id):
+    async def fake_sync(seed_id, **kwargs):
         return {"seed_id": seed_id, "status": "synced", "target": "attached",
                 "offers_written": 1, "offer_skips": {"variant_not_re_read": 2}}
 
@@ -276,7 +303,7 @@ def test_the_refresh_hook_reports_the_attached_write_and_row_skips(monkeypatch):
 def test_the_refresh_hook_marks_a_structural_skip(monkeypatch):
     import routes.employee_products as ep
 
-    async def fake_sync(seed_id):
+    async def fake_sync(seed_id, **kwargs):
         return {"seed_id": seed_id, "status": "no_listing_offer"}
 
     async def fake_pdp(**kwargs):

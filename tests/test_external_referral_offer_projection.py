@@ -26,7 +26,7 @@ import services.external_referral_readiness as err
 # --------------------------------------------------------------------------- projection
 
 def _arm(monkeypatch, calls, *, sync_status="synced"):
-    async def fake_sync(seed_id):
+    async def fake_sync(seed_id, **kwargs):
         calls.append(f"offers:{seed_id}")
         return {"status": sync_status}
 
@@ -116,7 +116,7 @@ def test_the_projection_never_breaks_the_refresh_that_produced_a_good_price(monk
     A cache projection that raises must not turn a successful price read into a failed refresh —
     the same isolation `agent_pdp_view_assembler` documents for its own writes.
     """
-    async def boom_sync(seed_id):
+    async def boom_sync(seed_id, **kwargs):
         raise RuntimeError("offers table on fire")
 
     async def boom_pdp(*, seed_id, proposal_id, refresh_source):
@@ -131,7 +131,7 @@ def test_the_projection_never_breaks_the_refresh_that_produced_a_good_price(monk
 
 def test_an_empty_seed_id_projects_nothing(monkeypatch):
     called = []
-    async def fake_sync(seed_id):
+    async def fake_sync(seed_id, **kwargs):
         called.append(seed_id)
     monkeypatch.setattr("services.external_offer_dual_write.dual_write_enabled", lambda: True)
     monkeypatch.setattr("services.external_offer_dual_write.sync_offer_for_seed", fake_sync)
@@ -443,7 +443,7 @@ def test_the_pdp_half_reports_its_own_outcome(monkeypatch):
     raising rebuild left `projected: 1` and no skip."""
     import asyncio as _asyncio
 
-    async def fake_sync(seed_id):
+    async def fake_sync(seed_id, **kwargs):
         return {"status": "synced"}
 
     async def skipped_pdp(**kw):
@@ -471,7 +471,7 @@ def test_projection_seconds_include_the_pdp_rebuild(monkeypatch):
     and reports a budget cost that is not there."""
     import asyncio as _asyncio
 
-    async def fake_sync(seed_id):
+    async def fake_sync(seed_id, **kwargs):
         return {"status": "synced"}
 
     async def slow_pdp(**kw):

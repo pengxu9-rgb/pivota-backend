@@ -534,7 +534,9 @@ async def sync_attached_listing_offers(seed: Dict[str, Any]) -> Dict[str, Any]:
     return {**result, "status": "listing_offer_not_written"}
 
 
-async def sync_offer_for_seed(seed_id: str) -> Dict[str, Any]:
+async def sync_offer_for_seed(
+    seed_id: str, *, project_attached_listing: bool = False
+) -> Dict[str, Any]:
     """Re-project one external seed's catalog_offers row from its current state.
 
     Best-effort + idempotent + NEVER raises — it rides on seed-write paths and
@@ -544,6 +546,14 @@ async def sync_offer_for_seed(seed_id: str) -> Dict[str, Any]:
     with a mirror upserts the mirror's offer; an attached seed without one prices
     its listing's existing rows on the canonical (`sync_attached_listing_offers`).
     Returns a small status dict.
+
+    `project_attached_listing` is the caller vouching that the seed's price is
+    CURRENT: re-read from the served page this run, or set by an authorized
+    edit (`routes/employee_products._project_refreshed_seed_to_serving_surfaces`
+    is both). The attached lane stamps the listing's rows `updated_at = NOW()`,
+    and a caller that merely rewrote seed_data (seed_data_writer's merge, the
+    mirror reconciler) would claim a freshness nobody earned, so those keep the
+    mirror-only behaviour: `no_mirror_product` for an attached seed.
     """
     if not seed_id:
         return {"seed_id": seed_id, "status": "no_seed_id"}
@@ -564,7 +574,7 @@ async def sync_offer_for_seed(seed_id: str) -> Dict[str, Any]:
 
         mirror = await resolve_mirror_product(seed_id)
         if not mirror:
-            if seed.get("attached_product_key"):
+            if project_attached_listing and seed.get("attached_product_key"):
                 # Attached to a canonical another lane built (the enrichment agent's `ext:`
                 # products): there is no mirror to upsert, but the canonical carries this
                 # listing's offer rows, and those are what the PDP reads.

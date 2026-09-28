@@ -4931,7 +4931,9 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
             OFFER_SYNC_WRITTEN_STATUSES,
         )
 
-        outcome = await sync_offer_for_seed(seed_id)
+        # Every caller of this helper vouches for the seed's price (a re-read, or an employee's
+        # edit), which is what lets the attached lane stamp the canonical's listing rows fresh.
+        outcome = await sync_offer_for_seed(seed_id, project_attached_listing=True)
         status = str((outcome or {}).get("status") or "").strip().lower()
         # Derived from the writer, never restated here. The first version guessed
         # {"synced","inserted","updated","ok"} — three statuses it cannot emit — and the tests

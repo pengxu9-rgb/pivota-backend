@@ -151,7 +151,7 @@ async def _sync(monkeypatch, db):
 
     monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
     monkeypatch.setattr(mod, "database", db)
-    return await mod.sync_offer_for_seed(SEED_ID)
+    return await mod.sync_offer_for_seed(SEED_ID, project_attached_listing=True)
 
 
 async def test_the_listing_rows_take_the_re_read_prices_and_nothing_else_moves(scoped_db, monkeypatch):
