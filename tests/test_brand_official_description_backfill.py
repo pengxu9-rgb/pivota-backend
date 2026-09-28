@@ -1292,3 +1292,55 @@ def test_two_rows_behind_ONE_page_are_not_a_template():
 def test_a_suppressed_row_is_never_in_the_population():
     """Filling a withdrawn row would move it to 'published' (mintree.us: 160 of 160 suppressed)."""
     assert "suppressed_at IS NULL" in bf._SELECT_ROWS
+
+
+
+def test_a_sibling_row_whose_title_is_not_in_the_text_cannot_carry_the_template():
+    """Review #2429 A: two rows behind one page; only one row's title appears in the value. The
+    value is judged against every name its product goes by, as mechanism 3 is."""
+    cands = {"pk1": _PERFUMANIA.format("CH Birds of Paradise Cologne"),
+             "pk2": _PERFUMANIA.format("CH Birds of Paradise Cologne"),
+             "o1": _PERFUMANIA.format("Pride Art of Arabia I Cologne"),
+             "o2": _PERFUMANIA.format("Eclat De Nuit EDP")}
+    titles = {"pk1": "CH Birds of Paradise Cologne", "pk2": "Carolina Herrera CH Birds of Paradise Cologne",
+              "o1": "Pride Art of Arabia I Cologne", "o2": "Eclat De Nuit EDP"}
+    handles = {"pk1": "ch-birds", "pk2": "ch-birds", "o1": "pride", "o2": "eclat"}
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles, handles=handles) == {}
+
+
+def test_an_edition_whose_title_is_not_in_the_text_cannot_carry_the_template():
+    """Review #2429 B: a base and its [Special Set] edition share a value naming the base; an
+    unrelated page shares the template. Mechanism 2 admits the pair as one family; 4 must not."""
+    base, edition = "New Classic Glaze Lipstick", "[Special Set] New Classic Glaze Lipstick"
+    cands = {"a": _PERFUMANIA.format(base), "b": _PERFUMANIA.format(base),
+             "z": _PERFUMANIA.format("Pride Art of Arabia I Cologne")}
+    titles = {"a": base, "b": edition, "z": "Pride Art of Arabia I Cologne"}
+    handles = {"a": "new-classic-glaze-lipstick", "b": "new-classic-glaze-lipstick-special-set", "z": "pride"}
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles, handles=handles) == {}
+
+
+def test_the_storefront_title_catches_a_template_the_catalog_title_misses():
+    """Review #2429 D: the catalog row's title carries a size the theme does not render; the
+    storefront's own title (from /products.json) is the string the template interpolates."""
+    cands, store, handles = _templated(_PERFUMANIA, ["CH Birds of Paradise Cologne", "Pride Art of Arabia I Cologne"])
+    catalog = {pk: f"{t} 3.4 oz" for pk, t in store.items()}
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=catalog, handles=handles) == cands  # blind
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=catalog, handles=handles, store_titles=store) == {}
+
+
+def test_the_feed_loader_keeps_the_storefront_titles(monkeypatch):
+    feed = [{"handle": "h1", "title": "CH Birds of Paradise Cologne", "body_html": "<p>x</p>"},
+            {"handle": "h2", "body_html": "<p>y</p>"}]
+
+    async def _feed(domain, max_products=None, **k):
+        return feed
+
+    monkeypatch.setattr(bf, "fetch_shopify_products", _feed)
+    body_map, _ = asyncio.run(bf._load_body_map("perfumania.com", 800))
+    assert body_map == {"h1": "x", "h2": "y"}
+    assert body_map.titles == {"h1": "CH Birds of Paradise Cologne"}
+
+
+def test_the_write_never_publishes_a_row_suppressed_mid_run():
+    """Review #2429: a paced --pdp-fallback run is long; the UPDATE re-checks suppression."""
+    assert "suppressed_at IS NULL" in bf._UPDATE_ROW

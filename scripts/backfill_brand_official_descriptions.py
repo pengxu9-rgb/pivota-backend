@@ -95,12 +95,16 @@ _SELECT_ROWS = """
       AND length(coalesce(description, '')) < 50
 """
 
+# `suppressed_at IS NULL` here too, not only in _SELECT_ROWS: a --pdp-fallback run paces merchant
+# requests per host and can run long, and a row suppressed between the SELECT and this write must
+# not be moved to 'published' (review #2429). Such a row is counted as filled; it is not written.
 _UPDATE_ROW = """
     UPDATE catalog_products
        SET description = :description,
            pdp_lifecycle_stage = :stage,
            updated_at = NOW()
      WHERE product_key = :product_key
+       AND suppressed_at IS NULL
 """
 
 def handle_from_url(canonical_url: str) -> tuple[str, str]:
@@ -136,6 +140,17 @@ async def _reconnect() -> None:
     raise RuntimeError("could not re-establish DB connection")
 
 
+class _FeedBodies(dict):
+    """handle -> body text, and `titles`: handle -> the storefront's OWN title for that product.
+
+    The title is the string a Liquid SEO template drops into the meta description, so it is what
+    mechanism 4 must cut out; the catalog row's title can differ (a size suffix, a brand prefix).
+    Carried on the map rather than returned beside it so a caller that only wants bodies is
+    unchanged."""
+
+    titles: Dict[str, str] = {}
+
+
 async def _load_body_map(domain: str, max_products: int) -> Tuple[Dict[str, str], bool]:
     # fetch_shopify_products swallows errors into [] — a transient network
     # failure would silently mark a whole domain "not_in_feed" (4 domains, 292
@@ -164,10 +179,15 @@ async def _load_body_map(domain: str, max_products: int) -> Tuple[Dict[str, str]
         len(products) >= max_products
         or (len(products) % 250 == 0 and len(products) < max_products)
     )
-    body_map = {
-        str(p.get("handle") or "").strip(): body_html_to_text(p.get("body_html"))
+    body_map = _FeedBodies(
+        (str(p.get("handle") or "").strip(), body_html_to_text(p.get("body_html")))
         for p in products
         if isinstance(p, dict) and p.get("handle")
+    )
+    body_map.titles = {
+        str(p.get("handle") or "").strip(): str(p.get("title") or "").strip()
+        for p in products
+        if isinstance(p, dict) and p.get("handle") and p.get("title")
     }
     return body_map, truncated
 
@@ -429,6 +449,7 @@ def drop_shared_boilerplate(
     blurb_verified: bool = True,
     handles: Optional[Dict[str, str]] = None,
     titles: Optional[Dict[str, str]] = None,
+    store_titles: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
     """Keep only the PDP meta descriptions that are about ONE product. Pure; no I/O.
 
@@ -456,8 +477,11 @@ def drop_shared_boilerplate(
       3. A TITLE ECHO from a themed name-tag template -- see `_is_title_echo`. Per-product, not
          the blurb, invisible to both of the above.
       4. A TITLE TEMPLATE -- see `_title_template`: storefront-wide SEO copy with each product's
-         name dropped in. Repetition of the value WITH ITS OWN TITLE CUT OUT, across pages that
-         are not one product's editions (the same exception as 2).
+         name dropped in. Repetition of the value WITH A TITLE CUT OUT, across pages that are not
+         one product's editions (the same exception as 2). Judged, like 3, against EVERY name the
+         value's product goes by -- the catalog titles of every row behind it and the storefront's
+         own title (`store_titles`, the string the theme actually interpolates) -- so a sibling
+         row whose title does not appear in the text cannot carry the template through (#2429).
 
     THE REPETITION UNIT IS THE PRODUCT PAGE, NOT THE ROW. Two catalog rows can share one
     canonical_url; they fetch the same PDP and produce the same value, and counting rows would
@@ -493,6 +517,10 @@ def drop_shared_boilerplate(
     """
     handles = handles or {}
     titles = titles or {}
+    store_titles = store_titles or {}
+
+    def names(pk: str) -> List[str]:
+        return [t for t in (titles.get(pk), store_titles.get(pk)) if t]
     # Count DISTINCT product pages per value, so one product behind two rows is not "shared".
     # Each page keeps its (handle, title) so a shared value can be asked whether its pages are
     # editions of ONE product.
@@ -502,16 +530,22 @@ def drop_shared_boilerplate(
     # echo judged only when it happened to sort first -- an order-dependent verdict, which the
     # #2097 determinism invariant forbids.
     all_titles: Dict[str, set] = {}
-    # (4) the same census over each value with its own title cut out.
+    # (4) the same census over each value with each of its product's names cut out.
     templates: Dict[str, Dict[str, tuple]] = {}
     for pk, v in candidates.items():
         h = handles.get(pk, pk)
         n = _norm_copy(v)
         seen.setdefault(n, {}).setdefault(h, (h, titles.get(pk)))
-        all_titles.setdefault(n, set()).add(titles.get(pk) or "")
-        tpl = _title_template(v, titles.get(pk))
-        if tpl is not None:
-            templates.setdefault(tpl, {}).setdefault(h, (h, titles.get(pk)))
+        all_titles.setdefault(n, set()).update(names(pk) or [""])
+        for name in names(pk):
+            tpl = _title_template(v, name)
+            if tpl is not None:
+                templates.setdefault(tpl, {}).setdefault(h, (h, titles.get(pk)))
+
+    def is_template(v: str, name: str) -> bool:
+        tpl = _title_template(v, name)
+        pages = templates.get(tpl) if tpl is not None else None
+        return bool(pages) and len(pages) > 1 and not _is_one_product_family(pages)
     # A blurb under the floor is treated as ABSENT, not as an armed comparison: no candidate that
     # cleared the floor can equal it, so it would disarm the refusal below while guarding nothing.
     # An UNVERIFIED blurb is the same hazard through a different door -- see `blurb_arming`.
@@ -522,8 +556,7 @@ def drop_shared_boilerplate(
         n = _norm_copy(v)
         if len(seen[n]) > 1 and not _is_one_product_family(seen[n]):
             continue                               # (2) shared across UNRELATED product pages
-        tpl = _title_template(v, titles.get(pk))
-        if tpl is not None and len(templates[tpl]) > 1 and not _is_one_product_family(templates[tpl]):
+        if any(is_template(v, t) for t in all_titles[n] if t):
             continue                               # (4) one template, each page's name dropped in
         # (1) THE EXACT MATCH FIRES WHATEVER THE DOOR. An unverified blurb that DOES equal a
         # candidate has proved itself on that candidate; refusing to use it would throw away the
@@ -709,6 +742,8 @@ async def run(apply: bool, domains_filter: List[str], max_products: int,
                 blurb_verified=blurb_verified,
                 handles={str(r["product_key"]): r["_handle"] for r in drows},
                 titles={str(r["product_key"]): r.get("title") for r in drows},
+                store_titles={str(r["product_key"]): getattr(body_map, "titles", {}).get(r["_handle"])
+                              for r in drows},
             )
             boilerplate = len(candidates) - len(kept)
             totals["boilerplate"] += boilerplate
