@@ -120,14 +120,23 @@ def host_backoff_tripped(consecutive_blocks: int, trip: int) -> bool:
 # about the product. `_degraded_reason_bucket` names them.
 _UNREACHABLE_REASON_BUCKETS = frozenset({"connection", "timeout", "dns", "tls"})
 
-# A host that gave no answer this many rows IN A ROW is skipped for the rest of the run. 09-26/27:
-# 1,431 and 1,014 degraded rows were `connection`, most of them on ichibanm.com. But ichibanm is
-# FLAKY, not dead: the 2026-09-28 census read 990/1,850 of its rows on 09-26 and 284/496 on 09-27
-# (~55%), with the failures interleaved -- and it is the largest served host (2,284 seeds). The
-# trip has to tell that apart from a host that never answers. At a 45% failure rate a run of n
-# failures starts at any row with p ~ 0.45^n: 5 trips it after ~100 rows (it would read ~55 of its
-# seeds a night instead of ~990); 20 makes that ~6e-6 per row, and a truly dead host still costs
-# only 20 rows a night, one lane of several. `<= 0` disables.
+# A host that gave no answer this many rows IN A ROW is skipped for the rest of the run. `<= 0`
+# disables. It exists for hosts that truly never answer; it CANNOT tell those apart from our own
+# egress failing, and until 2026-09-28 almost every `connection` failure was our own egress.
+#
+# THE MEASURED CAUSE. `pivota-crawl-nat` ran on Cloud NAT defaults: 64 ports per VM, no dynamic
+# allocation, 120s TCP TIME_WAIT. `_fetch_html` opens a fresh connection per fetch, and most
+# storefronts sit behind Shopify's shared edge (23.227.38.x:443), which is ONE destination to NAT.
+# 64 ports / 120s = ~0.53 new connections a second to it. The serial loop asked ~1/s, so ~half
+# connected. That is ichibanm.com's "55% read", which an earlier version of this comment called
+# a flaky host. NAT DROPPED logs matched the refresh's connection failures one for one:
+# 1,431/1,431 on 09-26, 1,023/1,014 on 09-27, ~7,900/~7,650 on 09-28. On 09-28, four lanes pushed
+# ~3.7/s, and this breaker skipped 2,764 rows on 20 HEALTHY hosts (kissusa, tarte, holiholic, ...).
+# The NAT was widened on 09-28 (min 1024 / max 16384 ports, dynamic, 30s TIME_WAIT).
+#
+# 20, not 5, still stands, on the old arithmetic: at any interleaved failure rate f a false trip
+# costs ~f^n per row. Re-derive it from post-widening runs before relying on the breaker, or on
+# any per-host "unreachable" statistic measured before then.
 _HOST_UNREACHABLE_TRIP_DEFAULT = 20
 
 # Hosts read at once. 1 is the serial loop. Capped at 8: a host is never read by two workers at
@@ -1972,10 +1981,10 @@ async def run_external_referral_refresh_batch(
     # 429 breaker because the cause and the fix differ.
     unreachable_hosts: Dict[str, int] = {}
     unreachable_streak: Dict[str, int] = {}
-    # One error per no-answer host, URLs stripped: enough to tell a refused connection (our
-    # egress IP blocked) from a DNS or TLS failure without reading per-row logs. On 09-28 every
-    # top no-answer host of 09-26/27 (ichibanm.com 860+212 rows) answered a plain HEAD from outside
-    # the crawl egress.
+    # One error per no-answer host, URLs stripped: enough to tell a connection failure from a DNS or
+    # TLS one without reading per-row logs. "All connection attempts failed" on many hosts at once
+    # is our NAT (see _HOST_UNREACHABLE_TRIP_DEFAULT), not the hosts: every top no-answer host of
+    # 09-26/27 answered a plain HEAD from outside the crawl egress.
     unreachable_samples: Dict[str, str] = {}
     skipped_for_unreachable_host = 0
     # Per-host cost, measured around the refresh call: the fetch, the pacing wait it includes,
