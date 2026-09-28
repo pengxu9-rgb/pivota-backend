@@ -1650,10 +1650,11 @@ def test_the_checkout_tier_surface_gates_on_enforce_and_not_on_the_sweep_dial():
     assert "purchasability.is_sweep_enabled()" not in source
 
 
-async def _ensure_connected_tables() -> None:
+async def _ensure_connected_tables(undo: list) -> None:
     """`merchant_onboarding` and `products_cache` from the repo's own metadata; `merchant_stores`
     from main.py's startup DDL, which is the only place it is defined (its columns this job reads
-    are store_id / merchant_id / platform / name / domain / status)."""
+    are store_id / merchant_id / platform / name / domain / status). Whatever it creates or adds
+    is recorded in `undo` for `_restore`."""
     import sqlalchemy
     from db.database import metadata
     from db.merchant_onboarding import merchant_onboarding
@@ -1662,6 +1663,9 @@ async def _ensure_connected_tables() -> None:
     url = (os.getenv("DATABASE_URL") or "").replace("sqlite+aiosqlite://", "sqlite://").replace(
         "postgresql+asyncpg://", "postgresql://"
     )
+    for table in ("merchant_onboarding", "products_cache", "merchant_stores"):
+        if not await _table_exists(table):
+            undo.append(("table", table))
     engine = sqlalchemy.create_engine(url)
     metadata.create_all(engine, tables=[merchant_onboarding, products_cache], checkfirst=True)
     engine.dispose()
@@ -1673,6 +1677,65 @@ async def _ensure_connected_tables() -> None:
         "connected_at TIMESTAMP WITH TIME ZONE, created_at TIMESTAMP WITH TIME ZONE "
         "DEFAULT CURRENT_TIMESTAMP)"
     )
+    # THE DIALECT GATE SHARES ONE DATABASE ACROSS TEST FILES, and an earlier one
+    # (test_connection_layer_postgres.py) leaves a `merchant_stores` without `name` / `status`,
+    # which the IF NOT EXISTS above then keeps. Add what this lane's fixture writes.
+    await _ensure_columns(
+        "merchant_stores", ("merchant_id", "platform", "name", "domain", "status"), undo
+    )
+
+
+#: The columns the cart-mint lane reads, beyond `id`. Added one by one when missing: the dialect
+#: gate shares ONE database across test files, and some of them create `external_product_seeds`
+#: with a single `id` column.
+#:
+#: AND PUT BACK AFTERWARDS (`_restore`). Leaving a table or a column behind is pollution in the
+#: other direction: files after this one create `external_product_seeds` with IF NOT EXISTS and
+#: then insert rows with no `id` and read `seed_data` as JSONB, so a leftover TEXT `seed_data`
+#: or `id` PRIMARY KEY failed 39 of their tests in a local run of the whole gate.
+_SEED_TABLE_COLUMNS = (
+    "status", "domain", "market", "attached_product_key", "attached_variant_id",
+    "external_product_id", "destination_url", "canonical_url", "seller_ref", "seed_kind",
+    "seed_data",
+)
+
+
+async def _table_exists(table: str) -> bool:
+    try:
+        await database.fetch_all(f"SELECT 1 FROM {table} WHERE 1 = 0")
+        return True
+    except Exception:  # noqa: BLE001 — the probe's only job is to say "missing"
+        return False
+
+
+async def _ensure_columns(table: str, columns, undo: list) -> None:
+    """Add each missing column as TEXT, recording it in `undo`. A probe per column rather than an
+    information_schema read, so the same code works on both dialects."""
+    for column in columns:
+        try:
+            await database.fetch_all(f"SELECT {column} FROM {table} WHERE 1 = 0")
+        except Exception:  # noqa: BLE001 — the probe's only job is to say "missing"
+            await database.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+            undo.append(("column", table, column))
+
+
+async def _ensure_seed_table(undo: list) -> None:
+    if not await _table_exists("external_product_seeds"):
+        undo.append(("table", "external_product_seeds"))
+        await database.execute("CREATE TABLE external_product_seeds (id TEXT PRIMARY KEY)")
+    await _ensure_columns("external_product_seeds", _SEED_TABLE_COLUMNS, undo)
+
+
+async def _restore(undo: list) -> None:
+    """Leave the shared database's schema as this fixture found it: drop what it created, newest
+    first. A column added to a table this fixture also created goes with the table."""
+    dropped = set()
+    for item in reversed(undo):
+        if item[0] == "table":
+            await database.execute(f"DROP TABLE IF EXISTS {item[1]}")
+            dropped.add(item[1])
+        elif item[1] not in dropped:
+            await database.execute(f"ALTER TABLE {item[1]} DROP COLUMN {item[2]}")
 
 
 @pytest.fixture
@@ -1711,14 +1774,20 @@ async def _population(_db):
     )
     # The CONNECTED-STORE lane's tables, present and EMPTY, so the population above is exactly
     # the two allowlists' and that lane reads (not fails to read) nothing. `_connected` fills it.
-    await _ensure_connected_tables()
+    undo: list = []
+    await _ensure_connected_tables(undo)
     await database.execute("DELETE FROM merchant_stores")
     await database.execute("DELETE FROM merchant_onboarding")
+    # And the CART-MINT lane's: the seed table, present and EMPTY. `_cart_seeds` fills it.
+    await _ensure_seed_table(undo)
+    await database.execute("DELETE FROM external_product_seeds")
     yield
     await database.execute("DELETE FROM reap_agentic_eligibility")
     await database.execute("DELETE FROM tierb_cart_link_eligibility")
     await database.execute("DELETE FROM merchant_stores")
     await database.execute("DELETE FROM merchant_onboarding")
+    await database.execute("DELETE FROM external_product_seeds")
+    await _restore(undo)
 
 
 # ══ the sweep's catalog hint is matched canonically ═══════════════════════════════════════
@@ -2058,6 +2127,11 @@ async def test_the_ops_route_with_a_market_is_unchanged_apart_from_a_null_reason
     assert body["note"] == "a fresh positive fact from vantage 'worker'; the door may offer purchase"
 
 
+async def _no_cart_mint():
+    """The CART-MINT lane, read and empty — for the DB-free cases, which have no seed table."""
+    return sweep.CartMintLane(hosts={})
+
+
 async def test_the_sweep_skips_and_counts_a_row_with_an_unusable_market(monkeypatch):
     """DB-free: the two lanes are stubbed, so a value no allowlist table would accept ("USA",
     None) can still be fed through the population builder. None is swept as US; each is
@@ -2084,6 +2158,7 @@ async def test_the_sweep_skips_and_counts_a_row_with_an_unusable_market(monkeypa
 
     monkeypatch.setattr(ledger, "list_enabled_merchant_markets", _variant_lane)
     monkeypatch.setattr(sweep, "_rows", _cart_lane)
+    monkeypatch.setattr(sweep, "_cart_mint_lane", _no_cart_mint)
     monkeypatch.setattr(sweep.facts, "list_due", _nothing_due)
     monkeypatch.setattr(sweep, "_catalog_variant", _no_variant)
 
@@ -2114,6 +2189,7 @@ async def test_the_sweep_report_carries_the_market_unknown_count_and_logs_it_onc
 
     monkeypatch.setattr(ledger, "list_enabled_merchant_markets", _variant_lane)
     monkeypatch.setattr(sweep, "_rows", _cart_lane)
+    monkeypatch.setattr(sweep, "_cart_mint_lane", _no_cart_mint)
     monkeypatch.setattr(sweep.facts, "list_due", _nothing_due)
     monkeypatch.setattr(sweep.facts, "record_check", _no_write)
     monkeypatch.setattr(sweep, "_catalog_variant", _no_variant)
@@ -2293,3 +2369,410 @@ async def test_the_connected_lane_failure_is_counted_and_the_allowlists_still_sw
 ])
 def test_only_a_region_that_names_a_country_becomes_a_market(region, market):
     assert sweep._connected_market(region) == market
+
+
+# ══ the CART-MINT lane ═════════════════════════════════════════════════════════════════════
+#
+# offers.resolve and the product-card lanes mint an external seed's prefilled cart only on a
+# fresh positive fact for the cart host x the buyer's market (#2407 / #2411). The population now
+# includes every (cart host, seed market) the minter WOULD build a cart on, computed by the
+# minter's own functions over every active seed — so it cannot be narrower than what mints carts.
+# `test_the_population_covers_every_cart_the_real_mint_builds` holds that against the real mint
+# endpoint, over the same rows.
+
+_SHOP_SNAPSHOT = {"snapshot": {"storefront_platform": "shopify"}}
+
+
+def _stamped(*variant_ids):
+    """A storefront-evidence snapshot with `shopify_variant_id` stamped on each variant entry."""
+    return {"snapshot": {"storefront_platform": "shopify",
+                         "variants": [{"shopify_variant_id": v} for v in variant_ids]}}
+
+
+#: (id, status, domain, market, attached_product_key, attached_variant_id, seed_data, catalog
+#:  variant for the attached key or None)
+_CART_SEEDS = (
+    # A standalone seed with ONE stamped variant: the seed-stamp hand-over builds the cart.
+    ("mpx_s_stamp", "active", "stamp-brand.example", "US", None, None,
+     {**_stamped("46100000000001"), "variants": [{"variant_id": "46100000000001"}]}, None),
+    # A writer-verified Shopify attachment, on the production `www.` + mixed-case spelling.
+    ("mpx_s_attached", "active", "www.Attached-Brand.example", "US",
+     "prod::m_cartmint::shopify::901", "46100000000002", {}, None),
+    # Three seeds whose cart variant ONLY the catalog can name (evidence branch: storefront is
+    # Shopify, nothing stamped). With `_SEED_PAGE_ROWS` = 2 they straddle pages, so every page
+    # needs its own primed resolver — the #2407 census's one-resolver-for-everything missed these.
+    ("mpx_s_catalog0", "active", "catalog-brand-0.example", "US",
+     "prod::m_cartmint::external_seed::7000", None, _SHOP_SNAPSHOT, "47000000000000"),
+    ("mpx_s_catalog1", "active", "catalog-brand-1.example", "US",
+     "prod::m_cartmint::external_seed::7001", None, _SHOP_SNAPSHOT, "47000000000001"),
+    ("mpx_s_catalog2", "active", "catalog-brand-2.example", "US",
+     "prod::m_cartmint::external_seed::7002", None, _SHOP_SNAPSHOT, "47000000000002"),
+    # A variant whose `id` looks like a merchant-issued variant but is not the catalog's, and whose
+    # `sku` names nothing: offers.resolve (which passes `named_variant_id`) reads a contradiction
+    # and mints no cart, but the card lanes (which do not) resolve the sole catalog row and DO.
+    ("mpx_s_unnamed", "active", "unnamed-brand.example", "US",
+     "prod::m_cartmint::external_seed::7003",
+     None, {**_SHOP_SNAPSHOT, "variants": [{"sku": "ABC-1", "id": "99999999999"}]}, "47000000000003"),
+    # The mirror: a barcode-shaped `sku` and no variant id. The card lanes read the barcode as a
+    # contradicting name and mint no cart; offers.resolve's narrower claim ignores a SKU and does.
+    ("mpx_s_named", "active", "named-brand.example", "US",
+     "prod::m_cartmint::external_seed::7004",
+     None, {**_SHOP_SNAPSHOT, "variants": [{"sku": "88888888888"}]}, "47000000000004"),
+    # Its only stored variant names an id the catalog does not hold, so every variant-carrying
+    # hand-over is contradicted — but a card the gateway built with NO variant id resolves the
+    # sole catalog row, and mints the cart. Only the empty-variant candidate finds it.
+    ("mpx_s_empty", "active", "empty-variant-brand.example", "US",
+     "prod::m_cartmint::external_seed::7005",
+     None, {**_SHOP_SNAPSHOT, "variants": [{"variant_id": "99999999998"}]}, "47000000000005"),
+    # A stamp that RESTATES the seed's own product id. A lane that passes the product id refuses
+    # it as a forgery; a gateway-built card that carries no product id cannot, and mints the cart.
+    ("mpx_s_restated", "active", "restated-brand.example", "US", None, None,
+     _stamped("46100000000013"), None),
+    # Overlaps the Tier B lane's judydoll.com x US, whose CONFIRMED variant must still win.
+    ("mpx_s_overlap", "active", "judydoll.com", "US", None, None, _stamped("46100000000005"), None),
+    # Listed in JP: keyed on JP, never on the buyer default.
+    ("mpx_s_jp", "active", "jp-brand.example", "JP", None, None, _stamped("46100000000006"), None),
+    # REFUSED — none of these reaches the population:
+    ("mpx_s_referral", "active", "referral-only.example", "US", None, None, {}, None),
+    ("mpx_s_multi", "active", "multi-brand.example", "US", None, None,
+     _stamped("46100000000007", "46100000000008"), None),  # never guess between two variants
+    ("mpx_s_paused", "paused", "paused-brand.example", "US", None, None,
+     _stamped("46100000000009"), None),
+    ("mpx_s_nomarket", "active", "nomarket-brand.example", "", None, None,
+     _stamped("46100000000010"), None),  # counted, never defaulted to US
+    ("mpx_s_nourl", "active", "nourl-brand.example", "US", None, None,
+     _stamped("46100000000011"), None),  # no http(s) URL: no lane mints a link at all
+)
+
+#: Exactly what the cart-mint lane must admit (the Tier B lane already names judydoll.com x US).
+_CART_MINT_EXPECTED = {
+    ("stamp-brand.example", "US"),
+    ("attached-brand.example", "US"),
+    ("catalog-brand-0.example", "US"),
+    ("catalog-brand-1.example", "US"),
+    ("catalog-brand-2.example", "US"),
+    ("unnamed-brand.example", "US"),
+    ("named-brand.example", "US"),
+    ("empty-variant-brand.example", "US"),
+    ("restated-brand.example", "US"),
+    ("judydoll.com", "US"),
+    ("jp-brand.example", "JP"),
+}
+_ALLOWLISTS = {("judydoll.com", "US"), ("flowerbeauty.com", "US")}
+
+
+def _seed_product_id(seed_id):
+    return "46100000000013" if seed_id == "mpx_s_restated" else f"ext_{seed_id}"
+
+
+def _seed_url(seed_id, domain):
+    if seed_id == "mpx_s_nourl":
+        return ""
+    return f"https://{domain.lower()}/products/{seed_id}"
+
+
+@pytest.fixture
+async def _cart_seeds(_population, monkeypatch):
+    import sqlalchemy
+    from db.catalog import catalog_products, catalog_skus
+    from db.database import metadata
+
+    url = (os.getenv("DATABASE_URL") or "").replace("sqlite+aiosqlite://", "sqlite://").replace(
+        "postgresql+asyncpg://", "postgresql://"
+    )
+    engine = sqlalchemy.create_engine(url)
+    metadata.create_all(engine, tables=[catalog_products, catalog_skus], checkfirst=True)
+    engine.dispose()
+    keys = [s[4] for s in _CART_SEEDS if s[7]]
+
+    async def _clean():
+        for table in ("catalog_skus", "catalog_products"):
+            for key in keys:
+                await database.execute(f"DELETE FROM {table} WHERE product_key = :pk", {"pk": key})
+
+    await _clean()
+    for seed_id, status, domain, market, key, attached_vid, seed_data, catalog_vid in _CART_SEEDS:
+        await database.execute(
+            "INSERT INTO external_product_seeds (id, status, domain, market, attached_product_key, "
+            "attached_variant_id, external_product_id, destination_url, canonical_url, seed_data) "
+            "VALUES (:id, :st, :d, :m, :k, :av, :epid, :url, :url, :sd)",
+            {"id": seed_id, "st": status, "d": domain, "m": market, "k": key, "av": attached_vid,
+             "epid": _seed_product_id(seed_id), "url": _seed_url(seed_id, domain),
+             "sd": json.dumps(seed_data)},
+        )
+        if catalog_vid:
+            spid = key.rsplit("::", 1)[-1]
+            await database.execute(
+                "INSERT INTO catalog_products (product_key, merchant_id, platform, "
+                "source_product_id, title, source_domain) "
+                "VALUES (:pk, 'm_cartmint', 'external_seed', :spid, 'Cart Mint', :d)",
+                {"pk": key, "spid": spid, "d": domain},
+            )
+            await database.execute(
+                "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, "
+                "source_product_id, source_variant_id, title, currency) "
+                "VALUES (:sk, :pk, 'm_cartmint', 'external_seed', :spid, :v, 'One', 'USD')",
+                {"sk": f"sku::{key}", "pk": key, "spid": spid, "v": catalog_vid},
+            )
+    # Two rows a page: the three catalog seeds straddle pages, so one resolver for the whole
+    # scan (sized to a page) would leave the later ones unprimed.
+    monkeypatch.setattr(sweep, "_SEED_PAGE_ROWS", 2)
+    monkeypatch.setattr(sweep, "_SEED_PAGE_PAUSE_S", 0)
+    try:
+        yield
+    finally:
+        await _clean()
+
+
+async def test_the_population_adds_every_host_the_cart_minter_builds_on(_db, _cart_seeds):
+    tally: dict = {}
+    sizes: dict = {}
+    targets = await sweep.load_population(50, tally=tally, sizes=sizes)
+    keys = {(t.domain, t.market) for t in targets}
+    assert keys == _ALLOWLISTS | _CART_MINT_EXPECTED
+    assert len(targets) == len(keys)
+    # The seed with no ISO-2 market is COUNTED and never swept as "US". Nothing else was refused
+    # by the key rule, and no read failed or came back incomplete.
+    assert tally == {sweep.MARKET_UNKNOWN_TALLY: 1}
+    assert sizes == {sweep.TOTAL_TALLY: len(keys), sweep.NEVER_CHECKED_TALLY: len(keys)}
+    by_key = {(t.domain, t.market): t for t in targets}
+    assert by_key[("judydoll.com", "US")].variant_id == "50041364447509", (
+        "the Tier B lane's CONFIRMED variant still wins where the cart-mint lane names the key too"
+    )
+    # NO CATALOG HINT for a key only the cart-mint lane names. catalog-brand-*.example DO have a
+    # catalog product on their host, so the hint would name one; a stale or SKU-shaped hint makes
+    # the preflight answer VARIANT_GONE (a confirmed negative) or INVALID_INPUT (never positive).
+    for key in _CART_MINT_EXPECTED - _ALLOWLISTS:
+        assert (by_key[key].variant_id, by_key[key].expected_price_minor) == (None, None), key
+
+
+async def test_the_lanes_are_reported_separately_for_the_census(_db, _cart_seeds):
+    detail: dict = {}
+    lanes = await sweep.collect_population(cart_mint=detail)
+    assert set(lanes["cart-mint"]) == _CART_MINT_EXPECTED
+    assert set(lanes["cart-link"]) == {("judydoll.com", "US")}
+    assert detail["complete"] is True
+    assert detail["seeds_scanned"] == sum(1 for s in _CART_SEEDS if s[1] == "active")
+    # One cart seed per expected key, plus the market-less one that mints a cart but is not keyed.
+    assert detail["cart_seeds"] == len(_CART_MINT_EXPECTED) + 1
+    assert detail["seeds_by_key"] == {key: 1 for key in _CART_MINT_EXPECTED}
+
+
+async def test_the_population_covers_every_cart_the_real_mint_builds(_db, _cart_seeds, monkeypatch):
+    """THE SAME PRODUCER, held end to end: every seed row goes through the real
+    `mint_external_seed_links` (the mint the gateway's own cards use), once per stored variant and
+    once with none, with and without its product id, and every cart it builds must be on a (host, market) the population holds.
+    The mint's own set must be non-empty and include the catalog-only seeds, or the check is
+    vacuous."""
+    import itertools
+
+    import routes.agent_shop_gateway as gw
+
+    domains = sorted({s[2].lower() for s in _CART_SEEDS} | {"judydoll.com"})
+
+    async def _allowed(*, market):
+        return domains
+
+    monkeypatch.setattr(gw, "get_allowed_domains_for_market", _allowed)
+    population = {(t.domain, t.market) for t in await sweep.load_population(50)}
+
+    minted = set()
+    for seed_id, status, domain, market, key, attached_vid, seed_data, _cv in _CART_SEEDS:
+        if status != "active" or not _seed_url(seed_id, domain):
+            continue
+        variant_ids = [gw._seed_offer_variant_id(v) or None for v in gw._seed_variants(seed_data)]
+        for variant_id, product_id in itertools.product(
+            dict.fromkeys([*variant_ids, None]), (_seed_product_id(seed_id), None)
+        ):
+            body = gw.ExternalSeedLinksRequest(market=market or None, candidates=[
+                gw.ExternalSeedLinkCandidate(
+                    external_seed_id=seed_id, destination_url=_seed_url(seed_id, domain),
+                    canonical_url=_seed_url(seed_id, domain), market=market or None,
+                    domain=domain, attached_product_key=key, attached_variant_id=attached_vid,
+                    external_product_id=product_id, variant_id=variant_id,
+                    seed_data=seed_data,
+                )
+            ])
+            for link in (await gw.mint_external_seed_links(body))["links"]:
+                if link.get("cart_url"):
+                    minted.add((mp.normalize_domain(link["cart_url"]), mp.normalize_market(market)))
+    keyed = {(host, market) for host, market in minted if market}
+    assert {("catalog-brand-2.example", "US"), ("unnamed-brand.example", "US"),
+            ("empty-variant-brand.example", "US"), ("restated-brand.example", "US")} <= keyed
+    assert keyed <= population, sorted(keyed - population)
+    assert ("nomarket-brand.example", None) in minted, "a cart the population counts but cannot key"
+
+
+async def test_a_swept_cart_mint_host_answers_the_cart_gate(_db, monkeypatch, _cart_seeds):
+    """End to end: an armed sweep checks the cart host, and `is_purchasable` on
+    `normalize_domain(<cart url>)` — the one read the cart gate makes — answers True for it in the
+    seed's market, and only there."""
+    from services.outbound_links_service import shopify_cart_base_url
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "1")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.population_unreadable == 0 and report.errors == 0
+    assert report.population_total == len(_ALLOWLISTS | _CART_MINT_EXPECTED)
+    cart = shopify_cart_base_url(shop_domain="www.Attached-Brand.example", variant_id="46100000000002")
+    assert await mp.is_purchasable(mp.normalize_domain(cart), "US") is True
+    assert await mp.is_purchasable("jp-brand.example", "JP") is True
+    assert await mp.is_purchasable("jp-brand.example", "US") is False
+    assert await mp.is_purchasable("nomarket-brand.example", "US") is False, "never defaulted"
+
+
+async def test_a_catalog_lookup_failure_leaves_the_lane_incomplete_and_counted(
+    _db, monkeypatch, _cart_seeds
+):
+    """A lookup that fails answers "no variant" — so a cart the minter would build is silently
+    missing. The lane keeps what it found (the stamped and attached seeds need no lookup) and the
+    run is counted as reading an incomplete population."""
+    from services.handover_variant_identity import HandoverVariantResolver
+
+    async def _down(self, keys):
+        raise RuntimeError("catalog_skus is unavailable")
+
+    monkeypatch.setattr(HandoverVariantResolver, "_fetch", _down)
+    tally: dict = {}
+    keys = {(t.domain, t.market) for t in await sweep.load_population(50, tally=tally)}
+    assert tally.get(sweep.UNREADABLE_TALLY) == 1
+    assert {("stamp-brand.example", "US"), ("attached-brand.example", "US")} <= keys
+    assert ("catalog-brand-0.example", "US") not in keys
+
+
+async def test_the_cart_mint_lane_failure_is_counted_and_the_other_lanes_still_swept(
+    _db, monkeypatch, _cart_seeds
+):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+    real_fetch_all = database.fetch_all
+
+    async def _seeds_down(query, *a, **k):
+        if query is sweep._SEED_PAGE_SQL:
+            raise RuntimeError("relation external_product_seeds is unavailable")
+        return await real_fetch_all(query, *a, **k)
+
+    monkeypatch.setattr(database, "fetch_all", _seeds_down)
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.population_unreadable == 1
+    assert sorted(host for host, _ in fetcher.calls) == ["flowerbeauty.com", "judydoll.com"]
+    assert sweep.exit_code_for(report) == sweep.EXIT_POPULATION_UNREADABLE
+
+
+async def test_the_lane_budget_stops_the_scan_and_is_counted(_db, monkeypatch, _cart_seeds):
+    """A slow database must not spend the run's budget before the first merchant is checked."""
+    monkeypatch.setattr(sweep, "_SEED_LANE_BUDGET_S", 0)
+    tally: dict = {}
+    keys = {(t.domain, t.market) for t in await sweep.load_population(50, tally=tally)}
+    assert tally.get(sweep.UNREADABLE_TALLY) == 1
+    assert keys == _ALLOWLISTS, "nothing was scanned"
+
+
+async def test_a_failed_staleness_read_is_counted(_db, monkeypatch, _cart_seeds):
+    """The rotation is ordered by `list_due`. Its soft form answered [] on a failure, every key
+    then read as never-checked, and every run would sweep the same first `batch` keys."""
+    real_fetch_all = database.fetch_all
+
+    async def _facts_down(query, *a, **k):
+        if query in (mp._SELECT_DUE_SQL, mp._SELECT_DUE_SQL_SQLITE):
+            raise RuntimeError("merchant_purchasability is unavailable")
+        return await real_fetch_all(query, *a, **k)
+
+    monkeypatch.setattr(database, "fetch_all", _facts_down)
+    assert await mp.list_due(10) == [], "the default form stays soft"
+    tally: dict = {}
+    await sweep.load_population(50, tally=tally)
+    assert tally.get(sweep.UNREADABLE_TALLY) == 1
+
+
+async def test_a_population_larger_than_the_batch_is_covered_by_the_rotation(
+    _db, monkeypatch, _cart_seeds
+):
+    """CAPACITY. With more keys than the batch, each run takes the never-checked first and then
+    the stalest, so the whole population is checked within ceil(total / batch) runs — and the
+    report says how far the rotation has got."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_BATCH", "4")
+    fetcher = _Fetcher({})
+    monkeypatch.setattr(sweep, "_preflight", fetcher)
+    total = len(_ALLOWLISTS | _CART_MINT_EXPECTED)
+    runs = -(-total // 4)
+    reports = []
+    for _ in range(runs):
+        reports.append(await sweep.run_merchant_purchasability_sweep())
+    swept = [(host, kwargs["market"]) for host, kwargs in fetcher.calls]
+    assert len(swept) == 4 * runs and all(r.population == 4 for r in reports)
+    first_pass = swept[:total]
+    assert set(first_pass) == _ALLOWLISTS | _CART_MINT_EXPECTED
+    assert len(set(first_pass)) == total, "no key is checked twice before every key is checked once"
+    assert [r.population_total for r in reports] == [total] * runs
+    assert [r.population_never_checked for r in reports] == [total - 4 * i for i in range(runs)]
+
+
+# ══ the coverage census (scripts/merchant_purchasability_census.py) ══════════════════════════
+#
+# Read after two or three days of sweeps, per host: is the fact positive, confirmed-negative,
+# unverifiable or never-checked? Its population is `collect_population`'s, so it reports on
+# exactly what the sweep sweeps. The read-only transaction itself is Postgres-only and is held in
+# tests/test_merchant_purchasability_postgres.py.
+
+from scripts import merchant_purchasability_census as census  # noqa: E402
+
+
+@pytest.mark.parametrize("fact, state", [
+    (None, "never_checked"),
+    ({"fresh": 1, "verdict": "ELIGIBLE"}, "positive"),
+    # A fresh window survives one negative (demotion needs two), so the gate still says yes.
+    ({"fresh": 1, "verdict": "NO_CARD_PAYMENT"}, "positive"),
+    ({"fresh": 0, "verdict": "NO_CARD_PAYMENT"}, "confirmed_negative"),
+    ({"fresh": 0, "verdict": "NOT_ACCEPTING_ORDERS"}, "confirmed_negative"),
+    ({"fresh": 0, "verdict": "BLOCKED_UNKNOWN"}, "unverifiable"),
+    ({"fresh": 0, "verdict": "ELIGIBLE"}, "unverifiable"),  # an expired window, or no card read
+    ({"fresh": 0, "verdict": None}, "unverifiable"),
+])
+def test_the_census_states_follow_the_facts_rules(fact, state):
+    assert census.classify(fact, mp.NEGATIVE_VERDICTS) == state
+
+
+def test_the_census_rows_carry_every_lane_and_count_hosts_once_in_their_best_state():
+    lanes = {
+        "variant": {}, "cart-link": {("a.example", "US"): "1"}, "connected-store": {},
+        "cart-mint": {("a.example", "US"): None, ("a.example", "CA"): None, ("b.example", "US"): None},
+    }
+    facts_by_key = {("a.example", "US"): {"fresh": 1, "verdict": "ELIGIBLE"},
+                    ("a.example", "CA"): {"fresh": 0, "verdict": "NO_CARD_PAYMENT"}}
+    rows = census.build_rows(lanes, facts_by_key, {("a.example", "US"): 3, ("b.example", "US"): 1},
+                             mp.NEGATIVE_VERDICTS)
+    assert [(r["host"], r["market"], r["state"], r["lanes"], r["cart_mint_seeds"]) for r in rows] == [
+        ("a.example", "CA", "confirmed_negative", ["cart-mint"], 0),
+        ("a.example", "US", "positive", ["cart-link", "cart-mint"], 3),
+        ("b.example", "US", "never_checked", ["cart-mint"], 1),
+    ]
+    summary = census.summarise(rows)
+    assert summary["cart_mint_keys"] == {"positive": 1, "confirmed_negative": 1, "unverifiable": 0,
+                                         "never_checked": 1}
+    assert summary["cart_mint_seeds"]["positive"] == 3
+    assert summary["hosts_best_state"] == {"positive": 1, "confirmed_negative": 0, "unverifiable": 0,
+                                           "never_checked": 1}
+
+
+def test_the_census_decoder_refuses_a_log_with_a_missing_row():
+    """Cloud Logging drops lines. A census over the rows that happened to arrive would under-count
+    silently, so a gap is an error, and so is a missing summary."""
+    def line(payload):
+        return "noise " + census._fence(payload) + " trailing\n"
+
+    rows = [{"kind": "row", "i": i, "n": 3, "host": f"h{i}.example", "market": "US",
+             "state": "positive", "lanes": ["cart-mint"], "cart_mint_seeds": 1} for i in range(3)]
+    summary = {"kind": "summary", "n": 3}
+    whole = "".join(line(r) for r in rows) + line(summary)
+    assert [r["host"] for r in census.decode(whole)["rows"]] == ["h0.example", "h1.example", "h2.example"]
+    with pytest.raises(ValueError, match="1 of 3 rows missing"):
+        census.decode(line(rows[0]) + line(rows[2]) + line(summary))
+    with pytest.raises(ValueError, match="no summary"):
+        census.decode("".join(line(r) for r in rows))

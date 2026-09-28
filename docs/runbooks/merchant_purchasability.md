@@ -306,10 +306,16 @@ SELECT merchant_domain, market_country, vantage, verdict, card_available,
  ORDER BY consecutive_failures DESC, checked_at DESC;
 ```
 
+> **For "which hosts have a fact", use the census, not this query.** Since 2026-09-28 the
+> population also includes the CART-MINT lane (see "The cart-mint lane" below), which is computed
+> by the cart minter's own Python over every active seed and cannot be written in SQL. The query
+> below covers the other three lanes only. `scripts/ops/merchant_purchasability_census.sh` reports
+> every lane, per host, in the four states — see "The coverage census".
+
 ```sql
--- NEVER CHECKED. The population is the UNION of the two Reap allowlists at merchant grain,
--- plus the connected Shopify stores (see "The connected-store lane" below). An approximation
--- of `load_population` in SQL: the connected half here skips the EU/UK refusal and the
+-- NEVER CHECKED, for the two Reap allowlists at merchant grain plus the connected Shopify stores
+-- (see "The connected-store lane" below) — NOT the cart-mint lane. An approximation of
+-- `load_population` in SQL: the connected half here skips the EU/UK refusal and the
 -- `normalize_shop_host` fold of a URL-spelled domain.
 WITH population AS (
     SELECT lower(merchant_domain) AS domain, upper(market_country) AS market
@@ -497,6 +503,101 @@ expected and is not an alert.
 **To give a connected store a cart in another market,** set its onboarding `region` to that
 country. One region per merchant is all this lane reads.
 
+Wix and WooCommerce connected stores are left out on purpose: no card lane mints a cart for them
+(`_attach_connected_product_redirects` gives only Shopify a `shop_domain`), and the preflight is
+Shopify-only, so their check could only ever come back unverifiable.
+
+### The cart-mint lane (2026-09-28)
+
+`offers.resolve` (#2407) and the product-card lanes (#2411) mint an EXTERNAL SEED's prefilled cart
+only on a fresh positive fact for the cart host × the buyer's market. The #2407 census found 432
+cart offers on 53 hosts, 358 of them on 47 hosts the sweep had never checked. `load_population`
+now unions a fourth lane, `_cart_mint_lane`:
+
+* **Same producer, not a restated predicate.** It pages every `status = 'active'` seed (500 a page,
+  0.1 s apart) and runs the minter's own chain on each —
+  `HandoverVariantResolver.choose` → `_external_seed_redirect_identity` → `resolve_cart_permalink`
+  — over the union of the inputs the four seed lanes differ on (every stored variant **plus the
+  empty one**, the product id from the row, the snapshot, or none, both URL spellings). A seed is in
+  the lane when any of those builds a cart. `tests/test_merchant_purchasability.py` drives the
+  real `mint_external_seed_links` over the same rows and asserts every cart it builds is on a key
+  the population holds.
+* **One resolver per page.** A resolver stops priming at 400 product keys. The #2407 census ran
+  one resolver over all 23,854 seeds, so it resolved catalog variants for at most 400 of them: its
+  432 / 53 is a **floor**. The 09-27 degrade-scope census bounds the other side: 6,283 cart-capable
+  seeds on 189 domains.
+* **Host** = `normalize_domain(<cart base url>)`, what `_CartPurchasabilityGate.allows_cart` reads.
+* **Market** = the seed row's `market` (every cart seed in the #2407 census was `US`). Never
+  defaulted: anything that is not ISO-2 is counted in `population_skipped_market_unknown`. The
+  gate asks the *buyer's* market; a buyer elsewhere gets no cart, which is what no fact gives.
+* **No variant, and no catalog hint.** Where the Tier B lane confirmed a variant for the same key,
+  that variant still wins. Otherwise the preflight picks an available variant for the market
+  itself. The catalog's variant hint is now used only for keys a Reap lane names (this applies to
+  the connected-store lane too): on a seed host the shortest `source_variant_id` can be a SKU or a
+  stale id, which the preflight answers `INVALID_INPUT` (never positive) or `VARIANT_GONE` (a
+  confirmed negative that demotes the store) — a statement about our index, not about whether the
+  store takes a card.
+* **Failures are counted** in `population_unreadable` (exit 1): a page read that raised (the lane
+  contributes nothing), a catalog lookup that failed (`handover_lookup_failed` /
+  `handover_not_primed` — a cart host may be missing), or a scan that ran past its own 300 s
+  budget. In the last two cases what was found is still swept. One counts-only line per run:
+  `cart-mint lane: seeds_scanned=… cart_seeds=… keys=… complete=… elapsed_ms=…`.
+
+### Capacity: a population larger than the batch (2026-09-28)
+
+With the cart-mint lane the population is larger than `BATCH` = 20, so a run no longer checks
+everyone. It does not have to: the population is sorted **never-checked first, then
+least-recently-checked**, so each run takes the 20 stalest keys and every key is re-checked once
+every ⌈*T* / 20⌉ runs (*T* = `population_total`). A positive fact lives 72 h.
+
+**Measured** (read-only, `gcloud logging`):
+- **On the crawl job:** the first live run on the crawl subnet (2026-09-28 01:07Z, image
+  `195b2da96`) took 207.5 s for 20 targets, **10.4 s per target**. This is the number to plan with.
+- **On the worker:** 14 worker `SweepReport`s of 20 targets on 2026-09-27 05:58–09:13Z took
+  76.7–104.5 s: 3.8–5.2 s per target, mean 4.4 s, the 1.5 s pause between merchants included. The
+  crawl job is about 2.4× slower. Every request start is paced ≥ 1.5 s apart across the run now,
+  and the egress is different.
+- **The seed scan:** the #2407 census job ran all 23,854 active seeds through the same functions
+  and finished inside 40 s end to end, job creation included. Locally the per-seed CPU is
+  ~0.05 ms.
+
+**One run** ≈ seed scan (est. 30–60 s; hard-stopped at 300 s and counted) + 20 × ~10.4 s ≈
+**4–5 minutes**. Worst realistic case: a 300 s scan, then 20 checks (~210 s), then one
+pathological merchant (~300 s) ≈ 810 s — inside the 1200 s task timeout. The 600 s budget is
+measured from the start of the run, scan included, so a slow scan shortens the checks, never the
+other way round.
+
+**No `BATCH` or `BUDGET_SECONDS` change is needed**, and raising `BATCH` buys little:
+- *Coverage* depends on the batch, not on the time per target, so it is the same at 10.4 s as at
+  4.4 s.
+- *Budget.* At 10.4 s a run fits ~52 targets in the 600 s budget after a 60 s scan. `BATCH` = 40
+  would halve the first pass, at twice the checks per merchant.
+- *Politeness.* `BATCH` ≈ 60 would check most of the population every hour — 21 abandoned
+  checkouts per merchant per day, today's rate — and would run into the budget (60 × 10.4 s
+  ≈ 624 s), so the rest would be counted as `abandoned_budget` and left to the rotation anyway.
+
+**Projected steady state** (*T* ≈ 75 with the census floor of 53 cart hosts; ≈ 230 at the
+189-domain upper bound):
+
+| | *T* = 75 | *T* = 230 |
+|---|---|---|
+| runs per full rotation, ⌈*T*/20⌉ | 4 | 12 |
+| longest gap between two checks of one key (21 runs/day, incl. the 01:07 → 05:07 gap) | ~7 h | ~15 h |
+| margin to the 72 h TTL | ~10× | ~5× |
+| checks (= abandoned checkouts) per merchant per day, 21 × 20 / *T* | ~5.6 | ~1.8 |
+| first full pass after arming (every key has a fact) | ~4 h | ~12–15 h |
+
+The rotation stops keeping every positive fact fresh only past *T* ≈ 1,240 (62 runs of 20 inside
+72 h). Watch `population_total` and `population_never_checked` in the `SweepReport`: after the
+first rotation `population_never_checked` should read ~0, and a key that stays never-checked is
+one the rotation is not reaching. If *T* ever approaches that limit, raise `BATCH` in
+`infra/gcp/setup_merchant_purchasability_sweep_job.sh` (the task timeout is derived from it) —
+not with `gcloud run jobs update`.
+
+The rotation is only as good as its order, so the staleness read (`facts.list_due`) is now
+strict: if it fails, the run sweeps in key order and counts one `population_unreadable`, instead of
+silently treating every key as never-checked and re-sweeping the alphabetically-first 20 every hour.
+
 ### Politeness: ~40 merchants, hourly
 
 The population is the union of the two Reap allowlists at merchant grain: 2 merchants until
@@ -518,7 +619,8 @@ connected-store lane added 2 more on 2026-09-28.
 * **Per merchant.** The population is ordered least-recently-checked first, and the batch is a
   **rotation, not a TTL filter**: with *P* merchants each is checked `21 × min(1, 20 / P)` times a
   day. At P = 40 that is **~11 checks, i.e. ~11 abandoned checkouts per merchant per day** (plus one
-  from the daily Tier B job); at P ≤ 20 it is 21. For comparison, the worker was running the
+  from the daily Tier B job); at P ≤ 20 it is 21. With the cart-mint lane (P ≈ 75–230, see
+  "Capacity") it falls to ~2–6. For comparison, the worker was running the
   sweep at a 900 s interval on 2026-09-27 — 96 checks per merchant per day for the 2 merchants
   then in the population. Lower `BATCH` in the script to cut the per-merchant count once P > 20.
 * **Freshness.** A merchant is re-checked every ~2 h at P = 40, against a 72 h TTL; two consecutive
@@ -639,7 +741,7 @@ execution and trips the "Cloud Run job failing" alert:
 | Exit | Meaning | Do |
 |---|---|---|
 | 0 | done — including a dark run (gate off, nobody contacted), an empty population, and a run the budget cut short (the rest are first next hour) | nothing |
-| 1 | a population lane could not be read (`population_unreadable > 0`), the population could not be built at all, or the database could not be connected to (`could not connect to the database` on the job's stdout; nothing was read). Whatever *was* read was still swept. Python's own exit on an uncaught traceback is also 1 — the log tells them apart; every case means "the population was not read" | read the log's `population lane(s) could not be read` line and the WARNING before it (it names the lane and the error type); with `ENFORCE` on, merchants on the unread allowlist are ageing towards a 409 |
+| 1 | a population lane could not be read or came back incomplete, or the staleness read failed (`population_unreadable > 0`), the population could not be built at all, or the database could not be connected to (`could not connect to the database` on the job's stdout; nothing was read). Whatever *was* read was still swept. Python's own exit on an uncaught traceback is also 1 — the log tells them apart; every case means "the population was not read" | read the log's `population lane(s) could not be read` line and the WARNING before it (it names the lane and the error type); with `ENFORCE` on, merchants on the unread allowlist are ageing towards a 409 |
 | 4 | the population was read, but a check raised or a fact could not be written (`errors > 0`) | read the job log; the per-check lines carry the vantage and the error type, never the merchant |
 
 `--max-retries 0`: a failed execution is not re-run automatically (a re-run is another round of
@@ -649,7 +751,7 @@ abandoned checkouts); the next hour's run is the retry.
 Logging → Cloud Run Jobs → `merchant-purchasability-sweep`, severity INFO):
 
 ```
-[2026-09-23 09:43:20,118] INFO - merchant_purchasability_sweep: SweepReport(population=20, population_skipped_unusable=0, population_skipped_market_unknown=0, population_unreadable=0, checked=20, positive=14, negative=2, unverifiable=4, written=20, abandoned_budget=0, errors=0, skipped_disabled=0, duration_ms=48213)
+[2026-09-23 09:43:20,118] INFO - merchant_purchasability_sweep: SweepReport(population=20, population_skipped_unusable=0, population_skipped_market_unknown=0, population_unreadable=0, population_total=74, population_never_checked=12, checked=20, positive=14, negative=2, unverifiable=4, written=20, abandoned_budget=0, errors=0, skipped_disabled=0, duration_ms=148213)
 ```
 
 ```sh
@@ -660,9 +762,11 @@ gcloud logging read 'resource.type="cloud_run_job"
 ```
 
 (The sample's counts are illustrative; its shape is current. `population_skipped_market_unknown`
-was added on 2026-09-26 and `population_unreadable` on 2026-09-27; the line is emitted on a run
-whose population could not be built too.) Read it as: `population` merchants taken this run
-(≤ `BATCH`); `checked` fetched; `positive / negative / unverifiable` partition `checked`;
+was added on 2026-09-26, `population_unreadable` on 2026-09-27, and `population_total` /
+`population_never_checked` on 2026-09-28; the line is emitted on a run whose population could not
+be built too.) Read it as: `population` merchants taken this run (≤ `BATCH`) out of
+`population_total` in all lanes, of which `population_never_checked` have no fact yet (see
+"Capacity"); `checked` fetched; `positive / negative / unverifiable` partition `checked`;
 `written` facts upserted; `abandoned_budget` not started because the budget ran out. With the
 gate off the run logs `merchant_purchasability_sweep: disabled; no merchant was contacted` and
 exits 0. A skipped allowlist row (a `merchant_domain` that is not a bare host name, §7's census
@@ -688,6 +792,40 @@ down: `tests/pivota_log_capture.py` reads the pivota handler's own stream with r
 WARNING; the `*_lands_on_pivota_stdout_*` and `*_does_not_depend_on_the_root_logger` tests in
 both job suites fail on a module-logger emit (4 of 5 sweep tests and all 3 poller tests on a plain
 revert, measured).
+
+### The coverage census: which hosts have a fact (2026-09-28)
+
+Before #2411's fail-closed cart gate is enabled on real data, every host the cart minter builds
+on needs a measured fact. After two or three days of hourly sweeps, read it per host:
+
+```sh
+# from a worktree of origin/main; <tag> = any main sha at or after this PR (prod web's is fine)
+scripts/ops/merchant_purchasability_census.sh <tag>
+```
+
+* **CPU-gated.** It first reads pivota-pg's `database/cpu/utilization` for the last 10 minutes
+  and refuses (exit 2, no job created) if any minute peaked at ≥ 35 %, or if the metric cannot be
+  read. Re-run when the primary is quieter; never lower `MAX_CPU` to get past it.
+* **Read-only at the server.** `scripts/merchant_purchasability_census.py` runs on one connection
+  inside one transaction opened `SET TRANSACTION READ ONLY`, and refuses to read anything unless
+  `SHOW transaction_read_only` answers `on`. `statement_timeout` is 30 s. It contacts no merchant
+  (default subnet).
+* **The sweep's own population.** It calls `collect_population`, the one function the sweep
+  builds its population with, so it reports the lanes each key came from and the cart-mint lane's
+  seed counts.
+* **Per (host, market), one of four states**, read from the buyer vantage:
+  `positive` (the gate keeps the cart), `confirmed_negative` (the last check was the store saying
+  no, e.g. no card), `unverifiable` (checked, never positive or expired, last check not a
+  confirmed negative: blocked, transport, variant unavailable…), `never_checked` (no row). Only
+  `positive` opens a cart. The summary gives counts over all keys, over the cart-mint keys (what
+  #2411 gates) and their seed counts, and per host in its best state.
+* **Output** lands in a temp dir (`census.txt`, `census.json`). Cloud Logging drops lines, so
+  every line is fenced and numbered and the decoder refuses an incomplete log. Exit 3 means the
+  report is complete but a population lane was unreadable or incomplete, so it under-counts.
+
+Enable #2411 on real data only when the cart-mint keys have no `never_checked`. Every
+`unverifiable` or `confirmed_negative` host will lose its carts under the gate — that is the gate
+working, but look at the list before arming it.
 
 ### Gateway (PIVOTA-Agent) change
 
