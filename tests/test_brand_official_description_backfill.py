@@ -1216,3 +1216,74 @@ def test_ONE_short_body_is_enough_to_buy_the_blurb(monkeypatch):
                               pdp_fallback=True)) == 0
     assert ("blurb", "jsmbeauty.sg") in fetched
     assert sorted(u["product_key"] for u in db.updates) == ["pk1", "pk2"]
+
+
+# -- (4) a storefront SEO template with each product's name dropped in (2026-09-28) -------------
+
+_PERFUMANIA = "Elevate your fragrance game with {} . Get this luxurious scent at a discounted price."
+_SENSA = ("Discover exclusive deals on {} at SensaBeauty. Shop now for the best prices and find your "
+          "perfect scent today.")
+
+
+def _templated(template, names):
+    return ({f"pk{i}": template.format(n) for i, n in enumerate(names)},
+            {f"pk{i}": n for i, n in enumerate(names)},
+            {f"pk{i}": f"h{i}" for i, n in enumerate(names)})
+
+
+@pytest.mark.parametrize("template", [_PERFUMANIA, _SENSA])
+def test_a_title_template_across_unrelated_pages_is_dropped(template):
+    """perfumania.com 6 of 6 sampled: the name differs on every page, so plain repetition (2)
+    never fires, and the remainder is long, so the title echo (3) passes it."""
+    cands, titles, handles = _templated(template, ["CH Birds of Paradise Cologne",
+                                                   "Pride Art of Arabia I Cologne",
+                                                   "Eclat De Nuit EDP"])
+    for v, t in zip(cands.values(), titles.values()):
+        assert not bf._is_title_echo(v, t)  # mechanism 3 alone would admit it
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles, handles=handles) == {}
+
+
+def test_real_copy_that_names_its_product_survives_beside_a_template():
+    """sensabeauty.com: most pages carry real scent notes that also contain the product name."""
+    cands, titles, handles = _templated(_SENSA, ["Eclat De Nuit EDP", "Club De Nuit EDT"])
+    real = ("Lattafa Najdia Tribute EDP delivers lively freshness with a smooth masculine trail, a "
+            "versatile fragrance for workdays and weekends.")
+    cands["pkr"], titles["pkr"], handles["pkr"] = real, "Najdia Tribute EDP", "najdia"
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles, handles=handles) == {"pkr": real}
+
+
+def test_a_retailer_wrapper_around_a_real_sentence_is_not_a_template():
+    """bluemercury.com: "Shop {brand} {title} on Bluemercury. <the product's own sentence>. Enjoy
+    free samples ..." -- the wrapper repeats, the middle does not, so the cut-out value differs."""
+    a = ("Shop Clinique Take The Day Off Cleansing Balm on Bluemercury. Our #1 makeup remover in a "
+         "silky balm formula. Enjoy free samples with all orders.")
+    b = ("Shop Aesop Eleos Nourishing Body Cleanser on Bluemercury. A gentle cream cleanser, ideal "
+         "for dry skin. Enjoy free samples with all orders.")
+    titles = {"a": "Take The Day Off Cleansing Balm", "b": "Eleos Nourishing Body Cleanser"}
+    kept = bf.drop_shared_boilerplate({"a": a, "b": b}, _BLURB, titles=titles, handles={"a": "a", "b": "b"})
+    assert kept == {"a": a, "b": b}
+
+
+def test_a_template_on_ONE_page_is_not_yet_a_template():
+    """Repetition is the evidence; a single page has none (the blurb and echo checks still apply)."""
+    cands, titles, handles = _templated(_PERFUMANIA, ["CH Birds of Paradise Cologne"])
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles, handles=handles) == cands
+
+
+def test_a_template_shared_only_by_editions_of_one_product_is_that_products_copy():
+    """The same exception as mechanism 2: a base product and its bracketed edition."""
+    base, edition = "New Classic Glaze Lipstick", "[Special Set] New Classic Glaze Lipstick"
+    tpl = "{} glides on in one swipe with a glassy finish that lasts all day without drying lips."
+    cands = {"a": tpl.format(base), "b": tpl.format(edition)}
+    kept = bf.drop_shared_boilerplate(cands, _BLURB, titles={"a": base, "b": edition},
+                                      handles={"a": "new-classic-glaze-lipstick", "b": "new-classic-glaze-lipstick-special-set"})
+    assert "a" in kept
+
+
+def test_two_rows_behind_ONE_page_are_not_a_template():
+    """The repetition unit is the product page (handles), as for mechanism 2."""
+    cands = {"pk1": _PERFUMANIA.format("CH Birds of Paradise Cologne"),
+             "pk2": _PERFUMANIA.format("CH Birds of Paradise Cologne")}
+    titles = {"pk1": "CH Birds of Paradise Cologne", "pk2": "CH Birds of Paradise Cologne"}
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles,
+                                      handles={"pk1": "same", "pk2": "same"}) == cands

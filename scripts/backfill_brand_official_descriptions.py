@@ -259,6 +259,27 @@ def _is_title_echo(value: str, title: Optional[str]) -> bool:
     return len(remainder) < _ECHO_REMAINDER_MIN
 
 
+_TITLE_SLOT = "\x00title\x00"
+
+
+def _title_template(value: str, title: Optional[str]) -> Optional[str]:
+    """The value with this product's own title cut out, or None when the title is not in it.
+
+    THE FOURTH BOILERPLATE FAMILY: a storefront-wide SEO template with the product name dropped
+    in. perfumania.com (2026-09-28), 6 of 6 sampled: "Elevate your fragrance game with {title} .
+    Get this luxurious scent at a discounted price." sensabeauty.com: "Discover exclusive deals on
+    {title} at SensaBeauty. Shop now for the best prices ...". The title differs on every page, so
+    repetition (mechanism 2) never sees it; the remainder is long, so the title echo (mechanism 3)
+    passes it. What repeats is the value with its title cut out.
+    """
+    if not title:
+        return None
+    v, t = _norm_copy(value), _norm_copy(title)
+    if not t or t not in v:
+        return None
+    return v.replace(t, _TITLE_SLOT)
+
+
 # A leading bracketed tag is how this storefront family labels an EDITION of a product, not a
 # different product: "[Devil Wears Prada II x JUNGSAEMMOOL] LIP-PRESSION Metal Serum Gloss",
 # "[Special Set] New Classic Glaze Lipstick", "[SUMMER EDITION] ...", "[9.9 EXCLUSIVE] ...".
@@ -430,6 +451,9 @@ def drop_shared_boilerplate(
          lines staying blocked `low_quality` (9- and 8-char descriptions) and serving.
       3. A TITLE ECHO from a themed name-tag template -- see `_is_title_echo`. Per-product, not
          the blurb, invisible to both of the above.
+      4. A TITLE TEMPLATE -- see `_title_template`: storefront-wide SEO copy with each product's
+         name dropped in. Repetition of the value WITH ITS OWN TITLE CUT OUT, across pages that
+         are not one product's editions (the same exception as 2).
 
     THE REPETITION UNIT IS THE PRODUCT PAGE, NOT THE ROW. Two catalog rows can share one
     canonical_url; they fetch the same PDP and produce the same value, and counting rows would
@@ -474,11 +498,16 @@ def drop_shared_boilerplate(
     # echo judged only when it happened to sort first -- an order-dependent verdict, which the
     # #2097 determinism invariant forbids.
     all_titles: Dict[str, set] = {}
+    # (4) the same census over each value with its own title cut out.
+    templates: Dict[str, Dict[str, tuple]] = {}
     for pk, v in candidates.items():
         h = handles.get(pk, pk)
         n = _norm_copy(v)
         seen.setdefault(n, {}).setdefault(h, (h, titles.get(pk)))
         all_titles.setdefault(n, set()).add(titles.get(pk) or "")
+        tpl = _title_template(v, titles.get(pk))
+        if tpl is not None:
+            templates.setdefault(tpl, {}).setdefault(h, (h, titles.get(pk)))
     # A blurb under the floor is treated as ABSENT, not as an armed comparison: no candidate that
     # cleared the floor can equal it, so it would disarm the refusal below while guarding nothing.
     # An UNVERIFIED blurb is the same hazard through a different door -- see `blurb_arming`.
@@ -489,6 +518,9 @@ def drop_shared_boilerplate(
         n = _norm_copy(v)
         if len(seen[n]) > 1 and not _is_one_product_family(seen[n]):
             continue                               # (2) shared across UNRELATED product pages
+        tpl = _title_template(v, titles.get(pk))
+        if tpl is not None and len(templates[tpl]) > 1 and not _is_one_product_family(templates[tpl]):
+            continue                               # (4) one template, each page's name dropped in
         # (1) THE EXACT MATCH FIRES WHATEVER THE DOOR. An unverified blurb that DOES equal a
         # candidate has proved itself on that candidate; refusing to use it would throw away the
         # measured jsmbeauty.sg win (`/meta.json` byte-identical to the homepage) for nothing.
