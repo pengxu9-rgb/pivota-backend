@@ -111,6 +111,8 @@ class FakeConn:
         self.events: List[tuple] = []
         self.marked: List[tuple] = []
         self.orphaned_keepers = 0
+        self.served_loser: Optional[str] = None
+        self.held: List[tuple] = []
         self.reverted_rows: List[str] = []
 
     def transaction(self):
@@ -153,6 +155,8 @@ class FakeConn:
         if "SELECT COUNT(*) FROM catalog_products WHERE merchant_id" in s:
             keys = self.live_groups.get((args[0], args[1]), [])
             return len([k for k in keys if k not in self.suppressed])
+        if "AS served_loser" in s:
+            return self.served_loser
         if "NOT EXISTS" in s:
             return self.orphaned_keepers
         raise AssertionError(f"unscripted fetchval: {s[:90]}")
@@ -168,6 +172,9 @@ class FakeConn:
             return "INSERT 0 1"
         if "SET status = 'applied'" in s:
             self.marked.append(args)
+            return "UPDATE 1"
+        if "SET status = 'proposed'" in s:
+            self.held.append((args[0], json.loads(args[1])))
             return "UPDATE 1"
         raise AssertionError(f"unscripted execute: {s[:90]}")
 
@@ -220,6 +227,37 @@ class TestApplyFlow:
         conn.orphaned_keepers = 1
         with pytest.raises(RuntimeError):
             await apply_approved(conn, run_id="RUN1")
+
+    @pytest.mark.asyncio
+    async def test_a_loser_that_is_the_served_row_is_held_for_review_not_suppressed(self):
+        conn = FakeConn(live_groups={("m1", "ck1"): ["a", "b"]},
+                        approved=[_approved(["a", "b"], "a")])
+        conn.served_loser = "b"
+        result = await apply_approved(conn, run_id="RUN1")
+        pid = conn.approved[0]["proposal_id"]
+        assert result == {"run_id": "RUN1", "applied": [], "skipped": [(pid, "a_loser_is_served")]}
+        assert conn.suppressed == [] and conn.deactivated == [] and conn.marked == []
+        [(held_id, held)] = conn.held
+        assert held_id == pid
+        assert (held["reason"], held["served_product_key"], held["run_id"]) == ("a_loser_is_served", "b", "RUN1")
+        assert [e[:2] for e in conn.events] == [(pid, "held")]
+
+    @pytest.mark.asyncio
+    async def test_a_drifted_proposal_is_skipped_for_drift_before_the_served_check(self):
+        conn = FakeConn(live_groups={("m1", "ck1"): ["a", "b", "x"]},
+                        approved=[_approved(["a", "b"], "a")])
+        conn.served_loser = "b"
+        result = await apply_approved(conn, run_id="RUN1")
+        assert result["skipped"][0][1] == "member_set_drift" and conn.held == []
+
+    @pytest.mark.asyncio
+    async def test_an_unguarded_strategy_is_not_served_checked(self):
+        p = _approved(["a", "b"], "a")
+        p["strategy"] = "tier3_judge"
+        conn = FakeConn(live_groups={("m1", "ck1"): ["a", "b"]}, approved=[p])
+        conn.served_loser = "b"  # a human decided tier3_judge proposals; apply honours that
+        result = await apply_approved(conn, run_id="RUN1")
+        assert len(result["applied"]) == 1 and conn.held == []
 
     @pytest.mark.asyncio
     async def test_strategy_filter(self):

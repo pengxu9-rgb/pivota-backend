@@ -44,6 +44,7 @@ from scripts.step5_working_set import (
     build_report,
 )
 from services.identity_resolution import (
+    A_LOSER_IS_SERVED_SQL,
     INSERT_EVENT_SQL,
     apply_approved,
     upsert_proposals,
@@ -90,13 +91,9 @@ GAUGES_SQL = {
 # row (agent_pdp_view's signature; signatures are unique, migration 071). A served row outside the
 # proposal -- another merchant's -- holds nothing. A held proposal stays 'proposed', is counted into
 # the sweep summary, and goes to the review rail (REVIEW_HELD_SQL) instead of waiting unseen.
-_A_LOSER_IS_SERVED = """
-    SELECT 1 FROM agent_pdp_view av
-    JOIN catalog_products cp ON cp.pivota_signature_id = av.pivota_signature_id
-    WHERE av.content_key = p.content_key
-      AND cp.product_key = ANY(p.subject_product_keys)
-      AND cp.product_key <> p.keeper_product_key
-"""
+# The predicate is the engine's (identity_resolution.A_LOSER_IS_SERVED_SQL): apply re-checks it, so a
+# proposal approved before this guard, or whose served row moved after approval, is held there too.
+_A_LOSER_IS_SERVED = A_LOSER_IS_SERVED_SQL
 
 APPROVE_ALLOWLIST_SQL = """
 UPDATE identity_resolution_proposals p
@@ -114,7 +111,9 @@ WHERE p.status = 'proposed' AND p.strategy = ANY($1::text[])
 
 REVIEW_HELD_SQL = """
 SELECT p.proposal_id, p.kind, p.strategy, p.merchant_id, p.content_key,
-       p.subject_product_keys, p.keeper_product_key, p.confidence, p.evidence
+       p.subject_product_keys, p.keeper_product_key, p.confidence, p.evidence,
+       'a_loser_is_served' AS hold_reason,
+       (""" + _A_LOSER_IS_SERVED + """ LIMIT 1) AS served_product_key
 FROM identity_resolution_proposals p
 WHERE p.status = 'proposed' AND p.strategy = ANY($1::text[])
   AND EXISTS (""" + _A_LOSER_IS_SERVED + """)
@@ -317,7 +316,7 @@ def review_task_row(proposal: Dict[str, Any]) -> Tuple[str, str, str, str]:
     task_id = f"pdptask_ir_{proposal['proposal_id']}"[:96]
     pdp_id = str(proposal.get("keeper_product_key")
                  or (proposal.get("subject_product_keys") or [""])[0])[:96]
-    checklist = json.dumps({
+    checklist = {
         "source": "identity_reconcile_sweep",
         "proposal_id": proposal["proposal_id"],
         "kind": proposal["kind"],
@@ -327,9 +326,14 @@ def review_task_row(proposal: Dict[str, Any]) -> Tuple[str, str, str, str]:
         "confidence": (float(proposal["confidence"])
                        if proposal.get("confidence") is not None else None),
         "evidence": proposal.get("evidence"),
-    })
+    }
+    if proposal.get("hold_reason"):
+        # Why a mechanical proposal is here instead of applied (REVIEW_HELD_SQL). One held at apply
+        # time also carries the approval it lost, in evidence.apply_held.
+        checklist["hold_reason"] = proposal["hold_reason"]
+        checklist["served_product_key"] = proposal.get("served_product_key")
     labels = json.dumps(["entity_resolution", "identity_reconcile_sweep"])
-    return task_id, pdp_id, checklist, labels
+    return task_id, pdp_id, json.dumps(checklist), labels
 
 
 async def _connect_with_retry(dsn: str, attempts: int = 6):
@@ -451,6 +455,8 @@ async def run_identity_reconcile_sweep_tick(
             "auto_approve_held_loser_served": held_loser_served,
             "applied": applied.get("applied", []),
             "apply_skipped": applied.get("skipped", []),
+            "apply_held_loser_served": sum(
+                1 for _, why in applied.get("skipped", []) if why == "a_loser_is_served"),
             "review_tasks_enqueued": review_tasks,
             "alerts": alerts,
         }
