@@ -52,18 +52,18 @@ async def test_apply_writes_modal_canonical_gtin(monkeypatch):
     rows = [
         # Two SKUs, one barcode repeated → modal wins; 13-digit → padded to 14.
         {"product_key": "prod::m::p::1", "gtin": None,
-         "barcodes": ["8809640733458", "8809640733458", "0000000000017"]},
+         "barcodes": ["8809640733451", "8809640733451", "0000000000017"]},
     ]
     fake = _install(monkeypatch, rows)
     report = await bf._drive(_args(apply=True))
     assert report["outcome_counts"]["gtin_computed"] == 1
     assert report["outcome_counts"]["updated"] == 1
-    assert fake.updates == [{"product_key": "prod::m::p::1", "gtin": "08809640733458"}]
+    assert fake.updates == [{"product_key": "prod::m::p::1", "gtin": "08809640733451"}]
 
 
 @pytest.mark.asyncio
 async def test_dry_run_writes_nothing(monkeypatch):
-    rows = [{"product_key": "prod::m::p::1", "gtin": None, "barcodes": ["8809640733458"]}]
+    rows = [{"product_key": "prod::m::p::1", "gtin": None, "barcodes": ["8809640733451"]}]
     fake = _install(monkeypatch, rows)
     report = await bf._drive(_args(apply=False))
     assert report["outcome_counts"]["gtin_computed"] == 1
@@ -74,7 +74,7 @@ async def test_dry_run_writes_nothing(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_skips_rows_already_carrying_gtin(monkeypatch):
-    rows = [{"product_key": "prod::m::p::1", "gtin": "08809640733458",
+    rows = [{"product_key": "prod::m::p::1", "gtin": "08809640733451",
              "barcodes": ["1111111111116"]}]
     fake = _install(monkeypatch, rows)
     report = await bf._drive(_args(apply=True))

@@ -306,8 +306,10 @@ def validated_source_gtin(value: Any) -> Optional[str]:
     """Only GS1-shaped, check-digit-valid observations earn a recovered match key.
 
     normalize_gtin owns normalization; its legacy padding alone also accepts a
-    one-digit supplier code, so this new observation boundary validates first.
-    Existing feed barcodes are not rewritten or reinterpreted here.
+    one-digit supplier code (or "0" -> "00000000000000"), so this validates
+    first. It is also the GLOBAL Tier-0 match-key rule: intake_identity.
+    canonical_gtin and agent_pdp_view_assembler.pick_gtin13 call it rather than
+    keep their own copy. Stored values are not rewritten here.
     """
     if not isinstance(value, str):
         return None

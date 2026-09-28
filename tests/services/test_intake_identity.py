@@ -33,8 +33,8 @@ from services.product_group_autogrouper import (  # noqa: E402
 BRAND = "Anua"
 TITLE = "Heartleaf 77% Soothing Toner"
 CK = make_content_key(BRAND, TITLE)          # the single canonical family key
-GTIN_RAW = "8809640733458"                   # 13-digit EAN
-GTIN14 = "08809640733458"                    # GS1-canonical 14-digit
+GTIN_RAW = "8809640733451"                   # 13-digit EAN
+GTIN14 = "08809640733451"                    # GS1-canonical 14-digit
 GTIN14_OTHER = "00000000000017"
 MERCHANT = "m_anua"
 
@@ -105,12 +105,47 @@ def _ctx(**over: Any) -> Dict[str, Any]:
 
 
 def test_canonical_gtin_only_keeps_clean_gtin14():
-    assert ii.canonical_gtin("8809640733458") == GTIN14      # 13 → padded 14
+    assert ii.canonical_gtin("8809640733451") == GTIN14      # 13 → padded 14
     assert ii.canonical_gtin("012345678905") == "00012345678905"  # 12 → 14
-    assert ii.canonical_gtin(" 08809640733458 ") == GTIN14   # trims + already 14
+    assert ii.canonical_gtin(" 08809640733451 ") == GTIN14   # trims + already 14
     assert ii.canonical_gtin("1234567890123456") is None     # 16 malformed → dropped
     assert ii.canonical_gtin("") is None
     assert ii.canonical_gtin(None) is None
+
+
+@pytest.mark.parametrize("value", ["0", "00000000", "0000000000000", "00000000000000"])
+def test_canonical_gtin_refuses_an_all_zero_barcode(value):
+    # normalize_gtin pads each of these to "00000000000000" — GS1-shaped, and
+    # the GLOBAL Tier-0 lookup would attach unrelated products on it.
+    assert ii.canonical_gtin(value) is None
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("96385074", "00000096385074"),        # GTIN-8
+    ("036000291452", "00036000291452"),    # GTIN-12 / UPC-A
+    ("4006381333931", "04006381333931"),   # GTIN-13 / EAN-13
+    ("10614141000019", "10614141000019"),  # GTIN-14
+    ("00000000000017", "00000000000017"),  # zeros inside a real code are fine
+])
+def test_canonical_gtin_accepts_real_gtins(value, expected):
+    assert ii.canonical_gtin(value) == expected
+
+
+def test_canonical_gtin_is_the_catalog_identity_validator():
+    # One rule, one function: the Tier-0 match key and the recovered-observation
+    # key must never disagree about what a GTIN is.
+    from services.catalog_identity import validated_source_gtin
+
+    for value in ("0", "00000000000000", "8809640733458", "12345", "4006381333931", None, ""):
+        assert ii.canonical_gtin(value) == validated_source_gtin(value)
+
+
+def test_the_all_zero_reject_stays_out_of_normalize_gtin():
+    # make_content_key folds normalize_gtin into every minted key; moving the
+    # reject there would silently re-key rows. That needs a census + backfill.
+    from services.catalog_identity import normalize_gtin
+
+    assert normalize_gtin("0") == "00000000000000"
 
 
 def test_all_door_flags_default_off():

@@ -109,14 +109,16 @@ def intake_identity_enabled(door: str) -> bool:
 
 
 def canonical_gtin(value: Optional[str]) -> Optional[str]:
-    """GS1-canonical GTIN-14 for storage + matching, or None. Only a clean
-    14-digit form is a reliable identifier — normalize_gtin passes 15+ digit
-    malformed inputs through unchanged, so we drop those rather than store a
-    junk match key (mirrors agent_pdp_view_assembler.pick_gtin13)."""
-    from services.catalog_identity import normalize_gtin
+    """GS1-canonical GTIN-14 for storage + matching, or None.
 
-    norm = normalize_gtin(value)
-    return norm if norm and len(norm) == 14 else None
+    The rule is catalog_identity.validated_source_gtin's (GTIN-8/12/13/14, check
+    digit, never all-zero) — not a second copy of it. normalize_gtin alone
+    zero-pads, so a feed barcode of "0" became "00000000000000": a GS1-shaped
+    key that the GLOBAL Tier-0 lookup (_rows_by_gtin) ATTACHES on, joining
+    unrelated products across merchants."""
+    from services.catalog_identity import validated_source_gtin
+
+    return validated_source_gtin(value)
 
 
 # --- DB lookups (each one small, exact, and monkeypatch-friendly) ----------------
