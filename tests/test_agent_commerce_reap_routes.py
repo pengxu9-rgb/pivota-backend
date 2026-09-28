@@ -3057,3 +3057,86 @@ async def test_no_key_means_no_tombstone(client):
     resp = await client.post(f"{BASE}/purchases", json=_body())
     assert _error(resp) == "merchant_not_eligible"
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 0
+
+
+# ── #2425 re-review: R2 (a refused claim abandons its purchase), R3 (a stale key is replaced), R4 ──
+
+
+@pytest.mark.parametrize("winner_body", ["tombstone", "other_request"])
+async def test_a_claim_that_loses_to_a_refusal_abandons_the_purchase_it_opened(
+    client, monkeypatch, winner_body
+):
+    """R2. Request A opens purchase P, and before A claims the key a CONCURRENT request lands the
+    key first -- as a merchant_not_eligible tombstone for the same body, or for a different body.
+    A's re-read then REFUSES; P must not be left open holding the buyer's address and email."""
+    await _seed_all()
+    real_write = routes_reap._write_idempotency_key
+
+    async def _race_then_write(**kwargs):
+        await database.execute(
+            "INSERT INTO reap_agentic_purchase_keys (agent_id, agent_user_ref_hash, "
+            "idempotency_key, purchase_id, request_hash) VALUES (:a, :h, :k, :p, :r)",
+            {"a": kwargs["agent_id"], "h": kwargs["agent_user_ref_hash"],
+             "k": kwargs["idempotency_key"],
+             "p": "refused:merchant_not_eligible" if winner_body == "tombstone" else "rp_other",
+             "r": kwargs["request_hash"] if winner_body == "tombstone" else "x" * 64},
+        )
+        return await real_write(**kwargs)
+
+    monkeypatch.setattr(routes_reap, "_write_idempotency_key", _race_then_write)
+    resp = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-race"))
+    expected = "merchant_not_eligible" if winner_body == "tombstone" else "idempotency_conflict"
+    assert resp.status_code == 409 and _error(resp) == expected, resp.text
+    rows = [dict(r) for r in await database.fetch_all(
+        "SELECT state, buyer_email, shipping_address FROM reap_agentic_purchases")]
+    assert len(rows) == 1
+    assert rows[0]["state"] == "refused"
+    assert rows[0]["buyer_email"] is None and rows[0]["shipping_address"] is None
+
+
+async def test_a_key_past_its_window_is_replaced_so_the_next_retry_replays(client):
+    """R3. After 24 h a key is forgotten -- but its row used to be forgotten FOR GOOD: the INSERT hit
+    the primary key, the re-read ignored the stale row, and every later retry opened another
+    purchase. Now the claim replaces the stale row and the next retry replays."""
+    await _seed_all()
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-old"))
+    assert first.status_code == 202
+    await database.execute(
+        "UPDATE reap_agentic_purchase_keys SET created_at = datetime('now', '-25 hours') "
+        "WHERE idempotency_key = 'K-old'")
+    second = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-old"))
+    assert second.status_code == 202
+    assert second.json()["purchase_id"] != first.json()["purchase_id"]
+    third = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-old"))
+    assert third.json()["purchase_id"] == second.json()["purchase_id"]
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 2
+    # A LIVE key is never overwritten by the upsert: a different body is still a conflict.
+    fourth = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-old", quantity=2))
+    assert _error(fourth) == "idempotency_conflict"
+
+
+async def test_a_stale_tombstone_is_replaced_too(client):
+    await _seed_catalog()
+    await _seed_link()
+    assert _error(await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-t"))) == \
+        "merchant_not_eligible"
+    await database.execute(
+        "UPDATE reap_agentic_purchase_keys SET created_at = datetime('now', '-25 hours') "
+        "WHERE idempotency_key = 'K-t'")
+    await _seed_eligibility()
+    resp = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-t"))
+    assert resp.status_code == 202, resp.text
+    again = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-t"))
+    assert again.json()["purchase_id"] == resp.json()["purchase_id"]
+
+
+async def test_merchant_disabled_under_a_key_writes_no_key_row(client):
+    """R4. Only merchant_not_eligible is remembered against a key (`_TOMBSTONED_REFUSALS`): an
+    operator's "off" is answered fresh on every request, so turning the merchant back on works
+    for the same key."""
+    await _seed_catalog()
+    await _seed_link()
+    await _seed_eligibility(enabled=False)
+    resp = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-off"))
+    assert _error(resp) == "merchant_disabled"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 0

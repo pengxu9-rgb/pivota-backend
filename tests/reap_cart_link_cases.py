@@ -2748,16 +2748,45 @@ async def test_the_dropped_outcome_is_written_on_every_exit(
         assert (await get(purchase_id))["offer_code_outcome"] == "dropped_expired"
 
 
-async def test_an_applied_code_is_kept_on_a_release_and_re_sent(reap, attribution, clock):
-    """The other direction: a code Reap ACCEPTED is not dropped by a release (quote expired), and
-    the next quote carries it again."""
+async def test_an_applied_code_does_not_cross_a_release_and_is_re_sent(reap, attribution, clock):
+    """R5 (#2425 re-review): a released step's quote is thrown away, so `applied` is NOT persisted
+    by the release -- the next step re-quotes with the code and decides again. A later refusal can
+    therefore never carry an `applied` from a quote that no longer exists."""
     purchase_id = await to_quoting_with_code()
     reap.request_cart_link_quote = ok(dict(discounted_quote(), expiresAt="2020-01-01T00:00:00Z"))
     assert (await step(purchase_id)).state == "quoting"
-    assert (await get(purchase_id))["offer_code_outcome"] == "applied"
+    row = await get(purchase_id)
+    assert row["offer_code_outcome"] is None and row["discount_minor"] is None
+    # ...and a later refused quote ends with no outcome claiming a discount held.
+    reap.request_cart_link_quote = rejected("QUOTE_UNFULFILLABLE", reason="ITEMS_UNSHIPPABLE")
+    moved = await step(purchase_id)
+    assert moved.state == "refused"
+    assert (await get(purchase_id))["offer_code_outcome"] is None
+    assert reap.named("request_cart_link_quote")[1]["offer_code"] == CODE
+
+
+async def test_an_applied_outcome_survives_the_pollers_plain_release_in_awaiting_approval(
+    reap, attribution, clock
+):
+    """R1 (#2425 re-review): the poller releases an 'awaiting_approval' row with NO outcome
+    (jobs/reap_agentic_purchase_poll.py). The outcome and the discount the approved quote wrote
+    through the TRANSITION must survive that release -- the ledger COALESCEs, it does not assign.
+    Collected on both dialects."""
+    purchase_id = await to_quoting_with_code()
     reap.request_cart_link_quote = ok(discounted_quote())
     assert (await step(purchase_id)).state == "awaiting_approval"
-    assert reap.named("request_cart_link_quote")[1]["offer_code"] == CODE
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET claimed_by = 'w_poll' WHERE id = :i", {"i": purchase_id})
+    assert await ledger.release_claim(purchase_id, "w_poll") is not None
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET claimed_by = 'w_poll' WHERE id = :i", {"i": purchase_id})
+    assert await ledger.release_claim(purchase_id, "w_poll", last_error_code="checkout_pending")
+    row = await get(purchase_id)
+    assert (row["offer_code_outcome"], row["discount_minor"]) == ("applied", 209)
+    # And a step in that state (the checkout poll) keeps it too.
+    reap.get_checkout = ok({**CHECKOUT_CREATED, "status": "REQUIRES_ACTION"})
+    await step(purchase_id)
+    assert (await get(purchase_id))["offer_code_outcome"] == "applied"
 
 
 async def test_the_claim_lost_between_the_two_quotes_makes_no_second_call(
