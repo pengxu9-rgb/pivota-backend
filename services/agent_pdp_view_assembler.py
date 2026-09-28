@@ -104,6 +104,7 @@ async def fetch_products_for_key(content_key: str, *, db: Any = None) -> List[Di
           cp.pivota_signature_id,
           cp.canonical_url,
           cp.sync_status,
+          cp.suppressed_at,
           cp.created_at,
           cp.material,
           cp.material_source,
@@ -316,27 +317,54 @@ def _is_retailer_listing(row: Dict[str, Any]) -> bool:
     return str(row.get("product_key") or "").startswith(_RETAILER_LISTING_KEY_PREFIX)
 
 
+# Set by annotate_served_copy: the title and description a row would SERVE as the winner, plus
+# the overlay read it came from. Never persisted; assemble_row reads named fields only.
+_SERVED_COPY = "_served_copy"
+
+
+def _passes_serving_content_bar(row: Dict[str, Any]) -> bool:
+    """This row, as the winner, would supply content the serving gate accepts, under a signature.
+
+    The gate's own checks (index_pipeline_state_service: suppressed / not_live / no_image /
+    short_description), read the way the gate reads them -- a set suppressed_at, or a non-empty
+    sync_status other than 'live', refuses; the description is the one agent_pdp_view would serve,
+    measured stripped -- plus a title (assemble_row builds nothing without one) and a signature: the
+    winner supplies the served id and canonical URL, so a row that would take the product off
+    serving, or serve it unsigned, is not a content-ready winner (review #2384). The ONE definition
+    both pick_canonical rules below use.
+
+    The served title and description come from annotate_served_copy (overlay first) when the caller
+    ran it -- the serving path does. Otherwise the row's own columns are the answer, and a caller
+    that loads none of them never passes, so its order is unchanged. The image is the row's own:
+    see annotate_served_copy for why the seed is not consulted.
+    """
+    from services.index_pipeline_state_service import MIN_DESCRIPTION_LENGTH
+
+    if row.get("suppressed_at") is not None:
+        return False
+    sync_status = str(row.get("sync_status") or "").strip()
+    if sync_status and sync_status != "live":
+        return False
+    served = row.get(_SERVED_COPY) or {"title": row.get("title"), "description": row.get("description")}
+    if not str(served.get("title") or "").strip():
+        return False
+    if len(str(served.get("description") or "").strip()) < MIN_DESCRIPTION_LENGTH:
+        return False
+    return bool(str(row.get("image_url") or "").strip() and row.get("pivota_signature_id"))
+
+
 def _is_brand_store_row(row: Dict[str, Any]) -> bool:
     """The brand's own store's copy of the product, with content to serve.
 
     Evidence is what the ingest pipeline already decided about the seller: a brand_direct offer on
     this row (Tier A or B proven at ingest, e.g. saiehello.com for Saie), or a host that IS the
-    brand's domain -- and never a known retailer host. A row the serving gate would refuse (description
-    under MIN_DESCRIPTION_LENGTH, no image) or without a signature never wins here: it would take the
-    product off serving or serve it unsigned. Rows missing these fields (callers that do not
-    load them) are simply not brand-store rows, so their order is unchanged. (A url_audit seed needs
-    no test here: pick_canonical ranks it last before this rule is consulted.)
+    brand's domain -- and never a known retailer host. A row that fails `_passes_serving_content_bar`
+    never wins here: it would take the product off serving or serve it unsigned. (A url_audit seed
+    needs no test here: pick_canonical ranks it last before this rule is consulted.)
     """
     if _is_retailer_listing(row):
         return False
-    from services.index_pipeline_state_service import MIN_DESCRIPTION_LENGTH
-
-    # The serving gate's own bar (index_pipeline_state_service: no_image / short_description), plus
-    # a signature: the winner supplies the served id and canonical URL, so a brand row that would
-    # take the product off serving, or serve it unsigned, never outranks a retailer's (review #2384).
-    if len(str(row.get("description") or "").strip()) < MIN_DESCRIPTION_LENGTH:
-        return False
-    if not str(row.get("image_url") or "").strip() or not row.get("pivota_signature_id"):
+    if not _passes_serving_content_bar(row):
         return False
     from services.offer_seller_identity import brand_owns_domain, host_from_url, is_known_retailer, normalize_host
 
@@ -359,6 +387,16 @@ def pick_canonical(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
           brand's own store row -- westman-atelier.com, naturium.com, tomfordbeauty.com,
           saiehello.com -- sat beside it). Groups without a retailer listing are ordered exactly
           as before.
+      0c. a row that passes `_passes_serving_content_bar` before one that does not. The winner
+          supplies the served title, description, image, id and canonical URL, and
+          index_pipeline_state gates the whole content_key on what it serves. Replayed with the
+          members' real overlays over all 2,897 multi-row content_keys on prod 2026-09-28, 179
+          change: 38 blocked short_description (koolseoul's title-only rows beside dodoskin/coscorea
+          1-2k-char copy) and 2 blocked no_image start serving; 135 were served from a SUPPRESSED
+          row (the retired Stila/Tarte/Tower 28 old-spelling rows, arencia's JP seeds, re-keyed
+          simihaze variants, the suppressed cocomo.sg row) and move to the live sibling; no served
+          overlay is dropped. A winner that already passes keeps rank 0, so only a content_key
+          whose current winner fails the bar can change.
       1. product_group_members.is_primary = true  (multi-seller canonical)
       2. catalog_products.pivota_signature_id is set  (indexed surface)
       3. lowest product_key ASC  (stable hash-derived ordering)
@@ -374,12 +412,13 @@ def pick_canonical(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     mixed_with_retailer = any(_is_retailer_listing(r) for r in rows)
 
-    def key(r: Dict[str, Any]) -> Tuple[int, int, int, int, str]:
+    def key(r: Dict[str, Any]) -> Tuple[int, int, int, int, int, str]:
         audit_rank = 1 if r.get("platform") == "url_audit" else 0
         brand_rank = (0 if _is_brand_store_row(r) else 1) if mixed_with_retailer else 0
+        content_rank = 0 if _passes_serving_content_bar(r) else 1
         primary_rank = 0 if r.get("group_is_primary") else 1
         sig_rank = 0 if r.get("pivota_signature_id") else 1
-        return (audit_rank, brand_rank, primary_rank, sig_rank, r.get("product_key") or "")
+        return (audit_rank, brand_rank, content_rank, primary_rank, sig_rank, r.get("product_key") or "")
 
     return sorted(rows, key=key)[0]
 
@@ -1188,26 +1227,13 @@ class _FetchFailed:
 FETCH_FAILED = _FetchFailed()
 
 
-async def _fetch_enrichment_for_canonical(
+async def _fetch_member_overlays(
     products: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    """Fetch the product_enrichment overlay for the served PDP. Prefers a
-    BRAND-ATTESTED overlay anywhere in the content_key cluster (the verified
-    brand's own copy is authoritative for the entity, even if attest keyed it to
-    a non-canonical member), else the canonical product's overlay. Keyed by the
-    catalog identity triple (merchant_id, platform, source_product_id), geo
-    'default'. Best-effort: any failure degrades to no overlay rather than
-    breaking the serve-cache rebuild — agent_pdp_view is a cache, never truth."""
-    if not products:
-        return None
+) -> Tuple[Dict[Tuple[str, str, str], Dict[str, Any]], bool]:
+    """Every cluster member's product_enrichment overlay, keyed by the catalog identity triple
+    (merchant_id, platform, source_product_id), geo 'default' -> (overlays, any_fetch_failed).
+    Best-effort: a failed read is reported, never raised."""
     from db.product_enrichment import get_enrichments_for_products
-
-    canonical = pick_canonical(products)
-    canonical_key = (
-        canonical.get("merchant_id"),
-        canonical.get("platform"),
-        canonical.get("source_product_id"),
-    )
 
     # ONE QUERY PER MERCHANT, not one per cluster member.
     #
@@ -1251,6 +1277,109 @@ async def _fetch_enrichment_for_canonical(
             continue
         for (platform, source_product_id), overlay in (fetched or {}).items():
             overlays[(merchant_id, platform, source_product_id)] = overlay
+    return overlays, any_fetch_failed
+
+
+def _overlay_for(product: Dict[str, Any], overlays: Dict[Tuple[str, str, str], Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    ident = (product.get("merchant_id"), product.get("platform"), product.get("source_product_id"))
+    if not all(ident):
+        return None
+    return overlays.get((str(ident[0]), str(ident[1]), str(ident[2])))
+
+
+def _brand_attested_overlay(
+    products: List[Dict[str, Any]], overlays: Dict[Tuple[str, str, str], Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """The FIRST brand-attested overlay in cluster order, or None. It serves whichever row wins."""
+    for product in products:
+        overlay = _overlay_for(product, overlays)
+        if overlay and overlay.get("updated_by_employee_id") == "brand_attestation":
+            return overlay
+    return None
+
+
+def annotate_served_copy(
+    products: List[Dict[str, Any]],
+    overlays: Dict[Tuple[str, str, str], Dict[str, Any]],
+    any_fetch_failed: bool,
+) -> None:
+    """Record on each row the title and description it would SERVE if it won the pick.
+
+    `_passes_serving_content_bar` must judge what the gate will read -- agent_pdp_view's
+    description, which assemble_row takes as coalesce(overlay description_markdown, the winner's
+    description, ...) -- not the row's raw column: an executor overlay (canonical_pdp_enrichment
+    writes one onto rows under 200 chars) makes a thin row serve fine, and demoting it would swap
+    800 chars of overlay for a sibling's 60 (review #2423). The overlay that applies to a row as
+    winner is the cluster's brand-attested overlay if there is one, else the row's own; the title
+    follows assemble_row the same way (title_override first).
+
+    DELIBERATELY NOT THE SEED. assemble_row falls back to the seed's copy and image, but which seed
+    a rebuild holds depends on its caller (the seed writer passes the seed that fired it, the
+    reconciler the cluster's newest), and a pick that read it would flip the served signature
+    between two refreshes of unchanged rows (review #2423). Rows and their overlays are the same
+    for every caller.
+
+    A FAILED overlay read judges every row as if it had no overlay -- the answer a successful read
+    gives almost every key -- rather than waving thin rows through: the rebuild then preserves the
+    published title/description, and a pick that differed from the successful read's would write
+    another row's signature and image under them (review #2423). The read itself (partial or not)
+    still rides on the rows for _fetch_enrichment_for_canonical, which reports FETCH_FAILED as before.
+    (Where an overlay DECIDES the pick and one merchant's read fails, the preserved copy can still
+    sit under the no-overlay winner's signature. Measured 2026-09-28: 0 of 2,896 multi-row
+    content_keys pick differently with and without their overlays; 22 have any overlay.)
+    """
+    judged = {} if any_fetch_failed else overlays
+    attested = _brand_attested_overlay(products, judged)
+    for product in products:
+        overlay = attested or _overlay_for(product, judged) or {}
+        product[_SERVED_COPY] = {
+            # the read itself, so the enrichment pick in the same rebuild reuses it
+            "own_overlay": _overlay_for(product, overlays),
+            "reads_failed": bool(any_fetch_failed),
+            "title": coalesce_first(overlay.get("title_override"), product.get("title")),
+            "description": coalesce_first(overlay.get("description_markdown"), product.get("description")),
+        }
+
+
+async def load_served_copy(products: List[Dict[str, Any]]) -> None:
+    """Fetch the members' overlays once and annotate the rows (annotate_served_copy). The read
+    rides on the rows, so _fetch_enrichment_for_canonical in the same rebuild does not repeat it."""
+    overlays, any_fetch_failed = await _fetch_member_overlays(products)
+    annotate_served_copy(products, overlays, any_fetch_failed)
+
+
+def _overlays_from_annotations(
+    products: List[Dict[str, Any]],
+) -> Optional[Tuple[Dict[Tuple[str, str, str], Dict[str, Any]], bool]]:
+    """The overlay read load_served_copy already made, recovered from the rows -- or None when
+    any row is unannotated (then the caller reads them itself)."""
+    if not products or any(not isinstance(p.get(_SERVED_COPY), dict) for p in products):
+        return None
+    overlays: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for product in products:
+        own = product[_SERVED_COPY].get("own_overlay")
+        ident = (product.get("merchant_id"), product.get("platform"), product.get("source_product_id"))
+        if own is not None and all(ident):
+            overlays[(str(ident[0]), str(ident[1]), str(ident[2]))] = own
+    return overlays, any(bool(p[_SERVED_COPY].get("reads_failed")) for p in products)
+
+
+async def _fetch_enrichment_for_canonical(
+    products: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Fetch the product_enrichment overlay for the served PDP. Prefers a
+    BRAND-ATTESTED overlay anywhere in the content_key cluster (the verified
+    brand's own copy is authoritative for the entity, even if attest keyed it to
+    a non-canonical member), else the canonical product's overlay. Keyed by the
+    catalog identity triple (merchant_id, platform, source_product_id), geo
+    'default'. Best-effort: any failure degrades to no overlay rather than
+    breaking the serve-cache rebuild — agent_pdp_view is a cache, never truth.
+    Rows annotated by load_served_copy carry the read already; it is reused, not repeated."""
+    if not products:
+        return None
+    overlays, any_fetch_failed = (
+        _overlays_from_annotations(products) or await _fetch_member_overlays(products)
+    )
 
     # Finding B: walk the content_key cluster — a brand-attested overlay wins
     # (only the verified brand can create one, so it's safe + authoritative for
@@ -1258,24 +1387,10 @@ async def _fetch_enrichment_for_canonical(
     # product that wins pick_canonical), else fall back to the canonical's overlay.
     # Iteration order is unchanged, so the winner is identical to the per-member
     # version: the FIRST brand-attested overlay in cluster order.
-    canonical_overlay: Optional[Dict[str, Any]] = None
-    for product in products:
-        ident = (
-            product.get("merchant_id"),
-            product.get("platform"),
-            product.get("source_product_id"),
-        )
-        if not all(ident):
-            continue
-        overlay = overlays.get(
-            (str(ident[0]), str(ident[1]), str(ident[2]))
-        )
-        if not overlay:
-            continue
-        if overlay.get("updated_by_employee_id") == "brand_attestation":
-            return overlay  # authoritative brand copy — wins immediately
-        if ident == canonical_key:
-            canonical_overlay = overlay
+    attested = _brand_attested_overlay(products, overlays)
+    if attested is not None:
+        return attested  # authoritative brand copy — wins immediately
+    canonical_overlay = _overlay_for(pick_canonical(products), overlays)
     if canonical_overlay is None and any_fetch_failed:
         # We have no overlay AND at least one read errored, so "there is no
         # overlay" is not a conclusion we are entitled to draw. Say so, and let
@@ -1373,6 +1488,10 @@ async def build_agent_pdp_view_row(
         if external_seed_id
         else await fetch_external_seed_for_keys(product_keys, db=read_db)
     )
+    # BEFORE the first pick_canonical below (evidence_safe_product_keys picks too): every pick in
+    # this rebuild must judge each row by what it would serve, overlay included, and all of them
+    # must see the same annotated rows. The overlays read here are reused for the enrichment pick.
+    await load_served_copy(products)
     # Identity-confidence gate: a no-GTIN content_key is deliberately non-unique
     # (brand+title), so a cluster can collide DISTINCT products. Scope the evidence
     # fetch to members safe to attribute to the served row, so we never bake
