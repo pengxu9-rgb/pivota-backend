@@ -64,7 +64,7 @@ MIGRATIONS = (
     # cases open would fail on an UndefinedColumn. See
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
-    MIGRATIONS_DIR / "246_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
+    MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
 )
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 
@@ -2697,16 +2697,87 @@ async def test_only_an_offer_code_rejection_triggers_the_requote(reap, attributi
 
 async def test_no_requote_when_the_budget_cannot_cover_one(reap, attribution, clock):
     """135 s of quote budget (170 less the checkout reserve). A refused code that took 115 s
-    leaves 20 -- under MIN_QUOTE_BUDGET_S -- so the retry is refused, not squeezed."""
+    leaves 20 -- under MIN_QUOTE_BUDGET_S -- so the re-quote is not squeezed in. The purchase is
+    NOT ended (#2425 review): the outcome is persisted through the fenced release, and the NEXT
+    step quotes without the code on a full budget."""
     purchase_id = await to_quoting_with_code()
     reap.request_cart_link_quote = [taking(clock, 115.0, rejected("OFFER_CODE_INVALID")),
                                     ok(cart_quote())]
     moved = await step(purchase_id)
-    assert moved.state == "refused" and moved.refusal_reason == "offer_code_rejected"
+    assert moved.outcome == "released" and moved.state == "quoting", moved
+    assert moved.last_error_code == "offer_code_invalid:no_retry_budget"
     assert len(reap.named("request_cart_link_quote")) == 1
     row = await get(purchase_id)
-    assert row["last_error_code"] == "offer_code_invalid:no_retry_budget"
-    assert row["buyer_email"] is None and "create_checkout" not in reap.sequence()
+    assert row["offer_code_outcome"] == "dropped_invalid"
+    assert row["buyer_email"] == EMAIL and "create_checkout" not in reap.sequence()
+
+    # The next step: ONE call, WITHOUT the code, and the outcome survives to the approval.
+    moved = await step(purchase_id)
+    assert moved.state == "awaiting_approval", moved
+    calls = reap.named("request_cart_link_quote")
+    assert len(calls) == 2 and "offer_code" not in calls[1]
+    assert (await get(purchase_id))["offer_code_outcome"] == "dropped_invalid"
+
+
+@pytest.mark.parametrize("second,expect_state", [
+    # a transport error on the re-quote: released, and the next step must not re-send the code
+    (rc.ReapResponse(ok=False, error="transport_error:ReadTimeout"), "quoting"),
+    # a retryable Reap answer on the re-quote: released the same way
+    (rejected("QUOTE_TEMPORARILY_UNAVAILABLE", status=503, retry_after=5), "quoting"),
+    # a quote with no id: a terminal failure that still says what happened to the code
+    (ok({k: v for k, v in cart_quote().items() if k != "id"}), "failed"),
+    # a quote that is already expired: released (quote_expired)
+    (ok(cart_quote(expiresAt="2020-01-01T00:00:00Z")), "quoting"),
+])
+async def test_the_dropped_outcome_is_written_on_every_exit(
+    reap, attribution, clock, second, expect_state
+):
+    """`_checkout_from_quote` writes what the code came to on EVERY exit it can write on -- a
+    transition or a release -- so a later step never re-sends a code Reap already refused."""
+    purchase_id = await to_quoting_with_code()
+    reap.request_cart_link_quote = [rejected("OFFER_CODE_EXPIRED"), second]
+    moved = await step(purchase_id)
+    assert moved.state == expect_state, moved
+    row = await get(purchase_id)
+    assert row["offer_code_outcome"] == "dropped_expired"
+    if expect_state == "quoting":
+        reap.request_cart_link_quote = ok(cart_quote())
+        assert (await step(purchase_id)).state == "awaiting_approval"
+        calls = reap.named("request_cart_link_quote")
+        assert len(calls) == 3 and "offer_code" not in calls[2]
+        assert (await get(purchase_id))["offer_code_outcome"] == "dropped_expired"
+
+
+async def test_an_applied_code_is_kept_on_a_release_and_re_sent(reap, attribution, clock):
+    """The other direction: a code Reap ACCEPTED is not dropped by a release (quote expired), and
+    the next quote carries it again."""
+    purchase_id = await to_quoting_with_code()
+    reap.request_cart_link_quote = ok(dict(discounted_quote(), expiresAt="2020-01-01T00:00:00Z"))
+    assert (await step(purchase_id)).state == "quoting"
+    assert (await get(purchase_id))["offer_code_outcome"] == "applied"
+    reap.request_cart_link_quote = ok(discounted_quote())
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    assert reap.named("request_cart_link_quote")[1]["offer_code"] == CODE
+
+
+async def test_the_claim_lost_between_the_two_quotes_makes_no_second_call(
+    reap, attribution, clock
+):
+    """The `_still_ours` re-read before the no-code re-quote. A worker whose lease moved while the
+    refused-code quote was in flight must not send a second quote to the merchant."""
+    purchase_id = await to_quoting_with_code()
+
+    async def _refused_then_stolen(**kwargs):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET claimed_by = 'w_other' WHERE id = :i",
+            {"i": purchase_id},
+        )
+        return rejected("OFFER_CODE_INVALID")
+
+    reap.request_cart_link_quote = [_refused_then_stolen, ok(cart_quote())]
+    moved = await step(purchase_id)
+    assert moved.outcome == "lost_claim"
+    assert len(reap.named("request_cart_link_quote")) == 1
 
 
 async def test_the_requote_is_given_what_is_left_of_the_budget(reap, attribution, clock):
@@ -2846,3 +2917,66 @@ async def test_the_ledger_refuses_what_the_service_would_never_write():
 def test_offer_code_is_create_only_and_its_outcome_is_a_transition_field():
     assert "offer_code" not in ledger._TRANSITION_FIELDS
     assert {"offer_code_outcome", "discount_minor"} <= set(ledger._TRANSITION_FIELDS)
+
+
+async def test_the_terminal_write_scrubs_the_code_and_keeps_its_outcome(reap, attribution, clock):
+    """B8 (#2425 review): the code is buyer-ENTERED, so the terminal write NULLs it with the email
+    and the address; what it came to, the discount and the tax flag are quote facts and stay."""
+    purchase_id = await to_quoting_with_code()
+    reap.request_cart_link_quote = ok(discounted_quote())
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    assert (await get(purchase_id))["offer_code"] == CODE
+    assert (await step(purchase_id)).state == "completed"
+    row = await get(purchase_id)
+    assert row["offer_code"] is None and row["buyer_email"] is None
+    assert (row["offer_code_outcome"], row["discount_minor"], row["tax_included"]) == (
+        "applied", 209, False)
+
+
+@pytest.mark.parametrize("sweep", ["expire", "exhaust"])
+async def test_both_sweeps_scrub_the_code_too(sweep):
+    row = await mk_cart_row(offer_code=CODE)
+    if sweep == "expire":
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET state = 'needs_enrollment', "
+            "hosted_url_expires_at = '2020-01-01 00:00:00' WHERE id = :i", {"i": row["id"]})
+        assert row["id"] in await ledger.expire_overdue_purchases(max_age_seconds=3600, limit=10)
+    else:
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET attempts = 99 WHERE id = :i", {"i": row["id"]})
+        assert row["id"] in await ledger.fail_exhausted_purchases(max_attempts=5, limit=10)
+    after = await get(row["id"])
+    assert after["offer_code"] is None and after["buyer_email"] is None
+
+
+async def test_tax_included_is_stored_and_public(reap, attribution):
+    """B7: a door summing subtotal + shipping + tax must know when tax is already in the prices."""
+    purchase_id = await to_quoting(reap)
+    quote = cart_quote()
+    quote["amountBreakdown"]["tax"] = {"amount": {"amount": 2.48, "currency": "USD"},
+                                       "includedInPrices": True}
+    reap.request_cart_link_quote = ok(quote)
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    row = await get(purchase_id)
+    assert row["tax_included"] is True and row["tax_minor"] == 248
+    assert ledger.public_purchase_view(row)["tax_included"] is True
+
+
+async def test_a_zero_retry_after_still_waits_one_second(reap, attribution):
+    """`max(1, retry_after)`: Reap's `Retry-After: 0` must not schedule a hot loop at `now`."""
+    purchase_id = await to_quoting(reap)
+    reap.request_cart_link_quote = rejected("QUOTE_TEMPORARILY_UNAVAILABLE", status=503,
+                                            retry_after=0)
+    moved = await step(purchase_id)
+    assert moved.outcome == "released" and moved.next_poll_in_seconds == 1
+
+
+async def test_a_reap_outage_is_released_not_refused(reap, attribution):
+    """B5: 503 AGENTIC_SERVICE_UNAVAILABLE is Reap's outage; it must not end the purchase as
+    `merchant_not_completable`."""
+    purchase_id = await to_quoting(reap)
+    reap.request_cart_link_quote = rejected("AGENTIC_SERVICE_UNAVAILABLE", status=503)
+    moved = await step(purchase_id)
+    assert moved.outcome == "released" and moved.state == "quoting"
+    assert moved.last_error_code == "service_unavailable"
+    assert (await get(purchase_id))["buyer_email"] == EMAIL

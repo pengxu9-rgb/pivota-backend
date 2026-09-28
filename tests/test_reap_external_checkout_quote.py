@@ -259,7 +259,6 @@ def _fail(wire, status, code, detail=None, headers=None):
      "quote_unfulfillable", "state_or_province_required"),
     (400, "QUOTE_UNFULFILLABLE", {"reason": "ADDRESS_LINE_2_REQUIRED"},
      "quote_unfulfillable", "address_line_2_required"),
-    (503, "AGENTIC_SERVICE_UNAVAILABLE", None, "service_unavailable", None),
     (409, "VARIANT_UNAVAILABLE", None, "variant_unavailable", None),
 ])
 def test_every_new_quote_code_classifies_to_its_own_kind(wire, status, code, detail, kind, reason):
@@ -281,10 +280,19 @@ def test_quote_temporarily_unavailable_is_retryable_records_retry_after_and_is_n
     assert got.merchant_probably_not_completable is False
     rejection = rc.classify_quote_rejection(got)
     assert rejection.retryable and rejection.retry_after_seconds == 7
-    # The OTHER 503 keeps its old meaning.
+    # A Reap OUTAGE that names itself is retryable too (#2425 review), never "not completable"...
     other = _fail(wire, 503, "AGENTIC_SERVICE_UNAVAILABLE")
-    assert other.merchant_probably_not_completable is True
-    assert rc.classify_quote_rejection(other).retryable is False
+    assert other.merchant_probably_not_completable is False
+    assert rc.classify_quote_rejection(other).kind == "service_unavailable"
+    assert rc.classify_quote_rejection(other).retryable is True
+    # ...and only a 503 whose code we cannot read keeps the old non-UCP inference.
+    wire.next_status = 503
+    wire.next_content = b"<html>busy</html>"
+    wire.next_headers = None
+    bare = _run(rc.request_cart_link_quote(cart_url=_link(), email="b@example.com",
+                                           shipping_address=GOOD_ADDRESS))
+    assert bare.merchant_probably_not_completable is True
+    assert rc.classify_quote_rejection(bare) is None
 
 
 def test_the_client_never_sleeps_on_retry_after(wire, monkeypatch):

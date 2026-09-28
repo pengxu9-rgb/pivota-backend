@@ -128,7 +128,7 @@ from services.reap_webhooks import major_to_minor
 # RECEIVED; see `create_purchase`.
 from services.reap_cart_link import cart_link_refusal, validate_cart_link
 
-# The offer-code rule (mig 246). The client owns it because it is the PARTNER's field shape, and
+# The offer-code rule (mig 247). The client owns it because it is the PARTNER's field shape, and
 # it imports nothing from db/ (stdlib, `services.reap_cart_link`, `utils.logger`), so this cannot
 # cycle. Imported rather than re-implemented: the route, the service and this module call the
 # same function object, pinned by identity in the tests.
@@ -299,17 +299,27 @@ _TRANSITION_FIELDS: Sequence[str] = (
     "next_poll_at",
     "shipping_address",
     "buyer_email",
-    # mig 246: what the buyer's offer code came to at the quote, and what Reap took off. Written
+    # mig 247: what the buyer's offer code came to at the quote, and what Reap took off. Written
     # by the 'quoting' step, never by create. `offer_code` itself is NOT here: it is the buyer's
     # input, stated once at create like the consent tag, and no poller step may revise it.
     "offer_code_outcome",
     "discount_minor",
+    # mig 247: whether `tax_minor` is ALREADY INSIDE the prices (Reap's `tax.includedInPrices`), so a
+    # reader summing subtotal + shipping + tax knows not to add it a second time.
+    "tax_included",
 )
 
-#: `offer_code_outcome` values (mig 246). The same set as
+#: `offer_code_outcome` values (mig 247). The same set as
 #: `services.reap_agentic_purchase.OFFER_CODE_OUTCOMES`, written out here because the ledger does
 #: not import the service; `test_the_offer_code_outcomes_agree` pins the two equal.
 OFFER_CODE_OUTCOMES = frozenset({"applied", "no_discount", "dropped_invalid", "dropped_expired"})
+
+
+def _require_offer_code_outcome(value: Any) -> Optional[str]:
+    """None, or one of `OFFER_CODE_OUTCOMES`; anything else is refused before any statement."""
+    if value is not None and value not in OFFER_CODE_OUTCOMES:
+        raise ValueError("offer_code_outcome is not a known outcome")
+    return value
 
 # Columns stored as jsonb on Postgres / TEXT-holding-JSON on SQLite. Encoded on the way in,
 # decoded on the way out — see properties 2 and 3.
@@ -776,6 +786,9 @@ def _normalize_row(row: Any, ts_columns: Sequence[str]) -> Optional[Dict[str, An
     for column in ts_columns:
         if column in out:
             out[column] = _decode_dt(out[column])
+    # SQLite hands a BOOLEAN back as 0/1; one shape out on both engines (mig 247).
+    if out.get("tax_included") is not None:
+        out["tax_included"] = bool(out["tax_included"])
     return out
 
 
@@ -853,11 +866,13 @@ def _is_unique_violation(exc: BaseException) -> bool:
 # `market_country`: an echoed catalog hint tells the owner nothing they did not send; a consent
 # tag tells them which of several versions was in force, which they may well not know.
 #
-# HERE, AND WHY — offer_code, offer_code_outcome, discount_minor (mig 246). The outcome is the
-# point: a code Reap refused is DROPPED and the purchase re-quoted without it, and the buyer must
-# be told that before they approve a price that is not the one they expected. The code is echoed
-# beside it so "dropped" names which code; it is the buyer's own input, not PII and not ours.
-# `discount_minor` is what Reap took off, next to the totals it explains.
+# HERE, AND WHY — offer_code, offer_code_outcome, discount_minor, tax_included (mig 247). The
+# outcome is the point: a code Reap refused is DROPPED and the purchase re-quoted without it, and
+# the buyer must be told that before they approve a price that is not the one they expected. The
+# code is echoed beside it while the purchase is in flight so "dropped" names which code; it is
+# buyer-ENTERED, so the terminal write NULLs it with the email and the address, and only the
+# outcome and the discount survive. `discount_minor` is what Reap took off, and `tax_included`
+# says whether `tax_minor` is already inside the prices, next to the totals they explain.
 PUBLIC_PURCHASE_COLUMNS = (
     "id",
     "state",
@@ -875,6 +890,7 @@ PUBLIC_PURCHASE_COLUMNS = (
     "final_total_minor",
     "shipping_minor",
     "tax_minor",
+    "tax_included",
     "hosted_url",
     "hosted_url_expires_at",
     "reap_quote_expires_at",
@@ -1191,7 +1207,7 @@ async def create_purchase(
     # buyer's address and email with no consent evidence and nothing scheduled to terminate it.
     consent = require_consent_version(consent_version)
     consented = _require_consented_at(consented_at, consent_version=consent)
-    # mig 246. THE SAME FUNCTION OBJECT the route and the service call -- one rule. Raises a
+    # mig 247. THE SAME FUNCTION OBJECT the route and the service call -- one rule. Raises a
     # ValueError here (the ledger's one refusal type) rather than the client's request error.
     try:
         code = validate_offer_code(offer_code)
@@ -1404,6 +1420,7 @@ _TRANSITION_SQL = """
            final_total_minor = COALESCE(:final_total_minor, final_total_minor),
            shipping_minor = COALESCE(:shipping_minor, shipping_minor),
            tax_minor = COALESCE(:tax_minor, tax_minor),
+           tax_included = COALESCE(:tax_included, tax_included),
            offer_code_outcome = COALESCE(:offer_code_outcome, offer_code_outcome),
            discount_minor = COALESCE(:discount_minor, discount_minor),
            hosted_url = COALESCE(:hosted_url, hosted_url),
@@ -1417,6 +1434,8 @@ _TRANSITION_SQL = """
                 THEN NULL ELSE COALESCE(CAST(:shipping_address AS JSONB), CAST(shipping_address AS JSONB)) END,
            buyer_email = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN NULL ELSE COALESCE(:buyer_email, buyer_email) END,
+           offer_code = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
+                THEN NULL ELSE offer_code END,
            claimed_by = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN NULL ELSE claimed_by END,
            claimed_at = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
@@ -1457,6 +1476,7 @@ _TRANSITION_SQL_SQLITE = """
            final_total_minor = COALESCE(:final_total_minor, final_total_minor),
            shipping_minor = COALESCE(:shipping_minor, shipping_minor),
            tax_minor = COALESCE(:tax_minor, tax_minor),
+           tax_included = COALESCE(:tax_included, tax_included),
            offer_code_outcome = COALESCE(:offer_code_outcome, offer_code_outcome),
            discount_minor = COALESCE(:discount_minor, discount_minor),
            hosted_url = COALESCE(:hosted_url, hosted_url),
@@ -1470,6 +1490,8 @@ _TRANSITION_SQL_SQLITE = """
                 THEN NULL ELSE COALESCE(:shipping_address, shipping_address) END,
            buyer_email = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN NULL ELSE COALESCE(:buyer_email, buyer_email) END,
+           offer_code = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
+                THEN NULL ELSE offer_code END,
            claimed_by = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN NULL ELSE claimed_by END,
            claimed_at = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
@@ -1572,9 +1594,10 @@ async def transition(
     unknown = [key for key in fields if key not in _TRANSITION_FIELDS]
     if unknown:
         raise TypeError(f"transition() got unexpected field(s): {', '.join(sorted(unknown))}")
-    outcome = fields.get("offer_code_outcome")
-    if outcome is not None and outcome not in OFFER_CODE_OUTCOMES:
-        raise ValueError("offer_code_outcome is not a known outcome")
+    _require_offer_code_outcome(fields.get("offer_code_outcome"))
+    tax_included = fields.get("tax_included")
+    if tax_included is not None and not isinstance(tax_included, bool):
+        raise ValueError("tax_included must be a bool or None")
     discount = fields.get("discount_minor")
     if discount is not None and (
         isinstance(discount, bool) or not isinstance(discount, int) or discount < 0
@@ -1766,6 +1789,7 @@ _RELEASE_CLAIM_SQL = """
            claimed_at = NULL,
            next_poll_at = COALESCE(:next_poll_at, next_poll_at),
            last_error_code = COALESCE(:last_error_code, last_error_code),
+           offer_code_outcome = COALESCE(:offer_code_outcome, offer_code_outcome),
            updated_at = clock_timestamp()
      WHERE id = :id
        AND claimed_by = :worker_id
@@ -1778,6 +1802,7 @@ _RELEASE_CLAIM_SQL_SQLITE = """
            claimed_at = NULL,
            next_poll_at = COALESCE(:next_poll_at, next_poll_at),
            last_error_code = COALESCE(:last_error_code, last_error_code),
+           offer_code_outcome = COALESCE(:offer_code_outcome, offer_code_outcome),
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
        AND claimed_by = :worker_id
@@ -1899,10 +1924,20 @@ async def release_claim(
     *,
     next_poll_at: Optional[datetime] = None,
     last_error_code: Optional[str] = None,
+    offer_code_outcome: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Give the lease back, optionally scheduling the next poll and recording WHY. None when this
     worker no longer holds the claim — the same fence, and the same answer, as a fenced
     `transition`.
+
+    ── `offer_code_outcome` (mig 247): WHAT A RELEASED QUOTE LEARNED ABOUT THE CODE ──────────
+
+    A quote step that learned Reap refuses the buyer's code (`dropped_invalid` /
+    `dropped_expired`) and then gives the lease back without a transition — no budget left for
+    the re-quote, a transport error on it, an expired quote — must not FORGET that: the next step
+    would send the same refused code again and spend another ~15 s at the merchant to hear the
+    same answer, on every poll. So the release carries it, through the same fence, COALESCEd like
+    `last_error_code`. Validated against `OFFER_CODE_OUTCOMES` before the statement.
 
     ── `last_error_code`: WHY THE STEP WAS RELEASED ─────────────────────────────────────────
 
@@ -1933,6 +1968,7 @@ async def release_claim(
         "worker_id": worker_id,
         "next_poll_at": _bind_dt(next_poll_at),
         "last_error_code": _require_error_code(last_error_code),
+        "offer_code_outcome": _require_offer_code_outcome(offer_code_outcome),
     }
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_RELEASE_CLAIM_SQL, values))
@@ -2010,6 +2046,7 @@ _EXPIRE_OVERDUE_SQL = """
        SET state = 'expired',
            shipping_address = NULL,
            buyer_email = NULL,
+           offer_code = NULL,
            claimed_by = NULL,
            claimed_at = NULL,
            last_error_code = COALESCE(last_error_code, 'hosted_url_expired'),
@@ -2036,6 +2073,7 @@ _EXPIRE_OVERDUE_SQL_SQLITE = """
        SET state = 'expired',
            shipping_address = NULL,
            buyer_email = NULL,
+           offer_code = NULL,
            claimed_by = NULL,
            claimed_at = NULL,
            last_error_code = COALESCE(last_error_code, 'hosted_url_expired'),
@@ -2063,6 +2101,7 @@ _FAIL_EXHAUSTED_SQL = """
            last_error_code = 'attempts_exhausted',
            shipping_address = NULL,
            buyer_email = NULL,
+           offer_code = NULL,
            claimed_by = NULL,
            claimed_at = NULL,
            terminal_at = clock_timestamp(),
@@ -2092,6 +2131,7 @@ _FAIL_EXHAUSTED_SQL_SQLITE = """
            last_error_code = 'attempts_exhausted',
            shipping_address = NULL,
            buyer_email = NULL,
+           offer_code = NULL,
            claimed_by = NULL,
            claimed_at = NULL,
            terminal_at = CURRENT_TIMESTAMP,

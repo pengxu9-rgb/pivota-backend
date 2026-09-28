@@ -194,6 +194,11 @@ _REFUSAL_STATUS: Dict[str, int] = {
     "consent_required": 400,
     # The request is well-formed; the world does not permit it. Editing the body will not help.
     "merchant_not_eligible": 409,
+    # An operator TURNED THIS MERCHANT OFF (a merchant row exists in this market and is disabled).
+    # A separate code from `merchant_not_eligible` ("nobody listed it") because a door may try the
+    # merchant another way on the second -- the gateway retries Tier B on it -- and must never do
+    # so on the first: "off" means off on every lane (see `_refuse_if_merchant_disabled`).
+    "merchant_disabled": 409,
     # The merchant is ALLOWLISTED but holds no fresh, positive purchasability fact: nobody has
     # recently rendered its checkout from the buyer's vantage and seen a card method at our
     # price. A SEPARATE CODE from `merchant_not_eligible` on purpose — the two say different
@@ -607,6 +612,35 @@ class _Eligibility:
         self.also_accept_domains = also_accept_domains
 
 
+async def _refuse_if_merchant_disabled(*, merchant_domain: str, market_country: str) -> None:
+    """`merchant_disabled` when an operator has a DISABLED merchant row for this merchant in this
+    market -- checked on the CART-LINK lane too.
+
+    THE CART-LINK LANE HAS ITS OWN ELIGIBILITY (the daily Tier B verdict), and before this it did
+    not read `reap_agentic_eligibility` at all. So the runbook's "turn a merchant off" (an UPDATE
+    to `enabled = FALSE`) stopped the variant lane and left the cart-link lane buying from the
+    same merchant -- and the gateway's Tier B retry, which fires on the variant lane's refusal,
+    made that the likely path rather than a corner. "Off" is a statement about the merchant, not
+    about one lane. The same folded match and the same market conjunct as `_eligibility`.
+    """
+    rows = await database.fetch_all(
+        _ELIGIBILITY_SQL,
+        {
+            "merchant_domain": merchant_domain,
+            "market_country": market_country,
+            "merchant_row": _MERCHANT_ROW,
+            "product_key": _MERCHANT_ROW,
+        },
+    )
+    if any(
+        str(dict(r).get("product_key") or "") == _MERCHANT_ROW and not bool(dict(r).get("enabled"))
+        for r in rows
+    ):
+        raise svc.PurchaseRefused(
+            "merchant_disabled", "an eligibility row for this domain and market is disabled"
+        )
+
+
 async def _eligibility(
     *, merchant_domain: str, market_country: str, product_key: str, variant_key: Optional[str]
 ) -> _Eligibility:
@@ -656,9 +690,16 @@ async def _eligibility(
     # order-independent answer and the one a payment gate should give. (Before canonical matching
     # the same ambiguity existed for a merchant row typed with a `variant_key`, and the answer
     # was row order.) The runbook's one-off collapses such twins.
-    if not merchant_rows or not all(bool(r.get("enabled")) for r in merchant_rows):
+    if not merchant_rows:
         raise svc.PurchaseRefused(
-            "merchant_not_eligible", "no enabled eligibility row for this domain and market"
+            "merchant_not_eligible", "no eligibility row for this domain and market"
+        )
+    if not all(bool(r.get("enabled")) for r in merchant_rows):
+        # NOT `merchant_not_eligible`: an operator turned this merchant off, and a door that
+        # tries another lane on "not eligible" must not route around that. See `merchant_disabled`
+        # in `_REFUSAL_STATUS`.
+        raise svc.PurchaseRefused(
+            "merchant_disabled", "an eligibility row for this domain and market is disabled"
         )
     merchant_row = merchant_rows[0]
 
@@ -1576,7 +1617,10 @@ _TOTAL_KEYS = (
     "final_total_minor",
     "shipping_minor",
     "tax_minor",
-    # mig 246: what Reap's offer-code discount took off, as evidence beside the total it
+    # mig 247: True when `tax_minor` is already INSIDE the prices (Reap's `tax.includedInPrices`),
+    # so a door summing subtotal + shipping + tax must not add it again. None until quoted.
+    "tax_included",
+    # mig 247: what Reap's offer-code discount took off, as evidence beside the total it
     # explains. `quoted_total_minor` is already net of it -- it is Reap's `finalAmount`.
     "discount_minor",
 )
@@ -1944,6 +1988,11 @@ async def start_reap_purchase(
             # THE OBSERVED HOST, NOT THE CANONICAL MERCHANT — see `merchant_host` above. The Tier B
             # verdict is keyed canonically by its own reader, so this is the same lookup either
             # way; the catalog read, the storefront evidence and the permalink are not.
+            # AN OPERATOR'S "OFF" FIRST: a disabled variant-lane row for this merchant refuses
+            # this lane too, whatever the Tier B verdict says.
+            await _refuse_if_merchant_disabled(
+                merchant_domain=merchant_domain, market_country=market_country
+            )
             if not await tierb_eligibility.is_cart_link_eligible(
                 merchant_host, market_country
             ):

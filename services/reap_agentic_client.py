@@ -1892,14 +1892,15 @@ async def _post(
                     # same cap as a success body and there is still exactly ONE bound per
                     # response; an oversized failure yields None and therefore no codes, which is
                     # the right way round.
-                    code, detail_code, detail_reason = (
+                    code, detail_code, detail_reason = _codes_for(
+                        path,
                         _error_codes(await _read_bounded(resp))
-                        if _reads_error_codes(path) else (None, None, None)
+                        if _reads_error_codes(path) else (None, None, None),
                     )
                     retry_after = _retry_after_seconds(
                         (resp.headers or {}).get("retry-after"))
-                    logger.warning("reap %s rejected: status=%s code=%s detail=%s reason=%s",
-                                   path, resp.status_code, code, detail_code, detail_reason)
+                    _log_rejection("reap", path, resp.status_code, code, detail_code,
+                                   detail_reason)
                     return ReapResponse(
                         ok=False, status=resp.status_code,
                         error=f"reap_status_{resp.status_code}",
@@ -2051,6 +2052,54 @@ def _error_codes(raw: Optional[bytes]) -> Tuple[Optional[str], Optional[str], Op
     return _code(error.get("code")), _code(detail.get("code")), _code(detail.get("reason"))
 
 
+def _is_quote_path(path: str) -> bool:
+    text = str(path or "")
+    return text == "/agentic/quotes" or text.startswith("/agentic/quotes/")
+
+
+#: Stand-in for a quote-leg `detail.reason` that passed the shape check but is not one the spec
+#: enumerates. The value itself is dropped (see `_codes_for`).
+UNRECOGNISED_REASON = "OTHER"
+
+
+def _codes_for(
+    path: str, codes: Tuple[Optional[str], Optional[str], Optional[str]]
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """What a failure body's codes may be KEPT as, per path.
+
+    ON THE QUOTE LEG, AN ALLOWLIST, NOT A SHAPE (review of #2425). The quote request carries the
+    buyer's address, and `_ERROR_CODE_RE` cannot tell `INVALID_PHONE` from an echoed
+    `SINGAPORE`, `SW1A1AA` or `JOHN_DOE` -- all upper-case tokens. So on `/agentic/quotes*` an
+    `error.code` is kept only if it is one of `QUOTE_REJECTION_KINDS`, `detail.code` (which the
+    quote spec does not define) is never kept, and `detail.reason` only if it is one of the
+    reasons the spec enumerates -- any other reason becomes `UNRECOGNISED_REASON`, so a new
+    partner reason is visible as "something we have not reviewed" without its text. The
+    enrollment and checkout legs, whose requests carry no address, keep the shape rule.
+    """
+    code, detail_code, reason = codes
+    if not _is_quote_path(path):
+        return code, detail_code, reason
+    known_reasons = frozenset().union(*QUOTE_REJECTION_REASONS.values())
+    return (
+        code if code in QUOTE_REJECTION_KINDS else None,
+        None,
+        (reason if reason in known_reasons else UNRECOGNISED_REASON) if reason else None,
+    )
+
+
+def _log_rejection(verb: str, path: str, status: Any, code: Any, detail: Any, reason: Any) -> None:
+    """One warning per failed partner call. On the quote leg only the CLASSIFIED code is logged
+    (`kind[:reason]`, our vocabulary, or `other`) -- never a partner scalar, allowlisted or not."""
+    if _is_quote_path(path):
+        rejection = classify_quote_rejection(
+            ReapResponse(ok=False, status=status, error_code=code, error_detail_reason=reason))
+        logger.warning("%s %s rejected: status=%s code=%s", verb, path, status,
+                       rejection.error_code if rejection else "other")
+        return
+    logger.warning("%s %s rejected: status=%s code=%s detail=%s reason=%s",
+                   verb, path, status, code, detail, reason)
+
+
 #: Ceiling on a recorded `Retry-After`. A partner value above it is clamped, not trusted: it
 #: becomes a poll schedule, and "come back in a week" from one response is not a schedule.
 MAX_RETRY_AFTER_S = 3600
@@ -2144,12 +2193,12 @@ async def _get(
                     # The body is read only on the two scoped paths, only for the two codes, and
                     # only through `_read_bounded`; an oversized error body simply yields no
                     # codes, which is the right trade and not a different outcome.
-                    code, detail_code, detail_reason = (
+                    code, detail_code, detail_reason = _codes_for(
+                        path,
                         _error_codes(await _read_bounded(resp))
-                        if _reads_error_codes(path) else (None, None, None)
+                        if _reads_error_codes(path) else (None, None, None),
                     )
-                    logger.warning("reap GET %s rejected: status=%s code=%s detail=%s reason=%s",
-                                   path, status, code, detail_code, detail_reason)
+                    _log_rejection("reap GET", path, status, code, detail_code, detail_reason)
                     return ReapResponse(
                         ok=False, status=status, error=f"reap_status_{status}",
                         error_code=code, error_detail_code=detail_code,
@@ -2321,10 +2370,18 @@ async def request_cart_link_quote(**kwargs: Any) -> ReapResponse:
 # this function; nothing else from a failure body exists in the process.
 
 #: 503s that say "try again later" rather than "this merchant cannot complete". Retried on the
-#: `Retry-After` schedule, never refused, and never read as `merchant_probably_not_completable`.
+#: `Retry-After` schedule (when sent), never refused, and never read as
+#: `merchant_probably_not_completable`.
+#:
+#: AGENTIC_SERVICE_UNAVAILABLE IS HERE TOO (review of #2425). It is the code of a REAP outage, and
+#: the n=2 inference that a 503 on a quote means "not a UCP merchant" was drawn from bodies we
+#: never read. Now that we read the code, an outage that NAMES itself must not end a buyer's
+#: purchase as `merchant_not_completable`; the attempts cap bounds a merchant that really never
+#: completes. A 503 whose code we cannot read keeps the old inference.
 TEMPORARY_UNAVAILABLE_CODES = frozenset({
     "QUOTE_TEMPORARILY_UNAVAILABLE",
     "CHECKOUT_TEMPORARILY_UNAVAILABLE",
+    "AGENTIC_SERVICE_UNAVAILABLE",
 })
 
 #: `error.code` -> kind. Lowercase kinds are OUR vocabulary (they land in `last_error_code`,
@@ -2349,7 +2406,11 @@ QUOTE_REJECTION_KINDS: Dict[str, str] = {
 }
 
 #: Kinds the purchase gives the lease back for, rather than ending on. See `retryable`.
-_RETRYABLE_KINDS = frozenset({"quote_temporarily_unavailable", "idempotency_request_in_progress"})
+_RETRYABLE_KINDS = frozenset({
+    "quote_temporarily_unavailable",
+    "service_unavailable",
+    "idempotency_request_in_progress",
+})
 
 #: The kinds that mean "the OFFER CODE was refused, the cart was not". Re-quoting once without
 #: the code is the purchase service's answer to exactly these two and to nothing else.
@@ -2389,9 +2450,10 @@ class QuoteRejection:
 
     @property
     def retryable(self) -> bool:
-        """Reap's own "try again": a temporary outage (503, with Retry-After), or the same
-        Idempotency-Key still being worked on by an earlier attempt (409). Neither is a fact
-        about the cart, so neither may end the purchase."""
+        """Reap's own "try again": a temporary outage (503 QUOTE_TEMPORARILY_UNAVAILABLE or
+        AGENTIC_SERVICE_UNAVAILABLE, Retry-After when sent), or the same Idempotency-Key still
+        being worked on by an earlier attempt (409). None is a fact about the cart, so none may
+        end the purchase."""
         return self.kind in _RETRYABLE_KINDS
 
     @property

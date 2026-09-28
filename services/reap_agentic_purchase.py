@@ -843,6 +843,10 @@ class QuoteCheck:
     #: an offer code; it is evidence of what Reap took off, never an input to the charge -- the
     #: charge is `finalAmount`, which is `total_minor`.
     discount_minor: Optional[int] = None
+    #: Reap's `tax.includedInPrices is True` for this quote: `tax_minor` is already inside the
+    #: prices and was NOT added in (c). Stored beside `tax_minor` (mig 247) so a reader of the
+    #: totals does not add it a second time.
+    tax_included: Optional[bool] = None
 
 
 def verify_quote(
@@ -1041,7 +1045,8 @@ def verify_quote(
         return QuoteCheck(False, "price_changed", "quote_items_subtotal_mismatch")
 
     # (c) — tax is a component only when it is not already inside the prices.
-    tax_component = 0 if tax_block.get("includedInPrices") is True else tax_minor
+    tax_included = tax_block.get("includedInPrices") is True
+    tax_component = 0 if tax_included else tax_minor
     reconstructed = subtotal_minor + shipping_minor + tax_component - discount_minor
     if abs(total_minor - reconstructed) > QUOTE_RECONCILE_TOLERANCE_MINOR:
         return QuoteCheck(False, "price_changed", "quote_total_not_reconciled")
@@ -1060,6 +1065,7 @@ def verify_quote(
         shipping_minor=shipping_minor,
         tax_minor=tax_minor,
         discount_minor=discount_minor if offer_code_sent else None,
+        tax_included=tax_included,
     )
 
 
@@ -1890,8 +1896,13 @@ async def _release(
     error_code: Optional[str] = None,
     transport: bool = False,
     seconds: Optional[int] = None,
+    offer_code_outcome: Optional[str] = None,
 ) -> AdvanceResult:
     """No progress: give the lease back and schedule the next look.
+
+    `offer_code_outcome`, when given, is written through the SAME fenced release (mig 247): a
+    quote step that learned Reap refuses the buyer's code must not forget it by releasing, or the
+    next step re-sends the refused code. See `_quote_with_offer_code`.
 
     `release_claim` takes `next_poll_at` AND NOTHING ELSE, so `error_code` cannot be persisted —
     it rides on the result and the log line. See the module header; this is the ledger's shape,
@@ -1918,6 +1929,9 @@ async def _release(
         # code outside `^[a-z0-9_:.-]{1,64}` rather than folding it, and this module builds
         # `transport_error:ReadTimeout` out of an httpx type name.
         last_error_code=error_code,
+        # Only when there is one, so a release that knows nothing about a code is the call it
+        # always was.
+        **({"offer_code_outcome": offer_code_outcome} if offer_code_outcome else {}),
     )
     if released is None:
         return _lost(row)
@@ -2273,6 +2287,8 @@ _QUOTE_REFUSAL_KINDS: Dict[str, str] = {
 
 #: `offer_code_outcome` values this module writes. The ledger holds the same set.
 OFFER_CODE_OUTCOMES = ("applied", "no_discount", "dropped_invalid", "dropped_expired")
+#: The outcomes after which the code is never sent again on this purchase.
+_DROPPED_OUTCOMES = frozenset({"dropped_invalid", "dropped_expired"})
 
 
 def _code_and_timeout(code: Optional[str], timeout: Optional[float]) -> Dict[str, Any]:
@@ -2307,6 +2323,8 @@ async def _quote_with_offer_code(
     call: Any,
     offer_code: Optional[str],
     deadline: float,
+    *,
+    dropped: Optional[str] = None,
 ) -> Any:
     """Quote once with the buyer's code; if Reap refuses THE CODE, quote once more without it.
 
@@ -2320,10 +2338,13 @@ async def _quote_with_offer_code(
 
     BOTH CALLS FIT ONE DEADLINE. `deadline` is the step's (`QUOTING_STEP_BUDGET_S` from the
     step's start, less `CHECKOUT_RESERVE_S`). Each call is given `min(slow-path bound, what is
-    left)`, and the retry is REFUSED -- `refused` / `offer_code_rejected` -- when what is left is
-    under `MIN_QUOTE_BUDGET_S`. The buyer is told their code was refused and nothing was charged;
-    a new purchase without the code starts with a full budget. Releasing instead would re-send
-    the same refused code on the next poll, forever.
+    left)`. When what is left after the refused code is under `MIN_QUOTE_BUDGET_S`, the re-quote
+    is NOT squeezed in: the outcome (`dropped_*`) is persisted through the fenced release and the
+    lease given back, and the next step -- which reads the persisted outcome and never re-sends a
+    dropped code (`_step_quoting`) -- quotes without it on a full budget.
+
+    `dropped` is an outcome an EARLIER step persisted; the code is then not sent at all and the
+    same outcome rides on this attempt so every exit writes it again.
 
     With no code this is exactly the call the lanes made before: same `_still_ours` re-read, no
     explicit timeout (the client's per-path default).
@@ -2331,7 +2352,7 @@ async def _quote_with_offer_code(
     if offer_code is None:
         if await _still_ours(row, worker_id) is None:
             return _lost(row)
-        return _QuoteAttempt(await call(None, None), offer_code_sent=False)
+        return _QuoteAttempt(await call(None, None), offer_code_sent=False, outcome=dropped)
 
     remaining = deadline - _monotonic()
     if remaining < MIN_QUOTE_BUDGET_S:
@@ -2348,10 +2369,9 @@ async def _quote_with_offer_code(
     outcome = "dropped_expired" if rejection.kind == "offer_code_expired" else "dropped_invalid"
     remaining = deadline - _monotonic()
     if remaining < MIN_QUOTE_BUDGET_S:
-        return await _move(
-            row, worker_id, ["quoting"], "refused",
-            refusal_reason="offer_code_rejected",
-            last_error_code=_error_code(f"{rejection.kind}:no_retry_budget"),
+        return await _release(
+            row, worker_id, error_code=f"{rejection.kind}:no_retry_budget",
+            offer_code_outcome=outcome,
         )
     if await _still_ours(row, worker_id) is None:
         return _lost(row)
@@ -2397,8 +2417,12 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
             row, worker_id, ["quoting"], "failed", last_error_code="partner_id_malformed"
         )
 
+    # A code an EARLIER step already heard Reap refuse is not sent again: the outcome was persisted
+    # (a transition or a release) and the quote goes out without it, carrying the same outcome.
+    prior_outcome = row.get("offer_code_outcome")
+    dropped = prior_outcome if prior_outcome in _DROPPED_OUTCOMES else None
     try:
-        offer_code = rc.validate_offer_code(row.get("offer_code"))
+        offer_code = None if dropped else rc.validate_offer_code(row.get("offer_code"))
     except rc.ReapRequestError:
         # `start_purchase` and the ledger both ran this rule before the row existed, so a row
         # that fails it here was written by something else. Refused before any partner call.
@@ -2409,7 +2433,8 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
 
     if _is_cart_link(row):
         return await _quote_cart_link(
-            row, worker_id, active, partner_enrollment, offer_code=offer_code, deadline=deadline
+            row, worker_id, active, partner_enrollment, offer_code=offer_code, deadline=deadline,
+            dropped=dropped,
         )
 
     resolution = await rc.resolve_our_row(**_resolution_inputs(row))
@@ -2444,7 +2469,9 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
             **_code_and_timeout(code, timeout),
         )
 
-    attempt = await _quote_with_offer_code(row, worker_id, _call, offer_code, deadline)
+    attempt = await _quote_with_offer_code(
+        row, worker_id, _call, offer_code, deadline, dropped=dropped
+    )
     if isinstance(attempt, AdvanceResult):
         return attempt
     return await _checkout_from_quote(
@@ -2469,6 +2496,7 @@ async def _quote_cart_link(
     *,
     offer_code: Optional[str] = None,
     deadline: Optional[float] = None,
+    dropped: Optional[str] = None,
 ) -> AdvanceResult:
     """'quoting' for a CART-LINK row: re-check the row, quote the URL, then the shared tail.
 
@@ -2497,6 +2525,7 @@ async def _quote_cart_link(
         attempt = await _quote_with_offer_code(
             row, worker_id, _call, offer_code,
             deadline if deadline is not None else _monotonic() + QUOTING_STEP_BUDGET_S,
+            dropped=dropped,
         )
     except rc.ReapRequestError as exc:
         # Raised BEFORE egress by the body builder. Its own code when it has one; a generic one
@@ -2546,17 +2575,24 @@ async def _checkout_from_quote(
     code_evidence: Dict[str, Any] = (
         {"offer_code_outcome": offer_code_outcome} if offer_code_outcome else {}
     )
+
+    async def _hold(**kwargs: Any) -> AdvanceResult:
+        """`_release`, carrying whatever this step knows about the code (see `code_evidence`)."""
+        return await _release(
+            row, worker_id, offer_code_outcome=code_evidence.get("offer_code_outcome"), **kwargs
+        )
+
     if not quote.ok:
         code = str(quote.error or "quote_failed")
         if _is_transport(code):
-            return await _release(row, worker_id, error_code=code, transport=True)
+            return await _hold(error_code=code, transport=True)
         rejection = rc.classify_quote_rejection(quote)
         if rejection is not None and rejection.retryable:
             # 503 QUOTE_TEMPORARILY_UNAVAILABLE: Reap's own "try again in a moment". Given the
             # lease back on Reap's schedule (Retry-After, recorded by the client and bounded
             # there), never slept on inside the step, and never read as the non-UCP 503 below.
-            return await _release(
-                row, worker_id, error_code=rejection.error_code,
+            return await _hold(
+                error_code=rejection.error_code,
                 transport=rejection.retry_after_seconds is None,
                 seconds=(max(1, rejection.retry_after_seconds)
                          if rejection.retry_after_seconds is not None else None),
@@ -2586,12 +2622,14 @@ async def _checkout_from_quote(
     raw_quote_id = str(quote.data.get("id") or "").strip()
     if not raw_quote_id:
         return await _move(
-            row, worker_id, ["quoting"], "failed", last_error_code="quote_id_missing"
+            row, worker_id, ["quoting"], "failed", last_error_code="quote_id_missing",
+            **code_evidence,
         )
     quote_id = _partner_id(raw_quote_id, what="quote")
     if quote_id is None:
         return await _move(
-            row, worker_id, ["quoting"], "failed", last_error_code="partner_id_malformed"
+            row, worker_id, ["quoting"], "failed", last_error_code="partner_id_malformed",
+            **code_evidence,
         )
 
     quote_expires = _parse_ts(quote.data.get("expiresAt"))
@@ -2622,6 +2660,7 @@ async def _checkout_from_quote(
         quoted_total_minor=verdict.total_minor,
         shipping_minor=verdict.shipping_minor,
         tax_minor=verdict.tax_minor,
+        tax_included=verdict.tax_included,
     )
     if verdict.discount_minor is not None:
         # A code was SENT and Reap priced it. `applied` when Reap returned discount lines,
@@ -2630,13 +2669,14 @@ async def _checkout_from_quote(
         # still `quoted_total_minor`, which is Reap's `finalAmount`.
         evidence["discount_minor"] = verdict.discount_minor
         evidence["offer_code_outcome"] = "applied" if verdict.discount_minor else "no_discount"
+        code_evidence["offer_code_outcome"] = evidence["offer_code_outcome"]
 
     # P2-9: a quote we already know is dead must not become a checkout. `reap_quote_expires_at`
     # was previously written and never read. Compared against this process's clock, which is the
     # clock available at this point; both sides are UTC, and the check is advisory — the partner
     # would refuse the create anyway. What it buys is a named reason and one fewer round trip.
     if quote_expires is not None and quote_expires <= _now():
-        return await _release(row, worker_id, error_code="quote_expired")
+        return await _hold(error_code="quote_expired")
 
     if await _still_ours(row, worker_id) is None:
         return _lost(row)
@@ -2657,8 +2697,8 @@ async def _checkout_from_quote(
             # answer as an expired quote -- give the lease back, on Reap's Retry-After when it
             # sent one, and let the next step re-quote -- never a terminal failure over a blip.
             wait = checkout.retry_after_seconds
-            return await _release(
-                row, worker_id, error_code=_error_code(top),
+            return await _hold(
+                error_code=_error_code(top),
                 transport=wait is None, seconds=max(1, wait) if wait is not None else None,
             )
         if "QUOTE_EXPIRED" in (detail, top):
@@ -2666,7 +2706,7 @@ async def _checkout_from_quote(
             # quote died between the quote and the create. Same answer as the pre-check -- give
             # the lease back and let the next step re-resolve and re-quote -- rather than the
             # generic branch below, which would END the purchase over a five-minute timer.
-            return await _release(row, worker_id, error_code="quote_expired")
+            return await _hold(error_code="quote_expired")
         if "ENROLLMENT_NOT_ACTIVE" in (detail, top):
             # 'quoting' → 'needs_enrollment' is not a legal edge, so there is no way to send the
             # buyer back to the card page on THIS purchase. Fail with the partner's own code; the
@@ -2688,7 +2728,7 @@ async def _checkout_from_quote(
             # the client turns a 200 carrying a `nextAction.url` it will not vouch for into
             # `ok=False, error="hosted_url_not_allowed"` AND DROPS `.data`, so the URL never
             # reaches this module at all.
-            return await _release(row, worker_id, error_code=code, transport=True)
+            return await _hold(error_code=code, transport=True)
         return await _move(
             row, worker_id, ["quoting"], "failed",
             last_error_code=_error_code(detail or checkout.error_code or code), **evidence,

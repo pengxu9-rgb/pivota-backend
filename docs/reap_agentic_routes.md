@@ -176,7 +176,8 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 |---|---|---|---|
 | 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured | fall back |
 | 401 | `agent_user_required` | no `X-Agent-User-JWT` | get a user token, or fall back |
-| 409 | `merchant_not_eligible` | no enabled variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market** | fall back |
+| 409 | `merchant_not_eligible` | no variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market** | fall back (a door may try the cart-link lane) |
+| 409 | `merchant_disabled` | an operator turned this merchant off: a variant-lane merchant row for this domain and market is disabled. Answered on **both** lanes | fall back; **do not** try another Reap lane |
 | 409 | `buyer_unlinked` | **you should never see this.** Since WP4b the buyer identity is created on the first purchase, so this no longer means "no link" — it is the fail-closed answer when the identity or the opaque ref could not be *stored* (a storage fault, not a request fault). Retrying is reasonable; editing the body will not help. | retry once, then fall back |
 | 409 | `row_not_found` | no such product under this domain, or the variant is not this product's, or no variant named and the product has more than one | fall back |
 | 409 | `row_not_shopify` | the catalog row's intake lane is not `shopify` | fall back |
@@ -412,14 +413,18 @@ if the poller is dark, or `completed` when an approval landed inside the last po
   `buyer.consent_version` on the `POST` that opened *this* purchase, and when. Never rewritten —
   a later purchase under a newer tag does not move them, and a terminal state does not clear
   them. `null` only on purchases opened before 233.
-* **`offer_code` / `offer_code_outcome` / `totals.discount_minor`** (migration **246**).
-  `offer_code` is what your door sent, as sent. `offer_code_outcome` is `null` until the quote,
-  then one of: `applied` (Reap took `discount_minor` off), `no_discount` (Reap accepted the code
-  and took nothing off), `dropped_invalid` / `dropped_expired` (Reap refused the code; the
-  purchase was re-quoted without it — **the price the buyer approves has no discount**).
-  `quoted_total_minor` is always Reap's own `finalAmount`, already net of any discount; we never
-  compute one. A refused code that leaves no time in the step for the re-quote ends the purchase
-  as `refused` / `offer_code_rejected`; start a new purchase without the code.
+* **`offer_code` / `offer_code_outcome` / `totals.discount_minor` / `totals.tax_included`**
+  (migration **247**). `offer_code` is what your door sent, as sent, while the purchase is in
+  flight; it is buyer input, so a terminal state (`completed`, `failed`, `refused`, `expired`)
+  clears it to `null` with the email and the address. `offer_code_outcome` is `null` until the
+  quote, then one of: `applied` (Reap took `discount_minor` off), `no_discount` (Reap accepted the
+  code and took nothing off), `dropped_invalid` / `dropped_expired` (Reap refused the code; the
+  purchase is re-quoted without it — **the price the buyer approves has no discount**). A dropped
+  code is never sent again on that purchase; if the step had no time left for the re-quote it is
+  released and the next poll re-quotes without the code. `quoted_total_minor` is always Reap's own
+  `finalAmount`, already net of any discount; we never compute one. `tax_included` is `true` when
+  `tax_minor` is already inside the prices (tax-inclusive markets such as SG): do **not** add it to
+  subtotal + shipping in that case.
 * **What is never here:** the buyer's email or address; `buyer_ref`, `agent_id`,
   `agent_user_ref_hash`; `reap_product_id`, `reap_variant_id`, `reap_quote_id`,
   `reap_checkout_id`; `enrollment_id`, `click_id`, `return_url`; any Reap media or image URL.

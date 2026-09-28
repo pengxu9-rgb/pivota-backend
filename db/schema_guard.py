@@ -1279,7 +1279,7 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
-            # mig 246: the buyer's offer code (create-only), what it came to at the
+            # mig 247: the buyer's offer code (create-only), what it came to at the
             # quote, and the discount Reap applied. The ledger names all three in
             # every purchase INSERT / transition, so without them every purchase
             # write fails loudly. ITS OWN try, per this block's rule, and not
@@ -1291,7 +1291,8 @@ async def ensure_required_schema_light() -> None:
                     ALTER TABLE IF EXISTS reap_agentic_purchases
                         ADD COLUMN IF NOT EXISTS offer_code VARCHAR(128),
                         ADD COLUMN IF NOT EXISTS offer_code_outcome VARCHAR(16),
-                        ADD COLUMN IF NOT EXISTS discount_minor BIGINT;
+                        ADD COLUMN IF NOT EXISTS discount_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS tax_included BOOLEAN;
                     """
                 )
             except Exception:  # noqa: BLE001
@@ -3852,7 +3853,7 @@ async def ensure_required_schema_light() -> None:
                         continue
             except Exception:  # noqa: BLE001
                 pass
-            # mig 246, SQLite twin: the offer-code columns, one statement per
+            # mig 247, SQLite twin: the offer-code columns, one statement per
             # column for the reason the mig-233 twin above states. Invisible to
             # the source-text coverage gate for the same reason; the runtime
             # suite (every offer-code assertion in the SQLite ledger/purchase
@@ -3862,6 +3863,7 @@ async def ensure_required_schema_light() -> None:
                     ("offer_code", "VARCHAR(128)"),
                     ("offer_code_outcome", "VARCHAR(16)"),
                     ("discount_minor", "BIGINT"),
+                    ("tax_included", "BOOLEAN"),
                 ):
                     try:
                         await database.execute(

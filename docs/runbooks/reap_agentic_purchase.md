@@ -958,6 +958,11 @@ than quietly resolving without the alias it was created to supply.
 --    once, at POST. They continue, and the poller finishes them. Folded, so a `www.` twin row is
 --    turned off too — and a disabled twin is enough on its own: the route refuses a merchant if
 --    ANY of its merchant rows in that market is disabled.
+--    It answers `409 merchant_disabled` (NOT `merchant_not_eligible`), on BOTH lanes: the
+--    cart-link (Tier B) lane also refuses a merchant with a disabled row here, whatever its daily
+--    Tier B verdict says, and the gateway never retries Tier B on `merchant_disabled`. To turn a
+--    merchant off that has NO variant-lane row, INSERT a disabled merchant row
+--    (product_key '', enabled FALSE) for it in that market.
 UPDATE reap_agentic_eligibility
    SET enabled = FALSE, updated_at = now()
  WHERE CASE WHEN lower(merchant_domain) LIKE 'www.%'

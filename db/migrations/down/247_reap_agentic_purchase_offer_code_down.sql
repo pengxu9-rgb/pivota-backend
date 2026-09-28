@@ -1,4 +1,4 @@
--- Reverse of 246_reap_agentic_purchase_offer_code.sql.
+-- Reverse of 247_reap_agentic_purchase_offer_code.sql.
 --
 -- WHAT THIS DESTROYS: the buyer's offer code on every purchase, what Reap made of it, and the
 -- discount Reap applied. Nothing else holds the code -- Reap's quote is gone within minutes.
@@ -10,6 +10,7 @@
 --
 -- `IF EXISTS` on each column and on the table, one statement each, so a partial apply reverses
 -- cleanly.
+ALTER TABLE IF EXISTS reap_agentic_purchases DROP COLUMN IF EXISTS tax_included;
 ALTER TABLE IF EXISTS reap_agentic_purchases DROP COLUMN IF EXISTS discount_minor;
 ALTER TABLE IF EXISTS reap_agentic_purchases DROP COLUMN IF EXISTS offer_code_outcome;
 ALTER TABLE IF EXISTS reap_agentic_purchases DROP COLUMN IF EXISTS offer_code;

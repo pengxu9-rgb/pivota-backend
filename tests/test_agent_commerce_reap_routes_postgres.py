@@ -107,7 +107,7 @@ _MIGRATIONS = (
     # would fail on an UndefinedColumn. See
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
-    _MIGRATIONS_DIR / "246_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
+    _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
 )
 
 #: Same convention as the ledger's gate: this file DROPS its tables, so it must be INCAPABLE of
@@ -1934,7 +1934,7 @@ async def test_a_disabled_twin_spelling_turns_the_merchant_off(
     for requested in ("brand-pg.example", "www.brand-pg.example"):
         resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=requested))
         assert resp.status_code == 409, (requested, resp.text)
-        assert _error(resp) == "merchant_not_eligible"
+        assert _error(resp) == "merchant_disabled"
 
 
 async def test_the_offer_seller_is_still_a_conjunct_under_the_www_spelling(client):

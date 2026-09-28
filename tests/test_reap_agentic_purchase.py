@@ -3194,3 +3194,32 @@ async def test_the_items_quote_drops_a_refused_code_and_requotes_once(reap, attr
     assert reap.sequence().count("resolve_our_row") == 1
     row = await ledger.get_purchase_internal(purchase_id)
     assert row["offer_code_outcome"] == "dropped_invalid" and row["quoted_total_minor"] == 4500
+
+
+@pytest.mark.parametrize("resolve_seconds,expect_quotes", [(114.0, 0), (112.0, 1)])
+async def test_a_slow_resolve_leaves_no_budget_for_a_coded_quote(
+    reap, attribution, monkeypatch, resolve_seconds, expect_quotes
+):
+    """B2(a), #2425 review. The variant lane resolves BEFORE it quotes, inside the same step
+    budget (135 s for quoting). A resolve that ate more than 113 s leaves under
+    MIN_QUOTE_BUDGET_S (22 s): the step is released as `quote_budget_exhausted` and NO quote is
+    sent. 112 s is the control: 23 s left, one quote."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(svc, "_monotonic", lambda: clock["now"])
+    purchase_id = await _to_quoting_with_code("SAVE10")
+    reap.calls.clear()
+
+    def _slow_resolve(**kwargs):
+        clock["now"] += resolve_seconds
+        return _resolved()
+
+    reap.resolve_our_row = _slow_resolve
+    reap.request_quote = _ok(_discounted())
+    moved = await _step(purchase_id)
+    assert len(reap.named("request_quote")) == expect_quotes
+    if expect_quotes == 0:
+        assert moved.outcome == "released" and moved.state == "quoting"
+        assert moved.last_error_code == "quote_budget_exhausted"
+    else:
+        assert moved.state == "awaiting_approval"
+        assert reap.named("request_quote")[0]["timeout_seconds"] == pytest.approx(23.0)

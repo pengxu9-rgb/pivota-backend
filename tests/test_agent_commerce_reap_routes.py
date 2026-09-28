@@ -1296,7 +1296,9 @@ async def test_a_disabled_eligibility_row_is_refused(client):
     await _seed_eligibility(enabled=False)
     resp = await client.post(f"{BASE}/purchases", json=_body())
     assert resp.status_code == 409
-    assert _error(resp) == "merchant_not_eligible"
+    # Its OWN code since #2425's review: an operator's "off" must be distinguishable from "never
+    # listed", or a door that tries the cart-link lane on the second routes around the first.
+    assert _error(resp) == "merchant_disabled"
 
 
 async def test_a_buyer_in_another_market_is_refused(client):
@@ -1808,6 +1810,7 @@ async def test_the_totals_are_one_object_with_one_spelling_each(client):
         "final_total_minor": None,
         "shipping_minor": 100,
         "tax_minor": 150,
+        "tax_included": None,
         "discount_minor": None,
     }
     for key in ("currency", "our_price_minor", "quoted_total_minor", "tax_minor"):
@@ -2747,7 +2750,7 @@ async def test_a_disabled_twin_spelling_turns_the_merchant_off(
     for requested in ("brand.example", "www.brand.example"):
         resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=requested))
         assert resp.status_code == 409, (requested, resp.text)
-        assert _error(resp) == "merchant_not_eligible"
+        assert _error(resp) == "merchant_disabled"
 
 
 async def test_the_offer_seller_is_still_a_conjunct_under_the_www_spelling(client):
@@ -2967,3 +2970,46 @@ def test_a_request_without_a_code_keeps_its_old_hash():
                  email="a@b.co", shipping_address={"city": "X"}, return_url="https://r")
     assert routes_reap._request_hash(**facts) == routes_reap._request_hash(**facts, offer_code=None)
     assert routes_reap._request_hash(**facts) != routes_reap._request_hash(**facts, offer_code="X")
+
+
+# ── merchant_disabled is a distinct answer, and it binds the cart-link lane too (B6) ──────────
+
+
+@pytest.mark.parametrize("spelling", ["brand.example", "www.brand.example"])
+async def test_a_disabled_variant_row_refuses_the_cart_link_lane_too(client, monkeypatch, spelling):
+    """An operator's "off" (runbook: UPDATE ... SET enabled = FALSE) must not be routed around by
+    the Tier B lane, whose own verdict says ELIGIBLE. Refused before any buyer or purchase write."""
+    await _seed_tierb_shopify_item()
+    await _seed_tierb_verdict()
+    await _seed_eligibility(domain=spelling, enabled=False)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link"))
+    assert resp.status_code == 409 and _error(resp) == "merchant_disabled"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM buyer_identity_links") == 0
+
+
+@pytest.mark.parametrize("variant_row", [None, "enabled", "other_market_disabled"])
+async def test_the_cart_link_lane_is_not_refused_without_a_disabled_row(
+    client, monkeypatch, variant_row
+):
+    """THE CONTROL, both ways: no variant row, an ENABLED one, or a disabled one in ANOTHER market
+    leaves the cart-link lane to its own Tier B verdict."""
+    await _seed_tierb_shopify_item()
+    await _seed_tierb_verdict()
+    if variant_row == "enabled":
+        await _seed_eligibility(enabled=True)
+    elif variant_row == "other_market_disabled":
+        await _seed_eligibility(enabled=False, market="SG")
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link"))
+    assert resp.status_code == 202, resp.text
+
+
+async def test_no_variant_row_is_still_merchant_not_eligible(client):
+    """The other half of the split: "never listed" keeps its old answer, which is the one a door
+    may try the cart-link lane on."""
+    await _seed_catalog()
+    await _seed_link()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 409 and _error(resp) == "merchant_not_eligible"
