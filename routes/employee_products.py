@@ -4901,8 +4901,8 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
 
     Returns counters so the batch can tell "healed 2,000" from "healed 0" — only `synced` means
     `sync_offer_for_seed` wrote a row; `wrote_mirror` / `wrote_attached` say which one. A skip in
-    OFFER_SYNC_STRUCTURAL_SKIP_STATUSES (no offer row this seed may touch) is marked
-    `structural_skip` so the batch does not count it as a projection that failed to write.
+    OFFER_SYNC_STRUCTURAL_SKIP_STATUSES (no offer row this seed may touch) is one the batch does
+    not count as a projection that failed to write.
     Dropping that dict is how a run that projected nothing would still have reported success.
 
     Best-effort and non-raising, mirroring the `seed_data_writer` hooks it stands in for: the
@@ -4927,7 +4927,6 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
 
         from services.external_offer_dual_write import (
             OFFER_SYNC_ERROR_STATUSES,
-            OFFER_SYNC_STRUCTURAL_SKIP_STATUSES,
             OFFER_SYNC_WRITTEN_STATUSES,
         )
 
@@ -4951,11 +4950,9 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
             counts["skip_" + (status or "unknown")] = 1
         else:
             counts["skipped"] = 1
+            # A status in OFFER_SYNC_STRUCTURAL_SKIP_STATUSES (nothing this writer may touch) is
+            # left out of "should have written" by the batch, which reads it off this key.
             counts["skip_" + (status or "unknown")] = 1
-            if status in OFFER_SYNC_STRUCTURAL_SKIP_STATUSES:
-                # Nothing this writer may touch. The batch leaves these out of "should have
-                # written" (external_referral_readiness.batch_run_status).
-                counts["structural_skip"] = 1
         # Per-row refusals inside the attached lane (a variant the page did not re-read, a row in
         # another currency), reported whether or not a sibling row was written.
         offer_skips = (outcome or {}).get("offer_skips")

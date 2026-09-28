@@ -297,20 +297,3 @@ def test_the_refresh_hook_reports_the_attached_write_and_row_skips(monkeypatch):
     counts = asyncio.run(ep._project_refreshed_seed_to_serving_surfaces("eps_1"))
     assert counts["projected"] == 1 and counts["wrote_attached"] == 1
     assert counts["offer_skip_variant_not_re_read"] == 2
-    assert "structural_skip" not in counts
-
-
-def test_the_refresh_hook_marks_a_structural_skip(monkeypatch):
-    import routes.employee_products as ep
-
-    async def fake_sync(seed_id, **kwargs):
-        return {"seed_id": seed_id, "status": "no_listing_offer"}
-
-    async def fake_pdp(**kwargs):
-        return "refreshed"
-
-    monkeypatch.setattr("services.external_offer_dual_write.dual_write_enabled", lambda: True)
-    monkeypatch.setattr("services.external_offer_dual_write.sync_offer_for_seed", fake_sync)
-    monkeypatch.setattr("services.seed_data_writer.refresh_agent_pdp_view_for_seed", fake_pdp)
-    counts = asyncio.run(ep._project_refreshed_seed_to_serving_surfaces("eps_1"))
-    assert counts["skip_no_listing_offer"] == 1 and counts["structural_skip"] == 1

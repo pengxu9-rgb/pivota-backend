@@ -1845,7 +1845,6 @@ async def run_external_referral_refresh_batch(
     proj_errored = 0
     proj_seconds = 0.0
     proj_skips: Dict[str, int] = {}
-    proj_structural = 0
     proj_writes: Dict[str, int] = {}
     proj_offer_skips: Dict[str, int] = {}
     pdp_refreshed = 0
@@ -1940,7 +1939,6 @@ async def run_external_referral_refresh_batch(
                     proj_written += int(proj.get("projected") or 0)
                     proj_errored += int(proj.get("errored") or 0)
                     proj_seconds += float(proj.get("seconds") or 0.0)
-                    proj_structural += int(proj.get("structural_skip") or 0)
                     pdp_refreshed += int(proj.get("pdp_refreshed") or 0)
                     pdp_errored += int(proj.get("pdp_errored") or 0)
                     for _k, _v in proj.items():
@@ -2024,6 +2022,13 @@ async def run_external_referral_refresh_batch(
             "snapshot without reaching the origin (paced-out host, robots, timeout or TLS)",
             refreshed_from_cache, refreshed,
         )
+    # Derived from the skip histogram with the WRITER's set, never restated here and never a
+    # second counter: skips with no offer row the writer may touch.
+    from services.external_offer_dual_write import OFFER_SYNC_STRUCTURAL_SKIP_STATUSES
+
+    proj_structural = sum(
+        n for status, n in proj_skips.items() if status in OFFER_SYNC_STRUCTURAL_SKIP_STATUSES
+    )
     return {
         # HONEST STATUS. This used to be `success if failed == 0`, and `failed` only counts
         # exceptions — so a run that stopped on budget, or that served half its rows from cache

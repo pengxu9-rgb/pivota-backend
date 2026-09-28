@@ -350,7 +350,7 @@ def test_a_starved_budget_stop_is_degraded_end_to_end(monkeypatch):
 
 def _structural(price="applied", status="no_mirror_product"):
     row = _ok(price=price, projected=0)
-    row["projection"].update({"skipped": 1, "skip_" + status: 1, "structural_skip": 1})
+    row["projection"].update({"skipped": 1, "skip_" + status: 1})
     return row
 
 
