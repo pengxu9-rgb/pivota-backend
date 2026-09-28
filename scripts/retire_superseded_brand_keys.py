@@ -115,9 +115,13 @@ WHERE content_key = ANY(:keys)
 # admits only pdp_lifecycle_stage validated/published or NULL (services/pivot_query_service.py; the same list
 # as retailer_ingest.pipeline.BACKEND_RECALL_LIFECYCLE_STAGES). A new row that serves its page but lands as
 # `candidate` or trust-shadowed is not findable. A row with no trust row is not searchable.
+# The PRODUCT's own trust row, joined the way search joins it (PIVOTA-Agent catalogServingIndex.js:
+# subject_type = 'product' AND subject_key = product_key). catalog_row_trust also holds offer / listing /
+# content_key rows whose nullable product_key names the product (mig 136); a public one of those must not
+# make an unsearchable product look searchable (queue review of #2426).
 SEARCHABLE_SQL = """
 SELECT p.product_key FROM catalog_products p
-JOIN catalog_row_trust t ON t.product_key = p.product_key
+JOIN catalog_row_trust t ON t.subject_type = 'product' AND t.subject_key = p.product_key
 WHERE p.product_key = ANY(:keys) AND t.serving_decision = 'public'
   AND (p.pdp_lifecycle_stage IS NULL OR p.pdp_lifecycle_stage IN ('validated', 'published'))
 """

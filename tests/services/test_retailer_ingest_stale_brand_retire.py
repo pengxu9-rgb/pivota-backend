@@ -444,7 +444,7 @@ async def test_revert_restores_only_rows_still_carrying_its_tombstone(monkeypatc
 
 def test_search_visibility_is_the_row_s_trust_and_recall_lifecycle():
     sql = " ".join(retire_tool.SEARCHABLE_SQL.split())
-    assert "JOIN catalog_row_trust t ON t.product_key = p.product_key" in sql
+    assert "JOIN catalog_row_trust t ON t.subject_type = 'product' AND t.subject_key = p.product_key" in sql
     assert "t.serving_decision = 'public'" in sql
     assert ("(p.pdp_lifecycle_stage IS NULL OR p.pdp_lifecycle_stage IN ('validated', 'published'))" in sql
             and pipeline.BACKEND_RECALL_LIFECYCLE_STAGES == ("validated", "published"))
