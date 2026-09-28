@@ -1525,6 +1525,12 @@ RETAILER_BRAND_SPELLINGS = {
     # not start with "Markwins WNW"). Markwins' OTHER labels (e.g. "Markwins Physicians Formula") are
     # deliberately not listed: only the WNW code names this brand.
     "wetnwild": "wetnwild", "wetnwildbeauty": "wetnwild", "markwinswnw": "wetnwild",
+    # ETUDE HOUSE renamed to ETUDE (2023) and retailers sell under both, measured in prod 2026-09-28: 293 retailer
+    # rows "ETUDE HOUSE" (luxiface.com 129, holiholic.com 106, openthebeauty.com 28, ...) against 184 "ETUDE" /
+    # "Etude" (dodoskin.com 77, moidaus.com 33, kbeautymakeup.com 24, ...) -- one product at two retailers never
+    # grouped. Existing rows are relabelled by scripts/relabel_retailer_brand.py (a re-crawl never updates a
+    # stored brand).
+    "etudehouse": "etude", "etude": "etude",
 }
 # The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
 # --brand. content_key is
@@ -1566,6 +1572,8 @@ RETAILER_BRAND_CANONICAL = {
     # The brand's own lowercase spelling, as on wetnwildbeauty.com.
     "wetnwild": "wet n wild",
     "lukbeautifood": "Lük Beautifood",
+    # The brand's own current name (etude.com). Every family member is relabelled to it (see the spellings note).
+    "etude": "ETUDE",
 }
 
 
