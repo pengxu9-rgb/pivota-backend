@@ -73,6 +73,7 @@ _MIGRATIONS = (
     # would fail on an UndefinedColumn. See
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
+    _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
 )
 
 # Same convention as the other gates on this rail: this file DROPS its tables, so it must be

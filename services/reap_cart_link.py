@@ -43,6 +43,7 @@ __all__ = [
     "MAX_CART_LINK_QUANTITY",
     "MAX_CART_URL_LENGTH",
     "cart_link_click_id",
+    "cart_link_host",
     "cart_link_line",
     "cart_link_refusal",
     "validate_cart_link",
@@ -293,3 +294,19 @@ def cart_link_click_id(url: object) -> Optional[str]:
     if reason is not None or parsed is None:
         return None
     return parsed[3]
+
+
+def cart_link_host(url: object) -> Optional[str]:
+    """The shop host a structurally valid cart link names, lowercased, or None. Structure only.
+
+    THE ONE SOURCE of `externalCheckout.merchantDomain` on a Reap cart-link quote: Reap refuses
+    a quote whose `merchantDomain` is not the URL's own host (400 `AGENTIC_REQUEST_REJECTED`,
+    measured 2026-09-28), so the client derives it from the URL rather than taking it as a
+    second input that could disagree.
+    """
+    if not isinstance(url, str):
+        return None
+    reason, parsed = _parse(url)
+    if reason is not None or parsed is None:
+        return None
+    return parsed[0]

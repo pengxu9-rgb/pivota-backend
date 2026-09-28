@@ -107,6 +107,7 @@ _MIGRATIONS = (
     # would fail on an UndefinedColumn. See
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
+    _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
 )
 
 #: Same convention as the ledger's gate: this file DROPS its tables, so it must be INCAPABLE of
@@ -1513,7 +1514,6 @@ async def test_tierb_cart_route_mints_owned_click_and_numeric_variant_on_postgre
         {"domain": DOMAIN},
     )
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
-    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "hypotheticalCartUrl")
     resp = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link"))
     assert resp.status_code == 202, resp.text
     purchase = await database.fetch_one(
@@ -1580,7 +1580,6 @@ async def test_tierb_mirrored_seed_requires_storefront_evidence_on_postgres(clie
             "VALUES (:domain, 'US', 'ELIGIBLE', now(), 1)", {"domain": DOMAIN},
         )
         monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
-        monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "hypotheticalCartUrl")
         response = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link"))
         assert response.status_code == 202, response.text
         purchase = await database.fetch_one(
@@ -1935,7 +1934,7 @@ async def test_a_disabled_twin_spelling_turns_the_merchant_off(
     for requested in ("brand-pg.example", "www.brand-pg.example"):
         resp = await client.post(f"{BASE}/purchases", json=_body(merchant_domain=requested))
         assert resp.status_code == 409, (requested, resp.text)
-        assert _error(resp) == "merchant_not_eligible"
+        assert _error(resp) == "merchant_disabled"
 
 
 async def test_the_offer_seller_is_still_a_conjunct_under_the_www_spelling(client):
@@ -2044,7 +2043,6 @@ async def test_the_cart_link_lane_keeps_the_host_it_was_given(client, monkeypatc
         {"domain": PG_CANONICAL_DOMAIN},
     )
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
-    monkeypatch.setattr(routes_reap.rc, "CART_LINK_QUOTE_FIELD", "hypotheticalCartUrl")
     resp = await client.post(
         f"{BASE}/purchases",
         json=_body(item_source="cart_link", merchant_domain="www.brand-pg.example"),

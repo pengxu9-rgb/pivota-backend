@@ -117,7 +117,8 @@ poller drives the state machine afterwards, on another process, over the next mi
 
 | field | required | notes |
 |---|---|---|
-| `item_source` | no (default `reap_variant`) | Set to `cart_link` for Tier B. The entire cart-link lane remains a 404 fallback until `REAP_AGENTIC_CART_LINK_ENABLED` is on **and** Reap publishes the quote body field (`CART_LINK_QUOTE_FIELD`, currently unset). |
+| `item_source` | no (default `reap_variant`) | Set to `cart_link` for Tier B. The entire cart-link lane remains a 404 fallback until `REAP_AGENTIC_CART_LINK_ENABLED` is on (it and `REAP_AGENTIC_ENABLED` are the only switches; the quote uses Reap's published `externalCheckout` body since 2026-09-28). |
+| `offer_code` | no | the buyer's own offer (coupon) code, either lane: a string of 1..128 characters with at least one non-whitespace character and no control character, sent to Reap **exactly as given** (not trimmed, not upper-cased). Empty, whitespace-only, over-long or control characters ⇒ `400 invalid_offer_code`; a non-string ⇒ `400 invalid_request`. Part of the idempotency hash when present (a retry that adds or changes a code is a different purchase). If Reap refuses the code (`OFFER_CODE_INVALID` / `OFFER_CODE_EXPIRED`) the purchase is re-quoted **once without it** and `offer_code_outcome` says so — tell your user before they approve. |
 | `merchant_domain` | yes | a bare host name, sent as observed (`www.brand.example` or `brand.example`); anything else — a scheme, port, path, userinfo, IP or single label — is `400 invalid_request`. Matched **canonically**: lower case, one leading `www.` removed, so `www.brand.example` and `brand.example` are the same merchant (`wwwbrand.example` is not). Variant lane: must be enabled in `reap_agentic_eligibility`. Cart-link lane: must have a fresh `tierb_cart_link_eligibility` verdict, and builds its cart URL on the host as sent. Both are checked in the buyer's market. |
 | `product_key` | yes | our catalog key (`catalog_products.product_key`). |
 | `variant_key` | no | our sku key (`catalog_skus.sku_key`), matched **exactly**. Omit only when the product has exactly one variant; a multi-variant product with no `variant_key` is `row_not_found`. |
@@ -127,7 +128,7 @@ poller drives the state machine afterwards, on another process, over the next mi
 | `buyer.shipping_address` | yes | **the Reap client's field names**, not the snake_case shape `/agent/v2/commerce/checkouts` uses. Required: `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `country`. Optional: `addressLine2`, `region`, `postalCode`. Unknown keys are dropped. |
 | `buyer.name`, `buyer.phone` | no | **fallbacks only.** Used when the address omits the field; never override it. `name` splits on the last space. |
 | `return_url` | no | defaults to `REAP_AGENTIC_RETURN_URL`, else `https://<first REAP_RETURN_URL_HOSTS host>/reap/return` — with nothing set, `https://api.pivota.cc/reap/return`, a static page this backend serves. Must be https, no userinfo, on a host in `REAP_RETURN_URL_HOSTS`. |
-| `idempotency_key` | no | honoured for **24 hours**, scoped to `(agent, buyer)`. |
+| `idempotency_key` | no | honoured for **24 hours**, scoped to `(agent, buyer)`. A variant-lane `409 merchant_not_eligible` is **remembered against the key** for that window: re-sending the same request with the same key is refused the same way even if the merchant is enabled meanwhile (a door that tried the cart-link lane under a second key must replay that purchase, not open another). Use a new key to start a new purchase. |
 | `click_context` | no | accepted and not forwarded. The click id this rail records is one **we** mint. |
 
 **There is no price field, and a price in the body is ignored.** The unit price comes from our
@@ -175,7 +176,8 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 |---|---|---|---|
 | 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured | fall back |
 | 401 | `agent_user_required` | no `X-Agent-User-JWT` | get a user token, or fall back |
-| 409 | `merchant_not_eligible` | no enabled variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market** | fall back |
+| 409 | `merchant_not_eligible` | no variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market** | fall back (a door may try the cart-link lane) |
+| 409 | `merchant_disabled` | an operator turned this merchant off: a variant-lane merchant row for this domain and market is disabled. Answered on **both** lanes | fall back; **do not** try another Reap lane |
 | 409 | `buyer_unlinked` | **you should never see this.** Since WP4b the buyer identity is created on the first purchase, so this no longer means "no link" — it is the fail-closed answer when the identity or the opaque ref could not be *stored* (a storage fault, not a request fault). Retrying is reasonable; editing the body will not help. | retry once, then fall back |
 | 409 | `row_not_found` | no such product under this domain, or the variant is not this product's, or no variant named and the product has more than one | fall back |
 | 409 | `row_not_shopify` | the catalog row's intake lane is not `shopify` | fall back |
@@ -189,6 +191,7 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 | 400 | `invalid_request` | the body is not a JSON object, did not validate, `quantity` out of range, `limit` out of range, or an identifier carries an unprintable character | fix the request |
 | 400 | `invalid_address` | the shipping address is incomplete or unprintable | fix the request |
 | 400 | `invalid_return_url` | not https, carries userinfo, or an unallowed host | fix the request |
+| 400 | `invalid_offer_code` | `offer_code` is empty, whitespace only, longer than 128 characters, or carries a control character | fix the request (or omit the code) |
 | 400 | `currency_unsupported` | a three-decimal currency; this rail's converter assumes two | fall back |
 
 No refusal ever carries the buyer's email or address, and none carries Reap's text.
@@ -410,6 +413,18 @@ if the poller is dark, or `completed` when an approval landed inside the last po
   `buyer.consent_version` on the `POST` that opened *this* purchase, and when. Never rewritten —
   a later purchase under a newer tag does not move them, and a terminal state does not clear
   them. `null` only on purchases opened before 233.
+* **`offer_code` / `offer_code_outcome` / `totals.discount_minor` / `totals.tax_included`**
+  (migration **247**). `offer_code` is what your door sent, as sent, while the purchase is in
+  flight; it is buyer input, so a terminal state (`completed`, `failed`, `refused`, `expired`)
+  clears it to `null` with the email and the address. `offer_code_outcome` is `null` until the
+  quote, then one of: `applied` (Reap took `discount_minor` off), `no_discount` (Reap accepted the
+  code and took nothing off), `dropped_invalid` / `dropped_expired` (Reap refused the code; the
+  purchase is re-quoted without it — **the price the buyer approves has no discount**). A dropped
+  code is never sent again on that purchase; if the step had no time left for the re-quote it is
+  released and the next poll re-quotes without the code. `quoted_total_minor` is always Reap's own
+  `finalAmount`, already net of any discount; we never compute one. `tax_included` is `true` when
+  `tax_minor` is already inside the prices (tax-inclusive markets such as SG): do **not** add it to
+  subtotal + shipping in that case.
 * **What is never here:** the buyer's email or address; `buyer_ref`, `agent_id`,
   `agent_user_ref_hash`; `reap_product_id`, `reap_variant_id`, `reap_quote_id`,
   `reap_checkout_id`; `enrollment_id`, `click_id`, `return_url`; any Reap media or image URL.

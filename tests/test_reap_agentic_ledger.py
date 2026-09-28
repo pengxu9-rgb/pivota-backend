@@ -551,6 +551,10 @@ _EXPECTED_PUBLIC_COLUMNS = {
     # partition test below forces the choice, and the allowlist's whole design is that a new
     # column is invisible until somebody writes it into both lists.
     "consent_version", "consented_at",
+    # mig 247. The buyer's OWN offer code (while in flight -- the terminal write NULLs it, as
+    # buyer input), what it came to (a code Reap refused is dropped and the buyer must be told
+    # before approving), what Reap took off, and whether tax_minor is already in the prices.
+    "offer_code", "offer_code_outcome", "discount_minor", "tax_included",
 }
 _EXPECTED_NEVER_PUBLIC = {
     "buyer_ref", "agent_id", "agent_user_ref_hash", "buyer_email", "shipping_address",
@@ -2702,7 +2706,8 @@ async def test_release_claim_has_no_attempts_delta():
 
     params = inspect.signature(ledger.release_claim).parameters
     assert "attempts_delta" not in params
-    assert set(params) == {"purchase_id", "worker_id", "next_poll_at", "last_error_code"}
+    assert set(params) == {
+        "purchase_id", "worker_id", "next_poll_at", "last_error_code", "offer_code_outcome"}
 
     purchase = await _claimed()
     before = (await ledger.get_purchase_internal(purchase["id"]))["attempts"]
@@ -3011,9 +3016,13 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
         "cart_url",
         "consent_version",
         "consented_at",
+        "offer_code",
+        "offer_code_outcome",
+        "discount_minor",
+        "tax_included",
     }, (
-        "the heal added something other than the three mig-225, two mig-229 and two mig-233 "
-        "columns"
+        "the heal added something other than the three mig-225, two mig-229, two mig-233 and "
+        "four mig-247 columns"
     )
 
     # And the rail works on the healed table.

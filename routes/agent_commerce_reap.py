@@ -180,6 +180,11 @@ _REFUSAL_STATUS: Dict[str, int] = {
     "invalid_address": 400,
     "invalid_return_url": 400,
     "currency_unsupported": 400,
+    # An offer code Reap's field cannot carry (empty, whitespace only, over 128 characters, a
+    # control character). Checked by `rc.validate_offer_code`, the one rule the service and the
+    # ledger also call. A code that is well-formed but that REAP refuses is not this: the
+    # purchase goes ahead without it and says so (`offer_code_outcome`).
+    "invalid_offer_code": 400,
     # The buyer did not agree to anything. 400 AND NOT 401/403: the caller CAN fix this by
     # editing the request — it is a missing field, not a missing credential — and a 401 would
     # send a door that already holds a valid user token off to re-authenticate, which would
@@ -189,6 +194,11 @@ _REFUSAL_STATUS: Dict[str, int] = {
     "consent_required": 400,
     # The request is well-formed; the world does not permit it. Editing the body will not help.
     "merchant_not_eligible": 409,
+    # An operator TURNED THIS MERCHANT OFF (a merchant row exists in this market and is disabled).
+    # A separate code from `merchant_not_eligible` ("nobody listed it") because a door may try the
+    # merchant another way on the second -- the gateway retries Tier B on it -- and must never do
+    # so on the first: "off" means off on every lane (see `_refuse_if_merchant_disabled`).
+    "merchant_disabled": 409,
     # The merchant is ALLOWLISTED but holds no fresh, positive purchasability fact: nobody has
     # recently rendered its checkout from the buyer's vantage and seen a card method at our
     # price. A SEPARATE CODE from `merchant_not_eligible` on purpose — the two say different
@@ -461,6 +471,21 @@ class StartPurchaseRequest(BaseModel):
     #: door can send what it already sends to the other commerce routes without a 422, and so
     #: that the day there is somewhere to put it, the field is already the one callers use.
     click_context: Optional[Dict[str, Any]] = None
+    #: The buyer's own offer (coupon) code, optional, either lane. Validated by the handler
+    #: through `rc.validate_offer_code` rather than by a pydantic constraint here, so a bad one
+    #: answers `invalid_offer_code` instead of a generic `invalid_request`, and so the rule has
+    #: one owner. Sent to Reap AS GIVEN; if Reap refuses it the purchase is re-quoted without it
+    #: and `offer_code_outcome` on the purchase says `dropped_invalid` / `dropped_expired`.
+    offer_code: Optional[str] = None
+
+
+def _offer_code(value: Any) -> Optional[str]:
+    """`rc.validate_offer_code` at the edge, as a `PurchaseRefused`. The SAME function object the
+    service and the ledger call -- one rule, one function; pinned by identity in the tests."""
+    try:
+        return rc.validate_offer_code(value)
+    except rc.ReapRequestError:
+        raise svc.PurchaseRefused("invalid_offer_code")
 
 
 def _buyer_address_for_client(buyer: ReapBuyer) -> Dict[str, Any]:
@@ -587,6 +612,35 @@ class _Eligibility:
         self.also_accept_domains = also_accept_domains
 
 
+async def _refuse_if_merchant_disabled(*, merchant_domain: str, market_country: str) -> None:
+    """`merchant_disabled` when an operator has a DISABLED merchant row for this merchant in this
+    market -- checked on the CART-LINK lane too.
+
+    THE CART-LINK LANE HAS ITS OWN ELIGIBILITY (the daily Tier B verdict), and before this it did
+    not read `reap_agentic_eligibility` at all. So the runbook's "turn a merchant off" (an UPDATE
+    to `enabled = FALSE`) stopped the variant lane and left the cart-link lane buying from the
+    same merchant -- and the gateway's Tier B retry, which fires on the variant lane's refusal,
+    made that the likely path rather than a corner. "Off" is a statement about the merchant, not
+    about one lane. The same folded match and the same market conjunct as `_eligibility`.
+    """
+    rows = await database.fetch_all(
+        _ELIGIBILITY_SQL,
+        {
+            "merchant_domain": merchant_domain,
+            "market_country": market_country,
+            "merchant_row": _MERCHANT_ROW,
+            "product_key": _MERCHANT_ROW,
+        },
+    )
+    if any(
+        str(dict(r).get("product_key") or "") == _MERCHANT_ROW and not bool(dict(r).get("enabled"))
+        for r in rows
+    ):
+        raise svc.PurchaseRefused(
+            "merchant_disabled", "an eligibility row for this domain and market is disabled"
+        )
+
+
 async def _eligibility(
     *, merchant_domain: str, market_country: str, product_key: str, variant_key: Optional[str]
 ) -> _Eligibility:
@@ -636,9 +690,16 @@ async def _eligibility(
     # order-independent answer and the one a payment gate should give. (Before canonical matching
     # the same ambiguity existed for a merchant row typed with a `variant_key`, and the answer
     # was row order.) The runbook's one-off collapses such twins.
-    if not merchant_rows or not all(bool(r.get("enabled")) for r in merchant_rows):
+    if not merchant_rows:
         raise svc.PurchaseRefused(
-            "merchant_not_eligible", "no enabled eligibility row for this domain and market"
+            "merchant_not_eligible", "no eligibility row for this domain and market"
+        )
+    if not all(bool(r.get("enabled")) for r in merchant_rows):
+        # NOT `merchant_not_eligible`: an operator turned this merchant off, and a door that
+        # tries another lane on "not eligible" must not route around that. See `merchant_disabled`
+        # in `_REFUSAL_STATUS`.
+        raise svc.PurchaseRefused(
+            "merchant_disabled", "an eligibility row for this domain and market is disabled"
         )
     merchant_row = merchant_rows[0]
 
@@ -1372,6 +1433,7 @@ def _request_hash(
     shipping_address: Mapping[str, Any],
     return_url: str,
     item_source: str = "reap_variant",
+    offer_code: Optional[str] = None,
 ) -> str:
     """A stable fingerprint of the fields that DECIDE this purchase.
 
@@ -1408,6 +1470,11 @@ def _request_hash(
     }
     if item_source != "reap_variant":
         facts["item_source"] = item_source
+    # Only when present, for the same reason as `item_source`: a request with no code keeps the
+    # hash it always had, and a retry that ADDS or CHANGES a code is a different purchase (it
+    # can change the price the buyer approves), so it must not replay the first one.
+    if offer_code is not None:
+        facts["offer_code"] = offer_code
     canonical = json.dumps(
         facts,
         sort_keys=True,
@@ -1458,7 +1525,64 @@ async def _replayed_purchase_id(
         raise svc.PurchaseRefused(
             "idempotency_conflict", "this key was used for a different request"
         )
-    return str(record.get("purchase_id") or "").strip() or None
+    stored = str(record.get("purchase_id") or "").strip()
+    if stored.startswith(_REFUSED_KEY_PREFIX):
+        # A TOMBSTONE: this key, for this exact request, was refused -- see
+        # `_tombstone_idempotency_key`. The same answer again, for the key's whole window.
+        reason = stored[len(_REFUSED_KEY_PREFIX):]
+        raise svc.PurchaseRefused(
+            reason if reason in _TOMBSTONED_REFUSALS else "merchant_not_eligible",
+            "this key was refused for this request",
+        )
+    return stored or None
+
+
+#: `reap_agentic_purchase_keys.purchase_id` of a key whose request was REFUSED (not a purchase).
+_REFUSED_KEY_PREFIX = "refused:"
+#: The refusals that are remembered against a key. Only the one a door answers by trying another
+#: lane with a DIFFERENT key; see `_tombstone_idempotency_key`.
+_TOMBSTONED_REFUSALS = frozenset({"merchant_not_eligible"})
+
+
+async def _tombstone_idempotency_key(
+    *, agent_id: str, agent_user_ref_hash: str, idempotency_key: str, request_hash: str,
+    reason: str,
+) -> None:
+    """Remember that THIS key, for THIS request, was refused with `reason`.
+
+    WHY (gateway review of #2425, G5). The UCP door answers a variant-lane
+    `merchant_not_eligible` by retrying the SAME buyer request on the cart-link lane under a
+    second, derived key K'. Before this, the refusal left key K unclaimed, so a client retry of
+    that create AFTER an operator enabled the merchant opened a SECOND purchase on the variant
+    lane under K, beside the cart-link one already opened under K' -- one buyer request, two
+    purchases, two hosted pages. With K remembered as refused, the retry gets the same refusal,
+    the door retries K', and the backend REPLAYS the cart-link purchase. The window is the key's
+    own (`_IDEMPOTENCY_WINDOW_SECONDS`); a buyer who wants the variant lane later sends a new key.
+
+    A failed insert is swallowed: the key is already claimed (a race, or a purchase), and the
+    lookup reads whichever row won.
+    """
+    if reason not in _TOMBSTONED_REFUSALS:
+        return
+    try:
+        await database.execute(
+            """
+            INSERT INTO reap_agentic_purchase_keys (
+                agent_id, agent_user_ref_hash, idempotency_key, purchase_id, request_hash
+            ) VALUES (
+                :agent_id, :agent_user_ref_hash, :idempotency_key, :purchase_id, :request_hash
+            )
+            """,
+            {
+                "agent_id": agent_id,
+                "agent_user_ref_hash": agent_user_ref_hash,
+                "idempotency_key": idempotency_key,
+                "purchase_id": f"{_REFUSED_KEY_PREFIX}{reason}",
+                "request_hash": request_hash,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _claim_idempotency_key(
@@ -1550,6 +1674,12 @@ _TOTAL_KEYS = (
     "final_total_minor",
     "shipping_minor",
     "tax_minor",
+    # mig 247: True when `tax_minor` is already INSIDE the prices (Reap's `tax.includedInPrices`),
+    # so a door summing subtotal + shipping + tax must not add it again. None until quoted.
+    "tax_included",
+    # mig 247: what Reap's offer-code discount took off, as evidence beside the total it
+    # explains. `quoted_total_minor` is already net of it -- it is Reap's `finalAmount`.
+    "discount_minor",
 )
 
 
@@ -1743,9 +1873,7 @@ async def start_reap_purchase(
 
         # The cart-link lane has two further dark gates. Decide them before consent or any
         # merchant/catalog read so a disabled lane is the same 404 fallback as the base rail.
-        if req.item_source == "cart_link" and (
-            not svc.is_cart_link_enabled() or not rc.supports_cart_link_quote()
-        ):
+        if req.item_source == "cart_link" and not svc.is_cart_link_enabled():
             raise svc.PurchaseRefused("not_available_on_this_rail")
 
         # ── CONSENT, AND WHERE IT SITS IN THE ORDER ──────────────────────────────────────────
@@ -1763,6 +1891,9 @@ async def start_reap_purchase(
         # purchase opened, and must not be able to learn — by the shape of the refusal — which
         # merchants we have enabled or what is in our catalogue.
         consent_version = _consent_version(req.buyer.consent_version)
+        # After consent, before anything is read or hashed: a code that cannot be sent is a
+        # malformed request, and it is part of what the idempotency key is a key FOR.
+        offer_code = _offer_code(req.offer_code)
 
         # EVERY ROUTE-OWNED IDENTIFIER THROUGH ONE CHECKPOINT, before any of them can reach a
         # bind. `.lower()` after the check rather than before: the check is about what the string
@@ -1826,6 +1957,7 @@ async def start_reap_purchase(
             shipping_address=shipping_address,
             return_url=return_url,
             item_source=req.item_source,
+            offer_code=offer_code,
         )
 
         if idempotency_key:
@@ -1913,6 +2045,11 @@ async def start_reap_purchase(
             # THE OBSERVED HOST, NOT THE CANONICAL MERCHANT — see `merchant_host` above. The Tier B
             # verdict is keyed canonically by its own reader, so this is the same lookup either
             # way; the catalog read, the storefront evidence and the permalink are not.
+            # AN OPERATOR'S "OFF" FIRST: a disabled variant-lane row for this merchant refuses
+            # this lane too, whatever the Tier B verdict says.
+            await _refuse_if_merchant_disabled(
+                merchant_domain=merchant_domain, market_country=market_country
+            )
             if not await tierb_eligibility.is_cart_link_eligible(
                 merchant_host, market_country
             ):
@@ -1924,12 +2061,23 @@ async def start_reap_purchase(
                 market_country=market_country,
             )
         else:
-            eligible = await _eligibility(
-                merchant_domain=merchant_domain,
-                market_country=market_country,
-                product_key=product_key,
-                variant_key=variant_key,
-            )
+            try:
+                eligible = await _eligibility(
+                    merchant_domain=merchant_domain,
+                    market_country=market_country,
+                    product_key=product_key,
+                    variant_key=variant_key,
+                )
+            except svc.PurchaseRefused as exc:
+                # The key remembers this refusal, so a retry after the merchant is enabled does
+                # not open a second purchase beside a cart-link one (`_tombstone_idempotency_key`).
+                if idempotency_key:
+                    await _tombstone_idempotency_key(
+                        agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash,
+                        idempotency_key=idempotency_key, request_hash=request_hash,
+                        reason=exc.reason,
+                    )
+                raise
             row = await _load_catalog_row(
                 merchant_domain=merchant_domain,
                 storefront_host=merchant_host,
@@ -1983,6 +2131,7 @@ async def start_reap_purchase(
             # with another caller's.
             click_id=click_id,
             return_url=return_url,
+            offer_code=offer_code,
         )
 
         if idempotency_key:
