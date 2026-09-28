@@ -110,6 +110,18 @@ SELECT content_key, serving_eligible FROM index_pipeline_state
 WHERE content_key = ANY(:keys)
 """
 
+# Search is a second surface with its own gate (review of #2426): public recall and discovery read the ROW's
+# catalog_row_trust.serving_decision = 'public' (services/catalog_trust_policy.py), and backend global recall
+# admits only pdp_lifecycle_stage validated/published or NULL (services/pivot_query_service.py; the same list
+# as retailer_ingest.pipeline.BACKEND_RECALL_LIFECYCLE_STAGES). A new row that serves its page but lands as
+# `candidate` or trust-shadowed is not findable. A row with no trust row is not searchable.
+SEARCHABLE_SQL = """
+SELECT p.product_key FROM catalog_products p
+JOIN catalog_row_trust t ON t.product_key = p.product_key
+WHERE p.product_key = ANY(:keys) AND t.serving_decision = 'public'
+  AND (p.pdp_lifecycle_stage IS NULL OR p.pdp_lifecycle_stage IN ('validated', 'published'))
+"""
+
 SEEDS_FOR_KEYS_SQL = """
 SELECT id, status FROM external_product_seeds
 WHERE attached_product_key = ANY(:keys)
@@ -197,7 +209,8 @@ def _host(value: Optional[str]) -> str:
 
 
 def select_retirable(cohort: List[Dict[str, Any]], rows: Dict[str, Dict[str, Any]], new_live: set,
-                     domain: str, *, serving: set, before_rewrite: bool = False) -> Dict[str, List[Dict[str, Any]]]:
+                     domain: str, *, serving: set, searchable: set,
+                     before_rewrite: bool = False) -> Dict[str, List[Dict[str, Any]]]:
     """Pure: split the cohort into what may be tombstoned and why the rest may not.
 
     A stale key is retirable only when it is present and live, owned by THIS store (derive_product_key
@@ -209,7 +222,11 @@ def select_retirable(cohort: List[Dict[str, Any]], rows: Dict[str, Dict[str, Any
     if the new row is blocked (short_description, ...) retiring the old row takes a served product off the
     catalog (hand-checked per store 2026-09-28). Such a key is kept as `new_not_serving`. An old row that is
     not serving loses nothing and is still retired. before_rewrite skips this with the new-key-live check:
-    the old order accepts the gap explicitly."""
+    the old order accepts the gap explicitly.
+
+    `searchable`: the same rule for search (public recall/discovery; SEARCHABLE_SQL), which gates on the ROW's
+    trust and lifecycle, not the page's content_key (review of #2426: the O HUI rows landed page-served but
+    `candidate`). Required as well. A key is kept when the retire would lose EITHER surface the old row has."""
     host = _host(domain)
     present = [c for c in cohort if c["stale_key"] in rows]
     suppressed = [c for c in present if rows[c["stale_key"]].get("suppression_reason")]
@@ -218,7 +235,9 @@ def select_retirable(cohort: List[Dict[str, Any]], rows: Dict[str, Dict[str, Any
     own = [c for c in live if c not in foreign]
     waiting = [] if before_rewrite else [c for c in own if c["new_key"] not in new_live]
     new_not_serving = [] if before_rewrite else [
-        c for c in own if c not in waiting and c["stale_key"] in serving and c["new_key"] not in serving
+        c for c in own if c not in waiting and (
+            (c["stale_key"] in serving and c["new_key"] not in serving)
+            or (c["stale_key"] in searchable and c["new_key"] not in searchable))
     ]
     retire = [c for c in own if c not in waiting and c not in new_not_serving]
     return {"present": present, "live": retire, "foreign": foreign, "waiting_for_new_key": waiting,
@@ -242,6 +261,13 @@ async def load_serving(stale_rows: Dict[str, Dict[str, Any]], own_live_new_rows:
     return {k for k, ck in ck_of.items() if ck in serving_cks}
 
 
+async def load_searchable(keys: List[str]) -> set:
+    """The `searchable` set for `select_retirable`: product_keys a public search can return (SEARCHABLE_SQL)."""
+    if not keys:
+        return set()
+    return {r["product_key"] for r in await database.fetch_all(SEARCHABLE_SQL, {"keys": sorted(set(keys))})}
+
+
 async def plan(domain: str, brand: str, category_path: str,
                stale_brand: Optional[str] = None, *, before_rewrite: bool = False) -> Dict[str, Any]:
     cohort = await build_cohort(domain, brand, category_path, stale_brand)
@@ -261,7 +287,9 @@ async def plan_for_cohort(cohort: List[Dict[str, Any]], domain: str, brand: str,
     new_live = {r["product_key"] for r in new_rows
                 if not r.get("suppression_reason") and _host(r.get("source_domain")) == _host(domain)}
     serving = await load_serving(rows, [r for r in new_rows if r["product_key"] in new_live])
-    split = select_retirable(cohort, rows, new_live, domain, serving=serving, before_rewrite=before_rewrite)
+    searchable = await load_searchable([*rows, *new_live])
+    split = select_retirable(cohort, rows, new_live, domain, serving=serving, searchable=searchable,
+                             before_rewrite=before_rewrite)
     present, live = split["present"], split["live"]
     # Seeds and offers for the keys this run will actually retire -- never a waiting or foreign key, so the
     # plan's counts are true and revert's manifest names only seeds this run deactivates.
@@ -274,6 +302,7 @@ async def plan_for_cohort(cohort: List[Dict[str, Any]], domain: str, brand: str,
         # product_keys (old and new) whose content_key serves, as read BEFORE any write: the drain's read-back
         # checks a retired key's new row still serves wherever its old row did.
         "serving": sorted(serving),
+        "searchable": sorted(searchable),
         "domain": domain, "brand_override": brand, "category_path": category_path, "stale_brand": stale_brand,
         "cohort": cohort, "rows": rows, "present": present, "live": live,
         "already_new": sorted(already_new), "seeds": seeds,

@@ -222,10 +222,13 @@ def test_the_option_is_accepted_on_a_brand_official_storefront():
 # --- the read-back, against a fake database ----------------------------------------------------------------
 
 class FakeDB:
-    def __init__(self, rows, serving_cks):
+    def __init__(self, rows, serving_cks, searchable=None):
         self.rows, self.serving_cks = rows, serving_cks
+        self.searchable = set(rows) if searchable is None else set(searchable)
 
     async def fetch_all(self, sql, values):
+        if "catalog_row_trust" in sql:
+            return [{"product_key": k} for k in values["keys"] if k in self.searchable]
         if "index_pipeline_state" in sql:
             return [{"content_key": ck, "serving_eligible": ck in self.serving_cks} for ck in values["keys"]]
         return [self.rows[k] for k in values["keys"] if k in self.rows]
@@ -435,3 +438,68 @@ async def test_revert_restores_only_rows_still_carrying_its_tombstone(monkeypatc
     assert calls == [("unsuppress", "k_ours", "retire_x", retire_tool.REASON),
                      ("unsuppress", "k_retired_again", "retire_x", retire_tool.REASON),
                      ("seed", "s1", ("k_ours",))]
+
+
+# --- queue review of #2426: search is a second surface, gated per ROW --------------------------------------
+
+def test_search_visibility_is_the_row_s_trust_and_recall_lifecycle():
+    sql = " ".join(retire_tool.SEARCHABLE_SQL.split())
+    assert "JOIN catalog_row_trust t ON t.product_key = p.product_key" in sql
+    assert "t.serving_decision = 'public'" in sql
+    assert ("(p.pdp_lifecycle_stage IS NULL OR p.pdp_lifecycle_stage IN ('validated', 'published'))" in sql
+            and pipeline.BACKEND_RECALL_LIFECYCLE_STAGES == ("validated", "published"))
+
+
+@pytest.mark.parametrize("serving,searchable,kept", [
+    ({"old0", "new0"}, {"old0"}, True),          # page fine, search lost: the O HUI `candidate` case
+    ({"old0"}, {"old0", "new0"}, True),           # search fine, page lost
+    ({"old0", "new0"}, {"old0", "new0"}, False),  # both surfaces carried over
+    ({"old0", "new0"}, set(), False),             # the old row was never searchable: nothing to lose there
+    (set(), set(), False),                        # nothing served before, nothing lost
+])
+def test_a_retire_never_loses_either_surface_the_old_row_had(serving, searchable, kept):
+    rows = {"old0": {"suppression_reason": None, "source_domain": "tartecosmetics.com"}}
+    out = retire_tool.select_retirable([pair(0)], rows, {"new0"}, "tartecosmetics.com",
+                                       serving=serving, searchable=searchable)
+    assert bool(out["new_not_serving"]) is kept and bool(out["live"]) is not kept
+
+
+@pytest.mark.parametrize("host", ["tartex.com", "shop.tartecosmetics.com.evil", "tartecosmetics.co",
+                                  "tartecosmetics.com.evil", "xtartecosmetics.com"])
+def test_the_store_host_match_is_exact(host):
+    rows = {"old0": {"suppression_reason": None, "source_domain": host}}
+    out = retire_tool.select_retirable([pair(0)], rows, {"new0"}, "tartecosmetics.com", serving=set(),
+                                       searchable=set())
+    assert out["foreign"] and not out["live"]
+    assert retire_tool.select_retirable([pair(0)], {"old0": {**rows["old0"], "source_domain": "WWW.TarteCosmetics.com"}},
+                                        {"new0"}, "tartecosmetics.com", serving=set(), searchable=set())["live"]
+
+
+async def test_the_readback_catches_a_retired_row_that_left_search(monkeypatch):
+    import db.database as dbmod
+    fake = FakeDB({"old0": row("old0", suppressed=True), "new0": row("new0")}, {"ck_new0"}, searchable=set())
+    monkeypatch.setattr(dbmod, "database", fake)
+    monkeypatch.setattr(retire_tool, "database", fake)
+    p = {**fake_plan(live=1, serving=["old0"]), "searchable": ["old0"]}
+    out = await pipeline._retire_readback(p, retire_tool)
+    assert not out["ok"] and out["problems"] == ["searchable before, new key not searchable: new0"]
+
+
+async def test_the_plan_reads_search_visibility_for_both_sides(monkeypatch):
+    from tests.test_retire_superseded_brand_keys import _plan_env
+    new_rows = [{"product_key": k, "source_domain": "stilacosmetics.com", "suppression_reason": None,
+                 "content_key": f"ck_{k}"} for k in ("new0", "new1")]
+    tool, asked = _plan_env(monkeypatch, new_rows=new_rows, serving_cks={"ck_old0", "ck_new0", "ck_old1", "ck_new1"},
+                            searchable_keys={"old0", "new0", "old1"})
+    p = await tool.plan("stilacosmetics.com", "Stila", "beauty", "Stila Cosmetics")
+    assert sorted(asked["searchable"][0]) == ["new0", "new1", "old0", "old1"]
+    assert [c["stale_key"] for c in p["live"]] == ["old0"]
+    assert [c["stale_key"] for c in p["new_not_serving"]] == ["old1"]  # old1 is findable, new1 is not
+    assert p["searchable"] == ["new0", "old0", "old1"]
+
+
+def test_a_failed_readback_names_the_offer_revert_too():
+    r = {"stale_brand": STALE, "outcome": "readback_failed", "counts": {"products": 2}, "retire_run_id": "retire_x",
+         "readback": {"problems": ["new key not live: new1"]}}
+    line = pipeline._retire_reason(r)
+    assert "revert --ingest-run" in line and "revert_offer_suppression" in line

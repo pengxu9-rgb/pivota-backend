@@ -181,7 +181,7 @@ def _rows(**over):
 def test_a_stale_key_is_retired_only_once_its_new_key_is_live():
     """Measured: 72 of stilacosmetics.com's 125 records were unresolved, and the drain drops those; retiring
     their stale keys first would have hidden the products."""
-    out = select_retirable(_C, _rows(), new_live={"new0", "new1"}, domain="stilacosmetics.com", serving=set())
+    out = select_retirable(_C, _rows(), new_live={"new0", "new1"}, domain="stilacosmetics.com", searchable=set(), serving=set())
     assert [c["stale_key"] for c in out["live"]] == ["old0", "old1"]
     assert [c["stale_key"] for c in out["waiting_for_new_key"]] == ["old2", "old3", "old4"]
 
@@ -189,7 +189,7 @@ def test_a_stale_key_is_retired_only_once_its_new_key_is_live():
 def test_another_sources_row_under_the_same_key_is_never_retired():
     rows = _rows(old0={"source_domain": "someretailer.com"}, old1={"source_domain": None})
     out = select_retirable(_C, rows, new_live={f"new{i}" for i in range(5)}, domain="www.stilacosmetics.com",
-                           serving=set())
+                           searchable=set(), serving=set())
     assert {c["stale_key"] for c in out["foreign"]} == {"old0", "old1"}
     assert {c["stale_key"] for c in out["live"]} == {"old2", "old3", "old4"}   # www. is the same store
 
@@ -198,13 +198,13 @@ def test_absent_and_already_suppressed_keys_are_left_alone():
     rows = _rows(old0={"suppression_reason": "x"})
     del rows["old1"]
     out = select_retirable(_C, rows, new_live={f"new{i}" for i in range(5)}, domain="stilacosmetics.com",
-                           serving=set())
+                           searchable=set(), serving=set())
     assert {c["stale_key"] for c in out["live"]} == {"old2", "old3", "old4"}
     assert {c["stale_key"] for c in out["present"]} == {"old0", "old2", "old3", "old4"}
 
 
 def test_the_old_order_is_an_explicit_choice():
-    out = select_retirable(_C, _rows(), new_live=set(), domain="stilacosmetics.com", serving=set(),
+    out = select_retirable(_C, _rows(), new_live=set(), domain="stilacosmetics.com", searchable=set(), serving=set(),
                            before_rewrite=True)
     assert len(out["live"]) == 5 and out["waiting_for_new_key"] == []
 
@@ -271,7 +271,7 @@ def test_the_cli_plumbs_the_old_order_flag(monkeypatch):
     assert seen["before_rewrite"] is True
 
 
-def _plan_env(monkeypatch, *, new_rows, serving_cks=()):
+def _plan_env(monkeypatch, *, new_rows, serving_cks=(), searchable_keys=()):
     """plan() against a fake DB: two stale rows on the store, new keys as given; seeds/offers recorded.
     Stale row oldN carries content_key ck_oldN; `serving_cks` are the serving_eligible content_keys."""
     import scripts.retire_superseded_brand_keys as tool
@@ -290,6 +290,9 @@ def _plan_env(monkeypatch, *, new_rows, serving_cks=()):
         if "external_product_seeds" in sql:
             asked["seeds"] = list(keys)
             return [{"id": f"seed_{k}", "status": "active"} for k in keys]
+        if "catalog_row_trust" in sql:
+            asked.setdefault("searchable", []).append(list(keys))
+            return [{"product_key": k} for k in keys if k in searchable_keys]
         if "index_pipeline_state" in sql:
             asked["serving"].append(list(keys))
             # Every key has a state row; the flag says which serve. Unserved flags alternate FALSE / NULL.
@@ -343,20 +346,20 @@ def _keys(out, bucket):
 
 
 def test_a_served_old_row_is_kept_while_its_new_row_is_not_served():
-    out = select_retirable(_C[:1], _rows(), new_live=_ALL_NEW, domain="stilacosmetics.com", serving={"old0"})
+    out = select_retirable(_C[:1], _rows(), new_live=_ALL_NEW, domain="stilacosmetics.com", searchable=set(), serving={"old0"})
     assert _keys(out, "live") == []
     assert _keys(out, "new_not_serving") == ["old0"]
 
 
 def test_an_unserved_old_row_is_retired_even_though_its_new_row_is_not_served():
     """Nothing is on the storefront to lose."""
-    out = select_retirable(_C[:1], _rows(), new_live=_ALL_NEW, domain="stilacosmetics.com", serving=set())
+    out = select_retirable(_C[:1], _rows(), new_live=_ALL_NEW, domain="stilacosmetics.com", searchable=set(), serving=set())
     assert _keys(out, "live") == ["old0"] and out["new_not_serving"] == []
 
 
 def test_a_served_old_row_is_retired_once_its_new_row_serves():
     out = select_retirable(_C[:1], _rows(), new_live=_ALL_NEW, domain="stilacosmetics.com",
-                           serving={"old0", "new0"})
+                           searchable=set(), serving={"old0", "new0"})
     assert _keys(out, "live") == ["old0"] and out["new_not_serving"] == []
 
 
@@ -364,7 +367,7 @@ def test_the_serving_check_splits_a_mixed_store_per_key():
     """old0 served/new0 blocked (kept), old1 dark/new1 blocked, old2 served/new2 served, old3 waiting, old4 x."""
     rows = _rows(old4={"suppression_reason": "x"})
     out = select_retirable(_C, rows, new_live={"new0", "new1", "new2"}, domain="stilacosmetics.com",
-                           serving={"old0", "old2", "new2", "old3"})
+                           searchable=set(), serving={"old0", "old2", "new2", "old3"})
     assert _keys(out, "new_not_serving") == ["old0"]
     assert _keys(out, "live") == ["old1", "old2"]
     assert _keys(out, "waiting_for_new_key") == ["old3"]
@@ -379,7 +382,7 @@ def test_the_serving_map_is_required():
 def test_the_old_order_retires_regardless_of_serving():
     """--before-rewrite retires before the new key exists at all; the serving gap is what it opts into."""
     out = select_retirable(_C, _rows(), new_live=set(), domain="stilacosmetics.com",
-                           serving={f"old{i}" for i in range(5)}, before_rewrite=True)
+                           searchable=set(), serving={f"old{i}" for i in range(5)}, before_rewrite=True)
     assert len(out["live"]) == 5 and out["new_not_serving"] == []
 
 

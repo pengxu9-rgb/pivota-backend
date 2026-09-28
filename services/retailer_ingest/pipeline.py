@@ -1343,7 +1343,8 @@ def _retire_reason(r: Dict[str, Any]) -> str:
     if r["outcome"] == "readback_failed":
         return (f"{head}retired {r['counts']['products']} key(s) ({r['retire_run_id']}) but the read-back "
                 f"disagrees: {r['readback']['problems'][:3]}; revert with retire_superseded_brand_keys revert "
-                f"--ingest-run <this run>")
+                f"--ingest-run <this run>, THEN services.catalog_offer_suppression.revert_offer_suppression("
+                f"<the manifest's product_keys>) -- restored rows have no live offers until it runs")
     return f"{head}retire FAILED, nothing retired: {r.get('error')}"
 
 
@@ -1365,7 +1366,9 @@ async def _retire_readback(p: Dict[str, Any], retire_tool: Any) -> Dict[str, Any
     new_live = {r["product_key"] for r in new_rows
                 if not r.get("suppression_reason") and retire_tool._host(r.get("source_domain")) == host}
     serving = await retire_tool.load_serving({}, [r for r in new_rows if r["product_key"] in new_live])
+    searchable = await retire_tool.load_searchable(sorted(new_live))
     was_serving = {c["stale_key"] for c in retired} & set(p.get("serving") or [])
+    was_searchable = {c["stale_key"] for c in retired} & set(p.get("searchable") or [])
     problems = []
     for c in retired:
         if not (old.get(c["stale_key"]) or {}).get("suppression_reason"):
@@ -1374,8 +1377,10 @@ async def _retire_readback(p: Dict[str, Any], retire_tool: Any) -> Dict[str, Any
             problems.append(f"new key not live: {c['new_key']}")
         elif c["stale_key"] in was_serving and c["new_key"] not in serving:
             problems.append(f"served before, new key not serving: {c['new_key']}")
+        elif c["stale_key"] in was_searchable and c["new_key"] not in searchable:
+            problems.append(f"searchable before, new key not searchable: {c['new_key']}")
     return {"ok": not problems, "retired": len(retired), "new_live": len(new_live),
-            "new_serving": len(serving), "problems": problems[:20]}
+            "new_serving": len(serving), "new_searchable": len(searchable), "problems": problems[:20]}
 
 
 async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timings: Dict[str, float],
