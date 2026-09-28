@@ -346,16 +346,77 @@ def test_the_identity_keepers_load_what_the_bar_reads():
             assert column in sql
 
 
-def test_the_dedup_sweep_auto_approves_only_a_keeper_that_is_the_served_row():
+def test_the_dedup_sweep_never_auto_suppresses_the_served_row():
     """The keeper reads raw columns; serving reads overlays. Where they differ, an unreviewed apply
-    would suppress the row being served -- so it is held, and counted (review #2423)."""
-    from services.identity_reconcile_sweep import APPROVE_ALLOWLIST_SQL, HELD_AUTO_APPROVE_SQL
+    would suppress the row being served -- so that proposal is held for review (review #2423)."""
+    from services.identity_reconcile_sweep import (
+        APPROVE_ALLOWLIST_SQL, HELD_AUTO_APPROVE_SQL, REVIEW_HELD_SQL, _A_LOSER_IS_SERVED)
 
-    for sql in (APPROVE_ALLOWLIST_SQL, HELD_AUTO_APPROVE_SQL):
-        assert "av.pivota_signature_id = cp.pivota_signature_id" in sql
-        assert "cp.product_key = p.keeper_product_key" in sql
-        assert "NOT EXISTS (SELECT 1 FROM agent_pdp_view av WHERE av.content_key = p.content_key)" in sql
-    assert "NOT (TRUE" in HELD_AUTO_APPROVE_SQL
+    assert "cp.pivota_signature_id = av.pivota_signature_id" in _A_LOSER_IS_SERVED
+    assert "cp.product_key = ANY(p.subject_product_keys)" in _A_LOSER_IS_SERVED
+    assert "cp.product_key <> p.keeper_product_key" in _A_LOSER_IS_SERVED
+    assert "AND NOT EXISTS (" + _A_LOSER_IS_SERVED + ")" in APPROVE_ALLOWLIST_SQL
+    for sql in (HELD_AUTO_APPROVE_SQL, REVIEW_HELD_SQL):
+        assert "AND EXISTS (" + _A_LOSER_IS_SERVED + ")" in sql
+
+
+def test_a_held_proposal_is_counted_warned_and_sent_to_review(monkeypatch, caplog):
+    import json
+    import logging
+
+    import services.identity_reconcile_sweep as sweep
+
+    held = {"proposal_id": "irp_held", "kind": "suppress_dup", "strategy": "same_url_dup", "merchant_id": "m",
+            "content_key": "ck_x", "subject_product_keys": ["a", "b"], "keeper_product_key": "a",
+            "confidence": 0.99, "evidence": "{}"}
+
+    class _Conn:
+        summary = None
+
+        async def fetchval(self, sql, *a):
+            return 0
+
+        async def fetch(self, sql, *a):
+            return [held] if sql is sweep.REVIEW_HELD_SQL else []
+
+        async def fetchrow(self, sql, *a):
+            if sql is sweep.HELD_AUTO_APPROVE_SQL:
+                return {"n": 1}
+            if sql is sweep.ENQUEUE_REVIEW_TASK_SQL:
+                return {"id": a[0]}
+            return None
+
+        async def execute(self, sql, *a):
+            if sql is sweep.INSERT_EVENT_SQL:
+                _Conn.summary = json.loads(a[3])
+
+        async def close(self):
+            pass
+
+    async def _connect(*a, **kw):
+        return _Conn()
+
+    monkeypatch.setattr(sweep, "_connect_with_retry", _connect)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://fake")
+    monkeypatch.delenv("ENABLE_TIER3_JUDGE", raising=False)
+    with caplog.at_level(logging.WARNING, logger="identity_reconcile_sweep"):
+        out = asyncio.run(sweep.run_identity_reconcile_sweep_tick(force=True))
+    assert out["auto_approve_held_loser_served"] == 1
+    assert _Conn.summary["auto_approve_held_loser_served"] == 1
+    assert out["review_tasks_enqueued"] == ["pdptask_ir_irp_held"]
+    assert any("held for review" in r.getMessage() for r in caplog.records)
+
+
+def test_a_partial_overlay_read_still_hands_the_enrichment_pick_what_it_read():
+    """A failed read judges the PICK as if no overlay existed, but the overlays that were read still
+    reach _fetch_enrichment_for_canonical, which serves the canonical's own as before."""
+    passing = _titled("ext:retailer:0000", "a.example", description="x" * 80)
+    other = _titled("ext:retailer:9999", "b.example", description="y" * 80)
+    rows = [passing, other]
+    overlay = {"description_markdown": OVERLAY_COPY}
+    assembler.annotate_served_copy(rows, _overlays((passing, overlay)), True)
+    assert pick_canonical(rows) is passing
+    assert asyncio.run(assembler._fetch_enrichment_for_canonical(rows)) is overlay
 
 
 def test_the_scripts_that_pick_the_served_winner_annotate_first(monkeypatch):

@@ -1322,6 +1322,9 @@ def annotate_served_copy(
     published title/description, and a pick that differed from the successful read's would write
     another row's signature and image under them (review #2423). The read itself (partial or not)
     still rides on the rows for _fetch_enrichment_for_canonical, which reports FETCH_FAILED as before.
+    (Where an overlay DECIDES the pick and one merchant's read fails, the preserved copy can still
+    sit under the no-overlay winner's signature. Measured 2026-09-28: 0 of 2,896 multi-row
+    content_keys pick differently with and without their overlays; 22 have any overlay.)
     """
     judged = {} if any_fetch_failed else overlays
     attested = _brand_attested_overlay(products, judged)
