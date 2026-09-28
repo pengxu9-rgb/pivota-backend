@@ -39,6 +39,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from collections import Counter
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
@@ -52,13 +53,32 @@ sys.path.insert(0, _REPO_ROOT)
 CLASSES = ("currency_named", "currency_named_other", "no_currency", "no_price", "fetch_failed")
 HOST_CONCURRENCY = 6
 SAMPLE_PREFIX = "CURRENCY_SAMPLE_JSON "
+_PART_RE = re.compile(r"CURRENCY_SAMPLE_JSON_PART (\d+)/(\d+) (\[.*\])\s*$")
 
 
 def load_sample(text: str) -> List[Dict[str, Any]]:
-    text = text.strip()
-    if text.startswith(SAMPLE_PREFIX):
-        text = text[len(SAMPLE_PREFIX):]
-    data = json.loads(text)
+    """The census sample, from any of: the census's whole output (its `CURRENCY_SAMPLE_JSON_PART
+    i/n` lines, in any order, with or without a log prefix), the old single `CURRENCY_SAMPLE_JSON`
+    line, or the bare JSON list. A missing or duplicated part is refused, never probed around."""
+    parts: Dict[int, list] = {}
+    totals = set()
+    for line in text.splitlines():
+        m = _PART_RE.search(line)
+        if m:
+            i, n = int(m.group(1)), int(m.group(2))
+            if i in parts:
+                raise SystemExit(f"CURRENCY_SAMPLE_JSON_PART {i}/{n} appears twice")
+            parts[i] = json.loads(m.group(3))
+            totals.add(n)
+    if parts:
+        if len(totals) != 1 or sorted(parts) != list(range(1, totals.pop() + 1)):
+            raise SystemExit(f"incomplete sample: have parts {sorted(parts)} of {sorted(totals) or '?'}")
+        data: Any = [item for i in sorted(parts) for item in parts[i]]
+    else:
+        text = text.strip()
+        if text.startswith(SAMPLE_PREFIX):
+            text = text[len(SAMPLE_PREFIX):]
+        data = json.loads(text)
     if not isinstance(data, list):
         raise SystemExit("the sample must be the JSON list from CURRENCY_SAMPLE_JSON")
     return [d for d in data if isinstance(d, dict) and d.get("urls")]
@@ -180,8 +200,9 @@ async def _production_fetch(url: str) -> str:
 
 async def _main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    parser.add_argument("sample", help="file holding the census's CURRENCY_SAMPLE_JSON line or its JSON")
+    parser.add_argument("sample", help="the census output (or its CURRENCY_SAMPLE_JSON lines, or the bare JSON)")
     parser.add_argument("--max-hosts", type=int, default=0, help="probe only the N largest hosts (0 = all)")
+    parser.add_argument("--out", help="also write the full result, every page's observation included, here")
     args = parser.parse_args(argv)
     with open(args.sample) as fh:
         sample = load_sample(fh.read())
@@ -191,8 +212,32 @@ async def _main(argv: Optional[Sequence[str]] = None) -> int:
     summary = summarise(sample, observations)
     for line in render(summary):
         print(line)
-    print("PROBE_JSON " + json.dumps({**summary, "observations": observations}, default=str, separators=(",", ":")))
+    for line in output_lines(summary):
+        print(line)
+    if args.out:
+        with open(args.out, "w") as fh:
+            json.dump({**summary, "observations": observations}, fh, default=str)
     return 0
+
+
+def output_lines(summary: Dict[str, Any]) -> List[str]:
+    """`PROBE_JSON {totals}` and `PROBE_HOSTS_JSON_PART i/n [...]`, each under the census's line
+    cap (one line of every host overflowed Cloud Logging's 102,400-character cut)."""
+    census = _census_module()
+    return [
+        "PROBE_JSON " + json.dumps({"totals": summary["totals"]}, default=str, separators=(",", ":")),
+        *census.json_part_lines("PROBE_HOSTS_JSON", summary["hosts"]),
+    ]
+
+
+def _census_module():
+    import importlib.util
+
+    path = os.path.join(_REPO_ROOT, "scripts", "ops", "external_seed_price_parse_census.py")
+    spec = importlib.util.spec_from_file_location("external_seed_price_parse_census", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 if __name__ == "__main__":

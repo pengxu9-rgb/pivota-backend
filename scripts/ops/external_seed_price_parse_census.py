@@ -494,10 +494,44 @@ async def _main() -> int:
         await conn.close()
     for line in render(summary):
         print(line)
-    print("CENSUS_JSON " + json.dumps(summary, default=str, separators=(",", ":")))
-    print("SUSPECTS_JSON " + json.dumps(suspects, default=str, separators=(",", ":")))
-    print("CURRENCY_SAMPLE_JSON " + json.dumps(sample, default=str, separators=(",", ":")))
+    for line in output_lines(summary, suspects, sample):
+        print(line)
     return 0
+
+
+# Cloud Logging cut the first prod run's CURRENCY_SAMPLE_JSON at exactly 102,400 characters
+# (2026-09-28, 397 hosts), mid-URL, so the line did not parse. Every emitted line stays under this.
+MAX_LINE_CHARS = 90_000
+
+
+def json_part_lines(prefix: str, items: Sequence[Any], *, max_chars: int = MAX_LINE_CHARS) -> List[str]:
+    """`{prefix}_PART i/n [json list]` lines, each under `max_chars`, that concatenate back to
+    `items` in order. Greedy by item; an item that alone exceeds the cap is a bug, not data."""
+    chunks: List[List[str]] = [[]]
+    size = 0
+    budget = max_chars - len(prefix) - 32  # "_PART 999/999 [" + "]"
+    for item in items:
+        text = json.dumps(item, default=str, separators=(",", ":"))
+        if len(text) + 1 > budget:
+            raise ValueError(f"one {prefix} item is {len(text)} chars, over the {max_chars} line cap")
+        if chunks[-1] and size + len(text) + 1 > budget:
+            chunks.append([])
+            size = 0
+        chunks[-1].append(text)
+        size += len(text) + 1
+    n = len(chunks)
+    return [f"{prefix}_PART {i}/{n} [{','.join(chunk)}]" for i, chunk in enumerate(chunks, 1)]
+
+
+def output_lines(summary: Dict[str, Any], suspects: Sequence[Any], sample: Sequence[Any]) -> List[str]:
+    """The machine-readable lines, each under MAX_LINE_CHARS. The lists are split into parts;
+    scripts/ops/external_seed_currency_probe.py reads the CURRENCY_SAMPLE parts straight from the
+    census output."""
+    census = "CENSUS_JSON " + json.dumps(summary, default=str, separators=(",", ":"))
+    if len(census) > MAX_LINE_CHARS:
+        summary = dict(summary, top_hosts=summary.get("top_hosts", [])[:10], truncated_top_hosts=True)
+        census = "CENSUS_JSON " + json.dumps(summary, default=str, separators=(",", ":"))
+    return [census, *json_part_lines("SUSPECTS_JSON", suspects), *json_part_lines("CURRENCY_SAMPLE_JSON", sample)]
 
 
 if __name__ == "__main__":

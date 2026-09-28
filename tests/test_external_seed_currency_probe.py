@@ -119,6 +119,73 @@ def test_the_census_line_loads_as_is_or_as_bare_json(tmp_path) -> None:
         probe.load_sample("{}")
 
 
+def _census():
+    spec = importlib.util.spec_from_file_location(
+        "external_seed_price_parse_census", _ROOT / "scripts/ops/external_seed_price_parse_census.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _big_sample(hosts: int = 1200):
+    """The shape of prod's 397-host sample (one line of it was cut at 102,400 chars), scaled up."""
+    return [
+        {"host": f"shop-{i:04d}.example.com", "market": "US", "served": 5, "default_shaped": 5,
+         "default_shaped_attached_offers": 9,
+         "urls": [f"https://shop-{i:04d}.example.com/products/a-long-product-handle-{j}-" + "x" * 60 for j in range(3)]}
+        for i in range(hosts)
+    ]
+
+
+def test_every_census_output_line_stays_under_the_log_cap_and_parses_back() -> None:
+    census = _census()
+    sample = _big_sample()
+    suspects = [{"id": f"eps_{i}", "host": "h.example", "flags": ["peer_x100"] * 3} for i in range(3000)]
+    summary = {"totals": {"served": 1}, "top_hosts": [{"host": f"h{i}", "n": i} for i in range(40)]}
+    lines = census.output_lines(summary, suspects, sample)
+    assert max(len(line) for line in lines) < census.MAX_LINE_CHARS < 102_400
+    sample_lines = [ln for ln in lines if ln.startswith("CURRENCY_SAMPLE_JSON_PART ")]
+    assert len(sample_lines) > 1, "the fixture must actually need splitting"
+    # the probe reads the census output as-is, parts shuffled, with a log prefix on each line
+    text = "\n".join(f"2026-09-28T06:26:00Z {ln}" for ln in reversed(lines))
+    assert _probe().load_sample(text) == sample
+    suspect_parts = [json.loads(ln.split(" ", 2)[2]) for ln in lines if ln.startswith("SUSPECTS_JSON_PART ")]
+    assert [s for part in suspect_parts for s in part] == suspects
+
+
+def test_a_missing_or_repeated_part_is_refused() -> None:
+    census, probe = _census(), _probe()
+    lines = census.json_part_lines("CURRENCY_SAMPLE_JSON", _big_sample())
+    assert len(lines) >= 3
+    with pytest.raises(SystemExit, match="incomplete"):
+        probe.load_sample("\n".join(lines[:1] + lines[2:]))
+    with pytest.raises(SystemExit, match="twice"):
+        probe.load_sample("\n".join(lines + lines[:1]))
+
+
+def test_an_item_too_big_for_any_line_is_an_error_not_an_overlong_line() -> None:
+    with pytest.raises(ValueError, match="line cap"):
+        _census().json_part_lines("CURRENCY_SAMPLE_JSON", [{"urls": ["x" * 100_000]}])
+
+
+def test_an_oversized_census_line_is_trimmed_not_cut() -> None:
+    census = _census()
+    summary = {"totals": {}, "top_hosts": [{"host": "x" * 5000} for _ in range(40)]}
+    (line,) = [ln for ln in census.output_lines(summary, [], []) if ln.startswith("CENSUS_JSON ")]
+    assert len(line) < census.MAX_LINE_CHARS
+    assert json.loads(line[len("CENSUS_JSON "):])["truncated_top_hosts"] is True
+
+
+def test_the_probe_output_stays_under_the_cap() -> None:
+    probe = _probe()
+    sample = _big_sample()
+    summary = probe.summarise(sample, {})
+    lines = probe.output_lines(summary)
+    assert lines[0].startswith("PROBE_JSON ") and len(lines) > 2
+    assert max(len(line) for line in lines) < _census().MAX_LINE_CHARS
+
+
 def test_the_report_renders() -> None:
     probe, _obs, summary = _run()
     report = "\n".join(probe.render(summary))
