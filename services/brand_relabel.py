@@ -122,6 +122,18 @@ INSERT INTO identity_resolution_events (proposal_id, action, run_id, detail)
 VALUES (NULL, :action, :run_id, CAST(:detail AS jsonb))
 RETURNING id
 """
+# Inside the write's own transaction: a stored manifest proves nothing about whether ITS write committed (review
+# of #2436: a failed run A, then a retry B with the same moves -- reverting A undid B). Revert needs "applied" and
+# no "reverted" for that run id, and records "reverted" in its own transaction.
+APPLIED_ACTION, REVERTED_ACTION = "brand_relabel_applied", "brand_relabel_reverted"
+RECORD_EVENT_SQL = """
+INSERT INTO identity_resolution_events (proposal_id, action, run_id, detail)
+VALUES (NULL, :action, :run_id, CAST(:detail AS jsonb))
+RETURNING id
+"""
+RUN_STATE_SQL = """
+SELECT action FROM identity_resolution_events WHERE run_id = :run_id AND action = ANY(:actions)
+"""
 LOAD_MANIFEST_SQL = """
 SELECT detail FROM identity_resolution_events WHERE action = :action AND run_id = :run_id
 ORDER BY id DESC LIMIT 1
@@ -304,11 +316,22 @@ def manifest_for(plan: Mapping[str, Any]) -> Dict[str, Any]:
             "moves": [{k: d[k] for k in MOVE_KEYS} for d in plan["moves"]]}
 
 
-async def write_moves(db: Any, moves: Iterable[Mapping[str, Any]], *, reverse: bool = False) -> Dict[str, int]:
+async def write_moves(db: Any, moves: Iterable[Mapping[str, Any]], *, reverse: bool = False,
+                      run_id: Optional[str] = None) -> Dict[str, int]:
     """One transaction, all or nothing. Forward: from -> to. Reverse: to -> from, for a manifest. Raises (rolled
-    back) on any drift: a row whose brand, content_key, group or recorded seeds are no longer what was read."""
+    back) on any drift: a row whose brand, content_key, group or recorded seeds are no longer what was read.
+    With `run_id`, the run's applied/reverted event is written in the SAME transaction, and a reverse write
+    refuses a run that never applied or was already reverted."""
     counts = {"products": 0, "groups": 0, "seeds": 0}
+    moves = list(moves)
     async with db.transaction():
+        if run_id is not None and reverse:
+            state = {r["action"] for r in await db.fetch_all(
+                RUN_STATE_SQL, {"run_id": run_id, "actions": [APPLIED_ACTION, REVERTED_ACTION]})}
+            if APPLIED_ACTION not in state:
+                raise RuntimeError(f"{run_id} never applied (its write did not commit): nothing to revert")
+            if REVERTED_ACTION in state:
+                raise RuntimeError(f"{run_id} was already reverted")
         for m in moves:
             f, t = ("to", "from") if reverse else ("from", "to")
             row = await db.fetch_one(MOVE_ROW_SQL, {"pk": m["product_key"], "from_brand": m[f"{f}_brand"],
@@ -336,6 +359,9 @@ async def write_moves(db: Any, moves: Iterable[Mapping[str, Any]], *, reverse: b
                 if len(done) != len(ids):
                     raise RuntimeError(f"drift on {m['product_key']}: a seed's brand changed since the plan")
                 counts["seeds"] += len(done)
+        if run_id is not None:
+            await db.fetch_one(RECORD_EVENT_SQL, {"action": REVERTED_ACTION if reverse else APPLIED_ACTION,
+                                                  "run_id": run_id, "detail": json.dumps(counts)})
     return counts
 
 

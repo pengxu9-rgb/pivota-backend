@@ -398,7 +398,8 @@ async def test_apply_stores_the_manifest_before_any_write_and_prints_no_manifest
     async def store(db, manifest):
         events.append(("store", manifest["run_id"]))
 
-    async def write(db, moves, reverse=False):
+    async def write(db, moves, reverse=False, run_id=None):
+        assert run_id and run_id.startswith("relabel_")  # the applied event is written with the moves
         events.append(("write", len(moves)))
         return {"products": len(moves), "groups": 1, "seeds": 0}
 
@@ -432,8 +433,8 @@ async def test_revert_by_run_id_reads_the_stored_manifest(monkeypatch):
         seen.append(run_id)
         return {"run_id": run_id, "moves": [{"from_ck": "a", "to_ck": "b"}]}
 
-    async def write(db, moves, reverse=False):
-        seen.append(("write", reverse))
+    async def write(db, moves, reverse=False, run_id=None):
+        seen.append(("write", reverse, run_id))
         return {}
 
     async def refresh(db, moves, **kw):
@@ -445,7 +446,7 @@ async def test_revert_by_run_id_reads_the_stored_manifest(monkeypatch):
     monkeypatch.setattr(rl, "refresh_after", refresh)
     await cli.run(argparse.Namespace(command="revert", family=None, apply=False, manifest=None,
                                      run_id="relabel_x", reverse=False))
-    assert seen == ["relabel_x", ("write", True), ("refresh", True)]
+    assert seen == ["relabel_x", ("write", True, "relabel_x"), ("refresh", True)]
 
 
 async def test_store_manifest_raises_when_nothing_was_stored():
@@ -455,3 +456,12 @@ async def test_store_manifest_raises_when_nothing_was_stored():
             return None
     with pytest.raises(RuntimeError, match="not stored"):
         await rl.store_manifest(DB(), {"run_id": "relabel_x", "moves": []})
+
+
+
+def test_status_lines_are_bounded():
+    import scripts.relabel_retailer_brand as cli
+    failed = [{"content_key": f"ck_{i}", "error": "x" * 200} for i in range(606)]
+    out = cli.bounded({"refreshed": 0, "failed_keys": failed})
+    assert out["failed_keys_total"] == 606 and len(out["failed_keys"]) == cli.FAILED_KEYS_SHOWN
+    assert len(rl.dumps(out)) < 100_000
