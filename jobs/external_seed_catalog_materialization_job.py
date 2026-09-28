@@ -13,7 +13,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
+
+from db.session_advisory_lock import AdvisoryLockUnavailable, DedicatedSessionAdvisoryLock
 
 logger = logging.getLogger(__name__)
 
@@ -50,39 +52,29 @@ def _batch_size() -> int:
     return max(1, min(value, 500))
 
 
-async def _try_acquire_materialization_lock() -> bool:
+async def _try_acquire_materialization_lock() -> Tuple[bool, Optional[DedicatedSessionAdvisoryLock]]:
+    """Take the tick's session advisory lock on a DEDICATED connection (the returned holder),
+    held until `_release_materialization_lock` closes it.
+
+    It used to be a bare `database.fetch_one`: databases 0.7.0 handed that pool connection
+    straight back, asyncpg's reset ran `pg_advisory_unlock_all()`, and the lock was gone before
+    the tick's first query -- two instances' ticks could always overlap.
+
+    Fails CLOSED: when the lock cannot be checked this raises `AdvisoryLockUnavailable` and the
+    tick is skipped. It used to fail open; a skipped tick costs one 15-minute interval.
+    """
     from db.database import database
 
     db_url = str(getattr(database, "url", "") or "")
     if not db_url.startswith(("postgres://", "postgresql://")):
-        return True
-    try:
-        row = await database.fetch_one(
-            "SELECT pg_try_advisory_lock(:lock_id) AS got",
-            {"lock_id": _JOB_LOCK_ID},
-        )
-        return bool(row and row["got"])
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "external_seed_materialization: advisory lock attempt failed: %s",
-            exc,
-        )
-        return True
+        return True, None
+    lock = DedicatedSessionAdvisoryLock(_JOB_LOCK_ID)
+    return await lock.try_acquire(), lock
 
 
-async def _release_materialization_lock() -> None:
-    from db.database import database
-
-    db_url = str(getattr(database, "url", "") or "")
-    if not db_url.startswith(("postgres://", "postgresql://")):
-        return
-    try:
-        await database.execute(
-            "SELECT pg_advisory_unlock(:lock_id)",
-            {"lock_id": _JOB_LOCK_ID},
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("external_seed_materialization: advisory unlock failed: %s", exc)
+async def _release_materialization_lock(lock: Optional[DedicatedSessionAdvisoryLock]) -> None:
+    if lock is not None:
+        await lock.release()
 
 
 async def _required_schema() -> Dict[str, Any]:
@@ -142,7 +134,11 @@ async def run_external_seed_catalog_materialization_tick() -> Dict[str, Any]:
         return {"ok": True, "skipped": "disabled", "applied": False}
 
     batch_size = _batch_size()
-    acquired = await _try_acquire_materialization_lock()
+    try:
+        acquired, lock = await _try_acquire_materialization_lock()
+    except AdvisoryLockUnavailable as exc:
+        logger.warning("external_seed_materialization: advisory lock unavailable, skipping tick: %s", exc)
+        return {"ok": False, "skipped": "lock_unavailable", "applied": False}
     if not acquired:
         return {"ok": True, "skipped": "lock_not_acquired", "applied": False}
 
@@ -208,4 +204,4 @@ async def run_external_seed_catalog_materialization_tick() -> Dict[str, Any]:
         logger.info("external_seed_materialization: %s", summary)
         return summary
     finally:
-        await _release_materialization_lock()
+        await _release_materialization_lock(lock)
