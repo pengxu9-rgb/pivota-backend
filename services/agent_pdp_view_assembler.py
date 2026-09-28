@@ -317,8 +317,8 @@ def _is_retailer_listing(row: Dict[str, Any]) -> bool:
     return str(row.get("product_key") or "").startswith(_RETAILER_LISTING_KEY_PREFIX)
 
 
-# Set by annotate_served_copy: what a row would SERVE as the winner ({title, description,
-# image_url, unknown}). Never persisted; assemble_row reads named fields only.
+# Set by annotate_served_copy: the title and description a row would SERVE as the winner, plus
+# the overlay read it came from. Never persisted; assemble_row reads named fields only.
 _SERVED_COPY = "_served_copy"
 
 
@@ -327,16 +327,16 @@ def _passes_serving_content_bar(row: Dict[str, Any]) -> bool:
 
     The gate's own checks (index_pipeline_state_service: suppressed / not_live / no_image /
     short_description), read the way the gate reads them -- a set suppressed_at, or a non-empty
-    sync_status other than 'live', refuses; the description and image are what agent_pdp_view would
-    serve, the description measured stripped -- plus a title (assemble_row builds nothing without
-    one) and a signature: the winner supplies the served id and canonical URL, so a row that would
-    take the product off serving, or serve it unsigned, is not a content-ready winner (review
-    #2384). The ONE definition both pick_canonical rules below use.
+    sync_status other than 'live', refuses; the description is the one agent_pdp_view would serve,
+    measured stripped -- plus a title (assemble_row builds nothing without one) and a signature: the
+    winner supplies the served id and canonical URL, so a row that would take the product off
+    serving, or serve it unsigned, is not a content-ready winner (review #2384). The ONE definition
+    both pick_canonical rules below use.
 
-    What the row would serve comes from annotate_served_copy (overlay, then the row's own column,
-    then the seed) when the caller ran it -- the serving path does. Otherwise the row's own columns
-    are the answer, and a caller that loads none of them never passes, so its order is unchanged.
-    When the overlay read failed the served copy is unknown, and the bar does not refuse on it.
+    The served title and description come from annotate_served_copy (overlay first) when the caller
+    ran it -- the serving path does. Otherwise the row's own columns are the answer, and a caller
+    that loads none of them never passes, so its order is unchanged. The image is the row's own:
+    see annotate_served_copy for why the seed is not consulted.
     """
     from services.index_pipeline_state_service import MIN_DESCRIPTION_LENGTH
 
@@ -345,16 +345,12 @@ def _passes_serving_content_bar(row: Dict[str, Any]) -> bool:
     sync_status = str(row.get("sync_status") or "").strip()
     if sync_status and sync_status != "live":
         return False
-    served = row.get(_SERVED_COPY)
-    if served is None:
-        served = {"title": row.get("title"), "description": row.get("description"),
-                  "image_url": row.get("image_url"), "unknown": False}
-    if not served.get("unknown"):
-        if not str(served.get("title") or "").strip():
-            return False
-        if len(str(served.get("description") or "").strip()) < MIN_DESCRIPTION_LENGTH:
-            return False
-    return bool(str(served.get("image_url") or "").strip() and row.get("pivota_signature_id"))
+    served = row.get(_SERVED_COPY) or {"title": row.get("title"), "description": row.get("description")}
+    if not str(served.get("title") or "").strip():
+        return False
+    if len(str(served.get("description") or "").strip()) < MIN_DESCRIPTION_LENGTH:
+        return False
+    return bool(str(row.get("image_url") or "").strip() and row.get("pivota_signature_id"))
 
 
 def _is_brand_store_row(row: Dict[str, Any]) -> bool:
@@ -394,13 +390,13 @@ def pick_canonical(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
       0c. a row that passes `_passes_serving_content_bar` before one that does not. The winner
           supplies the served title, description, image, id and canonical URL, and
           index_pipeline_state gates the whole content_key on what it serves. Replayed with the
-          members' real overlays and seeds over all 2,897 multi-row content_keys on prod
-          2026-09-28, 181 change: 38 blocked short_description (koolseoul's title-only rows beside
-          dodoskin/coscorea 1-2k-char copy) and 2 blocked no_image start serving; 139 were served
-          from a SUPPRESSED row (the retired Stila/Tarte/Tower 28 old-spelling rows, arencia's JP
-          seeds, re-keyed simihaze variants, the suppressed cocomo.sg row) and move to the live
-          sibling; no served overlay is dropped. A winner that already passes keeps rank 0, so
-          only a content_key whose current winner fails the bar can change.
+          members' real overlays over all 2,897 multi-row content_keys on prod 2026-09-28, 179
+          change: 38 blocked short_description (koolseoul's title-only rows beside dodoskin/coscorea
+          1-2k-char copy) and 2 blocked no_image start serving; 135 were served from a SUPPRESSED
+          row (the retired Stila/Tarte/Tower 28 old-spelling rows, arencia's JP seeds, re-keyed
+          simihaze variants, the suppressed cocomo.sg row) and move to the live sibling; no served
+          overlay is dropped. A winner that already passes keeps rank 0, so only a content_key
+          whose current winner fails the bar can change.
       1. product_group_members.is_primary = true  (multi-seller canonical)
       2. catalog_products.pivota_signature_id is set  (indexed surface)
       3. lowest product_key ASC  (stable hash-derived ordering)
@@ -1302,59 +1298,49 @@ def _brand_attested_overlay(
 
 def annotate_served_copy(
     products: List[Dict[str, Any]],
-    external_seed: Optional[Dict[str, Any]],
     overlays: Dict[Tuple[str, str, str], Dict[str, Any]],
     any_fetch_failed: bool,
 ) -> None:
-    """Record on each row the title, description and image it would SERVE if it won the pick.
+    """Record on each row the title and description it would SERVE if it won the pick.
 
     `_passes_serving_content_bar` must judge what the gate will read -- agent_pdp_view's
     description, which assemble_row takes as coalesce(overlay description_markdown, the winner's
-    description, the content_key's seed description / short_description) -- not the row's raw
-    column: an executor overlay (canonical_pdp_enrichment writes one onto rows under 200 chars)
-    makes a thin row serve fine, and demoting it would swap 800 chars of overlay for a sibling's
-    60 (review #2423). The overlay that applies to a row as winner is the cluster's brand-attested
-    overlay if there is one, else the row's own; title and image follow assemble_row the same way.
-    If any overlay read failed, the copy is UNKNOWN and the bar does not demote on it.
+    description, ...) -- not the row's raw column: an executor overlay (canonical_pdp_enrichment
+    writes one onto rows under 200 chars) makes a thin row serve fine, and demoting it would swap
+    800 chars of overlay for a sibling's 60 (review #2423). The overlay that applies to a row as
+    winner is the cluster's brand-attested overlay if there is one, else the row's own; the title
+    follows assemble_row the same way (title_override first).
+
+    DELIBERATELY NOT THE SEED. assemble_row falls back to the seed's copy and image, but which seed
+    a rebuild holds depends on its caller (the seed writer passes the seed that fired it, the
+    reconciler the cluster's newest), and a pick that read it would flip the served signature
+    between two refreshes of unchanged rows (review #2423). Rows and their overlays are the same
+    for every caller.
+
+    A FAILED overlay read judges every row as if it had no overlay -- the answer a successful read
+    gives almost every key -- rather than waving thin rows through: the rebuild then preserves the
+    published title/description, and a pick that differed from the successful read's would write
+    another row's signature and image under them (review #2423). The read itself (partial or not)
+    still rides on the rows for _fetch_enrichment_for_canonical, which reports FETCH_FAILED as before.
     """
-    seed_data = (external_seed or {}).get("seed_data") or {}
-    if isinstance(seed_data, str):
-        try:
-            seed_data = json.loads(seed_data)
-        except Exception:
-            seed_data = {}
-    if not isinstance(seed_data, dict):
-        seed_data = {}
-    attested = _brand_attested_overlay(products, overlays)
+    judged = {} if any_fetch_failed else overlays
+    attested = _brand_attested_overlay(products, judged)
     for product in products:
-        own = _overlay_for(product, overlays)
-        overlay = attested or own or {}
+        overlay = attested or _overlay_for(product, judged) or {}
         product[_SERVED_COPY] = {
             # the read itself, so the enrichment pick in the same rebuild reuses it
-            "own_overlay": own,
+            "own_overlay": _overlay_for(product, overlays),
+            "reads_failed": bool(any_fetch_failed),
             "title": coalesce_first(overlay.get("title_override"), product.get("title")),
-            "description": coalesce_first(
-                overlay.get("description_markdown"),
-                product.get("description"),
-                seed_data.get("description"),
-                seed_data.get("short_description"),
-            ),
-            "image_url": coalesce_first(
-                product.get("image_url"),
-                (external_seed or {}).get("image_url"),
-                seed_data.get("image_url"),
-            ),
-            "unknown": bool(any_fetch_failed),
+            "description": coalesce_first(overlay.get("description_markdown"), product.get("description")),
         }
 
 
-async def load_served_copy(
-    products: List[Dict[str, Any]], external_seed: Optional[Dict[str, Any]]
-) -> None:
+async def load_served_copy(products: List[Dict[str, Any]]) -> None:
     """Fetch the members' overlays once and annotate the rows (annotate_served_copy). The read
     rides on the rows, so _fetch_enrichment_for_canonical in the same rebuild does not repeat it."""
     overlays, any_fetch_failed = await _fetch_member_overlays(products)
-    annotate_served_copy(products, external_seed, overlays, any_fetch_failed)
+    annotate_served_copy(products, overlays, any_fetch_failed)
 
 
 def _overlays_from_annotations(
@@ -1370,7 +1356,7 @@ def _overlays_from_annotations(
         ident = (product.get("merchant_id"), product.get("platform"), product.get("source_product_id"))
         if own is not None and all(ident):
             overlays[(str(ident[0]), str(ident[1]), str(ident[2]))] = own
-    return overlays, any(bool(p[_SERVED_COPY].get("unknown")) for p in products)
+    return overlays, any(bool(p[_SERVED_COPY].get("reads_failed")) for p in products)
 
 
 async def _fetch_enrichment_for_canonical(
@@ -1500,7 +1486,7 @@ async def build_agent_pdp_view_row(
     # BEFORE the first pick_canonical below (evidence_safe_product_keys picks too): every pick in
     # this rebuild must judge each row by what it would serve, overlay included, and all of them
     # must see the same annotated rows. The overlays read here are reused for the enrichment pick.
-    await load_served_copy(products, external_seed)
+    await load_served_copy(products)
     # Identity-confidence gate: a no-GTIN content_key is deliberately non-unique
     # (brand+title), so a cluster can collide DISTINCT products. Scope the evidence
     # fetch to members safe to attribute to the served row, so we never bake

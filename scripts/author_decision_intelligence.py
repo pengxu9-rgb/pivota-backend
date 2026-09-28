@@ -62,7 +62,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.database import database  # noqa: E402
 from db.product_enrichment import upsert_enrichment  # noqa: E402
 from services.agent_pdp_view_assembler import (  # noqa: E402
-    fetch_external_seed_for_keys,
     fetch_products_for_key,
     load_served_copy,
     pick_canonical,
@@ -173,8 +172,7 @@ async def _prepare(ck: str) -> Optional[Dict[str, Any]]:
     if not products:
         return None
     # The winner the rebuild serves: annotate exactly as refresh_agent_pdp_view_for_content_key does.
-    product_keys = [p["product_key"] for p in products if p.get("product_key")]
-    await load_served_copy(products, await fetch_external_seed_for_keys(product_keys, db=database))
+    await load_served_copy(products)
     canonical = pick_canonical(products)
     if not all((canonical.get("merchant_id"), canonical.get("platform"),
                 canonical.get("source_product_id"))):

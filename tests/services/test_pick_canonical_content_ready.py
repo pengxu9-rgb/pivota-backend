@@ -161,10 +161,9 @@ def test_a_row_without_a_title_is_not_content_ready():
         assert pick_canonical([untitled, titled]) is titled
 
 
-# -- what the row would SERVE: overlay, then its own column, then the seed (review #2423) ------------
+# -- what the row would SERVE: its overlay, then its own column (review #2423) ------------------------
 
 OVERLAY_COPY = "Pivota enrichment copy. " * 30  # an executor overlay, 720 chars
-SEED = {"image_url": None, "seed_data": {"description": "Seed copy for the product, " * 8}}
 
 
 def _titled(pk, host, **kw):
@@ -178,58 +177,98 @@ def _overlays(*pairs):
     return {(r["merchant_id"], r["platform"], r["source_product_id"]): o for r, o in pairs}
 
 
-def test_a_thin_row_whose_overlay_serves_real_copy_keeps_the_pick():
+def _thin_and_sixty():
     thin = _titled("ext:retailer:0000", "a.example", description="Brand serum 30ml.")  # 17 chars raw
     sixty = _titled("ext:retailer:9999", "b.example", description="x" * 60)
+    return thin, sixty
+
+
+def test_a_thin_row_whose_overlay_serves_real_copy_keeps_the_pick():
+    thin, sixty = _thin_and_sixty()
     rows = [thin, sixty]
-    assembler.annotate_served_copy(rows, None, _overlays((thin, {"description_markdown": OVERLAY_COPY})), False)
+    assembler.annotate_served_copy(rows, _overlays((thin, {"description_markdown": OVERLAY_COPY})), False)
     assert pick_canonical(rows) is thin
 
 
 def test_without_its_overlay_the_same_thin_row_loses():
-    thin = _titled("ext:retailer:0000", "a.example", description="Brand serum 30ml.")
-    sixty = _titled("ext:retailer:9999", "b.example", description="x" * 60)
+    thin, sixty = _thin_and_sixty()
     rows = [thin, sixty]
-    assembler.annotate_served_copy(rows, None, {}, False)
+    assembler.annotate_served_copy(rows, {}, False)
     assert pick_canonical(rows) is sixty
 
 
 def test_a_brand_attested_overlay_serves_whichever_row_wins_so_it_reorders_nothing():
-    thin = _titled("ext:retailer:0000", "a.example", description="Brand serum 30ml.")
-    sixty = _titled("ext:retailer:9999", "b.example", description="x" * 60)
+    thin, sixty = _thin_and_sixty()
     rows = [thin, sixty]
     attested = {"description_markdown": OVERLAY_COPY, "updated_by_employee_id": "brand_attestation"}
-    assembler.annotate_served_copy(rows, None, _overlays((sixty, attested)), False)
+    assembler.annotate_served_copy(rows, _overlays((sixty, attested)), False)
     assert pick_canonical(rows) is thin  # both serve the attested copy: the old ladder decides
 
 
-def test_the_seed_description_fills_a_row_with_none_of_its_own():
-    """coalesce_first skips an EMPTY description, so the seed's copy is what that row serves."""
+def test_the_attested_overlay_outranks_a_rows_own_overlay_as_assemble_row_does():
+    """A THIN attested overlay serves on every row -- a row's own long overlay never reaches the PDP."""
+    first, second = _thin_and_sixty()
+    second["description"] = "Brand serum 30ml."
+    rows = [first, second]
+    thin_attested = {"description_markdown": "Brand copy.", "updated_by_employee_id": "brand_attestation"}
+    assembler.annotate_served_copy(
+        rows, _overlays((first, thin_attested), (second, {"description_markdown": OVERLAY_COPY})), False)
+    assert pick_canonical(rows) is first  # nobody passes: the old ladder, not the own overlay
+
+
+def test_a_title_override_counts_as_the_title():
+    thin, sixty = _thin_and_sixty()
+    thin["title"] = ""
+    thin["description"] = "x" * 60
+    rows = [thin, sixty]
+    assembler.annotate_served_copy(rows, _overlays((thin, {"title_override": "MISSHA Artemisia"})), False)
+    assert pick_canonical(rows) is thin
+    assembler.annotate_served_copy(rows, {}, False)
+    assert pick_canonical(rows) is sixty
+
+
+def test_the_rows_own_description_outranks_nothing_but_an_overlay():
+    """The overlay first, then the row's column -- never the other way round."""
+    thin, sixty = _thin_and_sixty()
+    thin["description"] = "x" * 200
+    rows = [thin, sixty]
+    assembler.annotate_served_copy(rows, _overlays((thin, {"description_markdown": "Short overlay."})), False)
+    assert pick_canonical(rows) is sixty  # the overlay is what serves, and it is thin
+
+
+def test_the_seed_never_decides_the_pick():
+    """Which seed a rebuild holds depends on its caller; a pick that read it would flip the served
+    signature between two refreshes of unchanged rows (review #2423)."""
     empty = _titled("ext:retailer:0000", "a.example", description="")
     sixty = _titled("ext:retailer:9999", "b.example", description="x" * 60)
     rows = [empty, sixty]
-    assembler.annotate_served_copy(rows, SEED, {}, False)
-    assert pick_canonical(rows) is empty
+    assembler.annotate_served_copy(rows, {}, False)
+    assert pick_canonical(rows) is sixty
+    import inspect
+    assert "seed" not in inspect.signature(assembler.annotate_served_copy).parameters
+    assert "seed" not in inspect.signature(assembler.load_served_copy).parameters
 
 
-def test_the_seed_image_fills_a_row_with_none_of_its_own():
+def test_a_failed_overlay_read_picks_what_a_read_with_no_overlays_picks():
+    """Not the old ladder: the rebuild preserves the published copy on a failed read, and a winner
+    that differed from the successful read's would write another row's signature under it."""
+    thin, sixty = _thin_and_sixty()
+    rows = [thin, sixty]
+    assembler.annotate_served_copy(rows, {}, False)
+    no_overlays = pick_canonical(rows)
+    partial = _overlays((thin, {"description_markdown": OVERLAY_COPY}))  # read before the failure
+    assembler.annotate_served_copy(rows, partial, True)
+    assert pick_canonical(rows) is no_overlays is sixty
+    # ...while the read itself still rides on the rows for the enrichment pick, which says it failed
+    assert asyncio.run(assembler._fetch_enrichment_for_canonical(rows)) is assembler.FETCH_FAILED
+
+
+def test_the_image_is_the_rows_own():
     no_image = _titled("ext:retailer:0000", "a.example", image=None)
     other = _titled("ext:retailer:9999", "b.example")
     rows = [no_image, other]
-    assembler.annotate_served_copy(rows, {"image_url": "https://cdn.example/seed.jpg", "seed_data": {}}, {}, False)
-    assert pick_canonical(rows) is no_image
-    assembler.annotate_served_copy(rows, None, {}, False)
+    assembler.annotate_served_copy(rows, {}, True)
     assert pick_canonical(rows) is other
-
-
-def test_a_failed_overlay_read_never_demotes_on_copy_but_still_on_suppression():
-    thin = _titled("ext:retailer:0000", "a.example", description="Brand serum 30ml.")
-    sixty = _titled("ext:retailer:9999", "b.example", description="x" * 60)
-    rows = [thin, sixty]
-    assembler.annotate_served_copy(rows, None, {}, True)
-    assert pick_canonical(rows) is thin
-    thin["suppressed_at"] = WITHDRAWN
-    assert pick_canonical(rows) is sixty
 
 
 def test_the_enrichment_pick_reuses_the_overlays_it_is_handed(monkeypatch):
@@ -241,9 +280,9 @@ def test_the_enrichment_pick_reuses_the_overlays_it_is_handed(monkeypatch):
     monkeypatch.setattr(db.product_enrichment, "get_enrichments_for_products", _no_read)
     thin = _titled("ext:retailer:0000", "a.example", description="Brand serum 30ml.")
     overlay = {"description_markdown": OVERLAY_COPY}
-    assembler.annotate_served_copy([thin], None, _overlays((thin, overlay)), False)
+    assembler.annotate_served_copy([thin], _overlays((thin, overlay)), False)
     assert asyncio.run(assembler._fetch_enrichment_for_canonical([thin])) is overlay
-    assembler.annotate_served_copy([thin], None, {}, True)  # the read failed: say so, as before
+    assembler.annotate_served_copy([thin], {}, True)  # the read failed: say so, as before
     assert asyncio.run(assembler._fetch_enrichment_for_canonical([thin])) is assembler.FETCH_FAILED
 
 
@@ -305,3 +344,68 @@ def test_the_identity_keepers_load_what_the_bar_reads():
     for sql in (DETAIL_SQL, JUDGE_ROWS_SQL):
         for column in ("title", "description", "image_url", "sync_status", "suppressed_at", "pivota_signature_id"):
             assert column in sql
+
+
+def test_the_dedup_sweep_auto_approves_only_a_keeper_that_is_the_served_row():
+    """The keeper reads raw columns; serving reads overlays. Where they differ, an unreviewed apply
+    would suppress the row being served -- so it is held, and counted (review #2423)."""
+    from services.identity_reconcile_sweep import APPROVE_ALLOWLIST_SQL, HELD_AUTO_APPROVE_SQL
+
+    for sql in (APPROVE_ALLOWLIST_SQL, HELD_AUTO_APPROVE_SQL):
+        assert "av.pivota_signature_id = cp.pivota_signature_id" in sql
+        assert "cp.product_key = p.keeper_product_key" in sql
+        assert "NOT EXISTS (SELECT 1 FROM agent_pdp_view av WHERE av.content_key = p.content_key)" in sql
+    assert "NOT (TRUE" in HELD_AUTO_APPROVE_SQL
+
+
+def test_the_scripts_that_pick_the_served_winner_annotate_first(monkeypatch):
+    """repair_external_seed_offer_mainline and author_decision_intelligence must pick the winner the
+    rebuild serves, so they annotate the rows before any pick."""
+    import scripts.author_decision_intelligence as adi
+    import scripts.repair_external_seed_offer_mainline as repair
+
+    thin, sixty = _thin_and_sixty()
+    seen = []
+
+    async def _rows(*a, **kw):
+        return [dict(thin), dict(sixty)]
+
+    async def _empty(*a, **kw):
+        return []
+
+    async def _none(*a, **kw):
+        return None
+
+    async def _annotate(products):
+        assembler.annotate_served_copy(products, _overlays((thin, {"description_markdown": OVERLAY_COPY})), False)
+
+    def _capture_assemble(**kw):
+        seen.append(pick_canonical(kw["products"])["product_key"])
+        return None
+
+    monkeypatch.setattr(repair, "fetch_products_for_key", _rows)
+    monkeypatch.setattr(repair, "fetch_skus_for_keys", _empty)
+    monkeypatch.setattr(repair, "fetch_offers_for_keys", _empty)
+    monkeypatch.setattr(repair, "fetch_external_seed_for_keys", _none)
+    monkeypatch.setattr(repair, "load_served_copy", _annotate)
+    monkeypatch.setattr(repair, "assemble_row", _capture_assemble)
+    asyncio.run(repair._build_apv_offer_field_update("ck_x", db=object()))
+    assert seen == [thin["product_key"]]  # the overlay row, as the rebuild serves it
+
+    class _DB:
+        async def fetch_one(self, *a, **kw):
+            raise _Stop()
+
+    class _Stop(Exception):
+        pass
+
+    def _capture_pick(products):
+        seen.append(pick_canonical(products)["product_key"])
+        raise _Stop()
+
+    monkeypatch.setattr(adi, "fetch_products_for_key", _rows)
+    monkeypatch.setattr(adi, "load_served_copy", _annotate)
+    monkeypatch.setattr(adi, "pick_canonical", _capture_pick)
+    with pytest.raises(_Stop):
+        asyncio.run(adi._prepare("ck_x"))
+    assert seen[-1] == thin["product_key"]
