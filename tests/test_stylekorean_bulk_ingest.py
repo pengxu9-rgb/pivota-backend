@@ -210,7 +210,7 @@ async def test_batched_skipped_pdp_excludes_its_offers(monkeypatch):
     async def no_audit(audit: Any, **kw: Any) -> None:
         return None
 
-    async def no_seller(seed: Any) -> Any:
+    async def no_seller(seed: Any, **_: Any) -> Any:
         return (None, None)
 
     monkeypatch.setattr(apply_mod, "guard_catalog_offer_rows", passthrough_guard)
@@ -397,7 +397,7 @@ async def test_batched_seed_derivation_failure_skips_seed_only(monkeypatch):
     async def record_audit(audit: Any, **kw: Any) -> None:
         audit_written.append(audit)
 
-    async def seller(seed: Any) -> Any:
+    async def seller(seed: Any, **_: Any) -> Any:
         if seed.get("id") == "s_bad":
             raise RuntimeError("driver blew up mid-derivation")
         return (None, None)
