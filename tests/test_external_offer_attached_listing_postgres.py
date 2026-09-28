@@ -36,6 +36,7 @@ _TABLE_MIGRATIONS = (
     "058_catalog_core.sql",
     "132_catalog_offer_suppression_writer_audit.sql",
     "135_catalog_product_sku_stale_suppression.sql",
+    "246_catalog_offers_price_checked_at.sql",
 )
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 _SCHEMA = f"attached_listing_offer_test_{os.getpid()}"
@@ -141,7 +142,8 @@ async def _load(db, *, variant_refresh_status="all_re_read"):
 async def _offers(db):
     rows = await db.fetch_all(
         "SELECT offer_id, list_price, merchant_effective_price, estimated_best_price, currency,"
-        " updated_at > TIMESTAMP '2026-09-12 01:37:40' AS touched FROM catalog_offers"
+        " updated_at > TIMESTAMP '2026-09-12 01:37:40' AS touched,"
+        " price_checked_at IS NOT NULL AS checked FROM catalog_offers"
     )
     return {r["offer_id"]: dict(r) for r in rows}
 
@@ -151,6 +153,7 @@ async def _sync(monkeypatch, db):
 
     monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
     monkeypatch.setattr(mod, "database", db)
+    monkeypatch.setattr(mod, "_price_check_column", {"present": False, "checked": None})
     return await mod.sync_offer_for_seed(SEED_ID, attached_price_source="refresh", currency_read=True)
 
 
@@ -168,8 +171,11 @@ async def test_the_listing_rows_take_the_re_read_prices_and_nothing_else_moves(s
         assert float(row["merchant_effective_price"]) == price
         assert float(row["estimated_best_price"]) == price
         assert row["currency"] == "USD" and row["touched"], oid
+        # The read dates the price it wrote (mig 246), which is what the gateway's as-of reads.
+        assert row["checked"], oid
     for oid, price in (("of_v999", 11.0), ("of_ulta", 31.0)):
         assert float(rows[oid]["list_price"]) == price and not rows[oid]["touched"], oid
+        assert not rows[oid]["checked"], oid
 
 
 async def test_variant_rows_hold_until_every_variant_was_re_read(scoped_db, monkeypatch):
@@ -179,6 +185,7 @@ async def test_variant_rows_hold_until_every_variant_was_re_read(scoped_db, monk
     rows = await _offers(scoped_db)
     assert float(rows["of_canon"]["list_price"]) == 22.7
     assert float(rows["of_v2"]["list_price"]) == 40.0 and not rows["of_v2"]["touched"]
+    assert rows["of_canon"]["checked"] and not rows["of_v2"]["checked"]
 
 
 async def test_the_guard_refuses_a_row_whose_currency_moved_after_the_read(scoped_db, monkeypatch):
