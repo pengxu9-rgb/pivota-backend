@@ -94,11 +94,14 @@ async def test_relabel_joins_the_canonical_product_and_reverts_exactly(db):
     await _product(db, "ext:retailer:e", "Etude", "Lash Perm", "theglowbeautyshop.com")
     await _product(db, "ext:retailer:gone", "ETUDE HOUSE", "Old", "luxiface.com", suppressed="x")
     await _product(db, "ext:retailer:other", "Innisfree", "Fixing Tint", "luxiface.com")
+    # a second seed on row a, already canonical before the run: never touched, forward or back
+    await db.execute("INSERT INTO external_product_seeds (attached_product_key, seed_data) VALUES "
+                     "('ext:retailer:a', CAST(:d AS jsonb))", {"d": json.dumps({"brand": "ETUDE"})})
     before = await _state(db)
 
-    rows, neighbours = await rl.load(db, ["etudehouse", "etude"], "ETUDE")
+    rows, neighbours, seeds = await rl.load(db, ["etudehouse", "etude"], "ETUDE")
     assert sorted(r["product_key"] for r in rows) == ["ext:retailer:a", "ext:retailer:b", "ext:retailer:e"]
-    plan = rl.plan_relabel(rows, neighbours, "ETUDE")
+    plan = rl.plan_relabel(rows, neighbours, "ETUDE", seeds)
     assert plan["counts"] == {"joined_by_title": 2, "case_only": 1}
     manifest = rl.manifest_for(plan)
     counts = await rl.write_moves(db, manifest["moves"])
@@ -111,7 +114,8 @@ async def test_relabel_joins_the_canonical_product_and_reverts_exactly(db):
     assert live["ext:retailer:gone"][0] == "ETUDE HOUSE" and live["ext:retailer:other"][0] == "Innisfree"
     grp = dict(groups_after)
     assert grp["retailer:ext:retailer:a"] == grp["retailer:ext:retailer:b"] == derive_product_group_id(canon_ck)
-    assert dict(seeds_after)["ext:retailer:a"] == "ETUDE" and dict(seeds_after)["ext:retailer:gone"] == "ETUDE HOUSE"
+    assert sorted(b for pk, b in seeds_after if pk == "ext:retailer:a") == ["ETUDE", "ETUDE"]
+    assert dict(seeds_after)["ext:retailer:gone"] == "ETUDE HOUSE"
 
     await rl.write_moves(db, manifest["moves"], reverse=True)
     assert await _state(db) == before
@@ -120,11 +124,59 @@ async def test_relabel_joins_the_canonical_product_and_reverts_exactly(db):
 async def test_a_drifted_row_rolls_the_whole_write_back(db):
     await _product(db, "ext:retailer:a", "ETUDE HOUSE", "Fixing Tint", "luxiface.com")
     await _product(db, "ext:retailer:b", "ETUDE HOUSE", "Lash Perm", "luxiface.com")
-    rows, neighbours = await rl.load(db, ["etudehouse", "etude"], "ETUDE")
-    manifest = rl.manifest_for(rl.plan_relabel(rows, neighbours, "ETUDE"))
+    rows, neighbours, seeds = await rl.load(db, ["etudehouse", "etude"], "ETUDE")
+    manifest = rl.manifest_for(rl.plan_relabel(rows, neighbours, "ETUDE", seeds))
     before = await _state(db)
     await db.execute("UPDATE catalog_products SET brand = 'Someone Else' WHERE product_key = 'ext:retailer:b'")
     drifted = await _state(db)
     with pytest.raises(RuntimeError, match="drift"):
         await rl.write_moves(db, manifest["moves"])
     assert await _state(db) == drifted != before  # row a's move rolled back with b's refusal
+
+
+
+async def _plan(db):
+    rows, neighbours, seeds = await rl.load(db, ["etudehouse", "etude"], "ETUDE")
+    return rl.manifest_for(rl.plan_relabel(rows, neighbours, "ETUDE", seeds))
+
+
+@pytest.mark.parametrize("drift", ["group", "seed", "suppressed"])
+async def test_each_real_sql_guard_refuses_a_row_that_moved_since_the_plan(db, drift):
+    """The unit fake re-implements the guards; these run the SQL's own WHERE clauses (review of #2434)."""
+    await _product(db, "ext:retailer:a", "ETUDE HOUSE", "Fixing Tint", "luxiface.com")
+    manifest = await _plan(db)
+    if drift == "group":
+        await db.execute("UPDATE product_group_members SET product_group_id = 'pg_moved' "
+                         "WHERE platform_product_id = 'retailer:ext:retailer:a'")
+    elif drift == "seed":
+        await db.execute("UPDATE external_product_seeds SET seed_data = CAST(:d AS jsonb) "
+                         "WHERE attached_product_key = 'ext:retailer:a'", {"d": json.dumps({"brand": "Re-crawled"})})
+    else:
+        await db.execute("UPDATE catalog_products SET suppression_reason = 'x' WHERE product_key = 'ext:retailer:a'")
+    drifted = await _state(db)
+    with pytest.raises(RuntimeError, match="drift"):
+        await rl.write_moves(db, manifest["moves"])
+    assert await _state(db) == drifted
+
+
+async def test_a_suppressed_row_is_neither_a_candidate_nor_a_neighbour(db):
+    await _product(db, "ext:retailer:gone", "ETUDE", "Fixing Tint", "dodoskin.com", suppressed="x")
+    await _product(db, "ext:retailer:a", "ETUDE HOUSE", "Fixing Tint", "luxiface.com")
+    rows, neighbours, _ = await rl.load(db, ["etudehouse", "etude"], "ETUDE")
+    assert [r["product_key"] for r in rows] == ["ext:retailer:a"]
+    assert "ext:retailer:gone" not in {n["product_key"] for n in neighbours}
+    [m] = rl.plan_relabel(rows, neighbours, "ETUDE")["moves"]
+    assert m["reason"] == "minted"  # the tombstoned ETUDE row is nobody's product to join
+
+
+async def test_a_revert_is_all_or_nothing(db):
+    await _product(db, "ext:retailer:a", "ETUDE HOUSE", "Fixing Tint", "luxiface.com")
+    await _product(db, "ext:retailer:b", "ETUDE HOUSE", "Lash Perm", "luxiface.com")
+    manifest = await _plan(db)
+    await rl.write_moves(db, manifest["moves"])
+    await db.execute("UPDATE catalog_products SET title = 'retitled', content_key = 'ck_other' "
+                     "WHERE product_key = 'ext:retailer:b'")
+    moved = await _state(db)
+    with pytest.raises(RuntimeError, match="drift"):
+        await rl.write_moves(db, manifest["moves"], reverse=True)
+    assert await _state(db) == moved  # row a stayed relabelled with b

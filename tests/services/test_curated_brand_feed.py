@@ -2025,9 +2025,7 @@ def test_the_override_wins_when_the_vendor_names_the_store():
         domain="metro.com.sg", category_path="beauty/makeup",
         brand_override="ETUDE HOUSE",
     )
-    # The override wins over the store-name vendor (resolve_record_brand below); the written spelling is then the
-    # ETUDE family's canonical one (RETAILER_BRAND_SPELLINGS, 2026-09-28).
-    assert rec["pdp"]["brand"] == "ETUDE"
+    assert rec["pdp"]["brand"] == "ETUDE HOUSE"
     assert cbf.resolve_record_brand(
         "Metro Singapore Departmental Store - Celebrating 69 Years in SG",
         "ETUDE HOUSE", "metro.com.sg",

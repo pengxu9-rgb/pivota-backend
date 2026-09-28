@@ -117,7 +117,7 @@ def test_the_manifest_carries_every_from_and_to_value():
     assert m["run_id"].startswith("relabel_") and m["canonical"] == "ETUDE"
     [mv] = m["moves"]
     assert set(mv) == {"product_key", "from_brand", "to_brand", "from_ck", "to_ck", "from_pg", "to_pg",
-                       "merchant_id", "platform", "spid"}
+                       "merchant_id", "platform", "spid", "seed_ids"}
 
 
 # --- the write, against a fake database --------------------------------------------------------------------
@@ -133,7 +133,7 @@ class DB:
         self.rows = {r["product_key"]: {"brand": r["brand"], "content_key": r["content_key"]} for r in rows}
         self.groups = {(r["merchant_id"], r["platform"], r["source_product_id"]): r["product_group_id"]
                        for r in rows if r.get("product_group_id")}
-        self.seeds = dict(seeds or {})
+        self.seeds = dict(seeds or {})  # seed id -> [attached product_key, brand]
 
     def transaction(self): return Tx()
 
@@ -163,27 +163,39 @@ class DB:
         raise AssertionError(sql)
 
     async def fetch_all(self, sql, v):
-        assert "external_product_seeds" in sql
-        if self.seeds.get(v["pk"]) == v["from_brand"]:
-            self.seeds[v["pk"]] = v["to_brand"]
-            return [{"id": 1}]
-        return []
+        assert "external_product_seeds" in sql and "id = ANY(:ids)" in sql
+        done = []
+        for sid in v["ids"]:
+            pk, brand = self.seeds.get(sid, (None, None))
+            if pk == v["pk"] and brand == v["from_brand"]:
+                self.seeds[sid] = [pk, v["to_brand"]]
+                done.append({"id": sid})
+        return done
 
 
 async def test_the_write_moves_brand_key_group_and_seed_and_the_revert_puts_them_back():
     a = row("ext:retailer:a")
-    db = DB([a], seeds={"ext:retailer:a": "ETUDE HOUSE"})
-    m = rl.manifest_for(plan([a]))
+    db = DB([a], seeds={1: ["ext:retailer:a", "ETUDE HOUSE"], 2: ["ext:retailer:a", "ETUDE"]})
+    m = rl.manifest_for(rl.plan_relabel([a], [a], CANON, {"ext:retailer:a": [1]}))
     counts = await rl.write_moves(db, m["moves"])
     assert counts == {"products": 1, "groups": 1, "seeds": 1}
     mv = m["moves"][0]
     assert db.rows["ext:retailer:a"] == {"brand": "ETUDE", "content_key": mv["to_ck"]}
     assert db.groups[(a["merchant_id"], "external_seed", a["source_product_id"])] == mv["to_pg"]
-    assert db.seeds["ext:retailer:a"] == "ETUDE"
+    assert db.seeds[1] == ["ext:retailer:a", "ETUDE"]
     await rl.write_moves(db, m["moves"], reverse=True)
     assert db.rows["ext:retailer:a"] == {"brand": "ETUDE HOUSE", "content_key": a["content_key"]}
     assert db.groups[(a["merchant_id"], "external_seed", a["source_product_id"])] == a["product_group_id"]
-    assert db.seeds["ext:retailer:a"] == "ETUDE HOUSE"
+    assert db.seeds[1] == ["ext:retailer:a", "ETUDE HOUSE"]
+    assert db.seeds[2] == ["ext:retailer:a", "ETUDE"]  # never read under the old spelling: untouched both ways
+
+
+async def test_a_seed_that_changed_since_the_plan_aborts_the_write():
+    a = row("ext:retailer:a")
+    db = DB([a], seeds={1: ["ext:retailer:a", "re-crawled to something else"]})
+    m = rl.manifest_for(rl.plan_relabel([a], [a], CANON, {"ext:retailer:a": [1]}))
+    with pytest.raises(RuntimeError, match="seed"):
+        await rl.write_moves(db, m["moves"])
 
 
 async def test_a_row_without_membership_gets_the_target_group_and_the_revert_removes_it():
@@ -230,9 +242,11 @@ async def test_load_finds_the_whole_group_behind_a_gtin_match():
             calls.append(v)
             if "regexp_replace" in sql:
                 return [a]
+            if "external_product_seeds" in sql:
+                return []
             rows = [a, c1, c2]
             return [r for r in rows if r["content_key"] in v["cks"] or (r["gtin"] and r["gtin"] in v["gtins"])]
-    rows, neighbours = await rl.load(LoadDB(), ["etudehouse", "etude"], CANON)
+    rows, neighbours, _ = await rl.load(LoadDB(), ["etudehouse", "etude"], CANON)
     assert rows == [a] and {n["product_key"] for n in neighbours} == {"ext:retailer:a", "ext:retailer:c1",
                                                                       "ext:retailer:c2"}
     assert only(rl.plan_relabel(rows, neighbours, CANON))["hold"] == "target_in_several_groups"
@@ -244,8 +258,13 @@ async def test_load_never_offers_a_row_already_spelt_canonically():
             if "regexp_replace" in sql:
                 assert set(v["keys"]) == {"etudehouse", "etude"}
                 return [row("ext:retailer:a"), row("ext:retailer:c", brand="ETUDE")]
+            if "external_product_seeds" in sql:
+                assert v["pks"] == ["ext:retailer:a"]
+                return [{"id": 7, "attached_product_key": "ext:retailer:a", "brand": "ETUDE HOUSE"},
+                        {"id": 8, "attached_product_key": "ext:retailer:a", "brand": "ETUDE"}]
             return []
-    rows, _ = await rl.load(LoadDB(), ["etudehouse", "etude"], CANON)
+    rows, _, seeds = await rl.load(LoadDB(), ["etudehouse", "etude"], CANON)
+    assert seeds == {"ext:retailer:a": ["7"]}  # only the seed under the row's own (old) spelling
     assert [r["product_key"] for r in rows] == ["ext:retailer:a"]
 
 
@@ -255,3 +274,87 @@ def test_the_candidate_query_is_live_retailer_rows_of_the_family():
     assert "lower(regexp_replace(cp.brand, '[^[:alnum:]]', '', 'g')) = ANY(:keys)" in sql
     move = " ".join(rl.MOVE_ROW_SQL.split())
     assert "WHERE product_key = :pk AND brand = :from_brand AND content_key IS NOT DISTINCT FROM :from_ck" in move
+
+
+# --- review of #2434 ---------------------------------------------------------------------------------------
+
+def test_a_row_intake_half_moved_takes_its_key_s_group_instead_of_being_certified():
+    """Re-crawled under the family: new key M (the canonical rows' key), old group O. The relabel must put it in
+    M's group -- never report the split as "already grouped"."""
+    canon = row("ext:retailer:c1", brand="ETUDE", host="dodoskin.com")
+    half = row("ext:retailer:a", ck=canon["content_key"], pg="pg_old_spelling")
+    m = only(plan([half], extra=[canon]))
+    assert m["to_ck"] == canon["content_key"] and m["from_pg"] == "pg_old_spelling"
+    assert m["to_pg"] == canon["product_group_id"] and m["reason"] == "brand_only_already_grouped_regrouped"
+
+
+def test_a_row_whose_own_key_is_split_across_groups_is_held():
+    c1 = row("ext:retailer:c1", brand="ETUDE", host="dodoskin.com")
+    c2 = {**row("ext:retailer:c2", brand="ETUDE", host="moidaus.com"), "product_group_id": "pg_x"}
+    half = row("ext:retailer:a", ck=c1["content_key"], pg="pg_old_spelling")
+    assert only(plan([half], extra=[c1, c2]))["hold"] == "own_key_in_several_groups"
+
+
+def test_a_case_only_row_alone_on_its_key_keeps_its_own_group():
+    e = row("ext:retailer:e", brand="Etude", host="theglowbeautyshop.com", pg="pg_custom")
+    m = only(plan([e]))
+    assert m["reason"] == "case_only" and m["to_pg"] == "pg_custom"
+
+
+def test_a_title_match_with_a_different_barcode_is_held_not_merged():
+    canon = row("ext:retailer:c1", brand="ETUDE", gtin="8801111", host="dodoskin.com")
+    assert only(plan([row("ext:retailer:a", gtin="8802222")], extra=[canon]))["hold"] == \
+        "gtin_conflicts_with_title_match"
+    # no barcode on either side, or the same one: joined as before
+    assert only(plan([row("ext:retailer:a")], extra=[canon]))["reason"] == "joined_by_title"
+
+
+def test_the_family_lists_its_accented_spellings():
+    from scripts.relabel_retailer_brand import FAMILIES
+    canonical, spellings = FAMILIES["etude"]
+    keys = {rl.brand_alnum(s) for s in spellings}
+    assert canonical == "ETUDE" and {"etudehouse", "etude", "étudehouse", "étude"} <= keys
+
+
+def test_the_losing_side_of_every_move_is_rebuilt_before_any_gaining_side():
+    moves = [{"from_ck": "ck_a", "to_ck": "ck_m"}, {"from_ck": "ck_b", "to_ck": "ck_a"}]
+    assert rl.touched_keys(moves) == ["ck_a", "ck_b", "ck_m"]
+    assert rl.touched_keys(moves, reverse=True) == ["ck_m", "ck_a", "ck_b"]
+
+
+async def test_refresh_rebuilds_every_key_trusts_every_row_on_them_and_lists_failures(monkeypatch):
+    from services import agent_pdp_view_assembler as apv, catalog_row_trust_upserter as tr
+    from services import index_pipeline_state_service as ips
+    calls = []
+
+    async def refresh(ck, **kw):
+        calls.append(("refresh", ck))
+        if ck == "ck_bad":
+            raise RuntimeError("boom")
+        return True
+
+    async def reap(ck, **kw):
+        calls.append(("reap", ck))
+        return ck == "ck_a"
+
+    async def recompute(ck, **kw):
+        calls.append(("recompute", ck))
+
+    async def trust(*, db, product_keys):
+        calls.append(("trust", tuple(product_keys)))
+        return len(product_keys)
+    monkeypatch.setattr(apv, "refresh_agent_pdp_view_for_content_key", refresh)
+    monkeypatch.setattr(apv, "delete_agent_pdp_view_if_orphaned", reap)
+    monkeypatch.setattr(ips, "recompute_serving_eligibility", recompute)
+    monkeypatch.setattr(tr, "upsert_catalog_row_trust_many", trust)
+
+    class DB:
+        async def fetch_all(self, sql, v):
+            assert "content_key = ANY(:cks)" in sql and v["cks"] == ["ck_a", "ck_bad", "ck_m"]
+            return [{"product_key": "p_moved"}, {"product_key": "p_canonical_already_there"}]
+    out = await rl.refresh_after(DB(), [{"from_ck": "ck_a", "to_ck": "ck_m"}, {"from_ck": "ck_bad", "to_ck": "ck_m"}],
+                                 source="t")
+    assert [c for c in calls if c[0] == "refresh"] == [("refresh", "ck_a"), ("refresh", "ck_bad"), ("refresh", "ck_m")]
+    assert ("reap", "ck_a") in calls and out["reaped"] == 1
+    assert calls[-1] == ("trust", ("p_moved", "p_canonical_already_there")) and out["trust"] == 2
+    assert [f["content_key"] for f in out["failed_keys"]] == ["ck_bad"] and out["recomputed"] == 2

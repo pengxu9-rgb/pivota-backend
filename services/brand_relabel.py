@@ -1,30 +1,37 @@
-"""Relabel EXISTING retailer rows from a retired brand spelling to the family's canonical one.
+"""Relabel EXISTING retailer rows from a retired brand spelling to one canonical spelling.
 
 WHY. A retailer row is keyed by its URL (`ext:retailer:<sha(url)>`) and the catalog upsert never updates a
-stored brand (services/catalog_enrichment_agent/apply.py: `brand` is INSERT-only), so a spelling family added
-to curated_brand_feed.RETAILER_BRAND_SPELLINGS fixes every FUTURE crawl but none of the rows already written.
-Those keep the old brand -- and a content_key built from it, so the same product at two retailers never
-groups as one product with two offers. Measured 2026-09-28: ETUDE's retailer rows split 293 "ETUDE HOUSE" /
-174 "ETUDE" / 10 "Etude" across 20 stores.
+stored brand (services/catalog_enrichment_agent/apply.py: `brand` is INSERT-only), so the rows already written
+keep the old spelling -- and a content_key built from it, so the same product at two retailers never groups as
+one product with two offers. Measured 2026-09-28: ETUDE's retailer rows split 293 "ETUDE HOUSE" / 174 "ETUDE"
+/ 10 "Etude" across 20 stores.
 
-WHAT A RELABEL MOVES, per row, all drift-guarded on the value read at plan time:
+ORDER, and why this module changes no ingest behaviour (review of #2434): a spelling family in
+curated_brand_feed.RETAILER_BRAND_SPELLINGS makes the drain write the canonical spelling, and intake identity
+then ATTACHES a re-crawled row to make_content_key(canonical, title) before its own canonical_url self-match.
+For a row still on the old spelling's key that means a new key but the old group, which apply.py's
+_ensure_primary_retailer_group refuses -- failing that store's whole job on every re-crawl. So:
+  1. relabel (this module), 2. resolve every HELD row, 3. only then add the family (a separate change).
+
+WHAT A RELABEL MOVES, per row, all drift-guarded on the value read at plan time, in ONE transaction:
   * catalog_products.brand                  -> the canonical spelling
   * catalog_products.content_key            -> the target key (below)
   * product_group_members.product_group_id  -> the target key's group
-  * external_product_seeds.seed_data.brand  -> the canonical spelling (the mirror a re-crawl rewrites anyway)
-then rebuilds both content_keys' served views and serving eligibility and the row's trust (after the commit).
+  * external_product_seeds.seed_data.brand  -> the canonical spelling, on exactly the seed ids read at plan time
+then, after the commit, rebuilds both keys' served views and serving eligibility, and the trust of every live
+row on a touched key. Any drift aborts the whole batch; `revert` is the same all-or-nothing write, backwards.
 
 THE TARGET KEY, in order:
-  1. the row's CURRENT content_key already holds a live row under the canonical spelling (intake identity
-     attached it there earlier): keep it -- a brand-only change;
-  2. a live canonical row shares this row's GTIN on exactly one content_key: join it;
-  3. make_content_key(canonical, title) -- the key intake mints (intake_identity, GTIN-less) -- joining the
-     canonical rows already on it, if any.
+  1. the row's CURRENT key already holds a live canonical row (intake attached it there): keep the key, and take
+     THAT key's group -- a row intake half-moved (new key, old group) is repaired here, not certified;
+  2. a live canonical row shares this row's GTIN on exactly one key: join it;
+  3. make_content_key(canonical, title) -- the key intake mints (GTIN-less) -- joining whatever lives there.
 A row is HELD, never moved, when:
-  * its GTIN matches canonical rows on several content_keys (which product is it?),
-  * the target content_key's live rows sit in more than one product group,
-  * or its CURRENT content_key has other live rows that this relabel does not move to the SAME target (moving
-    one member would split a product; a row of an unrelated brand on it is left alone with it).
+  * its GTIN matches canonical rows on several keys (which product is it?),
+  * a title-join target carries GTINs and none is this row's (intake would flag brand_title_collision),
+  * the target key's live rows sit in more than one product group,
+  * or its CURRENT key has other live rows that this relabel does not move to the SAME target (moving one member
+    would split a product; a row of an unrelated brand on it is left alone with it).
 Rows whose spelling only differs in case ("Etude" vs "ETUDE": normalize_brand lowercases) keep their key.
 """
 from __future__ import annotations
@@ -37,9 +44,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from services.catalog_identity import make_content_key, normalize_brand
 from services.product_group_autogrouper import derive_product_group_id
 
-RETAILER_PREFIX = "ext:retailer:"
-
-# Live retailer rows under any spelling of the family (matched case-insensitively on the alnum key in code).
+# Live retailer rows under any spelling of the family (matched on the lowercased alnum key: PG keeps É as alnum,
+# as Python's casefold does, so an accented spelling must be listed to match).
 CANDIDATES_SQL = """
 SELECT cp.product_key, cp.brand, cp.title, cp.gtin, cp.content_key, cp.merchant_id, cp.platform,
        cp.source_product_id, cp.source_domain, pgm.product_group_id
@@ -50,14 +56,22 @@ WHERE cp.suppression_reason IS NULL AND cp.product_key LIKE 'ext:retailer:%'
   AND lower(regexp_replace(cp.brand, '[^[:alnum:]]', '', 'g')) = ANY(:keys)
 """
 
-# Every live row on the content_keys involved (current and target), with its group: the neighbours a move
-# must not split, and the canonical rows it may join.
+# Every live row on the keys involved (current and target) or sharing a GTIN, with its group.
 NEIGHBOURS_SQL = """
 SELECT cp.product_key, cp.brand, cp.gtin, cp.content_key, pgm.product_group_id
 FROM catalog_products cp
 LEFT JOIN product_group_members pgm ON pgm.merchant_id = cp.merchant_id AND pgm.platform = cp.platform
      AND pgm.platform_product_id = cp.source_product_id
 WHERE cp.suppression_reason IS NULL AND (cp.content_key = ANY(:cks) OR cp.gtin = ANY(:gtins))
+"""
+
+SEEDS_SQL = """
+SELECT id, attached_product_key, seed_data ->> 'brand' AS brand FROM external_product_seeds
+WHERE attached_product_key = ANY(:pks)
+"""
+
+LIVE_ON_KEYS_SQL = """
+SELECT product_key FROM catalog_products WHERE content_key = ANY(:cks) AND suppression_reason IS NULL
 """
 
 MOVE_ROW_SQL = """
@@ -89,10 +103,12 @@ WHERE merchant_id = :merchant_id AND platform = :platform AND platform_product_i
 RETURNING product_group_id
 """
 
+# Exactly the seed ids the plan read under the old spelling -- a seed already canonical is never touched, forward
+# or back (review of #2434: an id-less revert rewrote an untouched "ETUDE" seed to "ETUDE HOUSE").
 SEED_BRAND_SQL = """
 UPDATE external_product_seeds SET seed_data = jsonb_set(seed_data, '{brand}', to_jsonb(CAST(:to_brand AS text))),
        updated_at = NOW()
-WHERE attached_product_key = :pk AND seed_data ->> 'brand' = :from_brand
+WHERE id = ANY(:ids) AND attached_product_key = :pk AND seed_data ->> 'brand' = :from_brand
 RETURNING id
 """
 
@@ -102,9 +118,11 @@ def brand_alnum(value: Any) -> str:
 
 
 def plan_relabel(rows: Sequence[Mapping[str, Any]], neighbours: Sequence[Mapping[str, Any]],
-                 canonical: str) -> Dict[str, Any]:
-    """Pure: one move (or hold) per candidate row. `rows` are the family's live retailer rows NOT already
-    spelt `canonical`; `neighbours` every live row on their current and target content_keys and GTINs."""
+                 canonical: str, seeds: Optional[Mapping[str, Sequence[Any]]] = None) -> Dict[str, Any]:
+    """Pure: one move (or hold) per candidate row. `rows` are the family's live retailer rows NOT already spelt
+    `canonical`; `neighbours` every live row on their current and target keys and GTINs; `seeds` the seed ids
+    per product_key that carry the row's current spelling."""
+    seeds = seeds or {}
     canon_norm = normalize_brand(canonical)
     moving = {r["product_key"] for r in rows}
 
@@ -120,10 +138,10 @@ def plan_relabel(rows: Sequence[Mapping[str, Any]], neighbours: Sequence[Mapping
         if n.get("gtin"):
             by_gtin.setdefault(str(n["gtin"]), []).append(n)
 
-    def group_of(ck: str) -> Tuple[Optional[str], bool]:
-        # EVERY live row on the target, moving ones included: a case-only "Etude" row that is itself being
-        # relabelled already sits on the canonical key in its own group, and joining any other group splits it.
-        groups = {n.get("product_group_id") for n in by_ck.get(ck, [])}
+    def group_of(ck: str, *, but: Optional[str] = None) -> Tuple[Optional[str], bool]:
+        # EVERY live row on the key, moving ones included (a case-only "Etude" row being relabelled already sits
+        # on the canonical key in its own group) -- except, when given, the row asking.
+        groups = {n.get("product_group_id") for n in by_ck.get(ck, []) if n["product_key"] != but}
         groups.discard(None)
         if len(groups) > 1:
             return None, False
@@ -134,15 +152,24 @@ def plan_relabel(rows: Sequence[Mapping[str, Any]], neighbours: Sequence[Mapping
         base = {"product_key": r["product_key"], "from_brand": r["brand"], "to_brand": canonical,
                 "from_ck": r.get("content_key"), "from_pg": r.get("product_group_id"),
                 "merchant_id": r["merchant_id"], "platform": r["platform"], "spid": r["source_product_id"],
-                "source_domain": r.get("source_domain"), "title": r.get("title")}
+                "source_domain": r.get("source_domain"), "title": r.get("title"),
+                "seed_ids": [str(s) for s in seeds.get(r["product_key"], [])]}
         cur = r.get("content_key")
-        if cur and any(is_canonical(n) for n in by_ck.get(cur, [])):
-            decided[r["product_key"]] = {**base, "to_ck": cur, "to_pg": r.get("product_group_id"),
-                                         "reason": "brand_only_already_grouped"}
-            continue
-        if cur and normalize_brand(r["brand"]) == canon_norm:
-            decided[r["product_key"]] = {**base, "to_ck": cur, "to_pg": r.get("product_group_id"),
-                                         "reason": "case_only"}
+        stays = cur and (any(is_canonical(n) for n in by_ck.get(cur, []))
+                         or normalize_brand(r["brand"]) == canon_norm)
+        if stays:
+            # The key stays; the GROUP must be the key's own. A row intake half-moved (this key, an old group)
+            # takes the key's group here -- never certified as it stands (review of #2434).
+            to_pg, ok = group_of(cur, but=r["product_key"])
+            if not ok:
+                decided[r["product_key"]] = {**base, "hold": "own_key_in_several_groups"}
+                continue
+            if not any(n["product_key"] != r["product_key"] for n in by_ck.get(cur, [])):
+                to_pg = r.get("product_group_id") or to_pg  # alone on its key: its group is the key's group
+            reason = ("case_only" if normalize_brand(r["brand"]) == canon_norm else "brand_only_already_grouped")
+            if to_pg != r.get("product_group_id"):
+                reason += "_regrouped"
+            decided[r["product_key"]] = {**base, "to_ck": cur, "to_pg": to_pg, "reason": reason}
             continue
         gtin = str(r.get("gtin") or "")
         gtin_cks = {n["content_key"] for n in by_gtin.get(gtin, []) if is_canonical(n) and n.get("content_key")} \
@@ -157,7 +184,13 @@ def plan_relabel(rows: Sequence[Mapping[str, Any]], neighbours: Sequence[Mapping
             if not to_ck:
                 decided[r["product_key"]] = {**base, "hold": "no_title"}
                 continue
-            reason = "joined_by_title" if by_ck.get(to_ck) else "minted"
+            there = by_ck.get(to_ck, [])
+            target_gtins = {str(n["gtin"]) for n in there if n.get("gtin")}
+            if gtin and target_gtins and gtin not in target_gtins:
+                # Same brand + title, different barcode: intake flags brand_title_collision for review.
+                decided[r["product_key"]] = {**base, "hold": "gtin_conflicts_with_title_match"}
+                continue
+            reason = "joined_by_title" if there else "minted"
         to_pg, ok = group_of(to_ck)
         if not ok:
             decided[r["product_key"]] = {**base, "hold": "target_in_several_groups"}
@@ -185,10 +218,11 @@ def plan_relabel(rows: Sequence[Mapping[str, Any]], neighbours: Sequence[Mapping
     return {"canonical": canonical, "moves": moves, "holds": holds, "counts": counts}
 
 
-async def load(db: Any, spellings: Sequence[str], canonical: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """The candidates (the family's live retailer rows not already spelt `canonical`) and every live row on
-    their current content_keys, their title-minted target keys, their GTINs -- and, second pass, on the
-    content_keys those GTINs point at, so a GTIN-joined target's whole group is known."""
+async def load(db: Any, spellings: Sequence[str], canonical: str
+               ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, List[str]]]:
+    """The candidates (the family's live retailer rows not already spelt `canonical`), every live row on their
+    current keys, their title-minted target keys and their GTINs -- and, second pass, on the keys those GTINs
+    point at, so a GTIN-joined target's whole group is known -- and the candidates' old-spelling seed ids."""
     keys = sorted({brand_alnum(s) for s in spellings} | {brand_alnum(canonical)})
     rows = [dict(r) for r in await db.fetch_all(CANDIDATES_SQL, {"keys": keys})]
     rows = [r for r in rows if r["brand"] != canonical]
@@ -201,20 +235,29 @@ async def load(db: Any, spellings: Sequence[str], canonical: str) -> Tuple[List[
         seen = {n["product_key"] for n in neighbours}
         neighbours += [dict(n) for n in await db.fetch_all(NEIGHBOURS_SQL, {"cks": sorted(more), "gtins": []})
                        if n["product_key"] not in seen]
-    return rows, neighbours
+    brand_of = {r["product_key"]: r["brand"] for r in rows}
+    seeds: Dict[str, List[str]] = {}
+    if rows:
+        for s in await db.fetch_all(SEEDS_SQL, {"pks": sorted(brand_of)}):
+            if s["brand"] == brand_of.get(s["attached_product_key"]):
+                seeds.setdefault(s["attached_product_key"], []).append(str(s["id"]))
+    return rows, neighbours, seeds
+
+
+MOVE_KEYS = ("product_key", "from_brand", "to_brand", "from_ck", "to_ck", "from_pg", "to_pg", "merchant_id",
+             "platform", "spid", "seed_ids")
 
 
 def manifest_for(plan: Mapping[str, Any]) -> Dict[str, Any]:
-    """The reversal record, built BEFORE the write: every move's from/to values."""
+    """The reversal record, built BEFORE the write: every move's from/to values and the seed ids it rewrites."""
     return {"run_id": f"relabel_{uuid.uuid4().hex[:12]}", "canonical": plan["canonical"],
             "at": datetime.now(timezone.utc).isoformat(),
-            "moves": [{k: d[k] for k in ("product_key", "from_brand", "to_brand", "from_ck", "to_ck", "from_pg",
-                                         "to_pg", "merchant_id", "platform", "spid")} for d in plan["moves"]]}
+            "moves": [{k: d[k] for k in MOVE_KEYS} for d in plan["moves"]]}
 
 
 async def write_moves(db: Any, moves: Iterable[Mapping[str, Any]], *, reverse: bool = False) -> Dict[str, int]:
-    """One transaction. Forward: from -> to. Reverse: to -> from, for a manifest. Raises (rolled back) on any
-    drift: a row whose brand, content_key or group is no longer what the plan read."""
+    """One transaction, all or nothing. Forward: from -> to. Reverse: to -> from, for a manifest. Raises (rolled
+    back) on any drift: a row whose brand, content_key, group or recorded seeds are no longer what was read."""
     counts = {"products": 0, "groups": 0, "seeds": 0}
     async with db.transaction():
         for m in moves:
@@ -236,38 +279,50 @@ async def write_moves(db: Any, moves: Iterable[Mapping[str, Any]], *, reverse: b
                 if not moved:
                     raise RuntimeError(f"drift on {m['product_key']}: group membership changed since the plan")
                 counts["groups"] += 1
-            seeds = await db.fetch_all(SEED_BRAND_SQL, {"pk": m["product_key"], "from_brand": m[f"{f}_brand"],
-                                                        "to_brand": m[f"{t}_brand"]})
-            counts["seeds"] += len(seeds)
+            ids = list(m.get("seed_ids") or [])
+            if ids:
+                done = await db.fetch_all(SEED_BRAND_SQL, {"ids": [int(i) for i in ids], "pk": m["product_key"],
+                                                           "from_brand": m[f"{f}_brand"], "to_brand": m[f"{t}_brand"]})
+                if len(done) != len(ids):
+                    raise RuntimeError(f"drift on {m['product_key']}: a seed's brand changed since the plan")
+                counts["seeds"] += len(done)
     return counts
 
 
+def touched_keys(moves: Iterable[Mapping[str, Any]], *, reverse: bool = False) -> List[str]:
+    """Both sides of every move, every LOSING side first: agent_pdp_view indexes a signature uniquely, so the
+    view that still carries a moved row must be rebuilt (or reaped) before the view that gains it."""
+    moves = list(moves)
+    lost = [m["to_ck"] if reverse else m["from_ck"] for m in moves]
+    gained = [m["from_ck"] if reverse else m["to_ck"] for m in moves]
+    return list(dict.fromkeys(k for k in [*lost, *gained] if k))
+
+
 async def refresh_after(db: Any, moves: Iterable[Mapping[str, Any]], *, source: str,
-                        reverse: bool = False) -> Dict[str, int]:
-    """After the commit: rebuild both content_keys' views (the side that LOST the row first -- agent_pdp_view
-    indexes a signature uniquely) and eligibility, then each moved row's trust. Never undoes the write."""
+                        reverse: bool = False) -> Dict[str, Any]:
+    """After the commit: every touched key's view (reaped when it is left empty) and eligibility, then the trust
+    of EVERY live row on those keys -- a joined key's own rows included. Never undoes the write; failures are
+    listed so `refresh --manifest` can re-run just this."""
     from services.agent_pdp_view_assembler import (delete_agent_pdp_view_if_orphaned,
                                                     refresh_agent_pdp_view_for_content_key)
     from services.catalog_row_trust_upserter import upsert_catalog_row_trust_many
     from services.index_pipeline_state_service import recompute_serving_eligibility
 
-    moves = list(moves)
-    lost = [m["to_ck"] if reverse else m["from_ck"] for m in moves]
-    gained = [m["from_ck"] if reverse else m["to_ck"] for m in moves]
-    order = list(dict.fromkeys(k for k in [*lost, *gained] if k))  # every losing side before any gaining one
-    out = {"refreshed": 0, "reaped": 0, "recomputed": 0, "trust": 0, "errors": 0}
+    order = touched_keys(moves, reverse=reverse)
+    out: Dict[str, Any] = {"refreshed": 0, "reaped": 0, "recomputed": 0, "trust": 0, "failed_keys": []}
     for ck in order:
         try:
             out["refreshed"] += int(bool(await refresh_agent_pdp_view_for_content_key(ck, refresh_source=source, db=db)))
             out["reaped"] += int(bool(await delete_agent_pdp_view_if_orphaned(ck, db=db)))
             await recompute_serving_eligibility(ck, reason=source, db=db)
             out["recomputed"] += 1
-        except Exception:  # noqa: BLE001 -- counted; a cache rebuild never undoes a committed relabel
-            out["errors"] += 1
+        except Exception as exc:  # noqa: BLE001 -- listed; a cache rebuild never undoes a committed relabel
+            out["failed_keys"].append({"content_key": ck, "error": f"{type(exc).__name__}: {exc}"[:200]})
     try:
-        out["trust"] = int(await upsert_catalog_row_trust_many(db=db, product_keys=[m["product_key"] for m in moves]) or 0)
-    except Exception:  # noqa: BLE001
-        out["errors"] += 1
+        pks = [r["product_key"] for r in await db.fetch_all(LIVE_ON_KEYS_SQL, {"cks": order})] if order else []
+        out["trust"] = int(await upsert_catalog_row_trust_many(db=db, product_keys=pks) or 0) if pks else 0
+    except Exception as exc:  # noqa: BLE001
+        out["failed_keys"].append({"content_key": None, "error": f"trust: {type(exc).__name__}: {exc}"[:200]})
     return out
 
 
