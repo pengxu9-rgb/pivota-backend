@@ -120,11 +120,15 @@ def host_backoff_tripped(consecutive_blocks: int, trip: int) -> bool:
 # about the product. `_degraded_reason_bucket` names them.
 _UNREACHABLE_REASON_BUCKETS = frozenset({"connection", "timeout", "dns", "tls"})
 
-# A host that gave no answer this many rows IN A ROW is skipped for the rest of the run. 09-27:
-# 1,014 of 1,062 degraded rows were `connection`, 212 of them on ichibanm.com alone, each one a
-# slot the budget paid for and a request that reached nobody. Five is past a flaky minute and
-# costs at most five rows per unreachable host per night. `<= 0` disables.
-_HOST_UNREACHABLE_TRIP_DEFAULT = 5
+# A host that gave no answer this many rows IN A ROW is skipped for the rest of the run. 09-26/27:
+# 1,431 and 1,014 degraded rows were `connection`, most of them on ichibanm.com. But ichibanm is
+# FLAKY, not dead: the 2026-09-28 census read 990/1,850 of its rows on 09-26 and 284/496 on 09-27
+# (~55%), with the failures interleaved -- and it is the largest served host (2,284 seeds). The
+# trip has to tell that apart from a host that never answers. At a 45% failure rate a run of n
+# failures starts at any row with p ~ 0.45^n: 5 trips it after ~100 rows (it would read ~55 of its
+# seeds a night instead of ~990); 20 makes that ~6e-6 per row, and a truly dead host still costs
+# only 20 rows a night, one lane of several. `<= 0` disables.
+_HOST_UNREACHABLE_TRIP_DEFAULT = 20
 
 # Hosts read at once. 1 is the serial loop. Capped at 8: a host is never read by two workers at
 # once, but every worker holds an event-loop slice for HTML parsing on a 1-vCPU job, and the
@@ -1730,7 +1734,8 @@ def refresh_queue_tier(*, is_fresh: bool, market: Any, price_currency: Any) -> T
 async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> List[str]:
     """Which seeds the nightly refresh re-reads, in order: served and stale first.
 
-    THE QUEUE USED TO MISS EVERY UNATTACHED SEED WE SERVE. It took `attached_product_key IS NOT NULL` rows
+    THE QUEUE USED TO SKIP UNATTACHED SEEDS. (The 2026-09-28 census found 0 served unattached seeds
+    -- all 19,808 served seeds are attached -- so this is a latent fix, not a coverage one.) It took `attached_product_key IS NOT NULL` rows
     first, then UNATTACHED rows only when their domain matched a connected merchant store, and
     only when the attached rows left room under the limit. With ~14k attached rows and a 4,000-row
     limit, there was never room. The seed lanes serve unattached seeds
