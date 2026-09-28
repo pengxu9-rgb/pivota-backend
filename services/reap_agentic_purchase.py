@@ -2577,9 +2577,21 @@ async def _checkout_from_quote(
     )
 
     async def _hold(**kwargs: Any) -> AdvanceResult:
-        """`_release`, carrying whatever this step knows about the code (see `code_evidence`)."""
+        """`_release`, carrying a DROPPED code's outcome (see `code_evidence`) -- and nothing else.
+
+        ONLY `dropped_*` CROSSES A RELEASE (review of #2425, R5). A release means this step's quote
+        is thrown away and the next step quotes again, so `applied` / `no_discount` describe a quote
+        that no longer exists: persisted, a later refused or failed quote would carry them into a
+        terminal row as if the discount had held. A DROP is different -- it is what the next step
+        must not re-send. `applied` still reaches the row, but only through the transition to
+        'awaiting_approval', whose quote IS the one the buyer approves; later releases in that
+        state pass no outcome and the ledger's COALESCE keeps it.
+        """
+        outcome = code_evidence.get("offer_code_outcome")
         return await _release(
-            row, worker_id, offer_code_outcome=code_evidence.get("offer_code_outcome"), **kwargs
+            row, worker_id,
+            offer_code_outcome=outcome if outcome in _DROPPED_OUTCOMES else None,
+            **kwargs,
         )
 
     if not quote.ok:
