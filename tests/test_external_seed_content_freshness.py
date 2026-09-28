@@ -348,16 +348,16 @@ def _order_by_keys(query: str) -> List[str]:
     return [spec.split()[0] for spec in _order_by_specs(query)]
 
 
-def test_every_seed_query_leads_on_the_attempt_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """BOTH branches -- the attached and unattached queries are separate SQL strings, and
-    fixing one while leaving the other is the shape of bug this asserts against."""
+def test_the_seed_query_leads_on_the_attempt_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ONE query now. The attached and unattached branches used to be separate SQL strings, and
+    fixing one while leaving the other was the shape of bug this asserted against. The
+    unattached branch is gone: every active seed is a candidate, tiered in Python on top of this
+    order."""
     queries = _selector_queries(monkeypatch)
-    assert len(queries) == 2, "expected the attached and unattached seed queries"
-
-    for query in queries:
-        assert _order_by_keys(query)[0] == "last_crawl_attempt_at", (
-            f"queue must lead on the attempt clock, got {_order_by_specs(query)!r}"
-        )
+    assert len(queries) == 1, "expected a single seed query"
+    assert _order_by_keys(queries[0])[0] == "last_crawl_attempt_at", (
+        f"queue must lead on the attempt clock, got {_order_by_specs(queries[0])!r}"
+    )
 
 
 def test_every_order_by_key_sorts_oldest_first_with_nulls_leading(
@@ -390,12 +390,11 @@ def test_freshness_sits_beneath_the_attempt_clock_and_updated_at_beneath_both(
         assert keys.index("last_crawled_at") < keys.index("updated_at")
 
 
-def test_the_attached_query_is_the_one_that_was_starved(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pins the original pathology: attaching bumps `updated_at`, and the attached query is
-    the one selecting on `attached_product_key` -- so servable rows, the only ones whose price
-    a buyer can see, sank in the queue."""
-    attached = [q for q in _selector_queries(monkeypatch) if "attached_product_key IS NOT NULL" in q]
-    assert len(attached) == 1
-    assert _order_by_keys(attached[0])[0] == "last_crawl_attempt_at"
+def test_the_query_does_not_select_on_attachment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The original pathology was an attached-only queue ordered by `updated_at`, which attaching
+    bumps. The rewrite drops the attached-only predicate altogether: the seed lanes serve
+    unattached seeds too, and the old second branch never got a slot (see
+    test_external_referral_refresh_skips_suppressed_products)."""
+    (query,) = _selector_queries(monkeypatch)
+    assert "attached_product_key IS NOT NULL" not in query
+    assert _order_by_keys(query)[0] == "last_crawl_attempt_at"
