@@ -46,7 +46,12 @@ async def db():
                 platform_product_id TEXT NOT NULL, is_primary BOOLEAN, updated_at TIMESTAMPTZ,
                 UNIQUE (merchant_id, platform, platform_product_id));
             CREATE TABLE {_SCHEMA}.external_product_seeds (
-                id BIGSERIAL PRIMARY KEY, attached_product_key TEXT, seed_data JSONB, updated_at TIMESTAMPTZ);
+                -- TEXT, as in prod (mig 044: "seed:catalog_enrichment_agent_v1:<hex>"); an integer stub hid a cast
+                id TEXT PRIMARY KEY DEFAULT ('seed:catalog_enrichment_agent_v1:' || md5(random()::text)),
+                attached_product_key TEXT, seed_data JSONB, updated_at TIMESTAMPTZ);
+            CREATE TABLE {_SCHEMA}.identity_resolution_events (
+                id BIGSERIAL PRIMARY KEY, proposal_id TEXT NULL, action TEXT NOT NULL, run_id TEXT NOT NULL,
+                detail JSONB NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
         """)
     finally:
         await conn.close()
@@ -180,3 +185,20 @@ async def test_a_revert_is_all_or_nothing(db):
     with pytest.raises(RuntimeError, match="drift"):
         await rl.write_moves(db, manifest["moves"], reverse=True)
     assert await _state(db) == moved  # row a stayed relabelled with b
+
+
+
+async def test_a_manifest_larger_than_a_log_line_round_trips_through_the_database(db):
+    """Cloud Logging cut the first ETUDE apply's 303-move manifest at 100 KB (2026-09-28): it is stored in
+    identity_resolution_events instead, and read back whole."""
+    moves = [{"product_key": f"ext:retailer:{i:040x}", "from_brand": "ETUDE HOUSE", "to_brand": "ETUDE",
+              "from_ck": f"ck_{i:032x}", "to_ck": f"ck_{i + 1:032x}", "from_pg": f"pg_{i:032x}",
+              "to_pg": f"pg_{i + 1:032x}", "merchant_id": "merch_obs_luxiface", "platform": "external_seed",
+              "spid": f"retailer:{i:040x}", "seed_ids": [f"seed:catalog_enrichment_agent_v1:{i:016x}"]}
+             for i in range(400)]
+    manifest = {"run_id": "relabel_big", "canonical": "ETUDE", "at": "t", "moves": moves}
+    assert len(json.dumps(manifest)) > 102400
+    await rl.store_manifest(db, manifest)
+    assert await rl.load_manifest(db, "relabel_big") == manifest
+    with pytest.raises(SystemExit):
+        await rl.load_manifest(db, "relabel_missing")

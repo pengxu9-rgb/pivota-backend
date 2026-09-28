@@ -113,6 +113,38 @@ RETURNING id
 """
 
 
+# The manifest's durable home, written BEFORE the write (one statement, committed on its own). Not the job log: a
+# 303-move manifest is ~140 KB and Cloud Logging cuts a line at 100 KB (measured 2026-09-28, run
+# relabel_d64104859b24 -- the printed manifest was unparseable). identity_resolution_events.action is free text.
+MANIFEST_ACTION = "brand_relabel_manifest"
+STORE_MANIFEST_SQL = """
+INSERT INTO identity_resolution_events (proposal_id, action, run_id, detail)
+VALUES (NULL, :action, :run_id, CAST(:detail AS jsonb))
+RETURNING id
+"""
+LOAD_MANIFEST_SQL = """
+SELECT detail FROM identity_resolution_events WHERE action = :action AND run_id = :run_id
+ORDER BY id DESC LIMIT 1
+"""
+
+
+async def store_manifest(db: Any, manifest: Mapping[str, Any]) -> None:
+    row = await db.fetch_one(STORE_MANIFEST_SQL, {"action": MANIFEST_ACTION, "run_id": manifest["run_id"],
+                                                  "detail": json.dumps(manifest, default=str)})
+    if not row:
+        raise RuntimeError(f"the manifest for {manifest['run_id']} was not stored: nothing written")
+
+
+async def load_manifest(db: Any, run_id: str) -> Dict[str, Any]:
+    row = await db.fetch_one(LOAD_MANIFEST_SQL, {"action": MANIFEST_ACTION, "run_id": run_id})
+    detail = row and row["detail"]
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    if not detail:
+        raise SystemExit(f"no stored manifest for {run_id}")
+    return detail
+
+
 def brand_alnum(value: Any) -> str:
     return "".join(c for c in str(value or "").casefold() if c.isalnum())
 
@@ -298,7 +330,8 @@ async def write_moves(db: Any, moves: Iterable[Mapping[str, Any]], *, reverse: b
                 counts["groups"] += 1
             ids = list(m.get("seed_ids") or [])
             if ids:
-                done = await db.fetch_all(SEED_BRAND_SQL, {"ids": [int(i) for i in ids], "pk": m["product_key"],
+                # external_product_seeds.id is TEXT ("seed:catalog_enrichment_agent_v1:<hex>", mig 044): bound as is
+                done = await db.fetch_all(SEED_BRAND_SQL, {"ids": [str(i) for i in ids], "pk": m["product_key"],
                                                            "from_brand": m[f"{f}_brand"], "to_brand": m[f"{t}_brand"]})
                 if len(done) != len(ids):
                     raise RuntimeError(f"drift on {m['product_key']}: a seed's brand changed since the plan")
