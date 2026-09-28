@@ -196,6 +196,23 @@ def select_retirable(cohort: List[Dict[str, Any]], rows: Dict[str, Dict[str, Any
             "new_not_serving": new_not_serving, "already_suppressed": suppressed}
 
 
+async def load_serving(stale_rows: Dict[str, Dict[str, Any]], own_live_new_rows: List[Dict[str, Any]]) -> set:
+    """The `serving` set for `select_retirable`: product_keys whose content_key is serving_eligible.
+
+    One query over both sides' content_keys: the new key's serving state decides whether a retire loses a
+    product, the old row's whether there is anything to lose. Pass only THIS store's live new rows -- a
+    foreign or suppressed row under the new key is not the re-run's row and must not make it look served."""
+    ck_of = {r["product_key"]: r.get("content_key")
+             for r in [*stale_rows.values(), *own_live_new_rows] if r.get("content_key")}
+    if not ck_of:
+        return set()
+    serving_cks = {
+        r["content_key"] for r in await database.fetch_all(SERVING_SQL, {"keys": sorted(set(ck_of.values()))})
+        if r["serving_eligible"] is True
+    }
+    return {k for k, ck in ck_of.items() if ck in serving_cks}
+
+
 async def plan(domain: str, brand: str, category_path: str,
                stale_brand: Optional[str] = None, *, before_rewrite: bool = False) -> Dict[str, Any]:
     cohort = await build_cohort(domain, brand, category_path, stale_brand)
@@ -208,15 +225,7 @@ async def plan(domain: str, brand: str, category_path: str,
     # under the same (brand, title) key proves nothing about the re-run (re-review of #2397).
     new_live = {r["product_key"] for r in new_rows
                 if not r.get("suppression_reason") and _host(r.get("source_domain")) == _host(domain)}
-    # One query over both sides' content_keys: the new key's serving state decides whether a retire loses a
-    # product, the old row's whether there is anything to lose. Mapped back to product_keys for the pure split.
-    own_new = {r["product_key"]: r for r in new_rows if r["product_key"] in new_live}
-    ck_of = {k: r.get("content_key") for k, r in {**rows, **own_new}.items() if r.get("content_key")}
-    serving_cks = {
-        r["content_key"] for r in await database.fetch_all(SERVING_SQL, {"keys": sorted(set(ck_of.values()))})
-        if r["serving_eligible"] is True
-    } if ck_of else set()
-    serving = {k for k, ck in ck_of.items() if ck in serving_cks}
+    serving = await load_serving(rows, [r for r in new_rows if r["product_key"] in new_live])
     split = select_retirable(cohort, rows, new_live, domain, serving=serving, before_rewrite=before_rewrite)
     present, live = split["present"], split["live"]
     # Seeds and offers for the keys this run will actually retire -- never a waiting or foreign key, so the
