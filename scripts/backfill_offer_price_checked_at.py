@@ -14,7 +14,13 @@ AN OFFER IS STAMPED ONLY WHEN ALL OF THESE HOLD:
   * the offer is the seed's own listing (`is_listing_offer`, the attached lane's rule), live, and
     its product-level row (`<product_key>::canonical`). A variant row carries its variant's price,
     which this does not compare;
-  * the offer's price and currency ARE the seed's, to the cent;
+  * the offer's price and currency ARE the seed's, to the cent, under BOTH served-price
+    expressions: coalesce(merchant_effective_price, list_price) (the gateway) and
+    coalesce(merchant_effective_price, estimated_best_price, list_price) (the backend's routes);
+  * the read named its currency on the page. The seed does not record that, so the read must be
+    at or after CURRENCY_READ_CUTOFF: the refresh job's re-image onto #2417 (backend:fbd2b9cec,
+    2026-09-28T11:46:51Z), after which a page with no currency stores no price at all. An older
+    read may have taken the market's currency, and is left for the refresh to re-read;
   * the offer has no stamp yet (a write is fill-only and never overwrites a later read).
 The UPDATE re-checks price, currency and suppression, so a row that moved after the read is
 skipped rather than dated. `updated_at` is deliberately left alone: this changes no offer truth.
@@ -30,12 +36,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from db.database import database
 from services.external_offer_dual_write import SKU_SUFFIX, is_listing_offer
 
 PRICE_TOLERANCE = 0.005
+# The external-referral-refresh job's lastUpdatedTime when it was re-imaged onto backend:fbd2b9cec
+# (which carries #2417). Reads before it may carry a market-default currency. Only ever moved LATER.
+CURRENCY_READ_CUTOFF = datetime(2026, 9, 28, 11, 46, 51, tzinfo=timezone.utc)
 
 PREFLIGHT_SQL = """
 SELECT
@@ -58,7 +68,7 @@ LIMIT :limit
 
 OFFERS_SQL = """
 SELECT o.offer_id, o.product_key, o.sku_key, o.merchant_id, o.currency, o.source_ref,
-       o.list_price, o.merchant_effective_price, o.price_checked_at,
+       o.list_price, o.merchant_effective_price, o.estimated_best_price, o.price_checked_at,
        o.offer_payload ->> 'destination_url' AS payload_destination_url,
        o.offer_payload ->> 'external_seed_id' AS payload_seed_id,
        o.suppressed_at IS NOT NULL AS suppressed
@@ -76,6 +86,7 @@ WHERE offer_id = :offer_id
   AND suppressed_at IS NULL
   AND upper(trim(coalesce(currency, ''))) = :currency
   AND abs(coalesce(merchant_effective_price, list_price) - :price) < 0.005
+  AND abs(coalesce(merchant_effective_price, estimated_best_price, list_price) - :price) < 0.005
 RETURNING offer_id
 """
 
@@ -88,7 +99,9 @@ def _price(value: Any) -> Optional[float]:
     return price if price is not None and price > 0 else None
 
 
-def plan_seed(seed: Dict[str, Any], offers: List[Dict[str, Any]]) -> Dict[str, Any]:
+def plan_seed(
+    seed: Dict[str, Any], offers: List[Dict[str, Any]], *, read_after: datetime = CURRENCY_READ_CUTOFF
+) -> Dict[str, Any]:
     """Pure: which of this seed's offers the backfill dates, and why the rest are left alone.
 
     Returns {"writes": [{offer_id, checked_at, price, currency}], "skips": {reason: n}}."""
@@ -101,6 +114,8 @@ def plan_seed(seed: Dict[str, Any], offers: List[Dict[str, Any]]) -> Dict[str, A
     checked_at = seed.get("last_crawled_at")
     if checked_at is None:
         return skip("seed_never_read")
+    if checked_at < max(read_after, CURRENCY_READ_CUTOFF):
+        return skip("read_before_currency_cutoff")
     seed_price = _price(seed.get("price_amount"))
     currency = str(seed.get("price_currency") or "").strip().upper()
     if seed_price is None or not currency:
@@ -124,8 +139,12 @@ def plan_seed(seed: Dict[str, Any], offers: List[Dict[str, Any]]) -> Dict[str, A
         elif str(offer.get("currency") or "").strip().upper() != currency:
             skip("currency_differs")
         else:
-            offer_price = _price(offer.get("merchant_effective_price")) or _price(offer.get("list_price"))
-            if offer_price is None or abs(offer_price - seed_price) >= PRICE_TOLERANCE:
+            mep = _price(offer.get("merchant_effective_price"))
+            served = (
+                mep or _price(offer.get("list_price")),
+                mep or _price(offer.get("estimated_best_price")) or _price(offer.get("list_price")),
+            )
+            if any(p is None or abs(p - seed_price) >= PRICE_TOLERANCE for p in served):
                 skip("price_differs")
             else:
                 writes.append({"offer_id": offer["offer_id"], "checked_at": checked_at,
@@ -133,13 +152,17 @@ def plan_seed(seed: Dict[str, Any], offers: List[Dict[str, Any]]) -> Dict[str, A
     return {"writes": writes, "skips": skips}
 
 
-async def run_backfill(db, *, apply: bool, batch: int = 500, max_seeds: int = 0) -> Dict[str, Any]:
+async def run_backfill(
+    db, *, apply: bool, batch: int = 500, max_seeds: int = 0, read_after: datetime = CURRENCY_READ_CUTOFF
+) -> Dict[str, Any]:
     """Plan (and with `apply`, write) over every read seed. Returns the summary; `refused` when
     migration 246 is not in place, because without its trigger a stamp could outlive its price."""
     preflight = dict(await db.fetch_one(PREFLIGHT_SQL))
     if not (preflight["has_column"] and preflight["has_trigger"]):
         return {"refused": "migration_246_not_applied", **preflight}
-    totals: Dict[str, Any] = {"apply": apply, "seeds": 0, "planned": 0, "written": 0,
+    if read_after < CURRENCY_READ_CUTOFF:
+        return {"refused": "read_after_precedes_currency_cutoff", "cutoff": CURRENCY_READ_CUTOFF.isoformat()}
+    totals: Dict[str, Any] = {"apply": apply, "read_after": read_after.isoformat(), "seeds": 0, "planned": 0, "written": 0,
                               "changed_since_read": 0, "skips": {}}
     after = ""
     while True:
@@ -153,7 +176,7 @@ async def run_backfill(db, *, apply: bool, batch: int = 500, max_seeds: int = 0)
             by_key.setdefault(row["product_key"], []).append(dict(row))
         for seed in seeds:
             totals["seeds"] += 1
-            plan = plan_seed(seed, by_key.get(seed["attached_product_key"], []))
+            plan = plan_seed(seed, by_key.get(seed["attached_product_key"], []), read_after=read_after)
             for reason, n in plan["skips"].items():
                 totals["skips"][reason] = totals["skips"].get(reason, 0) + n
             totals["planned"] += len(plan["writes"])
@@ -172,7 +195,10 @@ async def run_backfill(db, *, apply: bool, batch: int = 500, max_seeds: int = 0)
 async def _run(args: argparse.Namespace) -> int:
     await database.connect()
     try:
-        summary = await run_backfill(database, apply=args.apply, batch=args.batch, max_seeds=args.max_seeds)
+        summary = await run_backfill(
+            database, apply=args.apply, batch=args.batch, max_seeds=args.max_seeds,
+            read_after=datetime.fromisoformat(args.read_after) if args.read_after else CURRENCY_READ_CUTOFF,
+        )
     finally:
         await database.disconnect()
     # A text prefix keeps the line in textPayload, where run_oneoff_job.sh prints it.
@@ -185,6 +211,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--apply", action="store_true", help="write the stamps (else dry-run counts)")
     p.add_argument("--batch", type=int, default=500, help="seeds per read")
     p.add_argument("--max-seeds", type=int, default=0, help="stop after this many seeds (0 = all)")
+    p.add_argument("--read-after", default=None,
+                   help="ISO instant with offset; only reads at or after it (never earlier than CURRENCY_READ_CUTOFF)")
     return asyncio.run(_run(p.parse_args(argv)))
 
 

@@ -48,7 +48,8 @@ _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect
 _SCHEMA = f"offer_price_checked_at_test_{os.getpid()}"
 
 PK = "prod::external_seed::merch_obs_price_check::ext_price_check"
-READ_AT = datetime(2026, 9, 1, 5, 15, tzinfo=timezone.utc)
+# after the backfill's currency cutoff (the refresh re-imaged onto #2417, 2026-09-28T11:46:51Z)
+READ_AT = datetime(2026, 9, 29, 5, 15, tzinfo=timezone.utc)
 
 
 def _assert_throwaway_database() -> None:
@@ -96,6 +97,14 @@ async def _teardown(admin, scoped) -> None:
     await admin.disconnect()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_price_check_probe(monkeypatch):
+    """The dual-write's column probe caches per process; each test's schema is asked afresh."""
+    from services import external_offer_dual_write as mod
+
+    monkeypatch.setattr(mod, "_price_check_column", {"present": False, "checked": None})
+
+
 @pytest.fixture()
 async def scoped_db():
     admin, scoped = await _scratch(with_price_check=True)
@@ -118,8 +127,8 @@ async def unmigrated_db():
 async def _offer(db, *, checked_at=READ_AT):
     await db.execute(
         "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, availability,"
-        " currency, list_price, merchant_effective_price, price_checked_at)"
-        " VALUES ('of_1', 'sku_1', :pk, 'merch_obs_price_check', 'in_stock', 'SGD', 28.20, 28.20,"
+        " currency, list_price, merchant_effective_price, estimated_best_price, price_checked_at)"
+        " VALUES ('of_1', 'sku_1', :pk, 'merch_obs_price_check', 'in_stock', 'SGD', 28.20, 28.20, 28.20,"
         "         :checked)",
         {"pk": PK, "checked": checked_at},
     )
@@ -142,6 +151,7 @@ async def _checked(db, offer_id="of_1"):
     [
         "list_price = 30.00",
         "merchant_effective_price = 30.00",
+        "estimated_best_price = 30.00",
         "currency = 'USD'",
         "list_price = NULL, merchant_effective_price = NULL",
     ],
@@ -366,3 +376,68 @@ async def test_the_stamp_never_overwrites_a_later_read(scoped_db):
     write = {"offer_id": "of_listing", "checked_at": READ_AT, "price": 28.2, "currency": "SGD"}
     assert await scoped_db.fetch_all(STAMP_SQL, write) == []
     assert (await _checked(scoped_db, "of_listing"))["original"] is False
+
+
+# ── the column is never a precondition for writing a price ───────────────────────────────────────
+
+
+async def test_without_the_column_prices_still_move_and_stamp_once_it_lands(unmigrated_db, monkeypatch):
+    """Prod before schema_guard's heal lands (or after it deferred): both lanes write the price exactly
+    as before 246. The first write after the heal, once the probe re-asks, stamps."""
+    from db import schema_guard
+    from services import external_offer_dual_write as mod
+
+    monkeypatch.setattr(mod, "database", unmigrated_db)
+    moved = await _mirror_without_column(mod, 28.2)
+    assert float(moved["list_price"]) == 28.2
+
+    dest = "https://missha.us/products/pdrn-peel-shot"
+    await unmigrated_db.execute(
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, list_price,"
+        " merchant_effective_price, estimated_best_price, source_ref)"
+        " VALUES ('of_attached', :sku, 'ext:pdrn', 'agent_seed::missha', 'USD', 29, 29, 29, :dest)",
+        {"sku": "ext:pdrn::canonical", "dest": dest},
+    )
+    seed = {"id": "seed_attached", "attached_product_key": "ext:pdrn", "destination_url": dest,
+            "price_amount": 22.7, "price_currency": "USD"}
+    result = await mod.sync_attached_listing_offers(seed, source="refresh", currency_read=True)
+    assert result["status"] == "synced" and result["offers_written"] == 1, result
+    row = await unmigrated_db.fetch_one("SELECT list_price FROM catalog_offers WHERE offer_id = 'of_attached'")
+    assert float(row["list_price"]) == 22.7
+
+    monkeypatch.setattr(schema_guard, "database", unmigrated_db)
+    await schema_guard._heal_add_columns(
+        """
+        ALTER TABLE IF EXISTS catalog_offers
+          ADD COLUMN IF NOT EXISTS price_checked_at TIMESTAMPTZ NULL;
+        """
+    )
+    monkeypatch.setattr(mod, "_price_check_column", {"present": False, "checked": None})  # the re-ask
+    await mod.upsert_catalog_offer_from_seed_row(PK, _seed(30.0), merchant_id="merch_obs_price_check", price_read=True)
+    stamped = await unmigrated_db.fetch_one(
+        "SELECT list_price, price_checked_at FROM catalog_offers WHERE offer_id = :oid",
+        {"oid": mod.derive_mirror_offer_id(PK)},
+    )
+    assert float(stamped["list_price"]) == 30.0 and stamped["price_checked_at"] is not None
+
+
+async def _mirror_without_column(mod, price):
+    assert await mod.price_check_column_present() is False
+    await mod.upsert_catalog_offer_from_seed_row(PK, _seed(price), merchant_id="merch_obs_price_check", price_read=True)
+    row = await mod.database.fetch_one(
+        "SELECT list_price FROM catalog_offers WHERE offer_id = :oid", {"oid": mod.derive_mirror_offer_id(PK)}
+    )
+    return dict(row)
+
+
+async def test_the_stamp_refuses_a_row_the_backend_serves_at_another_price(scoped_db):
+    # mep NULL: the gateway serves list_price (28.20), the backend's routes estimated_best_price (19).
+    from scripts.backfill_offer_price_checked_at import STAMP_SQL
+
+    await _backfill_fixture(scoped_db)
+    await scoped_db.execute(
+        "UPDATE catalog_offers SET merchant_effective_price = NULL, estimated_best_price = 19"
+        " WHERE offer_id = 'of_listing'"
+    )
+    write = {"offer_id": "of_listing", "checked_at": READ_AT, "price": 28.2, "currency": "SGD"}
+    assert await scoped_db.fetch_all(STAMP_SQL, write) == []

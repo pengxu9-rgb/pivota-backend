@@ -251,6 +251,10 @@ async def _heal_guarded(table: str, needed: str, ddl: str) -> None:
 # Mig 246's trigger, installed from the migration file itself: the statements that run on a prod
 # boot are the ones reviewed in the .sql, never a copy that can drift from it. Needed while the
 # column exists (the function reads it) and the trigger does not.
+#
+# FIRST INSTALL ONLY. The guard looks for the trigger by NAME, so an edit to 246's function or
+# WHEN clause after a database has the trigger is not re-applied by a boot. Such a change ships
+# as a new migration and a new guard that recognises the new definition.
 PRICE_CHECK_MIGRATION = Path(__file__).resolve().parent / "migrations" / "246_catalog_offers_price_checked_at.sql"
 PRICE_CHECK_TRIGGER = "trg_catalog_offers_forget_unread_price_check"
 PRICE_CHECK_TRIGGER_NEEDED = f"""EXISTS (

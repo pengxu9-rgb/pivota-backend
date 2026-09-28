@@ -37,6 +37,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
@@ -167,6 +168,118 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
+# ── price_checked_at (migration 246) is never a precondition for writing a price ────────────────
+#
+# Prod boots skip db/migrations; the column arrives by schema_guard's heal, which takes the table's
+# lock under a 500ms lock_timeout and waits for the next boot when a bulk writer holds it. A write
+# that named a missing column would fail UndefinedColumn, `sync_offer_for_seed` would swallow it as
+# status=error, and prices would silently stop moving. So each writer asks first and, while the
+# column is absent, runs the statement it ran before 246, which is derived from the one below by
+# cutting exactly the stamp (`_without_price_check`), so the two cannot drift.
+PRICE_CHECK_COLUMN_SQL = """
+SELECT EXISTS (
+  SELECT 1 FROM pg_attribute
+  WHERE attrelid = to_regclass('catalog_offers')
+    AND attname = 'price_checked_at'
+    AND attnum > 0
+    AND NOT attisdropped
+) AS present
+"""
+# Absent is re-asked at most this often; present is final (the column is never dropped in service).
+PRICE_CHECK_RECHECK_SECONDS = 60.0
+_price_check_column: Dict[str, Any] = {"present": False, "checked": None}
+
+
+async def price_check_column_present() -> bool:
+    """Does catalog_offers carry price_checked_at yet? Never raises; a failed read is "absent"."""
+    if _price_check_column["present"]:
+        return True
+    now = time.monotonic()
+    checked = _price_check_column["checked"]
+    if checked is not None and now - checked < PRICE_CHECK_RECHECK_SECONDS:
+        return False
+    _price_check_column["checked"] = now
+    try:
+        row = await database.fetch_one(PRICE_CHECK_COLUMN_SQL)
+        present = bool(row and row["present"])
+    except Exception:  # noqa: BLE001
+        present = False
+    _price_check_column["present"] = present
+    return present
+
+
+def _without_price_check(sql: str, cuts: tuple) -> str:
+    """`sql` with each of `cuts` (old, new) applied exactly once, and no price_checked_at left."""
+    for old, new in cuts:
+        if sql.count(old) != 1:
+            raise RuntimeError(f"statement changed shape; update its price_checked_at cut: {old[:60]!r}")
+        sql = sql.replace(old, new)
+    if "price_checked_at" in sql or ":price_read" in sql:
+        raise RuntimeError("price_checked_at survived the cut")
+    return sql
+
+
+MIRROR_OFFER_UPSERT_SQL = """
+        INSERT INTO catalog_offers
+          (offer_id, sku_key, product_key, merchant_id,
+           catalog_track, truth_tier, readiness_tier,
+           offer_type, is_first_party, offer_mode,
+           channel, availability, inventory_quantity, currency,
+           list_price, merchant_effective_price, estimated_best_price,
+           price_confidence, source_system, source_ref, source_domain,
+           offer_payload, price_checked_at)
+        VALUES
+          (:offer_id, :sku_key, :product_key, :merchant_id,
+           :catalog_track, :truth_tier, :readiness_tier,
+           :offer_type, :is_first_party, :offer_mode,
+           :channel, :availability, :inventory_quantity, :currency,
+           :list_price, :merchant_effective_price, :estimated_best_price,
+           :price_confidence, :source_system, :source_ref, :source_domain,
+           CAST(:offer_payload AS jsonb),
+           CASE WHEN CAST(:price_read AS BOOLEAN) THEN NOW() END)
+        ON CONFLICT (offer_id) DO UPDATE SET
+          -- A KNOWN-retailer host is AUTHORITATIVE third-party evidence, so it
+          -- corrects a wrongly-stored value (demotes a bad brand_direct/first-party):
+          -- when EXCLUDED.offer_type='retailer' it wins. Otherwise we only FILL a
+          -- NULL offer_type (COALESCE) and keep is_first_party sticky — a brand_direct
+          -- or unknown never clobbers what onboard already set. Real corrections
+          -- away from retailer are the backfill's job, not this ingest upsert.
+          offer_type = CASE
+            WHEN EXCLUDED.offer_type = 'retailer' THEN 'retailer'
+            ELSE COALESCE(catalog_offers.offer_type, EXCLUDED.offer_type)
+          END,
+          is_first_party = CASE
+            WHEN EXCLUDED.offer_type = 'retailer' THEN FALSE
+            ELSE catalog_offers.is_first_party OR EXCLUDED.is_first_party
+          END,
+          availability = EXCLUDED.availability,
+          inventory_quantity = EXCLUDED.inventory_quantity,
+          currency = EXCLUDED.currency,
+          list_price = EXCLUDED.list_price,
+          merchant_effective_price = EXCLUDED.merchant_effective_price,
+          estimated_best_price = EXCLUDED.estimated_best_price,
+          price_confidence = EXCLUDED.price_confidence,
+          -- Fill-only: a source_domain already on the row (ingest-written or
+          -- audit-backfilled) is never clobbered — same correct-only posture as
+          -- the currency backfill. A later seed-domain edit is the audit's job
+          -- to reconcile, not this ingest upsert's.
+          source_domain = COALESCE(catalog_offers.source_domain, EXCLUDED.source_domain),
+          offer_payload = EXCLUDED.offer_payload,
+          price_checked_at = CASE
+            WHEN CAST(:price_read AS BOOLEAN) THEN NOW()
+            ELSE catalog_offers.price_checked_at
+          END,
+          updated_at = NOW()
+"""
+MIRROR_OFFER_UPSERT_SQL_WITHOUT_PRICE_CHECK = _without_price_check(MIRROR_OFFER_UPSERT_SQL, (
+    ("offer_payload, price_checked_at)", "offer_payload)"),
+    ("CAST(:offer_payload AS jsonb),\n           CASE WHEN CAST(:price_read AS BOOLEAN) THEN NOW() END)",
+     "CAST(:offer_payload AS jsonb))"),
+    ("          price_checked_at = CASE\n            WHEN CAST(:price_read AS BOOLEAN) THEN NOW()\n"
+     "            ELSE catalog_offers.price_checked_at\n          END,\n", ""),
+))
+
+
 async def upsert_catalog_offer_from_seed_row(
     product_key: str,
     row_dict: Dict[str, Any],
@@ -256,59 +369,9 @@ async def upsert_catalog_offer_from_seed_row(
         if plausible_domain(host):
             source_domain_value = host
             break
+    with_check = await price_check_column_present()
     await database.execute(
-        """
-        INSERT INTO catalog_offers
-          (offer_id, sku_key, product_key, merchant_id,
-           catalog_track, truth_tier, readiness_tier,
-           offer_type, is_first_party, offer_mode,
-           channel, availability, inventory_quantity, currency,
-           list_price, merchant_effective_price, estimated_best_price,
-           price_confidence, source_system, source_ref, source_domain,
-           offer_payload, price_checked_at)
-        VALUES
-          (:offer_id, :sku_key, :product_key, :merchant_id,
-           :catalog_track, :truth_tier, :readiness_tier,
-           :offer_type, :is_first_party, :offer_mode,
-           :channel, :availability, :inventory_quantity, :currency,
-           :list_price, :merchant_effective_price, :estimated_best_price,
-           :price_confidence, :source_system, :source_ref, :source_domain,
-           CAST(:offer_payload AS jsonb),
-           CASE WHEN CAST(:price_read AS BOOLEAN) THEN NOW() END)
-        ON CONFLICT (offer_id) DO UPDATE SET
-          -- A KNOWN-retailer host is AUTHORITATIVE third-party evidence, so it
-          -- corrects a wrongly-stored value (demotes a bad brand_direct/first-party):
-          -- when EXCLUDED.offer_type='retailer' it wins. Otherwise we only FILL a
-          -- NULL offer_type (COALESCE) and keep is_first_party sticky — a brand_direct
-          -- or unknown never clobbers what onboard already set. Real corrections
-          -- away from retailer are the backfill's job, not this ingest upsert.
-          offer_type = CASE
-            WHEN EXCLUDED.offer_type = 'retailer' THEN 'retailer'
-            ELSE COALESCE(catalog_offers.offer_type, EXCLUDED.offer_type)
-          END,
-          is_first_party = CASE
-            WHEN EXCLUDED.offer_type = 'retailer' THEN FALSE
-            ELSE catalog_offers.is_first_party OR EXCLUDED.is_first_party
-          END,
-          availability = EXCLUDED.availability,
-          inventory_quantity = EXCLUDED.inventory_quantity,
-          currency = EXCLUDED.currency,
-          list_price = EXCLUDED.list_price,
-          merchant_effective_price = EXCLUDED.merchant_effective_price,
-          estimated_best_price = EXCLUDED.estimated_best_price,
-          price_confidence = EXCLUDED.price_confidence,
-          -- Fill-only: a source_domain already on the row (ingest-written or
-          -- audit-backfilled) is never clobbered — same correct-only posture as
-          -- the currency backfill. A later seed-domain edit is the audit's job
-          -- to reconcile, not this ingest upsert's.
-          source_domain = COALESCE(catalog_offers.source_domain, EXCLUDED.source_domain),
-          offer_payload = EXCLUDED.offer_payload,
-          price_checked_at = CASE
-            WHEN CAST(:price_read AS BOOLEAN) THEN NOW()
-            ELSE catalog_offers.price_checked_at
-          END,
-          updated_at = NOW()
-        """,
+        MIRROR_OFFER_UPSERT_SQL if with_check else MIRROR_OFFER_UPSERT_SQL_WITHOUT_PRICE_CHECK,
         {
             "offer_id": offer_id,
             "sku_key": sku_key,
@@ -336,7 +399,8 @@ async def upsert_catalog_offer_from_seed_row(
             "offer_payload": json.dumps(
                 offer_payload, ensure_ascii=False, default=_json_default
             ),
-            "price_read": bool(price_read),
+            # Only the statement that names price_checked_at binds it.
+            **({"price_read": bool(price_read)} if with_check else {}),
         },
     )
 
@@ -451,6 +515,10 @@ WHERE offer_id = :offer_id
   AND suppressed_at IS NULL
 RETURNING offer_id
 """
+ATTACHED_LISTING_OFFER_UPDATE_SQL_WITHOUT_PRICE_CHECK = _without_price_check(ATTACHED_LISTING_OFFER_UPDATE_SQL, (
+    ("    -- Every write this lane makes is a vouched read (ATTACHED_PRICE_SOURCES), so it dates the price.\n"
+     "    price_checked_at = NOW(),\n", ""),
+))
 
 
 def _json_value(value: Any) -> Any:
@@ -618,10 +686,15 @@ async def sync_attached_listing_offers(
         return {"seed_id": seed_id, "status": plan["status"], "product_key": product_key}
     written = 0
     skips = dict(plan["skips"])
+    update_sql = (
+        ATTACHED_LISTING_OFFER_UPDATE_SQL
+        if await price_check_column_present()
+        else ATTACHED_LISTING_OFFER_UPDATE_SQL_WITHOUT_PRICE_CHECK
+    )
     for write in plan["writes"]:
         # RETURNING, because `execute` reports no row count: a row the guard no longer matches
         # (currency moved, offer suppressed since the read) is a skip, not a write.
-        if await database.fetch_one(ATTACHED_LISTING_OFFER_UPDATE_SQL, write):
+        if await database.fetch_one(update_sql, write):
             written += 1
         else:
             skips["changed_since_read"] = skips.get("changed_since_read", 0) + 1

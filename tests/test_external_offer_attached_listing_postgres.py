@@ -153,6 +153,7 @@ async def _sync(monkeypatch, db):
 
     monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
     monkeypatch.setattr(mod, "database", db)
+    monkeypatch.setattr(mod, "_price_check_column", {"present": False, "checked": None})
     return await mod.sync_offer_for_seed(SEED_ID, attached_price_source="refresh", currency_read=True)
 
 

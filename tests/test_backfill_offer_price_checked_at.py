@@ -11,11 +11,12 @@ from datetime import datetime, timezone
 
 import pytest
 
-from scripts.backfill_offer_price_checked_at import plan_seed
+from scripts.backfill_offer_price_checked_at import CURRENCY_READ_CUTOFF, plan_seed
 
 PK = "ext:missha-pdrn-peel-shot::3595c15f"
 DEST = "https://missha.us/products/pdrn-peel-shot"
-READ = datetime(2026, 9, 27, 5, 31, tzinfo=timezone.utc)
+# the first nightly refresh on the #2417 image
+READ = datetime(2026, 9, 29, 5, 31, tzinfo=timezone.utc)
 
 
 def _seed(**over):
@@ -53,6 +54,9 @@ def test_accept_a_currency_spelled_in_lower_case():
     "seed_over, offer_over, reason",
     [
         ({"last_crawled_at": None}, {}, "seed_never_read"),
+        # read before the refresh stored "no price" for a page with no currency: its currency may
+        # be the market's default, which is not a reading
+        ({"last_crawled_at": datetime(2026, 9, 28, 5, 31, tzinfo=timezone.utc)}, {}, "read_before_currency_cutoff"),
         ({"price_amount": None}, {}, "seed_has_no_price"),
         # an employee edit moved the seed price after the crawl: the crawl did not read 25.00
         ({"price_amount": 25.0}, {"list_price": 25.0, "merchant_effective_price": 25.0},
@@ -60,6 +64,8 @@ def test_accept_a_currency_spelled_in_lower_case():
         ({"snapshot_price_amount": None}, {}, "seed_price_not_from_its_read"),
         ({}, {"merchant_effective_price": 29.0, "list_price": 29.0}, "price_differs"),
         ({}, {"merchant_effective_price": 22.71}, "price_differs"),
+        # the backend's routes serve coalesce(mep, estimated_best_price, list_price)
+        ({}, {"merchant_effective_price": None, "estimated_best_price": 19.0}, "price_differs"),
         ({}, {"currency": "GBP"}, "currency_differs"),
         ({}, {"sku_key": f"{PK}::v:47761881301179"}, "variant_row"),
         ({}, {"suppressed": True}, "suppressed"),
@@ -79,3 +85,18 @@ def test_the_merchant_effective_price_is_the_price_compared():
     # the served price is coalesce(merchant_effective_price, list_price)
     assert plan_seed(_seed(), [_offer(list_price=30.0)])["writes"]
     assert plan_seed(_seed(), [_offer(merchant_effective_price=None, list_price=22.7)])["writes"]
+
+
+def test_the_cutoff_only_moves_later():
+    at_cutoff = _seed(last_crawled_at=CURRENCY_READ_CUTOFF)
+    assert plan_seed(at_cutoff, [_offer()])["writes"]
+    # asking for an EARLIER cutoff does not admit an older read
+    older = _seed(last_crawled_at=datetime(2026, 9, 20, tzinfo=timezone.utc))
+    early = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    assert plan_seed(older, [_offer()], read_after=early)["skips"] == {"read_before_currency_cutoff": 1}
+    # a LATER one does exclude a read the default would take
+    assert plan_seed(_seed(), [_offer()], read_after=datetime(2026, 10, 1, tzinfo=timezone.utc))["writes"] == []
+
+
+def test_an_estimated_best_price_that_agrees_is_accepted():
+    assert plan_seed(_seed(), [_offer(merchant_effective_price=None, estimated_best_price=22.7)])["writes"]

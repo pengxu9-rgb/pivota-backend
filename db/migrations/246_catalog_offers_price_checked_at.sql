@@ -16,7 +16,10 @@
 -- NULL means "no read on record". It is never defaulted, and never backfilled from updated_at.
 --
 -- WHAT KEEPS IT TRUE. A stamp dates ONE price. The trigger below forgets it when any writer
--- moves list_price, merchant_effective_price or currency without stamping a read of its own.
+-- moves list_price, merchant_effective_price, estimated_best_price or currency without stamping
+-- a read of its own. All three amounts are watched because readers serve different coalesces of
+-- them: the gateway coalesce(merchant_effective_price, list_price), the backend's agent routes
+-- coalesce(merchant_effective_price, estimated_best_price, list_price).
 -- That covers the ingest upserts, the one-off repair scripts, and every writer yet to be
 -- written, instead of a rule restated in each of them.
 --
@@ -43,11 +46,12 @@ $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_catalog_offers_forget_unread_price_check ON catalog_offers;
 
 CREATE TRIGGER trg_catalog_offers_forget_unread_price_check
-    BEFORE UPDATE OF list_price, merchant_effective_price, currency ON catalog_offers
+    BEFORE UPDATE OF list_price, merchant_effective_price, estimated_best_price, currency ON catalog_offers
     FOR EACH ROW
     WHEN (
         OLD.list_price IS DISTINCT FROM NEW.list_price
         OR OLD.merchant_effective_price IS DISTINCT FROM NEW.merchant_effective_price
+        OR OLD.estimated_best_price IS DISTINCT FROM NEW.estimated_best_price
         OR OLD.currency IS DISTINCT FROM NEW.currency
     )
     EXECUTE FUNCTION catalog_offers_forget_unread_price_check();

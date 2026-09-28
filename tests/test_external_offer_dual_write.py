@@ -20,17 +20,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from services import external_offer_dual_write as mod  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _fresh_price_check_probe(monkeypatch):
+    """The column probe caches per process; every test asks afresh."""
+    monkeypatch.setattr(mod, "_price_check_column", {"present": False, "checked": None})
+
+
 class FakeDB:
     """Mocks the two reads sync_offer_for_seed does: the seed fetch and the
     provenance mirror-product lookup (both fetch_one), plus execute capture."""
 
-    def __init__(self, *, seed=None, mirror=None):
+    def __init__(self, *, seed=None, mirror=None, price_check_column=True):
         self._seed = seed
         self._mirror = mirror  # {"product_key":..., "merchant_id":...} or None
+        self._price_check_column = price_check_column
         self.executed = []
 
     async def fetch_one(self, sql, params=None):
         s = str(sql)
+        if s == mod.PRICE_CHECK_COLUMN_SQL:
+            return {"present": self._price_check_column}
         if "FROM external_product_seeds" in s and "WHERE id" in s:
             return dict(self._seed) if self._seed else None
         if "FROM catalog_products" in s and "source_ref" in s:
@@ -313,9 +322,72 @@ def test_the_mirror_upsert_never_stamps_without_the_callers_word():
     own stamp, and migration 246's trigger forgets it if the price moved."""
     import inspect
 
-    source = inspect.getsource(mod.upsert_catalog_offer_from_seed_row)
-    assert "price_read: bool = False" in source
-    assert source.count("NOW() END") == 1  # the INSERT arm
-    assert "WHEN CAST(:price_read AS BOOLEAN) THEN NOW()" in source
-    assert "ELSE catalog_offers.price_checked_at" in source
+    assert "price_read: bool = False" in inspect.getsource(mod.upsert_catalog_offer_from_seed_row)
+    sql = mod.MIRROR_OFFER_UPSERT_SQL
+    assert sql.count("NOW() END") == 1  # the INSERT arm
+    assert "WHEN CAST(:price_read AS BOOLEAN) THEN NOW()" in sql
+    assert "ELSE catalog_offers.price_checked_at" in sql
     assert "price_checked_at = NOW()" in mod.ATTACHED_LISTING_OFFER_UPDATE_SQL
+
+
+# ── ...and the column is never a precondition for writing a price ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_without_the_column_the_mirror_writes_the_price_with_the_pre_246_statement(monkeypatch):
+    """schema_guard's heal can defer a boot (500ms lock_timeout). Until it lands, prices keep moving
+    exactly as before 246: same statement, no stamp, no price_read bind."""
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    seed = {
+        "id": "s1", "external_product_id": "ext1", "price_amount": 19.99, "price_currency": "USD",
+        "availability": "in_stock", "destination_url": "https://x.test/p", "domain": "x.test", "market": "US",
+    }
+    fake = FakeDB(seed=seed, mirror={"product_key": _REAL_PK, "merchant_id": _REAL_SELLER}, price_check_column=False)
+    monkeypatch.setattr(mod, "database", fake)
+
+    result = await mod.sync_offer_for_seed("s1", attached_price_source="refresh", currency_read=True)
+    assert result["status"] == "synced"
+    write = fake.executed[0]
+    assert write["sql"] == mod.MIRROR_OFFER_UPSERT_SQL_WITHOUT_PRICE_CHECK
+    assert "price_checked_at" not in write["sql"] and "price_read" not in write["params"]
+    assert write["params"]["list_price"] == 19.99
+
+
+def test_the_pre_246_statements_are_the_stamped_ones_minus_the_stamp():
+    # _without_price_check raises at import if a cut stops matching; this pins what it leaves.
+    assert "price_checked_at" in mod.MIRROR_OFFER_UPSERT_SQL
+    assert "price_checked_at" in mod.ATTACHED_LISTING_OFFER_UPDATE_SQL
+    for bare in (mod.MIRROR_OFFER_UPSERT_SQL_WITHOUT_PRICE_CHECK, mod.ATTACHED_LISTING_OFFER_UPDATE_SQL_WITHOUT_PRICE_CHECK):
+        assert "price_checked_at" not in bare and ":price_read" not in bare
+        assert "list_price" in bare and "updated_at = NOW()" in bare
+
+
+@pytest.mark.asyncio
+async def test_absent_is_re_asked_on_an_interval_and_present_is_final(monkeypatch):
+    calls = []
+
+    class Probe:
+        def __init__(self, answers):
+            self.answers = answers
+
+        async def fetch_one(self, sql, params=None):
+            calls.append(sql)
+            answer = self.answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return {"present": answer}
+
+    clock = [1000.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(mod, "database", Probe([False, RuntimeError("pool gone"), True]))
+
+    assert await mod.price_check_column_present() is False
+    assert await mod.price_check_column_present() is False  # cached: no second query
+    assert len(calls) == 1
+    clock[0] += mod.PRICE_CHECK_RECHECK_SECONDS
+    assert await mod.price_check_column_present() is False  # a failed read is "absent", never raises
+    clock[0] += mod.PRICE_CHECK_RECHECK_SECONDS
+    assert await mod.price_check_column_present() is True
+    clock[0] += 10 * mod.PRICE_CHECK_RECHECK_SECONDS
+    assert await mod.price_check_column_present() is True
+    assert len(calls) == 3
