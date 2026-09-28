@@ -84,6 +84,12 @@ _OPTION_TYPES = {
     # It decides the currency the store must prove (require_currency defaults to the market's) and what
     # the readback checks every offer is stamped. Multi-market storefronts ADR, Phase 1.
     "market": str,
+    # A brand's own store re-run under its canonical spelling (Tarte, not "Tarte Cosmetics"): the spelling
+    # the store's OLD rows were written under. After a verified apply the drain retires those old keys itself
+    # (scripts/retire_superseded_brand_keys.py, the same code the CLI runs) -- only where the new key is live
+    # on this store AND, when the old row serves, the new one serves too; everything else keeps its old row.
+    # The dry run records how many old rows are live on the store (checks.stale_brand_retire_preview).
+    "retire_stale_brand": str,
 }
 SOURCES = ("storefront", "affiliate_feed", "shopify_markets")
 MARKETS_SOURCE = "shopify_markets"
@@ -182,6 +188,13 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     if options.get("multi_brand") and (options.get("source_role", "retailer") != "retailer" or source != "storefront"):
         # A brand's own store is one brand (its domain must prove it); a feed maps one retailer listing.
         raise ValueError("options.multi_brand supports only a retailer storefront cohort")
+    if "retire_stale_brand" in options and (options.get("source_role") != "brand_official"
+                                            or source != "storefront" or options.get("multi_brand")):
+        # The retire derives each old key from (old spelling, title) and matches it to THIS store's rows: a
+        # brand's own storefront, one brand, crawled here -- the case the CLI was built and measured for.
+        raise ValueError("options.retire_stale_brand supports only a brand_official storefront cohort")
+    if "retire_stale_brand" in options and not str(options["retire_stale_brand"]).strip():
+        raise ValueError("options.retire_stale_brand must name the old spelling")
     if options.get("multi_brand") or "brands" in options:
         brands = options.get("brands")
         if not options.get("multi_brand"):
@@ -1020,7 +1033,11 @@ async def _run_stage(job: Dict[str, Any], *, db: Any, deadline: Optional[float] 
                                   and interrupted.get("catalog_write") != ledger.CATALOG_WRITE_NOT_STARTED)
         if interrupted["stage"] == APPLY and not write_may_have_started:
             note += "; the catalog write had not started, nothing was written"
-        await ledger.finish_run(interrupted["id"], outcome="interrupted", error=note, db=db)
+        # Keep what the run recorded before it died -- the write marker and, for an apply that was retiring an
+        # old spelling, the reversal manifest it stored before that write (ledger.record_retire_manifest).
+        kept = interrupted.get("checks")
+        kept = json.loads(kept) if isinstance(kept, str) else kept
+        await ledger.finish_run(interrupted["id"], outcome="interrupted", checks=kept, error=note, db=db)
         if write_may_have_started:
             # It may have written part of the cohort. Never re-apply blindly.
             reason = f"the previous apply was interrupted and may be partial; review before re-queueing"
@@ -1049,6 +1066,8 @@ async def _run_stage(job: Dict[str, Any], *, db: Any, deadline: Optional[float] 
         with _timed(timings, "check_s"):
             result = await _check(job, records)
         result["checks"]["timings"] = timings
+        if stage == DRY_RUN and (job.get("options") or {}).get("retire_stale_brand"):
+            result["checks"]["stale_brand_retire_preview"] = await _stale_brand_retire_preview(job, records)
         if stage == APPLY:
             result["checks"].setdefault("catalog_write", ledger.CATALOG_WRITE_NOT_STARTED)
         summary = {"crawl": result["checks"].get("crawl"), "plan": result["checks"].get("plan"),
@@ -1066,7 +1085,7 @@ async def _run_stage(job: Dict[str, Any], *, db: Any, deadline: Optional[float] 
                                     reason="dry run clean; apply due", next_run_at=datetime.now(timezone.utc),
                                     db=db)
             return {"job_id": job["id"], "stage": stage, "outcome": "clean", "status": "apply_due"}
-        return await _apply(job, run_id, result, summary, timings, db=db, deadline=deadline)
+        return await _apply(job, run_id, result, summary, timings, db=db, deadline=deadline, records=records)
     except _Stop as stop:
         await ledger.finish_run(run_id, outcome=stop.outcome,
                                 checks=_with_timings(stop.checks or result.get("checks"), timings, stage),
@@ -1120,7 +1139,8 @@ async def _write_lock_wait_s(job: Dict[str, Any], deadline: Optional[float], tim
 
 
 async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summary: Dict[str, Any],
-                 timings: Dict[str, float], *, db: Any, deadline: Optional[float] = None) -> Dict[str, Any]:
+                 timings: Dict[str, float], *, db: Any, deadline: Optional[float] = None,
+                 records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     from scripts.curated_apply_gate import evaluate_apply_log
     from services.catalog_enrichment_agent.apply import apply_ingest_plan
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_apply, require_primary_plan
@@ -1173,6 +1193,13 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
                                                    for p in plan.get("pdps") or []})
     ok = bool(gate.get("ok")) and readback["ok"]
     outcome = "applied" if ok else ("gate_failed" if not gate.get("ok") else "readback_failed")
+    retire: Optional[Dict[str, Any]] = None
+    if ok and (job.get("options") or {}).get("retire_stale_brand"):
+        # Only after a VERIFIED apply: the retire keys on the new rows being live (and serving) on this store.
+        with _timed(timings, "stale_brand_retire_s"):
+            retire = await _retire_stale_brand(job, run_id, records or [], result["checks"], db=db,
+                                               deadline=deadline)
+        result["checks"]["stale_brand_retire"] = retire
     await ledger.finish_run(run_id, outcome=outcome, **summary, applied={"gate": gate}, readback=readback,
                             db=db)
     kinds = [n.get("kind") for n in readback.get("notes") or []]
@@ -1183,8 +1210,137 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
             if kinds.count(k)]
     reason = ("; ".join(["applied and verified", *said]) if ok else
               f"{outcome}: gate {gate.get('reasons')}; readback {readback.get('problems')}")
-    await _move(job, status="done" if ok else "failed", run_id=run_id, reason=reason, db=db)
-    return {"job_id": job["id"], "stage": APPLY, "outcome": outcome, "status": "done" if ok else "failed"}
+    status = "done" if ok else "failed"
+    if retire is not None:
+        reason = f"{reason}; {_retire_reason(retire)}"
+        if retire["outcome"] in RETIRE_FAILED_OUTCOMES:
+            # The catalog apply stands (verified above); the retire did not. Failed reaches a human through the
+            # drain's failed alert; nothing is re-applied, and the old rows are all still live.
+            status = "failed"
+    await _move(job, status=status, run_id=run_id, reason=reason, db=db)
+    out = {"job_id": job["id"], "stage": APPLY, "outcome": outcome, "status": status}
+    if retire is not None:
+        out["stale_brand_retire"] = retire["outcome"]
+    return out
+
+
+#: A retire that wrote nothing and needs a human: its error, or a read-back that disagreed with the plan.
+RETIRE_FAILED_OUTCOMES = ("error", "readback_failed")
+
+
+def _retire_counts(p: Dict[str, Any]) -> Dict[str, int]:
+    return {"cohort": len(p["cohort"]), "present": len(p["present"]), "retirable": len(p["live"]),
+            "waiting_for_new_key": len(p["waiting_for_new_key"]),
+            "new_not_serving": len(p.get("new_not_serving") or []), "foreign": len(p["foreign"]),
+            "already_suppressed": len(p.get("already_suppressed") or [])}
+
+
+async def _stale_brand_retire_preview(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Dry run: how many of this store's rows are live under the old spelling (the retire's upper bound; the
+    apply retires only those whose new row is live and, where the old row serves, serving). Read-only."""
+    from scripts import retire_superseded_brand_keys as retire_tool
+    stale = str(job["options"]["retire_stale_brand"]).strip()
+    try:
+        cohort = retire_tool.cohort_from_records(records, job["brand"], stale)
+        p = await retire_tool.plan_for_cohort(cohort, job["domain"], job["brand"],
+                                              job["options"].get("category_path") or "beauty", stale,
+                                              before_rewrite=True)
+    except Exception as exc:  # noqa: BLE001 -- a preview never fails the dry run; the apply re-plans anyway
+        return {"stale_brand": stale, "error": f"{type(exc).__name__}: {exc}"[:500]}
+    counts = _retire_counts(p)
+    return {"stale_brand": stale, "cohort": counts["cohort"], "old_rows_live_on_store": counts["retirable"],
+            "foreign": counts["foreign"]}
+
+
+async def _retire_stale_brand(job: Dict[str, Any], run_id: str, records: List[Dict[str, Any]],
+                              checks: Dict[str, Any], *, db: Any, deadline: Optional[float]) -> Dict[str, Any]:
+    """Retire the store's old-spelling keys after a verified apply: the CLI's own plan (serving-guarded) on the
+    records this stage just applied, the manifest stored on the run BEFORE the write, the write under the
+    catalog write lock, then a read-back. Never raises: the outcome says what happened."""
+    from scripts import retire_superseded_brand_keys as retire_tool
+    stale = str(job["options"]["retire_stale_brand"]).strip()
+    out: Dict[str, Any] = {"stale_brand": stale}
+    try:
+        cohort = retire_tool.cohort_from_records(records, job["brand"], stale)
+        p = await retire_tool.plan_for_cohort(cohort, job["domain"], job["brand"],
+                                              job["options"].get("category_path") or "beauty", stale)
+        out.update(_retire_counts(p))
+        prepared = retire_tool.prepare_retire(p)
+        if not prepared:
+            out["outcome"] = "nothing_to_retire"
+            return out
+        # Durable before the write, and kept in the run's final checks too (finish_run rewrites the column).
+        await ledger.record_retire_manifest(run_id, prepared["manifest"], db=db)
+        checks["stale_brand_retire_manifest"] = prepared["manifest"]
+        out["retire_run_id"] = prepared["run_id"]
+        left = (deadline - time.monotonic() - RETIRE_LOCK_MARGIN_S) if deadline is not None else WRITE_LOCK_WAIT_S
+        async with ledger.catalog_write_lock(wait_s=max(0.0, min(WRITE_LOCK_WAIT_S, left)),
+                                             poll_s=WRITE_LOCK_POLL_S):
+            out["counts"] = await retire_tool.write_retire(prepared)
+    except (CatalogWriteLockBusy, CatalogWriteLockUnavailable) as exc:
+        # Nothing written (write_retire never ran). The stored manifest describes the rows as they still are.
+        out.update(outcome="deferred", error=f"catalog write lock: {type(exc).__name__}")
+        return out
+    except Exception as exc:  # noqa: BLE001 -- write_retire is one transaction: an error wrote nothing
+        out.update(outcome="error", error=f"{type(exc).__name__}: {exc}"[:600])
+        return out
+    out["readback"] = await _retire_readback(p, retire_tool)
+    out["outcome"] = "retired" if out["readback"]["ok"] else "readback_failed"
+    return out
+
+
+def _retire_reason(r: Dict[str, Any]) -> str:
+    """The job's status line for the retire, e.g. "old spelling 'Tarte Cosmetics': retired 51 key(s)
+    (retire_7983ba6a31bb); kept 19 waiting for a live new key, 1 whose new key does not serve yet"."""
+    head = f"old spelling {r['stale_brand']!r}: "
+    kept = [f"{r[k]} {label}" for k, label in (("waiting_for_new_key", "waiting for a live new key"),
+                                                ("new_not_serving", "whose new key does not serve yet"),
+                                                ("foreign", "owned by another source"))
+            if r.get(k)]
+    tail = f"; kept {', '.join(kept)}" if kept else ""
+    if r["outcome"] == "retired":
+        return f"{head}retired {r['counts']['products']} key(s) ({r['retire_run_id']}){tail}"
+    if r["outcome"] == "nothing_to_retire":
+        return f"{head}nothing to retire{tail}"
+    if r["outcome"] == "deferred":
+        return (f"{head}retire DEFERRED, nothing retired ({r.get('error')}); run "
+                f"scripts/retire_superseded_brand_keys.py --stale-brand by hand")
+    if r["outcome"] == "readback_failed":
+        return (f"{head}retired {r['counts']['products']} key(s) ({r['retire_run_id']}) but the read-back "
+                f"disagrees: {r['readback']['problems'][:3]}; revert with retire_superseded_brand_keys revert "
+                f"--ingest-run <this run>")
+    return f"{head}retire FAILED, nothing retired: {r.get('error')}"
+
+
+#: Seconds of the task the retire leaves unused when it waits for the write lock: its write is small, but it
+#: must not be the thing the task timeout kills.
+RETIRE_LOCK_MARGIN_S = 120
+
+
+async def _retire_readback(p: Dict[str, Any], retire_tool: Any) -> Dict[str, Any]:
+    """Every retired old key is suppressed, and its new key is live on this store -- and serving wherever the
+    old row served. Measured, not assumed: the plan was read before the write."""
+    from db.database import database
+    retired = p["live"]
+    old = {r["product_key"]: dict(r) for r in await database.fetch_all(
+        retire_tool.LIVE_ROWS_SQL, {"keys": [c["stale_key"] for c in retired]})}
+    new_rows = [dict(r) for r in await database.fetch_all(
+        retire_tool.LIVE_ROWS_SQL, {"keys": [c["new_key"] for c in retired]})]
+    host = retire_tool._host(p["domain"])
+    new_live = {r["product_key"] for r in new_rows
+                if not r.get("suppression_reason") and retire_tool._host(r.get("source_domain")) == host}
+    serving = await retire_tool.load_serving({}, [r for r in new_rows if r["product_key"] in new_live])
+    was_serving = {c["stale_key"] for c in retired} & set(p.get("serving") or [])
+    problems = []
+    for c in retired:
+        if not (old.get(c["stale_key"]) or {}).get("suppression_reason"):
+            problems.append(f"old key still live: {c['stale_key']}")
+        if c["new_key"] not in new_live:
+            problems.append(f"new key not live: {c['new_key']}")
+        elif c["stale_key"] in was_serving and c["new_key"] not in serving:
+            problems.append(f"served before, new key not serving: {c['new_key']}")
+    return {"ok": not problems, "retired": len(retired), "new_live": len(new_live),
+            "new_serving": len(serving), "problems": problems[:20]}
 
 
 async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timings: Dict[str, float],

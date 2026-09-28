@@ -34,6 +34,12 @@ stale SKU cannot collide with a new one (`_SKU_SUPPRESSED_IDENTITY_SQL` guards o
 matching `product_key`, and ours differ) — but retiring first means the storefront is
 never simultaneously serving both rows of a pair.
 
+THE DRAIN RUNS THIS TOO. A retailer-ingest job with options.retire_stale_brand (a brand_official storefront
+re-run under its canonical spelling) retires the old keys itself right after its verified apply, with this
+file's own pieces -- cohort_from_records (on the records the apply wrote), plan_for_cohort, prepare_retire,
+write_retire -- and stores the manifest on the apply run before writing. Undo it with
+`revert --ingest-run rir_...`. The CLI below stays for stores outside the drain and for a deferred retire.
+
 DRY-RUN BY DEFAULT. Nothing is written without --apply.
 
   # 1. plan
@@ -153,6 +159,13 @@ async def build_cohort(domain: str, brand: str, category_path: str,
     recs = await records_for_brand(
         domain=domain, category_path=category_path, brand=brand, emit_real_variants=True
     )
+    return cohort_from_records(recs, brand, stale_brand)
+
+
+def cohort_from_records(recs: List[Dict[str, Any]], brand: str,
+                        stale_brand: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Pure: the cohort of `build_cohort` from records already crawled. The retailer-ingest drain passes the
+    records its apply stage just wrote, so the cohort is the re-run's own crawl -- not a second one."""
     out: List[Dict[str, Any]] = []
     for rec in recs:
         pdp = rec.get("pdp") or {}
@@ -216,6 +229,12 @@ async def load_serving(stale_rows: Dict[str, Dict[str, Any]], own_live_new_rows:
 async def plan(domain: str, brand: str, category_path: str,
                stale_brand: Optional[str] = None, *, before_rewrite: bool = False) -> Dict[str, Any]:
     cohort = await build_cohort(domain, brand, category_path, stale_brand)
+    return await plan_for_cohort(cohort, domain, brand, category_path, stale_brand, before_rewrite=before_rewrite)
+
+
+async def plan_for_cohort(cohort: List[Dict[str, Any]], domain: str, brand: str, category_path: str,
+                          stale_brand: Optional[str] = None, *, before_rewrite: bool = False) -> Dict[str, Any]:
+    """`plan` for a cohort already built (the CLI crawls; the drain passes the records it applied)."""
     stale_keys = [c["stale_key"] for c in cohort]
     new_keys = [c["new_key"] for c in cohort]
     rows = {r["product_key"]: dict(r) for r in await database.fetch_all(LIVE_ROWS_SQL, {"keys": stale_keys})}
@@ -236,6 +255,9 @@ async def plan(domain: str, brand: str, category_path: str,
     return {
         "foreign": split["foreign"], "waiting_for_new_key": split["waiting_for_new_key"],
         "new_not_serving": split["new_not_serving"], "already_suppressed": split["already_suppressed"],
+        # product_keys (old and new) whose content_key serves, as read BEFORE any write: the drain's read-back
+        # checks a retired key's new row still serves wherever its old row did.
+        "serving": sorted(serving),
         "domain": domain, "brand_override": brand, "category_path": category_path, "stale_brand": stale_brand,
         "cohort": cohort, "rows": rows, "present": present, "live": live,
         "already_new": sorted(already_new), "seeds": seeds,
@@ -267,11 +289,13 @@ def print_plan(p: Dict[str, Any]) -> None:
         print(f"      keeps  : {c['new_key']}")
 
 
-async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
+def prepare_retire(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The run id, the rows' suppression metadata and the reversal manifest for `p`'s retirable keys, or
+    None when there is nothing to retire. Pure; the caller stores the manifest durably BEFORE `write_retire`
+    (a manifest written after the write cannot describe what it replaced)."""
     keys = [c["stale_key"] for c in p["live"]]
     if not keys:
-        print("nothing live to retire — no write.")
-        return {}
+        return None
     run_id = f"retire_{uuid.uuid4().hex[:12]}"
     metadata = json.dumps({
         "run_id": run_id, "reason": REASON,
@@ -301,6 +325,30 @@ async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
         ],
         "seeds": [{"id": str(s["id"]), "prior_status": s.get("status")} for s in p["active_seeds"]],
     }
+    return {"run_id": run_id, "keys": keys, "metadata": metadata, "manifest": manifest}
+
+
+async def write_retire(prepared: Dict[str, Any]) -> Dict[str, int]:
+    """The tombstone write, one transaction: rows, their active seeds, the offer cascade. Raises (rolled back)
+    unless every key ends suppressed."""
+    keys = prepared["keys"]
+    async with database.transaction():
+        await database.execute(SUPPRESS_SQL, {"reason": REASON, "metadata": prepared["metadata"], "keys": keys})
+        seed_rows = await database.fetch_all(DEACTIVATE_SEEDS_SQL, {"keys": keys})
+        offer_ids = await cascade_for_suppressed_product_keys(keys, apply=True)
+        after = await database.fetch_all(LIVE_ROWS_SQL, {"keys": keys})
+        unsuppressed = [r["product_key"] for r in after if not r["suppression_reason"]]
+        if unsuppressed:
+            raise RuntimeError(f"tombstone did not land on {len(unsuppressed)} row(s): {unsuppressed[:5]}")
+    return {"products": len(keys), "seeds": len(seed_rows), "offers": len(offer_ids)}
+
+
+async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
+    prepared = prepare_retire(p)
+    if not prepared:
+        print("nothing live to retire — no write.")
+        return {}
+    run_id, manifest = prepared["run_id"], prepared["manifest"]
     Path(manifest_path).write_text(json.dumps(manifest, indent=1, default=str))
     print(f"manifest written BEFORE the write: {manifest_path}")
     # AND to stdout. This script's normal home is a Cloud Run Job, whose filesystem dies
@@ -311,22 +359,33 @@ async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
     print("----8<---- MANIFEST BEGIN ----8<----")
     print(json.dumps(manifest, default=str))
     print("----8<---- MANIFEST END ----8<----")
-
-    async with database.transaction():
-        await database.execute(SUPPRESS_SQL, {"reason": REASON, "metadata": metadata, "keys": keys})
-        seed_rows = await database.fetch_all(DEACTIVATE_SEEDS_SQL, {"keys": keys})
-        offer_ids = await cascade_for_suppressed_product_keys(keys, apply=True)
-        after = await database.fetch_all(LIVE_ROWS_SQL, {"keys": keys})
-        unsuppressed = [r["product_key"] for r in after if not r["suppression_reason"]]
-        if unsuppressed:
-            raise RuntimeError(f"tombstone did not land on {len(unsuppressed)} row(s): {unsuppressed[:5]}")
-    counts = {"products": len(keys), "seeds": len(seed_rows), "offers": len(offer_ids)}
+    counts = await write_retire(prepared)
     print(f"applied: {counts}  run_id={run_id}")
     return counts
 
 
+# The manifest the retailer-ingest drain stored on its apply run (services.retailer_ingest.pipeline).
+INGEST_RUN_MANIFEST_SQL = """
+SELECT checks -> 'stale_brand_retire_manifest' AS manifest FROM retailer_ingest_runs WHERE id = :id
+"""
+
+
 async def revert(manifest_path: str) -> None:
-    m = json.loads(Path(manifest_path).read_text())
+    await revert_manifest(json.loads(Path(manifest_path).read_text()))
+
+
+async def revert_ingest_run(ingest_run_id: str) -> None:
+    """Revert the old-spelling retire a drain apply run did, from the manifest it stored before writing."""
+    row = await database.fetch_one(INGEST_RUN_MANIFEST_SQL, {"id": ingest_run_id})
+    m = row and row["manifest"]
+    if isinstance(m, str):
+        m = json.loads(m)
+    if not m:
+        raise SystemExit(f"no stale-brand retire manifest on ingest run {ingest_run_id}")
+    await revert_manifest(m)
+
+
+async def revert_manifest(m: Dict[str, Any]) -> None:
     async with database.transaction():
         for row in m["products"]:
             await database.execute(UNSUPPRESS_SQL, {
@@ -348,7 +407,10 @@ async def run(args: argparse.Namespace) -> int:
     await database.connect()
     try:
         if args.command == "revert":
-            await revert(args.manifest)
+            if args.ingest_run:
+                await revert_ingest_run(args.ingest_run)
+            else:
+                await revert(args.manifest)
             return 0
         p = await plan(args.domain, args.brand, args.category, args.stale_brand,
                        before_rewrite=args.before_rewrite)
@@ -377,11 +439,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="the spelling the OLD rows were written under, when the re-run uses another")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--manifest")
+    p.add_argument("--ingest-run", dest="ingest_run",
+                   help="revert: the retailer-ingest apply run (rir_...) whose old-spelling retire to undo")
     a = p.parse_args(argv)
     if a.command != "revert" and not (a.domain and a.brand):
         p.error("--domain and --brand are required")
-    if a.command == "revert" and not a.manifest:
-        p.error("revert requires --manifest")
+    if a.command == "revert" and not (a.manifest or a.ingest_run):
+        p.error("revert requires --manifest or --ingest-run")
     return asyncio.run(run(a))
 
 

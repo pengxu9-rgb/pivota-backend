@@ -313,6 +313,25 @@ async def mark_write_started(run_id: str, *, db: Any = None) -> None:
         raise RuntimeError(f"cannot mark the catalog write started: no unfinished run {run_id}")
 
 
+_RECORD_RETIRE_MANIFEST_SQL = """
+    UPDATE retailer_ingest_runs
+    SET checks = COALESCE(checks, '{}'::jsonb)
+                 || jsonb_build_object('stale_brand_retire_manifest', CAST(:manifest AS jsonb))
+    WHERE id = :id AND finished_at IS NULL
+    RETURNING id
+"""
+
+
+async def record_retire_manifest(run_id: str, manifest: Dict[str, Any], *, db: Any = None) -> None:
+    """Store, durably and BEFORE the write, the reversal manifest of the old-spelling retire an apply run is
+    about to do (pipeline._retire_stale_brand). `retire_superseded_brand_keys revert --ingest-run` reads it.
+    Raises when no unfinished run matched, so the retire never writes without its manifest."""
+    write_db = db or database
+    row = await write_db.fetch_one(_RECORD_RETIRE_MANIFEST_SQL, {"id": run_id, "manifest": _dumps(manifest)})
+    if not row:
+        raise RuntimeError(f"cannot record the retire manifest: no unfinished run {run_id}")
+
+
 async def finish_run(run_id: str, *, outcome: str, crawl: Any = None, plan: Any = None,
                      checks: Any = None, flags: Any = None, applied: Any = None,
                      readback: Any = None, error: Optional[str] = None, db: Any = None) -> None:
@@ -481,7 +500,7 @@ async def unfinished_run(job_id: str, *, db: Any = None) -> Optional[Dict[str, A
     `catalog_write` is the apply's write marker (see CATALOG_WRITE_STARTED), None when absent."""
     read_db = db or database
     row = await read_db.fetch_one(
-        "SELECT id, stage, started_at, finished_at, checks ->> 'catalog_write' AS catalog_write "
+        "SELECT id, stage, started_at, finished_at, checks ->> 'catalog_write' AS catalog_write, checks "
         "FROM retailer_ingest_runs WHERE job_id = :id "
         "ORDER BY started_at DESC LIMIT 1", {"id": job_id})
     return dict(row) if row and row["finished_at"] is None else None

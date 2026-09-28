@@ -1,0 +1,316 @@
+"""The drain retires a brand store's old-spelling keys itself, after a verified apply.
+
+2026-09-28 the Tarte / Stila / Tower 28 spelling merges were run by hand from a laptop session: wait for the
+apply, dry-run scripts/retire_superseded_brand_keys.py, check serving per store, apply it, fish the manifest
+out of Cloud Logging, read back. options.retire_stale_brand makes the drain do exactly that -- with the CLI's
+own plan (serving-guarded, #2424), the manifest stored on the run BEFORE the write, the write under the
+catalog write lock, and a read-back -- so nothing waits on a laptop.
+"""
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from scripts import retire_superseded_brand_keys as retire_tool
+from services import curated_brand_feed as feed
+from services.catalog_enrichment_agent.ingestion import derive_product_key
+from services.retailer_ingest import pipeline
+
+from tests.services.test_retailer_ingest_pipeline import TINT, env, job  # noqa: F401 -- the fixture
+
+STALE = "3CE Cosmetics"
+ACCEPT = ["brand_official_domain_unproven:k-touch.us:3ce"]
+
+
+def official(title, ptype, handle, body="<p>Ingredients: Water, Glycerin, Dimethicone</p>"):
+    return feed.shopify_product_to_record(
+        {"id": abs(hash(handle)) % 10**9, "vendor": "3CE", "title": title, "handle": handle,
+         "product_type": ptype, "body_html": body, "images": [{"src": "https://cdn.example/i.jpg"}],
+         "variants": [{"id": abs(hash(handle + "v")) % 10**12, "price": "20.00", "available": True,
+                       "sku": handle}]},
+        domain="k-touch.us", category_path="beauty", brand_override="3CE", currency="USD",
+        source_role="brand_official", emit_native_variants=True)
+
+
+def pair(i):
+    return {"stale_key": f"old{i}", "new_key": f"new{i}", "brand": "3CE", "title": f"t{i}"}
+
+
+def fake_plan(live=2, waiting=0, new_not_serving=0, serving=()):
+    cohort = [pair(i) for i in range(live + waiting + new_not_serving)]
+    return {"cohort": cohort, "present": cohort, "live": cohort[:live],
+            "waiting_for_new_key": cohort[live:live + waiting],
+            "new_not_serving": cohort[live + waiting:], "foreign": [], "already_suppressed": [],
+            "rows": {c["stale_key"]: {"suppression_reason": None, "suppressed_at": None,
+                                      "suppression_metadata": None} for c in cohort},
+            "active_seeds": [{"id": "s0", "status": "active"}], "seeds": [], "offers": [],
+            "domain": "k-touch.us", "brand_override": "3CE", "category_path": "beauty", "stale_brand": STALE,
+            "serving": sorted(serving)}
+
+
+@pytest.fixture
+def retire(env, monkeypatch):  # noqa: F811
+    """The retire tool with its database calls replaced; the pipeline and ledger are the real ones."""
+    async def fetch(**kw):
+        return feed.ShopifyProductBatch([official(*TINT)], scanned_products=1, pages=1)
+    monkeypatch.setattr(feed, "records_for_brand", fetch)
+    st = SimpleNamespace(plan=fake_plan(), plans=[], writes=[], write_error=None, events=[], manifests={},
+                         readback={"ok": True, "retired": 2, "new_live": 2, "new_serving": 2, "problems": []},
+                         preview_error=None)
+
+    async def plan_for_cohort(cohort, domain, brand, category_path, stale_brand=None, *, before_rewrite=False):
+        if before_rewrite and st.preview_error:
+            raise st.preview_error
+        st.plans.append({"cohort": cohort, "domain": domain, "brand": brand, "stale_brand": stale_brand,
+                         "before_rewrite": before_rewrite})
+        return st.plan
+
+    async def write_retire(prepared):
+        holder = env.ledger.lock_server.holder
+        st.events.append(("write", holder is not None and not holder.closed))
+        if st.write_error:
+            raise st.write_error
+        st.writes.append(prepared["keys"])
+        return {"products": len(prepared["keys"]), "seeds": 1, "offers": 3}
+
+    async def record_retire_manifest(run_id, manifest, db=None):
+        st.events.append(("manifest", run_id))
+        st.manifests[run_id] = manifest
+
+    async def readback(p, tool):
+        return st.readback
+
+    monkeypatch.setattr(retire_tool, "plan_for_cohort", plan_for_cohort)
+    monkeypatch.setattr(retire_tool, "write_retire", write_retire)
+    monkeypatch.setattr(pipeline, "_retire_readback", readback)
+    env.ledger.record_retire_manifest = record_retire_manifest
+    return st
+
+
+def rjob(status="apply_due", **options):
+    return job(status, source_role="brand_official", accepted_flags=ACCEPT, retire_stale_brand=STALE, **options)
+
+
+async def test_a_verified_apply_retires_the_old_spelling_with_its_manifest_stored_first(env, retire):  # noqa: F811
+    out = await pipeline.run_stage(rjob(), db=env.db)
+    assert out["status"] == "done" and out["stale_brand_retire"] == "retired", env.ledger.runs
+    [run_id] = [k for k, r in env.ledger.runs.items() if r.get("stage") == "apply"]
+    # manifest durable BEFORE the write, and the write under the catalog write lock
+    assert retire.events == [("manifest", run_id), ("write", True)]
+    assert retire.writes == [["old0", "old1"]]
+    run = env.ledger.runs[run_id]
+    assert run["checks"]["stale_brand_retire_manifest"] == retire.manifests[run_id]
+    assert run["checks"]["stale_brand_retire"]["outcome"] == "retired"
+    reason = env.ledger.transitions[-1]["reason"]
+    assert reason.startswith("applied and verified") and "old spelling '3CE Cosmetics': retired 2 key(s) (retire_" in reason
+
+
+async def test_the_cohort_is_the_stage_s_own_records_under_the_old_spelling(env, retire):  # noqa: F811
+    await pipeline.run_stage(rjob(), db=env.db)
+    [p] = retire.plans
+    assert p["domain"] == "k-touch.us" and p["brand"] == "3CE" and p["stale_brand"] == STALE
+    assert not p["before_rewrite"]  # the apply's plan keeps the new-key-live and serving guards
+    [c] = p["cohort"]
+    title = TINT[0]
+    assert c["stale_key"] == derive_product_key(STALE, title) and c["new_key"] == derive_product_key("3CE", title)
+
+
+async def test_kept_keys_are_named_in_the_status_line(env, retire):  # noqa: F811
+    retire.plan = fake_plan(live=1, waiting=3, new_not_serving=1)
+    await pipeline.run_stage(rjob(), db=env.db)
+    reason = env.ledger.transitions[-1]["reason"]
+    assert "retired 1 key(s)" in reason
+    assert "kept 3 waiting for a live new key, 1 whose new key does not serve yet" in reason
+
+
+async def test_nothing_to_retire_writes_nothing(env, retire):  # noqa: F811
+    retire.plan = fake_plan(live=0, waiting=2)
+    out = await pipeline.run_stage(rjob(), db=env.db)
+    assert out["status"] == "done" and out["stale_brand_retire"] == "nothing_to_retire"
+    assert retire.events == [] and retire.writes == []
+
+
+async def test_a_failed_retire_fails_the_job_but_never_the_apply(env, retire):  # noqa: F811
+    retire.write_error = RuntimeError("tombstone did not land on 1 row(s)")
+    out = await pipeline.run_stage(rjob(), db=env.db)
+    assert out["status"] == "failed" and out["outcome"] == "applied" and out["stale_brand_retire"] == "error"
+    assert len(env.applied) == 1  # the catalog apply stands; it is never re-queued by the retire
+    reason = env.ledger.transitions[-1]["reason"]
+    assert reason.startswith("applied and verified") and "retire FAILED, nothing retired" in reason
+
+
+async def test_a_busy_write_lock_defers_the_retire_without_writing(env, retire):  # noqa: F811
+    other = await env.ledger.lock_server.connect()
+    await other.fetchval("SELECT pg_try_advisory_lock(1)")  # another apply holds the lock ...
+    real = env.ledger.catalog_write_lock
+    calls = []
+
+    def lock(**kw):
+        calls.append(kw)
+        if len(calls) == 1:           # ... released for this stage's own apply,
+            env.ledger.lock_server.holder = None
+        else:                          # ... and taken again before the retire
+            env.ledger.lock_server.holder = other
+        return real(**{**kw, "wait_s": 0})
+    env.ledger.catalog_write_lock = lock
+    out = await pipeline.run_stage(rjob(), db=env.db)
+    assert out["status"] == "done" and out["stale_brand_retire"] == "deferred"
+    assert retire.writes == []
+    assert "retire DEFERRED, nothing retired" in env.ledger.transitions[-1]["reason"]
+
+
+async def test_a_readback_that_disagrees_fails_the_job_for_a_human(env, retire):  # noqa: F811
+    retire.readback = {"ok": False, "retired": 2, "new_live": 1, "new_serving": 1,
+                       "problems": ["new key not live: new1"]}
+    out = await pipeline.run_stage(rjob(), db=env.db)
+    assert out["status"] == "failed" and out["stale_brand_retire"] == "readback_failed"
+    assert "revert with retire_superseded_brand_keys revert --ingest-run" in env.ledger.transitions[-1]["reason"]
+
+
+async def test_an_apply_that_did_not_verify_never_retires(env, retire):  # noqa: F811
+    env.readback_rows = []  # the apply's own read-back finds nothing
+    out = await pipeline.run_stage(rjob(), db=env.db)
+    assert out["status"] == "failed" and "stale_brand_retire" not in out
+    assert retire.plans == [] and retire.events == []
+
+
+async def test_a_job_without_the_option_never_touches_the_retire(env, retire):  # noqa: F811
+    out = await pipeline.run_stage(job("apply_due", source_role="brand_official", accepted_flags=ACCEPT), db=env.db)
+    assert out["status"] == "done" and "stale_brand_retire" not in out and retire.plans == []
+
+
+async def test_the_dry_run_records_the_retire_s_upper_bound_and_writes_nothing(env, retire):  # noqa: F811
+    retire.plan = fake_plan(live=5)
+    out = await pipeline.run_stage(rjob("queued"), db=env.db)
+    assert out["status"] == "apply_due"
+    [p] = retire.plans
+    assert p["before_rewrite"]  # every live old row on the store: the apply decides which actually go
+    run = list(env.ledger.runs.values())[-1]
+    assert run["checks"]["stale_brand_retire_preview"] == {"stale_brand": STALE, "cohort": 5,
+                                                           "old_rows_live_on_store": 5, "foreign": 0}
+    assert retire.events == [] and retire.writes == []
+
+
+async def test_a_preview_error_never_fails_the_dry_run(env, retire):  # noqa: F811
+    retire.preview_error = RuntimeError("db blip")
+    out = await pipeline.run_stage(rjob("queued"), db=env.db)
+    assert out["status"] == "apply_due"
+    run = list(env.ledger.runs.values())[-1]
+    assert run["checks"]["stale_brand_retire_preview"]["error"].startswith("RuntimeError")
+
+
+@pytest.mark.parametrize("options", [
+    {"vendors": ["X"], "retire_stale_brand": "X Beauty"},                                   # a retailer
+    {"vendors": ["X"], "source_role": "brand_official", "retire_stale_brand": "X Beauty",
+     "source": "affiliate_feed", "feed": {}},
+    {"vendors": ["X"], "source_role": "brand_official", "retire_stale_brand": "  "},
+    # a brand store's USD sibling capture: brand_official, but not the storefront crawl the cohort comes from
+    {"vendors": ["X"], "source_role": "brand_official", "source": "shopify_markets", "retire_stale_brand": "X Beauty"},
+])
+def test_the_option_is_refused_outside_a_brand_official_storefront(options):
+    with pytest.raises(ValueError):
+        pipeline.validate_options(dict(options))
+
+
+def test_the_option_is_accepted_on_a_brand_official_storefront():
+    pipeline.validate_options({"vendors": ["X"], "source_role": "brand_official", "retire_stale_brand": "X Beauty"})
+
+
+# --- the read-back, against a fake database ----------------------------------------------------------------
+
+class FakeDB:
+    def __init__(self, rows, serving_cks):
+        self.rows, self.serving_cks = rows, serving_cks
+
+    async def fetch_all(self, sql, values):
+        if "index_pipeline_state" in sql:
+            return [{"content_key": ck, "serving_eligible": ck in self.serving_cks} for ck in values["keys"]]
+        return [self.rows[k] for k in values["keys"] if k in self.rows]
+
+
+def row(key, *, suppressed=False, host="k-touch.us", ck=None):
+    return {"product_key": key, "suppression_reason": "x" if suppressed else None, "source_domain": host,
+            "content_key": ck or f"ck_{key}"}
+
+
+@pytest.mark.parametrize("rows,serving_cks,want_problem", [
+    ({"old0": row("old0", suppressed=True), "new0": row("new0")}, {"ck_new0"}, None),
+    ({"old0": row("old0"), "new0": row("new0")}, {"ck_new0"}, "old key still live"),
+    ({"old0": row("old0", suppressed=True), "new0": row("new0", suppressed=True)}, set(), "new key not live"),
+    ({"old0": row("old0", suppressed=True), "new0": row("new0", host="retailer.com")}, set(), "new key not live"),
+    ({"old0": row("old0", suppressed=True), "new0": row("new0")}, set(), "served before, new key not serving"),
+])
+async def test_the_retire_readback(monkeypatch, rows, serving_cks, want_problem):
+    import db.database as dbmod
+    fake = FakeDB(rows, serving_cks)
+    monkeypatch.setattr(dbmod, "database", fake)
+    monkeypatch.setattr(retire_tool, "database", fake)
+    p = {**fake_plan(live=1, serving=["old0"]), "domain": "www.k-touch.us"}
+    out = await pipeline._retire_readback(p, retire_tool)
+    if want_problem is None:
+        assert out["ok"] and out["problems"] == []
+    else:
+        assert not out["ok"] and any(x.startswith(want_problem) for x in out["problems"])
+
+
+async def test_an_old_row_that_never_served_may_retire_to_an_unserved_new_row(monkeypatch):
+    import db.database as dbmod
+    fake = FakeDB({"old0": row("old0", suppressed=True), "new0": row("new0")}, set())
+    monkeypatch.setattr(dbmod, "database", fake)
+    monkeypatch.setattr(retire_tool, "database", fake)
+    out = await pipeline._retire_readback({**fake_plan(live=1, serving=[])}, retire_tool)
+    assert out["ok"]
+
+
+# --- the pieces the drain calls are the CLI's own ----------------------------------------------------------
+
+def test_the_cli_cohort_and_the_drain_cohort_are_one_function():
+    recs = [official(*TINT)]
+    assert retire_tool.cohort_from_records(recs, "3CE", STALE) == [{
+        "stale_key": derive_product_key(STALE, TINT[0]), "new_key": derive_product_key("3CE", TINT[0]),
+        "brand": "3CE", "title": TINT[0]}]
+    assert retire_tool.cohort_from_records(recs, "3CE", None) == []  # the same spelling moves no key
+
+
+def test_prepare_retire_describes_the_rows_before_the_write():
+    prepared = retire_tool.prepare_retire(fake_plan(live=2))
+    assert prepared["keys"] == ["old0", "old1"] and prepared["run_id"].startswith("retire_")
+    m = prepared["manifest"]
+    assert [x["product_key"] for x in m["products"]] == ["old0", "old1"]
+    assert m["seeds"] == [{"id": "s0", "prior_status": "active"}] and m["stale_brand"] == STALE
+    assert json.loads(prepared["metadata"])["run_id"] == prepared["run_id"]
+    assert retire_tool.prepare_retire(fake_plan(live=0)) is None
+
+
+async def test_revert_reads_the_manifest_the_drain_stored_on_its_run(monkeypatch):
+    manifest = {"run_id": "retire_x", "products": [], "seeds": []}
+    seen = []
+
+    class DB:
+        async def fetch_one(self, sql, values):
+            assert "stale_brand_retire_manifest" in sql and values == {"id": "rir_1"}
+            return {"manifest": json.dumps(manifest)}
+
+    async def revert_manifest(m):
+        seen.append(m)
+    monkeypatch.setattr(retire_tool, "database", DB())
+    monkeypatch.setattr(retire_tool, "revert_manifest", revert_manifest)
+    await retire_tool.revert_ingest_run("rir_1")
+    assert seen == [manifest]
+
+
+def test_the_manifest_write_is_guarded_on_an_unfinished_run():
+    from db import retailer_ingest as ledger
+    sql = " ".join(ledger._RECORD_RETIRE_MANIFEST_SQL.split())
+    assert "WHERE id = :id AND finished_at IS NULL RETURNING id" in sql
+    assert "|| jsonb_build_object('stale_brand_retire_manifest'" in sql
+
+
+async def test_the_manifest_write_raises_when_no_unfinished_run_matched():
+    from db import retailer_ingest as ledger
+
+    class DB:
+        async def fetch_one(self, sql, values):
+            return None
+    with pytest.raises(RuntimeError, match="no unfinished run"):
+        await ledger.record_retire_manifest("rir_gone", {"products": []}, db=DB())
