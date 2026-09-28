@@ -1287,3 +1287,8 @@ def test_two_rows_behind_ONE_page_are_not_a_template():
     titles = {"pk1": "CH Birds of Paradise Cologne", "pk2": "CH Birds of Paradise Cologne"}
     assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles,
                                       handles={"pk1": "same", "pk2": "same"}) == cands
+
+
+def test_a_suppressed_row_is_never_in_the_population():
+    """Filling a withdrawn row would move it to 'published' (mintree.us: 160 of 160 suppressed)."""
+    assert "suppressed_at IS NULL" in bf._SELECT_ROWS

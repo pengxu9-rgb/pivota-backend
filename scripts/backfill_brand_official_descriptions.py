@@ -86,6 +86,10 @@ _SELECT_ROWS = """
     FROM catalog_products
     WHERE source_system = 'catalog_enrichment_agent_v1'
       AND sync_status = 'live'
+      -- A SUPPRESSED row is withdrawn (a tombstone, a brand re-key's old spelling): filling it would
+      -- move a withdrawn row to 'published'. Measured 2026-09-28: 162 suppressed rows sat in this
+      -- population (mintree.us 160 of 160, tartecosmetics.com 1, tower28beauty.com 1).
+      AND suppressed_at IS NULL
       AND pdp_lifecycle_stage IN ('draft', 'candidate', 'validated')
       AND canonical_url LIKE 'https://%/products/%'
       AND length(coalesce(description, '')) < 50
