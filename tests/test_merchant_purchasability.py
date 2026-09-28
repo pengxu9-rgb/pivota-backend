@@ -1726,6 +1726,14 @@ async def _ensure_seed_table(undo: list) -> None:
     await _ensure_columns("external_product_seeds", _SEED_TABLE_COLUMNS, undo)
 
 
+async def _clear_scan_cache() -> None:
+    import db.merchant_purchasability_cart_mint_scans as mint_scans
+
+    mint_scans._reset_for_tests()
+    assert await mint_scans.ensure_table()
+    await database.execute(f"DELETE FROM {mint_scans.TABLE}")
+
+
 async def _restore(undo: list) -> None:
     """Leave the shared database's schema as this fixture found it: drop what it created, newest
     first. A column added to a table this fixture also created goes with the table."""
@@ -1778,10 +1786,14 @@ async def _population(_db):
     await _ensure_connected_tables(undo)
     await database.execute("DELETE FROM merchant_stores")
     await database.execute("DELETE FROM merchant_onboarding")
-    # And the CART-MINT lane's: the seed table, present and EMPTY. `_cart_seeds` fills it.
+    # And the CART-MINT lane's: the seed table, present and EMPTY. `_cart_seeds` fills it. Its
+    # scan CACHE starts empty too, or the first run here would read another test's scan as
+    # today's.
     await _ensure_seed_table(undo)
     await database.execute("DELETE FROM external_product_seeds")
+    await _clear_scan_cache()
     yield
+    await _clear_scan_cache()
     await database.execute("DELETE FROM reap_agentic_eligibility")
     await database.execute("DELETE FROM tierb_cart_link_eligibility")
     await database.execute("DELETE FROM merchant_stores")
@@ -2127,9 +2139,10 @@ async def test_the_ops_route_with_a_market_is_unchanged_apart_from_a_null_reason
     assert body["note"] == "a fresh positive fact from vantage 'worker'; the door may offer purchase"
 
 
-async def _no_cart_mint():
-    """The CART-MINT lane, read and empty — for the DB-free cases, which have no seed table."""
-    return sweep.CartMintLane(hosts={})
+async def _no_cart_mint(**_k):
+    """The CART-MINT lane, read and empty — for the DB-free cases, which have no seed table and
+    no scan cache."""
+    return sweep.CartMintPopulation(sweep.CartMintLane(hosts={}), "scan", 0, True)
 
 
 async def test_the_sweep_skips_and_counts_a_row_with_an_unusable_market(monkeypatch):
@@ -2158,7 +2171,7 @@ async def test_the_sweep_skips_and_counts_a_row_with_an_unusable_market(monkeypa
 
     monkeypatch.setattr(ledger, "list_enabled_merchant_markets", _variant_lane)
     monkeypatch.setattr(sweep, "_rows", _cart_lane)
-    monkeypatch.setattr(sweep, "_cart_mint_lane", _no_cart_mint)
+    monkeypatch.setattr(sweep, "_cart_mint_population", _no_cart_mint)
     monkeypatch.setattr(sweep.facts, "list_due", _nothing_due)
     monkeypatch.setattr(sweep, "_catalog_variant", _no_variant)
 
@@ -2189,7 +2202,7 @@ async def test_the_sweep_report_carries_the_market_unknown_count_and_logs_it_onc
 
     monkeypatch.setattr(ledger, "list_enabled_merchant_markets", _variant_lane)
     monkeypatch.setattr(sweep, "_rows", _cart_lane)
-    monkeypatch.setattr(sweep, "_cart_mint_lane", _no_cart_mint)
+    monkeypatch.setattr(sweep, "_cart_mint_population", _no_cart_mint)
     monkeypatch.setattr(sweep.facts, "list_due", _nothing_due)
     monkeypatch.setattr(sweep.facts, "record_check", _no_write)
     monkeypatch.setattr(sweep, "_catalog_variant", _no_variant)
@@ -2534,7 +2547,8 @@ async def test_the_population_adds_every_host_the_cart_minter_builds_on(_db, _ca
     # The seed with no ISO-2 market is COUNTED and never swept as "US". Nothing else was refused
     # by the key rule, and no read failed or came back incomplete.
     assert tally == {sweep.MARKET_UNKNOWN_TALLY: 1}
-    assert sizes == {sweep.TOTAL_TALLY: len(keys), sweep.NEVER_CHECKED_TALLY: len(keys)}
+    assert sizes == {sweep.TOTAL_TALLY: len(keys), sweep.NEVER_CHECKED_TALLY: len(keys),
+                     sweep.CART_MINT_AGE_TALLY: 0}
     by_key = {(t.domain, t.market): t for t in targets}
     assert by_key[("judydoll.com", "US")].variant_id == "50041364447509", (
         "the Tier B lane's CONFIRMED variant still wins where the cart-mint lane names the key too"
@@ -2776,3 +2790,159 @@ def test_the_census_decoder_refuses_a_log_with_a_missing_row():
         census.decode(line(rows[0]) + line(rows[2]) + line(summary))
     with pytest.raises(ValueError, match="no summary"):
         census.decode("".join(line(r) for r in rows))
+
+
+# ══ the cart-mint scan runs at most ONCE A DAY ═══════════════════════════════════════════════
+#
+# The scan reads every active seed on the 2-vCPU prod primary, and the sweep runs 21 times a
+# day. So it runs on the first sweep of each 05:00Z slot, and the other runs read the last
+# complete scan from `merchant_purchasability_cart_mint_scans`. A failed scan falls back to that
+# cache (logged, NOT counted) and retries no sooner than 6 h later; only a missing or >72 h old
+# cache is counted unreadable. These drive the real `load_population` on a moved clock.
+
+_DAY1 = datetime(2026, 9, 29, 5, 7, tzinfo=timezone.utc)
+
+
+class _Clock:
+    def __init__(self, now):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.fixture
+def _scans(monkeypatch, _cart_seeds):
+    """The clock, and a counter of real scans (the real `_cart_mint_lane`, wrapped)."""
+    clock = _Clock(_DAY1)
+    monkeypatch.setattr(sweep, "_utcnow", clock)
+    calls = {"scans": 0, "fail": False}
+    real = sweep._cart_mint_lane
+
+    async def _counted():
+        calls["scans"] += 1
+        if calls["fail"]:
+            raise RuntimeError("statement timeout")
+        return await real()
+
+    monkeypatch.setattr(sweep, "_cart_mint_lane", _counted)
+    return clock, calls
+
+
+async def _population_now():
+    tally: dict = {}
+    sizes: dict = {}
+    keys = {(t.domain, t.market) for t in await sweep.load_population(50, tally=tally, sizes=sizes)}
+    return keys, tally, sizes
+
+
+async def _add_cart_seed(domain):
+    await database.execute(
+        "INSERT INTO external_product_seeds (id, status, domain, market, destination_url, "
+        "canonical_url, seed_data) VALUES (:id, 'active', :d, 'US', :u, :u, :sd)",
+        {"id": f"mpx_s_new_{domain}", "d": domain, "u": f"https://{domain}/products/new",
+         "sd": json.dumps(_stamped("46100000000099"))},
+    )
+
+
+async def test_the_seed_table_is_scanned_once_a_day_and_the_other_runs_read_the_cache(_db, _scans):
+    clock, calls = _scans
+    keys, tally, sizes = await _population_now()
+    assert calls["scans"] == 1 and ("stamp-brand.example", "US") in keys
+    assert sizes[sweep.CART_MINT_AGE_TALLY] == 0 and tally == {sweep.MARKET_UNKNOWN_TALLY: 1}
+
+    # A cart host that appears after today's scan waits for tomorrow's: the other runs of the
+    # day, and tomorrow's 00:07 and 01:07 (still yesterday's 05:00 slot), read the cache.
+    await _add_cart_seed("late-brand.example")
+    for later in (timedelta(hours=1), timedelta(hours=19), timedelta(hours=20)):
+        clock.now = _DAY1 + later
+        keys, tally, sizes = await _population_now()
+        assert calls["scans"] == 1, later
+        assert ("late-brand.example", "US") not in keys and ("stamp-brand.example", "US") in keys
+        assert sizes[sweep.CART_MINT_AGE_TALLY] == int(later.total_seconds() // 60)
+        assert sweep.UNREADABLE_TALLY not in tally
+
+    clock.now = _DAY1 + timedelta(days=1)
+    keys, _tally, sizes = await _population_now()
+    assert calls["scans"] == 2 and ("late-brand.example", "US") in keys
+    assert sizes[sweep.CART_MINT_AGE_TALLY] == 0
+
+
+async def test_a_failed_scan_falls_back_to_the_last_complete_one_and_backs_off(_db, _scans, caplog):
+    """A slow database must not fail every run of the day: the fallback is logged, not counted,
+    and the next attempt waits 6 h."""
+    clock, calls = _scans
+    await _population_now()
+    calls["fail"] = True
+    clock.now = _DAY1 + timedelta(days=1)
+    keys, tally, sizes = await _population_now()
+    assert calls["scans"] == 2
+    assert sweep.UNREADABLE_TALLY not in tally, "a day-old scan stands in; nothing is counted"
+    assert ("stamp-brand.example", "US") in keys
+    assert sizes[sweep.CART_MINT_AGE_TALLY] == 24 * 60
+
+    clock.now = _DAY1 + timedelta(days=1, hours=5)
+    await _population_now()
+    assert calls["scans"] == 2, "backing off: no second attempt within 6 h of the failed one"
+    clock.now = _DAY1 + timedelta(days=1, hours=6, minutes=1)
+    await _population_now()
+    assert calls["scans"] == 3, "and the retry comes after it"
+
+
+async def test_no_complete_scan_young_enough_is_counted_unreadable(_db, _scans):
+    clock, calls = _scans
+    calls["fail"] = True
+    keys, tally, sizes = await _population_now()
+    assert tally.get(sweep.UNREADABLE_TALLY) == 1, "never scanned successfully"
+    assert keys == _ALLOWLISTS and sizes[sweep.CART_MINT_AGE_TALLY] == -1
+
+    calls["fail"] = False
+    clock.now = _DAY1 + timedelta(hours=7)
+    _keys, tally, _sizes = await _population_now()
+    assert sweep.UNREADABLE_TALLY not in tally
+    calls["fail"] = True
+    for days, counted in ((3, False), (4, True)):
+        clock.now = _DAY1 + timedelta(days=days, hours=1)
+        keys, tally, _sizes = await _population_now()
+        assert (tally.get(sweep.UNREADABLE_TALLY) == 1) is counted, days
+        assert ("stamp-brand.example", "US") in keys, "an old scan is still swept, just counted"
+
+
+async def test_an_unreadable_cache_never_scans(_db, _scans, monkeypatch):
+    """Scanning anyway would turn a broken cache table into an hourly full scan of the seeds."""
+    _clock, calls = _scans
+
+    async def _down(**_k):
+        raise RuntimeError("relation merchant_purchasability_cart_mint_scans is unavailable")
+
+    monkeypatch.setattr(sweep.mint_scans, "latest", _down)
+    keys, tally, _sizes = await _population_now()
+    assert calls["scans"] == 0
+    assert tally.get(sweep.UNREADABLE_TALLY) == 1 and keys == _ALLOWLISTS
+
+
+async def test_a_scan_that_cannot_be_cached_is_an_error_and_is_scanned_again(_db, _scans, monkeypatch):
+    clock, calls = _scans
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    monkeypatch.setattr(sweep, "_preflight", _Fetcher({}))
+
+    async def _no_write(**_k):
+        raise RuntimeError("permission denied")
+
+    monkeypatch.setattr(sweep.mint_scans, "record", _no_write)
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.errors == 1 and report.population_unreadable == 0
+    assert sweep.exit_code_for(report) == sweep.EXIT_ERRORS
+    clock.now = _DAY1 + timedelta(hours=1)
+    await sweep.run_merchant_purchasability_sweep()
+    assert calls["scans"] == 2
+
+
+async def test_the_census_scans_fresh_and_touches_no_cache(_db, _scans):
+    _clock, calls = _scans
+    import db.merchant_purchasability_cart_mint_scans as mint_scans
+
+    lanes = await sweep.collect_population(fresh_cart_mint_scan=True)
+    assert calls["scans"] == 1 and set(lanes["cart-mint"]) == _CART_MINT_EXPECTED
+    assert await mint_scans.latest(complete_only=False) is None

@@ -94,6 +94,10 @@ that every cart host it mints is in the population.
     in the census was US). The gate asks the BUYER's market, which the population cannot know; a
     buyer in another market gets no cart, which is the answer no fact already gives. Never
     defaulted: a seed with no ISO-2 market is counted in `population_skipped_market_unknown`.
+  * SCANNED AT MOST ONCE A DAY. The scan reads every active seed on the prod primary, so it runs
+    on the first sweep of each 05:00Z slot and the other runs read the cached result
+    (db/merchant_purchasability_cart_mint_scans.py); see `_cart_mint_population` for how a
+    failed scan falls back without paging every hour.
   * NO VARIANT. The seed's cart variant is not confirmed available the way a Tier B variant is, so
     where the Tier B lane confirmed one IT STILL WINS, and elsewhere the catalog hint or the
     preflight's own pick is used, exactly as for the connected lane.
@@ -193,11 +197,13 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
 import db.merchant_purchasability as facts
+import db.merchant_purchasability_cart_mint_scans as mint_scans
 import db.reap_agentic_ledger as ledger
 from db.database import database
 # THE ONE merchant-host canonicaliser — the same function `routes/agent_commerce_reap` validates
@@ -551,6 +557,144 @@ async def _cart_mint_lane() -> CartMintLane:
     lane.elapsed_ms = int((_monotonic() - started) * 1000)
     return lane
 
+
+# ── the cart-mint lane is scanned at most ONCE A DAY ─────────────────────────────────────────
+#
+# A scan reads every active seed's `seed_data` on the 2-vCPU prod primary, and the sweep runs 21
+# times a day; database load there caused serving timeouts on 2026-09-26/27. So a scan runs on
+# the first sweep of each UTC day's 05:00 slot (05:07, after the nightly crawls that share the
+# database and the crawl address: see the setup script) and every other run reads the last
+# complete scan from db/merchant_purchasability_cart_mint_scans.py. The seed table changes by
+# nightly refresh and ingest, so a day-old population misses at most one day of new cart hosts —
+# which a missing fact already answers safely (no cart).
+#
+# A FAILED OR INCOMPLETE SCAN DOES NOT PAGE EVERY HOUR. It is recorded, retried no sooner than
+# `_SCAN_RETRY_S` later, and meanwhile the last complete scan is used as long as it is no older
+# than `_SCAN_MAX_AGE_S` (whatever the failed scan did find is added to it). Only when there is
+# no complete scan that young is the lane counted unreadable (exit 1): the population can then be
+# missing hosts that have minted carts for days.
+#
+# AN UNREADABLE CACHE MEANS NO SCAN. If the table cannot be created or read, the lane cannot tell
+# whether it scanned today, and scanning anyway would turn a broken table into an hourly full
+# scan — the load this cache exists to prevent. It is counted unreadable instead.
+
+#: The UTC hour whose slot a scan belongs to; a complete scan at or after the latest one is fresh.
+_SCAN_SLOT_HOUR_UTC = 5
+#: The least time between two scan ATTEMPTS after one failed or came back incomplete.
+_SCAN_RETRY_S = 6 * 3600
+#: The oldest complete scan a run may fall back to without counting the lane unreadable. The
+#: fact TTL: past it, hosts minting carts since then may have no fact at all.
+_SCAN_MAX_AGE_S = 72 * 3600
+
+#: Indirected so tests move the clock across a slot without sleeping. An AWARE UTC datetime: it is
+#: written as `scanned_at`, and a naive one binds as local wall time under asyncpg.
+_utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc)  # noqa: E731
+
+#: The `SweepReport` count (added to `errors`) of scans whose result could not be written to the
+#: cache. The run still sweeps what it scanned, but the next run will scan again.
+CACHE_WRITE_FAILED_TALLY = "cart_mint_cache_write_failed"
+
+
+class CartMintCacheUnavailable(RuntimeError):
+    """The scan cache could not be created or read, so no scan was attempted (see above)."""
+
+
+@dataclass
+class CartMintPopulation:
+    """The cart-mint lane as a run uses it: `lane` is what to sweep, `source` where it came from
+    ("scan", "cache", or "cache+partial-scan"), `age_s` the age of the scan it rests on (0 for
+    this run's own), and `usable` False when it must be counted unreadable."""
+
+    lane: CartMintLane
+    source: str
+    age_s: int
+    usable: bool
+    reason: str = ""
+    cache_write_failed: bool = False
+
+
+def _scan_slot_start(now: datetime) -> datetime:
+    """The latest `_SCAN_SLOT_HOUR_UTC`:00 UTC at or before `now`."""
+    start = now.replace(hour=_SCAN_SLOT_HOUR_UTC, minute=0, second=0, microsecond=0)
+    return start if start <= now else start - timedelta(days=1)
+
+
+def _from_scan_row(row: Dict[str, Any]) -> CartMintLane:
+    return CartMintLane(
+        hosts=dict(row["hosts"]), seeds_scanned=int(row.get("seeds_scanned") or 0),
+        cart_seeds=int(row.get("cart_seeds") or 0), complete=True,
+        elapsed_ms=int(row.get("elapsed_ms") or 0),
+    )
+
+
+async def _cart_mint_population(*, fresh_scan: bool = False) -> CartMintPopulation:
+    """The cart-mint lane under the once-a-day policy above. `fresh_scan=True` (the census) scans
+    now and neither reads nor writes the cache. RAISES `CartMintCacheUnavailable` (no scan was
+    attempted) or, with `fresh_scan`, whatever the scan raised."""
+    if fresh_scan:
+        lane = await _cart_mint_lane()
+        return CartMintPopulation(lane, "scan", 0, lane.complete, lane.incomplete_reason)
+
+    try:
+        ready = await mint_scans.ensure_table()
+        cached = await mint_scans.latest(complete_only=True) if ready else None
+        last = await mint_scans.latest(complete_only=False) if ready else None
+    except Exception as exc:  # noqa: BLE001
+        raise CartMintCacheUnavailable(type(exc).__name__) from exc
+    if not ready:
+        raise CartMintCacheUnavailable("table_not_ready")
+
+    now = _utcnow()
+    if cached is not None and cached["scanned_at"] >= _scan_slot_start(now):
+        return CartMintPopulation(
+            _from_scan_row(cached), "cache", int((now - cached["scanned_at"]).total_seconds()), True
+        )
+
+    lane: Optional[CartMintLane] = None
+    reason = ""
+    write_failed = False
+    backing_off = (
+        last is not None and not last["complete"]
+        and (now - last["scanned_at"]).total_seconds() < _SCAN_RETRY_S
+    )
+    if backing_off:
+        reason = "retry_backoff"
+    else:
+        try:
+            lane = await _cart_mint_lane()
+            reason = lane.incomplete_reason
+        except Exception as exc:  # noqa: BLE001 — recorded and counted below, never a traceback
+            reason = f"error:{type(exc).__name__}"
+        try:
+            await mint_scans.record(
+                scan_id=f"cms_{uuid.uuid4().hex[:16]}", scanned_at=now,
+                complete=bool(lane is not None and lane.complete), reason=reason,
+                seeds_scanned=lane.seeds_scanned if lane else 0,
+                cart_seeds=lane.cart_seeds if lane else 0,
+                elapsed_ms=lane.elapsed_ms if lane else 0,
+                hosts=lane.hosts if lane else {},
+            )
+        except Exception as exc:  # noqa: BLE001
+            write_failed = True
+            logger.warning(
+                "merchant_purchasability_sweep: the cart-mint scan could not be cached "
+                "(error_type=%s); the next run will scan again", type(exc).__name__,
+            )
+        if lane is not None and lane.complete:
+            return CartMintPopulation(lane, "scan", 0, True, "", write_failed)
+
+    # Today's scan failed, came back incomplete, or is backing off: the last complete scan, plus
+    # whatever a partial scan found. Counted unreadable only when that scan is too old to trust.
+    hosts: Dict[Tuple[str, str], int] = dict(cached["hosts"]) if cached is not None else {}
+    for key, seeds in (lane.hosts.items() if lane is not None else ()):
+        hosts[key] = max(hosts.get(key, 0), seeds)
+    base = _from_scan_row(cached) if cached is not None else CartMintLane(hosts={}, complete=False)
+    base.hosts = hosts
+    age_s = int((now - cached["scanned_at"]).total_seconds()) if cached is not None else -1
+    usable = cached is not None and age_s <= _SCAN_MAX_AGE_S
+    source = "cache+partial-scan" if lane is not None and lane.hosts else "cache"
+    return CartMintPopulation(base, source, age_s, usable, reason, write_failed)
+
 #: `source_domain` IS FOLDED, BY THE ROUTE'S EXPRESSION, CHARACTER FOR CHARACTER. `:domain` is a
 #: population key, which is already canonical (lower case, one leading `www.` removed); the
 #: Shopify sync writes `source_domain` as Shopify's `shop_domain`, which in production is
@@ -660,6 +804,8 @@ UNREADABLE_TALLY = "population_unreadable"
 #: TTL (see "Capacity" in the runbook); `population` alone is capped at the batch.
 TOTAL_TALLY = "population_total"
 NEVER_CHECKED_TALLY = "population_never_checked"
+#: And the age, in minutes, of the cart-mint scan the run used (0 = scanned this run; -1 = none).
+CART_MINT_AGE_TALLY = "cart_mint_population_age_min"
 
 #: The lanes, in the order they are unioned. Only the cart-link lane carries a variant, and
 #: `merge_lanes` never replaces a variant with None, so the Tier B lane's CONFIRMED variant lands
@@ -671,6 +817,7 @@ async def collect_population(
     *,
     tally: Optional[Dict[str, int]] = None,
     cart_mint: Optional[Dict[str, Any]] = None,
+    fresh_cart_mint_scan: bool = False,
 ) -> Dict[str, Dict[Tuple[str, str], Optional[str]]]:
     """Every lane's admitted (domain, market) keys, by lane name, each with its variant.
 
@@ -682,9 +829,11 @@ async def collect_population(
     are still swept).
 
     `cart_mint`, when given, receives the cart-mint lane's counts (`seeds_scanned`, `cart_seeds`,
-    `complete`, and `seeds_by_key` — seeds per admitted key) for the census; the sweep ignores
-    them beyond one counts-only log line. This function is the ONE place the population is
-    decided: the sweep and scripts/merchant_purchasability_census.py both read it.
+    `complete`, `source`, `age_s`, and `seeds_by_key` — seeds per admitted key). The cart-mint lane
+    follows the once-a-day scan policy (`_cart_mint_population`); `fresh_cart_mint_scan=True`
+    scans now and touches no cache, which is what the read-only census does. This function is the
+    ONE place the population is decided: the sweep and scripts/merchant_purchasability_census.py
+    both read it.
     """
     lanes: Dict[str, Dict[Tuple[str, str], Optional[str]]] = {name: {} for name in LANES}
 
@@ -740,17 +889,31 @@ async def collect_population(
         if key is not None:
             lanes["connected-store"].setdefault(key, None)
 
-    minted: Optional[CartMintLane] = await _lane(_cart_mint_lane, "cart-mint")
-    if minted is not None:
-        if not minted.complete:
-            # The lane read, but under-reports: a catalog lookup it could not make, or a scan
-            # the lane budget cut short, hides carts the minter would build. Counted like a read
-            # that raised, and what WAS found is still swept.
+    population: Optional[CartMintPopulation] = await _lane(
+        lambda: _cart_mint_population(fresh_scan=fresh_cart_mint_scan), "cart-mint"
+    )
+    minted: Optional[CartMintLane] = population.lane if population is not None else None
+    if population is not None:
+        if population.cache_write_failed:
+            _count(CACHE_WRITE_FAILED_TALLY)
+        if not population.usable:
+            # Under-reports with nothing young enough to stand in: a catalog lookup it could not
+            # make, a scan the lane budget cut short, or a scan that raised, and no complete scan
+            # within `_SCAN_MAX_AGE_S`. Counted like a read that raised; what WAS found is swept.
             _count(UNREADABLE_TALLY)
             logger.warning(
                 "merchant_purchasability_sweep: the cart-mint population lane is incomplete "
-                "(reason=%s)", minted.incomplete_reason,
+                "(reason=%s)", population.reason,
             )
+        elif population.reason:
+            # Today's scan failed or is backing off, and a young-enough scan stands in: logged,
+            # NOT counted, so a slow database does not fail (and page) every run of the day.
+            operator_logger.warning(
+                "merchant_purchasability_sweep: today's cart-mint scan did not complete "
+                "(reason=%s); using the scan from %d min ago", population.reason,
+                population.age_s // 60,
+            )
+    if minted is not None:
         seeds_by_key: Dict[Tuple[str, str], int] = {}
         for (host, market), seeds in sorted(minted.hosts.items()):
             key = _key(host, market)
@@ -758,14 +921,16 @@ async def collect_population(
                 lanes["cart-mint"].setdefault(key, None)
                 seeds_by_key[key] = seeds_by_key.get(key, 0) + seeds
         operator_logger.info(
-            "merchant_purchasability_sweep: cart-mint lane: seeds_scanned=%d cart_seeds=%d "
-            "keys=%d complete=%s elapsed_ms=%d", minted.seeds_scanned, minted.cart_seeds,
-            len(lanes["cart-mint"]), minted.complete, minted.elapsed_ms,
+            "merchant_purchasability_sweep: cart-mint lane: source=%s age_min=%d seeds_scanned=%d "
+            "cart_seeds=%d keys=%d complete=%s elapsed_ms=%d", population.source,
+            population.age_s // 60 if population.age_s >= 0 else -1, minted.seeds_scanned,
+            minted.cart_seeds, len(lanes["cart-mint"]), minted.complete, minted.elapsed_ms,
         )
         if cart_mint is not None:
             cart_mint.update(
                 seeds_scanned=minted.seeds_scanned, cart_seeds=minted.cart_seeds,
-                complete=minted.complete, incomplete_reason=minted.incomplete_reason,
+                complete=population.usable and minted.complete, incomplete_reason=population.reason,
+                source=population.source, age_s=population.age_s,
                 elapsed_ms=minted.elapsed_ms, seeds_by_key=seeds_by_key,
             )
     return lanes
@@ -798,7 +963,11 @@ async def load_population(
     read fails (the run then sweeps in key order). `sizes` receives `TOTAL_TALLY` and
     `NEVER_CHECKED_TALLY`.
     """
-    lanes = await collect_population(tally=tally)
+    cart_mint: Dict[str, Any] = {}
+    lanes = await collect_population(tally=tally, cart_mint=cart_mint)
+    if sizes is not None:
+        age_s = cart_mint.get("age_s")
+        sizes[CART_MINT_AGE_TALLY] = int(age_s) // 60 if isinstance(age_s, int) and age_s >= 0 else -1
     merged = merge_lanes(lanes)
     # The keys that may take the catalog's variant hint: see "One representative variant" in the
     # module docstring.
@@ -908,6 +1077,11 @@ class SweepReport:
     #: first; after the first full rotation this should read ~0, and a key that STAYS here is one
     #: the rotation is not reaching.
     population_never_checked: int = 0
+    #: Minutes since the cart-mint scan this run used was taken: 0 when this run scanned, up to
+    #: ~24 h on a normal day, -1 when there was none. Above ~1,440 today's scan failed and an
+    #: older one stands in (see `_cart_mint_population`); above 4,320 the lane is counted
+    #: unreadable.
+    cart_mint_population_age_min: int = -1
     checked: int = 0
     positive: int = 0
     negative: int = 0
@@ -921,7 +1095,8 @@ class SweepReport:
 
 _COUNTS = (
     "population", "population_skipped_unusable", "population_skipped_market_unknown",
-    "population_unreadable", "population_total", "population_never_checked", "checked",
+    "population_unreadable", "population_total", "population_never_checked",
+    "cart_mint_population_age_min", "checked",
     "positive", "negative", "unverifiable", "written", "abandoned_budget", "errors",
     "skipped_disabled",
 )
@@ -985,6 +1160,7 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
     """
     started = _monotonic()
     counts = {name: 0 for name in _COUNTS}
+    counts["cart_mint_population_age_min"] = -1
 
     def _report() -> SweepReport:
         return SweepReport(duration_ms=int((_monotonic() - started) * 1000), **counts)
@@ -1021,6 +1197,10 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
     counts["population_unreadable"] = tally.get(UNREADABLE_TALLY, 0)
     counts["population_total"] = sizes.get(TOTAL_TALLY, 0)
     counts["population_never_checked"] = sizes.get(NEVER_CHECKED_TALLY, 0)
+    counts["cart_mint_population_age_min"] = sizes.get(CART_MINT_AGE_TALLY, -1)
+    # A scan that could not be cached means the next run scans the seed table again: an ERROR
+    # (exit 4), because left alone it is exactly the hourly load the cache exists to prevent.
+    counts["errors"] += tally.get(CACHE_WRITE_FAILED_TALLY, 0)
     if counts["population_unreadable"]:
         operator_logger.warning(
             "merchant_purchasability_sweep: %d population lane(s) could not be read; this run's "

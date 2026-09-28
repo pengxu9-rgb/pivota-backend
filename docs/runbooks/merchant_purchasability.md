@@ -537,11 +537,43 @@ now unions a fourth lane, `_cart_mint_lane`:
   stale id, which the preflight answers `INVALID_INPUT` (never positive) or `VARIANT_GONE` (a
   confirmed negative that demotes the store) — a statement about our index, not about whether the
   store takes a card.
-* **Failures are counted** in `population_unreadable` (exit 1): a page read that raised (the lane
-  contributes nothing), a catalog lookup that failed (`handover_lookup_failed` /
-  `handover_not_primed` — a cart host may be missing), or a scan that ran past its own 300 s
-  budget. In the last two cases what was found is still swept. One counts-only line per run:
-  `cart-mint lane: seeds_scanned=… cart_seeds=… keys=… complete=… elapsed_ms=…`.
+* **Scanned at most once a day, cached in `merchant_purchasability_cart_mint_scans`** (migration
+  245; created at first use by `db/merchant_purchasability_cart_mint_scans.ensure_table()`, like
+  `scheduler_job_slots`). A scan reads every active seed's `seed_data` on the 2-vCPU primary, so it
+  runs only on the first sweep of each **05:00Z** slot (normally 05:07, after the nightly crawls);
+  every other run reads the last complete scan. A cart host that starts minting mid-day is
+  therefore swept from the next day's scan on — until then it has no fact, and the gate gives it
+  no cart, which is the safe answer.
+* **Failures, and when they page.** A scan fails when a page read raises, a catalog lookup failed
+  or never ran (`handover_lookup_failed` / `handover_not_primed`, so a cart host may be missing),
+  or the scan ran past its own 300 s budget. Every attempt is recorded.
+  * *Today's scan failed, and the last complete scan is ≤ 72 h old:* the run uses that scan, plus
+    whatever the failed one found. It logs a WARNING and is **not** counted, so a slow database
+    does not fail every run of the day. The next attempt comes no sooner than 6 h later.
+  * *No complete scan in the last 72 h:* counted in `population_unreadable` (exit 1), and
+    whatever exists is still swept.
+  * *The cache table cannot be created or read:* **no scan at all** (scanning anyway would turn a
+    broken table into an hourly full scan). The lane is counted unreadable (exit 1).
+  * *A scan whose result cannot be written:* counted in `errors` (exit 4). The next run scans
+    again, which is the load the cache prevents, so it has to page.
+* **One counts-only line per run:**
+  `cart-mint lane: source=scan|cache|cache+partial-scan age_min=… seeds_scanned=… cart_seeds=…
+  keys=… complete=… elapsed_ms=…`. `SweepReport.cart_mint_population_age_min` carries the same age:
+  0 when this run scanned, up to ~1,440 on a normal day, more when today's scan failed, and −1
+  when there is none.
+
+```sql
+-- The scan cache: one row per attempt, newest first. `hosts` is [[host, market, seeds], ...].
+SELECT scanned_at, complete, reason, seeds_scanned, cart_seeds, elapsed_ms,
+       json_array_length(hosts::json) AS keys
+  FROM merchant_purchasability_cart_mint_scans
+ ORDER BY scanned_at DESC LIMIT 10;
+```
+
+**To force a rescan today** (e.g. after a big seed ingest), delete today's rows:
+`DELETE FROM merchant_purchasability_cart_mint_scans WHERE scanned_at >= date_trunc('day', now()) + interval '5 hours';`
+The next hourly run scans. **To roll the cache back**, drop the table
+(`db/migrations/down/245_…`). The next run recreates it and scans once.
 
 ### Capacity: a population larger than the batch (2026-09-28)
 
@@ -561,8 +593,9 @@ every ⌈*T* / 20⌉ runs (*T* = `population_total`). A positive fact lives 72 h
   and finished inside 40 s end to end, job creation included. Locally the per-seed CPU is
   ~0.05 ms.
 
-**One run** ≈ seed scan (est. 30–60 s; hard-stopped at 300 s and counted) + 20 × ~10.4 s ≈
-**4–5 minutes**. Worst realistic case: a 300 s scan, then 20 checks (~210 s), then one
+**One run** ≈ 20 × ~10.4 s ≈ **3.5 minutes**, plus the seed scan (est. 30–60 s; hard-stopped at
+300 s) **only on the first run of each 05:00Z day** — the other 20 runs a day read the cached scan.
+Worst realistic case (the daily scan run): a 300 s scan, then 20 checks (~210 s), then one
 pathological merchant (~300 s) ≈ 810 s — inside the 1200 s task timeout. The 600 s budget is
 measured from the start of the run, scan included, so a slow scan shortens the checks, never the
 other way round.

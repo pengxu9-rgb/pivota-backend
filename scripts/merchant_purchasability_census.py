@@ -163,7 +163,9 @@ async def census() -> Dict[str, Any]:
                 raise NotReadOnly("SHOW transaction_read_only did not answer 'on'")
             tally: Dict[str, int] = {}
             detail: Dict[str, Any] = {}
-            lanes = await sweep.collect_population(tally=tally, cart_mint=detail)
+            lanes = await sweep.collect_population(
+                tally=tally, cart_mint=detail, fresh_cart_mint_scan=True
+            )
             vantage = facts.buyer_vantage()
             facts_by_key = {
                 (str(r["merchant_domain"]), str(r["market_country"])): dict(r)

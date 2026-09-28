@@ -68,6 +68,8 @@ if _IS_PG:
         _connected,
         # The cart-mint lane's rows (external_product_seeds + the catalog rows the resolver reads).
         _cart_seeds,
+        # The cart-mint scan-cache cases: a moved clock and a counted scan.
+        _scans,
         page,
         res,
     )
@@ -656,3 +658,39 @@ async def test_the_census_transaction_refuses_a_write(_db, _cart_seeds, monkeypa
     with pytest.raises(Exception, match="read-only"):
         await census.census()
     assert await mp.get_fact("census-write.example", "US") is None
+
+
+# ══ the cart-mint scan cache: the migration and the first-use CREATE build one table ═══════════
+
+
+async def test_the_scan_cache_self_heal_builds_what_migration_245_builds(_db):
+    """Production never runs db/migrations; `ensure_table()` is what creates the table there. So
+    the two must build the same thing — compared through the catalog, not by reading SQL."""
+    import db.merchant_purchasability_cart_mint_scans as mint_scans
+    from db.database import database
+
+    table = mint_scans.TABLE
+    shape_sql = (
+        "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = :t ORDER BY ordinal_position"
+    )
+    key_sql = (
+        "SELECT kcu.column_name FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name "
+        "AND kcu.table_schema = tc.table_schema WHERE tc.table_name = :t "
+        "AND tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = current_schema()"
+    )
+
+    async def _shape():
+        cols = [tuple(dict(r).values()) for r in await database.fetch_all(shape_sql, {"t": table})]
+        keys = [dict(r)["column_name"] for r in await database.fetch_all(key_sql, {"t": table})]
+        return cols, keys
+
+    await database.execute(f"DROP TABLE IF EXISTS {table}")
+    await database.execute((_MIGRATIONS_DIR / "245_merchant_purchasability_cart_mint_scans.sql").read_text())
+    from_migration = await _shape()
+    await database.execute((_MIGRATIONS_DIR / "down" / "245_merchant_purchasability_cart_mint_scans_down.sql").read_text())
+    assert (await _shape())[0] == [], "the down migration removes it"
+    mint_scans._reset_for_tests()
+    assert await mint_scans.ensure_table()
+    assert await _shape() == from_migration and from_migration[1] == ["scan_id"]
