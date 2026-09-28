@@ -128,10 +128,14 @@ UPDATE catalog_products
 SET suppression_reason = :reason, suppressed_at = CAST(:suppressed_at AS timestamptz),
     suppression_metadata = CAST(:metadata AS jsonb), updated_at = NOW()
 WHERE product_key = :key
+  AND suppression_reason = :retired_reason AND suppression_metadata ->> 'run_id' = :run_id
+RETURNING product_key
 """
 
+# Only a seed on a row this revert restored: a row retired again since (another run) keeps its seed off.
 REACTIVATE_SEED_SQL = """
-UPDATE external_product_seeds SET status = :status, updated_at = NOW() WHERE id = :id
+UPDATE external_product_seeds SET status = :status, updated_at = NOW()
+WHERE id = :id AND attached_product_key = ANY(:keys)
 """
 
 
@@ -166,13 +170,25 @@ def cohort_from_records(recs: List[Dict[str, Any]], brand: str,
                         stale_brand: Optional[str] = None) -> List[Dict[str, Any]]:
     """Pure: the cohort of `build_cohort` from records already crawled. The retailer-ingest drain passes the
     records its apply stage just wrote, so the cohort is the re-run's own crawl -- not a second one."""
-    out: List[Dict[str, Any]] = []
+    pairs = []
     for rec in recs:
         pdp = rec.get("pdp") or {}
         title, new_brand = pdp.get("product_name"), pdp.get("brand")
         stale, new = derive_product_key(stale_brand or brand, title), derive_product_key(new_brand, title)
         if stale and new and stale != new:
-            out.append({"stale_key": stale, "new_key": new, "brand": new_brand, "title": title})
+            pairs.append({"stale_key": stale, "new_key": new, "brand": new_brand, "title": title})
+    # A stale key that is ANOTHER record's new key is that product's current row, never an old one: the key
+    # hashes (brand, title) run together, so a sibling brand ("A'pieu Pure Block Sun" re-keyed while "Missha
+    # Pure Block Sun" is written under the stale spelling) or a split ("Tower 28 Beauty" + "Lip Jelly" ==
+    # "Tower 28" + "Beauty Lip Jelly") collides with a live product of the same run (review of #2426).
+    current = {p["new_key"] for p in pairs}
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for p in pairs:
+        if p["stale_key"] in current or p["stale_key"] in seen:
+            continue  # ...and one stale key is one row: variants and repeated titles are not two retires
+        seen.add(p["stale_key"])
+        out.append(p)
     return out
 
 
@@ -366,8 +382,12 @@ async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
 
 # The manifest the retailer-ingest drain stored on its apply run (services.retailer_ingest.pipeline).
 INGEST_RUN_MANIFEST_SQL = """
-SELECT checks -> 'stale_brand_retire_manifest' AS manifest FROM retailer_ingest_runs WHERE id = :id
+SELECT checks -> 'stale_brand_retire_manifest' AS manifest,
+       checks -> 'stale_brand_retire' ->> 'outcome' AS outcome
+FROM retailer_ingest_runs WHERE id = :id
 """
+#: A drain retire that never reached its write (services.retailer_ingest.pipeline._retire_stale_brand).
+UNWRITTEN_OUTCOMES = ("nothing_to_retire", "deferred", "error")
 
 
 async def revert(manifest_path: str) -> None:
@@ -382,13 +402,18 @@ async def revert_ingest_run(ingest_run_id: str) -> None:
         m = json.loads(m)
     if not m:
         raise SystemExit(f"no stale-brand retire manifest on ingest run {ingest_run_id}")
+    if row["outcome"] in UNWRITTEN_OUTCOMES:
+        raise SystemExit(f"ingest run {ingest_run_id}'s retire was {row['outcome']!r}: it wrote nothing to revert")
     await revert_manifest(m)
 
 
 async def revert_manifest(m: Dict[str, Any]) -> None:
+    """Restore the rows THIS run retired -- only while they still carry its tombstone (reason and run id), so
+    a revert never undoes a later retire of the same key -- and reactivate the seeds on the rows it restored."""
+    restored: List[str] = []
     async with database.transaction():
         for row in m["products"]:
-            await database.execute(UNSUPPRESS_SQL, {
+            back = await database.fetch_one(UNSUPPRESS_SQL, {
                 "key": row["product_key"], "reason": row["prior_suppression_reason"],
                 "suppressed_at": row["prior_suppressed_at"],
                 # `CAST(:metadata AS jsonb)` wants TEXT. The driver hands a jsonb column
@@ -396,10 +421,17 @@ async def revert_manifest(m: Dict[str, Any]) -> None:
                 # to a text cast fails -- in `revert`, which is the one path that must
                 # not fail. Serialise anything that is not already a string.
                 "metadata": _as_json_text(row["prior_suppression_metadata"]),
+                "retired_reason": m.get("reason") or REASON, "run_id": m["run_id"],
             })
+            if back:
+                restored.append(row["product_key"])
         for s in m.get("seeds") or []:
-            await database.execute(REACTIVATE_SEED_SQL, {"id": s["id"], "status": s["prior_status"]})
-    print(f"reverted run {m['run_id']}: {len(m['products'])} product(s), {len(m.get('seeds') or [])} seed(s). "
+            await database.execute(REACTIVATE_SEED_SQL, {"id": s["id"], "status": s["prior_status"],
+                                                         "keys": restored})
+    skipped = len(m["products"]) - len(restored)
+    print(f"reverted run {m['run_id']}: {len(restored)} product(s)"
+          + (f" ({skipped} no longer carry this run's tombstone, left alone)" if skipped else "")
+          + f", seeds on those rows. "
           "Offer suppression is reverted by services.catalog_offer_suppression.revert_offer_suppression.")
 
 

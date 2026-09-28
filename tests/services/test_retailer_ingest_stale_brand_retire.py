@@ -61,8 +61,9 @@ def retire(env, monkeypatch):  # noqa: F811
     async def plan_for_cohort(cohort, domain, brand, category_path, stale_brand=None, *, before_rewrite=False):
         if before_rewrite and st.preview_error:
             raise st.preview_error
+        holder = env.ledger.lock_server.holder
         st.plans.append({"cohort": cohort, "domain": domain, "brand": brand, "stale_brand": stale_brand,
-                         "before_rewrite": before_rewrite})
+                         "before_rewrite": before_rewrite, "locked": holder is not None and not holder.closed})
         return st.plan
 
     async def write_retire(prepared):
@@ -78,6 +79,8 @@ def retire(env, monkeypatch):  # noqa: F811
         st.manifests[run_id] = manifest
 
     async def readback(p, tool):
+        if isinstance(st.readback, Exception):
+            raise st.readback
         return st.readback
 
     monkeypatch.setattr(retire_tool, "plan_for_cohort", plan_for_cohort)
@@ -289,7 +292,7 @@ async def test_revert_reads_the_manifest_the_drain_stored_on_its_run(monkeypatch
     class DB:
         async def fetch_one(self, sql, values):
             assert "stale_brand_retire_manifest" in sql and values == {"id": "rir_1"}
-            return {"manifest": json.dumps(manifest)}
+            return {"manifest": json.dumps(manifest), "outcome": "retired"}
 
     async def revert_manifest(m):
         seen.append(m)
@@ -314,3 +317,121 @@ async def test_the_manifest_write_raises_when_no_unfinished_run_matched():
             return None
     with pytest.raises(RuntimeError, match="no unfinished run"):
         await ledger.record_retire_manifest("rir_gone", {"products": []}, db=DB())
+
+
+# --- review of #2426 ------------------------------------------------------------------------------------
+
+def rec(brand, title):
+    return {"pdp": {"brand": brand, "product_name": title}}
+
+
+def test_a_stale_key_that_is_another_records_current_key_is_never_in_the_cohort():
+    """derive_product_key runs (brand, title) together: "Tower 28 Beauty" + "Lip Jelly" is the key of
+    "Tower 28" + "Beauty Lip Jelly" -- a live product of the same run, not an old row."""
+    assert derive_product_key("Tower 28 Beauty", "Lip Jelly") == derive_product_key("Tower 28", "Beauty Lip Jelly")
+    cohort = retire_tool.cohort_from_records(
+        [rec("Tower 28", "Lip Jelly"), rec("Tower 28", "Beauty Lip Jelly"), rec("Tower 28", "SOS Serum")],
+        "Tower 28", "Tower 28 Beauty")
+    assert [c["title"] for c in cohort] == ["Beauty Lip Jelly", "SOS Serum"]
+
+
+def test_one_stale_key_is_one_cohort_entry():
+    cohort = retire_tool.cohort_from_records([rec("3CE", "Tint"), rec("3CE", "Tint")], "3CE", STALE)
+    assert len(cohort) == 1
+
+
+async def test_the_keys_this_apply_wrote_are_never_retired(env, retire, monkeypatch):  # noqa: F811
+    applied = derive_product_key("3CE", TINT[0])
+    monkeypatch.setattr(retire_tool, "cohort_from_records",
+                        lambda recs, brand, stale: [{**pair(0), "stale_key": applied}, pair(1)])
+    await pipeline.run_stage(rjob(), db=env.db)
+    [p] = retire.plans
+    assert [c["stale_key"] for c in p["cohort"]] == ["old1"]
+
+
+async def test_the_plan_is_read_under_the_write_lock(env, retire):  # noqa: F811
+    await pipeline.run_stage(rjob(), db=env.db)
+    assert retire.plans[0]["locked"]
+
+
+async def test_the_same_spelling_is_refused_before_anything_runs(env, retire):  # noqa: F811
+    out = await pipeline.run_stage(job("queued", source_role="brand_official", accepted_flags=ACCEPT,
+                                       retire_stale_brand=" 3ce "), db=env.db)
+    assert out["status"] == "failed" and out["outcome"] == "invalid_job" and retire.plans == []
+
+
+async def test_a_readback_that_raises_is_a_failed_retire_not_a_crashed_stage(env, retire):  # noqa: F811
+    retire.readback = RuntimeError("connection reset")
+    out = await pipeline.run_stage(rjob(), db=env.db)
+    assert out["status"] == "failed" and out["outcome"] == "applied" and out["stale_brand_retire"] == "readback_failed"
+    assert retire.writes == [["old0", "old1"]]
+
+
+async def test_a_failed_retire_leaves_no_manifest_to_revert(env, retire):  # noqa: F811
+    retire.write_error = RuntimeError("boom")
+    await pipeline.run_stage(rjob(), db=env.db)
+    run = [r for r in env.ledger.runs.values() if r.get("stage") == "apply"][-1]
+    assert "stale_brand_retire_manifest" not in run["checks"]
+
+
+async def test_no_time_left_defers_without_touching_the_lock(env, retire):  # noqa: F811
+    import time
+    deadline = time.monotonic() + pipeline.RETIRE_LOCK_MARGIN_S - 1
+    out = await pipeline._retire_stale_brand(rjob(), "run_x", [official(*TINT)], {}, applied_keys=[],
+                                             db=env.db, deadline=deadline)
+    assert out["outcome"] == "deferred" and "no time left" in out["error"]
+    assert env.ledger.lock_waits == [] and retire.plans == [] and retire.writes == []
+
+
+async def test_the_lock_wait_leaves_the_margin_before_the_deadline(env, retire):  # noqa: F811
+    import time
+    env.ledger.runs["run_x"] = {"stage": "apply"}
+    deadline = time.monotonic() + pipeline.RETIRE_LOCK_MARGIN_S + 50
+    await pipeline._retire_stale_brand(rjob(), "run_x", [official(*TINT)], {}, applied_keys=[],
+                                       db=env.db, deadline=deadline)
+    [kw] = env.ledger.lock_waits
+    assert 40 < kw["wait_s"] <= 50
+    await pipeline._retire_stale_brand(rjob(), "run_x", [official(*TINT)], {}, applied_keys=[],
+                                       db=env.db, deadline=None)
+    assert env.ledger.lock_waits[-1]["wait_s"] == pipeline.WRITE_LOCK_WAIT_S
+
+
+@pytest.mark.parametrize("outcome", ["deferred", "error", "nothing_to_retire"])
+async def test_revert_refuses_a_drain_retire_that_never_wrote(monkeypatch, outcome):
+    class DB:
+        async def fetch_one(self, sql, values):
+            return {"manifest": {"run_id": "retire_x", "products": [{"product_key": "k"}], "seeds": []},
+                    "outcome": outcome}
+    monkeypatch.setattr(retire_tool, "database", DB())
+    with pytest.raises(SystemExit, match="wrote nothing"):
+        await retire_tool.revert_ingest_run("rir_1")
+
+
+async def test_revert_restores_only_rows_still_carrying_its_tombstone(monkeypatch):
+    """A key retired again by a later run keeps that run's tombstone -- and its seed stays off."""
+    calls = []
+
+    class Tx:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+    class DB:
+        def transaction(self): return Tx()
+
+        async def fetch_one(self, sql, values):
+            calls.append(("unsuppress", values["key"], values["run_id"], values["retired_reason"]))
+            assert "suppression_metadata ->> 'run_id' = :run_id" in sql
+            return {"product_key": values["key"]} if values["key"] == "k_ours" else None
+
+        async def execute(self, sql, values):
+            calls.append(("seed", values["id"], tuple(values["keys"])))
+            assert "attached_product_key = ANY(:keys)" in sql
+    monkeypatch.setattr(retire_tool, "database", DB())
+    m = {"run_id": "retire_x", "reason": retire_tool.REASON,
+         "products": [{"product_key": k, "prior_suppression_reason": None, "prior_suppressed_at": None,
+                       "prior_suppression_metadata": None} for k in ("k_ours", "k_retired_again")],
+         "seeds": [{"id": "s1", "prior_status": "active"}]}
+    await retire_tool.revert_manifest(m)
+    assert calls == [("unsuppress", "k_ours", "retire_x", retire_tool.REASON),
+                     ("unsuppress", "k_retired_again", "retire_x", retire_tool.REASON),
+                     ("seed", "s1", ("k_ours",))]
