@@ -1919,13 +1919,18 @@ async def run_external_referral_refresh_batch(
     # A scraped currency that disagrees with the stored one is refused rather than
     # applied (see routes/employee_products._refresh_external_seed_by_id). This counter
     # is the visible cost of that refusal: if it is non-trivial, the currency EXTRACTOR
-    # needs work — `_detect_currency_from_text` has no KRW case and the caller defaults
-    # by market — not the writer.
+    # needs work, not the writer. (Its main source, `resolve_external_offer` defaulting an
+    # unread currency by market, is gone: that now lands in `price_skipped_unreadable`.)
     price_skipped_currency_mismatch = 0
     # A fetch that produced a non-positive amount. Distinct from `unavailable` (no
     # reading at all) because it means the extractor read something and got a broken
     # offer shape — a different problem with a different fix.
     price_skipped_non_positive = 0
+    # The page carried a price the extractor would not read (utils/crawled_price.py refuses an
+    # ambiguous separator rather than guessing; an unread currency is no longer invented). By
+    # reason, so a rising count points at the signal the extractor is missing.
+    price_skipped_unreadable = 0
+    price_unreadable_reasons: Dict[str, int] = {}
     availability_changed = 0
     # Hosts the run stopped asking because they did not answer at all (connection refused or
     # reset, timeout, DNS, TLS), with how many of their rows it passed over. Kept apart from the
@@ -1947,7 +1952,7 @@ async def run_external_referral_refresh_batch(
         nonlocal refreshed, refreshed_from_cache, degraded, failed, unprocessable
         nonlocal price_changed, price_filled, price_unchanged, price_unavailable
         nonlocal price_skipped_incomplete_pair, price_skipped_currency_mismatch
-        nonlocal price_skipped_non_positive, availability_changed
+        nonlocal price_skipped_non_positive, price_skipped_unreadable, availability_changed
         nonlocal proj_attempted, proj_written, proj_errored, proj_seconds
         nonlocal pdp_refreshed, pdp_errored
         outcome = "failed"
@@ -1978,6 +1983,10 @@ async def run_external_referral_refresh_batch(
                     price_skipped_currency_mismatch += 1
                 elif price_status == "skipped_non_positive":
                     price_skipped_non_positive += 1
+                elif price_status == "skipped_unreadable":
+                    price_skipped_unreadable += 1
+                    reason = str(price.get("reason") or "unknown")
+                    price_unreadable_reasons[reason] = price_unreadable_reasons.get(reason, 0) + 1
                 elif price_status == "unavailable":
                     price_unavailable += 1
                 proj = result.get("projection")
@@ -2295,6 +2304,8 @@ async def run_external_referral_refresh_batch(
         "price_skipped_incomplete_pair": price_skipped_incomplete_pair,
         "price_skipped_currency_mismatch": price_skipped_currency_mismatch,
         "price_skipped_non_positive": price_skipped_non_positive,
+        "price_skipped_unreadable": price_skipped_unreadable,
+        "price_unreadable_reasons": price_unreadable_reasons,
         "availability_changed": availability_changed,
         "errors": errors[:20],
     }

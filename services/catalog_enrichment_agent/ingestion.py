@@ -65,6 +65,7 @@ from services.strong_identifier import (
 )
 from services.text_normalization.brand_case import proper_case_brand
 from services.variant_identity import MERCHANT_ISSUED, PRODUCT_DERIVED, variant_id_provenance
+from utils.crawled_price import decimal_hint_from_currency, parse_crawled_price
 
 
 def variant_own_price(variant: Dict[str, Any]) -> Optional[float]:
@@ -81,16 +82,21 @@ def variant_own_price(variant: Dict[str, Any]) -> Optional[float]:
     is never projected as an offer, because the serving price gate and recall
     both read catalog_offers and a priceless row there is at best inert and at
     worst a 0.00 on a PDP.
+
+    A TEXT amount is read by utils.crawled_price, the crawl's own rule. This used to drop every
+    comma, so a stored "28,80" projected as 2880 and "1.234,56" as 1.23456. The variant's own
+    currency is the only signal here; an amount that needs more ("1,234" with no currency) is
+    refused rather than guessed.
     """
+    currency = variant.get("price_currency") or variant.get("currency")
     for key in ("price_amount", "price", "list_price"):
         raw = variant.get(key)
         if raw is None or raw == "":
             continue
-        try:
-            value = float(str(raw).replace(",", ""))
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
+        value = parse_crawled_price(
+            raw, currency=currency, decimal_hint=decimal_hint_from_currency(currency)
+        ).amount
+        if value is not None and value > 0:
             return value
     return None
 

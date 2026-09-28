@@ -4799,8 +4799,8 @@ def _reconcile_seed_variants_with_read(
             per_variant = not rv.get("id_collided") and not rv.get("offer_aggregate")
             amount = _as_price(rv.get("price_amount"))
             # The offer's OWN currency, never a fallback. The product-level currency reaching
-            # this function is the column's (`resolve_external_offer` fabricates USD when the
-            # page states none), so inheriting it would read "3600" off a geo-served page as
+            # this function is the column's (`resolve_external_offer` fabricated USD when the
+            # page stated none; it no longer does), so inheriting it would read "3600" off a geo-served page as
             # $3,600 -- seen in the #2340 spot-check against a JPY-served sigmabeauty page.
             cur = str(rv.get("price_currency") or "").strip().upper() or None
             if (
@@ -5214,8 +5214,11 @@ async def _refresh_external_seed_by_id(
     # correction is dictated by it. It gated on `snap_price_currency is None` and on
     # `snap_availability is None`, having read `_extract_from_html`. Neither is ever
     # None by the time it arrives here — the CALLER post-processes both:
-    #   * services/external_offers_service.resolve_external_offer FABRICATES a
+    #   * services/external_offers_service.resolve_external_offer FABRICATED a
     #     currency when extraction found none: `"JPY" if market=="JP" else "USD"`.
+    #     (Fixed since: an unread currency now voids the amount and arrives here as
+    #     `skipped_unreadable` / `currency_unread`. The guards below stay: the stored
+    #     rows it wrote are still in the table.)
     #     `_detect_currency_from_text` has no `₩`/KRW case, so a Korean page priced
     #     ₩24,000 arrives as 24000.0 **USD**. The old COALESCE kept the stored KRW;
     #     a naive fix writes the fabricated USD and reports it as a correction.
@@ -5247,20 +5250,32 @@ async def _refresh_external_seed_by_id(
     # rather than swallowed so the rate is measurable. A genuine merchant currency
     # change therefore needs a human, which is the right cost: the alternative is
     # silently restating a ₩24,000 product as $24,000.
-    if fresh_amount is None:
+    # WHY the page gave no amount, when it carried a price we would not read: an ambiguous
+    # separator ("1,234" with no locale signal), two numbers in one field, or no readable
+    # currency (`resolve_external_offer` no longer invents one). Counted apart from
+    # `unavailable` (the page had no price at all) because the fix is in the extractor.
+    price_read = evidence.get("price_read") if isinstance(evidence, dict) else None
+    unreadable_reason = (
+        str(price_read.get("status") or "")
+        if isinstance(price_read, dict) and price_read.get("status") not in (None, "", "parsed", "empty")
+        else None
+    )
+    if fresh_amount is None and unreadable_reason:
+        next_amount, next_currency = prev_amount, prev_currency
+        price_status = "skipped_unreadable"
+    elif fresh_amount is None:
         next_amount, next_currency = prev_amount, prev_currency
         price_status = "unavailable"
     elif fresh_amount <= 0:
         # `price: 0` IS A DOCUMENTED BROKEN-OFFER SHAPE IN THIS CATALOG, not a free
-        # product. `_parse_price` strips every non-digit, so an unrenderable or
-        # sold-out PDP that emits `product:price:amount = 0` (or a currency glyph with
-        # no number) arrives here as a clean 0.0 — and "$0 / EUR price for US users"
+        # product. An unrenderable or sold-out PDP that emits
+        # `product:price:amount = 0` arrives here as a clean 0.0 — and "$0 / EUR price for US users"
         # is recorded a few hundred lines up as an OBSERVED production symptom, not a
         # hypothetical. The old COALESCE preserved the stored price in this cell, so
         # writing it would be a regression introduced by the very change meant to make
         # prices trustworthy — and it lands hardest on the out-of-stock cohort this
-        # work targets. Negative is unreachable (the minus sign is stripped upstream)
-        # but is covered by the same comparison rather than left to be discovered.
+        # work targets. Negative is unreachable (utils/crawled_price refuses a minus
+        # sign) but is covered by the same comparison rather than left to be discovered.
         next_amount, next_currency = prev_amount, prev_currency
         price_status = "skipped_non_positive"
     elif fresh_currency is None:
@@ -5320,6 +5335,7 @@ async def _refresh_external_seed_by_id(
 
     price_refresh = {
         "status": price_status,
+        **({"reason": unreadable_reason} if price_status == "skipped_unreadable" else {}),
         "changed": price_status == "applied",
         "previous_amount": prev_amount,
         "previous_currency": prev_currency,
