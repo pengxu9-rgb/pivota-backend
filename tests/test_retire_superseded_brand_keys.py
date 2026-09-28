@@ -442,7 +442,8 @@ _LOOKALIKES = ["shop.stilacosmetics.com", "stilacosmetics.com.evil.io", "notstil
 @pytest.mark.parametrize("lookalike", _LOOKALIKES)
 def test_a_lookalike_hosts_stale_row_is_foreign_never_retired(lookalike):
     rows = _rows(old0={"source_domain": lookalike}, old1={"source_domain": "www.stilacosmetics.com"})
-    out = select_retirable(_C[:2], rows, new_live=_ALL_NEW, domain="stilacosmetics.com", serving=set())
+    out = select_retirable(_C[:2], rows, new_live=_ALL_NEW, domain="stilacosmetics.com", serving=set(),
+                           searchable=set())
     assert _keys(out, "foreign") == ["old0"]
     assert _keys(out, "live") == ["old1"]   # www. is the same store
 
