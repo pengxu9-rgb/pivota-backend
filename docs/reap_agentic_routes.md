@@ -128,7 +128,7 @@ poller drives the state machine afterwards, on another process, over the next mi
 | `buyer.shipping_address` | yes | **the Reap client's field names**, not the snake_case shape `/agent/v2/commerce/checkouts` uses. Required: `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `country`. Optional: `addressLine2`, `region`, `postalCode`. Unknown keys are dropped. |
 | `buyer.name`, `buyer.phone` | no | **fallbacks only.** Used when the address omits the field; never override it. `name` splits on the last space. |
 | `return_url` | no | defaults to `REAP_AGENTIC_RETURN_URL`, else `https://<first REAP_RETURN_URL_HOSTS host>/reap/return` — with nothing set, `https://api.pivota.cc/reap/return`, a static page this backend serves. Must be https, no userinfo, on a host in `REAP_RETURN_URL_HOSTS`. |
-| `idempotency_key` | no | honoured for **24 hours**, scoped to `(agent, buyer)`. |
+| `idempotency_key` | no | honoured for **24 hours**, scoped to `(agent, buyer)`. A variant-lane `409 merchant_not_eligible` is **remembered against the key** for that window: re-sending the same request with the same key is refused the same way even if the merchant is enabled meanwhile (a door that tried the cart-link lane under a second key must replay that purchase, not open another). Use a new key to start a new purchase. |
 | `click_context` | no | accepted and not forwarded. The click id this rail records is one **we** mint. |
 
 **There is no price field, and a price in the body is ignored.** The unit price comes from our

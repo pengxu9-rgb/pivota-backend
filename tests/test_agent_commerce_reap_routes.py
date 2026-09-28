@@ -3013,3 +3013,47 @@ async def test_no_variant_row_is_still_merchant_not_eligible(client):
     await _seed_link()
     resp = await client.post(f"{BASE}/purchases", json=_body())
     assert resp.status_code == 409 and _error(resp) == "merchant_not_eligible"
+
+
+async def test_a_key_refused_merchant_not_eligible_stays_refused_after_the_merchant_is_enabled(
+    client, monkeypatch
+):
+    """G5 (gateway review of #2425). The UCP door answers a variant-lane merchant_not_eligible by
+    retrying on the cart-link lane under a derived key K'. If the variant refusal left key K
+    unclaimed, a client retry of the same create AFTER the merchant was enabled would open a SECOND
+    purchase (variant, under K) beside the cart-link one (under K'). K now remembers the refusal:
+    the retry is refused the same way, and the door's K' replays the cart-link purchase."""
+    await _seed_tierb_shopify_item()
+    await _seed_tierb_verdict()
+    await _seed_link()
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K"))
+    assert first.status_code == 409 and _error(first) == "merchant_not_eligible"
+    cart = await client.post(f"{BASE}/purchases",
+                             json=_body(idempotency_key="K-prime", item_source="cart_link"))
+    assert cart.status_code == 202, cart.text
+    p1 = cart.json()["purchase_id"]
+
+    await _seed_eligibility()  # the operator enables the merchant on the variant lane
+
+    retry = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K"))
+    assert retry.status_code == 409 and _error(retry) == "merchant_not_eligible"
+    replay = await client.post(f"{BASE}/purchases",
+                               json=_body(idempotency_key="K-prime", item_source="cart_link"))
+    assert replay.status_code == 202 and replay.json()["purchase_id"] == p1
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+
+    # CONTROLS: a NEW key opens a variant purchase now, and K with a different body is a conflict.
+    fresh = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K2"))
+    assert fresh.status_code == 202, fresh.text
+    other = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K", quantity=2))
+    assert other.status_code == 409 and _error(other) == "idempotency_conflict"
+
+
+async def test_no_key_means_no_tombstone(client):
+    await _seed_catalog()
+    await _seed_link()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert _error(resp) == "merchant_not_eligible"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 0

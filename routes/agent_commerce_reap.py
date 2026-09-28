@@ -1525,7 +1525,64 @@ async def _replayed_purchase_id(
         raise svc.PurchaseRefused(
             "idempotency_conflict", "this key was used for a different request"
         )
-    return str(record.get("purchase_id") or "").strip() or None
+    stored = str(record.get("purchase_id") or "").strip()
+    if stored.startswith(_REFUSED_KEY_PREFIX):
+        # A TOMBSTONE: this key, for this exact request, was refused -- see
+        # `_tombstone_idempotency_key`. The same answer again, for the key's whole window.
+        reason = stored[len(_REFUSED_KEY_PREFIX):]
+        raise svc.PurchaseRefused(
+            reason if reason in _TOMBSTONED_REFUSALS else "merchant_not_eligible",
+            "this key was refused for this request",
+        )
+    return stored or None
+
+
+#: `reap_agentic_purchase_keys.purchase_id` of a key whose request was REFUSED (not a purchase).
+_REFUSED_KEY_PREFIX = "refused:"
+#: The refusals that are remembered against a key. Only the one a door answers by trying another
+#: lane with a DIFFERENT key; see `_tombstone_idempotency_key`.
+_TOMBSTONED_REFUSALS = frozenset({"merchant_not_eligible"})
+
+
+async def _tombstone_idempotency_key(
+    *, agent_id: str, agent_user_ref_hash: str, idempotency_key: str, request_hash: str,
+    reason: str,
+) -> None:
+    """Remember that THIS key, for THIS request, was refused with `reason`.
+
+    WHY (gateway review of #2425, G5). The UCP door answers a variant-lane
+    `merchant_not_eligible` by retrying the SAME buyer request on the cart-link lane under a
+    second, derived key K'. Before this, the refusal left key K unclaimed, so a client retry of
+    that create AFTER an operator enabled the merchant opened a SECOND purchase on the variant
+    lane under K, beside the cart-link one already opened under K' -- one buyer request, two
+    purchases, two hosted pages. With K remembered as refused, the retry gets the same refusal,
+    the door retries K', and the backend REPLAYS the cart-link purchase. The window is the key's
+    own (`_IDEMPOTENCY_WINDOW_SECONDS`); a buyer who wants the variant lane later sends a new key.
+
+    A failed insert is swallowed: the key is already claimed (a race, or a purchase), and the
+    lookup reads whichever row won.
+    """
+    if reason not in _TOMBSTONED_REFUSALS:
+        return
+    try:
+        await database.execute(
+            """
+            INSERT INTO reap_agentic_purchase_keys (
+                agent_id, agent_user_ref_hash, idempotency_key, purchase_id, request_hash
+            ) VALUES (
+                :agent_id, :agent_user_ref_hash, :idempotency_key, :purchase_id, :request_hash
+            )
+            """,
+            {
+                "agent_id": agent_id,
+                "agent_user_ref_hash": agent_user_ref_hash,
+                "idempotency_key": idempotency_key,
+                "purchase_id": f"{_REFUSED_KEY_PREFIX}{reason}",
+                "request_hash": request_hash,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _claim_idempotency_key(
@@ -2004,12 +2061,23 @@ async def start_reap_purchase(
                 market_country=market_country,
             )
         else:
-            eligible = await _eligibility(
-                merchant_domain=merchant_domain,
-                market_country=market_country,
-                product_key=product_key,
-                variant_key=variant_key,
-            )
+            try:
+                eligible = await _eligibility(
+                    merchant_domain=merchant_domain,
+                    market_country=market_country,
+                    product_key=product_key,
+                    variant_key=variant_key,
+                )
+            except svc.PurchaseRefused as exc:
+                # The key remembers this refusal, so a retry after the merchant is enabled does
+                # not open a second purchase beside a cart-link one (`_tombstone_idempotency_key`).
+                if idempotency_key:
+                    await _tombstone_idempotency_key(
+                        agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash,
+                        idempotency_key=idempotency_key, request_hash=request_hash,
+                        reason=exc.reason,
+                    )
+                raise
             row = await _load_catalog_row(
                 merchant_domain=merchant_domain,
                 storefront_host=merchant_host,
