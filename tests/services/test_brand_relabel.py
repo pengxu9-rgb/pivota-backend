@@ -164,6 +164,7 @@ class DB:
 
     async def fetch_all(self, sql, v):
         assert "external_product_seeds" in sql and "id = ANY(:ids)" in sql
+        assert all(isinstance(i, str) for i in v["ids"])  # TEXT ids (mig 044), never cast
         done = []
         for sid in v["ids"]:
             pk, brand = self.seeds.get(sid, (None, None))
@@ -175,25 +176,25 @@ class DB:
 
 async def test_the_write_moves_brand_key_group_and_seed_and_the_revert_puts_them_back():
     a = row("ext:retailer:a")
-    db = DB([a], seeds={1: ["ext:retailer:a", "ETUDE HOUSE"], 2: ["ext:retailer:a", "ETUDE"]})
-    m = rl.manifest_for(rl.plan_relabel([a], [a], CANON, {"ext:retailer:a": [1]}))
+    db = DB([a], seeds={"seed:catalog_enrichment_agent_v1:aa01": ["ext:retailer:a", "ETUDE HOUSE"], "seed:catalog_enrichment_agent_v1:bb02": ["ext:retailer:a", "ETUDE"]})
+    m = rl.manifest_for(rl.plan_relabel([a], [a], CANON, {"ext:retailer:a": ["seed:catalog_enrichment_agent_v1:aa01"]}))
     counts = await rl.write_moves(db, m["moves"])
     assert counts == {"products": 1, "groups": 1, "seeds": 1}
     mv = m["moves"][0]
     assert db.rows["ext:retailer:a"] == {"brand": "ETUDE", "content_key": mv["to_ck"]}
     assert db.groups[(a["merchant_id"], "external_seed", a["source_product_id"])] == mv["to_pg"]
-    assert db.seeds[1] == ["ext:retailer:a", "ETUDE"]
+    assert db.seeds["seed:catalog_enrichment_agent_v1:aa01"] == ["ext:retailer:a", "ETUDE"]
     await rl.write_moves(db, m["moves"], reverse=True)
     assert db.rows["ext:retailer:a"] == {"brand": "ETUDE HOUSE", "content_key": a["content_key"]}
     assert db.groups[(a["merchant_id"], "external_seed", a["source_product_id"])] == a["product_group_id"]
-    assert db.seeds[1] == ["ext:retailer:a", "ETUDE HOUSE"]
-    assert db.seeds[2] == ["ext:retailer:a", "ETUDE"]  # never read under the old spelling: untouched both ways
+    assert db.seeds["seed:catalog_enrichment_agent_v1:aa01"] == ["ext:retailer:a", "ETUDE HOUSE"]
+    assert db.seeds["seed:catalog_enrichment_agent_v1:bb02"] == ["ext:retailer:a", "ETUDE"]  # never read under the old spelling: untouched both ways
 
 
 async def test_a_seed_that_changed_since_the_plan_aborts_the_write():
     a = row("ext:retailer:a")
-    db = DB([a], seeds={1: ["ext:retailer:a", "re-crawled to something else"]})
-    m = rl.manifest_for(rl.plan_relabel([a], [a], CANON, {"ext:retailer:a": [1]}))
+    db = DB([a], seeds={"seed:catalog_enrichment_agent_v1:aa01": ["ext:retailer:a", "re-crawled to something else"]})
+    m = rl.manifest_for(rl.plan_relabel([a], [a], CANON, {"ext:retailer:a": ["seed:catalog_enrichment_agent_v1:aa01"]}))
     with pytest.raises(RuntimeError, match="seed"):
         await rl.write_moves(db, m["moves"])
 
@@ -260,11 +261,11 @@ async def test_load_never_offers_a_row_already_spelt_canonically():
                 return [row("ext:retailer:a"), row("ext:retailer:c", brand="ETUDE")]
             if "external_product_seeds" in sql:
                 assert v["pks"] == ["ext:retailer:a"]
-                return [{"id": 7, "attached_product_key": "ext:retailer:a", "brand": "ETUDE HOUSE"},
-                        {"id": 8, "attached_product_key": "ext:retailer:a", "brand": "ETUDE"}]
+                return [{"id": "seed:catalog_enrichment_agent_v1:aa01", "attached_product_key": "ext:retailer:a", "brand": "ETUDE HOUSE"},
+                        {"id": "seed:catalog_enrichment_agent_v1:bb02", "attached_product_key": "ext:retailer:a", "brand": "ETUDE"}]
             return []
     rows, _, seeds = await rl.load(LoadDB(), ["etudehouse", "etude"], CANON)
-    assert seeds == {"ext:retailer:a": ["7"]}  # only the seed under the row's own (old) spelling
+    assert seeds == {"ext:retailer:a": ["seed:catalog_enrichment_agent_v1:aa01"]}  # only the seed under the row's own (old) spelling
     assert [r["product_key"] for r in rows] == ["ext:retailer:a"]
 
 
@@ -380,3 +381,87 @@ async def test_refresh_rebuilds_every_key_trusts_every_row_on_them_and_lists_fai
     assert ("reap", "ck_a") in calls and out["reaped"] == 1
     assert calls[-1] == ("trust", ("p_moved", "p_canonical_already_there")) and out["trust"] == 2
     assert [f["content_key"] for f in out["failed_keys"]] == ["ck_bad"] and out["recomputed"] == 2
+
+
+
+async def test_apply_stores_the_manifest_before_any_write_and_prints_no_manifest_line(monkeypatch, capsys):
+    import scripts.relabel_retailer_brand as cli
+    events = []
+
+    class FakeDatabase:
+        async def connect(self): events.append("connect")
+        async def disconnect(self): events.append("disconnect")
+
+    async def load(db, spellings, canonical):
+        return [row("ext:retailer:a")], [row("ext:retailer:a")], {}
+
+    async def store(db, manifest):
+        events.append(("store", manifest["run_id"]))
+
+    async def write(db, moves, reverse=False, run_id=None):
+        assert run_id and run_id.startswith("relabel_")  # the applied event is written with the moves
+        events.append(("write", len(moves)))
+        return {"products": len(moves), "groups": 1, "seeds": 0}
+
+    async def refresh(db, moves, **kw):
+        events.append("refresh")
+        return {}
+    monkeypatch.setattr(cli, "database", FakeDatabase())
+    monkeypatch.setattr(rl, "load", load)
+    monkeypatch.setattr(rl, "store_manifest", store)
+    monkeypatch.setattr(rl, "write_moves", write)
+    monkeypatch.setattr(rl, "refresh_after", refresh)
+    import argparse
+    await cli.run(argparse.Namespace(command="plan", family="etude", apply=True, manifest=None, run_id=None,
+                                     reverse=False))
+    kinds = [e[0] if isinstance(e, tuple) else e for e in events]
+    assert kinds == ["connect", "store", "write", "refresh", "disconnect"]
+    out = capsys.readouterr().out
+    assert "MANIFEST STORED run_id=relabel_" in out and '"moves": [' not in out  # never the whole manifest
+
+
+async def test_revert_by_run_id_reads_the_stored_manifest(monkeypatch):
+    import argparse
+    import scripts.relabel_retailer_brand as cli
+    seen = []
+
+    class FakeDatabase:
+        async def connect(self): pass
+        async def disconnect(self): pass
+
+    async def load_manifest(db, run_id):
+        seen.append(run_id)
+        return {"run_id": run_id, "moves": [{"from_ck": "a", "to_ck": "b"}]}
+
+    async def write(db, moves, reverse=False, run_id=None):
+        seen.append(("write", reverse, run_id))
+        return {}
+
+    async def refresh(db, moves, **kw):
+        seen.append(("refresh", kw["reverse"]))
+        return {}
+    monkeypatch.setattr(cli, "database", FakeDatabase())
+    monkeypatch.setattr(rl, "load_manifest", load_manifest)
+    monkeypatch.setattr(rl, "write_moves", write)
+    monkeypatch.setattr(rl, "refresh_after", refresh)
+    await cli.run(argparse.Namespace(command="revert", family=None, apply=False, manifest=None,
+                                     run_id="relabel_x", reverse=False))
+    assert seen == ["relabel_x", ("write", True, "relabel_x"), ("refresh", True)]
+
+
+async def test_store_manifest_raises_when_nothing_was_stored():
+    class DB:
+        async def fetch_one(self, sql, v):
+            assert "identity_resolution_events" in sql and v["action"] == rl.MANIFEST_ACTION
+            return None
+    with pytest.raises(RuntimeError, match="not stored"):
+        await rl.store_manifest(DB(), {"run_id": "relabel_x", "moves": []})
+
+
+
+def test_status_lines_are_bounded():
+    import scripts.relabel_retailer_brand as cli
+    failed = [{"content_key": f"ck_{i}", "error": "x" * 200} for i in range(606)]
+    out = cli.bounded({"refreshed": 0, "failed_keys": failed})
+    assert out["failed_keys_total"] == 606 and len(out["failed_keys"]) == cli.FAILED_KEYS_SHOWN
+    assert len(rl.dumps(out)) < 100_000

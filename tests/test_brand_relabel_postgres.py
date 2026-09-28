@@ -46,7 +46,12 @@ async def db():
                 platform_product_id TEXT NOT NULL, is_primary BOOLEAN, updated_at TIMESTAMPTZ,
                 UNIQUE (merchant_id, platform, platform_product_id));
             CREATE TABLE {_SCHEMA}.external_product_seeds (
-                id BIGSERIAL PRIMARY KEY, attached_product_key TEXT, seed_data JSONB, updated_at TIMESTAMPTZ);
+                -- TEXT, as in prod (mig 044: "seed:catalog_enrichment_agent_v1:<hex>"); an integer stub hid a cast
+                id TEXT PRIMARY KEY DEFAULT ('seed:catalog_enrichment_agent_v1:' || md5(random()::text)),
+                attached_product_key TEXT, seed_data JSONB, updated_at TIMESTAMPTZ);
+            CREATE TABLE {_SCHEMA}.identity_resolution_events (
+                id BIGSERIAL PRIMARY KEY, proposal_id TEXT NULL, action TEXT NOT NULL, run_id TEXT NOT NULL,
+                detail JSONB NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
         """)
     finally:
         await conn.close()
@@ -180,3 +185,69 @@ async def test_a_revert_is_all_or_nothing(db):
     with pytest.raises(RuntimeError, match="drift"):
         await rl.write_moves(db, manifest["moves"], reverse=True)
     assert await _state(db) == moved  # row a stayed relabelled with b
+
+
+
+async def test_a_manifest_larger_than_a_log_line_round_trips_through_the_database(db):
+    """Cloud Logging cut the first ETUDE apply's 303-move manifest at 100 KB (2026-09-28): it is stored in
+    identity_resolution_events instead, and read back whole."""
+    moves = [{"product_key": f"ext:retailer:{i:040x}", "from_brand": "ETUDE HOUSE", "to_brand": "ETUDE",
+              "from_ck": f"ck_{i:032x}", "to_ck": f"ck_{i + 1:032x}", "from_pg": f"pg_{i:032x}",
+              "to_pg": f"pg_{i + 1:032x}", "merchant_id": "merch_obs_luxiface", "platform": "external_seed",
+              "spid": f"retailer:{i:040x}", "seed_ids": [f"seed:catalog_enrichment_agent_v1:{i:016x}"]}
+             for i in range(400)]
+    manifest = {"run_id": "relabel_big", "canonical": "ETUDE", "at": "t", "moves": moves}
+    assert len(json.dumps(manifest)) > 102400
+    await rl.store_manifest(db, manifest)
+    assert await rl.load_manifest(db, "relabel_big") == manifest
+    with pytest.raises(SystemExit):
+        await rl.load_manifest(db, "relabel_missing")
+
+
+
+async def test_only_a_run_whose_write_committed_can_be_reverted_and_only_once(db):
+    """Review of #2436: run A stored its manifest and failed; retry B (same moves) applied. Reverting A must not
+    undo B's rows under A's id."""
+    await _product(db, "ext:retailer:a", "ETUDE HOUSE", "Fixing Tint", "luxiface.com")
+    a = await _plan(db)
+    await rl.store_manifest(db, a)
+    await db.execute("UPDATE catalog_products SET brand = 'drifted' WHERE product_key = 'ext:retailer:a'")
+    with pytest.raises(RuntimeError, match="drift"):
+        await rl.write_moves(db, a["moves"], run_id=a["run_id"])
+    await db.execute("UPDATE catalog_products SET brand = 'ETUDE HOUSE' WHERE product_key = 'ext:retailer:a'")
+    b = await _plan(db)
+    await rl.store_manifest(db, b)
+    await rl.write_moves(db, b["moves"], run_id=b["run_id"])
+    applied = await _state(db)
+    with pytest.raises(RuntimeError, match="never applied"):
+        await rl.write_moves(db, (await rl.load_manifest(db, a["run_id"]))["moves"], reverse=True, run_id=a["run_id"])
+    assert await _state(db) == applied
+    await rl.write_moves(db, b["moves"], reverse=True, run_id=b["run_id"])
+    with pytest.raises(RuntimeError, match="already reverted"):
+        await rl.write_moves(db, b["moves"], reverse=True, run_id=b["run_id"])
+    events = await db.fetch_all("SELECT action, run_id FROM identity_resolution_events ORDER BY id")
+    assert [(e["action"], e["run_id"]) for e in events] == [
+        ("brand_relabel_manifest", a["run_id"]), ("brand_relabel_manifest", b["run_id"]),
+        ("brand_relabel_applied", b["run_id"]), ("brand_relabel_reverted", b["run_id"])]
+
+
+async def test_a_failed_write_records_no_applied_event(db):
+    await _product(db, "ext:retailer:a", "ETUDE HOUSE", "Fixing Tint", "luxiface.com")
+    a = await _plan(db)
+    await db.execute("UPDATE product_group_members SET product_group_id = 'pg_moved'")
+    with pytest.raises(RuntimeError):
+        await rl.write_moves(db, a["moves"], run_id=a["run_id"])
+    assert await db.fetch_all("SELECT 1 FROM identity_resolution_events WHERE action = 'brand_relabel_applied'") == []
+
+
+async def test_the_applied_event_commits_with_the_write_or_neither_does(db):
+    """If recording "applied" fails, the relabel must roll back with it -- a committed write with no applied
+    event could never be reverted by run id."""
+    await _product(db, "ext:retailer:a", "ETUDE HOUSE", "Fixing Tint", "luxiface.com")
+    a = await _plan(db)
+    before = await _state(db)
+    await db.execute("ALTER TABLE identity_resolution_events ADD CONSTRAINT no_applied "
+                     "CHECK (action <> 'brand_relabel_applied')")
+    with pytest.raises(Exception):
+        await rl.write_moves(db, a["moves"], run_id=a["run_id"])
+    assert await _state(db) == before
