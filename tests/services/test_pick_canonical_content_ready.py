@@ -10,6 +10,7 @@ just withdrawn, arencia's JP seeds. The rows below are shaped like those.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -26,7 +27,8 @@ WITHDRAWN = datetime(2026, 9, 28, 0, 29, tzinfo=timezone.utc)
 
 def _row(product_key, *, host, description=REAL_COPY, image="https://cdn.example/i.jpg", sig=SIG,
          primary=True, sync_status="live", suppressed_at=None, platform="external_seed", brand="MISSHA"):
-    return {"product_key": product_key, "source_domain": host, "brand": brand, "description": description,
+    return {"product_key": product_key, "source_domain": host, "brand": brand, "title": TITLE_ONLY,
+            "description": description,
             "image_url": image, "pivota_signature_id": sig, "group_is_primary": primary,
             "sync_status": sync_status, "suppressed_at": suppressed_at, "platform": platform,
             "canonical_url": f"https://{host}/products/x", "has_brand_direct_offer": False}
@@ -142,3 +144,164 @@ async def test_the_loader_selects_the_fields_the_bar_reads():
     for column in ("cp.description", "cp.image_url", "cp.pivota_signature_id", "cp.sync_status",
                    "cp.suppressed_at"):
         assert column in db.sql
+
+
+def test_a_failing_primary_row_loses_to_a_passing_non_primary_one():
+    """Rung 0c sits ABOVE is_primary and the signature rung: the gate blocks the key whatever the group says."""
+    primary_thin = _row("ext:retailer:0000", host="a.example", description=TITLE_ONLY, primary=True)
+    other = _row("ext:retailer:9999", host="b.example", primary=False)
+    assert pick_canonical([primary_thin, other]) is other
+
+
+def test_a_row_without_a_title_is_not_content_ready():
+    """assemble_row builds nothing without a title, so such a winner would leave the key unbuilt."""
+    titled = _row("ext:retailer:9999", host="b.example")
+    for blank in ("", "   ", None):
+        untitled = dict(titled, product_key="ext:retailer:0000", title=blank)
+        assert pick_canonical([untitled, titled]) is titled
+
+
+# -- what the row would SERVE: overlay, then its own column, then the seed (review #2423) ------------
+
+OVERLAY_COPY = "Pivota enrichment copy. " * 30  # an executor overlay, 720 chars
+SEED = {"image_url": None, "seed_data": {"description": "Seed copy for the product, " * 8}}
+
+
+def _titled(pk, host, **kw):
+    r = _row(pk, host=host, **kw)
+    r["title"] = "MISSHA Artemisia Pack Foam Cleanser 150ml"
+    r.update(merchant_id=f"m-{host}", platform="shopify", source_product_id=f"sp-{pk[-4:]}")
+    return r
+
+
+def _overlays(*pairs):
+    return {(r["merchant_id"], r["platform"], r["source_product_id"]): o for r, o in pairs}
+
+
+def test_a_thin_row_whose_overlay_serves_real_copy_keeps_the_pick():
+    thin = _titled("ext:retailer:0000", "a.example", description="Brand serum 30ml.")  # 17 chars raw
+    sixty = _titled("ext:retailer:9999", "b.example", description="x" * 60)
+    rows = [thin, sixty]
+    assembler.annotate_served_copy(rows, None, _overlays((thin, {"description_markdown": OVERLAY_COPY})), False)
+    assert pick_canonical(rows) is thin
+
+
+def test_without_its_overlay_the_same_thin_row_loses():
+    thin = _titled("ext:retailer:0000", "a.example", description="Brand serum 30ml.")
+    sixty = _titled("ext:retailer:9999", "b.example", description="x" * 60)
+    rows = [thin, sixty]
+    assembler.annotate_served_copy(rows, None, {}, False)
+    assert pick_canonical(rows) is sixty
+
+
+def test_a_brand_attested_overlay_serves_whichever_row_wins_so_it_reorders_nothing():
+    thin = _titled("ext:retailer:0000", "a.example", description="Brand serum 30ml.")
+    sixty = _titled("ext:retailer:9999", "b.example", description="x" * 60)
+    rows = [thin, sixty]
+    attested = {"description_markdown": OVERLAY_COPY, "updated_by_employee_id": "brand_attestation"}
+    assembler.annotate_served_copy(rows, None, _overlays((sixty, attested)), False)
+    assert pick_canonical(rows) is thin  # both serve the attested copy: the old ladder decides
+
+
+def test_the_seed_description_fills_a_row_with_none_of_its_own():
+    """coalesce_first skips an EMPTY description, so the seed's copy is what that row serves."""
+    empty = _titled("ext:retailer:0000", "a.example", description="")
+    sixty = _titled("ext:retailer:9999", "b.example", description="x" * 60)
+    rows = [empty, sixty]
+    assembler.annotate_served_copy(rows, SEED, {}, False)
+    assert pick_canonical(rows) is empty
+
+
+def test_the_seed_image_fills_a_row_with_none_of_its_own():
+    no_image = _titled("ext:retailer:0000", "a.example", image=None)
+    other = _titled("ext:retailer:9999", "b.example")
+    rows = [no_image, other]
+    assembler.annotate_served_copy(rows, {"image_url": "https://cdn.example/seed.jpg", "seed_data": {}}, {}, False)
+    assert pick_canonical(rows) is no_image
+    assembler.annotate_served_copy(rows, None, {}, False)
+    assert pick_canonical(rows) is other
+
+
+def test_a_failed_overlay_read_never_demotes_on_copy_but_still_on_suppression():
+    thin = _titled("ext:retailer:0000", "a.example", description="Brand serum 30ml.")
+    sixty = _titled("ext:retailer:9999", "b.example", description="x" * 60)
+    rows = [thin, sixty]
+    assembler.annotate_served_copy(rows, None, {}, True)
+    assert pick_canonical(rows) is thin
+    thin["suppressed_at"] = WITHDRAWN
+    assert pick_canonical(rows) is sixty
+
+
+def test_the_enrichment_pick_reuses_the_overlays_it_is_handed(monkeypatch):
+    import db.product_enrichment
+
+    async def _no_read(*a, **kw):
+        raise AssertionError("overlays were already read")
+
+    monkeypatch.setattr(db.product_enrichment, "get_enrichments_for_products", _no_read)
+    thin = _titled("ext:retailer:0000", "a.example", description="Brand serum 30ml.")
+    overlay = {"description_markdown": OVERLAY_COPY}
+    assembler.annotate_served_copy([thin], None, _overlays((thin, overlay)), False)
+    assert asyncio.run(assembler._fetch_enrichment_for_canonical([thin])) is overlay
+    assembler.annotate_served_copy([thin], None, {}, True)  # the read failed: say so, as before
+    assert asyncio.run(assembler._fetch_enrichment_for_canonical([thin])) is assembler.FETCH_FAILED
+
+
+def test_the_rebuild_serves_the_overlay_row_and_reads_overlays_once(monkeypatch):
+    """End to end through refresh_agent_pdp_view_for_content_key: every pick in the rebuild (the
+    evidence scope, assemble_row, the enrichment pick) sees the annotated rows."""
+    import db.product_enrichment
+
+    thin = _titled("ext:retailer:0000", "a.example", description="Brand serum 30ml.")
+    sixty = _titled("ext:retailer:9999", "b.example", description="y" * 60)
+    reads = []
+
+    async def _bulk(merchant_id, *, product_keys=None, geo_code="default"):
+        reads.append(merchant_id)
+        if merchant_id == thin["merchant_id"]:
+            return {(thin["platform"], thin["source_product_id"]): {"description_markdown": OVERLAY_COPY}}
+        return {}
+
+    async def _rows(*a, **kw):
+        return [dict(thin), dict(sixty)]
+
+    async def _empty(*a, **kw):
+        return []
+
+    async def _none(*a, **kw):
+        return None
+
+    async def _no_evidence(*a, **kw):
+        return {}
+
+    monkeypatch.setattr(db.product_enrichment, "get_enrichments_for_products", _bulk)
+    monkeypatch.setattr(assembler, "fetch_products_for_key", _rows)
+    monkeypatch.setattr(assembler, "fetch_skus_for_keys", _empty)
+    monkeypatch.setattr(assembler, "fetch_offers_for_keys", _empty)
+    monkeypatch.setattr(assembler, "fetch_external_seed_for_keys", _none)
+    monkeypatch.setattr(assembler, "fetch_evidence_for_keys", _no_evidence)
+
+    class _DB:
+        params = None
+
+        async def execute(self, sql, params):
+            self.params = params
+
+        async def fetch_one(self, sql, params):
+            return None
+
+    db = _DB()
+    assert asyncio.run(assembler.refresh_agent_pdp_view_for_content_key("ck_x", refresh_source="t", db=db))
+    assert db.params["description"].startswith("Pivota enrichment copy.")
+    assert sorted(reads) == sorted({thin["merchant_id"], sixty["merchant_id"]})  # once per merchant
+
+
+def test_the_identity_keepers_load_what_the_bar_reads():
+    """same_url_dup / junk_url / the tier-3 judge pick their keeper with pick_canonical and are
+    auto-approved: a keeper the bar cannot see would suppress the row that serving picked."""
+    from scripts.step5_lane2_same_url_dedup import DETAIL_SQL
+    from services.identity_reconcile_sweep import JUDGE_ROWS_SQL
+
+    for sql in (DETAIL_SQL, JUDGE_ROWS_SQL):
+        for column in ("title", "description", "image_url", "sync_status", "suppressed_at", "pivota_signature_id"):
+            assert column in sql

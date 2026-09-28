@@ -136,7 +136,9 @@ LIMIT $1
 
 JUDGE_ROWS_SQL = """
 SELECT product_key, title, brand, canonical_url, source_ref, platform,
-       pivota_signature_id, source_product_id
+       pivota_signature_id, source_product_id,
+       -- pick_canonical's content bar (rung 0c) reads these (see DETAIL_SQL)
+       description, image_url, sync_status, suppressed_at
 FROM catalog_products
 WHERE product_key = ANY($1::text[])
 """

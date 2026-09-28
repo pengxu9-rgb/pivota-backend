@@ -48,6 +48,7 @@ from services.agent_pdp_view_assembler import (  # noqa: E402
     fetch_offers_for_keys,
     fetch_products_for_key,
     fetch_skus_for_keys,
+    load_served_copy,
     to_jsonb,
 )
 
@@ -192,6 +193,9 @@ async def _build_apv_offer_field_update(
     skus = await fetch_skus_for_keys(product_keys, db=db)
     offers = await fetch_offers_for_keys(product_keys, db=db)
     external_seed = await fetch_external_seed_for_keys(product_keys, db=db)
+    # The same served canonical the rebuild picks: pick_canonical judges each row by what it
+    # would serve (overlay included), so the rows must be annotated the way the rebuild does.
+    await load_served_copy(products, external_seed)
 
     # `offers` IS an overlay-carrying column. This script's UPDATE replaces the
     # whole array (`offers = CAST(:offers AS jsonb)`) and the W8 seller-trust
