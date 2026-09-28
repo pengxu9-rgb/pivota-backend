@@ -25,6 +25,9 @@ live (review of #2397 -- the drain's re-run drops unresolved rows, excluded hand
 rows, and a job can sit held for review; measured 2026-09-27, 72 of stilacosmetics.com's 125 records
 were unresolved, so retiring first would have hidden them). Both rows of a pair serving for a while is
 the status quo; a missing product is not. --before-rewrite restores the old order explicitly.
+Live is not served: a stale key whose old row is serving_eligible is also kept while its new key's
+content_key is not (e.g. blocked on short_description) -- reported as NEW NOT SERVING, retired on a later
+run once the new row serves.
 
 (Formerly: run this BEFORE the re-onboard.) The two key sets are disjoint, so a suppressed
 stale SKU cannot collide with a new one (`_SKU_SUPPRESSED_IDENTITY_SQL` guards on a
@@ -77,7 +80,7 @@ from services.curated_brand_feed import records_for_brand  # noqa: E402
 REASON = "brand_attribution_key_supersede"
 
 LIVE_ROWS_SQL = """
-SELECT product_key, merchant_id, brand, title, source_domain, suppression_reason, suppressed_at,
+SELECT product_key, merchant_id, brand, title, source_domain, content_key, suppression_reason, suppressed_at,
        suppression_metadata
 FROM catalog_products
 WHERE product_key = ANY(:keys)
@@ -91,6 +94,14 @@ SET suppression_reason = :reason,
     updated_at = NOW()
 WHERE product_key = ANY(:keys)
   AND suppression_reason IS NULL
+"""
+
+# Serving is decided per content_key, not per product_key: a row is on the storefront only while its
+# content_key is serving_eligible. A content_key with no state row, or a NULL flag, is not serving. The flag
+# is read, not filtered on, so `plan` decides it in code the tests exercise.
+SERVING_SQL = """
+SELECT content_key, serving_eligible FROM index_pipeline_state
+WHERE content_key = ANY(:keys)
 """
 
 SEEDS_FOR_KEYS_SQL = """
@@ -157,20 +168,32 @@ def _host(value: Optional[str]) -> str:
 
 
 def select_retirable(cohort: List[Dict[str, Any]], rows: Dict[str, Dict[str, Any]], new_live: set,
-                     domain: str, *, before_rewrite: bool = False) -> Dict[str, List[Dict[str, Any]]]:
+                     domain: str, *, serving: set, before_rewrite: bool = False) -> Dict[str, List[Dict[str, Any]]]:
     """Pure: split the cohort into what may be tombstoned and why the rest may not.
 
     A stale key is retirable only when it is present and live, owned by THIS store (derive_product_key
     hashes (brand, title) only, so the same key can belong to another source -- never touch it), and,
-    unless before_rewrite, its new key is already live (the re-run actually wrote the product)."""
+    unless before_rewrite, its new key is already live (the re-run actually wrote the product).
+
+    `serving`: the product_keys (stale and new) whose content_key is serving_eligible. Required, so no
+    caller can skip the check. A live new key is not enough when the old row is the one on the storefront:
+    if the new row is blocked (short_description, ...) retiring the old row takes a served product off the
+    catalog (hand-checked per store 2026-09-28). Such a key is kept as `new_not_serving`. An old row that is
+    not serving loses nothing and is still retired. before_rewrite skips this with the new-key-live check:
+    the old order accepts the gap explicitly."""
     host = _host(domain)
     present = [c for c in cohort if c["stale_key"] in rows]
-    live = [c for c in present if not rows[c["stale_key"]].get("suppression_reason")]
+    suppressed = [c for c in present if rows[c["stale_key"]].get("suppression_reason")]
+    live = [c for c in present if c not in suppressed]
     foreign = [c for c in live if _host(rows[c["stale_key"]].get("source_domain")) != host]
     own = [c for c in live if c not in foreign]
     waiting = [] if before_rewrite else [c for c in own if c["new_key"] not in new_live]
-    retire = [c for c in own if c not in waiting]
-    return {"present": present, "live": retire, "foreign": foreign, "waiting_for_new_key": waiting}
+    new_not_serving = [] if before_rewrite else [
+        c for c in own if c not in waiting and c["stale_key"] in serving and c["new_key"] not in serving
+    ]
+    retire = [c for c in own if c not in waiting and c not in new_not_serving]
+    return {"present": present, "live": retire, "foreign": foreign, "waiting_for_new_key": waiting,
+            "new_not_serving": new_not_serving, "already_suppressed": suppressed}
 
 
 async def plan(domain: str, brand: str, category_path: str,
@@ -185,7 +208,16 @@ async def plan(domain: str, brand: str, category_path: str,
     # under the same (brand, title) key proves nothing about the re-run (re-review of #2397).
     new_live = {r["product_key"] for r in new_rows
                 if not r.get("suppression_reason") and _host(r.get("source_domain")) == _host(domain)}
-    split = select_retirable(cohort, rows, new_live, domain, before_rewrite=before_rewrite)
+    # One query over both sides' content_keys: the new key's serving state decides whether a retire loses a
+    # product, the old row's whether there is anything to lose. Mapped back to product_keys for the pure split.
+    own_new = {r["product_key"]: r for r in new_rows if r["product_key"] in new_live}
+    ck_of = {k: r.get("content_key") for k, r in {**rows, **own_new}.items() if r.get("content_key")}
+    serving_cks = {
+        r["content_key"] for r in await database.fetch_all(SERVING_SQL, {"keys": sorted(set(ck_of.values()))})
+        if r["serving_eligible"] is True
+    } if ck_of else set()
+    serving = {k for k, ck in ck_of.items() if ck in serving_cks}
+    split = select_retirable(cohort, rows, new_live, domain, serving=serving, before_rewrite=before_rewrite)
     present, live = split["present"], split["live"]
     # Seeds and offers for the keys this run will actually retire -- never a waiting or foreign key, so the
     # plan's counts are true and revert's manifest names only seeds this run deactivates.
@@ -194,6 +226,7 @@ async def plan(domain: str, brand: str, category_path: str,
     offers = await cascade_for_suppressed_product_keys(retire_keys, apply=False) if retire_keys else []
     return {
         "foreign": split["foreign"], "waiting_for_new_key": split["waiting_for_new_key"],
+        "new_not_serving": split["new_not_serving"], "already_suppressed": split["already_suppressed"],
         "domain": domain, "brand_override": brand, "category_path": category_path, "stale_brand": stale_brand,
         "cohort": cohort, "rows": rows, "present": present, "live": live,
         "already_new": sorted(already_new), "seeds": seeds,
@@ -210,8 +243,9 @@ def print_plan(p: Dict[str, Any]) -> None:
     print(f"  present in catalog_products : {len(p['present'])}")
     print(f"  LIVE (would be tombstoned)  : {len(p['live'])}")
     print(f"  WAITING (new key not live)  : {len(p.get('waiting_for_new_key') or [])}  -- never retired")
+    print(f"  NEW NOT SERVING (old served): {len(p.get('new_not_serving') or [])}  -- never retired")
     print(f"  FOREIGN (another source)    : {len(p.get('foreign') or [])}  -- never retired")
-    print(f"  already suppressed          : {len(p['present']) - len(p['live'])}")
+    print(f"  already suppressed          : {len(p.get('already_suppressed') or [])}")
     print(f"  absent from catalog         : {len(p['cohort']) - len(p['present'])}")
     print(f"seeds attached    : {len(p['seeds'])}  (active, would deactivate: {len(p['active_seeds'])})")
     print(f"offers to cascade : {len(p['offers'])}")
