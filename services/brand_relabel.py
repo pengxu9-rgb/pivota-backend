@@ -138,14 +138,33 @@ def plan_relabel(rows: Sequence[Mapping[str, Any]], neighbours: Sequence[Mapping
         if n.get("gtin"):
             by_gtin.setdefault(str(n["gtin"]), []).append(n)
 
-    def group_of(ck: str, *, but: Optional[str] = None) -> Tuple[Optional[str], bool]:
-        # EVERY live row on the key, moving ones included (a case-only "Etude" row being relabelled already sits
-        # on the canonical key in its own group) -- except, when given, the row asking.
-        groups = {n.get("product_group_id") for n in by_ck.get(ck, []) if n["product_key"] != but}
+    def group_of(ck: str) -> Tuple[Optional[str], bool]:
+        # A TARGET key's group, for a row moving onto it: EVERY live row on the key, moving ones included (a
+        # case-only "Etude" row being relabelled already sits on the canonical key in its own group).
+        groups = {n.get("product_group_id") for n in by_ck.get(ck, [])}
         groups.discard(None)
         if len(groups) > 1:
             return None, False
         return (next(iter(groups)) if groups else derive_product_group_id(ck)), True
+
+    def own_key_group(r: Mapping[str, Any]) -> Optional[str]:
+        """The group a row that KEEPS its key belongs in, or None (hold). Read from the rows on the key that are
+        NOT being relabelled -- a moving row's group is itself a candidate for repair, and reading it let two
+        rows swap groups (re-review of #2434). With only moving rows on the key: the key's own group when any
+        of them already has it, else the single group they share. A row alone on its key keeps its group."""
+        cur = r["content_key"]
+        on_key = by_ck.get(cur, [])
+        fixed = {n.get("product_group_id") for n in on_key
+                 if n["product_key"] not in moving and n["product_key"] != r["product_key"]} - {None}
+        if fixed:
+            return next(iter(fixed)) if len(fixed) == 1 else None
+        if not [n for n in on_key if n["product_key"] != r["product_key"]]:
+            return r.get("product_group_id") or derive_product_group_id(cur)
+        groups = {n.get("product_group_id") for n in on_key} - {None}
+        own = derive_product_group_id(cur)
+        if own in groups or not groups:
+            return own
+        return next(iter(groups)) if len(groups) == 1 else None
 
     decided: Dict[str, Dict[str, Any]] = {}
     for r in rows:
@@ -160,12 +179,10 @@ def plan_relabel(rows: Sequence[Mapping[str, Any]], neighbours: Sequence[Mapping
         if stays:
             # The key stays; the GROUP must be the key's own. A row intake half-moved (this key, an old group)
             # takes the key's group here -- never certified as it stands (review of #2434).
-            to_pg, ok = group_of(cur, but=r["product_key"])
-            if not ok:
+            to_pg = own_key_group(r)
+            if to_pg is None:
                 decided[r["product_key"]] = {**base, "hold": "own_key_in_several_groups"}
                 continue
-            if not any(n["product_key"] != r["product_key"] for n in by_ck.get(cur, [])):
-                to_pg = r.get("product_group_id") or to_pg  # alone on its key: its group is the key's group
             reason = ("case_only" if normalize_brand(r["brand"]) == canon_norm else "brand_only_already_grouped")
             if to_pg != r.get("product_group_id"):
                 reason += "_regrouped"

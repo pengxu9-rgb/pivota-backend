@@ -295,6 +295,28 @@ def test_a_row_whose_own_key_is_split_across_groups_is_held():
     assert only(plan([half], extra=[c1, c2]))["hold"] == "own_key_in_several_groups"
 
 
+def test_two_moving_rows_on_one_key_never_swap_groups():
+    """Re-review of #2434: e1 correctly in pg_K, e2 half-moved into the old spelling's pg_O. Reading each other's
+    group, they swapped. Both belong in the key's own group."""
+    title = "Fixing Tint #01"
+    k = make_content_key("Etude", title)
+    e1 = row("ext:retailer:e1", brand="Etude", title=title, host="theglowbeautyshop.com")
+    e2 = row("ext:retailer:e2", brand="Etude", title=title, host="kbeautymakeup.com",
+             pg=derive_product_group_id(make_content_key("ETUDE HOUSE", title)))
+    assert e1["content_key"] == e2["content_key"] == k
+    p = plan([e1, e2])
+    got = {m["product_key"]: (m["to_pg"], m["reason"]) for m in p["moves"]}
+    assert got == {"ext:retailer:e1": (derive_product_group_id(k), "case_only"),
+                   "ext:retailer:e2": (derive_product_group_id(k), "case_only_regrouped")}
+
+
+def test_moving_rows_on_one_key_in_two_foreign_groups_are_held():
+    title = "Fixing Tint #01"
+    e1 = row("ext:retailer:e1", brand="Etude", title=title, pg="pg_x")
+    e2 = row("ext:retailer:e2", brand="Etude", title=title, host="kbeautymakeup.com", pg="pg_y")
+    assert {h["hold"] for h in plan([e1, e2])["holds"]} == {"own_key_in_several_groups"}
+
+
 def test_a_case_only_row_alone_on_its_key_keeps_its_own_group():
     e = row("ext:retailer:e", brand="Etude", host="theglowbeautyshop.com", pg="pg_custom")
     m = only(plan([e]))
