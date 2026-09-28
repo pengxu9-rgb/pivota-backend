@@ -104,6 +104,7 @@ async def fetch_products_for_key(content_key: str, *, db: Any = None) -> List[Di
           cp.pivota_signature_id,
           cp.canonical_url,
           cp.sync_status,
+          cp.suppressed_at,
           cp.created_at,
           cp.material,
           cp.material_source,
@@ -316,27 +317,41 @@ def _is_retailer_listing(row: Dict[str, Any]) -> bool:
     return str(row.get("product_key") or "").startswith(_RETAILER_LISTING_KEY_PREFIX)
 
 
+def _passes_serving_content_bar(row: Dict[str, Any]) -> bool:
+    """This row, as the winner, would supply content the serving gate accepts, under a signature.
+
+    The gate's own row checks (index_pipeline_state_service: suppressed / not_live / no_image /
+    short_description), read the way the gate reads them -- a set suppressed_at, or a non-empty
+    sync_status other than 'live', refuses; a description is measured stripped -- plus a signature:
+    the winner supplies the served id and canonical URL, so a row that would take the product off
+    serving, or serve it unsigned, is not a content-ready winner (review #2384). The ONE definition
+    both pick_canonical rules below use. Rows missing these fields (callers that do not load them)
+    never pass, so those callers' order is unchanged.
+    """
+    from services.index_pipeline_state_service import MIN_DESCRIPTION_LENGTH
+
+    if row.get("suppressed_at") is not None:
+        return False
+    sync_status = str(row.get("sync_status") or "").strip()
+    if sync_status and sync_status != "live":
+        return False
+    if len(str(row.get("description") or "").strip()) < MIN_DESCRIPTION_LENGTH:
+        return False
+    return bool(str(row.get("image_url") or "").strip() and row.get("pivota_signature_id"))
+
+
 def _is_brand_store_row(row: Dict[str, Any]) -> bool:
     """The brand's own store's copy of the product, with content to serve.
 
     Evidence is what the ingest pipeline already decided about the seller: a brand_direct offer on
     this row (Tier A or B proven at ingest, e.g. saiehello.com for Saie), or a host that IS the
-    brand's domain -- and never a known retailer host. A row the serving gate would refuse (description
-    under MIN_DESCRIPTION_LENGTH, no image) or without a signature never wins here: it would take the
-    product off serving or serve it unsigned. Rows missing these fields (callers that do not
-    load them) are simply not brand-store rows, so their order is unchanged. (A url_audit seed needs
-    no test here: pick_canonical ranks it last before this rule is consulted.)
+    brand's domain -- and never a known retailer host. A row that fails `_passes_serving_content_bar`
+    never wins here: it would take the product off serving or serve it unsigned. (A url_audit seed
+    needs no test here: pick_canonical ranks it last before this rule is consulted.)
     """
     if _is_retailer_listing(row):
         return False
-    from services.index_pipeline_state_service import MIN_DESCRIPTION_LENGTH
-
-    # The serving gate's own bar (index_pipeline_state_service: no_image / short_description), plus
-    # a signature: the winner supplies the served id and canonical URL, so a brand row that would
-    # take the product off serving, or serve it unsigned, never outranks a retailer's (review #2384).
-    if len(str(row.get("description") or "").strip()) < MIN_DESCRIPTION_LENGTH:
-        return False
-    if not str(row.get("image_url") or "").strip() or not row.get("pivota_signature_id"):
+    if not _passes_serving_content_bar(row):
         return False
     from services.offer_seller_identity import brand_owns_domain, host_from_url, is_known_retailer, normalize_host
 
@@ -359,6 +374,15 @@ def pick_canonical(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
           brand's own store row -- westman-atelier.com, naturium.com, tomfordbeauty.com,
           saiehello.com -- sat beside it). Groups without a retailer listing are ordered exactly
           as before.
+      0c. a row that passes `_passes_serving_content_bar` before one that does not. The winner
+          supplies the served description, image, id and canonical URL, and index_pipeline_state
+          gates the whole content_key on its description. Replayed over all 2,897 multi-row
+          content_keys on prod 2026-09-28, 179 change: 38 blocked short_description (koolseoul's
+          title-only rows beside dodoskin/coscorea 1-2k-char copy) and 2 blocked no_image start
+          serving; 135 were served from a SUPPRESSED row (the retired Stila/Tarte/Tower 28
+          old-spelling rows, arencia's JP seeds, the suppressed cocomo.sg row) and move to the live
+          sibling; 4 move off a failing row with no loss of copy. A winner that already passes
+          keeps rank 0, so only a content_key whose current winner fails the bar can change.
       1. product_group_members.is_primary = true  (multi-seller canonical)
       2. catalog_products.pivota_signature_id is set  (indexed surface)
       3. lowest product_key ASC  (stable hash-derived ordering)
@@ -374,12 +398,13 @@ def pick_canonical(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     mixed_with_retailer = any(_is_retailer_listing(r) for r in rows)
 
-    def key(r: Dict[str, Any]) -> Tuple[int, int, int, int, str]:
+    def key(r: Dict[str, Any]) -> Tuple[int, int, int, int, int, str]:
         audit_rank = 1 if r.get("platform") == "url_audit" else 0
         brand_rank = (0 if _is_brand_store_row(r) else 1) if mixed_with_retailer else 0
+        content_rank = 0 if _passes_serving_content_bar(r) else 1
         primary_rank = 0 if r.get("group_is_primary") else 1
         sig_rank = 0 if r.get("pivota_signature_id") else 1
-        return (audit_rank, brand_rank, primary_rank, sig_rank, r.get("product_key") or "")
+        return (audit_rank, brand_rank, content_rank, primary_rank, sig_rank, r.get("product_key") or "")
 
     return sorted(rows, key=key)[0]
 
