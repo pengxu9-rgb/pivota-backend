@@ -7,6 +7,8 @@ a capped crawl and a partial apply stop for a human, and an apply re-runs every 
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import json
+
 import pytest
 
 import scripts.onboard_curated_brands as cli
@@ -357,8 +359,21 @@ async def test_an_interrupted_apply_fails_and_is_never_reapplied(env):
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
     assert out["status"] == "failed" and out["outcome"] == "interrupted"
     assert env.applied == []
-    assert env.ledger.runs == {"run_killed": {"outcome": "interrupted",
+    assert env.ledger.runs == {"run_killed": {"outcome": "interrupted", "checks": None,
                                               "error": env.ledger.runs["run_killed"]["error"]}}
+
+
+async def test_an_interrupted_run_keeps_what_it_recorded_before_it_died(env):
+    """An apply killed mid-retire must keep the reversal manifest it stored before the write: finish_run
+    rewrites the checks column, so the interrupted finish passes the recorded checks back."""
+    kept = {"catalog_write": "started", "stale_brand_retire_manifest": {"run_id": "retire_x", "products": []}}
+    env.ledger.unfinished = {"id": "run_killed", "stage": "apply", "catalog_write": "started", "checks": kept}
+    await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert env.ledger.runs["run_killed"]["checks"] == kept
+    env.ledger.unfinished = {"id": "run_killed2", "stage": "apply", "catalog_write": "started",
+                             "checks": json.dumps(kept)}  # the driver may hand jsonb back as text
+    await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert env.ledger.runs["run_killed2"]["checks"] == kept
 
 
 async def test_an_apply_interrupted_after_its_write_marker_fails_as_may_be_partial(env):

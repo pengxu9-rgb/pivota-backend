@@ -34,6 +34,12 @@ stale SKU cannot collide with a new one (`_SKU_SUPPRESSED_IDENTITY_SQL` guards o
 matching `product_key`, and ours differ) — but retiring first means the storefront is
 never simultaneously serving both rows of a pair.
 
+THE DRAIN RUNS THIS TOO. A retailer-ingest job with options.retire_stale_brand (a brand_official storefront
+re-run under its canonical spelling) retires the old keys itself right after its verified apply, with this
+file's own pieces -- cohort_from_records (on the records the apply wrote), plan_for_cohort, prepare_retire,
+write_retire -- and stores the manifest on the apply run before writing. Undo it with
+`revert --ingest-run rir_...`. The CLI below stays for stores outside the drain and for a deferred retire.
+
 DRY-RUN BY DEFAULT. Nothing is written without --apply.
 
   # 1. plan
@@ -104,6 +110,22 @@ SELECT content_key, serving_eligible FROM index_pipeline_state
 WHERE content_key = ANY(:keys)
 """
 
+# Search is a second surface with its own gate (review of #2426): public recall and discovery read the ROW's
+# catalog_row_trust.serving_decision = 'public' (services/catalog_trust_policy.py), and backend global recall
+# admits only pdp_lifecycle_stage validated/published or NULL (services/pivot_query_service.py; the same list
+# as retailer_ingest.pipeline.BACKEND_RECALL_LIFECYCLE_STAGES). A new row that serves its page but lands as
+# `candidate` or trust-shadowed is not findable. A row with no trust row is not searchable.
+# The PRODUCT's own trust row, joined the way search joins it (PIVOTA-Agent catalogServingIndex.js:
+# subject_type = 'product' AND subject_key = product_key). catalog_row_trust also holds offer / listing /
+# content_key rows whose nullable product_key names the product (mig 136); a public one of those must not
+# make an unsearchable product look searchable (queue review of #2426).
+SEARCHABLE_SQL = """
+SELECT p.product_key FROM catalog_products p
+JOIN catalog_row_trust t ON t.subject_type = 'product' AND t.subject_key = p.product_key
+WHERE p.product_key = ANY(:keys) AND t.serving_decision = 'public'
+  AND (p.pdp_lifecycle_stage IS NULL OR p.pdp_lifecycle_stage IN ('validated', 'published'))
+"""
+
 SEEDS_FOR_KEYS_SQL = """
 SELECT id, status FROM external_product_seeds
 WHERE attached_product_key = ANY(:keys)
@@ -122,10 +144,14 @@ UPDATE catalog_products
 SET suppression_reason = :reason, suppressed_at = CAST(:suppressed_at AS timestamptz),
     suppression_metadata = CAST(:metadata AS jsonb), updated_at = NOW()
 WHERE product_key = :key
+  AND suppression_reason = :retired_reason AND suppression_metadata ->> 'run_id' = :run_id
+RETURNING product_key
 """
 
+# Only a seed on a row this revert restored: a row retired again since (another run) keeps its seed off.
 REACTIVATE_SEED_SQL = """
-UPDATE external_product_seeds SET status = :status, updated_at = NOW() WHERE id = :id
+UPDATE external_product_seeds SET status = :status, updated_at = NOW()
+WHERE id = :id AND attached_product_key = ANY(:keys)
 """
 
 
@@ -153,13 +179,32 @@ async def build_cohort(domain: str, brand: str, category_path: str,
     recs = await records_for_brand(
         domain=domain, category_path=category_path, brand=brand, emit_real_variants=True
     )
-    out: List[Dict[str, Any]] = []
+    return cohort_from_records(recs, brand, stale_brand)
+
+
+def cohort_from_records(recs: List[Dict[str, Any]], brand: str,
+                        stale_brand: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Pure: the cohort of `build_cohort` from records already crawled. The retailer-ingest drain passes the
+    records its apply stage just wrote, so the cohort is the re-run's own crawl -- not a second one."""
+    pairs = []
     for rec in recs:
         pdp = rec.get("pdp") or {}
         title, new_brand = pdp.get("product_name"), pdp.get("brand")
         stale, new = derive_product_key(stale_brand or brand, title), derive_product_key(new_brand, title)
         if stale and new and stale != new:
-            out.append({"stale_key": stale, "new_key": new, "brand": new_brand, "title": title})
+            pairs.append({"stale_key": stale, "new_key": new, "brand": new_brand, "title": title})
+    # A stale key that is ANOTHER record's new key is that product's current row, never an old one: the key
+    # hashes (brand, title) run together, so a sibling brand ("A'pieu Pure Block Sun" re-keyed while "Missha
+    # Pure Block Sun" is written under the stale spelling) or a split ("Tower 28 Beauty" + "Lip Jelly" ==
+    # "Tower 28" + "Beauty Lip Jelly") collides with a live product of the same run (review of #2426).
+    current = {p["new_key"] for p in pairs}
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for p in pairs:
+        if p["stale_key"] in current or p["stale_key"] in seen:
+            continue  # ...and one stale key is one row: variants and repeated titles are not two retires
+        seen.add(p["stale_key"])
+        out.append(p)
     return out
 
 
@@ -168,7 +213,8 @@ def _host(value: Optional[str]) -> str:
 
 
 def select_retirable(cohort: List[Dict[str, Any]], rows: Dict[str, Dict[str, Any]], new_live: set,
-                     domain: str, *, serving: set, before_rewrite: bool = False) -> Dict[str, List[Dict[str, Any]]]:
+                     domain: str, *, serving: set, searchable: set,
+                     before_rewrite: bool = False) -> Dict[str, List[Dict[str, Any]]]:
     """Pure: split the cohort into what may be tombstoned and why the rest may not.
 
     A stale key is retirable only when it is present and live, owned by THIS store (derive_product_key
@@ -180,7 +226,11 @@ def select_retirable(cohort: List[Dict[str, Any]], rows: Dict[str, Dict[str, Any
     if the new row is blocked (short_description, ...) retiring the old row takes a served product off the
     catalog (hand-checked per store 2026-09-28). Such a key is kept as `new_not_serving`. An old row that is
     not serving loses nothing and is still retired. before_rewrite skips this with the new-key-live check:
-    the old order accepts the gap explicitly."""
+    the old order accepts the gap explicitly.
+
+    `searchable`: the same rule for search (public recall/discovery; SEARCHABLE_SQL), which gates on the ROW's
+    trust and lifecycle, not the page's content_key (review of #2426: the O HUI rows landed page-served but
+    `candidate`). Required as well. A key is kept when the retire would lose EITHER surface the old row has."""
     host = _host(domain)
     present = [c for c in cohort if c["stale_key"] in rows]
     suppressed = [c for c in present if rows[c["stale_key"]].get("suppression_reason")]
@@ -189,7 +239,9 @@ def select_retirable(cohort: List[Dict[str, Any]], rows: Dict[str, Dict[str, Any
     own = [c for c in live if c not in foreign]
     waiting = [] if before_rewrite else [c for c in own if c["new_key"] not in new_live]
     new_not_serving = [] if before_rewrite else [
-        c for c in own if c not in waiting and c["stale_key"] in serving and c["new_key"] not in serving
+        c for c in own if c not in waiting and (
+            (c["stale_key"] in serving and c["new_key"] not in serving)
+            or (c["stale_key"] in searchable and c["new_key"] not in searchable))
     ]
     retire = [c for c in own if c not in waiting and c not in new_not_serving]
     return {"present": present, "live": retire, "foreign": foreign, "waiting_for_new_key": waiting,
@@ -213,9 +265,22 @@ async def load_serving(stale_rows: Dict[str, Dict[str, Any]], own_live_new_rows:
     return {k for k, ck in ck_of.items() if ck in serving_cks}
 
 
+async def load_searchable(keys: List[str]) -> set:
+    """The `searchable` set for `select_retirable`: product_keys a public search can return (SEARCHABLE_SQL)."""
+    if not keys:
+        return set()
+    return {r["product_key"] for r in await database.fetch_all(SEARCHABLE_SQL, {"keys": sorted(set(keys))})}
+
+
 async def plan(domain: str, brand: str, category_path: str,
                stale_brand: Optional[str] = None, *, before_rewrite: bool = False) -> Dict[str, Any]:
     cohort = await build_cohort(domain, brand, category_path, stale_brand)
+    return await plan_for_cohort(cohort, domain, brand, category_path, stale_brand, before_rewrite=before_rewrite)
+
+
+async def plan_for_cohort(cohort: List[Dict[str, Any]], domain: str, brand: str, category_path: str,
+                          stale_brand: Optional[str] = None, *, before_rewrite: bool = False) -> Dict[str, Any]:
+    """`plan` for a cohort already built (the CLI crawls; the drain passes the records it applied)."""
     stale_keys = [c["stale_key"] for c in cohort]
     new_keys = [c["new_key"] for c in cohort]
     rows = {r["product_key"]: dict(r) for r in await database.fetch_all(LIVE_ROWS_SQL, {"keys": stale_keys})}
@@ -226,7 +291,9 @@ async def plan(domain: str, brand: str, category_path: str,
     new_live = {r["product_key"] for r in new_rows
                 if not r.get("suppression_reason") and _host(r.get("source_domain")) == _host(domain)}
     serving = await load_serving(rows, [r for r in new_rows if r["product_key"] in new_live])
-    split = select_retirable(cohort, rows, new_live, domain, serving=serving, before_rewrite=before_rewrite)
+    searchable = await load_searchable([*rows, *new_live])
+    split = select_retirable(cohort, rows, new_live, domain, serving=serving, searchable=searchable,
+                             before_rewrite=before_rewrite)
     present, live = split["present"], split["live"]
     # Seeds and offers for the keys this run will actually retire -- never a waiting or foreign key, so the
     # plan's counts are true and revert's manifest names only seeds this run deactivates.
@@ -236,6 +303,10 @@ async def plan(domain: str, brand: str, category_path: str,
     return {
         "foreign": split["foreign"], "waiting_for_new_key": split["waiting_for_new_key"],
         "new_not_serving": split["new_not_serving"], "already_suppressed": split["already_suppressed"],
+        # product_keys (old and new) whose content_key serves, as read BEFORE any write: the drain's read-back
+        # checks a retired key's new row still serves wherever its old row did.
+        "serving": sorted(serving),
+        "searchable": sorted(searchable),
         "domain": domain, "brand_override": brand, "category_path": category_path, "stale_brand": stale_brand,
         "cohort": cohort, "rows": rows, "present": present, "live": live,
         "already_new": sorted(already_new), "seeds": seeds,
@@ -267,11 +338,13 @@ def print_plan(p: Dict[str, Any]) -> None:
         print(f"      keeps  : {c['new_key']}")
 
 
-async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
+def prepare_retire(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The run id, the rows' suppression metadata and the reversal manifest for `p`'s retirable keys, or
+    None when there is nothing to retire. Pure; the caller stores the manifest durably BEFORE `write_retire`
+    (a manifest written after the write cannot describe what it replaced)."""
     keys = [c["stale_key"] for c in p["live"]]
     if not keys:
-        print("nothing live to retire — no write.")
-        return {}
+        return None
     run_id = f"retire_{uuid.uuid4().hex[:12]}"
     metadata = json.dumps({
         "run_id": run_id, "reason": REASON,
@@ -301,6 +374,30 @@ async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
         ],
         "seeds": [{"id": str(s["id"]), "prior_status": s.get("status")} for s in p["active_seeds"]],
     }
+    return {"run_id": run_id, "keys": keys, "metadata": metadata, "manifest": manifest}
+
+
+async def write_retire(prepared: Dict[str, Any]) -> Dict[str, int]:
+    """The tombstone write, one transaction: rows, their active seeds, the offer cascade. Raises (rolled back)
+    unless every key ends suppressed."""
+    keys = prepared["keys"]
+    async with database.transaction():
+        await database.execute(SUPPRESS_SQL, {"reason": REASON, "metadata": prepared["metadata"], "keys": keys})
+        seed_rows = await database.fetch_all(DEACTIVATE_SEEDS_SQL, {"keys": keys})
+        offer_ids = await cascade_for_suppressed_product_keys(keys, apply=True)
+        after = await database.fetch_all(LIVE_ROWS_SQL, {"keys": keys})
+        unsuppressed = [r["product_key"] for r in after if not r["suppression_reason"]]
+        if unsuppressed:
+            raise RuntimeError(f"tombstone did not land on {len(unsuppressed)} row(s): {unsuppressed[:5]}")
+    return {"products": len(keys), "seeds": len(seed_rows), "offers": len(offer_ids)}
+
+
+async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
+    prepared = prepare_retire(p)
+    if not prepared:
+        print("nothing live to retire — no write.")
+        return {}
+    run_id, manifest = prepared["run_id"], prepared["manifest"]
     Path(manifest_path).write_text(json.dumps(manifest, indent=1, default=str))
     print(f"manifest written BEFORE the write: {manifest_path}")
     # AND to stdout. This script's normal home is a Cloud Run Job, whose filesystem dies
@@ -311,25 +408,45 @@ async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
     print("----8<---- MANIFEST BEGIN ----8<----")
     print(json.dumps(manifest, default=str))
     print("----8<---- MANIFEST END ----8<----")
-
-    async with database.transaction():
-        await database.execute(SUPPRESS_SQL, {"reason": REASON, "metadata": metadata, "keys": keys})
-        seed_rows = await database.fetch_all(DEACTIVATE_SEEDS_SQL, {"keys": keys})
-        offer_ids = await cascade_for_suppressed_product_keys(keys, apply=True)
-        after = await database.fetch_all(LIVE_ROWS_SQL, {"keys": keys})
-        unsuppressed = [r["product_key"] for r in after if not r["suppression_reason"]]
-        if unsuppressed:
-            raise RuntimeError(f"tombstone did not land on {len(unsuppressed)} row(s): {unsuppressed[:5]}")
-    counts = {"products": len(keys), "seeds": len(seed_rows), "offers": len(offer_ids)}
+    counts = await write_retire(prepared)
     print(f"applied: {counts}  run_id={run_id}")
     return counts
 
 
+# The manifest the retailer-ingest drain stored on its apply run (services.retailer_ingest.pipeline).
+INGEST_RUN_MANIFEST_SQL = """
+SELECT checks -> 'stale_brand_retire_manifest' AS manifest,
+       checks -> 'stale_brand_retire' ->> 'outcome' AS outcome
+FROM retailer_ingest_runs WHERE id = :id
+"""
+#: A drain retire that never reached its write (services.retailer_ingest.pipeline._retire_stale_brand).
+UNWRITTEN_OUTCOMES = ("nothing_to_retire", "deferred", "error")
+
+
 async def revert(manifest_path: str) -> None:
-    m = json.loads(Path(manifest_path).read_text())
+    await revert_manifest(json.loads(Path(manifest_path).read_text()))
+
+
+async def revert_ingest_run(ingest_run_id: str) -> None:
+    """Revert the old-spelling retire a drain apply run did, from the manifest it stored before writing."""
+    row = await database.fetch_one(INGEST_RUN_MANIFEST_SQL, {"id": ingest_run_id})
+    m = row and row["manifest"]
+    if isinstance(m, str):
+        m = json.loads(m)
+    if not m:
+        raise SystemExit(f"no stale-brand retire manifest on ingest run {ingest_run_id}")
+    if row["outcome"] in UNWRITTEN_OUTCOMES:
+        raise SystemExit(f"ingest run {ingest_run_id}'s retire was {row['outcome']!r}: it wrote nothing to revert")
+    await revert_manifest(m)
+
+
+async def revert_manifest(m: Dict[str, Any]) -> None:
+    """Restore the rows THIS run retired -- only while they still carry its tombstone (reason and run id), so
+    a revert never undoes a later retire of the same key -- and reactivate the seeds on the rows it restored."""
+    restored: List[str] = []
     async with database.transaction():
         for row in m["products"]:
-            await database.execute(UNSUPPRESS_SQL, {
+            back = await database.fetch_one(UNSUPPRESS_SQL, {
                 "key": row["product_key"], "reason": row["prior_suppression_reason"],
                 "suppressed_at": row["prior_suppressed_at"],
                 # `CAST(:metadata AS jsonb)` wants TEXT. The driver hands a jsonb column
@@ -337,10 +454,17 @@ async def revert(manifest_path: str) -> None:
                 # to a text cast fails -- in `revert`, which is the one path that must
                 # not fail. Serialise anything that is not already a string.
                 "metadata": _as_json_text(row["prior_suppression_metadata"]),
+                "retired_reason": m.get("reason") or REASON, "run_id": m["run_id"],
             })
+            if back:
+                restored.append(row["product_key"])
         for s in m.get("seeds") or []:
-            await database.execute(REACTIVATE_SEED_SQL, {"id": s["id"], "status": s["prior_status"]})
-    print(f"reverted run {m['run_id']}: {len(m['products'])} product(s), {len(m.get('seeds') or [])} seed(s). "
+            await database.execute(REACTIVATE_SEED_SQL, {"id": s["id"], "status": s["prior_status"],
+                                                         "keys": restored})
+    skipped = len(m["products"]) - len(restored)
+    print(f"reverted run {m['run_id']}: {len(restored)} product(s)"
+          + (f" ({skipped} no longer carry this run's tombstone, left alone)" if skipped else "")
+          + f", seeds on those rows. "
           "Offer suppression is reverted by services.catalog_offer_suppression.revert_offer_suppression.")
 
 
@@ -348,7 +472,10 @@ async def run(args: argparse.Namespace) -> int:
     await database.connect()
     try:
         if args.command == "revert":
-            await revert(args.manifest)
+            if args.ingest_run:
+                await revert_ingest_run(args.ingest_run)
+            else:
+                await revert(args.manifest)
             return 0
         p = await plan(args.domain, args.brand, args.category, args.stale_brand,
                        before_rewrite=args.before_rewrite)
@@ -377,11 +504,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="the spelling the OLD rows were written under, when the re-run uses another")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--manifest")
+    p.add_argument("--ingest-run", dest="ingest_run",
+                   help="revert: the retailer-ingest apply run (rir_...) whose old-spelling retire to undo")
     a = p.parse_args(argv)
     if a.command != "revert" and not (a.domain and a.brand):
         p.error("--domain and --brand are required")
-    if a.command == "revert" and not a.manifest:
-        p.error("revert requires --manifest")
+    if a.command == "revert" and not (a.manifest or a.ingest_run):
+        p.error("revert requires --manifest or --ingest-run")
     return asyncio.run(run(a))
 
 
