@@ -1934,10 +1934,12 @@ async def _guard_canonical_owner(
 
 #: What the upsert KEEPS on an existing row: `_PDP_UPSERT_SQL`'s DO UPDATE never sets title or description,
 #: so a re-crawl leaves the stored copy (e.g. a description a backfill filled from the product page) in place.
+#: A SUPPRESSED row is left out: a thin re-crawl must not re-stage a tombstone from its stored copy (the
+#: description backfill refuses them for the same reason, #2429); it keeps the plan's stage as before.
 _KEPT_COPY_SQL = """
                 SELECT product_key, title, description
                 FROM catalog_products
-                WHERE product_key = ANY(:keys)
+                WHERE product_key = ANY(:keys) AND suppressed_at IS NULL
                 """
 
 
@@ -1960,7 +1962,14 @@ async def _stage_from_kept_copy(
     kept: a planned row whose category does not resolve stays draft whatever its copy. A new row, or one
     whose stored copy is the planned copy, is untouched and triggers nothing but the one lookup.
 
-    `counts` carries keys only when a stage changed, so an apply with nothing to say reports as before."""
+    `counts["pdp_stage_from_kept_copy_planned"]` tallies PLANNED rows whose stage changed (a row the identity
+    gate or an insert failure later skips is still counted); it is present only when a stage changed, so an
+    apply with nothing to say reports as before.
+
+    Measured before shipping (prod, 2026-09-29, 15,301 live ingest rows): 0 rows are under-staged against
+    their stored copy (nothing to restore), and 0 rows at candidate or above hold a blank title or a
+    description under 50 chars (nothing this demotes on its next re-crawl). The 2,128 stored rows whose stage
+    exceeds what their copy earns all fail only ingestion's category rule, which this does not change."""
     counts: Dict[str, Any] = {}
     pdps = plan.get("pdps") or []
     keys = sorted({str(p.get("product_key")) for p in pdps if p.get("product_key")})
@@ -1994,7 +2003,7 @@ async def _stage_from_kept_copy(
         return plan, counts
     plan = dict(plan)
     plan["pdps"] = out_pdps
-    counts["pdp_stage_from_kept_copy"] = dict(sorted(changed.items()))
+    counts["pdp_stage_from_kept_copy_planned"] = dict(sorted(changed.items()))
     return plan, counts
 
 

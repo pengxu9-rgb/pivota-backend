@@ -303,4 +303,4 @@ async def test_a_recrawl_with_a_thin_body_keeps_the_stage_its_kept_copy_earns(re
         "SELECT description, pdp_lifecycle_stage FROM catalog_products WHERE product_key=:k", {"k": key}))
     assert after["description"] == before["description"]  # the upsert kept the copy...
     assert after["pdp_lifecycle_stage"] == "published"    # ...and the stage now says so
-    assert counts["pdp_stage_from_kept_copy"] == {"draft->published": 1}
+    assert counts["pdp_stage_from_kept_copy_planned"] == {"draft->published": 1}

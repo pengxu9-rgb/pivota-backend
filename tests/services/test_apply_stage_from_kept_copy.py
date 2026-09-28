@@ -42,7 +42,7 @@ def _run(pdps, stored):
 def test_a_thin_recrawl_of_a_row_with_real_copy_keeps_its_published_stage():
     plan, counts, _ = _run([_pdp()], [{"product_key": _pdp()["product_key"], "title": THIN, "description": REAL}])
     assert plan["pdps"][0]["pdp_lifecycle_stage"] == "published"
-    assert counts == {"pdp_stage_from_kept_copy": {"draft->published": 1}}
+    assert counts == {"pdp_stage_from_kept_copy_planned": {"draft->published": 1}}
     assert plan["skus"] == ["kept"]  # the rest of the plan is untouched
 
 
@@ -51,7 +51,7 @@ def test_a_row_that_keeps_THIN_copy_is_not_published_on_the_crawls_word():
     pdp = _pdp(description=REAL, stage="published")
     plan, counts, _ = _run([pdp], [{"product_key": pdp["product_key"], "title": THIN, "description": THIN}])
     assert plan["pdps"][0]["pdp_lifecycle_stage"] == "draft"
-    assert counts == {"pdp_stage_from_kept_copy": {"published->draft": 1}}
+    assert counts == {"pdp_stage_from_kept_copy_planned": {"published->draft": 1}}
 
 
 def test_a_new_row_is_untouched():
@@ -90,3 +90,19 @@ def test_a_blank_stored_title_is_judged_as_the_row_will_hold_it():
 def test_an_empty_plan_does_no_lookup():
     plan, counts, db = _run([], [])
     assert counts == {} and db.calls == []
+
+
+def test_a_new_row_beside_an_existing_one_keeps_its_planned_stage():
+    """Review #2438: the lookup finds the existing row; the NEW row in the same plan has no stored copy and
+    must keep the stage the crawl earned (not be judged against an empty stored copy)."""
+    existing = _pdp()
+    new = _pdp("ext:apieu-honey-milk-lip-oil::2", description=REAL, stage="published")
+    plan, counts, _ = _run([existing, new], [{"product_key": existing["product_key"], "title": THIN, "description": REAL}])
+    assert [p["pdp_lifecycle_stage"] for p in plan["pdps"]] == ["published", "published"]
+    assert plan["pdps"][1] is new
+    assert counts == {"pdp_stage_from_kept_copy_planned": {"draft->published": 1}}
+
+
+def test_a_suppressed_row_is_not_looked_up():
+    from services.catalog_enrichment_agent.apply import _KEPT_COPY_SQL
+    assert "suppressed_at IS NULL" in _KEPT_COPY_SQL
