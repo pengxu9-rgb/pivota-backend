@@ -119,7 +119,7 @@ def _audit_product() -> Dict[str, Any]:
         "pdp_url": "https://www.anua.com/products/heartleaf-toner",
         "vendor": "Anua",
         "product_type": "Toner",
-        "attributes_raw": {"barcode": "8809640733458"},
+        "attributes_raw": {"barcode": "8809640733451"},
     }
 
 
@@ -158,7 +158,7 @@ async def test_audit_door_attach_realigns_content_key_and_plumbs_gtin(fake_db, m
     out = await intake.upsert_audited_sku_to_index("m_anua", _audit_product())
     assert out == resolved_ck
     # R3: the source barcode reached the primitive, canonicalized (GS1 GTIN-14)
-    assert calls[0]["gtin"] == "08809640733458"
+    assert calls[0]["gtin"] == "08809640733451"
     assert calls[0]["door"] == ii.DOOR_URL_AUDIT
     assert calls[0]["merchant_ctx"]["merchant_id"] == "m_anua"
     # ...and is persisted as the gtin match-attribute on the row.
@@ -166,7 +166,7 @@ async def test_audit_door_attach_realigns_content_key_and_plumbs_gtin(fake_db, m
 
     stmt = _catalog_products_stmt(fake_db.executed)
     params = stmt.compile(dialect=postgresql.dialect()).params
-    assert params["gtin"] == "08809640733458"
+    assert params["gtin"] == "08809640733451"
     assert params["content_key"] == resolved_ck
 
 
@@ -258,7 +258,7 @@ def _ba_fields() -> Dict[str, Any]:
 
     return build_catalog_fields(
         "m_brand", "ba-toner-abc123def456",
-        title="Soothing Toner", brand="Anua", gtin="8809640733458",
+        title="Soothing Toner", brand="Anua", gtin="8809640733451",
     )
 
 
@@ -284,14 +284,14 @@ async def test_brand_authored_attach_realigns_content_key(fake_db, monkeypatch):
     assert out == fields["product_key"]
     assert fields["content_key"] == resolved_ck
     # R3: the merchant-supplied GTIN reached the primitive, canonicalized
-    assert calls[0]["gtin"] == "08809640733458"
+    assert calls[0]["gtin"] == "08809640733451"
     assert calls[0]["door"] == ii.DOOR_BRAND_AUTHORED
     # ...and persists as the gtin match-attribute column.
     from sqlalchemy.dialects import postgresql
 
     stmt = _catalog_products_stmt(fake_db.executed)
     params = stmt.compile(dialect=postgresql.dialect()).params
-    assert params["gtin"] == "08809640733458"
+    assert params["gtin"] == "08809640733451"
     assert params["content_key"] == resolved_ck
 
 
@@ -326,7 +326,7 @@ def _plan() -> Dict[str, Any]:
             "use_case_tags": "[]", "lifestyle_tags": "[]", "demographic": None,
             "pdp_lifecycle_stage": None, "pdp_scope": "unverified",
             "pdp_scope_source": None, "content_key": "ck_" + "0" * 32,
-            "barcode": "8809640733458" if brand == "BrandB" else None,
+            "barcode": "8809640733451" if brand == "BrandB" else None,
         }
 
     return {
@@ -374,7 +374,7 @@ async def test_enrichment_door_skip_filters_pdp_and_children(monkeypatch):
     assert pdp_inserts[0]["product_key"] == "pk::2"
     assert pdp_inserts[0]["content_key"] == resolved_ck  # ATTACH re-aligned
     # R3: pk::2's barcode canonicalized into the gtin match-attribute column
-    assert pdp_inserts[0]["gtin"] == "08809640733458"
+    assert pdp_inserts[0]["gtin"] == "08809640733451"
 
 
 @pytest.mark.asyncio
@@ -416,4 +416,4 @@ def test_seed_gtin_reads_top_level_and_variant():
     assert mod._seed_gtin({"variants": [{"barcode": "12345"}]}) == "12345"
     assert mod._seed_gtin({"variants": [{}]}) is None
     assert mod._seed_gtin(None) is None
-    assert mod._seed_gtin({"gtin13": "8809640733458", "barcode": "x"}) == "8809640733458"
+    assert mod._seed_gtin({"gtin13": "8809640733451", "barcode": "x"}) == "8809640733451"

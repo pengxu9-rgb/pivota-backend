@@ -130,7 +130,7 @@ async def test_a_family_of_only_retailer_listings_is_not_joined(family):
 @pytest.mark.asyncio
 async def test_a_different_gtin_on_the_brand_family_blocks_the_join(family):
     family[BRAND_CK] = [{**BRAND_ROW, "gtin": "08809643062982"}]
-    out = await _resolve("Missha Artemisia Calming Ampoule", gtin="8809643069999")
+    out = await _resolve("Missha Artemisia Calming Ampoule", gtin="8809643069991")
     assert out["content_key"] != BRAND_CK
 
 

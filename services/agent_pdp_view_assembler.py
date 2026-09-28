@@ -24,7 +24,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from db.database import database
-from services.catalog_identity import normalize_gtin
+from services.catalog_identity import validated_source_gtin
 from services.claim_safety import ensure_category_disclaimers
 from services.offer_buyability import availability_is_known_unavailable
 from services.source_quarantine import (
@@ -574,9 +574,11 @@ def pick_gtin13(skus: List[Dict[str, Any]]) -> Optional[str]:
     """Pick the canonical 14-char GTIN for the content_key group.
 
     Two failure modes to avoid:
-      1. agent_pdp_view.gtin13 is VARCHAR(14); normalize_gtin passes
-         15+ digit malformed inputs through unchanged. Skip those —
-         they aren't valid GTIN-14.
+      1. A barcode that is not a GTIN. validated_source_gtin owns that rule
+         (GTIN-8/12/13/14, check digit, never all-zero): normalize_gtin alone
+         passes 15+ digits through and zero-pads "0" into a GS1-shaped
+         "00000000000000", which the catalog_products.gtin backfill would hand
+         to the GLOBAL Tier-0 GTIN matcher.
       2. SKUs in the same content_key group can carry different
          barcodes (data noise, or genuine cross-merchant disagreement).
          Pick the modal value so we deterministically converge on the
@@ -588,8 +590,8 @@ def pick_gtin13(skus: List[Dict[str, Any]]) -> Optional[str]:
         bar = s.get("barcode")
         if not bar:
             continue
-        canon = normalize_gtin(str(bar))
-        if not canon or len(canon) != 14:
+        canon = validated_source_gtin(str(bar))
+        if not canon:
             continue
         counts[canon] = counts.get(canon, 0) + 1
     if not counts:

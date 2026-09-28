@@ -2036,3 +2036,93 @@ async def test_prune_tombstone_respects_the_row_cap(
 
     assert stats["catalog_products"] == 0, "2 stale rows must not pass a cap of 1"
     assert stats.get("tombstone_suppressed") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("barcode", "expected_gtin"),
+    [
+        ("0", None),
+        ("00000000", None),
+        ("0000000000000", None),
+        ("00000000000000", None),
+        ("8809640733451", "08809640733451"),
+    ],
+)
+async def test_ingest_standard_products_never_stores_or_matches_an_all_zero_barcode(
+    monkeypatch: pytest.MonkeyPatch,
+    barcode: str,
+    expected_gtin: str | None,
+) -> None:
+    """The real producer: a feed barcode reaches catalog_products.gtin and the
+    GLOBAL Tier-0 lookup through canonical_gtin. normalize_gtin pads "0" into
+    "00000000000000", which _rows_by_gtin would ATTACH on across merchants."""
+    import services.intake_identity as ii
+
+    product_writes = []
+    gtin_lookups = []
+
+    class DummyTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def fake_upsert_by_pk(table, _pk_name, values):
+        if getattr(table, "name", None) == "catalog_products":
+            product_writes.append(dict(values))
+
+    async def fake_rows_by_gtin(gtin14, _prefer_merchant_id):
+        gtin_lookups.append(gtin14)
+        return []
+
+    async def no_rows(*_args, **_kwargs):
+        return []
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def no_child_rows(*_args, **_kwargs):
+        return 0
+
+    monkeypatch.setenv("ENABLE_INTAKE_IDENTITY_SYNC", "1")
+    monkeypatch.setattr(ii, "_rows_by_gtin", fake_rows_by_gtin)
+    monkeypatch.setattr(ii, "_rows_by_content_key", no_rows)
+    monkeypatch.setattr(ii, "_candidates_by_canonical_url", no_rows)
+    monkeypatch.setattr(ii, "_candidates_by_source_id", no_rows)
+    monkeypatch.setattr(ii, "_write_provenance", noop)
+    monkeypatch.setattr(module.database, "transaction", lambda: DummyTransaction())
+    monkeypatch.setattr(module.database, "execute", noop)
+    monkeypatch.setattr(module, "upsert_catalog_merchant", noop)
+    monkeypatch.setattr(module, "_upsert_by_pk", fake_upsert_by_pk)
+    monkeypatch.setattr(module, "_upsert_field_fact", noop)
+    monkeypatch.setattr(module, "_append_snapshot", noop)
+    monkeypatch.setattr(module, "_replace_child_rows_multi", no_child_rows)
+    monkeypatch.setattr(module, "_resolve_catalog_sku_key", _generated_sku_key)
+    monkeypatch.setattr(module, "fold_category_with_llm_fallback", noop)
+    monkeypatch.setattr(module, "_schedule_fashion_enrichment", lambda **_kwargs: None)
+
+    await module.ingest_standard_products(
+        merchant_id="merch_zero_gtin",
+        platform="shopify",
+        product_payloads=[
+            {
+                "id": "prod_zero_gtin",
+                "product_id": "prod_zero_gtin",
+                "merchant_id": "merch_zero_gtin",
+                "platform": "shopify",
+                "title": "Barrier Repair Serum",
+                "vendor": "Acme Skin",
+                "barcode": barcode,
+                "price": 12.0,
+                "currency": "USD",
+                "variants": [{"id": "v1", "title": "Default", "price": 12.0, "inventory_quantity": 2}],
+            }
+        ],
+        source_system="shopify_products_sync",
+        source_ref="batch_zero_gtin",
+    )
+
+    assert [row["gtin"] for row in product_writes] == [expected_gtin]
+    assert gtin_lookups == ([expected_gtin] if expected_gtin else [])
