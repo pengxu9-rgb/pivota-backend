@@ -3144,3 +3144,82 @@ async def test_an_uncanonicalisable_stored_domain_still_closes_as_stored(attribu
          "final_total_minor": 4500, "currency": "USD", "click_id": "clk_leg"}
     )
     assert [c["merchant_id"] for c in attribution.calls] == ["legacy.example."]
+
+
+# ── offer codes on the VARIANT lane (2026-09-28) ─────────────────────────────────────────────
+# The fallback helper is shared with the cart-link lane (tests/reap_cart_link_cases.py carries
+# the full table); these pin that the items quote goes through it too.
+
+
+def _offer_rejected(code):
+    return rc.ReapResponse(ok=False, status=400, error="reap_status_400", error_code=code)
+
+
+def _discounted(amount=-4.25, final=40.75):
+    quote = json.loads(json.dumps(QUOTE_200))
+    quote["amountBreakdown"]["discounts"] = [
+        {"name": "Offer code", "amount": {"amount": amount, "currency": "USD"}}]
+    quote["amountBreakdown"]["finalAmount"] = {"amount": final, "currency": "USD"}
+    return quote
+
+
+async def _to_quoting_with_code(code):
+    purchase_id = await _start(offer_code=code)
+    await _step(purchase_id)  # resolving -> needs_enrollment
+    await _step(purchase_id)  # needs_enrollment -> quoting
+    return purchase_id
+
+
+async def test_the_items_quote_carries_the_code_and_records_the_discount(reap, attribution):
+    purchase_id = await _to_quoting_with_code("SAVE10")
+    reap.calls.clear()
+    reap.request_quote = _ok(_discounted())
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    (call,) = reap.named("request_quote")
+    assert call["offer_code"] == "SAVE10"
+    row = await ledger.get_purchase_internal(purchase_id)
+    assert (row["offer_code_outcome"], row["discount_minor"], row["quoted_total_minor"]) == (
+        "applied", 425, 4075)
+
+
+async def test_the_items_quote_drops_a_refused_code_and_requotes_once(reap, attribution):
+    purchase_id = await _to_quoting_with_code("BOGUS")
+    reap.calls.clear()
+    reap.request_quote = [_offer_rejected("OFFER_CODE_INVALID"), _ok(QUOTE_200)]
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    first, second = reap.named("request_quote")
+    assert first["offer_code"] == "BOGUS" and "offer_code" not in second
+    assert first["items"] == second["items"]
+    # The step re-resolves ONCE, not once per quote.
+    assert reap.sequence().count("resolve_our_row") == 1
+    row = await ledger.get_purchase_internal(purchase_id)
+    assert row["offer_code_outcome"] == "dropped_invalid" and row["quoted_total_minor"] == 4500
+
+
+@pytest.mark.parametrize("resolve_seconds,expect_quotes", [(114.0, 0), (112.0, 1)])
+async def test_a_slow_resolve_leaves_no_budget_for_a_coded_quote(
+    reap, attribution, monkeypatch, resolve_seconds, expect_quotes
+):
+    """B2(a), #2425 review. The variant lane resolves BEFORE it quotes, inside the same step
+    budget (135 s for quoting). A resolve that ate more than 113 s leaves under
+    MIN_QUOTE_BUDGET_S (22 s): the step is released as `quote_budget_exhausted` and NO quote is
+    sent. 112 s is the control: 23 s left, one quote."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(svc, "_monotonic", lambda: clock["now"])
+    purchase_id = await _to_quoting_with_code("SAVE10")
+    reap.calls.clear()
+
+    def _slow_resolve(**kwargs):
+        clock["now"] += resolve_seconds
+        return _resolved()
+
+    reap.resolve_our_row = _slow_resolve
+    reap.request_quote = _ok(_discounted())
+    moved = await _step(purchase_id)
+    assert len(reap.named("request_quote")) == expect_quotes
+    if expect_quotes == 0:
+        assert moved.outcome == "released" and moved.state == "quoting"
+        assert moved.last_error_code == "quote_budget_exhausted"
+    else:
+        assert moved.state == "awaiting_approval"
+        assert reap.named("request_quote")[0]["timeout_seconds"] == pytest.approx(23.0)

@@ -276,14 +276,12 @@
          "presentation": {
           "properties": {
            "returnUrl": {
+            "description": "HTTPS URL the browser returns to after the hosted flow",
             "format": "uri",
             "type": "string"
            },
            "type": {
-            "enum": [
-             "REDIRECT"
-            ],
-            "example": "REDIRECT",
+            "const": "REDIRECT",
             "type": "string"
            }
           },
@@ -294,6 +292,14 @@
           "type": "object"
          },
          "quoteId": {
+          "allOf": [
+           {
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+           },
+           {
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+           }
+          ],
           "type": "string"
          }
         },
@@ -322,14 +328,12 @@
          "presentation": {
           "properties": {
            "returnUrl": {
+            "description": "HTTPS URL the browser returns to after the hosted flow",
             "format": "uri",
             "type": "string"
            },
            "type": {
-            "enum": [
-             "REDIRECT"
-            ],
-            "example": "REDIRECT",
+            "const": "REDIRECT",
             "type": "string"
            }
           },
@@ -340,6 +344,14 @@
           "type": "object"
          },
          "quoteId": {
+          "allOf": [
+           {
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+           },
+           {
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+           }
+          ],
           "type": "string"
          }
         },
@@ -368,14 +380,12 @@
          "presentation": {
           "properties": {
            "returnUrl": {
+            "description": "HTTPS URL the browser returns to after the hosted flow",
             "format": "uri",
             "type": "string"
            },
            "type": {
-            "enum": [
-             "REDIRECT"
-            ],
-            "example": "REDIRECT",
+            "const": "REDIRECT",
             "type": "string"
            }
           },
@@ -386,6 +396,14 @@
           "type": "object"
          },
          "quoteId": {
+          "allOf": [
+           {
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+           },
+           {
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+           }
+          ],
           "type": "string"
          }
         },
@@ -536,6 +554,57 @@
             "error"
            ],
            "title": "AgenticRequestRejectedError",
+           "type": "object"
+          },
+          {
+           "description": "The request was rejected",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_REQUEST_REJECTED",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": false,
+                 "properties": {
+                  "field": {
+                   "enum": [
+                    "quoteId",
+                    "enrollmentId"
+                   ],
+                   "example": "quoteId",
+                   "type": "string"
+                  }
+                 },
+                 "required": [
+                  "field"
+                 ],
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "CheckoutRequestRejectedError",
            "type": "object"
           },
           {
@@ -882,7 +951,7 @@
       },
       "description": "Response for status 409"
      },
-     "503": {
+     "422": {
       "content": {
        "application/json": {
         "schema": {
@@ -890,7 +959,7 @@
           "error": {
            "properties": {
             "code": {
-             "const": "AGENTIC_SERVICE_UNAVAILABLE",
+             "const": "VALIDATION_FAILED",
              "type": "string"
             },
             "detail": {
@@ -919,12 +988,106 @@
          "required": [
           "error"
          ],
-         "title": "AgenticServiceUnavailableError",
+         "title": "UnprocessableEntityError",
          "type": "object"
         }
        }
       },
-      "description": "Agentic Payments is temporarily unavailable"
+      "description": "Validation failed"
+     },
+     "503": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "anyOf": [
+          {
+           "description": "Agentic Payments is temporarily unavailable",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_SERVICE_UNAVAILABLE",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "AgenticServiceUnavailableError",
+           "type": "object"
+          },
+          {
+           "description": "We couldn't complete this checkout right now. Please try again in a moment.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "CHECKOUT_TEMPORARILY_UNAVAILABLE",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "CheckoutTemporarilyUnavailableError",
+           "type": "object"
+          }
+         ]
+        }
+       }
+      },
+      "description": "Response for status 503",
+      "headers": {
+       "Retry-After": {
+        "description": "Returned only when error.code is CHECKOUT_TEMPORARILY_UNAVAILABLE.",
+        "schema": {
+         "type": "string"
+        }
+       }
+      }
      }
     },
     "summary": "Create checkout",
@@ -6627,7 +6790,7 @@
   },
   "/agentic/quotes": {
    "post": {
-    "description": "Opens and prices a merchant checkout for the chosen product variants; prices always come from the merchant. The response itemizes the total and lists the available shipping options. Quotes are short-lived: create the checkout before `expiresAt` passes, or open a fresh quote. `shippingAddress` is required when any item requires shipping.",
+    "description": "Opens and prices a merchant checkout from product variants or a checkout URL assembled by the client. Send exactly one of `items` and `externalCheckout`. Prices always come from the merchant. The response itemizes the total and lists the available shipping options. Quotes are short-lived: create the checkout before `expiresAt` passes, or open a fresh quote. `shippingAddress` is required for external checkout quotes and when any item requires shipping. Use `offerCode` to price an offer before approval. Reap makes one quote attempt and does not retry a failed merchant request. The error code states whether to correct the request or create a new quote.",
     "operationId": "createQuote_agentic",
     "parameters": [
      {
@@ -6659,272 +6822,681 @@
      "content": {
       "application/json": {
        "schema": {
-        "properties": {
-         "email": {
-          "allOf": [
+        "examples": [
+         {
+          "email": "lin.example@reap.hk",
+          "items": [
            {
-            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
-           },
-           {
-            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
+            "quantity": 1,
+            "variantId": "var_123"
            }
           ],
-          "type": "string"
+          "offerCode": "SAVE10"
          },
-         "items": {
-          "items": {
-           "properties": {
-            "quantity": {
-             "exclusiveMinimum": 0,
-             "maximum": 9007199254740991,
-             "type": "integer"
-            },
-            "variantId": {
-             "type": "string"
-            }
-           },
-           "required": [
-            "variantId",
-            "quantity"
-           ],
-           "type": "object"
+         {
+          "email": "lin.example@reap.hk",
+          "externalCheckout": {
+           "checkoutUrl": "https://checkout.example/cart/example-item:1?source=partner",
+           "merchantDomain": "checkout.example"
           },
-          "maxItems": 20,
-          "minItems": 1,
-          "type": "array"
-         },
-         "shippingAddress": {
+          "offerCode": "SAVE10",
+          "shippingAddress": {
+           "addressLine1": "1 Fictional Road",
+           "city": "Example",
+           "country": "HK",
+           "firstName": "Lin",
+           "lastName": "Example",
+           "phone": "+85220000000",
+           "postalCode": "000001"
+          }
+         }
+        ],
+        "oneOf": [
+         {
+          "additionalProperties": false,
+          "not": {
+           "required": [
+            "externalCheckout"
+           ]
+          },
           "properties": {
-           "addressLine1": {
+           "email": {
+            "format": "email",
+            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$",
+            "type": "string"
+           },
+           "items": {
+            "items": {
+             "properties": {
+              "quantity": {
+               "exclusiveMinimum": 0,
+               "maximum": 9007199254740991,
+               "type": "integer"
+              },
+              "variantId": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "variantId",
+              "quantity"
+             ],
+             "type": "object"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+           },
+           "offerCode": {
+            "description": "Offer code to apply while pricing the quote",
+            "maxLength": 128,
             "minLength": 1,
+            "pattern": "\\S",
             "type": "string"
            },
-           "addressLine2": {
-            "type": "string"
-           },
-           "city": {
-            "minLength": 1,
-            "type": "string"
-           },
-           "country": {
-            "type": "string"
-           },
-           "firstName": {
-            "minLength": 1,
-            "type": "string"
-           },
-           "lastName": {
-            "minLength": 1,
-            "type": "string"
-           },
-           "phone": {
-            "pattern": "^\\+[1-9]\\d{6,14}$",
-            "type": "string"
-           },
-           "postalCode": {
-            "type": "string"
-           },
-           "region": {
-            "type": "string"
+           "shippingAddress": {
+            "properties": {
+             "addressLine1": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "addressLine2": {
+              "type": "string"
+             },
+             "city": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "country": {
+              "type": "string"
+             },
+             "firstName": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "lastName": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "phone": {
+              "pattern": "^\\+[1-9]\\d{6,14}$",
+              "type": "string"
+             },
+             "postalCode": {
+              "type": "string"
+             },
+             "region": {
+              "type": "string"
+             }
+            },
+            "required": [
+             "firstName",
+             "lastName",
+             "phone",
+             "addressLine1",
+             "city",
+             "country"
+            ],
+            "type": "object"
            }
           },
           "required": [
-           "firstName",
-           "lastName",
-           "phone",
-           "addressLine1",
-           "city",
-           "country"
+           "email",
+           "items"
           ],
+          "title": "Reap discovery",
+          "type": "object"
+         },
+         {
+          "additionalProperties": false,
+          "not": {
+           "required": [
+            "items"
+           ]
+          },
+          "properties": {
+           "email": {
+            "format": "email",
+            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$",
+            "type": "string"
+           },
+           "externalCheckout": {
+            "additionalProperties": false,
+            "properties": {
+             "checkoutUrl": {
+              "description": "Caller-assembled checkout URL, preserved without rebuilding",
+              "format": "uri",
+              "maxLength": 8192,
+              "type": "string"
+             },
+             "merchantDomain": {
+              "maxLength": 253,
+              "minLength": 1,
+              "type": "string"
+             }
+            },
+            "required": [
+             "merchantDomain",
+             "checkoutUrl"
+            ],
+            "type": "object"
+           },
+           "offerCode": {
+            "description": "Offer code to apply while pricing the quote",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+           },
+           "shippingAddress": {
+            "properties": {
+             "addressLine1": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "addressLine2": {
+              "type": "string"
+             },
+             "city": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "country": {
+              "type": "string"
+             },
+             "firstName": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "lastName": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "phone": {
+              "pattern": "^\\+[1-9]\\d{6,14}$",
+              "type": "string"
+             },
+             "postalCode": {
+              "type": "string"
+             },
+             "region": {
+              "type": "string"
+             }
+            },
+            "required": [
+             "firstName",
+             "lastName",
+             "phone",
+             "addressLine1",
+             "city",
+             "country"
+            ],
+            "type": "object"
+           }
+          },
+          "required": [
+           "email",
+           "externalCheckout",
+           "shippingAddress"
+          ],
+          "title": "Checkout URL",
           "type": "object"
          }
-        },
-        "required": [
-         "items",
-         "email"
-        ],
-        "type": "object"
+        ]
        }
       },
       "application/x-www-form-urlencoded": {
        "schema": {
-        "properties": {
-         "email": {
-          "allOf": [
+        "examples": [
+         {
+          "email": "lin.example@reap.hk",
+          "items": [
            {
-            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
-           },
-           {
-            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
+            "quantity": 1,
+            "variantId": "var_123"
            }
           ],
-          "type": "string"
+          "offerCode": "SAVE10"
          },
-         "items": {
-          "items": {
-           "properties": {
-            "quantity": {
-             "exclusiveMinimum": 0,
-             "maximum": 9007199254740991,
-             "type": "integer"
-            },
-            "variantId": {
-             "type": "string"
-            }
-           },
-           "required": [
-            "variantId",
-            "quantity"
-           ],
-           "type": "object"
+         {
+          "email": "lin.example@reap.hk",
+          "externalCheckout": {
+           "checkoutUrl": "https://checkout.example/cart/example-item:1?source=partner",
+           "merchantDomain": "checkout.example"
           },
-          "maxItems": 20,
-          "minItems": 1,
-          "type": "array"
-         },
-         "shippingAddress": {
+          "offerCode": "SAVE10",
+          "shippingAddress": {
+           "addressLine1": "1 Fictional Road",
+           "city": "Example",
+           "country": "HK",
+           "firstName": "Lin",
+           "lastName": "Example",
+           "phone": "+85220000000",
+           "postalCode": "000001"
+          }
+         }
+        ],
+        "oneOf": [
+         {
+          "additionalProperties": false,
+          "not": {
+           "required": [
+            "externalCheckout"
+           ]
+          },
           "properties": {
-           "addressLine1": {
+           "email": {
+            "format": "email",
+            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$",
+            "type": "string"
+           },
+           "items": {
+            "items": {
+             "properties": {
+              "quantity": {
+               "exclusiveMinimum": 0,
+               "maximum": 9007199254740991,
+               "type": "integer"
+              },
+              "variantId": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "variantId",
+              "quantity"
+             ],
+             "type": "object"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+           },
+           "offerCode": {
+            "description": "Offer code to apply while pricing the quote",
+            "maxLength": 128,
             "minLength": 1,
+            "pattern": "\\S",
             "type": "string"
            },
-           "addressLine2": {
-            "type": "string"
-           },
-           "city": {
-            "minLength": 1,
-            "type": "string"
-           },
-           "country": {
-            "type": "string"
-           },
-           "firstName": {
-            "minLength": 1,
-            "type": "string"
-           },
-           "lastName": {
-            "minLength": 1,
-            "type": "string"
-           },
-           "phone": {
-            "pattern": "^\\+[1-9]\\d{6,14}$",
-            "type": "string"
-           },
-           "postalCode": {
-            "type": "string"
-           },
-           "region": {
-            "type": "string"
+           "shippingAddress": {
+            "properties": {
+             "addressLine1": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "addressLine2": {
+              "type": "string"
+             },
+             "city": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "country": {
+              "type": "string"
+             },
+             "firstName": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "lastName": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "phone": {
+              "pattern": "^\\+[1-9]\\d{6,14}$",
+              "type": "string"
+             },
+             "postalCode": {
+              "type": "string"
+             },
+             "region": {
+              "type": "string"
+             }
+            },
+            "required": [
+             "firstName",
+             "lastName",
+             "phone",
+             "addressLine1",
+             "city",
+             "country"
+            ],
+            "type": "object"
            }
           },
           "required": [
-           "firstName",
-           "lastName",
-           "phone",
-           "addressLine1",
-           "city",
-           "country"
+           "email",
+           "items"
           ],
+          "title": "Reap discovery",
+          "type": "object"
+         },
+         {
+          "additionalProperties": false,
+          "not": {
+           "required": [
+            "items"
+           ]
+          },
+          "properties": {
+           "email": {
+            "format": "email",
+            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$",
+            "type": "string"
+           },
+           "externalCheckout": {
+            "additionalProperties": false,
+            "properties": {
+             "checkoutUrl": {
+              "description": "Caller-assembled checkout URL, preserved without rebuilding",
+              "format": "uri",
+              "maxLength": 8192,
+              "type": "string"
+             },
+             "merchantDomain": {
+              "maxLength": 253,
+              "minLength": 1,
+              "type": "string"
+             }
+            },
+            "required": [
+             "merchantDomain",
+             "checkoutUrl"
+            ],
+            "type": "object"
+           },
+           "offerCode": {
+            "description": "Offer code to apply while pricing the quote",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+           },
+           "shippingAddress": {
+            "properties": {
+             "addressLine1": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "addressLine2": {
+              "type": "string"
+             },
+             "city": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "country": {
+              "type": "string"
+             },
+             "firstName": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "lastName": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "phone": {
+              "pattern": "^\\+[1-9]\\d{6,14}$",
+              "type": "string"
+             },
+             "postalCode": {
+              "type": "string"
+             },
+             "region": {
+              "type": "string"
+             }
+            },
+            "required": [
+             "firstName",
+             "lastName",
+             "phone",
+             "addressLine1",
+             "city",
+             "country"
+            ],
+            "type": "object"
+           }
+          },
+          "required": [
+           "email",
+           "externalCheckout",
+           "shippingAddress"
+          ],
+          "title": "Checkout URL",
           "type": "object"
          }
-        },
-        "required": [
-         "items",
-         "email"
-        ],
-        "type": "object"
+        ]
        }
       },
       "multipart/form-data": {
        "schema": {
-        "properties": {
-         "email": {
-          "allOf": [
+        "examples": [
+         {
+          "email": "lin.example@reap.hk",
+          "items": [
            {
-            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
-           },
-           {
-            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
+            "quantity": 1,
+            "variantId": "var_123"
            }
           ],
-          "type": "string"
+          "offerCode": "SAVE10"
          },
-         "items": {
-          "items": {
-           "properties": {
-            "quantity": {
-             "exclusiveMinimum": 0,
-             "maximum": 9007199254740991,
-             "type": "integer"
-            },
-            "variantId": {
-             "type": "string"
-            }
-           },
-           "required": [
-            "variantId",
-            "quantity"
-           ],
-           "type": "object"
+         {
+          "email": "lin.example@reap.hk",
+          "externalCheckout": {
+           "checkoutUrl": "https://checkout.example/cart/example-item:1?source=partner",
+           "merchantDomain": "checkout.example"
           },
-          "maxItems": 20,
-          "minItems": 1,
-          "type": "array"
-         },
-         "shippingAddress": {
+          "offerCode": "SAVE10",
+          "shippingAddress": {
+           "addressLine1": "1 Fictional Road",
+           "city": "Example",
+           "country": "HK",
+           "firstName": "Lin",
+           "lastName": "Example",
+           "phone": "+85220000000",
+           "postalCode": "000001"
+          }
+         }
+        ],
+        "oneOf": [
+         {
+          "additionalProperties": false,
+          "not": {
+           "required": [
+            "externalCheckout"
+           ]
+          },
           "properties": {
-           "addressLine1": {
+           "email": {
+            "format": "email",
+            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$",
+            "type": "string"
+           },
+           "items": {
+            "items": {
+             "properties": {
+              "quantity": {
+               "exclusiveMinimum": 0,
+               "maximum": 9007199254740991,
+               "type": "integer"
+              },
+              "variantId": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "variantId",
+              "quantity"
+             ],
+             "type": "object"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
+           },
+           "offerCode": {
+            "description": "Offer code to apply while pricing the quote",
+            "maxLength": 128,
             "minLength": 1,
+            "pattern": "\\S",
             "type": "string"
            },
-           "addressLine2": {
-            "type": "string"
-           },
-           "city": {
-            "minLength": 1,
-            "type": "string"
-           },
-           "country": {
-            "type": "string"
-           },
-           "firstName": {
-            "minLength": 1,
-            "type": "string"
-           },
-           "lastName": {
-            "minLength": 1,
-            "type": "string"
-           },
-           "phone": {
-            "pattern": "^\\+[1-9]\\d{6,14}$",
-            "type": "string"
-           },
-           "postalCode": {
-            "type": "string"
-           },
-           "region": {
-            "type": "string"
+           "shippingAddress": {
+            "properties": {
+             "addressLine1": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "addressLine2": {
+              "type": "string"
+             },
+             "city": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "country": {
+              "type": "string"
+             },
+             "firstName": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "lastName": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "phone": {
+              "pattern": "^\\+[1-9]\\d{6,14}$",
+              "type": "string"
+             },
+             "postalCode": {
+              "type": "string"
+             },
+             "region": {
+              "type": "string"
+             }
+            },
+            "required": [
+             "firstName",
+             "lastName",
+             "phone",
+             "addressLine1",
+             "city",
+             "country"
+            ],
+            "type": "object"
            }
           },
           "required": [
-           "firstName",
-           "lastName",
-           "phone",
-           "addressLine1",
-           "city",
-           "country"
+           "email",
+           "items"
           ],
+          "title": "Reap discovery",
+          "type": "object"
+         },
+         {
+          "additionalProperties": false,
+          "not": {
+           "required": [
+            "items"
+           ]
+          },
+          "properties": {
+           "email": {
+            "format": "email",
+            "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$",
+            "type": "string"
+           },
+           "externalCheckout": {
+            "additionalProperties": false,
+            "properties": {
+             "checkoutUrl": {
+              "description": "Caller-assembled checkout URL, preserved without rebuilding",
+              "format": "uri",
+              "maxLength": 8192,
+              "type": "string"
+             },
+             "merchantDomain": {
+              "maxLength": 253,
+              "minLength": 1,
+              "type": "string"
+             }
+            },
+            "required": [
+             "merchantDomain",
+             "checkoutUrl"
+            ],
+            "type": "object"
+           },
+           "offerCode": {
+            "description": "Offer code to apply while pricing the quote",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+           },
+           "shippingAddress": {
+            "properties": {
+             "addressLine1": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "addressLine2": {
+              "type": "string"
+             },
+             "city": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "country": {
+              "type": "string"
+             },
+             "firstName": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "lastName": {
+              "minLength": 1,
+              "type": "string"
+             },
+             "phone": {
+              "pattern": "^\\+[1-9]\\d{6,14}$",
+              "type": "string"
+             },
+             "postalCode": {
+              "type": "string"
+             },
+             "region": {
+              "type": "string"
+             }
+            },
+            "required": [
+             "firstName",
+             "lastName",
+             "phone",
+             "addressLine1",
+             "city",
+             "country"
+            ],
+            "type": "object"
+           }
+          },
+          "required": [
+           "email",
+           "externalCheckout",
+           "shippingAddress"
+          ],
+          "title": "Checkout URL",
           "type": "object"
          }
-        },
-        "required": [
-         "items",
-         "email"
-        ],
-        "type": "object"
+        ]
        }
       }
      },
+     "description": "Create and price a quote. The request shape depends on its source.",
      "required": true
     },
     "responses": {
@@ -7216,6 +7788,170 @@
            "type": "object"
           },
           {
+           "description": "The checkout URL cannot be used.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "CHECKOUT_URL_INVALID",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": false,
+                 "properties": {
+                  "reason": {
+                   "enum": [
+                    "NOT_FOUND",
+                    "EXPIRED",
+                    "INVALID",
+                    "MERCHANT_CONTEXT_UNVERIFIED"
+                   ],
+                   "example": "NOT_FOUND",
+                   "type": "string"
+                  }
+                 },
+                 "required": [
+                  "reason"
+                 ],
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "CheckoutUrlInvalidError",
+           "type": "object"
+          },
+          {
+           "description": "Card payment is unavailable for this checkout.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "CARD_PAYMENT_UNAVAILABLE",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "CardPaymentUnavailableError",
+           "type": "object"
+          },
+          {
+           "description": "The offer code is invalid.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "OFFER_CODE_INVALID",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "OfferCodeInvalidError",
+           "type": "object"
+          },
+          {
+           "description": "The offer code has expired.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "OFFER_CODE_EXPIRED",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "OfferCodeExpiredError",
+           "type": "object"
+          },
+          {
            "description": "The merchant cannot fulfill this quote as requested (for example, it cannot ship to the address).",
            "properties": {
             "error": {
@@ -7266,7 +8002,7 @@
                    "additionalProperties": false,
                    "properties": {
                     "message": {
-                     "const": "Your cart has been updated and the items you added can't be shipped to your address. Remove the items to complete the order.",
+                     "const": "Your cart has been updated and the items you added can't be shipped to your address. Remove the items to complete your order.",
                      "type": "string"
                     },
                     "reason": {
@@ -7580,45 +8316,95 @@
       "content": {
        "application/json": {
         "schema": {
-         "properties": {
-          "error": {
+         "anyOf": [
+          {
+           "description": "Agentic Payments is temporarily unavailable",
            "properties": {
-            "code": {
-             "const": "AGENTIC_SERVICE_UNAVAILABLE",
-             "type": "string"
-            },
-            "detail": {
-             "anyOf": [
-              {
-               "additionalProperties": {},
-               "type": "object"
+            "error": {
+             "properties": {
+              "code": {
+               "const": "AGENTIC_SERVICE_UNAVAILABLE",
+               "type": "string"
               },
-              {
-               "type": "null"
+              "detail": {
+               "anyOf": [
+                {
+                 "additionalProperties": {},
+                 "type": "object"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
               }
-             ]
-            },
-            "message": {
-             "type": "string"
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
             }
            },
            "required": [
-            "code",
-            "message",
-            "detail"
+            "error"
            ],
+           "title": "AgenticServiceUnavailableError",
+           "type": "object"
+          },
+          {
+           "description": "We couldn't complete this quote right now. Please try again in a moment.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "QUOTE_TEMPORARILY_UNAVAILABLE",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "QuoteTemporarilyUnavailableError",
            "type": "object"
           }
-         },
-         "required": [
-          "error"
-         ],
-         "title": "AgenticServiceUnavailableError",
-         "type": "object"
+         ]
         }
        }
       },
-      "description": "Agentic Payments is temporarily unavailable"
+      "description": "Response for status 503",
+      "headers": {
+       "Retry-After": {
+        "description": "Returned only when error.code is QUOTE_TEMPORARILY_UNAVAILABLE.",
+        "schema": {
+         "type": "string"
+        }
+       }
+      }
      }
     },
     "summary": "Create quote",
@@ -8128,7 +8914,7 @@
   },
   "/agentic/quotes/{id}/shipping-option": {
    "post": {
-    "description": "Selects a shipping option on an existing quote and re-prices it. The response is the updated quote with a fresh amount breakdown.",
+    "description": "Selects a shipping option on an existing quote and re-prices it. The response is the updated quote with a fresh amount breakdown. `QUOTE_REPLACEMENT_REQUIRED` means the caller must create a new quote.",
     "operationId": "selectShippingOption_agentic",
     "parameters": [
      {
@@ -8488,6 +9274,80 @@
            "type": "object"
           },
           {
+           "description": "The offer code is invalid.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "OFFER_CODE_INVALID",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "OfferCodeInvalidError",
+           "type": "object"
+          },
+          {
+           "description": "The offer code has expired.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "OFFER_CODE_EXPIRED",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "OfferCodeExpiredError",
+           "type": "object"
+          },
+          {
            "description": "Shipping option is not available.",
            "properties": {
             "error": {
@@ -8538,28 +9398,11 @@
                    "additionalProperties": false,
                    "properties": {
                     "message": {
-                     "const": "Your cart has been updated and the items you added can't be shipped to your address. Remove the items to complete the order.",
+                     "const": "Your cart has been updated and the items you added can't be shipped to your address. Remove the items to complete your order.",
                      "type": "string"
                     },
                     "reason": {
                      "const": "ITEMS_UNSHIPPABLE",
-                     "type": "string"
-                    }
-                   },
-                   "required": [
-                    "reason"
-                   ],
-                   "type": "object"
-                  },
-                  {
-                   "additionalProperties": false,
-                   "properties": {
-                    "message": {
-                     "const": "Address line 2 is required.",
-                     "type": "string"
-                    },
-                    "reason": {
-                     "const": "ADDRESS_LINE_2_REQUIRED",
                      "type": "string"
                     }
                    },
@@ -8733,44 +9576,123 @@
       "content": {
        "application/json": {
         "schema": {
-         "properties": {
-          "error": {
+         "anyOf": [
+          {
+           "description": "The quote has expired.",
            "properties": {
-            "code": {
-             "const": "QUOTE_EXPIRED",
-             "type": "string"
-            },
-            "detail": {
-             "anyOf": [
-              {
-               "type": "null"
+            "error": {
+             "properties": {
+              "code": {
+               "const": "QUOTE_EXPIRED",
+               "type": "string"
               },
-              {
-               "type": "null"
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
               }
-             ]
-            },
-            "message": {
-             "type": "string"
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
             }
            },
            "required": [
-            "code",
-            "message",
-            "detail"
+            "error"
            ],
+           "title": "QuoteExpiredError",
+           "type": "object"
+          },
+          {
+           "description": "Create a new quote.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "QUOTE_REPLACEMENT_REQUIRED",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "QuoteReplacementRequiredError",
+           "type": "object"
+          },
+          {
+           "description": "The quote can no longer be modified.",
+           "properties": {
+            "error": {
+             "properties": {
+              "code": {
+               "const": "QUOTE_NOT_MUTABLE",
+               "type": "string"
+              },
+              "detail": {
+               "anyOf": [
+                {
+                 "type": "null"
+                },
+                {
+                 "type": "null"
+                }
+               ]
+              },
+              "message": {
+               "type": "string"
+              }
+             },
+             "required": [
+              "code",
+              "message",
+              "detail"
+             ],
+             "type": "object"
+            }
+           },
+           "required": [
+            "error"
+           ],
+           "title": "QuoteNotMutableError",
            "type": "object"
           }
-         },
-         "required": [
-          "error"
-         ],
-         "title": "QuoteExpiredError",
-         "type": "object"
+         ]
         }
        }
       },
-      "description": "The quote has expired."
+      "description": "Response for status 409"
      },
      "503": {
       "content": {

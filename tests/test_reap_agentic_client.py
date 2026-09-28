@@ -21,6 +21,7 @@ So three kinds of test:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
@@ -2827,12 +2828,12 @@ def test_the_request_still_reaches_the_wire_unchanged_through_the_stream(wire):
 
 def test_a_4xx_body_is_never_read_at_all(wire):
     """Stronger than the old "the body is not returned": on an error status the body is not even
-    pulled off the socket, so a partner error payload echoing a buyer's address never enters this
-    process."""
+    pulled off the socket, so a partner error payload echoing a request never enters this
+    process. On a PRODUCT endpoint -- the quote joined the code-reading legs on 2026-09-28 (see
+    `test_a_quote_failure_body_yields_its_codes_and_nothing_else`)."""
     wire.next_status = 422
     wire.next_content = json.dumps({"echo": {"shippingAddress": GOOD_ADDRESS}}).encode()
-    got = _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}],
-                                email="b@example.com"))
+    got = _run(rc.search_products(query="Fenty Gloss Bomb"))
     assert not got.ok and got.status == 422 and got.data == {}
     assert wire.last_response.bytes_yielded == 0
 
@@ -5220,7 +5221,7 @@ def test_enroll_then_poll_then_checkout_reaches_the_paths_in_order(wire, clean_e
 # people learn to ignore.
 
 SPEC_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
-                            "reap_openapi_agentic_2026_09_25.json")
+                            "reap_openapi_agentic_2026_09_28.json")
 
 
 def _spec():
@@ -5377,6 +5378,11 @@ URL_PATHS_AND_GUARDS = {
     # Outbound, and OURS: validated before egress.
     "POST /agentic/enrollments REQUEST presentation.returnUrl": "validate_return_url",
     "POST /agentic/checkouts REQUEST presentation.returnUrl": "validate_return_url",
+    # Outbound, and the MERCHANT's: the Tier B cart permalink (2026-09-28 spec). Structurally
+    # re-checked by `build_cart_link_quote_request` (`services.reap_cart_link.cart_link_line`:
+    # one line, our click attribute, a country pin, no `checkout[...]`), after the ledger ran the
+    # full validator against the row's shop, click and market.
+    "POST /agentic/quotes REQUEST externalCheckout.checkoutUrl": "build_cart_link_quote_request",
     # WP4c. Enrollment REVOCATION left the `NOT CALLED` list: `retire_buyer_refs_for_buyer`
     # retires our side of a stranded enrollment at the moment a buyer link is repointed, and
     # this is the leg that tells Reap to stop honouring the card. It is NOT on the hosted
@@ -6287,17 +6293,85 @@ def test_both_verbs_share_one_bounded_reader(wire, clean_env):
 # Scoping by path gets both, and it lands where the risk is: the request body that can carry a
 # SHIPPING ADDRESS is the quote, and that is exactly the one still never read.
 
-def test_a_quote_failure_body_is_still_never_read(wire, clean_env):
-    """The base's property, unchanged, on the endpoint whose request carries an address."""
-    wire.next_status = 422
-    wire.next_content = json.dumps({"error": {"code": "VALIDATION_FAILED"},
-                                    "echo": {"shippingAddress": GOOD_ADDRESS}}).encode()
+def test_a_quote_failure_body_yields_its_codes_and_nothing_else(wire, clean_env):
+    """THE TRADE, RE-MADE ON 2026-09-28. The quote now has a state machine (an offer code Reap
+    refuses is dropped and the cart re-quoted), so its failure body IS read -- bounded, and for
+    three shape-checked scalars only. The address this body echoes must not survive anywhere on
+    the result, and `error.message` / `detail.message` (free text) are never read."""
+    wire.next_status = 400
+    wire.next_content = json.dumps({
+        "error": {"code": "QUOTE_UNFULFILLABLE", "message": "Brannan St is not deliverable",
+                  "detail": {"reason": "ITEMS_UNSHIPPABLE", "message": "Your cart has been updated"}},
+        "echo": {"shippingAddress": GOOD_ADDRESS},
+    }).encode()
     got = _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}],
-                                email="b@example.com"))
-    assert not got.ok and got.status == 422 and got.data == {}
-    assert wire.last_response.bytes_yielded == 0
-    # Not even the code, on this path. That is the trade, stated out loud.
-    assert got.error_code is None
+                                email="b@example.com", shipping_address=GOOD_ADDRESS))
+    assert not got.ok and got.status == 400 and got.data == {}
+    assert (got.error_code, got.error_detail_code, got.error_detail_reason) == (
+        "QUOTE_UNFULFILLABLE", None, "ITEMS_UNSHIPPABLE")
+    flat = json.dumps(dataclasses.asdict(got))
+    assert "Brannan" not in flat and "cart has been updated" not in flat
+
+
+#: Echoed-address strings a partner body could put where a code belongs. The last four are
+#: UPPER-CASE tokens that satisfy the code SHAPE (`^[A-Z][A-Z0-9_]{2,63}$`) -- which is why the
+#: quote leg keeps codes by ALLOWLIST, not by shape (#2425 review, B1).
+PII_IN_CODE_SLOTS = [
+    GOOD_ADDRESS["city"],            # "San Francisco"
+    "Test Buyer",                    # first + last name
+    GOOD_ADDRESS["addressLine1"],    # "900 Brannan St"
+    "SAN FRANCISCO",
+    "SINGAPORE",
+    "SW1A1AA",
+    "JOHN_DOE",
+]
+
+
+@pytest.mark.parametrize("pii", PII_IN_CODE_SLOTS)
+def test_an_address_where_a_code_belongs_yields_no_code(wire, clean_env, caplog, pii):
+    """On the quote leg -- the one whose request carries the address -- a value in `error.code`
+    or `detail.reason` that is not one of the spec's codes/reasons never survives: the code is
+    None, the reason is at most the `OTHER` sentinel, and neither the result nor the log line
+    carries the text."""
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    wire.next_status = 400
+    wire.next_content = json.dumps({"error": {
+        "code": pii, "message": "x", "detail": {"reason": pii, "code": pii}}}).encode()
+    got = _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}],
+                                email="b@example.com", shipping_address=GOOD_ADDRESS))
+    assert got.error_code is None and got.error_detail_code is None
+    assert got.error_detail_reason in (None, rc.UNRECOGNISED_REASON)
+    assert pii not in json.dumps(dataclasses.asdict(got))
+    assert pii not in caplog.text
+
+
+@pytest.mark.parametrize("pii", PII_IN_CODE_SLOTS[:4])
+def test_a_non_code_shaped_value_is_dropped_on_the_checkout_leg_too(wire, clean_env, pii):
+    """The SHAPE rule is still what guards the enrollment/checkout legs: lower case, spaces and
+    punctuation are not a code. (Kills a loosened `_ERROR_CODE_RE`.)"""
+    wire.next_status = 400
+    wire.next_content = json.dumps({"error": {"code": pii, "detail": {"code": pii}}}).encode()
+    got = _run(rc.create_checkout(quote_id="f1e2d3c4", enrollment_id=ENROLLMENT_UUID,
+                                  return_url=RETURN_URL))
+    assert got.error_code is None and got.error_detail_code is None
+
+
+def test_a_known_quote_code_and_reason_are_kept_and_logged_classified_only(wire, clean_env, caplog):
+    """B3: the quote leg logs OUR classified code, never the partner scalars."""
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    wire.next_status = 400
+    wire.next_content = json.dumps({"error": {
+        "code": "QUOTE_UNFULFILLABLE", "message": "Brannan",
+        "detail": {"reason": "ITEMS_UNSHIPPABLE"}}}).encode()
+    got = _run(rc.request_quote(items=[{"variantId": "var_x", "quantity": 1}],
+                                email="b@example.com", shipping_address=GOOD_ADDRESS))
+    assert (got.error_code, got.error_detail_reason) == ("QUOTE_UNFULFILLABLE", "ITEMS_UNSHIPPABLE")
+    assert "code=quote_unfulfillable:items_unshippable" in caplog.text
+    assert "QUOTE_UNFULFILLABLE" not in caplog.text and "ITEMS_UNSHIPPABLE" not in caplog.text
 
 
 @pytest.mark.parametrize("path_call", [
@@ -6335,13 +6409,14 @@ def test_the_product_endpoints_never_read_a_failure_body(wire, clean_env):
 def test_which_paths_read_a_failure_body_is_pinned():
     """A set, not a habit: adding an endpoint without deciding which side of this line it is on
     should be a failing test rather than a default."""
-    assert set(rc._ERROR_CODE_PATH_PREFIXES) == {"/agentic/enrollments", "/agentic/checkouts"}
+    assert set(rc._ERROR_CODE_PATH_PREFIXES) == {
+        "/agentic/enrollments", "/agentic/checkouts", "/agentic/quotes"}
     for path in ("/agentic/enrollments", "/agentic/enrollments/abc", "/agentic/checkouts",
-                 "/agentic/checkouts/abc"):
-        assert rc._reads_error_codes(path)
-    for path in ("/agentic/quotes", "/agentic/quotes/abc", "/agentic/products/search",
-                 "/agentic/products/details", "/agentic/products/variant",
+                 "/agentic/checkouts/abc", "/agentic/quotes", "/agentic/quotes/abc",
                  "/agentic/quotes/abc/shipping-option"):
+        assert rc._reads_error_codes(path)
+    for path in ("/agentic/products/search", "/agentic/products/details",
+                 "/agentic/products/variant"):
         assert not rc._reads_error_codes(path)
 
 
@@ -6372,7 +6447,7 @@ def test_the_error_code_reader_has_no_codes_without_bytes(raw):
     AttributeError and returns the same pair — so a mutant on that line is EQUIVALENT and would
     survive any test. Asserting the contract directly is what actually holds it, whichever line
     ends up implementing it."""
-    assert rc._error_codes(raw) == (None, None)
+    assert rc._error_codes(raw) == (None, None, None)
 
 
 def test_the_bounded_reader_closes_its_iterator_on_the_early_return(wire, clean_env):
@@ -6854,8 +6929,10 @@ def test_a_normal_url_with_punctuation_still_passes(clean_env):
     ("/agentic/checkouts/abc", True),
     ("/agentic/enrollmentsEVIL", False),
     ("/agentic/checkoutsEVIL/x", False),
-    ("/agentic/quotes", False),
-    ("/agentic/quotes/abc/shipping-option", False),
+    ("/agentic/quotes", True),
+    ("/agentic/quotes/abc/shipping-option", True),
+    ("/agentic/quotesEVIL", False),
+    ("/agentic/products/search", False),
 ])
 def test_the_error_code_paths_are_matched_by_segment(path, expected):
     """`"/agentic/enrollmentsEVIL".startswith("/agentic/enrollments")` is True, so a prefix test

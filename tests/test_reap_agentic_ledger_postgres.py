@@ -79,6 +79,7 @@ _MIGRATIONS = (
     # whole-table parity test would fail for a change that is correct. See
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
+    _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
 )
 _MIGRATION = _MIGRATIONS[0]
 
@@ -673,6 +674,8 @@ _EXPECTED_PUBLIC_COLUMNS = {
     # mig 233 — the buyer's own consent tag, public for the reason the SQLite twin of this list
     # states. Written here too, deliberately: the partition test forces the choice.
     "consent_version", "consented_at",
+    # mig 247 — the buyer's own offer code, its outcome and the discount; see the SQLite twin.
+    "offer_code", "offer_code_outcome", "discount_minor", "tax_included",
 }
 
 
@@ -2585,7 +2588,8 @@ async def test_release_claim_has_no_attempts_delta_on_postgres():
 
     params = inspect.signature(ledger.release_claim).parameters
     assert "attempts_delta" not in params
-    assert set(params) == {"purchase_id", "worker_id", "next_poll_at", "last_error_code"}
+    assert set(params) == {
+        "purchase_id", "worker_id", "next_poll_at", "last_error_code", "offer_code_outcome"}
 
     purchase = await _claimed()
     before = (await ledger.get_purchase_internal(purchase["id"]))["attempts"]
@@ -2826,6 +2830,10 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
         "cart_url",
         "consent_version",
         "consented_at",
+        "offer_code",
+        "offer_code_outcome",
+        "discount_minor",
+        "tax_included",
     }, (
         f"the heal on a 224-shaped database added {sorted(after - before)}"
     )

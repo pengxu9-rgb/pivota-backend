@@ -1329,6 +1329,24 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 247: the buyer's offer code (create-only), what it came to at the
+            # quote, and the discount Reap applied. The ledger names all three in
+            # every purchase INSERT / transition, so without them every purchase
+            # write fails loudly. ITS OWN try, per this block's rule, and not
+            # folded into the mig-224 CREATE above for the reason the mig-233 heal
+            # states. Same "no prose A-L-T-E-R T-A-B-L-E" rule as above.
+            try:
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS reap_agentic_purchases
+                        ADD COLUMN IF NOT EXISTS offer_code VARCHAR(128),
+                        ADD COLUMN IF NOT EXISTS offer_code_outcome VARCHAR(16),
+                        ADD COLUMN IF NOT EXISTS discount_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS tax_included BOOLEAN;
+                    """
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 237: the chargeback part of commerce_attribution_edges.refund_amount_cents.
             # Every refund and dispute write to the edge names this column
             # (services/commerce_attribution_service.py _APPLY_REFUND_TOTAL_QUERY,
@@ -3892,6 +3910,30 @@ async def ensure_required_schema_light() -> None:
                         # Almost always "duplicate column name" — the column is
                         # already there and this run had nothing to do. Continue
                         # so the remaining column still gets its chance.
+                        continue
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 247, SQLite twin: the offer-code columns, one statement per
+            # column for the reason the mig-233 twin above states. Invisible to
+            # the source-text coverage gate for the same reason; the runtime
+            # suite (every offer-code assertion in the SQLite ledger/purchase
+            # tests builds through this heal) is what defends it.
+            try:
+                for _offer_code_column, _offer_code_type in (
+                    ("offer_code", "VARCHAR(128)"),
+                    ("offer_code_outcome", "VARCHAR(16)"),
+                    ("discount_minor", "BIGINT"),
+                    ("tax_included", "BOOLEAN"),
+                ):
+                    try:
+                        await database.execute(
+                            text(
+                                f"ALTER TABLE reap_agentic_purchases "
+                                f"ADD COLUMN {_offer_code_column} "
+                                f"{_offer_code_type};"
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
                         continue
             except Exception:  # noqa: BLE001
                 pass
