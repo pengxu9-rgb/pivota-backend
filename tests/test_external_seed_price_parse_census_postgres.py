@@ -283,3 +283,37 @@ async def test_the_census_refuses_while_another_copy_runs(scoped_db):
     finally:
         await conn.close()
         await other.close()
+
+
+@needs_pg
+@pytest.mark.asyncio
+async def test_the_probe_takes_its_sample_through_the_census_read(scoped_db, capsys):
+    """`external_seed_currency_probe.py --from-db`: the census's own read (READ ONLY, its guards),
+    printed under the line cap, and the connection closed before anything is fetched."""
+    import asyncpg
+
+    await _seed(scoped_db, "usd_x", host="x.example.com", market="US", price=20.0, currency="USD", title="mask")
+    spec = importlib.util.spec_from_file_location(
+        "external_seed_currency_probe", _ROOT / "scripts/ops/external_seed_currency_probe.py"
+    )
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+
+    sep = "&" if "?" in _url() else "?"
+    sample = await probe.sample_from_db(f"{_url()}{sep}search_path={_SCHEMA}")
+    assert sample == [{"host": "x.example.com", "market": "US", "served": 1, "default_shaped": 1,
+                       "default_shaped_attached_offers": 0, "urls": ["https://x.example.com/products/usd_x"]}]
+    out = capsys.readouterr().out.splitlines()
+    assert any(ln.startswith("CENSUS_JSON ") for ln in out)
+    assert any(ln.startswith("CURRENCY_SAMPLE_JSON_PART 1/1 ") for ln in out)
+    assert max(len(ln) for ln in out) < 90_000
+    # nothing left open: no session of the census's application_name survives the call
+    conn = await asyncpg.connect(_url())
+    try:
+        left = await conn.fetchval(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'external_seed_price_parse_census'"
+        )
+    finally:
+        await conn.close()
+    assert left == 0
+

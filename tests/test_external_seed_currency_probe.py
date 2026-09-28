@@ -194,7 +194,142 @@ def test_the_report_renders() -> None:
 
 def test_the_probe_writes_nothing() -> None:
     """It re-reads pages; it must not go through resolve_external_offer (which upserts the
-    snapshot) or touch the database."""
+    snapshot), and its only database access is the census's READ ONLY `collect` (--from-db)."""
     text = (_ROOT / "scripts/ops/external_seed_currency_probe.py").read_text()
     assert "resolve_external_offer(" not in text
-    assert "database" not in text.replace("no database", "").replace("the database", "")
+    assert "from db." not in text and "import database" not in text
+    assert ".execute(" not in text and ".fetch(" not in text
+    for verb in ("INSERT ", "UPDATE ", "DELETE ", "TRUNCATE "):
+        assert verb not in text
+    assert "census.collect(conn)" in text
+
+
+# ------------------------------------------------------------------ pacing, deadline, start window
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.t = 0.0
+        self.fetch_times: list = []
+
+    def __call__(self) -> float:
+        return self.t
+
+    async def sleep(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def test_requests_are_paced_globally_not_just_per_host() -> None:
+    """The crawl NAT trips a cross-domain 429 on ~50 requests over 37 domains in a minute, so
+    the interval holds ACROSS hosts, whatever the host concurrency."""
+    probe, clock = _probe(), _FakeClock()
+
+    async def fetch(url: str) -> str:
+        clock.fetch_times.append(clock.t)
+        return PAGES.get(url) or _html()
+
+    sample = [dict(e, urls=e["urls"][:2]) for e in SAMPLE]
+    asyncio.run(probe.probe(sample, fetch, host_concurrency=4, global_interval=1.5, clock=clock, sleep=clock.sleep))
+    times = sorted(clock.fetch_times)
+    assert len(times) == sum(len(e["urls"]) for e in sample)
+    assert all(b - a >= 1.5 - 1e-9 for a, b in zip(times, times[1:])), times
+
+
+def test_past_the_deadline_no_fetch_starts_and_the_rest_are_not_attempted() -> None:
+    probe, clock = _probe(), _FakeClock()
+    fetched = []
+
+    async def fetch(url: str) -> str:
+        fetched.append(url)
+        return PAGES.get(url) or _html()
+
+    obs = asyncio.run(probe.probe(SAMPLE, fetch, host_concurrency=1, global_interval=1.0, deadline=2.5,
+                                  clock=clock, sleep=clock.sleep))
+    assert len(fetched) == 3  # at t=0, 1, 2; the next would start at 3 >= 2.5
+    classes = [o["class"] for key in obs for o in obs[key]]
+    assert classes.count("not_attempted") == sum(len(e["urls"]) for e in SAMPLE) - 3
+    summary = probe.summarise(SAMPLE, obs)
+    # fetched: nocur p1, p2 and named p1. An unread page is in no share: mixed.example and
+    # down.example read nothing, so they have no estimate; named.example's one read page counts.
+    by_host = {h["host"]: h for h in summary["hosts"]}
+    assert by_host["nocur.example"]["est_rows_no_currency"] == 40
+    assert by_host["named.example"]["est_rows_no_currency"] == 0
+    assert by_host["named.example"]["not_attempted"] == 1
+    assert by_host["mixed.example"]["est_rows_no_currency"] is None
+    assert by_host["mixed.example"]["not_attempted"] == 4
+
+
+@pytest.mark.parametrize(
+    "hhmm, refused",
+    [((4, 14), False), ((4, 15), True), ((5, 15), True), ((6, 14), True), ((6, 15), False), ((12, 0), False)],
+)
+def test_the_no_start_window_covers_the_refresh_and_this_runs_deadline(hhmm, refused) -> None:
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 9, 29, *hhmm, tzinfo=timezone.utc)
+    assert (_probe().start_refusal(now) is not None) is refused
+
+
+def test_from_db_refuses_inside_the_window_before_touching_the_database(monkeypatch, capsys) -> None:
+    from datetime import datetime, timezone
+
+    probe = _probe()
+
+    async def boom(dsn):  # pragma: no cover - must not be reached
+        raise AssertionError("the database was read inside the no-start window")
+
+    monkeypatch.setattr(probe, "sample_from_db", boom)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
+    rc = asyncio.run(probe._main(["--from-db"], now=datetime(2026, 9, 29, 5, 0, tzinfo=timezone.utc)))
+    assert rc == 2
+    assert "refusing" in capsys.readouterr().err
+
+
+def test_from_db_and_a_sample_file_are_exclusive() -> None:
+    with pytest.raises(SystemExit):
+        asyncio.run(_probe()._main(["sample.json", "--from-db"]))
+    with pytest.raises(SystemExit):
+        asyncio.run(_probe()._main([]))
+
+
+@pytest.mark.parametrize("census_fails", [False, True])
+def test_the_database_connection_is_closed_before_any_fetch(monkeypatch, census_fails) -> None:
+    """The crawl can run 45 minutes; it must never hold a session on the 2-vCPU primary."""
+    import sys
+    import types
+
+    probe = _probe()
+    conns = []
+
+    class FakeConn:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    async def connect(dsn):
+        conns.append(FakeConn())
+        return conns[-1]
+
+    class FakeCensus:
+        @staticmethod
+        async def collect(conn):
+            if census_fails:
+                raise RuntimeError("statement timeout")
+            return {"totals": {}}, [], SAMPLE[:1]
+
+        @staticmethod
+        def render(summary):
+            return []
+
+        @staticmethod
+        def output_lines(summary, suspects, sample):
+            return ["CENSUS_JSON {}"]
+
+    monkeypatch.setitem(sys.modules, "asyncpg", types.SimpleNamespace(connect=connect))
+    monkeypatch.setattr(probe, "_census_module", lambda: FakeCensus)
+    if census_fails:
+        with pytest.raises(RuntimeError):
+            asyncio.run(probe.sample_from_db("postgresql://x/y"))
+    else:
+        assert asyncio.run(probe.sample_from_db("postgresql://x/y")) == SAMPLE[:1]
+    assert conns and conns[0].closed
