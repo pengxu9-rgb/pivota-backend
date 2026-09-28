@@ -148,7 +148,9 @@ class _FeedBodies(dict):
     Carried on the map rather than returned beside it so a caller that only wants bodies is
     unchanged."""
 
-    titles: Dict[str, str] = {}
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.titles: Dict[str, str] = {}
 
 
 async def _load_body_map(domain: str, max_products: int) -> Tuple[Dict[str, str], bool]:
@@ -521,6 +523,21 @@ def drop_shared_boilerplate(
 
     def names(pk: str) -> List[str]:
         return [t for t in (titles.get(pk), store_titles.get(pk)) if t]
+
+    # ONE TITLE PER PAGE, chosen independently of candidate order: the storefront's own title (one
+    # per handle), else the smallest catalog title behind the handle. The family exception reads
+    # it, and "the first row behind the handle" made that verdict depend on the order candidates
+    # arrive in -- which the #2097 determinism invariant forbids (review #2429: 3 of 6 orderings of
+    # one base + edition + sized row flipped between kept and dropped).
+    rows_by_page: Dict[str, List[str]] = {}
+    for pk in candidates:
+        rows_by_page.setdefault(handles.get(pk, pk), []).append(pk)
+    page_title: Dict[str, Optional[str]] = {}
+    for h, pks in rows_by_page.items():
+        store = sorted(t for t in (store_titles.get(q) for q in pks) if t)
+        catalog = sorted(t for t in (titles.get(q) for q in pks) if t)
+        page_title[h] = (store or catalog or [None])[0]
+
     # Count DISTINCT product pages per value, so one product behind two rows is not "shared".
     # Each page keeps its (handle, title) so a shared value can be asked whether its pages are
     # editions of ONE product.
@@ -535,12 +552,12 @@ def drop_shared_boilerplate(
     for pk, v in candidates.items():
         h = handles.get(pk, pk)
         n = _norm_copy(v)
-        seen.setdefault(n, {}).setdefault(h, (h, titles.get(pk)))
+        seen.setdefault(n, {}).setdefault(h, (h, page_title.get(h)))
         all_titles.setdefault(n, set()).update(names(pk) or [""])
         for name in names(pk):
             tpl = _title_template(v, name)
             if tpl is not None:
-                templates.setdefault(tpl, {}).setdefault(h, (h, titles.get(pk)))
+                templates.setdefault(tpl, {}).setdefault(h, (h, page_title.get(h)))
 
     def is_template(v: str, name: str) -> bool:
         tpl = _title_template(v, name)

@@ -1344,3 +1344,47 @@ def test_the_feed_loader_keeps_the_storefront_titles(monkeypatch):
 def test_the_write_never_publishes_a_row_suppressed_mid_run():
     """Review #2429: a paced --pdp-fallback run is long; the UPDATE re-checks suppression."""
     assert "suppressed_at IS NULL" in bf._UPDATE_ROW
+
+
+
+def test_the_verdict_does_not_depend_on_candidate_order_with_store_titles():
+    """Review #2429 (a1): a base, its sized sibling row and a [Special Set] page share one value.
+    Every ordering must reach the same verdict (the #2097 determinism invariant)."""
+    import itertools
+
+    tpl = "{} glides on in one swipe with a glassy finish that lasts all day without drying lips."
+    rows = [("p1", "glaze-lip", "Glaze Lipstick"), ("p2", "glaze-lip", "Glaze Lipstick 3.5g"),
+            ("p3", "holiday-glaze-duo", "[Special Set] Glaze Lipstick")]
+    for store_titles in (None, {"p1": "Glaze Lipstick", "p2": "Glaze Lipstick",
+                                "p3": "[Special Set] Glaze Lipstick"}):
+        verdicts = set()
+        for perm in itertools.permutations(rows):
+            cands = {pk: tpl.format("Glaze Lipstick") for pk, _h, _t in perm}
+            kept = bf.drop_shared_boilerplate(
+                cands, _BLURB, titles={pk: t for pk, _h, t in perm},
+                handles={pk: h for pk, h, _t in perm}, store_titles=store_titles)
+            verdicts.add(tuple(sorted(kept)))
+        assert len(verdicts) == 1, (store_titles, verdicts)
+
+
+def test_run_hands_the_storefront_titles_to_the_boilerplate_census(monkeypatch):
+    """Review #2429: the loader keeps the store titles and the census uses them; run() must pass
+    them between the two. Only the STORE title reveals this template."""
+    rows = [_row("pk1", "ck1", "ch-birds", title="CH Birds of Paradise Cologne 3.4 oz"),
+            _row("pk2", "ck2", "pride", title="Pride Art of Arabia I Cologne 3.4 oz")]
+    for r in rows:
+        r["canonical_url"] = r["canonical_url"].replace("jsmbeauty.sg", "perfumania.com")
+        r["source_domain"] = "perfumania.com"
+    body = bf._FeedBodies({"ch-birds": "tiny", "pride": "tiny"})
+    body.titles = {"ch-birds": "CH Birds of Paradise Cologne", "pride": "Pride Art of Arabia I Cologne"}
+    db, refreshed, _fetched = _harness(
+        monkeypatch, rows, body_map=body,
+        pdp={"ch-birds": _PERFUMANIA.format("CH Birds of Paradise Cologne"),
+             "pride": _PERFUMANIA.format("Pride Art of Arabia I Cologne")})
+
+    async def _load(domain, max_products):
+        return body, False
+
+    monkeypatch.setattr(bf, "_load_body_map", _load)
+    asyncio.run(bf.run(True, ["perfumania.com"], 800, pdp_fallback=True))
+    assert db.updates == []
