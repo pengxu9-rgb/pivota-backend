@@ -8,7 +8,7 @@ The lane remains **dark** while the Reap cart-link dial is off or its quote fiel
 
 | Piece | Where |
 |---|---|
-| Merchant list (40 rows) | `config/tierb_cart_link_merchants.json`, validated by `services/tierb_cart_link_merchants.py` |
+| Merchant list (42 rows: the 40 measured 2026-09-18, idewcare.com, jsmbeauty.sg) | `config/tierb_cart_link_merchants.json`, validated by `services/tierb_cart_link_merchants.py` |
 | Job | `python -m jobs.tierb_cart_link_eligibility` |
 | Storage + read API | `db/tierb_cart_link_eligibility.py` (`record_result`, `get_eligibility`, `is_cart_link_eligible`) |
 | Schema | `db/migrations/228_*` and the self-heal `db/tierb_cart_link_eligibility_schema.py` |

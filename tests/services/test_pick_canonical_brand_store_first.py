@@ -19,7 +19,9 @@ RETAILER_COPY = "Westman Atelier's spot check brush, sold here with free shippin
 
 def _row(product_key, *, host, brand="Westman Atelier", description=BRAND_COPY, bd=False, primary=True,
          sig="sig_" + "a" * 32, platform="external_seed", image="https://cdn.example/i.jpg"):
-    return {"product_key": product_key, "source_domain": host, "brand": brand, "description": description,
+    # a title, as every catalog_products row has (NOT NULL): the content bar requires one (#2423)
+    return {"product_key": product_key, "source_domain": host, "brand": brand, "title": "Spot Check Brush",
+            "description": description,
             "has_brand_direct_offer": bd, "group_is_primary": primary, "pivota_signature_id": sig,
             "platform": platform, "canonical_url": f"https://{host}/products/x" if host else None,
             "image_url": image}

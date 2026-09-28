@@ -181,14 +181,15 @@ def _rows(**over):
 def test_a_stale_key_is_retired_only_once_its_new_key_is_live():
     """Measured: 72 of stilacosmetics.com's 125 records were unresolved, and the drain drops those; retiring
     their stale keys first would have hidden the products."""
-    out = select_retirable(_C, _rows(), new_live={"new0", "new1"}, domain="stilacosmetics.com")
+    out = select_retirable(_C, _rows(), new_live={"new0", "new1"}, domain="stilacosmetics.com", searchable=set(), serving=set())
     assert [c["stale_key"] for c in out["live"]] == ["old0", "old1"]
     assert [c["stale_key"] for c in out["waiting_for_new_key"]] == ["old2", "old3", "old4"]
 
 
 def test_another_sources_row_under_the_same_key_is_never_retired():
     rows = _rows(old0={"source_domain": "someretailer.com"}, old1={"source_domain": None})
-    out = select_retirable(_C, rows, new_live={f"new{i}" for i in range(5)}, domain="www.stilacosmetics.com")
+    out = select_retirable(_C, rows, new_live={f"new{i}" for i in range(5)}, domain="www.stilacosmetics.com",
+                           searchable=set(), serving=set())
     assert {c["stale_key"] for c in out["foreign"]} == {"old0", "old1"}
     assert {c["stale_key"] for c in out["live"]} == {"old2", "old3", "old4"}   # www. is the same store
 
@@ -196,13 +197,15 @@ def test_another_sources_row_under_the_same_key_is_never_retired():
 def test_absent_and_already_suppressed_keys_are_left_alone():
     rows = _rows(old0={"suppression_reason": "x"})
     del rows["old1"]
-    out = select_retirable(_C, rows, new_live={f"new{i}" for i in range(5)}, domain="stilacosmetics.com")
+    out = select_retirable(_C, rows, new_live={f"new{i}" for i in range(5)}, domain="stilacosmetics.com",
+                           searchable=set(), serving=set())
     assert {c["stale_key"] for c in out["live"]} == {"old2", "old3", "old4"}
     assert {c["stale_key"] for c in out["present"]} == {"old0", "old2", "old3", "old4"}
 
 
 def test_the_old_order_is_an_explicit_choice():
-    out = select_retirable(_C, _rows(), new_live=set(), domain="stilacosmetics.com", before_rewrite=True)
+    out = select_retirable(_C, _rows(), new_live=set(), domain="stilacosmetics.com", searchable=set(), serving=set(),
+                           before_rewrite=True)
     assert len(out["live"]) == 5 and out["waiting_for_new_key"] == []
 
 
@@ -268,15 +271,16 @@ def test_the_cli_plumbs_the_old_order_flag(monkeypatch):
     assert seen["before_rewrite"] is True
 
 
-def _plan_env(monkeypatch, *, new_rows):
-    """plan() against a fake DB: two stale rows on the store, new keys as given; seeds/offers recorded."""
+def _plan_env(monkeypatch, *, new_rows, serving_cks=(), searchable_keys=()):
+    """plan() against a fake DB: two stale rows on the store, new keys as given; seeds/offers recorded.
+    Stale row oldN carries content_key ck_oldN; `serving_cks` are the serving_eligible content_keys."""
     import scripts.retire_superseded_brand_keys as tool
     cohort = [{"stale_key": "old0", "new_key": "new0", "brand": "Stila", "title": "A"},
               {"stale_key": "old1", "new_key": "new1", "brand": "Stila", "title": "B"}]
     stale_rows = [{"product_key": k, "source_domain": "stilacosmetics.com", "suppression_reason": None,
                    "suppressed_at": None, "suppression_metadata": None, "merchant_id": "m", "brand": "Stila Cosmetics",
-                   "title": t} for k, t in (("old0", "A"), ("old1", "B"))]
-    asked = {"seeds": None, "offers": None}
+                   "title": t, "content_key": f"ck_{k}"} for k, t in (("old0", "A"), ("old1", "B"))]
+    asked = {"seeds": None, "offers": None, "serving": []}
 
     async def fake_cohort(*a, **k):
         return cohort
@@ -286,6 +290,14 @@ def _plan_env(monkeypatch, *, new_rows):
         if "external_product_seeds" in sql:
             asked["seeds"] = list(keys)
             return [{"id": f"seed_{k}", "status": "active"} for k in keys]
+        if "catalog_row_trust" in sql:
+            asked.setdefault("searchable", []).append(list(keys))
+            return [{"product_key": k} for k in keys if k in searchable_keys]
+        if "index_pipeline_state" in sql:
+            asked["serving"].append(list(keys))
+            # Every key has a state row; the flag says which serve. Unserved flags alternate FALSE / NULL.
+            return [{"content_key": ck, "serving_eligible": True if ck in serving_cks else (False if i % 2 else None)}
+                    for i, ck in enumerate(keys)]
         if keys and keys[0].startswith("old"):
             return [r for r in stale_rows if r["product_key"] in keys]
         return [r for r in new_rows if r["product_key"] in keys]
@@ -320,3 +332,130 @@ async def test_another_sources_new_key_does_not_count_as_the_rewrite(monkeypatch
     tool, asked = _plan_env(monkeypatch, new_rows=new_rows)
     p = await tool.plan("stilacosmetics.com", "Stila", "beauty", "Stila Cosmetics")
     assert p["live"] == [] and len(p["waiting_for_new_key"]) == 2 and p["seeds"] == [] and p["offers"] == []
+
+
+# --- a live new key is not a served one: never retire a served row onto a blocked replacement -----------
+# 2026-09-28 this was hand-checked per store (old rows joined to new by host + lower(title), serving_eligible
+# compared). The tool now refuses on its own.
+
+_ALL_NEW = {f"new{i}" for i in range(5)}
+
+
+def _keys(out, bucket):
+    return [c["stale_key"] for c in out[bucket]]
+
+
+def test_a_served_old_row_is_kept_while_its_new_row_is_not_served():
+    out = select_retirable(_C[:1], _rows(), new_live=_ALL_NEW, domain="stilacosmetics.com", searchable=set(), serving={"old0"})
+    assert _keys(out, "live") == []
+    assert _keys(out, "new_not_serving") == ["old0"]
+
+
+def test_an_unserved_old_row_is_retired_even_though_its_new_row_is_not_served():
+    """Nothing is on the storefront to lose."""
+    out = select_retirable(_C[:1], _rows(), new_live=_ALL_NEW, domain="stilacosmetics.com", searchable=set(), serving=set())
+    assert _keys(out, "live") == ["old0"] and out["new_not_serving"] == []
+
+
+def test_a_served_old_row_is_retired_once_its_new_row_serves():
+    out = select_retirable(_C[:1], _rows(), new_live=_ALL_NEW, domain="stilacosmetics.com",
+                           searchable=set(), serving={"old0", "new0"})
+    assert _keys(out, "live") == ["old0"] and out["new_not_serving"] == []
+
+
+def test_the_serving_check_splits_a_mixed_store_per_key():
+    """old0 served/new0 blocked (kept), old1 dark/new1 blocked, old2 served/new2 served, old3 waiting, old4 x."""
+    rows = _rows(old4={"suppression_reason": "x"})
+    out = select_retirable(_C, rows, new_live={"new0", "new1", "new2"}, domain="stilacosmetics.com",
+                           searchable=set(), serving={"old0", "old2", "new2", "old3"})
+    assert _keys(out, "new_not_serving") == ["old0"]
+    assert _keys(out, "live") == ["old1", "old2"]
+    assert _keys(out, "waiting_for_new_key") == ["old3"]
+    assert _keys(out, "already_suppressed") == ["old4"]
+
+
+def test_the_serving_map_is_required():
+    with pytest.raises(TypeError):
+        select_retirable(_C, _rows(), new_live=_ALL_NEW, domain="stilacosmetics.com")
+
+
+def test_the_old_order_retires_regardless_of_serving():
+    """--before-rewrite retires before the new key exists at all; the serving gap is what it opts into."""
+    out = select_retirable(_C, _rows(), new_live=set(), domain="stilacosmetics.com",
+                           searchable=set(), serving={f"old{i}" for i in range(5)}, before_rewrite=True)
+    assert len(out["live"]) == 5 and out["new_not_serving"] == []
+
+
+def _both_new_rows_live():
+    return [{"product_key": f"new{i}", "source_domain": "stilacosmetics.com", "suppression_reason": None,
+             "content_key": f"ck_new{i}"} for i in range(2)]
+
+
+@pytest.mark.asyncio
+async def test_plan_loads_serving_by_content_key_in_one_query(monkeypatch):
+    """old0 + old1 both serve; only new1 serves. old0 is kept, and its seeds/offers are not touched."""
+    tool, asked = _plan_env(monkeypatch, new_rows=_both_new_rows_live(),
+                            serving_cks={"ck_old0", "ck_old1", "ck_new1"})
+    p = await tool.plan("stilacosmetics.com", "Stila", "beauty", "Stila Cosmetics")
+    assert asked["serving"] == [["ck_new0", "ck_new1", "ck_old0", "ck_old1"]]
+    assert [c["stale_key"] for c in p["new_not_serving"]] == ["old0"]
+    assert [c["stale_key"] for c in p["live"]] == ["old1"]
+    assert asked["seeds"] == ["old1"] and asked["offers"] == ["old1"]
+
+
+@pytest.mark.asyncio
+async def test_plan_asks_serving_only_for_this_stores_live_new_rows(monkeypatch):
+    """A suppressed or foreign row under the new key is not the re-run's row; its content_key must not make the
+    new key look served."""
+    new_rows = [{"product_key": "new0", "source_domain": "someretailer.com", "suppression_reason": None,
+                 "content_key": "ck_foreign"},
+                {"product_key": "new1", "source_domain": "stilacosmetics.com", "suppression_reason": "x",
+                 "content_key": "ck_dead"}]
+    tool, asked = _plan_env(monkeypatch, new_rows=new_rows, serving_cks={"ck_foreign", "ck_dead"})
+    await tool.plan("stilacosmetics.com", "Stila", "beauty", "Stila Cosmetics")
+    assert asked["serving"] == [["ck_old0", "ck_old1"]]
+
+
+@pytest.mark.asyncio
+async def test_the_plan_prints_the_kept_count_and_counts_suppressed_rows_not_present_minus_live(monkeypatch, capsys):
+    import scripts.retire_superseded_brand_keys as tool
+    # old0 served, new0 live but blocked -> kept; old1's new key not written -> waiting. Nothing is suppressed,
+    # but present - live would print 2.
+    new_rows = _both_new_rows_live()[:1]
+    tool, _ = _plan_env(monkeypatch, new_rows=new_rows, serving_cks={"ck_old0"})
+    p = await tool.plan("stilacosmetics.com", "Stila", "beauty", "Stila Cosmetics")
+    tool.print_plan(p)
+    out = capsys.readouterr().out
+    assert "NEW NOT SERVING (old served): 1  -- never retired" in out
+    assert "WAITING (new key not live)  : 1" in out
+    assert "already suppressed          : 0" in out
+
+
+# --- the store scope is an exact host match: a subdomain or look-alike host is another source -----------
+# Mutation sweep of #2424: `!=` / `==` on _host() rewritten to a substring test survived every test above.
+# Hosts on both sides of a substring test: ones that CONTAIN the store's host and ones CONTAINED IN it.
+
+_LOOKALIKES = ["shop.stilacosmetics.com", "stilacosmetics.com.evil.io", "notstilacosmetics.com",
+               "cosmetics.com", "stilacosmetics.co"]
+
+
+@pytest.mark.parametrize("lookalike", _LOOKALIKES)
+def test_a_lookalike_hosts_stale_row_is_foreign_never_retired(lookalike):
+    rows = _rows(old0={"source_domain": lookalike}, old1={"source_domain": "www.stilacosmetics.com"})
+    out = select_retirable(_C[:2], rows, new_live=_ALL_NEW, domain="stilacosmetics.com", searchable=set(), serving=set())
+    assert _keys(out, "foreign") == ["old0"]
+    assert _keys(out, "live") == ["old1"]   # www. is the same store
+
+
+@pytest.mark.parametrize("lookalike", _LOOKALIKES)
+@pytest.mark.asyncio
+async def test_a_lookalike_hosts_new_row_does_not_count_as_the_rewrite(monkeypatch, lookalike):
+    new_rows = [{"product_key": "new0", "source_domain": lookalike, "suppression_reason": None,
+                 "content_key": "ck_new0"},
+                {"product_key": "new1", "source_domain": "www.stilacosmetics.com", "suppression_reason": None,
+                 "content_key": "ck_new1"}]
+    tool, asked = _plan_env(monkeypatch, new_rows=new_rows)
+    p = await tool.plan("stilacosmetics.com", "Stila", "beauty", "Stila Cosmetics")
+    assert [c["stale_key"] for c in p["waiting_for_new_key"]] == ["old0"]
+    assert [c["stale_key"] for c in p["live"]] == ["old1"]   # www. is the same store
+    assert asked["seeds"] == ["old1"] and asked["offers"] == ["old1"]

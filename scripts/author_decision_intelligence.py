@@ -63,6 +63,7 @@ from db.database import database  # noqa: E402
 from db.product_enrichment import upsert_enrichment  # noqa: E402
 from services.agent_pdp_view_assembler import (  # noqa: E402
     fetch_products_for_key,
+    load_served_copy,
     pick_canonical,
     refresh_agent_pdp_view_for_content_key,
 )
@@ -170,6 +171,8 @@ async def _prepare(ck: str) -> Optional[Dict[str, Any]]:
     products = await fetch_products_for_key(ck, db=database)
     if not products:
         return None
+    # The winner the rebuild serves: annotate exactly as refresh_agent_pdp_view_for_content_key does.
+    await load_served_copy(products)
     canonical = pick_canonical(products)
     if not all((canonical.get("merchant_id"), canonical.get("platform"),
                 canonical.get("source_product_id"))):

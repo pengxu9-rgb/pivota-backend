@@ -172,7 +172,10 @@ jobs:
   postgres-dialect-gate:
     name: execute real routes on real Postgres
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 15 was the ceiling, not the budget: on 2026-09-28 green runs took 14-15 min and
+    # #2422/#2423 were cancelled at 74% with every test passing. A cancelled gate is a
+    # red gate for a reason unrelated to the code; 25 leaves room for added PG tests.
+    timeout-minutes: 25
 
     services:
       postgres:

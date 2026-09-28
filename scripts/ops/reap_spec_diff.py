@@ -61,7 +61,7 @@ SPEC_URL = "https://docs.reap.global/api-reference/openapi.json"
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FIXTURE_PATH = os.path.join(
-    _REPO_ROOT, "tests", "fixtures", "reap_openapi_agentic_2026_09_25.json"
+    _REPO_ROOT, "tests", "fixtures", "reap_openapi_agentic_2026_09_28.json"
 )
 
 #: Keys dropped everywhere before comparison. Prose, not contract.
