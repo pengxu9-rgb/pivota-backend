@@ -172,6 +172,7 @@ async def upsert_catalog_offer_from_seed_row(
     row_dict: Dict[str, Any],
     *,
     merchant_id: str,
+    price_read: bool = False,
 ) -> None:
     """Write / refresh the canonical offer row carrying price + currency +
     availability for one external seed. `price_amount` is mapped 1:1 to all
@@ -184,6 +185,11 @@ async def upsert_catalog_offer_from_seed_row(
     `merchant_id` is REQUIRED and must be the seed's real observed seller (from
     resolve_mirror_product) — never the 'external_seed' sentinel, which ADR-009
     D2 bans and the mirror refuses.
+
+    `price_read` is the caller vouching that the seed's price and currency were
+    just read from the served page (see `sync_offer_for_seed`), and only then is
+    `price_checked_at` stamped. Otherwise the row keeps its stamp, and migration
+    246's trigger forgets it if this write moves the price.
     """
     if not merchant_id or merchant_id == "external_seed":
         raise ValueError(
@@ -259,7 +265,7 @@ async def upsert_catalog_offer_from_seed_row(
            channel, availability, inventory_quantity, currency,
            list_price, merchant_effective_price, estimated_best_price,
            price_confidence, source_system, source_ref, source_domain,
-           offer_payload)
+           offer_payload, price_checked_at)
         VALUES
           (:offer_id, :sku_key, :product_key, :merchant_id,
            :catalog_track, :truth_tier, :readiness_tier,
@@ -267,7 +273,8 @@ async def upsert_catalog_offer_from_seed_row(
            :channel, :availability, :inventory_quantity, :currency,
            :list_price, :merchant_effective_price, :estimated_best_price,
            :price_confidence, :source_system, :source_ref, :source_domain,
-           CAST(:offer_payload AS jsonb))
+           CAST(:offer_payload AS jsonb),
+           CASE WHEN CAST(:price_read AS BOOLEAN) THEN NOW() END)
         ON CONFLICT (offer_id) DO UPDATE SET
           -- A KNOWN-retailer host is AUTHORITATIVE third-party evidence, so it
           -- corrects a wrongly-stored value (demotes a bad brand_direct/first-party):
@@ -296,6 +303,10 @@ async def upsert_catalog_offer_from_seed_row(
           -- to reconcile, not this ingest upsert's.
           source_domain = COALESCE(catalog_offers.source_domain, EXCLUDED.source_domain),
           offer_payload = EXCLUDED.offer_payload,
+          price_checked_at = CASE
+            WHEN CAST(:price_read AS BOOLEAN) THEN NOW()
+            ELSE catalog_offers.price_checked_at
+          END,
           updated_at = NOW()
         """,
         {
@@ -325,6 +336,7 @@ async def upsert_catalog_offer_from_seed_row(
             "offer_payload": json.dumps(
                 offer_payload, ensure_ascii=False, default=_json_default
             ),
+            "price_read": bool(price_read),
         },
     )
 
@@ -390,6 +402,15 @@ _SEED_OFFER_COLUMNS = (
 # (R = EXTERNAL_OFFER_PROJECTION_MAX_PRICE_RATIO, default 3) is refused, counted and logged for a
 # human. An employee's edit is not bounded: correcting exactly such a 100x row is what it is for.
 ATTACHED_PRICE_SOURCES = frozenset({"refresh", "employee_edit"})
+
+
+def price_was_read(source: Optional[str], currency_read: bool) -> bool:
+    """Does the caller vouch for a price AND currency read now, so `price_checked_at` may say so?
+
+    The attached lane's own rule, for the mirror row too: an employee's edit, or a refresh whose
+    page named the currency. A refresh that fell back to the market's currency read a number but
+    not what it is in, and the seed_data merges and the reconciler pass no source at all."""
+    return source == "employee_edit" or (source == "refresh" and bool(currency_read))
 _DEFAULT_MAX_PRICE_RATIO = 3.0
 
 
@@ -422,6 +443,8 @@ UPDATE catalog_offers
 SET list_price = :price,
     merchant_effective_price = :price,
     estimated_best_price = :price,
+    -- Every write this lane makes is a vouched read (ATTACHED_PRICE_SOURCES), so it dates the price.
+    price_checked_at = NOW(),
     updated_at = NOW()
 WHERE offer_id = :offer_id
   AND upper(trim(coalesce(currency, ''))) = :currency
@@ -631,7 +654,9 @@ async def sync_offer_for_seed(
     CURRENT, and how: `refresh` (re-read from the served page this run;
     `currency_read` says the page named the currency) or `employee_edit` (an
     employee set the price). See ATTACHED_PRICE_SOURCES. The attached lane
-    stamps the listing's rows `updated_at = NOW()`, and a caller that merely
+    stamps the listing's rows `updated_at` and `price_checked_at` with NOW(), and
+    the mirror upsert stamps `price_checked_at` on the same vouching
+    (`price_was_read`). A caller that merely
     rewrote seed_data (seed_data_writer's merge, the mirror reconciler) would
     claim a freshness nobody earned, so those pass nothing and keep the
     mirror-only behaviour: `no_mirror_product` for an attached seed.
@@ -668,7 +693,8 @@ async def sync_offer_for_seed(
 
         product_key = mirror["product_key"]
         await upsert_catalog_offer_from_seed_row(
-            product_key, seed, merchant_id=mirror["merchant_id"]
+            product_key, seed, merchant_id=mirror["merchant_id"],
+            price_read=price_was_read(attached_price_source, currency_read),
         )
         return {"seed_id": seed_id, "status": "synced", "product_key": product_key, "target": "mirror"}
     except Exception as exc:  # noqa: BLE001

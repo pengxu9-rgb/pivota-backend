@@ -275,3 +275,47 @@ async def test_junk_seed_domain_does_not_shadow_a_good_url_host(monkeypatch):
         merchant_id=_REAL_SELLER,
     )
     assert fake2.executed[0]["params"]["source_domain"] is None
+
+
+# ── price_checked_at (mig 246): only a vouched read may date the mirror row's price ──────────────
+
+
+@pytest.mark.parametrize(
+    "source, currency_read, stamped",
+    [
+        (None, False, False),             # seed_data_writer's merge, the reconciler
+        (None, True, False),
+        ("refresh", True, True),          # re-read, and the page named the currency
+        ("refresh", False, False),        # a number read in a currency the reader filled in
+        ("employee_edit", False, True),   # an employee set the price
+        ("something_else", True, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_mirror_row_is_stamped_only_on_a_vouched_read(monkeypatch, source, currency_read, stamped):
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    seed = {
+        "id": "s1", "external_product_id": "ext1",
+        "price_amount": 19.99, "price_currency": "USD", "availability": "in_stock",
+        "destination_url": "https://x.test/p", "domain": "x.test", "market": "US",
+    }
+    fake = FakeDB(seed=seed, mirror={"product_key": _REAL_PK, "merchant_id": _REAL_SELLER})
+    monkeypatch.setattr(mod, "database", fake)
+
+    result = await mod.sync_offer_for_seed("s1", attached_price_source=source, currency_read=currency_read)
+    assert result["status"] == "synced" and result["target"] == "mirror"
+    assert fake.executed[0]["params"]["price_read"] is stamped
+    assert mod.price_was_read(source, currency_read) is stamped
+
+
+def test_the_mirror_upsert_never_stamps_without_the_callers_word():
+    """The statement's only source of a stamp is `:price_read`; an unvouched write keeps the row's
+    own stamp, and migration 246's trigger forgets it if the price moved."""
+    import inspect
+
+    source = inspect.getsource(mod.upsert_catalog_offer_from_seed_row)
+    assert "price_read: bool = False" in source
+    assert source.count("NOW() END") == 1  # the INSERT arm
+    assert "WHEN CAST(:price_read AS BOOLEAN) THEN NOW()" in source
+    assert "ELSE catalog_offers.price_checked_at" in source
+    assert "price_checked_at = NOW()" in mod.ATTACHED_LISTING_OFFER_UPDATE_SQL

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Sequence, Set
 
 from db.database import IS_POSTGRES, IS_SQLITE, database
@@ -245,6 +246,51 @@ async def _heal_guarded(table: str, needed: str, ddl: str) -> None:
         await database.execute(text(guarded_ddl(table, needed, ddl)))
     except Exception as exc:  # noqa: BLE001
         logger.warning("schema guard: %s heal deferred to next boot: %s", table, exc)
+
+
+# Mig 246's trigger, installed from the migration file itself: the statements that run on a prod
+# boot are the ones reviewed in the .sql, never a copy that can drift from it. Needed while the
+# column exists (the function reads it) and the trigger does not.
+PRICE_CHECK_MIGRATION = Path(__file__).resolve().parent / "migrations" / "246_catalog_offers_price_checked_at.sql"
+PRICE_CHECK_TRIGGER = "trg_catalog_offers_forget_unread_price_check"
+PRICE_CHECK_TRIGGER_NEEDED = f"""EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = to_regclass('catalog_offers')
+                  AND attname = 'price_checked_at'
+                  AND attnum > 0
+                  AND NOT attisdropped
+            ) AND NOT EXISTS (
+                SELECT 1 FROM pg_trigger
+                WHERE tgrelid = to_regclass('catalog_offers')
+                  AND tgname = '{PRICE_CHECK_TRIGGER}'
+                  AND NOT tgisinternal
+            )"""
+_PRICE_CHECK_TRIGGER_STATEMENTS = ("CREATE OR REPLACE FUNCTION", "DROP TRIGGER", "CREATE TRIGGER")
+
+
+def price_check_trigger_ddl() -> str:
+    """The function and trigger statements of migration 246, in file order, comments dropped."""
+    from db.sql_migrations import split_statements
+
+    picked = []
+    for statement in split_statements(PRICE_CHECK_MIGRATION.read_text()):
+        code = "\n".join(
+            line for line in statement.splitlines() if not line.lstrip().startswith("--")
+        ).strip().rstrip(";").strip()
+        if code.upper().startswith(_PRICE_CHECK_TRIGGER_STATEMENTS):
+            picked.append(code + ";")
+    if len(picked) != len(_PRICE_CHECK_TRIGGER_STATEMENTS):
+        raise ValueError(f"migration 246 changed shape: {len(picked)} trigger statements")
+    return "\n".join(picked)
+
+
+async def _heal_price_check_trigger() -> None:
+    try:
+        ddl = price_check_trigger_ddl()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("schema guard: price_checked_at trigger not installed: %s", exc)
+        return
+    await _heal_guarded("catalog_offers", PRICE_CHECK_TRIGGER_NEEDED, ddl)
 
 
 # And for index builds. `CREATE INDEX IF NOT EXISTS` takes the table's SHARE lock
@@ -2370,6 +2416,16 @@ async def ensure_required_schema_light() -> None:
                   ADD COLUMN IF NOT EXISTS suppressed_at TIMESTAMPTZ NULL;
                 """
             )
+            # mig 246: when the offer's price was last READ, and the trigger that forgets it when
+            # the price moves without a read. The dual-write writers stamp the column, so it has
+            # to land with the deploy; the trigger comes after it (its function reads the column).
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_offers
+                  ADD COLUMN IF NOT EXISTS price_checked_at TIMESTAMPTZ NULL;
+                """
+            )
+            await _heal_price_check_trigger()
             # Phase O-5b cross-PDP coalesce: agent_pdp_view aggregates
             # material/care/size_guide from all product_group_members +
             # matched external_product_seeds. The columns mirror the

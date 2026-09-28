@@ -69,6 +69,10 @@ _SEED_COLUMNS = (
 _LIGHTWEIGHT_DDL = "CREATE TABLE IF NOT EXISTS external_product_seeds (id text);\n" + "\n".join(
     f"ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS {name} {typ};"
     for name, typ in _SEED_COLUMNS
+) + (
+    # create_all(checkfirst) cannot widen a catalog_offers an earlier gate file made; the mirror
+    # upsert writes price_checked_at (mig 246, healed by schema_guard in prod).
+    "\nALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS price_checked_at TIMESTAMPTZ;"
 )
 
 _PREFIX = "dla-gate-"
