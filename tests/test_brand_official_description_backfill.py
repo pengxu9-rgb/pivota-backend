@@ -1355,11 +1355,15 @@ def test_the_verdict_does_not_depend_on_candidate_order_with_store_titles():
     tpl = "{} glides on in one swipe with a glassy finish that lasts all day without drying lips."
     rows = [("p1", "glaze-lip", "Glaze Lipstick"), ("p2", "glaze-lip", "Glaze Lipstick 3.5g"),
             ("p3", "holiday-glaze-duo", "[Special Set] Glaze Lipstick")]
-    for store_titles in (None, {"p1": "Glaze Lipstick", "p2": "Glaze Lipstick",
-                                "p3": "[Special Set] Glaze Lipstick"}):
+    # Both shapes: one identical value on every page (mechanism 2's census), and each page naming
+    # itself so only the value with its name cut out repeats (mechanism 4's census).
+    shapes = (lambda pk, t: tpl.format("Glaze Lipstick"),
+              lambda pk, t: tpl.format(t if pk == "p3" else "Glaze Lipstick"))
+    for shape, store_titles in itertools.product(shapes, (None, {
+            "p1": "Glaze Lipstick", "p2": "Glaze Lipstick", "p3": "[Special Set] Glaze Lipstick"})):
         verdicts = set()
         for perm in itertools.permutations(rows):
-            cands = {pk: tpl.format("Glaze Lipstick") for pk, _h, _t in perm}
+            cands = {pk: shape(pk, t) for pk, _h, t in perm}
             kept = bf.drop_shared_boilerplate(
                 cands, _BLURB, titles={pk: t for pk, _h, t in perm},
                 handles={pk: h for pk, h, _t in perm}, store_titles=store_titles)
