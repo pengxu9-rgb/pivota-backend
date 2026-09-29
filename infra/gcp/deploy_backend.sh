@@ -97,22 +97,44 @@ if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ] && [ "$CONFIG" = pre
 fi
 # Staging holds a restored copy of production data and production third-party credentials, so it is
 # IAM-gated by default. Prod is a public API. Override with PUBLIC=1 / PUBLIC=0.
+# UNDER CONFIG=preserve AN UNSET PUBLIC KEEPS WHAT THE SERVICE ALREADY GRANTS (see
+# preserved_public_invoker below): a service that already grants roles/run.invoker to allUsers is
+# redeployed public. Staging `web` became allUsers-invokable on 2026-09-29 (Peng) because the
+# staging gateway calls /agent/internal/auth/introspect without an ID token; ingress stays
+# `internal`. Before this, every preserve deploy of staging ran --no-allow-unauthenticated and
+# silently REVOKED that binding, breaking the staging gateway. An explicit PUBLIC=0 still wins.
 # all-traffic, NOT private-ranges-only. Under private-ranges-only outbound traffic to the public
 # internet does not traverse the VPC, so it never leaves via Cloud NAT and the reserved address is
 # NOT the source IP. `8.231.167.230` is published to Antom/Adyen for allowlisting, so a deploy that
 # reverted this would silently break their IP checks. Verified from inside the VPC: a Cloud Run job
 # on this egress mode reports EGRESS_IP=8.231.167.230.
 : "${VPC_EGRESS:=all-traffic}"
+_PUBLIC_EXPLICIT="${PUBLIC+1}"
 : "${PUBLIC:=$([ "$ENV" = prod ] && echo 1 || echo 0)}"
 # `internal` and `internal-and-cloud-load-balancing` are DIFFERENT values: only the latter admits
 # requests from Google Cloud Load Balancing. Setting plain `internal` on a service behind the LB
 # makes every request through api.pivota.cc fail with a valid certificate and a correct-looking
 # url map - the same "looks built, is not" shape as the unattached backend service.
 : "${INGRESS:=$([ "$ENV" = prod ] && echo internal-and-cloud-load-balancing || echo internal)}"
-[ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
 GCLOUD="${GCLOUD:-gcloud}"
 REGION=us-west1
 SERVICE="${SERVICE:-web}"
+preserved_public_invoker(){ # echoes 1 when the running service grants roles/run.invoker to allUsers
+  # A read failure (no service yet, no permission) echoes nothing: the env default then stands.
+  "$GCLOUD" run services get-iam-policy "$SERVICE" --project "$PROJECT" --region "$REGION" --format=json 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print(1 if any(b.get("role") == "roles/run.invoker" and "allUsers" in (b.get("members") or []) for b in (d.get("bindings") or [])) else 0)' 2>/dev/null || true
+}
+if [ -z "$_PUBLIC_EXPLICIT" ] && [ "$CONFIG" = preserve ] && [ "$PUBLIC" != 1 ] \
+   && [ "$(preserved_public_invoker)" = 1 ]; then
+  PUBLIC=1
+  echo "note: $SERVICE already grants roles/run.invoker to allUsers; CONFIG=preserve keeps it (PUBLIC=1). Pass PUBLIC=0 to make it private." >&2
+fi
+[ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
 if [ "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" = true ] && [ "$SERVICE" != web ]; then
   echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED is only valid for SERVICE=web." >&2
   exit 2
