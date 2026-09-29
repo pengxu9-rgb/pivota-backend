@@ -2304,13 +2304,17 @@ async def test_merchant_disabled_under_a_key_writes_no_key_row_on_postgres(clien
         "SELECT COUNT(*) FROM reap_agentic_purchase_keys WHERE idempotency_key = 'pg-k-off'") == 0
 
 
-@pytest.mark.parametrize("real_price,expected,reason", [
-    (None, 202, None),        # the live shape: only the placeholder is offered
-    ("28.00", 202, None),     # both offered, agreeing
-    ("26.00", 409, "row_price_ambiguous"),
+@pytest.mark.parametrize("real_price,extra_placeholder,expected,want", [
+    (None, None, 202, 2800),       # the live shape: only the placeholder is offered
+    ("28.00", None, 202, 2800),    # both offered, agreeing
+    ("26.00", None, 202, 2600),    # the real sku's offer wins; the placeholder is not read
+    # the same seller's SGD placeholder offer, stamped with the mirror's default market 'US', is not
+    # a disagreement for a US buyer (the currency conjunct, on this dialect)
+    (None, ("36.00", "SGD", "US"), 202, 2800),
+    (None, ("30.00", "USD", "US"), 409, "row_price_ambiguous"),
 ])
 async def test_tierb_a_mirror_row_priced_from_its_placeholder_on_postgres(
-    client, monkeypatch, real_price, expected, reason
+    client, monkeypatch, real_price, extra_placeholder, expected, want
 ):
     """The KraveBeauty staging row, on the production dialect: `::canonical` placeholder carrying the
     merchant's only offer (USD 28.00), one real sku naming the proven sole variant."""
@@ -2343,13 +2347,16 @@ async def test_tierb_a_mirror_row_priced_from_its_placeholder_on_postgres(
                 "(:sk, :pk, :m, 'external_seed', :ext, :vid, '24 Carrot Retinal', 'USD')",
                 {"sk": sku_key, "pk": pk, "m": merchant, "ext": ext, "vid": vid},
             )
-        offers = [(placeholder, "28.00")] + ([(real, real_price)] if real_price else [])
-        for i, (sku_key, price) in enumerate(offers):
+        offers = [(placeholder, "28.00", "USD", "US")]
+        offers += [(real, real_price, "USD", "US")] if real_price else []
+        offers += [(placeholder, *extra_placeholder)] if extra_placeholder else []
+        for i, (sku_key, amount, currency, market) in enumerate(offers):
             await database.execute(
                 "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, "
-                "merchant_effective_price, availability) VALUES (:oid, :sk, :pk, :m, 'USD', "
-                "CAST(:p AS NUMERIC), 'in_stock')",
-                {"oid": f"off_krave_pg_{i}", "sk": sku_key, "pk": pk, "m": merchant, "p": price},
+                "market, merchant_effective_price, availability) VALUES (:oid, :sk, :pk, :m, :cur, "
+                ":mk, CAST(:p AS NUMERIC), 'in_stock')",
+                {"oid": f"off_krave_pg_{i}", "sk": sku_key, "pk": pk, "m": merchant, "p": amount,
+                 "cur": currency, "mk": market},
             )
         seed_data = json.dumps({"snapshot": {
             "brand": "KraveBeauty", "storefront_platform": "shopify",
@@ -2381,10 +2388,10 @@ async def test_tierb_a_mirror_row_priced_from_its_placeholder_on_postgres(
                 "SELECT cart_url, our_price_minor FROM reap_agentic_purchases WHERE id = :id",
                 {"id": response.json()["purchase_id"]},
             )
-            assert purchase["our_price_minor"] == 2800
+            assert purchase["our_price_minor"] == want
             assert f"https://{domain}/cart/{variant}:1?" in purchase["cart_url"]
         else:
-            assert _error(response) == reason
+            assert _error(response) == want
     finally:
         await database.execute("DELETE FROM external_product_seeds WHERE id = :id", {"id": seed_id})
         await database.execute("DROP TABLE external_product_seeds")

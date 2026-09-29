@@ -1265,6 +1265,13 @@ _CART_SEED_VARIANT_SQL = """
        AND e.attached_product_key = :product_key
        AND lower(e.domain) = :merchant_domain AND upper(e.market) = :market_country
 """
+# THE MARKET'S CURRENCY, in SQL (review of #2457): an offer in another currency is not an offer for
+# this buyer -- not a price to compare, not a cheaper pick. It gates on `currency`, NEVER on
+# `market`, for the reason `services.region_pricing` gives: `market` is NOT NULL DEFAULT 'US' and
+# the mirror writer (`external_offer_dual_write.MIRROR_OFFER_UPSERT_SQL`) never sets it, so every
+# mirror offer -- an SG seed's SGD offer included -- reads 'US'. Filtering on it would refuse every
+# SG mirror row and still count an SGD offer as a US one. A NULL / blank currency matches nothing.
+_CART_OFFER_MARKET_CURRENCY = "upper(trim(coalesce(o.currency, ''))) = :market_currency"
 # EVERY usable offer this seller has on ONE sku (bounded) -- read for a mirror's `::canonical`
 # placeholder, whose offers must all AGREE before one is priced (see `_load_cart_link_item`).
 _CART_ALL_OFFERS_SQL = """
@@ -1278,6 +1285,7 @@ _CART_ALL_OFFERS_SQL = """
        AND coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) IS NOT NULL
        AND lower(coalesce(o.availability, 'unknown')) NOT IN
            ('out_of_stock', 'sold_out', 'unavailable')
+       AND """ + _CART_OFFER_MARKET_CURRENCY + """
      ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC
      LIMIT 20
 """
@@ -1292,6 +1300,7 @@ _CART_OFFER_SQL = """
        AND coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) IS NOT NULL
        AND lower(coalesce(o.availability, 'unknown')) NOT IN
            ('out_of_stock', 'sold_out', 'unavailable')
+       AND """ + _CART_OFFER_MARKET_CURRENCY + """
      ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC
      LIMIT 1
 """
@@ -1429,6 +1438,14 @@ def _mirror_seller_ref(product: Mapping[str, Any], seed: Mapping[str, Any], seed
     return None
 
 
+def _proof_live_variant_count(seed_data: Any) -> Optional[int]:
+    """The storefront proof's `live_variant_count` (an int, exactly as the proof reads it), or None."""
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data, dict) else None
+    proof = snapshot.get("shopify_cart_proof") if isinstance(snapshot, dict) else None
+    count = proof.get("live_variant_count") if isinstance(proof, dict) else None
+    return count if type(count) is int else None
+
+
 async def _load_cart_link_item(
     *, merchant_domain: str, product_key: str, variant_key: Optional[str],
     market_country: str,
@@ -1459,6 +1476,7 @@ async def _load_cart_link_item(
         named = dict(raw_sku)
 
     placeholder: Optional[Dict[str, Any]] = None
+    seed_data: Any = None
     if platform == "shopify":
         if named is not None:
             # The caller named the sku: exactly as before -- that sku, its variant, its offer.
@@ -1535,50 +1553,44 @@ async def _load_cart_link_item(
     # A MIRROR ROW MAY BE PRICED FROM ITS `::canonical` PLACEHOLDER (staging demo, 2026-09-29:
     # KraveBeauty 24 Carrot Retinal). The mirror writes its offer on the placeholder
     # (`external_offer_dual_write.derive_mirror_sku_key`); a real variant sku another lane added
-    # often carries none. The placeholder names no variant -- the seed's storefront proof above
-    # already proved the product has exactly ONE live variant -- so its offer is that variant's
-    # price, exactly as in the placeholder-only case this lane already accepts. Rules:
-    #   * every usable placeholder offer from THIS seller is read, and they must agree on
-    #     (currency, minor), else `row_price_ambiguous`;
-    #   * a real sku's usable offer is preferred, and must agree with the placeholder's if both
-    #     exist, else `row_price_ambiguous`;
+    # often carries none. The placeholder names no variant, so its offer is the variant's price
+    # ONLY while the storefront proof shows exactly ONE live variant (`live_variant_count == 1`,
+    # checked here itself, not inherited from today's proof: a multi-variant, variant-scoped proof
+    # must never be priced from a product-grain offer). Rules (review of #2457):
+    #   * the real sku's offer WINS whenever it has one -- it is variant-scoped and fresher, and
+    #     Reap's exact-subtotal check refuses a stale price at quote time; the placeholder is
+    #     not read and cannot disagree with it;
+    #   * only with NO usable real-sku offer is the placeholder read, EVERY usable offer this
+    #     seller has on it in the market's currency, and they must agree, else
+    #     `row_price_ambiguous`;
     #   * only for a mirror row with no caller-named sku; Shopify rows are unchanged.
-    placeholder_key = (
-        placeholder["sku_key"]
-        if platform != "shopify" and named is None and placeholder is not None else None
-    )
+    mirror_placeholder = placeholder if platform != "shopify" and named is None else None
 
     def _priced(candidate: Mapping[str, Any], found: Any) -> Tuple[Dict[str, Any], Dict[str, Any], str, Optional[int]]:
         found = dict(found)
         cur = str(found.get("currency") or candidate.get("currency") or "").strip().upper()
         return dict(candidate), found, cur, ledger.amount_minor_or_none(found.get("price"), cur)
 
+    offer_params = {"product_key": product_key, "merchant_id": seller_ref,
+                    "market_currency": _MARKET_CURRENCY.get(market_country)}
     priced: List[Tuple[Dict[str, Any], Dict[str, Any], str, Optional[int]]] = []
     for candidate in candidates:
-        if candidate["sku_key"] == placeholder_key:
-            continue  # read below, every offer, not the cheapest one
+        if mirror_placeholder is not None and candidate["sku_key"] == mirror_placeholder["sku_key"]:
+            continue  # the placeholder is only ever read below, every offer, behind the gate
         found = await database.fetch_one(
-            _CART_OFFER_SQL,
-            {"product_key": product_key, "sku_key": candidate["sku_key"],
-             "merchant_id": seller_ref},
+            _CART_OFFER_SQL, {**offer_params, "sku_key": candidate["sku_key"]}
         )
         if found is not None:
             priced.append(_priced(candidate, found))
-    placeholder_priced: List[Tuple[Dict[str, Any], Dict[str, Any], str, Optional[int]]] = []
-    if placeholder_key is not None:
-        placeholder_priced = [_priced(placeholder, found) for found in await database.fetch_all(
-            _CART_ALL_OFFERS_SQL,
-            {"product_key": product_key, "sku_key": placeholder_key, "merchant_id": seller_ref},
+    if (not priced and mirror_placeholder is not None
+            and _proof_live_variant_count(seed_data) == 1):
+        priced = [_priced(mirror_placeholder, found) for found in await database.fetch_all(
+            _CART_ALL_OFFERS_SQL, {**offer_params, "sku_key": mirror_placeholder["sku_key"]}
         )]
-    real_prices = {(cur, minor) for _c, _o, cur, minor in priced}
-    placeholder_prices = {(cur, minor) for _c, _o, cur, minor in placeholder_priced}
-    if len(real_prices) > 1 or len(placeholder_prices) > 1 or (
-        real_prices and placeholder_prices and real_prices != placeholder_prices
-    ):
+    if len({(cur, minor) for _c, _o, cur, minor in priced}) > 1:
         raise svc.PurchaseRefused(
             "row_price_ambiguous", "the spellings of this variant carry different prices"
         )
-    priced = priced or placeholder_priced
     if not priced:
         raise svc.PurchaseRefused("row_unpriced", "seller has no usable offer on this sku")
     sku, offer, currency, price_minor = priced[0]

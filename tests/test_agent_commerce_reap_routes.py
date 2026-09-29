@@ -3552,8 +3552,11 @@ KRAVE_PLACEHOLDER = f"{KRAVE_PK}::canonical"
 KRAVE_REAL = f"{KRAVE_PK}::sku_3c1f0e9a7b2d4c6e8f01"
 
 
-async def _seed_krave_mirror(*, offers):
-    """`offers`: [(sku_key, merchant_id, price)] -- USD, in_stock."""
+async def _seed_krave_mirror(*, offers, market="US", live_variant_count=1):
+    """`offers`: [(sku_key, merchant_id, price)] -- USD, in_stock, market 'US' (the mirror writer's
+    column default) -- or [(sku_key, merchant_id, price, {column: value})] to override any of
+    currency / market / availability / suppression_reason / suppressed_at. `market` is the seed's
+    and the Tier B verdict's; the buyer's market is the shipping country (`_krave_body`)."""
     await database.execute(
         "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, "
         "brand, category, product_type, source_domain, source_system, source_ref, seller_ref, "
@@ -3568,11 +3571,16 @@ async def _seed_krave_mirror(*, offers):
             "'24 Carrot Retinal', 'USD')",
             {"sk": sku_key, "pk": KRAVE_PK, "m": KRAVE_MERCHANT, "ext": KRAVE_EXT, "vid": vid},
         )
-    for i, (sku_key, merchant_id, price) in enumerate(offers):
+    for i, (sku_key, merchant_id, price, *extra) in enumerate(offers):
+        cols = {"currency": "USD", "market": "US", "availability": "in_stock",
+                "suppression_reason": None, "suppressed_at": None, **(extra[0] if extra else {})}
         await database.execute(
-            "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, "
-            "merchant_effective_price, availability) VALUES (:oid, :sk, :pk, :m, 'USD', :p, 'in_stock')",
-            {"oid": f"off_krave_{i}", "sk": sku_key, "pk": KRAVE_PK, "m": merchant_id, "p": price},
+            "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, market, "
+            "merchant_effective_price, availability, suppression_reason, suppressed_at) VALUES "
+            "(:oid, :sk, :pk, :m, :currency, :market, :p, :availability, :suppression_reason, "
+            ":suppressed_at)",
+            {"oid": f"off_krave_{i}", "sk": sku_key, "pk": KRAVE_PK, "m": merchant_id, "p": price,
+             **cols},
         )
     seed = {"snapshot": {
         "brand": "KraveBeauty", "title": "24 Carrot Retinal",
@@ -3581,57 +3589,114 @@ async def _seed_krave_mirror(*, offers):
         "shopify_cart_proof": {
             "source": "products_js_v1",
             "product_js_url": f"https://{KRAVE_DOMAIN}/products/24-carrot-retinal.js",
-            "live_variant_count": 1, "variant_id": KRAVE_VARIANT,
+            "live_variant_count": live_variant_count, "variant_id": KRAVE_VARIANT,
             "checked_at": datetime.now(timezone.utc).isoformat(),
         },
     }}
     await database.execute(
         "INSERT INTO external_product_seeds (id, status, domain, market, destination_url, "
         "canonical_url, attached_product_key, attached_variant_id, seed_data) VALUES "
-        "(:id, 'active', :d, 'US', :dest, NULL, :pk, NULL, :sd)",
-        {"id": KRAVE_SEED, "d": KRAVE_DOMAIN, "dest": f"https://{KRAVE_DOMAIN}/products/24-carrot-retinal",
-         "pk": KRAVE_PK, "sd": json.dumps(seed)},
+        "(:id, 'active', :d, :mk, :dest, NULL, :pk, NULL, :sd)",
+        {"id": KRAVE_SEED, "d": KRAVE_DOMAIN, "mk": market,
+         "dest": f"https://{KRAVE_DOMAIN}/products/24-carrot-retinal", "pk": KRAVE_PK,
+         "sd": json.dumps(seed)},
     )
     await database.execute(
         "INSERT INTO tierb_cart_link_eligibility (shop_domain, market, verdict, checked_at) "
-        "VALUES (:d, 'US', 'ELIGIBLE', CURRENT_TIMESTAMP)", {"d": KRAVE_DOMAIN},
+        "VALUES (:d, :mk, 'ELIGIBLE', CURRENT_TIMESTAMP)", {"d": KRAVE_DOMAIN, "mk": market},
     )
 
 
-def _krave_body() -> Dict[str, Any]:
+def _krave_body(country: str = "US") -> Dict[str, Any]:
     return _body(item_source="cart_link", merchant_domain=KRAVE_DOMAIN, product_key=KRAVE_PK,
-                 variant_key=None)
+                 variant_key=None, buyer=_buyer(shipping_address=dict(ADDRESS, country=country)))
 
 
-@pytest.mark.parametrize("offers,expected,price", [
+_SGD_SG = {"currency": "SGD", "market": "SG"}
+#: The mirror writer never sets `market`, so an SG seed's SGD offer carries the column default.
+_SGD_DEFAULT_MARKET = {"currency": "SGD", "market": "US"}
+_SUPPRESSED = {"suppression_reason": "stale_source", "suppressed_at": "2026-09-28 00:00:00"}
+
+
+@pytest.mark.parametrize("offers,price", [
     # THE LIVE SHAPE: the real sku has no offer, the placeholder has the merchant's only one.
-    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], 202, 2800),
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], 2800),
     # both offered, agreeing: the real sku's offer is used (same price)
-    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_REAL, KRAVE_MERCHANT, "28.00")], 202, 2800),
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_REAL, KRAVE_MERCHANT, "28.00")], 2800),
     # only the real sku offered: unchanged from before
-    ([(KRAVE_REAL, KRAVE_MERCHANT, "28.00")], 202, 2800),
+    ([(KRAVE_REAL, KRAVE_MERCHANT, "28.00")], 2800),
     # two placeholder offers from this merchant that agree
-    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], 202, 2800),
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], 2800),
+    # THE REAL SKU WINS (review of #2457): a disagreeing placeholder is never read, in either
+    # direction -- the real sku's offer is variant-scoped, and Reap's subtotal check catches stale.
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_REAL, KRAVE_MERCHANT, "26.00")], 2600),
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "24.00"), (KRAVE_REAL, KRAVE_MERCHANT, "26.00")], 2600),
+    # THE MARKET'S CURRENCY: the same seller's SGD placeholder offer beside the USD one is not a
+    # disagreement for a US buyer -- whether it is stamped SG or carries the mirror's default 'US'.
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"),
+      (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "36.00", _SGD_SG)], 2800),
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"),
+      (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "36.00", _SGD_DEFAULT_MARKET)], 2800),
+    # a real sku plus an SG/SGD placeholder offer
+    ([(KRAVE_REAL, KRAVE_MERCHANT, "28.00"), (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "36.00", _SGD_SG)], 2800),
+    # `_CART_OFFER_SQL` across currencies: the real sku's SGD offer is numerically cheaper, and is
+    # still not the US buyer's price (it used to be picked, then refused `row_currency_mismatch`).
+    ([(KRAVE_REAL, KRAVE_MERCHANT, "28.00"), (KRAVE_REAL, KRAVE_MERCHANT, "20.00", _SGD_SG)], 2800),
+    ([(KRAVE_REAL, KRAVE_MERCHANT, "28.00"),
+      (KRAVE_REAL, KRAVE_MERCHANT, "20.00", _SGD_DEFAULT_MARKET)], 2800),
+    # an OUT-OF-STOCK placeholder offer at another price is not a price
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"),
+      (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "30.00", {"availability": "out_of_stock"})], 2800),
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"),
+      (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "30.00", {"availability": "Sold_Out"})], 2800),
+    # a SUPPRESSED placeholder offer at another price is not a price (either suppression column)
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"),
+      (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "30.00", _SUPPRESSED)], 2800),
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"),
+      (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "30.00", {"suppression_reason": "stale_source"})], 2800),
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"),
+      (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "30.00", {"suppressed_at": "2026-09-28 00:00:00"})], 2800),
 ])
-async def test_a_mirror_row_is_priced_from_its_placeholder_offer(client, monkeypatch, offers, expected, price):
+async def test_a_mirror_row_is_priced_from_its_placeholder_offer(client, monkeypatch, offers, price):
     await _seed_krave_mirror(offers=offers)
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
     resp = await client.post(f"{BASE}/purchases", json=_krave_body())
-    assert resp.status_code == expected, resp.text
+    assert resp.status_code == 202, resp.text
     purchase = await _purchase_row(resp.json()["purchase_id"])
     assert purchase["our_price_minor"] == price and purchase["currency"] == "USD"
     assert f"https://{KRAVE_DOMAIN}/cart/{KRAVE_VARIANT}:1?" in purchase["cart_url"]
 
 
+@pytest.mark.parametrize("offers", [
+    # the mirror's own shape: the SGD offer carries the column default market 'US'. Filtering on
+    # `market` (not currency) would refuse every SG mirror row.
+    [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "36.00", _SGD_DEFAULT_MARKET)],
+    [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "36.00", _SGD_SG)],
+    # the same seller's USD offer is not a disagreement for an SG buyer
+    [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"),
+     (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "36.00", _SGD_DEFAULT_MARKET)],
+    # and the real sku's cheaper USD offer is not the SG buyer's price
+    [(KRAVE_REAL, KRAVE_MERCHANT, "20.00"), (KRAVE_REAL, KRAVE_MERCHANT, "36.00", _SGD_SG)],
+])
+async def test_an_sg_mirror_row_is_priced_in_sgd(client, monkeypatch, offers):
+    await _seed_krave_mirror(offers=offers, market="SG")
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_krave_body(country="SG"))
+    assert resp.status_code == 202, resp.text
+    purchase = await _purchase_row(resp.json()["purchase_id"])
+    assert purchase["our_price_minor"] == 3600 and purchase["currency"] == "SGD"
+
+
 @pytest.mark.parametrize("offers,reason", [
-    # real and placeholder disagree
-    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_REAL, KRAVE_MERCHANT, "26.00")],
-     "row_price_ambiguous"),
     # two placeholder offers from this merchant that disagree
     ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "30.00")],
      "row_price_ambiguous"),
     # the only placeholder offer is ANOTHER merchant's
     ([(KRAVE_PLACEHOLDER, "merch_obs_0000000000000000", "28.00")], "row_unpriced"),
+    # the only placeholder offer is suppressed / out of stock / in another market's currency
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00", _SUPPRESSED)], "row_unpriced"),
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00", {"availability": "out_of_stock"})], "row_unpriced"),
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "36.00", _SGD_DEFAULT_MARKET)], "row_unpriced"),
     # no offer anywhere
     ([], "row_unpriced"),
 ])
@@ -3641,6 +3706,32 @@ async def test_a_mirror_row_placeholder_price_refusals(client, monkeypatch, offe
     resp = await client.post(f"{BASE}/purchases", json=_krave_body())
     assert resp.status_code == 409 and _error(resp) == reason, resp.text
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+@pytest.mark.parametrize("live_variant_count,offers,expected", [
+    # control: the stubbed proof below changes nothing when the count is one
+    (1, [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], 202),
+    # MORE THAN ONE LIVE VARIANT: the product-grain placeholder offer is never that variant's price
+    (2, [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], "row_unpriced"),
+    (3, [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], "row_unpriced"),
+    # ... while the real sku's own (variant-scoped) offer still prices it
+    (2, [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_REAL, KRAVE_MERCHANT, "26.00")], 202),
+])
+async def test_a_multi_variant_proof_never_prices_from_the_placeholder(
+    client, monkeypatch, live_variant_count, offers, expected
+):
+    """FORWARD COMPAT: a variant-scoped proof of a multi-variant product (another PR) must not
+    reach the placeholder's price. Today's proof refuses such a snapshot before pricing, so the
+    proof reader is stubbed to accept it; the gate under test reads the snapshot itself."""
+    await _seed_krave_mirror(offers=offers, live_variant_count=live_variant_count)
+    monkeypatch.setattr(routes_reap, "sole_verified_cart_variant_id", lambda *a, **k: KRAVE_VARIANT)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_krave_body())
+    if expected == 202:
+        assert resp.status_code == 202, resp.text
+    else:
+        assert resp.status_code == 409 and _error(resp) == expected, resp.text
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
 async def test_a_named_real_mirror_sku_with_no_offer_is_not_priced_from_the_placeholder(client, monkeypatch):
