@@ -8,8 +8,10 @@ from the brand's own storefront by the proof job (PR B), and the purchase lane (
 with `services.reap_enrichment_cart_proof.verify_enrichment_cart_proof` before it builds a cart.
 The writer's full contract is in that module's docstring ("THE PROOF CONTRACT").
 
-INERT IN PR A. This module only declares the table. Nothing imports it outside the tests:
-`ensure_table()` has no caller, so no environment creates the table until PR B's writer calls it.
+WHO CREATES IT. PR B's writer calls `ensure_table()`. PR C's reader, `fetch_proof()`, calls it too,
+and only from the cart-link route's enrichment branch, which runs only while
+REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED (and the cart-link dial) is on: with the flag off no
+request path creates the table. An empty table reads as "no proof", which refuses the purchase.
 
 Migrations do not self-apply in prod; `ensure_table()` runs the same CREATE at first use, exactly
 like db/merchant_purchasability_cart_mint_scans.py. db/migrations/248_enrichment_cart_variant_proofs.sql
@@ -26,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List
+from typing import Any, Dict, List, Optional
 
 from db._ddl_guard import apply_ddl_statements
 from db.database import IS_POSTGRES
@@ -107,9 +109,38 @@ async def ensure_table() -> bool:
     return _DDL_READY
 
 
+#: The ONE read of a proof (PR C): exactly the row for this (product_key, sku_key), every column
+#: the verifier reads, nothing inferred. The primary key makes it at most one row.
+_SELECT_PROOF_SQL = """
+    SELECT product_key, sku_key, shop_host, handle, shopify_product_id, variant_id,
+           live_variant_count, available, live_price_minor, currency, source, checked_at, outcome
+      FROM enrichment_cart_variant_proofs
+     WHERE product_key = :product_key AND sku_key = :sku_key
+"""
+
+
+async def fetch_proof(product_key: str, sku_key: str) -> Optional[Dict[str, Any]]:
+    """The proof row for exactly `(product_key, sku_key)` as a dict, or None.
+
+    None when there is no row, AND when the table cannot be created (`ensure_table()` False): a
+    proof nobody can read is a missing proof, which `verify_enrichment_cart_proof` refuses
+    (`proof_missing`). A database error on the SELECT itself propagates, as every other read on
+    the purchase path does. Returned as a plain dict because the verifier takes a Mapping and a
+    `databases` Record is not one.
+    """
+    if not await ensure_table():
+        return None
+    from db.database import database
+
+    row = await database.fetch_one(
+        _SELECT_PROOF_SQL, {"product_key": product_key, "sku_key": sku_key}
+    )
+    return dict(row) if row is not None else None
+
+
 def _reset_for_tests() -> None:
     global _DDL_READY
     _DDL_READY = False
 
 
-__all__: List[str] = ["TABLE", "OUTCOME_OK", "PROOF_SOURCES", "ensure_table"]
+__all__: List[str] = ["TABLE", "OUTCOME_OK", "PROOF_SOURCES", "ensure_table", "fetch_proof"]

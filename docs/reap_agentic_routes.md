@@ -159,6 +159,41 @@ one of two kinds:
 The proof's product URL must be the seed's own, over https on the shop's host. A contradictory
 attached id, an unproven multi-variant product, or a synthetic canonical SKU without that evidence
 is refused. The seller's own offer supplies the exact price and currency.
+
+**Enrichment rows (option 2, dark).** A `catalog_enrichment_agent_v1` row (`product_key`
+`ext:<slug>::<8hex>`, or `ext:retailer:<32hex>` for the retailer lane) is refused on this lane
+while `REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED` is off (default), exactly as before the flag
+existed (`row_variant_unverified`, or `row_not_found` when the posted host differs from the row's
+`source_domain`). The flag arms nothing on its own: it is read only inside the cart-link lane and
+also requires `REAP_AGENTIC_CART_LINK_ENABLED`. It is not an in-flight kill switch; the cart-link
+dial remains that. With it on, such a row is bought only when all of these hold:
+
+* **Store.** `merchant_domain` is the same storefront as the row's `canonical_url` host **and**
+  its `source_domain`, after one `www.` fold on each side (`www.brand.example` = `brand.example`;
+  a subdomain, suffix or lookalike is `row_not_found`). The cart URL is built on the host as sent.
+* **Seller.** The row's `merchant_id` is exactly the observed seller id our own minting functions
+  re-derive from it (`ext:retailer:` → the retailer's domain; otherwise brand + host), and a
+  non-null `seller_ref` agrees. The offer's `agent_seed::…` owner and a seed's seller are never
+  the seller. Else `seller_identity_unverified`.
+* **Sku.** A `variant_key` must be one of the product's live skus (`row_not_found`). Without one:
+  exactly one real (`::v:`) sku is used; **two or more is `row_variant_ambiguous`** (the lane
+  never picks); none, and the `<product_key>::canonical` placeholder is used, which the proof
+  step accepts only when the product has **no** `::v:` sku at all, suppressed ones included, and
+  the storefront handle has exactly one variant.
+* **Proof.** A row in `enrichment_cart_variant_proofs` for exactly that (product, sku), written by
+  the storefront proof job, at most 72 hours old, `ok`, available, on the same store and handle,
+  naming the sku's own Shopify id (`services/reap_enrichment_cart_proof.verify_enrichment_cart_proof`).
+  The variant in the cart URL is the one this proof names and nothing else. Any refusal is
+  `row_variant_unverified`.
+* **Price.** The listing's own offers on that sku (the enrichment lane's, under its `agent_seed::`
+  namespace, live, available, `source_ref` on the same store and the product's handle) must agree
+  on one price in the buyer market's currency, and it must equal the price the proof read live.
+  Otherwise `row_unpriced`, `row_price_ambiguous`, `row_currency_mismatch`, or **`row_price_stale`**
+  (the catalog price moved since the proof). All of these are answered before a click or a
+  purchase row exists.
+
+`variant_title` on the 202 is whatever the sku's payload carries as `variant_title`; no live
+enrichment row carries one today, so it is `null`.
 A click row is recorded before the purchase opens so the later conversion has verified seller identity. The
 cart-link quote checks shipping options and totals, but an ELIGIBLE merchant verdict alone does
 not prove shipping for this buyer or every SKU.
@@ -218,7 +253,9 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 | 409 | `seller_identity_unverified` | the catalog seller identity does not agree with the offer owner | fall back |
 | 409 | `row_unpriced` | **this merchant** has no usable offer of its own on the sku, or the price is not exactly representable in minor units. On the **cart-link lane** "usable" includes "priced in the buyer market's currency", so a row whose offers are all in another currency answers `row_unpriced` here, not `row_currency_mismatch` | fall back |
 | 409 | `row_price_ambiguous` | cart-link lane, no `variant_key`: the catalog spells the ONE chosen Shopify variant with several skus, and this merchant's usable offers on them carry different prices | fall back, or name the sku (`variant_key`) to buy at that sku's price |
-| 409 | `row_currency_mismatch` | the offer is priced in a currency the buyer's market does not use (variant lane; the cart-link lane reads only offers in the market's currency and answers `row_unpriced` instead) | fall back |
+| 409 | `row_currency_mismatch` | the offer is priced in a currency the buyer's market does not use (variant lane, and the cart-link lane's enrichment rows; the cart-link lane otherwise reads only offers in the market's currency and answers `row_unpriced` instead) | fall back |
+| 409 | `row_price_stale` | cart-link lane, **enrichment rows only** (dark flag): the catalog offer's price differs from the price the storefront proof read live | fall back |
+| 409 | `row_variant_ambiguous` | cart-link lane, **enrichment rows only** (dark flag): no `variant_key`, and the product has two or more real skus | fall back, or name the sku (`variant_key`) |
 | 409 | `idempotency_conflict` | this key was already used for a **different** request | use a new key, or re-send the original request |
 | 400 | `consent_required` | `buyer.consent_version` is **absent, blank, longer than 32 characters, or carries an unprintable character** — i.e. a string-shaped value that is not usable | show your user the terms, then resend with the tag |
 | 400 | `invalid_request` | `buyer.consent_version` is **present but not a string** (`123`, `true`, `{}`, `[]`, `1.5`) — a type error is a malformed body, not a missing act by a human, and the two codes tell you to do different things | fix the request |

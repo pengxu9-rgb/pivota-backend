@@ -144,6 +144,19 @@ from services.seller_identity import resolve_seed_seller_identity
 # `db.merchant_purchasability.normalize_domain`, the key of the purchasability facts. See
 # `_merchant_domain_key` for why the route needs it.
 from services.tierb_cart_link_merchants import canonical_merchant_domain
+# Option 2 (PR C): the enrichment-row branch of the cart-link lane. The proof reader, the pure
+# verifier / seller / price checks (PR A), and THE owner of the one-`www.` storefront-host rule.
+import db.enrichment_cart_variant_proofs as enrichment_proofs
+from services.curated_brand_feed import _same_storefront_host
+from services.reap_enrichment_cart_proof import (
+    ENRICHMENT_SOURCE_SYSTEM,
+    PLACEHOLDER_SUFFIX as ENRICHMENT_PLACEHOLDER_SUFFIX,
+    VARIANT_INFIX as ENRICHMENT_VARIANT_INFIX,
+    derive_enrichment_seller,
+    enrichment_offer_price_ok,
+    storefront_page,
+    verify_enrichment_cart_proof,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +235,12 @@ _REFUSAL_STATUS: Dict[str, int] = {
     "row_variant_unverified": 409,
     "seller_identity_unverified": 409,
     "row_currency_mismatch": 409,
+    # Cart-link lane, ENRICHMENT rows only (option 2, dark flag): the catalog offer's price is not
+    # the price the storefront proof read live -- refused before any purchase opens.
+    "row_price_stale": 409,
+    # Cart-link lane, ENRICHMENT rows only: no `variant_key`, and the product has two or more real
+    # skus. The lane never picks one; the caller names the sku or falls back.
+    "row_variant_ambiguous": 409,
     "idempotency_conflict": 409,
 }
 
@@ -1447,6 +1466,227 @@ def _proof_live_variant_count(seed_data: Any) -> Optional[int]:
     return count if type(count) is int else None
 
 
+# ── option 2 (PR C): ENRICHMENT rows on the cart-link lane, behind a dark flag ───────────────
+#
+# A `catalog_enrichment_agent_v1` row (product keys `ext:<slug>::<8hex>` and, for the retailer lane,
+# `ext:retailer:<32hex>`) names a brand's own Shopify page in `canonical_url` and carries one
+# `::v:` sku per variant plus the `::canonical` placeholder. It has NO seed-borne storefront proof
+# and NO offer under its own seller: its offers sit under `agent_seed::…`. So none of the Shopify /
+# mirror rules above apply, and the branch below is a separate path end to end:
+#   * the product is found by KEY and enrichment source_system, and the POSTed host must be the
+#     same storefront as its canonical_url host AND its source_domain (`_same_storefront_host`,
+#     one `www.` fold; the gateway posts the storefront target's host, which may differ by `www.`);
+#   * the seller is `product.merchant_id` only when `derive_enrichment_seller` re-derives it;
+#   * the sku is the caller's (a live sku of this product), else the ONE real sku, else the
+#     placeholder -- never a pick among two;
+#   * the Shopify variant is the one `verify_enrichment_cart_proof` returns from the proof row, and
+#     nothing else;
+#   * the price is the listing's own offers, and must equal the proof's live price.
+# REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED off: none of this runs, not even the product read.
+_CART_ENRICHMENT_PRODUCT_SQL = """
+    SELECT p.product_key, p.merchant_id, p.seller_ref, p.seed_kind, p.source_system,
+           p.source_domain, p.canonical_url, p.title AS product_title, p.brand
+      FROM catalog_products p
+     WHERE p.product_key = :product_key AND p.source_system = :source_system
+       AND p.suppression_reason IS NULL
+       AND p.suppressed_at IS NULL
+"""
+# A caller-named sku, by its key exactly, live only.
+_CART_ENRICHMENT_SKU_BY_KEY_SQL = """
+    SELECT s.sku_key, s.source_variant_id, s.sku_payload
+      FROM catalog_skus s
+     WHERE s.product_key = :product_key AND s.sku_key = :variant_key
+       AND s.suppression_reason IS NULL AND s.suppressed_at IS NULL
+"""
+# LIMIT 3 IS EXACT, NOT A SAMPLE. The choice needs only "how many real skus: 0, 1, or 2+". The
+# primary key admits one placeholder at most, so any three rows hold at least two real skus -- a
+# refusal whatever the rest are -- and fewer than three rows are all of them.
+_CART_ENRICHMENT_LIVE_SKUS_SQL = """
+    SELECT s.sku_key, s.source_variant_id, s.sku_payload
+      FROM catalog_skus s
+     WHERE s.product_key = :product_key
+       AND s.suppression_reason IS NULL AND s.suppressed_at IS NULL
+     ORDER BY s.sku_key
+     LIMIT 3
+"""
+# EVERY `::v:` sku of the product, SUPPRESSED ONES INCLUDED (review of #2460): the verifier lets the
+# placeholder stand for the product only when the catalog knows no variant of it at all, and a
+# live-only count of 0 is exactly how a MAC parent whose shade skus were suppressed buys its
+# "Default Title" stub. A key-prefix test (`substr`, not LIKE: a product key may carry `_` or `%`).
+_CART_ENRICHMENT_VARIANT_SKU_COUNT_SQL = """
+    SELECT count(*) AS n
+      FROM catalog_skus s
+     WHERE s.product_key = :product_key
+       AND substr(s.sku_key, 1, :variant_prefix_len) = :variant_prefix
+"""
+# THE LISTING'S OWN OFFERS on this sku: written by the enrichment lane (source_system), under its
+# `agent_seed::` seller namespace, live, priced and not out of stock (`_CART_ALL_OFFERS_SQL`'s
+# availability rule). NOT filtered on currency: an offer in another currency is the listing's price
+# in the wrong money, which `enrichment_offer_price_ok` names `row_currency_mismatch` rather than
+# `row_unpriced`. The source_ref's host and handle are checked in Python (`_enrichment_listing_offer`),
+# exactly, by the same URL reader the verifier uses. Bounded: more than 50 is not one listing.
+_CART_ENRICHMENT_OFFERS_SQL = """
+    SELECT o.currency,
+           CAST(coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price)
+                AS TEXT) AS price,
+           o.source_ref
+      FROM catalog_offers o
+     WHERE o.product_key = :product_key AND o.sku_key = :sku_key
+       AND o.source_system = :source_system
+       AND substr(o.merchant_id, 1, :seed_merchant_prefix_len) = :seed_merchant_prefix
+       AND o.suppression_reason IS NULL AND o.suppressed_at IS NULL
+       AND coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) IS NOT NULL
+       AND lower(coalesce(o.availability, 'unknown')) NOT IN
+           ('out_of_stock', 'sold_out', 'unavailable')
+     ORDER BY o.offer_id
+     LIMIT 51
+"""
+#: More offers than this on one sku is not one listing's price.
+_CART_ENRICHMENT_MAX_OFFERS = 50
+#: The enrichment lane's offer-seller namespace (`ingestion.derive_merchant_id`:
+#: `agent_seed::<slug>`, `agent_seed::retailer::<host>`). It is where the listing's offers live;
+#: it is NEVER the seller of record (that is `product.merchant_id`).
+_ENRICHMENT_OFFER_MERCHANT_PREFIX = "agent_seed::"
+
+
+def _enrichment_sku_choice(live_skus: List[Mapping[str, Any]], product_key: str) -> Dict[str, Any]:
+    """The sku an enrichment row's cart link buys when the caller named none, or a refusal.
+
+    `live_skus` is `_CART_ENRICHMENT_LIVE_SKUS_SQL`'s rows (at most three). The placeholder is
+    recognised by its KEY, `<product_key>::canonical`, as the verifier recognises it -- never by
+    `_is_placeholder_sku`, which compares `source_variant_id` to the product key and so misreads
+    every enrichment key longer than 128 characters (the id is truncated there).
+      * two or more real skus  -> `row_variant_ambiguous`: never pick one;
+      * exactly one real sku   -> it (the verifier then proves its own variant);
+      * none                   -> the placeholder (the verifier gates it on the catalog's
+                                  variant count and the storefront's one variant);
+      * nothing live at all    -> `row_not_found`.
+    """
+    placeholder_key = product_key + ENRICHMENT_PLACEHOLDER_SUFFIX
+    real = [dict(row) for row in live_skus if row.get("sku_key") != placeholder_key]
+    if len(real) > 1:
+        raise svc.PurchaseRefused("row_variant_ambiguous", "two or more skus and none named")
+    if real:
+        return real[0]
+    for row in live_skus:
+        if row.get("sku_key") == placeholder_key:
+            return dict(row)
+    raise svc.PurchaseRefused("row_not_found", "no live sku for this product")
+
+
+def _enrichment_listing_offer(offer: Mapping[str, Any], shop_host: str, handle: str) -> bool:
+    """Is this offer the enrichment LISTING's own -- its source_ref the product's storefront page?
+
+    `storefront_page` (the verifier's URL reader) must parse it as `https://<host>/products/<handle>`,
+    the host must be the same storefront as the product's (`_same_storefront_host`: one `www.`
+    fold, no subdomain, suffix or lookalike) and the handle must be the product's, exactly.
+    """
+    page = storefront_page(offer.get("source_ref"))
+    return page is not None and _same_storefront_host(shop_host, page[0]) and page[1] == handle
+
+
+def _enrichment_variant_title(sku: Mapping[str, Any]) -> Optional[str]:
+    """DISPLAY ONLY: a variant title the sku's payload carries, else None. The proof table has no
+    title column and the enrichment writer puts none in `sku_payload` today, so this is None on
+    every live row; it is read so the day either source carries one, the purchase says it."""
+    payload = sku.get("sku_payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return None
+    title = payload.get("variant_title") if isinstance(payload, dict) else None
+    return (title.strip() or None) if isinstance(title, str) else None
+
+
+async def _load_enrichment_cart_link_item(
+    *, product: Dict[str, Any], merchant_host: str, variant_key: Optional[str],
+    market_country: str,
+) -> Tuple[Dict[str, Any], str, str, Optional[str]]:
+    """`_load_cart_link_item` for an ENRICHMENT row: the same four-tuple, or a refusal.
+
+    Reached only with REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED on, and only for a product whose
+    source_system is the enrichment lane's. See the note above `_CART_ENRICHMENT_PRODUCT_SQL`.
+    """
+    product_key = str(product.get("product_key") or "")
+    # THE STOREFRONT. The POSTed host must be this row's store: the canonical_url's host AND its
+    # source_domain, each after one `www.` fold. Anything else is not this product "under this
+    # domain" -- the same `row_not_found` the lane answers for a key on another domain.
+    page = storefront_page(product.get("canonical_url"))
+    if (page is None
+            or not _same_storefront_host(merchant_host, page[0])
+            or not _same_storefront_host(merchant_host, product.get("source_domain"))):
+        raise svc.PurchaseRefused("row_not_found", "no catalog product for this domain and key")
+    shop_host, handle = page
+
+    # THE SELLER OF RECORD: `product.merchant_id`, and only when the repo's own minting functions
+    # re-derive it from this row. Never the `agent_seed::` offer merchant, never a seed's seller_ref.
+    # A non-null product seller_ref must agree with it (the mirror rule, `_mirror_seller_ref`).
+    # (`merchant_id` is NOT NULL, so an underivable seller -- None -- never equals it.)
+    merchant_id = product.get("merchant_id")
+    seller_ref = str(product.get("seller_ref") or "").strip()
+    if derive_enrichment_seller(product) != merchant_id or (seller_ref and seller_ref != merchant_id):
+        raise svc.PurchaseRefused("seller_identity_unverified", "enrichment seller does not re-derive")
+
+    # THE SKU.
+    if variant_key:
+        raw_sku = await database.fetch_one(
+            _CART_ENRICHMENT_SKU_BY_KEY_SQL, {"product_key": product_key, "variant_key": variant_key}
+        )
+        if raw_sku is None:
+            raise svc.PurchaseRefused("row_not_found", "no sku for this product and key")
+        sku = dict(raw_sku)
+    else:
+        sku = _enrichment_sku_choice(
+            [dict(row) for row in await database.fetch_all(
+                _CART_ENRICHMENT_LIVE_SKUS_SQL, {"product_key": product_key}
+            )],
+            product_key,
+        )
+    variant_prefix = product_key + ENRICHMENT_VARIANT_INFIX
+    variant_sku_count = int(await database.fetch_val(
+        _CART_ENRICHMENT_VARIANT_SKU_COUNT_SQL,
+        {"product_key": product_key, "variant_prefix": variant_prefix,
+         "variant_prefix_len": len(variant_prefix)},
+    ) or 0)
+
+    # THE VARIANT: only what the verifier returns from the storefront proof for exactly this sku.
+    proof = await enrichment_proofs.fetch_proof(product_key, str(sku.get("sku_key") or ""))
+    proven, variant_id, reason = verify_enrichment_cart_proof(
+        product, sku, proof, catalog_variant_sku_count=variant_sku_count, now=_now(),
+    )
+    if not proven:
+        raise svc.PurchaseRefused("row_variant_unverified", f"enrichment proof refused: {reason}")
+
+    # THE PRICE: the listing's own offers on this sku, equal to the proof's live price, in the
+    # buyer market's currency -- decided here, BEFORE any click or purchase row exists.
+    offers = [dict(row) for row in await database.fetch_all(
+        _CART_ENRICHMENT_OFFERS_SQL,
+        {"product_key": product_key, "sku_key": sku["sku_key"],
+         "source_system": ENRICHMENT_SOURCE_SYSTEM,
+         "seed_merchant_prefix": _ENRICHMENT_OFFER_MERCHANT_PREFIX,
+         "seed_merchant_prefix_len": len(_ENRICHMENT_OFFER_MERCHANT_PREFIX)},
+    )]
+    if len(offers) > _CART_ENRICHMENT_MAX_OFFERS:
+        raise svc.PurchaseRefused("row_price_ambiguous", "too many offers for one listing")
+    listing = [offer for offer in offers if _enrichment_listing_offer(offer, shop_host, handle)]
+    market_currency = str(_MARKET_CURRENCY.get(market_country) or "").upper()
+    priced, price_minor, price_reason = enrichment_offer_price_ok(listing, proof, market_currency)
+    if not priced:
+        raise svc.PurchaseRefused(price_reason, "enrichment offer price refused")
+
+    return (
+        {"shop_domain": merchant_host, "our_price_minor": int(price_minor),
+         "currency": market_currency, "market_country": market_country,
+         "product_name": str(product.get("product_title") or "").strip() or None,
+         "product_key": product_key,
+         "variant_title": _enrichment_variant_title(sku)},
+        str(merchant_id),
+        variant_id,
+        str(product.get("seed_kind") or "").strip() or None,
+    )
+
+
 async def _load_cart_link_item(
     *, merchant_domain: str, product_key: str, variant_key: Optional[str],
     market_country: str,
@@ -1456,7 +1696,20 @@ async def _load_cart_link_item(
     The buyer/agent supplies only catalog keys. No caller URL, price, Shopify variant, or seller
     identity is accepted. Mirrored seeds need an attached product and a sole variant proven by
     storefront evidence. Numeric operator input alone cannot authorize a purchase.
+
+    ENRICHMENT rows (option 2) take `_load_enrichment_cart_link_item` instead, and only while
+    REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED is on. Off, not one extra statement runs here.
     """
+    if svc.is_cart_link_enrichment_enabled():
+        enrichment = await database.fetch_one(
+            _CART_ENRICHMENT_PRODUCT_SQL,
+            {"product_key": product_key, "source_system": ENRICHMENT_SOURCE_SYSTEM},
+        )
+        if enrichment is not None:
+            return await _load_enrichment_cart_link_item(
+                product=dict(enrichment), merchant_host=merchant_domain,
+                variant_key=variant_key, market_country=market_country,
+            )
     raw = await database.fetch_one(
         _CART_PRODUCT_SQL, {"product_key": product_key, "merchant_domain": merchant_domain}
     )
