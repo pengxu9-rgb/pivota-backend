@@ -2401,7 +2401,6 @@ async def test_tierb_a_mirror_row_priced_from_its_placeholder_on_postgres(
             "DELETE FROM tierb_cart_link_eligibility WHERE shop_domain = :d", {"d": domain})
 
 
-
 @pytest.mark.parametrize("env", ["staging", "prod"])
 async def test_tierb_the_backfill_then_the_cart_link_buys_a_named_variant_end_to_end(client, monkeypatch, env):
     """OPTION 1 end to end on the production dialect: the REAL live judydoll seed (8-shade

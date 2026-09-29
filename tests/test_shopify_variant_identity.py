@@ -1139,3 +1139,15 @@ def test_REFUSE_a_live_payload_listing_the_named_variant_twice() -> None:
     payload = _judy_js()
     payload["variants"].append(dict(payload["variants"][4]))
     assert _backfilled(payload)["snapshot"]["shopify_cart_proof"] is None
+
+
+def test_REFUSE_two_url_variants_even_with_nothing_else_to_disagree() -> None:
+    """Two distinct `variant=` values name two variants, whichever the seed would otherwise back:
+    an unstamped entry with no ids of its own, across one URL or two."""
+    bare = {"snapshot": {"variants": [{"title": "07 BURGUNDY INK"}]}}
+    base = f"https://{JUDY_HOST}/products/silky-matte-lip-ink"
+    for urls in ([f"{base}?variant={JUDY_VARIANT}&variant={JUDY_OTHER}"],
+                 [f"{base}?variant={JUDY_VARIANT}", f"{base}?variant={JUDY_OTHER}"]):
+        assert named_cart_variant_id(bare, product_urls=urls, shop_domain=JUDY_HOST) is None, urls
+    same_twice = [f"{base}?variant={JUDY_VARIANT}", f"{base}?variant={JUDY_VARIANT}&x=1"]
+    assert named_cart_variant_id(bare, product_urls=same_twice, shop_domain=JUDY_HOST) == JUDY_VARIANT

@@ -47,6 +47,7 @@ from db.database import IS_POSTGRES, database, metadata  # noqa: E402
 from db.schema_guard import ensure_required_schema_light  # noqa: E402
 import db.reap_agentic_ledger as ledger  # noqa: E402
 import routes.agent_commerce_reap as routes_reap  # noqa: E402
+from services.shopify_variant_identity import ProvenCartVariant  # noqa: E402
 import services.reap_agentic_purchase as svc  # noqa: E402
 from db.buyer_vault import hash_agent_user_ref  # noqa: E402
 from routes.agent_auth import get_agent_context  # noqa: E402
@@ -3347,7 +3348,8 @@ _FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 def _named_variant_seed(*, variant_overrides: Optional[Dict[str, Any]] = None,
-                        page_url: Optional[str] = None) -> Dict[str, Any]:
+                        page_url: Optional[str] = None, only_variant: Optional[str] = None,
+                        entry_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     from scripts.backfill_shopify_variant_ids import build_cart_proof
     from services.shopify_variant_identity import parse_product_js, stamp_variant_ids
 
@@ -3355,7 +3357,10 @@ def _named_variant_seed(*, variant_overrides: Optional[Dict[str, Any]] = None,
     row = json.loads((_FIXTURES / "judydoll_silky_matte_lip_ink_seed_2026_09_29.json").read_text())
     for variant in payload["variants"]:
         variant.update((variant_overrides or {}).get(str(variant["id"]), {}))
+    if only_variant:
+        payload["variants"] = [v for v in payload["variants"] if str(v["id"]) == only_variant]
     seed = row["seed_data"]
+    seed["snapshot"]["variants"][0].update(entry_overrides or {})
     live = parse_product_js(payload)
     new_variants, _ = stamp_variant_ids(seed["snapshot"]["variants"], live)
     seed["snapshot"].update({
@@ -3422,6 +3427,34 @@ async def test_a_named_variant_proof_never_prices_from_the_placeholder(client, m
     resp = await client.post(f"{BASE}/purchases", json=_live_body())
     assert resp.status_code == 409 and _error(resp) == "row_unpriced", resp.text
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_the_named_proof_placeholder_guard_is_reached_by_a_real_producer_shape(client, monkeypatch):
+    """#2459 review, F2: the shape that REACHES the guard. A seed entry whose `shopify_variant_id`
+    is junk (a live writer lands unvalidated keys there; `stamp_variant_ids` never overwrites one),
+    `?variant=` on its product URL, and a ONE-variant storefront: the sole proof cannot be written
+    (the stamp is junk), so `build_cart_proof` writes a NAMED proof with live_variant_count 1 --
+    which #2457's placeholder fallback reads as "one live variant". Only the named-scope guard
+    stops the product-level placeholder offer from pricing it."""
+    seed_data = _named_variant_seed(
+        only_variant=LIVE_VARIANT, page_url=f"https://{LIVE_DOMAIN}/products/{LIVE_HANDLE}?variant={LIVE_VARIANT}",
+        entry_overrides={"shopify_variant_id": "not-a-number"})
+    proof = seed_data["snapshot"]["shopify_cart_proof"]
+    assert proof["scope"] == "named_variant" and proof["live_variant_count"] == 1
+    await _seed_named_variant_mirror(env="prod", skus=LIVE_STAGING_SKUS, seed_data=seed_data,
+                                     offers_on=[LIVE_SKU_CANONICAL])
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert resp.status_code == 409 and _error(resp) == "row_unpriced", resp.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    # control: with the variant's OWN sku offered, the same row is bought at that price
+    await database.execute(
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, "
+        "merchant_effective_price, availability) VALUES "
+        "('off_guard_real', :sk, :pk, :m, 'USD', '13.99', 'in_stock')",
+        {"sk": LIVE_SKU_CRAWL, "pk": LIVE_PK, "m": LIVE_MERCHANT})
+    ok = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert ok.status_code == 202, ok.text
 
 
 @pytest.mark.parametrize("case", ["placeholder_only", "catalog_names_a_sibling", "unavailable",
@@ -3838,7 +3871,9 @@ async def test_a_multi_variant_proof_never_prices_from_the_placeholder(
     reach the placeholder's price. Today's proof refuses such a snapshot before pricing, so the
     proof reader is stubbed to accept it; the gate under test reads the snapshot itself."""
     await _seed_krave_mirror(offers=offers, live_variant_count=live_variant_count)
-    monkeypatch.setattr(routes_reap, "sole_verified_cart_variant_id", lambda *a, **k: KRAVE_VARIANT)
+    # #2459 renamed the route's authority call; the stub is the SOLE-scope answer it replaced.
+    monkeypatch.setattr(routes_reap, "verified_cart_variant_id",
+                        lambda *a, **k: ProvenCartVariant(KRAVE_VARIANT, "sole_variant"))
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
     resp = await client.post(f"{BASE}/purchases", json=_krave_body())
     if expected == 202:
@@ -3859,7 +3894,9 @@ async def test_a_named_placeholder_meets_the_same_live_variant_gate(
     proof reader is stubbed as in the unnamed test above."""
     await _seed_krave_mirror(offers=[(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")],
                              live_variant_count=live_variant_count, real_sku=False)
-    monkeypatch.setattr(routes_reap, "sole_verified_cart_variant_id", lambda *a, **k: KRAVE_VARIANT)
+    # #2459 renamed the route's authority call; the stub is the SOLE-scope answer it replaced.
+    monkeypatch.setattr(routes_reap, "verified_cart_variant_id",
+                        lambda *a, **k: ProvenCartVariant(KRAVE_VARIANT, "sole_variant"))
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
     resp = await client.post(f"{BASE}/purchases",
                              json={**_krave_body(), "variant_key": KRAVE_PLACEHOLDER})
