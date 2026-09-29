@@ -36,7 +36,12 @@ THE RULE, in order:
    first would leave a result that a second pass changes (the rule must be idempotent, because
    the reader re-applies it to what the writer already cleaned).
 5. Cap at `max_chars` CODE POINTS -- a Python str index is a code point, so a non-BMP emoji is
-   never split into half a surrogate pair -- strip the end again, and map empty to None.
+   never split into half a surrogate pair -- then strip the END of spaces AND of the kept format
+   characters, and map empty to None. Stripping the kept characters there does two jobs: a cap
+   that cuts between a ZWJ and the emoji it joins leaves no dangling joiner, and a title that is
+   nothing but kept characters and spaces (a lone LRM, "ZWJ ZWNJ") is None rather than a
+   string that shows nothing. The cost: a trailing LRM/RLM a merchant put after a final bracket
+   is dropped; a door appends its own text after the name anyway.
 
 HTML IS LEFT AS TEXT, ON PURPOSE. "<b>Rose</b>" stays "<b>Rose</b>". This is a storage/display
 guard, not an escaper: escaping here would double-escape in every renderer that already escapes,
@@ -60,6 +65,10 @@ DROPPED_CATEGORIES = frozenset({"Cc", "Cf", "Co", "Cs"})
 #: The Cf characters that are NOT dropped: ZWNJ, ZWJ, LRM, RLM. See the module docstring, step 2.
 KEPT_FORMAT_CHARS = frozenset({"\u200c", "\u200d", "\u200e", "\u200f"})
 
+#: What the end of a result is stripped of: the one space whitespace folds to, and the kept
+#: format characters, none of which means anything with nothing visible after it.
+_TRAILING_STRIP = " " + "".join(sorted(KEPT_FORMAT_CHARS))
+
 #: Longest product name shown, in code points. The ledger's `product_name` is TEXT (no limit), so
 #: this is Shopify's own product-title limit: no real storefront title is longer.
 MAX_PRODUCT_NAME = 255
@@ -79,7 +88,11 @@ def clean_display_text(value: Any, *, max_chars: int) -> Optional[str]:
         or unicodedata.category(ch) not in DROPPED_CATEGORIES
     )
     text = unicodedata.normalize("NFC", " ".join(text.split()))
-    return text[:max_chars].rstrip() or None
+    # AFTER the cap, strip the end of whitespace AND of the kept format characters (step 5): a cap
+    # can cut between a ZWJ and the emoji it joins, leaving a dangling joiner; and a title made of
+    # nothing but kept characters and spaces ("LRM", "ZWJ ZWNJ") would otherwise be a non-None
+    # string that shows nothing. Folded whitespace is only ever " " here, so " " is the whole set.
+    return text[:max_chars].rstrip(_TRAILING_STRIP) or None
 
 
 def clean_product_name(value: Any) -> Optional[str]:

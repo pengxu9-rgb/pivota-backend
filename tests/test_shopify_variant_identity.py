@@ -1269,7 +1269,7 @@ from services.text_normalization.display_text import (  # noqa: E402
 @pytest.mark.parametrize("title", [
     "\U0001f469\u200d\U0001f4bb Coder",                 # ZWJ inside an emoji sequence
     "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",  # ZWNJ in Persian orthography
-    "\u05d2\u05d5\u05d5\u05df 07\u200e",                 # LRM placing a number after Hebrew
+    "\u05d2\u05d5\u05d5\u05df \u200e07 ml",              # LRM placing a number after Hebrew
     "\u0644\u0648\u0646 \u200f(07)",                     # RLM before a bracket in Arabic
 ])
 def test_the_joiners_and_direction_marks_are_kept(title: str) -> None:
@@ -1338,9 +1338,33 @@ def test_the_rule_is_idempotent_and_leaves_nothing_it_drops_fuzzed() -> None:
         assert out and len(out) <= cap and out == out.strip(), (raw, out)
         assert unicodedata.normalize("NFC", out) == out, (raw, out)
         assert "  " not in out and all(c == " " or not c.isspace() for c in out), (raw, out)
+        assert out[-1] not in KEPT_FORMAT_CHARS, (raw, out)           # nothing dangling
+        assert any(c != " " and c not in KEPT_FORMAT_CHARS for c in out), (raw, out)  # visible
         assert not any(
             c not in KEPT_FORMAT_CHARS and unicodedata.category(c) in DROPPED_CATEGORIES for c in out
         ), (raw, out)
+
+
+@pytest.mark.parametrize("invisible", [
+    "\u200e", "\u200f", "\u200d\u200c", " \u200f ", "\u200e \u200d\t\u200c", "\u202e\u200d\u200b",
+])
+def test_a_title_of_only_kept_format_characters_is_none(invisible: str) -> None:
+    """Finding 3: LRM/RLM/ZWJ/ZWNJ are kept INSIDE text, but a title made of nothing else (and
+    whitespace) shows nothing, so it is None -- at the writer, at the reader, and for a name."""
+    assert _written_title(invisible) is None and _read_title(invisible) is None
+    assert clean_product_name(invisible) is None
+
+
+@pytest.mark.parametrize("dangling", ["\u200d", "\u200c", "\u200e", "\u200f", "\u200d \u200c"])
+def test_the_cap_never_leaves_a_dangling_kept_format_character(dangling: str) -> None:
+    """Finding 4: 199 x "X" + ZWJ + a woman emoji, capped at 200, cut between the joiner and the
+    emoji it joins. The end is stripped of kept format characters too, not only of spaces."""
+    raw = "X" * 199 + dangling + "\U0001f469\u200d\U0001f4bb"
+    assert _written_title(raw) == _read_title(raw) == "X" * 199
+    joined = "X" * 196 + "\U0001f469\u200d\U0001f4bb"                  # fits whole: kept whole
+    assert _written_title(joined) == joined and len(joined) == 199
+    assert clean_display_text("ab" + dangling + "c", max_chars=3) == "ab"
+    assert clean_display_text("X" + dangling, max_chars=50) == "X"    # uncapped trailing too
 
 
 def test_the_product_name_gets_the_same_rule_at_its_own_cap() -> None:
