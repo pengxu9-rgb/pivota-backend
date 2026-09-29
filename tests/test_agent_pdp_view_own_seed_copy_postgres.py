@@ -220,3 +220,51 @@ async def test_no_lines_reads_nothing_and_no_domain_refuses(scoped):
     assert await fetch_shared_section_lines("brand.example", [], exclude_product_keys=[], own_base_title="", db=scoped) == set()
     with pytest.raises(ValueError):
         await fetch_shared_section_lines("", [STORE_LINE], exclude_product_keys=[], own_base_title="", db=scoped)
+
+
+async def test_www_and_bare_seed_domains_are_one_storefront(scoped):
+    from services.agent_pdp_view_assembler import fetch_shared_section_lines
+
+    await _seed(scoped, "eps_w1", "pk_w1", domain="www.brand.example", title="Gloss Bomb", seed_data=_secs(STORE_LINE))
+    await _seed(scoped, "eps_w2", "pk_w2", domain="brand.example", title="Pro Filt'r", seed_data=_secs(STORE_LINE))
+    shared = await fetch_shared_section_lines(
+        "brand.example", [STORE_LINE], exclude_product_keys=["pk_own"], own_base_title="match stix", db=scoped)
+    assert shared == {STORE_LINE}
+
+
+async def test_the_seed_scan_is_bounded(scoped, monkeypatch):
+    import services.agent_pdp_view_assembler as assembler
+
+    for i in range(4):
+        await _seed(scoped, f"eps_b{i}", f"pk_b{i}", title=f"Product {i}", seed_data=_secs(STORE_LINE))
+    monkeypatch.setattr(assembler, "_SHARED_LINE_SEED_SCAN_MAX", 1)
+    shared = await assembler.fetch_shared_section_lines(
+        "brand.example", [STORE_LINE], exclude_product_keys=[], own_base_title="x", db=scoped)
+    assert shared == set()  # one seed scanned: one other product, under the threshold
+
+
+async def test_the_statement_timeout_bounds_the_check(scoped, monkeypatch):
+    """Runs in its own transaction with SET LOCAL statement_timeout; a check that overruns raises
+    (and the rebuild then appends nothing) instead of holding a CPU for web's 30 s."""
+    import asyncpg
+
+    import services.agent_pdp_view_assembler as assembler
+
+    await scoped.execute(
+        """
+        INSERT INTO external_product_seeds (id, attached_product_key, status, domain, title, seed_data, updated_at)
+        SELECT 'eps_t' || g, 'pk_t' || g, 'active', 'brand.example', 'Product ' || g,
+               jsonb_build_object('pdp_details_sections', (
+                 SELECT jsonb_agg(jsonb_build_object('heading', 'Details', 'body', repeat('filler text ', 200)))
+                 FROM generate_series(1, 8))),
+               now()
+        FROM generate_series(1, 2000) g
+        """
+    )
+    monkeypatch.setattr(assembler, "_SHARED_LINE_TIMEOUT_MS", 1)
+    with pytest.raises(asyncpg.exceptions.QueryCanceledError):
+        await assembler.fetch_shared_section_lines(
+            "brand.example", [f"line {i} that is not there" for i in range(24)],
+            exclude_product_keys=[], own_base_title="x", db=scoped)
+    # the transaction ended with the statement: the next query runs normally
+    assert await scoped.fetch_val("SELECT 1") == 1

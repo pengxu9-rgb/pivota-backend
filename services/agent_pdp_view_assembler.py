@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -275,7 +276,7 @@ async def fetch_own_seed_copy_for_keys(
 
 
 async def fetch_shared_section_lines(
-    domain: str,
+    host: str,
     lines: List[str],
     *,
     exclude_product_keys: List[str],
@@ -283,39 +284,63 @@ async def fetch_shared_section_lines(
     db: Any = None,
 ) -> set:
     """Of `lines`, those the page sections of at least _SHARED_LINE_MIN_OTHER_PRODUCTS other
-    products on the same storefront (seed domain) also carry: the store's copy, not this product's.
+    products on the same storefront also carry: the store's copy, not this product's -- plus every
+    line past _SHARED_LINE_CHECK_MAX, which is not checked and so is treated as shared.
 
-    Other editions of the product itself -- its shades, "Pro Filt'r … — #265" beside "— #210" -- are
-    one product, not boilerplate: they share its base title (_product_base_title, computed the same
-    way in SQL) and are not counted. One bounded read, on the winner's storefront only, and only
-    when there is a line to judge.
+    The storefront is the normalised host, matched with and without "www." (seed domains are
+    stored both ways). Other editions of the product itself -- its shades, "Pro Filt'r … — #265"
+    beside "— #210" -- are one product, not boilerplate: they share its base title
+    (_product_base_title, computed the same way in SQL) and are not counted.
+
+    BOUNDED, because it runs inside a rebuild on the 2-vCPU primary (review #2443): at most
+    _SHARED_LINE_SEED_SCAN_MAX seeds, both CTEs MATERIALIZED so each body is normalised once rather
+    than once per line, and a _SHARED_LINE_TIMEOUT_MS statement_timeout on Postgres. A timeout
+    raises; build_agent_pdp_view_row then appends nothing.
     """
     if not lines:
         return set()
-    if not domain:
-        raise ValueError("fetch_shared_section_lines needs the storefront's seed domain")
+    if not host:
+        raise ValueError("fetch_shared_section_lines needs the storefront's host")
+    checked, unchecked = list(lines[:_SHARED_LINE_CHECK_MAX]), set(lines[_SHARED_LINE_CHECK_MAX:])
     read_db = db or database
-    rows = await read_db.fetch_all(
-        """
-        WITH bodies AS (
-          SELECT lower(btrim(regexp_replace(coalesce(s.title, ''), '\\s+[—–-]\\s+.*$', ''))) AS base,
-                 regexp_replace(e->>'body', '\\s+', ' ', 'g') AS body
+    query = """
+        WITH seeds AS MATERIALIZED (
+          SELECT s.title, s.seed_data->'pdp_details_sections' AS sections
           FROM external_product_seeds s
-          CROSS JOIN LATERAL jsonb_array_elements(
-            CASE WHEN jsonb_typeof(s.seed_data->'pdp_details_sections') = 'array'
-                 THEN s.seed_data->'pdp_details_sections' ELSE CAST('[]' AS jsonb) END) e
-          WHERE s.domain = :domain
+          WHERE s.domain = ANY(CAST(:domains AS text[]))
             AND s.status = 'active'
             AND (s.attached_product_key IS NULL OR s.attached_product_key <> ALL(:keys))
+          ORDER BY s.id
+          LIMIT :seed_limit
+        ),
+        bodies AS MATERIALIZED (
+          SELECT lower(btrim(regexp_replace(coalesce(seeds.title, ''), '\\s+[—–-]\\s+.*$', ''))) AS base,
+                 regexp_replace(e->>'body', '\\s+', ' ', 'g') AS body
+          FROM seeds
+          CROSS JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(seeds.sections) = 'array'
+                 THEN seeds.sections ELSE CAST('[]' AS jsonb) END) e
         )
         SELECT l.line, count(DISTINCT b.base) AS products
         FROM unnest(CAST(:lines AS text[])) AS l(line)
         JOIN bodies b ON strpos(b.body, l.line) > 0 AND b.base <> :own_base
         GROUP BY l.line
-        """,
-        {"domain": domain, "lines": list(lines), "keys": list(exclude_product_keys), "own_base": own_base_title},
-    )
-    return {str(r["line"]) for r in rows or [] if int(r["products"] or 0) >= _SHARED_LINE_MIN_OTHER_PRODUCTS}
+        """
+    params = {
+        "domains": [host, f"www.{host}"],
+        "lines": checked,
+        "keys": list(exclude_product_keys),
+        "own_base": own_base_title,
+        "seed_limit": _SHARED_LINE_SEED_SCAN_MAX,
+    }
+    if hasattr(read_db, "transaction") and str(getattr(read_db, "url", "")).lower().startswith("postgres"):
+        async with read_db.transaction():
+            await read_db.execute(f"SET LOCAL statement_timeout = {int(_SHARED_LINE_TIMEOUT_MS)}")
+            rows = await read_db.fetch_all(query, params)
+    else:
+        rows = await read_db.fetch_all(query, params)
+    shared = {str(r["line"]) for r in rows or [] if int(r["products"] or 0) >= _SHARED_LINE_MIN_OTHER_PRODUCTS}
+    return shared | unchecked
 
 
 async def fetch_evidence_for_keys(
@@ -494,6 +519,11 @@ _BRAND_SECTION_MIN_CHARS = 80
 # distinct OTHER products -- title before " — " -- so the shades of one product sharing its copy
 # are one product, not boilerplate.
 _SHARED_LINE_MIN_OTHER_PRODUCTS = 2
+# Bounds on that check (fetch_shared_section_lines): lines judged per rebuild (the rest count as
+# shared, i.e. are not appended), seeds scanned per storefront, and its statement_timeout.
+_SHARED_LINE_CHECK_MAX = 24
+_SHARED_LINE_SEED_SCAN_MAX = 3000
+_SHARED_LINE_TIMEOUT_MS = 2000
 # Two sentences this alike (word-set Jaccard) say the same thing twice.
 _NEAR_DUPLICATE_JACCARD = 0.8
 
@@ -518,16 +548,20 @@ _NOT_PRODUCT_COPY: Tuple[Tuple[str, "re.Pattern[str]"], ...] = tuple(
     (name, re.compile(pattern, re.I))
     for name, pattern in (
         ("markup", r"<\s*/?\s*[a-z!]|&[a-z]+;|&#\d+;"),
-        ("link", r"https?://|www\.|\b[a-z0-9-]+\.(?:com|us|co|net)\b"),
+        ("link", r"https?://|www\.|\]\(|\b[a-z0-9-]+\.(?:com|us|co|net|org|io|shop|store|beauty|kr|jp|uk|au|ca|sg|de|fr)\b"),
+        ("contact", r"\S@\S|@\w|\b\w+ \[?at\]? \w+ \[?dot\]? (?:com|net|org|co)\b"
+                    r"|(?<!\w)\+?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}(?!\w)|\b(?:call|text|email|dm) us\b"),
         ("price", r"[$€£¥₩₹]\s?\d|\d\s?(?:円|원)|\b\d[\d,.]*\s?(?:usd|eur|gbp|krw|jpy|sgd|aud|cad|myr|won|yen)\b"
                   r"|\b(?:usd|eur|gbp|krw|jpy|sgd|aud|cad|myr|rm)\s?\d"),
         ("promo", r"\d+\s?%\s?off|\b(?:percent|half) off\b|\b(?:sale|promo|coupon|discount|bogo|deal"
                   r"|buy (?:one|1|two|2)|save (?:up to )?\S*\d|limited[- ]edition|while supplies last|limited time"
-                  r"|gift with purchase|free (?:shipping|gift|sample|returns?))\b"),
+                  r"|gift with purchase|free (?:shipping|gift|sample|returns?)|complimentary|with (?:every|any) (?:purchase|order)"
+                  r"|deluxe (?:sample|mini)|as seen (?:on|in)|featured in)\b"),
         ("store", r"\b(?:price|sold out|in stock|out of stock|add to (?:bag|cart)|shop now|available only"
                   r"|exclusively (?:at|on)|rewards?|refer a friend|privacy policy|terms of (?:use|service)"
                   r"|log ?in|sign in|my account|gift card|store locator|contact us|subscribe|sign up"
-                  r"|newsletter|klarna|afterpay)\b"),
+                  r"|newsletter|klarna|afterpay|affirm|sezzle|shop pay|pay in (?:4|four)|installments?|loyalty"
+                  r"|(?:earn|redeem|bonus|reward) points?|points? (?:program|per|on every))\b"),
         ("shipping", r"\b(?:shipping|ships (?:in|within|free|from|to)|free returns|returns? (?:within|policy)"
                      r"|return policy|refunds?|business days|delivery (?:in|within|times?))\b"),
         ("reviews", r"\b(?:reviews?|reviewers|rated|ratings?|verified (?:customers|buyers|purchasers)|out of 5"
@@ -537,7 +571,8 @@ _NOT_PRODUCT_COPY: Tuple[Tuple[str, "re.Pattern[str]"], ...] = tuple(
                        r"|shop (?:the|our))\b"),
         ("legal", r"^\W*(?:full )?(?:ingredients|warnings?|caution|directions)\s*:|\b(?:for external use only"
                   r"|keep out of (?:the )?reach|discontinue use|consult (?:a|your) (?:doctor|physician)"
-                  r"|prop(?:osition)? 65|avoid contact with (?:the )?eyes)\b"),
+                  r"|prop(?:osition)? 65|avoid contact with (?:the )?eyes|not been evaluated by the (?:food and drug"
+                  r" administration|fda)|not intended to diagnose)\b"),
         ("ingredient_list", r"^(?=(?:[^,]*,){8})(?=.*\b(?:aqua|water|glycerin|alcohol|parfum|fragrance|dimethicone)\b)"),
         ("call_to_action", r"\b(?:learn (?:more|how)|click|tap here|find out more|tiktok|instagram|follow us"
                            r"|(?:our|the) (?:blog|journal))\b"),
@@ -581,23 +616,40 @@ def _is_label_line(line: str) -> bool:
     return bool(words) and sum(w[0].isupper() for w in words) >= 0.75 * len(words)
 
 
+# Latin lookalikes NFKC leaves alone ("frее ѕhipping" in Cyrillic): folded before classifying.
+_CONFUSABLES = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "ѕ": "s", "і": "i", "ј": "j",
+    "ԁ": "d", "һ": "h", "ӏ": "l", "ԛ": "q", "ԝ": "w", "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M",
+    "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T", "Х": "X", "Ѕ": "S", "І": "I", "Ј": "J",
+    "ο": "o", "α": "a", "ε": "e", "ι": "i", "κ": "k", "ν": "v", "ρ": "p", "τ": "t", "υ": "u", "χ": "x",
+})
+# A footnote line: the marker a claim's fine print starts with.
+_FOOTNOTE_MARKERS = ("*", "†", "‡", "§", "¹", "²", "³")
+
+
+def _fold(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).translate(_CONFUSABLES)
+
+
 def _not_product_copy(line: str) -> Optional[str]:
-    """The class of non-product text the line is (_NOT_PRODUCT_COPY), or None."""
+    """The class of non-product text the line is (_NOT_PRODUCT_COPY), or None. Judged on the line
+    NFKC-normalised with Latin lookalikes folded, so "＄ 25" and "frее ѕhipping" read as written."""
+    probe = _fold(line)
     for name, pattern in _NOT_PRODUCT_COPY:
-        if pattern.search(line):
+        if pattern.search(probe):
             return name
     return None
 
 
 def _section_lines(body: Any) -> List[str]:
-    """The section's candidate lines: five words or more, not a "*Based on…" footnote, not a label
+    """The section's candidate lines: five words or more, not a "*Based on…" / "†" footnote, not a label
     line, not any _NOT_PRODUCT_COPY class. Nothing is judged against what is served yet."""
     lines = []
     for raw in _RUN_TOGETHER_LABEL.sub("\n", str(body or "")).splitlines():
         line = " ".join(raw.split())
         if len(re.findall(r"[A-Za-z][A-Za-z'’-]*", line)) < 5:
             continue
-        if line.startswith("*") or _is_label_line(line) or _not_product_copy(line):
+        if line.startswith(_FOOTNOTE_MARKERS) or _is_label_line(line) or _not_product_copy(line):
             continue
         lines.append(line)
     return lines
@@ -673,9 +725,9 @@ def _brand_section_plan(
 
 
 def brand_section_candidate_lines(canonical: Dict[str, Any], enrichment: Optional[Dict[str, Any]]) -> List[str]:
-    """Every line compose_brand_section_description might serve for this winner -- the lines the
-    storefront repetition check (fetch_shared_section_lines) must look up first."""
-    return sorted({line for _, lines in _brand_section_plan(canonical, enrichment) for line in lines})
+    """Every line compose_brand_section_description might serve for this winner, in page order --
+    the lines the storefront repetition check (fetch_shared_section_lines) must look up first."""
+    return list(dict.fromkeys(line for _, lines in _brand_section_plan(canonical, enrichment) for line in lines))
 
 
 def _near_duplicate(words: frozenset, served: List[frozenset]) -> bool:
@@ -1901,11 +1953,13 @@ async def build_agent_pdp_view_row(
     if enrichment is not FETCH_FAILED:
         winner = pick_canonical(products)
         candidate_lines = brand_section_candidate_lines(winner, enrichment)
-        seed_domain = str((winner.get(_OWN_SEED_COPY) or {}).get("domain") or "").strip()
-        if candidate_lines and seed_domain:  # no domain: nothing to count against, nothing appended
+        from services.offer_seller_identity import normalize_host
+
+        seed_host = normalize_host((winner.get(_OWN_SEED_COPY) or {}).get("domain")) or ""
+        if candidate_lines and seed_host:  # no domain: nothing to count against, nothing appended
             try:
                 winner[_SHARED_SECTION_LINES] = await fetch_shared_section_lines(
-                    seed_domain,
+                    seed_host,
                     candidate_lines,
                     exclude_product_keys=product_keys,
                     own_base_title=_product_base_title(winner.get("title")),

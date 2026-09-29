@@ -100,7 +100,7 @@ class _DB:
         self.sql = self.params = self.shared_sql = self.shared_params = None
 
     async def fetch_all(self, sql, params=None):
-        if "WITH bodies" in sql:
+        if "unnest(CAST(:lines AS text[]))" in sql:
             self.shared_sql, self.shared_params = sql, params
             if self.shared_fails:
                 raise RuntimeError("shared-line read failed")
@@ -283,7 +283,7 @@ def test_a_line_other_products_of_the_storefront_carry_is_dropped(patched):
     db = _DB([_seed()], shared={"Fenty Beauty is 100% cruelty free.": 2})
     assert _build(db)["description"] == f"{TAGLINE}\n\nDetails\n" + DETAILS_SERVED.rsplit("\n", 1)[0]
     params = db.shared_params
-    assert params["domain"] == HOST
+    assert params["domains"] == [HOST, f"www.{HOST}"]  # seed domains are stored both ways
     assert params["keys"] == [_row()["product_key"]]
     assert params["own_base"] == "match stix contour skinstick"  # its own shades are not "other products"
     assert "Fenty Beauty is 100% cruelty free." in params["lines"]
@@ -316,10 +316,30 @@ def test_the_repetition_query_counts_other_products_by_base_title_on_the_storefr
     db = _DB([_seed()])
     _build(db)
     sql = " ".join(db.shared_sql.split())
-    for fragment in ("s.domain = :domain", "s.status = 'active'", "s.attached_product_key <> ALL(:keys)",
+    for fragment in ("s.domain = ANY(CAST(:domains AS text[]))", "s.status = 'active'",
+                     "s.attached_product_key <> ALL(:keys)", "WITH seeds AS MATERIALIZED", "bodies AS MATERIALIZED",
+                     "LIMIT :seed_limit",
                      "count(DISTINCT b.base)", "b.base <> :own_base", "unnest(CAST(:lines AS text[]))",
                      "strpos(b.body, l.line) > 0"):
         assert fragment in sql
+
+
+def test_a_www_seed_domain_is_checked_as_the_bare_host(patched):
+    db = _DB([_seed(domain="www.fentybeauty.com")])
+    _build(db)
+    assert db.shared_params["domains"] == [HOST, f"www.{HOST}"]
+
+
+def test_lines_past_the_check_cap_are_not_appended(patched, monkeypatch):
+    monkeypatch.setattr(assembler, "_SHARED_LINE_CHECK_MAX", 1)
+    db = _DB([_seed(sections=_details(PROSE[0], PROSE[1]))])
+    assert _build(db)["description"] == f"{TAGLINE}\n\nDetails\n{PROSE[0]}"
+    assert db.shared_params["lines"] == [PROSE[0]]  # page order: the first line is the one checked
+
+
+def test_the_candidate_lines_keep_page_order(patched):
+    row = dict(_row(), **{assembler._OWN_SEED_COPY: _seed(sections=_details(PROSE[3], PROSE[0], PROSE[3]))})
+    assert assembler.brand_section_candidate_lines(row, None) == [PROSE[3], PROSE[0]]
 
 
 def test_no_repetition_read_without_a_candidate_line(patched):
@@ -353,7 +373,8 @@ def test_the_edition_suffix_is_cut_the_same_way_as_in_sql():
     ("Save 20 percent on the full routine when you buy it together.", "promo"),
     ("Buy one get one half off across the whole lip collection.", "promo"),
     ("Limited edition: while supplies last, so grab yours soon.", "promo"),
-    ("Complimentary standard shipping on all orders over fifty dollars.", "shipping"),
+    ("Complimentary standard shipping on all orders over fifty dollars.", "promo"),
+    ("Standard shipping on all orders over fifty dollars, every day.", "shipping"),
     ("Free returns within 30 days of delivery on every order placed.", "promo"),
     ("Ships within 2-3 business days from our warehouse in New Jersey.", "shipping"),
     ("Rated 4.8 out of 5 stars by over 2,000 verified customers.", "reviews"),
@@ -363,10 +384,25 @@ def test_the_edition_suffix_is_cut_the_same_way_as_in_sql():
     ("Water, Glycerin, Butylene Glycol, Niacinamide, Panthenol, Allantoin, Betaine, Squalane, Ceramide NP",
      "ingredient_list"),
     ("Join our rewards program to earn points on every purchase you make.", "store"),
+    ("Members of our Beauty Rewards club get early access to every launch.", "store"),
     ("Available only while this collection lasts, in selected colours.", "store"),
     ("Learn more about the Icon case and its refills in our guide.", "call_to_action"),
     ("Watch the full tutorial on our TikTok channel this week.", "call_to_action"),
     ("Want to protect your skin the right way? Tap into our blog: Mastering Moisture.", "call_to_action"),
+    # evasions from review #2443 round 2
+    ("Enjoy frее ѕhipping on every order over fifty dollars today.", "promo"),        # Cyrillic е, ѕ
+    ("The full size is ＄ 25 and lasts for months of daily use.", "price"),            # fullwidth
+    ("Read the [full routine guide](/pages/routine) before you start.", "link"),
+    ("Visit brand.shop to see the complete range of shades.", "link"),
+    ("Receive a complimentary deluxe mini with every purchase today.", "promo"),
+    ("As seen on the runways of Paris and in every magazine.", "promo"),
+    ("Join our loyalty club and earn points on every single purchase.", "store"),
+    ("Pay in 4 interest-free installments with Shop Pay at checkout.", "store"),
+    ("Questions? Call our team at (800) 555-0199 any weekday.", "contact"),
+    ("Write to hello@brand.example for help with any order.", "contact"),
+    ("Write to hello at brand dot com for help with any order.", "contact"),
+    ("Tag your look with @brand for a chance to be featured.", "contact"),
+    ("These statements have not been evaluated by the Food and Drug Administration.", "legal"),
 ])
 def test_every_class_of_non_product_line_is_named(line, kind):
     assert assembler._not_product_copy(line) == kind
@@ -394,9 +430,18 @@ def test_a_non_product_line_is_dropped_from_the_section_through_the_producer(pat
     "Made to layer, the buildable formula is weightless and easy to blend.",
     "Dermatologist tested and suitable for sensitive skin types.",
     "It returns skin to a calm, balanced feel after cleansing.",
+    "Apply to the high points of your face for a lit, lifted glow.",
+    "Complementary shades that flatter every undertone and skin type.",
+    "Contains 2% niacinamide and 10% squalane for a softer feel.",
 ])
 def test_product_copy_is_not_mistaken_for_store_text(line):
     assert assembler._not_product_copy(line) is None
+
+
+@pytest.mark.parametrize("marker", ["*", "†", "‡", "§", "¹"])
+def test_a_footnote_line_is_dropped_whatever_its_marker(patched, marker):
+    footnote = f"{marker}In an 8-week clinical study on 40 people, results were measured by an independent lab."
+    assert _served(_details(GOOD, footnote)) == f"{TAGLINE}\n\nDetails\n{GOOD}"
 
 
 def test_a_section_with_a_script_is_dropped_whole(patched):
