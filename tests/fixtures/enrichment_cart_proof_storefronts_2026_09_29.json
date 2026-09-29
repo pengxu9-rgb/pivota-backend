@@ -1,0 +1,498 @@
+{
+ "_about": "Real storefront responses read 2026-09-29 (read-only GETs from a laptop Shopify geolocates to JP), trimmed to the keys the proof job reads: no description, media or image URLs (images_count keeps how many there were). `set_cookie_cart_currency` is every cart_currency Set-Cookie on the SAME final response. Variant lists are complete unless `variants_trimmed` says otherwise.",
+ "tarte_js_amazonian_clay_baked_blush": {
+  "url": "https://tartecosmetics.com/products/amazonian-clay-baked-blush.js",
+  "final_url": "https://tartecosmetics.com/products/amazonian-clay-baked-blush.js",
+  "status": 200,
+  "set_cookie_cart_currency": [
+   "USD"
+  ],
+  "body": {
+   "id": 15531947491697,
+   "title": "Amazonian clay baked blush",
+   "handle": "amazonian-clay-baked-blush",
+   "vendor": "Tarte Cosmetics",
+   "options": [
+    {
+     "name": "color",
+     "position": 1,
+     "values": [
+      "pink",
+      "peach",
+      "berry"
+     ]
+    }
+   ],
+   "images_count": 12,
+   "variants": [
+    {
+     "id": 63530896753009,
+     "title": "pink",
+     "option1": "pink",
+     "option2": null,
+     "option3": null,
+     "sku": "FG12931",
+     "price": 3000,
+     "available": false,
+     "barcode": "197689000060"
+    },
+    {
+     "id": 63530896785777,
+     "title": "peach",
+     "option1": "peach",
+     "option2": null,
+     "option3": null,
+     "sku": "FG12932",
+     "price": 3000,
+     "available": false,
+     "barcode": "197689000077"
+    },
+    {
+     "id": 63530896818545,
+     "title": "berry",
+     "option1": "berry",
+     "option2": null,
+     "option3": null,
+     "sku": "FG12933",
+     "price": 3000,
+     "available": true,
+     "barcode": "197689000084"
+    }
+   ]
+  }
+ },
+ "tarte_products_json_page1_plain": {
+  "url": "https://tartecosmetics.com/products.json?limit=2&page=1",
+  "status": 200,
+  "set_cookie_cart_currency": [
+   "USD"
+  ],
+  "body": {
+   "products": [
+    {
+     "id": 15955084640625,
+     "title": "front row energy travel essentials",
+     "handle": "front-row-energy-travel-essentials",
+     "vendor": "Tarte Cosmetics",
+     "options": [
+      {
+       "name": "color",
+       "position": 1,
+       "values": [
+        "multi"
+       ]
+      }
+     ],
+     "images_count": 10,
+     "variants": [
+      {
+       "id": 64341820473713,
+       "title": "multi",
+       "option1": "multi",
+       "option2": null,
+       "option3": null,
+       "sku": "FG17699",
+       "price": "35.00",
+       "available": true
+      }
+     ]
+    },
+    {
+     "id": 15968558383473,
+     "title": "pretty in pearls lash curler",
+     "handle": "pretty-in-pearls-lash-curler",
+     "vendor": "Tarte Cosmetics",
+     "options": [
+      {
+       "name": "color",
+       "position": 1,
+       "values": [
+        "multi"
+       ]
+      }
+     ],
+     "images_count": 8,
+     "variants": [
+      {
+       "id": 64403821953393,
+       "title": "multi",
+       "option1": "multi",
+       "option2": null,
+       "option3": null,
+       "sku": "FG17458",
+       "price": "25.00",
+       "available": true
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "tarte_products_json_page1_country_GB": {
+  "url": "https://tartecosmetics.com/products.json?limit=2&page=1&country=GB",
+  "status": 200,
+  "set_cookie_cart_currency": [
+   "GBP"
+  ],
+  "body": {
+   "products": [
+    {
+     "id": 15955084640625,
+     "title": "front row energy travel essentials",
+     "handle": "front-row-energy-travel-essentials",
+     "vendor": "Tarte Cosmetics",
+     "options": [
+      {
+       "name": "color",
+       "position": 1,
+       "values": [
+        "multi"
+       ]
+      }
+     ],
+     "images_count": 10,
+     "variants": [
+      {
+       "id": 64341820473713,
+       "title": "multi",
+       "option1": "multi",
+       "option2": null,
+       "option3": null,
+       "sku": "FG17699",
+       "price": "33.00",
+       "available": true
+      }
+     ]
+    },
+    {
+     "id": 15968558383473,
+     "title": "pretty in pearls lash curler",
+     "handle": "pretty-in-pearls-lash-curler",
+     "vendor": "Tarte Cosmetics",
+     "options": [
+      {
+       "name": "color",
+       "position": 1,
+       "values": [
+        "multi"
+       ]
+      }
+     ],
+     "images_count": 8,
+     "variants": [
+      {
+       "id": 64403821953393,
+       "title": "multi",
+       "option1": "multi",
+       "option2": null,
+       "option3": null,
+       "sku": "FG17458",
+       "price": "23.00",
+       "available": true
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "jsm_js_lip_pression_glowy_tint": {
+  "url": "https://jsmbeauty.sg/products/lip-pression-glowy-tint.js",
+  "final_url": "https://jsmbeauty.sg/products/lip-pression-glowy-tint.js",
+  "status": 200,
+  "set_cookie_cart_currency": [
+   "SGD"
+  ],
+  "body": {
+   "id": 10298496155969,
+   "title": "LIP-PRESSION Glowy Tint",
+   "handle": "lip-pression-glowy-tint",
+   "vendor": "JUNGSAEMMOOL",
+   "options": [
+    {
+     "name": "Color",
+     "position": 1,
+     "values": [
+      "Early Peach",
+      "Peach Bare",
+      "Pink Melts",
+      "Choux Rosy",
+      "Oat Rose",
+      "Coco Beige",
+      "Rosenut",
+      "Berry Vine",
+      "Cold Cherry",
+      "Red Brix"
+     ]
+    }
+   ],
+   "images_count": 2,
+   "variants": [
+    {
+     "id": 51905273004353,
+     "title": "Early Peach",
+     "option1": "Early Peach",
+     "option2": null,
+     "option3": null,
+     "sku": "33681662",
+     "price": 3000,
+     "available": true,
+     "barcode": "8800332431662"
+    },
+    {
+     "id": 51905273069889,
+     "title": "Peach Bare",
+     "option1": "Peach Bare",
+     "option2": null,
+     "option3": null,
+     "sku": "33691679",
+     "price": 3000,
+     "available": true,
+     "barcode": "8800332431679"
+    },
+    {
+     "id": 51905273102657,
+     "title": "Pink Melts",
+     "option1": "Pink Melts",
+     "option2": null,
+     "option3": null,
+     "sku": "33701686",
+     "price": 3000,
+     "available": true,
+     "barcode": "8800332431686"
+    },
+    {
+     "id": 51905273135425,
+     "title": "Choux Rosy",
+     "option1": "Choux Rosy",
+     "option2": null,
+     "option3": null,
+     "sku": "33711693",
+     "price": 3000,
+     "available": true,
+     "barcode": "8800332431693"
+    },
+    {
+     "id": 51905322516801,
+     "title": "Oat Rose",
+     "option1": "Oat Rose",
+     "option2": null,
+     "option3": null,
+     "sku": "33721709",
+     "price": 3000,
+     "available": true,
+     "barcode": "8800332431709"
+    },
+    {
+     "id": 51905322549569,
+     "title": "Coco Beige",
+     "option1": "Coco Beige",
+     "option2": null,
+     "option3": null,
+     "sku": "33731716",
+     "price": 3000,
+     "available": true,
+     "barcode": "8800332431716"
+    },
+    {
+     "id": 51905322582337,
+     "title": "Rosenut",
+     "option1": "Rosenut",
+     "option2": null,
+     "option3": null,
+     "sku": "33741723",
+     "price": 3000,
+     "available": true,
+     "barcode": "8800332431723"
+    },
+    {
+     "id": 51905322615105,
+     "title": "Berry Vine",
+     "option1": "Berry Vine",
+     "option2": null,
+     "option3": null,
+     "sku": "33751730",
+     "price": 3000,
+     "available": true,
+     "barcode": "8800332431730"
+    },
+    {
+     "id": 51905322647873,
+     "title": "Cold Cherry",
+     "option1": "Cold Cherry",
+     "option2": null,
+     "option3": null,
+     "sku": "33761747",
+     "price": 3000,
+     "available": true,
+     "barcode": "8800332431747"
+    },
+    {
+     "id": 51905322680641,
+     "title": "Red Brix",
+     "option1": "Red Brix",
+     "option2": null,
+     "option3": null,
+     "sku": "33771754",
+     "price": 3000,
+     "available": true,
+     "barcode": "8800332431754"
+    }
+   ]
+  }
+ },
+ "mac_js_family_parent_stub": {
+  "url": "https://maccosmetics.com/products/studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control.js",
+  "final_url": "https://www.maccosmetics.com/products/studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control.js",
+  "redirect": 301,
+  "status": 200,
+  "set_cookie_cart_currency": [
+   "USD"
+  ],
+  "body": {
+   "id": 14917667782851,
+   "title": "Studio Fix Fluid SPF 15 24HR Matte Foundation + Oil Control",
+   "handle": "studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control",
+   "vendor": "MAC Cosmetics",
+   "options": [
+    {
+     "name": "Title",
+     "position": 1,
+     "values": [
+      "Studio Fix Fluid SPF 15 24HR Matte Foundation + Oil Control"
+     ]
+    }
+   ],
+   "images_count": 0,
+   "variants": [
+    {
+     "id": 54057377759427,
+     "title": "Studio Fix Fluid SPF 15 24HR Matte Foundation + Oil Control",
+     "option1": "Studio Fix Fluid SPF 15 24HR Matte Foundation + Oil Control",
+     "option2": null,
+     "option3": null,
+     "sku": "P2000_120613",
+     "price": 3900,
+     "available": true,
+     "barcode": null
+    }
+   ]
+  }
+ },
+ "mac_js_shade_nc50": {
+  "url": "https://maccosmetics.com/products/studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control-nc50.js",
+  "final_url": "https://www.maccosmetics.com/products/studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control-nc50.js",
+  "redirect": 301,
+  "status": 200,
+  "set_cookie_cart_currency": [
+   "USD"
+  ],
+  "body": {
+   "id": 14917675843779,
+   "title": "Studio Fix Fluid SPF 15 24HR Matte Foundation + Oil Control - NC50",
+   "handle": "studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control-nc50",
+   "vendor": "MAC Cosmetics",
+   "options": [
+    {
+     "name": "Shade",
+     "position": 1,
+     "values": [
+      "NC50"
+     ]
+    },
+    {
+     "name": "Size",
+     "position": 2,
+     "values": [
+      "1 fl oz"
+     ]
+    }
+   ],
+   "images_count": 16,
+   "variants": [
+    {
+     "id": 54057385787587,
+     "title": "NC50 / 1 fl oz",
+     "option1": "NC50",
+     "option2": "1 fl oz",
+     "option3": null,
+     "sku": "SRMX11",
+     "price": 3900,
+     "available": true,
+     "barcode": "773602642960"
+    }
+   ]
+  }
+ },
+ "mac_js_fix_plus_canonical_only": {
+  "url": "https://maccosmetics.com/products/fix.js",
+  "final_url": "https://www.maccosmetics.com/products/fix.js",
+  "redirect": 301,
+  "status": 200,
+  "set_cookie_cart_currency": [
+   "USD"
+  ],
+  "body": {
+   "id": 14917675909315,
+   "title": "Fix+",
+   "handle": "fix",
+   "vendor": "MAC Cosmetics",
+   "options": [
+    {
+     "name": "Title",
+     "position": 1,
+     "values": [
+      "Fix+"
+     ]
+    }
+   ],
+   "images_count": 0,
+   "variants": [
+    {
+     "id": 54057385820355,
+     "title": "Fix+",
+     "option1": "Fix+",
+     "option2": null,
+     "option3": null,
+     "sku": "P2000_126092",
+     "price": 3500,
+     "available": true,
+     "barcode": null
+    }
+   ]
+  }
+ },
+ "luafee_js_no_currency_cookie": {
+  "url": "https://luafee.jp/products/<handle>.js",
+  "status": 200,
+  "set_cookie_cart_currency": [],
+  "body": {
+   "id": 10522113343797,
+   "title": "[Qoo10] ヘア＆ボディパフュームミスト ２種中１種選択",
+   "handle": "qoo10-ヘア-ボディパフュームミスト-２種中１種選択",
+   "vendor": "Luafee_jp",
+   "options": [
+    {
+     "name": "Title",
+     "position": 1,
+     "values": [
+      "Default Title"
+     ]
+    }
+   ],
+   "images_count": 1,
+   "variants": [
+    {
+     "id": 52912527868213,
+     "title": "Default Title",
+     "option1": "Default Title",
+     "option2": null,
+     "option3": null,
+     "sku": null,
+     "price": 220000,
+     "available": true,
+     "barcode": null
+    }
+   ]
+  }
+ }
+}
