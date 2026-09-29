@@ -389,6 +389,27 @@ def listing_handle(canonical_url: Optional[str]) -> Optional[str]:
     return url.split(marker, 1)[1].split("?", 1)[0].split("#", 1)[0].strip("/").casefold() or None
 
 
+def content_listing(canonical_url: Optional[str]) -> Optional[Tuple[str, str]]:
+    """(host, listing) of a storefront URL: the host without `www.`, and the listing's handle
+    (listing_handle), else its casefolded path. None when the URL names no host or no path.
+
+    The handle, not the path, so one listing stays one listing under a market subfolder
+    (/en-gb/products/x and /products/x), and percent-decoded, so one listing is one listing however a
+    lane spelled it (`makewaves%C2%AE-mascara` and `makewaves®-mascara`)."""
+    from urllib.parse import unquote, urlsplit
+
+    url = str(canonical_url or "").strip()
+    try:
+        host = (urlsplit(url).hostname or "").lower().removeprefix("www.")
+        path = urlsplit(url).path
+    except ValueError:
+        return None
+    listing = unquote(listing_handle(url) or path.strip("/").casefold()).casefold()
+    if not host or not listing:
+        return None
+    return host, listing
+
+
 def _normalize_url(url: Optional[str]) -> str:
     if not url:
         return ""
@@ -1736,6 +1757,8 @@ def ingest_validated_jsonl(
     *,
     source_jsonl: Optional[str] = None,
     market: Optional[str] = None,
+    current_listings: Optional[Dict[str, Tuple[str, str]]] = None,
+    allow_moves: Iterable[str] = (),
 ) -> Dict[str, Any]:
     """Drive ingest_validated_record across an iterable of records and
     return all five row collections plus skipped_count. Pure — no DB
@@ -1744,9 +1767,36 @@ def ingest_validated_jsonl(
     `market` (optional): the destination market the caller DECLARES for every offer (see
     `_build_offer_inserts`); a record priced in another currency fails the whole plan.
 
+    `current_listings` (optional): product_key -> the (host, listing) its catalog row names today
+    (apply.current_listings). A plan NEVER MOVES A ROW OFF THE LISTING IT NAMES: that listing keeps
+    the key whenever the crawl carries it, in or out of stock; when the crawl does not (unpublished, a
+    renamed handle, a page the crawl dropped), every record of that key on that host is left out and
+    named in `listing_moves` -- unless the key is in `allow_moves` (a reviewer accepted the move).
+    Measured by the review of #2463: one out-of-stock crawl elected another page, re-pointed the row
+    and re-activated that page's seed while the old offer stayed live and the new one suppressed.
+    Only a row with no listing yet on the host, or an accepted move, is elected
+    (scripts/repair_same_title_listings.py moves rows on purpose, under review).
+
     Returns a dict with keys: pdps, skus, merchants, offers, seeds,
-    skipped. Lists are de-duped by their natural primary key so re-runs
+    skipped, listing_collisions, listing_moves. Lists are de-duped by their natural primary key so re-runs
     across files don't stack duplicate row dicts.
+
+    ONE LISTING PER CONTENT KEY PER HOST. A content-keyed row (derive_product_key: brand + title,
+    merchant-agnostic) is the SAME row for every record with that title, so a second listing on
+    the same host with the same title used to land its offers and seeds under the first one's PDP:
+    first-wins kept the title, the upsert re-pointed canonical_url/image_url, and the offers of
+    both pages sat under one product. Measured 2026-09-29: 189 live rows carried offers from more
+    than one page of one host -- COCODOR titles every diffuser, refill and candle of a scent with
+    the scent alone ("Black Cherry": 16 pages, $6.99-$19.59), Mr. Smith's full size, mini and
+    sachet share a title, beautyofjoseon.com lists each set once per region at different prices.
+    One listing per (key, host) keeps the key -- elected by `elect_listing_keeper`, never by record
+    order -- and every record naming another listing on that host for the same key is left out WHOLE
+    (pdp, skus, offers, seeds) and named in `listing_collisions`, with the evidence a reviewer needs
+    to tell a duplicate page of one product (same price, same merchant type) from a different
+    product wearing its title. Not
+    counted in `skipped`: the plan is still ready, and the drain decides what holds
+    (services/retailer_ingest/detectors.listing_collision_flags). An `ext:retailer:` row is keyed
+    by its listing URL, so it never meets another listing under its key.
     """
     pdp_rows: List[Dict[str, Any]] = []
     sku_rows: List[Dict[str, Any]] = []
@@ -1757,6 +1807,8 @@ def ingest_validated_jsonl(
     audit_reasons: Dict[str, int] = {}
     skipped = 0
     skipped_reasons: Dict[str, int] = {}
+    planned: List[Tuple[Dict[str, Any], Optional[Tuple[str, str]], Optional[Dict[str, Any]]]] = []
+    listings: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
     for record in rows:
         result = ingest_validated_record(record, source_jsonl=source_jsonl, market=market)
         if result is None:
@@ -1766,6 +1818,43 @@ def ingest_validated_jsonl(
             skipped += 1
             reason = str(result["skipped_reason"]).split(":")[0]
             skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+            continue
+        listing = content_listing(result["pdp"].get("canonical_url"))
+        group = evidence = None
+        if listing is not None:
+            group = (str(result["pdp"].get("product_key") or ""), listing[0])
+            evidence = listings.setdefault(group, {}).setdefault(listing[1], _listing_evidence(record, listing[1]))
+        planned.append((result, group, evidence))
+
+    def _current(group: Tuple[str, str]) -> Optional[str]:
+        named = (current_listings or {}).get(group[0])
+        return named[1] if named and named[0] == group[1] else None
+
+    allowed = {str(k) for k in allow_moves or ()}
+    keepers: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
+    listing_moves: List[Dict[str, Any]] = []
+    for group, by_handle in listings.items():
+        current = _current(group)
+        if current is not None and current in by_handle:
+            keepers[group] = by_handle[current]
+        elif current is not None and group[0] not in allowed:
+            keepers[group] = None  # held: the row stays on the listing it names
+            would_keep = elect_listing_keeper(list(by_handle.values()), market=market)["handle"]
+            listing_moves.append({"product_key": group[0], "host": group[1], "current": current,
+                                  "crawled": sorted(by_handle), "would_keep": would_keep})
+        else:
+            keepers[group] = elect_listing_keeper(list(by_handle.values()), market=market)
+    listing_collisions: List[Dict[str, Any]] = []
+    for group, by_handle in listings.items():
+        kept = keepers[group]
+        if kept is None:
+            continue
+        for handle, evidence in by_handle.items():
+            if handle != kept["handle"]:
+                listing_collisions.append({"product_key": group[0], "host": group[1],
+                                           "kept": kept, "dropped": evidence})
+    for result, group, evidence in planned:
+        if group is not None and (keepers[group] is None or evidence["handle"] != keepers[group]["handle"]):
             continue
         pdp_rows.append(result["pdp"])
         sku_rows.append(result["sku"])
@@ -1808,4 +1897,98 @@ def ingest_validated_jsonl(
         "skipped": skipped,
         "skipped_reasons": skipped_reasons,
         "audit_reasons": audit_reasons,
+        "listing_collisions": listing_collisions,
+        "listing_moves": listing_moves,
     }
+
+
+def _listing_evidence(record: Dict[str, Any], handle: str) -> Dict[str, Any]:
+    """What a reviewer compares across two listings that share a content key -- the storefront's own
+    product type, every price the record carries (its variants', else its offers'), its first image --
+    and what elect_listing_keeper ranks on: whether any of it is in stock, and its lowest storefront
+    variant id (its age)."""
+    pdp = record.get("pdp") if isinstance(record.get("pdp"), dict) else {}
+    variants = [v for v in pdp.get("variants") or [] if isinstance(v, dict)]
+    offers = [o for o in record.get("offers") or [] if isinstance(o, dict)]
+    prices = set()
+    for source in (variants, offers):
+        for item in source:
+            try:
+                price = round(float(item.get("price")), 2)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                prices.add(price)
+        if prices:
+            break
+    stock = [item.get("in_stock") for item in variants + offers if isinstance(item.get("in_stock"), bool)]
+    variant_ids = [int(str(v.get("variant_id")).strip()) for v in variants
+                   if str(v.get("variant_id") or "").strip().isdigit()]
+    image = next((str(o.get("image_url") or "") for o in offers if o.get("image_url")), "")
+    product_type = str(pdp.get("category_source_product_type") or "").strip()
+    return {"handle": handle, "product_name": pdp.get("product_name"),
+            "product_type": product_type or None, "prices": sorted(prices),
+            "image": image.split("?", 1)[0].rsplit("/", 1)[-1].casefold() or None,
+            "available": any(stock) if stock else None,
+            "oldest_variant_id": min(variant_ids) if variant_ids else None}
+
+
+#: Handle suffixes a store uses to name a region's copy of a listing, by the job market they serve.
+#: Measured 2026-09-29: meritbeauty.com -ukeu/-uk/-eu/-ca, beautyofjoseon.com -us/-uk/-eu/-global,
+#: iliabeauty.com -ca/-uk/-gb. `-global` names no region: it is never "another region's copy".
+REGION_HANDLE_SUFFIXES = {
+    "US": ("us",), "CA": ("ca",), "AU": ("au",), "JP": ("jp",), "SG": ("sg",), "KR": ("kr",),
+    "GB": ("uk", "ukeu", "gb"), "EU": ("eu", "ukeu"),
+}
+_EU_MARKETS = frozenset({"AT", "BE", "DE", "DK", "ES", "FI", "FR", "IE", "IT", "NL", "PL", "PT", "SE"})
+
+
+def _region_suffixes(market: Optional[str]) -> Tuple[str, ...]:
+    code = str(market or "US").strip().upper()
+    return REGION_HANDLE_SUFFIXES.get("EU" if code in _EU_MARKETS else "GB" if code == "UK" else code, ())
+
+
+def _region_copy(handle: str, handles: List[str], suffixes: Iterable[str]) -> bool:
+    """`handle` is `<stem>-<suffix>` for one of `suffixes` AND another listing of the group shares that
+    stem (is it, or `<stem>-...`): a region copy, not a product whose name ends in "-us"."""
+    for suffix in suffixes:
+        if handle.endswith("-" + suffix):
+            stem = handle[:-len(suffix) - 1]
+            if any(o != handle and (o == stem or o.startswith(stem + "-")) for o in handles):
+                return True
+    return False
+
+
+def elect_listing_keeper(listings: List[Dict[str, Any]], *, market: Optional[str] = None,
+                         current: Optional[str] = None) -> Dict[str, Any]:
+    """Which of a host's same-title listings keeps the content key. `listings` are _listing_evidence
+    dicts (the repair builds the same shape from the catalog); `current` is the handle the row names today.
+
+    Never record order: Shopify's /products.json lists newest-published first, so first-wins kept
+    whatever the merchant published last -- measured 2026-09-29 on meritbeauty.com, 32 of 36
+    price-identical pairs kept a `-ukeu`/`-ca`/`-eu` copy that 404s for a US shopper over the US page,
+    and every new ad-landing clone would have moved the key's listing again. In order:
+      1. the region copy named for the market (`<stem>-us` for US; the CLI and Path C declare none: US);
+      2. available: in stock first, unknown next, out of stock last (a stale base never beats a live relist,
+         and the repair, which often knows nothing of an ad clone, never trades a selling page for it);
+      3. not another region's copy (`-ukeu` for a US job; `-global` is no region);
+      4. a base listing: not another listing's handle plus a suffix (`serum` over `serum-sachet`);
+      5. `current`, the listing the row names today: the repair's tie-break (the ingest never elects for
+         a row that names a listing on the host -- it keeps it, see ingest_validated_jsonl);
+      6. the oldest listing: lowest storefront variant id (issued in creation order); none ranks last;
+      7. the handle, so the choice is total.
+    ONE function for the ingest and scripts/repair_same_title_listings.py, so the two keep one page."""
+    own = _region_suffixes(market)
+    foreign = {s for suffixes in REGION_HANDLE_SUFFIXES.values() for s in suffixes} - set(own)
+    handles = [str(item["handle"]) for item in listings]
+
+    def rank(item: Dict[str, Any]) -> tuple:
+        handle = str(item["handle"])
+        derived = any(handle != other and handle.startswith(other + "-") for other in handles)
+        oldest = item.get("oldest_variant_id")
+        stock = {True: 0, None: 1, False: 2}.get(item.get("available"), 1)
+        return (not _region_copy(handle, handles, own), stock,
+                _region_copy(handle, handles, foreign), derived, handle != current,
+                oldest is None, oldest or 0, handle)
+
+    return min(listings, key=rank)

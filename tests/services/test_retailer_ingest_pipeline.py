@@ -168,6 +168,13 @@ def env(monkeypatch):
     monkeypatch.setattr(cli, "_legacy_listing_report", clear)
     monkeypatch.setattr(cli, "_brand_host_guard_report", clear)
 
+    class EmptyCatalog:  # apply.current_listings reads it: no row names a listing yet
+        is_connected = True
+
+        async def fetch_all(self, query, values=None):
+            return []
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (EmptyCatalog(), None))
+
     from services.catalog_enrichment_agent import apply as apply_mod, primary_ingestion as pi
 
     async def fake_apply(plan, **kw):

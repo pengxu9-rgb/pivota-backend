@@ -55,7 +55,11 @@ _OPTION_TYPES = {
     # gift-set shelf, not dropped -- shoppers look for gift sets; the harm was the shelf. These handles
     # are filed under REFILE_SETS_LEAF before any check runs.
     "refile_to_sets": list,
-    "accepted_flags": list, "max_scan_products": int, "max_products": int,
+    "accepted_flags": list,
+    # Accept every same_key_other_listing flag of this job at once (COCODOR raised 89): a reviewer who has
+    # read the listings left out -- each is still recorded as a flag on the run.
+    "accept_listing_collisions": bool,
+    "max_scan_products": int, "max_products": int,
     "max_pdp_identity_fetches": int, "max_pdp_inci_fetches": int, "retailer_name": str, "notes": str,
     # "storefront" (default: crawl the retailer's /products.json), "affiliate_feed" (the network's
     # product datafeed; services/retailer_ingest/affiliate_feed.py) -- for stores that block crawlers --
@@ -817,7 +821,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
 
     # Every offer is DECLARED for the job's market (catalog_offers.market) and must be priced in its
     # currency; the seed rows keep the US serving partition (ingestion.SEED_PARTITION_MARKET).
-    plan = ingest_validated_jsonl(records, market=market)
+    moves_accepted = [k.split(":", 1)[1] for k in o.get("accepted_flags") or [] if k.startswith("listing_moved:")]
+    plan = await cli._plan_with_current_listings(records, market=market, allow_moves=moves_accepted)
     inspection = inspect_primary_plan(plan)
     checks["plan"] = {k: inspection.get(k) for k in ("status", "reasons", "planned", "unresolved_category_count")}
     if inspection.get("reasons"):
@@ -845,13 +850,28 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
         answered = [f for f in row_flags if f.get("handle") in refiled and f.get("rule") in REFILE_RESOLVES_RULES]
         row_flags = [f for f in row_flags if f not in answered]
         checks["refile_resolved_flags"] = sorted(f["key"] for f in answered)
+    # A listing the plan left out because an earlier one on this host has its title (one content key).
+    collisions = plan.get("listing_collisions") or []
+    checks["listing_collisions"] = len(collisions)
+    checks["current_listings"] = plan.get("current_listings")
+    checks["listing_moves"] = len(plan.get("listing_moves") or [])
+    row_flags += detectors.listing_move_flags(plan.get("listing_moves") or [])
+    if (plan.get("current_listings") or {}).get("status") in ("unchecked", "error"):
+        # Without the listing each row names, a plan cannot tell a move from a first ingest.
+        flags.append({"key": "current_listings_unread", "rule": "current_listings_unread",
+                      "severity": detectors.BLOCK, "acceptable": False,
+                      "detail": f"could not read the rows' current listings: {plan['current_listings']}"})
+    row_flags += detectors.listing_collision_flags(collisions)
     # Name each row's brand on its flag: in a multi_brand cohort the reviewer must see whose row it is.
     brand_of = {detectors._handle(r): (r.get("pdp") or {}).get("brand") for r in records}
     for f in row_flags:
         if f.get("handle") and not f.get("brand"):
             f["brand"] = brand_of.get(f["handle"])
     flags.extend(row_flags)
-    blocking = detectors.blocking(flags, accepted=o.get("accepted_flags") or [])
+    accepted = list(o.get("accepted_flags") or [])
+    if o.get("accept_listing_collisions"):
+        accepted += [f["key"] for f in flags if f.get("rule") == "same_key_other_listing"]
+    blocking = detectors.blocking(flags, accepted=accepted)
     checks["flags"] = {"block": len([f for f in flags if f["severity"] == detectors.BLOCK]),
                        "info": len([f for f in flags if f["severity"] == detectors.INFO]),
                        "blocking_after_approval": len(blocking)}

@@ -2515,3 +2515,56 @@ async def _apply_ingest_plan_batched(
     # The list can be thousands of rows; one log entry past 256 KiB is dropped by Cloud Logging.
     logger.info("apply_ingest_plan(batch) applied: %s", {**counts, "skipped_products": len(counts["skipped_products"])})
     return counts
+
+
+_CURRENT_LISTINGS_SQL = """
+                SELECT product_key, canonical_url FROM catalog_products
+                WHERE product_key = ANY(:product_keys)
+                """
+
+
+async def current_listings(product_keys: List[str], *, db: Any) -> Dict[str, Any]:
+    """product_key -> the (host, listing) its catalog row names today (ingestion.content_listing of its
+    canonical_url), for ingestion.elect_listing_keeper's tie-break: a re-ingest keeps the listing a row
+    already names -- the one scripts/repair_same_title_listings.py aligned it to -- unless a stronger
+    rule says otherwise. Read-only; keys with no row or no readable URL are absent."""
+    from services.catalog_enrichment_agent.ingestion import content_listing
+
+    keys = sorted({str(k) for k in product_keys if k})
+    if not keys:
+        return {}
+    rows = await db.fetch_all(_CURRENT_LISTINGS_SQL, {"product_keys": keys})
+    out = {}
+    for row in rows:
+        listing = content_listing(row["canonical_url"])
+        if listing:
+            out[str(row["product_key"])] = listing
+    return out
+
+
+def content_keys_of(plan: Dict[str, Any]) -> List[str]:
+    """Every content-keyed row a plan writes (a row a listing was left out of keeps another; `ext:retailer:`
+    rows are keyed by their URL and never move)."""
+    keys = {str(p.get("product_key") or "") for p in plan.get("pdps") or []}
+    return sorted(k for k in keys if k and not k.startswith("ext:retailer:"))
+
+
+async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, market: Optional[str] = None,
+                                     source_jsonl: Optional[str] = None,
+                                     allow_moves: Any = (), planner: Any = None) -> Dict[str, Any]:
+    """ingestion.ingest_validated_jsonl with the listing each of its rows names today, so the plan never
+    moves a row off it (`listing_moves`) -- the one way every lane that holds a catalog handle plans.
+    `current_listings.status` says what was read. `planner` is the caller's own ingest_validated_jsonl
+    (the name its tests patch)."""
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
+
+    planner = planner or ingest_validated_jsonl
+    records = list(records)
+    given = {k: v for k, v in (("market", market), ("source_jsonl", source_jsonl)) if v is not None}
+    first = planner(records, **given)
+    keys = content_keys_of(first)
+    if not keys:
+        return {**first, "current_listings": {"status": "not_applicable"}}
+    current = await current_listings(keys, db=db)
+    replanned = planner(records, **given, current_listings=current, allow_moves=allow_moves)
+    return {**replanned, "current_listings": {"status": "read", "rows": len(current)}}
