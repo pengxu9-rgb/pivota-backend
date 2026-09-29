@@ -749,6 +749,80 @@ def _best_variant_title_score(variants: List[Dict[str, Any]], product_title: Opt
     return best
 
 
+# Words, and numbers with their decimal point: "50 ml | 1.7 fl. oz." -> 1.7, 50, fl, ml, oz.
+_LABEL_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?|[^\W\d_]+", re.UNICODE)
+_LABEL_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+_LABEL_UNIT_TOKENS = frozenset(
+    {"ml", "l", "oz", "fl", "floz", "g", "kg", "mg", "lb", "lbs", "cm", "mm", "in", "inch", "inches",
+     "ct", "count", "pc", "pcs", "pack", "x"}
+)
+# Shopify's name for the only variant of a product with no options.
+_PLACEHOLDER_VARIANT_TITLES = frozenset({"default title"})
+
+
+def _label_tokens(text: Any) -> Tuple[str, ...]:
+    """A label's tokens as a sorted multiset, so "1.7 fl oz / 50 mL" == "50 ml | 1.7 fl. oz."."""
+    return tuple(sorted(_LABEL_TOKEN_RE.findall(str(text or "").lower())))
+
+
+def _name_words(tokens: Tuple[str, ...]) -> set:
+    return {t for t in tokens if t not in _LABEL_UNIT_TOKENS and not _LABEL_NUMBER_RE.fullmatch(t)}
+
+
+def _variant_option_labels(*variant_lists: Any) -> set:
+    """Every option label the variants carry (title, options values, option1..3), as tokens.
+
+    A LONE variant's title is often the product's own name, not a label: the extractor names an
+    offer with no size/colour by the page's product (`_offer_variants_from_node`). So a list with
+    one distinct title contributes it only when it names nothing ("50 ml", "1 pack").
+    """
+    labels: set = set()
+    for variants in variant_lists:
+        if not isinstance(variants, list):
+            continue
+        titles: set = set()
+        for v in variants:
+            if not isinstance(v, dict):
+                continue
+            title = _label_tokens(v.get("title")) if isinstance(v.get("title"), str) else ()
+            if title:
+                titles.add(title)
+            values = [v.get(k) for k in ("option1", "option2", "option3")]
+            options = v.get("options")
+            if isinstance(options, dict):
+                values.extend(options.values())
+            elif isinstance(options, list):
+                values.extend(o.get("value") if isinstance(o, dict) else o for o in options)
+            for value in values:
+                tokens = _label_tokens(value) if isinstance(value, str) else ()
+                if tokens:
+                    labels.add(tokens)
+        labels |= titles if len(titles) > 1 else {t for t in titles if not _name_words(t)}
+    return labels
+
+
+def _is_variant_label_not_product_title(
+    title: Any, *, variant_lists: Tuple[Any, ...], product_names: Tuple[Any, ...]
+) -> bool:
+    """Is `title` one of the product's OPTION LABELS rather than the product's name?
+
+    True when it matches a variant's option label (exactly or as a token permutation) and shares
+    no word with any of the product's own names -- "50 ml | 1.7 fl. oz.", "Default Title", "Black".
+    A variant-qualified title that still names the product ("Cica Cream - 50ml") is not a label.
+    """
+    tokens = _label_tokens(title)
+    if not tokens:
+        return False
+    if " ".join(str(title).lower().split()) in _PLACEHOLDER_VARIANT_TITLES:
+        return True
+    if tokens not in _variant_option_labels(*variant_lists):
+        return False
+    known_words: set = set()
+    for name in product_names:
+        known_words |= _name_words(_label_tokens(name))
+    return not (_name_words(tokens) & known_words)
+
+
 def _distinct_variant_titles(variants: List[Dict[str, Any]]) -> List[str]:
     out: List[str] = []
     for v in variants:
@@ -5170,6 +5244,30 @@ async def _refresh_external_seed_by_id(
 
     seed_data = _ensure_json_obj(row.get("seed_data"))
     seed_data.setdefault("snapshot", {})
+    # THE PAGE'S "TITLE" CAN BE A VARIANT'S OPTION LABEL. tatcha.com's ProductGroup JSON-LD
+    # named every variant "50 ml | 1.7 fl. oz.", the extractor took it, and the gateway serves
+    # `snapshot.title` ahead of the row's own title -- so two different Tatcha products shared
+    # one label and the identity backfill merged them (2026-09-29, sig_1b52c3ff0045a6d39c40dd7d).
+    # The extractor now names a variant by its group; this refuses whatever shape comes next.
+    snapshot_title_refused = None
+    product_names = (row.get("title"), seed_data.get("product_name"), seed_data.get("title"))
+    variant_lists = (snap_variants, _seed_variants(seed_data), seed_data["snapshot"].get("variants"))
+    if snap_title and _is_variant_label_not_product_title(
+        snap_title, variant_lists=variant_lists, product_names=product_names
+    ):
+        snapshot_title_refused = snap_title
+        snap_title = next(
+            (
+                str(name).strip()
+                for name in (*product_names, seed_data["snapshot"].get("title"))
+                if isinstance(name, str)
+                and name.strip()
+                and not _is_variant_label_not_product_title(
+                    name, variant_lists=variant_lists, product_names=product_names
+                )
+            ),
+            None,
+        )
     seed_data["snapshot"].update(
         {
             "canonical_url": canonical_url,
@@ -5593,6 +5691,8 @@ async def _refresh_external_seed_by_id(
         "canonical_url": served_canonical,
         "domain": domain,
         "seed_data": seed_data,
+        # The page's title, when it was a variant's option label and was not written.
+        "snapshot_title_refused": snapshot_title_refused,
         # DID THIS "SUCCESS" ACTUALLY CONTACT THE ORIGIN? Often not, and the status alone
         # cannot say. `resolve_external_offer` honours `raise_on_unavailable` ONLY in its
         # `except ExternalOfferUnavailable` arm; anything else — a timeout, TLS, robots, and
