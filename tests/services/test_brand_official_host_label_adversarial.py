@@ -44,8 +44,9 @@ def test_a_short_host_label_never_relabels_an_unrelated_vendor(host, vendor, ove
 def test_the_store_label_behind_a_regional_prefix_still_names_the_store(host):
     """The arm's job (the metro.com.sg store-name vendor) must survive a www./shop./us. host: before,
     the label read was "www"/"shop"/"us" and the store's own name went into the brand column."""
-    assert feed.resolve_record_brand(METRO_VENDOR, "ETUDE HOUSE", host) == ("ETUDE HOUSE", "override_vendor_is_store")
-    assert brand_written(host, METRO_VENDOR, "ETUDE HOUSE") == "ETUDE HOUSE"
+    # (LANEIGE, not ETUDE HOUSE: ETUDE is now a listed rename family and is written "ETUDE" -- its own test.)
+    assert feed.resolve_record_brand(METRO_VENDOR, "LANEIGE", host) == ("LANEIGE", "override_vendor_is_store")
+    assert brand_written(host, METRO_VENDOR, "LANEIGE") == "LANEIGE"
 
 
 @pytest.mark.parametrize("host,label", [
