@@ -106,7 +106,8 @@ def build_rows(brand: str, name: str, host: str, handle: str, variants: List[Dic
 def selected(rows: Dict[str, Any], sku: Dict[str, Any]) -> Dict[str, Any]:
     """One SELECT_TARGETS_SQL row: the product joined to one sku, with the ::v: count."""
     count = sum(1 for s in rows["skus"] if s["sku_key"].startswith(rows["product"]["product_key"] + "::v:"))
-    return {**rows["product"], "sku_key": sku["sku_key"], "source_variant_id": sku["source_variant_id"],
+    return {**rows["product"], "catalog_title": rows["product"]["title"],
+            "sku_key": sku["sku_key"], "source_variant_id": sku["source_variant_id"],
             "sku_payload": sku["sku_payload"], "catalog_variant_sku_count": count}
 
 
@@ -287,11 +288,39 @@ def test_the_parent_stub_signature_is_the_mac_parent_not_default_title():
     jsm["variants"][0]["title"] = jsm["title"]
     assert not is_parent_stub(parse_live_product(jsm)[0])
     # Case and surrounding space do not hide it; an empty title never matches.
+    # (A real sku, so only the title signal can be what catches it.)
     b = body("mac_js_family_parent_stub")
+    b["variants"][0]["sku"] = "SRMX11"
     b["variants"][0]["title"] = "  " + b["title"].upper() + " "
     assert is_parent_stub(parse_live_product(b)[0])
     b["title"] = b["variants"][0]["title"] = ""
+    b["variants"][0]["sku"] = "SRMX11"
     assert not is_parent_stub(parse_live_product(b)[0])
+
+
+def test_the_second_stub_signal_is_macs_product_code_on_an_imageless_product():
+    """A parent whose variant title were renamed is still caught: sole variant, `P2000_` sku, no
+    image. Each of the three conditions alone is not enough."""
+    def parent(**over):
+        b = body("mac_js_family_parent_stub")
+        b["variants"][0]["title"] = "Renamed"
+        b["variants"][0].update({k: v for k, v in over.items() if k == "sku"})
+        if "images" in over:
+            b["images"] = over["images"]
+        return parse_live_product(b)[0]
+
+    assert parent().image_count == 0 and parent().variants[0].sku == "P2000_120613"
+    assert is_parent_stub(parent())
+    assert not is_parent_stub(parent(images=["https://cdn/x.jpg"]))
+    assert not is_parent_stub(parent(sku="SRMX11"))
+    b = body("mac_js_family_parent_stub")
+    del b["images"]  # a response without an image list says nothing about images
+    b["variants"][0]["title"] = "Renamed"
+    assert not is_parent_stub(parse_live_product(b)[0])
+    two = body("mac_js_family_parent_stub")
+    two["variants"][0]["title"] = "Renamed"
+    two["variants"].append(dict(two["variants"][0], id=54057377759428))
+    assert not is_parent_stub(parse_live_product(two)[0])
 
 
 # ── the proof row each sku gets, and what the reader says of it ─────────────────────────────────
@@ -503,10 +532,37 @@ def test_domains_come_from_the_tier_b_list_with_their_market_currency():
 
 
 def test_main_refuses_without_a_domain_and_off_the_list(capsys):
-    assert job.main([]) == 2
-    assert job.main(["--domain", "notonthelist.com"]) == 2
-    assert job.main(["--domain", "tartecosmetics.com", "--domain", "jsmbeauty.sg", "--after", "ext:x"]) == 2
+    flag = "--on-crawl-egress"
+    assert job.main([flag]) == 2
+    assert job.main([flag, "--domain", "notonthelist.com"]) == 2
+    assert job.main([flag, "--domain", "tartecosmetics.com", "--domain", "jsmbeauty.sg", "--after", "ext:x"]) == 2
     assert "PROOF_ERROR" in capsys.readouterr().err
+
+
+def test_main_refuses_to_crawl_without_the_crawl_egress_flag_dry_run_included(monkeypatch, capsys):
+    async def must_not_run(*a, **k):
+        raise AssertionError("ran without --on-crawl-egress")
+
+    monkeypatch.setattr(job, "run", must_not_run)
+    for extra in ([], ["--apply"]):
+        assert job.main(["--domain", "tartecosmetics.com", *extra]) == job.EXIT_BAD_ARGS
+    assert "--on-crawl-egress" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("outcome,code", [("ok", 0), ("aborted", 1), ("crash", 3)])
+def test_main_exit_codes_tell_aborted_from_crashed(monkeypatch, capsys, outcome, code):
+    async def fake_run(db, client, plans, **kwargs):
+        if outcome == "crash":
+            raise RuntimeError("boom")
+        return {"aborted_on_block": outcome == "aborted", "domains": {}}
+
+    monkeypatch.setattr(job, "run", fake_run)
+    assert job.main(["--on-crawl-egress", "--domain", "tartecosmetics.com"]) == code
+    out = capsys.readouterr()
+    if outcome == "crash":
+        assert "PROOF_CRASH RuntimeError" in out.err and "PROOF_REPORT" not in out.out
+    else:
+        assert out.out.startswith("PROOF_REPORT ")
 
 
 def test_the_request_gap_has_a_floor_and_the_abort_threshold_a_minimum():
@@ -557,8 +613,11 @@ def test_the_sources_and_outcomes_fit_the_table():
 
 
 class Store:
-    """A fake set of storefronts. `routes[(host, path)]` is (status, body, cookie currencies) or
-    ("redirect", location). Records every request."""
+    """A fake set of storefronts, with the real response shapes: `.js` is `text/javascript`,
+    `/products.json` and `/meta.json` are `application/json`, and every response (a redirect hop
+    included, as MAC's 301 does) sets `_shopify_essential`. `routes[(host, path)]` is
+    (status, body, cookie currencies[, extra headers]) or ("redirect", location[, hop cookies]).
+    Records every request."""
 
     def __init__(self) -> None:
         self.routes: Dict[tuple, Any] = {}
@@ -575,13 +634,17 @@ class Store:
         if spec is None:
             return httpx.Response(404, headers={"content-type": "text/html"}, text="<html>404</html>")
         if spec[0] == "redirect":
-            return httpx.Response(301, headers={"location": spec[1] + request.url.path + "?" + request.url.query.decode()})
-        status, payload, currencies = spec
+            hop_cookies = spec[2] if len(spec) > 2 else ["_shopify_essential=hop; path=/"]
+            return httpx.Response(301, headers=[("location", spec[1] + request.url.path + "?" + request.url.query.decode())]
+                                  + [("set-cookie", c) for c in hop_cookies])
+        status, payload, currencies = spec[:3]
+        extra = list(spec[3]) if len(spec) > 3 else []
         if status != 200:
-            return httpx.Response(status, headers={"content-type": "text/html"}, text="<html>no</html>")
+            return httpx.Response(status, headers=[("content-type", "text/html")] + extra, text="<html>no</html>")
         if payload == "__html__":
             return httpx.Response(200, headers={"content-type": "text/html"}, text="<html>challenge</html>")
-        headers = [("content-type", "application/json; charset=utf-8")]
+        ctype = "text/javascript; charset=utf-8" if request.url.path.endswith(".js") else "application/json; charset=utf-8"
+        headers = [("content-type", ctype)]
         headers += [("set-cookie", "_shopify_essential=abc; path=/")]
         headers += [("set-cookie", f"cart_currency={c}; path=/") for c in currencies]
         if callable(payload):
@@ -589,7 +652,22 @@ class Store:
         return httpx.Response(200, headers=headers, content=json.dumps(payload, default=str).encode())
 
     def client(self) -> httpx.AsyncClient:
+        # A PLAIN client, whose jar keeps every cookie: the job itself must keep them off requests.
         return httpx.AsyncClient(transport=httpx.MockTransport(self.handler))
+
+
+@pytest.fixture(autouse=True)
+def _crawl_politeness(monkeypatch):
+    """The job gates every request through services.crawl_politeness: no real robots.txt fetch and
+    no real per-host interval in tests (a robots test turns robots back on with its own transport)."""
+    from services import crawl_politeness
+
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "false")
+    monkeypatch.setenv("CRAWL_BACKOFF_BASE_SECONDS", "0")
+    crawl_politeness.reset_for_tests()
+    yield
+    crawl_politeness.reset_for_tests()
 
 
 class NoSleepPacer(Pacer):
@@ -908,7 +986,8 @@ async def test_a_complete_listing_proves_what_it_lists_and_falls_back_to_js_for_
         report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JSON,
                                pacer=NoSleepPacer(), now=_tick())
     d = report["domains"][TARTE_HOST]
-    assert d["listing"] == {"pages": 2, "complete": True, "stop": None, "products_seen": 2, "duplicate_handles": 0}
+    assert d["hosts"][TARTE_HOST]["listing"] == {"pages": 2, "complete": True, "stop": None, "products_seen": 2,
+                                                  "duplicate_handles": 0}
     stored = await proofs_by_sku(job_db)
     single = stored[RUN_TARTE_SINGLE["product"]["product_key"] + "::canonical"]
     assert (single["outcome"], single["source"], single["live_price_minor"]) == ("ok", "products_json_v1", 3500)
@@ -937,7 +1016,8 @@ async def test_an_incomplete_listing_writes_nothing_for_the_handles_it_did_not_r
         report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JSON,
                                pacer=NoSleepPacer(), now=_tick())
     d = report["domains"][TARTE_HOST]
-    assert d["listing"]["complete"] is False and d["listing"]["stop"] == "page_2_repeated"
+    listing = d["hosts"][TARTE_HOST]["listing"]
+    assert listing["complete"] is False and listing["stop"] == "page_2_repeated"
     assert d["skipped"] == {"skip_listing_incomplete": 4}
     stored = await proofs_by_sku(job_db)
     assert set(stored) == {RUN_TARTE_SINGLE["product"]["product_key"] + "::canonical"}
@@ -959,7 +1039,8 @@ async def test_a_handle_listed_twice_is_read_by_js_instead(job_db):
         report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JSON,
                                pacer=NoSleepPacer(), now=_tick())
     d = report["domains"][TARTE_HOST]
-    assert d["listing"]["duplicate_handles"] == 1 and d["listing"]["complete"] is True
+    listing = d["hosts"][TARTE_HOST]["listing"]
+    assert listing["duplicate_handles"] == 1 and listing["complete"] is True
     stored = (await proofs_by_sku(job_db))[RUN_TARTE_SINGLE["product"]["product_key"] + "::canonical"]
     assert (stored["outcome"], stored["source"], stored["live_price_minor"]) == ("ok", "products_js_v1", 3500)
 
@@ -976,7 +1057,7 @@ async def test_auto_pages_the_listing_only_when_that_is_fewer_requests(job_db):
                  override_body=FIXTURES["tarte_products_json_page1_plain"]["body"]["products"][0])
         async with store.client() as client:
             report = await job.run(job_db, client, [TARTE_PLAN], apply=False, pacer=NoSleepPacer(), now=_tick())
-        assert report["domains"][TARTE_HOST]["source_mode"] == expected, published
+        assert report["domains"][TARTE_HOST]["hosts"][TARTE_HOST]["source_mode"] == expected, published
 
 
 async def test_consecutive_blocks_abort_the_whole_run(job_db):
@@ -1038,3 +1119,334 @@ def test_a_domain_listed_under_two_markets_is_refused(tmp_path):
         job.plan_domains(["brand.com"], merchants_path=str(path))
     with pytest.raises(job.MerchantListError, match="no currency"):
         job.plan_domains(["other.com"], merchants_path=str(path))
+
+
+# ── review round 1 (#2464): product identity, variant title, cookies, redirects, pacing ─────────
+
+
+def test_a_handle_now_held_by_another_product_is_product_changed_and_keeps_the_recorded_id():
+    t = target(TARTE, "::v:63530896818545")
+    evidence = js_evidence("tarte_js_amazonian_clay_baked_blush")
+    same = job.SkuTarget(**{**t.__dict__, "prior_product_id": "15531947491697"})
+    assert decide_proof(same, evidence, market_currency="USD").outcome == "ok"
+    other = job.SkuTarget(**{**t.__dict__, "prior_product_id": "99999999999999"})
+    proof = decide_proof(other, evidence, market_currency="USD")
+    assert (proof.outcome, proof.shopify_product_id, proof.variant_id, proof.live_price_minor) == (
+        job.PRODUCT_CHANGED, "99999999999999", None, None)
+
+
+@pytest.mark.parametrize("catalog_title,outcome", [
+    ("front row energy travel essentials", "ok"),
+    ("  FRONT  ROW\tenergy travel ESSENTIALS\n", "ok"),          # case and whitespace fold
+    ("front row energy travel essentials​", "ok"),         # a zero-width char is dropped
+    ("front row energy travel essentials 2", job.PRODUCT_CHANGED),
+    ("something else entirely", job.PRODUCT_CHANGED),
+    (None, job.PRODUCT_CHANGED),
+    ("   ", job.PRODUCT_CHANGED),
+])
+def test_a_placeholder_is_ok_only_when_the_live_title_is_the_catalogs(catalog_title, outcome):
+    t = target(TARTE_SINGLE, "::canonical")
+    t = job.SkuTarget(**{**t.__dict__, "catalog_title": catalog_title})
+    proof = decide_proof(t, listing_evidence("tarte_products_json_page1_plain", "front-row-energy-travel-essentials"),
+                         market_currency="USD")
+    assert proof.outcome == outcome
+
+
+def test_titles_compare_in_nfc():
+    decomposed = "Café Blush"  # e + combining acute
+    composed = "Café blush"
+    assert job.title_key(decomposed) == job.title_key(composed)
+    assert job.title_key(None) is None and job.title_key(3) is None
+
+
+def test_the_variant_title_is_recorded_cleaned_for_display():
+    proof = decide_proof(target(MAC_FAMILY, "::v:54057385787587"), js_evidence("mac_js_shade_nc50"), market_currency="USD")
+    assert proof.variant_title == "NC50 / 1 fl oz"
+    b = body("tarte_js_amazonian_clay_baked_blush")
+    b["variants"][2]["title"] = " ber‮ry\n  red​ "
+    ev = evidence_from_product(b, requested_handle=b["handle"], source=SOURCE_PRODUCTS_JS, checked_at=CHECKED,
+                               currency="USD", currency_problem=None)
+    proof = decide_proof(target(TARTE, "::v:63530896818545"), ev, market_currency="USD")
+    assert (proof.outcome, proof.variant_title) == ("ok", "berry red")
+    # No variant identified, no title.
+    gone = decide_proof(target(MAC_FAMILY, "::canonical"), js_evidence("mac_js_family_parent_stub"), market_currency="USD")
+    assert gone.variant_title is None
+
+
+def test_the_no_cookie_client_keeps_no_cookie():
+    async def go():
+        def handler(request):
+            return httpx.Response(200, headers=[("set-cookie", "cart_currency=GBP; path=/"),
+                                                ("set-cookie", "localization=GB; path=/")], json={})
+        async with job.no_cookie_client(transport=httpx.MockTransport(handler)) as client:
+            await client.get("https://tarte.ecvpjob.test/cart.js")
+            assert list(client.cookies.jar) == []
+    import asyncio
+    asyncio.run(go())
+
+
+async def test_a_redirect_hops_cookies_never_reach_the_next_hop_and_only_the_final_cookie_counts(job_db):
+    await insert_rows(job_db, RUN_MAC_FAMILY)
+    store = Store()
+    nc50 = "studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control-nc50"
+    store.routes[(MAC_HOST, f"/products/{nc50}.js")] = (
+        "redirect", f"https://www.{MAC_HOST}",
+        ["_shopify_essential=hop; path=/", "cart_currency=GBP; path=/", "localization=GB; path=/"])
+    store.js("www." + MAC_HOST, nc50, "mac_js_shade_nc50")
+    async with store.client() as client:  # a PLAIN client: its jar would keep the hop's cookies
+        pacer = NoSleepPacer()
+        report = await job.run(job_db, client, [MAC_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                               pacer=pacer, now=_tick())
+    stored = (await proofs_by_sku(job_db))[RUN_MAC_FAMILY["product"]["product_key"] + "::v:54057385787587"]
+    assert (stored["outcome"], stored["currency"], stored["variant_title"]) == ("ok", "USD", "NC50 / 1 fl oz")
+    hops = [r for r in store.requests if r.url.path.endswith(nc50 + ".js")]
+    assert [r.url.host for r in hops] == [MAC_HOST, "www." + MAC_HOST]
+    assert not any("cookie" in r.headers for r in store.requests)
+    assert hops[1].url.params.get("country") == "US"
+    # Every hop is a paced request start.
+    assert report["requests"] >= 2 and pacer.requests == len(store.requests)
+
+
+async def test_a_redirect_off_https_is_host_redirected_and_never_requested(job_db):
+    await insert_rows(job_db, RUN_TARTE)
+    store = Store()
+    store.routes[(TARTE_HOST, "/products/amazonian-clay-baked-blush.js")] = ("redirect", f"http://{TARTE_HOST}")
+    async with store.client() as client:
+        report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                               pacer=NoSleepPacer(), now=_tick())
+    assert report["domains"][TARTE_HOST]["outcomes"] == {HOST_REDIRECTED: 4}
+    assert [r.url.scheme for r in store.requests] == ["https"]
+
+
+async def test_a_gone_handle_answering_410_is_revoked(job_db):
+    await insert_rows(job_db, RUN_TARTE)
+    store = Store()
+    store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush", status=410)
+    async with store.client() as client:
+        report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                               pacer=NoSleepPacer(), now=_tick())
+    assert report["domains"][TARTE_HOST]["outcomes"] == {REVOKED_404: 4}
+
+
+async def test_each_listing_page_is_read_in_its_own_currency(job_db):
+    await insert_rows(job_db, RUN_TARTE_SINGLE)
+    pearls = rehost(build_rows("ecvpjob tarte", "pretty in pearls lash curler", "x", "pretty-in-pearls-lash-curler", []),
+                    TARTE_HOST)
+    await insert_rows(job_db, pearls)
+    store = Store()
+    first, second = _page("tarte_products_json_page1_plain")["products"]
+    gb_second = next(p for p in FIXTURES["tarte_products_json_page1_country_GB"]["body"]["products"]
+                     if p["handle"] == second["handle"])
+    pages = {"1": ({"products": [first]}, ["USD"]), "2": ({"products": [gb_second]}, ["GBP"]), "3": ({"products": []}, ["USD"])}
+
+    def handler(request):
+        store.requests.append(request)
+        payload, currencies = pages[request.url.params["page"]]
+        return httpx.Response(200, headers=[("content-type", "application/json")]
+                              + [("set-cookie", f"cart_currency={c}; path=/") for c in currencies], json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JSON,
+                               pacer=NoSleepPacer(), now=_tick())
+    stored = await proofs_by_sku(job_db)
+    assert stored[RUN_TARTE_SINGLE["product"]["product_key"] + "::canonical"]["outcome"] == "ok"
+    gb = stored[pearls["product"]["product_key"] + "::canonical"]
+    assert (gb["outcome"], gb["currency"]) == (CURRENCY_NOT_MARKET, "GBP")
+    assert report["domains"][TARTE_HOST]["currency_read"] == {"USD": 1, "GBP": 1}
+
+
+async def test_a_listing_that_redirects_off_the_store_refuses_every_handle(job_db):
+    await insert_rows(job_db, RUN_TARTE)
+    await insert_rows(job_db, RUN_TARTE_SINGLE)
+    store = Store()
+    store.routes[(TARTE_HOST, "/products.json")] = ("redirect", "https://uk.tarte.ecvpjob.test")
+    async with store.client() as client:
+        report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JSON,
+                               pacer=NoSleepPacer(), now=_tick())
+    d = report["domains"][TARTE_HOST]
+    assert d["outcomes"] == {HOST_REDIRECTED: 5}
+    assert d["hosts"][TARTE_HOST]["listing"]["stop"] == HOST_REDIRECTED
+    assert {r.url.host for r in store.requests} == {TARTE_HOST}
+
+
+@pytest.mark.parametrize("table,column", [
+    ("catalog_products", "suppressed_at"), ("catalog_products", "suppression_reason"),
+    ("catalog_skus", "suppressed_at"), ("catalog_skus", "suppression_reason"),
+])
+async def test_either_suppression_column_alone_withdraws_the_row(job_db, table, column):
+    await insert_rows(job_db, RUN_TARTE)
+    pk = RUN_TARTE["product"]["product_key"]
+    berry = sku_of(RUN_TARTE, "::v:63530896818545")["sku_key"]
+    value = CHECKED if column == "suppressed_at" else "fixture"
+    where = "product_key = :k" if table == "catalog_products" else "sku_key = :k"
+    await job_db.execute(f"UPDATE {table} SET {column} = :v WHERE {where}",
+                         {"v": value, "k": pk if table == "catalog_products" else berry})
+    got = {r["sku_key"] for r in await job.select_targets(job_db, TARTE_HOST, limit=10, after=None)}
+    if table == "catalog_products":
+        assert got == set()
+    else:
+        assert berry not in got and pk + "::canonical" in got
+
+
+async def test_the_same_instant_rewrites_and_an_older_one_does_not(job_db):
+    await insert_rows(job_db, RUN_TARTE)
+    row = ProofRow(product_key=RUN_TARTE["product"]["product_key"],
+                   sku_key=sku_of(RUN_TARTE, "::v:63530896818545")["sku_key"], shop_host=TARTE_HOST,
+                   handle="amazonian-clay-baked-blush", source=SOURCE_PRODUCTS_JS, checked_at=CHECKED,
+                   outcome=VARIANT_GONE, live_variant_count=3)
+    assert await job.upsert_proof(job_db, row, written_at=CHECKED)
+    again = ProofRow(**{**row.__dict__, "outcome": REVOKED_404})
+    assert await job.upsert_proof(job_db, again, written_at=CHECKED)
+    assert (await proofs_by_sku(job_db))[row.sku_key]["outcome"] == REVOKED_404
+
+
+async def test_a_reused_handle_is_product_changed_and_stays_so(job_db):
+    await insert_rows(job_db, RUN_TARTE)
+    store = Store()
+    store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush")
+    async with store.client() as client:
+        await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                      pacer=NoSleepPacer(), now=_tick())
+        reborn = dict(FIXTURES["tarte_js_amazonian_clay_baked_blush"]["body"], id=16000000000001)
+        store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush", override_body=reborn)
+        for hours in (1, 2):  # sticky: the second run does not turn the new product into an 'ok'
+            report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                                   pacer=NoSleepPacer(), now=lambda: CHECKED + timedelta(hours=hours))
+            assert report["domains"][TARTE_HOST]["outcomes"] == {job.PRODUCT_CHANGED: 4}
+            stored = await proofs_by_sku(job_db)
+            assert {r["shopify_product_id"] for r in stored.values()} == {"15531947491697"}
+            assert {r["outcome"] for r in stored.values()} == {job.PRODUCT_CHANGED}
+
+
+async def test_a_dry_run_with_no_proof_table_reads_no_prior(job_db):
+    from db.enrichment_cart_variant_proofs import TABLE, _reset_for_tests
+
+    await insert_rows(job_db, RUN_TARTE)
+    await job_db.execute(f"DROP TABLE {TABLE}")
+    _reset_for_tests()
+    try:
+        assert await job.select_prior_product_ids(job_db, [RUN_TARTE["product"]["product_key"]],
+                                                  table_must_exist=False) == {}
+        with pytest.raises(Exception):
+            await job.select_prior_product_ids(job_db, [RUN_TARTE["product"]["product_key"]], table_must_exist=True)
+    finally:
+        import db.enrichment_cart_variant_proofs as proofs
+
+        assert await proofs.ensure_table()
+
+
+async def test_a_blocked_meta_json_counts_as_a_block(job_db):
+    await insert_rows(job_db, RUN_TARTE)
+    store = Store()
+    store.routes[(TARTE_HOST, "/meta.json")] = (429, None, [])
+    async with store.client() as client:
+        report = await job.run(job_db, client, [TARTE_PLAN], apply=False, pacer=NoSleepPacer(), block_limit=1,
+                               now=_tick())
+    assert report["aborted_on_block"] is True
+    assert report["domains"][TARTE_HOST]["fetches"] == {"rate_limited": 1}
+
+
+async def test_retry_after_arms_the_crawl_lanes_backoff(job_db):
+    import time as _time
+
+    from services import crawl_politeness
+
+    await insert_rows(job_db, RUN_TARTE)
+    store = Store()
+    store.routes[(TARTE_HOST, "/products/amazonian-clay-baked-blush.js")] = (429, None, [], [("retry-after", "120")])
+    async with store.client() as client:
+        report = await job.run(job_db, client, [TARTE_PLAN], apply=False, source_mode=SOURCE_PRODUCTS_JS,
+                               pacer=NoSleepPacer(), block_limit=1, now=_tick())
+    assert report["aborted_on_block"] is True
+    held = crawl_politeness._STATE[TARTE_HOST].backoff_until - _time.monotonic()
+    assert 100 < held <= 120
+
+
+async def test_a_path_robots_disallows_is_skipped_and_nothing_is_written(job_db, monkeypatch):
+    from services import crawl_politeness
+
+    monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "true")
+    token = crawl_politeness.ROBOTS_TRANSPORT_FACTORY.set(lambda: httpx.MockTransport(
+        lambda request: httpx.Response(200, text="User-agent: *\nDisallow: /products/\n")))
+    try:
+        await insert_rows(job_db, RUN_TARTE)
+        store = Store()
+        store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush")
+        async with store.client() as client:
+            report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                                   pacer=NoSleepPacer(), now=_tick())
+    finally:
+        crawl_politeness.ROBOTS_TRANSPORT_FACTORY.reset(token)
+    d = report["domains"][TARTE_HOST]
+    assert d["skipped"] == {"skip_transient:robots_disallowed": 4} and d["written"] == 0
+    assert store.requests == []
+
+
+async def test_the_cursor_is_given_only_while_products_remain(job_db):
+    await insert_rows(job_db, RUN_TARTE)
+    await insert_rows(job_db, RUN_TARTE_SINGLE)
+    store = Store()
+    async with store.client() as client:
+        first = await job.run(job_db, client, [TARTE_PLAN], apply=False, source_mode=SOURCE_PRODUCTS_JS, limit=1,
+                              pacer=NoSleepPacer(), now=_tick())
+        d = first["domains"][TARTE_HOST]
+        assert (d["exhausted"], d["next_cursor"]) == (False, RUN_TARTE["product"]["product_key"])
+        rest = await job.run(job_db, client, [TARTE_PLAN], apply=False, source_mode=SOURCE_PRODUCTS_JS, limit=1,
+                             after=d["next_cursor"], pacer=NoSleepPacer(), now=_tick())
+        d = rest["domains"][TARTE_HOST]
+        assert d["products"] == 1 and (d["exhausted"], d["next_cursor"]) == (False, RUN_TARTE_SINGLE["product"]["product_key"])
+        done = await job.run(job_db, client, [TARTE_PLAN], apply=False, source_mode=SOURCE_PRODUCTS_JS, limit=5,
+                             pacer=NoSleepPacer(), now=_tick())
+        d = done["domains"][TARTE_HOST]
+        assert (d["products"], d["exhausted"], d["next_cursor"]) == (2, True, None)
+
+
+async def test_a_prior_refusal_without_a_product_id_does_not_block_the_product(job_db):
+    """Only a RECORDED product id is an identity: a 404 row (no id) followed by the product coming
+    back is an ordinary 'ok'."""
+    await insert_rows(job_db, RUN_TARTE)
+    store = Store()  # the blush 404s first
+    async with store.client() as client:
+        await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                      pacer=NoSleepPacer(), now=_tick())
+        assert {r["shopify_product_id"] for r in (await proofs_by_sku(job_db)).values()} == {None}
+        store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush")
+        report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                               pacer=NoSleepPacer(), now=lambda: CHECKED + timedelta(hours=1))
+    assert report["domains"][TARTE_HOST]["outcomes"] == {"ok": 3, PLACEHOLDER_HAS_VARIANT_SKUS: 1}
+
+
+async def test_a_dry_run_on_an_environment_that_never_wrote_a_proof_still_runs(job_db):
+    from db.enrichment_cart_variant_proofs import TABLE, _reset_for_tests
+
+    import db.enrichment_cart_variant_proofs as proofs
+
+    await insert_rows(job_db, RUN_TARTE)
+    await job_db.execute(f"DROP TABLE {TABLE}")
+    _reset_for_tests()
+    try:
+        store = Store()
+        store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush")
+        async with store.client() as client:
+            report = await job.run(job_db, client, [TARTE_PLAN], apply=False, source_mode=SOURCE_PRODUCTS_JS,
+                                   pacer=NoSleepPacer(), now=_tick())
+        assert report["domains"][TARTE_HOST]["outcomes"] == {"ok": 3, PLACEHOLDER_HAS_VARIANT_SKUS: 1}
+    finally:
+        assert await proofs.ensure_table()
+
+
+async def test_a_rerun_updates_the_recorded_variant_title(job_db):
+    await insert_rows(job_db, RUN_TARTE)
+    store = Store()
+    store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush")
+    berry = sku_of(RUN_TARTE, "::v:63530896818545")["sku_key"]
+    async with store.client() as client:
+        await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                      pacer=NoSleepPacer(), now=_tick())
+        assert (await proofs_by_sku(job_db))[berry]["variant_title"] == "berry"
+        renamed = json.loads(json.dumps(FIXTURES["tarte_js_amazonian_clay_baked_blush"]["body"]))
+        renamed["variants"][2]["title"] = "berry (new)"
+        store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush", override_body=renamed)
+        await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                      pacer=NoSleepPacer(), now=lambda: CHECKED + timedelta(hours=1))
+    assert (await proofs_by_sku(job_db))[berry]["variant_title"] == "berry (new)"

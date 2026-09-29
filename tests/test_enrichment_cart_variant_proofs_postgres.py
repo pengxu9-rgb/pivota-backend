@@ -49,6 +49,9 @@ if _IS_PG and _THROWAWAY:
 _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db" / "migrations"
 _MIGRATION = _MIGRATIONS_DIR / "248_enrichment_cart_variant_proofs.sql"
 _DOWN = _MIGRATIONS_DIR / "down" / "248_enrichment_cart_variant_proofs_down.sql"
+#: Migration 249 adds `variant_title`; the parity build is 248 then 249.
+_MIGRATION_249 = _MIGRATIONS_DIR / "249_enrichment_cart_variant_proofs_variant_title.sql"
+_DOWN_249 = _MIGRATIONS_DIR / "down" / "249_enrichment_cart_variant_proofs_variant_title_down.sql"
 _TABLE = "enrichment_cart_variant_proofs"
 
 
@@ -123,17 +126,21 @@ async def _clean():
         await database.disconnect()
 
 
-async def test_the_self_heal_builds_what_migration_248_builds(_clean):
+async def test_the_self_heal_builds_what_migrations_248_and_249_build(_clean):
     proofs = _clean
     database = await _connected()
     await _apply_text(_MIGRATION.read_text(encoding="utf-8"))
+    only_248 = await _fingerprint()
+    await _apply_text(_MIGRATION_249.read_text(encoding="utf-8"))
     from_migration = await _fingerprint()
+    assert [c[0] for c in from_migration[0]] == [c[0] for c in only_248[0]] + ["variant_title"]
+    assert from_migration[1:] == only_248[1:], "249 adds a column and nothing else"
     columns, constraints, names, indexes = from_migration
 
     assert [c[0] for c in columns] == [
         "product_key", "sku_key", "shop_host", "handle", "shopify_product_id", "variant_id",
         "live_variant_count", "available", "live_price_minor", "currency", "source", "checked_at",
-        "outcome", "created_at", "updated_at",
+        "outcome", "created_at", "updated_at", "variant_title",
     ]
     types = {c[0]: c[1] for c in columns}
     assert types["product_key"] == types["sku_key"] == "text", "keys reach 214/255 chars: TEXT, not varchar(128)"
@@ -145,14 +152,24 @@ async def test_the_self_heal_builds_what_migration_248_builds(_clean):
     assert any("'^[A-Z]{3}$'" in d for kind, d in constraints if kind == "c"), constraints
     assert list(indexes) == [f"{_TABLE}_pkey"]
 
+    await _apply_text(_DOWN_249.read_text(encoding="utf-8"))
+    assert await _fingerprint() == only_248, "249's down removes exactly its column"
     await _apply_text(_DOWN.read_text(encoding="utf-8"))
     assert (await _fingerprint())[0] == [], "the down migration removes the table"
 
     assert await proofs.ensure_table()
     assert await _fingerprint() == from_migration
 
-    # And the migration re-applies over a self-healed database without error or change.
+    # And the migrations re-apply over a self-healed database without error or change.
     await _apply_text(_MIGRATION.read_text(encoding="utf-8"))
+    await _apply_text(_MIGRATION_249.read_text(encoding="utf-8"))
+    assert await _fingerprint() == from_migration
+
+    # A table created BEFORE 249 (248 alone) gains the column from ensure_table().
+    await database.execute(f"DROP TABLE {_TABLE}")
+    await _apply_text(_MIGRATION.read_text(encoding="utf-8"))
+    proofs._reset_for_tests()
+    assert await proofs.ensure_table()
     assert await _fingerprint() == from_migration
     assert await database.fetch_val(f"SELECT count(*) FROM {_TABLE}") == 0
 

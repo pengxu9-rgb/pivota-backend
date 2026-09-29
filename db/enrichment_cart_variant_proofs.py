@@ -18,10 +18,13 @@ like db/merchant_purchasability_cart_mint_scans.py. db/migrations/248_enrichment
 is the record, and what the SQL gates plan against. tests/test_enrichment_cart_variant_proofs_postgres.py
 checks through the catalog that the two build the same table.
 
-ONE DIALECT DIFFERENCE, AND ONLY ONE. The currency CHECK is a regex (`~ '^[A-Z]{3}$'`) on
+TWO DIALECT DIFFERENCES, AND ONLY TWO. The currency CHECK is a regex (`~ '^[A-Z]{3}$'`) on
 Postgres, which SQLite cannot parse; the SQLite build (tests only) spells the same rule with
-GLOB. Everything else is character-for-character the migration, and a test pins that the two
-statements differ in exactly that clause.
+GLOB. And migration 249's `variant_title` column: Postgres runs the migration's own
+`ADD COLUMN IF NOT EXISTS` after the CREATE (so a table created before 249 gains it), which
+SQLite cannot parse; the SQLite build declares the column in its CREATE instead, in the same
+position (last). Everything else is character-for-character the migrations, and a test pins that
+the two builds differ in exactly those two places.
 """
 
 from __future__ import annotations
@@ -85,9 +88,24 @@ _CREATE_POSTGRES = """
       PRIMARY KEY (product_key, sku_key)
     )
     """
-_CREATE_SQLITE = _CREATE_POSTGRES.replace(POSTGRES_CURRENCY_CHECK, SQLITE_CURRENCY_CHECK)
+#: Migration 249, character for character inside the statement: the live variant's title, for
+#: display (the job writes it cleaned by services.shopify_variant_identity.clean_variant_title).
+_ADD_VARIANT_TITLE_POSTGRES = "ALTER TABLE enrichment_cart_variant_proofs ADD COLUMN IF NOT EXISTS variant_title TEXT;"
+#: Where the SQLite build declares migration 249's column instead: after the last column, as the ALTER
+#: appends it on Postgres.
+_LAST_COLUMN = "      updated_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,\n"
+_SQLITE_VARIANT_TITLE_COLUMN = "      variant_title       TEXT,\n"
+_CREATE_SQLITE = (
+    _CREATE_POSTGRES.replace(POSTGRES_CURRENCY_CHECK, SQLITE_CURRENCY_CHECK)
+    .replace(_LAST_COLUMN, _LAST_COLUMN + _SQLITE_VARIANT_TITLE_COLUMN)
+)
 
-_DDL_STATEMENTS = guarded_statements([_CREATE_POSTGRES if IS_POSTGRES else _CREATE_SQLITE])
+if _CREATE_SQLITE.count("variant_title") != 1:  # the anchor above moved: fail at import, not in a test DB
+    raise RuntimeError("the SQLite build lost migration 249's variant_title column")
+
+_DDL_STATEMENTS = guarded_statements(
+    [_CREATE_POSTGRES, _ADD_VARIANT_TITLE_POSTGRES] if IS_POSTGRES else [_CREATE_SQLITE]
+)
 
 
 async def ensure_table() -> bool:

@@ -1,5 +1,5 @@
 {
- "_about": "Real storefront responses read 2026-09-29 (read-only GETs from a laptop Shopify geolocates to JP), trimmed to the keys the proof job reads: no description, media or image URLs (images_count keeps how many there were). `set_cookie_cart_currency` is every cart_currency Set-Cookie on the SAME final response. Variant lists are complete unless `variants_trimmed` says otherwise.",
+ "_about": "Real storefront responses read 2026-09-29 (read-only GETs from a laptop Shopify geolocates to JP), trimmed to the keys the proof job reads (no description or media; `images` keeps the image URLs). `set_cookie_cart_currency` is every cart_currency Set-Cookie on the SAME final response; `content_type` is the response's own; MAC's 301 to www also sets the cookies in `redirect_set_cookie`.",
  "tarte_js_amazonian_clay_baked_blush": {
   "url": "https://tartecosmetics.com/products/amazonian-clay-baked-blush.js",
   "final_url": "https://tartecosmetics.com/products/amazonian-clay-baked-blush.js",
@@ -23,7 +23,20 @@
      ]
     }
    ],
-   "images_count": 12,
+   "images": [
+    "//cdn.shopify.com/s/files/1/0898/4972/4950/files/unique__197689000060__Amazonian-clay-baked-blush-pink__01.jpg?v=1777571421",
+    "//cdn.shopify.com/s/files/1/0898/4972/4950/files/tolstoy__02__tolstoy-poster_01KRK3JPVPD7P997XQMHXVFRZR_c103446d-63cd-44ed-9216-6c2eb3e9ed93.jpg?v=1778757828",
+    "//cdn.shopify.com/s/files/1/0898/4972/4950/files/unique__197689000077__Amazonian-clay-baked-blush-peach__01.jpg?v=1777571421",
+    "//cdn.shopify.com/s/files/1/0898/4972/4950/files/unique__197689000084__Amazonian-clay-baked-blush-berry__01.jpg?v=1777571421",
+    "//cdn.shopify.com/s/files/1/0898/4972/4950/files/unique__197689000077__Amazonian-clay-baked-blush-peach__02.jpg?v=1777571438",
+    "//cdn.shopify.com/s/files/1/0898/4972/4950/files/unique__197689000084__Amazonian-clay-baked-blush-berry__02.jpg?v=1777571438",
+    "//cdn.shopify.com/s/files/1/0898/4972/4950/files/unique__197689000060__Amazonian-clay-baked-blush-pink__02.jpg?v=1777571438",
+    "//cdn.shopify.com/s/files/1/0898/4972/4950/files/common__Amazonian-clay-baked-blush__01.jpg?v=1777571434",
+    "//cdn.shopify.com/s/files/1/0898/4972/4950/files/common__Amazonian-clay-baked-blush__02.jpg?v=1777571434",
+    "//cdn.shopify.com/s/files/1/0898/4972/4950/files/unique__197689000084__Amazonian-clay-baked-blush-berry__03.jpg?v=1777571446",
+    "//cdn.shopify.com/s/files/1/0898/4972/4950/files/unique__197689000060__Amazonian-clay-baked-blush-pink__03.jpg?v=1777571446",
+    "//cdn.shopify.com/s/files/1/0898/4972/4950/files/unique__197689000077__Amazonian-clay-baked-blush-peach__03.jpg?v=1777571446"
+   ],
    "variants": [
     {
      "id": 63530896753009,
@@ -59,7 +72,8 @@
      "barcode": "197689000084"
     }
    ]
-  }
+  },
+  "content_type": "text/javascript; charset=utf-8"
  },
  "tarte_products_json_page1_plain": {
   "url": "https://tartecosmetics.com/products.json?limit=2&page=1",
@@ -83,7 +97,18 @@
        ]
       }
      ],
-     "images_count": 10,
+     "images": [
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__01.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/tolstoy__02__tolstoy-poster_01M23YGTQ1757EV6RN8V1X0R68_77a9086c-8be3-48ea-a38d-c704a514dd71.jpg?v=1788986628",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__02.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__03.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__04.jpg?v=1787078416",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__05.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__06.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__07.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__08.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__09.jpg?v=1787078416"
+     ],
      "variants": [
       {
        "id": 64341820473713,
@@ -111,7 +136,16 @@
        ]
       }
      ],
-     "images_count": 8,
+     "images": [
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__01.jpg?v=1787078672",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/tolstoy__02__tolstoy-poster_01M1EWZY305BD5YCBQM22KCWK5_fbcef8ae-be66-461c-adb9-a6e2ebd45185.jpg?v=1788280380",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__02.jpg?v=1787078672",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__03.jpg?v=1787078672",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__04.jpg?v=1787078672",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__05.jpg?v=1787078672",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__06.jpg?v=1787078672",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__07.jpg?v=1787078672"
+     ],
      "variants": [
       {
        "id": 64403821953393,
@@ -126,7 +160,8 @@
      ]
     }
    ]
-  }
+  },
+  "content_type": "application/json; charset=utf-8"
  },
  "tarte_products_json_page1_country_GB": {
   "url": "https://tartecosmetics.com/products.json?limit=2&page=1&country=GB",
@@ -150,7 +185,18 @@
        ]
       }
      ],
-     "images_count": 10,
+     "images": [
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__01.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/tolstoy__02__tolstoy-poster_01M23YGTQ1757EV6RN8V1X0R68_77a9086c-8be3-48ea-a38d-c704a514dd71.jpg?v=1788986628",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__02.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__03.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__04.jpg?v=1787078416",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__05.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__06.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__07.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__08.jpg?v=1787078415",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__front-row-energy-travel-essentials__09.jpg?v=1787078416"
+     ],
      "variants": [
       {
        "id": 64341820473713,
@@ -178,7 +224,16 @@
        ]
       }
      ],
-     "images_count": 8,
+     "images": [
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__01.jpg?v=1787078672",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/tolstoy__02__tolstoy-poster_01M1EWZY305BD5YCBQM22KCWK5_fbcef8ae-be66-461c-adb9-a6e2ebd45185.jpg?v=1788280380",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__02.jpg?v=1787078672",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__03.jpg?v=1787078672",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__04.jpg?v=1787078672",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__05.jpg?v=1787078672",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__06.jpg?v=1787078672",
+      "https://cdn.shopify.com/s/files/1/0898/4972/4950/files/common__pretty-in-pearls-lash-curler__07.jpg?v=1787078672"
+     ],
      "variants": [
       {
        "id": 64403821953393,
@@ -193,7 +248,8 @@
      ]
     }
    ]
-  }
+  },
+  "content_type": "application/json; charset=utf-8"
  },
  "jsm_js_lip_pression_glowy_tint": {
   "url": "https://jsmbeauty.sg/products/lip-pression-glowy-tint.js",
@@ -225,7 +281,10 @@
      ]
     }
    ],
-   "images_count": 2,
+   "images": [
+    "//cdn.shopify.com/s/files/1/0684/0634/6049/files/glowy_tint_01.jpg?v=1782804601",
+    "//cdn.shopify.com/s/files/1/0684/0634/6049/files/YK_UhP2Q.jpg?v=1782804663"
+   ],
    "variants": [
     {
      "id": 51905273004353,
@@ -338,7 +397,8 @@
      "barcode": "8800332431754"
     }
    ]
-  }
+  },
+  "content_type": "text/javascript; charset=utf-8"
  },
  "mac_js_family_parent_stub": {
   "url": "https://maccosmetics.com/products/studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control.js",
@@ -362,7 +422,7 @@
      ]
     }
    ],
-   "images_count": 0,
+   "images": [],
    "variants": [
     {
      "id": 54057377759427,
@@ -376,7 +436,11 @@
      "barcode": null
     }
    ]
-  }
+  },
+  "content_type": "text/javascript; charset=utf-8",
+  "redirect_set_cookie": [
+   "_shopify_essential"
+  ]
  },
  "mac_js_shade_nc50": {
   "url": "https://maccosmetics.com/products/studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control-nc50.js",
@@ -407,7 +471,24 @@
      ]
     }
    ],
-   "images_count": 16,
+   "images": [
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mac_sku_SRMX11_US_3000x3000_0S.png?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mac_sku_SRMX11_NA_3000x3000_1.png?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mc_sku_SRMX11_US_3000x3000_1.png?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mac_sku_SRMX11_3000x3000_2.jpg?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mc_sku_SRMX11_US_3000x3000_2.jpg?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mac_sku_SRMX11_NA_3000x3000_3.jpg?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mc_sku_SRMX11_US_3000x3000_3_76039777-638e-4864-b014-7358fb3deecb.jpg?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mac_sku_SRMX11_NA_3000x3000_4.jpg?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mc_sku_SRMX11_US_3000x3000_4_0f1ac753-0c40-4ce7-a0a3-b5eb5048682b.jpg?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mc_sku_SRMX11_US_3000x3000_5.jpg?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mc_sku_SRMX11_US_3000x3000_6.jpg?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mc_sku_SRMX11_US_3000x3000_7.jpg?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mac_sku_SRMX11_3000x3000_8_ed1916ed-9815-4788-9820-f0083343b3db.jpg?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mc_sku_SRMX11_US_3000x3000_8.jpg?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mc_sku_SRMX11_US_3000x3000_9.jpg?v=1790641088",
+    "//cdn.shopify.com/s/files/1/0774/8481/8690/files/mc_sku_SRMX11_US_3000x3000_10.jpg?v=1790641088"
+   ],
    "variants": [
     {
      "id": 54057385787587,
@@ -421,7 +502,11 @@
      "barcode": "773602642960"
     }
    ]
-  }
+  },
+  "content_type": "text/javascript; charset=utf-8",
+  "redirect_set_cookie": [
+   "_shopify_essential"
+  ]
  },
  "mac_js_fix_plus_canonical_only": {
   "url": "https://maccosmetics.com/products/fix.js",
@@ -445,7 +530,7 @@
      ]
     }
    ],
-   "images_count": 0,
+   "images": [],
    "variants": [
     {
      "id": 54057385820355,
@@ -459,7 +544,11 @@
      "barcode": null
     }
    ]
-  }
+  },
+  "content_type": "text/javascript; charset=utf-8",
+  "redirect_set_cookie": [
+   "_shopify_essential"
+  ]
  },
  "luafee_js_no_currency_cookie": {
   "url": "https://luafee.jp/products/<handle>.js",
@@ -479,7 +568,9 @@
      ]
     }
    ],
-   "images_count": 1,
+   "images": [
+    "//cdn.shopify.com/s/files/1/0860/6593/8741/files/2026-05-22_173952.png?v=1779439302"
+   ],
    "variants": [
     {
      "id": 52912527868213,
@@ -493,6 +584,7 @@
      "barcode": null
     }
    ]
-  }
+  },
+  "content_type": "text/javascript; charset=utf-8"
  }
 }

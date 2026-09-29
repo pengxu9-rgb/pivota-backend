@@ -43,11 +43,13 @@ pytestmark = pytest.mark.skipif(
 
 if _IS_PG and _THROWAWAY:
     from tests.test_enrichment_cart_variant_proof_job import *  # noqa: F401,F403,E402
-    # A star-import skips underscore names; the fixture is resolved by NAME in this module.
+    # A star-import skips underscore names; fixtures (the autouse crawl-politeness one included)
+    # are resolved by NAME in this module.
     from tests.test_enrichment_cart_variant_proof_job import (  # noqa: F401,E402
         CHECKED,
         RUN_TARTE,
         TARTE_HOST,
+        _crawl_politeness,
         job_db,
         proofs_by_sku,
         sku_of,

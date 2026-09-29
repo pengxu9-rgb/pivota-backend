@@ -1347,6 +1347,20 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 249: the live variant title on the enrichment cart proof (display only; the
+            # proof job writes it, PR C shows it). The table itself is created on first use by
+            # db/enrichment_cart_variant_proofs.ensure_table(), which also runs this ALTER; this
+            # heal covers a table created before 249. A no-op while the table does not exist.
+            # ITS OWN try, per this block's rule.
+            try:
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS enrichment_cart_variant_proofs
+                        ADD COLUMN IF NOT EXISTS variant_title TEXT;
+                    """
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 237: the chargeback part of commerce_attribution_edges.refund_amount_cents.
             # Every refund and dispute write to the edge names this column
             # (services/commerce_attribution_service.py _APPLY_REFUND_TOTAL_QUERY,

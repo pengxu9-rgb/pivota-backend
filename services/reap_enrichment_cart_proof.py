@@ -35,8 +35,12 @@ THE PLACEHOLDER NEVER STANDS IN FOR A VARIANT THE CATALOG KNOWS. It may be bough
 product has NO `::v:` sku at all (`catalog_variant_sku_count == 0`, which the caller counts) AND
 the handle has exactly one variant. The count includes SUPPRESSED `::v:` skus (a suppressed shade
 is still a variant the catalog knows). Without the first condition, MAC's 99 folded families pass:
-their canonical_url is the parent handle, whose one variant is a "Default Title" stub, while the
-placeholder's price is the first shade's -- the cart would buy the stub.
+their canonical_url is the parent handle, whose one variant is a stub, while the placeholder's
+price is the first shade's -- the cart would buy the stub. The stub is NOT "Default Title" (on MAC
+that is only the gift wrap): it is a single variant whose title RESTATES the product title (option
+"Title" = "Studio Fix Fluid SPF 15 ..."), with a `P2000_` product-code sku and no image, where a
+real shade has Shade/Size options, images and a barcode (live, 2026-09-29). The proof job refuses
+such a handle as `parent_stub` (jobs/enrichment_cart_variant_proof.is_parent_stub).
 
 HOSTS ARE COMPARED EXACTLY AFTER ONE `www.` FOLD, the same fold on all three sides (the
 canonical_url host, `source_domain`, the proof's `shop_host`), by the repo's existing owner of
@@ -66,6 +70,9 @@ what this verifier assumes. A row that breaks any of these must not be written a
   * checked_at  when the response was read (TIMESTAMPTZ); updated_at is SET EXPLICITLY on every
                 write (the column default fires on INSERT only).
   * outcome     'ok', or a refusal the job keeps for itself ('revoked_404', 'variant_gone', ...).
+  * variant_title  (migration 249) that variant's live title, cleaned by
+                `services.shopify_variant_identity.clean_variant_title`; DISPLAY ONLY, never read
+                by this verifier. NULL when the job identified no variant.
 PR C's offer SQL must filter suppressed offers (`suppression_reason IS NULL AND suppressed_at IS
 NULL`) and select by listing identity; `enrichment_offer_price_ok` sees only what it is handed.
 """

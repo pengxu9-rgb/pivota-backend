@@ -18,6 +18,8 @@ from db.database import database
 _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db" / "migrations"
 _MIGRATION = _MIGRATIONS_DIR / "248_enrichment_cart_variant_proofs.sql"
 _DOWN = _MIGRATIONS_DIR / "down" / "248_enrichment_cart_variant_proofs_down.sql"
+_MIGRATION_249 = _MIGRATIONS_DIR / "249_enrichment_cart_variant_proofs_variant_title.sql"
+_DOWN_249 = _MIGRATIONS_DIR / "down" / "249_enrichment_cart_variant_proofs_variant_title_down.sql"
 
 #: A 214-character enrichment product_key (ingestion.derive_product_key's longest shape).
 LONG_PK = "ext:" + "t" * 200 + "::578c4614"
@@ -66,16 +68,28 @@ def test_the_self_heal_statement_is_the_migrations_statement():
     migration = _statement_body(_MIGRATION.read_text(encoding="utf-8"))
     assert migration.startswith("CREATE TABLE IF NOT EXISTS enrichment_cart_variant_proofs (")
     assert _statement_body(proofs._CREATE_POSTGRES) == migration
-    # This run's dialect builds its own statement, and only that one.
-    expected = proofs._CREATE_POSTGRES if proofs.IS_POSTGRES else proofs._CREATE_SQLITE
-    assert proofs._DDL_STATEMENTS == [expected]
+    # Migration 249's ALTER is the self-heal's second Postgres statement, character for character.
+    assert _statement_body(_MIGRATION_249.read_text(encoding="utf-8")) == _statement_body(
+        proofs._ADD_VARIANT_TITLE_POSTGRES)
+    # This run's dialect builds its own statements, and only those.
+    if proofs.IS_POSTGRES:
+        from db.schema_guard import guarded_statements
+
+        assert proofs._DDL_STATEMENTS == guarded_statements(
+            [proofs._CREATE_POSTGRES, proofs._ADD_VARIANT_TITLE_POSTGRES], postgres=True)
+    else:
+        assert proofs._DDL_STATEMENTS == [proofs._CREATE_SQLITE]
 
 
-def test_the_sqlite_build_differs_from_postgres_only_in_the_currency_regex():
+def test_the_sqlite_build_differs_from_postgres_only_in_the_currency_regex_and_249s_column():
     pg, lite = proofs._CREATE_POSTGRES, proofs._CREATE_SQLITE
     assert pg.count(proofs.POSTGRES_CURRENCY_CHECK) == 1
     assert lite != pg
-    assert lite.replace(proofs.SQLITE_CURRENCY_CHECK, proofs.POSTGRES_CURRENCY_CHECK) == pg
+    assert lite.count(proofs._SQLITE_VARIANT_TITLE_COLUMN) == 1 and "variant_title" not in pg
+    assert lite.replace(proofs.SQLITE_CURRENCY_CHECK, proofs.POSTGRES_CURRENCY_CHECK).replace(
+        proofs._SQLITE_VARIANT_TITLE_COLUMN, "") == pg
+    # The column the SQLite build declares is the one migration 249 adds.
+    assert "variant_title TEXT" in _MIGRATION_249.read_text(encoding="utf-8")
 
 
 def test_the_source_check_is_the_verifiers_source_list():
@@ -91,13 +105,26 @@ def test_the_migration_is_additive_and_the_down_drops_only_this_table():
     assert down == "DROP TABLE IF EXISTS enrichment_cart_variant_proofs"
 
 
-def test_no_migration_after_248_touches_the_table():
+def test_no_migration_after_249_touches_the_table():
     """A later migration that ALTERs this table must join the parity build in the _postgres twin."""
-    later = [
+    later = sorted(
         p.name for p in _MIGRATIONS_DIR.glob("*.sql")
         if int(re.match(r"\d+", p.name).group(0)) > 248 and proofs.TABLE in p.read_text(encoding="utf-8")
-    ]
-    assert later == [], f"extend tests/test_enrichment_cart_variant_proofs_postgres.py for {later}"
+    )
+    assert later == [_MIGRATION_249.name], f"extend tests/test_enrichment_cart_variant_proofs_postgres.py for {later}"
+
+
+def test_migration_249_only_adds_the_column_and_its_down_only_drops_it():
+    body = _statement_body(_MIGRATION_249.read_text(encoding="utf-8"))
+    assert body == "ALTER TABLE enrichment_cart_variant_proofs ADD COLUMN IF NOT EXISTS variant_title TEXT"
+    down = _statement_body(_DOWN_249.read_text(encoding="utf-8"))
+    assert down == "ALTER TABLE enrichment_cart_variant_proofs DROP COLUMN IF EXISTS variant_title"
+
+
+def test_schema_guard_heals_migration_249s_column():
+    guard = (Path(__file__).resolve().parent.parent / "db" / "schema_guard.py").read_text(encoding="utf-8")
+    assert re.search(r"ALTER TABLE IF EXISTS enrichment_cart_variant_proofs\s+ADD COLUMN IF NOT EXISTS "
+                     r"variant_title TEXT;", guard)
 
 
 @pytest.fixture
