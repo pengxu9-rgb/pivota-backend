@@ -303,8 +303,8 @@ def verify_enrichment_cart_proof(
     `catalog_variant_sku_count` is how many `::v:` skus the product has in catalog_skus, ALL of
     them, SUPPRESSED ONES INCLUDED; the caller counts them. A live-only count is wrong: a MAC
     parent whose shade skus were all suppressed would count 0, and its placeholder would then buy
-    the parent handle's one "Default Title" stub at the first shade's price. It is required so no
-    caller can forget it.
+    the parent handle's one-variant stub (its title restates the product title; see THE
+    PLACEHOLDER above) at the first shade's price. It is required so no caller can forget it.
 
     ACCEPTED in one of two modes; `reason` names which:
       * sole_variant   the proof's handle has exactly one live variant. The `::canonical`

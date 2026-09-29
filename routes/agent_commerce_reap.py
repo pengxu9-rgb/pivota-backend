@@ -1517,8 +1517,10 @@ _CART_ENRICHMENT_LIVE_SKUS_SQL = """
 # EVERY `::v:` sku of the product, SUPPRESSED ONES INCLUDED (review of #2460): the verifier lets the
 # placeholder stand for the product only when the catalog knows no variant of it at all, and a
 # live-only count of 0 is exactly how a MAC parent whose shade skus were suppressed buys its
-# "Default Title" stub. It is ALSO the no-`variant_key` rule's count (review of #2465): a product
-# whose catalog knows two variants, one of them suppressed, is still a product with two variants.
+# one-variant stub (the variant restates the product title, `P2000_` sku, no image -- not "Default
+# Title"; services/reap_enrichment_cart_proof.py THE PLACEHOLDER). It is ALSO the no-`variant_key`
+# rule's count (review of #2465): a product whose catalog knows two variants, one of them
+# suppressed, is still a product with two variants.
 # `substr` rather than LIKE only so the prefix is compared as a plain string (`::v:` after this
 # exact product_key), with no pattern characters to escape.
 _CART_ENRICHMENT_VARIANT_SKU_COUNT_SQL = """
