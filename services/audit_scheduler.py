@@ -78,6 +78,10 @@ jobs otherwise SHARE the Connection this startup context created, the root
 cause of the #1754 all-jobs wedge) and is bounded by `_JOB_RUN_DEADLINES`.
 Per-run state is on /__scheduler_health (`runs`, `stalled`); an operator can
 force a run with POST /admin/scheduler/jobs/{id}/run-now.
+
+SCHEDULER_JOB_ALLOWLIST (services/scheduler_job_allowlist.py) narrows a worker to
+the job ids it names; unset or empty it filters nothing. Skipped ids are
+reported on /__scheduler_health. Runbook: docs/runbooks/scheduler_job_allowlist.md.
 """
 
 from __future__ import annotations
@@ -305,7 +309,18 @@ def scheduler_diagnostics() -> dict:
         "fireable_job_count": fireable,
         "runs": runs,
         "stalled": stalled,
+        # job_allowlist / skipped_by_allowlist / job_allowlist_unknown_ids — present ONLY when
+        # SCHEDULER_JOB_ALLOWLIST is set, so this payload is unchanged everywhere else.
+        **_allowlist_diagnostics(),
     }
+
+
+def _allowlist_diagnostics() -> dict:
+    try:
+        from services.scheduler_job_allowlist import diagnostics
+        return diagnostics()
+    except Exception:  # noqa: BLE001 — diagnostics must never break the health endpoint
+        return {}
 
 
 def _queue_worker_enabled() -> bool:
@@ -384,6 +399,15 @@ async def start_scheduler() -> None:
             )
 
         from services.scheduler_job_runner import wrap_job
+        from services import scheduler_job_allowlist as job_allowlist
+
+        # SCHEDULER_JOB_ALLOWLIST (services/scheduler_job_allowlist.py): None when unset/empty,
+        # which is NO FILTER — every branch below that consults it is then a no-op.
+        allowlist = job_allowlist.active_allowlist()
+        job_allowlist.begin_scheduler_boot()
+        # Every id `_add_job` is asked for on a worker, registered or not — what an allowlist
+        # entry is checked against, so a typo is reported rather than silently starting nothing.
+        seen_job_ids: set = set()
 
         def _add_job(func, *args, **kwargs):
             # Register a scheduled job ONLY on the production worker, so a
@@ -403,6 +427,12 @@ async def start_scheduler() -> None:
             # completes cannot make `max_instances=1` skip every future tick.
             if worker_enabled:
                 job_id = kwargs.get("id") or getattr(func, "__name__", repr(func))
+                seen_job_ids.add(job_id)
+                # Skipped BEFORE wrap_job, so a skipped id is also absent from the runner's
+                # registry: run-now answers 404 job_not_registered for it, not a forced run.
+                if not job_allowlist.is_allowed(job_id, allowlist):
+                    job_allowlist.note_skipped(job_id, job_allowlist.KIND_SCHEDULER_JOB)
+                    return
                 wrapped = wrap_job(
                     job_id, func, deadline_seconds=run_deadline_for(job_id),
                 )
@@ -1389,6 +1419,9 @@ async def start_scheduler() -> None:
             misfire_grace_time=21600,  # fire up to 6h late rather than skip a week
         )
 
+        if allowlist is not None:
+            _report_allowlist(allowlist, seen_job_ids, worker_enabled, scheduler)
+
         scheduler.start()
         _SCHEDULER = scheduler
 
@@ -1491,6 +1524,39 @@ async def start_scheduler() -> None:
             "audit_scheduler: start failed (continuing degraded): %s",
             exc,
         )
+
+
+def _report_allowlist(allowlist, seen_job_ids, worker_enabled: bool, scheduler) -> None:
+    """Boot-time report for an ACTIVE SCHEDULER_JOB_ALLOWLIST. Never called when it is unset.
+
+    Through the "pivota" logger at WARNING: prod leaves root at WARNING, so a module logger's
+    lines here could be dropped, and "which jobs did this worker decline to start" is exactly the
+    question someone arming a single-purpose worker needs answered from the logs alone.
+    """
+    from services import scheduler_job_allowlist as job_allowlist
+    from utils.logger import logger as operator_logger
+
+    # Only on a worker: with the worker gate off `_add_job` records no ids (and the
+    # `if worker_enabled:` blocks never call it), so every entry would read as a typo.
+    unknown = job_allowlist.unknown_ids(allowlist, seen_job_ids) if worker_enabled else []
+    job_allowlist.record_unknown(unknown)
+    if unknown:
+        operator_logger.warning(
+            "audit_scheduler: %s names %d id(s) that match no scheduler job or process loop: "
+            "%s (matching is exact and case-sensitive; known ids are on /__scheduler_health "
+            "and in docs/runbooks/scheduler_job_allowlist.md)",
+            job_allowlist.ENV_VAR, len(unknown), unknown,
+        )
+    try:
+        registered = sorted(j.id for j in scheduler.get_jobs())
+    except Exception:  # noqa: BLE001 — a report must never break boot
+        registered = []
+    operator_logger.warning(
+        "audit_scheduler: %s ACTIVE allowlist=%s worker_enabled=%s registered=%s "
+        "skipped_by_allowlist=%d",
+        job_allowlist.ENV_VAR, sorted(allowlist), worker_enabled, registered,
+        len(job_allowlist.skipped_ids()),
+    )
 
 
 async def restart_scheduler() -> dict:

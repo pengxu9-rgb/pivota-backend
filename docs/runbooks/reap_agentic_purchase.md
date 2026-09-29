@@ -320,7 +320,10 @@ print the URL. A staging worker pointed at prod's URL would bring the poaching h
 
 1. Deploy the worker service.
 2. `AUDIT_WORKER_ENABLED=true` on it (or let the service-name detection decide; the gate is
-   fail-safe toward ENABLED, so an unknown platform stays on).
+   fail-safe toward ENABLED, so an unknown platform stays on). A worker that should run ONLY
+   this poller (the staging partner demo) also sets
+   `SCHEDULER_JOB_ALLOWLIST=reap_agentic_purchase_poll`; see
+   `docs/runbooks/scheduler_job_allowlist.md`.
 3. `REAP_API_BASE_URL` + `REAP_API_KEY` — both, or `is_configured()` is false and every run
    returns `skipped_disabled=1`.
 4. `REAP_AGENTIC_ENABLED=1`. **This is the arming step.** No redeploy and no scheduler restart:
