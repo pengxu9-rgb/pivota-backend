@@ -115,7 +115,7 @@ async def test_real_sql_finds_live_and_suppressed_owners_and_writes_nothing(cata
 
 async def _seed(admin, key, status, *, attached=True):
     """attached=False: the seed that CREATED the row (catalog_products.source_ref) but was never attached to it."""
-    seed_id = f"seed:{key}:{status}"
+    seed_id = f"seed:{key}:{status!r}"
     await admin.execute("INSERT INTO external_product_seeds (id, attached_product_key, status) VALUES ($1, $2, $3)",
                         seed_id, key if attached else None, status)
     return seed_id
@@ -128,7 +128,8 @@ async def _offer(admin, key, *, suppressed):
         f"offer:{key}:{suppressed}", key, datetime(2026, 9, 1, tzinfo=timezone.utc) if suppressed else None)
 
 
-@pytest.mark.parametrize("live_link", ["active_seed", "ACTIVE_seed", "source_ref_seed", "live_offer"])
+@pytest.mark.parametrize("live_link", ["active_seed", "ACTIVE_seed", "source_ref_seed", "null_status_seed",
+                                       "blank_status_seed", "padded_status_seed", "live_offer"])
 async def test_real_sql_a_suppressed_owner_with_any_live_link_still_refuses(catalog, live_link):
     """Suppressing the product row is not retiring its chain: an active seed (attached, or the row's own
     source_ref seed; status in any case) or a live offer on it still refuses."""
@@ -136,7 +137,9 @@ async def test_real_sql_a_suppressed_owner_with_any_live_link_still_refuses(cata
 
     database, admin = catalog
     plan = _plan()
-    status = {"active_seed": "active", "ACTIVE_seed": "ACTIVE", "source_ref_seed": "active"}.get(live_link, "inactive")
+    # NULL / blank / padded: the serving predicate (pdp_renderability, acceptable_only) serves those seeds too.
+    status = {"active_seed": "active", "ACTIVE_seed": "ACTIVE", "source_ref_seed": "active", "null_status_seed": None,
+              "blank_status_seed": "", "padded_status_seed": " active "}.get(live_link, "inactive")
     seed_id = await _seed(admin, LEGACY_SUPPRESSED, status, attached=live_link != "source_ref_seed")
     await _insert(admin, LEGACY_SUPPRESSED, "https://ohlolly.com/products/haruharu-wonder-serum-mist",
                   suppressed=True, source_ref=seed_id)

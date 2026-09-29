@@ -1686,9 +1686,11 @@ _LEGACY_LISTING_OWNERS_SQL = """
                -- "this row's seed" is either link, as identity_resolution's DEACTIVATE_SEEDS_SQL reads it: the
                -- attach back-link, OR the mirror's provenance (source_ref = seed id) -- older mirror rows were
                -- written without the back-link, and such a seed serves while it is active (review of #2448).
+               -- "Active" is the SERVING predicate's (services/pdp_renderability.py, acceptable_only): a NULL,
+               -- blank or padded status serves too, so it is never evidence of retirement (queue review of #2448).
                EXISTS (SELECT 1 FROM external_product_seeds s
                         WHERE (s.attached_product_key = cp.product_key OR s.id = cp.source_ref)
-                         AND lower(coalesce(s.status, '')) = 'active') AS has_active_seed,
+                         AND coalesce(lower(trim(s.status)), '') IN ('', 'active')) AS has_active_seed,
                EXISTS (SELECT 1 FROM catalog_offers o WHERE o.product_key = cp.product_key
                          AND o.suppressed_at IS NULL) AS has_live_offer
         FROM catalog_products cp
@@ -1787,7 +1789,9 @@ _LIVE_RETAILER_LISTINGS_ON_HOST_SQL = """
 async def live_retailer_listing_owner(database: Any, canonical_url: Optional[str]) -> Optional[str]:
     """The live `ext:retailer:` product that now owns this URL's listing, or None. A tool that REVERTS a retired
     legacy chain asks this first: the apply admitted a new listing on that URL (legacy_chain_retired), so
-    reviving the old row would put two live listings on one URL (review of #2448)."""
+    reviving the old row would put two live listings on one URL (review of #2448). Cost: one scan of the host's
+    live `ext:retailer:` rows per call (the host is an expression, not indexed) -- fine for a revert's handful of
+    rows, not for a bulk loop."""
     from urllib.parse import urlsplit
 
     from services.catalog_enrichment_agent.ingestion import retailer_listing_identity

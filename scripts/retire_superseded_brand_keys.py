@@ -477,9 +477,10 @@ async def revert_manifest(m: Dict[str, Any]) -> None:
         for s in m.get("seeds") or []:
             await database.execute(REACTIVATE_SEED_SQL, {"id": s["id"], "status": s["prior_status"],
                                                          "keys": restored})
-    skipped = len(m["products"]) - len(restored)
+    skipped = len(m["products"]) - len(restored) - len(owned)
     print(f"reverted run {m['run_id']}: {len(restored)} product(s)"
           + (f" ({skipped} no longer carry this run's tombstone, left alone)" if skipped else "")
+          + (f" ({len(owned)} skipped: a live listing owns the URL)" if owned else "")
           + f", seeds on those rows. "
           "Offer suppression is reverted by services.catalog_offer_suppression.revert_offer_suppression.")
 
