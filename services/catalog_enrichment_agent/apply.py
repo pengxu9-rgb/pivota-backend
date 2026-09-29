@@ -1682,11 +1682,25 @@ async def _prepare_seller_of_record(plan: Dict[str, Any], database: Any) -> Dict
 #: for disclosure: the WHERE clause deliberately does NOT exclude suppressed rows
 #: (see `_refuse_parallel_retailer_listings` for why a suppressed owner still blocks).
 _LEGACY_LISTING_OWNERS_SQL = """
-        SELECT product_key, source_domain, canonical_url, suppressed_at, suppression_reason
-        FROM catalog_products
-        WHERE lower(split_part(regexp_replace(canonical_url,
+        SELECT cp.product_key, cp.source_domain, cp.canonical_url, cp.suppressed_at, cp.suppression_reason,
+               EXISTS (SELECT 1 FROM external_product_seeds s WHERE s.attached_product_key = cp.product_key
+                         AND lower(coalesce(s.status, '')) = 'active') AS has_active_seed,
+               EXISTS (SELECT 1 FROM catalog_offers o WHERE o.product_key = cp.product_key
+                         AND o.suppressed_at IS NULL) AS has_live_offer
+        FROM catalog_products cp
+        WHERE lower(split_part(regexp_replace(cp.canonical_url,
                              '^https?://(www[.])?', '', 'i'), '/', 1)) = ANY(:hosts)
         """
+
+
+def legacy_chain_retired(row: Dict[str, Any]) -> bool:
+    """The legacy owner's WHOLE chain is retired: the product suppressed WITH a reason, no active seed attached,
+    no live offer. A suppressed product row alone proves nothing (its seeds carry their own status, its offers
+    their own suppression) -- this checks each link. Measured 2026-09-29: cocomo.sg's 421 old brand-style rows
+    (suppressed 09-27, reason sg_retailer_filed_under_us_partition) had 421 inactive seeds and 491 suppressed
+    offers, and still blocked the store's SG re-file on 286 URLs."""
+    return (row.get("suppressed_at") is not None and bool(str(row.get("suppression_reason") or "").strip())
+            and row.get("has_active_seed") is False and row.get("has_live_offer") is False)
 
 
 def planned_retailer_listings(plan: Dict[str, Any]) -> Dict[str, str]:
@@ -1735,7 +1749,10 @@ async def find_legacy_retailer_listing_owners(plan: Dict[str, Any], database: An
             continue
         if identity in listings and row.get("product_key") != listings[identity]:
             findings.append({
-                "kind": "conflict",
+                # A retired chain is reported, never refused: nothing of it can serve, so the new listing is the
+                # URL's only live row. Anything short of that -- a live row, an active seed, a live offer, a
+                # suppression without a reason -- is still the conflict it always was.
+                "kind": "retired_owner" if legacy_chain_retired(row) else "conflict",
                 "listing": identity,
                 "planned_product_key": listings[identity],
                 "legacy_product_key": row.get("product_key"),
@@ -1761,14 +1778,17 @@ async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any
     The reviewed cohort migration owns retiring old children and seed rows. Both
     executors refuse before any merchant or catalog write when that work remains.
 
-    A SUPPRESSED legacy owner still refuses (unchanged since the guard landed).
+    A SUPPRESSED legacy owner still refuses -- unless its WHOLE chain is proven retired (legacy_chain_retired:
+    suppressed with a reason, no active seed, no live offer; 2026-09-29). KNOWN LIMIT: reverting such a chain
+    afterwards (withdraw_catalog_rows --revert, a suppression manifest) puts two live listings on one URL; a
+    revert of a re-filed store must retire the new listing first.
     `catalog_products.suppressed_at` is reversible -- scripts/withdraw_catalog_rows.py
     --revert and services/identity_resolution.py REVERT_ROWS_SQL both clear it -- and it
     says nothing about the row's seed/sku/offer chain (external_product_seeds carries
     its own `status`), so a suppressed product row is not proof its legacy chain is
     retired. Admitting it would let a revert put two live listings on one URL.
     """
-    findings = await find_legacy_retailer_listing_owners(plan, database)
+    findings = [f for f in await find_legacy_retailer_listing_owners(plan, database) if f["kind"] != "retired_owner"]
     if findings:
         raise ValueError(legacy_listing_refusal(findings[0]))
 

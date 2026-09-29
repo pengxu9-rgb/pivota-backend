@@ -435,6 +435,8 @@ async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[s
         if connected_here and getattr(database, "is_connected", False):
             await database.disconnect()
 
+    retired = [f for f in findings if f["kind"] == "retired_owner"]
+    findings = [f for f in findings if f["kind"] != "retired_owner"]  # the apply admits a retired chain
     by_listing: Dict[str, Dict[str, Any]] = {}
     for finding in findings:
         if finding["kind"] != "conflict":
@@ -457,6 +459,7 @@ async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[s
         "suppressed_conflict_count": sum(1 for o in owners if o["suppressed"]),
         "listings_with_conflicts": len(by_listing),
         "conflicts": list(by_listing.values()),
+        "retired_owner_count": len(retired),
         "unproven_legacy_rows": [
             {"product_key": f["legacy_product_key"], "canonical_url": f["canonical_url"]}
             for f in findings if f["kind"] == "identity_unproven"
