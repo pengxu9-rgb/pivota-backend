@@ -391,13 +391,26 @@ async def fetch_product_js(client: Any, url: str) -> Tuple[Optional[Any], str]:
         return None, "unparseable"
 
 
-def _live_title(live_variant: Dict[str, Any]) -> Optional[str]:
+def _raw_live_variant(raw_live: Any, variant_id: str) -> Optional[Dict[str, Any]]:
+    """The products.js entry, AS SERVED, whose numeric id is `variant_id` (the first; the callers
+    have already required it to be unique), or None."""
+    for raw in raw_live if isinstance(raw_live, list) else []:
+        if isinstance(raw, dict) and _numeric_id(raw.get("id")) == variant_id:
+            return raw
+    return None
+
+
+def _live_title(raw_variant: Optional[Dict[str, Any]]) -> Optional[str]:
     """The live storefront's own title for the proven variant ("07 BURGUNDY INK"), for DISPLAY:
     the buyer never picks the shade on this lane, so the purchase must say which one it buys.
     Read by nothing that decides what is bought. Merchant-typed, so it goes through the same
     `clean_variant_title` the reader applies (controls, bidi and zero-width out; capped at
-    `MAX_VARIANT_TITLE` code points)."""
-    return clean_variant_title(str(live_variant.get("title") or ""))
+    `MAX_VARIANT_TITLE` code points).
+
+    Read from the RAW entry, not from `parse_product_js`'s output: the parser `str()`s the title
+    for label matching, which would turn a non-string title (7, a dict) into text. A title that
+    is not a string is no title."""
+    return clean_variant_title(raw_variant.get("title")) if isinstance(raw_variant, dict) else None
 
 
 def build_cart_proof(
@@ -433,7 +446,7 @@ def build_cart_proof(
             "product_js_url": js_url,
             "live_variant_count": 1,
             "variant_id": live[0]["shopify_variant_id"],
-            "variant_title": _live_title(live[0]),
+            "variant_title": _live_title(_raw_live_variant(raw_live, live[0]["shopify_variant_id"])),
             "checked_at": stamp,
         }
     stamped_seed = {**seed_data, "snapshot": {**(seed_data.get("snapshot") or {}),
@@ -444,19 +457,17 @@ def build_cart_proof(
     hits = [item for item in live if item.get("shopify_variant_id") == named]
     if len(hits) != 1 or hits[0].get("available") is not True:
         return None
+    raw_hit = _raw_live_variant(raw_live, named)
     price_minor = None
-    for raw in raw_live or []:
-        if isinstance(raw, dict) and _numeric_id(raw.get("id")) == named:
-            value = raw.get("price")
-            if isinstance(value, int) and not isinstance(value, bool):
-                price_minor = value
-            break
+    value = raw_hit.get("price") if raw_hit is not None else None
+    if isinstance(value, int) and not isinstance(value, bool):
+        price_minor = value
     return {
         "source": STOREFRONT_PLATFORM_SOURCE,
         "scope": CART_PROOF_SCOPE_NAMED,
         "product_js_url": js_url,
         "variant_id": named,
-        "variant_title": _live_title(hits[0]),
+        "variant_title": _live_title(raw_hit),
         "available": True,
         "live_variant_count": live_count,
         "price_minor": price_minor,

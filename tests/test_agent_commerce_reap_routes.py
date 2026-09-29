@@ -3435,6 +3435,47 @@ async def test_an_old_proofs_dirty_variant_title_reaches_nobody_dirty(client, mo
         == "07 BURGUNDY INK <b>"
 
 
+async def test_a_dirty_catalog_product_title_is_stored_and_shown_clean(client, monkeypatch):
+    """#2462 follow-up: the door composes "<product name> -- <variant title>", so an unterminated
+    U+202E in the CATALOG title would reverse the clean variant title after it. The cart-link
+    loader cleans the product name with the same display rule before it is stored."""
+    await _seed_named_variant_mirror(env="staging", skus=LIVE_STAGING_SKUS, seed_data=_named_variant_seed())
+    await database.execute("UPDATE catalog_products SET title = :t WHERE product_key = :pk",
+                           {"t": "Silky Matte\u202e Lip\nInk\u200b\ue000", "pk": LIVE_PK})
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert resp.status_code == 202, resp.text
+    purchase = await _purchase_row(resp.json()["purchase_id"])
+    got = await client.get(f"{BASE}/purchases/{resp.json()['purchase_id']}")
+    assert purchase["product_name"] == got.json()["product_name"] == "Silky Matte Lip Ink"
+
+
+async def test_a_row_written_dirty_before_the_rule_is_answered_clean_everywhere(client, monkeypatch):
+    """A purchase row written before #2462 still HOLDS the raw names. GET, the list and an
+    idempotent replay all answer from the public view, which cleans them on the way out -- so
+    they agree with a fresh 202 -- while the stored row itself is left exactly as written."""
+    await _seed_named_variant_mirror(env="staging", skus=LIVE_STAGING_SKUS, seed_data=_named_variant_seed())
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    body = {**_live_body(), "idempotency_key": "dirty-old-row"}
+    first = await client.post(f"{BASE}/purchases", json=body)
+    assert first.status_code == 202, first.text
+    purchase_id = first.json()["purchase_id"]
+    dirty_title, dirty_name = "\u202e07\nBURGUNDY\u200b INK\ufeff", "\u2066Silky Matte\tLip Ink\ue000"
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET variant_title = :v, product_name = :p WHERE id = :id",
+        {"v": dirty_title, "p": dirty_name, "id": purchase_id})
+    got = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
+    listed = [p for p in (await client.get(f"{BASE}/purchases")).json()["purchases"]
+              if p["id"] == purchase_id]
+    again = await client.post(f"{BASE}/purchases", json=body)
+    assert again.status_code == 202 and again.json()["purchase_id"] == purchase_id
+    for view in (got, listed[0]):
+        assert (view["variant_title"], view["product_name"]) == ("07 BURGUNDY INK", "Silky Matte Lip Ink")
+    assert again.json()["variant_title"] == first.json()["variant_title"] == "07 BURGUNDY INK"
+    row = await _purchase_row(purchase_id)
+    assert (row["variant_title"], row["product_name"]) == (dirty_title, dirty_name)
+
+
 async def test_a_named_variant_proof_never_prices_from_the_placeholder(client, monkeypatch):
     """#2457 review: only a SOLE proof may let the `::canonical` product-level offer stand in. On a
     multi-variant product, the placeholder's price is not the named shade's price."""
