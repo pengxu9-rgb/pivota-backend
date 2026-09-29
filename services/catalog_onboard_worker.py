@@ -234,7 +234,9 @@ async def _process_curated_brand(payload: Dict[str, Any], *, apply: bool, db: An
     )
     plan = ingest_validated_jsonl(records)
     out = {"records": len(records), "plan_pdps": len(plan.get("pdps") or []), "applied": None,
-           "crawl": crawl_report, "primary_ingestion": inspect_primary_plan(plan)}
+           "crawl": crawl_report, "primary_ingestion": inspect_primary_plan(plan),
+           # Listings left out: another listing on this host has the same title (one content key).
+           "listing_collisions": plan.get("listing_collisions") or []}
     if apply:
         preflight = require_primary_plan(plan)
     if apply and plan.get("pdps"):

@@ -1638,10 +1638,11 @@ def ingest_validated_jsonl(
     than one page of one host -- COCODOR titles every diffuser, refill and candle of a scent with
     the scent alone ("Black Cherry": 16 pages, $6.99-$19.59), Mr. Smith's full size, mini and
     sachet share a title, beautyofjoseon.com lists each set once per region at different prices.
-    The first listing in record order keeps the key; every later record naming another listing on
-    that host for the same key is left out WHOLE (pdp, skus, offers, seeds) and named in
-    `listing_collisions`, with the evidence a reviewer needs to tell a duplicate page of one
-    product (same price, same merchant type) from a different product wearing its title. Not
+    One listing per (key, host) keeps the key -- elected by `elect_listing_keeper`, never by record
+    order -- and every record naming another listing on that host for the same key is left out WHOLE
+    (pdp, skus, offers, seeds) and named in `listing_collisions`, with the evidence a reviewer needs
+    to tell a duplicate page of one product (same price, same merchant type) from a different
+    product wearing its title. Not
     counted in `skipped`: the plan is still ready, and the drain decides what holds
     (services/retailer_ingest/detectors.listing_collision_flags). An `ext:retailer:` row is keyed
     by its listing URL, so it never meets another listing under its key.
@@ -1655,8 +1656,8 @@ def ingest_validated_jsonl(
     audit_reasons: Dict[str, int] = {}
     skipped = 0
     skipped_reasons: Dict[str, int] = {}
-    listing_owner: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    listing_collisions: List[Dict[str, Any]] = []
+    planned: List[Tuple[Dict[str, Any], Optional[Tuple[str, str]], Optional[Dict[str, Any]]]] = []
+    listings: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
     for record in rows:
         result = ingest_validated_record(record, source_jsonl=source_jsonl, market=market)
         if result is None:
@@ -1667,15 +1668,25 @@ def ingest_validated_jsonl(
             reason = str(result["skipped_reason"]).split(":")[0]
             skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
             continue
-        product_key = str(result["pdp"].get("product_key") or "")
         listing = content_listing(result["pdp"].get("canonical_url"))
+        group = evidence = None
         if listing is not None:
-            evidence = _listing_evidence(record, listing[1])
-            owner = listing_owner.setdefault((product_key, listing[0]), evidence)
-            if owner["handle"] != evidence["handle"]:
-                listing_collisions.append({"product_key": product_key, "host": listing[0],
-                                           "kept": owner, "dropped": evidence})
-                continue
+            group = (str(result["pdp"].get("product_key") or ""), listing[0])
+            evidence = listings.setdefault(group, {}).setdefault(listing[1], _listing_evidence(record, listing[1]))
+        planned.append((result, group, evidence))
+
+    keepers = {group: elect_listing_keeper(list(by_handle.values()), market=market)
+               for group, by_handle in listings.items()}
+    listing_collisions: List[Dict[str, Any]] = []
+    for group, by_handle in listings.items():
+        kept = keepers[group]
+        for handle, evidence in by_handle.items():
+            if handle != kept["handle"]:
+                listing_collisions.append({"product_key": group[0], "host": group[1],
+                                           "kept": kept, "dropped": evidence})
+    for result, group, evidence in planned:
+        if group is not None and evidence["handle"] != keepers[group]["handle"]:
+            continue
         pdp_rows.append(result["pdp"])
         sku_rows.append(result["sku"])
         sku_rows.extend(result.get("variant_skus") or [])
@@ -1723,7 +1734,8 @@ def ingest_validated_jsonl(
 
 def _listing_evidence(record: Dict[str, Any], handle: str) -> Dict[str, Any]:
     """What a reviewer compares across two listings that share a content key: the storefront's
-    own product type and every price the record carries (its variants', else its offers')."""
+    own product type and every price the record carries (its variants', else its offers'); and the
+    listing's lowest storefront variant id, which elect_listing_keeper reads as its age."""
     pdp = record.get("pdp") if isinstance(record.get("pdp"), dict) else {}
     prices = set()
     for source in (pdp.get("variants") or [], record.get("offers") or []):
@@ -1736,6 +1748,35 @@ def _listing_evidence(record: Dict[str, Any], handle: str) -> Dict[str, Any]:
                 prices.add(price)
         if prices:
             break
+    variant_ids = [int(str(v.get("variant_id")).strip()) for v in pdp.get("variants") or []
+                   if isinstance(v, dict) and str(v.get("variant_id") or "").strip().isdigit()]
     product_type = str(pdp.get("category_source_product_type") or "").strip()
     return {"handle": handle, "product_name": pdp.get("product_name"),
-            "product_type": product_type or None, "prices": sorted(prices)}
+            "product_type": product_type or None, "prices": sorted(prices),
+            "oldest_variant_id": min(variant_ids) if variant_ids else None}
+
+
+def elect_listing_keeper(listings: List[Dict[str, Any]], *, market: Optional[str] = None) -> Dict[str, Any]:
+    """Which of a host's same-title listings (_listing_evidence dicts) keeps the content key.
+
+    Never record order: Shopify's /products.json lists newest-published first, so first-wins kept
+    whatever the merchant published last -- measured 2026-09-29 on meritbeauty.com, 32 of 36
+    price-identical pairs kept a `-ukeu`/`-ca`/`-eu` copy that 404s for a US shopper over the US page,
+    and every new ad-landing clone would move the key's listing again. In order:
+      1. the listing named for the market (`<handle>-us` for US; the CLI and Path C declare none: US);
+      2. a base listing: not another listing's handle plus a suffix (`the-minimalist` over
+         `the-minimalist-ukeu`, `serum` over `serum-sachet`);
+      3. the oldest listing: lowest storefront variant id (ids are issued in creation order, so a
+         newer clone never displaces it); a listing without one ranks after those with one;
+      4. the handle, so the choice is total.
+    One function for the ingest and any repair of rows it wrote, so the two keep the same page."""
+    suffix = "-" + str(market or "US").strip().lower()
+    handles = [str(item["handle"]) for item in listings]
+
+    def rank(item: Dict[str, Any]) -> tuple:
+        handle = str(item["handle"])
+        derived = any(handle != other and handle.startswith(other + "-") for other in handles)
+        oldest = item.get("oldest_variant_id")
+        return (not handle.endswith(suffix), derived, oldest is None, oldest or 0, handle)
+
+    return min(listings, key=rank)
