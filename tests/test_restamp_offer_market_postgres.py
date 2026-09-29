@@ -68,13 +68,13 @@ async def _product(admin, key, url, ck, source_ref=None):
 
 
 async def _offer(admin, offer_id, key, *, market="US", currency="SGD", source_domain=None, suppressed=False,
-                 sku=None, channel="default", track="internal_merchant_free"):
+                 sku=None, channel="default", track="internal_merchant_free", source_ref=None):
     await admin.execute(
         """INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, channel, market, currency,
-                                       source_domain, suppressed_at, catalog_track, source_system)
-           VALUES ($1, $2, $3, 'm_sg', $4, $5, $6, $7, $8, $9, 'catalog_enrichment_agent_v1')""",
+                                       source_domain, suppressed_at, catalog_track, source_system, source_ref)
+           VALUES ($1, $2, $3, 'm_sg', $4, $5, $6, $7, $8, $9, 'catalog_enrichment_agent_v1', $10)""",
         offer_id, sku or f"sku:{offer_id}", key, channel, market, currency, source_domain,
-        SUPPRESSED_AT if suppressed else None, track)
+        SUPPRESSED_AT if suppressed else None, track, source_ref)
 
 
 async def _seed_rows(admin):
@@ -122,7 +122,11 @@ async def test_the_plan_takes_exactly_the_named_hosts_sgd_rows(catalog):
 
 
 NOT_JSM = ("shop.jsmbeauty.sg", "jsmbeauty.sg.evil.com", "", None, "mailto:x@jsmbeauty.sg", "ftp://jsmbeauty.sg/x",
-           "https://evil.com\\@jsmbeauty.sg/x", "https://jsm beauty.sg")
+           "https://evil.com\\@jsmbeauty.sg/x", "https://jsm beauty.sg",
+           # review of #2455: a digit after a non-web scheme is not a port; whitespace and non-ASCII agree in both
+           "mailto:1@jsmbeauty.sg", "tel:65@jsmbeauty.sg", "data:1,@jsmbeauty.sg", "\tjsmbeauty.sg",
+           "jsmbeauty.sg\u00a0", "jsmbeauty.sg\r\n", "https://jsmbeauty.sg/x\ny", "\u0130jsmbeauty.sg",
+           "\u212ajsmbeauty.sg")  # KELVIN SIGN: Python lowercases it to ASCII 'k'; both must refuse it
 
 
 @pytest.mark.parametrize("text", [
@@ -146,7 +150,7 @@ async def test_a_blank_source_domain_falls_back_to_the_product_url(catalog):
     assert [o["offer_id"] for o in (await tool.plan(database, ["jsmbeauty.sg"], "US", "SG"))["offers"]] == ["o_blank"]
 
 
-@pytest.mark.parametrize("rewriter", ["catalog_sync_track", "external_brand_crawl_seed"])
+@pytest.mark.parametrize("rewriter", ["catalog_sync_track", "external_brand_crawl_seed", "external_brand_crawl_offer_ref"])
 async def test_a_lane_that_rewrites_market_is_refused(catalog, rewriter):
     """catalog_sync rewrites every column on re-sync; the crawl onboarder sets market from the seed: a restamp
     of their offers would be silently undone."""
@@ -161,8 +165,12 @@ async def test_a_lane_that_rewrites_market_is_refused(catalog, rewriter):
         seed_id = onboard._seed_id("9000001")
         await admin.execute("INSERT INTO external_product_seeds (id, tool) VALUES ($1, $2)",
                             seed_id, onboard.SEED_TOOL_SCOPE)
-        await _product(admin, "ext:jsm::1", "https://jsmbeauty.sg/products/a", "ck_a", source_ref=seed_id)
-        await _offer(admin, "o_crawled", "ext:jsm::1")
+        if rewriter == "external_brand_crawl_seed":
+            await _product(admin, "ext:jsm::1", "https://jsmbeauty.sg/products/a", "ck_a", source_ref=seed_id)
+            await _offer(admin, "o_crawled", "ext:jsm::1")
+        else:  # the mirror kept ANOTHER seed on the product; the offer's own source_ref is the onboarder's
+            await _product(admin, "ext:jsm::1", "https://jsmbeauty.sg/products/a", "ck_a", source_ref="seed:other")
+            await _offer(admin, "o_crawled", "ext:jsm::1", source_ref=seed_id)
     before = await _markets(admin)
     p = await tool.plan(database, ["jsmbeauty.sg"], "US", "SG")
     assert len(p["rewriting_lane_offers"]) == 1
@@ -349,3 +357,15 @@ def test_a_failed_rebuild_exits_non_zero():
     from scripts import restamp_offer_market as tool
     assert tool.exit_code({"refresh": {"failed_keys_total": 1}}) == 2
     assert tool.exit_code({"refresh": {"failed_keys_total": 0}}) == 0 and tool.exit_code({}) == 0
+
+
+async def test_revert_takes_any_spelling_of_the_prior_market_as_already_there(catalog):
+    """A's prior was ' us'; another writer since set 'US'. That offer is where the revert would put it -- it must
+    not leave A unrevertable (review of #2455)."""
+    database, admin, tool, _, _ = catalog
+    await _seed_rows(admin)
+    out = await tool.apply(database, await tool.plan(database, ["jsmbeauty.sg"], "US", "SG"))
+    await admin.execute("UPDATE catalog_offers SET market = 'Us' WHERE offer_id = 'o_c_padded'")
+    done = await tool.revert(database, out["run_id"])
+    assert (done["reverted"], done["already"]) == (4, 1)
+    assert (await _markets(admin))["o_c_padded"] == "Us"

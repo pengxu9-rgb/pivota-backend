@@ -74,13 +74,18 @@ REWRITING_SEED_ID_PREFIXES = ("external_brand_crawl::",)
 def _host_sql(expr: str) -> str:
     """`offer_host` in SQL: lower/trim, drop an http(s) scheme (or a bare //), userinfo, then everything from the
     first / ? # or : (path, query, fragment, port), then any leading www. and trailing dots. Text with another
-    scheme (mailto:...), a backslash, or a result that is not a hostname names no web host: ''."""
-    t = f"lower(trim(coalesce({expr}, '')))"
+    scheme (mailto:1@..., tel:...; a `host:443` port is not one), a backslash, non-ASCII, whitespace other than
+    the trimmed outer spaces, or a result that is not a hostname names no web host: ''."""
+    raw = f"coalesce({expr}, '')"
+    t = f"lower(trim({raw}))"
     s = f"regexp_replace({t}, '^(https?:)?//', '')"
     s = f"regexp_replace({s}, '^[^/?#@]*@', '')"
     s = f"regexp_replace({s}, '[/?#:].*$', '')"
     s = f"regexp_replace(regexp_replace({s}, '^(www[.])+', ''), '[.]+$', '')"
-    return (f"(CASE WHEN strpos({t}, chr(92)) > 0 OR ({t} ~ '^[a-z][a-z0-9+.-]*:[^0-9]' AND {t} !~ '^https?:') "
+    other_scheme = (f"({t} ~ '^[a-z][a-z0-9+.-]*:' AND {t} !~ '^https?:' "
+                    f"AND {t} !~ '^[^:/?#@]*:[0-9]+([/?#]|$)')")
+    return (f"(CASE WHEN strpos({t}, chr(92)) > 0 OR octet_length({raw}) <> char_length({raw}) "
+            f"OR {t} ~ '[[:space:][:cntrl:]]' OR {other_scheme} "
             f"OR {s} !~ '^[a-z0-9.-]*$' THEN '' ELSE {s} END)")
 
 
@@ -92,8 +97,11 @@ CURRENCY_SQL = "upper(trim(coalesce({a}.currency, '')))"
 PLAN_SQL = f"""
 SELECT o.offer_id, o.product_key, o.sku_key, o.channel, o.market, o.currency, o.catalog_track, o.source_system,
        (o.suppressed_at IS NULL) AS live, cp.content_key, {HOST_SQL} AS host,
-       EXISTS (SELECT 1 FROM external_product_seeds s WHERE s.id = cp.source_ref
-                 AND s.id LIKE ANY(:rewriting_id_patterns)) AS seed_lane_rewrites
+       -- the offer's own seed (external_offer_dual_write writes o.source_ref = seed id) or its product's: the
+       -- mirror keeps whichever seed won the epid group in cp.source_ref, while the onboarder still rewrites
+       -- the offer by product_key (review of #2455)
+       (coalesce(o.source_ref, '') LIKE ANY(:rewriting_id_patterns)
+        OR coalesce(cp.source_ref, '') LIKE ANY(:rewriting_id_patterns)) AS seed_lane_rewrites
 FROM catalog_offers o LEFT JOIN catalog_products cp ON cp.product_key = o.product_key
 WHERE {HOST_SQL} = ANY(:hosts)
   AND {MARKET_SQL.format(a='o')} = :from_market
@@ -135,8 +143,8 @@ ORDER BY o.offer_id, s.offer_id
 # A revert leaves an offer that already reads its prior value where it is (review 2 of #2450: after a later run
 # B restamped an offer run A had moved, and B was reverted, that offer is back at A's prior value -- counting it
 # as drift made A unrevertable forever).
-ALREADY_AT_SQL = """
-SELECT offer_id FROM catalog_offers WHERE offer_id = ANY(:ids) AND market = :target
+ALREADY_AT_SQL = f"""
+SELECT offer_id FROM catalog_offers WHERE offer_id = ANY(:ids) AND {MARKET_SQL.format(a='catalog_offers')} = :target
 """
 
 # Drift-guarded on the exact value read at plan time; the count check in `_write` aborts the transaction.
@@ -174,14 +182,19 @@ _SCHEME = re.compile(r"^(https?:)?//")
 
 
 def offer_host(text: Any) -> str:
-    """HOST_SQL, in Python (the two are pinned equal by the tests)."""
-    t = str(text or "").strip().lower()
+    """HOST_SQL, in Python (the two are pinned equal by the tests; PG trim() strips spaces only, so does this)."""
+    raw = str(text or "")
+    if not raw.isascii():
+        return ""
+    t = raw.strip(" ").lower()
     s = _SCHEME.sub("", t)
     s = re.sub(r"^[^/?#@]*@", "", s)
-    s = re.sub(r"[/?#:].*$", "", s)
+    s = re.sub(r"[/?#:].*$", "", s, flags=re.S)
     s = re.sub(r"[.]+$", "", re.sub(r"^(www[.])+", "", s))
-    other_scheme = re.match(r"^[a-z][a-z0-9+.-]*:[^0-9]", t) and not re.match(r"^https?:", t)
-    return "" if "\\" in t or other_scheme or not re.fullmatch(r"[a-z0-9.-]*", s) else s
+    other_scheme = (re.match(r"^[a-z][a-z0-9+.-]*:", t) and not re.match(r"^https?:", t)
+                    and not re.match(r"^[^:/?#@]*:[0-9]+([/?#]|$)", t))
+    bad = "\\" in t or re.search(r"[\s\x00-\x1f\x7f]", t) or other_scheme
+    return "" if bad or not re.fullmatch(r"[a-z0-9.-]*", s) else s
 
 
 async def collisions(db: Any, ids: List[str], target: str) -> List[Dict[str, Any]]:
@@ -261,7 +274,9 @@ async def _write(db: Any, m: Mapping[str, Any], *, reverse: bool) -> Dict[str, i
     moved = already = 0
     for (prior, target), ids in groups.items():
         if reverse:
-            there = {r["offer_id"] for r in await db.fetch_all(ALREADY_AT_SQL, {"ids": ids, "target": target})}
+            # any spelling of the prior market (another writer's 'US' for a prior ' us') is "already there"
+            there = {r["offer_id"] for r in await db.fetch_all(
+                ALREADY_AT_SQL, {"ids": ids, "target": target.strip().upper()})}
             ids, already = [i for i in ids if i not in there], already + len(there)
             if not ids:
                 continue
@@ -344,7 +359,8 @@ async def revert(db: Any, run_id: str) -> Dict[str, Any]:
 def exit_code(out: Mapping[str, Any]) -> int:
     """Non-zero when a committed write left views unrebuilt: nothing else retries them -- the nightly reconciler
     (jobs/agent_pdp_view_reconciler_cron.py) keys "changed" on MAX(offer.updated_at), which a restamp does not
-    bump. Re-run `refresh --run-id`."""
+    bump. Re-run `refresh --run-id`. (scripts/ops/run_oneoff_job.sh reports any non-zero as exit 1: the
+    `COMMITTED <run_id>` line is what tells a failed rebuild from a failed write.)"""
     return 2 if ((out.get("refresh") or {}).get("failed_keys_total") or 0) > 0 else 0
 
 
