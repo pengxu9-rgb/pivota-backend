@@ -184,6 +184,15 @@ def _is_invisible(ch: str) -> bool:
     return unicodedata.category(ch) == "Cf" or any(lo <= code <= hi for lo, hi in _INVISIBLE_RANGES)
 
 
+def _unit_or_nothing(symbol: str) -> str:
+    """A symbol drops out of the identity -- except a unit sign, which is its letters: "50㎖" is
+    "50ml", "㎎" is "mg". The trademark signs spell letters too ("™" -> "TM") and are dropped."""
+    if symbol in "™℠":
+        return ""
+    spelled = unicodedata.normalize("NFKC", symbol)
+    return spelled if any(ch.isalnum() for ch in spelled) else ""
+
+
 def product_identity_text(brand: Optional[str], product_name: Optional[str]) -> str:
     """(brand, product name) in every script: symbols and invisible characters dropped (so "Glow™" is
     "Glow"), NFKC (fullwidth ＭＶ is MV, Ⅱ is ii), casefolded, runs of letters/marks/digits joined by
@@ -193,9 +202,10 @@ def product_identity_text(brand: Optional[str], product_name: Optional[str]) -> 
     (unicodedata.unidata_version); an upgrade that re-categorises a code point in a stored name would
     move that key."""
     text = "".join(
-        " " if _MODIFIER_LETTERS[0] <= ord(ch) <= _MODIFIER_LETTERS[1] else ch
+        " " if _MODIFIER_LETTERS[0] <= ord(ch) <= _MODIFIER_LETTERS[1] else _unit_or_nothing(ch)
+        if unicodedata.category(ch).startswith("S") else ch
         for ch in f"{brand or ''} {product_name or ''}"
-        if not unicodedata.category(ch).startswith("S") and not _is_invisible(ch)
+        if not _is_invisible(ch)
     )
     text = unicodedata.normalize("NFKC", text).casefold()
     words = "".join(ch if unicodedata.category(ch)[0] in "LMN" else " " for ch in text)

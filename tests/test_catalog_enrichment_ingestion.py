@@ -139,6 +139,9 @@ def test_non_latin_identity_ignores_case_symbols_and_width():
     assert derive_product_key("Sulwhasoo", "자음​생크림") == key
     assert derive_product_key("Sulwhasoo", "자음­생크림") == key
     assert derive_product_key("Brand", "크림 ❤️") == derive_product_key("Brand", "크림 ❤")
+    # A unit sign is its letters, not a symbol to drop.
+    assert derive_product_key("Brand", "化粧水 50㎖") == derive_product_key("Brand", "化粧水 50ml")
+    assert derive_product_key("Brand", "化粧水 50㎖") != derive_product_key("Brand", "化粧水 50")
 
 
 @pytest.mark.parametrize("modified,plain", [
