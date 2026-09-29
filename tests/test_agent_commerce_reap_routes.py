@@ -3379,3 +3379,157 @@ async def test_a_caller_named_sku_outside_the_chosen_variant_is_refused_on_a_mir
     assert ok.status_code == 202, ok.text
     bad = await client.post(f"{BASE}/purchases", json={**_live_body(), "variant_key": LIVE_SKU_CANONICAL})
     assert bad.status_code == 409 and _error(bad) == "row_variant_unverified"
+
+
+# ── #2453 review round ──────────────────────────────────────────────────────────────────────
+
+
+async def test_a_named_shopify_sku_past_the_list_cap_is_still_found(client, monkeypatch):
+    """Regression probe A: the caller-named sku is read BY KEY, not searched inside the bounded
+    no-key list -- a product with 60 skus and a named key that sorts last is bought (main: 202)."""
+    await _seed_tierb_shopify_item()
+    await _seed_tierb_verdict()
+    for i in range(60):
+        await database.execute(
+            "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, "
+            "source_variant_id, title, currency) VALUES (:sk, :pk, 'm_brand', 'shopify', '1001', :vid, "
+            ":t, 'USD')",
+            {"sk": f"{PRODUCT_KEY}::a{i:03d}", "pk": PRODUCT_KEY, "vid": str(40000000000000 + i),
+             "t": f"Shade {i}"},
+        )
+    late = f"{PRODUCT_KEY}::zz_named"
+    await database.execute(
+        "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, "
+        "source_variant_id, title, currency) VALUES (:sk, :pk, 'm_brand', 'shopify', '1001', "
+        "'41111111111111', 'Late', 'USD')", {"sk": late, "pk": PRODUCT_KEY})
+    await database.execute(
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, "
+        "merchant_effective_price) VALUES ('off_late', :sk, :pk, 'm_brand', 'USD', '42.50')",
+        {"sk": late, "pk": PRODUCT_KEY})
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link", variant_key=late))
+    assert resp.status_code == 202, resp.text
+    purchase = await _purchase_row(resp.json()["purchase_id"])
+    assert "/cart/41111111111111:1?" in purchase["cart_url"]
+
+
+async def _reprice(sku_key: str, price: str) -> None:
+    await database.execute(
+        "UPDATE catalog_offers SET merchant_effective_price = :p WHERE sku_key = :sk",
+        {"p": price, "sk": sku_key})
+
+
+async def test_a_named_mirror_spelling_is_priced_itself(client, monkeypatch):
+    """Probe B/I: a caller-named sku is priced from ITS offer, not the lowest sku_key's."""
+    await _seed_live_mirror()
+    await _reprice(LIVE_SKU_PROMOTED, "14.99")
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json={**_live_body(), "variant_key": LIVE_SKU_PROMOTED})
+    assert resp.status_code == 202, resp.text
+    assert (await _purchase_row(resp.json()["purchase_id"]))["our_price_minor"] == 1499
+    named_low = await client.post(f"{BASE}/purchases", json={**_live_body(), "variant_key": LIVE_SKU_CRAWL})
+    assert named_low.status_code == 202, named_low.text
+    assert (await _purchase_row(named_low.json()["purchase_id"]))["our_price_minor"] == 1399
+
+
+async def test_unnamed_spellings_that_disagree_on_price_are_refused(client, monkeypatch):
+    await _seed_live_mirror()
+    await _reprice(LIVE_SKU_PROMOTED, "14.99")
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert resp.status_code == 409 and _error(resp) == "row_price_ambiguous"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_unnamed_spellings_that_agree_on_price_are_bought(client, monkeypatch):
+    """CONTROL: the same row with agreeing prices (the live shape: 13.99 everywhere)."""
+    await _seed_live_mirror()
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert resp.status_code == 202, resp.text
+
+
+async def test_shopify_no_key_two_distinct_variants_is_ambiguous(client, monkeypatch):
+    """M13 / probe K."""
+    await _seed_tierb_shopify_item()
+    await _seed_tierb_verdict()
+    await database.execute(
+        "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, "
+        "source_variant_id, title, currency) VALUES (:sk, :pk, 'm_brand', 'shopify', '1001', "
+        "'50041364447510', 'Large', 'USD')", {"sk": SECOND_SKU_KEY, "pk": PRODUCT_KEY})
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link", variant_key=None))
+    assert resp.status_code == 409 and _error(resp) == "row_not_found"
+
+
+async def test_shopify_no_key_placeholder_plus_one_real_sku_is_bought(client, monkeypatch):
+    """M13 / probe L: the `::canonical` placeholder beside ONE real variant is not ambiguity."""
+    await _seed_tierb_shopify_item()
+    await _seed_tierb_verdict()
+    await database.execute(
+        "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, "
+        "source_variant_id, title, currency) VALUES (:sk, :pk, 'm_brand', 'shopify', '1001', :pk, "
+        "'Standard Eau de Parfum', 'USD')", {"sk": f"{PRODUCT_KEY}::canonical", "pk": PRODUCT_KEY})
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link", variant_key=None))
+    assert resp.status_code == 202, resp.text
+    assert "/cart/50041364447509:1?" in (await _purchase_row(resp.json()["purchase_id"]))["cart_url"]
+
+
+async def test_a_mirror_whose_only_real_sku_names_no_variant_is_unverified(client, monkeypatch):
+    """M9 / probe H."""
+    await _seed_live_mirror(skus=((LIVE_SKU_CANONICAL, LIVE_PK), (LIVE_SKU_CRAWL, "SKU-SILKY-01")))
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert resp.status_code == 409 and _error(resp) == "row_variant_unverified"
+
+
+def test_the_sku_cap_refuses_more_than_fifty_rows():
+    """M10: over `_CART_MAX_SKUS` live skus is not a product one cart link can name -- even when
+    every row names the SAME variant (so the distinct-variant rule alone would accept it)."""
+    def rows(n):
+        spellings = [f"{LIVE_EXT_ID}:{LIVE_VARIANT}", LIVE_VARIANT, f"gid://shopify/ProductVariant/{LIVE_VARIANT}"]
+        return [{"sku_key": f"{LIVE_PK}::s{i:03d}", "source_variant_id": spellings[i % 3]} for i in range(n)]
+    variant, group, _ = routes_reap._cart_sku_choice(rows(routes_reap._CART_MAX_SKUS), LIVE_PK)
+    assert variant == LIVE_VARIANT and len(group) == routes_reap._CART_MAX_SKUS
+    with pytest.raises(svc.PurchaseRefused) as caught:
+        routes_reap._cart_sku_choice(rows(routes_reap._CART_MAX_SKUS + 1), LIVE_PK)
+    assert caught.value.reason == "row_not_found"
+
+
+def test_the_mirrored_brand_order_is_the_mirror_scripts_own():
+    """ONE order: `MIRRORED_BRAND_PATHS` must equal the `coalesce(...) AS mirrored_brand` list in
+    scripts/mirror_external_seeds_to_catalog_products.py -- parsed from the SQL, not restated."""
+    import re as _re
+    src = (Path(__file__).resolve().parents[1]
+           / "scripts" / "mirror_external_seeds_to_catalog_products.py").read_text(encoding="utf-8")
+    block = src[:src.index("AS mirrored_brand")]
+    block = block[block.rindex("coalesce("):]
+    paths = []
+    for arrow, path in _re.findall(r"eps\.seed_data\s*(#>>|->>)\s*'([^']+)'", block):
+        paths.append(tuple(path.strip("{}").split(",")) if arrow == "#>>" else (path,))
+    assert tuple(paths) == routes_reap.MIRRORED_BRAND_PATHS
+
+
+@pytest.mark.parametrize("seed_data,expected", [
+    ({"snapshot": {"brand": "A", "vendor": "B"}, "brand": "C", "vendor": "D"}, "A"),
+    ({"snapshot": {"vendor": "B"}, "brand": "C", "vendor": "D"}, "C"),
+    ({"snapshot": {"vendor": "B"}, "vendor": "D"}, "B"),
+    ({"vendor": " D "}, "D"),
+    ({"snapshot": {"brand": "  "}, "brand": "C"}, None),   # SQL coalesce: a present blank wins
+    ({}, None),
+])
+def test_mirrored_seed_brand_is_sql_coalesce(seed_data, expected):
+    assert routes_reap.mirrored_seed_brand(seed_data) == expected
+
+
+async def test_a_vendor_only_mirror_seed_derives_its_seller(client, monkeypatch):
+    """A seed with no brand anywhere but `snapshot.vendor` -- what the mirror minted from -- and a
+    product row with no brand: the seller still derives to the row's merch_obs_ id."""
+    seed = _live_seed_data()
+    del seed["snapshot"]["brand"]
+    seed["snapshot"]["vendor"] = "Judydoll"
+    await _seed_live_mirror(brand=None, seed_data=seed)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert resp.status_code == 202, resp.text

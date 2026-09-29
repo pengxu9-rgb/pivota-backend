@@ -213,6 +213,10 @@ _REFUSAL_STATUS: Dict[str, int] = {
     "buyer_unlinked": 409,
     "row_not_found": 409,
     "row_unpriced": 409,
+    # Tier B: two catalog spellings of the ONE chosen Shopify variant carry different usable
+    # prices for this seller, and no sku was named -- no single price to commit to. 409 like
+    # `row_unpriced`: the body is fine, the catalog is not.
+    "row_price_ambiguous": 409,
     "row_not_shopify": 409,
     "row_variant_unverified": 409,
     "seller_identity_unverified": 409,
@@ -1235,6 +1239,14 @@ _CART_PRODUCT_SQL = """
        AND p.suppression_reason IS NULL
        AND p.suppressed_at IS NULL
 """
+# A CALLER-NAMED sku is read by its key, exactly (review of #2453): searching the bounded list
+# below for it refused a named variant that sorted past the cap on a product with many skus.
+_CART_SKU_BY_KEY_SQL = """
+    SELECT s.sku_key, s.source_variant_id, s.title AS variant_title, s.currency
+      FROM catalog_skus s
+     WHERE s.product_key = :product_key AND s.sku_key = :variant_key
+       AND s.suppression_reason IS NULL AND s.suppressed_at IS NULL
+"""
 # EVERY live sku of the product (bounded), not `LIMIT 2`: the choice is made by `_cart_sku_choice`
 # over what the skus RESOLVE to, and a mirror row routinely carries three rows for one variant.
 _CART_PRODUCT_SKUS_SQL = """
@@ -1345,6 +1357,29 @@ def _cart_sku_choice(
     return numeric, sorted(group, key=lambda row: str(row.get("sku_key") or "")), placeholder
 
 
+#: `scripts/mirror_external_seeds_to_catalog_products.py`'s `mirrored_brand` -- the brand the mirror
+#: hands `ensure_observed_seller` to mint the row's `merch_obs_` id -- is
+#: `nullif(btrim(coalesce(<these, in order>, '')), '')`. That SQL is the only owner of the order (no
+#: Python helper carries it), so it is restated here ONCE and a test parses the script's SQL and
+#: pins the two equal.
+MIRRORED_BRAND_PATHS: Tuple[Tuple[str, ...], ...] = (
+    ("snapshot", "brand"), ("brand",), ("snapshot", "vendor"), ("vendor",),
+)
+
+
+def mirrored_seed_brand(seed_data: Any) -> Optional[str]:
+    """The mirror's `mirrored_brand` for a seed: SQL `coalesce` semantics -- the FIRST path that is
+    present (not JSON null / absent) wins, even if blank, and is then trimmed; blank -> None."""
+    data = seed_data if isinstance(seed_data, dict) else {}
+    for path in MIRRORED_BRAND_PATHS:
+        node: Any = data
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        if node is not None:
+            return str(node).strip() or None
+    return None
+
+
 def _mirror_seller_ref(product: Mapping[str, Any], seed: Mapping[str, Any], seed_data: Any,
                        merchant_domain: str) -> Optional[str]:
     """The seller of a MIRROR row, or None.
@@ -1354,9 +1389,9 @@ def _mirror_seller_ref(product: Mapping[str, Any], seed: Mapping[str, Any], seed
     row's `merchant_id` is EXACTLY the observed seller id the repo's own minting function derives
     for this storefront: `resolve_seed_seller_identity(brand, domain)` over the attached ACTIVE
     seed's domain (which `_CART_SEED_VARIANT_SQL` already pinned to `merchant_domain` and this
-    product; no seed row -> None). The brand is the row's own (the product's, else the seed's
-    snapshot / top-level brand). A non-null seller_ref keeps today's rule: it must equal
-    merchant_id. Live: brand Judydoll + judydoll.com -> merch_obs_a25cbba37ef98c52.
+    product; no seed row -> None). The brand is the one the mirror minted from
+    (`mirrored_seed_brand`: snapshot.brand, brand, snapshot.vendor, vendor), else the product's.
+    A non-null seller_ref keeps today's rule: it must equal merchant_id. Live: brand Judydoll + judydoll.com -> merch_obs_a25cbba37ef98c52.
     """
     merchant_id = str(product.get("merchant_id") or "").strip()
     seller_ref = str(product.get("seller_ref") or "").strip()
@@ -1364,11 +1399,9 @@ def _mirror_seller_ref(product: Mapping[str, Any], seed: Mapping[str, Any], seed
         return seller_ref if seller_ref == merchant_id else None
     if not merchant_id or not seed:
         return None
-    data = seed_data if isinstance(seed_data, dict) else {}
-    snapshot = data.get("snapshot") if isinstance(data.get("snapshot"), dict) else {}
-    # The row's own brand first, then the seed's -- where crawl seeds actually carry it:
-    # `snapshot.brand` (scripts/backfill_seller_of_record._seed_brand: 2,024 of 2,026 seeds).
-    for brand in (product.get("brand"), snapshot.get("brand"), data.get("brand")):
+    # The brand the MIRROR minted this row's seller from (`mirrored_seed_brand`, the mirror's own
+    # coalesce order), then the product row's copy of it (a re-key may have written that).
+    for brand in (mirrored_seed_brand(seed_data), product.get("brand")):
         if not str(brand or "").strip():
             continue
         try:
@@ -1400,19 +1433,24 @@ async def _load_cart_link_item(
     if platform not in ("shopify", "external_seed"):
         raise svc.PurchaseRefused("row_not_shopify", "cart-link product has no Shopify source")
 
-    skus = [dict(row) for row in await database.fetch_all(
-        _CART_PRODUCT_SKUS_SQL, {"product_key": product_key}
-    )]
+    named: Optional[Dict[str, Any]] = None
     if variant_key:
-        named = [row for row in skus if row.get("sku_key") == variant_key]
-        if not named:
+        raw_sku = await database.fetch_one(
+            _CART_SKU_BY_KEY_SQL, {"product_key": product_key, "variant_key": variant_key}
+        )
+        if raw_sku is None:
             raise svc.PurchaseRefused("row_not_found", "no sku for this product and key")
+        named = dict(raw_sku)
 
     if platform == "shopify":
-        if variant_key:
-            candidates = named
-            variant_id = extract_shopify_numeric_variant_id(named[0].get("source_variant_id"))
+        if named is not None:
+            # The caller named the sku: exactly as before -- that sku, its variant, its offer.
+            candidates = [named]
+            variant_id = extract_shopify_numeric_variant_id(named.get("source_variant_id"))
         else:
+            skus = [dict(row) for row in await database.fetch_all(
+                _CART_PRODUCT_SKUS_SQL, {"product_key": product_key}
+            )]
             variant_id, candidates, _placeholder = _cart_sku_choice(skus, product_key)
         seller_ref = str(product.get("seller_ref") or product.get("merchant_id") or "").strip()
     else:
@@ -1420,6 +1458,9 @@ async def _load_cart_link_item(
             raise svc.PurchaseRefused("row_variant_unverified", "external seed source is unknown")
         # A mirror is a product-grain row: its sku is chosen by the SAME rule as the no-key path,
         # never by the caller. A caller-named sku must be one of the rows that rule chose.
+        skus = [dict(row) for row in await database.fetch_all(
+            _CART_PRODUCT_SKUS_SQL, {"product_key": product_key}
+        )]
         sku_variant, candidates, placeholder = _cart_sku_choice(skus, product_key)
         if candidates and sku_variant is None:
             # A mirror's one real sku names no Shopify variant: not a cart this lane can prove.
@@ -1430,8 +1471,11 @@ async def _load_cart_link_item(
             candidates = [placeholder] if placeholder else []
         if not candidates:
             raise svc.PurchaseRefused("row_not_found", "variant is ambiguous")
-        if variant_key and variant_key not in {row["sku_key"] for row in candidates}:
-            raise svc.PurchaseRefused("row_variant_unverified", "mirror variant is ambiguous")
+        if named is not None:
+            if named["sku_key"] not in {row["sku_key"] for row in candidates}:
+                raise svc.PurchaseRefused("row_variant_unverified", "mirror variant is ambiguous")
+            # The caller named one of the chosen spellings: THAT sku is priced.
+            candidates = [named]
         seed = await database.fetch_one(
             _CART_SEED_VARIANT_SQL,
             {"seed_id": product.get("source_ref"), "product_key": product_key,
@@ -1465,26 +1509,32 @@ async def _load_cart_link_item(
     if not seller_ref or seller_ref != str(product.get("merchant_id") or "").strip():
         raise svc.PurchaseRefused("seller_identity_unverified", "catalog seller identity is ambiguous")
 
-    # THE PRICED SKU: the lowest sku_key naming the chosen variant that this seller has a usable
-    # offer on (deterministic; the live mirror row offers the same price on every spelling).
-    offer = None
-    sku: Dict[str, Any] = candidates[0] if candidates else {}
+    # THE PRICED SKU. A caller-named sku is priced itself (`candidates == [named]`). Without a
+    # name, every spelling of the ONE chosen variant that this seller has a usable offer on is
+    # read, and they must AGREE (review of #2453): the lowest sku_key's price is only a
+    # deterministic pick when it is the same price as the others. Disagreeing spellings are a
+    # price nobody can vouch for -> `row_price_ambiguous`.
+    priced: List[Tuple[Dict[str, Any], Dict[str, Any], str, Optional[int]]] = []
     for candidate in candidates:
-        offer = await database.fetch_one(
+        found = await database.fetch_one(
             _CART_OFFER_SQL,
             {"product_key": product_key, "sku_key": candidate["sku_key"],
              "merchant_id": seller_ref},
         )
-        if offer is not None:
-            sku = candidate
-            break
-    if offer is None:
+        if found is None:
+            continue
+        found = dict(found)
+        cur = str(found.get("currency") or candidate.get("currency") or "").strip().upper()
+        priced.append((candidate, found, cur, ledger.amount_minor_or_none(found.get("price"), cur)))
+    if not priced:
         raise svc.PurchaseRefused("row_unpriced", "seller has no usable offer on this sku")
-    offer = dict(offer)
-    currency = str(offer.get("currency") or sku.get("currency") or "").strip().upper()
+    if len({(cur, minor) for _c, _o, cur, minor in priced}) > 1:
+        raise svc.PurchaseRefused(
+            "row_price_ambiguous", "the spellings of this variant carry different prices"
+        )
+    sku, offer, currency, price_minor = priced[0]
     if currency != _MARKET_CURRENCY.get(market_country):
         raise svc.PurchaseRefused("row_currency_mismatch", "offer currency differs from market")
-    price_minor = ledger.amount_minor_or_none(offer.get("price"), currency)
     if not price_minor or price_minor <= 0:
         raise svc.PurchaseRefused("row_unpriced", "offer price is not an exact minor amount")
 
