@@ -64,6 +64,8 @@ MIGRATIONS = (
 )
 SEEDS_MIGRATION = MIGRATIONS_DIR / "044_external_product_seeds.sql"
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
+#: Where the SQLite arm parks a pre-existing external_product_seeds for the duration of a test.
+PARKED_SEEDS = "external_product_seeds_parked_by_enrichment_route_cases"
 
 RAIL_TABLES = (
     "reap_agentic_purchase_keys",
@@ -291,17 +293,21 @@ async def enrichment_db():
         for table in RAIL_TABLES:
             await database.execute(f"DROP TABLE IF EXISTS {table}")
         await ensure_required_schema_light()
-        # Other SQLite suites need migration 044's wider seed table in this shared file: create
-        # the narrow one only when absent, and drop only what this file created.
+        # THE SHARED SQLite FILE MAY ALREADY HOLD AN external_product_seeds, in whatever shape the
+        # suite before this one built (the full sweep found one without `attached_variant_id`).
+        # So it is PARKED under another name, this file's own table is built, and at teardown
+        # this table is dropped and the parked one renamed back: the file is left as found.
         had_seeds = await database.fetch_one(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'external_product_seeds'"
         ) is not None
-        if not had_seeds:
-            await database.execute(
-                "CREATE TABLE external_product_seeds (id TEXT PRIMARY KEY, status TEXT, "
-                "domain TEXT, market TEXT, destination_url TEXT, canonical_url TEXT, "
-                "attached_product_key TEXT, attached_variant_id TEXT, seed_data TEXT)"
-            )
+        await database.execute(f"DROP TABLE IF EXISTS {PARKED_SEEDS}")
+        if had_seeds:
+            await database.execute(f"ALTER TABLE external_product_seeds RENAME TO {PARKED_SEEDS}")
+        await database.execute(
+            "CREATE TABLE external_product_seeds (id TEXT PRIMARY KEY, status TEXT, "
+            "domain TEXT, market TEXT, destination_url TEXT, canonical_url TEXT, "
+            "attached_product_key TEXT, attached_variant_id TEXT, seed_data TEXT)"
+        )
         url = (os.getenv("DATABASE_URL") or "").replace("sqlite+aiosqlite://", "sqlite://")
     engine = sqlalchemy.create_engine(url)
     metadata.create_all(engine, tables=[
@@ -323,10 +329,10 @@ async def enrichment_db():
         if IS_POSTGRES:
             await database.execute("DROP TABLE IF EXISTS external_product_seeds")
         else:
-            await database.execute(
-                "DELETE FROM external_product_seeds WHERE id = :id", {"id": LIVE_SEED_ID})
-            if not had_seeds:
-                await database.execute("DROP TABLE external_product_seeds")
+            await database.execute("DROP TABLE IF EXISTS external_product_seeds")
+            if had_seeds:
+                await database.execute(
+                    f"ALTER TABLE {PARKED_SEEDS} RENAME TO external_product_seeds")
         if IS_POSTGRES and not was_connected and database.is_connected:
             await database.disconnect()
 
