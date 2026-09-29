@@ -16,6 +16,17 @@ THE CONTRACT
     Only listed ids start. A value that is set but names NO ids (",", " , ") is a filter that
     allows NOTHING, not "no filter": an operator who typed a list meant to restrict, and the
     fail-open reading would start every job on a worker that was meant to run one.
+  * `*` (anywhere in the list)          -> explicitly ALL jobs: no filter, but reported as such.
+
+FAIL CLOSED OUTSIDE PRODUCTION. When `platform_env()` is not production AND AUDIT_WORKER_ENABLED
+is EXPLICITLY true AND this variable is unset/blank, the allowlist is ALLOW-NOTHING and an ERROR
+goes to the "pivota" logger. `*` is the opt-in for "everything" there. Why: the ways this variable
+disappears are all silent — infra/gcp/deploy_worker.sh CONFIG=apply replaces the whole env via
+--env-vars-file, gcloud turns `SCHEDULER_JOB_ALLOWLIST=,` into an empty value, the console can
+clear the field — and on staging (a restored copy of prod, with some money-path dials armed) the
+fail-open result is every job at once. Production is untouched by this rule: there the worker
+has always run everything and still does. A service whose worker flag is unset or false (staging
+`web`, today's staging `worker`) is untouched too, loops included.
 
 WHAT AN ID IS. The id a job registers under in `audit_scheduler._add_job` — the same id
 /__scheduler_health reports — or one of the process-level loops in `PROCESS_LOOP_IDS`, which are
@@ -30,7 +41,7 @@ at WARNING and reported as `job_allowlist_unknown_ids`.
 from __future__ import annotations
 
 import os
-from typing import Dict, FrozenSet, Iterable, List, Optional
+from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 ENV_VAR = "SCHEDULER_JOB_ALLOWLIST"
 
@@ -45,6 +56,14 @@ PROCESS_LOOP_IDS: FrozenSet[str] = frozenset(
     {AGENT_WEBHOOK_RETRY_WORKER, MERCHANT_WEBHOOK_RETRY_WORKER, PHOTO_CLEANUP_LOOP}
 )
 
+#: The explicit "every job" entry — required to run everything on a non-production worker.
+ALL_JOBS = "*"
+
+SOURCE_UNSET = "unset"
+SOURCE_ENV = "env"
+SOURCE_ALL = "all"
+SOURCE_FAIL_CLOSED = "fail_closed_non_production"
+
 KIND_SCHEDULER_JOB = "scheduler_job"
 KIND_PROCESS_LOOP = "process_loop"
 
@@ -52,6 +71,9 @@ KIND_PROCESS_LOOP = "process_loop"
 _SKIPPED: Dict[str, str] = {}
 # Listed ids that matched no known job at the last scheduler boot.
 _UNKNOWN: List[str] = []
+# The fail-closed ERROR is logged once per process, not once per caller (scheduler boot, three
+# loop gates, every health poll).
+_FAIL_CLOSED_LOGGED = False
 
 
 def parse_allowlist(raw: Optional[str]) -> Optional[FrozenSet[str]]:
@@ -61,8 +83,51 @@ def parse_allowlist(raw: Optional[str]) -> Optional[FrozenSet[str]]:
     return frozenset(part.strip() for part in raw.split(",") if part.strip())
 
 
+def _worker_flag_explicitly_true() -> bool:
+    # The same truthy spellings services.audit_scheduler._queue_worker_enabled accepts.
+    return (os.getenv("AUDIT_WORKER_ENABLED") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _fail_closed_applies() -> bool:
+    if not _worker_flag_explicitly_true():
+        return False
+    from config.platform import platform_env
+
+    return platform_env() != "production"
+
+
+def _log_fail_closed_once() -> None:
+    global _FAIL_CLOSED_LOGGED
+    if _FAIL_CLOSED_LOGGED:
+        return
+    _FAIL_CLOSED_LOGGED = True
+    from config.platform import platform_env
+    from utils.logger import logger as operator_logger
+
+    operator_logger.error(
+        "scheduler_job_allowlist: AUDIT_WORKER_ENABLED is explicitly true on a NON-PRODUCTION "
+        "service (platform_env=%s) and %s is unset or blank, so NO scheduler job and no boot "
+        "loop will start. Set it to the job ids this worker should run, or to %r to run every "
+        "job. See docs/runbooks/scheduler_job_allowlist.md.",
+        platform_env(), ENV_VAR, ALL_JOBS,
+    )
+
+
+def resolve_allowlist() -> Tuple[Optional[FrozenSet[str]], str]:
+    """(allowlist, source). allowlist None means NO FILTER; a frozenset is the ids allowed."""
+    parsed = parse_allowlist(os.getenv(ENV_VAR))
+    if parsed is not None:
+        if ALL_JOBS in parsed:
+            return None, SOURCE_ALL
+        return parsed, SOURCE_ENV
+    if _fail_closed_applies():
+        _log_fail_closed_once()
+        return frozenset(), SOURCE_FAIL_CLOSED
+    return None, SOURCE_UNSET
+
+
 def active_allowlist() -> Optional[FrozenSet[str]]:
-    return parse_allowlist(os.getenv(ENV_VAR))
+    return resolve_allowlist()[0]
 
 
 def is_allowed(job_id: str, allowlist: Optional[FrozenSet[str]]) -> bool:
@@ -105,18 +170,21 @@ def skipped_ids() -> List[str]:
 
 
 def diagnostics() -> Dict[str, object]:
-    """Fields for /__scheduler_health. EMPTY when the allowlist is unset, so the endpoint's
-    response is unchanged for every process that does not set it."""
-    allowlist = active_allowlist()
-    if allowlist is None:
+    """Fields for /__scheduler_health. EMPTY when the allowlist is unset (and not failing
+    closed), so the endpoint's response is unchanged for every such process."""
+    allowlist, source = resolve_allowlist()
+    if source == SOURCE_UNSET:
         return {}
     return {
-        "job_allowlist": sorted(allowlist),
+        "job_allowlist": [ALL_JOBS] if allowlist is None else sorted(allowlist),
+        "job_allowlist_source": source,
         "skipped_by_allowlist": skipped_ids(),
         "job_allowlist_unknown_ids": list(_UNKNOWN),
     }
 
 
 def _reset_for_tests() -> None:
+    global _FAIL_CLOSED_LOGGED
     _SKIPPED.clear()
     _UNKNOWN.clear()
+    _FAIL_CLOSED_LOGGED = False

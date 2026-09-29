@@ -301,12 +301,23 @@ the unfenced bulk sweeps and must never be alerted on.
 ## Arming it
 
 The poller runs **only on the worker service**. `_add_job` registers nothing unless
-`services.audit_scheduler._queue_worker_enabled()` is true. The claim has no environment filter,
-so what keeps a staging worker off production purchases is that staging has its own database:
-prod and staging run separate Cloud SQL instances (`infra/gcp/README.md`, verified 2026-09-29).
-The gate dates from the Railway era, when they shared one Postgres and a staging service would
-have poached production purchases and spent a buyer's card with staging code; it still keeps the
-poller off staging/preview services by default.
+`services.audit_scheduler._queue_worker_enabled()` is true. The claim has no environment filter.
+Prod and staging run separate Cloud SQL instances (`infra/gcp/README.md`, verified 2026-09-29),
+so a staging worker cannot reach **prod's** rows — but that is NOT enough to keep it off
+production purchases: **staging's database is a restored copy of production.** Every production
+purchase that was `resolving`, `quoting`, `needs_enrollment`, `awaiting_approval` or `processing`
+when the copy was taken is in it, with the buyer's email and address, and an armed staging
+poller would claim it and call `create_enrollment` (Reap emails that real buyer),
+`request_quote` and `create_checkout`. Arming on staging therefore requires the **Staging
+pre-flight** below. The gate itself dates from the Railway era, when prod and staging shared one
+Postgres; it still keeps the poller off staging/preview services by default.
+
+Code guard, in addition: outside production (`platform_env()` ≠ production) the poller's step 4
+runs only when `REAP_API_BASE_URL`'s host is exactly `sandbox.api.reap.global` or
+`mx.sandbox.api.reap.global` (`rc.is_sandbox_base_url`). Any other host — `prod.api.reap.global`,
+a suffix like `x.sandbox.api.reap.global` — reports `skipped_disabled=1` and logs one ERROR on the
+`pivota` logger per process; the sweeps still run. It is a backstop, not a substitute for the
+pre-flight: the sandbox would still be asked to enroll and quote production buyers' rows.
 
 **Pre-flight before arming any worker:** confirm its `DATABASE_URL` host is its own project's
 instance (prod `10.25.0.2`, staging `10.122.0.3`) — compare host and database name only, never
@@ -318,12 +329,92 @@ print the URL. A staging worker pointed at prod's URL would bring the poaching h
 > `docs/` on the scheduler lane; this is the same gap that left `catalog_import_drain_tick`
 > registered on an undeployed worker.
 
+### Staging pre-flight (MANDATORY before `REAP_AGENTIC_ENABLED=1` on staging)
+
+**a. Count.** Read-only, through a one-off Cloud Run job in the staging project (the database is
+on a private VPC address; `scripts/ops/run_oneoff_job.sh` is the way in — read the `DATABASE_URL`
+secretKeyRef off the staging worker rather than trusting the name below, and keep `@` out of the
+program so the script's `--args` delimiter choice stays deterministic):
+
+```
+cat > /tmp/reap_staging_preflight.py <<'EOF'
+import asyncio, os, sys
+from urllib.parse import urlparse
+import asyncpg
+
+TERMINAL = ["completed", "failed", "refused", "expired"]
+
+async def main():
+    url = os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://")
+    u = urlparse(url)
+    print("db host", u.hostname, "db name", u.path.lstrip("/"))   # host + name only, never the URL
+    c = await asyncpg.connect(url)
+    try:
+        await c.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+        purchases = await c.fetch(
+            "SELECT state, count(*) AS n, count(buyer_email) AS with_email "
+            "FROM reap_agentic_purchases WHERE state <> ALL($1::text[]) "
+            "GROUP BY state ORDER BY state", TERMINAL)
+        enrollments = await c.fetch(
+            "SELECT status, count(*) AS n FROM reap_agentic_enrollments "
+            "WHERE status IN ('pending', 'active') GROUP BY status ORDER BY status")
+    finally:
+        await c.close()
+    for r in purchases:
+        print("non-terminal purchase", r["state"], r["n"], "with_email", r["with_email"])
+    for r in enrollments:
+        print("live enrollment", r["status"], r["n"])
+    if purchases or enrollments:
+        print("STOP: live rows present")
+        sys.exit(3)
+    print("CLEAR: no non-terminal purchase, no pending/active enrollment")
+
+asyncio.run(main())
+EOF
+PROJECT=pivota-staging \
+ENV_VARS=PIVOTA_ENV=staging,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600 \
+SECRETS=DATABASE_URL=<staging worker's DATABASE_URL secret>:latest \
+  scripts/ops/run_oneoff_job.sh -c "$(cat /tmp/reap_staging_preflight.py)"
+```
+
+The **exit code is the verdict** (0 = CLEAR, non-zero = STOP or a failed run); the printed host
+must be staging's (`10.122.0.3`).
+
+**b. Scrub, or STOP.** If anything is live, either stop here, or — with the rail owner's explicit
+go, announced before it runs — terminalise and scrub those rows in the **staging** database only,
+the way a terminal transition does (`db/reap_agentic_ledger.py`: PII and claim columns nulled,
+`terminal_at` stamped):
+
+```sql
+UPDATE reap_agentic_purchases
+   SET state = 'refused', last_error_code = 'staging_preflight_scrub',
+       shipping_address = NULL, buyer_email = NULL, offer_code = NULL,
+       claimed_by = NULL, claimed_at = NULL, next_poll_at = NULL,
+       terminal_at = clock_timestamp(), state_entered_at = clock_timestamp(),
+       updated_at = clock_timestamp()
+ WHERE state NOT IN ('completed', 'failed', 'refused', 'expired');
+UPDATE reap_agentic_enrollments
+   SET status = 'dead', hosted_url = NULL, hosted_url_expires_at = NULL, updated_at = now()
+ WHERE status IN ('pending', 'active');
+```
+
+Then re-run (a) until it exits 0. Never run this against production.
+
+**c. Sandbox only.** `REAP_API_BASE_URL` must be exactly `https://sandbox.api.reap.global` (or
+`https://mx.sandbox.api.reap.global`), and `REAP_API_KEY` a sandbox key. The poller refuses any
+other host outside production (above), but check it before arming rather than discovering it in
+the ERROR line.
+
+### Steps
+
 1. Deploy the worker service.
 2. `AUDIT_WORKER_ENABLED=true` on it (or let the service-name detection decide; the gate is
-   fail-safe toward ENABLED, so an unknown platform stays on). A worker that should run ONLY
-   this poller (the staging partner demo) also sets
-   `SCHEDULER_JOB_ALLOWLIST=reap_agentic_purchase_poll`; see
-   `docs/runbooks/scheduler_job_allowlist.md`.
+   fail-safe toward ENABLED, so an unknown platform stays on). **On staging, set it in the same
+   command as `SCHEDULER_JOB_ALLOWLIST=reap_agentic_purchase_poll`** — one revision, never two —
+   using the exact command in `docs/runbooks/scheduler_job_allowlist.md` ("Arm the worker").
+   Outside production a worker with the flag explicitly true and no allowlist starts nothing.
+   To undo, set `AUDIT_WORKER_ENABLED=false` (or `REAP_AGENTIC_ENABLED=0`); never remove the
+   allowlist while the flag is true.
 3. `REAP_API_BASE_URL` + `REAP_API_KEY` — both, or `is_configured()` is false and every run
    returns `skipped_disabled=1`.
 4. `REAP_AGENTIC_ENABLED=1`. **This is the arming step.** No redeploy and no scheduler restart:

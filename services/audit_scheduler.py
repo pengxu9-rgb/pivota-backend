@@ -319,8 +319,10 @@ def _allowlist_diagnostics() -> dict:
     try:
         from services.scheduler_job_allowlist import diagnostics
         return diagnostics()
-    except Exception:  # noqa: BLE001 — diagnostics must never break the health endpoint
-        return {}
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never break the health endpoint
+        # NOT `{}`: that is exactly what an unset allowlist reports, so a broken read would
+        # look like "no filter" on the one page an operator checks. Type only, no message.
+        return {"job_allowlist_error": type(exc).__name__}
 
 
 def _queue_worker_enabled() -> bool:
@@ -402,7 +404,8 @@ async def start_scheduler() -> None:
         from services import scheduler_job_allowlist as job_allowlist
 
         # SCHEDULER_JOB_ALLOWLIST (services/scheduler_job_allowlist.py): None when unset/empty,
-        # which is NO FILTER — every branch below that consults it is then a no-op.
+        # which is NO FILTER — every branch below that consults it is then a no-op. Outside
+        # production with AUDIT_WORKER_ENABLED explicitly true, unset means ALLOW-NOTHING.
         allowlist = job_allowlist.active_allowlist()
         job_allowlist.begin_scheduler_boot()
         # Every id `_add_job` is asked for on a worker, registered or not — what an allowlist

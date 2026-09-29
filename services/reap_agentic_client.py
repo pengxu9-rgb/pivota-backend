@@ -427,6 +427,24 @@ def simulate_checkout_header(
     return {SIMULATE_CHECKOUT_HEADER: SIMULATE_CHECKOUT_VALUE}
 
 
+def is_sandbox_base_url(raw: Optional[str] = None) -> bool:
+    """True only when the base URL (`raw`, else REAP_API_BASE_URL) passes `validate_base_url` AND
+    its hostname is EXACTLY one of `SIMULATE_CHECKOUT_SANDBOX_HOSTS`. Never raises.
+
+    The poller's outside-production guard (jobs/reap_agentic_purchase_poll.py): staging is a
+    restored copy of production, so an armed staging poller pointed at `prod.api.reap.global`
+    would drive production buyers' rows against the real rail.
+    """
+    url = raw if raw is not None else base_url()
+    if not url or not url.strip():
+        return False
+    try:
+        host = (urlparse(validate_base_url(url.strip())).hostname or "").lower()
+    except ReapConfigError:
+        return False
+    return host in SIMULATE_CHECKOUT_SANDBOX_HOSTS
+
+
 #: Reap retains an idempotency key for 24 h, but a quote's `expiresAt` is roughly 5 minutes. A
 #: key derived from the body ALONE therefore replays a long-dead quote to the same cart the next
 #: day -- the caller gets a 200 carrying an expired `expiresAt` and prices that may have moved.

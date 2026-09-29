@@ -402,6 +402,47 @@ async def test_the_gate_is_an_allowlist_not_a_denylist(monkeypatch, reap, value)
     assert reap.calls == []
 
 
+@pytest.mark.parametrize("pivota_env,base,armed", [
+    ("staging", "https://prod.api.reap.global", False),
+    ("staging", "https://mx.prod.api.reap.global", False),
+    ("staging", "https://x.sandbox.api.reap.global", False),   # exact host, not a suffix
+    ("development", "https://prod.api.reap.global", False),
+    ("staging", "https://sandbox.api.reap.global", True),
+    ("staging", "https://mx.sandbox.api.reap.global", True),
+    ("production", "https://prod.api.reap.global", True),       # production is unchanged
+])
+async def test_outside_production_step_4_runs_only_against_an_exact_sandbox_host(
+    monkeypatch, reap, pivota_env, base, armed
+):
+    """Staging is a RESTORED COPY of production: an armed staging poller pointed at the real rail
+    would claim production buyers' rows and enroll (Reap emails the buyer), quote and check out.
+    Outside production, step 4 needs an exact sandbox host; the sweeps still run either way."""
+    await _start()
+    monkeypatch.setenv("PIVOTA_ENV", pivota_env)
+    monkeypatch.setenv("REAP_API_BASE_URL", base)
+    report = await _run()
+    if armed:
+        assert report.skipped_disabled == 0
+        assert report.claimed == 1
+    else:
+        assert report.skipped_disabled == 1
+        assert report.claimed == 0
+        assert reap.calls == []
+
+
+async def test_the_non_sandbox_refusal_is_one_error_through_the_pivota_logger(monkeypatch, reap):
+    await _start()
+    monkeypatch.setenv("PIVOTA_ENV", "staging")
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://prod.api.reap.global")
+    with root_as_in_prod(), capture_pivota_stdout() as buf:
+        await _run()
+        await _run()
+    lines = [ln for ln in pivota_lines(buf) if "not exactly a Reap sandbox host" in ln]
+    assert len(lines) == 1, pivota_lines(buf)
+    assert " ERROR - " in lines[0]
+    assert "sk_test_key" not in buf.getvalue()
+
+
 # ══ 2. one step, and no claim left behind ═════════════════════════════════════════════════════
 
 

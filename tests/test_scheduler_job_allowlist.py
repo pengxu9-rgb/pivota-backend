@@ -41,8 +41,13 @@ MAIN_WORKER_JOB_IDS = [
 
 _ENV_KEYS = (
     "AUDIT_WORKER_ENABLED", "RAILWAY_SERVICE_NAME", "RAILWAY_ENVIRONMENT",
-    allowlist_mod.ENV_VAR,
+    "RAILWAY_ENVIRONMENT_NAME", "PIVOTA_ENV", "PIVOTA_SERVICE_NAME", "K_SERVICE", "K_REVISION",
+    "K_CONFIGURATION", allowlist_mod.ENV_VAR,
 )
+_HEALTH_KEYS = {
+    "job_allowlist", "job_allowlist_source", "skipped_by_allowlist", "job_allowlist_unknown_ids",
+    "job_allowlist_error",
+}
 
 
 # --- the parser: accepting and refusing examples ------------------------------------------
@@ -155,13 +160,21 @@ async def _start(monkeypatch, sched, **env):
     {allowlist_mod.ENV_VAR: "   "},             # whitespace only
 ])
 async def test_unset_registers_exactly_mains_job_set(monkeypatch, clean_state, env):
-    rec = await _start(monkeypatch, clean_state, AUDIT_WORKER_ENABLED="true", **env)
+    rec = await _start(
+        monkeypatch, clean_state, PIVOTA_ENV="production", AUDIT_WORKER_ENABLED="true", **env,
+    )
     assert rec.ids == MAIN_WORKER_JOB_IDS
     assert runner.registered_job_ids() == sorted(MAIN_WORKER_JOB_IDS)
     assert allowlist_mod.skipped_ids() == []
     # The health payload carries no allowlist keys at all: byte-identical to main's.
     diag = clean_state.scheduler_diagnostics()
-    assert not {"job_allowlist", "skipped_by_allowlist", "job_allowlist_unknown_ids"} & set(diag)
+    assert not _HEALTH_KEYS & set(diag)
+
+
+async def test_unset_on_a_local_default_worker_registers_mains_job_set(monkeypatch, clean_state):
+    """No PIVOTA_ENV and no worker flag: the fail-safe-ENABLED local default, unchanged."""
+    rec = await _start(monkeypatch, clean_state)
+    assert rec.ids == MAIN_WORKER_JOB_IDS
 
 
 async def test_unset_on_staging_still_registers_nothing(monkeypatch, clean_state):
@@ -210,6 +223,7 @@ async def test_health_reports_allowlist_skipped_and_unknown(monkeypatch, clean_s
     assert [j["id"] for j in body["jobs"]] == [REAP]
     assert body["job_count"] == 1
     assert body["job_allowlist"] == sorted([REAP, "REAP_AGENTIC_PURCHASE_POLL"])
+    assert body["job_allowlist_source"] == "env"
     assert body["job_allowlist_unknown_ids"] == ["REAP_AGENTIC_PURCHASE_POLL"]
     assert body["skipped_by_allowlist"] == sorted(set(MAIN_WORKER_JOB_IDS) - {REAP})
     assert "settlement_file_transfer" in body["skipped_by_allowlist"]
@@ -268,8 +282,108 @@ async def test_valid_allowlist_logs_the_active_line_and_no_unknown_warning(monke
 
 async def test_unset_logs_nothing_about_an_allowlist(monkeypatch, clean_state):
     with root_as_in_prod(), capture_pivota_stdout() as buf:
-        await _start(monkeypatch, clean_state, AUDIT_WORKER_ENABLED="true")
-    assert not [ln for ln in pivota_lines(buf) if "ALLOWLIST" in ln]
+        await _start(monkeypatch, clean_state, PIVOTA_ENV="production", AUDIT_WORKER_ENABLED="true")
+    assert not [ln for ln in pivota_lines(buf) if "ALLOWLIST" in ln.upper()]
+
+
+# --- set but naming no ids: allow nothing (item: surviving mutants) -----------------------
+
+
+@pytest.mark.parametrize("pivota_env", ["production", "staging"])
+async def test_commas_only_registers_nothing_and_wraps_nothing(monkeypatch, clean_state, pivota_env):
+    rec = await _start(
+        monkeypatch, clean_state,
+        PIVOTA_ENV=pivota_env, AUDIT_WORKER_ENABLED="true", SCHEDULER_JOB_ALLOWLIST=",",
+    )
+    assert rec.ids == []
+    assert runner.registered_job_ids() == []
+    assert allowlist_mod.skipped_ids() == sorted(MAIN_WORKER_JOB_IDS)
+
+
+# --- fail closed outside production -------------------------------------------------------
+
+
+@pytest.mark.parametrize("pivota_env", ["staging", "development"])
+@pytest.mark.parametrize("raw", [None, "", "   "])
+async def test_non_production_worker_with_no_allowlist_starts_nothing(
+    monkeypatch, clean_state, pivota_env, raw
+):
+    """deploy_worker.sh CONFIG=apply replaces the whole env, gcloud can empty `,`, the console can
+    clear the field: on a non-production worker a vanished allowlist must not mean every job."""
+    env = {} if raw is None else {allowlist_mod.ENV_VAR: raw}
+    with root_as_in_prod(), capture_pivota_stdout() as buf:
+        rec = await _start(
+            monkeypatch, clean_state, PIVOTA_ENV=pivota_env, AUDIT_WORKER_ENABLED="true", **env,
+        )
+        spawned = _record_spawns(monkeypatch)
+        await _start_loops(monkeypatch)
+        diag = clean_state.scheduler_diagnostics()
+    assert rec.ids == []
+    assert runner.registered_job_ids() == []
+    assert spawned == []
+    errors = [ln for ln in pivota_lines(buf) if " ERROR - " in ln and "NON-PRODUCTION" in ln]
+    assert len(errors) == 1, pivota_lines(buf)
+    assert diag["job_allowlist"] == []
+    assert diag["job_allowlist_source"] == "fail_closed_non_production"
+    assert set(ALL_LOOPS) <= set(diag["skipped_by_allowlist"])
+
+
+@pytest.mark.parametrize("raw", ["*", " * ", "*,", f"*,{REAP}"])
+async def test_star_is_the_explicit_opt_in_to_every_job_outside_production(
+    monkeypatch, clean_state, raw
+):
+    rec = await _start(
+        monkeypatch, clean_state,
+        PIVOTA_ENV="staging", AUDIT_WORKER_ENABLED="true", SCHEDULER_JOB_ALLOWLIST=raw,
+    )
+    assert rec.ids == MAIN_WORKER_JOB_IDS
+    spawned = _record_spawns(monkeypatch)
+    await _start_loops(monkeypatch)
+    assert spawned == ALL_LOOPS
+    diag = clean_state.scheduler_diagnostics()
+    assert diag["job_allowlist"] == ["*"] and diag["job_allowlist_source"] == "all"
+    assert diag["skipped_by_allowlist"] == []
+
+
+@pytest.mark.parametrize("flag", [None, "false", "0", ""])
+async def test_non_production_service_without_an_explicit_worker_flag_is_unchanged(
+    monkeypatch, clean_state, flag
+):
+    """Staging `web` (flag unset) and today's staging `worker` (flag false): the new rule must not
+    refuse anything they do today — their webhook loops keep starting, nothing is logged."""
+    env = {} if flag is None else {"AUDIT_WORKER_ENABLED": flag}
+    with root_as_in_prod(), capture_pivota_stdout() as buf:
+        # K_SERVICE: a deployed Cloud Run service, which is what turns the worker gate off on
+        # staging when the flag is not set (the same answer main gives).
+        rec = await _start(
+            monkeypatch, clean_state,
+            PIVOTA_ENV="staging", PIVOTA_SERVICE_NAME="web", K_SERVICE="web", **env,
+        )
+        spawned = _record_spawns(monkeypatch)
+        await _start_loops(monkeypatch)
+        diag = clean_state.scheduler_diagnostics()
+    assert rec.ids == []
+    assert spawned == ALL_LOOPS
+    assert not _HEALTH_KEYS & set(diag)
+    assert not [ln for ln in pivota_lines(buf) if "allowlist" in ln.lower()]
+
+
+async def test_production_worker_without_an_allowlist_is_unchanged(monkeypatch, clean_state):
+    rec = await _start(monkeypatch, clean_state, PIVOTA_ENV="production", AUDIT_WORKER_ENABLED="true")
+    spawned = _record_spawns(monkeypatch)
+    await _start_loops(monkeypatch)
+    assert rec.ids == MAIN_WORKER_JOB_IDS
+    assert spawned == ALL_LOOPS
+
+
+async def test_a_broken_allowlist_read_is_not_reported_as_unset(monkeypatch, clean_state):
+    def boom():
+        raise RuntimeError("secret detail that must not leak")
+
+    monkeypatch.setattr(allowlist_mod, "diagnostics", boom)
+    diag = clean_state.scheduler_diagnostics()
+    assert diag["job_allowlist_error"] == "RuntimeError"
+    assert "secret detail" not in repr(diag)
 
 
 # --- the boot-time process loops started outside APScheduler ------------------------------
@@ -309,6 +423,14 @@ async def _start_loops(monkeypatch):
 
 
 ALL_LOOPS = ["agent_webhook_retry_worker", "merchant_webhook_retry_worker", "photo_cleanup_loop"]
+
+
+async def test_process_loops_start_nothing_with_commas_only(monkeypatch, clean_state):
+    monkeypatch.setenv(allowlist_mod.ENV_VAR, ",")
+    spawned = _record_spawns(monkeypatch)
+    await _start_loops(monkeypatch)
+    assert spawned == []
+    assert allowlist_mod.skipped_ids() == sorted(ALL_LOOPS)
 
 
 async def test_process_loops_all_start_when_unset(monkeypatch, clean_state):

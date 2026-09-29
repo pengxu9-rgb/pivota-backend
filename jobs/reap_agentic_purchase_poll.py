@@ -152,6 +152,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 import db.reap_agentic_ledger as ledger
+from config.platform import is_production
 import services.reap_agentic_client as rc
 import services.reap_agentic_purchase as purchase_svc
 from db.database import database
@@ -711,6 +712,23 @@ async def run_reap_agentic_purchase_poll(
             purchase_svc.is_enabled(),
             rc.is_configured(),
         )
+        return _report()
+
+    # OUTSIDE PRODUCTION, ONLY THE SANDBOX. Staging is a RESTORED COPY of production, so the rows
+    # this step would claim can be real buyers' purchases, and `advance` would then enroll (Reap
+    # emails the buyer), quote and check out on whatever host REAP_API_BASE_URL names. Anywhere
+    # but production, step 4 therefore runs only against an exact sandbox host. Same effect as
+    # the dial being off — the sweeps above still ran — plus one ERROR per process.
+    if not is_production() and not rc.is_sandbox_base_url():
+        counts["skipped_disabled"] = 1
+        if "non_sandbox_outside_production" not in _WARNED_DIALS:
+            _WARNED_DIALS.add("non_sandbox_outside_production")
+            operator_logger.error(
+                "reap_agentic_poll: REAP_AGENTIC_ENABLED is on outside production but "
+                "REAP_API_BASE_URL is not exactly a Reap sandbox host (%s); step 4 will not "
+                "run. See docs/runbooks/reap_agentic_purchase.md.",
+                ", ".join(sorted(rc.SIMULATE_CHECKOUT_SANDBOX_HOSTS)),
+            )
         return _report()
 
     if _budget_spent():
