@@ -1932,6 +1932,81 @@ async def _guard_canonical_owner(
     return plan, counts
 
 
+#: What the upsert KEEPS on an existing row: `_PDP_UPSERT_SQL`'s DO UPDATE never sets title or description,
+#: so a re-crawl leaves the stored copy (e.g. a description a backfill filled from the product page) in place.
+#: A SUPPRESSED row is left out: a thin re-crawl must not re-stage a tombstone from its stored copy (the
+#: description backfill refuses them for the same reason, #2429); it keeps the plan's stage as before.
+_KEPT_COPY_SQL = """
+                SELECT product_key, title, description
+                FROM catalog_products
+                WHERE product_key = ANY(:keys) AND suppressed_at IS NULL
+                """
+
+
+async def _stage_from_kept_copy(
+    plan: Dict[str, Any], database: Any,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Judge each existing row's lifecycle stage by the copy the upsert will actually leave on it. Returns
+    (plan, counts).
+
+    WHY. The plan's pdp_lifecycle_stage is computed at ingest from the CRAWLED body
+    (ingestion._lifecycle_stage_for_agent_pdp), but `_PDP_UPSERT_SQL` keeps the stored title and
+    description and writes that stage. A store whose body_html is its title plus images (koolseoul,
+    tartecosmetics.com) therefore re-crawled a backfilled row -- stored copy 140+ chars, published --
+    back to draft, and nothing restores it: the description backfill selects only rows under 50 chars.
+    Measured 2026-09-29: 279 rows filled that day were one re-crawl from that.
+
+    The stage is recomputed with compute_lifecycle_stage over the planned row with the STORED title and
+    description, for rows that exist. Everything else stays the plan's -- image, category, tags -- so a
+    product that loses its image or its category still drops, and the ingest's own category rule is
+    kept: a planned row whose category does not resolve stays draft whatever its copy. A new row, or one
+    whose stored copy is the planned copy, is untouched and triggers nothing but the one lookup.
+
+    `counts["pdp_stage_from_kept_copy_planned"]` tallies PLANNED rows whose stage changed (a row the identity
+    gate or an insert failure later skips is still counted); it is present only when a stage changed, so an
+    apply with nothing to say reports as before.
+
+    Measured before shipping (prod, 2026-09-29, 15,301 live ingest rows): 0 rows are under-staged against
+    their stored copy (nothing to restore), and 0 rows at candidate or above hold a blank title or a
+    description under 50 chars (nothing this demotes on its next re-crawl). The 2,128 stored rows whose stage
+    exceeds what their copy earns all fail only ingestion's category rule, which this does not change."""
+    counts: Dict[str, Any] = {}
+    pdps = plan.get("pdps") or []
+    keys = sorted({str(p.get("product_key")) for p in pdps if p.get("product_key")})
+    if not keys:
+        return plan, counts
+    rows = await database.fetch_all(_KEPT_COPY_SQL, {"keys": keys})
+    stored_by_key = {str(dict(r).get("product_key") or ""): dict(r) for r in rows or []}
+    if not stored_by_key:
+        return plan, counts
+    from services.category_path_aliases import resolve
+    from services.pdp_lifecycle import compute_lifecycle_stage
+
+    changed: Dict[str, int] = {}
+    out_pdps = []
+    for pdp in pdps:
+        stored = stored_by_key.get(str(pdp.get("product_key") or ""))
+        if stored is None or not resolve(pdp.get("category_path")):
+            out_pdps.append(pdp)
+            continue
+        kept_title, kept_description = stored.get("title"), stored.get("description")
+        if kept_title == pdp.get("title") and kept_description == pdp.get("description"):
+            out_pdps.append(pdp)
+            continue
+        stage = compute_lifecycle_stage({**pdp, "title": kept_title, "description": kept_description})
+        if stage != pdp.get("pdp_lifecycle_stage"):
+            key = f"{pdp.get('pdp_lifecycle_stage')}->{stage}"
+            changed[key] = changed.get(key, 0) + 1
+            pdp = {**pdp, "pdp_lifecycle_stage": stage}
+        out_pdps.append(pdp)
+    if not changed:
+        return plan, counts
+    plan = dict(plan)
+    plan["pdps"] = out_pdps
+    counts["pdp_stage_from_kept_copy_planned"] = dict(sorted(changed.items()))
+    return plan, counts
+
+
 async def apply_ingest_plan(
     plan: Dict[str, Any],
     *,
@@ -2002,6 +2077,9 @@ async def _apply_ingest_plan(
     plan = await _prepare_seller_of_record(plan, database)
     # BOTH executors: the guard rewrites the planned rows before either one writes them.
     plan, owner_counts = await _guard_canonical_owner(plan, database, market=market)
+    # BOTH executors too: the stage the upsert writes must describe the copy the upsert keeps.
+    plan, stage_counts = await _stage_from_kept_copy(plan, database)
+    owner_counts = {**owner_counts, **stage_counts}
 
     if batch:
         counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database)
