@@ -1151,3 +1151,100 @@ def test_REFUSE_two_url_variants_even_with_nothing_else_to_disagree() -> None:
         assert named_cart_variant_id(bare, product_urls=urls, shop_domain=JUDY_HOST) is None, urls
     same_twice = [f"{base}?variant={JUDY_VARIANT}", f"{base}?variant={JUDY_VARIANT}&x=1"]
     assert named_cart_variant_id(bare, product_urls=same_twice, shop_domain=JUDY_HOST) == JUDY_VARIANT
+
+
+# ---------------------------------------------------------------- variant title = merchant text
+#
+# The proof's `variant_title` is typed by the MERCHANT and reaches CartLinkItem, the purchase row
+# and the 202/replay bodies. One rule (`services.text_normalization.clean_display_text`, via
+# `clean_variant_title`) runs at the WRITER (build_cart_proof) and again at the READER
+# (verified_cart_variant_id), so a proof written before the rule is cleaned on read.
+
+from services.shopify_variant_identity import MAX_VARIANT_TITLE, clean_variant_title  # noqa: E402
+from services.text_normalization import clean_display_text  # noqa: E402
+
+
+def _written_title(title: Any) -> Any:
+    """What the backfill WRITES into the proof when the storefront titles the named shade so."""
+    return _backfilled(_judy_js(**{JUDY_VARIANT: {"title": title}}))["snapshot"]["shopify_cart_proof"]["variant_title"]
+
+
+def _read_title(title: Any) -> Any:
+    """What the verifier READS back from a proof that already holds `title` (an OLD proof)."""
+    seed = _backfilled()
+    seed["snapshot"]["shopify_cart_proof"]["variant_title"] = title
+    return _verify(seed).variant_title
+
+
+@pytest.mark.parametrize("title", [
+    "07 BURGUNDY INK", "Default Title", "30 ml / Rose", "Café Crème", "Größe 2 · 50 ml",
+    "樱花 01", "Shade 💄 Red", "<b>Rose</b> & \"Co\"",
+])
+def test_a_real_title_is_written_and_read_unchanged(title: str) -> None:
+    """Real titles, HTML included (escaping is the renderer's job), pass through both ends."""
+    assert _written_title(title) == title
+    assert _read_title(title) == title
+
+
+@pytest.mark.parametrize("dirty,clean", [
+    ("07\nBURGUNDY INK", "07 BURGUNDY INK"),          # Cc whitespace -> ONE space, not glued
+    ("07\tBURGUNDY  \r\n INK", "07 BURGUNDY INK"),    # a run of mixed whitespace -> one space
+    ("07 BURG\x00UNDY\x7f INK\x85", "07 BURGUNDY INK"),  # Cc non-whitespace dropped; NEL folded
+    ("07 ‮BURGUNDY INK", "07 BURGUNDY INK"),     # Cf: RIGHT-TO-LEFT OVERRIDE
+    ("‪‫‬‭07 BURGUNDY INK", "07 BURGUNDY INK"),  # Cf: the other embeddings
+    ("⁦07 BURGUNDY INK⁩", "07 BURGUNDY INK"),  # Cf: bidi isolates
+    ("07 BURG​UNDY INK", "07 BURGUNDY INK"),     # Cf: ZERO WIDTH SPACE
+    ("﻿07 BURGUNDY INK", "07 BURGUNDY INK"),     # Cf: BOM / ZWNBSP
+    ("07 BURGUNDY INK", "07 BURGUNDY INK"),     # Co: private use
+    ("07 BURGUNDY INK\U000f0000", "07 BURGUNDY INK"),  # Co: supplementary private use
+    ("07 BURGUNDY \ud83dINK", "07 BURGUNDY INK"),     # Cs: a lone surrogate (json "\\ud83d")
+    ("  07 BURGUNDY INK  ", "07 BURGUNDY INK"),       # stripped
+])
+def test_every_unprintable_category_is_removed_at_both_ends(dirty: str, clean: str) -> None:
+    assert _written_title(dirty) == clean
+    assert _read_title(dirty) == clean
+
+
+def test_the_title_is_nfc_normalised_after_the_drop() -> None:
+    """Decomposed "e" + COMBINING ACUTE is stored composed, including when a zero-width space sat
+    between them -- so the rule is idempotent, which the reader re-applying it relies on."""
+    assert clean_variant_title("Café") == "Café"
+    assert clean_variant_title("Cafe​́") == "Café"
+    for raw in ("Cafe​́", "a‮ ​ b", "X" * 199 + " Y", "\n\t"):
+        once = clean_variant_title(raw)
+        assert clean_variant_title(once) == once
+
+
+def test_a_long_title_is_capped_by_code_points_and_never_splits_an_emoji() -> None:
+    assert MAX_VARIANT_TITLE == 200
+    assert _written_title("X" * 300) == _read_title("X" * 300) == "X" * 200
+    edge = "X" * 199 + "💄" + "Y" * 100                # the emoji is code point 200
+    for got in (_written_title(edge), _read_title(edge)):
+        assert got == "X" * 199 + "💄" and len(got) == 200
+        assert json.loads(json.dumps(got)) == got      # a whole surrogate pair on the wire
+        got.encode("utf-8")                            # no lone surrogate survives the cap
+    # dropped characters never spend the budget, and a cut on a space leaves no trailing space
+    assert clean_variant_title("‮" * 50 + "X" * 200) == "X" * 200
+    assert clean_variant_title("X" * 199 + " Y") == "X" * 199
+
+
+@pytest.mark.parametrize("junk", ["\n\t\r", "‮​﻿", "", "⁦⁩ \x00", "", "   "])
+def test_an_all_unprintable_title_is_none_and_the_proof_still_stands(junk: str) -> None:
+    written = _backfilled(_judy_js(**{JUDY_VARIANT: {"title": junk}}))
+    assert written["snapshot"]["shopify_cart_proof"]["variant_title"] is None
+    assert _verify(written) == (JUDY_VARIANT, CART_PROOF_SCOPE_NAMED, None)
+    assert _read_title(junk) is None
+
+
+def test_an_old_proof_with_a_dirty_title_is_cleaned_on_read() -> None:
+    """A proof the backfill wrote BEFORE the rule holds the raw title; the verifier cleans it."""
+    for scope_payload in (None, {"variants": [JUDY_JS["variants"][4]]}):   # named, then sole
+        seed = _backfilled(scope_payload)
+        seed["snapshot"]["shopify_cart_proof"]["variant_title"] = "‮07\nBURGUNDY​ INK"
+        assert _verify(seed).variant_title == "07 BURGUNDY INK"
+
+
+def test_clean_display_text_refuses_non_text_and_honours_its_cap() -> None:
+    for value in (None, 7, {"not": "text"}, ["07"], b"07"):
+        assert clean_display_text(value, max_chars=10) is None
+    assert clean_display_text("abcdef", max_chars=3) == "abc"

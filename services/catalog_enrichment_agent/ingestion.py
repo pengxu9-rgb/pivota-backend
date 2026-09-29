@@ -18,7 +18,8 @@ This revision writes the full chain at ingestion time so agent PDPs are
 shaped identically to merchant-sync PDPs.
 
 Idempotency contract:
-- An official PDP keeps its historical (brand_normalized, canonical_product_name) key.
+- An official PDP keeps its historical (brand_normalized, canonical_product_name) key, except that a
+  name whose slug dropped non-Latin text hashes its full-script identity (derive_product_key).
 - An explicit retailer PDP is keyed by its storefront listing URL; content identity is separate.
 - An SKU is identified by (product_key + '::canonical') — one per PDP.
 - An offer is identified by a deterministic id derived from
@@ -38,6 +39,7 @@ import hashlib
 import json
 import logging
 import re
+import unicodedata
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from services.beauty_external_ranking import (
@@ -160,9 +162,123 @@ def canonical_product_name(brand: Optional[str], product_name: Optional[str]) ->
     """Stable (brand_normalized, product_name_normalized) key. Two PDPs
     with identical brand + product name (modulo punctuation/case) collapse
     to the same key — by design, so the agent can re-run without
-    duplicating rows."""
-    norm = _normalize_token(f"{brand or ''} {product_name or ''}").replace(" ", "-")
+    duplicating rows.
+
+    NFC first: a decomposed "crème" (e + U+0300) would otherwise slug to "cre-me", not the "cr-me"
+    of the composed spelling (prod census 2026-09-29: 2 of 17,315 stored names are not NFC, and
+    NFC moves neither key)."""
+    text = unicodedata.normalize("NFC", f"{brand or ''} {product_name or ''}")
+    norm = _normalize_token(text).replace(" ", "-")
     return norm or "unknown"
+
+
+#: Dropped before anything else: invisible format characters (zero-width space/joiner, soft hyphen,
+#: bidi marks -- category Cf), variation selectors and the keycap mark, none of which the eye sees,
+#: so "자음\u200b생크림" and "자음생크림" are one product.
+_INVISIBLE_RANGES = ((0xFE00, 0xFE0F), (0xE0100, 0xE01EF), (0x20E3, 0x20E3))
+#: Spacing modifier letters (ʼ ʻ ʹ ˆ): apostrophe-like punctuation in Latin names ("Kiehlʼs",
+#: "Hawaiʻi"), read as a word break exactly as the ASCII slug reads "'".
+_MODIFIER_LETTERS = (0x02B0, 0x02FF)
+#: Letters Vietnamese spells words with: diacritics there are lexical everywhere ("mắt" eye / "mặt"
+#: face), unlike the occasional crème, and the ASCII slug reduces both to "m-t".
+_VIETNAMESE_LETTERS = frozenset("ơưđƠƯĐ") | frozenset(chr(c) for c in range(0x1EA0, 0x1EFA))
+
+
+def _is_invisible(ch: str) -> bool:
+    code = ord(ch)
+    return unicodedata.category(ch) == "Cf" or any(lo <= code <= hi for lo, hi in _INVISIBLE_RANGES)
+
+
+def _unit_or_nothing(symbol: str) -> str:
+    """A symbol drops out of the identity -- except a unit sign, which is its letters: "50㎖" is
+    "50ml", "㎎" is "mg". The trademark signs spell letters too ("™" -> "TM") and are dropped."""
+    if symbol in "™℠":
+        return ""
+    spelled = unicodedata.normalize("NFKC", symbol)
+    return spelled if any(ch.isalnum() for ch in spelled) else ""
+
+
+def product_identity_text(brand: Optional[str], product_name: Optional[str]) -> str:
+    """(brand, product name) in every script: symbols and invisible characters dropped (so "Glow™" is
+    "Glow"), NFKC (fullwidth ＭＶ is MV, Ⅱ is ii), casefolded, runs of letters/marks/digits joined by
+    "-". `canonical_product_name` is its ASCII shadow, which keeps nothing of "설화수 자음생크림".
+
+    The digest this feeds depends on the Unicode tables of the running Python
+    (unicodedata.unidata_version); an upgrade that re-categorises a code point in a stored name would
+    move that key."""
+    text = "".join(
+        " " if _MODIFIER_LETTERS[0] <= ord(ch) <= _MODIFIER_LETTERS[1] else _unit_or_nothing(ch)
+        if unicodedata.category(ch).startswith("S") else ch
+        for ch in f"{brand or ''} {product_name or ''}"
+        if not _is_invisible(ch)
+    )
+    text = unicodedata.normalize("NFKC", text).casefold()
+    words = "".join(ch if unicodedata.category(ch)[0] in "LMN" else " " for ch in text)
+    return "-".join(words.split())
+
+
+#: Hex digits of the full-identity digest. The ASCII prefix of an all-Hangul/CJK name is "unknown",
+#: so this digest alone tells such products apart: 8 hex (32 bits) would expect a birthday collision
+#: within ~77k of them, 16 hex needs ~5 billion.
+_IDENTITY_DIGEST_HEX = 16
+
+
+def _script_identity(brand: Optional[str], product_name: Optional[str]) -> Optional[Tuple[str, str]]:
+    """(ASCII prefix, 16-hex sha1 of `product_identity_text`) when the legacy slug cannot stand for
+    the product; None otherwise, and the legacy key applies unchanged.
+
+    The legacy digest hashes the slug, so it carried nothing the slug had lost: ("Sulwhasoo", "자음생크림")
+    and ("Sulwhasoo", "윤조에센스") were both ext:sulwhasoo::971a96b9, every all-CJK name was
+    ext:unknown::50d8b4a9, and ingest UPSERTs by key -- the second product landed its offers, SKUs,
+    URL and image on the first one's row (adversarial review 2026-09-29).
+
+    "Cannot stand for" = the name has a character `_names_the_product` counts, or its slug is empty
+    ("é è" would be ext:unknown:: too). Every existing key not at risk stays byte-identical. Measured on
+    prod 2026-09-29, 6,191 content-keyed enrichment rows: 580 carry non-ASCII; 497 only lose symbols
+    (™ ® –), 82 lose Latin diacritics or superscripts (crème, B², 360º), none has a Vietnamese letter,
+    Roman numeral, circled number, fraction or modifier letter, and 1 (a Cos de BAHA Japanese title,
+    draft) loses non-Latin text -- the only key this changes. The other Latin cases stay on the legacy
+    digest: they collide only when two names differ in nothing but accented letters, and moving 80
+    live keys to close that would duplicate every one of them on its next ingest.
+
+    The prefix is the ASCII slug of the identity text, not of the raw name, so width variants of one
+    product ("ＭＶマルチビタ" / "MVマルチビタ") share the whole key, not only the digest."""
+    # NFC so a decomposed Vietnamese "mặt" (a + U+0323 + U+0302) is the precomposed letter it spells --
+    # after dropping invisibles, which product_identity_text drops too and which would block composition.
+    text = unicodedata.normalize("NFC", "".join(
+        ch for ch in f"{brand or ''} {product_name or ''}" if not _is_invisible(ch)))
+    if not any(_names_the_product(ch) for ch in text) and _normalize_token(text):
+        return None
+    identity = product_identity_text(brand, product_name)
+    if not identity:
+        return None
+    prefix = _normalize_token(identity).replace(" ", "-") or "unknown"
+    return prefix, hashlib.sha1(identity.encode("utf-8")).hexdigest()[:_IDENTITY_DIGEST_HEX]
+
+
+def _names_the_product(ch: str) -> bool:
+    """A character the ASCII slug drops that tells products apart: a letter of a script other than
+    Latin (Hangul, Kana, CJK, Thai, Cyrillic, ... and fullwidth Ｇｌｏｗ), a Vietnamese letter, a
+    non-ASCII digit or numeral (５, Ⅱ, ①, ½). Superscript/subscript forms ("²", the "º" of "360º") and
+    modifier letters (ʼ) are Latin-class residue and stay on the legacy key."""
+    if ch.isascii() or _MODIFIER_LETTERS[0] <= ord(ch) <= _MODIFIER_LETTERS[1]:
+        return False
+    if ch in _VIETNAMESE_LETTERS:
+        return True
+    category = unicodedata.category(ch)
+    if category in ("Nd", "Nl"):
+        return True
+    superscript = unicodedata.decomposition(ch).startswith(("<super>", "<sub>"))
+    if category == "No":
+        return not superscript
+    if category not in ("Lu", "Ll", "Lt", "Lo"):   # Lm (ー, 々) rides with the script letters it modifies
+        return False
+    return not unicodedata.name(ch, "").startswith("LATIN ") and not superscript
+
+
+#: The legacy key of every name whose ASCII slug is empty or literally "unknown". Ingest refuses it
+#: (_build_pdp_payload); the gateway's Reap cart-link lane refuses it too (PIVOTA-Agent #2329/#2330).
+SHARED_UNKNOWN_PRODUCT_KEY = "ext:unknown::" + hashlib.sha1(b"unknown").hexdigest()[:8]
 
 
 #: catalog_products / catalog_skus.source_product_id is VARCHAR(128) (migration 058).
@@ -178,6 +294,12 @@ def bounded_source_product_id(brand: Optional[str], product_name: Optional[str])
     insert failed on the column, and one missing product marked the whole 362-product store job partial.
     No stored row changes: a longer id could never have been written."""
     canonical = canonical_product_name(brand, product_name)
+    script_identity = _script_identity(brand, product_name)
+    if script_identity:
+        # Two same-merchant products that differ only in non-Latin text share `canonical`; without the
+        # digest they would share (merchant_id, platform, source_product_id), a unique index.
+        prefix, digest = script_identity
+        return f"{prefix[:SOURCE_PRODUCT_ID_MAX - 1 - len(digest)]}-{digest}"
     if len(canonical) <= SOURCE_PRODUCT_ID_MAX:
         return canonical
     digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:8]
@@ -195,8 +317,14 @@ def derive_product_key(brand: Optional[str], product_name: Optional[str]) -> str
     """Stable product_key derived from (brand, product_name). Uses a
     deterministic hash to bound the length to the catalog_products
     VARCHAR(255) limit while preserving readability of the prefix.
-    Format: 'ext:<canonical>::<8-char-hash>'."""
+    Format: 'ext:<canonical>::<8-char-hash>', or 'ext:<canonical>::<16-char-hash>' when the ASCII
+    slug cannot stand for the product (see _script_identity) -- the only case where the slug is not
+    the product. Both are at most 214 chars."""
     canonical = canonical_product_name(brand, product_name)
+    script_identity = _script_identity(brand, product_name)
+    if script_identity:
+        prefix, digest = script_identity
+        return f"ext:{prefix[:208 - len(digest)]}::{digest}"
     digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:8]
     # Truncate canonical prefix to keep total length sensible.
     prefix = canonical[:200]
@@ -413,6 +541,16 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         "variants": [v for v in (pdp.get("variants") or []) if isinstance(v, dict)],
     }
     if not payload["brand"] or not payload["product_name"]:
+        return {}
+    # A brand + name made only of symbols ("™" "—") identifies nothing.
+    if not product_identity_text(payload["brand"], payload["product_name"]):
+        return {}
+    # A content-keyed row whose brand + name slug to nothing or to literally "unknown" ("Unknown" "™")
+    # would land on the one key all such rows share. Retailer rows are keyed by their URL
+    # (_build_pdp_insert) and never use this key, so they are not refused for it: a refused record
+    # fails the whole store's primary apply (primary_ingestion: records_skipped).
+    if (pdp.get("source_role") != "retailer"
+            and derive_product_key(payload["brand"], payload["product_name"]) == SHARED_UNKNOWN_PRODUCT_KEY):
         return {}
     return payload
 

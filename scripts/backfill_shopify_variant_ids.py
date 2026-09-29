@@ -138,7 +138,9 @@ from db.database import database  # noqa: E402
 from services.shopify_variant_identity import (  # noqa: E402
     CART_PROOF_SCOPE_NAMED,
     CART_PROOF_SCOPE_SOLE,
+    MAX_VARIANT_TITLE,  # noqa: F401  (re-exported: the cap this script's proofs are written at)
     _numeric_id,
+    clean_variant_title,
     named_cart_variant_id,
     parse_product_js,
     product_js_url,
@@ -389,17 +391,13 @@ async def fetch_product_js(client: Any, url: str) -> Tuple[Optional[Any], str]:
         return None, "unparseable"
 
 
-#: Longest variant title a proof carries. A Shopify variant title is `option1 / option2 / option3`;
-#: anything past this is not a title a buyer is shown.
-MAX_VARIANT_TITLE = 200
-
-
 def _live_title(live_variant: Dict[str, Any]) -> Optional[str]:
     """The live storefront's own title for the proven variant ("07 BURGUNDY INK"), for DISPLAY:
     the buyer never picks the shade on this lane, so the purchase must say which one it buys.
-    Read by nothing that decides what is bought."""
-    title = str(live_variant.get("title") or "").strip()
-    return title[:MAX_VARIANT_TITLE] or None
+    Read by nothing that decides what is bought. Merchant-typed, so it goes through the same
+    `clean_variant_title` the reader applies (controls, bidi and zero-width out; capped at
+    `MAX_VARIANT_TITLE` code points)."""
+    return clean_variant_title(str(live_variant.get("title") or ""))
 
 
 def build_cart_proof(

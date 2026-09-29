@@ -3418,6 +3418,23 @@ async def test_a_replayed_cart_link_purchase_answers_the_same_variant_title(clie
     assert again.json()["variant_title"] == first.json()["variant_title"] == "07 BURGUNDY INK"
 
 
+async def test_an_old_proofs_dirty_variant_title_reaches_nobody_dirty(client, monkeypatch):
+    """The title is merchant-typed storefront text. A proof written BEFORE the display rule (a
+    newline, U+202E, a zero-width space and a private-use glyph in it) is cleaned where it is
+    READ, so the 202 body, the stored row and GET all carry the clean title. HTML stays text."""
+    seed_data = _named_variant_seed()
+    seed_data["snapshot"]["shopify_cart_proof"]["variant_title"] = (
+        "\u202e07\nBURGUNDY\u200b INK\ue000 <b>")
+    await _seed_named_variant_mirror(env="staging", skus=LIVE_STAGING_SKUS, seed_data=seed_data)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert resp.status_code == 202, resp.text
+    purchase = await _purchase_row(resp.json()["purchase_id"])
+    got = await client.get(f"{BASE}/purchases/{resp.json()['purchase_id']}")
+    assert resp.json()["variant_title"] == purchase["variant_title"] == got.json()["variant_title"] \
+        == "07 BURGUNDY INK <b>"
+
+
 async def test_a_named_variant_proof_never_prices_from_the_placeholder(client, monkeypatch):
     """#2457 review: only a SOLE proof may let the `::canonical` product-level offer stand in. On a
     multi-variant product, the placeholder's price is not the named shade's price."""
