@@ -635,7 +635,8 @@ class Store:
             return httpx.Response(404, headers={"content-type": "text/html"}, text="<html>404</html>")
         if spec[0] == "redirect":
             hop_cookies = spec[2] if len(spec) > 2 else ["_shopify_essential=hop; path=/"]
-            return httpx.Response(301, headers=[("location", spec[1] + request.url.path + "?" + request.url.query.decode())]
+            status = spec[3] if len(spec) > 3 else 301
+            return httpx.Response(status, headers=[("location", spec[1] + request.url.path + "?" + request.url.query.decode())]
                                   + [("set-cookie", c) for c in hop_cookies])
         status, payload, currencies = spec[:3]
         extra = list(spec[3]) if len(spec) > 3 else []
@@ -1450,3 +1451,187 @@ async def test_a_rerun_updates_the_recorded_variant_title(job_db):
         await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
                       pacer=NoSleepPacer(), now=lambda: CHECKED + timedelta(hours=1))
     assert (await proofs_by_sku(job_db))[berry]["variant_title"] == "berry (new)"
+
+
+
+# ── review round 2 (#2464): the identity anchor survives, pacing never crashes, redirects ───────
+
+
+async def test_a_404_between_two_readings_does_not_erase_the_product_anchor(job_db):
+    """The reviewer's repro: A ok -> B product_changed -> 404 (knows no product) -> B again. The
+    fourth run must still say product_changed, and the stored id must stay A's throughout."""
+    await insert_rows(job_db, RUN_TARTE)
+    store = Store()
+    a_body = FIXTURES["tarte_js_amazonian_clay_baked_blush"]["body"]
+    b_body = dict(a_body, id=16000000000001)
+    handle = "amazonian-clay-baked-blush"
+    runs = [("A", a_body, {"ok": 3, PLACEHOLDER_HAS_VARIANT_SKUS: 1}),
+            ("B", b_body, {job.PRODUCT_CHANGED: 4}),
+            ("404", None, {REVOKED_404: 4}),
+            ("B", b_body, {job.PRODUCT_CHANGED: 4})]
+    async with store.client() as client:
+        for hour, (label, served, expected) in enumerate(runs):
+            if served is None:
+                store.routes.pop((TARTE_HOST, f"/products/{handle}.js"), None)
+            else:
+                store.js(TARTE_HOST, handle, "tarte_js_amazonian_clay_baked_blush", override_body=served)
+            report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                                   pacer=NoSleepPacer(), now=lambda h=hour: CHECKED + timedelta(hours=h))
+            assert report["domains"][TARTE_HOST]["outcomes"] == expected, label
+            stored = await proofs_by_sku(job_db)
+            assert {r["shopify_product_id"] for r in stored.values()} == {"15531947491697"}, label
+
+
+def _slow_backoff(monkeypatch):
+    """A Retry-After the crawl lane clamps to 3 s, and a job that waits at most 1 s for a slot."""
+    monkeypatch.setenv("CRAWL_MAX_BACKOFF_SECONDS", "3")
+    monkeypatch.setenv("ENRICHMENT_PROOF_MAX_POLITE_WAIT_S", "1")
+
+
+async def test_a_host_held_longer_than_the_job_waits_is_crawl_paced_not_a_crash(job_db, monkeypatch):
+    _slow_backoff(monkeypatch)
+    await insert_rows(job_db, RUN_TARTE)
+    await insert_rows(job_db, RUN_TARTE_SINGLE)
+    store = Store()
+    store.routes[(TARTE_HOST, "/products/amazonian-clay-baked-blush.js")] = (429, None, [], [("retry-after", "120")])
+    store.js(TARTE_HOST, "front-row-energy-travel-essentials", "tarte_js_amazonian_clay_baked_blush")
+    async with store.client() as client:
+        report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                               pacer=NoSleepPacer(), now=_tick())
+    d = report["domains"][TARTE_HOST]
+    assert report["aborted_on_block"] is False
+    assert d["fetches"] == {"rate_limited": 1, "crawl_paced": 1}
+    assert d["skipped"] == {"skip_transient:rate_limited": 4, "skip_transient:crawl_paced": 1}
+    assert [r.url.path for r in store.requests] == ["/products/amazonian-clay-baked-blush.js"]
+    assert await proofs_by_sku(job_db) == {}
+
+
+def test_the_polite_wait_is_bounded_and_never_forever():
+    assert job.max_polite_wait_s({}) == 60.0
+    assert job.max_polite_wait_s({"ENRICHMENT_PROOF_MAX_POLITE_WAIT_S": "5"}) == 5.0
+    for bad in ("0", "-1", "nan", "inf", "x"):
+        assert job.max_polite_wait_s({"ENRICHMENT_PROOF_MAX_POLITE_WAIT_S": bad}) == 60.0, bad
+
+
+async def test_a_backoff_from_the_www_twin_holds_the_next_apex_request(job_db, monkeypatch):
+    """MAC answers from www after a 301. A 429 there must hold the storefront, not only www: the
+    next handle starts at the apex again."""
+    _slow_backoff(monkeypatch)
+    await insert_rows(job_db, RUN_MAC_FAMILY)
+    store = Store()
+    nc50 = "studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control-nc50"
+    nc10 = "studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control-nc10"
+    for handle in (nc10, nc50, "studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control"):
+        store.routes[(MAC_HOST, f"/products/{handle}.js")] = ("redirect", f"https://www.{MAC_HOST}")
+    store.routes[("www." + MAC_HOST, "/products/studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control.js")] = (
+        429, None, [], [("retry-after", "120")])
+    async with store.client() as client:
+        report = await job.run(job_db, client, [MAC_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                               pacer=NoSleepPacer(), now=_tick())
+    d = report["domains"][MAC_HOST]
+    assert d["fetches"] == {"rate_limited": 1, "crawl_paced": 2}
+    # The parent (first by sku order) went apex -> www -> 429; nothing was sent after it.
+    assert [(r.url.host, r.url.path.rsplit("/", 1)[-1]) for r in store.requests] == [
+        (MAC_HOST, "studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control.js"),
+        ("www." + MAC_HOST, "studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control.js")]
+
+
+async def test_a_crawl_delay_over_the_cap_skips_the_whole_host(job_db, monkeypatch):
+    from services import crawl_politeness
+
+    monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "true")
+    token = crawl_politeness.ROBOTS_TRANSPORT_FACTORY.set(lambda: httpx.MockTransport(
+        lambda request: httpx.Response(200, text="User-agent: *\nCrawl-delay: 100000\n")))
+    try:
+        await insert_rows(job_db, RUN_TARTE)
+        await insert_rows(job_db, RUN_TARTE_SINGLE)
+        store = Store()
+        store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush")
+        store.js(TARTE_HOST, "front-row-energy-travel-essentials", "tarte_js_amazonian_clay_baked_blush")
+        async with store.client() as client:
+            report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                                   pacer=NoSleepPacer(), now=_tick())
+    finally:
+        crawl_politeness.ROBOTS_TRANSPORT_FACTORY.reset(token)
+    d = report["domains"][TARTE_HOST]
+    assert store.requests == []
+    assert d["fetches"] == {"crawl_delay_too_long": 1}  # asked once, then the host is skipped
+    assert d["skipped"] == {"skip_transient:crawl_delay_too_long": 5} and d["written"] == 0
+
+
+def _chain_handler(store, steps):
+    """`steps[(host, path, query)]` -> an httpx.Response factory; records requests."""
+    def handler(request):
+        store.requests.append(request)
+        key = (request.url.host, request.url.path, request.url.query.decode())
+        return steps[key]()
+    return handler
+
+
+async def test_a_two_hop_chain_with_a_308_and_a_relative_location_is_followed(job_db):
+    await insert_rows(job_db, RUN_TARTE)
+    store = Store()
+    path = "/products/amazonian-clay-baked-blush.js"
+    body = FIXTURES["tarte_js_amazonian_clay_baked_blush"]["body"]
+    steps = {
+        (TARTE_HOST, path, "country=US"): lambda: httpx.Response(
+            301, headers={"location": f"https://www.{TARTE_HOST}{path}?country=US"}),
+        ("www." + TARTE_HOST, path, "country=US"): lambda: httpx.Response(
+            308, headers={"location": f"{path}?country=US&hop=2"}),  # relative
+        ("www." + TARTE_HOST, path, "country=US&hop=2"): lambda: httpx.Response(
+            200, headers=[("content-type", "text/javascript; charset=utf-8"),
+                          ("set-cookie", "cart_currency=USD; path=/")], json=body),
+    }
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_chain_handler(store, steps))) as client:
+        report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                               pacer=NoSleepPacer(), now=_tick())
+    assert report["domains"][TARTE_HOST]["outcomes"] == {"ok": 3, PLACEHOLDER_HAS_VARIANT_SKUS: 1}
+    assert len(store.requests) == 3
+
+
+async def test_a_redirect_loop_stops_at_the_cap_as_a_transient(job_db):
+    await insert_rows(job_db, RUN_TARTE)
+    store = Store()
+    path = "/products/amazonian-clay-baked-blush.js"
+    steps = {(TARTE_HOST, path, "country=US"): lambda: httpx.Response(302, headers={"location": f"{path}?country=US"})}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_chain_handler(store, steps))) as client:
+        report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                               pacer=NoSleepPacer(), now=_tick())
+    d = report["domains"][TARTE_HOST]
+    assert d["skipped"] == {"skip_transient:too_many_redirects": 4} and d["written"] == 0
+    assert len(store.requests) == job.MAX_REDIRECTS + 1
+
+
+async def test_a_redirect_without_a_location_is_never_a_404(job_db):
+    await insert_rows(job_db, RUN_TARTE)
+    store = Store()
+    path = "/products/amazonian-clay-baked-blush.js"
+    steps = {(TARTE_HOST, path, "country=US"): lambda: httpx.Response(301)}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_chain_handler(store, steps))) as client:
+        report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                               pacer=NoSleepPacer(), now=_tick())
+    d = report["domains"][TARTE_HOST]
+    assert d["outcomes"] == {} and d["skipped"] == {"skip_transient:redirect_without_location": 4}
+    assert await proofs_by_sku(job_db) == {}
+
+
+async def test_a_request_robots_kept_us_from_sending_neither_counts_nor_resets_the_block_streak(job_db, monkeypatch):
+    from services import crawl_politeness
+
+    monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "true")
+    token = crawl_politeness.ROBOTS_TRANSPORT_FACTORY.set(lambda: httpx.MockTransport(
+        lambda request: httpx.Response(200, text="User-agent: *\nDisallow: /products/front-row\n")))
+    try:
+        third = rehost(build_rows("ecvpjob tarte", "zz third", "x", "zz-third", []), TARTE_HOST)
+        for rows in (RUN_TARTE, RUN_TARTE_SINGLE, third):
+            await insert_rows(job_db, rows)
+        store = Store()
+        store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush", status=429)
+        store.js(TARTE_HOST, "zz-third", "tarte_js_amazonian_clay_baked_blush", status=429)
+        async with store.client() as client:
+            report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                                   pacer=NoSleepPacer(), block_limit=2, now=_tick())
+    finally:
+        crawl_politeness.ROBOTS_TRANSPORT_FACTORY.reset(token)
+    assert report["aborted_on_block"] is True
+    assert report["domains"][TARTE_HOST]["fetches"] == {"rate_limited": 2, "robots_disallowed": 1}

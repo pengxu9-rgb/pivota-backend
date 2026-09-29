@@ -56,7 +56,10 @@ product has new ids, so it reads `variant_gone`), but the placeholder names no v
   * once a proof row records a `shopify_product_id`, a live product under the same handle with a
     DIFFERENT id is `product_changed`, for every sku, and the row KEEPS the recorded id, so the
     refusal is sticky: it does not turn into an 'ok' for the new product on the next run. A
-    person clears it (delete the proof row) after checking the catalog row;
+    person clears it (delete the proof row) after checking the catalog row. The recorded id is
+    never erased by a later row that knows no product (a 404, a redirect, a malformed payload
+    write NULL): the upsert COALESCEs it, so "A ok, B product_changed, 404, B again" still reads
+    `product_changed`;
   * a placeholder is 'ok' only when the live product's title equals the catalog's
     `catalog_products.title` after the display-text rule, case-folded (`clean_display_text`:
     controls dropped, whitespace folded, NFC). Otherwise `product_changed`.
@@ -119,7 +122,8 @@ It fails closed: an ordinary product that happens to name its lone variant after
 too, and shows up in the report by count.
 
 WHAT IS NOT WRITTEN. A transient read (429/403/5xx/timeout/a challenge page served as 200, a path
-robots.txt disallows) is not evidence of anything: nothing is written for those skus, a prior
+robots.txt disallows, a request pacing held back, a redirect without a Location) is not evidence
+of anything: nothing is written for those skus, a prior
 proof keeps its checked_at and ages out after the verifier's 72h. Neither is a row this job cannot
 name a proof FOR (an unusable canonical_url, a canonical host that is not the requested domain, an
 unreadable source_handle). Everything else, every definitive refusal included, IS written, so a
@@ -136,8 +140,14 @@ services.tierb_cart_link_merchants), which also gives each domain its market. Pa
     (default 3.0 s, floor 1.5 s), one domain at a time;
   * every request, hop included, also goes through `services.crawl_politeness.before_request`, the
     crawl lane's owner of robots.txt (a disallowed path is skipped, a `Crawl-delay` is honoured, one
-    over its cap skips the host) and of the per-host backoff that `note_response` arms from a
-    429/503's `Retry-After`;
+    over its cap skips the HOST for the rest of the run) and of the backoff that `note_response`
+    arms from a 429/503's `Retry-After`. The wait is BOUNDED by `ENRICHMENT_PROOF_MAX_POLITE_WAIT_S`
+    (default 60 s): a host held longer is not asked (`crawl_paced`, nothing written) rather than
+    stalling the run. crawl_politeness keys its state by exact hostname, so each request is gated on,
+    and each answer reported for, BOTH the host requested and the storefront's requested host when
+    a redirect moved to its `www.` twin: one storefront, one rate limiter, one backoff;
+  * redirects (301/302/303/307/308, relative Locations resolved) are followed by hand, at most
+    5 hops; a 3xx with no Location is a transient `redirect_without_location`, never a 404;
   * `ENRICHMENT_PROOF_ABORT_AFTER_BLOCKS` (default 5) consecutive block-shaped answers (429, 403,
     5xx, a transport error, on any endpoint /meta.json included) abort the whole run, since the
     2026-08-21 block was IP-level and cross-domain. A challenge page neither aborts nor resets.
@@ -241,12 +251,20 @@ USER_AGENT = os.getenv("EXTERNAL_OFFER_USER_AGENT") or "Mozilla/5.0 (compatible;
 MIN_REQUEST_GAP_FLOOR_S = 1.5
 REQUEST_TIMEOUT_S = 20.0
 MAX_REDIRECTS = 5
+#: The longest this job waits for crawl_politeness to give a host a slot (a Retry-After backoff or a
+#: Crawl-delay). Longer than this, the request is not sent: `crawl_paced`, no evidence, nothing
+#: written. Bounded (never crawl_politeness's `max_wait=0`, "forever"), so one host's long
+#: Retry-After cannot stall the run past its task timeout.
+DEFAULT_MAX_POLITE_WAIT_S = 60.0
 PER_PAGE = 250
 #: Shopify serves /products.json pages 1..100 only (services/curated_brand_feed.SHOPIFY_MAX_PAGES).
 MAX_LISTING_PAGES = 100
 BLOCK_OUTCOMES = frozenset({"rate_limited", "http_403", "http_500", "http_502", "http_503",
                             "http_504", "http_520", "http_521", "http_522", "http_524"})
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+#: Outcomes of a request that was NOT sent (robots, a pacing refusal): neither a block nor an answer,
+#: so they neither count toward nor reset the block streak.
+NEUTRAL_OUTCOMES = frozenset({"not_json", "robots_disallowed", "crawl_paced", "crawl_delay_too_long"})
 DEFAULT_LIMIT = 2000
 
 _CURRENCY = re.compile(r"[A-Z]{3}")
@@ -279,6 +297,18 @@ def abort_after_blocks(environ: Optional[Mapping[str, str]] = None) -> int:
     except ValueError:
         value = 5
     return max(1, value)
+
+
+def max_polite_wait_s(environ: Optional[Mapping[str, str]] = None) -> float:
+    """Positive and finite, always: 0 would mean "wait forever" to crawl_politeness."""
+    env = os.environ if environ is None else environ
+    try:
+        value = float(env.get("ENRICHMENT_PROOF_MAX_POLITE_WAIT_S") or DEFAULT_MAX_POLITE_WAIT_S)
+    except ValueError:
+        value = DEFAULT_MAX_POLITE_WAIT_S
+    if not math.isfinite(value) or value <= 0:
+        value = DEFAULT_MAX_POLITE_WAIT_S
+    return value
 
 
 def is_block(outcome: str) -> bool:
@@ -653,32 +683,56 @@ def _clear_cookies(client: Any) -> None:
         pass
 
 
+def _politeness_urls(url: str, requested_host: str) -> List[str]:
+    """The URLs crawl_politeness is told about for one request: the one actually requested, and the
+    same path on the REQUESTED storefront host when a redirect moved to its `www.` twin. The two
+    are one storefront (`_same_storefront_host`) behind one rate limiter, so a 429 from
+    www.brand.com must hold the next apex request too, and crawl_politeness keys its state by
+    exact hostname. Both hosts are gated and both are told about every answer."""
+    parts = urlsplit(url)
+    urls = [url]
+    if (parts.hostname or "") != requested_host:
+        urls.append(parts._replace(netloc=requested_host).geturl())
+    return urls
+
+
 async def fetch_json(client: Any, url: str, *, requested_host: str, pacer: Pacer,
                      now: Callable[[], datetime]) -> Fetched:
     """GET `url`, following same-storefront https redirects BY HAND: every hop is paced, gated by
-    crawl_politeness (robots, Crawl-delay, Retry-After backoff) and sent with no cookie. Only the
-    FINAL response's Set-Cookie is kept. Never raises: every failure is a classified outcome."""
+    crawl_politeness (robots, Crawl-delay, Retry-After backoff, keyed on the storefront) and sent
+    with no cookie. Only the FINAL response's Set-Cookie is kept. Never raises: every failure is a
+    classified outcome."""
     current = url
     for _hop in range(MAX_REDIRECTS + 1):
-        await pacer.wait()
+        polite_urls = _politeness_urls(current, requested_host)
         try:
-            await crawl_politeness.before_request(current, user_agent=USER_AGENT, max_wait=0)
+            for polite_url in polite_urls:
+                await crawl_politeness.before_request(polite_url, user_agent=USER_AGENT,
+                                                      max_wait=max_polite_wait_s())
         except crawl_politeness.RobotsDisallowed:
             return Fetched(outcome="robots_disallowed")
         except crawl_politeness.CrawlDelayTooLong:
+            # The host asks for a rate we will not sustain: the caller skips the whole host.
             return Fetched(outcome="crawl_delay_too_long")
+        except crawl_politeness.CrawlPaced:
+            # Held longer than we wait (a long Retry-After): not sent, no evidence.
+            return Fetched(outcome="crawl_paced")
+        await pacer.wait()
         _clear_cookies(client)
         try:
             resp = await client.get(current, headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
                                     timeout=REQUEST_TIMEOUT_S, follow_redirects=False)
         except Exception as exc:  # noqa: BLE001 - classified, not swallowed
             return Fetched(outcome=f"error:{type(exc).__name__}")
-        crawl_politeness.note_response(current, resp.status_code, retry_after=resp.headers.get("retry-after"))
+        for polite_url in polite_urls:
+            crawl_politeness.note_response(polite_url, resp.status_code,
+                                           retry_after=resp.headers.get("retry-after"))
         checked_at = now()
         if resp.status_code in _REDIRECT_STATUSES:
             location = resp.headers.get("location")
             if not location:
-                return Fetched(outcome=f"http_{resp.status_code}")
+                # A redirect that names nowhere says nothing about the product: never a 404.
+                return Fetched(outcome="redirect_without_location")
             nxt = urlsplit(urljoin(current, location))
             if nxt.scheme != "https" or not _same_storefront_host(requested_host, nxt.hostname or ""):
                 # Never requested: the redirect itself is the answer.
@@ -868,7 +922,8 @@ SELECT_OFFERS_SQL = """
 
 # Idempotent on (product_key, sku_key). An older reading never overwrites a newer one (two runs,
 # or a re-run of an old report); the same instant may (a re-run of the same reading). updated_at is
-# bound, never left to the INSERT-only default.
+# bound, never left to the INSERT-only default. A recorded shopify_product_id survives every later
+# row that knows none (see PRODUCT IDENTITY in the module docstring).
 UPSERT_PROOF_SQL = f"""
     INSERT INTO {TABLE}
         (product_key, sku_key, shop_host, handle, shopify_product_id, variant_id, live_variant_count,
@@ -879,7 +934,10 @@ UPSERT_PROOF_SQL = f"""
     ON CONFLICT (product_key, sku_key) DO UPDATE SET
         shop_host = excluded.shop_host,
         handle = excluded.handle,
-        shopify_product_id = excluded.shopify_product_id,
+        -- THE PRODUCT-IDENTITY ANCHOR IS NEVER ERASED. A handle-level refusal (a 404, a redirect, a
+        -- malformed payload) knows no product and writes NULL; overwriting the stored id with it
+        -- would let the NEXT run accept whatever product holds the handle then.
+        shopify_product_id = COALESCE(excluded.shopify_product_id, {TABLE}.shopify_product_id),
         variant_id = excluded.variant_id,
         live_variant_count = excluded.live_variant_count,
         available = excluded.available,
@@ -1023,9 +1081,10 @@ async def run_domain(db: Any, client: Any, plan: DomainPlan, *, apply: bool, sou
             block_state["consecutive"] += 1
             if block_state["consecutive"] >= block_limit:
                 return False
-        elif outcome != "not_json":
-            # `not_json` is neither a block nor a clean answer (a challenge page or a soft-404):
-            # it must not reset the streak (scripts/backfill_shopify_variant_ids.py, measured).
+        elif outcome not in NEUTRAL_OUTCOMES:
+            # `not_json` is neither a block nor a clean answer (a challenge page or a soft-404), and
+            # a request robots or pacing kept us from sending is no answer at all: neither may
+            # reset the streak (scripts/backfill_shopify_variant_ids.py, measured).
             block_state["consecutive"] = 0
         return True
 
@@ -1042,10 +1101,18 @@ async def run_domain(db: Any, client: Any, plan: DomainPlan, *, apply: bool, sou
         for target in targets:
             decided.append(decide_proof(target, evidence, market_currency=plan.market_currency))
 
+    skipped_hosts: Dict[str, str] = {}
+
     async def js(host: str, handle: str, targets: List[SkuTarget]) -> None:
+        if host in skipped_hosts:
+            # A host that asked for a Crawl-delay over the cap is not asked again this run.
+            report["skipped"][f"{SKIP_TRANSIENT}:{skipped_hosts[host]}"] += len(targets)
+            return
         evidence, fetch_outcome = await read_handle_js(client, host, handle, plan.market, pacer=pacer, now=now)
         if not on_fetch(fetch_outcome):
             raise _Abort()
+        if fetch_outcome == "crawl_delay_too_long":
+            skipped_hosts[host] = fetch_outcome
         record(evidence, targets)
 
     try:
