@@ -123,7 +123,7 @@ handle is quoting against something nobody has checked since.
 | `REAP_API_BASE_URL` + `REAP_API_KEY` | unset | both required; otherwise `start_purchase` refuses `rail_unconfigured`. |
 | `REAP_RETURN_URL_HOSTS` | `api.pivota.cc,agent.pivota.cc` | host allowlist for our own `returnUrl`. Empty/unset means the default, not "no hosts". **Order matters:** the first host is the default return URL's host. |
 | `REAP_AGENTIC_RETURN_URL` | unset | the return URL the routes use when the caller sends none. Unset ⇒ `https://<first REAP_RETURN_URL_HOSTS host>/reap/return`. Validated like a caller's (https, allowlisted host, no userinfo). |
-| `REAP_AGENTIC_SIMULATE_CHECKOUT` | **unset = off** | **Sandbox only.** Exactly `COMPLETED` (case-sensitive; anything else is ignored with a WARNING on the `pivota` logger) adds `X-Simulate-Checkout: COMPLETED` to `POST /agentic/checkouts` and to no other request — and only when `REAP_API_BASE_URL`'s host is exactly `sandbox.api.reap.global` or `mx.sandbox.api.reap.global` (any other host: header withheld, WARNING). See below. |
+| `REAP_AGENTIC_SIMULATE_CHECKOUT` | **unset = off** | **Sandbox only.** Exactly `COMPLETED` (case-sensitive; anything else is ignored with a WARNING on the `pivota` logger) adds `X-Simulate-Checkout: COMPLETED` to `POST /agentic/checkouts` and to no other request — and only when `REAP_API_BASE_URL`'s host is exactly one of the sandbox hosts `sandbox.api.reap.global`, `sg.sandbox.api.reap.global` or `mx.sandbox.api.reap.global` (`rc.REAP_SANDBOX_HOSTS`; any other host: header withheld, WARNING). See below. |
 
 **`REAP_AGENTIC_SIMULATE_CHECKOUT`, measured 25 Sep in the sandbox.** It does not skip the buyer:
 the checkout is still created `REQUIRES_ACTION` with a hosted approval URL, and a human must approve
@@ -313,9 +313,11 @@ pre-flight** below. The gate itself dates from the Railway era, when prod and st
 Postgres; it still keeps the poller off staging/preview services by default.
 
 Code guard, in addition: outside production (`platform_env()` ≠ production) the poller's step 4
-runs only when `REAP_API_BASE_URL`'s host is exactly `sandbox.api.reap.global` or
-`mx.sandbox.api.reap.global` (`rc.is_sandbox_base_url`). Any other host — `prod.api.reap.global`,
-a suffix like `x.sandbox.api.reap.global` — reports `skipped_disabled=1` and logs one ERROR on the
+runs only when `REAP_API_BASE_URL`'s host is exactly one of `sandbox.api.reap.global`,
+`sg.sandbox.api.reap.global` or `mx.sandbox.api.reap.global` (`rc.is_sandbox_base_url`, reading
+`rc.REAP_SANDBOX_HOSTS` — the same set as the simulate header). Any other host —
+`prod.api.reap.global`, `sg.prod.api.reap.global`, `mx.prod.api.reap.global`, a suffix like
+`x.sandbox.api.reap.global`, a URL with userinfo — reports `skipped_disabled=1` and logs one ERROR on the
 `pivota` logger per process; the sweeps still run. It is a backstop, not a substitute for the
 pre-flight: the sandbox would still be asked to enroll and quote production buyers' rows.
 
@@ -400,8 +402,9 @@ UPDATE reap_agentic_enrollments
 
 Then re-run (a) until it exits 0. Never run this against production.
 
-**c. Sandbox only.** `REAP_API_BASE_URL` must be exactly `https://sandbox.api.reap.global` (or
-`https://mx.sandbox.api.reap.global`), and `REAP_API_KEY` a sandbox key. The poller refuses any
+**c. Sandbox only.** `REAP_API_BASE_URL` must be exactly one of `https://sandbox.api.reap.global`,
+`https://sg.sandbox.api.reap.global` (verified live for cart-link quotes 2026-09-28; the SG demo
+merchant) or `https://mx.sandbox.api.reap.global`, and `REAP_API_KEY` a sandbox key. The poller refuses any
 other host outside production (above), but check it before arming rather than discovering it in
 the ERROR line.
 

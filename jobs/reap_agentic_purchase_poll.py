@@ -727,7 +727,7 @@ async def run_reap_agentic_purchase_poll(
                 "reap_agentic_poll: REAP_AGENTIC_ENABLED is on outside production but "
                 "REAP_API_BASE_URL is not exactly a Reap sandbox host (%s); step 4 will not "
                 "run. See docs/runbooks/reap_agentic_purchase.md.",
-                ", ".join(sorted(rc.SIMULATE_CHECKOUT_SANDBOX_HOSTS)),
+                ", ".join(sorted(rc.REAP_SANDBOX_HOSTS)),
             )
         return _report()
 

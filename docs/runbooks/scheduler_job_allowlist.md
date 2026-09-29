@@ -133,7 +133,8 @@ job fills, so it needs no other job. The allowlist is `reap_agentic_purchase_pol
 `docs/runbooks/reap_agentic_purchase.md` ("Staging pre-flight"): the staging database is a
 restored copy of production, so non-terminal production purchases and enrollments in it must be
 counted and scrubbed (or you STOP) before the rail is armed, and `REAP_API_BASE_URL` must be
-exactly a sandbox host (outside production the poller refuses any other host anyway).
+exactly a sandbox host — `sandbox.api.reap.global`, `sg.sandbox.api.reap.global` or
+`mx.sandbox.api.reap.global` (outside production the poller refuses any other host anyway).
 
 ### Arm the worker: ONE command, both variables together
 

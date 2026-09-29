@@ -370,8 +370,8 @@ def validate_base_url(raw: Optional[str] = None) -> str:
 # FAILED the un-simulated sandbox returns. That is what makes our own rail runnable end to end.
 #
 # It must never reach production, however an operator sets the environment. So the header is
-# emitted only when BOTH the dial is the exact string and the base URL's host is one of the two
-# sandbox hosts, compared as an exact string. `ALLOWED_HOST_SUFFIXES` is NOT reused for this: it
+# emitted only when BOTH the dial is the exact string and the base URL's host is one of Reap's
+# sandbox hosts (`REAP_SANDBOX_HOSTS`), compared as an exact string. `ALLOWED_HOST_SUFFIXES` is NOT reused for this: it
 # admits `prod.api.reap.global` by design. Reap rejecting the header in production is the second
 # lock, not the first.
 
@@ -381,9 +381,24 @@ SIMULATE_CHECKOUT_HEADER = "X-Simulate-Checkout"
 #: The ONLY accepted dial value, and the only value the spec admits for the header. Case-sensitive
 #: and not coerced: `completed`, `1`, `true` are ignored rather than read as "on".
 SIMULATE_CHECKOUT_VALUE = "COMPLETED"
-#: Exact hostnames, from the spec's `servers` block. Exact, not suffix: `x.sandbox.api.reap.global`
-#: is not one of them, and `prod.api.reap.global` must never be.
-SIMULATE_CHECKOUT_SANDBOX_HOSTS = frozenset({"sandbox.api.reap.global", "mx.sandbox.api.reap.global"})
+#: Reap's SANDBOX hosts: the ONE list. Exact hostnames, from the spec's `servers` block
+#: (tests/fixtures/reap_openapi_agentic_2026_09_28.json: sg.sandbox, mx.sandbox, and the
+#: `sandbox` alias of sg.sandbox; the three `prod` entries are the production servers). Exact, not
+#: suffix: `x.sandbox.api.reap.global` is not one of them, and no `prod` host may ever be.
+#: tests/test_reap_agentic_client_simulate_checkout.py derives this set from that fixture, so a
+#: servers change fails a test instead of drifting.
+#:
+#: Two gates read it, and they must agree, so there is deliberately no second list:
+#:   * `simulate_checkout_header` — the sandbox-only `X-Simulate-Checkout` header;
+#:   * `is_sandbox_base_url` — outside production the poller calls the partner only here.
+#: sg.sandbox was verified live for externalCheckout (cart-link) quotes on 2026-09-28.
+REAP_SANDBOX_HOSTS = frozenset({
+    "sandbox.api.reap.global",
+    "sg.sandbox.api.reap.global",
+    "mx.sandbox.api.reap.global",
+})
+#: The simulate header's host set IS the sandbox set (an alias, not a copy).
+SIMULATE_CHECKOUT_SANDBOX_HOSTS = REAP_SANDBOX_HOSTS
 
 
 def simulate_checkout_header(
@@ -429,7 +444,7 @@ def simulate_checkout_header(
 
 def is_sandbox_base_url(raw: Optional[str] = None) -> bool:
     """True only when the base URL (`raw`, else REAP_API_BASE_URL) passes `validate_base_url` AND
-    its hostname is EXACTLY one of `SIMULATE_CHECKOUT_SANDBOX_HOSTS`. Never raises.
+    its hostname is EXACTLY one of `REAP_SANDBOX_HOSTS`. Never raises.
 
     The poller's outside-production guard (jobs/reap_agentic_purchase_poll.py): staging is a
     restored copy of production, so an armed staging poller pointed at `prod.api.reap.global`
@@ -442,7 +457,7 @@ def is_sandbox_base_url(raw: Optional[str] = None) -> bool:
         host = (urlparse(validate_base_url(url.strip())).hostname or "").lower()
     except ReapConfigError:
         return False
-    return host in SIMULATE_CHECKOUT_SANDBOX_HOSTS
+    return host in REAP_SANDBOX_HOSTS
 
 
 #: Reap retains an idempotency key for 24 h, but a quote's `expiresAt` is roughly 5 minutes. A

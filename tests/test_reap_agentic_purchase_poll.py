@@ -405,10 +405,13 @@ async def test_the_gate_is_an_allowlist_not_a_denylist(monkeypatch, reap, value)
 @pytest.mark.parametrize("pivota_env,base,armed", [
     ("staging", "https://prod.api.reap.global", False),
     ("staging", "https://mx.prod.api.reap.global", False),
+    ("staging", "https://sg.prod.api.reap.global", False),
+    ("staging", "https://attacker.sg.sandbox.api.reap.global", False),
     ("staging", "https://x.sandbox.api.reap.global", False),   # exact host, not a suffix
     ("development", "https://prod.api.reap.global", False),
     ("staging", "https://sandbox.api.reap.global", True),
     ("staging", "https://mx.sandbox.api.reap.global", True),
+    ("staging", "https://sg.sandbox.api.reap.global", True),       # the SG demo host
     ("production", "https://prod.api.reap.global", True),       # production is unchanged
 ])
 async def test_outside_production_step_4_runs_only_against_an_exact_sandbox_host(
