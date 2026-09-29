@@ -868,6 +868,59 @@ async def test_a3_the_same_sku_named_by_the_caller_is_bought(client):
     assert purchase["our_price_minor"] == 2800
 
 
+async def seed_mac_single_folded_shade() -> str:
+    """A7: a folded MAC family whose catalog holds ONE shade. canonical_url is the PARENT handle;
+    the only `::v:` sku is NC10, `sku_payload.source_handle = <parent>-nc10`, with its own sole
+    proof (the shade's handle has one variant) and its own offer. Returns that sku_key."""
+    await seed_product(pk=MAC_PK, merchant=MAC_MERCHANT, brand="MAC Cosmetics", domain=MAC_HOST,
+                       url=MAC_URL, title="Studio Fix Fluid SPF 15 24HR Matte Foundation")
+    await seed_sku(pk=MAC_PK, sku_key=f"{MAC_PK}::canonical", merchant=MAC_MERCHANT, svid=MAC_PK,
+                   title="Studio Fix Fluid SPF 15 24HR Matte Foundation")
+    vid, handle = MAC_SHADES[0]
+    sku_key = f"{MAC_PK}::v:{vid}"
+    await seed_sku(pk=MAC_PK, sku_key=sku_key, merchant=MAC_MERCHANT, svid=vid, title="NC10",
+                   source_handle=handle)
+    await seed_offer(oid="off_mac_a7", pk=MAC_PK, sku_key=sku_key, merchant=MAC_OFFER_MERCHANT,
+                     price="39.00", source_ref=MAC_URL)
+    await seed_proof(pk=MAC_PK, sku_key=sku_key, shop_host=MAC_HOST, handle=handle,
+                     variant_id=vid, price_minor=3900)
+    await seed_tierb(MAC_HOST)
+    return sku_key
+
+
+async def test_a7_the_only_catalog_shade_of_a_folded_family_is_not_bought_unnamed(client, monkeypatch):
+    """A7 (review of #2465, P2): catalog count 1, the shade's proof sole_variant -- every other
+    rule passes, and NC10 is a shade nobody chose. Refused before the proof is read."""
+    await seed_mac_single_folded_shade()
+    seen = spy_statements(monkeypatch)
+    resp = await client.post(f"{BASE}/purchases", json=body(host=MAC_HOST, product_key=MAC_PK))
+    await assert_refused(resp, "row_variant_ambiguous")
+    assert proofs._SELECT_PROOF_SQL not in seen
+
+
+async def test_a7_the_same_folded_shade_named_by_the_caller_is_bought(client):
+    sku_key = await seed_mac_single_folded_shade()
+    resp = await client.post(f"{BASE}/purchases", json=body(
+        host=MAC_HOST, product_key=MAC_PK, variant_key=sku_key))
+    assert resp.status_code == 202, resp.text
+    purchase = await purchase_of(resp)
+    assert purchase["cart_url"] == cart_url_for(MAC_HOST, MAC_SHADES[0][0], purchase["click_id"])
+
+
+@pytest.mark.parametrize("source_handle", [TARTE_HANDLE, "", "   "])
+async def test_a_source_handle_equal_to_the_canonical_handle_or_blank_is_not_a_folded_shade(
+    client, source_handle,
+):
+    """The fold rule reads only a NON-EMPTY source_handle that DIFFERS from the canonical handle:
+    the same handle, or a blank one, is the product's own page (tarte stays 202 with no key)."""
+    await seed_tarte()
+    await database.execute(
+        f"UPDATE catalog_skus SET sku_payload = {_jsonb('p')} WHERE sku_key = :sk",
+        {"sk": TARTE_SKU, "p": json.dumps({"source_handle": source_handle})})
+    resp = await client.post(f"{BASE}/purchases", json=body(host=TARTE_HOST, product_key=TARTE_PK))
+    assert resp.status_code == 202, resp.text
+
+
 async def test_two_suppressed_variant_skus_behind_a_placeholder_are_ambiguous(client):
     """The MAC stub with TWO suppressed `::v:` skus: the catalog knows two variants -> the no-key
     rule refuses before the placeholder is even tried."""

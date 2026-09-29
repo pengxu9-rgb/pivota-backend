@@ -1608,6 +1608,25 @@ def _enrichment_listing_offer(offer: Mapping[str, Any], shop_host: str, handle: 
     return page is not None and _same_storefront_host(shop_host, page[0]) and page[1] == handle
 
 
+def _enrichment_sku_payload(sku: Mapping[str, Any]) -> Dict[str, Any]:
+    """`sku_payload` as a dict ({} when absent or unreadable; the verifier refuses a malformed one).
+    asyncpg and SQLite both hand JSON back as text."""
+    payload = sku.get("sku_payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _enrichment_source_handle(sku: Mapping[str, Any]) -> str:
+    """The sku's own storefront handle when it is a FOLDED shade (`sku_payload.source_handle`),
+    else ''."""
+    handle = _enrichment_sku_payload(sku).get("source_handle")
+    return handle.strip() if isinstance(handle, str) else ""
+
+
 def _enrichment_variant_title(sku: Mapping[str, Any]) -> Optional[str]:
     """DISPLAY ONLY: a variant title the sku's payload carries, else None. The proof table has no
     title column and the enrichment writer puts none in `sku_payload` today, so this is None on
@@ -1618,13 +1637,7 @@ def _enrichment_variant_title(sku: Mapping[str, Any]) -> Optional[str]:
     `variant_title` column, prefer the PROOF's title (the live storefront's words, as the mirror
     lane does) and select it in `db.enrichment_cart_variant_proofs._SELECT_PROOF_SQL`; this PR
     does not add the column."""
-    payload = sku.get("sku_payload")
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            return None
-    return clean_variant_title(payload.get("variant_title") if isinstance(payload, dict) else None)
+    return clean_variant_title(_enrichment_sku_payload(sku).get("variant_title"))
 
 
 async def _load_enrichment_cart_link_item(
@@ -1683,6 +1696,15 @@ async def _load_enrichment_cart_link_item(
             product_key,
             variant_sku_count,
         )
+        # A FOLDED SHADE IS ONE CHOICE AMONG A FAMILY (review of #2465, P2 / A7). A sku whose
+        # `sku_payload.source_handle` names another handle than the canonical_url's is one shade of
+        # a folded family (`curated_brand_feed` sets source_handle ONLY for folded variants): the
+        # catalog holding just that one shade, and its own handle having one variant, does not make
+        # the family single-variant. Nobody named it, so it is not bought -- refused before the
+        # proof is read. A caller-NAMED folded shade is unaffected (the branch above).
+        folded_handle = _enrichment_source_handle(sku)
+        if folded_handle and folded_handle != handle:
+            raise svc.PurchaseRefused("row_variant_ambiguous", "one shade of a folded family")
 
     # THE VARIANT: only what the verifier returns from the storefront proof for exactly this sku.
     proof = await enrichment_proofs.fetch_proof(product_key, str(sku.get("sku_key") or ""))

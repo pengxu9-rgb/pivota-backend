@@ -185,6 +185,9 @@ dial remains that. With it on, such a row is bought only when all of these hold:
   * that one sku is used if it is live, and its storefront proof must then be **sole-variant**
     (the handle has exactly one variant); a catalog holding one of a storefront's two sizes is
     refused;
+  * a **folded shade** (its `sku_payload.source_handle` names another handle than the
+    `canonical_url`'s, e.g. MAC `<parent>-nc10`) is one choice among a family and is never bought
+    without a `variant_key`, even when it is the only shade the catalog holds; named, it is;
   * with no live real sku, the `<product_key>::canonical` placeholder is used, which the proof
     step accepts only when the product has **no** `::v:` sku at all, suppressed ones included,
     and the storefront handle has exactly one variant.
