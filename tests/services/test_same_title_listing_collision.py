@@ -19,16 +19,18 @@ from services.retailer_ingest import detectors, pipeline
 from tests.services.test_retailer_ingest_pipeline import env, job  # noqa: F401  (fixture)
 
 
-def official(title, ptype, handle, price, vid=None, *, domain="cocodor.com", vendor="COCODOR", role="brand_official"):
+def official(title, ptype, handle, price, vid=None, *, domain="cocodor.com", vendor="COCODOR", role="brand_official",
+             image=None, available=True):
     """A product as the storefront serves it. `vid` is its (first) variant id: Shopify issues ids in
-    creation order, so a lower id is an older listing. Defaults to a stable digest of the handle."""
+    creation order, so a lower id is an older listing. Defaults to a stable digest of the handle; the
+    image defaults to one of its own (a duplicate page passes the original's)."""
     import zlib
     vid = vid or 40_000_000_000_000 + zlib.crc32(f"{domain}/{handle}".encode())
     return feed.shopify_product_to_record(
-        {"id": vid // 1000, "vendor": vendor, "title": title, "handle": handle,
+        {"id": 8_000_000_000 + vid % 1_000_000_000, "vendor": vendor, "title": title, "handle": handle,
          "product_type": ptype, "body_html": "<p>A lip colour for soft, velvet lips.</p>",
-         "images": [{"src": f"https://cdn.example/{handle}.jpg"}],
-         "variants": [{"id": vid, "price": price, "available": True, "sku": handle}]},
+         "images": [{"src": image or f"https://cdn.example/{handle}.jpg?v=1"}],
+         "variants": [{"id": vid, "price": price, "available": available, "sku": handle}]},
         domain=domain, category_path="beauty", brand_override=vendor, currency="USD",
         source_role=role, emit_native_variants=True,
         **({"retailer_name": domain} if role == "retailer" else {}))
@@ -136,6 +138,9 @@ def test_the_keeper_rule_in_order():
     assert elect([ev("clg_b01", 7), ev("clg_v03", 3)])["handle"] == "clg_v03"          # oldest
     assert elect([ev("b", None), ev("a", None)])["handle"] == "a"                      # handle last
     assert elect([ev("a", None), ev("b", 5)])["handle"] == "b"                         # an id beats none
+    known = [dict(ev("clg_b01", 1), available=None), dict(ev("clg_v09", 9), available=True)]
+    assert elect(known)["handle"] == "clg_v09"                                          # in stock beats unknown
+    assert elect([dict(ev("x", 1), available=False), dict(ev("y", 9), available=None)])["handle"] == "y"
 
 
 def test_the_same_title_on_another_host_still_shares_the_row():
@@ -175,10 +180,18 @@ def test_retailer_listings_are_keyed_by_url_and_never_collide():
 
 
 @pytest.mark.parametrize("kept,dropped,severity", [
-    ({"prices": [23.0], "product_type": "Mask"}, {"prices": [23.0], "product_type": "Mask"}, detectors.INFO),
-    ({"prices": [21.0], "product_type": None}, {"prices": [35.0], "product_type": None}, detectors.BLOCK),
-    ({"prices": [6.99], "product_type": "refill"}, {"prices": [6.99], "product_type": "candle"}, detectors.BLOCK),
-    ({"prices": [], "product_type": "x"}, {"prices": [], "product_type": "x"}, detectors.BLOCK),
+    ({"prices": [23.0], "product_type": "Mask", "image": "a.jpg"},
+     {"prices": [23.0], "product_type": "Mask", "image": "a.jpg"}, detectors.INFO),       # an ad clone
+    ({"prices": [21.0], "product_type": None, "image": "a.jpg"},
+     {"prices": [35.0], "product_type": None, "image": "a.jpg"}, detectors.BLOCK),       # another price
+    ({"prices": [6.99], "product_type": "refill", "image": "a.jpg"},
+     {"prices": [6.99], "product_type": "candle", "image": "a.jpg"}, detectors.BLOCK),   # another type
+    ({"prices": [5.99], "product_type": "Blush", "image": "rose.jpg"},
+     {"prices": [5.99], "product_type": "Blush", "image": "nude.jpg"}, detectors.BLOCK), # a shade
+    ({"prices": [5.99], "product_type": "Blush", "image": None},
+     {"prices": [5.99], "product_type": "Blush", "image": None}, detectors.BLOCK),       # no image: unproven
+    ({"prices": [], "product_type": "x", "image": "a.jpg"},
+     {"prices": [], "product_type": "x", "image": "a.jpg"}, detectors.BLOCK),            # no price: unproven
 ])
 def test_a_left_out_listing_holds_unless_it_looks_like_the_same_product(kept, dropped, severity):
     [flag] = detectors.listing_collision_flags([{
@@ -198,10 +211,10 @@ LIGHT = ("Velvet Lip Tint", "LIP TINT", "velvet-lip-tint-light", "4.99")
 DOMAIN_OK = "brand_official_domain_unproven:k-touch.us:3ce"
 
 
-def _drain(env, monkeypatch, rows):  # noqa: F811
-    async def fetch(**kw):
+def _drain(env, monkeypatch, rows, **kw):  # noqa: F811
+    async def fetch(**_):
         return feed.ShopifyProductBatch(
-            [official(*r, domain="k-touch.us", vendor="3CE") for r in rows], scanned_products=len(rows), pages=1)
+            [official(*r, domain="k-touch.us", vendor="3CE", **kw) for r in rows], scanned_products=len(rows), pages=1)
     monkeypatch.setattr(feed, "records_for_brand", fetch)
 
 
@@ -235,7 +248,8 @@ async def test_excluding_the_kept_listing_makes_the_other_one_the_row(env, monke
 
 
 async def test_a_duplicate_page_at_the_same_price_is_left_out_without_holding(env, monkeypatch):  # noqa: F811
-    _drain(env, monkeypatch, [DARK, (DARK[0], DARK[1], "velvet-lip-tint-dark-1", DARK[3])])
+    _drain(env, monkeypatch, [DARK, (DARK[0], DARK[1], "velvet-lip-tint-dark-1", DARK[3])],
+           image="https://cdn.example/files/velvet-dark.jpg?v=3")
     out = await pipeline.run_stage(job(source_role="brand_official", accepted_flags=[DOMAIN_OK]), db=env.db)
     assert out["status"] == "apply_due"
     run = list(env.ledger.runs.values())[-1]
@@ -279,3 +293,131 @@ def test_the_unattended_onboard_queue_reports_what_it_left_out(monkeypatch):
     out = asyncio.run(w._process_curated_brand(payload, apply=False, db=None))
     assert out["plan_pdps"] == 1
     assert [c["dropped"]["handle"] for c in out["listing_collisions"]] == [CANDLE[2]]
+
+
+# ---------------------------------------------------------------- review 2 (controller) defaults
+
+def test_a_stale_base_never_beats_a_live_relist():
+    """misshaus.com: the base listing sold out and was replaced by `-new`; a sold-out base must not keep the row."""
+    kw = dict(domain="misshaus.com", vendor="Missha")
+    title = "M Perfect Cover BB Cream SPF 42 PA+++(50ml)"
+    stale = official(title, "Limited", "m-perfect-cover-bb-cream", "19.00", 43_000_000_000_001, available=False, **kw)
+    relist = official(title, "Limited", "m-perfect-cover-bb-cream-new", "14.50", 43_000_000_000_009, **kw)
+    assert _offer_handles(ingest_validated_jsonl([stale, relist])) == {"m-perfect-cover-bb-cream-new"}
+
+
+def test_another_regions_copy_ranks_after_a_global_one():
+    """beautyofjoseon.com lists some sets only as -eu and -global: a US row keeps -global."""
+    kw = dict(domain="beautyofjoseon.com", vendor="Beauty of Joseon")
+    eu = official("Relax + Relief SPF Duo", "", "relax-relief-spf-duo-eu", "44.00", 44_000_000_000_001, **kw)
+    glob = official("Relax + Relief SPF Duo", "", "relax-relief-spf-duo-global", "44.00", 44_000_000_000_009, **kw)
+    assert _offer_handles(ingest_validated_jsonl([eu, glob], market="US")) == {"relax-relief-spf-duo-global"}
+
+
+def test_a_handle_ending_in_us_is_a_region_copy_only_beside_its_stem():
+    from services.catalog_enrichment_agent.ingestion import elect_listing_keeper as elect
+
+    def ev(handle, oldest):
+        return {"handle": handle, "oldest_variant_id": oldest}
+    # "hair-mask-for-us" is a product name: no other listing is "hair-mask-for" or "hair-mask-for-...".
+    assert elect([ev("hair-mask-for-us", 9), ev("hair-mask-deluxe", 1)])["handle"] == "hair-mask-deluxe"
+    assert elect([ev("hair-mask-us", 9), ev("hair-mask-eu", 1)])["handle"] == "hair-mask-us"
+    # GB jobs read -uk/-ukeu, EU jobs -eu/-ukeu (review 2: not only -gb)
+    assert elect([ev("set-ukeu", 9), ev("set", 1)], market="GB")["handle"] == "set-ukeu"
+    assert elect([ev("set-eu", 9), ev("set", 1)], market="DE")["handle"] == "set-eu"
+
+
+def test_a_tie_keeps_the_listing_the_row_names_today():
+    """After scripts/repair_same_title_listings.py aligned a row, a re-crawl must not move it on a tie
+    (two ad clones of one product): the row's current listing beats the older clone."""
+    title, kw = "[Amazon #1] Biodance PDRN Capsule Cream", dict(domain="biodance.com", vendor="Biodance",
+                                                                 image="https://cdn.example/pcc.jpg")
+    a = official(title, "", "0707_pcc_a_albina1", "21.99", 46_000_000_000_001, **kw)
+    b = official(title, "", "0707_pcc_a_glownastzy1", "21.99", 46_000_000_000_009, **kw)
+    key = ingest_validated_jsonl([a])["pdps"][0]["product_key"]
+    assert _offer_handles(ingest_validated_jsonl([a, b])) == {"0707_pcc_a_albina1"}  # oldest
+    current = {key: ("biodance.com", "0707_pcc_a_glownastzy1")}
+    assert _offer_handles(ingest_validated_jsonl([a, b], current_listings=current)) == {"0707_pcc_a_glownastzy1"}
+    # ...on its own host only
+    elsewhere = {key: ("us.biodance.com", "0707_pcc_a_glownastzy1")}
+    assert _offer_handles(ingest_validated_jsonl([a, b], current_listings=elsewhere)) == {"0707_pcc_a_albina1"}
+    # ...and never over a stronger rule: a sold-out current listing loses to an available one
+    sold_out = official(title, "", "0707_pcc_a_glownastzy1", "21.99", 46_000_000_000_009, available=False, **kw)
+    assert _offer_handles(ingest_validated_jsonl([a, sold_out], current_listings=current)) == {"0707_pcc_a_albina1"}
+
+
+def test_price_evidence_is_the_variants_and_the_offers_only_without_them():
+    from services.catalog_enrichment_agent.ingestion import _listing_evidence
+    record = official(*REFILL)
+    record["offers"][0]["price"] = 99.0            # a stale offer price never joins the variants'
+    assert _listing_evidence(record, "h")["prices"] == [6.99]
+    for v in record["pdp"]["variants"]:
+        v["price"] = None
+    assert _listing_evidence(record, "h")["prices"] == [99.0]
+
+
+class _Catalog:
+    """What apply.current_listings reads: catalog_products.canonical_url by product_key."""
+
+    is_connected = True
+
+    def __init__(self, rows):
+        self.rows, self.queries = rows, []
+
+    async def fetch_all(self, query, values=None):
+        self.queries.append(query)
+        return [{"product_key": k, "canonical_url": u} for k, u in self.rows.items()
+                if k in (values or {}).get("product_keys", [])]
+
+
+async def test_the_drain_keeps_the_listing_the_row_names_on_a_tie(env, monkeypatch):  # noqa: F811
+    dup = (DARK[0], DARK[1], "lp-velvet-lip-tint-dark", DARK[3], 45_000_000_000_009)
+    rows = [(*DARK, 45_000_000_000_001), dup]
+    _drain(env, monkeypatch, rows, image="https://cdn.example/files/velvet-dark.jpg")
+    key = ingest_validated_jsonl([official(*DARK, domain="k-touch.us", vendor="3CE")])["pdps"][0]["product_key"]
+    catalog = _Catalog({key: "https://k-touch.us/products/lp-velvet-lip-tint-dark"})
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (catalog, None))
+    opts = dict(source_role="brand_official", accepted_flags=[DOMAIN_OK])
+    assert (await pipeline.run_stage(job(**opts), db=env.db))["status"] == "apply_due"
+    run = list(env.ledger.runs.values())[-1]
+    assert run["checks"]["current_listings"] == {"status": "read", "rows": 1}
+    assert [f["key"] for f in run["flags"] if f["rule"] == "same_key_other_listing"] == [
+        "same_key_other_listing:velvet-lip-tint-dark"]
+    assert all(q.lstrip().upper().startswith("SELECT") for q in catalog.queries)
+    out = await pipeline.run_stage(job("apply_due", **opts), db=env.db)
+    assert out["status"] == "done" and _offer_handles(env.applied[-1]) == {"lp-velvet-lip-tint-dark"}
+
+
+async def test_a_job_can_accept_all_its_left_out_listings_at_once(env, monkeypatch):  # noqa: F811
+    _drain(env, monkeypatch, [DARK, LIGHT, (DARK[0], DARK[1], "velvet-lip-tint-berry", "6.49")])
+    opts = dict(source_role="brand_official", accepted_flags=[DOMAIN_OK])
+    assert (await pipeline.run_stage(job(**opts), db=env.db))["status"] == "held"
+    out = await pipeline.run_stage(job(accept_listing_collisions=True, **opts), db=env.db)
+    assert out["status"] == "apply_due"
+    run = list(env.ledger.runs.values())[-1]
+    assert len([f for f in run["flags"] if f["rule"] == "same_key_other_listing"]) == 2  # still recorded
+    with pytest.raises(ValueError):
+        pipeline.validate_options({"vendors": ["3CE"], "accept_listing_collisions": "yes"})
+
+
+def test_the_onboard_queue_keeps_the_listing_the_row_names_on_a_tie(monkeypatch):
+    import asyncio
+
+    from services import catalog_onboard_worker as w
+    from services.curated_brand_feed import CuratedRecordBatch
+
+    kw = dict(domain="biodance.com", vendor="Biodance", image="https://cdn.example/pcc.jpg")
+    title = "[Amazon #1] Biodance PDRN Capsule Cream"
+    records = [official(title, "", "0707_pcc_a_albina1", "21.99", 46_000_000_000_001, **kw),
+               official(title, "", "0707_pcc_a_glownastzy1", "21.99", 46_000_000_000_009, **kw)]
+    key = ingest_validated_jsonl(records[:1])["pdps"][0]["product_key"]
+
+    async def fetch(**_):
+        return CuratedRecordBatch(records, crawl_report={"status": "complete", "pages": 1, "scanned_products": 2,
+                                                         "selected_products": 2, "emitted_records": 2})
+    monkeypatch.setattr(w, "records_for_brand", fetch)
+    payload = {"domain": "biodance.com", "brand": "Biodance", "source_role": "brand_official",
+               "only_vendors": ["Biodance"], "require_currency": "USD", "category_path": "beauty"}
+    catalog = _Catalog({key: "https://biodance.com/products/0707_pcc_a_glownastzy1"})
+    out = asyncio.run(w._process_curated_brand(payload, apply=False, db=catalog))
+    assert [c["kept"]["handle"] for c in out["listing_collisions"]] == ["0707_pcc_a_glownastzy1"]

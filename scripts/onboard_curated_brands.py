@@ -406,6 +406,35 @@ def _preflight_database() -> tuple:
     return db_module.database, None
 
 
+async def _replan_with_current_listings(plan: Dict[str, Any], records: List[Dict[str, Any]], *,
+                                        market: Optional[str] = None) -> Dict[str, Any]:
+    """When the plan left listings out (same title, one content key), plan again with the listing each
+    of those rows names today, so ingestion.elect_listing_keeper keeps it on a tie instead of moving the
+    row (read-only SELECT). Without a Postgres catalog, or when the read fails, the first plan stands and
+    `current_listings.status` says why."""
+    from services.catalog_enrichment_agent.apply import current_listings
+
+    keys = sorted({c["product_key"] for c in plan.get("listing_collisions") or []})
+    if not keys:
+        return plan
+    database, reason = _preflight_database()
+    if database is None:
+        return {**plan, "current_listings": {"status": "unchecked", "reason": reason}}
+    connected_here = False
+    try:
+        if not getattr(database, "is_connected", False):
+            await database.connect()
+            connected_here = True
+        current = await current_listings(keys, db=_SelectOnlyHandle(database))
+    except Exception as exc:  # noqa: BLE001 -- reported; the class only (a driver error can quote its URL)
+        return {**plan, "current_listings": {"status": "error", "error": type(exc).__name__}}
+    finally:
+        if connected_here and getattr(database, "is_connected", False):
+            await database.disconnect()
+    replanned = ingest_validated_jsonl(records, market=market, current_listings=current)
+    return {**replanned, "current_listings": {"status": "read", "rows": len(current)}}
+
+
 async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[str, Any]:
     """Which planned listings an older, non-`ext:retailer:` catalog row already owns.
 
@@ -676,7 +705,7 @@ async def _run(args: argparse.Namespace) -> int:
     if excluded_handles - matched_handles:
         raise ValueError(f"--exclude-handle values matched no product in this run: "
                          f"{sorted(excluded_handles - matched_handles)}")
-    plan = ingest_validated_jsonl(all_records)
+    plan = await _replan_with_current_listings(ingest_validated_jsonl(all_records), all_records)
     print(
         f"plan: pdps={len(plan.get('pdps') or [])} skus={len(plan.get('skus') or [])} "
         f"offers={len(plan.get('offers') or [])} seeds={len(plan.get('seeds') or [])} "

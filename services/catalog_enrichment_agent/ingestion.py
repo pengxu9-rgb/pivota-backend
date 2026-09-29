@@ -1618,6 +1618,7 @@ def ingest_validated_jsonl(
     *,
     source_jsonl: Optional[str] = None,
     market: Optional[str] = None,
+    current_listings: Optional[Dict[str, Tuple[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Drive ingest_validated_record across an iterable of records and
     return all five row collections plus skipped_count. Pure — no DB
@@ -1625,6 +1626,9 @@ def ingest_validated_jsonl(
 
     `market` (optional): the destination market the caller DECLARES for every offer (see
     `_build_offer_inserts`); a record priced in another currency fails the whole plan.
+
+    `current_listings` (optional): product_key -> the (host, listing) its catalog row names today
+    (apply.current_listings), for elect_listing_keeper's tie-break.
 
     Returns a dict with keys: pdps, skus, merchants, offers, seeds,
     skipped, listing_collisions. Lists are de-duped by their natural primary key so re-runs
@@ -1675,7 +1679,11 @@ def ingest_validated_jsonl(
             evidence = listings.setdefault(group, {}).setdefault(listing[1], _listing_evidence(record, listing[1]))
         planned.append((result, group, evidence))
 
-    keepers = {group: elect_listing_keeper(list(by_handle.values()), market=market)
+    def _current(group: Tuple[str, str]) -> Optional[str]:
+        named = (current_listings or {}).get(group[0])
+        return named[1] if named and named[0] == group[1] else None
+
+    keepers = {group: elect_listing_keeper(list(by_handle.values()), market=market, current=_current(group))
                for group, by_handle in listings.items()}
     listing_collisions: List[Dict[str, Any]] = []
     for group, by_handle in listings.items():
@@ -1733,50 +1741,91 @@ def ingest_validated_jsonl(
 
 
 def _listing_evidence(record: Dict[str, Any], handle: str) -> Dict[str, Any]:
-    """What a reviewer compares across two listings that share a content key: the storefront's
-    own product type and every price the record carries (its variants', else its offers'); and the
-    listing's lowest storefront variant id, which elect_listing_keeper reads as its age."""
+    """What a reviewer compares across two listings that share a content key -- the storefront's own
+    product type, every price the record carries (its variants', else its offers'), its first image --
+    and what elect_listing_keeper ranks on: whether any of it is in stock, and its lowest storefront
+    variant id (its age)."""
     pdp = record.get("pdp") if isinstance(record.get("pdp"), dict) else {}
+    variants = [v for v in pdp.get("variants") or [] if isinstance(v, dict)]
+    offers = [o for o in record.get("offers") or [] if isinstance(o, dict)]
     prices = set()
-    for source in (pdp.get("variants") or [], record.get("offers") or []):
+    for source in (variants, offers):
         for item in source:
             try:
-                price = round(float((item or {}).get("price")), 2)
-            except (TypeError, ValueError, AttributeError):
+                price = round(float(item.get("price")), 2)
+            except (TypeError, ValueError):
                 continue
             if price > 0:
                 prices.add(price)
         if prices:
             break
-    variant_ids = [int(str(v.get("variant_id")).strip()) for v in pdp.get("variants") or []
-                   if isinstance(v, dict) and str(v.get("variant_id") or "").strip().isdigit()]
+    stock = [item.get("in_stock") for item in variants + offers if isinstance(item.get("in_stock"), bool)]
+    variant_ids = [int(str(v.get("variant_id")).strip()) for v in variants
+                   if str(v.get("variant_id") or "").strip().isdigit()]
+    image = next((str(o.get("image_url") or "") for o in offers if o.get("image_url")), "")
     product_type = str(pdp.get("category_source_product_type") or "").strip()
     return {"handle": handle, "product_name": pdp.get("product_name"),
             "product_type": product_type or None, "prices": sorted(prices),
+            "image": image.split("?", 1)[0].rsplit("/", 1)[-1].casefold() or None,
+            "available": any(stock) if stock else None,
             "oldest_variant_id": min(variant_ids) if variant_ids else None}
 
 
-def elect_listing_keeper(listings: List[Dict[str, Any]], *, market: Optional[str] = None) -> Dict[str, Any]:
-    """Which of a host's same-title listings (_listing_evidence dicts) keeps the content key.
+#: Handle suffixes a store uses to name a region's copy of a listing, by the job market they serve.
+#: Measured 2026-09-29: meritbeauty.com -ukeu/-uk/-eu/-ca, beautyofjoseon.com -us/-uk/-eu/-global,
+#: iliabeauty.com -ca/-uk/-gb. `-global` names no region: it is never "another region's copy".
+REGION_HANDLE_SUFFIXES = {
+    "US": ("us",), "CA": ("ca",), "AU": ("au",), "JP": ("jp",), "SG": ("sg",), "KR": ("kr",),
+    "GB": ("uk", "ukeu", "gb"), "EU": ("eu", "ukeu"),
+}
+_EU_MARKETS = frozenset({"AT", "BE", "DE", "DK", "ES", "FI", "FR", "IE", "IT", "NL", "PL", "PT", "SE"})
+
+
+def _region_suffixes(market: Optional[str]) -> Tuple[str, ...]:
+    code = str(market or "US").strip().upper()
+    return REGION_HANDLE_SUFFIXES.get("EU" if code in _EU_MARKETS else "GB" if code == "UK" else code, ())
+
+
+def _region_copy(handle: str, handles: List[str], suffixes: Iterable[str]) -> bool:
+    """`handle` is `<stem>-<suffix>` for one of `suffixes` AND another listing of the group shares that
+    stem (is it, or `<stem>-...`): a region copy, not a product whose name ends in "-us"."""
+    for suffix in suffixes:
+        if handle.endswith("-" + suffix):
+            stem = handle[:-len(suffix) - 1]
+            if any(o != handle and (o == stem or o.startswith(stem + "-")) for o in handles):
+                return True
+    return False
+
+
+def elect_listing_keeper(listings: List[Dict[str, Any]], *, market: Optional[str] = None,
+                         current: Optional[str] = None) -> Dict[str, Any]:
+    """Which of a host's same-title listings keeps the content key. `listings` are _listing_evidence
+    dicts (the repair builds the same shape from the catalog); `current` is the handle the row names today.
 
     Never record order: Shopify's /products.json lists newest-published first, so first-wins kept
     whatever the merchant published last -- measured 2026-09-29 on meritbeauty.com, 32 of 36
     price-identical pairs kept a `-ukeu`/`-ca`/`-eu` copy that 404s for a US shopper over the US page,
-    and every new ad-landing clone would move the key's listing again. In order:
-      1. the listing named for the market (`<handle>-us` for US; the CLI and Path C declare none: US);
-      2. a base listing: not another listing's handle plus a suffix (`the-minimalist` over
-         `the-minimalist-ukeu`, `serum` over `serum-sachet`);
-      3. the oldest listing: lowest storefront variant id (ids are issued in creation order, so a
-         newer clone never displaces it); a listing without one ranks after those with one;
-      4. the handle, so the choice is total.
-    One function for the ingest and any repair of rows it wrote, so the two keep the same page."""
-    suffix = "-" + str(market or "US").strip().lower()
+    and every new ad-landing clone would have moved the key's listing again. In order:
+      1. the region copy named for the market (`<stem>-us` for US; the CLI and Path C declare none: US);
+      2. available: in stock first, unknown next, out of stock last (a stale base never beats a live relist,
+         and the repair, which often knows nothing of an ad clone, never trades a selling page for it);
+      3. not another region's copy (`-ukeu` for a US job; `-global` is no region);
+      4. a base listing: not another listing's handle plus a suffix (`serum` over `serum-sachet`);
+      5. the row's current listing, so a tie never moves a row that is already right;
+      6. the oldest listing: lowest storefront variant id (issued in creation order); none ranks last;
+      7. the handle, so the choice is total.
+    ONE function for the ingest and scripts/repair_same_title_listings.py, so the two keep one page."""
+    own = _region_suffixes(market)
+    foreign = {s for suffixes in REGION_HANDLE_SUFFIXES.values() for s in suffixes} - set(own)
     handles = [str(item["handle"]) for item in listings]
 
     def rank(item: Dict[str, Any]) -> tuple:
         handle = str(item["handle"])
         derived = any(handle != other and handle.startswith(other + "-") for other in handles)
         oldest = item.get("oldest_variant_id")
-        return (not handle.endswith(suffix), derived, oldest is None, oldest or 0, handle)
+        stock = {True: 0, None: 1, False: 2}.get(item.get("available"), 1)
+        return (not _region_copy(handle, handles, own), stock,
+                _region_copy(handle, handles, foreign), derived, handle != current,
+                oldest is None, oldest or 0, handle)
 
     return min(listings, key=rank)

@@ -233,6 +233,11 @@ async def _process_curated_brand(payload: Dict[str, Any], *, apply: bool, db: An
         inspect_primary_plan, require_primary_plan, require_primary_apply,
     )
     plan = ingest_validated_jsonl(records)
+    if db is not None and plan.get("listing_collisions"):
+        # Keep the listing each collided row names today on a tie (ingestion.elect_listing_keeper).
+        from services.catalog_enrichment_agent.apply import current_listings
+        current = await current_listings([c["product_key"] for c in plan["listing_collisions"]], db=db)
+        plan = ingest_validated_jsonl(records, current_listings=current)
     out = {"records": len(records), "plan_pdps": len(plan.get("pdps") or []), "applied": None,
            "crawl": crawl_report, "primary_ingestion": inspect_primary_plan(plan),
            # Listings left out: another listing on this host has the same title (one content key).

@@ -2515,3 +2515,28 @@ async def _apply_ingest_plan_batched(
     # The list can be thousands of rows; one log entry past 256 KiB is dropped by Cloud Logging.
     logger.info("apply_ingest_plan(batch) applied: %s", {**counts, "skipped_products": len(counts["skipped_products"])})
     return counts
+
+
+_CURRENT_LISTINGS_SQL = """
+                SELECT product_key, canonical_url FROM catalog_products
+                WHERE product_key = ANY(:product_keys)
+                """
+
+
+async def current_listings(product_keys: List[str], *, db: Any) -> Dict[str, Any]:
+    """product_key -> the (host, listing) its catalog row names today (ingestion.content_listing of its
+    canonical_url), for ingestion.elect_listing_keeper's tie-break: a re-ingest keeps the listing a row
+    already names -- the one scripts/repair_same_title_listings.py aligned it to -- unless a stronger
+    rule says otherwise. Read-only; keys with no row or no readable URL are absent."""
+    from services.catalog_enrichment_agent.ingestion import content_listing
+
+    keys = sorted({str(k) for k in product_keys if k})
+    if not keys:
+        return {}
+    rows = await db.fetch_all(_CURRENT_LISTINGS_SQL, {"product_keys": keys})
+    out = {}
+    for row in rows:
+        listing = content_listing(row["canonical_url"])
+        if listing:
+            out[str(row["product_key"])] = listing
+    return out

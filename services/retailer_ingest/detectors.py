@@ -366,17 +366,19 @@ def listing_collision_flags(collisions: Iterable[Dict[str, Any]]) -> List[Dict[s
     the same host carries the same title, and so the same content key (ingestion.ingest_validated_jsonl).
 
     Leaving it out is what keeps a buyer from seeing one page and buying another; the flag says what
-    was left out. INFO when both pages look like one product listed twice -- the same prices and the
-    same merchant product type (an ad landing clone, a region copy at one price). Otherwise BLOCK: a
-    different price or type is how a different product wearing the same title shows (COCODOR
-    "Black Cherry" refill $6.99 vs diffuser $11.19; Mr. Smith full size vs sachet), and a reviewer
-    decides. Accepting the key applies the cohort without that listing; exclude_handles on the KEPT
-    listing makes the other one the row's listing instead."""
+    was left out. INFO only when both pages look like one product listed twice -- the same prices, the
+    same merchant product type AND the same image (an ad landing clone, a region copy). Otherwise BLOCK,
+    and a reviewer decides: a different price or type is how a different product wearing the same title
+    shows (COCODOR "Black Cherry" refill $6.99 vs diffuser $11.19; Mr. Smith full size vs sachet), and a
+    different image at one price is a shade (us.mcobeauty.com lists each "Dream Liquid Dewy Blush" shade
+    as its own $5.99 product). Accepting the key (or options.accept_listing_collisions) applies the cohort
+    without that listing; exclude_handles on the KEPT listing makes the other one the row's listing."""
     flags = []
     for c in collisions or []:
         kept, dropped = c.get("kept") or {}, c.get("dropped") or {}
         same = (bool(kept.get("prices")) and kept.get("prices") == dropped.get("prices")
-                and kept.get("product_type") == dropped.get("product_type"))
+                and kept.get("product_type") == dropped.get("product_type")
+                and bool(kept.get("image")) and kept.get("image") == dropped.get("image"))
         flags.append({
             "key": f"same_key_other_listing:{dropped.get('handle')}",
             "rule": "same_key_other_listing",
@@ -386,9 +388,10 @@ def listing_collision_flags(collisions: Iterable[Dict[str, Any]]) -> List[Dict[s
             "category_path": None,
             "merchant_product_type": dropped.get("product_type"),
             "detail": (f"left out: {c.get('host')} lists {dropped.get('handle')!r} (type "
-                       f"{dropped.get('product_type')!r}, prices {(dropped.get('prices') or [])[:4]}) under the "
-                       f"same title as {kept.get('handle')!r} (type {kept.get('product_type')!r}, prices "
-                       f"{(kept.get('prices') or [])[:4]}), which keeps {c.get('product_key')}"),
+                       f"{dropped.get('product_type')!r}, prices {(dropped.get('prices') or [])[:4]}, image "
+                       f"{dropped.get('image')!r}) under the same title as {kept.get('handle')!r} (type "
+                       f"{kept.get('product_type')!r}, prices {(kept.get('prices') or [])[:4]}, image "
+                       f"{kept.get('image')!r}), which keeps {c.get('product_key')}"),
         })
     return flags
 
