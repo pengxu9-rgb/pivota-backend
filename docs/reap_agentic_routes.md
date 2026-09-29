@@ -184,6 +184,7 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 | 409 | `row_variant_unverified` | Tier B has no numeric Shopify variant verified from our catalog or active same-market seed | fall back |
 | 409 | `seller_identity_unverified` | the catalog seller identity does not agree with the offer owner | fall back |
 | 409 | `row_unpriced` | **this merchant** has no usable offer of its own on the sku, or the price is not exactly representable in minor units | fall back |
+| 409 | `row_price_ambiguous` | cart-link lane, no `variant_key`: the catalog spells the ONE chosen Shopify variant with several skus, and this merchant's usable offers on them carry different prices | fall back, or name the sku (`variant_key`) to buy at that sku's price |
 | 409 | `row_currency_mismatch` | the offer is priced in a currency the buyer's market does not use | fall back |
 | 409 | `idempotency_conflict` | this key was already used for a **different** request | use a new key, or re-send the original request |
 | 400 | `consent_required` | `buyer.consent_version` is **absent, blank, longer than 32 characters, or carries an unprintable character** — i.e. a string-shaped value that is not usable | show your user the terms, then resend with the tag |

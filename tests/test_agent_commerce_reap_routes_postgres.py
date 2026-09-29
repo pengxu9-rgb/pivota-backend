@@ -1552,10 +1552,19 @@ async def test_tierb_mirrored_seed_requires_storefront_evidence_on_postgres(clie
             "source_system = 'external_product_seeds_mirror_v1', source_ref = :seed_id "
             "WHERE product_key = :pk", {"seed_id": seed_id, "pk": PRODUCT_KEY},
         )
+        # The mirror's real placeholder: `<product_key>::canonical`, source_variant_id = the key.
+        placeholder = f"{PRODUCT_KEY}::canonical"
         await database.execute(
-            "UPDATE catalog_skus SET source_variant_id = :pk WHERE sku_key = :sk",
-            {"pk": PRODUCT_KEY, "sk": SKU_KEY},
+            "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, "
+            "source_product_id, source_variant_id, title, currency) SELECT :new, product_key, "
+            "merchant_id, platform, source_product_id, :pk, title, currency FROM catalog_skus "
+            "WHERE sku_key = :old", {"new": placeholder, "pk": PRODUCT_KEY, "old": SKU_KEY},
         )
+        await database.execute(
+            "UPDATE catalog_offers SET sku_key = :new WHERE sku_key = :old",
+            {"new": placeholder, "old": SKU_KEY},
+        )
+        await database.execute("DELETE FROM catalog_skus WHERE sku_key = :old", {"old": SKU_KEY})
         stamped = json.dumps({"snapshot": {"storefront_platform": "shopify", "variants": [
             {"shopify_variant_id": "50041364447509"}
         ], "shopify_cart_proof": {
@@ -1580,7 +1589,8 @@ async def test_tierb_mirrored_seed_requires_storefront_evidence_on_postgres(clie
             "VALUES (:domain, 'US', 'ELIGIBLE', now(), 1)", {"domain": DOMAIN},
         )
         monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
-        response = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link"))
+        response = await client.post(
+            f"{BASE}/purchases", json=_body(item_source="cart_link", variant_key=None))
         assert response.status_code == 202, response.text
         purchase = await database.fetch_one(
             "SELECT cart_url FROM reap_agentic_purchases WHERE id = :id",
@@ -1592,6 +1602,94 @@ async def test_tierb_mirrored_seed_requires_storefront_evidence_on_postgres(clie
             "DELETE FROM external_product_seeds WHERE id = :seed_id", {"seed_id": seed_id}
         )
         await database.execute("DROP TABLE external_product_seeds")
+
+
+@pytest.mark.parametrize("seller_merchant,expected", [
+    ("merch_obs_a25cbba37ef98c52", 202),     # derived from (Judydoll, judydoll.com): the live row
+    ("merch_obs_0000000000000000", 409),     # not the derived id: seller_identity_unverified
+])
+async def test_tierb_a_live_shaped_mirror_row_on_postgres(client, monkeypatch, seller_merchant, expected):
+    """The staging-demo row, on the production dialect: the `::canonical` placeholder, the crawl
+    lane's `::sku_…` (`ext_…:<n>`) and the promoter's `::v:<n>` naming ONE Shopify variant; offers
+    on every sku; seller_ref NULL; a real mirror seed with a fresh storefront proof."""
+    from db.sql_migrations import split_statements
+
+    ext = "ext_0f95730ee5ba05a6b7957ada"
+    pk = f"prod::external_seed::external_seed::{ext}"
+    seed_id = "epsv_38ad88d436c32e24ba7c6446"
+    domain = "judydoll.com"
+    variant = "49819267301653"
+    await database.execute("DROP TABLE IF EXISTS external_product_seeds")
+    for statement in split_statements(
+        (_MIGRATIONS_DIR / "044_external_product_seeds.sql").read_text(encoding="utf-8")
+    ):
+        await database.execute(statement)
+    try:
+        await database.execute(
+            "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, "
+            "title, brand, category, product_type, source_domain, source_system, source_ref, "
+            "seller_ref, seed_kind) VALUES (:pk, :m, 'external_seed', :ext, 'Silky Matte Lip Ink', "
+            "'Judydoll', 'makeup', 'Lipstick', :d, 'external_product_seeds_mirror_v1', :seed, "
+            "NULL, 'self')",
+            {"pk": pk, "m": seller_merchant, "ext": ext, "d": domain, "seed": seed_id},
+        )
+        for sku_key, vid in ((f"{pk}::canonical", pk),
+                             (f"{pk}::sku_58ae6f8de2c8797993f2", f"{ext}:{variant}"),
+                             (f"{pk}::v:{variant}", variant)):
+            await database.execute(
+                "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, "
+                "source_product_id, source_variant_id, title, currency) VALUES "
+                "(:sk, :pk, :m, 'external_seed', :ext, :vid, 'Silky Matte Lip Ink', 'USD')",
+                {"sk": sku_key, "pk": pk, "m": seller_merchant, "ext": ext, "vid": vid},
+            )
+            await database.execute(
+                "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, "
+                "merchant_effective_price, availability) VALUES "
+                "(:oid, :sk, :pk, :m, 'USD', 13.99, 'in_stock')",
+                {"oid": f"off_pg_{sku_key[-20:]}", "sk": sku_key, "pk": pk, "m": seller_merchant},
+            )
+        seed_data = json.dumps({"snapshot": {
+            "brand": "Judydoll", "storefront_platform": "shopify",
+            "storefront_platform_source": "products_js_v1",
+            "variants": [{"title": "Default Title", "shopify_variant_id": variant}],
+            "shopify_cart_proof": {
+                "source": "products_js_v1",
+                "product_js_url": f"https://{domain}/products/silky-matte-lip-ink.js",
+                "live_variant_count": 1, "variant_id": variant,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }}})
+        await database.execute(
+            "INSERT INTO external_product_seeds (id, market, destination_url, domain, "
+            "attached_product_key, attached_variant_id, seed_data) VALUES "
+            "(:id, 'US', :url, :d, :pk, NULL, CAST(:sd AS JSONB))",
+            {"id": seed_id, "url": f"https://{domain}/products/silky-matte-lip-ink", "d": domain,
+             "pk": pk, "sd": seed_data},
+        )
+        await database.execute(
+            "INSERT INTO tierb_cart_link_eligibility "
+            "(shop_domain, market, verdict, checked_at, consecutive_same) "
+            "VALUES (:d, 'US', 'ELIGIBLE', now(), 1)", {"d": domain},
+        )
+        monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+        response = await client.post(f"{BASE}/purchases", json=_body(
+            item_source="cart_link", merchant_domain=domain, product_key=pk, variant_key=None))
+        assert response.status_code == expected, response.text
+        if expected == 202:
+            purchase = await database.fetch_one(
+                "SELECT cart_url, our_price_minor FROM reap_agentic_purchases WHERE id = :id",
+                {"id": response.json()["purchase_id"]},
+            )
+            assert f"https://{domain}/cart/{variant}:1?" in purchase["cart_url"]
+            assert purchase["our_price_minor"] == 1399
+        else:
+            assert _error(response) == "seller_identity_unverified"
+    finally:
+        await database.execute("DELETE FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+        await database.execute("DROP TABLE external_product_seeds")
+        for table in ("catalog_offers", "catalog_skus", "catalog_products"):
+            await database.execute(f"DELETE FROM {table} WHERE product_key = :pk", {"pk": pk})
+        await database.execute(
+            "DELETE FROM tierb_cart_link_eligibility WHERE shop_domain = :d", {"d": domain})
 
 
 @pytest.mark.parametrize(
