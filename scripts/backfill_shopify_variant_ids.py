@@ -12,7 +12,12 @@ stamps into `seed_data.snapshot`:
     storefront_platform        = "shopify"          <- proves the is_shopify gate's predicate
     storefront_platform_source = "products_js_v1"   <- provenance, so the claim is auditable
     variants[].shopify_variant_id                   <- the numeric id the permalink needs
-    shopify_cart_proof                               <- same-fetch sole-live-variant attestation
+    shopify_cart_proof                               <- same-fetch cart attestation, one of:
+        * sole-variant (no `scope`): the live product has exactly one variant, the seed's;
+        * `scope: named_variant`: the seed names ONE variant of a multi-variant product
+          (services.shopify_variant_identity.named_cart_variant_id) and the live products.js
+          lists it, available. Written from the SAME fetch; see `build_cart_proof`.
+      JSON null when the fetch supports neither: that REVOKES any earlier proof.
 
 A successful `/products/<handle>.js` parse IS the proof of Shopify-ness: only Shopify serves
 that endpoint in that shape. So the same fetch that recovers variant ids also establishes
@@ -127,6 +132,10 @@ if str(ROOT) not in sys.path:
 
 from db.database import database  # noqa: E402
 from services.shopify_variant_identity import (  # noqa: E402
+    CART_PROOF_SCOPE_NAMED,
+    CART_PROOF_SCOPE_SOLE,
+    _numeric_id,
+    named_cart_variant_id,
     parse_product_js,
     product_js_url,
     stamp_variant_ids,
@@ -193,6 +202,12 @@ SELECT_CANDIDATES_SQL = f"""
       AND jsonb_array_length({_SNAPSHOT_VARIANTS_SAFE}) > 0
       -- Unstamped variants need recovery; a sole stamped row without cart proof needs
       -- same-fetch proof; a row with proof is revisited to refresh or revoke it.
+      -- NAMED-VARIANT SEEDS ARE ALREADY IN HERE, by construction, not by a new clause:
+      -- `named_cart_variant_id` names a variant only from a snapshot of exactly ONE entry
+      -- (a 2+ entry snapshot names nothing), so every seed that can carry a named proof is
+      -- either unstamped (clause 1), single-entry without a proof key (clause 2), or holds a
+      -- proof key -- including the JSON null a revocation writes (clause 3).
+      -- tests/test_backfill_shopify_variant_ids_postgres.py pins all three shapes.
       AND (EXISTS (
             SELECT 1 FROM jsonb_array_elements({_SNAPSHOT_VARIANTS_SAFE}) AS v
             -- NUMERIC, not merely non-empty. A live writer lands unvalidated variant keys
@@ -358,6 +373,67 @@ async def fetch_product_js(client: Any, url: str) -> Tuple[Optional[Any], str]:
         return None, "unparseable"
 
 
+def build_cart_proof(
+    seed_data: Dict[str, Any], new_variants: List[Dict[str, Any]], payload: Any,
+    live: List[Dict[str, Any]], *, js_url: str, page_url: Optional[str], shop_host: str,
+    checked_at: datetime,
+) -> Optional[Dict[str, Any]]:
+    """The `snapshot.shopify_cart_proof` ONE products.js fetch supports, or None (= revoke).
+
+    PURE, and the only place a proof is authored, so the tests drive exactly what is written.
+
+    1. THE SOLE-VARIANT PROOF, unchanged: the live product has exactly one variant and it is the
+       seed's one (now stamped) entry. No `scope` key -- it is byte-for-byte what it always was.
+       It is tried FIRST, so a fetch that supports it can never write the weaker named proof.
+    2. ELSE THE NAMED-VARIANT PROOF: the seed names ONE variant
+       (`services.shopify_variant_identity.named_cart_variant_id`, over the variants as they will
+       be written and the same product URL the fetch was derived from), that variant appears
+       EXACTLY once in the live payload, and it is `available`. Records the live count and price
+       for audit; neither is a gate.
+    3. ELSE None, which the caller writes as JSON null: a prior proof whose variant has vanished,
+       gone unavailable, or is no longer the one the seed names is REVOKED by the same fetch.
+    """
+    raw_live = payload.get("variants") if isinstance(payload, dict) else None
+    live_count = len(raw_live) if isinstance(raw_live, list) else 0
+    stamp = checked_at.isoformat()
+    if (
+        live_count == 1 and len(live) == 1 and len(new_variants) == 1
+        and new_variants[0].get("shopify_variant_id") == live[0]["shopify_variant_id"]
+    ):
+        return {
+            "source": STOREFRONT_PLATFORM_SOURCE,
+            "product_js_url": js_url,
+            "live_variant_count": 1,
+            "variant_id": live[0]["shopify_variant_id"],
+            "checked_at": stamp,
+        }
+    stamped_seed = {**seed_data, "snapshot": {**(seed_data.get("snapshot") or {}),
+                                              "variants": new_variants}}
+    named = named_cart_variant_id(stamped_seed, product_urls=[page_url], shop_domain=shop_host)
+    if not named:
+        return None
+    hits = [item for item in live if item.get("shopify_variant_id") == named]
+    if len(hits) != 1 or hits[0].get("available") is not True:
+        return None
+    price_minor = None
+    for raw in raw_live or []:
+        if isinstance(raw, dict) and _numeric_id(raw.get("id")) == named:
+            value = raw.get("price")
+            if isinstance(value, int) and not isinstance(value, bool):
+                price_minor = value
+            break
+    return {
+        "source": STOREFRONT_PLATFORM_SOURCE,
+        "scope": CART_PROOF_SCOPE_NAMED,
+        "product_js_url": js_url,
+        "variant_id": named,
+        "available": True,
+        "live_variant_count": live_count,
+        "price_minor": price_minor,
+        "checked_at": stamp,
+    }
+
+
 async def run(
     limit: int, domain: Optional[str], apply: bool, client: Any, after: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -366,6 +442,7 @@ async def run(
     outcomes: Counter = Counter()
     reasons: Counter = Counter()
     per_domain_blocks: Counter = Counter()
+    proof_scopes: Counter = Counter()
     stamped_total = 0
     changed_rows = 0
     conflicts = 0
@@ -424,20 +501,13 @@ async def run(
         live = parse_product_js(payload)
         new_variants, report = stamp_variant_ids(variants, live)
         reasons[report["reason"]] += 1
-        raw_live = payload.get("variants") if isinstance(payload, dict) else None
-        live_count = len(raw_live) if isinstance(raw_live, list) else 0
-        cart_proof = None
-        if (
-            live_count == 1 and len(live) == 1 and len(new_variants) == 1
-            and new_variants[0].get("shopify_variant_id") == live[0]["shopify_variant_id"]
-        ):
-            cart_proof = {
-                "source": STOREFRONT_PLATFORM_SOURCE,
-                "product_js_url": js_url,
-                "live_variant_count": 1,
-                "variant_id": live[0]["shopify_variant_id"],
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-            }
+        cart_proof = build_cart_proof(
+            seed_data, new_variants, payload, live,
+            js_url=js_url, page_url=page_url, shop_host=host,
+            checked_at=datetime.now(timezone.utc),
+        )
+        if cart_proof is not None:
+            proof_scopes[cart_proof.get("scope") or CART_PROOF_SCOPE_SOLE] += 1
         prior_proof = (seed_data.get("snapshot") or {}).get("shopify_cart_proof")
         if report["stamped"] <= 0 and not cart_proof and not prior_proof:
             continue
@@ -476,6 +546,9 @@ async def run(
         "write_conflicts": conflicts,
         "fetch_outcomes": dict(outcomes),
         "match_reasons": dict(reasons),
+        # Proofs this run computed, by scope (a dry run too). `sole_variant` is the unscoped
+        # proof; `named_variant` attests the one variant a seed names on a multi-variant product.
+        "cart_proofs": dict(proof_scopes),
         "most_blocked_domains": dict(per_domain_blocks.most_common(10)),
     }
 

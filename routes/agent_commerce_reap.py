@@ -131,7 +131,7 @@ from services.outbound_links_service import (
     build_shopify_cart_permalink,
     extract_shopify_numeric_variant_id,
 )
-from services.shopify_variant_identity import sole_verified_cart_variant_id
+from services.shopify_variant_identity import CART_PROOF_SCOPE_NAMED, verified_cart_variant_id
 # THE owner of the observed seller-of-record id (`merch_obs_<hash>`): the SAME dispatch every
 # ingestion and re-key path mints with (retailer domain -> etld1 alone, else (brand, etld1)).
 # Imported, never re-implemented -- see `_mirror_seller_ref`.
@@ -1466,6 +1466,7 @@ async def _load_cart_link_item(
     if platform not in ("shopify", "external_seed"):
         raise svc.PurchaseRefused("row_not_shopify", "cart-link product has no Shopify source")
 
+    proof_scope: Optional[str] = None  # the mirror's storefront-proof scope; None on shopify rows
     named: Optional[Dict[str, Any]] = None
     if variant_key:
         raw_sku = await database.fetch_one(
@@ -1524,11 +1525,15 @@ async def _load_cart_link_item(
                 seed_data = json.loads(seed_data)
             except (TypeError, ValueError):
                 seed_data = None
-        variant_id = sole_verified_cart_variant_id(
+        # Sole-variant proof, or a named-variant proof (a multi-variant product whose seed names
+        # ONE variant) -- which also requires the catalog's chosen variant to be that one.
+        proven = verified_cart_variant_id(
             seed_data,
             product_urls=[seed.get("canonical_url") or seed.get("destination_url")],
             shop_domain=merchant_domain,
+            catalog_variant_id=sku_variant,
         )
+        variant_id, proof_scope = proven if proven else (None, None)
         # THE SEED'S STOREFRONT PROOF IS THE AUTHORITY; the catalog sku must AGREE with it. A sku
         # naming another Shopify variant than the one the storefront proved is a contradiction.
         if sku_variant is not None and variant_id != sku_variant:
@@ -1599,6 +1604,11 @@ async def _load_cart_link_item(
     if not priced:
         raise svc.PurchaseRefused("row_unpriced", "seller has no usable offer on this sku")
     sku, offer, currency, price_minor = priced[0]
+    if proof_scope == CART_PROOF_SCOPE_NAMED and _is_placeholder_sku(sku, product_key):
+        # A NAMED-variant proof is about one variant of a multi-variant product: only that
+        # variant's own sku offer is its price. The product-level `::canonical` placeholder offer
+        # stands in only under a SOLE proof (one live variant), never here.
+        raise svc.PurchaseRefused("row_unpriced", "no offer on the proven variant's own sku")
     if currency != _MARKET_CURRENCY.get(market_country):
         raise svc.PurchaseRefused("row_currency_mismatch", "offer currency differs from market")
     if not price_minor or price_minor <= 0:

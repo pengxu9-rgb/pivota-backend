@@ -59,8 +59,8 @@ from __future__ import annotations
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urlunparse
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 # Shopify caps a product at 100 variants; anything past that is not a Shopify product page.
 MAX_VARIANTS = 100
@@ -390,6 +390,68 @@ def sole_stamped_variant_id(seed_data: Any) -> Optional[str]:
     return sole if _numeric_id(sole) else None
 
 
+#: The one provenance a cart proof may carry: a successful `/products/<handle>.js` fetch by
+#: scripts/backfill_shopify_variant_ids.py, the ONLY writer of `snapshot.shopify_cart_proof`.
+CART_PROOF_SOURCE = "products_js_v1"
+#: `scope` of a proof that attests ONE NAMED variant of a (possibly multi-variant) product. The
+#: original sole-variant proof carries NO `scope` key, and is left exactly as it was written.
+CART_PROOF_SCOPE_NAMED = "named_variant"
+#: The label `verified_cart_variant_id` reports for the unscoped sole-variant proof. A label for
+#: callers only: it is never written into a proof.
+CART_PROOF_SCOPE_SOLE = "sole_variant"
+#: How old a proof may be. One number for both scopes.
+CART_PROOF_MAX_AGE = timedelta(days=7)
+
+
+def _cart_proof(seed_data: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(seed_data, dict):
+        return None
+    snapshot = seed_data.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    proof = snapshot.get("shopify_cart_proof")
+    return proof if isinstance(proof, dict) else None
+
+
+def _cart_proof_fetch_is_trusted(
+    proof: Dict[str, Any], *, product_urls: List[str], shop_domain: str, now: Optional[datetime],
+) -> bool:
+    """THE FETCH RULE, shared by both scopes: the proof came from a products.js fetch of THIS
+    seed's own product URL, over https on the shop's own host (default port), and is fresh.
+
+    `product_js_url` must be one of the seed's product URLs + `.js` (so a proof cannot be carried
+    to another product), its scheme https and port 443, its host byte-equal to `shop_domain`, and
+    `checked_at` a tz-aware ISO timestamp neither in the future nor older than
+    `CART_PROOF_MAX_AGE`. Every scope-specific rule sits on top of this one; none restates it.
+    """
+    if proof.get("source") != CART_PROOF_SOURCE:
+        return False
+    proof_url = proof.get("product_js_url")
+    if not isinstance(proof_url, str) or proof_url not in {
+        product_js_url(url) for url in product_urls if url
+    }:
+        return False
+    try:
+        proof_origin = urlparse(proof_url)
+        proof_host = proof_origin.hostname
+        proof_port = proof_origin.port
+    except ValueError:
+        return False
+    if (proof_origin.scheme != "https" or proof_port not in (None, 443)
+            or proof_host != str(shop_domain or "").strip().lower()):
+        return False
+    try:
+        checked_at = datetime.fromisoformat(str(proof.get("checked_at") or ""))
+    except ValueError:
+        return False
+    if checked_at.tzinfo is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    if checked_at > current or current - checked_at > CART_PROOF_MAX_AGE:
+        return False
+    return True
+
+
 def sole_verified_cart_variant_id(
     seed_data: Any, *, product_urls: List[str], shop_domain: str,
     now: Optional[datetime] = None,
@@ -399,41 +461,145 @@ def sole_verified_cart_variant_id(
     A snapshot with one stamped entry is insufficient: a label match can stamp that entry
     while Shopify's live product has several variants. The dedicated proof is written only
     from a successful products.js response by the backfill, never inferred from seed labels.
+
+    THE SOLE-VARIANT RULE: an UNSCOPED proof (no `scope` key -- a named-variant proof is never
+    read as a sole one, even when its informational count happens to be 1), live_variant_count
+    exactly the int 1, its variant the seed's sole stamped entry, and the shared fetch rule.
     """
-    if not isinstance(seed_data, dict):
-        return None
-    snapshot = seed_data.get("snapshot")
-    if not isinstance(snapshot, dict):
-        return None
-    proof = snapshot.get("shopify_cart_proof")
-    if not isinstance(proof, dict) or proof.get("source") != "products_js_v1":
+    proof = _cart_proof(seed_data)
+    if proof is None or "scope" in proof:
         return None
     if type(proof.get("live_variant_count")) is not int or proof["live_variant_count"] != 1:
         return None
     variant_id = sole_stamped_variant_id(seed_data)
     if not variant_id or _numeric_id(proof.get("variant_id")) != variant_id:
         return None
-    proof_url = proof.get("product_js_url")
-    if not isinstance(proof_url, str) or proof_url not in {
-        product_js_url(url) for url in product_urls if url
-    }:
-        return None
-    try:
-        proof_origin = urlparse(proof_url)
-        proof_host = proof_origin.hostname
-        proof_port = proof_origin.port
-    except ValueError:
-        return None
-    if (proof_origin.scheme != "https" or proof_port not in (None, 443)
-            or proof_host != str(shop_domain or "").strip().lower()):
-        return None
-    try:
-        checked_at = datetime.fromisoformat(str(proof.get("checked_at") or ""))
-    except ValueError:
-        return None
-    if checked_at.tzinfo is None:
-        return None
-    current = now or datetime.now(timezone.utc)
-    if checked_at > current or current - checked_at > timedelta(days=7):
+    if not _cart_proof_fetch_is_trusted(
+        proof, product_urls=product_urls, shop_domain=shop_domain, now=now,
+    ):
         return None
     return variant_id
+
+
+def _url_named_variant_ids(product_urls: List[str], shop_domain: str) -> Optional[set]:
+    """The distinct `variant=` values on the seed's own product URLs on the shop host.
+
+    None means "the URLs name something unreadable" (a non-numeric or blank `variant=`) and
+    refuses outright. A URL on another host is not the seed's storefront URL and names nothing.
+    """
+    host = str(shop_domain or "").strip().lower()
+    named: set = set()
+    for url in product_urls or []:
+        if not url:
+            continue
+        try:
+            parsed = urlparse(str(url))
+            url_host = parsed.hostname
+        except ValueError:
+            return None
+        if not host or url_host != host:
+            continue
+        for value in parse_qs(parsed.query, keep_blank_values=True).get("variant", []):
+            if not (value.isascii() and value.isdigit()):
+                return None
+            named.add(value)
+    return named
+
+
+def named_cart_variant_id(
+    seed_data: Any, *, product_urls: List[str], shop_domain: str,
+) -> Optional[str]:
+    """THE NAMING RULE: the ONE Shopify variant a seed names, or None.
+
+    A seed names a variant through
+      * its snapshot: exactly ONE variant entry, stamped with a numeric `shopify_variant_id`
+        (`sole_stamped_variant_id`) -- a snapshot with two or more entries is a product-grain
+        seed that names no single variant, and names NOTHING here even if a URL does; and/or
+      * its own product URL(s) on the shop host: exactly one distinct numeric `variant=`.
+    Both present -> they must AGREE, else None. Zero named, two named (two distinct URL values,
+    or snapshot and URL disagreeing), or an unreadable `variant=` -> None.
+
+    ACCEPT {1 entry stamped 4981}; {1 entry stamped 4981, url ?variant=4981}; {1 unstamped
+    entry, url ?variant=4981}. REFUSE {2 entries}; {stamped 4981, url ?variant=4982};
+    {url ?variant=1&variant=2}; {url ?variant=abc}; {1 unstamped entry, no variant= url}.
+
+    Read by the backfill (to decide what to fetch-prove) AND by `verified_cart_variant_id` (to
+    check the proof is about the variant the seed names), so the two can never disagree.
+    """
+    if not isinstance(seed_data, dict):
+        return None
+    snapshot = seed_data.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    variants = snapshot.get("variants")
+    if isinstance(variants, list) and len(variants) > 1:
+        return None
+    stamped = sole_stamped_variant_id(seed_data)
+    from_urls = _url_named_variant_ids(product_urls, shop_domain)
+    if from_urls is None or len(from_urls) > 1:
+        return None
+    from_url = next(iter(from_urls)) if from_urls else None
+    if stamped and from_url and stamped != from_url:
+        return None
+    return stamped or from_url
+
+
+def named_verified_cart_variant_id(
+    seed_data: Any, *, product_urls: List[str], shop_domain: str,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """THE NAMED-VARIANT RULE: a `scope: named_variant` proof whose variant is the one the
+    seed names (`named_cart_variant_id`), `available` exactly True on the live products.js, and
+    the shared fetch rule. `live_variant_count` is informational and NOT read here: the product
+    may have any number of variants, because the seed -- not the product -- names the one to buy.
+    """
+    proof = _cart_proof(seed_data)
+    if proof is None or proof.get("scope") != CART_PROOF_SCOPE_NAMED:
+        return None
+    named = named_cart_variant_id(seed_data, product_urls=product_urls, shop_domain=shop_domain)
+    if not named or _numeric_id(proof.get("variant_id")) != named:
+        return None
+    if proof.get("available") is not True:
+        return None
+    if not _cart_proof_fetch_is_trusted(
+        proof, product_urls=product_urls, shop_domain=shop_domain, now=now,
+    ):
+        return None
+    return named
+
+
+class ProvenCartVariant(NamedTuple):
+    variant_id: str
+    #: `CART_PROOF_SCOPE_SOLE` or `CART_PROOF_SCOPE_NAMED`. Callers gate on it: only a SOLE proof
+    #: shows the product has one live variant, so only it may let a product-level (placeholder)
+    #: price stand in for the variant's own.
+    scope: str
+
+
+def verified_cart_variant_id(
+    seed_data: Any, *, product_urls: List[str], shop_domain: str,
+    catalog_variant_id: Optional[str], now: Optional[datetime] = None,
+) -> Optional[ProvenCartVariant]:
+    """The Shopify variant a mirrored cart link may buy: the sole-variant proof, else the
+    named-variant proof. The reap cart-link lane's one authority call.
+
+    `catalog_variant_id` is the catalog's chosen numeric variant (None when the product carries
+    only its `::canonical` placeholder). A SOLE proof keeps today's contract -- the caller refuses
+    a catalog variant that differs, and a placeholder-only row is bought on the proof alone,
+    because there is nothing else to buy. A NAMED proof is for a product that HAS other variants,
+    so the catalog must name the SAME one explicitly: a placeholder-only row is refused here,
+    since its product-level offer is not a price anybody vouched for on that one shade.
+
+    Returns the variant AND the scope that proved it, or None.
+    """
+    sole = sole_verified_cart_variant_id(
+        seed_data, product_urls=product_urls, shop_domain=shop_domain, now=now,
+    )
+    if sole:
+        return ProvenCartVariant(sole, CART_PROOF_SCOPE_SOLE)
+    named = named_verified_cart_variant_id(
+        seed_data, product_urls=product_urls, shop_domain=shop_domain, now=now,
+    )
+    if named and named == catalog_variant_id:
+        return ProvenCartVariant(named, CART_PROOF_SCOPE_NAMED)
+    return None

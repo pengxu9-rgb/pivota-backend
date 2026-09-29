@@ -793,3 +793,224 @@ def test_a_myshopify_host_is_shopify_even_without_a_platform_label() -> None:
         destination_url="https://shop.myshopify.com/products/x", shop_domain=None,
         platform=None, cart_variant_id="41234567890123",
     ) == "https://shop.myshopify.com/cart/41234567890123:1"
+
+
+# ---------------------------------------------------------------- the NAMED-variant cart proof
+#
+# Option 1 (Peng, 2026-09-29): a multi-variant product is buyable through the Reap cart link when
+# the seed NAMES one variant and the backfill's products.js fetch proves that variant exists and is
+# available. Every case is built from REAL shapes: the live judydoll products.js (8 shades,
+# trimmed), the live seed (staging epsv_38ad88d436c32e24ba7c6446, trimmed), and the proof the
+# backfill's own `build_cart_proof` writes from those two -- never a hand-built proof dict.
+
+import copy  # noqa: E402
+import json  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from scripts.backfill_shopify_variant_ids import build_cart_proof  # noqa: E402
+from services.shopify_variant_identity import (  # noqa: E402
+    CART_PROOF_SCOPE_NAMED,
+    CART_PROOF_SCOPE_SOLE,
+    named_cart_variant_id,
+    named_verified_cart_variant_id,
+    verified_cart_variant_id,
+)
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+JUDY_JS = json.loads((_FIXTURES / "judydoll_silky_matte_lip_ink_products_js_2026_09_29.json").read_text())
+JUDY_SEED = json.loads((_FIXTURES / "judydoll_silky_matte_lip_ink_seed_2026_09_29.json").read_text())
+JUDY_HOST = "judydoll.com"
+JUDY_VARIANT = "49819267301653"          # 07 BURGUNDY INK, the shade the seed names
+JUDY_OTHER = "49819267170581"            # 01 PETAL INK, a sibling shade
+JUDY_JS_URL = "https://judydoll.com/products/silky-matte-lip-ink.js"
+JUDY_STAGING_URLS = [JUDY_SEED["canonical_url"]]          # the route passes canonical or destination
+JUDY_PROD_URLS = [JUDY_SEED["destination_url"]]           # prod canonical carries ?variant=
+T0 = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
+
+
+def _judy_js(**variant_overrides: Dict[str, Any]) -> Dict[str, Any]:
+    payload = copy.deepcopy(JUDY_JS)
+    for variant in payload["variants"]:
+        variant.update(variant_overrides.get(str(variant["id"]), {}))
+    return payload
+
+
+def _backfilled(payload: Dict[str, Any] | None = None, *, page_url: str | None = None,
+                seed_data: Dict[str, Any] | None = None, checked_at: datetime = T0) -> Dict[str, Any]:
+    """What `scripts/backfill_shopify_variant_ids.run` writes into seed_data for this fetch: the
+    stamped variants and the proof, both from the backfill's own functions."""
+    seed = copy.deepcopy(seed_data if seed_data is not None else JUDY_SEED["seed_data"])
+    payload = payload if payload is not None else JUDY_JS
+    live = parse_product_js(payload)
+    new_variants, _ = stamp_variant_ids(seed["snapshot"]["variants"], live)
+    proof = build_cart_proof(
+        seed, new_variants, payload, live, js_url=JUDY_JS_URL,
+        page_url=page_url or JUDY_SEED["canonical_url"], shop_host=JUDY_HOST, checked_at=checked_at,
+    )
+    seed["snapshot"].update({"variants": new_variants, "storefront_platform": "shopify",
+                             "storefront_platform_source": "products_js_v1",
+                             "shopify_cart_proof": proof})
+    return seed
+
+
+def _verify(seed_data: Any, urls: List[str] = JUDY_STAGING_URLS, *, catalog: str | None = JUDY_VARIANT,
+            now: datetime = T0 + timedelta(hours=1), host: str = JUDY_HOST):
+    return verified_cart_variant_id(seed_data, product_urls=urls, shop_domain=host,
+                                    catalog_variant_id=catalog, now=now)
+
+
+def test_the_live_judydoll_fetch_writes_a_named_variant_proof() -> None:
+    """The backfill's ACTUAL output on the live shapes: a label match stamps the seed's one entry
+    (07 BURGUNDY INK), and the 8-variant storefront yields a named proof, never a sole one."""
+    seed = _backfilled()
+    assert seed["snapshot"]["variants"][0]["shopify_variant_id"] == JUDY_VARIANT
+    assert seed["snapshot"]["shopify_cart_proof"] == {
+        "source": "products_js_v1", "scope": "named_variant", "product_js_url": JUDY_JS_URL,
+        "variant_id": JUDY_VARIANT, "available": True, "live_variant_count": 8,
+        "price_minor": 1399, "checked_at": T0.isoformat(),
+    }
+
+
+@pytest.mark.parametrize("urls", [JUDY_STAGING_URLS, JUDY_PROD_URLS], ids=["staging", "prod"])
+def test_ACCEPT_a_multi_variant_product_with_the_named_variant_available(urls) -> None:
+    proven = _verify(_backfilled(page_url=urls[0]), urls)
+    assert proven == (JUDY_VARIANT, CART_PROOF_SCOPE_NAMED)
+    assert proven.variant_id == JUDY_VARIANT and proven.scope == "named_variant"
+
+
+def test_the_sole_path_refuses_a_named_proof_and_the_named_path_refuses_a_sole_one() -> None:
+    named = _backfilled()
+    assert sole_verified_cart_variant_id(named, product_urls=JUDY_STAGING_URLS,
+                                         shop_domain=JUDY_HOST, now=T0) is None
+    # even when its informational count reads 1
+    one = copy.deepcopy(named)
+    one["snapshot"]["shopify_cart_proof"]["live_variant_count"] = 1
+    assert sole_verified_cart_variant_id(one, product_urls=JUDY_STAGING_URLS,
+                                         shop_domain=JUDY_HOST, now=T0) is None
+    sole = _backfilled({"variants": [JUDY_JS["variants"][4]]})
+    assert "scope" not in sole["snapshot"]["shopify_cart_proof"]
+    assert named_verified_cart_variant_id(sole, product_urls=JUDY_STAGING_URLS,
+                                          shop_domain=JUDY_HOST, now=T0) is None
+
+
+def test_the_sole_variant_path_is_unchanged() -> None:
+    """A one-variant storefront still writes the UNSCOPED proof (byte-for-byte the old keys) and is
+    accepted as SOLE -- with or without a catalog variant, exactly as before."""
+    seed = _backfilled({"variants": [JUDY_JS["variants"][4]]})
+    assert seed["snapshot"]["shopify_cart_proof"] == {
+        "source": "products_js_v1", "product_js_url": JUDY_JS_URL, "live_variant_count": 1,
+        "variant_id": JUDY_VARIANT, "checked_at": T0.isoformat(),
+    }
+    assert _verify(seed) == (JUDY_VARIANT, CART_PROOF_SCOPE_SOLE)
+    assert _verify(seed, catalog=None) == (JUDY_VARIANT, CART_PROOF_SCOPE_SOLE)
+    assert sole_verified_cart_variant_id(seed, product_urls=JUDY_STAGING_URLS,
+                                         shop_domain=JUDY_HOST, now=T0) == JUDY_VARIANT
+
+
+def test_a_fetch_supporting_a_sole_proof_never_writes_the_weaker_named_one() -> None:
+    """A one-variant product whose seed ALSO names that variant by URL gets the sole proof."""
+    seed = _backfilled({"variants": [JUDY_JS["variants"][4]]}, page_url=JUDY_SEED["destination_url"])
+    assert "scope" not in seed["snapshot"]["shopify_cart_proof"]
+
+
+def test_REFUSE_the_named_variant_absent_from_the_live_store() -> None:
+    gone = _judy_js()
+    gone["variants"] = [v for v in gone["variants"] if str(v["id"]) != JUDY_VARIANT]
+    # the seed entry is stamped from an EARLIER fetch; the shade has since been delisted
+    stamped = _backfilled()
+    seed = _backfilled(gone, seed_data=stamped)
+    assert seed["snapshot"]["shopify_cart_proof"] is None
+    assert _verify(seed) is None
+
+
+def test_REFUSE_the_named_variant_unavailable() -> None:
+    seed = _backfilled(_judy_js(**{JUDY_VARIANT: {"available": False}}))
+    assert seed["snapshot"]["shopify_cart_proof"] is None, "the backfill never writes it"
+    forged = _backfilled()
+    for bad in (False, None, "true", 1):
+        forged["snapshot"]["shopify_cart_proof"]["available"] = bad
+        assert _verify(forged) is None, bad
+    del forged["snapshot"]["shopify_cart_proof"]["available"]
+    assert _verify(forged) is None
+
+
+def test_REFUSE_a_stale_or_future_proof() -> None:
+    seed = _backfilled()
+    assert _verify(seed, now=T0 + timedelta(days=7)) is not None
+    assert _verify(seed, now=T0 + timedelta(days=7, seconds=1)) is None
+    assert _verify(seed, now=T0 - timedelta(seconds=1)) is None
+    naive = copy.deepcopy(seed)
+    naive["snapshot"]["shopify_cart_proof"]["checked_at"] = "2026-09-29T12:00:00"
+    assert _verify(naive) is None
+
+
+def test_REFUSE_a_proof_variant_other_than_the_named_one() -> None:
+    seed = _backfilled()
+    seed["snapshot"]["shopify_cart_proof"]["variant_id"] = JUDY_OTHER
+    assert _verify(seed) is None
+    assert _verify(seed, catalog=JUDY_OTHER) is None
+
+
+def test_REFUSE_a_catalog_variant_other_than_the_proven_one_or_none() -> None:
+    seed = _backfilled()
+    assert _verify(seed, catalog=JUDY_OTHER) is None
+    assert _verify(seed, catalog=None) is None, "a placeholder-only row names no variant"
+
+
+def test_REFUSE_a_seed_naming_two_variants() -> None:
+    two = copy.deepcopy(JUDY_SEED["seed_data"])
+    second = dict(two["snapshot"]["variants"][0], title="01 PETAL INK", option_value="01 PETAL INK",
+                  display_label="Shade: 01 PETAL INK", sku="6978647800823", id=JUDY_OTHER,
+                  options=[{"name": "Shade", "value": "01 PETAL INK", "axis_kind": "shade"}])
+    two["snapshot"]["variants"].append(second)
+    seed = _backfilled(seed_data=two)
+    assert seed["snapshot"]["shopify_cart_proof"] is None
+    # and a forged named proof on it is refused by the verifier too
+    seed["snapshot"]["shopify_cart_proof"] = _backfilled()["snapshot"]["shopify_cart_proof"]
+    assert _verify(seed) is None
+    # two distinct `variant=` on the product URL(s)
+    urls = [f"https://{JUDY_HOST}/products/silky-matte-lip-ink?variant={JUDY_VARIANT}&variant={JUDY_OTHER}"]
+    assert named_cart_variant_id(_backfilled(), product_urls=urls, shop_domain=JUDY_HOST) is None
+    assert _verify(_backfilled(), urls) is None
+
+
+def test_REFUSE_a_url_variant_that_disagrees_with_the_stamped_one() -> None:
+    other_url = f"https://{JUDY_HOST}/products/silky-matte-lip-ink?variant={JUDY_OTHER}"
+    seed = _backfilled(page_url=other_url)
+    assert seed["snapshot"]["shopify_cart_proof"] is None
+    assert _verify(_backfilled(), [other_url]) is None
+
+
+@pytest.mark.parametrize("url", [
+    "http://judydoll.com/products/silky-matte-lip-ink",
+    "https://judydoll.com:8443/products/silky-matte-lip-ink",
+    "https://notjudydoll.com/products/silky-matte-lip-ink",
+    "https://www.judydoll.com/products/silky-matte-lip-ink",
+])
+def test_REFUSE_a_proof_fetched_off_https_or_off_the_shop_host(url) -> None:
+    js = product_js_url(url)
+    seed = _backfilled()
+    seed["snapshot"]["shopify_cart_proof"]["product_js_url"] = js
+    assert _verify(seed, [url]) is None
+
+
+def test_REFUSE_a_proof_for_another_products_url() -> None:
+    seed = _backfilled()
+    assert _verify(seed, [f"https://{JUDY_HOST}/products/other-lip"]) is None
+
+
+def test_the_naming_rule_accepts_and_refuses_by_source_agreement() -> None:
+    unstamped = JUDY_SEED["seed_data"]
+    stamped = _backfilled()
+    staging, prod = JUDY_STAGING_URLS, JUDY_PROD_URLS
+    name = lambda seed, urls: named_cart_variant_id(seed, product_urls=urls, shop_domain=JUDY_HOST)  # noqa: E731
+    # ACCEPT: stamped entry alone; stamped + agreeing URL; unstamped entry + URL.
+    assert name(stamped, staging) == JUDY_VARIANT
+    assert name(stamped, prod) == JUDY_VARIANT
+    assert name(unstamped, prod) == JUDY_VARIANT
+    # REFUSE: nothing names it; unreadable `variant=`; URL on another host names nothing.
+    assert name(unstamped, staging) is None
+    assert name(stamped, [f"https://{JUDY_HOST}/products/silky-matte-lip-ink?variant=abc"]) is None
+    assert name(stamped, [f"https://{JUDY_HOST}/products/silky-matte-lip-ink?variant="]) is None
+    assert name(unstamped, [f"https://other.com/products/silky-matte-lip-ink?variant={JUDY_VARIANT}"]) is None
+    assert name(None, staging) is None and name({"snapshot": []}, staging) is None
