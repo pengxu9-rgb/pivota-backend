@@ -1565,6 +1565,11 @@ async def _load_cart_link_item(
     #     `row_price_ambiguous`;
     #   * only for a mirror row with no caller-named sku; Shopify rows are unchanged.
     mirror_placeholder = placeholder if platform != "shopify" and named is None else None
+    # The same gate when the caller NAMES the placeholder (review of #2457): it is priced by the
+    # ordinary read below, and must not become the way around `live_variant_count == 1`.
+    if (platform != "shopify" and named is not None and _is_placeholder_sku(named, product_key)
+            and _proof_live_variant_count(seed_data) != 1):
+        raise svc.PurchaseRefused("row_unpriced", "a placeholder prices only a sole live variant")
 
     def _priced(candidate: Mapping[str, Any], found: Any) -> Tuple[Dict[str, Any], Dict[str, Any], str, Optional[int]]:
         found = dict(found)

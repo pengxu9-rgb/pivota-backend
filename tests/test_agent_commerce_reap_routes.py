@@ -3552,7 +3552,7 @@ KRAVE_PLACEHOLDER = f"{KRAVE_PK}::canonical"
 KRAVE_REAL = f"{KRAVE_PK}::sku_3c1f0e9a7b2d4c6e8f01"
 
 
-async def _seed_krave_mirror(*, offers, market="US", live_variant_count=1):
+async def _seed_krave_mirror(*, offers, market="US", live_variant_count=1, real_sku=True):
     """`offers`: [(sku_key, merchant_id, price)] -- USD, in_stock, market 'US' (the mirror writer's
     column default) -- or [(sku_key, merchant_id, price, {column: value})] to override any of
     currency / market / availability / suppression_reason / suppressed_at. `market` is the seed's
@@ -3564,7 +3564,9 @@ async def _seed_krave_mirror(*, offers, market="US", live_variant_count=1):
         "'skincare', 'Serum', :d, 'external_product_seeds_mirror_v1', :seed, NULL, 'self')",
         {"pk": KRAVE_PK, "m": KRAVE_MERCHANT, "ext": KRAVE_EXT, "d": KRAVE_DOMAIN, "seed": KRAVE_SEED},
     )
-    for sku_key, vid in ((KRAVE_PLACEHOLDER, KRAVE_PK), (KRAVE_REAL, f"{KRAVE_EXT}:{KRAVE_VARIANT}")):
+    skus = [(KRAVE_PLACEHOLDER, KRAVE_PK)]
+    skus += [(KRAVE_REAL, f"{KRAVE_EXT}:{KRAVE_VARIANT}")] if real_sku else []
+    for sku_key, vid in skus:
         await database.execute(
             "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, "
             "source_variant_id, title, currency) VALUES (:sk, :pk, :m, 'external_seed', :ext, :vid, "
@@ -3714,6 +3716,8 @@ async def test_a_mirror_row_placeholder_price_refusals(client, monkeypatch, offe
     # MORE THAN ONE LIVE VARIANT: the product-grain placeholder offer is never that variant's price
     (2, [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], "row_unpriced"),
     (3, [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], "row_unpriced"),
+    # the count is an int, exactly as the proof reads it: a string "1" is not one live variant
+    ("1", [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], "row_unpriced"),
     # ... while the real sku's own (variant-scoped) offer still prices it
     (2, [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_REAL, KRAVE_MERCHANT, "26.00")], 202),
 ])
@@ -3729,6 +3733,29 @@ async def test_a_multi_variant_proof_never_prices_from_the_placeholder(
     resp = await client.post(f"{BASE}/purchases", json=_krave_body())
     if expected == 202:
         assert resp.status_code == 202, resp.text
+    else:
+        assert resp.status_code == 409 and _error(resp) == expected, resp.text
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+@pytest.mark.parametrize("live_variant_count,expected", [
+    (1, 202), (2, "row_unpriced"), (3, "row_unpriced"), ("1", "row_unpriced"),
+])
+async def test_a_named_placeholder_meets_the_same_live_variant_gate(
+    client, monkeypatch, live_variant_count, expected
+):
+    """NAMING the placeholder is not a way around the gate (review of #2457): a placeholder-only
+    row, the caller naming `<pk>::canonical`, is priced from it only under one live variant. The
+    proof reader is stubbed as in the unnamed test above."""
+    await _seed_krave_mirror(offers=[(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")],
+                             live_variant_count=live_variant_count, real_sku=False)
+    monkeypatch.setattr(routes_reap, "sole_verified_cart_variant_id", lambda *a, **k: KRAVE_VARIANT)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases",
+                             json={**_krave_body(), "variant_key": KRAVE_PLACEHOLDER})
+    if expected == 202:
+        assert resp.status_code == 202, resp.text
+        assert (await _purchase_row(resp.json()["purchase_id"]))["our_price_minor"] == 2800
     else:
         assert resp.status_code == 409 and _error(resp) == expected, resp.text
         assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
