@@ -28,6 +28,8 @@ STAGING_ENV = {"PIVOTA_ENV": "staging", "DATABASE_URL": STAGING_URL}
 
 class FakeConn:
     def __init__(self, *, database="pivota", server_addr="10.122.0.3", live=True, fail_on=None):
+        self.connected_with = None
+        self.args = []
         self.database = database
         self.server_addr = server_addr
         self.live = live
@@ -58,6 +60,7 @@ class FakeConn:
 
     async def execute(self, sql, *args):
         self.statements.append(sql)
+        self.args.append((sql, args))
         if self.in_tx:
             self.tx_statements.append(sql)
         if self.fail_on and self.fail_on in sql:
@@ -90,7 +93,8 @@ class FakeConn:
 async def _main(argv, env, conn, **kw):
     lines = []
 
-    async def connect(url):
+    async def connect(url, **connect_kw):
+        conn.connected_with = (url, connect_kw)
         return conn
 
     code = await P.main(argv, env, connect=connect, out=lines.append, **kw)
@@ -121,7 +125,8 @@ async def test_anything_but_staging_aborts_before_touching_a_reap_row(argv, env,
     assert code == P.EXIT_ABORT
     assert any(reason in ln for ln in lines), lines
     assert _touched_reap_rows(conn) == []
-    assert conn.closed
+    # URL/env problems abort before connecting; server problems abort and close.
+    assert conn.connected_with is None or conn.closed
 
 
 async def test_no_database_url_aborts():
@@ -211,3 +216,108 @@ def test_the_program_is_self_contained_and_has_no_at_sign():
             assert {a.name for a in node.names} <= allowed
         elif isinstance(node, ast.ImportFrom):
             assert node.module in allowed
+
+
+# --- round 4: the URL cannot redirect the connection; the env check is exact -----------------
+
+_AT = chr(64)
+
+
+@pytest.mark.parametrize("url,reason", [
+    # multi-host: the specific reason is asserted, because the host and port checks would also
+    # abort some of these and would otherwise hide a missing multi-host check.
+    ("postgresql://u:pw" + _AT + "10.122.0.3:5432,10.25.0.2:5432/pivota", "more than one host"),
+    ("postgresql://u:pw" + _AT + "10.122.0.3,10.25.0.2/pivota", "more than one host"),
+    ("postgresql://u:pw" + _AT + "10.122.0.3:5432/pivota?host=10.25.0.2", "query sets host"),
+    ("postgresql://u:pw" + _AT + "10.122.0.3:5432/pivota?hostaddr=10.25.0.2", "query sets hostaddr"),
+    ("postgresql://u:pw" + _AT + "10.122.0.3:5432/pivota?service=prod", "query sets service"),
+    ("postgresql://u:pw" + _AT + "10.122.0.3:5432/pivota?sslmode=require&HOST=10.25.0.2", "query sets host"),
+    ("postgresql://u:pw" + _AT + "10.122.0.3:5432/pivota?host=", "query sets host"),  # blank counts
+])
+async def test_a_url_that_could_redirect_the_connection_aborts_before_connecting(url, reason):
+    conn = FakeConn()
+    code, lines = await _main(["scrub", "--apply"], {"PIVOTA_ENV": "staging", "DATABASE_URL": url}, conn)
+    assert code == P.EXIT_ABORT, lines
+    assert any(reason in ln for ln in lines), lines
+    assert conn.connected_with is None
+    assert conn.statements == []
+
+
+async def test_a_comma_in_the_password_is_not_read_as_multi_host():
+    url = "postgresql://u:p,w" + _AT + "10.122.0.3:5432/pivota?sslmode=require"
+    conn = FakeConn(live=False)
+    code, _ = await _main(["census"], {"PIVOTA_ENV": "staging", "DATABASE_URL": url}, conn)
+    assert code == P.EXIT_OK
+
+
+async def test_the_connection_is_pinned_to_the_expected_host():
+    conn = FakeConn(live=False)
+    await _main(["census"], STAGING_ENV, conn)
+    # host AND port: a `host=` keyword alone makes asyncpg drop the DSN port (measured, 0.31).
+    assert conn.connected_with[1] == {"host": "10.122.0.3", "port": 5432}
+
+
+async def test_the_urls_port_is_passed_with_the_pinned_host():
+    url = "postgresql://u:pw" + _AT + "10.122.0.3:6543/pivota"
+    conn = FakeConn(live=False)
+    await _main(["census"], {"PIVOTA_ENV": "staging", "DATABASE_URL": url}, conn)
+    assert conn.connected_with[1] == {"host": "10.122.0.3", "port": 6543}
+
+
+async def test_a_garbage_port_aborts_before_connecting():
+    url = "postgresql://u:pw" + _AT + "10.122.0.3:54x2/pivota"
+    conn = FakeConn()
+    code, _ = await _main(["census"], {"PIVOTA_ENV": "staging", "DATABASE_URL": url}, conn)
+    assert code == P.EXIT_ABORT and conn.connected_with is None
+
+
+@pytest.mark.parametrize("value", [
+    " staging-old", "STAGING", "Staging", "staging2", "staging ", " staging", "stag", "prestaging",
+    "production", "",
+])
+async def test_the_env_check_is_exact_and_refuses_whitespace(value):
+    """Whitespace is REFUSED, not stripped: run_oneoff_job.sh passes ENV_VARS verbatim, so a
+    near-miss only comes from someone typing one."""
+    conn = FakeConn()
+    code, lines = await _main(["scrub", "--apply"], {"PIVOTA_ENV": value, "DATABASE_URL": STAGING_URL}, conn)
+    assert code == P.EXIT_ABORT
+    assert any("PIVOTA_ENV" in ln for ln in lines)
+    assert conn.connected_with is None
+
+
+# --- the scrub reaches every non-terminal state the schema allows -----------------------------
+
+import re as _re  # noqa: E402
+
+_MIGRATION = Path(__file__).resolve().parents[1] / "db" / "migrations" / "224_reap_agentic_ledger.sql"
+
+
+def _schema_states():
+    sql = _MIGRATION.read_text()
+    m = _re.search(r"state VARCHAR\(\d+\) NOT NULL CHECK \(state IN \((.*?)\)\)", sql, _re.S)
+    assert m, "migration 224's state CHECK was not found"
+    return set(_re.findall(r"'([a-z_]+)'", m.group(1)))
+
+
+def test_the_scrub_where_excludes_no_non_terminal_state():
+    states = _schema_states()
+    assert len(states) >= 9, states
+    terminal = set(P.TERMINAL)
+    assert terminal <= states, "TERMINAL names a state the schema does not have"
+    non_terminal = states - terminal
+    assert non_terminal == {"resolving", "needs_enrollment", "quoting", "awaiting_approval",
+                            "processing"}
+    # The ledger's own terminal set agrees, so the scrub and the state machine mean the same thing.
+    from db.reap_agentic_ledger import TERMINAL_STATES
+    assert terminal == set(TERMINAL_STATES)
+    # The WHERE is `state <> ALL(<TERMINAL>)`, bound to exactly P.TERMINAL.
+    assert "WHERE state <> ALL($1::text[])" in P._SCRUB_PURCHASES
+    assert "WHERE state <> ALL($1::text[])" in P._CENSUS_PURCHASES
+
+
+async def test_the_scrub_binds_exactly_the_terminal_list():
+    conn = FakeConn()
+    await _main(["scrub", "--apply"], STAGING_ENV, conn)
+    bound = [args for sql, args in conn.args if sql.startswith("UPDATE reap_agentic_purchases")]
+    assert bound == [(P.TERMINAL,)]
+    assert not (set(bound[0][0]) & (_schema_states() - set(P.TERMINAL)))

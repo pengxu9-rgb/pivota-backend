@@ -14,8 +14,11 @@ REAP_AGENTIC_ENABLED=1 on staging, and again after EVERY staging restore.
 
 THE TARGET CHECK RUNS FIRST AND ABORTS (exit 2) BEFORE ANY QUERY THAT READS OR WRITES REAP ROWS
 unless ALL of these hold — any doubt is an abort:
-    * PIVOTA_ENV is exactly `staging`;
-    * the DATABASE_URL host is exactly staging's private IP (EXPECTED_HOST) — prod's is 10.25.0.2;
+    * PIVOTA_ENV is exactly `staging` (no whitespace, no case-folding);
+    * the DATABASE_URL names ONE host, exactly staging's private IP (EXPECTED_HOST) — prod's is
+      10.25.0.2 — and carries no host / hostaddr / service query parameter; the connection is
+      then made with host=EXPECTED_HOST (and the URL's port) explicitly, so the URL cannot
+      redirect it;
     * the server answers current_database() with exactly staging's database name (EXPECTED_DB).
 The server's own inet_server_addr() is PRINTED, not compared: what Cloud SQL reports there for a
 private-IP connection is not verified, and a check that might never pass is a check operators
@@ -42,7 +45,7 @@ import asyncio
 import os
 import sys
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 #: Staging's Cloud SQL private IP and database name (infra/gcp/README.md). NOT overridable from
 #: the command line or the environment: a knob here is a way to point the scrub at production.
@@ -94,22 +97,44 @@ def _rowcount(status: str) -> int:
         return -1
 
 
-async def target_problems(
-    conn: Any,
-    url: str,
-    env: Mapping[str, str],
-    *,
-    expected_host: str = EXPECTED_HOST,
-    expected_db: str = EXPECTED_DB,
+#: libpq/asyncpg query parameters that can point a connection somewhere other than the URL's
+#: host. Any of them present is an abort, whatever its value.
+_HOST_OVERRIDE_QUERY_KEYS = frozenset({"host", "hostaddr", "service"})
+
+
+def static_problems(
+    url: str, env: Mapping[str, str], *, expected_host: str = EXPECTED_HOST,
 ) -> List[str]:
-    """Every reason this connection is NOT staging's database. Empty list = proceed."""
+    """Reasons to abort BEFORE connecting at all. Empty list = connect (to `expected_host`)."""
     problems: List[str] = []
-    pivota_env = (env.get("PIVOTA_ENV") or "").strip()
+    # EXACT: no strip, no case-folding. ' staging', 'staging ', 'STAGING', 'staging2' and
+    # 'staging-old' are all refused. run_oneoff_job.sh passes ENV_VARS verbatim, so the only way
+    # to a near-miss is someone typing one, and a near-miss is not a statement that this is staging.
+    pivota_env = env.get("PIVOTA_ENV") or ""
     if pivota_env != EXPECTED_ENV:
         problems.append(f"PIVOTA_ENV is {pivota_env!r}, not {EXPECTED_ENV!r}")
-    url_host = (urlparse(url).hostname or "").lower()
+    parsed = urlparse(url)
+    # The host part only (after any userinfo), so a comma in a password is not misread.
+    hostinfo = parsed.netloc.rpartition(chr(64))[2]
+    if "," in hostinfo:
+        problems.append("DATABASE_URL names more than one host")
+    query_keys = {key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    overrides = sorted(query_keys & _HOST_OVERRIDE_QUERY_KEYS)
+    if overrides:
+        problems.append(f"DATABASE_URL query sets {', '.join(overrides)}")
+    url_host = (parsed.hostname or "").lower()
     if url_host != expected_host:
         problems.append(f"DATABASE_URL host is {url_host!r}, not {expected_host!r}")
+    try:
+        parsed.port
+    except ValueError:
+        problems.append("DATABASE_URL port is not a number")
+    return problems
+
+
+async def server_problems(conn: Any, *, expected_db: str = EXPECTED_DB) -> List[str]:
+    """Reasons the database we reached is not staging's. Empty list = proceed."""
+    problems: List[str] = []
     try:
         database = await conn.fetchval("SELECT current_database()")
     except Exception as exc:  # noqa: BLE001 — cannot tell where we are: that is an abort
@@ -152,7 +177,7 @@ async def main(
     argv: Sequence[str],
     env: Optional[Mapping[str, str]] = None,
     *,
-    connect: Optional[Callable[[str], Awaitable[Any]]] = None,
+    connect: Optional[Callable[..., Awaitable[Any]]] = None,
     expected_host: str = EXPECTED_HOST,
     expected_db: str = EXPECTED_DB,
     out: Callable[[str], None] = print,
@@ -175,15 +200,24 @@ async def main(
     parsed = urlparse(url)
     out(f"db host {parsed.hostname} db name {parsed.path.lstrip('/')}")
 
+    problems = static_problems(url, env, expected_host=expected_host)
+    if problems:
+        for problem in problems:
+            out(f"ABORT: {problem}")
+        out("ABORT: this is not staging's database; nothing was read or written")
+        return EXIT_ABORT
+
     if connect is None:
         import asyncpg
 
         connect = asyncpg.connect
-    conn = await connect(url)
+    # host= EXPLICITLY, not only via the URL: asyncpg lets keyword arguments override the DSN, so
+    # nothing in the URL can steer this connection anywhere but the host checked above. port= goes
+    # with it, and that is not decoration: measured on asyncpg 0.31, a `host=` keyword alone
+    # DROPS the DSN's port and falls back to 5432 (or PGPORT), i.e. possibly a different server.
+    conn = await connect(url, host=expected_host, port=parsed.port or 5432)
     try:
-        problems = await target_problems(
-            conn, url, env, expected_host=expected_host, expected_db=expected_db,
-        )
+        problems = await server_problems(conn, expected_db=expected_db)
         if problems:
             for problem in problems:
                 out(f"ABORT: {problem}")

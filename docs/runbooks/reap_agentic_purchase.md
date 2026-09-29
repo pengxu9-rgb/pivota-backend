@@ -348,9 +348,11 @@ image yet.
 > **`run_oneoff_job.sh` DEFAULTS TO PRODUCTION** — `PROJECT=pivota-prod`, prod's `DATABASE_URL`,
 > `PIVOTA_ENV=production`. The staging block below is not optional, and the program does not trust
 > it: before it reads or writes a single Reap row it ABORTS (exit 2) unless `PIVOTA_ENV` is
-> `staging`, the `DATABASE_URL` host is exactly staging's `10.122.0.3`, and the server's
-> `current_database()` is exactly `pivota`. Any doubt — an unreadable identity included — is an
-> abort. Those expected values are constants in the program, not flags.
+> exactly `staging` (no surrounding whitespace, no other case), the `DATABASE_URL` names ONE host,
+> exactly staging's `10.122.0.3`, with no `host` / `hostaddr` / `service` query parameter, and the
+> server's `current_database()` is exactly `pivota`. It then connects with `host=10.122.0.3`
+> passed explicitly, so nothing in the URL can redirect it. Any doubt — an unreadable identity
+> included — is an abort. Those expected values are constants in the program, not flags.
 
 Read the `DATABASE_URL` secretKeyRef off the staging worker rather than trusting the name below:
 

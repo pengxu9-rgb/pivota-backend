@@ -93,6 +93,7 @@ import os
 from typing import Optional
 
 from config.platform import is_deployed, platform_env, service_name
+from services.worker_flag import worker_flag_override  # the one AUDIT_WORKER_ENABLED parser
 
 logger = logging.getLogger(__name__)
 
@@ -323,21 +324,6 @@ def _allowlist_diagnostics() -> dict:
         # NOT `{}`: that is exactly what an unset allowlist reports, so a broken read would
         # look like "no filter" on the one page an operator checks. Type only, no message.
         return {"job_allowlist_error": type(exc).__name__}
-
-
-_WORKER_FLAG_TRUTHY = ("1", "true", "yes", "on")
-
-
-def worker_flag_override() -> Optional[bool]:
-    """AUDIT_WORKER_ENABLED, parsed ONCE for every reader: None when unset or blank (no explicit
-    decision), else True for a truthy spelling (case- and whitespace-insensitive) and False for
-    anything else. `_queue_worker_enabled` and the SCHEDULER_JOB_ALLOWLIST fail-closed rule
-    (services/scheduler_job_allowlist.py) both read it here, so they cannot disagree about what
-    "explicitly true" means."""
-    raw = (os.getenv("AUDIT_WORKER_ENABLED") or "").strip().lower()
-    if not raw:
-        return None
-    return raw in _WORKER_FLAG_TRUTHY
 
 
 def _queue_worker_enabled() -> bool:

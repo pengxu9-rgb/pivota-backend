@@ -43,6 +43,8 @@ from __future__ import annotations
 import os
 from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
 
+from services.worker_flag import worker_flag_override
+
 ENV_VAR = "SCHEDULER_JOB_ALLOWLIST"
 
 # Background loops a process starts at boot OUTSIDE APScheduler (see main.startup_event). The
@@ -84,9 +86,9 @@ def parse_allowlist(raw: Optional[str]) -> Optional[FrozenSet[str]]:
 
 
 def _worker_flag_explicitly_true() -> bool:
-    # ONE parser for AUDIT_WORKER_ENABLED, shared with _queue_worker_enabled.
-    from services.audit_scheduler import worker_flag_override
-
+    # ONE parser for AUDIT_WORKER_ENABLED, shared with _queue_worker_enabled — from the tiny
+    # services.worker_flag, NOT services.audit_scheduler, so a webhook loop's start gate does not
+    # import the scheduler into a process that never starts it.
     return worker_flag_override() is True
 
 

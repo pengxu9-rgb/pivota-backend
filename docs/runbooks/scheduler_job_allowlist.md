@@ -68,6 +68,15 @@ APScheduler (`main.startup_event`):
 | `merchant_webhook_retry_worker` | re-delivers failed outbound merchant webhooks |
 | `photo_cleanup_loop` | deletes expired photo uploads (also needs `PHOTO_CLEANUP_LOOP_ENABLED`) |
 
+The two webhook retry loops have a SECOND, independent gate: `WEBHOOK_RETRY_DELIVERY_ENABLED`
+(`services/webhook_retry_delivery_gate.py`, #2445), which decides whether a started loop delivers
+anything (by default only in production). The allowlist decides whether the loop STARTS; the
+delivery gate decides whether it DELIVERS. A retry goes out only when both allow it, and neither
+overrides the other: listing a loop does not opt it into delivery on staging, and
+`WEBHOOK_RETRY_DELIVERY_ENABLED=true` does not start a loop the allowlist excludes
+(`tests/test_webhook_retry_loop_allowlist_composition.py`). The inline `process_due_retries` call
+in `list_deliveries` is request-triggered, so only the delivery gate applies to it.
+
 ## What it covers
 
 Everything a worker process starts on its own:
