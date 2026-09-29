@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -236,6 +237,39 @@ async def fetch_external_seed_by_id(
     return dict(row) if row else None
 
 
+async def fetch_own_seed_copy_for_keys(
+    product_keys: List[str],
+    *,
+    db: Any = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Each product's OWN newest active seed: how its description was chosen, whether a person
+    reviewed it, and the brand-page sections the crawl captured -> {product_key: {...}}.
+
+    Keyed per row, unlike fetch_external_seed_for_keys (one seed for the whole cluster, chosen by
+    the caller), so what compose_brand_section_description serves depends only on the winner.
+    """
+    if not product_keys:
+        return {}
+    read_db = db or database
+    rows = await read_db.fetch_all(
+        """
+        SELECT DISTINCT ON (attached_product_key)
+               attached_product_key,
+               coalesce(seed_data->>'seed_description_origin',
+                        seed_data->'snapshot'->>'seed_description_origin', '') AS description_origin,
+               (seed_data->'snapshot_quarantine'->'pivota_description_rollback_v1') IS NOT NULL
+                 AS description_reviewed,
+               seed_data->'pdp_details_sections' AS details_sections
+        FROM external_product_seeds
+        WHERE attached_product_key = ANY(:keys)
+          AND status = 'active'
+        ORDER BY attached_product_key, updated_at DESC
+        """,
+        {"keys": product_keys},
+    )
+    return {str(r["attached_product_key"]): dict(r) for r in rows or []}
+
+
 async def fetch_evidence_for_keys(
     product_keys: List[str],
     *,
@@ -366,12 +400,192 @@ def _is_brand_store_row(row: Dict[str, Any]) -> bool:
         return False
     if not _passes_serving_content_bar(row):
         return False
+    return _is_brand_owned_row(row)
+
+
+def _is_brand_owned_row(row: Dict[str, Any]) -> bool:
+    """The brand's own store sells this row: not a retailer listing, a host that is not a known
+    retailer, and a brand_direct offer (the ingest pipeline's seller verdict) or the brand's domain."""
+    if _is_retailer_listing(row):
+        return False
     from services.offer_seller_identity import brand_owns_domain, host_from_url, is_known_retailer, normalize_host
 
     host = normalize_host(row.get("source_domain")) or host_from_url(row.get("canonical_url"))
     if not host or is_known_retailer(host):
         return False
     return bool(row.get("has_brand_direct_offer")) or brand_owns_domain(row.get("brand"), host)
+
+
+# ---------------------------------------------------------------------
+# Brand section copy: a thin brand-store description, filled from the brand's own page sections
+# ---------------------------------------------------------------------
+#
+# Measured on prod 2026-09-29: 1,849 of 8,117 served brand-store products serve under 200 chars,
+# mostly the store's one-line tagline (the crawl's pdp_variant_description), while the same row's
+# own seed already holds the brand's Details / Overview / Benefits sections from its page (Fenty's
+# accordions, Rare Beauty, Pixi, Jurlique, Ole Henriksen...). The public PDP renders those sections;
+# the served description -- what agents read and the serving gate measures -- never saw them.
+
+# Set by build_agent_pdp_view_row from fetch_own_seed_copy_for_keys. Never persisted.
+_OWN_SEED_COPY = "_own_seed_copy"
+
+# canonical_pdp_enrichment's own "thin enough to be worth more copy" line.
+_THIN_SERVED_DESCRIPTION_CHARS = 200
+_BRAND_SECTION_MAX_CHARS = 900
+_COMPOSED_DESCRIPTION_MAX_CHARS = 1600
+_BRAND_SECTION_MAX_COUNT = 3
+_BRAND_SECTION_MIN_CHARS = 80
+
+# The crawl's tags for a description taken as-is from the brand's page. Any other origin was chosen
+# by a person -- the reviewed Pivota-intel rollbacks (pivota.description.rollback.v1, which replaced
+# junk and wrong-variant copy), reviewed content patches, manual text -- and is served as reviewed.
+_CRAWLED_DESCRIPTION_ORIGINS = frozenset({"", "pdp_variant_description", "pdp_product_description"})
+
+# Matched against the heading's lowercased words. Descriptive sections only: never how-to,
+# ingredients, FAQ, claims / clinical results, taxonomy ("Product Type"), "About the brand", or
+# "Features" (murad.com's is a concern list ending in an item number).
+_BRAND_COPY_HEADING = re.compile(
+    r"(?:product )?(?:details|overview|description)|(?:key |product )?benefits?|what it (?:is|does)"
+    r"|why (?:we made it|we love it|you ll love it|you will love it)|highlights"
+)
+# Storefront tags and image alt text are captured as "sections" but are not prose.
+_NON_PROSE_SECTION_KIND = re.compile(r"tags?$|media_alt")
+# A line about the store, price, promotion or account, a link or domain, or a call to action on the
+# page: dropped from the section ("Available only on RareBeauty.com", "LEARN MORE ABOUT THE ICON
+# CASE HERE"). A menu or footer captured under "Details" is all such lines.
+_STORE_LINE = re.compile(
+    r"https?://|www\.|\b[a-z0-9-]+\.(?:com|us|co|net)\b|[$€£¥]\s?\d|\d+\s?% off|\b(?:price|sale|sold out"
+    r"|in stock|out of stock|add to (?:bag|cart)|shop now|available only|exclusively (?:at|on)"
+    r"|learn (?:more|how)|click|tap here|find out more|tiktok|instagram"
+    r"|free (?:shipping|gift|sample)|promo|coupon|discount|klarna|afterpay|subscribe|sign up|newsletter"
+    r"|rewards?|refer a friend|privacy policy|terms of (?:use|service)|log ?in|sign in|my account|gift card"
+    r"|store locator|contact us)\b",
+    re.I,
+)
+# Two first-person words: a customer review captured beside the product copy.
+_FIRST_PERSON = re.compile(r"\b(?:i|i'm|i've|my|me)\b", re.I)
+# Our own generated summaries sometimes sit in the sections too ("positioned for brightening",
+# "…from reviewed source evidence"); they are not the brand's copy.
+_SYNTHETIC_SUMMARY = re.compile(r"\bpositioned (?:as|for|around)\b|\bpositioning\b|\breviewed source", re.I)
+# "…trouble spotsUnique Feature: …" -- labels the crawl ran together; split them onto their own line.
+_RUN_TOGETHER_LABEL = re.compile(r"(?<=[a-z0-9.)])(?=(?:[A-Z][a-z]+ ){0,3}[A-Z][a-z]+:)")
+
+
+def _norm_words(text: Any) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+
+
+def _section_heading(value: Any) -> str:
+    """The heading's first non-empty line (the crawl sometimes doubles it: "Details\\n\\nDetails")."""
+    for line in str(value or "").splitlines():
+        line = line.strip().rstrip(":?+").strip()
+        if line:
+            return line
+    return ""
+
+
+def _is_label_line(line: str) -> bool:
+    """A heading-like line with no sentence end, most words capitalised: "What Else You Need To
+    Know", "Skin Concerns - Dryness, Dullness", a run-together list of set contents."""
+    if line.rstrip().endswith((".", "!", "?")):
+        return False
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z'’-]*", line) if len(w) >= 3]
+    return bool(words) and sum(w[0].isupper() for w in words) >= 0.75 * len(words)
+
+
+def _brand_section_prose(body: Any, served: str) -> str:
+    """The section's own prose: lines of five words or more that are not already served, not store
+    text (_STORE_LINE), not a "*Based on…" footnote and not a label line. Menu entries and repeats of
+    the tagline drop out the same way."""
+    lines = []
+    for raw in _RUN_TOGETHER_LABEL.sub("\n", str(body or "")).splitlines():
+        line = " ".join(raw.split())
+        if len(re.findall(r"[A-Za-z][A-Za-z'’-]*", line)) < 5:
+            continue
+        if _STORE_LINE.search(line) or line.startswith("*") or _is_label_line(line):
+            continue
+        words = _norm_words(line)
+        if words and words not in served:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _clip_at_sentence(text: str, limit: int) -> str:
+    """At most `limit` chars, ending on a sentence or line; "" rather than a fragment."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "), cut.rfind("\n"))
+    return cut[: end + 1].strip() if end >= limit // 3 else ""
+
+
+def compose_brand_section_description(
+    canonical: Dict[str, Any],
+    description: Optional[str],
+    enrichment: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """The served description, followed by the brand's own descriptive page sections when it is a
+    thin crawled tagline on the brand's own store row. Otherwise the description, unchanged.
+
+    Only when all hold:
+      * no overlay description (curated or generated copy is served as written);
+      * the description is the winner's own column (not a seed fallback, which depends on the caller);
+      * it is under _THIN_SERVED_DESCRIPTION_CHARS;
+      * the winner's own seed took it from the brand's page (_CRAWLED_DESCRIPTION_ORIGINS) and no
+        reviewed rollback replaced it;
+      * the winner is the brand's own store (_is_brand_owned_row) -- a retailer's sections are the
+        retailer's copy.
+    Sections are appended in page order: descriptive headings only (_BRAND_COPY_HEADING), each
+    heading once, prose kinds only, store / footnote / label lines and lines already served dropped,
+    no section in a reviewer's voice or our own generated summary's, at most
+    _BRAND_SECTION_MAX_COUNT sections and _COMPOSED_DESCRIPTION_MAX_CHARS in all.
+    """
+    own = canonical.get(_OWN_SEED_COPY)
+    if not isinstance(own, dict) or not isinstance(description, str):
+        return description
+    if coalesce_first((enrichment or {}).get("description_markdown")):
+        return description
+    if description != coalesce_first(canonical.get("description")):
+        return description
+    if len(description) >= _THIN_SERVED_DESCRIPTION_CHARS:
+        return description
+    if own.get("description_reviewed") or str(own.get("description_origin") or "") not in _CRAWLED_DESCRIPTION_ORIGINS:
+        return description
+    if not _is_brand_owned_row(canonical):
+        return description
+    sections = _parse_jsonish(own.get("details_sections"))
+    if not isinstance(sections, list):
+        return description
+
+    served = _norm_words(description)
+    blocks: List[str] = []
+    headings_used = set()
+    total = len(description)
+    for section in sections:
+        if len(blocks) >= _BRAND_SECTION_MAX_COUNT:
+            break
+        if not isinstance(section, dict) or _NON_PROSE_SECTION_KIND.search(str(section.get("source_kind") or "")):
+            continue
+        heading = _section_heading(section.get("heading"))
+        heading_words = _norm_words(heading)
+        if heading_words in headings_used or not _BRAND_COPY_HEADING.fullmatch(heading_words):
+            continue
+        prose = _brand_section_prose(section.get("body"), served)
+        if len(prose) < _BRAND_SECTION_MIN_CHARS:
+            continue
+        if len(_FIRST_PERSON.findall(prose)) >= 2 or _SYNTHETIC_SUMMARY.search(prose):
+            continue
+        prose = _clip_at_sentence(prose, _BRAND_SECTION_MAX_CHARS)
+        if not prose:
+            continue
+        block = f"{heading.capitalize() if heading.isupper() else heading}\n{prose}"
+        if total + 2 + len(block) > _COMPOSED_DESCRIPTION_MAX_CHARS:
+            break
+        blocks.append(block)
+        headings_used.add(heading_words)
+        total += 2 + len(block)
+        served = f"{served} {_norm_words(prose)}"
+    return "\n\n".join([description, *blocks]) if blocks else description
 
 
 def pick_canonical(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -962,6 +1176,7 @@ def assemble_row(
         seed_data.get("description"),
         seed_data.get("short_description"),
     )
+    description = compose_brand_section_description(canonical, description, enrichment)
 
     image_url = coalesce_first(
         canonical.get("image_url"),
@@ -1488,6 +1703,16 @@ async def build_agent_pdp_view_row(
         if external_seed_id
         else await fetch_external_seed_for_keys(product_keys, db=read_db)
     )
+    # Each row's OWN seed, for compose_brand_section_description. Best-effort: without it the
+    # description is served exactly as before.
+    try:
+        own_seed_copy = await fetch_own_seed_copy_for_keys(product_keys, db=read_db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("agent_pdp_view own-seed copy fetch failed (best-effort): %s", str(exc)[:200])
+        own_seed_copy = {}
+    for product in products:
+        if product.get("product_key") in own_seed_copy:
+            product[_OWN_SEED_COPY] = own_seed_copy[product["product_key"]]
     # BEFORE the first pick_canonical below (evidence_safe_product_keys picks too): every pick in
     # this rebuild must judge each row by what it would serve, overlay included, and all of them
     # must see the same annotated rows. The overlays read here are reused for the enrichment pick.
