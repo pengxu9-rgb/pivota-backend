@@ -223,7 +223,10 @@ jobs:
           }
 
           # Above both required workflows' `timeout-minutes` (sweep 40, dialect gate 25 as of
-          # 2026-09-28) plus runner queueing. A hung
+          # 2026-09-28) plus runner queueing. Since 2026-09-29 the sweep is sharded and its 40 is a
+          # CRITICAL PATH, not one job: 30 per shard, then 10 for the `sweep` job that merges them
+          # and runs after all of them. tests/test_deploy_prod_gates_on_the_test_sweep.py sums
+          # timeouts along `needs:` for exactly that reason. A hung
           # sweep is killed by its own timeout and arrives here as a blocking conclusion long
           # before this fires; this deadline is for the run that NEVER STARTS.
           DEADLINE_MINUTES = 50
