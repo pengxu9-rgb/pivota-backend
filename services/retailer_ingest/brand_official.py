@@ -172,6 +172,8 @@ async def ingest_brand_official(
         "plan_pdps": len(plan["pdps"]),
         "plan_offers": len(plan["offers"]),
         "skipped": plan["skipped"],
+        # Listings left out: another listing on this host has the same title (one content key).
+        "listing_collisions": plan.get("listing_collisions") or [],
         "applied": None,
     }
     if apply:

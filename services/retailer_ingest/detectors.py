@@ -361,6 +361,38 @@ def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True,
     return flags
 
 
+def listing_collision_flags(collisions: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """same_key_other_listing: one flag per listing the plan left out because an earlier listing on
+    the same host carries the same title, and so the same content key (ingestion.ingest_validated_jsonl).
+
+    Leaving it out is what keeps a buyer from seeing one page and buying another; the flag says what
+    was left out. INFO when both pages look like one product listed twice -- the same prices and the
+    same merchant product type (an ad landing clone, a region copy at one price). Otherwise BLOCK: a
+    different price or type is how a different product wearing the same title shows (COCODOR
+    "Black Cherry" refill $6.99 vs diffuser $11.19; Mr. Smith full size vs sachet), and a reviewer
+    decides. Accepting the key applies the cohort without that listing; exclude_handles on the KEPT
+    listing makes the other one the row's listing instead."""
+    flags = []
+    for c in collisions or []:
+        kept, dropped = c.get("kept") or {}, c.get("dropped") or {}
+        same = (bool(kept.get("prices")) and kept.get("prices") == dropped.get("prices")
+                and kept.get("product_type") == dropped.get("product_type"))
+        flags.append({
+            "key": f"same_key_other_listing:{dropped.get('handle')}",
+            "rule": "same_key_other_listing",
+            "severity": INFO if same else BLOCK,
+            "handle": dropped.get("handle"),
+            "product_name": dropped.get("product_name"),
+            "category_path": None,
+            "merchant_product_type": dropped.get("product_type"),
+            "detail": (f"left out: {c.get('host')} lists {dropped.get('handle')!r} (type "
+                       f"{dropped.get('product_type')!r}, prices {(dropped.get('prices') or [])[:4]}) under the "
+                       f"same title as {kept.get('handle')!r} (type {kept.get('product_type')!r}, prices "
+                       f"{(kept.get('prices') or [])[:4]}), which keeps {c.get('product_key')}"),
+        })
+    return flags
+
+
 def blocking(flags: Iterable[Dict[str, Any]], *, accepted: Iterable[str] = ()) -> List[Dict[str, Any]]:
     """The BLOCK flags an approval has not accepted by key (cohort-level flags are never accepted)."""
     ok = set(accepted or ())

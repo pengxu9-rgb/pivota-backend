@@ -83,6 +83,7 @@ async def run_candidates(
         "plan_pdps": len(plan.get("pdps") or []),
         "plan_offers": len(plan.get("offers") or []),
         "plan_skipped": plan.get("skipped"),
+        "plan_listing_collisions": len(plan.get("listing_collisions") or []),
         "applied": None,
     }
     if apply and plan.get("pdps"):

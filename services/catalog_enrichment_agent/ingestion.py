@@ -261,6 +261,26 @@ def listing_handle(canonical_url: Optional[str]) -> Optional[str]:
     return url.split(marker, 1)[1].split("?", 1)[0].split("#", 1)[0].strip("/").casefold() or None
 
 
+def content_listing(canonical_url: Optional[str]) -> Optional[Tuple[str, str]]:
+    """(host, listing) of a storefront URL: the host without `www.`, and the listing's handle
+    (listing_handle), else its casefolded path. None when the URL names no host or no path.
+
+    The handle, not the path, so one listing stays one listing under a market subfolder
+    (/en-gb/products/x and /products/x)."""
+    from urllib.parse import urlsplit
+
+    url = str(canonical_url or "").strip()
+    try:
+        host = (urlsplit(url).hostname or "").lower().removeprefix("www.")
+        path = urlsplit(url).path
+    except ValueError:
+        return None
+    listing = listing_handle(url) or path.strip("/").casefold()
+    if not host or not listing:
+        return None
+    return host, listing
+
+
 def _normalize_url(url: Optional[str]) -> str:
     if not url:
         return ""
@@ -1607,8 +1627,24 @@ def ingest_validated_jsonl(
     `_build_offer_inserts`); a record priced in another currency fails the whole plan.
 
     Returns a dict with keys: pdps, skus, merchants, offers, seeds,
-    skipped. Lists are de-duped by their natural primary key so re-runs
+    skipped, listing_collisions. Lists are de-duped by their natural primary key so re-runs
     across files don't stack duplicate row dicts.
+
+    ONE LISTING PER CONTENT KEY PER HOST. A content-keyed row (derive_product_key: brand + title,
+    merchant-agnostic) is the SAME row for every record with that title, so a second listing on
+    the same host with the same title used to land its offers and seeds under the first one's PDP:
+    first-wins kept the title, the upsert re-pointed canonical_url/image_url, and the offers of
+    both pages sat under one product. Measured 2026-09-29: 189 live rows carried offers from more
+    than one page of one host -- COCODOR titles every diffuser, refill and candle of a scent with
+    the scent alone ("Black Cherry": 16 pages, $6.99-$19.59), Mr. Smith's full size, mini and
+    sachet share a title, beautyofjoseon.com lists each set once per region at different prices.
+    The first listing in record order keeps the key; every later record naming another listing on
+    that host for the same key is left out WHOLE (pdp, skus, offers, seeds) and named in
+    `listing_collisions`, with the evidence a reviewer needs to tell a duplicate page of one
+    product (same price, same merchant type) from a different product wearing its title. Not
+    counted in `skipped`: the plan is still ready, and the drain decides what holds
+    (services/retailer_ingest/detectors.listing_collision_flags). An `ext:retailer:` row is keyed
+    by its listing URL, so it never meets another listing under its key.
     """
     pdp_rows: List[Dict[str, Any]] = []
     sku_rows: List[Dict[str, Any]] = []
@@ -1619,6 +1655,8 @@ def ingest_validated_jsonl(
     audit_reasons: Dict[str, int] = {}
     skipped = 0
     skipped_reasons: Dict[str, int] = {}
+    listing_owner: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    listing_collisions: List[Dict[str, Any]] = []
     for record in rows:
         result = ingest_validated_record(record, source_jsonl=source_jsonl, market=market)
         if result is None:
@@ -1629,6 +1667,15 @@ def ingest_validated_jsonl(
             reason = str(result["skipped_reason"]).split(":")[0]
             skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
             continue
+        product_key = str(result["pdp"].get("product_key") or "")
+        listing = content_listing(result["pdp"].get("canonical_url"))
+        if listing is not None:
+            evidence = _listing_evidence(record, listing[1])
+            owner = listing_owner.setdefault((product_key, listing[0]), evidence)
+            if owner["handle"] != evidence["handle"]:
+                listing_collisions.append({"product_key": product_key, "host": listing[0],
+                                           "kept": owner, "dropped": evidence})
+                continue
         pdp_rows.append(result["pdp"])
         sku_rows.append(result["sku"])
         sku_rows.extend(result.get("variant_skus") or [])
@@ -1670,4 +1717,25 @@ def ingest_validated_jsonl(
         "skipped": skipped,
         "skipped_reasons": skipped_reasons,
         "audit_reasons": audit_reasons,
+        "listing_collisions": listing_collisions,
     }
+
+
+def _listing_evidence(record: Dict[str, Any], handle: str) -> Dict[str, Any]:
+    """What a reviewer compares across two listings that share a content key: the storefront's
+    own product type and every price the record carries (its variants', else its offers')."""
+    pdp = record.get("pdp") if isinstance(record.get("pdp"), dict) else {}
+    prices = set()
+    for source in (pdp.get("variants") or [], record.get("offers") or []):
+        for item in source:
+            try:
+                price = round(float((item or {}).get("price")), 2)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if price > 0:
+                prices.add(price)
+        if prices:
+            break
+    product_type = str(pdp.get("category_source_product_type") or "").strip()
+    return {"handle": handle, "product_name": pdp.get("product_name"),
+            "product_type": product_type or None, "prices": sorted(prices)}

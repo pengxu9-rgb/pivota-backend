@@ -224,6 +224,10 @@ def _record_handle(record: Dict[str, Any]) -> Optional[str]:
 #: Printed once per record --exclude-handle removed. Greppable.
 EXCLUDED_PDP_PREFIX = "    excluded pdp "
 
+#: Printed once per listing the plan left out because an earlier listing on the same host has its
+#: title, and so its content key (ingestion.ingest_validated_jsonl). Greppable.
+LISTING_COLLISION_PREFIX = "    left out, same title as another listing "
+
 
 def _exclude_by_handle(records: List[Dict[str, Any]], handles: set, *, domain: str) -> tuple:
     """Drop the records whose storefront handle is in `handles`; return (kept, handles that matched).
@@ -678,6 +682,10 @@ async def _run(args: argparse.Namespace) -> int:
         f"offers={len(plan.get('offers') or [])} seeds={len(plan.get('seeds') or [])} "
         f"skipped={plan.get('skipped')}"
     )
+    for collision in plan.get("listing_collisions") or []:
+        # Left out of the plan: another listing on this host has its title (one content key).
+        # --exclude-handle the kept listing to write this one instead.
+        print(LISTING_COLLISION_PREFIX + json.dumps(collision, sort_keys=True, ensure_ascii=False))
     print("primary ingestion: " + json.dumps(inspect_primary_plan(plan), sort_keys=True))
     legacy = brand_guard = None
     if not args.apply:

@@ -168,8 +168,10 @@ async def _do_ingest(args: argparse.Namespace) -> int:
     skipped = plan["skipped"]
     audit_reasons = plan.get("audit_reasons") or {}
     logger.info(
-        "ingest plan: pdps=%s skus=%s merchants=%s offers=%s seeds=%s skipped=%s audit_reasons=%s",
+        "ingest plan: pdps=%s skus=%s merchants=%s offers=%s seeds=%s skipped=%s audit_reasons=%s "
+        "listing_collisions=%s",
         len(pdps), len(skus), len(merchants), len(offers), len(seeds), skipped, audit_reasons,
+        plan.get("listing_collisions") or [],
     )
     if not args.apply:
         if pdps:

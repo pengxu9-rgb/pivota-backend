@@ -845,6 +845,10 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
         answered = [f for f in row_flags if f.get("handle") in refiled and f.get("rule") in REFILE_RESOLVES_RULES]
         row_flags = [f for f in row_flags if f not in answered]
         checks["refile_resolved_flags"] = sorted(f["key"] for f in answered)
+    # A listing the plan left out because an earlier one on this host has its title (one content key).
+    collisions = plan.get("listing_collisions") or []
+    checks["listing_collisions"] = len(collisions)
+    row_flags += detectors.listing_collision_flags(collisions)
     # Name each row's brand on its flag: in a multi_brand cohort the reviewer must see whose row it is.
     brand_of = {detectors._handle(r): (r.get("pdp") or {}).get("brand") for r in records}
     for f in row_flags:
