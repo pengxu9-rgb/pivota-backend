@@ -11,15 +11,16 @@ same rows as a market/currency disagreement.
 TWO LANES DO REWRITE market on an existing row, and a restamp of their offers would be silently undone, so the
 plan REFUSES them (review of #2450):
   * catalog_sync (catalog_track 'internal_merchant'): `_upsert_by_pk` rewrites every column on re-sync;
-  * scripts/onboard_external_brand_from_crawl.py (seed tool 'external_brand_crawl'): sets market from the
-    seed, whose partition is 'US'.
+  * scripts/onboard_external_brand_from_crawl.py (seed id `external_brand_crawl::<epid>`): sets market from
+    the seed, whose partition is 'US'.
 
 WHAT IT CHANGES for a buyer: region pricing gates on CURRENCY, never on market (services/region_pricing.py),
 so serving eligibility does not move. offer_buyability compares the offer's market to the request's: after
 the restamp an SG buyer sees these offers as domestic, a US buyer as cross-border. agent_pdp_view copies
 o.market, so every touched content_key's view is rebuilt after the commit. `updated_at` is NOT bumped: a
 restamp is not a new observation, and `ORDER BY o.updated_at` readers (pivot_query_service, the reconciler's
-keeper election) must not reorder over it.
+keeper election) must not reorder over it -- so the nightly view reconciler will not retry a failed rebuild
+either: the run exits non-zero and `refresh --run-id` is the retry.
 
 SCOPE -- a restamp, never a relabel of price:
   * only offers on the named hosts (offer source_domain, else its product's canonical_url; scheme, userinfo,
@@ -64,17 +65,23 @@ from db.database import database  # noqa: E402
 from services.region_pricing import normalize_region, pricing_currency_for_region  # noqa: E402
 
 REWRITING_TRACKS = ("internal_merchant",)       # catalog_sync_service._upsert_by_pk rewrites every column
-REWRITING_SEED_TOOLS = ("external_brand_crawl",)  # onboard_external_brand_from_crawl sets market from the seed
+# onboard_external_brand_from_crawl sets market from the seed. Its seeds carry tool '*' (SEED_TOOL_SCOPE, since
+# #2169); the provenance is the id prefix `external_brand_crawl::<epid>` (its _seed_id) -- pinned against the
+# producer by the tests (review 2 of #2450: a tool = 'external_brand_crawl' match found none of its seeds).
+REWRITING_SEED_ID_PREFIXES = ("external_brand_crawl::",)
 
 
 def _host_sql(expr: str) -> str:
-    """`offer_host` in SQL: lower/trim, drop scheme (or a bare //), userinfo, then everything from the first
-    / ? # or : (path, query, fragment, port), then any leading www. and a trailing dot."""
-    s = f"lower(trim(coalesce({expr}, '')))"
-    s = f"regexp_replace({s}, '^([a-z][a-z0-9+.-]*:)?//', '')"
+    """`offer_host` in SQL: lower/trim, drop an http(s) scheme (or a bare //), userinfo, then everything from the
+    first / ? # or : (path, query, fragment, port), then any leading www. and trailing dots. Text with another
+    scheme (mailto:...), a backslash, or a result that is not a hostname names no web host: ''."""
+    t = f"lower(trim(coalesce({expr}, '')))"
+    s = f"regexp_replace({t}, '^(https?:)?//', '')"
     s = f"regexp_replace({s}, '^[^/?#@]*@', '')"
     s = f"regexp_replace({s}, '[/?#:].*$', '')"
-    return f"regexp_replace(regexp_replace({s}, '^(www[.])+', ''), '[.]+$', '')"
+    s = f"regexp_replace(regexp_replace({s}, '^(www[.])+', ''), '[.]+$', '')"
+    return (f"(CASE WHEN strpos({t}, chr(92)) > 0 OR ({t} ~ '^[a-z][a-z0-9+.-]*:[^0-9]' AND {t} !~ '^https?:') "
+            f"OR {s} !~ '^[a-z0-9.-]*$' THEN '' ELSE {s} END)")
 
 
 _SOURCE_TEXT = "coalesce(nullif(trim(o.source_domain), ''), cp.canonical_url)"
@@ -86,7 +93,7 @@ PLAN_SQL = f"""
 SELECT o.offer_id, o.product_key, o.sku_key, o.channel, o.market, o.currency, o.catalog_track, o.source_system,
        (o.suppressed_at IS NULL) AS live, cp.content_key, {HOST_SQL} AS host,
        EXISTS (SELECT 1 FROM external_product_seeds s WHERE s.id = cp.source_ref
-                 AND s.tool = ANY(:rewriting_tools)) AS seed_lane_rewrites
+                 AND s.id LIKE ANY(:rewriting_id_patterns)) AS seed_lane_rewrites
 FROM catalog_offers o LEFT JOIN catalog_products cp ON cp.product_key = o.product_key
 WHERE {HOST_SQL} = ANY(:hosts)
   AND {MARKET_SQL.format(a='o')} = :from_market
@@ -125,6 +132,13 @@ WHERE o.offer_id = ANY(:ids) AND s.suppressed_at IS NULL
 ORDER BY o.offer_id, s.offer_id
 """
 
+# A revert leaves an offer that already reads its prior value where it is (review 2 of #2450: after a later run
+# B restamped an offer run A had moved, and B was reverted, that offer is back at A's prior value -- counting it
+# as drift made A unrevertable forever).
+ALREADY_AT_SQL = """
+SELECT offer_id FROM catalog_offers WHERE offer_id = ANY(:ids) AND market = :target
+"""
+
 # Drift-guarded on the exact value read at plan time; the count check in `_write` aborts the transaction.
 RESTAMP_SQL = f"""
 UPDATE catalog_offers SET market = :to_market
@@ -156,15 +170,18 @@ WHERE a.action = :applied AND a.id > :after_id
 # A job log cuts a line at ~100 KB: the report carries counts and a bounded sample.
 SAMPLE = 20
 
-_SCHEME = re.compile(r"^([a-z][a-z0-9+.-]*:)?//")
+_SCHEME = re.compile(r"^(https?:)?//")
 
 
 def offer_host(text: Any) -> str:
     """HOST_SQL, in Python (the two are pinned equal by the tests)."""
-    s = _SCHEME.sub("", str(text or "").strip().lower())
+    t = str(text or "").strip().lower()
+    s = _SCHEME.sub("", t)
     s = re.sub(r"^[^/?#@]*@", "", s)
     s = re.sub(r"[/?#:].*$", "", s)
-    return re.sub(r"[.]+$", "", re.sub(r"^(www[.])+", "", s))
+    s = re.sub(r"[.]+$", "", re.sub(r"^(www[.])+", "", s))
+    other_scheme = re.match(r"^[a-z][a-z0-9+.-]*:[^0-9]", t) and not re.match(r"^https?:", t)
+    return "" if "\\" in t or other_scheme or not re.fullmatch(r"[a-z0-9.-]*", s) else s
 
 
 async def collisions(db: Any, ids: List[str], target: str) -> List[Dict[str, Any]]:
@@ -182,7 +199,7 @@ async def plan(db: Any, hosts: List[str], from_market: str, to_market: str) -> D
     if not hosts:
         raise ValueError("at least one --host is required")
     values = {"hosts": hosts, "from_market": from_m, "currency": currency}
-    rows = [dict(r) for r in await db.fetch_all(PLAN_SQL, {**values, "rewriting_tools": list(REWRITING_SEED_TOOLS)})]
+    rows = [dict(r) for r in await db.fetch_all(PLAN_SQL, {**values, "rewriting_id_patterns": [f"{p}%" for p in REWRITING_SEED_ID_PREFIXES]})]
     left = [dict(r) for r in await db.fetch_all(LEFT_ALONE_SQL, values)]
     near = [dict(r) for r in await db.fetch_all(NEAR_MISS_SQL, {
         "hosts": hosts, "currency": currency, "host_patterns": [f"%{h}%" for h in hosts]})]
@@ -233,15 +250,21 @@ async def load_manifest(db: Any, run_id: str) -> Dict[str, Any]:
     return detail
 
 
-async def _write(db: Any, m: Mapping[str, Any], *, reverse: bool) -> int:
+async def _write(db: Any, m: Mapping[str, Any], *, reverse: bool) -> Dict[str, int]:
     """All or nothing, inside the caller's transaction: every offer moves from its read value to its target, or
-    none does. Forward: prior spelling -> TO. Reverse: TO -> that offer's own prior spelling."""
+    none does. Forward: prior spelling -> TO. Reverse: TO -> that offer's own prior spelling, leaving an offer
+    that already reads it (`already`)."""
     groups: Dict[tuple, List[str]] = {}
     for o in m["offers"]:
         pair = (m["to_market"], o["prior_market"]) if reverse else (o["prior_market"], m["to_market"])
         groups.setdefault(pair, []).append(o["offer_id"])
-    moved = 0
+    moved = already = 0
     for (prior, target), ids in groups.items():
+        if reverse:
+            there = {r["offer_id"] for r in await db.fetch_all(ALREADY_AT_SQL, {"ids": ids, "target": target})}
+            ids, already = [i for i in ids if i not in there], already + len(there)
+            if not ids:
+                continue
         clash = await collisions(db, ids, target)  # again, inside the transaction: offers written since the plan
         if clash:
             raise SystemExit(f"refused: {len(clash)} offer(s) would duplicate a live {target.strip().upper()} "
@@ -252,7 +275,7 @@ async def _write(db: Any, m: Mapping[str, Any], *, reverse: bool) -> int:
             raise RuntimeError(f"drift: {len(ids) - len(got)} of {len(ids)} offer(s) no longer read market "
                                f"{prior!r} in {m['currency']}; nothing written")
         moved += len(got)
-    return moved
+    return {"moved": moved, "already": already}
 
 
 async def refresh_after(db: Any, m: Mapping[str, Any], *, source: str) -> Dict[str, Any]:
@@ -287,7 +310,7 @@ async def apply(db: Any, p: Mapping[str, Any]) -> Dict[str, Any]:
     m = {**{k: p[k] for k in ("hosts", "from_market", "to_market", "currency", "offers")}, "run_id": run_id}
     await _record(db, MANIFEST_ACTION, run_id, m)  # committed on its own, BEFORE the write
     async with db.transaction():
-        moved = await _write(db, m, reverse=False)
+        moved = (await _write(db, m, reverse=False))["moved"]
         await _record(db, APPLIED_ACTION, run_id, {"moved": moved})
     # Before the rebuild: a job killed during 245 view rebuilds must still leave the committed run id in its log.
     print(f"COMMITTED {run_id}: {moved} offer(s) restamped {m['from_market']} -> {m['to_market']}", flush=True)
@@ -311,29 +334,41 @@ async def revert(db: Any, run_id: str) -> Dict[str, Any]:
             raise SystemExit(f"refused: later run {r['run_id']} restamped {len(shared)} of these offers; revert "
                              f"it first")
     async with db.transaction():
-        moved = await _write(db, m, reverse=True)
-        await _record(db, REVERTED_ACTION, run_id, {"moved": moved})
-    print(f"REVERTED {run_id}: {moved} offer(s)", flush=True)
-    return {"run_id": run_id, "reverted": moved, "refresh": await refresh_after(db, m, source=f"{run_id}:revert")}
+        done = await _write(db, m, reverse=True)
+        await _record(db, REVERTED_ACTION, run_id, done)
+    print(f"REVERTED {run_id}: {done['moved']} offer(s), {done['already']} already at their prior market", flush=True)
+    return {"run_id": run_id, "reverted": done["moved"], "already": done["already"],
+            "refresh": await refresh_after(db, m, source=f"{run_id}:revert")}
+
+
+def exit_code(out: Mapping[str, Any]) -> int:
+    """Non-zero when a committed write left views unrebuilt: nothing else retries them -- the nightly reconciler
+    (jobs/agent_pdp_view_reconciler_cron.py) keys "changed" on MAX(offer.updated_at), which a restamp does not
+    bump. Re-run `refresh --run-id`."""
+    return 2 if ((out.get("refresh") or {}).get("failed_keys_total") or 0) > 0 else 0
 
 
 async def run(args: argparse.Namespace) -> int:
     await database.connect()
     try:
+        out: Dict[str, Any] = {}
         if args.command == "revert":
-            print("REVERT_DONE " + json.dumps(await revert(database, args.run_id), default=str), flush=True)
+            out = await revert(database, args.run_id)
+            print("REVERT_DONE " + json.dumps(out, default=str), flush=True)
         elif args.command == "refresh":
             m = await load_manifest(database, args.run_id)
             src = f"{args.run_id}:revert" if args.reverse else args.run_id
-            print("REFRESHED " + json.dumps(await refresh_after(database, m, source=src), default=str), flush=True)
+            out = {"refresh": await refresh_after(database, m, source=src)}
+            print("REFRESHED " + json.dumps(out, default=str), flush=True)
         else:
             p = await plan(database, args.host, args.from_market, args.to_market)
             print("PLAN " + json.dumps(summary(p), default=str), flush=True)
             if args.apply:
-                print("APPLIED " + json.dumps(await apply(database, p), default=str), flush=True)
+                out = await apply(database, p)
+                print("APPLIED " + json.dumps(out, default=str), flush=True)
             else:
                 print("dry run: nothing written (--apply to write)", flush=True)
-        return 0
+        return exit_code(out)
     finally:
         await database.disconnect()
 

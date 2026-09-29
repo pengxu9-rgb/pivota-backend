@@ -121,16 +121,29 @@ async def test_the_plan_takes_exactly_the_named_hosts_sgd_rows(catalog):
     assert await _markets(admin) == before  # the plan writes nothing
 
 
+NOT_JSM = ("shop.jsmbeauty.sg", "jsmbeauty.sg.evil.com", "", None, "mailto:x@jsmbeauty.sg", "ftp://jsmbeauty.sg/x",
+           "https://evil.com\\@jsmbeauty.sg/x", "https://jsm beauty.sg")
+
+
 @pytest.mark.parametrize("text", [
     "https://www.jsmbeauty.sg/products/x", "HTTPS://WWW.JSMBEAUTY.SG", "//jsmbeauty.sg/x", " jsmbeauty.sg ",
-    "jsmbeauty.sg:443", "https://user@jsmbeauty.sg/x", "https://jsmbeauty.sg./x", "www.www.jsmbeauty.sg",
-    "jsmbeauty.sg?x=1", "jsmbeauty.sg#top", "shop.jsmbeauty.sg", "jsmbeauty.sg.evil.com", "", None,
+    "jsmbeauty.sg:443", "https://user@jsmbeauty.sg/x", "https://user:pw@jsmbeauty.sg:8443/x", "https://jsmbeauty.sg./x",
+    "jsmbeauty.sg..", "www.www.jsmbeauty.sg", "jsmbeauty.sg?x=1", "jsmbeauty.sg#top", *NOT_JSM,
 ])
 async def test_offer_host_and_host_sql_agree(catalog, text):
+    """Only http(s) or scheme-less text names a web host; a browser reads `evil.com\\@jsmbeauty.sg` as evil.com,
+    and mailto: is no host at all (review 2 of #2450)."""
     database, _, tool, _, _ = catalog
     got = await database.fetch_val(f"SELECT {tool._host_sql('CAST(:t AS text)')}", {"t": text})
     assert got == tool.offer_host(text)
-    assert (got == "jsmbeauty.sg") is (text not in ("shop.jsmbeauty.sg", "jsmbeauty.sg.evil.com", "", None))
+    assert (got == "jsmbeauty.sg") is (text not in NOT_JSM)
+
+
+async def test_a_blank_source_domain_falls_back_to_the_product_url(catalog):
+    database, admin, tool, _, _ = catalog
+    await _product(admin, "ext:jsm::1", "https://jsmbeauty.sg/products/a", "ck_a")
+    await _offer(admin, "o_blank", "ext:jsm::1", source_domain="   ")
+    assert [o["offer_id"] for o in (await tool.plan(database, ["jsmbeauty.sg"], "US", "SG"))["offers"]] == ["o_blank"]
 
 
 @pytest.mark.parametrize("rewriter", ["catalog_sync_track", "external_brand_crawl_seed"])
@@ -142,8 +155,13 @@ async def test_a_lane_that_rewrites_market_is_refused(catalog, rewriter):
         await _product(admin, "ext:jsm::1", "https://jsmbeauty.sg/products/a", "ck_a")
         await _offer(admin, "o_synced", "ext:jsm::1", track="internal_merchant")
     else:
-        await admin.execute("INSERT INTO external_product_seeds (id, tool) VALUES ('seed_1', 'external_brand_crawl')")
-        await _product(admin, "ext:jsm::1", "https://jsmbeauty.sg/products/a", "ck_a", source_ref="seed_1")
+        # the seed exactly as the producer writes it: id `external_brand_crawl::<epid>`, tool '*' (#2169)
+        from scripts import onboard_external_brand_from_crawl as onboard
+        assert tool.REWRITING_SEED_ID_PREFIXES == (f"{onboard.TOOL}::",)
+        seed_id = onboard._seed_id("9000001")
+        await admin.execute("INSERT INTO external_product_seeds (id, tool) VALUES ($1, $2)",
+                            seed_id, onboard.SEED_TOOL_SCOPE)
+        await _product(admin, "ext:jsm::1", "https://jsmbeauty.sg/products/a", "ck_a", source_ref=seed_id)
         await _offer(admin, "o_crawled", "ext:jsm::1")
     before = await _markets(admin)
     p = await tool.plan(database, ["jsmbeauty.sg"], "US", "SG")
@@ -223,6 +241,7 @@ async def test_a_drifted_revert_writes_nothing(catalog):
 async def test_revert_of_an_older_run_is_refused_while_a_later_run_holds_its_offers(catalog):
     database, admin, tool, _, _ = catalog
     await _seed_rows(admin)
+    original = await _markets(admin)
     a = await tool.apply(database, await tool.plan(database, ["jsmbeauty.sg"], "US", "SG"))
     await admin.execute("UPDATE catalog_offers SET market = 'US' WHERE offer_id = 'o_a_url_only'")
     b = await tool.apply(database, await tool.plan(database, ["jsmbeauty.sg"], "US", "SG"))
@@ -232,8 +251,9 @@ async def test_revert_of_an_older_run_is_refused_while_a_later_run_holds_its_off
         await tool.revert(database, a["run_id"])
     assert await _markets(admin) == before
     await tool.revert(database, b["run_id"])  # the later run reverts cleanly ...
-    with pytest.raises(RuntimeError, match="drift: 1 of 4"):  # ... and A, whose row was hand-moved, stays all-or-nothing
-        await tool.revert(database, a["run_id"])
+    done = await tool.revert(database, a["run_id"])  # ... and then A: the offer B returned is already at US
+    assert (done["reverted"], done["already"]) == (4, 1)
+    assert await _markets(admin) == original  # every offer, " us" included, is back where it started
 
 
 # ------------------------------------------------------------------ duplicate shelves
@@ -255,6 +275,14 @@ async def test_a_would_be_duplicate_shelf_refuses_the_whole_run(catalog):
     # a suppressed SG offer is no shelf at all, and another channel is another shelf
     await admin.execute("UPDATE catalog_offers SET suppressed_at = NOW() WHERE offer_id = 'o_live_sg'")
     await admin.execute("UPDATE catalog_offers SET channel = 'agent' WHERE offer_id = 'o_live_sg2'")
+    assert (await tool.plan(database, ["jsmbeauty.sg"], "US", "SG"))["collisions"] == []
+
+
+async def test_a_suppressed_and_a_live_planned_offer_on_one_shelf_do_not_collide(catalog):
+    database, admin, tool, _, _ = catalog
+    await _product(admin, "ext:jsm::1", "https://jsmbeauty.sg/products/a", "ck_a")
+    await _offer(admin, "o_1", "ext:jsm::1", sku="sku:shared")
+    await _offer(admin, "o_2", "ext:jsm::1", sku="sku:shared", suppressed=True)
     assert (await tool.plan(database, ["jsmbeauty.sg"], "US", "SG"))["collisions"] == []
 
 
@@ -313,3 +341,11 @@ async def test_the_rebuild_covers_every_touched_key_and_lists_a_failure(catalog,
     assert views == [("ck_a", "restamp_x"), ("ck_b", "restamp_x")] and recomputed == views
     assert (out["refreshed"], out["recomputed"], out["failed_keys_total"]) == (2, 2, 1)
     assert out["failed_keys"][0]["content_key"] == "ck_bad"
+
+
+def test_a_failed_rebuild_exits_non_zero():
+    """The nightly view reconciler keys on offer updated_at, which a restamp does not bump: only the exit code
+    tells the operator to re-run `refresh --run-id`."""
+    from scripts import restamp_offer_market as tool
+    assert tool.exit_code({"refresh": {"failed_keys_total": 1}}) == 2
+    assert tool.exit_code({"refresh": {"failed_keys_total": 0}}) == 0 and tool.exit_code({}) == 0
