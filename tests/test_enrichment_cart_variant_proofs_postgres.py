@@ -140,8 +140,9 @@ async def test_the_self_heal_builds_what_migration_248_builds(_clean):
     assert types["checked_at"] == "timestamp with time zone"
     assert types["live_price_minor"] == "bigint" and types["available"] == "boolean"
     assert ("p", "PRIMARY KEY (product_key, sku_key)") in constraints
-    assert sum(1 for kind, _ in constraints if kind == "c") == 4, constraints
-    assert names == ["ck_enrichment_cart_variant_proofs_ok_has_evidence"]
+    assert sum(1 for kind, _ in constraints if kind == "c") == 5, constraints
+    assert names == ["ck_enrichment_cart_variant_proofs_ok_has_evidence", "ck_enrichment_cart_variant_proofs_source"]
+    assert any("'^[A-Z]{3}$'" in d for kind, d in constraints if kind == "c"), constraints
     assert list(indexes) == [f"{_TABLE}_pkey"]
 
     await _apply_text(_DOWN.read_text(encoding="utf-8"))
@@ -165,7 +166,7 @@ async def test_the_parity_fingerprint_sees_a_missing_check(_clean):
     database = await _connected()
     await database.execute(f"DROP TABLE IF EXISTS {_TABLE}")
     narrowed = migration.replace(
-        "currency            TEXT CHECK (currency IS NULL OR (length(currency) = 3 AND currency = upper(currency))),",
+        "currency            TEXT CHECK (currency IS NULL OR currency ~ '^[A-Z]{3}$'),",
         "currency            TEXT,",
     )
     assert narrowed != migration, "the control's edit no longer matches the migration text"

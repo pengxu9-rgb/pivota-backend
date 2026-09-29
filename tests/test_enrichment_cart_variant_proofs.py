@@ -65,7 +65,23 @@ def _statement_body(sql: str) -> str:
 def test_the_self_heal_statement_is_the_migrations_statement():
     migration = _statement_body(_MIGRATION.read_text(encoding="utf-8"))
     assert migration.startswith("CREATE TABLE IF NOT EXISTS enrichment_cart_variant_proofs (")
-    assert [_statement_body(s) for s in proofs._DDL_STATEMENTS] == [migration]
+    assert _statement_body(proofs._CREATE_POSTGRES) == migration
+    # This run's dialect builds its own statement, and only that one.
+    expected = proofs._CREATE_POSTGRES if proofs.IS_POSTGRES else proofs._CREATE_SQLITE
+    assert proofs._DDL_STATEMENTS == [expected]
+
+
+def test_the_sqlite_build_differs_from_postgres_only_in_the_currency_regex():
+    pg, lite = proofs._CREATE_POSTGRES, proofs._CREATE_SQLITE
+    assert pg.count(proofs.POSTGRES_CURRENCY_CHECK) == 1
+    assert lite != pg
+    assert lite.replace(proofs.SQLITE_CURRENCY_CHECK, proofs.POSTGRES_CURRENCY_CHECK) == pg
+
+
+def test_the_source_check_is_the_verifiers_source_list():
+    migration = _statement_body(_MIGRATION.read_text(encoding="utf-8"))
+    listed = re.search(r"source IN \(([^)]*)\)", migration).group(1)
+    assert tuple(v.strip().strip("'") for v in listed.split(",")) == proofs.PROOF_SOURCES
 
 
 def test_the_migration_is_additive_and_the_down_drops_only_this_table():
@@ -135,6 +151,17 @@ async def test_an_ok_proof_must_carry_its_evidence(proof_db, missing):
         await database.execute(_INSERT, _row(**{missing: None}))
 
 
+@pytest.mark.parametrize("over", [{"live_variant_count": 0}, {"live_price_minor": 0}])
+async def test_an_ok_proof_has_a_variant_and_a_price(proof_db, over):
+    with pytest.raises(Exception, match=_CONSTRAINT):
+        await database.execute(_INSERT, _row(**over))
+
+
+async def test_a_refusal_may_record_no_variant_and_no_price(proof_db):
+    await database.execute(_INSERT, _row(outcome="variant_gone", live_variant_count=0, live_price_minor=0))
+    assert await database.fetch_val(f"SELECT live_variant_count FROM {proofs.TABLE}") == 0
+
+
 async def test_a_refusal_outcome_may_carry_no_evidence(proof_db):
     await database.execute(_INSERT, _row(
         outcome="revoked_404", variant_id=None, live_variant_count=None, available=None,
@@ -143,8 +170,11 @@ async def test_a_refusal_outcome_may_carry_no_evidence(proof_db):
 
 
 @pytest.mark.parametrize("over", [
-    {"currency": "usd"}, {"currency": "US"}, {"currency": "USDT"},
+    {"currency": "usd"}, {"currency": "US"}, {"currency": "USDT"}, {"currency": "1$!"}, {"currency": "U$D"},
+    {"currency": "Usd"}, {"currency": "ÉUR"}, {"currency": ""},
+    {"source": "anything"}, {"source": "PRODUCTS_JSON_V1"}, {"source": "anything", "outcome": "revoked_404"},
     {"live_variant_count": -1}, {"live_price_minor": -1},
+    {"live_variant_count": -1, "outcome": "revoked_404"}, {"live_price_minor": -1, "outcome": "revoked_404"},
     {"shop_host": None}, {"handle": None}, {"source": None}, {"checked_at": None}, {"outcome": None},
 ])
 async def test_the_table_refuses_a_malformed_row(proof_db, over):

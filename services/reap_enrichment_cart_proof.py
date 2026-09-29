@@ -30,6 +30,43 @@ So the id is `source_variant_id`; a key that DOES spell `::v:<digits>` must agre
 The placeholder is recognised by its key alone (`<product_key>::canonical`): its
 `source_variant_id` is the product_key only while that fits 128 characters
 (ingestion.canonical_sku_variant_id), so comparing the two misses every longer key.
+
+THE PLACEHOLDER NEVER STANDS IN FOR A VARIANT THE CATALOG KNOWS. It may be bought only when the
+product has NO `::v:` sku at all (`catalog_variant_sku_count == 0`, which the caller counts) AND
+the handle has exactly one variant. Without the first condition, MAC's 99 folded families pass:
+their canonical_url is the parent handle, whose one variant is a "Default Title" stub, while the
+placeholder's price is the first shade's -- the cart would buy the stub.
+
+HOSTS ARE COMPARED EXACTLY AFTER ONE `www.` FOLD, the same fold on all three sides (the
+canonical_url host, `source_domain`, the proof's `shop_host`), by the repo's existing owner of
+that rule, `services.curated_brand_feed._same_storefront_host` (case and a trailing dot are also
+folded; a subdomain, a suffix or a lookalike never matches).
+
+THE PROOF CONTRACT -- what PR B's writer must put in db/enrichment_cart_variant_proofs.py, and
+what this verifier assumes. A row that breaks any of these must not be written as 'ok'.
+  * product_key, sku_key  the catalog row the proof is FOR, exactly. One proof per sku.
+  * shop_host   the host the job REQUESTED (the canonical_url host). If the storefront redirects
+                to a host that fails `_same_storefront_host` against it, the outcome is not 'ok'
+                (e.g. 'host_redirected').
+  * handle      Shopify's own `handle` from the response, verbatim; compared exactly with
+                `sku_payload.source_handle`, else the canonical_url handle.
+  * variant_id  a variant id taken from the storefront response for that handle (bare ASCII
+                digits). An 'ok' proof is written only when the sku's own numeric id is FOUND
+                among that handle's variants (for the placeholder: the handle's one variant).
+  * live_variant_count  ALL variants on the handle, available or not. Sole-variant mode relies on
+                it: a 3-shade product with 2 shades sold out has live_variant_count 3, not 1.
+  * available   that variant's own `available`.
+  * live_price_minor, currency  that variant's price in ISO-4217 MINOR units of the currency the
+                price was ACTUALLY read in (not the market's, not an assumed one). `.js` prices
+                are x100 for every currency, JPY and KRW included, so the writer converts with
+                the currency's exponent (`.js` 440000 JPY -> 4400); `/products.json` prices are
+                major-unit strings.
+  * source      one of PROOF_SOURCES (the table CHECKs it).
+  * checked_at  when the response was read (TIMESTAMPTZ); updated_at is SET EXPLICITLY on every
+                write (the column default fires on INSERT only).
+  * outcome     'ok', or a refusal the job keeps for itself ('revoked_404', 'variant_gone', ...).
+PR C's offer SQL must filter suppressed offers (`suppression_reason IS NULL AND suppressed_at IS
+NULL`) and select by listing identity; `enrichment_offer_price_ok` sees only what it is handed.
 """
 
 from __future__ import annotations
@@ -40,12 +77,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
-from db.enrichment_cart_variant_proofs import OUTCOME_OK
+from db.enrichment_cart_variant_proofs import OUTCOME_OK, PROOF_SOURCES
 # THE repo's major -> minor conversion for this rail: refuses (None) rather than rounds, knows the
 # zero-decimal currencies, and refuses a binary float. The cart-link route prices with it too.
 from db.reap_agentic_ledger import amount_minor_or_none
 # The one reader of a Shopify variant reference (bare digits or `gid://shopify/ProductVariant/<n>`).
 from services.outbound_links_service import extract_shopify_numeric_variant_id
+# THE owner of the "same storefront host" rule (one `www.` fold, nothing else). Imported.
+from services.curated_brand_feed import _same_storefront_host
 # THE owners of the observed seller-of-record id. Imported, never re-implemented.
 from services.seller_identity import etld1, make_observed_retailer_id, resolve_seed_seller_identity
 # Shopify caps a product at 100 variants.
@@ -62,9 +101,6 @@ VARIANT_INFIX = "::v:"
 
 #: How old a proof may be. The storefront price and stock move; 72h is the design's bound.
 MAX_PROOF_AGE = timedelta(hours=72)
-#: What PR B's job may record as `source`: the store-wide `/products.json` page, or a handle's
-#: `/products/<handle>.js`. Anything else was not read from the storefront by that job.
-PROOF_SOURCES = frozenset({"products_json_v1", "products_js_v1"})
 
 # Success reasons.
 SOLE_VARIANT = "sole_variant"
@@ -90,6 +126,7 @@ PROOF_FROM_FUTURE = "proof_from_future"
 PROOF_STALE = "proof_stale"
 PROOF_UNAVAILABLE = "proof_unavailable"
 PLACEHOLDER_MULTI_VARIANT = "placeholder_multi_variant"
+PLACEHOLDER_HAS_VARIANT_SKUS = "placeholder_has_variant_skus"
 VARIANT_MISMATCH = "variant_mismatch"
 
 # Reasons of enrichment_offer_price_ok (the route's own vocabulary, plus row_price_stale).
@@ -105,6 +142,7 @@ _NUMERIC_ID = re.compile(r"[0-9]{1,20}")
 _HANDLE = re.compile(r"[^/?#\\\s]+")
 _PRODUCT_PATH = re.compile(r"/products/([^/]+)")
 _CURRENCY = re.compile(r"[A-Z]{3}")
+_GID_PREFIX = "gid://shopify/ProductVariant/"
 
 Verdict = Tuple[bool, Optional[str], str]
 
@@ -128,6 +166,19 @@ def _numeric_id(value: Any) -> Optional[str]:
     if isinstance(value, str) and _NUMERIC_ID.fullmatch(value):
         return value
     return None
+
+
+def _strict_variant_id(value: Any) -> Optional[str]:
+    """A sku's `source_variant_id` as a Shopify numeric id, STRICTLY: the whole value is ASCII digits
+    or exactly `gid://shopify/ProductVariant/<digits>`. The shared reader
+    (`extract_shopify_numeric_variant_id`) also strips whitespace and finds a gid anywhere in the
+    string; this wrapper keeps its answer only when the value IS one of the two exact spellings."""
+    if not isinstance(value, str):
+        return None
+    numeric = _numeric_id(extract_shopify_numeric_variant_id(value))
+    if numeric is None:
+        return None
+    return numeric if value in (numeric, _GID_PREFIX + numeric) else None
 
 
 def storefront_page(canonical_url: Any) -> Optional[Tuple[str, str]]:
@@ -219,7 +270,7 @@ def _sku_variant(sku_key: str, product_key: str, source_variant_id: Any) -> Tupl
     must name the same id; a key with digits and a source_variant_id without is a contradiction
     too, never a fallback to the key.
     """
-    stored = _numeric_id(extract_shopify_numeric_variant_id(_text(source_variant_id)))
+    stored = _strict_variant_id(source_variant_id)
     token = sku_key[len(product_key) + len(VARIANT_INFIX):]
     keyed = token if _NUMERIC_ID.fullmatch(token) else None
     if keyed is not None and keyed != stored:
@@ -232,6 +283,7 @@ def verify_enrichment_cart_proof(
     sku_row: Any,
     proof_row: Any,
     *,
+    catalog_variant_sku_count: int,
     now: datetime,
     max_age: timedelta = MAX_PROOF_AGE,
 ) -> Verdict:
@@ -240,25 +292,31 @@ def verify_enrichment_cart_proof(
     Inputs are the catalog_products row (product_key, source_system, source_domain,
     canonical_url), the catalog_skus row (sku_key, source_variant_id, sku_payload) and the
     enrichment_cart_variant_proofs row for exactly that (product_key, sku_key), or None.
+    `catalog_variant_sku_count` is how many LIVE non-placeholder skus (`::v:`) the product has in
+    catalog_skus; the caller counts them. It is required so no caller can forget it.
 
     ACCEPTED in one of two modes; `reason` names which:
       * sole_variant   the proof's handle has exactly one live variant. The `::canonical`
-                       placeholder may ONLY use this mode. A real sku must also name the
-                       proof's variant (tarte `amazonian-clay-...` with one shade).
+                       placeholder may ONLY use this mode, and only on a product with no
+                       `::v:` sku. A real sku must also name the proof's variant (tarte
+                       flat blush brush, one variant).
       * named_variant  the handle has several live variants and the sku's own numeric id IS the
                        proof's variant (a MAC shade folded into its own handle, a bluemercury
                        size).
     Both modes require: the row is an enrichment row; the sku belongs to it; the proof is for
     this (product_key, sku_key); canonical_url is `https://<host>/products/<handle>`; the host
-    equals `source_domain` and the proof's shop_host EXACTLY (no subdomain, suffix or `www.`
-    match); the proof's handle equals `sku_payload.source_handle` when set, else the
+    equals `source_domain` and the proof's shop_host after one `www.` fold (no subdomain,
+    suffix or lookalike match); the proof's handle equals `sku_payload.source_handle` when set, else the
     canonical_url handle; the proof was read by PR B's job (`source`), its outcome is 'ok', it is
     at most `max_age` old and not from the future; the variant is available.
 
-    `now` must be timezone-aware; a naive `now` is a caller bug and raises ValueError.
+    `now` must be timezone-aware and `catalog_variant_sku_count` a non-negative int; anything else
+    is a caller bug and raises ValueError.
     """
     if not isinstance(now, datetime) or now.utcoffset() is None:
         raise ValueError("verify_enrichment_cart_proof: `now` must be a timezone-aware datetime")
+    if type(catalog_variant_sku_count) is not int or catalog_variant_sku_count < 0:
+        raise ValueError("verify_enrichment_cart_proof: `catalog_variant_sku_count` must be an int >= 0")
     product = _mapping(product_row)
     sku = _mapping(sku_row)
     if product is None or sku is None:
@@ -283,9 +341,9 @@ def verify_enrichment_cart_proof(
     if page is None:
         return _refuse(CANONICAL_URL_UNUSABLE)
     host, canonical_handle = page
-    if host != _text(product.get("source_domain")).strip().lower():
+    if not _same_storefront_host(host, _text(product.get("source_domain"))):
         return _refuse(HOST_MISMATCH)
-    if host != proof.get("shop_host"):
+    if not _same_storefront_host(host, _text(proof.get("shop_host"))):
         return _refuse(HOST_MISMATCH)
 
     payload = _sku_payload(sku.get("sku_payload"))
@@ -318,8 +376,11 @@ def verify_enrichment_cart_proof(
         return _refuse(PROOF_MALFORMED)
 
     if placeholder:
-        # The placeholder names the PRODUCT, not a variant: only a handle with one live variant
-        # says which variant that is.
+        # The placeholder names the PRODUCT, not a variant. It may stand for the product's one
+        # variant only when the catalog knows no variant of it (else the MAC parent-stub cart) and
+        # the handle has exactly one variant, sold out or not (else it is some shade, unnamed).
+        if catalog_variant_sku_count != 0:
+            return _refuse(PLACEHOLDER_HAS_VARIANT_SKUS)
         if live_count != 1:
             return _refuse(PLACEHOLDER_MULTI_VARIANT)
         return True, proof_variant, SOLE_VARIANT
@@ -369,37 +430,46 @@ def enrichment_offer_price_ok(
     """`(ok, price_minor | None, reason)` for the offers PR C's SQL selected for this sku.
 
     Each offer carries `price` (a MAJOR-unit decimal, as text or Decimal -- `_CART_OFFER_SQL`
-    CASTs it to TEXT; a binary float is refused as unusable) and `currency`. An offer whose price
-    does not convert exactly to minor units is not usable and is skipped. Then:
+    CASTs it to TEXT; a binary float is refused as unusable) and `currency`. An offer is unusable
+    when it is not a mapping, its currency is not three letters, or its price does not convert
+    exactly to minor units. Then:
       row_unpriced           no usable offer;
-      row_price_ambiguous    usable offers disagree on (currency, price);
+      row_price_ambiguous    usable offers disagree on (currency, price), or an unusable offer
+                             sits beside usable ones (a price nobody can read is not agreement);
       row_currency_mismatch  the offers' currency, or the proof's, is not the market's;
       row_price_stale        the proof has no live price, or it differs from the offers'.
     Call it after verify_enrichment_cart_proof accepted `proof`.
     """
+    market = _text(market_currency).strip().upper()
     usable = set()
+    unusable = 0
     for raw in offers or ():
         offer = _mapping(raw)
         if offer is None:
+            unusable += 1
             continue
         currency = _text(offer.get("currency")).strip().upper()
         if not _CURRENCY.fullmatch(currency):
+            unusable += 1
             continue
         minor = amount_minor_or_none(offer.get("price"), currency)
         if minor is None:
+            unusable += 1
             continue
         usable.add((currency, minor))
     if not usable:
         return _refuse(ROW_UNPRICED)
+    if unusable:
+        return _refuse(ROW_PRICE_AMBIGUOUS)
     if len(usable) > 1:
         return _refuse(ROW_PRICE_AMBIGUOUS)
     ((currency, minor),) = usable
-    if currency != market_currency:
+    if currency != market:
         return _refuse(ROW_CURRENCY_MISMATCH)
     proof_row = _mapping(proof)
     if proof_row is None:
         return _refuse(ROW_PRICE_STALE)
-    if proof_row.get("currency") != market_currency:
+    if proof_row.get("currency") != market:
         return _refuse(ROW_CURRENCY_MISMATCH)
     live = proof_row.get("live_price_minor")
     if type(live) is not int or live != minor:

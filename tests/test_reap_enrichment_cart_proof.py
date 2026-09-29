@@ -145,8 +145,14 @@ LONG = product(LONG_PK, "https://tartecosmetics.com/products/shape-tape-ultra-cr
                brand="tarte", merchant_id="merch_obs_c75008da8d4366d6")
 
 
-def verify(prod, sk, pr, **kw):
-    return verify_enrichment_cart_proof(prod, sk, pr, now=kw.pop("now", NOW), **kw)
+def verify(prod, sk, pr, *, count=None, **kw):
+    """`count` is catalog_variant_sku_count. Default: 0 for a placeholder (a canonical-only
+    product), 1 otherwise (the sku itself). Tests that are ABOUT the count pass it."""
+    if count is None:
+        is_canon = isinstance(sk, dict) and str(sk.get("sku_key", "")).endswith("::canonical")
+        count = 0 if is_canon else 1
+    return verify_enrichment_cart_proof(prod, sk, pr, catalog_variant_sku_count=count,
+                                        now=kw.pop("now", NOW), **kw)
 
 
 def with_(row, **over):
@@ -162,10 +168,39 @@ def test_tarte_sole_variant_is_accepted():
     assert verify(TARTE, TARTE_SKU, TARTE_PROOF) == (True, "52729903251478", "sole_variant")
 
 
-def test_tarte_placeholder_of_a_sole_variant_product_is_accepted():
+def test_the_placeholder_of_a_product_with_a_variant_sku_is_refused():
+    """tarte flat blush brush carries `::canonical` AND `::v:52729903251478`: the cart must name the
+    variant sku, never the placeholder, even though the handle has one variant."""
     canon = placeholder(TARTE_PK)
     pr = with_(TARTE_PROOF, sku_key=canon["sku_key"])
-    assert verify(TARTE, canon, pr) == (True, "52729903251478", "sole_variant")
+    assert verify(TARTE, canon, pr, count=1) == (False, None, "placeholder_has_variant_skus")
+    assert verify(TARTE, canon, pr, count=0) == (True, "52729903251478", "sole_variant")
+
+
+def test_the_mac_parent_stub_is_never_bought_through_the_placeholder():
+    """MAC's 99 folded families: canonical_url is the PARENT handle, whose one variant is a
+    'Default Title' stub (P2000_...), while the placeholder is priced as the first shade. The proof
+    of the parent handle says lvc=1 -- the catalog's shade skus are what refuse it."""
+    canon = placeholder(MAC_PK)
+    parent = proof(MAC, canon, host="maccosmetics.com",
+                   handle="studio-fix-fluid-spf-15-24hr-matte-foundation-oil-control",
+                   variant="54057000000001", lvc=1, price=3900)
+    assert verify(MAC, canon, parent, count=3) == (False, None, "placeholder_has_variant_skus")
+
+
+def test_a_native_three_shade_product_with_two_sold_out_refuses_its_placeholder():
+    """live_variant_count counts ALL variants on the handle. Two sold-out shades still make the
+    placeholder ambiguous even though only one shade can be bought."""
+    canon = placeholder(BRONZER_PK)
+    pr = with_(BRONZER_PROOF, sku_key=canon["sku_key"], live_variant_count=3, available=True)
+    assert verify(BRONZER, canon, pr, count=0) == (False, None, "placeholder_multi_variant")
+
+
+@pytest.mark.parametrize("count", [-1, True, "0", None, 0.0])
+def test_a_malformed_catalog_variant_sku_count_is_a_caller_bug(count):
+    with pytest.raises(ValueError):
+        verify_enrichment_cart_proof(CHESTNUT, CHESTNUT_CANON, CHESTNUT_PROOF,
+                                     catalog_variant_sku_count=count, now=NOW)
 
 
 def test_tarte_shade_of_a_three_shade_product_is_named():
@@ -210,12 +245,13 @@ def test_a_product_key_longer_than_128_characters():
     canon = placeholder(LONG_PK, svid=LONG_SPID)
     pr = proof(LONG, canon, host="tartecosmetics.com", handle="shape-tape-ultra-creamy-concealer",
                variant="52729903251478")
-    assert verify(LONG, canon, pr) == (True, "52729903251478", "sole_variant")
+    assert verify(LONG, canon, pr, count=0) == (True, "52729903251478", "sole_variant")
     shade = sku(LONG_PK + "::v:52729903251478", "52729903251478")
     assert len(shade["sku_key"]) > 128
     pr = with_(pr, sku_key=shade["sku_key"], live_variant_count=4)
     assert verify(LONG, shade, pr) == (True, "52729903251478", "named_variant")
-    assert verify(LONG, canon, with_(pr, sku_key=canon["sku_key"])) == (False, None, "placeholder_multi_variant")
+    assert verify(LONG, canon, with_(pr, sku_key=canon["sku_key"]), count=0) == (
+        False, None, "placeholder_multi_variant")
 
 
 # ── refused: the proof's own state ──────────────────────────────────────────────────────────────
@@ -319,11 +355,25 @@ def test_a_sku_whose_id_is_not_the_proofs_variant_is_refused():
 
 
 @pytest.mark.parametrize("shop_host", [
-    "evil-tarte.com", "tartecosmetics.com.evil.io", "www.tartecosmetics.com", "shop.tartecosmetics.com",
-    "TarteCosmetics.com", "tartecosmetics.com.", "artecosmetics.com", "", None,
+    "evil-tarte.com", "tartecosmetics.com.evil.io", "shop.tartecosmetics.com", "www.shop.tartecosmetics.com",
+    "wwwtartecosmetics.com", "artecosmetics.com", "tartecosmetics.co", "", None, 42,
 ])
 def test_a_proof_from_any_other_host_is_refused(shop_host):
     assert verify(TARTE, TARTE_SKU, with_(TARTE_PROOF, shop_host=shop_host)) == (False, None, "host_mismatch")
+
+
+@pytest.mark.parametrize("shop_host", ["www.tartecosmetics.com", "TarteCosmetics.com", "tartecosmetics.com."])
+def test_a_proof_from_the_same_storefront_after_one_www_fold_is_accepted(shop_host):
+    assert verify(TARTE, TARTE_SKU, with_(TARTE_PROOF, shop_host=shop_host))[0] is True
+
+
+def test_the_www_fold_is_the_same_on_all_three_sides():
+    www = with_(TARTE, canonical_url="https://www.tartecosmetics.com/products/flat-blush-brush")
+    assert verify(www, TARTE_SKU, TARTE_PROOF)[0] is True
+    assert verify(www, TARTE_SKU, with_(TARTE_PROOF, shop_host="www.tartecosmetics.com"))[0] is True
+    assert verify(with_(www, source_domain="www.tartecosmetics.com"), TARTE_SKU, TARTE_PROOF)[0] is True
+    assert verify(with_(www, source_domain="shop.tartecosmetics.com"), TARTE_SKU, TARTE_PROOF) == (
+        False, None, "host_mismatch")
 
 
 @pytest.mark.parametrize("url", [
@@ -338,9 +388,10 @@ def test_a_lookalike_canonical_host_is_refused_even_when_the_proof_agrees_with_i
 
 
 def test_the_canonical_host_must_be_the_rows_source_domain():
-    assert verify(with_(TARTE, source_domain="www.tartecosmetics.com"), TARTE_SKU, TARTE_PROOF) == (
-        False, None, "host_mismatch")
-    assert verify(with_(TARTE, source_domain=None), TARTE_SKU, TARTE_PROOF) == (False, None, "host_mismatch")
+    for other in ("shop.tartecosmetics.com", "evil-tarte.com", "tartecosmetics.com.evil.io", None, ""):
+        assert verify(with_(TARTE, source_domain=other), TARTE_SKU, TARTE_PROOF) == (
+            False, None, "host_mismatch"), other
+    assert verify(with_(TARTE, source_domain="www.tartecosmetics.com"), TARTE_SKU, TARTE_PROOF)[0] is True
     # Case is not identity for a DNS name: the stored domain is compared folded.
     assert verify(with_(TARTE, source_domain="TarteCosmetics.com"), TARTE_SKU, TARTE_PROOF)[0] is True
 
@@ -353,6 +404,8 @@ def test_the_canonical_host_must_be_the_rows_source_domain():
     "ftp://tartecosmetics.com/products/flat-blush-brush",
     "https:///products/flat-blush-brush",
     "https://evil@tartecosmetics.com/products/flat-blush-brush",
+    "https://@tartecosmetics.com/products/flat-blush-brush",
+    "https://:@tartecosmetics.com/products/flat-blush-brush",
     "https://tartecosmetics.com:443/products/flat-blush-brush",
     "https://tartecosmetics.com:8443/products/flat-blush-brush",
     "https://tartecosmetics.com:abc/products/flat-blush-brush",
@@ -420,10 +473,11 @@ def test_a_sku_payload_may_be_a_dict_or_absent():
 
 
 def test_a_canonical_placeholder_on_a_multi_variant_handle_is_refused():
-    canon = placeholder(BRONZER_PK)
-    pr = with_(BRONZER_PROOF, sku_key=canon["sku_key"])
-    assert verify(BRONZER, canon, pr) == (False, None, "placeholder_multi_variant")
-    assert verify(BRONZER, canon, with_(pr, live_variant_count=2)) == (False, None, "placeholder_multi_variant")
+    canon = placeholder(CHESTNUT_PK)
+    pr = with_(CHESTNUT_PROOF, sku_key=canon["sku_key"])
+    for lvc in (2, 3, 100):
+        assert verify(CHESTNUT, canon, with_(pr, live_variant_count=lvc), count=0) == (
+            False, None, "placeholder_multi_variant")
 
 
 # ── refused: the sku's own identity ─────────────────────────────────────────────────────────────
@@ -443,6 +497,16 @@ def test_a_variant_sku_with_no_numeric_id_is_refused_even_on_a_sole_variant_hand
     8 oz sku whose 16.9 oz sibling was delisted) must not."""
     sk = sku(BM_SKU["sku_key"], svid)
     assert verify(BM, sk, BM_PROOF) == (False, None, "sku_variant_unverified")
+
+
+@pytest.mark.parametrize("svid", [
+    " 32903948173387", "32903948173387 ", "x gid://shopify/ProductVariant/32903948173387",
+    "gid://shopify/ProductVariant/32903948173387?x=1", "gid://shopify/ProductVariant/32903948173387 ",
+    "gid://shopify/Product/32903948173387",
+])
+def test_a_source_variant_id_is_read_strictly(svid):
+    """Only the two exact spellings; the shared reader alone would find an id in each of these."""
+    assert verify(BM, sku(BM_SKU["sku_key"], svid), BM_PROOF) == (False, None, "sku_variant_unverified")
 
 
 def test_a_gid_source_variant_id_is_read():
@@ -497,7 +561,8 @@ def test_a_row_that_is_not_a_mapping_is_refused(which):
 
 def test_a_naive_now_is_a_caller_bug():
     with pytest.raises(ValueError):
-        verify_enrichment_cart_proof(TARTE, TARTE_SKU, TARTE_PROOF, now=datetime(2026, 9, 29, 12, 0))
+        verify_enrichment_cart_proof(TARTE, TARTE_SKU, TARTE_PROOF, catalog_variant_sku_count=1,
+                                     now=datetime(2026, 9, 29, 12, 0))
 
 
 # ── the seller ──────────────────────────────────────────────────────────────────────────────────
@@ -530,6 +595,14 @@ def test_the_brand_direct_dispatch_would_have_minted_a_different_seller_for_blue
     assert resolve_seed_seller_identity(brand="NARS", domain="bluemercury.com")["merchant_id"] != BM["merchant_id"]
     not_a_retailer_key = with_(BM, product_key="ext:nars-16-blush-brush::0badc0de")
     assert derive_enrichment_seller(not_a_retailer_key) != BM["merchant_id"]
+
+
+@pytest.mark.parametrize("key", ["ext:retailer-beauty-flat-brush::0badc0de", "ext:tarte-retailer:exclusive::0badc0de",
+                                 "ext:Retailer:37065ae3db2eba22d6b959e19dbb1284", "retailer:37065ae3db2eba22d6b959e19dbb1284"])
+def test_only_the_exact_retailer_prefix_keys_a_row_on_its_domain(key):
+    """A brand slug that merely CONTAINS 'retailer' is a brand-direct row."""
+    brand_direct = with_(BM, product_key=key, brand="NARS")
+    assert derive_enrichment_seller(brand_direct) == "merch_obs_2b6ad333b9173fb7"
 
 
 def test_the_seller_is_read_from_the_canonical_host_not_another_url():
@@ -603,8 +676,16 @@ def test_no_usable_offer_is_unpriced():
         assert enrichment_offer_price_ok(offers, TARTE_PROOF, "USD") == (False, None, "row_unpriced"), offers
 
 
-def test_an_unusable_offer_beside_a_usable_one_is_skipped():
-    assert enrichment_offer_price_ok([offer("abc"), offer("34.00")], TARTE_PROOF, "USD") == (True, 3400, "ok")
+@pytest.mark.parametrize("bad", [offer("abc"), offer("34.00", None), offer(None), offer(34.0), "34.00", None])
+def test_an_unusable_offer_beside_a_usable_one_is_ambiguous(bad):
+    """Fail closed: a spelling whose price nobody can read is not a spelling that agrees."""
+    assert enrichment_offer_price_ok([bad, offer("34.00")], TARTE_PROOF, "USD") == (False, None, "row_price_ambiguous")
+    assert enrichment_offer_price_ok([offer("34.00"), bad], TARTE_PROOF, "USD") == (False, None, "row_price_ambiguous")
+
+
+def test_the_market_currency_is_compared_upper_cased():
+    assert enrichment_offer_price_ok([offer("34.00")], TARTE_PROOF, "usd") == (True, 3400, "ok")
+    assert enrichment_offer_price_ok([offer("34.00")], TARTE_PROOF, " USD ") == (True, 3400, "ok")
 
 
 def test_an_offer_in_another_currency_than_the_market_is_refused():
