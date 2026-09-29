@@ -3533,3 +3533,136 @@ async def test_a_vendor_only_mirror_seed_derives_its_seller(client, monkeypatch)
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
     resp = await client.post(f"{BASE}/purchases", json=_live_body())
     assert resp.status_code == 202, resp.text
+
+
+# ── Tier B mirror priced from its `::canonical` placeholder (staging demo, 2026-09-29) ───────
+#
+# The live row: KraveBeauty 24 Carrot Retinal, prod::external_seed::external_seed::ext_8026e9…,
+# merchant merch_obs_a6747fa7eb42a31c (derived from KraveBeauty + kravebeauty.com). Skus: the
+# `::canonical` placeholder and ONE real sku resolving to 41596313010251. The ONLY offer for the
+# merchant sits on the placeholder: USD 28.00, in_stock. The seed proves one live variant.
+
+KRAVE_DOMAIN = "kravebeauty.com"
+KRAVE_EXT = "ext_8026e90301d17f1f7745b5c7"
+KRAVE_PK = f"prod::external_seed::external_seed::{KRAVE_EXT}"
+KRAVE_MERCHANT = "merch_obs_a6747fa7eb42a31c"
+KRAVE_SEED = "epsv_krave_24_carrot_retinal"
+KRAVE_VARIANT = "41596313010251"
+KRAVE_PLACEHOLDER = f"{KRAVE_PK}::canonical"
+KRAVE_REAL = f"{KRAVE_PK}::sku_3c1f0e9a7b2d4c6e8f01"
+
+
+async def _seed_krave_mirror(*, offers):
+    """`offers`: [(sku_key, merchant_id, price)] -- USD, in_stock."""
+    await database.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, "
+        "brand, category, product_type, source_domain, source_system, source_ref, seller_ref, "
+        "seed_kind) VALUES (:pk, :m, 'external_seed', :ext, '24 Carrot Retinal', 'KraveBeauty', "
+        "'skincare', 'Serum', :d, 'external_product_seeds_mirror_v1', :seed, NULL, 'self')",
+        {"pk": KRAVE_PK, "m": KRAVE_MERCHANT, "ext": KRAVE_EXT, "d": KRAVE_DOMAIN, "seed": KRAVE_SEED},
+    )
+    for sku_key, vid in ((KRAVE_PLACEHOLDER, KRAVE_PK), (KRAVE_REAL, f"{KRAVE_EXT}:{KRAVE_VARIANT}")):
+        await database.execute(
+            "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, "
+            "source_variant_id, title, currency) VALUES (:sk, :pk, :m, 'external_seed', :ext, :vid, "
+            "'24 Carrot Retinal', 'USD')",
+            {"sk": sku_key, "pk": KRAVE_PK, "m": KRAVE_MERCHANT, "ext": KRAVE_EXT, "vid": vid},
+        )
+    for i, (sku_key, merchant_id, price) in enumerate(offers):
+        await database.execute(
+            "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, "
+            "merchant_effective_price, availability) VALUES (:oid, :sk, :pk, :m, 'USD', :p, 'in_stock')",
+            {"oid": f"off_krave_{i}", "sk": sku_key, "pk": KRAVE_PK, "m": merchant_id, "p": price},
+        )
+    seed = {"snapshot": {
+        "brand": "KraveBeauty", "title": "24 Carrot Retinal",
+        "storefront_platform": "shopify", "storefront_platform_source": "products_js_v1",
+        "variants": [{"title": "Default Title", "price": "28.00", "shopify_variant_id": KRAVE_VARIANT}],
+        "shopify_cart_proof": {
+            "source": "products_js_v1",
+            "product_js_url": f"https://{KRAVE_DOMAIN}/products/24-carrot-retinal.js",
+            "live_variant_count": 1, "variant_id": KRAVE_VARIANT,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }}
+    await database.execute(
+        "INSERT INTO external_product_seeds (id, status, domain, market, destination_url, "
+        "canonical_url, attached_product_key, attached_variant_id, seed_data) VALUES "
+        "(:id, 'active', :d, 'US', :dest, NULL, :pk, NULL, :sd)",
+        {"id": KRAVE_SEED, "d": KRAVE_DOMAIN, "dest": f"https://{KRAVE_DOMAIN}/products/24-carrot-retinal",
+         "pk": KRAVE_PK, "sd": json.dumps(seed)},
+    )
+    await database.execute(
+        "INSERT INTO tierb_cart_link_eligibility (shop_domain, market, verdict, checked_at) "
+        "VALUES (:d, 'US', 'ELIGIBLE', CURRENT_TIMESTAMP)", {"d": KRAVE_DOMAIN},
+    )
+
+
+def _krave_body() -> Dict[str, Any]:
+    return _body(item_source="cart_link", merchant_domain=KRAVE_DOMAIN, product_key=KRAVE_PK,
+                 variant_key=None)
+
+
+@pytest.mark.parametrize("offers,expected,price", [
+    # THE LIVE SHAPE: the real sku has no offer, the placeholder has the merchant's only one.
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], 202, 2800),
+    # both offered, agreeing: the real sku's offer is used (same price)
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_REAL, KRAVE_MERCHANT, "28.00")], 202, 2800),
+    # only the real sku offered: unchanged from before
+    ([(KRAVE_REAL, KRAVE_MERCHANT, "28.00")], 202, 2800),
+    # two placeholder offers from this merchant that agree
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], 202, 2800),
+])
+async def test_a_mirror_row_is_priced_from_its_placeholder_offer(client, monkeypatch, offers, expected, price):
+    await _seed_krave_mirror(offers=offers)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_krave_body())
+    assert resp.status_code == expected, resp.text
+    purchase = await _purchase_row(resp.json()["purchase_id"])
+    assert purchase["our_price_minor"] == price and purchase["currency"] == "USD"
+    assert f"https://{KRAVE_DOMAIN}/cart/{KRAVE_VARIANT}:1?" in purchase["cart_url"]
+
+
+@pytest.mark.parametrize("offers,reason", [
+    # real and placeholder disagree
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_REAL, KRAVE_MERCHANT, "26.00")],
+     "row_price_ambiguous"),
+    # two placeholder offers from this merchant that disagree
+    ([(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00"), (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "30.00")],
+     "row_price_ambiguous"),
+    # the only placeholder offer is ANOTHER merchant's
+    ([(KRAVE_PLACEHOLDER, "merch_obs_0000000000000000", "28.00")], "row_unpriced"),
+    # no offer anywhere
+    ([], "row_unpriced"),
+])
+async def test_a_mirror_row_placeholder_price_refusals(client, monkeypatch, offers, reason):
+    await _seed_krave_mirror(offers=offers)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_krave_body())
+    assert resp.status_code == 409 and _error(resp) == reason, resp.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_a_named_real_mirror_sku_with_no_offer_is_not_priced_from_the_placeholder(client, monkeypatch):
+    """The placeholder price is the NO-name path's; a caller who named the real sku buys at THAT
+    sku's price or not at all."""
+    await _seed_krave_mirror(offers=[(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")])
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json={**_krave_body(), "variant_key": KRAVE_REAL})
+    assert resp.status_code == 409 and _error(resp) == "row_unpriced"
+
+
+async def test_a_shopify_row_is_never_priced_from_a_placeholder(client, monkeypatch):
+    """Shopify rows are unchanged: a placeholder offer does not price the chosen real sku."""
+    await _seed_tierb_shopify_item()
+    await _seed_tierb_verdict()
+    placeholder = f"{PRODUCT_KEY}::canonical"
+    await database.execute(
+        "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, "
+        "source_variant_id, title, currency) VALUES (:sk, :pk, 'm_brand', 'shopify', '1001', :pk, "
+        "'Standard', 'USD')", {"sk": placeholder, "pk": PRODUCT_KEY})
+    await database.execute(
+        "UPDATE catalog_offers SET sku_key = :ph WHERE sku_key = :sk", {"ph": placeholder, "sk": SKU_KEY})
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link", variant_key=None))
+    assert resp.status_code == 409 and _error(resp) == "row_unpriced"

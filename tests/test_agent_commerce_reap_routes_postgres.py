@@ -2302,3 +2302,93 @@ async def test_merchant_disabled_under_a_key_writes_no_key_row_on_postgres(clien
     assert _error(resp) == "merchant_disabled"
     assert await database.fetch_val(
         "SELECT COUNT(*) FROM reap_agentic_purchase_keys WHERE idempotency_key = 'pg-k-off'") == 0
+
+
+@pytest.mark.parametrize("real_price,expected,reason", [
+    (None, 202, None),        # the live shape: only the placeholder is offered
+    ("28.00", 202, None),     # both offered, agreeing
+    ("26.00", 409, "row_price_ambiguous"),
+])
+async def test_tierb_a_mirror_row_priced_from_its_placeholder_on_postgres(
+    client, monkeypatch, real_price, expected, reason
+):
+    """The KraveBeauty staging row, on the production dialect: `::canonical` placeholder carrying the
+    merchant's only offer (USD 28.00), one real sku naming the proven sole variant."""
+    from db.sql_migrations import split_statements
+
+    ext = "ext_8026e90301d17f1f7745b5c7"
+    pk = f"prod::external_seed::external_seed::{ext}"
+    seed_id = "epsv_krave_pg"
+    domain = "kravebeauty.com"
+    merchant = "merch_obs_a6747fa7eb42a31c"
+    variant = "41596313010251"
+    placeholder, real = f"{pk}::canonical", f"{pk}::sku_3c1f0e9a7b2d4c6e8f01"
+    await database.execute("DROP TABLE IF EXISTS external_product_seeds")
+    for statement in split_statements(
+        (_MIGRATIONS_DIR / "044_external_product_seeds.sql").read_text(encoding="utf-8")
+    ):
+        await database.execute(statement)
+    try:
+        await database.execute(
+            "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, "
+            "title, brand, category, product_type, source_domain, source_system, source_ref, "
+            "seller_ref, seed_kind) VALUES (:pk, :m, 'external_seed', :ext, '24 Carrot Retinal', "
+            "'KraveBeauty', 'skincare', 'Serum', :d, 'external_product_seeds_mirror_v1', :seed, NULL, 'self')",
+            {"pk": pk, "m": merchant, "ext": ext, "d": domain, "seed": seed_id},
+        )
+        for sku_key, vid in ((placeholder, pk), (real, f"{ext}:{variant}")):
+            await database.execute(
+                "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, "
+                "source_product_id, source_variant_id, title, currency) VALUES "
+                "(:sk, :pk, :m, 'external_seed', :ext, :vid, '24 Carrot Retinal', 'USD')",
+                {"sk": sku_key, "pk": pk, "m": merchant, "ext": ext, "vid": vid},
+            )
+        offers = [(placeholder, "28.00")] + ([(real, real_price)] if real_price else [])
+        for i, (sku_key, price) in enumerate(offers):
+            await database.execute(
+                "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, "
+                "merchant_effective_price, availability) VALUES (:oid, :sk, :pk, :m, 'USD', "
+                "CAST(:p AS NUMERIC), 'in_stock')",
+                {"oid": f"off_krave_pg_{i}", "sk": sku_key, "pk": pk, "m": merchant, "p": price},
+            )
+        seed_data = json.dumps({"snapshot": {
+            "brand": "KraveBeauty", "storefront_platform": "shopify",
+            "variants": [{"title": "Default Title", "shopify_variant_id": variant}],
+            "shopify_cart_proof": {
+                "source": "products_js_v1",
+                "product_js_url": f"https://{domain}/products/24-carrot-retinal.js",
+                "live_variant_count": 1, "variant_id": variant,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }}})
+        await database.execute(
+            "INSERT INTO external_product_seeds (id, market, destination_url, domain, "
+            "attached_product_key, attached_variant_id, seed_data) VALUES "
+            "(:id, 'US', :url, :d, :pk, NULL, CAST(:sd AS JSONB))",
+            {"id": seed_id, "url": f"https://{domain}/products/24-carrot-retinal", "d": domain,
+             "pk": pk, "sd": seed_data},
+        )
+        await database.execute(
+            "INSERT INTO tierb_cart_link_eligibility "
+            "(shop_domain, market, verdict, checked_at, consecutive_same) "
+            "VALUES (:d, 'US', 'ELIGIBLE', now(), 1)", {"d": domain},
+        )
+        monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+        response = await client.post(f"{BASE}/purchases", json=_body(
+            item_source="cart_link", merchant_domain=domain, product_key=pk, variant_key=None))
+        assert response.status_code == expected, response.text
+        if expected == 202:
+            purchase = await database.fetch_one(
+                "SELECT cart_url, our_price_minor FROM reap_agentic_purchases WHERE id = :id",
+                {"id": response.json()["purchase_id"]},
+            )
+            assert purchase["our_price_minor"] == 2800
+            assert f"https://{domain}/cart/{variant}:1?" in purchase["cart_url"]
+        else:
+            assert _error(response) == reason
+    finally:
+        await database.execute("DELETE FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+        await database.execute("DROP TABLE external_product_seeds")
+        for table in ("catalog_offers", "catalog_skus", "catalog_products"):
+            await database.execute(f"DELETE FROM {table} WHERE product_key = :pk", {"pk": pk})
+        await database.execute(
+            "DELETE FROM tierb_cart_link_eligibility WHERE shop_domain = :d", {"d": domain})
