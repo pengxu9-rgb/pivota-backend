@@ -1,38 +1,48 @@
 #!/usr/bin/env python3
 """Restamp the DECLARED market of existing offers on named stores: catalog_offers.market FROM -> TO.
 
-WHY. `catalog_offers.market` is INSERT-only: no offer upsert updates it on conflict (external_offer_dual_write,
-catalog_enrichment_agent/apply, reconcile_catalog_offers ...). Offers written by a lane that never declared a
-market took the column's DEFAULT 'US' -- jsmbeauty.sg and makeupforever.sg: 1,080 SGD offers stamped 'US'
-(census 2026-09-29) -- and a re-crawl under the retailer_ingest SG market cannot move them, so its readback
-fails "stamped market SG: 0" (services/retailer_ingest/pipeline.py). services/catalog_invariant_checks counts
-the same rows as a market/currency disagreement.
+WHY. The catalog upserts write `catalog_offers.market` on INSERT only (catalog_enrichment_agent/apply
+`_offer_upsert_sql_with_market`, external_offer_dual_write), so offers a lane wrote without declaring a market
+keep the column's DEFAULT 'US' -- jsmbeauty.sg and makeupforever.sg: 1,080 SGD offers stamped 'US' (census
+2026-09-29) -- and a re-crawl under the retailer_ingest SG market cannot move them: its readback fails
+"stamped market SG: 0" (services/retailer_ingest/pipeline.py). services/catalog_invariant_checks counts the
+same rows as a market/currency disagreement.
+
+TWO LANES DO REWRITE market on an existing row, and a restamp of their offers would be silently undone, so the
+plan REFUSES them (review of #2450):
+  * catalog_sync (catalog_track 'internal_merchant'): `_upsert_by_pk` rewrites every column on re-sync;
+  * scripts/onboard_external_brand_from_crawl.py (seed tool 'external_brand_crawl'): sets market from the
+    seed, whose partition is 'US'.
 
 WHAT IT CHANGES for a buyer: region pricing gates on CURRENCY, never on market (services/region_pricing.py),
 so serving eligibility does not move. offer_buyability compares the offer's market to the request's: after
 the restamp an SG buyer sees these offers as domestic, a US buyer as cross-border. agent_pdp_view copies
-o.market, so every touched content_key's view is rebuilt after the commit.
+o.market, so every touched content_key's view is rebuilt after the commit. `updated_at` is NOT bumped: a
+restamp is not a new observation, and `ORDER BY o.updated_at` readers (pivot_query_service, the reconciler's
+keeper election) must not reorder over it.
 
 SCOPE -- a restamp, never a relabel of price:
-  * only offers on the named hosts (offer source_domain, else its product's canonical_url; www. folded);
-  * only rows stamped FROM whose currency is ALREADY the TO market's currency (region_pricing's one rule,
-    require_market_currency) -- a USD sibling on the same store (Shopify-Markets capture) is never touched;
+  * only offers on the named hosts (offer source_domain, else its product's canonical_url; scheme, userinfo,
+    port, path, `www.` and a trailing dot folded -- `offer_host` below and HOST_SQL agree); rows whose raw
+    source text names a host but does not normalise to it are REPORTED as near misses, never written;
+  * only rows stamped FROM (any spelling: trimmed, upper-cased) whose currency is ALREADY the TO market's --
+    a USD sibling on the same store (Shopify-Markets capture) is never touched;
   * suppressed rows included: relabelling a row that does not serve changes nothing a buyer sees, and a row
     left on the wrong market would re-enter wrong the day its suppression lifts (the currency backfill's
     lesson, scripts/backfill_offer_market_currency.py);
-  * refused whole when any planned offer's (sku_key, channel) already has a live TO offer: the restamp would
-    make a duplicate shelf (catalog_invariant_checks duplicate_offers_per_sku_channel_market).
+  * refused whole when the target would duplicate a live (sku_key, channel, market) shelf -- against existing
+    offers AND among the planned ones -- checked at plan time and again inside the write's transaction, in
+    both directions (a revert must not collide with a US offer written since).
 
   Dry run (default; writes nothing):
     python -m scripts.restamp_offer_market --host jsmbeauty.sg --host makeupforever.sg --from US --to SG
   Apply (the manifest is STORED in identity_resolution_events before the write; one transaction; any drift
-  since the plan aborts it all):
+  since the plan aborts it all; the run id is printed the moment it commits):
     ... --apply
-  Revert a run (all or nothing), or re-run only its view / eligibility rebuild:
+  Revert a run (all or nothing; refused while a LATER applied run holds any of its offers), or re-run only its
+  view / eligibility rebuild:
     python -m scripts.restamp_offer_market revert --run-id restamp_<hex>
     python -m scripts.restamp_offer_market refresh --run-id restamp_<hex> [--reverse]
-
-A later INSERT by the same lane still takes the DEFAULT 'US': this fixes the rows that exist, not the writer.
 
 Needs DATABASE_URL: run it through scripts/ops/run_oneoff_job.sh.
 """
@@ -42,6 +52,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import uuid
 from collections import Counter
@@ -52,45 +63,72 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.database import database  # noqa: E402
 from services.region_pricing import normalize_region, pricing_currency_for_region  # noqa: E402
 
-# The host an offer belongs to: its own source_domain, else its product's URL. A bare-host source_domain has no
-# scheme, so the scheme is optional; www. folds as everywhere else (apply._LEGACY_LISTING_OWNERS_SQL).
-HOST_SQL = ("lower(split_part(regexp_replace(coalesce(nullif(o.source_domain, ''), cp.canonical_url), "
-            "'^(https?://)?(www[.])?', '', 'i'), '/', 1))")
+REWRITING_TRACKS = ("internal_merchant",)       # catalog_sync_service._upsert_by_pk rewrites every column
+REWRITING_SEED_TOOLS = ("external_brand_crawl",)  # onboard_external_brand_from_crawl sets market from the seed
+
+
+def _host_sql(expr: str) -> str:
+    """`offer_host` in SQL: lower/trim, drop scheme (or a bare //), userinfo, then everything from the first
+    / ? # or : (path, query, fragment, port), then any leading www. and a trailing dot."""
+    s = f"lower(trim(coalesce({expr}, '')))"
+    s = f"regexp_replace({s}, '^([a-z][a-z0-9+.-]*:)?//', '')"
+    s = f"regexp_replace({s}, '^[^/?#@]*@', '')"
+    s = f"regexp_replace({s}, '[/?#:].*$', '')"
+    return f"regexp_replace(regexp_replace({s}, '^(www[.])+', ''), '[.]+$', '')"
+
+
+_SOURCE_TEXT = "coalesce(nullif(trim(o.source_domain), ''), cp.canonical_url)"
+HOST_SQL = _host_sql(_SOURCE_TEXT)
+MARKET_SQL = "upper(trim(coalesce({a}.market, '')))"
+CURRENCY_SQL = "upper(trim(coalesce({a}.currency, '')))"
 
 PLAN_SQL = f"""
-SELECT o.offer_id, o.product_key, o.sku_key, o.channel, o.market, o.currency,
-       (o.suppressed_at IS NULL) AS live, cp.content_key, {HOST_SQL} AS host
+SELECT o.offer_id, o.product_key, o.sku_key, o.channel, o.market, o.currency, o.catalog_track, o.source_system,
+       (o.suppressed_at IS NULL) AS live, cp.content_key, {HOST_SQL} AS host,
+       EXISTS (SELECT 1 FROM external_product_seeds s WHERE s.id = cp.source_ref
+                 AND s.tool = ANY(:rewriting_tools)) AS seed_lane_rewrites
 FROM catalog_offers o LEFT JOIN catalog_products cp ON cp.product_key = o.product_key
 WHERE {HOST_SQL} = ANY(:hosts)
-  AND upper(trim(coalesce(o.market, ''))) = :from_market
-  AND upper(trim(coalesce(o.currency, ''))) = :currency
+  AND {MARKET_SQL.format(a='o')} = :from_market
+  AND {CURRENCY_SQL.format(a='o')} = :currency
 ORDER BY o.offer_id
 """
 
 # Everything else on those hosts, so the report says what was LEFT and why (a USD sibling, another market).
 LEFT_ALONE_SQL = f"""
-SELECT {HOST_SQL} AS host, upper(trim(coalesce(o.market, ''))) AS market,
-       upper(trim(coalesce(o.currency, ''))) AS currency, count(*) AS n
+SELECT {HOST_SQL} AS host, {MARKET_SQL.format(a='o')} AS market, {CURRENCY_SQL.format(a='o')} AS currency,
+       count(*) AS n
 FROM catalog_offers o LEFT JOIN catalog_products cp ON cp.product_key = o.product_key
 WHERE {HOST_SQL} = ANY(:hosts)
-  AND NOT (upper(trim(coalesce(o.market, ''))) = :from_market AND upper(trim(coalesce(o.currency, ''))) = :currency)
+  AND NOT ({MARKET_SQL.format(a='o')} = :from_market AND {CURRENCY_SQL.format(a='o')} = :currency)
 GROUP BY 1, 2, 3 ORDER BY 1, 4 DESC
 """
 
-COLLISIONS_SQL = """
+# Rows whose source text MENTIONS a named host but does not normalise to it (a subdomain, a lookalike, a URL
+# the normaliser cannot read): never written, always shown -- "nothing left alone" must not be blind to them.
+NEAR_MISS_SQL = f"""
+SELECT o.offer_id, {_SOURCE_TEXT} AS source_text, {HOST_SQL} AS host
+FROM catalog_offers o LEFT JOIN catalog_products cp ON cp.product_key = o.product_key
+WHERE {_SOURCE_TEXT} ILIKE ANY(:host_patterns) AND NOT ({HOST_SQL} = ANY(:hosts))
+  AND {CURRENCY_SQL.format(a='o')} = :currency
+ORDER BY o.offer_id LIMIT 50
+"""
+
+# A move of `ids` to `target` duplicates a live shelf when another live offer already sits on its
+# (sku_key, channel) in `target`, or when two live offers of the move share one.
+COLLISIONS_SQL = f"""
 SELECT o.offer_id, s.offer_id AS existing_offer_id, o.sku_key, o.channel
 FROM catalog_offers o
 JOIN catalog_offers s ON s.sku_key = o.sku_key AND s.channel = o.channel AND s.offer_id <> o.offer_id
 WHERE o.offer_id = ANY(:ids) AND s.suppressed_at IS NULL
-  AND upper(trim(coalesce(s.market, ''))) = :to_market
-ORDER BY o.offer_id
+  AND ({MARKET_SQL.format(a='s')} = :target OR (s.offer_id = ANY(:ids) AND o.suppressed_at IS NULL))
+ORDER BY o.offer_id, s.offer_id
 """
 
-# Drift-guarded on the value read at plan time: an offer whose market or currency moved since is not written,
-# and the count check below then aborts the whole transaction.
-RESTAMP_SQL = """
-UPDATE catalog_offers SET market = :to_market, updated_at = NOW()
-WHERE offer_id = ANY(:ids) AND market = :prior_market AND upper(trim(coalesce(currency, ''))) = :currency
+# Drift-guarded on the exact value read at plan time; the count check in `_write` aborts the transaction.
+RESTAMP_SQL = f"""
+UPDATE catalog_offers SET market = :to_market
+WHERE offer_id = ANY(:ids) AND market = :prior_market AND {CURRENCY_SQL.format(a='catalog_offers')} = :currency
 RETURNING offer_id
 """
 
@@ -102,21 +140,37 @@ VALUES (NULL, :action, :run_id, CAST(:detail AS jsonb))
 RETURNING id
 """
 RUN_STATE_SQL = """
-SELECT action FROM identity_resolution_events WHERE run_id = :run_id AND action = ANY(:actions)
+SELECT action, id FROM identity_resolution_events WHERE run_id = :run_id AND action = ANY(:actions)
 """
 LOAD_MANIFEST_SQL = """
 SELECT detail FROM identity_resolution_events WHERE action = :action AND run_id = :run_id
 ORDER BY id DESC LIMIT 1
 """
+# Runs applied after `after_id` and not reverted: a revert of an older run must not move their offers.
+LATER_LIVE_RUNS_SQL = """
+SELECT a.run_id FROM identity_resolution_events a
+WHERE a.action = :applied AND a.id > :after_id
+  AND NOT EXISTS (SELECT 1 FROM identity_resolution_events r WHERE r.run_id = a.run_id AND r.action = :reverted)
+"""
 
 # A job log cuts a line at ~100 KB: the report carries counts and a bounded sample.
 SAMPLE = 20
 
+_SCHEME = re.compile(r"^([a-z][a-z0-9+.-]*:)?//")
 
-def normalize_host(host: str) -> str:
-    h = str(host or "").strip().lower()
-    h = h.split("://", 1)[-1].split("/", 1)[0]
-    return h[4:] if h.startswith("www.") else h
+
+def offer_host(text: Any) -> str:
+    """HOST_SQL, in Python (the two are pinned equal by the tests)."""
+    s = _SCHEME.sub("", str(text or "").strip().lower())
+    s = re.sub(r"^[^/?#@]*@", "", s)
+    s = re.sub(r"[/?#:].*$", "", s)
+    return re.sub(r"[.]+$", "", re.sub(r"^(www[.])+", "", s))
+
+
+async def collisions(db: Any, ids: List[str], target: str) -> List[Dict[str, Any]]:
+    if not ids:
+        return []
+    return [dict(r) for r in await db.fetch_all(COLLISIONS_SQL, {"ids": ids, "target": target.strip().upper()})]
 
 
 async def plan(db: Any, hosts: List[str], from_market: str, to_market: str) -> Dict[str, Any]:
@@ -124,18 +178,23 @@ async def plan(db: Any, hosts: List[str], from_market: str, to_market: str) -> D
     if from_m == to_m:
         raise ValueError(f"from and to are both {to_m}")
     currency = pricing_currency_for_region(to_m)  # raises for a market with no pricing currency
-    hosts = sorted({normalize_host(h) for h in hosts if normalize_host(h)})
+    hosts = sorted({offer_host(h) for h in hosts if offer_host(h)})
     if not hosts:
         raise ValueError("at least one --host is required")
     values = {"hosts": hosts, "from_market": from_m, "currency": currency}
-    rows = [dict(r) for r in await db.fetch_all(PLAN_SQL, values)]
+    rows = [dict(r) for r in await db.fetch_all(PLAN_SQL, {**values, "rewriting_tools": list(REWRITING_SEED_TOOLS)})]
     left = [dict(r) for r in await db.fetch_all(LEFT_ALONE_SQL, values)]
-    ids = [r["offer_id"] for r in rows]
-    collisions = [dict(r) for r in await db.fetch_all(COLLISIONS_SQL, {"ids": ids, "to_market": to_m})] if ids else []
+    near = [dict(r) for r in await db.fetch_all(NEAR_MISS_SQL, {
+        "hosts": hosts, "currency": currency, "host_patterns": [f"%{h}%" for h in hosts]})]
+    rewriting = [r["offer_id"] for r in rows
+                 if (r["catalog_track"] or "") in REWRITING_TRACKS or r["seed_lane_rewrites"]]
     return {"hosts": hosts, "from_market": from_m, "to_market": to_m, "currency": currency,
             "offers": [{"offer_id": r["offer_id"], "prior_market": r["market"], "content_key": r["content_key"],
                         "host": r["host"], "live": bool(r["live"])} for r in rows],
-            "left_alone": left, "collisions": collisions}
+            "lanes": dict(Counter(f"{r['source_system']}|{r['catalog_track']}" for r in rows)),
+            "rewriting_lane_offers": rewriting,
+            "left_alone": left, "near_misses": near,
+            "collisions": await collisions(db, [r["offer_id"] for r in rows], to_m)}
 
 
 def summary(p: Mapping[str, Any]) -> Dict[str, Any]:
@@ -145,10 +204,13 @@ def summary(p: Mapping[str, Any]) -> Dict[str, Any]:
         "hosts": p["hosts"], "from": p["from_market"], "to": p["to_market"], "currency": p["currency"],
         "offers": len(offers),
         "by_host": {f"{h} {state}": n for (h, state), n in sorted(by.items())},
+        "lanes": p["lanes"],
+        "rewriting_lane_offers": len(p["rewriting_lane_offers"]),
         "content_keys": len({o["content_key"] for o in offers if o["content_key"]}),
         "offers_without_content_key": sum(1 for o in offers if not o["content_key"]),
         "prior_market_spellings": dict(Counter(o["prior_market"] for o in offers)),
         "left_alone": p["left_alone"],
+        "near_misses": len(p["near_misses"]), "near_miss_sample": p["near_misses"][:SAMPLE],
         "collisions": len(p["collisions"]), "collision_sample": p["collisions"][:SAMPLE],
         "sample": [o["offer_id"] for o in offers[:SAMPLE]],
     }
@@ -172,16 +234,18 @@ async def load_manifest(db: Any, run_id: str) -> Dict[str, Any]:
 
 
 async def _write(db: Any, m: Mapping[str, Any], *, reverse: bool) -> int:
-    """All or nothing, inside the caller's transaction: every offer moves from its read value, or none does."""
-    to_m = m["from_market"] if reverse else m["to_market"]
-    groups: Dict[str, List[str]] = {}
+    """All or nothing, inside the caller's transaction: every offer moves from its read value to its target, or
+    none does. Forward: prior spelling -> TO. Reverse: TO -> that offer's own prior spelling."""
+    groups: Dict[tuple, List[str]] = {}
     for o in m["offers"]:
-        prior = m["to_market"] if reverse else o["prior_market"]
-        target = o["prior_market"] if reverse else to_m
-        groups.setdefault(f"{prior}\x00{target}", []).append(o["offer_id"])
+        pair = (m["to_market"], o["prior_market"]) if reverse else (o["prior_market"], m["to_market"])
+        groups.setdefault(pair, []).append(o["offer_id"])
     moved = 0
-    for key, ids in groups.items():
-        prior, target = key.split("\x00")
+    for (prior, target), ids in groups.items():
+        clash = await collisions(db, ids, target)  # again, inside the transaction: offers written since the plan
+        if clash:
+            raise SystemExit(f"refused: {len(clash)} offer(s) would duplicate a live {target.strip().upper()} "
+                             f"shelf on the same (sku_key, channel), e.g. {clash[0]}; nothing written")
         got = await db.fetch_all(RESTAMP_SQL, {"ids": ids, "to_market": target, "prior_market": prior,
                                                "currency": m["currency"]})
         if len(got) != len(ids):
@@ -211,9 +275,12 @@ async def refresh_after(db: Any, m: Mapping[str, Any], *, source: str) -> Dict[s
 
 
 async def apply(db: Any, p: Mapping[str, Any]) -> Dict[str, Any]:
+    if p["rewriting_lane_offers"]:
+        raise SystemExit(f"refused: {len(p['rewriting_lane_offers'])} offer(s) belong to a lane that rewrites "
+                         f"market on re-sync (e.g. {p['rewriting_lane_offers'][0]}); nothing written")
     if p["collisions"]:
         raise SystemExit(f"refused: {len(p['collisions'])} offer(s) would duplicate a live {p['to_market']} "
-                         f"offer on the same (sku_key, channel); nothing written")
+                         f"shelf on the same (sku_key, channel); nothing written")
     if not p["offers"]:
         raise SystemExit("nothing to restamp")
     run_id = f"restamp_{uuid.uuid4().hex[:12]}"
@@ -222,20 +289,31 @@ async def apply(db: Any, p: Mapping[str, Any]) -> Dict[str, Any]:
     async with db.transaction():
         moved = await _write(db, m, reverse=False)
         await _record(db, APPLIED_ACTION, run_id, {"moved": moved})
+    # Before the rebuild: a job killed during 245 view rebuilds must still leave the committed run id in its log.
+    print(f"COMMITTED {run_id}: {moved} offer(s) restamped {m['from_market']} -> {m['to_market']}", flush=True)
     return {"run_id": run_id, "moved": moved, "refresh": await refresh_after(db, m, source=run_id)}
 
 
 async def revert(db: Any, run_id: str) -> Dict[str, Any]:
     m = await load_manifest(db, run_id)
-    state = {r["action"] for r in await db.fetch_all(RUN_STATE_SQL, {"run_id": run_id,
-                                                                    "actions": [APPLIED_ACTION, REVERTED_ACTION]})}
+    state = {r["action"]: r["id"] for r in await db.fetch_all(
+        RUN_STATE_SQL, {"run_id": run_id, "actions": [APPLIED_ACTION, REVERTED_ACTION]})}
     if APPLIED_ACTION not in state:
         raise SystemExit(f"{run_id} never committed: nothing to revert")
     if REVERTED_ACTION in state:
         raise SystemExit(f"{run_id} is already reverted")
+    mine = {o["offer_id"] for o in m["offers"]}
+    for r in await db.fetch_all(LATER_LIVE_RUNS_SQL, {"applied": APPLIED_ACTION, "reverted": REVERTED_ACTION,
+                                                      "after_id": state[APPLIED_ACTION]}):
+        later = await load_manifest(db, r["run_id"])
+        shared = mine & {o["offer_id"] for o in later["offers"]}
+        if shared:
+            raise SystemExit(f"refused: later run {r['run_id']} restamped {len(shared)} of these offers; revert "
+                             f"it first")
     async with db.transaction():
         moved = await _write(db, m, reverse=True)
         await _record(db, REVERTED_ACTION, run_id, {"moved": moved})
+    print(f"REVERTED {run_id}: {moved} offer(s)", flush=True)
     return {"run_id": run_id, "reverted": moved, "refresh": await refresh_after(db, m, source=f"{run_id}:revert")}
 
 
@@ -243,7 +321,7 @@ async def run(args: argparse.Namespace) -> int:
     await database.connect()
     try:
         if args.command == "revert":
-            print("REVERTED " + json.dumps(await revert(database, args.run_id), default=str), flush=True)
+            print("REVERT_DONE " + json.dumps(await revert(database, args.run_id), default=str), flush=True)
         elif args.command == "refresh":
             m = await load_manifest(database, args.run_id)
             src = f"{args.run_id}:revert" if args.reverse else args.run_id

@@ -385,8 +385,9 @@ def _offer_upsert_sql_with_market(sql: str) -> str:
     Derived from the one statement rather than spelled twice, so the two can never drift, and
     refused unless it changed exactly the two places it must. `market` is written on INSERT only,
     like `currency`: ON CONFLICT refreshes neither, so a re-ingest never restamps an existing row's
-    market (the SG rows' deliberate 'US' stays put, and a legacy row this plan collides with keeps
-    its stamp -- the retailer_ingest readback then reports the disagreement instead of hiding it).
+    market (a legacy row this plan collides with keeps its stamp -- the retailer_ingest readback then
+    reports the disagreement instead of hiding it; scripts/restamp_offer_market.py is the reviewed way to
+    move an existing row's market, e.g. the SG stores' default-'US' offers).
     Rows that declare no market keep using `_OFFER_UPSERT_SQL` itself, byte for byte."""
     cols_old = "offer_type, is_first_party,\n"
     vals_old = ":offer_type, :is_first_party,\n"
