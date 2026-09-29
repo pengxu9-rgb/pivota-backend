@@ -189,8 +189,15 @@ async def _do_ingest(args: argparse.Namespace) -> int:
     # Apply mode — execute the plan via the shared FK-order executor
     # (services.catalog_enrichment_agent.apply) so the CLI + the programmatic
     # runner share one upsert code path (no SQL drift).
-    from services.catalog_enrichment_agent.apply import apply_ingest_plan  # noqa: E402
+    from db.database import database  # noqa: E402
+    from services.catalog_enrichment_agent.apply import apply_ingest_plan, plan_with_current_listings  # noqa: E402
 
+    if not getattr(database, "is_connected", False):
+        await database.connect()
+    # Never move a row off the listing it names (ingestion.ingest_validated_jsonl `listing_moves`).
+    plan = await plan_with_current_listings(rows, db=database, source_jsonl=str(in_path))
+    if plan.get("listing_moves"):
+        logger.warning("held (row names a listing this input does not carry): %s", plan["listing_moves"])
     await apply_ingest_plan(
         plan,
         batch_label=f"run_catalog_enrichment:{args.category}:{in_path}",

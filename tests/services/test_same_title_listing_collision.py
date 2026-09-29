@@ -327,23 +327,51 @@ def test_a_handle_ending_in_us_is_a_region_copy_only_beside_its_stem():
     assert elect([ev("set-eu", 9), ev("set", 1)], market="DE")["handle"] == "set-eu"
 
 
-def test_a_tie_keeps_the_listing_the_row_names_today():
-    """After scripts/repair_same_title_listings.py aligned a row, a re-crawl must not move it on a tie
-    (two ad clones of one product): the row's current listing beats the older clone."""
+def test_a_row_keeps_the_listing_it_names_even_out_of_stock():
+    """Review of #2463 at 533184dcd (P1): with stock ranked above the row's own listing, ONE out-of-stock crawl
+    elected another page, re-pointed the row and re-activated that page's seed, while the old offer stayed live
+    and the new one stayed suppressed. The row's listing now keeps the key whenever the crawl carries it."""
     title, kw = "[Amazon #1] Biodance PDRN Capsule Cream", dict(domain="biodance.com", vendor="Biodance",
                                                                  image="https://cdn.example/pcc.jpg")
     a = official(title, "", "0707_pcc_a_albina1", "21.99", 46_000_000_000_001, **kw)
     b = official(title, "", "0707_pcc_a_glownastzy1", "21.99", 46_000_000_000_009, **kw)
     key = ingest_validated_jsonl([a])["pdps"][0]["product_key"]
-    assert _offer_handles(ingest_validated_jsonl([a, b])) == {"0707_pcc_a_albina1"}  # oldest
+    assert _offer_handles(ingest_validated_jsonl([a, b])) == {"0707_pcc_a_albina1"}  # a first ingest: oldest
     current = {key: ("biodance.com", "0707_pcc_a_glownastzy1")}
     assert _offer_handles(ingest_validated_jsonl([a, b], current_listings=current)) == {"0707_pcc_a_glownastzy1"}
-    # ...on its own host only
+    sold_out = official(title, "", "0707_pcc_a_glownastzy1", "21.99", 46_000_000_000_009, available=False, **kw)
+    plan = ingest_validated_jsonl([a, sold_out], current_listings=current)
+    assert _offer_handles(plan) == {"0707_pcc_a_glownastzy1"} and plan["listing_moves"] == []
+    # ...and a region/base rule never moves it either
+    base = official(title, "", "0707_pcc_a", "21.99", 46_000_000_000_010, **kw)
+    assert _offer_handles(ingest_validated_jsonl([base, b], current_listings=current)) == {"0707_pcc_a_glownastzy1"}
+    # ...on its own host only: another host's listing is not this row's listing here
     elsewhere = {key: ("us.biodance.com", "0707_pcc_a_glownastzy1")}
     assert _offer_handles(ingest_validated_jsonl([a, b], current_listings=elsewhere)) == {"0707_pcc_a_albina1"}
-    # ...and never over a stronger rule: a sold-out current listing loses to an available one
-    sold_out = official(title, "", "0707_pcc_a_glownastzy1", "21.99", 46_000_000_000_009, available=False, **kw)
-    assert _offer_handles(ingest_validated_jsonl([a, sold_out], current_listings=current)) == {"0707_pcc_a_albina1"}
+
+
+def test_a_row_whose_listing_the_crawl_does_not_carry_is_held_not_moved():
+    """The row names a page this crawl lacks (unpublished, renamed, or a page the crawl dropped): every record of
+    that row on that host is left out and named in listing_moves -- even when only ONE other page is crawled, so
+    there is no collision at all -- until the move is accepted."""
+    key = ingest_validated_jsonl([official(*REFILL)])["pdps"][0]["product_key"]
+    current = {key: ("cocodor.com", CANDLE[2])}
+    for rows in ([official(*REFILL)], [official(*REFILL), official(*DIFFUSER)]):
+        plan = ingest_validated_jsonl(rows, current_listings=current)
+        assert plan["pdps"] == [] and plan["offers"] == [] and plan["seeds"] == [] and plan["listing_collisions"] == []
+        [move] = plan["listing_moves"]
+        assert (move["product_key"], move["host"], move["current"], move["would_keep"]) == (
+            key, "cocodor.com", CANDLE[2], REFILL[2])
+        assert plan["skipped"] == 0
+    moved = ingest_validated_jsonl([official(*REFILL), official(*DIFFUSER)], current_listings=current,
+                                   allow_moves=[key])
+    assert _offer_handles(moved) == {REFILL[2]} and moved["listing_moves"] == []
+
+
+def test_a_percent_encoded_handle_is_the_same_listing():
+    assert content_listing("https://tower28beauty.com/products/makewaves%C2%AE-mascara") == \
+        content_listing("https://tower28beauty.com/products/MakeWaves®-Mascara") == ("tower28beauty.com",
+                                                                                     "makewaves®-mascara")
 
 
 def test_price_evidence_is_the_variants_and_the_offers_only_without_them():
@@ -381,6 +409,7 @@ async def test_the_drain_keeps_the_listing_the_row_names_on_a_tie(env, monkeypat
     assert (await pipeline.run_stage(job(**opts), db=env.db))["status"] == "apply_due"
     run = list(env.ledger.runs.values())[-1]
     assert run["checks"]["current_listings"] == {"status": "read", "rows": 1}
+    assert run["checks"]["listing_moves"] == 0
     assert [f["key"] for f in run["flags"] if f["rule"] == "same_key_other_listing"] == [
         "same_key_other_listing:velvet-lip-tint-dark"]
     assert all(q.lstrip().upper().startswith("SELECT") for q in catalog.queries)
@@ -421,3 +450,112 @@ def test_the_onboard_queue_keeps_the_listing_the_row_names_on_a_tie(monkeypatch)
     catalog = _Catalog({key: "https://biodance.com/products/0707_pcc_a_glownastzy1"})
     out = asyncio.run(w._process_curated_brand(payload, apply=False, db=catalog))
     assert [c["kept"]["handle"] for c in out["listing_collisions"]] == ["0707_pcc_a_glownastzy1"]
+
+
+async def test_the_drain_holds_a_move_and_bulk_accept_does_not_release_it(env, monkeypatch):  # noqa: F811
+    _drain(env, monkeypatch, [DARK, LIGHT])
+    key = ingest_validated_jsonl([official(*DARK, domain="k-touch.us", vendor="3CE")])["pdps"][0]["product_key"]
+    catalog = _Catalog({key: "https://k-touch.us/products/velvet-lip-tint-unpublished"})
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (catalog, None))
+    opts = dict(source_role="brand_official", accepted_flags=[DOMAIN_OK], accept_listing_collisions=True)
+    assert (await pipeline.run_stage(job(**opts), db=env.db))["status"] == "held"
+    run = list(env.ledger.runs.values())[-1]
+    [flag] = [f for f in run["flags"] if f["rule"] == "listing_moved"]
+    assert flag["key"] == f"listing_moved:{key}" and flag["severity"] == detectors.BLOCK
+    assert "velvet-lip-tint-unpublished" in flag["detail"] and run["checks"]["listing_moves"] == 1
+    # accepting the move is what lets the row move -- to the elected listing
+    opts["accepted_flags"] = [DOMAIN_OK, flag["key"]]
+    assert (await pipeline.run_stage(job(**opts), db=env.db))["status"] == "apply_due"
+    out = await pipeline.run_stage(job("apply_due", **opts), db=env.db)
+    assert out["status"] == "done" and len(_offer_handles(env.applied[-1])) == 1
+
+
+async def test_the_drain_holds_when_it_cannot_read_the_rows_listings(env, monkeypatch):  # noqa: F811
+    _drain(env, monkeypatch, [DARK])
+    for db_answer in ((None, "no_postgres_database_url"), ("boom", None)):
+        monkeypatch.setattr(cli, "_preflight_database", lambda answer=db_answer: answer)
+        opts = dict(source_role="brand_official", accepted_flags=[DOMAIN_OK, "current_listings_unread"])
+        assert (await pipeline.run_stage(job(**opts), db=env.db))["status"] == "held"  # never acceptable
+        run = list(env.ledger.runs.values())[-1]
+        assert [f["key"] for f in run["flags"] if f["severity"] == "block" and f["key"] != DOMAIN_OK] == [
+            "current_listings_unread"]
+
+
+def test_the_cli_prints_a_held_move(monkeypatch, capsys):
+    from unittest.mock import AsyncMock
+
+    async def fetch(**_):
+        return feed.ShopifyProductBatch([official(*DARK, domain="k-touch.us", vendor="3CE")], scanned_products=1,
+                                        pages=1)
+    stub = AsyncMock(side_effect=fetch)
+    stub.last_vendor_filter_report = stub.last_brand_census = stub.last_fold_report = None
+    monkeypatch.setattr(cli, "records_for_brand", stub)
+    key = ingest_validated_jsonl([official(*DARK, domain="k-touch.us", vendor="3CE")])["pdps"][0]["product_key"]
+    monkeypatch.setattr(cli, "_preflight_database",
+                        lambda: (_Catalog({key: "https://k-touch.us/products/velvet-lip-tint-old"}), None))
+    argv = ["--domain", "k-touch.us", "--category", "beauty", "--brand", "3CE", "--only-vendor", "3CE",
+            "--source-role", "brand_official", "--emit-real-variants", "--plan-print-limit", "0",
+            "--only-category", "beauty/makeup/lip"]
+    assert cli.main(argv) == 0  # a dry run reads nothing unless asked
+    assert not [line for line in capsys.readouterr().out.splitlines() if line.startswith(cli.LISTING_MOVE_PREFIX)]
+    argv.append("--check-current-listings")
+    assert cli.main(argv) == 0
+    out = capsys.readouterr().out
+    assert [line for line in out.splitlines() if line.startswith(cli.LISTING_MOVE_PREFIX)][0].count(key) == 1
+    assert cli.main(argv + ["--allow-listing-move", key]) == 0
+    assert not [line for line in capsys.readouterr().out.splitlines() if line.startswith(cli.LISTING_MOVE_PREFIX)]
+
+
+def test_the_unattended_onboard_queue_never_moves_a_row(monkeypatch):
+    import asyncio
+
+    from services import catalog_onboard_worker as w
+    from services.curated_brand_feed import CuratedRecordBatch
+
+    records = [official(*REFILL)]
+
+    async def fetch(**_):
+        return CuratedRecordBatch(records, crawl_report={"status": "complete", "pages": 1, "scanned_products": 1,
+                                                         "selected_products": 1, "emitted_records": 1})
+    monkeypatch.setattr(w, "records_for_brand", fetch)
+    key = ingest_validated_jsonl(records)["pdps"][0]["product_key"]
+    payload = {"domain": "cocodor.com", "brand": "COCODOR", "source_role": "brand_official",
+               "only_vendors": ["COCODOR"], "require_currency": "USD", "category_path": "beauty"}
+    out = asyncio.run(w._process_curated_brand(payload, apply=False, db=_Catalog({key: cocodor_url(CANDLE[2])})))
+    assert out["plan_pdps"] == 0 and [m["current"] for m in out["listing_moves"]] == [CANDLE[2]]
+
+
+def cocodor_url(handle):
+    return f"https://cocodor.com/products/{handle}"
+
+
+def test_retailer_rows_are_never_read_for_a_current_listing():
+    """`ext:retailer:` rows are keyed by their URL: their listing cannot move, so a plan of them reads nothing."""
+    import asyncio
+
+    from services.catalog_enrichment_agent.apply import plan_with_current_listings
+    catalog = _Catalog({})
+    rows = [official("Black Cherry", "refill", h, "6.99", domain="k-touch.us", role="retailer") for h in ("a", "b")]
+    plan = asyncio.run(plan_with_current_listings(rows, db=catalog))
+    assert plan["current_listings"] == {"status": "not_applicable"} and catalog.queries == []
+    mixed = asyncio.run(plan_with_current_listings(rows + [official(*REFILL)], db=catalog))
+    assert mixed["current_listings"]["status"] == "read" and len(catalog.queries) == 1
+
+
+def test_a_cli_apply_that_cannot_read_the_rows_listings_writes_nothing(monkeypatch, capsys):
+    from unittest.mock import AsyncMock
+
+    async def fetch(**_):
+        return feed.ShopifyProductBatch([official(*DARK, domain="k-touch.us", vendor="3CE")], scanned_products=1,
+                                        pages=1)
+    stub = AsyncMock(side_effect=fetch)
+    stub.last_vendor_filter_report = stub.last_brand_census = stub.last_fold_report = None
+    monkeypatch.setattr(cli, "records_for_brand", stub)
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (None, "no_postgres_database_url"))
+    applied = AsyncMock()
+    monkeypatch.setattr(cli, "apply_ingest_plan", applied)
+    argv = ["--domain", "k-touch.us", "--category", "beauty", "--brand", "3CE", "--only-vendor", "3CE",
+            "--source-role", "brand_official", "--emit-real-variants", "--plan-print-limit", "0",
+            "--only-category", "beauty/makeup/lip", "--apply"]
+    assert cli.main(argv) == 2
+    assert "current_listings_unread" in capsys.readouterr().err and applied.await_count == 0

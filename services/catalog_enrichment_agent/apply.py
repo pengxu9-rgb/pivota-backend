@@ -2540,3 +2540,31 @@ async def current_listings(product_keys: List[str], *, db: Any) -> Dict[str, Any
         if listing:
             out[str(row["product_key"])] = listing
     return out
+
+
+def content_keys_of(plan: Dict[str, Any]) -> List[str]:
+    """Every content-keyed row a plan writes (a row a listing was left out of keeps another; `ext:retailer:`
+    rows are keyed by their URL and never move)."""
+    keys = {str(p.get("product_key") or "") for p in plan.get("pdps") or []}
+    return sorted(k for k in keys if k and not k.startswith("ext:retailer:"))
+
+
+async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, market: Optional[str] = None,
+                                     source_jsonl: Optional[str] = None,
+                                     allow_moves: Any = (), planner: Any = None) -> Dict[str, Any]:
+    """ingestion.ingest_validated_jsonl with the listing each of its rows names today, so the plan never
+    moves a row off it (`listing_moves`) -- the one way every lane that holds a catalog handle plans.
+    `current_listings.status` says what was read. `planner` is the caller's own ingest_validated_jsonl
+    (the name its tests patch)."""
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
+
+    planner = planner or ingest_validated_jsonl
+    records = list(records)
+    given = {k: v for k, v in (("market", market), ("source_jsonl", source_jsonl)) if v is not None}
+    first = planner(records, **given)
+    keys = content_keys_of(first)
+    if not keys:
+        return {**first, "current_listings": {"status": "not_applicable"}}
+    current = await current_listings(keys, db=db)
+    replanned = planner(records, **given, current_listings=current, allow_moves=allow_moves)
+    return {**replanned, "current_listings": {"status": "read", "rows": len(current)}}

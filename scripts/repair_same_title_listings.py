@@ -8,13 +8,16 @@ than its live offer's (the upsert re-points canonical_url/image_url, while scrip
 whichever offer on the shared `::canonical` SKU was touched last); 47 sell two or more pages at once; 114 keep active
 seeds on several pages, which the seed refresh re-touches.
 
-WHAT IT DOES, per live row and host with more than one listing. The keeper is ingestion.elect_listing_keeper -- the
+WHAT IT DOES, per live row and host with more than one listing, for ONE market (--market, default US: the keeper is
+elected for that market's buyer; other markets' offers and seeds are counted in `other_market_left`, never written). The keeper is ingestion.elect_listing_keeper -- the
 SAME function the ingest uses, fed from the catalog (see `evidence`), with the row's current listing as the
 tie-break -- so the next ingest keeps the page this repair keeps instead of bringing a second one back:
   * suppress every LIVE offer of the other listings (reason `same_key_other_listing`, the run and keeper in
     suppression_metadata);
   * restore the keeper's offers the reconciler suppressed as `duplicate_offer` -- only where no other live offer
-    would sit on the same (sku_key, channel, market) shelf, and only the newest one per shelf;
+    would sit on the same (sku_key, channel, market) shelf, and only the one whose PRICE was read most recently
+    (price_checked_at; the dry run counts restored offers by that date -- "never" is a price of unknown age, which
+    stays what it was until the seed refresh re-reads the keeper's page: apply just before a refresh run);
   * deactivate every ACTIVE seed of the other listings (status 'inactive'), so the seed refresh stops re-touching
     their offers;
   * re-point the row's canonical_url / image_url to the keeper's page when they name another listing of that host
@@ -30,7 +33,8 @@ over a repair); every touched content_key's served view and eligibility are rebu
 
   Dry run (default; writes nothing):
     python -m scripts.repair_same_title_listings [--host cocodor.com ...] [--product-key ext:... ...] [--market US]
-  Apply (Peng's go; BEFORE the drain is re-imaged onto #2463):
+  Apply (Peng's go; AFTER the drain is re-imaged onto #2463 -- the old drain image re-points rows and re-activates
+  the left-out pages' seeds on its next run of a store, undoing this; the new one never moves a row off its listing):
     ... --apply
   Revert a run (all or nothing; refused while a LATER applied run holds any of its rows), or re-run its rebuild:
     python -m scripts.repair_same_title_listings revert --run-id samelisting_<hex>
@@ -68,7 +72,7 @@ WHERE source_system = :source_system AND suppressed_at IS NULL
 ORDER BY product_key
 """
 OFFERS_SQL = """
-SELECT o.offer_id, o.product_key, o.sku_key, o.channel, o.market, o.availability, o.updated_at,
+SELECT o.offer_id, o.product_key, o.sku_key, o.channel, o.market, o.availability, o.updated_at, o.price_checked_at,
        o.suppressed_at, o.suppression_reason, o.suppression_metadata, o.source_ref,
        o.offer_payload->>'destination_url' AS destination_url, o.offer_payload->>'canonical_url' AS canonical_url,
        o.offer_payload->>'image_url' AS image_url, s.source_variant_id
@@ -78,7 +82,7 @@ ORDER BY o.offer_id
 """
 SEEDS_SQL = """
 SELECT id, attached_product_key AS product_key, canonical_url, destination_url, image_url, status, availability,
-       destination_verdict
+       destination_verdict, market, updated_at
 FROM external_product_seeds WHERE attached_product_key = ANY(:keys)
 ORDER BY id
 """
@@ -106,6 +110,13 @@ WHERE o.offer_id = ANY(:ids) AND s.suppressed_at IS NULL
 SEED_STATUS_SQL = """
 UPDATE external_product_seeds SET status = :status, updated_at = NOW()
 WHERE id = ANY(:ids) AND status = :prior
+RETURNING id
+"""
+# Revert: one seed back to its status AND its updated_at as read at plan time (refresh lanes order on it).
+SEED_RESTORE_SQL = """
+UPDATE external_product_seeds
+SET status = :status, updated_at = CAST(CAST(:prior_updated_at AS text) AS timestamptz)
+WHERE id = :id AND status = :prior
 RETURNING id
 """
 REPOINT_SQL = """
@@ -190,9 +201,17 @@ def _listing_of_seed(s: Mapping[str, Any]) -> Optional[Tuple[str, str]]:
     return content_listing(s.get("canonical_url") or s.get("destination_url"))
 
 
+def _in_market(item: Mapping[str, Any], market: str) -> bool:
+    """An offer or seed of `market` (a row with no market is the catalog's default, US)."""
+    return str(item.get("market") or "US").strip().upper() == market.strip().upper()
+
+
 def plan_row(row: Mapping[str, Any], offers: List[Mapping[str, Any]], seeds: List[Mapping[str, Any]], *,
              market: str) -> List[Dict[str, Any]]:
-    """One entry per host of this row that carries more than one listing: the keeper and every change."""
+    """One entry per host of this row that carries more than one listing: the keeper and every change.
+
+    Only `market`'s offers and seeds are changed (the keeper is elected for that market; a GB job on the same
+    host would elect its own): other markets' are counted in `other_market_left`, never written."""
     by_host: Dict[str, Dict[str, Dict[str, list]]] = {}
     for o in offers:
         listing = _listing_of_offer(o)
@@ -211,27 +230,42 @@ def plan_row(row: Mapping[str, Any], offers: List[Mapping[str, Any]], seeds: Lis
             [evidence(h, v["offers"], v["seeds"]) for h, v in sorted(listings.items())], market=market,
             current=current[1] if current and current[0] == host else None)
         k = keeper["handle"]
-        mine = listings[k]
-        others = {h: v for h, v in listings.items() if h != k}
+        mine = {"offers": [o for o in listings[k]["offers"] if _in_market(o, market)],
+                "seeds": [x for x in listings[k]["seeds"] if _in_market(x, market)]}
+        others = {h: {"offers": [o for o in v["offers"] if _in_market(o, market)],
+                      "seeds": [x for x in v["seeds"] if _in_market(x, market)]}
+                  for h, v in listings.items() if h != k}
+        other_market_left = sum(1 for v in listings.values() for o in v["offers"] + v["seeds"]
+                                if not _in_market(o, market))
         live_others = [o for v in others.values() for o in v["offers"] if o.get("suppressed_at") is None]
         suppress = [o["offer_id"] for o in live_others]
         # what a revert puts back: a live offer's metadata (NULL stays NULL)
         prior_metadata = {o["offer_id"]: (_json(o["suppression_metadata"]) if o.get("suppression_metadata") is not None
                                           else None) for o in live_others}
-        deactivate = [s["id"] for v in others.values() for s in v["seeds"] if s.get("status") == "active"]
+        seeds_off = [x for v in others.values() for x in v["seeds"] if x.get("status") == "active"]
+        deactivate = [x["id"] for x in seeds_off]
         live_shelves = {(o["sku_key"], o["channel"], o.get("market")) for o in mine["offers"]
                         if o.get("suppressed_at") is None}
+        # The offer whose PRICE was read most recently comes back (review 2: the reconciler bumps updated_at when
+        # it suppresses, and the price refresh skips suppressed offers, so updated_at says nothing of the price).
         restore, taken = [], set(live_shelves)
-        for o in sorted(mine["offers"], key=lambda o: (str(o.get("updated_at") or ""), o["offer_id"]), reverse=True):
+        # (reverse order: a price never read sorts "" -- last)
+        for o in sorted(mine["offers"], key=lambda o: (str(o.get("price_checked_at") or ""),
+                                                       str(o.get("updated_at") or ""), o["offer_id"]), reverse=True):
             shelf = (o["sku_key"], o["channel"], o.get("market"))
             if o.get("suppressed_at") is not None and o.get("suppression_reason") == DUPLICATE_REASON \
                     and shelf not in taken:
                 taken.add(shelf)
-                restore.append({"offer_id": o["offer_id"], "prior_suppressed_at": str(o["suppressed_at"])})
+                restore.append({"offer_id": o["offer_id"], "prior_suppressed_at": str(o["suppressed_at"]),
+                                "price_checked_at": None if o.get("price_checked_at") is None
+                                else str(o["price_checked_at"])})
         entry: Dict[str, Any] = {
             "product_key": row["product_key"], "content_key": row.get("content_key"), "host": host,
             "keeper": k, "keeper_evidence": keeper, "left_out": sorted(others), "suppress": suppress,
             "suppress_prior_metadata": prior_metadata,
+            "deactivate_prior_updated_at": {x["id"]: None if x.get("updated_at") is None else str(x["updated_at"])
+                                            for x in seeds_off},
+            "other_market_left": other_market_left,
             "restore": restore, "deactivate": deactivate, "repoint": None, "skipped": None}
         if keeper.get("available") is False:
             # every listing of this host is gone or sold out: moving the row between dead pages (and restoring an
@@ -289,6 +323,10 @@ def summary(p: Mapping[str, Any]) -> Dict[str, Any]:
         "seeds_to_deactivate": sum(len(g["deactivate"]) for g in act),
         "rows_to_repoint": sum(1 for g in act if g["repoint"]),
         "listings_left_out": sum(len(g["left_out"]) for g in act),
+        "other_market_left": sum(g.get("other_market_left") or 0 for g in p["groups"]),
+        # how old the price of each offer that comes back is (review 2): by the day its price was last read
+        "restored_price_checked": dict(Counter((r["price_checked_at"] or "never")[:10]
+                                               for g in act for r in g["restore"]).most_common(15)),
         "by_host": dict(Counter(g["host"] for g in act).most_common(40)),
         "sample": [{k: g[k] for k in ("product_key", "host", "keeper", "left_out", "suppress", "restore",
                                       "repoint", "skipped")} for g in p["groups"][:SAMPLE]],
@@ -361,10 +399,12 @@ async def _reverse(db: Any, m: Mapping[str, Any]) -> Dict[str, int]:
                 "prior_image_url": r["image_url"]})
             _expect(got, [g["product_key"]], "re-pointed rows")
             done["repointed"] += 1
-        if g["deactivate"]:
-            got = await db.fetch_all(SEED_STATUS_SQL, {"ids": g["deactivate"], "status": "active", "prior": "inactive"})
-            _expect(got, g["deactivate"], "deactivated seeds")
-            done["reactivated"] += len(got)
+        for seed_id in g["deactivate"]:
+            got = await db.fetch_all(SEED_RESTORE_SQL, {
+                "id": seed_id, "status": "active", "prior": "inactive",
+                "prior_updated_at": (g.get("deactivate_prior_updated_at") or {}).get(seed_id)})
+            _expect(got, [seed_id], "deactivated seeds")
+            done["reactivated"] += 1
         for r in g["restore"]:
             got = await db.fetch_all(RESUPPRESS_SQL, {"offer_id": r["offer_id"], "reason": DUPLICATE_REASON,
                                                       "prior_suppressed_at": r["prior_suppressed_at"]})

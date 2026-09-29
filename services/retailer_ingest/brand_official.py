@@ -164,7 +164,12 @@ async def ingest_brand_official(
     `batch=True` routes the apply through the round-trip-eliminating executor
     (identical SQL/guard/audit) — used by the StyleKorean CLI where the plan is
     written from a laptop over the high-latency Railway public proxy."""
-    plan = ingest_validated_jsonl(official_records, source_jsonl=f"brand_official:{domain}")
+    if db is not None:
+        # Never move a row off the listing it names (ingestion.ingest_validated_jsonl `listing_moves`).
+        from services.catalog_enrichment_agent.apply import plan_with_current_listings
+        plan = await plan_with_current_listings(official_records, db=db, source_jsonl=f"brand_official:{domain}")
+    else:
+        plan = ingest_validated_jsonl(official_records, source_jsonl=f"brand_official:{domain}")
     summary: Dict[str, Any] = {
         "domain": domain,
         "brand": brand,
@@ -174,6 +179,7 @@ async def ingest_brand_official(
         "skipped": plan["skipped"],
         # Listings left out: another listing on this host has the same title (one content key).
         "listing_collisions": plan.get("listing_collisions") or [],
+        "listing_moves": plan.get("listing_moves") or [],
         "applied": None,
     }
     if apply:

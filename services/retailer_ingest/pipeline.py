@@ -821,8 +821,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
 
     # Every offer is DECLARED for the job's market (catalog_offers.market) and must be priced in its
     # currency; the seed rows keep the US serving partition (ingestion.SEED_PARTITION_MARKET).
-    plan = await cli._replan_with_current_listings(ingest_validated_jsonl(records, market=market), records,
-                                                   market=market)
+    moves_accepted = [k.split(":", 1)[1] for k in o.get("accepted_flags") or [] if k.startswith("listing_moved:")]
+    plan = await cli._plan_with_current_listings(records, market=market, allow_moves=moves_accepted)
     inspection = inspect_primary_plan(plan)
     checks["plan"] = {k: inspection.get(k) for k in ("status", "reasons", "planned", "unresolved_category_count")}
     if inspection.get("reasons"):
@@ -853,8 +853,14 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     # A listing the plan left out because an earlier one on this host has its title (one content key).
     collisions = plan.get("listing_collisions") or []
     checks["listing_collisions"] = len(collisions)
-    if plan.get("current_listings"):
-        checks["current_listings"] = plan["current_listings"]
+    checks["current_listings"] = plan.get("current_listings")
+    checks["listing_moves"] = len(plan.get("listing_moves") or [])
+    row_flags += detectors.listing_move_flags(plan.get("listing_moves") or [])
+    if (plan.get("current_listings") or {}).get("status") in ("unchecked", "error"):
+        # Without the listing each row names, a plan cannot tell a move from a first ingest.
+        flags.append({"key": "current_listings_unread", "rule": "current_listings_unread",
+                      "severity": detectors.BLOCK, "acceptable": False,
+                      "detail": f"could not read the rows' current listings: {plan['current_listings']}"})
     row_flags += detectors.listing_collision_flags(collisions)
     # Name each row's brand on its flag: in a multi_brand cohort the reviewer must see whose row it is.
     brand_of = {detectors._handle(r): (r.get("pdp") or {}).get("brand") for r in records}

@@ -396,6 +396,26 @@ def listing_collision_flags(collisions: Iterable[Dict[str, Any]]) -> List[Dict[s
     return flags
 
 
+def listing_move_flags(moves: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """listing_moved: a row names a listing on this host that the crawl does not carry, so the plan held
+    every record of it (ingestion.ingest_validated_jsonl never moves a row). Always BLOCK and never covered
+    by options.accept_listing_collisions: accepting `listing_moved:<product_key>` is what lets the row move
+    to the listing named in the detail (a renamed handle, an unpublished page); a crawl that merely dropped
+    the page is answered by re-running it."""
+    return [{
+        "key": f"listing_moved:{m.get('product_key')}",
+        "rule": "listing_moved",
+        "severity": BLOCK,
+        "handle": m.get("would_keep"),
+        "product_name": None,
+        "category_path": None,
+        "merchant_product_type": None,
+        "detail": (f"held: {m.get('host')} row {m.get('product_key')} names {m.get('current')!r}, which this "
+                   f"crawl does not carry; accepting moves it to {m.get('would_keep')!r} "
+                   f"(crawled {list(m.get('crawled') or [])[:5]})"),
+    } for m in moves or []]
+
+
 def blocking(flags: Iterable[Dict[str, Any]], *, accepted: Iterable[str] = ()) -> List[Dict[str, Any]]:
     """The BLOCK flags an approval has not accepted by key (cohort-level flags are never accepted)."""
     ok = set(accepted or ())

@@ -394,8 +394,9 @@ def content_listing(canonical_url: Optional[str]) -> Optional[Tuple[str, str]]:
     (listing_handle), else its casefolded path. None when the URL names no host or no path.
 
     The handle, not the path, so one listing stays one listing under a market subfolder
-    (/en-gb/products/x and /products/x)."""
-    from urllib.parse import urlsplit
+    (/en-gb/products/x and /products/x), and percent-decoded, so one listing is one listing however a
+    lane spelled it (`makewaves%C2%AE-mascara` and `makewaves®-mascara`)."""
+    from urllib.parse import unquote, urlsplit
 
     url = str(canonical_url or "").strip()
     try:
@@ -403,7 +404,7 @@ def content_listing(canonical_url: Optional[str]) -> Optional[Tuple[str, str]]:
         path = urlsplit(url).path
     except ValueError:
         return None
-    listing = listing_handle(url) or path.strip("/").casefold()
+    listing = unquote(listing_handle(url) or path.strip("/").casefold()).casefold()
     if not host or not listing:
         return None
     return host, listing
@@ -1757,6 +1758,7 @@ def ingest_validated_jsonl(
     source_jsonl: Optional[str] = None,
     market: Optional[str] = None,
     current_listings: Optional[Dict[str, Tuple[str, str]]] = None,
+    allow_moves: Iterable[str] = (),
 ) -> Dict[str, Any]:
     """Drive ingest_validated_record across an iterable of records and
     return all five row collections plus skipped_count. Pure — no DB
@@ -1766,10 +1768,17 @@ def ingest_validated_jsonl(
     `_build_offer_inserts`); a record priced in another currency fails the whole plan.
 
     `current_listings` (optional): product_key -> the (host, listing) its catalog row names today
-    (apply.current_listings), for elect_listing_keeper's tie-break.
+    (apply.current_listings). A plan NEVER MOVES A ROW OFF THE LISTING IT NAMES: that listing keeps
+    the key whenever the crawl carries it, in or out of stock; when the crawl does not (unpublished, a
+    renamed handle, a page the crawl dropped), every record of that key on that host is left out and
+    named in `listing_moves` -- unless the key is in `allow_moves` (a reviewer accepted the move).
+    Measured by the review of #2463: one out-of-stock crawl elected another page, re-pointed the row
+    and re-activated that page's seed while the old offer stayed live and the new one suppressed.
+    Only a row with no listing yet on the host, or an accepted move, is elected
+    (scripts/repair_same_title_listings.py moves rows on purpose, under review).
 
     Returns a dict with keys: pdps, skus, merchants, offers, seeds,
-    skipped, listing_collisions. Lists are de-duped by their natural primary key so re-runs
+    skipped, listing_collisions, listing_moves. Lists are de-duped by their natural primary key so re-runs
     across files don't stack duplicate row dicts.
 
     ONE LISTING PER CONTENT KEY PER HOST. A content-keyed row (derive_product_key: brand + title,
@@ -1821,17 +1830,31 @@ def ingest_validated_jsonl(
         named = (current_listings or {}).get(group[0])
         return named[1] if named and named[0] == group[1] else None
 
-    keepers = {group: elect_listing_keeper(list(by_handle.values()), market=market, current=_current(group))
-               for group, by_handle in listings.items()}
+    allowed = {str(k) for k in allow_moves or ()}
+    keepers: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
+    listing_moves: List[Dict[str, Any]] = []
+    for group, by_handle in listings.items():
+        current = _current(group)
+        if current is not None and current in by_handle:
+            keepers[group] = by_handle[current]
+        elif current is not None and group[0] not in allowed:
+            keepers[group] = None  # held: the row stays on the listing it names
+            would_keep = elect_listing_keeper(list(by_handle.values()), market=market)["handle"]
+            listing_moves.append({"product_key": group[0], "host": group[1], "current": current,
+                                  "crawled": sorted(by_handle), "would_keep": would_keep})
+        else:
+            keepers[group] = elect_listing_keeper(list(by_handle.values()), market=market)
     listing_collisions: List[Dict[str, Any]] = []
     for group, by_handle in listings.items():
         kept = keepers[group]
+        if kept is None:
+            continue
         for handle, evidence in by_handle.items():
             if handle != kept["handle"]:
                 listing_collisions.append({"product_key": group[0], "host": group[1],
                                            "kept": kept, "dropped": evidence})
     for result, group, evidence in planned:
-        if group is not None and evidence["handle"] != keepers[group]["handle"]:
+        if group is not None and (keepers[group] is None or evidence["handle"] != keepers[group]["handle"]):
             continue
         pdp_rows.append(result["pdp"])
         sku_rows.append(result["sku"])
@@ -1875,6 +1898,7 @@ def ingest_validated_jsonl(
         "skipped_reasons": skipped_reasons,
         "audit_reasons": audit_reasons,
         "listing_collisions": listing_collisions,
+        "listing_moves": listing_moves,
     }
 
 
@@ -1949,7 +1973,8 @@ def elect_listing_keeper(listings: List[Dict[str, Any]], *, market: Optional[str
          and the repair, which often knows nothing of an ad clone, never trades a selling page for it);
       3. not another region's copy (`-ukeu` for a US job; `-global` is no region);
       4. a base listing: not another listing's handle plus a suffix (`serum` over `serum-sachet`);
-      5. the row's current listing, so a tie never moves a row that is already right;
+      5. `current`, the listing the row names today: the repair's tie-break (the ingest never elects for
+         a row that names a listing on the host -- it keeps it, see ingest_validated_jsonl);
       6. the oldest listing: lowest storefront variant id (issued in creation order); none ranks last;
       7. the handle, so the choice is total.
     ONE function for the ingest and scripts/repair_same_title_listings.py, so the two keep one page."""

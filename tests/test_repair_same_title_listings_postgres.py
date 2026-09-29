@@ -18,6 +18,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 EARLIER = datetime(2026, 9, 1, tzinfo=timezone.utc)
+SEED_TOUCHED = datetime(2026, 9, 28, 5, 15, 7, tzinfo=timezone.utc)
 K_BC = "ext:cocodor-black-cherry::5f884f1a"
 K_MIN = "ext:merit-the-minimalist::11111111"
 K_SKIP = "ext:saie-glossybounce-duo::22222222"
@@ -63,13 +64,15 @@ async def catalog(monkeypatch):
         for name in ("catalog_products", "catalog_offers", "catalog_skus"):
             await admin.execute(str(sa.schema.CreateTable(dbmod.metadata.tables[name]).compile(
                 dialect=postgresql.dialect())))
+        # Migration 246 (not on the model): when an offer's price was last read.
+        await admin.execute("ALTER TABLE catalog_offers ADD COLUMN price_checked_at TIMESTAMPTZ NULL")
         # Not on the shared metadata: migration 179's shape, and the seed columns the tool reads and writes.
         await admin.execute("CREATE TABLE identity_resolution_events (id BIGSERIAL PRIMARY KEY, proposal_id TEXT, "
                             "action TEXT NOT NULL, run_id TEXT NOT NULL, detail JSONB, "
                             "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
         await admin.execute("CREATE TABLE external_product_seeds (id TEXT PRIMARY KEY, attached_product_key TEXT, "
                             "canonical_url TEXT, destination_url TEXT, image_url TEXT, status TEXT, "
-                            "availability TEXT, destination_verdict TEXT, updated_at TIMESTAMPTZ)")
+                            "availability TEXT, destination_verdict TEXT, market TEXT, updated_at TIMESTAMPTZ)")
         await _rows(admin)
         database = databases.Database(url, server_settings={"search_path": schema})
         await database.connect()
@@ -93,23 +96,24 @@ async def _product(admin, key, url, image, *, suppressed=False):
 
 
 async def _offer(admin, offer_id, key, url, *, reason=None, availability="in_stock", image=None,
-                 updated=EARLIER.replace(tzinfo=None), metadata=None, market="US"):
+                 updated=EARLIER.replace(tzinfo=None), metadata=None, market="US", price_checked=None):
     await admin.execute(
         """INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, channel, market, availability,
                                        suppressed_at, suppression_reason, offer_payload, source_ref, updated_at,
-                                       suppression_metadata)
+                                       suppression_metadata, price_checked_at)
            VALUES ($1, $2 || '::canonical', $2, 'm', 'default', $10, $3, $4, $5, CAST($6 AS jsonb), $7, $8,
-                   CAST($9 AS jsonb))""",
+                   CAST($9 AS jsonb), $11)""",
         offer_id, key, availability, EARLIER if reason else None, reason,
         json.dumps({"destination_url": url, "canonical_url": url, "image_url": image or url + ".jpg"}), url, updated,
-        None if metadata is None else json.dumps(metadata), market)
+        None if metadata is None else json.dumps(metadata), market, price_checked)
 
 
 async def _seed(admin, seed_id, key, url, *, status="active", availability="in_stock", verdict="live"):
     await admin.execute(
         """INSERT INTO external_product_seeds (id, attached_product_key, canonical_url, destination_url, image_url,
-                                               status, availability, destination_verdict)
-           VALUES ($1, $2, $3, $3, $3 || '.jpg', $4, $5, $6)""", seed_id, key, url, status, availability, verdict)
+                                               status, availability, destination_verdict, market, updated_at)
+           VALUES ($1, $2, $3, $3, $3 || '.jpg', $4, $5, $6, 'US', $7)""",
+        seed_id, key, url, status, availability, verdict, SEED_TOUCHED)
 
 
 async def _rows(admin):
@@ -118,10 +122,17 @@ async def _rows(admin):
     await _product(admin, K_BC, candle, candle + ".jpg")
     await _offer(admin, "o_refill", K_BC, cocodor("diffuser-refill-6-7oz-black-cherry"),
                  metadata={"reconcile_batch_id": "rb_1"})  # a live offer the reconciler once kept
-    await _offer(admin, "o_candle", K_BC, cocodor("soy-candle-medium-black-cherry"), reason="duplicate_offer",
+    # Two keeper offers on one shelf. The reconciler touched o_candle_stale last (updated_at), but o_candle's price
+    # was read more recently: the price, not the touch, decides which comes back.
+    await _offer(admin, "o_candle_stale", K_BC, cocodor("soy-candle-medium-black-cherry"), reason="duplicate_offer",
                  updated=datetime(2026, 9, 20))
-    # the same shelf, older: only the newest keeper offer per shelf comes back
-    await _offer(admin, "o_candle_old", K_BC, cocodor("soy-candle-medium-black-cherry"), reason="duplicate_offer")
+    await _offer(admin, "o_candle", K_BC, cocodor("soy-candle-medium-black-cherry"), reason="duplicate_offer",
+                 price_checked=datetime(2026, 9, 25, tzinfo=timezone.utc))
+    # the refill page's SG offer: another market's election, never written by a US repair
+    await _offer(admin, "o_refill_sg", K_BC, cocodor("diffuser-refill-6-7oz-black-cherry"), market="SG")
+    # ...and the kept page's SG duplicate: an SG repair's to restore, not a US one's
+    await _offer(admin, "o_candle_sg", K_BC, cocodor("soy-candle-medium-black-cherry"), market="SG",
+                 reason="duplicate_offer")
     # another shelf, suppressed for a reason the repair does not own: never restored
     await _offer(admin, "o_candle_dead", K_BC, cocodor("soy-candle-medium-black-cherry"), market="SG",
                  reason="external_seed_destination_dead")
@@ -160,7 +171,7 @@ async def _rows(admin):
     oil = "https://veganifectus.com/products/amazon-1-superfood-cleansing-oil"
     await _product(admin, K_NOIMG, oil + "-2", oil + "-2.jpg")
     await _offer(admin, "o_noimg_2", K_NOIMG, oil + "-2")
-    await _offer(admin, "o_noimg", K_NOIMG, oil, market="SG")
+    await _offer(admin, "o_noimg", K_NOIMG, oil)
     await admin.execute("UPDATE catalog_offers SET offer_payload = offer_payload - 'image_url' "
                         "WHERE offer_id = 'o_noimg'")
     # Two listings, but already aligned: one live, the row names it, the other's seed already inactive.
@@ -179,7 +190,8 @@ async def _state(admin):
     offers = {r["offer_id"]: (r["suppressed_at"], r["suppression_reason"], json.loads(r["m"]) if r["m"] else None)
               for r in await admin.fetch("SELECT offer_id, suppressed_at, suppression_reason, "
                                          "suppression_metadata AS m FROM catalog_offers")}
-    seeds = {r["id"]: r["status"] for r in await admin.fetch("SELECT id, status FROM external_product_seeds")}
+    seeds = {r["id"]: (r["status"], r["updated_at"])
+             for r in await admin.fetch("SELECT id, status, updated_at FROM external_product_seeds")}
     rows = {r["product_key"]: (r["canonical_url"], r["image_url"])
             for r in await admin.fetch("SELECT product_key, canonical_url, image_url FROM catalog_products")}
     return offers, seeds, rows
@@ -209,6 +221,7 @@ async def test_the_plan_elects_the_ingests_keeper_and_writes_nothing(catalog):
     s = tool.summary(p)
     assert (s["offers_to_suppress"], s["offers_to_restore"], s["seeds_to_deactivate"], s["rows_to_repoint"]) == \
         (1, 1, 4, 2)
+    assert bc["other_market_left"] == 3 and s["restored_price_checked"] == {"2026-09-25": 1}
     assert await _state(admin) == before
 
 
@@ -216,11 +229,13 @@ async def test_apply_writes_every_change_after_storing_its_manifest(catalog):
     db, admin, tool, refreshed = catalog
     out = await tool.apply(db, await tool.plan(db, hosts=[], keys=[]))
     offers, seeds, rows = await _state(admin)
+    seeds = {k: v[0] for k, v in seeds.items()}
     assert offers["o_refill"][0] is not None and offers["o_refill"][1] == "same_key_other_listing"
     assert offers["o_refill"][2] == {"reconcile_batch_id": "rb_1", "same_listing_run": out["run_id"],
                                      "same_listing_keeper": "soy-candle-medium-black-cherry"}
     assert offers["o_candle"][:2] == (None, None)
-    assert offers["o_candle_old"][1] == "duplicate_offer"
+    assert offers["o_candle_stale"][1] == "duplicate_offer" and offers["o_refill_sg"][0] is None
+    assert offers["o_candle_sg"][1] == "duplicate_offer"
     assert offers["o_candle_dead"][1] == "external_seed_destination_dead"
     assert offers["o_diffuser"][1] == "duplicate_offer"  # left out, already suppressed: untouched
     assert offers["o_skip"][0] is None and seeds["s_skip"] == "active"  # skipped whole
@@ -233,7 +248,7 @@ async def test_apply_writes_every_change_after_storing_its_manifest(catalog):
     assert refreshed == [(out["run_id"], sorted([ck(K_BC), ck(K_MIN), ck(K_DEAD)]))]
     # every live offer of a repaired row is now its keeper's
     live = {r["product_key"]: r["n"] for r in await admin.fetch(
-        "SELECT product_key, count(*) n FROM catalog_offers WHERE suppressed_at IS NULL GROUP BY 1")}
+        "SELECT product_key, count(*) n FROM catalog_offers WHERE suppressed_at IS NULL AND market = 'US' GROUP BY 1")}
     assert live[K_BC] == 1 and live[K_MIN] == 1
 
 
@@ -246,7 +261,7 @@ async def test_drift_since_the_plan_aborts_the_whole_write(catalog):
         await tool.apply(db, p)
     offers, seeds, rows = await _state(admin)
     assert offers == before[0] and rows == before[2]
-    assert seeds == {**before[1], "s_min_ukeu": "paused"}
+    assert seeds == {**before[1], "s_min_ukeu": ("paused", SEED_TOUCHED)}
     events = [r["action"] for r in await admin.fetch("SELECT action FROM identity_resolution_events")]
     assert events == [tool.MANIFEST_ACTION]  # stored, never applied
 
@@ -342,3 +357,41 @@ async def test_a_host_scoped_plan_touches_only_that_host(catalog):
     db, _, tool, _ = catalog
     p = await tool.plan(db, hosts=["www.meritbeauty.com"], keys=[])
     assert [g["product_key"] for g in p["groups"]] == [K_MIN]
+
+
+async def test_a_keeper_offer_relabelled_since_the_plan_is_not_restored(catalog):
+    db, admin, tool, _ = catalog
+    p = await tool.plan(db, hosts=[], keys=[])
+    await admin.execute("UPDATE catalog_offers SET suppression_reason = 'product_suppressed' "
+                        "WHERE offer_id = 'o_candle'")
+    before = await _state(admin)
+    with pytest.raises(RuntimeError, match="drift"):
+        await tool.apply(db, p)
+    assert await _state(admin) == before
+
+
+async def test_after_the_repair_an_out_of_stock_or_missing_page_never_moves_the_row(catalog):
+    """Review of #2463 at 533184dcd (P1), on the repaired catalog: one crawl with the kept candle page sold out
+    keeps it; a crawl without it holds the row (listing_moves) instead of moving it."""
+    from services import curated_brand_feed as feed
+    from services.catalog_enrichment_agent.apply import plan_with_current_listings
+    from services.catalog_enrichment_agent.ingestion import derive_product_key
+
+    db, admin, tool, _ = catalog
+    await tool.apply(db, await tool.plan(db, hosts=[], keys=[]))
+    key = derive_product_key("COCODOR", "Black Cherry")
+    await admin.execute("UPDATE catalog_products SET product_key = $1 WHERE product_key = $2", key, K_BC)
+
+    def record(handle, ptype, price, vid, available=True):
+        return feed.shopify_product_to_record(
+            {"id": 8_000_000_000 + vid % 1000, "vendor": "COCODOR", "title": "Black Cherry", "handle": handle,
+             "product_type": ptype, "body_html": "<p>x</p>", "images": [{"src": f"https://cdn.example/{handle}.jpg"}],
+             "variants": [{"id": vid, "price": price, "available": available, "sku": handle}]},
+            domain="cocodor.com", category_path="beauty", brand_override="COCODOR", currency="USD",
+            source_role="brand_official", emit_native_variants=True)
+    refill = record("diffuser-refill-6-7oz-black-cherry", "refill", "6.99", 49_000_000_000_001)
+    candle_oos = record("soy-candle-medium-black-cherry", "candle", "9.99", 49_000_000_000_003, available=False)
+    plan = await plan_with_current_listings([refill, candle_oos], db=db)
+    assert [c["kept"]["handle"] for c in plan["listing_collisions"]] == ["soy-candle-medium-black-cherry"]
+    held = await plan_with_current_listings([refill], db=db)
+    assert held["pdps"] == [] and [m["current"] for m in held["listing_moves"]] == ["soy-candle-medium-black-cherry"]
