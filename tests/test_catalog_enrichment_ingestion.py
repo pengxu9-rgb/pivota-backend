@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -204,6 +205,29 @@ def test_non_latin_keys_fit_the_widest_key_budget():
 def test_a_symbol_only_name_is_not_ingested():
     """"™"/"—" identify nothing; they used to mint the shared ext:unknown::50d8b4a9."""
     assert ingest_validated_record(_record(brand="™", product_name="—")) is None
+    # A slug that is literally "unknown" lands on the same shared key.
+    assert ingest_validated_record(_record(brand="Unknown", product_name="™")) is None
+
+
+def test_a_retailer_row_is_not_refused_for_a_key_it_never_uses():
+    """Retailer rows are keyed by their URL; refusing one for the shared content key would fail the
+    whole store's primary apply over a row that cannot collide. Symbol-only names are still refused."""
+    kept = ingest_validated_record(_record(brand="Unknown", product_name="É", source_role="retailer"))
+    assert kept["pdp"]["product_key"].startswith("ext:retailer:")
+    assert ingest_validated_record(_record(brand="Unknown", product_name="É")) is None
+    assert ingest_validated_record(_record(brand="™", product_name="—", source_role="retailer")) is None
+
+
+def test_decomposed_unicode_is_the_same_product():
+    """NFD input (macOS filenames, some feeds) spells the same letters: same key as NFC, and the
+    Vietnamese trigger still sees the precomposed letter, so "mắt"/"mặt" stay apart."""
+    nfd = lambda t: unicodedata.normalize("NFD", t)
+    assert derive_product_key("Cocoon", nfd("Kem dưỡng mắt")) == derive_product_key("Cocoon", "Kem dưỡng mắt")
+    assert derive_product_key("Cocoon", nfd("Kem dưỡng mắt")) != derive_product_key("Cocoon", nfd("Kem dưỡng mặt"))
+    assert derive_product_key("Tarte", nfd("maracuja juicy lip crème")) == \
+        "ext:tarte-maracuja-juicy-lip-cr-me::15a5c2fe"
+    # An invisible character between a letter and its marks must not hide the letter from the trigger.
+    assert derive_product_key("Cocoon", "Kem ma​̣̂t") != derive_product_key("Cocoon", "Kem ma​̆́t")
 
 
 def test_derive_seed_id_is_deterministic():

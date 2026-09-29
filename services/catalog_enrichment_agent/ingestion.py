@@ -162,8 +162,13 @@ def canonical_product_name(brand: Optional[str], product_name: Optional[str]) ->
     """Stable (brand_normalized, product_name_normalized) key. Two PDPs
     with identical brand + product name (modulo punctuation/case) collapse
     to the same key — by design, so the agent can re-run without
-    duplicating rows."""
-    norm = _normalize_token(f"{brand or ''} {product_name or ''}").replace(" ", "-")
+    duplicating rows.
+
+    NFC first: a decomposed "crème" (e + U+0300) would otherwise slug to "cre-me", not the "cr-me"
+    of the composed spelling (prod census 2026-09-29: 2 of 17,315 stored names are not NFC, and
+    NFC moves neither key)."""
+    text = unicodedata.normalize("NFC", f"{brand or ''} {product_name or ''}")
+    norm = _normalize_token(text).replace(" ", "-")
     return norm or "unknown"
 
 
@@ -238,7 +243,10 @@ def _script_identity(brand: Optional[str], product_name: Optional[str]) -> Optio
 
     The prefix is the ASCII slug of the identity text, not of the raw name, so width variants of one
     product ("ＭＶマルチビタ" / "MVマルチビタ") share the whole key, not only the digest."""
-    text = f"{brand or ''} {product_name or ''}"
+    # NFC so a decomposed Vietnamese "mặt" (a + U+0323 + U+0302) is the precomposed letter it spells --
+    # after dropping invisibles, which product_identity_text drops too and which would block composition.
+    text = unicodedata.normalize("NFC", "".join(
+        ch for ch in f"{brand or ''} {product_name or ''}" if not _is_invisible(ch)))
     if not any(_names_the_product(ch) for ch in text) and _normalize_token(text):
         return None
     identity = product_identity_text(brand, product_name)
@@ -266,6 +274,11 @@ def _names_the_product(ch: str) -> bool:
     if category not in ("Lu", "Ll", "Lt", "Lo"):   # Lm (ー, 々) rides with the script letters it modifies
         return False
     return not unicodedata.name(ch, "").startswith("LATIN ") and not superscript
+
+
+#: The legacy key of every name whose ASCII slug is empty or literally "unknown". Ingest refuses it
+#: (_build_pdp_payload); the gateway's Reap cart-link lane refuses it too (PIVOTA-Agent #2329/#2330).
+SHARED_UNKNOWN_PRODUCT_KEY = "ext:unknown::" + hashlib.sha1(b"unknown").hexdigest()[:8]
 
 
 #: catalog_products / catalog_skus.source_product_id is VARCHAR(128) (migration 058).
@@ -509,9 +522,15 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
     }
     if not payload["brand"] or not payload["product_name"]:
         return {}
-    # A name made only of symbols ("™", "—") identifies nothing; its key would be ext:unknown::<the one
-    # digest every such name shares>.
+    # A brand + name made only of symbols ("™" "—") identifies nothing.
     if not product_identity_text(payload["brand"], payload["product_name"]):
+        return {}
+    # A content-keyed row whose brand + name slug to nothing or to literally "unknown" ("Unknown" "™")
+    # would land on the one key all such rows share. Retailer rows are keyed by their URL
+    # (_build_pdp_insert) and never use this key, so they are not refused for it: a refused record
+    # fails the whole store's primary apply (primary_ingestion: records_skipped).
+    if (pdp.get("source_role") != "retailer"
+            and derive_product_key(payload["brand"], payload["product_name"]) == SHARED_UNKNOWN_PRODUCT_KEY):
         return {}
     return payload
 
