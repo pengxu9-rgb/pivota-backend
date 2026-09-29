@@ -1014,3 +1014,45 @@ def test_the_naming_rule_accepts_and_refuses_by_source_agreement() -> None:
     assert name(stamped, [f"https://{JUDY_HOST}/products/silky-matte-lip-ink?variant="]) is None
     assert name(unstamped, [f"https://other.com/products/silky-matte-lip-ink?variant={JUDY_VARIANT}"]) is None
     assert name(None, staging) is None and name({"snapshot": []}, staging) is None
+
+
+def test_REFUSE_a_proof_from_any_other_source_in_either_scope() -> None:
+    named = _backfilled()
+    sole = _backfilled({"variants": [JUDY_JS["variants"][4]]})
+    for seed in (named, sole):
+        assert _verify(seed) is not None
+        for source in ("products_json_v1", None, "operator"):
+            forged = copy.deepcopy(seed)
+            forged["snapshot"]["shopify_cart_proof"]["source"] = source
+            assert _verify(forged) is None, source
+
+
+def test_REFUSE_a_sole_proof_for_a_variant_other_than_the_stamped_one() -> None:
+    sole = _backfilled({"variants": [JUDY_JS["variants"][4]]})
+    sole["snapshot"]["shopify_cart_proof"]["variant_id"] = JUDY_OTHER
+    assert _verify(sole) is None
+    assert _verify(sole, catalog=JUDY_OTHER) is None
+
+
+@pytest.mark.parametrize("scope", [None, "", "sole_variant", "named", "NAMED_VARIANT"])
+def test_REFUSE_a_multi_variant_proof_not_scoped_named_variant(scope) -> None:
+    """An 8-variant proof is accepted ONLY under the exact named_variant scope; unscoped it is a
+    sole proof with the wrong count, and any other scope is unknown."""
+    seed = _backfilled()
+    proof = seed["snapshot"]["shopify_cart_proof"]
+    if scope is None:
+        del proof["scope"]
+    else:
+        proof["scope"] = scope
+    assert _verify(seed) is None
+
+
+def test_REFUSE_a_url_naming_one_variant_of_a_seed_with_several_entries() -> None:
+    """A 2+ entry snapshot is a product-grain seed: it names NOTHING, whatever its URL says."""
+    two = copy.deepcopy(JUDY_SEED["seed_data"])
+    two["snapshot"]["variants"].append(dict(two["snapshot"]["variants"][0], title="01 PETAL INK"))
+    assert named_cart_variant_id(two, product_urls=JUDY_PROD_URLS, shop_domain=JUDY_HOST) is None
+    seed = _backfilled(seed_data=two, page_url=JUDY_SEED["destination_url"])
+    assert seed["snapshot"]["shopify_cart_proof"] is None
+    seed["snapshot"]["shopify_cart_proof"] = _backfilled(page_url=JUDY_SEED["destination_url"])["snapshot"]["shopify_cart_proof"]
+    assert _verify(seed, JUDY_PROD_URLS) is None
