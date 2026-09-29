@@ -1532,6 +1532,8 @@ RETAILER_BRAND_SPELLINGS = {
     # 2026-09-29: 303 rows, 0 held; a re-crawl never updates a stored brand) -- this family must not reach the drain
     # while an old-spelling row is live, or intake re-keys that row into the new key's group and apply refuses it.
     "etudehouse": "etude", "etude": "etude",
+    # _brand_key keeps accents (isalnum), so the accented spellings are keys of their own (review of #2440).
+    "étudehouse": "etude", "étude": "etude",
 }
 # The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
 # --brand. content_key is

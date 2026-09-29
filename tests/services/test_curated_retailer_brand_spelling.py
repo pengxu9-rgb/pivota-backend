@@ -108,7 +108,7 @@ def test_case_and_punctuation_variants_still_collapse_as_before():
     assert brand_on("retailer.com", "TONY MOLY", "TONYMOLY") == "TONYMOLY"
 
 
-@pytest.mark.parametrize("vendor", ["ETUDE HOUSE", "Etude House", "ETUDE", "Etude", "etude"])
+@pytest.mark.parametrize("vendor", ["ETUDE HOUSE", "Etude House", "ETUDE", "Etude", "etude", "Étude House", "ÉTUDE"])
 @pytest.mark.parametrize("override", [None, "ETUDE HOUSE", "Etude", "ETUDE"])
 def test_etude_is_one_brand_written_as_its_current_name(vendor, override):
     """Measured 2026-09-28: 293 retailer rows "ETUDE HOUSE" vs 184 "ETUDE"/"Etude" -- one maker, renamed in 2023."""
