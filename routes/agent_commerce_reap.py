@@ -1741,9 +1741,8 @@ async def _load_enrichment_cart_link_item(
     return (
         {"shop_domain": merchant_host, "our_price_minor": int(price_minor),
          "currency": market_currency, "market_country": market_country,
-         # TODO(#2467): once `services.text_normalization.clean_product_name` is on main, use it
-         # here as the mirror/Shopify cart-link path does; this is the raw title until then.
-         "product_name": str(product.get("product_title") or "").strip() or None,
+         # Merchant-typed text: the same display rule as the mirror/Shopify path (#2467).
+         "product_name": clean_product_name(product.get("product_title")),
          "product_key": product_key,
          "variant_title": _enrichment_variant_title(sku)},
         str(merchant_id),

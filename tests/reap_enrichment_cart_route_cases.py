@@ -775,6 +775,18 @@ async def test_a_variant_title_the_sku_payload_carries_reaches_the_purchase(clie
     assert (await purchase_of(resp))["variant_title"] == "16.9 oz"
 
 
+async def test_a_dirty_catalog_title_is_stored_clean_on_the_enrichment_path(client):
+    """The product title is merchant-typed: `clean_product_name` (#2467) -- the bidi override and
+    zero-width space dropped, the newline and tab folded -- on the purchase row."""
+    await seed_tarte()
+    await database.execute(
+        "UPDATE catalog_products SET title = :t WHERE product_key = :pk",
+        {"pk": TARTE_PK, "t": "  Flat\u202e Blush\n\tBrush\u200b  "})
+    resp = await client.post(f"{BASE}/purchases", json=body(host=TARTE_HOST, product_key=TARTE_PK))
+    assert resp.status_code == 202, resp.text
+    assert (await purchase_of(resp))["product_name"] == "Flat Blush Brush"
+
+
 async def test_the_route_creates_the_proof_table_and_refuses_without_a_proof(client):
     """No table yet (PR B's writer has not run anywhere): the reader's self-heal creates it, and an
     empty table is a missing proof."""
