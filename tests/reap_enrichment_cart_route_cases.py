@@ -746,12 +746,14 @@ async def test_a_product_seller_ref_equal_to_its_merchant_is_accepted(client):
 
 async def test_a_variant_title_the_sku_payload_carries_reaches_the_purchase(client):
     """DISPLAY ONLY. No live source carries one today (None above); when the payload does, the
-    purchase and the 202 say it, as the mirror lane does with its proof's title."""
+    purchase and the 202 say it, as the mirror lane does with its proof's title -- cleaned by the
+    same rule (#2462): the bidi override and zero-width space dropped, the newline folded."""
     await seed_bluemercury_two_sizes()
     sku_key = BM2_SKUS[0][0]
     await database.execute(
         f"UPDATE catalog_skus SET sku_payload = {_jsonb('p')} WHERE sku_key = :sk",
-        {"sk": sku_key, "p": json.dumps({"variant_title": " 16.9 oz ", "source_handle": None})})
+        {"sk": sku_key, "p": json.dumps({"variant_title": " 16.9\u202e\n oz\u200b ",
+                                         "source_handle": None})})
     resp = await client.post(f"{BASE}/purchases", json=body(
         host=BM_HOST, product_key=BM2_PK, variant_key=sku_key))
     assert resp.status_code == 202, resp.text

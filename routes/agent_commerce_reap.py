@@ -132,7 +132,11 @@ from services.outbound_links_service import (
     build_shopify_cart_permalink,
     extract_shopify_numeric_variant_id,
 )
-from services.shopify_variant_identity import CART_PROOF_SCOPE_NAMED, verified_cart_variant_id
+from services.shopify_variant_identity import (
+    CART_PROOF_SCOPE_NAMED,
+    clean_variant_title,
+    verified_cart_variant_id,
+)
 # THE owner of the observed seller-of-record id (`merch_obs_<hash>`): the SAME dispatch every
 # ingestion and re-key path mints with (retailer domain -> etld1 alone, else (brand, etld1)).
 # Imported, never re-implemented -- see `_mirror_seller_ref`.
@@ -1588,15 +1592,15 @@ def _enrichment_listing_offer(offer: Mapping[str, Any], shop_host: str, handle: 
 def _enrichment_variant_title(sku: Mapping[str, Any]) -> Optional[str]:
     """DISPLAY ONLY: a variant title the sku's payload carries, else None. The proof table has no
     title column and the enrichment writer puts none in `sku_payload` today, so this is None on
-    every live row; it is read so the day either source carries one, the purchase says it."""
+    every live row; it is read so the day either source carries one, the purchase says it.
+    Merchant-typed text, so it passes THE cart-link title rule (`clean_variant_title`, #2462)."""
     payload = sku.get("sku_payload")
     if isinstance(payload, str):
         try:
             payload = json.loads(payload)
         except ValueError:
             return None
-    title = payload.get("variant_title") if isinstance(payload, dict) else None
-    return (title.strip() or None) if isinstance(title, str) else None
+    return clean_variant_title(payload.get("variant_title") if isinstance(payload, dict) else None)
 
 
 async def _load_enrichment_cart_link_item(
