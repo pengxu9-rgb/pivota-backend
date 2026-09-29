@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from db._ddl_guard import apply_ddl_statements
@@ -119,17 +120,33 @@ _SELECT_PROOF_SQL = """
 """
 
 
+#: After `ensure_table()` FAILS on the request path, how long the reader answers "no proof"
+#: without trying the DDL again (review of #2465, F3). Without it, a role that cannot CREATE would
+#: re-run a failing CREATE, under `_DDL_LOCK`, on every flag-on purchase request.
+FETCH_DDL_RETRY_SECONDS = 60.0
+#: `time.monotonic()` of the reader's last failed `ensure_table()`, or None.
+_FETCH_DDL_FAILED_AT: Optional[float] = None
+
+
 async def fetch_proof(product_key: str, sku_key: str) -> Optional[Dict[str, Any]]:
     """The proof row for exactly `(product_key, sku_key)` as a dict, or None.
 
     None when there is no row, AND when the table cannot be created (`ensure_table()` False): a
     proof nobody can read is a missing proof, which `verify_enrichment_cart_proof` refuses
-    (`proof_missing`). A database error on the SELECT itself propagates, as every other read on
-    the purchase path does. Returned as a plain dict because the verifier takes a Mapping and a
-    `databases` Record is not one.
+    (`proof_missing`). A failed `ensure_table()` is REMEMBERED for `FETCH_DDL_RETRY_SECONDS`: in
+    that window this answers None without touching the DDL or its lock, then tries once more. A
+    database error on the SELECT itself propagates, as every other read on the purchase path does.
+    Returned as a plain dict because the verifier takes a Mapping and a `databases` Record is not
+    one.
     """
-    if not await ensure_table():
+    global _FETCH_DDL_FAILED_AT
+    if (_FETCH_DDL_FAILED_AT is not None
+            and time.monotonic() - _FETCH_DDL_FAILED_AT < FETCH_DDL_RETRY_SECONDS):
         return None
+    if not await ensure_table():
+        _FETCH_DDL_FAILED_AT = time.monotonic()
+        return None
+    _FETCH_DDL_FAILED_AT = None
     from db.database import database
 
     row = await database.fetch_one(
@@ -139,8 +156,9 @@ async def fetch_proof(product_key: str, sku_key: str) -> Optional[Dict[str, Any]
 
 
 def _reset_for_tests() -> None:
-    global _DDL_READY
+    global _DDL_READY, _FETCH_DDL_FAILED_AT
     _DDL_READY = False
+    _FETCH_DDL_FAILED_AT = None
 
 
 __all__: List[str] = ["TABLE", "OUTCOME_OK", "PROOF_SOURCES", "ensure_table", "fetch_proof"]

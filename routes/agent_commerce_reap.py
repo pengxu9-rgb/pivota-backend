@@ -155,6 +155,7 @@ from services.curated_brand_feed import _same_storefront_host
 from services.reap_enrichment_cart_proof import (
     ENRICHMENT_SOURCE_SYSTEM,
     PLACEHOLDER_SUFFIX as ENRICHMENT_PLACEHOLDER_SUFFIX,
+    SOLE_VARIANT as ENRICHMENT_SOLE_VARIANT,
     VARIANT_INFIX as ENRICHMENT_VARIANT_INFIX,
     derive_enrichment_seller,
     enrichment_offer_price_ok,
@@ -1516,7 +1517,10 @@ _CART_ENRICHMENT_LIVE_SKUS_SQL = """
 # EVERY `::v:` sku of the product, SUPPRESSED ONES INCLUDED (review of #2460): the verifier lets the
 # placeholder stand for the product only when the catalog knows no variant of it at all, and a
 # live-only count of 0 is exactly how a MAC parent whose shade skus were suppressed buys its
-# "Default Title" stub. A key-prefix test (`substr`, not LIKE: a product key may carry `_` or `%`).
+# "Default Title" stub. It is ALSO the no-`variant_key` rule's count (review of #2465): a product
+# whose catalog knows two variants, one of them suppressed, is still a product with two variants.
+# `substr` rather than LIKE only so the prefix is compared as a plain string (`::v:` after this
+# exact product_key), with no pattern characters to escape.
 _CART_ENRICHMENT_VARIANT_SKU_COUNT_SQL = """
     SELECT count(*) AS n
       FROM catalog_skus s
@@ -1547,25 +1551,40 @@ _CART_ENRICHMENT_OFFERS_SQL = """
 """
 #: More offers than this on one sku is not one listing's price.
 _CART_ENRICHMENT_MAX_OFFERS = 50
+#: THE LEGACY COLLAPSED KEY (review of PIVOTA-Agent#2330, defence in depth beside the gateway's
+#: identical refusal): `ext:unknown::<8 hex>` was minted for products with no brand, and MANY
+#: different products shared one such key -- so a proof "for" it proves whichever product was
+#: written last. It names no one product and is refused before anything is read for it. The
+#: distinct 16-hex successor (`ext:unknown::<16 hex>`, pivota-backend#2461) is NOT this shape.
+_LEGACY_COLLAPSED_ENRICHMENT_KEY = re.compile(r"ext:unknown::[0-9a-f]{8}")
 #: The enrichment lane's offer-seller namespace (`ingestion.derive_merchant_id`:
 #: `agent_seed::<slug>`, `agent_seed::retailer::<host>`). It is where the listing's offers live;
 #: it is NEVER the seller of record (that is `product.merchant_id`).
 _ENRICHMENT_OFFER_MERCHANT_PREFIX = "agent_seed::"
 
 
-def _enrichment_sku_choice(live_skus: List[Mapping[str, Any]], product_key: str) -> Dict[str, Any]:
+def _enrichment_sku_choice(
+    live_skus: List[Mapping[str, Any]], product_key: str, variant_sku_count: int,
+) -> Dict[str, Any]:
     """The sku an enrichment row's cart link buys when the caller named none, or a refusal.
 
-    `live_skus` is `_CART_ENRICHMENT_LIVE_SKUS_SQL`'s rows (at most three). The placeholder is
-    recognised by its KEY, `<product_key>::canonical`, as the verifier recognises it -- never by
-    `_is_placeholder_sku`, which compares `source_variant_id` to the product key and so misreads
-    every enrichment key longer than 128 characters (the id is truncated there).
-      * two or more real skus  -> `row_variant_ambiguous`: never pick one;
-      * exactly one real sku   -> it (the verifier then proves its own variant);
-      * none                   -> the placeholder (the verifier gates it on the catalog's
-                                  variant count and the storefront's one variant);
-      * nothing live at all    -> `row_not_found`.
+    `live_skus` is `_CART_ENRICHMENT_LIVE_SKUS_SQL`'s rows (at most three); `variant_sku_count` is
+    `_CART_ENRICHMENT_VARIANT_SKU_COUNT_SQL`'s: EVERY `::v:` sku, SUPPRESSED ONES INCLUDED. The
+    placeholder is recognised by its KEY, `<product_key>::canonical`, as the verifier recognises it
+    -- never by `_is_placeholder_sku`, which compares `source_variant_id` to the product key and so
+    misreads every enrichment key longer than 128 characters (the id is truncated there).
+      * the catalog knows two or more variants (suppressed ones count) -> `row_variant_ambiguous`.
+        A LIVE-only rule (review of #2465, P1) bought NC10 of a 3-shade MAC line whose other two
+        shades were suppressed, and the 8 oz of a two-size bluemercury wash whose 16.9 oz was;
+      * two or more live real skus  -> `row_variant_ambiguous`: never pick one;
+      * exactly one real sku        -> it (the verifier then proves its own variant, and the
+                                       caller also requires its SOLE-variant mode);
+      * none                        -> the placeholder (the verifier gates it on the catalog's
+                                       variant count and the storefront's one variant);
+      * nothing live at all         -> `row_not_found`.
     """
+    if variant_sku_count > 1:
+        raise svc.PurchaseRefused("row_variant_ambiguous", "the catalog knows two or more variants")
     placeholder_key = product_key + ENRICHMENT_PLACEHOLDER_SUFFIX
     real = [dict(row) for row in live_skus if row.get("sku_key") != placeholder_key]
     if len(real) > 1:
@@ -1593,7 +1612,12 @@ def _enrichment_variant_title(sku: Mapping[str, Any]) -> Optional[str]:
     """DISPLAY ONLY: a variant title the sku's payload carries, else None. The proof table has no
     title column and the enrichment writer puts none in `sku_payload` today, so this is None on
     every live row; it is read so the day either source carries one, the purchase says it.
-    Merchant-typed text, so it passes THE cart-link title rule (`clean_variant_title`, #2462)."""
+    Merchant-typed text, so it passes THE cart-link title rule (`clean_variant_title`, #2462).
+
+    TODO(option 2 PR B, #2464): once `enrichment_cart_variant_proofs` carries the storefront's own
+    `variant_title` column, prefer the PROOF's title (the live storefront's words, as the mirror
+    lane does) and select it in `db.enrichment_cart_variant_proofs._SELECT_PROOF_SQL`; this PR
+    does not add the column."""
     payload = sku.get("sku_payload")
     if isinstance(payload, str):
         try:
@@ -1613,6 +1637,8 @@ async def _load_enrichment_cart_link_item(
     source_system is the enrichment lane's. See the note above `_CART_ENRICHMENT_PRODUCT_SQL`.
     """
     product_key = str(product.get("product_key") or "")
+    if _LEGACY_COLLAPSED_ENRICHMENT_KEY.fullmatch(product_key):
+        raise svc.PurchaseRefused("row_not_found", "a legacy collapsed key names no one product")
     # THE STOREFRONT. The POSTed host must be this row's store: the canonical_url's host AND its
     # source_domain, each after one `www.` fold. Anything else is not this product "under this
     # domain" -- the same `row_not_found` the lane answers for a key on another domain.
@@ -1632,6 +1658,15 @@ async def _load_enrichment_cart_link_item(
     if derive_enrichment_seller(product) != merchant_id or (seller_ref and seller_ref != merchant_id):
         raise svc.PurchaseRefused("seller_identity_unverified", "enrichment seller does not re-derive")
 
+    # THE CATALOG'S VARIANT COUNT, suppressed skus included: the no-key rule and the verifier's
+    # placeholder gate both read it, so it is read before any sku is chosen or proof is read.
+    variant_prefix = product_key + ENRICHMENT_VARIANT_INFIX
+    variant_sku_count = int(await database.fetch_val(
+        _CART_ENRICHMENT_VARIANT_SKU_COUNT_SQL,
+        {"product_key": product_key, "variant_prefix": variant_prefix,
+         "variant_prefix_len": len(variant_prefix)},
+    ) or 0)
+
     # THE SKU.
     if variant_key:
         raw_sku = await database.fetch_one(
@@ -1646,13 +1681,8 @@ async def _load_enrichment_cart_link_item(
                 _CART_ENRICHMENT_LIVE_SKUS_SQL, {"product_key": product_key}
             )],
             product_key,
+            variant_sku_count,
         )
-    variant_prefix = product_key + ENRICHMENT_VARIANT_INFIX
-    variant_sku_count = int(await database.fetch_val(
-        _CART_ENRICHMENT_VARIANT_SKU_COUNT_SQL,
-        {"product_key": product_key, "variant_prefix": variant_prefix,
-         "variant_prefix_len": len(variant_prefix)},
-    ) or 0)
 
     # THE VARIANT: only what the verifier returns from the storefront proof for exactly this sku.
     proof = await enrichment_proofs.fetch_proof(product_key, str(sku.get("sku_key") or ""))
@@ -1661,6 +1691,13 @@ async def _load_enrichment_cart_link_item(
     )
     if not proven:
         raise svc.PurchaseRefused("row_variant_unverified", f"enrichment proof refused: {reason}")
+    # NOBODY NAMED A VARIANT, SO THE STOREFRONT MUST HAVE ONLY ONE (review of #2465, P1). The
+    # verifier also accepts a NAMED-variant proof (the handle has several variants and this sku's
+    # id is one of them) -- right when the caller named the sku, a silent pick when nobody did: the
+    # catalog holding one of a storefront's two sizes is not a buyer choosing that size. (The
+    # catalog-side count is enforced before the choice, in `_enrichment_sku_choice`.)
+    if not variant_key and reason != ENRICHMENT_SOLE_VARIANT:
+        raise svc.PurchaseRefused("row_variant_ambiguous", "the storefront has several variants")
 
     # THE PRICE: the listing's own offers on this sku, equal to the proof's live price, in the
     # buyer market's currency -- decided here, BEFORE any click or purchase row exists.
@@ -1682,6 +1719,8 @@ async def _load_enrichment_cart_link_item(
     return (
         {"shop_domain": merchant_host, "our_price_minor": int(price_minor),
          "currency": market_currency, "market_country": market_country,
+         # TODO(#2467): once `services.text_normalization.clean_product_name` is on main, use it
+         # here as the mirror/Shopify cart-link path does; this is the raw title until then.
          "product_name": str(product.get("product_title") or "").strip() or None,
          "product_key": product_key,
          "variant_title": _enrichment_variant_title(sku)},

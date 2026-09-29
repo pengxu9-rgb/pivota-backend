@@ -475,24 +475,31 @@ async def seed_tarte(*, host: str = TARTE_HOST, domain: str = TARTE_HOST, url: s
     return {"sku": sku, "placeholder": placeholder}
 
 
-async def seed_mac_folded(*, live_variant_count: int = 1) -> None:
+#: Per-shade prices (major, minor) -- DIFFERENT on purpose, so a shade is priced from its own
+#: offer and its own proof and never a neighbour's.
+MAC_SHADE_PRICES = (("39.00", 3900), ("41.00", 4100), ("43.00", 4300))
+
+
+async def seed_mac_folded(*, live_variant_count: int = 1, suppressed_shades: int = 0) -> None:
     """MAC Studio Fix Fluid, FOLDED: each shade is its own Shopify product (sku_payload.source_handle),
-    the canonical_url is the parent handle, every offer's source_ref is the parent page."""
+    the canonical_url is the parent handle, every offer's source_ref is the parent page. Each shade
+    has its own price and its own proof. The LAST `suppressed_shades` shades are suppressed."""
     await seed_product(pk=MAC_PK, merchant=MAC_MERCHANT, brand="MAC Cosmetics", domain=MAC_HOST,
                        url=MAC_URL, title="Studio Fix Fluid SPF 15 24HR Matte Foundation")
     await seed_sku(pk=MAC_PK, sku_key=f"{MAC_PK}::canonical", merchant=MAC_MERCHANT, svid=MAC_PK,
                    title="Studio Fix Fluid SPF 15 24HR Matte Foundation")
     for n, (vid, handle) in enumerate(MAC_SHADES):
         sku_key = f"{MAC_PK}::v:{vid}"
+        price, minor = MAC_SHADE_PRICES[n]
         await seed_sku(pk=MAC_PK, sku_key=sku_key, merchant=MAC_MERCHANT, svid=vid,
-                       title=handle.rsplit("-", 1)[-1].upper(), source_handle=handle)
+                       title=handle.rsplit("-", 1)[-1].upper(), source_handle=handle,
+                       suppressed="both" if n >= len(MAC_SHADES) - suppressed_shades else None)
         await seed_offer(oid=f"off_mac_{n}", pk=MAC_PK, sku_key=sku_key, merchant=MAC_OFFER_MERCHANT,
-                         price="39.00", source_ref=MAC_URL)
+                         price=price, source_ref=MAC_URL)
+        await seed_proof(pk=MAC_PK, sku_key=sku_key, shop_host=MAC_HOST, handle=handle,
+                         variant_id=vid, price_minor=minor, live_variant_count=live_variant_count)
     await seed_offer(oid="off_mac_c", pk=MAC_PK, sku_key=f"{MAC_PK}::canonical",
                      merchant=MAC_OFFER_MERCHANT, price="39.00", source_ref=MAC_URL)
-    vid, handle = MAC_SHADES[0]
-    await seed_proof(pk=MAC_PK, sku_key=f"{MAC_PK}::v:{vid}", shop_host=MAC_HOST, handle=handle,
-                     variant_id=vid, price_minor=3900, live_variant_count=live_variant_count)
     await seed_tierb(MAC_HOST)
 
 
@@ -535,8 +542,12 @@ async def seed_bluemercury() -> None:
     await seed_tierb(BM_HOST)
 
 
-async def seed_bluemercury_two_sizes() -> None:
-    """bluemercury Facial Fuel: TWO real skus (16.9 oz, 8 oz), each priced, a named proof each."""
+async def seed_bluemercury_two_sizes(*, suppress_first: bool = False,
+                                     catalog_has_first: bool = True) -> None:
+    """bluemercury Facial Fuel: TWO real skus (16.9 oz, 8 oz), each priced, a named proof each
+    (the storefront handle has both: live_variant_count 2). `suppress_first` suppresses the 16.9 oz
+    sku; `catalog_has_first=False` leaves it out of the catalog entirely (the catalog knows one of
+    the storefront's two sizes)."""
     await seed_product(pk=BM2_PK, merchant=BM_MERCHANT, brand="Kiehl's Since 1851", domain=BM_HOST,
                        url=BM2_URL, title="Facial Fuel Energizing Face Wash")
     await seed_sku(pk=BM2_PK, sku_key=f"{BM2_PK}::canonical", merchant=BM_MERCHANT, svid=BM2_PK,
@@ -544,7 +555,10 @@ async def seed_bluemercury_two_sizes() -> None:
     await seed_offer(oid="off_bm2_c", pk=BM2_PK, sku_key=f"{BM2_PK}::canonical",
                      merchant=BM_OFFER_MERCHANT, price="28.00", source_ref=BM2_URL)
     for n, (sku_key, vid, title, price) in enumerate(BM2_SKUS):
-        await seed_sku(pk=BM2_PK, sku_key=sku_key, merchant=BM_MERCHANT, svid=vid, title=title)
+        if n == 0 and not catalog_has_first:
+            continue
+        await seed_sku(pk=BM2_PK, sku_key=sku_key, merchant=BM_MERCHANT, svid=vid, title=title,
+                       suppressed="both" if n == 0 and suppress_first else None)
         await seed_offer(oid=f"off_bm2_{n}", pk=BM2_PK, sku_key=sku_key, merchant=BM_OFFER_MERCHANT,
                          price=price, source_ref=BM2_URL)
         await seed_proof(pk=BM2_PK, sku_key=sku_key, shop_host=BM_HOST, handle=BM2_HANDLE,
@@ -797,16 +811,182 @@ async def test_mac_folded_shades_with_no_variant_key_are_ambiguous(client):
 async def test_a_mac_placeholder_never_buys_the_parent_stub_when_shade_skus_were_suppressed(
     client, mode,
 ):
-    """THE #2460 CARRY-OVER: every `::v:` sku suppressed, so a LIVE-only count is 0 and the
+    """THE #2460 CARRY-OVER: the `::v:` sku suppressed, so a LIVE-only count is 0 and the
     placeholder would buy the parent handle's "Default Title" stub at the first shade's price. The
-    count includes suppressed skus, and the verifier refuses."""
-    await seed_mac_stub(suppressed_variant_skus=2, mode=mode)
+    count includes suppressed skus, and the verifier refuses. (ONE suppressed sku, so the no-key
+    count rule -- two or more -- is not what refuses here; the verifier's placeholder gate is.)"""
+    await seed_mac_stub(suppressed_variant_skus=1, mode=mode)
     resp = await client.post(f"{BASE}/purchases", json=body(host=MAC_HOST, product_key=MAC_STUB_PK))
     await assert_refused(resp, "row_variant_unverified")
     # ...and the caller naming the placeholder does not get round it.
     resp = await client.post(f"{BASE}/purchases", json=body(
         host=MAC_HOST, product_key=MAC_STUB_PK, variant_key=f"{MAC_STUB_PK}::canonical"))
     await assert_refused(resp, "row_variant_unverified")
+
+
+# ── NO variant_key ON A MULTI-VARIANT PRODUCT (review of #2465, P1) ──────────────────────────
+#
+# The gateway sends no variant_key, and each of these rows LOOKS single-variant to it. Before the
+# fix every one opened a purchase for one variant nobody picked.
+
+
+async def test_a1_mac_shades_two_of_three_suppressed_no_key_is_ambiguous(client, monkeypatch):
+    """A1: 3 folded shades, 2 suppressed. The live-only choice saw ONE real sku (NC10), whose own
+    proof is SOLE (the shade's handle has one variant) -- the verifier cannot catch it. The count
+    of every `::v:` sku does, and it refuses before any proof is read."""
+    await seed_mac_folded(suppressed_shades=2)
+    seen = spy_statements(monkeypatch)
+    resp = await client.post(f"{BASE}/purchases", json=body(host=MAC_HOST, product_key=MAC_PK))
+    await assert_refused(resp, "row_variant_ambiguous")
+    assert proofs._SELECT_PROOF_SQL not in seen
+
+
+async def test_a2_two_sizes_one_suppressed_no_key_is_ambiguous(client):
+    """A2: bluemercury Facial Fuel with the 16.9 oz sku suppressed: not "the 8 oz product"."""
+    await seed_bluemercury_two_sizes(suppress_first=True)
+    resp = await client.post(f"{BASE}/purchases", json=body(host=BM_HOST, product_key=BM2_PK))
+    await assert_refused(resp, "row_variant_ambiguous")
+
+
+async def test_a3_catalog_knows_one_of_two_storefront_sizes_no_key_is_ambiguous(client):
+    """A3: the catalog has ONE `::v:` sku, but the storefront handle has two (proof
+    live_variant_count 2, the verifier's named_variant mode). Nobody named it: refused."""
+    await seed_bluemercury_two_sizes(catalog_has_first=False)
+    resp = await client.post(f"{BASE}/purchases", json=body(host=BM_HOST, product_key=BM2_PK))
+    await assert_refused(resp, "row_variant_ambiguous")
+
+
+async def test_a3_the_same_sku_named_by_the_caller_is_bought(client):
+    """The control for A3: the caller NAMES the one catalog size -> the named proof buys it."""
+    await seed_bluemercury_two_sizes(catalog_has_first=False)
+    sku_key, vid, _title, _price = BM2_SKUS[1]
+    resp = await client.post(f"{BASE}/purchases", json=body(
+        host=BM_HOST, product_key=BM2_PK, variant_key=sku_key))
+    assert resp.status_code == 202, resp.text
+    purchase = await purchase_of(resp)
+    assert purchase["cart_url"] == cart_url_for(BM_HOST, vid, purchase["click_id"])
+    assert purchase["our_price_minor"] == 2800
+
+
+async def test_two_suppressed_variant_skus_behind_a_placeholder_are_ambiguous(client):
+    """The MAC stub with TWO suppressed `::v:` skus: the catalog knows two variants -> the no-key
+    rule refuses before the placeholder is even tried."""
+    await seed_mac_stub(suppressed_variant_skus=2)
+    resp = await client.post(f"{BASE}/purchases", json=body(host=MAC_HOST, product_key=MAC_STUB_PK))
+    await assert_refused(resp, "row_variant_ambiguous")
+
+
+@pytest.mark.parametrize("mode", ["at", "reason"])
+async def test_a_suppressed_variant_sku_is_never_the_no_key_choice(client, mode):
+    """ONE `::v:` sku, suppressed (by either column alone), with a valid proof and offer of its
+    own: the no-key choice reads LIVE skus, so the placeholder is chosen and the verifier refuses
+    it (the catalog knows a variant). The suppressed sku is never bought."""
+    await seed_mac_stub(suppressed_variant_skus=1, mode=mode)
+    vid = f"5405737{0:07d}"
+    sku_key = f"{MAC_STUB_PK}::v:{vid}"
+    await seed_offer(oid="off_mac_stub_v", pk=MAC_STUB_PK, sku_key=sku_key,
+                     merchant=MAC_OFFER_MERCHANT, price="26.00", source_ref=MAC_STUB_URL)
+    await seed_proof(pk=MAC_STUB_PK, sku_key=sku_key, shop_host=MAC_HOST,
+                     handle=f"{MAC_STUB_PARENT}-0", variant_id=vid, price_minor=2600)
+    resp = await client.post(f"{BASE}/purchases", json=body(host=MAC_HOST, product_key=MAC_STUB_PK))
+    await assert_refused(resp, "row_variant_unverified")
+
+
+async def test_a_second_live_sku_of_another_spelling_is_ambiguous(client):
+    """The live-sku read is LIMIT 3 because the choice needs to see a SECOND real sku even behind
+    the placeholder: placeholder + a non-`::v:` spelling + the one `::v:` sku is two real skus."""
+    await seed_tarte()
+    await seed_sku(pk=TARTE_PK, sku_key=f"{TARTE_PK}::sku_crawl01", merchant=TARTE_MERCHANT,
+                   svid=f"ext_x:{TARTE_VARIANT}", title="Default Title")
+    resp = await client.post(f"{BASE}/purchases", json=body(host=TARTE_HOST, product_key=TARTE_PK))
+    await assert_refused(resp, "row_variant_ambiguous")
+
+
+@pytest.mark.parametrize("shade", [0, 1, 2])
+async def test_each_named_mac_shade_is_priced_from_its_own_offer_and_proof(client, shade):
+    """Shade-price isolation: 39.00 / 41.00 / 43.00. The named shade's own offer and own proof,
+    never a neighbour's (a shade priced from the placeholder or another shade would read 39.00)."""
+    await seed_mac_folded()
+    vid, _handle = MAC_SHADES[shade]
+    resp = await client.post(f"{BASE}/purchases", json=body(
+        host=MAC_HOST, product_key=MAC_PK, variant_key=f"{MAC_PK}::v:{vid}"))
+    assert resp.status_code == 202, resp.text
+    purchase = await purchase_of(resp)
+    assert purchase["cart_url"] == cart_url_for(MAC_HOST, vid, purchase["click_id"])
+    assert purchase["our_price_minor"] == MAC_SHADE_PRICES[shade][1]
+
+
+async def test_a_legacy_collapsed_8_hex_key_is_refused_before_anything_is_read(client, monkeypatch):
+    """`ext:unknown::<8 hex>` was shared by many products: refused (defence in depth beside the
+    gateway), before the seller, sku, count, proof or offer reads."""
+    legacy = "ext:unknown::0123abcd"
+    await seed_tarte(pk=legacy)
+    seen = spy_statements(monkeypatch)
+    resp = await client.post(f"{BASE}/purchases", json=body(host=TARTE_HOST, product_key=legacy))
+    await assert_refused(resp, "row_not_found")
+    assert [sql for sql in seen if sql in _ENRICHMENT_SQL] == [routes_reap._CART_ENRICHMENT_PRODUCT_SQL]
+
+
+@pytest.mark.parametrize("pk", ["ext:unknown::0123456789abcdef", "ext:unknown::0123abcd0",
+                                "ext:unknown::0123ABCD"])
+async def test_keys_that_are_not_the_legacy_8_hex_shape_are_not_refused_by_that_rule(client, pk):
+    """The distinct 16-hex successor (pivota-backend#2461) and near-misses are ordinary keys."""
+    await seed_tarte(pk=pk)
+    resp = await client.post(f"{BASE}/purchases", json=body(host=TARTE_HOST, product_key=pk))
+    assert resp.status_code == 202, resp.text
+
+
+def test_the_legacy_collapsed_key_shape():
+    rule = routes_reap._LEGACY_COLLAPSED_ENRICHMENT_KEY.fullmatch
+    assert rule("ext:unknown::0123abcd")
+    for key in ("ext:unknown::0123456789abcdef", "ext:unknown::0123abcd0", "ext:unknown::0123abc",
+                "ext:unknown::0123ABCD", "ext:unknownx::0123abcd", "xext:unknown::0123abcd",
+                TARTE_PK):
+        assert not rule(key), key
+
+
+# ── the storefront-proof table's self-heal, on the request path (review of #2465, F3) ────────
+
+
+async def test_a_failed_proof_table_create_is_not_retried_on_every_request(client, monkeypatch):
+    """A role that cannot CREATE: the first request tries the DDL once and refuses; requests in
+    the next `FETCH_DDL_RETRY_SECONDS` refuse WITHOUT re-running it; after the window it is tried
+    once more."""
+    await seed_tarte(proof=False)
+    await _drop_proofs()
+    calls = []
+
+    async def _failing_ddl(*args, **kwargs):
+        calls.append(1)
+        return False
+
+    real_ddl = proofs.apply_ddl_statements
+    monkeypatch.setattr(proofs, "apply_ddl_statements", _failing_ddl)
+    clock = [1000.0]
+    monkeypatch.setattr(proofs.time, "monotonic", lambda: clock[0])
+    for _ in range(3):
+        resp = await client.post(f"{BASE}/purchases", json=body(host=TARTE_HOST, product_key=TARTE_PK))
+        await assert_refused(resp, "row_variant_unverified")
+    assert len(calls) == 1
+    clock[0] += proofs.FETCH_DDL_RETRY_SECONDS - 1
+    assert await proofs.fetch_proof(TARTE_PK, TARTE_SKU) is None and len(calls) == 1
+    clock[0] += 2
+    assert await proofs.fetch_proof(TARTE_PK, TARTE_SKU) is None and len(calls) == 2
+    # The DDL works again: the next call past the window creates the table and reads normally.
+    monkeypatch.setattr(proofs, "apply_ddl_statements", real_ddl)
+    clock[0] += proofs.FETCH_DDL_RETRY_SECONDS + 1
+    assert await proofs.fetch_proof(TARTE_PK, TARTE_SKU) is None
+    assert await proofs_table_exists() and proofs._FETCH_DDL_FAILED_AT is None
+
+
+async def test_a_successful_create_clears_the_remembered_failure(monkeypatch):
+    await _drop_proofs()
+    clock = [5000.0]
+    monkeypatch.setattr(proofs.time, "monotonic", lambda: clock[0])
+    proofs._FETCH_DDL_FAILED_AT = clock[0] - proofs.FETCH_DDL_RETRY_SECONDS - 1  # window over
+    assert await proofs.fetch_proof(TARTE_PK, TARTE_SKU) is None
+    assert proofs._FETCH_DDL_FAILED_AT is None
+    assert await proofs_table_exists()
 
 
 @pytest.mark.parametrize("posted", [
@@ -1016,19 +1196,27 @@ def test_the_enrichment_sku_choice_rule():
     ph = {"sku_key": f"{pk}::canonical", "source_variant_id": pk}
     a = {"sku_key": f"{pk}::v:1", "source_variant_id": "1"}
     b = {"sku_key": f"{pk}::v:2", "source_variant_id": "2"}
-    assert choose([ph, a], pk) == a
-    assert choose([a], pk) == a
-    assert choose([ph], pk) == ph
-    for rows in ([ph, a, b], [a, b]):
+    assert choose([ph, a], pk, 1) == a
+    assert choose([a], pk, 1) == a
+    assert choose([ph], pk, 0) == ph
+    assert choose([ph], pk, 1) == ph   # one suppressed `::v:`: the VERIFIER's placeholder gate refuses
+    # two live real skus -> ambiguous, whatever the count says (a non-`::v:` spelling is real too)
+    for rows, count in (([ph, a, b], 2), ([a, b], 2), ([a, b], 1), ([a, b], 0)):
         with pytest.raises(svc.PurchaseRefused) as caught:
-            choose(rows, pk)
+            choose(rows, pk, count)
+        assert caught.value.reason == "row_variant_ambiguous"
+    # the catalog knows two or more variants (suppressed ones count) -> ambiguous, even with ONE
+    # live real sku, or none (review of #2465, P1)
+    for rows in ([ph, a], [a], [ph]):
+        with pytest.raises(svc.PurchaseRefused) as caught:
+            choose(rows, pk, 2)
         assert caught.value.reason == "row_variant_ambiguous"
     with pytest.raises(svc.PurchaseRefused) as caught:
-        choose([], pk)
+        choose([], pk, 0)
     assert caught.value.reason == "row_not_found"
     # a placeholder spelled for ANOTHER product is a real sku here, never this product's placeholder
     other = {"sku_key": f"{BM_PK}::canonical", "source_variant_id": BM_PK}
-    assert choose([other], pk) == other
+    assert choose([other], pk, 0) == other
 
 
 # ── FLAG OFF: byte-identical to main ─────────────────────────────────────────────────────────

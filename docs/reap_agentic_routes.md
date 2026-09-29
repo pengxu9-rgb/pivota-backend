@@ -175,13 +175,22 @@ dial remains that. With it on, such a row is bought only when all of these hold:
   re-derive from it (`ext:retailer:` → the retailer's domain; otherwise brand + host), and a
   non-null `seller_ref` agrees. The offer's `agent_seed::…` owner and a seed's seller are never
   the seller. Else `seller_identity_unverified`.
-* **Sku.** A `variant_key` must be one of the product's live skus (`row_not_found`). Without one:
-  exactly one real (`::v:`) sku is used; **two or more is `row_variant_ambiguous`** (the lane
-  never picks); none, and the `<product_key>::canonical` placeholder is used, which the proof
-  step accepts only when the product has **no** `::v:` sku at all, suppressed ones included, and
-  the storefront handle has exactly one variant.
+* **Key.** The legacy collapsed key `ext:unknown::<8 hex>` (shared by many products) is
+  `row_not_found`; the distinct `ext:unknown::<16 hex>` keys are ordinary keys.
+* **Sku.** A `variant_key` must be one of the product's live skus (`row_not_found`). Without one,
+  the product must be single-variant **in the catalog and on the storefront**, else
+  **`row_variant_ambiguous`** (the lane never picks a variant nobody named):
+  * the catalog may know at most ONE `::v:` sku, **suppressed ones counted** (a 3-shade line with
+    two shades suppressed, or a two-size product with one size suppressed, is not single-variant);
+  * that one sku is used if it is live, and its storefront proof must then be **sole-variant**
+    (the handle has exactly one variant); a catalog holding one of a storefront's two sizes is
+    refused;
+  * with no live real sku, the `<product_key>::canonical` placeholder is used, which the proof
+    step accepts only when the product has **no** `::v:` sku at all, suppressed ones included,
+    and the storefront handle has exactly one variant.
 * **Proof.** A row in `enrichment_cart_variant_proofs` for exactly that (product, sku), written by
-  the storefront proof job, at most 72 hours old, `ok`, available, on the same store and handle,
+  the storefront proof job (the route creates the empty table on first use; if that CREATE fails,
+  it refuses for 60 s without retrying the DDL), at most 72 hours old, `ok`, available, on the same store and handle,
   naming the sku's own Shopify id (`services/reap_enrichment_cart_proof.verify_enrichment_cart_proof`).
   The variant in the cart URL is the one this proof names and nothing else. Any refusal is
   `row_variant_unverified`.
@@ -255,7 +264,7 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 | 409 | `row_price_ambiguous` | cart-link lane, no `variant_key`: the catalog spells the ONE chosen Shopify variant with several skus, and this merchant's usable offers on them carry different prices | fall back, or name the sku (`variant_key`) to buy at that sku's price |
 | 409 | `row_currency_mismatch` | the offer is priced in a currency the buyer's market does not use (variant lane, and the cart-link lane's enrichment rows; the cart-link lane otherwise reads only offers in the market's currency and answers `row_unpriced` instead) | fall back |
 | 409 | `row_price_stale` | cart-link lane, **enrichment rows only** (dark flag): the catalog offer's price differs from the price the storefront proof read live | fall back |
-| 409 | `row_variant_ambiguous` | cart-link lane, **enrichment rows only** (dark flag): no `variant_key`, and the product has two or more real skus | fall back, or name the sku (`variant_key`) |
+| 409 | `row_variant_ambiguous` | cart-link lane, **enrichment rows only** (dark flag): no `variant_key`, and the product is not single-variant: two or more `::v:` skus in the catalog (suppressed ones counted), or a storefront handle with several variants | fall back, or name the sku (`variant_key`) |
 | 409 | `idempotency_conflict` | this key was already used for a **different** request | use a new key, or re-send the original request |
 | 400 | `consent_required` | `buyer.consent_version` is **absent, blank, longer than 32 characters, or carries an unprintable character** — i.e. a string-shaped value that is not usable | show your user the terms, then resend with the tag |
 | 400 | `invalid_request` | `buyer.consent_version` is **present but not a string** (`123`, `true`, `{}`, `[]`, `1.5`) — a type error is a malformed body, not a missing act by a human, and the two codes tell you to do different things | fix the request |
