@@ -243,3 +243,41 @@ async def test_withdraw_requires_a_product_key(monkeypatch):
     _patch(monkeypatch, db)
     rc = await withdraw._run(argparse.Namespace(product_key=None, reason="x", apply=True, revert=False))
     assert rc == 2 and not db.executed
+
+
+
+async def test_revert_never_revives_a_row_whose_url_a_live_retailer_listing_now_owns(monkeypatch):
+    """Review of #2448: the apply admits a new ext:retailer: listing onto a URL whose legacy chain is retired. A
+    revert of that chain would put two live listings on one URL, so the row is skipped, with the owner named."""
+    url = "https://cocomo.sg/products/kopher-curepair-sun"
+
+    class DB(_FakeDB):
+        async def fetch_all(self, query, values=None):
+            q = " ".join(str(query).split())
+            if "product_key LIKE 'ext:retailer:%'" in q:
+                assert values == {"host": "cocomo.sg"}
+                return [{"product_key": "ext:retailer:new", "canonical_url": url + "?variant=1"}]
+            return await super().fetch_all(query, values)
+    db = DB()
+    _patch(monkeypatch, db)
+    refiled = {**_ours(), "product_key": "ext:kopher-curepair::1", "canonical_url": "https://www.cocomo.sg/products/kopher-curepair-sun/"}
+    other = {**_ours(), "product_key": "ext:other::2", "canonical_url": "https://cocomo.sg/products/something-else"}
+    await withdraw._revert([refiled, other])
+    reverted = {v["pk"] for _q, v in db.touching("SET suppressed_at = NULL")}
+    assert reverted == {"ext:other::2"}
+
+
+async def test_revert_is_not_blocked_by_the_rows_own_live_listing(monkeypatch):
+    """A retailer listing we withdrew whose product row a partial revert already made live finds ITSELF as the URL's
+    live listing -- its skus/offers/seeds must still come back."""
+    url = "https://cocomo.sg/products/kopher-curepair-sun"
+
+    class DB(_FakeDB):
+        async def fetch_all(self, query, values=None):
+            if "product_key LIKE 'ext:retailer:%'" in " ".join(str(query).split()):
+                return [{"product_key": "ext:retailer:self", "canonical_url": url}]
+            return await super().fetch_all(query, values)
+    db = DB()
+    _patch(monkeypatch, db)
+    await withdraw._revert([{**_ours(), "product_key": "ext:retailer:self", "canonical_url": url}])
+    assert {v["pk"] for _q, v in db.touching("SET suppressed_at = NULL")} == {"ext:retailer:self"}

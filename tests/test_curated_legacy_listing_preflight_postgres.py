@@ -65,13 +65,14 @@ def _plan():
     return ing.ingest_validated_jsonl([record])
 
 
-async def _insert(admin, key, url, *, suppressed=False):
+async def _insert(admin, key, url, *, suppressed=False, source_ref=None):
+    # source_product_id is NOT the product key on real rows (it is the store's product id): nothing may join on it.
     await admin.execute(
         """INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title,
-                                         canonical_url, source_domain, suppressed_at, suppression_reason)
-           VALUES ($1, 'm_legacy', 'external_seed', $1, 'Legacy', $2, NULL, $3, $4)""",
+                                         canonical_url, source_domain, suppressed_at, suppression_reason, source_ref)
+           VALUES ($1, 'm_legacy', 'external_seed', 'shopify:9000001', 'Legacy', $2, NULL, $3, $4, $5)""",
         key, url, datetime(2026, 9, 1, tzinfo=timezone.utc) if suppressed else None,
-        "stale" if suppressed else None,
+        "stale" if suppressed else None, source_ref,
     )
 
 
@@ -112,9 +113,12 @@ async def test_real_sql_finds_live_and_suppressed_owners_and_writes_nothing(cata
     assert await _snapshot(admin) == before
 
 
-async def _seed(admin, key, status):
+async def _seed(admin, key, status, *, attached=True):
+    """attached=False: the seed that CREATED the row (catalog_products.source_ref) but was never attached to it."""
+    seed_id = f"seed:{key}:{status}"
     await admin.execute("INSERT INTO external_product_seeds (id, attached_product_key, status) VALUES ($1, $2, $3)",
-                        f"seed:{key}:{status}", key, status)
+                        seed_id, key if attached else None, status)
+    return seed_id
 
 
 async def _offer(admin, key, *, suppressed):
@@ -124,16 +128,18 @@ async def _offer(admin, key, *, suppressed):
         f"offer:{key}:{suppressed}", key, datetime(2026, 9, 1, tzinfo=timezone.utc) if suppressed else None)
 
 
-@pytest.mark.parametrize("live_link", ["active_seed", "live_offer"])
+@pytest.mark.parametrize("live_link", ["active_seed", "ACTIVE_seed", "source_ref_seed", "live_offer"])
 async def test_real_sql_a_suppressed_owner_with_any_live_link_still_refuses(catalog, live_link):
-    """Suppressing the product row is not retiring its chain: an active seed or a live offer on it still refuses."""
+    """Suppressing the product row is not retiring its chain: an active seed (attached, or the row's own
+    source_ref seed; status in any case) or a live offer on it still refuses."""
     from services.catalog_enrichment_agent import apply as writer
 
     database, admin = catalog
     plan = _plan()
+    status = {"active_seed": "active", "ACTIVE_seed": "ACTIVE", "source_ref_seed": "active"}.get(live_link, "inactive")
+    seed_id = await _seed(admin, LEGACY_SUPPRESSED, status, attached=live_link != "source_ref_seed")
     await _insert(admin, LEGACY_SUPPRESSED, "https://ohlolly.com/products/haruharu-wonder-serum-mist",
-                  suppressed=True)
-    await _seed(admin, LEGACY_SUPPRESSED, "active" if live_link == "active_seed" else "inactive")
+                  suppressed=True, source_ref=seed_id)
     await _offer(admin, LEGACY_SUPPRESSED, suppressed=live_link != "live_offer")
     with pytest.raises(ValueError, match=f"retailer_listing_migration_required: existing product {LEGACY_SUPPRESSED}"):
         await writer._refuse_parallel_retailer_listings(plan, database)
@@ -203,3 +209,18 @@ async def test_real_sql_a_live_owner_with_a_leftover_reason_is_not_retired(catal
                         LEGACY_LIVE)
     with pytest.raises(ValueError, match=f"retailer_listing_migration_required: existing product {LEGACY_LIVE}"):
         await writer._refuse_parallel_retailer_listings(plan, database)
+
+
+async def test_real_sql_live_retailer_listing_owner_matches_the_url_not_the_host(catalog):
+    """withdraw_catalog_rows --revert asks it before reviving a retired chain (review of #2448)."""
+    from services.catalog_enrichment_agent import apply as writer
+
+    database, admin = catalog
+    url = "https://ohlolly.com/products/haruharu-wonder-serum-mist"
+    await _insert(admin, "ext:retailer:live", url + "?variant=45000000000001")
+    await _insert(admin, "ext:retailer:gone", "https://www.ohlolly.com/products/other", suppressed=True)
+    await _insert(admin, "ext:retailer:other", "https://ohlolly.com/products/other-thing")
+    assert await writer.live_retailer_listing_owner(database, "https://www.ohlolly.com" + url[19:] + "/") \
+        == "ext:retailer:live"
+    assert await writer.live_retailer_listing_owner(database, "https://ohlolly.com/products/other") is None
+    assert await writer.live_retailer_listing_owner(database, None) is None

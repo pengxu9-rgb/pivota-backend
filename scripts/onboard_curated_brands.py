@@ -410,7 +410,8 @@ async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[s
     (--check-legacy-listings): when not requested, the report says `unchecked` rather than going
     silent, because a silent dry run is how Wave 1 read `ready_to_apply` for a cohort (haruharu
     wonder at ohlolly.com) that the apply then refused. Suppressed owners are listed and COUNTED as
-    conflicts, because the apply refuses on them too.
+    conflicts, because the apply refuses on them too -- except an owner whose whole chain is retired
+    (apply.legacy_chain_retired), which the apply admits: counted in `retired_owner_count`, not a conflict.
     """
     listings = planned_retailer_listings(plan)
     report: Dict[str, Any] = {"planned_listings": len(listings)}

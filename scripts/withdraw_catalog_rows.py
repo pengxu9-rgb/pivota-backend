@@ -61,6 +61,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.database import database  # noqa: E402
+from services.catalog_enrichment_agent.apply import live_retailer_listing_owner  # noqa: E402
 from services.catalog_row_trust_upserter import upsert_catalog_row_trust_many  # noqa: E402
 from services.index_pipeline_state_service import recompute_serving_eligibility  # noqa: E402
 
@@ -73,7 +74,7 @@ _SUPPRESSIBLE_TABLES = ("catalog_products", "catalog_skus", "catalog_offers")
 
 _ROW_COLUMNS_SQL = """
 SELECT cp.product_key, cp.content_key, cp.title, cp.brand, cp.source_system, cp.source_domain,
-       cp.suppression_reason, cp.suppressed_at, cp.suppression_metadata,
+       cp.canonical_url, cp.suppression_reason, cp.suppressed_at, cp.suppression_metadata,
        (SELECT count(*) FROM catalog_skus s WHERE s.product_key = cp.product_key) AS skus,
        (SELECT count(*) FROM catalog_offers o WHERE o.product_key = cp.product_key) AS offers,
        (SELECT count(*) FROM external_product_seeds e
@@ -190,6 +191,12 @@ async def _revert(rows: List[Dict[str, Any]]) -> Dict[str, str]:
         meta = _meta(row)
         if meta.get("script") != SCRIPT_NAME:
             print(f"  ! {pk}: suppressed by {meta.get('script') or 'another lane'}, not reverting")
+            continue
+        # A retired chain whose URL a retailer listing was since admitted onto (apply.legacy_chain_retired):
+        # reviving it would put two live listings on one URL. Retire that listing first, then revert.
+        owner = await live_retailer_listing_owner(database, row.get("canonical_url"))
+        if owner and owner != pk:
+            print(f"  ! {pk}: its URL is now {owner}'s live retailer listing, not reverting")
             continue
         reason = str(meta.get("reason") or DEFAULT_REASON)
         seed_ids = [str(s) for s in (meta.get("deactivated_seed_ids") or [])]

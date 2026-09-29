@@ -1678,12 +1678,16 @@ async def _prepare_seller_of_record(plan: Dict[str, Any], database: Any) -> Dict
 
 #: Every row on a planned listing's host. Shared by the apply guard and the dry-run
 #: preflight (`find_legacy_retailer_listing_owners`) so that the preflight reports
-#: exactly the rows the apply will refuse on. The suppression columns are read only
-#: for disclosure: the WHERE clause deliberately does NOT exclude suppressed rows
-#: (see `_refuse_parallel_retailer_listings` for why a suppressed owner still blocks).
+#: exactly the rows the apply will refuse on. The WHERE clause deliberately does NOT exclude
+#: suppressed rows: a suppressed owner still blocks unless its WHOLE chain is retired -- the
+#: seed / offer columns feed `legacy_chain_retired` (see `_refuse_parallel_retailer_listings`).
 _LEGACY_LISTING_OWNERS_SQL = """
         SELECT cp.product_key, cp.source_domain, cp.canonical_url, cp.suppressed_at, cp.suppression_reason,
-               EXISTS (SELECT 1 FROM external_product_seeds s WHERE s.attached_product_key = cp.product_key
+               -- "this row's seed" is either link, as identity_resolution's DEACTIVATE_SEEDS_SQL reads it: the
+               -- attach back-link, OR the mirror's provenance (source_ref = seed id) -- older mirror rows were
+               -- written without the back-link, and such a seed serves while it is active (review of #2448).
+               EXISTS (SELECT 1 FROM external_product_seeds s
+                        WHERE (s.attached_product_key = cp.product_key OR s.id = cp.source_ref)
                          AND lower(coalesce(s.status, '')) = 'active') AS has_active_seed,
                EXISTS (SELECT 1 FROM catalog_offers o WHERE o.product_key = cp.product_key
                          AND o.suppressed_at IS NULL) AS has_live_offer
@@ -1694,8 +1698,8 @@ _LEGACY_LISTING_OWNERS_SQL = """
 
 
 def legacy_chain_retired(row: Dict[str, Any]) -> bool:
-    """The legacy owner's WHOLE chain is retired: the product suppressed WITH a reason, no active seed attached,
-    no live offer. A suppressed product row alone proves nothing (its seeds carry their own status, its offers
+    """The legacy owner's WHOLE chain is retired: the product suppressed WITH a reason, no active seed (attached to
+    it, or its source_ref), no live offer. A suppressed product row alone proves nothing (its seeds carry their own status, its offers
     their own suppression) -- this checks each link. Measured 2026-09-29: cocomo.sg's 421 old brand-style rows
     (suppressed 09-27, reason sg_retailer_filed_under_us_partition) had 421 inactive seeds and 491 suppressed
     offers, and still blocked the store's SG re-file on 286 URLs."""
@@ -1762,6 +1766,40 @@ async def find_legacy_retailer_listing_owners(plan: Dict[str, Any], database: An
     return findings
 
 
+_LIVE_RETAILER_LISTINGS_ON_HOST_SQL = """
+        SELECT product_key, canonical_url FROM catalog_products
+        WHERE product_key LIKE 'ext:retailer:%' AND suppressed_at IS NULL
+          AND lower(split_part(regexp_replace(canonical_url, '^https?://(www[.])?', '', 'i'), '/', 1)) = :host
+        """
+
+
+async def live_retailer_listing_owner(database: Any, canonical_url: Optional[str]) -> Optional[str]:
+    """The live `ext:retailer:` product that now owns this URL's listing, or None. A tool that REVERTS a retired
+    legacy chain asks this first: the apply admitted a new listing on that URL (legacy_chain_retired), so
+    reviving the old row would put two live listings on one URL (review of #2448)."""
+    from urllib.parse import urlsplit
+
+    from services.catalog_enrichment_agent.ingestion import retailer_listing_identity
+
+    url = str(canonical_url or "")
+    host = (urlsplit(url).hostname or "").lower()
+    host = host[4:] if host.startswith("www.") else host
+    if not host:
+        return None
+    try:
+        identity = retailer_listing_identity(host, url)
+    except ValueError:
+        return None
+    for row in await database.fetch_all(_LIVE_RETAILER_LISTINGS_ON_HOST_SQL, {"host": host}) or []:
+        row = dict(row)
+        try:
+            if retailer_listing_identity(host, row.get("canonical_url") or "") == identity:
+                return row["product_key"]
+        except ValueError:
+            continue
+    return None
+
+
 def legacy_listing_refusal(finding: Dict[str, Any]) -> str:
     """The message the apply guard raises for this finding (the dry run quotes it)."""
     if finding["kind"] == "identity_unproven":
@@ -1780,8 +1818,8 @@ async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any
 
     A SUPPRESSED legacy owner still refuses -- unless its WHOLE chain is proven retired (legacy_chain_retired:
     suppressed with a reason, no active seed, no live offer; 2026-09-29). KNOWN LIMIT: reverting such a chain
-    afterwards (withdraw_catalog_rows --revert, a suppression manifest) puts two live listings on one URL; a
-    revert of a re-filed store must retire the new listing first.
+    afterwards puts two live listings on one URL: scripts/withdraw_catalog_rows.py --revert refuses a row whose
+    URL a live listing now owns (live_retailer_listing_owner); any other revert must retire the new listing first.
     `catalog_products.suppressed_at` is reversible -- scripts/withdraw_catalog_rows.py
     --revert and services/identity_resolution.py REVERT_ROWS_SQL both clear it -- and it
     says nothing about the row's seed/sku/offer chain (external_product_seeds carries

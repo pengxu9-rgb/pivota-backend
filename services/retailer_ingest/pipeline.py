@@ -826,7 +826,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
 
     legacy = await cli._legacy_listing_report(plan, check=True)
     guard = await cli._brand_host_guard_report(plan, check=True)
-    checks["legacy_listings"] = {k: legacy.get(k) for k in ("status", "conflict_count", "planned_listings")}
+    checks["legacy_listings"] = {k: legacy.get(k) for k in ("status", "conflict_count", "planned_listings",
+                                                             "retired_owner_count")}
     checks["brand_host_guard"] = {k: guard.get(k) for k in ("status", "rows_at_risk", "planned_groups")}
     for name, report in (("legacy_listings", legacy), ("brand_host_guard", guard)):
         if report.get("status") in ("conflicts", "error"):
