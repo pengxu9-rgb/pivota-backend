@@ -1190,12 +1190,12 @@ def test_a_real_title_is_written_and_read_unchanged(title: str) -> None:
     ("07\nBURGUNDY INK", "07 BURGUNDY INK"),          # Cc whitespace -> ONE space, not glued
     ("07\tBURGUNDY  \r\n INK", "07 BURGUNDY INK"),    # a run of mixed whitespace -> one space
     ("07 BURG\x00UNDY\x7f INK\x85", "07 BURGUNDY INK"),  # Cc non-whitespace dropped; NEL folded
-    ("07 ‮BURGUNDY INK", "07 BURGUNDY INK"),     # Cf: RIGHT-TO-LEFT OVERRIDE
-    ("‪‫‬‭07 BURGUNDY INK", "07 BURGUNDY INK"),  # Cf: the other embeddings
-    ("⁦07 BURGUNDY INK⁩", "07 BURGUNDY INK"),  # Cf: bidi isolates
-    ("07 BURG​UNDY INK", "07 BURGUNDY INK"),     # Cf: ZERO WIDTH SPACE
-    ("﻿07 BURGUNDY INK", "07 BURGUNDY INK"),     # Cf: BOM / ZWNBSP
-    ("07 BURGUNDY INK", "07 BURGUNDY INK"),     # Co: private use
+    ("07 \u202eBURGUNDY INK", "07 BURGUNDY INK"),     # Cf: RIGHT-TO-LEFT OVERRIDE
+    ("\u202a\u202b\u202c\u202d07 BURGUNDY INK", "07 BURGUNDY INK"),  # Cf: the other embeddings
+    ("\u206607 BURGUNDY INK\u2069", "07 BURGUNDY INK"),  # Cf: bidi isolates
+    ("07 BURG\u200bUNDY INK", "07 BURGUNDY INK"),     # Cf: ZERO WIDTH SPACE
+    ("\ufeff07 BURGUNDY INK", "07 BURGUNDY INK"),     # Cf: BOM / ZWNBSP
+    ("07 BURGUNDY INK\ue000", "07 BURGUNDY INK"),     # Co: private use
     ("07 BURGUNDY INK\U000f0000", "07 BURGUNDY INK"),  # Co: supplementary private use
     ("07 BURGUNDY \ud83dINK", "07 BURGUNDY INK"),     # Cs: a lone surrogate (json "\\ud83d")
     ("  07 BURGUNDY INK  ", "07 BURGUNDY INK"),       # stripped
@@ -1208,9 +1208,9 @@ def test_every_unprintable_category_is_removed_at_both_ends(dirty: str, clean: s
 def test_the_title_is_nfc_normalised_after_the_drop() -> None:
     """Decomposed "e" + COMBINING ACUTE is stored composed, including when a zero-width space sat
     between them -- so the rule is idempotent, which the reader re-applying it relies on."""
-    assert clean_variant_title("Café") == "Café"
-    assert clean_variant_title("Cafe​́") == "Café"
-    for raw in ("Cafe​́", "a‮ ​ b", "X" * 199 + " Y", "\n\t"):
+    assert clean_variant_title("Cafe\u0301") == "Café"
+    assert clean_variant_title("Cafe\u200b\u0301") == "Café"
+    for raw in ("Cafe\u200b\u0301", "a\u202e \u200b b", "X" * 199 + " Y", "\n\t"):
         once = clean_variant_title(raw)
         assert clean_variant_title(once) == once
 
@@ -1224,11 +1224,14 @@ def test_a_long_title_is_capped_by_code_points_and_never_splits_an_emoji() -> No
         assert json.loads(json.dumps(got)) == got      # a whole surrogate pair on the wire
         got.encode("utf-8")                            # no lone surrogate survives the cap
     # dropped characters never spend the budget, and a cut on a space leaves no trailing space
-    assert clean_variant_title("‮" * 50 + "X" * 200) == "X" * 200
+    assert clean_variant_title("\u202e" * 50 + "X" * 200) == "X" * 200
     assert clean_variant_title("X" * 199 + " Y") == "X" * 199
 
 
-@pytest.mark.parametrize("junk", ["\n\t\r", "‮​﻿", "", "⁦⁩ \x00", "", "   "])
+@pytest.mark.parametrize("junk", [
+    "\n\t\r", "\u202e\u200b\ufeff", "\ue000", "\u2066\u2069 \x00",
+    pytest.param("", id="empty"), pytest.param(" " * 3, id="three-spaces"),
+])
 def test_an_all_unprintable_title_is_none_and_the_proof_still_stands(junk: str) -> None:
     written = _backfilled(_judy_js(**{JUDY_VARIANT: {"title": junk}}))
     assert written["snapshot"]["shopify_cart_proof"]["variant_title"] is None
@@ -1240,7 +1243,7 @@ def test_an_old_proof_with_a_dirty_title_is_cleaned_on_read() -> None:
     """A proof the backfill wrote BEFORE the rule holds the raw title; the verifier cleans it."""
     for scope_payload in (None, {"variants": [JUDY_JS["variants"][4]]}):   # named, then sole
         seed = _backfilled(scope_payload)
-        seed["snapshot"]["shopify_cart_proof"]["variant_title"] = "‮07\nBURGUNDY​ INK"
+        seed["snapshot"]["shopify_cart_proof"]["variant_title"] = "\u202e07\nBURGUNDY\u200b INK\ue000"
         assert _verify(seed).variant_title == "07 BURGUNDY INK"
 
 
@@ -1248,3 +1251,101 @@ def test_clean_display_text_refuses_non_text_and_honours_its_cap() -> None:
     for value in (None, 7, {"not": "text"}, ["07"], b"07"):
         assert clean_display_text(value, max_chars=10) is None
     assert clean_display_text("abcdef", max_chars=3) == "abc"
+
+
+# ---------------------------------------------------------------- #2462 review follow-up
+
+import random  # noqa: E402
+import unicodedata  # noqa: E402
+
+from services.text_normalization.display_text import (  # noqa: E402
+    DROPPED_CATEGORIES,
+    KEPT_FORMAT_CHARS,
+    MAX_PRODUCT_NAME,
+    clean_product_name,
+)
+
+
+@pytest.mark.parametrize("title", [
+    "\U0001f469\u200d\U0001f4bb Coder",                 # ZWJ inside an emoji sequence
+    "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",  # ZWNJ in Persian orthography
+    "\u05d2\u05d5\u05d5\u05df 07\u200e",                 # LRM placing a number after Hebrew
+    "\u0644\u0648\u0646 \u200f(07)",                     # RLM before a bracket in Arabic
+])
+def test_the_joiners_and_direction_marks_are_kept(title: str) -> None:
+    """ZWJ/ZWNJ/LRM/RLM only ever mangle display when dropped; none re-orders text beyond itself."""
+    assert _written_title(title) == _read_title(title) == title
+
+
+@pytest.mark.parametrize("dirty,clean", [
+    # England's flag: black flag + TAG g b e n g + CANCEL TAG. The tags are invisible ASCII
+    # ("ASCII smuggling"), so they go and the flag degrades to the plain black flag.
+    ("Flag \U0001f3f4\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f",
+     "Flag \U0001f3f4"),
+    ("07 BURG\u2060UNDY INK", "07 BURGUNDY INK"),       # WORD JOINER: an invisible spacer
+    ("07 BUR\u00adGUNDY INK", "07 BURGUNDY INK"),       # SOFT HYPHEN
+    ("07 BURGUNDY\u180e INK", "07 BURGUNDY INK"),       # MONGOLIAN VOWEL SEPARATOR
+])
+def test_tag_characters_and_invisible_spacers_are_still_dropped(dirty: str, clean: str) -> None:
+    assert _written_title(dirty) == _read_title(dirty) == clean
+
+
+@pytest.mark.parametrize("bidi", ["\u202a", "\u202b", "\u202c", "\u202d", "\u202e", "\u2066", "\u2067", "\u2068", "\u2069"])
+def test_every_bidi_embedding_override_and_isolate_is_dropped(bidi: str) -> None:
+    """Each one individually: these are the characters that re-order the text AROUND them."""
+    assert _written_title(f"07 {bidi}BURGUNDY INK") == _read_title(f"07 {bidi}BURGUNDY INK") \
+        == "07 BURGUNDY INK"
+
+
+@pytest.mark.parametrize("title", [7, 7.5, True, {"not": "text"}, ["07 BURGUNDY INK"]])
+def test_a_non_string_storefront_title_is_no_title(title: Any) -> None:
+    """The writer reads the RAW products.js entry: a non-string title is None, not "7"."""
+    seed = _backfilled(_judy_js(**{JUDY_VARIANT: {"title": title}}))
+    assert seed["snapshot"]["shopify_cart_proof"]["variant_title"] is None
+    assert _verify(seed) == (JUDY_VARIANT, CART_PROOF_SCOPE_NAMED, None)
+    sole = _backfilled({"variants": [dict(JUDY_JS["variants"][4], title=title)]})
+    assert sole["snapshot"]["shopify_cart_proof"]["variant_title"] is None
+
+
+def test_the_writer_reads_the_title_and_price_of_the_proven_variant_only() -> None:
+    """The raw-entry lookup is by numeric id: a sibling's title or price never lands in the proof."""
+    proof = _backfilled(_judy_js(**{JUDY_OTHER: {"title": "01 PETAL INK", "price": 1}}))[
+        "snapshot"]["shopify_cart_proof"]
+    assert proof["variant_title"] == "07 BURGUNDY INK" and proof["price_minor"] == 1399
+
+
+_FUZZ_ALPHABET = (
+    "aZ09 -/<>&\"'\u00e9e\u0301\u0327\u05d0\u0627\u6a31\U0001f469\U0001f3f4\U0001f484"
+    "\t\n\r\x0b\x0c\x1c\x1f\x85\u00a0\u2028\u2029\u3000\u2003"
+    "\x00\x07\x7f\x9f\u00ad\u061c\u180e\u200b\u200c\u200d\u200e\u200f\u2060\u2061\ufeff"
+    "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufff9"
+    "\ue000\uf8ff\U000f0000\U00100000" + chr(0xD800) + chr(0xDC00) + "\ud83d"
+    "\U000e0001\U000e0020\U000e0067\U000e007f\u0378\uffff"
+)
+
+
+def test_the_rule_is_idempotent_and_leaves_nothing_it_drops_fuzzed() -> None:
+    """Every output is a fixed point, is NFC, has no dropped character, no leading, trailing or
+    doubled whitespace, and fits the cap -- on 20,000 random strings over the awkward alphabet."""
+    rng = random.Random(2462)
+    for _ in range(20000):
+        cap = rng.choice((1, 2, 3, 5, 8, 200))
+        raw = "".join(rng.choice(_FUZZ_ALPHABET) for _ in range(rng.randint(0, 12)))
+        out = clean_display_text(raw, max_chars=cap)
+        assert clean_display_text(out, max_chars=cap) == out, (raw, out)
+        if out is None:
+            continue
+        assert out and len(out) <= cap and out == out.strip(), (raw, out)
+        assert unicodedata.normalize("NFC", out) == out, (raw, out)
+        assert "  " not in out and all(c == " " or not c.isspace() for c in out), (raw, out)
+        assert not any(
+            c not in KEPT_FORMAT_CHARS and unicodedata.category(c) in DROPPED_CATEGORIES for c in out
+        ), (raw, out)
+
+
+def test_the_product_name_gets_the_same_rule_at_its_own_cap() -> None:
+    assert MAX_PRODUCT_NAME == 255
+    assert clean_product_name("Silky Matte Lip Ink") == "Silky Matte Lip Ink"
+    assert clean_product_name("Silky\u202e Matte\nLip\u200b Ink\ue000") == "Silky Matte Lip Ink"
+    assert clean_product_name("P" * 300) == "P" * 255
+    assert clean_product_name("\u202e\n") is None and clean_product_name(None) is None

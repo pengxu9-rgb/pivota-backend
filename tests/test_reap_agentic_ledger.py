@@ -651,6 +651,23 @@ async def test_public_view_handles_none_and_partial_rows():
     assert ledger.public_purchase_view({"id": "rp_1", "buyer_email": "x@y.z"}) == {"id": "rp_1"}
 
 
+async def test_public_view_cleans_the_two_merchant_names_and_nothing_else():
+    """#2462 follow-up: a row written before the display rule is shown clean; the row dict passed
+    in is not modified; absent keys stay absent; other text columns are projected as stored."""
+    row = {"id": "rp_1", "product_name": "\u202eSilky\nMatte\u200b", "variant_title": "07\ue000 INK\t",
+           "brand": "Judy\u200bdoll"}
+    view = ledger.public_purchase_view(row)
+    assert view == {"id": "rp_1", "product_name": "Silky Matte", "variant_title": "07 INK",
+                    "brand": "Judy\u200bdoll"}
+    assert row["product_name"] == "\u202eSilky\nMatte\u200b"
+    assert ledger.public_purchase_view({"id": "rp_2", "variant_title": "\u202e"}) == {
+        "id": "rp_2", "variant_title": None}
+    assert ledger.public_purchase_view({"id": "rp_3", "product_name": "P" * 300}) == {
+        "id": "rp_3", "product_name": "P" * 255}                      # no variant_title key added
+    assert ledger.public_purchase_view({"id": "rp_4", "variant_title": "07"}) == {
+        "id": "rp_4", "variant_title": "07"}                           # no product_name key added
+
+
 async def test_get_purchase_internal_is_named_internal_and_is_not_exported():
     """C3. The unscoped, unredacted read is the one a route author must not reach for by
     accident, so it carries the suffix and stays out of `__all__`."""

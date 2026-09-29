@@ -134,6 +134,11 @@ from services.reap_cart_link import cart_link_refusal, validate_cart_link
 # same function object, pinned by identity in the tests.
 from services.reap_agentic_client import ReapRequestError, validate_offer_code
 
+# The display-text rules (#2462 and its follow-up) for the two merchant-typed names a public view
+# shows. Both modules are stdlib-only (plus each other), so this cannot cycle.
+from services.shopify_variant_identity import clean_variant_title
+from services.text_normalization.display_text import clean_product_name
+
 # `get_purchase_internal`, `get_enrollment_internal` AND `get_enrollment_by_reap_id` are
 # deliberately ABSENT. The first two are the unscoped, unredacted reads and their names say so.
 #
@@ -916,7 +921,18 @@ def public_purchase_view(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, An
     """
     if row is None:
         return None
-    return {key: row[key] for key in PUBLIC_PURCHASE_COLUMNS if key in row}
+    view = {key: row[key] for key in PUBLIC_PURCHASE_COLUMNS if key in row}
+    # THE TWO NAMES ARE CLEANED ON THE WAY OUT, not only on the way in. They are merchant-typed
+    # display text, and a row written before the display rule existed (#2462) still holds
+    # whatever the storefront sent -- a U+202E, a newline. This view is what GET, the list and an
+    # idempotent replay all answer with, so all three agree with a fresh 202, whatever the row
+    # was written under. The ROW is untouched: the variant lane's resolver matches on the stored
+    # value, never on this projection.
+    if "product_name" in view:
+        view["product_name"] = clean_product_name(view["product_name"])
+    if "variant_title" in view:
+        view["variant_title"] = clean_variant_title(view["variant_title"])
+    return view
 
 
 def _purchase(row: Any) -> Optional[Dict[str, Any]]:

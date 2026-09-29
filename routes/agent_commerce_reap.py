@@ -127,6 +127,7 @@ from db.database import IS_POSTGRES, database
 from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
+from services.text_normalization.display_text import clean_product_name
 from services.outbound_links_service import (
     build_shopify_cart_permalink,
     extract_shopify_numeric_variant_id,
@@ -1622,7 +1623,8 @@ async def _load_cart_link_item(
     return (
         {"shop_domain": merchant_domain, "our_price_minor": int(price_minor),
          "currency": currency, "market_country": market_country,
-         "product_name": str(product.get("product_title") or "").strip() or None,
+         # Merchant-typed catalog text: the same display rule as the variant title after it.
+         "product_name": clean_product_name(product.get("product_title")),
          "product_key": product_key,
          # DISPLAY ONLY: which variant this link buys, in the live storefront's words, so a
          # door can show "07 BURGUNDY INK" -- the buyer never picks it on this lane.
