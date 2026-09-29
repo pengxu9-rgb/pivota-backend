@@ -410,7 +410,8 @@ async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[s
     (--check-legacy-listings): when not requested, the report says `unchecked` rather than going
     silent, because a silent dry run is how Wave 1 read `ready_to_apply` for a cohort (haruharu
     wonder at ohlolly.com) that the apply then refused. Suppressed owners are listed and COUNTED as
-    conflicts, because the apply refuses on them too.
+    conflicts, because the apply refuses on them too -- except an owner whose whole chain is retired
+    (apply.legacy_chain_retired), which the apply admits: counted in `retired_owner_count`, not a conflict.
     """
     listings = planned_retailer_listings(plan)
     report: Dict[str, Any] = {"planned_listings": len(listings)}
@@ -435,6 +436,8 @@ async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[s
         if connected_here and getattr(database, "is_connected", False):
             await database.disconnect()
 
+    retired = [f for f in findings if f["kind"] == "retired_owner"]
+    findings = [f for f in findings if f["kind"] != "retired_owner"]  # the apply admits a retired chain
     by_listing: Dict[str, Dict[str, Any]] = {}
     for finding in findings:
         if finding["kind"] != "conflict":
@@ -457,6 +460,7 @@ async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[s
         "suppressed_conflict_count": sum(1 for o in owners if o["suppressed"]),
         "listings_with_conflicts": len(by_listing),
         "conflicts": list(by_listing.values()),
+        "retired_owner_count": len(retired),
         "unproven_legacy_rows": [
             {"product_key": f["legacy_product_key"], "canonical_url": f["canonical_url"]}
             for f in findings if f["kind"] == "identity_unproven"
