@@ -1635,3 +1635,25 @@ async def test_a_request_robots_kept_us_from_sending_neither_counts_nor_resets_t
         crawl_politeness.ROBOTS_TRANSPORT_FACTORY.reset(token)
     assert report["aborted_on_block"] is True
     assert report["domains"][TARTE_HOST]["fetches"] == {"rate_limited": 2, "robots_disallowed": 1}
+
+
+async def test_a_crawl_paced_request_neither_counts_toward_nor_resets_the_block_streak(job_db, monkeypatch):
+    """429 on the apex (held 3 s, the job waits 1 s) -> the apex's next handle is crawl_paced (not
+    sent) -> a 429 from the www twin's own product is the SECOND block, and aborts at limit 2. Had
+    crawl_paced counted, the run would abort before the www request; had it reset, it never would."""
+    _slow_backoff(monkeypatch)
+    www = "www." + TARTE_HOST
+    on_www = rehost(build_rows("ecvpjob tarte", "zz on www", "x", "zz-on-www", []), www)
+    for rows in (RUN_TARTE, RUN_TARTE_SINGLE, on_www):
+        await insert_rows(job_db, rows)
+    store = Store()
+    store.routes[(TARTE_HOST, "/products/amazonian-clay-baked-blush.js")] = (429, None, [], [("retry-after", "120")])
+    store.js(TARTE_HOST, "front-row-energy-travel-essentials", "tarte_js_amazonian_clay_baked_blush")
+    store.js(www, "zz-on-www", "tarte_js_amazonian_clay_baked_blush", status=429)
+    async with store.client() as client:
+        report = await job.run(job_db, client, [TARTE_PLAN], apply=True, source_mode=SOURCE_PRODUCTS_JS,
+                               pacer=NoSleepPacer(), block_limit=2, now=_tick())
+    assert report["aborted_on_block"] is True
+    assert report["domains"][TARTE_HOST]["fetches"] == {"rate_limited": 2, "crawl_paced": 1}
+    assert [(r.url.host, r.url.path) for r in store.requests] == [
+        (TARTE_HOST, "/products/amazonian-clay-baked-blush.js"), (www, "/products/zz-on-www.js")]
