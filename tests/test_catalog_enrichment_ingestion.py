@@ -107,6 +107,10 @@ _NON_LATIN_COLLISIONS = [
     (("Missha", "Крем"), ("Missha", "Серум")),
     (("Shiseido", "ｸﾞﾛｳ"), ("Shiseido", "ﾏｽｸ")),
     (("Brand", "Ｇｌｏｗ"), ("Brand", "Ｓｈｉｎｅ")),        # fullwidth Latin: the slug drops it too
+    (("IPSA", "Metabolizer ME Ⅰ"), ("IPSA", "Metabolizer ME Ⅱ")),   # Roman numerals (Nl)
+    (("Brand", "Mask ①"), ("Brand", "Mask ②")),
+    (("Cocoon", "Kem dưỡng mắt"), ("Cocoon", "Kem dưỡng mặt")),     # eye cream / face cream
+    (("é", "è"), ("ö", "ü")),                                       # slug "unknown", no script letter
 ]
 
 
@@ -128,6 +132,25 @@ def test_non_latin_identity_ignores_case_symbols_and_width():
     assert derive_product_key("SULWHASOO", "자음생크림™") == key
     assert derive_product_key("Sulwhasoo", "  자음생크림 ") == key
     assert derive_product_key("Cos de BAHA", "MVマルチビタ") == derive_product_key("Cos de BAHA", "MVﾏﾙﾁﾋﾞﾀ")
+    # The whole key, prefix included: fullwidth ＭＶ / ５０ beside kana is common in Japanese titles.
+    assert derive_product_key("Cos de BAHA", "ＭＶマルチビタ") == derive_product_key("Cos de BAHA", "MVマルチビタ")
+    assert derive_product_key("Brand", "化粧水 ５０ml") == derive_product_key("Brand", "化粧水 50ml")
+    # Invisible characters are not word breaks.
+    assert derive_product_key("Sulwhasoo", "자음​생크림") == key
+    assert derive_product_key("Sulwhasoo", "자음­생크림") == key
+    assert derive_product_key("Brand", "크림 ❤️") == derive_product_key("Brand", "크림 ❤")
+
+
+@pytest.mark.parametrize("modified,plain", [
+    ("Kiehlʼs Ultra Facial Cream", "Kiehl's Ultra Facial Cream"),
+    ("Hawaiʻi Kukui Oil", "Hawai'i Kukui Oil"),
+])
+def test_a_modifier_apostrophe_keeps_the_latin_key(modified, plain):
+    """ʼ/ʻ are Latin punctuation, not a script: the name keeps the key its ASCII spelling has."""
+    assert derive_product_key("Brand", modified) == derive_product_key("Brand", plain)
+    assert derive_product_key("Brand", modified + " 크림") == derive_product_key("Brand", plain + " 크림")
+    assert derive_product_key("Brand", modified).endswith("::" + hashlib.sha1(
+        canonical_product_name("Brand", plain).encode("utf-8")).hexdigest()[:8])
 
 
 # (brand, title, key) read from prod 2026-09-29. Every one of these names loses characters in the slug
@@ -163,6 +186,8 @@ def test_the_one_prod_key_the_fix_moves():
     rows, draft stage). Pinned so the repair plan in the PR names the right row."""
     brand, title = "Cos de BAHA", "【美容神ゆりちゃん監修】MVマルチビタ導入美容液 50ml"
     assert derive_product_key(brand, title) == "ext:cos-de-baha-mv-50ml::63c46c9fb300432e"
+    pdp = ingest_validated_record(_record(brand=brand, product_name=title))["pdp"]
+    assert pdp["source_product_id"] == "cos-de-baha-mv-50ml-63c46c9fb300432e"
 
 
 def test_non_latin_keys_fit_the_widest_key_budget():
