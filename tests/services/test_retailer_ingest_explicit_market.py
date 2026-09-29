@@ -59,10 +59,11 @@ def test_market_us_in_any_case_is_us(given):
     assert o["market"] == "US" and pipeline.job_currency(o) == "USD"
 
 
-@pytest.mark.parametrize("market", ["SG", "GB", "KR", "CA"])
+@pytest.mark.parametrize("market", ["GB", "KR", "CA", "HK"])
 def test_a_real_market_that_is_not_allowlisted_yet_is_refused(market):
     # These ARE in region_pricing: only the ingest allowlist refuses them. (AU/JP joined the allowlist as
-    # acquisition markets in Phase 2: tests/services/test_retailer_ingest_markets_phase2.py.)
+    # acquisition markets in Phase 2: tests/services/test_retailer_ingest_markets_phase2.py; SG as a SERVED
+    # market 2026-09-29: tests/services/test_retailer_ingest_sg_market.py.)
     with pytest.raises(ValueError, match="not an ingest market yet"):
         pipeline.validate_options({"vendors": ["X"], "market": market})
 
@@ -88,7 +89,7 @@ def test_require_currency_must_be_the_markets(currency):
 
 async def test_a_market_outside_the_allowlist_is_refused_before_any_crawl(env):  # noqa: F811
     env.crawl_error = AssertionError("must not crawl")
-    out = await pipeline.run_stage(job(market="SG", require_currency="SGD"), db=env.db)
+    out = await pipeline.run_stage(job(market="GB", require_currency="GBP"), db=env.db)
     assert (out["status"], out["outcome"]) == ("failed", "invalid_job")
     assert "not an ingest market yet" in out["reason"]
 

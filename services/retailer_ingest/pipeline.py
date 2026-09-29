@@ -98,7 +98,14 @@ DEFAULT_MARKET = "US"
 #: job's market and must be priced in that market's currency (ingestion._build_offer_inserts(market=),
 #: region_pricing.require_market_currency): the declared-destination semantics ADR-024 reserves for a
 #: writer that declares one. normalize_curated_brand_payload accepts exactly this list from this lane.
-INGEST_MARKETS = ("US", "AU", "JP")
+INGEST_MARKETS = ("US", "AU", "JP", "SG")
+#: The ingest markets that are SERVED, not acquired: a job's rows must read back serving-eligible. SG
+#: (Peng 2026-09-29): a live serving region (PIVOTA_SERVING_PRICING_REGIONS = US,SG on web; Meitu's merchant
+#: list crawled SG stores). Its rows are written like every other market's: catalog_offers.market 'SG' priced
+#: in SGD, and the seed in the "US" partition (ingestion.SEED_PARTITION_MARKET) -- where SG buyers already
+#: find SGD seeds by currency (external_seed_search serving currency, #2389). Only the offer stamp is new:
+#: jsmbeauty.sg / makeupforever.sg, written before this, carry market 'US' with SGD (INSERT-only column).
+SERVED_INGEST_MARKETS = tuple(m for m in INGEST_MARKETS if m not in ACQUISITION_MARKETS)
 #: Multi-market storefronts ADR Phase 2 (approved by Peng 2026-09-26): ACQUISITION markets. A job for
 #: one crawls the storefront's base currency (AUD/JPY) and stores its rows truthfully (market 'AU',
 #: currency 'AUD'); they are NOT served, because serving gates on the offer's currency against the
@@ -611,12 +618,29 @@ def _require_acquisition_is_unserved(market: str) -> None:
                     f"job, then re-queue.")
 
 
+def _require_served_market_is_served(market: str) -> None:
+    """A served market's rows must read back serving-eligible, and index_pipeline_state decides that in THIS
+    process from its own PIVOTA_SERVING_PRICING_REGIONS (read at import). A drain whose env lists only US
+    would score every SGD row as priced for no served region and fail the job after its write -- so refuse
+    before any crawl, and name the env to fix (infra/gcp/setup_scheduler.sh carries US,SG for the drain)."""
+    if market not in SERVED_INGEST_MARKETS or market == DEFAULT_MARKET:
+        return
+    from services.index_pipeline_state_service import serving_pricing_regions
+    regions = serving_pricing_regions()
+    if market not in regions:
+        raise _Stop("served_market_unconfigured", "failed",
+                    f"market {market} is served, but this process serves only {regions} "
+                    f"(PIVOTA_SERVING_PRICING_REGIONS): its {market} rows would read back unserved. Set the "
+                    f"drain's env to include {market}, then re-queue.")
+
+
 async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
     from services.curated_brand_feed import (CrawlIncomplete, lash_nail_title_evidence, lip_title_evidence,
                                              records_for_brand)
     import contextlib
 
     _require_acquisition_is_unserved(job_market(job.get("options")))
+    _require_served_market_is_served(job_market(job.get("options")))
     try:
         payload = ingest_payload(job)
         if (job.get("options") or {}).get("collections"):
@@ -868,9 +892,9 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
     USD/US siblings on the SAME host (services/retailer_ingest/shopify_markets.py, source_system
     shopify_markets_us_localization), as did the older scripts/capture_us_market_offers.py, so a re-run of
     the storefront's AU crawl would otherwise count them as its own and fail after every write (review of
-    #2358, D1). `domain=None` counts every offer of the product (a caller with no storefront). SG rows (market 'US', currency 'SGD',
-    because external_product_seeds.market is a hard serving partition) are never written by this lane:
-    SG is not an INGEST_MARKET.
+    #2358, D1). `domain=None` counts every offer of the product (a caller with no storefront). An SG job's
+    offers are stamped market 'SG' in SGD; its seeds stay in the "US" partition like every market's
+    (external_product_seeds.market is a hard serving partition -- ingestion.SEED_PARTITION_MARKET).
 
     ACQUISITION markets (AU/JP): the rows must land STORED and NOT SERVED. A row the index blocks as
     no_us_offer -- the last rung of its ladder, reached only when every content gate passed -- with its
