@@ -488,8 +488,9 @@ def test_no_args_value_beginning_with_a_dash_uses_the_space_form():
 # last occurrence. A source grep would pass with the override placed anywhere.
 DRAIN = "retailer-ingest-drain"
 DRAIN_TRIGGER = "retailer-ingest-drain-cron"
-# The env the 2026-09-23 curated-ingest one-offs ran with. PIVOTA_SERVING_PRICING_REGIONS is US
-# alone: the pipeline requires USD and the multi-region value carries a comma.
+# The env the 2026-09-23 curated-ingest one-offs ran with. PIVOTA_SERVING_PRICING_REGIONS is US,SG since SG
+# became a served ingest market (2026-09-29): the drain scores serving in its own process. The value carries a
+# comma, so the line uses gcloud's "^|^" alternate delimiter.
 PROVEN_INGEST_ENV = {
     "ENABLE_INTAKE_IDENTITY_ENRICHMENT": "1",
     "ENABLE_INTAKE_IDENTITY_AUDIT": "1",
@@ -504,7 +505,7 @@ PROVEN_INGEST_ENV = {
     "INDEXNOW_ENABLED": "true",
     "PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS": "1",
     "STRICT_BEAUTY_CATEGORY_TEXT_RECALL": "true",
-    "PIVOTA_SERVING_PRICING_REGIONS": "US",
+    "PIVOTA_SERVING_PRICING_REGIONS": "US,SG",
     "DB_STATEMENT_TIMEOUT_SECONDS": "30",
     "DB_COMMAND_TIMEOUT_SECONDS": "600",
     "CURATED_CRAWL_PAGE_ATTEMPTS": "5",
@@ -538,14 +539,23 @@ def _values(tokens: list[str], flag: str) -> list[str]:
     return out
 
 
+def _split_env(raw: str) -> list[str]:
+    """gcloud's list parsing: "^D^..." makes D the item delimiter, otherwise items split on ","."""
+    m = re.fullmatch(r"\^(.)\^(.*)", raw, re.S)
+    delim, body = (m.group(1), m.group(2)) if m else (",", raw)
+    return body.split(delim)
+
+
 def _env(tokens: list[str]) -> dict[str, str]:
     (raw,) = _values(tokens, "--set-env-vars")  # ONE line: the reconcile replaces the whole set
-    items = raw.split(",")
+    m = re.fullmatch(r"\^(.)\^.*", raw, re.S)
+    delim = m.group(1) if m else ","
+    items = _split_env(raw)
     env = {}
     for item in items:
-        # gcloud splits on EVERY comma, so a comma inside a value leaves a fragment with no
+        # gcloud splits on EVERY delimiter, so a delimiter inside a value leaves a fragment with no
         # `KEY=` of its own. That fragment is what this catches.
-        assert re.fullmatch(r"[A-Z][A-Z0-9_]*=[^,]*", item), f"not a KEY=VALUE item: {item!r}"
+        assert re.fullmatch(r"[A-Z][A-Z0-9_]*=[^" + re.escape(delim) + r"]*", item), f"not a KEY=VALUE item: {item!r}"
         key, value = item.split("=", 1)
         assert key not in env, f"{key} set twice on one --set-env-vars line"
         env[key] = value
@@ -660,7 +670,7 @@ def test_the_drain_budget_leaves_the_last_stage_room_inside_the_task_timeout():
     text = SCRIPT.read_text(encoding="utf-8")
     block = text[text.index("mkcrawljob retailer-ingest-drain"):]
     block = block[:block.index("\n\n")]
-    env = dict(kv.split("=", 1) for kv in re.search(r'--set-env-vars "([^"]+)"', block).group(1).split(","))
+    env = dict(kv.split("=", 1) for kv in _split_env(re.search(r'--set-env-vars "([^"]+)"', block).group(1)))
     timeouts = [int(t) for t in re.findall(r"--task-timeout (\d+)s", block)]
     task_timeout = timeouts[-1]  # the later flag wins, as in gcloud
     assert task_timeout == 3600

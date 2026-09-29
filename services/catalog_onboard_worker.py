@@ -58,8 +58,8 @@ def normalize_curated_brand_payload(payload: Dict[str, Any], *,
 
     `markets`: the markets the CALLER can write truthfully. The default is US only, because this
     queue's own drain (`_process_curated_brand`) stamps no market on its offers. The retailer_ingest
-    lane passes its INGEST_MARKETS (US plus the AU/JP acquisition markets of the multi-market
-    storefronts ADR, Phase 2): it declares the job's market on every offer it writes
+    lane passes its INGEST_MARKETS (US and SG served, plus the AU/JP acquisition markets of the
+    multi-market storefronts ADR, Phase 2): it declares the job's market on every offer it writes
     (ingestion._build_offer_inserts(market=...)) and keeps the seed partition at US.
     """
     if not isinstance(payload, dict):
