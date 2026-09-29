@@ -292,7 +292,7 @@ if __name__ == "__main__":
 
 def _create_reconcile_enabled() -> bool:
     """OFF by default. This lane enqueues merchant-order creates on the money
-    path, staging shares the prod Postgres, and its first prod run will pick up
+    path, and its first prod run will pick up
     every pre-queue order that never got one — so it is armed deliberately,
     after a `--dry-run` has sized that backlog."""
     return str(

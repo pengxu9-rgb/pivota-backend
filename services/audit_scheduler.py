@@ -312,12 +312,18 @@ def _queue_worker_enabled() -> bool:
     """Whether THIS process should drain the shared async-run queues
     (audit / executor / verification worker ticks + their lease reapers).
 
-    Production and staging SHARE one Postgres (single-DB tenancy by design), and
-    these workers claim work by polling the shared tables with NO environment
-    filter. So a staging service running them POACHES production-enqueued runs it
-    can't complete — it lacks prod secrets (e.g. PROMOTIONS_ADMIN_KEY) and may run
-    older code — then silently fails them (0 probes, "succeeded" empty audit).
-    Gate the drainers so only the production worker claims the shared queue.
+    These workers claim work by polling the queue tables with NO environment
+    filter, so the database boundary is what keeps one environment's worker off
+    another's runs. This gate was written in
+    the Railway era, when production and staging SHARED one Postgres and a
+    staging service running the drainers POACHED production-enqueued runs it
+    couldn't complete (no prod secrets such as PROMOTIONS_ADMIN_KEY, possibly
+    older code), then silently failed them (0 probes, "succeeded" empty audit).
+    On GCP they no longer share one: prod and staging each run their own Cloud
+    SQL instance (infra/gcp/README.md, verified 2026-09-29). The gate still
+    keeps the singleton crons and drainers off staging/preview services by
+    default, and the claim still has no environment filter — so verify a
+    worker's DATABASE_URL host is its own project's instance before arming it.
 
     Fail-safe toward ENABLED: only disable when this is clearly a staging/preview
     service, or AUDIT_WORKER_ENABLED is explicitly false — so a detection miss
@@ -363,8 +369,9 @@ async def start_scheduler() -> None:
 
     try:
         scheduler = AsyncIOScheduler(timezone="UTC")
-        # Only the production worker drains the SHARED async-run queues; a
-        # staging service on the same DB must not poach prod-enqueued runs.
+        # Only the production worker drains the async-run queues by default.
+        # (Written when staging shared prod's DB and would have poached
+        # prod-enqueued runs; each environment now has its own instance.)
         worker_enabled = _queue_worker_enabled()
         if not worker_enabled:
             logger.warning(
@@ -379,10 +386,12 @@ async def start_scheduler() -> None:
         from services.scheduler_job_runner import wrap_job
 
         def _add_job(func, *args, **kwargs):
-            # Register a scheduled job ONLY on the production worker. Prod+staging
-            # share one Postgres, so a staging service must NOT double-fire these
-            # singleton prod crons (daily audit check, settlement, billing,
-            # reconcile, backfills) or drain the shared queues. Gates everything
+            # Register a scheduled job ONLY on the production worker, so a
+            # staging service does not run these singleton crons (daily audit
+            # check, settlement, billing, reconcile, backfills) or drain the
+            # queues. Written when prod+staging shared one Postgres and staging
+            # would have double-fired them against prod's rows; staging now has
+            # its own instance (infra/gcp/README.md). Gates everything
             # uniformly — the explicit `if worker_enabled:` blocks below are now
             # redundant but harmless.
             #
@@ -475,8 +484,8 @@ async def start_scheduler() -> None:
         # 05:00 UTC (after nightly_index_health). Min-sample-gated, so it surfaces
         # nothing until real transaction volume exists — a safe no-op pre-launch.
         from services.outcome_aggregation_service import refresh_all_outcomes
-        # _add_job (NOT scheduler.add_job) so staging — which shares prod's
-        # Postgres — does not double-fire this singleton cron. It used the raw
+        # _add_job (NOT scheduler.add_job) so this singleton cron runs only on
+        # the production worker, like every other job. It used the raw
         # add_job and slipped the env gate every other job respects.
         _add_job(
             refresh_all_outcomes,
@@ -1256,7 +1265,7 @@ async def start_scheduler() -> None:
         # missing/mis-correlated webhook can't strand a real charge. 5min keeps
         # recovery latency low without hammering the PSP API. The tick is DORMANT
         # unless PAYMENT_RECONCILE_SWEEP_ENABLED is set — it auto-finalizes
-        # payments, and staging shares the prod DB, so enable deliberately.
+        # payments, so enable deliberately.
         from services.payment_reconcile import run_payment_reconcile_tick
         _add_job(
             run_payment_reconcile_tick,
@@ -1275,8 +1284,8 @@ async def start_scheduler() -> None:
         # refund state close to real time; the claim is SKIP LOCKED so a second
         # drainer would be safe, and `_add_job` already restricts this to the
         # production worker. NOT flag-gated: unlike the reconcile sweep this
-        # only acts on rows a request explicitly enqueued, so a staging service
-        # sharing the prod DB cannot invent work — and gating it would recreate
+        # only acts on rows a request explicitly enqueued, so a drainer cannot
+        # invent work — and gating it would recreate
         # the silent-loss failure it exists to remove.
         from services.merchant_order_sync_drain import (
             run_merchant_order_sync_lease_reaper_tick,
@@ -1323,9 +1332,9 @@ async def start_scheduler() -> None:
         # ENQUEUES rather than creating, and skips any order that already has a
         # create job in any state, so it cannot re-attempt work the queue owns.
         #
-        # Flag-gated anyway: it writes on the money path, staging shares the
-        # prod Postgres, and its first prod run will pick up the pre-queue
-        # backlog. Arm it deliberately after a `--dry-run` has sized that.
+        # Flag-gated anyway: it writes on the money path, and its first prod
+        # run will pick up the pre-queue backlog. Arm it deliberately after a
+        # `--dry-run` has sized that.
         from jobs.agentic_commerce_reconciliation import (
             run_merchant_order_create_reconcile_tick,
         )
@@ -1362,7 +1371,7 @@ async def start_scheduler() -> None:
         # (same_url_dup, junk_url) -> review batches for the rest -> alert
         # if a duplication gauge rises. DORMANT unless
         # ENABLE_IDENTITY_RECONCILE_SWEEP is set (the tick checks the flag
-        # itself); staging shares the prod DB, so enable deliberately.
+        # itself), so enable deliberately.
         # docs/plans/adr010_d2_catalog_reconciliation_at_scale.md.
         from services.identity_reconcile_sweep import (
             run_identity_reconcile_sweep_tick,

@@ -64,7 +64,7 @@ DEFAULT_BASE_URL = "https://web-staging-staging-5257.up.railway.app"
 WEBHOOK_PATH = "/webhooks/stripe/billing"
 
 # Synthetic merchant + customer provisioned for the shakeout. These IDs are
-# real on staging (shared DB) and the merchant exists in merchant_onboarding,
+# real on staging (Railway-era staging, which shared prod's DB) and the merchant exists in merchant_onboarding,
 # user_subscriptions (id 21), and merchants (id 20) with stripe_customer_id
 # already populated from §A.
 SHAKEOUT_MERCHANT_ID = "merch_shakeout_938623c93f73432a"

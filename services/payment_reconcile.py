@@ -31,8 +31,9 @@ from utils.logger import logger
 def _reconcile_sweep_enabled() -> bool:
     """The sweep auto-finalizes payments + creates merchant orders, so it is
     OFF by default and must be deliberately enabled for controlled rollout.
-    Important under single-DB tenancy (staging shares the prod Postgres): a
-    staging deploy must not silently reconcile prod orders."""
+    (Originally also because staging shared the prod Postgres and a staging
+    deploy could silently reconcile prod orders; staging has its own instance
+    now, see infra/gcp/README.md.)"""
     return str(os.getenv("PAYMENT_RECONCILE_SWEEP_ENABLED", "")).strip().lower() in {
         "1",
         "true",

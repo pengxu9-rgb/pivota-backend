@@ -214,7 +214,7 @@ Everything else is sized from that one number: the lease floor (180), the run de
 > leases and the next tick simply re-claims what it did not reach.
 
 Two constants are deliberately **not** dials: `SWEEP_BATCH` (200 rows per sweep statement — a
-lock-window property of a Postgres prod and staging share, not an operator setting) and
+lock-window property of prod's Postgres under live traffic, not an operator setting) and
 `MAX_SWEEP_ITERATIONS` (20 — the cap that stops a sweep whose predicate a future migration makes
 permanently true becoming an infinite loop inside a scheduled job).
 
@@ -301,9 +301,16 @@ the unfenced bulk sweeps and must never be alerted on.
 ## Arming it
 
 The poller runs **only on the worker service**. `_add_job` registers nothing unless
-`services.audit_scheduler._queue_worker_enabled()` is true, because prod and staging share one
-Postgres and the claim has no environment filter — a staging service would poach production
-purchases and spend a buyer's card with staging code.
+`services.audit_scheduler._queue_worker_enabled()` is true. The claim has no environment filter,
+so what keeps a staging worker off production purchases is that staging has its own database:
+prod and staging run separate Cloud SQL instances (`infra/gcp/README.md`, verified 2026-09-29).
+The gate dates from the Railway era, when they shared one Postgres and a staging service would
+have poached production purchases and spent a buyer's card with staging code; it still keeps the
+poller off staging/preview services by default.
+
+**Pre-flight before arming any worker:** confirm its `DATABASE_URL` host is its own project's
+instance (prod `10.25.0.2`, staging `10.122.0.3`) — compare host and database name only, never
+print the URL. A staging worker pointed at prod's URL would bring the poaching hazard back.
 
 > **THE WORKER SERVICE IS DEPLOYED SEPARATELY. The normal backend deploy does NOT ship it.**
 > Merging this and deploying the backend changes nothing: the job only exists in a process where
