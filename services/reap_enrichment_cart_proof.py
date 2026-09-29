@@ -13,8 +13,8 @@ cart permalink, so it has to know three things the catalog alone cannot vouch fo
   3. WHAT it costs                           -> `enrichment_offer_price_ok`, the catalog offer
      price, only when it equals the price the proof read live.
 
-INERT IN PR A. Nothing calls these functions yet. PR C wires them into the purchase lane behind a
-dark flag; until then no behaviour anywhere changes.
+CALLED BY PR C, BEHIND A DARK FLAG. routes/agent_commerce_reap._load_enrichment_cart_link_item calls
+all three, and only while REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED and the cart-link dial are on.
 
 EVERY FUNCTION REFUSES RATHER THAN GUESSES. A wrong answer here buys the wrong shade, bills the
 wrong seller, or charges a price nobody quoted. Each refusal is a short stable reason code that
@@ -33,7 +33,8 @@ The placeholder is recognised by its key alone (`<product_key>::canonical`): its
 
 THE PLACEHOLDER NEVER STANDS IN FOR A VARIANT THE CATALOG KNOWS. It may be bought only when the
 product has NO `::v:` sku at all (`catalog_variant_sku_count == 0`, which the caller counts) AND
-the handle has exactly one variant. Without the first condition, MAC's 99 folded families pass:
+the handle has exactly one variant. The count includes SUPPRESSED `::v:` skus (a suppressed shade
+is still a variant the catalog knows). Without the first condition, MAC's 99 folded families pass:
 their canonical_url is the parent handle, whose one variant is a "Default Title" stub, while the
 placeholder's price is the first shade's -- the cart would buy the stub.
 
@@ -292,8 +293,11 @@ def verify_enrichment_cart_proof(
     Inputs are the catalog_products row (product_key, source_system, source_domain,
     canonical_url), the catalog_skus row (sku_key, source_variant_id, sku_payload) and the
     enrichment_cart_variant_proofs row for exactly that (product_key, sku_key), or None.
-    `catalog_variant_sku_count` is how many LIVE non-placeholder skus (`::v:`) the product has in
-    catalog_skus; the caller counts them. It is required so no caller can forget it.
+    `catalog_variant_sku_count` is how many `::v:` skus the product has in catalog_skus, ALL of
+    them, SUPPRESSED ONES INCLUDED; the caller counts them. A live-only count is wrong: a MAC
+    parent whose shade skus were all suppressed would count 0, and its placeholder would then buy
+    the parent handle's one "Default Title" stub at the first shade's price. It is required so no
+    caller can forget it.
 
     ACCEPTED in one of two modes; `reason` names which:
       * sole_variant   the proof's handle has exactly one live variant. The `::canonical`

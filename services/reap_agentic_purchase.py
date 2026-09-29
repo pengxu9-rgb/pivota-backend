@@ -190,6 +190,25 @@ def is_cart_link_enabled() -> bool:
     return (os.getenv(REAP_AGENTIC_CART_LINK_ENABLED_ENV) or "").strip().lower() in _TRUTHY
 
 
+#: Option 2 (PR C, 2026-09-29): may the cart-link lane buy an ENRICHMENT catalog row
+#: (`catalog_enrichment_agent_v1`) against a storefront proof in `enrichment_cart_variant_proofs`?
+#: Default OFF, the same strict parse, read at call time. It is an ADDITION to the cart-link dial,
+#: never a replacement: the reader below ANDs `is_cart_link_enabled()`, so this flag alone arms
+#: nothing. While it is off, `routes.agent_commerce_reap._load_cart_link_item` runs not one extra
+#: statement: the lane is exactly the one before this flag existed.
+#:
+#: NOT A KILL SWITCH FOR ROWS IN FLIGHT. `advance` does not re-read it; turning it off stops new
+#: enrichment purchases, and `REAP_AGENTIC_CART_LINK_ENABLED` remains the in-flight switch.
+REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED_ENV = "REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED"
+
+
+def is_cart_link_enrichment_enabled() -> bool:
+    """Is the cart-link lane's enrichment-row branch armed? Both dials, read now; default OFF."""
+    return is_cart_link_enabled() and (
+        (os.getenv(REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED_ENV) or "").strip().lower() in _TRUTHY
+    )
+
+
 # ── the backoff table ────────────────────────────────────────────────────────────────────────
 
 #: Seconds to wait before looking at a purchase again when a step made NO PROGRESS. Keyed by the
