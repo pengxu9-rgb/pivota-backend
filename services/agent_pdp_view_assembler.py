@@ -1846,6 +1846,11 @@ async def refresh_agent_pdp_view_for_content_key(
     build (no catalog rows / too thin a row to be useful — no title). Raises
     on DB errors so callers can decide isolation; the catalog_sync caller
     wraps this best-effort so a stale PDP cache never breaks ingest.
+
+    Nothing to build must also mean nothing served: when the key still has
+    catalog rows but none the builder may use, the view row it had is deleted
+    (see delete_agent_pdp_view_if_unbuildable). A key with no catalog rows at
+    all is left to the orphan reaper, as before.
     """
     read_db = db or database
     row = await build_agent_pdp_view_row(
@@ -1856,6 +1861,9 @@ async def refresh_agent_pdp_view_for_content_key(
         refreshed_by_proposal_id=refreshed_by_proposal_id,
     )
     if row is None:
+        await delete_agent_pdp_view_if_unbuildable(
+            content_key, refresh_source=refresh_source, db=read_db
+        )
         return False
     await read_db.execute(UPSERT_SQL, row_to_upsert_params(row))
     return True
@@ -2124,6 +2132,121 @@ async def reap_orphaned_agent_pdp_view_rows(
         "with_evidence": with_evidence,
         "deleted": deleted,
         "sample": orphans[:10],
+    }
+
+
+# ---------------------------------------------------------------------
+# Unbuildable reaper — the key's catalog rows exist, none of them may be served
+# ---------------------------------------------------------------------
+#
+# The orphan reaper above only fires when NO catalog_products row references the
+# key. A key whose rows all come from a quarantined source (or all lack a title)
+# is not an orphan, yet the builder declines it: fetch_products_for_key anti-joins
+# the quarantine, so the refresh returns False and writes nothing. The view then
+# keeps serving whatever it held when the quarantine landed. Measured 2026-09-29:
+# 922 of 23,473 view rows, 778 of them last written by the 2026-06 backfill
+# (backfill_3a_ii), 553 still serving_eligible or index_eligible. The reconciler
+# excludes these keys by design (its `buildable` gate), so no sweep ever touched
+# them.
+#
+# "Buildable" is the reconciler's own predicate (jobs/agent_pdp_view_reconciler_cron
+# _TRUTH_CTE): a member that survives the quarantine anti-join with a non-empty
+# title. Using the same predicate means the reconciler and this reaper split the
+# keys between them; neither has to guess what the other covers. Deleting is safe
+# because the view is a cache: if the quarantine is revoked, the next refresh (or
+# the reconciler's missing-public pass) builds the row again from catalog truth.
+
+_UNBUILDABLE_PREDICATE = f"""
+    EXISTS (SELECT 1 FROM catalog_products cp0 WHERE cp0.content_key = av.content_key)
+    AND NOT EXISTS (
+        SELECT 1 FROM catalog_products cp
+        WHERE cp.content_key = av.content_key
+          AND cp.title IS NOT NULL AND trim(cp.title) <> ''
+        {_SOURCE_QUARANTINE_ANTI_JOIN}
+    )
+"""
+
+_DELETE_IF_UNBUILDABLE_SQL = f"""
+    DELETE FROM agent_pdp_view av
+    WHERE av.content_key = :content_key
+      AND {_UNBUILDABLE_PREDICATE}
+    RETURNING av.content_key, av.pdp_lifecycle_stage, av.refresh_source
+"""
+
+
+async def delete_agent_pdp_view_if_unbuildable(
+    content_key: str, *, refresh_source: Optional[str] = None, db: Any = None
+) -> bool:
+    """Delete the view row for `content_key` IFF catalog rows still reference the
+    key but none is buildable. The predicate is re-checked inside the DELETE, so a
+    member that became buildable after the caller's build returned None keeps its
+    row. No-op for a live key, an orphan, or a key with no view row.
+
+    Returns True when a row was deleted.
+    """
+    if not content_key:
+        return False
+    read_db = db or database
+    deleted = await read_db.fetch_one(_DELETE_IF_UNBUILDABLE_SQL, {"content_key": content_key})
+    if not deleted:
+        return False
+    # WARNING: prod drops INFO from module loggers, and a served row going away
+    # is worth seeing.
+    logger.warning({
+        "event": "agent_pdp_view_unbuildable_reaped",
+        "content_key": content_key,
+        "pdp_lifecycle_stage": dict(deleted).get("pdp_lifecycle_stage"),
+        "last_refresh_source": dict(deleted).get("refresh_source"),
+        "refresh_source": refresh_source,
+    })
+    return True
+
+
+async def reap_unbuildable_agent_pdp_view_rows(
+    *,
+    db: Any = None,
+    limit: Optional[int] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Sweep the view rows delete_agent_pdp_view_if_unbuildable would delete.
+
+    Dry-run by DEFAULT, unlike the orphan sweep: the first run removes the
+    backlog of stale rows (922 on 2026-09-29), which is a prod write that needs an
+    explicit go. Returns {"unbuildable", "deleted", "content_keys", "sample"};
+    `content_keys` is the full list so a dry run can be kept as a manifest.
+    """
+    read_db = db or database
+    limit_clause = " LIMIT :limit" if limit and int(limit) > 0 else ""
+    params = {"limit": int(limit)} if limit and int(limit) > 0 else {}
+    rows = await read_db.fetch_all(
+        f"""
+        SELECT av.content_key, av.pivota_signature_id, av.title,
+               av.pdp_lifecycle_stage, av.refresh_source
+        FROM agent_pdp_view av
+        WHERE {_UNBUILDABLE_PREDICATE}
+        ORDER BY av.refreshed_at ASC, av.content_key
+        """ + limit_clause,
+        params,
+    )
+    found = [dict(r) for r in rows]
+    deleted = 0
+    if not dry_run:
+        for r in found:
+            deleted += int(await delete_agent_pdp_view_if_unbuildable(
+                r["content_key"], refresh_source="unbuildable_sweep", db=read_db
+            ))
+    if found:
+        logger.warning({
+            "event": "agent_pdp_view_unbuildable_sweep",
+            "unbuildable": len(found),
+            "deleted": deleted,
+            "dry_run": dry_run,
+        })
+    return {
+        "unbuildable": len(found),
+        "deleted": deleted,
+        "content_keys": [r["content_key"] for r in found],
+        "sample": found[:10],
     }
 
 

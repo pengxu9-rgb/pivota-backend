@@ -32,7 +32,9 @@ refreshed_at=NOW(), so a converged row drops out of the candidate set and
 idle passes write nothing. Orphan view rows (content_key with no
 catalog_products row left) are deliberately out of scope — the orphan
 reaper owns deletes; this job only converges rows that upstream truth says
-should exist.
+should exist. The same goes for view rows whose keys fail the `buildable`
+gate below: the refresh primitive deletes those itself
+(services.agent_pdp_view_assembler.delete_agent_pdp_view_if_unbuildable).
 
 Env vars:
   AGENT_PDP_VIEW_RECONCILE_ENABLED       default true — set false to pause
