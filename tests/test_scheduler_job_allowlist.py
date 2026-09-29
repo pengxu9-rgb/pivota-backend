@@ -303,17 +303,18 @@ async def test_commas_only_registers_nothing_and_wraps_nothing(monkeypatch, clea
 # --- fail closed outside production -------------------------------------------------------
 
 
+@pytest.mark.parametrize("flag", ["true", "1", "yes", "on", " TRUE "])
 @pytest.mark.parametrize("pivota_env", ["staging", "development"])
 @pytest.mark.parametrize("raw", [None, "", "   "])
 async def test_non_production_worker_with_no_allowlist_starts_nothing(
-    monkeypatch, clean_state, pivota_env, raw
+    monkeypatch, clean_state, pivota_env, raw, flag
 ):
     """deploy_worker.sh CONFIG=apply replaces the whole env, gcloud can empty `,`, the console can
     clear the field: on a non-production worker a vanished allowlist must not mean every job."""
     env = {} if raw is None else {allowlist_mod.ENV_VAR: raw}
     with root_as_in_prod(), capture_pivota_stdout() as buf:
         rec = await _start(
-            monkeypatch, clean_state, PIVOTA_ENV=pivota_env, AUDIT_WORKER_ENABLED="true", **env,
+            monkeypatch, clean_state, PIVOTA_ENV=pivota_env, AUDIT_WORKER_ENABLED=flag, **env,
         )
         spawned = _record_spawns(monkeypatch)
         await _start_loops(monkeypatch)
@@ -332,11 +333,16 @@ async def test_non_production_worker_with_no_allowlist_starts_nothing(
 async def test_star_is_the_explicit_opt_in_to_every_job_outside_production(
     monkeypatch, clean_state, raw
 ):
-    rec = await _start(
-        monkeypatch, clean_state,
-        PIVOTA_ENV="staging", AUDIT_WORKER_ENABLED="true", SCHEDULER_JOB_ALLOWLIST=raw,
-    )
+    with root_as_in_prod(), capture_pivota_stdout() as buf:
+        rec = await _start(
+            monkeypatch, clean_state,
+            PIVOTA_ENV="staging", AUDIT_WORKER_ENABLED="true", SCHEDULER_JOB_ALLOWLIST=raw,
+        )
     assert rec.ids == MAIN_WORKER_JOB_IDS
+    # `*` is an explicit choice, so the boot says so, like any other active allowlist.
+    active = [ln for ln in pivota_lines(buf) if "SCHEDULER_JOB_ALLOWLIST ACTIVE" in ln]
+    assert len(active) == 1 and "allowlist=['*']" in active[0], pivota_lines(buf)
+    assert not [ln for ln in pivota_lines(buf) if "match no scheduler job" in ln]
     spawned = _record_spawns(monkeypatch)
     await _start_loops(monkeypatch)
     assert spawned == ALL_LOOPS
@@ -459,3 +465,24 @@ async def test_process_loop_skips_survive_the_scheduler_boot(monkeypatch, clean_
     skipped = clean_state.scheduler_diagnostics()["skipped_by_allowlist"]
     assert set(ALL_LOOPS) <= set(skipped)
     assert len(skipped) == len(MAIN_WORKER_JOB_IDS) - 1 + len(ALL_LOOPS)
+
+
+# --- one parser for AUDIT_WORKER_ENABLED ---------------------------------------------------
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, None), ("", None), ("   ", None),
+    ("1", True), ("true", True), ("TRUE", True), (" yes ", True), ("On", True),
+    ("0", False), ("false", False), ("no", False), ("off", False), ("ture", False),
+])
+def test_worker_flag_override_is_the_one_parser(monkeypatch, raw, expected):
+    import services.audit_scheduler as sched
+
+    if raw is None:
+        monkeypatch.delenv("AUDIT_WORKER_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("AUDIT_WORKER_ENABLED", raw)
+    assert sched.worker_flag_override() is expected
+    assert allowlist_mod._worker_flag_explicitly_true() is (expected is True)
+    if expected is not None:
+        assert sched._queue_worker_enabled() is expected

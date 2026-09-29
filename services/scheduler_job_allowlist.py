@@ -84,8 +84,10 @@ def parse_allowlist(raw: Optional[str]) -> Optional[FrozenSet[str]]:
 
 
 def _worker_flag_explicitly_true() -> bool:
-    # The same truthy spellings services.audit_scheduler._queue_worker_enabled accepts.
-    return (os.getenv("AUDIT_WORKER_ENABLED") or "").strip().lower() in ("1", "true", "yes", "on")
+    # ONE parser for AUDIT_WORKER_ENABLED, shared with _queue_worker_enabled.
+    from services.audit_scheduler import worker_flag_override
+
+    return worker_flag_override() is True
 
 
 def _fail_closed_applies() -> bool:

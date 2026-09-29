@@ -331,76 +331,55 @@ print the URL. A staging worker pointed at prod's URL would bring the poaching h
 > `docs/` on the scheduler lane; this is the same gap that left `catalog_import_drain_tick`
 > registered on an undeployed worker.
 
-### Staging pre-flight (MANDATORY before `REAP_AGENTIC_ENABLED=1` on staging)
+### Staging pre-flight (MANDATORY before `REAP_AGENTIC_ENABLED=1` on staging, and after EVERY staging restore)
 
-**a. Count.** Read-only, through a one-off Cloud Run job in the staging project (the database is
-on a private VPC address; `scripts/ops/run_oneoff_job.sh` is the way in — read the `DATABASE_URL`
-secretKeyRef off the staging worker rather than trusting the name below, and keep `@` out of the
-program so the script's `--args` delimiter choice stays deterministic):
+**Re-run it after every restore of the staging database.** A restore brings back whatever was
+live in production at that moment — purchases mid-payment, buyers' emails and addresses, live Reap
+approval links — and the poller, if armed, claims them on its next tick. A CLEAR from before the
+restore says nothing about the database after it. (Only claiming rows created after an arming
+timestamp would make this structural; that is not built — it needs a claim-SQL change in both
+dialects — so the census after each restore is the control.)
+
+Both steps are ONE program, `scripts/ops/reap_staging_preflight.py`, run as a one-off Cloud Run job
+in the **staging** project. The database is on a private VPC address; `run_oneoff_job.sh` is the
+way in, and it is run inline (`-c "$(cat …)"`) because the program need not be in any deployed
+image yet.
+
+> **`run_oneoff_job.sh` DEFAULTS TO PRODUCTION** — `PROJECT=pivota-prod`, prod's `DATABASE_URL`,
+> `PIVOTA_ENV=production`. The staging block below is not optional, and the program does not trust
+> it: before it reads or writes a single Reap row it ABORTS (exit 2) unless `PIVOTA_ENV` is
+> `staging`, the `DATABASE_URL` host is exactly staging's `10.122.0.3`, and the server's
+> `current_database()` is exactly `pivota`. Any doubt — an unreadable identity included — is an
+> abort. Those expected values are constants in the program, not flags.
+
+Read the `DATABASE_URL` secretKeyRef off the staging worker rather than trusting the name below:
 
 ```
-cat > /tmp/reap_staging_preflight.py <<'EOF'
-import asyncio, os, sys
-from urllib.parse import urlparse
-import asyncpg
-
-TERMINAL = ["completed", "failed", "refused", "expired"]
-
-async def main():
-    url = os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://")
-    u = urlparse(url)
-    print("db host", u.hostname, "db name", u.path.lstrip("/"))   # host + name only, never the URL
-    c = await asyncpg.connect(url)
-    try:
-        await c.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-        purchases = await c.fetch(
-            "SELECT state, count(*) AS n, count(buyer_email) AS with_email "
-            "FROM reap_agentic_purchases WHERE state <> ALL($1::text[]) "
-            "GROUP BY state ORDER BY state", TERMINAL)
-        enrollments = await c.fetch(
-            "SELECT status, count(*) AS n FROM reap_agentic_enrollments "
-            "WHERE status IN ('pending', 'active') GROUP BY status ORDER BY status")
-    finally:
-        await c.close()
-    for r in purchases:
-        print("non-terminal purchase", r["state"], r["n"], "with_email", r["with_email"])
-    for r in enrollments:
-        print("live enrollment", r["status"], r["n"])
-    if purchases or enrollments:
-        print("STOP: live rows present")
-        sys.exit(3)
-    print("CLEAR: no non-terminal purchase, no pending/active enrollment")
-
-asyncio.run(main())
-EOF
 PROJECT=pivota-staging \
 ENV_VARS=PIVOTA_ENV=staging,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600 \
 SECRETS=DATABASE_URL=<staging worker's DATABASE_URL secret>:latest \
-  scripts/ops/run_oneoff_job.sh -c "$(cat /tmp/reap_staging_preflight.py)"
+  scripts/ops/run_oneoff_job.sh -c "$(cat scripts/ops/reap_staging_preflight.py)" census
 ```
 
-The **exit code is the verdict** (0 = CLEAR, non-zero = STOP or a failed run); the printed host
-must be staging's (`10.122.0.3`).
+**a. Count** — `census`. Read-only (the session is `READ ONLY`). Prints the host, database name and
+counts only: non-terminal purchases by state (with how many carry an email and an approval link)
+and pending/active enrollments. **The exit code is the verdict:** 0 = CLEAR, 3 = STOP (live rows),
+2 = ABORT (not staging, or bad arguments). A non-zero exit from the runner can also be a failed
+job — read its output before concluding anything.
 
-**b. Scrub, or STOP.** If anything is live, either stop here, or — with the rail owner's explicit
-go, announced before it runs — terminalise and scrub those rows in the **staging** database only,
-the way a terminal transition does (`db/reap_agentic_ledger.py`: PII and claim columns nulled,
-`terminal_at` stamped):
+**b. Scrub, or STOP.** Either stop here, or — with the rail owner's explicit go, announced before
+it runs — run the SAME block with `scrub` (a dry run: the census plus what would change, writes
+nothing), then `scrub --apply`. `--apply` runs BOTH updates in ONE transaction, so either every
+live row is scrubbed or none is:
 
-```sql
-UPDATE reap_agentic_purchases
-   SET state = 'refused', last_error_code = 'staging_preflight_scrub',
-       shipping_address = NULL, buyer_email = NULL, offer_code = NULL,
-       claimed_by = NULL, claimed_at = NULL, next_poll_at = NULL,
-       terminal_at = clock_timestamp(), state_entered_at = clock_timestamp(),
-       updated_at = clock_timestamp()
- WHERE state NOT IN ('completed', 'failed', 'refused', 'expired');
-UPDATE reap_agentic_enrollments
-   SET status = 'dead', hosted_url = NULL, hosted_url_expires_at = NULL, updated_at = now()
- WHERE status IN ('pending', 'active');
-```
+* purchases not in a terminal state -> `refused`, `last_error_code = 'staging_preflight_scrub'`,
+  with `buyer_email`, `shipping_address`, `offer_code`, **`hosted_url`, `hosted_url_expires_at`**
+  (a restored row's link is a live Reap approval URL for a real production checkout), the claim
+  and `next_poll_at` nulled, and `terminal_at` stamped — the terminal transition's own scrub;
+* `pending`/`active` enrollments -> `dead`, with their `hosted_url` and expiry nulled.
 
-Then re-run (a) until it exits 0. Never run this against production.
+It prints the two row counts and re-runs the census; exit 0 means CLEAR. Never point it at
+production — and if you do, it aborts.
 
 **c. Sandbox only.** `REAP_API_BASE_URL` must be exactly one of `https://sandbox.api.reap.global`,
 `https://sg.sandbox.api.reap.global` (verified live for cart-link quotes 2026-09-28; the SG demo

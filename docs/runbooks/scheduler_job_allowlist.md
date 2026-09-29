@@ -104,16 +104,19 @@ set, or the non-production fail-closed rule applies):
 `fail_closed_non_production`. If reading the allowlist itself fails, the page shows
 `"job_allowlist_error": "<ExceptionType>"` rather than nothing — an absent key means unset.
 
-`jobs` / `job_count` then list only what registered. The boot also writes one WARNING line:
+`jobs` / `job_count` then list only what registered. The boot also writes one WARNING line (for `*` too, as `allowlist=['*']`, and for the fail-closed case as `allowlist=[]`):
 `audit_scheduler: SCHEDULER_JOB_ALLOWLIST ACTIVE allowlist=[...] worker_enabled=True registered=[...] skipped_by_allowlist=N`.
 
 ## Setting it with gcloud: commas
 
-`gcloud run services update --update-env-vars` splits its argument **on commas**, so
-`--update-env-vars SCHEDULER_JOB_ALLOWLIST=a,b` sets `SCHEDULER_JOB_ALLOWLIST=a` and then tries to
-parse `b` as a second `KEY=VALUE`. For any value with a comma — and whenever you set more than one
-variable, which is always the case here — use gcloud's custom-delimiter form: the argument starts
-with `^<delim>^` and then uses `<delim>` between pairs:
+`gcloud run services update --update-env-vars` splits its argument **on commas** into
+`KEY=VALUE` pairs, so `--update-env-vars SCHEDULER_JOB_ALLOWLIST=a,b` leaves `b` with no `=`.
+gcloud then **rejects the whole flag** (`Bad syntax for dict arg: [b]`) and **applies nothing** —
+no new revision, no variable changed, including any other pair in the same flag. That fails safe,
+but it also means the command you thought armed (or disarmed) the worker did not. For any value
+with a comma — and whenever you set more than one variable, which is always the case here — use
+gcloud's custom-delimiter form: the argument starts with `^<delim>^` and then uses `<delim>`
+between pairs:
 
 ```
 --update-env-vars='^|^SCHEDULER_JOB_ALLOWLIST=a,b|AUDIT_WORKER_ENABLED=true'
@@ -132,7 +135,8 @@ job fills, so it needs no other job. The allowlist is `reap_agentic_purchase_pol
 **Before anything here**, do the mandatory Reap pre-flight in
 `docs/runbooks/reap_agentic_purchase.md` ("Staging pre-flight"): the staging database is a
 restored copy of production, so non-terminal production purchases and enrollments in it must be
-counted and scrubbed (or you STOP) before the rail is armed, and `REAP_API_BASE_URL` must be
+counted and scrubbed (or you STOP) before the rail is armed — **and again after every staging
+restore**, which brings the live production rows back — and `REAP_API_BASE_URL` must be
 exactly a sandbox host — `sandbox.api.reap.global`, `sg.sandbox.api.reap.global` or
 `mx.sandbox.api.reap.global` (outside production the poller refuses any other host anyway).
 

@@ -325,6 +325,21 @@ def _allowlist_diagnostics() -> dict:
         return {"job_allowlist_error": type(exc).__name__}
 
 
+_WORKER_FLAG_TRUTHY = ("1", "true", "yes", "on")
+
+
+def worker_flag_override() -> Optional[bool]:
+    """AUDIT_WORKER_ENABLED, parsed ONCE for every reader: None when unset or blank (no explicit
+    decision), else True for a truthy spelling (case- and whitespace-insensitive) and False for
+    anything else. `_queue_worker_enabled` and the SCHEDULER_JOB_ALLOWLIST fail-closed rule
+    (services/scheduler_job_allowlist.py) both read it here, so they cannot disagree about what
+    "explicitly true" means."""
+    raw = (os.getenv("AUDIT_WORKER_ENABLED") or "").strip().lower()
+    if not raw:
+        return None
+    return raw in _WORKER_FLAG_TRUTHY
+
+
 def _queue_worker_enabled() -> bool:
     """Whether THIS process should drain the shared async-run queues
     (audit / executor / verification worker ticks + their lease reapers).
@@ -346,9 +361,9 @@ def _queue_worker_enabled() -> bool:
     service, or AUDIT_WORKER_ENABLED is explicitly false — so a detection miss
     can never accidentally stop the PRODUCTION worker (worst case = no change).
     """
-    override = (os.getenv("AUDIT_WORKER_ENABLED") or "").strip().lower()
-    if override:
-        return override in ("1", "true", "yes", "on")
+    override = worker_flag_override()
+    if override is not None:
+        return override
     service = (service_name() or "").lower()
     if "staging" in service or "preview" in service:
         return False
@@ -406,7 +421,7 @@ async def start_scheduler() -> None:
         # SCHEDULER_JOB_ALLOWLIST (services/scheduler_job_allowlist.py): None when unset/empty,
         # which is NO FILTER — every branch below that consults it is then a no-op. Outside
         # production with AUDIT_WORKER_ENABLED explicitly true, unset means ALLOW-NOTHING.
-        allowlist = job_allowlist.active_allowlist()
+        allowlist, allowlist_source = job_allowlist.resolve_allowlist()
         job_allowlist.begin_scheduler_boot()
         # Every id `_add_job` is asked for on a worker, registered or not — what an allowlist
         # entry is checked against, so a typo is reported rather than silently starting nothing.
@@ -1422,7 +1437,7 @@ async def start_scheduler() -> None:
             misfire_grace_time=21600,  # fire up to 6h late rather than skip a week
         )
 
-        if allowlist is not None:
+        if allowlist_source != job_allowlist.SOURCE_UNSET:
             _report_allowlist(allowlist, seen_job_ids, worker_enabled, scheduler)
 
         scheduler.start()
@@ -1530,7 +1545,8 @@ async def start_scheduler() -> None:
 
 
 def _report_allowlist(allowlist, seen_job_ids, worker_enabled: bool, scheduler) -> None:
-    """Boot-time report for an ACTIVE SCHEDULER_JOB_ALLOWLIST. Never called when it is unset.
+    """Boot-time report for an ACTIVE SCHEDULER_JOB_ALLOWLIST — a list, `*`, or the
+    non-production fail-closed. Never called when it is unset (source "unset").
 
     Through the "pivota" logger at WARNING: prod leaves root at WARNING, so a module logger's
     lines here could be dropped, and "which jobs did this worker decline to start" is exactly the
@@ -1541,7 +1557,11 @@ def _report_allowlist(allowlist, seen_job_ids, worker_enabled: bool, scheduler) 
 
     # Only on a worker: with the worker gate off `_add_job` records no ids (and the
     # `if worker_enabled:` blocks never call it), so every entry would read as a typo.
-    unknown = job_allowlist.unknown_ids(allowlist, seen_job_ids) if worker_enabled else []
+    # allowlist None here means `*` (source "all"): no ids to check, but still an ACTIVE line.
+    unknown = (
+        job_allowlist.unknown_ids(allowlist, seen_job_ids)
+        if worker_enabled and allowlist is not None else []
+    )
     job_allowlist.record_unknown(unknown)
     if unknown:
         operator_logger.warning(
@@ -1557,7 +1577,9 @@ def _report_allowlist(allowlist, seen_job_ids, worker_enabled: bool, scheduler) 
     operator_logger.warning(
         "audit_scheduler: %s ACTIVE allowlist=%s worker_enabled=%s registered=%s "
         "skipped_by_allowlist=%d",
-        job_allowlist.ENV_VAR, sorted(allowlist), worker_enabled, registered,
+        job_allowlist.ENV_VAR,
+        [job_allowlist.ALL_JOBS] if allowlist is None else sorted(allowlist),
+        worker_enabled, registered,
         len(job_allowlist.skipped_ids()),
     )
 
