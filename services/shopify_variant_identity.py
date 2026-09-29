@@ -62,6 +62,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import parse_qs, urlparse, urlunparse
 
+from services.text_normalization.display_text import clean_display_text
+
 # Shopify caps a product at 100 variants; anything past that is not a Shopify product page.
 MAX_VARIANTS = 100
 
@@ -616,10 +618,28 @@ class ProvenCartVariant(NamedTuple):
     variant_title: Optional[str] = None
 
 
+#: Longest variant title a cart proof carries, in code points. A Shopify variant title is
+#: `option1 / option2 / option3`; anything past this is not a title a buyer is shown. The backfill
+#: (writer) and `_proof_variant_title` (reader) both cap with THIS constant.
+MAX_VARIANT_TITLE = 200
+
+
+def clean_variant_title(title: Any) -> Optional[str]:
+    """The ONE rule for a cart proof's `variant_title`, applied where it is WRITTEN
+    (`scripts/backfill_shopify_variant_ids._live_title`) and again where it is READ
+    (`_proof_variant_title`), so a proof written before the rule existed is cleaned on read.
+
+    The title is merchant-typed storefront text: `clean_display_text` drops control, format
+    (bidi override/isolate, zero-width), private-use and surrogate characters, folds whitespace
+    to single spaces, NFC-normalises and caps. HTML is left as text -- escaping is the
+    renderer's job, not storage's. "07 BURGUNDY INK" and "Default Title" pass unchanged.
+    """
+    return clean_display_text(title, max_chars=MAX_VARIANT_TITLE)
+
+
 def _proof_variant_title(seed_data: Any) -> Optional[str]:
     proof = _cart_proof(seed_data) or {}
-    title = proof.get("variant_title")
-    return (title.strip()[:200] or None) if isinstance(title, str) else None
+    return clean_variant_title(proof.get("variant_title"))
 
 
 def verified_cart_variant_id(
