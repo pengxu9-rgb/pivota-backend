@@ -114,6 +114,7 @@ def _checkout():
 @pytest.mark.parametrize("base,dial", [
     ("https://sandbox.api.reap.global", "COMPLETED"),
     ("https://mx.sandbox.api.reap.global", "COMPLETED"),
+    ("https://sg.sandbox.api.reap.global", "COMPLETED"),
     # Hostnames are case-insensitive; `.strip()` removes surrounding whitespace only.
     ("https://SANDBOX.API.REAP.GLOBAL/", " COMPLETED\n"),
     # An explicit port: the comparison is on the parsed HOSTNAME, not the netloc. These kill a
@@ -133,6 +134,7 @@ def test_the_sandbox_hosts_with_the_exact_dial_get_the_header(base, dial, ops_lo
     "https://prod.api.reap.global",                          # production
     "https://api.reap.global",
     "https://mx.prod.api.reap.global",
+    "https://sg.prod.api.reap.global",
     "https://sandbox.api.reap.global.evil.example",          # suffix attack
     "https://evil.example/sandbox.api.reap.global",          # host in the path
     "https://sandbox-api.reap.global",                       # near miss
@@ -336,3 +338,69 @@ def test_a_simulated_checkout_is_a_different_request_from_an_unsimulated_one(wir
         {"quoteId": QUOTE_ID, "enrollmentId": ENROLLMENT_UUID, "simulate": "COMPLETED"},
         bucket_seconds=None,
     )
+
+
+# --- ONE sandbox host set, derived from Reap's published servers list ----------------------
+#
+# `REAP_SANDBOX_HOSTS` feeds both the simulate header and the poller's outside-production guard
+# (`is_sandbox_base_url`). It is pinned to the spec fixture so a servers change fails here rather
+# than leaving one gate behind the other.
+
+import json as _json
+import pathlib as _pathlib
+from urllib.parse import urlparse as _urlparse
+
+_SPEC = _pathlib.Path(__file__).parent / "fixtures" / "reap_openapi_agentic_2026_09_28.json"
+
+
+def _spec_hosts():
+    servers = _json.loads(_SPEC.read_text())["servers"]
+    sandbox = {_urlparse(s["url"]).hostname for s in servers if "sandbox" in s["description"].lower()}
+    prod = {_urlparse(s["url"]).hostname for s in servers if "production" in s["description"].lower()}
+    return sandbox, prod
+
+
+def test_the_sandbox_host_set_is_exactly_the_specs_sandbox_servers():
+    sandbox, prod = _spec_hosts()
+    assert sandbox == {"sandbox.api.reap.global", "sg.sandbox.api.reap.global",
+                       "mx.sandbox.api.reap.global"}
+    assert rc.REAP_SANDBOX_HOSTS == sandbox
+    assert not (rc.REAP_SANDBOX_HOSTS & prod)
+    # One list, not two: the simulate header's set IS the sandbox set.
+    assert rc.SIMULATE_CHECKOUT_SANDBOX_HOSTS is rc.REAP_SANDBOX_HOSTS
+
+
+@pytest.mark.parametrize("base", [
+    "https://sandbox.api.reap.global",
+    "https://sg.sandbox.api.reap.global",
+    "https://mx.sandbox.api.reap.global",
+    "https://SG.SANDBOX.API.REAP.GLOBAL/",
+    "https://sg.sandbox.api.reap.global:443",
+])
+def test_is_sandbox_base_url_accepts_the_three_sandbox_hosts(base):
+    assert rc.is_sandbox_base_url(base) is True
+
+
+@pytest.mark.parametrize("base", [
+    "https://prod.api.reap.global",
+    "https://sg.prod.api.reap.global",
+    "https://mx.prod.api.reap.global",
+    "https://attacker.sg.sandbox.api.reap.global",           # suffix trick: exact match only
+    "https://x.sandbox.api.reap.global",
+    "https://sg.sandbox.api.reap.global.evil.example",
+    "https://u:p@sg.sandbox.api.reap.global",                # userinfo
+    "http://sg.sandbox.api.reap.global",                     # not https
+    "",
+    "   ",
+])
+def test_is_sandbox_base_url_refuses_everything_else(base):
+    assert rc.is_sandbox_base_url(base) is False
+
+
+def test_is_sandbox_base_url_reads_the_environment_when_not_given_a_value(monkeypatch):
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sg.sandbox.api.reap.global")
+    assert rc.is_sandbox_base_url() is True
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sg.prod.api.reap.global")
+    assert rc.is_sandbox_base_url() is False
+    monkeypatch.delenv("REAP_API_BASE_URL")
+    assert rc.is_sandbox_base_url() is False

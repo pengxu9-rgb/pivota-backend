@@ -123,7 +123,7 @@ handle is quoting against something nobody has checked since.
 | `REAP_API_BASE_URL` + `REAP_API_KEY` | unset | both required; otherwise `start_purchase` refuses `rail_unconfigured`. |
 | `REAP_RETURN_URL_HOSTS` | `api.pivota.cc,agent.pivota.cc` | host allowlist for our own `returnUrl`. Empty/unset means the default, not "no hosts". **Order matters:** the first host is the default return URL's host. |
 | `REAP_AGENTIC_RETURN_URL` | unset | the return URL the routes use when the caller sends none. Unset ⇒ `https://<first REAP_RETURN_URL_HOSTS host>/reap/return`. Validated like a caller's (https, allowlisted host, no userinfo). |
-| `REAP_AGENTIC_SIMULATE_CHECKOUT` | **unset = off** | **Sandbox only.** Exactly `COMPLETED` (case-sensitive; anything else is ignored with a WARNING on the `pivota` logger) adds `X-Simulate-Checkout: COMPLETED` to `POST /agentic/checkouts` and to no other request — and only when `REAP_API_BASE_URL`'s host is exactly `sandbox.api.reap.global` or `mx.sandbox.api.reap.global` (any other host: header withheld, WARNING). See below. |
+| `REAP_AGENTIC_SIMULATE_CHECKOUT` | **unset = off** | **Sandbox only.** Exactly `COMPLETED` (case-sensitive; anything else is ignored with a WARNING on the `pivota` logger) adds `X-Simulate-Checkout: COMPLETED` to `POST /agentic/checkouts` and to no other request — and only when `REAP_API_BASE_URL`'s host is exactly one of the sandbox hosts `sandbox.api.reap.global`, `sg.sandbox.api.reap.global` or `mx.sandbox.api.reap.global` (`rc.REAP_SANDBOX_HOSTS`; any other host: header withheld, WARNING). See below. |
 
 **`REAP_AGENTIC_SIMULATE_CHECKOUT`, measured 25 Sep in the sandbox.** It does not skip the buyer:
 the checkout is still created `REQUIRES_ACTION` with a hosted approval URL, and a human must approve
@@ -301,12 +301,25 @@ the unfenced bulk sweeps and must never be alerted on.
 ## Arming it
 
 The poller runs **only on the worker service**. `_add_job` registers nothing unless
-`services.audit_scheduler._queue_worker_enabled()` is true. The claim has no environment filter,
-so what keeps a staging worker off production purchases is that staging has its own database:
-prod and staging run separate Cloud SQL instances (`infra/gcp/README.md`, verified 2026-09-29).
-The gate dates from the Railway era, when they shared one Postgres and a staging service would
-have poached production purchases and spent a buyer's card with staging code; it still keeps the
-poller off staging/preview services by default.
+`services.audit_scheduler._queue_worker_enabled()` is true. The claim has no environment filter.
+Prod and staging run separate Cloud SQL instances (`infra/gcp/README.md`, verified 2026-09-29),
+so a staging worker cannot reach **prod's** rows — but that is NOT enough to keep it off
+production purchases: **staging's database is a restored copy of production.** Every production
+purchase that was `resolving`, `quoting`, `needs_enrollment`, `awaiting_approval` or `processing`
+when the copy was taken is in it, with the buyer's email and address, and an armed staging
+poller would claim it and call `create_enrollment` (Reap emails that real buyer),
+`request_quote` and `create_checkout`. Arming on staging therefore requires the **Staging
+pre-flight** below. The gate itself dates from the Railway era, when prod and staging shared one
+Postgres; it still keeps the poller off staging/preview services by default.
+
+Code guard, in addition: outside production (`platform_env()` ≠ production) the poller's step 4
+runs only when `REAP_API_BASE_URL`'s host is exactly one of `sandbox.api.reap.global`,
+`sg.sandbox.api.reap.global` or `mx.sandbox.api.reap.global` (`rc.is_sandbox_base_url`, reading
+`rc.REAP_SANDBOX_HOSTS` — the same set as the simulate header). Any other host —
+`prod.api.reap.global`, `sg.prod.api.reap.global`, `mx.prod.api.reap.global`, a suffix like
+`x.sandbox.api.reap.global`, a URL with userinfo — reports `skipped_disabled=1` and logs one ERROR on the
+`pivota` logger per process; the sweeps still run. It is a backstop, not a substitute for the
+pre-flight: the sandbox would still be asked to enroll and quote production buyers' rows.
 
 **Pre-flight before arming any worker:** confirm its `DATABASE_URL` host is its own project's
 instance (prod `10.25.0.2`, staging `10.122.0.3`) — compare host and database name only, never
@@ -318,9 +331,74 @@ print the URL. A staging worker pointed at prod's URL would bring the poaching h
 > `docs/` on the scheduler lane; this is the same gap that left `catalog_import_drain_tick`
 > registered on an undeployed worker.
 
+### Staging pre-flight (MANDATORY before `REAP_AGENTIC_ENABLED=1` on staging, and after EVERY staging restore)
+
+**Re-run it after every restore of the staging database.** A restore brings back whatever was
+live in production at that moment — purchases mid-payment, buyers' emails and addresses, live Reap
+approval links — and the poller, if armed, claims them on its next tick. A CLEAR from before the
+restore says nothing about the database after it. (Only claiming rows created after an arming
+timestamp would make this structural; that is not built — it needs a claim-SQL change in both
+dialects — so the census after each restore is the control.)
+
+Both steps are ONE program, `scripts/ops/reap_staging_preflight.py`, run as a one-off Cloud Run job
+in the **staging** project. The database is on a private VPC address; `run_oneoff_job.sh` is the
+way in, and it is run inline (`-c "$(cat …)"`) because the program need not be in any deployed
+image yet.
+
+> **`run_oneoff_job.sh` DEFAULTS TO PRODUCTION** — `PROJECT=pivota-prod`, prod's `DATABASE_URL`,
+> `PIVOTA_ENV=production`. The staging block below is not optional, and the program does not trust
+> it: before it reads or writes a single Reap row it ABORTS (exit 2) unless `PIVOTA_ENV` is
+> exactly `staging` (no surrounding whitespace, no other case), the `DATABASE_URL` names ONE host,
+> exactly staging's `10.122.0.3`, with no `host` / `hostaddr` / `service` query parameter, and the
+> server's `current_database()` is exactly `pivota`. It then connects with `host=10.122.0.3`
+> passed explicitly, so nothing in the URL can redirect it. Any doubt — an unreadable identity
+> included — is an abort. Those expected values are constants in the program, not flags.
+
+Read the `DATABASE_URL` secretKeyRef off the staging worker rather than trusting the name below:
+
+```
+PROJECT=pivota-staging \
+ENV_VARS=PIVOTA_ENV=staging,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600 \
+SECRETS=DATABASE_URL=<staging worker's DATABASE_URL secret>:latest \
+  scripts/ops/run_oneoff_job.sh -c "$(cat scripts/ops/reap_staging_preflight.py)" census
+```
+
+**a. Count** — `census`. Read-only (the session is `READ ONLY`). Prints the host, database name and
+counts only: non-terminal purchases by state (with how many carry an email and an approval link)
+and pending/active enrollments. **The exit code is the verdict:** 0 = CLEAR, 3 = STOP (live rows),
+2 = ABORT (not staging, or bad arguments). A non-zero exit from the runner can also be a failed
+job — read its output before concluding anything.
+
+**b. Scrub, or STOP.** Either stop here, or — with the rail owner's explicit go, announced before
+it runs — run the SAME block with `scrub` (a dry run: the census plus what would change, writes
+nothing), then `scrub --apply`. `--apply` runs BOTH updates in ONE transaction, so either every
+live row is scrubbed or none is:
+
+* purchases not in a terminal state -> `refused`, `last_error_code = 'staging_preflight_scrub'`,
+  with `buyer_email`, `shipping_address`, `offer_code`, **`hosted_url`, `hosted_url_expires_at`**
+  (a restored row's link is a live Reap approval URL for a real production checkout), the claim
+  and `next_poll_at` nulled, and `terminal_at` stamped — the terminal transition's own scrub;
+* `pending`/`active` enrollments -> `dead`, with their `hosted_url` and expiry nulled.
+
+It prints the two row counts and re-runs the census; exit 0 means CLEAR. Never point it at
+production — and if you do, it aborts.
+
+**c. Sandbox only.** `REAP_API_BASE_URL` must be exactly one of `https://sandbox.api.reap.global`,
+`https://sg.sandbox.api.reap.global` (verified live for cart-link quotes 2026-09-28; the SG demo
+merchant) or `https://mx.sandbox.api.reap.global`, and `REAP_API_KEY` a sandbox key. The poller refuses any
+other host outside production (above), but check it before arming rather than discovering it in
+the ERROR line.
+
+### Steps
+
 1. Deploy the worker service.
 2. `AUDIT_WORKER_ENABLED=true` on it (or let the service-name detection decide; the gate is
-   fail-safe toward ENABLED, so an unknown platform stays on).
+   fail-safe toward ENABLED, so an unknown platform stays on). **On staging, set it in the same
+   command as `SCHEDULER_JOB_ALLOWLIST=reap_agentic_purchase_poll`** — one revision, never two —
+   using the exact command in `docs/runbooks/scheduler_job_allowlist.md` ("Arm the worker").
+   Outside production a worker with the flag explicitly true and no allowlist starts nothing.
+   To undo, set `AUDIT_WORKER_ENABLED=false` (or `REAP_AGENTIC_ENABLED=0`); never remove the
+   allowlist while the flag is true.
 3. `REAP_API_BASE_URL` + `REAP_API_KEY` — both, or `is_configured()` is false and every run
    returns `skipped_disabled=1`.
 4. `REAP_AGENTIC_ENABLED=1`. **This is the arming step.** No redeploy and no scheduler restart:
