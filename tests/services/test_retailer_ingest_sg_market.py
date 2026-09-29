@@ -102,6 +102,16 @@ async def test_an_sg_job_runs_where_sg_is_served(env, monkeypatch):  # noqa: F81
         await pipeline.run_stage(sg_job(), db=env.db)
 
 
+async def test_an_sg_apply_is_refused_before_its_recrawl_too(env, monkeypatch):  # noqa: F811
+    """The guard is not a dry-run check: an SG job that reached apply_due on a drain later re-imaged without SG
+    must not write rows that read back unserved (review of #2442: a dry-run-only mutant survived)."""
+    monkeypatch.setattr(ips, "serving_pricing_regions", lambda: ["US"])
+    env.crawl_error = AssertionError("must not crawl")
+    out = await pipeline.run_stage(sg_job("apply_due"), db=env.db)
+    assert (out["status"], out["outcome"]) == ("failed", "served_market_unconfigured")
+    assert env.applied == []
+
+
 @pytest.mark.parametrize("market", ["US", "AU", "JP"])
 async def test_the_served_market_guard_never_touches_us_or_acquisition_jobs(env, monkeypatch, market):  # noqa: F811
     monkeypatch.setattr(ips, "serving_pricing_regions", lambda: ["US"])

@@ -681,8 +681,9 @@ _HAS_US_OFFER_EXISTS = has_offer_priced_for_region_sql("cp.product_key", "US")
 # names a second region.
 #
 # NOT DERIVED FROM THE ROW. A row's own market cannot be read here: catalog_offers
-# .market is a NOT NULL DEFAULT 'US' that no external-seed writer sets (mig 149),
-# so it says 'US' for the SGD rows too. Currency is the only truthful signal, and
+# .market is a NOT NULL DEFAULT 'US' that older external-seed writers never set (mig 149),
+# so it says 'US' for the older SGD rows (the retailer_ingest lane stamps 'SG' since
+# 2026-09-29, but the column is INSERT-only). Currency is the only truthful signal, and
 # this asks the only question currency can answer — "is this priced in something
 # one of our served regions expects" — never "convert it".
 _SERVING_REGIONS_ENV = "PIVOTA_SERVING_PRICING_REGIONS"
