@@ -161,6 +161,27 @@ async def test_real_sql_a_fully_retired_chain_is_reported_not_refused(catalog):
     await writer._refuse_parallel_retailer_listings(plan, database)  # admitted: no raise
 
 
+@pytest.mark.parametrize("reason", ["stale_after_sync", "d2_same_url"])
+async def test_real_sql_a_suppression_its_own_lane_lifts_is_not_a_retirement(catalog, reason):
+    """Review of #2448: catalog_sync clears `stale_after_sync` on the next re-sync; identity_resolution.revert_run
+    revives its `d2_*` rows with their seeds. A new listing admitted onto either URL would be its twin by then."""
+    from services import catalog_sync_service, identity_resolution
+    from services.catalog_enrichment_agent import apply as writer
+
+    assert catalog_sync_service.STALE_AFTER_SYNC in writer.SELF_REVIVING_SUPPRESSION_REASONS
+    assert "suppression_reason LIKE 'd2" in identity_resolution.REVERT_ROWS_SQL
+    database, admin = catalog
+    plan = _plan()
+    await _insert(admin, LEGACY_SUPPRESSED, "https://ohlolly.com/products/haruharu-wonder-serum-mist",
+                  suppressed=True)
+    await admin.execute("UPDATE catalog_products SET suppression_reason = $2 WHERE product_key = $1",
+                        LEGACY_SUPPRESSED, reason)
+    await _seed(admin, LEGACY_SUPPRESSED, "inactive")
+    await _offer(admin, LEGACY_SUPPRESSED, suppressed=True)
+    with pytest.raises(ValueError, match="retailer_listing_migration_required"):
+        await writer._refuse_parallel_retailer_listings(plan, database)
+
+
 async def test_real_sql_a_suppression_without_a_reason_is_not_a_retirement(catalog):
     from services.catalog_enrichment_agent import apply as writer
 
@@ -220,7 +241,10 @@ async def test_real_sql_live_retailer_listing_owner_matches_the_url_not_the_host
     await _insert(admin, "ext:retailer:live", url + "?variant=45000000000001")
     await _insert(admin, "ext:retailer:gone", "https://www.ohlolly.com/products/other", suppressed=True)
     await _insert(admin, "ext:retailer:other", "https://ohlolly.com/products/other-thing")
+    await _insert(admin, "ext:legacy-live", "https://ohlolly.com/products/legacy-only")  # live, but not a listing
     assert await writer.live_retailer_listing_owner(database, "https://www.ohlolly.com" + url[19:] + "/") \
         == "ext:retailer:live"
     assert await writer.live_retailer_listing_owner(database, "https://ohlolly.com/products/other") is None
+    assert await writer.live_retailer_listing_owner(database, "https://ohlolly.com/products/legacy-only") is None
     assert await writer.live_retailer_listing_owner(database, None) is None
+    assert await writer.live_retailer_listing_owner(database, "https://[bad/products/x") is None

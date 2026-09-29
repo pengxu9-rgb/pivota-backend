@@ -1697,13 +1697,24 @@ _LEGACY_LISTING_OWNERS_SQL = """
         """
 
 
+#: Suppressions their own lane lifts again, so never a retirement (review of #2448): catalog_sync_service clears a
+#: `stale_after_sync` tombstone on the next re-sync (STALE_AFTER_SYNC), and identity_resolution.revert_run revives
+#: every `d2_<strategy>` row of the run it reverts, seeds included. Admitting a new listing onto either URL would
+#: leave two live listings on it the moment that lane runs.
+SELF_REVIVING_SUPPRESSION_REASONS = ("stale_after_sync",)
+SELF_REVIVING_SUPPRESSION_PREFIXES = ("d2_",)
+
+
 def legacy_chain_retired(row: Dict[str, Any]) -> bool:
-    """The legacy owner's WHOLE chain is retired: the product suppressed WITH a reason, no active seed (attached to
-    it, or its source_ref), no live offer. A suppressed product row alone proves nothing (its seeds carry their own status, its offers
-    their own suppression) -- this checks each link. Measured 2026-09-29: cocomo.sg's 421 old brand-style rows
-    (suppressed 09-27, reason sg_retailer_filed_under_us_partition) had 421 inactive seeds and 491 suppressed
-    offers, and still blocked the store's SG re-file on 286 URLs."""
-    return (row.get("suppressed_at") is not None and bool(str(row.get("suppression_reason") or "").strip())
+    """The legacy owner's WHOLE chain is retired: the product suppressed WITH a reason no lane lifts on its own, no
+    active seed (attached to it, or its source_ref), no live offer. A suppressed product row alone proves nothing
+    (its seeds carry their own status, its offers their own suppression) -- this checks each link. Measured
+    2026-09-29: cocomo.sg's 421 old brand-style rows (suppressed 09-27, reason sg_retailer_filed_under_us_partition)
+    had 421 inactive seeds and 491 suppressed offers, and still blocked the store's SG re-file on 286 URLs."""
+    reason = str(row.get("suppression_reason") or "").strip()
+    if not reason or reason in SELF_REVIVING_SUPPRESSION_REASONS or reason.startswith(SELF_REVIVING_SUPPRESSION_PREFIXES):
+        return False
+    return (row.get("suppressed_at") is not None
             and row.get("has_active_seed") is False and row.get("has_live_offer") is False)
 
 
@@ -1782,13 +1793,13 @@ async def live_retailer_listing_owner(database: Any, canonical_url: Optional[str
     from services.catalog_enrichment_agent.ingestion import retailer_listing_identity
 
     url = str(canonical_url or "")
-    host = (urlsplit(url).hostname or "").lower()
-    host = host[4:] if host.startswith("www.") else host
-    if not host:
-        return None
-    try:
-        identity = retailer_listing_identity(host, url)
+    try:  # a malformed legacy URL ("https://[bad/") must not abort the caller's revert loop
+        host = (urlsplit(url).hostname or "").lower()
+        host = host[4:] if host.startswith("www.") else host
+        identity = retailer_listing_identity(host, url) if host else None
     except ValueError:
+        return None
+    if not host or identity is None:
         return None
     for row in await database.fetch_all(_LIVE_RETAILER_LISTINGS_ON_HOST_SQL, {"host": host}) or []:
         row = dict(row)
@@ -1817,14 +1828,16 @@ async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any
     executors refuse before any merchant or catalog write when that work remains.
 
     A SUPPRESSED legacy owner still refuses -- unless its WHOLE chain is proven retired (legacy_chain_retired:
-    suppressed with a reason, no active seed, no live offer; 2026-09-29). KNOWN LIMIT: reverting such a chain
-    afterwards puts two live listings on one URL: scripts/withdraw_catalog_rows.py --revert refuses a row whose
-    URL a live listing now owns (live_retailer_listing_owner); any other revert must retire the new listing first.
-    `catalog_products.suppressed_at` is reversible -- scripts/withdraw_catalog_rows.py
-    --revert and services/identity_resolution.py REVERT_ROWS_SQL both clear it -- and it
-    says nothing about the row's seed/sku/offer chain (external_product_seeds carries
-    its own `status`), so a suppressed product row is not proof its legacy chain is
-    retired. Admitting it would let a revert put two live listings on one URL.
+    suppressed with a reason no lane lifts on its own, no active seed, no live offer; 2026-09-29).
+    `catalog_products.suppressed_at` is reversible and says nothing about the row's seed/sku/offer chain
+    (external_product_seeds carries its own `status`), so a suppressed product row alone is not proof.
+    Reviving an admitted chain would put two live listings on one URL, so each reviver is closed:
+      - catalog_sync re-sync (`stale_after_sync`) and identity_resolution.revert_run (`d2_*`): those reasons
+        never count as retired (SELF_REVIVING_SUPPRESSION_*);
+      - scripts/withdraw_catalog_rows.py and scripts/remediate_unpublished_crawl_rows.py --revert: skip a row
+        whose URL a live listing now owns (live_retailer_listing_owner).
+    KNOWN LIMIT: a hand-run revert (e.g. the SQL in scripts/step5_*.py docstrings) must retire the new listing
+    first. A mirror seed linked only by external_product_id is not followed (the mirror insert is DO NOTHING).
     """
     findings = [f for f in await find_legacy_retailer_listing_owners(plan, database) if f["kind"] != "retired_owner"]
     if findings:

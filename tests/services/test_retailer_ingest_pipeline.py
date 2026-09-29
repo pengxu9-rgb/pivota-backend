@@ -1518,3 +1518,14 @@ async def test_a_lip_pass_keeps_a_refiled_lip_set_instead_of_dropping_it(env):
     paths = {p["canonical_url"].rsplit("/", 1)[-1]: p["category_path"] for p in env.applied[0]["pdps"]}
     assert paths["lip-duo-set"] == pipeline.REFILE_SETS_LEAF and "velvet-lip-tint-plush" in paths
     assert list(env.ledger.runs.values())[-1]["checks"]["refiled_kept_outside_filter"] == ["lip-duo-set"]
+
+
+async def test_the_run_records_how_many_retired_legacy_owners_it_admitted(env, monkeypatch):
+    """A retired chain is admitted silently at apply (#2448): the run's checks are the only record of how many."""
+    async def retired(plan, *, check):
+        return {"status": "clear", "conflict_count": 0, "planned_listings": 3, "retired_owner_count": 2}
+    monkeypatch.setattr(cli, "_legacy_listing_report", retired)
+    await pipeline.run_stage(job(), db=env.db)
+    run = list(env.ledger.runs.values())[-1]
+    assert run["checks"]["legacy_listings"] == {"status": "clear", "conflict_count": 0, "planned_listings": 3,
+                                                "retired_owner_count": 2}
