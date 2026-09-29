@@ -1831,13 +1831,18 @@ async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any
     suppressed with a reason no lane lifts on its own, no active seed, no live offer; 2026-09-29).
     `catalog_products.suppressed_at` is reversible and says nothing about the row's seed/sku/offer chain
     (external_product_seeds carries its own `status`), so a suppressed product row alone is not proof.
-    Reviving an admitted chain would put two live listings on one URL, so each reviver is closed:
+    Reviving an admitted chain would put two live listings on one URL. The product-row revivers are closed:
       - catalog_sync re-sync (`stale_after_sync`) and identity_resolution.revert_run (`d2_*`): those reasons
         never count as retired (SELF_REVIVING_SUPPRESSION_*);
-      - scripts/withdraw_catalog_rows.py and scripts/remediate_unpublished_crawl_rows.py --revert: skip a row
-        whose URL a live listing now owns (live_retailer_listing_owner).
-    KNOWN LIMIT: a hand-run revert (e.g. the SQL in scripts/step5_*.py docstrings) must retire the new listing
-    first. A mirror seed linked only by external_product_id is not followed (the mirror insert is DO NOTHING).
+      - scripts/withdraw_catalog_rows.py, remediate_unpublished_crawl_rows.py and retire_superseded_brand_keys.py
+        reverts skip a row whose URL a live listing now owns (live_retailer_listing_owner).
+    KNOWN LIMITS (review of #2448), each needing the new listing retired first:
+      - a hand-run revert (e.g. the SQL in scripts/step5_*.py docstrings);
+      - a SEED revived without its product -- the seed lane serves without joining catalog_products: a
+        revert_run reactivating a d2 loser's seed that is also this row's source_ref, or
+        onboard_external_brand_from_crawl re-run on the legacy store (its upsert sets status 'active');
+      - a new offer catalog_sync inserts under the suppressed product (it then reads as a live link);
+      - a mirror seed linked only by external_product_id is not followed (the mirror insert is DO NOTHING).
     """
     findings = [f for f in await find_legacy_retailer_listing_owners(plan, database) if f["kind"] != "retired_owner"]
     if findings:

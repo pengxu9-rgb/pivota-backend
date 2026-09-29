@@ -77,6 +77,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.database import database  # noqa: E402
+from services.catalog_enrichment_agent.apply import live_retailer_listing_owner  # noqa: E402
 from services.catalog_enrichment_agent.ingestion import derive_product_key  # noqa: E402
 from services.catalog_offer_suppression import (  # noqa: E402
     cascade_for_suppressed_product_keys,
@@ -137,6 +138,10 @@ SET status = 'inactive', updated_at = NOW()
 WHERE attached_product_key = ANY(:keys)
   AND lower(coalesce(status, '')) = 'active'
 RETURNING id
+"""
+
+URLS_FOR_KEYS_SQL = """
+SELECT product_key, canonical_url FROM catalog_products WHERE product_key = ANY(:keys)
 """
 
 UNSUPPRESS_SQL = """
@@ -444,8 +449,19 @@ async def revert_manifest(m: Dict[str, Any]) -> None:
     """Restore the rows THIS run retired -- only while they still carry its tombstone (reason and run id), so
     a revert never undoes a later retire of the same key -- and reactivate the seeds on the rows it restored."""
     restored: List[str] = []
+    # A retired row whose URL a retailer listing was since admitted onto (apply.legacy_chain_retired): reviving
+    # it -- or its seeds -- would put two live listings on one URL. Retire that listing first, then revert.
+    owned: Dict[str, str] = {}
+    for r in await database.fetch_all(URLS_FOR_KEYS_SQL, {"keys": [row["product_key"] for row in m["products"]]}):
+        owner = await live_retailer_listing_owner(database, r["canonical_url"])
+        if owner and owner != r["product_key"]:
+            owned[r["product_key"]] = owner
     async with database.transaction():
         for row in m["products"]:
+            if row["product_key"] in owned:
+                print(f"  ! {row['product_key']}: its URL is now {owned[row['product_key']]}'s live retailer "
+                      "listing, not reverting")
+                continue
             back = await database.fetch_one(UNSUPPRESS_SQL, {
                 "key": row["product_key"], "reason": row["prior_suppression_reason"],
                 "suppressed_at": row["prior_suppressed_at"],
