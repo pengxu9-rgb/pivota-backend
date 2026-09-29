@@ -141,11 +141,24 @@ minting a buyer. It constructs the single-line Shopify permalink itself, includi
 an owned `pivota_click_id`; the caller cannot provide a URL, variant ID, seller identity or price.
 The catalog SKU must identify a numeric Shopify variant. For a mirrored external seed, a numeric
 operator-entered `attached_variant_id` is **not** enough: the active same-market seed must be
-attached to this catalog product and carry a dedicated, at-most-seven-day-old proof from the
-same Shopify `.js` fetch that the live storefront had exactly one variant. The proof's product
-URL and numeric id must agree with the seed snapshot. A contradictory attached id, a
-multi-variant snapshot, or a synthetic canonical SKU
-without that evidence is refused. The seller's own offer supplies the exact price and currency.
+attached to this catalog product and carry a dedicated, at-most-seven-day-old storefront proof
+from one Shopify `.js` fetch (`scripts/backfill_shopify_variant_ids.py` is its only writer), of
+one of two kinds:
+
+* **sole variant** — the live storefront had exactly one variant, and it is the seed's; or
+* **named variant** (`scope: "named_variant"`, 2026-09-29) — the product has several variants
+  (shades, sizes), the seed **names exactly one** of them, and the live storefront lists that one,
+  `available: true`. A seed names a variant by its single snapshot entry's stamped id and/or one
+  numeric `variant=` on its own product URL on the shop host; the two must agree, and so must
+  every numeric variant id the seed itself records (the entry's `variant_id` / `id`, and
+  `selected_variant_id` / `default_variant_id`). A snapshot with two or more entries names none.
+  The catalog's chosen sku must name **that same** variant — a row carrying only the synthetic
+  `::canonical` placeholder is refused — and it is priced **only** from that variant's own sku
+  offer, never from the product-level placeholder offer.
+
+The proof's product URL must be the seed's own, over https on the shop's host. A contradictory
+attached id, an unproven multi-variant product, or a synthetic canonical SKU without that evidence
+is refused. The seller's own offer supplies the exact price and currency.
 A click row is recorded before the purchase opens so the later conversion has verified seller identity. The
 cart-link quote checks shipping options and totals, but an ELIGIBLE merchant verdict alone does
 not prove shipping for this buyer or every SKU.
@@ -160,9 +173,29 @@ not prove shipping for this buyer or every SKU.
 }
 ```
 
+**Cart-link lane only**, the body also carries **`variant_title`** (additive; no other field
+changes, and the variant lane's body is exactly the three keys above):
+
+```json
+{
+  "purchase_id": "rp_283fba3ce85c4e59bb331e54",
+  "status": "resolving",
+  "poll_after_seconds": 60,
+  "variant_title": "07 BURGUNDY INK"
+}
+```
+
+It is the live storefront's own title for the variant the permalink buys, recorded by the
+storefront proof. On this lane **the buyer never picks the variant** — the seed names it — so show
+it to the buyer before they approve ("Silky Matte Lip Ink — 07 BURGUNDY INK"). Display only: the
+numeric variant in the cart URL is what is bought. `null` when the proof recorded no title
+(proofs written before 2026-09-29). A single-variant product's title is often Shopify's literal
+`Default Title`, returned as is. The same value is stored as the purchase's `variant_title`, so
+`GET` returns it too.
+
 A **replay** (same `idempotency_key`, same agent, same buyer, inside 24 h, **and the same
 request**) returns the same `purchase_id` and the purchase's **current** state, which may not be
-`resolving`.
+`resolving` (and, on the cart-link lane, the same `variant_title`).
 
 The key is compared together with a hash of the request it was used for: item source, merchant, product,
 variant, quantity, buyer email, shipping address and return url. Reuse a key on a **different**

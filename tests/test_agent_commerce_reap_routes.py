@@ -47,6 +47,7 @@ from db.database import IS_POSTGRES, database, metadata  # noqa: E402
 from db.schema_guard import ensure_required_schema_light  # noqa: E402
 import db.reap_agentic_ledger as ledger  # noqa: E402
 import routes.agent_commerce_reap as routes_reap  # noqa: E402
+from services.shopify_variant_identity import ProvenCartVariant  # noqa: E402
 import services.reap_agentic_purchase as svc  # noqa: E402
 from db.buyer_vault import hash_agent_user_ref  # noqa: E402
 from routes.agent_auth import get_agent_context  # noqa: E402
@@ -3337,6 +3338,148 @@ async def test_a_mirror_row_with_no_fresh_storefront_proof_is_refused(client, mo
     assert resp.status_code == 409 and _error(resp) == "row_variant_unverified"
 
 
+# ── option 1: a MULTI-variant product whose seed NAMES one variant (Peng, 2026-09-29) ────────
+#
+# The live judydoll row as it really is: 8 shades on the storefront (tests/fixtures/judydoll_*
+# products_js), a seed naming 07 BURGUNDY INK (tests/fixtures/judydoll_*_seed, staging), and the
+# proof scripts/backfill_shopify_variant_ids.build_cart_proof writes from exactly those two.
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def _named_variant_seed(*, variant_overrides: Optional[Dict[str, Any]] = None,
+                        page_url: Optional[str] = None, only_variant: Optional[str] = None,
+                        entry_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    from scripts.backfill_shopify_variant_ids import build_cart_proof
+    from services.shopify_variant_identity import parse_product_js, stamp_variant_ids
+
+    payload = json.loads((_FIXTURES / "judydoll_silky_matte_lip_ink_products_js_2026_09_29.json").read_text())
+    row = json.loads((_FIXTURES / "judydoll_silky_matte_lip_ink_seed_2026_09_29.json").read_text())
+    for variant in payload["variants"]:
+        variant.update((variant_overrides or {}).get(str(variant["id"]), {}))
+    if only_variant:
+        payload["variants"] = [v for v in payload["variants"] if str(v["id"]) == only_variant]
+    seed = row["seed_data"]
+    seed["snapshot"]["variants"][0].update(entry_overrides or {})
+    live = parse_product_js(payload)
+    new_variants, _ = stamp_variant_ids(seed["snapshot"]["variants"], live)
+    seed["snapshot"].update({
+        "variants": new_variants, "storefront_platform": "shopify",
+        "storefront_platform_source": "products_js_v1",
+        "shopify_cart_proof": build_cart_proof(
+            seed, new_variants, payload, live,
+            js_url=f"https://{LIVE_DOMAIN}/products/{LIVE_HANDLE}.js",
+            page_url=page_url or row["canonical_url"], shop_host=LIVE_DOMAIN,
+            checked_at=datetime.now(timezone.utc)),
+    })
+    return seed
+
+
+async def _seed_named_variant_mirror(*, env: str, seed_data: Dict[str, Any], **kw) -> None:
+    """`_seed_live_mirror`, then the seed's two URL columns exactly as each environment has them."""
+    await _seed_live_mirror(seed_data=seed_data, **kw)
+    dest = f"https://{LIVE_DOMAIN}/products/{LIVE_HANDLE}?variant={LIVE_VARIANT}&utm_source=pivota&utm_medium=affiliate"
+    canonical = dest if env == "prod" else f"https://{LIVE_DOMAIN}/products/{LIVE_HANDLE}"
+    await database.execute(
+        "UPDATE external_product_seeds SET canonical_url = :c, destination_url = :d WHERE id = :id",
+        {"c": canonical, "d": dest, "id": LIVE_SEED_ID})
+
+
+@pytest.mark.parametrize("env,skus", [("staging", LIVE_STAGING_SKUS), ("prod", LIVE_PROD_SKUS)])
+async def test_a_multi_variant_mirror_row_is_bought_on_its_named_variant_proof(client, monkeypatch, env, skus):
+    seed_data = _named_variant_seed()
+    assert seed_data["snapshot"]["shopify_cart_proof"]["scope"] == "named_variant"
+    assert seed_data["snapshot"]["shopify_cart_proof"]["live_variant_count"] == 8
+    await _seed_named_variant_mirror(env=env, skus=skus, seed_data=seed_data)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert resp.status_code == 202, resp.text
+    purchase = await _purchase_row(resp.json()["purchase_id"])
+    assert f"https://{LIVE_DOMAIN}/cart/{LIVE_VARIANT}:1?" in purchase["cart_url"]
+    assert purchase["our_price_minor"] == 1399 and purchase["currency"] == "USD"
+    # F1 (#2459 review): the buyer never picked the shade, so the purchase SAYS which one it buys,
+    # in the live storefront's words -- on the create response, on the stored row, and on GET.
+    assert resp.json()["variant_title"] == "07 BURGUNDY INK"
+    assert purchase["variant_title"] == "07 BURGUNDY INK"
+    got = await client.get(f"{BASE}/purchases/{resp.json()['purchase_id']}")
+    assert got.status_code == 200 and got.json()["variant_title"] == "07 BURGUNDY INK"
+    # additive: every field the response had before is still there
+    assert {"purchase_id", "status", "poll_after_seconds"} <= set(resp.json())
+
+
+async def test_a_replayed_cart_link_purchase_answers_the_same_variant_title(client, monkeypatch):
+    await _seed_named_variant_mirror(env="staging", skus=LIVE_STAGING_SKUS, seed_data=_named_variant_seed())
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    body = {**_live_body(), "idempotency_key": "named-variant-replay"}
+    first = await client.post(f"{BASE}/purchases", json=body)
+    again = await client.post(f"{BASE}/purchases", json=body)
+    assert first.status_code == again.status_code == 202, again.text
+    assert again.json()["purchase_id"] == first.json()["purchase_id"]
+    assert again.json()["variant_title"] == first.json()["variant_title"] == "07 BURGUNDY INK"
+
+
+async def test_a_named_variant_proof_never_prices_from_the_placeholder(client, monkeypatch):
+    """#2457 review: only a SOLE proof may let the `::canonical` product-level offer stand in. On a
+    multi-variant product, the placeholder's price is not the named shade's price."""
+    await _seed_named_variant_mirror(env="staging", skus=LIVE_STAGING_SKUS,
+                                     seed_data=_named_variant_seed(), offers_on=[LIVE_SKU_CANONICAL])
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert resp.status_code == 409 and _error(resp) == "row_unpriced", resp.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_the_named_proof_placeholder_guard_is_reached_by_a_real_producer_shape(client, monkeypatch):
+    """#2459 review, F2: the shape that REACHES the guard. A seed entry whose `shopify_variant_id`
+    is junk (a live writer lands unvalidated keys there; `stamp_variant_ids` never overwrites one),
+    `?variant=` on its product URL, and a ONE-variant storefront: the sole proof cannot be written
+    (the stamp is junk), so `build_cart_proof` writes a NAMED proof with live_variant_count 1 --
+    which #2457's placeholder fallback reads as "one live variant". Only the named-scope guard
+    stops the product-level placeholder offer from pricing it."""
+    seed_data = _named_variant_seed(
+        only_variant=LIVE_VARIANT, page_url=f"https://{LIVE_DOMAIN}/products/{LIVE_HANDLE}?variant={LIVE_VARIANT}",
+        entry_overrides={"shopify_variant_id": "not-a-number"})
+    proof = seed_data["snapshot"]["shopify_cart_proof"]
+    assert proof["scope"] == "named_variant" and proof["live_variant_count"] == 1
+    await _seed_named_variant_mirror(env="prod", skus=LIVE_STAGING_SKUS, seed_data=seed_data,
+                                     offers_on=[LIVE_SKU_CANONICAL])
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert resp.status_code == 409 and _error(resp) == "row_unpriced", resp.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    # control: with the variant's OWN sku offered, the same row is bought at that price
+    await database.execute(
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, "
+        "merchant_effective_price, availability) VALUES "
+        "('off_guard_real', :sk, :pk, :m, 'USD', '13.99', 'in_stock')",
+        {"sk": LIVE_SKU_CRAWL, "pk": LIVE_PK, "m": LIVE_MERCHANT})
+    ok = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert ok.status_code == 202, ok.text
+
+
+@pytest.mark.parametrize("case", ["placeholder_only", "catalog_names_a_sibling", "unavailable",
+                                  "url_names_a_sibling"])
+async def test_a_named_variant_proof_is_refused_unless_every_source_agrees(client, monkeypatch, case):
+    sibling = "49819267170581"  # 01 PETAL INK, live on the same product
+    skus, seed_data = LIVE_STAGING_SKUS, _named_variant_seed()
+    if case == "placeholder_only":
+        skus = LIVE_STAGING_SKUS[:1]
+    elif case == "catalog_names_a_sibling":
+        skus = ((LIVE_SKU_CANONICAL, LIVE_PK), (LIVE_SKU_CRAWL, f"{LIVE_EXT_ID}:{sibling}"))
+    elif case == "unavailable":
+        seed_data = _named_variant_seed(variant_overrides={LIVE_VARIANT: {"available": False}})
+        assert seed_data["snapshot"]["shopify_cart_proof"] is None
+    await _seed_named_variant_mirror(env="staging", skus=skus, seed_data=seed_data)
+    if case == "url_names_a_sibling":
+        await database.execute(
+            "UPDATE external_product_seeds SET canonical_url = :c WHERE id = :id",
+            {"c": f"https://{LIVE_DOMAIN}/products/{LIVE_HANDLE}?variant={sibling}", "id": LIVE_SEED_ID})
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_live_body())
+    assert resp.status_code == 409 and _error(resp) == "row_variant_unverified", resp.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
 @pytest.mark.parametrize("merchant_id,seller_ref,brand,snapshot_brand,expected", [
     # the live row: seller_ref NULL, merchant_id derived from (Judydoll, judydoll.com)
     (LIVE_MERCHANT, None, "Judydoll", "Judydoll", 202),
@@ -3728,7 +3871,9 @@ async def test_a_multi_variant_proof_never_prices_from_the_placeholder(
     reach the placeholder's price. Today's proof refuses such a snapshot before pricing, so the
     proof reader is stubbed to accept it; the gate under test reads the snapshot itself."""
     await _seed_krave_mirror(offers=offers, live_variant_count=live_variant_count)
-    monkeypatch.setattr(routes_reap, "sole_verified_cart_variant_id", lambda *a, **k: KRAVE_VARIANT)
+    # #2459 renamed the route's authority call; the stub is the SOLE-scope answer it replaced.
+    monkeypatch.setattr(routes_reap, "verified_cart_variant_id",
+                        lambda *a, **k: ProvenCartVariant(KRAVE_VARIANT, "sole_variant"))
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
     resp = await client.post(f"{BASE}/purchases", json=_krave_body())
     if expected == 202:
@@ -3749,7 +3894,9 @@ async def test_a_named_placeholder_meets_the_same_live_variant_gate(
     proof reader is stubbed as in the unnamed test above."""
     await _seed_krave_mirror(offers=[(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")],
                              live_variant_count=live_variant_count, real_sku=False)
-    monkeypatch.setattr(routes_reap, "sole_verified_cart_variant_id", lambda *a, **k: KRAVE_VARIANT)
+    # #2459 renamed the route's authority call; the stub is the SOLE-scope answer it replaced.
+    monkeypatch.setattr(routes_reap, "verified_cart_variant_id",
+                        lambda *a, **k: ProvenCartVariant(KRAVE_VARIANT, "sole_variant"))
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
     resp = await client.post(f"{BASE}/purchases",
                              json={**_krave_body(), "variant_key": KRAVE_PLACEHOLDER})

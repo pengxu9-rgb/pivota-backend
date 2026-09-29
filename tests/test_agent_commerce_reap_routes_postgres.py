@@ -2399,3 +2399,95 @@ async def test_tierb_a_mirror_row_priced_from_its_placeholder_on_postgres(
             await database.execute(f"DELETE FROM {table} WHERE product_key = :pk", {"pk": pk})
         await database.execute(
             "DELETE FROM tierb_cart_link_eligibility WHERE shop_domain = :d", {"d": domain})
+
+
+@pytest.mark.parametrize("env", ["staging", "prod"])
+async def test_tierb_the_backfill_then_the_cart_link_buys_a_named_variant_end_to_end(client, monkeypatch, env):
+    """OPTION 1 end to end on the production dialect: the REAL live judydoll seed (8-shade
+    product, seed naming 07 BURGUNDY INK) is written by `scripts/backfill_shopify_variant_ids.run`
+    from the REAL products.js body, and the cart-link route then buys THAT shade -- nothing between
+    the two is hand-built. The seed's URL columns are each environment's own."""
+    from db.sql_migrations import split_statements
+    from scripts.backfill_shopify_variant_ids import run as backfill
+
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    products_js = json.loads((fixtures / "judydoll_silky_matte_lip_ink_products_js_2026_09_29.json").read_text())
+    row = json.loads((fixtures / "judydoll_silky_matte_lip_ink_seed_2026_09_29.json").read_text())
+    ext = "ext_0f95730ee5ba05a6b7957ada"
+    pk, seed_id, domain, variant = row["attached_product_key"], row["id"], row["domain"], "49819267301653"
+    merchant = "merch_obs_a25cbba37ef98c52"
+    await database.execute("DROP TABLE IF EXISTS external_product_seeds")
+    for statement in split_statements(
+        (_MIGRATIONS_DIR / "044_external_product_seeds.sql").read_text(encoding="utf-8")
+    ):
+        await database.execute(statement)
+    try:
+        await database.execute(
+            "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, "
+            "title, brand, category, product_type, source_domain, source_system, source_ref, "
+            "seller_ref, seed_kind) VALUES (:pk, :m, 'external_seed', :ext, 'Silky Matte Lip Ink', "
+            "'Judydoll', 'makeup', 'Lipstick', :d, 'external_product_seeds_mirror_v1', :seed, "
+            "NULL, 'self')", {"pk": pk, "m": merchant, "ext": ext, "d": domain, "seed": seed_id})
+        skus = [(f"{pk}::canonical", pk), (f"{pk}::sku_58ae6f8de2c8797993f2", f"{ext}:{variant}")]
+        if env == "prod":
+            skus.append((f"{pk}::v:{variant}", variant))
+        for sku_key, vid in skus:
+            await database.execute(
+                "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, "
+                "source_product_id, source_variant_id, title, currency) VALUES "
+                "(:sk, :pk, :m, 'external_seed', :ext, :vid, 'Silky Matte Lip Ink', 'USD')",
+                {"sk": sku_key, "pk": pk, "m": merchant, "ext": ext, "vid": vid})
+            await database.execute(
+                "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, "
+                "merchant_effective_price, availability) VALUES "
+                "(:oid, :sk, :pk, :m, 'USD', 13.99, 'in_stock')",
+                {"oid": f"off_pg_named_{sku_key[-20:]}", "sk": sku_key, "pk": pk, "m": merchant})
+        await database.execute(
+            "INSERT INTO external_product_seeds (id, market, status, destination_url, canonical_url, "
+            "domain, attached_product_key, attached_variant_id, seed_data) VALUES "
+            "(:id, 'US', 'active', :dest, :canon, :d, :pk, NULL, CAST(:sd AS JSONB))",
+            {"id": seed_id, "dest": row["destination_url"],
+             "canon": row["destination_url"] if env == "prod" else row["canonical_url"],
+             "d": domain, "pk": pk, "sd": json.dumps(row["seed_data"])})
+        await database.execute(
+            "INSERT INTO tierb_cart_link_eligibility "
+            "(shop_domain, market, verdict, checked_at, consecutive_same) "
+            "VALUES (:d, 'US', 'ELIGIBLE', now(), 1)", {"d": domain})
+        monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+        body = _body(item_source="cart_link", merchant_domain=domain, product_key=pk, variant_key=None)
+
+        # BEFORE the backfill: no proof -> refused, as today.
+        before = await client.post(f"{BASE}/purchases", json=body)
+        assert before.status_code == 409 and _error(before) == "row_variant_unverified", before.text
+
+        class _Resp:
+            status_code = 200
+            headers = {"content-type": "text/javascript; charset=utf-8"}
+
+            @staticmethod
+            def json():
+                return products_js
+
+        class _Client:
+            async def get(self, url, **kwargs):
+                assert url == "https://judydoll.com/products/silky-matte-lip-ink.js"
+                return _Resp()
+
+        summary = await backfill(limit=10, domain=domain, apply=True, client=_Client())
+        assert summary["cart_proofs"] == {"named_variant": 1} and summary["write_conflicts"] == 0
+
+        response = await client.post(f"{BASE}/purchases", json={**body, "idempotency_key": f"pg-named-{env}"})
+        assert response.status_code == 202, response.text
+        purchase = await database.fetch_one(
+            "SELECT cart_url, our_price_minor, currency FROM reap_agentic_purchases WHERE id = :id",
+            {"id": response.json()["purchase_id"]})
+        assert f"https://{domain}/cart/{variant}:1?" in purchase["cart_url"]
+        assert purchase["our_price_minor"] == 1399 and purchase["currency"] == "USD"
+        assert response.json()["variant_title"] == "07 BURGUNDY INK"
+    finally:
+        await database.execute("DELETE FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+        await database.execute("DROP TABLE external_product_seeds")
+        for table in ("catalog_offers", "catalog_skus", "catalog_products"):
+            await database.execute(f"DELETE FROM {table} WHERE product_key = :pk", {"pk": pk})
+        await database.execute(
+            "DELETE FROM tierb_cart_link_eligibility WHERE shop_domain = :d", {"d": domain})
