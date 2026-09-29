@@ -3392,6 +3392,25 @@ async def test_a_multi_variant_mirror_row_is_bought_on_its_named_variant_proof(c
     purchase = await _purchase_row(resp.json()["purchase_id"])
     assert f"https://{LIVE_DOMAIN}/cart/{LIVE_VARIANT}:1?" in purchase["cart_url"]
     assert purchase["our_price_minor"] == 1399 and purchase["currency"] == "USD"
+    # F1 (#2459 review): the buyer never picked the shade, so the purchase SAYS which one it buys,
+    # in the live storefront's words -- on the create response, on the stored row, and on GET.
+    assert resp.json()["variant_title"] == "07 BURGUNDY INK"
+    assert purchase["variant_title"] == "07 BURGUNDY INK"
+    got = await client.get(f"{BASE}/purchases/{resp.json()['purchase_id']}")
+    assert got.status_code == 200 and got.json()["variant_title"] == "07 BURGUNDY INK"
+    # additive: every field the response had before is still there
+    assert {"purchase_id", "status", "poll_after_seconds"} <= set(resp.json())
+
+
+async def test_a_replayed_cart_link_purchase_answers_the_same_variant_title(client, monkeypatch):
+    await _seed_named_variant_mirror(env="staging", skus=LIVE_STAGING_SKUS, seed_data=_named_variant_seed())
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    body = {**_live_body(), "idempotency_key": "named-variant-replay"}
+    first = await client.post(f"{BASE}/purchases", json=body)
+    again = await client.post(f"{BASE}/purchases", json=body)
+    assert first.status_code == again.status_code == 202, again.text
+    assert again.json()["purchase_id"] == first.json()["purchase_id"]
+    assert again.json()["variant_title"] == first.json()["variant_title"] == "07 BURGUNDY INK"
 
 
 async def test_a_named_variant_proof_never_prices_from_the_placeholder(client, monkeypatch):

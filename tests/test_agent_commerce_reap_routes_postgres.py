@@ -2484,6 +2484,7 @@ async def test_tierb_the_backfill_then_the_cart_link_buys_a_named_variant_end_to
             {"id": response.json()["purchase_id"]})
         assert f"https://{domain}/cart/{variant}:1?" in purchase["cart_url"]
         assert purchase["our_price_minor"] == 1399 and purchase["currency"] == "USD"
+        assert response.json()["variant_title"] == "07 BURGUNDY INK"
     finally:
         await database.execute("DELETE FROM external_product_seeds WHERE id = :id", {"id": seed_id})
         await database.execute("DROP TABLE external_product_seeds")

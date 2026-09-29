@@ -866,15 +866,15 @@ def test_the_live_judydoll_fetch_writes_a_named_variant_proof() -> None:
     assert seed["snapshot"]["variants"][0]["shopify_variant_id"] == JUDY_VARIANT
     assert seed["snapshot"]["shopify_cart_proof"] == {
         "source": "products_js_v1", "scope": "named_variant", "product_js_url": JUDY_JS_URL,
-        "variant_id": JUDY_VARIANT, "available": True, "live_variant_count": 8,
-        "price_minor": 1399, "checked_at": T0.isoformat(),
+        "variant_id": JUDY_VARIANT, "variant_title": "07 BURGUNDY INK", "available": True,
+        "live_variant_count": 8, "price_minor": 1399, "checked_at": T0.isoformat(),
     }
 
 
 @pytest.mark.parametrize("urls", [JUDY_STAGING_URLS, JUDY_PROD_URLS], ids=["staging", "prod"])
 def test_ACCEPT_a_multi_variant_product_with_the_named_variant_available(urls) -> None:
     proven = _verify(_backfilled(page_url=urls[0]), urls)
-    assert proven == (JUDY_VARIANT, CART_PROOF_SCOPE_NAMED)
+    assert proven == (JUDY_VARIANT, CART_PROOF_SCOPE_NAMED, "07 BURGUNDY INK")
     assert proven.variant_id == JUDY_VARIANT and proven.scope == "named_variant"
 
 
@@ -899,10 +899,10 @@ def test_the_sole_variant_path_is_unchanged() -> None:
     seed = _backfilled({"variants": [JUDY_JS["variants"][4]]})
     assert seed["snapshot"]["shopify_cart_proof"] == {
         "source": "products_js_v1", "product_js_url": JUDY_JS_URL, "live_variant_count": 1,
-        "variant_id": JUDY_VARIANT, "checked_at": T0.isoformat(),
+        "variant_id": JUDY_VARIANT, "variant_title": "07 BURGUNDY INK", "checked_at": T0.isoformat(),
     }
-    assert _verify(seed) == (JUDY_VARIANT, CART_PROOF_SCOPE_SOLE)
-    assert _verify(seed, catalog=None) == (JUDY_VARIANT, CART_PROOF_SCOPE_SOLE)
+    assert _verify(seed) == (JUDY_VARIANT, CART_PROOF_SCOPE_SOLE, "07 BURGUNDY INK")
+    assert _verify(seed, catalog=None) == (JUDY_VARIANT, CART_PROOF_SCOPE_SOLE, "07 BURGUNDY INK")
     assert sole_verified_cart_variant_id(seed, product_urls=JUDY_STAGING_URLS,
                                          shop_domain=JUDY_HOST, now=T0) == JUDY_VARIANT
 
@@ -1056,3 +1056,86 @@ def test_REFUSE_a_url_naming_one_variant_of_a_seed_with_several_entries() -> Non
     assert seed["snapshot"]["shopify_cart_proof"] is None
     seed["snapshot"]["shopify_cart_proof"] = _backfilled(page_url=JUDY_SEED["destination_url"])["snapshot"]["shopify_cart_proof"]
     assert _verify(seed, JUDY_PROD_URLS) is None
+
+
+
+# ---------------------------------------------------------------- #2459 review round
+
+def test_the_proven_variant_carries_the_live_title_for_display() -> None:
+    """F1: the buyer never picks the shade, so the proof records the storefront's own title and
+    the verifier hands it on. Display only: the title is not part of any rule."""
+    named = _verify(_backfilled())
+    assert named.variant_title == "07 BURGUNDY INK" and named.scope == CART_PROOF_SCOPE_NAMED
+    sole = _verify(_backfilled({"variants": [JUDY_JS["variants"][4]]}))
+    assert sole.variant_title == "07 BURGUNDY INK" and sole.scope == CART_PROOF_SCOPE_SOLE
+    untitled = _backfilled()
+    del untitled["snapshot"]["shopify_cart_proof"]["variant_title"]
+    assert _verify(untitled) == (JUDY_VARIANT, CART_PROOF_SCOPE_NAMED, None)
+    junk = _backfilled()
+    junk["snapshot"]["shopify_cart_proof"]["variant_title"] = {"not": "text"}
+    assert _verify(junk).variant_title is None
+    long = _backfilled(_judy_js(**{JUDY_VARIANT: {"title": "X" * 500}}))
+    assert len(long["snapshot"]["shopify_cart_proof"]["variant_title"]) == 200
+
+
+def _relabelled_as_petal(seed_data: Dict[str, Any]) -> Dict[str, Any]:
+    """The reviewer's probe on the REAL seed: the entry's ids (and the snapshot's selected /
+    default) still say 07 BURGUNDY INK, but every LABEL -- title, option, display label, sku --
+    says 01 PETAL INK. A label match then stamps 01."""
+    seed = copy.deepcopy(seed_data)
+    entry = seed["snapshot"]["variants"][0]
+    entry.update(title="01 PETAL INK", option_value="01 PETAL INK", display_label="Shade: 01 PETAL INK",
+                 sku="6978647800823",
+                 options=[{"name": "Shade", "value": "01 PETAL INK", "axis_kind": "shade"}])
+    return seed
+
+
+def test_REFUSE_a_label_stamp_that_contradicts_the_seeds_own_variant_id() -> None:
+    """F4: the stamp lands on 01 by label, the seed's crawl-time ids say 07 -> names nothing, so
+    the backfill writes no proof and a forged 01 proof is refused too."""
+    probe = _relabelled_as_petal(JUDY_SEED["seed_data"])
+    seed = _backfilled(seed_data=probe)
+    assert seed["snapshot"]["variants"][0]["shopify_variant_id"] == JUDY_OTHER, "the label stamp"
+    assert named_cart_variant_id(seed, product_urls=JUDY_STAGING_URLS, shop_domain=JUDY_HOST) is None
+    assert seed["snapshot"]["shopify_cart_proof"] is None
+    forged = copy.deepcopy(seed)
+    forged["snapshot"]["shopify_cart_proof"] = dict(
+        _backfilled()["snapshot"]["shopify_cart_proof"], variant_id=JUDY_OTHER)
+    assert _verify(forged, catalog=JUDY_OTHER) is None
+
+
+@pytest.mark.parametrize("where,key", [
+    ("entry", "variant_id"), ("entry", "id"),
+    ("snapshot", "selected_variant_id"), ("snapshot", "default_variant_id"),
+    ("document", "selected_variant_id"), ("document", "default_variant_id"),
+])
+def test_every_variant_id_the_seed_records_must_agree_with_the_name(where, key) -> None:
+    seed = _backfilled()
+    assert _verify(seed) is not None
+    target = {"entry": seed["snapshot"]["variants"][0], "snapshot": seed["snapshot"],
+              "document": seed}[where]
+    target[key] = JUDY_OTHER
+    assert named_cart_variant_id(seed, product_urls=JUDY_STAGING_URLS, shop_domain=JUDY_HOST) is None
+    assert _verify(seed) is None
+    # a NON-numeric value claims nothing (the crawl writes SKU-shaped values in some lanes)
+    target[key] = "sku-07-burgundy"
+    assert _verify(seed) == (JUDY_VARIANT, CART_PROOF_SCOPE_NAMED, "07 BURGUNDY INK")
+    target[key] = f"gid://shopify/ProductVariant/{JUDY_OTHER}"
+    assert _verify(seed) is None
+
+
+def test_the_parser_counts_only_a_boolean_true_as_available() -> None:
+    """F5: `bool("false")` is True. Only the JSON boolean true is availability evidence."""
+    for raw, expected in ((True, True), (False, False), ("false", False), ("true", False),
+                          (1, False), (None, False)):
+        parsed = parse_product_js({"variants": [{"id": 1, "title": "x", "available": raw}]})
+        assert parsed[0]["available"] is expected, raw
+    assert _backfilled(_judy_js(**{JUDY_VARIANT: {"available": "false"}}))["snapshot"]["shopify_cart_proof"] is None
+    assert _backfilled(_judy_js(**{JUDY_VARIANT: {"available": "true"}}))["snapshot"]["shopify_cart_proof"] is None
+
+
+def test_REFUSE_a_live_payload_listing_the_named_variant_twice() -> None:
+    """F6: a storefront repeating the named id is not evidence of ONE purchasable variant."""
+    payload = _judy_js()
+    payload["variants"].append(dict(payload["variants"][4]))
+    assert _backfilled(payload)["snapshot"]["shopify_cart_proof"] is None

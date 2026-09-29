@@ -368,6 +368,10 @@ class CartLinkItem:
     market_country: str
     product_name: Optional[str] = None
     product_key: Optional[str] = None
+    #: DISPLAY ONLY, like `product_name`: which variant the permalink buys, in the storefront's
+    #: words ("07 BURGUNDY INK"). Stored as the row's `variant_title` so GET shows it. Nothing on
+    #: this lane reads it to decide what is bought -- the URL's numeric variant is the identity.
+    variant_title: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1718,6 +1722,7 @@ async def _start_cart_link_purchase(
             merchant_domain=shop_domain,
             product_key=str(item.product_key or "").strip() or None,
             product_name=str(item.product_name or "").strip() or None,
+            variant_title=str(item.variant_title or "").strip() or None,
             quantity=quantity,
             currency=currency,
             our_price_minor=item.our_price_minor,

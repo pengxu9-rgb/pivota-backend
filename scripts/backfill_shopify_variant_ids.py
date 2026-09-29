@@ -70,6 +70,10 @@ any onboarding pass over the same brand. Fixing that merge is onboarding's chang
 USAGE — note SUBNET on every form that leaves this machine. A DRY RUN FETCHES TOO: `--apply`
 gates the write, not the crawl, so an unpinned dry run bursts just as hard as a real one.
 
+    # dry run, ONE seed (repeat --seed-id for more; eligibility rules still apply)
+    SUBNET=pivota-crawl scripts/ops/run_oneoff_job.sh scripts/backfill_shopify_variant_ids.py \
+        --seed-id epsv_38ad88d436c32e24ba7c6446 --domain judydoll.com --limit 1
+
     # dry run, one storefront, through the job runner (the normal path)
     SUBNET=pivota-crawl scripts/ops/run_oneoff_job.sh scripts/backfill_shopify_variant_ids.py \
         --domain genabelle.com --limit 5
@@ -220,6 +224,7 @@ SELECT_CANDIDATES_SQL = f"""
               AND NOT (seed_data->'snapshot' ? 'shopify_cart_proof'))
           OR seed_data->'snapshot' ? 'shopify_cart_proof')
       {{domain_clause}}
+      {{seed_clause}}
       {{cursor_clause}}
     -- ORDER BY id + a CURSOR, because eligibility alone is not progress. A row that can never
     -- be stamped — a dead handle (6.7% of a live sample), or any `no_confident_match` — stays
@@ -285,9 +290,18 @@ class Pacer:
 
 
 async def select_candidates(
-    limit: int, domain: Optional[str], after: Optional[str] = None
+    limit: int, domain: Optional[str], after: Optional[str] = None,
+    seed_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     values: Dict[str, Any] = {"limit": max(1, int(limit))}
+    seed_clause = ""
+    if seed_ids:
+        # TARGETING, not widening: `--seed-id` ANDs onto every eligibility rule above, so a named
+        # seed that is not a candidate (inactive, no product URL, nothing to prove) is still not
+        # selected. One bound parameter per id -- never an interpolated value.
+        ids = list(dict.fromkeys(str(seed_id) for seed_id in seed_ids))
+        seed_clause = "AND id IN (" + ", ".join(f":seed_id_{i}" for i in range(len(ids))) + ")"
+        values.update({f"seed_id_{i}": seed_id for i, seed_id in enumerate(ids)})
     cursor_clause = ""
     if after:
         cursor_clause = "AND id > :after"
@@ -303,7 +317,9 @@ async def select_candidates(
         values["domain_exact"] = domain
         values["domain_suffix"] = f"%.{safe}"
     rows = await database.fetch_all(
-        SELECT_CANDIDATES_SQL.format(domain_clause=domain_clause, cursor_clause=cursor_clause),
+        SELECT_CANDIDATES_SQL.format(
+            domain_clause=domain_clause, seed_clause=seed_clause, cursor_clause=cursor_clause,
+        ),
         values,
     )
     return [dict(r) for r in rows or []]
@@ -373,6 +389,19 @@ async def fetch_product_js(client: Any, url: str) -> Tuple[Optional[Any], str]:
         return None, "unparseable"
 
 
+#: Longest variant title a proof carries. A Shopify variant title is `option1 / option2 / option3`;
+#: anything past this is not a title a buyer is shown.
+MAX_VARIANT_TITLE = 200
+
+
+def _live_title(live_variant: Dict[str, Any]) -> Optional[str]:
+    """The live storefront's own title for the proven variant ("07 BURGUNDY INK"), for DISPLAY:
+    the buyer never picks the shade on this lane, so the purchase must say which one it buys.
+    Read by nothing that decides what is bought."""
+    title = str(live_variant.get("title") or "").strip()
+    return title[:MAX_VARIANT_TITLE] or None
+
+
 def build_cart_proof(
     seed_data: Dict[str, Any], new_variants: List[Dict[str, Any]], payload: Any,
     live: List[Dict[str, Any]], *, js_url: str, page_url: Optional[str], shop_host: str,
@@ -382,14 +411,15 @@ def build_cart_proof(
 
     PURE, and the only place a proof is authored, so the tests drive exactly what is written.
 
-    1. THE SOLE-VARIANT PROOF, unchanged: the live product has exactly one variant and it is the
-       seed's one (now stamped) entry. No `scope` key -- it is byte-for-byte what it always was.
+    1. THE SOLE-VARIANT PROOF: the live product has exactly one variant and it is the seed's one
+       (now stamped) entry. No `scope` key; its keys are what they always were, plus the
+       display-only `variant_title` (no verifier reads it).
        It is tried FIRST, so a fetch that supports it can never write the weaker named proof.
     2. ELSE THE NAMED-VARIANT PROOF: the seed names ONE variant
        (`services.shopify_variant_identity.named_cart_variant_id`, over the variants as they will
        be written and the same product URL the fetch was derived from), that variant appears
        EXACTLY once in the live payload, and it is `available`. Records the live count and price
-       for audit; neither is a gate.
+       for audit, and the live `variant_title` for display; none of the three is a gate.
     3. ELSE None, which the caller writes as JSON null: a prior proof whose variant has vanished,
        gone unavailable, or is no longer the one the seed names is REVOKED by the same fetch.
     """
@@ -405,6 +435,7 @@ def build_cart_proof(
             "product_js_url": js_url,
             "live_variant_count": 1,
             "variant_id": live[0]["shopify_variant_id"],
+            "variant_title": _live_title(live[0]),
             "checked_at": stamp,
         }
     stamped_seed = {**seed_data, "snapshot": {**(seed_data.get("snapshot") or {}),
@@ -427,6 +458,7 @@ def build_cart_proof(
         "scope": CART_PROOF_SCOPE_NAMED,
         "product_js_url": js_url,
         "variant_id": named,
+        "variant_title": _live_title(hits[0]),
         "available": True,
         "live_variant_count": live_count,
         "price_minor": price_minor,
@@ -435,9 +467,10 @@ def build_cart_proof(
 
 
 async def run(
-    limit: int, domain: Optional[str], apply: bool, client: Any, after: Optional[str] = None
+    limit: int, domain: Optional[str], apply: bool, client: Any, after: Optional[str] = None,
+    seed_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    rows = await select_candidates(limit=limit, domain=domain, after=after)
+    rows = await select_candidates(limit=limit, domain=domain, after=after, seed_ids=seed_ids)
     pacer = Pacer()
     outcomes: Counter = Counter()
     reasons: Counter = Counter()
@@ -562,6 +595,10 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="write; omit for a dry run")
     parser.add_argument("--after", type=str, default=None,
                         help="resume past this seed id (use next_cursor from a prior run)")
+    parser.add_argument("--seed-id", dest="seed_ids", action="append", default=None,
+                        metavar="ID",
+                        help="only this seed (repeatable); still subject to every eligibility "
+                             "rule, and to --domain / --after / --limit when given")
     args = parser.parse_args()
 
     async def _main() -> Dict[str, Any]:
@@ -570,7 +607,7 @@ def main() -> int:
             async with httpx.AsyncClient() as client:
                 return await run(
                     limit=args.limit, domain=args.domain, apply=args.apply,
-                    client=client, after=args.after,
+                    client=client, after=args.after, seed_ids=args.seed_ids,
                 )
         finally:
             await database.disconnect()

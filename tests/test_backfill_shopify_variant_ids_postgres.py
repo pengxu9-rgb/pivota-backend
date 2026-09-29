@@ -803,7 +803,7 @@ async def test_the_live_judydoll_seed_gets_a_named_variant_proof_end_to_end(_db,
     proven = verified_cart_variant_id(
         after, product_urls=[row["canonical_url"] or row["destination_url"]],
         shop_domain="judydoll.com", catalog_variant_id=_JUDY_VARIANT)
-    assert proven == (_JUDY_VARIANT, "named_variant")
+    assert proven == (_JUDY_VARIANT, "named_variant", "07 BURGUNDY INK")
 
 
 @pytest.mark.parametrize("change", ["unavailable", "delisted"])
@@ -864,3 +864,64 @@ async def test_a_dry_run_reports_the_named_proof_without_writing_it(_db) -> None
     summary = await run(limit=10, domain="judydoll.com", apply=False, client=_judy_client(_JUDY_JS))
     assert summary["mode"] == "dry_run" and summary["cart_proofs"] == {"named_variant": 1}
     assert "shopify_cart_proof" not in (await _seed_data(_db, _JUDY_ROW["id"]))["snapshot"]
+
+
+async def test_seed_id_targets_exactly_the_named_seeds_under_the_same_eligibility(_db) -> None:
+    """F3 (#2459 review): `--seed-id` restricts selection to those ids and to nothing else -- it
+    never widens past the eligibility rules, and it composes with --domain / --after / --limit."""
+    from scripts.backfill_shopify_variant_ids import run
+
+    entry = _JUDY_ROW["seed_data"]["snapshot"]["variants"][0]
+    await _insert(_db, "epsv_0first", _snapshot(entry), url=_JUDY_ROW["canonical_url"], domain="judydoll.com")
+    await _insert_judy(_db)
+    await _insert(_db, "epsv_zlast", _snapshot(entry), url=_JUDY_ROW["canonical_url"], domain="judydoll.com")
+    await _insert(_db, "epsv_inactive", _snapshot(entry), url=_JUDY_ROW["canonical_url"],
+                  domain="judydoll.com", status="inactive")
+    await _insert(_db, "epsv_other_shop", _snapshot(entry), url="https://brand.com/products/x",
+                  domain="brand.com")
+    target = _JUDY_ROW["id"]
+
+    assert [r["id"] for r in await _select(domain="judydoll.com", limit=1)] == ["epsv_0first"], \
+        "without targeting, ORDER BY id LIMIT 1 walks the wrong seed"
+    from scripts.backfill_shopify_variant_ids import select_candidates
+    pick = lambda **kw: select_candidates(**{"limit": 50, "domain": None, **kw})  # noqa: E731
+    assert [r["id"] for r in await pick(seed_ids=[target], limit=1)] == [target]
+    assert [r["id"] for r in await pick(seed_ids=[target, "epsv_zlast", target])] == [target, "epsv_zlast"]
+    assert [r["id"] for r in await pick(seed_ids=["epsv_inactive"])] == [], "eligibility still applies"
+    assert [r["id"] for r in await pick(seed_ids=[target], domain="brand.com")] == []
+    assert [r["id"] for r in await pick(seed_ids=["epsv_other_shop", target], domain="judydoll.com")] == [target]
+    assert [r["id"] for r in await pick(seed_ids=[target], after=target)] == []
+    assert [r["id"] for r in await pick(seed_ids=["x' OR '1'='1"])] == [], "bound, never interpolated"
+
+    client = _judy_client(_JUDY_JS)
+    summary = await run(limit=1, domain="judydoll.com", apply=False, client=client, seed_ids=[target])
+    assert client.calls == ["https://judydoll.com/products/silky-matte-lip-ink.js"]
+    assert summary["candidates"] == 1 and summary["next_cursor"] == target
+    assert summary["cart_proofs"] == {"named_variant": 1}
+
+
+def test_seed_id_is_a_repeatable_cli_flag(monkeypatch) -> None:
+    import scripts.backfill_shopify_variant_ids as backfill
+
+    seen: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        seen.update(kwargs)
+        return {"aborted_on_block": False}
+
+    class _Db:
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(backfill, "run", fake_run)
+    monkeypatch.setattr(backfill, "database", _Db())
+    monkeypatch.setattr("sys.argv", ["backfill", "--seed-id", "epsv_a", "--seed-id", "epsv_b",
+                                     "--domain", "judydoll.com", "--limit", "2"])
+    assert backfill.main() == 0
+    assert seen["seed_ids"] == ["epsv_a", "epsv_b"] and seen["domain"] == "judydoll.com"
+    monkeypatch.setattr("sys.argv", ["backfill"])
+    backfill.main()
+    assert seen["seed_ids"] is None

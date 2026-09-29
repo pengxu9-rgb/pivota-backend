@@ -1467,6 +1467,7 @@ async def _load_cart_link_item(
         raise svc.PurchaseRefused("row_not_shopify", "cart-link product has no Shopify source")
 
     proof_scope: Optional[str] = None  # the mirror's storefront-proof scope; None on shopify rows
+    proof_variant_title: Optional[str] = None  # the proof's live title, display only
     named: Optional[Dict[str, Any]] = None
     if variant_key:
         raw_sku = await database.fetch_one(
@@ -1533,7 +1534,9 @@ async def _load_cart_link_item(
             shop_domain=merchant_domain,
             catalog_variant_id=sku_variant,
         )
-        variant_id, proof_scope = proven if proven else (None, None)
+        variant_id = proven.variant_id if proven else None
+        proof_scope = proven.scope if proven else None
+        proof_variant_title = proven.variant_title if proven else None
         # THE SEED'S STOREFRONT PROOF IS THE AUTHORITY; the catalog sku must AGREE with it. A sku
         # naming another Shopify variant than the one the storefront proved is a contradiction.
         if sku_variant is not None and variant_id != sku_variant:
@@ -1620,7 +1623,10 @@ async def _load_cart_link_item(
         {"shop_domain": merchant_domain, "our_price_minor": int(price_minor),
          "currency": currency, "market_country": market_country,
          "product_name": str(product.get("product_title") or "").strip() or None,
-         "product_key": product_key},
+         "product_key": product_key,
+         # DISPLAY ONLY: which variant this link buys, in the live storefront's words, so a
+         # door can show "07 BURGUNDY INK" -- the buyer never picks it on this lane.
+         "variant_title": proof_variant_title},
         seller_ref,
         variant_id,
         str(product.get("seed_kind") or "").strip() or None,
@@ -2295,14 +2301,16 @@ async def start_reap_purchase(
                     )
                     if replay_buyer_id:
                         await _record_consent(replay_buyer_id, consent_version)
-                    return JSONResponse(
-                        status_code=202,
-                        content={
-                            "purchase_id": replayed,
-                            "status": view.get("state"),
-                            "poll_after_seconds": view.get("poll_after_seconds"),
-                        },
-                    )
+                    replay_body: Dict[str, Any] = {
+                        "purchase_id": replayed,
+                        "status": view.get("state"),
+                        "poll_after_seconds": view.get("poll_after_seconds"),
+                    }
+                    if req.item_source == "cart_link":
+                        # The same additive field the cart-link create answered with. The key's
+                        # request hash covers `item_source`, so a replay is always the same lane.
+                        replay_body["variant_title"] = view.get("variant_title")
+                    return JSONResponse(status_code=202, content=replay_body)
 
         # PURCHASABILITY BEFORE EITHER LANE'S ELIGIBILITY, because it is the broader refusal:
         # both allowlists say a merchant is PERMITTED, and neither says its checkout can be PAID.
@@ -2457,14 +2465,18 @@ async def start_reap_purchase(
             merchant_domain,
             agent_id,
         )
-        return JSONResponse(
-            status_code=202,
-            content={
-                "purchase_id": purchase_id,
-                "status": "resolving",
-                "poll_after_seconds": svc.POLL_INTERVALS.get("resolving"),
-            },
-        )
+        accepted: Dict[str, Any] = {
+            "purchase_id": purchase_id,
+            "status": "resolving",
+            "poll_after_seconds": svc.POLL_INTERVALS.get("resolving"),
+        }
+        if cart_link_item is not None:
+            # ADDITIVE, CART-LINK LANE ONLY, display only: the variant this link buys, in the live
+            # storefront's words ("07 BURGUNDY INK") -- the buyer never picks it on this lane.
+            # The stored row's `variant_title`, as GET returns it; null when the proof has none.
+            # The variant lane's 202 body is unchanged.
+            accepted["variant_title"] = cart_link_item.variant_title
+        return JSONResponse(status_code=202, content=accepted)
     except svc.PurchaseRefused as exc:
         return _refused(exc)
 

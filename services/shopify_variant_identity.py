@@ -146,7 +146,9 @@ def parse_product_js(payload: Any) -> List[Dict[str, Any]]:
                 "sku": (str(raw.get("sku")).strip() or None) if raw.get("sku") else None,
                 "options": options,
                 "price_amount": price,
-                "available": bool(raw.get("available")),
+                # `is True`, not truthiness: a string "false" (or any non-boolean) is NOT
+                # available. Shopify sends a JSON boolean; anything else is not evidence.
+                "available": raw.get("available") is True,
             }
         )
     return out
@@ -519,9 +521,14 @@ def named_cart_variant_id(
     Both present -> they must AGREE, else None. Zero named, two named (two distinct URL values,
     or snapshot and URL disagreeing), or an unreadable `variant=` -> None.
 
+    AND every numeric variant id the seed itself records (`_seed_own_variant_claims`: the entry's
+    `variant_id` / `id`, and `selected_variant_id` / `default_variant_id` on the snapshot or the
+    document) must equal the name, else None.
+
     ACCEPT {1 entry stamped 4981}; {1 entry stamped 4981, url ?variant=4981}; {1 unstamped
-    entry, url ?variant=4981}. REFUSE {2 entries}; {stamped 4981, url ?variant=4982};
-    {url ?variant=1&variant=2}; {url ?variant=abc}; {1 unstamped entry, no variant= url}.
+    entry, url ?variant=4981}; {stamped 4981, entry id 4981}. REFUSE {2 entries}; {stamped 4981,
+    url ?variant=4982}; {url ?variant=1&variant=2}; {url ?variant=abc}; {1 unstamped entry, no
+    variant= url}; {stamped 4981, entry id / selected_variant_id 4982}.
 
     Read by the backfill (to decide what to fetch-prove) AND by `verified_cart_variant_id` (to
     check the proof is about the variant the seed names), so the two can never disagree.
@@ -541,7 +548,36 @@ def named_cart_variant_id(
     from_url = next(iter(from_urls)) if from_urls else None
     if stamped and from_url and stamped != from_url:
         return None
-    return stamped or from_url
+    named = stamped or from_url
+    if named and any(claim != named for claim in _seed_own_variant_claims(seed_data)):
+        return None
+    return named
+
+
+#: Where the crawl records the variant a seed was captured on, besides the stamp and the URL:
+#: the entry's own ids, and the snapshot's (and the document's) selected / default variant.
+_ENTRY_VARIANT_KEYS = ("variant_id", "id")
+_SEED_VARIANT_KEYS = ("selected_variant_id", "default_variant_id")
+
+
+def _seed_own_variant_claims(seed_data: Dict[str, Any]) -> List[str]:
+    """Every NUMERIC variant id the seed itself records (non-numeric values claim nothing).
+
+    `named_cart_variant_id` refuses when any of these disagrees with the name: the stamp comes from
+    a LABEL match and can land on a sibling shade whose label the entry happens to share, and
+    then the seed's own crawl-time id is the witness that it did (review of #2459: entry id 07,
+    title "01 PETAL INK" -> stamped 01). Measured on prod 2026-09-29 over the 1,946 mirror rows
+    that name one variant: 0 disagree on any of these keys.
+    """
+    claims: List[str] = []
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data, dict) else None
+    variants = snapshot.get("variants") if isinstance(snapshot, dict) else None
+    if isinstance(variants, list) and len(variants) == 1 and isinstance(variants[0], dict):
+        claims.extend(_numeric_id(variants[0].get(key)) for key in _ENTRY_VARIANT_KEYS)
+    for doc in (snapshot, seed_data):
+        if isinstance(doc, dict):
+            claims.extend(_numeric_id(doc.get(key)) for key in _SEED_VARIANT_KEYS)
+    return [claim for claim in claims if claim]
 
 
 def named_verified_cart_variant_id(
@@ -574,6 +610,16 @@ class ProvenCartVariant(NamedTuple):
     #: shows the product has one live variant, so only it may let a product-level (placeholder)
     #: price stand in for the variant's own.
     scope: str
+    #: The live storefront's title for that variant, as the backfill recorded it ("07 BURGUNDY
+    #: INK"), or None. DISPLAY ONLY -- the buyer never picks the shade on this lane, so the
+    #: purchase says which one it buys. Nothing reads it to decide what is bought.
+    variant_title: Optional[str] = None
+
+
+def _proof_variant_title(seed_data: Any) -> Optional[str]:
+    proof = _cart_proof(seed_data) or {}
+    title = proof.get("variant_title")
+    return (title.strip()[:200] or None) if isinstance(title, str) else None
 
 
 def verified_cart_variant_id(
@@ -590,16 +636,16 @@ def verified_cart_variant_id(
     so the catalog must name the SAME one explicitly: a placeholder-only row is refused here,
     since its product-level offer is not a price anybody vouched for on that one shade.
 
-    Returns the variant AND the scope that proved it, or None.
+    Returns the variant, the scope that proved it and the proof's display title, or None.
     """
     sole = sole_verified_cart_variant_id(
         seed_data, product_urls=product_urls, shop_domain=shop_domain, now=now,
     )
     if sole:
-        return ProvenCartVariant(sole, CART_PROOF_SCOPE_SOLE)
+        return ProvenCartVariant(sole, CART_PROOF_SCOPE_SOLE, _proof_variant_title(seed_data))
     named = named_verified_cart_variant_id(
         seed_data, product_urls=product_urls, shop_domain=shop_domain, now=now,
     )
     if named and named == catalog_variant_id:
-        return ProvenCartVariant(named, CART_PROOF_SCOPE_NAMED)
+        return ProvenCartVariant(named, CART_PROOF_SCOPE_NAMED, _proof_variant_title(seed_data))
     return None
