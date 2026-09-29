@@ -2230,8 +2230,22 @@ async def test_the_sweep_report_carries_the_market_unknown_count_and_logs_it_onc
 # onboarding store) and keys each store on the host the card's cart is built on x the merchant's
 # declared region, which is used ONLY when it is an ISO-2 country.
 
+#: TEST MERCHANTS, taken from the policy itself rather than restated: two listed rig ids (one with
+#: a live store, one with only a legacy store) and one merchant only the policy's
+#: `pivota-review-demo*` domain resolver can name. Every one would be ADMITTED by the lane's own
+#: rules (Shopify, products, region US) — so only the test-merchant skip keeps them out.
+from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS  # noqa: E402
+
+_RIG_LIVE, _RIG_LEGACY = sorted(KNOWN_TEST_MERCHANT_IDS)[:2]
+_RIG_BY_DOMAIN = "m_demo_domain_rig"
+
 _CONNECTED_MERCHANTS = (
     # merchant_id, region, has a cached product
+    (_RIG_LIVE, "US", True),
+    (_RIG_LEGACY, "US", True),
+    # Its region is junk, like prod's review-demo rows: a rig must not be reported as
+    # market-unknown, because it was never going to be swept at all.
+    (_RIG_BY_DOMAIN, "shopify", True),
     ("m_conn", "us", True),
     ("m_conn_twin", "US", True),        # a second live row on the SAME store host
     ("m_url", "US", True),              # domain stored as a URL
@@ -2250,6 +2264,8 @@ _CONNECTED_MERCHANTS = (
 
 _CONNECTED_STORES = (
     # store_id, merchant_id, platform, domain, status
+    ("st_rig_live", _RIG_LIVE, "shopify", "rig-live.myshopify.com", "active"),
+    ("st_rig_domain", _RIG_BY_DOMAIN, "shopify", "pivota-review-demo-9.myshopify.com", "active"),
     ("st_conn", "m_conn", "shopify", "Conn-Store.myshopify.com", "active"),
     ("st_twin", "m_conn_twin", "Shopify", "conn-store.myshopify.com", "connected"),
     ("st_url", "m_url", "shopify", "https://url-store.myshopify.com/", "active"),
@@ -2265,6 +2281,7 @@ _CONNECTED_STORES = (
 
 _LEGACY_STORES = {
     # merchant_id -> (mcp_platform, mcp_shop_domain, mcp_connected)
+    _RIG_LEGACY: ("shopify", "rig-legacy.myshopify.com", True),
     "m_legacy": ("shopify", "legacy-store.myshopify.com", True),
     "m_legacy_dead": ("Shopify", "legacy-dead.myshopify.com", False),
     "m_legacy_shadowed": ("shopify", "legacy-shadowed.myshopify.com", True),
@@ -2280,8 +2297,16 @@ _CONNECTED_EXPECTED = {
 }
 
 
+#: The rigs above, one row each.
+_CONNECTED_TEST_MERCHANT_ROWS = 3
+
+
 @pytest.fixture
 async def _connected(_population):
+    from services import test_merchant_policy
+
+    # The policy memoises its domain-resolved set; a set another test resolved must not answer here.
+    test_merchant_policy.reset_cache()
     for merchant_id, region, _has_product in _CONNECTED_MERCHANTS:
         platform, shop_domain, connected = _LEGACY_STORES.get(merchant_id, (None, None, False))
         await database.execute(
@@ -2306,6 +2331,7 @@ async def _connected(_population):
     yield
     for merchant_id in with_products:
         await database.execute("DELETE FROM products_cache WHERE merchant_id = :m", {"m": merchant_id})
+    test_merchant_policy.reset_cache()
 
 
 async def test_the_population_adds_the_connected_shopify_stores(_db, _connected):
@@ -2314,8 +2340,14 @@ async def test_the_population_adds_the_connected_shopify_stores(_db, _connected)
     keys = {(t.domain, t.market) for t in targets}
     assert keys == {("judydoll.com", "US"), ("flowerbeauty.com", "US")} | _CONNECTED_EXPECTED
     assert len(targets) == len(keys), "two live rows on one host are ONE merchant x market"
-    # EU, APAC, "shopify" and NULL — each skipped and COUNTED, never defaulted to US.
-    assert tally == {sweep.MARKET_UNKNOWN_TALLY: 4}
+    # EU, APAC, "shopify" and NULL — each skipped and COUNTED, never defaulted to US. The three
+    # test merchants are counted as that and nothing else: the rig whose region is "shopify" is
+    # NOT a fifth market-unknown.
+    assert tally == {sweep.MARKET_UNKNOWN_TALLY: 4,
+                     sweep.TEST_MERCHANT_TALLY: _CONNECTED_TEST_MERCHANT_ROWS}
+    rig_hosts = {"rig-live.myshopify.com", "rig-legacy.myshopify.com",
+                 "pivota-review-demo-9.myshopify.com"}
+    assert not {t.domain for t in targets} & rig_hosts
     assert all(t.variant_id is None for t in targets if (t.domain, t.market) in _CONNECTED_EXPECTED), (
         "the connected lane carries no variant; the preflight picks one for the market"
     )
@@ -2347,7 +2379,11 @@ async def test_a_swept_connected_store_answers_the_card_gate(_db, monkeypatch, _
     report = await sweep.run_merchant_purchasability_sweep()
     swept = {(host, kwargs["market"]) for host, kwargs in fetcher.calls}
     assert _CONNECTED_EXPECTED <= swept
+    assert not {host for host, _m in swept} & {
+        "rig-live.myshopify.com", "rig-legacy.myshopify.com", "pivota-review-demo-9.myshopify.com"
+    }, "a test store is never contacted: each check leaves an abandoned checkout on it"
     assert report.population_skipped_market_unknown == 4
+    assert report.population_skipped_test_merchant == _CONNECTED_TEST_MERCHANT_ROWS
     assert report.population_unreadable == 0
     assert await mp.is_purchasable("conn-store.myshopify.com", "US") is True
     assert await mp.is_purchasable("conn-store.myshopify.com", "CA") is False

@@ -486,6 +486,12 @@ unions a third lane (`_CONNECTED_LANE_SQL`):
   store (which the card lane uses whatever `mcp_connected` says). Shopify only, and only for a
   merchant with at least one `products_cache` row, since a store that serves no card makes a fact
   that gates nothing.
+* **Not a test merchant** (2026-09-29). A merchant `services.test_merchant_policy` excludes (the
+  static rig ids plus every `pivota-review-demo*` store) is skipped and counted in
+  `population_skipped_test_merchant`. That is the set search already hides from buyers, so its
+  fact gates no card anyone is served, and each check only leaves an abandoned checkout on our
+  own store. The skip runs before the market rule, so a rig's junk region is not counted as
+  market-unknown.
 * **Host.** `normalize_shop_host(domain)`, the host `shopify_cart_base_url` builds the card's cart
   on.
 * **Market.** The merchant's declared `merchant_onboarding.region`, only when it is an ISO-2
@@ -494,11 +500,25 @@ unions a third lane (`_CONNECTED_LANE_SQL`):
   they are never defaulted. A wrong region costs one abandoned checkout and a negative fact,
   which is the same answer as no fact.
 
-Measured 2026-09-28: `region` is US ×40, `shopify` ×12, APAC ×6, CA ×3, Other ×1, NULL ×1. The lane
-adds **2 targets** (`ijaqit-v9.myshopify.com` from two live store rows, `i9j3i0-kj.myshopify.com`
-legacy, both US). It also adds **+3 to `population_skipped_market_unknown` on every run**: three
-legacy stores whose region reads `shopify`, two of them `pivota-review-demo*` rigs. That count is
-expected and is not an alert.
+**Every connected store is a test store today** (Peng, 2026-09-29). There is no real
+outside-merchant connection yet; the lane exists so the first one is covered on day one.
+
+Measured on prod 2026-09-29, applying the policy to the lane's own rows: **6 rows → 4
+`population_skipped_test_merchant`, 1 market-unknown, 1 target**.
+
+| merchant | store | region | outcome |
+|---|---|---|---|
+| `merch_efbc46b4619cfbdf` ("Chydan") | ijaqit-v9 (live) | US | skipped: test merchant |
+| `merch_bbd34645bc1950cc` | i9j3i0-kj (legacy) | US | skipped: test merchant |
+| `merch_shopify_00d4a720d67d96c5dcba` | pivota-review-demo (legacy) | shopify | skipped: test merchant |
+| `merch_shopify_0584b37f7a8be00a5223` | pivota-review-demo-2 (legacy) | shopify | skipped: test merchant |
+| `merch_c5e24a8d3738d73b` ("Pivota Live Demo Store") | ijaqit-v9 (live) | US | **swept** (not on the list) |
+| `merch_shopify_0c74768217e098809ab3` | mec3xu-zd (legacy) | shopify | market-unknown (not on the list) |
+
+Both counts are expected and are not alerts. Adding the last two merchants to
+`KNOWN_TEST_MERCHANT_IDS` would also hide them from search, so that is a product call, not a sweep
+fix. The first sweep of these stores (2026-09-29 06:08Z) read ijaqit-v9 `NO_CARD_PAYMENT` and
+i9j3i0-kj `VARIANT_UNVERIFIED` (a 401 from its `products.json`).
 
 **To give a connected store a cart in another market,** set its onboarding `region` to that
 country. One region per merchant is all this lane reads.
@@ -784,7 +804,7 @@ abandoned checkouts); the next hour's run is the retry.
 Logging → Cloud Run Jobs → `merchant-purchasability-sweep`, severity INFO):
 
 ```
-[2026-09-23 09:43:20,118] INFO - merchant_purchasability_sweep: SweepReport(population=20, population_skipped_unusable=0, population_skipped_market_unknown=0, population_unreadable=0, population_total=74, population_never_checked=12, checked=20, positive=14, negative=2, unverifiable=4, written=20, abandoned_budget=0, errors=0, skipped_disabled=0, duration_ms=148213)
+[2026-09-23 09:43:20,118] INFO - merchant_purchasability_sweep: SweepReport(population=20, population_skipped_unusable=0, population_skipped_market_unknown=0, population_skipped_test_merchant=0, population_unreadable=0, population_total=74, population_never_checked=12, checked=20, positive=14, negative=2, unverifiable=4, written=20, abandoned_budget=0, errors=0, skipped_disabled=0, duration_ms=148213)
 ```
 
 ```sh
@@ -796,14 +816,15 @@ gcloud logging read 'resource.type="cloud_run_job"
 
 (The sample's counts are illustrative; its shape is current. `population_skipped_market_unknown`
 was added on 2026-09-26, `population_unreadable` on 2026-09-27, and `population_total` /
-`population_never_checked` on 2026-09-28; the line is emitted on a run whose population could not
-be built too.) Read it as: `population` merchants taken this run (≤ `BATCH`) out of
+`population_never_checked` on 2026-09-28, and `population_skipped_test_merchant` on 2026-09-29;
+the line is emitted on a run whose population could not be built too.) Read it as: `population` merchants taken this run (≤ `BATCH`) out of
 `population_total` in all lanes, of which `population_never_checked` have no fact yet (see
 "Capacity"); `checked` fetched; `positive / negative / unverifiable` partition `checked`;
 `written` facts upserted; `abandoned_budget` not started because the budget ran out. With the
 gate off the run logs `merchant_purchasability_sweep: disabled; no merchant was contacted` and
 exits 0. A skipped allowlist row (a `merchant_domain` that is not a bare host name, §7's census
-query; or a non-ISO-2 market) logs once per run, as a count, at WARNING on the same channel.
+query; or a non-ISO-2 market) logs once per run, as a count, at WARNING on the same channel. A
+skipped test merchant logs nothing: it is policy, and it shows only in its count.
 
 **Why the line goes through `utils.logger`.** Measured 2026-09-23 on the worker:
 `/__scheduler_health` showed `runs_ok=1` and Cloud Logging held **zero**
