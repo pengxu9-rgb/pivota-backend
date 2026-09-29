@@ -62,6 +62,12 @@ never checked and, under enforcement, its cards could never carry a cart again.
     `merchant_onboarding.mcp_shop_domain` — Shopify only, since Wix / WooCommerce cards never
     mint a cart and the preflight is Shopify-only — and only for a merchant with a cached
     product, because a store that serves no card makes a fact that gates nothing.
+  * NOT A TEST MERCHANT: a merchant `services.test_merchant_policy.get_excluded_merchant_ids`
+    excludes (the static rig ids plus every `pivota-review-demo*` store) is skipped and counted
+    as `population_skipped_test_merchant`. That is the set search already hides from buyers, so
+    a fact about it gates no card anyone is served, and checking it only leaves an abandoned
+    checkout on our own store. Skipped BEFORE the host and market rules, so a rig's junk region
+    is not reported as `population_skipped_market_unknown`.
   * THE HOST is `normalize_shop_host(domain)` — the function `shopify_cart_base_url` builds the
     card's cart on — then the same `_population_key` every lane goes through.
   * THE MARKET is the merchant's declared `merchant_onboarding.region`, and ONLY when it is an
@@ -72,10 +78,14 @@ never checked and, under enforcement, its cards could never carry a cart again.
     unverifiable, which is the answer an absent fact already gives, so a wrong region can
     only cost one abandoned checkout, never open a cart.
 
-  Measured 2026-09-28: `region` reads US 40, "shopify" 12, APAC 6, CA 3, Other 1, NULL 1 across
-  merchant_onboarding. The lane admits two hosts today — ijaqit-v9.myshopify.com (two live store
-  rows) and i9j3i0-kj.myshopify.com (legacy), both US — and counts the three legacy stores whose
-  region reads "shopify" as market-unknown.
+  EVERY CONNECTED STORE IS A TEST STORE TODAY (Peng, 2026-09-29): there is no real
+  outside-merchant connection yet, and the lane exists so the first one is covered on day one.
+  Measured on prod 2026-09-29, the policy's own rules over the lane's own rows: 6 rows, 4 of them
+  listed test merchants and now skipped — merch_efbc46b4619cfbdf (ijaqit-v9),
+  merch_bbd34645bc1950cc (i9j3i0-kj) and the two `pivota-review-demo*` legacy stores. Two are NOT
+  on the list: "Pivota Live Demo Store" (merch_c5e24a8d3738d73b, ijaqit-v9, region US) is still
+  swept, and the legacy mec3xu-zd.myshopify.com (merch_shopify_0c74768217e098809ab3, region
+  "shopify") is still counted as market-unknown. Listing either hides it from search too.
 
 THE FOURTH LANE IS THE CART MINTER ITSELF. The same card gate, and `offers.resolve`, mint an
 EXTERNAL SEED's prefilled cart only on a fresh positive fact for the cart host x the buyer's
@@ -214,6 +224,9 @@ from services.tierb_cart_link_merchants import canonical_merchant_domain
 # the connected store domain with it), so a connected-store fact is keyed on the host the card
 # gate asks about. See `_CONNECTED_LANE_SQL`.
 from services.outbound_links_service import normalize_shop_host
+# THE test-merchant policy search already serves by (the find_products_multi rig filter). One owner:
+# the connected-store lane skips exactly the merchants it excludes. See `_CONNECTED_LANE_SQL`.
+from services.test_merchant_policy import get_excluded_merchant_ids
 from services.shopify_cart_link_preflight import (
     REQUEST_TIMEOUT_S,
     USER_AGENT,
@@ -365,7 +378,7 @@ SELECT shop_domain AS domain, market AS market, variant_id
 #: so a store with none serves no card, a fact about it gates nothing, and checking it would only
 #: leave an abandoned checkout behind.
 _CONNECTED_LANE_SQL = """
-SELECT s.domain AS domain, o.region AS region
+SELECT s.merchant_id AS merchant_id, s.domain AS domain, o.region AS region
   FROM merchant_stores s
   JOIN merchant_onboarding o ON o.merchant_id = s.merchant_id
  WHERE s.status IN ('active', 'connected')
@@ -373,7 +386,7 @@ SELECT s.domain AS domain, o.region AS region
    AND COALESCE(s.domain, '') <> ''
    AND EXISTS (SELECT 1 FROM products_cache pc WHERE pc.merchant_id = s.merchant_id)
 UNION ALL
-SELECT o.mcp_shop_domain AS domain, o.region AS region
+SELECT o.merchant_id AS merchant_id, o.mcp_shop_domain AS domain, o.region AS region
   FROM merchant_onboarding o
  WHERE lower(COALESCE(o.mcp_platform, '')) = 'shopify'
    AND COALESCE(o.mcp_shop_domain, '') <> ''
@@ -788,6 +801,11 @@ UNUSABLE_TALLY = "population_skipped_unusable"
 #: 2026-09-26, silently swept under a truncated market).
 MARKET_UNKNOWN_TALLY = "population_skipped_market_unknown"
 
+#: The `SweepReport` count of connected-store rows skipped because their merchant is a TEST
+#: merchant (`services.test_merchant_policy`). Expected and not an alert: every connected store
+#: was a test store on 2026-09-29. A COUNT, never the merchant ids.
+TEST_MERCHANT_TALLY = "population_skipped_test_merchant"
+
 #: The `SweepReport` count of population reads that failed: once per LANE (the two allowlists, the
 #: connected stores, the cart minter) whose read raised or — the cart-mint lane only — came back
 #: incomplete, and once when the staleness read (`facts.list_due`) raised. The run still sweeps
@@ -884,7 +902,14 @@ async def collect_population(
         variant = str(row.get("variant_id") or "").strip() or None
         if key is not None and (variant or key not in lanes["cart-link"]):
             lanes["cart-link"][key] = variant
-    for row in await _lane(lambda: _rows(_CONNECTED_LANE_SQL), "connected-store") or []:
+    connected_rows = await _lane(lambda: _rows(_CONNECTED_LANE_SQL), "connected-store") or []
+    # Read only when there are rows to filter. It fails SOFT to the static rig ids (its own
+    # contract, the one search relies on), never to "exclude nobody".
+    test_merchants = await get_excluded_merchant_ids(database) if connected_rows else set()
+    for row in connected_rows:
+        if str(row.get("merchant_id") or "").strip() in test_merchants:
+            _count(TEST_MERCHANT_TALLY)
+            continue
         key = _key(normalize_shop_host(row.get("domain")), _connected_market(row.get("region")))
         if key is not None:
             lanes["connected-store"].setdefault(key, None)
@@ -1064,6 +1089,9 @@ class SweepReport:
     #: market is never defaulted or truncated, so such a row is not swept; see
     #: `MARKET_UNKNOWN_TALLY`.
     population_skipped_market_unknown: int = 0
+    #: Connected-store rows left out because the merchant is a TEST merchant; see
+    #: `TEST_MERCHANT_TALLY`. Expected, not an alert.
+    population_skipped_test_merchant: int = 0
     #: Population reads (the four lanes and the staleness read, 0..5) that RAISED or, for the
     #: cart-mint lane, came back incomplete; or 1 when the population could not be built at all.
     #: Non-zero means this run swept an incomplete population (or in the wrong order); the CLI
@@ -1095,7 +1123,7 @@ class SweepReport:
 
 _COUNTS = (
     "population", "population_skipped_unusable", "population_skipped_market_unknown",
-    "population_unreadable", "population_total", "population_never_checked",
+    "population_skipped_test_merchant", "population_unreadable", "population_total", "population_never_checked",
     "cart_mint_population_age_min", "checked",
     "positive", "negative", "unverifiable", "written", "abandoned_budget", "errors",
     "skipped_disabled",
@@ -1215,6 +1243,8 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
             "host name", counts["population_skipped_unusable"],
         )
     counts["population_skipped_market_unknown"] = tally.get(MARKET_UNKNOWN_TALLY, 0)
+    # No warning line: skipping a test store is policy, not a fault.
+    counts["population_skipped_test_merchant"] = tally.get(TEST_MERCHANT_TALLY, 0)
     if counts["population_skipped_market_unknown"]:
         operator_logger.warning(
             "merchant_purchasability_sweep: %d allowlist row(s) skipped: market is not an ISO-2 "
