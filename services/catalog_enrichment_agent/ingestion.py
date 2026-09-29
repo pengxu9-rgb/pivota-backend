@@ -243,8 +243,10 @@ def _script_identity(brand: Optional[str], product_name: Optional[str]) -> Optio
 
     The prefix is the ASCII slug of the identity text, not of the raw name, so width variants of one
     product ("ＭＶマルチビタ" / "MVマルチビタ") share the whole key, not only the digest."""
-    # NFC so a decomposed Vietnamese "mặt" (a + U+0323 + U+0302) is the precomposed letter it spells.
-    text = unicodedata.normalize("NFC", f"{brand or ''} {product_name or ''}")
+    # NFC so a decomposed Vietnamese "mặt" (a + U+0323 + U+0302) is the precomposed letter it spells --
+    # after dropping invisibles, which product_identity_text drops too and which would block composition.
+    text = unicodedata.normalize("NFC", "".join(
+        ch for ch in f"{brand or ''} {product_name or ''}" if not _is_invisible(ch)))
     if not any(_names_the_product(ch) for ch in text) and _normalize_token(text):
         return None
     identity = product_identity_text(brand, product_name)
@@ -520,9 +522,15 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
     }
     if not payload["brand"] or not payload["product_name"]:
         return {}
-    # A name made only of symbols ("™", "—"), or one whose slug is literally "unknown" ("Unknown" "™"),
-    # would land on the one key every such name shares; it identifies nothing.
-    if derive_product_key(payload["brand"], payload["product_name"]) == SHARED_UNKNOWN_PRODUCT_KEY:
+    # A brand + name made only of symbols ("™" "—") identifies nothing.
+    if not product_identity_text(payload["brand"], payload["product_name"]):
+        return {}
+    # A content-keyed row whose brand + name slug to nothing or to literally "unknown" ("Unknown" "™")
+    # would land on the one key all such rows share. Retailer rows are keyed by their URL
+    # (_build_pdp_insert) and never use this key, so they are not refused for it: a refused record
+    # fails the whole store's primary apply (primary_ingestion: records_skipped).
+    if (pdp.get("source_role") != "retailer"
+            and derive_product_key(payload["brand"], payload["product_name"]) == SHARED_UNKNOWN_PRODUCT_KEY):
         return {}
     return payload
 
