@@ -48,9 +48,18 @@ BOUNDED WAITS. A shared wait can never grow without limit, whatever the row, the
     stalling every later run;
   * a lease that still comes back further out than the horizon is treated as a DB failure: ERROR,
     local pacing, and the DB retried after 30s.
-The horizon is `max(60, 8 * max_lease / rate)` seconds (60s at the defaults, 1,600s at the most
-extreme settings, rate 0.1 with lease 20): room for ~8 processes each holding a full lease, so a
-legitimate backlog never looks poisoned.
+  * a process never holds more than TWO max leases of future time: `refill` does not lease while
+    this process has already handed a caller a slot more than `max_lease / rate` ahead (the
+    lookahead cap), so a burst of K concurrent callers waits in the process instead of reserving
+    K slots of shared future.
+The horizon is `max(60, 16 * max_lease / rate)` seconds (80s at the defaults, 3,200s at the most
+extreme settings, rate 0.1 with lease 20): room for 8 processes each holding its two-lease cap,
+so a legitimate backlog never looks poisoned.
+
+EVERY PROCESS MUST USE THE SAME `CRAWL_SHOPIFY_EDGE_RPS`. The rate is not stored in the row: each
+lease advances the shared schedule by `n / (that process's rate)`. One job set to 0.1 reserves 10s
+per slot on the shared timeline and drags every other job down with it (the reviewer measured the
+refresh at 0.18 req/s beside a 0.1 process). Set the rate once, identically, on every crawl job.
 
 HOW A HOST BECOMES "SHOPIFY-SERVED", decided before the request:
   * by its lane: the Tier B and purchasability sweeps check Shopify merchants only (their preflight
@@ -158,6 +167,7 @@ _sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep
 _slots: Deque[float] = deque()
 _grants: Deque[float] = deque()  # when slots were granted, trailing `_DEMAND_WINDOW` only
 _waiting = 0  # callers currently waiting on a lease refill
+_granted_until = 0.0  # the furthest-out slot this process has handed to a caller (monotonic)
 _local_next = 0.0  # the local fallback schedule's own horizon (monotonic)
 _db_down_until = 0.0
 _inflight: "Optional[asyncio.Future[None]]" = None
@@ -170,6 +180,7 @@ def _zero_stats() -> Dict[str, float]:
     return {
         "granted": 0, "waited_seconds": 0.0, "leases": 0, "leased_slots": 0, "db_errors": 0,
         "local_slots": 0, "expired_slots": 0, "refused": 0, "hosts_learned": 0, "hosts_marked": 0,
+        "held_back_seconds": 0.0,
     }
 
 
@@ -217,7 +228,7 @@ def db_timeout() -> float:
 
 def horizon() -> float:
     """How far past the DB's "now" a lease may start; see BOUNDED WAITS."""
-    return max(_HORIZON_MIN, 8.0 * lease_size() / rate())
+    return max(_HORIZON_MIN, 16.0 * lease_size() / rate())
 
 
 # ── which hosts are Shopify-served ──────────────────────────────────────────────────────────
@@ -372,6 +383,17 @@ async def refill() -> None:
         leader = loop.create_future()
         _inflight = leader
         try:
+            # THE LOOKAHEAD CAP. `take_nowait` hands a future slot to a caller at once, so K
+            # concurrent callers would otherwise hold K slots of future time, and four processes
+            # bursting 50 callers each outran the horizon: the SQL heal then restarted the schedule
+            # at "now" underneath slots already handed out (3.17 req/s against 2.0 in the
+            # reviewer's simulation). No new lease while this process has already handed out a slot
+            # more than one max lease (max_lease / rate) ahead; the waiters wait here instead. A
+            # process therefore never holds more than two max leases of future time.
+            ahead = _granted_until - _monotonic() - lease_size() / rate()
+            if ahead > 0:
+                _stats["held_back_seconds"] += ahead
+                await _sleep(ahead)
             await _lease()
         finally:
             # In a `finally` so a follower is never stranded on a future nobody resolves.
@@ -390,6 +412,7 @@ def take_nowait(*, max_wait: Optional[float] = None) -> Optional[float]:
     `max_wait` raises `EdgePaced` and is NOT taken. Expired slots are dropped first: spending one
     late would be a burst the shared schedule never granted.
     """
+    global _granted_until
     now = _monotonic()
     grace = 1.0 / rate()
     while _slots and _slots[0] < now - grace:
@@ -406,6 +429,7 @@ def take_nowait(*, max_wait: Optional[float] = None) -> Optional[float]:
             f"{max_wait:.1f}s the caller allows"
         )
     _slots.popleft()
+    _granted_until = max(_granted_until, slot)
     _stats["granted"] += 1
     _stats["waited_seconds"] += max(0.0, wait)
     _trim_grants(now)
@@ -441,6 +465,7 @@ def stats() -> Dict[str, Any]:
     """Counts for a job's summary line. Hosts are counted, never listed."""
     out: Dict[str, Any] = dict(_stats)
     out["waited_seconds"] = round(float(out["waited_seconds"]), 1)
+    out["held_back_seconds"] = round(float(out["held_back_seconds"]), 1)
     out.update(enabled=enabled(), rate=rate(), max_lease=lease_size(),
                fallback_rate=fallback_rate(), known_hosts=len(_known))
     return out
@@ -448,11 +473,12 @@ def stats() -> Dict[str, Any]:
 
 def reset_for_tests() -> None:
     """Drop all pacer state and restore the seams. Tests only."""
-    global _slots, _grants, _waiting, _local_next, _db_down_until
+    global _slots, _grants, _waiting, _granted_until, _local_next, _db_down_until
     global _inflight, _inflight_loop, _announced, _stats, _lease_fn, _monotonic, _sleep
     _slots = deque()
     _grants = deque()
     _waiting = 0
+    _granted_until = 0.0
     _local_next = 0.0
     _db_down_until = 0.0
     _inflight = None

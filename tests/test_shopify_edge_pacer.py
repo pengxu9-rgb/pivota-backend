@@ -1049,11 +1049,14 @@ async def test_the_horizon_is_passed_to_the_lease_and_bounded(monkeypatch) -> No
 
     sep._lease_fn = lease
     await sep.acquire()
-    assert seen == [60.0]  # max(60, 8 * 10 / 2.0)
+    assert seen == [80.0]  # max(60, 16 * 10 / 2.0)
     monkeypatch.setenv(sep.RATE_ENV, "0.1")
-    assert sep.horizon() == 800.0
-    monkeypatch.setenv(sep.LEASE_ENV, "20")
     assert sep.horizon() == 1600.0
+    monkeypatch.setenv(sep.LEASE_ENV, "20")
+    assert sep.horizon() == 3200.0
+    monkeypatch.setenv(sep.RATE_ENV, "20")
+    monkeypatch.setenv(sep.LEASE_ENV, "10")
+    assert sep.horizon() == 60.0
     monkeypatch.setenv(sep.RATE_ENV, "20")
     assert sep.horizon() == 60.0
 
@@ -1130,3 +1133,60 @@ async def test_a_bounded_caller_rechecks_its_host_after_waiting_on_a_lease(monke
         await bounded
     await unbounded
     assert clock.now - 1000.0 < 10.0
+
+
+
+def _pacer_copy(name: str):
+    """A second, independent copy of the pacer module: one "process" of a multi-process test."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, REPO / "services" / "shopify_edge_pacer.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+async def test_a_burst_of_concurrent_callers_stays_in_budget_without_healing(monkeypatch) -> None:
+    """Four processes each bursting 50 concurrent callers. Without the lookahead cap every caller
+    got a future slot at once, the shared backlog outran the horizon, and the SQL heal restarted the
+    schedule underneath slots already handed out: 3.17 req/s against a 2.0 budget in the reviewer's
+    simulation. Real time, scaled: rate 100/s, horizon floor 1.2s."""
+    rate, per_process, procs = 100.0, 50, 4
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    monkeypatch.setenv(sep.RATE_ENV, str(rate))  # each copy's rate cap is raised to allow it
+    db = {"next": 0.0, "heals": 0, "leases": 0}
+
+    async def lease(bucket, *, slots, rate_per_s, horizon_s):
+        now = time.monotonic()
+        span = slots / rate_per_s
+        if db["next"] > now + horizon_s:
+            db["heals"] += 1
+            base = now
+        else:
+            base = max(db["next"], now)
+        db["next"] = base + span
+        db["leases"] += 1
+        return base, now
+
+    starts: List[float] = []
+    copies = []
+    for i in range(procs):
+        m = _pacer_copy(f"_edge_pacer_proc{i}")
+        m._RATE_MAX = rate
+        m._HORIZON_MIN = 1.2
+        m._DEMAND_WINDOW = 0.02  # the 1s demand window at this 50x time scale
+        m._lease_fn = lease
+        copies.append(m)
+
+    async def one(m) -> None:
+        await m.acquire()
+        starts.append(time.monotonic())
+
+    await asyncio.wait_for(
+        asyncio.gather(*(one(m) for m in copies for _ in range(per_process))), timeout=30)
+    starts.sort()
+    total = procs * per_process
+    assert db["heals"] == 0, db
+    assert starts[-1] - starts[0] >= (total - 3) / rate, starts[-1] - starts[0]
+    worst = max(sum(1 for t in starts if s <= t < s + 1.0 / rate * 10) for s in starts)
+    assert worst <= 10 + 2, worst
