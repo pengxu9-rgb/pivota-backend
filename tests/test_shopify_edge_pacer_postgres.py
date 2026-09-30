@@ -46,6 +46,10 @@ if _IS_PG and _THROWAWAY:
 
 _MIGRATION = pathlib.Path(__file__).resolve().parent.parent / "db" / "migrations" / "251_crawl_egress_pacer.sql"
 _TABLE = "crawl_egress_pacer"
+# The lease statement reads clock_timestamp() more than once (schedule, then RETURNING db_now), so on
+# a loaded runner they differ by the statement's own duration. The failures these checks catch are off
+# by a whole lease span (>= 1 s) or the poisoned 1e6 s; half a second separates them.
+_DB_CLOCK_SLACK = 0.5
 
 _CATALOG_SQL = """
     SELECT column_name, data_type, is_nullable, COALESCE(column_default, '') AS column_default
@@ -101,12 +105,12 @@ async def test_the_lease_statement_on_postgres() -> None:
         table.reset_for_tests()
         start1, now1 = await table.lease_slots("pg_bucket", slots=10, rate_per_s=2.0, horizon_s=60)
         start2, _ = await table.lease_slots("pg_bucket", slots=10, rate_per_s=2.0, horizon_s=60)
-        assert abs(start1 - now1) < 0.05
+        assert abs(start1 - now1) < _DB_CLOCK_SLACK
         assert start2 == pytest.approx(start1 + 5.0, abs=1e-6), "leases abut; no overlap"
         await database.execute(
             f"UPDATE {_TABLE} SET next_free_epoch = 0 WHERE bucket = 'pg_bucket'")
         start3, now3 = await table.lease_slots("pg_bucket", slots=1, rate_per_s=2.0, horizon_s=60)
-        assert start3 >= now3 - 0.01, "an idle bucket restarts at now: no stored burst"
+        assert start3 >= now3 - _DB_CLOCK_SLACK, "an idle bucket restarts at now: no stored burst"
         row = await database.fetch_one(f"SELECT leases FROM {_TABLE} WHERE bucket = 'pg_bucket'")
         assert int(row[0]) == 3, "one statement per lease"
         # POISONED ROW (a typo'd rate, a DB clock step): restarts at now, then leases abut again.
@@ -114,7 +118,7 @@ async def test_the_lease_statement_on_postgres() -> None:
             f"UPDATE {_TABLE} SET next_free_epoch = next_free_epoch + 1000000 "
             "WHERE bucket = 'pg_bucket'")
         start4, now4 = await table.lease_slots("pg_bucket", slots=2, rate_per_s=2.0, horizon_s=60)
-        assert abs(start4 - now4) < 0.05
+        assert abs(start4 - now4) < _DB_CLOCK_SLACK
         start5, _ = await table.lease_slots("pg_bucket", slots=2, rate_per_s=2.0, horizon_s=60)
         assert start5 == pytest.approx(start4 + 1.0, abs=1e-6)
     finally:
