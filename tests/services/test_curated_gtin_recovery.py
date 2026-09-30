@@ -64,9 +64,9 @@ async def test_only_barcode_copied_and_native_identity_preserved(monkeypatch):
     assert p == before
     assert report == dict(attempted=1, recovered=1, failed=0, paced=0, budget_stopped=0, blocked_stopped=0,
                           capped=0, recovered_gtins=1, http_requests=1)
-    # Waits for its turn, bounded by what is left of the recovery's budget (#2477): a fixed 10s refused
-    # every product once the shared Shopify-edge schedule was over 10s out; unbounded slept out a 429.
-    assert 0 < feed.crawl_politeness.before_request.await_args.kwargs['max_wait'] <= feed.GTIN_RECOVERY_BUDGET_S
+    # With the shared Shopify-edge pacer off this is main exactly: a 10s bound per request (#2477). The
+    # pacer-on bound (what is left of the budget) is pinned in test_curated_shopify_edge_pacer_wiring.
+    assert feed.crawl_politeness.before_request.await_args.kwargs['max_wait'] == 10.0
 
 
 @pytest.mark.asyncio

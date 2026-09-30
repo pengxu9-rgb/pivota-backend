@@ -241,8 +241,9 @@ def test_a_host_answering_429_ends_the_recovery_after_one_request_like_main(monk
 def test_a_backed_up_schedule_stops_at_the_budget_not_after_thousands_of_seconds(monkeypatch):
     """Review #2477 P0: a steady 15s shared backlog (flag on) cost ~3,000s for 200 products unbounded.
     On a fake clock: each turn takes 15s; the recovery stops when its budget cannot cover the next."""
+    monkeypatch.setenv(shopify_edge_pacer.ENABLED_ENV, "1")  # the budget bounds the shared pacer's waits
     clock = [1000.0]
-    monkeypatch.setattr(cbf.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cbf, "_clock", lambda: clock[0])  # the budget's own clock, not asyncio's
     waits = []
 
     async def gate(url, *, user_agent, max_wait=None):
@@ -265,3 +266,49 @@ def test_a_backed_up_schedule_stops_at_the_budget_not_after_thousands_of_seconds
         [_gtin_product(n) for n in range(1, 11)], domain=HOST, budget_s=40))
     assert report["recovered"] == 2 and report["budget_stopped"] == 8 and report["failed"] == 0
     assert clock[0] - 1000.0 == 30  # never ran past its budget
+
+
+
+def test_a_throttle_on_the_redirect_target_stops_the_batch(monkeypatch):
+    """Review #2477 P2: apex .js redirects to www and www answers 429. Blocks are counted on the host
+    that answered (www), so the stop must read it, not only the apex."""
+    crawl_politeness.reset_for_tests()
+    www = "www." + HOST
+    requests = []
+
+    def reply(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        requests.append(request.url.host)
+        if request.url.host == HOST:
+            return httpx.Response(301, headers={"location": f"https://{www}{request.url.path}"})
+        return httpx.Response(429, headers={"retry-after": "60"})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(reply), **kw))
+    _rows, report = asyncio.run(cbf.recover_missing_variant_gtins(
+        [_gtin_product(n) for n in range(1, 11)], domain=HOST))
+    assert requests == [HOST, www]  # one product's redirect hop, then the stop
+    assert report["failed"] == 1 and report["blocked_stopped"] == 9
+    crawl_politeness.reset_for_tests()
+
+
+def test_with_the_pacer_off_there_is_no_budget_and_every_request_keeps_mains_10s_bound(monkeypatch):
+    waits = []
+
+    async def gate(url, *, user_agent, max_wait=None):
+        waits.append(max_wait)
+
+    def reply(request):
+        n = int(request.url.path.split("oil-")[1].split(".")[0])
+        detail = _gtin_product(n)
+        detail["variants"][0]["barcode"] = "8809530070499"
+        return httpx.Response(200, json=detail)
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(reply), **kw))
+    monkeypatch.setattr(crawl_politeness, "before_request", gate)
+    monkeypatch.setattr(crawl_politeness, "note_response", lambda *a, **kw: None)
+    monkeypatch.setattr(cbf, "_clock", lambda: (_ for _ in ()).throw(AssertionError("no budget clock off")))
+    _rows, report = asyncio.run(cbf.recover_missing_variant_gtins([_gtin_product(1), _gtin_product(2)], domain=HOST))
+    assert waits == [10.0, 10.0] and report["recovered"] == 2
