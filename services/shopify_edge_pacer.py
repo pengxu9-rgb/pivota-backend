@@ -443,8 +443,11 @@ async def acquire(*, max_wait: Optional[float] = None) -> float:
     `max_wait=None` waits as long as the budget needs (a batch). A number is the caller's patience:
     a slot further out raises `EdgePaced` without being taken.
     """
+    # The patience is a DEADLINE: time spent held back by the lookahead cap or waiting on a lease
+    # refill counts against it.
+    deadline = None if max_wait is None else _monotonic() + max_wait
     while True:
-        slot = take_nowait(max_wait=max_wait)
+        slot = take_nowait(max_wait=None if deadline is None else deadline - _monotonic())
         if slot is None:
             await refill()
             continue

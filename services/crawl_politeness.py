@@ -405,17 +405,19 @@ async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = N
         # slot is taken with no await between it and the host reservation below, and a refusal
         # (`EdgePaced`, a `CrawlPaced`) is raised before either is reserved -- this function's
         # contract. Only a lease refill awaits, and everything is re-read after it.
+        # The caller's patience is a deadline: time spent waiting on a refill counts against it.
+        deadline = now + ceiling
         slot = edge.take_nowait(max_wait=ceiling)
         while slot is None:
             await edge.refill()
             now = time.monotonic()
             start = max(now, state.next_allowed, state.backoff_until)
-            if (start - now) > ceiling:
+            if start > deadline:
                 raise CrawlPaced(
                     f"{host} next free in {start - now:.1f}s, over the {ceiling:.1f}s the caller "
                     f"allows"
                 )
-            slot = edge.take_nowait(max_wait=ceiling)
+            slot = edge.take_nowait(max_wait=deadline - now)
         start = max(start, slot)
     # Reserve BEFORE sleeping. Read-then-write with no await between them is atomic on one loop,
     # so N concurrent callers take N distinct slots instead of all waking at the same instant.

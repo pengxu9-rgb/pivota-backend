@@ -752,6 +752,7 @@ _CHILD = textwrap.dedent(
     from services import shopify_edge_pacer as sep
 
     starts = []
+    windows = []
     real = httpx.AsyncClient
 
     def handler(request):
@@ -769,13 +770,21 @@ _CHILD = textwrap.dedent(
         hosts = [f"shop{{i}}.example" for i in range(6)]
         for h in hosts:
             sep.mark_shopify_host(h)
+        real_lease = sep._lease_fn
+
+        async def recording(bucket, **kw):
+            start, db_now = await real_lease(bucket, **kw)
+            windows.append((start, start + kw["slots"] / kw["rate_per_s"]))
+            return start, db_now
+
+        sep._lease_fn = recording
         open(sys.argv[2], "w").close()
         while not os.path.exists(sys.argv[1]):
             await asyncio.sleep(0.01)
         for i in range(int(sys.argv[3])):
             await eos._fetch_html(f"https://{{hosts[i % 6]}}/products/p{{i}}", max_wait=0)
         await database.disconnect()
-        print("RESULT " + json.dumps({{"starts": starts, "stats": sep.stats()}}))
+        print("RESULT " + json.dumps({{"starts": starts, "windows": windows, "stats": sep.stats()}}))
 
     asyncio.run(main())
     """
@@ -825,9 +834,13 @@ def assert_one_shared_budget(run: Dict[str, Any]) -> None:
     # Two processes each pacing alone would finish 2n requests in ~(n - 1) / rate seconds. One
     # shared budget needs ~(2n - 1) / rate. Allow one slot of slack for the lease-edge grace.
     assert merged[-1] - merged[0] >= (2 * n - 3) / rate, (merged[-1] - merged[0])
-    # No window of one second holds more than rate + 2 starts (no burst beyond the grace).
-    worst = max(sum(1 for t in merged if s <= t < s + 1.0) for s in merged)
-    assert worst <= rate + 2, worst
+    # The budget itself, exactly, on the DB's own clock: the windows the two processes leased on
+    # the shared timeline never overlap, so no stretch of it holds more than rate x width + 1 slots.
+    # (Not a wall-clock window on request starts: an event-loop or GC stall wakes overdue requests
+    # together, which says nothing about the schedule and flakes under load.)
+    windows = sorted(w for r in run["results"] for w in r["windows"])
+    overlaps = [(x, y) for x, y in zip(windows, windows[1:]) if y[0] < x[1] - 1e-4]
+    assert not overlaps, overlaps[:3]
     # They really interleaved: each process started some of its requests while the other ran.
     assert min(b) < max(a) and min(a) < max(b)
     for r in run["results"]:
@@ -1214,3 +1227,65 @@ async def test_a_burst_of_concurrent_callers_stays_in_budget_without_healing(mon
     assert len(handed) == total
     handed.sort()
     assert handed[-1] - handed[0] >= (total - 3) / rate, handed[-1] - handed[0]
+
+
+
+async def test_time_spent_on_a_refill_counts_against_a_bounded_callers_patience(monkeypatch):
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    clock = _install_clock(monkeypatch)
+
+    async def slow(bucket, *, slots, rate_per_s, horizon_s):
+        clock.now += 4.0  # a slow refill (or a lookahead hold)
+        return clock.now + 2.0, clock.now  # ...then a slot 2s out: 6s after the call
+
+    sep._lease_fn = slow
+    with pytest.raises(sep.EdgePaced):
+        await sep.acquire(max_wait=5.0)
+    sep.reset_for_tests()
+    clock = _install_clock(monkeypatch)
+    sep._lease_fn = slow
+    assert await sep.acquire(max_wait=7.0) == pytest.approx(2.0)
+
+
+async def test_a_refill_counts_against_the_gates_bounded_patience(monkeypatch):
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "5")
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "0")
+    clock = _install_clock(monkeypatch)
+
+    async def slow(bucket, *, slots, rate_per_s, horizon_s):
+        clock.now += 4.0
+        return clock.now + 2.0, clock.now
+
+    sep._lease_fn = slow
+    sep.mark_shopify_host("shop-a.example")
+    with pytest.raises(cp.CrawlPaced):
+        await cp.before_request("https://shop-a.example/a", user_agent="PivotaBot")
+
+
+async def test_a_host_slot_taken_during_a_refill_is_judged_against_the_original_deadline(monkeypatch):
+    """A bounded caller (5s) waits 4s on a refill while another caller reserves the host 8s out.
+    Measured from now the host is 4s away (inside 5s); measured from the call it is 8s (outside).
+    The patience is the call's, so it is refused."""
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "8")
+    clock = _install_clock(monkeypatch)
+    gate = asyncio.Event()
+
+    async def slow(bucket, *, slots, rate_per_s, horizon_s):
+        await gate.wait()
+        clock.now += 4.0
+        return clock.now, clock.now
+
+    sep._lease_fn = slow
+    sep.mark_shopify_host("shop-a.example")
+    bounded = asyncio.ensure_future(
+        cp.before_request("https://shop-a.example/a", user_agent="PivotaBot", max_wait=5))
+    await asyncio.sleep(0.01)
+    unbounded = asyncio.ensure_future(
+        cp.before_request("https://shop-a.example/b", user_agent="PivotaBot", max_wait=0))
+    await asyncio.sleep(0.01)
+    gate.set()
+    with pytest.raises(cp.CrawlPaced):
+        await bounded
+    await unbounded
