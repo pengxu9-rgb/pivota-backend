@@ -129,10 +129,17 @@ except Exception:
     sys.exit(0)
 print(1 if any(b.get("role") == "roles/run.invoker" and "allUsers" in (b.get("members") or []) for b in (d.get("bindings") or [])) else 0)' 2>/dev/null || true
 }
-if [ -z "$_PUBLIC_EXPLICIT" ] && [ "$CONFIG" = preserve ] && [ "$PUBLIC" != 1 ] \
-   && [ "$(preserved_public_invoker)" = 1 ]; then
-  PUBLIC=1
-  echo "note: $SERVICE already grants roles/run.invoker to allUsers; CONFIG=preserve keeps it (PUBLIC=1). Pass PUBLIC=0 to make it private." >&2
+if [ -z "$_PUBLIC_EXPLICIT" ] && [ "$CONFIG" = preserve ] && [ "$PUBLIC" != 1 ]; then
+  _PRESERVED_PUBLIC="$(preserved_public_invoker)"
+  if [ "$_PRESERVED_PUBLIC" = 1 ]; then
+    PUBLIC=1
+    echo "note: $SERVICE already grants roles/run.invoker to allUsers; CONFIG=preserve keeps it (PUBLIC=1). Pass PUBLIC=0 to make it private." >&2
+  elif [ -z "$_PRESERVED_PUBLIC" ]; then
+    # The read failed (no service yet, no permission, expired auth, gcloud/python3 error), so the
+    # default below may REVOKE an allUsers binding nobody can see from here. Say so, loudly.
+    echo "WARNING: could not read $SERVICE's IAM policy in $PROJECT; deploying with --no-allow-unauthenticated," \
+      "which REVOKES any existing allUsers invoker binding. Pass PUBLIC=1 to keep it public, or PUBLIC=0 to confirm private." >&2
+  fi
 fi
 [ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
 if [ "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" = true ] && [ "$SERVICE" != web ]; then
