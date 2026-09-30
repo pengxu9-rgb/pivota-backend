@@ -351,3 +351,33 @@ def test_r7250_d_enrichment_tiny_stores_under_an_ip_block_count_once_aborted():
     assert breaker.blocks.tripped and breaker.blocks.trip_reason == "nothing_answering"
     assert [results[d].status for d in ("a.com", "b.com", "c.com")] == [ABORTED] * 3
     assert results["d.com"].status == refresh.IP_THROTTLED and results["e.com"].status == refresh.NOT_REACHED
+
+
+def test_r7250_a_store_that_answers_only_after_its_run_is_no_health_before_it(monkeypatch):
+    """Three stores each open with three timeouts and then answer (a slow start, not a block). Each
+    counts, but none had answered BEFORE its run: health that comes after the blocks is not "the blocks
+    began after health", and three is not the four a run with nothing answering needs. No trip."""
+    domains = ["a.com", "b.com", "c.com", "h.com"]
+    handler = _scripted({d: ["timeout"] * 3 for d in ("a.com", "b.com", "c.com")})
+    seeds = {d: _mirror_seeds(d, 8) for d in domains}
+    results, client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=25, breaker=True)
+    assert set(client.breaker.blocks.streaks.counting) == {"a.com", "b.com", "c.com"}
+    assert not client.breaker.tripped
+    assert [results[d].status for d in domains] == [refresh.DONE] * 4
+
+
+def test_r7250_a_counting_store_leaves_the_window_after_its_last_block():
+    now = [0.0]
+    health = refresh.LaneHealth()
+    window = refresh.StoreStreakWindow(health, clock=lambda: now[0])
+    for store in ("a.com", "b.com", "c.com", "d.com"):
+        health.clean(store)
+    verdicts = []
+    for store, t in (("a.com", 0.0), ("b.com", 500.0), ("c.com", 1000.0), ("d.com", 1100.0)):
+        now[0] = t
+        for _ in range(refresh.LANE_STORE_STREAK):
+            verdict = window.block(store)
+        verdicts.append(verdict)
+    # c.com at t=1000: a.com's last block was 1000 s ago, outside the 900 s window -> two stores.
+    assert verdicts == [None, None, None, "blocks_after_health"]
+    assert set(window.counting) == {"b.com", "c.com", "d.com"}

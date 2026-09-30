@@ -74,28 +74,37 @@ so its writes commit page by page), inside a wall-clock budget, and prints one r
   when it is walked to its end with at least one block and **no clean answer at all** (a store we
   never read is not `done` and gets no `last_completed_at`). Then **the pass moves on**.
 - **The address**: one IP-throttle breaker per run (`services.crawl_ip_throttle.IpThrottleBreaker`,
-  #2473), fed every response's headers through `crawl_politeness.note_response`. It trips when **3
-  distinct stores answer 429 (or 503 + Retry-After) within 15 minutes** -- thresholds for lanes that
-  walk ONE store at a time (#2473's defaults, 10 hosts in 60 s, suit the many-host refresh and could
-  never trip here). A trip **stops the whole pass** (`ip_throttled`, exit 1) and **forgives every
-  back-off of that run**. This is what keeps healthy stores from being backed off under the
-  2026-09-30 pattern -- a rate throttle that lets occasional 200s through, where each store sees a few
-  429s among its answers: three such stores trip the breaker long before anyone is backed off.
-- **The breaker counts STORES, not hostnames** (a store's apex, `www.` twin and subdomains are one),
-  and a trip needs at least one of the three stores to be one this run had NOT already aborted: three
-  stores that each blocked us outright are three store-level blocks. A trip forgives only the
-  back-offs recorded **within the breaker window** (15 min) before it; an earlier, unrelated block
-  keeps its back-off.
+  #2473), fed every response's headers through `crawl_politeness.note_response`. **A store counts
+  toward a trip only once its own run of 429s (or 503 + Retry-After) reaches 3 in a row** (a clean
+  answer from it ends the run): one transient 429, timeout or 502 on a healthy store is not a block.
+  It trips when **3 counting stores within 15 minutes include one that had answered cleanly earlier
+  this run** (the blocks began after health: `trip_reason: blocks_after_health`), **or when a 4th
+  store counts with nothing answering since the first of them** (a run that starts already blocked,
+  as the 09-30 throttle did hours before both lanes' slots: `nothing_answering`). Thresholds are for
+  lanes that walk ONE store at a time (#2473's defaults, 10 hosts in 60 s, suit the many-host refresh
+  and could never trip here). A trip **stops the whole pass** (`ip_throttled`, exit 1) and
+  **forgives the back-offs of that run**. This is what keeps healthy stores from being backed off
+  under the 2026-09-30 pattern -- a rate throttle that let ~29% through, so each store's 429s come in
+  runs between its answers: three such stores trip the breaker long before anyone is backed off.
+- **The breaker counts STORES, not hostnames** (a store's apex, `www.` twin and subdomains are one).
+  Three stores that refuse us from their first request, walked back to back and followed by a store
+  that answers, are three store-level blocks: **no trip, and each keeps its back-off**. A trip
+  forgives only the back-offs recorded **within the breaker window** (15 min) before it; an earlier,
+  unrelated block keeps its back-off.
 - **A second run-level stop for blocks that are not 429s.** 403s, 5xx and transport errors
   (connection resets, timeouts) never trip the throttle breaker, yet an IP-level block looks exactly
   like that (the 2026-08-21 shape; the 2026-09-28 NAT drops). A second, store-keyed breaker counts
-  those, with the same rule (3 distinct stores in 15 min, at least one not already aborted). Its
-  trip also stops the pass without backing off stores and forgives back-offs within its window
-  (`block_breaker` in the report). One store that genuinely 403s everything is aborted and backed
-  off on its own; the same answer from store after store stops the pass.
+  those, with the same rule (3 in a row per store; 3 stores with health before, or 4 with nothing
+  answering), and also counts **every store the lane aborted** (a two-seed store never reaches 3 in
+  a row). Its trip also stops the pass without backing off stores and forgives back-offs within its
+  window (`block_breaker` in the report, with `trip_reason`). One store that genuinely 403s
+  everything is aborted and backed off on its own; stores that had been answering and then block one
+  after another stop the pass.
 - **Redirects are followed one hop at a time**, each hop gated, paced and reported like the first
   request (at most 3 hops, https only, the same storefront only), with ONE patience deadline for
-  the whole request.
+  the whole request. A redirect off the storefront (or off https) is never requested: the backfill
+  reports it as `http_421` (the enrichment writer's `host_redirected`), counted in
+  `off_storefront_redirects`, and it is **not** in `most_blocked_domains`.
 - **Held requests.** A request `crawl_politeness` does not release within 60 s (a Retry-After or
   backoff hold, a Crawl-delay over the cap, the shared edge slot) is not sent and is counted. The page
   stops its store as `held_by_politeness` (exit 4) WITHOUT advancing the cursor past it: the store is
@@ -285,7 +294,8 @@ is the measurement this lane was sized without: seeds walked per domain), `cart_
 (`sole_variant` / `named_variant` proofs computed, dry run too), `rows_with_new_ids`,
 `variant_ids_stamped`, `write_conflicts` (the refresh job rewrote the row under us: skipped, never
 forced), `fetch_outcomes` (`dead_handle` = the seed's URL is gone; `not_json` = a challenge page or
-a themed soft-404), `most_blocked_domains`. A proof the fetch no longer supports is written as JSON
+a themed soft-404; `http_421` = a redirect off the storefront, never followed; `http_425` / `http_451`
+= held / refused by crawl_politeness, not sent), `most_blocked_domains`. A proof the fetch no longer supports is written as JSON
 `null` (revoked) by the same run.
 
 **Enrichment** (`writer.pages[]` is the writer's own per-domain report, see the docstring of
