@@ -361,14 +361,13 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 # an image with bounded review concurrency (PIVOTA-Agent #2335) and RELGRAPH_SYNC_REVIEW_CONCURRENCY
 # is set with it: 1,000 sequential reviews are ~2 h and fail the step every night.
 #
-# So this raise removes ONE of three walls. It changes nothing about the daily run, which exits in
-# minutes either way.
+# So this raise removes ONE of three walls. It changes nothing about the daily run, which takes
+# ~37 minutes at today's caps either way.
 #
 # COST: infra/gcp/setup_monitoring.sh alerts on relgraph-sync via completed_task_attempt_count
-# {result=failed} — it fires only AFTER a task dies, and there is no duration-based alert. A wedged
-# job is therefore silent for 4h instead of 1h (8h instead of 2h across the retry). Accepted here
-# because the daily run exits in minutes, so a run that is still alive at 1h is already anomalous —
-# but if these caps are ever raised, add a duration alert rather than relying on the failure signal.
+# {result=failed}, which fires only AFTER a task dies, and via "prod: relgraph-sync running over two
+# hours" (running_executions > 0 for 7200s), which catches a wedged or chained run at ~2h instead of
+# at the 4h task timeout (8h across the retry). The daily run takes ~37 minutes today.
 #
 # Precedent for raising, not just lowering: the twelve other mkjob callers all LOWER 3600s, but
 # external-seed-destination-sweep raises mkcrawljob's 300s to 3600s. This is the first override to

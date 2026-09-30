@@ -281,6 +281,22 @@ print(json.dumps({
   "alertStrategy": {"autoClose": autoclose}}))' "$@" "$CHANNEL"
 }
 
+promql_policy() { # DISPLAY_NAME CONDITION_NAME DOC QUERY DURATION EVAL_INTERVAL AUTOCLOSE
+  python3 -c '
+import json, sys
+(name, condition_name, doc, query, duration, evaluation_interval, autoclose, channel) = sys.argv[1:9]
+print(json.dumps({
+  "displayName": name,
+  "documentation": {"content": doc, "mimeType": "text/markdown"},
+  "combiner": "OR",
+  "conditions": [{
+    "displayName": condition_name,
+    "conditionPrometheusQueryLanguage": {
+      "query": query, "duration": duration, "evaluationInterval": evaluation_interval}}],
+  "notificationChannels": [channel],
+  "alertStrategy": {"autoClose": autoclose}}))' "$@" "$CHANNEL"
+}
+
 upsert "prod: host is down" "$(policy \
   "prod: host is down" \
   "An uptime check against a public pivota.cc host is failing. This is the only alert that fires when the whole path breaks - DNS, load balancer, TLS or the service itself." \
@@ -293,25 +309,29 @@ upsert "prod: TLS certificate expiring" "$(policy \
   'metric.type="monitoring.googleapis.com/uptime_check/time_until_ssl_cert_expires" AND resource.type="uptime_url"' \
   ALIGN_MIN REDUCE_MIN resource.label.host COMPARISON_LT 14 3600s 3600s 86400s)"
 
-# 0.2/s was UNREACHABLE and so this policy had never fired once. It asks for 12 5xx per second on
-# an API whose baseline is roughly 2 requests per MINUTE (~0.03/s measured 2026-08-28) - a total
-# outage returning 5xx to every single caller still tops out an order of magnitude below the
-# threshold. A rate threshold has to be set against real traffic, not a round number.
-#
-# 0.01/s over 600s needs SEVEN errors in ten minutes — COMPARISON_GT is strict and 6/600 is exactly
-# 0.01, so six does not trip it. Against a ~20-request baseline that is a ~35% error rate: high enough
-# not to trip on one unhandled exception, low enough that a wedged service cannot hide under it. Revisit if traffic grows by an order of magnitude.
-upsert "prod: load balancer 5xx" "$(policy \
+# Preserve the 2026-09-25 hand-edited ratio: absolute error rate does not track changing traffic.
+# upsert deletes/re-creates by displayName, so reconciling a new policy must not revert this one.
+upsert "prod: load balancer 5xx" "$(promql_policy \
   "prod: load balancer 5xx" \
+  "LB 5xx ratio > 1% over 10m" \
   "The external load balancer is returning 5xx. This is the user-visible symptom of most backend failures - a revision that will not start, database saturation, or an unhandled exception." \
-  'metric.type="loadbalancing.googleapis.com/https/request_count" AND resource.type="https_lb_rule" AND metric.label.response_code_class="500"' \
-  ALIGN_RATE REDUCE_SUM "" COMPARISON_GT 0.01 600s 600s 3600s)"
+  'sum(rate(loadbalancing_googleapis_com:https_request_count{monitored_resource="https_lb_rule",response_code_class="500"}[10m])) / sum(rate(loadbalancing_googleapis_com:https_request_count{monitored_resource="https_lb_rule"}[10m])) > 0.01' \
+  600s 60s 3600s)"
 
 upsert "prod: Cloud Run job failing" "$(policy \
   "prod: Cloud Run job failing" \
   "A scheduled Cloud Run job task is failing. reviews-invitation-send runs every minute and relgraph-sync daily; a persistent failure in either is otherwise completely silent. For retailer-ingest-drain, a failure here is an UNEXPECTED exception (the run is recorded as outcome=error in retailer_ingest_runs); stages that end held or failed exit 0 and page through their own retailer-ingest policies instead." \
   'metric.type="run.googleapis.com/job/completed_task_attempt_count" AND resource.type="cloud_run_job" AND metric.label.result="failed"' \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 300s 3600s)"
+
+# A 300s alignment covers several 60s samples; empty windows must not reset the duration timer.
+# This is continuous job occupancy (running_executions > 0 for 2h), not per-execution age: one wedged
+# run or runs chained back to back both fire it; two short overlapping runs do not.
+upsert "prod: relgraph-sync running over two hours" "$(policy \
+  "prod: relgraph-sync running over two hours" \
+  "relgraph-sync has running executions continuously for two hours. Today's daily run takes ~37 minutes (build ~8, sequential review ~29); the inner step timeout is 45 minutes. Task timeout is 14400s with max-retries 1, so a wedged task can remain alive well after the expected run. It fires on continuous occupancy of two hours or more, whether one wedged run or runs chained back to back; two short overlapping runs do not trip it. Sampling/visibility lag can delay the alert several minutes." \
+  'metric.type="run.googleapis.com/job/running_executions" AND resource.type="cloud_run_job" AND resource.label.job_name="relgraph-sync"' \
+  ALIGN_MAX REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 7200s 14400s)"
 
 upsert "prod: Cloud SQL connections high" "$(policy \
   "prod: Cloud SQL connections high" \
