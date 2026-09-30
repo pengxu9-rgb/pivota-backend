@@ -440,11 +440,15 @@ only not coincided with.
 
 ## Known limits
 
-- **The mirror writer does not consult robots.txt or honour `Retry-After`** (the enrichment writer
-  does, through `services.crawl_politeness`). It paces itself (1 s global, 3 s per store); a store
-  is aborted after 8 consecutive block-shaped answers (or no clean answer at all) and backed off;
-  the pass stops after 16 across stores when the current store is blocked too. Making the backfill polite is
-  that script's change, not this job's.
+- **A HAND run of the mirror writer is not polite** (the scheduled job is). Since #2476, the scheduled
+  `reap-cart-proof-mirror` job sends every request, redirect hops included, through
+  `crawl_politeness` (robots.txt, `Retry-After`, per-host backoff, the shared Shopify-edge pacer). It
+  aborts a store after 8 block-shaped answers in a row (or no clean answer at all), and stops the pass
+  only through the lane breakers above. A hand run of `scripts/backfill_shopify_variant_ids.py` gets
+  none of that. It paces itself (1 s global, 3 s per store), ignores robots.txt and `Retry-After`,
+  and has one block counter for the whole run: it aborts the run after 8 block-shaped answers in a
+  row, across every store it touches. That is why hand runs stay under this runbook's hard gate and
+  single-seed. Making the script itself polite is that script's change, not this job's.
 - **bluemercury may exceed `/products.json`'s 100-page cap** (see "Reading the report").
 - **The enrichment writer re-reads a store's listing for every 250-product page** in `auto` mode
   (MAC and tarte are two pages each): a few extra listing requests, in exchange for page-by-page
