@@ -237,8 +237,8 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
             if ws(spelling) not in (ws(vendor), canonical):
                 overridden.append(f"{vendor!r} -> {spelling!r} (family {family!r} always writes {canonical!r})")
         if overridden:
-            raise ValueError("options.brands cannot map a spelling-family vendor to a value other than the vendor's "
-                             "own spelling or the family's canonical spelling: " + "; ".join(overridden))
+            raise ValueError("options.brands cannot respell a spelling-family vendor to a value other than the "
+                             "vendor's own spelling or the family's canonical spelling: " + "; ".join(overridden))
         ignored = sorted(k for k, v in brands.items()
                          if _retailer_brand_family(alnum(k)) is None and alnum(k) != alnum(v))
         if ignored:
