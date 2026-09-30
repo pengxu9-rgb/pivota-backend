@@ -1485,7 +1485,8 @@ async def _fetch_html(
         # raise_for_status would leave with it unrecorded — so the next call would hit the same
         # host at the same rate that just got us throttled.
         crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
+            url, resp.status_code, retry_after=resp.headers.get("retry-after"),
+            headers=resp.headers,
         )
         if observed is not None:
             observed["status_code"] = resp.status_code

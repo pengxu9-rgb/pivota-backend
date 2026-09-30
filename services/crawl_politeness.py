@@ -46,6 +46,8 @@ from urllib.robotparser import RobotFileParser
 
 import httpx
 
+from services import crawl_ip_throttle
+
 ROBOTS_TRANSPORT_FACTORY = ContextVar("robots_transport_factory", default=None)
 
 logger = logging.getLogger(__name__)
@@ -394,11 +396,25 @@ async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = N
         await asyncio.sleep(delay)
 
 
-def note_response(url: str, status_code: int, *, retry_after: Optional[str] = None) -> None:
-    """Feed a response back in so the next request to this host is paced accordingly."""
+def note_response(
+    url: str,
+    status_code: int,
+    *,
+    retry_after: Optional[str] = None,
+    headers: Any = None,
+) -> None:
+    """Feed a response back in so the next request to this host is paced accordingly.
+
+    `headers` is optional and never changes the pacing. When given it is (a) forwarded to any
+    installed `crawl_ip_throttle` breaker, for every status, and (b) on a 429/503 its allowlisted
+    headers are appended to the backoff line, so an IP throttle (`retry-after=60`) can be told
+    from a bot challenge (`cf-mitigated=challenge`) from the log alone.
+    """
     host = host_of(url)
     if not host:
         return
+    if headers is not None:
+        crawl_ip_throttle.observe_response(host, status_code, headers)
     # Bounded here too, not only in await_slot: note_response CREATES state, and a caller that
     # only ever records responses (or one whose requests are all refused) would otherwise grow
     # this cache past the ceiling without await_slot ever running.
@@ -427,9 +443,15 @@ def note_response(url: str, status_code: int, *, retry_after: Optional[str] = No
         wait = max(wait, min(ceiling, parsed))
 
     state.backoff_until = time.monotonic() + wait
+    # OUR hold first, unchanged, so existing log parsing keeps working; then what the host said.
+    # Before 2026-09-30 only the hold was logged, and a `Retry-After: 60` IP throttle read the
+    # same as a bot challenge.
+    diag = crawl_ip_throttle.format_throttle_headers(
+        crawl_ip_throttle.capture_throttle_headers(headers)
+    )
     logger.warning(
-        "crawl backoff: %s returned %s (consecutive=%d), holding %.1fs",
-        host, status_code, state.consecutive_blocks, wait,
+        "crawl backoff: %s returned %s (consecutive=%d), holding %.1fs%s",
+        host, status_code, state.consecutive_blocks, wait, f" [{diag}]" if diag else "",
     )
 
 

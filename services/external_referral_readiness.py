@@ -32,7 +32,7 @@ from services.external_seed_destination_liveness import (
     CONFIRMED_DEAD_VERDICTS,
     RETIREMENT_STREAK,
 )
-from services import crawl_politeness
+from services import crawl_ip_throttle, crawl_politeness
 from services.external_seed_search import (
     SEED_SUPPRESSED_PRODUCT_ANTI_JOIN,
     build_seed_quarantine_anti_join,
@@ -1905,14 +1905,47 @@ async def _fetch_refresh_candidate_hosts(seed_ids: Sequence[str]) -> Dict[str, s
     return hosts
 
 
+async def _run_workers(worker: Callable[[], Awaitable[None]], concurrency: int) -> None:
+    if concurrency <= 1:
+        # Inline, in this task's own context: exactly the serial loop this replaced.
+        await worker()
+        return
+    # A FRESH CONTEXT PER WORKER. `databases` 0.7.0 parks its Connection in a ContextVar and
+    # this task has already queried, so a plain child task would share that one Connection
+    # and silently join a sibling's open transaction (reference: services/scheduler_job_runner
+    # `spawn_isolated`). Isolated, each worker checks its own connection out of the pool,
+    # whose size (DB_POOL_MAX_SIZE, 2 on the job) caps the DB concurrency whatever this is.
+    from services.scheduler_job_runner import spawn_isolated
+
+    workers = [
+        spawn_isolated(worker(), name=f"external-referral-refresh-worker-{index}")
+        for index in range(concurrency)
+    ]
+    await asyncio.gather(*workers)
+
+
 async def run_external_referral_refresh_batch(
     *,
     refresh_seed_by_id: Callable[[str], Awaitable[Dict[str, Any]]],
     limit: int = 500,
     budget_seconds: Optional[float] = None,
     host_concurrency: Optional[int] = None,
+    ip_throttle_trip_hosts: Optional[int] = None,
+    ip_throttle_window_seconds: Optional[float] = None,
+    ip_throttle_enabled: Optional[bool] = None,
 ) -> Dict[str, Any]:
     candidate_seed_ids = await get_external_referral_refresh_candidate_seed_ids(limit=limit)
+    # THE IP BREAKER, beside the per-host one and for a different failure. The per-host breaker
+    # sees one host's streak; on 09-30 Shopify's shared edge throttled our one egress IP across
+    # 331 hosts at once, and the per-host breaker tripped 261 times, one host at a time, while the
+    # run kept asking. See `services.crawl_ip_throttle`.
+    ip_breaker = crawl_ip_throttle.IpThrottleBreaker.from_env(
+        trip_hosts=ip_throttle_trip_hosts,
+        window_seconds=ip_throttle_window_seconds,
+        enabled=ip_throttle_enabled,
+    )
+    ip_throttle_skips: Dict[str, int] = {}
+    skipped_for_ip_throttle = 0
     budget = _refresh_budget_seconds(budget_seconds)
     host_trip = _host_block_trip()
     unreachable_trip = _host_unreachable_trip()
@@ -2161,6 +2194,14 @@ async def run_external_referral_refresh_batch(
     in_flight = 0
     lane_freed = asyncio.Condition()
 
+    def _drain_ip_throttled_lane(key: str) -> None:
+        nonlocal skipped_for_ip_throttle
+        # Unstamped, exactly like the per-host breaker's skips: `refresh_seed_by_id` is never
+        # called for these rows, so `last_crawl_attempt_at` is untouched and they lead tomorrow.
+        remaining = len(lanes.pop(key, ()))
+        ip_throttle_skips[key] = ip_throttle_skips.get(key, 0) + remaining
+        skipped_for_ip_throttle += remaining
+
     def _drain_tripped_lane(key: str) -> None:
         nonlocal skipped_for_host_backoff, skipped_for_unreachable_host
         # Passed-over rows are NOT stamped (`refresh_seed_by_id` is never called), so they keep
@@ -2191,6 +2232,15 @@ async def run_external_referral_refresh_batch(
                 if not ready:
                     return
                 _position, key = heapq.heappop(ready)
+                # AT TAKE TIME, the one place it needs to be: a host whose lane is back in
+                # `ready` has no row in flight, and a host known to be Shopify-served (it
+                # answered earlier this run, before or after the trip) must not be asked again
+                # once the IP breaker has tripped. A host first seen after the trip costs one
+                # request, which is how it becomes known.
+                if ip_breaker.blocks(key):
+                    _drain_ip_throttled_lane(key)
+                    lane_freed.notify_all()
+                    continue
                 seed_id = lanes[key].popleft()
                 in_flight += 1
                 rows_started += 1
@@ -2207,22 +2257,15 @@ async def run_external_referral_refresh_batch(
                         lanes.pop(key, None)
                     lane_freed.notify_all()
 
-    if concurrency <= 1:
-        # Inline, in this task's own context: exactly the serial loop this replaced.
-        await _worker()
-    else:
-        # A FRESH CONTEXT PER WORKER. `databases` 0.7.0 parks its Connection in a ContextVar and
-        # this task has already queried, so a plain child task would share that one Connection
-        # and silently join a sibling's open transaction (reference: services/scheduler_job_runner
-        # `spawn_isolated`). Isolated, each worker checks its own connection out of the pool,
-        # whose size (DB_POOL_MAX_SIZE, 2 on the job) caps the DB concurrency whatever this is.
-        from services.scheduler_job_runner import spawn_isolated
-
-        workers = [
-            spawn_isolated(_worker(), name=f"external-referral-refresh-worker-{index}")
-            for index in range(concurrency)
-        ]
-        await asyncio.gather(*workers)
+    with crawl_ip_throttle.installed(ip_breaker):
+        await _run_workers(_worker, concurrency)
+    if ip_breaker.tripped:
+        logger.warning(
+            "external referral refresh: IP throttled at %s (%d Shopify-served hosts 429'd within "
+            "%.0fs); %d rows on Shopify-served hosts deferred to the next run",
+            ip_breaker.tripped_at, ip_breaker.trip_host_count, ip_breaker.window_seconds,
+            skipped_for_ip_throttle,
+        )
     if stopped_early:
         skipped_for_budget = sum(len(lane) for lane in lanes.values())
         # LOUD, because a silent truncation reads exactly like a completed sweep: the summary
@@ -2251,7 +2294,8 @@ async def run_external_referral_refresh_batch(
         - skipped_for_budget
         - unprocessable
         - skipped_for_host_backoff
-        - skipped_for_unreachable_host,
+        - skipped_for_unreachable_host
+        - skipped_for_ip_throttle,
     )
     origin_yield = (origin_reads / attempted_count) if attempted_count else 1.0
     min_yield = _min_origin_yield()
@@ -2270,26 +2314,34 @@ async def run_external_referral_refresh_batch(
     proj_structural = sum(
         n for status, n in proj_skips.items() if status in OFFER_SYNC_STRUCTURAL_SKIP_STATUSES
     )
+    base_status = batch_run_status(
+        failed=failed,
+        stopped_early=stopped_early,
+        attempted_count=attempted_count,
+        origin_reads=origin_reads,
+        price_changes=price_changed,
+        projections_attempted=proj_attempted,
+        projections_written=proj_written,
+        projections_errored=proj_errored,
+        projections_structural_skips=proj_structural,
+        projections_written_attached=int(proj_writes.get("attached") or 0),
+        candidate_count=len(candidate_seed_ids),
+        skipped_for_budget=skipped_for_budget,
+    )
     return {
         # HONEST STATUS. This used to be `success if failed == 0`, and `failed` only counts
         # exceptions — so a run that stopped on budget, or that served half its rows from cache
         # without reaching a single origin, reported success. The job then exited 0 and Cloud
         # Run showed a green tick over a night that refreshed almost nothing. `stopped_early`
         # and `low_origin_yield` are the two ways that happens in practice.
-        "status": batch_run_status(
-            failed=failed,
-            stopped_early=stopped_early,
-            attempted_count=attempted_count,
-            origin_reads=origin_reads,
-            price_changes=price_changed,
-            projections_attempted=proj_attempted,
-            projections_written=proj_written,
-            projections_errored=proj_errored,
-            projections_structural_skips=proj_structural,
-            projections_written_attached=int(proj_writes.get("attached") or 0),
-            candidate_count=len(candidate_seed_ids),
-            skipped_for_budget=skipped_for_budget,
-        ),
+        #
+        # `ip_throttled` OUTRANKS the other rules, and says so. The 429s before the trip drag the
+        # yield under its floor, so the yield rule would call every IP-throttled night
+        # "degraded" and hide the cause again. What the other rules would have said is kept in
+        # `status_without_ip_throttle`, so a night that was ALSO broken for another reason
+        # (failed rows, a starved budget) is still visible.
+        "status": "ip_throttled" if ip_breaker.tripped else base_status,
+        "status_without_ip_throttle": base_status,
         # "healed 2,000" vs "healed 0" — the projection OUTCOME, not just that it was called.
         "unprocessable": unprocessable,
         "unprocessable_reasons": dict(sorted(unprocessable_reasons.items(), key=lambda kv: -kv[1])[:8]),
@@ -2354,6 +2406,13 @@ async def run_external_referral_refresh_batch(
         "unreachable_host_skips": dict(sorted(unreachable_hosts.items(), key=lambda kv: -kv[1])[:10]),
         "host_unreachable_trip": unreachable_trip,
         "unreachable_host_errors": unreachable_samples,
+        # Rows NOT attempted because the IP breaker tripped and their host is Shopify-served.
+        # Unstamped, like the per-host skips, so they lead tomorrow's queue.
+        "skipped_for_ip_throttle": skipped_for_ip_throttle,
+        "ip_throttle_skips": dict(sorted(ip_throttle_skips.items(), key=lambda kv: -kv[1])[:10]),
+        # `ip_throttled`, the trip time, host counts, first/last 429 and the 429/503 header
+        # aggregate (`throttle_diagnostics`): see `crawl_ip_throttle.IpThrottleBreaker.summary`.
+        **ip_breaker.summary(),
         # Where the budget went, per host: the 15 hosts that cost the most wall-clock.
         "host_seconds": {
             host: {
