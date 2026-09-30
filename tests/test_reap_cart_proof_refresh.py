@@ -763,6 +763,70 @@ def test_nothing_that_runs_on_merge_or_on_a_schedule_names_these_jobs():
         assert (REPO / "infra" / "gcp" / deploy).is_file(), f"precondition: {deploy} was scanned"
 
 
+def _code_references(path: Path) -> str:
+    """What a file can EXECUTE with: a shell script's whole text; a Python file's code only -- string
+    constants that are not docstrings, and imported module names -- so a docstring that documents the
+    wrapper as its caller (scripts/backfill_shopify_variant_ids.py does) is not an invocation."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix != ".py":
+        return text
+    import ast
+
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return text
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", [])
+            if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant):
+                docstrings.add(id(body[0].value))
+    parts: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+            parts.append(node.value)
+        elif isinstance(node, ast.Import):
+            parts.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            parts.append(node.module or "")
+            parts.extend(f"{node.module}.{alias.name}" for alias in node.names)
+    return "\n".join(parts)
+
+
+def test_no_script_under_scripts_invokes_these_jobs():
+    """The same pin, over scripts/ (ops helpers, one-off runners, CI helpers): nothing there may run the
+    setup script, import or execute the wrapper, or name the Cloud Run jobs."""
+    names = ("setup_reap_cart_proof_jobs", "reap_cart_proof_refresh", "reap-cart-proof")
+    checked = 0
+    for path in sorted((REPO / "scripts").rglob("*")):
+        if not path.is_file() or "__pycache__" in path.parts or path.suffix in (".pyc", ".csv", ".md"):
+            continue
+        checked += 1
+        hits = [n for n in names if n in _code_references(path)]
+        assert not hits, f"{path.relative_to(REPO)} invokes {hits}"
+    assert checked > 50, "the scan found almost nothing under scripts/"
+
+
+def test_the_scripts_scan_sees_an_invocation_and_ignores_a_docstring(tmp_path):
+    shell = tmp_path / "x.sh"
+    shell.write_text("infra/gcp/setup_reap_cart_proof_jobs.sh prod abc --enable\n")
+    assert "setup_reap_cart_proof_jobs" in _code_references(shell)
+    code = tmp_path / "x.py"
+    code.write_text('"""Called by jobs/reap_cart_proof_refresh.py."""\nimport subprocess\n'
+                    'subprocess.run(["python", "-m", "jobs.reap_cart_proof_refresh", "mirror"])\n')
+    assert "reap_cart_proof_refresh" in _code_references(code)
+    doc_only = tmp_path / "y.py"
+    doc_only.write_text('"""Its scheduled caller is jobs/reap_cart_proof_refresh.py."""\nX = 1\n')
+    assert "reap_cart_proof_refresh" not in _code_references(doc_only)
+    imported = tmp_path / "z.py"
+    imported.write_text("from jobs import reap_cart_proof_refresh\n")
+    assert "reap_cart_proof_refresh" in _code_references(imported)
+    plain_import = tmp_path / "w.py"
+    plain_import.write_text("import jobs.reap_cart_proof_refresh as refresh\n")
+    assert "reap_cart_proof_refresh" in _code_references(plain_import)
+
+
 def test_the_wrapper_holds_no_literal_sentinel_merchant():
     """The ADR-009 rule, applied to this new file: no `external_seed` merchant literal and no
     hardcoded observed-seller prefix."""

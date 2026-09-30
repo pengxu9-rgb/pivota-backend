@@ -1,5 +1,21 @@
 # Reap cart proofs (two daily jobs)
 
+> **⛔ HARD GATE — DO NOT EXECUTE OR `--enable` EITHER JOB, AND DO NOT RUN EITHER WRITER BY HAND
+> (`scripts/ops/run_oneoff_job.sh`), IN ANY ENVIRONMENT, until ALL of these hold:**
+>
+> **(a)** the crawl-IP incident is closed. Shopify's edge has been throttling our single crawl NAT
+> IP (34.82.199.35) across all shops since ~00:00Z 2026-09-30. "Closed" means **at least 24 h with
+> no crawl-backoff 429 bursts and no IP-throttle breaker trips** on the crawlers already sharing that
+> address -- the external-referral refresh, the external-seed destination sweep,
+> `tierb-cart-link-eligibility` and `merchant-purchasability-sweep` -- **plus Peng's go**;
+>
+> **(b)** #2474 (the shared Shopify-edge pacer in `crawl_politeness`) is merged, **both lanes are
+> wired through it** (the follow-up PR to #2471), and **`CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true` is
+> set on both jobs** (check with `gcloud run jobs describe`).
+>
+> This includes the dark dry run: a dry run fetches exactly as hard as an apply. Provisioning the
+> jobs DARK (step 1) contacts no store and is allowed; executing them (step 2 onward) is not.
+
 The Reap cart-link lane buys through a Shopify cart permalink and refuses any row without a
 **fresh storefront proof**. Two writers author those proofs, and two Cloud Run Jobs run them on a
 schedule:
@@ -17,6 +33,12 @@ schedule:
 | Domains, enrichment | `ENRICHMENT_DOMAINS` in the entry point: stila, jsmbeauty.sg, bluemercury, tarte, MAC (last) |
 | Where each store got to | `reap_cart_proof_refresh_cursors` (migration 250, `db/reap_cart_proof_refresh_cursors.py`) |
 | Readers | mirror: `services.shopify_variant_identity.verified_cart_variant_id`; enrichment: `services.reap_enrichment_cart_proof.verify_enrichment_cart_proof`, behind `REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED` |
+
+**No table here is created at boot.** Migration 250 is NOT applied by any deploy or startup: all
+four services run with `SKIP_HEAVY_STARTUP_INIT=true`, so `db/migrations/` never runs in prod. The
+cursor table exists only once the first APPLY run's `ensure_table()` has created it (a dry run on
+an environment where no apply has run reads "no cursors" and writes nothing); the enrichment proof
+table likewise appears on its first writer apply (or its reader's first flag-on request).
 
 The entry point owns no proof logic. It walks each domain page by page by calling the writer's
 own entry point on the writer's own cursor (mirror: `run(limit=50)`; enrichment: `run_domain(limit=250)`,
@@ -107,8 +129,13 @@ be an image in `us-west1-docker.pkg.dev/pivota-shared/pivota/backend` that conta
 ```sh
 ENV=staging; PROJECT=pivota-staging; TAG=<backend sha>
 
-# 1. provision DARK (creates or updates both jobs; gate false; triggers paused)
+# 1. provision DARK (creates or updates both jobs; gate false; triggers paused). Contacts no store.
 infra/gcp/setup_reap_cart_proof_jobs.sh $ENV $TAG
+
+# ⛔ STOP HERE until the HARD GATE at the top of this runbook holds: (a) >= 24 h with no crawl-backoff
+#    429 bursts and no breaker trips on the referral refresh, the destination sweep, Tier B and the
+#    purchasability sweep, plus Peng's go; (b) #2474 merged, both lanes wired through it, and
+#    CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true on both jobs.
 
 # 2. DRY RUN each job on its real definition (fetches, writes nothing)
 gcloud run jobs execute reap-cart-proof-enrichment --project $PROJECT --region us-west1 --wait
@@ -264,6 +291,10 @@ an `ok` for the new product. Clearing it is a person's decision:
    purchase lane refuses it, which is the safe direction.
 
 ## Running a writer by hand (outside the jobs)
+
+> **⛔ STOP: the HARD GATE at the top of this runbook applies here too.** A hand run with
+> `scripts/ops/run_oneoff_job.sh` crawls the same stores from the same crawl IP; do not run either
+> writer by hand until every condition there holds.
 
 Only for a targeted fix; the jobs are the normal path. Always `SUBNET=pivota-crawl`, and
 re-list the whole `ENV_VARS` (it replaces the runner's defaults):
