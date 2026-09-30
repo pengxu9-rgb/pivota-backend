@@ -888,6 +888,14 @@ def test_no_other_migration_touches_the_table() -> None:
     assert touching == []
 
 
+# The lease statement reads the DB clock (`clock_timestamp()` / `julianday('now')`) more than once:
+# the schedule is computed from one reading and `db_now` is RETURNed from a later one, so on a loaded
+# runner the two differ by however long the statement took. Every "starts at now" check below is
+# against a failure that is off by a whole lease span (>= 1 s) or by the poisoned 1e6 s, so half a
+# second tells them apart without timing the database.
+_DB_CLOCK_SLACK = 0.5
+
+
 async def test_the_lease_statement_has_no_stored_burst_and_heals_a_poisoned_row(tmp_path, monkeypatch) -> None:
     """The real SQL on the hermetic dialect: consecutive leases abut, an idle bucket restarts at
     'now' (never in the past), and every lease is one round-trip that bumps `leases`."""
@@ -902,7 +910,7 @@ async def test_the_lease_statement_has_no_stored_burst_and_heals_a_poisoned_row(
         table.reset_for_tests()
         start1, now1 = await table.lease_slots("t_bucket", slots=4, rate_per_s=2.0, horizon_s=60)
         start2, _now2 = await table.lease_slots("t_bucket", slots=4, rate_per_s=2.0, horizon_s=60)
-        assert start1 == pytest.approx(now1, abs=0.05)
+        assert start1 == pytest.approx(now1, abs=_DB_CLOCK_SLACK)
         assert start2 == pytest.approx(start1 + 2.0, abs=1e-6), "leases abut; no overlap"
         row = await database.fetch_one(
             "SELECT leases FROM crawl_egress_pacer WHERE bucket = 't_bucket'")
@@ -910,14 +918,14 @@ async def test_the_lease_statement_has_no_stored_burst_and_heals_a_poisoned_row(
         await database.execute(
             "UPDATE crawl_egress_pacer SET next_free_epoch = 0 WHERE bucket = 't_bucket'")
         start3, now3 = await table.lease_slots("t_bucket", slots=1, rate_per_s=2.0, horizon_s=60)
-        assert start3 >= now3 - 0.01, "an idle bucket hands out slots from now, not from the past"
+        assert start3 >= now3 - _DB_CLOCK_SLACK, "an idle bucket hands out slots from now, not from the past"
         # POISONED: a typo'd rate or a clock step pushed the schedule ~11 days out. The next
         # lease starts within the horizon, and the row is healed for everyone after it.
         await database.execute(
             "UPDATE crawl_egress_pacer SET next_free_epoch = next_free_epoch + 1000000 "
             "WHERE bucket = 't_bucket'")
         start4, now4 = await table.lease_slots("t_bucket", slots=2, rate_per_s=2.0, horizon_s=60)
-        assert start4 == pytest.approx(now4, abs=0.05), start4 - now4
+        assert start4 == pytest.approx(now4, abs=_DB_CLOCK_SLACK), start4 - now4
         start5, _ = await table.lease_slots("t_bucket", slots=2, rate_per_s=2.0, horizon_s=60)
         assert start5 == pytest.approx(start4 + 1.0, abs=1e-6)
         for bad in (dict(slots=0, rate_per_s=2.0, horizon_s=60),
@@ -950,7 +958,7 @@ async def test_a_lost_create_race_does_not_cost_the_lease(monkeypatch) -> None:
 
         monkeypatch.setattr(table, "ensure_table", lost_race)
         start, now = await table.lease_slots("race_bucket", slots=2, rate_per_s=1.0, horizon_s=60)
-        assert start >= now - 0.01
+        assert start >= now - _DB_CLOCK_SLACK
     finally:
         await database.execute("DROP TABLE IF EXISTS crawl_egress_pacer")
         table.reset_for_tests()
