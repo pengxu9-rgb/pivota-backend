@@ -20,8 +20,8 @@ transition.
 
 | state | what it means | this package's step calls | → |
 |---|---|---|---|
-| `resolving` | we have our catalog row, not Reap's variant | `resolve_our_row`; then either `get_active_enrollment` or `upsert_pending_enrollment` + `create_enrollment` | `needs_enrollment`, `quoting`, `refused`, `failed` |
-| `needs_enrollment` | buyer has a hosted card page open | `get_active_enrollment`; `get_enrollment_internal` (re-read — a READ, not the old upsert-as-read); `get_enrollment`; `mark_enrollment_active` / `mark_enrollment_dead` | `quoting`, `expired` (sweep only), `failed` |
+| `resolving` | we have our catalog row, not Reap's variant | `resolve_our_row`; then `get_active_enrollment`; else `get_pending_enrollment` and, if that row has a partner id, `get_enrollment` to **reconcile** it (see *The enrollment lifecycle*); else `upsert_pending_enrollment` + `create_enrollment` | `needs_enrollment`, `quoting`, `refused`, `failed` |
+| `needs_enrollment` | buyer has a hosted card page open | `get_active_enrollment`; `get_enrollment_internal` (re-read — a READ, not the old upsert-as-read); `get_enrollment`; `mark_enrollment_active` / `mark_enrollment_dead`. Keeps polling **past** the link's expiry for the enrollment grace | `quoting` (hosted link cleared), `expired` (sweep only), `failed` |
 | `quoting` | ready to price and hand the buyer a link | `get_active_enrollment`; `resolve_our_row` **again**; `request_quote`; **`verify_quote`**; `create_checkout` — **all in one step** | `awaiting_approval`, `refused`, `failed` |
 | `awaiting_approval` | buyer has the approval page | `get_checkout` | `processing`, `completed`, `failed`, `expired` |
 | `processing` | buyer approved; Reap is placing the order | `get_checkout` | `completed`, `failed` |
@@ -29,6 +29,74 @@ transition.
 
 **Terminal writes NULL `buyer_email` and `shipping_address`**, stamp `terminal_at` and clear the
 claim — in the same UPDATE, so a crash cannot skip the PII half.
+
+**Any transition INTO `quoting` clears `hosted_url` and `hosted_url_expires_at`** (a rule in
+`_TRANSITION_SQL`, keyed on the target state; `transition` refuses a caller that passes either
+with `to_state='quoting'`). The only link a row can carry into `quoting` is the spent enrollment
+page, and its expiry is what the sweep acts on; the approval page is written by `awaiting_approval`.
+
+### The enrollment lifecycle — one pending row per buyer, reconciled before minting
+
+Found on staging 2026-09-30, the first real sandbox card enrollment (all UTC, one demo buyer):
+
+| time | what happened |
+|---|---|
+| 11:21:34 | purchase A → `needs_enrollment`; our row `re_5fe1…`, Reap enrollment `9041ef1a-…`, link expires **11:36:34** |
+| ~11:23 | buyer completes Reap's page ("Reap has received your response") |
+| until 11:36:43 | `GET /agentic/enrollments/{id}` still says `REQUIRES_ACTION`, `updatedAt` unchanged |
+| **11:36:43** | `ACTIVE`, `paymentMethod.last4` 7847 — **9 s after the link expired** (04:05 showed the same shape) |
+| 11:37:02 | the sweep expires A (`hosted_url_expired`); our row stays `pending` |
+| 11:37:38 | purchase B: no active row; `upsert_pending_enrollment` returns the SAME pending row (same id = same attempt id), `create_enrollment` replays and returns the OLD dead link; B is swept 54 s later |
+| 11:41 | purchase C, the same. **A buyer whose card IS active at Reap could never buy.** |
+
+What the rail does now:
+
+1. **Reap's ACTIVE arrives at or after the hosted session's expiry**, so the link's expiry is not
+   the enrollment's end. The expire sweep gives `needs_enrollment` an **enrollment grace**
+   (`REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS`, default **180**) past `hosted_url_expires_at`, and
+   the poller keeps reading the enrollment during it; ACTIVE in the grace → `quoting`.
+   `awaiting_approval` gets **no** grace: its QUOTE dies at the expiry. The absolute
+   `REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` fallback is unchanged.
+2. **`resolving` reconciles before it mints.** No active row, but a `pending` row that has a
+   `reap_enrollment_id` (a link was handed out): one guarded `get_enrollment` first
+   (`_still_ours` in front of it, like every partner call):
+
+   | Reap says | and | then |
+   |---|---|---|
+   | `ACTIVE` | — | `mark_enrollment_active` (network, last4) → `quoting`. **Nothing minted.** |
+   | `REQUIRES_ACTION` | the stored link has ≥ 60 s left (or no expiry) and is still on the allowlist | reuse **that row and that link** → `needs_enrollment`. Two purchases may wait on one row; both advance on ACTIVE |
+   | `REQUIRES_ACTION` | the link is dead or dying, but we are **inside the grace** | **hold**: release in `resolving`, `enrollment_settling`, re-check in 30 s. Retiring it now could orphan a card being enrolled at this moment |
+   | `REQUIRES_ACTION` past the grace, or `EXPIRED` / `FAILED` / `REVOKED` | — | `mark_enrollment_dead` the row, mint a **NEW** row → a NEW attempt id → a NEW enrollment and link at Reap. The dead link is never replayed |
+   | unrecognised | — | release, `unknown_enrollment_status`; nothing reused, retired or minted |
+   | transport error | — | release with the doubled backoff |
+   | any other failed read | — | `failed` with the partner's code; nothing minted around a row we could not read |
+   | (stored partner id malformed) | — | `failed`, `partner_id_malformed`, no read — clear the row by hand |
+
+3. **`upsert_pending_enrollment` never hands back a dead link as "the" attempt.** Without an
+   `enrollment_id`, if the buyer's pending row has `hosted_url_expires_at` in the past (SERVER
+   clock) it raises `PendingEnrollmentExpired` instead of returning it — it cannot retire the row
+   itself (Reap may say ACTIVE; the ledger never calls Reap) and must not mint a second pending
+   row. The caller reconciles and calls again. A pending row with **no** expiry (a create whose
+   response was lost) is still returned and replayed, as before. The purchase service maps a
+   raise to a release with `enrollment_pending_expired`.
+4. **A create that comes back with a dead link** (a replay of an attempt whose first response we
+   never saw) is recorded, retired and **not** handed to the buyer (`enrollment_link_expired`);
+   the next step mints a new attempt. Nobody saw that link, so retiring it cannot orphan a card.
+
+"One pending row per buyer" is kept by code (migration 224 has no index for it): every path
+above retires a row before a new one is minted. `get_pending_enrollment(buyer_ref)` is the read.
+
+**Operator check** — a buyer stuck behind a pending row:
+
+```sql
+SELECT id, reap_enrollment_id, status, reap_status, hosted_url_expires_at, updated_at
+  FROM reap_agentic_enrollments
+ WHERE buyer_ref = '<reap_buyer_ref>' ORDER BY created_at DESC;
+```
+
+After this change a `pending` row with a partner id reconciles itself on the buyer's next purchase.
+Rows stranded **before** it (pending here, ACTIVE at Reap) are healed the same way — no manual
+write needed; the next purchase reads Reap and activates.
 
 ### Why the quote and the checkout are one step
 A quote expires in ~5 minutes; a poll cycle is not guaranteed to be shorter, and there is no
@@ -186,6 +254,7 @@ bad setting, it would be an exception out of a scheduled job on every tick.
 | `REAP_AGENTIC_CLAIM_BATCH` | 10 | 1–100 | rows claimed per run. Capped at 100 because each row is a serial partner chain |
 | `REAP_AGENTIC_LEASE_SECONDS` | 300 | **180**–3600 | what `requeue_stale_claims` measures against. The floor is 180, not the ledger's 30: a lease shorter than one step gets a LIVE worker's row requeued underneath it, and both workers then call the partner |
 | `REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` | 3600 | 60–2592000 | the absolute PII deadline in `expire_overdue_purchases`, measured from `state_entered_at` |
+| `REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS` | 180 | 0–3600 | how long past `hosted_url_expires_at` the sweep leaves a **`needs_enrollment`** row alone (Reap flips ACTIVE at/after the link dies); also how long `resolving` holds instead of retiring a pending enrollment. `awaiting_approval` never gets it. 0 = Reap's exact expiry. Read by `services.reap_agentic_purchase.enrollment_grace_seconds()` — ONE reader, which the job calls — not a job dial |
 | `REAP_AGENTIC_MAX_ATTEMPTS` | 50 | 1–10000 | attempts ceiling. `attempts` counts **claims**, and only in `resolving`/`quoting`/`processing` |
 | `REAP_AGENTIC_ERROR_BACKOFF_SECONDS` | 120 | 1–3600 | how long a row waits after `advance` **raised**. Not the state machine's table — this is the path where it did not get to choose |
 | `REAP_AGENTIC_POLL_BUDGET_SECONDS` | 240 | 10–3600 | wall-clock budget. It stops the job **starting** work — a row already in flight finishes — so the run deadline is sized as budget + one whole step |
@@ -233,7 +302,7 @@ run deadline **600 s** in `_JOB_RUN_DEADLINES` (see the derivation above).
 | # | step | bound |
 |---|---|---|
 | 1 | `requeue_stale_claims(lease_seconds=REAP_AGENTIC_LEASE_SECONDS)` | one batch of 200 per run |
-| 2 | `expire_overdue_purchases(max_age_seconds=REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS)` | 200 per statement, looped until a partial batch, hard cap 20 iterations |
+| 2 | `expire_overdue_purchases(max_age_seconds=REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS, enrollment_grace_seconds=REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS)` | 200 per statement, looped until a partial batch, hard cap 20 iterations |
 | 3 | `fail_exhausted_purchases(REAP_AGENTIC_MAX_ATTEMPTS, include_processing=False)` | same |
 | 4 | `claim_due_purchases(worker, limit=REAP_AGENTIC_CLAIM_BATCH)` → per row `advance` → `release_claim` | **sequential**, one partner chain at a time, stopped by `REAP_AGENTIC_POLL_BUDGET_SECONDS` |
 
@@ -543,12 +612,20 @@ link. Nothing from Reap's product-media fields is ever stored or forwarded.
 
 `last_error_code` (on `failed`, or alongside a refusal): the four quote-check codes in the table
 above, plus `ENROLLMENT_NOT_ACTIVE`, `enrollment_dead`, `enrollment_no_hosted_action`,
-`enrollment_row_unreadable`, `partner_id_malformed`, `checkout_no_hosted_action`,
+`enrollment_row_unreadable`, `enrollment_not_activatable` (Reap said ACTIVE but our row was
+retired and no other card is active — fail closed), `partner_id_malformed`, `checkout_no_hosted_action`,
 `checkout_failed`, `approval_window_lapsed` (a partner `FAILED` on `awaiting_approval` after the
 quote's expiry — the buyer did not approve in time), `checkout_expired`, `checkout_id_missing`,
 `quote_id_missing`, `quote_expired`,
 `no_active_enrollment`, `completed_without_order_id`, `final_amount_missing`, and
 `reap_status_<n>` / `AGENTIC_*` codes passed through from the partner.
+
+Codes on a RELEASE (the row stays in `resolving`, the code is on `last_error_code`):
+`enrollment_settling` (the buyer's pending enrollment link is dead or dying but inside the grace —
+waiting for Reap to say ACTIVE or for the grace to pass), `enrollment_link_expired` (a create
+returned a dead link; retired, a new attempt is minted next step), `enrollment_pending_expired`
+(the ledger refused to replay a dead pending row it could not reconcile), and
+`enrollment_not_activatable` (on `resolving`, re-reconciled next step).
 
 ### The three codes that suppress the attribution edge
 

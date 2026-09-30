@@ -113,6 +113,8 @@ _EXPECTED_UNIQUE_INDEXES = {
 
 _PAST = "CURRENT_TIMESTAMP - INTERVAL '120 seconds'"
 _FUTURE = "CURRENT_TIMESTAMP + INTERVAL '3600 seconds'"
+#: Past Reap's expiry AND the default enrollment grace (180 s).
+_PAST_GRACE = "CURRENT_TIMESTAMP - INTERVAL '400 seconds'"
 
 
 def _assert_throwaway_database() -> None:
@@ -241,8 +243,9 @@ def _transition_params(purchase_id: str, from_states, to_state: str, holder=None
     return params
 
 
-def _sweep_params(max_age_seconds: int = 3600, limit: int = 200):
-    return {"max_age_seconds": max_age_seconds, "limit": limit}
+def _sweep_params(max_age_seconds: int = 3600, limit: int = 200, enrollment_grace_seconds: int = 180):
+    return {"max_age_seconds": max_age_seconds, "limit": limit,
+            "enrollment_grace_seconds": enrollment_grace_seconds}
 
 
 def _fail_params(max_attempts: int = 5, limit: int = 200, include_processing: int = 1):
@@ -956,7 +959,9 @@ async def test_a_naive_datetime_is_read_as_utc_not_as_local_time_on_postgres(tz)
         moved = await ledger.transition(
             purchase["id"],
             from_states=["resolving"],
-            to_state="quoting",
+            # 'needs_enrollment', not 'quoting': a transition INTO 'quoting' clears the hosted
+            # link by rule (and refuses one passed in), so it cannot carry this probe.
+            to_state="needs_enrollment",
             reap_quote_expires_at=naive,
             hosted_url_expires_at=naive,
         )
@@ -988,7 +993,11 @@ async def test_expire_moves_an_overdue_hosted_page_and_scrubs_it_on_postgres(sta
     import db.reap_agentic_ledger as ledger
 
     purchase = await _mk(state=state)
-    await _set_clock_column(purchase["id"], "hosted_url_expires_at", _PAST)
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at",
+        # A 'needs_enrollment' page is overdue only once the ENROLLMENT GRACE (180 s by
+        # default) has passed too; see test_the_enrollment_grace_* for the window itself.
+        _PAST_GRACE if state == "needs_enrollment" else _PAST,
+    )
     await database.execute(
         "UPDATE reap_agentic_purchases SET claimed_by = 'w1', "
         "claimed_at = CURRENT_TIMESTAMP WHERE id = :i",
@@ -3619,3 +3628,113 @@ async def test_none_is_refused_by_the_doors_and_accepted_by_the_column():
 
     purchase = await _mk(consent_version=None)
     assert purchase["consent_version"] is None and purchase["consented_at"] is None
+
+
+# ── 2026-09-30: the enrollment grace, the pending read, and the dead-link guard, on Postgres ──
+#
+# The SQLite arm is in tests/test_reap_agentic_ledger.py. Here the ENGINE is what is under test:
+# `clock_timestamp()` arithmetic with a bound integer grace, the CASE-computed expiry flag, and
+# the `:to_state_probe = 'quoting'` CASE that clears the hosted link — all planned by asyncpg.
+
+
+async def _set_enrollment_expiry(enrollment_id: str, sql_expr: str) -> None:
+    from db.database import database
+
+    await database.execute(
+        f"UPDATE reap_agentic_enrollments SET hosted_url_expires_at = {sql_expr} WHERE id = :i",
+        {"i": enrollment_id},
+    )
+
+
+async def _pending_with_link(buyer_ref: str = "bref_alice", reap_id: str = "9041ef1a-1377-45f6-b09a-95d5eb07f908"):
+    import db.reap_agentic_ledger as ledger
+
+    return await ledger.upsert_pending_enrollment(
+        buyer_ref=buyer_ref,
+        reap_enrollment_id=reap_id,
+        hosted_url="https://pay.prava.space/enroll/9041ef1a",
+        hosted_url_expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+
+
+async def test_the_enrollment_grace_window_on_postgres():
+    """28 s past the link (the staging sweep): kept by the default grace, taken with grace 0;
+    181 s past: taken by the default."""
+    import db.reap_agentic_ledger as ledger
+
+    inside = await _mk(state="needs_enrollment")
+    await _set_clock_column(inside["id"], "hosted_url_expires_at", "clock_timestamp() - INTERVAL '28 seconds'")
+    past = await _mk(state="needs_enrollment", buyer_ref="bref_past")
+    await _set_clock_column(past["id"], "hosted_url_expires_at", "clock_timestamp() - INTERVAL '181 seconds'")
+
+    assert await ledger.expire_overdue_purchases() == [past["id"]]
+    assert await _state_of(inside["id"]) == "needs_enrollment"
+    assert await ledger.expire_overdue_purchases(enrollment_grace_seconds=0) == [inside["id"]]
+
+
+async def test_awaiting_approval_gets_no_enrollment_grace_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="awaiting_approval")
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", "clock_timestamp() - INTERVAL '9 seconds'")
+    assert await ledger.expire_overdue_purchases() == [purchase["id"]]
+
+
+async def test_the_raw_expire_statement_binds_the_grace_on_postgres():
+    """The statement itself, on a second connection, with the grace as a bound integer."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="needs_enrollment")
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", "clock_timestamp() - INTERVAL '28 seconds'")
+    conn = await _raw_connection()
+    try:
+        kept = await _run_on(conn, ledger._EXPIRE_OVERDUE_SQL, _sweep_params(enrollment_grace_seconds=60))
+        taken = await _run_on(conn, ledger._EXPIRE_OVERDUE_SQL, _sweep_params(enrollment_grace_seconds=0))
+    finally:
+        await conn.close()
+    assert kept == []
+    assert [r["id"] for r in taken] == [purchase["id"]]
+
+
+async def test_upsert_refuses_a_pending_row_whose_link_is_dead_on_postgres():
+    """The expiry flag is decided on the SERVER clock."""
+    import db.reap_agentic_ledger as ledger
+
+    pending = await _pending_with_link()
+    assert (await ledger.upsert_pending_enrollment(buyer_ref="bref_alice"))["id"] == pending["id"]
+    await _set_enrollment_expiry(pending["id"], "clock_timestamp() - INTERVAL '64 seconds'")
+    read = await ledger.get_pending_enrollment("bref_alice")
+    assert read["hosted_url_expired"] is True
+    with pytest.raises(ledger.PendingEnrollmentExpired) as caught:
+        await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    assert caught.value.enrollment_id == pending["id"]
+    await ledger.mark_enrollment_dead(pending["id"], reap_status="EXPIRED")
+    fresh = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    assert fresh["id"] != pending["id"]
+    assert (await ledger.get_pending_enrollment("bref_alice"))["id"] == fresh["id"]
+
+
+async def test_a_transition_into_quoting_clears_the_hosted_link_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk()
+    await ledger.transition(
+        purchase["id"], from_states=["resolving"], to_state="needs_enrollment",
+        hosted_url="https://pay.prava.space/enroll/9041ef1a",
+        hosted_url_expires_at=datetime.now(timezone.utc) - timedelta(seconds=9),
+    )
+    quoting = await ledger.transition(
+        purchase["id"], from_states=["needs_enrollment"], to_state="quoting"
+    )
+    assert quoting["hosted_url"] is None and quoting["hosted_url_expires_at"] is None
+    other = await _mk(buyer_ref="bref_q")
+    with pytest.raises(ValueError):
+        await ledger.transition(
+            other["id"], from_states=["resolving"], to_state="quoting",
+            hosted_url="https://pay.prava.space/enroll/x",
+        )
+    moved = await ledger.transition(
+        purchase["id"], from_states=["quoting"], to_state="awaiting_approval",
+        hosted_url="https://pay.prava.space/checkout/x",
+    )
+    assert moved["hosted_url"] == "https://pay.prava.space/checkout/x"
