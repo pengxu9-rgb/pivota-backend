@@ -125,26 +125,13 @@ def test_an_unverified_channel_is_surfaced(source: str) -> None:
 
 
 def test_the_lb_5xx_threshold_is_reachable_at_real_traffic(source: str) -> None:
-    """0.2 req/s asks for 12 5xx per second on an API serving ~0.03 req/s.
-
-    A total outage returning 5xx to every caller still sat an order of magnitude under it, which
-    is why this policy had never fired once. The assertion is on the *magnitude* rather than an
-    exact number so the threshold stays tunable — what must not come back is a value that no
-    achievable failure can reach.
-    """
-    body = _uncommented(source)
-    assert "COMPARISON_GT 0.2 300s" not in body, "the unreachable threshold is back"
-    marker = "prod: load balancer 5xx"
-    idx = body.rindex(marker)
-    tail = body[idx : idx + 800]
-    threshold = float(tail.split("COMPARISON_GT")[1].split()[0])
-    assert threshold <= 0.05, (
-        f"threshold {threshold}/s is unreachable at ~0.03 req/s baseline traffic"
-    )
-    # The window is half the claim: 0.01/s over 300s needs 4 errors, over 600s
-    # needs 7. The comment justifies the 600s figure, so a silent revert to 300s
-    # makes the rationale describe a policy that no longer exists.
-    assert "COMPARISON_GT %s 600s 600s" % tail.split("COMPARISON_GT")[1].split()[0] in tail
+    """Preserve the live 1% ratio and its 10-minute window as traffic changes."""
+    call = source.split('upsert "prod: load balancer 5xx"', 1)[1].split(')"', 1)[0]
+    assert '$(promql_policy' in call
+    assert 'response_code_class="500"}[10m]' in call
+    assert 'https_request_count{monitored_resource="https_lb_rule"}[10m]' in call
+    assert '> 0.01' in call
+    assert '600s 60s 3600s' in call
 
 
 def test_pool_exhaustion_has_its_own_alert(source: str) -> None:
