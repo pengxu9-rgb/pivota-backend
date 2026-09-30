@@ -35,10 +35,27 @@ from services.catalog_identity import validated_source_gtin
 from services import storefront_currency
 
 from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
-from services import crawl_politeness
+from services import crawl_politeness, shopify_edge_pacer
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 
 logger = logging.getLogger("curated_brand_feed")
+
+
+def _note_response(url: str, resp: Any) -> None:
+    """Feed one storefront response back to the crawl gates -- the ONE place this module does it.
+
+    crawl_politeness paces the next request to this host (unchanged) and, given the headers, forwards
+    them to any installed IP-throttle breaker and puts their throttle diagnostics on a 429/503
+    backoff line (#2473). The shared Shopify-edge pacer (#2474) learns the host that ANSWERED as
+    Shopify-served from its response headers, so later requests to it share the crawl IP's budget.
+    Both pacer calls are no-ops unless CRAWL_SHOPIFY_EDGE_PACER_ENABLED is on."""
+    headers = getattr(resp, "headers", None)
+    crawl_politeness.note_response(
+        url, resp.status_code,
+        retry_after=headers.get("retry-after") if headers is not None else None,
+        headers=headers,
+    )
+    shopify_edge_pacer.learn_from_response(str(getattr(resp, "url", None) or url), headers)
 
 _UA = "PivotaCommerceIndex/1.0 (+https://pivota.cc; catalog coverage)"
 _PER_PAGE = 250  # Shopify max
@@ -258,6 +275,9 @@ async def fetch_shopify_shop_locale(
     host = _clean_domain(domain)
     if not host:
         return {"currency": None}
+    # /meta.json is a Shopify storefront endpoint: pace it on the shared Shopify-edge budget from
+    # the first request (a no-op with the pacer off).
+    shopify_edge_pacer.mark_shopify_host(host)
 
     async def _gated_fetch(url: str) -> Optional[str]:
         headers = {"User-Agent": _UA, "Accept": "application/json"}
@@ -268,9 +288,7 @@ async def fetch_shopify_shop_locale(
             ) as client:
                 await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
                 resp = await client.get(url)
-                crawl_politeness.note_response(
-                    url, resp.status_code, retry_after=resp.headers.get("retry-after")
-                )
+                _note_response(url, resp)
                 if not _same_storefront_host(host, getattr(getattr(resp, "url", None), "host", None)):
                     return None
                 if resp.status_code != 200:
@@ -503,6 +521,10 @@ async def fetch_shopify_products(
     scanned = 0
     page = 1
     seen_pages: set = set()
+    # /products.json (and a collection's) is Shopify's storefront feed: this host is Shopify-served
+    # by construction, so every page of the crawl -- the first included -- is paced on the crawl IP's
+    # shared Shopify-edge budget (a no-op with CRAWL_SHOPIFY_EDGE_PACER_ENABLED off).
+    shopify_edge_pacer.mark_shopify_host(host)
     timeout = httpx.Timeout(timeout_s, connect=5.0)
     headers = {"User-Agent": _UA, "Accept": "application/json"}
     attempts = _page_attempts()
@@ -530,9 +552,7 @@ async def fetch_shopify_products(
                             raise
                         await asyncio.sleep(0.5 * (2 ** attempt))
                         continue
-                    crawl_politeness.note_response(
-                        url, resp.status_code, retry_after=resp.headers.get("retry-after")
-                    )
+                    _note_response(url, resp)
                     actual_host = getattr(getattr(resp, "url", None), "host", None)
                     if not _same_storefront_host(host, actual_host):
                         # A regional/sibling store can have a different catalog and
@@ -683,13 +703,13 @@ async def _fetch_missing_variant_gtins(
             or any(source_ids.count(vid) != 1 for vid in wanted)):
         return {}, requests
     url = f"https://{host}/products/{quote(handle, safe='')}.js"
+    shopify_edge_pacer.mark_shopify_host(host)  # /products/<handle>.js is a Shopify endpoint
     try:
         for redirect in range(3):
             await crawl_politeness.before_request(url, user_agent=_UA, max_wait=10.0)
             requests += 1
             response = await client.get(url)
-            crawl_politeness.note_response(url, response.status_code,
-                                           retry_after=response.headers.get("retry-after"))
+            _note_response(url, response)
             if not _same_storefront_host(host, getattr(getattr(response, "url", None), "host", None)):
                 return {}, requests
             if response.status_code in {301, 302, 303, 307, 308}:
@@ -1245,9 +1265,7 @@ async def fetch_pdp_description(
                 follow_redirects=True, timeout=timeout, headers=headers
             ) as c:
                 resp = await c.get(url)
-        crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
-        )
+        _note_response(url, resp)
         if resp.status_code != 200:
             return None
         return description_from_pdp_html(resp.text)
@@ -1291,9 +1309,7 @@ async def fetch_shop_description(
                 follow_redirects=True, timeout=timeout, headers=headers
             ) as c:
                 resp = await c.get(url)
-        crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
-        )
+        _note_response(url, resp)
         if resp.status_code != 200:
             return None
         return description_from_pdp_html(resp.text)
@@ -1330,6 +1346,7 @@ async def fetch_shop_description_from_meta(
     if not host:
         return None
     url = f"https://{host}/meta.json"
+    shopify_edge_pacer.mark_shopify_host(host)  # a Shopify storefront endpoint
     timeout = httpx.Timeout(timeout_s, connect=5.0)
     headers = {"User-Agent": _UA, "Accept": "application/json"}
     try:
@@ -1341,9 +1358,7 @@ async def fetch_shop_description_from_meta(
                 follow_redirects=True, timeout=timeout, headers=headers
             ) as c:
                 resp = await c.get(url)
-        crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
-        )
+        _note_response(url, resp)
         if resp.status_code != 200:
             return None
         # THE ANSWER MUST COME FROM THE HOST WE ASKED. `follow_redirects=True` with no check
@@ -1407,9 +1422,7 @@ async def fetch_pdp_inci(
                 follow_redirects=True, timeout=timeout, headers=headers
             ) as c:
                 resp = await c.get(url)
-        crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
-        )
+        _note_response(url, resp)
         if resp.status_code != 200:
             return None
         return inci_from_pdp_html(resp.text)

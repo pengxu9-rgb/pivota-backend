@@ -221,6 +221,10 @@ class _Session:
         another host; a 200 that should be JSON and is not is a bot wall. Other codes are the caller's."""
         from services.curated_brand_feed import _UA
         url = f"https://{self.host}{path}"
+        # Shopify Markets capture (/localization, /cart.js) is Shopify by construction: pace it on the
+        # crawl IP's shared Shopify-edge budget (a no-op with CRAWL_SHOPIFY_EDGE_PACER_ENABLED off).
+        from services import shopify_edge_pacer
+        shopify_edge_pacer.mark_shopify_host(self.host)
         try:
             await self.polite.before_request(url, user_agent=_UA, max_wait=0)
         except RobotsDisallowed as exc:
@@ -233,7 +237,8 @@ class _Session:
             resp = await self.client.request(method, url, **kw)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise self._refuse("crawl_throttled", "queued", f"{path}: {type(exc).__name__}", transient=True) from exc
-        self.polite.note_response(url, resp.status_code, retry_after=resp.headers.get("retry-after"))
+        self.polite.note_response(url, resp.status_code, retry_after=resp.headers.get("retry-after"),
+                                  headers=resp.headers)
         final = _host(str(getattr(resp, "url", "") or url))
         if final != self.host:
             # A geo-router or a sibling regional store: another catalog, another currency.
