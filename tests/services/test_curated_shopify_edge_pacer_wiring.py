@@ -163,18 +163,19 @@ def test_gtin_recovery_is_paced_as_shopify_and_waits_for_its_turn(monkeypatch):
     monkeypatch.setattr(crawl_politeness, "note_response", lambda *a, **kw: None)
     _rows, report = asyncio.run(cbf.recover_missing_variant_gtins(
         [_gtin_product(1), _gtin_product(2)], domain=HOST))
-    assert seen == [(True, 0), (True, 0)]
+    assert [applies for applies, _w in seen] == [True, True]
+    assert all(0 < wait <= cbf.GTIN_RECOVERY_BUDGET_S for _a, wait in seen)  # bounded by the budget, not 10s
     assert report["recovered"] == 2 and report["failed"] == 0 and report["paced"] == 0
 
 
 def test_a_pacing_refusal_is_counted_paced_not_failed_and_stops_the_batch(monkeypatch):
-    """P1: a refusal the gate can still raise (CrawlDelayTooLong / EdgePaced) is not the product's
-    failure, and every later product would be refused the same way."""
+    """A host asking for a Crawl-delay longer than we honour: not the product's failure, and every
+    later product would be refused the same way."""
     calls = []
 
     async def gate(url, *, user_agent, max_wait=None):
         calls.append(url)
-        raise shopify_edge_pacer.EdgePaced("next shared slot is 15s out")
+        raise crawl_politeness.CrawlDelayTooLong("Crawl-delay 120s")
 
     real = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(
@@ -206,3 +207,61 @@ def test_the_inci_and_shop_blurb_pages_feed_headers_and_learn(monkeypatch, fetch
     asyncio.run(fetch())
     assert notes and all(headers is not None for _u, _s, headers in notes)
     assert shopify_edge_pacer.is_shopify_host("inci.example.com")
+
+
+
+def test_a_host_answering_429_ends_the_recovery_after_one_request_like_main(monkeypatch):
+    """Review #2477 P0: flag OFF, the drain's pacing env, every .js answering 429 Retry-After 60.
+    main stopped after 1 request in ~0s; an unbounded wait slept out the growing backoff for every
+    product (~16h for 200). Run through the REAL politeness gate."""
+    import time as _time
+
+    crawl_politeness.reset_for_tests()
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "4")
+    monkeypatch.setenv("CRAWL_BACKOFF_BASE_SECONDS", "15")
+    requests = []
+
+    def reply(request):
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        requests.append(request.url.path)
+        return httpx.Response(429, headers={"retry-after": "60"})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(reply), **kw))
+    started = _time.monotonic()
+    _rows, report = asyncio.run(cbf.recover_missing_variant_gtins(
+        [_gtin_product(n) for n in range(1, 21)], domain=HOST))
+    assert len(requests) == 1 and report["http_requests"] == 1
+    assert report["failed"] == 1 and report["blocked_stopped"] == 19
+    assert _time.monotonic() - started < 5
+    crawl_politeness.reset_for_tests()
+
+
+def test_a_backed_up_schedule_stops_at_the_budget_not_after_thousands_of_seconds(monkeypatch):
+    """Review #2477 P0: a steady 15s shared backlog (flag on) cost ~3,000s for 200 products unbounded.
+    On a fake clock: each turn takes 15s; the recovery stops when its budget cannot cover the next."""
+    clock = [1000.0]
+    monkeypatch.setattr(cbf.time, "monotonic", lambda: clock[0])
+    waits = []
+
+    async def gate(url, *, user_agent, max_wait=None):
+        waits.append(max_wait)
+        if max_wait < 15:
+            raise shopify_edge_pacer.EdgePaced("next shared slot is 15s out")
+        clock[0] += 15
+
+    def reply(request):
+        n = int(request.url.path.split("oil-")[1].split(".")[0])
+        detail = _gtin_product(n)
+        detail["variants"][0]["barcode"] = "8809530070499"
+        return httpx.Response(200, json=detail)
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(reply), **kw))
+    monkeypatch.setattr(crawl_politeness, "before_request", gate)
+    monkeypatch.setattr(crawl_politeness, "note_response", lambda *a, **kw: None)
+    _rows, report = asyncio.run(cbf.recover_missing_variant_gtins(
+        [_gtin_product(n) for n in range(1, 11)], domain=HOST, budget_s=40))
+    assert report["recovered"] == 2 and report["budget_stopped"] == 8 and report["failed"] == 0
+    assert clock[0] - 1000.0 == 30  # never ran past its budget

@@ -682,7 +682,7 @@ def _missing_barcode(variant: Dict[str, Any]) -> bool:
 
 
 async def _fetch_missing_variant_gtins(
-    product: Dict[str, Any], *, domain: str, client: httpx.AsyncClient,
+    product: Dict[str, Any], *, domain: str, client: httpx.AsyncClient, deadline: Optional[float] = None,
 ) -> Tuple[Dict[str, str], int]:
     """Return only validated (native variant ID -> GTIN), never detail-page copy.
 
@@ -710,13 +710,14 @@ async def _fetch_missing_variant_gtins(
     shopify_edge_pacer.mark_shopify_host(host)  # /products/<handle>.js is a Shopify endpoint
     try:
         for redirect in range(3):
-            # WAIT FOR THE TURN (max_wait=0, like every other request in this module). A bounded wait
-            # made a marked host's request refuse whenever the shared Shopify-edge schedule was more
-            # than 10s out, and every later product the same way: with the pacer on and backed up,
-            # the whole recovery ended "failed" having sent nothing (review of #2477). A refusal that
-            # can still happen (CrawlDelayTooLong) propagates to recover_missing_variant_gtins, which
-            # counts it as `paced`, not `failed`.
-            await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
+            # WAIT FOR THE TURN, BOUNDED BY THE RECOVERY'S OWN BUDGET (`deadline`, monotonic). A fixed
+            # 10s bound refused a Shopify-marked host whenever the shared Shopify-edge schedule was
+            # more than 10s out, so with the pacer on and backed up every product ended `failed`
+            # having sent nothing; an unbounded wait instead slept out a 429'ing host's growing
+            # backoff product after product (~16h for 200). Either way the refusal (CrawlPaced)
+            # propagates to recover_missing_variant_gtins, which stops the batch and counts why
+            # (review of #2477).
+            await crawl_politeness.before_request(url, user_agent=_UA, max_wait=_remaining_wait(deadline))
             requests += 1
             response = await client.get(url)
             _note_response(url, response)
@@ -753,21 +754,47 @@ async def _fetch_missing_variant_gtins(
                     recovered[vid] = gtin
             return recovered, requests
     except crawl_politeness.CrawlPaced:
-        raise  # a pacing refusal is not this product's failure; the caller stops and counts it
+        if requests:  # refused on a redirect hop: this product did ask, so it failed like any other
+            return {}, requests
+        raise  # refused before asking: not this product's failure; the caller stops and counts why
     except Exception as exc:
         logger.debug("GTIN recovery refused for %s/%s: %s", host, handle, type(exc).__name__)
     return {}, requests
 
 
+#: A GTIN recovery never runs longer than this (seconds). Above what the unthrottled path needs at the
+#: drain's pacing (200 products x CRAWL_MIN_INTERVAL_SECONDS 4 = 800s), so it bounds only a backed-up
+#: Shopify-edge schedule or a slow host; the INCI step's budget (pipeline.DRAIN_PDP_INCI_BUDGET_S) is
+#: the same 900s.
+GTIN_RECOVERY_BUDGET_S = 900.0
+#: Stop asking a host after this many 429/503s in a row: one, as on main, where the first throttle
+#: ended the batch after a single request. Asking again only feeds the throttle (2026-09-30).
+GTIN_RECOVERY_STOP_AFTER_BLOCKS = 1
+
+
+def _remaining_wait(deadline: Optional[float]) -> float:
+    """The longest a paced request may wait for its turn: the rest of the budget. 0 means unbounded in
+    crawl_politeness, so no deadline -> 0, and an exhausted one raises rather than going unbounded."""
+    if deadline is None:
+        return 0
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise crawl_politeness.CrawlPaced("GTIN recovery budget exhausted")
+    return left
+
+
 async def recover_missing_variant_gtins(
     products: List[Dict[str, Any]], *, domain: str, max_fetches: int = 100,
+    budget_s: Optional[float] = GTIN_RECOVERY_BUDGET_S,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Recover selected products only, before shade folding changes product identity.
 
     attempted/recovered/failed/capped/paced count PRODUCTS; recovered_gtins counts variant
-    barcodes and http_requests includes bounded redirect hops. `paced` is products not recovered
-    because the crawl gate refused to pace a request (CrawlPaced): the batch stops there -- every
-    later product would be refused the same way -- and none of them is counted `failed`. A failed observation
+    barcodes and http_requests includes bounded redirect hops. The batch STOPS, and the products it
+    did not attempt are counted by why -- never `failed`:
+      * blocked_stopped: the host answered GTIN_RECOVERY_STOP_AFTER_BLOCKS 429/503s in a row;
+      * budget_stopped: `budget_s` ran out (a request's wait is bounded by what is left of it);
+      * paced: the host asks for a Crawl-delay longer than we will honour (CrawlDelayTooLong). A failed observation
     never changes its product. Each attempt has at most three requests with the
     client's ten-second timeout, paced by the shared merchant crawl gate.
     """
@@ -777,23 +804,36 @@ async def recover_missing_variant_gtins(
               for p in products]
     candidates = [p for p in copied if any(isinstance(v, dict) and _missing_barcode(v)
                                           for v in p["variants"])]
-    report = {"attempted": 0, "recovered": 0, "failed": 0, "paced": 0,
+    report = {"attempted": 0, "recovered": 0, "failed": 0, "paced": 0, "budget_stopped": 0,
+              "blocked_stopped": 0,
               "capped": max(0, len(candidates) - max_fetches), "recovered_gtins": 0, "http_requests": 0}
     if not candidates or not max_fetches:
         return copied, report
     async with httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(10.0, connect=5.0),
                                  headers={"User-Agent": _UA, "Accept": "application/json"}) as client:
         batch = candidates[:max_fetches]
+        host = _clean_domain(domain)
+        deadline = time.monotonic() + budget_s if budget_s else None
         for index, product in enumerate(batch):
-            report["attempted"] += 1
-            try:
-                recovered, requests = await _fetch_missing_variant_gtins(product, domain=domain, client=client)
-            except crawl_politeness.CrawlPaced as exc:
-                report["paced"] = len(batch) - index
-                report["attempted"] -= 1
-                logger.warning("GTIN recovery for %s stopped: the crawl gate refused to pace (%s); %d "
-                               "product(s) not attempted", domain, type(exc).__name__, report["paced"])
+            left = len(batch) - index
+            if crawl_politeness.consecutive_blocks(host) >= GTIN_RECOVERY_STOP_AFTER_BLOCKS:
+                report["blocked_stopped"] = left
+                logger.warning("GTIN recovery for %s stopped: the host is throttling (429/503); %d "
+                               "product(s) not attempted", domain, left)
                 break
+            try:
+                _remaining_wait(deadline)  # raises once the budget is spent, before counting an attempt
+                recovered, requests = await _fetch_missing_variant_gtins(
+                    product, domain=domain, client=client, deadline=deadline)
+            except crawl_politeness.CrawlPaced as exc:
+                # Refused before any request for this product: it is not attempted, and neither is
+                # anything after it.
+                key = "paced" if isinstance(exc, crawl_politeness.CrawlDelayTooLong) else "budget_stopped"
+                report[key] = left
+                logger.warning("GTIN recovery for %s stopped (%s: %s); %d product(s) not attempted",
+                               domain, key, type(exc).__name__, left)
+                break
+            report["attempted"] += 1
             report["http_requests"] += requests
             applied = 0
             for variant in product["variants"]:
