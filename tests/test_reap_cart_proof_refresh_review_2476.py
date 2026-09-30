@@ -166,3 +166,24 @@ def test_nit_enrichment_crawl_delay_too_long_is_not_a_hold():
     page = refresh.asyncio.run(refresh.enrichment_page_fn(job, None, None, {"a.com": "P"}, apply=False,
                                                           pacer=None)("a.com", None))
     assert page.held == 0 and not page.aborted
+
+
+def test_p1_1_three_stores_we_already_blamed_do_not_trip_the_block_breaker_a_fourth_does():
+    """The block breaker's rule is the throttle breaker's: three stores that each blocked us outright
+    (all already aborted) are three store-level blocks, backed off on their own evidence; the same
+    answer from a store we had not blamed is what makes it the address."""
+    aborted = {"a.com", "b.com", "c.com"}
+    lane = refresh.lane_breaker(["a.com", "b.com", "c.com", "d.com"], is_aborted=lambda s: s in aborted)
+    for host in ("a.com", "www.b.com", "c.com"):
+        lane.observe_block(host, "http_403")
+    assert not lane.tripped
+    lane.observe_block("d.com", "error:ConnectError")
+    assert lane.tripped and lane.blocks.trip_store_count == 4
+    assert lane.blocks.summary()["by_outcome"] == {"http_403": 3, "error:ConnectError": 1}
+
+
+def test_p1_1_a_429_is_the_throttle_breakers_not_the_block_breakers():
+    lane = refresh.lane_breaker(["a.com", "b.com", "c.com"], is_aborted=lambda s: False)
+    for host in ("a.com", "b.com", "c.com"):
+        lane.observe_block(host, "rate_limited")
+    assert not lane.blocks.tripped and lane.blocks.blocks == 0
