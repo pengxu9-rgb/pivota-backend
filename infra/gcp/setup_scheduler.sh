@@ -114,6 +114,9 @@ case "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" in true|false) ;; *) echo "EXTERN
 # whole env, so a reconcile that left them out would silently turn the graph back into a dry run.
 # Unset = the environment's standing state: on in prod, off in staging. RELGRAPH_SYNC_WRITES=false
 # reconciles prod as a dry run. Staging refuses true: it holds a prod snapshot (see STAGING SAFETY).
+# An emergency writes-off done by hand (`gcloud run jobs update relgraph-sync --update-env-vars
+# RELGRAPH_SYNC_ALLOW_WRITES=false`) is RE-ARMED by the next plain reconcile; keep it off by passing
+# RELGRAPH_SYNC_WRITES=false to every run until it is meant to come back.
 : "${RELGRAPH_SYNC_WRITES:=}"
 case "$RELGRAPH_SYNC_WRITES" in ""|true|false) ;; *) echo "RELGRAPH_SYNC_WRITES must be true, false or unset (got '$RELGRAPH_SYNC_WRITES')" >&2; exit 2 ;; esac
 if [ -z "$RELGRAPH_SYNC_WRITES" ]; then
