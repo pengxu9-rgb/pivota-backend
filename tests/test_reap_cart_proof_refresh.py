@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import signal
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -538,9 +539,7 @@ def test_enrichment_stores_throttling_one_after_another_trip_the_breaker_and_sto
     """Under the 09-30 pattern (a rate throttle that lets 200s through) no store reaches its own
     threshold, yet three distinct stores 429ing within the window trip the breaker: the pass stops and
     nothing is backed off."""
-    from services.crawl_ip_throttle import IpThrottleBreaker
-
-    breaker = IpThrottleBreaker(trip_hosts=refresh.LANE_IP_TRIP_HOSTS, window_seconds=refresh.LANE_IP_TRIP_WINDOW_S)
+    breaker = refresh.store_breaker(["a.com", "b.com", "c.com", "d.com"], is_aborted=lambda s: False)
     mixed = ["429", "ok", "429", "ok", "ok"]
     results = _enrichment_pass({"a.com": mixed, "b.com": mixed, "c.com": mixed, "d.com": ["ok"]}, breaker)
     assert results["a.com"].status == DONE and results["b.com"].status == DONE
@@ -1028,10 +1027,12 @@ def _mirror_seeds(domain: str, n: int, start: int = 0) -> List[Dict[str, Any]]:
              "seed_data": {"snapshot": {"variants": [{"sku": f"s{i}"}]}}} for i in range(start, start + n)]
 
 
-def _real_backfill_pass(monkeypatch, seeds_by_domain, handler, domains, page_size=3, breaker=None,
-                        max_wait=refresh.MIRROR_MAX_POLITE_WAIT_S):
+def _real_backfill_pass(monkeypatch, seeds_by_domain, handler, domains, page_size=3, breaker=False,
+                        max_wait=refresh.MIRROR_MAX_POLITE_WAIT_S, forgive_window_s=refresh.LANE_IP_TRIP_WINDOW_S):
     """The REAL backfill `run()` over a faked selection and a mock transport, through the mirror client
-    (crawl_politeness gate, IP breaker installed when given)."""
+    (crawl_politeness gate; with `breaker=True`, the lane's store-keyed IP breaker installed exactly as
+    run_lane installs it). Bounded at 20 s, so a wait that should have been refused fails the test
+    instead of hanging it."""
     from scripts import backfill_shopify_variant_ids as backfill
     from services import crawl_ip_throttle
 
@@ -1042,27 +1043,32 @@ def _real_backfill_pass(monkeypatch, seeds_by_domain, handler, domains, page_siz
     monkeypatch.setattr(backfill, "select_candidates", fake_select)
     monkeypatch.setattr(backfill, "GLOBAL_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(backfill, "PER_DOMAIN_MIN_GAP_S", 0.0)
+    results: Dict[str, DomainResult] = {}
+    ip = (refresh.store_breaker(domains, is_aborted=lambda s: s in results and results[s].status == ABORTED)
+          if breaker else None)
 
     async def go():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as raw:
-            client = refresh.BlockStreakClient(raw, backfill, breaker=breaker, max_wait=max_wait)
-            results = await drive(domains, refresh.mirror_page_fn(backfill, client, apply=False, page_size=page_size),
-                                  refresh.merge_mirror, budget_s=60, gap_s=0.0, on_domain_start=client.start_store,
-                                  stop_signal=(lambda: breaker.tripped) if breaker is not None else None)
+            client = refresh.BlockStreakClient(raw, backfill, breaker=ip, max_wait=max_wait)
+            await drive(domains, refresh.mirror_page_fn(backfill, client, apply=False, page_size=page_size),
+                        refresh.merge_mirror, budget_s=60, gap_s=0.0, on_domain_start=client.start_store,
+                        stop_signal=(lambda: ip.tripped) if ip is not None else None,
+                        forgive_window_s=forgive_window_s, results=results)
             return results, client
 
-    if breaker is None:
-        return asyncio.run(go())
-    with crawl_ip_throttle.installed(breaker):
-        return asyncio.run(go())
+    async def bounded():
+        return await asyncio.wait_for(go(), timeout=20)
+
+    if ip is None:
+        return asyncio.run(bounded())
+    with crawl_ip_throttle.installed(ip):
+        return asyncio.run(bounded())
 
 
 def test_small_stores_under_an_ip_level_block_trip_the_breaker_and_nothing_is_backed_off(monkeypatch):
     """Each store has 5 seeds, under the backfill's threshold of 8, and every answer is a 429. The
     breaker (3 distinct throttling stores) trips at c.com's first answer; c.com asks nothing more, d and
     e are not reached, and a and b -- aborted as "no clean answer" -- have their back-off forgiven."""
-    from services.crawl_ip_throttle import IpThrottleBreaker
-
     requested: List[str] = []
 
     def handler(request):
@@ -1071,9 +1077,8 @@ def test_small_stores_under_an_ip_level_block_trip_the_breaker_and_nothing_is_ba
 
     domains = ["a.com", "b.com", "c.com", "d.com", "e.com"]
     seeds = {d: _mirror_seeds(d, 5) for d in domains}
-    breaker = IpThrottleBreaker(trip_hosts=refresh.LANE_IP_TRIP_HOSTS, window_seconds=refresh.LANE_IP_TRIP_WINDOW_S)
-    results, client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=10, breaker=breaker)
-    assert breaker.tripped and len(requested) == 11
+    results, client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=10, breaker=True)
+    assert client.breaker.tripped and len(requested) == 11
     assert [results[d].status for d in ("a.com", "b.com")] == [ABORTED, ABORTED]
     assert results["a.com"].ip_block and results["b.com"].ip_block
     assert results["c.com"].status == refresh.IP_THROTTLED and results["c.com"].pass_abort
@@ -1612,7 +1617,6 @@ def test_the_09_30_pattern_a_throttle_that_lets_200s_through_backs_off_no_health
     through). No store reaches 8 in a row and none is "never read", so without the breaker every one
     would be walked into the throttle; with it, the third throttling store trips it, the pass stops,
     and no store carries a back-off."""
-    from services.crawl_ip_throttle import IpThrottleBreaker
 
     def handler(request):
         n = int(request.url.path.split("/h")[-1].split(".")[0])
@@ -1620,8 +1624,7 @@ def test_the_09_30_pattern_a_throttle_that_lets_200s_through_backs_off_no_health
 
     domains = ["a.com", "b.com", "c.com", "d.com"]
     seeds = {d: _mirror_seeds(d, 6) for d in domains}
-    breaker = IpThrottleBreaker(trip_hosts=refresh.LANE_IP_TRIP_HOSTS, window_seconds=refresh.LANE_IP_TRIP_WINDOW_S)
-    results, _client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=10, breaker=breaker)
+    results, _client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=10, breaker=True)
     assert results["a.com"].status == DONE and results["b.com"].status == DONE
     assert results["c.com"].status == refresh.IP_THROTTLED and results["d.com"].status == NOT_REACHED
     assert not any(refresh.cursor_row_for(r, True, T0)["blocked_until"] for r in results.values())
@@ -1629,8 +1632,7 @@ def test_the_09_30_pattern_a_throttle_that_lets_200s_through_backs_off_no_health
 
 def test_a_store_that_blocked_us_earlier_is_forgiven_when_the_breaker_trips_later(monkeypatch):
     """a.com blocks us outright (8 x 403) -- a back-off, at first. Later stores throttle (429s) and the
-    breaker trips: in a run the address was throttled, a.com's back-off is forgiven too."""
-    from services.crawl_ip_throttle import IpThrottleBreaker
+    breaker trips within the window: a.com's back-off is forgiven too."""
 
     def handler(request):
         host = request.url.host
@@ -1638,9 +1640,8 @@ def test_a_store_that_blocked_us_earlier_is_forgiven_when_the_breaker_trips_late
 
     domains = ["a.com", "b.com", "c.com", "d.com", "e.com"]
     seeds = {d: _mirror_seeds(d, 10) for d in domains}
-    breaker = IpThrottleBreaker(trip_hosts=refresh.LANE_IP_TRIP_HOSTS, window_seconds=refresh.LANE_IP_TRIP_WINDOW_S)
     # 403 is not a throttle signal: a.com alone does not count toward the trip.
-    results, _client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=25, breaker=breaker)
+    results, _client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=25, breaker=True)
     assert results["a.com"].status == ABORTED and results["a.com"].ip_block
     assert results["b.com"].status == DONE
     assert results["e.com"].status == refresh.IP_THROTTLED
@@ -1666,9 +1667,14 @@ def test_a_retry_after_holds_the_mirror_lanes_next_request_and_it_is_not_sent(mo
     seeds = {"a.com": _mirror_seeds("a.com", 5)}
     results, client = _real_backfill_pass(monkeypatch, seeds, handler, ["a.com"], page_size=10, max_wait=0.5)
     assert requested == ["a.com"]
-    assert client.not_sent == 4
+    assert client.not_sent == 4 and client.store_not_sent == 4
     assert results["a.com"].writer["fetch_outcomes"] == {"rate_limited": 1, "not_json": 4}
-    assert results["a.com"].status == ABORTED, "one block and no clean answer: never read"
+    # B2(a): one real 429 and four HELD requests is not "had a block, no clean answer": the store was
+    # not refused, it was not asked. Held: no back-off, no completion, the cursor stays where it was.
+    assert results["a.com"].status == refresh.HELD
+    row = refresh.cursor_row_for(results["a.com"], True, T0)
+    assert row["next_cursor"] is None and row["blocked_until"] is None and row["completed_at"] is None
+    assert exit_code(results) == refresh.EXIT_BUDGET
 
 
 def test_every_mirror_request_is_marked_shopify_and_takes_a_shared_edge_slot(monkeypatch):
@@ -1796,3 +1802,251 @@ def test_after_a_trip_no_later_store_is_asked_even_if_the_page_that_tripped_it_c
     assert state.results["a.com"].status == CRASHED
     assert state.results["b.com"].status == refresh.IP_THROTTLED and state.results["b.com"].pass_abort
     assert state.info["ip_throttle"]["ip_throttled"] is True
+
+
+# ── B1: the breaker is keyed by STORE and needs a store we had not already blamed ───────────────
+
+
+def test_b1_one_stores_apex_and_www_plus_one_stray_429_is_not_three_stores():
+    """The reviewer's split-host case: a.com answers 429 from its apex AND its www twin, and b.com
+    throws one stray 429. Keyed by hostname that is three -- a trip, and the genuine blocker's back-off
+    forgiven. Keyed by store it is two: no trip."""
+    from services.crawl_ip_throttle import IpThrottleBreaker
+
+    by_host = IpThrottleBreaker(trip_hosts=refresh.LANE_IP_TRIP_HOSTS, window_seconds=refresh.LANE_IP_TRIP_WINDOW_S)
+    by_store = refresh.store_breaker(["a.com", "b.com", "c.com"], is_aborted=lambda s: False)
+    for breaker in (by_host, by_store):
+        for host in ("a.com", "www.a.com", "shop.a.com", "b.com"):
+            breaker.observe(host, 429, {})
+    assert by_host.tripped, "precondition: the hostname-keyed breaker would have tripped"
+    assert not by_store.tripped
+    by_store.observe("www.c.com", 429, {})
+    assert by_store.tripped and by_store.trip_host_count == 3
+    assert by_store.store_of("WWW.A.COM") == "a.com" and by_store.store_of("www.other.com") == "other.com"
+
+
+def test_b1_three_stores_we_already_blamed_do_not_trip_it_a_fourth_answering_store_does():
+    aborted = {"a.com", "b.com", "c.com"}
+    breaker = refresh.store_breaker(["a.com", "b.com", "c.com", "d.com"], is_aborted=lambda s: s in aborted)
+    for host in ("a.com", "b.com", "c.com"):
+        breaker.observe(host, 429, {})
+    assert not breaker.tripped, "three store-level blocks, each already backed off on its own evidence"
+    breaker.observe("d.com", 429, {})
+    assert breaker.tripped
+
+
+def test_b1_a_non_throttle_answer_never_trips_it_and_its_diagnostics_are_2473s():
+    breaker = refresh.store_breaker(["a.com", "b.com", "c.com"], is_aborted=lambda s: False)
+    for host in ("a.com", "b.com", "c.com"):
+        breaker.observe(host, 403, {})
+        breaker.observe(host, 503, {})  # a bare 503 is an outage, not a throttle
+    assert not breaker.tripped
+    summary = breaker.summary()
+    assert summary["ip_throttled"] is False and summary["throttle_diagnostics"]["responses"] == 3
+    for host in ("a.com", "b.com", "c.com"):
+        breaker.observe(host, 503, {"retry-after": "30"})
+    assert breaker.tripped and breaker.summary()["ip_throttle_trip_host_count"] == 3
+
+
+def test_b1_the_09_30_pattern_trips_on_the_third_store_through_run_lane(monkeypatch):
+    """Through the REAL run_lane (the breaker it builds and installs): stores answering 429/404
+    alternately trip it at the third store, and no store is backed off."""
+    from scripts import backfill_shopify_variant_ids as backfill
+
+    domains = ["a.com", "b.com", "c.com", "d.com"]
+    seeds = {d: _mirror_seeds(d, 6) for d in domains}
+
+    async def fake_select(limit, domain, after=None, seed_ids=None):
+        rows = [r for r in seeds[domain] if after is None or r["id"] > after]
+        return [dict(r) for r in rows[:limit]]
+
+    def handler(request):
+        n = int(request.url.path.split("/h")[-1].split(".")[0])
+        return httpx.Response(429 if n % 2 == 0 else 404)
+
+    monkeypatch.setattr(backfill, "select_candidates", fake_select)
+    monkeypatch.setattr(backfill, "GLOBAL_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(backfill, "PER_DOMAIN_MIN_GAP_S", 0.0)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(refresh.httpx, "AsyncClient",
+                        lambda *a, **k: real_client(transport=httpx.MockTransport(handler)))
+    db = MemoryDb()
+    plan = refresh.LanePlan(lane="mirror", domains=domains, writer=backfill, gap_s=0.0,
+                            proof_max_age=timedelta(days=7))
+    state = refresh.RunState()
+    asyncio.run(refresh.run_lane(plan, apply=True, budget_s=600, emit=lambda line: None, state=state, db=db,
+                                 now=lambda: T0))
+    assert [state.results[d].status for d in domains] == [DONE, DONE, refresh.IP_THROTTLED, NOT_REACHED]
+    assert state.info["ip_throttle"]["ip_throttle_trip_host_count"] == 3
+    assert all(r["blocked_until"] is None for r in db.rows.values())
+
+
+# ── forgiveness: only aborts inside the breaker window ──────────────────────────────────────────
+
+
+def test_only_a_back_off_recorded_inside_the_window_before_the_trip_is_forgiven():
+    clock = Clock()
+    run_page, _ = pages_fn({
+        "a.com": [Page({}, None, aborted=True)],
+        "b.com": [Page({}, None)],
+        "c.com": [Page({}, None, aborted=True)],
+        "d.com": [Page({}, None, abort_pass=True)],
+    }, clock=clock, cost=400.0)
+    results = asyncio.run(drive(["a.com", "b.com", "c.com", "d.com"], run_page, merge_list, budget_s=10_000,
+                                gap_s=0.0, clock=clock, sleep=clock.sleep, forgive_window_s=900.0))
+    # a.com aborted at t=400, the trip at t=1600: 1200 s before it, outside the 900 s window.
+    assert results["a.com"].status == ABORTED and not results["a.com"].ip_block
+    assert results["c.com"].ip_block, "aborted at t=1200, 400 s before the trip"
+    assert refresh.cursor_row_for(results["a.com"], True, T0)["blocked_until"] == T0 + refresh.MIRROR_BLOCK_BACKOFF
+    assert refresh.cursor_row_for(results["c.com"], True, T0)["blocked_until"] is None
+
+
+def test_run_lane_forgives_within_the_lanes_breaker_window():
+    captured: Dict[str, Any] = {}
+    real = refresh.drive
+
+    async def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return await real(*args, **kwargs)
+
+    writer = FakeMirrorWriter()
+    plan = refresh.LanePlan(lane="mirror", domains=["a.com"], writer=writer, gap_s=0.0,
+                            proof_max_age=timedelta(days=7))
+    import unittest.mock as mock
+
+    with mock.patch.object(refresh, "drive", spy):
+        _run_real_lane(plan, apply=False, db=StubDb())
+    assert captured["forgive_window_s"] == refresh.LANE_IP_TRIP_WINDOW_S
+
+
+# ── B2: held requests are counted, never read as a store's verdict, and hold the cursor ─────────
+
+
+def test_b2_a_store_whose_every_request_was_held_is_not_done(monkeypatch):
+    """The host is under a Retry-After hold before the store starts: every request is held. The old
+    code read that as `done` (exit 0, cursor reset, nothing read)."""
+    from services import crawl_politeness
+
+    crawl_politeness.note_response("https://a.com/", 429, retry_after="120")
+    requested: List[str] = []
+
+    def handler(request):
+        requested.append(request.url.host)
+        return httpx.Response(404)
+
+    seeds = {"a.com": _mirror_seeds("a.com", 4)}
+    results, client = _real_backfill_pass(monkeypatch, seeds, handler, ["a.com"], page_size=10, max_wait=0.5)
+    assert requested == [] and client.not_sent == 4
+    assert results["a.com"].status == refresh.HELD
+    row = refresh.cursor_row_for(results["a.com"], True, T0)
+    assert row["completed_at"] is None and row["blocked_until"] is None
+    assert exit_code(results) == refresh.EXIT_BUDGET
+
+
+def test_b2_a_held_page_does_not_advance_the_cursor_past_it(monkeypatch):
+    """Page 1 reads fine and advances the cursor; page 2 meets a Retry-After hold: the store stops with
+    its cursor at the END OF PAGE 1, so the held rows are walked next run."""
+    served = {"n": 0}
+
+    def handler(request):
+        served["n"] += 1
+        if served["n"] == 4:
+            return httpx.Response(429, headers={"retry-after": "120"})
+        return httpx.Response(404)
+
+    seeds = {"a.com": _mirror_seeds("a.com", 9)}
+    results, client = _real_backfill_pass(monkeypatch, seeds, handler, ["a.com"], page_size=3, max_wait=0.5)
+    assert results["a.com"].status == refresh.HELD and results["a.com"].pages == 2
+    assert results["a.com"].last_cursor == "epsv_a002", "page 1's cursor, not page 2's"
+    assert refresh.cursor_row_for(results["a.com"], True, T0)["next_cursor"] == "epsv_a002"
+    assert client.not_sent == 2
+
+
+def test_b2_enrichment_held_requests_stop_the_store_without_a_verdict():
+    job = FakeEnrichmentJob([{"exhausted": True, "next_cursor": None, "aborted_on_block": False,
+                              "fetches": {"rate_limited": 1, "crawl_paced": 3}}])
+    page = asyncio.run(refresh.enrichment_page_fn(job, None, None, {"a.com": "P"}, apply=False,
+                                                  pacer=None)("a.com", None))
+    assert page.held == 3 and not page.aborted and page.next_cursor is None
+    robots = FakeEnrichmentJob([{"exhausted": True, "next_cursor": None, "aborted_on_block": False,
+                                 "fetches": {"robots_disallowed": 3}}])
+    page = asyncio.run(refresh.enrichment_page_fn(robots, None, None, {"a.com": "P"}, apply=False,
+                                                  pacer=None)("a.com", None))
+    assert page.held == 0, "a robots refusal is permanent, not a hold"
+
+
+def test_b2_enrichment_never_read_ignores_held_requests():
+    class Held(BlockingEnrichmentJob):
+        async def run_domain(self, db, client, plan, *, block_state, block_limit, **kwargs):
+            block_state["consecutive"] += 1  # one real block, then the rest held
+            return {"aborted_on_block": False, "exhausted": True, "next_cursor": None,
+                    "fetches": {"rate_limited": 1, "crawl_paced": 4}}
+
+    page_fn = refresh.enrichment_page_fn(Held({"a.com": []}), None, None, {"a.com": "a.com"}, apply=False,
+                                         pacer=None)
+    results = asyncio.run(drive(["a.com"], page_fn, refresh.merge_enrichment, budget_s=60, gap_s=0.0))
+    assert results["a.com"].status == refresh.HELD
+
+
+# ── the pacer's "both slots or neither", and failing open ───────────────────────────────────────
+
+
+def test_a_shared_slot_further_out_than_the_lane_waits_holds_the_request_and_reserves_nothing(monkeypatch):
+    from services import crawl_politeness, shopify_edge_pacer
+
+    monkeypatch.setenv("CRAWL_SHOPIFY_EDGE_PACER_ENABLED", "true")
+    shopify_edge_pacer.reset_for_tests()
+
+    async def far_lease(bucket, *, slots, rate_per_s, horizon_s=None):
+        return 30.0, 0.0  # the shared schedule's next slot is 30 s out, inside the horizon
+
+    monkeypatch.setattr(shopify_edge_pacer, "_lease_fn", far_lease)
+    requested: List[str] = []
+    seeds = {"a.com": _mirror_seeds("a.com", 3)}
+    results, client = _real_backfill_pass(monkeypatch, seeds, lambda r: requested.append(r.url.host) or
+                                          httpx.Response(404), ["a.com"], page_size=10, max_wait=0.5)
+    assert requested == [] and client.not_sent == 3 and results["a.com"].status == refresh.HELD
+    state = crawl_politeness._STATE.get("a.com")
+    assert state is None or state.next_allowed <= time.monotonic(), "a refusal reserved the host slot"
+    assert shopify_edge_pacer.stats()["refused"] >= 3
+
+
+def test_when_the_shared_budget_is_unreachable_the_lane_is_paced_locally_and_still_reads(monkeypatch):
+    from services import shopify_edge_pacer
+
+    monkeypatch.setenv("CRAWL_SHOPIFY_EDGE_PACER_ENABLED", "true")
+    monkeypatch.setenv("CRAWL_SHOPIFY_EDGE_RPS", "20")
+    monkeypatch.setenv("CRAWL_SHOPIFY_EDGE_FALLBACK_RPS", "20")
+    shopify_edge_pacer.reset_for_tests()
+
+    async def down(bucket, *, slots, rate_per_s, horizon_s=None):
+        raise ConnectionError("db down")
+
+    monkeypatch.setattr(shopify_edge_pacer, "_lease_fn", down)
+    requested: List[str] = []
+    seeds = {"a.com": _mirror_seeds("a.com", 3)}
+    results, client = _real_backfill_pass(monkeypatch, seeds, lambda r: requested.append(r.url.host) or
+                                          httpx.Response(404), ["a.com"], page_size=10)
+    assert len(requested) == 3 and client.not_sent == 0 and results["a.com"].status == DONE
+    stats = shopify_edge_pacer.stats()
+    assert stats["db_errors"] >= 1 and stats["local_slots"] >= 3
+
+
+# ── robots: the mirror lane now honours Disallow ────────────────────────────────────────────────
+
+
+def test_a_robots_disallowed_mirror_request_is_not_sent_and_is_not_a_hold(monkeypatch):
+    from services import crawl_politeness
+
+    monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "true")
+    token = crawl_politeness.ROBOTS_TRANSPORT_FACTORY.set(lambda: httpx.MockTransport(
+        lambda request: httpx.Response(200, text="User-agent: *\nDisallow: /products/\n")))
+    requested: List[str] = []
+    try:
+        seeds = {"a.com": _mirror_seeds("a.com", 3)}
+        results, client = _real_backfill_pass(monkeypatch, seeds, lambda r: requested.append(r.url.host) or
+                                              httpx.Response(404), ["a.com"], page_size=10)
+    finally:
+        crawl_politeness.ROBOTS_TRANSPORT_FACTORY.reset(token)
+    assert requested == [] and client.robots_disallowed == 3 and client.not_sent == 0
+    assert results["a.com"].status == DONE, "a permanent refusal: walked, nothing to wait for"

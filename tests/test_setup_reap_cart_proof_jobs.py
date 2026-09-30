@@ -273,8 +273,8 @@ def test_a_failed_resume_fails_the_script(tmp_path):
 def test_the_env_is_exactly_the_gate_the_db_guardrails_the_plumbing_and_the_shared_pacer(tmp_path, flag, gate):
     """Nothing else: no REAP key (writing a proof needs none), no writer pacing override (the timeouts
     are sized from the writers' defaults), no second vantage. The shared Shopify-edge pacer (#2474) is
-    ON for both jobs whether dark or armed -- a dry run fetches exactly as hard -- with the smallest
-    lease (these lanes send ~1 request / 3 s; a lease of 10 would hold 5 s of the shared schedule)."""
+    ON for both jobs whether dark or armed -- a dry run fetches exactly as hard -- with its lease CAPPED
+    at 2 (leases are sized by demand; the cap bounds what one lane can hold of the shared schedule)."""
     _proc, calls = _run(tmp_path, "prod", TAG, *flag)
     for name in JOBS:
         job = _one(calls, "run", "jobs", "create", name)

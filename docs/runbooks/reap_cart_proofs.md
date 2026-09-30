@@ -81,12 +81,23 @@ so its writes commit page by page), inside a wall-clock budget, and prints one r
   back-off of that run**. This is what keeps healthy stores from being backed off under the
   2026-09-30 pattern -- a rate throttle that lets occasional 200s through, where each store sees a few
   429s among its answers: three such stores trip the breaker long before anyone is backed off.
+- **The breaker counts STORES, not hostnames** (a store's apex, `www.` twin and subdomains are one),
+  and a trip needs at least one of the three stores to be one this run had NOT already aborted: three
+  stores that each blocked us outright are three store-level blocks. A trip forgives only the
+  back-offs recorded **within the breaker window** (15 min) before it; an earlier, unrelated block
+  keeps its back-off.
+- **Held requests.** A request `crawl_politeness` does not release within 60 s (a Retry-After or
+  backoff hold, a Crawl-delay over the cap, the shared edge slot) is not sent and is counted. The page
+  stops its store as `held_by_politeness` (exit 4) WITHOUT advancing the cursor past it: the store is
+  neither `done` nor `aborted_on_block`, gets no back-off, and resumes before the held rows next run.
+  A request robots.txt disallows is also not sent, but that refusal is permanent: counted apart
+  (`robots_disallowed`) and not a hold.
 - Mirror: the client handed to the backfill classifies every answer with the backfill's own rules
   and, once the store has tripped or the breaker has, answers 429 locally without sending.
   Enrichment: the writer's `should_stop` is the breaker, so it stops asking the moment it trips.
 
 **Pacing: every request goes through `crawl_politeness` and the shared Shopify-edge pacer (#2474).**
-Both lanes wait for `crawl_politeness.await_slot` before every request: the host's own interval, any
+Both lanes wait for `crawl_politeness.before_request` before every request: robots.txt, the host's own interval, any
 Retry-After / backoff hold a previous answer armed, and (with `CRAWL_SHOPIFY_EDGE_PACER_ENABLED`,
 set on both jobs by the setup script) a slot of the ONE aggregate budget every crawl job on the
 crawl IP shares (default 2 req/s). Both lanes mark their hosts Shopify-served (every target is a Tier
@@ -141,7 +152,8 @@ and #2474 merged):
    wires #2474). The backend tag the jobs run must contain that PR: re-run the setup script with it.
 2. **Both lanes feed the shared pacer and the breaker.** They mark their hosts Shopify-served, learn
    from and report response headers, and the setup script sets `CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true`
-   (and `CRAWL_SHOPIFY_EDGE_LEASE=2`) on both jobs: check with `gcloud run jobs describe`.
+   (and `CRAWL_SHOPIFY_EDGE_LEASE=2`, a cap on the demand-sized lease) on both jobs: check with
+   `gcloud run jobs describe`.
 3. **The IP-throttle breaker is what stops a pass**, and a trip backs nothing off (this runbook,
    "Blocks").
 4. **The mirror budget is sized from the prod census** (PR body: 2,092 candidates over the 42 Tier B
@@ -230,6 +242,7 @@ Top level: `lane`, `mode` (`dry_run` / `apply`), `budget_s`, `elapsed_s`, `exit_
 |---|---|
 | `done` | walked to its end |
 | `aborted_on_block` | this store answered T consecutive 429/403/5xx/transport errors, or never answered cleanly at all; it is backed off (mirror 3 days, enrichment 1 day) and the pass moved on. With `ip_block: true`, the breaker tripped later in the same run and the back-off was forgiven |
+| `held_by_politeness` | crawl_politeness held one or more of this store's requests past 60 s: they were NOT sent, the store stopped there WITHOUT advancing its cursor past them, no back-off. `not_sent_by_politeness` counts them |
 | `ip_throttled` | the IP-throttle breaker tripped during (or right before) this store: **the whole pass stopped** here, nothing is backed off, and the store resumes from its cursor next run. The top-level `ip_throttle` block has the breaker's evidence (hosts, first/last 429, Retry-After and server histograms) |
 | `backed_off` | skipped: this store blocked us within its lane's back-off (`backed_off` at the top level lists until when) |
 | `crashed` | the writer raised; `error` says what; the next domain still ran. `crash_cursor_reset: true`: the second crash in a row at this cursor, which was reset |
