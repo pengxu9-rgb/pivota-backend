@@ -15,8 +15,8 @@ WHAT IT DOES:
     a denylist, so a cookie or an auth header can never reach a log line by construction.
   * `IpThrottleBreaker` counts DISTINCT hosts that answered 429 (or 503 with a Retry-After) inside
     a sliding window, and trips when `trip_hosts` of them do so within `window_seconds`. A tripped
-    breaker `blocks()` every host that has throttled us this run, and every host known to be
-    Shopify-served; a host that never throttles (ulta, theordinary on 09-30) carries on. It
+    breaker `blocks()` every host whose latest answer was a throttle, and every host known to be
+    Shopify-served; a host that answers (ulta, theordinary on 09-30) carries on. It
     changes WHETHER a caller asks, never how fast: pacing stays in `crawl_politeness`.
   * A Shopify-served count is kept beside the all-hosts one. It trips nothing; it is the evidence
     for which edge did it.
@@ -30,7 +30,8 @@ IP inside a minute is the signal whatever edge sends it; no healthy night comes 
 
 WHY `blocks()` INCLUDES EVERY THROTTLED HOST. 321 of the 332 hosts were first contacted after the
 trip point, so almost none could ever be learned as Shopify-served. Stopping a host after its first
-429 costs one request per host, not the four the per-host breaker needs.
+429 costs one request per host, not the four the per-host breaker needs. It is a host's LATEST
+answer that counts: one that 429'd early and has read fine since keeps being read.
 
 HOW IT IS FED. `crawl_politeness.note_response(..., headers=resp.headers)` is the one funnel every
 crawl lane already reports through, and it forwards each response here. A batch `install()`s a
@@ -191,9 +192,17 @@ class IpThrottleBreaker:
     ) -> None:
         self.trip_hosts = int(trip_hosts)
         window = float(window_seconds)
-        # A NaN window never prunes (every comparison is False); an explicit argument gets the
-        # same finite-or-default treatment as the env var.
-        self.window_seconds = max(0.0, window) if math.isfinite(window) else WINDOW_SECONDS_DEFAULT
+        # A NaN window never prunes (every comparison is False), and a window <= 0 prunes every
+        # host but the current one, which silently disables the trip. Neither is how to turn the
+        # breaker off; the kill switch (`enabled=False`, trip_hosts <= 0) is.
+        if not math.isfinite(window) or window <= 0:
+            logger.warning(
+                "crawl ip throttle: window %r is not a positive number of seconds; using the "
+                "default %.0fs (disable the breaker with its kill switch instead)",
+                window_seconds, WINDOW_SECONDS_DEFAULT,
+            )
+            window = WINDOW_SECONDS_DEFAULT
+        self.window_seconds = window
         self.enabled = bool(enabled) and self.trip_hosts > 0
         self.tripped = False
         self.tripped_at: Optional[str] = None
@@ -207,7 +216,10 @@ class IpThrottleBreaker:
         self.peak_shopify_hosts = 0
         self.peak_all_hosts = 0
         self.shopify_hosts: Set[str] = set()
+        # Every host that throttled us at any point this run (reported), and the hosts whose
+        # LATEST answer was a throttle (what `blocks()` holds back).
         self.throttled_hosts: Set[str] = set()
+        self.last_answer_throttled: Set[str] = set()
         self.throttled_shopify_hosts: Set[str] = set()
         # Diagnostics over every 429/503 seen, whether or not it counted toward a trip.
         self.responses = 0
@@ -247,6 +259,12 @@ class IpThrottleBreaker:
         shopify = looks_shopify_served(diag)
         if shopify:
             _remember(self.shopify_hosts, host)
+        if not is_ip_throttle_signal(status_code, diag):
+            # ANY OTHER ANSWER CLEARS IT. A host that 429'd once early and has read fine since
+            # is not part of the storm: on 09-30 ulta (392 of the run's 556 reads) had 429s too,
+            # and a sticky set would have held back every remaining ulta row after a trip.
+            # Shopify-ness stays sticky; it is a fact about the host, not about its last answer.
+            self.last_answer_throttled.discard(host)
         if status_code not in (429, 503):
             return
         self.responses += 1
@@ -264,6 +282,7 @@ class IpThrottleBreaker:
         self.first_throttle_at = self.first_throttle_at or wall
         self.last_throttle_at = wall
         _remember(self.throttled_hosts, host)
+        _remember(self.last_answer_throttled, host)
         now = _now()
         self._recent_all[host] = now
         self._prune(self._recent_all, now, self.window_seconds)
@@ -290,12 +309,13 @@ class IpThrottleBreaker:
             )
 
     def blocks(self, host: str) -> bool:
-        """Should the caller stop asking `host`? Only after a trip, and only a host that has
-        throttled us this run or is known to be Shopify-served (the edge that did it on 09-30)."""
+        """Should the caller stop asking `host`? Only after a trip, and only a host whose LATEST
+        answer was a throttle, or that is known to be Shopify-served (the edge that did it on
+        09-30)."""
         if not self.tripped:
             return False
         key = str(host or "").strip().lower()
-        return key in self.throttled_hosts or key in self.shopify_hosts
+        return key in self.last_answer_throttled or key in self.shopify_hosts
 
     def summary(self) -> Dict[str, Any]:
         def top(counter: Dict[str, int], n: int = 10) -> Dict[str, int]:

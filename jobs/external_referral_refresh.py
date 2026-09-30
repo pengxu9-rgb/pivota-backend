@@ -170,7 +170,10 @@ def main() -> int:
         "--ip-throttle-window-seconds",
         type=float,
         default=None,
-        help="The IP breaker's sliding window. Defaults to CRAWL_IP_THROTTLE_WINDOW_SECONDS, then 60.",
+        help=(
+            "The IP breaker's sliding window. Defaults to CRAWL_IP_THROTTLE_WINDOW_SECONDS, then 60. "
+            "A value <= 0 is invalid and falls back to 60; use --no-ip-throttle-breaker to disable."
+        ),
     )
     parser.add_argument(
         "--no-ip-throttle-breaker",

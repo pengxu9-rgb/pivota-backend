@@ -234,6 +234,41 @@ def test_the_markerless_storm_trips_with_four_workers(monkeypatch: pytest.Monkey
     assert len(stamped) + summary["skipped_for_ip_throttle"] == len(rows)
 
 
+def test_a_host_that_throttled_once_and_then_read_keeps_being_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The re-review's P2, its exact reproduction: ulta answers one 429, then reads 20 times, then
+    12 Shopify hosts storm and the breaker trips. ulta was 392 of 09-30's 556 reads; a sticky
+    "has throttled" set held back 100 of its 121 rows. It is the LATEST answer that counts."""
+    rows: List[Tuple[str, Answer]] = [("www.ulta.com", (429, PLAIN, None))]
+    rows += [("www.ulta.com", PLAIN_OK)] * 20
+    for i in range(12):
+        rows.append((f"s{i}.shop", THROTTLED))
+        rows.append(("www.ulta.com", PLAIN_OK))
+    rows += [("www.ulta.com", PLAIN_OK)] * 88
+    summary, stamped, seed_ids = _drive(monkeypatch, rows, concurrency=1)
+    called = _hosts_called(rows, stamped, seed_ids)
+    assert summary["ip_throttled"] is True
+    assert summary["ip_throttle_hosts"] == 13, "ulta's early 429 is still reported"
+    assert called["www.ulta.com"] == 121, "every ulta row is read after the trip"
+    assert "www.ulta.com" not in summary["ip_throttle_skips"]
+
+
+def test_a_host_whose_latest_answer_is_a_throttle_is_held_back() -> None:
+    """...and the converse: read, then 429, is blocked; 429, then read, is not."""
+    breaker = cit.IpThrottleBreaker(trip_hosts=2, window_seconds=60)
+    breaker.observe("a.example", 200, {})
+    breaker.observe("a.example", 429, {})
+    breaker.observe("b.example", 429, {})
+    breaker.observe("b.example", 200, {})
+    assert breaker.tripped
+    assert breaker.blocks("a.example") and not breaker.blocks("b.example")
+    breaker.observe("b.example", 503, {"retry-after": "30"})
+    assert breaker.blocks("b.example")
+    breaker.observe("b.example", 503, {})
+    assert not breaker.blocks("b.example"), "a bare 503 is an answer, not a throttle"
+
+
 def test_the_storm_trips_with_four_workers_too(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prod runs `--host-concurrency 4`. Order is no longer exact; the invariants are."""
     rows = _storm_rows(30)
@@ -466,8 +501,24 @@ def test_a_non_finite_env_falls_back_to_the_default(monkeypatch, caplog, raw) ->
     assert any("not a finite number" in r.getMessage() for r in caplog.records)
 
 
-def test_a_non_finite_window_argument_falls_back_to_the_default() -> None:
-    assert cit.IpThrottleBreaker(window_seconds=float("nan")).window_seconds == cit.WINDOW_SECONDS_DEFAULT
+@pytest.mark.parametrize("window", [float("nan"), float("inf"), 0.0, -5.0])
+def test_a_window_that_is_not_a_positive_number_falls_back_to_the_default(caplog, window) -> None:
+    """A window <= 0 used to be accepted and pruned every host but the current one, which
+    silently disabled the trip. The kill switch is the documented way to turn it off."""
+    caplog.set_level(logging.WARNING, logger="services.crawl_ip_throttle")
+    assert cit.IpThrottleBreaker(window_seconds=window).window_seconds == cit.WINDOW_SECONDS_DEFAULT
+    assert any("not a positive number" in r.getMessage() for r in caplog.records)
+
+
+def test_a_zero_window_from_the_cli_or_env_still_trips(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary, _, _ = _drive(monkeypatch, _markerless_storm_rows(20), concurrency=1,
+                           ip_throttle_window_seconds=0)
+    assert summary["ip_throttle_window_seconds"] == cit.WINDOW_SECONDS_DEFAULT
+    assert summary["ip_throttled"] is True
+    cp.reset_for_tests()
+    monkeypatch.setenv("CRAWL_IP_THROTTLE_WINDOW_SECONDS", "-1")
+    summary, _, _ = _drive(monkeypatch, _markerless_storm_rows(20), concurrency=1)
+    assert summary["ip_throttled"] is True
 
 
 def test_a_tripped_breaker_never_forgets_a_blocked_host(monkeypatch: pytest.MonkeyPatch) -> None:
