@@ -1708,6 +1708,9 @@ async def test_reuse_hold_and_fresh_attempt_on_postgres(reap):
     import db.reap_agentic_ledger as ledger
 
     _, old = await _a_waiting_on_a_link(reap)
+    # Reap's read ECHOES the session it created (link + expiry): a fresh `nextAction` would now be
+    # used over the stored link, so a fixed "+15 min" answer would make every read look live.
+    reap.get_enrollment = _echo_session()
 
     reap.calls.clear()
     reused = await _start()

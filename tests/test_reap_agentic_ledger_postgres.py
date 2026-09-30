@@ -1542,6 +1542,10 @@ async def test_a_blocked_activation_resolves_without_raising_at_the_caller():
     import db.reap_agentic_ledger as ledger
 
     mine = await ledger.upsert_pending_enrollment(buyer_ref="bref_race")
+    # TWO PENDING ROWS FOR ONE BUYER is what migration 252's index now refuses — and what a
+    # database that has not had 252 applied can still hold. `mark_enrollment_active` must keep
+    # surviving it there, so this test builds that database.
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
     await database.execute(
         "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status) "
         "VALUES ('re_theirs', 'bref_race', 'pending')"
@@ -1631,6 +1635,10 @@ async def test_same_buyer_two_targets_at_once_on_the_shared_database_leaves_one_
     import db.reap_agentic_ledger as ledger
 
     first = await ledger.upsert_pending_enrollment(buyer_ref="buyer_same")
+    # TWO PENDING ROWS FOR ONE BUYER is what migration 252's index now refuses — and what a
+    # database that has not had 252 applied can still hold. `mark_enrollment_active` must keep
+    # surviving it there, so this test builds that database.
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
     await database.execute(
         "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status) "
         "VALUES ('re_second', 'buyer_same', 'pending')"
