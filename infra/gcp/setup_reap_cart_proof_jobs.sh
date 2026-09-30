@@ -71,6 +71,8 @@
 #                                          ~1 request / 3 s, lease one slot at a time anyway; the cap
 #                                          bounds what either lane can ever hold of the SHARED
 #                                          schedule to 2 slots (~1 s at 2 req/s), even in a burst.
+#   CRAWL_SHOPIFY_EDGE_RPS is deliberately NOT set: every job on the crawl IP must use the SAME
+#   shared rate (#2474), so these jobs inherit the global default (pinned by a test).
 #
 # SCHEDULES AND TIMEOUTS (UTC). The crawl address's DAILY neighbours, each as its longest window
 # (task timeout x (max-retries + 1)):

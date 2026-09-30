@@ -535,3 +535,21 @@ def test_staging_targets_the_staging_project(tmp_path):
         assert _env_vars(job)["PIVOTA_ENV"] == "staging"
         trigger = _one(calls, "scheduler", "jobs", "create", "http", f"{name}-cron")
         assert "/namespaces/pivota-staging/" in _flag(trigger, "--uri")
+
+
+@pytest.mark.parametrize("flag", [(), ("--enable",), ("--disable",)])
+def test_the_shared_pacer_rate_is_left_unset_on_both_jobs(tmp_path, flag):
+    """#2474: every crawl job on the crawl IP MUST use the same CRAWL_SHOPIFY_EDGE_RPS, so these jobs
+    never set their own; they inherit the global default the pacer reads."""
+    from services import shopify_edge_pacer
+
+    proc, calls = _run(tmp_path, "prod", TAG, *flag)
+    assert proc.returncode == 0, proc.stderr
+    for name in JOBS:
+        job = _one(calls, "run", "jobs", "create", name)
+        env = _env_vars(job)
+        assert shopify_edge_pacer.RATE_ENV == "CRAWL_SHOPIFY_EDGE_RPS"
+        assert shopify_edge_pacer.RATE_ENV not in env, env
+        assert shopify_edge_pacer.FALLBACK_RATE_ENV not in env, env
+    code = "\n".join(line for line in SCRIPT.read_text().splitlines() if not line.lstrip().startswith("#"))
+    assert "CRAWL_SHOPIFY_EDGE_RPS" not in code

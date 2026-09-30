@@ -2071,3 +2071,26 @@ def test_the_pacer_learns_the_host_that_answered_after_a_redirect(monkeypatch):
     seeds = {"a.com": _mirror_seeds("a.com", 1)}
     _real_backfill_pass(monkeypatch, seeds, handler, ["a.com"], page_size=10)
     assert shopify_edge_pacer.is_shopify_host("store.shopcdn.example")
+
+
+def test_a_slow_shared_lease_counts_against_the_lanes_patience_and_the_request_is_held(monkeypatch):
+    """The merged pacer treats `max_wait` as a DEADLINE: time spent waiting for a lease refill counts
+    against it. A lease that takes 1 s against the lane's 0.5 s patience holds the request (not sent,
+    counted, the store `held_by_politeness`), and no host slot is reserved for it."""
+    from services import crawl_politeness, shopify_edge_pacer
+
+    monkeypatch.setenv("CRAWL_SHOPIFY_EDGE_PACER_ENABLED", "true")
+    shopify_edge_pacer.reset_for_tests()
+
+    async def slow_lease(bucket, *, slots, rate_per_s, horizon_s=None):
+        await asyncio.sleep(1.0)
+        return 0.0, 0.0
+
+    monkeypatch.setattr(shopify_edge_pacer, "_lease_fn", slow_lease)
+    requested: List[str] = []
+    seeds = {"a.com": _mirror_seeds("a.com", 1)}
+    results, client = _real_backfill_pass(monkeypatch, seeds, lambda r: requested.append(r.url.host) or
+                                          httpx.Response(404), ["a.com"], page_size=10, max_wait=0.5)
+    assert requested == [] and client.not_sent == 1 and results["a.com"].status == refresh.HELD
+    state = crawl_politeness._STATE.get("a.com")
+    assert state is None or state.next_allowed <= time.monotonic(), "a refused request reserved the host slot"

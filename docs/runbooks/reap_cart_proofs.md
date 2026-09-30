@@ -153,7 +153,8 @@ and #2474 merged):
 2. **Both lanes feed the shared pacer and the breaker.** They mark their hosts Shopify-served, learn
    from and report response headers, and the setup script sets `CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true`
    (and `CRAWL_SHOPIFY_EDGE_LEASE=2`, a cap on the demand-sized lease) on both jobs: check with
-   `gcloud run jobs describe`.
+   `gcloud run jobs describe`. `CRAWL_SHOPIFY_EDGE_RPS` must NOT be set on them: every crawl job shares
+   one rate (#2474), the global default.
 3. **The IP-throttle breaker is what stops a pass**, and a trip backs nothing off (this runbook,
    "Blocks").
 4. **The mirror budget is sized from the prod census** (PR body: 2,092 candidates over the 42 Tier B
