@@ -41,7 +41,7 @@ an environment where no apply has run reads "no cursors" and writes nothing); th
 table likewise appears on its first writer apply (or its reader's first flag-on request).
 
 The entry point owns no proof logic. It walks each domain page by page by calling the writer's
-own entry point on the writer's own cursor (mirror: `run(limit=50)`; enrichment: `run_domain(limit=250)`,
+own entry point on the writer's own cursor (mirror: `run(limit=25)`; enrichment: `run_domain(limit=250)`,
 so its writes commit page by page), inside a wall-clock budget, and prints one report line.
 
 **Order and resume.**
@@ -86,12 +86,25 @@ so its writes commit page by page), inside a wall-clock budget, and prints one r
   stores that each blocked us outright are three store-level blocks. A trip forgives only the
   back-offs recorded **within the breaker window** (15 min) before it; an earlier, unrelated block
   keeps its back-off.
+- **A second run-level stop for blocks that are not 429s.** 403s, 5xx and transport errors
+  (connection resets, timeouts) never trip the throttle breaker, yet an IP-level block looks exactly
+  like that (the 2026-08-21 shape; the 2026-09-28 NAT drops). A second, store-keyed breaker counts
+  those, with the same rule (3 distinct stores in 15 min, at least one not already aborted). Its
+  trip also stops the pass without backing off stores and forgives back-offs within its window
+  (`block_breaker` in the report). One store that genuinely 403s everything is aborted and backed
+  off on its own; the same answer from store after store stops the pass.
+- **Redirects are followed one hop at a time**, each hop gated, paced and reported like the first
+  request (at most 3 hops, https only, the same storefront only), with ONE patience deadline for
+  the whole request.
 - **Held requests.** A request `crawl_politeness` does not release within 60 s (a Retry-After or
   backoff hold, a Crawl-delay over the cap, the shared edge slot) is not sent and is counted. The page
   stops its store as `held_by_politeness` (exit 4) WITHOUT advancing the cursor past it: the store is
   neither `done` nor `aborted_on_block`, gets no back-off, and resumes before the held rows next run.
-  A request robots.txt disallows is also not sent, but that refusal is permanent: counted apart
-  (`robots_disallowed`) and not a hold.
+  A request robots.txt disallows, or one to a host whose Crawl-delay is over the cap, is also not
+  sent, but that refusal is permanent: counted apart (`robots_disallowed`, `crawl_delay_too_long`),
+  not a hold -- the store advances past it. In the backfill's own report a held request shows as
+  `http_425` and a permanent refusal as `http_451` (local answers, never sent, never counted as a
+  block).
 - Mirror: the client handed to the backfill classifies every answer with the backfill's own rules
   and, once the store has tripped or the breaker has, answers 429 locally without sending.
   Enrichment: the writer's `should_stop` is the breaker, so it stops asking the moment it trips.
@@ -231,7 +244,7 @@ If the task timeout's SIGTERM arrives, the job prints the REPORT line with what 
 (`"terminated": "SIGTERM"`, the store in flight `terminated`) BEFORE it lets go of the database, and
 exits non-zero (4, or 1/3 if those apply) even if nothing had finished. Every page already
 checkpointed stays checkpointed; the in-flight page is lost and redone next run. **What that page
-costs, in requests:** mirror, at most 50 seeds (50 `.js` requests, ~2.5 min at 3 s). Enrichment is
+costs, in requests:** mirror, at most 25 seeds (25 `.js` requests plus their redirect hops, ~1.5 min at 3 s). Enrichment is
 250 PRODUCTS, but a product can hold many storefront handles: MAC's first 250 products are ~1,600
 handles (the folded shades), which in the `.js` fallback is ~1,600 requests, **~80 minutes**, of
 work thrown away (in normal `auto` listing mode it is a few listing pages).

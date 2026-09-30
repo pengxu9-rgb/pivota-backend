@@ -59,7 +59,7 @@ THE EGRESS. Both writers fetch merchant storefronts, so this runs ONLY on the cr
 A container cannot see its own subnet, so `--on-crawl-egress` is REQUIRED (the enrichment writer's
 own rule, applied to both lanes): without it this exits 2 before touching the database or the net.
 
-PAGES AND PACING. Mirror: `backfill.run(limit=50)` per page. Enrichment: the writer's `run_domain`
+PAGES AND PACING. Mirror: `backfill.run(limit=25)` per page. Enrichment: the writer's `run_domain`
 with `limit=250` products per page, so its writes (made at the end of each call) commit page by page
 and the budget can stop between pages of one store. Inside a page the writer paces itself. Between
 pages this module waits `inter_call_gap_s()`, the writer's own slowest spacing, because a mirror call
@@ -89,6 +89,10 @@ BLOCKS, AND THE IP BREAKER.
     during an IP-level throttle -- including the 2026-09-30 pattern, a rate throttle that lets
     occasional 200s through -- a store that "blocked us" was the address's problem, not the store's.
     A store that blocked us well before the throttle keeps its back-off.
+  * THE OTHER BLOCK SHAPES: 403s, 5xx and transport errors never trip #2473's breaker (it counts
+    429 / 503 + Retry-After only), yet an IP-level block looks like that too (the 2026-08-21 shape,
+    the 2026-09-28 NAT drops). `StoreBlockBreaker`, store-keyed with the same rule, counts them; its
+    trip stops the pass exactly like the throttle breaker's (`LaneBreaker` holds both).
   * HELD ROWS: a request crawl_politeness does not release in time (a Retry-After / backoff hold, a
     Crawl-delay over the cap, the shared edge slot) is not sent and is COUNTED. A page with any held
     request stops its store WITHOUT advancing the cursor past it (`held_by_politeness`, exit 4): the
@@ -152,6 +156,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -178,7 +183,7 @@ ENRICHMENT_DOMAINS = (
 
 #: Mirror candidates per writer call. The writer's own default is 100; 50 halves the worst case of
 #: the one page the budget cannot stop (see the setup script's task timeout).
-MIRROR_PAGE_SIZE = 50
+MIRROR_PAGE_SIZE = 25
 #: Enrichment products per writer call (the writer's default is 2,000). The writer writes at the end of
 #: each call, so this is also the most work a SIGTERM can cost.
 ENRICHMENT_PAGE_PRODUCTS = 250
@@ -204,6 +209,15 @@ LANE_IP_TRIP_WINDOW_S = 900.0
 #: Crawl-delay, the shared Shopify-edge slot). Longer, and the request is not sent. The enrichment writer's
 #: own `ENRICHMENT_PROOF_MAX_POLITE_WAIT_S` has the same default.
 MIRROR_MAX_POLITE_WAIT_S = 60.0
+#: Redirect hops the mirror client follows BY HAND (each one gated, paced and reported); the backfill's
+#: own `follow_redirects=True` is overridden, because httpx would follow hops nothing gates.
+MIRROR_MAX_REDIRECTS = 3
+#: Synthetic statuses of the mirror client's LOCAL answers, so the backfill's report names them
+#: (`http_425`, `http_451`) instead of folding them into `not_json` / `most_blocked_domains`. Neither
+#: is in the backfill's BLOCK_OUTCOMES; the backfill writes nothing for either.
+LOCAL_HELD_STATUS = 425        # crawl_politeness held the request past our patience: not sent, retried
+LOCAL_REFUSED_STATUS = 451     # robots.txt Disallow or a Crawl-delay over the cap: permanent, not sent
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 #: Crashes at the same resume cursor, in consecutive runs, before that cursor is reset to NULL.
 CRASH_RESET_AFTER = 2
 
@@ -636,6 +650,89 @@ def store_breaker(stores: Sequence[str], *, is_aborted: Callable[[str], bool]) -
     return StoreThrottleBreaker(trip_hosts=LANE_IP_TRIP_HOSTS, window_seconds=LANE_IP_TRIP_WINDOW_S, enabled=True)
 
 
+class StoreBlockBreaker:
+    """The run-level stop for block shapes that are NOT a throttle: 403s, 5xx, challenge-less refusals
+    and transport errors (connection resets, timeouts). #2473's breaker counts only 429 / 503 +
+    Retry-After, but an IP-level block also looks like the 2026-08-21 shape (403s interleaved with
+    resets; scripts/backfill_shopify_variant_ids.py) or the 2026-09-28 NAT drops. Same rule as the
+    throttle breaker: `LANE_IP_TRIP_HOSTS` distinct STORES within `LANE_IP_TRIP_WINDOW_S`, at least one
+    of them not already aborted this run -- so one store that genuinely 403s everything is aborted and
+    backed off on its own, while the same answer from store after store stops the pass."""
+
+    def __init__(self, store_of: Callable[[str], str], *, is_aborted: Callable[[str], bool],
+                 trip_stores: int = LANE_IP_TRIP_HOSTS, window_s: float = LANE_IP_TRIP_WINDOW_S,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._store_of = store_of
+        self._is_aborted = is_aborted
+        self.trip_stores = int(trip_stores)
+        self.window_s = float(window_s)
+        self._clock = clock
+        self._recent: Dict[str, float] = {}
+        self.tripped = False
+        self.tripped_at: Optional[str] = None
+        self.trip_store_count = 0
+        self.blocks = 0
+        self.by_outcome: Dict[str, int] = {}
+
+    def observe_block(self, host: str, outcome: str) -> None:
+        store = self._store_of(host)
+        if not store:
+            return
+        self.blocks += 1
+        key = outcome if outcome in self.by_outcome or len(self.by_outcome) < 16 else "other"
+        self.by_outcome[key] = self.by_outcome.get(key, 0) + 1
+        now = self._clock()
+        self._recent[store] = now
+        for other in [s for s, t in self._recent.items() if now - t > self.window_s]:
+            del self._recent[other]
+        if self.tripped:
+            return
+        window = set(self._recent)
+        if len(window) >= self.trip_stores and any(not self._is_aborted(s) for s in window):
+            self.tripped = True
+            self.tripped_at = datetime.now(timezone.utc).isoformat()
+            self.trip_store_count = len(window)
+            logger.warning("reap cart proof refresh: %d distinct stores answered block-shaped (non-429) "
+                           "within %.0fs (not all already blocked this run); the crawl IP is blocked",
+                           len(window), self.window_s)
+
+    def summary(self) -> Dict[str, Any]:
+        return {"block_breaker_tripped": self.tripped, "tripped_at": self.tripped_at,
+                "trip_store_count": self.trip_store_count, "blocks": self.blocks,
+                "by_outcome": dict(self.by_outcome)}
+
+
+class LaneBreaker:
+    """Both run-level stops for a lane: `throttle` (#2473's breaker, store-keyed: 429 / 503 +
+    Retry-After, fed through `crawl_politeness.note_response`) and `blocks` (`StoreBlockBreaker`: every
+    other block shape, fed by the lanes). Either one tripping stops the pass WITHOUT backing off stores
+    and forgives the back-offs recorded within the window. Installable with
+    `crawl_ip_throttle.installed()` (it forwards `observe` to the throttle breaker)."""
+
+    def __init__(self, stores: Sequence[str], *, is_aborted: Callable[[str], bool]) -> None:
+        self.throttle = store_breaker(stores, is_aborted=is_aborted)
+        self.blocks = StoreBlockBreaker(self.throttle.store_of, is_aborted=is_aborted)
+
+    @property
+    def tripped(self) -> bool:
+        return bool(self.throttle.tripped or self.blocks.tripped)
+
+    def store_of(self, host: str) -> str:
+        return self.throttle.store_of(host)
+
+    def observe(self, host: str, status_code: int, diag: Mapping[str, str]) -> None:
+        self.throttle.observe(host, status_code, diag)
+
+    def observe_block(self, host: str, outcome: str) -> None:
+        """A block-shaped answer. A 429 is the throttle breaker's (fed with its headers elsewhere)."""
+        if outcome != "rate_limited":
+            self.blocks.observe_block(host, outcome)
+
+
+def lane_breaker(stores: Sequence[str], *, is_aborted: Callable[[str], bool]) -> LaneBreaker:
+    return LaneBreaker(stores, is_aborted=is_aborted)
+
+
 class BlockStreakClient:
     """The client handed to the backfill. For every GET the backfill makes it
 
@@ -669,6 +766,7 @@ class BlockStreakClient:
         self.short_circuited = 0
         self.not_sent = 0
         self.robots_disallowed = 0
+        self.crawl_delay_too_long = 0
         self.store_blocks = 0
         self.store_clean = 0
         self.store_not_sent = 0
@@ -687,40 +785,70 @@ class BlockStreakClient:
     def ip_tripped(self) -> bool:
         return bool(getattr(self.breaker, "tripped", False))
 
+    def _local(self, url: str, status: int, why: str) -> Any:
+        return httpx.Response(status, headers={"content-type": "text/plain"}, text=f"not sent: {why}",
+                              request=httpx.Request("GET", url))
+
     async def get(self, url: str, **kwargs: Any) -> Any:
         if self.store_tripped or self.ip_tripped:
             self.short_circuited += 1
             return httpx.Response(429, request=httpx.Request("GET", url))
         from services import crawl_politeness, shopify_edge_pacer
+        from services.curated_brand_feed import _same_storefront_host
 
-        shopify_edge_pacer.mark_shopify_host(url)
         user_agent = str(getattr(self._backfill, "USER_AGENT", "") or "")
-        try:
-            await crawl_politeness.before_request(url, user_agent=user_agent, max_wait=self.max_wait)
-        except crawl_politeness.RobotsDisallowed:
-            self.robots_disallowed += 1
-            return httpx.Response(200, headers={"content-type": "text/plain"}, text="not sent: robots",
-                                  request=httpx.Request("GET", url))
-        except crawl_politeness.CrawlPaced as exc:  # CrawlDelayTooLong and EdgePaced included
-            self.not_sent += 1
-            self.store_not_sent += 1
-            return httpx.Response(200, headers={"content-type": "text/plain"},
-                                  text=f"not sent: {type(exc).__name__}", request=httpx.Request("GET", url))
-        try:
-            result: Any = await self._client.get(url, **kwargs)
-        except Exception as exc:  # noqa: BLE001 - re-raised below, after it is counted
-            result = exc
-        if not isinstance(result, Exception):
+        # Hops are followed HERE, one by one, each gated, paced and reported like the first request;
+        # httpx following them would send requests nothing gates (#2476 review P1-2).
+        kwargs = {**kwargs, "follow_redirects": False}
+        requested_host = urlsplit(url).hostname or ""
+        # The lane's patience is a DEADLINE for the whole request, hops included.
+        deadline = time.monotonic() + self.max_wait
+        current = url
+        result: Any = None
+        for _hop in range(MIRROR_MAX_REDIRECTS + 1):
+            shopify_edge_pacer.mark_shopify_host(current)
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise crawl_politeness.CrawlPaced("the request's patience ran out between hops")
+                await crawl_politeness.before_request(current, user_agent=user_agent, max_wait=remaining)
+            except crawl_politeness.RobotsDisallowed:
+                self.robots_disallowed += 1
+                return self._local(current, LOCAL_REFUSED_STATUS, "robots")
+            except crawl_politeness.CrawlDelayTooLong:
+                # The host asks for a Crawl-delay over the cap: permanent for this run, not a hold.
+                self.crawl_delay_too_long += 1
+                return self._local(current, LOCAL_REFUSED_STATUS, "crawl-delay")
+            except crawl_politeness.CrawlPaced as exc:  # EdgePaced included
+                self.not_sent += 1
+                self.store_not_sent += 1
+                return self._local(current, LOCAL_HELD_STATUS, type(exc).__name__)
+            try:
+                result = await self._client.get(current, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - re-raised below, after it is counted
+                result = exc
+                break
             headers = getattr(result, "headers", None)
             crawl_politeness.note_response(
-                url, result.status_code,
+                current, result.status_code,
                 retry_after=headers.get("retry-after") if headers is not None else None, headers=headers)
-            # Keyed by the host that ANSWERED: the backfill follows redirects.
-            shopify_edge_pacer.learn_from_response(str(getattr(result, "url", "") or url), headers)
+            shopify_edge_pacer.learn_from_response(current, headers)
+            if result.status_code not in _REDIRECT_STATUSES:
+                break
+            location = headers.get("location") if headers is not None else None
+            if not location:
+                break
+            nxt = urlsplit(urljoin(current, location))
+            if nxt.scheme != "https" or not _same_storefront_host(requested_host, nxt.hostname or ""):
+                break  # off this storefront or off https: never requested; the backfill reads the 3xx
+            current = nxt.geturl()
         _payload, outcome = await self._backfill.fetch_product_js(_Replay(result), url)
         if self._backfill._is_block(outcome):
             self.state["store"] += 1
             self.store_blocks += 1
+            observe = getattr(self.breaker, "observe_block", None)
+            if observe is not None:
+                observe(requested_host, outcome)
         elif outcome != "not_json":
             self.state["store"] = 0
             self.store_clean += 1
@@ -780,9 +908,9 @@ def mirror_page_fn(backfill: Any, client: Any, *, apply: bool, page_size: int = 
     return run_page
 
 
-#: The enrichment writer's fetch outcomes for a request crawl_politeness did not release. Its
-#: `robots_disallowed` is permanent, not a hold, and is not here.
-ENRICHMENT_HELD_OUTCOMES = ("crawl_paced", "crawl_delay_too_long")
+#: The enrichment writer's fetch outcome for a request crawl_politeness held past its patience. Its
+#: `robots_disallowed` and `crawl_delay_too_long` are permanent refusals, not holds, and are not here.
+ENRICHMENT_HELD_OUTCOMES = ("crawl_paced",)
 
 
 def enrichment_page_fn(job: Any, db: Any, client: Any, plans: Mapping[str, Any], *, apply: bool, pacer: Any,
@@ -798,9 +926,15 @@ def enrichment_page_fn(job: Any, db: Any, client: Any, plans: Mapping[str, Any],
     async def run_page(domain: str, after: Optional[str]) -> Page:
         limit = job.abort_after_blocks()
         streak = per_store.setdefault(domain, ObservedStreak())
+        def on_block(outcome: str) -> None:
+            observe = getattr(breaker, "observe_block", None)
+            if observe is not None:
+                observe(domain, outcome)
+
         report = await job.run_domain(db, client, plans[domain], apply=apply, source_mode="auto",
                                       limit=page_products, after=after, pacer=pacer,
-                                      block_limit=limit, block_state=streak, should_stop=ip_tripped)
+                                      block_limit=limit, block_state=streak, should_stop=ip_tripped,
+                                      on_block=on_block)
         exhausted = bool(report.get("exhausted"))
         fetches = report.get("fetches") or {}
         # Requests crawl_politeness did not release (a hold, a Crawl-delay over the cap): not asked.
@@ -905,7 +1039,7 @@ async def run_lane(plan: LanePlan, *, apply: bool, budget_s: float, emit: Callab
             result = state.results.get(store)
             return result is not None and result.status == ABORTED
 
-        breaker = store_breaker(plan.domains, is_aborted=already_blocked)
+        breaker = lane_breaker(plan.domains, is_aborted=already_blocked)
         kwargs["stop_signal"] = lambda: breaker.tripped
         kwargs["forgive_window_s"] = LANE_IP_TRIP_WINDOW_S
         try:
@@ -920,6 +1054,7 @@ async def run_lane(plan: LanePlan, *, apply: bool, budget_s: float, emit: Callab
                             info["block_streak_short_circuited"] = client.short_circuited
                             info["not_sent_by_politeness"] = client.not_sent
                             info["robots_disallowed"] = client.robots_disallowed
+                            info["crawl_delay_too_long"] = client.crawl_delay_too_long
                 else:
                     job = plan.writer
                     if apply and not await plan.ensure_proof_table():
@@ -934,7 +1069,8 @@ async def run_lane(plan: LanePlan, *, apply: bool, budget_s: float, emit: Callab
                         finally:
                             info["requests"] = pacer.requests
         finally:
-            info["ip_throttle"] = breaker.summary()
+            info["ip_throttle"] = breaker.throttle.summary()
+            info["block_breaker"] = breaker.blocks.summary()
             info["shopify_edge_pacer"] = shopify_edge_pacer.stats()
     finally:
         # A SIGTERM lands here first: print the partial report while the process is still ours and

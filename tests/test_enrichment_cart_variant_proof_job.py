@@ -1743,3 +1743,65 @@ async def test_every_request_is_marked_shopify_and_takes_a_shared_edge_slot(monk
         assert shopify_edge_pacer.stats()["granted"] == 3 and leases
     finally:
         shopify_edge_pacer.reset_for_tests()
+
+
+async def test_a_www_hop_takes_one_shared_edge_slot_not_two(monkeypatch):
+    """#2476 review: the gate is asked for the URL actually requested only. An apex 301 -> www fetch
+    is two requests and takes two shared slots (one per hop), not three."""
+    from services import shopify_edge_pacer
+
+    monkeypatch.setenv("CRAWL_SHOPIFY_EDGE_PACER_ENABLED", "true")
+    shopify_edge_pacer.reset_for_tests()
+
+    async def lease(bucket, *, slots, rate_per_s, horizon_s=None):
+        return 0.0, 0.0
+
+    monkeypatch.setattr(shopify_edge_pacer, "_lease_fn", lease)
+    try:
+        store = Store()
+        store.routes[("brand.ecvpjob.test", "/products/h.js")] = ("redirect", "https://www.brand.ecvpjob.test")
+        store.routes[("www.brand.ecvpjob.test", "/products/h.js")] = (404, None, [])
+        async with store.client() as client:
+            await job.fetch_json(client, "https://brand.ecvpjob.test/products/h.js",
+                                 requested_host="brand.ecvpjob.test", pacer=NoSleepPacer(), now=_tick())
+        assert len(store.requests) == 2
+        assert shopify_edge_pacer.stats()["granted"] == 2
+    finally:
+        shopify_edge_pacer.reset_for_tests()
+
+
+async def test_the_runs_own_pacer_waits_before_the_gate_reserves_a_slot(monkeypatch):
+    from services import crawl_politeness
+
+    order: List[str] = []
+
+    class RecordingPacer(NoSleepPacer):
+        async def wait(self):
+            order.append("pacer")
+            await super().wait()
+
+    real = crawl_politeness.before_request
+
+    async def gate(url, **kw):
+        order.append("gate")
+        return await real(url, **kw)
+
+    monkeypatch.setattr(crawl_politeness, "before_request", gate)
+    store = Store()
+    store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush")
+    async with store.client() as client:
+        await job.fetch_json(client, job.product_js_url(TARTE_HOST, "amazonian-clay-baked-blush", "US"),
+                             requested_host=TARTE_HOST, pacer=RecordingPacer(), now=_tick())
+    assert order == ["pacer", "gate"]
+
+
+async def test_on_block_hears_every_block_shaped_answer(job_db):
+    await insert_rows(job_db, RUN_TARTE)
+    store = Store()
+    store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush", status=403)
+    heard: List[str] = []
+    async with store.client() as client:
+        await job.run_domain(job_db, client, TARTE_PLAN, apply=False, source_mode=SOURCE_PRODUCTS_JS,
+                             limit=job.DEFAULT_LIMIT, after=None, pacer=NoSleepPacer(), block_limit=5,
+                             block_state={"consecutive": 0}, now=_tick(), on_block=heard.append)
+    assert heard == ["http_403"]

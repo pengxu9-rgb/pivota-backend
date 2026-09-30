@@ -377,8 +377,10 @@ def test_the_mirror_timeout_covers_the_budget_plus_one_page(tmp_path):
     timeout, budget, _ = _job_numbers(calls, "reap-cart-proof-mirror")
     # With the politeness gate in front of every request, a request can wait up to
     # MIRROR_MAX_POLITE_WAIT_S before it is sent (or given up), then take the request timeout.
+    # Every hop the client follows by hand (up to MIRROR_MAX_REDIRECTS) can take a request timeout; the
+    # polite wait is ONE deadline for the whole request, hops and lease refills included.
     one_page = refresh.MIRROR_PAGE_SIZE * (backfill.PER_DOMAIN_MIN_GAP_S + refresh.MIRROR_MAX_POLITE_WAIT_S
-                                           + backfill.REQUEST_TIMEOUT_S)
+                                           + (refresh.MIRROR_MAX_REDIRECTS + 1) * backfill.REQUEST_TIMEOUT_S)
     assert timeout >= budget + one_page, (timeout, budget, one_page)
 
 

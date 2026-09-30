@@ -421,7 +421,8 @@ class FakeBackfill:
 
 @pytest.mark.parametrize("apply", [False, True])
 def test_the_mirror_page_calls_the_backfill_for_one_domain_with_the_gate(apply):
-    backfill = FakeBackfill([{"candidates": 50, "next_cursor": "epsv_9", "aborted_on_block": False}])
+    backfill = FakeBackfill([{"candidates": refresh.MIRROR_PAGE_SIZE, "next_cursor": "epsv_9",
+                              "aborted_on_block": False}])
     client = object()
     page = asyncio.run(refresh.mirror_page_fn(backfill, client, apply=apply)("anua.us", "epsv_1"))
     assert backfill.calls == [{"limit": refresh.MIRROR_PAGE_SIZE, "domain": "anua.us", "apply": apply,
@@ -430,10 +431,12 @@ def test_the_mirror_page_calls_the_backfill_for_one_domain_with_the_gate(apply):
 
 
 def test_a_short_mirror_page_ends_the_domain_and_an_aborted_one_stops():
-    short = FakeBackfill([{"candidates": 49, "next_cursor": "epsv_9", "aborted_on_block": False}])
+    short = FakeBackfill([{"candidates": refresh.MIRROR_PAGE_SIZE - 1, "next_cursor": "epsv_9",
+                           "aborted_on_block": False}])
     page = asyncio.run(refresh.mirror_page_fn(short, None, apply=False)("anua.us", None))
     assert page.next_cursor is None and not page.aborted
-    blocked = FakeBackfill([{"candidates": 50, "next_cursor": "epsv_9", "aborted_on_block": True}])
+    blocked = FakeBackfill([{"candidates": refresh.MIRROR_PAGE_SIZE, "next_cursor": "epsv_9",
+                             "aborted_on_block": True}])
     page = asyncio.run(refresh.mirror_page_fn(blocked, None, apply=False)("anua.us", None))
     assert page.aborted and page.next_cursor is None
 
@@ -460,6 +463,10 @@ def test_the_enrichment_page_calls_the_writer_for_one_plan_with_the_shared_pacer
 
     class Breaker:
         tripped = False
+        seen: List[tuple] = []
+
+        def observe_block(self, host, outcome):
+            self.seen.append((host, outcome))
 
     breaker = Breaker()
     page = asyncio.run(refresh.enrichment_page_fn(job, db, client, plans, apply=apply, pacer=pacer,
@@ -467,6 +474,9 @@ def test_the_enrichment_page_calls_the_writer_for_one_plan_with_the_shared_pacer
     (call,) = job.calls
     streak = call[3].pop("block_state")
     should_stop = call[3].pop("should_stop")
+    on_block = call[3].pop("on_block")
+    on_block("http_403")
+    assert breaker.seen == [("tartecosmetics.com", "http_403")], "the writer's blocks feed the block breaker"
     assert call == (db, client, "PLAN-T", {
         "apply": apply, "source_mode": "auto", "limit": refresh.ENRICHMENT_PAGE_PRODUCTS, "after": "ext:k1",
         "pacer": pacer, "block_limit": 5})
@@ -1044,7 +1054,7 @@ def _real_backfill_pass(monkeypatch, seeds_by_domain, handler, domains, page_siz
     monkeypatch.setattr(backfill, "GLOBAL_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(backfill, "PER_DOMAIN_MIN_GAP_S", 0.0)
     results: Dict[str, DomainResult] = {}
-    ip = (refresh.store_breaker(domains, is_aborted=lambda s: s in results and results[s].status == ABORTED)
+    ip = (refresh.lane_breaker(domains, is_aborted=lambda s: s in results and results[s].status == ABORTED)
           if breaker else None)
 
     async def go():
@@ -1668,7 +1678,10 @@ def test_a_retry_after_holds_the_mirror_lanes_next_request_and_it_is_not_sent(mo
     results, client = _real_backfill_pass(monkeypatch, seeds, handler, ["a.com"], page_size=10, max_wait=0.5)
     assert requested == ["a.com"]
     assert client.not_sent == 4 and client.store_not_sent == 4
-    assert results["a.com"].writer["fetch_outcomes"] == {"rate_limited": 1, "not_json": 4}
+    # Held requests are answered locally with LOCAL_HELD_STATUS: the backfill names them http_425, not
+    # not_json, and does not count them into most_blocked_domains.
+    assert results["a.com"].writer["fetch_outcomes"] == {"rate_limited": 1, "http_425": 4}
+    assert results["a.com"].writer["most_blocked_domains"] == {"a.com": 1}
     # B2(a): one real 429 and four HELD requests is not "had a block, no clean answer": the store was
     # not refused, it was not asked. Held: no back-off, no completion, the cursor stays where it was.
     assert results["a.com"].status == refresh.HELD
@@ -2065,12 +2078,12 @@ def test_the_pacer_learns_the_host_that_answered_after_a_redirect(monkeypatch):
 
     def handler(request):
         if request.url.host == "a.com":
-            return httpx.Response(301, headers={"location": "https://store.shopcdn.example/products/h0.js"})
+            return httpx.Response(301, headers={"location": "https://www.a.com/products/h0.js"})
         return httpx.Response(404, headers={"x-shopid": "7"})
 
     seeds = {"a.com": _mirror_seeds("a.com", 1)}
     _real_backfill_pass(monkeypatch, seeds, handler, ["a.com"], page_size=10)
-    assert shopify_edge_pacer.is_shopify_host("store.shopcdn.example")
+    assert shopify_edge_pacer.is_shopify_host("www.a.com")
 
 
 def test_a_slow_shared_lease_counts_against_the_lanes_patience_and_the_request_is_held(monkeypatch):

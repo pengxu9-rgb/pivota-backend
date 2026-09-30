@@ -107,17 +107,23 @@
 #     MEASURED (prod census, read-only, 2026-09-30, the backfill's own eligibility SQL): 2,092
 #     candidate seeds over the 42 Tier B domains (34 with any; fentybeauty.com 724, paulmitchell.com
 #     243, mixsoon.us 197, tonymoly.us 185, then <= 73 each; 0 hold a proof today). One .js per
-#     candidate at 3.0 s per store (stores are walked one at a time) is 6,276 s, plus ~70 writer
-#     calls x the 3 s inter-call gap = ~6,500 s. THE SHARED 2 req/s DOES NOT LENGTHEN IT: this lane
+#     candidate at 3.0 s per store (stores are walked one at a time) is 6,276 s, plus ~125 writer
+#     calls (25 candidates a page) x the 3 s inter-call gap = ~6,650 s. THE SHARED 2 req/s DOES NOT LENGTHEN IT: this lane
 #     sends 0.33 req/s, under even the pacer's fail-open local rate (a quarter of 2 = 0.5 req/s), and
 #     between 10:13 and 14:23 only the hourly purchasability sweep (1.5 s pacing, 0.67 req/s) shares
-#     the edge budget: 1.0 req/s of 2. The 10,800 s budget is 1.66x the measured need, which also
+#     the edge budget: 1.0 req/s of 2. The 10,800 s budget is 1.62x the measured need, which also
 #     absorbs an average edge wait of up to ~2 s per request. If the budget cuts the pass (exit 4),
 #     the cut store resumes from its stored cursor, stalest stores first; exit 4 on consecutive days
 #     means raise the budget and the task timeout here.
-#     The extra 4,200 s is one 50-candidate page the budget cannot stop, now with the politeness
-#     gate in front of every request: 50 x (3 s pacing + up to 60 s waiting for crawl_politeness,
-#     MIRROR_MAX_POLITE_WAIT_S, + a 20 s request timeout) = 4,150 s at worst.
+#     The extra 4,200 s is one 25-candidate page the budget cannot stop, with the politeness gate
+#     in front of every request AND every redirect hop: 25 x (3 s pacing + up to 60 s waiting for
+#     crawl_politeness -- ONE deadline for the whole request, MIRROR_MAX_POLITE_WAIT_S, which also
+#     absorbs any shared-edge lease refill -- + 4 x a 20 s timeout, the request and up to
+#     MIRROR_MAX_REDIRECTS hops) = 3,575 s, leaving ~625 s for what that bound omits: the page's
+#     SELECT and UPDATEs (<= 30 s each, DB_STATEMENT_TIMEOUT_SECONDS) and robots.txt fetches (5 s
+#     timeout, once per host per hour). The realistic worst case is far lower: 8 consecutive block
+#     answers abort the store, a held request costs no request timeout, and either breaker stops
+#     the pass.
 #     Daily against a 7-day proof: six missed days of margin.
 # tests/test_setup_reap_cart_proof_jobs.py re-derives these windows from the neighbours' scripts.
 set -euo pipefail
