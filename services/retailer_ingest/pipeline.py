@@ -210,7 +210,7 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         brands = options.get("brands")
         if not options.get("multi_brand"):
             raise ValueError("options.brands is only meaningful with options.multi_brand")
-        from services.curated_brand_feed import _retailer_brand_family, _vendor_token as fold
+        from services.curated_brand_feed import RETAILER_BRAND_CANONICAL, _retailer_brand_family, _vendor_token as fold
         if not isinstance(brands, dict) or not all(isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
                                                    for k, v in brands.items()):
             raise ValueError("options.brands must map every vendor to its canonical brand spelling")
@@ -224,8 +224,13 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         # digits) or a measured family (RETAILER_BRAND_SPELLINGS). Anything else would be silently
         # ignored at crawl time -- refuse it here instead of letting the operator think it applied.
         alnum = lambda v: "".join(c for c in str(v).casefold() if c.isalnum())
-        # A measured family writes ITS spelling whatever the value says, so a family vendor may only be
-        # respelt into that same family (review of #2302: {"Kose": "Shiseido"} passed, then wrote "Kosé").
+        # A measured family always writes its canonical spelling. Refuse a conflicting override
+        # here instead of accepting an operator option that the crawl cannot honour.
+        for vendor, spelling in brands.items():
+            family = _retailer_brand_family(alnum(vendor))
+            if family is not None and spelling != RETAILER_BRAND_CANONICAL[family]:
+                raise ValueError(f"options.brands can only respell vendor {vendor!r} to its family {family!r}; "
+                                 f"use canonical spelling {RETAILER_BRAND_CANONICAL[family]!r}")
         ignored = sorted(k for k, v in brands.items()
                          if alnum(k) != alnum(v) and (_retailer_brand_family(alnum(k)) is None
                                                       or _retailer_brand_family(alnum(k)) != _retailer_brand_family(alnum(v))))
