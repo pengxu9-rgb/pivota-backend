@@ -152,9 +152,12 @@ services.tierb_cart_link_merchants), which also gives each domain its market. Pa
     5xx, a transport error, on any endpoint /meta.json included) abort the whole run, since the
     2026-08-21 block was IP-level and cross-domain. A challenge page neither aborts nor resets.
 
-NOT SCHEDULED. Nothing here is registered with services/audit_scheduler or any Cloud Scheduler
-trigger, and no default domain list exists; a test pins both. Provisioning a job is a separate,
-deliberate step (see the PR that introduced this file for the exact commands).
+SCHEDULED ONLY THROUGH ONE DARK-BY-DEFAULT WRAPPER. Nothing here is registered with
+services/audit_scheduler, and this module has no default domain list. Its one scheduled caller is
+jobs/reap_cart_proof_refresh.py (`enrichment` lane: a pinned list of five stores, one `run()` per
+domain, a budget), provisioned by the operator-run infra/gcp/setup_reap_cart_proof_jobs.sh as the
+Cloud Run Job `reap-cart-proof-enrichment`, dry-run and paused unless --enable. A test pins that no
+other infra file, workflow or scheduler names this module or that wrapper.
 
 EXIT CODES: 0 done; 1 aborted on a block; 2 bad arguments, a domain not on the Tier B list, or
 no `--on-crawl-egress`; 3 crashed (an unexpected exception; the report line is not printed).

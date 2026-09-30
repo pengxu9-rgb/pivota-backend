@@ -592,13 +592,25 @@ async def test_the_pacer_spaces_request_starts():
     assert slept == [2.0] and pacer.requests == 3
 
 
-def test_the_job_is_not_scheduled_anywhere():
+def test_the_job_is_scheduled_only_through_the_dark_by_default_wrapper():
+    """Its one scheduled caller is jobs/reap_cart_proof_refresh.py, provisioned by the operator-run
+    infra/gcp/setup_reap_cart_proof_jobs.sh (dry run + paused unless --enable; that script's own
+    test pins the dark default). Nothing else may name this module or that wrapper: not the worker's
+    scheduler, not another infra file, not a workflow."""
     root = Path(__file__).resolve().parents[1]
+    allowed = root / "infra" / "gcp" / "setup_reap_cart_proof_jobs.sh"
+    names = ("enrichment_cart_variant_proof", "reap_cart_proof_refresh")
     for path in [root / "services" / "audit_scheduler.py", *sorted((root / "infra").rglob("*"))]:
+        if path == allowed:
+            continue
         if path.is_file() and path.suffix in (".py", ".sh", ".yaml", ".yml", ".json", ".tf"):
-            assert "enrichment_cart_variant_proof" not in path.read_text(encoding="utf-8", errors="replace"), path
+            text = path.read_text(encoding="utf-8", errors="replace")
+            assert not any(name in text for name in names), path
     for path in sorted((root / ".github" / "workflows").glob("*.yml")):
-        assert "enrichment_cart_variant_proof" not in path.read_text(encoding="utf-8"), path
+        text = path.read_text(encoding="utf-8")
+        assert not any(name in text for name in names), path
+    # The wrapper passes an explicit domain list; this module still has no default population.
+    assert job.main(["--on-crawl-egress"]) == job.EXIT_BAD_ARGS
 
 
 def test_the_sources_and_outcomes_fit_the_table():
