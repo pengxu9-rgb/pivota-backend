@@ -554,3 +554,26 @@ def test_r61fb_nit_an_off_storefront_redirect_is_neutral_for_breaker_health(monk
     assert client.breaker.health.first_clean == {} and client.breaker.health.last_clean == 0
     assert results["a.com"].writer["fetch_outcomes"] == {"http_421": 3}
     assert results["a.com"].status == refresh.DONE
+
+
+def test_r61fb_b_enrichment_four_tiny_stores_with_one_block_each_do_not_trip():
+    """The enrichment twin of the slow-start case: four stores whose only answer is one block (aborted
+    "never read"), then a healthy store. An abort does not make a store count. No trip."""
+    answers = {f"t{i}.com": ["block"] for i in range(4)}
+    answers["h.com"] = ["ok", "ok"]
+    results, breaker = _enrichment_pass(answers)
+    assert not breaker.tripped and breaker.blocks.streaks.counting == {}
+    assert [results[f"t{i}.com"].status for i in range(4)] == [ABORTED] * 4
+    assert results["h.com"].status == refresh.DONE
+
+
+@pytest.mark.parametrize("kind", ["403", "429"])
+def test_r61fb_two_blocks_in_a_row_on_three_healthy_stores_are_not_a_run(monkeypatch, kind):
+    """LANE_STORE_STREAK is three: each store answers, blocks twice, answers again. Two in a row is not
+    a store blocking us, so nothing counts and nothing trips (a streak of two would trip here)."""
+    domains = ["a.com", "b.com", "c.com", "d.com"]
+    handler = _scripted({d: ["ok", kind, kind, "ok"] for d in domains})
+    results, client = _real_backfill_pass(monkeypatch, {d: _mirror_seeds(d, 6) for d in domains}, handler, domains,
+                                          page_size=25, breaker=True)
+    assert not client.breaker.tripped
+    assert [results[d].status for d in domains] == [refresh.DONE] * 4
