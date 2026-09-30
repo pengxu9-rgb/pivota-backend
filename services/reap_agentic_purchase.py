@@ -2242,6 +2242,23 @@ async def _resolving_to_enrollment(
         code = str(created.error or "enrollment_create_failed")
         if _is_transport(code):
             return await _release(row, worker_id, error_code=code, transport=True)
+        rejection = rc.classify_quote_rejection(created)
+        if rejection is not None and rejection.kind in _ENROLLMENT_CREATE_RETRY_KINDS:
+            # THE DESIGNED OUTCOME OF THE ONE-PENDING RACE, NOT A FAILURE (round-2 review of
+            # #2483, P2-A). Two workers, one buyer: the loser's INSERT is refused by migration
+            # 252's index, it is handed the WINNER's attempt, and it calls `create_enrollment`
+            # with the same Idempotency-Key while the winner's create is still in flight. Reap
+            # answers 409 IDEMPOTENCY_REQUEST_IN_PROGRESS (or IDEMPOTENT_PARAMETER_MISMATCH: the
+            # two bodies differ in their return URL). Released with backoff, exactly as the
+            # quote path treats the same answer: on the next poll the winner has stored the
+            # session on the shared row and the reconcile REUSES it.
+            return await _release(
+                row, worker_id,
+                error_code=rejection.error_code,
+                transport=rejection.retry_after_seconds is None,
+                seconds=(max(1, rejection.retry_after_seconds)
+                         if rejection.retry_after_seconds is not None else None),
+            )
         return await _move(
             row, worker_id, ["resolving"], "failed",
             last_error_code=_error_code(created.error_detail_code or created.error_code or code),
@@ -2308,6 +2325,15 @@ async def _resolving_to_enrollment(
         hosted_url_expires_at=expires,
         **evidence,
     )
+
+
+#: Reap's answers to an enrollment create that mean "that Idempotency-Key is someone else's call,
+#: still running or with another body" — a concurrent create of the SAME attempt, which the
+#: one-pending winner hand-back makes the designed outcome of a race. Released, never failed.
+_ENROLLMENT_CREATE_RETRY_KINDS = frozenset({
+    "idempotency_request_in_progress",
+    "idempotent_parameter_mismatch",
+})
 
 
 @dataclass

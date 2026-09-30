@@ -125,9 +125,16 @@ both dialects, each in its own try). With it the second INSERT is refused and th
 the loser **the winner** — both purchases wait on one attempt, and Reap's idempotency gives them
 one enrollment and one link. An INSERT that carried a partner's answer and lost the race raises
 `PendingEnrollmentTaken` instead (the service releases with `enrollment_pending_superseded`).
+Because the loser is handed the winner's attempt, it can call `create_enrollment` with the SAME
+Idempotency-Key while the winner's create is still in flight; Reap answers 409
+`IDEMPOTENCY_REQUEST_IN_PROGRESS` (or `IDEMPOTENT_PARAMETER_MISMATCH` — the two bodies differ in
+their return URL). That is the designed outcome of the race, so it RELEASES with backoff
+(`idempotency_request_in_progress` / `idempotent_parameter_mismatch`), exactly as the quote path
+does; the next poll reuses the winner's stored session. It never fails the purchase.
 
 **Before 252 is applied** (production applies migrations by hand; the self-heal creates the index
-at startup but SKIPS it if duplicates already exist) the race can still mint two rows. Nothing is
+at startup but SKIPS it if duplicates already exist — and then logs a WARNING from `db.schema_guard`
+naming `uq_reap_agentic_enrollments_one_pending` and this census, once per startup) the race can still mint two rows. Nothing is
 stranded: the service reconciles **every** pending row oldest-first, an ACTIVE one wins, and
 dead ones are retired — the duplicate is resolved on the buyer's next purchase. The index is what
 stops it happening at all. **Census before applying 252** (the CREATE fails if this returns rows):

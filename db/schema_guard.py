@@ -642,6 +642,22 @@ async def check_required_schema() -> Dict[str, List[str]]:
     return missing
 
 
+def _warn_one_pending_index_missing(exc: BaseException) -> None:
+    """Migration 252's index could not be built. SWALLOWED like every sibling (startup must not
+    fail on it) but NOT SILENT, because this is the one index whose absence changes behaviour:
+    without it a concurrent mint is no longer handed the winner, and the purchase service's
+    reconcile-every-pending-row path is what keeps a buyer from being stranded. The usual cause
+    is a buyer that already has two pending enrollments; the runbook's census finds them. The
+    exception TYPE only — never its text, which can quote row values."""
+    logger.warning(
+        "schema_guard: could not create uq_reap_agentic_enrollments_one_pending (%s); "
+        "a buyer_ref probably already has two pending enrollments. Run the census in "
+        "docs/runbooks/reap_agentic_purchase.md ('One pending row per buyer') and reconcile "
+        "the duplicates, then restart or apply db/migrations/252 by hand",
+        type(exc).__name__,
+    )
+
+
 async def ensure_required_schema_light() -> None:
     """
     Best-effort DDL for *critical* schema dependencies.
@@ -1036,8 +1052,8 @@ async def ensure_required_schema_light() -> None:
                     "ON reap_agentic_enrollments (buyer_ref) "
                     "WHERE status = 'pending';"
                 )
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _warn_one_pending_index_missing(exc)
             # mig 225: the resolver's three hint columns.
             #
             # THIS DDL MUST BUILD THE SAME SCHEMA AS
@@ -3668,8 +3684,8 @@ async def ensure_required_schema_light() -> None:
                         "WHERE status = 'pending';"
                     )
                 )
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _warn_one_pending_index_missing(exc)
             # mig 225: the resolver's three hint columns, SQLite twin.
             #
             # ── TWO LAYERS OF try, AND EACH ONE ANSWERS A DIFFERENT FAILURE ──

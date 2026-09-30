@@ -1854,3 +1854,42 @@ async def test_r2_and_the_settling_exemption_on_postgres(reap):
 
     assert (await svc.advance(held, "w9")).last_error_code == "enrollment_settling"
     assert reap.named("resolve_our_row") == []
+
+
+async def test_two_purchases_creating_one_attempt_concurrently_on_postgres(reap):
+    """Round-2 P2-A on the real engine: two purchases of one first-time buyer, stepped at once
+    on two connections; the second create of the SAME attempt gets Reap's 409 in-progress and is
+    RELEASED; its next poll reuses the winner's session. One row, one enrollment, one link."""
+    import asyncio
+
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_client as rc
+    import services.reap_agentic_purchase as svc
+
+    calls, second_arrived = [], asyncio.Event()
+
+    async def _create(**kwargs):
+        calls.append(kwargs["attempt_id"])
+        if len(calls) == 1:
+            await asyncio.wait_for(second_arrived.wait(), timeout=60)
+            return _ok(_requires_action())
+        second_arrived.set()
+        return rc.ReapResponse(ok=False, status=409, error="reap_status_409",
+                               error_code="IDEMPOTENCY_REQUEST_IN_PROGRESS")
+
+    reap.create_enrollment = _create
+    reap.get_enrollment = _echo_session()
+    first, second = await _start(), await _start()
+    await _claim(first, "w1")
+    await _claim(second, "w2")
+    results = await asyncio.gather(svc.advance(first, "w1"), svc.advance(second, "w2"))
+
+    assert len(calls) == 2 and len(set(calls)) == 1
+    assert sorted(r.outcome for r in results) == ["advanced", "released"]
+    loser = next(pid for pid, r in zip((first, second), results) if r.outcome == "released")
+    assert (await _get(loser))["last_error_code"] == "idempotency_request_in_progress"
+    assert (await _step(loser, "w3")).state == "needs_enrollment"
+    a, b = await _get(first), await _get(second)
+    assert a["enrollment_id"] == b["enrollment_id"] == calls[0]
+    assert a["hosted_url"] == b["hosted_url"] == STAGING_LINK
+    assert len(await ledger.get_pending_enrollments("bref_alice")) == 1

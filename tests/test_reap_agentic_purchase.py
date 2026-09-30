@@ -4095,3 +4095,83 @@ async def test_a_repeated_settling_hold_logs_warning_once_then_info(reap, caplog
         await _step(purchase)
     held = [r for r in caplog.records if "enrollment_settling" in r.getMessage()]
     assert [r.levelno for r in held] == [logging.WARNING, logging.INFO, logging.INFO]
+
+
+# ── round-2 review of #2483 at 8df71dd6e, P2-A: two creates of ONE attempt, concurrently ─────
+
+
+def _in_progress() -> rc.ReapResponse:
+    """Reap's 409 for an Idempotency-Key whose first call is still running — the shape the
+    client builds from the error body (`error.code`, shape-checked)."""
+    return rc.ReapResponse(
+        ok=False, status=409, error="reap_status_409",
+        error_code="IDEMPOTENCY_REQUEST_IN_PROGRESS",
+    )
+
+
+def _concurrent_create():
+    """A `create_enrollment` whose FIRST call blocks until a SECOND call for the same attempt
+    arrives, and answers that second one 409 IDEMPOTENCY_REQUEST_IN_PROGRESS — two workers
+    creating the winner's attempt at the same moment, as Reap sees it."""
+    import asyncio
+
+    state = {"calls": [], "second_arrived": asyncio.Event()}
+
+    async def _create(**kwargs):
+        state["calls"].append(kwargs["attempt_id"])
+        if len(state["calls"]) == 1:
+            await asyncio.wait_for(state["second_arrived"].wait(), timeout=20)
+            return _ok(_enrollment_requires_action())
+        state["second_arrived"].set()
+        return _in_progress()
+
+    return _create, state
+
+
+@pytest.mark.parametrize("second_answer", ["IDEMPOTENCY_REQUEST_IN_PROGRESS",
+                                           "IDEMPOTENT_PARAMETER_MISMATCH"])
+async def test_two_purchases_creating_one_attempt_concurrently_both_wait_on_one_link(
+    reap, second_answer
+):
+    """P2-A. Both purchases of one first-time buyer step AT ONCE (asyncio.gather): one mints the
+    buyer's pending row, the other is handed it (or loses the INSERT and is handed the winner),
+    and both call `create_enrollment` with the SAME attempt while the first is still in flight.
+    Reap's 409 for the second is a RELEASE, not a failure; on its next poll that purchase
+    reuses the winner's stored session. One pending row, one enrollment at Reap, one link."""
+    import asyncio
+
+    create, state = _concurrent_create()
+    if second_answer != "IDEMPOTENCY_REQUEST_IN_PROGRESS":
+        async def _mismatch(**kwargs):
+            answer = await create(**kwargs)
+            if not answer.ok:
+                return rc.ReapResponse(ok=False, status=422, error="reap_status_422",
+                                       error_code=second_answer)
+            return answer
+        reap.create_enrollment = _mismatch
+    else:
+        reap.create_enrollment = create
+    reap.get_enrollment = _reap_echoes_the_session()
+    first, second = await _start(), await _start()
+    await _claim(first, "w1")
+    await _claim(second, "w2")
+
+    results = await asyncio.gather(svc.advance(first, "w1"), svc.advance(second, "w2"))
+
+    assert len(state["calls"]) == 2 and len(set(state["calls"])) == 1, "ONE attempt, created twice"
+    outcomes = sorted((r.outcome, r.state, r.last_error_code) for r in results)
+    loser_code = "idempotency_request_in_progress" if second_answer.startswith("IDEMPOTENCY") \
+        else "idempotent_parameter_mismatch"
+    assert outcomes == sorted([("advanced", "needs_enrollment", None),
+                               ("released", "resolving", loser_code)])
+    loser = next(pid for pid, r in zip((first, second), results) if r.outcome == "released")
+    assert (await _get(loser))["state"] == "resolving", "released, not failed"
+
+    reap.calls.clear()
+    assert (await _step(loser, "w3")).state == "needs_enrollment"
+    assert reap.named("create_enrollment") == [], "the next poll REUSES the winner's session"
+    a, b = await _get(first), await _get(second)
+    assert a["enrollment_id"] == b["enrollment_id"] == state["calls"][0]
+    assert a["hosted_url"] == b["hosted_url"] == STAGING_LINK
+    assert await _pending_count() == 1
+    assert "failed" not in {a["state"], b["state"]}

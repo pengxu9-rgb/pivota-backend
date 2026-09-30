@@ -4430,3 +4430,27 @@ async def test_a_settling_claim_is_not_an_attempt_and_other_resolving_claims_are
     assert claimed[held["id"]] == 0
     assert claimed[other["id"]] == 1
     assert claimed[quoting["id"]] == 1
+
+
+async def test_the_self_heal_warns_when_the_one_pending_index_cannot_be_built(caplog):
+    """Round-2 nit. A database that already holds two pending rows for one buyer cannot take
+    migration 252's index. The self-heal still swallows that (startup must not fail) — but it
+    SAYS so, naming the index and the runbook census, because this is the one index whose
+    absence changes behaviour. The control: a clean rebuild says nothing."""
+    import logging as _logging
+
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
+    caplog.set_level(_logging.WARNING, logger="db.schema_guard")
+    await ensure_required_schema_light()
+    assert not [r for r in caplog.records if "one_pending" in r.getMessage()], "control"
+
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
+    await _raw_pending("re_dup1")
+    await _raw_pending("re_dup2")
+    caplog.clear()
+    await ensure_required_schema_light()
+    warned = [r for r in caplog.records if "uq_reap_agentic_enrollments_one_pending" in r.getMessage()]
+    assert len(warned) == 1 and warned[0].levelno == _logging.WARNING
+    assert "census" in warned[0].getMessage()
+    assert "re_dup" not in warned[0].getMessage(), "the exception TYPE only, never row values"
+    assert await _enrollment_count() == 2, "swallowed: startup went on, nothing was deleted"
