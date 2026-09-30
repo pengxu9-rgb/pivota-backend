@@ -32,8 +32,10 @@
 #              created dark. A plain re-run (e.g. to re-image onto a newer <backend-tag>) therefore
 #              never arms and never silently disarms.
 # The state is read for BOTH jobs before EITHER is touched, and the script refuses to guess: a plain
-# re-run exits 1 without writing when one job is armed and the other dark (a SPLIT), or when one
-# job's gate and trigger disagree (e.g. a failed earlier run). Pass --enable or --disable then.
+# re-run exits 1 without writing when one job is armed and the other dark OR MISSING (a SPLIT; a
+# plain re-run never creates a job armed), or when one job's gate and trigger disagree (e.g. a
+# failed earlier run). Pass --enable or --disable then. A trigger this script CREATES is paused
+# immediately (gcloud has no create --paused), before any other write.
 # ORDER: disarming pauses both triggers FIRST, then updates the jobs; arming updates both jobs and
 # both triggers first and resumes the triggers LAST, so a failure part-way through an arm never
 # leaves a trigger firing (the next plain re-run then sees the disagreement and asks for a flag).
@@ -97,7 +99,7 @@
 #     starts where the need is. That only keeps up if a day's budget covers a day's churn: exit 4
 #     on consecutive days means raise the budget and the task timeout here.
 #     The extra 1,800 s is one 50-candidate page the budget cannot stop: 50 x (3 s + a 20 s
-#     timeout) = 1,150 s at worst, since 8 consecutive block-shaped answers abort the pass.
+#     timeout) = 1,150 s at worst, since 8 consecutive block-shaped answers abort the store.
 #     Daily against a 7-day proof: six missed days of margin.
 # tests/test_setup_reap_cart_proof_jobs.py re-derives these windows from the neighbours' scripts.
 set -euo pipefail
@@ -188,10 +190,11 @@ case "$REQUEST" in
         echo "Re-run with --enable or --disable to set both jobs explicitly." >&2
         exit 1 ;;
     esac
+    # A MISSING job next to an armed one is a split too: a plain re-run never creates a job armed.
     case "$STATES" in
-      *armed*dark*|*dark*armed*)
-        echo "REFUSING: the two jobs are SPLIT (one armed, one dark). Nothing was changed." >&2
-        echo "Re-run with --enable or --disable to set both jobs explicitly." >&2
+      *armed*dark*|*dark*armed*|*armed*new*|*new*armed*)
+        echo "REFUSING: the two jobs are SPLIT (one armed, the other dark or missing). Nothing was changed." >&2
+        echo "Re-run with --enable (arms both, creating a missing one armed) or --disable." >&2
         exit 1 ;;
       *armed*) ENABLED=true ;;
       *) ENABLED=false ;;
@@ -231,6 +234,12 @@ mktrigger(){ # job schedule
   "$GCLOUD" scheduler jobs "$verb" http "$trigger" --location "$REGION" \
     --schedule="$schedule" --time-zone=Etc/UTC --uri="$uri" --http-method=POST \
     --oauth-service-account-email="$SA" --attempt-deadline=300s --quiet
+  # `scheduler jobs create` has no --paused and a new trigger starts ENABLED: pause it before
+  # anything else is written, so a trigger is never live because it was just created.
+  if [ "$verb" = create ]; then
+    "$GCLOUD" scheduler jobs pause "$trigger" --location "$REGION" --quiet \
+      || { echo "FAILED to pause the new $trigger - it may be LIVE" >&2; exit 1; }
+  fi
 }
 
 settrigger(){ # job

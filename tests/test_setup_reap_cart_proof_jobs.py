@@ -30,6 +30,7 @@ JOBS = ("reap-cart-proof-enrichment", "reap-cart-proof-mirror")
 
 # Fields separated by \x1f, one invocation per line. Reads are answered from env:
 #   JOB_EXISTS / TRIGGER_EXISTS          create vs update, and whether describe answers at all
+#   <MIRROR|ENRICHMENT>_JOB_EXISTS, _TRIGGER_EXISTS   the same, for one job
 #   ENRICHMENT_GATE / MIRROR_GATE        the job's REAP_CART_PROOF_APPLY as `describe --format=json` shows it
 #   ENRICHMENT_TRIGGER / MIRROR_TRIGGER  the trigger's `state`
 #   SUBNET_EXISTS=0                      the crawl-subnet preflight fails
@@ -41,13 +42,19 @@ FAKE_GCLOUD = textwrap.dedent(
     printf '%s\\x1f' "$@" >> "$GCLOUD_LOG"; printf '\\n' >> "$GCLOUD_LOG"
     case "$1 $2 $3" in
       "run jobs describe")
-        [ "${JOB_EXISTS:-0}" = 1 ] || exit 1
-        case "$4" in reap-cart-proof-mirror) g="${MIRROR_GATE:-false}" ;; *) g="${ENRICHMENT_GATE:-false}" ;; esac
+        case "$4" in
+          reap-cart-proof-mirror) e="${MIRROR_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${MIRROR_GATE:-false}" ;;
+          *) e="${ENRICHMENT_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${ENRICHMENT_GATE:-false}" ;;
+        esac
+        [ "$e" = 1 ] || exit 1
         printf '{"spec":{"template":{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"PIVOTA_ENV","value":"production"},{"name":"REAP_CART_PROOF_APPLY","value":"%s"}]}]}}}}}}' "$g"
         exit 0 ;;
       "scheduler jobs describe")
-        [ "${TRIGGER_EXISTS:-0}" = 1 ] || exit 1
-        case "$4" in reap-cart-proof-mirror-cron) t="${MIRROR_TRIGGER:-PAUSED}" ;; *) t="${ENRICHMENT_TRIGGER:-PAUSED}" ;; esac
+        case "$4" in
+          reap-cart-proof-mirror-cron) e="${MIRROR_TRIGGER_EXISTS:-${TRIGGER_EXISTS:-0}}"; t="${MIRROR_TRIGGER:-PAUSED}" ;;
+          *) e="${ENRICHMENT_TRIGGER_EXISTS:-${TRIGGER_EXISTS:-0}}"; t="${ENRICHMENT_TRIGGER:-PAUSED}" ;;
+        esac
+        [ "$e" = 1 ] || exit 1
         echo "$t"; exit 0 ;;
       "compute networks subnets") [ "${SUBNET_EXISTS:-1}" = 1 ] && exit 0 || exit 1 ;;
       "scheduler jobs resume") [ "${RESUME_FAILS:-0}" = 1 ] && exit 1 || exit 0 ;;
@@ -107,6 +114,11 @@ def _pause_resume(calls: List[List[str]]) -> List[Tuple[str, str]]:
     return [(c[2], c[3]) for c in calls if c[:2] == ["scheduler", "jobs"] and c[2] in ("pause", "resume")]
 
 
+def _final_states(calls: List[List[str]]) -> Dict[str, str]:
+    """Each trigger's LAST pause/resume: the state the script leaves it in."""
+    return {trigger: verb for verb, trigger in _pause_resume(calls)}
+
+
 def _seconds(value: str) -> int:
     return int(re.fullmatch(r"(\d+)s", value).group(1))
 
@@ -132,7 +144,8 @@ def test_dark_by_default_both_jobs_on_the_crawl_subnet_dry_run_and_paused(tmp_pa
         trigger = _one(calls, "scheduler", "jobs", "create", "http", f"{name}-cron")
         assert _flag(trigger, "--time-zone") == "Etc/UTC"
         assert _flag(trigger, "--uri").endswith(f"/namespaces/pivota-prod/jobs/{name}:run")
-    assert sorted(_pause_resume(calls)) == sorted(("pause", f"{n}-cron") for n in JOBS)
+    assert _final_states(calls) == {f"{n}-cron": "pause" for n in JOBS}
+    assert not [c for c in calls if c[:3] == ["scheduler", "jobs", "resume"]]
     assert "DARK" in proc.stdout and "DRY RUN" in proc.stdout
 
 
@@ -141,7 +154,10 @@ def test_enable_arms_all_four_switches_together(tmp_path):
     assert proc.returncode == 0, proc.stderr
     for name in JOBS:
         assert _env_vars(_one(calls, "run", "jobs", "create", name))["REAP_CART_PROOF_APPLY"] == "true"
-    assert sorted(_pause_resume(calls)) == sorted(("resume", f"{n}-cron") for n in JOBS)
+    assert _final_states(calls) == {f"{n}-cron": "resume" for n in JOBS}
+    resumes = [i for i, c in enumerate(calls) if c[:3] == ["scheduler", "jobs", "resume"]]
+    job_writes = [i for i, c in enumerate(calls) if c[:2] == ["run", "jobs"] and c[2] in ("create", "update")]
+    assert min(resumes) > max(job_writes), "the triggers are resumed last"
     assert "ARMED" in proc.stdout
 
 
@@ -212,6 +228,40 @@ def test_an_arm_that_fails_on_the_second_job_resumes_no_trigger(tmp_path):
     assert proc.returncode != 0
     assert not [c for c in calls if c[:3] == ["scheduler", "jobs", "resume"]]
     assert not [c for c in calls if c[:3] == ["scheduler", "jobs", "create"]]
+
+
+@pytest.mark.parametrize("flag", ["", "--enable", "--disable"])
+def test_a_created_trigger_is_paused_before_any_other_write(tmp_path, flag):
+    """N5: `scheduler jobs create` has no --paused and a new trigger starts ENABLED."""
+    proc, calls = _run(tmp_path, "prod", TAG, *([flag] if flag else []))
+    assert proc.returncode == 0, proc.stderr
+    writes = _writes(calls)
+    created = [i for i, c in enumerate(writes) if c[:4] == ["scheduler", "jobs", "create", "http"]]
+    assert len(created) == 2
+    for i in created:
+        assert writes[i + 1][:4] == ["scheduler", "jobs", "pause", writes[i][4]], writes[i:i + 2]
+
+
+@pytest.mark.parametrize("missing", ["MIRROR", "ENRICHMENT"])
+def test_a_plain_rerun_never_creates_a_missing_job_next_to_an_armed_one(tmp_path, missing):
+    """N5: one job armed, the other missing: that is a split. A plain re-run refuses without writing;
+    only --enable creates the missing one (armed, like its twin)."""
+    env = {**ARMED, f"{missing}_JOB_EXISTS": "0", f"{missing}_TRIGGER_EXISTS": "0"}
+    proc, calls = _run(tmp_path, "prod", TAG, env=env)
+    assert proc.returncode == 1 and "SPLIT" in proc.stderr and "missing" in proc.stderr
+    assert _writes(calls) == []
+    proc, calls = _run(tmp_path, "prod", TAG, "--enable", env=env)
+    assert proc.returncode == 0, proc.stderr
+    name = f"reap-cart-proof-{missing.lower()}"
+    assert _env_vars(_one(calls, "run", "jobs", "create", name))["REAP_CART_PROOF_APPLY"] == "true"
+
+
+def test_a_plain_rerun_with_one_job_missing_and_the_other_dark_creates_it_dark(tmp_path):
+    env = {**DARK, "MIRROR_JOB_EXISTS": "0", "MIRROR_TRIGGER_EXISTS": "0"}
+    proc, calls = _run(tmp_path, "prod", TAG, env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert _env_vars(_one(calls, "run", "jobs", "create", "reap-cart-proof-mirror"))["REAP_CART_PROOF_APPLY"] == "false"
+    assert _final_states(calls) == {f"{n}-cron": "pause" for n in JOBS}
 
 
 def test_a_failed_resume_fails_the_script(tmp_path):

@@ -30,12 +30,28 @@ so its writes commit page by page), inside a wall-clock budget, and prints one r
 - Mirror order: stores no run has walked to the end go first; then by the earlier of the oldest
   **still-valid** proof among the store's active seeds (one SQL read; lapsed proofs are ignored) and
   the store's last completed walk; then by name. A completed walk moves a store to the back, so no
-  store starves while the budget covers a day's work.
+  store starves while the budget covers a day's work. Seeds are matched to stores exactly as the
+  backfill's `--domain` filter matches them (case-sensitive; exact or a `.`-subdomain), so a seed
+  whose `domain` column the backfill would never select does not move a store either.
+- **Both lanes: a store that blocked us is backed off.** When a store ends `aborted_on_block`, its
+  row gets `blocked_until` = now + 3 days: it is skipped (`backed_off`) until then, and walked LAST
+  on the first run after that. One store that always blocks us therefore costs one threshold's worth
+  of requests every few days and never the other stores' refresh.
+- **A poison page does not pin the cursor.** A store that crashes at the SAME resume cursor on two
+  runs in a row has that cursor reset to NULL (`crash_cursor_reset` in the report, a WARNING in the
+  log), so the rows before it are walked again; read `error` to fix the page itself.
 
-**Blocks.** The consecutive-block streak is carried across pages and stores (a writer's own counter
-restarts at every call). Mirror: the client handed to the backfill classifies every answer with the
-backfill's own rules and, at the backfill's threshold (8), answers every further request 429
-locally, without sending it, and the pass stops. Enrichment: one shared `block_state` (threshold 5).
+**Blocks.** Two streaks of consecutive block-shaped answers (429/403/5xx/transport errors; a clean
+answer resets both, a challenge page or an unsent request touches neither), at the writer's own
+threshold T (mirror 8, enrichment 5):
+- the STORE streak: at T that store is aborted (`aborted_on_block`, backed off) and **the pass moves
+  on** to the next store;
+- the RUN streak, carried across stores: at 2 x T (the next store also blocked from its first
+  request, with no clean answer in between) **the whole pass stops** -- that is what an IP-level
+  block looks like. Small stores that each stay under T still trip it.
+Mirror: the client handed to the backfill classifies every answer with the backfill's own rules and,
+once a streak trips, answers 429 locally without sending. Enrichment: the writer's own `block_state`,
+one per store, observed into the run streak (it can overshoot by up to T - 1 requests).
 
 ## The egress rule (read this first)
 
@@ -59,8 +75,11 @@ together:
 
 **A plain re-run (no flag) keeps the current state**: the script reads both jobs' gate and trigger
 with `describe` before touching either, and re-images them (a newer `<backend-tag>`) without arming
-or disarming. It refuses, writing nothing, when the two jobs are split (one armed, one dark) or a
-job's gate and trigger disagree (a failed earlier run): pass `--enable` or `--disable` then.
+or disarming. It refuses, writing nothing, when the two jobs are split (one armed, the other dark
+**or missing** -- a plain re-run never creates a job armed) or a job's gate and trigger disagree (a
+failed earlier run): pass `--enable` or `--disable` then. A missing job next to a dark one is
+created dark. A trigger the script creates is paused immediately (gcloud has no `create --paused`),
+before any other write.
 `--disable` prints a loud `DISARMING` line and pauses both triggers before it touches either job;
 `--enable` resumes the triggers last, so a failure part-way leaves nothing firing.
 
@@ -122,9 +141,13 @@ gcloud logging read \
 ```
 
 If the task timeout's SIGTERM arrives, the job prints the REPORT line with what it has
-(`"terminated": "SIGTERM"`, the store in flight `terminated`, exit 4) before it exits; every page
-already checkpointed stays checkpointed, and the in-flight page (at most 50 seeds / 250 products) is
-redone next run.
+(`"terminated": "SIGTERM"`, the store in flight `terminated`) BEFORE it lets go of the database, and
+exits non-zero (4, or 1/3 if those apply) even if nothing had finished. Every page already
+checkpointed stays checkpointed; the in-flight page is lost and redone next run. **What that page
+costs, in requests:** mirror, at most 50 seeds (50 `.js` requests, ~2.5 min at 3 s). Enrichment is
+250 PRODUCTS, but a product can hold many storefront handles: MAC's first 250 products are ~1,600
+handles (the folded shades), which in the `.js` fallback is ~1,600 requests, **~80 minutes**, of
+work thrown away (in normal `auto` listing mode it is a few listing pages).
 
 Top level: `lane`, `mode` (`dry_run` / `apply`), `budget_s`, `elapsed_s`, `exit_code`,
 `status_counts`, `domains_order`, and `domains.<domain>` = `{status, pages, elapsed_s, writer, …}`.
@@ -132,8 +155,9 @@ Top level: `lane`, `mode` (`dry_run` / `apply`), `budget_s`, `elapsed_s`, `exit_
 | `status` | meaning |
 |---|---|
 | `done` | walked to its end |
-| `aborted_on_block` | the writer hit consecutive 429/403/5xx/transport errors; **the whole pass stopped** (the block is IP-level) |
-| `crashed` | the writer raised; `error` says what; the next domain still ran |
+| `aborted_on_block` | this store answered T consecutive 429/403/5xx/transport errors; it is backed off 3 days and the pass moved on. With `pass_abort: true`, the run streak tripped too and **the whole pass stopped** (IP-level) |
+| `backed_off` | skipped: this store blocked us within the last 3 days (`backed_off` at the top level lists until when) |
+| `crashed` | the writer raised; `error` says what; the next domain still ran. `crash_cursor_reset: true`: the second crash in a row at this cursor, which was reset |
 | `cursor_stuck` | the writer returned the cursor it was given; the domain was stopped rather than looped |
 | `budget_stopped` | the budget ran out while walking this domain; `last_cursor` is where it stopped and where the next run resumes |
 | `not_reached` | the budget (or an abort) ended the pass before this domain |
@@ -146,11 +170,11 @@ re-walks from the older cursor). Top level, `resumed` lists the stores resumed m
 
 | exit | meaning | do |
 |---|---|---|
-| 0 | every domain walked to its end | nothing |
-| 1 | aborted on a block | suspect the crawl address; check `most_blocked_domains` / `fetches`; do not re-run straight away |
+| 0 | every store walked to its end (`backed_off` stores are listed, not counted) | nothing; glance at `backed_off` |
+| 1 | the WHOLE PASS aborted on a block (the run streak tripped) | suspect the crawl address; check `most_blocked_domains` / `fetches`; do not re-run straight away |
 | 2 | bad arguments, no `--on-crawl-egress`, a missing merchant list, or the writer refused the domain list; nothing attempted | fix the job args or `config/tierb_cart_link_merchants.json` |
 | 3 | a writer crashed (or `cursor_stuck`), or the pass itself could not plan or start (`REAP_CART_PROOF_CRASH` on stderr, no report) | read the job log |
-| 4 | the budget, or the task timeout's SIGTERM, ended the pass before every domain was walked | the cut store resumes from its cursor and the stalest stores go first next run. **This is not self-healing on its own**: it only catches up if one day's budget covers one day's work. Exit 4 on consecutive days means the budget is too small: raise the budget AND the task timeout together in the setup script, and read `reap_cart_proof_refresh_cursors` (below) to see which stores are behind |
+| 4 | a store was left unwalked: the budget, the task timeout's SIGTERM, or one store that blocked us (`aborted_on_block` without `pass_abort`; it is backed off, see the lever below) | a store that blocked us: check that store alone; nothing else was affected. Otherwise: the cut store resumes from its cursor and the stalest stores go first next run. **This is not self-healing on its own**: it only catches up if one day's budget covers one day's work. Exit 4 on consecutive days means the budget is too small: raise the budget AND the task timeout together in the setup script, and read `reap_cart_proof_refresh_cursors` (below) to see which stores are behind |
 
 A non-zero exit fails the execution. `--max-retries 0`: nothing re-runs automatically.
 
@@ -189,9 +213,14 @@ SELECT domain,
 ```
 
 ```sql
--- where each store got to, and when it was last walked to its end
-SELECT lane, domain, next_cursor, last_status, last_completed_at, updated_at
+-- where each store got to, when it was last walked to its end, its block back-off, its crash count
+SELECT lane, domain, next_cursor, last_status, last_completed_at, blocked_until, crash_count, updated_at
   FROM reap_cart_proof_refresh_cursors ORDER BY lane, last_completed_at NULLS FIRST, domain;
+
+-- CLEAR A STORE'S BLOCK BACK-OFF (it is walked on the next run, LAST, because its last run blocked).
+-- Do it once you know the store answers again (e.g. a one-store dry run by hand), not blindly.
+UPDATE reap_cart_proof_refresh_cursors SET blocked_until = NULL
+ WHERE lane = '<mirror|enrichment>' AND domain = '<domain>';
 
 -- forget a store's cursor (it restarts at its first page next run); only with the triggers paused
 DELETE FROM reap_cart_proof_refresh_cursors WHERE lane = 'mirror' AND domain = '<domain>';
@@ -287,8 +316,9 @@ only not coincided with.
 ## Known limits
 
 - **The mirror writer does not consult robots.txt or honour `Retry-After`** (the enrichment writer
-  does, through `services.crawl_politeness`). It paces itself (1 s global, 3 s per store) and aborts
-  on 8 consecutive block-shaped answers, now carried across stores. Making the backfill polite is
+  does, through `services.crawl_politeness`). It paces itself (1 s global, 3 s per store); a store
+  is aborted after 8 consecutive block-shaped answers and backed off, and the pass after 16 across
+  stores. Making the backfill polite is
   that script's change, not this job's.
 - **bluemercury may exceed `/products.json`'s 100-page cap** (see "Reading the report").
 - **The enrichment writer re-reads a store's listing for every 250-product page** in `auto` mode

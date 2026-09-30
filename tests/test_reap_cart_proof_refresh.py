@@ -131,8 +131,11 @@ def test_among_never_completed_stores_the_older_proof_goes_first_and_the_suffix_
     oldest = {"www.e.com": T0 - timedelta(days=4), "d.com": T0 - timedelta(days=1),
               "note.com": T0 - timedelta(days=6)}
     assert refresh.order_mirror_domains(["d.com", "e.com"], oldest, {}) == ["e.com", "d.com"]
-    assert refresh._seed_domain_is("www.e.com", "e.com") and refresh._seed_domain_is("E.com.", "e.com")
-    assert refresh._seed_domain_is("shop.e.com", "e.com")
+    assert refresh._seed_domain_is("www.e.com", "e.com") and refresh._seed_domain_is("shop.e.com", "e.com")
+    # Exactly the backfill's SQL: case-sensitive, no trimming. A seed it will not select must not count.
+    assert not refresh._seed_domain_is("E.com", "e.com") and not refresh._seed_domain_is("www.E.COM", "e.com")
+    assert not refresh._seed_domain_is("e.com.", "e.com")
+    assert refresh._seed_domain_is("WWW.e.com", "e.com"), "the backfill's LIKE '%.e.com' matches it too"
     assert not refresh._seed_domain_is("note.com", "e.com") and not refresh._seed_domain_is("e.com.au", "e.com")
 
 
@@ -245,7 +248,8 @@ def test_a_domain_cut_mid_walk_is_budget_stopped_not_done():
     assert exit_code(results) == refresh.EXIT_BUDGET
 
 
-def test_a_block_abort_stops_the_whole_pass():
+def test_a_store_that_blocks_is_aborted_and_the_pass_moves_on():
+    """N1: one store that blocks us must not cost the others their refresh."""
     clock = Clock()
     run_page, calls = pages_fn({
         "a.com": [Page({}, None)],
@@ -253,8 +257,23 @@ def test_a_block_abort_stops_the_whole_pass():
         "c.com": [Page({}, None)],
     })
     results = _drive(["a.com", "b.com", "c.com"], run_page, clock)
+    assert [c[0] for c in calls] == ["a.com", "b.com", "c.com"]
+    assert results["b.com"].status == ABORTED and not results["b.com"].pass_abort
+    assert results["c.com"].status == DONE
+    assert exit_code(results) == refresh.EXIT_BUDGET, "a store left unwalked, not an IP-level block"
+
+
+def test_a_tripped_run_streak_stops_the_whole_pass():
+    clock = Clock()
+    run_page, calls = pages_fn({
+        "a.com": [Page({}, None, aborted=True)],
+        "b.com": [Page({}, None, aborted=True, abort_pass=True)],
+        "c.com": [Page({}, None)],
+    })
+    results = _drive(["a.com", "b.com", "c.com"], run_page, clock)
     assert [c[0] for c in calls] == ["a.com", "b.com"]
-    assert results["b.com"].status == ABORTED and results["c.com"].status == NOT_REACHED
+    assert results["b.com"].status == ABORTED and results["b.com"].pass_abort
+    assert results["c.com"].status == NOT_REACHED
     assert exit_code(results) == refresh.EXIT_ABORTED_ON_BLOCK
 
 
@@ -297,7 +316,7 @@ def test_the_driver_refuses_a_non_positive_budget():
 def test_a_progress_line_per_finished_domain_none_for_the_unreached():
     clock = Clock()
     lines: List[str] = []
-    run_page, _ = pages_fn({"a.com": [Page({}, None)], "b.com": [Page({}, None, aborted=True)],
+    run_page, _ = pages_fn({"a.com": [Page({}, None)], "b.com": [Page({}, None, aborted=True, abort_pass=True)],
                             "c.com": [Page({}, None)]})
     _drive(["a.com", "b.com", "c.com"], run_page, clock, emit=lines.append)
     assert [json.loads(line[len(refresh.PROGRESS_PREFIX):])["domain"] for line in lines] == ["a.com", "b.com"]
@@ -315,16 +334,26 @@ def test_no_progress_line_for_a_domain_the_budget_never_started():
 
 @pytest.mark.parametrize("statuses, code", [
     ([DONE, DONE], 0),
+    ([DONE, refresh.BACKED_OFF], 0),
     ([DONE, NOT_REACHED], 4),
     ([BUDGET_STOPPED, NOT_REACHED], 4),
+    ([DONE, ABORTED], 4),
     ([CRASHED, NOT_REACHED], 3),
+    ([CRASHED, ABORTED], 3),
     ([CURSOR_STUCK, DONE], 3),
-    ([CRASHED, ABORTED, NOT_REACHED], 1),
-    ([ABORTED], 1),
+    ([CRASHED, "pass", NOT_REACHED], 1),
+    (["pass"], 1),
 ])
 def test_exit_code_precedence(statuses, code):
-    results = {f"d{i}.com": DomainResult(status=s) for i, s in enumerate(statuses)}
+    results = {f"d{i}.com": (DomainResult(status=ABORTED, pass_abort=True) if s == "pass" else DomainResult(status=s))
+               for i, s in enumerate(statuses)}
     assert exit_code(results) == code
+
+
+def test_a_sigterm_is_never_exit_0_even_with_nothing_walked():
+    assert exit_code({}, terminated=True) == refresh.EXIT_BUDGET
+    assert exit_code({"a.com": DomainResult(status=DONE)}, terminated=True) == refresh.EXIT_BUDGET
+    assert exit_code({"a.com": DomainResult(status=CRASHED)}, terminated=True) == refresh.EXIT_CRASHED
 
 
 # ── the page adapters: what each writer is called with, and how its report is read ─────────────
@@ -377,12 +406,15 @@ def test_the_enrichment_page_calls_the_writer_for_one_plan_with_the_shared_pacer
     domain_report = {"exhausted": False, "next_cursor": "ext:k9", "aborted_on_block": False, "written": 0}
     job = FakeEnrichmentJob([domain_report])
     plans = {"tartecosmetics.com": "PLAN-T", "maccosmetics.com": "PLAN-M"}
-    pacer, db, client, streak = object(), object(), object(), {"consecutive": 2}
+    pacer, db, client, run = object(), object(), object(), {"consecutive": 2}
     page = asyncio.run(refresh.enrichment_page_fn(job, db, client, plans, apply=apply, pacer=pacer,
-                                                  block_state=streak)("tartecosmetics.com", "ext:k1"))
-    assert job.calls == [(db, client, "PLAN-T", {
+                                                  run_streak=run)("tartecosmetics.com", "ext:k1"))
+    (call,) = job.calls
+    streak = call[3].pop("block_state")
+    assert call == (db, client, "PLAN-T", {
         "apply": apply, "source_mode": "auto", "limit": refresh.ENRICHMENT_PAGE_PRODUCTS, "after": "ext:k1",
-        "pacer": pacer, "block_limit": 5, "block_state": streak})]
+        "pacer": pacer, "block_limit": 5})
+    assert isinstance(streak, refresh.ObservedStreak) and streak.run is run and streak["consecutive"] == 0
     assert page.next_cursor == "ext:k9" and page.report == domain_report and not page.aborted
 
 
@@ -395,12 +427,88 @@ def test_the_enrichment_page_is_small_enough_to_commit_and_stop_between_pages():
 def test_an_exhausted_or_aborted_enrichment_domain_has_no_next_page():
     exhausted = FakeEnrichmentJob([{"exhausted": True, "next_cursor": "x"}])
     page = asyncio.run(refresh.enrichment_page_fn(exhausted, None, None, {"a.com": "P"}, apply=False,
-                                                  pacer=None, block_state={"consecutive": 0})("a.com", None))
+                                                  pacer=None, run_streak={"consecutive": 0})("a.com", None))
     assert page.next_cursor is None and not page.aborted
     aborted = FakeEnrichmentJob([{"exhausted": False, "next_cursor": "x", "aborted_on_block": True}])
     page = asyncio.run(refresh.enrichment_page_fn(aborted, None, None, {"a.com": "P"}, apply=False,
-                                                  pacer=None, block_state={"consecutive": 0})("a.com", None))
-    assert page.aborted and page.next_cursor is None
+                                                  pacer=None, run_streak={"consecutive": 0})("a.com", None))
+    assert page.aborted and page.next_cursor is None and not page.abort_pass
+
+
+class BlockingEnrichmentJob:
+    """Moves the writer's block_state exactly as `run_domain`'s on_fetch does: +1 per block (aborting the
+    store at the limit), 0 on a clean answer."""
+
+    def __init__(self, answers: Dict[str, List[str]]) -> None:
+        self.answers = answers
+
+    def abort_after_blocks(self) -> int:
+        return 5
+
+    async def run_domain(self, db, client, plan, *, block_state, block_limit, **kwargs):
+        for answer in self.answers[plan]:
+            if answer == "block":
+                block_state["consecutive"] += 1
+                if block_state["consecutive"] >= block_limit:
+                    return {"aborted_on_block": True, "exhausted": False, "next_cursor": None}
+            else:
+                block_state["consecutive"] = 0
+        return {"aborted_on_block": False, "exhausted": True, "next_cursor": None}
+
+
+def _enrichment_pass(answers):
+    job = BlockingEnrichmentJob(answers)
+    run = {"consecutive": 0}
+    page_fn = refresh.enrichment_page_fn(job, None, None, {d: d for d in answers}, apply=False, pacer=None,
+                                         run_streak=run)
+    return asyncio.run(drive(list(answers), page_fn, refresh.merge_enrichment, budget_s=60, gap_s=0.0)), run
+
+
+def test_enrichment_one_blocking_store_is_aborted_and_the_next_store_is_walked():
+    results, run = _enrichment_pass({"a.com": ["block"] * 9, "b.com": ["ok", "ok"], "c.com": ["ok"]})
+    assert results["a.com"].status == ABORTED and not results["a.com"].pass_abort
+    assert results["b.com"].status == DONE and results["c.com"].status == DONE and run["consecutive"] == 0
+
+
+def test_enrichment_two_stores_blocking_in_a_row_stop_the_pass():
+    results, run = _enrichment_pass({"a.com": ["block"] * 9, "b.com": ["block"] * 9, "c.com": ["ok"]})
+    assert results["a.com"].status == ABORTED and results["b.com"].pass_abort
+    assert results["c.com"].status == NOT_REACHED and run["consecutive"] == 10
+
+
+def test_enrichment_the_store_streak_is_carried_across_that_stores_pages():
+    """Three blocks at the end of page 1 and two at the start of page 2 are five in a row: the store
+    is aborted, as one multi-domain writer call would have done."""
+    class PagedJob(BlockingEnrichmentJob):
+        async def run_domain(self, db, client, plan, *, block_state, block_limit, after=None, **kwargs):
+            page = self.answers[plan].pop(0)
+            for answer in page:
+                if answer == "block":
+                    block_state["consecutive"] += 1
+                    if block_state["consecutive"] >= block_limit:
+                        return {"aborted_on_block": True, "exhausted": False, "next_cursor": None}
+                else:
+                    block_state["consecutive"] = 0
+            return {"aborted_on_block": False, "exhausted": not self.answers[plan],
+                    "next_cursor": None if not self.answers[plan] else f"k{len(self.answers[plan])}"}
+
+    job = PagedJob({"a.com": [["ok", "block", "block", "block"], ["block", "block", "ok"]], "b.com": [["ok"]]})
+    run = {"consecutive": 0}
+    page_fn = refresh.enrichment_page_fn(job, None, None, {"a.com": "a.com", "b.com": "b.com"}, apply=False,
+                                         pacer=None, run_streak=run)
+    results = asyncio.run(drive(["a.com", "b.com"], page_fn, refresh.merge_enrichment, budget_s=60, gap_s=0.0))
+    assert results["a.com"].status == ABORTED and results["a.com"].pages == 2
+    assert results["b.com"].status == DONE
+
+
+def test_the_observed_streak_mirrors_the_writers_counter_into_the_run_streak():
+    run = {"consecutive": 3}
+    streak = refresh.ObservedStreak(run)
+    streak["consecutive"] += 1
+    streak["consecutive"] += 1
+    assert streak["consecutive"] == 2 and run["consecutive"] == 5
+    streak["consecutive"] = 0
+    assert run["consecutive"] == 0
 
 
 def test_mirror_pages_are_summed_per_domain():
@@ -473,7 +581,7 @@ def test_the_real_enrichment_writer_reports_an_empty_domain_as_done():
     async def go():
         return await drive(["tartecosmetics.com"],
                            refresh.enrichment_page_fn(writer, EmptyDb(), None, plans, apply=False, pacer=pacer,
-                                                      block_state={"consecutive": 0}),
+                                                      run_streak={"consecutive": 0}),
                            refresh.merge_enrichment, budget_s=60, gap_s=0.0)
 
     results = asyncio.run(go())
@@ -704,17 +812,49 @@ def test_a_failed_checkpoint_is_recorded_and_the_pass_goes_on():
     assert results["a.com"].status == DONE and "ConnectionError" in results["a.com"].checkpoint_error
 
 
+_BASE = {"completed_at": None, "blocked_until": None, "crash_count": 0}
+
+
 @pytest.mark.parametrize("status, final, stored", [
-    (DONE, True, {"next_cursor": None, "last_status": DONE, "completed_at": T0}),
-    (CURSOR_STUCK, True, {"next_cursor": None, "last_status": CURSOR_STUCK, "completed_at": None}),
-    (BUDGET_STOPPED, True, {"next_cursor": "c7", "last_status": BUDGET_STOPPED, "completed_at": None}),
-    (ABORTED, True, {"next_cursor": "c7", "last_status": ABORTED, "completed_at": None}),
-    (CRASHED, True, {"next_cursor": "c7", "last_status": CRASHED, "completed_at": None}),
-    (NOT_REACHED, False, {"next_cursor": "c7", "last_status": "in_progress", "completed_at": None}),
+    (DONE, True, {**_BASE, "next_cursor": None, "last_status": DONE, "completed_at": T0}),
+    (CURSOR_STUCK, True, {**_BASE, "next_cursor": None, "last_status": CURSOR_STUCK}),
+    (BUDGET_STOPPED, True, {**_BASE, "next_cursor": "c7", "last_status": BUDGET_STOPPED}),
+    (ABORTED, True, {**_BASE, "next_cursor": "c7", "last_status": ABORTED, "blocked_until": T0 + timedelta(days=3)}),
+    (CRASHED, True, {**_BASE, "next_cursor": "c7", "last_status": CRASHED, "crash_count": 1}),
+    (NOT_REACHED, False, {**_BASE, "next_cursor": "c7", "last_status": "in_progress"}),
 ])
 def test_what_a_checkpoint_stores(status, final, stored):
     result = DomainResult(status=status, start_cursor="c3", last_cursor="c7")
     assert refresh.cursor_row_for(result, final, T0) == stored
+
+
+def test_the_store_whose_abort_stopped_the_pass_is_not_backed_off():
+    result = DomainResult(status=ABORTED, start_cursor="c3", pass_abort=True)
+    assert refresh.cursor_row_for(result, True, T0)["blocked_until"] is None
+
+
+def _crashed(cursor, count=1):
+    return CursorRow(next_cursor=cursor, last_status=CRASHED, last_completed_at=None, updated_at=None,
+                     crash_count=count)
+
+
+def test_a_second_crash_at_the_same_cursor_resets_it_so_the_rows_before_are_walked(caplog):
+    """N2: a poison page must not pin the cursor forever."""
+    result = DomainResult(status=CRASHED, start_cursor="c7")
+    row = refresh.cursor_row_for(result, True, T0, _crashed("c7", 1))
+    assert row["next_cursor"] is None and row["crash_count"] == 0 and result.crash_cursor_reset
+    assert "resetting the cursor" in caplog.text
+
+
+@pytest.mark.parametrize("prior", [
+    None,
+    _crashed("c5", 1),                                                    # crashed somewhere else
+    CursorRow(next_cursor="c7", last_status=BUDGET_STOPPED, last_completed_at=None, updated_at=None),
+])
+def test_a_first_crash_at_a_cursor_keeps_it_and_counts_one(prior):
+    result = DomainResult(status=CRASHED, start_cursor="c7")
+    row = refresh.cursor_row_for(result, True, T0, prior)
+    assert row["next_cursor"] == "c7" and row["crash_count"] == 1 and not result.crash_cursor_reset
 
 
 def test_a_domain_cut_on_its_first_page_keeps_the_cursor_it_resumed_from():
@@ -765,15 +905,15 @@ def _real_backfill_pass(monkeypatch, seeds_by_domain, handler, domains, page_siz
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as raw:
             client = refresh.BlockStreakClient(raw, backfill)
             results = await drive(domains, refresh.mirror_page_fn(backfill, client, apply=False, page_size=page_size),
-                                  refresh.merge_mirror, budget_s=60, gap_s=0.0)
+                                  refresh.merge_mirror, budget_s=60, gap_s=0.0, on_domain_start=client.start_store)
             return results, client
 
     return asyncio.run(go())
 
 
-def test_eight_consecutive_blocks_across_two_small_domains_abort_the_pass(monkeypatch):
-    """Each store has 5 seeds, under the backfill's threshold of 8 on its own. Without the carried
-    streak neither call aborts and the pass walks a third store into the same block."""
+def test_small_stores_under_an_ip_level_block_trip_the_run_streak_and_stop_the_pass(monkeypatch):
+    """Each store has 5 seeds, under the backfill's threshold of 8 on its own, so no STORE aborts; the
+    RUN streak (two stores' worth, 16) stops the pass, and nothing leaves after the 16th block."""
     from scripts import backfill_shopify_variant_ids as backfill
 
     assert backfill.CONSECUTIVE_BLOCK_ABORT == 8
@@ -783,13 +923,35 @@ def test_eight_consecutive_blocks_across_two_small_domains_abort_the_pass(monkey
         requested.append(request.url.host)
         return httpx.Response(429)
 
-    seeds = {d: _mirror_seeds(d, 5) for d in ("a.com", "b.com", "c.com")}
-    results, client = _real_backfill_pass(monkeypatch, seeds, handler, ["a.com", "b.com", "c.com"], page_size=10)
-    assert results["a.com"].status == DONE
-    assert results["b.com"].status == ABORTED and results["c.com"].status == NOT_REACHED
-    assert len(requested) == 8, "no request leaves once the carried streak reaches the threshold"
-    assert client.short_circuited == 2, "b.com's last two seeds were answered locally"
+    domains = ["a.com", "b.com", "c.com", "d.com", "e.com"]
+    seeds = {d: _mirror_seeds(d, 5) for d in domains}
+    results, client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=10)
+    assert [results[d].status for d in domains[:3]] == [DONE, DONE, DONE]
+    assert results["d.com"].status == ABORTED and results["d.com"].pass_abort
+    assert results["e.com"].status == NOT_REACHED
+    assert len(requested) == 16, "no request leaves once the run streak trips"
+    assert client.short_circuited == 4, "d.com's last four seeds were answered locally"
     assert exit_code(results) == refresh.EXIT_ABORTED_ON_BLOCK
+
+
+@pytest.mark.parametrize("page_size", [10, 5])
+def test_one_store_that_blocks_is_aborted_alone_and_the_next_store_is_walked(monkeypatch, page_size):
+    """page_size 5: the store streak reaches 8 across two backfill calls, while each call's own counter
+    stays under 8 -- only the carried store streak can abort it."""
+    from scripts import backfill_shopify_variant_ids as backfill
+
+    requested: List[str] = []
+
+    def handler(request):
+        requested.append(request.url.host)
+        return httpx.Response(403 if request.url.host == "a.com" else 404)
+
+    seeds = {"a.com": _mirror_seeds("a.com", 20), "b.com": _mirror_seeds("b.com", 4)}
+    results, client = _real_backfill_pass(monkeypatch, seeds, handler, ["a.com", "b.com"], page_size=page_size)
+    assert results["a.com"].status == ABORTED and not results["a.com"].pass_abort
+    assert requested.count("a.com") == backfill.CONSECUTIVE_BLOCK_ABORT
+    assert results["b.com"].status == DONE and requested.count("b.com") == 4
+    assert client.state == {"store": 0, "run": 0}
 
 
 def test_a_clean_answer_resets_the_carried_streak_and_not_json_neither_adds_nor_resets(monkeypatch):
@@ -804,7 +966,7 @@ def test_a_clean_answer_resets_the_carried_streak_and_not_json_neither_adds_nor_
     results, client = _real_backfill_pass(monkeypatch, seeds, handler, ["a.com", "b.com"])
     # 5 blocks, a 404 resets; then 4 + (not_json) + 3 = 7 blocks: under 8, so no abort.
     assert results["a.com"].status == DONE and results["b.com"].status == DONE
-    assert client.state["consecutive"] == 7 and client.short_circuited == 0
+    assert client.state == {"store": 7, "run": 7} and client.short_circuited == 0
 
 
 def test_the_streak_client_passes_a_transport_error_through_after_counting_it():
@@ -817,7 +979,7 @@ def test_the_streak_client_passes_a_transport_error_through_after_counting_it():
     client = refresh.BlockStreakClient(Raising(), backfill)
     with pytest.raises(httpx.ConnectError):
         asyncio.run(client.get("https://a.com/products/x.js"))
-    assert client.state["consecutive"] == 1
+    assert client.state == {"store": 1, "run": 1}
 
 
 # ── F1: the REAL run_lane, a stub database, fake writers ────────────────────────────────────────
@@ -963,8 +1125,179 @@ def test_the_real_enrichment_lane_hands_the_gate_the_shared_pacer_and_the_no_coo
         "the writer's no-cookie client, never a plain one"
     pacers = {id(c[3]["pacer"]) for c in writer.calls}
     assert len(pacers) == 1 and isinstance(writer.calls[0][3]["pacer"], FakeEnrichmentWriter.Pacer)
-    assert len({id(c[3]["block_state"]) for c in writer.calls}) == 1, "one block streak for the pass"
+    streaks = [c[3]["block_state"] for c in writer.calls]
+    assert len({id(x) for x in streaks}) == 2, "a store streak per store"
+    assert len({id(x.run) for x in streaks}) == 1, "one run streak for the pass"
     assert all(c[3]["limit"] == refresh.ENRICHMENT_PAGE_PRODUCTS for c in writer.calls)
     assert ensured == ([True] if apply else [])
     assert {r.status for r in state.results.values()} == {DONE}
     assert state.info["requests"] == 0
+
+
+# ── N1: back-off, blocked stores last, and the reviewer's simulation ─────────────────────────────
+
+
+def _cursor(status="done", blocked_until=None, completed=None):
+    return CursorRow(next_cursor=None, last_status=status, last_completed_at=completed, updated_at=None,
+                     blocked_until=blocked_until)
+
+
+def test_a_store_inside_its_back_off_is_skipped_and_one_past_it_goes_last():
+    cursors = {"a.com": _cursor(ABORTED, T0 + timedelta(days=1)),       # still backed off
+               "b.com": _cursor(ABORTED, T0 - timedelta(hours=1)),      # back-off over: retry, last
+               "c.com": _cursor(DONE)}
+    order, skipped = refresh.defer_blocked(["a.com", "b.com", "c.com", "d.com"], cursors, T0)
+    assert order == ["c.com", "d.com", "b.com"] and skipped == ["a.com"]
+
+
+class MemoryDb:
+    """A stub database that keeps the cursor table in memory across runs (and answers the stalest-first
+    read with nothing), so several days can be simulated through the REAL run_lane."""
+
+    def __init__(self) -> None:
+        self.rows: Dict[tuple, Dict[str, Any]] = {}
+
+    async def connect(self):
+        return None
+
+    async def disconnect(self):
+        return None
+
+    async def fetch_all(self, sql, values=None):
+        if "FROM reap_cart_proof_refresh_cursors" in sql:
+            return [dict(r, domain=d) for (lane, d), r in self.rows.items() if lane == values["lane"]]
+        return []
+
+    async def execute(self, sql, values=None):
+        if values and "INSERT INTO reap_cart_proof_refresh_cursors" in sql:
+            key = (values["lane"], values["domain"])
+            prior = self.rows.get(key, {})
+            row = {k: values[k] for k in ("next_cursor", "last_status", "blocked_until", "crash_count", "updated_at")}
+            row["last_completed_at"] = values["last_completed_at"] or prior.get("last_completed_at")
+            self.rows[key] = row
+
+
+def test_the_reviewers_simulation_one_always_blocking_store_and_41_healthy_all_walked(monkeypatch):
+    """N1. The blocking store sorts first (never completed, first by name) and 403s every .js. Day 1: it
+    is aborted after the threshold and every one of the 41 others is walked. Day 2: it is backed off.
+    Day 4: it is walked LAST, and the 41 are still all walked."""
+    from scripts import backfill_shopify_variant_ids as backfill
+
+    blocker = "aaa-blocker.com"
+    healthy = [f"store{i:02d}.com" for i in range(41)]
+    seeds = {d: _mirror_seeds(d, 3) for d in healthy}
+    seeds[blocker] = _mirror_seeds(blocker, 30)
+
+    async def fake_select(limit, domain, after=None, seed_ids=None):
+        rows = [r for r in seeds[domain] if after is None or r["id"] > after]
+        return [dict(r) for r in rows[:limit]]
+
+    monkeypatch.setattr(backfill, "select_candidates", fake_select)
+    monkeypatch.setattr(backfill, "GLOBAL_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(backfill, "PER_DOMAIN_MIN_GAP_S", 0.0)
+    requested: List[str] = []
+
+    def handler(request):
+        requested.append(request.url.host)
+        return httpx.Response(403 if request.url.host == blocker else 404)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(refresh.httpx, "AsyncClient",
+                        lambda *a, **k: real_client(transport=httpx.MockTransport(handler)))
+    db = MemoryDb()
+    plan = refresh.LanePlan(lane="mirror", domains=sorted([blocker, *healthy]), writer=backfill, gap_s=0.0,
+                            proof_max_age=timedelta(days=7))
+
+    def day(offset):
+        requested.clear()
+        state = refresh.RunState()
+        asyncio.run(refresh.run_lane(plan, apply=True, budget_s=600, emit=lambda line: None, state=state, db=db,
+                                     now=lambda: T0 + offset))
+        return state
+
+    first = day(timedelta(0))
+    assert first.info["domains_order"][0] == blocker
+    assert first.results[blocker].status == ABORTED and not first.results[blocker].pass_abort
+    assert [first.results[d].status for d in healthy] == [DONE] * 41
+    assert requested.count(blocker) == backfill.CONSECUTIVE_BLOCK_ABORT
+    assert exit_code(first.results) == refresh.EXIT_BUDGET
+
+    second = day(timedelta(days=1))
+    assert second.results[blocker].status == refresh.BACKED_OFF and blocker not in requested
+    assert [second.results[d].status for d in healthy] == [DONE] * 41
+    assert exit_code(second.results) == refresh.EXIT_OK
+
+    fourth = day(timedelta(days=3, hours=1))
+    assert fourth.info["domains_order"][-1] == blocker, "a store that blocked us goes last"
+    assert [fourth.results[d].status for d in healthy] == [DONE] * 41
+    assert fourth.results[blocker].status == ABORTED
+    assert db.rows[("mirror", blocker)]["blocked_until"] == T0 + timedelta(days=3, hours=1) + refresh.BLOCK_BACKOFF
+
+
+def test_the_enrichment_lane_backs_off_and_defers_its_fixed_order_too():
+    writer = FakeEnrichmentWriter()
+    plan = refresh.LanePlan(lane="enrichment", domains=["a.com", "b.com", "c.com"], writer=writer, gap_s=0.0,
+                            plans={"a.com": "PLAN-A", "b.com": "PLAN-B", "c.com": "PLAN-C"})
+    db = StubDb(cursor_rows=[
+        {"domain": "a.com", "next_cursor": None, "last_status": ABORTED, "last_completed_at": None,
+         "blocked_until": T0 - timedelta(hours=1), "crash_count": 0, "updated_at": None},
+        {"domain": "b.com", "next_cursor": None, "last_status": ABORTED, "last_completed_at": None,
+         "blocked_until": T0 + timedelta(days=2), "crash_count": 0, "updated_at": None}])
+    state = _run_real_lane(plan, apply=False, db=db)
+    assert [c[2] for c in writer.calls] == ["PLAN-C", "PLAN-A"]
+    assert state.results["b.com"].status == refresh.BACKED_OFF and "b.com" in state.info["backed_off"]
+
+
+# ── N3: the SIGTERM report is printed before the database is let go, and is never exit 0 ────────
+
+
+def _sigterm_main(monkeypatch, *, when):
+    """Run main() with the REAL run_lane on a stub database; SIGTERM is sent at `when` ("connect" or
+    "page"). Returns (exit code, report lines, lines printed before disconnect)."""
+    lines: List[str] = []
+    before_disconnect: List[List[str]] = []
+
+    class Db(StubDb):
+        async def connect(self):
+            await super().connect()
+            if when == "connect":
+                os.kill(os.getpid(), signal.SIGTERM)
+                await asyncio.sleep(30)
+
+        async def disconnect(self):
+            before_disconnect.append(list(lines))
+            await super().disconnect()
+
+    class Writer(FakeMirrorWriter):
+        async def run(self, **kwargs):
+            if kwargs["domain"] == "b.com":
+                os.kill(os.getpid(), signal.SIGTERM)
+                await asyncio.sleep(30)
+            return {"candidates": 0, "next_cursor": None, "aborted_on_block": False}
+
+    plan = refresh.LanePlan(lane="mirror", domains=["a.com", "b.com", "c.com"], writer=Writer(), gap_s=0.0,
+                            proof_max_age=timedelta(days=7))
+    monkeypatch.setattr(refresh, "plan_lane", lambda lane, now: plan)
+    real = refresh.run_lane
+
+    async def run_lane(plan, **kwargs):
+        return await real(plan, db=Db(), **kwargs)
+
+    monkeypatch.setattr(refresh, "run_lane", run_lane)
+    code = refresh.main(["mirror", "--on-crawl-egress", "--budget-seconds", "60"], environ={}, emit=lines.append)
+    return code, [line for line in lines if line.startswith(refresh.REPORT_PREFIX)], before_disconnect
+
+
+def test_the_partial_report_is_printed_before_the_disconnect(monkeypatch):
+    code, reports, before = _sigterm_main(monkeypatch, when="page")
+    assert code == refresh.EXIT_BUDGET and len(reports) == 1
+    assert before and any(line.startswith(refresh.REPORT_PREFIX) for line in before[0])
+    body = json.loads(reports[0][len(refresh.REPORT_PREFIX):])
+    assert body["terminated"] == "SIGTERM" and body["domains"]["b.com"]["status"] == TERMINATED
+
+
+def test_a_sigterm_before_any_store_still_reports_and_exits_4(monkeypatch):
+    code, reports, _before = _sigterm_main(monkeypatch, when="connect")
+    assert code == refresh.EXIT_BUDGET and len(reports) == 1
+    body = json.loads(reports[0][len(refresh.REPORT_PREFIX):])
+    assert body["terminated"] == "SIGTERM" and body["exit_code"] == refresh.EXIT_BUDGET

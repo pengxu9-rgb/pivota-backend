@@ -61,7 +61,8 @@ async def pg():
     await database.execute(f"DROP TABLE IF EXISTS {_TABLE}")
     await database.execute("CREATE TABLE IF NOT EXISTS external_product_seeds (id TEXT)")
     for name, column_type in (("domain", "TEXT"), ("seed_data", "JSONB DEFAULT '{}'::jsonb"),
-                              ("status", "TEXT DEFAULT 'active'")):
+                              ("status", "TEXT DEFAULT 'active'"), ("canonical_url", "TEXT"),
+                              ("destination_url", "TEXT"), ("updated_at", "TIMESTAMPTZ DEFAULT NOW()")):
         await database.execute(f"ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS {name} {column_type}")
     await database.execute("DELETE FROM external_product_seeds WHERE id LIKE :p", {"p": _PREFIX + "%"})
     yield database
@@ -101,7 +102,7 @@ async def test_the_self_heal_builds_what_migration_250_builds(pg):
     assert await _fingerprint(pg) == from_migration
     columns, constraints = from_migration
     assert [c[0] for c in columns] == ["lane", "domain", "next_cursor", "last_status", "last_completed_at",
-                                       "updated_at"]
+                                       "blocked_until", "crash_count", "updated_at"]
     assert ("p", "PRIMARY KEY (lane, domain)") in constraints
 
 
@@ -110,9 +111,10 @@ async def _seed(db, suffix, domain, proof, status="active"):
     if proof is not ...:
         seed_data["snapshot"]["shopify_cart_proof"] = proof
     await db.execute(
-        "INSERT INTO external_product_seeds (id, domain, seed_data, status) "
-        "VALUES (:id, :domain, CAST(:sd AS jsonb), :status)",
-        {"id": _PREFIX + suffix, "domain": domain, "sd": json.dumps(seed_data), "status": status})
+        "INSERT INTO external_product_seeds (id, domain, destination_url, seed_data, status) "
+        "VALUES (:id, :domain, :url, CAST(:sd AS jsonb), :status)",
+        {"id": _PREFIX + suffix, "domain": domain, "url": f"https://{domain}/products/h{suffix}",
+         "sd": json.dumps(seed_data), "status": status})
 
 
 async def test_the_stalest_first_read_counts_only_valid_active_object_proofs(pg):
@@ -122,7 +124,8 @@ async def test_the_stalest_first_read_counts_only_valid_active_object_proofs(pg)
         return {"source": "products_js_v1", "checked_at": (NOW - age).isoformat()}
 
     await _seed(pg, "1", "rcpr-a.com", proof(timedelta(days=2)))
-    await _seed(pg, "2", "WWW.rcpr-a.com", proof(timedelta(days=5)))
+    await _seed(pg, "2", "www.rcpr-a.com", proof(timedelta(days=5)))
+    await _seed(pg, "2b", "RCPR-A.com", proof(timedelta(days=6)))       # the backfill never selects it
     await _seed(pg, "3", "rcpr-b.com", proof(timedelta(days=9)))          # lapsed: ignored
     await _seed(pg, "4", "rcpr-b.com", None)                              # revoked (JSON null)
     await _seed(pg, "5", "rcpr-c.com", ...)                               # never proven
@@ -133,6 +136,11 @@ async def test_the_stalest_first_read_counts_only_valid_active_object_proofs(pg)
     assert ours == {"rcpr-a.com": NOW - timedelta(days=2), "www.rcpr-a.com": NOW - timedelta(days=5)}
     order = refresh.order_mirror_domains(["rcpr-a.com", "rcpr-b.com"], ours, {})
     assert order == ["rcpr-b.com", "rcpr-a.com"], "no proof at all sorts before an aging one"
+    # The backfill's own selection agrees about which seeds belong to rcpr-a.com.
+    from scripts.backfill_shopify_variant_ids import select_candidates
+
+    picked = {r["domain"] for r in await select_candidates(limit=50, domain="rcpr-a.com")}
+    assert picked == {"rcpr-a.com", "www.rcpr-a.com"}, "RCPR-A.com is neither walked nor counted"
 
 
 async def test_the_real_mirror_lane_checkpoints_and_the_next_run_resumes(pg):
@@ -165,15 +173,25 @@ async def test_the_real_mirror_lane_checkpoints_and_the_next_run_resumes(pg):
 
     row = (await cursors.load(pg, "mirror", table_must_exist=True))["rcpr-a.com"]
     assert row.next_cursor == "epsv_020" and row.last_status == refresh.ABORTED and row.last_completed_at is None
+    assert row.blocked_until == NOW + refresh.BLOCK_BACKOFF, "the store that blocked us is backed off"
+
+    # Inside the back-off the store is not walked at all.
+    idle = Writer([])
+    plan.writer = idle
+    skipped = refresh.RunState()
+    await refresh.run_lane(plan, apply=True, budget_s=60, emit=lambda line: None, state=skipped,
+                           db=_KeepOpen(pg), now=lambda: NOW + timedelta(days=1))
+    assert idle.calls == [] and skipped.results["rcpr-a.com"].status == refresh.BACKED_OFF
 
     second = Writer([{"candidates": 3, "aborted_on_block": False, "next_cursor": "epsv_023"}])
     plan.writer = second
+    later = NOW + refresh.BLOCK_BACKOFF + timedelta(hours=1)
     await refresh.run_lane(plan, apply=True, budget_s=60, emit=lambda line: None, state=refresh.RunState(),
-                           db=_KeepOpen(pg), now=lambda: NOW + timedelta(days=1))
-    assert second.calls == [("rcpr-a.com", "epsv_020")]
+                           db=_KeepOpen(pg), now=lambda: later)
+    assert second.calls == [("rcpr-a.com", "epsv_020")], "after the back-off it resumes from its cursor"
     row = (await cursors.load(pg, "mirror", table_must_exist=True))["rcpr-a.com"]
-    assert row.next_cursor is None and row.last_status == refresh.DONE
-    assert row.last_completed_at == NOW + timedelta(days=1)
+    assert row.next_cursor is None and row.last_status == refresh.DONE and row.blocked_until is None
+    assert row.last_completed_at == later
 
 
 class _KeepOpen:

@@ -30,6 +30,8 @@ _CREATE = """CREATE TABLE IF NOT EXISTS reap_cart_proof_refresh_cursors (
   next_cursor        TEXT,
   last_status        TEXT NOT NULL,
   last_completed_at  TIMESTAMPTZ,
+  blocked_until      TIMESTAMPTZ,
+  crash_count        INTEGER NOT NULL DEFAULT 0,
   updated_at         TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (lane, domain)
 )"""
@@ -37,7 +39,7 @@ _CREATE = """CREATE TABLE IF NOT EXISTS reap_cart_proof_refresh_cursors (
 _DDL_STATEMENTS = guarded_statements([_CREATE])
 
 SELECT_CURSORS_SQL = """
-    SELECT domain, next_cursor, last_status, last_completed_at, updated_at
+    SELECT domain, next_cursor, last_status, last_completed_at, blocked_until, crash_count, updated_at
       FROM reap_cart_proof_refresh_cursors
      WHERE lane = :lane
 """
@@ -46,12 +48,14 @@ SELECT_CURSORS_SQL = """
 # (NULL) keeps the stored value, so the mirror lane's ordering remembers when a store was last walked fully.
 UPSERT_CURSOR_SQL = """
     INSERT INTO reap_cart_proof_refresh_cursors
-        (lane, domain, next_cursor, last_status, last_completed_at, updated_at)
+        (lane, domain, next_cursor, last_status, last_completed_at, blocked_until, crash_count, updated_at)
     VALUES
-        (:lane, :domain, :next_cursor, :last_status, :last_completed_at, :updated_at)
+        (:lane, :domain, :next_cursor, :last_status, :last_completed_at, :blocked_until, :crash_count, :updated_at)
     ON CONFLICT (lane, domain) DO UPDATE SET
         next_cursor = excluded.next_cursor,
         last_status = excluded.last_status,
+        blocked_until = excluded.blocked_until,
+        crash_count = excluded.crash_count,
         last_completed_at = COALESCE(excluded.last_completed_at, reap_cart_proof_refresh_cursors.last_completed_at),
         updated_at = excluded.updated_at
 """
@@ -63,6 +67,8 @@ class CursorRow:
     last_status: str
     last_completed_at: Optional[datetime]
     updated_at: Optional[datetime]
+    blocked_until: Optional[datetime] = None
+    crash_count: int = 0
 
 
 async def ensure_table(db: Any) -> bool:
@@ -96,15 +102,19 @@ async def load(db: Any, lane: str, *, table_must_exist: bool) -> Dict[str, Curso
         out[str(row["domain"])] = CursorRow(
             next_cursor=row.get("next_cursor"), last_status=str(row.get("last_status") or ""),
             last_completed_at=_as_datetime(row.get("last_completed_at")),
-            updated_at=_as_datetime(row.get("updated_at")))
+            updated_at=_as_datetime(row.get("updated_at")),
+            blocked_until=_as_datetime(row.get("blocked_until")),
+            crash_count=int(row.get("crash_count") or 0))
     return out
 
 
 async def save(db: Any, *, lane: str, domain: str, next_cursor: Optional[str], last_status: str,
-               completed_at: Optional[datetime], now: datetime) -> None:
+               completed_at: Optional[datetime], now: datetime, blocked_until: Optional[datetime] = None,
+               crash_count: int = 0) -> None:
     await db.execute(UPSERT_CURSOR_SQL, {
         "lane": lane, "domain": domain, "next_cursor": next_cursor, "last_status": last_status,
-        "last_completed_at": completed_at, "updated_at": now,
+        "last_completed_at": completed_at, "blocked_until": blocked_until, "crash_count": int(crash_count),
+        "updated_at": now,
     })
 
 

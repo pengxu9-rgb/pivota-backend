@@ -98,3 +98,22 @@ async def test_a_missing_table_reads_as_no_cursors_only_for_a_dry_run():
     finally:
         if not was_connected and database.is_connected:
             await database.disconnect()
+
+
+async def test_the_block_back_off_and_the_crash_count_round_trip(cursor_db):
+    until = datetime(2026, 10, 3, 10, 0, tzinfo=timezone.utc)
+    await cursors.save(cursor_db, lane="mirror", domain="b.com", next_cursor="epsv_1", last_status="aborted_on_block",
+                       completed_at=None, now=T1, blocked_until=until, crash_count=0)
+    await cursors.save(cursor_db, lane="mirror", domain="c.com", next_cursor="epsv_2", last_status="crashed",
+                       completed_at=None, now=T1, crash_count=1)
+    rows = await cursors.load(cursor_db, "mirror", table_must_exist=True)
+    assert _utc(rows["b.com"].blocked_until) == until and rows["b.com"].crash_count == 0
+    assert rows["c.com"].blocked_until is None and rows["c.com"].crash_count == 1
+    # An UPDATE carries the crash count too (the second crash in a row at a cursor).
+    await cursors.save(cursor_db, lane="mirror", domain="c.com", next_cursor="epsv_2", last_status="crashed",
+                       completed_at=None, now=T2, crash_count=2)
+    assert (await cursors.load(cursor_db, "mirror", table_must_exist=True))["c.com"].crash_count == 2
+    # A later write that is not a block clears the back-off.
+    await cursors.save(cursor_db, lane="mirror", domain="b.com", next_cursor=None, last_status="done",
+                       completed_at=T2, now=T2)
+    assert (await cursors.load(cursor_db, "mirror", table_must_exist=True))["b.com"].blocked_until is None
