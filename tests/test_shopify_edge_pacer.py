@@ -1150,11 +1150,21 @@ async def test_a_burst_of_concurrent_callers_stays_in_budget_without_healing(mon
     """Four processes each bursting 50 concurrent callers. Without the lookahead cap every caller
     got a future slot at once, the shared backlog outran the horizon, and the SQL heal restarted the
     schedule underneath slots already handed out: 3.17 req/s against a 2.0 budget in the reviewer's
-    simulation. Real time, scaled: rate 100/s, horizon floor 1.2s."""
+    simulation. Real time, scaled: rate 100/s, horizon floor 1.2s.
+
+    ASSERTED ON THE SCHEDULE, NOT ON WAKE TIMES. At 100/s slots are 10ms apart, so any event-loop
+    stall (a full GC on a 30k-test shard's heap takes ~320ms) wakes every overdue caller together; a
+    wall-clock window check flaked 3 runs in 30. What the budget promises is the SCHEDULE: the
+    leased windows on the shared timeline never overlap (so no stretch of it holds more than rate x
+    width + 1 slots), no lease was healed on top of another, and the slots handed to callers span at
+    least the budget's time. All exact, whatever the scheduler does.
+    """
+    import gc
+
     rate, per_process, procs = 100.0, 50, 4
     monkeypatch.setenv(sep.ENABLED_ENV, "1")
     monkeypatch.setenv(sep.RATE_ENV, str(rate))  # each copy's rate cap is raised to allow it
-    db = {"next": 0.0, "heals": 0, "leases": 0}
+    db = {"next": 0.0, "heals": 0, "windows": []}
 
     async def lease(bucket, *, slots, rate_per_s, horizon_s):
         now = time.monotonic()
@@ -1165,10 +1175,10 @@ async def test_a_burst_of_concurrent_callers_stays_in_budget_without_healing(mon
         else:
             base = max(db["next"], now)
         db["next"] = base + span
-        db["leases"] += 1
+        db["windows"].append((base, base + span))
         return base, now
 
-    starts: List[float] = []
+    handed: List[float] = []
     copies = []
     for i in range(procs):
         m = _pacer_copy(f"_edge_pacer_proc{i}")
@@ -1176,17 +1186,31 @@ async def test_a_burst_of_concurrent_callers_stays_in_budget_without_healing(mon
         m._HORIZON_MIN = 1.2
         m._DEMAND_WINDOW = 0.02  # the 1s demand window at this 50x time scale
         m._lease_fn = lease
+        real_take = m.take_nowait
+
+        def take(*, max_wait=None, _real=real_take):
+            slot = _real(max_wait=max_wait)
+            if slot is not None:
+                handed.append(slot)
+            return slot
+
+        m.take_nowait = take
         copies.append(m)
 
-    async def one(m) -> None:
-        await m.acquire()
-        starts.append(time.monotonic())
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(m.acquire() for m in copies for _ in range(per_process))), timeout=60)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
 
-    await asyncio.wait_for(
-        asyncio.gather(*(one(m) for m in copies for _ in range(per_process))), timeout=30)
-    starts.sort()
     total = procs * per_process
-    assert db["heals"] == 0, db
-    assert starts[-1] - starts[0] >= (total - 3) / rate, starts[-1] - starts[0]
-    worst = max(sum(1 for t in starts if s <= t < s + 1.0 / rate * 10) for s in starts)
-    assert worst <= 10 + 2, worst
+    assert db["heals"] == 0, db["heals"]
+    windows = sorted(db["windows"])
+    overlaps = [(a, b) for a, b in zip(windows, windows[1:]) if b[0] < a[1] - 1e-9]
+    assert not overlaps, overlaps[:3]
+    assert len(handed) == total
+    handed.sort()
+    assert handed[-1] - handed[0] >= (total - 3) / rate, handed[-1] - handed[0]
