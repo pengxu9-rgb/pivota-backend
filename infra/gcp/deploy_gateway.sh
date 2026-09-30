@@ -102,8 +102,15 @@ case "$CONFIG" in preserve|apply) ;; *) echo "CONFIG must be preserve or apply (
 # outside the VPC - including the operator running the deploy. Pass INGRESS=internal explicitly to
 # tighten it as a considered change rather than a side effect of shipping code.
 : "${INGRESS:=$([ "$ENV" = prod ] && echo internal-and-cloud-load-balancing || echo all)}"
+# UNDER CONFIG=preserve AN UNSET PUBLIC KEEPS WHAT THE SERVICE ALREADY GRANTS (see
+# preserved_public_invoker below): a service that already grants roles/run.invoker to allUsers is
+# redeployed public. The staging gateway became allUsers-invokable on 2026-09-29 (Peng) so partner
+# agents (Meitu, Chance AI) can call /ucp/mcp with their agent keys. On 2026-09-30 04:05Z a preserve
+# deploy of staging (d02ff489a) ran --no-allow-unauthenticated and silently REVOKED that binding:
+# every anonymous call got Cloud Run's 403. Same fix as deploy_backend.sh (#2452). An explicit
+# PUBLIC=0 still wins.
+_PUBLIC_EXPLICIT="${PUBLIC+1}"
 : "${PUBLIC:=$([ "$ENV" = prod ] && echo 1 || echo 0)}"
-[ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
 GCLOUD="${GCLOUD:-gcloud}"
 # ── SHAPE OVERRIDES ────────────────────────────────────────────────────────────────────────────
 # `CONCURRENCY_LIMIT` is the name the rest of the repo uses (deploy_backend.sh, the proof-issuer
@@ -147,6 +154,22 @@ esac
 esac
 REGION=us-west1
 SERVICE="${SERVICE:-gateway}"
+preserved_public_invoker(){ # echoes 1 when the running service grants roles/run.invoker to allUsers
+  # A read failure (no service yet, no permission) echoes nothing: the env default then stands.
+  "$GCLOUD" run services get-iam-policy "$SERVICE" --project "$PROJECT" --region "$REGION" --format=json 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print(1 if any(b.get("role") == "roles/run.invoker" and "allUsers" in (b.get("members") or []) for b in (d.get("bindings") or [])) else 0)' 2>/dev/null || true
+}
+if [ -z "$_PUBLIC_EXPLICIT" ] && [ "$CONFIG" = preserve ] && [ "$PUBLIC" != 1 ] \
+   && [ "$(preserved_public_invoker)" = 1 ]; then
+  PUBLIC=1
+  echo "note: $SERVICE already grants roles/run.invoker to allUsers; CONFIG=preserve keeps it (PUBLIC=1). Pass PUBLIC=0 to make it private." >&2
+fi
+[ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
 IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$TAG"
 CANDIDATE_TAG="c-$(printf '%s' "$TAG" | tr -cd '[:alnum:]' | tail -c 12)"
 # `--no-traffic` is rejected on service CREATION, so the candidate-then-verify flow only applies to
