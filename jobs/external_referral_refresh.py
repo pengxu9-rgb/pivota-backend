@@ -84,18 +84,34 @@ async def run_daily_external_referral_refresh(
     limit: int = 500,
     budget_seconds: Optional[float] = None,
     host_concurrency: Optional[int] = None,
+    ip_throttle_trip_hosts: Optional[int] = None,
+    ip_throttle_window_seconds: Optional[float] = None,
+    ip_throttle_enabled: Optional[bool] = None,
 ) -> Dict[str, Any]:
     summary = await run_external_referral_refresh_batch(
         refresh_seed_by_id=_refresh_unbounded,
         limit=limit,
         budget_seconds=budget_seconds,
         host_concurrency=host_concurrency,
+        ip_throttle_trip_hosts=ip_throttle_trip_hosts,
+        ip_throttle_window_seconds=ip_throttle_window_seconds,
+        ip_throttle_enabled=ip_throttle_enabled,
     )
     if shopify_edge_pacer.enabled():
         # Only with the flag on, so the summary is unchanged while the pacer is dark. Every fetch
         # of this job reaches the shared budget through `crawl_politeness.await_slot`.
         summary["shopify_edge_pacer"] = shopify_edge_pacer.stats()
     return summary
+
+
+# Exit codes. Both non-zero ones fail the Cloud Run execution, so an alert on a failed execution
+# fires for either; the code (and the log line before it) says which it was.
+EXIT_OK = 0
+EXIT_DEGRADED = 1
+# A shared edge (Shopify's, on 09-30) throttled our egress IP and the run stopped asking the hosts
+# that throttled it (`services.crawl_ip_throttle`). Distinct from 1 because the fix is different: nothing on
+# our side is broken, the crawl rate from one IP is. Not 2, which argparse uses for bad arguments.
+EXIT_IP_THROTTLED = 3
 
 
 PRICE_REFRESH_KEYS = (
@@ -115,6 +131,13 @@ PRICE_REFRESH_KEYS = (
 def price_refresh_line(summary: Dict[str, Any]) -> Dict[str, Any]:
     """The run's price outcomes, as the one `PRICE_REFRESH` log line carries them."""
     return {key: summary.get(key) for key in PRICE_REFRESH_KEYS}
+
+
+def ip_throttle_line(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """The IP breaker's outcome and the 429/503 diagnostics, as the `IP_THROTTLE` line carries them."""
+    keys = [k for k in summary if k.startswith("ip_throttle")]
+    keys += ["skipped_for_ip_throttle", "throttle_diagnostics", "status", "status_without_ip_throttle"]
+    return {key: summary.get(key) for key in keys}
 
 
 def main() -> int:
@@ -140,6 +163,32 @@ def main() -> int:
             "EXTERNAL_REFERRAL_REFRESH_HOST_CONCURRENCY, then 1. Clamped to [1, 8]."
         ),
     )
+    parser.add_argument(
+        "--ip-throttle-trip-hosts",
+        type=int,
+        default=None,
+        help=(
+            "Distinct hosts answering 429 (or 503 + Retry-After) within the window that trip the "
+            "IP breaker. Defaults to CRAWL_IP_THROTTLE_TRIP_HOSTS, then 10. <= 0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--ip-throttle-window-seconds",
+        type=float,
+        default=None,
+        help=(
+            "The IP breaker's sliding window. Defaults to CRAWL_IP_THROTTLE_WINDOW_SECONDS, then 60. "
+            "A value <= 0 is invalid and falls back to 60; use --no-ip-throttle-breaker to disable."
+        ),
+    )
+    parser.add_argument(
+        "--no-ip-throttle-breaker",
+        action="store_true",
+        help=(
+            "Kill switch: never trip the IP breaker (diagnostics are still collected). "
+            "CRAWL_IP_THROTTLE_BREAKER_ENABLED=false does the same without a flag."
+        ),
+    )
     args = parser.parse_args()
 
     # THE POOL DOES NOT EXIST UNTIL SOMEONE OPENS IT. Inside the API process the lifespan hook
@@ -156,6 +205,10 @@ def main() -> int:
                 limit=args.limit,
                 budget_seconds=args.budget_seconds,
                 host_concurrency=args.host_concurrency,
+                ip_throttle_trip_hosts=args.ip_throttle_trip_hosts,
+                ip_throttle_window_seconds=args.ip_throttle_window_seconds,
+                # None, not True, when the flag is absent: the env var still gets its say.
+                ip_throttle_enabled=False if args.no_ip_throttle_breaker else None,
             )
         finally:
             await database.disconnect()
@@ -166,6 +219,8 @@ def main() -> int:
     # line in Cloud Logging) and the logger.info below is dropped in prod (root at WARNING), so
     # neither can be filtered for a night's price counts. The prefix keeps it textPayload.
     print("PRICE_REFRESH " + json.dumps(price_refresh_line(summary), separators=(",", ":"), default=str))
+    # Same reason, for the IP breaker and the 429/503 header aggregate: one filterable line a night.
+    print("IP_THROTTLE " + json.dumps(ip_throttle_line(summary), separators=(",", ":"), default=str))
     logger.info("external referral refresh completed", extra={"summary": summary})
     # EXIT CODE FOLLOWS THE SUMMARY. This used to `return 0` unconditionally, so Cloud Run
     # showed a green tick over every run — including nights that stopped on budget with 659
@@ -173,6 +228,21 @@ def main() -> int:
     # A scheduler tick is the only place anyone would notice, so the summary has to reach it.
     # `maxRetries` is 0 on the job, so a non-zero exit surfaces the run without a retry storm.
     status = str(summary.get("status") or "").strip().lower()
+    if status == "ip_throttled":
+        logger.error(
+            "external referral refresh finished ip_throttled: %s distinct hosts answered "
+            "429 within %ss (first 429 %s, tripped %s); %s rows deferred to the next run "
+            "(skipped_for_ip_throttle). Without the IP throttle this run would read %s "
+            "(origin_yield=%s)",
+            summary.get("ip_throttle_trip_host_count"),
+            summary.get("ip_throttle_window_seconds"),
+            summary.get("ip_throttle_first_429_at"),
+            summary.get("ip_throttle_tripped_at"),
+            summary.get("skipped_for_ip_throttle"),
+            summary.get("status_without_ip_throttle"),
+            summary.get("origin_yield"),
+        )
+        return EXIT_IP_THROTTLED
     if status != "success":
         logger.warning(
             "external referral refresh finished %s (stopped_early=%s budget_reach=%s "
@@ -184,8 +254,8 @@ def main() -> int:
             summary.get("host_backoff_skips"),
             summary.get("degraded_reason_counts"),
         )
-        return 1
-    return 0
+        return EXIT_DEGRADED
+    return EXIT_OK
 
 
 if __name__ == "__main__":
