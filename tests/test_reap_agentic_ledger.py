@@ -4451,6 +4451,32 @@ async def test_the_self_heal_warns_when_the_one_pending_index_cannot_be_built(ca
     await ensure_required_schema_light()
     warned = [r for r in caplog.records if "uq_reap_agentic_enrollments_one_pending" in r.getMessage()]
     assert len(warned) == 1 and warned[0].levelno == _logging.WARNING
-    assert "census" in warned[0].getMessage()
-    assert "re_dup" not in warned[0].getMessage(), "the exception TYPE only, never row values"
+    assert "census" in warned[0].getMessage(), "a UNIQUE violation names the duplicates"
+    assert "IntegrityError" in warned[0].getMessage(), "the real exception, not a guess"
+    assert "re_dup" not in warned[0].getMessage(), "DDL text only, never row values"
     assert await _enrollment_count() == 2, "swallowed: startup went on, nothing was deleted"
+
+
+async def test_the_self_heal_does_not_blame_duplicates_for_another_failure(caplog, monkeypatch):
+    """Deploy-safety nit on e426d3b34: a failure that is NOT a unique violation (here a locked
+    database) is reported as itself — "could not build <index>: <exc>" — without the census
+    advice, which would send an operator looking for duplicates that do not exist."""
+    import logging as _logging
+
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
+    real = database.execute
+
+    async def _locked(query, *args, **kwargs):
+        if "uq_reap_agentic_enrollments_one_pending" in str(query):
+            raise sqlite3.OperationalError("database is locked")
+        return await real(query, *args, **kwargs)
+
+    monkeypatch.setattr(database, "execute", _locked)
+    caplog.set_level(_logging.WARNING, logger="db.schema_guard")
+    await ensure_required_schema_light()
+    warned = [r for r in caplog.records if "uq_reap_agentic_enrollments_one_pending" in r.getMessage()]
+    assert len(warned) == 1
+    text = warned[0].getMessage()
+    assert "could not build uq_reap_agentic_enrollments_one_pending" in text
+    assert "OperationalError: database is locked" in text
+    assert "census" not in text and "duplicate" not in text

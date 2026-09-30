@@ -218,8 +218,14 @@ async def seed_buyer_ref(*, buyer_id: str, reap_buyer_ref: str) -> None:
 
 
 async def seed_enrollment(*, reap_buyer_ref: str, status: str = "active") -> str:
-    """One enrollment on a ref, in `status`. Built through the ledger's own writers so the row is
-    the shape production writes, not a hand-assembled INSERT that could outlive a column."""
+    """One enrollment on a ref, in `status` ('active' | 'pending' | 'dead'). Built through the
+    ledger's own writers so the row is the shape production writes, not a hand-assembled INSERT
+    that could outlive a column.
+
+    EVERY status passes through 'pending' first, and migration 252
+    (`uq_reap_agentic_enrollments_one_pending`) allows ONE pending row per ref: seed the
+    'active' and 'dead' rows BEFORE the one 'pending' row, or drop the index first to model a
+    database that predates it (`drop_one_pending_index`)."""
     # AN EXPLICIT (and deliberately unmatched) id forces the INSERT arm, so every call here is
     # a DISTINCT row. Left to itself `upsert_pending_enrollment` REFRESHES the ref's existing
     # pending row — correct in production, and useless for a fixture that needs a stack of them.
@@ -237,9 +243,19 @@ async def seed_enrollment(*, reap_buyer_ref: str, status: str = "active") -> str
             card_network="VISA",
             card_last4="4242",
         )
+    elif status == "dead":
+        await ledger.mark_enrollment_dead(enrollment_id, reap_status="EXPIRED")
     elif status != "pending":
         raise AssertionError(f"unsupported seed status {status!r}")
     return enrollment_id
+
+
+async def drop_one_pending_index() -> None:
+    """A database migration 252 has not reached — production and staging predate the index, and
+    the self-heal SKIPS it where a ref already holds two pending rows. Such a database can carry
+    a stack of pending attempts on one ref, and everything that sweeps a ref must still see them
+    all."""
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
 
 
 async def enrollment_row(enrollment_id: str):
@@ -817,12 +833,38 @@ async def test_retire_of_an_unknown_buyer_is_zeros_not_an_error():
 
 
 async def test_retire_counts_every_enrollment_on_the_ref():
-    """`mark_enrollment_dead` is called per ROW, not once per ref: a ref can carry a stack of
-    pending attempts beside its active one, and each of them is a page a card can be entered on.
+    """`mark_enrollment_dead` is called per ROW, not once per ref: a ref carries rows in every
+    status — its active card, its pending attempt (a page a card can be entered on), and the
+    dead ones it has already retired — and the count is exactly the rows that were LIVE.
 
     The count is what the log line reports, so it is asserted rather than inferred from "they are
-    all dead now" — a sweep that dealt with one and reported three would read as healthy.
+    all dead now" — a sweep that dealt with one and reported two would read as healthy. The dead
+    rows are the control: already dead, not counted, and not rewritten.
     """
+    await seed_buyer_ref(buyer_id=MINTED_BUYER, reap_buyer_ref=REAP_REF)
+    # Order matters under migration 252: one pending row per ref, so the rows that pass through
+    # 'pending' on their way to another status are seeded first.
+    retired_1 = await seed_enrollment(reap_buyer_ref=REAP_REF, status="dead")
+    retired_2 = await seed_enrollment(reap_buyer_ref=REAP_REF, status="dead")
+    card = await seed_enrollment(reap_buyer_ref=REAP_REF, status="active")
+    attempt = await seed_enrollment(reap_buyer_ref=REAP_REF, status="pending")
+
+    report = await ledger.retire_buyer_refs_for_buyer(MINTED_BUYER, reason="buyer_link_repointed")
+
+    assert (report.refs_retired, report.enrollments_marked_dead) == (1, 2)
+    for enrollment_id in (card, attempt):
+        row = dict(await enrollment_row(enrollment_id))
+        assert (row["status"], row["reap_status"]) == ("dead", "buyer_link_repointed")
+    for enrollment_id in (retired_1, retired_2):
+        row = dict(await enrollment_row(enrollment_id))
+        assert (row["status"], row["reap_status"]) == ("dead", "EXPIRED"), "not rewritten"
+
+
+async def test_retire_counts_every_pending_attempt_on_a_ref_that_predates_migration_252():
+    """REAL DATA CAN HOLD A STACK OF PENDING ATTEMPTS. Production and staging predate migration
+    252, and the self-heal skips the index where duplicates already exist — so a ref may carry
+    two pending rows beside its active one, and the retire must count and kill all three."""
+    await drop_one_pending_index()
     await seed_buyer_ref(buyer_id=MINTED_BUYER, reap_buyer_ref=REAP_REF)
     first = await seed_enrollment(reap_buyer_ref=REAP_REF, status="pending")
     second = await seed_enrollment(reap_buyer_ref=REAP_REF, status="pending")

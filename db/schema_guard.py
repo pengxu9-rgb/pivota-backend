@@ -642,19 +642,55 @@ async def check_required_schema() -> Dict[str, List[str]]:
     return missing
 
 
+def _is_unique_violation(exc: BaseException) -> bool:
+    """A UNIQUE violation on either driver: asyncpg's `UniqueViolationError` (SQLSTATE 23505) or
+    SQLite's `IntegrityError` naming "unique", looked for through `__cause__`/`__context__`/`orig`
+    too. Local rather than imported from db/reap_agentic_ledger: this module is imported by far
+    more than the rail, and must not pull the rail's imports into every boot."""
+    seen, candidates = set(), [exc]
+    while candidates:
+        current = candidates.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if getattr(current, "sqlstate", None) == "23505":
+            return True
+        if type(current).__name__ == "UniqueViolationError":
+            return True
+        if type(current).__name__ == "IntegrityError" and "unique" in str(current).lower():
+            return True
+        candidates.extend(
+            (current.__cause__, current.__context__, getattr(current, "orig", None))
+        )
+    return False
+
+
 def _warn_one_pending_index_missing(exc: BaseException) -> None:
     """Migration 252's index could not be built. SWALLOWED like every sibling (startup must not
     fail on it) but NOT SILENT, because this is the one index whose absence changes behaviour:
     without it a concurrent mint is no longer handed the winner, and the purchase service's
-    reconcile-every-pending-row path is what keeps a buyer from being stranded. The usual cause
-    is a buyer that already has two pending enrollments; the runbook's census finds them. The
-    exception TYPE only — never its text, which can quote row values."""
+    reconcile-every-pending-row path is what keeps a buyer from being stranded.
+
+    THE CAUSE IS NAMED ONLY WHEN IT IS KNOWN. A unique violation means a buyer_ref already holds
+    two pending enrollments, and the runbook's census finds them; any other failure (a missing
+    table, a lock, a permission) is reported as what it is, not blamed on duplicates. The
+    exception's MESSAGE is logged: for a CREATE INDEX it is DDL text (Postgres keeps the
+    offending key in `detail`, which is not read here), never a row of buyer data."""
+    message = str(exc)[:300]
+    if _is_unique_violation(exc):
+        logger.warning(
+            "schema_guard: could not create uq_reap_agentic_enrollments_one_pending: %s: %s — "
+            "a buyer_ref already has two pending enrollments. Run the census in "
+            "docs/runbooks/reap_agentic_purchase.md ('One pending row per buyer') and reconcile "
+            "the duplicates, then restart or apply db/migrations/252 by hand",
+            type(exc).__name__,
+            message,
+        )
+        return
     logger.warning(
-        "schema_guard: could not create uq_reap_agentic_enrollments_one_pending (%s); "
-        "a buyer_ref probably already has two pending enrollments. Run the census in "
-        "docs/runbooks/reap_agentic_purchase.md ('One pending row per buyer') and reconcile "
-        "the duplicates, then restart or apply db/migrations/252 by hand",
+        "schema_guard: could not build uq_reap_agentic_enrollments_one_pending: %s: %s",
         type(exc).__name__,
+        message,
     )
 
 
