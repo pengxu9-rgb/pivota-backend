@@ -45,6 +45,7 @@ import httpx
 
 from db.database import database
 from services import crawl_politeness
+from services import shopify_edge_pacer
 from services.catalog_offer_suppression import cascade_offer_suppression
 from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
 from services.outbound_warm_handoff import extract_product_handle
@@ -243,6 +244,8 @@ async def probe_destination(
     crawl_politeness.note_response(
         url, resp.status_code, retry_after=resp.headers.get("retry-after")
     )
+    # Teaches the shared Shopify-edge budget which hosts it covers (a no-op with its flag off).
+    shopify_edge_pacer.learn_from_response(str(resp.url), resp.headers)
     return classify_destination(
         requested_url=url,
         status_code=resp.status_code,
@@ -343,6 +346,7 @@ async def _get_catalogue_page(
         crawl_politeness.note_response(
             url, resp.status_code, retry_after=resp.headers.get("retry-after")
         )
+        shopify_edge_pacer.learn_from_response(str(resp.url), resp.headers)
         mitigated = resp.headers.get("cf-mitigated")
         if mitigated:
             # A challenge is a refusal, not a pacing signal — retrying can only stall.
