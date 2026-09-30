@@ -325,10 +325,11 @@ upsert "prod: Cloud Run job failing" "$(policy \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 300s 3600s)"
 
 # A 300s alignment covers several 60s samples; empty windows must not reset the duration timer.
-# This is continuous job occupancy, including overlapping executions, not per-execution age.
+# This is continuous job occupancy (running_executions > 0 for 2h), not per-execution age: one wedged
+# run or runs chained back to back both fire it; two short overlapping runs do not.
 upsert "prod: relgraph-sync running over two hours" "$(policy \
   "prod: relgraph-sync running over two hours" \
-  "relgraph-sync has running executions continuously for two hours. Today's daily run takes ~37 minutes (build ~8, sequential review ~29); the inner step timeout is 45 minutes. Task timeout is 14400s with max-retries 1, so a wedged task can remain alive well after the expected run. This also detects overlapping executions. Sampling/visibility lag can delay the alert several minutes." \
+  "relgraph-sync has running executions continuously for two hours. Today's daily run takes ~37 minutes (build ~8, sequential review ~29); the inner step timeout is 45 minutes. Task timeout is 14400s with max-retries 1, so a wedged task can remain alive well after the expected run. It fires on continuous occupancy of two hours or more, whether one wedged run or runs chained back to back; two short overlapping runs do not trip it. Sampling/visibility lag can delay the alert several minutes." \
   'metric.type="run.googleapis.com/job/running_executions" AND resource.type="cloud_run_job" AND resource.label.job_name="relgraph-sync"' \
   ALIGN_MAX REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 7200s 14400s)"
 

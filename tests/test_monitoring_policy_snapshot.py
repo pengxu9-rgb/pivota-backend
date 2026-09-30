@@ -50,9 +50,28 @@ def test_relgraph_occupancy_alert_shape_and_current_sizing():
                           'crossSeriesReducer': 'REDUCE_SUM', 'groupByFields': ['resource.label.job_name']}],
         'comparison': 'COMPARISON_GT', 'thresholdValue': 0, 'duration': '7200s', 'trigger': {'count': 1},
     }
-    for phrase in ['~37 minutes', '45 minutes', '14400s', 'max-retries 1', 'overlapping executions']:
+    for phrase in ['~37 minutes', '45 minutes', '14400s', 'max-retries 1', 'continuous occupancy of two hours']:
         assert phrase in policy['documentation']['content']
     assert policy['notificationChannels'] == LIVE[0]['notificationChannels']
+
+
+# Fields the API assigns or manages; everything else the upsert's delete+create writes (or wipes).
+SERVER_MANAGED = {'name', 'creationRecord', 'mutationRecord'}
+
+
+def comparable_policy(policy):
+    policy = {k: v for k, v in json.loads(json.dumps(policy)).items() if k not in SERVER_MANAGED}
+    policy['conditions'] = [clean_condition(c) for c in policy.get('conditions', [])]
+    policy.setdefault('enabled', True)  # the API default on create, echoed on read
+    return policy
+
+
+def test_every_field_the_upsert_writes_matches_live_for_every_policy():
+    # Whole policy, not a key list: a live severity, userLabels or enabled=false that the generator
+    # omits would be wiped by the delete+create, and must fail here first.
+    generated = generated_policies()
+    for live in LIVE:
+        assert comparable_policy(generated[live['displayName']]) == comparable_policy(live), live['displayName']
 
 
 def test_every_live_policy_is_compared_and_only_reported_drift_remains():
