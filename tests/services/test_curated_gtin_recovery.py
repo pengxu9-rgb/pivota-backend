@@ -62,8 +62,10 @@ async def test_only_barcode_copied_and_native_identity_preserved(monkeypatch):
     expected['variants'][0]['barcode'] = GTIN
     assert rows == [expected]
     assert p == before
-    assert report == dict(attempted=1, recovered=1, failed=0, capped=0, recovered_gtins=1, http_requests=1)
-    assert feed.crawl_politeness.before_request.await_args.kwargs['max_wait'] == 10.0
+    assert report == dict(attempted=1, recovered=1, failed=0, paced=0, capped=0, recovered_gtins=1, http_requests=1)
+    # Waits for its turn (#2477): a bounded wait refused every product once the shared Shopify-edge
+    # schedule was over 10s out, and the recovery ended `failed` having sent nothing.
+    assert feed.crawl_politeness.before_request.await_args.kwargs['max_wait'] == 0
 
 
 @pytest.mark.asyncio

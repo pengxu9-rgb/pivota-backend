@@ -524,6 +524,10 @@ async def fetch_shopify_products(
     # /products.json (and a collection's) is Shopify's storefront feed: this host is Shopify-served
     # by construction, so every page of the crawl -- the first included -- is paced on the crawl IP's
     # shared Shopify-edge budget (a no-op with CRAWL_SHOPIFY_EDGE_PACER_ENABLED off).
+    # MARKED BEFORE THE ANSWER, on purpose: page 1 is where pacing matters under a throttle. The cost
+    # is that a non-Shopify brand domain probed here (records_for_brand tries this first; such a
+    # domain returns nothing) spends one or two requests of the shared budget and stays cached as
+    # Shopify for this process. That can only slow its requests, never cause a 429 (review of #2477).
     shopify_edge_pacer.mark_shopify_host(host)
     timeout = httpx.Timeout(timeout_s, connect=5.0)
     headers = {"User-Agent": _UA, "Accept": "application/json"}
@@ -706,7 +710,13 @@ async def _fetch_missing_variant_gtins(
     shopify_edge_pacer.mark_shopify_host(host)  # /products/<handle>.js is a Shopify endpoint
     try:
         for redirect in range(3):
-            await crawl_politeness.before_request(url, user_agent=_UA, max_wait=10.0)
+            # WAIT FOR THE TURN (max_wait=0, like every other request in this module). A bounded wait
+            # made a marked host's request refuse whenever the shared Shopify-edge schedule was more
+            # than 10s out, and every later product the same way: with the pacer on and backed up,
+            # the whole recovery ended "failed" having sent nothing (review of #2477). A refusal that
+            # can still happen (CrawlDelayTooLong) propagates to recover_missing_variant_gtins, which
+            # counts it as `paced`, not `failed`.
+            await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
             requests += 1
             response = await client.get(url)
             _note_response(url, response)
@@ -742,6 +752,8 @@ async def _fetch_missing_variant_gtins(
                 if gtin:
                     recovered[vid] = gtin
             return recovered, requests
+    except crawl_politeness.CrawlPaced:
+        raise  # a pacing refusal is not this product's failure; the caller stops and counts it
     except Exception as exc:
         logger.debug("GTIN recovery refused for %s/%s: %s", host, handle, type(exc).__name__)
     return {}, requests
@@ -752,8 +764,10 @@ async def recover_missing_variant_gtins(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Recover selected products only, before shade folding changes product identity.
 
-    attempted/recovered/failed/capped count PRODUCTS; recovered_gtins counts variant
-    barcodes and http_requests includes bounded redirect hops. A failed observation
+    attempted/recovered/failed/capped/paced count PRODUCTS; recovered_gtins counts variant
+    barcodes and http_requests includes bounded redirect hops. `paced` is products not recovered
+    because the crawl gate refused to pace a request (CrawlPaced): the batch stops there -- every
+    later product would be refused the same way -- and none of them is counted `failed`. A failed observation
     never changes its product. Each attempt has at most three requests with the
     client's ten-second timeout, paced by the shared merchant crawl gate.
     """
@@ -763,15 +777,23 @@ async def recover_missing_variant_gtins(
               for p in products]
     candidates = [p for p in copied if any(isinstance(v, dict) and _missing_barcode(v)
                                           for v in p["variants"])]
-    report = {"attempted": 0, "recovered": 0, "failed": 0,
+    report = {"attempted": 0, "recovered": 0, "failed": 0, "paced": 0,
               "capped": max(0, len(candidates) - max_fetches), "recovered_gtins": 0, "http_requests": 0}
     if not candidates or not max_fetches:
         return copied, report
     async with httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(10.0, connect=5.0),
                                  headers={"User-Agent": _UA, "Accept": "application/json"}) as client:
-        for product in candidates[:max_fetches]:
+        batch = candidates[:max_fetches]
+        for index, product in enumerate(batch):
             report["attempted"] += 1
-            recovered, requests = await _fetch_missing_variant_gtins(product, domain=domain, client=client)
+            try:
+                recovered, requests = await _fetch_missing_variant_gtins(product, domain=domain, client=client)
+            except crawl_politeness.CrawlPaced as exc:
+                report["paced"] = len(batch) - index
+                report["attempted"] -= 1
+                logger.warning("GTIN recovery for %s stopped: the crawl gate refused to pace (%s); %d "
+                               "product(s) not attempted", domain, type(exc).__name__, report["paced"])
+                break
             report["http_requests"] += requests
             applied = 0
             for variant in product["variants"]:

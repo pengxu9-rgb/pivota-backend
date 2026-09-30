@@ -134,3 +134,75 @@ def test_the_markets_capture_paces_its_requests_as_shopify(monkeypatch):
 
     asyncio.run(run())
     assert seen[0] is True and ("headers", True) in seen
+
+
+# -- review of #2477 ---------------------------------------------------------------------------------
+
+def _gtin_product(n):
+    return {"id": 9000000 + n, "handle": f"oil-{n}", "vendor": "Brand", "title": "Oil",
+            "variants": [{"id": 45000000000000 + n, "price": "10.00"}]}
+
+
+def test_gtin_recovery_is_paced_as_shopify_and_waits_for_its_turn(monkeypatch):
+    """P1: the .js fetch is marked AND waits (max_wait=0); a bounded wait refused every product."""
+    monkeypatch.setenv(shopify_edge_pacer.ENABLED_ENV, "1")
+    seen = []
+
+    async def gate(url, *, user_agent, max_wait=None):
+        seen.append((shopify_edge_pacer.applies(url), max_wait))
+
+    def reply(request):
+        n = int(request.url.path.split("oil-")[1].split(".")[0])
+        detail = _gtin_product(n)
+        detail["variants"][0]["barcode"] = "8809530070499"
+        return httpx.Response(200, json=detail)
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(reply), **kw))
+    monkeypatch.setattr(crawl_politeness, "before_request", gate)
+    monkeypatch.setattr(crawl_politeness, "note_response", lambda *a, **kw: None)
+    _rows, report = asyncio.run(cbf.recover_missing_variant_gtins(
+        [_gtin_product(1), _gtin_product(2)], domain=HOST))
+    assert seen == [(True, 0), (True, 0)]
+    assert report["recovered"] == 2 and report["failed"] == 0 and report["paced"] == 0
+
+
+def test_a_pacing_refusal_is_counted_paced_not_failed_and_stops_the_batch(monkeypatch):
+    """P1: a refusal the gate can still raise (CrawlDelayTooLong / EdgePaced) is not the product's
+    failure, and every later product would be refused the same way."""
+    calls = []
+
+    async def gate(url, *, user_agent, max_wait=None):
+        calls.append(url)
+        raise shopify_edge_pacer.EdgePaced("next shared slot is 15s out")
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(
+        transport=httpx.MockTransport(lambda r: httpx.Response(500)), **kw))
+    monkeypatch.setattr(crawl_politeness, "before_request", gate)
+    _rows, report = asyncio.run(cbf.recover_missing_variant_gtins(
+        [_gtin_product(n) for n in range(1, 6)], domain=HOST))
+    assert report["failed"] == 0 and report["paced"] == 5 and report["attempted"] == 0
+    assert report["http_requests"] == 0 and len(calls) == 1
+
+
+def test_the_shop_locale_fetch_is_paced_as_shopify(monkeypatch):
+    """/meta.json via storefront_currency: marked before the first request."""
+    monkeypatch.setenv(shopify_edge_pacer.ENABLED_ENV, "1")
+    seen, _ = _serve(monkeypatch, lambda request: httpx.Response(
+        200, json={"currency": "USD"}, headers={"content-type": "application/json"}))
+    asyncio.run(cbf.fetch_shopify_shop_locale(HOST))
+    assert seen and all(applies for _url, applies in seen)
+
+
+@pytest.mark.parametrize("fetch", [
+    lambda: cbf.fetch_pdp_inci("inci.example.com", "lip-oil"),
+    lambda: cbf.fetch_shop_description("inci.example.com"),
+])
+def test_the_inci_and_shop_blurb_pages_feed_headers_and_learn(monkeypatch, fetch):
+    monkeypatch.setenv(shopify_edge_pacer.ENABLED_ENV, "1")
+    _, notes = _serve(monkeypatch, lambda request: httpx.Response(
+        200, text="<html></html>", headers={"x-shopid": "9"}))
+    asyncio.run(fetch())
+    assert notes and all(headers is not None for _u, _s, headers in notes)
+    assert shopify_edge_pacer.is_shopify_host("inci.example.com")
