@@ -188,6 +188,52 @@ def test_skipped_rows_are_never_handed_to_the_refresher(monkeypatch: pytest.Monk
     ), "only Shopify-served rows are held back"
 
 
+# What prod's 09-30 429s most likely looked like: no Shopify header on the 429 itself (unknown,
+# the logs never recorded headers) and no Retry-After longer than our own 2s first hold. Only 3 of
+# the 332 hosts had a read before their first 429, so almost none could be LEARNED as Shopify.
+MARKERLESS = (429, {"server": "cloudflare"}, None)
+
+
+def _markerless_storm_rows(hosts: int) -> List[Tuple[str, Answer]]:
+    rows: List[Tuple[str, Answer]] = []
+    for _round in range(3):
+        for i in range(hosts):
+            rows.append((f"m{i}.example", MARKERLESS))
+            rows.append(("www.ulta.com", PLAIN_OK))
+    return rows
+
+
+def test_the_09_30_storm_trips_with_markerless_429s(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The review's P1: a breaker that needed Shopify markers would not have fired on 09-30. The
+    trip counts DISTINCT hosts, and a host that throttled is stopped after its one request."""
+    rows = _markerless_storm_rows(20)
+    summary, stamped, seed_ids = _drive(monkeypatch, rows, concurrency=1)
+    called = _hosts_called(rows, stamped, seed_ids)
+    assert summary["status"] == "ip_throttled"
+    assert summary["ip_throttle_trip_host_count"] == 10
+    assert summary["ip_throttle_trip_shopify_host_count"] == 0, "no marker was needed"
+    assert summary["ip_throttle_peak_shopify_hosts_in_window"] == 0
+    assert called["www.ulta.com"] == 60, "a host that never throttles is never held back"
+    # m0..m9 before the trip, m10..m19 on first contact: one request each, then their lanes drain.
+    assert all(called[f"m{i}.example"] == 1 for i in range(20)), called
+    assert summary["skipped_for_ip_throttle"] == 20 * 2
+    assert summary["skipped_for_host_backoff"] == 0
+    assert summary["throttle_diagnostics"]["retry_after"] == {"none": 20}
+
+
+def test_the_markerless_storm_trips_with_four_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reviewer's reproduction: 4 workers, 30 hosts answering 429 with only
+    `server: cloudflare`. The Shopify-marker version read `ip_throttled=False, status success`."""
+    rows = _markerless_storm_rows(30)
+    summary, stamped, seed_ids = _drive(monkeypatch, rows, concurrency=4)
+    called = _hosts_called(rows, stamped, seed_ids)
+    assert summary["ip_throttled"] is True and summary["status"] == "ip_throttled"
+    assert called["www.ulta.com"] == 90
+    assert all(called[f"m{i}.example"] == 1 for i in range(30)), called
+    assert summary["skipped_for_ip_throttle"] == 30 * 2
+    assert len(stamped) + summary["skipped_for_ip_throttle"] == len(rows)
+
+
 def test_the_storm_trips_with_four_workers_too(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prod runs `--host-concurrency 4`. Order is no longer exact; the invariants are."""
     rows = _storm_rows(30)
@@ -237,6 +283,8 @@ def test_a_09_29_day_never_trips(monkeypatch: pytest.MonkeyPatch) -> None:
     assert summary["skipped_for_ip_throttle"] == 0
     assert len(stamped) == len(rows)
     assert summary["ip_throttle_hosts"] == 17
+    # The trip now counts ALL hosts; 09-29's busiest minute had 3.
+    assert summary["ip_throttle_peak_hosts_in_window"] == 3
     assert summary["ip_throttle_peak_shopify_hosts_in_window"] == 3
     assert summary["throttle_diagnostics"]["responses"] == 42
 
@@ -248,18 +296,22 @@ def test_a_single_hot_host_is_the_per_host_breakers_job(monkeypatch: pytest.Monk
     rows = [("fentybeauty.com", THROTTLED)] * 30 + [("www.ulta.com", PLAIN_OK)] * 5
     summary, stamped, _ = _drive(monkeypatch, rows, concurrency=1)
     assert summary["ip_throttled"] is False
+    assert summary["ip_throttle_peak_hosts_in_window"] == 1, "one host is one distinct host"
     assert summary["ip_throttle_peak_shopify_hosts_in_window"] == 1
     assert summary["throttle_diagnostics"]["responses"] == 30
     assert len(stamped) == 35
 
 
-def test_non_shopify_hosts_are_counted_but_never_trip(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The all-hosts count is evidence, not a trigger: 15 non-Shopify hosts 429ing in one minute
-    is not Shopify's edge, and stopping them would be guessing."""
-    rows = [(f"h{i}.example", (429, {"server": "nginx", "retry-after": "5"}, None)) for i in range(15)]
-    summary, stamped, _ = _drive(monkeypatch, rows, concurrency=1)
+def test_nine_hosts_do_not_trip_and_the_tenth_does(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The boundary, on hosts behind no Shopify edge at all: the trip is the distinct count."""
+    nine = [(f"h{i}.example", (429, {"server": "nginx"}, None)) for i in range(9)]
+    summary, _, _ = _drive(monkeypatch, nine, concurrency=1)
     assert summary["ip_throttled"] is False
-    assert summary["ip_throttle_peak_hosts_in_window"] == 15
+    assert summary["ip_throttle_peak_hosts_in_window"] == 9
+    cp.reset_for_tests()
+    ten = [(f"h{i}.example", (429, {"server": "nginx"}, None)) for i in range(10)]
+    summary, _, _ = _drive(monkeypatch, ten, concurrency=1)
+    assert summary["ip_throttled"] is True
     assert summary["ip_throttle_peak_shopify_hosts_in_window"] == 0
 
 
@@ -277,11 +329,15 @@ def test_a_503_counts_only_with_a_retry_after(monkeypatch: pytest.MonkeyPatch) -
 
 def test_a_shopify_host_is_recognised_from_an_earlier_answer(monkeypatch: pytest.MonkeyPatch) -> None:
     """A 429 page can carry fewer headers than the product page the same host served a minute
-    earlier. Shopify-ness learned from the 200 sticks to the host."""
-    rows = [(f"k{i}.shop", SHOP_OK) for i in range(10)]
+    earlier. Shopify-ness learned from the 200 sticks to the host, for the diagnostic count and
+    for blocking (a Shopify-served host that has not throttled yet is still held back)."""
+    rows = [(f"k{i}.shop", SHOP_OK) for i in range(11)]
     rows += [(f"k{i}.shop", (429, {"server": "cloudflare", "retry-after": "60"}, None)) for i in range(10)]
-    summary, _, _ = _drive(monkeypatch, rows, concurrency=1)
+    rows += [("k10.shop", SHOP_OK)]
+    summary, stamped, seed_ids = _drive(monkeypatch, rows, concurrency=1)
     assert summary["ip_throttled"] is True
+    assert summary["ip_throttle_trip_shopify_host_count"] == 10
+    assert _hosts_called(rows, stamped, seed_ids)["k10.shop"] == 1, "known Shopify, held back"
 
 
 # --------------------------------------------------------------------- tuning and the kill switch
@@ -394,6 +450,52 @@ def test_a_line_with_no_headers_is_unchanged(caplog: pytest.LogCaptureFixture) -
     caplog.set_level(logging.WARNING, logger="services.crawl_politeness")
     cp.note_response("https://a.com/x", 429)
     assert caplog.records[-1].getMessage() == "crawl backoff: a.com returned 429 (consecutive=1), holding 0.0s"
+
+
+# --------------------------------------------------------------------- bounds
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "ten"])
+def test_a_non_finite_env_falls_back_to_the_default(monkeypatch, caplog, raw) -> None:
+    monkeypatch.setenv("CRAWL_IP_THROTTLE_TRIP_HOSTS", raw)
+    monkeypatch.setenv("CRAWL_IP_THROTTLE_WINDOW_SECONDS", raw)
+    caplog.set_level(logging.WARNING, logger="services.crawl_ip_throttle")
+    breaker = cit.IpThrottleBreaker.from_env()
+    assert breaker.trip_hosts == cit.TRIP_HOSTS_DEFAULT
+    assert breaker.window_seconds == cit.WINDOW_SECONDS_DEFAULT
+    assert any("not a finite number" in r.getMessage() for r in caplog.records)
+
+
+def test_a_non_finite_window_argument_falls_back_to_the_default() -> None:
+    assert cit.IpThrottleBreaker(window_seconds=float("nan")).window_seconds == cit.WINDOW_SECONDS_DEFAULT
+
+
+def test_a_tripped_breaker_never_forgets_a_blocked_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The first version cleared the Shopify set wholesale at its cap, which silently un-blocked
+    every host after a trip. Past the cap NEW hosts are not remembered; old ones stay."""
+    monkeypatch.setattr(cit, "_MAX_TRACKED_HOSTS", 12)
+    breaker = cit.IpThrottleBreaker(trip_hosts=10, window_seconds=60)
+    for i in range(10):
+        breaker.observe(f"h{i}.example", 429, {})
+    breaker.observe("shop.example", 200, {"powered-by": "Shopify"})
+    assert breaker.tripped
+    for i in range(10, 200):
+        breaker.observe(f"h{i}.example", 429, {"powered-by": "Shopify"})
+    assert all(breaker.blocks(f"h{i}.example") for i in range(10))
+    assert breaker.blocks("shop.example")
+    assert len(breaker.throttled_hosts) <= 12 and len(breaker.shopify_hosts) <= 12
+    assert not breaker.blocks("www.ulta.com")
+
+
+def test_the_diagnostic_histograms_are_bounded_as_they_grow() -> None:
+    """Header values are chosen by third parties; the histograms cap their keys while running."""
+    breaker = cit.IpThrottleBreaker(enabled=False)
+    for i in range(500):
+        breaker.observe(f"h{i}.example", 429, {"server": f"srv-{i}", "retry-after": str(i)})
+    for counter in (breaker.by_server, breaker.retry_after):
+        assert len(counter) <= 32
+        assert sum(counter.values()) == 500
+        assert counter["other"] == 500 - 31
 
 
 # --------------------------------------------------------------------- exit code

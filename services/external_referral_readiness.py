@@ -1938,7 +1938,8 @@ async def run_external_referral_refresh_batch(
     # THE IP BREAKER, beside the per-host one and for a different failure. The per-host breaker
     # sees one host's streak; on 09-30 Shopify's shared edge throttled our one egress IP across
     # 331 hosts at once, and the per-host breaker tripped 261 times, one host at a time, while the
-    # run kept asking. See `services.crawl_ip_throttle`.
+    # run kept asking. It trips on DISTINCT hosts throttling inside a window, whatever edge they
+    # sit behind. See `services.crawl_ip_throttle`.
     ip_breaker = crawl_ip_throttle.IpThrottleBreaker.from_env(
         trip_hosts=ip_throttle_trip_hosts,
         window_seconds=ip_throttle_window_seconds,
@@ -2233,10 +2234,10 @@ async def run_external_referral_refresh_batch(
                     return
                 _position, key = heapq.heappop(ready)
                 # AT TAKE TIME, the one place it needs to be: a host whose lane is back in
-                # `ready` has no row in flight, and a host known to be Shopify-served (it
-                # answered earlier this run, before or after the trip) must not be asked again
-                # once the IP breaker has tripped. A host first seen after the trip costs one
-                # request, which is how it becomes known.
+                # `ready` has no row in flight. Once the IP breaker has tripped, a host that has
+                # throttled us this run, or is known to be Shopify-served, is not asked again. A
+                # host first seen after the trip costs one request; if it throttles, that is its
+                # last.
                 if ip_breaker.blocks(key):
                     _drain_ip_throttled_lane(key)
                     lane_freed.notify_all()
@@ -2261,10 +2262,11 @@ async def run_external_referral_refresh_batch(
         await _run_workers(_worker, concurrency)
     if ip_breaker.tripped:
         logger.warning(
-            "external referral refresh: IP throttled at %s (%d Shopify-served hosts 429'd within "
-            "%.0fs); %d rows on Shopify-served hosts deferred to the next run",
-            ip_breaker.tripped_at, ip_breaker.trip_host_count, ip_breaker.window_seconds,
-            skipped_for_ip_throttle,
+            "external referral refresh: IP throttled at %s (%d distinct hosts, %d Shopify-served, "
+            "429'd within %.0fs); %d rows on throttled or Shopify-served hosts deferred to the "
+            "next run",
+            ip_breaker.tripped_at, ip_breaker.trip_host_count, ip_breaker.trip_shopify_host_count,
+            ip_breaker.window_seconds, skipped_for_ip_throttle,
         )
     if stopped_early:
         skipped_for_budget = sum(len(lane) for lane in lanes.values())
@@ -2406,7 +2408,8 @@ async def run_external_referral_refresh_batch(
         "unreachable_host_skips": dict(sorted(unreachable_hosts.items(), key=lambda kv: -kv[1])[:10]),
         "host_unreachable_trip": unreachable_trip,
         "unreachable_host_errors": unreachable_samples,
-        # Rows NOT attempted because the IP breaker tripped and their host is Shopify-served.
+        # Rows NOT attempted because the IP breaker tripped and their host had throttled us or is
+        # Shopify-served.
         # Unstamped, like the per-host skips, so they lead tomorrow's queue.
         "skipped_for_ip_throttle": skipped_for_ip_throttle,
         "ip_throttle_skips": dict(sorted(ip_throttle_skips.items(), key=lambda kv: -kv[1])[:10]),

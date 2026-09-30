@@ -102,8 +102,8 @@ async def run_daily_external_referral_refresh(
 # fires for either; the code (and the log line before it) says which it was.
 EXIT_OK = 0
 EXIT_DEGRADED = 1
-# The shared Shopify edge throttled our egress IP and the run stopped asking Shopify-served
-# hosts (`services.crawl_ip_throttle`). Distinct from 1 because the fix is different: nothing on
+# A shared edge (Shopify's, on 09-30) throttled our egress IP and the run stopped asking the hosts
+# that throttled it (`services.crawl_ip_throttle`). Distinct from 1 because the fix is different: nothing on
 # our side is broken, the crawl rate from one IP is. Not 2, which argparse uses for bad arguments.
 EXIT_IP_THROTTLED = 3
 
@@ -162,8 +162,8 @@ def main() -> int:
         type=int,
         default=None,
         help=(
-            "Distinct Shopify-served hosts answering 429 within the window that trip the IP "
-            "breaker. Defaults to CRAWL_IP_THROTTLE_TRIP_HOSTS, then 10. <= 0 disables it."
+            "Distinct hosts answering 429 (or 503 + Retry-After) within the window that trip the "
+            "IP breaker. Defaults to CRAWL_IP_THROTTLE_TRIP_HOSTS, then 10. <= 0 disables it."
         ),
     )
     parser.add_argument(
@@ -221,7 +221,7 @@ def main() -> int:
     status = str(summary.get("status") or "").strip().lower()
     if status == "ip_throttled":
         logger.error(
-            "external referral refresh finished ip_throttled: %s Shopify-served hosts answered "
+            "external referral refresh finished ip_throttled: %s distinct hosts answered "
             "429 within %ss (first 429 %s, tripped %s); %s rows deferred to the next run "
             "(skipped_for_ip_throttle). Without the IP throttle this run would read %s "
             "(origin_yield=%s)",
