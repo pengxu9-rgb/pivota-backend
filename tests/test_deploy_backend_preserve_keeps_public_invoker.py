@@ -95,3 +95,31 @@ def test_an_unreadable_or_empty_policy_falls_back_to_the_env_default(tmp_path, p
 def test_prod_is_unchanged(tmp_path):
     flag, _ = _flag(tmp_path, env="prod", config="preserve", policy=PRIVATE)
     assert flag == "--allow-unauthenticated"
+
+
+# A failed IAM read falls back to the env default (private on staging), which REVOKES an allUsers
+# binding the script could not see. It must say so rather than revoke silently.
+UNREADABLE_WARNING = "could not read"
+
+
+@pytest.mark.parametrize("policy", [None, "not a policy object"])
+def test_an_unreadable_policy_warns_that_the_deploy_revokes_public_access(tmp_path, policy):
+    flag, err = _flag(tmp_path, env="staging", config="preserve", policy=policy)
+    assert flag == "--no-allow-unauthenticated"
+    assert UNREADABLE_WARNING in err
+    assert "REVOKES" in err and "PUBLIC=1" in err
+
+
+@pytest.mark.parametrize("policy", [ALL_USERS, PRIVATE, OTHER_ROLE, {}, {"bindings": None}])
+def test_a_readable_policy_never_warns(tmp_path, policy):
+    _, err = _flag(tmp_path, env="staging", config="preserve", policy=policy)
+    assert UNREADABLE_WARNING not in err
+
+
+@pytest.mark.parametrize(
+    "env,config,public",
+    [("staging", "preserve", "0"), ("staging", "apply", None), ("prod", "preserve", None)],
+)
+def test_no_iam_read_means_no_warning(tmp_path, env, config, public):
+    _, err = _flag(tmp_path, env=env, config=config, policy=None, public=public)
+    assert UNREADABLE_WARNING not in err
