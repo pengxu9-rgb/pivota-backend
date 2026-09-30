@@ -46,6 +46,8 @@ esac
 #                 trigger's pause state and rewrites no worker env (CONFIG=preserve).
 #   arm one lane: ARM=content-canonical-election-cron infra/gcp/setup_scheduler.sh prod <a> <b>
 #   disarm one:   DISARM=reviews-invitation-send-cron infra/gcp/setup_scheduler.sh prod <a> <b>
+#   graph dry run: RELGRAPH_SYNC_WRITES=false infra/gcp/setup_scheduler.sh prod <a> <b>
+#                 (relgraph-sync writes stay ON in prod when unset; see RELGRAPH_SYNC_WRITES below)
 #   rewrite env:  CONFIG=apply WORKERS=true infra/gcp/setup_scheduler.sh prod <a> <b>
 #                 Needs the Railway-ported files, which no longer exist. See CONFIG below.
 #
@@ -107,6 +109,22 @@ case "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" in true|false) ;; *) echo "STORE_AUD
 case "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_REPROBE_ARMED must be exactly true or false (got '$STORE_AUDIT_COMMERCE_REPROBE_ARMED')" >&2; exit 2 ;; esac
 case "$EXTERNAL_SEED_DESTINATION_SWEEP" in true|false) ;; *) echo "EXTERNAL_SEED_DESTINATION_SWEEP must be exactly true or false (got '$EXTERNAL_SEED_DESTINATION_SWEEP')" >&2; exit 2 ;; esac
 case "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" in true|false) ;; *) echo "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE must be exactly true or false (got '$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE')" >&2; exit 2 ;; esac
+# relgraph-sync WRITES (build + AI review apply). Unlike the lanes above, these are LIVE in prod
+# (armed by hand 2026-09-27, verified green 2026-09-30), and the job's --set-env-vars REPLACES its
+# whole env, so a reconcile that left them out would silently turn the graph back into a dry run.
+# Unset = the environment's standing state: on in prod, off in staging. RELGRAPH_SYNC_WRITES=false
+# reconciles prod as a dry run. Staging refuses true: it holds a prod snapshot (see STAGING SAFETY).
+# An emergency writes-off done by hand (`gcloud run jobs update relgraph-sync --update-env-vars
+# RELGRAPH_SYNC_ALLOW_WRITES=false`) is RE-ARMED by the next plain reconcile; keep it off by passing
+# RELGRAPH_SYNC_WRITES=false to every run until it is meant to come back.
+: "${RELGRAPH_SYNC_WRITES:=}"
+case "$RELGRAPH_SYNC_WRITES" in ""|true|false) ;; *) echo "RELGRAPH_SYNC_WRITES must be true, false or unset (got '$RELGRAPH_SYNC_WRITES')" >&2; exit 2 ;; esac
+if [ -z "$RELGRAPH_SYNC_WRITES" ]; then
+  if [ "$ENV" = prod ]; then RELGRAPH_SYNC_WRITES=true; else RELGRAPH_SYNC_WRITES=false; fi
+fi
+if [ "$ENV" = staging ] && [ "$RELGRAPH_SYNC_WRITES" = true ]; then
+  echo "RELGRAPH_SYNC_WRITES=true is refused in staging: it would run LLM review writes against a production snapshot" >&2; exit 2
+fi
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] && [ "$EXTERNAL_SEED_DESTINATION_SWEEP" != true ]; then
   echo "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true requires EXTERNAL_SEED_DESTINATION_SWEEP=true" >&2; exit 2
 fi
@@ -327,12 +345,21 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 # that costs two attempts, so 3600s really means two wasted hours; 14400s likewise means eight.
 #
 # ⚠️ THE CAPS ARE NOT SET HERE AND CANNOT BE SET LIVE. They are RELGRAPH_SYNC_LIMIT (default 200,
-# max 2000) and RELGRAPH_SYNC_SELECT_LIMIT (default 250, max 5000), read inside the GATEWAY image by
-# PIVOTA-Agent's scripts/run-relationship-graph-sync-routine-cron.js — grepping THIS repo for them
-# finds nothing. Raising them means adding them to the --set-env-vars line below, because that flag
-# REPLACES the whole env set: an operator who adds them with `gcloud run jobs update` has them wiped
-# by the next reconcile of this script. That is the same drift this timeout override exists to
-# prevent, and it applies to the caps too.
+# max 2000), RELGRAPH_SYNC_SELECT_LIMIT (default 250, max 5000) and RELGRAPH_SYNC_REVIEW_LIMIT
+# (default 250), read inside the GATEWAY image by PIVOTA-Agent's
+# scripts/run-relationship-graph-sync-routine-cron.js — grepping THIS repo for them finds nothing.
+# Raising them means adding them to relgraph_sync_env below, because --set-env-vars REPLACES the
+# whole env set: an operator who adds them with `gcloud run jobs update` has them wiped by the next
+# reconcile of this script. That is the same drift this timeout override exists to prevent, and it
+# applies to the caps too.
+#
+# THE ENV BELOW IS THE LIVE JOB'S, VAR FOR VAR (2026-09-30). The write gates, the confirm token (a
+# code constant, WRAPPER_CONFIRM_TOKEN, not a secret), the Vertex settings and the 45-minute step
+# budget were all set by hand, so before this a reconcile silently disarmed graph writes and broke
+# AI review. Measured shape at these values: build ~8 min + 250 sequential reviews ~29 min (~7 s
+# each) = ~37 of 45 minutes. Do NOT raise RELGRAPH_SYNC_REVIEW_LIMIT here until relgraph-sync runs
+# an image with bounded review concurrency (PIVOTA-Agent #2335) and RELGRAPH_SYNC_REVIEW_CONCURRENCY
+# is set with it: 1,000 sequential reviews are ~2 h and fail the step every night.
 #
 # So this raise removes ONE of three walls. It changes nothing about the daily run, which exits in
 # minutes either way.
@@ -346,9 +373,21 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 # Precedent for raising, not just lowering: the twelve other mkjob callers all LOWER 3600s, but
 # external-seed-destination-sweep raises mkcrawljob's 300s to 3600s. This is the first override to
 # exceed 3600s.
+# Staging gets neither Vertex nor the write gates: GOOGLE_CLOUD_PROJECT follows $PROJECT, and the
+# gates follow RELGRAPH_SYNC_WRITES (validated above; never true in staging).
+relgraph_sync_env(){
+  local env="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=45"
+  if [ "$ENV" = prod ]; then
+    env="$env,VERTEX_AI_ENABLED=true,GOOGLE_CLOUD_PROJECT=$PROJECT,GOOGLE_CLOUD_LOCATION=global,GCE_METADATA_HOST=metadata.google.internal"
+  fi
+  if [ "$RELGRAPH_SYNC_WRITES" = true ]; then
+    env="$env,RELGRAPH_SYNC_APPLY_BUILD=true,RELGRAPH_SYNC_APPLY_REVIEW=true,RELGRAPH_SYNC_ALLOW_WRITES=true,RELGRAPH_SYNC_CONFIRM=APPLY_RELGRAPH_SYNC_ROUTINE"
+  fi
+  printf '%s' "$env"
+}
 mkjob relgraph-sync "$GATEWAY_IMAGE" "$SA" \
   --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest" \
-  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1" \
+  --set-env-vars "$(relgraph_sync_env)" \
   --task-timeout 14400s \
   --command npm --args "run,relgraph:sync-routine:cron"
 
