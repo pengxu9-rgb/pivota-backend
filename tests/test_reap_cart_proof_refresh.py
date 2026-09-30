@@ -2050,3 +2050,24 @@ def test_a_robots_disallowed_mirror_request_is_not_sent_and_is_not_a_hold(monkey
         crawl_politeness.ROBOTS_TRANSPORT_FACTORY.reset(token)
     assert requested == [] and client.robots_disallowed == 3 and client.not_sent == 0
     assert results["a.com"].status == DONE, "a permanent refusal: walked, nothing to wait for"
+
+
+def test_the_pacer_learns_the_host_that_answered_after_a_redirect(monkeypatch):
+    from services import shopify_edge_pacer
+
+    monkeypatch.setenv("CRAWL_SHOPIFY_EDGE_PACER_ENABLED", "true")
+    shopify_edge_pacer.reset_for_tests()
+
+    async def lease(bucket, *, slots, rate_per_s, horizon_s=None):
+        return 0.0, 0.0
+
+    monkeypatch.setattr(shopify_edge_pacer, "_lease_fn", lease)
+
+    def handler(request):
+        if request.url.host == "a.com":
+            return httpx.Response(301, headers={"location": "https://store.shopcdn.example/products/h0.js"})
+        return httpx.Response(404, headers={"x-shopid": "7"})
+
+    seeds = {"a.com": _mirror_seeds("a.com", 1)}
+    _real_backfill_pass(monkeypatch, seeds, handler, ["a.com"], page_size=10)
+    assert shopify_edge_pacer.is_shopify_host("store.shopcdn.example")
