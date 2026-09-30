@@ -62,7 +62,10 @@ async def test_only_barcode_copied_and_native_identity_preserved(monkeypatch):
     expected['variants'][0]['barcode'] = GTIN
     assert rows == [expected]
     assert p == before
-    assert report == dict(attempted=1, recovered=1, failed=0, capped=0, recovered_gtins=1, http_requests=1)
+    assert report == dict(attempted=1, recovered=1, failed=0, paced=0, budget_stopped=0, blocked_stopped=0,
+                          capped=0, recovered_gtins=1, http_requests=1)
+    # With the shared Shopify-edge pacer off this is main exactly: a 10s bound per request (#2477). The
+    # pacer-on bound (what is left of the budget) is pinned in test_curated_shopify_edge_pacer_wiring.
     assert feed.crawl_politeness.before_request.await_args.kwargs['max_wait'] == 10.0
 
 

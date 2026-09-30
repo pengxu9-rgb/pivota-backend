@@ -526,7 +526,8 @@ class Polite:
         if path in self.disallow:
             raise RobotsDisallowed(f"robots.txt disallows {url}")
 
-    def note_response(self, url, status_code, *, retry_after=None):
+    def note_response(self, url, status_code, *, retry_after=None, headers=None):
+        # crawl_politeness.note_response's signature: the capture passes the response headers (#2473).
         self.calls.append(("note", urlsplit(url).path, status_code))
 
 

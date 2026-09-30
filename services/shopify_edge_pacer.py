@@ -71,8 +71,8 @@ HOW A HOST BECOMES "SHOPIFY-SERVED", decided before the request:
     (the final URL after redirects). The first request to an unknown host is therefore unpaced by
     this budget (it still has the per-host one). No seed or merchant row carries a platform field
     for external seeds (external_product_seeds has none), so the learned cache is the general path.
-    It is per-process and bounded (10k hosts). `mark_shopify_host` exists for a caller that knows;
-    none calls it yet.
+    It is per-process and bounded (10k hosts). `mark_shopify_host` is for a caller that knows: the
+    curated brand feed / retailer-ingest drain marks its Shopify-by-construction endpoints (#2477).
 
 FAIL OPEN, LOUDLY AND SLOWLY. If the lease statement fails, takes longer than
 `CRAWL_SHOPIFY_EDGE_DB_TIMEOUT_SECONDS` (3s), or returns an out-of-horizon lease, the process logs at
@@ -245,7 +245,9 @@ def _remember(host: str) -> bool:
 
 
 def mark_shopify_host(host_or_url: str) -> None:
-    """For a caller that KNOWS this host is Shopify-served. No caller uses it yet."""
+    """For a caller that KNOWS this host is Shopify-served: the curated brand feed / retailer-ingest
+    drain marks the Shopify-by-construction endpoints it crawls (/products.json, /products/<h>.js,
+    /meta.json, the Markets capture) before the first request (#2477)."""
     if not enabled():
         return
     raw = str(host_or_url or "")
