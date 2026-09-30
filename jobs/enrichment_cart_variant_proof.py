@@ -143,9 +143,10 @@ services.tierb_cart_link_merchants), which also gives each domain its market. Pa
     over its cap skips the HOST for the rest of the run) and of the backoff that `note_response`
     arms from a 429/503's `Retry-After`. The wait is BOUNDED by `ENRICHMENT_PROOF_MAX_POLITE_WAIT_S`
     (default 60 s): a host held longer is not asked (`crawl_paced`, nothing written) rather than
-    stalling the run. crawl_politeness keys its state by exact hostname, so each request is gated on,
-    and each answer reported for, BOTH the host requested and the storefront's requested host when
-    a redirect moved to its `www.` twin: one storefront, one rate limiter, one backoff;
+    stalling the run. crawl_politeness keys its state by exact hostname, so each answer is reported
+    for BOTH the host requested and the storefront's requested host when a redirect moved to its
+    `www.` twin (one storefront, one backoff), while each request is GATED on the URL actually
+    requested only -- so it takes one shared Shopify-edge slot, not two -- after the run's own pacer;
   * redirects (301/302/303/307/308, relative Locations resolved) are followed by hand, at most
     5 hops; a 3xx with no Location is a transient `redirect_without_location`, never a 404;
   * `ENRICHMENT_PROOF_ABORT_AFTER_BLOCKS` (default 5) consecutive block-shaped answers (429, 403,
@@ -196,7 +197,7 @@ from db.enrichment_cart_variant_proofs import OUTCOME_OK, PROOF_SOURCES, TABLE  
 from db.reap_agentic_ledger import amount_minor_or_none  # noqa: E402
 # The map the purchase lane prices with. One map, so the proof's currency and the lane's agree.
 from routes.agent_commerce_reap import _MARKET_CURRENCY  # noqa: E402
-from services import crawl_politeness  # noqa: E402
+from services import crawl_politeness, shopify_edge_pacer  # noqa: E402
 from services.curated_brand_feed import _same_storefront_host  # noqa: E402
 from services.reap_enrichment_cart_proof import (  # noqa: E402
     ENRICHMENT_SOURCE_SYSTEM,
@@ -710,10 +711,18 @@ async def fetch_json(client: Any, url: str, *, requested_host: str, pacer: Pacer
     current = url
     for _hop in range(MAX_REDIRECTS + 1):
         polite_urls = _politeness_urls(current, requested_host)
+        # Every request here is a Shopify storefront endpoint (/products.json, /products/<h>.js,
+        # /meta.json) on a Tier B Shopify store, so the shared Shopify-edge budget applies from the
+        # FIRST request (services/shopify_edge_pacer.py; a no-op while its flag is off).
+        shopify_edge_pacer.mark_shopify_host(current)
+        # The run's own spacing FIRST, then the gate: a shared Shopify-edge slot reserved before a
+        # 3 s pacer sleep would be spent late or expire. And the gate is asked for the URL actually
+        # requested ONLY, so a request takes ONE shared slot even on a www hop; the storefront's twin
+        # host still shares its backoff, because every answer is noted for both (below).
+        await pacer.wait()
         try:
-            for polite_url in polite_urls:
-                await crawl_politeness.before_request(polite_url, user_agent=USER_AGENT,
-                                                      max_wait=max_polite_wait_s())
+            await crawl_politeness.before_request(polite_urls[0], user_agent=USER_AGENT,
+                                                  max_wait=max_polite_wait_s())
         except crawl_politeness.RobotsDisallowed:
             return Fetched(outcome="robots_disallowed")
         except crawl_politeness.CrawlDelayTooLong:
@@ -722,16 +731,19 @@ async def fetch_json(client: Any, url: str, *, requested_host: str, pacer: Pacer
         except crawl_politeness.CrawlPaced:
             # Held longer than we wait (a long Retry-After): not sent, no evidence.
             return Fetched(outcome="crawl_paced")
-        await pacer.wait()
         _clear_cookies(client)
         try:
             resp = await client.get(current, headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
                                     timeout=REQUEST_TIMEOUT_S, follow_redirects=False)
         except Exception as exc:  # noqa: BLE001 - classified, not swallowed
             return Fetched(outcome=f"error:{type(exc).__name__}")
-        for polite_url in polite_urls:
+        for index, polite_url in enumerate(polite_urls):
+            # Headers for the URL actually requested only: they feed the IP-throttle breaker, which
+            # counts DISTINCT hosts, and the storefront's www twin is the same store, not a second host.
             crawl_politeness.note_response(polite_url, resp.status_code,
-                                           retry_after=resp.headers.get("retry-after"))
+                                           retry_after=resp.headers.get("retry-after"),
+                                           headers=resp.headers if index == 0 else None)
+        shopify_edge_pacer.learn_from_response(current, resp.headers)
         checked_at = now()
         if resp.status_code in _REDIRECT_STATUSES:
             location = resp.headers.get("location")
@@ -1050,7 +1062,13 @@ def _utcnow() -> datetime:
 
 async def run_domain(db: Any, client: Any, plan: DomainPlan, *, apply: bool, source_mode: str, limit: int,
                      after: Optional[str], pacer: Pacer, block_limit: int, block_state: Dict[str, int],
-                     now: Callable[[], datetime] = _utcnow) -> Dict[str, Any]:
+                     now: Callable[[], datetime] = _utcnow,
+                     should_stop: Optional[Callable[[], bool]] = None,
+                     on_block: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """One domain's page. `should_stop`, when given, is asked after every fetch: True aborts the run
+    exactly as a block streak does (jobs/reap_cart_proof_refresh.py passes its run-level breakers).
+    `on_block`, when given, is told the outcome of every block-shaped answer (the caller's run-level
+    block breaker)."""
     report: Dict[str, Any] = {
         "market": plan.market, "market_currency": plan.market_currency, "products": 0, "skus": 0,
         "outcomes": Counter(), "skipped": Counter(), "fetches": Counter(), "currency_read": Counter(),
@@ -1082,6 +1100,10 @@ async def run_domain(db: Any, client: Any, plan: DomainPlan, *, apply: bool, sou
 
     def on_fetch(outcome: str) -> bool:
         report["fetches"][outcome] += 1
+        if is_block(outcome) and on_block is not None:
+            on_block(outcome)
+        if should_stop is not None and should_stop():
+            return False
         if is_block(outcome):
             block_state["consecutive"] += 1
             if block_state["consecutive"] >= block_limit:

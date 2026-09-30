@@ -41,7 +41,9 @@ THE UNSCOPED SWEEP IS A ONE-SHOT OPS RUN, NOT A SCHEDULED JOB, DELIBERATELY. Do 
 infra/gcp/setup_scheduler.sh. The one scheduled caller is DOMAIN-SCOPED: jobs/reap_cart_proof_refresh.py
 (`mirror` lane) calls `run()` one `--domain` at a time over the Tier B cart-link list, paging on
 `next_cursor` (stored between runs), to keep the 7-day cart proofs fresh. It hands `run()` a client
-that carries the consecutive-block streak across calls; nothing in this file changes for it. It is provisioned by the operator-run
+that gates every fetch through `services.crawl_politeness` (Retry-After, per-host backoff, the
+shared Shopify-edge pacer) and the run's IP-throttle breaker, and carries the per-store block count
+across calls; nothing in this file changes for it. A HAND run of this script gets none of that. It is provisioned by the operator-run
 infra/gcp/setup_reap_cart_proof_jobs.sh (Cloud Run Job `reap-cart-proof-mirror`), dry-run and paused
 unless --enable.
 

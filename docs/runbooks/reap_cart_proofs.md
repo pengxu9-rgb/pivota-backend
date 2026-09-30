@@ -41,7 +41,7 @@ an environment where no apply has run reads "no cursors" and writes nothing); th
 table likewise appears on its first writer apply (or its reader's first flag-on request).
 
 The entry point owns no proof logic. It walks each domain page by page by calling the writer's
-own entry point on the writer's own cursor (mirror: `run(limit=50)`; enrichment: `run_domain(limit=250)`,
+own entry point on the writer's own cursor (mirror: `run(limit=25)`; enrichment: `run_domain(limit=250)`,
 so its writes commit page by page), inside a wall-clock budget, and prints one report line.
 
 **Order and resume.**
@@ -60,29 +60,79 @@ so its writes commit page by page), inside a wall-clock budget, and prints one r
   after that. The back-off is shorter than the lane's proof life, so one block never guarantees a
   lapse: **mirror 3 days** (proofs live 7 days), **enrichment 1 day** (proofs live 72 h). One store
   that always blocks us costs one threshold's worth of requests per back-off and never the other
-  stores' refresh. **No store is backed off for an IP-level block**: when the pass stops (below),
-  every store aborted since the last clean answer is re-recorded without `blocked_until`
-  (`ip_block: true` in the report).
+  stores' refresh. **No store is backed off in a run whose IP-throttle breaker tripped** (below):
+  every store that run backed off is re-recorded without `blocked_until` (`ip_block: true` in the
+  report) -- during an address-level throttle a store that "blocked us" was not the problem.
 - **A poison page does not pin the cursor.** A store that crashes at the SAME resume cursor on two
   runs in a row has that cursor reset to NULL (`crash_cursor_reset` in the report, a WARNING in the
   log), so the rows before it are walked again; read `error` to fix the page itself.
 
-**Blocks.** Two streaks of consecutive block-shaped answers (429/403/5xx/transport errors; a clean
-answer resets both, a challenge page or an unsent request touches neither), at the writer's own
-threshold T (mirror 8, enrichment 5):
-- the STORE streak, per store: a store is aborted (`aborted_on_block`, backed off) when its streak
-  reaches T, **or** when it is walked to its end with at least one block and **no clean answer at
-  all** (a small store we never actually read is not `done` and gets no `last_completed_at`). Then
-  **the pass moves on** to the next store;
-- the RUN streak, carried across stores: **the whole pass stops** only when the run streak is at
-  2 x T **and the current store has itself just been aborted** by one of the rules above. A healthy
-  store that inherits an earlier store's trailing blocks and sees a couple of transient 429s is NOT
-  enough; a store that is itself blocked right after another one is -- that is what an IP-level
-  block looks like. Small stores that each stay under T still trip it (each is aborted as "no clean
-  answer").
-Mirror: the client handed to the backfill classifies every answer with the backfill's own rules and,
-once the store streak trips, answers 429 locally without sending. Enrichment: the writer's own `block_state`,
-one per store, observed into the run streak (it can overshoot by up to T - 1 requests).
+**Blocks, and the IP-throttle breaker.**
+- **A store**: aborted (`aborted_on_block`, backed off) when its consecutive block-shaped answers
+  (429/403/5xx/transport errors; a clean answer resets the count, a challenge page or an unsent
+  request does not touch it) reach the writer's own threshold T (mirror 8, enrichment 5), **or**
+  when it is walked to its end with at least one block and **no clean answer at all** (a store we
+  never read is not `done` and gets no `last_completed_at`). Then **the pass moves on**.
+- **The address**: one IP-throttle breaker per run (`services.crawl_ip_throttle.IpThrottleBreaker`,
+  #2473), fed every response's headers through `crawl_politeness.note_response`. **A store counts
+  toward a trip only once its own run of 429s (or 503 + Retry-After) reaches 3 in a row** (a clean
+  answer from it ends the run): one transient 429, timeout or 502 on a healthy store is not a block,
+  and a tiny store aborted after one error does not count either. It trips (`trip_reason:
+  blocks_after_health`) when **3 counting stores within 15 minutes include one that was healthy** --
+  it answered cleanly earlier this run, or **the cursor table says a previous run walked it cleanly
+  and its last run did not blame it** -- **and no other store has answered cleanly since they began**.
+  So a run that starts already blocked (the 09-30 throttle began hours before both lanes' slots) trips
+  on the third previously-healthy store; stores the table already blames (`aborted_on_block` last
+  time, forgiven or not), which `defer_blocked` walks last and back to back, are no evidence and never
+  trip it; and blockers walked between stores that still answer do not trip it. **Four first-contact
+  stores** (no cursor row) counting with nothing answering since also trip it (`nothing_answering`):
+  a new lane or new stores meeting a blocked address, at most once per store ever. **What does not
+  stop:** a run that starts blocked when no store has health on record and none is first contact
+  walks every store to its own threshold (8) and backs each off for 3 days. Thresholds are for
+  lanes that walk ONE store at a time (#2473's defaults, 10 hosts in 60 s, suit the many-host refresh
+  and could never trip here). A trip **stops the whole pass** (`ip_throttled`, exit 1) and
+  **forgives the back-offs of that run**. This is what keeps healthy stores from being backed off
+  under the 2026-09-30 pattern -- a rate throttle that let ~29% through, so each store's 429s come in
+  runs between its answers: three such stores trip the breaker long before anyone is backed off.
+- **The breaker counts STORES, not hostnames** (a store's apex, `www.` twin and subdomains are one).
+  Three stores that refuse us from their first request, walked back to back and followed by a store
+  that answers, are three store-level blocks: **no trip, and each keeps its back-off**. A trip
+  forgives only the back-offs recorded **within the breaker window** (15 min) before it; an earlier,
+  unrelated block keeps its back-off.
+- **A second run-level stop for blocks that are not 429s.** 403s, 5xx and transport errors
+  (connection resets, timeouts) never trip the throttle breaker, yet an IP-level block looks exactly
+  like that (the 2026-08-21 shape; the 2026-09-28 NAT drops). A second, store-keyed breaker counts
+  those, with the same rule. Its trip also stops the pass without backing off stores and forgives back-offs within its
+  window (`block_breaker` in the report, with `trip_reason`). One store that genuinely 403s
+  everything is aborted and backed off on its own; stores that had been answering and then block one
+  after another stop the pass.
+- **Redirects are followed one hop at a time**, each hop gated, paced and reported like the first
+  request (at most 3 hops, https only, the same storefront only), with ONE patience deadline for
+  the whole request. A redirect off the storefront (or off https) is never requested: the backfill
+  reports it as `http_421` (the enrichment writer's `host_redirected`), counted in
+  `off_storefront_redirects`, and it is **not** in `most_blocked_domains`.
+- **Held requests.** A request `crawl_politeness` does not release within 60 s (a Retry-After or
+  backoff hold, a Crawl-delay over the cap, the shared edge slot) is not sent and is counted. The page
+  stops its store as `held_by_politeness` (exit 4) WITHOUT advancing the cursor past it: the store is
+  neither `done` nor `aborted_on_block`, gets no back-off, and resumes before the held rows next run.
+  A request robots.txt disallows, or one to a host whose Crawl-delay is over the cap, is also not
+  sent, but that refusal is permanent: counted apart (`robots_disallowed`, `crawl_delay_too_long`),
+  not a hold -- the store advances past it. In the backfill's own report a held request shows as
+  `http_425` and a permanent refusal as `http_451` (local answers, never sent, never counted as a
+  block).
+- Mirror: the client handed to the backfill classifies every answer with the backfill's own rules
+  and, once the store has tripped or the breaker has, answers 429 locally without sending.
+  Enrichment: the writer's `should_stop` is the breaker, so it stops asking the moment it trips.
+
+**Pacing: every request goes through `crawl_politeness` and the shared Shopify-edge pacer (#2474).**
+Both lanes wait for `crawl_politeness.before_request` before every request: robots.txt, the host's own interval, any
+Retry-After / backoff hold a previous answer armed, and (with `CRAWL_SHOPIFY_EDGE_PACER_ENABLED`,
+set on both jobs by the setup script) a slot of the ONE aggregate budget every crawl job on the
+crawl IP shares (default 2 req/s). Both lanes mark their hosts Shopify-served (every target is a Tier
+B Shopify store) and teach the pacer from response headers. A request the gate will not release
+within 60 s is not sent (mirror: counted as `not_sent_by_politeness`, the row is left for the next
+run). With the pacer on, **a dry run writes one thing**: its slot leases in `crawl_egress_pacer`
+(migration 251), the shared schedule itself. Nothing else.
 
 ## The egress rule (read this first)
 
@@ -120,6 +170,24 @@ the write, not the crawl). That is deliberate: it is the dry run on the real job
 start one by hand inside another crawl's window (02:20–04:20, 05:15–06:15 UTC) or while a
 scheduled run of the other cart-proof job is in flight: they share stores.
 
+## Preconditions (all four, before ANY execution, dry runs included)
+
+In addition to the HARD GATE at the top (the crawl-IP incident closed with >= 24 h of normal reads,
+and #2474 merged):
+
+1. **The mirror lane goes through `crawl_politeness`.** Its requests honour Retry-After and the
+   per-host backoff and take the shared Shopify-edge slot (the follow-up PR to #2471, which also
+   wires #2474). The backend tag the jobs run must contain that PR: re-run the setup script with it.
+2. **Both lanes feed the shared pacer and the breaker.** They mark their hosts Shopify-served, learn
+   from and report response headers, and the setup script sets `CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true`
+   (and `CRAWL_SHOPIFY_EDGE_LEASE=2`, a cap on the demand-sized lease) on both jobs: check with
+   `gcloud run jobs describe`. `CRAWL_SHOPIFY_EDGE_RPS` must NOT be set on them: every crawl job shares
+   one rate (#2474), the global default.
+3. **The IP-throttle breaker is what stops a pass**, and a trip backs nothing off (this runbook,
+   "Blocks").
+4. **The mirror budget is sized from the prod census** (PR body: 2,092 candidates over the 42 Tier B
+   domains, ~6,500 s at the lane's pacing; budget 10,800 s, task timeout 15,000 s).
+
 ## Procedure, per environment
 
 Staging first. Staging has its own Postgres (10.122.0.3) and may hold no enrichment rows: the
@@ -132,12 +200,23 @@ ENV=staging; PROJECT=pivota-staging; TAG=<backend sha>
 # 1. provision DARK (creates or updates both jobs; gate false; triggers paused). Contacts no store.
 infra/gcp/setup_reap_cart_proof_jobs.sh $ENV $TAG
 
-# ⛔ STOP HERE until the HARD GATE at the top of this runbook holds: (a) >= 24 h with no crawl-backoff
-#    429 bursts and no breaker trips on the referral refresh, the destination sweep, Tier B and the
-#    purchasability sweep, plus Peng's go; (b) #2474 merged, both lanes wired through it, and
-#    CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true on both jobs.
+# ⛔ STOP HERE until the HARD GATE at the top of this runbook (>= 24 h with no crawl-backoff 429 bursts
+#    and no breaker trips on the referral refresh, the destination sweep, Tier B and the purchasability
+#    sweep, plus Peng's go; #2474 merged, both lanes wired through it, and
+#    CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true on both jobs) and the PRECONDITIONS 1-4 above all hold.
 
-# 2. DRY RUN each job on its real definition (fetches, writes nothing)
+# 2. FIRST DRY RUN: ONE SMALL STORE PER LANE, not all 42. `--args` replaces the job's args for this
+#    execution only (the job definition is untouched). judydoll.com has 3 mirror candidates (prod
+#    census 2026-09-30); stilacosmetics.com is the smallest enrichment store (~124 products, a few
+#    /products.json pages in `auto` mode).
+gcloud run jobs execute reap-cart-proof-mirror --project $PROJECT --region us-west1 --wait \
+  --args=-m,jobs.reap_cart_proof_refresh,mirror,--on-crawl-egress,--budget-seconds,600,--only,judydoll.com
+gcloud run jobs execute reap-cart-proof-enrichment --project $PROJECT --region us-west1 --wait \
+  --args=-m,jobs.reap_cart_proof_refresh,enrichment,--on-crawl-egress,--budget-seconds,600,--only,stilacosmetics.com
+#    Read both reports: `ip_throttle.ip_throttled` must be false, `throttle_diagnostics.responses`
+#    ~0, `shopify_edge_pacer.enabled` true with `granted` > 0, and the store `done`.
+
+# 2b. Only then, the FULL dry run of each job on its real definition (fetches; writes only its pacer leases)
 gcloud run jobs execute reap-cart-proof-enrichment --project $PROJECT --region us-west1 --wait
 gcloud run jobs execute reap-cart-proof-mirror     --project $PROJECT --region us-west1 --wait
 
@@ -180,7 +259,7 @@ If the task timeout's SIGTERM arrives, the job prints the REPORT line with what 
 (`"terminated": "SIGTERM"`, the store in flight `terminated`) BEFORE it lets go of the database, and
 exits non-zero (4, or 1/3 if those apply) even if nothing had finished. Every page already
 checkpointed stays checkpointed; the in-flight page is lost and redone next run. **What that page
-costs, in requests:** mirror, at most 50 seeds (50 `.js` requests, ~2.5 min at 3 s). Enrichment is
+costs, in requests:** mirror, at most 25 seeds (25 `.js` requests plus their redirect hops, ~1.5 min at 3 s). Enrichment is
 250 PRODUCTS, but a product can hold many storefront handles: MAC's first 250 products are ~1,600
 handles (the folded shades), which in the `.js` fallback is ~1,600 requests, **~80 minutes**, of
 work thrown away (in normal `auto` listing mode it is a few listing pages).
@@ -191,7 +270,9 @@ Top level: `lane`, `mode` (`dry_run` / `apply`), `budget_s`, `elapsed_s`, `exit_
 | `status` | meaning |
 |---|---|
 | `done` | walked to its end |
-| `aborted_on_block` | this store answered T consecutive 429/403/5xx/transport errors, or never answered cleanly at all; it is backed off (mirror 3 days, enrichment 1 day) and the pass moved on. With `pass_abort: true`, the run streak tripped too and **the whole pass stopped** (IP-level); with `ip_block: true`, it was aborted inside that same block and is NOT backed off |
+| `aborted_on_block` | this store answered T consecutive 429/403/5xx/transport errors, or never answered cleanly at all; it is backed off (mirror 3 days, enrichment 1 day) and the pass moved on. With `ip_block: true`, the breaker tripped later in the same run and the back-off was forgiven |
+| `held_by_politeness` | crawl_politeness held one or more of this store's requests past 60 s: they were NOT sent, the store stopped there WITHOUT advancing its cursor past them, no back-off. `not_sent_by_politeness` counts them |
+| `ip_throttled` | the IP-throttle breaker tripped during (or right before) this store: **the whole pass stopped** here, nothing is backed off, and the store resumes from its cursor next run. The top-level `ip_throttle` block has the breaker's evidence (hosts, first/last 429, Retry-After and server histograms) |
 | `backed_off` | skipped: this store blocked us within its lane's back-off (`backed_off` at the top level lists until when) |
 | `crashed` | the writer raised; `error` says what; the next domain still ran. `crash_cursor_reset: true`: the second crash in a row at this cursor, which was reset |
 | `cursor_stuck` | the writer returned the cursor it was given; the domain was stopped rather than looped |
@@ -207,7 +288,7 @@ re-walks from the older cursor). Top level, `resumed` lists the stores resumed m
 | exit | meaning | do |
 |---|---|---|
 | 0 | every store walked to its end (`backed_off` stores are listed, not counted) | nothing; glance at `backed_off` |
-| 1 | the WHOLE PASS aborted on a block (the run streak tripped) | suspect the crawl address; check `most_blocked_domains` / `fetches`; do not re-run straight away |
+| 1 | the WHOLE PASS stopped: the IP-throttle breaker tripped (`ip_throttled`) | the crawl address is being throttled: read `ip_throttle`, check the other crawl jobs (refresh, destination sweep, Tier B, purchasability sweep), and do not re-run until they read normally again |
 | 2 | bad arguments, no `--on-crawl-egress`, a missing merchant list, or the writer refused the domain list; nothing attempted | fix the job args or `config/tierb_cart_link_merchants.json` |
 | 3 | a writer crashed (or `cursor_stuck`), or the pass itself could not plan or start (`REAP_CART_PROOF_CRASH` on stderr, no report) | read the job log |
 | 4 | a store was left unwalked: the budget, the task timeout's SIGTERM, or one store that blocked us (`aborted_on_block` without `pass_abort`; it is backed off, see the lever below) | a store that blocked us: check that store alone; nothing else was affected. Otherwise: the cut store resumes from its cursor and the stalest stores go first next run. **This is not self-healing on its own**: it only catches up if one day's budget covers one day's work. Exit 4 on consecutive days means the budget is too small: raise the budget AND the task timeout together in the setup script, and read `reap_cart_proof_refresh_cursors` (below) to see which stores are behind |
@@ -219,7 +300,8 @@ is the measurement this lane was sized without: seeds walked per domain), `cart_
 (`sole_variant` / `named_variant` proofs computed, dry run too), `rows_with_new_ids`,
 `variant_ids_stamped`, `write_conflicts` (the refresh job rewrote the row under us: skipped, never
 forced), `fetch_outcomes` (`dead_handle` = the seed's URL is gone; `not_json` = a challenge page or
-a themed soft-404), `most_blocked_domains`. A proof the fetch no longer supports is written as JSON
+a themed soft-404; `http_421` = a redirect off the storefront, never followed; `http_425` / `http_451`
+= held / refused by crawl_politeness, not sent), `most_blocked_domains`. A proof the fetch no longer supports is written as JSON
 `null` (revoked) by the same run.
 
 **Enrichment** (`writer.pages[]` is the writer's own per-domain report, see the docstring of
@@ -296,7 +378,10 @@ an `ok` for the new product. Clearing it is a person's decision:
 > `scripts/ops/run_oneoff_job.sh` crawls the same stores from the same crawl IP; do not run either
 > writer by hand until every condition there holds.
 
-Only for a targeted fix; the jobs are the normal path. Always `SUBNET=pivota-crawl`, and
+Only for a targeted fix; the jobs are the normal path. **Prefer the job with `--only <store>`** (step 2
+above): a hand run of `scripts/backfill_shopify_variant_ids.py` does NOT go through
+`crawl_politeness`, the shared Shopify-edge pacer or the IP breaker (only the job's mirror client
+does), so it should stay a single seed. Always `SUBNET=pivota-crawl`, and
 re-list the whole `ENV_VARS` (it replaces the runner's defaults):
 
 ```sh

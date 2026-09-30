@@ -269,10 +269,13 @@ def test_a_failed_resume_fails_the_script(tmp_path):
     assert proc.returncode == 1 and "FAILED to resume" in proc.stderr
 
 
-def test_the_env_is_exactly_the_gate_the_db_guardrails_and_the_plumbing(tmp_path):
-    """Nothing else: no REAP key (writing a proof needs none), no pacing override (the timeouts are
-    sized from the writers' defaults), no second vantage."""
-    _proc, calls = _run(tmp_path, "prod", TAG)
+@pytest.mark.parametrize("flag, gate", [((), "false"), (("--enable",), "true")])
+def test_the_env_is_exactly_the_gate_the_db_guardrails_the_plumbing_and_the_shared_pacer(tmp_path, flag, gate):
+    """Nothing else: no REAP key (writing a proof needs none), no writer pacing override (the timeouts
+    are sized from the writers' defaults), no second vantage. The shared Shopify-edge pacer (#2474) is
+    ON for both jobs whether dark or armed -- a dry run fetches exactly as hard -- with its lease CAPPED
+    at 2 (leases are sized by demand; the cap bounds what one lane can hold of the shared schedule)."""
+    _proc, calls = _run(tmp_path, "prod", TAG, *flag)
     for name in JOBS:
         job = _one(calls, "run", "jobs", "create", name)
         assert _flag(job, "--set-secrets") == "DATABASE_URL=DATABASE_URL:latest"
@@ -280,8 +283,30 @@ def test_the_env_is_exactly_the_gate_the_db_guardrails_and_the_plumbing(tmp_path
             "PIVOTA_ENV": "production", "PIVOTA_SERVICE_NAME": name, "PIVOTA_COMMIT_SHA": TAG,
             "DB_POOL_MIN_SIZE": "1", "DB_POOL_MAX_SIZE": "2",
             "DB_STATEMENT_TIMEOUT_SECONDS": "30", "DB_COMMAND_TIMEOUT_SECONDS": "600",
-            "REAP_CART_PROOF_APPLY": "false",
+            "REAP_CART_PROOF_APPLY": gate,
+            "CRAWL_SHOPIFY_EDGE_PACER_ENABLED": "true", "CRAWL_SHOPIFY_EDGE_LEASE": "2",
         }
+
+
+def test_the_pacer_env_names_are_the_pacers_own():
+    """The setup script's names must be the ones services/shopify_edge_pacer.py reads, and the lease cap
+    one it accepts unclamped (#2474 sizes leases by demand, capped at CRAWL_SHOPIFY_EDGE_LEASE)."""
+    import os
+
+    from services import shopify_edge_pacer
+
+    text = SCRIPT.read_text()
+    assert f"{shopify_edge_pacer.ENABLED_ENV}=true" in text
+    assert f"{shopify_edge_pacer.LEASE_ENV}=2" in text
+    old = os.environ.get(shopify_edge_pacer.LEASE_ENV)
+    os.environ[shopify_edge_pacer.LEASE_ENV] = "2"
+    try:
+        assert shopify_edge_pacer.lease_size() == 2, "the cap is taken as set, not clamped"
+    finally:
+        if old is None:
+            del os.environ[shopify_edge_pacer.LEASE_ENV]
+        else:
+            os.environ[shopify_edge_pacer.LEASE_ENV] = old
 
 
 def test_args_name_the_wrapper_lane_the_egress_flag_and_the_budget_in_the_equals_form(tmp_path):
@@ -350,8 +375,45 @@ def test_the_mirror_timeout_covers_the_budget_plus_one_page(tmp_path):
 
     _proc, calls = _run(tmp_path, "prod", TAG)
     timeout, budget, _ = _job_numbers(calls, "reap-cart-proof-mirror")
-    one_page = refresh.MIRROR_PAGE_SIZE * (backfill.PER_DOMAIN_MIN_GAP_S + backfill.REQUEST_TIMEOUT_S)
+    # With the politeness gate in front of every request, a request can wait up to
+    # MIRROR_MAX_POLITE_WAIT_S before it is sent (or given up), then take the request timeout.
+    # Every hop the client follows by hand (up to MIRROR_MAX_REDIRECTS) can take a request timeout; the
+    # polite wait is ONE deadline for the whole request, hops and lease refills included.
+    one_page = refresh.MIRROR_PAGE_SIZE * (backfill.PER_DOMAIN_MIN_GAP_S + refresh.MIRROR_MAX_POLITE_WAIT_S
+                                           + (refresh.MIRROR_MAX_REDIRECTS + 1) * backfill.REQUEST_TIMEOUT_S)
     assert timeout >= budget + one_page, (timeout, budget, one_page)
+
+
+#: Prod census, 2026-09-30, read-only (scripts/ops/run_oneoff_job.sh, the backfill's own eligibility
+#: SQL, counts only): mirror candidates over the 42 Tier B domains. Re-measure before changing the budget.
+MIRROR_CANDIDATES_CENSUS = 2092
+
+
+def test_the_mirror_budget_covers_the_measured_candidates_with_headroom(tmp_path):
+    """The lane walks stores one at a time at the backfill's per-store gap; the budget must cover every
+    measured candidate at that pace, plus the inter-call gaps, with at least 1.5x headroom."""
+    import jobs.reap_cart_proof_refresh as refresh
+    from scripts import backfill_shopify_variant_ids as backfill
+
+    _proc, calls = _run(tmp_path, "prod", TAG)
+    _timeout, budget, _ = _job_numbers(calls, "reap-cart-proof-mirror")
+    gap = refresh.inter_call_gap_s("mirror", backfill=backfill)
+    calls_needed = MIRROR_CANDIDATES_CENSUS // refresh.MIRROR_PAGE_SIZE + 42
+    need = MIRROR_CANDIDATES_CENSUS * backfill.PER_DOMAIN_MIN_GAP_S + calls_needed * gap
+    assert budget >= 1.5 * need, (budget, need)
+
+
+def test_the_shared_edge_budget_cannot_slow_either_lane_below_its_own_pacing():
+    """Re-derived at 2 req/s shared: each lane sends one request per 3 s (0.33 req/s), under the pacer's
+    fail-open LOCAL rate (a quarter of the shared rate), let alone the shared rate itself. So the
+    timeouts, sized from each writer's own pacing, still hold with the pacer on."""
+    import jobs.enrichment_cart_variant_proof as writer
+    from scripts import backfill_shopify_variant_ids as backfill
+    from services import shopify_edge_pacer
+
+    assert shopify_edge_pacer.rate() == 2.0
+    for lane_gap in (backfill.PER_DOMAIN_MIN_GAP_S, writer.request_gap_s({})):
+        assert 1.0 / lane_gap <= shopify_edge_pacer.fallback_rate() <= shopify_edge_pacer.rate()
 
 
 def test_a_daily_run_keeps_each_proof_inside_its_validity(tmp_path):
@@ -475,3 +537,21 @@ def test_staging_targets_the_staging_project(tmp_path):
         assert _env_vars(job)["PIVOTA_ENV"] == "staging"
         trigger = _one(calls, "scheduler", "jobs", "create", "http", f"{name}-cron")
         assert "/namespaces/pivota-staging/" in _flag(trigger, "--uri")
+
+
+@pytest.mark.parametrize("flag", [(), ("--enable",), ("--disable",)])
+def test_the_shared_pacer_rate_is_left_unset_on_both_jobs(tmp_path, flag):
+    """#2474: every crawl job on the crawl IP MUST use the same CRAWL_SHOPIFY_EDGE_RPS, so these jobs
+    never set their own; they inherit the global default the pacer reads."""
+    from services import shopify_edge_pacer
+
+    proc, calls = _run(tmp_path, "prod", TAG, *flag)
+    assert proc.returncode == 0, proc.stderr
+    for name in JOBS:
+        job = _one(calls, "run", "jobs", "create", name)
+        env = _env_vars(job)
+        assert shopify_edge_pacer.RATE_ENV == "CRAWL_SHOPIFY_EDGE_RPS"
+        assert shopify_edge_pacer.RATE_ENV not in env, env
+        assert shopify_edge_pacer.FALLBACK_RATE_ENV not in env, env
+    code = "\n".join(line for line in SCRIPT.read_text().splitlines() if not line.lstrip().startswith("#"))
+    assert "CRAWL_SHOPIFY_EDGE_RPS" not in code
