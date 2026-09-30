@@ -1544,7 +1544,7 @@ async def test_the_run_records_how_many_retired_legacy_owners_it_admitted(env, m
 @pytest.mark.parametrize("vendor,override", [("SKIN1004", "Skin1004"), ("Etude House", "ETUDE HOUSE"),
                                              ("Lancome", "LANCOME")])
 def test_a_family_vendor_cannot_be_respelt_to_a_third_spelling(vendor, override):
-    with pytest.raises(ValueError, match="third spelling.*family .* always writes"):
+    with pytest.raises(ValueError, match="value other than the vendor's own spelling.*family .* always writes"):
         pipeline.validate_options({"vendors": [vendor], "multi_brand": True, "brands": {vendor: override}})
 
 
@@ -1556,6 +1556,13 @@ def test_a_family_vendor_cannot_be_respelt_to_a_third_spelling(vendor, override)
                                           ("MISSHA", "Missha"), ("MISSHA", "Missha  "), ("MISSHA", " MISSHA")])
 def test_a_family_vendor_accepts_its_own_spelling_or_the_canonical(vendor, value):
     pipeline.validate_options({"vendors": [vendor], "multi_brand": True, "brands": {vendor: value}})
+
+
+def test_every_family_canonical_is_already_whitespace_collapsed():
+    # validate_options compares the collapsed value against the RAW canonical; a new family entry with a
+    # double space would make its own canonical unacceptable.
+    from services.curated_brand_feed import RETAILER_BRAND_CANONICAL
+    assert all(" ".join(c.split()) == c for c in RETAILER_BRAND_CANONICAL.values())
 
 
 def test_every_third_spelling_is_reported_in_one_error():
