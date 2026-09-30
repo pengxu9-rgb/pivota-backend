@@ -76,11 +76,19 @@ so its writes commit page by page), inside a wall-clock budget, and prints one r
 - **The address**: one IP-throttle breaker per run (`services.crawl_ip_throttle.IpThrottleBreaker`,
   #2473), fed every response's headers through `crawl_politeness.note_response`. **A store counts
   toward a trip only once its own run of 429s (or 503 + Retry-After) reaches 3 in a row** (a clean
-  answer from it ends the run): one transient 429, timeout or 502 on a healthy store is not a block.
-  It trips when **3 counting stores within 15 minutes include one that had answered cleanly earlier
-  this run** (the blocks began after health: `trip_reason: blocks_after_health`), **or when a 4th
-  store counts with nothing answering since the first of them** (a run that starts already blocked,
-  as the 09-30 throttle did hours before both lanes' slots: `nothing_answering`). Thresholds are for
+  answer from it ends the run): one transient 429, timeout or 502 on a healthy store is not a block,
+  and a tiny store aborted after one error does not count either. It trips (`trip_reason:
+  blocks_after_health`) when **3 counting stores within 15 minutes include one that was healthy** --
+  it answered cleanly earlier this run, or **the cursor table says a previous run walked it cleanly
+  and its last run did not blame it** -- **and no other store has answered cleanly since they began**.
+  So a run that starts already blocked (the 09-30 throttle began hours before both lanes' slots) trips
+  on the third previously-healthy store; stores the table already blames (`aborted_on_block` last
+  time, forgiven or not), which `defer_blocked` walks last and back to back, are no evidence and never
+  trip it; and blockers walked between stores that still answer do not trip it. **Four first-contact
+  stores** (no cursor row) counting with nothing answering since also trip it (`nothing_answering`):
+  a new lane or new stores meeting a blocked address, at most once per store ever. **What does not
+  stop:** a run that starts blocked when no store has health on record and none is first contact
+  walks every store to its own threshold (8) and backs each off for 3 days. Thresholds are for
   lanes that walk ONE store at a time (#2473's defaults, 10 hosts in 60 s, suit the many-host refresh
   and could never trip here). A trip **stops the whole pass** (`ip_throttled`, exit 1) and
   **forgives the back-offs of that run**. This is what keeps healthy stores from being backed off
@@ -94,9 +102,7 @@ so its writes commit page by page), inside a wall-clock budget, and prints one r
 - **A second run-level stop for blocks that are not 429s.** 403s, 5xx and transport errors
   (connection resets, timeouts) never trip the throttle breaker, yet an IP-level block looks exactly
   like that (the 2026-08-21 shape; the 2026-09-28 NAT drops). A second, store-keyed breaker counts
-  those, with the same rule (3 in a row per store; 3 stores with health before, or 4 with nothing
-  answering), and also counts **every store the lane aborted** (a two-seed store never reaches 3 in
-  a row). Its trip also stops the pass without backing off stores and forgives back-offs within its
+  those, with the same rule. Its trip also stops the pass without backing off stores and forgives back-offs within its
   window (`block_breaker` in the report, with `trip_reason`). One store that genuinely 403s
   everything is aborted and backed off on its own; stores that had been answering and then block one
   after another stop the pass.

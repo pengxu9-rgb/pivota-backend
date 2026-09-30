@@ -1045,7 +1045,8 @@ def _mirror_seeds(domain: str, n: int, start: int = 0) -> List[Dict[str, Any]]:
 
 
 def _real_backfill_pass(monkeypatch, seeds_by_domain, handler, domains, page_size=3, breaker=False,
-                        max_wait=refresh.MIRROR_MAX_POLITE_WAIT_S, forgive_window_s=refresh.LANE_IP_TRIP_WINDOW_S):
+                        max_wait=refresh.MIRROR_MAX_POLITE_WAIT_S, forgive_window_s=refresh.LANE_IP_TRIP_WINDOW_S,
+                        prior=None):
     """The REAL backfill `run()` over a faked selection and a mock transport, through the mirror client
     (crawl_politeness gate; with `breaker=True`, the lane's store-keyed IP breaker installed exactly as
     run_lane installs it). Bounded at 20 s, so a wait that should have been refused fails the test
@@ -1061,7 +1062,7 @@ def _real_backfill_pass(monkeypatch, seeds_by_domain, handler, domains, page_siz
     monkeypatch.setattr(backfill, "GLOBAL_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(backfill, "PER_DOMAIN_MIN_GAP_S", 0.0)
     results: Dict[str, DomainResult] = {}
-    ip = refresh.lane_breaker(domains) if breaker else None
+    ip = refresh.lane_breaker(domains, prior=prior) if breaker else None
 
     async def go():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as raw:
@@ -1666,11 +1667,12 @@ def test_a_store_that_blocked_us_earlier_is_forgiven_when_the_breaker_trips_late
     results, _client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=25, breaker=True)
     assert results["a.com"].status == ABORTED and results["a.com"].ip_block
     assert results["b.com"].status == DONE
-    # c.com is aborted (8 x 429 after one answer); d.com's abort makes a, c, d three stores in the window
-    # and c.com had answered first: the block breaker trips on d.com's abort, in d.com's own page.
+    # c, d and e each answer once and then 429 three in a row: three counting stores that had answered,
+    # and nothing outside them answering since -- the throttle breaker trips at e.com's third 429.
     assert results["c.com"].status == ABORTED and results["c.com"].ip_block
-    assert results["d.com"].status == refresh.IP_THROTTLED and results["e.com"].status == NOT_REACHED
-    assert _client.breaker.blocks.trip_reason == "blocks_after_health"
+    assert results["d.com"].status == ABORTED and results["d.com"].ip_block
+    assert results["e.com"].status == refresh.IP_THROTTLED
+    assert _client.breaker.throttle.trip_reason == "blocks_after_health"
     assert refresh.cursor_row_for(results["a.com"], True, T0)["blocked_until"] is None
 
 

@@ -308,20 +308,6 @@ def test_r7250_c_a_healthy_store_between_blocking_stores_keeps_the_pass_going(mo
     assert [results[d].status for d in domains] == [ABORTED, refresh.DONE, ABORTED, ABORTED, ABORTED]
 
 
-def test_r7250_d_tiny_stores_under_an_ip_block_count_once_aborted(monkeypatch):
-    """Stores with two seeds each can never reach LANE_STORE_STREAK; every answer is a 403 from the
-    run's first request. Each is aborted as "never read" -- and an aborted store counts. The fourth,
-    with nothing answering since the first, trips the block breaker inside its own page."""
-    domains = ["a.com", "b.com", "c.com", "d.com", "e.com"]
-    handler = _scripted({d: ["403"] * 5 for d in domains})
-    seeds = {d: _mirror_seeds(d, 2) for d in domains}
-    results, client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=25, breaker=True)
-    assert client.breaker.blocks.tripped and client.breaker.blocks.trip_reason == "nothing_answering"
-    assert [results[d].status for d in ("a.com", "b.com", "c.com")] == [ABORTED] * 3
-    assert results["d.com"].status == refresh.IP_THROTTLED and results["e.com"].status == refresh.NOT_REACHED
-    assert not any(refresh.cursor_row_for(r, True, T0)["blocked_until"] for r in results.values())
-
-
 def _enrichment_pass(answers):
     from tests.test_reap_cart_proof_refresh import BlockingEnrichmentJob
 
@@ -341,16 +327,6 @@ def test_r7250_c_enrichment_three_genuinely_throttling_stores_then_healthy_ones_
     assert [results[d].status for d in ("x.com", "y.com", "z.com")] == [ABORTED] * 3
     assert all(refresh.cursor_row_for(results[d], True, T0)["blocked_until"] for d in ("x.com", "y.com", "z.com"))
     assert results["h.com"].status == refresh.DONE
-
-
-def test_r7250_d_enrichment_tiny_stores_under_an_ip_block_count_once_aborted():
-    """Two blocks each (under both the streak and the writer's limit of 5), never a clean answer: each
-    store is aborted "never read", and the fourth abort trips the block breaker in its own page."""
-    answers = {d: ["block", "block"] for d in ("a.com", "b.com", "c.com", "d.com", "e.com")}
-    results, breaker = _enrichment_pass(answers)
-    assert breaker.blocks.tripped and breaker.blocks.trip_reason == "nothing_answering"
-    assert [results[d].status for d in ("a.com", "b.com", "c.com")] == [ABORTED] * 3
-    assert results["d.com"].status == refresh.IP_THROTTLED and results["e.com"].status == refresh.NOT_REACHED
 
 
 def test_r7250_a_store_that_answers_only_after_its_run_is_no_health_before_it(monkeypatch):
@@ -381,3 +357,200 @@ def test_r7250_a_counting_store_leaves_the_window_after_its_last_block():
     # c.com at t=1000: a.com's last block was 1000 s ago, outside the 900 s window -> two stores.
     assert verdicts == [None, None, None, "blocks_after_health"]
     assert set(window.counting) == {"b.com", "c.com", "d.com"}
+
+
+# ── Review of 61fb15f78: health from the cursor table, stores still answering, no abort-only count ─
+#
+# The reviewer's repro (scratchpad review-2476/repro_r3_2476.py) PRINTS each scenario and asserts
+# nothing, so it could not be copied as a regression test. Its scenarios are rebuilt here with the fixed
+# behaviour asserted, through the REAL run_lane (MemoryDb keeps the cursor table across nights, so
+# defer_blocked and the table's health are the production ones) or `_real_backfill_pass`.
+
+
+def _night_runner(monkeypatch, domains, seeds, handler, rows=None, lane="mirror"):
+    """`night(offset)` runs the REAL run_lane over `domains` against a MemoryDb seeded with `rows`
+    (domain -> cursor row fields), and returns (state, hosts requested that night, db)."""
+    from datetime import timedelta
+    from scripts import backfill_shopify_variant_ids as backfill
+    from tests.test_reap_cart_proof_refresh import MemoryDb
+
+    async def fake_select(limit, domain, after=None, seed_ids=None):
+        rows_ = [r for r in seeds[domain] if after is None or r["id"] > after]
+        return [dict(r) for r in rows_[:limit]]
+
+    requested: List[str] = []
+
+    def counting(request):
+        requested.append(request.url.host)
+        return handler(request)
+
+    monkeypatch.setattr(backfill, "select_candidates", fake_select)
+    monkeypatch.setattr(backfill, "GLOBAL_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(backfill, "PER_DOMAIN_MIN_GAP_S", 0.0)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(refresh.httpx, "AsyncClient",
+                        lambda *a, **k: real_client(transport=httpx.MockTransport(counting)))
+    db = MemoryDb()
+    for domain, row in (rows or {}).items():
+        db.rows[(lane, domain)] = {"next_cursor": None, "blocked_until": None, "crash_count": 0,
+                                   "updated_at": T0 - timedelta(days=1), "last_completed_at": None, **row}
+    plan = refresh.LanePlan(lane=lane, domains=list(domains), writer=backfill, gap_s=0.0,
+                            proof_max_age=timedelta(days=7))
+
+    def night(offset=timedelta(0)):
+        requested.clear()
+        state = refresh.RunState()
+        refresh.asyncio.run(refresh.run_lane(plan, apply=True, budget_s=600, emit=lambda line: None, state=state,
+                                             db=db, now=lambda: T0 + offset))
+        return state, list(requested), db
+
+    return night
+
+
+def _blocked_until(db, domain, lane="mirror"):
+    return db.rows[(lane, domain)]["blocked_until"]
+
+
+@pytest.mark.parametrize("last_night", ["forgiven", "back_off_expired"])
+def test_r61fb_a_four_genuine_blockers_walked_last_do_not_trip_and_keep_their_back_offs(monkeypatch, last_night):
+    """The reviewer's loop. a, c, e, g genuinely refuse us; last time they were aborted (their back-off
+    either forgiven by a trip, or just expired), so defer_blocked walks them LAST, back to back, after
+    the healthy b, d, f, h. The table blames them: no evidence the address went bad, and they are not
+    first contact. No trip, exit 4, and each serves its back-off."""
+    from datetime import timedelta
+    from scripts import backfill_shopify_variant_ids as backfill
+
+    domains = [f"{c}.com" for c in "abcdefgh"]
+    bad = ("a.com", "c.com", "e.com", "g.com")
+    seeds = {d: _mirror_seeds(d, 12) for d in domains}
+    until = None if last_night == "forgiven" else T0 - timedelta(minutes=1)
+    rows = {d: {"last_status": refresh.DONE, "last_completed_at": T0 - timedelta(days=1)} for d in domains}
+    rows.update({d: {"last_status": ABORTED, "blocked_until": until,
+                     "last_completed_at": T0 - timedelta(days=5)} for d in bad})
+    night = _night_runner(monkeypatch, domains, seeds, lambda r: httpx.Response(403 if r.url.host in bad else 404),
+                          rows=rows)
+    state, requested, db = night()
+    assert state.info["domains_order"] == ["b.com", "d.com", "f.com", "h.com", *bad]
+    assert state.info["block_breaker"]["block_breaker_tripped"] is False
+    assert [state.results[d].status for d in bad] == [ABORTED] * 4
+    assert all(_blocked_until(db, d) == T0 + refresh.MIRROR_BLOCK_BACKOFF for d in bad)
+    assert [requested.count(d) for d in bad] == [backfill.CONSECUTIVE_BLOCK_ABORT] * 4
+    assert exit_code(state.results) == refresh.EXIT_BUDGET
+    # The next nights: backed off until day 3, then walked last again -- still no trip.
+    state, requested, _db = night(timedelta(days=1))
+    assert [state.results[d].status for d in bad] == [refresh.BACKED_OFF] * 4 and not set(bad) & set(requested)
+    state, _requested, db = night(timedelta(days=3, minutes=1))
+    assert state.info["domains_order"][-4:] == list(bad)
+    assert not state.info["block_breaker"]["block_breaker_tripped"]
+    assert all(_blocked_until(db, d) is not None for d in bad)
+
+
+def test_r61fb_a_blockers_interleaved_with_answering_stores_do_not_trip_even_with_past_health(monkeypatch):
+    """The night they START refusing us: a, c, e, g were healthy last time (evidence), but b, d, f answer
+    between them. A store outside the window still answering says the address is fine."""
+    from datetime import timedelta
+
+    domains = [f"{c}.com" for c in "abcdefgh"]
+    bad = ("a.com", "c.com", "e.com", "g.com")
+    rows = {d: {"last_status": refresh.DONE, "last_completed_at": T0 - timedelta(days=1)} for d in domains}
+    night = _night_runner(monkeypatch, domains, {d: _mirror_seeds(d, 12) for d in domains},
+                          lambda r: httpx.Response(403 if r.url.host in bad else 404), rows=rows)
+    state, _requested, db = night()
+    assert state.info["domains_order"] == domains
+    assert not state.info["block_breaker"]["block_breaker_tripped"]
+    assert all(_blocked_until(db, d) is not None for d in bad)
+    assert [state.results[d].status for d in domains if d not in bad] == [refresh.DONE] * 4
+
+
+def test_r61fb_b_four_tiny_stores_with_one_transient_error_each_do_not_trip(monkeypatch):
+    """The reviewer's slow-start case: four one-seed stores walked first, each out once (a ReadTimeout),
+    then healthy stores. Each is aborted by the never-read rule -- but an abort no longer makes a store
+    count, and one error is a run of one. No trip."""
+    tiny = [f"t{i}.com" for i in range(4)]
+    domains = tiny + ["h1.com", "h2.com"]
+
+    def handler(request):
+        if request.url.host in tiny:
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(404)
+
+    seeds = {d: _mirror_seeds(d, 1) for d in tiny}
+    seeds.update({d: _mirror_seeds(d, 10) for d in ("h1.com", "h2.com")})
+    results, client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=25, breaker=True)
+    assert not client.breaker.tripped and client.breaker.blocks.streaks.counting == {}
+    assert results["h1.com"].status == refresh.DONE and results["h2.com"].status == refresh.DONE
+    assert exit_code(results) != refresh.EXIT_ABORTED_ON_BLOCK
+
+
+@pytest.mark.parametrize("kind", ["403", "429"])
+@pytest.mark.parametrize("history", ["done", "completed_then_in_progress"])
+def test_r61fb_c_a_run_that_starts_blocked_trips_on_stores_that_were_healthy_before(monkeypatch, kind, history):
+    """No store answers from the run's first request, but the cursor table says each was walked cleanly
+    on a previous run (last_status done, or a last_completed_at kept under a later in-progress walk):
+    the address went bad. The third store's third block trips it; nothing is backed off; exit 1."""
+    from datetime import timedelta
+    from scripts import backfill_shopify_variant_ids as backfill
+
+    domains = [f"s{i}.com" for i in range(6)]
+    status = refresh.DONE if history == "done" else refresh.IN_PROGRESS
+    rows = {d: {"last_status": status, "last_completed_at": T0 - timedelta(days=2)} for d in domains}
+    night = _night_runner(monkeypatch, domains, {d: _mirror_seeds(d, 20) for d in domains},
+                          lambda r: httpx.Response(int(kind)), rows=rows)
+    state, requested, db = night()
+    info = state.info["ip_throttle"] if kind == "429" else state.info["block_breaker"]
+    reason = info["ip_throttle_trip_reason"] if kind == "429" else info["trip_reason"]
+    assert reason == "blocks_after_health"
+    limit, k = backfill.CONSECUTIVE_BLOCK_ABORT, refresh.LANE_STORE_STREAK
+    assert len(requested) == 2 * limit + k
+    order = state.info["domains_order"]
+    assert state.results[order[2]].status == refresh.IP_THROTTLED
+    assert all(r["blocked_until"] is None for r in db.rows.values())
+    assert exit_code(state.results) == refresh.EXIT_ABORTED_ON_BLOCK
+
+
+def test_r61fb_d_a_run_that_starts_blocked_with_no_store_ever_read_cleanly_walks_every_store(monkeypatch):
+    """(d), stated plainly: the address is blocked from the run's first request, and the table has NO
+    health for any store -- each was blamed last time, or walked but never to its end -- and none is
+    first contact. There is no evidence the address (rather than each store) is the problem, so there is
+    no trip: every store is walked to its own threshold and backed off (mirror 3 days, under the 7-day
+    proof life). Cost: T requests per store."""
+    from datetime import timedelta
+    from scripts import backfill_shopify_variant_ids as backfill
+
+    domains = [f"s{i}.com" for i in range(5)]
+    rows = {d: {"last_status": ABORTED, "last_completed_at": None} for d in domains[:3]}
+    rows.update({d: {"last_status": refresh.IP_THROTTLED, "last_completed_at": None} for d in domains[3:]})
+    night = _night_runner(monkeypatch, domains, {d: _mirror_seeds(d, 20) for d in domains},
+                          lambda r: httpx.Response(403), rows=rows)
+    state, requested, db = night(timedelta(days=0))
+    assert not state.info["block_breaker"]["block_breaker_tripped"]
+    assert len(requested) == 5 * backfill.CONSECUTIVE_BLOCK_ABORT
+    assert all(state.results[d].status == ABORTED for d in domains)
+    assert all(_blocked_until(db, d) is not None for d in domains)
+    assert exit_code(state.results) == refresh.EXIT_BUDGET
+
+
+def test_r61fb_d_first_contact_stores_blocked_from_the_first_request_still_trip(monkeypatch):
+    """The other half of (d): stores the table has never seen (first contact) -- a new lane, or new
+    stores -- blocked from the first request. The fourth trips `nothing_answering`, through run_lane."""
+    domains = [f"s{i}.com" for i in range(6)]
+    night = _night_runner(monkeypatch, domains, {d: _mirror_seeds(d, 20) for d in domains},
+                          lambda r: httpx.Response(403))
+    state, requested, db = night()
+    assert state.info["block_breaker"]["trip_reason"] == "nothing_answering"
+    assert state.results[state.info["domains_order"][3]].status == refresh.IP_THROTTLED
+    assert all(r["blocked_until"] is None for r in db.rows.values())
+
+
+def test_r61fb_nit_an_off_storefront_redirect_is_neutral_for_breaker_health(monkeypatch):
+    """A 421 (redirect off the storefront, never followed) is neither a block nor a clean answer for the
+    breakers or the store count; the backfill's report still names it `http_421`."""
+    def handler(request):
+        return httpx.Response(301, headers={"location": "https://elsewhere.example/p.js"})
+
+    results, client = _real_backfill_pass(monkeypatch, {"a.com": _mirror_seeds("a.com", 3)}, handler, ["a.com"],
+                                          page_size=10, breaker=True)
+    assert client.off_storefront_redirects == 3 and client.store_clean == 0
+    assert client.breaker.health.first_clean == {} and client.breaker.health.last_clean == 0
+    assert results["a.com"].writer["fetch_outcomes"] == {"http_421": 3}
+    assert results["a.com"].status == refresh.DONE
