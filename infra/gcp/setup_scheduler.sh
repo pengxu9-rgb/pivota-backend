@@ -361,8 +361,8 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 # an image with bounded review concurrency (PIVOTA-Agent #2335) and RELGRAPH_SYNC_REVIEW_CONCURRENCY
 # is set with it: 1,000 sequential reviews are ~2 h and fail the step every night.
 #
-# So this raise removes ONE of three walls. It changes nothing about the daily run, which exits in
-# minutes either way.
+# So this raise removes ONE of three walls. It changes nothing about the daily run, which takes
+# ~37 minutes at today's caps either way.
 #
 # COST: infra/gcp/setup_monitoring.sh alerts on relgraph-sync via completed_task_attempt_count
 # {result=failed}, which fires only AFTER a task dies, and via "prod: relgraph-sync running over two
