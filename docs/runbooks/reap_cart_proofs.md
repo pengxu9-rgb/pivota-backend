@@ -440,15 +440,45 @@ only not coincided with.
 
 ## Known limits
 
-- **The mirror writer does not consult robots.txt or honour `Retry-After`** (the enrichment writer
-  does, through `services.crawl_politeness`). It paces itself (1 s global, 3 s per store); a store
-  is aborted after 8 consecutive block-shaped answers (or no clean answer at all) and backed off;
-  the pass stops after 16 across stores when the current store is blocked too. Making the backfill polite is
-  that script's change, not this job's.
+- **A HAND run of the mirror writer is not polite** (the scheduled job is). Since #2476, the scheduled
+  `reap-cart-proof-mirror` job sends every request, redirect hops included, through
+  `crawl_politeness` (robots.txt, `Retry-After`, per-host backoff, the shared Shopify-edge pacer). It
+  aborts a store after 8 block-shaped answers in a row (or no clean answer at all), and stops the pass
+  only through the lane breakers above. A hand run of `scripts/backfill_shopify_variant_ids.py` gets
+  none of that. It paces itself (1 s global, 3 s per store), ignores robots.txt and `Retry-After`,
+  and has one block counter for the whole run: it aborts the run after 8 block-shaped answers in a
+  row, across every store it touches. That is why hand runs stay under this runbook's hard gate and
+  single-seed. Making the script itself polite is that script's change, not this job's.
 - **bluemercury may exceed `/products.json`'s 100-page cap** (see "Reading the report").
 - **The enrichment writer re-reads a store's listing for every 250-product page** in `auto` mode
   (MAC and tarte are two pages each): a few extra listing requests, in exchange for page-by-page
   commits and a budget that can stop inside a store.
+- **A PARTIAL throttle escapes the lane breaker** (#2476 review, P2, measured). The breaker's
+  "still answering" veto means a clean answer from any store outside the counting window cancels the
+  trip. So once roughly 1 walked store in 3 or more still reads cleanly, a throttle on the rest never
+  stops the pass. Measured with every cursor row healthy (T = a throttled store, F = a free one, in
+  walk order):
+
+  | walk order | result |
+  |---|---|
+  | `TF` | no trip; 6 of 12 stores backed off |
+  | `TTF` | no trip; 8 of 12 backed off |
+  | `TTFTFF` | no trip |
+  | `TTTF` | trips after 19 requests |
+
+  The throttled stores are aborted and backed off, and their rows then say `aborted_on_block`. A
+  blamed store is never evidence again, so each serves its 3-day back-off and is walked last (about
+  112 requests per cycle) until the address recovers. The 2026-09-30 shape (~97% of answers
+  throttled) does trip. **What to watch:** many `aborted_on_block` stores in one run that exits 4
+  rather than 1. Treat that as a possible partial IP throttle: check the other crawl jobs' breakers
+  before trusting the back-offs. **Possible tightening, not implemented:** count a store as "still
+  answering" only after several consecutive clean answers since the window began.
+- **A table with every row present and none healthy never trips** (#2476). This means every store was
+  blamed last time, or was walked but never to its end, and none is first contact. If such a run
+  starts blocked, it walks every store to its threshold and backs each off. That costs about 272–336
+  mirror requests once per 3-day back-off, not nightly. It only arises if the lane has never walked
+  cleanly from this address, and #2475's hard gate (≥ 24 h of normal reads first) makes the first
+  runs healthy.
 
 `tests/test_setup_reap_cart_proof_jobs.py` re-derives the neighbour windows from their scripts (and
 pins the two live-only ones) and fails if a schedule or timeout moves into one.
