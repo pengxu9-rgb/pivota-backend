@@ -313,6 +313,16 @@ upsert "prod: Cloud Run job failing" "$(policy \
   'metric.type="run.googleapis.com/job/completed_task_attempt_count" AND resource.type="cloud_run_job" AND metric.label.result="failed"' \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 300s 3600s)"
 
+# Running executions is a GA gauge, sampled every 60s (up to 120s visibility lag):
+# https://docs.cloud.google.com/monitoring/api/metrics_gcp_p_z#run
+# This measures continuous job occupancy, not the age of an individual execution. Overlapping
+# executions can keep it positive too; that is also anomalous for this once-daily job.
+upsert "prod: relgraph-sync running over two hours" "$(policy \
+  "prod: relgraph-sync running over two hours" \
+  "relgraph-sync has had at least one running execution continuously for two hours. Phase 1 expects ~30 minutes (200 anchors, 1000 reviews, concurrency 6). Check for a wedged run, overlapping executions, or an older image ignoring review concurrency; the failure signal only arrives after a task dies. Sampling/visibility lag can delay this alert by several minutes." \
+  'metric.type="run.googleapis.com/job/running_executions" AND resource.type="cloud_run_job" AND resource.label.job_name="relgraph-sync"' \
+  ALIGN_MAX REDUCE_SUM resource.label.job_name COMPARISON_GT 0 60s 7200s 14400s)"
+
 upsert "prod: Cloud SQL connections high" "$(policy \
   "prod: Cloud SQL connections high" \
   "Postgres backends are above 80% of max_connections (300). This codebase has wedged on pool exhaustion before - see the 2026-08-20 sitemap incident, where a plan built without statistics opened enough connections to exhaust the pool. Look for a stuck query or a revision that will not scale down." \
