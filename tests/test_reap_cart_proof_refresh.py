@@ -800,7 +800,7 @@ def test_no_script_under_scripts_invokes_these_jobs():
     names = ("setup_reap_cart_proof_jobs", "reap_cart_proof_refresh", "reap-cart-proof")
     checked = 0
     for path in sorted((REPO / "scripts").rglob("*")):
-        if not path.is_file() or "__pycache__" in path.parts or path.suffix in (".pyc", ".json", ".csv", ".md"):
+        if not path.is_file() or "__pycache__" in path.parts or path.suffix in (".pyc", ".csv", ".md"):
             continue
         checked += 1
         hits = [n for n in names if n in _code_references(path)]
