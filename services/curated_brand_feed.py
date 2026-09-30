@@ -1534,6 +1534,23 @@ RETAILER_BRAND_SPELLINGS = {
     "etudehouse": "etude", "etude": "etude",
     # _brand_key keeps accents (isalnum), so the accented spellings are keys of their own (review of #2440).
     "étudehouse": "etude", "étude": "etude",
+    # K-beauty / US wave, measured in prod 2026-09-30 over the 13,337 rows ingested 09-23..09-29: each brand
+    # below was stored under two or three spellings that differ ONLY in case (normalize_brand lowercases, so
+    # every spelling of one brand already shares a content_key -- these families move no identity, and so,
+    # unlike ETUDE, may reach the drain before the old rows are relabelled). The vendor's case decided the
+    # display brand: dodoskin.com/holiholic.com "MISSHA" (413 retailer rows) vs misshaus.com "Missha" (149);
+    # eyurs.com "ROUND LAB" vs roundlab.com "Round Lab"; skin1004.com itself writes both "SKIN1004" and
+    # "Skin1004"; cocomo.sg "ANUA"/"ISNTREE"/"GENABELLE"/"MOLVANY"/"ARENCIA". "Centellian 24" (one merchant
+    # row, not a crawl lane) splits by a space; the crawl lanes only ever wrote "Centellian24"/"CENTELLIAN24",
+    # so that family moves no stored crawl row's identity either.
+    # NOT here yet, because they DO move identity (see services/brand_relabel.py ORDER): "O HUI (오휘)" /
+    # "Jung Saem Mool" (smkoreabeauty.com retailer rows -- relabel first), "APIEU" (misshaus.com brand rows --
+    # the product_key moves too), "Supergoop" (supergoop.com brand rows -- no relabel tool reaches them).
+    "missha": "missha", "mixsoon": "mixsoon", "roundlab": "roundlab", "anua": "anua", "arencia": "arencia",
+    "skin1004": "skin1004", "medicube": "medicube", "beautyofjoseon": "beautyofjoseon",
+    "theordinary": "theordinary", "isntree": "isntree", "centellian24": "centellian24",
+    "makeupforever": "makeupforever", "genabelle": "genabelle", "maybelline": "maybelline",
+    "bobbibrown": "bobbibrown", "molvany": "molvany", "byterry": "byterry",
 }
 # The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
 # --brand. content_key is
@@ -1577,6 +1594,27 @@ RETAILER_BRAND_CANONICAL = {
     "lukbeautifood": "Lük Beautifood",
     # The brand's own current name (etude.com). Every family member is relabelled to it (see the spellings note).
     "etude": "ETUDE",
+    # 2026-09-30 wave. Rule: the spelling the catalog already carries on the rows the retailer relabel tool
+    # cannot reach (brand-official / merchant rows, not ext:retailer:), so repairing the existing rows is the
+    # reviewed relabel of retailer rows alone. Rows per spelling outside ext:retailer: in parentheses. It
+    # agrees with the brand's own styling where that is clear (SKIN1004, The Ordinary, Beauty of Joseon).
+    "missha": "Missha",                     # misshaus.com 149 (vs "MISSHA" 0; 413 retailer rows)
+    "mixsoon": "Mixsoon",                   # 225 (vs "MIXSOON" 4, mixsoon.us)
+    "roundlab": "Round Lab",                # roundlab.com 88 (vs "ROUND LAB" 42)
+    "anua": "Anua",                         # anua.com/anua.us 86 (vs "ANUA" 6, all suppressed)
+    "arencia": "Arencia",                   # 126 (vs "ARENCIA" 21)
+    "skin1004": "SKIN1004",                 # skin1004.com 93 (vs "Skin1004" 48)
+    "medicube": "MEDICUBE",                 # 66 (vs "Medicube" 17, medicube.us)
+    "beautyofjoseon": "Beauty of Joseon",   # beautyofjoseon.com 103 (vs "BEAUTY OF JOSEON" 2, suppressed)
+    "theordinary": "The Ordinary",          # 109 (vs "the ordinary" 5)
+    "isntree": "Isntree",                   # isntree-global.com 58 (vs "ISNTREE" 5, suppressed)
+    "centellian24": "Centellian24",         # centellian24usa.com 106 (vs "Centellian 24" 1, "CENTELLIAN24" 1)
+    "makeupforever": "MAKE UP FOR EVER",    # makeupforever.sg 74 (vs "Make Up For Ever" 0; 4 retailer rows)
+    "genabelle": "Genabelle",               # 31 (vs "GENABELLE" 8, suppressed)
+    "maybelline": "Maybelline",             # 25 (vs "MAYBELLINE" 0; 12 retailer rows)
+    "bobbibrown": "Bobbi Brown",            # 9 (vs "BOBBI BROWN" 0; 17 retailer rows)
+    "molvany": "Molvany",                   # 10 (vs "MOLVANY" 4, suppressed)
+    "byterry": "BY TERRY",                  # retailer rows only (11 vs "By Terry" 4): the brand's own styling
 }
 
 
