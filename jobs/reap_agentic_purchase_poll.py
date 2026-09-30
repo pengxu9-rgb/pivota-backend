@@ -635,7 +635,7 @@ async def run_reap_agentic_purchase_poll(
 
     # ── 2. the PII deadline — ALWAYS, ARMED OR NOT ───────────────────────────────────────────
     # The ENROLLMENT GRACE comes from the state machine's own reader, not a second dial here:
-    # the same number decides when `_reconcile_pending_enrollment` may retire a pending
+    # the same number decides when `_reconcile_one` may retire a pending
     # enrollment, and two readers of one env var are two rules. Read once per run.
     enrollment_grace = purchase_svc.enrollment_grace_seconds()
 

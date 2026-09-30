@@ -65,6 +65,8 @@ MIGRATIONS = (
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
     MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
+    # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
+    MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
 )
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 

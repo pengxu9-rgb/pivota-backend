@@ -4265,3 +4265,168 @@ async def test_a_transition_into_quoting_refuses_a_hosted_link(field):
             purchase["id"], from_states=["resolving"], to_state="quoting", **{field: value}
         )
     assert await _state_of(purchase["id"]) == "resolving"
+
+
+# ── review of #2483 at 93f585c26: the ledger halves ─────────────────────────────────────────
+
+
+async def _raw_pending(id_: str, buyer_ref: str = "bref_alice", **cols) -> None:
+    names = ["id", "buyer_ref", "status", *cols]
+    await database.execute(
+        f"INSERT INTO reap_agentic_enrollments ({', '.join(names)}) VALUES "
+        f"({', '.join(':' + n for n in names)})",
+        {"id": id_, "buyer_ref": buyer_ref, "status": "pending", **cols},
+    )
+
+
+async def test_the_self_heal_refuses_a_second_pending_row_for_one_buyer():
+    """Migration 252's index, as the SELF-HEAL builds it, tested behaviourally — and its
+    partial predicate: other buyers, and dead/active rows of the same buyer, do not collide."""
+    await _raw_pending("re_one")
+    with pytest.raises(sqlite3.IntegrityError):
+        await _raw_pending("re_two")
+    await _raw_pending("re_bob", buyer_ref="bref_bob")
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status) "
+        "VALUES ('re_dead', 'bref_alice', 'dead')"
+    )
+    assert await _enrollment_count() == 1
+
+
+async def test_the_migration_and_the_self_heal_declare_the_same_one_pending_index():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    migration = (root / "db/migrations/252_reap_agentic_enrollments_one_pending.sql").read_text()
+    guard = (root / "db/schema_guard.py").read_text()
+    down = (root / "db/migrations/down/252_reap_agentic_enrollments_one_pending_down.sql").read_text()
+    assert "uq_reap_agentic_enrollments_one_pending" in migration
+    assert "ON reap_agentic_enrollments (buyer_ref)" in migration
+    assert "WHERE status = 'pending'" in migration
+    assert guard.count('"uq_reap_agentic_enrollments_one_pending "') == 2, "both dialects"
+    assert "DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending" in down
+
+
+async def test_a_concurrent_mint_hands_the_loser_the_winner(monkeypatch):
+    """P2-1. The race inside `upsert_pending_enrollment`: our read saw no pending row, another
+    writer inserted one, our INSERT is refused by the index — and we get THE WINNER back, not a
+    raw IntegrityError and not a second row."""
+    real = ledger.get_pending_enrollments
+    calls = {"n": 0}
+
+    async def _stale_then_real(buyer_ref):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await _raw_pending("re_winner")      # the other writer, between our read and INSERT
+            return []
+        return await real(buyer_ref)
+
+    monkeypatch.setattr(ledger, "get_pending_enrollments", _stale_then_real)
+    got = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    assert got["id"] == "re_winner"
+    assert await _enrollment_count() == 1
+
+
+async def test_a_concurrent_mint_carrying_partner_fields_is_refused_by_name(monkeypatch):
+    """The same refusal on an INSERT that carried a partner's answer: the winner is NOT returned
+    (that would drop the answer silently) — `PendingEnrollmentTaken` names it."""
+    real = ledger.get_pending_enrollments
+    calls = {"n": 0}
+
+    async def _stale_then_real(buyer_ref):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await _raw_pending("re_winner")
+            return []
+        return await real(buyer_ref)
+
+    monkeypatch.setattr(ledger, "get_pending_enrollments", _stale_then_real)
+    with pytest.raises(ledger.PendingEnrollmentTaken) as caught:
+        await ledger.upsert_pending_enrollment(
+            buyer_ref="bref_alice", hosted_url="https://pay.prava.space/enroll/x"
+        )
+    assert caught.value.winner_id == "re_winner"
+
+
+async def test_a_partner_id_held_by_another_row_is_a_named_conflict_on_update_and_insert():
+    """P1-1. `uq_reap_agentic_enrollments_reap_id` refusing the write is `EnrollmentIdConflict`
+    carrying the holder — on the UPDATE (recording a create's answer on our attempt) and on the
+    INSERT — never a raw driver error."""
+    held = "9041ef1a-1377-45f6-b09a-95d5eb07f908"
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id) "
+        "VALUES ('re_old', 'bref_alice', 'dead', :r)", {"r": held},
+    )
+    ours = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    with pytest.raises(ledger.EnrollmentIdConflict) as on_update:
+        await ledger.upsert_pending_enrollment(
+            buyer_ref="bref_alice", enrollment_id=ours["id"], reap_enrollment_id=held
+        )
+    assert on_update.value.enrollment_id == ours["id"]
+    assert (on_update.value.holder["id"], on_update.value.holder["status"]) == ("re_old", "dead")
+    await ledger.mark_enrollment_dead(ours["id"])
+    with pytest.raises(ledger.EnrollmentIdConflict) as on_insert:
+        await ledger.upsert_pending_enrollment(buyer_ref="bref_alice", reap_enrollment_id=held)
+    assert on_insert.value.enrollment_id is None
+    assert on_insert.value.holder["id"] == "re_old"
+
+
+async def test_a_linked_pending_row_with_no_expiry_dies_with_reaps_session():
+    """P2-2. No recorded expiry is not "never expires": a row WITH a link is judged against
+    created_at + HOSTED_SESSION_SECONDS; a row with NO link (a lost create response) never is."""
+    await _raw_pending("re_linked", hosted_url="https://pay.prava.space/enroll/x")
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET created_at = datetime('now', '-100 seconds')"
+    )
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is False
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET created_at = datetime('now', :s)",
+        {"s": f"-{ledger.HOSTED_SESSION_SECONDS + 1} seconds"},
+    )
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is True
+    with pytest.raises(ledger.PendingEnrollmentExpired):
+        await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    await database.execute("UPDATE reap_agentic_enrollments SET hosted_url = NULL")
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is False
+
+
+async def test_pending_enrollments_are_every_row_oldest_first_with_the_whole_row():
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
+    await _raw_pending("re_b", agent_id="agent_one", reap_status="REQUIRES_ACTION")
+    await _raw_pending("re_a")
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET created_at = datetime('now', '-60 seconds') "
+        "WHERE id = 're_a'"
+    )
+    rows = await ledger.get_pending_enrollments("bref_alice")
+    assert [r["id"] for r in rows] == ["re_a", "re_b"]
+    assert {"agent_id", "reap_status", "created_at", "updated_at"} <= set(rows[1])
+    assert (rows[1]["agent_id"], rows[1]["reap_status"]) == ("agent_one", "REQUIRES_ACTION")
+    assert (await ledger.get_pending_enrollment("bref_alice"))["id"] == "re_a"
+    # ANY dead link among them stops the upsert, whichever row it would have picked.
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET hosted_url_expires_at = datetime('now', '-5 seconds') "
+        "WHERE id = 're_b'"
+    )
+    with pytest.raises(ledger.PendingEnrollmentExpired) as caught:
+        await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    assert caught.value.enrollment_id == "re_b"
+
+
+async def test_a_settling_claim_is_not_an_attempt_and_other_resolving_claims_are():
+    """P2-3, at the statement: `enrollment_settling` on a 'resolving' row exempts the claim;
+    any other code (or none) counts; the exemption is 'resolving'-only."""
+    held = await _mk()
+    other = await _mk(buyer_ref="bref_other")
+    quoting = await _mk(state="quoting", buyer_ref="bref_q")
+    for row, code in ((held, "enrollment_settling"), (other, "transport_error:readtimeout"),
+                      (quoting, "enrollment_settling")):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET last_error_code = :c, "
+            "next_poll_at = datetime('now', '-1 seconds') WHERE id = :i",
+            {"c": code, "i": row["id"]},
+        )
+    claimed = {r["id"]: r["attempts"] for r in await ledger.claim_due_purchases("w1")}
+    assert claimed[held["id"]] == 0
+    assert claimed[other["id"]] == 1
+    assert claimed[quoting["id"]] == 1

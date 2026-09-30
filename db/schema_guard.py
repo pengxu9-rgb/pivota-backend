@@ -1015,6 +1015,29 @@ async def ensure_required_schema_light() -> None:
                 # call against it is an UndefinedTable 500 rather than a wrong
                 # answer, so the failure is visible from the first request.
                 pass
+            # mig 252: AT MOST ONE PENDING ENROLLMENT PER BUYER.
+            # db/migrations/252_reap_agentic_enrollments_one_pending.sql is the
+            # same index. Two purchases of one buyer, each in 'resolving' in one
+            # tick, used to mint one pending enrollment EACH (two hosted links to
+            # one buyer, review of #2483 P2-1); with this index the second INSERT
+            # is refused and db/reap_agentic_ledger.upsert_pending_enrollment
+            # hands it the winner instead.
+            #
+            # ITS OWN try/except, for the reason every sibling states: CREATE
+            # UNIQUE INDEX FAILS on a database that already holds two pending
+            # rows for one buyer_ref, and that failure must not starve anything
+            # after it. The rail stays correct without the index — the purchase
+            # service reconciles EVERY pending row, oldest first — it just stops
+            # being able to prevent the duplicate. The runbook has the census.
+            try:
+                await _ensure_index(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_reap_agentic_enrollments_one_pending "
+                    "ON reap_agentic_enrollments (buyer_ref) "
+                    "WHERE status = 'pending';"
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 225: the resolver's three hint columns.
             #
             # THIS DDL MUST BUILD THE SAME SCHEMA AS
@@ -3628,6 +3651,21 @@ async def ensure_required_schema_light() -> None:
                         "uq_reap_agentic_purchases_checkout "
                         "ON reap_agentic_purchases (reap_checkout_id) "
                         "WHERE reap_checkout_id IS NOT NULL;"
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 252: at most one PENDING enrollment per buyer, SQLite twin of
+            # the Postgres block above (same index, same reason, same own try:
+            # it fails on a database that already holds two pending rows for one
+            # buyer_ref, and must not starve what follows).
+            try:
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_enrollments_one_pending "
+                        "ON reap_agentic_enrollments (buyer_ref) "
+                        "WHERE status = 'pending';"
                     )
                 )
             except Exception:  # noqa: BLE001

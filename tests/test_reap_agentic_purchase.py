@@ -3293,10 +3293,33 @@ async def _enrollments(buyer_ref: str = "bref_alice"):
     ]
 
 
+def _reap_echoes_the_session():
+    """A `get_enrollment` that answers REQUIRES_ACTION with the SAME session it created — the
+    stored link and the stored expiry, read back from our row — the way Reap's GET echoes a
+    session that is still open (or has just died). Moving our row's clock (`_age_links`) moves
+    what this fake says, so a test ages ONE clock and not two."""
+
+    async def _read(**kwargs):
+        stored = await database.fetch_one(
+            "SELECT hosted_url, hosted_url_expires_at FROM reap_agentic_enrollments "
+            "WHERE reap_enrollment_id = :r",
+            {"r": kwargs["id"]},
+        )
+        action = None
+        if stored is not None and stored["hosted_url"]:
+            expires = ledger._decode_dt(stored["hosted_url_expires_at"])
+            action = {"type": "REDIRECT", "url": stored["hosted_url"]}
+            if expires is not None:
+                action["expiresAt"] = expires.isoformat().replace("+00:00", "Z")
+        return _ok({"id": kwargs["id"], "status": "REQUIRES_ACTION", "nextAction": action})
+
+    return _read
+
+
 async def _purchase_a_waiting_on_a_link(reap) -> tuple:
     """Step 1 and 2: A reaches needs_enrollment; Reap keeps saying REQUIRES_ACTION."""
     reap.create_enrollment = _ok(_enrollment_requires_action())
-    reap.get_enrollment = _ok(_enrollment_requires_action())
+    reap.get_enrollment = _reap_echoes_the_session()
     purchase_a = await _start()
     assert (await _step(purchase_a)).state == "needs_enrollment"
     ours = (await _get(purchase_a))["enrollment_id"]
@@ -3425,7 +3448,8 @@ async def test_a_dead_pending_enrollment_is_retired_and_a_new_attempt_minted(
     minted, and B is handed the NEW link — never the dead one."""
     _, old = await _purchase_a_waiting_on_a_link(reap)
     await _age_links(seconds_past)
-    reap.get_enrollment = _ok(dict(_enrollment_requires_action(), status=reap_says))
+    if reap_says != "REQUIRES_ACTION":
+        reap.get_enrollment = _ok(dict(_enrollment_requires_action(), status=reap_says, nextAction=None))
     new_reap_id = "22222222-2222-2222-2222-222222222222"
     new_link = "https://pay.prava.space/enroll/ses_NEW"
     reap.create_enrollment = _ok(_enrollment_requires_action(new_reap_id, new_link))
@@ -3490,9 +3514,26 @@ async def test_a_transport_failure_reading_the_pending_enrollment_releases(reap)
     assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
 
 
-async def test_a_partner_error_reading_the_pending_enrollment_fails_without_minting(reap):
-    """FAIL CLOSED: a row whose state we could not read is not minted around."""
+@pytest.mark.parametrize("status,code", [(500, "reap_status_500"), (404, "reap_status_404")])
+async def test_a_failed_read_inside_the_grace_releases_without_minting(reap, status, code):
+    """Review of #2483, P2-4. Inside the grace the row may yet settle: a failed read — any
+    status, even a 404 — RELEASES with backoff. Nothing is minted around it, nothing retired."""
     _, old = await _purchase_a_waiting_on_a_link(reap)
+    reap.get_enrollment = rc.ReapResponse(ok=False, status=status, error=code)
+    reap.calls.clear()
+    purchase_b = await _start()
+    result = await _step(purchase_b)
+    assert (result.outcome, result.state, result.last_error_code) == ("released", "resolving", code)
+    assert result.next_poll_in_seconds == 120, "the doubled backoff, not the plain interval"
+    assert reap.named("create_enrollment") == []
+    assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
+
+
+async def test_a_partner_error_past_the_grace_fails_without_minting(reap):
+    """FAIL CLOSED: past the grace, a failure that is NOT "no such enrollment" fails the
+    purchase by the partner's code; the row stays for an operator (runbook)."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(400)
     reap.get_enrollment = rc.ReapResponse(ok=False, status=500, error="reap_status_500")
     reap.calls.clear()
     purchase_b = await _start()
@@ -3500,6 +3541,35 @@ async def test_a_partner_error_reading_the_pending_enrollment_fails_without_mint
     assert (result.state, result.last_error_code) == ("failed", "reap_status_500")
     assert reap.named("create_enrollment") == []
     assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        rc.ReapResponse(ok=False, status=404, error="reap_status_404"),
+        rc.ReapResponse(ok=False, status=410, error="reap_status_410"),
+        rc.ReapResponse(ok=False, status=400, error="reap_status_400",
+                        error_code="AGENTIC_RESOURCE_NOT_FOUND"),
+    ],
+    ids=["404", "410", "not_found_code"],
+)
+async def test_no_such_enrollment_past_the_grace_retires_the_row_and_mints_fresh(reap, response):
+    """Review of #2483, P2-4. The sticky mode: a pending row Reap no longer knows used to fail
+    EVERY later purchase of the buyer. Past the grace it is retired with the partner's code and
+    a new attempt is minted."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(400)
+    reap.get_enrollment = response
+    reap.create_enrollment = _ok(
+        _enrollment_requires_action("99999999-9999-9999-9999-999999999999")
+    )
+    reap.calls.clear()
+    purchase_b = await _start()
+    assert (await _step(purchase_b)).state == "needs_enrollment"
+    retired = await ledger.get_enrollment_internal(old)
+    assert retired["status"] == "dead"
+    [created] = reap.named("create_enrollment")
+    assert created["attempt_id"] != old
 
 
 async def test_a_malformed_partner_id_on_the_pending_row_fails_without_a_read(reap):
@@ -3522,7 +3592,7 @@ async def test_the_reconcile_read_is_guarded_by_the_ownership_re_read(reap, monk
     await _purchase_a_waiting_on_a_link(reap)
     purchase_b = await _start()
     await _claim(purchase_b, "w1")
-    real = ledger.get_pending_enrollment
+    real = ledger.get_pending_enrollments
 
     async def _steal_then_read(buyer_ref):
         await database.execute(
@@ -3531,7 +3601,7 @@ async def test_the_reconcile_read_is_guarded_by_the_ownership_re_read(reap, monk
         )
         return await real(buyer_ref)
 
-    monkeypatch.setattr(ledger, "get_pending_enrollment", _steal_then_read)
+    monkeypatch.setattr(ledger, "get_pending_enrollments", _steal_then_read)
     reap.calls.clear()
     result = await svc.advance(purchase_b, "w1")
     assert result.outcome == "lost_claim"
@@ -3642,3 +3712,367 @@ async def test_the_grace_dial_moves_the_services_hold_window(reap, monkeypatch):
     purchase_b = await _start()
     assert (await _step(purchase_b)).state == "needs_enrollment"
     assert (await ledger.get_enrollment_internal(old))["status"] == "dead"
+
+
+# ── review of #2483 at 93f585c26: the five findings, through `advance` on the real ledger ────
+
+
+def _create_keyed_by_attempt():
+    """`create_enrollment` as Reap's idempotency makes it: ONE enrollment per attempt id, and the
+    same answer every time that attempt is replayed."""
+    import uuid as _uuid
+
+    def _create(**kwargs):
+        attempt = str(kwargs["attempt_id"])
+        enrollment = str(_uuid.uuid5(_uuid.NAMESPACE_OID, attempt))
+        return _ok(_enrollment_requires_action(
+            enrollment, url=f"https://pay.prava.space/enroll/{attempt}"
+        ))
+
+    return _create
+
+
+async def _set_created_at(enrollment_id: str, seconds_ago: int) -> None:
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET created_at = datetime('now', :shift) WHERE id = :i",
+        {"shift": f"-{int(seconds_ago)} seconds", "i": enrollment_id},
+    )
+
+
+async def _pending_count(buyer_ref: str = "bref_alice") -> int:
+    return int(await database.fetch_val(
+        "SELECT COUNT(*) FROM reap_agentic_enrollments WHERE buyer_ref = :b AND status = 'pending'",
+        {"b": buyer_ref},
+    ))
+
+
+async def _drop_one_pending_index() -> None:
+    """A database migration 252 has not reached (prod applies migrations by hand)."""
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
+
+
+# P1-1 — a create that answers with an enrollment id another row of ours already holds.
+
+
+async def test_r3_a_create_returning_an_id_we_hold_on_a_dead_row_fails_by_name(reap):
+    """THE REVIEWER'S REPRO. A is retired past the grace (it keeps its partner id); B mints N;
+    Reap answers N's create with A's enrollment. That used to be a raw IntegrityError out of
+    `advance` on every poll, for every later purchase. Now: N is retired, B fails
+    `enrollment_id_conflict`, A is not resurrected — and C, the next purchase, gets the same
+    named answer instead of an exception."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(400)
+    for _ in range(2):  # B, then C
+        reap.calls.clear()
+        purchase = await _start()
+        result = await _step(purchase)
+        assert (result.state, result.last_error_code) == ("failed", "enrollment_id_conflict")
+        [created] = reap.named("create_enrollment")
+        attempt = await ledger.get_enrollment_internal(created["attempt_id"])
+        assert attempt["status"] == "dead" and attempt["reap_enrollment_id"] is None
+        assert (await ledger.get_enrollment_internal(old))["status"] == "dead"
+        assert await _pending_count() == 0
+        assert await ledger.get_active_enrollment("bref_alice") is None
+
+
+async def test_a_create_returning_another_buyers_enrollment_fails_and_touches_nothing(reap):
+    """REFUSING EXAMPLE: the holder is ANOTHER buyer's row. Nothing of theirs is written."""
+    bob = await ledger.upsert_pending_enrollment(
+        buyer_ref="bref_bob", reap_enrollment_id=STAGING_ENROLLMENT,
+        hosted_url=STAGING_LINK,
+        hosted_url_expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+    reap.create_enrollment = _ok(_enrollment_requires_action())
+    purchase = await _start()
+    result = await _step(purchase)
+    assert (result.state, result.last_error_code) == ("failed", "enrollment_id_conflict")
+    after = await ledger.get_enrollment_internal(bob["id"])
+    assert (after["status"], after["hosted_url"]) == ("pending", STAGING_LINK)
+    assert await _pending_count() == 0
+
+
+async def test_a_create_returning_this_buyers_active_enrollment_quotes_on_it(reap):
+    """The holder became this buyer's ACTIVE card while we were creating (a concurrent step
+    activated it). The purchase quotes on that card; our attempt is retired."""
+    held = "66666666-6666-6666-6666-666666666666"
+
+    async def _create(**kwargs):
+        await database.execute(
+            "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id) "
+            "VALUES ('re_winner', 'bref_alice', 'active', :r)",
+            {"r": held},
+        )
+        return _ok(_enrollment_requires_action(held))
+
+    reap.create_enrollment = _create
+    purchase = await _start()
+    result = await _step(purchase)
+    assert result.state == "quoting"
+    assert (await _get(purchase))["enrollment_id"] == "re_winner"
+    [created] = reap.named("create_enrollment")
+    assert (await ledger.get_enrollment_internal(created["attempt_id"]))["status"] == "dead"
+
+
+async def test_a_create_returning_this_buyers_pending_enrollment_reuses_it(reap):
+    """The holder is this buyer's PENDING row (created concurrently; possible only without
+    migration 252's index). It is reconciled like any pending row — here its link is live, so
+    the purchase waits on IT and our attempt is retired."""
+    await _drop_one_pending_index()
+    holder_link = "https://pay.prava.space/enroll/HOLDER"
+    holder_id = "77777777-7777-7777-7777-777777777777"
+
+    async def _create(**kwargs):
+        # A concurrent mint's recorded answer, landing while our create is in flight.
+        await database.execute(
+            "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id, "
+            "hosted_url, hosted_url_expires_at) VALUES ('re_holder', 'bref_alice', 'pending', "
+            ":r, :u, datetime('now', '+600 seconds'))",
+            {"r": holder_id, "u": holder_link},
+        )
+        return _ok(_enrollment_requires_action(holder_id, url=holder_link))
+
+    reap.create_enrollment = _create
+    reap.get_enrollment = _reap_echoes_the_session()
+    purchase = await _start()
+    result = await _step(purchase)
+    assert result.state == "needs_enrollment"
+    row = await _get(purchase)
+    assert (row["enrollment_id"], row["hosted_url"]) == ("re_holder", holder_link)
+    [created] = reap.named("create_enrollment")
+    assert (await ledger.get_enrollment_internal(created["attempt_id"]))["status"] == "dead"
+
+
+# P2-1 — two purchases of one buyer in one tick.
+
+
+async def _race_two_purchases(reap, monkeypatch):
+    """Purchase 1 and purchase 2 of ONE buyer, stepped so that 2 runs its WHOLE step between
+    1's read of the buyer's pending rows (none) and 1's INSERT — the interleaving two workers
+    with two leases can produce in one poll tick."""
+    await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(400)                   # A's link is dead past the grace: both will retire it
+    reap.create_enrollment = _create_keyed_by_attempt()
+    reap.calls.clear()
+    first, second = await _start(), await _start()
+    real = ledger.get_pending_enrollments
+    calls = {"n": 0}
+
+    async def _interleaved(buyer_ref):
+        rows = await real(buyer_ref)
+        calls["n"] += 1
+        if calls["n"] == 2:                 # purchase 1, inside its mint, after A was retired
+            await _step(second, "w2")
+        return rows
+
+    monkeypatch.setattr(ledger, "get_pending_enrollments", _interleaved)
+    one = await _step(first, "w1")
+    monkeypatch.setattr(ledger, "get_pending_enrollments", real)
+    return first, second, one
+
+
+async def test_r1_two_purchases_of_one_buyer_share_one_attempt(reap, monkeypatch):
+    """THE REVIEWER'S REPRO, with migration 252's index: the second INSERT is refused, the
+    ledger hands back the winner, and both purchases wait on ONE row, ONE enrollment, ONE link."""
+    first, second, one = await _race_two_purchases(reap, monkeypatch)
+    assert one.state == "needs_enrollment"
+    assert (await _get(second))["state"] == "needs_enrollment"
+    assert await _pending_count() == 1
+    a, b = await _get(first), await _get(second)
+    assert a["enrollment_id"] == b["enrollment_id"]
+    assert a["hosted_url"] == b["hosted_url"]
+    attempts = {c["attempt_id"] for c in reap.named("create_enrollment")}
+    assert attempts == {a["enrollment_id"]}, "a replay of the winner's attempt, not a second one"
+
+
+async def test_without_the_index_the_race_mints_two_and_the_next_purchase_reconciles_both(
+    reap, monkeypatch
+):
+    """BEFORE MIGRATION 252 IS APPLIED the race still mints two pending rows (the index is the
+    only thing that can prevent it) — but nothing is stranded: the next purchase reconciles
+    EVERY pending row, and the one the buyer finished is activated."""
+    await _drop_one_pending_index()
+    first, second, _ = await _race_two_purchases(reap, monkeypatch)
+    assert await _pending_count() == 2
+    finished = (await _get(first))["enrollment_id"]
+    finished_row = await ledger.get_enrollment_internal(finished)
+
+    async def _reap_says(**kwargs):
+        if kwargs["id"] == finished_row["reap_enrollment_id"]:
+            return _ok(_enrollment_active(kwargs["id"]))
+        return await _reap_echoes_the_session()(**kwargs)
+
+    reap.get_enrollment = _reap_says
+    third = await _start()
+    assert (await _step(third)).state == "quoting"
+    assert (await _get(third))["enrollment_id"] == finished
+    assert (await ledger.get_active_enrollment("bref_alice"))["id"] == finished
+
+
+async def _two_pending_rows_without_the_index():
+    await _drop_one_pending_index()
+    rows = []
+    for n, (reap_id, age) in enumerate((
+        ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 120),
+        ("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 60),
+    )):
+        await database.execute(
+            "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id, "
+            "hosted_url, hosted_url_expires_at) VALUES (:i, 'bref_alice', 'pending', :r, :u, "
+            "datetime('now', '+600 seconds'))",
+            {"i": f"re_dup{n}", "r": reap_id, "u": f"https://pay.prava.space/enroll/dup{n}"},
+        )
+        await _set_created_at(f"re_dup{n}", age)
+        rows.append((f"re_dup{n}", reap_id))
+    return rows
+
+
+async def test_with_two_live_pending_rows_the_oldest_is_reused_deterministically(reap):
+    (older, _), (newer, _) = await _two_pending_rows_without_the_index()
+    reap.get_enrollment = _reap_echoes_the_session()
+    purchase = await _start()
+    assert (await _step(purchase)).state == "needs_enrollment"
+    assert (await _get(purchase))["enrollment_id"] == older
+    assert reap.named("create_enrollment") == []
+    assert [r["id"] for r in await ledger.get_pending_enrollments("bref_alice")] == [older, newer]
+
+
+async def test_an_active_newer_pending_row_wins_over_a_live_older_one(reap):
+    """ACTIVE anywhere wins: the buyer finished the NEWER link; reusing the older one would ask
+    for the card again and leave the finished one pending here, ACTIVE at Reap."""
+    (older, _), (newer, newer_reap) = await _two_pending_rows_without_the_index()
+
+    async def _reap_says(**kwargs):
+        if kwargs["id"] == newer_reap:
+            return _ok(_enrollment_active(newer_reap))
+        return await _reap_echoes_the_session()(**kwargs)
+
+    reap.get_enrollment = _reap_says
+    purchase = await _start()
+    assert (await _step(purchase)).state == "quoting"
+    assert (await _get(purchase))["enrollment_id"] == newer
+    assert (await ledger.get_active_enrollment("bref_alice"))["id"] == newer
+
+
+# P2-2 — a stored link with NO expiry.
+
+
+async def test_r2_a_pending_link_with_no_expiry_is_not_reused_for_ever(reap):
+    """THE REVIEWER'S REPRO. A link stored without an expiry, 7200 s old: dated from created_at
+    + Reap's 15-minute session, it is long dead — retired, and a NEW attempt is minted."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET hosted_url_expires_at = NULL WHERE id = :i",
+        {"i": old},
+    )
+    await _set_created_at(old, 7200)
+    reap.create_enrollment = _ok(
+        _enrollment_requires_action("12121212-1212-1212-1212-121212121212",
+                                    url="https://pay.prava.space/enroll/FRESH")
+    )
+    purchase = await _start()
+    assert (await _step(purchase)).state == "needs_enrollment"
+    assert (await _get(purchase))["hosted_url"] == "https://pay.prava.space/enroll/FRESH"
+    assert (await ledger.get_enrollment_internal(old))["status"] == "dead"
+
+
+async def test_a_young_pending_link_with_no_expiry_is_reused_with_an_estimated_expiry(reap):
+    """The control: 100 s old, no expiry → still live (created + 15 min). It is reused, and the
+    purchase carries the ESTIMATE so the sweep bounds it by the link's life."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET hosted_url_expires_at = NULL WHERE id = :i",
+        {"i": old},
+    )
+    await _set_created_at(old, 100)
+    reap.calls.clear()
+    purchase = await _start()
+    assert (await _step(purchase)).state == "needs_enrollment"
+    row = await _get(purchase)
+    assert row["enrollment_id"] == old and reap.named("create_enrollment") == []
+    created = (await ledger.get_pending_enrollments("bref_alice"))[0]["created_at"]
+    assert row["hosted_url_expires_at"] == created + timedelta(seconds=ledger.HOSTED_SESSION_SECONDS)
+
+
+# P2-3 — the hold re-check does not resolve again, and does not spend attempts.
+
+
+async def test_a_settling_re_check_does_not_re_run_the_resolve(reap):
+    await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(9)
+    purchase = await _start()
+    assert (await _step(purchase)).last_error_code == "enrollment_settling"
+    reap.calls.clear()
+    again = await _step(purchase)
+    assert again.last_error_code == "enrollment_settling"
+    assert reap.named("resolve_our_row") == [], "the hold re-check asks the enrollment question only"
+    assert len(reap.named("get_enrollment")) == 1
+    # And when the hold ends, the WHOLE step runs: resolve, then the decision, then quoting.
+    reap.get_enrollment = _ok(_enrollment_active())
+    reap.calls.clear()
+    assert (await _step(purchase)).state == "quoting"
+    assert reap.named("resolve_our_row"), "a hold that ends runs the resolve and its refusals"
+
+
+async def test_a_settling_hold_does_not_spend_the_attempt_ceiling(reap):
+    """Claims of a held row are EXEMPT from `attempts`; any other 'resolving' release counts."""
+    await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(9)
+    purchase = await _start()
+
+    async def _claim_for_real():
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET next_poll_at = datetime('now', '-1 seconds') "
+            "WHERE id = :i", {"i": purchase},
+        )
+        claimed = [r for r in await ledger.claim_due_purchases("w1") if r["id"] == purchase]
+        assert claimed, "the row must be claimable"
+        return claimed[0]["attempts"]
+
+    first = await _claim_for_real()                      # a fresh row: counts
+    assert (await svc.advance(purchase, "w1")).last_error_code == "enrollment_settling"
+    for _ in range(3):
+        assert await _claim_for_real() == first, "a settling claim is not an attempt"
+        assert (await svc.advance(purchase, "w1")).last_error_code == "enrollment_settling"
+    reap.get_enrollment = _transport()
+    await _claim_for_real()
+    assert (await svc.advance(purchase, "w1")).last_error_code == "transport_error:readtimeout"
+    assert await _claim_for_real() == first + 1, "any other release in 'resolving' still counts"
+
+
+# Nits.
+
+
+async def test_a_fresher_link_from_reaps_read_is_used_over_the_stored_one(reap):
+    """Reap's GET carries a `nextAction`: it is vetted by the allowlist and used — link and
+    expiry — instead of the stored one, which here has already died."""
+    await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(9)
+    fresh = "https://pay.prava.space/enroll/ses_REFRESHED"
+    reap.get_enrollment = _ok(_enrollment_requires_action(url=fresh, expires_in=600))
+    purchase = await _start()
+    assert (await _step(purchase)).state == "needs_enrollment"
+    row = await _get(purchase)
+    assert row["hosted_url"] == fresh
+    assert row["hosted_url_expires_at"] > datetime.now(timezone.utc) + timedelta(seconds=500)
+
+
+async def test_a_fresher_link_we_would_not_vouch_for_is_not_used(reap):
+    await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(9)
+    reap.get_enrollment = _ok(
+        _enrollment_requires_action(url="https://evilprava.space/enroll/x", expires_in=600)
+    )
+    purchase = await _start()
+    result = await _step(purchase)
+    assert result.last_error_code == "enrollment_settling", "stored link (dead, in grace) → hold"
+
+
+async def test_a_repeated_settling_hold_logs_warning_once_then_info(reap, caplog):
+    await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(9)
+    purchase = await _start()
+    caplog.set_level(logging.INFO, logger=svc.logger.name)
+    for _ in range(3):
+        await _step(purchase)
+    held = [r for r in caplog.records if "enrollment_settling" in r.getMessage()]
+    assert [r.levelno for r in held] == [logging.WARNING, logging.INFO, logging.INFO]

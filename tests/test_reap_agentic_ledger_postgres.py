@@ -80,6 +80,8 @@ _MIGRATIONS = (
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
     _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
+    # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
+    _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
 )
 _MIGRATION = _MIGRATIONS[0]
 
@@ -3751,3 +3753,97 @@ async def test_get_pending_enrollment_reads_only_pending_rows_on_postgres():
     dead = await _pending_with_link(buyer_ref="bref_bob", reap_id="11111111-1111-1111-1111-111111111111")
     await ledger.mark_enrollment_dead(dead["id"])
     assert await ledger.get_pending_enrollment("bref_bob") is None
+
+
+# ── review of #2483 at 93f585c26: the ledger halves, on Postgres ────────────────────────────
+#
+# What the engine decides here: asyncpg's unique-violation SHAPE (UniqueViolationError, 23505)
+# reaching `EnrollmentIdConflict` / the winner hand-back; migration 252's partial index as the
+# migration builds it; the NULL-expiry rule's `clock_timestamp()` arithmetic; and the claim's
+# settling exemption.
+
+
+async def _raw_pending_pg(id_: str, buyer_ref: str = "bref_alice", reap_id=None, hosted_url=None):
+    from db.database import database
+
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id, "
+        "hosted_url) VALUES (:i, :b, 'pending', :r, :u)",
+        {"i": id_, "b": buyer_ref, "r": reap_id, "u": hosted_url},
+    )
+
+
+async def test_migration_252_refuses_a_second_pending_row_on_postgres():
+    import asyncpg
+
+    await _raw_pending_pg("re_one")
+    with pytest.raises(asyncpg.exceptions.UniqueViolationError):
+        await _raw_pending_pg("re_two")
+    await _raw_pending_pg("re_bob", buyer_ref="bref_bob")
+
+
+async def test_a_concurrent_mint_hands_the_loser_the_winner_on_postgres(monkeypatch):
+    import db.reap_agentic_ledger as ledger
+
+    real = ledger.get_pending_enrollments
+    calls = {"n": 0}
+
+    async def _stale_then_real(buyer_ref):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await _raw_pending_pg("re_winner")
+            return []
+        return await real(buyer_ref)
+
+    monkeypatch.setattr(ledger, "get_pending_enrollments", _stale_then_real)
+    assert (await ledger.upsert_pending_enrollment(buyer_ref="bref_alice"))["id"] == "re_winner"
+
+
+async def test_a_held_partner_id_is_a_named_conflict_on_postgres():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    held = "9041ef1a-1377-45f6-b09a-95d5eb07f908"
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id) "
+        "VALUES ('re_old', 'bref_alice', 'dead', :r)", {"r": held},
+    )
+    ours = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    with pytest.raises(ledger.EnrollmentIdConflict) as caught:
+        await ledger.upsert_pending_enrollment(
+            buyer_ref="bref_alice", enrollment_id=ours["id"], reap_enrollment_id=held
+        )
+    assert caught.value.holder["id"] == "re_old"
+
+
+async def test_a_linked_pending_row_with_no_expiry_dies_with_reaps_session_on_postgres():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    await _raw_pending_pg("re_linked", hosted_url="https://pay.prava.space/enroll/x")
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET created_at = clock_timestamp() - INTERVAL '100 seconds'"
+    )
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is False
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET created_at = clock_timestamp() - INTERVAL '901 seconds'"
+    )
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is True
+    await database.execute("UPDATE reap_agentic_enrollments SET hosted_url = NULL")
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is False
+
+
+async def test_a_settling_claim_is_not_an_attempt_on_postgres():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    held = await _mk()
+    other = await _mk(buyer_ref="bref_other")
+    for row, code in ((held, "enrollment_settling"), (other, "transport_error:readtimeout")):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET last_error_code = :c, "
+            "next_poll_at = clock_timestamp() - INTERVAL '1 second' WHERE id = :i",
+            {"c": code, "i": row["id"]},
+        )
+    claimed = {r["id"]: r["attempts"] for r in await ledger.claim_due_purchases("w1")}
+    assert (claimed[held["id"]], claimed[other["id"]]) == (0, 1)
