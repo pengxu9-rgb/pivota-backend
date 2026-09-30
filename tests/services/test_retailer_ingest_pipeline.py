@@ -1153,7 +1153,9 @@ async def test_multi_brand_writes_each_vendors_canonical_spelling(env, monkeypat
     assert first["status"] == "apply_due", list(env.ledger.runs.values())[-1]
     out = await pipeline.run_stage({**job("apply_due", **opts), "brand": "store (2 brands)"}, db=env.db)
     assert out["status"] == "done", env.ledger.runs
-    assert sorted(p["brand"] for p in env.applied[-1]["pdps"]) == ["Dr.Jart+", "Skin1004"]
+    # "Dr. Jart+" is unlisted, so options.brands respells it. SKIN1004 is a listed spelling family (2026-09-30):
+    # the family writes its one spelling whatever options.brands says -- as a family already did for "Kose"/"KOSE".
+    assert sorted(p["brand"] for p in env.applied[-1]["pdps"]) == ["Dr.Jart+", "SKIN1004"]
 
 
 @pytest.mark.parametrize("options", [

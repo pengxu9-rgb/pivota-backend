@@ -46,6 +46,22 @@ def bounded(refresh: dict) -> dict:
 
 
 FAMILIES = {
+    # Measured in prod 2026-09-30 (read-only dry run of this plan): retailer rows off the canonical spelling.
+    # Case-only (no content_key moves; the spelling family is already live for these):
+    #   missha 413 (14 hosts), roundlab 31, bobbibrown 17, maybelline 12, makeupforever 4, byterry 4 -- 0 held.
+    # Identity-changing (the spelling family must wait for this relabel -- services/brand_relabel.py ORDER):
+    #   ohui 20 on smkoreabeauty.com (15 minted, 3 already grouped, 2 held would_split_its_product),
+    #   jungsaemmool 5 on smkoreabeauty.com (5 minted, 0 held).
+    # Each canonical is curated_brand_feed.RETAILER_BRAND_CANONICAL's for that family (pinned by a test).
+    "missha": ("Missha", ["MISSHA", "Missha"]),
+    "roundlab": ("Round Lab", ["ROUND LAB", "Round Lab"]),
+    "bobbibrown": ("Bobbi Brown", ["BOBBI BROWN", "Bobbi Brown"]),
+    "maybelline": ("Maybelline", ["MAYBELLINE", "Maybelline"]),
+    "makeupforever": ("MAKE UP FOR EVER", ["Make Up For Ever", "MAKE UP FOR EVER"]),
+    "byterry": ("BY TERRY", ["By Terry", "BY TERRY"]),
+    # smkoreabeauty.com writes the Hangul name after the brand; _brand_key and PG [:alnum:] both keep Hangul.
+    "ohui": ("O HUI", ["O HUI (오휘)", "O HUI"]),
+    "jungsaemmool": ("JUNGSAEMMOOL", ["Jung Saem Mool", "JUNGSAEMMOOL"]),
     "etude": ("ETUDE", ["ETUDE HOUSE", "Etude House", "ETUDE", "Etude", "ÉTUDE HOUSE", "Étude House", "ÉTUDE",
                         "Étude"]),
 }
