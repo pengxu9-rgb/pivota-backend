@@ -210,7 +210,7 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         brands = options.get("brands")
         if not options.get("multi_brand"):
             raise ValueError("options.brands is only meaningful with options.multi_brand")
-        from services.curated_brand_feed import _retailer_brand_family, _vendor_token as fold
+        from services.curated_brand_feed import RETAILER_BRAND_CANONICAL, _retailer_brand_family, _vendor_token as fold
         if not isinstance(brands, dict) or not all(isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
                                                    for k, v in brands.items()):
             raise ValueError("options.brands must map every vendor to its canonical brand spelling")
@@ -221,14 +221,26 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         if len({fold(k) for k in brands}) != len(brands):
             raise ValueError("options.brands has two keys for the same vendor")
         # Retailer mode applies an override only to the SAME brand spelt differently (equal letters and
-        # digits) or a measured family (RETAILER_BRAND_SPELLINGS). Anything else would be silently
-        # ignored at crawl time -- refuse it here instead of letting the operator think it applied.
+        # digits). A vendor in a measured family (RETAILER_BRAND_SPELLINGS) always writes the family's
+        # canonical spelling, as it has since #2302, so for those the value may only say "no respelling"
+        # (the vendor's own spelling, which operators use to list a store's vendors) or name the
+        # canonical itself. Anything else would be silently overridden or ignored at crawl time --
+        # refuse it here, every offender at once, instead of letting the operator think it applied.
         alnum = lambda v: "".join(c for c in str(v).casefold() if c.isalnum())
-        # A measured family writes ITS spelling whatever the value says, so a family vendor may only be
-        # respelt into that same family (review of #2302: {"Kose": "Shiseido"} passed, then wrote "Kosé").
+        ws = lambda v: " ".join(str(v).split())  # the collapse _crawl applies before use
+        overridden = []
+        for vendor, spelling in brands.items():
+            family = _retailer_brand_family(alnum(vendor))
+            if family is None:
+                continue
+            canonical = RETAILER_BRAND_CANONICAL[family]
+            if ws(spelling) not in (ws(vendor), canonical):
+                overridden.append(f"{vendor!r} -> {spelling!r} (family {family!r} always writes {canonical!r})")
+        if overridden:
+            raise ValueError("options.brands cannot respell a spelling-family vendor to a value other than the "
+                             "vendor's own spelling or the family's canonical spelling: " + "; ".join(overridden))
         ignored = sorted(k for k, v in brands.items()
-                         if alnum(k) != alnum(v) and (_retailer_brand_family(alnum(k)) is None
-                                                      or _retailer_brand_family(alnum(k)) != _retailer_brand_family(alnum(v))))
+                         if _retailer_brand_family(alnum(k)) is None and alnum(k) != alnum(v))
         if ignored:
             raise ValueError(f"options.brands can only respell a vendor (same letters and digits); "
                              f"these would be ignored: {ignored}")
