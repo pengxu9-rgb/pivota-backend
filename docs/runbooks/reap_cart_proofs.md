@@ -34,9 +34,13 @@ so its writes commit page by page), inside a wall-clock budget, and prints one r
   backfill's `--domain` filter matches them (case-sensitive; exact or a `.`-subdomain), so a seed
   whose `domain` column the backfill would never select does not move a store either.
 - **Both lanes: a store that blocked us is backed off.** When a store ends `aborted_on_block`, its
-  row gets `blocked_until` = now + 3 days: it is skipped (`backed_off`) until then, and walked LAST
-  on the first run after that. One store that always blocks us therefore costs one threshold's worth
-  of requests every few days and never the other stores' refresh.
+  row gets `blocked_until`: it is skipped (`backed_off`) until then, and walked LAST on the first run
+  after that. The back-off is shorter than the lane's proof life, so one block never guarantees a
+  lapse: **mirror 3 days** (proofs live 7 days), **enrichment 1 day** (proofs live 72 h). One store
+  that always blocks us costs one threshold's worth of requests per back-off and never the other
+  stores' refresh. **No store is backed off for an IP-level block**: when the pass stops (below),
+  every store aborted since the last clean answer is re-recorded without `blocked_until`
+  (`ip_block: true` in the report).
 - **A poison page does not pin the cursor.** A store that crashes at the SAME resume cursor on two
   runs in a row has that cursor reset to NULL (`crash_cursor_reset` in the report, a WARNING in the
   log), so the rows before it are walked again; read `error` to fix the page itself.
@@ -44,13 +48,18 @@ so its writes commit page by page), inside a wall-clock budget, and prints one r
 **Blocks.** Two streaks of consecutive block-shaped answers (429/403/5xx/transport errors; a clean
 answer resets both, a challenge page or an unsent request touches neither), at the writer's own
 threshold T (mirror 8, enrichment 5):
-- the STORE streak: at T that store is aborted (`aborted_on_block`, backed off) and **the pass moves
-  on** to the next store;
-- the RUN streak, carried across stores: at 2 x T (the next store also blocked from its first
-  request, with no clean answer in between) **the whole pass stops** -- that is what an IP-level
-  block looks like. Small stores that each stay under T still trip it.
+- the STORE streak, per store: a store is aborted (`aborted_on_block`, backed off) when its streak
+  reaches T, **or** when it is walked to its end with at least one block and **no clean answer at
+  all** (a small store we never actually read is not `done` and gets no `last_completed_at`). Then
+  **the pass moves on** to the next store;
+- the RUN streak, carried across stores: **the whole pass stops** only when the run streak is at
+  2 x T **and the current store has itself just been aborted** by one of the rules above. A healthy
+  store that inherits an earlier store's trailing blocks and sees a couple of transient 429s is NOT
+  enough; a store that is itself blocked right after another one is -- that is what an IP-level
+  block looks like. Small stores that each stay under T still trip it (each is aborted as "no clean
+  answer").
 Mirror: the client handed to the backfill classifies every answer with the backfill's own rules and,
-once a streak trips, answers 429 locally without sending. Enrichment: the writer's own `block_state`,
+once the store streak trips, answers 429 locally without sending. Enrichment: the writer's own `block_state`,
 one per store, observed into the run streak (it can overshoot by up to T - 1 requests).
 
 ## The egress rule (read this first)
@@ -155,8 +164,8 @@ Top level: `lane`, `mode` (`dry_run` / `apply`), `budget_s`, `elapsed_s`, `exit_
 | `status` | meaning |
 |---|---|
 | `done` | walked to its end |
-| `aborted_on_block` | this store answered T consecutive 429/403/5xx/transport errors; it is backed off 3 days and the pass moved on. With `pass_abort: true`, the run streak tripped too and **the whole pass stopped** (IP-level) |
-| `backed_off` | skipped: this store blocked us within the last 3 days (`backed_off` at the top level lists until when) |
+| `aborted_on_block` | this store answered T consecutive 429/403/5xx/transport errors, or never answered cleanly at all; it is backed off (mirror 3 days, enrichment 1 day) and the pass moved on. With `pass_abort: true`, the run streak tripped too and **the whole pass stopped** (IP-level); with `ip_block: true`, it was aborted inside that same block and is NOT backed off |
+| `backed_off` | skipped: this store blocked us within its lane's back-off (`backed_off` at the top level lists until when) |
 | `crashed` | the writer raised; `error` says what; the next domain still ran. `crash_cursor_reset: true`: the second crash in a row at this cursor, which was reset |
 | `cursor_stuck` | the writer returned the cursor it was given; the domain was stopped rather than looped |
 | `budget_stopped` | the budget ran out while walking this domain; `last_cursor` is where it stopped and where the next run resumes |
@@ -317,8 +326,8 @@ only not coincided with.
 
 - **The mirror writer does not consult robots.txt or honour `Retry-After`** (the enrichment writer
   does, through `services.crawl_politeness`). It paces itself (1 s global, 3 s per store); a store
-  is aborted after 8 consecutive block-shaped answers and backed off, and the pass after 16 across
-  stores. Making the backfill polite is
+  is aborted after 8 consecutive block-shaped answers (or no clean answer at all) and backed off;
+  the pass stops after 16 across stores when the current store is blocked too. Making the backfill polite is
   that script's change, not this job's.
 - **bluemercury may exceed `/products.json`'s 100-page cap** (see "Reading the report").
 - **The enrichment writer re-reads a store's listing for every 250-product page** in `auto` mode

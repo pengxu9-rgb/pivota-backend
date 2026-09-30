@@ -173,7 +173,7 @@ async def test_the_real_mirror_lane_checkpoints_and_the_next_run_resumes(pg):
 
     row = (await cursors.load(pg, "mirror", table_must_exist=True))["rcpr-a.com"]
     assert row.next_cursor == "epsv_020" and row.last_status == refresh.ABORTED and row.last_completed_at is None
-    assert row.blocked_until == NOW + refresh.BLOCK_BACKOFF, "the store that blocked us is backed off"
+    assert row.blocked_until == NOW + refresh.MIRROR_BLOCK_BACKOFF, "the store that blocked us is backed off"
 
     # Inside the back-off the store is not walked at all.
     idle = Writer([])
@@ -185,7 +185,7 @@ async def test_the_real_mirror_lane_checkpoints_and_the_next_run_resumes(pg):
 
     second = Writer([{"candidates": 3, "aborted_on_block": False, "next_cursor": "epsv_023"}])
     plan.writer = second
-    later = NOW + refresh.BLOCK_BACKOFF + timedelta(hours=1)
+    later = NOW + refresh.MIRROR_BLOCK_BACKOFF + timedelta(hours=1)
     await refresh.run_lane(plan, apply=True, budget_s=60, emit=lambda line: None, state=refresh.RunState(),
                            db=_KeepOpen(pg), now=lambda: later)
     assert second.calls == [("rcpr-a.com", "epsv_020")], "after the back-off it resumes from its cursor"
