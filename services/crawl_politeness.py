@@ -317,6 +317,22 @@ def _robots_delay_cap() -> float:
     return _f("CRAWL_MAX_ROBOTS_DELAY_SECONDS", _MAX_ROBOTS_DELAY_DEFAULT)
 
 
+async def _shopify_edge_slot(url: str, *, ceiling: Optional[float]) -> None:
+    """The SECOND gate: the aggregate budget every crawl process on the crawl egress IP shares for
+    Shopify-served hosts (services/shopify_edge_pacer.py). `await_slot` calls it AFTER the host's
+    own slot, so a request starts at whichever of the two is later; the host's interval is never
+    shortened by it.
+
+    `ceiling` is what is left of the caller's patience after the host slot (None = unbounded). A
+    shared slot further out raises `EdgePaced`, a `CrawlPaced`, which every caller already handles.
+    With `CRAWL_SHOPIFY_EDGE_PACER_ENABLED` off `acquire_for_url` returns before touching any
+    pacer state.
+    """
+    from services import shopify_edge_pacer  # noqa: PLC0415 - it imports this module
+
+    await shopify_edge_pacer.acquire_for_url(url, max_wait=ceiling)
+
+
 async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = None) -> None:
     """Sleep until this host may be hit again, then reserve the slot.
 
@@ -392,6 +408,7 @@ async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = N
     delay = start - now
     if delay > 0:
         await asyncio.sleep(delay)
+    await _shopify_edge_slot(url, ceiling=None if unbounded else max(0.0, ceiling - max(0.0, delay)))
 
 
 def note_response(url: str, status_code: int, *, retry_after: Optional[str] = None) -> None:

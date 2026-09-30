@@ -15,6 +15,7 @@ from sqlalchemy import and_, select, update
 from db.database import database
 from db.external_offers import external_offer_snapshots
 from services import crawl_politeness
+from services import shopify_edge_pacer
 from utils.availability_vocabulary import normalize_availability
 from utils.crawled_price import (
     agreed_hint,
@@ -1491,6 +1492,8 @@ async def _fetch_html(
             observed["status_code"] = resp.status_code
             observed["final_url"] = str(resp.url)
             observed["bot_challenged"] = bool(resp.headers.get("cf-mitigated"))
+        # Teaches the shared Shopify-edge budget which hosts it covers (a no-op with its flag off).
+        shopify_edge_pacer.learn_from_response(url, resp.headers)
         # WAS `resp.raise_for_status()`. Same control flow — every existing caller
         # catches `Exception` — but the status and the final URL now survive the throw,
         # which is what lets the refresh record "this product is gone" instead of

@@ -1269,7 +1269,9 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
             # PER-MERCHANT, PER-VANTAGE try/except. One store that hangs, 403s or returns
             # something nobody has classified must not end the batch behind it.
             try:
-                transport = PacedTransport(_inner_transport(via), pacer)
+                # The shared Shopify-edge budget models the CRAWL egress IP only: the direct
+                # vantage (via=None) leaves from it; the proxy vantage does not.
+                transport = PacedTransport(_inner_transport(via), pacer, shopify_edge=via is None)
                 async with httpx.AsyncClient(
                     headers=headers, timeout=REQUEST_TIMEOUT_S, transport=transport
                 ) as client:

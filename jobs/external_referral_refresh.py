@@ -39,6 +39,7 @@ from typing import Any, Dict, Optional
 
 from db.database import database
 from routes.employee_products import _refresh_external_seed_by_id
+from services import shopify_edge_pacer
 from services.external_referral_readiness import run_external_referral_refresh_batch
 
 
@@ -84,12 +85,17 @@ async def run_daily_external_referral_refresh(
     budget_seconds: Optional[float] = None,
     host_concurrency: Optional[int] = None,
 ) -> Dict[str, Any]:
-    return await run_external_referral_refresh_batch(
+    summary = await run_external_referral_refresh_batch(
         refresh_seed_by_id=_refresh_unbounded,
         limit=limit,
         budget_seconds=budget_seconds,
         host_concurrency=host_concurrency,
     )
+    if shopify_edge_pacer.enabled():
+        # Only with the flag on, so the summary is unchanged while the pacer is dark. Every fetch
+        # of this job reaches the shared budget through `crawl_politeness.await_slot`.
+        summary["shopify_edge_pacer"] = shopify_edge_pacer.stats()
+    return summary
 
 
 PRICE_REFRESH_KEYS = (
