@@ -28,19 +28,38 @@ SCHEDULER_SCRIPT = REPO / "infra" / "gcp" / "setup_scheduler.sh"
 TAG = "b" * 40
 JOBS = ("reap-cart-proof-enrichment", "reap-cart-proof-mirror")
 
+# Fields separated by \x1f, one invocation per line. Reads are answered from env:
+#   JOB_EXISTS / TRIGGER_EXISTS          create vs update, and whether describe answers at all
+#   ENRICHMENT_GATE / MIRROR_GATE        the job's REAP_CART_PROOF_APPLY as `describe --format=json` shows it
+#   ENRICHMENT_TRIGGER / MIRROR_TRIGGER  the trigger's `state`
+#   SUBNET_EXISTS=0                      the crawl-subnet preflight fails
+#   RESUME_FAILS=1                       every `scheduler jobs resume` fails
+#   FAIL_UPDATE_JOB=<name>               `run jobs create|update <name>` fails
 FAKE_GCLOUD = textwrap.dedent(
     """\
     #!/usr/bin/env bash
     printf '%s\\x1f' "$@" >> "$GCLOUD_LOG"; printf '\\n' >> "$GCLOUD_LOG"
     case "$1 $2 $3" in
-      "run jobs describe") [ "${JOB_EXISTS:-0}" = 1 ] && exit 0 || exit 1 ;;
-      "scheduler jobs describe") [ "${TRIGGER_EXISTS:-0}" = 1 ] && exit 0 || exit 1 ;;
+      "run jobs describe")
+        [ "${JOB_EXISTS:-0}" = 1 ] || exit 1
+        case "$4" in reap-cart-proof-mirror) g="${MIRROR_GATE:-false}" ;; *) g="${ENRICHMENT_GATE:-false}" ;; esac
+        printf '{"spec":{"template":{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"PIVOTA_ENV","value":"production"},{"name":"REAP_CART_PROOF_APPLY","value":"%s"}]}]}}}}}}' "$g"
+        exit 0 ;;
+      "scheduler jobs describe")
+        [ "${TRIGGER_EXISTS:-0}" = 1 ] || exit 1
+        case "$4" in reap-cart-proof-mirror-cron) t="${MIRROR_TRIGGER:-PAUSED}" ;; *) t="${ENRICHMENT_TRIGGER:-PAUSED}" ;; esac
+        echo "$t"; exit 0 ;;
       "compute networks subnets") [ "${SUBNET_EXISTS:-1}" = 1 ] && exit 0 || exit 1 ;;
       "scheduler jobs resume") [ "${RESUME_FAILS:-0}" = 1 ] && exit 1 || exit 0 ;;
+      "run jobs create"|"run jobs update") [ "$4" = "${FAIL_UPDATE_JOB:-}" ] && exit 1 || exit 0 ;;
     esac
     exit 0
     """
 )
+
+ARMED = {"JOB_EXISTS": "1", "TRIGGER_EXISTS": "1", "ENRICHMENT_GATE": "true", "MIRROR_GATE": "true",
+         "ENRICHMENT_TRIGGER": "ENABLED", "MIRROR_TRIGGER": "ENABLED"}
+DARK = {"JOB_EXISTS": "1", "TRIGGER_EXISTS": "1"}
 
 
 def _run(tmp_path: Path, *args: str, env: Optional[Dict[str, str]] = None
@@ -126,14 +145,73 @@ def test_enable_arms_all_four_switches_together(tmp_path):
     assert "ARMED" in proc.stdout
 
 
-def test_a_rerun_without_enable_updates_in_place_and_disarms(tmp_path):
-    proc, calls = _run(tmp_path, "prod", TAG, env={"JOB_EXISTS": "1", "TRIGGER_EXISTS": "1"})
+def _writes(calls: List[List[str]]) -> List[List[str]]:
+    return [c for c in calls if not (c[1:3] == ["jobs", "describe"] or c[:2] in (["iam", "service-accounts"],
+                                                                                ["artifacts", "docker"],
+                                                                                ["compute", "networks"]))]
+
+
+def test_a_plain_rerun_of_armed_jobs_keeps_them_armed(tmp_path):
+    """F5: re-imaging onto a newer tag must not silently disarm."""
+    proc, calls = _run(tmp_path, "prod", TAG, env=ARMED)
+    assert proc.returncode == 0, proc.stderr
+    for name in JOBS:
+        assert _env_vars(_one(calls, "run", "jobs", "update", name))["REAP_CART_PROOF_APPLY"] == "true"
+        _one(calls, "scheduler", "jobs", "update", "http", f"{name}-cron")
+    assert {state for state, _ in _pause_resume(calls)} == {"resume"}
+    assert "KEEPING" in proc.stdout and "DISARMING" not in proc.stdout
+
+
+def test_a_plain_rerun_of_dark_jobs_keeps_them_dark(tmp_path):
+    proc, calls = _run(tmp_path, "prod", TAG, env=DARK)
     assert proc.returncode == 0, proc.stderr
     for name in JOBS:
         assert _env_vars(_one(calls, "run", "jobs", "update", name))["REAP_CART_PROOF_APPLY"] == "false"
-        _one(calls, "scheduler", "jobs", "update", "http", f"{name}-cron")
     assert not [c for c in calls if c[2:3] == ["create"]]
     assert {state for state, _ in _pause_resume(calls)} == {"pause"}
+    assert "KEEPING" in proc.stdout
+
+
+def test_disable_disarms_loudly_and_pauses_the_triggers_before_touching_a_job(tmp_path):
+    proc, calls = _run(tmp_path, "prod", TAG, "--disable", env=ARMED)
+    assert proc.returncode == 0, proc.stderr
+    assert "DISARMING" in proc.stdout
+    for name in JOBS:
+        assert _env_vars(_one(calls, "run", "jobs", "update", name))["REAP_CART_PROOF_APPLY"] == "false"
+    writes = _writes(calls)
+    first_job_write = next(i for i, c in enumerate(writes) if c[:3] == ["run", "jobs", "update"])
+    paused_first = [c[3] for c in writes[:first_job_write] if c[:3] == ["scheduler", "jobs", "pause"]]
+    assert sorted(paused_first) == sorted(f"{n}-cron" for n in JOBS), writes
+    assert not [c for c in calls if c[:3] == ["scheduler", "jobs", "resume"]]
+
+
+@pytest.mark.parametrize("env, why", [
+    ({**DARK, "MIRROR_GATE": "true", "MIRROR_TRIGGER": "ENABLED"}, "SPLIT"),
+    ({**DARK, "ENRICHMENT_GATE": "true"}, "disagree"),
+    ({**DARK, "MIRROR_TRIGGER": "ENABLED"}, "disagree"),
+])
+def test_a_plain_rerun_refuses_a_split_or_inconsistent_state_before_writing(tmp_path, env, why):
+    proc, calls = _run(tmp_path, "prod", TAG, env=env)
+    assert proc.returncode == 1 and why in proc.stderr and "Nothing was changed" in proc.stderr
+    assert _writes(calls) == [], "refused after reading, before any write"
+
+
+@pytest.mark.parametrize("flag, gate, verb", [("--enable", "true", "resume"), ("--disable", "false", "pause")])
+def test_an_explicit_flag_settles_a_split_state(tmp_path, flag, gate, verb):
+    env = {**DARK, "MIRROR_GATE": "true", "MIRROR_TRIGGER": "ENABLED"}
+    proc, calls = _run(tmp_path, "prod", TAG, flag, env=env)
+    assert proc.returncode == 0, proc.stderr
+    for name in JOBS:
+        assert _env_vars(_one(calls, "run", "jobs", "update", name))["REAP_CART_PROOF_APPLY"] == gate
+    assert {state for state, _ in _pause_resume(calls)} == {verb}
+
+
+def test_an_arm_that_fails_on_the_second_job_resumes_no_trigger(tmp_path):
+    """The triggers are resumed LAST, so a failure part-way through an arm leaves nothing firing."""
+    proc, calls = _run(tmp_path, "prod", TAG, "--enable", env={"FAIL_UPDATE_JOB": "reap-cart-proof-mirror"})
+    assert proc.returncode != 0
+    assert not [c for c in calls if c[:3] == ["scheduler", "jobs", "resume"]]
+    assert not [c for c in calls if c[:3] == ["scheduler", "jobs", "create"]]
 
 
 def test_a_failed_resume_fails_the_script(tmp_path):
@@ -323,6 +401,7 @@ def test_the_schedules_never_overlap_the_daily_crawls_or_each_other(tmp_path):
     (("prod",), "backend-tag is required"),
     (("prod", TAG, "--enabled"), "unknown argument"),
     (("prod", TAG, "--enable", "extra"), "too many arguments"),
+    (("prod", TAG, "--enable", "--disable"), "too many arguments"),
 ])
 def test_bad_arguments_exit_2_before_touching_anything(tmp_path, args, message):
     proc, calls = _run(tmp_path, *args)

@@ -154,9 +154,11 @@ services.tierb_cart_link_merchants), which also gives each domain its market. Pa
 
 SCHEDULED ONLY THROUGH ONE DARK-BY-DEFAULT WRAPPER. Nothing here is registered with
 services/audit_scheduler, and this module has no default domain list. Its one scheduled caller is
-jobs/reap_cart_proof_refresh.py (`enrichment` lane: a pinned list of five stores, one `run()` per
-domain, a budget), provisioned by the operator-run infra/gcp/setup_reap_cart_proof_jobs.sh as the
-Cloud Run Job `reap-cart-proof-enrichment`, dry-run and paused unless --enable. A test pins that no
+jobs/reap_cart_proof_refresh.py (`enrichment` lane: a pinned list of five stores, `run_domain` 250
+products at a time with one shared pacer and block streak, a budget, a stored cursor per store; it
+calls this module's `ensure_table` itself on apply, as `run()` does), provisioned by the operator-run
+infra/gcp/setup_reap_cart_proof_jobs.sh as the Cloud Run Job `reap-cart-proof-enrichment`, dry-run
+and paused unless --enable. A test pins that no
 other infra file, workflow or scheduler names this module or that wrapper.
 
 EXIT CODES: 0 done; 1 aborted on a block; 2 bad arguments, a domain not on the Tier B list, or

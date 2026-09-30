@@ -40,7 +40,8 @@ script's four historical P0s were SQL semantics no Python-level test could see.
 THE UNSCOPED SWEEP IS A ONE-SHOT OPS RUN, NOT A SCHEDULED JOB, DELIBERATELY. Do not add it to
 infra/gcp/setup_scheduler.sh. The one scheduled caller is DOMAIN-SCOPED: jobs/reap_cart_proof_refresh.py
 (`mirror` lane) calls `run()` one `--domain` at a time over the Tier B cart-link list, paging on
-`next_cursor`, to keep the 7-day cart proofs fresh. It is provisioned by the operator-run
+`next_cursor` (stored between runs), to keep the 7-day cart proofs fresh. It hands `run()` a client
+that carries the consecutive-block streak across calls; nothing in this file changes for it. It is provisioned by the operator-run
 infra/gcp/setup_reap_cart_proof_jobs.sh (Cloud Run Job `reap-cart-proof-mirror`), dry-run and paused
 unless --enable.
 

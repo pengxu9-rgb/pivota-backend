@@ -12,13 +12,30 @@ schedule:
 | Piece | Where |
 |---|---|
 | Entry point (both jobs) | `python -m jobs.reap_cart_proof_refresh mirror\|enrichment --on-crawl-egress --budget-seconds N` |
-| Provisioning | `infra/gcp/setup_reap_cart_proof_jobs.sh staging\|prod <backend-tag> [--enable]` |
-| Domains, mirror | every domain on `config/tierb_cart_link_merchants.json` (42), order rotated by UTC day |
+| Provisioning | `infra/gcp/setup_reap_cart_proof_jobs.sh staging\|prod <backend-tag> [--enable\|--disable]` |
+| Domains, mirror | every domain on `config/tierb_cart_link_merchants.json` (42), **stalest first** (below) |
 | Domains, enrichment | `ENRICHMENT_DOMAINS` in the entry point: stila, jsmbeauty.sg, bluemercury, tarte, MAC (last) |
+| Where each store got to | `reap_cart_proof_refresh_cursors` (migration 250, `db/reap_cart_proof_refresh_cursors.py`) |
 | Readers | mirror: `services.shopify_variant_identity.verified_cart_variant_id`; enrichment: `services.reap_enrichment_cart_proof.verify_enrichment_cart_proof`, behind `REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED` |
 
 The entry point owns no proof logic. It walks each domain page by page by calling the writer's
-own `run()` on the writer's own cursor, inside a wall-clock budget, and prints one report line.
+own entry point on the writer's own cursor (mirror: `run(limit=50)`; enrichment: `run_domain(limit=250)`,
+so its writes commit page by page), inside a wall-clock budget, and prints one report line.
+
+**Order and resume.**
+- Every APPLY run stores, per (lane, store), the cursor to resume from, after every page and when
+  the store ends. A store the budget (or a block, or a crash) cut is resumed from there next run;
+  a store walked to its end starts from its first page next run. A dry run reads the cursors (it
+  walks what the next apply would) and writes nothing.
+- Mirror order: stores no run has walked to the end go first; then by the earlier of the oldest
+  **still-valid** proof among the store's active seeds (one SQL read; lapsed proofs are ignored) and
+  the store's last completed walk; then by name. A completed walk moves a store to the back, so no
+  store starves while the budget covers a day's work.
+
+**Blocks.** The consecutive-block streak is carried across pages and stores (a writer's own counter
+restarts at every call). Mirror: the client handed to the backfill classifies every answer with the
+backfill's own rules and, at the backfill's threshold (8), answers every further request 429
+locally, without sending it, and the pass stops. Enrichment: one shared `block_state` (threshold 5).
 
 ## The egress rule (read this first)
 
@@ -37,16 +54,21 @@ together:
 
 | | `REAP_CART_PROOF_APPLY` | triggers | a scheduled run | a hand `gcloud run jobs execute` |
 |---|---|---|---|---|
-| dark (default) | `false` | paused | none | **a dry run**: fetches every store, writes nothing |
-| `--enable` | `true` | resumed | writes | writes |
+| dark (new jobs, or `--disable`) | `false` | paused | none | **a dry run**: fetches every store, writes nothing |
+| armed (`--enable`) | `true` | resumed | writes | writes |
+
+**A plain re-run (no flag) keeps the current state**: the script reads both jobs' gate and trigger
+with `describe` before touching either, and re-images them (a newer `<backend-tag>`) without arming
+or disarming. It refuses, writing nothing, when the two jobs are split (one armed, one dark) or a
+job's gate and trigger disagree (a failed earlier run): pass `--enable` or `--disable` then.
+`--disable` prints a loud `DISARMING` line and pauses both triggers before it touches either job;
+`--enable` resumes the triggers last, so a failure part-way leaves nothing firing.
 
 **A dark job is not inert when executed by hand.** Unlike the Tier B job (dark = contacts nobody),
 a hand execution of a dark cart-proof job crawls, exactly as hard as a real run (both writers gate
 the write, not the crawl). That is deliberate: it is the dry run on the real job definition. Do not
 start one by hand inside another crawl's window (02:20–04:20, 05:15–06:15 UTC) or while a
 scheduled run of the other cart-proof job is in flight: they share stores.
-
-Re-running the setup script **without** `--enable` disarms both jobs.
 
 ## Procedure, per environment
 
@@ -75,6 +97,9 @@ gcloud run jobs execute reap-cart-proof-mirror --project $PROJECT --region us-we
 infra/gcp/setup_reap_cart_proof_jobs.sh $ENV $TAG --enable
 ```
 
+Step 3's one-off apply writes cursors too (it is an apply), so step 4's first scheduled run resumes
+wherever step 3 stopped.
+
 Then prod with `ENV=prod PROJECT=pivota-prod`. **Steps 3 and 4 write to production: Peng's go
 first.** Announce each prod apply to the owner of the lane it writes (the Reap rail).
 
@@ -82,7 +107,7 @@ first.** Announce each prod apply to the owner of the lane it writes (the Reap r
 reports every failure as 1). Read the report line for the job's own code.
 
 A backend deploy **never re-images these jobs**: they run `<backend-tag>` until the setup script is
-re-run with a newer one, and re-running it without `--enable` disarms, so re-arm deliberately.
+re-run with a newer one (no flag: the current armed/dark state is kept).
 
 ## Reading the report
 
@@ -96,8 +121,10 @@ gcloud logging read \
   --project pivota-prod --limit 1 --freshness 2d --format 'value(textPayload)'
 ```
 
-If the run was killed by its task timeout there is no REPORT line; the PROGRESS lines say which
-domains finished (their writes are committed).
+If the task timeout's SIGTERM arrives, the job prints the REPORT line with what it has
+(`"terminated": "SIGTERM"`, the store in flight `terminated`, exit 4) before it exits; every page
+already checkpointed stays checkpointed, and the in-flight page (at most 50 seeds / 250 products) is
+redone next run.
 
 Top level: `lane`, `mode` (`dry_run` / `apply`), `budget_s`, `elapsed_s`, `exit_code`,
 `status_counts`, `domains_order`, and `domains.<domain>` = `{status, pages, elapsed_s, writer, …}`.
@@ -108,16 +135,22 @@ Top level: `lane`, `mode` (`dry_run` / `apply`), `budget_s`, `elapsed_s`, `exit_
 | `aborted_on_block` | the writer hit consecutive 429/403/5xx/transport errors; **the whole pass stopped** (the block is IP-level) |
 | `crashed` | the writer raised; `error` says what; the next domain still ran |
 | `cursor_stuck` | the writer returned the cursor it was given; the domain was stopped rather than looped |
-| `budget_stopped` | the budget ran out while walking this domain; `last_cursor` is where it stopped |
+| `budget_stopped` | the budget ran out while walking this domain; `last_cursor` is where it stopped and where the next run resumes |
 | `not_reached` | the budget (or an abort) ended the pass before this domain |
+| `terminated` | the SIGTERM arrived while this domain was in flight |
+
+Per domain, `start_cursor` is where this run resumed it (absent = its first page) and
+`checkpoint_error` says a cursor could not be stored (the proofs were still written; the next run
+re-walks from the older cursor). Top level, `resumed` lists the stores resumed mid-walk, and
+`block_streak_short_circuited` (mirror) counts requests answered locally after the streak tripped.
 
 | exit | meaning | do |
 |---|---|---|
 | 0 | every domain walked to its end | nothing |
 | 1 | aborted on a block | suspect the crawl address; check `most_blocked_domains` / `fetches`; do not re-run straight away |
-| 2 | bad arguments, no `--on-crawl-egress`, or the writer refused the domain list; nothing attempted | fix the job args or `config/tierb_cart_link_merchants.json` |
-| 3 | a writer crashed (or `cursor_stuck`), or the pass itself could not start (`REAP_CART_PROOF_CRASH` on stderr, no report) | read the job log |
-| 4 | the budget ran out before every domain was walked | the next day starts elsewhere (mirror rotates); if it repeats, raise the budget AND the task timeout together in the setup script |
+| 2 | bad arguments, no `--on-crawl-egress`, a missing merchant list, or the writer refused the domain list; nothing attempted | fix the job args or `config/tierb_cart_link_merchants.json` |
+| 3 | a writer crashed (or `cursor_stuck`), or the pass itself could not plan or start (`REAP_CART_PROOF_CRASH` on stderr, no report) | read the job log |
+| 4 | the budget, or the task timeout's SIGTERM, ended the pass before every domain was walked | the cut store resumes from its cursor and the stalest stores go first next run. **This is not self-healing on its own**: it only catches up if one day's budget covers one day's work. Exit 4 on consecutive days means the budget is too small: raise the budget AND the task timeout together in the setup script, and read `reap_cart_proof_refresh_cursors` (below) to see which stores are behind |
 
 A non-zero exit fails the execution. `--max-retries 0`: nothing re-runs automatically.
 
@@ -153,6 +186,15 @@ SELECT domain,
        min(seed_data->'snapshot'->'shopify_cart_proof'->>'checked_at') AS oldest
   FROM external_product_seeds WHERE status = 'active' GROUP BY 1 HAVING count(*) FILTER
        (WHERE seed_data->'snapshot' ? 'shopify_cart_proof') > 0 ORDER BY 1;
+```
+
+```sql
+-- where each store got to, and when it was last walked to its end
+SELECT lane, domain, next_cursor, last_status, last_completed_at, updated_at
+  FROM reap_cart_proof_refresh_cursors ORDER BY lane, last_completed_at NULLS FIRST, domain;
+
+-- forget a store's cursor (it restarts at its first page next run); only with the triggers paused
+DELETE FROM reap_cart_proof_refresh_cursors WHERE lane = 'mirror' AND domain = '<domain>';
 ```
 
 Prod Postgres is private: run SQL through `scripts/ops/run_oneoff_job.sh -c "<program>"` (a
@@ -206,8 +248,9 @@ Add `--apply` to write. Do not run either inside the scheduled window of the mat
 ## Disarm
 
 ```sh
-# both jobs dark again (gate false, triggers paused):
-infra/gcp/setup_reap_cart_proof_jobs.sh prod <backend-tag>
+# both jobs dark again (triggers paused first, then gate false); prints a loud DISARMING line.
+# A re-run WITHOUT --disable keeps an armed job armed.
+infra/gcp/setup_reap_cart_proof_jobs.sh prod <backend-tag> --disable
 
 # fastest, without the script (the job's env still says apply until the script is re-run):
 gcloud scheduler jobs pause reap-cart-proof-enrichment-cron --location us-west1 --project pivota-prod
@@ -238,8 +281,19 @@ only not coincided with.
   (5,610 s), 8,496 s in all. MAC is last so it can never starve the other four.
 - **mirror**, 10:13, budget 10,800 s, task timeout 12,600 s (the budget plus one 50-seed page).
   At 3 s per seed that is ~3,600 seeds a day. **Not measured**: the first dry run's
-  `writer.candidates` per domain is the measurement; if the pass is cut (exit 4), raise both
-  numbers in the setup script.
+  `writer.candidates` per domain is the measurement; if the pass is cut (exit 4) on consecutive
+  days, raise both numbers in the setup script.
+
+## Known limits
+
+- **The mirror writer does not consult robots.txt or honour `Retry-After`** (the enrichment writer
+  does, through `services.crawl_politeness`). It paces itself (1 s global, 3 s per store) and aborts
+  on 8 consecutive block-shaped answers, now carried across stores. Making the backfill polite is
+  that script's change, not this job's.
+- **bluemercury may exceed `/products.json`'s 100-page cap** (see "Reading the report").
+- **The enrichment writer re-reads a store's listing for every 250-product page** in `auto` mode
+  (MAC and tarte are two pages each): a few extra listing requests, in exchange for page-by-page
+  commits and a budget that can stop inside a store.
 
 `tests/test_setup_reap_cart_proof_jobs.py` re-derives the neighbour windows from their scripts (and
 pins the two live-only ones) and fails if a schedule or timeout moves into one.
