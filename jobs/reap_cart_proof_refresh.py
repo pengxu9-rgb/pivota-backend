@@ -484,7 +484,8 @@ async def drive(domains: Sequence[str], run_page: PageFn, merge: MergeFn, *, bud
 
 def exit_code(results: Mapping[str, DomainResult], *, terminated: bool = False) -> int:
     statuses = {r.status for r in results.values()}
-    if any(r.pass_abort for r in results.values()) or IP_THROTTLED in statuses:
+    # Every `ip_throttled` store carries pass_abort: the breaker stopped the pass there.
+    if any(r.pass_abort for r in results.values()):
         return EXIT_ABORTED_ON_BLOCK
     if statuses & {CRASHED, CURSOR_STUCK}:
         return EXIT_CRASHED

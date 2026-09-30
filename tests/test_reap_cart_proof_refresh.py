@@ -1772,3 +1772,27 @@ def test_the_lane_breaker_is_calibrated_for_one_store_at_a_time():
     per_store = backfill.CONSECUTIVE_BLOCK_ABORT * backfill.PER_DOMAIN_MIN_GAP_S
     assert refresh.LANE_IP_TRIP_WINDOW_S >= 2 * refresh.LANE_IP_TRIP_HOSTS * per_store
     assert refresh.LANE_IP_TRIP_WINDOW_S >= 600
+
+
+def test_after_a_trip_no_later_store_is_asked_even_if_the_page_that_tripped_it_crashed():
+    """The breaker trips inside a.com's page and the page then crashes: the page never reports
+    `abort_pass`, so only the run's stop signal keeps b.com from being asked at all."""
+    from services import crawl_ip_throttle
+
+    class Writer(FakeEnrichmentWriter):
+        async def run_domain(self, db, client, plan, **kwargs):
+            self.calls.append((db, client, plan, kwargs))
+            if plan == "PLAN-A":
+                for host in ("x.com", "y.com", "z.com"):
+                    crawl_ip_throttle.observe_response(host, 429, {})
+                raise RuntimeError("the page broke after the trip")
+            return {"exhausted": True, "next_cursor": None, "aborted_on_block": False}
+
+    writer = Writer()
+    plan = refresh.LanePlan(lane="enrichment", domains=["a.com", "b.com"], writer=writer, gap_s=0.0,
+                            plans={"a.com": "PLAN-A", "b.com": "PLAN-B"})
+    state = _run_real_lane(plan, apply=False, db=StubDb())
+    assert [c[2] for c in writer.calls] == ["PLAN-A"]
+    assert state.results["a.com"].status == CRASHED
+    assert state.results["b.com"].status == refresh.IP_THROTTLED and state.results["b.com"].pass_abort
+    assert state.info["ip_throttle"]["ip_throttled"] is True
