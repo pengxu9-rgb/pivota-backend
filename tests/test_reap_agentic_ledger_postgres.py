@@ -3738,3 +3738,16 @@ async def test_a_transition_into_quoting_clears_the_hosted_link_on_postgres():
         hosted_url="https://pay.prava.space/checkout/x",
     )
     assert moved["hosted_url"] == "https://pay.prava.space/checkout/x"
+
+
+async def test_get_pending_enrollment_reads_only_pending_rows_on_postgres():
+    """An ACTIVE or DEAD row is never 'the pending row', whatever its timestamps say."""
+    import db.reap_agentic_ledger as ledger
+
+    pending = await _pending_with_link()
+    assert (await ledger.get_pending_enrollment("bref_alice"))["id"] == pending["id"]
+    await ledger.mark_enrollment_active(pending["id"])
+    assert await ledger.get_pending_enrollment("bref_alice") is None
+    dead = await _pending_with_link(buyer_ref="bref_bob", reap_id="11111111-1111-1111-1111-111111111111")
+    await ledger.mark_enrollment_dead(dead["id"])
+    assert await ledger.get_pending_enrollment("bref_bob") is None
