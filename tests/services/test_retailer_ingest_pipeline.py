@@ -1539,15 +1539,33 @@ async def test_the_run_records_how_many_retired_legacy_owners_it_admitted(env, m
                                                 "retired_owner_count": 2}
 
 
-@pytest.mark.parametrize("vendor,override", [("SKIN1004", "Skin1004"), ("MISSHA", "MISSHA")])
-def test_family_override_must_equal_its_canonical_spelling(vendor, override):
-    with pytest.raises(ValueError, match="family.*canonical spelling"):
+# A third spelling: neither the vendor's own nor the family's canonical. The crawl would write the
+# canonical anyway, so accepting it would let the operator think "Skin1004" applied.
+@pytest.mark.parametrize("vendor,override", [("SKIN1004", "Skin1004"), ("Etude House", "ETUDE HOUSE"),
+                                             ("Lancome", "LANCOME")])
+def test_a_family_vendor_cannot_be_respelt_to_a_third_spelling(vendor, override):
+    with pytest.raises(ValueError, match="third spelling.*family .* always writes"):
         pipeline.validate_options({"vendors": [vendor], "multi_brand": True, "brands": {vendor: override}})
 
 
-@pytest.mark.parametrize("vendor,canonical", [("SKIN1004", "SKIN1004"), ("MISSHA", "Missha")])
-def test_family_canonical_override_is_accepted(vendor, canonical):
-    pipeline.validate_options({"vendors": [vendor], "multi_brand": True, "brands": {vendor: canonical}})
+# The vendor's own spelling (how operators list a store's vendors: 31 prod jobs from meitu_retailers,
+# meitu_recrawl and us_top100 map e.g. {"MISSHA": "MISSHA"}) or the canonical, whitespace collapsed
+# the way the crawl collapses it. Pre-#2482 these were accepted; re-enqueuing them must keep working.
+@pytest.mark.parametrize("vendor,value", [("MISSHA", "MISSHA"), ("ETUDE HOUSE", "ETUDE HOUSE"),
+                                          ("Lancome", "Lancome"), ("SKIN1004", "SKIN1004"),
+                                          ("MISSHA", "Missha"), ("MISSHA", "Missha  "), ("MISSHA", " MISSHA")])
+def test_a_family_vendor_accepts_its_own_spelling_or_the_canonical(vendor, value):
+    pipeline.validate_options({"vendors": [vendor], "multi_brand": True, "brands": {vendor: value}})
+
+
+def test_every_third_spelling_is_reported_in_one_error():
+    brands = {"SKIN1004": "Skin1004", "Etude House": "ETUDE HOUSE", "MISSHA": "MISSHA", "3CE": "3CE"}
+    with pytest.raises(ValueError) as err:
+        pipeline.validate_options({"vendors": list(brands), "multi_brand": True, "brands": brands})
+    message = str(err.value)
+    assert "'SKIN1004' -> 'Skin1004'" in message and "'SKIN1004'" in message
+    assert "'Etude House' -> 'ETUDE HOUSE'" in message and "'ETUDE'" in message
+    assert "'MISSHA' ->" not in message
 
 
 def test_non_family_override_is_accepted():
