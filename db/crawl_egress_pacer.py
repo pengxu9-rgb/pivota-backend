@@ -54,7 +54,10 @@ _LEASE_TEMPLATE = """
     INSERT INTO crawl_egress_pacer AS p (bucket, next_free_epoch, leases, updated_at)
     VALUES (:bucket, {now} + CAST(:span AS DOUBLE PRECISION), 1, CURRENT_TIMESTAMP)
     ON CONFLICT (bucket) DO UPDATE
-       SET next_free_epoch = {greatest}(p.next_free_epoch, {now}) + CAST(:span AS DOUBLE PRECISION),
+       SET next_free_epoch = CASE
+             WHEN p.next_free_epoch > {now} + CAST(:horizon AS DOUBLE PRECISION) THEN {now}
+             ELSE {greatest}(p.next_free_epoch, {now})
+           END + CAST(:span AS DOUBLE PRECISION),
            leases = p.leases + 1,
            updated_at = CURRENT_TIMESTAMP
     RETURNING next_free_epoch, {now} AS db_now
@@ -81,18 +84,27 @@ async def ensure_table() -> bool:
     return _DDL_READY
 
 
-async def lease_slots(bucket: str, *, slots: int, rate_per_s: float) -> Tuple[float, float]:
+async def lease_slots(
+    bucket: str, *, slots: int, rate_per_s: float, horizon_s: float
+) -> Tuple[float, float]:
     """Reserve `slots` request slots on `bucket` at `rate_per_s`. ONE round-trip.
 
     Returns `(start_epoch, db_now_epoch)`, both DB-clock seconds: the leased slots start at
-    `start_epoch + i / rate_per_s` for i in range(slots). `start_epoch` is never earlier than the
-    DB's "now" at the time of the statement (GREATEST), so an idle bucket never hands out slots in
-    the past — there is no stored burst to spend.
+    `start_epoch + i / rate_per_s` for i in range(slots). `start_epoch` is:
+      * never earlier than the DB's "now" (GREATEST), so an idle bucket never hands out slots in
+        the past — there is no stored burst to spend;
+      * never later than "now + horizon_s": a schedule already further out than that is not a
+        backlog any real set of processes could hold (the caller sizes the horizon for ~8 processes
+        each holding a full lease) but a POISONED row — a typo'd rate, a DB clock step, a process
+        running a different rate — so it restarts at "now" and heals on this lease, instead of
+        making every later lease wait behind it. (Restarting at "now", not clamping to
+        "now + horizon": a clamp would leave the row just past the horizon and overlap the next
+        lease with this one.)
 
     Raises on any DB error; the caller decides what failing open means.
     """
-    if slots < 1 or not rate_per_s > 0:
-        raise ValueError("a lease needs at least one slot and a positive rate")
+    if slots < 1 or not rate_per_s > 0 or not horizon_s > 0:
+        raise ValueError("a lease needs at least one slot, a positive rate and a positive horizon")
     # A failed CREATE does not stop the lease. Two crawl jobs starting together both run the
     # first-use CREATE, and Postgres can fail the loser of that race (a duplicate pg_type row)
     # although the table now exists. The upsert below is the real test: it raises if the table is
@@ -103,7 +115,7 @@ async def lease_slots(bucket: str, *, slots: int, rate_per_s: float) -> Tuple[fl
     span = float(slots) / float(rate_per_s)
     row = await database.fetch_one(
         LEASE_SQL_POSTGRES if IS_POSTGRES else LEASE_SQL_SQLITE,
-        {"bucket": bucket, "span": span},
+        {"bucket": bucket, "span": span, "horizon": float(horizon_s)},
     )
     if row is None:
         raise RuntimeError("crawl_egress_pacer lease returned no row")

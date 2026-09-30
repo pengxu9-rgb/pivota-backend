@@ -319,20 +319,15 @@ def _robots_delay_cap() -> float:
     return _f("CRAWL_MAX_ROBOTS_DELAY_SECONDS", _MAX_ROBOTS_DELAY_DEFAULT)
 
 
-async def _shopify_edge_slot(url: str, *, ceiling: Optional[float]) -> None:
-    """The SECOND gate: the aggregate budget every crawl process on the crawl egress IP shares for
-    Shopify-served hosts (services/shopify_edge_pacer.py). `await_slot` calls it AFTER the host's
-    own slot, so a request starts at whichever of the two is later; the host's interval is never
-    shortened by it.
-
-    `ceiling` is what is left of the caller's patience after the host slot (None = unbounded). A
-    shared slot further out raises `EdgePaced`, a `CrawlPaced`, which every caller already handles.
-    With `CRAWL_SHOPIFY_EDGE_PACER_ENABLED` off `acquire_for_url` returns before touching any
-    pacer state.
+def _shopify_edge(url: str) -> Any:
+    """The shared Shopify-edge budget (services/shopify_edge_pacer.py) when it applies to `url`,
+    else None. It applies only with `CRAWL_SHOPIFY_EDGE_PACER_ENABLED` on AND `url`'s host known to
+    be Shopify-served; with the flag off this touches no pacer state and `await_slot` runs exactly
+    the pre-pacer path.
     """
     from services import shopify_edge_pacer  # noqa: PLC0415 - it imports this module
 
-    await shopify_edge_pacer.acquire_for_url(url, max_wait=ceiling)
+    return shopify_edge_pacer if shopify_edge_pacer.applies(url) else None
 
 
 async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = None) -> None:
@@ -404,13 +399,38 @@ async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = N
         raise CrawlPaced(
             f"{host} next free in {start - now:.1f}s, over the {ceiling:.1f}s the caller allows"
         )
+    edge = _shopify_edge(url)
+    if edge is not None and not unbounded:
+        # THE SHARED SHOPIFY-EDGE SLOT, FOR A BOUNDED CALLER: BOTH SLOTS OR NEITHER. The shared
+        # slot is taken with no await between it and the host reservation below, and a refusal
+        # (`EdgePaced`, a `CrawlPaced`) is raised before either is reserved -- this function's
+        # contract. Only a lease refill awaits, and everything is re-read after it.
+        slot = edge.take_nowait(max_wait=ceiling)
+        while slot is None:
+            await edge.refill()
+            now = time.monotonic()
+            start = max(now, state.next_allowed, state.backoff_until)
+            if (start - now) > ceiling:
+                raise CrawlPaced(
+                    f"{host} next free in {start - now:.1f}s, over the {ceiling:.1f}s the caller "
+                    f"allows"
+                )
+            slot = edge.take_nowait(max_wait=ceiling)
+        start = max(start, slot)
     # Reserve BEFORE sleeping. Read-then-write with no await between them is atomic on one loop,
     # so N concurrent callers take N distinct slots instead of all waking at the same instant.
     state.next_allowed = start + interval
     delay = start - now
     if delay > 0:
         await asyncio.sleep(delay)
-    await _shopify_edge_slot(url, ceiling=None if unbounded else max(0.0, ceiling - max(0.0, delay)))
+    if edge is not None and unbounded:
+        # AN UNBOUNDED CALLER (every batch job) takes the shared slot AFTER its host slot, so no
+        # shared slot is spent while the host's own interval is still running. It can never be
+        # refused, so nothing reserved above is ever abandoned. If the shared slot made us start
+        # later than the host slot, the host's next slot moves with it: the host interval is
+        # measured from when the request really started.
+        if await edge.acquire() > 0:
+            state.next_allowed = max(state.next_allowed, time.monotonic() + interval)
 
 
 def note_response(

@@ -1493,8 +1493,9 @@ async def _fetch_html(
             observed["status_code"] = resp.status_code
             observed["final_url"] = str(resp.url)
             observed["bot_challenged"] = bool(resp.headers.get("cf-mitigated"))
-        # Teaches the shared Shopify-edge budget which hosts it covers (a no-op with its flag off).
-        shopify_edge_pacer.learn_from_response(url, resp.headers)
+        # Teaches the shared Shopify-edge budget which hosts it covers, keyed by the host that
+        # ANSWERED (the final URL after redirects). A no-op with its flag off.
+        shopify_edge_pacer.learn_from_response(str(resp.url), resp.headers)
         # WAS `resp.raise_for_status()`. Same control flow — every existing caller
         # catches `Exception` — but the status and the final URL now survive the throw,
         # which is what lets the refresh record "this product is gone" instead of

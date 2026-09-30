@@ -108,11 +108,11 @@ class Leases:
         self.next_free = 0.0
         self.calls: List[int] = []
 
-    async def __call__(self, bucket: str, *, slots: int, rate_per_s: float):
+    async def __call__(self, bucket: str, *, slots: int, rate_per_s: float, horizon_s: float):
         self.calls.append(slots)
         now = self.clock.now
         span = slots / rate_per_s
-        self.next_free = max(self.next_free, now) + span
+        self.next_free = max(min(self.next_free, now + horizon_s), now) + span
         return self.next_free - span, now
 
 
@@ -176,10 +176,7 @@ async def test_flag_off_is_the_pre_pacer_path_exactly(monkeypatch: pytest.Monkey
     flag_off = await _run_scenario(monkeypatch)
 
     # The pre-pacer code path: no second gate, and no header learning at the fetch sites.
-    async def _no_edge(url: str, *, ceiling: Optional[float]) -> None:
-        return None
-
-    monkeypatch.setattr(cp, "_shopify_edge_slot", _no_edge)
+    monkeypatch.setattr(cp, "_shopify_edge", lambda url: None)
     monkeypatch.setattr(sep, "learn_from_response", lambda url, headers: False)
     baseline = await _run_scenario(monkeypatch)
 
@@ -308,14 +305,15 @@ def test_shopify_header_evidence(headers, expected) -> None:
         assert sep.looks_shopify_served(httpx.Headers(headers)) is expected
 
 
-async def test_batch_leasing_bounds_db_round_trips(monkeypatch) -> None:
-    """100 paced requests with a lease of 10 cost exactly 10 statements; a lease of 20, 5."""
-    for lease, expected in (("10", 10), ("20", 5)):
+async def test_a_busy_process_leases_about_a_second_of_demand_per_statement(monkeypatch) -> None:
+    """100 back-to-back requests at 4 req/s: the lease grows with demand, so statements stay near
+    one per second (not one per request), and never exceed the configured max lease."""
+    for max_lease in ("10", "3"):
         cp.reset_for_tests()
         sep.reset_for_tests()
         monkeypatch.setenv(sep.ENABLED_ENV, "1")
         monkeypatch.setenv(sep.RATE_ENV, "4")
-        monkeypatch.setenv(sep.LEASE_ENV, lease)
+        monkeypatch.setenv(sep.LEASE_ENV, max_lease)
         monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "0")
         clock = _install_clock(monkeypatch)
         leases = Leases(clock)
@@ -325,10 +323,31 @@ async def test_batch_leasing_bounds_db_round_trips(monkeypatch) -> None:
         for host in hosts:
             sep.mark_shopify_host(host)
         await _fetch_all([f"https://{hosts[i % 10]}/products/{i}" for i in range(100)])
-        assert len(leases.calls) == expected, (lease, leases.calls)
+        elapsed = clock.now - 1000.0
+        assert elapsed >= 99 / 4.0, "the 100 requests took the budget's time"
+        assert max(leases.calls) <= int(max_lease)
+        assert sum(leases.calls) - 100 <= int(max_lease), "at most one lease's tail left unused"
+        # About one statement per second (the stated bound, max(1, rate / max_lease) per second),
+        # not one per request.
+        per_second = max(1.0, 4.0 / int(max_lease))
+        assert len(leases.calls) <= elapsed * per_second + 3, (len(leases.calls), elapsed)
         assert sep.stats()["granted"] == 100
-        # ...and the 100 requests took the budget's time: 99 intervals at 4 req/s.
-        assert clock.now - 1000.0 >= 99 / 4.0
+
+
+async def test_a_low_demand_process_leases_one_slot_at_a_time_and_wastes_none(monkeypatch) -> None:
+    """The P1 the fixed lease had: a caller spacing its own requests 3s apart (the purchasability
+    sweep) reserved 10 slots and used ~3, pushing every other process back."""
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    monkeypatch.setenv(sep.RATE_ENV, "2")
+    monkeypatch.setenv(sep.LEASE_ENV, "10")
+    clock = _install_clock(monkeypatch)
+    leases = Leases(clock)
+    sep._lease_fn = leases
+    for _ in range(20):
+        await sep.acquire()
+        clock.now += 3.0
+    assert leases.calls == [1] * 20
+    assert sep.stats()["expired_slots"] == 0
 
 
 async def test_concurrent_callers_in_one_process_share_one_lease(monkeypatch) -> None:
@@ -338,7 +357,7 @@ async def test_concurrent_callers_in_one_process_share_one_lease(monkeypatch) ->
     gate = asyncio.Event()
     calls: List[int] = []
 
-    async def slow_lease(bucket, *, slots, rate_per_s):
+    async def slow_lease(bucket, *, slots, rate_per_s, **kw):
         calls.append(slots)
         await gate.wait()
         return clock.now, clock.now
@@ -346,10 +365,12 @@ async def test_concurrent_callers_in_one_process_share_one_lease(monkeypatch) ->
     sep._lease_fn = slow_lease
     tasks = [asyncio.ensure_future(sep.acquire()) for _ in range(8)]
     await asyncio.sleep(0.01)
-    assert calls == [10], "eight concurrent callers must not issue eight statements"
+    assert calls == [1], "eight concurrent callers must not issue eight statements"
     gate.set()
     await asyncio.gather(*tasks)
-    assert calls == [10] and sep.stats()["granted"] == 8
+    # The leader leased for itself; the seven that queued behind it are served by ONE more lease
+    # sized for them.
+    assert len(calls) == 2 and calls[1] >= 7 and sep.stats()["granted"] == 8
 
 
 async def test_a_lease_leader_that_is_cancelled_does_not_strand_followers(monkeypatch) -> None:
@@ -358,7 +379,7 @@ async def test_a_lease_leader_that_is_cancelled_does_not_strand_followers(monkey
     first = asyncio.Event()
     n = {"calls": 0}
 
-    async def lease(bucket, *, slots, rate_per_s):
+    async def lease(bucket, *, slots, rate_per_s, **kw):
         n["calls"] += 1
         if n["calls"] == 1:
             await first.wait()  # the leader hangs until cancelled
@@ -374,18 +395,21 @@ async def test_a_lease_leader_that_is_cancelled_does_not_strand_followers(monkey
     assert n["calls"] == 2
 
 
-async def test_slots_are_spent_in_order_and_expired_ones_are_dropped(monkeypatch) -> None:
+async def test_slots_a_full_interval_stale_are_dropped_not_spent(monkeypatch) -> None:
     monkeypatch.setenv(sep.ENABLED_ENV, "1")
     monkeypatch.setenv(sep.RATE_ENV, "1")
-    monkeypatch.setenv(sep.LEASE_ENV, "5")
     clock = _install_clock(monkeypatch)
     leases = Leases(clock)
     sep._lease_fn = leases
+    await asyncio.gather(*(sep.acquire() for _ in range(4)))  # a burst of demand
+    await sep.refill()  # ...and a lease sized for it, held unused
+    held = len(sep._slots)
+    assert held >= 1
+    clock.now += 60  # idle for a minute: the held slots are now a burst nobody granted
+    sleeps = len(clock.sleeps)
     await sep.acquire()
-    clock.now += 60  # idle for a minute: the other four slots are now a burst nobody granted
-    await sep.acquire()
-    assert sep.stats()["expired_slots"] == 4 and len(leases.calls) == 2
-    assert clock.sleeps == [], "a fresh lease starts now, not in the past and not later"
+    assert sep.stats()["expired_slots"] == held
+    assert clock.sleeps[sleeps:] == [], "a fresh lease starts now, not in the past and not later"
 
 
 async def test_a_bounded_caller_is_refused_without_losing_the_slot(monkeypatch) -> None:
@@ -394,6 +418,7 @@ async def test_a_bounded_caller_is_refused_without_losing_the_slot(monkeypatch) 
     clock = _install_clock(monkeypatch)
     sep._lease_fn = Leases(clock)
     await sep.acquire()
+    await sep.refill()  # hold the next slot locally, so the refusal is about ITS time
     with pytest.raises(sep.EdgePaced) as info:
         await sep.acquire(max_wait=5)
     assert isinstance(info.value, cp.CrawlPaced), "every caller already handles CrawlPaced"
@@ -402,20 +427,59 @@ async def test_a_bounded_caller_is_refused_without_losing_the_slot(monkeypatch) 
     assert clock.now - before == pytest.approx(10.0), "the refused slot was the next one taken"
 
 
-async def test_the_bounded_gate_passes_the_remaining_patience(monkeypatch) -> None:
-    """Through crawl_politeness: a bounded caller (the live route's default) is refused as
-    CrawlPaced when the shared slot is further out than its ceiling."""
+async def test_a_bounded_refusal_reserves_neither_slot(monkeypatch):
+    """Through crawl_politeness: a bounded caller refused by the shared budget (EdgePaced, a
+    CrawlPaced) leaves BOTH the host's slot and the shared slot for the next caller —
+    `await_slot`'s contract that a refusal does not reserve."""
     monkeypatch.setenv(sep.ENABLED_ENV, "1")
-    monkeypatch.setenv(sep.RATE_ENV, "0.05")  # 20s apart, over the 10s default ceiling
-    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv(sep.RATE_ENV, "0.1")  # 10s apart
+    monkeypatch.setenv("CRAWL_MAX_WAIT_SECONDS", "5")
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "1")
     clock = _install_clock(monkeypatch)
     sep._lease_fn = Leases(clock)
     sep.mark_shopify_host("shop-a.example")
     await cp.before_request("https://shop-a.example/a", user_agent="PivotaBot")
+    clock.now += 1.0  # the host's own interval has passed; only the shared budget is binding
+    await sep.refill()
+    held = list(sep._slots)
+    before = cp._STATE["shop-a.example"].next_allowed
     with pytest.raises(cp.CrawlPaced):
         await cp.before_request("https://shop-a.example/b", user_agent="PivotaBot")
+    assert cp._STATE["shop-a.example"].next_allowed == before, "the host slot was not reserved"
+    assert list(sep._slots) == held, "the shared slot was not taken"
     await cp.before_request("https://shop-a.example/c", user_agent="PivotaBot", max_wait=0)
-    assert clock.now - 1000.0 == pytest.approx(20.0)
+    assert clock.now == pytest.approx(held[0])
+
+
+async def test_a_bounded_caller_within_patience_starts_at_the_later_of_both(monkeypatch):
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    monkeypatch.setenv(sep.RATE_ENV, "0.25")  # 4s apart
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "1")
+    clock = _install_clock(monkeypatch)
+    sep._lease_fn = Leases(clock)
+    sep.mark_shopify_host("shop-a.example")
+    await cp.before_request("https://shop-a.example/a", user_agent="PivotaBot")
+    await cp.before_request("https://shop-a.example/b", user_agent="PivotaBot")  # 4s <= 10s
+    assert clock.now - 1000.0 == pytest.approx(4.0)
+    assert cp._STATE["shop-a.example"].next_allowed == pytest.approx(clock.now + 1.0)
+
+
+async def test_an_unbounded_callers_host_interval_runs_from_its_real_start(monkeypatch):
+    """A shared wait that pushes a request past its host slot moves the host's next slot too, so
+    two requests to one host are never closer than the host interval."""
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    monkeypatch.setenv(sep.RATE_ENV, "10")
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "3")
+    clock = _install_clock(monkeypatch)
+    leases = Leases(clock)
+    leases.next_free = clock.now + 2.5  # other processes hold the next 2.5s of the budget
+    sep._lease_fn = leases
+    seen = _mock_http(monkeypatch, clock, lambda h: (200, SHOPIFY))
+    sep.mark_shopify_host("shop-a.example")
+    await _fetch_all(["https://shop-a.example/products/1", "https://shop-a.example/products/2"])
+    (_h1, t1), (_h2, t2) = seen
+    assert t1 - 1000.0 == pytest.approx(2.5)
+    assert t2 - t1 >= 3.0 - 1e-9, (t1, t2)
 
 
 async def test_the_host_interval_and_the_shared_budget_compose_as_the_later_of_the_two(monkeypatch):
@@ -442,7 +506,7 @@ async def test_a_failing_budget_fails_open_to_the_local_rate_loudly(monkeypatch,
     clock = _install_clock(monkeypatch)
     attempts: List[float] = []
 
-    async def down(bucket, *, slots, rate_per_s):
+    async def down(bucket, *, slots, rate_per_s, **kw):
         attempts.append(clock.now)
         raise ConnectionRefusedError("pivota-pg unreachable")
 
@@ -456,9 +520,9 @@ async def test_a_failing_budget_fails_open_to_the_local_rate_loudly(monkeypatch,
     times = [t for _h, t in seen]
     assert min(b - a for a, b in zip(times, times[1:])) >= 2.0 - 1e-9, "never unpaced"
     assert any("unreachable" in r.getMessage() and r.levelno == logging.ERROR for r in caplog.records)
-    # 25 requests at 2s = 48s in leases of 5 (10s each): five refills, but the DB is asked only
-    # twice — once at the start and once more after its 30s retry window, not on every lease.
-    assert attempts == [1000.0, 1038.0]
+    # 25 requests at 2s = 48s, one slot per lease (this caller's demand): 25 refills, but the DB
+    # is asked only twice — at the start and once its 30s retry window has passed.
+    assert attempts == [1000.0, 1030.0]
     assert sep.stats()["db_errors"] == 2 and sep.stats()["leases"] == 0
 
 
@@ -467,7 +531,7 @@ async def test_a_hanging_budget_times_out_and_fails_open(monkeypatch, caplog) ->
     monkeypatch.setenv(sep.DB_TIMEOUT_ENV, "0.05")
     _install_clock(monkeypatch)
 
-    async def hang(bucket, *, slots, rate_per_s):
+    async def hang(bucket, *, slots, rate_per_s, **kw):
         await asyncio.Event().wait()
 
     sep._lease_fn = hang
@@ -501,6 +565,7 @@ async def test_the_real_db_lease_failing_fails_open(monkeypatch) -> None:
 
 @pytest.mark.parametrize("raw,expected", [
     (None, 2.0), ("3", 3.0), ("0", 2.0), ("-1", 2.0), ("nan", 2.0), ("inf", 2.0), ("x", 2.0),
+    ("0.001", 0.1), ("0.1", 0.1), ("20", 20.0), ("1e9", 20.0),
 ])
 def test_rate_parsing(monkeypatch, raw, expected) -> None:
     if raw is None:
@@ -511,7 +576,8 @@ def test_rate_parsing(monkeypatch, raw, expected) -> None:
 
 
 @pytest.mark.parametrize("raw,expected", [
-    (None, 10), ("1", 2), ("2", 2), ("20", 20), ("500", 50), ("x", 10), ("nan", 10), ("15.9", 15),
+    (None, 10), ("0", 1), ("1", 1), ("2", 2), ("20", 20), ("21", 20), ("500", 20), ("x", 10),
+    ("nan", 10), ("15.9", 15),
 ])
 def test_lease_parsing(monkeypatch, raw, expected) -> None:
     if raw is None:
@@ -625,16 +691,18 @@ async def test_a_shared_wait_past_the_tierb_deadline_is_budget_exhausted(monkeyp
     import jobs.tierb_cart_link_eligibility as tierb
 
     monkeypatch.setenv(sep.ENABLED_ENV, "1")
-    monkeypatch.setenv(sep.RATE_ENV, "0.01")  # 100s apart
+    monkeypatch.setenv(sep.RATE_ENV, "0.1")  # 10s apart
     clock = _install_clock(monkeypatch)
     sep._lease_fn = Leases(clock)
-    pacer = tierb.RequestPacer(clock=clock.monotonic, sleep=clock.sleep, deadline=clock.now + 50)
+    pacer = tierb.RequestPacer(clock=clock.monotonic, sleep=clock.sleep, deadline=clock.now + 5)
     transport = tierb.PacedTransport(
         httpx.MockTransport(lambda r: httpx.Response(200)), pacer, shopify_edge=True
     )
     await transport.handle_async_request(httpx.Request("GET", "https://m.example/"))
     with pytest.raises(tierb.BudgetExhausted):
         await transport.handle_async_request(httpx.Request("GET", "https://m.example/"))
+    assert len(pacer.starts) == 1, "a start refused by the shared budget is not a request"
+    assert clock.now - 1000.0 < 5, "it did not sleep toward a slot past the deadline"
 
 
 async def test_the_sweep_paces_only_the_crawl_egress_vantage(monkeypatch) -> None:
@@ -765,8 +833,10 @@ def assert_one_shared_budget(run: Dict[str, Any]) -> None:
     for r in run["results"]:
         stats = r["stats"]
         assert stats["db_errors"] == 0, stats
-        # Batch leasing: ceil(n / lease) statements each, plus at most one for an expired lease tail.
-        assert stats["leases"] <= -(-n // run["lease"]) + 1, stats
+        # Leases are sized by demand: a serial caller getting ~rate/2 req/s leases several slots
+        # per statement, so well under one statement per request, and no slot beyond its max.
+        assert stats["leases"] <= n // 2 + 1, stats
+        assert stats["leased_slots"] - n <= run["lease"], stats
 
 
 def test_two_processes_share_one_budget_sqlite(tmp_path: pathlib.Path) -> None:
@@ -805,7 +875,7 @@ def test_no_other_migration_touches_the_table() -> None:
     assert touching == []
 
 
-async def test_the_lease_statement_on_sqlite_has_no_stored_burst(tmp_path, monkeypatch) -> None:
+async def test_the_lease_statement_has_no_stored_burst_and_heals_a_poisoned_row(tmp_path, monkeypatch) -> None:
     """The real SQL on the hermetic dialect: consecutive leases abut, an idle bucket restarts at
     'now' (never in the past), and every lease is one round-trip that bumps `leases`."""
     import db.crawl_egress_pacer as table
@@ -817,8 +887,8 @@ async def test_the_lease_statement_on_sqlite_has_no_stored_burst(tmp_path, monke
     try:
         await database.execute("DROP TABLE IF EXISTS crawl_egress_pacer")
         table.reset_for_tests()
-        start1, now1 = await table.lease_slots("t_bucket", slots=4, rate_per_s=2.0)
-        start2, _now2 = await table.lease_slots("t_bucket", slots=4, rate_per_s=2.0)
+        start1, now1 = await table.lease_slots("t_bucket", slots=4, rate_per_s=2.0, horizon_s=60)
+        start2, _now2 = await table.lease_slots("t_bucket", slots=4, rate_per_s=2.0, horizon_s=60)
         assert start1 == pytest.approx(now1, abs=0.05)
         assert start2 == pytest.approx(start1 + 2.0, abs=1e-6), "leases abut; no overlap"
         row = await database.fetch_one(
@@ -826,12 +896,22 @@ async def test_the_lease_statement_on_sqlite_has_no_stored_burst(tmp_path, monke
         assert int(row[0]) == 2
         await database.execute(
             "UPDATE crawl_egress_pacer SET next_free_epoch = 0 WHERE bucket = 't_bucket'")
-        start3, now3 = await table.lease_slots("t_bucket", slots=1, rate_per_s=2.0)
+        start3, now3 = await table.lease_slots("t_bucket", slots=1, rate_per_s=2.0, horizon_s=60)
         assert start3 >= now3 - 0.01, "an idle bucket hands out slots from now, not from the past"
-        with pytest.raises(ValueError):
-            await table.lease_slots("t_bucket", slots=0, rate_per_s=2.0)
-        with pytest.raises(ValueError):
-            await table.lease_slots("t_bucket", slots=1, rate_per_s=0.0)
+        # POISONED: a typo'd rate or a clock step pushed the schedule ~11 days out. The next
+        # lease starts within the horizon, and the row is healed for everyone after it.
+        await database.execute(
+            "UPDATE crawl_egress_pacer SET next_free_epoch = next_free_epoch + 1000000 "
+            "WHERE bucket = 't_bucket'")
+        start4, now4 = await table.lease_slots("t_bucket", slots=2, rate_per_s=2.0, horizon_s=60)
+        assert start4 == pytest.approx(now4, abs=0.05), start4 - now4
+        start5, _ = await table.lease_slots("t_bucket", slots=2, rate_per_s=2.0, horizon_s=60)
+        assert start5 == pytest.approx(start4 + 1.0, abs=1e-6)
+        for bad in (dict(slots=0, rate_per_s=2.0, horizon_s=60),
+                    dict(slots=1, rate_per_s=0.0, horizon_s=60),
+                    dict(slots=1, rate_per_s=2.0, horizon_s=0)):
+            with pytest.raises(ValueError):
+                await table.lease_slots("t_bucket", **bad)
     finally:
         await database.execute("DROP TABLE IF EXISTS crawl_egress_pacer")
         table.reset_for_tests()
@@ -856,7 +936,7 @@ async def test_a_lost_create_race_does_not_cost_the_lease(monkeypatch) -> None:
             return False
 
         monkeypatch.setattr(table, "ensure_table", lost_race)
-        start, now = await table.lease_slots("race_bucket", slots=2, rate_per_s=1.0)
+        start, now = await table.lease_slots("race_bucket", slots=2, rate_per_s=1.0, horizon_s=60)
         assert start >= now - 0.01
     finally:
         await database.execute("DROP TABLE IF EXISTS crawl_egress_pacer")
@@ -879,33 +959,29 @@ async def test_turning_the_flag_off_stops_pacing_a_known_host_at_once(monkeypatc
     assert sep.stats()["granted"] == granted
 
 
-async def test_a_db_lease_after_a_local_run_never_starts_inside_it(monkeypatch) -> None:
-    """Fail open for one retry window, then the database comes back: its first slot starts after
-    the last local slot, so the transition is never two requests back to back."""
+async def test_a_db_lease_after_a_local_run_keeps_its_db_times(monkeypatch) -> None:
+    """Recovery does not shift the DB's slots past the local fallback schedule: those windows
+    belong to other processes, and moving a lease into them doubles the edge's rate for a lease."""
     monkeypatch.setenv(sep.ENABLED_ENV, "1")
     monkeypatch.setenv(sep.RATE_ENV, "1")
     monkeypatch.setenv(sep.FALLBACK_RATE_ENV, "0.1")  # local slots 10s apart
-    monkeypatch.setenv(sep.LEASE_ENV, "4")
     clock = _install_clock(monkeypatch)
     healthy = Leases(clock)
     state = {"down": True}
 
-    async def flaky(bucket, *, slots, rate_per_s):
+    async def flaky(bucket, *, slots, rate_per_s, **kw):
         if state["down"]:
             state["down"] = False
             raise OSError("blip")
-        return await healthy(bucket, slots=slots, rate_per_s=rate_per_s)
+        return await healthy(bucket, slots=slots, rate_per_s=rate_per_s, **kw)
 
     sep._lease_fn = flaky
-    starts = []
-    for _ in range(4):  # the local run: 1000, 1010, 1020, 1030
-        await sep.acquire()
-        starts.append(clock.now)
-    clock.now += 0.5  # the DB is back; its lease would start "now", inside the last local interval
-    monkeypatch.setattr(sep, "_db_down_until", 0.0)
+    await sep.acquire()  # local slot at 1000; the local schedule's next is 1010
+    monkeypatch.setattr(sep, "_db_down_until", 0.0)  # the DB is back
+    clock.now += 1.0
     await sep.acquire()
-    starts.append(clock.now)
-    assert starts[-1] - starts[-2] >= 10.0 - 1e-9, starts
+    assert clock.now == pytest.approx(1001.0), "the DB's slot starts at the DB's time"
+
 
 
 async def test_the_destination_catalogue_read_learns_and_its_later_pages_are_paced(monkeypatch):
@@ -928,3 +1004,129 @@ async def test_the_destination_catalogue_read_learns_and_its_later_pages_are_pac
     assert read.handles == {"h1", "h2", "h3"}
     assert sep.is_shopify_host("shop-e.example") and leases.calls
     assert min(b - a for a, b in zip(starts[1:], starts[2:])) >= 2.0
+
+
+# ── bounded waits: a tiny rate, a DB clock jump, the horizon ────────────────────────────────
+
+
+async def test_a_typod_tiny_rate_is_floored(monkeypatch) -> None:
+    """`CRAWL_SHOPIFY_EDGE_RPS=0.001` would have been 1,000s per request, stored in the shared row
+    for every later run; it is floored at 0.1 and the horizon bounds any wait."""
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    monkeypatch.setenv(sep.RATE_ENV, "0.001")
+    clock = _install_clock(monkeypatch)
+    leases = Leases(clock)
+    sep._lease_fn = leases
+    for _ in range(3):
+        await sep.acquire()
+    assert clock.now - 1000.0 == pytest.approx(20.0)  # 10s apart, not 1,000s
+
+
+async def test_a_lease_past_the_horizon_fails_open(monkeypatch, caplog) -> None:
+    """A DB clock step (or a row the SQL clamp did not heal) hands back a lease a day out: that is
+    a failure, not a day-long sleep."""
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    clock = _install_clock(monkeypatch)
+
+    async def jumped(bucket, *, slots, rate_per_s, horizon_s):
+        return clock.now + 86_400.0, clock.now
+
+    sep._lease_fn = jumped
+    with caplog.at_level(logging.ERROR, logger=sep.logger.name):
+        waited = await sep.acquire()
+    assert waited < 1.0 and sep.stats()["db_errors"] == 1 and sep.stats()["local_slots"] >= 1
+    assert any("horizon" in r.getMessage() for r in caplog.records)
+
+
+async def test_the_horizon_is_passed_to_the_lease_and_bounded(monkeypatch) -> None:
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    clock = _install_clock(monkeypatch)
+    seen = []
+
+    async def lease(bucket, *, slots, rate_per_s, horizon_s):
+        seen.append(horizon_s)
+        return clock.now, clock.now
+
+    sep._lease_fn = lease
+    await sep.acquire()
+    assert seen == [60.0]  # max(60, 8 * 10 / 2.0)
+    monkeypatch.setenv(sep.RATE_ENV, "0.1")
+    assert sep.horizon() == 800.0
+    monkeypatch.setenv(sep.LEASE_ENV, "20")
+    assert sep.horizon() == 1600.0
+    monkeypatch.setenv(sep.RATE_ENV, "20")
+    assert sep.horizon() == 60.0
+
+
+async def test_learning_keys_on_the_host_that_answered(monkeypatch) -> None:
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    _install_clock(monkeypatch)
+
+    def handler(request):
+        if request.url.host == "shop-r.example":
+            return httpx.Response(301, headers={"location": "https://www.shop-r.example/p"})
+        return httpx.Response(200, headers=SHOPIFY, text="<html></html>")
+
+    def factory(*a, **kw):
+        kw["transport"] = httpx.MockTransport(handler)
+        return _REAL_ASYNC_CLIENT(*a, **kw)
+
+    monkeypatch.setattr(eos.httpx, "AsyncClient", factory)
+    await _fetch_all(["https://shop-r.example/p"])
+    assert sep.is_shopify_host("www.shop-r.example")
+    assert not sep.is_shopify_host("shop-r.example")
+
+
+async def test_tierb_spaces_its_next_start_from_the_real_one(monkeypatch) -> None:
+    """A request the shared budget held back went out LATER than the run's pacer granted it; the
+    run's own 1.5s spacing is measured from when it really went out."""
+    import jobs.tierb_cart_link_eligibility as tierb
+
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    monkeypatch.setenv(sep.RATE_ENV, "10")
+    clock = _install_clock(monkeypatch)
+    leases = Leases(clock)
+    leases.next_free = clock.now + 1.0  # other processes hold the next second of the budget
+    sep._lease_fn = leases
+    starts: List[float] = []
+
+    def handler(request):
+        starts.append(clock.now)
+        return httpx.Response(200)
+
+    pacer = tierb.RequestPacer(clock=clock.monotonic, sleep=clock.sleep)
+    transport = tierb.PacedTransport(httpx.MockTransport(handler), pacer, shopify_edge=True)
+    for _ in range(2):
+        await transport.handle_async_request(httpx.Request("GET", "https://m.example/"))
+    assert starts[0] - 1000.0 == pytest.approx(1.0)
+    assert starts[1] - starts[0] >= 1.5 - 1e-9, starts
+    assert pacer.starts == starts
+
+
+async def test_a_bounded_caller_rechecks_its_host_after_waiting_on_a_lease(monkeypatch):
+    """While a bounded caller waits on a lease refill, another caller may reserve the same host far
+    out. The bounded caller re-reads the host slot and is refused rather than sleeping past its
+    patience."""
+    monkeypatch.setenv(sep.ENABLED_ENV, "1")
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "30")
+    clock = _install_clock(monkeypatch)
+    gate = asyncio.Event()
+    inner = Leases(clock)
+
+    async def slow(bucket, **kw):
+        await gate.wait()
+        return await inner(bucket, **kw)
+
+    sep._lease_fn = slow
+    sep.mark_shopify_host("shop-a.example")
+    bounded = asyncio.ensure_future(
+        cp.before_request("https://shop-a.example/a", user_agent="PivotaBot", max_wait=10))
+    await asyncio.sleep(0.01)  # the bounded caller is now waiting on the lease
+    unbounded = asyncio.ensure_future(
+        cp.before_request("https://shop-a.example/b", user_agent="PivotaBot", max_wait=0))
+    await asyncio.sleep(0.01)  # ...and the unbounded one has reserved the host's next slot
+    gate.set()
+    with pytest.raises(cp.CrawlPaced):
+        await bounded
+    await unbounded
+    assert clock.now - 1000.0 < 10.0

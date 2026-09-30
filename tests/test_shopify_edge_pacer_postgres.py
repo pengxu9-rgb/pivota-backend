@@ -99,16 +99,24 @@ async def test_the_lease_statement_on_postgres() -> None:
     try:
         await database.execute(f"DROP TABLE IF EXISTS {_TABLE}")
         table.reset_for_tests()
-        start1, now1 = await table.lease_slots("pg_bucket", slots=10, rate_per_s=2.0)
-        start2, _ = await table.lease_slots("pg_bucket", slots=10, rate_per_s=2.0)
+        start1, now1 = await table.lease_slots("pg_bucket", slots=10, rate_per_s=2.0, horizon_s=60)
+        start2, _ = await table.lease_slots("pg_bucket", slots=10, rate_per_s=2.0, horizon_s=60)
         assert abs(start1 - now1) < 0.05
         assert start2 == pytest.approx(start1 + 5.0, abs=1e-6), "leases abut; no overlap"
         await database.execute(
             f"UPDATE {_TABLE} SET next_free_epoch = 0 WHERE bucket = 'pg_bucket'")
-        start3, now3 = await table.lease_slots("pg_bucket", slots=1, rate_per_s=2.0)
+        start3, now3 = await table.lease_slots("pg_bucket", slots=1, rate_per_s=2.0, horizon_s=60)
         assert start3 >= now3 - 0.01, "an idle bucket restarts at now: no stored burst"
         row = await database.fetch_one(f"SELECT leases FROM {_TABLE} WHERE bucket = 'pg_bucket'")
         assert int(row[0]) == 3, "one statement per lease"
+        # POISONED ROW (a typo'd rate, a DB clock step): restarts at now, then leases abut again.
+        await database.execute(
+            f"UPDATE {_TABLE} SET next_free_epoch = next_free_epoch + 1000000 "
+            "WHERE bucket = 'pg_bucket'")
+        start4, now4 = await table.lease_slots("pg_bucket", slots=2, rate_per_s=2.0, horizon_s=60)
+        assert abs(start4 - now4) < 0.05
+        start5, _ = await table.lease_slots("pg_bucket", slots=2, rate_per_s=2.0, horizon_s=60)
+        assert start5 == pytest.approx(start4 + 1.0, abs=1e-6)
     finally:
         await database.execute(f"DROP TABLE IF EXISTS {_TABLE}")
         table.reset_for_tests()

@@ -176,7 +176,29 @@ class RequestPacer:
     def expired(self) -> bool:
         return self.deadline is not None and self._clock() >= self.deadline
 
-    async def acquire(self) -> None:
+    def remaining(self) -> Optional[float]:
+        """Seconds left before the deadline (None without one)."""
+        return None if self.deadline is None else self.deadline - self._clock()
+
+    def cancel_start(self, start: float) -> None:
+        """A granted start that never became a request (refused downstream): drop it from `starts`.
+        The spacing it reserved stays reserved, which is only ever more conservative."""
+        try:
+            self.starts.remove(start)
+        except ValueError:
+            pass
+
+    def moved_start(self, start: float, actual: float) -> None:
+        """A granted start that went out LATER than granted (it waited on the shared Shopify-edge
+        budget): record the real time, and space the next start from it."""
+        try:
+            self.starts[self.starts.index(start)] = actual
+        except ValueError:
+            self.starts.append(actual)
+        self._next_start = max(self._next_start or actual, actual + self.min_interval_s)
+
+    async def acquire(self) -> float:
+        """Wait for this run's next start and return it."""
         async with self._lock:
             now = self._clock()
             if self._next_start is not None and now < self._next_start:
@@ -188,6 +210,7 @@ class RequestPacer:
                 raise BudgetExhausted("the run's budget is spent")
             self.starts.append(now)
             self._next_start = now + self.min_interval_s
+            return now
 
 
 class PacedTransport(httpx.AsyncBaseTransport):
@@ -196,8 +219,9 @@ class PacedTransport(httpx.AsyncBaseTransport):
     `shopify_edge=True` says every request through this transport leaves from the crawl egress IP
     to a Shopify storefront, so it ALSO takes a slot of the aggregate budget every crawl process
     shares (services/shopify_edge_pacer.py) — after this run's own spacing, so a request starts at
-    whichever is later. It is a no-op while `CRAWL_SHOPIFY_EDGE_PACER_ENABLED` is off. A shared
-    slot that lands at or past this run's deadline is BudgetExhausted, like any other late slot.
+    whichever is later. It is a no-op while `CRAWL_SHOPIFY_EDGE_PACER_ENABLED` is off. The shared
+    wait is bounded by what is left of the run's budget: a shared slot past the deadline is
+    BudgetExhausted, like any other late slot, and its start is not counted as a request.
     """
 
     def __init__(
@@ -208,11 +232,15 @@ class PacedTransport(httpx.AsyncBaseTransport):
         self._shopify_edge = shopify_edge
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        await self._pacer.acquire()
+        start = await self._pacer.acquire()
         if self._shopify_edge and shopify_edge_pacer.enabled():
-            await shopify_edge_pacer.acquire()
-            if self._pacer.expired():
-                raise BudgetExhausted("the run's budget was spent waiting for the shared Shopify-edge slot")
+            try:
+                waited = await shopify_edge_pacer.acquire(max_wait=self._pacer.remaining())
+            except shopify_edge_pacer.EdgePaced:
+                self._pacer.cancel_start(start)
+                raise BudgetExhausted("the shared Shopify-edge slot is past the run's budget") from None
+            if waited > 0:
+                self._pacer.moved_start(start, self._pacer._clock())
         return await self._inner.handle_async_request(request)
 
     async def aclose(self) -> None:
