@@ -546,11 +546,12 @@ def test_enrichment_one_blocking_store_is_aborted_and_the_next_store_is_walked()
 
 
 def test_enrichment_stores_throttling_one_after_another_trip_the_breaker_and_stop_the_pass():
-    """Under the 09-30 pattern (a rate throttle that lets 200s through) no store reaches its own
-    threshold, yet three distinct stores 429ing within the window trip the breaker: the pass stops and
-    nothing is backed off."""
-    breaker = refresh.store_breaker(["a.com", "b.com", "c.com", "d.com"], is_aborted=lambda s: False)
-    mixed = ["429", "ok", "429", "ok", "ok"]
+    """Under the 09-30 pattern (a rate throttle that lets 200s through: yield 0.29, so 429s come in runs)
+    no store reaches its own threshold of 5, yet three stores that had answered and then 429 three in a
+    row trip the breaker: the pass stops and nothing is backed off. The health comes from the writer's
+    own streak resets (`ObservedStreak(on_clean=...)`)."""
+    breaker = refresh.lane_breaker(["a.com", "b.com", "c.com", "d.com"])
+    mixed = ["ok", "429", "429", "429", "ok"]
     results = _enrichment_pass({"a.com": mixed, "b.com": mixed, "c.com": mixed, "d.com": ["ok"]}, breaker)
     assert results["a.com"].status == DONE and results["b.com"].status == DONE
     assert results["c.com"].status == refresh.IP_THROTTLED and results["c.com"].pass_abort
@@ -593,6 +594,12 @@ def test_the_observed_streak_counts_blocks_and_clean_answers():
     streak["consecutive"] = 0
     streak["consecutive"] = 0
     assert streak.clean == 2 and streak.blocks == 2
+    seen: List[int] = []
+    reported = refresh.ObservedStreak(on_clean=lambda: seen.append(1))
+    reported["consecutive"] += 1
+    assert seen == []
+    reported["consecutive"] = 0
+    assert seen == [1], "every clean answer is reported to the breakers' health"
 
 
 def test_mirror_pages_are_summed_per_domain():
@@ -1054,8 +1061,7 @@ def _real_backfill_pass(monkeypatch, seeds_by_domain, handler, domains, page_siz
     monkeypatch.setattr(backfill, "GLOBAL_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(backfill, "PER_DOMAIN_MIN_GAP_S", 0.0)
     results: Dict[str, DomainResult] = {}
-    ip = (refresh.lane_breaker(domains, is_aborted=lambda s: s in results and results[s].status == ABORTED)
-          if breaker else None)
+    ip = refresh.lane_breaker(domains) if breaker else None
 
     async def go():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as raw:
@@ -1076,9 +1082,11 @@ def _real_backfill_pass(monkeypatch, seeds_by_domain, handler, domains, page_siz
 
 
 def test_small_stores_under_an_ip_level_block_trip_the_breaker_and_nothing_is_backed_off(monkeypatch):
-    """Each store has 5 seeds, under the backfill's threshold of 8, and every answer is a 429. The
-    breaker (3 distinct throttling stores) trips at c.com's first answer; c.com asks nothing more, d and
-    e are not reached, and a and b -- aborted as "no clean answer" -- have their back-off forgiven."""
+    """Each store has 5 seeds, under the backfill's threshold of 8, and every answer is a 429 from the
+    run's first request: no store ever answered, so there is no health to compare to. Three counting
+    stores are not enough on their own (three stores can genuinely refuse us); the FOURTH, with nothing
+    answering since, trips it at its third 429 ("nothing_answering"). a, b and c -- aborted as "no clean
+    answer" -- have their back-off forgiven; e is not reached."""
     requested: List[str] = []
 
     def handler(request):
@@ -1088,11 +1096,12 @@ def test_small_stores_under_an_ip_level_block_trip_the_breaker_and_nothing_is_ba
     domains = ["a.com", "b.com", "c.com", "d.com", "e.com"]
     seeds = {d: _mirror_seeds(d, 5) for d in domains}
     results, client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=10, breaker=True)
-    assert client.breaker.tripped and len(requested) == 11
-    assert [results[d].status for d in ("a.com", "b.com")] == [ABORTED, ABORTED]
-    assert results["a.com"].ip_block and results["b.com"].ip_block
-    assert results["c.com"].status == refresh.IP_THROTTLED and results["c.com"].pass_abort
-    assert [results[d].status for d in ("d.com", "e.com")] == [NOT_REACHED, NOT_REACHED]
+    assert client.breaker.throttle.tripped and len(requested) == 3 * 5 + refresh.LANE_STORE_STREAK
+    assert client.breaker.throttle.trip_reason == "nothing_answering"
+    assert [results[d].status for d in ("a.com", "b.com", "c.com")] == [ABORTED, ABORTED, ABORTED]
+    assert results["a.com"].ip_block and results["b.com"].ip_block and results["c.com"].ip_block
+    assert results["d.com"].status == refresh.IP_THROTTLED and results["d.com"].pass_abort
+    assert results["e.com"].status == NOT_REACHED
     assert not any(refresh.cursor_row_for(r, True, T0)["blocked_until"] for r in results.values())
     assert exit_code(results) == refresh.EXIT_ABORTED_ON_BLOCK
 
@@ -1499,12 +1508,14 @@ def test_a_sigterm_before_any_store_still_reports_and_exits_4(monkeypatch):
 
 
 def test_r1_an_ip_level_block_leaves_no_store_backed_off(monkeypatch):
-    """20-seed stores, every answer a 429, through the REAL run_lane (breaker installed, lane
-    thresholds). a.com and b.com are aborted and first recorded with a back-off; c.com's first 429 trips
-    the breaker, the pass stops, and both are re-recorded without it. Nothing carries blocked_until."""
+    """20-seed stores, every answer a 429 from the run's first request, through the REAL run_lane
+    (breaker installed, lane thresholds). a, b and c are aborted and first recorded with a back-off
+    (nothing ever answered, and three stores can genuinely refuse us); d.com's third 429, with nothing
+    answering since a.com began, trips the breaker, the pass stops, and all three are re-recorded
+    without it. Nothing carries blocked_until."""
     from scripts import backfill_shopify_variant_ids as backfill
 
-    domains = ["a.com", "b.com", "c.com"]
+    domains = ["a.com", "b.com", "c.com", "d.com"]
     seeds = {d: _mirror_seeds(d, 20) for d in domains}
 
     async def fake_select(limit, domain, after=None, seed_ids=None):
@@ -1523,13 +1534,12 @@ def test_r1_an_ip_level_block_leaves_no_store_backed_off(monkeypatch):
     state = refresh.RunState()
     asyncio.run(refresh.run_lane(plan, apply=True, budget_s=600, emit=lambda line: None, state=state, db=db,
                                  now=lambda: T0))
-    # a.com and b.com each 429 eight times (store aborts, 2 distinct hosts); c.com's first 429 is the
-    # third distinct throttling store inside the window: the breaker trips, the pass stops.
-    assert state.results["a.com"].status == ABORTED and state.results["a.com"].ip_block
-    assert state.results["b.com"].status == ABORTED and state.results["b.com"].ip_block
-    assert state.results["c.com"].status == refresh.IP_THROTTLED and state.results["c.com"].pass_abort
+    for d in ("a.com", "b.com", "c.com"):
+        assert state.results[d].status == ABORTED and state.results[d].ip_block, d
+    assert state.results["d.com"].status == refresh.IP_THROTTLED and state.results["d.com"].pass_abort
     assert state.info["ip_throttle"]["ip_throttled"] is True
-    assert {d: r["blocked_until"] for (_, d), r in db.rows.items()} == {"a.com": None, "b.com": None, "c.com": None}
+    assert state.info["ip_throttle"]["ip_throttle_trip_reason"] == "nothing_answering"
+    assert {d: r["blocked_until"] for (_, d), r in db.rows.items()} == {d: None for d in domains}
     assert all(r["last_completed_at"] is None for r in db.rows.values())
 
 
@@ -1623,14 +1633,14 @@ def test_the_carried_store_streak_aborts_a_store_that_had_answered_before(monkey
 
 
 def test_the_09_30_pattern_a_throttle_that_lets_200s_through_backs_off_no_healthy_store(monkeypatch):
-    """Every store answers 429, 404, 429, 404, ... (a rate throttle that lets occasional answers
-    through). No store reaches 8 in a row and none is "never read", so without the breaker every one
-    would be walked into the throttle; with it, the third throttling store trips it, the pass stops,
-    and no store carries a back-off."""
+    """Every store answers 404, then 429 x3, 404, 429 (a rate throttle that lets ~29% through, as on
+    09-30: its 429s come in runs). No store reaches 8 in a row and none is "never read", so without the
+    breaker every one would be walked into the throttle; with it, the third store whose run reached
+    three trips it, the pass stops, and no store carries a back-off."""
 
     def handler(request):
         n = int(request.url.path.split("/h")[-1].split(".")[0])
-        return httpx.Response(429 if n % 2 == 0 else 404)
+        return httpx.Response(429 if n in (1, 2, 3, 5) else 404)
 
     domains = ["a.com", "b.com", "c.com", "d.com"]
     seeds = {d: _mirror_seeds(d, 6) for d in domains}
@@ -1641,12 +1651,14 @@ def test_the_09_30_pattern_a_throttle_that_lets_200s_through_backs_off_no_health
 
 
 def test_a_store_that_blocked_us_earlier_is_forgiven_when_the_breaker_trips_later(monkeypatch):
-    """a.com blocks us outright (8 x 403) -- a back-off, at first. Later stores throttle (429s) and the
-    breaker trips within the window: a.com's back-off is forgiven too."""
+    """a.com blocks us outright (8 x 403) -- a back-off, at first. Later stores answer once and then
+    throttle (429s), and the breaker trips within the window: a.com's back-off is forgiven too."""
 
     def handler(request):
         host = request.url.host
-        return httpx.Response(403 if host == "a.com" else (404 if host == "b.com" else 429))
+        if host in ("a.com", "b.com"):
+            return httpx.Response(403 if host == "a.com" else 404)
+        return httpx.Response(404 if request.url.path.endswith("/h0.js") else 429)
 
     domains = ["a.com", "b.com", "c.com", "d.com", "e.com"]
     seeds = {d: _mirror_seeds(d, 10) for d in domains}
@@ -1654,7 +1666,11 @@ def test_a_store_that_blocked_us_earlier_is_forgiven_when_the_breaker_trips_late
     results, _client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=25, breaker=True)
     assert results["a.com"].status == ABORTED and results["a.com"].ip_block
     assert results["b.com"].status == DONE
-    assert results["e.com"].status == refresh.IP_THROTTLED
+    # c.com is aborted (8 x 429 after one answer); d.com's abort makes a, c, d three stores in the window
+    # and c.com had answered first: the block breaker trips on d.com's abort, in d.com's own page.
+    assert results["c.com"].status == ABORTED and results["c.com"].ip_block
+    assert results["d.com"].status == refresh.IP_THROTTLED and results["e.com"].status == NOT_REACHED
+    assert _client.breaker.blocks.trip_reason == "blocks_after_health"
     assert refresh.cursor_row_for(results["a.com"], True, T0)["blocked_until"] is None
 
 
@@ -1802,8 +1818,10 @@ def test_after_a_trip_no_later_store_is_asked_even_if_the_page_that_tripped_it_c
         async def run_domain(self, db, client, plan, **kwargs):
             self.calls.append((db, client, plan, kwargs))
             if plan == "PLAN-A":
-                for host in ("x.com", "y.com", "z.com"):
-                    crawl_ip_throttle.observe_response(host, 429, {})
+                # Four stores, each three 429s in a row, nothing answering: a trip.
+                for host in ("w.com", "x.com", "y.com", "z.com"):
+                    for _ in range(refresh.LANE_STORE_STREAK):
+                        crawl_ip_throttle.observe_response(host, 429, {})
                 raise RuntimeError("the page broke after the trip")
             return {"exhausted": True, "next_cursor": None, "aborted_on_block": False}
 
@@ -1827,43 +1845,46 @@ def test_b1_one_stores_apex_and_www_plus_one_stray_429_is_not_three_stores():
     from services.crawl_ip_throttle import IpThrottleBreaker
 
     by_host = IpThrottleBreaker(trip_hosts=refresh.LANE_IP_TRIP_HOSTS, window_seconds=refresh.LANE_IP_TRIP_WINDOW_S)
-    by_store = refresh.store_breaker(["a.com", "b.com", "c.com"], is_aborted=lambda s: False)
+    lane = refresh.lane_breaker(["a.com", "b.com", "c.com"])
+    by_store = lane.throttle
+    for host in ("a.com", "b.com", "c.com"):
+        lane.observe_clean(host)  # every store had answered: health, so three counting stores would trip
     for breaker in (by_host, by_store):
         for host in ("a.com", "www.a.com", "shop.a.com", "b.com"):
             breaker.observe(host, 429, {})
     assert by_host.tripped, "precondition: the hostname-keyed breaker would have tripped"
     assert not by_store.tripped
-    by_store.observe("www.c.com", 429, {})
-    assert by_store.tripped and by_store.trip_host_count == 3
+    assert by_store.streaks.streak == {"a.com": 3, "b.com": 1}, "a.com's three hosts are ONE store's run"
+    for host in ("b.com", "www.b.com", "c.com", "www.c.com", "c.com"):
+        by_store.observe(host, 429, {})
+    assert by_store.tripped and by_store.trip_host_count == 3 and by_store.trip_reason == "blocks_after_health"
     assert by_store.store_of("WWW.A.COM") == "a.com" and by_store.store_of("www.other.com") == "other.com"
 
 
-def test_b1_three_stores_we_already_blamed_do_not_trip_it_a_fourth_answering_store_does():
-    aborted = {"a.com", "b.com", "c.com"}
-    breaker = refresh.store_breaker(["a.com", "b.com", "c.com", "d.com"], is_aborted=lambda s: s in aborted)
-    for host in ("a.com", "b.com", "c.com"):
-        breaker.observe(host, 429, {})
-    assert not breaker.tripped, "three store-level blocks, each already backed off on its own evidence"
-    breaker.observe("d.com", 429, {})
-    assert breaker.tripped
-
-
 def test_b1_a_non_throttle_answer_never_trips_it_and_its_diagnostics_are_2473s():
-    breaker = refresh.store_breaker(["a.com", "b.com", "c.com"], is_aborted=lambda s: False)
+    health = refresh.LaneHealth()
+    breaker = refresh.store_breaker(["a.com", "b.com", "c.com"], health=health)
+    health.clean("a.com")
     for host in ("a.com", "b.com", "c.com"):
-        breaker.observe(host, 403, {})
-        breaker.observe(host, 503, {})  # a bare 503 is an outage, not a throttle
-    assert not breaker.tripped
+        for _ in range(refresh.LANE_STORE_STREAK):
+            breaker.observe(host, 403, {})
+            breaker.observe(host, 503, {})  # a bare 503 is an outage, not a throttle
+    assert not breaker.tripped and breaker.streaks.streak == {}
     summary = breaker.summary()
-    assert summary["ip_throttled"] is False and summary["throttle_diagnostics"]["responses"] == 3
+    assert summary["ip_throttled"] is False
+    assert summary["throttle_diagnostics"]["responses"] == 3 * refresh.LANE_STORE_STREAK
     for host in ("a.com", "b.com", "c.com"):
-        breaker.observe(host, 503, {"retry-after": "30"})
+        for _ in range(refresh.LANE_STORE_STREAK):
+            breaker.observe(host, 503, {"retry-after": "30"})
     assert breaker.tripped and breaker.summary()["ip_throttle_trip_host_count"] == 3
+    assert breaker.summary()["ip_throttle_trip_reason"] == "blocks_after_health"
 
 
 def test_b1_the_09_30_pattern_trips_on_the_third_store_through_run_lane(monkeypatch):
-    """Through the REAL run_lane (the breaker it builds and installs): stores answering 429/404
-    alternately trip it at the third store, and no store is backed off."""
+    """Through the REAL run_lane (the breaker it builds and installs): the 09-30 throttle let ~29% of
+    requests through, so a store's 429s come in RUNS between the answers it lets through. Each store
+    answers h0, then 429s h1-h3 (three in a row: it counts, and it had answered first), then h4: the
+    third such store trips it, and no store is backed off."""
     from scripts import backfill_shopify_variant_ids as backfill
 
     domains = ["a.com", "b.com", "c.com", "d.com"]
@@ -1875,7 +1896,7 @@ def test_b1_the_09_30_pattern_trips_on_the_third_store_through_run_lane(monkeypa
 
     def handler(request):
         n = int(request.url.path.split("/h")[-1].split(".")[0])
-        return httpx.Response(429 if n % 2 == 0 else 404)
+        return httpx.Response(429 if n in (1, 2, 3, 5) else 404)
 
     monkeypatch.setattr(backfill, "select_candidates", fake_select)
     monkeypatch.setattr(backfill, "GLOBAL_MIN_INTERVAL_S", 0.0)
@@ -1891,6 +1912,7 @@ def test_b1_the_09_30_pattern_trips_on_the_third_store_through_run_lane(monkeypa
                                  now=lambda: T0))
     assert [state.results[d].status for d in domains] == [DONE, DONE, refresh.IP_THROTTLED, NOT_REACHED]
     assert state.info["ip_throttle"]["ip_throttle_trip_host_count"] == 3
+    assert state.info["ip_throttle"]["ip_throttle_trip_reason"] == "blocks_after_health"
     assert all(r["blocked_until"] is None for r in db.rows.values())
 
 
