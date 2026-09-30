@@ -289,14 +289,24 @@ def test_the_env_is_exactly_the_gate_the_db_guardrails_the_plumbing_and_the_shar
 
 
 def test_the_pacer_env_names_are_the_pacers_own():
-    """The setup script's names must be the ones services/shopify_edge_pacer.py reads, and the lease must
-    be one it accepts unclamped."""
+    """The setup script's names must be the ones services/shopify_edge_pacer.py reads, and the lease cap
+    one it accepts unclamped (#2474 sizes leases by demand, capped at CRAWL_SHOPIFY_EDGE_LEASE)."""
+    import os
+
     from services import shopify_edge_pacer
 
     text = SCRIPT.read_text()
     assert f"{shopify_edge_pacer.ENABLED_ENV}=true" in text
     assert f"{shopify_edge_pacer.LEASE_ENV}=2" in text
-    assert shopify_edge_pacer._LEASE_MIN <= 2 <= shopify_edge_pacer._LEASE_MAX
+    old = os.environ.get(shopify_edge_pacer.LEASE_ENV)
+    os.environ[shopify_edge_pacer.LEASE_ENV] = "2"
+    try:
+        assert shopify_edge_pacer.lease_size() == 2, "the cap is taken as set, not clamped"
+    finally:
+        if old is None:
+            del os.environ[shopify_edge_pacer.LEASE_ENV]
+        else:
+            os.environ[shopify_edge_pacer.LEASE_ENV] = old
 
 
 def test_args_name_the_wrapper_lane_the_egress_flag_and_the_budget_in_the_equals_form(tmp_path):

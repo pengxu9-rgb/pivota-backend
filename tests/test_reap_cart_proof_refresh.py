@@ -1678,7 +1678,7 @@ def test_every_mirror_request_is_marked_shopify_and_takes_a_shared_edge_slot(mon
     shopify_edge_pacer.reset_for_tests()
     leases: List[int] = []
 
-    async def lease(bucket, *, slots, rate_per_s):
+    async def lease(bucket, *, slots, rate_per_s, horizon_s=None):
         leases.append(slots)
         return 0.0, 0.0
 
