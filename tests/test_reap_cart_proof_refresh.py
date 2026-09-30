@@ -37,6 +37,26 @@ from db.reap_cart_proof_refresh_cursors import CursorRow
 REPO = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture(autouse=True)
+def _crawl_state(monkeypatch):
+    """The mirror client gates every request through services.crawl_politeness: no real robots.txt
+    fetch, no per-host sleeping, no backoff sleeping, and no pacer or breaker state carried between
+    tests. The shared Shopify-edge pacer is OFF unless a test turns it on."""
+    from services import crawl_ip_throttle, crawl_politeness, shopify_edge_pacer
+
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "false")
+    monkeypatch.setenv("CRAWL_BACKOFF_BASE_SECONDS", "0")
+    monkeypatch.delenv("CRAWL_SHOPIFY_EDGE_PACER_ENABLED", raising=False)
+    crawl_politeness.reset_for_tests()
+    shopify_edge_pacer.reset_for_tests()
+    crawl_ip_throttle.reset_for_tests()
+    yield
+    crawl_politeness.reset_for_tests()
+    shopify_edge_pacer.reset_for_tests()
+    crawl_ip_throttle.reset_for_tests()
+
+
 class Clock:
     def __init__(self) -> None:
         self.t = 1000.0
@@ -263,18 +283,47 @@ def test_a_store_that_blocks_is_aborted_and_the_pass_moves_on():
     assert exit_code(results) == refresh.EXIT_BUDGET, "a store left unwalked, not an IP-level block"
 
 
-def test_a_tripped_run_streak_stops_the_whole_pass():
+def test_an_ip_breaker_trip_stops_the_whole_pass_and_forgives_this_runs_back_offs():
     clock = Clock()
     run_page, calls = pages_fn({
         "a.com": [Page({}, None, aborted=True)],
-        "b.com": [Page({}, None, aborted=True, abort_pass=True)],
+        "b.com": [Page({}, None, abort_pass=True)],
         "c.com": [Page({}, None)],
     })
-    results = _drive(["a.com", "b.com", "c.com"], run_page, clock)
+    marks: List[tuple] = []
+
+    async def checkpoint(domain, result, final):
+        if final:
+            marks.append((domain, refresh.cursor_row_for(result, True, T0)["blocked_until"]))
+
+    results = asyncio.run(drive(["a.com", "b.com", "c.com"], run_page, merge_list, budget_s=100, gap_s=0.0,
+                                clock=clock, sleep=clock.sleep, checkpoint=checkpoint))
     assert [c[0] for c in calls] == ["a.com", "b.com"]
-    assert results["b.com"].status == ABORTED and results["b.com"].pass_abort
+    assert results["b.com"].status == refresh.IP_THROTTLED and results["b.com"].pass_abort
     assert results["c.com"].status == NOT_REACHED
+    assert results["a.com"].status == ABORTED and results["a.com"].ip_block
+    assert marks == [("a.com", T0 + refresh.MIRROR_BLOCK_BACKOFF), ("a.com", None), ("b.com", None)], \
+        "a.com is first recorded with a back-off, then re-recorded without it when the breaker trips"
     assert exit_code(results) == refresh.EXIT_ABORTED_ON_BLOCK
+
+
+def test_a_trip_seen_between_pages_stops_before_the_next_writer_call():
+    clock = Clock()
+    tripped = {"v": False}
+    run_page, calls = pages_fn({"a.com": [Page({}, "c1"), Page({}, None)], "b.com": [Page({}, None)]})
+
+    async def page(domain, after):
+        out = await run_page(domain, after)
+        tripped["v"] = True
+        return out
+
+    results = asyncio.run(drive(["a.com", "b.com"], page, merge_list, budget_s=100, gap_s=0.0, clock=clock,
+                                sleep=clock.sleep, stop_signal=lambda: tripped["v"]))
+    assert calls == [("a.com", None)]
+    assert results["a.com"].status == refresh.IP_THROTTLED and results["a.com"].last_cursor == "c1"
+    assert results["b.com"].status == NOT_REACHED
+    row = refresh.cursor_row_for(results["a.com"], True, T0)
+    assert row["next_cursor"] == "c1" and row["blocked_until"] is None and row["completed_at"] is None
 
 
 def test_an_abort_mid_domain_does_not_follow_its_cursor():
@@ -402,19 +451,28 @@ class FakeEnrichmentJob:
 
 
 @pytest.mark.parametrize("apply", [False, True])
-def test_the_enrichment_page_calls_the_writer_for_one_plan_with_the_shared_pacer_and_streak(apply):
+def test_the_enrichment_page_calls_the_writer_for_one_plan_with_the_shared_pacer_and_the_breaker(apply):
     domain_report = {"exhausted": False, "next_cursor": "ext:k9", "aborted_on_block": False, "written": 0}
     job = FakeEnrichmentJob([domain_report])
     plans = {"tartecosmetics.com": "PLAN-T", "maccosmetics.com": "PLAN-M"}
-    pacer, db, client, run = object(), object(), object(), {"consecutive": 2}
+    pacer, db, client = object(), object(), object()
+
+    class Breaker:
+        tripped = False
+
+    breaker = Breaker()
     page = asyncio.run(refresh.enrichment_page_fn(job, db, client, plans, apply=apply, pacer=pacer,
-                                                  run_streak=run)("tartecosmetics.com", "ext:k1"))
+                                                  breaker=breaker)("tartecosmetics.com", "ext:k1"))
     (call,) = job.calls
     streak = call[3].pop("block_state")
+    should_stop = call[3].pop("should_stop")
     assert call == (db, client, "PLAN-T", {
         "apply": apply, "source_mode": "auto", "limit": refresh.ENRICHMENT_PAGE_PRODUCTS, "after": "ext:k1",
         "pacer": pacer, "block_limit": 5})
-    assert isinstance(streak, refresh.ObservedStreak) and streak.run is run and streak["consecutive"] == 0
+    assert isinstance(streak, refresh.ObservedStreak) and streak["consecutive"] == 0
+    assert should_stop() is False
+    breaker.tripped = True
+    assert should_stop() is True, "the writer's should_stop IS the breaker"
     assert page.next_cursor == "ext:k9" and page.report == domain_report and not page.aborted
 
 
@@ -427,27 +485,33 @@ def test_the_enrichment_page_is_small_enough_to_commit_and_stop_between_pages():
 def test_an_exhausted_or_aborted_enrichment_domain_has_no_next_page():
     exhausted = FakeEnrichmentJob([{"exhausted": True, "next_cursor": "x"}])
     page = asyncio.run(refresh.enrichment_page_fn(exhausted, None, None, {"a.com": "P"}, apply=False,
-                                                  pacer=None, run_streak={"consecutive": 0})("a.com", None))
+                                                  pacer=None)("a.com", None))
     assert page.next_cursor is None and not page.aborted
     aborted = FakeEnrichmentJob([{"exhausted": False, "next_cursor": "x", "aborted_on_block": True}])
     page = asyncio.run(refresh.enrichment_page_fn(aborted, None, None, {"a.com": "P"}, apply=False,
-                                                  pacer=None, run_streak={"consecutive": 0})("a.com", None))
+                                                  pacer=None)("a.com", None))
     assert page.aborted and page.next_cursor is None and not page.abort_pass
 
 
 class BlockingEnrichmentJob:
     """Moves the writer's block_state exactly as `run_domain`'s on_fetch does: +1 per block (aborting the
-    store at the limit), 0 on a clean answer."""
+    store at the limit), 0 on a clean answer; asks `should_stop` after every answer, as on_fetch does.
+    A "429" answer is also reported to the breaker, as the writer's note_response(headers=...) does."""
 
-    def __init__(self, answers: Dict[str, List[str]]) -> None:
+    def __init__(self, answers: Dict[str, List[str]], breaker: Any = None) -> None:
         self.answers = answers
+        self.breaker = breaker
 
     def abort_after_blocks(self) -> int:
         return 5
 
-    async def run_domain(self, db, client, plan, *, block_state, block_limit, **kwargs):
+    async def run_domain(self, db, client, plan, *, block_state, block_limit, should_stop=None, **kwargs):
         for answer in self.answers[plan]:
-            if answer == "block":
+            if self.breaker is not None and answer in ("block", "429"):
+                self.breaker.observe(plan, 429, {})
+            if should_stop is not None and should_stop():
+                return {"aborted_on_block": True, "exhausted": False, "next_cursor": None}
+            if answer in ("block", "429"):
                 block_state["consecutive"] += 1
                 if block_state["consecutive"] >= block_limit:
                     return {"aborted_on_block": True, "exhausted": False, "next_cursor": None}
@@ -456,24 +520,33 @@ class BlockingEnrichmentJob:
         return {"aborted_on_block": False, "exhausted": True, "next_cursor": None}
 
 
-def _enrichment_pass(answers):
-    job = BlockingEnrichmentJob(answers)
-    run = {"consecutive": 0}
+def _enrichment_pass(answers, breaker=None):
+    job = BlockingEnrichmentJob(answers, breaker=breaker)
     page_fn = refresh.enrichment_page_fn(job, None, None, {d: d for d in answers}, apply=False, pacer=None,
-                                         run_streak=run)
-    return asyncio.run(drive(list(answers), page_fn, refresh.merge_enrichment, budget_s=60, gap_s=0.0)), run
+                                         breaker=breaker)
+    return asyncio.run(drive(list(answers), page_fn, refresh.merge_enrichment, budget_s=60, gap_s=0.0,
+                             stop_signal=(lambda: breaker.tripped) if breaker is not None else None))
 
 
 def test_enrichment_one_blocking_store_is_aborted_and_the_next_store_is_walked():
-    results, run = _enrichment_pass({"a.com": ["block"] * 9, "b.com": ["ok", "ok"], "c.com": ["ok"]})
+    results = _enrichment_pass({"a.com": ["block"] * 9, "b.com": ["ok", "ok"], "c.com": ["ok"]})
     assert results["a.com"].status == ABORTED and not results["a.com"].pass_abort
-    assert results["b.com"].status == DONE and results["c.com"].status == DONE and run["consecutive"] == 0
+    assert results["b.com"].status == DONE and results["c.com"].status == DONE
 
 
-def test_enrichment_two_stores_blocking_in_a_row_stop_the_pass():
-    results, run = _enrichment_pass({"a.com": ["block"] * 9, "b.com": ["block"] * 9, "c.com": ["ok"]})
-    assert results["a.com"].status == ABORTED and results["b.com"].pass_abort
-    assert results["c.com"].status == NOT_REACHED and run["consecutive"] == 10
+def test_enrichment_stores_throttling_one_after_another_trip_the_breaker_and_stop_the_pass():
+    """Under the 09-30 pattern (a rate throttle that lets 200s through) no store reaches its own
+    threshold, yet three distinct stores 429ing within the window trip the breaker: the pass stops and
+    nothing is backed off."""
+    from services.crawl_ip_throttle import IpThrottleBreaker
+
+    breaker = IpThrottleBreaker(trip_hosts=refresh.LANE_IP_TRIP_HOSTS, window_seconds=refresh.LANE_IP_TRIP_WINDOW_S)
+    mixed = ["429", "ok", "429", "ok", "ok"]
+    results = _enrichment_pass({"a.com": mixed, "b.com": mixed, "c.com": mixed, "d.com": ["ok"]}, breaker)
+    assert results["a.com"].status == DONE and results["b.com"].status == DONE
+    assert results["c.com"].status == refresh.IP_THROTTLED and results["c.com"].pass_abort
+    assert results["d.com"].status == NOT_REACHED
+    assert not any(refresh.cursor_row_for(r, True, T0)["blocked_until"] for r in results.values())
 
 
 class PagedEnrichmentJob(BlockingEnrichmentJob):
@@ -496,22 +569,21 @@ def test_enrichment_the_store_streak_is_carried_across_that_stores_pages():
     """Three blocks at the end of page 1 and two at the start of page 2 are five in a row: the store
     is aborted, as one multi-domain writer call would have done."""
     job = PagedEnrichmentJob({"a.com": [["ok", "block", "block", "block"], ["block", "block", "ok"]], "b.com": [["ok"]]})
-    run = {"consecutive": 0}
     page_fn = refresh.enrichment_page_fn(job, None, None, {"a.com": "a.com", "b.com": "b.com"}, apply=False,
-                                         pacer=None, run_streak=run)
+                                         pacer=None)
     results = asyncio.run(drive(["a.com", "b.com"], page_fn, refresh.merge_enrichment, budget_s=60, gap_s=0.0))
     assert results["a.com"].status == ABORTED and results["a.com"].pages == 2
     assert results["b.com"].status == DONE
 
 
-def test_the_observed_streak_mirrors_the_writers_counter_into_the_run_streak():
-    run = {"consecutive": 3}
-    streak = refresh.ObservedStreak(run)
+def test_the_observed_streak_counts_blocks_and_clean_answers():
+    streak = refresh.ObservedStreak()
     streak["consecutive"] += 1
     streak["consecutive"] += 1
-    assert streak["consecutive"] == 2 and run["consecutive"] == 5
+    assert streak["consecutive"] == 2 and streak.blocks == 2 and streak.clean == 0
     streak["consecutive"] = 0
-    assert run["consecutive"] == 0
+    streak["consecutive"] = 0
+    assert streak.clean == 2 and streak.blocks == 2
 
 
 def test_mirror_pages_are_summed_per_domain():
@@ -583,8 +655,7 @@ def test_the_real_enrichment_writer_reports_an_empty_domain_as_done():
 
     async def go():
         return await drive(["tartecosmetics.com"],
-                           refresh.enrichment_page_fn(writer, EmptyDb(), None, plans, apply=False, pacer=pacer,
-                                                      run_streak={"consecutive": 0}),
+                           refresh.enrichment_page_fn(writer, EmptyDb(), None, plans, apply=False, pacer=pacer),
                            refresh.merge_enrichment, budget_s=60, gap_s=0.0)
 
     results = asyncio.run(go())
@@ -957,8 +1028,12 @@ def _mirror_seeds(domain: str, n: int, start: int = 0) -> List[Dict[str, Any]]:
              "seed_data": {"snapshot": {"variants": [{"sku": f"s{i}"}]}}} for i in range(start, start + n)]
 
 
-def _real_backfill_pass(monkeypatch, seeds_by_domain, handler, domains, page_size=3):
+def _real_backfill_pass(monkeypatch, seeds_by_domain, handler, domains, page_size=3, breaker=None,
+                        max_wait=refresh.MIRROR_MAX_POLITE_WAIT_S):
+    """The REAL backfill `run()` over a faked selection and a mock transport, through the mirror client
+    (crawl_politeness gate, IP breaker installed when given)."""
     from scripts import backfill_shopify_variant_ids as backfill
+    from services import crawl_ip_throttle
 
     async def fake_select(limit, domain, after=None, seed_ids=None):
         rows = [s for s in seeds_by_domain[domain] if after is None or s["id"] > after]
@@ -970,22 +1045,24 @@ def _real_backfill_pass(monkeypatch, seeds_by_domain, handler, domains, page_siz
 
     async def go():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as raw:
-            client = refresh.BlockStreakClient(raw, backfill)
+            client = refresh.BlockStreakClient(raw, backfill, breaker=breaker, max_wait=max_wait)
             results = await drive(domains, refresh.mirror_page_fn(backfill, client, apply=False, page_size=page_size),
-                                  refresh.merge_mirror, budget_s=60, gap_s=0.0, on_domain_start=client.start_store)
+                                  refresh.merge_mirror, budget_s=60, gap_s=0.0, on_domain_start=client.start_store,
+                                  stop_signal=(lambda: breaker.tripped) if breaker is not None else None)
             return results, client
 
-    return asyncio.run(go())
+    if breaker is None:
+        return asyncio.run(go())
+    with crawl_ip_throttle.installed(breaker):
+        return asyncio.run(go())
 
 
-def test_small_stores_under_an_ip_level_block_are_not_done_and_stop_the_pass(monkeypatch):
-    """Each store has 5 seeds, under the backfill's threshold of 8, and every answer is a block. None is
-    recorded `done` (nothing was read): each is aborted as "no clean answer". The run streak reaches 16
-    inside d.com, and d.com is itself blocked, so the pass stops when d.com ends; a-c are marked as the
-    address's block (no back-off)."""
-    from scripts import backfill_shopify_variant_ids as backfill
+def test_small_stores_under_an_ip_level_block_trip_the_breaker_and_nothing_is_backed_off(monkeypatch):
+    """Each store has 5 seeds, under the backfill's threshold of 8, and every answer is a 429. The
+    breaker (3 distinct throttling stores) trips at c.com's first answer; c.com asks nothing more, d and
+    e are not reached, and a and b -- aborted as "no clean answer" -- have their back-off forgiven."""
+    from services.crawl_ip_throttle import IpThrottleBreaker
 
-    assert backfill.CONSECUTIVE_BLOCK_ABORT == 8
     requested: List[str] = []
 
     def handler(request):
@@ -994,17 +1071,21 @@ def test_small_stores_under_an_ip_level_block_are_not_done_and_stop_the_pass(mon
 
     domains = ["a.com", "b.com", "c.com", "d.com", "e.com"]
     seeds = {d: _mirror_seeds(d, 5) for d in domains}
-    results, client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=10)
-    assert [results[d].status for d in domains[:4]] == [ABORTED] * 4
-    assert [results[d].ip_block for d in domains[:3]] == [True] * 3 and results["d.com"].pass_abort
-    assert results["e.com"].status == NOT_REACHED
-    assert len(requested) == 20
+    breaker = IpThrottleBreaker(trip_hosts=refresh.LANE_IP_TRIP_HOSTS, window_seconds=refresh.LANE_IP_TRIP_WINDOW_S)
+    results, client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=10, breaker=breaker)
+    assert breaker.tripped and len(requested) == 11
+    assert [results[d].status for d in ("a.com", "b.com")] == [ABORTED, ABORTED]
+    assert results["a.com"].ip_block and results["b.com"].ip_block
+    assert results["c.com"].status == refresh.IP_THROTTLED and results["c.com"].pass_abort
+    assert [results[d].status for d in ("d.com", "e.com")] == [NOT_REACHED, NOT_REACHED]
+    assert not any(refresh.cursor_row_for(r, True, T0)["blocked_until"] for r in results.values())
     assert exit_code(results) == refresh.EXIT_ABORTED_ON_BLOCK
 
 
 def test_r2_a_healthy_store_that_inherits_trailing_blocks_does_not_stop_the_pass(monkeypatch):
     """The reviewer's case: X answers 15 clean then 5 blocks; Y blocks throughout; Z sees 3 transient
-    429s then answers. The run streak reaches 16 inside Z, but Z's own streak is 3: Z is walked."""
+    429s then answers. No breaker here (one store throttling is not an address throttle), and Z's own
+    streak is 3: Z is walked, Y alone is aborted."""
     from scripts import backfill_shopify_variant_ids as backfill
 
     answers = {"x.com": ["ok"] * 15 + ["block"] * 5, "y.com": ["block"] * 20, "z.com": ["block"] * 3 + ["ok"] * 7}
@@ -1017,8 +1098,7 @@ def test_r2_a_healthy_store_that_inherits_trailing_blocks_does_not_stop_the_pass
         return httpx.Response(429 if answers[host][i] == "block" else 404)
 
     seeds = {d: _mirror_seeds(d, len(a)) for d, a in answers.items()}
-    # Page size 3: Z's FIRST page is its three 429s, so at the end of that page the run streak is 16 and
-    # Z's own streak 3 -- the exact moment only the "current store blocked too" rule protects Z.
+    # Page size 3: Z's FIRST page is its three 429s; its second page answers.
     results, client = _real_backfill_pass(monkeypatch, seeds, handler, list(answers), page_size=3)
     assert results["x.com"].status == DONE
     assert results["y.com"].status == ABORTED and not results["y.com"].pass_abort
@@ -1044,7 +1124,7 @@ def test_one_store_that_blocks_is_aborted_alone_and_the_next_store_is_walked(mon
     assert results["a.com"].status == ABORTED and not results["a.com"].pass_abort
     assert requested.count("a.com") == backfill.CONSECUTIVE_BLOCK_ABORT
     assert results["b.com"].status == DONE and requested.count("b.com") == 4
-    assert client.state == {"store": 0, "run": 0}
+    assert client.state == {"store": 0}
 
 
 def test_a_clean_answer_resets_the_carried_streak_and_not_json_neither_adds_nor_resets(monkeypatch):
@@ -1061,7 +1141,7 @@ def test_a_clean_answer_resets_the_carried_streak_and_not_json_neither_adds_nor_
     # but b.com never answered cleanly once, so it is not `done` (the "no clean answer" rule).
     assert results["a.com"].status == DONE
     assert results["b.com"].status == ABORTED and not results["b.com"].pass_abort
-    assert client.state == {"store": 7, "run": 7} and client.short_circuited == 0
+    assert client.state == {"store": 7} and client.short_circuited == 0
 
 
 def test_the_streak_client_passes_a_transport_error_through_after_counting_it():
@@ -1074,7 +1154,7 @@ def test_the_streak_client_passes_a_transport_error_through_after_counting_it():
     client = refresh.BlockStreakClient(Raising(), backfill)
     with pytest.raises(httpx.ConnectError):
         asyncio.run(client.get("https://a.com/products/x.js"))
-    assert client.state == {"store": 1, "run": 1}
+    assert client.state == {"store": 1}
 
 
 # ── F1: the REAL run_lane, a stub database, fake writers ────────────────────────────────────────
@@ -1221,8 +1301,10 @@ def test_the_real_enrichment_lane_hands_the_gate_the_shared_pacer_and_the_no_coo
     pacers = {id(c[3]["pacer"]) for c in writer.calls}
     assert len(pacers) == 1 and isinstance(writer.calls[0][3]["pacer"], FakeEnrichmentWriter.Pacer)
     streaks = [c[3]["block_state"] for c in writer.calls]
-    assert len({id(x) for x in streaks}) == 2, "a store streak per store"
-    assert len({id(x.run) for x in streaks}) == 1, "one run streak for the pass"
+    assert len({id(x) for x in streaks}) == 2 and all(isinstance(x, refresh.ObservedStreak) for x in streaks), \
+        "a store streak per store"
+    stops = [c[3]["should_stop"] for c in writer.calls]
+    assert all(stop() is False for stop in stops), "the run's breaker, not tripped"
     assert all(c[3]["limit"] == refresh.ENRICHMENT_PAGE_PRODUCTS for c in writer.calls)
     assert ensured == ([True] if apply else [])
     assert {r.status for r in state.results.values()} == {DONE}
@@ -1402,9 +1484,9 @@ def test_a_sigterm_before_any_store_still_reports_and_exits_4(monkeypatch):
 
 
 def test_r1_an_ip_level_block_leaves_no_store_backed_off(monkeypatch):
-    """20-seed stores, every answer a 429. a.com trips its store streak (8) and is recorded with a
-    back-off; b.com trips the run streak (16) with its own streak at 8, so the pass stops -- and a.com
-    is re-recorded without its back-off. Nothing in the cursor table carries blocked_until."""
+    """20-seed stores, every answer a 429, through the REAL run_lane (breaker installed, lane
+    thresholds). a.com and b.com are aborted and first recorded with a back-off; c.com's first 429 trips
+    the breaker, the pass stops, and both are re-recorded without it. Nothing carries blocked_until."""
     from scripts import backfill_shopify_variant_ids as backfill
 
     domains = ["a.com", "b.com", "c.com"]
@@ -1426,35 +1508,23 @@ def test_r1_an_ip_level_block_leaves_no_store_backed_off(monkeypatch):
     state = refresh.RunState()
     asyncio.run(refresh.run_lane(plan, apply=True, budget_s=600, emit=lambda line: None, state=state, db=db,
                                  now=lambda: T0))
+    # a.com and b.com each 429 eight times (store aborts, 2 distinct hosts); c.com's first 429 is the
+    # third distinct throttling store inside the window: the breaker trips, the pass stops.
     assert state.results["a.com"].status == ABORTED and state.results["a.com"].ip_block
-    assert state.results["b.com"].pass_abort and state.results["c.com"].status == NOT_REACHED
-    assert {d: r["blocked_until"] for (_, d), r in db.rows.items()} == {"a.com": None, "b.com": None}
+    assert state.results["b.com"].status == ABORTED and state.results["b.com"].ip_block
+    assert state.results["c.com"].status == refresh.IP_THROTTLED and state.results["c.com"].pass_abort
+    assert state.info["ip_throttle"]["ip_throttled"] is True
+    assert {d: r["blocked_until"] for (_, d), r in db.rows.items()} == {"a.com": None, "b.com": None, "c.com": None}
     assert all(r["last_completed_at"] is None for r in db.rows.values())
 
 
-def test_r1_a_store_aborted_before_a_clean_answer_keeps_its_back_off():
-    """Only stores inside the SAME unbroken block streak are the address's: a store that blocked us and
-    was followed by a clean answer keeps its back-off even if the pass stops later."""
+def test_without_a_trip_a_store_that_blocked_us_keeps_its_back_off():
     clock = Clock()
-    run_page, _ = pages_fn({
-        "a.com": [Page({}, None, aborted=True)],
-        "b.com": [Page({}, None, run_reset=True)],
-        "c.com": [Page({}, None, aborted=True)],
-        "d.com": [Page({}, None, aborted=True, abort_pass=True)],
-    })
-    marks: List[tuple] = []
-
-    async def checkpoint(domain, result, final):
-        if final:
-            marks.append((domain, refresh.cursor_row_for(result, True, T0)["blocked_until"]))
-
-    results = asyncio.run(drive(["a.com", "b.com", "c.com", "d.com"], run_page, merge_list, budget_s=100,
-                                gap_s=0.0, clock=clock, sleep=clock.sleep, checkpoint=checkpoint))
-    last = dict(marks)
-    assert last["a.com"] == T0 + refresh.MIRROR_BLOCK_BACKOFF and not results["a.com"].ip_block
-    assert last["c.com"] is None and results["c.com"].ip_block, "re-recorded without the back-off"
-    assert last["d.com"] is None
-    assert marks.count(("c.com", T0 + refresh.MIRROR_BLOCK_BACKOFF)) == 1, "first recorded with one"
+    run_page, _ = pages_fn({"a.com": [Page({}, None, aborted=True)], "b.com": [Page({}, None)]})
+    results = asyncio.run(drive(["a.com", "b.com"], run_page, merge_list, budget_s=100, gap_s=0.0, clock=clock,
+                                sleep=clock.sleep, stop_signal=lambda: False))
+    assert results["a.com"].status == ABORTED and not results["a.com"].ip_block
+    assert refresh.cursor_row_for(results["a.com"], True, T0)["blocked_until"] == T0 + refresh.MIRROR_BLOCK_BACKOFF
 
 
 def test_r1_each_lanes_back_off_is_shorter_than_its_proofs_life():
@@ -1499,8 +1569,7 @@ def test_r1_the_enrichment_lane_records_its_one_day_back_off():
 
 def test_a_store_with_blocks_and_no_clean_answer_is_aborted_not_done():
     def run(answers):
-        results, _run = _enrichment_pass(answers)
-        return results
+        return _enrichment_pass(answers)
 
     results = run({"a.com": ["block", "block"], "b.com": ["ok"]})
     assert results["a.com"].status == ABORTED and not results["a.com"].pass_abort
@@ -1512,28 +1581,12 @@ def test_a_store_with_blocks_and_no_clean_answer_is_aborted_not_done():
     assert results["a.com"].status == DONE, "a store with nothing to fetch is not blocked"
 
 
-def test_the_enrichment_run_streak_needs_the_current_store_blocked_too():
-    """R2 for enrichment: 4 trailing blocks in a.com (under 5, but a.com had a clean answer, so it is
-    done), b.com aborted at 5 (run 9), c.com sees 2 blocks (run 11 >= 10) and then answers: walked."""
-    results, _run = _enrichment_pass({"a.com": ["ok"] + ["block"] * 4, "b.com": ["block"] * 9,
-                                      "c.com": ["block", "block", "ok", "ok"]})
-    assert results["a.com"].status == DONE and results["b.com"].status == ABORTED
-    assert not results["b.com"].pass_abort and results["c.com"].status == DONE
-
-
-
-def test_r2_enrichment_a_store_whose_first_page_inherits_the_run_streak_is_walked():
-    """Mirror of the X/Y/Z case on the enrichment lane, across pages: after c.com's first page the run
-    streak is 11 (>= 10) but c.com's own streak is 2; its second page answers."""
-    job = PagedEnrichmentJob({"a.com": [["ok", "block", "block", "block", "block"]], "b.com": [["block"] * 9],
-                              "c.com": [["block", "block"], ["ok", "ok"]]})
-    run = {"consecutive": 0}
-    page_fn = refresh.enrichment_page_fn(job, None, None, {d: d for d in ("a.com", "b.com", "c.com")},
-                                         apply=False, pacer=None, run_streak=run)
-    results = asyncio.run(drive(["a.com", "b.com", "c.com"], page_fn, refresh.merge_enrichment, budget_s=60,
-                                gap_s=0.0))
-    assert results["b.com"].status == ABORTED and not results["b.com"].pass_abort
-    assert results["c.com"].status == DONE and results["c.com"].pages == 2
+def test_enrichment_a_store_with_a_few_transient_429s_is_walked():
+    job = PagedEnrichmentJob({"a.com": [["ok"] + ["block"] * 4], "b.com": [["block", "block"], ["ok", "ok"]]})
+    page_fn = refresh.enrichment_page_fn(job, None, None, {d: d for d in ("a.com", "b.com")}, apply=False,
+                                         pacer=None)
+    results = asyncio.run(drive(["a.com", "b.com"], page_fn, refresh.merge_enrichment, budget_s=60, gap_s=0.0))
+    assert results["a.com"].status == DONE and results["b.com"].status == DONE and results["b.com"].pages == 2
 
 
 def test_the_carried_store_streak_aborts_a_store_that_had_answered_before(monkeypatch):
@@ -1554,26 +1607,168 @@ def test_the_carried_store_streak_aborts_a_store_that_had_answered_before(monkey
     assert len(requested) == 9
 
 
-def test_r1_a_clean_answer_between_blocks_keeps_the_earlier_stores_back_off(monkeypatch):
-    """a.com blocks us (403s), b.com answers, then c.com and d.com meet an IP-level block (429s). The
-    pass stops at d.com; c.com was inside that unbroken block (no back-off), a.com was not."""
+def test_the_09_30_pattern_a_throttle_that_lets_200s_through_backs_off_no_healthy_store(monkeypatch):
+    """Every store answers 429, 404, 429, 404, ... (a rate throttle that lets occasional answers
+    through). No store reaches 8 in a row and none is "never read", so without the breaker every one
+    would be walked into the throttle; with it, the third throttling store trips it, the pass stops,
+    and no store carries a back-off."""
+    from services.crawl_ip_throttle import IpThrottleBreaker
+
     def handler(request):
-        host = request.url.host
-        return httpx.Response({"a.com": 403, "b.com": 404}.get(host, 429))
+        n = int(request.url.path.split("/h")[-1].split(".")[0])
+        return httpx.Response(429 if n % 2 == 0 else 404)
 
     domains = ["a.com", "b.com", "c.com", "d.com"]
-    seeds = {d: _mirror_seeds(d, 20) for d in domains}
-    results, _client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=25)
-    assert results["a.com"].status == ABORTED and not results["a.com"].ip_block
+    seeds = {d: _mirror_seeds(d, 6) for d in domains}
+    breaker = IpThrottleBreaker(trip_hosts=refresh.LANE_IP_TRIP_HOSTS, window_seconds=refresh.LANE_IP_TRIP_WINDOW_S)
+    results, _client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=10, breaker=breaker)
+    assert results["a.com"].status == DONE and results["b.com"].status == DONE
+    assert results["c.com"].status == refresh.IP_THROTTLED and results["d.com"].status == NOT_REACHED
+    assert not any(refresh.cursor_row_for(r, True, T0)["blocked_until"] for r in results.values())
+
+
+def test_a_store_that_blocked_us_earlier_is_forgiven_when_the_breaker_trips_later(monkeypatch):
+    """a.com blocks us outright (8 x 403) -- a back-off, at first. Later stores throttle (429s) and the
+    breaker trips: in a run the address was throttled, a.com's back-off is forgiven too."""
+    from services.crawl_ip_throttle import IpThrottleBreaker
+
+    def handler(request):
+        host = request.url.host
+        return httpx.Response(403 if host == "a.com" else (404 if host == "b.com" else 429))
+
+    domains = ["a.com", "b.com", "c.com", "d.com", "e.com"]
+    seeds = {d: _mirror_seeds(d, 10) for d in domains}
+    breaker = IpThrottleBreaker(trip_hosts=refresh.LANE_IP_TRIP_HOSTS, window_seconds=refresh.LANE_IP_TRIP_WINDOW_S)
+    # 403 is not a throttle signal: a.com alone does not count toward the trip.
+    results, _client = _real_backfill_pass(monkeypatch, seeds, handler, domains, page_size=25, breaker=breaker)
+    assert results["a.com"].status == ABORTED and results["a.com"].ip_block
     assert results["b.com"].status == DONE
-    assert results["c.com"].status == ABORTED and results["c.com"].ip_block
-    assert results["d.com"].pass_abort
-    assert refresh.cursor_row_for(results["a.com"], True, T0)["blocked_until"] is not None
-    assert refresh.cursor_row_for(results["c.com"], True, T0)["blocked_until"] is None
+    assert results["e.com"].status == refresh.IP_THROTTLED
+    assert refresh.cursor_row_for(results["a.com"], True, T0)["blocked_until"] is None
 
 
-def test_r1_enrichment_a_clean_answer_between_blocks_keeps_the_earlier_stores_back_off():
-    results, _run = _enrichment_pass({"a.com": ["block"] * 9, "b.com": ["ok"], "c.com": ["block"] * 9,
-                                      "d.com": ["block"] * 9})
-    assert results["a.com"].status == ABORTED and not results["a.com"].ip_block
-    assert results["c.com"].ip_block and results["d.com"].pass_abort
+
+
+# ── the mirror lane goes through crawl_politeness and the shared Shopify-edge pacer ─────────────
+
+
+def test_a_retry_after_holds_the_mirror_lanes_next_request_and_it_is_not_sent(monkeypatch):
+    """The backfill's own fetch ignores Retry-After; the mirror client does not. A 429 with
+    `Retry-After: 120` arms the host's backoff in crawl_politeness, so the next four requests are not
+    sent (their slot is further out than the lane waits); the backfill sees them as neutral non-answers
+    and writes nothing for those rows."""
+    requested: List[str] = []
+
+    def handler(request):
+        requested.append(request.url.host)
+        return httpx.Response(429, headers={"retry-after": "120"})
+
+    seeds = {"a.com": _mirror_seeds("a.com", 5)}
+    results, client = _real_backfill_pass(monkeypatch, seeds, handler, ["a.com"], page_size=10, max_wait=0.5)
+    assert requested == ["a.com"]
+    assert client.not_sent == 4
+    assert results["a.com"].writer["fetch_outcomes"] == {"rate_limited": 1, "not_json": 4}
+    assert results["a.com"].status == ABORTED, "one block and no clean answer: never read"
+
+
+def test_every_mirror_request_is_marked_shopify_and_takes_a_shared_edge_slot(monkeypatch):
+    from services import shopify_edge_pacer
+
+    monkeypatch.setenv("CRAWL_SHOPIFY_EDGE_PACER_ENABLED", "true")
+    shopify_edge_pacer.reset_for_tests()
+    leases: List[int] = []
+
+    async def lease(bucket, *, slots, rate_per_s):
+        leases.append(slots)
+        return 0.0, 0.0
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(shopify_edge_pacer, "_lease_fn", lease)
+    monkeypatch.setattr(shopify_edge_pacer, "_sleep", no_sleep)
+    seeds = {"a.com": _mirror_seeds("a.com", 3)}
+    results, _client = _real_backfill_pass(monkeypatch, seeds, lambda r: httpx.Response(404), ["a.com"],
+                                           page_size=10)
+    assert results["a.com"].status == DONE
+    assert shopify_edge_pacer.is_shopify_host("a.com")
+    assert shopify_edge_pacer.stats()["granted"] == 3 and leases
+
+
+def test_the_mirror_client_reports_every_answer_with_its_headers_to_crawl_politeness(monkeypatch):
+    from services import crawl_politeness
+    from scripts import backfill_shopify_variant_ids as backfill
+
+    seen: List[tuple] = []
+    real = crawl_politeness.note_response
+
+    def spy(url, status, *, retry_after=None, headers=None):
+        seen.append((status, retry_after, None if headers is None else headers.get("x-shopid")))
+        return real(url, status, retry_after=retry_after, headers=headers)
+
+    monkeypatch.setattr(crawl_politeness, "note_response", spy)
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda r: httpx.Response(429, headers={"retry-after": "1", "x-shopid": "42"}))) as raw:
+            client = refresh.BlockStreakClient(raw, backfill)
+            await client.get("https://a.com/products/x.js")
+
+    asyncio.run(go())
+    assert seen == [(429, "1", "42")]
+
+
+# ── --only: the first dry run is ONE small store ────────────────────────────────────────────────
+
+
+def test_only_restricts_the_lane_to_named_stores_in_the_lanes_own_order():
+    plan = refresh.LanePlan(lane="enrichment", domains=["a.com", "b.com", "c.com"], writer=None, gap_s=0.0,
+                            plans={"a.com": 1, "b.com": 2, "c.com": 3})
+    out = refresh.restrict(plan, ["c.com", "www.A.com"])
+    assert out.domains == ["a.com", "c.com"] and out.plans == {"a.com": 1, "c.com": 3}
+    assert refresh.restrict(refresh.LanePlan(lane="mirror", domains=["a.com"], writer=None, gap_s=0.0),
+                            None).domains == ["a.com"]
+
+
+def test_only_refuses_a_store_off_the_lanes_list(monkeypatch, capsys):
+    monkeypatch.setattr(refresh, "plan_lane",
+                        lambda lane, now: refresh.LanePlan(lane=lane, domains=["a.com"], writer=None, gap_s=0.0))
+
+    async def must_not_run(*a, **k):
+        raise AssertionError("ran with an off-list --only")
+
+    monkeypatch.setattr(refresh, "run_lane", must_not_run)
+    assert refresh.main(["mirror", "--on-crawl-egress", "--budget-seconds", "60", "--only", "evil.com"],
+                        environ={}) == refresh.EXIT_BAD_ARGS
+    assert "evil.com" in capsys.readouterr().err
+    assert refresh.main(["mirror", "--on-crawl-egress", "--budget-seconds", "60", "--only", "not a host"],
+                        environ={}) == refresh.EXIT_BAD_ARGS
+
+
+def test_only_reaches_the_lane(monkeypatch):
+    seen: Dict[str, Any] = {}
+    monkeypatch.setattr(refresh, "plan_lane", lambda lane, now: refresh.LanePlan(
+        lane=lane, domains=["a.com", "b.com"], writer=None, gap_s=0.0))
+
+    async def run_lane(plan, *, apply, budget_s, emit, state):
+        seen["domains"] = list(plan.domains)
+        return state.info
+
+    monkeypatch.setattr(refresh, "run_lane", run_lane)
+    refresh.main(["mirror", "--on-crawl-egress", "--budget-seconds", "60", "--only", "b.com"], environ={},
+                 emit=lambda line: None)
+    assert seen["domains"] == ["b.com"]
+
+
+def test_the_lane_breaker_is_calibrated_for_one_store_at_a_time():
+    """#2473's defaults (10 distinct hosts in 60 s) suit a crawl that reaches hundreds of hosts at ~4
+    req/s. These lanes walk ONE store at a time at ~1 request / 3 s, so a store adds at most ~one
+    distinct host a minute: the lane needs a few hosts over a long window, or it can never trip."""
+    from scripts import backfill_shopify_variant_ids as backfill
+    from services import crawl_ip_throttle
+
+    assert refresh.LANE_IP_TRIP_HOSTS <= 3 < crawl_ip_throttle.TRIP_HOSTS_DEFAULT
+    # Enough time for LANE_IP_TRIP_HOSTS stores to each reach their own abort threshold, twice over.
+    per_store = backfill.CONSECUTIVE_BLOCK_ABORT * backfill.PER_DOMAIN_MIN_GAP_S
+    assert refresh.LANE_IP_TRIP_WINDOW_S >= 2 * refresh.LANE_IP_TRIP_HOSTS * per_store
+    assert refresh.LANE_IP_TRIP_WINDOW_S >= 600

@@ -58,9 +58,19 @@
 # defaults both to OFF; `web` runs 30/600), the gate. Plus the plumbing every job on this address
 # carries, copied from the Tier B job: PIVOTA_SERVICE_NAME / PIVOTA_COMMIT_SHA (log labels) and
 # DB_POOL_MIN_SIZE=1 / DB_POOL_MAX_SIZE=2 (the pool defaults are 5/20; each writer holds one
-# connection at a time, and the prod primary has 2 vCPUs). The pacing knobs are NOT set: the
-# writers' defaults (mirror 1.0 s global / 3.0 s per store; enrichment 3.0 s) are what the task
+# connection at a time, and the prod primary has 2 vCPUs). The writers' own pacing knobs are NOT
+# set: their defaults (mirror 1.0 s global / 3.0 s per store; enrichment 3.0 s) are what the task
 # timeouts below are sized from, and a job-level override would silently invalidate that sizing.
+# THE SHARED SHOPIFY-EDGE PACER (#2474) IS ON FOR BOTH JOBS, dark or armed, because a dry run fetches
+# exactly as hard as an apply:
+#   CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true  every request to a Shopify-served host (all of ours) also
+#                                          takes a slot of the aggregate budget every crawl job on
+#                                          the crawl IP shares (CRAWL_SHOPIFY_EDGE_RPS, default 2/s);
+#   CRAWL_SHOPIFY_EDGE_LEASE=2             the smallest lease. A lease reserves N slots 1/rate apart
+#                                          and slots unused a full interval later are dropped; these
+#                                          lanes send ~1 request / 3 s, so the default lease of 10
+#                                          would reserve ~5 s of the SHARED schedule per request we
+#                                          send (2 req/s held for 0.33 used). 2 holds ~0.67 req/s.
 #
 # SCHEDULES AND TIMEOUTS (UTC). The crawl address's DAILY neighbours, each as its longest window
 # (task timeout x (max-retries + 1)):
@@ -76,6 +86,8 @@
 # never overlap each other (they share stores: tarte, MAC, bluemercury, stila, jsm are on both lists).
 #
 #   enrichment  06:41 daily. Budget 3600 s, task timeout 10800 s -> worst case over by 09:41.
+#     Its 3.0 s gap is 0.33 req/s, under the shared 2 req/s and its 0.5 req/s fail-open share; at
+#     06:41-09:41 the only other edge users are the hourly purchasability sweep and the probes.
 #     Normal cost is small: `--source auto` pages /products.json when that is fewer requests than
 #     one .js per handle (MAC: ~1,870 handles vs ~10 listing pages), so a pass is minutes. The
 #     timeout is sized for the FALLBACK, where /meta.json is unreadable and the writer reads one
@@ -89,17 +101,21 @@
 #     wrapper already isolates a store's crash, commits each 250-product page as it ends, stores a
 #     cursor per store, and prints its partial report on the timeout's SIGTERM.
 #     Daily against a 72 h proof: two missed days of margin.
-#   mirror      10:13 daily. Budget 10800 s, task timeout 12600 s -> worst case over by 13:43.
-#     One .js per candidate seed at 3.0 s per store (domains are walked one at a time), so the
-#     budget covers ~3,600 candidate fetches a day across the 42 Tier B domains. The per-domain
-#     candidate counts are NOT measured yet (no read of prod was taken for this PR); the first dry
-#     run reports them (`writer.candidates` per domain, `elapsed_s`). If the budget cuts the pass
-#     (exit 4), the cut store resumes from its stored cursor and the stores are ordered stalest
-#     first (never-completed, then oldest valid proof / last completed walk), so the next run
-#     starts where the need is. That only keeps up if a day's budget covers a day's churn: exit 4
-#     on consecutive days means raise the budget and the task timeout here.
-#     The extra 1,800 s is one 50-candidate page the budget cannot stop: 50 x (3 s + a 20 s
-#     timeout) = 1,150 s at worst, since 8 consecutive block-shaped answers abort the store.
+#   mirror      10:13 daily. Budget 10800 s, task timeout 15000 s -> worst case over by 14:23.
+#     MEASURED (prod census, read-only, 2026-09-30, the backfill's own eligibility SQL): 2,092
+#     candidate seeds over the 42 Tier B domains (34 with any; fentybeauty.com 724, paulmitchell.com
+#     243, mixsoon.us 197, tonymoly.us 185, then <= 73 each; 0 hold a proof today). One .js per
+#     candidate at 3.0 s per store (stores are walked one at a time) is 6,276 s, plus ~70 writer
+#     calls x the 3 s inter-call gap = ~6,500 s. THE SHARED 2 req/s DOES NOT LENGTHEN IT: this lane
+#     sends 0.33 req/s, under even the pacer's fail-open local rate (a quarter of 2 = 0.5 req/s), and
+#     between 10:13 and 14:23 only the hourly purchasability sweep (1.5 s pacing, 0.67 req/s) shares
+#     the edge budget: 1.0 req/s of 2. The 10,800 s budget is 1.66x the measured need, which also
+#     absorbs an average edge wait of up to ~2 s per request. If the budget cuts the pass (exit 4),
+#     the cut store resumes from its stored cursor, stalest stores first; exit 4 on consecutive days
+#     means raise the budget and the task timeout here.
+#     The extra 4,200 s is one 50-candidate page the budget cannot stop, now with the politeness
+#     gate in front of every request: 50 x (3 s pacing + up to 60 s waiting for crawl_politeness,
+#     MIRROR_MAX_POLITE_WAIT_S, + a 20 s request timeout) = 4,150 s at worst.
 #     Daily against a 7-day proof: six missed days of margin.
 # tests/test_setup_reap_cart_proof_jobs.py re-derives these windows from the neighbours' scripts.
 set -euo pipefail
@@ -124,7 +140,7 @@ SUBNET=pivota-crawl
 MIRROR_JOB=reap-cart-proof-mirror
 MIRROR_SCHEDULE="13 10 * * *"
 MIRROR_BUDGET_SECONDS=10800
-MIRROR_TASK_TIMEOUT=12600s
+MIRROR_TASK_TIMEOUT=15000s
 ENRICHMENT_JOB=reap-cart-proof-enrichment
 ENRICHMENT_SCHEDULE="41 6 * * *"
 ENRICHMENT_BUDGET_SECONDS=3600
@@ -212,6 +228,7 @@ mkproofjob(){ # job lane budget-seconds task-timeout
   env_vars="$env_vars,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2"
   env_vars="$env_vars,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600"
   env_vars="$env_vars,REAP_CART_PROOF_APPLY=$ENABLED"
+  env_vars="$env_vars,CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true,CRAWL_SHOPIFY_EDGE_LEASE=2"
   echo "== job: $job (lane $lane, subnet $SUBNET, apply $ENABLED)"
   local verb=create; have "$GCLOUD" run jobs describe "$job" --region "$REGION" && verb=update
   # --args= in the EQUALS form: the value starts with a dash, and `--args "-m,..."` is parsed by

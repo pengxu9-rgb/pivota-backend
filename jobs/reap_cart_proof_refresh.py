@@ -72,25 +72,39 @@ worst case. A domain the budget cut is `budget_stopped` (walked partway; resumed
 `not_reached`. If the task timeout's SIGTERM arrives anyway, the partial report is printed first
 (`terminated`), and every page already checkpointed stays checkpointed.
 
-BLOCKS. Two streaks of consecutive block-shaped answers (a clean answer resets both; a challenge page
-or a request never sent resets neither), each at the writer's own threshold T (mirror 8, enrichment 5):
-  * the STORE streak, per store across its pages. A store is aborted (`aborted_on_block`, backed off
-    as above) when it reaches T, OR when it is walked to its end having had at least one block and
-    NO clean answer at all (a small store we never actually read is not `done`, and gets no
-    `last_completed_at`). The pass then MOVES ON to the next store;
-  * the RUN streak, carried across stores. THE WHOLE PASS stops only when the run streak is at
-    `PASS_BLOCK_STORES` x T AND the CURRENT store has itself just been aborted by one of the two
-    rules above -- so the store that stops the pass is itself blocked, not a healthy store that
-    inherited an earlier store's trailing blocks and saw a couple of transient 429s. That is what an
-    IP-level block like 2026-08-21's looks like; a run of small stores that each stay under T still
-    trips it (each is aborted as "no clean answer"). When the pass stops, every store aborted since
-    the last clean answer is re-recorded WITHOUT a back-off.
+BLOCKS, AND THE IP BREAKER.
+  * THE STORE: a store is aborted (`aborted_on_block`, backed off as above) when its consecutive
+    block-shaped answers reach the writer's own threshold T (mirror 8, enrichment 5; a clean answer
+    resets the count, a challenge page or a request never sent does not touch it), OR when it is
+    walked to its end having had at least one block and NO clean answer at all (a store we never
+    actually read is not `done`, and gets no `last_completed_at`). The pass then MOVES ON.
+  * THE ADDRESS: one `services.crawl_ip_throttle.IpThrottleBreaker` (#2473) per run, installed for the
+    run and fed with every response's headers through `crawl_politeness.note_response`. It trips when
+    `LANE_IP_TRIP_HOSTS` distinct stores answer 429 (or 503 + Retry-After) within
+    `LANE_IP_TRIP_WINDOW_S`: thresholds for a lane that walks stores ONE AT A TIME (see the constants).
+    A trip STOPS THE WHOLE PASS (the store in flight is `ip_throttled`/`pass_abort`, the rest
+    `not_reached`) and FORGIVES every back-off this run recorded (`ip_block`): during an IP-level
+    throttle -- including the 2026-09-30 pattern, a rate throttle that lets occasional 200s through --
+    a store that "blocked us" was the address's problem, not the store's. Nothing is backed off
+    in a run whose breaker tripped.
   Mirror: the backfill keeps its counter inside one `run()`, so the client handed to it
   (`BlockStreakClient`) classifies every answer with the backfill's OWN `fetch_product_js` and
-  `_is_block`; once the store streak trips it answers 429 locally, without touching the network. Enrichment:
-  the writer's own `block_state` counter, one per store (`ObservedStreak`), observed into the run
-  streak (the writer stops the store at T; the run streak can trip up to T - 1 requests after the
-  point it was reached).
+  `_is_block`, carries the store count across calls, and once the store has tripped or the breaker
+  has, answers 429 locally without touching the network. Enrichment: the writer's own `block_state`,
+  one per store (`ObservedStreak`), and the writer's `should_stop` hook, so it stops asking the
+  moment the breaker trips.
+
+THE SHARED SHOPIFY-EDGE PACER (#2474). Both lanes' every request goes through
+`crawl_politeness.await_slot` (the host's own slot, its Retry-After / backoff hold, then the shared
+Shopify-edge slot): the enrichment writer through its `before_request`, the mirror lane through
+`BlockStreakClient`, which the backfill's plain `client.get` now reaches. Both lanes mark their hosts
+as Shopify-served (every one is a Tier B Shopify store's products.js / products.json / meta.json)
+and teach the pacer from response headers, so with `CRAWL_SHOPIFY_EDGE_PACER_ENABLED` (set on both
+jobs by the setup script) every request also takes a slot of the aggregate budget all crawl jobs on
+the crawl IP share. A request the gate will not let out within `MIRROR_MAX_POLITE_WAIT_S` is NOT
+sent: the mirror client answers it locally as a non-answer (the backfill sees `not_json`: neutral,
+nothing written for that row). NOTE: a pacer-enabled run leases slots from `crawl_egress_pacer`
+(migration 251) -- a dry run writes THAT shared row, and nothing else.
 
 A CRASH (an exception out of the writer, or out of summing its report) is recorded against its domain
 and the pass moves on: one store's unreadable data must not cost the other stores their refresh.
@@ -101,7 +115,7 @@ domain ends.
 
 EXIT CODES. #2464's four, plus one for the budget:
   0  every domain walked to its end (a `backed_off` store does not count against it: it is reported)
-  1  the PASS aborted on a block (the run streak tripped)
+  1  the PASS stopped: the IP-throttle breaker tripped (`ip_throttled`)
   2  bad arguments, no --on-crawl-egress, a missing merchant list, or a domain list the writer
      refuses; nothing attempted
   3  a writer crashed on at least one domain (the others were still attempted), a cursor did not
@@ -169,8 +183,19 @@ ENRICHMENT_BLOCK_BACKOFF = timedelta(days=1)
 
 def block_backoff(lane: str) -> timedelta:
     return MIRROR_BLOCK_BACKOFF if lane == "mirror" else ENRICHMENT_BLOCK_BACKOFF
-#: The whole pass stops after this many stores' worth of consecutive block answers.
-PASS_BLOCK_STORES = 2
+#: The IP breaker for these lanes (#2473's `IpThrottleBreaker`, with lane thresholds). Its defaults (10 distinct
+#: hosts in 60 s) are calibrated on the external-referral refresh, which reaches hundreds of hosts at ~4 req/s;
+#: these lanes walk ONE store at a time at ~1 request / 3 s, so a store contributes at most one distinct host
+#: per ~minute and 10-in-60s could never trip. Three distinct stores throttling within 15 minutes: during an
+#: IP-level throttle every store 429s within its first few requests (three stores in ~1-2 minutes); on a
+#: healthy run three different stores each answering a 429 inside 15 minutes is itself worth stopping for.
+#: A false trip costs only deferral: the pass stops, nothing is backed off, the next run resumes.
+LANE_IP_TRIP_HOSTS = 3
+LANE_IP_TRIP_WINDOW_S = 900.0
+#: The longest the mirror lane waits for `crawl_politeness` to let a request out (a Retry-After hold, a
+#: Crawl-delay, the shared Shopify-edge slot). Longer, and the request is not sent. The enrichment writer's
+#: own `ENRICHMENT_PROOF_MAX_POLITE_WAIT_S` has the same default.
+MIRROR_MAX_POLITE_WAIT_S = 60.0
 #: Crashes at the same resume cursor, in consecutive runs, before that cursor is reset to NULL.
 CRASH_RESET_AFTER = 2
 
@@ -192,6 +217,7 @@ CURSOR_STUCK = "cursor_stuck"
 TERMINATED = "terminated"
 IN_PROGRESS = "in_progress"
 BACKED_OFF = "backed_off"
+IP_THROTTLED = "ip_throttled"
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -302,10 +328,8 @@ class Page:
     next_cursor: Optional[str]
     #: this STORE blocked us: record it, back it off, move on
     aborted: bool = False
-    #: the RUN streak tripped with this store blocked too (an IP-level block): stop the whole pass
+    #: the IP breaker tripped during this page: stop the whole pass, back nothing off
     abort_pass: bool = False
-    #: at least one clean answer during this page (the run streak was broken)
-    run_reset: bool = False
 
 
 PageFn = Callable[[str, Optional[str]], Awaitable[Page]]
@@ -323,7 +347,7 @@ class DomainResult:
     checkpoint_error: Optional[str] = None
     #: this store's abort is the one that stopped the whole pass
     pass_abort: bool = False
-    #: aborted inside the unbroken block streak that then stopped the pass: the address's block
+    #: aborted in a run whose IP breaker then tripped: its back-off is forgiven (the address's block)
     ip_block: bool = False
     #: this run reset a cursor that crashed twice in a row
     crash_cursor_reset: bool = False
@@ -367,11 +391,13 @@ async def drive(domains: Sequence[str], run_page: PageFn, merge: MergeFn, *, bud
                 start_cursors: Optional[Mapping[str, Optional[str]]] = None,
                 checkpoint: Optional[CheckpointFn] = None,
                 results: Optional[Dict[str, DomainResult]] = None,
-                on_domain_start: Optional[Callable[[str], None]] = None) -> Dict[str, DomainResult]:
+                on_domain_start: Optional[Callable[[str], None]] = None,
+                stop_signal: Optional[Callable[[], bool]] = None) -> Dict[str, DomainResult]:
     """Walk each domain page by page, in order, inside one budget. See the module docstring.
 
     `results`, when given, is filled in place as the pass goes, so a caller interrupted mid-pass (the
-    SIGTERM path) still holds every finished domain."""
+    SIGTERM path) still holds every finished domain. `stop_signal` (the IP breaker's `tripped`) is
+    checked before every writer call: once true, the pass stops and no back-off of this run stands."""
     if not budget_s > 0:
         raise ValueError("budget_s must be positive")
     started = clock()
@@ -380,8 +406,8 @@ async def drive(domains: Sequence[str], run_page: PageFn, merge: MergeFn, *, bud
         results[domain] = DomainResult(start_cursor=(start_cursors or {}).get(domain))
     first_call = True
     stop_all = False
-    #: stores aborted since the last clean answer: if the pass then stops, they were the address's block
-    unbroken: List[str] = []
+    #: stores this run backed off: if the IP breaker trips, every one of them is forgiven
+    backed_off_this_run: List[str] = []
     for domain in domains:
         if stop_all:
             break
@@ -392,6 +418,12 @@ async def drive(domains: Sequence[str], run_page: PageFn, merge: MergeFn, *, bud
             on_domain_start(domain)
         try:
             while True:
+                if stop_signal is not None and stop_signal():
+                    # The IP breaker tripped (in an earlier store, or between pages of this one).
+                    result.status = IP_THROTTLED
+                    result.pass_abort = True
+                    stop_all = True
+                    break
                 if clock() - started >= budget_s:
                     # Every later domain meets this same check first and is recorded `not_reached`.
                     result.status = BUDGET_STOPPED if result.pages else NOT_REACHED
@@ -402,21 +434,21 @@ async def drive(domains: Sequence[str], run_page: PageFn, merge: MergeFn, *, bud
                 try:
                     page = await run_page(domain, after)
                     result.pages += 1
-                    if page.run_reset:
-                        unbroken.clear()
                     merge(result.writer, page.report)
                 except Exception as exc:  # noqa: BLE001 - recorded against the domain; the pass goes on
                     logger.exception("reap cart proof refresh: %s crashed", domain)
                     result.status = CRASHED
                     result.error = f"{type(exc).__name__}: {str(exc)[:300]}"
                     break
-                if page.aborted or page.abort_pass:
-                    # This store blocked us. Only a tripped RUN streak (the next store blocked too)
-                    # stops the pass; otherwise the next store gets its turn.
+                if page.abort_pass:
+                    # The IP breaker tripped during this page: the address is throttled, not the store.
+                    result.status = IP_THROTTLED
+                    result.pass_abort = True
+                    stop_all = True
+                    break
+                if page.aborted:
+                    # This store blocked us: it is backed off, and the next store gets its turn.
                     result.status = ABORTED
-                    if page.abort_pass:
-                        result.pass_abort = True
-                        stop_all = True
                     break
                 if page.next_cursor is None:
                     result.status = DONE
@@ -435,13 +467,13 @@ async def drive(domains: Sequence[str], run_page: PageFn, merge: MergeFn, *, bud
             raise
         result.elapsed_s = clock() - domain_started
         if result.pass_abort:
-            # R1: every store aborted since the last clean answer was part of the same address-level
-            # block. Re-record each without its back-off (its first checkpoint gave it one).
-            for earlier in unbroken:
+            # The IP breaker tripped: every store this run backed off hit the address's throttle, not
+            # its own. Re-record each without its back-off (its first checkpoint gave it one).
+            for earlier in backed_off_this_run:
                 results[earlier].ip_block = True
                 await _checkpoint(checkpoint, earlier, results[earlier], True)
         elif result.status == ABORTED:
-            unbroken.append(domain)
+            backed_off_this_run.append(domain)
         if result.status != NOT_REACHED:
             await _checkpoint(checkpoint, domain, result, True)
             if emit is not None:
@@ -452,7 +484,7 @@ async def drive(domains: Sequence[str], run_page: PageFn, merge: MergeFn, *, bud
 
 def exit_code(results: Mapping[str, DomainResult], *, terminated: bool = False) -> int:
     statuses = {r.status for r in results.values()}
-    if any(r.pass_abort for r in results.values()):
+    if any(r.pass_abort for r in results.values()) or IP_THROTTLED in statuses:
         return EXIT_ABORTED_ON_BLOCK
     if statuses & {CRASHED, CURSOR_STUCK}:
         return EXIT_CRASHED
@@ -474,8 +506,8 @@ def cursor_row_for(result: DomainResult, final: bool, now: datetime,
     elif result.status == CURSOR_STUCK:
         row.update(next_cursor=None)
     elif result.status == ABORTED and not (result.pass_abort or result.ip_block):
-        # This store blocked us: skip it for a while, then walk it last. A store aborted inside the
-        # block that stopped the whole pass is not backed off -- that block was the address's.
+        # This store blocked us: skip it for a while, then walk it last. Not in a run whose IP breaker
+        # tripped -- that throttle was the address's.
         row.update(blocked_until=now + backoff)
     elif result.status == CRASHED:
         cursor = result.resume_cursor()
@@ -529,26 +561,36 @@ class _Replay:
 
 
 class BlockStreakClient:
-    """The client handed to the backfill: every GET goes to the real client, and its answer is classified
-    by the backfill's OWN `fetch_product_js` + `_is_block` into two streaks (see BLOCKS in the module
-    docstring): a block adds one to both, `not_json` (a challenge page or a soft-404) touches neither,
-    anything else resets both. `start_store()` resets the store streak.
+    """The client handed to the backfill. For every GET the backfill makes it
 
-    `store_tripped` at the backfill's `CONSECUTIVE_BLOCK_ABORT`; `run_tripped` at `PASS_BLOCK_STORES`
-    times that. Once the store trips, every further GET is answered 429 HERE, with no request sent, and
-    `mirror_page_fn` reports the page aborted (and the pass, when the run streak has tripped too). The
-    client also counts this store's blocks and clean answers, and every clean answer ever
-    (`clean_answers`), for the "no clean answer" and "streak broken" rules."""
+      1. answers 429 LOCALLY (nothing sent) once this store's block count has reached the backfill's
+         `CONSECUTIVE_BLOCK_ABORT` or the run's IP breaker has tripped;
+      2. marks the host Shopify-served (every mirror target is a Tier B Shopify store's products.js)
+         and waits for `crawl_politeness.await_slot`: the host's own interval, any Retry-After /
+         backoff hold `note_response` armed, and the shared Shopify-edge slot (#2474). A slot further
+         out than `max_wait` is NOT sent: answered locally as a non-answer the backfill reads as
+         `not_json` (neutral; nothing written for that row);
+      3. sends it on the real client, then reports the answer with its HEADERS to
+         `crawl_politeness.note_response` (per-host backoff, and the installed IP breaker) and to
+         `shopify_edge_pacer.learn_from_response`;
+      4. classifies it with the backfill's OWN `fetch_product_js` + `_is_block` into this store's
+         count: a block adds one, `not_json` touches nothing, anything else resets it.
 
-    def __init__(self, client: Any, backfill: Any) -> None:
+    `start_store()` resets the per-store counts. The backfill's logic is untouched: it still paces,
+    classifies and aborts exactly as before; this only decides what its `client.get` returns."""
+
+    def __init__(self, client: Any, backfill: Any, *, breaker: Any = None,
+                 max_wait: float = MIRROR_MAX_POLITE_WAIT_S) -> None:
         self._client = client
         self._backfill = backfill
-        self.state = {"store": 0, "run": 0}
+        self.breaker = breaker
+        self.max_wait = max_wait
+        self.state = {"store": 0}
         self.limit = int(backfill.CONSECUTIVE_BLOCK_ABORT)
         self.short_circuited = 0
+        self.not_sent = 0
         self.store_blocks = 0
         self.store_clean = 0
-        self.clean_answers = 0
 
     def start_store(self, _domain: str = "") -> None:
         self.state["store"] = 0
@@ -560,40 +602,52 @@ class BlockStreakClient:
         return self.state["store"] >= self.limit
 
     @property
-    def run_tripped(self) -> bool:
-        return self.state["run"] >= PASS_BLOCK_STORES * self.limit
+    def ip_tripped(self) -> bool:
+        return bool(getattr(self.breaker, "tripped", False))
 
     async def get(self, url: str, **kwargs: Any) -> Any:
-        if self.store_tripped:
+        if self.store_tripped or self.ip_tripped:
             self.short_circuited += 1
             return httpx.Response(429, request=httpx.Request("GET", url))
+        from services import crawl_politeness, shopify_edge_pacer
+
+        shopify_edge_pacer.mark_shopify_host(url)
+        user_agent = str(getattr(self._backfill, "USER_AGENT", "") or "")
+        try:
+            await crawl_politeness.await_slot(url, user_agent=user_agent, max_wait=self.max_wait)
+        except crawl_politeness.CrawlPaced as exc:  # CrawlDelayTooLong and EdgePaced included
+            self.not_sent += 1
+            return httpx.Response(200, headers={"content-type": "text/plain"},
+                                  text=f"not sent: {type(exc).__name__}", request=httpx.Request("GET", url))
         try:
             result: Any = await self._client.get(url, **kwargs)
         except Exception as exc:  # noqa: BLE001 - re-raised below, after it is counted
             result = exc
+        if not isinstance(result, Exception):
+            headers = getattr(result, "headers", None)
+            crawl_politeness.note_response(
+                url, result.status_code,
+                retry_after=headers.get("retry-after") if headers is not None else None, headers=headers)
+            shopify_edge_pacer.learn_from_response(url, headers)
         _payload, outcome = await self._backfill.fetch_product_js(_Replay(result), url)
         if self._backfill._is_block(outcome):
             self.state["store"] += 1
-            self.state["run"] += 1
             self.store_blocks += 1
         elif outcome != "not_json":
             self.state["store"] = 0
-            self.state["run"] = 0
             self.store_clean += 1
-            self.clean_answers += 1
         if isinstance(result, Exception):
             raise result
         return result
 
 
 class ObservedStreak(dict):
-    """The enrichment writer's `block_state` for ONE store, observed into the shared run streak. The
-    writer adds one per block (`block_state["consecutive"] += 1`), sets 0 on a clean answer and leaves
-    it alone for a neutral one; every such write is mirrored into `run["consecutive"]`."""
+    """The enrichment writer's `block_state` for ONE store, carried across that store's pages, with its
+    blocks and clean answers counted. The writer adds one per block (`block_state["consecutive"] += 1`),
+    sets 0 on a clean answer and leaves it alone for a neutral one."""
 
-    def __init__(self, run: Dict[str, int]) -> None:
+    def __init__(self) -> None:
         super().__init__(consecutive=0)
-        self.run = run
         self.blocks = 0
         self.clean = 0
 
@@ -601,11 +655,8 @@ class ObservedStreak(dict):
         if key == "consecutive":
             old = self.get("consecutive", 0)
             if value > old:
-                self.run["consecutive"] += value - old
                 self.blocks += value - old
             elif value == 0:
-                self.run["consecutive"] = 0
-                self.run["clean_answers"] = self.run.get("clean_answers", 0) + 1
                 self.clean += 1
         super().__setitem__(key, value)
 
@@ -621,47 +672,45 @@ def mirror_domains(merchants_path: Optional[str] = None) -> List[str]:
 
 def mirror_page_fn(backfill: Any, client: Any, *, apply: bool, page_size: int = MIRROR_PAGE_SIZE) -> PageFn:
     async def run_page(domain: str, after: Optional[str]) -> Page:
-        clean_before = getattr(client, "clean_answers", 0)
         report = await backfill.run(limit=page_size, domain=domain, apply=apply, client=client, after=after)
         # Fewer candidates than asked for: the domain is walked to its end.
         exhausted = int(report.get("candidates") or 0) < page_size
         # A store walked to its end with blocks and not ONE clean answer was never actually read.
         never_read = (exhausted and getattr(client, "store_blocks", 0) > 0
                       and getattr(client, "store_clean", 0) == 0)
-        # The backfill's own abort, OR the store streak carried across this store's calls reaching the
+        # The backfill's own abort, OR the store count carried across this store's calls reaching the
         # same threshold (the backfill's per-call counter cannot see blocks from earlier calls).
         aborted = (bool(report.get("aborted_on_block")) or bool(getattr(client, "store_tripped", False))
                    or never_read)
-        # The pass stops only when THIS store is blocked too (R2), not on inherited trailing blocks.
-        abort_pass = aborted and bool(getattr(client, "run_tripped", False))
-        cursor = None if (aborted or exhausted) else report.get("next_cursor")
-        return Page(report=report, next_cursor=cursor, aborted=aborted, abort_pass=abort_pass,
-                    run_reset=getattr(client, "clean_answers", 0) > clean_before)
+        abort_pass = bool(getattr(client, "ip_tripped", False))
+        cursor = None if (aborted or abort_pass or exhausted) else report.get("next_cursor")
+        return Page(report=report, next_cursor=cursor, aborted=aborted, abort_pass=abort_pass)
 
     return run_page
 
 
 def enrichment_page_fn(job: Any, db: Any, client: Any, plans: Mapping[str, Any], *, apply: bool, pacer: Any,
-                       run_streak: Dict[str, int], page_products: int = ENRICHMENT_PAGE_PRODUCTS) -> PageFn:
+                       breaker: Any = None, page_products: int = ENRICHMENT_PAGE_PRODUCTS) -> PageFn:
     """One `run_domain` call per page. Each store gets its own `ObservedStreak` (the writer's store
-    streak, carried across that store's pages); every one feeds `run_streak`."""
+    count, carried across that store's pages). The writer's `should_stop` is the IP breaker, so it
+    stops asking the moment the breaker trips."""
     per_store: Dict[str, ObservedStreak] = {}
+
+    def ip_tripped() -> bool:
+        return bool(getattr(breaker, "tripped", False))
 
     async def run_page(domain: str, after: Optional[str]) -> Page:
         limit = job.abort_after_blocks()
-        streak = per_store.setdefault(domain, ObservedStreak(run_streak))
-        clean_before = run_streak.get("clean_answers", 0)
+        streak = per_store.setdefault(domain, ObservedStreak())
         report = await job.run_domain(db, client, plans[domain], apply=apply, source_mode="auto",
                                       limit=page_products, after=after, pacer=pacer,
-                                      block_limit=limit, block_state=streak)
+                                      block_limit=limit, block_state=streak, should_stop=ip_tripped)
         exhausted = bool(report.get("exhausted"))
         never_read = exhausted and streak.blocks > 0 and streak.clean == 0
-        aborted = bool(report.get("aborted_on_block")) or never_read
-        # The pass stops only when THIS store is blocked too (R2), not on inherited trailing blocks.
-        abort_pass = aborted and run_streak["consecutive"] >= PASS_BLOCK_STORES * limit
-        cursor = None if (aborted or exhausted) else report.get("next_cursor")
-        return Page(report=dict(report), next_cursor=cursor, aborted=aborted, abort_pass=abort_pass,
-                    run_reset=run_streak.get("clean_answers", 0) > clean_before)
+        abort_pass = ip_tripped()
+        aborted = (bool(report.get("aborted_on_block")) or never_read) and not abort_pass
+        cursor = None if (aborted or abort_pass or exhausted) else report.get("next_cursor")
+        return Page(report=dict(report), next_cursor=cursor, aborted=aborted, abort_pass=abort_pass)
 
     return run_page
 
@@ -751,28 +800,38 @@ async def run_lane(plan: LanePlan, *, apply: bool, budget_s: float, emit: Callab
         info["backed_off"] = {d: str(cursors[d].blocked_until) for d in backed_off}
         for domain in backed_off:
             state.results[domain] = DomainResult(status=BACKED_OFF)
-        if plan.lane == "mirror":
-            async with httpx.AsyncClient() as raw_client:
-                client = BlockStreakClient(raw_client, plan.writer)
-                try:
-                    await drive(domains, mirror_page_fn(plan.writer, client, apply=apply), merge_mirror,
-                                on_domain_start=client.start_store, **kwargs)
-                finally:
-                    info["block_streak_short_circuited"] = client.short_circuited
-        else:
-            job = plan.writer
-            if apply and not await plan.ensure_proof_table():
-                raise RuntimeError("could not ensure the enrichment proof table")
-            pacer = job.Pacer(job.request_gap_s())
-            run_streak = {"consecutive": 0, "clean_answers": 0}
-            async with job.no_cookie_client() as client:
-                try:
-                    await drive(domains,
-                                enrichment_page_fn(job, db, client, plan.plans, apply=apply, pacer=pacer,
-                                                   run_streak=run_streak),
-                                merge_enrichment, **kwargs)
-                finally:
-                    info["requests"] = pacer.requests
+        from services import crawl_ip_throttle, shopify_edge_pacer
+
+        breaker = crawl_ip_throttle.IpThrottleBreaker(trip_hosts=LANE_IP_TRIP_HOSTS,
+                                                      window_seconds=LANE_IP_TRIP_WINDOW_S, enabled=True)
+        kwargs["stop_signal"] = lambda: breaker.tripped
+        try:
+            with crawl_ip_throttle.installed(breaker):
+                if plan.lane == "mirror":
+                    async with httpx.AsyncClient() as raw_client:
+                        client = BlockStreakClient(raw_client, plan.writer, breaker=breaker)
+                        try:
+                            await drive(domains, mirror_page_fn(plan.writer, client, apply=apply), merge_mirror,
+                                        on_domain_start=client.start_store, **kwargs)
+                        finally:
+                            info["block_streak_short_circuited"] = client.short_circuited
+                            info["not_sent_by_politeness"] = client.not_sent
+                else:
+                    job = plan.writer
+                    if apply and not await plan.ensure_proof_table():
+                        raise RuntimeError("could not ensure the enrichment proof table")
+                    pacer = job.Pacer(job.request_gap_s())
+                    async with job.no_cookie_client() as client:
+                        try:
+                            await drive(domains,
+                                        enrichment_page_fn(job, db, client, plan.plans, apply=apply, pacer=pacer,
+                                                           breaker=breaker),
+                                        merge_enrichment, **kwargs)
+                        finally:
+                            info["requests"] = pacer.requests
+        finally:
+            info["ip_throttle"] = breaker.summary()
+            info["shopify_edge_pacer"] = shopify_edge_pacer.stats()
     finally:
         # A SIGTERM lands here first: print the partial report while the process is still ours and
         # BEFORE the disconnect, which can itself take the grace period.
@@ -792,7 +851,29 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
                         help="REQUIRED: this process egresses by the crawl subnet (pivota-crawl)")
     parser.add_argument("--budget-seconds", type=float, required=True,
                         help="wall-clock budget; once spent no new page starts")
+    parser.add_argument("--only", action="append", default=None, metavar="DOMAIN",
+                        help="walk only this store (repeatable); it must be on the lane's list. For the "
+                             "first dry run, which is ONE small store (docs/runbooks/reap_cart_proofs.md)")
     return parser.parse_args(argv)
+
+
+def restrict(plan: LanePlan, only: Optional[Sequence[str]]) -> LanePlan:
+    """The plan limited to `only`, in the plan's own order. A domain not on the lane's list is refused
+    (MerchantListError: exit 2, nothing attempted), never silently dropped."""
+    if not only:
+        return plan
+    from services.tierb_cart_link_merchants import MerchantListError, normalize_domain
+
+    try:
+        wanted = {normalize_domain(d) for d in only}
+    except ValueError as exc:
+        raise MerchantListError(f"--only: {exc}") from None
+    missing = sorted(wanted - set(plan.domains))
+    if missing:
+        raise MerchantListError(f"--only names stores not on the {plan.lane} lane's list: {missing}")
+    plan.domains = [d for d in plan.domains if d in wanted]
+    plan.plans = {d: p for d, p in plan.plans.items() if d in wanted}
+    return plan
 
 
 def _emit(line: str) -> None:
@@ -845,7 +926,7 @@ def main(argv: Optional[List[str]] = None, *, environ: Optional[Mapping[str, str
     try:
         from services.tierb_cart_link_merchants import MerchantListError
 
-        plan = plan_lane(args.lane, now)
+        plan = restrict(plan_lane(args.lane, now), args.only)
     except (MerchantListError, FileNotFoundError) as exc:
         print(f"REAP_CART_PROOF_ERROR {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return EXIT_BAD_ARGS

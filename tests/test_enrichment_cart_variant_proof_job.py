@@ -1669,3 +1669,77 @@ async def test_a_crawl_paced_request_neither_counts_toward_nor_resets_the_block_
     assert report["domains"][TARTE_HOST]["fetches"] == {"rate_limited": 2, "crawl_paced": 1}
     assert [(r.url.host, r.url.path) for r in store.requests] == [
         (TARTE_HOST, "/products/amazonian-clay-baked-blush.js"), (www, "/products/zz-on-www.js")]
+
+
+# ── the crawl-safety hooks (#2473 breaker, #2474 shared Shopify-edge pacer) ─────────────────────
+
+
+async def test_should_stop_aborts_the_domain_at_the_next_fetch(job_db):
+    """jobs/reap_cart_proof_refresh.py passes its IP-throttle breaker as `should_stop`: once it has
+    tripped, the writer stops asking after the fetch in hand, exactly as a block streak aborts."""
+    await insert_rows(job_db, RUN_TARTE)
+    await insert_rows(job_db, RUN_TARTE_SINGLE)
+    store = Store()
+    store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush")
+    store.js(TARTE_HOST, "front-row-energy-travel-essentials", "tarte_js_amazonian_clay_baked_blush")
+    async with store.client() as client:
+        report = await job.run_domain(job_db, client, TARTE_PLAN, apply=False, source_mode=SOURCE_PRODUCTS_JS,
+                                      limit=job.DEFAULT_LIMIT, after=None, pacer=NoSleepPacer(), block_limit=5,
+                                      block_state={"consecutive": 0}, now=_tick(), should_stop=lambda: True)
+    assert report["aborted_on_block"] is True
+    assert len(store.requests) == 1, "nothing more is asked once should_stop says so"
+    async with store.client() as client:
+        report = await job.run_domain(job_db, client, TARTE_PLAN, apply=False, source_mode=SOURCE_PRODUCTS_JS,
+                                      limit=job.DEFAULT_LIMIT, after=None, pacer=NoSleepPacer(), block_limit=5,
+                                      block_state={"consecutive": 0}, now=_tick(), should_stop=lambda: False)
+    assert report["aborted_on_block"] is False
+
+
+async def test_the_breaker_hears_the_requested_hosts_answer_with_its_headers():
+    """note_response gets the response headers (so an installed IP breaker counts the throttle), for the
+    URL actually requested only: after a redirect to the www twin, one store is ONE throttling host."""
+    from services import crawl_ip_throttle
+
+    store = Store()
+    store.routes[("brand.ecvpjob.test", "/products/h.js")] = ("redirect", "https://www.brand.ecvpjob.test")
+    store.routes[("www.brand.ecvpjob.test", "/products/h.js")] = (429, None, [], [("retry-after", "30")])
+    breaker = crawl_ip_throttle.IpThrottleBreaker(trip_hosts=2, window_seconds=600)
+    with crawl_ip_throttle.installed(breaker):
+        async with store.client() as client:
+            fetched = await job.fetch_json(client, "https://brand.ecvpjob.test/products/h.js",
+                                           requested_host="brand.ecvpjob.test", pacer=NoSleepPacer(), now=_tick())
+    assert fetched.outcome == "rate_limited"
+    assert breaker.throttled_hosts == {"www.brand.ecvpjob.test"}, breaker.throttled_hosts
+    assert breaker.summary()["throttle_diagnostics"]["retry_after"] == {"30": 1}
+    assert not breaker.tripped
+
+
+async def test_every_request_is_marked_shopify_and_takes_a_shared_edge_slot(monkeypatch):
+    """With CRAWL_SHOPIFY_EDGE_PACER_ENABLED, the writer's hosts are Shopify-served from the FIRST
+    request (it only ever asks Shopify endpoints), so every request takes a slot of the shared budget."""
+    from services import shopify_edge_pacer
+
+    monkeypatch.setenv("CRAWL_SHOPIFY_EDGE_PACER_ENABLED", "true")
+    shopify_edge_pacer.reset_for_tests()
+    leases: List[int] = []
+
+    async def lease(bucket, *, slots, rate_per_s):
+        leases.append(slots)
+        return 0.0, 0.0
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(shopify_edge_pacer, "_lease_fn", lease)
+    monkeypatch.setattr(shopify_edge_pacer, "_sleep", no_sleep)
+    try:
+        store = Store()
+        store.js(TARTE_HOST, "amazonian-clay-baked-blush", "tarte_js_amazonian_clay_baked_blush")
+        async with store.client() as client:
+            for _ in range(3):
+                await job.fetch_json(client, job.product_js_url(TARTE_HOST, "amazonian-clay-baked-blush", "US"),
+                                     requested_host=TARTE_HOST, pacer=NoSleepPacer(), now=_tick())
+        assert shopify_edge_pacer.is_shopify_host(TARTE_HOST)
+        assert shopify_edge_pacer.stats()["granted"] == 3 and leases
+    finally:
+        shopify_edge_pacer.reset_for_tests()

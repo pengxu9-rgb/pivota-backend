@@ -269,10 +269,13 @@ def test_a_failed_resume_fails_the_script(tmp_path):
     assert proc.returncode == 1 and "FAILED to resume" in proc.stderr
 
 
-def test_the_env_is_exactly_the_gate_the_db_guardrails_and_the_plumbing(tmp_path):
-    """Nothing else: no REAP key (writing a proof needs none), no pacing override (the timeouts are
-    sized from the writers' defaults), no second vantage."""
-    _proc, calls = _run(tmp_path, "prod", TAG)
+@pytest.mark.parametrize("flag, gate", [((), "false"), (("--enable",), "true")])
+def test_the_env_is_exactly_the_gate_the_db_guardrails_the_plumbing_and_the_shared_pacer(tmp_path, flag, gate):
+    """Nothing else: no REAP key (writing a proof needs none), no writer pacing override (the timeouts
+    are sized from the writers' defaults), no second vantage. The shared Shopify-edge pacer (#2474) is
+    ON for both jobs whether dark or armed -- a dry run fetches exactly as hard -- with the smallest
+    lease (these lanes send ~1 request / 3 s; a lease of 10 would hold 5 s of the shared schedule)."""
+    _proc, calls = _run(tmp_path, "prod", TAG, *flag)
     for name in JOBS:
         job = _one(calls, "run", "jobs", "create", name)
         assert _flag(job, "--set-secrets") == "DATABASE_URL=DATABASE_URL:latest"
@@ -280,8 +283,20 @@ def test_the_env_is_exactly_the_gate_the_db_guardrails_and_the_plumbing(tmp_path
             "PIVOTA_ENV": "production", "PIVOTA_SERVICE_NAME": name, "PIVOTA_COMMIT_SHA": TAG,
             "DB_POOL_MIN_SIZE": "1", "DB_POOL_MAX_SIZE": "2",
             "DB_STATEMENT_TIMEOUT_SECONDS": "30", "DB_COMMAND_TIMEOUT_SECONDS": "600",
-            "REAP_CART_PROOF_APPLY": "false",
+            "REAP_CART_PROOF_APPLY": gate,
+            "CRAWL_SHOPIFY_EDGE_PACER_ENABLED": "true", "CRAWL_SHOPIFY_EDGE_LEASE": "2",
         }
+
+
+def test_the_pacer_env_names_are_the_pacers_own():
+    """The setup script's names must be the ones services/shopify_edge_pacer.py reads, and the lease must
+    be one it accepts unclamped."""
+    from services import shopify_edge_pacer
+
+    text = SCRIPT.read_text()
+    assert f"{shopify_edge_pacer.ENABLED_ENV}=true" in text
+    assert f"{shopify_edge_pacer.LEASE_ENV}=2" in text
+    assert shopify_edge_pacer._LEASE_MIN <= 2 <= shopify_edge_pacer._LEASE_MAX
 
 
 def test_args_name_the_wrapper_lane_the_egress_flag_and_the_budget_in_the_equals_form(tmp_path):
@@ -350,8 +365,43 @@ def test_the_mirror_timeout_covers_the_budget_plus_one_page(tmp_path):
 
     _proc, calls = _run(tmp_path, "prod", TAG)
     timeout, budget, _ = _job_numbers(calls, "reap-cart-proof-mirror")
-    one_page = refresh.MIRROR_PAGE_SIZE * (backfill.PER_DOMAIN_MIN_GAP_S + backfill.REQUEST_TIMEOUT_S)
+    # With the politeness gate in front of every request, a request can wait up to
+    # MIRROR_MAX_POLITE_WAIT_S before it is sent (or given up), then take the request timeout.
+    one_page = refresh.MIRROR_PAGE_SIZE * (backfill.PER_DOMAIN_MIN_GAP_S + refresh.MIRROR_MAX_POLITE_WAIT_S
+                                           + backfill.REQUEST_TIMEOUT_S)
     assert timeout >= budget + one_page, (timeout, budget, one_page)
+
+
+#: Prod census, 2026-09-30, read-only (scripts/ops/run_oneoff_job.sh, the backfill's own eligibility
+#: SQL, counts only): mirror candidates over the 42 Tier B domains. Re-measure before changing the budget.
+MIRROR_CANDIDATES_CENSUS = 2092
+
+
+def test_the_mirror_budget_covers_the_measured_candidates_with_headroom(tmp_path):
+    """The lane walks stores one at a time at the backfill's per-store gap; the budget must cover every
+    measured candidate at that pace, plus the inter-call gaps, with at least 1.5x headroom."""
+    import jobs.reap_cart_proof_refresh as refresh
+    from scripts import backfill_shopify_variant_ids as backfill
+
+    _proc, calls = _run(tmp_path, "prod", TAG)
+    _timeout, budget, _ = _job_numbers(calls, "reap-cart-proof-mirror")
+    gap = refresh.inter_call_gap_s("mirror", backfill=backfill)
+    calls_needed = MIRROR_CANDIDATES_CENSUS // refresh.MIRROR_PAGE_SIZE + 42
+    need = MIRROR_CANDIDATES_CENSUS * backfill.PER_DOMAIN_MIN_GAP_S + calls_needed * gap
+    assert budget >= 1.5 * need, (budget, need)
+
+
+def test_the_shared_edge_budget_cannot_slow_either_lane_below_its_own_pacing():
+    """Re-derived at 2 req/s shared: each lane sends one request per 3 s (0.33 req/s), under the pacer's
+    fail-open LOCAL rate (a quarter of the shared rate), let alone the shared rate itself. So the
+    timeouts, sized from each writer's own pacing, still hold with the pacer on."""
+    import jobs.enrichment_cart_variant_proof as writer
+    from scripts import backfill_shopify_variant_ids as backfill
+    from services import shopify_edge_pacer
+
+    assert shopify_edge_pacer.rate() == 2.0
+    for lane_gap in (backfill.PER_DOMAIN_MIN_GAP_S, writer.request_gap_s({})):
+        assert 1.0 / lane_gap <= shopify_edge_pacer.fallback_rate() <= shopify_edge_pacer.rate()
 
 
 def test_a_daily_run_keeps_each_proof_inside_its_validity(tmp_path):
