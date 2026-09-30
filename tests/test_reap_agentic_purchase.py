@@ -3791,6 +3791,25 @@ async def test_a_create_returning_another_buyers_enrollment_fails_and_touches_no
     assert await _pending_count() == 0
 
 
+async def test_a_create_returning_another_buyers_ACTIVE_card_never_quotes_on_it(reap):
+    """FAIL CLOSED, the case that matters: the holder is another buyer's ACTIVE card. Quoting on
+    it would charge THEIR card for OUR buyer's purchase. Refused by name; their row untouched."""
+    theirs = "55555555-5555-5555-5555-555555555555"
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id, "
+        "card_last4) VALUES ('re_bobs_card', 'bref_bob', 'active', :r, '1111')",
+        {"r": theirs},
+    )
+    reap.create_enrollment = _ok(_enrollment_requires_action(theirs))
+    purchase = await _start()
+    result = await _step(purchase)
+    assert (result.state, result.last_error_code) == ("failed", "enrollment_id_conflict")
+    assert (await _get(purchase))["enrollment_id"] != "re_bobs_card"
+    assert reap.named("create_checkout") == []
+    bob = await ledger.get_active_enrollment("bref_bob")
+    assert (bob["id"], bob["card_last4"]) == ("re_bobs_card", "1111")
+
+
 async def test_a_create_returning_this_buyers_active_enrollment_quotes_on_it(reap):
     """The holder became this buyer's ACTIVE card while we were creating (a concurrent step
     activated it). The purchase quotes on that card; our attempt is retired."""
