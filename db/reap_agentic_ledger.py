@@ -177,9 +177,18 @@ __all__ = [
     "expire_overdue_purchases",
     "fail_exhausted_purchases",
     "upsert_pending_enrollment",
+    "PendingEnrollmentExpired",
+    "EnrollmentIdConflict",
+    "PendingEnrollmentTaken",
+    "HOSTED_SESSION_SECONDS",
+    "get_pending_enrollments",
     "mark_enrollment_active",
     "mark_enrollment_dead",
     "get_active_enrollment",
+    # Keyed on `buyer_ref`, like `get_active_enrollment`; see its docstring.
+    "get_pending_enrollment",
+    "ENROLLMENT_GRACE_SECONDS_DEFAULT",
+    "ENROLLMENT_GRACE_SECONDS_MAX",
     # WP4c. Exported because its caller is OUTSIDE this rail — routes/buyer_api, the hosted
     # checkout — and it is scoped by construction: it takes a buyer id and touches only what
     # hangs off that buyer id. Nothing it returns identifies anybody (see `RetireReport`).
@@ -1410,6 +1419,17 @@ async def list_purchases_for_owner(
 # Both occurrences are VALUE positions of the same column type, so Postgres deduces one type for
 # them; the split that statement needs is between a value being assigned and a value being
 # compared, which is not what this is. The PREPARE gate is what actually confirms it.
+# ── A ROW ENTERING 'quoting' CARRIES NO HOSTED LINK ────────────────────────────────────────
+#
+# `hosted_url` / `hosted_url_expires_at` are CLEARED on any transition INTO 'quoting', and that
+# is a rule about the target state, not a field a caller remembers to pass. The link a row
+# carries into 'quoting' can only be the ENROLLMENT page it just finished with (from
+# 'needs_enrollment') or nothing (from 'resolving'); the approval page does not exist until
+# 'awaiting_approval' writes it. Keeping the spent enrollment link made the row say something
+# false — a live-looking page and an expiry belonging to a state the purchase had left — and an
+# expiry is exactly what `expire_overdue_purchases` acts on. `transition` REFUSES a caller that
+# passes either field with to_state='quoting', so the CASE never silently drops a value.
+#
 _TRANSITION_SQL = """
     UPDATE reap_agentic_purchases
        SET state = :to_state,
@@ -1439,8 +1459,10 @@ _TRANSITION_SQL = """
            tax_included = COALESCE(:tax_included, tax_included),
            offer_code_outcome = COALESCE(:offer_code_outcome, offer_code_outcome),
            discount_minor = COALESCE(:discount_minor, discount_minor),
-           hosted_url = COALESCE(:hosted_url, hosted_url),
-           hosted_url_expires_at = COALESCE(:hosted_url_expires_at, hosted_url_expires_at),
+           hosted_url = CASE WHEN :to_state_probe = 'quoting'
+                THEN NULL ELSE COALESCE(:hosted_url, hosted_url) END,
+           hosted_url_expires_at = CASE WHEN :to_state_probe = 'quoting'
+                THEN NULL ELSE COALESCE(:hosted_url_expires_at, hosted_url_expires_at) END,
            refusal_reason = COALESCE(:refusal_reason, refusal_reason),
            queries_tried = COALESCE(CAST(:queries_tried AS JSONB), CAST(queries_tried AS JSONB)),
            last_error_code = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
@@ -1495,8 +1517,10 @@ _TRANSITION_SQL_SQLITE = """
            tax_included = COALESCE(:tax_included, tax_included),
            offer_code_outcome = COALESCE(:offer_code_outcome, offer_code_outcome),
            discount_minor = COALESCE(:discount_minor, discount_minor),
-           hosted_url = COALESCE(:hosted_url, hosted_url),
-           hosted_url_expires_at = COALESCE(:hosted_url_expires_at, hosted_url_expires_at),
+           hosted_url = CASE WHEN :to_state_probe = 'quoting'
+                THEN NULL ELSE COALESCE(:hosted_url, hosted_url) END,
+           hosted_url_expires_at = CASE WHEN :to_state_probe = 'quoting'
+                THEN NULL ELSE COALESCE(:hosted_url_expires_at, hosted_url_expires_at) END,
            refusal_reason = COALESCE(:refusal_reason, refusal_reason),
            queries_tried = COALESCE(:queries_tried, queries_tried),
            last_error_code = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
@@ -1610,6 +1634,13 @@ async def transition(
     unknown = [key for key in fields if key not in _TRANSITION_FIELDS]
     if unknown:
         raise TypeError(f"transition() got unexpected field(s): {', '.join(sorted(unknown))}")
+    if to_state == "quoting" and any(
+        fields.get(column) is not None for column in ("hosted_url", "hosted_url_expires_at")
+    ):
+        # The statement CLEARS both on the way into 'quoting' (see the note on _TRANSITION_SQL);
+        # a caller passing one expects it stored, and a silently dropped write is the thing this
+        # function refuses everywhere else.
+        raise ValueError("a transition into 'quoting' clears the hosted link; do not pass one")
     _require_offer_code_outcome(fields.get("offer_code_outcome"))
     tax_included = fields.get("tax_included")
     if tax_included is not None and not isinstance(tax_included, bool):
@@ -1739,11 +1770,22 @@ _SELECT_DUE_PURCHASES_SQL_SQLITE = """
 # a coupling between two packages that nothing would check. `expire_overdue_purchases` is what
 # bounds the waiting states, on a clock rather than a counter, which is the right instrument for
 # waiting on a person.
+#
+# ONE MORE WAIT ON A PERSON, IN 'resolving': a row the purchase service RELEASED with
+# `last_error_code = 'enrollment_settling'` is holding because the buyer's pending enrollment
+# link has just died and Reap may still turn it ACTIVE (it flips at or after the session's
+# expiry; services/reap_agentic_purchase._decide_pending). That hold re-checks every 30 s for up
+# to `MIN_LINK_LIFETIME_SECONDS + REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS`, and counting it would
+# fail the purchase `attempts_exhausted` BEFORE the grace ends once the grace dial is large
+# (3600 s = 122 claims against a default ceiling of 50; review of #2483, P2-3). It is bounded on
+# a clock instead — the service stops holding when the link's expiry + grace has passed — so the
+# claim is exempt. Any other code on a 'resolving' row (a transport error, anything) counts.
 _CLAIM_PURCHASE_SQL = """
     UPDATE reap_agentic_purchases
        SET claimed_by = :worker_id,
            claimed_at = clock_timestamp(),
            attempts = CASE WHEN state IN ('awaiting_approval', 'needs_enrollment')
+                  OR (state = 'resolving' AND last_error_code = 'enrollment_settling')
                 THEN attempts ELSE attempts + 1 END,
            updated_at = clock_timestamp()
      WHERE id = :id
@@ -1759,6 +1801,7 @@ _CLAIM_PURCHASE_SQL_SQLITE = """
        SET claimed_by = :worker_id,
            claimed_at = CURRENT_TIMESTAMP,
            attempts = CASE WHEN state IN ('awaiting_approval', 'needs_enrollment')
+                  OR (state = 'resolving' AND last_error_code = 'enrollment_settling')
                 THEN attempts ELSE attempts + 1 END,
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
@@ -2046,11 +2089,29 @@ async def requeue_stale_claims(*, lease_seconds: int = 300, limit: int = 50) -> 
 # separately, that test watched a tuple the SQL never read, and adding 'processing' to the expire
 # sweep's list — expiring a purchase the buyer had ALREADY APPROVED — survived both dialects.
 
+#: THE ENROLLMENT GRACE, in seconds: how long after a 'needs_enrollment' purchase's
+#: `hosted_url_expires_at` the expire sweep still leaves it alone. See the clock note below and
+#: `expire_overdue_purchases`. The ENV dial (REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS) is read by
+#: `services.reap_agentic_purchase.enrollment_grace_seconds`, which falls back to THIS number —
+#: one default, owned here because the ledger cannot import the service.
+ENROLLMENT_GRACE_SECONDS_DEFAULT = 180
+#: The largest grace either reader accepts. Above an hour the grace would outlive the absolute
+#: `max_age` fallback's own default, and the dial would stop meaning anything.
+ENROLLMENT_GRACE_SECONDS_MAX = 3600
+
 # The expire sweep takes a row on EITHER of two clocks, and the second one is the reason the
 # first is not enough:
 #
 #   hosted_url_expires_at — Reap told us when the approval page dies. Precise, and absent
 #                           whenever we never got a hosted URL, or got one without an expiry.
+#                           For 'needs_enrollment' the clock carries a GRACE
+#                           (`enrollment_grace_seconds`, default 180): Reap flips an
+#                           enrollment to ACTIVE at or AFTER its hosted session's expiry
+#                           (staging 2026-09-30: completed ~11:23, still REQUIRES_ACTION
+#                           until 11:36:43, 9 s past the 11:36:34 expiry). Without the grace
+#                           the sweep expired the purchase before the poller could see the
+#                           card it was waiting for. 'awaiting_approval' gets NO grace: there
+#                           the QUOTE dies at Reap's expiry, so nothing can arrive after it.
 #   updated_at + max_age  — the ABSOLUTE fallback. Without it a row in 'needs_enrollment' or
 #                           'awaiting_approval' with a NULL hosted_url_expires_at is never
 #                           expired by anything, and keeps the buyer's address and email
@@ -2074,8 +2135,13 @@ _EXPIRE_OVERDUE_SQL = """
         SELECT id FROM reap_agentic_purchases
          WHERE state IN ('needs_enrollment', 'awaiting_approval')
            AND (
-                (hosted_url_expires_at IS NOT NULL
+                (state = 'awaiting_approval'
+                 AND hosted_url_expires_at IS NOT NULL
                  AND hosted_url_expires_at < clock_timestamp())
+                OR (state = 'needs_enrollment'
+                 AND hosted_url_expires_at IS NOT NULL
+                 AND hosted_url_expires_at
+                     < clock_timestamp() - (:enrollment_grace_seconds * INTERVAL '1 second'))
                 OR state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
            )
          ORDER BY state_entered_at ASC, id ASC
@@ -2101,8 +2167,12 @@ _EXPIRE_OVERDUE_SQL_SQLITE = """
         SELECT id FROM reap_agentic_purchases
          WHERE state IN ('needs_enrollment', 'awaiting_approval')
            AND (
-                (hosted_url_expires_at IS NOT NULL
+                (state = 'awaiting_approval'
+                 AND hosted_url_expires_at IS NOT NULL
                  AND hosted_url_expires_at < CURRENT_TIMESTAMP)
+                OR (state = 'needs_enrollment'
+                 AND hosted_url_expires_at IS NOT NULL
+                 AND hosted_url_expires_at < datetime('now', :enrollment_grace_window))
                 OR state_entered_at < datetime('now', :max_age_window)
            )
          ORDER BY state_entered_at ASC, id ASC
@@ -2243,7 +2313,10 @@ def _sweep_limit(limit: Any) -> int:
 
 
 async def expire_overdue_purchases(
-    *, max_age_seconds: int = 3600, limit: int = 200
+    *,
+    max_age_seconds: int = 3600,
+    limit: int = 200,
+    enrollment_grace_seconds: int = ENROLLMENT_GRACE_SECONDS_DEFAULT,
 ) -> List[str]:
     """Expire purchases waiting on a buyer who never came back; return the ids that moved.
 
@@ -2261,6 +2334,18 @@ async def expire_overdue_purchases(
     is exempt in both waiting states, and 'needs_enrollment' has no hosted URL of its own at all.
     `state_entered_at` moves only when the STATE moves, which is a clock the poller cannot reset.
 
+    THE ENROLLMENT GRACE. In 'needs_enrollment' the hosted-expiry clock fires
+    `enrollment_grace_seconds` AFTER `hosted_url_expires_at`, not at it — Reap turns an
+    enrollment ACTIVE at or after its hosted session dies (measured on staging 2026-09-30:
+    9 s after), so a sweep on the exact expiry terminated purchases whose card had just been
+    enrolled, before the poller could read it. 'awaiting_approval' keeps Reap's exact expiry:
+    there the QUOTE dies then, and no approval can land after it. The absolute
+    `state_entered_at + max_age_seconds` fallback is unchanged and still bounds both states.
+    The production caller (jobs/reap_agentic_purchase_poll.py) passes
+    `services.reap_agentic_purchase.enrollment_grace_seconds()`, which reads
+    REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS; the default here is the same number, so a caller
+    that passes nothing gets the grace rather than the bug. 0 means "Reap's exact expiry".
+
     BOUNDED. At most `limit` rows per call; loop until fewer than `limit` come back. An unbounded
     UPDATE on first arming locks every qualifying row at once, on a Postgres serving live
     traffic.
@@ -2272,15 +2357,26 @@ async def expire_overdue_purchases(
     poller must treat None from `transition_as_holder` as "re-read", never as "retry harder".
     """
     seconds = _require_int(max_age_seconds, "max_age_seconds", minimum=60)
+    grace = _require_int(
+        enrollment_grace_seconds,
+        "enrollment_grace_seconds",
+        minimum=0,
+        maximum=ENROLLMENT_GRACE_SECONDS_MAX,
+    )
     capped = _sweep_limit(limit)
     if IS_POSTGRES:
         rows = await database.fetch_all(
-            _EXPIRE_OVERDUE_SQL, {"max_age_seconds": seconds, "limit": capped}
+            _EXPIRE_OVERDUE_SQL,
+            {"max_age_seconds": seconds, "enrollment_grace_seconds": grace, "limit": capped},
         )
     else:
         rows = await database.fetch_all(
             _EXPIRE_OVERDUE_SQL_SQLITE,
-            {"max_age_window": f"-{seconds} seconds", "limit": capped},
+            {
+                "max_age_window": f"-{seconds} seconds",
+                "enrollment_grace_window": f"-{grace} seconds",
+                "limit": capped,
+            },
         )
     return [str(r["id"]) for r in rows]
 
@@ -2327,11 +2423,54 @@ async def fail_exhausted_purchases(
 
 # ── enrollments ──────────────────────────────────────────────────────────────────────────────
 
-_SELECT_PENDING_ENROLLMENT_SQL = """
-    SELECT * FROM reap_agentic_enrollments
+# THE BUYER'S PENDING ENROLLMENTS, AND WHETHER EACH ONE'S HOSTED LINK IS ALREADY DEAD.
+#
+# `hosted_url_expired` is computed HERE, on the server's clock (property 4), because it is the
+# guard `upsert_pending_enrollment` refuses on and a guard must not depend on the clock of
+# whichever pod happens to run it. A row that HAS a link but NO recorded expiry (Reap's
+# `expiresAt` is spec-optional, and `_parse_ts` answers None on a format it cannot read) is
+# judged against `created_at + :session_seconds` — Reap's hosted-session lifetime — rather than
+# treated as live for ever: that was a dead link replayed to every later purchase (review of
+# #2483, P2-2). A row with no link at all (a create whose response was lost) is never "expired":
+# its replay is how the lost response is recovered.
+#
+# EVERY pending row, OLDEST FIRST, not "the newest one". One pending row per buyer is what the
+# rail wants and what `uq_reap_agentic_enrollments_one_pending` (migration 252) enforces — but
+# on a database where that index is not yet applied (production applies migrations by hand; the
+# self-heal creates it at startup and skips it if duplicates already exist), two purchases of
+# one buyer can each mint one. Returning only the newest then left the older one — possibly the
+# one the buyer finished — pending here and ACTIVE at Reap: the stranding #2483 fixes. So the
+# caller sees them all and reconciles every one; the order is DETERMINISTIC (created_at, then
+# id), which "newest by created_at DESC" inside one second was not.
+_SELECT_PENDING_ENROLLMENTS_SQL = """
+    SELECT id, buyer_ref, agent_id, reap_enrollment_id, status, reap_status,
+           hosted_url, hosted_url_expires_at, card_network, card_last4,
+           created_at, updated_at,
+           CASE WHEN hosted_url_expires_at IS NOT NULL
+                THEN CASE WHEN hosted_url_expires_at <= clock_timestamp() THEN 1 ELSE 0 END
+                WHEN hosted_url IS NOT NULL
+                THEN CASE WHEN created_at
+                               <= clock_timestamp() - (:session_seconds * INTERVAL '1 second')
+                          THEN 1 ELSE 0 END
+                ELSE 0 END AS hosted_url_expired
+      FROM reap_agentic_enrollments
      WHERE buyer_ref = :buyer_ref AND status = 'pending'
-     ORDER BY created_at DESC, id DESC
-     LIMIT 1
+     ORDER BY created_at ASC, id ASC
+"""
+
+_SELECT_PENDING_ENROLLMENTS_SQL_SQLITE = """
+    SELECT id, buyer_ref, agent_id, reap_enrollment_id, status, reap_status,
+           hosted_url, hosted_url_expires_at, card_network, card_last4,
+           created_at, updated_at,
+           CASE WHEN hosted_url_expires_at IS NOT NULL
+                THEN CASE WHEN hosted_url_expires_at <= CURRENT_TIMESTAMP THEN 1 ELSE 0 END
+                WHEN hosted_url IS NOT NULL
+                THEN CASE WHEN created_at <= datetime('now', :session_window)
+                          THEN 1 ELSE 0 END
+                ELSE 0 END AS hosted_url_expired
+      FROM reap_agentic_enrollments
+     WHERE buyer_ref = :buyer_ref AND status = 'pending'
+     ORDER BY created_at ASC, id ASC
 """
 
 _UPDATE_PENDING_ENROLLMENT_SQL = """
@@ -2537,6 +2676,127 @@ _SELECT_ENROLLMENT_BY_REAP_ID_SQL = """
 """
 
 
+#: Reap's hosted-session lifetime, in seconds: how long an enrollment's hosted link lives when
+#: Reap does not say. Measured, not assumed: every enrollment `nextAction.expiresAt` seen on
+#: staging (2026-09-30, 04:05 and 11:21 attempts) was created + 15 min, the same 15 min the
+#: approval page carries (see APPROVAL_WINDOW_LAPSED in the service), and
+#: `services.reap_agentic_client.create_enrollment` states the same "about fifteen minutes". Used
+#: ONLY for a link that arrived WITHOUT an expiry — a recorded `expiresAt` always wins.
+HOSTED_SESSION_SECONDS = 900
+
+
+class PendingEnrollmentExpired(RuntimeError):
+    """`upsert_pending_enrollment` found a pending enrollment for the buyer whose hosted link is
+    already DEAD. It refuses to hand that row back as "the" attempt.
+
+    WHY A RAISE AND NOT A FRESH ROW. The only safe thing to do with a pending row whose link has
+    expired depends on what REAP says about it, and this module never talks to Reap: on staging
+    2026-09-30 exactly such a row was ACTIVE at Reap (the buyer finished; Reap flipped it 9 s
+    after the link's expiry). Retiring it here would orphan a live card authorization; handing it
+    back replays the dead link (the attempt id is the row id, so `create_enrollment` returns the
+    SAME enrollment and its dead page); minting a second pending row breaks "one pending per
+    buyer". So the caller must RECONCILE first — read Reap, then `mark_enrollment_active` or
+    `mark_enrollment_dead` — and call again. `enrollment_id` names the row to reconcile.
+    """
+
+    def __init__(self, enrollment_id: str):
+        super().__init__(
+            f"pending enrollment {enrollment_id} has an expired hosted link; reconcile it with "
+            "Reap (mark it active or dead) before minting another attempt"
+        )
+        self.enrollment_id = enrollment_id
+
+
+class EnrollmentIdConflict(RuntimeError):
+    """Reap handed back an enrollment id that ANOTHER row of ours already holds.
+
+    `uq_reap_agentic_enrollments_reap_id` (migration 224) refused the write. Found by the review
+    of #2483 (P1-1): retiring a pending row keeps its `reap_enrollment_id`, so a fresh mint whose
+    create answer carries THAT id (Reap de-duplicating by owner, or an open session for the
+    owner) raised a raw IntegrityError out of `advance` on every poll, for every later purchase
+    of that buyer, until the attempt ceiling. Now it is this, named, and it carries what the
+    caller needs to decide:
+
+        enrollment_id  the row we were writing (our attempt); None when the write was an INSERT
+        holder         the row that already holds the partner id, in the by-reap-id projection
+    """
+
+    def __init__(self, enrollment_id: Optional[str], holder: Dict[str, Any]):
+        super().__init__(
+            f"reap enrollment id is already held by enrollment {holder.get('id')} "
+            f"(status {holder.get('status')}); not written onto {enrollment_id}"
+        )
+        self.enrollment_id = enrollment_id
+        self.holder = holder
+
+
+class PendingEnrollmentTaken(RuntimeError):
+    """An INSERT that carried a partner's answer was refused by
+    `uq_reap_agentic_enrollments_one_pending`: another pending row for this buyer exists
+    (`winner_id`). Raised rather than returning the winner, because returning it would silently
+    drop the partner id and link the caller asked to store. A caller that carries NO partner
+    fields is handed the winner instead (that is the ordinary two-purchases-one-buyer race)."""
+
+    def __init__(self, winner_id: str):
+        super().__init__(f"the buyer already has pending enrollment {winner_id}")
+        self.winner_id = winner_id
+
+
+async def get_pending_enrollments(buyer_ref: str) -> List[Dict[str, Any]]:
+    """EVERY pending enrollment of the buyer, OLDEST FIRST. A READ; it writes nothing.
+
+    Each row carries `hosted_url_expired` (bool, SERVER clock; see the note on the statement for
+    the no-expiry rule) next to `id, buyer_ref, agent_id, reap_enrollment_id, status,
+    reap_status, hosted_url, hosted_url_expires_at, card_network, card_last4, created_at,
+    updated_at` — the whole row, as the `SELECT *` this replaced returned. It is what the
+    purchase service reads before it mints an enrollment: a pending row that already has a
+    `reap_enrollment_id` has been handed to a buyer, and the buyer may have FINISHED it, so it
+    is reconciled with Reap rather than replayed or abandoned. Normally zero or one row; more
+    only on a database without migration 252's index (see the statement).
+
+    Exported for the same reason `get_active_enrollment` is: it is keyed on `buyer_ref`, which we
+    minted and which a caller has already proved is theirs.
+    """
+    ref = _require_lookup_id(buyer_ref, "buyer_ref")
+    if IS_POSTGRES:
+        rows = await database.fetch_all(
+            _SELECT_PENDING_ENROLLMENTS_SQL,
+            {"buyer_ref": ref, "session_seconds": HOSTED_SESSION_SECONDS},
+        )
+    else:
+        rows = await database.fetch_all(
+            _SELECT_PENDING_ENROLLMENTS_SQL_SQLITE,
+            {"buyer_ref": ref, "session_window": f"-{HOSTED_SESSION_SECONDS} seconds"},
+        )
+    out = []
+    for row in rows:
+        item = _enrollment(row)
+        if item is not None:
+            item["hosted_url_expired"] = bool(item.get("hosted_url_expired"))
+            out.append(item)
+    return out
+
+
+async def get_pending_enrollment(buyer_ref: str) -> Optional[Dict[str, Any]]:
+    """The buyer's OLDEST pending enrollment, or None — `get_pending_enrollments(buyer_ref)[0]`.
+
+    Oldest, deterministically, not "newest": see `get_pending_enrollments`. A caller that must
+    not miss a second pending row (the purchase service) reads the list.
+    """
+    rows = await get_pending_enrollments(buyer_ref)
+    return rows[0] if rows else None
+
+
+async def _holder_of(reap_enrollment_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not reap_enrollment_id:
+        return None
+    return _enrollment(
+        await database.fetch_one(
+            _SELECT_ENROLLMENT_BY_REAP_ID_SQL, {"reap_enrollment_id": reap_enrollment_id}
+        )
+    )
+
+
 async def upsert_pending_enrollment(
     *,
     buyer_ref: str,
@@ -2549,10 +2809,39 @@ async def upsert_pending_enrollment(
 ) -> Dict[str, Any]:
     """Mint or refresh the buyer's PENDING enrollment.
 
-    Upsert rather than insert because the hosted page EXPIRES: a buyer who opens the enrol link,
-    walks away, and comes back needs a new hosted_url on the row that is already pending, not a
-    second pending row. Existing 'active' and 'dead' rows are untouched — this only ever refreshes
-    a pending one.
+    Upsert rather than insert so a buyer has AT MOST ONE pending row: a second call for the same
+    buyer finds the pending row and refreshes it rather than minting another. Existing 'active'
+    and 'dead' rows are untouched — this only ever refreshes a pending one.
+
+    ── WITHOUT `enrollment_id`: "WHICH ATTEMPT IS THIS?" ───────────────────────────────────
+
+    The row returned is the ATTEMPT: its id is the `attempt_id` the partner's idempotency key is
+    built from, so returning an existing row means "replay that attempt". That is right for a
+    row whose create never came back (a lost response is recovered by the replay) and for a
+    row whose hosted link is still live. It is WRONG for a row whose link has already expired —
+    the replay hands back the same dead page (staging 2026-09-30, purchases B and C). So when the
+    buyer's pending row has `hosted_url_expires_at` in the past (SERVER clock), this RAISES
+    `PendingEnrollmentExpired` instead of returning it. See that class for why neither minting a
+    second row nor retiring this one is safe here. A pending row with NO expiry recorded is
+    returned as before: nothing says its link is dead.
+
+    With several pending rows (a database without migration 252's index), the OLDEST is the
+    attempt, and ANY dead link among them raises — see `_the_attempt`.
+
+    ── WITH `enrollment_id`: "WRITE WHAT THE PARTNER SAID ONTO THIS ATTEMPT" ───────────────
+
+    No expiry check — the caller already holds the attempt and is recording the create's answer.
+
+    ── THE TWO UNIQUE INDEXES, AND WHAT EACH REFUSAL BECOMES ────────────────────────────────
+
+    uq_reap_agentic_enrollments_reap_id     the partner id is already on ANOTHER row of ours
+                                            -> `EnrollmentIdConflict` (with that row). Never a
+                                            raw driver error (review of #2483, P1-1).
+    uq_reap_agentic_enrollments_one_pending the buyer already has a pending row (a concurrent
+                                            mint won) -> the WINNER is returned when this call
+                                            carried no partner fields (the ordinary race: both
+                                            purchases then share one attempt), else
+                                            `PendingEnrollmentTaken`.
     """
     if not (buyer_ref or "").strip():
         raise ValueError("buyer_ref is required")
@@ -2564,19 +2853,27 @@ async def upsert_pending_enrollment(
         "hosted_url_expires_at": _bind_dt(hosted_url_expires_at),
     }
     if enrollment_id is None:
-        existing = await database.fetch_one(
-            _SELECT_PENDING_ENROLLMENT_SQL, {"buyer_ref": buyer_ref}
-        )
+        existing = await _the_attempt(buyer_ref)
         enrollment_id = str(existing["id"]) if existing is not None else None
     if enrollment_id is not None:
-        if IS_POSTGRES:
-            updated = await database.fetch_one(
-                _UPDATE_PENDING_ENROLLMENT_SQL, {**updates, "id": enrollment_id}
-            )
-        else:
-            updated = await database.fetch_one(
-                _UPDATE_PENDING_ENROLLMENT_SQL_SQLITE, {**updates, "id": enrollment_id}
-            )
+        try:
+            if IS_POSTGRES:
+                updated = await database.fetch_one(
+                    _UPDATE_PENDING_ENROLLMENT_SQL, {**updates, "id": enrollment_id}
+                )
+            else:
+                updated = await database.fetch_one(
+                    _UPDATE_PENDING_ENROLLMENT_SQL_SQLITE, {**updates, "id": enrollment_id}
+                )
+        except Exception as exc:  # noqa: BLE001 — narrowed immediately
+            # The UPDATE does not change `status` or `buyer_ref`, so the only unique index it
+            # can trip is the partner-id one. Named, not raw — see EnrollmentIdConflict.
+            if not _is_unique_violation(exc):
+                raise
+            holder = await _holder_of(reap_enrollment_id)
+            if holder is None or str(holder.get("id")) == enrollment_id:
+                raise
+            raise EnrollmentIdConflict(enrollment_id, holder) from exc
         # None means the row stopped being pending between the read and the write (the buyer
         # finished enrolling). Fall through and mint a fresh pending row rather than resurrect
         # an active one.
@@ -2584,14 +2881,48 @@ async def upsert_pending_enrollment(
             result = _enrollment(updated)
             assert result is not None
             return result
-    row = await database.fetch_one(
-        _INSERT_PENDING_ENROLLMENT_SQL,
-        {**updates, "id": new_enrollment_id(), "buyer_ref": buyer_ref},
-    )
+    try:
+        row = await database.fetch_one(
+            _INSERT_PENDING_ENROLLMENT_SQL,
+            {**updates, "id": new_enrollment_id(), "buyer_ref": buyer_ref},
+        )
+    except Exception as exc:  # noqa: BLE001 — narrowed immediately
+        if not _is_unique_violation(exc):
+            raise
+        holder = await _holder_of(reap_enrollment_id)
+        if holder is not None:
+            raise EnrollmentIdConflict(None, holder) from exc
+        # `uq_reap_agentic_enrollments_one_pending` (migration 252): another writer minted this
+        # buyer's pending row between our read and this INSERT — two purchases of one buyer in
+        # one tick. RE-READ AND USE THE WINNER, under the same expiry guard as the read above,
+        # so both purchases share one attempt (and Reap's idempotency, one enrollment and one
+        # link) instead of the buyer getting two.
+        winner = await _the_attempt(buyer_ref)
+        if winner is None:
+            raise
+        if any(value is not None for key, value in updates.items() if key != "agent_id"):
+            raise PendingEnrollmentTaken(str(winner["id"])) from exc
+        return winner
     created = _enrollment(row)
     if created is None:  # pragma: no cover
         raise RuntimeError("enrollment insert returned no row")
     return created
+
+
+async def _the_attempt(buyer_ref: str) -> Optional[Dict[str, Any]]:
+    """Which existing pending row IS the buyer's attempt, or None. The OLDEST, deterministically;
+    and none at all if ANY pending row's link is already dead — that row must be reconciled with
+    Reap first (see PendingEnrollmentExpired), whichever of them we would otherwise have picked."""
+    pendings = await get_pending_enrollments(buyer_ref)
+    for pending in pendings:
+        if pending["hosted_url_expired"]:
+            raise PendingEnrollmentExpired(str(pending["id"]))
+    if not pendings:
+        return None
+    # The full row, as the UPDATE's RETURNING * would give it — without the computed flag.
+    winner = dict(pendings[0])
+    winner.pop("hosted_url_expired", None)
+    return winner
 
 
 async def mark_enrollment_active(

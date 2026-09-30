@@ -727,7 +727,7 @@ async def test_the_sweeps_loop_until_drained_and_stop_at_the_iteration_cap(monke
     inside a scheduled job."""
     calls = []
 
-    async def _always_full(*, max_age_seconds, limit):
+    async def _always_full(*, max_age_seconds, limit, enrollment_grace_seconds):
         calls.append(limit)
         # `await asyncio.sleep(0)` IS LOAD-BEARING, and not for the passing case. A coroutine
         # that never awaits anything does not yield to the event loop, so with the cap removed
@@ -894,7 +894,7 @@ async def test_the_budget_also_stops_a_sweep_that_keeps_finding_work(monkeypatch
     clock = _Clock(monkeypatch)
     calls = []
 
-    async def _always_full(*, max_age_seconds, limit):
+    async def _always_full(*, max_age_seconds, limit, enrollment_grace_seconds):
         calls.append(limit)
         clock.spend_budget()
         await asyncio.sleep(0)
@@ -1754,3 +1754,47 @@ def test_the_job_id_is_force_runnable_and_pausable_by_an_operator():
 
     assert "reap_agentic_purchase_poll" in _RUNNABLE_JOB_IDS
     assert "reap_agentic_purchase_poll" in _MANAGEABLE_JOB_IDS
+
+
+# ══ 2026-09-30: the enrollment grace reaches the sweep ════════════════════════════════════════
+
+
+async def _waiting_on_an_enrollment_link(seconds_past: int) -> str:
+    purchase_id = await _start()
+    await _raw(
+        "UPDATE reap_agentic_purchases SET state = 'needs_enrollment', "
+        "hosted_url_expires_at = datetime('now', :shift) WHERE id = :i",
+        {"shift": f"-{int(seconds_past)} seconds", "i": purchase_id},
+    )
+    return purchase_id
+
+
+async def test_the_job_leaves_a_needs_enrollment_row_alone_inside_the_grace(monkeypatch, reap):
+    """Staging 2026-09-30: the sweep ran 28 s after the link expired and 19 s after Reap had
+    turned the enrollment ACTIVE. With the job passing the grace, that row survives the sweep.
+    The rail is OFF so the only thing that can move the row is the sweep itself."""
+    purchase_id = await _waiting_on_an_enrollment_link(28)
+    monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    report = await _run(worker_id="w1")
+    assert report.expired == 0
+    assert (await _get(purchase_id))["state"] == "needs_enrollment"
+
+
+async def test_the_job_reads_the_grace_dial_from_the_state_machine(monkeypatch, reap):
+    """ONE reader: `REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS=0` is Reap's exact expiry again, and
+    the job hands exactly the service's value to the ledger."""
+    monkeypatch.setenv(svc.REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS_ENV, "0")
+    purchase_id = await _waiting_on_an_enrollment_link(28)
+    monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    seen = []
+    real = job.ledger.expire_overdue_purchases
+
+    async def _spy(**kwargs):
+        seen.append(kwargs["enrollment_grace_seconds"])
+        return await real(**kwargs)
+
+    monkeypatch.setattr(job.ledger, "expire_overdue_purchases", _spy)
+    report = await _run(worker_id="w1")
+    assert seen and set(seen) == {0}
+    assert report.expired == 1
+    assert (await _get(purchase_id))["state"] == "expired"

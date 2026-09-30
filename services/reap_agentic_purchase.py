@@ -140,6 +140,7 @@ __all__ = [
     "QuoteCheck",
     "advance",
     "reconcile_completed_cart_link_claims",
+    "enrollment_grace_seconds",
     "is_cart_link_enabled",
     "is_enabled",
     "start_purchase",
@@ -207,6 +208,86 @@ def is_cart_link_enrichment_enabled() -> bool:
     return is_cart_link_enabled() and (
         (os.getenv(REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED_ENV) or "").strip().lower() in _TRUTHY
     )
+
+
+#: THE ENROLLMENT GRACE (seconds). Reap turns an enrollment ACTIVE at or AFTER its hosted
+#: session's expiry — measured on staging 2026-09-30: the buyer finished Reap's page at ~11:23,
+#: `GET /agentic/enrollments/{id}` said REQUIRES_ACTION (updatedAt unchanged) until 11:36:43, and
+#: the session had expired at 11:36:34. So "the hosted link has expired" is NOT "the enrollment
+#: is over", for this long afterwards. Two readers act on it, and both get it from HERE:
+#:
+#:   * the expire sweep, via jobs/reap_agentic_purchase_poll.py, which leaves a
+#:     'needs_enrollment' purchase alone for this long past its link's expiry so the poller can
+#:     still see the ACTIVE ('awaiting_approval' gets no grace — its QUOTE dies at the expiry);
+#:   * `_reconcile_one`, which will not RETIRE a buyer's pending enrollment and
+#:     mint a new one while that enrollment could still turn ACTIVE.
+#:
+#: Read at CALL time. Unset, empty, non-integer or outside 0..`ledger.ENROLLMENT_GRACE_SECONDS_MAX`
+#: means the default (`ledger.ENROLLMENT_GRACE_SECONDS_DEFAULT`, 180), with a warning naming the
+#: variable once per process — a typo must not take the grace (or the sweep) out of service.
+REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS_ENV = "REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS"
+
+_WARNED_GRACE: set = set()
+
+
+def enrollment_grace_seconds() -> int:
+    """The enrollment grace, in seconds. See `REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS_ENV`."""
+    default = ledger.ENROLLMENT_GRACE_SECONDS_DEFAULT
+    raw = (os.getenv(REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS_ENV) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = None
+    if value is None or value < 0 or value > ledger.ENROLLMENT_GRACE_SECONDS_MAX:
+        if REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS_ENV not in _WARNED_GRACE:
+            _WARNED_GRACE.add(REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS_ENV)
+            logger.warning(
+                "reap_agentic: %s=%r is not an integer in 0..%d; using the default %d "
+                "(this is logged once per process)",
+                REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS_ENV,
+                raw,
+                ledger.ENROLLMENT_GRACE_SECONDS_MAX,
+                default,
+            )
+        return default
+    return value
+
+
+#: The least life, in seconds, a pending enrollment's hosted link must have LEFT for this module
+#: to hand it to a buyer — whether it is a link another purchase of theirs is already showing
+#: (reuse) or one `create_enrollment` just returned. A link with less than this is treated as
+#: dying: sending a buyer to a page that dies before they can type a card number in is the dead
+#: link again, a minute later.
+MIN_LINK_LIFETIME_SECONDS = 60
+
+
+def _link_is_usable(expires_at: Optional[datetime]) -> bool:
+    """True when a hosted link with this expiry may be given to a buyer NOW.
+
+    None is usable ONLY for a link that was just created (Reap's spec makes `expiresAt`
+    optional). A link that is being REUSED never reaches here with None: its expiry is
+    `_effective_expiry`, which dates a missing one from the row's `created_at` — without that, a
+    link with no recorded expiry was reused for ever (review of #2483, P2-2).
+    """
+    if expires_at is None:
+        return True
+    return expires_at - _now() >= timedelta(seconds=MIN_LINK_LIFETIME_SECONDS)
+
+
+def _effective_expiry(
+    expires_at: Optional[datetime], created_at: Optional[datetime]
+) -> Optional[datetime]:
+    """When a stored enrollment link dies: Reap's `expiresAt` when we have one, otherwise the
+    row's `created_at` + Reap's hosted-session lifetime (`ledger.HOSTED_SESSION_SECONDS`, the
+    same number the ledger's `hosted_url_expired` flag uses). "No expiry recorded" is not
+    "never expires"."""
+    if isinstance(expires_at, datetime):
+        return expires_at
+    if isinstance(created_at, datetime):
+        return created_at + timedelta(seconds=ledger.HOSTED_SESSION_SECONDS)
+    return None
 
 
 # ── the backoff table ────────────────────────────────────────────────────────────────────────
@@ -1913,6 +1994,10 @@ async def _move(
     )
 
 
+#: Release codes logged at WARNING only the first time in a row; see `_release`.
+_QUIET_WHEN_REPEATED = frozenset({"enrollment_settling"})
+
+
 async def _release(
     row: Mapping[str, Any],
     worker_id: str,
@@ -1963,7 +2048,17 @@ async def _release(
         # The CODE, never a body, a URL or an address. Every value that reaches this line is
         # either our own vocabulary or `ReapResponse.error`/`error_code`, both of which the
         # client shape-checks before it keeps them.
-        logger.warning(
+        #
+        # A HOLD THAT REPEATS ITSELF IS SAID ONCE. `enrollment_settling` re-checks every 30 s for
+        # up to the enrollment grace; a WARNING per re-check per purchase is how a real warning
+        # becomes noise. The FIRST release with it is a WARNING; a release repeating the code the
+        # row already carries is INFO (which production's root logger drops).
+        repeat = (
+            error_code in _QUIET_WHEN_REPEATED
+            and str(row.get("last_error_code") or "") == error_code
+        )
+        logger.log(
+            logging.INFO if repeat else logging.WARNING,
             "reap_agentic: purchase=%s state=%s held at %s, retry in %ss",
             row["id"],
             state,
@@ -2035,6 +2130,19 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
             )
         return await _resolving_to_enrollment(row, worker_id, {})
 
+    # A HOLD RE-CHECKS THE ENROLLMENT, NOT THE CATALOG. A row released as `enrollment_settling`
+    # is waiting for Reap to settle the buyer's pending enrollment; its re-check every 30 s used
+    # to run `resolve_our_row` — a Reap SEARCH — first, every time (review of #2483, P2-3). So
+    # ask the enrollment question alone, and only when the answer is no longer "hold" run the
+    # whole step (the resolve, its refusals, and the enrollment decision again, from scratch).
+    if str(row.get("last_error_code") or "") == "enrollment_settling":
+        if await ledger.get_active_enrollment(str(row["buyer_ref"])) is None:
+            decision = await _decide_pending(row, worker_id, {})
+            if decision.kind == "hold":
+                return await _hold_for_settling(row, worker_id)
+            if decision.kind == "done":
+                return decision.result
+
     resolution = await rc.resolve_our_row(**_resolution_inputs(row))
     queries = list(getattr(resolution, "queries_tried", None) or [])
 
@@ -2099,12 +2207,31 @@ async def _resolving_to_enrollment(
             last_error_code="buyer_email_missing", **evidence,
         )
 
+    # RECONCILE BEFORE MINTING. A pending row that already carries a partner id was handed to
+    # this buyer as a hosted link, and they may have FINISHED it: on staging 2026-09-30 a
+    # returning buyer's card was ACTIVE at Reap while our row still said 'pending' (Reap flipped
+    # it 9 s after the link expired, and the sweep had already expired that purchase). Without
+    # this, every later purchase by that buyer minted "again" — got the SAME row back, replayed
+    # the SAME attempt id, and was handed the SAME dead link — so a buyer whose card IS enrolled
+    # could never buy. See `_decide_pending` for the outcomes.
+    decision = await _decide_pending(row, worker_id, evidence)
+    if decision.kind != "mint":
+        return await _act_on(row, worker_id, decision, evidence)
+
     # Mint OUR enrollment row FIRST: its id is the `attempt_id` the partner's idempotency key is
     # derived from, and without it a second attempt by the same buyer replays the first
     # enrollment — with its dead 15-minute link — for the rest of the day.
-    ours = await ledger.upsert_pending_enrollment(
-        buyer_ref=str(row["buyer_ref"]), agent_id=row.get("agent_id")
-    )
+    try:
+        ours = await ledger.upsert_pending_enrollment(
+            buyer_ref=str(row["buyer_ref"]), agent_id=row.get("agent_id")
+        )
+    except ledger.PendingEnrollmentExpired:
+        # The ledger refuses to hand back a pending row whose link is already dead (it would
+        # replay that link). Reachable only when such a row has NO partner id — so the
+        # reconcile above could not read it — or when another writer put one there between the
+        # read above and this call. Neither is resolved by retrying immediately; say so and
+        # wait, bounded by the attempt ceiling like any other 'resolving' hold.
+        return await _release(row, worker_id, error_code="enrollment_pending_expired")
     created = await rc.create_enrollment(
         owner_id=str(row["buyer_ref"]),
         return_url=_stage_url(row.get("return_url"), "enroll"),
@@ -2115,6 +2242,23 @@ async def _resolving_to_enrollment(
         code = str(created.error or "enrollment_create_failed")
         if _is_transport(code):
             return await _release(row, worker_id, error_code=code, transport=True)
+        rejection = rc.classify_quote_rejection(created)
+        if rejection is not None and rejection.kind in _ENROLLMENT_CREATE_RETRY_KINDS:
+            # THE DESIGNED OUTCOME OF THE ONE-PENDING RACE, NOT A FAILURE (round-2 review of
+            # #2483, P2-A). Two workers, one buyer: the loser's INSERT is refused by migration
+            # 252's index, it is handed the WINNER's attempt, and it calls `create_enrollment`
+            # with the same Idempotency-Key while the winner's create is still in flight. Reap
+            # answers 409 IDEMPOTENCY_REQUEST_IN_PROGRESS (or IDEMPOTENT_PARAMETER_MISMATCH: the
+            # two bodies differ in their return URL). Released with backoff, exactly as the
+            # quote path treats the same answer: on the next poll the winner has stored the
+            # session on the shared row and the reconcile REUSES it.
+            return await _release(
+                row, worker_id,
+                error_code=rejection.error_code,
+                transport=rejection.retry_after_seconds is None,
+                seconds=(max(1, rejection.retry_after_seconds)
+                         if rejection.retry_after_seconds is not None else None),
+            )
         return await _move(
             row, worker_id, ["resolving"], "failed",
             last_error_code=_error_code(created.error_detail_code or created.error_code or code),
@@ -2143,22 +2287,366 @@ async def _resolving_to_enrollment(
 
     if await _still_ours(row, worker_id) is None:
         return _lost(row)
-    await ledger.upsert_pending_enrollment(
-        buyer_ref=str(row["buyer_ref"]),
-        agent_id=row.get("agent_id"),
-        enrollment_id=str(ours["id"]),
-        reap_enrollment_id=partner_enrollment_id,
-        reap_status=_cap(created.data.get("status")),
-        hosted_url=hosted_url,
-        hosted_url_expires_at=expires,
-    )
+    try:
+        recorded = await ledger.upsert_pending_enrollment(
+            buyer_ref=str(row["buyer_ref"]),
+            agent_id=row.get("agent_id"),
+            enrollment_id=str(ours["id"]),
+            reap_enrollment_id=partner_enrollment_id,
+            reap_status=_cap(created.data.get("status")),
+            hosted_url=hosted_url,
+            hosted_url_expires_at=expires,
+        )
+    except ledger.EnrollmentIdConflict as conflict:
+        return await _enrollment_id_conflict(
+            row, worker_id, str(ours["id"]), conflict.holder, created.data, evidence
+        )
+    except ledger.PendingEnrollmentTaken:
+        # Our attempt row stopped being pending between the mint and now, and ANOTHER pending
+        # row of this buyer exists: the answer we hold has nowhere to go. Nobody was shown its
+        # link. The next step reconciles the buyer's pending row, whichever it is.
+        return await _release(row, worker_id, error_code="enrollment_pending_superseded")
+    if not _link_is_usable(expires):
+        # A link that is ALREADY DEAD (or dies within `MIN_LINK_LIFETIME_SECONDS`) out of a
+        # create. The create is idempotent on our attempt id, so this is a REPLAY of an attempt
+        # whose first response we never saw — minutes or hours ago. Nobody was ever shown that
+        # link (the only path to a buyer is the purchase row below, never written for it), so
+        # nobody can finish it: retiring it cannot orphan a card. It is recorded first (above)
+        # so the dead row names the partner's enrollment, then retired, and the next step mints
+        # a NEW attempt instead of handing the buyer a page that is already gone.
+        await ledger.mark_enrollment_dead(
+            str(recorded["id"]), reap_status=_cap(created.data.get("status"))
+        )
+        return await _release(row, worker_id, error_code="enrollment_link_expired")
     return await _move(
         row, worker_id, ["resolving"], "needs_enrollment",
-        enrollment_id=str(ours["id"]),
+        enrollment_id=str(recorded["id"]),
         hosted_url=hosted_url,
         hosted_url_expires_at=expires,
         **evidence,
     )
+
+
+#: Reap's answers to an enrollment create that mean "that Idempotency-Key is someone else's call,
+#: still running or with another body" — a concurrent create of the SAME attempt, which the
+#: one-pending winner hand-back makes the designed outcome of a race. Released, never failed.
+_ENROLLMENT_CREATE_RETRY_KINDS = frozenset({
+    "idempotency_request_in_progress",
+    "idempotent_parameter_mismatch",
+})
+
+
+@dataclass
+class _EnrollmentDecision:
+    """What the buyer's pending enrollment(s) mean for this 'resolving' step. See `_decide_pending`.
+
+      active   a card is active now (`enrollment_id`)            -> 'quoting'
+      reuse    a live link on a pending row (`enrollment_id`,
+               `link`, `expires`)                                -> 'needs_enrollment'
+      hold     a link just died; Reap may still turn it ACTIVE    -> release, `enrollment_settling`
+      mint     nothing pending is usable or holdable              -> mint a NEW attempt
+      retired  (one row only) the row was marked dead             -> keep looking / mint
+      done     the step already has its result (`result`): a lost lease, a release, a failure
+    """
+
+    kind: str
+    enrollment_id: Optional[str] = None
+    link: Optional[str] = None
+    expires: Optional[datetime] = None
+    result: Optional[AdvanceResult] = None
+
+
+async def _decide_pending(
+    row: Mapping[str, Any], worker_id: str, evidence: Mapping[str, Any]
+) -> _EnrollmentDecision:
+    """Ask REAP what became of EVERY pending enrollment of the buyer that has a partner id,
+    OLDEST FIRST, before anything is minted.
+
+    Every one, not "the" one. One pending row per buyer is what the rail wants and what
+    migration 252's index enforces, but without that index two purchases of one buyer can each
+    have minted one (review of #2483, P2-1), and the buyer may have finished EITHER. So each row
+    is reconciled (`_reconcile_one`) and the answers are combined:
+
+      * any row ACTIVE at Reap wins outright — activated, and the step goes to 'quoting';
+      * else the OLDEST row with a live, allowlisted link is reused;
+      * else, if any row's link died inside the grace, the step holds;
+      * else every row has been retired and a new attempt is minted.
+
+    A row whose read fails or whose status is unrecognised ends the decision there (`done`),
+    fail closed: nothing is minted around a row whose state we could not establish.
+    """
+    pendings = await ledger.get_pending_enrollments(str(row["buyer_ref"]))
+    reuse: Optional[_EnrollmentDecision] = None
+    hold = False
+    for pending in pendings:
+        if not str(pending.get("reap_enrollment_id") or "").strip():
+            continue  # never sent to a buyer: the mint below replays it (a lost create response)
+        outcome = await _reconcile_one(row, worker_id, pending, evidence)
+        if outcome.kind in ("active", "done"):
+            return outcome
+        if outcome.kind == "reuse" and reuse is None:
+            reuse = outcome
+        elif outcome.kind == "hold":
+            hold = True
+    if reuse is not None:
+        return reuse
+    if hold:
+        return _EnrollmentDecision("hold")
+    return _EnrollmentDecision("mint")
+
+
+def _enrollment_gone(read: Any) -> bool:
+    """Did Reap answer "there is no such enrollment"? 404 / 410, or the partner's own code for
+    it (`AGENTIC_RESOURCE_NOT_FOUND`, which the client keeps from the error body)."""
+    if getattr(read, "status", None) in (404, 410):
+        return True
+    codes = {getattr(read, "error_code", None), getattr(read, "error_detail_code", None)}
+    return "AGENTIC_RESOURCE_NOT_FOUND" in codes
+
+
+async def _reconcile_one(
+    row: Mapping[str, Any],
+    worker_id: str,
+    pending: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> _EnrollmentDecision:
+    """ONE pending row with a partner id, against ONE guarded `get_enrollment`.
+
+      ACTIVE          `mark_enrollment_active` (with last4) → `active`. Nothing is minted.
+      REQUIRES_ACTION and the link — Reap's FRESH `nextAction` from this read when it sends one
+                      (allowlist-vetted by `rc.hosted_action`), else the stored one — has at
+                      least `MIN_LINK_LIFETIME_SECONDS` left → `reuse`. A link with NO expiry is
+                      dated from the row's `created_at` (`_effective_expiry`), never "live for
+                      ever".
+      REQUIRES_ACTION but the link is dead or dying and we are still inside
+                      `enrollment_grace_seconds()` of its expiry → `hold`. Reap turns
+                      enrollments ACTIVE up to that long after the link dies; retiring the row
+                      now would orphan a card the buyer is enrolling at this moment.
+      REQUIRES_ACTION past the grace, EXPIRED, FAILED, REVOKED → retire it → `retired`.
+      unrecognised    released, `unknown_enrollment_status` → `done`. Never advances.
+
+    A FAILED READ (review of #2483, P2-4): a transport error releases with the doubled backoff.
+    Any other failure INSIDE the grace releases with backoff too — the row may yet settle. PAST
+    the grace, "no such enrollment" (404/410/AGENTIC_RESOURCE_NOT_FOUND) RETIRES the row with the
+    partner's code, so the buyer's next attempt mints fresh instead of failing on it for ever;
+    any other failure past the grace fails the purchase with the partner's code, and the row
+    stays for an operator (runbook).
+
+    THE READ IS GUARDED LIKE EVERY PARTNER CALL IN THIS MODULE: `_still_ours` in front of it, so
+    a worker that lost its lease spends no request (and no rate-limit budget) on a row it cannot
+    write.
+    """
+    evidence = dict(evidence)
+    pending_id = str(pending["id"])
+    partner_id = _partner_id(pending.get("reap_enrollment_id"), what="enrollment", uuid=True)
+    if partner_id is None:
+        # Stored before the write-time check existed, or by another writer: `rc.get_enrollment`
+        # would raise out of `advance` on every poll. Not retired here — a row we cannot read is
+        # not a row we know to be dead — so this is an operator's to clear (see the runbook).
+        return _EnrollmentDecision("done", result=await _move(
+            row, worker_id, ["resolving"], "failed",
+            last_error_code="partner_id_malformed", **evidence,
+        ))
+
+    grace = timedelta(seconds=enrollment_grace_seconds())
+    stored_expiry = _effective_expiry(
+        pending.get("hosted_url_expires_at"), pending.get("created_at")
+    )
+    past_grace = stored_expiry is not None and _now() >= stored_expiry + grace
+
+    if await _still_ours(row, worker_id) is None:
+        return _EnrollmentDecision("done", result=_lost(row))
+    read = await rc.get_enrollment(partner_id)
+    if not read.ok:
+        code = str(read.error or "enrollment_read_failed")
+        if _is_transport(code):
+            return _EnrollmentDecision("done", result=await _release(
+                row, worker_id, error_code=code, transport=True
+            ))
+        partner_code = _error_code(read.error_detail_code or read.error_code or code)
+        if not past_grace:
+            return _EnrollmentDecision("done", result=await _release(
+                row, worker_id, error_code=partner_code, transport=True
+            ))
+        if _enrollment_gone(read):
+            if await _still_ours(row, worker_id) is None:
+                return _EnrollmentDecision("done", result=_lost(row))
+            await ledger.mark_enrollment_dead(pending_id, reap_status=_cap(partner_code))
+            return _EnrollmentDecision("retired")
+        return _EnrollmentDecision("done", result=await _move(
+            row, worker_id, ["resolving"], "failed",
+            last_error_code=partner_code, **evidence,
+        ))
+
+    state = rc.enrollment_state(read.data)
+    if state == "active":
+        if await _still_ours(row, worker_id) is None:
+            return _EnrollmentDecision("done", result=_lost(row))
+        activated = await _activate_from_read(row, pending_id, partner_id, read.data)
+        if activated is None:
+            # Our row stopped being activatable between the read and the write (retired by
+            # another step or an operator) and no other card is active. Nothing to quote with;
+            # the next step reconciles again from whatever is there then.
+            return _EnrollmentDecision("done", result=await _release(
+                row, worker_id, error_code="enrollment_not_activatable"
+            ))
+        return _EnrollmentDecision("active", enrollment_id=str(activated["id"]))
+
+    if state == "pending":
+        fresh = rc.hosted_action(read.data)
+        if fresh is not None:
+            link = fresh[0]
+            expires = _parse_ts(fresh[1]) or stored_expiry
+        else:
+            link = str(pending.get("hosted_url") or "").strip()
+            expires = stored_expiry
+        vouched = bool(link) and rc.hosted_url_is_allowed(link)
+        if vouched and expires is not None and _link_is_usable(expires):
+            return _EnrollmentDecision(
+                "reuse", enrollment_id=pending_id, link=link, expires=expires
+            )
+        if vouched and expires is not None and _now() < expires + grace:
+            return _EnrollmentDecision("hold")
+        # Past the grace (or no link we would hand anyone): Reap is not going to finish it.
+    elif state != "dead":
+        return _EnrollmentDecision("done", result=await _release(
+            row, worker_id, error_code="unknown_enrollment_status"
+        ))
+
+    if await _still_ours(row, worker_id) is None:
+        return _EnrollmentDecision("done", result=_lost(row))
+    await ledger.mark_enrollment_dead(pending_id, reap_status=_cap(read.data.get("status")))
+    return _EnrollmentDecision("retired")
+
+
+async def _hold_for_settling(row: Mapping[str, Any], worker_id: str) -> AdvanceResult:
+    """Release a 'resolving' row whose buyer's enrollment link has just died, to look again on
+    the needs_enrollment cadence. The code is also the marker the ledger's claim reads to leave
+    `attempts` alone, and `_step_resolving` reads to skip the resolve on the re-check."""
+    return await _release(
+        row, worker_id,
+        error_code="enrollment_settling",
+        seconds=POLL_INTERVALS["needs_enrollment"],
+    )
+
+
+async def _act_on(
+    row: Mapping[str, Any],
+    worker_id: str,
+    decision: _EnrollmentDecision,
+    evidence: Mapping[str, Any],
+) -> AdvanceResult:
+    """Turn a non-`mint` decision into this 'resolving' step's one write."""
+    evidence = dict(evidence)
+    if decision.kind == "done":
+        assert decision.result is not None
+        return decision.result
+    if decision.kind == "active":
+        return await _move(
+            row, worker_id, ["resolving"], "quoting",
+            enrollment_id=str(decision.enrollment_id), **evidence,
+        )
+    if decision.kind == "reuse":
+        return await _move(
+            row, worker_id, ["resolving"], "needs_enrollment",
+            enrollment_id=str(decision.enrollment_id),
+            hosted_url=decision.link,
+            # Reap's expiry, or our estimate of it (`_effective_expiry`) when Reap sent none, so
+            # the sweep bounds this purchase by the link's life and not only by `max_age`.
+            hosted_url_expires_at=decision.expires,
+            **evidence,
+        )
+    if decision.kind == "hold":
+        return await _hold_for_settling(row, worker_id)
+    raise RuntimeError(f"no action for enrollment decision {decision.kind!r}")  # pragma: no cover
+
+
+async def _enrollment_id_conflict(
+    row: Mapping[str, Any],
+    worker_id: str,
+    ours_id: str,
+    holder: Mapping[str, Any],
+    partner: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> AdvanceResult:
+    """A fresh create came back with an enrollment id ANOTHER row of ours already holds.
+
+    Review of #2483, P1-1: a retired row keeps its `reap_enrollment_id`, and when Reap answers a
+    NEW attempt with that same enrollment (de-duplicating by owner, or an open session for the
+    owner) `uq_reap_agentic_enrollments_reap_id` refuses the write. That used to be a raw
+    IntegrityError out of `advance` on every poll, for every later purchase of that buyer. Now:
+
+      * OUR new attempt row is retired first — it will never hold that id, and a pending row
+        with no partner id would be replayed into the same conflict on the next step;
+      * the holder belongs to ANOTHER buyer → `failed`, `enrollment_id_conflict`. Nothing of
+        theirs is touched, and this is worth a human (logged at WARNING);
+      * the holder is this buyer's ACTIVE row → 'quoting' on it;
+      * the holder is this buyer's PENDING row → reconciled exactly like any pending row
+        (`_reconcile_one`: ACTIVE → activate, REQUIRES_ACTION → reuse or hold); a holder that
+        turns out dead is retired and the purchase fails `enrollment_id_conflict`;
+      * the holder is DEAD → `failed`, `enrollment_id_conflict`. FAIL CLOSED: the ledger never
+        resurrects a dead row (`mark_enrollment_active` refuses it by design — a dead row may be
+        a revoked card), and minting again would get the same answer. The runbook has the
+        operator path.
+    """
+    logger.warning(
+        "reap_agentic: purchase=%s create_enrollment returned an enrollment already held by "
+        "enrollment=%s (status=%s); attempt=%s retired",
+        row["id"], holder.get("id"), holder.get("status"), ours_id,
+    )
+    if await _still_ours(row, worker_id) is None:
+        return _lost(row)
+    await ledger.mark_enrollment_dead(ours_id, reap_status=_cap(partner.get("status")))
+    conflict = dict(evidence, last_error_code="enrollment_id_conflict")
+    if str(holder.get("buyer_ref") or "") != str(row["buyer_ref"]):
+        return await _move(row, worker_id, ["resolving"], "failed", **conflict)
+    status = str(holder.get("status") or "")
+    if status == "active":
+        return await _move(
+            row, worker_id, ["resolving"], "quoting",
+            enrollment_id=str(holder["id"]), **evidence,
+        )
+    if status == "pending":
+        mine = [
+            p for p in await ledger.get_pending_enrollments(str(row["buyer_ref"]))
+            if str(p["id"]) == str(holder["id"])
+        ]
+        if mine:
+            decision = await _reconcile_one(row, worker_id, mine[0], evidence)
+            if decision.kind not in ("retired", "mint"):
+                return await _act_on(row, worker_id, decision, evidence)
+    return await _move(row, worker_id, ["resolving"], "failed", **conflict)
+
+
+async def _activate_from_read(
+    row: Mapping[str, Any], enrollment_id: str, partner_id: str, data: Mapping[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Record an ACTIVE read from Reap on our row; return the buyer's ACTIVE enrollment, or None.
+
+    ONE function for both callers ('resolving' reconciling a pending row, 'needs_enrollment'
+    polling its own), so the card attributes are taken from the payload one way.
+
+    `mark_enrollment_active` answers None when the target is not activatable (it is 'dead', or a
+    concurrent activation for the buyer won). That None USED TO BE IGNORED and the purchase moved
+    to 'quoting' on a row that was not active. Now: if the buyer has SOME active enrollment (the
+    concurrent winner), that is the card; otherwise None, and the caller does not quote.
+    """
+    method = data.get("paymentMethod")
+    method = method if isinstance(method, dict) else {}
+    last4 = str(method.get("last4") or "").strip()
+    activated = await ledger.mark_enrollment_active(
+        enrollment_id,
+        reap_enrollment_id=partner_id,
+        reap_status=_cap(data.get("status")),
+        # The ONLY two card attributes that may be stored. `last4` is passed only when it is
+        # exactly four digits — the ledger raises otherwise, and a partner sending something
+        # else must not turn a completed enrollment into an exception.
+        card_network=_cap(method.get("network")),
+        card_last4=last4 if _LAST4_RE.match(last4) else None,
+    )
+    if activated is not None:
+        return activated
+    return await ledger.get_active_enrollment(str(row["buyer_ref"]))
 
 
 async def _enrollment_row(row: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2193,6 +2681,12 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
     """needs_enrollment → quoting | failed, or wait. ('expired' is the sweep's edge, not ours.)
 
     The buyer has a hosted card page open. We are asking the partner whether they finished.
+
+    THE PAGE'S EXPIRY IS NOT THIS STEP'S DEADLINE. Reap turns an enrollment ACTIVE at or after the
+    hosted session expires (staging 2026-09-30: 9 s after), so this step keeps reading the
+    enrollment past `hosted_url_expires_at`, for as long as the expire sweep leaves the purchase
+    alone — `enrollment_grace_seconds()` past that expiry — and an ACTIVE read in that window
+    goes to 'quoting' like any other.
     """
     # The buyer may have enrolled via ANOTHER purchase of theirs, in which case the card is
     # already active and there is nothing to poll. Checked first, and it is also what keeps the
@@ -2235,23 +2729,22 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
 
     state = rc.enrollment_state(read.data)
     if state == "active":
-        method = read.data.get("paymentMethod")
-        method = method if isinstance(method, dict) else {}
-        last4 = str(method.get("last4") or "").strip()
         if await _still_ours(row, worker_id) is None:
             return _lost(row)
-        await ledger.mark_enrollment_active(
-            str(ours["id"]),
-            reap_enrollment_id=partner_id,
-            reap_status=_cap(read.data.get("status")),
-            # The ONLY two card attributes that may be stored. `last4` is passed only when it is
-            # exactly four digits — the ledger raises otherwise, and a partner sending something
-            # else must not turn a completed enrollment into an exception.
-            card_network=_cap(method.get("network")),
-            card_last4=last4 if _LAST4_RE.match(last4) else None,
-        )
+        activated = await _activate_from_read(row, str(ours["id"]), partner_id, read.data)
+        if activated is None:
+            # Reap says ACTIVE, our row is not activatable (retired), and the buyer has no other
+            # active card. Quoting would fail on `no_active_enrollment` one step later; failing
+            # here says why. FAIL CLOSED: a card our ledger calls dead is not charged.
+            return await _move(
+                row, worker_id, ["needs_enrollment"], "failed",
+                last_error_code="enrollment_not_activatable",
+            )
+        # The hosted link is cleared by the ledger on the way into 'quoting' (it clears on ANY
+        # transition into that state), so the spent enrollment page and its expiry do not ride
+        # along on a row that no longer waits on them.
         return await _move(
-            row, worker_id, ["needs_enrollment"], "quoting", enrollment_id=str(ours["id"])
+            row, worker_id, ["needs_enrollment"], "quoting", enrollment_id=str(activated["id"])
         )
     if state == "dead":
         if await _still_ours(row, worker_id) is None:

@@ -77,6 +77,8 @@ _MIGRATIONS = (
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
     _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
+    # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
+    _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
 )
 
 # Same convention as tests/test_reap_agentic_ledger_postgres.py: this gate DROPS its tables, so
@@ -115,7 +117,10 @@ ENROLLMENT_CREATED = {
     "nextAction": {
         "type": "REDIRECT",
         "url": "https://pay.prava.space/enroll/3fa85f64",
-        "expiresAt": "2026-09-17T21:00:00Z",
+        # FAR future on purpose: a create whose link is already dead is now RETIRED rather than
+        # handed to the buyer (a replayed attempt; see `_link_is_usable`). The dead-link
+        # case has its own tests.
+        "expiresAt": "2099-01-01T00:00:00Z",
     },
 }
 ENROLLMENT_ACTIVE = {
@@ -1588,3 +1593,303 @@ async def test_an_uncanonicalisable_stored_domain_still_closes_as_stored(attribu
          "final_total_minor": 4500, "currency": "USD", "click_id": "clk_leg"}
     )
     assert [c["merchant_id"] for c in attribution.calls] == ["legacy.example."]
+
+
+# ── 2026-09-30: a returning buyer whose card IS active at Reap could never buy (Postgres) ─────
+#
+# The SQLite arm (tests/test_reap_agentic_purchase.py) walks every branch. Here the same staging
+# sequence runs against the real engine, because every decision in it is a CLOCK comparison —
+# the sweep's grace in SQL, the ledger's expiry flag in SQL, the service's link check in Python
+# against a timestamptz read back through asyncpg — and a clock that is off by a timezone turns
+# "9 s past" into "hours past" without any other symptom.
+
+STAGING_ENROLLMENT = "9041ef1a-1377-45f6-b09a-95d5eb07f908"
+STAGING_LINK = "https://pay.prava.space/enroll/ses_01M3S0RSP39FEXTT7ZRYHSRDJQ"
+
+
+def _iso_in(seconds: float) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _requires_action(reap_id=STAGING_ENROLLMENT, url=STAGING_LINK, expires_in=900):
+    return {
+        "id": reap_id,
+        "status": "REQUIRES_ACTION",
+        "nextAction": {"type": "REDIRECT", "url": url, "expiresAt": _iso_in(expires_in)},
+    }
+
+
+def _active(reap_id=STAGING_ENROLLMENT):
+    return {
+        "id": reap_id,
+        "status": "ACTIVE",
+        "paymentMethod": {"type": "CARD", "network": "VISA", "last4": "7847"},
+        "nextAction": None,
+    }
+
+
+async def _age_links(seconds_past: int) -> None:
+    for table in ("reap_agentic_enrollments", "reap_agentic_purchases"):
+        await _raw(
+            f"UPDATE {table} SET hosted_url_expires_at = "
+            f"clock_timestamp() - ({int(seconds_past)} * INTERVAL '1 second') "
+            "WHERE hosted_url_expires_at IS NOT NULL",
+            {},
+        )
+
+
+async def _a_waiting_on_a_link(reap):
+    reap.create_enrollment = _ok(_requires_action())
+    reap.get_enrollment = _ok(_requires_action())
+    purchase_a = await _start()
+    assert (await _step(purchase_a)).state == "needs_enrollment"
+    ours = (await _get(purchase_a))["enrollment_id"]
+    assert (await _step(purchase_a)).last_error_code == "enrollment_pending"
+    return purchase_a, ours
+
+
+async def test_the_staging_sequence_a_returning_buyer_with_an_active_card_now_buys_on_postgres(
+    reap,
+):
+    import db.reap_agentic_ledger as ledger
+
+    purchase_a, ours = await _a_waiting_on_a_link(reap)
+    reap.get_enrollment = _ok(_active())
+    await _age_links(28)
+    # Staging's sweep: Reap's exact expiry. A goes; our row stays 'pending'.
+    assert await ledger.expire_overdue_purchases(enrollment_grace_seconds=0) == [purchase_a]
+    assert (await ledger.get_pending_enrollment("bref_alice"))["id"] == ours
+
+    reap.calls.clear()
+    purchase_b = await _start()
+    assert (await _step(purchase_b)).state == "quoting"
+    assert reap.named("create_enrollment") == []
+    b = await _get(purchase_b)
+    assert b["enrollment_id"] == ours
+    assert b["hosted_url"] is None and b["hosted_url_expires_at"] is None
+    active = await ledger.get_active_enrollment("bref_alice")
+    assert (active["id"], active["card_last4"]) == (ours, "7847")
+
+    purchase_c = await _start()
+    assert (await _step(purchase_c)).state == "quoting"
+    assert reap.named("create_enrollment") == []
+
+
+async def test_the_grace_lets_a_proceed_on_postgres(reap):
+    import db.reap_agentic_ledger as ledger
+
+    purchase_a, ours = await _a_waiting_on_a_link(reap)
+    reap.get_enrollment = _ok(_active())
+    await _age_links(28)
+    assert await ledger.expire_overdue_purchases() == []
+    assert (await _step(purchase_a)).state == "quoting"
+    a = await _get(purchase_a)
+    assert a["hosted_url"] is None and a["hosted_url_expires_at"] is None
+
+    stale, _ = await _a_waiting_on_a_link_for("bref_bob", reap)
+    await _age_links(181)
+    assert stale in await ledger.expire_overdue_purchases()
+
+
+async def _a_waiting_on_a_link_for(buyer_ref, reap):
+    reap.create_enrollment = _ok(_requires_action("77777777-7777-7777-7777-777777777777"))
+    reap.get_enrollment = _ok(_requires_action("77777777-7777-7777-7777-777777777777"))
+    purchase = await _start(buyer_ref=buyer_ref)
+    assert (await _step(purchase)).state == "needs_enrollment"
+    return purchase, (await _get(purchase))["enrollment_id"]
+
+
+async def test_reuse_hold_and_fresh_attempt_on_postgres(reap):
+    """Live link → reused; 9 s dead → held; 400 s dead → retired and a NEW attempt minted."""
+    import db.reap_agentic_ledger as ledger
+
+    _, old = await _a_waiting_on_a_link(reap)
+    # Reap's read ECHOES the session it created (link + expiry): a fresh `nextAction` would now be
+    # used over the stored link, so a fixed "+15 min" answer would make every read look live.
+    reap.get_enrollment = _echo_session()
+
+    reap.calls.clear()
+    reused = await _start()
+    assert (await _step(reused)).state == "needs_enrollment"
+    assert (await _get(reused))["enrollment_id"] == old
+    assert reap.named("create_enrollment") == []
+
+    await _age_links(9)
+    held = await _start()
+    result = await _step(held)
+    assert (result.state, result.last_error_code) == ("resolving", "enrollment_settling")
+    assert reap.named("create_enrollment") == []
+
+    await _age_links(400)
+    reap.create_enrollment = _ok(
+        _requires_action("88888888-8888-8888-8888-888888888888", "https://pay.prava.space/enroll/NEW")
+    )
+    fresh = await _start()
+    assert (await _step(fresh)).state == "needs_enrollment"
+    [created] = reap.named("create_enrollment")
+    assert created["attempt_id"] != old
+    assert (await ledger.get_enrollment_internal(old))["status"] == "dead"
+    assert (await _get(fresh))["hosted_url"] == "https://pay.prava.space/enroll/NEW"
+
+
+# ── review of #2483 at 93f585c26, through `advance` on Postgres ─────────────────────────────
+
+
+def _echo_session():
+    """REQUIRES_ACTION echoing the stored session — see the SQLite arm's
+    `_reap_echoes_the_session`."""
+
+    async def _read(**kwargs):
+        from db.database import database
+        import db.reap_agentic_ledger as ledger
+
+        stored = await database.fetch_one(
+            "SELECT hosted_url, hosted_url_expires_at FROM reap_agentic_enrollments "
+            "WHERE reap_enrollment_id = :r", {"r": kwargs["id"]},
+        )
+        action = None
+        if stored is not None and stored["hosted_url"]:
+            action = {"type": "REDIRECT", "url": stored["hosted_url"]}
+            expires = ledger._decode_dt(stored["hosted_url_expires_at"])
+            if expires is not None:
+                action["expiresAt"] = expires.isoformat().replace("+00:00", "Z")
+        return _ok({"id": kwargs["id"], "status": "REQUIRES_ACTION", "nextAction": action})
+
+    return _read
+
+
+async def test_r3_a_create_returning_an_id_we_hold_on_a_dead_row_fails_by_name_on_postgres(reap):
+    """P1-1 on the engine whose unique-violation shape is asyncpg's."""
+    import db.reap_agentic_ledger as ledger
+
+    _, old = await _a_waiting_on_a_link(reap)
+    reap.get_enrollment = _echo_session()
+    await _age_links(400)
+    for _ in range(2):
+        reap.calls.clear()
+        purchase = await _start()
+        result = await _step(purchase)
+        assert (result.state, result.last_error_code) == ("failed", "enrollment_id_conflict")
+        [created] = reap.named("create_enrollment")
+        assert (await ledger.get_enrollment_internal(created["attempt_id"]))["status"] == "dead"
+    assert (await ledger.get_enrollment_internal(old))["status"] == "dead"
+
+
+async def test_r1_two_purchases_of_one_buyer_share_one_attempt_on_postgres(reap, monkeypatch):
+    """P2-1 on Postgres: purchase 2 runs its whole step between purchase 1's read and INSERT;
+    migration 252's index refuses 1's row and both wait on ONE attempt."""
+    import uuid as _uuid
+
+    import db.reap_agentic_ledger as ledger
+
+    await _a_waiting_on_a_link(reap)
+    reap.get_enrollment = _echo_session()
+    await _age_links(400)
+
+    def _create(**kwargs):
+        attempt = str(kwargs["attempt_id"])
+        return _ok(_requires_action(
+            str(_uuid.uuid5(_uuid.NAMESPACE_OID, attempt)),
+            f"https://pay.prava.space/enroll/{attempt}",
+        ))
+
+    reap.create_enrollment = _create
+    reap.calls.clear()
+    first, second = await _start(), await _start()
+    real = ledger.get_pending_enrollments
+    calls = {"n": 0}
+
+    async def _interleaved(buyer_ref):
+        rows = await real(buyer_ref)
+        calls["n"] += 1
+        if calls["n"] == 2:
+            await _step(second, "w2")
+        return rows
+
+    monkeypatch.setattr(ledger, "get_pending_enrollments", _interleaved)
+    assert (await _step(first, "w1")).state == "needs_enrollment"
+    monkeypatch.setattr(ledger, "get_pending_enrollments", real)
+    a, b = await _get(first), await _get(second)
+    assert b["state"] == "needs_enrollment"
+    assert a["enrollment_id"] == b["enrollment_id"]
+    assert len(await ledger.get_pending_enrollments("bref_alice")) == 1
+    assert {c["attempt_id"] for c in reap.named("create_enrollment")} == {a["enrollment_id"]}
+
+
+async def test_r2_and_the_settling_exemption_on_postgres(reap):
+    """P2-2: a linked row with no expiry, 7200 s old, is retired, not reused. P2-3: a settling
+    re-check neither resolves again nor counts an attempt."""
+    import db.reap_agentic_ledger as ledger
+
+    _, old = await _a_waiting_on_a_link(reap)
+    reap.get_enrollment = _echo_session()
+    await _raw(
+        "UPDATE reap_agentic_enrollments SET hosted_url_expires_at = NULL, "
+        "created_at = clock_timestamp() - INTERVAL '7200 seconds' WHERE id = :i", {"i": old},
+    )
+    reap.create_enrollment = _ok(_requires_action(
+        "13131313-1313-1313-1313-131313131313", "https://pay.prava.space/enroll/FRESH"
+    ))
+    fresh = await _start()
+    assert (await _step(fresh)).state == "needs_enrollment"
+    assert (await _get(fresh))["hosted_url"] == "https://pay.prava.space/enroll/FRESH"
+    assert (await ledger.get_enrollment_internal(old))["status"] == "dead"
+
+    await _age_links(9)                     # FRESH's link just died: the next purchase holds
+    held = await _start()
+    assert (await _step(held)).last_error_code == "enrollment_settling"
+    await _raw(
+        "UPDATE reap_agentic_purchases SET next_poll_at = clock_timestamp() - INTERVAL '1 second' "
+        "WHERE id = :i", {"i": held},
+    )
+    before = (await _get(held))["attempts"]
+    claimed = [r for r in await ledger.claim_due_purchases("w9") if r["id"] == held]
+    assert claimed and claimed[0]["attempts"] == before
+    reap.calls.clear()
+    import services.reap_agentic_purchase as svc
+
+    assert (await svc.advance(held, "w9")).last_error_code == "enrollment_settling"
+    assert reap.named("resolve_our_row") == []
+
+
+async def test_two_purchases_creating_one_attempt_concurrently_on_postgres(reap):
+    """Round-2 P2-A on the real engine: two purchases of one first-time buyer, stepped at once
+    on two connections; the second create of the SAME attempt gets Reap's 409 in-progress and is
+    RELEASED; its next poll reuses the winner's session. One row, one enrollment, one link."""
+    import asyncio
+
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_client as rc
+    import services.reap_agentic_purchase as svc
+
+    calls, second_arrived = [], asyncio.Event()
+
+    async def _create(**kwargs):
+        calls.append(kwargs["attempt_id"])
+        if len(calls) == 1:
+            await asyncio.wait_for(second_arrived.wait(), timeout=60)
+            return _ok(_requires_action())
+        second_arrived.set()
+        return rc.ReapResponse(ok=False, status=409, error="reap_status_409",
+                               error_code="IDEMPOTENCY_REQUEST_IN_PROGRESS")
+
+    reap.create_enrollment = _create
+    reap.get_enrollment = _echo_session()
+    first, second = await _start(), await _start()
+    await _claim(first, "w1")
+    await _claim(second, "w2")
+    results = await asyncio.gather(svc.advance(first, "w1"), svc.advance(second, "w2"))
+
+    assert len(calls) == 2 and len(set(calls)) == 1
+    assert sorted(r.outcome for r in results) == ["advanced", "released"]
+    loser = next(pid for pid, r in zip((first, second), results) if r.outcome == "released")
+    assert (await _get(loser))["last_error_code"] == "idempotency_request_in_progress"
+    assert (await _step(loser, "w3")).state == "needs_enrollment"
+    a, b = await _get(first), await _get(second)
+    assert a["enrollment_id"] == b["enrollment_id"] == calls[0]
+    assert a["hosted_url"] == b["hosted_url"] == STAGING_LINK
+    assert len(await ledger.get_pending_enrollments("bref_alice")) == 1

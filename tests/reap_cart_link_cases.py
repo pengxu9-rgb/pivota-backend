@@ -65,6 +65,8 @@ MIGRATIONS = (
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
     MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
+    # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
+    MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
 )
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 
@@ -94,7 +96,10 @@ ENROLLMENT_CREATED = {
     "nextAction": {
         "type": "REDIRECT",
         "url": "https://pay.prava.space/enroll/3fa85f64",
-        "expiresAt": "2026-09-17T21:00:00Z",
+        # FAR future on purpose: a create whose link is already dead is now RETIRED rather than
+        # handed to the buyer (a replayed attempt; see `_link_is_usable`). The dead-link
+        # case has its own tests.
+        "expiresAt": "2099-01-01T00:00:00Z",
     },
 }
 ENROLLMENT_ACTIVE = {
