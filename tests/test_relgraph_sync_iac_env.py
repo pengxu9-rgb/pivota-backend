@@ -3,7 +3,8 @@
 `--set-env-vars` REPLACES a Cloud Run job's whole env, so whatever this script passes IS the job's
 env after a reconcile. Before 2026-09-30 the relgraph write gates, the Vertex settings and the step
 budget lived only on the live job, set by hand, and any reconcile silently turned graph writes off
-and broke AI review. These tests pin the reconciled env to the live job's, var for var, and pin that
+and broke AI review. These tests pin the reconciled env to the target live env after the green 2026-10-01 night and raise,
+var for var, and pin that
 staging never receives the write gates or the prod Vertex project.
 
 The script runs end to end with the same fake gcloud as test_setup_scheduler_is_safe_to_rerun.py:
@@ -24,7 +25,7 @@ from tests.test_setup_scheduler_is_safe_to_rerun import (
     WEB_JSON,
 )
 
-# The live job's env on 2026-09-30 (`gcloud run jobs describe relgraph-sync`), minus
+# Target live env after the green 2026-10-01 night and operator raise, minus
 # PIVOTA_COMMIT_SHA, which every reconcile restamps from the gateway tag.
 LIVE_PROD_ENV = {
     "PIVOTA_ENV": "production",
@@ -37,7 +38,9 @@ LIVE_PROD_ENV = {
     "RELGRAPH_SYNC_APPLY_REVIEW": "true",
     "RELGRAPH_SYNC_ALLOW_WRITES": "true",
     "RELGRAPH_SYNC_CONFIRM": "APPLY_RELGRAPH_SYNC_ROUTINE",
-    "RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES": "45",
+    "RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES": "90",
+    "RELGRAPH_SYNC_REVIEW_LIMIT": "1000",
+    "RELGRAPH_SYNC_REVIEW_CONCURRENCY": "6",
     "VERTEX_AI_ENABLED": "true",
     "GOOGLE_CLOUD_PROJECT": "pivota-prod",
     "GOOGLE_CLOUD_LOCATION": "global",
@@ -101,13 +104,18 @@ def test_a_prod_reconcile_reproduces_the_live_env_var_for_var(tmp_path):
     assert env == LIVE_PROD_ENV
 
 
-def test_throughput_caps_stay_at_the_image_defaults_until_review_concurrency_ships(tmp_path):
-    # 1,000 sequential reviews (~7 s each) blow the step every night on an image without
-    # PIVOTA-Agent #2335; raise these together with RELGRAPH_SYNC_REVIEW_CONCURRENCY, not before.
-    env = _relgraph_sync_env(_reconcile(tmp_path, "prod", {})[0])
-    for cap in ("RELGRAPH_SYNC_REVIEW_LIMIT", "RELGRAPH_SYNC_REVIEW_CONCURRENCY", "RELGRAPH_SYNC_LIMIT",
-                "RELGRAPH_SYNC_SELECT_LIMIT"):
-        assert cap not in env
+def test_review_throughput_is_prod_only_and_anchor_caps_remain_at_image_defaults(tmp_path):
+    prod = _relgraph_sync_env(_reconcile(tmp_path, "prod", {})[0])
+    staging = _relgraph_sync_env(_reconcile(tmp_path, "staging", {})[0])
+    assert prod["RELGRAPH_SYNC_REVIEW_LIMIT"] == "1000"
+    assert prod["RELGRAPH_SYNC_REVIEW_CONCURRENCY"] == "6"
+    assert prod["RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES"] == "90"
+    assert staging["RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES"] == "45"
+    for cap in ("RELGRAPH_SYNC_REVIEW_LIMIT", "RELGRAPH_SYNC_REVIEW_CONCURRENCY"):
+        assert cap not in staging
+    for env in (prod, staging):
+        for cap in ("RELGRAPH_SYNC_LIMIT", "RELGRAPH_SYNC_SELECT_LIMIT"):
+            assert cap not in env
 
 
 def test_prod_can_be_reconciled_as_a_dry_run(tmp_path):

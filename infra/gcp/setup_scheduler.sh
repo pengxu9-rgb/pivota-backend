@@ -337,38 +337,24 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 # is this file's established shape rather than a new assumption — though nothing here TESTS it, and
 # no test asserts it, so treat it as convention-backed, not proven.
 #
-# 3600s is NOT this job's binding constraint today: the cron entry point caps itself well before the
-# clock at 200 anchors over 250 selected rows in a 24h window, which finishes in ~4 minutes
-# (measured 2026-09-09 10:37Z). It becomes the wall the moment anyone raises those caps to rebuild
-# the graph for real: measured the same day, a --limit 1000 build over a 5,000-row selection was
-# TERMINATED at exactly 3600s mid-build, producing no audit and no edges. With --max-retries 1 above
-# that costs two attempts, so 3600s really means two wasted hours; 14400s likewise means eight.
+# The 2026-09-09 baseline (200 anchors / 250 selected rows) finished in ~4 minutes. A
+# 1000-anchor build over 5000 selected rows was terminated at exactly 3600s mid-build,
+# producing no audit and no edges. The outer task timeout remains 14400s; with the one retry
+# above it can consume eight hours. This phase raises only reviews, keeping anchors at 200.
 #
-# ⚠️ THE CAPS ARE NOT SET HERE AND CANNOT BE SET LIVE. They are RELGRAPH_SYNC_LIMIT (default 200,
-# max 2000), RELGRAPH_SYNC_SELECT_LIMIT (default 250, max 5000) and RELGRAPH_SYNC_REVIEW_LIMIT
-# (default 250), read inside the GATEWAY image by PIVOTA-Agent's
-# scripts/run-relationship-graph-sync-routine-cron.js — grepping THIS repo for them finds nothing.
-# Raising them means adding them to relgraph_sync_env below, because --set-env-vars REPLACES the
-# whole env set: an operator who adds them with `gcloud run jobs update` has them wiped by the next
-# reconcile of this script. That is the same drift this timeout override exists to prevent, and it
-# applies to the caps too.
+# RELGRAPH_SYNC_LIMIT (default 200, max 2000) and RELGRAPH_SYNC_SELECT_LIMIT (default 250,
+# max 5000) remain absent here. RELGRAPH_SYNC_REVIEW_LIMIT and CONCURRENCY are read inside
+# the gateway image by scripts/run-relationship-graph-sync-routine-cron.js. Their prod values
+# are now explicit below so reconcile preserves the operator's conditional live raise.
 #
-# THE ENV BELOW IS THE LIVE JOB'S, VAR FOR VAR (2026-09-30). The write gates, the confirm token (a
-# code constant, WRAPPER_CONFIRM_TOKEN, not a secret), the Vertex settings and the 45-minute step
-# budget were all set by hand, so before this a reconcile silently disarmed graph writes and broke
-# AI review. Measured shape at these values: build ~8 min + 250 sequential reviews ~29 min (~7 s
-# each) = ~37 of 45 minutes. Do NOT raise RELGRAPH_SYNC_REVIEW_LIMIT here until relgraph-sync runs
-# an image with bounded review concurrency (PIVOTA-Agent #2335) and RELGRAPH_SYNC_REVIEW_CONCURRENCY
-# is set with it: 1,000 sequential reviews are ~2 h and fail the step every night.
-#
-# So this raise removes ONE of three walls. It changes nothing about the daily run, which exits in
-# minutes either way.
-#
-# COST: infra/gcp/setup_monitoring.sh alerts on relgraph-sync via completed_task_attempt_count
-# {result=failed} — it fires only AFTER a task dies, and there is no duration-based alert. A wedged
-# job is therefore silent for 4h instead of 1h (8h instead of 2h across the retry). Accepted here
-# because the daily run exits in minutes, so a run that is still alive at 1h is already anomalous —
-# but if these caps are ever raised, add a duration alert rather than relying on the failure signal.
+# Merge this review-throughput phase only after the 2026-10-01 10:37Z night is green AND
+# the live job has the same three values below. Merging runs nothing. Reconcile requires a
+# gateway image containing PIVOTA-Agent #2335 (3020d9272 or later): bounded review concurrency
+# and the breaker (8 consecutive transport errors stop review and make the job exit 1).
+# Build ~8 min + 1000 reviews * ~7 s / 6 ~= 20 min of review, or ~30 min overall, under the
+# 90-minute per-step budget. Anchor caps remain at the image defaults (200); LIMIT and
+# SELECT_LIMIT are intentionally absent. --set-env-vars replaces the whole job env, so these
+# review settings must match the operator's live raise before the next reconcile.
 #
 # Precedent for raising, not just lowering: the twelve other mkjob callers all LOWER 3600s, but
 # external-seed-destination-sweep raises mkcrawljob's 300s to 3600s. This is the first override to
@@ -376,9 +362,11 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 # Staging gets neither Vertex nor the write gates: GOOGLE_CLOUD_PROJECT follows $PROJECT, and the
 # gates follow RELGRAPH_SYNC_WRITES (validated above; never true in staging).
 relgraph_sync_env(){
-  local env="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=45"
+  local env="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1"
   if [ "$ENV" = prod ]; then
-    env="$env,VERTEX_AI_ENABLED=true,GOOGLE_CLOUD_PROJECT=$PROJECT,GOOGLE_CLOUD_LOCATION=global,GCE_METADATA_HOST=metadata.google.internal"
+    env="$env,RELGRAPH_SYNC_REVIEW_LIMIT=1000,RELGRAPH_SYNC_REVIEW_CONCURRENCY=6,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=90,VERTEX_AI_ENABLED=true,GOOGLE_CLOUD_PROJECT=$PROJECT,GOOGLE_CLOUD_LOCATION=global,GCE_METADATA_HOST=metadata.google.internal"
+  else
+    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=45"
   fi
   if [ "$RELGRAPH_SYNC_WRITES" = true ]; then
     env="$env,RELGRAPH_SYNC_APPLY_BUILD=true,RELGRAPH_SYNC_APPLY_REVIEW=true,RELGRAPH_SYNC_ALLOW_WRITES=true,RELGRAPH_SYNC_CONFIRM=APPLY_RELGRAPH_SYNC_ROUTINE"
