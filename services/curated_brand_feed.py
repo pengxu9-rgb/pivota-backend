@@ -1644,6 +1644,12 @@ RETAILER_BRAND_SPELLINGS = {
     # jsmbeauty.sg's "JUNGSAEMMOOL"). Relabelled by scripts/relabel_retailer_brand.py --family jungsaemmool (run id
     # in this change's PR); a re-crawl now writes "JUNGSAEMMOOL" onto the relabelled key instead of the old one.
     "jungsaemmool": "jungsaemmool",
+    # Same ORDER: smkoreabeauty.com wrote "O HUI (오휘)" on 20 retailer rows (_brand_key keeps the Hangul, so its key
+    # differs from "O HUI"). 18 were relabelled (relabel_retailer_brand.py --family ohui, run relabel_fad2cefd5223);
+    # the 2 the relabel held -- a 2-piece and a 3-piece Extreme White set sharing one GTIN, hence one content_key --
+    # were withdrawn first (withdraw_catalog_rows.py, reason ohui_set_gtin_collision). Neither had a product group,
+    # so a re-crawl that re-keys them cannot trip _ensure_primary_retailer_group.
+    "ohui": "ohui", "ohui오휘": "ohui",
 }
 # The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
 # --brand. content_key is
@@ -1709,6 +1715,7 @@ RETAILER_BRAND_CANONICAL = {
     "molvany": "Molvany",                   # 10 (vs "MOLVANY" 4, suppressed)
     "byterry": "BY TERRY",                  # retailer rows only (11 vs "By Terry" 4): the brand's own styling
     "jungsaemmool": "JUNGSAEMMOOL",         # jsmbeauty.sg 171 (vs smkoreabeauty.com "Jung Saem Mool" 5, relabelled)
+    "ohui": "O HUI",                        # 409 retailer rows (vs smkoreabeauty.com "O HUI (오휘)" 20: 18 relabelled, 2 withdrawn)
 }
 
 

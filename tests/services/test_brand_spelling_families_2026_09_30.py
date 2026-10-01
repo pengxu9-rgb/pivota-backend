@@ -148,7 +148,6 @@ def test_the_corpus_is_the_measured_one():
 # ---- identity-changing splits: NOT families yet (ORDER: relabel first) ------------------------------------------
 
 @pytest.mark.parametrize("host,vendor,canonical", [
-    ("smkoreabeauty.com", "O HUI (오휘)", "O HUI"),          # 20 retailer rows
     ("misshaus.com", "APIEU", "A'PIEU"),                      # 17 brand rows; product_key moves with it
     ("supergoop.com", "Supergoop", "Supergoop!"),             # 8 brand rows; no relabel tool reaches them
 ])
@@ -176,4 +175,19 @@ def test_jungsaemmool_became_a_family_after_its_relabel():
         retailer_name="smkoreabeauty.com",
     )
     assert row["pdp"]["brand"] == "JUNGSAEMMOOL"
+
+
+def test_ohui_became_a_family_after_its_relabel():
+    """18 "O HUI (오휘)" rows relabelled, the 2 held GTIN-sharing sets withdrawn: the family now writes "O HUI"."""
+    for vendor in ("O HUI (오휘)", "O HUI", "OHUI"):
+        assert feed._retailer_brand_family(feed._brand_key(vendor)) == "ohui", vendor
+    row = feed.shopify_product_to_record(
+        {"id": 9100778, "vendor": "O HUI (오휘)", "title": "Miracle Moisture Cream", "handle": "ohui-cream",
+         "product_type": "Cream", "body_html": "<p>Ingredients: Water, Glycerin</p>",
+         "images": [{"src": "https://cdn.example/ohui.jpg"}],
+         "variants": [{"id": 45000000007778, "price": "52.00", "available": True, "sku": "ohui-cream"}]},
+        domain="smkoreabeauty.com", category_path="beauty/skincare", currency="USD", source_role="retailer",
+        retailer_name="smkoreabeauty.com",
+    )
+    assert row["pdp"]["brand"] == "O HUI"
 
