@@ -76,6 +76,13 @@ deadline cancellation and carried on would defeat the watchdog the whole schedul
 around (#1754). It propagates, and the `finally` still releases every claim on the way out.
 `test_a_cancelled_run_propagates_and_still_releases_every_claim` pins both halves.
 
+The ONE `except asyncio.CancelledError` in this file re-raises on its next line. It exists to
+tell the cleanup WHY it is finding claims: a run cancelled mid-step — its deadline, or the
+service shutting down under a deploy — holds claims because it was interrupted, not because the
+loop forgot them. The release is identical either way; only the log line differs, and that
+difference is what keeps every deploy that lands mid-step from paging as a failing poller
+(infra/gcp/setup_monitoring.sh excludes `released on cancellation`).
+
 The claim is NOT released by every path through `advance`, which is why the release here is
 unconditional rather than conditional on the outcome:
 
@@ -143,6 +150,7 @@ service that would run this is deployed separately — see docs/runbooks/reap_ag
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import socket
@@ -382,8 +390,9 @@ class PollReport:
     with a live hosted page is not in it. It is read in STEP 5, on armed runs only, so:
 
         >= 0   counted, and that is the count.
-        -1     NOT COUNTED (`NOT_COUNTED`): the rail is disarmed, or the read failed — in which
-               case `errors` says so. Never 0: "nobody looked" must not read as "nobody is stuck".
+        -1     NOT COUNTED (`NOT_COUNTED`): the rail is disarmed, the run budget was already
+               spent when step 5 was reached, or the read failed — in which last case `errors`
+               says so. Never 0: "nobody looked" must not read as "nobody is stuck".
     """
 
     requeued: int = 0
@@ -548,8 +557,14 @@ async def _sweep_until_drained(
     return total
 
 
-async def _release_leftovers(worker: str) -> int:
+async def _release_leftovers(worker: str, *, cancelled: bool = False) -> int:
     """Release every claim this worker still holds. Returns how many there were.
+
+    `cancelled` CHANGES THE LOG LINE AND NOTHING ELSE. On a run that completed its loop, a
+    claim found here is a bug and is logged as one, at ERROR. On a run that was cancelled
+    mid-step the claims are the ones it was interrupted holding: expected, logged at WARNING
+    with the words `released on cancellation`, which the failing-poller metric excludes. The
+    SELECT, the release and the return value are the same on both paths.
 
     RUNS IN A `finally`, INCLUDING ON A CANCEL, so it is written to survive things going wrong
     rather than to be elegant:
@@ -562,8 +577,8 @@ async def _release_leftovers(worker: str) -> int:
         rows behind it — the same rule jobs/agent_card_revocation_sweep.py states as rule 3.
       * `except Exception`, never `BaseException`: a cancellation must keep travelling.
 
-    Anything it finds is a bug in the loop above, which is why the caller counts the result under
-    `errors`. But it is RELEASED first: leaving a row stuck for a whole lease to make a point
+    On a run that finished its loop, anything it finds is a bug in the loop above, which is why
+    the caller counts the result under `errors`. But it is RELEASED first: leaving a row stuck for a whole lease to make a point
     helps nobody.
     """
     leftovers: List[Any] = []
@@ -588,11 +603,18 @@ async def _release_leftovers(worker: str) -> int:
     released = 0
     for leftover in leftovers:
         purchase_id = str(leftover["id"])
-        logger.error(
-            "reap_agentic_poll: purchase=%s was STILL CLAIMED after the loop; releasing it. "
-            "This is a bug in the poller, not in the ledger",
-            purchase_id,
-        )
+        if cancelled:
+            logger.warning(
+                "reap_agentic_poll: purchase=%s released on cancellation — the run was "
+                "cancelled (its deadline, or the service shutting down) while it held this claim",
+                purchase_id,
+            )
+        else:
+            logger.error(
+                "reap_agentic_poll: purchase=%s was STILL CLAIMED after the loop; releasing it. "
+                "This is a bug in the poller, not in the ledger",
+                purchase_id,
+            )
         try:
             await ledger.release_claim(purchase_id, worker)
         except Exception as exc:  # noqa: BLE001 — one bad row must not strand the rest
@@ -778,6 +800,7 @@ async def run_reap_agentic_purchase_poll(
     # EVERYTHING FROM HERE IS INSIDE ONE try/finally, AND THAT IS FIX F1/F2. The `finally` is the
     # only thing standing between a cancelled or raising run and a batch of leases held for a
     # full lease window — with, in two states, a buyer's address and email on them.
+    cancelled = False
     try:
         for row in rows:
             purchase_id = str(row["id"])
@@ -886,22 +909,37 @@ async def run_reap_agentic_purchase_poll(
             # bare, so a pool blip on row 2 of 10 propagated out of the whole function and
             # abandoned the eight leases behind it.
             await _release_guarded(purchase_id, worker, counts)
+    except asyncio.CancelledError:
+        # NOT SWALLOWED: re-raised on the next line. Noted only so the cleanup below can say
+        # what it is looking at — see the module header.
+        cancelled = True
+        raise
     finally:
         # THE INVARIANT, CHECKED RATHER THAN ASSERTED IN PROSE — and checked on the way out of a
         # cancellation too, which is the path the first cut had no answer for at all.
-        counts["errors"] += await _release_leftovers(worker)
+        counts["errors"] += await _release_leftovers(worker, cancelled=cancelled)
 
     # ── 5. the stuck count — READ ONLY, AND ONLY ON AN ARMED RUN ─────────────────────────────
     # After the loop, so a purchase this very tick moved is not counted, and below both early
     # returns above, so a disarmed rail issues no statement it did not issue before. It is given
     # the SAME max age and grace the expire sweep was given at the top of this run: a waiting
     # row's deadline is the sweep's own, not a second opinion.
+    #
+    # NOT ON A SPENT BUDGET. The budget is what keeps a run inside its deadline; a diagnostic
+    # that could add a pool checkout and a statement timeout on top of an over-budget run is how
+    # a slow tick becomes a cancelled one. Skipped, the field stays NOT_COUNTED and `errors` is
+    # NOT raised — nothing failed — so a tick like this is neither "nothing stuck" nor a page.
+    # A poller that spends its budget on EVERY tick therefore reports no stuck count at all;
+    # `abandoned_budget` is the count that says so, and the runbook says what to do about it.
     try:
-        counts["stuck_over_age"] = await ledger.count_stuck_purchases(
-            stuck_after_seconds=STUCK_AFTER_SECONDS,
-            max_age_seconds=hosted_max_age,
-            enrollment_grace_seconds=enrollment_grace,
-        )
+        if _budget_spent():
+            logger.debug("reap_agentic_poll: step 5 skipped, the run budget is spent")
+        else:
+            counts["stuck_over_age"] = await ledger.count_stuck_purchases(
+                stuck_after_seconds=STUCK_AFTER_SECONDS,
+                max_age_seconds=hosted_max_age,
+                enrollment_grace_seconds=enrollment_grace,
+            )
     except Exception as exc:  # noqa: BLE001 — a diagnostic must never fail the run that carries it
         # NOT_COUNTED stays on the report and `errors` carries the failure, so the alert that
         # cannot see stuck purchases this tick is replaced by the one that says the poller is
@@ -917,8 +955,8 @@ async def run_reap_agentic_purchase_poll(
     report = _report()
     # THE PROOF LINE: `[ts] INFO - reap_agentic_poll: PollReport(...)` on the worker's stdout.
     # THREE LOG-BASED METRICS MATCH THIS LINE (infra/gcp/setup_monitoring.sh): its presence,
-    # `stuck_over_age=[1-9]` and `errors=[1-9]`. The prefix, the `PollReport(` and the
-    # `name=<int>` pairs are therefore a contract; tests/test_reap_rail_alerts.py runs this job
+    # `stuck_over_age=[1-9]` and `, errors=[1-9]`. The prefix, the `PollReport(` and the
+    # `, name=<int>` pairs are therefore a contract; tests/test_reap_rail_alerts.py runs this job
     # and feeds the line it really printed through the filters.
     operator_logger.info("reap_agentic_poll: %s", report)
     return report

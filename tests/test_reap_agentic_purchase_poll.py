@@ -1064,6 +1064,59 @@ async def test_a_cancelled_run_propagates_and_still_releases_every_claim(monkeyp
     ]
 
 
+async def test_a_cancelled_run_calls_its_claims_released_on_cancellation_not_a_bug(
+    monkeypatch, reap, caplog
+):
+    """THE LOG LINE IS PART OF AN ALERT. A run cancelled mid-step — its deadline, or the service
+    shutting down under a deploy — holds claims because it was interrupted. They are released
+    exactly as a leftover is, but logged at WARNING as `released on cancellation`, which the
+    failing-poller metric excludes; `STILL CLAIMED after the loop` is the bug's line and must not
+    appear, or every deploy that lands mid-step pages (review of #2488, P1)."""
+    ids = [await _start(buyer_ref=f"bref_{n}") for n in range(3)]
+
+    async def _cancelled(pid, worker):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(job.purchase_svc, "advance", _cancelled)
+    caplog.set_level(logging.DEBUG, logger="jobs.reap_agentic_purchase_poll")
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run(worker_id="w1")
+
+    assert await _all_claims() == {}
+    records = [r for r in caplog.records if r.name == "jobs.reap_agentic_purchase_poll"]
+    released = [r for r in records if "released on cancellation" in r.getMessage()]
+    assert sorted(r.getMessage().split("purchase=")[1].split(" ")[0] for r in released) == sorted(ids)
+    assert {r.levelno for r in released} == {logging.WARNING}
+    assert not [r for r in records if "STILL CLAIMED" in r.getMessage()]
+    assert not [r for r in records if r.levelno >= logging.ERROR]
+
+
+async def test_a_claim_the_loop_forgot_is_still_logged_as_the_bug_it_is(monkeypatch, reap, caplog):
+    """The other side of the split: no cancellation, so a claim found after the loop keeps the
+    ERROR line and the `errors` count. The cancel wording must not leak onto this path."""
+    purchase_id = await _start()
+    real_release = job.ledger.release_claim
+    swallowed = []
+
+    async def _swallow_once(pid, worker, **kwargs):
+        if pid == purchase_id and not swallowed:
+            swallowed.append(pid)
+            return await _get(pid)
+        return await real_release(pid, worker, **kwargs)
+
+    monkeypatch.setattr(job.ledger, "release_claim", _swallow_once)
+    caplog.set_level(logging.DEBUG, logger="jobs.reap_agentic_purchase_poll")
+
+    report = await _run(worker_id="w1")
+
+    assert report.errors == 1
+    bug = [r for r in caplog.records if "STILL CLAIMED after the loop" in r.getMessage()]
+    assert len(bug) == 1 and bug[0].levelno == logging.ERROR
+    assert purchase_id in bug[0].getMessage()
+    assert "released on cancellation" not in caplog.text
+
+
 async def test_a_raising_release_does_not_abandon_the_rest_of_the_batch(monkeypatch, reap):
     """The post-step `release_claim` sat BARE in the first cut, outside the per-row guard, so a
     pool blip on row 2 of 4 propagated out of the whole function and abandoned every lease behind
@@ -1821,6 +1874,45 @@ async def test_a_failed_stuck_read_is_not_counted_not_zero_and_the_run_still_rep
     assert EMAIL not in caplog.text, "the exception MESSAGE reached a log line"
     (line,) = [ln for ln in pivota_lines(out) if "PollReport(" in ln]
     assert "stuck_over_age=-1" in line and "errors=1" in line
+
+
+async def test_a_spent_budget_skips_the_stuck_read_and_says_not_counted(monkeypatch, reap):
+    """Step 5 respects the run budget. A diagnostic issued past it can add a pool checkout and a
+    statement timeout to a run that is already over-budget — the way a slow tick becomes one the
+    scheduler cancels. Skipped, the report says NOT COUNTED, `errors` stays 0 (nothing failed),
+    and the report line is still printed."""
+    stuck = await _start(buyer_ref="bref_paid")
+    await _park(stuck, "processing", job.STUCK_AFTER_SECONDS + 5, reap_checkout_id="chk_stuck")
+    await _start(buyer_ref="bref_slow")
+    reads = _watch_the_stuck_read(monkeypatch)
+    clock = _Clock(monkeypatch)
+    resolved = _resolved()
+
+    def _slow_row(**kwargs):
+        clock.spend_budget()  # the one row this run steps uses the whole budget
+        return resolved
+
+    reap.resolve_our_row = _slow_row
+
+    with capture_pivota_stdout() as out:
+        report = await _run(worker_id="w1")
+
+    assert report.advanced == 1, "the run did its real work before the budget ran out"
+    assert reads == [], "the stuck-count read was issued on a spent budget"
+    assert report.stuck_over_age == job.NOT_COUNTED
+    assert report.errors == 0, "a skipped diagnostic is not an error"
+    (line,) = [ln for ln in pivota_lines(out) if "PollReport(" in ln]
+    assert "stuck_over_age=-1" in line
+
+
+async def test_a_run_inside_its_budget_issues_the_stuck_read_once(monkeypatch, reap):
+    """The control for the skip above: same shape, budget not spent."""
+    await _start()
+    reads = _watch_the_stuck_read(monkeypatch)
+    _Clock(monkeypatch)
+    report = await _run(worker_id="w1")
+    assert len(reads) == 1
+    assert report.stuck_over_age == 0
 
 
 async def test_the_stuck_read_is_given_the_windows_the_expire_sweep_was_given(monkeypatch, reap):

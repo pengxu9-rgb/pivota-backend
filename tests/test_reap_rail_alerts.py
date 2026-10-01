@@ -26,8 +26,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import json
 import os
 import re
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -44,9 +47,13 @@ from pivota_log_capture import capture_pivota_stdout, pivota_lines, root_as_in_p
 # The poller's own SQLite fixtures and helpers. The FIXTURES are imported by name on purpose:
 # pytest discovers a fixture wherever the name is bound, and a second copy of the faked Reap
 # surface would be a second thing to keep in step with the state machine.
+from test_reap_agentic_purchase import _resolved  # noqa: E402
 from test_reap_agentic_purchase_poll import (  # noqa: E402,F401
+    _Clock,
+    _all_claims,
     _db,
     _env,
+    _get,
     _no_network,
     _park,
     _raw,
@@ -55,7 +62,6 @@ from test_reap_agentic_purchase_poll import (  # noqa: E402,F401
     attribution,
     reap,
 )
-from test_monitoring_policy_snapshot import generated_policies  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     IS_POSTGRES, reason="drives the poller on its SQLite fixtures; the filters are dialect-free"
@@ -80,6 +86,32 @@ METRICS = {
 @pytest.fixture(scope="module")
 def source() -> str:
     return SCRIPT.read_text(encoding="utf-8")
+
+
+CHANNEL = "projects/p/notificationChannels/1"
+
+
+def reap_policies() -> dict:
+    """The three policies' JSON, from the script's OWN generators — the python inside `policy`
+    and `promql_policy` is extracted and run; the provisioning script itself never is. Same idea
+    as tests/test_monitoring_policy_snapshot.py, keyed on the function these policies are
+    written through."""
+    source = SCRIPT.read_text(encoding="utf-8")
+    generators = {
+        name: source.split(name + "() {", 1)[1].split("python3 -c '\n", 1)[1].split("' \"$@\"", 1)[0]
+        for name in ("policy", "promql_policy")
+    }
+    out = {}
+    for name, generator, body in re.findall(
+        r'^upsert_on_new_metric "([^"]+)" "\$\((policy|promql_policy) (.*?)\)"$', source, re.S | re.M
+    ):
+        args = shlex.split(body.replace("\\\n", "").replace("\\`", "`"))
+        proc = subprocess.run(
+            [sys.executable, "-c", generators[generator], *args, CHANNEL],
+            text=True, capture_output=True, check=True,
+        )
+        out[name] = json.loads(proc.stdout)
+    return out
 
 
 def _filter(source: str, var: str) -> str:
@@ -348,6 +380,34 @@ async def test_a_stuck_count_that_could_not_be_taken_is_failing_not_stuck(
     assert counts["reap_agentic_poll_report"] == 1
 
 
+async def test_a_tick_that_ran_out_of_budget_is_a_heartbeat_and_not_a_page(
+    filters, monkeypatch, reap
+):
+    """Step 5 is skipped on a spent budget: the line is still printed, with the sentinel. That
+    is neither a stuck purchase nor a failing poller, so it must feed only the heartbeat — in
+    particular the skip must not be announced on a line the failing metric would count."""
+    paid = await _start(buyer_ref="bref_paid")
+    await _park(paid, "processing", job.STUCK_AFTER_SECONDS + 5, reap_checkout_id="chk_stuck")
+    await _start(buyer_ref="bref_slow")
+    clock = _Clock(monkeypatch)
+    resolved = _resolved()
+
+    def _slow_row(**kwargs):
+        clock.spend_budget()
+        return resolved
+
+    reap.resolve_our_row = _slow_row
+    with worker_log() as lines:
+        report = await _run(worker_id="w1")
+    assert report.stuck_over_age == job.NOT_COUNTED and report.errors == 0
+    assert any("stuck_over_age=-1" in line for line in lines), lines
+    assert _counts(filters, lines) == {
+        "reap_agentic_poll_report": 1,
+        "reap_agentic_poll_stuck": 0,
+        "reap_agentic_poll_failing": 0,
+    }, lines
+
+
 async def test_a_payment_past_the_attempt_ceiling_reaches_the_failing_metric(
     filters, monkeypatch, reap
 ):
@@ -452,10 +512,13 @@ async def test_another_jobs_deadline_does_not(filters, monkeypatch):
     assert lines and _counts(filters, lines) == dict.fromkeys(METRICS, 0), lines
 
 
-async def test_a_deploy_landing_mid_run_does_not_page(filters, monkeypatch):
-    """Shutting the service down cancels the runner's WRAPPER while a run is in flight, and the
-    runner says so at ERROR ("ABANDONED as a zombie (wrapper cancelled ...)"). That is every
-    deploy that lands mid-step, not a failing poller."""
+async def test_a_deploy_landing_while_the_runner_holds_a_stub_run_does_not_page(
+    filters, monkeypatch
+):
+    """The runner's half on its own: shutting the service down cancels the runner's WRAPPER
+    while a run is in flight, and the runner says so at ERROR ("ABANDONED as a zombie (wrapper
+    cancelled ...)"). The poller's half — the claims it was holding — is the next test, and is
+    the one the first cut of the filter got wrong."""
     monkeypatch.setattr(runner, "_REGISTRY", {})
     started = asyncio.Event()
 
@@ -477,6 +540,128 @@ async def test_a_deploy_landing_mid_run_does_not_page(filters, monkeypatch):
         await asyncio.sleep(0.2)  # let the grace timer run inside the capture
     assert any("wrapper cancelled" in line for line in lines), lines
     assert _counts(filters, lines) == dict.fromkeys(METRICS, 0), lines
+
+
+def _hang_mid_step(reap) -> asyncio.Event:
+    """Make the partner never answer, so the REAL poller is parked inside the REAL `advance` of
+    its first row with the whole batch claimed. The event is set once it is there."""
+    in_step = asyncio.Event()
+
+    async def _never_answers(**kwargs):
+        in_step.set()
+        await asyncio.sleep(60)
+
+    reap.resolve_our_row = _never_answers
+    return in_step
+
+
+async def _until_no_claims() -> None:
+    for _ in range(200):
+        if not await _all_claims():
+            return
+        await asyncio.sleep(0.02)
+
+
+async def test_a_deploy_landing_mid_step_with_claims_held_does_not_page(filters, monkeypatch, reap):
+    """P1 FROM REVIEW OF #2488, reproduced as it was measured: the REAL poller, through the REAL
+    `runner.run_isolated`, cancelled by its wrapper mid-step with three rows claimed. The job's
+    `finally` releases all three and logs each — and the first cut of the failing filter matched
+    those three lines, so every deploy that landed during a step would have paged
+    (`{'report': 0, 'stuck': 0, 'failing': 3}`).
+
+    Every line the worker wrote is fed through the filters; none may count."""
+    monkeypatch.setattr(runner, "_REGISTRY", {})
+    ids = [await _start(buyer_ref=f"bref_{n}") for n in range(3)]
+    in_step = _hang_mid_step(reap)
+
+    with worker_log() as lines:
+        wrapper = asyncio.ensure_future(
+            runner.run_isolated(
+                "reap_agentic_purchase_poll", job.run_reap_agentic_purchase_poll,
+                deadline_seconds=600, cancel_grace_seconds=5.0,
+            )
+        )
+        await asyncio.wait_for(in_step.wait(), 10)
+        assert sorted(await _all_claims()) == sorted(ids), "the run is not holding the batch"
+        wrapper.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wrapper
+        await _until_no_claims()
+
+    assert await _all_claims() == {}, "the cancelled run left claims behind"
+    released = [line for line in lines if "released on cancellation" in line]
+    assert len(released) == 3, lines
+    assert not any("STILL CLAIMED" in line for line in lines), (
+        "a cancelled run described its claims as a bug in the loop"
+    )
+    assert any("wrapper cancelled" in line for line in lines), lines
+    assert len(lines) >= 4
+    assert _counts(filters, lines) == dict.fromkeys(METRICS, 0), lines
+
+
+async def test_a_real_run_cancelled_at_its_deadline_pages_once_for_the_deadline(
+    filters, monkeypatch, reap
+):
+    """The other cancellation. The per-claim lines are the same expected ones and do not count;
+    the RUNNER's deadline line does, exactly once — a wedged run is a failing poller."""
+    monkeypatch.setattr(runner, "_REGISTRY", {})
+    for n in range(3):
+        await _start(buyer_ref=f"bref_{n}")
+    _hang_mid_step(reap)
+
+    with worker_log() as lines:
+        with pytest.raises(runner.JobDeadlineExceeded):
+            await runner.run_isolated(
+                "reap_agentic_purchase_poll", job.run_reap_agentic_purchase_poll,
+                deadline_seconds=0.5, cancel_grace_seconds=5.0,
+            )
+        await _until_no_claims()
+
+    assert await _all_claims() == {}
+    assert sum("released on cancellation" in line for line in lines) == 3, lines
+    hit = [line for line in lines if matches(filters["reap_agentic_poll_failing"], _entry(line))]
+    assert len(hit) == 1 and "run deadline" in hit[0], lines
+
+
+async def test_a_claim_the_loop_forgot_still_pages_twice_over(filters, monkeypatch, reap):
+    """THE PATH THE EXCLUSION MUST NOT HIDE. A run that FINISHED its loop and still holds a claim
+    has a bug: it keeps its own ERROR text, which the filter matches, and the leftover is counted
+    under `errors`, so the report line matches as well. Two independent arms, both live."""
+    purchase_id = await _start()
+    real_release = job.ledger.release_claim
+    swallowed = []
+
+    async def _swallow_once(pid, worker, **kwargs):
+        if pid == purchase_id and not swallowed:
+            swallowed.append(pid)
+            return await _get(pid)  # looks like a successful release; releases nothing
+        return await real_release(pid, worker, **kwargs)
+
+    monkeypatch.setattr(job.ledger, "release_claim", _swallow_once)
+
+    with worker_log() as lines:
+        report = await _run(worker_id="w1")
+
+    assert report.errors == 1 and await _all_claims() == {}
+    hit = [line for line in lines if matches(filters["reap_agentic_poll_failing"], _entry(line))]
+    assert len(hit) == 2, lines
+    assert any("STILL CLAIMED after the loop" in line for line in hit), "arm (b), the job's line"
+    assert any("PollReport(" in line and ", errors=1," in line for line in hit), "arm (a), errors"
+    assert not any("released on cancellation" in line for line in lines)
+
+
+def test_only_the_errors_field_itself_counts_as_errors(filters):
+    """`, errors=` is anchored to the field. A later field whose NAME ends in `errors` and is
+    non-zero must not read as the poller failing — and the real field still must."""
+    def line(tail):
+        return "[2026-10-01 09:39:48,028] INFO - reap_agentic_poll: PollReport(requeued=0, " + tail
+
+    quiet = line("terminal=0, errors=0, skipped_disabled=0, transport_errors=7, duration_ms=19)")
+    loud = line("terminal=0, errors=3, skipped_disabled=0, duration_ms=19)")
+    failing = filters["reap_agentic_poll_failing"]
+    assert not matches(failing, _entry(quiet))
+    assert matches(failing, _entry(loud))
+    assert 'textPayload=~", errors=[1-9]"' in failing
 
 
 # ── lines that look close and must not count ─────────────────────────────────────────────────
@@ -566,7 +751,7 @@ def _threshold(policy: dict) -> dict:
 def test_the_stuck_policy_fires_on_one_report_and_stays_one_incident():
     from services.audit_scheduler import _JOB_RUN_DEADLINES
 
-    policy = generated_policies()[STUCK_POLICY]
+    policy = reap_policies()[STUCK_POLICY]
     threshold = _threshold(policy)
     assert threshold["filter"] == (
         'metric.type="logging.googleapis.com/user/reap_agentic_poll_stuck" '
@@ -588,7 +773,7 @@ def test_the_stuck_policy_fires_on_one_report_and_stays_one_incident():
 
 
 def test_the_failing_policy_fires_on_one_line():
-    policy = generated_policies()[FAILING_POLICY]
+    policy = reap_policies()[FAILING_POLICY]
     threshold = _threshold(policy)
     assert threshold["filter"] == (
         'metric.type="logging.googleapis.com/user/reap_agentic_poll_failing" '
@@ -599,45 +784,257 @@ def test_the_failing_policy_fires_on_one_line():
     assert "docs/runbooks/reap_agentic_purchase.md" in policy["documentation"]["content"]
 
 
-def test_the_silent_policy_needs_a_heartbeat_to_have_existed():
-    """DARK-SAFE BY CONSTRUCTION. The query is `(reports in the 6h before the window) unless
-    (reports in the window)`: with no report series at all — an environment never armed — the
-    left side is empty and so is the result. A bare absence condition, or `... < 1`, would page
-    production the moment it was installed."""
-    from services.audit_scheduler import _JOB_RUN_DEADLINES
+def _silent_condition() -> dict:
+    (condition,) = reap_policies()[SILENT_POLICY]["conditions"]
+    return condition["conditionPrometheusQueryLanguage"]
 
-    policy = generated_policies()[SILENT_POLICY]
-    (condition,) = policy["conditions"]
-    promql = condition["conditionPrometheusQueryLanguage"]
+
+def _silent_query():
     series = 'logging_googleapis_com:user_reap_agentic_poll_report{monitored_resource="cloud_run_revision"}'
+    query = _silent_condition()["query"]
     m = re.fullmatch(
         r"\(sum\(sum_over_time\((?P<a>.+?)\[(?P<lookback>\d+)h\] offset (?P<gap>\d+)m\)\) > 0\) "
         r"unless \(sum\(sum_over_time\((?P<b>.+?)\[(?P<window>\d+)m\]\)\) > 0\)",
-        promql["query"],
+        query,
     )
-    assert m, promql["query"]
+    assert m, query
     assert m["a"] == m["b"] == series
+    return m
+
+
+def test_the_silent_policy_needs_a_heartbeat_to_have_existed():
+    """DARK-SAFE BY CONSTRUCTION. The query is `(reports in the look-back before the window)
+    unless (reports in the window)`: with no report series at all — an environment never armed —
+    the left side is empty and so is the result. A bare absence condition, or `... < 1`, would
+    page production the moment it was installed."""
+    m = _silent_query()
     assert "reap_agentic_poll_report" in METRICS
     # The "was alive" side must end where the "is silent" side begins, or a poller that is
     # reporting right now would satisfy both and the two could not disagree.
     assert m["gap"] == m["window"]
-    # One run may take its whole deadline between two reports.
-    assert int(m["window"]) * 60 >= _JOB_RUN_DEADLINES["reap_agentic_purchase_poll"]
-    # Long enough that the incident is still open when somebody reads the email; short enough
-    # that a rail disarmed on purpose stops being "recently alive" the same day.
-    assert int(m["lookback"]) == 6
-    assert promql["duration"] == "300s" and promql["evaluationInterval"] == "60s"
+    query = _silent_condition()["query"]
     # sum_over_time over the per-minute delta samples; increase()/rate() misread them.
-    assert "increase(" not in promql["query"] and "rate(" not in promql["query"]
-    assert "disarmed on purpose" in policy["documentation"]["content"]
+    assert "increase(" not in query and "rate(" not in query
+
+
+def test_the_silent_window_outlasts_a_slow_run_and_the_metrics_own_lag():
+    """Two things can put a gap between two report lines AS MONITORING SEES THEM without the
+    poller being dead: one run using its whole deadline, and a log-based metric arriving late —
+    documented as up to 10 minutes. The window has to be longer than either."""
+    from services.audit_scheduler import _JOB_RUN_DEADLINES
+
+    window_s = int(_silent_query()["window"]) * 60
+    assert window_s > _JOB_RUN_DEADLINES["reap_agentic_purchase_poll"]
+    assert window_s > 10 * 60
+    promql = _silent_condition()
+    assert promql["duration"] == "300s" and promql["evaluationInterval"] == "60s"
+
+
+def test_the_silent_look_back_is_the_longest_the_platform_documents():
+    """A dead poller stops being "recently alive" when the look-back runs out, and after that no
+    policy says anything — so the look-back is as long as it may be. For a user-defined log-based
+    metric a PromQL condition may read "the most recent 25 hours" and "the sum of your retest
+    window, alignment period, and any time shift caused by using the offset modifier must be at
+    most 25 hours"."""
+    m = _silent_query()
+    duration_s = int(_silent_condition()["duration"].rstrip("s"))
+    reach_s = int(m["lookback"]) * 3600 + int(m["gap"]) * 60 + duration_s
+    assert int(m["lookback"]) == 24
+    assert reach_s <= 25 * 3600, f"the query reaches back {reach_s}s, past the documented 25 hours"
+
+
+def test_the_silent_policy_keeps_emailing_while_it_is_open():
+    """One email for a poller that then stays dead for a day is one email somebody can miss."""
+    policy = reap_policies()[SILENT_POLICY]
+    (strategy,) = policy["alertStrategy"]["notificationChannelStrategy"]
+    assert strategy["notificationChannelNames"] == policy["notificationChannels"] == [CHANNEL]
+    seconds = int(strategy["renotifyInterval"].rstrip("s"))
+    assert 30 * 60 <= seconds <= 24 * 3600, "the API bounds renotifyInterval to 30 minutes..24 hours"
+    assert seconds == 3600
+    assert policy["alertStrategy"]["autoClose"] == "3600s"
+    doc = policy["documentation"]["content"]
+    assert "snooze" in doc and "24 hours after the last report" in doc
+
+
+def test_the_silent_policy_does_not_need_its_metric_to_exist_yet():
+    """The heartbeat metric is created by the same run, seconds earlier, and a PromQL policy is
+    refused when a metric it names has no descriptor — unless the condition says not to check.
+    With the check off the API can no longer catch a typo, so the name is pinned here to the
+    metric the script creates."""
+    assert _silent_condition()["disableMetricValidation"] is True
+    assert "logging_googleapis_com:user_reap_agentic_poll_report{" in _silent_condition()["query"]
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "upsert_log_metric reap_agentic_poll_report " in source
+
+
+def test_the_optional_promql_arguments_leave_every_other_policy_as_it_was():
+    """`upsert` deletes and re-creates, so a field the generator started adding to every PromQL
+    policy would land on the live load-balancer policy on the next run. Without the optional
+    arguments the generator's output has no renotify and no validation switch."""
+    from test_monitoring_policy_snapshot import generated_policies
+
+    lb = generated_policies()["prod: load balancer 5xx"]
+    assert set(lb["alertStrategy"]) == {"autoClose"}
+    (condition,) = lb["conditions"]
+    assert set(condition["conditionPrometheusQueryLanguage"]) == {
+        "query", "duration", "evaluationInterval"
+    }
 
 
 def test_every_policy_goes_to_the_channel_and_is_in_the_runbook():
-    policies = generated_policies()
+    policies = reap_policies()
     runbook = RUNBOOK.read_text(encoding="utf-8")
     for name in (STUCK_POLICY, FAILING_POLICY, SILENT_POLICY):
         policy = policies[name]
         assert policy["displayName"] == name
-        assert policy["notificationChannels"], name
-        assert policy["alertStrategy"] == {"autoClose": "3600s"}
+        assert policy["notificationChannels"] == [CHANNEL], name
+        assert policy["alertStrategy"]["autoClose"] == "3600s"
         assert name in runbook, f"the runbook's Alerts section does not name {name!r}"
+
+
+# ── the first run: policies over metrics created seconds earlier ─────────────────────────────
+#
+# Monitoring rejects a policy over a log metric it cannot see yet ("Cannot find metric(s) that
+# match type ... it could take up to 10 minutes to become available"). Through `upsert` that
+# rejection aborts the run. `upsert_on_new_metric` is the answer, and it is tested by running
+# ITS OWN TEXT, extracted from the script, in a shell where `api` and `sleep` are stubs and
+# `curl`/`gcloud` are tripwires. The provisioning script itself is never executed.
+
+_REJECTED = json.dumps({"error": {"code": 404, "message": (
+    'Cannot find metric(s) that match type = "logging.googleapis.com/user/reap_agentic_poll_stuck". '
+    "If a metric was created recently, it could take up to 10 minutes to become available. "
+    "Please try again soon.")}})
+
+_API_STUB = r'''
+import json, sys
+state_path, method, path = sys.argv[1:4]
+state = json.load(open(state_path))
+state["calls"].append([method, path])
+if method == "GET":
+    out = {"alertPolicies": state["existing"]}
+elif method == "POST":
+    answers = state["post"]
+    out = answers.pop(0) if len(answers) > 1 else answers[0]
+else:
+    out = {}
+json.dump(state, open(state_path, "w"))
+print(json.dumps(out))
+'''
+
+
+def _shell_function(source: str, name: str) -> str:
+    start = source.index(f"\n{name}() {{") + 1
+    return source[start: source.index("\n}\n", start) + 3]
+
+
+def _run_upserts(tmp_path, source, *, post, existing=(), tries=20, names=("prod: A",)):
+    """Run `upsert_on_new_metric` for each name against a scripted Monitoring API."""
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"calls": [], "existing": list(existing), "post": list(post)}))
+    stub = tmp_path / "api_stub.py"
+    stub.write_text(_API_STUB)
+    calls = "".join(
+        f"upsert_on_new_metric {shlex.quote(n)} {shlex.quote(json.dumps({'displayName': n}))}\n"
+        for n in names
+    )
+    script = f"""
+set -euo pipefail
+curl() {{ echo "TRIPWIRE: curl was called" >&2; exit 97; }}
+gcloud() {{ echo "TRIPWIRE: gcloud was called" >&2; exit 97; }}
+sleep() {{ echo "sleep $1" >> {shlex.quote(str(tmp_path / 'sleeps'))}; }}
+api() {{ {shlex.quote(sys.executable)} {shlex.quote(str(stub))} {shlex.quote(str(state))} "$1" "$2"; }}
+{_shell_function(source, "check")}
+NEW_METRIC_TRIES={tries}
+NEW_METRIC_RETRY_SECONDS=30
+NEW_METRIC_DEFERRED=""
+{_shell_function(source, "upsert_on_new_metric")}
+{calls}
+echo "DEFERRED=[$NEW_METRIC_DEFERRED] TRIES=$NEW_METRIC_TRIES"
+"""
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+    sleeps = (tmp_path / "sleeps").read_text().splitlines() if (tmp_path / "sleeps").exists() else []
+    return proc, json.loads(state.read_text())["calls"], sleeps
+
+
+_CREATED = {"name": "projects/p/alertPolicies/new", "displayName": "prod: A"}
+_STALE = [
+    {"name": "projects/p/alertPolicies/old1", "displayName": "prod: A"},
+    {"name": "projects/p/alertPolicies/other", "displayName": "prod: host is down"},
+    {"name": "projects/p/alertPolicies/old2", "displayName": "prod: A"},
+]
+
+
+def test_a_visible_metric_is_created_first_and_the_old_policy_deleted_after(tmp_path, source):
+    """CREATE, THEN DELETE — the reverse of `upsert`. Every policy carrying the name goes (a run
+    that died between the two steps leaves a pair), and nobody else's does."""
+    proc, calls, sleeps = _run_upserts(tmp_path, source, post=[_CREATED], existing=_STALE)
+    assert proc.returncode == 0, proc.stderr
+    assert calls == [
+        ["GET", "alertPolicies"],
+        ["POST", "alertPolicies"],
+        ["DELETE", "alertPolicies/old1"],
+        ["DELETE", "alertPolicies/old2"],
+    ]
+    assert sleeps == []
+    assert "DEFERRED=[] TRIES=20" in proc.stdout
+
+
+def test_a_metric_monitoring_cannot_see_yet_is_waited_for(tmp_path, source):
+    proc, calls, sleeps = _run_upserts(
+        tmp_path, source, post=[json.loads(_REJECTED)] * 3 + [_CREATED], existing=_STALE[:1]
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert [c[0] for c in calls] == ["GET", "POST", "POST", "POST", "POST", "DELETE"]
+    assert sleeps == ["sleep 30"] * 3
+    assert "DEFERRED=[] TRIES=17" in proc.stdout
+
+
+def test_out_of_budget_the_policy_is_deferred_and_what_was_live_is_left_alone(tmp_path, source):
+    """The run does NOT abort and does NOT delete: the policy that was live stays live, the name
+    is kept for the final message, and the budget is SHARED — the second policy gets one attempt,
+    not another ten minutes."""
+    proc, calls, sleeps = _run_upserts(
+        tmp_path, source, post=[json.loads(_REJECTED)], existing=_STALE, tries=2,
+        names=("prod: A", "prod: B"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert [c[0] for c in calls] == ["GET", "POST", "POST", "POST", "GET", "POST"]
+    assert not [c for c in calls if c[0] == "DELETE"], "a deferred policy's predecessor was deleted"
+    assert sleeps == ["sleep 30"] * 2
+    assert "DEFERRED=[prod: A, prod: B] TRIES=0" in proc.stdout
+    assert "DEFERRED prod: A" in proc.stderr and "DEFERRED prod: B" in proc.stderr
+
+
+def test_any_other_api_error_still_aborts_the_run(tmp_path, source):
+    """Only the one known rejection is waited out. Everything else goes through `check`, as it
+    does for every other policy in the script — and nothing is deleted on the way out."""
+    denied = {"error": {"code": 403, "message": "Permission monitoring.alertPolicies.create denied"}}
+    proc, calls, sleeps = _run_upserts(tmp_path, source, post=[denied], existing=_STALE)
+    assert proc.returncode != 0 and proc.returncode != 97
+    assert "policy prod: A FAILED: Permission monitoring.alertPolicies.create denied" in proc.stderr
+    assert [c[0] for c in calls] == ["GET", "POST"]
+    assert sleeps == [] and "DEFERRED=" not in proc.stdout
+
+
+def test_the_script_wires_the_first_run_safely(source):
+    body = _uncommented(source)
+    # Every log metric exists before any policy is touched.
+    first_policy = body.index('\nupsert "')
+    for metric in METRICS:
+        assert body.index(f"upsert_log_metric {metric} ") < first_policy
+    # The three Reap policies, and only they, take the waiting path; they come after every
+    # `upsert`, so a deferral cannot leave one of the nine existing policies unwritten.
+    waited = re.findall(r'^upsert_on_new_metric "([^"]+)"', body, re.M)
+    assert waited == [STUCK_POLICY, FAILING_POLICY, SILENT_POLICY]
+    assert body.rindex('\nupsert "') < body.index('\nupsert_on_new_metric "')
+    assert not re.search(r'^upsert "prod: Reap', body, re.M)
+    # Ten minutes by default, shared: 20 tries of 30 s.
+    assert 'NEW_METRIC_TRIES="${NEW_METRIC_TRIES:-20}"' in body
+    assert 'NEW_METRIC_RETRY_SECONDS="${NEW_METRIC_RETRY_SECONDS:-30}"' in body
+    # A deferral is said out loud and fails the run — after the summary, and without stepping in
+    # front of the channel check, which must still be able to exit first.
+    said = body.index('echo "NOT CREATED: $NEW_METRIC_DEFERRED"')
+    channel = body.index('if [ "${CHANNEL_UNDELIVERABLE:-0}" = 1 ]; then')
+    assert body.index('print("policies:", len(ps))') < said < channel
+    tail = body[channel:]
+    assert re.search(r'if \[ -n "\$NEW_METRIC_DEFERRED" \]; then\n  exit 1\nfi\s*$', tail)
