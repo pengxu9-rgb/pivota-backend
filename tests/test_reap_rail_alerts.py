@@ -1099,6 +1099,19 @@ def test_a_list_that_is_not_a_policy_list_creates_nothing(tmp_path, source, list
         assert "list policies FAILED" in proc.stderr and "currently unavailable" in proc.stderr
 
 
+@pytest.mark.parametrize("function", ["upsert", "upsert_on_new_metric"])
+def test_a_project_with_no_policies_at_all_is_not_an_error(tmp_path, source, function):
+    """THE FIRST-EVER RUN. A project with zero alert policies answers the list with a bare `{}`
+    — no `alertPolicies` key at all; `pivota-staging` does today. That is a legitimate empty
+    list, not a malformed reply: the guard that refuses an error document must let it through,
+    and the run goes on to create. A guard written as "the key must be present" would make the
+    script unable to bootstrap a project."""
+    proc, calls, sleeps = _run_upserts(tmp_path, source, post=[_CREATED], get={}, function=function)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert calls == [["GET", "alertPolicies"], ["POST", "alertPolicies"]]
+    assert sleeps == [] and "   prod: A" in proc.stdout
+
+
 def test_plain_upsert_also_aborts_on_an_error_list_and_on_a_nameless_create(tmp_path, source):
     """The nine existing policies go through `upsert`, which had both holes. The change there is
     strictly "abort where it used to continue": the healthy path issues the same calls."""

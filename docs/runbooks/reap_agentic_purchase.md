@@ -782,9 +782,17 @@ before relying on them at a later commit.
      `REAP_AGENTIC_CART_LINK_LANE_ENABLED=0`, which gates the gateway's create path only. Do not
      set the backend flag on the **worker** for a graceful stop: there it is a kill switch for
      rows in flight (a cart-link row with no quote yet is refused on its next step).
-   * These two exist for the cart-link lane only. If purchases on the other lane (`item_source =
-     reap_variant`; the seller lane, in the gateway's terms) must stop too, set `REAP_AGENTIC_ENABLED=0` on the **WEB service only**. All three
-     routes then answer 404; the gateway maps that to a degraded "incomplete, poll again" answer
+     The gateway flag is **not purely a create gate**: at `873b60727` the gateway enables offer
+     codes on every Reap create only when BOTH its lane flag and this cart-link flag are on
+     (`ucpReapAgenticLane.js:259-260`), so while it is off, purchases created on the other lane
+     lose their discount codes.
+   * **These two stop the cart-link lane and nothing else.** The other lane (`item_source =
+     reap_variant`; the seller lane, in the gateway's terms) keeps creating purchases, so step 2's
+     "no non-terminal purchase" is never reached on their strength alone. **For a FULL stop of
+     the rail the next switch is REQUIRED, not optional:** `REAP_AGENTIC_ENABLED=0` on the **WEB
+     service only**. (Skip it only when the intent is to stop the cart-link lane and leave the
+     rail running — and then do not go on to step 3.) All three routes then answer 404; the
+     gateway maps that to a degraded "incomplete, poll again" answer
      rather than an error; and the worker, which has its own env, keeps stepping the rows in
      flight. What that costs, plainly:
      * a purchase that has **not yet handed the buyer a hosted URL** can no longer be paid — the
