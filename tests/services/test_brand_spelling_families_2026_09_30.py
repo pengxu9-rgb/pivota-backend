@@ -149,7 +149,6 @@ def test_the_corpus_is_the_measured_one():
 
 @pytest.mark.parametrize("host,vendor,canonical", [
     ("smkoreabeauty.com", "O HUI (오휘)", "O HUI"),          # 20 retailer rows
-    ("smkoreabeauty.com", "Jung Saem Mool", "JUNGSAEMMOOL"),  # 5 retailer rows
     ("misshaus.com", "APIEU", "A'PIEU"),                      # 17 brand rows; product_key moves with it
     ("supergoop.com", "Supergoop", "Supergoop!"),             # 8 brand rows; no relabel tool reaches them
 ])
@@ -161,3 +160,20 @@ def test_an_identity_changing_split_is_not_a_family_until_its_rows_are_relabelle
     assert feed._retailer_brand_family(feed._brand_key(vendor)) is None
     role = "retailer" if host == "smkoreabeauty.com" else "brand_official"
     assert written(host, vendor, None, role=role) == vendor
+
+
+def test_jungsaemmool_became_a_family_after_its_relabel():
+    """The follow-up the test above asks for: smkoreabeauty.com's 5 "Jung Saem Mool" rows were relabelled first
+    (scripts/relabel_retailer_brand.py --family jungsaemmool), so the family now writes the canonical."""
+    assert feed._retailer_brand_family(feed._brand_key("Jung Saem Mool")) == "jungsaemmool"
+    assert feed.RETAILER_BRAND_CANONICAL["jungsaemmool"] == "JUNGSAEMMOOL"
+    row = feed.shopify_product_to_record(
+        {"id": 9100777, "vendor": "Jung Saem Mool", "title": "Essential Skin Nutrition Cream", "handle": "jsm-cream",
+         "product_type": "Cream", "body_html": "<p>Ingredients: Water, Glycerin</p>",
+         "images": [{"src": "https://cdn.example/jsm.jpg"}],
+         "variants": [{"id": 45000000007777, "price": "38.00", "available": True, "sku": "jsm-cream"}]},
+        domain="smkoreabeauty.com", category_path="beauty/skincare", currency="USD", source_role="retailer",
+        retailer_name="smkoreabeauty.com",
+    )
+    assert row["pdp"]["brand"] == "JUNGSAEMMOOL"
+
