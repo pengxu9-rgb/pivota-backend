@@ -4175,3 +4175,116 @@ async def test_two_purchases_creating_one_attempt_concurrently_both_wait_on_one_
     assert a["hosted_url"] == b["hosted_url"] == STAGING_LINK
     assert await _pending_count() == 1
     assert "failed" not in {a["state"], b["state"]}
+
+
+# Checkout outcome reconciliation: local clocks never decide whether the buyer paid.
+async def _recovery_checkout():
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _step(purchase_id)
+    await _step(purchase_id)
+    assert (await _get(purchase_id))["state"] == "awaiting_approval"
+    from db.database import database, IS_POSTGRES
+    old = "clock_timestamp() - INTERVAL '25 days'" if IS_POSTGRES else "datetime('now', '-25 days')"
+    await database.execute(
+        f"UPDATE reap_agentic_purchases SET hosted_url_expires_at = {old}, "
+        f"state_entered_at = {old}, next_poll_at = {old}, attempts = 1005 WHERE id = :id",
+        {"id": purchase_id},
+    )
+    import db.reap_agentic_ledger as ledger
+    await ledger.release_claim(purchase_id, "w1")
+    return purchase_id
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("PROCESSING", "processing"), ("COMPLETED", "completed"),
+    ("FAILED", "failed"), ("EXPIRED", "expired"),
+])
+async def test_recovery_late_authoritative_outcome_survives_all_local_sweeps(reap, attribution, status, expected):
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_purchase as svc
+    purchase_id = await _recovery_checkout()
+    before = await _get(purchase_id)
+    assert await ledger.expire_overdue_purchases() == []
+    assert await ledger.fail_exhausted_purchases(50, include_processing=True) == []
+    assert await ledger.scrub_reconciling_purchase_pii() == [purchase_id]
+    scrubbed = await _get(purchase_id)
+    for key in ("reap_checkout_id", "reap_quote_id", "quoted_total_minor", "currency", "click_id", "consent_version", "consented_at"):
+        assert scrubbed[key] == before[key]
+    assert scrubbed["shipping_address"] is None and scrubbed["buyer_email"] is None
+    assert await ledger.scrub_reconciling_purchase_pii() == []
+    reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, status=status))
+    result = await _step(purchase_id)
+    assert result.state == expected
+    assert (await _get(purchase_id))["state"] == expected
+    if expected == "completed":
+        assert len(attribution.calls) == 1
+        assert (await svc.advance(purchase_id, "other-worker")).outcome == "terminal"
+        assert len(attribution.calls) == 1
+
+
+async def test_recovery_prolonged_outage_and_disarm_do_not_strand_a_checkout(reap, attribution, monkeypatch):
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+    purchase_id = await _recovery_checkout()
+    # A new pre-checkout purchase must remain untouched while creates are disarmed.
+    untouched = await _start(agent_user_ref_hash="another-user", buyer_ref="another-buyer")
+    monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    reap.get_checkout = _transport()
+    reap.calls.clear()
+    for n in range(3):
+        await database.execute("UPDATE reap_agentic_purchases SET next_poll_at = CURRENT_TIMESTAMP WHERE id = :id", {"id": purchase_id})
+        report = await job.run_reap_agentic_purchase_poll(worker_id=f"recovery-{n}")
+        assert report.claimed == 1 and report.expired == 0
+        assert (await _get(purchase_id))["state"] == "awaiting_approval"
+    row = await _get(purchase_id)
+    assert row["reap_checkout_id"] and row["buyer_email"] is None and row["shipping_address"] is None
+    assert (await _get(untouched))["state"] == "resolving"
+    assert reap.sequence() == ["get_checkout"] * 3
+    reap.get_checkout = _ok(CHECKOUT_COMPLETED)
+    await database.execute("UPDATE reap_agentic_purchases SET next_poll_at = CURRENT_TIMESTAMP WHERE id = :id", {"id": purchase_id})
+    await job.run_reap_agentic_purchase_poll(worker_id="recovered")
+    assert (await _get(purchase_id))["state"] == "completed"
+    assert len(attribution.calls) == 1
+
+
+async def test_recovery_sweep_during_provider_read_preserves_claim_and_one_conversion(reap, attribution, monkeypatch):
+    import asyncio
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_purchase as svc
+    purchase_id = await _recovery_checkout()
+    entered, resume = asyncio.Event(), asyncio.Event()
+    async def read(**kwargs):
+        entered.set()
+        await resume.wait()
+        return _ok(CHECKOUT_COMPLETED)
+    reap.get_checkout = read
+    await _claim(purchase_id, "reader")
+    task = asyncio.create_task(svc.advance(purchase_id, "reader"))
+    await asyncio.wait_for(entered.wait(), 5)
+    try:
+        assert await ledger.expire_overdue_purchases() == []
+        assert await ledger.fail_exhausted_purchases(50) == []
+        assert await ledger.scrub_reconciling_purchase_pii() == [purchase_id]
+        assert (await _get(purchase_id))["claimed_by"] == "reader"
+    finally:
+        resume.set()
+    assert (await task).state == "completed"
+    assert len(attribution.calls) == 1
+
+
+async def test_recovery_partial_claim_cancellation_releases_lease(reap, monkeypatch):
+    import asyncio
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+    purchase_id = await _recovery_checkout()
+    real = ledger.claim_due_purchases
+    async def partial(*args, **kwargs):
+        rows = await real(*args, **kwargs)
+        assert rows
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(ledger, "claim_due_purchases", partial)
+    with pytest.raises(asyncio.CancelledError):
+        await job.run_reap_agentic_purchase_poll(worker_id="cancelled-claim")
+    assert (await _get(purchase_id))["claimed_by"] is None

@@ -793,16 +793,17 @@ async def test_the_list_shows_only_this_agents_purchases(client):
 # ── 4. the dial, the allowlist, and the rest of the contract on the production dialect ───────
 
 
-async def test_every_route_answers_404_while_the_dial_is_off(client, monkeypatch):
+async def test_creates_and_list_remain_dark_while_status_is_readable(client, monkeypatch):
     await _seed_all()
     monkeypatch.delenv("REAP_AGENTIC_ENABLED", raising=False)
     for resp in (
         await client.post(f"{BASE}/purchases", json=_body()),
         await client.get(f"{BASE}/purchases"),
-        await client.get(f"{BASE}/purchases/rp_nope"),
     ):
         assert resp.status_code == 404
         assert _error(resp) == "not_available_on_this_rail"
+    missing = await client.get(f"{BASE}/purchases/rp_nope")
+    assert missing.status_code == 404 and _error(missing) == "purchase_not_found"
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
@@ -2493,3 +2494,34 @@ async def test_tierb_the_backfill_then_the_cart_link_buys_a_named_variant_end_to
             await database.execute(f"DELETE FROM {table} WHERE product_key = :pk", {"pk": pk})
         await database.execute(
             "DELETE FROM tierb_cart_link_eligibility WHERE shop_domain = :d", {"d": domain})
+
+
+@pytest.mark.parametrize("missing_credentials", [False, True])
+async def test_disarmed_status_read_retains_identity_checks_and_has_no_provider_work(client, monkeypatch, missing_credentials):
+    await _seed_all()
+    purchase_id = (await client.post(f"{BASE}/purchases", json=_body())).json()["purchase_id"]
+    monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    if missing_credentials:
+        monkeypatch.delenv("REAP_API_KEY", raising=False)
+    import services.reap_agentic_purchase as purchase_svc
+    import services.reap_agentic_client as reap_client
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("stored status read attempted provider work")
+    monkeypatch.setattr(purchase_svc, "advance", forbidden)
+    for name in ("get_checkout", "create_checkout", "create_enrollment", "request_quote"):
+        monkeypatch.setattr(reap_client, name, forbidden)
+    response = await client.get(f"{BASE}/purchases/{purchase_id}")
+    assert response.status_code == 200 and response.json()["id"] == purchase_id
+    # A create remains dark; neither owner conjunct nor required user session is relaxed.
+    assert (await client.post(f"{BASE}/purchases", json=_body())).status_code == 404
+    CALLER.agent_user_ref = OTHER_USER_REF
+    denied = await client.get(f"{BASE}/purchases/{purchase_id}")
+    assert denied.status_code == 404 and _error(denied) == "purchase_not_found"
+    CALLER.agent_user_ref = USER_REF
+    CALLER.agent_id = OTHER_AGENT
+    denied = await client.get(f"{BASE}/purchases/{purchase_id}")
+    assert denied.status_code == 404 and _error(denied) == "purchase_not_found"
+    CALLER.agent_id = AGENT
+    CALLER.agent_user_ref = None
+    denied = await client.get(f"{BASE}/purchases/{purchase_id}")
+    assert denied.status_code == 401 and _error(denied) == "agent_user_required"

@@ -3350,8 +3350,8 @@ async def _step_checkout_poll(
         # EVERY failed read releases, including a partner status. The buyer has approved (or is
         # approving) a payment that is in flight; writing a terminal state over one bad read
         # would be our ledger saying 'failed' while their card says otherwise. The bounds are the
-        # ledger's sweeps — `expire_overdue_purchases` on a clock, `fail_exhausted_purchases` on
-        # a counter — not this step.
+        # ledger's separate contact scrub bounds PII retention without terminating this
+        # checkout. Local clocks/attempt counts never stand in for the provider outcome.
         code = str(read.error or "checkout_read_failed")
         return await _release(row, worker_id, error_code=code, transport=_is_transport(code))
 

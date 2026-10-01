@@ -219,6 +219,7 @@ async def _raw_connection():
 
 async def _run_on(conn, sql: str, params: dict):
     positional, order = _to_positional(sql)
+    params = dict(params, reconciliation_only=params.get("reconciliation_only", 0))
     return await conn.fetch(positional, *[params[name] for name in order])
 
 
@@ -1268,7 +1269,7 @@ async def test_the_candidate_select_does_not_offer_already_claimed_rows_on_postg
 
     offered = {
         r["id"]
-        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50})
+        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50, "reconciliation_only": 0})
     }
     assert free["id"] in offered and held["id"] not in offered
 

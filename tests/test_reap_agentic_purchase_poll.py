@@ -1810,10 +1810,8 @@ def _watch_the_stuck_read(monkeypatch) -> list:
     return calls
 
 
-async def test_a_disarmed_run_does_not_issue_the_stuck_read(monkeypatch, reap):
-    """THE RAIL IS DARK IN PRODUCTION. Deploying this must add no statement to a disarmed tick:
-    the read is step 5, below the gate. The report says NOT COUNTED, never 0 — and a disarmed run
-    prints no report line at all, so the alert has nothing to read either way."""
+async def test_a_disarmed_run_reconciles_and_reports_stuck_checkouts(monkeypatch, reap):
+    """Disarming stops new work while reconciliation and its alerts remain observable."""
     stuck = await _start()
     await _park(stuck, "processing", 99999, reap_checkout_id="chk_dark")
     reads = _watch_the_stuck_read(monkeypatch)
@@ -1822,11 +1820,11 @@ async def test_a_disarmed_run_does_not_issue_the_stuck_read(monkeypatch, reap):
     with root_as_in_prod(), capture_pivota_stdout() as out:
         report = await _run()
 
-    assert reads == [], "a disarmed run issued the stuck-count read"
+    assert len(reads) == 1, "disarmed reconciliation must retain monitoring"
     assert report.skipped_disabled == 1
-    assert report.stuck_over_age == job.NOT_COUNTED == -1
+    assert report.stuck_over_age == 0
     assert report.errors == 0
-    assert not [line for line in pivota_lines(out) if "PollReport(" in line]
+    assert [line for line in pivota_lines(out) if "PollReport(" in line]
 
 
 async def test_an_unconfigured_client_does_not_issue_the_stuck_read(monkeypatch, reap):
