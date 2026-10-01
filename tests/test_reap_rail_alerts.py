@@ -454,8 +454,8 @@ async def test_a_bad_dial_reaches_the_failing_metric_once(filters, monkeypatch, 
 # ── a DARK environment prints nothing these metrics can count ────────────────────────────────
 
 
-@pytest.mark.parametrize("how", ["unset", "off", "no_key"])
-async def test_a_dark_rail_feeds_none_of_the_three_metrics(filters, monkeypatch, reap, how):
+@pytest.mark.parametrize("how", ["no_key"])
+async def test_an_unconfigured_rail_feeds_none_of_the_three_metrics(filters, monkeypatch, reap, how):
     """PRODUCTION TODAY: `REAP_AGENTIC_ENABLED` unset. Even with a purchase in the ledger that an
     armed run would report as stuck, a disarmed tick prints NO line — so there is no heartbeat
     series for the silent policy to miss, and nothing for the other two to count."""
@@ -474,8 +474,35 @@ async def test_a_dark_rail_feeds_none_of_the_three_metrics(filters, monkeypatch,
             report = await _run()
             assert report.skipped_disabled == 1
 
-    assert lines == [], "a disarmed poller wrote a line"
+    assert reap.calls == [], "an unconfigured client reached the provider"
     assert _counts(filters, lines) == dict.fromkeys(METRICS, 0)
+
+
+@pytest.mark.parametrize("how", ["unset", "off"])
+async def test_disarmed_reconciliation_remains_monitored_without_new_work(filters, monkeypatch, reap, how):
+    from test_reap_agentic_purchase import _ok
+    live = await _start(buyer_ref="bref_live")
+    old = await _start(buyer_ref="bref_old")
+    await _park(old, "processing", 99999, reap_checkout_id="chk_dark")
+    if how == "unset":
+        monkeypatch.delenv("REAP_AGENTIC_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    reap.get_checkout = _ok({"status": "PROCESSING"})
+    reap.calls.clear()
+    with worker_log() as lines:
+        for tick in range(3):
+            await _raw("UPDATE reap_agentic_purchases SET next_poll_at = CURRENT_TIMESTAMP WHERE id = :id", {"id": old})
+            report = await _run(worker_id=f"disarmed-{tick}")
+            assert report.skipped_disabled == 1 and report.claimed == 1
+    assert reap.sequence() == ["get_checkout"] * 3
+    assert (await _get(live))["state"] == "resolving"
+    assert _counts(filters, lines) == {
+        "reap_agentic_poll_report": 3, "reap_agentic_poll_stuck": 3,
+        "reap_agentic_poll_failing": 0,
+    }
 
 
 async def test_an_armed_staging_pointed_at_a_real_host_is_failing_not_silent(
