@@ -1995,7 +1995,7 @@ async def _move(
 
 
 #: Release codes logged at WARNING only the first time in a row; see `_release`.
-_QUIET_WHEN_REPEATED = frozenset({"enrollment_settling"})
+_QUIET_WHEN_REPEATED = frozenset({"enrollment_settling", "enrollment_pending"})
 
 
 async def _release(
