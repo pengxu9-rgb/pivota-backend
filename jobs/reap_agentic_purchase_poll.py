@@ -277,6 +277,32 @@ STUCK_AFTER_SECONDS = 1800
 #: `PollReport.stuck_over_age` when step 5 did not produce a count. See `PollReport`.
 NOT_COUNTED = -1
 
+#: How long step 5's one COUNT may take before the run gives up on it. Not a dial.
+#:
+#: The statement reads a handful of rows through an index and answers in milliseconds, so ten
+#: seconds is not a performance budget: it is how long this job will queue for a pool slot, or
+#: sit behind a lock, before saying "I could not count" out loud (`errors`, which pages) instead
+#: of holding the run open.
+#:
+#: IT IS SIZED AGAINST THE 600 s RUN DEADLINE, with what a timeout costs AFTER it fires.
+#: `asyncio.wait_for` cancels the read and then WAITS for it to unwind, and in this repo's DB
+#: layer that unwinding is deliberate (db/database.py, "A cancelled request must still hand its
+#: connection back"): the statement is cancelled on the server and the connection is released
+#: before the cancellation is re-raised. On a healthy socket that is milliseconds. On a silent
+#: one the release is bounded by `DB_POOL_CHECKOUT_TIMEOUT_SECONDS` (120 s), after which asyncpg
+#: terminates the connection. So the worst case this step adds to a run is 10 + 120 s:
+#:
+#:     240  the run budget (no new row is started after it)
+#:   + 170  the slowest realistic step, already in flight when the budget ran out
+#:   +  10  this timeout
+#:   + 120  the DB layer handing the connection back over a dead socket
+#:   = 540  under the 600 s deadline, with 60 s for the sweeps' own statements.
+#:
+#: When `wait_for` returns, nothing of the count is left running: no statement on the server, no
+#: pool slot held. tests/test_reap_agentic_purchase_poll_postgres.py holds that against a real
+#: lock.
+STUCK_COUNT_TIMEOUT_SECONDS = 10
+
 
 #: Dial names already warned about IN THIS PROCESS. A bad dial is a STANDING condition, not an
 #: event: at a 30 s interval the first cut logged the same warning 2,880 times a day, which is
@@ -390,9 +416,10 @@ class PollReport:
     with a live hosted page is not in it. It is read in STEP 5, on armed runs only, so:
 
         >= 0   counted, and that is the count.
-        -1     NOT COUNTED (`NOT_COUNTED`): the rail is disarmed, the run budget was already
-               spent when step 5 was reached, or the read failed — in which last case `errors`
-               says so. Never 0: "nobody looked" must not read as "nobody is stuck".
+        -1     NOT COUNTED (`NOT_COUNTED`): the rail is disarmed, or the read failed or timed
+               out — in which case `errors` says so. Never 0: "nobody looked" must not read as
+               "nobody is stuck". On an armed run that printed a report, `-1` always comes with
+               `errors` >= 1.
     """
 
     requeued: int = 0
@@ -925,25 +952,28 @@ async def run_reap_agentic_purchase_poll(
     # the SAME max age and grace the expire sweep was given at the top of this run: a waiting
     # row's deadline is the sweep's own, not a second opinion.
     #
-    # NOT ON A SPENT BUDGET. The budget is what keeps a run inside its deadline; a diagnostic
-    # that could add a pool checkout and a statement timeout on top of an over-budget run is how
-    # a slow tick becomes a cancelled one. Skipped, the field stays NOT_COUNTED and `errors` is
-    # NOT raised — nothing failed — so a tick like this is neither "nothing stuck" nor a page.
-    # A poller that spends its budget on EVERY tick therefore reports no stuck count at all;
-    # `abandoned_budget` is the count that says so, and the runbook says what to do about it.
+    # ALWAYS TAKEN, EVEN ON A SPENT BUDGET — AND BOUNDED ON ITS OWN CLOCK INSTEAD. Skipping it
+    # when the budget was spent (the previous cut) made the stuck alert blind exactly when the
+    # poller was slowest: three over-budget ticks in a row reported `stuck_over_age=-1, errors=0`
+    # over a payment 90 minutes in flight, and nothing paged. So the count runs on every armed
+    # run that gets this far, under `STUCK_COUNT_TIMEOUT_SECONDS`; see that constant for the
+    # arithmetic against the run deadline.
+    #
+    # A COUNT THAT COULD NOT BE TAKEN IS A FAILURE, NEVER A SILENT -1. Timed out or raised, the
+    # field keeps NOT_COUNTED and `errors` goes up, so the tick the stuck alert cannot see is the
+    # failing alert's. `asyncio.TimeoutError` is an `Exception`; a cancellation of the RUN is not,
+    # and still propagates from here.
     try:
-        if _budget_spent():
-            logger.debug("reap_agentic_poll: step 5 skipped, the run budget is spent")
-        else:
-            counts["stuck_over_age"] = await ledger.count_stuck_purchases(
+        counts["stuck_over_age"] = await asyncio.wait_for(
+            ledger.count_stuck_purchases(
                 stuck_after_seconds=STUCK_AFTER_SECONDS,
                 max_age_seconds=hosted_max_age,
                 enrollment_grace_seconds=enrollment_grace,
-            )
+            ),
+            timeout=STUCK_COUNT_TIMEOUT_SECONDS,
+        )
     except Exception as exc:  # noqa: BLE001 — a diagnostic must never fail the run that carries it
-        # NOT_COUNTED stays on the report and `errors` carries the failure, so the alert that
-        # cannot see stuck purchases this tick is replaced by the one that says the poller is
-        # failing. The TYPE only, as everywhere in this file.
+        # The TYPE only, as everywhere in this file; a timeout reads `error_type=TimeoutError`.
         counts["errors"] += 1
         logger.error(
             "reap_agentic_poll: could not count stuck purchases (error_type=%s); "

@@ -999,3 +999,61 @@ async def test_a_disarmed_run_does_not_count_on_postgres(monkeypatch, reap):
     assert reads == [], "a disarmed run issued the stuck-count read"
     assert report.skipped_disabled == 1
     assert report.stuck_over_age == job.NOT_COUNTED == -1
+
+
+async def test_a_timed_out_count_leaves_no_statement_and_no_held_connection(monkeypatch, reap):
+    """WHAT `asyncio.wait_for` REALLY DOES TO A STATEMENT ON THIS DRIVER, measured rather than
+    assumed. Step 5's count runs under a timeout; a second backend takes an ACCESS EXCLUSIVE lock
+    on the table just before it, so the count genuinely blocks on the server.
+
+    When the timeout fires the read is cancelled and `wait_for` waits for it to unwind. With
+    db/database.py's cancellation-safe exit that means: asyncpg sends the server a cancel for
+    the statement, the connection goes back to the pool, and only then does the timeout surface.
+    So when the run returns there must be NO backend still running or waiting on the count, NO
+    pool connection checked out, and the `databases` Connection this context keeps must still
+    work ("Connection is already acquired" is what a half-released one says)."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+
+    await _start()
+    locker = await _raw_connection()
+    held = locker.transaction()
+    real_count = ledger.count_stuck_purchases
+    calls = []
+
+    async def _behind_a_lock(**kwargs):
+        calls.append(kwargs)
+        await held.start()
+        await locker.execute("LOCK TABLE reap_agentic_purchases IN ACCESS EXCLUSIVE MODE")
+        return await real_count(**kwargs)
+
+    monkeypatch.setattr(ledger, "count_stuck_purchases", _behind_a_lock)
+    monkeypatch.setattr(job, "STUCK_COUNT_TIMEOUT_SECONDS", 1)
+    loop = asyncio.get_running_loop()
+    try:
+        began = loop.time()
+        report = await _run(worker_id="pod-a")
+        elapsed = loop.time() - began
+
+        assert len(calls) == 1
+        assert report.stuck_over_age == job.NOT_COUNTED == -1
+        assert report.errors == 1, "a count that timed out must be an error, never a silent -1"
+        assert report.advanced == 1
+        assert 1.0 <= elapsed < 10, f"the run took {elapsed:.1f}s around a 1s timeout"
+
+        still_there = await locker.fetch(
+            "SELECT pid, state, wait_event_type FROM pg_stat_activity "
+            "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+            "AND state <> 'idle' AND query ILIKE '%COUNT(*) AS stuck%'"
+        )
+        assert still_there == [], "the timed-out count is still running or waiting on the server"
+        pool = database._backend._pool
+        assert pool.get_idle_size() == pool.get_size(), "a pool connection is still checked out"
+    finally:
+        await held.rollback()
+        await locker.close()
+
+    # The lock is gone: the same context's Connection takes the count straight away.
+    assert await real_count(stuck_after_seconds=1800) == 0
+    assert await _all_claims() == {}

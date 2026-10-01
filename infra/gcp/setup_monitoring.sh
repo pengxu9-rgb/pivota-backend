@@ -295,10 +295,35 @@ upsert_log_metric reap_agentic_poll_failing \
   "$REAP_POLL_FAILING_FILTER"
 
 echo "== alert policies"
+# Two replies used to be read as good news, and both now ABORT where the run previously went on:
+#   * an ERROR DOCUMENT from the list. `d.get("alertPolicies", [])` over {"error": ...} is an empty
+#     list, i.e. "this policy does not exist yet" - so the create ran without the delete and left
+#     a second policy under the same displayName.
+#   * a create reply with NO POLICY NAME in it. check() passes an empty body (curl exit 0, nothing
+#     written), so the predecessor was deleted and nothing had replaced it.
+# Neither changes what is sent: the bodies come from policy()/promql_policy() and are untouched.
+require_policy_name() { # JSON LABEL   -> abort unless the reply is a created policy
+  python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+label = sys.argv[1]
+try:
+    d = json.loads(raw)
+except ValueError:
+    d = None
+name = d.get("name") if isinstance(d, dict) else None
+if not (isinstance(name, str) and "/alertPolicies/" in name):
+    sys.exit(label + " FAILED: the reply carries no policy name, so nothing was created: "
+             + (raw[:200] or "an empty reply"))
+' "$2" <<<"$1"
+}
+
 upsert() { # DISPLAY_NAME BODY   -> replace by displayName so thresholds live in git
   OLD="$(api GET alertPolicies | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
+if not isinstance(d, dict) or "error" in d:
+    sys.exit("list policies FAILED: " + json.dumps(d)[:200])
 for p in d.get("alertPolicies", []):
     if p.get("displayName") == sys.argv[1]:
         print(p["name"]); break
@@ -309,6 +334,7 @@ for p in d.get("alertPolicies", []):
   fi
   R="$(api POST alertPolicies "$2")"
   check "$R" "policy $1"
+  require_policy_name "$R" "policy $1"
   echo "   $1"
 }
 
@@ -391,6 +417,9 @@ print(json.dumps({
 #   * THAT ONE REJECTION is waited out, NEW_METRIC_RETRY_SECONDS at a time, on a budget of
 #     NEW_METRIC_TRIES shared by every policy that goes through here (10 minutes by default, not
 #     10 minutes each). ANY OTHER API error still aborts through check(), as everywhere else.
+#   * THE LIST MUST BE A LIST AND THE CREATE MUST NAME A POLICY, as in upsert() - an error
+#     document read as "no predecessors" leaves a duplicate, and an empty create reply read as
+#     success deletes the predecessor of a policy that was never made. Both abort.
 #   * OUT OF BUDGET, the policy is DEFERRED, not fatal: its name is kept, the run carries on to
 #     the summary, and the script exits 1 at the very end saying which policies to re-run for.
 #     Every policy posted through upsert() above has already been written by then.
@@ -402,6 +431,8 @@ upsert_on_new_metric() { # DISPLAY_NAME BODY
   stale="$(api GET alertPolicies | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
+if not isinstance(d, dict) or "error" in d:
+    sys.exit("list policies FAILED: " + json.dumps(d)[:200])
 for p in d.get("alertPolicies", []):
     if p.get("displayName") == sys.argv[1]:
         print(p["name"])
@@ -432,6 +463,8 @@ if isinstance(d, dict) and "error" in d:
     esac
   done
   check "$resp" "policy $1"
+  # Nothing is deleted until the reply NAMES the policy it created.
+  require_policy_name "$resp" "policy $1"
   for old in $stale; do
     resp="$(api DELETE "${old#projects/*/}")"
     check "$resp" "delete $1"

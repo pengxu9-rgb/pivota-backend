@@ -387,7 +387,7 @@ run deadline **600 s** in `_JOB_RUN_DEADLINES` (see the derivation above).
 | 2 | `expire_overdue_purchases(max_age_seconds=REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS, enrollment_grace_seconds=REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS)` | 200 per statement, looped until a partial batch, hard cap 20 iterations |
 | 3 | `fail_exhausted_purchases(REAP_AGENTIC_MAX_ATTEMPTS, include_processing=False)` | same |
 | 4 | `claim_due_purchases(worker, limit=REAP_AGENTIC_CLAIM_BATCH)` → per row `advance` → `release_claim` | **sequential**, one partner chain at a time, stopped by `REAP_AGENTIC_POLL_BUDGET_SECONDS` |
-| 5 | `count_stuck_purchases(stuck_after_seconds=1800, …)` → `stuck_over_age`, then the report line | **read-only**, one `COUNT` over the non-terminal rows; **armed runs only** — a disarmed tick stops before step 4 and issues neither the read nor the line — and **skipped when the run budget is already spent** (the line is still printed, with `stuck_over_age=-1`) |
+| 5 | `count_stuck_purchases(stuck_after_seconds=1800, …)` → `stuck_over_age`, then the report line | **read-only**, one `COUNT` over the non-terminal rows; **armed runs only** — a disarmed tick stops before step 4 and issues neither the read nor the line. Taken on every armed run that gets this far, **including one that is over its budget**, and bounded by its own 10 s timeout (`STUCK_COUNT_TIMEOUT_SECONDS`): 240 budget + 170 slowest step + 10 + up to 120 for the DB layer to hand the connection back = 540 s, inside the 600 s run deadline |
 
 **The sweeps run before the claim** because a row held by a dead pod is not claimable until the
 requeue frees it — a claim-first run would skip exactly the rows that most need attention, every
@@ -415,7 +415,7 @@ ERROR lines an operator must act on.
 | `expired` | purchases the buyer abandoned; PII NULLed | normal; a spike means hosted pages are expiring before buyers use them |
 | `failed_exhausted` | rows that hit the attempt ceiling | look at `last_error_code` on those rows — the rail is failing the same way repeatedly |
 | `processing_over_attempts` | **read-only.** Purchases in `processing` at or past `max_attempts` — the exact set the fail sweep refuses to terminate because a payment is in flight | **any non-zero value that does not fall needs a human.** Reconcile the checkout with Reap; the counter will never resolve these. See below |
-| `stuck_over_age` | **read-only, armed runs only.** Purchases more than 30 minutes past the last moment the rail's own rules let them stay in their state — see [Alerts](#alerts) for the definition. `-1` = **not counted**, never "zero": the run budget was already spent when step 5 was reached (`errors` unchanged), or the read failed (`errors` says so) | **any value ≥ 1 pages** (`prod: Reap purchase stuck over 30 minutes`) |
+| `stuck_over_age` | **read-only, armed runs only.** Purchases more than 30 minutes past the last moment the rail's own rules let them stay in their state — see [Alerts](#alerts) for the definition. `-1` = **not counted**, never "zero": the count timed out (10 s) or raised, and `errors` is raised with it | **any value ≥ 1 pages** (`prod: Reap purchase stuck over 30 minutes`) |
 | `claimed` | leases taken this run | `== REAP_AGENTIC_CLAIM_BATCH` every tick means the backlog is growing; raise the batch or the interval |
 | `advanced` | rows that changed state | — |
 | `released` | rows that made no progress because **the partner was not ready** | — |
@@ -473,10 +473,11 @@ filters match text, never `severity>=ERROR`.
   24 hours (the longest look-back Cloud Monitoring allows for a log-based metric). It emails
   hourly for those 24 hours; after that the incident closes by itself, fixed or not, and
   `processing` rows sit unread with no alert. An open `went silent` is not something to leave.
-* **`stuck_over_age` is not taken while the rail is disarmed**, nor on a tick whose run budget was
-  already spent when step 5 was reached (`-1`, with `errors=0`). A poller that spends its budget
-  on every tick — `abandoned_budget` > 0 every run — therefore never counts stuck purchases;
-  treat that as its own problem (lower `REAP_AGENTIC_CLAIM_BATCH` or raise the budget).
+* **`stuck_over_age` is not taken while the rail is disarmed** — a disarmed tick stops before
+  step 5 and prints no report. On an armed run it is always taken, over-budget ticks included,
+  under a 10-second timeout of its own; if it times out or errors the report says
+  `stuck_over_age=-1` **and** `errors` goes up, so that tick pages as `poller failing` instead.
+  `-1` beside `errors=0` cannot appear on a report line.
 
 **None of them can fire on a rail that has never been armed.** A disarmed tick returns before the
 report line and writes nothing, so the first metric has nothing to count and the third has no
@@ -531,7 +532,9 @@ purchase ids and exception **types** only.
 * `purchase(s) are in 'processing' at or past max_attempts` → the section of that name below.
   This one repeats every tick until a human resolves the row, so the incident stays open.
 * `could not count stuck purchases` → the stuck alert is blind for that tick
-  (`stuck_over_age=-1`); it is a database error, look at the pool and Cloud SQL.
+  (`stuck_over_age=-1`). `error_type=TimeoutError` means the count did not answer in 10 s — a
+  saturated pool or a lock on the table; anything else is a database error. Look at the pool
+  and Cloud SQL.
 * `… is not an integer` / `is outside …` → a dial is mis-set and the default is in use. Fix the env
   var; it is logged once per process.
 * `budget was spent by the sweeps` / `stopped after N rows` → the run is spending its budget
@@ -768,16 +771,33 @@ poller was dark is written `expired` (and their address and email nulled) with *
 the payment's outcome. The same happens whenever step 4 is skipped while the sweeps run — the
 client losing its configuration, most notably; disarming is simply the case an operator chooses.
 
-So, for a planned stop:
+So, for a planned stop. The gateway facts below are the gateway's (PIVOTA-Agent) behaviour as
+read at its commit `873b60727`, not something this repository can check — re-read the gateway
+before relying on them at a later commit.
 
-1. **Stop NEW purchases first, and leave the poller armed.** Turn off the lanes that open them:
-   `REAP_AGENTIC_CART_LINK_ENABLED=0` on **web and worker** (the route refuses new cart-link
-   purchases; on the worker it also refuses cart-link rows that have no quote yet — it never
-   touches a row that already has a checkout), and the gateway's Reap lane flags, so agents stop
-   being offered the rail. Those flags belong to the gateway service and are not named in this
-   repository. If they cannot be reached, `REAP_AGENTIC_ENABLED=0` on the **web service only**
-   stops every new purchase as well — all three routes answer 404, the status read included —
-   while the worker, which has its own env, keeps stepping the rows in flight.
+1. **Stop NEW purchases with the create-only switches, and leave everything that reads or steps a
+   purchase ON.**
+   * Cart-link lane: `REAP_AGENTIC_CART_LINK_ENABLED=0` on the **web** service — the create route
+     then answers 404 for a cart-link purchase and nothing else changes — and the gateway's
+     `REAP_AGENTIC_CART_LINK_LANE_ENABLED=0`, which gates the gateway's create path only. Do not
+     set the backend flag on the **worker** for a graceful stop: there it is a kill switch for
+     rows in flight (a cart-link row with no quote yet is refused on its next step).
+   * These two exist for the cart-link lane only. If purchases on the other lane (`item_source =
+     reap_variant`; the seller lane, in the gateway's terms) must stop too, set `REAP_AGENTIC_ENABLED=0` on the **WEB service only**. All three
+     routes then answer 404; the gateway maps that to a degraded "incomplete, poll again" answer
+     rather than an error; and the worker, which has its own env, keeps stepping the rows in
+     flight. What that costs, plainly:
+     * a purchase that has **not yet handed the buyer a hosted URL** can no longer be paid — the
+       URL reaches the buyer only through the status read, which is now 404. It ends `expired` or
+       `failed`, uncharged;
+     * a buyer **already on Reap's page** can still approve and be charged, and the worker
+       completes the row as usual — but the agent sees "incomplete / state unavailable" for that
+       purchase until the web service is re-enabled.
+   * **NEVER turn off the gateway's `REAP_AGENTIC_LANE_ENABLED` while any purchase is
+     non-terminal.** With it off the gateway returns before its status-read branch, so reads for
+     in-flight `reap_…` purchases stop reaching this rail: a buyer on Reap's approval page can
+     approve and be charged while the agent never learns the outcome — and an agent told the id
+     is unknown may create the purchase again.
 2. **Wait until the ledger has no non-terminal purchase:**
 
    ```sql
@@ -788,7 +808,8 @@ So, for a planned stop:
    Zero rows. The waiting states empty themselves within the hosted-page lifetime
    (`REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` at most), `resolving` and `quoting` move on or fail at
    the attempt ceiling, and `processing` empties when Reap answers.
-3. **Only then** `REAP_AGENTIC_ENABLED=0`, and snooze `went silent`.
+3. **Only then:** `REAP_AGENTIC_ENABLED=0` on the **worker** (and on web, if step 1 did not already
+   do it), snooze `went silent`, and — **last** — the gateway's `REAP_AGENTIC_LANE_ENABLED=0`.
 
 **In an emergency disarm** — the dial has to go off now — list the non-terminal rows with the
 query under [Alerts](#alerts) *before or immediately after*, and reconcile every

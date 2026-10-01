@@ -380,15 +380,13 @@ async def test_a_stuck_count_that_could_not_be_taken_is_failing_not_stuck(
     assert counts["reap_agentic_poll_report"] == 1
 
 
-async def test_a_tick_that_ran_out_of_budget_is_a_heartbeat_and_not_a_page(
-    filters, monkeypatch, reap
-):
-    """Step 5 is skipped on a spent budget: the line is still printed, with the sentinel. That
-    is neither a stuck purchase nor a failing poller, so it must feed only the heartbeat — in
-    particular the skip must not be announced on a line the failing metric would count."""
+async def test_over_budget_ticks_still_page_for_a_stuck_payment(filters, monkeypatch, reap):
+    """REVIEW OF #2488, ROUND 2, AS MEASURED: three consecutive over-budget ticks with a payment
+    90 minutes in `processing`. With step 5 skipped on a spent budget every report read
+    `stuck_over_age=-1, errors=0` and neither STUCK nor FAILING saw anything. Every one of these
+    ticks must now reach the stuck metric."""
     paid = await _start(buyer_ref="bref_paid")
-    await _park(paid, "processing", job.STUCK_AFTER_SECONDS + 5, reap_checkout_id="chk_stuck")
-    await _start(buyer_ref="bref_slow")
+    await _park(paid, "processing", 90 * 60, reap_checkout_id="chk_stuck")
     clock = _Clock(monkeypatch)
     resolved = _resolved()
 
@@ -398,14 +396,35 @@ async def test_a_tick_that_ran_out_of_budget_is_a_heartbeat_and_not_a_page(
 
     reap.resolve_our_row = _slow_row
     with worker_log() as lines:
-        report = await _run(worker_id="w1")
-    assert report.stuck_over_age == job.NOT_COUNTED and report.errors == 0
-    assert any("stuck_over_age=-1" in line for line in lines), lines
+        for tick in range(3):
+            await _start(buyer_ref=f"bref_slow_{tick}")
+            report = await _run(worker_id=f"w{tick}")
+            assert report.stuck_over_age == 1 and report.duration_ms >= 9_000_000
     assert _counts(filters, lines) == {
-        "reap_agentic_poll_report": 1,
-        "reap_agentic_poll_stuck": 0,
+        "reap_agentic_poll_report": 3,
+        "reap_agentic_poll_stuck": 3,
         "reap_agentic_poll_failing": 0,
     }, lines
+
+
+async def test_a_count_that_timed_out_pages_as_failing(filters, monkeypatch, reap):
+    """The other half: when the bounded count cannot be taken the tick is NOT silent. `-1`
+    arrives with `errors=1` and the job's own ERROR line, and both reach the failing metric."""
+    await _start()
+
+    async def _hangs(**kwargs):
+        await asyncio.sleep(8)
+
+    monkeypatch.setattr(ledger, "count_stuck_purchases", _hangs)
+    monkeypatch.setattr(job, "STUCK_COUNT_TIMEOUT_SECONDS", 0.05)
+    with worker_log() as lines:
+        report = await _run(worker_id="w1")
+    assert report.stuck_over_age == job.NOT_COUNTED and report.errors == 1
+    hit = [line for line in lines if matches(filters["reap_agentic_poll_failing"], _entry(line))]
+    assert len(hit) == 2, lines
+    assert any("error_type=TimeoutError" in line for line in hit)
+    assert any("stuck_over_age=-1," in line and ", errors=1," in line for line in hit)
+    assert _count(filters, "reap_agentic_poll_stuck", lines) == 0
 
 
 async def test_a_payment_past_the_attempt_ceiling_reaches_the_failing_metric(
@@ -911,14 +930,15 @@ state_path, method, path = sys.argv[1:4]
 state = json.load(open(state_path))
 state["calls"].append([method, path])
 if method == "GET":
-    out = {"alertPolicies": state["existing"]}
+    out = state["get"] if state.get("get") is not None else {"alertPolicies": state["existing"]}
 elif method == "POST":
     answers = state["post"]
     out = answers.pop(0) if len(answers) > 1 else answers[0]
 else:
     out = {}
 json.dump(state, open(state_path, "w"))
-print(json.dumps(out))
+if out != "EMPTY":  # an empty body with exit 0: what a proxy or a truncated reply looks like
+    print(json.dumps(out))
 '''
 
 
@@ -927,14 +947,19 @@ def _shell_function(source: str, name: str) -> str:
     return source[start: source.index("\n}\n", start) + 3]
 
 
-def _run_upserts(tmp_path, source, *, post, existing=(), tries=20, names=("prod: A",)):
-    """Run `upsert_on_new_metric` for each name against a scripted Monitoring API."""
+def _run_upserts(
+    tmp_path, source, *, post, existing=(), tries=20, names=("prod: A",),
+    function="upsert_on_new_metric", get=None,
+):
+    """Run `function` for each name against a scripted Monitoring API."""
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"calls": [], "existing": list(existing), "post": list(post)}))
+    state.write_text(json.dumps(
+        {"calls": [], "existing": list(existing), "post": list(post), "get": get}
+    ))
     stub = tmp_path / "api_stub.py"
     stub.write_text(_API_STUB)
     calls = "".join(
-        f"upsert_on_new_metric {shlex.quote(n)} {shlex.quote(json.dumps({'displayName': n}))}\n"
+        f"{function} {shlex.quote(n)} {shlex.quote(json.dumps({'displayName': n}))}\n"
         for n in names
     )
     script = f"""
@@ -943,7 +968,10 @@ curl() {{ echo "TRIPWIRE: curl was called" >&2; exit 97; }}
 gcloud() {{ echo "TRIPWIRE: gcloud was called" >&2; exit 97; }}
 sleep() {{ echo "sleep $1" >> {shlex.quote(str(tmp_path / 'sleeps'))}; }}
 api() {{ {shlex.quote(sys.executable)} {shlex.quote(str(stub))} {shlex.quote(str(state))} "$1" "$2"; }}
+TOKEN=not-a-token
 {_shell_function(source, "check")}
+{_shell_function(source, "require_policy_name")}
+{_shell_function(source, "upsert")}
 NEW_METRIC_TRIES={tries}
 NEW_METRIC_RETRY_SECONDS=30
 NEW_METRIC_DEFERRED=""
@@ -1038,3 +1066,80 @@ def test_the_script_wires_the_first_run_safely(source):
     assert body.index('print("policies:", len(ps))') < said < channel
     tail = body[channel:]
     assert re.search(r'if \[ -n "\$NEW_METRIC_DEFERRED" \]; then\n  exit 1\nfi\s*$', tail)
+
+
+# ── replies that used to be read as good news ────────────────────────────────────────────────
+#
+# Review of #2488, round 2, stub-ran the function: an EMPTY create reply was treated as
+# "created" (the predecessor was deleted and nothing replaced it: 11 policies, exit 0), and an
+# ERROR DOCUMENT from the list was treated as "no predecessors" (a duplicate: 13 policies,
+# exit 0). Both abort now, in `upsert_on_new_metric` and in `upsert`, which had the same holes.
+
+_LIST_ERROR = {"error": {"code": 503, "message": "The service is currently unavailable."}}
+
+
+@pytest.mark.parametrize("reply", ["EMPTY", {}, {"displayName": "prod: A"}, {"name": ""}],
+                         ids=["empty-body", "empty-object", "no-name", "blank-name"])
+def test_a_create_reply_that_names_no_policy_deletes_nothing(tmp_path, source, reply):
+    proc, calls, sleeps = _run_upserts(tmp_path, source, post=[reply], existing=_STALE)
+    assert proc.returncode not in (0, 97), proc.stdout + proc.stderr
+    assert "policy prod: A FAILED: the reply carries no policy name" in proc.stderr
+    assert [c[0] for c in calls] == ["GET", "POST"], "the predecessor was deleted"
+    assert "DEFERRED=" not in proc.stdout, "the run carried on past a create that created nothing"
+
+
+@pytest.mark.parametrize("listing", [_LIST_ERROR, [], "EMPTY"], ids=["error-doc", "not-an-object", "empty-body"])
+def test_a_list_that_is_not_a_policy_list_creates_nothing(tmp_path, source, listing):
+    """An error document is not "no predecessors". Creating after one leaves two policies under
+    one displayName, and the next run deletes only what it can see."""
+    proc, calls, sleeps = _run_upserts(tmp_path, source, post=[_CREATED], get=listing)
+    assert proc.returncode not in (0, 97), proc.stdout + proc.stderr
+    assert calls == [["GET", "alertPolicies"]], "a policy was created after an unreadable list"
+    if listing == _LIST_ERROR:
+        assert "list policies FAILED" in proc.stderr and "currently unavailable" in proc.stderr
+
+
+def test_plain_upsert_also_aborts_on_an_error_list_and_on_a_nameless_create(tmp_path, source):
+    """The nine existing policies go through `upsert`, which had both holes. The change there is
+    strictly "abort where it used to continue": the healthy path issues the same calls."""
+    (tmp_path / "a").mkdir(); (tmp_path / "b").mkdir(); (tmp_path / "c").mkdir()
+    proc, calls, _ = _run_upserts(tmp_path / "a", source, post=[_CREATED], get=_LIST_ERROR,
+                                  function="upsert")
+    assert proc.returncode not in (0, 97) and calls == [["GET", "alertPolicies"]]
+    assert "list policies FAILED" in proc.stderr
+
+    proc, calls, _ = _run_upserts(tmp_path / "b", source, post=["EMPTY"], function="upsert")
+    assert proc.returncode not in (0, 97)
+    assert "policy prod: A FAILED: the reply carries no policy name" in proc.stderr
+
+    proc, calls, _ = _run_upserts(tmp_path / "c", source, post=[_CREATED], function="upsert")
+    assert proc.returncode == 0, proc.stderr
+    assert calls == [["GET", "alertPolicies"], ["POST", "alertPolicies"]]
+    assert "   prod: A" in proc.stdout
+
+
+def test_the_nine_existing_policies_render_exactly_as_before_this_change():
+    """`upsert` was edited, and it deletes and re-creates: what it SENDS for the nine policies
+    that exist in prod must not have moved by a byte. The digest is of the generators' raw output
+    for every `upsert "..."` call, taken from `origin/main` (0524b5911) before this branch
+    touched the script and identical on it. A deliberate change to one of those policies changes
+    this digest; update it in the same commit, on purpose."""
+    import hashlib
+
+    source = SCRIPT.read_text(encoding="utf-8")
+    generators = {
+        name: source.split(name + "() {", 1)[1].split("python3 -c '\n", 1)[1].split("' \"$@\"", 1)[0]
+        for name in ("policy", "promql_policy")
+    }
+    rendered = {}
+    for name, generator, body in re.findall(
+        r'^upsert "([^"]+)" "\$\((policy|promql_policy) (.*?)\)"$', source, re.S | re.M
+    ):
+        args = shlex.split(body.replace("\\\n", "").replace("\\`", "`"))
+        rendered[name] = subprocess.run(
+            [sys.executable, "-c", generators[generator], *args, CHANNEL],
+            text=True, capture_output=True, check=True,
+        ).stdout
+    assert len(rendered) == 9, sorted(rendered)
+    digest = hashlib.sha256(json.dumps(rendered, sort_keys=True).encode()).hexdigest()
+    assert digest == "9ff583df92b8d4a70c771356c6ec7bc4b6336f17c50a907ab4f323beca2b3186"

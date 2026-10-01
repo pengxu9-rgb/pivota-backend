@@ -1876,15 +1876,15 @@ async def test_a_failed_stuck_read_is_not_counted_not_zero_and_the_run_still_rep
     assert "stuck_over_age=-1" in line and "errors=1" in line
 
 
-async def test_a_spent_budget_skips_the_stuck_read_and_says_not_counted(monkeypatch, reap):
-    """Step 5 respects the run budget. A diagnostic issued past it can add a pool checkout and a
-    statement timeout to a run that is already over-budget — the way a slow tick becomes one the
-    scheduler cancels. Skipped, the report says NOT COUNTED, `errors` stays 0 (nothing failed),
-    and the report line is still printed."""
-    stuck = await _start(buyer_ref="bref_paid")
-    await _park(stuck, "processing", job.STUCK_AFTER_SECONDS + 5, reap_checkout_id="chk_stuck")
-    await _start(buyer_ref="bref_slow")
-    reads = _watch_the_stuck_read(monkeypatch)
+async def test_an_over_budget_run_still_counts_the_stuck_purchases(monkeypatch, reap):
+    """THE SCENARIO REVIEW MEASURED (#2488 round 2). A payment 90 minutes in `processing`, and
+    three ticks in a row that each spend the whole run budget on the one row they step. The
+    previous cut SKIPPED step 5 on a spent budget: every one of those reports read
+    `stuck_over_age=-1, errors=0`, with `abandoned_budget=0`, and nothing paged — the stuck alert
+    was blind exactly when the poller was slowest. The count is now taken on every armed run
+    that reaches it, bounded by its own timeout rather than by the budget."""
+    paid = await _start(buyer_ref="bref_paid")
+    await _park(paid, "processing", 90 * 60, reap_checkout_id="chk_stuck")
     clock = _Clock(monkeypatch)
     resolved = _resolved()
 
@@ -1894,25 +1894,98 @@ async def test_a_spent_budget_skips_the_stuck_read_and_says_not_counted(monkeypa
 
     reap.resolve_our_row = _slow_row
 
-    with capture_pivota_stdout() as out:
-        report = await _run(worker_id="w1")
-
-    assert report.advanced == 1, "the run did its real work before the budget ran out"
-    assert reads == [], "the stuck-count read was issued on a spent budget"
-    assert report.stuck_over_age == job.NOT_COUNTED
-    assert report.errors == 0, "a skipped diagnostic is not an error"
-    (line,) = [ln for ln in pivota_lines(out) if "PollReport(" in ln]
-    assert "stuck_over_age=-1" in line
+    for tick in range(3):
+        await _start(buyer_ref=f"bref_slow_{tick}")
+        with capture_pivota_stdout() as out:
+            report = await _run(worker_id=f"w{tick}")
+        assert report.advanced == 1 and report.abandoned_budget == 0
+        assert report.duration_ms >= 9_000_000, "the run was not over budget when it reached step 5"
+        assert report.stuck_over_age == 1, f"tick {tick}: an over-budget run did not count"
+        assert report.errors == 0
+        (line,) = [ln for ln in pivota_lines(out) if "PollReport(" in ln]
+        assert "stuck_over_age=1," in line
 
 
 async def test_a_run_inside_its_budget_issues_the_stuck_read_once(monkeypatch, reap):
-    """The control for the skip above: same shape, budget not spent."""
     await _start()
     reads = _watch_the_stuck_read(monkeypatch)
     _Clock(monkeypatch)
     report = await _run(worker_id="w1")
     assert len(reads) == 1
     assert report.stuck_over_age == 0
+
+
+async def test_a_count_that_times_out_is_an_error_not_a_silent_sentinel(
+    monkeypatch, reap, caplog
+):
+    """The count has a clock of its own. When it runs out the read is CANCELLED and awaited —
+    nothing is left running behind the run — the field says NOT COUNTED, and `errors` goes up:
+    failing to count is a failure and pages as one. `-1` with `errors=0` must not be possible on
+    a run that printed a report."""
+    await _start()
+    seen = {}
+
+    async def _hangs(**kwargs):
+        seen["started"] = True
+        try:
+            await asyncio.sleep(8)
+        except asyncio.CancelledError:
+            seen["cancelled"] = True
+            raise
+        finally:
+            seen["finished"] = True
+
+    monkeypatch.setattr(ledger, "count_stuck_purchases", _hangs)
+    monkeypatch.setattr(job, "STUCK_COUNT_TIMEOUT_SECONDS", 0.05)
+    caplog.set_level(logging.ERROR, logger="jobs.reap_agentic_purchase_poll")
+
+    began = asyncio.get_running_loop().time()
+    with capture_pivota_stdout() as out:
+        report = await _run(worker_id="w1")
+    elapsed = asyncio.get_running_loop().time() - began
+
+    assert seen == {"started": True, "cancelled": True, "finished": True}, (
+        "the timed-out read was not cancelled and awaited"
+    )
+    assert elapsed < 5, f"the run waited {elapsed:.1f}s on a 0.05s timeout"
+    assert report.stuck_over_age == job.NOT_COUNTED
+    assert report.errors == 1
+    assert report.advanced == 1, "the diagnostic timing out must not undo the run's real work"
+    assert "could not count stuck purchases (error_type=TimeoutError)" in caplog.text
+    (line,) = [ln for ln in pivota_lines(out) if "PollReport(" in ln]
+    assert "stuck_over_age=-1," in line and ", errors=1," in line
+
+
+def test_the_count_timeout_fits_inside_the_run_deadline():
+    """The arithmetic the constant's comment states, held against the numbers it depends on:
+    the budget, the slowest step, this timeout, and the DB layer's own bound on handing a
+    connection back after a cancelled statement. If any of them moves, re-derive."""
+    from db.database import DB_POOL_CHECKOUT_TIMEOUT_SECONDS
+    from services.audit_scheduler import _JOB_RUN_DEADLINES
+
+    worst = (
+        job.DIALS["poll_budget_seconds"].default
+        + svc.QUOTING_STEP_BUDGET_S
+        + job.STUCK_COUNT_TIMEOUT_SECONDS
+        + DB_POOL_CHECKOUT_TIMEOUT_SECONDS
+    )
+    assert job.STUCK_COUNT_TIMEOUT_SECONDS == 10
+    assert worst <= _JOB_RUN_DEADLINES["reap_agentic_purchase_poll"] - 30, worst
+
+
+async def test_a_run_cancelled_during_the_count_still_propagates(monkeypatch, reap):
+    """`wait_for` turns ITS OWN timeout into an `Exception`. A cancellation of the RUN — the
+    deadline, a shutdown — is not one, and must keep travelling through step 5 as it does
+    through step 4."""
+    await _start()
+
+    async def _cancelled(**kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(ledger, "count_stuck_purchases", _cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await _run(worker_id="w1")
+    assert await _all_claims() == {}
 
 
 async def test_the_stuck_read_is_given_the_windows_the_expire_sweep_was_given(monkeypatch, reap):
