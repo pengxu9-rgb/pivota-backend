@@ -4480,3 +4480,204 @@ async def test_the_self_heal_does_not_blame_duplicates_for_another_failure(caplo
     assert "could not build uq_reap_agentic_enrollments_one_pending" in text
     assert "OperationalError: database is locked" in text
     assert "census" not in text and "duplicate" not in text
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+# The stuck count — `count_stuck_purchases`, the number the "purchase stuck" alert reads
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+#
+# READ ONLY, so there is no row to read back: every test is a count, and every counted case has a
+# control one second (or one rule) on the other side of it. The three windows used throughout:
+# stuck_after = 1800, the sweep's max age = 3600, the enrollment grace = 180.
+
+_STUCK = dict(stuck_after_seconds=1800, max_age_seconds=3600, enrollment_grace_seconds=180)
+
+
+def _ago(seconds: int) -> str:
+    return f"datetime('now', '-{int(seconds)} seconds')"
+
+
+async def _stuck_row(state: str, *, entered=None, hosted=None, code=None, buyer_ref="bref_alice"):
+    purchase = await _mk(state=state, buyer_ref=buyer_ref)
+    if entered is not None:
+        await _set_clock_column(purchase["id"], "state_entered_at", _ago(entered))
+    if hosted is not None:
+        await _set_clock_column(purchase["id"], "hosted_url_expires_at", _ago(hosted))
+    if code is not None:
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET last_error_code = :c WHERE id = :i",
+            {"c": code, "i": purchase["id"]},
+        )
+    return purchase
+
+
+#: (state, seconds since state_entered_at, seconds since hosted_url_expires_at, last_error_code).
+#: A NEGATIVE hosted value is a page that is still live.
+_STUCK_ROWS = [
+    # OUR work, 30 minutes old. 'processing' is the buyer-approved-and-nothing-happened row.
+    ("processing", 1801, None, None),
+    ("quoting", 1801, None, None),
+    ("resolving", 1801, None, None),  # last_error_code NULL: must not fall through a NULL compare
+    ("resolving", 1801, None, "transport_error:readtimeout"),
+    # The settling hold gets the grace and no more.
+    ("resolving", 1800 + 180 + 1, None, "enrollment_settling"),
+    # The marker survives a transition (COALESCE), so it must only exempt a 'resolving' row.
+    ("processing", 1801, None, "enrollment_settling"),
+    ("quoting", 1801, None, "enrollment_settling"),
+    # The waiting states: 30 minutes past the deadline the expire sweep enforces.
+    ("awaiting_approval", 2800, 1801, None),
+    ("needs_enrollment", 2800, 1800 + 180 + 1, None),
+    ("awaiting_approval", 3600 + 1800 + 1, None, None),
+    ("needs_enrollment", 3600 + 1800 + 1, None, None),
+    # A live page does not excuse a row past the absolute fallback: the sweep takes it there too.
+    ("needs_enrollment", 3600 + 1800 + 1, -3600, None),
+]
+
+_NOT_STUCK_ROWS = [
+    ("processing", 1700, None, None),
+    ("quoting", 1700, None, None),
+    ("resolving", 1700, None, None),
+    # Inside stuck_after + grace: the hold is still allowed to be holding.
+    ("resolving", 1900, None, "enrollment_settling"),
+    # A BUYER WITH A LIVE PAGE, 50 minutes in. The case the definition exists for.
+    ("awaiting_approval", 3000, -600, None),
+    ("needs_enrollment", 3000, -600, None),
+    # Overdue, but inside the margin: that is the expire sweep's row, not a stuck one.
+    ("awaiting_approval", 3000, 600, None),
+    ("needs_enrollment", 3000, 1900, None),  # past stuck_after, inside the grace on top of it
+    # No hosted deadline: the absolute fallback, plus the margin, has not passed.
+    ("awaiting_approval", 5000, None, None),
+    ("needs_enrollment", 5000, None, None),
+    # Brand new, every countable state.
+    ("resolving", 0, None, None),
+    ("needs_enrollment", 0, None, None),
+    ("quoting", 0, None, None),
+    ("awaiting_approval", 0, None, None),
+    ("processing", 0, None, None),
+]
+
+
+@pytest.mark.parametrize("state,entered,hosted,code", _STUCK_ROWS)
+async def test_a_purchase_past_its_deadline_by_the_margin_is_counted(state, entered, hosted, code):
+    await _stuck_row(state, entered=entered, hosted=hosted, code=code)
+    assert await ledger.count_stuck_purchases(**_STUCK) == 1
+
+
+@pytest.mark.parametrize("state,entered,hosted,code", _NOT_STUCK_ROWS)
+async def test_a_purchase_that_is_allowed_to_be_where_it_is_is_not_counted(
+    state, entered, hosted, code
+):
+    """The controls. Without them a count that returned the number of non-terminal rows would
+    pass every case above."""
+    await _stuck_row(state, entered=entered, hosted=hosted, code=code)
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+
+
+@pytest.mark.parametrize("state", _TERMINALS)
+async def test_a_terminal_purchase_is_never_stuck_however_old(state):
+    purchase = await _mk(state=state)
+    await _set_clock_column(purchase["id"], "state_entered_at", _ago(999999))
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", _ago(999999))
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+
+
+async def test_the_stuck_count_is_a_count_of_rows_not_a_flag():
+    for n in range(3):
+        await _stuck_row("processing", entered=4000, buyer_ref=f"bref_{n}")
+    await _stuck_row("processing", entered=10, buyer_ref="bref_fresh")
+    assert await ledger.count_stuck_purchases(**_STUCK) == 3
+
+
+async def test_each_stuck_window_is_the_argument_not_a_constant_in_the_sql():
+    """Three binds, three ways for one of them to be a literal that happens to match the default."""
+    work = await _stuck_row("processing", entered=700, buyer_ref="bref_w")
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+    assert await ledger.count_stuck_purchases(**dict(_STUCK, stuck_after_seconds=600)) == 1
+    await database.execute("DELETE FROM reap_agentic_purchases WHERE id = :i", {"i": work["id"]})
+
+    # needs_enrollment 1900 s past its link: inside 1800 + 180, outside 1800 + 60.
+    held = await _stuck_row("needs_enrollment", entered=2800, hosted=1900, buyer_ref="bref_g")
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+    assert await ledger.count_stuck_purchases(**dict(_STUCK, enrollment_grace_seconds=60)) == 1
+    await database.execute("DELETE FROM reap_agentic_purchases WHERE id = :i", {"i": held["id"]})
+
+    # No hosted deadline, 5000 s in: inside 3600 + 1800, outside 600 + 1800.
+    await _stuck_row("awaiting_approval", entered=5000, buyer_ref="bref_m")
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+    assert await ledger.count_stuck_purchases(**dict(_STUCK, max_age_seconds=600)) == 1
+
+
+async def test_a_waiting_row_is_only_ever_stuck_if_the_expire_sweep_would_take_it():
+    """THE DEFINITION, AS A PROPERTY: in the two states that wait on a buyer, "stuck" is a strict
+    subset of "the sweep's own deadline has passed". Run the real sweep with the same max age and
+    grace and nothing waiting is left to count — so the alert can never fire on a buyer who is
+    still allowed to be on the hosted page."""
+    n = 0
+    for state in ("needs_enrollment", "awaiting_approval"):
+        for entered in (0, 1700, 3000, 5000, 5500, 99999):
+            for hosted in (None, -3600, 100, 1700, 1900, 2100, 99999):
+                n += 1
+                await _stuck_row(state, entered=entered, hosted=hosted, buyer_ref=f"bref_{n}")
+    assert await ledger.count_stuck_purchases(**_STUCK) > 0, "the grid counted nothing at all"
+
+    while await ledger.expire_overdue_purchases(
+        max_age_seconds=3600, enrollment_grace_seconds=180, limit=500
+    ):
+        pass
+
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+    left = await database.fetch_all(
+        "SELECT id FROM reap_agentic_purchases WHERE state IN ('needs_enrollment', "
+        "'awaiting_approval')",
+        {},
+    )
+    assert left, "the sweep took every row — the grid has no legitimately waiting buyer in it"
+
+
+async def test_the_stuck_count_writes_nothing():
+    await _stuck_row("processing", entered=4000)
+    await _stuck_row("needs_enrollment", entered=9000, buyer_ref="bref_b")
+    before = [dict(r) for r in await database.fetch_all(
+        "SELECT * FROM reap_agentic_purchases ORDER BY id", {}
+    )]
+    assert await ledger.count_stuck_purchases(**_STUCK) == 2
+    after = [dict(r) for r in await database.fetch_all(
+        "SELECT * FROM reap_agentic_purchases ORDER BY id", {}
+    )]
+    assert after == before
+
+
+def test_the_stuck_count_covers_exactly_the_states_the_machine_can_wait_in():
+    """Parsed out of the statement, like the sweeps' lists. A state added to the machine must
+    land on one side of the count or the other, and the waiting side must be the expire sweep's
+    own list — that is what makes a waiting row's deadline the sweep's."""
+    counted = set(ledger._STUCK_COUNTED_STATES)
+    assert counted == set(ledger._POLLABLE_STATES) == ledger.PURCHASE_STATES - ledger.TERMINAL_STATES
+    assert set(ledger._STUCK_HUMAN_WAIT_STATES) == set(ledger._EXPIRE_SOURCE_STATES)
+    assert set(ledger._STUCK_WORK_STATES) == counted - set(ledger._EXPIRE_SOURCE_STATES)
+    for anchor in ("WHERE state IN (", "(state IN (", "OR (state IN ("):
+        assert ledger._states_in(ledger._COUNT_STUCK_PURCHASES_SQL, anchor) == ledger._states_in(
+            ledger._COUNT_STUCK_PURCHASES_SQL_SQLITE, anchor
+        ), f"the dialect twins disagree after {anchor!r}"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        dict(stuck_after_seconds=59),
+        dict(stuck_after_seconds=True),
+        dict(stuck_after_seconds="1800"),
+        dict(stuck_after_seconds=1800.0),
+        dict(max_age_seconds=59),
+        dict(max_age_seconds=None),
+        dict(enrollment_grace_seconds=-1),
+        dict(enrollment_grace_seconds=3601),
+    ],
+)
+async def test_the_stuck_count_takes_strict_bounded_ints(bad):
+    with pytest.raises(ValueError):
+        await ledger.count_stuck_purchases(**dict(_STUCK, **bad))
+
+
+def test_the_stuck_count_is_exported():
+    assert "count_stuck_purchases" in ledger.__all__

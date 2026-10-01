@@ -237,11 +237,93 @@ upsert_log_metric retailer_ingest_drain_failed \
   "Retailer ingest drain stages that left a job FAILED - the ledger gave up on that store" \
   "$RID_FAILED_FILTER"
 
+# The Reap agentic purchase rail (jobs/reap_agentic_purchase_poll.py) is a scheduler job on the
+# `worker` SERVICE, not a Cloud Run job: it has no task to fail, so "prod: Cloud Run job failing"
+# cannot see it, and Cloud Monitoring cannot read the ledger. Everything below keys on the lines
+# that job writes. Read on staging 2026-10-01, where the rail is armed - these are whole
+# textPayloads, and NEITHER carries a severity:
+#   stdout  [2026-10-01 09:39:48,028] INFO - reap_agentic_poll: PollReport(requeued=0, ..., errors=0, skipped_disabled=0, duration_ms=19)
+#   stderr  reap_agentic: purchase=rp_... state=needs_enrollment held at enrollment_pending, retry in 30s
+# The first is the per-run report, through utils.logger's own stdout handler. The second is what
+# every MODULE logger's WARNING/ERROR looks like on this service: nothing configures the root
+# logger, so the line leaves through Python's last-resort handler as the bare message on stderr -
+# no level name in the text and no severity on the entry. A filter with `severity>=ERROR` would
+# be an enabled metric that can never count; these match text only.
+#
+#   REPORT   every report line. A report is printed ONLY by an armed run (REAP_AGENTIC_ENABLED on,
+#            client configured): a disarmed tick returns before it and prints nothing at all. So
+#            this is the rail's heartbeat, and it has no series in an environment that has never
+#            been armed. It is the input of the "went silent" policy below, not an alert itself.
+#   STUCK    a report whose `stuck_over_age` is >= 1. A STANDING condition: every armed tick
+#            repeats it until the purchase moves. `[1-9]` cannot match `stuck_over_age=0`, nor the
+#            `stuck_over_age=-1` the job prints when the count could not be taken - that tick is
+#            FAILING's (errors=1), not a claim that nothing is stuck.
+#   FAILING  (a) a report with `errors` >= 1 - anchored `, errors=` so it is that field and not
+#            the tail of some later one; (b) ANY other `reap_agentic_poll: ` line - with the root
+#            logger at WARNING the only ones that survive are the job's WARNING and ERROR lines
+#            (a raised step, a claim that outlived the loop, 'processing' past the attempt
+#            ceiling, a bad dial, a budget spent before the claim); (c) the scheduler runner
+#            saying this job's run blew its deadline or would not unwind. The runner quotes the
+#            job id with repr(), hence the `.` either side of it.
+#
+#            A DEPLOY THAT LANDS MID-STEP MUST NOT PAGE, and it writes up to 2 + N lines for a
+#            run holding N claims. Two are excluded by text, one is simply not matched:
+#              `released on cancellation`  the job's own line, one per claim it was interrupted
+#                                          holding. Its `finally` releases them on a cancel
+#                                          exactly as it does a leftover - but a leftover on a
+#                                          run that FINISHED its loop is a bug and keeps its own
+#                                          ERROR text (`STILL CLAIMED after the loop`), which
+#                                          this still matches, as does the report's errors=N.
+#              `wrapper cancelled`         the runner abandoning the in-flight run.
+#              `Job "..." raised an exception`  APScheduler, for the CancelledError that follows.
+#            The first of these was missed in the first cut of this filter: measured by review,
+#            a real poller cancelled through the real runner with three claimed rows matched 3
+#            lines. A run cancelled at its DEADLINE writes the same per-claim lines, and pages
+#            anyway through the runner's own `exceeded its ... run deadline` line (c). A run
+#            that raises on every tick prints no report, and that is the "went silent" policy's.
+REAP_POLL_REPORT_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND textPayload:"reap_agentic_poll: PollReport("'
+REAP_POLL_STUCK_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND textPayload:"reap_agentic_poll: PollReport(" AND textPayload=~"stuck_over_age=[1-9]"'
+REAP_POLL_FAILING_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND ((textPayload:"reap_agentic_poll: " AND (textPayload=~", errors=[1-9]" OR NOT textPayload:"PollReport(") AND NOT textPayload:"released on cancellation") OR (textPayload=~"scheduler job .reap_agentic_purchase_poll." AND NOT textPayload:"wrapper cancelled"))'
+upsert_log_metric reap_agentic_poll_report \
+  "Reap agentic purchase poller report lines - one per ARMED run; a disarmed poller prints none" \
+  "$REAP_POLL_REPORT_FILTER"
+upsert_log_metric reap_agentic_poll_stuck \
+  "Reap agentic purchase poller reports that counted a purchase stuck more than 30 minutes past its deadline" \
+  "$REAP_POLL_STUCK_FILTER"
+upsert_log_metric reap_agentic_poll_failing \
+  "Reap agentic purchase poller failures - a report with errors, any warning or error line of the job, or its run deadline exceeded" \
+  "$REAP_POLL_FAILING_FILTER"
+
 echo "== alert policies"
+# Two replies used to be read as good news, and both now ABORT where the run previously went on:
+#   * an ERROR DOCUMENT from the list. `d.get("alertPolicies", [])` over {"error": ...} is an empty
+#     list, i.e. "this policy does not exist yet" - so the create ran without the delete and left
+#     a second policy under the same displayName.
+#   * a create reply with NO POLICY NAME in it. check() passes an empty body (curl exit 0, nothing
+#     written), so the predecessor was deleted and nothing had replaced it.
+# Neither changes what is sent: the bodies come from policy()/promql_policy() and are untouched.
+require_policy_name() { # JSON LABEL   -> abort unless the reply is a created policy
+  python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+label = sys.argv[1]
+try:
+    d = json.loads(raw)
+except ValueError:
+    d = None
+name = d.get("name") if isinstance(d, dict) else None
+if not (isinstance(name, str) and "/alertPolicies/" in name):
+    sys.exit(label + " FAILED: the reply carries no policy name, so nothing was created: "
+             + (raw[:200] or "an empty reply"))
+' "$2" <<<"$1"
+}
+
 upsert() { # DISPLAY_NAME BODY   -> replace by displayName so thresholds live in git
   OLD="$(api GET alertPolicies | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
+if not isinstance(d, dict) or "error" in d:
+    sys.exit("list policies FAILED: " + json.dumps(d)[:200])
 for p in d.get("alertPolicies", []):
     if p.get("displayName") == sys.argv[1]:
         print(p["name"]); break
@@ -252,6 +334,7 @@ for p in d.get("alertPolicies", []):
   fi
   R="$(api POST alertPolicies "$2")"
   check "$R" "policy $1"
+  require_policy_name "$R" "policy $1"
   echo "   $1"
 }
 
@@ -281,20 +364,112 @@ print(json.dumps({
   "alertStrategy": {"autoClose": autoclose}}))' "$@" "$CHANNEL"
 }
 
-promql_policy() { # DISPLAY_NAME CONDITION_NAME DOC QUERY DURATION EVAL_INTERVAL AUTOCLOSE
+# RENOTIFY (optional, e.g. 3600s) re-sends the notification for an incident that is still open:
+# alertStrategy.notificationChannelStrategy[].renotifyInterval, which the API bounds to between 30
+# minutes and 24 hours. Omitted, the JSON is byte for byte what it was before the argument existed
+# - upsert() deletes and re-creates, so a field added to every policy here would land on the live
+# load-balancer policy on the next run.
+#
+# NEW_METRIC (optional, the literal word) sets disableMetricValidation on the condition. A PromQL
+# policy is otherwise refused unless every metric it names already has a descriptor, and a log
+# metric this script created seconds ago may not have one yet; with the check off the policy is
+# accepted, evaluates to nothing until the metric exists, and to data after. Use it only for a
+# metric this script creates, and keep the name under test: the API will no longer catch a typo.
+promql_policy() { # DISPLAY_NAME CONDITION_NAME DOC QUERY DURATION EVAL_INTERVAL AUTOCLOSE [RENOTIFY [NEW_METRIC]]
   python3 -c '
 import json, sys
-(name, condition_name, doc, query, duration, evaluation_interval, autoclose, channel) = sys.argv[1:9]
+args = sys.argv[1:]
+channel = args.pop()
+(name, condition_name, doc, query, duration, evaluation_interval, autoclose) = args[:7]
+condition = {"query": query, "duration": duration, "evaluationInterval": evaluation_interval}
+strategy = {"autoClose": autoclose}
+if len(args) > 7:
+    strategy["notificationChannelStrategy"] = [
+        {"notificationChannelNames": [channel], "renotifyInterval": args[7]}]
+if len(args) > 8:
+    if args[8] != "NEW_METRIC":
+        sys.exit("promql_policy: the ninth argument can only be NEW_METRIC, got " + repr(args[8]))
+    condition["disableMetricValidation"] = True
 print(json.dumps({
   "displayName": name,
   "documentation": {"content": doc, "mimeType": "text/markdown"},
   "combiner": "OR",
   "conditions": [{
     "displayName": condition_name,
-    "conditionPrometheusQueryLanguage": {
-      "query": query, "duration": duration, "evaluationInterval": evaluation_interval}}],
+    "conditionPrometheusQueryLanguage": condition}],
   "notificationChannels": [channel],
-  "alertStrategy": {"autoClose": autoclose}}))' "$@" "$CHANNEL"
+  "alertStrategy": strategy}))' "$@" "$CHANNEL"
+}
+
+# A policy over a log metric THIS RUN may have created seconds ago. Monitoring rejects such a
+# policy until the metric's descriptor is visible to it - "Cannot find metric(s) that match type
+# ... If a metric was created recently, it could take up to 10 minutes to become available" - and
+# through upsert() that rejection would abort the whole run from check(). That wording is the
+# API's as it has been reported, NOT captured by running this script: the match below is on two
+# fragments of it, and if the real text carries neither, the first run stops at check() with the
+# API's own message after every upsert() above has completed. Re-running ten minutes later is the
+# remedy either way. So, for these only:
+#
+#   * CREATE FIRST, DELETE AFTER. upsert() deletes the old policy and then posts the new one, so a
+#     rejected post leaves NO policy. Here the old one (every one carrying this displayName - a
+#     run that died between the two steps leaves a pair) is removed only once its replacement
+#     exists, so a failed run leaves whatever was live exactly as it was.
+#   * THAT ONE REJECTION is waited out, NEW_METRIC_RETRY_SECONDS at a time, on a budget of
+#     NEW_METRIC_TRIES shared by every policy that goes through here (10 minutes by default, not
+#     10 minutes each). ANY OTHER API error still aborts through check(), as everywhere else.
+#   * THE LIST MUST BE A LIST AND THE CREATE MUST NAME A POLICY, as in upsert() - an error
+#     document read as "no predecessors" leaves a duplicate, and an empty create reply read as
+#     success deletes the predecessor of a policy that was never made. Both abort.
+#   * OUT OF BUDGET, the policy is DEFERRED, not fatal: its name is kept, the run carries on to
+#     the summary, and the script exits 1 at the very end saying which policies to re-run for.
+#     Every policy posted through upsert() above has already been written by then.
+NEW_METRIC_TRIES="${NEW_METRIC_TRIES:-20}"
+NEW_METRIC_RETRY_SECONDS="${NEW_METRIC_RETRY_SECONDS:-30}"
+NEW_METRIC_DEFERRED=""
+upsert_on_new_metric() { # DISPLAY_NAME BODY
+  local stale old resp err
+  stale="$(api GET alertPolicies | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not isinstance(d, dict) or "error" in d:
+    sys.exit("list policies FAILED: " + json.dumps(d)[:200])
+for p in d.get("alertPolicies", []):
+    if p.get("displayName") == sys.argv[1]:
+        print(p["name"])
+' "$1")"
+  while :; do
+    resp="$(api POST alertPolicies "$2")"
+    err="$(python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read() or "{}")
+except ValueError:
+    d = {}
+if isinstance(d, dict) and "error" in d:
+    print(d["error"].get("message", ""))
+' <<<"$resp")"
+    case "$err" in
+      *"Cannot find metric"*|*"could take up to 10 minutes"*)
+        if [ "$NEW_METRIC_TRIES" -le 0 ]; then
+          NEW_METRIC_DEFERRED="${NEW_METRIC_DEFERRED}${NEW_METRIC_DEFERRED:+, }$1"
+          echo "   DEFERRED $1 - its log metric is not visible to Monitoring yet" >&2
+          return 0
+        fi
+        NEW_METRIC_TRIES=$((NEW_METRIC_TRIES - 1))
+        echo "   $1: log metric not visible to Monitoring yet, retrying in ${NEW_METRIC_RETRY_SECONDS}s"
+        sleep "$NEW_METRIC_RETRY_SECONDS"
+        ;;
+      *) break ;;
+    esac
+  done
+  check "$resp" "policy $1"
+  # Nothing is deleted until the reply NAMES the policy it created.
+  require_policy_name "$resp" "policy $1"
+  for old in $stale; do
+    resp="$(api DELETE "${old#projects/*/}")"
+    check "$resp" "delete $1"
+  done
+  echo "   $1"
 }
 
 upsert "prod: host is down" "$(policy \
@@ -366,6 +541,63 @@ upsert "prod: retailer ingest job failed" "$(policy \
   'metric.type="logging.googleapis.com/user/retailer_ingest_drain_failed" AND resource.type="cloud_run_job"' \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 0s 3600s)"
 
+# The Reap agentic purchase rail. Three policies over the three log metrics above; the runbook
+# for all of them is docs/runbooks/reap_agentic_purchase.md, "Alerts".
+#
+# STUCK aligns over 900s. The armed poller reports every 30s, but one run may legitimately take
+# most of its 600s run deadline, and the window must outlast the longest gap between two reports
+# or a standing condition becomes a fresh incident per slow tick. DURATION 0s for the reason the
+# drain policies give: a log counter writes no points between matching lines.
+upsert_on_new_metric "prod: Reap purchase stuck over 30 minutes" "$(policy \
+  "prod: Reap purchase stuck over 30 minutes" \
+  "The Reap purchase poller reported stuck_over_age >= 1: at least one purchase is more than 30 minutes past the last moment the rail's own rules allow it to stay in its state. In quoting, processing and resolving that is 30 minutes in the state - and processing means the buyer APPROVED and the payment has no outcome yet. A buyer still on a live hosted page is NOT counted: needs_enrollment and awaiting_approval count only when the expire sweep should have taken the row 30 minutes ago. Find them: \`SELECT id, state, state_entered_at, last_error_code, attempts, claimed_by, hosted_url_expires_at FROM reap_agentic_purchases WHERE state IN ('resolving','needs_enrollment','quoting','awaiting_approval','processing') ORDER BY state_entered_at\`. Do NOT fail a processing row before reconciling its checkout with Reap. This stays open while any purchase is stuck. Runbook: docs/runbooks/reap_agentic_purchase.md, Alerts." \
+  'metric.type="logging.googleapis.com/user/reap_agentic_poll_stuck" AND resource.type="cloud_run_revision"' \
+  ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 900s 0s 3600s)"
+
+upsert_on_new_metric "prod: Reap purchase poller failing" "$(policy \
+  "prod: Reap purchase poller failing" \
+  "The Reap purchase poller on the worker service logged a failure: a report line with errors >= 1, a warning or error line of its own (advance RAISED, a claim STILL CLAIMED after the loop, purchases in processing at or past max_attempts, a count that could not be taken, a dial outside its bounds, the run budget spent before the claim), or the scheduler cancelled its run at the 600s deadline. Read the lines: worker service logs, textPayload containing reap_agentic_poll. The messages carry purchase ids and exception TYPES only. Runbook: docs/runbooks/reap_agentic_purchase.md, Alerts and When errors > 0." \
+  'metric.type="logging.googleapis.com/user/reap_agentic_poll_failing" AND resource.type="cloud_run_revision"' \
+  ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 300s 0s 3600s)"
+
+# SILENT is "the heartbeat WAS there and has STOPPED", not "there is no heartbeat". The left side
+# needs a report line in the 24 hours before the last 15 minutes; `unless` then drops it while the
+# last 15 minutes still have one. An environment that has never been armed has no series, the left
+# side is an empty vector, and the policy cannot fire. Arming the rail arms the alert; nothing has
+# to be switched on with it. Checked 2026-10-01 through the PromQL query API (read-only): this
+# shape answers an empty vector in pivota-prod, where REAP_AGENTIC_ENABLED is unset; and over an
+# existing log metric there (retailer_ingest_drain_failed) it answers a value when the earlier
+# window has lines and the later one has none, and nothing when both have them.
+#
+# sum_over_time, NOT increase or rate: in PromQL a log counter is a per-minute DELTA sample (the
+# count for that minute, zero-filled only next to a match), not a cumulative counter, so increase()
+# reads every drop as a reset - it answered 12 for a week whose samples add up to 11.
+#
+# THE NUMBERS, and the documentation each one leans on:
+#   15m   of silence, then the 300s duration: ~20 minutes to fire. One run can take its whole 600s
+#         deadline between two reports, and a log-based metric "may take up to 10 minutes" to
+#         reach Monitoring (logging/docs/logs-based-metrics/troubleshooting), so a 10-minute
+#         window could read empty over a healthy poller.
+#   24h   of look-back, the most the platform allows here: "You can only alert on the most recent
+#         25 hours of data for ... user-defined Log-Based metrics", and "the sum of your retest
+#         window, alignment period, and any time shift caused by using the offset modifier must
+#         be at most 25 hours" (monitoring/promql/promql-in-alerting). 5m + 24h + 15m = 24h20m.
+#   3600s renotify: while the incident is open the email repeats hourly, so one missed message is
+#         not the only page. The API allows 30 minutes to 24 hours (AlertStrategy.
+#         NotificationChannelStrategy.renotifyInterval). No other policy in this file sets it.
+#
+# WHAT THIS CANNOT DO. 24 hours after the last report the left side is empty, the condition stops
+# being true and the incident closes - fixed or not. From then on a dead poller produces NO signal
+# from any of the three policies: the other two read lines only a running poller prints. A
+# DELIBERATE disarm of an armed rail looks identical from here (the job prints nothing either way):
+# it opens this once and renotifies until it is snoozed or the 24 hours run out.
+upsert_on_new_metric "prod: Reap purchase poller went silent" "$(promql_policy \
+  "prod: Reap purchase poller went silent" \
+  "report line present in the last 24h, absent for 15m" \
+  "The Reap purchase poller was printing its per-run report and has printed none for about 20 minutes. Nothing is advancing purchases: a buyer who approves now waits. Either the worker service is down or its scheduler is wedged (check /__scheduler_health for reap_agentic_purchase_poll), every run is raising before it reports (worker logs: Job run_reap_agentic_purchase_poll raised an exception), the Reap client lost its configuration so step 4 is skipped without a line, or someone turned REAP_AGENTIC_ENABLED off. This repeats hourly while it is open. If the rail was disarmed on purpose this is expected, and the incident cannot be closed by hand while the condition holds: snooze this policy instead. The condition stops being true 24 hours after the last report, fixed or not, and after that a dead poller raises nothing. It cannot fire in an environment that printed no report in the previous 24 hours. Runbook: docs/runbooks/reap_agentic_purchase.md, Alerts." \
+  '(sum(sum_over_time(logging_googleapis_com:user_reap_agentic_poll_report{monitored_resource="cloud_run_revision"}[24h] offset 15m)) > 0) unless (sum(sum_over_time(logging_googleapis_com:user_reap_agentic_poll_report{monitored_resource="cloud_run_revision"}[15m])) > 0)' \
+  300s 60s 3600s 3600s NEW_METRIC)"
+
 echo
 echo "channel : $ALERT_EMAIL"
 api GET alertPolicies | python3 -c '
@@ -382,6 +614,13 @@ d = json.load(sys.stdin)
 print("uptime  :", len(d.get("uptimeCheckConfigs", [])))
 '
 
+# Said BEFORE the channel check below, which may exit first; acted on after it.
+if [ -n "$NEW_METRIC_DEFERRED" ]; then
+  echo "NOT CREATED: $NEW_METRIC_DEFERRED" >&2
+  echo "This run created their log metrics and Monitoring could not see them yet. Every other" >&2
+  echo "policy above was written. Re-run this script in 10 minutes, with the same ALERT_EMAIL." >&2
+fi
+
 # A warning on stderr is only a result if a human is standing there to read it.
 # This script is exactly the kind of thing that gets wrapped in CI or a runbook
 # step, and an undeliverable channel means every policy above is decoration — so
@@ -390,5 +629,9 @@ print("uptime  :", len(d.get("uptimeCheckConfigs", [])))
 # fully configured one that reports a problem.
 if [ "${CHANNEL_UNDELIVERABLE:-0}" = 1 ]; then
   echo "FAILED: alerts are configured but the channel cannot receive them." >&2
+  exit 1
+fi
+
+if [ -n "$NEW_METRIC_DEFERRED" ]; then
   exit 1
 fi

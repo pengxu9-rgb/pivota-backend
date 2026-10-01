@@ -1064,6 +1064,59 @@ async def test_a_cancelled_run_propagates_and_still_releases_every_claim(monkeyp
     ]
 
 
+async def test_a_cancelled_run_calls_its_claims_released_on_cancellation_not_a_bug(
+    monkeypatch, reap, caplog
+):
+    """THE LOG LINE IS PART OF AN ALERT. A run cancelled mid-step — its deadline, or the service
+    shutting down under a deploy — holds claims because it was interrupted. They are released
+    exactly as a leftover is, but logged at WARNING as `released on cancellation`, which the
+    failing-poller metric excludes; `STILL CLAIMED after the loop` is the bug's line and must not
+    appear, or every deploy that lands mid-step pages (review of #2488, P1)."""
+    ids = [await _start(buyer_ref=f"bref_{n}") for n in range(3)]
+
+    async def _cancelled(pid, worker):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(job.purchase_svc, "advance", _cancelled)
+    caplog.set_level(logging.DEBUG, logger="jobs.reap_agentic_purchase_poll")
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run(worker_id="w1")
+
+    assert await _all_claims() == {}
+    records = [r for r in caplog.records if r.name == "jobs.reap_agentic_purchase_poll"]
+    released = [r for r in records if "released on cancellation" in r.getMessage()]
+    assert sorted(r.getMessage().split("purchase=")[1].split(" ")[0] for r in released) == sorted(ids)
+    assert {r.levelno for r in released} == {logging.WARNING}
+    assert not [r for r in records if "STILL CLAIMED" in r.getMessage()]
+    assert not [r for r in records if r.levelno >= logging.ERROR]
+
+
+async def test_a_claim_the_loop_forgot_is_still_logged_as_the_bug_it_is(monkeypatch, reap, caplog):
+    """The other side of the split: no cancellation, so a claim found after the loop keeps the
+    ERROR line and the `errors` count. The cancel wording must not leak onto this path."""
+    purchase_id = await _start()
+    real_release = job.ledger.release_claim
+    swallowed = []
+
+    async def _swallow_once(pid, worker, **kwargs):
+        if pid == purchase_id and not swallowed:
+            swallowed.append(pid)
+            return await _get(pid)
+        return await real_release(pid, worker, **kwargs)
+
+    monkeypatch.setattr(job.ledger, "release_claim", _swallow_once)
+    caplog.set_level(logging.DEBUG, logger="jobs.reap_agentic_purchase_poll")
+
+    report = await _run(worker_id="w1")
+
+    assert report.errors == 1
+    bug = [r for r in caplog.records if "STILL CLAIMED after the loop" in r.getMessage()]
+    assert len(bug) == 1 and bug[0].levelno == logging.ERROR
+    assert purchase_id in bug[0].getMessage()
+    assert "released on cancellation" not in caplog.text
+
+
 async def test_a_raising_release_does_not_abandon_the_rest_of_the_batch(monkeypatch, reap):
     """The post-step `release_claim` sat BARE in the first cut, outside the per-row guard, so a
     pool blip on row 2 of 4 propagated out of the whole function and abandoned every lease behind
@@ -1585,7 +1638,7 @@ async def test_the_report_carries_only_integers(reap):
     fields = vars(report)
     assert set(fields) == {
         "requeued", "expired", "failed_exhausted", "processing_over_attempts",
-        "claimed", "advanced", "released", "abandoned_budget",
+        "stuck_over_age", "claimed", "advanced", "released", "abandoned_budget",
         "lost_claim", "terminal", "errors", "skipped_disabled", "duration_ms",
     }
     assert all(isinstance(v, int) for v in fields.values())
@@ -1653,6 +1706,317 @@ async def test_the_report_line_does_not_depend_on_the_root_logger(reap):
     assert not any(m.startswith("reap_agentic_poll: PollReport(") for m in sink.messages), (
         "the report line propagated to root, i.e. it went through the module logger"
     )
+
+
+# ══ 10c. the stuck count ══════════════════════════════════════════════════════════════════════
+#
+# `stuck_over_age` is what the "purchase stuck" alert reads off the report line. WHICH rows count
+# is the ledger's definition and is tested there (tests/test_reap_agentic_ledger.py); what is
+# tested here is the job's half: it reads on armed runs ONLY, after the loop, with the sweep's own
+# windows, and a read that fails says NOT COUNTED rather than zero.
+
+
+async def _park(purchase_id: str, state: str, entered_seconds_ago: int, **cols) -> None:
+    """Put a row in `state`, aged, and NOT DUE — so the run under test reports on it without
+    stepping it."""
+    sets = ", ".join(f"{name} = :{name}" for name in cols)
+    await _raw(
+        "UPDATE reap_agentic_purchases SET state = :s, "
+        f"state_entered_at = datetime('now', '-{int(entered_seconds_ago)} seconds'), "
+        "next_poll_at = datetime('now', '+3600 seconds')"
+        + (", " + sets if sets else "")
+        + " WHERE id = :i",
+        dict(cols, s=state, i=purchase_id),
+    )
+
+
+async def test_an_armed_run_reports_the_purchases_stuck_past_their_deadline(reap):
+    approved = await _start(buyer_ref="bref_paid")
+    quoting = await _start(buyer_ref="bref_quote")
+    fresh = await _start(buyer_ref="bref_fresh")
+    await _park(approved, "processing", job.STUCK_AFTER_SECONDS + 5, reap_checkout_id="chk_stuck")
+    await _park(quoting, "quoting", job.STUCK_AFTER_SECONDS + 5)
+    await _park(fresh, "processing", job.STUCK_AFTER_SECONDS - 60, reap_checkout_id="chk_fresh")
+
+    report = await _run(worker_id="w1")
+
+    assert report.stuck_over_age == 2
+    assert report.errors == 0
+    assert job.STUCK_AFTER_SECONDS == 1800, (
+        "the alert policy in infra/gcp/setup_monitoring.sh says 30 minutes; change them together"
+    )
+
+
+async def test_an_armed_run_with_nothing_stuck_reports_zero_not_the_sentinel(reap):
+    await _start()
+    report = await _run(worker_id="w1")
+    assert report.stuck_over_age == 0
+    assert report.stuck_over_age != job.NOT_COUNTED
+
+
+def test_a_report_nobody_filled_in_says_not_counted():
+    """The dataclass default is the sentinel too: a `PollReport` built anywhere without a count
+    must not claim that nothing is stuck."""
+    assert job.PollReport().stuck_over_age == job.NOT_COUNTED == -1
+
+
+async def test_a_buyer_still_on_a_live_hosted_page_is_not_reported_stuck(reap):
+    """Fifty minutes into `awaiting_approval` with a page that has not expired: waiting on a
+    person, with a deadline of its own that has not passed. The same age in `processing` is the
+    alert."""
+    waiting = await _start(buyer_ref="bref_wait")
+    await _park(waiting, "awaiting_approval", 3000, reap_checkout_id="chk_wait")
+    await _raw(
+        "UPDATE reap_agentic_purchases SET hosted_url_expires_at = datetime('now', '+600 seconds') "
+        "WHERE id = :i",
+        {"i": waiting},
+    )
+    assert (await _run(worker_id="w1")).stuck_over_age == 0
+
+    await _raw("UPDATE reap_agentic_purchases SET state = 'processing' WHERE id = :i", {"i": waiting})
+    assert (await _run(worker_id="w1")).stuck_over_age == 1
+
+
+async def test_the_stuck_count_is_read_after_the_loop(reap):
+    """A row this very tick moves is not stuck: it was 'resolving' for an hour, the run steps it
+    to 'needs_enrollment', and the state clock restarts. A read placed before the claim loop
+    reports 1 here and pages for a purchase that has just started moving."""
+    purchase_id = await _start()
+    await _raw(
+        "UPDATE reap_agentic_purchases SET state_entered_at = datetime('now', '-3600 seconds') "
+        "WHERE id = :i",
+        {"i": purchase_id},
+    )
+    assert await ledger.count_stuck_purchases(stuck_after_seconds=job.STUCK_AFTER_SECONDS) == 1
+
+    report = await _run(worker_id="w1")
+
+    assert report.advanced == 1
+    assert (await _get(purchase_id))["state"] == "needs_enrollment"
+    assert report.stuck_over_age == 0
+
+
+def _watch_the_stuck_read(monkeypatch) -> list:
+    """Every call to the stuck-count read, recorded. A LIST, not a raising stub: the job wraps
+    the read in `except Exception`, so a stub that raised would be swallowed into `errors` and a
+    test that only looked at the report would pass with the read issued."""
+    calls = []
+
+    async def _recorded(**kwargs):
+        calls.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(ledger, "count_stuck_purchases", _recorded)
+    return calls
+
+
+async def test_a_disarmed_run_does_not_issue_the_stuck_read(monkeypatch, reap):
+    """THE RAIL IS DARK IN PRODUCTION. Deploying this must add no statement to a disarmed tick:
+    the read is step 5, below the gate. The report says NOT COUNTED, never 0 — and a disarmed run
+    prints no report line at all, so the alert has nothing to read either way."""
+    stuck = await _start()
+    await _park(stuck, "processing", 99999, reap_checkout_id="chk_dark")
+    reads = _watch_the_stuck_read(monkeypatch)
+    monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+
+    with root_as_in_prod(), capture_pivota_stdout() as out:
+        report = await _run()
+
+    assert reads == [], "a disarmed run issued the stuck-count read"
+    assert report.skipped_disabled == 1
+    assert report.stuck_over_age == job.NOT_COUNTED == -1
+    assert report.errors == 0
+    assert not [line for line in pivota_lines(out) if "PollReport(" in line]
+
+
+async def test_an_unconfigured_client_does_not_issue_the_stuck_read(monkeypatch, reap):
+    await _start()
+    reads = _watch_the_stuck_read(monkeypatch)
+    monkeypatch.delenv("REAP_API_KEY", raising=False)
+    report = await _run()
+    assert reads == []
+    assert report.skipped_disabled == 1
+    assert report.stuck_over_age == job.NOT_COUNTED
+
+
+async def test_the_non_sandbox_refusal_does_not_issue_the_stuck_read(monkeypatch, reap):
+    await _start()
+    reads = _watch_the_stuck_read(monkeypatch)
+    monkeypatch.setenv("PIVOTA_ENV", "staging")
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://prod.api.reap.global")
+    report = await _run()
+    assert reads == []
+    assert report.skipped_disabled == 1
+    assert report.stuck_over_age == job.NOT_COUNTED
+
+
+async def test_a_failed_stuck_read_is_not_counted_not_zero_and_the_run_still_reports(
+    monkeypatch, reap, caplog
+):
+    """A count that could not be taken must not read as "nobody is stuck". The field keeps the
+    sentinel — which the stuck metric's `[1-9]` cannot match — `errors` goes up so the
+    poller-failing alert covers the tick, and the report line is still printed."""
+    await _start()
+
+    async def _boom(**kwargs):
+        raise RuntimeError(f"row content: {EMAIL}")
+
+    monkeypatch.setattr(ledger, "count_stuck_purchases", _boom)
+    caplog.set_level(logging.ERROR, logger="jobs.reap_agentic_purchase_poll")
+
+    with capture_pivota_stdout() as out:
+        report = await _run(worker_id="w1")
+
+    assert report.stuck_over_age == job.NOT_COUNTED
+    assert report.errors == 1
+    assert report.advanced == 1, "the diagnostic failing must not undo the run's real work"
+    assert "could not count stuck purchases (error_type=RuntimeError)" in caplog.text
+    assert EMAIL not in caplog.text, "the exception MESSAGE reached a log line"
+    (line,) = [ln for ln in pivota_lines(out) if "PollReport(" in ln]
+    assert "stuck_over_age=-1" in line and "errors=1" in line
+
+
+async def test_an_over_budget_run_still_counts_the_stuck_purchases(monkeypatch, reap):
+    """THE SCENARIO REVIEW MEASURED (#2488 round 2). A payment 90 minutes in `processing`, and
+    three ticks in a row that each spend the whole run budget on the one row they step. The
+    previous cut SKIPPED step 5 on a spent budget: every one of those reports read
+    `stuck_over_age=-1, errors=0`, with `abandoned_budget=0`, and nothing paged — the stuck alert
+    was blind exactly when the poller was slowest. The count is now taken on every armed run
+    that reaches it, bounded by its own timeout rather than by the budget."""
+    paid = await _start(buyer_ref="bref_paid")
+    await _park(paid, "processing", 90 * 60, reap_checkout_id="chk_stuck")
+    clock = _Clock(monkeypatch)
+    resolved = _resolved()
+
+    def _slow_row(**kwargs):
+        clock.spend_budget()  # the one row this run steps uses the whole budget
+        return resolved
+
+    reap.resolve_our_row = _slow_row
+
+    for tick in range(3):
+        await _start(buyer_ref=f"bref_slow_{tick}")
+        with capture_pivota_stdout() as out:
+            report = await _run(worker_id=f"w{tick}")
+        assert report.advanced == 1 and report.abandoned_budget == 0
+        assert report.duration_ms >= 9_000_000, "the run was not over budget when it reached step 5"
+        assert report.stuck_over_age == 1, f"tick {tick}: an over-budget run did not count"
+        assert report.errors == 0
+        (line,) = [ln for ln in pivota_lines(out) if "PollReport(" in ln]
+        assert "stuck_over_age=1," in line
+
+
+async def test_a_run_inside_its_budget_issues_the_stuck_read_once(monkeypatch, reap):
+    await _start()
+    reads = _watch_the_stuck_read(monkeypatch)
+    _Clock(monkeypatch)
+    report = await _run(worker_id="w1")
+    assert len(reads) == 1
+    assert report.stuck_over_age == 0
+
+
+async def test_a_count_that_times_out_is_an_error_not_a_silent_sentinel(
+    monkeypatch, reap, caplog
+):
+    """The count has a clock of its own. When it runs out the read is CANCELLED and awaited —
+    nothing is left running behind the run — the field says NOT COUNTED, and `errors` goes up:
+    failing to count is a failure and pages as one. `-1` with `errors=0` must not be possible on
+    a run that printed a report."""
+    await _start()
+    seen = {}
+
+    async def _hangs(**kwargs):
+        seen["started"] = True
+        try:
+            await asyncio.sleep(8)
+        except asyncio.CancelledError:
+            seen["cancelled"] = True
+            raise
+        finally:
+            seen["finished"] = True
+
+    monkeypatch.setattr(ledger, "count_stuck_purchases", _hangs)
+    monkeypatch.setattr(job, "STUCK_COUNT_TIMEOUT_SECONDS", 0.05)
+    caplog.set_level(logging.ERROR, logger="jobs.reap_agentic_purchase_poll")
+
+    began = asyncio.get_running_loop().time()
+    with capture_pivota_stdout() as out:
+        report = await _run(worker_id="w1")
+    elapsed = asyncio.get_running_loop().time() - began
+
+    assert seen == {"started": True, "cancelled": True, "finished": True}, (
+        "the timed-out read was not cancelled and awaited"
+    )
+    assert elapsed < 5, f"the run waited {elapsed:.1f}s on a 0.05s timeout"
+    assert report.stuck_over_age == job.NOT_COUNTED
+    assert report.errors == 1
+    assert report.advanced == 1, "the diagnostic timing out must not undo the run's real work"
+    assert "could not count stuck purchases (error_type=TimeoutError)" in caplog.text
+    (line,) = [ln for ln in pivota_lines(out) if "PollReport(" in ln]
+    assert "stuck_over_age=-1," in line and ", errors=1," in line
+
+
+def test_the_count_timeout_fits_inside_the_run_deadline():
+    """The arithmetic the constant's comment states, held against the numbers it depends on:
+    the budget, the slowest step, this timeout, and the DB layer's own bound on handing a
+    connection back after a cancelled statement. If any of them moves, re-derive."""
+    from db.database import DB_POOL_CHECKOUT_TIMEOUT_SECONDS
+    from services.audit_scheduler import _JOB_RUN_DEADLINES
+
+    worst = (
+        job.DIALS["poll_budget_seconds"].default
+        + svc.QUOTING_STEP_BUDGET_S
+        + job.STUCK_COUNT_TIMEOUT_SECONDS
+        + DB_POOL_CHECKOUT_TIMEOUT_SECONDS
+    )
+    assert job.STUCK_COUNT_TIMEOUT_SECONDS == 10
+    assert worst <= _JOB_RUN_DEADLINES["reap_agentic_purchase_poll"] - 30, worst
+
+
+async def test_a_run_cancelled_during_the_count_still_propagates(monkeypatch, reap):
+    """`wait_for` turns ITS OWN timeout into an `Exception`. A cancellation of the RUN — the
+    deadline, a shutdown — is not one, and must keep travelling through step 5 as it does
+    through step 4."""
+    await _start()
+
+    async def _cancelled(**kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(ledger, "count_stuck_purchases", _cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await _run(worker_id="w1")
+    assert await _all_claims() == {}
+
+
+async def test_the_stuck_read_is_given_the_windows_the_expire_sweep_was_given(monkeypatch, reap):
+    """A waiting row's deadline is the sweep's own. Two readers of the two dials would be two
+    rules, so the job hands the count exactly what it handed the sweep."""
+    await _start()
+    monkeypatch.setenv("REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS", "7200")
+    monkeypatch.setenv("REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS", "240")
+    seen = {}
+    real_expire, real_count = ledger.expire_overdue_purchases, ledger.count_stuck_purchases
+
+    async def _expire(**kwargs):
+        seen["expire"] = kwargs
+        return await real_expire(**kwargs)
+
+    async def _count(**kwargs):
+        seen["count"] = kwargs
+        return await real_count(**kwargs)
+
+    monkeypatch.setattr(ledger, "expire_overdue_purchases", _expire)
+    monkeypatch.setattr(ledger, "count_stuck_purchases", _count)
+
+    await _run(worker_id="w1")
+
+    assert seen["count"] == {
+        "stuck_after_seconds": job.STUCK_AFTER_SECONDS,
+        "max_age_seconds": 7200,
+        "enrollment_grace_seconds": 240,
+    }
+    assert seen["count"]["max_age_seconds"] == seen["expire"]["max_age_seconds"]
+    assert seen["count"]["enrollment_grace_seconds"] == seen["expire"]["enrollment_grace_seconds"]
 
 
 # ══ 11. registration ══════════════════════════════════════════════════════════════════════════

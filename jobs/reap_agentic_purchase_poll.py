@@ -16,6 +16,7 @@ bookkeeping SELECTs, no HTTP, and no transitions — it is a LOOP and a set of B
                                                                                      ALWAYS
   3b. count the 'processing' rows at or over the attempt ceiling — READ ONLY.         ALWAYS
   4. `claim_due_purchases` → `advance` → `release_claim`, one row at a time.  ONLY WHEN ARMED
+  5. count the purchases stuck past their deadline — READ ONLY — and report.   ONLY WHEN ARMED
 
 THE SWEEPS RUN BEFORE THE CLAIM, AND THAT IS THE WHOLE POINT OF THE ORDER. Claiming first means
 this run takes a lease on rows that steps 1–3 were about to recover or terminate, and then spends
@@ -74,6 +75,13 @@ on modern Python precisely so that cleanup handlers do not swallow it: a run tha
 deadline cancellation and carried on would defeat the watchdog the whole scheduler is built
 around (#1754). It propagates, and the `finally` still releases every claim on the way out.
 `test_a_cancelled_run_propagates_and_still_releases_every_claim` pins both halves.
+
+The ONE `except asyncio.CancelledError` in this file re-raises on its next line. It exists to
+tell the cleanup WHY it is finding claims: a run cancelled mid-step — its deadline, or the
+service shutting down under a deploy — holds claims because it was interrupted, not because the
+loop forgot them. The release is identical either way; only the log line differs, and that
+difference is what keeps every deploy that lands mid-step from paging as a failing poller
+(infra/gcp/setup_monitoring.sh excludes `released on cancellation`).
 
 The claim is NOT released by every path through `advance`, which is why the release here is
 unconditional rather than conditional on the outcome:
@@ -142,6 +150,7 @@ service that would run this is deployed separately — see docs/runbooks/reap_ag
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import socket
@@ -259,6 +268,41 @@ SWEEP_BATCH = 200
 #: repo gives.
 MAX_SWEEP_ITERATIONS = 20
 
+#: How far past its deadline a purchase must be before `PollReport.stuck_over_age` counts it.
+#: Not a dial: it is half of an alert definition — the other half is the policy in
+#: infra/gcp/setup_monitoring.sh, whose name says "30 minutes" — and the two change together, in
+#: git. What "deadline" means per state is `ledger.count_stuck_purchases`'s to say.
+STUCK_AFTER_SECONDS = 1800
+
+#: `PollReport.stuck_over_age` when step 5 did not produce a count. See `PollReport`.
+NOT_COUNTED = -1
+
+#: How long step 5's one COUNT may take before the run gives up on it. Not a dial.
+#:
+#: The statement reads a handful of rows through an index and answers in milliseconds, so ten
+#: seconds is not a performance budget: it is how long this job will queue for a pool slot, or
+#: sit behind a lock, before saying "I could not count" out loud (`errors`, which pages) instead
+#: of holding the run open.
+#:
+#: IT IS SIZED AGAINST THE 600 s RUN DEADLINE, with what a timeout costs AFTER it fires.
+#: `asyncio.wait_for` cancels the read and then WAITS for it to unwind, and in this repo's DB
+#: layer that unwinding is deliberate (db/database.py, "A cancelled request must still hand its
+#: connection back"): the statement is cancelled on the server and the connection is released
+#: before the cancellation is re-raised. On a healthy socket that is milliseconds. On a silent
+#: one the release is bounded by `DB_POOL_CHECKOUT_TIMEOUT_SECONDS` (120 s), after which asyncpg
+#: terminates the connection. So the worst case this step adds to a run is 10 + 120 s:
+#:
+#:     240  the run budget (no new row is started after it)
+#:   + 170  the slowest realistic step, already in flight when the budget ran out
+#:   +  10  this timeout
+#:   + 120  the DB layer handing the connection back over a dead socket
+#:   = 540  under the 600 s deadline, with 60 s for the sweeps' own statements.
+#:
+#: When `wait_for` returns, nothing of the count is left running: no statement on the server, no
+#: pool slot held. tests/test_reap_agentic_purchase_poll_postgres.py holds that against a real
+#: lock.
+STUCK_COUNT_TIMEOUT_SECONDS = 10
+
 
 #: Dial names already warned about IN THIS PROCESS. A bad dial is a STANDING condition, not an
 #: event: at a 30 s interval the first cut logged the same warning 2,880 times a day, which is
@@ -364,12 +408,25 @@ class PollReport:
     flight — and, with it, their address and email. A number that does not fall needs a person.
     The first cut reported nothing at all for those rows: measured at attempts=100,005 on a row
     no count mentioned.
+
+    `stuck_over_age` IS THE NUMBER THE "PURCHASE STUCK" ALERT READS, off the report line
+    (infra/gcp/setup_monitoring.sh matches `stuck_over_age=[1-9]`). It is how many non-terminal
+    purchases are more than `STUCK_AFTER_SECONDS` past the last moment the rail's own rules let
+    them stay where they are — `ledger.count_stuck_purchases` owns the definition, and a buyer
+    with a live hosted page is not in it. It is read in STEP 5, on armed runs only, so:
+
+        >= 0   counted, and that is the count.
+        -1     NOT COUNTED (`NOT_COUNTED`): the rail is disarmed, or the read failed or timed
+               out — in which case `errors` says so. Never 0: "nobody looked" must not read as
+               "nobody is stuck". On an armed run that printed a report, `-1` always comes with
+               `errors` >= 1.
     """
 
     requeued: int = 0
     expired: int = 0
     failed_exhausted: int = 0
     processing_over_attempts: int = 0
+    stuck_over_age: int = -1
     claimed: int = 0
     advanced: int = 0
     released: int = 0
@@ -527,8 +584,14 @@ async def _sweep_until_drained(
     return total
 
 
-async def _release_leftovers(worker: str) -> int:
+async def _release_leftovers(worker: str, *, cancelled: bool = False) -> int:
     """Release every claim this worker still holds. Returns how many there were.
+
+    `cancelled` CHANGES THE LOG LINE AND NOTHING ELSE. On a run that completed its loop, a
+    claim found here is a bug and is logged as one, at ERROR. On a run that was cancelled
+    mid-step the claims are the ones it was interrupted holding: expected, logged at WARNING
+    with the words `released on cancellation`, which the failing-poller metric excludes. The
+    SELECT, the release and the return value are the same on both paths.
 
     RUNS IN A `finally`, INCLUDING ON A CANCEL, so it is written to survive things going wrong
     rather than to be elegant:
@@ -541,8 +604,8 @@ async def _release_leftovers(worker: str) -> int:
         rows behind it — the same rule jobs/agent_card_revocation_sweep.py states as rule 3.
       * `except Exception`, never `BaseException`: a cancellation must keep travelling.
 
-    Anything it finds is a bug in the loop above, which is why the caller counts the result under
-    `errors`. But it is RELEASED first: leaving a row stuck for a whole lease to make a point
+    On a run that finished its loop, anything it finds is a bug in the loop above, which is why
+    the caller counts the result under `errors`. But it is RELEASED first: leaving a row stuck for a whole lease to make a point
     helps nobody.
     """
     leftovers: List[Any] = []
@@ -567,11 +630,18 @@ async def _release_leftovers(worker: str) -> int:
     released = 0
     for leftover in leftovers:
         purchase_id = str(leftover["id"])
-        logger.error(
-            "reap_agentic_poll: purchase=%s was STILL CLAIMED after the loop; releasing it. "
-            "This is a bug in the poller, not in the ledger",
-            purchase_id,
-        )
+        if cancelled:
+            logger.warning(
+                "reap_agentic_poll: purchase=%s released on cancellation — the run was "
+                "cancelled (its deadline, or the service shutting down) while it held this claim",
+                purchase_id,
+            )
+        else:
+            logger.error(
+                "reap_agentic_poll: purchase=%s was STILL CLAIMED after the loop; releasing it. "
+                "This is a bug in the poller, not in the ledger",
+                purchase_id,
+            )
         try:
             await ledger.release_claim(purchase_id, worker)
         except Exception as exc:  # noqa: BLE001 — one bad row must not strand the rest
@@ -617,6 +687,7 @@ async def run_reap_agentic_purchase_poll(
     budget_seconds = _env_int(DIALS["poll_budget_seconds"])
 
     counts = {name: 0 for name in _COUNTS}
+    counts["stuck_over_age"] = NOT_COUNTED
 
     def _budget_spent() -> bool:
         return (_monotonic() - started) >= budget_seconds
@@ -756,6 +827,7 @@ async def run_reap_agentic_purchase_poll(
     # EVERYTHING FROM HERE IS INSIDE ONE try/finally, AND THAT IS FIX F1/F2. The `finally` is the
     # only thing standing between a cancelled or raising run and a batch of leases held for a
     # full lease window — with, in two states, a buyer's address and email on them.
+    cancelled = False
     try:
         for row in rows:
             purchase_id = str(row["id"])
@@ -864,13 +936,58 @@ async def run_reap_agentic_purchase_poll(
             # bare, so a pool blip on row 2 of 10 propagated out of the whole function and
             # abandoned the eight leases behind it.
             await _release_guarded(purchase_id, worker, counts)
+    except asyncio.CancelledError:
+        # NOT SWALLOWED: re-raised on the next line. Noted only so the cleanup below can say
+        # what it is looking at — see the module header.
+        cancelled = True
+        raise
     finally:
         # THE INVARIANT, CHECKED RATHER THAN ASSERTED IN PROSE — and checked on the way out of a
         # cancellation too, which is the path the first cut had no answer for at all.
-        counts["errors"] += await _release_leftovers(worker)
+        counts["errors"] += await _release_leftovers(worker, cancelled=cancelled)
+
+    # ── 5. the stuck count — READ ONLY, AND ONLY ON AN ARMED RUN ─────────────────────────────
+    # After the loop, so a purchase this very tick moved is not counted, and below both early
+    # returns above, so a disarmed rail issues no statement it did not issue before. It is given
+    # the SAME max age and grace the expire sweep was given at the top of this run: a waiting
+    # row's deadline is the sweep's own, not a second opinion.
+    #
+    # ALWAYS TAKEN, EVEN ON A SPENT BUDGET — AND BOUNDED ON ITS OWN CLOCK INSTEAD. Skipping it
+    # when the budget was spent (the previous cut) made the stuck alert blind exactly when the
+    # poller was slowest: three over-budget ticks in a row reported `stuck_over_age=-1, errors=0`
+    # over a payment 90 minutes in flight, and nothing paged. So the count runs on every armed
+    # run that gets this far, under `STUCK_COUNT_TIMEOUT_SECONDS`; see that constant for the
+    # arithmetic against the run deadline.
+    #
+    # A COUNT THAT COULD NOT BE TAKEN IS A FAILURE, NEVER A SILENT -1. Timed out or raised, the
+    # field keeps NOT_COUNTED and `errors` goes up, so the tick the stuck alert cannot see is the
+    # failing alert's. `asyncio.TimeoutError` is an `Exception`; a cancellation of the RUN is not,
+    # and still propagates from here.
+    try:
+        counts["stuck_over_age"] = await asyncio.wait_for(
+            ledger.count_stuck_purchases(
+                stuck_after_seconds=STUCK_AFTER_SECONDS,
+                max_age_seconds=hosted_max_age,
+                enrollment_grace_seconds=enrollment_grace,
+            ),
+            timeout=STUCK_COUNT_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 — a diagnostic must never fail the run that carries it
+        # The TYPE only, as everywhere in this file; a timeout reads `error_type=TimeoutError`.
+        counts["errors"] += 1
+        logger.error(
+            "reap_agentic_poll: could not count stuck purchases (error_type=%s); "
+            "stuck_over_age is reported as %d, meaning NOT COUNTED",
+            type(exc).__name__,
+            NOT_COUNTED,
+        )
 
     report = _report()
     # THE PROOF LINE: `[ts] INFO - reap_agentic_poll: PollReport(...)` on the worker's stdout.
+    # THREE LOG-BASED METRICS MATCH THIS LINE (infra/gcp/setup_monitoring.sh): its presence,
+    # `stuck_over_age=[1-9]` and `, errors=[1-9]`. The prefix, the `PollReport(` and the
+    # `, name=<int>` pairs are therefore a contract; tests/test_reap_rail_alerts.py runs this job
+    # and feeds the line it really printed through the filters.
     operator_logger.info("reap_agentic_poll: %s", report)
     return report
 
