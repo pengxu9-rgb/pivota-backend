@@ -4097,6 +4097,16 @@ async def test_a_repeated_settling_hold_logs_warning_once_then_info(reap, caplog
     assert [r.levelno for r in held] == [logging.WARNING, logging.INFO, logging.INFO]
 
 
+async def test_a_buyer_on_the_enrollment_page_logs_warning_once_then_info(reap, caplog):
+    caplog.set_level(logging.INFO, logger=svc.logger.name)
+    purchase, _ = await _purchase_a_waiting_on_a_link(reap)
+    for _ in range(3):
+        result = await _step(purchase)
+        assert result.last_error_code == "enrollment_pending"
+    held = [r for r in caplog.records if "held at enrollment_pending," in r.getMessage()]
+    assert [r.levelno for r in held] == [logging.WARNING, logging.INFO, logging.INFO, logging.INFO]
+
+
 # ── round-2 review of #2483 at 8df71dd6e, P2-A: two creates of ONE attempt, concurrently ─────
 
 
