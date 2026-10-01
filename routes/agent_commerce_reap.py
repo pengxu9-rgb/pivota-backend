@@ -7,14 +7,18 @@ belong to. Everything that talks to Reap happens later, in the poller, on anothe
 
 ── WHAT 404 MEANS HERE ──────────────────────────────────────────────────────────────────────
 
-While `REAP_AGENTIC_ENABLED` is off or the client has no credentials, EVERY route on this router
-answers **404**, not 503. That is a deliberate lie about existence and it is the right one: the
+While `REAP_AGENTIC_ENABLED` is off or the client has no credentials, create and list routes
+answer **404**, not 503. That is a deliberate lie about existence and it is the right one: the
 agent door's job on receiving it is to fall back to another rail, and a 503 reads as "this rail
 is the answer, try again shortly" — which would make an unarmed rail look like an outage and
 stall a buyer behind it. The rail is dark by default, so 404 is also the honest description of
 production today.
 
-The gate is the FIRST statement of each of the three handlers rather than a router-level
+The stored purchase-by-ID GET remains authenticated and owner-scoped while disarmed; it
+makes no provider calls, so a buyer can observe an already exposed checkout
+while create/reconciliation credentials are being repaired.
+
+The create/list gate is the FIRST statement of those handlers rather than a router-level
 dependency, and that costs one ordering property: an unauthenticated caller gets 401 from
 `get_agent_context` before it can learn the route is dark. Three reasons it is still here:
 
@@ -2809,7 +2813,8 @@ async def get_reap_purchase(
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     try:
-        _require_rail()
+        # Stored owner-scoped status reads survive create disarming/credential outages.
+        # This handler makes no provider call and retains both identity dependencies.
         agent_user_ref = _require_agent_user(agent_user)
         agent_user_ref_hash = hash_agent_user_ref(agent_user_ref)
         if not agent_user_ref_hash:

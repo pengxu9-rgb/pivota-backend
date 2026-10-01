@@ -175,6 +175,7 @@ __all__ = [
     "release_claim",
     "requeue_stale_claims",
     "expire_overdue_purchases",
+    "scrub_reconciling_purchase_pii",
     "fail_exhausted_purchases",
     "count_stuck_purchases",
     "upsert_pending_enrollment",
@@ -1743,6 +1744,8 @@ _SELECT_DUE_PURCHASES_SQL = """
        AND claimed_by IS NULL
        AND next_poll_at IS NOT NULL
        AND next_poll_at <= clock_timestamp()
+       AND (:reconciliation_only = 0 OR
+            (state IN ('awaiting_approval', 'processing') AND reap_checkout_id IS NOT NULL))
      ORDER BY next_poll_at ASC, id ASC
      LIMIT :limit
 """
@@ -1753,6 +1756,8 @@ _SELECT_DUE_PURCHASES_SQL_SQLITE = """
        AND claimed_by IS NULL
        AND next_poll_at IS NOT NULL
        AND next_poll_at <= CURRENT_TIMESTAMP
+       AND (:reconciliation_only = 0 OR
+            (state IN ('awaiting_approval', 'processing') AND reap_checkout_id IS NOT NULL))
      ORDER BY next_poll_at ASC, id ASC
      LIMIT :limit
 """
@@ -1794,6 +1799,8 @@ _CLAIM_PURCHASE_SQL = """
        AND state IN (
            'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
        )
+       AND (:reconciliation_only = 0 OR
+            (state IN ('awaiting_approval', 'processing') AND reap_checkout_id IS NOT NULL))
     RETURNING *
 """
 
@@ -1810,6 +1817,8 @@ _CLAIM_PURCHASE_SQL_SQLITE = """
        AND state IN (
            'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
        )
+       AND (:reconciliation_only = 0 OR
+            (state IN ('awaiting_approval', 'processing') AND reap_checkout_id IS NOT NULL))
     RETURNING *
 """
 
@@ -1938,8 +1947,13 @@ _SELECT_DUE_STATES = _states_in(_SELECT_DUE_PURCHASES_SQL, "WHERE state IN (")
 _CLAIM_ATTEMPT_EXEMPT_STATES = _states_in(_CLAIM_PURCHASE_SQL, "attempts = CASE WHEN state IN (")
 
 
-async def claim_due_purchases(worker_id: str, *, limit: int = 10) -> List[Dict[str, Any]]:
+async def claim_due_purchases(
+    worker_id: str, *, limit: int = 10, reconciliation_only: bool = False
+) -> List[Dict[str, Any]]:
     """Take a lease on up to `limit` purchases whose next_poll_at has come.
+
+    reconciliation_only filters both SELECT and UPDATE to checkout-backed approval/processing
+    rows, permitting safe GET-only recovery while new purchase work is disabled.
 
     THERE IS NO `lease_seconds` PARAMETER, and there used to be. It was accepted here, documented
     as "what requeue_stale_claims measures against", and connected to nothing: the lease length
@@ -1960,12 +1974,21 @@ async def claim_due_purchases(worker_id: str, *, limit: int = 10) -> List[Dict[s
     _require_worker_id(worker_id, "worker_id")
     capped = _sweep_limit(limit)
     if IS_POSTGRES:
-        candidates = await database.fetch_all(_SELECT_DUE_PURCHASES_SQL, {"limit": capped})
+        candidates = await database.fetch_all(
+            _SELECT_DUE_PURCHASES_SQL,
+            {"limit": capped, "reconciliation_only": int(reconciliation_only)},
+        )
     else:
-        candidates = await database.fetch_all(_SELECT_DUE_PURCHASES_SQL_SQLITE, {"limit": capped})
+        candidates = await database.fetch_all(
+            _SELECT_DUE_PURCHASES_SQL_SQLITE,
+            {"limit": capped, "reconciliation_only": int(reconciliation_only)},
+        )
     claimed: List[Dict[str, Any]] = []
     for candidate in candidates:
-        params = {"id": candidate["id"], "worker_id": worker_id}
+        params = {
+            "id": candidate["id"], "worker_id": worker_id,
+            "reconciliation_only": int(reconciliation_only),
+        }
         if IS_POSTGRES:
             row = await database.fetch_one(_CLAIM_PURCHASE_SQL, params)
         else:
@@ -2111,8 +2134,8 @@ ENROLLMENT_GRACE_SECONDS_MAX = 3600
 #                           (staging 2026-09-30: completed ~11:23, still REQUIRES_ACTION
 #                           until 11:36:43, 9 s past the 11:36:34 expiry). Without the grace
 #                           the sweep expired the purchase before the poller could see the
-#                           card it was waiting for. 'awaiting_approval' gets NO grace: there
-#                           the QUOTE dies at Reap's expiry, so nothing can arrive after it.
+#                           card it was waiting for. Checkout-backed awaiting_approval is
+#                           excluded: a local deadline never proves the buyer did not pay.
 #   updated_at + max_age  — the ABSOLUTE fallback. Without it a row in 'needs_enrollment' or
 #                           'awaiting_approval' with a NULL hosted_url_expires_at is never
 #                           expired by anything, and keeps the buyer's address and email
@@ -2132,9 +2155,11 @@ _EXPIRE_OVERDUE_SQL = """
            state_entered_at = clock_timestamp(),
            updated_at = clock_timestamp()
      WHERE state IN ('needs_enrollment', 'awaiting_approval')
+       AND (state = 'needs_enrollment' OR reap_checkout_id IS NULL)
        AND id IN (
         SELECT id FROM reap_agentic_purchases
          WHERE state IN ('needs_enrollment', 'awaiting_approval')
+           AND (state = 'needs_enrollment' OR reap_checkout_id IS NULL)
            AND (
                 (state = 'awaiting_approval'
                  AND hosted_url_expires_at IS NOT NULL
@@ -2164,9 +2189,11 @@ _EXPIRE_OVERDUE_SQL_SQLITE = """
            state_entered_at = CURRENT_TIMESTAMP,
            updated_at = CURRENT_TIMESTAMP
      WHERE state IN ('needs_enrollment', 'awaiting_approval')
+       AND (state = 'needs_enrollment' OR reap_checkout_id IS NULL)
        AND id IN (
         SELECT id FROM reap_agentic_purchases
          WHERE state IN ('needs_enrollment', 'awaiting_approval')
+           AND (state = 'needs_enrollment' OR reap_checkout_id IS NULL)
            AND (
                 (state = 'awaiting_approval'
                  AND hosted_url_expires_at IS NOT NULL
@@ -2198,6 +2225,7 @@ _FAIL_EXHAUSTED_SQL = """
            'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
        )
        AND (:include_processing = 1 OR state <> 'processing')
+       AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
        AND attempts >= :max_attempts
        AND id IN (
         SELECT id FROM reap_agentic_purchases
@@ -2205,6 +2233,7 @@ _FAIL_EXHAUSTED_SQL = """
                'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
            )
            AND (:include_processing = 1 OR state <> 'processing')
+           AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
            AND attempts >= :max_attempts
          ORDER BY attempts DESC, id ASC
          LIMIT :limit
@@ -2228,6 +2257,7 @@ _FAIL_EXHAUSTED_SQL_SQLITE = """
            'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
        )
        AND (:include_processing = 1 OR state <> 'processing')
+       AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
        AND attempts >= :max_attempts
        AND id IN (
         SELECT id FROM reap_agentic_purchases
@@ -2235,6 +2265,7 @@ _FAIL_EXHAUSTED_SQL_SQLITE = """
                'resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing'
            )
            AND (:include_processing = 1 OR state <> 'processing')
+           AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
            AND attempts >= :max_attempts
          ORDER BY attempts DESC, id ASC
          LIMIT :limit
@@ -2319,43 +2350,14 @@ async def expire_overdue_purchases(
     limit: int = 200,
     enrollment_grace_seconds: int = ENROLLMENT_GRACE_SECONDS_DEFAULT,
 ) -> List[str]:
-    """Expire purchases waiting on a buyer who never came back; return the ids that moved.
+    """Expire abandoned enrollment/pre-checkout rows; return the ids that moved.
 
-    Two clocks, both the SERVER's: Reap's `hosted_url_expires_at` when we have one, and an
-    absolute `state_entered_at + max_age_seconds` fallback for the rows where we do not. The
-    fallback is what makes this a PII deadline rather than a best-effort one — a row in
-    'awaiting_approval' with no hosted-page expiry was previously expired by nothing at all and
-    kept the buyer's address and email indefinitely.
-
-    THE FALLBACK MEASURES `state_entered_at`, NOT `updated_at`, AND THAT DISTINCTION IS THE WHOLE
-    GUARD. `updated_at` is written by every claim, every release and every requeue, so a deadline
-    measured from it is reset by the poll loop itself and NEVER FIRES at any realistic cadence.
-    Measured: a row aged 99999 seconds, then ONE ordinary claim+release, was not expired and kept
-    the buyer's address and email. These are precisely the rows with no other bound — `attempts`
-    is exempt in both waiting states, and 'needs_enrollment' has no hosted URL of its own at all.
-    `state_entered_at` moves only when the STATE moves, which is a clock the poller cannot reset.
-
-    THE ENROLLMENT GRACE. In 'needs_enrollment' the hosted-expiry clock fires
-    `enrollment_grace_seconds` AFTER `hosted_url_expires_at`, not at it — Reap turns an
-    enrollment ACTIVE at or after its hosted session dies (measured on staging 2026-09-30:
-    9 s after), so a sweep on the exact expiry terminated purchases whose card had just been
-    enrolled, before the poller could read it. 'awaiting_approval' keeps Reap's exact expiry:
-    there the QUOTE dies then, and no approval can land after it. The absolute
-    `state_entered_at + max_age_seconds` fallback is unchanged and still bounds both states.
-    The production caller (jobs/reap_agentic_purchase_poll.py) passes
-    `services.reap_agentic_purchase.enrollment_grace_seconds()`, which reads
-    REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS; the default here is the same number, so a caller
-    that passes nothing gets the grace rather than the bug. 0 means "Reap's exact expiry".
-
-    BOUNDED. At most `limit` rows per call; loop until fewer than `limit` come back. An unbounded
-    UPDATE on first arming locks every qualifying row at once, on a Postgres serving live
-    traffic.
-
-    UNFENCED, AND THE POLLER MUST KNOW IT. This is a bulk terminal write that takes no `holder`,
-    so it can terminate a purchase a live worker currently holds the lease on. That is deliberate
-    — a worker holding a lease on an abandoned purchase must not be able to keep it alive — and
-    it is safe because the worker's next write goes through the fence and gets None back. The
-    poller must treat None from `transition_as_holder` as "re-read", never as "retry harder".
+    A stored checkout in awaiting_approval is excluded in BOTH the candidate query and UPDATE:
+    it may be paid even while our last observed state still says awaiting_approval. Only an
+    authoritative get_checkout outcome may terminate it. Its contact retention is separately
+    bounded by scrub_reconciling_purchase_pii. Enrollment grace and the server-clock absolute
+    fallback still bound pre-checkout rows. Bounded, unfenced terminal updates remain safe
+    because holder writes use the state/owner fence.
     """
     seconds = _require_int(max_age_seconds, "max_age_seconds", minimum=60)
     grace = _require_int(
@@ -2382,25 +2384,76 @@ async def expire_overdue_purchases(
     return [str(r["id"]) for r in rows]
 
 
+_SCRUB_RECONCILING_PII_SQL = """
+    UPDATE reap_agentic_purchases
+       SET shipping_address = NULL, buyer_email = NULL, offer_code = NULL
+     WHERE state IN ('awaiting_approval', 'processing')
+       AND reap_checkout_id IS NOT NULL
+       AND (shipping_address IS NOT NULL OR buyer_email IS NOT NULL OR offer_code IS NOT NULL)
+       AND state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+       AND id IN (
+           SELECT id FROM reap_agentic_purchases
+            WHERE state IN ('awaiting_approval', 'processing')
+              AND reap_checkout_id IS NOT NULL
+              AND (shipping_address IS NOT NULL OR buyer_email IS NOT NULL OR offer_code IS NOT NULL)
+              AND state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+            ORDER BY state_entered_at ASC, id ASC LIMIT :limit
+       )
+    RETURNING id
+"""
+
+_SCRUB_RECONCILING_PII_SQL_SQLITE = """
+    UPDATE reap_agentic_purchases
+       SET shipping_address = NULL, buyer_email = NULL, offer_code = NULL
+     WHERE state IN ('awaiting_approval', 'processing')
+       AND reap_checkout_id IS NOT NULL
+       AND (shipping_address IS NOT NULL OR buyer_email IS NOT NULL OR offer_code IS NOT NULL)
+       AND state_entered_at < datetime('now', :max_age_window)
+       AND id IN (
+           SELECT id FROM reap_agentic_purchases
+            WHERE state IN ('awaiting_approval', 'processing')
+              AND reap_checkout_id IS NOT NULL
+              AND (shipping_address IS NOT NULL OR buyer_email IS NOT NULL OR offer_code IS NOT NULL)
+              AND state_entered_at < datetime('now', :max_age_window)
+            ORDER BY state_entered_at ASC, id ASC LIMIT :limit
+       )
+    RETURNING id
+"""
+
+
+async def scrub_reconciling_purchase_pii(
+    *, max_age_seconds: int = 3600, limit: int = 200
+) -> List[str]:
+    """Bound contact retention without deciding whether an exposed checkout was paid.
+
+    Checkout reads and conversion close need no shipping address/email/offer code. Keep all
+    checkout, quote, amount, consent and attribution evidence; do not alter state, claims,
+    state_entered_at or terminal_at. Idempotent and safe against a concurrent holder write.
+    """
+    seconds = _require_int(max_age_seconds, "max_age_seconds", minimum=60)
+    capped = _sweep_limit(limit)
+    if IS_POSTGRES:
+        rows = await database.fetch_all(
+            _SCRUB_RECONCILING_PII_SQL, {"max_age_seconds": seconds, "limit": capped}
+        )
+    else:
+        rows = await database.fetch_all(
+            _SCRUB_RECONCILING_PII_SQL_SQLITE,
+            {"max_age_window": f"-{seconds} seconds", "limit": capped},
+        )
+    return [str(r["id"]) for r in rows]
+
+
 async def fail_exhausted_purchases(
     max_attempts: int, *, limit: int = 200, include_processing: bool = False
 ) -> List[str]:
     """Fail non-terminal purchases claimed `max_attempts` times or more; return the ids.
 
-    `attempts` COUNTS CLAIMS, NOT RETRIES, and only in the states where a claim means work was
-    tried — 'awaiting_approval' and 'needs_enrollment' are exempt, because a buyer taking an hour
-    on the partner's page is not a failure and polling them every 30 seconds would otherwise
-    reach ~120 attempts on a perfectly healthy purchase. Those two states are bounded by
-    `expire_overdue_purchases` instead, on a clock, which is the right instrument for waiting on
-    a person. Choose `max_attempts` against how many times you expect to RETRY, not against poll
-    cadence.
-
-    'processing' IS SKIPPED UNLESS YOU ASK FOR IT. A purchase in 'processing' has been APPROVED
-    BY THE BUYER and its payment is in flight with Reap. Auto-failing that on an attempt counter
-    would write a terminal state over a charge we do not know the outcome of — our ledger saying
-    'failed' while the buyer's card says otherwise. `include_processing=True` exists because the
-    poller package will eventually need a deliberate answer for a payment stuck in flight; that
-    answer belongs to whoever can also reconcile it with Reap, not to a counter in a sweep.
+    `attempts` counts claims outside the human-wait states, not actual retries.
+    Checkout-backed awaiting_approval/processing rows are ALWAYS excluded, including when
+    include_processing=True: an attempt counter is not authoritative payment evidence.
+    The optional flag only covers processing rows without a persisted checkout. Resolve a
+    genuine payment through the provider-read step or an explicitly audited repair instead.
 
     BOUNDED, for the same reason as the expire sweep.
 

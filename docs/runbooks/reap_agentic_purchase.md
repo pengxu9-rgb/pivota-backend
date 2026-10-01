@@ -55,8 +55,8 @@ What the rail does now:
    the enrollment's end. The expire sweep gives `needs_enrollment` an **enrollment grace**
    (`REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS`, default **180**) past `hosted_url_expires_at`, and
    the poller keeps reading the enrollment during it; ACTIVE in the grace → `quoting`.
-   `awaiting_approval` gets **no** grace: its QUOTE dies at the expiry. The absolute
-   `REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` fallback is unchanged.
+   Checkout-backed `awaiting_approval` remains recoverable after either deadline; only an
+   authoritative checkout read decides its outcome. Contact retention has its own deadline.
 2. **`resolving` reconciles before it mints.** No active row, but `pending` rows that have a
    `reap_enrollment_id` (a link was handed out): **every** such row, **oldest first**, gets one
    guarded `get_enrollment` (`_still_ours` in front of it, like every partner call):
@@ -304,21 +304,38 @@ full https URL on an allowlisted host, or put a different host first in `REAP_RE
 purchase already in flight must be allowed to finish (or fail cleanly) after the dial is turned
 off — stranding a row in `awaiting_approval` after the buyer has paid is worse than finishing it.
 
-> **The poller re-checks it, but ONLY for the partner-facing half.**
-> `run_reap_agentic_purchase_poll` gates **step 4 only** (claim + `advance`). With the rail off
-> it returns `skipped_disabled=1`, takes no claim and makes no partner call — and **the three
-> sweeps above it run anyway**, including the PII deadline.
->
-> The first cut gated the whole run, and that was a measured retention bug: with the rail off, an
-> `awaiting_approval` row 99,999 s old kept `buyer_email` and `shipping_address` across three
-> consecutive ticks. Because the gate is `is_enabled() **and** `is_configured()`, one unset
-> credential had the same effect as an operator switching the feature off.
->
-> The rule is: **the dial stops us talking to a partner. It is not permission to stop forgetting
-> people.** That is safe because none of steps 1–3 calls a partner (they are three UPDATEs in
-> `db/reap_agentic_ledger.py`) and none can touch a row whose payment is in flight —
-> `expire_overdue_purchases` names only the two waiting states and `fail_exhausted_purchases`
-> runs `include_processing=False`, both parsed out of the SQL that enforces them.
+With the rail off, the poller still claims checkout-backed `awaiting_approval` and `processing`
+rows and makes **GET-only checkout reads**. Candidate selection and claim UPDATE both enforce
+this scope. It does not resolve, enroll, quote or create another checkout. Keep the worker,
+correct-host credentials and reconciliation schedule running when rolling back new purchases.
+`skipped_disabled=1` means new-purchase work is disabled, not that checkout reads stopped.
+A missing credential or a non-sandbox host outside production blocks provider reads; cleanup
+still runs. The authenticated owner-scoped purchase-by-ID GET remains available from stored
+data with the create flag off, even during credential outages; it makes no provider call.
+
+**Payment uncertainty and contact retention are separate.** Clock/attempt sweeps never terminally
+expire/fail a checkout-backed buyer-facing row. The bounded PII scrub clears shipping address,
+buyer email and offer code after `REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` in that state, retaining
+checkout/quote/order IDs, amounts/currency, consent and attribution evidence. Neither this scrub
+nor a provider outage clears a live claim or marks the row terminal. Provider `FAILED`/`EXPIRED`
+responses still terminate unapproved checkouts with ordinary terminal cleanup. Unknown/error
+responses remain due for retries and visible to stuck-purchase monitoring.
+
+**Historical recovery is a separate release gate.** This change prevents future clock-sweep
+losses; it intentionally does not automatically reopen terminal rows created by old versions.
+Before live rollout, use a read-only census of expired checkout-backed rows, reconcile each
+candidate with authenticated Reap GET and record purchase/checkout IDs, provider status and
+observation time in an operator audit. `last_error_code` alone cannot identify the old sweep
+because its COALESCE preserved earlier errors. Do not revive authoritative FAILED/EXPIRED
+outcomes. For a provider PROCESSING/COMPLETED contradicting our terminal row, a separately
+reviewed, dry-run-first repair must preserve identity/amount/consent evidence, fence updates,
+clear only the erroneous terminal marker, and close conversion under the existing unique
+merchant/order and click-claim constraints. No bulk reopening or provider writes are authorized
+by this code. Never claim “unpaid” solely because a local hosted deadline passed.
+
+No schema migration or new state is required. Deployment must replace all old poller replicas
+before relying on this invariant: an old replica still has the unsafe terminal sweep. Rolling
+back to the old code reintroduces the loss risk and is unsafe while exposed checkouts remain.
 
 ### The poller's dials
 
@@ -396,9 +413,9 @@ tick, forever, on a pod that keeps dying.
 **Step 3 never touches `processing`.** A purchase in `processing` has been approved by the buyer
 and its payment is in flight with Reap; auto-failing it on a counter writes `failed` over a
 charge whose outcome we do not know. **A payment stuck in `processing` is a human decision** —
-reconcile the checkout with Reap by hand, then either transition the row or call
-`fail_exhausted_purchases(..., include_processing=True)` yourself. There is deliberately no env
-var for it: a dial would let somebody arm it once and forget.
+reconcile the checkout with Reap using the authoritative read step or an audited repair.
+Checkout-backed states are excluded even with `include_processing=True`; counters cannot
+substitute for provider evidence.
 
 **After the loop this worker holds no claims**, and that is *checked with a query*, not asserted.
 Anything left over is released and counted under `errors`.
@@ -843,10 +860,8 @@ To resolve one:
 1. `SELECT id, reap_checkout_id, attempts, state_entered_at FROM reap_agentic_purchases
    WHERE state = 'processing' AND attempts >= <max_attempts>;`
 2. Ask Reap what that checkout did. This rail has **no webhooks**, so this is a manual lookup.
-3. Then, and only then, transition the row by hand — or, if you have confirmed the charge did not
-   happen, call `fail_exhausted_purchases(..., include_processing=True)` yourself. There is no
-   env var for that flag on purpose: a dial would let somebody arm it once and forget, which is
-   the same as not having decided.
+3. Apply the authoritative outcome through the fenced checkout read step or a reviewed repair.
+   Never use an attempt count to decide whether a checkout was paid.
 
 Both `run-now` and `pause`/`resume` are **allowlists** in `routes/admin_scheduler_jobs.py`
 (`_RUNNABLE_JOB_IDS`, `_MANAGEABLE_JOB_IDS`); `reap_agentic_purchase_poll` was added to both, and
@@ -895,10 +910,10 @@ Obligations, in order of how expensive they are to get wrong:
    and doubled again for each consecutive failure, up to `MAX_BACKOFF_SECONDS` (600). The counter
    is the ledger's `attempts`, which is exempt in the two human-wait states — so those stay at
    interval × 2 and are bounded by `expire_overdue_purchases` on a clock instead.
-5. **Run the two sweeps.** They are the only bounds on the waiting states:
-   * `expire_overdue_purchases(max_age_seconds=…)` — the PII deadline. `attempts` is exempt in
-     `needs_enrollment` and `awaiting_approval`, so without this a buyer who walks away keeps
-     their address and email on the row indefinitely.
+5. **Run cleanup separately from checkout outcome reconciliation.**
+   * `expire_overdue_purchases(max_age_seconds=…)` — abandoned pre-checkout expiry.
+   * `scrub_reconciling_purchase_pii(max_age_seconds=…)` — the independent contact deadline
+     for approval/processing rows with a checkout; retains state and evidence for recovery.
    * `fail_exhausted_purchases(max_attempts=…)` — bounds `resolving` / `quoting` / `processing`.
      `include_processing` defaults **False** on purpose: a purchase in `processing` has been
      approved and its payment is in flight, and auto-failing it writes a terminal state over a

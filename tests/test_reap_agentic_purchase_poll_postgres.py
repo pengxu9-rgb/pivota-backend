@@ -971,9 +971,8 @@ async def test_an_armed_run_reports_stuck_purchases_on_postgres(reap):
     assert (await _get(waiting))["state"] == "awaiting_approval"
 
 
-async def test_a_disarmed_run_does_not_count_on_postgres(monkeypatch, reap):
-    """The rail is dark in production: a disarmed tick must issue no statement it did not issue
-    before, and its report must say NOT COUNTED rather than zero."""
+async def test_a_disarmed_run_still_counts_reconciliation_on_postgres(monkeypatch, reap):
+    """Disarmed reconciliation must keep stuck-checkout monitoring active."""
     import db.reap_agentic_ledger as ledger
     import jobs.reap_agentic_purchase_poll as job
 
@@ -996,9 +995,9 @@ async def test_a_disarmed_run_does_not_count_on_postgres(monkeypatch, reap):
 
     report = await _run()
 
-    assert reads == [], "a disarmed run issued the stuck-count read"
+    assert len(reads) == 1, "disarmed reconciliation must retain monitoring"
     assert report.skipped_disabled == 1
-    assert report.stuck_over_age == job.NOT_COUNTED == -1
+    assert report.stuck_over_age == 0
 
 
 async def test_a_timed_out_count_leaves_no_statement_and_no_held_connection(monkeypatch, reap):
