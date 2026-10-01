@@ -2306,6 +2306,19 @@ async def _resolving_to_enrollment(
         # row of this buyer exists: the answer we hold has nowhere to go. Nobody was shown its
         # link. The next step reconciles the buyer's pending row, whichever it is.
         return await _release(row, worker_id, error_code="enrollment_pending_superseded")
+    if not recorded or recorded.get("buyer_ref") != row.get("buyer_ref"):
+        return await _release(row, worker_id, error_code="enrollment_row_unreadable")
+    raw_expiry = created.data.get("nextAction", {}).get("expiresAt")
+    if raw_expiry is not None and expires is None:
+        if await _still_ours(row, worker_id) is None:
+            return _lost(row)
+        await ledger.mark_enrollment_dead(str(recorded["id"]))
+        return await _release(row, worker_id, error_code="enrollment_deadline_invalid")
+    # Missing optional provider expiry uses the ORIGINAL enrollment attempt's clock.
+    # Replayed creates/reads must not restart that clock on a new purchase.
+    expires = _effective_expiry(expires, recorded.get("created_at"))
+    if expires is None:
+        return await _release(row, worker_id, error_code="enrollment_deadline_unavailable")
     if not _link_is_usable(expires):
         # A link that is ALREADY DEAD (or dies within `MIN_LINK_LIFETIME_SECONDS`) out of a
         # create. The create is idempotent on our attempt id, so this is a REPLAY of an attempt

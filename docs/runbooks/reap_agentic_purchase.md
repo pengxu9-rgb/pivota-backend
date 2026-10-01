@@ -1779,3 +1779,19 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp3_test 
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4b_test \
     .venv/bin/python -m pytest tests/test_agent_commerce_reap_routes_postgres.py
 ```
+
+
+### Enrollment links without provider expiry
+
+If Reap omits optional enrollment expiresAt, the purchase carries a stable estimate from the
+originating enrollment attempt created_at plus the existing HOSTED_SESSION_SECONDS policy
+(900 seconds). A reused attempt keeps that deadline; reads and reloads never restamp it.
+An explicit valid provider expiresAt wins. A malformed supplied expiry is refused, rather
+than silently treated as omitted. The originating created_at is available only on internal
+enrollment reads, not in public purchase responses.
+
+For legacy needs_enrollment purchases with NULL deadline, owner GET derives the same estimate
+from the original enrollment row, after checking enrollment ID, buyer_ref and exact stored
+link. No row is changed. Missing/unreadable/wrong-owner provenance or an expired estimate
+withholds the hosted action. Owner data passes public_purchase_view before response building;
+no identity, buyer contact or enrollment ID is added to the public contract.

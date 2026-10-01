@@ -2839,7 +2839,7 @@ _SELECT_ACTIVE_ENROLLMENT_SQL = """
 # #1588 shape this file avoids everywhere else. A test asserts the two projections are identical.
 _SELECT_ENROLLMENT_BY_ID_SQL = """
     SELECT id, buyer_ref, reap_enrollment_id, status, hosted_url, hosted_url_expires_at,
-           card_network, card_last4
+           card_network, card_last4, created_at
       FROM reap_agentic_enrollments
      WHERE id = :id
 """
@@ -2853,7 +2853,7 @@ _SELECT_ENROLLMENT_BY_ID_SQL = """
 # wildcarded on None would hand back an arbitrary one of them.
 _SELECT_ENROLLMENT_BY_REAP_ID_SQL = """
     SELECT id, buyer_ref, reap_enrollment_id, status, hosted_url, hosted_url_expires_at,
-           card_network, card_last4
+           card_network, card_last4, created_at
       FROM reap_agentic_enrollments
      WHERE reap_enrollment_id = :reap_enrollment_id
 """
