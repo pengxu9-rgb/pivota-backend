@@ -2622,9 +2622,9 @@ async def test_release_claim_has_no_attempts_delta_on_postgres():
 
 _ENROLLMENT_PROJECTION = {
     "id", "buyer_ref", "reap_enrollment_id", "status", "hosted_url", "hosted_url_expires_at",
-    "card_network", "card_last4",
+    "card_network", "card_last4", "created_at",
 }
-_ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "created_at", "updated_at"}
+_ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "updated_at"}
 
 
 async def test_get_enrollment_internal_reads_a_pending_row_on_postgres():

@@ -2439,8 +2439,34 @@ def _public_body(view: Mapping[str, Any]) -> Dict[str, Any]:
 async def _owner_view(
     *, purchase_id: str, agent_id: str, agent_user_ref_hash: str
 ) -> Optional[Dict[str, Any]]:
-    view = await ledger.get_purchase_for_owner(purchase_id, agent_id, agent_user_ref_hash)
-    return _public_body(view) if view else None
+    # Private columns are needed only to scope the legacy enrollment deadline lookup;
+    # public_purchase_view must redact them before any response is built.
+    row = await ledger.get_purchase_for_owner(
+        purchase_id, agent_id, agent_user_ref_hash, include_private=True
+    )
+    if not row:
+        return None
+    if row.get("state") == "needs_enrollment" and row.get("hosted_url_expires_at") is None:
+        enrollment = None
+        enrollment_id = str(row.get("enrollment_id") or "").strip()
+        if enrollment_id:
+            try:
+                enrollment = await ledger.get_enrollment_internal(enrollment_id)
+            except Exception:  # Lookup unavailable: never emit a link with an invented deadline.
+                enrollment = None
+        if (enrollment and str(enrollment.get("id")) == enrollment_id
+                and enrollment.get("buyer_ref") == row.get("buyer_ref")
+                and enrollment.get("hosted_url") == row.get("hosted_url")):
+            deadline = svc._effective_expiry(
+                enrollment.get("hosted_url_expires_at"), enrollment.get("created_at")
+            )
+        else:
+            deadline = None
+        if deadline is None:
+            row.pop("hosted_url", None)
+        else:
+            row["hosted_url_expires_at"] = deadline
+    return _public_body(ledger.public_purchase_view(row))
 
 
 def _not_found() -> JSONResponse:
