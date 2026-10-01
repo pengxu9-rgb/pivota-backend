@@ -969,6 +969,9 @@ gcloud() {{ echo "TRIPWIRE: gcloud was called" >&2; exit 97; }}
 sleep() {{ echo "sleep $1" >> {shlex.quote(str(tmp_path / 'sleeps'))}; }}
 api() {{ {shlex.quote(sys.executable)} {shlex.quote(str(stub))} {shlex.quote(str(state))} "$1" "$2"; }}
 TOKEN=not-a-token
+ENV=prod
+{_shell_function(source, "environment_policy_name")}
+{_shell_function(source, "environment_policy_body")}
 {_shell_function(source, "check")}
 {_shell_function(source, "require_policy_name")}
 {_shell_function(source, "upsert")}
