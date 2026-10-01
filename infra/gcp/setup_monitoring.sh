@@ -237,6 +237,51 @@ upsert_log_metric retailer_ingest_drain_failed \
   "Retailer ingest drain stages that left a job FAILED - the ledger gave up on that store" \
   "$RID_FAILED_FILTER"
 
+# The Reap agentic purchase rail (jobs/reap_agentic_purchase_poll.py) is a scheduler job on the
+# `worker` SERVICE, not a Cloud Run job: it has no task to fail, so "prod: Cloud Run job failing"
+# cannot see it, and Cloud Monitoring cannot read the ledger. Everything below keys on the lines
+# that job writes. Read on staging 2026-10-01, where the rail is armed - these are whole
+# textPayloads, and NEITHER carries a severity:
+#   stdout  [2026-10-01 09:39:48,028] INFO - reap_agentic_poll: PollReport(requeued=0, ..., errors=0, skipped_disabled=0, duration_ms=19)
+#   stderr  reap_agentic: purchase=rp_... state=needs_enrollment held at enrollment_pending, retry in 30s
+# The first is the per-run report, through utils.logger's own stdout handler. The second is what
+# every MODULE logger's WARNING/ERROR looks like on this service: nothing configures the root
+# logger, so the line leaves through Python's last-resort handler as the bare message on stderr -
+# no level name in the text and no severity on the entry. A filter with `severity>=ERROR` would
+# be an enabled metric that can never count; these match text only.
+#
+#   REPORT   every report line. A report is printed ONLY by an armed run (REAP_AGENTIC_ENABLED on,
+#            client configured): a disarmed tick returns before it and prints nothing at all. So
+#            this is the rail's heartbeat, and it has no series in an environment that has never
+#            been armed. It is the input of the "went silent" policy below, not an alert itself.
+#   STUCK    a report whose `stuck_over_age` is >= 1. A STANDING condition: every armed tick
+#            repeats it until the purchase moves. `[1-9]` cannot match `stuck_over_age=0`, nor the
+#            `stuck_over_age=-1` the job prints when the count could not be taken - that tick is
+#            FAILING's (errors=1), not a claim that nothing is stuck.
+#   FAILING  (a) a report with `errors` >= 1; (b) ANY other `reap_agentic_poll: ` line - with the
+#            root logger at WARNING the only ones that survive are the job's WARNING and ERROR
+#            lines (a raised step, a claim that outlived the loop, 'processing' past the attempt
+#            ceiling, a bad dial, a budget spent before the claim); (c) the scheduler runner
+#            saying this job's run blew its deadline or would not unwind. The runner quotes the
+#            job id with repr(), hence the `.` either side of it. `wrapper cancelled` is excluded:
+#            that is the runner abandoning an in-flight run because the service is shutting down,
+#            i.e. every deploy that lands mid-step. APScheduler's own `Job "..." raised an
+#            exception` is deliberately NOT matched for the same reason - it follows that line on
+#            every such deploy; a run that raises on every tick prints no report, and that is the
+#            "went silent" policy's.
+REAP_POLL_REPORT_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND textPayload:"reap_agentic_poll: PollReport("'
+REAP_POLL_STUCK_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND textPayload:"reap_agentic_poll: PollReport(" AND textPayload=~"stuck_over_age=[1-9]"'
+REAP_POLL_FAILING_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND ((textPayload:"reap_agentic_poll: " AND (textPayload=~"errors=[1-9]" OR NOT textPayload:"PollReport(")) OR (textPayload=~"scheduler job .reap_agentic_purchase_poll." AND NOT textPayload:"wrapper cancelled"))'
+upsert_log_metric reap_agentic_poll_report \
+  "Reap agentic purchase poller report lines - one per ARMED run; a disarmed poller prints none" \
+  "$REAP_POLL_REPORT_FILTER"
+upsert_log_metric reap_agentic_poll_stuck \
+  "Reap agentic purchase poller reports that counted a purchase stuck more than 30 minutes past its deadline" \
+  "$REAP_POLL_STUCK_FILTER"
+upsert_log_metric reap_agentic_poll_failing \
+  "Reap agentic purchase poller failures - a report with errors, any warning or error line of the job, or its run deadline exceeded" \
+  "$REAP_POLL_FAILING_FILTER"
+
 echo "== alert policies"
 upsert() { # DISPLAY_NAME BODY   -> replace by displayName so thresholds live in git
   OLD="$(api GET alertPolicies | python3 -c '
@@ -365,6 +410,50 @@ upsert "prod: retailer ingest job failed" "$(policy \
   "A retailer-ingest-drain stage left a job FAILED: crawl capped or failed, currency unproven, retry budget spent, apply refused (MAY BE PARTIAL), or the apply gate / read-back disagreed. The execution itself exited 0, so the Cloud Run job-failing policy does not fire for this. Read \`SELECT id, domain, brand, status_reason FROM retailer_ingest_jobs WHERE status = 'failed' ORDER BY updated_at DESC\` and the job's latest retailer_ingest_runs row." \
   'metric.type="logging.googleapis.com/user/retailer_ingest_drain_failed" AND resource.type="cloud_run_job"' \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 0s 3600s)"
+
+# The Reap agentic purchase rail. Three policies over the three log metrics above; the runbook
+# for all of them is docs/runbooks/reap_agentic_purchase.md, "Alerts".
+#
+# STUCK aligns over 900s. The armed poller reports every 30s, but one run may legitimately take
+# most of its 600s run deadline, and the window must outlast the longest gap between two reports
+# or a standing condition becomes a fresh incident per slow tick. DURATION 0s for the reason the
+# drain policies give: a log counter writes no points between matching lines.
+upsert "prod: Reap purchase stuck over 30 minutes" "$(policy \
+  "prod: Reap purchase stuck over 30 minutes" \
+  "The Reap purchase poller reported stuck_over_age >= 1: at least one purchase is more than 30 minutes past the last moment the rail's own rules allow it to stay in its state. In quoting, processing and resolving that is 30 minutes in the state - and processing means the buyer APPROVED and the payment has no outcome yet. A buyer still on a live hosted page is NOT counted: needs_enrollment and awaiting_approval count only when the expire sweep should have taken the row 30 minutes ago. Find them: \`SELECT id, state, state_entered_at, last_error_code, attempts, claimed_by, hosted_url_expires_at FROM reap_agentic_purchases WHERE state IN ('resolving','needs_enrollment','quoting','awaiting_approval','processing') ORDER BY state_entered_at\`. Do NOT fail a processing row before reconciling its checkout with Reap. This stays open while any purchase is stuck. Runbook: docs/runbooks/reap_agentic_purchase.md, Alerts." \
+  'metric.type="logging.googleapis.com/user/reap_agentic_poll_stuck" AND resource.type="cloud_run_revision"' \
+  ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 900s 0s 3600s)"
+
+upsert "prod: Reap purchase poller failing" "$(policy \
+  "prod: Reap purchase poller failing" \
+  "The Reap purchase poller on the worker service logged a failure: a report line with errors >= 1, a warning or error line of its own (advance RAISED, a claim STILL CLAIMED after the loop, purchases in processing at or past max_attempts, a count that could not be taken, a dial outside its bounds, the run budget spent before the claim), or the scheduler cancelled its run at the 600s deadline. Read the lines: worker service logs, textPayload containing reap_agentic_poll. The messages carry purchase ids and exception TYPES only. Runbook: docs/runbooks/reap_agentic_purchase.md, Alerts and When errors > 0." \
+  'metric.type="logging.googleapis.com/user/reap_agentic_poll_failing" AND resource.type="cloud_run_revision"' \
+  ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 300s 0s 3600s)"
+
+# SILENT is "the heartbeat WAS there and has STOPPED", not "there is no heartbeat". The left side
+# needs a report line in the 6 hours before the last 10 minutes; `unless` then drops it while the
+# last 10 minutes still have one. An environment that has never been armed has no series, the left
+# side is an empty vector, and the policy cannot fire. Arming the rail arms the alert; nothing has
+# to be switched on with it. Checked 2026-10-01 through the PromQL query API (read-only): this
+# exact query answers an empty vector in pivota-prod, where REAP_AGENTIC_ENABLED is unset; and the
+# same shape over an existing log metric there (retailer_ingest_drain_failed) answers a value when
+# the earlier window has lines and the later one has none, and nothing when both have them.
+#
+# sum_over_time, NOT increase or rate: in PromQL a log counter is a per-minute DELTA sample (the
+# count for that minute, zero-filled only next to a match), not a cumulative counter, so increase()
+# reads every drop as a reset - it answered 12 for a week whose samples add up to 11.
+#
+# 10m of silence plus the 300s duration is ~15 minutes: one run can take its whole 600s deadline
+# between two reports, and the duration absorbs that and the metric's ingestion lag. A DELIBERATE
+# disarm of an armed rail looks identical from here (the job prints nothing either way) and opens
+# this once; it stops being true 6 hours after the last report, which is also when an incident
+# nobody fixed closes itself - the email is the page, not the incident's state.
+upsert "prod: Reap purchase poller went silent" "$(promql_policy \
+  "prod: Reap purchase poller went silent" \
+  "report line present in the last 6h, absent for 10m" \
+  "The Reap purchase poller was printing its per-run report and has printed none for about 15 minutes. Nothing is advancing purchases: a buyer who approves now waits. Either the worker service is down or its scheduler is wedged (check /__scheduler_health for reap_agentic_purchase_poll), every run is raising before it reports (worker logs: Job run_reap_agentic_purchase_poll raised an exception), the Reap client lost its configuration so step 4 is skipped without a line, or someone turned REAP_AGENTIC_ENABLED off. If the rail was disarmed on purpose this is expected: close the incident. It cannot fire in an environment that printed no report in the previous 6 hours. Runbook: docs/runbooks/reap_agentic_purchase.md, Alerts." \
+  '(sum(sum_over_time(logging_googleapis_com:user_reap_agentic_poll_report{monitored_resource="cloud_run_revision"}[6h] offset 10m)) > 0) unless (sum(sum_over_time(logging_googleapis_com:user_reap_agentic_poll_report{monitored_resource="cloud_run_revision"}[10m])) > 0)' \
+  300s 60s 3600s)"
 
 echo
 echo "channel : $ALERT_EMAIL"

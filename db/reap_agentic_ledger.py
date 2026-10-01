@@ -176,6 +176,7 @@ __all__ = [
     "requeue_stale_claims",
     "expire_overdue_purchases",
     "fail_exhausted_purchases",
+    "count_stuck_purchases",
     "upsert_pending_enrollment",
     "PendingEnrollmentExpired",
     "EnrollmentIdConflict",
@@ -2419,6 +2420,135 @@ async def fail_exhausted_purchases(
     else:
         rows = await database.fetch_all(_FAIL_EXHAUSTED_SQL_SQLITE, params)
     return [str(r["id"]) for r in rows]
+
+
+# ── the stuck count — READ ONLY ──────────────────────────────────────────────────────────────
+#
+# HOW MANY PURCHASES ARE MORE THAN `stuck_after` PAST THE LAST MOMENT THIS RAIL'S OWN RULES LET
+# THEM STAY WHERE THEY ARE. The poller puts the number on its report line and Cloud Monitoring
+# alerts on it (infra/gcp/setup_monitoring.sh); nothing in the state machine reads it.
+#
+# "In a non-terminal state for a long time" is NOT the definition, because two states wait on a
+# PERSON and are allowed to. The deadline each row is measured from:
+#
+#   quoting, processing   `state_entered_at`. These are OUR work (and Reap's): nothing in them
+#                         waits on anybody, and 'processing' is the row whose buyer has ALREADY
+#                         APPROVED — the one case with no sweep behind it at all.
+#   resolving             `state_entered_at` as well, EXCEPT while the row is holding at
+#                         `enrollment_settling` — the wait on Reap flipping a just-finished
+#                         enrollment ACTIVE, which the claim statement above exempts from
+#                         `attempts` with this same predicate. That hold is bounded by the
+#                         enrollment grace, so it gets the grace added.
+#   needs_enrollment      the expire sweep's own two clocks: `hosted_url_expires_at` + the grace,
+#   awaiting_approval     or `hosted_url_expires_at` exactly, and for both the absolute
+#                         `state_entered_at + max_age` fallback. A buyer with a LIVE hosted page
+#                         is waiting legitimately and is never counted; a row the sweep should
+#                         have expired `stuck_after` ago, and which is still here, is.
+#
+# THE MARGIN IS ON THE DEADLINE, NOT ON THE AGE, for the two waiting states. The poller reads this
+# AFTER its claim loop, which can run for minutes after the expire sweep did; "overdue at all"
+# would count a row whose page died in that gap, one tick before the sweep takes it.
+#
+# The top-level `state IN (…)` is what `idx_reap_agentic_purchases_state_poll (state, …)` serves:
+# the read touches the non-terminal rows — a handful — and never the terminal history.
+_COUNT_STUCK_PURCHASES_SQL = """
+    SELECT COUNT(*) AS stuck FROM reap_agentic_purchases
+     WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
+       AND (
+            (state IN ('resolving', 'quoting', 'processing')
+             AND state_entered_at < clock_timestamp() - (:stuck_seconds * INTERVAL '1 second')
+             AND (state_entered_at
+                      < clock_timestamp() - (:stuck_grace_seconds * INTERVAL '1 second')
+                  OR NOT (state = 'resolving'
+                          AND COALESCE(last_error_code, '') = 'enrollment_settling')))
+            OR (state = 'awaiting_approval'
+             AND hosted_url_expires_at IS NOT NULL
+             AND hosted_url_expires_at
+                 < clock_timestamp() - (:stuck_seconds * INTERVAL '1 second'))
+            OR (state = 'needs_enrollment'
+             AND hosted_url_expires_at IS NOT NULL
+             AND hosted_url_expires_at
+                 < clock_timestamp() - (:stuck_grace_seconds * INTERVAL '1 second'))
+            OR (state IN ('needs_enrollment', 'awaiting_approval')
+             AND state_entered_at
+                 < clock_timestamp() - (:stuck_max_age_seconds * INTERVAL '1 second'))
+       )
+"""
+
+_COUNT_STUCK_PURCHASES_SQL_SQLITE = """
+    SELECT COUNT(*) AS stuck FROM reap_agentic_purchases
+     WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
+       AND (
+            (state IN ('resolving', 'quoting', 'processing')
+             AND state_entered_at < datetime('now', :stuck_window)
+             AND (state_entered_at < datetime('now', :stuck_grace_window)
+                  OR NOT (state = 'resolving'
+                          AND COALESCE(last_error_code, '') = 'enrollment_settling')))
+            OR (state = 'awaiting_approval'
+             AND hosted_url_expires_at IS NOT NULL
+             AND hosted_url_expires_at < datetime('now', :stuck_window))
+            OR (state = 'needs_enrollment'
+             AND hosted_url_expires_at IS NOT NULL
+             AND hosted_url_expires_at < datetime('now', :stuck_grace_window))
+            OR (state IN ('needs_enrollment', 'awaiting_approval')
+             AND state_entered_at < datetime('now', :stuck_max_age_window))
+       )
+"""
+
+# Parsed out of the statement, like every other state list here. Tests hold the three against the
+# claim's and the expire sweep's own lists, so a state added to the machine cannot be left out of
+# the count, and a state the sweep starts bounding cannot stay on the wrong side of it.
+_STUCK_COUNTED_STATES = _states_in(_COUNT_STUCK_PURCHASES_SQL, "WHERE state IN (")
+_STUCK_WORK_STATES = _states_in(_COUNT_STUCK_PURCHASES_SQL, "(state IN (")
+_STUCK_HUMAN_WAIT_STATES = _states_in(_COUNT_STUCK_PURCHASES_SQL, "OR (state IN (")
+
+
+async def count_stuck_purchases(
+    *,
+    stuck_after_seconds: int,
+    max_age_seconds: int = 3600,
+    enrollment_grace_seconds: int = ENROLLMENT_GRACE_SECONDS_DEFAULT,
+) -> int:
+    """How many non-terminal purchases are more than `stuck_after_seconds` past their deadline.
+
+    READ ONLY: one COUNT, no row returned, nothing written. See the note above the statement for
+    what "deadline" means in each state — it is not the row's age in the two states that wait on
+    a buyer.
+
+    `max_age_seconds` and `enrollment_grace_seconds` MUST BE THE VALUES THE EXPIRE SWEEP WAS
+    GIVEN. They are what makes a waiting row's deadline the sweep's own; a caller passing
+    different numbers is counting against a rule nothing enforces.
+
+    A COUNT, NEVER IDS. The poller's report carries counts only, and a caller that had the ids
+    would be one refactor away from logging them.
+    """
+    stuck_after = _require_int(stuck_after_seconds, "stuck_after_seconds", minimum=60)
+    max_age = _require_int(max_age_seconds, "max_age_seconds", minimum=60)
+    grace = _require_int(
+        enrollment_grace_seconds,
+        "enrollment_grace_seconds",
+        minimum=0,
+        maximum=ENROLLMENT_GRACE_SECONDS_MAX,
+    )
+    if IS_POSTGRES:
+        row = await database.fetch_one(
+            _COUNT_STUCK_PURCHASES_SQL,
+            {
+                "stuck_seconds": stuck_after,
+                "stuck_grace_seconds": stuck_after + grace,
+                "stuck_max_age_seconds": stuck_after + max_age,
+            },
+        )
+    else:
+        row = await database.fetch_one(
+            _COUNT_STUCK_PURCHASES_SQL_SQLITE,
+            {
+                "stuck_window": f"-{stuck_after} seconds",
+                "stuck_grace_window": f"-{stuck_after + grace} seconds",
+                "stuck_max_age_window": f"-{stuck_after + max_age} seconds",
+            },
+        )
+    return int(row["stuck"]) if row is not None else 0
 
 
 # ── enrollments ──────────────────────────────────────────────────────────────────────────────

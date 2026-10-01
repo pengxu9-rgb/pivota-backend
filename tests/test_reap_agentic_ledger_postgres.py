@@ -3855,3 +3855,142 @@ async def test_a_settling_claim_is_not_an_attempt_on_postgres():
         )
     claimed = {r["id"]: r["attempts"] for r in await ledger.claim_due_purchases("w1")}
     assert (claimed[held["id"]], claimed[other["id"]]) == (0, 1)
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+# The stuck count — `count_stuck_purchases`, on REAL Postgres
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+#
+# The row-level table lives in the SQLite arm. What only this arm can say: the statement BINDS
+# (three integer parameters, each multiplied into an interval, two of them used twice), its
+# cutoffs compare against real `timestamptz` columns on the server's clock, the planner can
+# serve it from `idx_reap_agentic_purchases_state_poll`, and it is the same answer SQLite gives.
+
+_STUCK = dict(stuck_after_seconds=1800, max_age_seconds=3600, enrollment_grace_seconds=180)
+
+
+def _ago(seconds: int) -> str:
+    return f"clock_timestamp() - INTERVAL '{int(seconds)} seconds'"
+
+
+async def _stuck_row(state, *, entered=None, hosted=None, code=None, buyer_ref="bref_alice"):
+    from db.database import database
+
+    purchase = await _mk(state=state, buyer_ref=buyer_ref)
+    if entered is not None:
+        await _set_clock_column(purchase["id"], "state_entered_at", _ago(entered))
+    if hosted is not None:
+        await _set_clock_column(purchase["id"], "hosted_url_expires_at", _ago(hosted))
+    if code is not None:
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET last_error_code = :c WHERE id = :i",
+            {"c": code, "i": purchase["id"]},
+        )
+    return purchase
+
+
+@pytest.mark.parametrize(
+    "state,entered,hosted,code,expected",
+    [
+        ("processing", 1801, None, None, 1),
+        ("processing", 1700, None, None, 0),
+        ("quoting", 1801, None, None, 1),
+        ("resolving", 1801, None, None, 1),  # a NULL last_error_code must not hide the row
+        ("resolving", 1900, None, "enrollment_settling", 0),
+        ("resolving", 1981, None, "enrollment_settling", 1),
+        ("processing", 1801, None, "enrollment_settling", 1),  # the marker only exempts 'resolving'
+        ("awaiting_approval", 3000, -600, None, 0),  # a buyer on a LIVE page, 50 minutes in
+        ("awaiting_approval", 3000, 600, None, 0),   # overdue: the sweep's row, not a stuck one
+        ("awaiting_approval", 3000, 1801, None, 1),
+        ("needs_enrollment", 3000, 1900, None, 0),   # inside the grace on top of the margin
+        ("needs_enrollment", 3000, 1981, None, 1),
+        ("awaiting_approval", 5000, None, None, 0),
+        ("awaiting_approval", 5401, None, None, 1),
+        ("needs_enrollment", 5401, -3600, None, 1),  # the absolute fallback beats a live page
+        ("completed", 999999, 999999, None, 0),
+        ("expired", 999999, 999999, None, 0),
+    ],
+)
+async def test_the_stuck_count_on_postgres(state, entered, hosted, code, expected):
+    import db.reap_agentic_ledger as ledger
+
+    await _stuck_row(state, entered=entered, hosted=hosted, code=code)
+    assert await ledger.count_stuck_purchases(**_STUCK) == expected
+
+
+async def test_each_stuck_window_is_bound_not_baked_in_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    await _stuck_row("processing", entered=700, buyer_ref="bref_w")
+    await _stuck_row("needs_enrollment", entered=2000, hosted=1900, buyer_ref="bref_g")
+    await _stuck_row("awaiting_approval", entered=5000, buyer_ref="bref_m")
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+    assert await ledger.count_stuck_purchases(**dict(_STUCK, stuck_after_seconds=600)) == 3
+    assert await ledger.count_stuck_purchases(**dict(_STUCK, enrollment_grace_seconds=60)) == 1
+    assert await ledger.count_stuck_purchases(**dict(_STUCK, max_age_seconds=600)) == 1
+
+
+async def test_a_waiting_row_is_only_stuck_if_the_expire_sweep_would_take_it_on_postgres():
+    """The definition as a property, against the REAL sweep statement: with the same max age and
+    grace, once the sweep has run nothing in the two waiting states is left to count."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    n = 0
+    for state in ("needs_enrollment", "awaiting_approval"):
+        for entered in (0, 3000, 5000, 5500):
+            for hosted in (None, -3600, 100, 1900, 2100):
+                n += 1
+                await _stuck_row(state, entered=entered, hosted=hosted, buyer_ref=f"bref_{n}")
+    assert await ledger.count_stuck_purchases(**_STUCK) > 0
+    while await ledger.expire_overdue_purchases(
+        max_age_seconds=3600, enrollment_grace_seconds=180, limit=500
+    ):
+        pass
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+    left = await database.fetch_all(
+        "SELECT id FROM reap_agentic_purchases "
+        "WHERE state IN ('needs_enrollment', 'awaiting_approval')"
+    )
+    assert left, "the grid has no legitimately waiting buyer in it"
+
+
+async def test_the_stuck_count_writes_nothing_on_postgres():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    await _stuck_row("processing", entered=4000)
+    before = [dict(r) for r in await database.fetch_all(
+        "SELECT *, xmin::text AS row_version FROM reap_agentic_purchases ORDER BY id"
+    )]
+    assert await ledger.count_stuck_purchases(**_STUCK) == 1
+    after = [dict(r) for r in await database.fetch_all(
+        "SELECT *, xmin::text AS row_version FROM reap_agentic_purchases ORDER BY id"
+    )]
+    assert after == before, "a row version moved: the count wrote something"
+
+
+async def test_the_stuck_count_can_be_served_by_the_state_poll_index():
+    """`state IN (…)` at the top level is an index condition on
+    `idx_reap_agentic_purchases_state_poll (state, next_poll_at)`: the count reads the
+    non-terminal rows and never the terminal history, which is everything else in the table.
+
+    Sequential scans are switched off for the EXPLAIN only, so this asks "CAN the planner use
+    the index for this statement" rather than "does it choose to on five rows" — on a table this
+    small it would not, and that says nothing about the shape production has."""
+    import db.reap_agentic_ledger as ledger
+
+    for n in range(5):
+        await _mk(buyer_ref=f"bref_{n}")
+    positional, order = _to_positional(ledger._COUNT_STUCK_PURCHASES_SQL)
+    params = {"stuck_seconds": 1800, "stuck_grace_seconds": 1980, "stuck_max_age_seconds": 5400}
+    conn = await _raw_connection()
+    try:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL enable_seqscan = off")
+            plan = await conn.fetch("EXPLAIN " + positional, *[params[name] for name in order])
+    finally:
+        await conn.close()
+    text = "\n".join(row[0] for row in plan)
+    assert "idx_reap_agentic_purchases_state_poll" in text, text
+    assert re.search(r"Index Cond: .*state.*= ANY", text), text

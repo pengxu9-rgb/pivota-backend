@@ -387,6 +387,7 @@ run deadline **600 s** in `_JOB_RUN_DEADLINES` (see the derivation above).
 | 2 | `expire_overdue_purchases(max_age_seconds=REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS, enrollment_grace_seconds=REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS)` | 200 per statement, looped until a partial batch, hard cap 20 iterations |
 | 3 | `fail_exhausted_purchases(REAP_AGENTIC_MAX_ATTEMPTS, include_processing=False)` | same |
 | 4 | `claim_due_purchases(worker, limit=REAP_AGENTIC_CLAIM_BATCH)` → per row `advance` → `release_claim` | **sequential**, one partner chain at a time, stopped by `REAP_AGENTIC_POLL_BUDGET_SECONDS` |
+| 5 | `count_stuck_purchases(stuck_after_seconds=1800, …)` → `stuck_over_age`, then the report line | **read-only**, one `COUNT` over the non-terminal rows; **armed runs only** — a disarmed tick stops before step 4 and issues neither the read nor the line |
 
 **The sweeps run before the claim** because a row held by a dead pod is not claimable until the
 requeue frees it — a claim-first run would skip exactly the rows that most need attention, every
@@ -414,6 +415,7 @@ ERROR lines an operator must act on.
 | `expired` | purchases the buyer abandoned; PII NULLed | normal; a spike means hosted pages are expiring before buyers use them |
 | `failed_exhausted` | rows that hit the attempt ceiling | look at `last_error_code` on those rows — the rail is failing the same way repeatedly |
 | `processing_over_attempts` | **read-only.** Purchases in `processing` at or past `max_attempts` — the exact set the fail sweep refuses to terminate because a payment is in flight | **any non-zero value that does not fall needs a human.** Reconcile the checkout with Reap; the counter will never resolve these. See below |
+| `stuck_over_age` | **read-only, armed runs only.** Purchases more than 30 minutes past the last moment the rail's own rules let them stay in their state — see [Alerts](#alerts) for the definition. `-1` = **not counted** (the read failed; `errors` says so), never "zero" | **any value ≥ 1 pages** (`prod: Reap purchase stuck over 30 minutes`) |
 | `claimed` | leases taken this run | `== REAP_AGENTIC_CLAIM_BATCH` every tick means the backlog is growing; raise the batch or the interval |
 | `advanced` | rows that changed state | — |
 | `released` | rows that made no progress because **the partner was not ready** | — |
@@ -446,6 +448,112 @@ ERROR lines an operator must act on.
 
 Everything else is a count, not an error. In particular `lost_claim` is the designed answer to
 the unfenced bulk sweeps and must never be alerted on.
+
+---
+
+## Alerts
+
+Three policies, provisioned by `infra/gcp/setup_monitoring.sh prod|staging` (idempotent; **apply
+it before arming** — it is not run by any deploy). Cloud Monitoring cannot read the ledger, so all
+three are log-based metrics over lines the poller writes on the **`worker`** service. Those lines
+carry **no severity** on Cloud Run (the report is plain text on stdout; a module logger's
+WARNING/ERROR leaves through Python's last-resort handler as the bare message on stderr), so the
+filters match text, never `severity>=ERROR`.
+
+| policy | metric | fires when |
+|---|---|---|
+| `prod: Reap purchase stuck over 30 minutes` | `reap_agentic_poll_stuck` | a report line has `stuck_over_age` ≥ 1 |
+| `prod: Reap purchase poller failing` | `reap_agentic_poll_failing` | a report line has `errors` ≥ 1, **or** the job wrote any other `reap_agentic_poll: ` line (they are all WARNING/ERROR), **or** the scheduler cancelled its run at the 600 s deadline |
+| `prod: Reap purchase poller went silent` | `reap_agentic_poll_report` | there was a report line in the last 6 h and there has been none for ~15 minutes |
+
+**None of them can fire on a rail that has never been armed.** A disarmed tick returns before the
+report line and writes nothing, so the first metric has nothing to count and the third has no
+series to go missing: its query is "reports earlier `unless` reports now", which is empty when
+there were never any. (The second can still fire while dark if a sweep-side line appears — a bad
+dial, `processing` rows past the attempt ceiling — and those are real.)
+
+### `prod: Reap purchase stuck over 30 minutes`
+
+**What "stuck" means.** A purchase is counted when it is more than 30 minutes past the last
+moment this rail's own rules allow it to still be in its state:
+
+| state | counted when | why |
+|---|---|---|
+| `quoting`, `processing` | 30 min since `state_entered_at` | our work and Reap's; nothing here waits on a person. **`processing` is the buyer who approved and got nothing** — and the one state no sweep bounds |
+| `resolving` | 30 min since `state_entered_at` (+ the enrollment grace while `last_error_code = enrollment_settling`) | the settling hold is a bounded wait on Reap, see [The hold](#the-hold--enrollment_settling-its-cost-and-its-ceiling) |
+| `awaiting_approval` | 30 min past `hosted_url_expires_at`, or past `state_entered_at + REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` | **a buyer on a live hosted page is waiting legitimately and is never counted.** These are exactly the expire sweep's clocks: a row counted here is one the sweep should have expired half an hour ago and did not |
+| `needs_enrollment` | the same, with `REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS` added to the hosted expiry | as above |
+
+The count is taken at the end of an **armed** run (step 5), so it is only as fresh as the last
+report line. It stays open while any purchase is stuck and closes about an hour after the last
+report that counted one.
+
+**What to do.**
+
+```sql
+SELECT id, state, state_entered_at, last_error_code, attempts, claimed_by, claimed_at,
+       next_poll_at, hosted_url_expires_at, reap_checkout_id
+  FROM reap_agentic_purchases
+ WHERE state IN ('resolving','needs_enrollment','quoting','awaiting_approval','processing')
+ ORDER BY state_entered_at;
+```
+
+* `processing` — the payment is in flight. Follow
+  [When `processing_over_attempts` will not go down](#when-processing_over_attempts-will-not-go-down):
+  ask Reap what the checkout did **before** touching the row. Never fail it on a guess.
+* `resolving` / `quoting` — read `last_error_code`. `transport_error:*` is the partner being
+  unreachable (the row backs off up to 600 s and is failed by the attempt ceiling eventually);
+  `poller_advance_raised:*` is a step that raises — see [When `errors` > 0](#when-errors--0).
+  A `claimed_by` that never clears means a worker is dying mid-step.
+* `needs_enrollment` / `awaiting_approval` — the expire sweep is not taking rows it should. Check
+  `poller failing` and the worker's logs for the run raising before step 4; the buyer's PII is
+  being held past its deadline.
+
+### `prod: Reap purchase poller failing`
+
+Read the lines: worker service logs, `textPayload` containing `reap_agentic_poll`. They carry
+purchase ids and exception **types** only.
+
+* a report with `errors` ≥ 1, `advance RAISED`, `STILL CLAIMED after the loop`,
+  `returned an unhandled outcome` → [When `errors` > 0](#when-errors--0).
+* `purchase(s) are in 'processing' at or past max_attempts` → the section of that name below.
+  This one repeats every tick until a human resolves the row, so the incident stays open.
+* `could not count stuck purchases` → the stuck alert is blind for that tick
+  (`stuck_over_age=-1`); it is a database error, look at the pool and Cloud SQL.
+* `… is not an integer` / `is outside …` → a dial is mis-set and the default is in use. Fix the env
+  var; it is logged once per process.
+* `budget was spent by the sweeps` / `stopped after N rows` → the run is spending its budget
+  before the claim; look at `duration_ms` and the sweep counts.
+* `scheduler job 'reap_agentic_purchase_poll' exceeded its 600s run deadline` → a wedged run was
+  cancelled; `/__scheduler_health` has the run state. Its claims were released on the way out.
+* `REAP_AGENTIC_ENABLED is on outside production but REAP_API_BASE_URL is not exactly a Reap
+  sandbox host` → staging is armed against a non-sandbox host; step 4 is refusing to run.
+
+Not counted, on purpose: the runner's `ABANDONED as a zombie (wrapper cancelled …)` line and
+APScheduler's `Job "run_reap_agentic_purchase_poll …" raised an exception`. Both appear on every
+deploy that lands while a run is in flight. A run that raises on **every** tick prints no report
+and is the next alert's.
+
+### `prod: Reap purchase poller went silent`
+
+The poller was reporting and stopped: no purchase is being advanced, so a buyer who approves now
+waits. In order of likelihood:
+
+1. **The rail was disarmed on purpose** (`REAP_AGENTIC_ENABLED` off). From the logs this is
+   indistinguishable from a dead poller — a disarmed tick writes nothing — so the alert opens
+   **once**, ~15 minutes after the last report. Close it. Before disarming with purchases in
+   flight, run the query above: nothing will advance or count them while the rail is off.
+2. **The client lost its configuration** (`REAP_API_BASE_URL` / `REAP_API_KEY`):
+   `is_configured()` is false, step 4 is skipped exactly as if the dial were off, and nothing is
+   logged. Check the worker revision's env and secrets.
+3. **Every run is raising before it reports** — a sweep failing on the database, typically. Worker
+   logs: `Job "run_reap_agentic_purchase_poll …" raised an exception`, with the traceback.
+4. **The worker is down or its scheduler is wedged.** `GET /__scheduler_health` on the worker:
+   `runs.reap_agentic_purchase_poll` shows the last start, outcome and any zombie; `run-now`
+   forces a tick.
+
+The condition holds for 6 hours after the last report and then stops being true on its own; an
+incident that closed that way was not fixed.
 
 ---
 
@@ -553,7 +661,9 @@ the ERROR line.
 3. `REAP_API_BASE_URL` + `REAP_API_KEY` — both, or `is_configured()` is false and every run
    returns `skipped_disabled=1`.
 4. `REAP_AGENTIC_ENABLED=1`. **This is the arming step.** No redeploy and no scheduler restart:
-   the gate lives inside the job, so the next tick picks it up.
+   the gate lives inside the job, so the next tick picks it up. **Apply the alerts first**
+   (`ALERT_EMAIL=… infra/gcp/setup_monitoring.sh prod`, see [Alerts](#alerts)): they key on the
+   report line an armed run prints, so they are inert until this step and live from it.
 5. Run it once by hand and read the report:
    `POST /admin/scheduler/jobs/reap_agentic_purchase_poll/run-now` (admin auth). The response is
    the runner outcome; the counts are in the job's own log line and on
@@ -576,6 +686,10 @@ buyers. Turning the dial off stops only the partner-facing half.
 With the dial off, purchases already in flight **stall** — nothing advances them — but they are
 still expired on the clock and still have their PII nulled, and their claims are still recovered.
 That is the intended resting state for a disarmed rail.
+
+A disarmed poller also stops **reporting**, so `stuck_over_age` is no longer taken and
+`prod: Reap purchase poller went silent` opens once, ~15 minutes later ([Alerts](#alerts)). That
+is the alert working; close it. A `processing` row left behind is yours to watch by hand.
 
 **If you must pause:** set a reminder to resume. A paused poller is a rail that has stopped
 forgetting people, and nothing else in the system will do it for you.
@@ -1491,6 +1605,7 @@ without it as `serve`, then `purchase`, then `poll --dry-run`.
 | `tests/test_reap_agentic_purchase_postgres.py` | Postgres (dialect gate) | the fence across **two backend connections**, jsonb-as-text, the server-side clock, the partial unique index, PREPARE |
 | `tests/test_reap_agentic_purchase_poll.py` | SQLite | the poller: the gate (step 4 only), the run order, the counts, the dials and their bounds, the budget, the leftover-claims invariant, cancellation, registration |
 | `tests/test_reap_agentic_purchase_poll_postgres.py` | Postgres (dialect gate) | the poller across **two real backend connections**, its SQL constants under PREPARE, the error backoff against the server clock, `include_processing=False` on the real statement, the PII deadline with the rail off, claim release on cancellation |
+| `tests/test_reap_rail_alerts.py` | SQLite | the three alert metrics: the REAL poller's and runner's lines, on both streams as the worker writes them, through the filters parsed out of `infra/gcp/setup_monitoring.sh`; a dark rail feeding none of them; the three policies' shape |
 | `tests/test_agent_commerce_reap_routes.py` | SQLite | the three routes over the real app: the router is MOUNTED, the 404 on all three while dark **and for every shape of malformed input**, the ownership conjuncts, eligibility and the market, the price coming from our catalog and from THIS merchant's own offer, the market-currency rule, the buyer ref, idempotency including the request-hash conflict, unprintable identifiers, the hosted-URL vetting, the per-statement self-heal, and that no response or log line carries the buyer; **WP4b**: the first purchase minting exactly one buyer/link/ref, the second reusing them, a hosted-checkout link never being re-minted, two agents sharing a user ref getting two buyers, a link racing in at the write seam winning, and consent being required, ordered after the dial, and stored |
 | `tests/test_agent_commerce_reap_routes_postgres.py` | Postgres (dialect gate) | migrations 226+227 vs the self-heal through the **catalog** (columns, `indexdef`, `pg_get_constraintdef`), the `numeric`→`Decimal` price path the `CAST` exists for, the `market_country` regex CHECK, **a NUL byte in an identifier being a refusal and not a 500** (asyncpg raises where SQLite stores it happily, so only this arm can see it), and every security-relevant refusal re-run on the production dialect; **WP4b**: the mint against the REAL unique constraint (`ON CONFLICT DO NOTHING` as Postgres implements it), the `VARCHAR(32)` consent cap refusing rather than truncating, and `consented_at` being a real aware `timestamptz` |
 
