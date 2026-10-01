@@ -378,7 +378,11 @@ print(json.dumps({
 # A policy over a log metric THIS RUN may have created seconds ago. Monitoring rejects such a
 # policy until the metric's descriptor is visible to it - "Cannot find metric(s) that match type
 # ... If a metric was created recently, it could take up to 10 minutes to become available" - and
-# through upsert() that rejection would abort the whole run from check(). So, for these only:
+# through upsert() that rejection would abort the whole run from check(). That wording is the
+# API's as it has been reported, NOT captured by running this script: the match below is on two
+# fragments of it, and if the real text carries neither, the first run stops at check() with the
+# API's own message after every upsert() above has completed. Re-running ten minutes later is the
+# remedy either way. So, for these only:
 #
 #   * CREATE FIRST, DELETE AFTER. upsert() deletes the old policy and then posts the new one, so a
 #     rejected post leaves NO policy. Here the old one (every one carrying this displayName - a
@@ -414,7 +418,7 @@ if isinstance(d, dict) and "error" in d:
     print(d["error"].get("message", ""))
 ' <<<"$resp")"
     case "$err" in
-      *"Cannot find metric"*)
+      *"Cannot find metric"*|*"could take up to 10 minutes"*)
         if [ "$NEW_METRIC_TRIES" -le 0 ]; then
           NEW_METRIC_DEFERRED="${NEW_METRIC_DEFERRED}${NEW_METRIC_DEFERRED:+, }$1"
           echo "   DEFERRED $1 - its log metric is not visible to Monitoring yet" >&2
