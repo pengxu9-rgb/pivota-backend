@@ -351,8 +351,9 @@ def test_every_relabel_family_writes_the_ingest_familys_canonical_spelling():
         if family is not None:
             assert feed.RETAILER_BRAND_CANONICAL[family] == canonical, name
             assert all(feed._retailer_brand_family(feed._brand_key(s)) == family for s in spellings), name
-    # 2026-09-30: the identity-changing families wait for their relabel (services/brand_relabel.py ORDER).
-    for pending in ("O HUI (오휘)", "Jung Saem Mool"):
+    # The identity-changing families wait for their relabel (services/brand_relabel.py ORDER). jungsaemmool was
+    # relabelled and became a family; ohui still has 2 held rows (one GTIN on a 2-piece and a 3-piece set).
+    for pending in ("O HUI (오휘)",):
         assert feed._retailer_brand_family(feed._brand_key(pending)) is None
 
 

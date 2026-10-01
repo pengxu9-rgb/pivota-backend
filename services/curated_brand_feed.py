@@ -1639,6 +1639,11 @@ RETAILER_BRAND_SPELLINGS = {
     "theordinary": "theordinary", "isntree": "isntree", "centellian24": "centellian24",
     "makeupforever": "makeupforever", "genabelle": "genabelle", "maybelline": "maybelline",
     "bobbibrown": "bobbibrown", "molvany": "molvany", "byterry": "byterry",
+    # Identity-changing, added only AFTER its rows were relabelled (services/brand_relabel.py ORDER): smkoreabeauty.com
+    # wrote "Jung Saem Mool" (5 retailer rows; normalize_brand keeps the spaces, so its content_key differed from
+    # jsmbeauty.sg's "JUNGSAEMMOOL"). Relabelled by scripts/relabel_retailer_brand.py --family jungsaemmool (run id
+    # in this change's PR); a re-crawl now writes "JUNGSAEMMOOL" onto the relabelled key instead of the old one.
+    "jungsaemmool": "jungsaemmool",
 }
 # The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
 # --brand. content_key is
@@ -1703,6 +1708,7 @@ RETAILER_BRAND_CANONICAL = {
     "bobbibrown": "Bobbi Brown",            # 9 (vs "BOBBI BROWN" 0; 17 retailer rows)
     "molvany": "Molvany",                   # 10 (vs "MOLVANY" 4, suppressed)
     "byterry": "BY TERRY",                  # retailer rows only (11 vs "By Terry" 4): the brand's own styling
+    "jungsaemmool": "JUNGSAEMMOOL",         # jsmbeauty.sg 171 (vs smkoreabeauty.com "Jung Saem Mool" 5, relabelled)
 }
 
 
