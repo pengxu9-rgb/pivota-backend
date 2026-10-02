@@ -140,6 +140,7 @@ from services.shopify_variant_identity import (
     CART_PROOF_SCOPE_NAMED,
     clean_variant_title,
     verified_cart_variant_id,
+    verified_selected_cart_variant_id,
 )
 # THE owner of the observed seller-of-record id (`merch_obs_<hash>`): the SAME dispatch every
 # ingestion and re-key path mints with (retailer domain -> etld1 alone, else (brand, etld1)).
@@ -1825,7 +1826,12 @@ async def _load_cart_link_item(
         skus = [dict(row) for row in await database.fetch_all(
             _CART_PRODUCT_SKUS_SQL, {"product_key": product_key}
         )]
-        sku_variant, candidates, placeholder = _cart_sku_choice(skus, product_key)
+        if named is not None and not _is_placeholder_sku(named, product_key):
+            sku_variant = _cart_numeric_variant(named.get("source_variant_id"), product_key)
+            candidates = [named]
+            placeholder = None  # A selected size never inherits a product-level price.
+        else:
+            sku_variant, candidates, placeholder = _cart_sku_choice(skus, product_key)
         if candidates and sku_variant is None:
             # A mirror's one real sku names no Shopify variant: not a cart this lane can prove.
             raise svc.PurchaseRefused("row_variant_unverified", "mirror sku names no Shopify variant")
@@ -1861,6 +1867,12 @@ async def _load_cart_link_item(
             shop_domain=merchant_domain,
             catalog_variant_id=sku_variant,
         )
+        if named is not None and not _is_placeholder_sku(named, product_key):
+            selected_proof = verified_selected_cart_variant_id(
+                seed_data, product_urls=[seed.get("canonical_url") or seed.get("destination_url")],
+                shop_domain=merchant_domain, catalog_variant_id=sku_variant,
+            )
+            proven = selected_proof or proven
         variant_id = proven.variant_id if proven else None
         proof_scope = proven.scope if proven else None
         proof_variant_title = proven.variant_title if proven else None

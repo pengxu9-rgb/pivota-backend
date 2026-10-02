@@ -669,3 +669,35 @@ def verified_cart_variant_id(
     if named and named == catalog_variant_id:
         return ProvenCartVariant(named, CART_PROOF_SCOPE_NAMED, _proof_variant_title(seed_data))
     return None
+
+
+def verified_selected_cart_variant_id(
+    seed_data: Any, *, product_urls: List[str], shop_domain: str,
+    catalog_variant_id: Optional[str], now: Optional[datetime] = None,
+) -> Optional[ProvenCartVariant]:
+    """Explicit buyer selection, backed by a variant-scoped same-fetch proof.
+
+    This does not relax the no-selection rule. A product-level placeholder cannot
+    call this path: the route supplies the numeric identity of an existing named SKU.
+    """
+    selected = _numeric_id(catalog_variant_id)
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data, dict) else None
+    if not selected or not isinstance(snapshot, dict):
+        return None
+    proofs = snapshot.get("shopify_cart_variant_proofs")
+    proof = proofs.get(selected) if isinstance(proofs, dict) else None
+    if not isinstance(proof, dict) or proof.get("scope") != "buyer_selected_variant":
+        return None
+    if (_numeric_id(proof.get("variant_id")) != selected or proof.get("available") is not True
+            or type(proof.get("live_variant_count")) is not int or not 2 <= proof["live_variant_count"] < 100):
+        return None
+    if not _cart_proof_fetch_is_trusted(proof, product_urls=product_urls, shop_domain=shop_domain, now=now):
+        return None
+    variants = snapshot.get("variants")
+    hits = [v for v in variants if isinstance(v, dict) and _numeric_id(v.get("shopify_variant_id")) == selected] if isinstance(variants, list) else []
+    if len(hits) != 1:
+        return None
+    # An old captured id cannot be silently replaced by a label match on a sibling.
+    if any(_numeric_id(hits[0].get(k)) not in (None, selected) for k in _ENTRY_VARIANT_KEYS):
+        return None
+    return ProvenCartVariant(selected, CART_PROOF_SCOPE_NAMED, clean_variant_title(proof.get("variant_title")))
