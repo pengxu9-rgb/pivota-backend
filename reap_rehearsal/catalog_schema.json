@@ -1,0 +1,1679 @@
+{
+  "source_snapshot_sha256": "7cd52ab8b7e19063adce72d52d0c7f85ab17ec78c43e2830d403e46c399eb5d6",
+  "columns": [
+    {
+      "table_name": "catalog_merchants",
+      "column_name": "merchant_id",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_merchants",
+      "column_name": "merchant_name",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_merchants",
+      "column_name": "primary_platform",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_merchants",
+      "column_name": "status",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_merchants",
+      "column_name": "source_system",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_merchants",
+      "column_name": "source_ref",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_merchants",
+      "column_name": "metadata_json",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_merchants",
+      "column_name": "created_at",
+      "formatted_type": "timestamp without time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_merchants",
+      "column_name": "updated_at",
+      "formatted_type": "timestamp without time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_merchants",
+      "column_name": "last_full_sync_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_merchants",
+      "column_name": "audit_schedule",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_merchants",
+      "column_name": "indexable",
+      "formatted_type": "boolean",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "product_key",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "merchant_id",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "platform",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "source_product_id",
+      "formatted_type": "character varying(128)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "catalog_track",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "truth_tier",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "readiness_tier",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "source_system",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "source_ref",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "title",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "description",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "brand",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "product_type",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "category",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "canonical_url",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "image_url",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "product_payload",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "freshness_json",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "created_at",
+      "formatted_type": "timestamp without time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "updated_at",
+      "formatted_type": "timestamp without time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "category_path",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "category_confidence",
+      "formatted_type": "real",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "category_label_source",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "pdp_scope",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "pdp_scope_source",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "pdp_scope_set_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "pivota_signature_id",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "pivota_canonical_url",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "pivota_signature_minted_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "tags",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "price_tier",
+      "formatted_type": "character varying(16)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "use_case_tags",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "lifestyle_tags",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "demographic",
+      "formatted_type": "character varying(16)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "pdp_lifecycle_stage",
+      "formatted_type": "character varying(16)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "content_key",
+      "formatted_type": "character varying(40)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "last_seen_in_sync_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "sync_status",
+      "formatted_type": "character varying(16)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "material",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "material_source",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "material_confidence",
+      "formatted_type": "real",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "care",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "care_source",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "care_confidence",
+      "formatted_type": "real",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "size_guide",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "size_guide_source",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "size_guide_confidence",
+      "formatted_type": "real",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "category_label",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "source_domain",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "suppression_reason",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "suppressed_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "suppression_metadata",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "content_changed_at",
+      "formatted_type": "timestamp without time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "category_kind",
+      "formatted_type": "character varying(16)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "claim_state",
+      "formatted_type": "character varying(16)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "resolved_vertical",
+      "formatted_type": "character varying(16)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "llm_attributes",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "seller_ref",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "seed_kind",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "gtin",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "rating_value",
+      "formatted_type": "numeric",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "rating_count",
+      "formatted_type": "integer",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "pdp_will_render",
+      "formatted_type": "boolean",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "pdp_will_render_computed_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "recall_doc",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "recall_market",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "recall_tool",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "recall_availability",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_products",
+      "column_name": "recall_doc_updated_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "sku_key",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "product_key",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "merchant_id",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "platform",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "source_product_id",
+      "formatted_type": "character varying(128)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "source_variant_id",
+      "formatted_type": "character varying(128)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "sku",
+      "formatted_type": "character varying(128)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "barcode",
+      "formatted_type": "character varying(128)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "title",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "currency",
+      "formatted_type": "character varying(16)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "image_url",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "visible_attributes",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "visible_option_labels",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "ingredient_ids",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "sku_payload",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "readiness_tier",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "created_at",
+      "formatted_type": "timestamp without time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "updated_at",
+      "formatted_type": "timestamp without time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "source_domain",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "suppression_reason",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "suppressed_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_skus",
+      "column_name": "suppression_metadata",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "offer_id",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "sku_key",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "product_key",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "merchant_id",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "catalog_track",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "truth_tier",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "readiness_tier",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "offer_mode",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "channel",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "availability",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "inventory_quantity",
+      "formatted_type": "integer",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "currency",
+      "formatted_type": "character varying(16)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "list_price",
+      "formatted_type": "numeric(12,2)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "merchant_effective_price",
+      "formatted_type": "numeric(12,2)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "estimated_best_price",
+      "formatted_type": "numeric(12,2)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "price_confidence",
+      "formatted_type": "numeric(5,2)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "source_system",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "source_ref",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "offer_payload",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "created_at",
+      "formatted_type": "timestamp without time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "updated_at",
+      "formatted_type": "timestamp without time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "suppression_reason",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "suppressed_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "source_domain",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "suppression_metadata",
+      "formatted_type": "jsonb",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "offer_type",
+      "formatted_type": "character varying(16)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "market",
+      "formatted_type": "character varying(8)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "is_first_party",
+      "formatted_type": "boolean",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "why_buy_direct",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_offers",
+      "column_name": "price_checked_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "id",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "market",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "tool",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "destination_url",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "canonical_url",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "domain",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "title",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "image_url",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "price_amount",
+      "formatted_type": "double precision",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "price_currency",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "availability",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "status",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "notes",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "created_by_employee_id",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "attached_product_key",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "attached_variant_id",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "created_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "updated_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "seed_data",
+      "formatted_type": "jsonb",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "utm_template",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "partner_type",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "disclosure_text",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "external_product_id",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "content_lock",
+      "formatted_type": "jsonb",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "seller_ref",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "seed_kind",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "search_text",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "destination_checked_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "destination_http_status",
+      "formatted_type": "integer",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "destination_verdict",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "destination_failure_streak",
+      "formatted_type": "integer",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "last_crawled_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "external_product_seeds",
+      "column_name": "last_crawl_attempt_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "content_key",
+      "formatted_type": "character varying(40)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "pivota_signature_id",
+      "formatted_type": "character varying(40)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "merchant_id",
+      "formatted_type": "character varying(100)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "pipeline_stage",
+      "formatted_type": "character varying(20)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "blocker_code",
+      "formatted_type": "character varying(40)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "blocker_detail",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "serving_eligible",
+      "formatted_type": "boolean",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "content_quality_score",
+      "formatted_type": "real",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "model_readiness_score",
+      "formatted_type": "real",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "conversion_potential_score",
+      "formatted_type": "real",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "quality_rules_version",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "quality_scored_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "extraction_content_hash",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "extractor_version",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "last_extracted_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "seed_audit_status",
+      "formatted_type": "character varying(30)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "identity_resolved",
+      "formatted_type": "boolean",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "product_group_id",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "has_image",
+      "formatted_type": "boolean",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "has_price",
+      "formatted_type": "boolean",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "description_length",
+      "formatted_type": "integer",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "consolidation_version",
+      "formatted_type": "character varying(32)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "last_consolidated_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "created_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "readiness_tier",
+      "formatted_type": "character varying(64)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "index_pipeline_state",
+      "column_name": "index_eligible",
+      "formatted_type": "boolean",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "subject_type",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "subject_key",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "product_key",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "source_listing_ref",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "content_key",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "source_id",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "source_domain",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "source_lifecycle_state",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "source_last_checked_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "identity_status",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "identity_confidence",
+      "formatted_type": "numeric(4,3)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "matched_product_key",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "matched_content_key",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "matched_sellable_item_group_id",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "freshness_state",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "last_verified_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "verification_source",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "serving_decision",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "serving_reason_codes",
+      "formatted_type": "text[]",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "manual_override_id",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "policy_version",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "catalog_row_trust",
+      "column_name": "updated_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "source_listing_ref",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "merchant_id",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "product_id",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "source_kind",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "source_tier",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "live_read_enabled",
+      "formatted_type": "boolean",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "sellable_item_group_id",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "product_line_id",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "review_family_id",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "identity_status",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "identity_confidence",
+      "formatted_type": "numeric(6,4)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "matched_by_rule",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "match_basis",
+      "formatted_type": "jsonb",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "strong_identity",
+      "formatted_type": "jsonb",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "soft_identity",
+      "formatted_type": "jsonb",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "variant_axes",
+      "formatted_type": "jsonb",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "source_payload",
+      "formatted_type": "jsonb",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "review_summary",
+      "formatted_type": "jsonb",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "official_url",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "official_domain",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "brand_norm",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "title_norm",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "title_core_norm",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "review_required",
+      "formatted_type": "boolean",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "review_reason_codes",
+      "formatted_type": "jsonb",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "created_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "pdp_identity_listing",
+      "column_name": "updated_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "store_id",
+      "formatted_type": "character varying(50)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "merchant_id",
+      "formatted_type": "character varying(50)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "platform",
+      "formatted_type": "character varying(50)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "name",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "domain",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "api_key",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "status",
+      "formatted_type": "character varying(50)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "connected_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "last_sync",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "product_count",
+      "formatted_type": "integer",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "created_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "realtime_enabled",
+      "formatted_type": "boolean",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "api_endpoint",
+      "formatted_type": "character varying(500)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "query_ttl_seconds",
+      "formatted_type": "integer",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "support_email",
+      "formatted_type": "character varying(255)",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "is_primary",
+      "formatted_type": "boolean",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "order_writeback_status",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "order_writeback_enabled_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "order_writeback_canary_order_id",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "order_writeback_last_canary_order_id",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "order_writeback_last_verified_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "order_writeback_last_error",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "content_writeback_status",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "content_writeback_enabled_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "content_writeback_canary_product_id",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "content_writeback_last_canary_product_id",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "content_writeback_last_written_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "content_writeback_last_error",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "upstream_probe_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "upstream_probe_status",
+      "formatted_type": "text",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "upstream_probe_http_status",
+      "formatted_type": "integer",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "merchant_stores",
+      "column_name": "upstream_probe_failures",
+      "formatted_type": "integer",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "content_canonical_election",
+      "column_name": "content_key",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "content_canonical_election",
+      "column_name": "canonical_sig_id",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "content_canonical_election",
+      "column_name": "election_reason",
+      "formatted_type": "text",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "content_canonical_election",
+      "column_name": "elected_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "NO"
+    },
+    {
+      "table_name": "content_canonical_election",
+      "column_name": "updated_at",
+      "formatted_type": "timestamp with time zone",
+      "is_nullable": "NO"
+    }
+  ],
+  "limitations": [
+    "Column/type/nullability metadata only; no original constraints, indexes, triggers or defaults.",
+    "Core four catalog primary keys follow candidate db/catalog.py; external seed indexes are applied by source migration.",
+    "No rows, credentials, merchant fetches or clock/proof updates."
+  ],
+  "canonical_election_metadata_sha256": "d9539f168d2ee37c878bdbeb78adb98bf23dbd78545f4a3a11107e27926aef93"
+}
