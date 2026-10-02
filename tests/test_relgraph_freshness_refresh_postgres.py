@@ -182,21 +182,22 @@ async def test_real_mirror_owner_write_is_not_fresh_without_price_currency_read(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("merchant,source,attachment,bound", [
-    ("seller", "123", "P2", False),
-    ("external_seed", "ext_shared", "P2", False),
-    ("seller", "123", None, False),
-    ("seller", "123", "P1", True),
-    ("external_seed", "123", None, True),
-    ("seller", "ext_shared", None, True),
+@pytest.mark.parametrize("merchant,platform,source,attachment,bound", [
+    ("seller", "shopify", "123", "P2", False),
+    ("seller", "external_seed", "123", "P2", False),
+    ("seller", "shopify", "123", None, False),
+    ("seller", "shopify", "123", "P1", True),
+    ("seller", "external_seed", "123", None, True),
+    ("external_seed", "shopify", "123", None, False),
+    ("seller", "shopify", "ext_shared", None, True),
 ])
-async def test_seed_binding_is_exact_or_external_namespace_not_recycled_native_id(scoped_db, merchant, source, attachment, bound):
+async def test_seed_binding_is_exact_or_external_lane_not_recycled_native_id(scoped_db, merchant, platform, source, attachment, bound):
     await scoped_db.execute("INSERT INTO catalog_products VALUES ('P2','other','shopify','123','other.example','live',NULL,NULL,true,now())")
     await scoped_db.execute("INSERT INTO catalog_merchants VALUES ('other','active')")
     await scoped_db.execute("INSERT INTO merchant_stores VALUES ('other','shopify','active','other.example')")
-    await scoped_db.execute("UPDATE catalog_products SET merchant_id=:merchant,platform='shopify',source_product_id=:source,pdp_will_render_computed_at=now() WHERE product_key='P1'",
-                            {"merchant": merchant, "source": source})
-    await scoped_db.execute("UPDATE merchant_stores SET platform='shopify' WHERE merchant_id='seller'")
+    await scoped_db.execute("UPDATE catalog_products SET merchant_id=:merchant,platform=:platform,source_product_id=:source,pdp_will_render_computed_at=now() WHERE product_key='P1'",
+                            {"merchant": merchant, "platform": platform, "source": source})
+    await scoped_db.execute("UPDATE merchant_stores SET platform=:platform WHERE merchant_id='seller'", {"platform": platform})
     await scoped_db.execute("UPDATE external_product_seeds SET status='inactive' WHERE id<>'seed_good'")
     await scoped_db.execute("UPDATE external_product_seeds SET external_product_id=:source,attached_product_key=:attached,last_crawled_at=now() WHERE id='seed_good'",
                             {"source": source, "attached": attachment})

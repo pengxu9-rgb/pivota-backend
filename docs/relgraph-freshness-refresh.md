@@ -21,8 +21,9 @@ suppression and quarantine. A merchant disconnected after planning is excluded. 
 seed selector repeats its own guards on the restricted IDs; no URL is accepted as input.
 Every origin proof and restricted seed selection also requires an exact attachment. A
 populated conflicting attachment defeats ID fallback. Unattached rows may bind only the
-legacy `external_seed` namespace or globally external `ext_` IDs; native store-local IDs
-alone cannot establish freshness or authorize origin work for another listing.
+stable `platform='external_seed'` source lane or globally external `ext_` IDs. The lane
+survives observed seller rekeying; a seller's name alone cannot establish it. Native
+store-local IDs alone cannot establish freshness or authorize work for another listing.
 
 The existing refresh batch retains origin politeness, host/IP breakers, and origin/product/
 currency validation. The crawl deadline is hard (maximum 600 seconds); page recomputation

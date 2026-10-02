@@ -64,12 +64,13 @@ def read_manifest(path: str) -> Dict[str, Any]:
 
 def seed_product_binding_sql(seed_alias: str, product_alias: str) -> str:
     # Exact attachments override every fallback. Unattached native platform IDs are
-    # merchant-scoped, so only the legacy external namespace/global ext_ IDs may bind.
+    # merchant-scoped, so only the stable external source lane/global ext_ IDs may bind.
+    # The platform lane remains valid when its merchant is rekeyed to an observed seller.
     # These aliases are fixed by this module, never manifest values.
     return f"""({seed_alias}.attached_product_key = {product_alias}.product_key
       OR (NULLIF(btrim({seed_alias}.attached_product_key), '') IS NULL
         AND {seed_alias}.external_product_id = {product_alias}.source_product_id
-        AND ({product_alias}.merchant_id = 'external_seed' OR {product_alias}.source_product_id ~* '^ext_')))"""
+        AND ({product_alias}.platform = 'external_seed' OR {product_alias}.source_product_id ~* '^ext_')))"""
 
 
 async def plan(db: Any, manifest: Dict[str, Any]) -> Dict[str, Any]:
