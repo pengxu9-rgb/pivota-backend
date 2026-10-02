@@ -47,9 +47,11 @@ The stock `api_keys` schema is copied exactly from source (hash/status-based, wi
 ## Local tests
 
 ```
-PYTHONDONTWRITEBYTECODE=1 python -m pytest -q tests/test_reap_rehearsal_guard.py tests/test_reap_rehearsal_guard_postgres.py
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q tests/test_reap_rehearsal_guard.py tests/test_reap_rehearsal_guard_postgres_integration.py
 ```
 
 Set `REAP_GUARD_TEST_MANIFEST` only to the mode0600 disposable localhost55435 manifest prepared by root. Without it, database tests skip. Tests never load ambient/cloud DSNs. Production target constants are replaced only by explicit in-process test bindings, not an operator override. Negative cases revert local privilege/schema/state mutations. Source auth probe is a subprocess using real ASGI routes and restricted-role SQL; it never connects to a provider. Real Reap routes transitively import pure schema helper definitions, but startup initializer calls are trapped and absent.
 
 Rollback before activation: remove the dedicated candidate service/job; do not fall back to `main:app`. Preserve private manifest and scoped database for investigation; deletion of new cloud resources is root-controlled. Current preparation contains no provider state to reconcile. Later owned/real-provider rollback must keep read/recovery/reconciliation available and needs its own reviewed procedure.
+
+The restricted-role suite uses the repository `*_postgres_integration.py` convention: it requires its own manifest and is not a generic DATABASE_URL dialect suite. CI runs it in `Reap Rehearsal Guard` against a fresh PostgreSQL17 host-network container listening directly on127.0.0.1:55435. Host-network is deliberate: forwarded container ports do not prove the server-side address/port checked by this guard. CI also grants PG17 MAINTAIN temporarily to prove the privilege-name audit, then revokes it. Cleanup deletes only resources whose successful creation was recorded; collisions are preserved. The existing dialect gate retains its zero-skips assertion unchanged.

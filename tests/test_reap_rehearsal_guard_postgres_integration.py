@@ -256,3 +256,21 @@ def test_actual_minimal_app_introspection_with_restricted_database(fixture_confi
     assert result.returncode == 0, result.stderr
     evidence = json.loads(result.stdout.strip().splitlines()[-1])
     assert evidence["checks"] == 6 and evidence["real_provider_requests"] == 0
+
+
+def test_administrative_privilege_for_actual_server_version(fixture_config):
+    async def run():
+        c = await admin(fixture_config)
+        version = int(await c.fetchval("SHOW server_version_num"))
+        privilege = "MAINTAIN" if version >= 170000 else "TRIGGER"
+        reason = "runtime_acl_admin" if version >= 170000 else "runtime_table_admin"
+        try:
+            await c.execute("GRANT " + privilege + " ON catalog_products TO " + g.TARGET.runtime)
+            with pytest.raises(g.GuardRejected, match=reason):
+                await probe(fixture_config)
+        finally:
+            await c.execute("REVOKE " + privilege + " ON catalog_products FROM " + g.TARGET.runtime)
+            await c.close()
+        await probe(fixture_config)
+
+    asyncio.run(run())

@@ -1,0 +1,84 @@
+name: Reap Rehearsal Guard
+
+on:
+  pull_request:
+    paths:
+      - 'reap_rehearsal/**'
+      - 'scripts/ci/prepare_reap_rehearsal_guard.py'
+      - 'tests/test_reap_rehearsal_guard.py'
+      - 'tests/test_reap_rehearsal_guard_postgres_integration.py'
+      - 'tests/reap_rehearsal_auth_probe.py'
+      - 'requirements*.txt'
+      - '.github/workflows/reap-rehearsal-guard.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reap-rehearsal-guard-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  isolated-guard:
+    name: restricted roles and actual preparation routes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install test dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Start a fresh loopback-only PostgreSQL service
+        id: start_guard_postgres
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Linux host networking preserves the actual inet_server_addr/port.
+          # Port forwarding a container5432 to host55435 would fail this guard.
+          container_id="$(docker run --detach --name "reap-guard-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --network host \
+            --env POSTGRES_USER=postgres --env POSTGRES_PASSWORD=postgres --env POSTGRES_DB=postgres \
+            postgres:17 -c listen_addresses=127.0.0.1 -c port=55435)"
+          [[ "$container_id" =~ ^[0-9a-f]{64}$ ]]
+          printf "container_id=%s\n" "$container_id" >> "$GITHUB_OUTPUT"
+          for attempt in $(seq 1 30); do
+            if docker exec "$container_id" pg_isready -h 127.0.0.1 -p 55435 -U postgres -d postgres; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Prepare isolated roles and private fixture
+        id: prepare_guard_fixture
+        run: python scripts/ci/prepare_reap_rehearsal_guard.py
+      - name: Execute every guard case without skips
+        env:
+          REAP_GUARD_TEST_MANIFEST: ${{ runner.temp }}/reap-guard-fixture.private.json
+        run: |
+          pytest -q -p no:cacheprovider --junitxml=reap-guard-tests.xml \
+            tests/test_reap_rehearsal_guard.py tests/test_reap_rehearsal_guard_postgres_integration.py
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root=ET.parse('reap-guard-tests.xml').getroot()
+          suites=root.findall('testsuite') or [root]
+          tests=sum(int(s.get('tests',0)) for s in suites)
+          skipped=sum(int(s.get('skipped',0)) for s in suites)
+          if tests<76 or skipped:sys.exit('Guard job did not execute all76 cases without skips')
+          print(f'Guard CI executed {tests} cases, zero skips')
+          PY
+      - name: Delete ephemeral service and private credentials
+        if: always()
+        shell: bash
+        env:
+          CREATED_CONTAINER_ID: ${{ steps.start_guard_postgres.outputs.container_id }}
+          CREATED_FIXTURE: ${{ steps.prepare_guard_fixture.outputs.fixture_owned }}
+        run: |
+          if [[ "$CREATED_CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]]; then
+            docker rm -f "$CREATED_CONTAINER_ID" >/dev/null
+          fi
+          if [ "$CREATED_FIXTURE" = true ]; then
+            rm -f "${RUNNER_TEMP}/reap-guard-fixture.private.json"
+          fi
