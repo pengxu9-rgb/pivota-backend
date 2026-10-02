@@ -675,27 +675,22 @@ async def run_reap_agentic_purchase_poll(
         return gate() and os.getenv("REAP_AGENTIC_CREATE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
 
     async def _finish() -> PollReport:
-        try:
-            counts["contact_retention_blocked"] = await ledger.count_contact_retention_blocked()
-            counts["checkout_needs_human"] = await ledger.count_checkout_needs_human()
-            counts["stuck_over_age"] = await asyncio.wait_for(
-                ledger.count_stuck_purchases(
-                    stuck_after_seconds=STUCK_AFTER_SECONDS,
-                    reconciliation_only=(not _precheckout_enabled() or not purchase_svc.is_reconciliation_enabled() or not rc.is_configured() or (not is_production() and not rc.is_sandbox_base_url())),
-                    max_age_seconds=hosted_max_age,
-                    enrollment_grace_seconds=enrollment_grace,
-                ),
-                timeout=STUCK_COUNT_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:  # noqa: BLE001 — a diagnostic must never fail the run that carries it
-            # The TYPE only, as everywhere in this file; a timeout reads `error_type=TimeoutError`.
-            counts["errors"] += 1
-            logger.error(
-                "reap_agentic_poll: could not count stuck purchases (error_type=%s); "
-                "stuck_over_age is reported as %d, meaning NOT COUNTED",
-                type(exc).__name__,
-                NOT_COUNTED,
-            )
+        async def _diagnostic(name, awaitable):
+            try:
+                counts[name] = await asyncio.wait_for(awaitable, timeout=STUCK_COUNT_TIMEOUT_SECONDS)
+            except Exception as exc:
+                counts[name] = NOT_COUNTED
+                counts["errors"] += 1
+                logger.error("reap_agentic_poll: could not count %s (error_type=%s); not counted", name, type(exc).__name__)
+        await _diagnostic("contact_retention_blocked", ledger.count_contact_retention_blocked())
+        await _diagnostic("checkout_needs_human", ledger.count_checkout_needs_human())
+        await _diagnostic("stuck_over_age", ledger.count_stuck_purchases(
+            stuck_after_seconds=STUCK_AFTER_SECONDS,
+            reconciliation_only=(not _precheckout_enabled() or not purchase_svc.is_reconciliation_enabled()
+                                 or not rc.is_configured() or (not is_production() and not rc.is_sandbox_base_url())),
+            max_age_seconds=hosted_max_age,
+            enrollment_grace_seconds=enrollment_grace,
+        ))
 
         report = _report()
         # THE PROOF LINE: `[ts] INFO - reap_agentic_poll: PollReport(...)` on the worker's stdout.

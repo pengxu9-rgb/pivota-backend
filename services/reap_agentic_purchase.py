@@ -2102,7 +2102,7 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
         # bug worth not compounding.
         return AdvanceResult(str(row["id"]), outcome="terminal", state=state)
     if not is_reconciliation_enabled():
-        return await _release(row, worker_id, error_code="reconciliation_disabled")
+        return await _release(row, worker_id, error_code=row.get("last_error_code") or "reconciliation_disabled")
     if state in {"resolving", "quoting"} and row.get("last_error_code") == "contact_retention_elapsed":
         # Privacy expiry never invents a payment outcome or permits a new provider operation.
         return await _release(row, worker_id, error_code="contact_retention_elapsed")

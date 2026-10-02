@@ -2122,3 +2122,35 @@ async def test_permanent_checkout_read_enters_human_review_without_terminalizing
     await database.execute('UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id', {'id':pid})
     report = await job.run_reap_agentic_purchase_poll(worker_id='provider-recovers')
     assert (await _get(pid))['state'] == 'processing' and report.checkout_needs_human == 0
+
+async def test_mid_claim_stop_preserves_contact_pause_and_attempt_exemption(reap, monkeypatch):
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_purchase as svc
+    pid = await _start()
+    await database.execute("UPDATE reap_agentic_purchases SET state='quoting',buyer_email=NULL,shipping_address=NULL,last_error_code='contact_retention_elapsed' WHERE id=:id", {'id':pid})
+    await _claim(pid, 'pause-flips')
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','0')
+    reap.calls.clear()
+    result = await svc.advance(pid,'pause-flips')
+    assert result.last_error_code == 'contact_retention_elapsed'
+    assert (await _get(pid))['last_error_code'] == 'contact_retention_elapsed'
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','1')
+    await database.execute('UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id', {'id':pid})
+    await _claim(pid,'resume-pause')
+    await svc.advance(pid,'resume-pause')
+    assert (await _get(pid))['state']=='quoting' and (await _get(pid))['attempts']==0
+    assert await ledger.count_contact_retention_blocked()==1 and reap.calls==[]
+
+async def test_hung_contact_diagnostic_does_not_hide_other_health(reap, monkeypatch):
+    import asyncio
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+    await _recovery_checkout()
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','0')
+    monkeypatch.setattr(job,'STUCK_COUNT_TIMEOUT_SECONDS',0.02)
+    async def hang():await asyncio.Event().wait()
+    monkeypatch.setattr(ledger,'count_contact_retention_blocked',hang)
+    report=await asyncio.wait_for(job.run_reap_agentic_purchase_poll(worker_id='health-independence'),0.5)
+    assert report.contact_retention_blocked==-1 and report.stuck_over_age==1
+    assert report.errors==1 and report.checkout_needs_human==0
