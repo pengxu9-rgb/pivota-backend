@@ -1,6 +1,6 @@
 # Isolated staging preparation entrypoint
 
-This opt-in package is based on backend `ffae02260a8520eaa7e9cbf044a90b62d376d6ab`. Normal Docker startup is unchanged. Never point the normal `main:app` entrypoint at a rehearsal database: even `SKIP_HEAVY_STARTUP_INIT=true` leaves light startup DDL enabled.
+This opt-in package is based on backend `ffae02260a8520eaa7e9cbf044a90b62d377d6ab`. Normal Docker startup is unchanged. Never point the normal `main:app` entrypoint at a rehearsal database: even `SKIP_HEAVY_STARTUP_INIT=true` leaves light startup DDL enabled.
 
 ## Deployment gate
 

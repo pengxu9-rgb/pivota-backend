@@ -222,7 +222,7 @@ async def validate_connection(conn, mode, target=TARGET):
     ):
         reject("other_database_access")
     schemas = await conn.fetch(
-        "SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg_%' AND nspname NOT IN ('public','information_schema')"
+        "SELECT nspname FROM pg_namespace WHERE left(nspname,3) <> 'pg_' AND nspname NOT IN ('public','information_schema')"
     )
     if schemas:
         reject("unexpected_schema")
@@ -248,7 +248,7 @@ async def validate_connection(conn, mode, target=TARGET):
         ):
             reject("runtime_schema_inventory")
     if await conn.fetchval(
-        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_%'"
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND left(n.nspname,3) <> 'pg_'"
     ):
         reject("unexpected_user_functions")
     if await conn.fetchval("SELECT count(*) FROM pg_event_trigger"):

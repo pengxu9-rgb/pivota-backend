@@ -105,6 +105,7 @@ def test_runtime_role_and_baseline(fixture_config):
             "runtime_schema_inventory",
         ),
         ("CREATE SCHEMA foreign_fixture", "DROP SCHEMA foreign_fixture", "unexpected_schema"),
+        ("CREATE SCHEMA pgx", "DROP SCHEMA pgx", "unexpected_schema"),
         (
             "CREATE SEQUENCE public.foreign_fixture",
             "DROP SEQUENCE public.foreign_fixture",
