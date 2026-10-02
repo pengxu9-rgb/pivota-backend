@@ -112,34 +112,52 @@ print(json.dumps({"type": "email", "displayName": "pivota " + sys.argv[2] + " al
   echo "   created $CHANNEL"
 fi
 
-# Deliberately OUTSIDE the if/else. An API-created email channel is born
-# UNVERIFIED and stays that way until a human completes the emailed code, so the
-# CREATE arm is the one that manufactures an undeliverable channel. Checking only
-# the reuse arm instruments the branch that OBSERVES the damage while staying
-# silent on the branch that CAUSES it — which is how the live 08-28 channel came
-# to exist with no verificationStatus while the script reported success.
+# Validate the actual resource after BOTH create and reuse. Explicit UNVERIFIED
+# requires verification; omitted/UNSPECIFIED can mean verification is not required.
+# Neither a usable API state nor VERIFIED establishes delivery of the current alert:
+# a controlled notification and confirmation from the intended recipient are still required.
+# https://docs.cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.notificationChannels
 #
 # `${CHANNEL#projects/*/}` is a SHORTEST-prefix strip: `*` cannot swallow the
 # second `/` because the character after `projects/` is `p`, so this yields
 # `notificationChannels/<id>`, which `api()` prefixes with the project path. `##`
 # would yield a bare id and GET a 404, making the warning fire unconditionally
 # and training the reader to ignore it. A test pins the single `#`.
-CHANNEL_VERIFIED="$(api GET "${CHANNEL#projects/*/}" 2>/dev/null | python3 -c '
+if ! CHANNEL_RESPONSE="$(api GET "${CHANNEL#projects/*/}")"; then
+  echo "FAILED: notification channel GET failed; delivery readiness is unknown." >&2
+  exit 1
+fi
+CHANNEL_VERIFIED="$(python3 -c '
 import json, sys
 raw = sys.stdin.read().strip()
 try:
-    print(json.loads(raw).get("verificationStatus", "") if raw else "")
+    channel = json.loads(raw)
 except ValueError:
-    print("")
-')"
+    sys.exit("FAILED: notification channel GET returned missing or malformed JSON.")
+if not isinstance(channel, dict) or "error" in channel:
+    sys.exit("FAILED: notification channel GET returned an invalid resource or API error.")
+if channel.get("name") != sys.argv[1] or channel.get("type") != "email":
+    sys.exit("FAILED: notification channel GET returned the wrong resource or channel type.")
+if channel.get("enabled") is not True:
+    sys.exit("FAILED: notification channel is disabled or its enabled state is missing.")
+labels = channel.get("labels")
+if not isinstance(labels, dict) or labels.get("email_address") != sys.argv[2]:
+    sys.exit("FAILED: notification channel recipient does not match ALERT_EMAIL.")
+status = channel.get("verificationStatus", "VERIFICATION_STATUS_UNSPECIFIED")
+if status not in ("VERIFIED", "UNVERIFIED", "VERIFICATION_STATUS_UNSPECIFIED"):
+    sys.exit("FAILED: notification channel verification state is invalid or unsupported.")
+print(status)
+' "$CHANNEL" "$ALERT_EMAIL" <<<"$CHANNEL_RESPONSE")"
 CHANNEL_UNDELIVERABLE=0
-if [ "$CHANNEL_VERIFIED" != VERIFIED ]; then
+if [ "$CHANNEL_VERIFIED" = UNVERIFIED ]; then
   CHANNEL_UNDELIVERABLE=1
-  echo "   WARNING: channel is '${CHANNEL_VERIFIED:-UNSET}', not VERIFIED." >&2
-  echo "   Cloud Monitoring does not deliver to an unverified email channel. Every policy" >&2
-  echo "   below will fire into the void. Open the channel in the console and complete" >&2
-  echo "   verification, then re-run this script to confirm." >&2
+  echo "   WARNING: channel is UNVERIFIED and requires verification before it can function." >&2
+  echo "   Complete the channel verification process, then confirm actual alert receipt." >&2
+elif [ "$CHANNEL_VERIFIED" = VERIFICATION_STATUS_UNSPECIFIED ]; then
+  echo "   Channel verification status is omitted/UNSPECIFIED; verification may not be required."
 fi
+echo "   Channel API state does not prove alert delivery. Confirm a controlled notification"
+echo "   with the intended recipient before marking delivery readiness complete."
 
 echo "== uptime checks"
 UP="$(api GET uptimeCheckConfigs)"

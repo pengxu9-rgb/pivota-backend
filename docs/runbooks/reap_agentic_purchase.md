@@ -618,11 +618,16 @@ reported at least once more.
    everything else and exits 1 naming it. The nine existing policies are written before the Reap
    ones are attempted, and a Reap policy that already exists is replaced only after its
    replacement was accepted, so a deferred run leaves nothing worse than it found it.
-5. **The script exits 1 on a successful run today**, with `WARNING: channel is 'UNSET', not
-   VERIFIED` and `FAILED: alerts are configured but the channel cannot receive them`: the prod
-   email channels report no `verificationStatus`. That is existing behaviour and is not caused by
-   these policies; judge the run by the `policies: 12` list, and treat the channel warning as the
-   separate open question it already was.
+5. **Separate channel API state from actual delivery.** The script reads and validates the exact
+   enabled email channel after both create and reuse. Failed, missing, malformed or error responses,
+   mismatched resources/recipients and disabled channels stop the run before policy reconciliation.
+   Explicit `UNVERIFIED` requires verification and makes the run fail. An omitted status or
+   `VERIFICATION_STATUS_UNSPECIFIED` can mean verification is not required; it is not evidence of
+   delivery failure or receipt. [Google's channel API contract](https://docs.cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.notificationChannels)
+   distinguishes these states. Before marking delivery ready, use an authorized, isolated controlled
+   notification and confirm receipt with the intended person. Do not infer delivery from a channel
+   creation response, a `VERIFIED` field, the policy count, or an incident alone. Requesting a
+   verification email is a separate send and must not silently replace or add to an authorized test.
 
 ---
 
