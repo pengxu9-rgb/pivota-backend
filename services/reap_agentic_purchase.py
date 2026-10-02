@@ -1960,6 +1960,10 @@ async def _still_ours(row: Mapping[str, Any], worker_id: str) -> Optional[Dict[s
     hold — `expire_overdue_purchases` and `fail_exhausted_purchases` take no holder — so
     `claimed_by` alone would still let a worker quote a purchase that is already 'expired'.
     """
+    # A stop raised during the preceding request prevents the next partner operation.
+    # Requests already in flight can finish; the stop never fabricates an outcome.
+    if not is_reconciliation_enabled():
+        return None
     fresh = await ledger.get_purchase_internal(str(row["id"]))
     if fresh is None:
         return None
@@ -2103,13 +2107,20 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
         return AdvanceResult(str(row["id"]), outcome="terminal", state=state)
     if not is_reconciliation_enabled():
         return await _release(row, worker_id, error_code=row.get("last_error_code") or "reconciliation_disabled")
-    if state in {"resolving", "quoting"} and row.get("last_error_code") == "contact_retention_elapsed":
+    if state in {"resolving", "needs_enrollment", "quoting"} and row.get("last_error_code") == "contact_retention_elapsed":
         # Privacy expiry never invents a payment outcome or permits a new provider operation.
         return await _release(row, worker_id, error_code="contact_retention_elapsed")
     handler = _STEPS.get(state)
     if handler is None:  # pragma: no cover — every non-terminal state has a step
         raise RuntimeError(f"no step for purchase state {state!r}")
-    return await handler(row, worker_id)
+    token = rc.worker_provider_permission.set(is_reconciliation_enabled)
+    try:
+        return await handler(row, worker_id)
+    except rc.ProviderOperationStopped:
+        fresh = await ledger.get_purchase_internal(str(row["id"])) or row
+        return await _release(fresh, worker_id, error_code=fresh.get("last_error_code") or "reconciliation_disabled")
+    finally:
+        rc.worker_provider_permission.reset(token)
 
 
 # ── the steps ────────────────────────────────────────────────────────────────────────────────

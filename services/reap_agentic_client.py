@@ -94,6 +94,22 @@ physical object.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
+
+class ProviderOperationStopped(RuntimeError):
+    """A worker stop was raised before a new transport operation."""
+
+
+# Worker-scoped: direct clients retain their existing behavior; child resolver calls inherit it.
+worker_provider_permission = ContextVar("reap_worker_provider_permission", default=None)
+
+
+def _check_worker_provider_permission():
+    permission = worker_provider_permission.get()
+    if permission is not None and not permission():
+        raise ProviderOperationStopped("reconciliation_disabled")
+
 import hashlib
 import json
 import logging
@@ -1878,6 +1894,7 @@ async def _post(
     wrong host or a missing key is an operator error that must be visible rather than degrade
     quietly into "Reap is unavailable" on every request forever.
     """
+    _check_worker_provider_permission()
     if not is_configured():
         return ReapResponse(ok=False, error="reap_client_not_configured")
     # The allowlist is enforced HERE, on the call, and not only in a helper an operator might run.
@@ -2190,6 +2207,7 @@ async def _get(
     NOTHING IS STRING-FORMATTED INTO A PATH HERE THAT HAS NOT BEEN THROUGH `_path_id`. That is
     the guard that stops a caller-supplied id from adding a segment or a query of its own.
     """
+    _check_worker_provider_permission()
     if not is_configured():
         return ReapResponse(ok=False, error="reap_client_not_configured")
     url = validate_base_url()

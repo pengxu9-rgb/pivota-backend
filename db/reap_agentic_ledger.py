@@ -2390,7 +2390,7 @@ async def expire_overdue_purchases(
 _SCRUB_RECONCILING_PII_SQL = """
     UPDATE reap_agentic_purchases
        SET shipping_address=NULL, buyer_email=NULL, offer_code=NULL,
-           last_error_code=CASE WHEN state IN ('resolving','quoting')
+           last_error_code=CASE WHEN state IN ('resolving','needs_enrollment','quoting')
                                THEN 'contact_retention_elapsed' ELSE last_error_code END
      WHERE claimed_by IS NULL
        AND state IN ('resolving','needs_enrollment','quoting','awaiting_approval','processing')
@@ -2413,7 +2413,7 @@ _SCRUB_RECONCILING_PII_SQL = """
 _SCRUB_RECONCILING_PII_SQL_SQLITE = """
     UPDATE reap_agentic_purchases
        SET shipping_address=NULL, buyer_email=NULL, offer_code=NULL,
-           last_error_code=CASE WHEN state IN ('resolving','quoting')
+           last_error_code=CASE WHEN state IN ('resolving','needs_enrollment','quoting')
                                THEN 'contact_retention_elapsed' ELSE last_error_code END
      WHERE claimed_by IS NULL
        AND state IN ('resolving','needs_enrollment','quoting','awaiting_approval','processing')
@@ -2654,7 +2654,7 @@ async def count_checkout_needs_human() -> int:
 async def count_contact_retention_blocked() -> int:
     """Privacy-blocked work is preserved operator work, not ordinary retryable stuck work."""
     return int(await database.fetch_val(
-        "SELECT count(*) FROM reap_agentic_purchases WHERE state IN ('resolving','quoting') AND last_error_code='contact_retention_elapsed'"
+        "SELECT count(*) FROM reap_agentic_purchases WHERE state IN ('resolving','needs_enrollment','quoting') AND last_error_code='contact_retention_elapsed'"
     ) or 0)
 
 

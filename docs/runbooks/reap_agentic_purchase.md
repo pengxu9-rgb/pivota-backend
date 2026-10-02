@@ -1791,10 +1791,12 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4b_test
 ### Checkout reads requiring human reconciliation
 
 Three consecutive permanent-shaped reads (404, unknown checkout status or unsafe hosted URL)
-produce `checkout_unresolvable:<count>:<reason>` and a15-minute retry, capped at count99.
+produce `checkout_unresolvable:<count>:<reason>` and a 15-minute retry, capped at count99.
 This is an observation category, not evidence of payment failure. These rows remain recoverable
 and are counted in `checkout_needs_human`, separately from ordinary `stuck_over_age`; errors
 that are not explicitly classified still count as ordinary stuck work. A transient outage does
 not clear the human category; a valid provider waiting/processing/terminal outcome does.
 The report also exposes `contact_retention_blocked` for preserved precheckout work whose contact
 cap elapsed. Both figures need an operator review queue; no new cloud policy is provisioned here.
+
+The reconciliation stop is checked before every worker-scoped HTTP transport operation, including resolver search/details/variant subrequests. An already in-flight request may finish, but its successor must not start. Context is reset after each step; standalone client callers retain their existing contract. Privacy-expired `needs_enrollment` rows also hold without new provider preparation; stored enrollment evidence is retained for operator review.

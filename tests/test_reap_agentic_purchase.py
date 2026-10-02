@@ -4436,3 +4436,46 @@ async def test_hung_contact_diagnostic_does_not_hide_other_health(reap, monkeypa
     report=await asyncio.wait_for(job.run_reap_agentic_purchase_poll(worker_id='health-independence'),0.5)
     assert report.contact_retention_blocked==-1 and report.stuck_over_age==1
     assert report.errors==1 and report.checkout_needs_human==0
+
+async def test_stop_after_quote_prevents_next_checkout(reap, monkeypatch):
+    await _active_enrollment()
+    pid = await _start()
+    await _step(pid)
+    def stop_after_quote(**kwargs):
+        monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED', '0')
+        return _ok(QUOTE_200)
+    reap.request_quote = stop_after_quote
+    reap.calls.clear()
+    await _step(pid)
+    assert reap.sequence() == ['resolve_our_row', 'request_quote']
+    assert (await _get(pid))['state'] == 'quoting'
+
+async def test_contact_cap_needs_enrollment_cannot_resume_quote(reap):
+    from db.database import database, IS_POSTGRES
+    import db.reap_agentic_ledger as ledger
+    pid = await _start()
+    await _step(pid)
+    await ledger.release_claim(pid, 'w1')
+    assert (await _get(pid))['state'] == 'needs_enrollment'
+    old = "clock_timestamp() - INTERVAL '2 hours'" if IS_POSTGRES else "datetime('now','-2 hours')"
+    await database.execute(f"UPDATE reap_agentic_purchases SET created_at={old} WHERE id=:id", {'id':pid})
+    assert await ledger.scrub_reconciling_purchase_pii(max_age_seconds=900) == [pid]
+    reap.calls.clear()
+    await _step(pid)
+    await _step(pid)
+    assert reap.calls == []
+    assert (await _get(pid))['state'] == 'needs_enrollment'
+    assert await ledger.count_contact_retention_blocked() == 1
+
+async def test_worker_stop_guards_nested_real_client_transport(reap, monkeypatch):
+    import services.reap_agentic_client as rc
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','0')
+    from services.reap_agentic_purchase import is_reconciliation_enabled
+    token = rc.worker_provider_permission.set(is_reconciliation_enabled)
+    try:
+        for operation in (rc._post('/agentic/products/search', {'query':'fixture'}), rc._get('/agentic/checkouts/fixture')):
+            with pytest.raises(rc.ProviderOperationStopped):
+                await operation
+    finally:
+        rc.worker_provider_permission.reset(token)
+    assert rc.worker_provider_permission.get() is None
