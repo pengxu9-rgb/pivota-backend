@@ -397,6 +397,7 @@ class PollReport:
     processing_over_attempts: int = 0
     stuck_over_age: int = -1
     contact_retention_blocked: int = 0
+    checkout_needs_human: int = 0
     claimed: int = 0
     advanced: int = 0
     released: int = 0
@@ -409,6 +410,7 @@ class PollReport:
 
 
 _COUNTS = (
+    "checkout_needs_human",
     "contact_retention_blocked",
     "requeued",
     "expired",
@@ -675,6 +677,7 @@ async def run_reap_agentic_purchase_poll(
     async def _finish() -> PollReport:
         try:
             counts["contact_retention_blocked"] = await ledger.count_contact_retention_blocked()
+            counts["checkout_needs_human"] = await ledger.count_checkout_needs_human()
             counts["stuck_over_age"] = await asyncio.wait_for(
                 ledger.count_stuck_purchases(
                     stuck_after_seconds=STUCK_AFTER_SECONDS,

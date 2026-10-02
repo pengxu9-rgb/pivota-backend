@@ -1272,7 +1272,7 @@ async def test_an_unrecognised_checkout_status_never_advances(reap, attribution)
     await _step(purchase_id)
     result = await _step(purchase_id)
     assert result.outcome == "released"
-    assert result.last_error_code == "unknown_checkout_status"
+    assert result.last_error_code == "checkout_read_permanent:1:unknown_checkout_status"
     assert (await _get(purchase_id))["state"] == "awaiting_approval"
     assert attribution.calls == []
 
@@ -4372,3 +4372,35 @@ async def test_creation_privacy_cap_does_not_reset_and_resume_calls_no_provider(
     result = await svc.advance(pid, 'resume-no-contact')
     assert result.last_error_code == 'contact_retention_elapsed' and result.state == 'quoting'
     assert (await _get(pid))['attempts'] == 55 and reap.calls == []
+
+@pytest.mark.parametrize('reason', ['reap_status_404','hosted_url_not_allowed','unknown_checkout_status'])
+async def test_permanent_checkout_read_enters_human_review_without_terminalizing(reap, monkeypatch, reason):
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+    import services.reap_agentic_client as rc
+    pid = await _recovery_checkout()
+    if reason == 'unknown_checkout_status':
+        reap.get_checkout = _ok({'status':'UNRECOGNIZED'})
+    else:
+        reap.get_checkout = rc.ReapResponse(ok=False,status=404,error=reason)
+    for n in range(5):
+        await database.execute('UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id', {'id':pid})
+        report = await job.run_reap_agentic_purchase_poll(worker_id='permanent-'+str(n))
+    row = await _get(pid)
+    assert row['state'] == 'awaiting_approval'
+    assert row['last_error_code'].startswith('checkout_unresolvable:')
+    assert report.checkout_needs_human == 1 and report.stuck_over_age == 0
+    assert await ledger.fail_exhausted_purchases(1,include_processing=True) == []
+    from datetime import datetime,timezone
+    assert (row['next_poll_at']-datetime.now(timezone.utc)).total_seconds() >= 899
+    # A transient failure cannot silently remove the human-review classification.
+    reap.get_checkout = _transport()
+    await database.execute('UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id', {'id':pid})
+    await job.run_reap_agentic_purchase_poll(worker_id='human-outage')
+    assert (await _get(pid))['last_error_code'].startswith('checkout_unresolvable:')
+    # A valid provider waiting/processing outcome restores normal reconciliation.
+    reap.get_checkout = _ok({'status':'PROCESSING'})
+    await database.execute('UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id', {'id':pid})
+    report = await job.run_reap_agentic_purchase_poll(worker_id='provider-recovers')
+    assert (await _get(pid))['state'] == 'processing' and report.checkout_needs_human == 0

@@ -1638,7 +1638,7 @@ async def test_the_report_carries_only_integers(reap):
     fields = vars(report)
     assert set(fields) == {
         "requeued", "expired", "failed_exhausted", "processing_over_attempts",
-        "stuck_over_age", "contact_retention_blocked", "claimed", "advanced", "released", "abandoned_budget",
+        "stuck_over_age", "contact_retention_blocked", "checkout_needs_human", "claimed", "advanced", "released", "abandoned_budget",
         "lost_claim", "terminal", "errors", "skipped_disabled", "duration_ms",
     }
     assert all(isinstance(v, int) for v in fields.values())

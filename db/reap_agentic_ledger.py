@@ -174,6 +174,7 @@ __all__ = [
     "fail_exhausted_purchases",
     "count_stuck_purchases",
     "count_contact_retention_blocked",
+    "count_checkout_needs_human",
     "upsert_pending_enrollment",
     "PendingEnrollmentExpired",
     "EnrollmentIdConflict",
@@ -2625,6 +2626,29 @@ async def count_stuck_purchases(
             },
         )
     return int(row["stuck"]) if row is not None else 0
+
+
+_COUNT_CHECKOUT_NEEDS_HUMAN_SQL = """
+    SELECT count(*) AS n FROM reap_agentic_purchases
+     WHERE state IN ('awaiting_approval','processing') AND reap_checkout_id IS NOT NULL
+       AND substr(COALESCE(last_error_code,''),1,21)='checkout_unresolvable'
+       AND substr(last_error_code,22,1)=chr(58)
+"""
+_COUNT_CHECKOUT_NEEDS_HUMAN_SQL_SQLITE = """
+    SELECT count(*) AS n FROM reap_agentic_purchases
+     WHERE state IN ('awaiting_approval','processing') AND reap_checkout_id IS NOT NULL
+       AND substr(COALESCE(last_error_code,''),1,21)='checkout_unresolvable'
+       AND substr(last_error_code,22,1)=char(58)
+"""
+
+
+async def count_checkout_needs_human() -> int:
+    """Only explicitly classified unresolved reads; never general transport/refusal errors."""
+    if IS_POSTGRES:
+        row = await database.fetch_one(_COUNT_CHECKOUT_NEEDS_HUMAN_SQL)
+    else:
+        row = await database.fetch_one(_COUNT_CHECKOUT_NEEDS_HUMAN_SQL_SQLITE)
+    return int(row['n']) if row is not None else 0
 
 
 async def count_contact_retention_blocked() -> int:

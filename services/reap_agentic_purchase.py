@@ -3325,6 +3325,35 @@ async def _checkout_from_quote(
     )
 
 
+# A permanent-shaped read failure is not payment proof. Escalate observation, not outcome.
+PERMANENT_CHECKOUT_READ_ERRORS = frozenset({"reap_status_404", "hosted_url_not_allowed", "unknown_checkout_status"})
+PERMANENT_CHECKOUT_READ_LIMIT = 3
+CHECKOUT_HUMAN_RETRY_SECONDS = 900
+
+
+def _checkout_failure_count(code: Any) -> int:
+    parts = str(code or "").split(":", 2)
+    if len(parts) == 3 and parts[0] in {"checkout_read_permanent", "checkout_unresolvable"}:
+        try:
+            return min(max(int(parts[1]), 0), 99)
+        except ValueError:
+            pass
+    return 0
+
+
+async def _release_checkout_read_failure(row, worker_id, code):
+    previous = str(row.get("last_error_code") or "")
+    if code in PERMANENT_CHECKOUT_READ_ERRORS:
+        count = min(_checkout_failure_count(previous) + 1, 99)
+        prefix = "checkout_unresolvable" if count >= PERMANENT_CHECKOUT_READ_LIMIT else "checkout_read_permanent"
+        return await _release(row, worker_id, error_code=f"{prefix}:{count}:{code}",
+                              seconds=CHECKOUT_HUMAN_RETRY_SECONDS if prefix == "checkout_unresolvable" else None)
+    if previous.startswith("checkout_unresolvable:"):
+        # Only a valid provider outcome clears human review; an outage cannot hide it.
+        return await _release(row, worker_id, error_code=previous, seconds=CHECKOUT_HUMAN_RETRY_SECONDS)
+    return await _release(row, worker_id, error_code=code, transport=_is_transport(code))
+
+
 async def _step_checkout_poll(
     row: Mapping[str, Any], worker_id: str, from_state: str
 ) -> AdvanceResult:
@@ -3364,8 +3393,9 @@ async def _step_checkout_poll(
         # ledger's separate contact scrub bounds PII retention without terminating this
         # checkout. Local clocks/attempt counts never stand in for the provider outcome.
         code = str(read.error or "checkout_read_failed")
-        return await _release(row, worker_id, error_code=code, transport=_is_transport(code))
+        return await _release_checkout_read_failure(row, worker_id, code)
 
+    recovered_code = "checkout_read_recovered" if _checkout_failure_count(row.get("last_error_code")) else None
     state = rc.checkout_state(read.data)
     if state == "completed":
         return await _complete(row, worker_id, from_state, read.data)
@@ -3386,12 +3416,12 @@ async def _step_checkout_poll(
         )
     if state == "processing":
         if from_state == "processing":
-            return await _release(row, worker_id, error_code=None)
-        return await _move(row, worker_id, [from_state], "processing")
+            return await _release(row, worker_id, error_code=recovered_code)
+        return await _move(row, worker_id, [from_state], "processing", last_error_code=recovered_code)
     if state == "awaiting_buyer":
-        return await _release(row, worker_id, error_code=None)
+        return await _release(row, worker_id, error_code=recovered_code)
     # unknown — never advances, in either state.
-    return await _release(row, worker_id, error_code="unknown_checkout_status")
+    return await _release_checkout_read_failure(row, worker_id, "unknown_checkout_status")
 
 
 #: `last_error_code` for a Reap FAILED that landed on an approval the buyer simply did not give in
