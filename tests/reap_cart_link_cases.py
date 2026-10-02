@@ -1276,14 +1276,23 @@ async def test_a_503_on_the_quote_refuses_as_not_completable(reap, attribution):
 
 
 @pytest.mark.parametrize(
-    "env,value", [("REAP_AGENTIC_CART_LINK_ENABLED", "0"), ("REAP_AGENTIC_ENABLED", "ture")]
+    "env,value", [("REAP_AGENTIC_CART_LINK_ENABLED", "0"), ("REAP_AGENTIC_ENABLED", "ture"),
+                  ("REAP_AGENTIC_CREATE_ENABLED", "0"), ("REAP_AGENTIC_CREATE_ENABLED", "ture")]
 )
-async def test_a_dial_turned_off_refuses_a_resolving_row(reap, attribution, monkeypatch, env, value):
+async def test_lane_disable_refuses_but_master_or_create_pause_retains_a_resolving_row(reap, attribution, monkeypatch, env, value):
     purchase_id = await start()
     monkeypatch.setenv(env, value)
     moved = await step(purchase_id)
-    assert moved.state == "refused" and moved.refusal_reason == "cart_link_disabled"
-    assert (await get(purchase_id))["buyer_email"] is None
+    stored = await get(purchase_id)
+    if env == "REAP_AGENTIC_CART_LINK_ENABLED":
+        assert moved.state == "refused" and moved.refusal_reason == "cart_link_disabled"
+        assert stored["buyer_email"] is None
+    else:
+        assert moved.outcome == "released" and moved.state == "resolving"
+        assert stored["last_error_code"] == "create_disabled"
+        assert stored["buyer_email"] is not None
+        assert stored["claimed_by"] is None
+        assert stored["next_poll_at"] is not None
     assert reap.calls == []
 
 
@@ -1297,13 +1306,16 @@ async def test_a_dial_turned_off_refuses_a_quoting_row_before_any_quote(
     assert reap.named("request_cart_link_quote") == []
 
 
+@pytest.mark.parametrize("env,value", [("REAP_AGENTIC_CART_LINK_ENABLED", "0"),
+    ("REAP_AGENTIC_ENABLED", "0"), ("REAP_AGENTIC_CREATE_ENABLED", "0"),
+    ("REAP_AGENTIC_PILOT_SCOPE", "malformed")])
 async def test_a_dial_turned_off_after_the_checkout_exists_never_abandons_it(
-    reap, attribution, monkeypatch
+    reap, attribution, monkeypatch, env, value
 ):
     """The buyer may have approved. Polling continues and the purchase completes."""
     purchase_id = await to_quoting(reap)
     assert (await step(purchase_id)).state == "awaiting_approval"
-    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "0")
+    monkeypatch.setenv(env, value)
     assert (await step(purchase_id)).state == "completed"
     assert len(attribution.calls) == 1
 
