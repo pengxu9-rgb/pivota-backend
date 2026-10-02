@@ -621,7 +621,8 @@ reported at least once more.
 5. **Separate channel API state from actual delivery.** The script reads and validates the exact
    enabled email channel after both create and reuse. Failed, missing, malformed or error responses,
    mismatched resources/recipients and disabled channels stop the run before policy reconciliation.
-   Explicit `UNVERIFIED` requires verification and makes the run fail. An omitted status or
+   Explicit `UNVERIFIED` requires verification and stops the run before uptime, metric or policy
+   reconciliation. An omitted status or
    `VERIFICATION_STATUS_UNSPECIFIED` can mean verification is not required; it is not evidence of
    delivery failure or receipt. [Google's channel API contract](https://docs.cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.notificationChannels)
    distinguishes these states. Before marking delivery ready, use an authorized, isolated controlled

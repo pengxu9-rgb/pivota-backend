@@ -148,11 +148,11 @@ if status not in ("VERIFIED", "UNVERIFIED", "VERIFICATION_STATUS_UNSPECIFIED"):
     sys.exit("FAILED: notification channel verification state is invalid or unsupported.")
 print(status)
 ' "$CHANNEL" "$ALERT_EMAIL" <<<"$CHANNEL_RESPONSE")"
-CHANNEL_UNDELIVERABLE=0
 if [ "$CHANNEL_VERIFIED" = UNVERIFIED ]; then
-  CHANNEL_UNDELIVERABLE=1
   echo "   WARNING: channel is UNVERIFIED and requires verification before it can function." >&2
   echo "   Complete the channel verification process, then confirm actual alert receipt." >&2
+  echo "FAILED: notification channel cannot receive alerts; no policy reconciliation was performed." >&2
+  exit 1
 elif [ "$CHANNEL_VERIFIED" = VERIFICATION_STATUS_UNSPECIFIED ]; then
   echo "   Channel verification status is omitted/UNSPECIFIED; verification may not be required."
 fi
@@ -656,22 +656,10 @@ d = json.load(sys.stdin)
 print("uptime  :", len(d.get("uptimeCheckConfigs", [])))
 '
 
-# Said BEFORE the channel check below, which may exit first; acted on after it.
 if [ -n "$NEW_METRIC_DEFERRED" ]; then
   echo "NOT CREATED: $NEW_METRIC_DEFERRED" >&2
   echo "This run created their log metrics and Monitoring could not see them yet. Every other" >&2
   echo "policy above was written. Re-run this script in 10 minutes, with the same ALERT_EMAIL." >&2
-fi
-
-# A warning on stderr is only a result if a human is standing there to read it.
-# This script is exactly the kind of thing that gets wrapped in CI or a runbook
-# step, and an undeliverable channel means every policy above is decoration — so
-# say it with the exit code too. Deliberately LAST: the policies are still
-# created and reported first, because a half-configured project is worse than a
-# fully configured one that reports a problem.
-if [ "${CHANNEL_UNDELIVERABLE:-0}" = 1 ]; then
-  echo "FAILED: alerts are configured but the channel cannot receive them." >&2
-  exit 1
 fi
 
 if [ -n "$NEW_METRIC_DEFERRED" ]; then

@@ -115,8 +115,10 @@ def test_an_unverified_channel_is_surfaced(source: str) -> None:
     # it teaches the operator to skip the one line that matters.
     assert '${CHANNEL#projects/*/}' in body
     assert '${CHANNEL##projects/*/}' not in body
-    # An undeliverable channel must fail the run, not just print to stderr.
-    assert "CHANNEL_UNDELIVERABLE" in body and "exit 1" in body
+    # A nonfunctioning channel must fail BEFORE any policy/metric/uptime writes.
+    unverified = body.split('if [ "$CHANNEL_VERIFIED" = UNVERIFIED ]; then', 1)[1]
+    assert "exit 1" in unverified.split("elif", 1)[0]
+    assert body.index('if [ "$CHANNEL_VERIFIED" = UNVERIFIED ]; then') < body.index('UP="$(api GET uptimeCheckConfigs)"')
 
 
 def test_the_lb_5xx_threshold_is_reachable_at_real_traffic(source: str) -> None:

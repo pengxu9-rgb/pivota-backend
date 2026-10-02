@@ -1062,13 +1062,12 @@ def test_the_script_wires_the_first_run_safely(source):
     # Ten minutes by default, shared: 20 tries of 30 s.
     assert 'NEW_METRIC_TRIES="${NEW_METRIC_TRIES:-20}"' in body
     assert 'NEW_METRIC_RETRY_SECONDS="${NEW_METRIC_RETRY_SECONDS:-30}"' in body
-    # A deferral is said out loud and fails the run — after the summary, and without stepping in
-    # front of the channel check, which must still be able to exit first.
+    # Channel validation fails before any cloud reconciliation. A new-metric deferral
+    # is said out loud after the summary, then fails the run without losing prior policies.
     said = body.index('echo "NOT CREATED: $NEW_METRIC_DEFERRED"')
-    channel = body.index('if [ "${CHANNEL_UNDELIVERABLE:-0}" = 1 ]; then')
-    assert body.index('print("policies:", len(ps))') < said < channel
-    tail = body[channel:]
-    assert re.search(r'if \[ -n "\$NEW_METRIC_DEFERRED" \]; then\n  exit 1\nfi\s*$', tail)
+    channel = body.index('if [ "$CHANNEL_VERIFIED" = UNVERIFIED ]; then')
+    assert channel < first_policy < body.index('print("policies:", len(ps))') < said
+    assert re.search(r'if \[ -n "\$NEW_METRIC_DEFERRED" \]; then\n  exit 1\nfi\s*$', body[said:])
 
 
 # ── replies that used to be read as good news ────────────────────────────────────────────────

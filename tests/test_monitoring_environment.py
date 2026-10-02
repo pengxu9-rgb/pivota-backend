@@ -119,9 +119,16 @@ def test_explicit_unverified_email_channel_fails_and_requires_receipt(tmp_path, 
     assert proc.returncode != 0
     assert "UNVERIFIED and requires verification" in proc.stderr
     assert "confirm actual alert receipt" in proc.stderr
-    assert "FAILED: alerts are configured but the channel cannot receive them" in proc.stderr
+    assert "no policy reconciliation was performed" in proc.stderr
     assert len(state["notificationChannels"]) == 1
     assert not any("VerificationCode" in c["path"] for c in state["calls"])
+    read_index = next(i for i, c in enumerate(state["calls"])
+                      if c["method"] == "GET" and c["path"].startswith("notificationChannels/"))
+    assert not any(c["method"] in {"POST", "PATCH", "DELETE"}
+                   for c in state["calls"][read_index + 1:])
+    assert not state.get("alertPolicies")
+    assert not state.get("uptimeCheckConfigs")
+    assert not any(args[:2] == ["logging", "metrics"] for args in state["gcloud"])
 
 
 @pytest.mark.parametrize("channel_existing", [False, True], ids=["create", "reuse"])
