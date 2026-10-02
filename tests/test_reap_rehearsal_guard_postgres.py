@@ -50,6 +50,26 @@ def test_runtime_role_and_baseline(fixture_config):
     "sql,undo,reason",
     [
         (
+            "GRANT CONNECT ON DATABASE postgres TO PUBLIC",
+            "REVOKE CONNECT ON DATABASE postgres FROM PUBLIC",
+            "other_database_access",
+        ),
+        (
+            "GRANT CONNECT ON DATABASE postgres TO " + g.TARGET.runtime,
+            "REVOKE CONNECT ON DATABASE postgres FROM " + g.TARGET.runtime,
+            "other_database_access",
+        ),
+        (
+            "GRANT UPDATE(title) ON catalog_products TO " + g.TARGET.runtime,
+            "REVOKE UPDATE(title) ON catalog_products FROM " + g.TARGET.runtime,
+            "runtime_acl_admin",
+        ),
+        (
+            "GRANT SELECT(title) ON catalog_products TO " + g.TARGET.runtime + " WITH GRANT OPTION",
+            "REVOKE SELECT(title) ON catalog_products FROM " + g.TARGET.runtime,
+            "runtime_acl_admin",
+        ),
+        (
             "GRANT CREATE ON DATABASE " + g.TARGET.database + " TO " + g.TARGET.runtime,
             "REVOKE CREATE ON DATABASE " + g.TARGET.database + " FROM " + g.TARGET.runtime,
             "runtime_ddl_privileges",

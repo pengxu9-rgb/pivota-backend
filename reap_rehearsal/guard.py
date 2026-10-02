@@ -217,6 +217,10 @@ async def validate_connection(conn, mode, target=TARGET):
             reject("migration_ddl_privileges")
     elif row["db_create"] or row["db_temp"] or row["schema_create"] or not row["schema_usage"]:
         reject("runtime_ddl_privileges")
+    if await conn.fetchval(
+        "SELECT count(*) FROM pg_database WHERE datallowconn AND datname<>current_database() AND has_database_privilege(current_user,oid,'CONNECT')"
+    ):
+        reject("other_database_access")
     schemas = await conn.fetch(
         "SELECT nspname FROM pg_namespace WHERE nspname NOT LIKE 'pg_%' AND nspname NOT IN ('public','information_schema')"
     )
@@ -314,6 +318,12 @@ async def validate_runtime_acls(conn):
         WHERE n.nspname='public' AND c.relkind IN ('r','S')
         AND (a.grantee=0 OR a.grantee=(SELECT oid FROM pg_roles WHERE rolname=current_user))""")
     validate_acl_entries(entries)
+    column_entries = await conn.fetch("""SELECT c.relname,c.relkind::text AS relkind,a.privilege_type,a.is_grantable
+        FROM pg_attribute attribute JOIN pg_class c ON c.oid=attribute.attrelid
+        JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(attribute.attacl) a
+        WHERE n.nspname='public' AND (a.grantee=0 OR a.grantee=(SELECT oid FROM pg_roles WHERE rolname=current_user))""")
+    # Per-column grants can bypass an otherwise read-only table ACL.
+    validate_acl_entries(column_entries)
 
 
 async def validate_catalog_columns(conn):
