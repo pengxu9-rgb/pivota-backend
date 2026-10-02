@@ -4336,7 +4336,7 @@ async def test_enrollment_deadline_legacy_owner_view_uses_originating_attempt_wi
     assert (await _get(purchase_id))["hosted_url_expires_at"] is None
 
 
-@pytest.mark.parametrize("bad", ["expired", "wrong_buyer", "wrong_id", "wrong_link", "unavailable", "malformed_clock"])
+@pytest.mark.parametrize("bad", ["expired", "wrong_buyer", "wrong_id", "wrong_link", "unavailable", "malformed_clock", "dead", "active"])
 async def test_enrollment_deadline_legacy_fails_closed_when_provenance_cannot_support_link(reap, monkeypatch, bad):
     from db.database import database, IS_POSTGRES
     import db.reap_agentic_ledger as ledger
@@ -4353,6 +4353,7 @@ async def test_enrollment_deadline_legacy_fails_closed_when_provenance_cannot_su
         if bad == "wrong_id": original["id"] = "some-other-attempt"
         if bad == "wrong_link": original["hosted_url"] = "https://pay.prava.space/enroll/some-other-link"
         if bad == "malformed_clock": original["created_at"] = "not-a-timestamp"
+        if bad in {"dead", "active"}: original["status"] = bad
         async def record(*args): return None if bad == "unavailable" else original
         monkeypatch.setattr(ledger, "get_enrollment_internal", record)
     for _ in range(2):

@@ -2454,7 +2454,8 @@ async def _owner_view(
                 enrollment = await ledger.get_enrollment_internal(enrollment_id)
             except Exception:  # Lookup unavailable: never emit a link with an invented deadline.
                 enrollment = None
-        if (enrollment and str(enrollment.get("id")) == enrollment_id
+        if (enrollment and enrollment.get("status") == "pending"
+                and str(enrollment.get("id")) == enrollment_id
                 and enrollment.get("buyer_ref") == row.get("buyer_ref")
                 and enrollment.get("hosted_url") == row.get("hosted_url")):
             deadline = svc._effective_expiry(
