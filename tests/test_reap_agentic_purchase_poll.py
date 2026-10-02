@@ -2160,3 +2160,56 @@ async def test_the_job_reads_the_grace_dial_from_the_state_machine(monkeypatch, 
     assert seen and set(seen) == {0}
     assert report.expired == 1
     assert (await _get(purchase_id))["state"] == "expired"
+
+
+@pytest.mark.parametrize("pause", ["off", "malformed_scope"])
+@pytest.mark.parametrize("queued_state", ["resolving", "needs_enrollment", "quoting"])
+async def test_create_pause_keeps_precheckout_queued_and_reconciles_exposed_checkout(monkeypatch, reap, pause, queued_state):
+    import db.reap_agentic_ledger as ledger
+    queued = await _start(buyer_ref="bref_queue_pause")
+    await _raw("UPDATE reap_agentic_purchases SET state=:state WHERE id=:id", {"state": queued_state, "id": queued})
+    exposed = await _start(buyer_ref="bref_checkout_pause")
+    await _raw("UPDATE reap_agentic_purchases SET state='awaiting_approval', reap_checkout_id='chk_paused', next_poll_at=:due WHERE id=:id",
+               {"id": exposed, "due": datetime.now(timezone.utc) - timedelta(seconds=1)})
+    if pause == "off":
+        monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "0")
+    else:
+        monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", "malformed")
+    report = await _run()
+    assert report.skipped_disabled == 1
+    assert (await ledger.get_purchase_internal(queued))["state"] == queued_state
+    assert (await ledger.get_purchase_internal(queued))["attempts"] == 0
+    assert (await ledger.get_purchase_internal(exposed))["state"] == "completed"
+    assert [name for name, _ in reap.calls] == ["get_checkout"]
+
+
+@pytest.mark.parametrize("queued_state", ["resolving", "needs_enrollment", "quoting"])
+async def test_narrowed_pilot_scope_prevents_queued_provider_work_but_reads_exposed_checkout(monkeypatch, reap, queued_state):
+    import json
+    import db.reap_agentic_ledger as ledger
+    queued = await _start(buyer_ref="bref_queue_scope")
+    exposed = await _start(buyer_ref="bref_checkout_scope")
+    await _raw("UPDATE reap_agentic_purchases SET state=:state WHERE id=:id", {"state": queued_state, "id": queued})
+    await _raw("UPDATE reap_agentic_purchases SET state='awaiting_approval', reap_checkout_id='chk_scope', next_poll_at=:due WHERE id=:id",
+               {"id": exposed, "due": datetime.now(timezone.utc) - timedelta(seconds=1)})
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps({
+        "agent_ids": ["different-agent"], "merchant_domains": ["brand.example"], "markets": ["US"],
+        "product_keys": ["pk_1"], "quantities": [1]}))
+    await _run()
+    pending = await ledger.get_purchase_internal(queued)
+    assert pending["state"] == queued_state
+    assert pending["last_error_code"] == "pilot_scope_refused"
+    assert (await ledger.get_purchase_internal(exposed))["state"] == "completed"
+    assert [name for name, _ in reap.calls] == ["get_checkout"]
+
+
+async def test_matching_pilot_scope_allows_queued_provider_progress(monkeypatch, reap):
+    import json
+    import db.reap_agentic_ledger as ledger
+    purchase = await _start()
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps({
+        "agent_ids": ["agent_one"], "merchant_domains": ["brand.example"], "markets": ["US"],
+        "product_keys": ["pk_1"], "quantities": [1]}))
+    await _run()
+    assert (await ledger.get_purchase_internal(purchase))["state"] == "needs_enrollment"
+    assert "create_enrollment" in [name for name, _ in reap.calls]

@@ -750,7 +750,7 @@ async def run_reap_agentic_purchase_poll(
     #
     # Keep checkout GET/reconciliation alive when new purchase work is disarmed.
     # Removing credentials pauses reads but never disables the contact-retention sweeps.
-    reconciliation_only = not purchase_svc.is_enabled()
+    reconciliation_only = not purchase_svc.is_create_enabled()
     if reconciliation_only:
         counts["skipped_disabled"] = 1  # Creation/enrollment steps skipped; checkout reads continue.
     if not rc.is_configured():
