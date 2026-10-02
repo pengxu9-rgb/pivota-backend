@@ -454,8 +454,8 @@ async def test_a_bad_dial_reaches_the_failing_metric_once(filters, monkeypatch, 
 # ── a DARK environment prints nothing these metrics can count ────────────────────────────────
 
 
-async def test_an_unconfigured_rail_feeds_none_of_the_three_metrics(filters, monkeypatch, reap):
-    """Missing credentials block provider reads; PII logs are allowed and no metric hits."""
+async def test_an_unconfigured_rail_reports_maintenance_and_exposed_stuck(filters, monkeypatch, reap):
+    """Missing credentials block provider reads; retention and exposed diagnostic heartbeat remain."""
     await _start(buyer_ref="bref_live")
     old = await _start(buyer_ref="bref_old")
     await _park(old, "processing", 99999, reap_checkout_id="chk_dark")
@@ -467,7 +467,7 @@ async def test_an_unconfigured_rail_feeds_none_of_the_three_metrics(filters, mon
             assert report.skipped_disabled == 1
 
     assert reap.calls == [], "an unconfigured client reached the provider"
-    assert _counts(filters, lines) == dict.fromkeys(METRICS, 0)
+    assert _counts(filters, lines) == {"reap_agentic_poll_report":3,"reap_agentic_poll_stuck":3,"reap_agentic_poll_failing":0}
 
 
 @pytest.mark.parametrize("how", ["unset", "off"])
@@ -510,7 +510,7 @@ async def test_an_armed_staging_pointed_at_a_real_host_is_failing_not_silent(
         await _run()
         await _run()
     assert _counts(filters, lines) == {
-        "reap_agentic_poll_report": 0,
+        "reap_agentic_poll_report": 2,
         "reap_agentic_poll_stuck": 0,
         "reap_agentic_poll_failing": 1,
     }, lines

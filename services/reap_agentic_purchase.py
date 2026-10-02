@@ -143,6 +143,7 @@ __all__ = [
     "enrollment_grace_seconds",
     "is_cart_link_enabled",
     "is_enabled",
+    "is_reconciliation_enabled",
     "start_purchase",
     "transport_backoff_seconds",
     "verify_cart_link_quote",
@@ -1860,6 +1861,11 @@ async def _start_cart_link_purchase(
 # ── advance ──────────────────────────────────────────────────────────────────────────────────
 
 
+def is_reconciliation_enabled() -> bool:
+    """Independent provider-I/O stop; privacy maintenance does not depend on it."""
+    return os.getenv("REAP_AGENTIC_RECONCILE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _next_poll_for(to_state: str) -> datetime:
     """When to look at a row we JUST MOVED.
 
@@ -2095,6 +2101,11 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
         # No partner call, no write. A terminal row is done, and a poller that reached one has a
         # bug worth not compounding.
         return AdvanceResult(str(row["id"]), outcome="terminal", state=state)
+    if not is_reconciliation_enabled():
+        return await _release(row, worker_id, error_code="reconciliation_disabled")
+    if state in {"resolving", "quoting"} and row.get("last_error_code") == "contact_retention_elapsed":
+        # Privacy expiry never invents a payment outcome or permits a new provider operation.
+        return await _release(row, worker_id, error_code="contact_retention_elapsed")
     handler = _STEPS.get(state)
     if handler is None:  # pragma: no cover — every non-terminal state has a step
         raise RuntimeError(f"no step for purchase state {state!r}")

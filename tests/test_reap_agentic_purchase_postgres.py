@@ -1984,7 +1984,7 @@ async def test_recovery_sweep_during_provider_read_preserves_claim_and_one_conve
     try:
         assert await ledger.expire_overdue_purchases() == []
         assert await ledger.fail_exhausted_purchases(50) == []
-        assert await ledger.scrub_reconciling_purchase_pii() == [purchase_id]
+        assert await ledger.scrub_reconciling_purchase_pii() == []
         assert (await _get(purchase_id))["claimed_by"] == "reader"
     finally:
         resume.set()
@@ -2006,3 +2006,87 @@ async def test_recovery_partial_claim_cancellation_releases_lease(reap, monkeypa
     with pytest.raises(asyncio.CancelledError):
         await job.run_reap_agentic_purchase_poll(worker_id="cancelled-claim")
     assert (await _get(purchase_id))["claimed_by"] is None
+
+# Independent stop, privacy and partial-acquisition regressions (#2490 follow-up).
+async def test_reconciliation_stop_blocks_provider_but_keeps_privacy(reap, monkeypatch):
+    import jobs.reap_agentic_purchase_poll as job
+    purchase_id = await _recovery_checkout()
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED', '0')
+    reap.calls.clear()
+    report = await job.run_reap_agentic_purchase_poll(worker_id='stop-all-provider')
+    assert report.claimed == 0 and reap.calls == []
+    row = await _get(purchase_id)
+    assert row['state'] == 'awaiting_approval' and row['buyer_email'] is None
+
+async def test_contact_scrub_uses_expired_link_before_max_age(reap):
+    from db.database import database, IS_POSTGRES
+    import db.reap_agentic_ledger as ledger
+    await _active_enrollment()
+    pid = await _start()
+    await _step(pid)
+    await _step(pid)
+    old = "clock_timestamp() - INTERVAL '20 minutes'" if IS_POSTGRES else "datetime('now','-20 minutes')"
+    await database.execute(f'UPDATE reap_agentic_purchases SET hosted_url_expires_at={old} WHERE id=:id', {'id':pid})
+    assert await ledger.scrub_reconciling_purchase_pii(max_age_seconds=3600) == []
+    await ledger.release_claim(pid, 'w1')
+    assert await ledger.scrub_reconciling_purchase_pii(max_age_seconds=3600) == [pid]
+    assert (await _get(pid))['state'] == 'awaiting_approval'
+
+async def test_paused_precheckout_rows_do_not_feed_stuck_count(reap, monkeypatch):
+    from db.database import database, IS_POSTGRES
+    import jobs.reap_agentic_purchase_poll as job
+    for state in ('resolving','quoting'):
+        pid = await _start(buyer_ref='paused_'+state)
+        old = "clock_timestamp() - INTERVAL '3 days'" if IS_POSTGRES else "datetime('now','-3 days')"
+        await database.execute(f'UPDATE reap_agentic_purchases SET state=:state,state_entered_at={old} WHERE id=:id', {'state':state,'id':pid})
+    monkeypatch.setenv('REAP_AGENTIC_ENABLED', '0')
+    reap.calls.clear()
+    report = await job.run_reap_agentic_purchase_poll(worker_id='paused-precheckout')
+    assert report.claimed == 0 and report.stuck_over_age == 0 and reap.calls == []
+
+async def test_missing_credentials_still_counts_exposed_stuck(reap, monkeypatch):
+    import jobs.reap_agentic_purchase_poll as job
+    await _recovery_checkout()
+    monkeypatch.delenv('REAP_API_KEY', raising=False)
+    reap.calls.clear()
+    report = await job.run_reap_agentic_purchase_poll(worker_id='no-credentials')
+    assert report.claimed == 0 and report.stuck_over_age == 1 and reap.calls == []
+
+async def test_partial_acquisition_cancellation_releases_first_lease(reap, monkeypatch):
+    import asyncio
+    from db.database import database, IS_POSTGRES
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+    for n in range(2): await _start(buyer_ref='partial_'+str(n))
+    real = database.fetch_one
+    seen = 0
+    sql = ledger._CLAIM_PURCHASE_SQL if IS_POSTGRES else ledger._CLAIM_PURCHASE_SQL_SQLITE
+    async def cancel_second(query, *args, **kwargs):
+        nonlocal seen
+        if query == sql:
+            seen += 1
+            if seen == 2: raise asyncio.CancelledError()
+        return await real(query, *args, **kwargs)
+    monkeypatch.setattr(database, 'fetch_one', cancel_second)
+    with pytest.raises(asyncio.CancelledError):
+        await job.run_reap_agentic_purchase_poll(worker_id='partial-real-loop')
+    assert seen == 2
+    rows = await database.fetch_all('SELECT claimed_by FROM reap_agentic_purchases')
+    assert all(row['claimed_by'] is None for row in rows)
+
+async def test_creation_privacy_cap_does_not_reset_and_resume_calls_no_provider(reap, monkeypatch):
+    from db.database import database, IS_POSTGRES
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_purchase as svc
+    old = "clock_timestamp() - INTERVAL '2 hours'" if IS_POSTGRES else "datetime('now','-2 hours')"
+    pid = await _start()
+    await database.execute(f"UPDATE reap_agentic_purchases SET state='quoting',created_at={old},attempts=55 WHERE id=:id", {'id':pid})
+    assert await ledger.scrub_reconciling_purchase_pii(max_age_seconds=900) == [pid]
+    row = await _get(pid)
+    assert row['state'] == 'quoting' and row['last_error_code'] == 'contact_retention_elapsed'
+    assert await ledger.fail_exhausted_purchases(50) == []
+    reap.calls.clear()
+    await _claim(pid, 'resume-no-contact')
+    result = await svc.advance(pid, 'resume-no-contact')
+    assert result.last_error_code == 'contact_retention_elapsed' and result.state == 'quoting'
+    assert (await _get(pid))['attempts'] == 55 and reap.calls == []

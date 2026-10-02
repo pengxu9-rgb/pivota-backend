@@ -3984,7 +3984,7 @@ async def test_the_stuck_count_can_be_served_by_the_state_poll_index():
     for n in range(5):
         await _mk(buyer_ref=f"bref_{n}")
     positional, order = _to_positional(ledger._COUNT_STUCK_PURCHASES_SQL)
-    params = {"stuck_seconds": 1800, "stuck_grace_seconds": 1980, "stuck_max_age_seconds": 5400}
+    params = {"reconciliation_only": 0, "stuck_seconds": 1800, "stuck_grace_seconds": 1980, "stuck_max_age_seconds": 5400}
     conn = await _raw_connection()
     try:
         async with conn.transaction():
