@@ -681,16 +681,17 @@ async def run_reap_agentic_purchase_poll(
             except Exception as exc:
                 counts[name] = NOT_COUNTED
                 counts["errors"] += 1
-                logger.error("reap_agentic_poll: could not count %s (error_type=%s); not counted", name, type(exc).__name__)
-        await _diagnostic("contact_retention_blocked", ledger.count_contact_retention_blocked())
-        await _diagnostic("checkout_needs_human", ledger.count_checkout_needs_human())
-        await _diagnostic("stuck_over_age", ledger.count_stuck_purchases(
+                logger.error("reap_agentic_poll: could not count %s (error_type=%s); not counted", "stuck purchases" if name == "stuck_over_age" else name, type(exc).__name__)
+        await asyncio.gather(
+            _diagnostic("contact_retention_blocked", ledger.count_contact_retention_blocked()),
+            _diagnostic("checkout_needs_human", ledger.count_checkout_needs_human()),
+            _diagnostic("stuck_over_age", ledger.count_stuck_purchases(
             stuck_after_seconds=STUCK_AFTER_SECONDS,
             reconciliation_only=(not _precheckout_enabled() or not purchase_svc.is_reconciliation_enabled()
                                  or not rc.is_configured() or (not is_production() and not rc.is_sandbox_base_url())),
             max_age_seconds=hosted_max_age,
             enrollment_grace_seconds=enrollment_grace,
-        ))
+        )))
 
         report = _report()
         # THE PROOF LINE: `[ts] INFO - reap_agentic_poll: PollReport(...)` on the worker's stdout.

@@ -252,7 +252,7 @@ upsert_log_metric retailer_ingest_drain_failed \
 #
 #   REPORT   every report line. A report is printed by every completed maintenance tick, including missing
 #            credentials and disabled provider reads. This is job/retention heartbeat, not arming. It is the input of the "went silent" policy below, not an alert itself.
-#   STUCK    a report whose `stuck_over_age` is >= 1. A STANDING condition: every armed tick
+#   STUCK    a report whose `stuck_over_age` is >= 1. A STANDING condition: every completed maintenance tick
 #            repeats it until the purchase moves. `[1-9]` cannot match `stuck_over_age=0`, nor the
 #            `stuck_over_age=-1` the job prints when the count could not be taken - that tick is
 #            FAILING's (errors=1), not a claim that nothing is stuck.

@@ -63,6 +63,7 @@ pytestmark = pytest.mark.skipif(
 #: quiet version of that.
 _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "db/migrations"
 _MIGRATIONS = (
+    _MIGRATIONS_DIR / "253_reap_checkout_manual_resolution_audit.sql",
     _MIGRATIONS_DIR / "224_reap_agentic_ledger.sql",
     _MIGRATIONS_DIR / "225_reap_agentic_purchase_hints.sql",
     # 229 adds item_source + cart_url (the cart-link lane). Without it the whole-table parity
@@ -228,6 +229,7 @@ async def _db():
         await database.connect()
     # Drop FIRST, so a constraint deleted from the migration cannot survive via IF NOT EXISTS
     # and leave this gate testing a schema the repo no longer declares.
+    await database.execute("DROP TABLE IF EXISTS reap_checkout_manual_resolution_audit")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_enrollments")
     await _apply_migration()
@@ -395,7 +397,7 @@ class Attribution:
         self.calls.append(kwargs)
         if self.raises is not None:
             raise self.raises
-        return {"id": "edge_1"}
+        return {"id": "edge_1", "edge_id": "edge_1"}
 
 
 @pytest.fixture(autouse=True)
@@ -2197,3 +2199,202 @@ async def test_worker_stop_guards_nested_real_client_transport(reap, monkeypatch
     finally:
         rc.worker_provider_permission.reset(token)
     assert rc.worker_provider_permission.get() is None
+
+async def _manual_case(status='COMPLETED', state='awaiting_approval'):
+    from datetime import datetime,timezone
+    from db.database import database
+    pid=await _recovery_checkout()
+    await database.execute("UPDATE reap_agentic_purchases SET state=:state,last_error_code='checkout_unresolvable:3:reap_status_404' WHERE id=:id",{'id':pid,'state':state})
+    row=await _get(pid)
+    evidence={'source':'authenticated_reap_checkout_read','authoritative_verified':True,'reference':'support_case_synthetic_1','observed_at':datetime.now(timezone.utc),'provider_base_url':'https://sandbox.api.reap.global','payload':dict(CHECKOUT_COMPLETED,status=status,id=row['reap_checkout_id'])}
+    return pid,row,evidence
+
+async def test_manual_preview_and_exact_replay_are_read_only(reap,attribution):
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    from db.database import database
+    pid,row,evidence=await _manual_case()
+    reap.calls.clear();attribution.calls.clear()
+    args=dict(evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'])
+    preview=await resolve_checkout_manually(pid,**args)
+    assert preview['status']=='eligible' and await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    assert reap.calls==[] and attribution.calls==[]
+    result=await resolve_checkout_manually(pid,**args,dry_run=False)
+    assert result['state']=='completed' and len(attribution.calls)==1
+    terminal=await _get(pid)
+    assert terminal['buyer_email'] is None and terminal['shipping_address'] is None and terminal['claimed_by'] is None
+    assert terminal['consent_version']==row['consent_version'] and terminal['consented_at']==row['consented_at']
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==1
+    replay=await resolve_checkout_manually(pid,**args,dry_run=False)
+    assert replay['status']=='already_resolved' and await _get(pid)==terminal
+    assert len(attribution.calls)==1 and reap.calls==[]
+
+@pytest.mark.parametrize('defect',['unverified','checkout','status','amount','currency','order','old','future','claimed','stale','origin_absent','origin_other'])
+async def test_manual_refuses_unverified_or_unfenced_outcomes(reap,attribution,defect):
+    from datetime import timedelta
+    from db.database import database
+    from services.reap_checkout_recovery import resolve_checkout_manually,ManualResolutionRefused
+    pid,row,evidence=await _manual_case()
+    expected=row['updated_at']
+    if defect=='unverified':evidence['authoritative_verified']=False
+    elif defect=='checkout':evidence['payload']['id']='another_checkout'
+    elif defect=='status':evidence['payload']['status']='PROCESSING'
+    elif defect=='amount':evidence['payload']['finalAmount']={'amount':100,'currency':'USD'}
+    elif defect=='currency':evidence['payload']['finalAmount']={'amount':45,'currency':'SGD'}
+    elif defect=='order':evidence['payload']['orderId']=True
+    elif defect=='old':evidence['observed_at']-=timedelta(days=2)
+    elif defect=='future':evidence['observed_at']+=timedelta(minutes=1)
+    elif defect=='claimed':await _claim(pid,'actual_worker')
+    elif defect=='stale':expected-=timedelta(seconds=1)
+    elif defect=='origin_absent':evidence.pop('provider_base_url')
+    elif defect=='origin_other':evidence['provider_base_url']='https://api.reap.global'
+    before=await _get(pid);reap.calls.clear();attribution.calls.clear()
+    with pytest.raises(ManualResolutionRefused):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=expected,dry_run=False)
+    assert await _get(pid)==before
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    assert reap.calls==[] and attribution.calls==[]
+
+@pytest.mark.parametrize('failure',['audit','terminal','edge'])
+async def test_manual_failure_rolls_back_audit_outcome_and_claim(reap,attribution,monkeypatch,failure):
+    from db.database import database
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    import services.reap_agentic_purchase as svc
+    pid,row,evidence=await _manual_case();reap.calls.clear()
+    if failure=='audit':
+        original=database.execute
+        async def broken(query,*args,**kwargs):
+            if 'INSERT INTO reap_checkout_manual_resolution_audit' in str(query):raise RuntimeError('synthetic_audit_failure')
+            return await original(query,*args,**kwargs)
+        monkeypatch.setattr(database,'execute',broken)
+    elif failure=='terminal':
+        original=svc._move
+        async def broken(*args,**kwargs):
+            result=await original(*args,**kwargs)
+            raise RuntimeError('synthetic_after_terminal_failure')
+        monkeypatch.setattr(svc,'_move',broken)
+    else:attribution.raises=RuntimeError('synthetic_edge_failure')
+    with pytest.raises(RuntimeError):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    assert reap.calls==[]
+
+@pytest.mark.parametrize('status,state,target',[('FAILED','awaiting_approval','failed'),('EXPIRED','awaiting_approval','expired'),('EXPIRED','processing','failed')])
+async def test_manual_authoritative_unpaid_terminal_evidence(reap,status,state,target):
+    from db.database import database
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid,row,evidence=await _manual_case(status,state);reap.calls.clear()
+    result=await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert result['state']==target and (await _get(pid))['claimed_by'] is None and reap.calls==[]
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==1
+
+async def test_manual_compare_and_swap_loses_without_audit_or_outcome(reap,monkeypatch):
+    from db.database import database
+    from services.reap_checkout_recovery import resolve_checkout_manually,ManualResolutionRefused
+    pid,row,evidence=await _manual_case()
+    original=database.fetch_one
+    async def moved(query,*args,**kwargs):
+        if 'UPDATE reap_agentic_purchases SET claimed_by=:holder' in str(query):return None
+        return await original(query,*args,**kwargs)
+    monkeypatch.setattr(database,'fetch_one',moved)
+    with pytest.raises(ManualResolutionRefused,match='compare_and_swap_lost'):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+
+async def test_manual_sql_edge_failure_rolls_back_both_business_and_audit(reap,monkeypatch):
+    from db.database import database
+    import services.commerce_attribution_service as cas
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    await database.execute('DROP TABLE IF EXISTS synthetic_manual_edge')
+    await database.execute('CREATE TABLE synthetic_manual_edge (id INTEGER PRIMARY KEY)')
+    pid,row,evidence=await _manual_case()
+    async def real_database_writer(**kwargs):
+        await database.execute('INSERT INTO synthetic_manual_edge(id) VALUES (1)')
+        # A actual database error after an edge write must not commit either on SQLite or PG.
+        await database.execute('INSERT INTO synthetic_manual_edge(id) VALUES (1)')
+    monkeypatch.setattr(cas,'close_external_order_conversion',real_database_writer)
+    with pytest.raises(Exception):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM synthetic_manual_edge')==0
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    await database.execute('DROP TABLE synthetic_manual_edge')
+
+async def test_manual_migration_and_selfheal_have_identical_audit_contract(reap):
+    from pathlib import Path
+    from db.database import database,IS_POSTGRES
+    from db.schema_guard import ensure_required_schema_light
+    from db.sql_migrations import split_statements
+    async def columns():
+        if IS_POSTGRES:
+            rows=await database.fetch_all("SELECT column_name,data_type,is_nullable,column_default FROM information_schema.columns WHERE table_schema='public' AND table_name='reap_checkout_manual_resolution_audit' ORDER BY ordinal_position")
+            checks=await database.fetch_all("SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid='reap_checkout_manual_resolution_audit'::regclass ORDER BY pg_get_constraintdef(oid)")
+        else:
+            rows=await database.fetch_all('PRAGMA table_info(reap_checkout_manual_resolution_audit)')
+            checks=await database.fetch_all("SELECT sql FROM sqlite_master WHERE name='reap_checkout_manual_resolution_audit'")
+        return [dict(r) for r in rows],[dict(r) for r in checks]
+    await database.execute('DROP TABLE reap_checkout_manual_resolution_audit')
+    migration=(Path(__file__).parent.parent/'db/migrations/253_reap_checkout_manual_resolution_audit.sql').read_text()
+    if not IS_POSTGRES:migration=migration.replace('TIMESTAMPTZ','TIMESTAMP')
+    for statement in split_statements(migration):await database.execute(statement)
+    migrated=await columns()
+    await database.execute('DROP TABLE reap_checkout_manual_resolution_audit')
+    await ensure_required_schema_light()
+    healed=await columns()
+    assert migrated==healed
+
+async def test_manual_concurrent_decisions_have_one_audit_and_one_completion(reap,attribution):
+    import asyncio, contextvars
+    from db.database import database
+    from services.reap_checkout_recovery import resolve_checkout_manually,ManualResolutionRefused
+    pid,row,evidence=await _manual_case();attribution.calls.clear();reap.calls.clear()
+    async def attempt():
+        try:
+            return await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+        except ManualResolutionRefused as exc:
+            return str(exc)
+    tasks=[contextvars.Context().run(asyncio.create_task,attempt()) for _ in range(2)]
+    results=await asyncio.wait_for(asyncio.gather(*tasks),5)
+    assert sum(isinstance(r,dict) and r['status']=='resolved' for r in results)==1
+    assert (await _get(pid))['state']=='completed'
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==1
+    assert len(attribution.calls)==1 and reap.calls==[]
+
+@pytest.mark.parametrize('failure',['suppressed_edge','native_edge_missing'])
+async def test_manual_false_attribution_or_release_fence_rolls_back(reap,monkeypatch,failure):
+    import services.reap_agentic_purchase as svc
+    import db.reap_agentic_ledger as ledger
+    from db.database import database
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid,row,evidence=await _manual_case()
+    async def refused(*args,**kwargs):return False if failure=='suppressed_edge' else None
+    if failure=='suppressed_edge':
+        monkeypatch.setattr(svc,'_close_attribution',refused)
+    else:
+        import services.commerce_attribution_service as cas
+        monkeypatch.setattr(cas,'close_external_order_conversion',refused)
+    with pytest.raises((RuntimeError,ValueError)):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+
+async def test_manual_other_channel_claim_is_audited_completion_without_reap_edge(reap,attribution):
+    from db.database import database
+    from services import conversion_click_claims as ccc
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid,row,evidence=await _manual_case()
+    click='synthetic_manual_other_channel'
+    cart=f"https://brand.example/cart/49922977038613:1?attributes[pivota_click_id]={click}&country=US"
+    await database.execute("UPDATE reap_agentic_purchases SET item_source='cart_link',cart_url=:cart,click_id=:click WHERE id=:id",{'id':pid,'cart':cart,'click':click})
+    await database.execute('DELETE FROM conversion_click_claims WHERE click_id=:click',{'click':click})
+    assert await ccc.claim_click(click,claimed_by=ccc.MERCHANT_CLAIMANT,external_order_id='merchant_synthetic_order')
+    before=dict(await database.fetch_one('SELECT * FROM conversion_click_claims WHERE click_id=:click',{'click':click}))
+    row=await _get(pid);reap.calls.clear();attribution.calls.clear()
+    result=await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert result['state']=='completed' and (await _get(pid))['last_error_code']==ccc.CLOSED_BY_OTHER_CHANNEL
+    audit=await database.fetch_one('SELECT * FROM reap_checkout_manual_resolution_audit WHERE purchase_id=:id',{'id':pid})
+    assert audit['attribution_outcome']=='closed_by_other_channel'
+    assert dict(await database.fetch_one('SELECT * FROM conversion_click_claims WHERE click_id=:click',{'click':click}))==before
+    assert reap.calls==[] and attribution.calls==[]

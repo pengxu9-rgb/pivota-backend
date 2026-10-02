@@ -2522,7 +2522,7 @@ async def fail_exhausted_purchases(
 _COUNT_STUCK_PURCHASES_SQL = """
     SELECT COUNT(*) AS stuck FROM reap_agentic_purchases
      WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
-       AND (:reconciliation_only = 0 OR (state IN ('awaiting_approval','processing') AND reap_checkout_id IS NOT NULL))
+       AND (:reconciliation_only = 0 OR ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL))
        AND NOT (substr(COALESCE(last_error_code,''),1,21) = 'checkout_unresolvable' AND substr(last_error_code,22,1) = chr(58))
        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
        AND (
@@ -2549,7 +2549,7 @@ _COUNT_STUCK_PURCHASES_SQL = """
 _COUNT_STUCK_PURCHASES_SQL_SQLITE = """
     SELECT COUNT(*) AS stuck FROM reap_agentic_purchases
      WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
-       AND (:reconciliation_only = 0 OR (state IN ('awaiting_approval','processing') AND reap_checkout_id IS NOT NULL))
+       AND (:reconciliation_only = 0 OR ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL))
        AND NOT (substr(COALESCE(last_error_code,''),1,21) = 'checkout_unresolvable' AND substr(last_error_code,22,1) = char(58))
        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
        AND (

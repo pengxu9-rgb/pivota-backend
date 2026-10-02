@@ -3482,7 +3482,7 @@ async def _step_processing(row: Mapping[str, Any], worker_id: str) -> AdvanceRes
 
 
 async def _complete(
-    row: Mapping[str, Any], worker_id: str, from_state: str, payload: Mapping[str, Any]
+    row: Mapping[str, Any], worker_id: str, from_state: str, payload: Mapping[str, Any], *, strict_attribution: bool = False, allow_other_channel: bool = False
 ) -> AdvanceResult:
     """Write 'completed', then close the attribution edge — but ONLY when we can key and price it.
 
@@ -3586,6 +3586,8 @@ async def _complete(
                 row.get("click_id"), claimed_by=ccc.REAP_CLAIMANT, external_order_id=order_id
             )
         except Exception as exc:  # noqa: BLE001 — fail closed, by design
+            if strict_attribution:
+                raise
             logger.warning(
                 "reap_agentic: purchase=%s attribution claim failed error_type=%s",
                 row["id"], type(exc).__name__,
@@ -3615,6 +3617,8 @@ async def _complete(
         return moved
 
     if reason is not None:
+        if strict_attribution and not (allow_other_channel and reason == ccc.CLOSED_BY_OTHER_CHANNEL):
+            raise RuntimeError("manual_attribution_suppressed:" + str(reason))
         logger.warning(
             "reap_agentic: purchase=%s completed but no attribution edge written (%s); "
             "reap_checkout_id is stored so a reconciliation can still close it",
@@ -3627,7 +3631,9 @@ async def _complete(
     # `buyer_email` and `shipping_address`, so what comes back has no PII in it at all — which is
     # exactly the row the hook should see.
     completed = await ledger.get_purchase_internal(str(row["id"])) or {}
-    closed = await _close_attribution(completed)
+    closed = await _close_attribution(completed, strict=strict_attribution)
+    if strict_attribution and closed is not True:
+        raise RuntimeError("manual_attribution_not_closed")
     if claimed and not closed:
         # We own the click and wrote no edge. NOT released (see the claim block above): this is
         # the missed edge the design accepts, made visible instead of silent.
@@ -3680,7 +3686,7 @@ def _converting_shop_domain(purchase: Mapping[str, Any]) -> str:
     return _attribution_merchant_key(purchase.get("merchant_domain"))
 
 
-async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
+async def _close_attribution(purchase: Mapping[str, Any], *, strict: bool = False) -> bool:
     """Tell the attribution ledger a Pivota-referred order closed. NEVER FAILS THE PURCHASE.
 
     The purchase row is ALREADY 'completed' and terminal when this runs, so there is nothing to
@@ -3725,7 +3731,7 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
             )
             if seller_ref:
                 merchant_id = seller_ref
-        await close_external_order_conversion(
+        edge = await close_external_order_conversion(
             merchant_id=merchant_id,
             click_id=purchase.get("click_id"),
             external_order_id=str(purchase.get("reap_order_id") or ""),
@@ -3744,7 +3750,11 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
             converting_shop_domain=converting_shop,
             is_self_report=False,
         )
+        if strict and (not isinstance(edge, Mapping) or not edge.get("edge_id")):
+            raise RuntimeError("manual_attribution_edge_missing")
     except Exception as exc:  # noqa: BLE001 — deliberately broad; see the docstring
+        if strict:
+            raise
         logger.warning(
             "reap_agentic: attribution close failed for purchase=%s error_type=%s",
             purchase.get("id"),
