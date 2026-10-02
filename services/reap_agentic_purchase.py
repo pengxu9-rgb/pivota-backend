@@ -143,6 +143,7 @@ __all__ = [
     "enrollment_grace_seconds",
     "is_cart_link_enabled",
     "is_enabled",
+    "is_reconciliation_enabled",
     "start_purchase",
     "transport_backoff_seconds",
     "verify_cart_link_quote",
@@ -1860,6 +1861,11 @@ async def _start_cart_link_purchase(
 # ── advance ──────────────────────────────────────────────────────────────────────────────────
 
 
+def is_reconciliation_enabled() -> bool:
+    """Independent provider-I/O stop; privacy maintenance does not depend on it."""
+    return os.getenv("REAP_AGENTIC_RECONCILE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _next_poll_for(to_state: str) -> datetime:
     """When to look at a row we JUST MOVED.
 
@@ -1954,6 +1960,10 @@ async def _still_ours(row: Mapping[str, Any], worker_id: str) -> Optional[Dict[s
     hold — `expire_overdue_purchases` and `fail_exhausted_purchases` take no holder — so
     `claimed_by` alone would still let a worker quote a purchase that is already 'expired'.
     """
+    # A stop raised during the preceding request prevents the next partner operation.
+    # Requests already in flight can finish; the stop never fabricates an outcome.
+    if not is_reconciliation_enabled():
+        return None
     fresh = await ledger.get_purchase_internal(str(row["id"]))
     if fresh is None:
         return None
@@ -2095,10 +2105,22 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
         # No partner call, no write. A terminal row is done, and a poller that reached one has a
         # bug worth not compounding.
         return AdvanceResult(str(row["id"]), outcome="terminal", state=state)
+    if not is_reconciliation_enabled():
+        return await _release(row, worker_id, error_code=row.get("last_error_code") or "reconciliation_disabled")
+    if state in {"resolving", "needs_enrollment", "quoting"} and row.get("last_error_code") == "contact_retention_elapsed":
+        # Privacy expiry never invents a payment outcome or permits a new provider operation.
+        return await _release(row, worker_id, error_code="contact_retention_elapsed")
     handler = _STEPS.get(state)
     if handler is None:  # pragma: no cover — every non-terminal state has a step
         raise RuntimeError(f"no step for purchase state {state!r}")
-    return await handler(row, worker_id)
+    token = rc.worker_provider_permission.set(is_reconciliation_enabled)
+    try:
+        return await handler(row, worker_id)
+    except rc.ProviderOperationStopped:
+        fresh = await ledger.get_purchase_internal(str(row["id"])) or row
+        return await _release(fresh, worker_id, error_code=fresh.get("last_error_code") or "reconciliation_disabled")
+    finally:
+        rc.worker_provider_permission.reset(token)
 
 
 # ── the steps ────────────────────────────────────────────────────────────────────────────────
@@ -3314,6 +3336,35 @@ async def _checkout_from_quote(
     )
 
 
+# A permanent-shaped read failure is not payment proof. Escalate observation, not outcome.
+PERMANENT_CHECKOUT_READ_ERRORS = frozenset({"reap_status_404", "hosted_url_not_allowed", "unknown_checkout_status"})
+PERMANENT_CHECKOUT_READ_LIMIT = 3
+CHECKOUT_HUMAN_RETRY_SECONDS = 900
+
+
+def _checkout_failure_count(code: Any) -> int:
+    parts = str(code or "").split(":", 2)
+    if len(parts) == 3 and parts[0] in {"checkout_read_permanent", "checkout_unresolvable"}:
+        try:
+            return min(max(int(parts[1]), 0), 99)
+        except ValueError:
+            pass
+    return 0
+
+
+async def _release_checkout_read_failure(row, worker_id, code):
+    previous = str(row.get("last_error_code") or "")
+    if code in PERMANENT_CHECKOUT_READ_ERRORS:
+        count = min(_checkout_failure_count(previous) + 1, 99)
+        prefix = "checkout_unresolvable" if count >= PERMANENT_CHECKOUT_READ_LIMIT else "checkout_read_permanent"
+        return await _release(row, worker_id, error_code=f"{prefix}:{count}:{code}",
+                              seconds=CHECKOUT_HUMAN_RETRY_SECONDS if prefix == "checkout_unresolvable" else None)
+    if previous.startswith("checkout_unresolvable:"):
+        # Only a valid provider outcome clears human review; an outage cannot hide it.
+        return await _release(row, worker_id, error_code=previous, seconds=CHECKOUT_HUMAN_RETRY_SECONDS)
+    return await _release(row, worker_id, error_code=code, transport=_is_transport(code))
+
+
 async def _step_checkout_poll(
     row: Mapping[str, Any], worker_id: str, from_state: str
 ) -> AdvanceResult:
@@ -3353,8 +3404,9 @@ async def _step_checkout_poll(
         # ledger's separate contact scrub bounds PII retention without terminating this
         # checkout. Local clocks/attempt counts never stand in for the provider outcome.
         code = str(read.error or "checkout_read_failed")
-        return await _release(row, worker_id, error_code=code, transport=_is_transport(code))
+        return await _release_checkout_read_failure(row, worker_id, code)
 
+    recovered_code = "checkout_read_recovered" if _checkout_failure_count(row.get("last_error_code")) else None
     state = rc.checkout_state(read.data)
     if state == "completed":
         return await _complete(row, worker_id, from_state, read.data)
@@ -3375,12 +3427,12 @@ async def _step_checkout_poll(
         )
     if state == "processing":
         if from_state == "processing":
-            return await _release(row, worker_id, error_code=None)
-        return await _move(row, worker_id, [from_state], "processing")
+            return await _release(row, worker_id, error_code=recovered_code)
+        return await _move(row, worker_id, [from_state], "processing", last_error_code=recovered_code)
     if state == "awaiting_buyer":
-        return await _release(row, worker_id, error_code=None)
+        return await _release(row, worker_id, error_code=recovered_code)
     # unknown — never advances, in either state.
-    return await _release(row, worker_id, error_code="unknown_checkout_status")
+    return await _release_checkout_read_failure(row, worker_id, "unknown_checkout_status")
 
 
 #: `last_error_code` for a Reap FAILED that landed on an approval the buyer simply did not give in
@@ -3430,7 +3482,7 @@ async def _step_processing(row: Mapping[str, Any], worker_id: str) -> AdvanceRes
 
 
 async def _complete(
-    row: Mapping[str, Any], worker_id: str, from_state: str, payload: Mapping[str, Any]
+    row: Mapping[str, Any], worker_id: str, from_state: str, payload: Mapping[str, Any], *, strict_attribution: bool = False, allow_other_channel: bool = False
 ) -> AdvanceResult:
     """Write 'completed', then close the attribution edge — but ONLY when we can key and price it.
 
@@ -3534,6 +3586,8 @@ async def _complete(
                 row.get("click_id"), claimed_by=ccc.REAP_CLAIMANT, external_order_id=order_id
             )
         except Exception as exc:  # noqa: BLE001 — fail closed, by design
+            if strict_attribution:
+                raise
             logger.warning(
                 "reap_agentic: purchase=%s attribution claim failed error_type=%s",
                 row["id"], type(exc).__name__,
@@ -3563,6 +3617,8 @@ async def _complete(
         return moved
 
     if reason is not None:
+        if strict_attribution and not (allow_other_channel and reason == ccc.CLOSED_BY_OTHER_CHANNEL):
+            raise RuntimeError("manual_attribution_suppressed:" + str(reason))
         logger.warning(
             "reap_agentic: purchase=%s completed but no attribution edge written (%s); "
             "reap_checkout_id is stored so a reconciliation can still close it",
@@ -3575,7 +3631,9 @@ async def _complete(
     # `buyer_email` and `shipping_address`, so what comes back has no PII in it at all — which is
     # exactly the row the hook should see.
     completed = await ledger.get_purchase_internal(str(row["id"])) or {}
-    closed = await _close_attribution(completed)
+    closed = await _close_attribution(completed, strict=strict_attribution)
+    if strict_attribution and closed is not True:
+        raise RuntimeError("manual_attribution_not_closed")
     if claimed and not closed:
         # We own the click and wrote no edge. NOT released (see the claim block above): this is
         # the missed edge the design accepts, made visible instead of silent.
@@ -3628,7 +3686,7 @@ def _converting_shop_domain(purchase: Mapping[str, Any]) -> str:
     return _attribution_merchant_key(purchase.get("merchant_domain"))
 
 
-async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
+async def _close_attribution(purchase: Mapping[str, Any], *, strict: bool = False) -> bool:
     """Tell the attribution ledger a Pivota-referred order closed. NEVER FAILS THE PURCHASE.
 
     The purchase row is ALREADY 'completed' and terminal when this runs, so there is nothing to
@@ -3673,7 +3731,7 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
             )
             if seller_ref:
                 merchant_id = seller_ref
-        await close_external_order_conversion(
+        edge = await close_external_order_conversion(
             merchant_id=merchant_id,
             click_id=purchase.get("click_id"),
             external_order_id=str(purchase.get("reap_order_id") or ""),
@@ -3692,7 +3750,11 @@ async def _close_attribution(purchase: Mapping[str, Any]) -> bool:
             converting_shop_domain=converting_shop,
             is_self_report=False,
         )
+        if strict and (not isinstance(edge, Mapping) or not edge.get("edge_id")):
+            raise RuntimeError("manual_attribution_edge_missing")
     except Exception as exc:  # noqa: BLE001 — deliberately broad; see the docstring
+        if strict:
+            raise
         logger.warning(
             "reap_agentic: attribution close failed for purchase=%s error_type=%s",
             purchase.get("id"),
