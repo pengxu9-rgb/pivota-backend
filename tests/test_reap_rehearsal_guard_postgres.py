@@ -86,6 +86,16 @@ def test_runtime_role_and_baseline(fixture_config):
         ),
         ("CREATE SCHEMA foreign_fixture", "DROP SCHEMA foreign_fixture", "unexpected_schema"),
         (
+            "CREATE SEQUENCE public.foreign_fixture",
+            "DROP SEQUENCE public.foreign_fixture",
+            "runtime_sequence_inventory",
+        ),
+        (
+            "ALTER TABLE catalog_products ADD COLUMN foreign_fixture TEXT",
+            "ALTER TABLE catalog_products DROP COLUMN foreign_fixture",
+            "catalog_column_contract",
+        ),
+        (
             "CREATE TABLE public.foreign_fixture(x INTEGER)",
             "DROP TABLE public.foreign_fixture",
             "runtime_schema_inventory",

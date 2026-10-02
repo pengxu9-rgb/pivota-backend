@@ -225,8 +225,17 @@ async def validate_connection(conn, mode, target=TARGET):
     tables = await conn.fetch(
         "SELECT c.relname,c.relkind::text AS relkind,c.relrowsecurity,c.relforcerowsecurity,pg_get_userbyid(c.relowner) AS owner FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f')"
     )
+    sequences = await conn.fetch("""SELECT c.relname,pg_get_userbyid(c.relowner) AS owner,t.relname AS owned_table
+        FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        LEFT JOIN pg_depend d ON d.classid='pg_class'::regclass AND d.objid=c.oid AND d.refclassid='pg_class'::regclass AND d.deptype IN ('a','i')
+        LEFT JOIN pg_class t ON t.oid=d.refobjid
+        WHERE n.nspname='public' AND c.relkind='S'""")
+    if mode == "runtime" and any(
+        row["owner"] != target.migrator or row["owned_table"] not in TABLES for row in sequences
+    ):
+        reject("runtime_sequence_inventory")
     if mode == "migrate":
-        if tables:
+        if tables or sequences:
             reject("migration_requires_empty_database")
     else:
         if {r["relname"] for r in tables} != set(TABLES) | {MARKER} or any(
