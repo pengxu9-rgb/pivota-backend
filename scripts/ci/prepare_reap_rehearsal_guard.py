@@ -55,7 +55,7 @@ async def prepare(env):
             raise RuntimeError("guard_ci_actual_server")
         databases = {row["datname"] for row in await client.fetch("SELECT datname FROM pg_database")}
         roles = {
-            row["rolname"] for row in await client.fetch("SELECT rolname FROM pg_roles WHERE rolname NOT LIKE 'pg_%'")
+            row["rolname"] for row in await client.fetch("SELECT rolname FROM pg_roles WHERE left(rolname,3) <> 'pg_'")
         }
         if databases != {"postgres", "template0", "template1"} or roles != {"postgres"}:
             raise RuntimeError("guard_ci_requires_fresh_cluster")
