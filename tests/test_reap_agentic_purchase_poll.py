@@ -2037,8 +2037,13 @@ class _RecordingScheduler:
 
 async def _start_scheduler(monkeypatch, **env):
     import services.audit_scheduler as sched
+    # Scheduling does not execute Stripe jobs. Prevent an unrelated Stripe SDK
+    # constructor from creating its HTTP client while the no-network guard is active.
+    import stripe
+    from unittest.mock import MagicMock
+    monkeypatch.setattr(stripe, "StripeClient", MagicMock())
 
-    for k in ("AUDIT_WORKER_ENABLED", "RAILWAY_SERVICE_NAME", "RAILWAY_ENVIRONMENT"):
+    for k in ("AUDIT_WORKER_ENABLED", "RAILWAY_SERVICE_NAME", "RAILWAY_ENVIRONMENT", "PIVOTA_ENV"):
         monkeypatch.delenv(k, raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)

@@ -1793,8 +1793,8 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4b_test
 If Reap omits optional enrollment expiresAt, the purchase carries a stable estimate from the
 originating enrollment attempt created_at plus the existing HOSTED_SESSION_SECONDS policy
 (900 seconds). A reused attempt keeps that deadline; reads and reloads never restamp it.
-An explicit valid provider expiresAt wins. A malformed supplied expiry is refused, rather
-than silently treated as omitted. The originating created_at is available only on internal
+An explicit valid provider expiresAt wins. A malformed supplied expiry leaves the original pending attempt uncertain, rather
+than silently treating it as omitted or granting permission to mint a replacement. The originating created_at is available only on internal
 enrollment reads, not in public purchase responses.
 
 For legacy needs_enrollment purchases with NULL deadline, owner GET derives the same estimate
@@ -1839,3 +1839,10 @@ The create route opens the purchase and binds its immutable attempt key in one s
 Storage uncertainty returns503 `checkout_outcome_unknown`. It never acknowledges an unmapped purchase or authorizes another checkout path. A merchant refusal tombstone must also be durable; a competing purchase winner or uncertain tombstone write returns unknown. Recover the original key/body/owner while creates are paused. No key age authorizes a replacement purchase. Current selected Reap checkout policy does not automatically switch to cart-link, native checkout or storefront purchase after any failure or refusal.
 
 A commit acknowledgement can be lost after the database commits. Treat503 as uncertain and recover the exact original attempt, never mint a fresh key to escape it. The public recovery view retains its established `id` field; create acceptance uses `purchase_id`. Same-key replay returns the winner's current state, not a fabricated resolving state. An intentional new purchase requires its own explicit buyer intent and new key.
+
+
+### Durable enrollment expiry provenance
+
+Migration 254 and independent startup self-heal blocks add the private `hosted_url_expiry_invalid` boolean. Explicit malformed create/read expiry sets it under the purchase lease. Optional later omission cannot clear it, including after the original estimated grace or on a new purchase. A valid allowlisted provider action with explicit timestamp or authoritative ACTIVE/dead status can resolve the same attempt; unclassified reads remain uncertain. No invalid-expiry path retires or remints the attempt based on guessed age. Runtime rollback preserves this column.
+
+Explicit named attempt updates are also buyer-scoped and refuse if that attempt stopped pending. A provider response cannot fall through onto a newly minted enrollment clock. Initial creates, normal reuse, owner GET/recover and owner history share the original attempt deadline calculation; public serializers suppress enrollment links whose provenance or deadline is unavailable. All owner reads remain read-only and redact private identity/contact/enrollment provenance. An allowlisted authoritative provider refresh may update its action under the lease while preserving the original attempt and state clocks.

@@ -1111,6 +1111,11 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 _warn_one_pending_index_missing(exc)
+            # mig 254: durable malformed expiry provenance, independently healed.
+            try:
+                await database.execute(text("ALTER TABLE IF EXISTS reap_agentic_enrollments ADD COLUMN IF NOT EXISTS hosted_url_expiry_invalid BOOLEAN NOT NULL DEFAULT FALSE;"))
+            except Exception:  # noqa: BLE001
+                pass
             # mig 225: the resolver's three hint columns.
             #
             # THIS DDL MUST BUILD THE SAME SCHEMA AS
@@ -3764,6 +3769,11 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 _warn_one_pending_index_missing(exc)
+            # mig 254: SQLite twin; duplicate column is the idempotent no-op.
+            try:
+                await database.execute(text("ALTER TABLE reap_agentic_enrollments ADD COLUMN hosted_url_expiry_invalid BOOLEAN NOT NULL DEFAULT FALSE;"))
+            except Exception:  # noqa: BLE001
+                pass
             # mig 225: the resolver's three hint columns, SQLite twin.
             #
             # ── TWO LAYERS OF try, AND EACH ONE ANSWERS A DIFFERENT FAILURE ──

@@ -76,6 +76,7 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
     # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
+    _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
 )
 
 # Same convention as the other gates on this rail: this file DROPS its tables, so it must be

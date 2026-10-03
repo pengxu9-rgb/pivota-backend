@@ -80,6 +80,7 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
     # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
+    _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
 )
 
 # Same convention as tests/test_reap_agentic_ledger_postgres.py: this gate DROPS its tables, so
@@ -2624,3 +2625,168 @@ async def test_manual_foreign_reap_click_claim_is_not_merchant_channel(reap,manu
     assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
     assert await database.fetch_val('SELECT count(*) FROM commerce_attribution_edges')==0
     assert dict(await database.fetch_one('SELECT * FROM conversion_click_claims WHERE click_id=:click',{'click':click}))==before
+
+from datetime import timedelta
+import services.reap_agentic_client as rc
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+async def test_deadline_all_owner_reads_share_original_clock_and_redaction(reap,monkeypatch,legacy):
+    from types import SimpleNamespace
+    from starlette.requests import Request
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route
+    pid=await _deadline_missing_provider_expiry(reap)
+    if legacy:await database.execute('UPDATE reap_agentic_purchases SET hosted_url_expires_at=NULL WHERE id=:id',{'id':pid})
+    before=await _get(pid)
+    enrollment=await ledger.get_enrollment_internal(before['enrollment_id'])
+    expected=enrollment['created_at']+timedelta(seconds=ledger.HOSTED_SESSION_SECONDS)
+    monkeypatch.setattr(route,'_require_rail',lambda:None)
+    monkeypatch.setattr(route,'_require_agent_user',lambda _: 'synthetic-user')
+    monkeypatch.setattr(route,'hash_agent_user_ref',lambda _: 'hash_alice')
+    request=Request({'type':'http','method':'GET','path':'/purchases','query_string':b''})
+    for _ in range(2):
+        listed=await route.list_reap_purchases(request,SimpleNamespace(agent_id='agent_one'),None)
+        owner=await route._owner_view(purchase_id=pid,agent_id='agent_one',agent_user_ref_hash='hash_alice')
+        assert listed['purchases'][0]==owner
+        assert owner['hosted_url_expires_at']==expected and owner['hosted_url']
+        for key in ['buyer_ref','enrollment_id','buyer_email','shipping_address','hosted_url_expiry_invalid']:assert key not in owner
+    assert await _get(pid)==before
+    assert await ledger.get_enrollment_internal(enrollment['id'])==enrollment
+
+@pytest.mark.parametrize('defect',['superseded','returned_id','wrong_buyer'])
+async def test_deadline_recording_named_attempt_never_mints_a_new_clock(reap,monkeypatch,defect):
+    import copy
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    payload=copy.deepcopy(ENROLLMENT_CREATED);payload['nextAction'].pop('expiresAt');reap.create_enrollment=_ok(payload)
+    actual=ledger.upsert_pending_enrollment
+    seen=[]
+    async def changed(**kwargs):
+        if kwargs.get('reap_enrollment_id'):
+            seen.append(kwargs['enrollment_id'])
+            if defect=='superseded':await database.execute("UPDATE reap_agentic_enrollments SET status='dead' WHERE id=:id",{'id':kwargs['enrollment_id']})
+            if defect=='wrong_buyer':kwargs['buyer_ref']='foreign_buyer'
+        result=await actual(**kwargs)
+        if kwargs.get('reap_enrollment_id') and defect=='returned_id':result=dict(result,id='another_attempt')
+        return result
+    monkeypatch.setattr(ledger,'upsert_pending_enrollment',changed)
+    pid=await _start();result=await _step(pid)
+    assert result.outcome=='released' and result.state=='resolving'
+    assert not (await _get(pid))['hosted_url'] and (await _get(pid))['hosted_url_expires_at'] is None
+    rows=await database.fetch_all('SELECT * FROM reap_agentic_enrollments')
+    assert len(rows)==1 and rows[0]['id']==seen[0]
+    assert rows[0]['buyer_ref']=='bref_alice'
+
+@pytest.mark.parametrize('later',['malformed','omitted','missing404'])
+async def test_deadline_invalid_provenance_survives_age_and_new_purchase_without_remint(reap,later):
+    import copy
+    from db.database import database,IS_POSTGRES
+    import db.reap_agentic_ledger as ledger
+    bad=copy.deepcopy(ENROLLMENT_CREATED);bad['nextAction']['expiresAt']='malformed'
+    reap.create_enrollment=_ok(bad)
+    first=await _start();result=await _step(first)
+    assert result.outcome=='released' and result.last_error_code=='enrollment_deadline_invalid'
+    attempt=(await ledger.get_pending_enrollments('bref_alice'))[0]
+    assert attempt['hosted_url_expiry_invalid']
+    age="clock_timestamp()-INTERVAL '1 day'" if IS_POSTGRES else "datetime('now','-1 day')"
+    await database.execute(f'UPDATE reap_agentic_enrollments SET created_at={age} WHERE id=:id',{'id':attempt['id']})
+    reply=copy.deepcopy(bad)
+    if later=='omitted':reply['nextAction'].pop('expiresAt')
+    reap.get_enrollment=rc.ReapResponse(ok=False,status=404,error='reap_status_404') if later=='missing404' else _ok(reply)
+    second=await _start()
+    for pid in (first,second,second):
+        result=await _step(pid)
+        assert result.outcome=='released' and result.state=='resolving'
+        assert not (await _get(pid))['hosted_url']
+    assert len(reap.named('create_enrollment'))==1
+    assert await database.fetch_val("SELECT count(*) FROM reap_agentic_enrollments WHERE status='pending'")==1
+    assert await database.fetch_val("SELECT count(*) FROM reap_agentic_enrollments WHERE status='dead'")==0
+
+@pytest.mark.parametrize('later',['valid_expiry','active'])
+async def test_deadline_authoritative_response_can_resolve_retained_invalid_attempt(reap,later):
+    import copy
+    import db.reap_agentic_ledger as ledger
+    bad=copy.deepcopy(ENROLLMENT_CREATED);bad['nextAction']['expiresAt']='malformed';reap.create_enrollment=_ok(bad)
+    pid=await _start();await _step(pid)
+    attempt=(await ledger.get_pending_enrollments('bref_alice'))[0]
+    reap.get_enrollment=_ok(ENROLLMENT_ACTIVE if later=='active' else ENROLLMENT_CREATED)
+    result=await _step(pid)
+    assert result.state==('quoting' if later=='active' else 'needs_enrollment')
+    recorded=await ledger.get_enrollment_internal(attempt['id'])
+    assert not recorded['hosted_url_expiry_invalid'] and recorded['created_at']==attempt['created_at']
+    assert len(reap.named('create_enrollment'))==1
+
+async def test_deadline_malformed_read_suppresses_previously_valid_link_and_preserves_attempt(reap):
+    import copy
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route
+    pid=await _deadline_missing_provider_expiry(reap);before=await _get(pid)
+    bad=copy.deepcopy(ENROLLMENT_CREATED);bad['nextAction']['expiresAt']='malformed';reap.get_enrollment=_ok(bad)
+    result=await _step(pid)
+    assert result.last_error_code=='enrollment_deadline_invalid'
+    public=await route._owner_view(purchase_id=pid,agent_id='agent_one',agent_user_ref_hash='hash_alice')
+    assert not public.get('hosted_url') and not public.get('hosted_url_expires_at')
+    recorded=await ledger.get_enrollment_internal(before['enrollment_id'])
+    assert recorded['status']=='pending' and recorded['hosted_url_expiry_invalid']
+    assert (await _get(pid))['hosted_url_expires_at']==before['hosted_url_expires_at']
+
+async def test_deadline_allowlisted_authoritative_refresh_is_visible_to_existing_purchase(reap):
+    import copy
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route
+    pid=await _deadline_missing_provider_expiry(reap);before=await _get(pid)
+    refreshed=copy.deepcopy(ENROLLMENT_CREATED);refreshed['nextAction']['url']='https://pay.prava.space/enroll/session_refreshed'
+    reap.get_enrollment=_ok(refreshed)
+    assert (await _step(pid)).outcome=='released'
+    public=await route._owner_view(purchase_id=pid,agent_id='agent_one',agent_user_ref_hash='hash_alice')
+    assert public['hosted_url']==refreshed['nextAction']['url'] and public['hosted_url_expires_at'].year==2099
+    row=await _get(pid);enrollment=await ledger.get_enrollment_internal(row['enrollment_id'])
+    assert row['enrollment_id']==before['enrollment_id'] and row['state_entered_at']==before['state_entered_at']
+    assert enrollment['created_at']<=before['created_at']+timedelta(seconds=1)
+
+async def test_deadline_expiry_provenance_selfheal_and_migration_physical_parity(reap):
+    from pathlib import Path
+    from db.database import database,IS_POSTGRES
+    from db.sql_migrations import split_statements
+    from db.schema_guard import ensure_required_schema_light
+    async def column():
+        if IS_POSTGRES:
+            rows=await database.fetch_all("SELECT column_name,data_type,is_nullable,column_default FROM information_schema.columns WHERE table_schema='public' AND table_name='reap_agentic_enrollments' AND column_name='hosted_url_expiry_invalid'")
+        else:
+            rows=[x for x in await database.fetch_all('PRAGMA table_info(reap_agentic_enrollments)') if x['name']=='hosted_url_expiry_invalid']
+        return [dict(x) for x in rows]
+    await database.execute('ALTER TABLE reap_agentic_enrollments DROP COLUMN hosted_url_expiry_invalid')
+    migration=(Path(__file__).parent.parent/'db/migrations/254_reap_enrollment_expiry_provenance.sql').read_text()
+    if not IS_POSTGRES:migration=migration.replace('ALTER TABLE IF EXISTS','ALTER TABLE').replace('ADD COLUMN IF NOT EXISTS','ADD COLUMN')
+    for statement in split_statements(migration):await database.execute(statement)
+    migrated=await column();assert migrated
+    await database.execute('ALTER TABLE reap_agentic_enrollments DROP COLUMN hosted_url_expiry_invalid')
+    await ensure_required_schema_light();assert await column()==migrated
+    await ensure_required_schema_light();assert await column()==migrated
+
+
+async def test_deadline_refresh_losing_lease_preserves_next_holders_recoverable_action(reap,monkeypatch):
+    import copy
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route
+    pid=await _deadline_missing_provider_expiry(reap)
+    fresh=copy.deepcopy(ENROLLMENT_CREATED);fresh['nextAction']['url']='https://pay.prava.space/enroll/lease_refreshed'
+    reap.get_enrollment=_ok(fresh)
+    original=ledger.record_enrollment_expiry_provenance
+    async def lose_after_provenance(**kwargs):
+        result=await original(**kwargs)
+        await database.execute("UPDATE reap_agentic_purchases SET claimed_by='next_holder' WHERE id=:id",{'id':pid})
+        return result
+    monkeypatch.setattr(ledger,'record_enrollment_expiry_provenance',lose_after_provenance)
+    assert (await _step(pid)).outcome=='lost_claim'
+    assert (await _get(pid))['claimed_by']=='next_holder'
+    public=await route._owner_view(purchase_id=pid,agent_id='agent_one',agent_user_ref_hash='hash_alice')
+    assert not public.get('hosted_url')
+    monkeypatch.setattr(ledger,'record_enrollment_expiry_provenance',original)
+    assert (await svc.advance(pid,'next_holder')).outcome=='released'
+    public=await route._owner_view(purchase_id=pid,agent_id='agent_one',agent_user_ref_hash='hash_alice')
+    assert public['hosted_url']==fresh['nextAction']['url'] and public['hosted_url_expires_at'].year==2099
+    assert len(reap.named('create_enrollment'))==1

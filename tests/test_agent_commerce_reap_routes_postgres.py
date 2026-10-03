@@ -110,6 +110,7 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
     # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
+    _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
 )
 
 #: Same convention as the ledger's gate: this file DROPS its tables, so it must be INCAPABLE of
@@ -1378,6 +1379,9 @@ async def test_a_live_hosted_url_is_shown(client):
         hosted_url="https://pay.prava.space/enroll/abc",
         hosted_url_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
     )
+    purchase = await ledger.get_purchase_internal(purchase_id)
+    enrollment = await ledger.upsert_pending_enrollment(buyer_ref=purchase["buyer_ref"], hosted_url=purchase["hosted_url"], hosted_url_expires_at=purchase["hosted_url_expires_at"])
+    await database.execute("UPDATE reap_agentic_purchases SET enrollment_id=:enrollment WHERE id=:id", {"id":purchase_id,"enrollment":enrollment["id"]})
     body = (await client.get(f"{BASE}/purchases/{purchase_id}")).json()
     assert body["hosted_url"] == "https://pay.prava.space/enroll/abc"
 
@@ -2873,3 +2877,33 @@ async def test_atomic_key_duplicate_cleanup_failure_cannot_leave_claimable_orpha
     recovered = await client.post(f"{BASE}/purchases/recover", json=body)
     assert recovered.status_code == 200
     assert recovered.json()["id"] == first.json()["purchase_id"]
+
+
+@pytest.mark.parametrize('legacy',[False,True])
+@pytest.mark.parametrize('invalid',[False,True])
+async def test_deadline_http_get_history_recover_have_identical_stable_handoff(client,monkeypatch,legacy,invalid):
+    await _seed_all()
+    request_body=_body(idempotency_key='deadline-synthetic-http')
+    response=await client.post(f'{BASE}/purchases',json=request_body)
+    assert response.status_code==202,response.text
+    pid=response.json()['purchase_id']
+    row=await ledger.get_purchase_internal(pid)
+    link='https://pay.prava.space/enroll/owned_deadline_fixture'
+    enrollment=await ledger.upsert_pending_enrollment(buyer_ref=row['buyer_ref'],hosted_url=link,hosted_url_expiry_invalid=invalid)
+    deadline=enrollment['created_at']+timedelta(seconds=ledger.HOSTED_SESSION_SECONDS)
+    await ledger.transition(pid,from_states=('resolving',),to_state='needs_enrollment',enrollment_id=enrollment['id'],hosted_url=link,hosted_url_expires_at=None if legacy else deadline)
+    before=await ledger.get_purchase_internal(pid)
+    original_enrollment=await ledger.get_enrollment_internal(enrollment['id'])
+    monkeypatch.setenv('REAP_AGENTIC_CREATE_ENABLED','0')
+    for _ in range(2):
+        direct=await client.get(f'{BASE}/purchases/{pid}')
+        history=await client.get(f'{BASE}/purchases')
+        recovered=await client.post(f'{BASE}/purchases/recover',json=request_body)
+        assert direct.status_code==history.status_code==recovered.status_code==200
+        views=[direct.json(),history.json()['purchases'][0],recovered.json()]
+        assert views[0]==views[1]==views[2]
+        if invalid:assert not views[0].get('hosted_url') and not views[0].get('hosted_url_expires_at')
+        else:assert views[0]['hosted_url']==link and views[0]['hosted_url_expires_at']
+        for key in ['buyer_ref','buyer_email','shipping_address','enrollment_id','hosted_url_expiry_invalid']:assert key not in views[0]
+    assert await ledger.get_purchase_internal(pid)==before
+    assert await ledger.get_enrollment_internal(enrollment['id'])==original_enrollment

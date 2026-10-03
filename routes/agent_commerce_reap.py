@@ -2374,6 +2374,7 @@ def _public_body(view: Mapping[str, Any]) -> Dict[str, Any]:
         state in _HOSTED_STATES
         and rc.hosted_url_is_allowed(hosted_url)
         and (deadline is None or deadline > _now())
+        and (state != "needs_enrollment" or deadline is not None)
     ):
         body["hosted_url"] = hosted_url
         body["hosted_url_expires_at"] = hosted_expires
@@ -2404,25 +2405,34 @@ async def _owner_view(
     )
     if not row:
         return None
-    if row.get("state") == "needs_enrollment" and row.get("hosted_url_expires_at") is None:
+    return await _owner_public_body(row)
+
+
+async def _owner_public_body(row):
+    """Owner-scoped private row to a redacted response with an original-attempt deadline."""
+    row = dict(row)
+    if row.get("state") == "needs_enrollment":
         enrollment = None
         enrollment_id = str(row.get("enrollment_id") or "").strip()
         if enrollment_id:
             try:
                 enrollment = await ledger.get_enrollment_internal(enrollment_id)
-            except Exception:  # Lookup unavailable: never emit a link with an invented deadline.
+            except Exception:
                 enrollment = None
         if (enrollment and enrollment.get("status") == "pending"
                 and str(enrollment.get("id")) == enrollment_id
                 and enrollment.get("buyer_ref") == row.get("buyer_ref")
-                and enrollment.get("hosted_url") == row.get("hosted_url")):
-            deadline = svc._effective_expiry(
-                enrollment.get("hosted_url_expires_at"), enrollment.get("created_at")
-            )
+                and enrollment.get("hosted_url") == row.get("hosted_url")
+                and not enrollment.get("hosted_url_expiry_invalid")):
+            deadline = svc._effective_expiry(enrollment.get("hosted_url_expires_at"), enrollment.get("created_at"))
+            purchase_deadline = svc._parse_ts(row.get("hosted_url_expires_at"))
+            if deadline is not None and purchase_deadline is not None:
+                deadline = min(deadline, purchase_deadline)
         else:
             deadline = None
         if deadline is None:
             row.pop("hosted_url", None)
+            row.pop("hosted_url_expires_at", None)
         else:
             row["hosted_url_expires_at"] = deadline
     return _public_body(ledger.public_purchase_view(row))
@@ -2933,9 +2943,9 @@ async def list_reap_purchases(
     # THE SAME CONJUNCT AS THE SINGLE READ, and this is the read that matters more: a get that
     # leaks needs an id to be guessed first, and a list that leaks hands the whole set over.
     views = await ledger.list_purchases_for_owner(
-        str(context.agent_id), agent_user_ref_hash, limit=min(int(limit), _LIST_MAX)
+        str(context.agent_id), agent_user_ref_hash, limit=min(int(limit), _LIST_MAX), include_private=True
     )
     return {
-        "purchases": [_public_body(view) for view in views],
+        "purchases": [await _owner_public_body(view) for view in views],
         "limit": min(int(limit), _LIST_MAX),
     }

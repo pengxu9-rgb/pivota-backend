@@ -82,6 +82,7 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
     # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
+    _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
 )
 _MIGRATION = _MIGRATIONS[0]
 
@@ -2623,6 +2624,7 @@ async def test_release_claim_has_no_attempts_delta_on_postgres():
 _ENROLLMENT_PROJECTION = {
     "id", "buyer_ref", "reap_enrollment_id", "status", "hosted_url", "hosted_url_expires_at",
     "card_network", "card_last4", "created_at",
+    "hosted_url_expiry_invalid",
 }
 _ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "updated_at"}
 
