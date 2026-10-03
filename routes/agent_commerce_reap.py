@@ -113,7 +113,7 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, StrictInt
 
 import db.reap_agentic_ledger as ledger
 # THE ONE consent-tag shape rule, imported rather than re-implemented. Bound at module level
@@ -268,6 +268,8 @@ def _refused(exc: svc.PurchaseRefused) -> JSONResponse:
     names fields and bounds and is for our logs, not for a caller.
     """
     reason = str(getattr(exc, "reason", "") or "invalid_request")
+    if reason in {"create_disabled", "pilot_scope_invalid", "pilot_scope_refused"}:
+        return JSONResponse(status_code=404, content={"error": "not_available_on_this_rail"})
     return JSONResponse(
         status_code=_REFUSAL_STATUS.get(reason, _DEFAULT_REFUSAL_STATUS),
         content={"error": reason},
@@ -501,7 +503,7 @@ class StartPurchaseRequest(BaseModel):
     merchant_domain: str = Field(..., min_length=1, max_length=255)
     product_key: str = Field(..., min_length=1)
     variant_key: Optional[str] = None
-    quantity: int = Field(1, ge=1, le=svc.MAX_QUANTITY)
+    quantity: StrictInt = Field(1, ge=1, le=svc.MAX_QUANTITY)
     buyer: ReapBuyer
     return_url: Optional[str] = None
     idempotency_key: Optional[str] = Field(default=None, max_length=128)
@@ -517,6 +519,11 @@ class StartPurchaseRequest(BaseModel):
     #: one owner. Sent to Reap AS GIVEN; if Reap refuses it the purchase is re-quoted without it
     #: and `offer_code_outcome` on the purchase says `dropped_invalid` / `dropped_expired`.
     offer_code: Optional[str] = None
+
+
+class RecoverPurchaseRequest(StartPurchaseRequest):
+    # Recovery must recognize bodies accepted before strict create admission; it cannot spend.
+    quantity: int = Field(1, ge=1, le=svc.MAX_QUANTITY)
 
 
 def _offer_code(value: Any) -> Optional[str]:
@@ -2642,7 +2649,7 @@ async def start_reap_purchase(
         svc.enforce_pilot_scope(
             agent_id=agent_id, merchant_domain=merchant_domain,
             market_country=str(shipping_address.get("country") or ""),
-            product_key=product_key, quantity=int(req.quantity),
+            product_key=product_key, quantity=req.quantity, resolved=False,
         )
 
         # PURCHASABILITY BEFORE EITHER LANE'S ELIGIBILITY, because it is the broader refusal:
@@ -2724,6 +2731,17 @@ async def start_reap_purchase(
                 accept_variant_labels=eligible.accept_variant_labels,
                 also_accept_domains=eligible.also_accept_domains,
             )
+
+        facts = cart_facts if cart_facts is not None else row
+        svc.enforce_pilot_scope(
+            agent_id=agent_id, merchant_domain=(facts["shop_domain"] if isinstance(facts, dict) else facts.merchant_domain),
+            market_country=(facts["market_country"] if isinstance(facts, dict) else facts.market_country),
+            product_key=(facts.get("product_key") if isinstance(facts, dict) else facts.product_key),
+            quantity=req.quantity,
+            variant_key=("shopify:" + str(cart_variant) if cart_facts is not None else row.variant_key),
+            currency=(facts["currency"] if isinstance(facts, dict) else facts.currency),
+            total_minor=(facts["our_price_minor"] if isinstance(facts, dict) else facts.our_price_minor) * req.quantity,
+        )
 
         buyer_id = await _buyer_id_for(
             agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash
@@ -2847,7 +2865,7 @@ async def recover_reap_purchase(
             raise svc.PurchaseRefused("agent_user_required")
         try:
             payload = await request.json()
-            req = StartPurchaseRequest.model_validate(payload)
+            req = RecoverPurchaseRequest.model_validate(payload)
         except (ValueError, ValidationError):
             raise svc.PurchaseRefused("invalid_request", "the recovery body did not validate")
         key = _identifier(req.idempotency_key, "idempotency_key", max_chars=128)

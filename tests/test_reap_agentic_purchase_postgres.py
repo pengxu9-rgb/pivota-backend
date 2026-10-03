@@ -2790,3 +2790,131 @@ async def test_deadline_refresh_losing_lease_preserves_next_holders_recoverable_
     public=await route._owner_view(purchase_id=pid,agent_id='agent_one',agent_user_ref_hash='hash_alice')
     assert public['hosted_url']==fresh['nextAction']['url'] and public['hosted_url_expires_at'].year==2099
     assert len(reap.named('create_enrollment'))==1
+
+
+# Bounded production pilot admission: durable query behavior and real quote totals.
+def _bounded_pilot(**over):
+    scope = {"agent_ids": ["agent_one"], "merchant_domains": ["brand.example"], "markets": ["US"],
+             "product_keys": ["pk_1"], "quantities": [1], "variant_keys": ["vk_1"],
+             "currency": "USD", "max_total_minor": 4500}
+    scope.update(over)
+    return scope
+
+
+def test_production_pilot_requires_all_bounds_or_literal_optout(monkeypatch):
+    import json
+    import services.reap_agentic_purchase as svc
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    for value in [None, "", "UNRESTRICTED", " unrestricted", "null", json.dumps({
+            k: v for k, v in _bounded_pilot().items() if k not in {"variant_keys", "currency", "max_total_minor"}})]:
+        if value is None:
+            monkeypatch.delenv("REAP_AGENTIC_PILOT_SCOPE", raising=False)
+        else:
+            monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", value)
+        assert not svc.is_create_enabled()
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", "unrestricted")
+    assert svc.is_create_enabled()
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot()))
+    assert svc.is_create_enabled()
+
+
+@pytest.mark.parametrize("quantity", [True, 1.0, "1"])
+def test_create_quantity_strict_recovery_legacy_compatible(quantity):
+    from pydantic import ValidationError
+    import routes.agent_commerce_reap as route
+    body = {"merchant_domain": "brand.example", "product_key": "pk_1", "quantity": quantity,
+            "buyer": {"email": EMAIL, "shipping_address": ADDRESS}}
+    with pytest.raises(ValidationError):
+        route.StartPurchaseRequest.model_validate(body)
+    assert route.RecoverPurchaseRequest.model_validate(body).quantity == 1
+
+
+@pytest.mark.parametrize("field,value", [("variant_keys", ["wrong"]), ("currency", "EUR"),
+                                         ("max_total_minor", 4249)])
+async def test_resolved_production_scope_refuses_before_insert(monkeypatch, field, value):
+    import json
+    import services.reap_agentic_purchase as svc
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot(**{field: value})))
+    with pytest.raises(svc.PurchaseRefused) as exc:
+        await _start()
+    assert exc.value.reason == "pilot_scope_refused"
+
+
+@pytest.mark.parametrize("state", ["resolving", "quoting", "needs_enrollment"])
+@pytest.mark.parametrize("settling", [False, True])
+async def test_scope_paused_rows_never_claim_or_exhaust_after_52_ticks(monkeypatch, reap, state, settling):
+    import json
+    import db.reap_agentic_ledger as ledger
+    from db.database import database
+    import services.reap_agentic_purchase as svc
+    purchase = await _start()
+    await database.execute("UPDATE reap_agentic_purchases SET state=:state, attempts=51, last_error_code=:error WHERE id=:id",
+                           {"id": purchase, "state": state, "error": "enrollment_settling" if settling else None})
+    before = await ledger.get_purchase_internal(purchase)
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot(agent_ids=["other-agent"])))
+    for _ in range(52):
+        assert await ledger.claim_due_purchases("scope-worker", pilot_scope=svc.pilot_admission_scope()) == []
+        assert await ledger.fail_exhausted_purchases(50, pilot_scope=svc.pilot_admission_scope()) == []
+    after = await ledger.get_purchase_internal(purchase)
+    for name in ["state", "attempts", "state_entered_at", "last_error_code", "next_poll_at", "claimed_by"]:
+        assert after[name] == before[name]
+    assert reap.calls == []
+    assert await ledger.count_precheckout_paused(pilot_scope=svc.pilot_admission_scope()) == 1
+    assert await ledger.count_stuck_purchases(stuck_after_seconds=60, pilot_scope=svc.pilot_admission_scope()) == 0
+
+
+@pytest.mark.parametrize("state", ["resolving", "quoting", "needs_enrollment"])
+@pytest.mark.parametrize("settling", [False, True])
+async def test_scope_change_after_claim_refunds_only_unadvanced_claim(monkeypatch, reap, state, settling):
+    import json
+    import db.reap_agentic_ledger as ledger
+    from db.database import database
+    import services.reap_agentic_purchase as svc
+    purchase = await _start()
+    await database.execute("UPDATE reap_agentic_purchases SET state=:state, attempts=7, last_error_code=:error WHERE id=:id",
+                           {"id": purchase, "state": state, "error": "enrollment_settling" if settling else None})
+    before = await ledger.get_purchase_internal(purchase)
+    rows = await ledger.claim_due_purchases("scope-worker")
+    assert len(rows) == 1
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot(agent_ids=["other-agent"])))
+    result = await svc.advance(purchase, "scope-worker")
+    assert result.outcome == "released"
+    after = await ledger.get_purchase_internal(purchase)
+    assert after["claimed_by"] is None
+    for name in ["state", "attempts", "state_entered_at", "last_error_code", "next_poll_at"]:
+        assert after[name] == before[name]
+    assert reap.calls == []
+
+
+@pytest.mark.parametrize("cap,allowed", [(4250, False), (4499, False), (4500, True)])
+async def test_quote_tax_shipping_authoritative_total_bounded_before_checkout(monkeypatch, reap, cap, allowed):
+    import json
+    import services.reap_agentic_purchase as svc
+    from db.database import database
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot(max_total_minor=cap)))
+    purchase = await _start()
+    await _active_enrollment()
+    await database.execute("UPDATE reap_agentic_purchases SET state='quoting' WHERE id=:id", {"id": purchase})
+    result = await _step(purchase)
+    assert bool(reap.named("create_checkout")) is allowed
+    assert result.state == ("awaiting_approval" if allowed else "refused")
+    if not allowed:
+        assert result.refusal_reason == "pilot_scope_refused"
+
+
+async def test_pause_refund_cannot_touch_changed_attempt_or_foreign_holder():
+    import db.reap_agentic_ledger as ledger
+    from db.database import database
+    purchase = await _start()
+    rows = await ledger.claim_due_purchases("scope-worker")
+    assert len(rows) == 1
+    stale = rows[0]
+    await database.execute("UPDATE reap_agentic_purchases SET attempts=attempts+1 WHERE id=:id", {"id": purchase})
+    assert await ledger.release_paused_claim(stale, "scope-worker") is None
+    current = await ledger.get_purchase_internal(purchase)
+    assert await ledger.release_paused_claim(current, "foreign-worker") is None
+    assert (await ledger.get_purchase_internal(purchase))["claimed_by"] == "scope-worker"

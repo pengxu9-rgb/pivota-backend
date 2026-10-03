@@ -1082,6 +1082,7 @@ async def test_create_pause_keeps_precheckout_queued_and_reconciles_exposed_chec
 
 @pytest.mark.parametrize("queued_state", ["resolving", "needs_enrollment", "quoting"])
 async def test_narrowed_pilot_scope_prevents_queued_provider_work_but_reads_exposed_checkout(monkeypatch, reap, queued_state):
+    monkeypatch.setenv("PIVOTA_ENV", "staging")
     import json
     import db.reap_agentic_ledger as ledger
     queued = await _start(buyer_ref="bref_queue_scope")
@@ -1095,7 +1096,8 @@ async def test_narrowed_pilot_scope_prevents_queued_provider_work_but_reads_expo
     await _run()
     pending = await ledger.get_purchase_internal(queued)
     assert pending["state"] == queued_state
-    assert pending["last_error_code"] == "pilot_scope_refused"
+    assert pending["last_error_code"] is None
+    assert pending["attempts"] == 0
     assert (await ledger.get_purchase_internal(exposed))["state"] == "completed"
     assert [name for name, _ in reap.calls] == ["get_checkout"]
 

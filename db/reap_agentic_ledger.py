@@ -1743,6 +1743,11 @@ _SELECT_DUE_PURCHASES_SQL = """
        AND next_poll_at <= clock_timestamp()
        AND (:reconciliation_only = 0 OR
             (state IN ('awaiting_approval', 'processing') AND reap_checkout_id IS NOT NULL))
+       AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((CAST(agent_id AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'agent_ids')) AND CAST(merchant_domain AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'merchant_domains')) AND CAST(market_country AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'markets')) AND CAST(product_key AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'product_keys')) AND CAST(quantity AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'quantities')) AND (NOT jsonb_exists(CAST(:pilot_scope AS jsonb), 'variant_keys') OR (
+                variant_key IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'variant_keys'))
+                AND currency = CAST(:pilot_scope AS jsonb)->>'currency'
+                AND quantity > 0 AND our_price_minor > 0
+                AND our_price_minor <= CAST(CAST(:pilot_scope AS jsonb)->>'max_total_minor' AS BIGINT) / quantity))), FALSE))
      ORDER BY next_poll_at ASC, id ASC
      LIMIT :limit
 """
@@ -1755,6 +1760,11 @@ _SELECT_DUE_PURCHASES_SQL_SQLITE = """
        AND next_poll_at <= CURRENT_TIMESTAMP
        AND (:reconciliation_only = 0 OR
             (state IN ('awaiting_approval', 'processing') AND reap_checkout_id IS NOT NULL))
+       AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((agent_id IN (SELECT value FROM json_each(:pilot_scope, '$.agent_ids')) AND merchant_domain IN (SELECT value FROM json_each(:pilot_scope, '$.merchant_domains')) AND market_country IN (SELECT value FROM json_each(:pilot_scope, '$.markets')) AND product_key IN (SELECT value FROM json_each(:pilot_scope, '$.product_keys')) AND quantity IN (SELECT value FROM json_each(:pilot_scope, '$.quantities')) AND (json_type(:pilot_scope, '$.variant_keys') IS NULL OR (
+                variant_key IN (SELECT value FROM json_each(:pilot_scope, '$.variant_keys'))
+                AND currency = json_extract(:pilot_scope, '$.currency')
+                AND quantity > 0 AND our_price_minor > 0
+                AND our_price_minor <= json_extract(:pilot_scope, '$.max_total_minor') / quantity))), FALSE))
      ORDER BY next_poll_at ASC, id ASC
      LIMIT :limit
 """
@@ -1799,6 +1809,11 @@ _CLAIM_PURCHASE_SQL = """
        )
        AND (:reconciliation_only = 0 OR
             (state IN ('awaiting_approval', 'processing') AND reap_checkout_id IS NOT NULL))
+       AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((CAST(agent_id AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'agent_ids')) AND CAST(merchant_domain AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'merchant_domains')) AND CAST(market_country AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'markets')) AND CAST(product_key AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'product_keys')) AND CAST(quantity AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'quantities')) AND (NOT jsonb_exists(CAST(:pilot_scope AS jsonb), 'variant_keys') OR (
+                variant_key IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'variant_keys'))
+                AND currency = CAST(:pilot_scope AS jsonb)->>'currency'
+                AND quantity > 0 AND our_price_minor > 0
+                AND our_price_minor <= CAST(CAST(:pilot_scope AS jsonb)->>'max_total_minor' AS BIGINT) / quantity))), FALSE))
     RETURNING *
 """
 
@@ -1818,6 +1833,11 @@ _CLAIM_PURCHASE_SQL_SQLITE = """
        )
        AND (:reconciliation_only = 0 OR
             (state IN ('awaiting_approval', 'processing') AND reap_checkout_id IS NOT NULL))
+       AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((agent_id IN (SELECT value FROM json_each(:pilot_scope, '$.agent_ids')) AND merchant_domain IN (SELECT value FROM json_each(:pilot_scope, '$.merchant_domains')) AND market_country IN (SELECT value FROM json_each(:pilot_scope, '$.markets')) AND product_key IN (SELECT value FROM json_each(:pilot_scope, '$.product_keys')) AND quantity IN (SELECT value FROM json_each(:pilot_scope, '$.quantities')) AND (json_type(:pilot_scope, '$.variant_keys') IS NULL OR (
+                variant_key IN (SELECT value FROM json_each(:pilot_scope, '$.variant_keys'))
+                AND currency = json_extract(:pilot_scope, '$.currency')
+                AND quantity > 0 AND our_price_minor > 0
+                AND our_price_minor <= json_extract(:pilot_scope, '$.max_total_minor') / quantity))), FALSE))
     RETURNING *
 """
 
@@ -1946,8 +1966,70 @@ _SELECT_DUE_STATES = _states_in(_SELECT_DUE_PURCHASES_SQL, "WHERE state IN (")
 _CLAIM_ATTEMPT_EXEMPT_STATES = _states_in(_CLAIM_PURCHASE_SQL, "attempts = CASE WHEN state IN (")
 
 
+def _scope_param(scope):
+    return json.dumps(scope, sort_keys=True, separators=(",", ":")) if scope is not None else None
+
+
+_COUNT_PRECHECKOUT_PAUSED_SQL = """
+    SELECT COUNT(*) AS paused FROM reap_agentic_purchases
+     WHERE state IN ('resolving', 'needs_enrollment', 'quoting')
+       AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
+       AND (:precheckout_enabled = 0 OR NOT (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((CAST(agent_id AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'agent_ids')) AND CAST(merchant_domain AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'merchant_domains')) AND CAST(market_country AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'markets')) AND CAST(product_key AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'product_keys')) AND CAST(quantity AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'quantities')) AND (NOT jsonb_exists(CAST(:pilot_scope AS jsonb), 'variant_keys') OR (
+                variant_key IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'variant_keys'))
+                AND currency = CAST(:pilot_scope AS jsonb)->>'currency'
+                AND quantity > 0 AND our_price_minor > 0
+                AND our_price_minor <= CAST(CAST(:pilot_scope AS jsonb)->>'max_total_minor' AS BIGINT) / quantity))), FALSE)))
+"""
+
+_COUNT_PRECHECKOUT_PAUSED_SQL_SQLITE = """
+    SELECT COUNT(*) AS paused FROM reap_agentic_purchases
+     WHERE state IN ('resolving', 'needs_enrollment', 'quoting')
+       AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
+       AND (:precheckout_enabled = 0 OR NOT (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((agent_id IN (SELECT value FROM json_each(:pilot_scope, '$.agent_ids')) AND merchant_domain IN (SELECT value FROM json_each(:pilot_scope, '$.merchant_domains')) AND market_country IN (SELECT value FROM json_each(:pilot_scope, '$.markets')) AND product_key IN (SELECT value FROM json_each(:pilot_scope, '$.product_keys')) AND quantity IN (SELECT value FROM json_each(:pilot_scope, '$.quantities')) AND (json_type(:pilot_scope, '$.variant_keys') IS NULL OR (
+                variant_key IN (SELECT value FROM json_each(:pilot_scope, '$.variant_keys'))
+                AND currency = json_extract(:pilot_scope, '$.currency')
+                AND quantity > 0 AND our_price_minor > 0
+                AND our_price_minor <= json_extract(:pilot_scope, '$.max_total_minor') / quantity))), FALSE)))
+"""
+
+async def count_precheckout_paused(*, precheckout_enabled=True, pilot_scope=None):
+    row = await database.fetch_one(
+        _COUNT_PRECHECKOUT_PAUSED_SQL if IS_POSTGRES else _COUNT_PRECHECKOUT_PAUSED_SQL_SQLITE,
+        {"precheckout_enabled": int(precheckout_enabled), "pilot_scope": _scope_param(pilot_scope)})
+    return int(row["paused"]) if row is not None else 0
+
+
+_RELEASE_PAUSED_CLAIM_SQL = """
+    UPDATE reap_agentic_purchases
+       SET claimed_by = NULL, claimed_at = NULL, updated_at = clock_timestamp(),
+           attempts = CASE WHEN state IN ('resolving', 'quoting') AND attempts > 0
+                       AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
+                       AND NOT (state = 'resolving' AND COALESCE(last_error_code,'') = 'enrollment_settling')
+                     THEN attempts - 1 ELSE attempts END
+     WHERE id = :id AND claimed_by = :worker_id AND state = :state AND attempts = :attempts
+    RETURNING *
+"""
+
+_RELEASE_PAUSED_CLAIM_SQL_SQLITE = """
+    UPDATE reap_agentic_purchases
+       SET claimed_by = NULL, claimed_at = NULL, updated_at = CURRENT_TIMESTAMP,
+           attempts = CASE WHEN state IN ('resolving', 'quoting') AND attempts > 0
+                       AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
+                       AND NOT (state = 'resolving' AND COALESCE(last_error_code,'') = 'enrollment_settling')
+                     THEN attempts - 1 ELSE attempts END
+     WHERE id = :id AND claimed_by = :worker_id AND state = :state AND attempts = :attempts
+    RETURNING *
+"""
+
+async def release_paused_claim(row, worker_id):
+    _require_worker_id(worker_id, "worker_id")
+    return _purchase(await database.fetch_one(
+        _RELEASE_PAUSED_CLAIM_SQL if IS_POSTGRES else _RELEASE_PAUSED_CLAIM_SQL_SQLITE,
+        {"id": str(row["id"]), "worker_id": worker_id, "state": str(row["state"]), "attempts": row["attempts"]}))
+
+
 async def claim_due_purchases(
-    worker_id: str, *, limit: int = 10, reconciliation_only: bool = False
+    worker_id: str, *, limit: int = 10, reconciliation_only: bool = False, pilot_scope: Optional[Mapping[str, Any]] = None
 ) -> List[Dict[str, Any]]:
     """Take a lease on up to `limit` purchases whose next_poll_at has come.
 
@@ -1975,18 +2057,18 @@ async def claim_due_purchases(
     if IS_POSTGRES:
         candidates = await database.fetch_all(
             _SELECT_DUE_PURCHASES_SQL,
-            {"limit": capped, "reconciliation_only": int(reconciliation_only)},
+            {"limit": capped, "reconciliation_only": int(reconciliation_only), "pilot_scope": _scope_param(pilot_scope)},
         )
     else:
         candidates = await database.fetch_all(
             _SELECT_DUE_PURCHASES_SQL_SQLITE,
-            {"limit": capped, "reconciliation_only": int(reconciliation_only)},
+            {"limit": capped, "reconciliation_only": int(reconciliation_only), "pilot_scope": _scope_param(pilot_scope)},
         )
     claimed: List[Dict[str, Any]] = []
     for candidate in candidates:
         params = {
             "id": candidate["id"], "worker_id": worker_id,
-            "reconciliation_only": int(reconciliation_only),
+            "reconciliation_only": int(reconciliation_only), "pilot_scope": _scope_param(pilot_scope),
         }
         if IS_POSTGRES:
             row = await database.fetch_one(_CLAIM_PURCHASE_SQL, params)
@@ -2226,6 +2308,12 @@ _FAIL_EXHAUSTED_SQL = """
        AND (:include_processing = 1 OR state <> 'processing')
        AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
+       AND (:precheckout_enabled = 1 OR state NOT IN ('resolving', 'needs_enrollment', 'quoting'))
+       AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((CAST(agent_id AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'agent_ids')) AND CAST(merchant_domain AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'merchant_domains')) AND CAST(market_country AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'markets')) AND CAST(product_key AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'product_keys')) AND CAST(quantity AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'quantities')) AND (NOT jsonb_exists(CAST(:pilot_scope AS jsonb), 'variant_keys') OR (
+                variant_key IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'variant_keys'))
+                AND currency = CAST(:pilot_scope AS jsonb)->>'currency'
+                AND quantity > 0 AND our_price_minor > 0
+                AND our_price_minor <= CAST(CAST(:pilot_scope AS jsonb)->>'max_total_minor' AS BIGINT) / quantity))), FALSE))
        AND attempts >= :max_attempts
        AND id IN (
         SELECT id FROM reap_agentic_purchases
@@ -2235,6 +2323,12 @@ _FAIL_EXHAUSTED_SQL = """
            AND (:include_processing = 1 OR state <> 'processing')
            AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
            AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
+       AND (:precheckout_enabled = 1 OR state NOT IN ('resolving', 'needs_enrollment', 'quoting'))
+       AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((CAST(agent_id AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'agent_ids')) AND CAST(merchant_domain AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'merchant_domains')) AND CAST(market_country AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'markets')) AND CAST(product_key AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'product_keys')) AND CAST(quantity AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'quantities')) AND (NOT jsonb_exists(CAST(:pilot_scope AS jsonb), 'variant_keys') OR (
+                variant_key IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'variant_keys'))
+                AND currency = CAST(:pilot_scope AS jsonb)->>'currency'
+                AND quantity > 0 AND our_price_minor > 0
+                AND our_price_minor <= CAST(CAST(:pilot_scope AS jsonb)->>'max_total_minor' AS BIGINT) / quantity))), FALSE))
        AND attempts >= :max_attempts
          ORDER BY attempts DESC, id ASC
          LIMIT :limit
@@ -2260,6 +2354,12 @@ _FAIL_EXHAUSTED_SQL_SQLITE = """
        AND (:include_processing = 1 OR state <> 'processing')
        AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
+       AND (:precheckout_enabled = 1 OR state NOT IN ('resolving', 'needs_enrollment', 'quoting'))
+       AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((agent_id IN (SELECT value FROM json_each(:pilot_scope, '$.agent_ids')) AND merchant_domain IN (SELECT value FROM json_each(:pilot_scope, '$.merchant_domains')) AND market_country IN (SELECT value FROM json_each(:pilot_scope, '$.markets')) AND product_key IN (SELECT value FROM json_each(:pilot_scope, '$.product_keys')) AND quantity IN (SELECT value FROM json_each(:pilot_scope, '$.quantities')) AND (json_type(:pilot_scope, '$.variant_keys') IS NULL OR (
+                variant_key IN (SELECT value FROM json_each(:pilot_scope, '$.variant_keys'))
+                AND currency = json_extract(:pilot_scope, '$.currency')
+                AND quantity > 0 AND our_price_minor > 0
+                AND our_price_minor <= json_extract(:pilot_scope, '$.max_total_minor') / quantity))), FALSE))
        AND attempts >= :max_attempts
        AND id IN (
         SELECT id FROM reap_agentic_purchases
@@ -2269,6 +2369,12 @@ _FAIL_EXHAUSTED_SQL_SQLITE = """
            AND (:include_processing = 1 OR state <> 'processing')
            AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
            AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
+       AND (:precheckout_enabled = 1 OR state NOT IN ('resolving', 'needs_enrollment', 'quoting'))
+       AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((agent_id IN (SELECT value FROM json_each(:pilot_scope, '$.agent_ids')) AND merchant_domain IN (SELECT value FROM json_each(:pilot_scope, '$.merchant_domains')) AND market_country IN (SELECT value FROM json_each(:pilot_scope, '$.markets')) AND product_key IN (SELECT value FROM json_each(:pilot_scope, '$.product_keys')) AND quantity IN (SELECT value FROM json_each(:pilot_scope, '$.quantities')) AND (json_type(:pilot_scope, '$.variant_keys') IS NULL OR (
+                variant_key IN (SELECT value FROM json_each(:pilot_scope, '$.variant_keys'))
+                AND currency = json_extract(:pilot_scope, '$.currency')
+                AND quantity > 0 AND our_price_minor > 0
+                AND our_price_minor <= json_extract(:pilot_scope, '$.max_total_minor') / quantity))), FALSE))
        AND attempts >= :max_attempts
          ORDER BY attempts DESC, id ASC
          LIMIT :limit
@@ -2460,7 +2566,8 @@ async def scrub_reconciling_purchase_pii(
 
 
 async def fail_exhausted_purchases(
-    max_attempts: int, *, limit: int = 200, include_processing: bool = False
+    max_attempts: int, *, limit: int = 200, include_processing: bool = False,
+    precheckout_enabled: bool = True, pilot_scope: Optional[Mapping[str, Any]] = None
 ) -> List[str]:
     """Fail non-terminal purchases claimed `max_attempts` times or more; return the ids.
 
@@ -2482,6 +2589,7 @@ async def fail_exhausted_purchases(
         "max_attempts": attempts_bound,
         "limit": capped,
         "include_processing": 1 if include_processing else 0,
+        "precheckout_enabled": int(precheckout_enabled), "pilot_scope": _scope_param(pilot_scope),
     }
     if IS_POSTGRES:
         rows = await database.fetch_all(_FAIL_EXHAUSTED_SQL, params)
@@ -2523,6 +2631,11 @@ _COUNT_STUCK_PURCHASES_SQL = """
     SELECT COUNT(*) AS stuck FROM reap_agentic_purchases
      WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
        AND (:reconciliation_only = 0 OR ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL))
+       AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((CAST(agent_id AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'agent_ids')) AND CAST(merchant_domain AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'merchant_domains')) AND CAST(market_country AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'markets')) AND CAST(product_key AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'product_keys')) AND CAST(quantity AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'quantities')) AND (NOT jsonb_exists(CAST(:pilot_scope AS jsonb), 'variant_keys') OR (
+                variant_key IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'variant_keys'))
+                AND currency = CAST(:pilot_scope AS jsonb)->>'currency'
+                AND quantity > 0 AND our_price_minor > 0
+                AND our_price_minor <= CAST(CAST(:pilot_scope AS jsonb)->>'max_total_minor' AS BIGINT) / quantity))), FALSE))
        AND NOT (substr(COALESCE(last_error_code,''),1,21) = 'checkout_unresolvable' AND substr(last_error_code,22,1) = chr(58))
        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
        AND (
@@ -2550,6 +2663,11 @@ _COUNT_STUCK_PURCHASES_SQL_SQLITE = """
     SELECT COUNT(*) AS stuck FROM reap_agentic_purchases
      WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
        AND (:reconciliation_only = 0 OR ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL))
+       AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((agent_id IN (SELECT value FROM json_each(:pilot_scope, '$.agent_ids')) AND merchant_domain IN (SELECT value FROM json_each(:pilot_scope, '$.merchant_domains')) AND market_country IN (SELECT value FROM json_each(:pilot_scope, '$.markets')) AND product_key IN (SELECT value FROM json_each(:pilot_scope, '$.product_keys')) AND quantity IN (SELECT value FROM json_each(:pilot_scope, '$.quantities')) AND (json_type(:pilot_scope, '$.variant_keys') IS NULL OR (
+                variant_key IN (SELECT value FROM json_each(:pilot_scope, '$.variant_keys'))
+                AND currency = json_extract(:pilot_scope, '$.currency')
+                AND quantity > 0 AND our_price_minor > 0
+                AND our_price_minor <= json_extract(:pilot_scope, '$.max_total_minor') / quantity))), FALSE))
        AND NOT (substr(COALESCE(last_error_code,''),1,21) = 'checkout_unresolvable' AND substr(last_error_code,22,1) = char(58))
        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
        AND (
@@ -2581,6 +2699,7 @@ async def count_stuck_purchases(
     *,
     stuck_after_seconds: int,
     reconciliation_only: bool = False,
+    pilot_scope: Optional[Mapping[str, Any]] = None,
     max_age_seconds: int = 3600,
     enrollment_grace_seconds: int = ENROLLMENT_GRACE_SECONDS_DEFAULT,
 ) -> int:
@@ -2609,7 +2728,7 @@ async def count_stuck_purchases(
         row = await database.fetch_one(
             _COUNT_STUCK_PURCHASES_SQL,
             {
-                "reconciliation_only": int(reconciliation_only),
+                "reconciliation_only": int(reconciliation_only), "pilot_scope": _scope_param(pilot_scope),
                 "stuck_seconds": stuck_after,
                 "stuck_grace_seconds": stuck_after + grace,
                 "stuck_max_age_seconds": stuck_after + max_age,
@@ -2619,7 +2738,7 @@ async def count_stuck_purchases(
         row = await database.fetch_one(
             _COUNT_STUCK_PURCHASES_SQL_SQLITE,
             {
-                "reconciliation_only": int(reconciliation_only),
+                "reconciliation_only": int(reconciliation_only), "pilot_scope": _scope_param(pilot_scope),
                 "stuck_window": f"-{stuck_after} seconds",
                 "stuck_grace_window": f"-{stuck_after + grace} seconds",
                 "stuck_max_age_window": f"-{stuck_after + max_age} seconds",

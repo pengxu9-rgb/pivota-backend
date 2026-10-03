@@ -396,6 +396,7 @@ class PollReport:
     failed_exhausted: int = 0
     processing_over_attempts: int = 0
     stuck_over_age: int = -1
+    precheckout_paused: int = 0
     contact_retention_blocked: int = 0
     checkout_needs_human: int = 0
     claimed: int = 0
@@ -410,6 +411,7 @@ class PollReport:
 
 
 _COUNTS = (
+    "precheckout_paused",
     "checkout_needs_human",
     "contact_retention_blocked",
     "requeued",
@@ -683,10 +685,13 @@ async def run_reap_agentic_purchase_poll(
                 counts["errors"] += 1
                 logger.error("reap_agentic_poll: could not count %s (error_type=%s); not counted", "stuck purchases" if name == "stuck_over_age" else name, type(exc).__name__)
         await asyncio.gather(
+            _diagnostic("precheckout_paused", ledger.count_precheckout_paused(
+                precheckout_enabled=_precheckout_enabled(), pilot_scope=purchase_svc.pilot_admission_scope())),
             _diagnostic("contact_retention_blocked", ledger.count_contact_retention_blocked()),
             _diagnostic("checkout_needs_human", ledger.count_checkout_needs_human()),
             _diagnostic("stuck_over_age", ledger.count_stuck_purchases(
             stuck_after_seconds=STUCK_AFTER_SECONDS,
+            pilot_scope=purchase_svc.pilot_admission_scope(),
             reconciliation_only=(not _precheckout_enabled() or not purchase_svc.is_reconciliation_enabled()
                                  or not rc.is_configured() or (not is_production() and not rc.is_sandbox_base_url())),
             max_age_seconds=hosted_max_age,
@@ -751,7 +756,8 @@ async def run_reap_agentic_purchase_poll(
         # It is also why step 3b exists: a refusal nobody can see is indistinguishable from a
         # sweep that had nothing to do.
         return await ledger.fail_exhausted_purchases(
-            max_attempts, limit=limit, include_processing=False
+            max_attempts, limit=limit, include_processing=False,
+            precheckout_enabled=_precheckout_enabled(), pilot_scope=purchase_svc.pilot_admission_scope()
         )
 
     counts["failed_exhausted"] = await _sweep_until_drained(
@@ -835,7 +841,7 @@ async def run_reap_agentic_purchase_poll(
     try:
         # Include acquisition in cleanup: cancellation may land after a partial batch claim.
         rows = await ledger.claim_due_purchases(
-            worker, limit=claim_batch,
+            worker, limit=claim_batch, pilot_scope=purchase_svc.pilot_admission_scope(),
             **({"reconciliation_only": True} if reconciliation_only else {})
         )
         counts["claimed"] = len(rows)

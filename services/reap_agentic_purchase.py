@@ -181,12 +181,24 @@ REAP_AGENTIC_PILOT_SCOPE_ENV = "REAP_AGENTIC_PILOT_SCOPE"
 
 
 
-def _pilot_scope() -> Optional[Dict[str, list]]:
+_SCOPE_POSTURES: set = set()
+
+
+def _pilot_scope() -> Optional[Dict[str, Any]]:
+    """A bounded production cohort. Only literal unrestricted is an explicit opt-out."""
+    from config.platform import is_production, platform_env
     configured = os.getenv(REAP_AGENTIC_PILOT_SCOPE_ENV)
-    if configured is None:
-        return None
-    names = {"agent_ids", "merchant_domains", "markets", "product_keys", "quantities"}
-    def no_duplicate_keys(pairs):
+    base = {"agent_ids", "merchant_domains", "markets", "product_keys", "quantities"}
+    complete = base | {"variant_keys", "currency", "max_total_minor"}
+    def posture(kind, raw, error=False):
+        import hashlib
+        fingerprint = hashlib.sha256((raw or "").encode()).hexdigest()[:12]
+        key = (kind, fingerprint)
+        if key not in _SCOPE_POSTURES:
+            _SCOPE_POSTURES.add(key)
+            (logger.error if error else logger.info)(
+                "reap_agentic pilot posture=%s fingerprint=%s", kind, fingerprint)
+    def no_duplicates(pairs):
         result = {}
         for key, value in pairs:
             if key in result:
@@ -194,14 +206,24 @@ def _pilot_scope() -> Optional[Dict[str, list]]:
             result[key] = value
         return result
     try:
-        scope = json.loads(configured, object_pairs_hook=no_duplicate_keys)
-        if not isinstance(scope, dict) or not scope or set(scope) != names:
+        if configured is None:
+            if is_production():
+                raise ValueError
+            posture("nonproduction_unset", None)
+            return None
+        if configured == "unrestricted":
+            posture("explicit_unrestricted", configured)
+            return None
+        scope = json.loads(configured, object_pairs_hook=no_duplicates)
+        if not isinstance(scope, dict) or (set(scope) != complete and not (
+                platform_env() == "staging" and set(scope) == base)):
             raise ValueError
-        for name, values in scope.items():
+        for name in base | ({"variant_keys"} if "variant_keys" in scope else set()):
+            values = scope[name]
             if not isinstance(values, list) or not values:
                 raise ValueError
             if name == "quantities":
-                if any(type(v) is not int or v < 1 or v > 100 for v in values):
+                if any(type(v) is not int or v < 1 or v > MAX_QUANTITY for v in values):
                     raise ValueError
             else:
                 if any(not isinstance(v, str) or not v or v != v.strip() or len(v) > 1024
@@ -211,16 +233,21 @@ def _pilot_scope() -> Optional[Dict[str, list]]:
                     raise ValueError
                 if name == "merchant_domains" and any(
                     not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", v)
-                    or "." not in v or ".." in v or canonical_merchant_domain(v) != v for v in values
-                ):
+                    or "." not in v or ".." in v or canonical_merchant_domain(v) != v for v in values):
                     raise ValueError
+        if "currency" in scope and (not isinstance(scope["currency"], str)
+                or not re.fullmatch(r"[A-Z]{3}", scope["currency"])
+                or type(scope["max_total_minor"]) is not int or scope["max_total_minor"] < 1
+                or scope["max_total_minor"] > 9223372036854775807):
+            raise ValueError
+        posture("bounded" if set(scope) == complete else "nonproduction_legacy", configured)
         return scope
     except (ValueError, TypeError):
-        raise PurchaseRefused("pilot_scope_invalid", "configured pilot scope is invalid")
+        posture("invalid_or_missing", configured, True)
+        raise PurchaseRefused("pilot_scope_invalid", "configured pilot scope is invalid") from None
 
 
 def is_create_enabled() -> bool:
-    """Optional create-only pause. Unset inherits master; malformed dials/scope fail closed."""
     value = os.getenv(REAP_AGENTIC_CREATE_ENABLED_ENV)
     if not is_enabled() or (value is not None and value.strip().lower() not in _TRUTHY):
         return False
@@ -231,17 +258,48 @@ def is_create_enabled() -> bool:
     return True
 
 
+def pilot_admission_scope() -> Optional[Dict[str, Any]]:
+    """Validated query admission; an invalid scope admits no pre-checkout row."""
+    try:
+        return _pilot_scope()
+    except PurchaseRefused:
+        return {}
+
+
 def enforce_pilot_scope(*, agent_id: str, merchant_domain: str, market_country: str,
-                        product_key: str, quantity: int) -> None:
-    """Optional exact allowlists, applied only to fresh creates. Never logs configured IDs."""
+                        product_key: str, quantity: int, variant_key: Optional[str] = None,
+                        currency: Optional[str] = None, total_minor: Optional[int] = None,
+                        resolved: bool = True) -> None:
+    if type(quantity) is not int or not 1 <= quantity <= MAX_QUANTITY:
+        raise PurchaseRefused("invalid_request", "quantity must be an integer")
+    try:
+        domain = canonical_merchant_domain(merchant_domain)
+    except (ValueError, TypeError):
+        raise PurchaseRefused("invalid_request", "merchant domain is invalid") from None
     scope = _pilot_scope()
     if scope is None:
         return
-    fields = {"agent_ids": agent_id, "merchant_domains": canonical_merchant_domain(merchant_domain),
-              "markets": str(market_country).upper(), "product_keys": product_key,
-              "quantities": quantity}
-    if any(fields[name] not in values for name, values in scope.items()):
+    market = str(market_country).strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", market):
+        raise PurchaseRefused("invalid_request", "market country is invalid")
+    fields = {"agent_ids": agent_id, "merchant_domains": domain, "markets": market,
+              "product_keys": product_key, "quantities": quantity}
+    if any(value not in scope[name] for name, value in fields.items()):
         raise PurchaseRefused("pilot_scope_refused", "request is outside configured pilot scope")
+    if resolved and "variant_keys" in scope and (
+            variant_key not in scope["variant_keys"] or currency != scope["currency"]
+            or type(total_minor) is not int or total_minor < 0
+            or total_minor > scope["max_total_minor"]):
+        raise PurchaseRefused("pilot_scope_refused", "resolved item or total is outside pilot scope")
+
+
+def _row_scope(row, *, total_minor=None):
+    return enforce_pilot_scope(
+        agent_id=str(row.get("agent_id") or ""), merchant_domain=str(row.get("merchant_domain") or ""),
+        market_country=str(row.get("market_country") or ""), product_key=str(row.get("product_key") or ""),
+        quantity=row.get("quantity"), variant_key=row.get("variant_key"), currency=row.get("currency"),
+        total_minor=total_minor if total_minor is not None else (row.get("our_price_minor") * row.get("quantity")
+            if type(row.get("our_price_minor")) is int and type(row.get("quantity")) is int else None))
 
 
 #: The CART-LINK lane's own dial (Tier B: a Shopify cart permalink Reap quotes as received).
@@ -1523,6 +1581,12 @@ async def start_purchase(
             agent_id=agent_id, merchant_domain=str(scope_item.shop_domain if isinstance(scope_item, CartLinkItem) else scope_item.merchant_domain),
             market_country=str(scope_item.market_country or ""),
             product_key=str(scope_item.product_key or ""), quantity=quantity,
+            variant_key=("shopify:" + str(cart_link_line(scope_item.cart_url)[0])
+                         if isinstance(scope_item, CartLinkItem) and cart_link_line(scope_item.cart_url)
+                         else getattr(scope_item, "variant_key", None)),
+            currency=str(scope_item.currency or "").upper(),
+            total_minor=(scope_item.our_price_minor * quantity
+                         if type(scope_item.our_price_minor) is int and type(quantity) is int else None),
         )
 
     # 2b. THE CONSENT, ON BOTH LANES. Since migration 233 the purchase ROW carries the tag that
@@ -1554,7 +1618,7 @@ async def start_purchase(
     # 3. THE ROW.
     if not isinstance(row, PurchaseRow):
         raise PurchaseRefused("invalid_request", "row must be a PurchaseRow")
-    merchant_domain = _require_text(row.merchant_domain, "row.merchant_domain")
+    merchant_domain = canonical_merchant_domain(_require_text(row.merchant_domain, "row.merchant_domain"))
     product_key = _require_text(row.product_key, "row.product_key")
     product_name = _require_text(row.product_name, "row.product_name")
     currency = _require_text(row.currency, "row.currency").upper()
@@ -1904,6 +1968,7 @@ async def _start_cart_link_purchase(
             agent_user_ref_hash=agent_user_ref_hash,
             merchant_domain=shop_domain,
             product_key=str(item.product_key or "").strip() or None,
+            variant_key="shopify:" + str(line[0]),
             product_name=str(item.product_name or "").strip() or None,
             variant_title=str(item.variant_title or "").strip() or None,
             quantity=quantity,
@@ -2166,6 +2231,16 @@ async def _release(
     )
 
 
+async def _pause_precheckout(row, worker_id):
+    # Only refund this still-owned, unadvanced claim. Preserve attempts accumulated by work,
+    # enrollment settling provenance and the state clock; pausing is not an error transition.
+    released = await ledger.release_paused_claim(row, worker_id)
+    if released is None:
+        return _lost(row)
+    return AdvanceResult(str(row["id"]), outcome="released", state=str(row["state"]),
+                         last_error_code=row.get("last_error_code"))
+
+
 async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
     """ONE step for a purchase the caller has ALREADY CLAIMED.
 
@@ -2192,19 +2267,13 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
     if state in {"resolving", "needs_enrollment", "quoting"} and row.get("last_error_code") == "contact_retention_elapsed":
         # Privacy expiry never invents a payment outcome or permits a new provider operation.
         return await _release(row, worker_id, error_code="contact_retention_elapsed")
-    if state in {"resolving", "needs_enrollment", "quoting"} and not is_create_enabled():
-        return await _release(row, worker_id, error_code="create_disabled")
     if state in {"resolving", "needs_enrollment", "quoting"}:
         try:
-            enforce_pilot_scope(
-                agent_id=str(row.get("agent_id") or ""),
-                merchant_domain=str(row.get("merchant_domain") or ""),
-                market_country=str(row.get("market_country") or ""),
-                product_key=str(row.get("product_key") or ""),
-                quantity=row.get("quantity"),
-            )
-        except PurchaseRefused as exc:
-            return await _release(row, worker_id, error_code=exc.reason)
+            if not is_create_enabled():
+                raise PurchaseRefused("create_disabled")
+            _row_scope(row)
+        except PurchaseRefused:
+            return await _pause_precheckout(row, worker_id)
     handler = _STEPS.get(state)
     if handler is None:  # pragma: no cover — every non-terminal state has a step
         raise RuntimeError(f"no step for purchase state {state!r}")
@@ -3393,6 +3462,13 @@ async def _checkout_from_quote(
 
     if await _still_ours(row, worker_id) is None:
         return _lost(row)
+    if not is_create_enabled():
+        return await _pause_precheckout(row, worker_id)
+    try:
+        _row_scope(row, total_minor=verdict.total_minor)
+    except PurchaseRefused as exc:
+        return await _move(row, worker_id, ["quoting"], "refused",
+                           refusal_reason=exc.reason, last_error_code=exc.reason, **evidence)
     checkout = await rc.create_checkout(
         quote_id=quote_id,
         enrollment_id=partner_enrollment,
