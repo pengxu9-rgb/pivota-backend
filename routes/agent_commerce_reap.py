@@ -1,6 +1,6 @@
 """The agent-facing door onto the Reap agentic purchase rail (WP4).
 
-Four routes over the machinery WP1–WP3 built. This module owns NO state and makes NO partner
+Routes over the machinery WP1–WP3 built. This module owns NO state and makes NO partner
 call: it decides whether a purchase may be opened, builds the one `PurchaseRow` that
 `services.reap_agentic_purchase.start_purchase` will trust, and reads rows back to the buyer they
 belong to. Everything that talks to Reap happens later, in the poller, on another process.
@@ -95,7 +95,7 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError, StrictInt
+from pydantic import BaseModel, Field, ValidationError, StrictInt, StrictStr
 
 import db.reap_agentic_ledger as ledger
 # THE ONE consent-tag shape rule, imported rather than re-implemented. Bound at module level
@@ -507,6 +507,19 @@ class StartPurchaseRequest(BaseModel):
 class RecoverPurchaseRequest(StartPurchaseRequest):
     # Recovery must recognize bodies accepted before strict create admission; it cannot spend.
     quantity: int = Field(1, ge=1, le=svc.MAX_QUANTITY)
+
+
+class PreparePurchaseSelectionRequest(BaseModel):
+    """Resolve a selected Shopify ID without creating an attempt or buyer identity."""
+
+    item_source: Literal["cart_link"]
+    merchant_domain: StrictStr
+    product_key: StrictStr
+    variant_id: StrictStr
+    quantity: StrictInt = Field(..., ge=1, le=svc.MAX_QUANTITY)
+    market_country: StrictStr
+
+    model_config = {"extra": "forbid"}
 
 
 def _offer_code(value: Any) -> Optional[str]:
@@ -2468,6 +2481,119 @@ def _not_found() -> JSONResponse:
 #: dial says, because the routes are mounted at import and the schema is built from the router.
 #: That is a deliberate trade — see the note on the mount in `main.py` — and it is documented on
 #: the contract page rather than papered over.
+
+
+@router.post("/purchases/prepare")
+async def prepare_reap_purchase_selection(
+    request: Request,
+    context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
+):
+    """Authenticated read-only selection witness, before an original create body exists.
+
+    A numeric selector is not a SKU key. Resolve it to exactly one existing live SKU,
+    then use the create lane's proof, seller and own-offer reader with that exact key.
+    No buyer, consent, idempotency, click, enrollment or purchase row is touched; no
+    network fetch or provider request is made. Recovery never calls this endpoint.
+    """
+    try:
+        _require_rail()
+        if not svc.is_create_enabled() or not svc.is_cart_link_enabled():
+            raise svc.PurchaseRefused("not_available_on_this_rail")
+        _require_agent_user(agent_user)
+        try:
+            payload = await request.json()
+            req = PreparePurchaseSelectionRequest.model_validate(payload)
+        except (ValidationError, ValueError, TypeError):
+            raise svc.PurchaseRefused("invalid_request") from None
+        merchant_host = _identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower()
+        merchant_domain = _merchant_domain_key(merchant_host)
+        product_key = _identifier(req.product_key, "product_key", max_chars=1024)
+        variant_id = _identifier(req.variant_id, "variant_id", max_chars=20)
+        if not re.fullmatch(r"[1-9][0-9]{0,19}", variant_id):
+            raise svc.PurchaseRefused("invalid_request")
+        market = purchasability.normalize_market(req.market_country)
+        if market is None:
+            raise svc.PurchaseRefused("invalid_request")
+        agent_id = str(context.agent_id)
+        svc.enforce_pilot_scope(
+            agent_id=agent_id, merchant_domain=merchant_domain, market_country=market,
+            product_key=product_key, quantity=req.quantity, resolved=False,
+        )
+        async with database.transaction():
+            if IS_POSTGRES:
+                # One coherent catalog/proof snapshot, enforced read-only by PostgreSQL.
+                await database.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            if purchasability.is_enforcement_enabled() and not await purchasability.is_purchasable(
+                merchant_domain, market
+            ):
+                raise svc.PurchaseRefused("merchant_not_purchasable")
+            await _refuse_if_merchant_disabled(merchant_domain=merchant_domain, market_country=market)
+            if not await tierb_eligibility.is_cart_link_eligible(merchant_host, market):
+                raise svc.PurchaseRefused("merchant_not_eligible")
+            product = await database.fetch_one(
+                _CART_PRODUCT_SQL, {"product_key": product_key, "merchant_domain": merchant_host}
+            )
+            if product is None:
+                raise svc.PurchaseRefused("row_not_found")
+            product = dict(product)
+            if str(product.get("platform") or "").lower() not in {"shopify", "external_seed"}:
+                raise svc.PurchaseRefused("row_not_shopify")
+            skus = [dict(row) for row in await database.fetch_all(
+                _CART_PRODUCT_SKUS_SQL.replace(
+                    "s.sku_key, s.source_variant_id,", "s.sku_key, s.source_variant_id, s.merchant_id, s.platform,"
+                ), {"product_key": product_key}
+            )]
+            if len(skus) > _CART_MAX_SKUS:
+                raise svc.PurchaseRefused("row_variant_ambiguous")
+            matches = [sku for sku in skus
+                       if not _is_placeholder_sku(sku, product_key)
+                       and _cart_numeric_variant(sku.get("source_variant_id"), product_key) == variant_id]
+            if len(matches) != 1:
+                raise svc.PurchaseRefused(
+                    "row_variant_ambiguous" if matches else "row_variant_unverified"
+                )
+            variant_key = str(matches[0]["sku_key"])
+            if (matches[0]["merchant_id"] != product["merchant_id"]
+                    or matches[0]["platform"] != product["platform"]):
+                raise svc.PurchaseRefused("row_variant_unverified")
+            facts, seller, resolved_id, _seed_kind = await _load_cart_link_item(
+                merchant_domain=merchant_host, product_key=product_key,
+                variant_key=variant_key, market_country=market,
+            )
+            if resolved_id != variant_id:
+                raise svc.PurchaseRefused("row_variant_unverified")
+            if str(matches[0].get("currency") or "").strip().upper() != facts["currency"]:
+                raise svc.PurchaseRefused("row_currency_mismatch")
+            # A preparation witness cannot pick a cheapest price from conflicting own
+            # offers. It requires the selected real SKU's current offers to agree.
+            offers = [dict(row) for row in await database.fetch_all(
+                _CART_ALL_OFFERS_SQL.replace("LIMIT 20", "LIMIT 21"),
+                {"product_key": product_key, "sku_key": variant_key, "merchant_id": seller,
+                 "market_currency": _MARKET_CURRENCY.get(market)},
+            )]
+            prices = {ledger.amount_minor_or_none(row.get("price"), facts["currency"]) for row in offers}
+            if len(offers) > 20 or prices != {facts["our_price_minor"]}:
+                raise svc.PurchaseRefused("row_price_ambiguous")
+            if not context.can_access_merchant(seller):
+                raise svc.PurchaseRefused("not_available_on_this_rail")
+            _require_rail()
+            if not svc.is_create_enabled() or not svc.is_cart_link_enabled():
+                raise svc.PurchaseRefused("not_available_on_this_rail")
+            svc.enforce_pilot_scope(
+                agent_id=agent_id, merchant_domain=facts["shop_domain"], market_country=market,
+                product_key=product_key, quantity=req.quantity, variant_key="shopify:" + resolved_id,
+                currency=facts["currency"], total_minor=facts["our_price_minor"] * req.quantity,
+            )
+            selection = {
+                "product_key": product_key, "variant_id": resolved_id, "variant_key": variant_key,
+                "merchant_domain": merchant_host, "market": market, "currency": facts["currency"],
+                "unit_price_minor": facts["our_price_minor"], "quantity": req.quantity,
+                "item_source": "cart_link",
+            }
+        return JSONResponse(status_code=200, content={"selection": selection})
+    except svc.PurchaseRefused as exc:
+        return _refused(exc)
 
 
 @router.post("/purchases")
