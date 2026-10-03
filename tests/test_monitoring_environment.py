@@ -99,7 +99,7 @@ def test_usable_email_api_state_does_not_claim_actual_delivery(tmp_path, channel
     state, proc = run_script(tmp_path, "staging", channel_mode=mode,
                              channel_existing=channel_existing, return_process=True)
     assert proc.returncode == 0, proc.stderr
-    assert len(state["alertPolicies"]) == 10
+    assert len(state["alertPolicies"]) == 12
     assert "Channel API state does not prove alert delivery" in proc.stdout
     assert "Confirm a controlled notification" in proc.stdout
     assert "cannot receive" not in proc.stderr
@@ -153,10 +153,10 @@ def test_staging_never_probes_prod_and_scopes_regular_and_reap_policies(tmp_path
     assert not state.get("uptimeCheckConfigs")
     assert state["notificationChannels"][0]["displayName"] == "pivota staging alerts"
     policies = state["alertPolicies"]
-    assert len(policies) == 10  # 7 project policies, 3 Reap policies; no host/TLS
+    assert len(policies) == 12  # 7 project policies, 5 Reap policies; no host/TLS
     assert all(p["displayName"].startswith("staging:") for p in policies)
     assert not any("prod:" in json.dumps(p) for p in policies)
-    assert sum("Reap" in p["displayName"] for p in policies) == 3
+    assert sum("Reap" in p["displayName"] for p in policies) == 5
     assert all("--project" not in args or args[args.index("--project") + 1] == "pivota-staging"
                for args in state["gcloud"])
 
@@ -168,7 +168,7 @@ def test_production_names_hosts_and_policy_shapes_are_preserved(tmp_path):
         "api.pivota.cc", "gateway.pivota.cc", "mcp.pivota.cc", "commerce.mcp.pivota.cc",
         "ucp.pivota.cc", "acp.pivota.cc",
     }
-    assert len(state["alertPolicies"]) == 12
+    assert len(state["alertPolicies"]) == 14
     assert all(p["displayName"].startswith("prod:") for p in state["alertPolicies"])
 
 

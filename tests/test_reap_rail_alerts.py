@@ -1075,7 +1075,9 @@ def test_the_script_wires_the_first_run_safely(source):
     # The three Reap policies, and only they, take the waiting path; they come after every
     # `upsert`, so a deferral cannot leave one of the nine existing policies unwritten.
     waited = re.findall(r'^upsert_on_new_metric "([^"]+)"', body, re.M)
-    assert waited == [STUCK_POLICY, FAILING_POLICY, SILENT_POLICY]
+    assert waited == [STUCK_POLICY, FAILING_POLICY, SILENT_POLICY,
+                      "prod: Reap checkout needs human reconciliation",
+                      "prod: Reap buyer contact retention blocked"]
     assert body.rindex('\nupsert "') < body.index('\nupsert_on_new_metric "')
     assert not re.search(r'^upsert "prod: Reap', body, re.M)
     # Ten minutes by default, shared: 20 tries of 30 s.

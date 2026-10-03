@@ -313,6 +313,16 @@ upsert_log_metric reap_agentic_poll_failing \
   "Reap agentic purchase poller failures - a report with errors, any warning or error line of the job, or its run deadline exceeded" \
   "$REAP_POLL_FAILING_FILTER"
 
+# Separate queues: neither is an ordinary stuck purchase or a transient poll failure.
+REAP_POLL_HUMAN_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND textPayload:"reap_agentic_poll: PollReport(" AND textPayload=~"checkout_needs_human=[1-9]"'
+REAP_POLL_CONTACT_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND textPayload:"reap_agentic_poll: PollReport(" AND textPayload=~"contact_retention_blocked=[1-9]"'
+upsert_log_metric reap_agentic_poll_human \
+  "Reap checkout outcomes requiring authenticated human reconciliation" \
+  "$REAP_POLL_HUMAN_FILTER"
+upsert_log_metric reap_agentic_poll_contact \
+  "Reap precheckout purchases held after buyer contact retention elapsed" \
+  "$REAP_POLL_CONTACT_FILTER"
+
 echo "== alert policies"
 # Two replies used to be read as good news, and both now ABORT where the run previously went on:
 #   * an ERROR DOCUMENT from the list. `d.get("alertPolicies", [])` over {"error": ...} is an empty
@@ -637,6 +647,19 @@ upsert_on_new_metric "prod: Reap purchase poller went silent" "$(promql_policy \
   "The Reap purchase poller was printing its per-run report and has printed none for about 20 minutes. Nothing is advancing purchases: a buyer who approves now waits. Either the worker service is down or its scheduler is wedged (check /__scheduler_health for reap_agentic_purchase_poll), every run is raising before it reports (worker logs: Job run_reap_agentic_purchase_poll raised an exception), the Reap client lost its configuration so step 4 is skipped without a line, or someone turned REAP_AGENTIC_ENABLED off. This repeats hourly while it is open. If the rail was disarmed on purpose this is expected, and the incident cannot be closed by hand while the condition holds: snooze this policy instead. The condition stops being true 24 hours after the last report, fixed or not, and after that a dead poller raises nothing. It cannot fire in an environment that printed no report in the previous 24 hours. Runbook: docs/runbooks/reap_agentic_purchase.md, Alerts." \
   '(sum(sum_over_time(logging_googleapis_com:user_reap_agentic_poll_report{monitored_resource="cloud_run_revision"}[24h] offset 15m)) > 0) unless (sum(sum_over_time(logging_googleapis_com:user_reap_agentic_poll_report{monitored_resource="cloud_run_revision"}[15m])) > 0)' \
   300s 60s 3600s 3600s NEW_METRIC)"
+
+
+upsert_on_new_metric "prod: Reap checkout needs human reconciliation" "$(policy \
+  "prod: Reap checkout needs human reconciliation" \
+  "The poller counted checkout_needs_human >= 1. A repeated permanent checkout read failure needs authenticated provider evidence and an audited operator decision. Keep the purchase nonterminal; do not create a replacement, fail an uncertain payment, or restore contact. Inspect purchase IDs and exact error categories through owner-authorized tooling. Runbook: docs/runbooks/reap_agentic_purchase.md, Checkout reads requiring human reconciliation and Audited manual checkout resolution." \
+  'metric.type="logging.googleapis.com/user/reap_agentic_poll_human" AND resource.type="cloud_run_revision"' \
+  ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 900s 0s 3600s)"
+
+upsert_on_new_metric "prod: Reap buyer contact retention blocked" "$(policy \
+  "prod: Reap buyer contact retention blocked" \
+  "The poller counted contact_retention_blocked >= 1. Contact has been scrubbed while the purchase and payment evidence remain. Resuming flags cannot restore contact or restart checkout. Inspect whether an external operation exists, then use an independently reviewed contact reauthorization or reconciliation procedure. Do not copy old PII or blindly retry. Runbook: docs/runbooks/reap_agentic_purchase.md, Worker stop and independent contact retention." \
+  'metric.type="logging.googleapis.com/user/reap_agentic_poll_contact" AND resource.type="cloud_run_revision"' \
+  ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 900s 0s 3600s)"
 
 echo
 echo "channel : $ALERT_EMAIL"
