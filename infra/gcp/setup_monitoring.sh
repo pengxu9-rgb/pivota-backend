@@ -32,6 +32,13 @@ case "$ENV" in
   *) echo "usage: $0 prod|staging" >&2; exit 2 ;;
 esac
 
+# A dedicated rehearsal worker must not read the old shared worker's reports.
+REAP_WORKER_SERVICE_NAME="${REAP_WORKER_SERVICE_NAME:-worker}"
+if [[ ! "$REAP_WORKER_SERVICE_NAME" =~ ^[a-z]([-a-z0-9]*[a-z0-9])?$ ]] || [ "${#REAP_WORKER_SERVICE_NAME}" -gt 63 ]; then
+  echo "REAP_WORKER_SERVICE_NAME must be one exact Cloud Run service name" >&2
+  exit 2
+fi
+
 GCLOUD="${GCLOUD:-gcloud}"
 API="https://monitoring.googleapis.com/v3/projects/$PROJECT"
 TOKEN="$("$GCLOUD" auth print-access-token)"
@@ -243,6 +250,9 @@ fi
 RID_HELD_FILTER='resource.type="cloud_run_job" AND resource.labels.job_name="retailer-ingest-drain" AND textPayload:"retailer_ingest_drain: " AND (textPayload=~"\"held\": [1-9]" OR textPayload:"\"outcome\": \"held\"")'
 RID_FAILED_FILTER='resource.type="cloud_run_job" AND resource.labels.job_name="retailer-ingest-drain" AND textPayload:"retailer_ingest_drain: " AND textPayload:"\"status\": \"failed\""'
 upsert_log_metric() { # NAME DESCRIPTION FILTER
+  if [[ "$1" == reap_agentic_poll_* ]]; then
+    set -- "$1" "$2" "${3/resource.labels.service_name=\"worker\"/resource.labels.service_name=\"$REAP_WORKER_SERVICE_NAME\"}"
+  fi
   if "$GCLOUD" logging metrics describe "$1" --project "$PROJECT" >/dev/null 2>&1; then
     "$GCLOUD" logging metrics update "$1" --project "$PROJECT" --description "$2" --log-filter="$3" --quiet
     echo "   updated $1"

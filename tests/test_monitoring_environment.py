@@ -64,7 +64,7 @@ print(out if isinstance(out, str) else json.dumps(out))
 
 
 def run_script(tmp_path, env, *, repeat=False, channel_mode="verified",
-               channel_existing=False, return_process=False):
+               channel_existing=False, return_process=False, worker_service="worker"):
     state = tmp_path / "state.json"
     if not repeat:
         initial = {"calls": [], "gcloud": []}
@@ -85,7 +85,8 @@ def run_script(tmp_path, env, *, repeat=False, channel_mode="verified",
         env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
              "GCLOUD": str(tmp_path / "gcloud"), "ALERT_EMAIL": "monitored@example.com",
              "MONITORING_TEST_STATE": str(state), "NEW_METRIC_TRIES": "0",
-             "MONITORING_CHANNEL_MODE": channel_mode},
+             "MONITORING_CHANNEL_MODE": channel_mode,
+             "REAP_WORKER_SERVICE_NAME": worker_service},
     )
     if return_process:
         return json.loads(state.read_text()), proc
@@ -180,3 +181,19 @@ def test_rerun_reuses_channel_and_checks_and_replaces_policies_by_environment_na
     assert len(state.get("uptimeCheckConfigs", [])) == len(initial.get("uptimeCheckConfigs", []))
     assert len(state["alertPolicies"]) == len(initial["alertPolicies"])
     assert len({p["displayName"] for p in state["alertPolicies"]}) == len(state["alertPolicies"])
+
+
+def test_dedicated_worker_filters_do_not_watch_shared_worker(tmp_path):
+    state=run_script(tmp_path,"staging",worker_service="reap-isolated-worker")
+    calls=[args for args in state["gcloud"] if args[:2]==["logging","metrics"] and len(args)>3 and args[2] in {"create","update"} and args[3].startswith("reap_agentic_poll_")]
+    assert len(calls)==5
+    for args in calls:
+        log_filter=next(x for x in args if x.startswith("--log-filter="))
+        assert 'resource.labels.service_name="reap-isolated-worker"' in log_filter
+        assert 'resource.labels.service_name="worker"' not in log_filter
+
+@pytest.mark.parametrize("worker",["*",'worker" OR true',"Bad","-worker","worker-","w"*64])
+def test_invalid_worker_target_fails_before_cloud_reads(tmp_path,worker):
+    state,proc=run_script(tmp_path,"staging",worker_service=worker,return_process=True)
+    assert proc.returncode==2 and "one exact Cloud Run service name" in proc.stderr
+    assert state["calls"]==[] and state["gcloud"]==[]
