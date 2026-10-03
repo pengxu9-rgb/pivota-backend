@@ -238,6 +238,7 @@ _REFUSAL_STATUS: Dict[str, int] = {
     # skus. The lane never picks one; the caller names the sku or falls back.
     "row_variant_ambiguous": 409,
     "idempotency_conflict": 409,
+    "attempt_retired": 409,
 }
 
 _DEFAULT_REFUSAL_STATUS = 409
