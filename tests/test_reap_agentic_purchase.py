@@ -5290,6 +5290,7 @@ async def test_scope_pause_attempt_exempt_claim_timestamp_generation(monkeypatch
     monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot()))
     purchase = await _start()
     assert (await _step(purchase)).state == "needs_enrollment"
+    assert await ledger.release_claim(purchase, "w1") is not None
     await database.execute("UPDATE reap_agentic_purchases SET state=:state,last_error_code=:error,next_poll_at=CURRENT_TIMESTAMP WHERE id=:id",
                            {"id": purchase, "state": state, "error": "enrollment_settling" if state == "resolving" else None})
     original = await ledger.get_purchase_internal(purchase)
