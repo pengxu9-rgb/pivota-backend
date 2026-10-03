@@ -658,7 +658,11 @@ def quiet_writer(monkeypatch):
         incis.extend(rows)
         return {"inci_written": len(rows), "inci_skipped": 0}
     monkeypatch.setattr(writer, "write_writer_audit_log", AsyncMock())
-    monkeypatch.setattr(writer, "guard_catalog_offer_rows", AsyncMock(side_effect=lambda offers: (offers, {}, [])))
+    async def accept_live_offers(offers, *, require_live_links=False):
+        assert require_live_links is True
+        return offers, {}, []
+
+    monkeypatch.setattr(writer, "guard_catalog_offer_rows", AsyncMock(side_effect=accept_live_offers))
     monkeypatch.setattr(writer, "_derive_seed_seller_for_plan_row", AsyncMock(return_value=("seller", "cross")))
     monkeypatch.setattr(writer, "_apply_inci_rows", inci)
     monkeypatch.setattr(writer, "_ensure_singleton_pg", AsyncMock())
