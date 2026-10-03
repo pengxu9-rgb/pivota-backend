@@ -1924,6 +1924,9 @@ async def _post(
             # while having read all of it, which is the part that costs. `stream` plus
             # `_read_bounded` makes the bound real: DECODED bytes are counted as they arrive, in
             # steps of at most 64 KiB, and the read is abandoned once the cap is passed.
+            # Opening the client is asynchronous; the stop may have changed
+            # since this operation entered. Check again at the dispatch boundary.
+            _check_worker_provider_permission()
             async with client.stream(
                 "POST", f"{url}{path}", json=body,
                 headers=_headers(key, path, body, idempotency_extra=idempotency_extra,
@@ -1966,6 +1969,8 @@ async def _post(
                     )
                 raw = await _read_bounded(resp)
                 status = resp.status_code
+    except ProviderOperationStopped:
+        raise
     except Exception as exc:  # noqa: BLE001
         # The exception TYPE only. Never the request: the body can carry a shipping address and
         # the headers carry the key, and an exception string is the easiest place for either to
@@ -2228,6 +2233,9 @@ async def _get(
             # after it refuses to PARSE a body it has already fully allocated -- a cosmetic
             # bound. The read has to stop AT the cap to be one, and doing that here with a second
             # copy of the logic would give the two verbs two bounds to drift apart.
+            # Opening the client is asynchronous; the stop may have changed
+            # since this operation entered. Check again at the dispatch boundary.
+            _check_worker_provider_permission()
             async with client.stream(
                 "GET", f"{url}{path}",
                 params=params or None,
@@ -2258,6 +2266,8 @@ async def _get(
                             (resp.headers or {}).get("retry-after")),
                     )
                 raw = await _read_bounded(resp)
+    except ProviderOperationStopped:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("reap GET %s failed: %s", path, type(exc).__name__)
         return ReapResponse(ok=False, error=f"transport_error:{type(exc).__name__}")
