@@ -5,6 +5,8 @@ the route suites' network ban remains in force. Preparation touches no commerce 
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
+from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -36,21 +38,63 @@ def error(response):
     return payload.get("error") if isinstance(payload.get("error"), str) else payload.get("error", {}).get("details", {}).get("error")
 
 
-@pytest.fixture(autouse=True)
-async def prepare_seed_cleanup(_db):
+@asynccontextmanager
+async def isolated_prepare_seed_table():
+    """Own a complete fixture and restore any inherited table, schema and rows.
+
+    The full sweep shares one database. Other seed suites may leave a narrower
+    schema than migration 044; IF NOT EXISTS cannot establish this reader's schema.
+    Renaming preserves inherited rows and dependent references without healing
+    another suite's schema or weakening the production proof query.
+    """
     found = await database.fetch_one(
         "SELECT 1 FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='external_product_seeds'"
         if IS_POSTGRES else "SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_product_seeds'"
     )
-    if not found:
-        await database.execute("CREATE TABLE external_product_seeds (id TEXT PRIMARY KEY, status TEXT, domain TEXT, market TEXT, destination_url TEXT, canonical_url TEXT, attached_product_key TEXT, attached_variant_id TEXT, seed_data TEXT)")
-    await database.execute("DELETE FROM external_product_seeds WHERE id=:id", {"id": SEED})
+    inherited = "reap_prepare_inherited_" + uuid4().hex
+    if found:
+        await database.execute(f"ALTER TABLE external_product_seeds RENAME TO {inherited}")
+    created = False
     try:
+        await database.execute("CREATE TABLE external_product_seeds (id TEXT PRIMARY KEY, status TEXT, domain TEXT, market TEXT, destination_url TEXT, canonical_url TEXT, attached_product_key TEXT, attached_variant_id TEXT, seed_data TEXT)")
+        created = True
         yield
     finally:
-        await database.execute("DELETE FROM external_product_seeds WHERE id=:id", {"id": SEED})
-        if not found:
+        if created:
             await database.execute("DROP TABLE external_product_seeds")
+        if found:
+            await database.execute(f"ALTER TABLE {inherited} RENAME TO external_product_seeds")
+
+
+@pytest.fixture(autouse=True)
+async def prepare_seed_cleanup(_db):
+    async with isolated_prepare_seed_table():
+        yield
+
+
+@pytest.mark.parametrize("inherited_wide", [False, True])
+async def test_prepare_seed_fixture_preserves_inherited_schema_and_rows(inherited_wide):
+    # Reproduce a preceding suite's table within this test's already isolated table.
+    await database.execute("DROP TABLE external_product_seeds")
+    extra = ", attached_variant_id TEXT" if inherited_wide else ""
+    await database.execute("CREATE TABLE external_product_seeds (id TEXT PRIMARY KEY, owner_value TEXT" + extra + ")")
+    await database.execute("INSERT INTO external_product_seeds (id,owner_value) VALUES ('other-suite','preserve-me')")
+
+    async def columns():
+        rows = await database.fetch_all(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='external_product_seeds' ORDER BY ordinal_position"
+            if IS_POSTGRES else "PRAGMA table_info(external_product_seeds)"
+        )
+        return [row["column_name" if IS_POSTGRES else "name"] for row in rows]
+
+    before_columns = await columns()
+    before_rows = [dict(row) for row in await database.fetch_all("SELECT * FROM external_product_seeds")]
+    async with isolated_prepare_seed_table():
+        assert "attached_variant_id" in await columns()
+        assert await database.fetch_all("SELECT * FROM external_product_seeds") == []
+        await database.execute("INSERT INTO external_product_seeds (id,attached_variant_id) VALUES ('owned-fixture','123')")
+    assert await columns() == before_columns
+    assert [dict(row) for row in await database.fetch_all("SELECT * FROM external_product_seeds")] == before_rows
 
 
 async def seed(monkeypatch, *, proof_age_days=0, source="external_product_seeds_mirror_v1", price="13.99", proof=True):
