@@ -108,7 +108,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence
+from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence
 
 from db.database import IS_POSTGRES, database
 
