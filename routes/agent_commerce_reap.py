@@ -95,7 +95,7 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError, StrictInt, StrictStr
+from pydantic import BaseModel, Field, ValidationError, StrictInt, StrictStr, model_validator
 
 import db.reap_agentic_ledger as ledger
 # THE ONE consent-tag shape rule, imported rather than re-implemented. Bound at module level
@@ -222,6 +222,7 @@ _REFUSAL_STATUS: Dict[str, int] = {
     "buyer_unlinked": 409,
     "row_not_found": 409,
     "row_unpriced": 409,
+    "price_changed": 409,
     # Tier B: two catalog spellings of the ONE chosen Shopify variant carry different usable
     # prices for this seller, and no sku was named -- no single price to commit to. 409 like
     # `row_unpriced`: the body is fine, the catalog is not.
@@ -502,6 +503,18 @@ class StartPurchaseRequest(BaseModel):
     #: one owner. Sent to Reap AS GIVEN; if Reap refuses it the purchase is re-quoted without it
     #: and `offer_code_outcome` on the purchase says `dropped_invalid` / `dropped_expired`.
     offer_code: Optional[str] = None
+    # Optional only for legacy bodies. New witnessed selections bind both exact
+    # money fields into the original attempt; neither is a client price override.
+    expected_unit_price_minor: Optional[StrictInt] = Field(None, ge=1, le=9007199254740991)
+    expected_currency: Optional[StrictStr] = Field(None, pattern=r"^[A-Z]{3}$")
+
+    @model_validator(mode="after")
+    def paired_expected_money(self):
+        names = {"expected_unit_price_minor", "expected_currency"}
+        present = names & self.model_fields_set
+        if present and (present != names or self.expected_unit_price_minor is None or self.expected_currency is None):
+            raise ValueError("expected money must be a nonnull pair")
+        return self
 
 
 class RecoverPurchaseRequest(StartPurchaseRequest):
@@ -2031,6 +2044,8 @@ def _request_hash(
     return_url: str,
     item_source: str = "reap_variant",
     offer_code: Optional[str] = None,
+    expected_unit_price_minor: Optional[int] = None,
+    expected_currency: Optional[str] = None,
 ) -> str:
     """A stable fingerprint of the fields that DECIDE this purchase.
 
@@ -2040,7 +2055,7 @@ def _request_hash(
 
     WHAT IS NOT IN IT: `click_context` (accepted and forwarded nowhere) and the idempotency key
     itself (it is the lookup, not part of what is being compared). Also nothing the ROUTE derives
-    rather than the caller supplying — the price, the buyer ref, the click id — because those are
+    rather than the caller supplying — the authoritative price, the buyer ref, the click id — because those are
     ours and a client retrying an identical request must hash identically even though the click
     id will differ.
 
@@ -2072,6 +2087,13 @@ def _request_hash(
     # can change the price the buyer approves), so it must not replay the first one.
     if offer_code is not None:
         facts["offer_code"] = offer_code
+    # Absent pair preserves every legacy fingerprint byte-for-byte. Recovery
+    # compares this original pair without current price/proof/eligibility reads.
+    if expected_unit_price_minor is not None or expected_currency is not None:
+        if type(expected_unit_price_minor) is not int or expected_unit_price_minor <= 0 or not isinstance(expected_currency, str) or not re.fullmatch(r"[A-Z]{3}", expected_currency):
+            raise svc.PurchaseRefused("invalid_request", "expected money must be a strict pair")
+        facts["expected_unit_price_minor"] = expected_unit_price_minor
+        facts["expected_currency"] = expected_currency
     canonical = json.dumps(
         facts,
         sort_keys=True,
@@ -2712,6 +2734,8 @@ async def start_reap_purchase(
             return_url=return_url,
             item_source=req.item_source,
             offer_code=offer_code,
+            expected_unit_price_minor=req.expected_unit_price_minor,
+            expected_currency=req.expected_currency,
         )
 
         if idempotency_key:
@@ -2835,7 +2859,9 @@ async def start_reap_purchase(
             except svc.PurchaseRefused as exc:
                 # The key remembers this refusal, so a retry after the merchant is enabled does
                 # not open a second purchase beside a cart-link one (`_tombstone_idempotency_key`).
-                if idempotency_key:
+                if idempotency_key and req.expected_unit_price_minor is None:
+                    # A bound-money selection has not passed authoritative money
+                    # admission yet; preserve zero business writes on this path.
                     await _tombstone_idempotency_key(
                         agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash,
                         idempotency_key=idempotency_key, request_hash=request_hash,
@@ -2853,6 +2879,11 @@ async def start_reap_purchase(
             )
 
         facts = cart_facts if cart_facts is not None else row
+        if req.expected_unit_price_minor is not None:
+            actual_minor = facts["our_price_minor"] if isinstance(facts, dict) else facts.our_price_minor
+            actual_currency = facts["currency"] if isinstance(facts, dict) else facts.currency
+            if type(actual_minor) is not int or actual_minor != req.expected_unit_price_minor or actual_currency != req.expected_currency:
+                raise svc.PurchaseRefused("price_changed", "the selected offer money changed")
         svc.enforce_pilot_scope(
             agent_id=agent_id, merchant_domain=(facts["shop_domain"] if isinstance(facts, dict) else facts.merchant_domain),
             market_country=(facts["market_country"] if isinstance(facts, dict) else facts.market_country),
@@ -2999,6 +3030,8 @@ async def recover_reap_purchase(
             shipping_address=_buyer_address_for_client(req.buyer),
             return_url=str(req.return_url or "").strip() or _default_return_url(),
             item_source=req.item_source, offer_code=_offer_code(req.offer_code),
+            expected_unit_price_minor=req.expected_unit_price_minor,
+            expected_currency=req.expected_currency,
         )
         purchase_id = await _replayed_purchase_id(
             agent_id=str(context.agent_id), agent_user_ref_hash=owner_hash,

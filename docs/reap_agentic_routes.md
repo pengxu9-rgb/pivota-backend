@@ -766,3 +766,33 @@ A failed recovery preserves uncertainty; it never authorizes a new payment attem
 ### Optional direct-create pilot controls
 
 `REAP_AGENTIC_CREATE_ENABLED` pauses fresh work independently of status and authenticated recovery. Production requires `REAP_AGENTIC_PILOT_SCOPE` with all five cohort lists plus `variant_keys`, `currency` and `max_total_minor`; the exact literal `unrestricted` is the only explicit opt-out. Missing, malformed, incomplete or outside-scope create admission returns the private `404 not_available_on_this_rail` before buyer identity/consent writes. Quantity is a strict integer for create; authenticated recovery retains the earlier accepted numeric-body normalization. Existing owner GET/recover and checkout reconciliation remain independent of current create scope. See the runbook for variant namespaces, quote caps and worker pause diagnostics.
+
+### Immutable selected money on new attempts
+
+A caller using a prepared selection sends `expected_unit_price_minor` and
+`expected_currency` together in the original create body. The minor amount is a
+positive strict integer no larger than 9007199254740991; the currency is exactly
+three uppercase letters. A partial pair, explicit null, boolean, float or numeric
+string is `invalid_request` (400). These fields constrain the selection; they
+never override the server's own offer price.
+
+Both lanes compare the pair with the freshly resolved authoritative SKU/own offer
+before creating a buyer reference, consent record, click, key or purchase. A
+changed unit amount or currency is `price_changed` (409); existing source and
+market-currency refusals also remain in force. A bound variant request refused
+before money admission does not create an eligibility tombstone. Once accepted,
+the purchase stores that authoritative unit amount/currency. The existing
+provider resolution and exact quote subtotal/currency checks continue to compare
+against that stored purchase, including shipping/tax total pilot limits.
+
+The supplied pair is included in the immutable request fingerprint. A same-key
+retry or authenticated recovery compares the original pair and returns the
+original purchase even if today's catalog money, eligibility or proof changed.
+Adding, removing or changing either field on an existing key is an
+`idempotency_conflict` (409). Recovery performs no current selection lookup.
+
+Bodies with both fields omitted retain the prior fingerprint byte-for-byte. Old
+client attempts—including attempts whose client retained a selection witness
+without putting a money pair on the original backend body—must recover with that
+original body. Do not infer or add money fields from a retained witness, do not
+remint the attempt, and do not switch checkout routes after any refusal.
