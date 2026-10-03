@@ -11,12 +11,12 @@ bookkeeping SELECTs, no HTTP, and no transitions — it is a LOOP and a set of B
 ── THE ORDER OF ONE RUN, AND WHY IT IS THAT ORDER ───────────────────────────────────────────
 
   1. `requeue_stale_claims`     free the leases of workers that died mid-step.       ALWAYS
-  2. `expire_overdue_purchases` the PII deadline for the two states that wait on a PERSON. ALWAYS
+  2. `expire_overdue_purchases` pre-checkout expiry and independent checkout PII scrubbing. ALWAYS
   3. `fail_exhausted_purchases` the attempt ceiling for the states where a claim means we TRIED.
                                                                                      ALWAYS
   3b. count the 'processing' rows at or over the attempt ceiling — READ ONLY.         ALWAYS
-  4. `claim_due_purchases` → `advance` → `release_claim`, one row at a time.  ONLY WHEN ARMED
-  5. count the purchases stuck past their deadline — READ ONLY — and report.   ONLY WHEN ARMED
+  4. `claim_due_purchases` → `advance` → `release_claim`, one row at a time.  WHEN CONFIGURED (read-only reconciliation if disarmed)
+  5. count the purchases stuck past their deadline — READ ONLY — and report.   WHEN CONFIGURED (read-only reconciliation if disarmed)
 
 THE SWEEPS RUN BEFORE THE CLAIM, AND THAT IS THE WHOLE POINT OF THE ORDER. Claiming first means
 this run takes a lease on rows that steps 1–3 were about to recover or terminate, and then spends
@@ -25,27 +25,17 @@ worker died is NOT claimable until the requeue frees it, so a claim-first run wo
 the rows that most need attention and leave them for the next tick — every tick, forever, on a
 pod that keeps dying. Sweep first, then claim what is left.
 
-── WHAT THE DIAL GATES, AND WHAT IT MUST NOT ────────────────────────────────────────────────
+── WHAT THE DIAL GATES ─────────────────────────────────────────────────────────────────────
 
-`REAP_AGENTIC_ENABLED` (plus a configured client) gates STEP 4 AND ONLY STEP 4.
+REAP_AGENTIC_ENABLED stops creation, resolution, enrollment and quoting. Existing checkout
+reads continue while credentials and the environment/host guard remain valid: disarming must
+not strand a buyer who may already have paid. Both candidate selection and claim UPDATE filter
+reconciliation-only runs to checkout-backed awaiting_approval/processing rows.
 
-The first cut gated the whole run, and that was a PII RETENTION BUG, measured: with the rail off,
-an `awaiting_approval` row 99,999 seconds old kept `buyer_email` and `shipping_address` across
-three consecutive ticks, because the expire sweep never ran. The gate is
-`is_enabled() and is_configured()`, so a CREDENTIAL BLIP — one unset env var — had the same
-effect as an operator disabling the feature: the deadline stopped.
-
-Steps 1–3 are safe to run unarmed and that is checkable rather than asserted:
-
-  * none of them calls a partner. They are three UPDATE statements in db/reap_agentic_ledger.py.
-  * none of them can touch a row whose payment is in flight. `expire_overdue_purchases` names
-    only 'needs_enrollment' and 'awaiting_approval'; `fail_exhausted_purchases` runs with
-    `include_processing=False`, and both state lists are parsed out of the SQL that enforces
-    them (`ledger._states_in`), so this is not a claim about a comment.
-  * `requeue_stale_claims` only clears a dead worker's lease. It writes no state.
-
-So the rule is: THE DIAL STOPS US TALKING TO A PARTNER. It does not stop us keeping our promises
-about a buyer's data. A rail an operator has switched off must still forget people.
+Clock sweeps terminate only pre-checkout waiting rows. A separate bounded PII scrub clears
+contact fields on old checkout-backed rows without changing state, claims or evidence. Neither
+clock expiry nor attempts may decide the outcome of an exposed checkout. Unknown responses
+and transport outages remain pollable; authoritative checkout responses determine terminals.
 
 ── THE INVARIANT THIS JOB GUARANTEES ────────────────────────────────────────────────────────
 
@@ -385,29 +375,10 @@ def job_interval_seconds() -> int:
 class PollReport:
     """What one run did. COUNTS ONLY — no ids, no rows, no PII. See the module header.
 
-    `skipped_disabled` is 1 when STEP 4 was skipped because the rail is disarmed. It is NOT "the
-    run did nothing": the three sweeps above it ran anyway, and their counts are real. It is a
-    COUNT rather than a boolean so that a caller summing reports across ticks can see "step 4 has
-    been inert for 400 runs", which is the question an operator actually asks after arming
-    something and seeing nothing happen.
-
-    `errors` is the only count that should ever page anyone. `processing_over_attempts` is the
-    one that should ever WAKE anyone.
-
-    'processing' IS THE ONLY POLLABLE STATE WITH NO BOUND AT ALL, and that is derived from the
-    ledger's own SQL rather than asserted here — see
-    `test_processing_is_the_only_state_with_no_bound`, which parses
-    `_EXPIRE_SOURCE_STATES` / `_FAIL_EXHAUSTED_SOURCE_STATES` / `_CLAIM_ATTEMPT_EXEMPT_STATES`
-    out of the statements that enforce them. `expire_overdue_purchases` does not name it, so it
-    has NO PII DEADLINE; `fail_exhausted_purchases` skips it, so the counter never terminates it.
-    #2204's round-2 review measured exactly what that costs: a row parked in 'processing' and
-    aged to 2020 still held `buyer_email` and `shipping_address`. That fix removed the one path
-    which parked rows there deliberately; it did not, and could not, bound the state.
-
-    So this count is not a nicety. It is the ONLY signal that a buyer's payment is stuck in
-    flight — and, with it, their address and email. A number that does not fall needs a person.
-    The first cut reported nothing at all for those rows: measured at attempts=100,005 on a row
-    no count mentioned.
+    `skipped_disabled` is 1 when new-purchase work is disabled or provider credentials/host
+    prevent reads. Existing checkout reconciliation can still claim/advance with the create
+    dial off. Contact-retention sweeps run regardless. `errors`, `processing_over_attempts`
+    and `stuck_over_age` remain meaningful while reconciliation is running.
 
     `stuck_over_age` IS THE NUMBER THE "PURCHASE STUCK" ALERT READS, off the report line
     (infra/gcp/setup_monitoring.sh matches `stuck_over_age=[1-9]`). It is how many non-terminal
@@ -476,8 +447,8 @@ _LEFTOVER_CLAIMS_SQL = """
 #: ONLY. Reported so that the refusal is visible rather than silent: the alternative to a count
 #: is an operator discovering a stuck charge when the buyer complains.
 #:
-#: 'processing' also has NO PII DEADLINE — `expire_overdue_purchases` does not name it — so these
-#: rows hold `buyer_email` and `shipping_address` for as long as they sit there. See `PollReport`.
+#: Contact retention is separately bounded by scrub_reconciling_purchase_pii; state recovery
+#: remains required even after contact fields have been cleared.
 _PROCESSING_OVER_ATTEMPTS_SQL = """
     SELECT COUNT(*) AS stuck FROM reap_agentic_purchases
      WHERE state = 'processing'
@@ -721,6 +692,16 @@ async def run_reap_agentic_purchase_poll(
         _expire, SWEEP_BATCH, "expire_overdue", _budget_spent
     )
 
+    async def _scrub(limit: int) -> List[str]:
+        return await ledger.scrub_reconciling_purchase_pii(
+            max_age_seconds=hosted_max_age, limit=limit
+        )
+
+    # Contact retention is independent of the paid outcome. Runs even with no credentials.
+    scrubbed = await _sweep_until_drained(_scrub, SWEEP_BATCH, "scrub_reconciling_pii", _budget_spent)
+    if scrubbed:
+        logger.info("reap_agentic_poll: contact rows scrubbed=%d", scrubbed)
+
     # ── 3. the attempt ceiling — ALWAYS, ARMED OR NOT ────────────────────────────────────────
     async def _fail_exhausted(limit: int) -> List[str]:
         # `include_processing=False`, ALWAYS, and it is not configurable from here. A purchase in
@@ -728,8 +709,7 @@ async def run_reap_agentic_purchase_poll(
         # auto-failing it on a counter writes 'failed' over a charge whose outcome we do not
         # know, so our ledger says the purchase failed while the buyer's card says otherwise.
         # A PAYMENT STUCK IN FLIGHT IS A HUMAN DECISION: an operator who has reconciled the
-        # checkout with Reap calls `fail_exhausted_purchases(..., include_processing=True)` by
-        # hand, or transitions the row. There is deliberately no env var for it — a dial would
+        # checkout with Reap uses the authoritative read step or an explicitly audited repair. There is deliberately no env var for it — a dial would
         # let somebody arm it once and forget, which is the same as not having decided.
         #
         # It is also why step 3b exists: a refusal nobody can see is indistinguishable from a
@@ -766,24 +746,14 @@ async def run_reap_agentic_purchase_poll(
             type(exc).__name__,
         )
 
-    # ── 4. claim, step, release — ONLY WHEN ARMED ────────────────────────────────────────────
+    # ── 4. claim, step, release — WHEN CONFIGURED (read-only reconciliation if disarmed) ────────────────────────────────────────────
     #
-    # THE GATE IS INSIDE THE JOB, NOT AT REGISTRATION. The job is ALWAYS registered, so deploying
-    # this is inert rather than absent: an operator arms the rail with an env var and the next
-    # tick picks it up, with no redeploy and no scheduler restart. That is the shape
-    # services/external_conversion_poller.py already uses (`_poller_enabled`), and it is why
-    # there is no second gate in `start_scheduler` — two gates for one concept is two things to
-    # get out of step.
-    #
-    # `is_enabled()` is REUSED from the state machine rather than re-read here. It is the
-    # allowlist-of-truthy-spellings reader that decides whether `start_purchase` will open a
-    # purchase at all, and a poller that armed on a spelling the opener refused (or vice versa)
-    # would be a rail that half exists.
-    #
-    # IT GATES THIS STEP AND NOTHING ABOVE IT. See the module header: gating the whole run was a
-    # measured PII retention bug, and `is_configured()` being half the condition made a
-    # credential blip enough to cause it.
-    if not purchase_svc.is_enabled() or not rc.is_configured():
+    # Keep checkout GET/reconciliation alive when new purchase work is disarmed.
+    # Removing credentials pauses reads but never disables the contact-retention sweeps.
+    reconciliation_only = not purchase_svc.is_create_enabled()
+    if reconciliation_only:
+        counts["skipped_disabled"] = 1  # Creation/enrollment steps skipped; checkout reads continue.
+    if not rc.is_configured():
         counts["skipped_disabled"] = 1
         logger.debug(
             "reap_agentic_poll: step 4 skipped (enabled=%s configured=%s); the sweeps ran",
@@ -821,14 +791,18 @@ async def run_reap_agentic_purchase_poll(
         )
         return _report()
 
-    rows = await ledger.claim_due_purchases(worker, limit=claim_batch)
-    counts["claimed"] = len(rows)
 
-    # EVERYTHING FROM HERE IS INSIDE ONE try/finally, AND THAT IS FIX F1/F2. The `finally` is the
+    # Claim acquisition and all processing are inside the cleanup try/finally. The `finally` is the
     # only thing standing between a cancelled or raising run and a batch of leases held for a
     # full lease window — with, in two states, a buyer's address and email on them.
     cancelled = False
     try:
+        # Include acquisition in cleanup: cancellation may land after a partial batch claim.
+        rows = await ledger.claim_due_purchases(
+            worker, limit=claim_batch,
+            **({"reconciliation_only": True} if reconciliation_only else {})
+        )
+        counts["claimed"] = len(rows)
         for row in rows:
             purchase_id = str(row["id"])
 

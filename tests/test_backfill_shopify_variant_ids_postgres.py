@@ -257,6 +257,7 @@ async def _stamp(db, seed_id: str, variants: List[Dict[str, Any]], updated_at: A
             "platform": STOREFRONT_PLATFORM,
             "platform_source": STOREFRONT_PLATFORM_SOURCE,
             "cart_proof": json.dumps(cart_proof),
+            "variant_proofs": json.dumps({}),
             "updated_at": updated_at,
         },
     )
@@ -854,7 +855,7 @@ async def test_named_variant_seeds_are_selected_in_every_state(_db) -> None:
     await _insert(_db, "e_two_stamped", _snapshot(stamped, dict(stamped, shopify_variant_id="1")))
 
     assert [r["id"] for r in await _select()] == [
-        "a_unstamped", "b_stamped_no_proof", "c_named_proof", "d_revoked"]
+        "a_unstamped", "b_stamped_no_proof", "c_named_proof", "d_revoked", "e_two_stamped"]
 
 
 async def test_a_dry_run_reports_the_named_proof_without_writing_it(_db) -> None:
@@ -925,3 +926,8 @@ def test_seed_id_is_a_repeatable_cli_flag(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", ["backfill"])
     backfill.main()
     assert seen["seed_ids"] is None
+
+
+async def test_fully_stamped_multivariant_row_needs_selector_proof_refresh(_db):
+    await _insert(_db, "selectable", _snapshot({"shopify_variant_id":"11"},{"shopify_variant_id":"22"}))
+    assert [r["id"] for r in await _select()] == ["selectable"]

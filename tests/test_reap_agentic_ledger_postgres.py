@@ -219,6 +219,7 @@ async def _raw_connection():
 
 async def _run_on(conn, sql: str, params: dict):
     positional, order = _to_positional(sql)
+    params = dict(params, reconciliation_only=params.get("reconciliation_only", 0))
     return await conn.fetch(positional, *[params[name] for name in order])
 
 
@@ -1268,7 +1269,7 @@ async def test_the_candidate_select_does_not_offer_already_claimed_rows_on_postg
 
     offered = {
         r["id"]
-        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50})
+        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50, "reconciliation_only": 0})
     }
     assert free["id"] in offered and held["id"] not in offered
 
@@ -2621,9 +2622,9 @@ async def test_release_claim_has_no_attempts_delta_on_postgres():
 
 _ENROLLMENT_PROJECTION = {
     "id", "buyer_ref", "reap_enrollment_id", "status", "hosted_url", "hosted_url_expires_at",
-    "card_network", "card_last4",
+    "card_network", "card_last4", "created_at",
 }
-_ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "created_at", "updated_at"}
+_ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "updated_at"}
 
 
 async def test_get_enrollment_internal_reads_a_pending_row_on_postgres():

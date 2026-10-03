@@ -7,14 +7,18 @@ belong to. Everything that talks to Reap happens later, in the poller, on anothe
 
 ── WHAT 404 MEANS HERE ──────────────────────────────────────────────────────────────────────
 
-While `REAP_AGENTIC_ENABLED` is off or the client has no credentials, EVERY route on this router
-answers **404**, not 503. That is a deliberate lie about existence and it is the right one: the
+While `REAP_AGENTIC_ENABLED` is off or the client has no credentials, create and list routes
+answer **404**, not 503. That is a deliberate lie about existence and it is the right one: the
 agent door's job on receiving it is to fall back to another rail, and a 503 reads as "this rail
 is the answer, try again shortly" — which would make an unarmed rail look like an outage and
 stall a buyer behind it. The rail is dark by default, so 404 is also the honest description of
 production today.
 
-The gate is the FIRST statement of each of the three handlers rather than a router-level
+The stored purchase-by-ID GET remains authenticated and owner-scoped while disarmed; it
+makes no provider calls, so a buyer can observe an already exposed checkout
+while create/reconciliation credentials are being repaired.
+
+The create/list gate is the FIRST statement of those handlers rather than a router-level
 dependency, and that costs one ordering property: an unauthenticated caller gets 401 from
 `get_agent_context` before it can learn the route is dark. Three reasons it is still here:
 
@@ -136,6 +140,7 @@ from services.shopify_variant_identity import (
     CART_PROOF_SCOPE_NAMED,
     clean_variant_title,
     verified_cart_variant_id,
+    verified_selected_cart_variant_id,
 )
 # THE owner of the observed seller-of-record id (`merch_obs_<hash>`): the SAME dispatch every
 # ingestion and re-key path mints with (retailer domain -> etld1 alone, else (brand, etld1)).
@@ -183,6 +188,9 @@ _REFUSAL_STATUS: Dict[str, int] = {
     # "fall back", and a caller that could tell them apart would learn our configuration.
     "not_available_on_this_rail": 404,
     "rail_disabled": 404,
+    "create_disabled": 404,
+    "pilot_scope_invalid": 404,
+    "pilot_scope_refused": 404,
     "rail_unconfigured": 404,
     # The caller is not authenticated as a buyer. 401 and not 403, because 403 would assert that
     # we know who this buyer is and are refusing them — we do not know, there is no token. It
@@ -1818,7 +1826,12 @@ async def _load_cart_link_item(
         skus = [dict(row) for row in await database.fetch_all(
             _CART_PRODUCT_SKUS_SQL, {"product_key": product_key}
         )]
-        sku_variant, candidates, placeholder = _cart_sku_choice(skus, product_key)
+        if named is not None and not _is_placeholder_sku(named, product_key):
+            sku_variant = _cart_numeric_variant(named.get("source_variant_id"), product_key)
+            candidates = [named]
+            placeholder = None  # A selected size never inherits a product-level price.
+        else:
+            sku_variant, candidates, placeholder = _cart_sku_choice(skus, product_key)
         if candidates and sku_variant is None:
             # A mirror's one real sku names no Shopify variant: not a cart this lane can prove.
             raise svc.PurchaseRefused("row_variant_unverified", "mirror sku names no Shopify variant")
@@ -1854,6 +1867,12 @@ async def _load_cart_link_item(
             shop_domain=merchant_domain,
             catalog_variant_id=sku_variant,
         )
+        if named is not None and not _is_placeholder_sku(named, product_key):
+            selected_proof = verified_selected_cart_variant_id(
+                seed_data, product_urls=[seed.get("canonical_url") or seed.get("destination_url")],
+                shop_domain=merchant_domain, catalog_variant_id=sku_variant,
+            )
+            proven = selected_proof or proven
         variant_id = proven.variant_id if proven else None
         proof_scope = proven.scope if proven else None
         proof_variant_title = proven.variant_title if proven else None
@@ -1999,12 +2018,6 @@ def _default_return_url() -> str:
     return f"https://{hosts[0]}/reap/return"
 
 
-#: How long a key is honoured. Beyond it the same key starts a NEW purchase, which is the right
-#: default for a key an agent is likely to reuse across sessions — and the reason the window is
-#: enforced here, in a policy line, rather than by a constraint in the table.
-_IDEMPOTENCY_WINDOW_SECONDS = 24 * 60 * 60
-
-
 def _request_hash(
     *,
     merchant_domain: str,
@@ -2094,25 +2107,17 @@ async def _replayed_purchase_id(
     if not row:
         return None
     record = dict(row)
-    created = _aware(record.get("created_at"))
-    if created is not None:
-        age = (_now() - created).total_seconds()
-        if age > _IDEMPOTENCY_WINDOW_SECONDS:
-            # OUTSIDE THE WINDOW THE KEY IS FORGOTTEN, and that includes the conflict check:
-            # refusing a caller for disagreeing with a fingerprint we are no longer honouring
-            # would be the worst of both rules. The stale row IS replaced -- by this request's own
-            # claim, `_write_idempotency_key`'s upsert -- so the NEXT retry replays the new
-            # purchase rather than opening yet another one.
-            return None
+    # A durable attempt remains the same purchase beyond 24 hours. Age never authorizes a
+    # second possibly charged checkout; a new intentional purchase requires a new key.
     stored_hash = str(record.get("request_hash") or "")
-    if stored_hash and stored_hash != request_hash:
+    if not stored_hash or stored_hash != request_hash:
         raise svc.PurchaseRefused(
             "idempotency_conflict", "this key was used for a different request"
         )
     stored = str(record.get("purchase_id") or "").strip()
     if stored.startswith(_REFUSED_KEY_PREFIX):
         # A TOMBSTONE: this key, for this exact request, was refused -- see
-        # `_tombstone_idempotency_key`. The same answer again, for the key's whole window.
+        # `_tombstone_idempotency_key`. The same answer again for the lifetime of this attempt key.
         reason = stored[len(_REFUSED_KEY_PREFIX):]
         raise svc.PurchaseRefused(
             reason if reason in _TOMBSTONED_REFUSALS else "merchant_not_eligible",
@@ -2140,8 +2145,8 @@ async def _tombstone_idempotency_key(
     that create AFTER an operator enabled the merchant opened a SECOND purchase on the variant
     lane under K, beside the cart-link one already opened under K' -- one buyer request, two
     purchases, two hosted pages. With K remembered as refused, the retry gets the same refusal,
-    the door retries K', and the backend REPLAYS the cart-link purchase. The window is the key's
-    own (`_IDEMPOTENCY_WINDOW_SECONDS`); a buyer who wants the variant lane later sends a new key.
+    the door retries K', and the backend REPLAYS the cart-link purchase. A buyer who intentionally
+    wants the variant lane later sends a new key.
 
     A failed insert is swallowed: the key is already claimed (a race, or a purchase), and the
     lookup reads whichever row won.
@@ -2158,25 +2163,15 @@ async def _tombstone_idempotency_key(
         pass
 
 
-# THE KEY ROW IS AN UPSERT THAT ONLY REPLACES A STALE ROW (review of #2425, R3). A key is honoured for
-# `_IDEMPOTENCY_WINDOW_SECONDS`; after that `_replayed_purchase_id` ignores the row -- and a plain INSERT then
-# hit the primary key, the loser path re-read the stale row as "nothing", and the row was NEVER replaced: the
-# key had lost idempotency for good, and every retry opened another purchase. Now a row older than the window
-# is overwritten in the same statement (`DO UPDATE ... WHERE created_at < cutoff`), and a live row is left
-# alone (the WHERE is false, no row is returned, the caller re-reads the winner). One statement per dialect,
-# module-level so the PREPARE sweep sees them; SQLite has had UPSERT with a WHERE since 3.24.
+# Lifetime mappings are immutable at the SQL conflict fence too, not just at lookup.
+# Concurrent first requests still converge through the winner re-read/duplicate cleanup.
 _WRITE_KEY_SQL = """
     INSERT INTO reap_agentic_purchase_keys (
         agent_id, agent_user_ref_hash, idempotency_key, purchase_id, request_hash
     ) VALUES (
         :agent_id, :agent_user_ref_hash, :idempotency_key, :purchase_id, :request_hash
     )
-    ON CONFLICT (agent_id, agent_user_ref_hash, idempotency_key) DO UPDATE
-       SET purchase_id = EXCLUDED.purchase_id,
-           request_hash = EXCLUDED.request_hash,
-           created_at = now()
-     WHERE reap_agentic_purchase_keys.created_at
-           < now() - (CAST(:window_seconds AS INTEGER) * INTERVAL '1 second')
+    ON CONFLICT (agent_id, agent_user_ref_hash, idempotency_key) DO NOTHING
     RETURNING purchase_id
 """
 
@@ -2186,11 +2181,7 @@ _WRITE_KEY_SQL_SQLITE = """
     ) VALUES (
         :agent_id, :agent_user_ref_hash, :idempotency_key, :purchase_id, :request_hash
     )
-    ON CONFLICT (agent_id, agent_user_ref_hash, idempotency_key) DO UPDATE
-       SET purchase_id = excluded.purchase_id,
-           request_hash = excluded.request_hash,
-           created_at = CURRENT_TIMESTAMP
-     WHERE reap_agentic_purchase_keys.created_at < datetime('now', :window_modifier)
+    ON CONFLICT (agent_id, agent_user_ref_hash, idempotency_key) DO NOTHING
     RETURNING purchase_id
 """
 
@@ -2199,7 +2190,7 @@ async def _write_idempotency_key(
     *, agent_id: str, agent_user_ref_hash: str, idempotency_key: str, purchase_id: str,
     request_hash: str,
 ) -> bool:
-    """Land this key row -- fresh, or over a row past the window. True when it landed."""
+    """Land a new immutable key mapping. True when this insert won."""
     values = {
         "agent_id": agent_id,
         "agent_user_ref_hash": agent_user_ref_hash,
@@ -2209,12 +2200,11 @@ async def _write_idempotency_key(
     }
     if IS_POSTGRES:
         row = await database.fetch_one(
-            _WRITE_KEY_SQL, {**values, "window_seconds": _IDEMPOTENCY_WINDOW_SECONDS}
+            _WRITE_KEY_SQL, values
         )
     else:
         row = await database.fetch_one(
-            _WRITE_KEY_SQL_SQLITE,
-            {**values, "window_modifier": f"-{_IDEMPOTENCY_WINDOW_SECONDS} seconds"},
+            _WRITE_KEY_SQL_SQLITE, values,
         )
     return row is not None
 
@@ -2318,8 +2308,7 @@ def _aware(value: Any) -> Optional[datetime]:
     module's reads of `reap_agentic_purchase_keys` are raw SQL with no result processor; and the
     ledger's own reads are already normalised to NAIVE UTC datetimes. Comparing an aware datetime
     to a naive one raises, and treating a string as "not a datetime" silently skips the
-    comparison — which is how the idempotency window came to be unenforced on SQLite while every
-    test that did not age a row still passed.
+    comparison. Timestamp comparison must behave identically on both dialects.
 
     `ledger._decode_dt` is the repo's one parser for the string shape, and it is reused rather
     than reimplemented: a second parser would be a second opinion about what SQLite stored, and
@@ -2402,7 +2391,7 @@ def _public_body(view: Mapping[str, Any]) -> Dict[str, Any]:
     # that is the earlier of the quote's expiry and the page's (see `approval_deadline`); on
     # 'needs_enrollment' nothing has been quoted — the row re-quotes after the card is added, so
     # the quote column, always NULL there by the legal edges, is not consulted. `_now()` is the
-    # same aware-UTC clock the idempotency window uses; `reap_quote_expires_at` itself stays in
+    # same aware-UTC clock as the provider deadline; `reap_quote_expires_at` itself stays in
     # the body untouched, as the raw column it has always been.
     if state == "awaiting_approval":
         deadline = approval_deadline(body.get("reap_quote_expires_at"), hosted_expires)
@@ -2435,8 +2424,35 @@ def _public_body(view: Mapping[str, Any]) -> Dict[str, Any]:
 async def _owner_view(
     *, purchase_id: str, agent_id: str, agent_user_ref_hash: str
 ) -> Optional[Dict[str, Any]]:
-    view = await ledger.get_purchase_for_owner(purchase_id, agent_id, agent_user_ref_hash)
-    return _public_body(view) if view else None
+    # Private columns are needed only to scope the legacy enrollment deadline lookup;
+    # public_purchase_view must redact them before any response is built.
+    row = await ledger.get_purchase_for_owner(
+        purchase_id, agent_id, agent_user_ref_hash, include_private=True
+    )
+    if not row:
+        return None
+    if row.get("state") == "needs_enrollment" and row.get("hosted_url_expires_at") is None:
+        enrollment = None
+        enrollment_id = str(row.get("enrollment_id") or "").strip()
+        if enrollment_id:
+            try:
+                enrollment = await ledger.get_enrollment_internal(enrollment_id)
+            except Exception:  # Lookup unavailable: never emit a link with an invented deadline.
+                enrollment = None
+        if (enrollment and enrollment.get("status") == "pending"
+                and str(enrollment.get("id")) == enrollment_id
+                and enrollment.get("buyer_ref") == row.get("buyer_ref")
+                and enrollment.get("hosted_url") == row.get("hosted_url")):
+            deadline = svc._effective_expiry(
+                enrollment.get("hosted_url_expires_at"), enrollment.get("created_at")
+            )
+        else:
+            deadline = None
+        if deadline is None:
+            row.pop("hosted_url", None)
+        else:
+            row["hosted_url_expires_at"] = deadline
+    return _public_body(ledger.public_purchase_view(row))
 
 
 def _not_found() -> JSONResponse:
@@ -2476,6 +2492,8 @@ async def start_reap_purchase(
     """Open a purchase and answer at once. MAKES NO PARTNER CALL — the poller does that."""
     try:
         _require_rail()
+        if not svc.is_create_enabled():
+            raise svc.PurchaseRefused("create_disabled")
         agent_user_ref = _require_agent_user(agent_user)
 
         try:
@@ -2632,6 +2650,14 @@ async def start_reap_purchase(
                         # request hash covers `item_source`, so a replay is always the same lane.
                         replay_body["variant_title"] = view.get("variant_title")
                     return JSONResponse(status_code=202, content=replay_body)
+                # An immutable key without an owner-visible row cannot authorize a new attempt.
+                return _not_found()
+
+        svc.enforce_pilot_scope(
+            agent_id=agent_id, merchant_domain=merchant_domain,
+            market_country=str(shipping_address.get("country") or ""),
+            product_key=product_key, quantity=int(req.quantity),
+        )
 
         # PURCHASABILITY BEFORE EITHER LANE'S ELIGIBILITY, because it is the broader refusal:
         # both allowlists say a merchant is PERMITTED, and neither says its checkout can be PAID.
@@ -2802,6 +2828,56 @@ async def start_reap_purchase(
         return _refused(exc)
 
 
+@router.post("/purchases/recover")
+async def recover_reap_purchase(
+    request: Request,
+    context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
+):
+    """Read-only exact-attempt lookup, available while create is disabled.
+
+    Takes the original create body so the existing canonical fingerprint can be checked.
+    Reads only: no merchant/catalog lookup, identity/consent write, provider call or key refresh.
+    Missing/uncertain mapping must never be interpreted as permission to create another attempt.
+    """
+    try:
+        agent_user_ref = _require_agent_user(agent_user)
+        owner_hash = hash_agent_user_ref(agent_user_ref)
+        if not owner_hash:
+            raise svc.PurchaseRefused("agent_user_required")
+        try:
+            payload = await request.json()
+            req = StartPurchaseRequest.model_validate(payload)
+        except (ValueError, ValidationError):
+            raise svc.PurchaseRefused("invalid_request", "the recovery body did not validate")
+        key = _identifier(req.idempotency_key, "idempotency_key", max_chars=128)
+        merchant = _merchant_domain_key(_identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower())
+        product = _identifier(req.product_key, "product_key", max_chars=1024)
+        variant = _identifier(req.variant_key, "variant_key", max_chars=1024) if str(req.variant_key or "").strip() else None
+        _consent_version(req.buyer.consent_version)  # Validation only; preserve stored consent.
+        request_hash = _request_hash(
+            merchant_domain=merchant, product_key=product, variant_key=variant,
+            quantity=int(req.quantity), email=str(req.buyer.email or "").strip(),
+            shipping_address=_buyer_address_for_client(req.buyer),
+            return_url=str(req.return_url or "").strip() or _default_return_url(),
+            item_source=req.item_source, offer_code=_offer_code(req.offer_code),
+        )
+        purchase_id = await _replayed_purchase_id(
+            agent_id=str(context.agent_id), agent_user_ref_hash=owner_hash,
+            idempotency_key=key, request_hash=request_hash,
+        )
+        if purchase_id:
+            view = await _owner_view(purchase_id=purchase_id, agent_id=str(context.agent_id), agent_user_ref_hash=owner_hash)
+            if view:
+                return view
+        return _not_found()
+    except svc.PurchaseRefused as exc:
+        # Refusal tombstones never identify an opened purchase; keep recovery a lookup.
+        if exc.reason in _TOMBSTONED_REFUSALS:
+            return _not_found()
+        return _refused(exc)
+
+
 @router.get("/purchases/{purchase_id}")
 async def get_reap_purchase(
     purchase_id: str,
@@ -2809,7 +2885,8 @@ async def get_reap_purchase(
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     try:
-        _require_rail()
+        # Stored owner-scoped status reads survive create disarming/credential outages.
+        # This handler makes no provider call and retains both identity dependencies.
         agent_user_ref = _require_agent_user(agent_user)
         agent_user_ref_hash = hash_agent_user_ref(agent_user_ref)
         if not agent_user_ref_hash:

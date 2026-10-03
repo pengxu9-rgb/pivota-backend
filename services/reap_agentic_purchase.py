@@ -104,6 +104,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import json
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -143,6 +144,8 @@ __all__ = [
     "enrollment_grace_seconds",
     "is_cart_link_enabled",
     "is_enabled",
+    "is_create_enabled",
+    "enforce_pilot_scope",
     "start_purchase",
     "transport_backoff_seconds",
     "verify_cart_link_quote",
@@ -169,6 +172,74 @@ def is_enabled() -> bool:
     a buyer's own card at a third party.
     """
     return (os.getenv(REAP_AGENTIC_ENABLED_ENV) or "").strip().lower() in _TRUTHY
+
+
+REAP_AGENTIC_CREATE_ENABLED_ENV = "REAP_AGENTIC_CREATE_ENABLED"
+REAP_AGENTIC_PILOT_SCOPE_ENV = "REAP_AGENTIC_PILOT_SCOPE"
+
+
+
+def _pilot_scope() -> Optional[Dict[str, list]]:
+    configured = os.getenv(REAP_AGENTIC_PILOT_SCOPE_ENV)
+    if configured is None:
+        return None
+    names = {"agent_ids", "merchant_domains", "markets", "product_keys", "quantities"}
+    def no_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+    try:
+        scope = json.loads(configured, object_pairs_hook=no_duplicate_keys)
+        if not isinstance(scope, dict) or not scope or set(scope) != names:
+            raise ValueError
+        for name, values in scope.items():
+            if not isinstance(values, list) or not values:
+                raise ValueError
+            if name == "quantities":
+                if any(type(v) is not int or v < 1 or v > 100 for v in values):
+                    raise ValueError
+            else:
+                if any(not isinstance(v, str) or not v or v != v.strip() or len(v) > 1024
+                       or any(ord(c) < 32 or ord(c) == 127 for c in v) for v in values):
+                    raise ValueError
+                if name == "markets" and any(not re.fullmatch(r"[A-Z]{2}", v) for v in values):
+                    raise ValueError
+                if name == "merchant_domains" and any(
+                    not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", v)
+                    or "." not in v or ".." in v or canonical_merchant_domain(v) != v for v in values
+                ):
+                    raise ValueError
+        return scope
+    except (ValueError, TypeError):
+        raise PurchaseRefused("pilot_scope_invalid", "configured pilot scope is invalid")
+
+
+def is_create_enabled() -> bool:
+    """Optional create-only pause. Unset inherits master; malformed dials/scope fail closed."""
+    value = os.getenv(REAP_AGENTIC_CREATE_ENABLED_ENV)
+    if not is_enabled() or (value is not None and value.strip().lower() not in _TRUTHY):
+        return False
+    try:
+        _pilot_scope()
+    except PurchaseRefused:
+        return False
+    return True
+
+
+def enforce_pilot_scope(*, agent_id: str, merchant_domain: str, market_country: str,
+                        product_key: str, quantity: int) -> None:
+    """Optional exact allowlists, applied only to fresh creates. Never logs configured IDs."""
+    scope = _pilot_scope()
+    if scope is None:
+        return
+    fields = {"agent_ids": agent_id, "merchant_domains": canonical_merchant_domain(merchant_domain),
+              "markets": str(market_country).upper(), "product_keys": product_key,
+              "quantities": quantity}
+    if any(fields[name] not in values for name, values in scope.items()):
+        raise PurchaseRefused("pilot_scope_refused", "request is outside configured pilot scope")
 
 
 #: The CART-LINK lane's own dial (Tier B: a Shopify cart permalink Reap quotes as received).
@@ -1428,6 +1499,8 @@ async def start_purchase(
     #    that could tell a caller something about our configuration.
     if not is_enabled():
         raise PurchaseRefused("rail_disabled", f"{REAP_AGENTIC_ENABLED_ENV} is not set")
+    if not is_create_enabled():
+        raise PurchaseRefused("create_disabled", "new purchase work is paused")
     if cart_link is not None and not is_cart_link_enabled():
         raise PurchaseRefused(
             "cart_link_disabled", f"{REAP_AGENTIC_CART_LINK_ENABLED_ENV} is not set"
@@ -1441,6 +1514,14 @@ async def start_purchase(
     agent_id = _require_text(agent_id, "agent_id")
     agent_user_ref_hash = _require_text(agent_user_ref_hash, "agent_user_ref_hash")
     buyer_ref = _require_text(buyer_ref, "buyer_ref")
+
+    scope_item = cart_link if cart_link is not None else row
+    if isinstance(scope_item, (PurchaseRow, CartLinkItem)):
+        enforce_pilot_scope(
+            agent_id=agent_id, merchant_domain=str(scope_item.shop_domain if isinstance(scope_item, CartLinkItem) else scope_item.merchant_domain),
+            market_country=str(scope_item.market_country or ""),
+            product_key=str(scope_item.product_key or ""), quantity=quantity,
+        )
 
     # 2b. THE CONSENT, ON BOTH LANES. Since migration 233 the purchase ROW carries the tag that
     #     was in force when it was opened, so a purchase with no consent is a row nothing can
@@ -1995,7 +2076,7 @@ async def _move(
 
 
 #: Release codes logged at WARNING only the first time in a row; see `_release`.
-_QUIET_WHEN_REPEATED = frozenset({"enrollment_settling"})
+_QUIET_WHEN_REPEATED = frozenset({"enrollment_settling", "enrollment_pending"})
 
 
 async def _release(
@@ -2095,6 +2176,19 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
         # No partner call, no write. A terminal row is done, and a poller that reached one has a
         # bug worth not compounding.
         return AdvanceResult(str(row["id"]), outcome="terminal", state=state)
+    if state in {"resolving", "needs_enrollment", "quoting"} and not is_create_enabled():
+        return await _release(row, worker_id, error_code="create_disabled")
+    if state in {"resolving", "needs_enrollment", "quoting"}:
+        try:
+            enforce_pilot_scope(
+                agent_id=str(row.get("agent_id") or ""),
+                merchant_domain=str(row.get("merchant_domain") or ""),
+                market_country=str(row.get("market_country") or ""),
+                product_key=str(row.get("product_key") or ""),
+                quantity=row.get("quantity"),
+            )
+        except PurchaseRefused as exc:
+            return await _release(row, worker_id, error_code=exc.reason)
     handler = _STEPS.get(state)
     if handler is None:  # pragma: no cover — every non-terminal state has a step
         raise RuntimeError(f"no step for purchase state {state!r}")
@@ -2306,6 +2400,19 @@ async def _resolving_to_enrollment(
         # row of this buyer exists: the answer we hold has nowhere to go. Nobody was shown its
         # link. The next step reconciles the buyer's pending row, whichever it is.
         return await _release(row, worker_id, error_code="enrollment_pending_superseded")
+    if not recorded or recorded.get("buyer_ref") != row.get("buyer_ref"):
+        return await _release(row, worker_id, error_code="enrollment_row_unreadable")
+    raw_expiry = created.data.get("nextAction", {}).get("expiresAt")
+    if raw_expiry is not None and expires is None:
+        if await _still_ours(row, worker_id) is None:
+            return _lost(row)
+        await ledger.mark_enrollment_dead(str(recorded["id"]))
+        return await _release(row, worker_id, error_code="enrollment_deadline_invalid")
+    # Missing optional provider expiry uses the ORIGINAL enrollment attempt's clock.
+    # Replayed creates/reads must not restart that clock on a new purchase.
+    expires = _effective_expiry(expires, recorded.get("created_at"))
+    if expires is None:
+        return await _release(row, worker_id, error_code="enrollment_deadline_unavailable")
     if not _link_is_usable(expires):
         # A link that is ALREADY DEAD (or dies within `MIN_LINK_LIFETIME_SECONDS`) out of a
         # create. The create is idempotent on our attempt id, so this is a REPLAY of an attempt
@@ -3350,8 +3457,8 @@ async def _step_checkout_poll(
         # EVERY failed read releases, including a partner status. The buyer has approved (or is
         # approving) a payment that is in flight; writing a terminal state over one bad read
         # would be our ledger saying 'failed' while their card says otherwise. The bounds are the
-        # ledger's sweeps — `expire_overdue_purchases` on a clock, `fail_exhausted_purchases` on
-        # a counter — not this step.
+        # ledger's separate contact scrub bounds PII retention without terminating this
+        # checkout. Local clocks/attempt counts never stand in for the provider outcome.
         code = str(read.error or "checkout_read_failed")
         return await _release(row, worker_id, error_code=code, transport=_is_transport(code))
 

@@ -884,7 +884,7 @@ async def test_the_candidate_select_does_not_offer_already_claimed_rows():
         if IS_POSTGRES
         else ledger._SELECT_DUE_PURCHASES_SQL_SQLITE
     )
-    offered = {r["id"] for r in await database.fetch_all(sql, {"limit": 50})}
+    offered = {r["id"] for r in await database.fetch_all(sql, {"limit": 50, "reconciliation_only": 0})}
     assert free["id"] in offered
     assert held["id"] not in offered, (
         "a row somebody already holds must not be offered as a candidate — the claim would "
@@ -928,7 +928,7 @@ async def test_the_claim_statement_refuses_a_row_that_went_terminal_after_the_se
     )
 
     sql = ledger._CLAIM_PURCHASE_SQL if IS_POSTGRES else ledger._CLAIM_PURCHASE_SQL_SQLITE
-    row = await database.fetch_one(sql, {"id": purchase["id"], "worker_id": "worker_a"})
+    row = await database.fetch_one(sql, {"id": purchase["id"], "worker_id": "worker_a", "reconciliation_only": 0})
     assert row is None, (
         "the claim UPDATE must re-check the state: between the candidate SELECT and this "
         "statement the row reached a terminal state, and a poller must never be handed one"
@@ -2759,9 +2759,9 @@ async def test_release_still_schedules_the_next_poll_alongside_the_code():
 # compared against the module's own idea of itself cannot notice that idea changing.
 _ENROLLMENT_PROJECTION = {
     "id", "buyer_ref", "reap_enrollment_id", "status", "hosted_url", "hosted_url_expires_at",
-    "card_network", "card_last4",
+    "card_network", "card_last4", "created_at",
 }
-_ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "created_at", "updated_at"}
+_ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "updated_at"}
 
 
 async def test_get_enrollment_internal_reads_a_pending_row_by_id():
