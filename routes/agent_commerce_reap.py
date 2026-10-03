@@ -238,6 +238,7 @@ _REFUSAL_STATUS: Dict[str, int] = {
     # skus. The lane never picks one; the caller names the sku or falls back.
     "row_variant_ambiguous": 409,
     "idempotency_conflict": 409,
+    "attempt_retired": 409,
 }
 
 _DEFAULT_REFUSAL_STATUS = 409
@@ -2142,11 +2143,14 @@ async def _replayed_purchase_id(
     if stored.startswith(_REFUSED_KEY_PREFIX):
         # A TOMBSTONE: this key, for this exact request, was refused -- see
         # `_tombstone_idempotency_key`. The same answer again for the lifetime of this attempt key.
+        from services.reap_unopened_attempt import MARKER
+        if MARKER.fullmatch(stored):
+            raise svc.PurchaseRefused("attempt_retired", "this original attempt was permanently retired")
         reason = stored[len(_REFUSED_KEY_PREFIX):]
-        raise svc.PurchaseRefused(
-            reason if reason in _TOMBSTONED_REFUSALS else "merchant_not_eligible",
-            "this key was refused for this request",
-        )
+        if reason not in _TOMBSTONED_REFUSALS:
+            # Corrupt/unknown tombstones cannot authorize another purchase lane.
+            raise _PurchasePersistenceUnavailable()
+        raise svc.PurchaseRefused(reason, "this key was refused for this request")
     return stored or None
 
 
@@ -3033,6 +3037,14 @@ async def recover_reap_purchase(
             expected_unit_price_minor=req.expected_unit_price_minor,
             expected_currency=req.expected_currency,
         )
+        try:
+            from services.reap_unopened_attempt import retired_receipt
+            receipt = await retired_receipt(agent_id=str(context.agent_id), owner_hash=owner_hash,
+                                            key=key, request_hash=request_hash)
+        except Exception:
+            raise _PurchasePersistenceUnavailable() from None
+        if receipt:
+            return receipt
         purchase_id = await _replayed_purchase_id(
             agent_id=str(context.agent_id), agent_user_ref_hash=owner_hash,
             idempotency_key=key, request_hash=request_hash,
@@ -3042,6 +3054,8 @@ async def recover_reap_purchase(
             if view:
                 return view
         return _not_found()
+    except _PurchasePersistenceUnavailable:
+        return JSONResponse(status_code=503, content={"error": "checkout_outcome_unknown"})
     except svc.PurchaseRefused as exc:
         # Refusal tombstones never identify an opened purchase; keep recovery a lookup.
         if exc.reason in _TOMBSTONED_REFUSALS:

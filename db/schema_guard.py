@@ -981,6 +981,22 @@ async def ensure_required_schema_light() -> None:
                     "ON reap_agentic_enrollments (buyer_ref) "
                     "WHERE status = 'active';"
                 )
+                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_unopened_attempt_retirements (
+    receipt_id VARCHAR(32) PRIMARY KEY,
+    agent_id VARCHAR(128) NOT NULL,
+    agent_user_ref_hash VARCHAR(64) NOT NULL,
+    native_key VARCHAR(128) NOT NULL,
+    cart_key VARCHAR(128) NOT NULL,
+    native_request_hash VARCHAR(64) NOT NULL,
+    cart_request_hash VARCHAR(64) NOT NULL,
+    authority_sha256 VARCHAR(64) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (agent_id, agent_user_ref_hash, native_key, cart_key),
+    CHECK (native_key <> cart_key)
+);
+"""))
                 await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_checkout_manual_resolution_audit (
     purchase_id VARCHAR(64) PRIMARY KEY,
     reap_checkout_id VARCHAR(128) NOT NULL,
@@ -3643,6 +3659,22 @@ async def ensure_required_schema_light() -> None:
                         "WHERE status = 'active';"
                     )
                 )
+                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_unopened_attempt_retirements (
+    receipt_id VARCHAR(32) PRIMARY KEY,
+    agent_id VARCHAR(128) NOT NULL,
+    agent_user_ref_hash VARCHAR(64) NOT NULL,
+    native_key VARCHAR(128) NOT NULL,
+    cart_key VARCHAR(128) NOT NULL,
+    native_request_hash VARCHAR(64) NOT NULL,
+    cart_request_hash VARCHAR(64) NOT NULL,
+    authority_sha256 VARCHAR(64) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (agent_id, agent_user_ref_hash, native_key, cart_key),
+    CHECK (native_key <> cart_key)
+);
+"""))
                 await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_checkout_manual_resolution_audit (
     purchase_id VARCHAR(64) PRIMARY KEY,
     reap_checkout_id VARCHAR(128) NOT NULL,
