@@ -1,6 +1,6 @@
 # `/agent/v2/commerce/reap` — the contract, for the gateway (WP5)
 
-Four routes. `routes/agent_commerce_reap.py` is the implementation and
+`routes/agent_commerce_reap.py` implements this contract.
 `docs/runbooks/reap_agentic_purchase.md` is the operational half; this page is the wire.
 
 **New purchases are disabled by default.** The base gate or missing credentials make
@@ -78,6 +78,42 @@ this rail — a 404 from here reports `PRODUCT_NOT_FOUND`, which means nothing a
 **This app cannot return 422.** The middleware rewrites every 422 to **400** and replaces the
 details with a `validation_errors` list. So the "you can fix this by editing the request" class
 answers **400**, not 422. Do not treat 400 as a transport error.
+
+---
+
+## `POST /agent/v2/commerce/reap/purchases/prepare`
+
+Resolves a buyer-selected numeric Shopify variant to its **existing catalog SKU key** before
+creating the original purchase body or idempotency key. Both agent and buyer authentication
+apply. Master, credentials, create and cart-link gates must be live; a paused create refuses
+preparation. The request has exactly `item_source: "cart_link"`, `merchant_domain`,
+`product_key`, `variant_id`, `quantity` and `market_country`. Selector IDs are positive decimal
+strings; quantity is a strict integer. Extra keys, caller price, buyer contact, consent,
+idempotency and variant-key assertions are refused with `invalid_request`.
+
+Success is HTTP 200 with a `selection` object containing `product_key`, `variant_id`,
+`variant_key`, `merchant_domain`, `market`, `currency`, `unit_price_minor`, `quantity` and
+`item_source`. `variant_key` is the stored SKU key, not a key constructed from `variant_id`.
+The merchant field preserves the validated observed storefront host needed by the create
+lane; pilot and merchant eligibility use the existing canonical merchant rule.
+
+The selected numeric ID must resolve to exactly one unsuppressed, nonplaceholder SKU of that
+product and seller/source. Duplicate aliases refuse `row_variant_ambiguous`; no SKU is chosen
+by ordering or a default variant. The existing cart-link reader validates active attached
+source, seller identity, current storefront proof and the selected SKU's own offer. Missing,
+expired or contradictory evidence refuses. Preparation requires its usable own offers to
+agree on exact currency and minor price, and enforces the same current agent, domain, market,
+product, quantity, variant, currency and item-total pilot bound as create. The later provider
+quote must still satisfy the authoritative full total cap, including shipping, tax and fees.
+
+This endpoint performs only catalog/eligibility/proof reads: no buyer link, consent, key,
+click, enrollment or purchase writes, and no provider, merchant, crawl or enrichment network
+request. PostgreSQL enforces a read-only repeatable-read transaction. A witness is a current
+selection description, **not a reservation or permission to skip create's checks**. The door
+checks the selected witness before its first create dispatch, then saves the original body,
+key and buyer session. A missing, refused or uncertain preparation never authorizes another
+checkout route. Original-attempt recovery does not prepare again and remains independent of
+current catalog/proof/scope while create is paused.
 
 ---
 
