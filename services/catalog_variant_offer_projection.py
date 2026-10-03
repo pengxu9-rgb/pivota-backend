@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from db.database import database
 from services.catalog_enrichment_agent.ingestion import variant_own_price
 from services.catalog_offer_writer_guard import guard_catalog_offer_rows
+from services.catalog_offer_link_repair import plan_hash
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 from services.offer_seller_identity import normalize_host
 from services.seller_identity import resolve_seed_seller_identity
@@ -42,7 +43,7 @@ TEMPLATES_SQL = """
 SELECT merchant_id, currency, market, source_domain, offer_type, is_first_party,
        why_buy_direct, offer_payload, source_ref
 FROM catalog_offers
-WHERE product_key=:pk AND sku_key=:canonical AND merchant_id=:merchant
+WHERE product_key=:pk AND (sku_key=:canonical OR (offer_id=:mirror_offer_id AND source_system=:mirror_source)) AND merchant_id=:merchant
 AND suppressed_at IS NULL AND suppression_reason IS NULL
 ORDER BY offer_id
 """
@@ -295,23 +296,27 @@ def plan_offers(product, variants, skus, templates, existing):
     return rows, dict(counts)
 
 
-async def project_missing_variant_offers(product_key, *, apply=False, db=None):
+async def project_missing_variant_offers(product_key, *, apply=False, db=None, include_manifest=False, expected_plan_hash=None):
     db = db or database
+    def refuse(reason):
+        if apply and expected_plan_hash is not None:
+            raise RuntimeError("variant_offer_product_plan_changed")
+        return {"planned": 0, "inserted": 0, "skips": {reason: 1}}
     async with db.transaction():
         product = await db.fetch_one(PRODUCT_SQL + (" FOR UPDATE" if apply else ""), {"pk": product_key, "src": MIRROR})
         if not product:
-            return {"planned": 0, "inserted": 0, "skips": {"product_not_live_mirror": 1}}
+            return refuse("product_not_live_mirror")
         product = dict(product)
         if product["merchant_id"] == "external_seed" or not product.get("source_ref"):
-            return {"planned": 0, "inserted": 0, "skips": {"seller_or_seed_missing": 1}}
+            return refuse("seller_or_seed_missing")
         seeds = await db.fetch_all(
             SEED_SQL + (" FOR SHARE" if apply else ""), {"pk": product_key, "seed_id": product["source_ref"]}
         )
         if len(seeds) != 1:
-            return {"planned": 0, "inserted": 0, "skips": {"active_attached_seed_missing": 1}}
+            return refuse("active_attached_seed_missing")
         scope = seed_scope(product, dict(seeds[0]))
         if scope is None:
-            return {"planned": 0, "inserted": 0, "skips": {"seed_listing_or_seller_mismatch": 1}}
+            return refuse("seed_listing_or_seller_mismatch")
         product.update(scope)
         skus = [
             dict(s)
@@ -323,14 +328,19 @@ async def project_missing_variant_offers(product_key, *, apply=False, db=None):
             dict(t)
             for t in await db.fetch_all(
                 TEMPLATES_SQL + (" FOR UPDATE" if apply else ""),
-                {"pk": product_key, "canonical": product_key + "::canonical", "merchant": product["merchant_id"]},
+                {"pk": product_key, "canonical": product_key + "::canonical", "merchant": product["merchant_id"],
+                 "mirror_offer_id": "offer:external_seed:" + hashlib.sha256(product_key.encode()).hexdigest()[:32],
+                 "mirror_source": MIRROR},
             )
         ]
         existing = [dict(o) for o in await db.fetch_all(EXISTING_SQL, {"pk": product_key})]
         rows, skips = plan_offers(product, variants_from_seed(seeds[0]["seed_data"]), skus, templates, existing)
-        accepted, rejected, _ = await guard_catalog_offer_rows(rows, db=db, live_only=True)
+        accepted, rejected, _ = await guard_catalog_offer_rows(rows, db=db, live_only=True, require_live_links=True)
         counts = collections.Counter(skips)
         counts.update(rejected)
+        digest = plan_hash(accepted)
+        if apply and expected_plan_hash is not None and digest != expected_plan_hash:
+            raise RuntimeError("variant_offer_product_plan_changed")
         inserted = 0
         if apply:
             for row in accepted:
@@ -348,4 +358,5 @@ async def project_missing_variant_offers(product_key, *, apply=False, db=None):
                         "actor": SOURCE,
                     },
                 )
-        return {"planned": len(accepted), "inserted": inserted, "skips": dict(counts)}
+        return {"planned": len(accepted), "inserted": inserted, "skips": dict(counts),
+                **({"manifest": accepted, "plan_sha256": digest} if include_manifest else {})}

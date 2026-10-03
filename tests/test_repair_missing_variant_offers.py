@@ -23,3 +23,12 @@ def test_only_expected_staging_target_accepted(monkeypatch):
     monkeypatch.setenv("PIVOTA_ENV", "staging")
     monkeypatch.setenv("DATABASE_URL", "postgresql://operator@10.122.0.3/pivota")
     validate_target()
+
+
+def test_production_requires_explicit_environment_and_current_database(monkeypatch):
+    monkeypatch.setenv('PIVOTA_ENV','production')
+    monkeypatch.setenv('DATABASE_URL','postgresql://operator@10.25.0.2/pivota_08220842_Zsqlgz')
+    with pytest.raises(RuntimeError):validate_target()
+    validate_target('production')
+    monkeypatch.setenv('DATABASE_URL','postgresql://operator@10.25.0.2/pivota')
+    with pytest.raises(RuntimeError):validate_target('production')

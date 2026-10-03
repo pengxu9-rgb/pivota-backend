@@ -4408,6 +4408,10 @@ async def test_permanent_checkout_read_enters_human_review_without_terminalizing
         reap.get_checkout = _ok({'status':'UNRECOGNIZED'})
     else:
         reap.get_checkout = rc.ReapResponse(ok=False,status=404,error=reason)
+    # SQLite persists second precision; assert the scheduled interval against a
+    # fixed service clock instead of subtracting wall time spent on later checks.
+    fixed_now = datetime.now(timezone.utc).replace(microsecond=0)
+    monkeypatch.setattr(svc, '_now', lambda: fixed_now)
     for n in range(5):
         await database.execute('UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id', {'id':pid})
         report = await job.run_reap_agentic_purchase_poll(worker_id='permanent-'+str(n))
@@ -4416,8 +4420,7 @@ async def test_permanent_checkout_read_enters_human_review_without_terminalizing
     assert row['last_error_code'].startswith('checkout_unresolvable:')
     assert report.checkout_needs_human == 1 and report.stuck_over_age == 0
     assert await ledger.fail_exhausted_purchases(1,include_processing=True) == []
-    from datetime import datetime,timezone
-    assert (row['next_poll_at']-datetime.now(timezone.utc)).total_seconds() >= 899
+    assert row['next_poll_at'] == fixed_now + timedelta(minutes=15)
     # A transient failure cannot silently remove the human-review classification.
     reap.get_checkout = _transport()
     await database.execute('UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id', {'id':pid})

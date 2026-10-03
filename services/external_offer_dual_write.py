@@ -133,6 +133,7 @@ async def resolve_mirror_product(seed_id: str) -> Optional[Dict[str, str]]:
         SELECT product_key, merchant_id
         FROM catalog_products
         WHERE source_ref = :seed_id AND source_system = :src
+          AND suppressed_at IS NULL AND suppression_reason IS NULL
         ORDER BY updated_at DESC NULLS LAST
         LIMIT 1
         """,
@@ -224,19 +225,23 @@ MIRROR_OFFER_UPSERT_SQL = """
           (offer_id, sku_key, product_key, merchant_id,
            catalog_track, truth_tier, readiness_tier,
            offer_type, is_first_party, offer_mode,
-           channel, availability, inventory_quantity, currency,
+           channel, availability, inventory_quantity, currency, market,
            list_price, merchant_effective_price, estimated_best_price,
            price_confidence, source_system, source_ref, source_domain,
            offer_payload, price_checked_at)
-        VALUES
-          (:offer_id, :sku_key, :product_key, :merchant_id,
+        SELECT
+          :offer_id, CAST(:sku_key AS VARCHAR), CAST(:product_key AS VARCHAR), :merchant_id,
            :catalog_track, :truth_tier, :readiness_tier,
            :offer_type, :is_first_party, :offer_mode,
-           :channel, :availability, :inventory_quantity, :currency,
+           :channel, :availability, :inventory_quantity, :currency, CAST(:market AS VARCHAR),
            :list_price, :merchant_effective_price, :estimated_best_price,
            :price_confidence, :source_system, :source_ref, :source_domain,
            CAST(:offer_payload AS jsonb),
-           CASE WHEN CAST(:price_read AS BOOLEAN) THEN NOW() END)
+           CASE WHEN CAST(:price_read AS BOOLEAN) THEN NOW() END
+        WHERE EXISTS (SELECT 1 FROM catalog_products p JOIN catalog_skus s ON s.product_key=p.product_key
+          WHERE p.product_key=CAST(:product_key AS VARCHAR) AND s.sku_key=CAST(:sku_key AS VARCHAR)
+          AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+          AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL)
         ON CONFLICT (offer_id) DO UPDATE SET
           -- A KNOWN-retailer host is AUTHORITATIVE third-party evidence, so it
           -- corrects a wrongly-stored value (demotes a bad brand_direct/first-party):
@@ -270,11 +275,14 @@ MIRROR_OFFER_UPSERT_SQL = """
             ELSE catalog_offers.price_checked_at
           END,
           updated_at = NOW()
+        WHERE catalog_offers.suppressed_at IS NULL AND catalog_offers.suppression_reason IS NULL
+          AND catalog_offers.market=EXCLUDED.market
+          AND NOT (COALESCE(catalog_offers.offer_payload,CAST('{}' AS jsonb)) ? 'price_repair')
 """
 MIRROR_OFFER_UPSERT_SQL_WITHOUT_PRICE_CHECK = _without_price_check(MIRROR_OFFER_UPSERT_SQL, (
     ("offer_payload, price_checked_at)", "offer_payload)"),
-    ("CAST(:offer_payload AS jsonb),\n           CASE WHEN CAST(:price_read AS BOOLEAN) THEN NOW() END)",
-     "CAST(:offer_payload AS jsonb))"),
+    ("CAST(:offer_payload AS jsonb),\n           CASE WHEN CAST(:price_read AS BOOLEAN) THEN NOW() END",
+     "CAST(:offer_payload AS jsonb)"),
     ("          price_checked_at = CASE\n            WHEN CAST(:price_read AS BOOLEAN) THEN NOW()\n"
      "            ELSE catalog_offers.price_checked_at\n          END,\n", ""),
 ))
@@ -387,6 +395,7 @@ async def upsert_catalog_offer_from_seed_row(
             "availability": row_dict.get("availability"),
             "inventory_quantity": None,
             "currency": row_dict.get("price_currency") or "USD",
+            "market": row_dict.get("market") or "US",
             "list_price": list_price_value,
             "merchant_effective_price": list_price_value,
             "estimated_best_price": list_price_value,
@@ -504,11 +513,14 @@ SELECT o.offer_id, o.sku_key, o.merchant_id, o.currency, o.source_ref,
        o.list_price, o.merchant_effective_price,
        o.offer_payload ->> 'destination_url' AS payload_destination_url,
        o.offer_payload ->> 'external_seed_id' AS payload_seed_id,
-       o.suppressed_at IS NOT NULL AS suppressed,
+       (o.suppressed_at IS NOT NULL OR o.suppression_reason IS NOT NULL) AS suppressed,
        sk.source_variant_id
 FROM catalog_offers o
-LEFT JOIN catalog_skus sk ON sk.sku_key = o.sku_key
+JOIN catalog_skus sk ON sk.sku_key = o.sku_key AND sk.product_key=o.product_key
+JOIN catalog_products p ON p.product_key=o.product_key
 WHERE o.product_key = :product_key
+ AND sk.suppressed_at IS NULL AND sk.suppression_reason IS NULL
+ AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
 """
 
 # Guarded on what the row was when read: a concurrent writer that moved the currency or suppressed
@@ -523,7 +535,11 @@ SET list_price = :price,
     updated_at = NOW()
 WHERE offer_id = :offer_id
   AND upper(trim(coalesce(currency, ''))) = :currency
-  AND suppressed_at IS NULL
+  AND suppressed_at IS NULL AND suppression_reason IS NULL
+  AND EXISTS (SELECT 1 FROM catalog_skus sk JOIN catalog_products p ON p.product_key=sk.product_key
+    WHERE sk.sku_key=catalog_offers.sku_key AND sk.product_key=catalog_offers.product_key
+    AND sk.suppressed_at IS NULL AND sk.suppression_reason IS NULL
+    AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL)
 RETURNING offer_id
 """
 ATTACHED_LISTING_OFFER_UPDATE_SQL_WITHOUT_PRICE_CHECK = _without_price_check(ATTACHED_LISTING_OFFER_UPDATE_SQL, (

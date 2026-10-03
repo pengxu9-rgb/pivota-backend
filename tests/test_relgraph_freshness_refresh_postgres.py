@@ -148,6 +148,11 @@ async def test_real_mirror_owner_write_is_not_fresh_without_price_currency_read(
       ALTER TABLE catalog_offers ADD COLUMN price_confidence text;
       ALTER TABLE catalog_offers ADD COLUMN source_domain text;
       ALTER TABLE catalog_offers ADD COLUMN updated_at timestamptz;
+      ALTER TABLE catalog_offers ADD COLUMN suppression_reason text;
+      CREATE TABLE catalog_skus(sku_key text PRIMARY KEY,product_key text,
+        suppressed_at timestamptz,suppression_reason text);
+      INSERT INTO catalog_skus VALUES('P1::canonical','P1',NULL,NULL);
+      UPDATE catalog_offers SET sku_key='P1::canonical',merchant_id='seller';
     """
     for statement in setup_sql.split(";"):
         if statement.strip():

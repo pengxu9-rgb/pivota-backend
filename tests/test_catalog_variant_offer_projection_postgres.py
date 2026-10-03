@@ -64,6 +64,11 @@ async def db():
             destination_url='https://brand.example/products/test',market='US' WHERE id=:seed""",
             {"m": M, "seed": SEED},
         )
+        await database.execute(
+            """INSERT INTO catalog_skus(sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency)
+            VALUES(:sk,:pk,:m,'external_seed','external-product',:pk,'Canonical','USD')""",
+            {"sk": PK + "::canonical", "pk": PK, "m": M},
+        )
         for vid in ["677289689108", "42199434526795"]:
             await database.execute(
                 """INSERT INTO catalog_skus(sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency)
@@ -310,3 +315,23 @@ async def test_concurrent_promotion_waits_for_product_before_locking_skus(db, mo
         await live.execute("DELETE FROM catalog_products WHERE product_key=:pk", {"pk": pk})
         await promoting.disconnect()
         await live.disconnect()
+
+async def test_reviewed_native_money_cannot_be_replaced_by_canonical_seed_replay(db):
+ from services.external_offer_dual_write import upsert_catalog_offer_from_seed_row,derive_mirror_offer_id
+ data={'id':SEED,'price_amount':16,'price_currency':'USD','availability':'out_of_stock','domain':'brand.example',
+       'market':'US','destination_url':'https://brand.example/products/test','seed_kind':'self'}
+ await upsert_catalog_offer_from_seed_row(PK,data,merchant_id=M)
+ oid=derive_mirror_offer_id(PK)
+ await db.execute("UPDATE catalog_offers SET offer_payload=offer_payload||CAST(:marker AS jsonb) WHERE offer_id=:oid",
+                  {'oid':oid,'marker':json.dumps({'price_repair':{'writer':'catalog_variant_price_repair_v1'}})})
+ await upsert_catalog_offer_from_seed_row(PK,{**data,'price_amount':99,'availability':'in_stock'},merchant_id=M,price_read=True)
+ row=await db.fetch_one("SELECT list_price,availability,offer_payload,price_checked_at FROM catalog_offers WHERE offer_id=:oid",{'oid':oid})
+ assert float(row['list_price'])==16 and row['availability']=='out_of_stock' and row['price_checked_at'] is None
+ assert json.loads(row['offer_payload'])['price_repair']['writer']=='catalog_variant_price_repair_v1'
+
+async def test_expected_manifest_refuses_source_disappearance(db):
+ dry=await mod.project_missing_variant_offers(PK,db=db,include_manifest=True)
+ await db.execute("UPDATE external_product_seeds SET status='inactive' WHERE id=:seed",{'seed':SEED})
+ with pytest.raises(RuntimeError,match='plan_changed'):
+  await mod.project_missing_variant_offers(PK,db=db,apply=True,expected_plan_hash=dry['plan_sha256'])
+ assert await db.fetch_val("SELECT count(*) FROM catalog_offers WHERE source_system=:src",{'src':mod.SOURCE})==0

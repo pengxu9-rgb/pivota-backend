@@ -2262,7 +2262,7 @@ async def _apply_ingest_plan(
         # `_filter_children_of_skipped` applies to the children of a skipped PDP.
         offers = _drop_offers_of_refused_skus(offers, refused_sku_keys, counts)
 
-        accepted_offers, skip_reasons, _rejected_offers = await guard_catalog_offer_rows(offers)
+        accepted_offers, skip_reasons, _rejected_offers = await guard_catalog_offer_rows(offers, require_live_links=True)
         if skip_reasons:
             audit.record_skips(skip_reasons)
             counts["offers_skipped"] = sum(skip_reasons.values())
@@ -2463,7 +2463,7 @@ async def _apply_ingest_plan_batched(
     )
 
     # 4. catalog_offers — SAME guard + audit as the per-row path.
-    accepted_offers, skip_reasons, _rejected_offers = await guard_catalog_offer_rows(offers)
+    accepted_offers, skip_reasons, _rejected_offers = await guard_catalog_offer_rows(offers, require_live_links=True)
     if skip_reasons:
         audit.record_skips(skip_reasons)
         counts["offers_skipped"] = sum(skip_reasons.values())

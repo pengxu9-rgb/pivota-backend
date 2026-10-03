@@ -578,7 +578,8 @@ UPSERT_SKU_SQL = """
         sku = EXCLUDED.sku,
         barcode = EXCLUDED.barcode,
         title = EXCLUDED.title,
-        currency = EXCLUDED.currency,
+        currency = CASE WHEN catalog_skus.sku_payload->'price_repair' IS NOT NULL
+          THEN catalog_skus.currency ELSE EXCLUDED.currency END,
         image_url = EXCLUDED.image_url,
         visible_option_labels = EXCLUDED.visible_option_labels,
         visible_attributes = EXCLUDED.visible_attributes,
@@ -587,7 +588,10 @@ UPSERT_SKU_SQL = """
         -- `agent_version` / `canonical_url`. COALESCE because `NULL || jsonb` is
         -- NULL and the column is nullable.
         sku_payload = COALESCE(catalog_skus.sku_payload, CAST('{}' AS jsonb))
-                      || EXCLUDED.sku_payload,
+                      || CASE WHEN catalog_skus.sku_payload->'price_repair' IS NOT NULL
+                        THEN EXCLUDED.sku_payload - ARRAY['price','price_amount','list_price','currency','price_currency',
+                          'available','availability','stock','merchant_effective_price','estimated_best_price']
+                        ELSE EXCLUDED.sku_payload END,
         -- `readiness_tier` WAS INSERT-ONLY, and with the identity arbiter that made
         -- the promoter's headline count a lie. An ingest-spelled `<pk>::v:<vid>` row
         -- sits at 'referral_only' (that is what `apply._SKU_UPSERT_SQL` inserts);
@@ -610,6 +614,7 @@ UPSERT_SKU_SQL = """
         -- every (stored, offered) pair through this CASE and checks it against that
         -- module's list.
         readiness_tier = CASE
+            WHEN catalog_skus.sku_payload->'price_repair' IS NOT NULL THEN catalog_skus.readiness_tier
             WHEN catalog_skus.readiness_tier = 'referral_only'
                  AND EXCLUDED.readiness_tier IN ('knowledge_ready', 'commerce_ready')
               THEN EXCLUDED.readiness_tier
