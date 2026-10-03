@@ -73,3 +73,23 @@ supersede the reviewed evidence; this repair scan intentionally excludes already
 healthy rows. Shared writer pre-read guards validate static physical links; the
 repair transactions and canonical SQL add their own atomic checks, and this is
 not a general concurrency guarantee for every catalog writer.
+
+### Refresh protection after a reviewed repair
+
+The attached-listing projection refuses offers carrying `price_repair`, including a marker added
+between planning and the UPDATE. A generic product-page read or employee listing-price edit does
+not supersede reviewed native-variant money. Supersession still requires a dedicated verified
+native-variant receipt and a reviewed atomic SKU/offer update; this guard does not implement it.
+
+For unprotected listing offers, projection refuses contradictory explicit listing URLs or seed
+IDs, duplicate/conflicting variant identities, contradictory price/currency aliases, nonfinite
+or unrepresentable prices, and a conflicting SKU currency. Numeric Shopify IDs and their GID
+aliases are equivalent. The UPDATE compares the complete offer/SKU/product snapshots read during
+planning; a change visible before the statement causes a counted `changed_since_read` refusal.
+This is a compare-before-write guard, not a general serializable transaction guarantee.
+
+The seed refresh also refuses single-variant fallback money/stock when explicit native IDs name
+a different sibling, and refuses fallback money in a contradictory currency. Localized or
+unparseable stored price text still counts as carried money: reading only stock cannot make that
+price fresh. These changes neither perform additional merchant reads nor stamp stored repairs
+as newly checked. Existing crawl gates and checkout admission controls remain applicable.
