@@ -2413,23 +2413,24 @@ async def _resolving_to_enrollment(
             reap_status=_cap(created.data.get("status")),
             hosted_url=hosted_url,
             hosted_url_expires_at=expires,
+            hosted_url_expiry_invalid=(True if expires_at is not None and expires is None else False if expires is not None else None),
         )
     except ledger.EnrollmentIdConflict as conflict:
         return await _enrollment_id_conflict(
             row, worker_id, str(ours["id"]), conflict.holder, created.data, evidence
         )
-    except ledger.PendingEnrollmentTaken:
+    except (ledger.PendingEnrollmentTaken, ledger.EnrollmentAttemptUnavailable):
         # Our attempt row stopped being pending between the mint and now, and ANOTHER pending
         # row of this buyer exists: the answer we hold has nowhere to go. Nobody was shown its
         # link. The next step reconciles the buyer's pending row, whichever it is.
         return await _release(row, worker_id, error_code="enrollment_pending_superseded")
-    if not recorded or recorded.get("buyer_ref") != row.get("buyer_ref"):
+    if (not recorded or recorded.get("buyer_ref") != row.get("buyer_ref")
+            or str(recorded.get("id")) != str(ours["id"])):
         return await _release(row, worker_id, error_code="enrollment_row_unreadable")
     raw_expiry = created.data.get("nextAction", {}).get("expiresAt")
-    if raw_expiry is not None and expires is None:
-        if await _still_ours(row, worker_id) is None:
-            return _lost(row)
-        await ledger.mark_enrollment_dead(str(recorded["id"]))
+    if (raw_expiry is not None and expires is None) or recorded.get("hosted_url_expiry_invalid"):
+        # The provider created an attempt; malformed expiry is uncertainty, never
+        # permission to retire it or mint another. Persisted provenance survives retries.
         return await _release(row, worker_id, error_code="enrollment_deadline_invalid")
     # Missing optional provider expiry uses the ORIGINAL enrollment attempt's clock.
     # Replayed creates/reads must not restart that clock on a new purchase.
@@ -2534,6 +2535,52 @@ def _enrollment_gone(read: Any) -> bool:
     return "AGENTIC_RESOURCE_NOT_FOUND" in codes
 
 
+async def _checked_enrollment_expiry(row, worker_id, enrollment, data):
+    """Validate explicit provider expiry before inferring a deadline from an omission.
+
+    An omitted expiry cannot clear durable uncertainty. A valid explicit timestamp
+    or authoritative ACTIVE/dead status can resolve the retained original attempt.
+    """
+    action = data.get("nextAction")
+    raw = action.get("expiresAt") if isinstance(action, Mapping) else None
+    parsed = _parse_ts(raw)
+    invalid = raw is not None and parsed is None
+    if invalid or (enrollment.get("hosted_url_expiry_invalid") and parsed is None):
+        if invalid and not enrollment.get("hosted_url_expiry_invalid"):
+            recorded = await ledger.record_enrollment_expiry_provenance(
+                enrollment_id=str(enrollment["id"]), buyer_ref=str(row["buyer_ref"]),
+                purchase_id=str(row["id"]), worker_id=worker_id, invalid=True,
+            )
+            if recorded is None:
+                return _lost(row)
+        return await _release(row, worker_id, error_code="enrollment_deadline_invalid")
+    fresh = rc.hosted_action(data)
+    changed_link = fresh is not None and fresh[0] != enrollment.get("hosted_url")
+    changed_expiry = fresh is not None and parsed is not None and parsed != _parse_ts(enrollment.get("hosted_url_expires_at"))
+    if parsed is not None and fresh is None and enrollment.get("hosted_url_expiry_invalid"):
+        return await _release(row, worker_id, error_code="enrollment_deadline_invalid")
+    stale_purchase_action = row.get("state") == "needs_enrollment" and fresh is not None and (
+        fresh[0] != row.get("hosted_url")
+        or (parsed is not None and parsed != _parse_ts(row.get("hosted_url_expires_at")))
+    )
+    if (parsed is not None and fresh is not None and enrollment.get("hosted_url_expiry_invalid")) or changed_link or changed_expiry or stale_purchase_action:
+        recorded = await ledger.record_enrollment_expiry_provenance(
+            enrollment_id=str(enrollment["id"]), buyer_ref=str(row["buyer_ref"]),
+            purchase_id=str(row["id"]), worker_id=worker_id, invalid=False, expires=parsed, hosted_url=fresh[0] if fresh is not None else None,
+        )
+        if recorded is None:
+            return _lost(row)
+        deadline = _effective_expiry(parsed or enrollment.get("hosted_url_expires_at"), enrollment.get("created_at"))
+        if row.get("state") == "needs_enrollment" and fresh is not None and _link_is_usable(deadline):
+            refreshed = await ledger.refresh_enrollment_purchase_action(
+                purchase_id=str(row["id"]), enrollment_id=str(enrollment["id"]), buyer_ref=str(row["buyer_ref"]),
+                worker_id=worker_id, hosted_url=fresh[0], expires=deadline,
+            )
+            if refreshed is None:
+                return _lost(row)
+    return None
+
+
 async def _reconcile_one(
     row: Mapping[str, Any],
     worker_id: str,
@@ -2579,7 +2626,7 @@ async def _reconcile_one(
         ))
 
     grace = timedelta(seconds=enrollment_grace_seconds())
-    stored_expiry = _effective_expiry(
+    stored_expiry = None if pending.get("hosted_url_expiry_invalid") else _effective_expiry(
         pending.get("hosted_url_expires_at"), pending.get("created_at")
     )
     past_grace = stored_expiry is not None and _now() >= stored_expiry + grace
@@ -2623,10 +2670,14 @@ async def _reconcile_one(
         return _EnrollmentDecision("active", enrollment_id=str(activated["id"]))
 
     if state == "pending":
+        provenance = await _checked_enrollment_expiry(row, worker_id, pending, read.data)
+        if provenance is not None:
+            return _EnrollmentDecision("done", result=provenance)
         fresh = rc.hosted_action(read.data)
         if fresh is not None:
             link = fresh[0]
-            expires = _parse_ts(fresh[1]) or stored_expiry
+            supplied = _parse_ts(fresh[1])
+            expires = supplied or stored_expiry
         else:
             link = str(pending.get("hosted_url") or "").strip()
             expires = stored_expiry
@@ -2886,6 +2937,9 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
             row, worker_id, ["needs_enrollment"], "failed", last_error_code="enrollment_dead"
         )
     if state == "pending":
+        provenance = await _checked_enrollment_expiry(row, worker_id, ours, read.data)
+        if provenance is not None:
+            return provenance
         return await _release(row, worker_id, error_code="enrollment_pending")
     # UNKNOWN NEVER ADVANCES. A status we do not recognise is a reason to keep looking and tell a
     # human — folding it into 'active' sends a buyer to a checkout that cannot complete, and

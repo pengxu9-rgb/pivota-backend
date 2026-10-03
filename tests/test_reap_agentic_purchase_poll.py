@@ -2037,8 +2037,8 @@ class _RecordingScheduler:
 
 async def _start_scheduler(monkeypatch, **env):
     import services.audit_scheduler as sched
-    # Registration does not execute Stripe jobs; isolate the unrelated SDK client
-    # constructor while retaining the strict Reap network guard.
+    # Scheduling does not execute Stripe jobs. Prevent an unrelated Stripe SDK
+    # constructor from creating its HTTP client while the no-network guard is active.
     import stripe
     from unittest.mock import MagicMock
     monkeypatch.setattr(stripe, "StripeClient", MagicMock())
