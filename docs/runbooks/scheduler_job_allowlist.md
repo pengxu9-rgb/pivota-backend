@@ -193,7 +193,7 @@ gcloud run services update worker --project pivota-staging --region us-west1 \
   --update-env-vars AUDIT_WORKER_ENABLED=false
 ```
 
-To stop only the partner calls and keep the PII sweeps running, set `REAP_AGENTIC_ENABLED=0`
+To stop all new partner calls and keep the PII sweeps running, set `REAP_AGENTIC_RECONCILE_ENABLED=0`
 instead (see the Reap runbook's "Stopping it"). Once `/__scheduler_health` shows
 `worker_enabled: false` and `job_count: 0`, the allowlist may be left in place or removed — it is
 inert with the flag off.

@@ -80,16 +80,11 @@ column CHECKs enforce the pairing for any other writer. Both are create-only.
    The state vocabularies inside those statements are therefore literal too, and the Python
    tuples are parsed back OUT of the SQL — see `_states_in` for why that direction.
 
-6. THIS MODULE OPENS NO TRANSACTIONS, AND THE CUTOFFS DEPEND ON THAT. On Postgres
-   `CURRENT_TIMESTAMP` is TRANSACTION-start time, not wall-clock time: inside a long
-   caller-supplied transaction it FREEZES, so a poll loop that ran inside one would compare
-   every row against the clock as it was when the transaction began and either sweep nothing or
-   sweep everything. Every function here runs in autocommit — `mark_enrollment_active` held the
-   last `database.transaction()` and no longer does, for reasons of its own — so the two are
-   equivalent today. The cutoffs still use `clock_timestamp()` on Postgres rather than rely on
-   that: it reads the wall clock at STATEMENT time, so a future caller that wraps one of these
-   in a transaction cannot silently freeze it. SQLite has no equivalent and keeps
-   CURRENT_TIMESTAMP, which is statement-time there anyway.
+6. WORKER LOOPS ARE NOT ONE LONG TRANSACTION. PostgreSQL CURRENT_TIMESTAMP freezes at
+   transaction start; due/sweep predicates therefore use clock_timestamp(), the statement-time
+   wall clock. Short atomic caller units (purchase plus immutable request key, or an audited
+   manual outcome plus audit entry) may deliberately use database.transaction(). They must not
+   hold a transaction across provider/merchant I/O. SQLite CURRENT_TIMESTAMP is statement-time.
 
 ── WHY `transition` IS ONE STATEMENT ────────────────────────────────────────────────────────
 
@@ -178,6 +173,8 @@ __all__ = [
     "scrub_reconciling_purchase_pii",
     "fail_exhausted_purchases",
     "count_stuck_purchases",
+    "count_contact_retention_blocked",
+    "count_checkout_needs_human",
     "upsert_pending_enrollment",
     "PendingEnrollmentExpired",
     "EnrollmentIdConflict",
@@ -1791,6 +1788,7 @@ _CLAIM_PURCHASE_SQL = """
        SET claimed_by = :worker_id,
            claimed_at = clock_timestamp(),
            attempts = CASE WHEN state IN ('awaiting_approval', 'needs_enrollment')
+                  OR last_error_code = 'contact_retention_elapsed'
                   OR (state = 'resolving' AND last_error_code = 'enrollment_settling')
                 THEN attempts ELSE attempts + 1 END,
            updated_at = clock_timestamp()
@@ -1809,6 +1807,7 @@ _CLAIM_PURCHASE_SQL_SQLITE = """
        SET claimed_by = :worker_id,
            claimed_at = CURRENT_TIMESTAMP,
            attempts = CASE WHEN state IN ('awaiting_approval', 'needs_enrollment')
+                  OR last_error_code = 'contact_retention_elapsed'
                   OR (state = 'resolving' AND last_error_code = 'enrollment_settling')
                 THEN attempts ELSE attempts + 1 END,
            updated_at = CURRENT_TIMESTAMP
@@ -2226,6 +2225,7 @@ _FAIL_EXHAUSTED_SQL = """
        )
        AND (:include_processing = 1 OR state <> 'processing')
        AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
+       AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
        AND attempts >= :max_attempts
        AND id IN (
         SELECT id FROM reap_agentic_purchases
@@ -2234,7 +2234,8 @@ _FAIL_EXHAUSTED_SQL = """
            )
            AND (:include_processing = 1 OR state <> 'processing')
            AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
-           AND attempts >= :max_attempts
+           AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
+       AND attempts >= :max_attempts
          ORDER BY attempts DESC, id ASC
          LIMIT :limit
      )
@@ -2258,6 +2259,7 @@ _FAIL_EXHAUSTED_SQL_SQLITE = """
        )
        AND (:include_processing = 1 OR state <> 'processing')
        AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
+       AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
        AND attempts >= :max_attempts
        AND id IN (
         SELECT id FROM reap_agentic_purchases
@@ -2266,7 +2268,8 @@ _FAIL_EXHAUSTED_SQL_SQLITE = """
            )
            AND (:include_processing = 1 OR state <> 'processing')
            AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
-           AND attempts >= :max_attempts
+           AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
+       AND attempts >= :max_attempts
          ORDER BY attempts DESC, id ASC
          LIMIT :limit
      )
@@ -2386,51 +2389,63 @@ async def expire_overdue_purchases(
 
 _SCRUB_RECONCILING_PII_SQL = """
     UPDATE reap_agentic_purchases
-       SET shipping_address = NULL, buyer_email = NULL, offer_code = NULL
-     WHERE state IN ('awaiting_approval', 'processing')
-       AND reap_checkout_id IS NOT NULL
+       SET shipping_address=NULL, buyer_email=NULL, offer_code=NULL,
+           last_error_code=CASE WHEN state IN ('resolving','needs_enrollment','quoting')
+                               THEN 'contact_retention_elapsed' ELSE last_error_code END
+     WHERE claimed_by IS NULL
+       AND state IN ('resolving','needs_enrollment','quoting','awaiting_approval','processing')
        AND (shipping_address IS NOT NULL OR buyer_email IS NOT NULL OR offer_code IS NOT NULL)
-       AND state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+       AND (created_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+            OR (state IN ('awaiting_approval','processing')
+                AND hosted_url_expires_at IS NOT NULL AND hosted_url_expires_at <= clock_timestamp()))
        AND id IN (
            SELECT id FROM reap_agentic_purchases
-            WHERE state IN ('awaiting_approval', 'processing')
-              AND reap_checkout_id IS NOT NULL
+            WHERE claimed_by IS NULL
+              AND state IN ('resolving','needs_enrollment','quoting','awaiting_approval','processing')
               AND (shipping_address IS NOT NULL OR buyer_email IS NOT NULL OR offer_code IS NOT NULL)
-              AND state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
-            ORDER BY state_entered_at ASC, id ASC LIMIT :limit
-       )
-    RETURNING id
+              AND (created_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+                   OR (state IN ('awaiting_approval','processing')
+                       AND hosted_url_expires_at IS NOT NULL AND hosted_url_expires_at <= clock_timestamp()))
+            ORDER BY created_at ASC,id ASC LIMIT :limit
+       ) RETURNING id
 """
 
 _SCRUB_RECONCILING_PII_SQL_SQLITE = """
     UPDATE reap_agentic_purchases
-       SET shipping_address = NULL, buyer_email = NULL, offer_code = NULL
-     WHERE state IN ('awaiting_approval', 'processing')
-       AND reap_checkout_id IS NOT NULL
+       SET shipping_address=NULL, buyer_email=NULL, offer_code=NULL,
+           last_error_code=CASE WHEN state IN ('resolving','needs_enrollment','quoting')
+                               THEN 'contact_retention_elapsed' ELSE last_error_code END
+     WHERE claimed_by IS NULL
+       AND state IN ('resolving','needs_enrollment','quoting','awaiting_approval','processing')
        AND (shipping_address IS NOT NULL OR buyer_email IS NOT NULL OR offer_code IS NOT NULL)
-       AND state_entered_at < datetime('now', :max_age_window)
+       AND (created_at < datetime('now', :max_age_window)
+            OR (state IN ('awaiting_approval','processing')
+                AND hosted_url_expires_at IS NOT NULL AND hosted_url_expires_at <= CURRENT_TIMESTAMP))
        AND id IN (
            SELECT id FROM reap_agentic_purchases
-            WHERE state IN ('awaiting_approval', 'processing')
-              AND reap_checkout_id IS NOT NULL
+            WHERE claimed_by IS NULL
+              AND state IN ('resolving','needs_enrollment','quoting','awaiting_approval','processing')
               AND (shipping_address IS NOT NULL OR buyer_email IS NOT NULL OR offer_code IS NOT NULL)
-              AND state_entered_at < datetime('now', :max_age_window)
-            ORDER BY state_entered_at ASC, id ASC LIMIT :limit
-       )
-    RETURNING id
+              AND (created_at < datetime('now', :max_age_window)
+                   OR (state IN ('awaiting_approval','processing')
+                       AND hosted_url_expires_at IS NOT NULL AND hosted_url_expires_at <= CURRENT_TIMESTAMP))
+            ORDER BY created_at ASC,id ASC LIMIT :limit
+       ) RETURNING id
 """
 
-
 async def scrub_reconciling_purchase_pii(
-    *, max_age_seconds: int = 3600, limit: int = 200
+    *, max_age_seconds: int = 900, limit: int = 200
 ) -> List[str]:
     """Bound contact retention without deciding whether an exposed checkout was paid.
 
     Checkout reads and conversion close need no shipping address/email/offer code. Keep all
     checkout, quote, amount, consent and attribution evidence; do not alter state, claims,
-    state_entered_at or terminal_at. Idempotent and safe against a concurrent holder write.
+    state_entered_at or terminal_at. The independent creation-age cap cannot reset on
+    transition. Exposed rows also scrub at explicit hosted expiry. Live claims defer cleanup
+    until released/requeued; both selection and UPDATE fence claimed_by IS NULL.
+    Contact-expired precheckout rows are preserved and cannot call the provider on resume.
     """
-    seconds = _require_int(max_age_seconds, "max_age_seconds", minimum=60)
+    seconds = _require_int(max_age_seconds, "max_age_seconds", minimum=60, maximum=3600)
     capped = _sweep_limit(limit)
     if IS_POSTGRES:
         rows = await database.fetch_all(
@@ -2507,6 +2522,9 @@ async def fail_exhausted_purchases(
 _COUNT_STUCK_PURCHASES_SQL = """
     SELECT COUNT(*) AS stuck FROM reap_agentic_purchases
      WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
+       AND (:reconciliation_only = 0 OR ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL))
+       AND NOT (substr(COALESCE(last_error_code,''),1,21) = 'checkout_unresolvable' AND substr(last_error_code,22,1) = chr(58))
+       AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
        AND (
             (state IN ('resolving', 'quoting', 'processing')
              AND state_entered_at < clock_timestamp() - (:stuck_seconds * INTERVAL '1 second')
@@ -2531,6 +2549,9 @@ _COUNT_STUCK_PURCHASES_SQL = """
 _COUNT_STUCK_PURCHASES_SQL_SQLITE = """
     SELECT COUNT(*) AS stuck FROM reap_agentic_purchases
      WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
+       AND (:reconciliation_only = 0 OR ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL))
+       AND NOT (substr(COALESCE(last_error_code,''),1,21) = 'checkout_unresolvable' AND substr(last_error_code,22,1) = char(58))
+       AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
        AND (
             (state IN ('resolving', 'quoting', 'processing')
              AND state_entered_at < datetime('now', :stuck_window)
@@ -2559,6 +2580,7 @@ _STUCK_HUMAN_WAIT_STATES = _states_in(_COUNT_STUCK_PURCHASES_SQL, "OR (state IN 
 async def count_stuck_purchases(
     *,
     stuck_after_seconds: int,
+    reconciliation_only: bool = False,
     max_age_seconds: int = 3600,
     enrollment_grace_seconds: int = ENROLLMENT_GRACE_SECONDS_DEFAULT,
 ) -> int:
@@ -2587,6 +2609,7 @@ async def count_stuck_purchases(
         row = await database.fetch_one(
             _COUNT_STUCK_PURCHASES_SQL,
             {
+                "reconciliation_only": int(reconciliation_only),
                 "stuck_seconds": stuck_after,
                 "stuck_grace_seconds": stuck_after + grace,
                 "stuck_max_age_seconds": stuck_after + max_age,
@@ -2596,12 +2619,43 @@ async def count_stuck_purchases(
         row = await database.fetch_one(
             _COUNT_STUCK_PURCHASES_SQL_SQLITE,
             {
+                "reconciliation_only": int(reconciliation_only),
                 "stuck_window": f"-{stuck_after} seconds",
                 "stuck_grace_window": f"-{stuck_after + grace} seconds",
                 "stuck_max_age_window": f"-{stuck_after + max_age} seconds",
             },
         )
     return int(row["stuck"]) if row is not None else 0
+
+
+_COUNT_CHECKOUT_NEEDS_HUMAN_SQL = """
+    SELECT count(*) AS n FROM reap_agentic_purchases
+     WHERE state IN ('awaiting_approval','processing') AND reap_checkout_id IS NOT NULL
+       AND substr(COALESCE(last_error_code,''),1,21)='checkout_unresolvable'
+       AND substr(last_error_code,22,1)=chr(58)
+"""
+_COUNT_CHECKOUT_NEEDS_HUMAN_SQL_SQLITE = """
+    SELECT count(*) AS n FROM reap_agentic_purchases
+     WHERE state IN ('awaiting_approval','processing') AND reap_checkout_id IS NOT NULL
+       AND substr(COALESCE(last_error_code,''),1,21)='checkout_unresolvable'
+       AND substr(last_error_code,22,1)=char(58)
+"""
+
+
+async def count_checkout_needs_human() -> int:
+    """Only explicitly classified unresolved reads; never general transport/refusal errors."""
+    if IS_POSTGRES:
+        row = await database.fetch_one(_COUNT_CHECKOUT_NEEDS_HUMAN_SQL)
+    else:
+        row = await database.fetch_one(_COUNT_CHECKOUT_NEEDS_HUMAN_SQL_SQLITE)
+    return int(row['n']) if row is not None else 0
+
+
+async def count_contact_retention_blocked() -> int:
+    """Privacy-blocked work is preserved operator work, not ordinary retryable stuck work."""
+    return int(await database.fetch_val(
+        "SELECT count(*) FROM reap_agentic_purchases WHERE state IN ('resolving','needs_enrollment','quoting') AND last_error_code='contact_retention_elapsed'"
+    ) or 0)
 
 
 # ── enrollments ──────────────────────────────────────────────────────────────────────────────

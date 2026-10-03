@@ -128,7 +128,7 @@ poller drives the state machine afterwards, on another process, over the next mi
 | `buyer.shipping_address` | yes | **the Reap client's field names**, not the snake_case shape `/agent/v2/commerce/checkouts` uses. Required: `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `country`. Optional: `addressLine2`, `region`, `postalCode`. Unknown keys are dropped. |
 | `buyer.name`, `buyer.phone` | no | **fallbacks only.** Used when the address omits the field; never override it. `name` splits on the last space. |
 | `return_url` | no | defaults to `REAP_AGENTIC_RETURN_URL`, else `https://<first REAP_RETURN_URL_HOSTS host>/reap/return` — with nothing set, `https://api.pivota.cc/reap/return`, a static page this backend serves. Must be https, no userinfo, on a host in `REAP_RETURN_URL_HOSTS`. |
-| `idempotency_key` | no | honoured for **24 hours**, scoped to `(agent, buyer)`. A variant-lane `409 merchant_not_eligible` is **remembered against the key** for that window: re-sending the same request with the same key is refused the same way even if the merchant is enabled meanwhile (a door that tried the cart-link lane under a second key must replay that purchase, not open another). Use a new key to start a new purchase. After the 24 hours a key is forgotten and its row is REPLACED by the next request's purchase, so a retry after that replays the new purchase rather than opening another. |
+| `idempotency_key` | optional for create; required for recovery | immutable, scoped to `(agent, buyer)`, retained for the lifetime of the attempt. Same normalized body returns the original purchase regardless of age or terminal state; a different body is `409 idempotency_conflict`. An unverifiable legacy hash fails closed. Refusal tombstones also persist. A new intentional purchase requires a fresh key; age never permits rollover. |
 | `click_context` | no | accepted and not forwarded. The click id this rail records is one **we** mint. |
 
 **There is no price field, and a price in the body is ignored.** The unit price comes from our
@@ -240,7 +240,7 @@ numeric variant in the cart URL is what is bought. `null` when the proof recorde
 `Default Title`, returned as is. The same value is stored as the purchase's `variant_title`, so
 `GET` returns it too.
 
-A **replay** (same `idempotency_key`, same agent, same buyer, inside 24 h, **and the same
+A **replay** (same `idempotency_key`, same agent, same buyer, at any age, **and the same
 request**) returns the same `purchase_id` and the purchase's **current** state, which may not be
 `resolving` (and, on the cart-link lane, the same `variant_title`).
 
@@ -705,3 +705,17 @@ same as to every other request, so this field cannot be used to probe whether th
 the POST — `resolving` has no page yet.
 
 There are **no webhooks on this rail**. The poll is the only way an outcome is ever learned.
+
+
+### Recover a lost create response
+
+`POST /agent/v2/commerce/reap/purchases/recover` takes the original `StartPurchaseRequest` body and a required nonempty `idempotency_key`. It uses the same API-key and end-user authentication and exact owner pair as create/GET. It is available while create flags or provider credentials are disabled. It does not check current merchant/catalog eligibility, call Reap, create identities/purchases, write consent, refresh keys or retain new buyer PII.
+
+The canonical hash is identical to create: merchant domain, product/variant, quantity, normalized buyer email/address, resolved return URL, item source and optional offer code. Keep the exact original body and resolved return URL; a changed configured default after an omitted return URL safely causes a conflict. Consent version is validated but is not hashed or rewritten by recovery. Click context is not hashed.
+
+* `200`: the same redacted owner purchase view as GET-by-ID.
+* `404 purchase_not_found`: unknown key, refusal tombstone, missing purchase or unowned purchase.
+* `409 idempotency_conflict`: a changed request or unverifiable stored fingerprint.
+* `400`: malformed original body or missing/invalid key; `401`: missing end-user identity.
+
+A failed recovery preserves uncertainty; it never authorizes a new payment attempt. Retry read-only recovery or escalate with the original key. On the enabled create route, a same-body replay still returns `202` for the existing purchase and follows the established consent update contract. Disabled create remains disabled; use recover for a read-only lookup. No schema migration is needed. Do not delete or overwrite the key mapping merely because 24 hours elapsed. Older application versions can still perform rollover, so replace all create handlers before relying on the lifetime guarantee.

@@ -1037,7 +1037,7 @@ async def test_a_timed_out_count_leaves_no_statement_and_no_held_connection(monk
 
         assert len(calls) == 1
         assert report.stuck_over_age == job.NOT_COUNTED == -1
-        assert report.errors == 1, "a count that timed out must be an error, never a silent -1"
+        assert report.errors == sum(value == job.NOT_COUNTED for value in (report.stuck_over_age, report.contact_retention_blocked, report.checkout_needs_human)), "every timed-out independent count must be an error, never a silent -1"
         assert report.advanced == 1
         assert 1.0 <= elapsed < 10, f"the run took {elapsed:.1f}s around a 1s timeout"
 
