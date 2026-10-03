@@ -111,6 +111,7 @@ _MIGRATIONS = (
     # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
+    _MIGRATIONS_DIR / "255_reap_unopened_attempt_retirements.sql",
 )
 
 #: Same convention as the ledger's gate: this file DROPS its tables, so it must be INCAPABLE of
@@ -123,6 +124,7 @@ _TABLES = (
     "reap_agentic_eligibility",
     "reap_agentic_buyer_refs",
     "reap_agentic_purchase_keys",
+    "reap_unopened_attempt_retirements",
 )
 _RAIL_TABLES = _TABLES + (
     "reap_agentic_purchases", "reap_agentic_enrollments",
@@ -3048,3 +3050,133 @@ async def test_full_production_pilot_admits_resolved_primary_route_and_replays(c
     replayed = await client.post(f"{BASE}/purchases", json=body)
     assert replayed.status_code == 202 and replayed.json()["purchase_id"] == purchase["id"], replayed.text
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+
+
+async def _retirement_args():
+    from services import reap_unopened_attempt as retirement
+    native, cart = "ucp-reap-v1-" + "a" * 48, "ucp-reap-v1-" + "b" * 48
+    hashes = {}
+    for lane, key in (("reap_variant", native), ("cart_link", cart)):
+        req = routes_reap.RecoverPurchaseRequest.model_validate(_body(item_source=lane,idempotency_key=key))
+        hashes[lane] = routes_reap._request_hash(merchant_domain=DOMAIN,product_key=PRODUCT_KEY,
+            variant_key=SKU_KEY,quantity=1,email=EMAIL,shipping_address=routes_reap._buyer_address_for_client(req.buyer),
+            return_url=routes_reap._default_return_url(),item_source=lane,offer_code=None)
+    return dict(agent_id=AGENT,owner_hash=hash_agent_user_ref(USER_REF),native_key=native,cart_key=cart,
+        native_request_hash=hashes["reap_variant"],cart_request_hash=hashes["cart_link"],
+        expected_database=await retirement.database_identity(),operator_ref="test.reviewed.synthetic",
+        provenance={**dict.fromkeys(retirement.CHECKS,True),"evidence_sha256":"c"*64,
+            "checked_at":datetime.now(timezone.utc).isoformat()})
+
+
+async def test_retirement_preview_apply_recover_and_old_keys_cannot_create(client,monkeypatch):
+    from services import reap_unopened_attempt as r
+    await _seed_atomic_request_lane(monkeypatch,"cart_link")
+    args=await _retirement_args()
+    assert (await r.retire_unopened_attempt(**args))["status"]=="eligible"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys")==0
+    applied=await r.retire_unopened_attempt(**args,dry_run=False)
+    assert (await r.retire_unopened_attempt(**args,dry_run=False))["status"]=="already_retired"
+    for lane, name in (("reap_variant","native_key"),("cart_link","cart_key")):
+        body=_body(item_source=lane,idempotency_key=args[name])
+        recovered=await client.post(f"{BASE}/purchases/recover",json=body)
+        assert recovered.status_code==200, recovered.text
+        assert recovered.json()=={"recovery_status":"retired","reconciliation_id":applied["reconciliation_id"]}
+        created=await client.post(f"{BASE}/purchases",json=body)
+        assert created.status_code==409 and _error(created)=="attempt_retired",created.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")==0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_unopened_attempt_retirements")==1
+
+
+@pytest.mark.parametrize("conflict",["database","provenance","stale","history","foreign","hash","partial"])
+async def test_retirement_refuses_ambiguous_or_unreviewed_state(client,monkeypatch,conflict):
+    from services import reap_unopened_attempt as r
+    await _seed_all();args=await _retirement_args()
+    if conflict=="database":args["expected_database"]={}
+    elif conflict=="provenance":args["provenance"]["historical_ledgers_reconciled"]=False
+    elif conflict=="stale":args["provenance"]["checked_at"]=(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+    elif conflict=="history":assert (await client.post(f"{BASE}/purchases",json=_body(idempotency_key="different-historical-key"))).status_code==202
+    else:
+        await routes_reap._write_idempotency_key(agent_id=OTHER_AGENT if conflict=="foreign" else AGENT,
+            agent_user_ref_hash=args["owner_hash"],idempotency_key=args["native_key"],
+            request_hash="d"*64 if conflict=="hash" else args["native_request_hash"],purchase_id="refused:attempt_retired:"+"e"*32)
+    before=await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys")
+    with pytest.raises(r.RetirementRefused):await r.retire_unopened_attempt(**args,dry_run=False)
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys")==before
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_unopened_attempt_retirements")==0
+
+
+@pytest.mark.parametrize("lane",["reap_variant","cart_link"])
+@pytest.mark.parametrize("winner",["create","retirement"])
+async def test_retirement_races_real_independent_create_connection(client,monkeypatch,lane,winner):
+    import asyncio,contextvars
+    from services import reap_unopened_attempt as r
+    await _seed_atomic_request_lane(monkeypatch,lane);args=await _retirement_args()
+    target=args["native_key" if lane=="reap_variant" else "cart_key"]
+    entered,release=asyncio.Event(),asyncio.Event()
+    if winner=="retirement":
+        real=routes_reap._replayed_purchase_id
+        async def delayed(**kw):
+            result=await real(**kw)
+            if kw["idempotency_key"]==target and result is None:
+                entered.set();await asyncio.wait_for(release.wait(),10)
+            return result
+        monkeypatch.setattr(routes_reap,"_replayed_purchase_id",delayed)
+    else:
+        real=routes_reap._write_idempotency_key
+        async def delayed(**kw):
+            result=await real(**kw)
+            if kw["idempotency_key"]==target and str(kw["purchase_id"]).startswith("rp_"):
+                entered.set();await asyncio.wait_for(release.wait(),10)
+            return result
+        monkeypatch.setattr(routes_reap,"_write_idempotency_key",delayed)
+    create=contextvars.Context().run(asyncio.create_task,client.post(f"{BASE}/purchases",json=_body(item_source=lane,idempotency_key=target)))
+    await asyncio.wait_for(entered.wait(),10)
+    retire=contextvars.Context().run(asyncio.create_task,r.retire_unopened_attempt(**args,dry_run=False))
+    if winner=="retirement":
+        receipt=await asyncio.wait_for(retire,10);release.set()
+        result=await asyncio.wait_for(create,10)
+        assert result.status_code==409, result.text
+        assert receipt["status"]=="retired"
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")==0
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys")==2
+    else:
+        await asyncio.sleep(.1);assert not retire.done();release.set()
+        result=await asyncio.wait_for(create,10);assert result.status_code==202,result.text
+        with pytest.raises(r.RetirementRefused):await asyncio.wait_for(retire,10)
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")==1
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys")==1
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_unopened_attempt_retirements")==0
+
+
+async def test_retirement_audit_failure_rolls_back_both_fences(client,monkeypatch):
+    from services import reap_unopened_attempt as r
+    await _seed_all();args=await _retirement_args();real=database.execute
+    async def fault(query,*a,**kw):
+        if str(query).startswith("INSERT INTO reap_unopened_attempt_retirements"):
+            raise RuntimeError("synthetic audit failure")
+        return await real(query,*a,**kw)
+    monkeypatch.setattr(database,"execute",fault)
+    with pytest.raises(RuntimeError):await r.retire_unopened_attempt(**args,dry_run=False)
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys")==0
+
+
+@pytest.mark.parametrize("damage",["audit","companion","hash","marker","authority","audit_shape"])
+async def test_retired_receipt_requires_complete_unchanged_evidence(client,monkeypatch,damage):
+    from services import reap_unopened_attempt as r
+    await _seed_all();args=await _retirement_args();await r.retire_unopened_attempt(**args,dry_run=False)
+    if damage=="audit":await database.execute("DELETE FROM reap_unopened_attempt_retirements")
+    elif damage=="companion":await database.execute("DELETE FROM reap_agentic_purchase_keys WHERE idempotency_key=:k",{"k":args["cart_key"]})
+    elif damage=="hash":await database.execute("UPDATE reap_agentic_purchase_keys SET request_hash=:h WHERE idempotency_key=:k",{"h":"f"*64,"k":args["cart_key"]})
+    elif damage=="authority":await database.execute("UPDATE reap_unopened_attempt_retirements SET authority_sha256=:h",{"h":"f"*64})
+    elif damage=="audit_shape":await database.execute("UPDATE reap_unopened_attempt_retirements SET evidence_sha256='bad'")
+    else:await database.execute("UPDATE reap_agentic_purchase_keys SET purchase_id='refused:attempt_retired:bad'")
+    result=await client.post(f"{BASE}/purchases/recover",json=_body(item_source="reap_variant",idempotency_key=args["native_key"]))
+    assert result.status_code!=200,result.text
+
+
+@pytest.mark.parametrize("preview",[None,0,1,"",[],{}])
+async def test_retirement_requires_explicit_boolean_preview(client,preview):
+    from services import reap_unopened_attempt as r
+    args=await _retirement_args()
+    with pytest.raises(r.RetirementRefused):await r.retire_unopened_attempt(**args,dry_run=preview)
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys")==0
