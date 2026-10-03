@@ -167,12 +167,8 @@ logger = logging.getLogger(__name__)
 # per-row errors and dial warnings stay on the module logger, where WARNING and above still land.
 # See jobs/merchant_purchasability_sweep.py for the longer note and why root is left alone.
 #
-# DELIBERATELY NOT MOVED: the "step 4 skipped" DEBUG line below. With the rail off this job
-# returns BEFORE the report line, so a disarmed worker emits nothing per tick — unlike the sweep,
-# whose disabled line did move. That is the 30 s interval talking: one INFO line per tick while
-# dark is ~2,900 lines a day saying the same thing, and /__scheduler_health `runs` is the proof
-# of a tick in that state. If an operator needs a per-tick line while dark, move THAT line, not
-# the report's early return.
+# Every completed maintenance tick reports, including provider-stop/missing-credentials ticks.
+# The heartbeat means the job/retention maintenance is alive, not that purchases are armed.
 
 __all__ = [
     "DIALS",
@@ -231,6 +227,7 @@ DIALS: Dict[str, _Dial] = {
     # pathologically slow row, not a duplicated charge.
     "lease_seconds": _Dial("REAP_AGENTIC_LEASE_SECONDS", 300, 180, 3600),
     # The PII deadline for `needs_enrollment` / `awaiting_approval`. The ledger's floor is 60.
+    "contact_max_age_seconds": _Dial("REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS", 900, 60, 3600),
     "hosted_max_age_seconds": _Dial("REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS", 3600, 60, 2592000),
     # Attempts are counted at CLAIM and only in resolving/quoting/processing, so this is a count
     # of tries, not of ticks. The ledger's floor is 1.
@@ -384,12 +381,13 @@ class PollReport:
     (infra/gcp/setup_monitoring.sh matches `stuck_over_age=[1-9]`). It is how many non-terminal
     purchases are more than `STUCK_AFTER_SECONDS` past the last moment the rail's own rules let
     them stay where they are — `ledger.count_stuck_purchases` owns the definition, and a buyer
-    with a live hosted page is not in it. It is read in STEP 5, on armed runs only, so:
+    with a live hosted page is not in it. Every completed maintenance run counts it.
+    When precheckout/provider work is paused, only exposed checkout states are counted:
 
         >= 0   counted, and that is the count.
-        -1     NOT COUNTED (`NOT_COUNTED`): the rail is disarmed, or the read failed or timed
+        -1     NOT COUNTED (`NOT_COUNTED`): the read failed or timed
                out — in which case `errors` says so. Never 0: "nobody looked" must not read as
-               "nobody is stuck". On an armed run that printed a report, `-1` always comes with
+               "nobody is stuck". On a run that printed a report, `-1` always comes with
                `errors` >= 1.
     """
 
@@ -398,6 +396,9 @@ class PollReport:
     failed_exhausted: int = 0
     processing_over_attempts: int = 0
     stuck_over_age: int = -1
+    precheckout_paused: int = 0
+    contact_retention_blocked: int = 0
+    checkout_needs_human: int = 0
     claimed: int = 0
     advanced: int = 0
     released: int = 0
@@ -410,6 +411,9 @@ class PollReport:
 
 
 _COUNTS = (
+    "precheckout_paused",
+    "checkout_needs_human",
+    "contact_retention_blocked",
     "requeued",
     "expired",
     "failed_exhausted",
@@ -653,6 +657,7 @@ async def run_reap_agentic_purchase_poll(
     claim_batch = _env_int(DIALS["claim_batch"])
     lease_seconds = _env_int(DIALS["lease_seconds"])
     hosted_max_age = _env_int(DIALS["hosted_max_age_seconds"])
+    contact_max_age = _env_int(DIALS["contact_max_age_seconds"])
     max_attempts = _env_int(DIALS["max_attempts"])
     error_backoff = _env_int(DIALS["error_backoff_seconds"])
     budget_seconds = _env_int(DIALS["poll_budget_seconds"])
@@ -665,6 +670,42 @@ async def run_reap_agentic_purchase_poll(
 
     def _report() -> PollReport:
         return PollReport(duration_ms=int((_monotonic() - started) * 1000), **counts)
+
+    def _precheckout_enabled() -> bool:
+        # The pilot-scope follow-up exports is_create_enabled; retain compatibility on this base.
+        gate = getattr(purchase_svc, "is_create_enabled", purchase_svc.is_enabled)
+        return gate() and os.getenv("REAP_AGENTIC_CREATE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+    async def _finish() -> PollReport:
+        async def _diagnostic(name, awaitable):
+            try:
+                counts[name] = await asyncio.wait_for(awaitable, timeout=STUCK_COUNT_TIMEOUT_SECONDS)
+            except Exception as exc:
+                counts[name] = NOT_COUNTED
+                counts["errors"] += 1
+                logger.error("reap_agentic_poll: could not count %s (error_type=%s); not counted", "stuck purchases" if name == "stuck_over_age" else name, type(exc).__name__)
+        await asyncio.gather(
+            _diagnostic("precheckout_paused", ledger.count_precheckout_paused(
+                precheckout_enabled=_precheckout_enabled(), pilot_scope=purchase_svc.pilot_admission_scope())),
+            _diagnostic("contact_retention_blocked", ledger.count_contact_retention_blocked()),
+            _diagnostic("checkout_needs_human", ledger.count_checkout_needs_human()),
+            _diagnostic("stuck_over_age", ledger.count_stuck_purchases(
+            stuck_after_seconds=STUCK_AFTER_SECONDS,
+            pilot_scope=purchase_svc.pilot_admission_scope(),
+            reconciliation_only=(not _precheckout_enabled() or not purchase_svc.is_reconciliation_enabled()
+                                 or not rc.is_configured() or (not is_production() and not rc.is_sandbox_base_url())),
+            max_age_seconds=hosted_max_age,
+            enrollment_grace_seconds=enrollment_grace,
+        )))
+
+        report = _report()
+        # THE PROOF LINE: `[ts] INFO - reap_agentic_poll: PollReport(...)` on the worker's stdout.
+        # THREE LOG-BASED METRICS MATCH THIS LINE (infra/gcp/setup_monitoring.sh): its presence,
+        # `stuck_over_age=[1-9]` and `, errors=[1-9]`. The prefix, the `PollReport(` and the
+        # `, name=<int>` pairs are therefore a contract; tests/test_reap_rail_alerts.py runs this job
+        # and feeds the line it really printed through the filters.
+        operator_logger.info("reap_agentic_poll: %s", report)
+        return report
 
     # ── 1. stale leases — ALWAYS, ARMED OR NOT ───────────────────────────────────────────────
     # Bounded by ONE statement rather than a drain loop: a requeue that keeps finding full
@@ -694,7 +735,7 @@ async def run_reap_agentic_purchase_poll(
 
     async def _scrub(limit: int) -> List[str]:
         return await ledger.scrub_reconciling_purchase_pii(
-            max_age_seconds=hosted_max_age, limit=limit
+            max_age_seconds=contact_max_age, limit=limit
         )
 
     # Contact retention is independent of the paid outcome. Runs even with no credentials.
@@ -715,7 +756,8 @@ async def run_reap_agentic_purchase_poll(
         # It is also why step 3b exists: a refusal nobody can see is indistinguishable from a
         # sweep that had nothing to do.
         return await ledger.fail_exhausted_purchases(
-            max_attempts, limit=limit, include_processing=False
+            max_attempts, limit=limit, include_processing=False,
+            precheckout_enabled=_precheckout_enabled(), pilot_scope=purchase_svc.pilot_admission_scope()
         )
 
     counts["failed_exhausted"] = await _sweep_until_drained(
@@ -750,17 +792,17 @@ async def run_reap_agentic_purchase_poll(
     #
     # Keep checkout GET/reconciliation alive when new purchase work is disarmed.
     # Removing credentials pauses reads but never disables the contact-retention sweeps.
-    reconciliation_only = not purchase_svc.is_create_enabled()
+    reconciliation_only = not _precheckout_enabled()
     if reconciliation_only:
         counts["skipped_disabled"] = 1  # Creation/enrollment steps skipped; checkout reads continue.
-    if not rc.is_configured():
+    if not purchase_svc.is_reconciliation_enabled() or not rc.is_configured():
         counts["skipped_disabled"] = 1
         logger.debug(
             "reap_agentic_poll: step 4 skipped (enabled=%s configured=%s); the sweeps ran",
             purchase_svc.is_enabled(),
             rc.is_configured(),
         )
-        return _report()
+        return await _finish()
 
     # OUTSIDE PRODUCTION, ONLY THE SANDBOX. Staging is a RESTORED COPY of production, so the rows
     # this step would claim can be real buyers' purchases, and `advance` would then enroll (Reap
@@ -777,7 +819,7 @@ async def run_reap_agentic_purchase_poll(
                 "run. See docs/runbooks/reap_agentic_purchase.md.",
                 ", ".join(sorted(rc.REAP_SANDBOX_HOSTS)),
             )
-        return _report()
+        return await _finish()
 
     if _budget_spent():
         # The sweeps ate the budget. Claiming now would take leases this run cannot service and
@@ -789,7 +831,7 @@ async def run_reap_agentic_purchase_poll(
             "this tick",
             budget_seconds,
         )
-        return _report()
+        return await _finish()
 
 
     # Claim acquisition and all processing are inside the cleanup try/finally. The `finally` is the
@@ -799,7 +841,7 @@ async def run_reap_agentic_purchase_poll(
     try:
         # Include acquisition in cleanup: cancellation may land after a partial batch claim.
         rows = await ledger.claim_due_purchases(
-            worker, limit=claim_batch,
+            worker, limit=claim_batch, pilot_scope=purchase_svc.pilot_admission_scope(),
             **({"reconciliation_only": True} if reconciliation_only else {})
         )
         counts["claimed"] = len(rows)
@@ -920,50 +962,7 @@ async def run_reap_agentic_purchase_poll(
         # cancellation too, which is the path the first cut had no answer for at all.
         counts["errors"] += await _release_leftovers(worker, cancelled=cancelled)
 
-    # ── 5. the stuck count — READ ONLY, AND ONLY ON AN ARMED RUN ─────────────────────────────
-    # After the loop, so a purchase this very tick moved is not counted, and below both early
-    # returns above, so a disarmed rail issues no statement it did not issue before. It is given
-    # the SAME max age and grace the expire sweep was given at the top of this run: a waiting
-    # row's deadline is the sweep's own, not a second opinion.
-    #
-    # ALWAYS TAKEN, EVEN ON A SPENT BUDGET — AND BOUNDED ON ITS OWN CLOCK INSTEAD. Skipping it
-    # when the budget was spent (the previous cut) made the stuck alert blind exactly when the
-    # poller was slowest: three over-budget ticks in a row reported `stuck_over_age=-1, errors=0`
-    # over a payment 90 minutes in flight, and nothing paged. So the count runs on every armed
-    # run that gets this far, under `STUCK_COUNT_TIMEOUT_SECONDS`; see that constant for the
-    # arithmetic against the run deadline.
-    #
-    # A COUNT THAT COULD NOT BE TAKEN IS A FAILURE, NEVER A SILENT -1. Timed out or raised, the
-    # field keeps NOT_COUNTED and `errors` goes up, so the tick the stuck alert cannot see is the
-    # failing alert's. `asyncio.TimeoutError` is an `Exception`; a cancellation of the RUN is not,
-    # and still propagates from here.
-    try:
-        counts["stuck_over_age"] = await asyncio.wait_for(
-            ledger.count_stuck_purchases(
-                stuck_after_seconds=STUCK_AFTER_SECONDS,
-                max_age_seconds=hosted_max_age,
-                enrollment_grace_seconds=enrollment_grace,
-            ),
-            timeout=STUCK_COUNT_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:  # noqa: BLE001 — a diagnostic must never fail the run that carries it
-        # The TYPE only, as everywhere in this file; a timeout reads `error_type=TimeoutError`.
-        counts["errors"] += 1
-        logger.error(
-            "reap_agentic_poll: could not count stuck purchases (error_type=%s); "
-            "stuck_over_age is reported as %d, meaning NOT COUNTED",
-            type(exc).__name__,
-            NOT_COUNTED,
-        )
-
-    report = _report()
-    # THE PROOF LINE: `[ts] INFO - reap_agentic_poll: PollReport(...)` on the worker's stdout.
-    # THREE LOG-BASED METRICS MATCH THIS LINE (infra/gcp/setup_monitoring.sh): its presence,
-    # `stuck_over_age=[1-9]` and `, errors=[1-9]`. The prefix, the `PollReport(` and the
-    # `, name=<int>` pairs are therefore a contract; tests/test_reap_rail_alerts.py runs this job
-    # and feeds the line it really printed through the filters.
-    operator_logger.info("reap_agentic_poll: %s", report)
-    return report
+    return await _finish()
 
 
 async def _release_guarded(purchase_id: str, worker: str, counts: Dict[str, int]) -> bool:

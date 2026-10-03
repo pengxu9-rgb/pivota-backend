@@ -86,12 +86,10 @@ def test_the_inferred_default_is_not_reachable_from_prod(source: str) -> None:
 
 
 def test_the_verification_check_covers_the_create_branch(source: str) -> None:
-    """The CREATE arm is the one that manufactures an undeliverable channel.
+    """Both newly created and reused channels need an actual resource read.
 
-    An API-created email channel is born UNVERIFIED. Putting the check only in the
-    reuse arm instruments the branch that observes the damage and stays silent on
-    the branch that causes it — which is exactly how the live 08-28 channel came to
-    exist while the script printed a clean summary.
+    Either can explicitly require verification or have no applicable verification
+    state; neither is evidence of receipt by the intended person.
 
     Asserts by position: the check must sit after the `fi` that closes the
     create/reuse if-else, not inside either arm.
@@ -106,22 +104,21 @@ def test_the_verification_check_covers_the_create_branch(source: str) -> None:
 
 
 def test_an_unverified_channel_is_surfaced(source: str) -> None:
-    """Cloud Monitoring delivers nothing to an unverified email channel.
-
-    The live channel on 2026-08-28 reported no verificationStatus at all, so every policy was
-    firing into the void with no signal anywhere that this was happening.
-    """
+    """Explicit UNVERIFIED fails, distinct from an omitted/exempt state."""
     body = _uncommented(source)
     assert "verificationStatus" in body
-    assert '[ "$CHANNEL_VERIFIED" != VERIFIED ]' in body
+    assert '[ "$CHANNEL_VERIFIED" = UNVERIFIED ]' in body
+    assert '"VERIFICATION_STATUS_UNSPECIFIED"' in body
     # SHORTEST-prefix strip. `##` yields a bare channel id, the GET 404s, the
     # status reads empty and the warning fires on every run including a genuinely
     # verified channel — a permanent false alarm is worse than no alarm, because
     # it teaches the operator to skip the one line that matters.
     assert '${CHANNEL#projects/*/}' in body
     assert '${CHANNEL##projects/*/}' not in body
-    # An undeliverable channel must fail the run, not just print to stderr.
-    assert "CHANNEL_UNDELIVERABLE" in body and "exit 1" in body
+    # A nonfunctioning channel must fail BEFORE any policy/metric/uptime writes.
+    unverified = body.split('if [ "$CHANNEL_VERIFIED" = UNVERIFIED ]; then', 1)[1]
+    assert "exit 1" in unverified.split("elif", 1)[0]
+    assert body.index('if [ "$CHANNEL_VERIFIED" = UNVERIFIED ]; then') < body.index('UP="$(api GET uptimeCheckConfigs)"')
 
 
 def test_the_lb_5xx_threshold_is_reachable_at_real_traffic(source: str) -> None:

@@ -1,0 +1,56 @@
+"""Real worker lines and executable installer receipts; no cloud writes or email."""
+import pytest
+from test_reap_rail_alerts import (source, _filter, matches, _entry, worker_log, reap_policies,
+                                  _threshold, _db, _env, _no_network, reap, attribution,
+                                  _start, _park, _run, ledger, job, IS_POSTGRES)
+pytestmark=pytest.mark.skipif(IS_POSTGRES, reason='real SQLite worker; filters dialect independent')
+QUEUES=[('checkout_needs_human','REAP_POLL_HUMAN_FILTER','human','checkout needs human reconciliation'),
+        ('contact_retention_blocked','REAP_POLL_CONTACT_FILTER','contact','buyer contact retention blocked')]
+
+@pytest.mark.parametrize('field,var,metric,label',QUEUES)
+@pytest.mark.parametrize('count,hit',[(0,False),(-1,False),(1,True),(12,True)])
+def test_filter_exact_queue_and_worker(source,field,var,metric,label,count,hit):
+    log_filter=_filter(source,var)
+    line=f'reap_agentic_poll: PollReport({field}={count}, errors=0)'
+    assert matches(log_filter,_entry(line)) is hit
+    assert not matches(log_filter,_entry(line,service='web'))
+    assert not matches(log_filter,_entry(line,resource_type='cloud_run_job'))
+    assert not matches(log_filter,_entry(f'reap_agentic_poll: {field}=1'))
+    other='contact_retention_blocked' if field=='checkout_needs_human' else 'checkout_needs_human'
+    assert not matches(log_filter,_entry(f'reap_agentic_poll: PollReport({other}=1, {field}=0, errors=0)'))
+
+@pytest.mark.parametrize('field,var,metric,label',QUEUES)
+def test_policy_generator_owns_queue_and_verified_channel(source,field,var,metric,label):
+    policy=reap_policies()['prod: Reap '+label]
+    t=_threshold(policy)
+    assert t['filter']==f'metric.type="logging.googleapis.com/user/reap_agentic_poll_{metric}" AND resource.type="cloud_run_revision"'
+    assert t['duration']=='0s' and t['thresholdValue']==0
+    assert t['aggregations'][0]['alignmentPeriod']=='900s'
+    assert policy['notificationChannels']==['projects/p/notificationChannels/1']
+    assert 'Do not' in policy['documentation']['content'] or 'do not' in policy['documentation']['content']
+    assert f'upsert_log_metric reap_agentic_poll_{metric}' in source
+
+async def test_real_held_worker_report_reaches_both_queues_only(source,reap,monkeypatch):
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','0')
+    human=await _start(buyer_ref='queue_human')
+    contact=await _start(buyer_ref='queue_contact')
+    await _park(human,'processing',2000,reap_checkout_id='chk_queue',last_error_code='checkout_unresolvable:3:reap_status_404')
+    await _park(contact,'quoting',2000,last_error_code='contact_retention_elapsed')
+    with worker_log() as lines:
+        report=await _run(worker_id='queue-alert-test')
+    assert report.checkout_needs_human==1 and report.contact_retention_blocked==1
+    assert report.stuck_over_age==0 and report.errors==0 and reap.calls==[]
+    for _,var,_,_ in QUEUES:
+        assert sum(matches(_filter(source,var),_entry(x)) for x in lines)==1
+    assert not any(matches(_filter(source,'REAP_POLL_STUCK_FILTER'),_entry(x)) for x in lines)
+    assert not any(matches(_filter(source,'REAP_POLL_FAILING_FILTER'),_entry(x)) for x in lines)
+
+async def test_queue_diagnostic_unavailable_pages_error_never_fabricates_queue(source,reap,monkeypatch):
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','0')
+    async def unavailable():raise RuntimeError('fixture unavailable')
+    monkeypatch.setattr(ledger,'count_checkout_needs_human',unavailable)
+    with worker_log() as lines:
+        report=await _run(worker_id='queue-alert-unavailable')
+    assert report.checkout_needs_human==-1 and report.errors==1
+    assert not any(matches(_filter(source,'REAP_POLL_HUMAN_FILTER'),_entry(x)) for x in lines)
+    assert any(matches(_filter(source,'REAP_POLL_FAILING_FILTER'),_entry(x)) for x in lines)

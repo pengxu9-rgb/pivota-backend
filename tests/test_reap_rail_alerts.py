@@ -454,8 +454,8 @@ async def test_a_bad_dial_reaches_the_failing_metric_once(filters, monkeypatch, 
 # ── a DARK environment prints nothing these metrics can count ────────────────────────────────
 
 
-async def test_an_unconfigured_rail_feeds_none_of_the_three_metrics(filters, monkeypatch, reap):
-    """Missing credentials block provider reads; PII logs are allowed and no metric hits."""
+async def test_an_unconfigured_rail_reports_maintenance_and_exposed_stuck(filters, monkeypatch, reap):
+    """Missing credentials block provider reads; retention and exposed diagnostic heartbeat remain."""
     await _start(buyer_ref="bref_live")
     old = await _start(buyer_ref="bref_old")
     await _park(old, "processing", 99999, reap_checkout_id="chk_dark")
@@ -467,7 +467,34 @@ async def test_an_unconfigured_rail_feeds_none_of_the_three_metrics(filters, mon
             assert report.skipped_disabled == 1
 
     assert reap.calls == [], "an unconfigured client reached the provider"
-    assert _counts(filters, lines) == dict.fromkeys(METRICS, 0)
+    assert _counts(filters, lines) == {"reap_agentic_poll_report":3,"reap_agentic_poll_stuck":3,"reap_agentic_poll_failing":0}
+
+
+@pytest.mark.parametrize("how", ["unset", "off"])
+async def test_disarmed_reconciliation_remains_monitored_without_new_work(filters, monkeypatch, reap, how):
+    from test_reap_agentic_purchase import _ok
+    live = await _start(buyer_ref="bref_live")
+    old = await _start(buyer_ref="bref_old")
+    await _park(old, "processing", 99999, reap_checkout_id="chk_dark")
+    if how == "unset":
+        monkeypatch.delenv("REAP_AGENTIC_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    reap.get_checkout = _ok({"status": "PROCESSING"})
+    reap.calls.clear()
+    with worker_log() as lines:
+        for tick in range(3):
+            await _raw("UPDATE reap_agentic_purchases SET next_poll_at = CURRENT_TIMESTAMP WHERE id = :id", {"id": old})
+            report = await _run(worker_id=f"disarmed-{tick}")
+            assert report.skipped_disabled == 1 and report.claimed == 1
+    assert reap.sequence() == ["get_checkout"] * 3
+    assert (await _get(live))["state"] == "resolving"
+    assert _counts(filters, lines) == {
+        "reap_agentic_poll_report": 3, "reap_agentic_poll_stuck": 3,
+        "reap_agentic_poll_failing": 0,
+    }
 
 
 @pytest.mark.parametrize("how", ["unset", "off"])
@@ -510,7 +537,7 @@ async def test_an_armed_staging_pointed_at_a_real_host_is_failing_not_silent(
         await _run()
         await _run()
     assert _counts(filters, lines) == {
-        "reap_agentic_poll_report": 0,
+        "reap_agentic_poll_report": 2,
         "reap_agentic_poll_stuck": 0,
         "reap_agentic_poll_failing": 1,
     }, lines
@@ -1075,19 +1102,20 @@ def test_the_script_wires_the_first_run_safely(source):
     # The three Reap policies, and only they, take the waiting path; they come after every
     # `upsert`, so a deferral cannot leave one of the nine existing policies unwritten.
     waited = re.findall(r'^upsert_on_new_metric "([^"]+)"', body, re.M)
-    assert waited == [STUCK_POLICY, FAILING_POLICY, SILENT_POLICY]
+    assert waited == [STUCK_POLICY, FAILING_POLICY, SILENT_POLICY,
+                      "prod: Reap checkout needs human reconciliation",
+                      "prod: Reap buyer contact retention blocked"]
     assert body.rindex('\nupsert "') < body.index('\nupsert_on_new_metric "')
     assert not re.search(r'^upsert "prod: Reap', body, re.M)
     # Ten minutes by default, shared: 20 tries of 30 s.
     assert 'NEW_METRIC_TRIES="${NEW_METRIC_TRIES:-20}"' in body
     assert 'NEW_METRIC_RETRY_SECONDS="${NEW_METRIC_RETRY_SECONDS:-30}"' in body
-    # A deferral is said out loud and fails the run — after the summary, and without stepping in
-    # front of the channel check, which must still be able to exit first.
+    # Channel validation fails before any cloud reconciliation. A new-metric deferral
+    # is said out loud after the summary, then fails the run without losing prior policies.
     said = body.index('echo "NOT CREATED: $NEW_METRIC_DEFERRED"')
-    channel = body.index('if [ "${CHANNEL_UNDELIVERABLE:-0}" = 1 ]; then')
-    assert body.index('print("policies:", len(ps))') < said < channel
-    tail = body[channel:]
-    assert re.search(r'if \[ -n "\$NEW_METRIC_DEFERRED" \]; then\n  exit 1\nfi\s*$', tail)
+    channel = body.index('if [ "$CHANNEL_VERIFIED" = UNVERIFIED ]; then')
+    assert channel < first_policy < body.index('print("policies:", len(ps))') < said
+    assert re.search(r'if \[ -n "\$NEW_METRIC_DEFERRED" \]; then\n  exit 1\nfi\s*$', body[said:])
 
 
 # ── replies that used to be read as good news ────────────────────────────────────────────────

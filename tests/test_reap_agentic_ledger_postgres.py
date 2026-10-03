@@ -82,6 +82,7 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
     # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
+    _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
 )
 _MIGRATION = _MIGRATIONS[0]
 
@@ -219,7 +220,7 @@ async def _raw_connection():
 
 async def _run_on(conn, sql: str, params: dict):
     positional, order = _to_positional(sql)
-    params = dict(params, reconciliation_only=params.get("reconciliation_only", 0))
+    params = dict(params, reconciliation_only=params.get("reconciliation_only", 0), pilot_scope=params.get("pilot_scope"), precheckout_enabled=params.get("precheckout_enabled", 1))
     return await conn.fetch(positional, *[params[name] for name in order])
 
 
@@ -1269,7 +1270,7 @@ async def test_the_candidate_select_does_not_offer_already_claimed_rows_on_postg
 
     offered = {
         r["id"]
-        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50, "reconciliation_only": 0})
+        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50, "reconciliation_only": 0, "pilot_scope": None})
     }
     assert free["id"] in offered and held["id"] not in offered
 
@@ -2623,6 +2624,7 @@ async def test_release_claim_has_no_attempts_delta_on_postgres():
 _ENROLLMENT_PROJECTION = {
     "id", "buyer_ref", "reap_enrollment_id", "status", "hosted_url", "hosted_url_expires_at",
     "card_network", "card_last4", "created_at",
+    "hosted_url_expiry_invalid",
 }
 _ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "updated_at"}
 
@@ -3984,7 +3986,7 @@ async def test_the_stuck_count_can_be_served_by_the_state_poll_index():
     for n in range(5):
         await _mk(buyer_ref=f"bref_{n}")
     positional, order = _to_positional(ledger._COUNT_STUCK_PURCHASES_SQL)
-    params = {"stuck_seconds": 1800, "stuck_grace_seconds": 1980, "stuck_max_age_seconds": 5400}
+    params = {"reconciliation_only": 0, "pilot_scope": None, "stuck_seconds": 1800, "stuck_grace_seconds": 1980, "stuck_max_age_seconds": 5400}
     conn = await _raw_connection()
     try:
         async with conn.transaction():

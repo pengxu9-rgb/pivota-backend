@@ -32,6 +32,13 @@ case "$ENV" in
   *) echo "usage: $0 prod|staging" >&2; exit 2 ;;
 esac
 
+# A dedicated rehearsal worker must not read the old shared worker's reports.
+REAP_WORKER_SERVICE_NAME="${REAP_WORKER_SERVICE_NAME:-worker}"
+if [[ ! "$REAP_WORKER_SERVICE_NAME" =~ ^[a-z]([-a-z0-9]*[a-z0-9])?$ ]] || [ "${#REAP_WORKER_SERVICE_NAME}" -gt 63 ]; then
+  echo "REAP_WORKER_SERVICE_NAME must be one exact Cloud Run service name" >&2
+  exit 2
+fi
+
 GCLOUD="${GCLOUD:-gcloud}"
 API="https://monitoring.googleapis.com/v3/projects/$PROJECT"
 TOKEN="$("$GCLOUD" auth print-access-token)"
@@ -112,34 +119,52 @@ print(json.dumps({"type": "email", "displayName": "pivota " + sys.argv[2] + " al
   echo "   created $CHANNEL"
 fi
 
-# Deliberately OUTSIDE the if/else. An API-created email channel is born
-# UNVERIFIED and stays that way until a human completes the emailed code, so the
-# CREATE arm is the one that manufactures an undeliverable channel. Checking only
-# the reuse arm instruments the branch that OBSERVES the damage while staying
-# silent on the branch that CAUSES it — which is how the live 08-28 channel came
-# to exist with no verificationStatus while the script reported success.
+# Validate the actual resource after BOTH create and reuse. Explicit UNVERIFIED
+# requires verification; omitted/UNSPECIFIED can mean verification is not required.
+# Neither a usable API state nor VERIFIED establishes delivery of the current alert:
+# a controlled notification and confirmation from the intended recipient are still required.
+# https://docs.cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.notificationChannels
 #
 # `${CHANNEL#projects/*/}` is a SHORTEST-prefix strip: `*` cannot swallow the
 # second `/` because the character after `projects/` is `p`, so this yields
 # `notificationChannels/<id>`, which `api()` prefixes with the project path. `##`
 # would yield a bare id and GET a 404, making the warning fire unconditionally
 # and training the reader to ignore it. A test pins the single `#`.
-CHANNEL_VERIFIED="$(api GET "${CHANNEL#projects/*/}" 2>/dev/null | python3 -c '
+if ! CHANNEL_RESPONSE="$(api GET "${CHANNEL#projects/*/}")"; then
+  echo "FAILED: notification channel GET failed; delivery readiness is unknown." >&2
+  exit 1
+fi
+CHANNEL_VERIFIED="$(python3 -c '
 import json, sys
 raw = sys.stdin.read().strip()
 try:
-    print(json.loads(raw).get("verificationStatus", "") if raw else "")
+    channel = json.loads(raw)
 except ValueError:
-    print("")
-')"
-CHANNEL_UNDELIVERABLE=0
-if [ "$CHANNEL_VERIFIED" != VERIFIED ]; then
-  CHANNEL_UNDELIVERABLE=1
-  echo "   WARNING: channel is '${CHANNEL_VERIFIED:-UNSET}', not VERIFIED." >&2
-  echo "   Cloud Monitoring does not deliver to an unverified email channel. Every policy" >&2
-  echo "   below will fire into the void. Open the channel in the console and complete" >&2
-  echo "   verification, then re-run this script to confirm." >&2
+    sys.exit("FAILED: notification channel GET returned missing or malformed JSON.")
+if not isinstance(channel, dict) or "error" in channel:
+    sys.exit("FAILED: notification channel GET returned an invalid resource or API error.")
+if channel.get("name") != sys.argv[1] or channel.get("type") != "email":
+    sys.exit("FAILED: notification channel GET returned the wrong resource or channel type.")
+if channel.get("enabled") is not True:
+    sys.exit("FAILED: notification channel is disabled or its enabled state is missing.")
+labels = channel.get("labels")
+if not isinstance(labels, dict) or labels.get("email_address") != sys.argv[2]:
+    sys.exit("FAILED: notification channel recipient does not match ALERT_EMAIL.")
+status = channel.get("verificationStatus", "VERIFICATION_STATUS_UNSPECIFIED")
+if status not in ("VERIFIED", "UNVERIFIED", "VERIFICATION_STATUS_UNSPECIFIED"):
+    sys.exit("FAILED: notification channel verification state is invalid or unsupported.")
+print(status)
+' "$CHANNEL" "$ALERT_EMAIL" <<<"$CHANNEL_RESPONSE")"
+if [ "$CHANNEL_VERIFIED" = UNVERIFIED ]; then
+  echo "   WARNING: channel is UNVERIFIED and requires verification before it can function." >&2
+  echo "   Complete the channel verification process, then confirm actual alert receipt." >&2
+  echo "FAILED: notification channel cannot receive alerts; no policy reconciliation was performed." >&2
+  exit 1
+elif [ "$CHANNEL_VERIFIED" = VERIFICATION_STATUS_UNSPECIFIED ]; then
+  echo "   Channel verification status is omitted/UNSPECIFIED; verification may not be required."
 fi
+echo "   Channel API state does not prove alert delivery. Confirm a controlled notification"
+echo "   with the intended recipient before marking delivery readiness complete."
 
 echo "== uptime checks"
 UP="$(api GET uptimeCheckConfigs)"
@@ -225,6 +250,9 @@ fi
 RID_HELD_FILTER='resource.type="cloud_run_job" AND resource.labels.job_name="retailer-ingest-drain" AND textPayload:"retailer_ingest_drain: " AND (textPayload=~"\"held\": [1-9]" OR textPayload:"\"outcome\": \"held\"")'
 RID_FAILED_FILTER='resource.type="cloud_run_job" AND resource.labels.job_name="retailer-ingest-drain" AND textPayload:"retailer_ingest_drain: " AND textPayload:"\"status\": \"failed\""'
 upsert_log_metric() { # NAME DESCRIPTION FILTER
+  if [[ "$1" == reap_agentic_poll_* ]]; then
+    set -- "$1" "$2" "${3/resource.labels.service_name=\"worker\"/resource.labels.service_name=\"$REAP_WORKER_SERVICE_NAME\"}"
+  fi
   if "$GCLOUD" logging metrics describe "$1" --project "$PROJECT" >/dev/null 2>&1; then
     "$GCLOUD" logging metrics update "$1" --project "$PROJECT" --description "$2" --log-filter="$3" --quiet
     echo "   updated $1"
@@ -253,11 +281,9 @@ upsert_log_metric retailer_ingest_drain_failed \
 # no level name in the text and no severity on the entry. A filter with `severity>=ERROR` would
 # be an enabled metric that can never count; these match text only.
 #
-#   REPORT   every report line. A report is printed ONLY by an armed run (REAP_AGENTIC_ENABLED on,
-#            client configured): a disarmed tick returns before it and prints nothing at all. So
-#            this is the rail's heartbeat, and it has no series in an environment that has never
-#            been armed. It is the input of the "went silent" policy below, not an alert itself.
-#   STUCK    a report whose `stuck_over_age` is >= 1. A STANDING condition: every armed tick
+#   REPORT   every report line. A report is printed by every completed maintenance tick, including missing
+#            credentials and disabled provider reads. This is job/retention heartbeat, not arming. It is the input of the "went silent" policy below, not an alert itself.
+#   STUCK    a report whose `stuck_over_age` is >= 1. A STANDING condition: every completed maintenance tick
 #            repeats it until the purchase moves. `[1-9]` cannot match `stuck_over_age=0`, nor the
 #            `stuck_over_age=-1` the job prints when the count could not be taken - that tick is
 #            FAILING's (errors=1), not a claim that nothing is stuck.
@@ -288,7 +314,7 @@ REAP_POLL_REPORT_FILTER='resource.type="cloud_run_revision" AND resource.labels.
 REAP_POLL_STUCK_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND textPayload:"reap_agentic_poll: PollReport(" AND textPayload=~"stuck_over_age=[1-9]"'
 REAP_POLL_FAILING_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND ((textPayload:"reap_agentic_poll: " AND (textPayload=~", errors=[1-9]" OR NOT textPayload:"PollReport(") AND NOT textPayload:"released on cancellation") OR (textPayload=~"scheduler job .reap_agentic_purchase_poll." AND NOT textPayload:"wrapper cancelled"))'
 upsert_log_metric reap_agentic_poll_report \
-  "Reap agentic purchase poller report lines - one per ARMED run; a disarmed poller prints none" \
+  "Reap agentic purchase poller report lines - one per completed maintenance run, including provider/create pauses" \
   "$REAP_POLL_REPORT_FILTER"
 upsert_log_metric reap_agentic_poll_stuck \
   "Reap agentic purchase poller reports that counted a purchase stuck more than 30 minutes past its deadline" \
@@ -296,6 +322,16 @@ upsert_log_metric reap_agentic_poll_stuck \
 upsert_log_metric reap_agentic_poll_failing \
   "Reap agentic purchase poller failures - a report with errors, any warning or error line of the job, or its run deadline exceeded" \
   "$REAP_POLL_FAILING_FILTER"
+
+# Separate queues: neither is an ordinary stuck purchase or a transient poll failure.
+REAP_POLL_HUMAN_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND textPayload:"reap_agentic_poll: PollReport(" AND textPayload=~"checkout_needs_human=[1-9]"'
+REAP_POLL_CONTACT_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND textPayload:"reap_agentic_poll: PollReport(" AND textPayload=~"contact_retention_blocked=[1-9]"'
+upsert_log_metric reap_agentic_poll_human \
+  "Reap checkout outcomes requiring authenticated human reconciliation" \
+  "$REAP_POLL_HUMAN_FILTER"
+upsert_log_metric reap_agentic_poll_contact \
+  "Reap precheckout purchases held after buyer contact retention elapsed" \
+  "$REAP_POLL_CONTACT_FILTER"
 
 echo "== alert policies"
 # Two replies used to be read as good news, and both now ABORT where the run previously went on:
@@ -565,7 +601,7 @@ upsert "prod: retailer ingest job failed" "$(policy \
   'metric.type="logging.googleapis.com/user/retailer_ingest_drain_failed" AND resource.type="cloud_run_job"' \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 0s 3600s)"
 
-# The Reap agentic purchase rail. Three policies over the three log metrics above; the runbook
+# The Reap agentic purchase rail. Five policies over the five log metrics above; the runbook
 # for all of them is docs/runbooks/reap_agentic_purchase.md, "Alerts".
 #
 # STUCK aligns over 900s. The armed poller reports every 30s, but one run may legitimately take
@@ -612,15 +648,29 @@ upsert_on_new_metric "prod: Reap purchase poller failing" "$(policy \
 #
 # WHAT THIS CANNOT DO. 24 hours after the last report the left side is empty, the condition stops
 # being true and the incident closes - fixed or not. From then on a dead poller produces NO signal
-# from any of the three policies: the other two read lines only a running poller prints. A
-# DELIBERATE disarm of an armed rail looks identical from here (the job prints nothing either way):
-# it opens this once and renotifies until it is snoozed or the 24 hours run out.
+# from any of the five policies: the other four require lines from a running poller.
+# Maintenance heartbeat continues with creation or provider reads disabled, including missing
+# credentials. Deliberately pausing the scheduler or excluding the job stops reports; snooze
+# this policy for that maintenance window until scheduling resumes or the 24 hours run out.
 upsert_on_new_metric "prod: Reap purchase poller went silent" "$(promql_policy \
   "prod: Reap purchase poller went silent" \
   "report line present in the last 24h, absent for 15m" \
-  "The Reap purchase poller was printing its per-run report and has printed none for about 20 minutes. Nothing is advancing purchases: a buyer who approves now waits. Either the worker service is down or its scheduler is wedged (check /__scheduler_health for reap_agentic_purchase_poll), every run is raising before it reports (worker logs: Job run_reap_agentic_purchase_poll raised an exception), the Reap client lost its configuration so step 4 is skipped without a line, or someone turned REAP_AGENTIC_ENABLED off. This repeats hourly while it is open. If the rail was disarmed on purpose this is expected, and the incident cannot be closed by hand while the condition holds: snooze this policy instead. The condition stops being true 24 hours after the last report, fixed or not, and after that a dead poller raises nothing. It cannot fire in an environment that printed no report in the previous 24 hours. Runbook: docs/runbooks/reap_agentic_purchase.md, Alerts." \
+  "The Reap purchase poller was printing its per-run report and has printed none for about 20 minutes. Scheduled maintenance reports have stopped; privacy sweeps and purchase progression may be delayed. Check worker readiness, /__scheduler_health, the job allowlist, deliberate scheduler maintenance and exceptions before the report. Maintenance heartbeat continues when creation or provider reads are disabled, including missing Reap credentials; those flags alone do not explain silence. This repeats hourly while it is open. For a deliberate scheduler pause, snooze the policy for the reviewed maintenance window; do not infer failed or unpaid checkout outcomes from silence. The condition stops being true 24 hours after the last report, fixed or not, and after that a dead poller raises nothing. It cannot fire in an environment that printed no report in the previous 24 hours. Runbook: docs/runbooks/reap_agentic_purchase.md, Alerts." \
   '(sum(sum_over_time(logging_googleapis_com:user_reap_agentic_poll_report{monitored_resource="cloud_run_revision"}[24h] offset 15m)) > 0) unless (sum(sum_over_time(logging_googleapis_com:user_reap_agentic_poll_report{monitored_resource="cloud_run_revision"}[15m])) > 0)' \
   300s 60s 3600s 3600s NEW_METRIC)"
+
+
+upsert_on_new_metric "prod: Reap checkout needs human reconciliation" "$(policy \
+  "prod: Reap checkout needs human reconciliation" \
+  "The poller counted checkout_needs_human >= 1. A repeated permanent checkout read failure needs authenticated provider evidence and an audited operator decision. Keep the purchase nonterminal; do not create a replacement, fail an uncertain payment, or restore contact. Inspect purchase IDs and exact error categories through owner-authorized tooling. Runbook: docs/runbooks/reap_agentic_purchase.md, Checkout reads requiring human reconciliation and Audited manual checkout resolution." \
+  'metric.type="logging.googleapis.com/user/reap_agentic_poll_human" AND resource.type="cloud_run_revision"' \
+  ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 900s 0s 3600s)"
+
+upsert_on_new_metric "prod: Reap buyer contact retention blocked" "$(policy \
+  "prod: Reap buyer contact retention blocked" \
+  "The poller counted contact_retention_blocked >= 1. Contact has been scrubbed while the purchase and payment evidence remain. Resuming flags cannot restore contact or restart checkout. Inspect whether an external operation exists, then use an independently reviewed contact reauthorization or reconciliation procedure. Do not copy old PII or blindly retry. Runbook: docs/runbooks/reap_agentic_purchase.md, Worker stop and independent contact retention." \
+  'metric.type="logging.googleapis.com/user/reap_agentic_poll_contact" AND resource.type="cloud_run_revision"' \
+  ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 900s 0s 3600s)"
 
 echo
 echo "channel : $ALERT_EMAIL"
@@ -638,22 +688,10 @@ d = json.load(sys.stdin)
 print("uptime  :", len(d.get("uptimeCheckConfigs", [])))
 '
 
-# Said BEFORE the channel check below, which may exit first; acted on after it.
 if [ -n "$NEW_METRIC_DEFERRED" ]; then
   echo "NOT CREATED: $NEW_METRIC_DEFERRED" >&2
   echo "This run created their log metrics and Monitoring could not see them yet. Every other" >&2
   echo "policy above was written. Re-run this script in 10 minutes, with the same ALERT_EMAIL." >&2
-fi
-
-# A warning on stderr is only a result if a human is standing there to read it.
-# This script is exactly the kind of thing that gets wrapped in CI or a runbook
-# step, and an undeliverable channel means every policy above is decoration — so
-# say it with the exit code too. Deliberately LAST: the policies are still
-# created and reported first, because a half-configured project is worse than a
-# fully configured one that reports a problem.
-if [ "${CHANNEL_UNDELIVERABLE:-0}" = 1 ]; then
-  echo "FAILED: alerts are configured but the channel cannot receive them." >&2
-  exit 1
 fi
 
 if [ -n "$NEW_METRIC_DEFERRED" ]; then

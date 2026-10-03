@@ -67,6 +67,8 @@ MIGRATIONS = (
     MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
     # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
     MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
+    MIGRATIONS_DIR / "253_reap_checkout_manual_resolution_audit.sql",
+    MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
 )
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 
@@ -1289,7 +1291,7 @@ async def test_lane_disable_refuses_but_master_or_create_pause_retains_a_resolvi
         assert stored["buyer_email"] is None
     else:
         assert moved.outcome == "released" and moved.state == "resolving"
-        assert stored["last_error_code"] == "create_disabled"
+        assert stored["last_error_code"] is None
         assert stored["buyer_email"] is not None
         assert stored["claimed_by"] is None
         assert stored["next_poll_at"] is not None
@@ -3026,3 +3028,37 @@ async def test_a_reap_outage_is_released_not_refused(reap, attribution):
     assert moved.outcome == "released" and moved.state == "quoting"
     assert moved.last_error_code == "service_unavailable"
     assert (await get(purchase_id))["buyer_email"] == EMAIL
+
+
+@pytest.mark.parametrize("cap,allowed", [(2820, False), (3319, False), (3320, True)])
+async def test_cart_pilot_uses_actual_variant_namespace_and_shipping_total(monkeypatch, reap, cap, allowed):
+    scope = {"agent_ids": ["agent_one"], "merchant_domains": [SHOP], "markets": ["US"],
+             "product_keys": ["cart_product"], "quantities": [1],
+             "variant_keys": ["shopify:" + VARIANT], "currency": "USD", "max_total_minor": cap}
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(scope))
+    await active_enrollment()
+    purchase = await start(cart_link=item(product_key="cart_product"))
+    row = await get(purchase)
+    assert row["variant_key"] == "shopify:" + VARIANT
+    assert len(await ledger.claim_due_purchases("scope-worker", pilot_scope=svc.pilot_admission_scope())) == 1
+    result = await svc.advance(purchase, "scope-worker")
+    assert result.state == "quoting"
+    result = await step(purchase)
+    assert bool(reap.named("create_checkout")) is allowed
+    assert result.state == ("awaiting_approval" if allowed else "refused")
+    if not allowed:
+        assert result.refusal_reason == "pilot_scope_refused"
+
+
+@pytest.mark.parametrize("identity", [VARIANT, "sku_placeholder", "var_opaque_1"])
+async def test_cart_pilot_refuses_provider_or_placeholder_identity(monkeypatch, identity):
+    scope = {"agent_ids": ["agent_one"], "merchant_domains": [SHOP], "markets": ["US"],
+             "product_keys": ["cart_product"], "quantities": [1],
+             "variant_keys": [identity], "currency": "USD", "max_total_minor": 5000}
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(scope))
+    with pytest.raises(svc.PurchaseRefused) as exc:
+        await start(cart_link=item(product_key="cart_product"))
+    assert exc.value.reason == "pilot_scope_refused"
+    assert await count() == 0
