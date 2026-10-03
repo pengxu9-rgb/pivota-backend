@@ -1096,16 +1096,17 @@ and what the routes decide.
 | `GET /purchases/{id}` | the owner's read: state, totals, the current hosted URL, the order reference |
 | `GET /purchases?limit=` | the same, for this buyer's recent purchases |
 
-### The dial makes them 404, not 503
+### Admission gates and original-attempt reads
 
-While `is_enabled()` is false **or** `rc.is_configured()` is false, all three answer
-**404 `not_available_on_this_rail`**. That is not a bug report, it is the design: the agent door's
-job on a 404 is to fall back to another rail, and a 503 would read as "this rail is the answer,
-retry shortly" and stall a buyer behind a feature nobody has armed. The check is the first
-statement of each handler — one per route, not a router-level dependency, so a mutation that
-deletes one is killed by its own test rather than by all three at once.
+The base gate or missing credentials make create and list return
+**404 `not_available_on_this_rail`**. A create-only pause blocks fresh purchases while
+owner-scoped purchase GET and exact original-attempt recovery remain readable without
+provider calls. List still requires the base rail. A selected Reap checkout stays on Reap:
+no refusal or uncertain response authorizes cart-link retry, kernel checkout or storefront
+handoff. Keep the original buyer session, request body and idempotency key.
 
-The gate is read **per request**, so arming the rail is an env change and not a redeploy.
+Settings are read per request. On Cloud Run, changing revision environment settings requires
+a new revision; verify its effective profile and traffic before treating the gate as armed.
 
 ### What the routes decide, and what they refuse to trust
 
@@ -1771,7 +1772,7 @@ without it as `serve`, then `purchase`, then `poll --dry-run`.
 | `tests/test_reap_agentic_purchase_poll.py` | SQLite | the poller: the gate (step 4 only), the run order, the counts, the dials and their bounds, the budget, the leftover-claims invariant, cancellation, registration |
 | `tests/test_reap_agentic_purchase_poll_postgres.py` | Postgres (dialect gate) | the poller across **two real backend connections**, its SQL constants under PREPARE, the error backoff against the server clock, `include_processing=False` on the real statement, the PII deadline with the rail off, claim release on cancellation |
 | `tests/test_reap_rail_alerts.py` | SQLite | the three alert metrics: the REAL poller's and runner's lines, on both streams as the worker writes them, through the filters parsed out of `infra/gcp/setup_monitoring.sh`; a dark rail feeding none of them; the three policies' shape |
-| `tests/test_agent_commerce_reap_routes.py` | SQLite | the three routes over the real app: the router is MOUNTED, the 404 on all three while dark **and for every shape of malformed input**, the ownership conjuncts, eligibility and the market, the price coming from our catalog and from THIS merchant's own offer, the market-currency rule, the buyer ref, idempotency including the request-hash conflict, unprintable identifiers, the hosted-URL vetting, the per-statement self-heal, and that no response or log line carries the buyer; **WP4b**: the first purchase minting exactly one buyer/link/ref, the second reusing them, a hosted-checkout link never being re-minted, two agents sharing a user ref getting two buyers, a link racing in at the write seam winning, and consent being required, ordered after the dial, and stored |
+| `tests/test_agent_commerce_reap_routes.py` | SQLite | the three routes over the real app: the router is MOUNTED, create/list 404 while the base rail is dark, including malformed input, and authenticated owner GET/recovery while create is paused, the ownership conjuncts, eligibility and the market, the price coming from our catalog and from THIS merchant's own offer, the market-currency rule, the buyer ref, idempotency including the request-hash conflict, unprintable identifiers, the hosted-URL vetting, the per-statement self-heal, and that no response or log line carries the buyer; **WP4b**: the first purchase minting exactly one buyer/link/ref, the second reusing them, a hosted-checkout link never being re-minted, two agents sharing a user ref getting two buyers, a link racing in at the write seam winning, and consent being required, ordered after the dial, and stored |
 | `tests/test_agent_commerce_reap_routes_postgres.py` | Postgres (dialect gate) | migrations 226+227 vs the self-heal through the **catalog** (columns, `indexdef`, `pg_get_constraintdef`), the `numeric`→`Decimal` price path the `CAST` exists for, the `market_country` regex CHECK, **a NUL byte in an identifier being a refusal and not a 500** (asyncpg raises where SQLite stores it happily, so only this arm can see it), and every security-relevant refusal re-run on the production dialect; **WP4b**: the mint against the REAL unique constraint (`ON CONFLICT DO NOTHING` as Postgres implements it), the `VARCHAR(32)` consent cap refusing rather than truncating, and `consented_at` being a real aware `timestamptz` |
 
 | `tests/test_reap_local_e2e_harness.py` | SQLite | the local e2e harness: both safety guards (local DB, sandbox-only base), the allowlisted env, call-log redaction, sandbox-only egress, `seed` read back through the route's own catalog SQL, and `run --dry-run` driven to `completed` with and without a seeded enrollment |

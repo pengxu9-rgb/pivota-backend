@@ -3,10 +3,12 @@
 Three routes. `routes/agent_commerce_reap.py` is the implementation and
 `docs/runbooks/reap_agentic_purchase.md` is the operational half; this page is the wire.
 
-**The rail is DARK.** `REAP_AGENTIC_ENABLED` is unset in production, so every route below answers
-**404 `not_available_on_this_rail`** today. That is the state to build the fallback against: the
-door should treat a 404 from this prefix as "this rail is not available for this purchase" and go
-somewhere else, exactly as it would for a merchant that is not eligible.
+**New purchases are disabled by default.** The base gate or missing credentials make
+create and list return **404 `not_available_on_this_rail`**; the create-only gate blocks
+new purchases independently. Owner-scoped purchase GET and exact original-attempt recovery
+remain available while create is paused. After the buyer selects Reap, no refusal,
+unavailable response or uncertain outcome authorizes another checkout route or a cart-link
+retry. Preserve the original body, key and buyer session for read-only recovery.
 
 ---
 
@@ -117,7 +119,7 @@ poller drives the state machine afterwards, on another process, over the next mi
 
 | field | required | notes |
 |---|---|---|
-| `item_source` | no (default `reap_variant`) | Set to `cart_link` for Tier B. The entire cart-link lane remains a 404 fallback until `REAP_AGENTIC_CART_LINK_ENABLED` is on (it and `REAP_AGENTIC_ENABLED` are the only switches; the quote uses Reap's published `externalCheckout` body since 2026-09-28). |
+| `item_source` | no (default `reap_variant`) | Set to `cart_link` for Tier B. Choose the source explicitly before the first POST; never retry a refused variant purchase as cart-link. The cart-link lane remains unavailable (404) until `REAP_AGENTIC_CART_LINK_ENABLED` is on (it and `REAP_AGENTIC_ENABLED` are the only switches; the quote uses Reap's published `externalCheckout` body since 2026-09-28). |
 | `offer_code` | no | the buyer's own offer (coupon) code, either lane: a string of 1..128 characters with at least one non-whitespace character and no control character, sent to Reap **exactly as given** (not trimmed, not upper-cased). Empty, whitespace-only, over-long or control characters ⇒ `400 invalid_offer_code`; a non-string ⇒ `400 invalid_request`. Part of the idempotency hash when present (a retry that adds or changes a code is a different purchase). If Reap refuses the code (`OFFER_CODE_INVALID` / `OFFER_CODE_EXPIRED`) the purchase is re-quoted **once without it** and `offer_code_outcome` says so — tell your user before they approve. |
 | `merchant_domain` | yes | a bare host name, sent as observed (`www.brand.example` or `brand.example`); anything else — a scheme, port, path, userinfo, IP or single label — is `400 invalid_request`. Matched **canonically**: lower case, one leading `www.` removed, so `www.brand.example` and `brand.example` are the same merchant (`wwwbrand.example` is not). Variant lane: must be enabled in `reap_agentic_eligibility`. Cart-link lane: must have a fresh `tierb_cart_link_eligibility` verdict, and builds its cart URL on the host as sent. Both are checked in the buyer's market. |
 | `product_key` | yes | our catalog key (`catalog_products.product_key`). |
@@ -254,28 +256,28 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 
 | status | `detail.error` | meaning | what the door should do |
 |---|---|---|---|
-| 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured | fall back |
-| 401 | `agent_user_required` | no `X-Agent-User-JWT` | get a user token, or fall back |
-| 409 | `merchant_not_eligible` | no variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market** | fall back (a door may try the cart-link lane) |
-| 409 | `merchant_disabled` | an operator turned this merchant off: a variant-lane merchant row for this domain and market is disabled. Answered on **both** lanes | fall back; **do not** try another Reap lane |
-| 409 | `buyer_unlinked` | **you should never see this.** Since WP4b the buyer identity is created on the first purchase, so this no longer means "no link" — it is the fail-closed answer when the identity or the opaque ref could not be *stored* (a storage fault, not a request fault). Retrying is reasonable; editing the body will not help. | retry once, then fall back |
-| 409 | `row_not_found` | no such product under this domain, or the variant is not this product's, or no variant named and the product has more than one | fall back |
-| 409 | `row_not_shopify` | the catalog row's intake lane is not `shopify` | fall back |
-| 409 | `row_variant_unverified` | Tier B has no numeric Shopify variant verified from our catalog or active same-market seed | fall back |
-| 409 | `seller_identity_unverified` | the catalog seller identity does not agree with the offer owner | fall back |
-| 409 | `row_unpriced` | **this merchant** has no usable offer of its own on the sku, or the price is not exactly representable in minor units. On the **cart-link lane** "usable" includes "priced in the buyer market's currency", so a row whose offers are all in another currency answers `row_unpriced` here, not `row_currency_mismatch` | fall back |
-| 409 | `row_price_ambiguous` | cart-link lane, no `variant_key`: the catalog spells the ONE chosen Shopify variant with several skus, and this merchant's usable offers on them carry different prices | fall back, or name the sku (`variant_key`) to buy at that sku's price |
-| 409 | `row_currency_mismatch` | the offer is priced in a currency the buyer's market does not use (variant lane, and the cart-link lane's enrichment rows; the cart-link lane otherwise reads only offers in the market's currency and answers `row_unpriced` instead) | fall back |
-| 409 | `row_price_stale` | cart-link lane, **enrichment rows only** (dark flag): the catalog offer's price differs from the price the storefront proof read live | fall back |
-| 409 | `row_variant_ambiguous` | cart-link lane, **enrichment rows only** (dark flag): no `variant_key`, and the product is not single-variant: two or more `::v:` skus in the catalog (suppressed ones counted), or a storefront handle with several variants | fall back, or name the sku (`variant_key`) |
-| 409 | `idempotency_conflict` | this key was already used for a **different** request | use a new key, or re-send the original request |
+| 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured | show unavailable; preserve the selected route and original attempt |
+| 401 | `agent_user_required` | no `X-Agent-User-JWT` | obtain the original buyer session; do not switch routes |
+| 409 | `merchant_not_eligible` | no variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market** | show blocked; do not retry through cart-link |
+| 409 | `merchant_disabled` | an operator turned this merchant off: a variant-lane merchant row for this domain and market is disabled. Answered on **both** lanes | show blocked; do not try another Reap lane |
+| 409 | `buyer_unlinked` | **you should never see this.** Since WP4b the buyer identity is created on the first purchase, so this no longer means "no link" — it is the fail-closed answer when the identity or the opaque ref could not be *stored* (a storage fault, not a request fault). Retrying is reasonable; editing the body will not help. | show unknown or unavailable; recover the exact original attempt before retrying |
+| 409 | `row_not_found` | no such product under this domain, or the variant is not this product's, or no variant named and the product has more than one | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_not_shopify` | the catalog row's intake lane is not `shopify` | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_variant_unverified` | Tier B has no numeric Shopify variant verified from our catalog or active same-market seed | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `seller_identity_unverified` | the catalog seller identity does not agree with the offer owner | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_unpriced` | **this merchant** has no usable offer of its own on the sku, or the price is not exactly representable in minor units. On the **cart-link lane** "usable" includes "priced in the buyer market's currency", so a row whose offers are all in another currency answers `row_unpriced` here, not `row_currency_mismatch` | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_price_ambiguous` | cart-link lane, no `variant_key`: the catalog spells the ONE chosen Shopify variant with several skus, and this merchant's usable offers on them carry different prices | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_currency_mismatch` | the offer is priced in a currency the buyer's market does not use (variant lane, and the cart-link lane's enrichment rows; the cart-link lane otherwise reads only offers in the market's currency and answers `row_unpriced` instead) | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_price_stale` | cart-link lane, **enrichment rows only** (dark flag): the catalog offer's price differs from the price the storefront proof read live | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_variant_ambiguous` | cart-link lane, **enrichment rows only** (dark flag): no `variant_key`, and the product is not single-variant: two or more `::v:` skus in the catalog (suppressed ones counted), or a storefront handle with several variants | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `idempotency_conflict` | this key was already used for a **different** request | preserve the original key and body; recover its outcome before any new purchase intent |
 | 400 | `consent_required` | `buyer.consent_version` is **absent, blank, longer than 32 characters, or carries an unprintable character** — i.e. a string-shaped value that is not usable | show your user the terms, then resend with the tag |
 | 400 | `invalid_request` | `buyer.consent_version` is **present but not a string** (`123`, `true`, `{}`, `[]`, `1.5`) — a type error is a malformed body, not a missing act by a human, and the two codes tell you to do different things | fix the request |
 | 400 | `invalid_request` | the body is not a JSON object, did not validate, `quantity` out of range, `limit` out of range, or an identifier carries an unprintable character | fix the request |
 | 400 | `invalid_address` | the shipping address is incomplete or unprintable | fix the request |
 | 400 | `invalid_return_url` | not https, carries userinfo, or an unallowed host | fix the request |
 | 400 | `invalid_offer_code` | `offer_code` is empty, whitespace only, longer than 128 characters, or carries a control character | fix the request (or omit the code) |
-| 400 | `currency_unsupported` | a three-decimal currency; this rail's converter assumes two | fall back |
+| 400 | `currency_unsupported` | a three-decimal currency; this rail's converter assumes two | show blocked; resolve the refusal before any new purchase intent |
 
 No refusal ever carries the buyer's email or address, and none carries Reap's text.
 

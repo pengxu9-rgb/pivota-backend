@@ -7,35 +7,17 @@ belong to. Everything that talks to Reap happens later, in the poller, on anothe
 
 ── WHAT 404 MEANS HERE ──────────────────────────────────────────────────────────────────────
 
-While `REAP_AGENTIC_ENABLED` is off or the client has no credentials, create and list routes
-answer **404**, not 503. That is a deliberate lie about existence and it is the right one: the
-agent door's job on receiving it is to fall back to another rail, and a 503 reads as "this rail
-is the answer, try again shortly" — which would make an unarmed rail look like an outage and
-stall a buyer behind it. The rail is dark by default, so 404 is also the honest description of
-production today.
+While the base rail is off or lacks credentials, create and list return
+**404 `not_available_on_this_rail`**. A create-only pause also blocks new purchases.
+Once the buyer selects Reap, unavailable or ambiguous responses never authorize another
+rail, a cart-link retry, or a replacement idempotency key. Preserve the original attempt
+and use authenticated, read-only recovery when its outcome is uncertain.
 
-The stored purchase-by-ID GET remains authenticated and owner-scoped while disarmed; it
-makes no provider calls, so a buyer can observe an already exposed checkout
-while create/reconciliation credentials are being repaired.
-
-The create/list gate is the FIRST statement of those handlers rather than a router-level
-dependency, and that costs one ordering property: an unauthenticated caller gets 401 from
-`get_agent_context` before it can learn the route is dark. Three reasons it is still here:
-
-  * a router-level dependency makes all three gates ONE mutation. The mutant table for this PR
-    kills the dial check on POST, on GET and on the list separately, and it can only do that if
-    they are separate statements. A guard nothing can kill on its own is a guard nothing checks.
-  * the caller that matters is the door, which is always authenticated. It sees 404.
-  * the gate is not duplicated. There is exactly one check per route — no router-level copy —
-    because a second, unreachable copy reads as protection that does not exist.
-
-Both handlers take a raw `Request` and do ALL of their parsing inside the body, after the dial,
-for the same reason. Anything in the signature — a `Body(...)` model, a `Query(le=...)` bound — is
-validated by FastAPI BEFORE the handler runs, and its refusal is a 400 naming the field. That made
-the dark rail probeable: a body of `[1, 2]`, the wrong content-type, or `?limit=500` each answered
-400 while every well-formed request answered 404, and no test that sends only valid requests would
-ever have noticed. `/openapi.json` still lists the paths — the routes are mounted at import — and
-that residue is documented rather than papered over.
+The stored purchase-by-ID GET and original-attempt recovery remain authenticated and
+owner-scoped while disarmed. They make no provider calls. List remains base-rail gated.
+Create parses its raw request after admission checks; list parses its limit after its
+base gate. Authentication dependencies run first, so unauthenticated callers receive 401.
+The mounted paths remain visible in `/openapi.json` regardless of admission settings.
 
 ── WHAT THIS ROUTE REFUSES TO TRUST ─────────────────────────────────────────────────────────
 
@@ -185,7 +167,7 @@ router = APIRouter(prefix="/agent/v2/commerce/reap", tags=["agent-commerce-reap"
 #: and answering 422 would tell the caller to edit a request that may be perfectly well-formed.
 _REFUSAL_STATUS: Dict[str, int] = {
     # The rail is not here. Indistinguishable from the dial being off, deliberately: both mean
-    # "fall back", and a caller that could tell them apart would learn our configuration.
+    # "unavailable", and a caller that could tell them apart would learn our configuration.
     "not_available_on_this_rail": 404,
     "rail_disabled": 404,
     "create_disabled": 404,
@@ -2518,7 +2500,7 @@ async def start_reap_purchase(
             raise svc.PurchaseRefused("invalid_request", "the request body did not validate")
 
         # The cart-link lane has two further dark gates. Decide them before consent or any
-        # merchant/catalog read so a disabled lane is the same 404 fallback as the base rail.
+        # merchant/catalog read so a disabled lane is the same 404 unavailability as the base rail.
         if req.item_source == "cart_link" and not svc.is_cart_link_enabled():
             raise svc.PurchaseRefused("not_available_on_this_rail")
 
