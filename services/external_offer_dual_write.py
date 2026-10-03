@@ -230,7 +230,7 @@ MIRROR_OFFER_UPSERT_SQL = """
            price_confidence, source_system, source_ref, source_domain,
            offer_payload, price_checked_at)
         SELECT
-          :offer_id, :sku_key, :product_key, :merchant_id,
+          :offer_id, CAST(:sku_key AS VARCHAR), CAST(:product_key AS VARCHAR), :merchant_id,
            :catalog_track, :truth_tier, :readiness_tier,
            :offer_type, :is_first_party, :offer_mode,
            :channel, :availability, :inventory_quantity, :currency, CAST(:market AS VARCHAR),
