@@ -591,8 +591,9 @@ def is_listing_offer(offer: Dict[str, Any], seed: Dict[str, Any]) -> bool:
     # A seed ID never overrides a contradictory explicit listing URL. Retargeting a seed
     # leaves old listing offers behind; pricing those from the new destination buys a sibling.
     listing_urls = [offer.get("payload_destination_url")]
-    if str(offer.get("source_ref") or "").startswith(("https://", "http://")):
-        listing_urls.append(offer["source_ref"])
+    source_ref = str(offer.get("source_ref") or "").strip()
+    if source_ref.lower().startswith(("https://", "http://")):
+        listing_urls.append(source_ref)
     if any(url and (not dest or not same_destination(url, dest)) for url in listing_urls):
         return False
     if seed_id and seed_id in (offer.get("source_ref"), offer.get("payload_seed_id")):

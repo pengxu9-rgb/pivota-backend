@@ -438,3 +438,8 @@ def test_equivalent_numeric_and_gid_aliases_name_the_same_variant():
                              'price_amount':38,'price_currency':'USD'}])
     offer=_offer('of_v2',sku=f'{PK}::v:47761881301180',vid='47761881301180')
     assert _plan(seed,[offer])['writes'] == [{'offer_id':'of_v2','price':38,'currency':'USD'}]
+
+@pytest.mark.parametrize('source_ref',['HTTPS://missha.us/products/other','  https://missha.us/products/other  '])
+def test_url_formatting_cannot_hide_a_conflicting_listing_claim(source_ref):
+    seed=_seed();offer=_offer('other',source_ref=source_ref,payload_dest=None,payload_seed=seed['id'])
+    assert _plan(seed,[offer])['status'] == 'no_listing_offer'
