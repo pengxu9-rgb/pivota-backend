@@ -719,3 +719,10 @@ The canonical hash is identical to create: merchant domain, product/variant, qua
 * `400`: malformed original body or missing/invalid key; `401`: missing end-user identity.
 
 A failed recovery preserves uncertainty; it never authorizes a new payment attempt. Retry read-only recovery or escalate with the original key. On the enabled create route, a same-body replay still returns `202` for the existing purchase and follows the established consent update contract. Disabled create remains disabled; use recover for a read-only lookup. No schema migration is needed. Do not delete or overwrite the key mapping merely because 24 hours elapsed. Older application versions can still perform rollover, so replace all create handlers before relying on the lifetime guarantee.
+
+
+
+
+### Optional direct-create pilot controls
+
+`REAP_AGENTIC_CREATE_ENABLED` can pause creates independently of existing status/recovery. Optional `REAP_AGENTIC_PILOT_SCOPE` requires all five exact nonempty allowlists (`agent_ids`, `merchant_domains`, `markets`, `product_keys`, `quantities`); malformed or partial JSON pauses new work. A fresh out-of-scope request returns `404 pilot_scope_refused` before buyer writes; disabled/invalid create configuration returns `404 create_disabled`. These refusals do not clear an existing attempt's uncertainty. GET/recover and exposed-checkout reconciliation survive the pause; omitted configuration preserves compatibility. See the runbook for worker and rollout acceptance.

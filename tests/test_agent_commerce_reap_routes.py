@@ -247,6 +247,8 @@ async def _db():
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
+    monkeypatch.delenv("REAP_AGENTIC_CREATE_ENABLED", raising=False)
+    monkeypatch.delenv("REAP_AGENTIC_PILOT_SCOPE", raising=False)
     monkeypatch.setenv("REAP_AGENTIC_ENABLED", "1")
     monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
     monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
@@ -4032,6 +4034,10 @@ async def test_disarmed_status_read_retains_identity_checks_and_has_no_provider_
     assert denied.status_code == 401 and _error(denied) == "agent_user_required"
 
 
+
+
+
+
 # Durable recovery never opens another checkout or refreshes identity/consent.
 @pytest.mark.parametrize("state", ["awaiting_approval", "processing", "completed"])
 async def test_recovery_after_25_days_is_read_only_while_create_is_paused(client, monkeypatch, state):
@@ -4409,3 +4415,124 @@ async def test_deadline_http_get_history_recover_have_identical_stable_handoff(c
         for key in ['buyer_ref','buyer_email','shipping_address','enrollment_id','hosted_url_expiry_invalid']:assert key not in views[0]
     assert await ledger.get_purchase_internal(pid)==before
     assert await ledger.get_enrollment_internal(enrollment['id'])==original_enrollment
+
+
+@pytest.mark.parametrize("flag", ["0", "false", "", "ture", "arbitrary"])
+async def test_create_only_pause_precedes_buyer_writes_and_preserves_read_recovery(client, monkeypatch, flag):
+    await _seed_all()
+    body = _body(idempotency_key="pilot-pause-read")
+    purchase_id = (await client.post(f"{BASE}/purchases", json=body)).json()["purchase_id"]
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", flag)
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("paused create reached a buyer write")
+    monkeypatch.setattr(routes_reap, "_buyer_id_for", forbidden)
+    monkeypatch.setattr(routes_reap, "_record_consent", forbidden)
+    response = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pilot-new"))
+    assert response.status_code == 404 and _error(response) == "create_disabled", response.text
+    assert (await client.get(f"{BASE}/purchases/{purchase_id}")).status_code == 200
+    recovered = await client.post(f"{BASE}/purchases/recover", json=body)
+    assert recovered.status_code == 200 and recovered.json()["id"] == purchase_id
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+
+
+@pytest.mark.parametrize("field,value", [
+    ("agent_ids", "other-agent"), ("merchant_domains", "other.example"),
+    ("markets", "CA"), ("product_keys", "other-product"), ("quantities", 2),
+])
+async def test_exact_pilot_scope_refuses_each_wrong_dimension_before_buyer_writes(client, monkeypatch, field, value):
+    await _seed_all()
+    scope = {"agent_ids": [AGENT], "merchant_domains": [DOMAIN], "markets": ["US"],
+             "product_keys": [PRODUCT_KEY], "quantities": [1]}
+    scope[field] = [value]
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(scope))
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("outside-pilot request reached buyer writes")
+    monkeypatch.setattr(routes_reap, "_buyer_id_for", forbidden)
+    monkeypatch.setattr(routes_reap, "_record_consent", forbidden)
+    response = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pilot-denied"))
+    assert response.status_code == 404 and _error(response) == "pilot_scope_refused", response.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 0
+
+
+@pytest.mark.parametrize("configured", ["", "not-json", "null", "[]", "{}", '{"unknown":[1]}',
+    '{"agent_ids":[]}', '{"agent_ids":"x"}', '{"agent_ids":[""]}', '{"agent_ids":[" x"]}',
+    '{"markets":["us"]}', '{"markets":["USA"]}', '{"merchant_domains":["https://brand.example"]}',
+    '{"quantities":[true]}', '{"quantities":[0]}', '{"quantities":[1.0]}',
+    '{"agent_ids":["a"],"agent_ids":["b"]}'])
+async def test_malformed_pilot_configuration_fails_closed(client, monkeypatch, configured):
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", configured)
+    response = await client.post(f"{BASE}/purchases", json=_body())
+    assert response.status_code == 404 and _error(response) == "create_disabled", response.text
+    assert svc.is_create_enabled() is False
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_matching_pilot_scope_allows_create_and_later_scope_change_preserves_existing_attempt(client, monkeypatch):
+    await _seed_all()
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "true")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps({
+        "agent_ids": [AGENT], "merchant_domains": [DOMAIN], "markets": ["US"],
+        "product_keys": [PRODUCT_KEY], "quantities": [1]}))
+    body = _body(idempotency_key="pilot-allowed")
+    created = await client.post(f"{BASE}/purchases", json=body)
+    assert created.status_code == 202, created.text
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps({
+        "agent_ids": ["different-agent"], "merchant_domains": [DOMAIN], "markets": ["US"],
+        "product_keys": [PRODUCT_KEY], "quantities": [1]}))
+    replay = await client.post(f"{BASE}/purchases", json=body)
+    assert replay.status_code == 202 and replay.json()["purchase_id"] == created.json()["purchase_id"]
+    recovered = await client.post(f"{BASE}/purchases/recover", json=body)
+    assert recovered.status_code == 200 and recovered.json()["id"] == created.json()["purchase_id"]
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", "malformed")
+    assert (await client.post(f"{BASE}/purchases/recover", json=body)).status_code == 200
+
+
+@pytest.mark.parametrize("missing", ["agent_ids", "merchant_domains", "markets", "product_keys", "quantities"])
+async def test_a_partial_pilot_allowlist_fails_closed(client, monkeypatch, missing):
+    scope = {"agent_ids": [AGENT], "merchant_domains": [DOMAIN], "markets": ["US"],
+             "product_keys": [PRODUCT_KEY], "quantities": [1]}
+    del scope[missing]
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(scope))
+    response = await client.post(f"{BASE}/purchases", json=_body())
+    assert response.status_code == 404 and _error(response) == "create_disabled", response.text
+    assert svc.is_create_enabled() is False
+
+@pytest.mark.parametrize("selection,expected", [("proven", 202), ("other", 409), ("missing", 409)])
+async def test_explicit_multi_variant_mirror_selection_keeps_proof_authoritative(client, monkeypatch, selection, expected):
+    other_variant = "49819267301654"
+    other_key = f"{LIVE_PK}::v:{other_variant}"
+    await _seed_named_variant_mirror(env="prod", skus=LIVE_PROD_SKUS + ((other_key, other_variant),), seed_data=_named_variant_seed())
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    selected = {"proven": LIVE_SKU_PROMOTED, "other": other_key, "missing": None}[selection]
+    response = await client.post(f"{BASE}/purchases", json={**_live_body(), "variant_key": selected, "idempotency_key": "selected-variant-replay"})
+    assert response.status_code == expected, response.text
+    if expected == 202:
+        row = await _purchase_row(response.json()["purchase_id"])
+        replay = await client.post(f"{BASE}/purchases", json={**_live_body(), "variant_key": selected, "idempotency_key": "selected-variant-replay"})
+        assert replay.status_code == 202 and replay.json()["purchase_id"] == response.json()["purchase_id"]
+        changed = await client.post(f"{BASE}/purchases", json={**_live_body(), "variant_key": other_key, "idempotency_key": "selected-variant-replay"})
+        assert changed.status_code == 409 and _error(changed) == "idempotency_conflict"
+        assert f"/cart/{LIVE_VARIANT}:1?" in row["cart_url"]
+        assert row["our_price_minor"] == 1399
+    else:
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+@pytest.mark.parametrize('choice', [0, 1])
+async def test_two_selected_mirror_sizes_have_independent_proofs_and_prices(client, monkeypatch, choice):
+    from scripts.backfill_shopify_variant_ids import build_selected_variant_proofs
+    second='42199434526795'
+    second_key=f'{KRAVE_PK}::v::{second}'
+    await _seed_krave_mirror(offers=[(KRAVE_REAL, KRAVE_MERCHANT, '16.00'),(second_key, KRAVE_MERCHANT, '27.00')])
+    await database.execute("INSERT INTO catalog_skus (sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency) VALUES (:sk,:pk,:m,'external_seed',:ext,:vid,'2 Pack','USD')", {'sk':second_key,'pk':KRAVE_PK,'m':KRAVE_MERCHANT,'ext':KRAVE_EXT,'vid':second})
+    ids=[KRAVE_VARIANT,second]
+    variants=[{'shopify_variant_id':vid,'variant_id':vid} for vid in ids]
+    payload={'handle':'24-carrot-retinal','variants':[{'id':int(vid),'available':True,'title':title,'price':price} for vid,title,price in zip(ids,['1 Pack','2 Pack'],[1600,2700])]}
+    seed={'snapshot':{'brand':'KraveBeauty','variants':variants,'storefront_platform':'shopify','storefront_platform_source':'products_js_v1','shopify_cart_variant_proofs':build_selected_variant_proofs(variants,payload,js_url=f'https://{KRAVE_DOMAIN}/products/24-carrot-retinal.js',checked_at=datetime.now(timezone.utc))}}
+    await database.execute('UPDATE external_product_seeds SET seed_data=:data WHERE id=:id',{'data':json.dumps(seed),'id':KRAVE_SEED})
+    monkeypatch.setenv('REAP_AGENTIC_CART_LINK_ENABLED','1')
+    response=await client.post(f'{BASE}/purchases',json={**_krave_body(),'variant_key':[KRAVE_REAL,second_key][choice]})
+    assert response.status_code==202,response.text
+    row=await _purchase_row(response.json()['purchase_id'])
+    assert row['our_price_minor']==[1600,2700][choice]
+    assert f'/cart/{ids[choice]}:1?' in row['cart_url']

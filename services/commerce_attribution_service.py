@@ -1778,6 +1778,7 @@ async def close_external_order_conversion(
             "order_id": synthetic_order_id,
             "click_id": click_id,
             "click_matched": click_matched,
+            "agent_id": edge_agent_id,
             "canonical_product_id": values["canonical_product_id"],
             "canonical_variant_id": values["canonical_variant_id"],
             "surface": values["surface"],

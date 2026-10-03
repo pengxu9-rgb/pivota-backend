@@ -231,7 +231,8 @@ SELECT_CANDIDATES_SQL = f"""
           )
           OR (jsonb_array_length({_SNAPSHOT_VARIANTS_SAFE}) = 1
               AND NOT (seed_data->'snapshot' ? 'shopify_cart_proof'))
-          OR seed_data->'snapshot' ? 'shopify_cart_proof')
+          OR seed_data->'snapshot' ? 'shopify_cart_proof'
+          OR jsonb_array_length({_SNAPSHOT_VARIANTS_SAFE}) > 1)
       {{domain_clause}}
       {{seed_clause}}
       {{cursor_clause}}
@@ -253,7 +254,7 @@ SELECT_CANDIDATES_SQL = f"""
 # non-RETURNING UPDATE either way — without it every successful write read as a conflict.
 STAMP_UPDATE_SQL = """
     UPDATE external_product_seeds
-    SET seed_data = jsonb_set(
+    SET seed_data = jsonb_set(jsonb_set(
             jsonb_set(
                 jsonb_set(
                     jsonb_set(seed_data, '{snapshot,variants}', CAST(:variants AS jsonb), true),
@@ -262,7 +263,7 @@ STAMP_UPDATE_SQL = """
                 '{snapshot,storefront_platform_source}', to_jsonb(CAST(:platform_source AS text)), true
             ),
             '{snapshot,shopify_cart_proof}', CAST(:cart_proof AS jsonb), true
-        )
+        ), '{snapshot,shopify_cart_variant_proofs}', CAST(:variant_proofs AS jsonb), true)
     WHERE id = :id
       -- THE LOAD-BEARING GUARD IS THE SNAPSHOT ONE (mutation-verified: dropping it is the
       -- only one of these that turns a refusal into a raise). `jsonb_set` on a scalar raises
@@ -482,6 +483,43 @@ def build_cart_proof(
     }
 
 
+def build_selected_variant_proofs(
+    new_variants: List[Dict[str, Any]], payload: Any, *, js_url: str, checked_at: datetime,
+) -> Dict[str, Dict[str, Any]]:
+    """Prove each explicitly selectable variant from ONE complete product.js response.
+
+    No fetches or prices are invented. A bad/full-list ambiguity revokes every
+    prior selector proof; a removed, unavailable or contradictory entry gets none.
+    """
+    path = urlparse(js_url).path
+    expected_handle = path[len("/products/"):-3] if path.startswith("/products/") and path.endswith(".js") else None
+    if not expected_handle or not isinstance(payload, dict) or payload.get("handle") != expected_handle:
+        return {}
+    raw = payload.get("variants")
+    if not isinstance(raw, list) or len(raw) < 2 or len(raw) >= 100:
+        return {}
+    ids = [str(v.get("id") or "") if isinstance(v, dict) else "" for v in raw]
+    if any(not vid.isascii() or not vid.isdigit() or int(vid) < 1 for vid in ids) or len(set(ids)) != len(ids):
+        return {}
+    if any(type(v.get("available")) is not bool for v in raw):
+        return {}
+    result = {}
+    for entry in new_variants:
+        vid = str(entry.get("shopify_variant_id") or "")
+        if vid not in ids or sum(str(v.get("shopify_variant_id") or "") == vid for v in new_variants) != 1:
+            continue
+        if any(str(entry.get(k)) != vid for k in ("variant_id", "id") if entry.get(k) is not None and str(entry.get(k)).isdigit()):
+            continue
+        hit = raw[ids.index(vid)]
+        if hit["available"] is not True:
+            continue
+        result[vid] = {"source": STOREFRONT_PLATFORM_SOURCE, "scope": "buyer_selected_variant",
+            "product_js_url": js_url, "variant_id": vid, "available": True,
+            "live_variant_count": len(raw), "variant_title": _live_title(hit),
+            "checked_at": checked_at.isoformat()}
+    return result
+
+
 async def run(
     limit: int, domain: Optional[str], apply: bool, client: Any, after: Optional[str] = None,
     seed_ids: Optional[List[str]] = None,
@@ -557,8 +595,10 @@ async def run(
         )
         if cart_proof is not None:
             proof_scopes[cart_proof.get("scope") or CART_PROOF_SCOPE_SOLE] += 1
+        variant_proofs = build_selected_variant_proofs(new_variants, payload, js_url=js_url, checked_at=datetime.now(timezone.utc))
+        prior_variant_proofs = (seed_data.get("snapshot") or {}).get("shopify_cart_variant_proofs")
         prior_proof = (seed_data.get("snapshot") or {}).get("shopify_cart_proof")
-        if report["stamped"] <= 0 and not cart_proof and not prior_proof:
+        if report["stamped"] <= 0 and not cart_proof and not prior_proof and not variant_proofs and not prior_variant_proofs:
             continue
 
         stamped_total += report["stamped"]
@@ -572,6 +612,7 @@ async def run(
                     "platform": STOREFRONT_PLATFORM,
                     "platform_source": STOREFRONT_PLATFORM_SOURCE,
                     "cart_proof": json.dumps(cart_proof),
+                    "variant_proofs": json.dumps(variant_proofs),
                     "updated_at": row.get("updated_at"),
                 },
             )

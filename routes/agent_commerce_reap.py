@@ -140,6 +140,7 @@ from services.shopify_variant_identity import (
     CART_PROOF_SCOPE_NAMED,
     clean_variant_title,
     verified_cart_variant_id,
+    verified_selected_cart_variant_id,
 )
 # THE owner of the observed seller-of-record id (`merch_obs_<hash>`): the SAME dispatch every
 # ingestion and re-key path mints with (retailer domain -> etld1 alone, else (brand, etld1)).
@@ -187,6 +188,9 @@ _REFUSAL_STATUS: Dict[str, int] = {
     # "fall back", and a caller that could tell them apart would learn our configuration.
     "not_available_on_this_rail": 404,
     "rail_disabled": 404,
+    "create_disabled": 404,
+    "pilot_scope_invalid": 404,
+    "pilot_scope_refused": 404,
     "rail_unconfigured": 404,
     # The caller is not authenticated as a buyer. 401 and not 403, because 403 would assert that
     # we know who this buyer is and are refusing them — we do not know, there is no token. It
@@ -1822,7 +1826,12 @@ async def _load_cart_link_item(
         skus = [dict(row) for row in await database.fetch_all(
             _CART_PRODUCT_SKUS_SQL, {"product_key": product_key}
         )]
-        sku_variant, candidates, placeholder = _cart_sku_choice(skus, product_key)
+        if named is not None and not _is_placeholder_sku(named, product_key):
+            sku_variant = _cart_numeric_variant(named.get("source_variant_id"), product_key)
+            candidates = [named]
+            placeholder = None  # A selected size never inherits a product-level price.
+        else:
+            sku_variant, candidates, placeholder = _cart_sku_choice(skus, product_key)
         if candidates and sku_variant is None:
             # A mirror's one real sku names no Shopify variant: not a cart this lane can prove.
             raise svc.PurchaseRefused("row_variant_unverified", "mirror sku names no Shopify variant")
@@ -1858,6 +1867,12 @@ async def _load_cart_link_item(
             shop_domain=merchant_domain,
             catalog_variant_id=sku_variant,
         )
+        if named is not None and not _is_placeholder_sku(named, product_key):
+            selected_proof = verified_selected_cart_variant_id(
+                seed_data, product_urls=[seed.get("canonical_url") or seed.get("destination_url")],
+                shop_domain=merchant_domain, catalog_variant_id=sku_variant,
+            )
+            proven = selected_proof or proven
         variant_id = proven.variant_id if proven else None
         proof_scope = proven.scope if proven else None
         proof_variant_title = proven.variant_title if proven else None
@@ -2475,6 +2490,8 @@ async def start_reap_purchase(
     """Open a purchase and answer at once. MAKES NO PARTNER CALL — the poller does that."""
     try:
         _require_rail()
+        if not svc.is_create_enabled():
+            raise svc.PurchaseRefused("create_disabled")
         agent_user_ref = _require_agent_user(agent_user)
 
         try:
@@ -2633,6 +2650,12 @@ async def start_reap_purchase(
                     return JSONResponse(status_code=202, content=replay_body)
                 # An immutable key without an owner-visible row cannot authorize a new attempt.
                 return _not_found()
+
+        svc.enforce_pilot_scope(
+            agent_id=agent_id, merchant_domain=merchant_domain,
+            market_country=str(shipping_address.get("country") or ""),
+            product_key=product_key, quantity=int(req.quantity),
+        )
 
         # PURCHASABILITY BEFORE EITHER LANE'S ELIGIBILITY, because it is the broader refusal:
         # both allowlists say a merchant is PERMITTED, and neither says its checkout can be PAID.

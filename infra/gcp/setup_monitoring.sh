@@ -58,8 +58,11 @@ if [ -z "${ALERT_EMAIL:-}" ]; then
 fi
 [ -n "$ALERT_EMAIL" ] || { echo "ALERT_EMAIL empty and no gcloud account set" >&2; exit 2; }
 
-# Public hostnames, prod only. Staging is IAM-gated with nothing public to probe.
-HOSTS=(api.pivota.cc gateway.pivota.cc mcp.pivota.cc commerce.mcp.pivota.cc ucp.pivota.cc acp.pivota.cc)
+# Public hostname checks belong only to prod. Staging must never probe prod.
+HOSTS=()
+if [ "$ENV" = prod ]; then
+  HOSTS=(api.pivota.cc gateway.pivota.cc mcp.pivota.cc commerce.mcp.pivota.cc ucp.pivota.cc acp.pivota.cc)
+fi
 
 api() { # METHOD PATH [BODY]
   if [ -n "${3:-}" ]; then
@@ -101,8 +104,8 @@ if [ -n "$CHANNEL" ]; then
 else
   BODY="$(python3 -c '
 import json, sys
-print(json.dumps({"type": "email", "displayName": "pivota prod alerts",
-                  "labels": {"email_address": sys.argv[1]}, "enabled": True}))' "$ALERT_EMAIL")"
+print(json.dumps({"type": "email", "displayName": "pivota " + sys.argv[2] + " alerts",
+                  "labels": {"email_address": sys.argv[1]}, "enabled": True}))' "$ALERT_EMAIL" "$ENV")"
   RESP="$(api POST notificationChannels "$BODY")"
   check "$RESP" "create channel"
   CHANNEL="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])' <<<"$RESP")"
@@ -316,7 +319,25 @@ if not (isinstance(name, str) and "/alertPolicies/" in name):
 ' "$2" <<<"$1"
 }
 
+# Policy generators retain the exact prod payloads. Normalize at BOTH write paths
+# so staging cannot inherit prod names, including the new-metric retry path.
+environment_policy_name() {
+  printf '%s:%s' "$ENV" "${1#prod:}"
+}
+environment_policy_body() {
+  if [ "$ENV" = prod ]; then printf '%s' "$1"; return; fi
+  python3 -c '
+import json, sys
+body = json.loads(sys.argv[1])
+for entry in [body, *body.get("conditions", [])]:
+    name = entry.get("displayName", "")
+    if name.startswith("prod:"):
+        entry["displayName"] = sys.argv[2] + name[5:]
+print(json.dumps(body))' "$1" "$ENV:"
+}
+
 upsert() { # DISPLAY_NAME BODY   -> replace by displayName so thresholds live in git
+  set -- "$(environment_policy_name "$1")" "$(environment_policy_body "$2")"
   OLD="$(api GET alertPolicies | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -425,6 +446,7 @@ NEW_METRIC_TRIES="${NEW_METRIC_TRIES:-20}"
 NEW_METRIC_RETRY_SECONDS="${NEW_METRIC_RETRY_SECONDS:-30}"
 NEW_METRIC_DEFERRED=""
 upsert_on_new_metric() { # DISPLAY_NAME BODY
+  set -- "$(environment_policy_name "$1")" "$(environment_policy_body "$2")"
   local stale old resp err
   stale="$(api GET alertPolicies | python3 -c '
 import json, sys
@@ -470,6 +492,7 @@ if isinstance(d, dict) and "error" in d:
   echo "   $1"
 }
 
+if [ "${#HOSTS[@]}" -gt 0 ]; then
 upsert "prod: host is down" "$(policy \
   "prod: host is down" \
   "An uptime check against a public pivota.cc host is failing. This is the only alert that fires when the whole path breaks - DNS, load balancer, TLS or the service itself." \
@@ -481,6 +504,7 @@ upsert "prod: TLS certificate expiring" "$(policy \
   "A certificate is within 14 days of expiry. These are Certificate-Manager MANAGED certs that renew automatically, so this firing means renewal is BLOCKED - almost always because an _acme-challenge CNAME was removed from the pivota.cc zone. Fix the DNS authorization before the cert actually expires." \
   'metric.type="monitoring.googleapis.com/uptime_check/time_until_ssl_cert_expires" AND resource.type="uptime_url"' \
   ALIGN_MIN REDUCE_MIN resource.label.host COMPARISON_LT 14 3600s 3600s 86400s)"
+fi
 
 # Preserve the 2026-09-25 hand-edited ratio: absolute error rate does not track changing traffic.
 # upsert deletes/re-creates by displayName, so reconciling a new policy must not revert this one.
