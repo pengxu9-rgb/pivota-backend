@@ -1113,7 +1113,7 @@ async def ensure_required_schema_light() -> None:
                 _warn_one_pending_index_missing(exc)
             # mig 254: durable malformed expiry provenance, independently healed.
             try:
-                await database.execute(text("ALTER TABLE IF EXISTS reap_agentic_enrollments ADD COLUMN IF NOT EXISTS hosted_url_expiry_invalid BOOLEAN NOT NULL DEFAULT FALSE;"))
+                await _heal_add_columns("ALTER TABLE IF EXISTS reap_agentic_enrollments ADD COLUMN IF NOT EXISTS hosted_url_expiry_invalid BOOLEAN NOT NULL DEFAULT FALSE;")
             except Exception:  # noqa: BLE001
                 pass
             # mig 225: the resolver's three hint columns.

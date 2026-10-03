@@ -226,16 +226,23 @@ async def seed_enrollment(*, reap_buyer_ref: str, status: str = "active") -> str
     (`uq_reap_agentic_enrollments_one_pending`) allows ONE pending row per ref: seed the
     'active' and 'dead' rows BEFORE the one 'pending' row, or drop the index first to model a
     database that predates it (`drop_one_pending_index`)."""
-    # AN EXPLICIT (and deliberately unmatched) id forces the INSERT arm, so every call here is
-    # a DISTINCT row. Left to itself `upsert_pending_enrollment` REFRESHES the ref's existing
-    # pending row — correct in production, and useless for a fixture that needs a stack of them.
-    row = await ledger.upsert_pending_enrollment(
-        buyer_ref=reap_buyer_ref,
-        agent_id=AGENT,
-        hosted_url="https://pay.reap.global/enroll/abc",
-        enrollment_id=ledger.new_enrollment_id(),
+    # A named provider-response update can only update an existing attempt. Build the
+    # original pending fixture with the ledger's INSERT statement, including server defaults,
+    # rather than pretending a response to an unknown attempt is a fresh create. Direct
+    # storage seeding also models legacy duplicate pending rows after the index is dropped;
+    # the normal unnamed upsert correctly reuses those rows and cannot build that fixture.
+    enrollment_id = ledger.new_enrollment_id()
+    row = await database.fetch_one(
+        ledger._INSERT_PENDING_ENROLLMENT_SQL,
+        {
+            "id": enrollment_id, "buyer_ref": reap_buyer_ref, "agent_id": AGENT,
+            "hosted_url": "https://pay.reap.global/enroll/abc",
+            "reap_enrollment_id": None, "reap_status": None,
+            "hosted_url_expires_at": None, "hosted_url_expiry_invalid": False,
+        },
     )
-    enrollment_id = str(row["id"])
+    assert row is not None and row["id"] == enrollment_id
+    assert row["hosted_url_expiry_invalid"] is False or row["hosted_url_expiry_invalid"] == 0
     if status == "active":
         await ledger.mark_enrollment_active(
             enrollment_id,
