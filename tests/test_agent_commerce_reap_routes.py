@@ -973,14 +973,16 @@ async def test_a_link_written_between_the_read_and_the_insert_wins(client, monke
 async def test_two_first_purchases_in_flight_leave_one_buyer_one_link_and_one_ref(client):
     """Both callers run the whole handler; only one row of each may exist afterwards."""
     import asyncio
+    import contextvars
 
     await _seed_catalog()
     await _seed_eligibility()
 
-    first, second = await asyncio.gather(
-        client.post(f"{BASE}/purchases", json=_body()),
-        client.post(f"{BASE}/purchases", json=_body()),
-    )
+    # HTTP requests own separate connections, rather than inheriting the
+    # fixture's databases0.7 ContextVar and sharing nested transactions.
+    tasks = [contextvars.Context().run(asyncio.create_task,
+        client.post(f"{BASE}/purchases", json=_body())) for _ in range(2)]
+    first, second = await asyncio.gather(*tasks)
 
     assert first.status_code == 202
     assert second.status_code == 202
@@ -3111,9 +3113,9 @@ async def test_a_claim_that_loses_to_a_refusal_abandons_the_purchase_it_opened(
     assert resp.status_code == 409 and _error(resp) == expected, resp.text
     rows = [dict(r) for r in await database.fetch_all(
         "SELECT state, buyer_email, shipping_address FROM reap_agentic_purchases")]
-    assert len(rows) == 1
-    assert rows[0]["state"] == "refused"
-    assert rows[0]["buyer_email"] is None and rows[0]["shipping_address"] is None
+    # This seam injects the competitor on the same connection: the whole failed
+    # transaction rolls back. Independent real winners survive in the race tests.
+    assert rows == []
 
 
 async def test_a_lifetime_key_replays_without_replacement(client):
@@ -4028,6 +4030,8 @@ async def test_disarmed_status_read_retains_identity_checks_and_has_no_provider_
 
 
 
+
+
 # Durable recovery never opens another checkout or refreshes identity/consent.
 @pytest.mark.parametrize("state", ["awaiting_approval", "processing", "completed"])
 async def test_recovery_after_25_days_is_read_only_while_create_is_paused(client, monkeypatch, state):
@@ -4191,6 +4195,190 @@ async def test_recovery_does_not_silently_recompute_a_changed_default_return_url
     monkeypatch.setenv("REAP_AGENTIC_RETURN_URL", "https://shop.example/reap/changed")
     response = await client.post(f"{BASE}/purchases/recover", json=body)
     assert response.status_code == 409 and _error(response) == "idempotency_conflict", response.text
+
+
+
+async def _seed_atomic_request_lane(monkeypatch, lane):
+    await _seed_all()
+    if lane == "cart_link":
+        monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+        await database.execute("UPDATE catalog_products SET seller_ref=merchant_id WHERE product_key=:p", {"p": PRODUCT_KEY})
+        await database.execute("UPDATE catalog_skus SET source_variant_id='50041364447509' WHERE sku_key=:s", {"s": SKU_KEY})
+        await database.execute("INSERT INTO tierb_cart_link_eligibility (shop_domain,market,verdict,checked_at,consecutive_same) VALUES (:d,'US','ELIGIBLE',CURRENT_TIMESTAMP,1)", {"d": DOMAIN})
+
+# Durable create/key atomicity: a worker must never see a purchase without its key.
+@pytest.mark.parametrize("failure", ["key_constraint", "after_purchase"])
+@pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
+async def test_atomic_key_failure_rolls_back_purchase_and_retry_cannot_duplicate(client, monkeypatch, failure, lane):
+    await _seed_atomic_request_lane(monkeypatch, lane)
+    body = _body(item_source=lane, idempotency_key="atomic-failed-insert")
+    seam = "_write_idempotency_key" if failure == "key_constraint" else "_claim_idempotency_key"
+    real = getattr(routes_reap, seam)
+
+    async def unavailable(**kwargs):
+        if failure == "key_constraint":
+            # Actual statement failure on each engine, not a fake database response.
+            await database.execute("INSERT INTO reap_agentic_purchase_keys (purchase_id) VALUES ('synthetic-key-fault')")
+        raise RuntimeError("synthetic failure after purchase, before durable key")
+
+    monkeypatch.setattr(routes_reap, seam, unavailable)
+    response = await client.post(f"{BASE}/purchases", json=body)
+    assert response.status_code == 503, response.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 0
+    assert (await client.post(f"{BASE}/purchases/recover", json=body)).status_code == 404
+    monkeypatch.setattr(routes_reap, seam, real)
+    accepted = await client.post(f"{BASE}/purchases", json=body)
+    assert accepted.status_code == 202, accepted.text
+    replay = await client.post(f"{BASE}/purchases", json=body)
+    assert replay.json()["purchase_id"] == accepted.json()["purchase_id"]
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 1
+
+
+@pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
+async def test_atomic_key_cancellation_after_purchase_rolls_back(client, monkeypatch, lane):
+    import asyncio
+    await _seed_atomic_request_lane(monkeypatch, lane)
+    async def cancelled(**kwargs):
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(routes_reap, "_claim_idempotency_key", cancelled)
+    from starlette.requests import Request
+    raw = json.dumps(_body(item_source=lane, idempotency_key="atomic-cancelled")).encode()
+    async def receive():
+        return {"type": "http.request", "body": raw, "more_body": False}
+    request = Request({"type": "http", "method": "POST", "path": f"{BASE}/purchases", "headers": []}, receive)
+    # Exercise cancellation at the actual handler. ASGITransport+middleware cannot
+    # represent a cancelled response and replaces it with its own assertion.
+    with pytest.raises(asyncio.CancelledError):
+        await routes_reap.start_reap_purchase(request, context=CALLER, agent_user=AgentUserContext(agent_user_ref=USER_REF))
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 0
+
+
+@pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
+async def test_atomic_key_worker_connection_cannot_observe_precommit_purchase(client, monkeypatch, lane):
+    from databases import Database
+    await _seed_atomic_request_lane(monkeypatch, lane)
+    observer = Database(os.environ["DATABASE_URL"])
+    await observer.connect()
+    seen = []
+    real = svc.start_purchase
+    async def observed_start(**kwargs):
+        purchase_id = await real(**kwargs)
+        seen.append(await observer.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases WHERE id=:p", {"p": purchase_id}))
+        return purchase_id
+    monkeypatch.setattr(svc, "start_purchase", observed_start)
+    try:
+        response = await client.post(f"{BASE}/purchases", json=_body(item_source=lane, idempotency_key="atomic-worker-visibility"))
+        assert response.status_code == 202, response.text
+        assert seen == [0], "another database connection saw the purchase before its key was durable"
+        assert await observer.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+        assert await observer.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 1
+    finally:
+        await observer.disconnect()
+
+
+@pytest.mark.parametrize("different_body", [False, True])
+@pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
+async def test_atomic_key_concurrent_requests_have_one_claimable_purchase(client, monkeypatch, different_body, lane):
+    import asyncio
+    import contextvars
+    await _seed_atomic_request_lane(monkeypatch, lane)
+    real = routes_reap._replayed_purchase_id
+    arrived = 0
+    both = asyncio.Event()
+    async def simultaneous_miss(**kwargs):
+        nonlocal arrived
+        if arrived < 2:
+            result = await real(**kwargs)
+            assert result is None
+            arrived += 1
+            if arrived == 2:
+                both.set()
+            await asyncio.wait_for(both.wait(), timeout=5)
+            return None
+        return await real(**kwargs)
+    monkeypatch.setattr(routes_reap, "_replayed_purchase_id", simultaneous_miss)
+    # Independent HTTP requests must not inherit the fixture's existing
+    # databases0.7 ContextVar connection and share a transaction stack.
+    posts = [
+        client.post(f"{BASE}/purchases", json=_body(item_source=lane, idempotency_key="atomic-concurrent", quantity=1)),
+        client.post(f"{BASE}/purchases", json=_body(item_source=lane, idempotency_key="atomic-concurrent", quantity=2 if different_body else 1)),
+    ]
+    tasks = [contextvars.Context().run(asyncio.create_task, post) for post in posts]
+    first, second = await asyncio.wait_for(asyncio.gather(*tasks), timeout=15)
+    assert sorted([first.status_code, second.status_code]) == ([202, 409] if different_body else [202, 202]), (first.text, second.text)
+    if not different_body:
+        assert first.json()["purchase_id"] == second.json()["purchase_id"]
+    else:
+        refused = first if first.status_code == 409 else second
+        assert _error(refused) == "idempotency_conflict"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 1
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases WHERE state='resolving'") == 1
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases WHERE state='refused' AND (buyer_email IS NOT NULL OR shipping_address IS NOT NULL)") == 0
+
+
+async def test_atomic_key_tombstone_insert_failure_is_not_authoritative_refusal(client, monkeypatch):
+    await _seed_catalog()
+    await _seed_link()
+    async def unavailable(**kwargs):
+        await database.execute("INSERT INTO reap_agentic_purchase_keys (purchase_id) VALUES ('synthetic-refusal-key-fault')")
+    monkeypatch.setattr(routes_reap, "_write_idempotency_key", unavailable)
+    response = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="atomic-tombstone-fault"))
+    assert response.status_code == 503, response.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 0
+
+
+async def test_atomic_key_tombstone_losing_to_a_purchase_never_authorizes_cart_retry(client, monkeypatch):
+    await _seed_all()
+    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="atomic-original-purchase"))
+    assert first.status_code == 202
+    purchase = first.json()["purchase_id"]
+    await database.execute("DELETE FROM reap_agentic_eligibility")
+    real = routes_reap._write_idempotency_key
+    async def winner_lands(**kwargs):
+        await database.execute(
+            "INSERT INTO reap_agentic_purchase_keys (agent_id,agent_user_ref_hash,idempotency_key,purchase_id,request_hash) "
+            "VALUES (:agent_id,:agent_user_ref_hash,:idempotency_key,:purchase_id,:request_hash)",
+            {**kwargs, "purchase_id": purchase})
+        return await real(**kwargs)
+    monkeypatch.setattr(routes_reap, "_write_idempotency_key", winner_lands)
+    body = _body(idempotency_key="atomic-tombstone-race")
+    response = await client.post(f"{BASE}/purchases", json=body)
+    assert response.status_code == 503, response.text
+    recovered = await client.post(f"{BASE}/purchases/recover", json=body)
+    assert recovered.status_code == 200 and recovered.json()["id"] == purchase
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+
+
+@pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
+async def test_atomic_key_duplicate_cleanup_failure_cannot_leave_claimable_orphan(client, monkeypatch, lane):
+    await _seed_atomic_request_lane(monkeypatch, lane)
+    body = _body(item_source=lane, idempotency_key="atomic-cleanup-fault")
+    first = await client.post(f"{BASE}/purchases", json=body)
+    assert first.status_code == 202, first.text
+    real_lookup = routes_reap._replayed_purchase_id
+    first_miss = True
+    async def miss_before_concurrent_winner(**kwargs):
+        nonlocal first_miss
+        if first_miss:
+            first_miss = False
+            return None
+        return await real_lookup(**kwargs)
+    async def broken_cleanup(*args, **kwargs):
+        # A real statement failure, after the immutable key picked the durable winner.
+        await database.execute("UPDATE reap_atomic_cleanup_missing_table SET id='synthetic'")
+    monkeypatch.setattr(routes_reap, "_replayed_purchase_id", miss_before_concurrent_winner)
+    monkeypatch.setattr(ledger, "transition", broken_cleanup)
+    retry = await client.post(f"{BASE}/purchases", json=body)
+    assert retry.status_code == 503, retry.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 1
+    recovered = await client.post(f"{BASE}/purchases/recover", json=body)
+    assert recovered.status_code == 200
+    assert recovered.json()["id"] == first.json()["purchase_id"]
 
 
 @pytest.mark.parametrize("flag", ["0", "false", "", "ture", "arbitrary"])

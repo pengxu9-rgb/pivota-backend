@@ -1788,6 +1788,11 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4b_test
 ```
 
 
+### Lost response recovery and durable attempt keys
+
+Use authenticated `POST /agent/v2/commerce/reap/purchases/recover` with the original create body and opaque key while creates are paused. The read-only endpoint checks the original canonical request fingerprint and returns the owner view without merchant freshness checks, provider calls or consent/PII writes. Preserve the explicit original return URL: if a caller omitted it and the default changes, fingerprint conflict keeps the attempt uncertain. Never resolve that conflict by creating with a new key until the original outcome is authoritatively reconciled.
+
+Mappings and refusal tombstones are immutable regardless of age, including completed purchases. The old 24-hour rollover is removed from both lookup and SQL insertion. Existing mappings require no migration; historical overwritten mappings cannot be reconstructed by this fix and remain an operator audit gate. Roll out to every create-serving instance before relying on this guarantee; do not delete old keys as cleanup. Normal enabled create replays retain existing consent-write semantics; use recover when a read-only replay is required.
 ### Checkout reads requiring human reconciliation
 
 Three consecutive permanent-shaped reads (404, unknown checkout status or unsafe hosted URL)
@@ -1811,6 +1816,15 @@ Only checkout-backed `awaiting_approval`/`processing` rows explicitly classified
 Migration 253 and both startup self-heal dialects create `reap_checkout_manual_resolution_audit`. It stores one decision per purchase: checkout, original state/version, terminal status, operator/evidence handles, verified source, observed time/origin and normalized evidence SHA256. It stores no full provider body or buyer contact. The audit append, conditional terminal decision, terminal lease clearing, click claim and attribution edge call share one short database transaction; unexpected failures or suppression roll back that unit. A deterministic existing merchant-channel click claim is legitimate: completion keeps `attribution_closed_by_other_channel`, preserves that claim, writes no Reap edge, and audits `attribution_outcome=closed_by_other_channel`. Other completions audit `edge_closed` only after rereading the durable attribution edge and checking exact merchant, external and synthetic order, amount/currency, click/agent, converted source/state and the purchase/checkout partner provenance. A synthesized close receipt after `ON CONFLICT DO NOTHING` is insufficient: a missing edge or conflicting existing order slot rolls back the terminal outcome and audit without overwriting the edge. Failed/expired decisions audit `not_applicable`. Ancillary commerce event/interaction emission retains its existing best-effort semantics and requires a separate receipt check; this primitive does not promise those receipts exist. Exact-evidence replay is read-only and cannot create another audit or edge. Do not delete the audit table when rolling back runtime code; removing this function leaves classified rows safely unresolved.
 
 `contact_retention_blocked` is a separate owner/operator queue, covering privacy-held resolving, needs_enrollment and quoting work. Resuming flags does not restore discarded contact or mint another checkout. An operator must inspect whether an external checkout may exist and use a separately reviewed recovery/contact-reauthorization procedure; there is no automatic quoting cleanup or blind retry. `checkout_needs_human` is a separate payment uncertainty queue. The existing three metrics match heartbeat, ordinary stuck and errors only: before arming, these two cohorts need an explicitly owned, reviewed alert/runbook. No cloud policy is created or enabled by this source change.
+
+
+### Atomic purchase and immutable key acceptance
+
+The create route opens the purchase and binds its immutable attempt key in one short database transaction. `start_purchase` makes no provider call. Other database connections cannot claim or observe the new purchase until the key and purchase commit together. A same-body concurrent loser is scrubbed before that transaction commits; a conflicting request, cancellation, failed key write or failed loser cleanup rolls back its uncommitted purchase. SQLite reserves its writer before the cart-lane reads to avoid deferred-read upgrade races; this reservation changes no mapping.
+
+Storage uncertainty returns503 `checkout_outcome_unknown`. It never acknowledges an unmapped purchase or authorizes another checkout path. A merchant refusal tombstone must also be durable; a competing purchase winner or uncertain tombstone write returns unknown. Recover the original key/body/owner while creates are paused. No key age authorizes a replacement purchase. Current selected Reap checkout policy does not automatically switch to cart-link, native checkout or storefront purchase after any failure or refusal.
+
+A commit acknowledgement can be lost after the database commits. Treat503 as uncertain and recover the exact original attempt, never mint a fresh key to escape it. The public recovery view retains its established `id` field; create acceptance uses `purchase_id`. Same-key replay returns the winner's current state, not a fabricated resolving state. An intentional new purchase requires its own explicit buyer intent and new key.
 
 
 ### Enrollment links without provider expiry
