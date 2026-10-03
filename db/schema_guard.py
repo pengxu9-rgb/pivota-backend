@@ -981,6 +981,27 @@ async def ensure_required_schema_light() -> None:
                     "ON reap_agentic_enrollments (buyer_ref) "
                     "WHERE status = 'active';"
                 )
+                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_checkout_manual_resolution_audit (
+    purchase_id VARCHAR(64) PRIMARY KEY,
+    reap_checkout_id VARCHAR(128) NOT NULL,
+    from_state VARCHAR(32) NOT NULL,
+    resolved_state VARCHAR(32) NOT NULL,
+    attribution_outcome VARCHAR(32) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    evidence_source VARCHAR(64) NOT NULL,
+    evidence_reference VARCHAR(128) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    expected_updated_at TIMESTAMPTZ NOT NULL,
+    evidence_observed_at TIMESTAMPTZ NOT NULL,
+    provider_base_url VARCHAR(255) NOT NULL,
+    provider_status VARCHAR(32) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (from_state IN ('awaiting_approval','processing')),
+    CHECK (resolved_state IN ('completed','failed','expired')),
+    CHECK (provider_status IN ('COMPLETED','FAILED','EXPIRED')),
+    CHECK (attribution_outcome IN ('edge_closed','closed_by_other_channel','not_applicable')),
+    CHECK (evidence_source IN ('authenticated_reap_checkout_read','verified_reap_support_statement'))
+);"""))
                 await database.execute(
                     text(
                         """
@@ -1090,6 +1111,11 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 _warn_one_pending_index_missing(exc)
+            # mig 254: durable malformed expiry provenance, independently healed.
+            try:
+                await database.execute(text("ALTER TABLE IF EXISTS reap_agentic_enrollments ADD COLUMN IF NOT EXISTS hosted_url_expiry_invalid BOOLEAN NOT NULL DEFAULT FALSE;"))
+            except Exception:  # noqa: BLE001
+                pass
             # mig 225: the resolver's three hint columns.
             #
             # THIS DDL MUST BUILD THE SAME SCHEMA AS
@@ -3617,6 +3643,27 @@ async def ensure_required_schema_light() -> None:
                         "WHERE status = 'active';"
                     )
                 )
+                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_checkout_manual_resolution_audit (
+    purchase_id VARCHAR(64) PRIMARY KEY,
+    reap_checkout_id VARCHAR(128) NOT NULL,
+    from_state VARCHAR(32) NOT NULL,
+    resolved_state VARCHAR(32) NOT NULL,
+    attribution_outcome VARCHAR(32) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    evidence_source VARCHAR(64) NOT NULL,
+    evidence_reference VARCHAR(128) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    expected_updated_at TIMESTAMP NOT NULL,
+    evidence_observed_at TIMESTAMP NOT NULL,
+    provider_base_url VARCHAR(255) NOT NULL,
+    provider_status VARCHAR(32) NOT NULL,
+    recorded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (from_state IN ('awaiting_approval','processing')),
+    CHECK (resolved_state IN ('completed','failed','expired')),
+    CHECK (provider_status IN ('COMPLETED','FAILED','EXPIRED')),
+    CHECK (attribution_outcome IN ('edge_closed','closed_by_other_channel','not_applicable')),
+    CHECK (evidence_source IN ('authenticated_reap_checkout_read','verified_reap_support_statement'))
+);"""))
                 await database.execute(
                     text(
                         """
@@ -3722,6 +3769,11 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 _warn_one_pending_index_missing(exc)
+            # mig 254: SQLite twin; duplicate column is the idempotent no-op.
+            try:
+                await database.execute(text("ALTER TABLE reap_agentic_enrollments ADD COLUMN hosted_url_expiry_invalid BOOLEAN NOT NULL DEFAULT FALSE;"))
+            except Exception:  # noqa: BLE001
+                pass
             # mig 225: the resolver's three hint columns, SQLite twin.
             #
             # ── TWO LAYERS OF try, AND EACH ONE ANSWERS A DIFFERENT FAILURE ──

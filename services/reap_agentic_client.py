@@ -94,6 +94,22 @@ physical object.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
+
+class ProviderOperationStopped(RuntimeError):
+    """A worker stop was raised before a new transport operation."""
+
+
+# Worker-scoped: direct clients retain their existing behavior; child resolver calls inherit it.
+worker_provider_permission = ContextVar("reap_worker_provider_permission", default=None)
+
+
+def _check_worker_provider_permission():
+    permission = worker_provider_permission.get()
+    if permission is not None and not permission():
+        raise ProviderOperationStopped("reconciliation_disabled")
+
 import hashlib
 import json
 import logging
@@ -1878,6 +1894,7 @@ async def _post(
     wrong host or a missing key is an operator error that must be visible rather than degrade
     quietly into "Reap is unavailable" on every request forever.
     """
+    _check_worker_provider_permission()
     if not is_configured():
         return ReapResponse(ok=False, error="reap_client_not_configured")
     # The allowlist is enforced HERE, on the call, and not only in a helper an operator might run.
@@ -1907,6 +1924,9 @@ async def _post(
             # while having read all of it, which is the part that costs. `stream` plus
             # `_read_bounded` makes the bound real: DECODED bytes are counted as they arrive, in
             # steps of at most 64 KiB, and the read is abandoned once the cap is passed.
+            # Opening the client is asynchronous; the stop may have changed
+            # since this operation entered. Check again at the dispatch boundary.
+            _check_worker_provider_permission()
             async with client.stream(
                 "POST", f"{url}{path}", json=body,
                 headers=_headers(key, path, body, idempotency_extra=idempotency_extra,
@@ -1949,6 +1969,8 @@ async def _post(
                     )
                 raw = await _read_bounded(resp)
                 status = resp.status_code
+    except ProviderOperationStopped:
+        raise
     except Exception as exc:  # noqa: BLE001
         # The exception TYPE only. Never the request: the body can carry a shipping address and
         # the headers carry the key, and an exception string is the easiest place for either to
@@ -2190,6 +2212,7 @@ async def _get(
     NOTHING IS STRING-FORMATTED INTO A PATH HERE THAT HAS NOT BEEN THROUGH `_path_id`. That is
     the guard that stops a caller-supplied id from adding a segment or a query of its own.
     """
+    _check_worker_provider_permission()
     if not is_configured():
         return ReapResponse(ok=False, error="reap_client_not_configured")
     url = validate_base_url()
@@ -2210,6 +2233,9 @@ async def _get(
             # after it refuses to PARSE a body it has already fully allocated -- a cosmetic
             # bound. The read has to stop AT the cap to be one, and doing that here with a second
             # copy of the logic would give the two verbs two bounds to drift apart.
+            # Opening the client is asynchronous; the stop may have changed
+            # since this operation entered. Check again at the dispatch boundary.
+            _check_worker_provider_permission()
             async with client.stream(
                 "GET", f"{url}{path}",
                 params=params or None,
@@ -2240,6 +2266,8 @@ async def _get(
                             (resp.headers or {}).get("retry-after")),
                     )
                 raw = await _read_bounded(resp)
+    except ProviderOperationStopped:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("reap GET %s failed: %s", path, type(exc).__name__)
         return ReapResponse(ok=False, error=f"transport_error:{type(exc).__name__}")
