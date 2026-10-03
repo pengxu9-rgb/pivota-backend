@@ -601,7 +601,7 @@ upsert "prod: retailer ingest job failed" "$(policy \
   'metric.type="logging.googleapis.com/user/retailer_ingest_drain_failed" AND resource.type="cloud_run_job"' \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 0s 3600s)"
 
-# The Reap agentic purchase rail. Three policies over the three log metrics above; the runbook
+# The Reap agentic purchase rail. Five policies over the five log metrics above; the runbook
 # for all of them is docs/runbooks/reap_agentic_purchase.md, "Alerts".
 #
 # STUCK aligns over 900s. The armed poller reports every 30s, but one run may legitimately take
@@ -648,13 +648,14 @@ upsert_on_new_metric "prod: Reap purchase poller failing" "$(policy \
 #
 # WHAT THIS CANNOT DO. 24 hours after the last report the left side is empty, the condition stops
 # being true and the incident closes - fixed or not. From then on a dead poller produces NO signal
-# from any of the three policies: the other two read lines only a running poller prints. A
-# DELIBERATE disarm of an armed rail looks identical from here (the job prints nothing either way):
-# it opens this once and renotifies until it is snoozed or the 24 hours run out.
+# from any of the five policies: the other four require lines from a running poller.
+# Maintenance heartbeat continues with creation or provider reads disabled, including missing
+# credentials. Deliberately pausing the scheduler or excluding the job stops reports; snooze
+# this policy for that maintenance window until scheduling resumes or the 24 hours run out.
 upsert_on_new_metric "prod: Reap purchase poller went silent" "$(promql_policy \
   "prod: Reap purchase poller went silent" \
   "report line present in the last 24h, absent for 15m" \
-  "The Reap purchase poller was printing its per-run report and has printed none for about 20 minutes. Nothing is advancing purchases: a buyer who approves now waits. Either the worker service is down or its scheduler is wedged (check /__scheduler_health for reap_agentic_purchase_poll), every run is raising before it reports (worker logs: Job run_reap_agentic_purchase_poll raised an exception), the Reap client lost its configuration so step 4 is skipped without a line, or someone turned REAP_AGENTIC_ENABLED off. This repeats hourly while it is open. If the rail was disarmed on purpose this is expected, and the incident cannot be closed by hand while the condition holds: snooze this policy instead. The condition stops being true 24 hours after the last report, fixed or not, and after that a dead poller raises nothing. It cannot fire in an environment that printed no report in the previous 24 hours. Runbook: docs/runbooks/reap_agentic_purchase.md, Alerts." \
+  "The Reap purchase poller was printing its per-run report and has printed none for about 20 minutes. Scheduled maintenance reports have stopped; privacy sweeps and purchase progression may be delayed. Check worker readiness, /__scheduler_health, the job allowlist, deliberate scheduler maintenance and exceptions before the report. Maintenance heartbeat continues when creation or provider reads are disabled, including missing Reap credentials; those flags alone do not explain silence. This repeats hourly while it is open. For a deliberate scheduler pause, snooze the policy for the reviewed maintenance window; do not infer failed or unpaid checkout outcomes from silence. The condition stops being true 24 hours after the last report, fixed or not, and after that a dead poller raises nothing. It cannot fire in an environment that printed no report in the previous 24 hours. Runbook: docs/runbooks/reap_agentic_purchase.md, Alerts." \
   '(sum(sum_over_time(logging_googleapis_com:user_reap_agentic_poll_report{monitored_resource="cloud_run_revision"}[24h] offset 15m)) > 0) unless (sum(sum_over_time(logging_googleapis_com:user_reap_agentic_poll_report{monitored_resource="cloud_run_revision"}[15m])) > 0)' \
   300s 60s 3600s 3600s NEW_METRIC)"
 
