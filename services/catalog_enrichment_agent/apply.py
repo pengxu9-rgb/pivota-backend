@@ -523,11 +523,15 @@ def _seed_with_served_canonical(seed: Dict[str, Any]) -> Dict[str, Any]:
     return {**seed, "canonical_url": served, "domain": _domain_of(served)}
 
 
-async def _derive_seed_seller_for_plan_row(seed: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+async def _derive_seed_seller_for_plan_row(
+    seed: Dict[str, Any], *, brand_official_domain: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
     """Derive `(seller_ref, seed_kind)` for one enrichment plan seed row (ADR-009
     D3). Brand comes from the seed_data JSON (`_build_seed_inserts` stores it),
     the destination from `domain`/`destination_url`, and the anchor from
-    `attached_product_key` (synthetic here → no tenant anchor → CROSS)."""
+    `attached_product_key` (synthetic here → no tenant anchor → CROSS, unless the
+    seed's destination is the brand-official storefront of the planned row it
+    attaches to: see `_brand_official_storefronts`)."""
     import json as _json
 
     from services.seller_identity import (
@@ -549,7 +553,25 @@ async def _derive_seed_seller_for_plan_row(seed: Dict[str, Any]) -> tuple[Option
         brand=brand,
         destination_domain=seed.get("domain") or seed.get("destination_url"),
         source_system=str(seed.get("tool") or AGENT_VERSION),
+        brand_official_domain=brand_official_domain,
     )
+
+
+def _brand_official_storefronts(pdps: List[Dict[str, Any]]) -> Dict[str, str]:
+    """product_key -> storefront host, for the planned rows a brand's own storefront writes.
+
+    A seed attaches to its planned row by attached_product_key. When that row is
+    source_role=brand_official and the seed's destination is the row's own
+    storefront, the seed is the brand selling on its own store: 'self', not 'cross'
+    (derive_seed_seller). 'cross' shadowed every brand-official cohort in trust
+    (IDENTITY_LIVE_READ_DISABLED, 2026-09-28)."""
+    out: Dict[str, str] = {}
+    for pdp in pdps or []:
+        key = str(pdp.get("product_key") or "")
+        host = _storefront_host(pdp.get("source_domain"))
+        if key and host and _is_brand_official_pdp(pdp):
+            out[key] = host
+    return out
 
 
 def _note_pdp_refusal(
@@ -2286,16 +2308,19 @@ async def _apply_ingest_plan(
                 logger.exception("insert offer failed for offer_id=%s — %s", offer.get("offer_id"), exc)
 
     # 5. external_product_seeds — audit + legacy compatibility.
+    own_storefronts = _brand_official_storefronts(pdps)
     for seed in seeds:
         try:
             # ADR-009 D3 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY
             # _REFERENCE §4): derive the seller-of-record at write time. Enrichment
-            # offers are external retailer offers whose `attached_product_key` is a
-            # synthetic `pk_<hash>` (no tenant anchor) → these resolve CROSS to an
-            # observed seller. NULL only when unmintable (derive logs loudly) —
-            # never assumed 'self'.
+            # seeds attach to a synthetic `pk_<hash>` (no tenant anchor) → they
+            # resolve CROSS to an observed seller, except a seed on the brand-
+            # official storefront of its own planned row, which is SELF. NULL only
+            # when unmintable (derive logs loudly).
             seed = _seed_with_served_canonical(seed)
-            seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(seed)
+            seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(
+                seed, brand_official_domain=own_storefronts.get(str(seed.get("attached_product_key") or "")),
+            )
             await database.execute(
                 _SEED_UPSERT_SQL,
                 {**seed, "seller_ref": seller_ref, "seed_kind": seed_kind},
@@ -2483,10 +2508,13 @@ async def _apply_ingest_plan_batched(
 
     # 5. external_product_seeds — per-row seller derivation (ADR-009 D3), then bulk.
     seed_rows = []
+    own_storefronts = _brand_official_storefronts(pdps)
     for seed in seeds:
         seed = _seed_with_served_canonical(seed)
         try:
-            seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(seed)
+            seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(
+                seed, brand_official_domain=own_storefronts.get(str(seed.get("attached_product_key") or "")),
+            )
         except Exception as exc:  # noqa: BLE001 — same skip semantics as the per-row
             # path: one seed's derivation failure must not abort the apply AFTER
             # pdps/skus/offers are committed, nor lose the writer-audit row below.
