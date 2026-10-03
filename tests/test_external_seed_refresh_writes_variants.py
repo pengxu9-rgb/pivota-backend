@@ -1165,3 +1165,24 @@ def test_a_localized_stored_price_requires_its_own_price_read(monkeypatch):
     assert stored['seed_data']['variants'][0]['price_amount'] == '20,00'
     assert '46536716517563' in result['variant_refresh']['not_re_read']
     assert not _trusted(_serve(stored))
+
+
+def test_empty_primary_money_does_not_make_a_priced_variant_stock_only(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563','','out_of_stock',price=20),
+                             _variant('46536716517564',25,'in_stock')],price=25,availability='in_stock')
+    result, stored = _refresh(monkeypatch,row,_page([
+        _offer(25,IN,sku='46536716517564'),
+        {'@type':'Offer','sku':'46536716517563','availability':IN,'priceCurrency':'USD'},
+    ]))
+    assert stored['seed_data']['variants'][0]['price'] == 20
+    assert '46536716517563' in result['variant_refresh']['not_re_read']
+    assert not _trusted(_serve(stored))
+
+
+def test_known_stored_sku_refuses_a_different_explicit_page_sku(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563',32,'out_of_stock',sku='ABC')],price=32,availability='out_of_stock')
+    result, stored = _refresh(monkeypatch,row,_page([_offer(20,IN,sku='DEF')]))
+    variant = stored['seed_data']['variants'][0]
+    assert (variant['price_amount'],variant['availability'],variant['sku']) == (32,'out_of_stock','ABC')
+    assert result['variant_refresh']['not_re_read_count'] == 1
+    assert not _trusted(_serve(stored))

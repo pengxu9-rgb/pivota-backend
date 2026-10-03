@@ -4743,10 +4743,11 @@ def _seed_variant_identifiers(variant: Dict[str, Any]) -> List[str]:
 
 def _seed_variant_stored_price(variant: Dict[str, Any]) -> Any:
     """The price the serving builders read off a stored variant, same precedence."""
-    raw = variant.get("price_amount")
-    if raw is None:
-        raw = variant.get("price") or variant.get("amount") or variant.get("value")
-    return raw
+    for key in ("price_amount", "price", "amount", "value", "list_price"):
+        raw = variant.get(key)
+        if raw not in (None, ""):
+            return raw
+    return None
 
 
 def _native_refresh_variant_ids(variant: Dict[str, Any]) -> set:
@@ -4905,6 +4906,12 @@ def _reconcile_seed_variants_with_read(
         fallback_identity_ok = len(stored_native) <= 1 and not (
             stored_native and read_native and read_native != stored_native
         )
+        stored_codes = {str(v[k]).strip() for k in ("sku", "sku_id") if v.get(k)}
+        read_codes = {_seed_variant_key(rv) for rv in read_variants
+                      if _seed_variant_key(rv) and not _POSITIONAL_OFFER_ID.match(_seed_variant_key(rv))
+                      and not _native_refresh_variant_ids(rv)}
+        if stored_codes and read_codes and not stored_codes.intersection(read_codes):
+            fallback_identity_ok = False
         stored_currencies = {str(v[k]).strip().upper() for k in ("price_currency", "currency") if v.get(k)}
         fallback_currency_ok = (
             (not stored_currencies or stored_currencies == {product_cur})
