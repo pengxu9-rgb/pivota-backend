@@ -36,6 +36,7 @@ _TABLE_MIGRATIONS = (
     "058_catalog_core.sql",
     "132_catalog_offer_suppression_writer_audit.sql",
     "135_catalog_product_sku_stale_suppression.sql",
+    "149_catalog_offers_agent_decision_fields.sql",
     "246_catalog_offers_price_checked_at.sql",
 )
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
@@ -194,14 +195,63 @@ async def test_the_guard_refuses_a_row_whose_currency_moved_after_the_read(scope
     from services import external_offer_dual_write as mod
 
     await _load(scoped_db)
+    read = dict(next(r for r in await scoped_db.fetch_all(mod.ATTACHED_LISTING_OFFERS_SQL, {"product_key": PK})
+                     if r["offer_id"] == "of_canon"))
+    values = {"offer_id": "of_canon", "price": 22.7, "currency": "USD",
+              **{k: read[k] for k in ("read_offer", "read_sku", "read_product")}}
     await scoped_db.execute("UPDATE catalog_offers SET currency = 'GBP' WHERE offer_id = 'of_canon'")
     row = await scoped_db.fetch_one(
-        mod.ATTACHED_LISTING_OFFER_UPDATE_SQL, {"offer_id": "of_canon", "price": 22.7, "currency": "USD"}
+        mod.ATTACHED_LISTING_OFFER_UPDATE_SQL, values
     )
     assert row is None
     await scoped_db.execute("UPDATE catalog_offers SET currency = 'USD', suppressed_at = NOW() WHERE offer_id = 'of_canon'")
     row = await scoped_db.fetch_one(
-        mod.ATTACHED_LISTING_OFFER_UPDATE_SQL, {"offer_id": "of_canon", "price": 22.7, "currency": "USD"}
+        mod.ATTACHED_LISTING_OFFER_UPDATE_SQL, values
     )
     assert row is None
     assert float((await _offers(scoped_db))["of_canon"]["list_price"]) == 29.0
+
+
+@pytest.mark.parametrize('mutation', [
+    "UPDATE catalog_offers SET source_ref='https://missha.us/products/other', offer_payload='{}' WHERE offer_id='of_v1'",
+    "UPDATE catalog_offers SET merchant_id='other_seller' WHERE offer_id='of_v1'",
+    "UPDATE catalog_offers SET market='CA' WHERE offer_id='of_v1'",
+    "UPDATE catalog_offers SET merchant_effective_price=33 WHERE offer_id='of_v1'",
+    "UPDATE catalog_offers SET offer_payload=jsonb_build_object('price_repair',NULL) WHERE offer_id='of_v1'",
+    "UPDATE catalog_skus SET source_variant_id='47761881309999' WHERE source_variant_id='47761881301179'",
+    "UPDATE catalog_skus SET currency='EUR' WHERE source_variant_id='47761881301179'",
+    "UPDATE catalog_skus SET suppression_reason='intentional' WHERE source_variant_id='47761881301179'",
+    "UPDATE catalog_products SET source_ref='other-source' WHERE product_key='ext:missha-pdrn-peel-shot::3595c15f'",
+])
+async def test_changed_listing_or_identity_is_not_repriced_or_stamped(scoped_db,mutation):
+    from services import external_offer_dual_write as mod
+    await _load(scoped_db)
+    read = next(r for r in await scoped_db.fetch_all(mod.ATTACHED_LISTING_OFFERS_SQL,{'product_key':PK})
+                if r['offer_id']=='of_v1')
+    values = {'offer_id':'of_v1','price':22.7,'currency':'USD',
+              **{k:read[k] for k in ('read_offer','read_sku','read_product')}}
+    await scoped_db.execute(mutation)
+    before = dict(await scoped_db.fetch_one("SELECT to_jsonb(o)::text AS state FROM catalog_offers o WHERE offer_id='of_v1'"))
+    assert await scoped_db.fetch_one(mod.ATTACHED_LISTING_OFFER_UPDATE_SQL,values) is None
+    after = dict(await scoped_db.fetch_one("SELECT to_jsonb(o)::text AS state FROM catalog_offers o WHERE offer_id='of_v1'"))
+    assert before == after
+
+
+async def test_reviewed_repair_stays_untouched_through_real_projection(scoped_db,monkeypatch):
+    await _load(scoped_db)
+    await scoped_db.execute("UPDATE catalog_offers SET offer_payload=offer_payload || jsonb_build_object('price_repair',jsonb_build_object('evidence_hash','reviewed')) WHERE offer_id='of_v1'")
+    before = dict(await scoped_db.fetch_one("SELECT to_jsonb(o)::text AS state FROM catalog_offers o WHERE offer_id='of_v1'"))
+    result = await _sync(monkeypatch,scoped_db)
+    assert result['offers_written'] == 2
+    assert result['offer_skips'] == {'reviewed_price_repair':1,'variant_not_on_seed':1}
+    after = dict(await scoped_db.fetch_one("SELECT to_jsonb(o)::text AS state FROM catalog_offers o WHERE offer_id='of_v1'"))
+    assert before == after
+
+
+async def test_variant_currency_conflict_never_gets_a_fresh_price_clock(scoped_db,monkeypatch):
+    await _load(scoped_db)
+    await scoped_db.execute("UPDATE external_product_seeds SET seed_data=jsonb_set(seed_data,'{variants,1,price_currency}',to_jsonb('EUR'::text)) WHERE id=:id",{'id':SEED_ID})
+    result = await _sync(monkeypatch,scoped_db)
+    assert result['offer_skips']['variant_currency_mismatch'] == 1
+    row = (await _offers(scoped_db))['of_v2']
+    assert float(row['list_price']) == 40 and not row['checked'] and not row['touched']
