@@ -108,6 +108,7 @@ import re
 import json
 import time
 import unicodedata
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -184,6 +185,7 @@ REAP_AGENTIC_PILOT_SCOPE_ENV = "REAP_AGENTIC_PILOT_SCOPE"
 
 
 _SCOPE_POSTURES: set = set()
+_WORKER_QUOTE_TOTAL = ContextVar("reap_worker_quote_total", default=None)
 
 
 def _pilot_scope() -> Optional[Dict[str, Any]]:
@@ -1582,11 +1584,11 @@ async def start_purchase(
         enforce_pilot_scope(
             agent_id=agent_id, merchant_domain=str(scope_item.shop_domain if isinstance(scope_item, CartLinkItem) else scope_item.merchant_domain),
             market_country=str(scope_item.market_country or ""),
-            product_key=str(scope_item.product_key or ""), quantity=quantity,
+            product_key=str(scope_item.product_key or "").strip(), quantity=quantity,
             variant_key=("shopify:" + str(cart_link_line(scope_item.cart_url)[0])
                          if isinstance(scope_item, CartLinkItem) and cart_link_line(scope_item.cart_url)
                          else getattr(scope_item, "variant_key", None)),
-            currency=str(scope_item.currency or "").upper(),
+            currency=str(scope_item.currency or "").strip().upper(),
             total_minor=(scope_item.our_price_minor * quantity
                          if type(scope_item.our_price_minor) is int and type(quantity) is int else None),
         )
@@ -2279,11 +2281,27 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
     handler = _STEPS.get(state)
     if handler is None:  # pragma: no cover — every non-terminal state has a step
         raise RuntimeError(f"no step for purchase state {state!r}")
-    token = rc.worker_provider_permission.set(is_reconciliation_enabled)
+    scope_stopped = False
+    def provider_permission():
+        nonlocal scope_stopped
+        if not is_reconciliation_enabled():
+            return False
+        if state in {"resolving", "needs_enrollment", "quoting"}:
+            try:
+                if not is_create_enabled():
+                    raise PurchaseRefused("create_disabled")
+                _row_scope(row, total_minor=_WORKER_QUOTE_TOTAL.get())
+            except PurchaseRefused:
+                scope_stopped = True
+                return False
+        return True
+    token = rc.worker_provider_permission.set(provider_permission)
     try:
         return await handler(row, worker_id)
     except rc.ProviderOperationStopped:
         fresh = await ledger.get_purchase_internal(str(row["id"])) or row
+        if scope_stopped:
+            return await _pause_precheckout(fresh, worker_id)
         return await _release(fresh, worker_id, error_code=fresh.get("last_error_code") or "reconciliation_disabled")
     finally:
         rc.worker_provider_permission.reset(token)
@@ -3471,11 +3489,17 @@ async def _checkout_from_quote(
     except PurchaseRefused as exc:
         return await _move(row, worker_id, ["quoting"], "refused",
                            refusal_reason=exc.reason, last_error_code=exc.reason, **evidence)
-    checkout = await rc.create_checkout(
-        quote_id=quote_id,
-        enrollment_id=partner_enrollment,
-        return_url=_stage_url(row.get("return_url"), "checkout"),
-    )
+    # This value reaches the client's final pre-stream permission check, including when
+    # configuration changes during AsyncClient entry. Scope always bounds the actual charge.
+    amount_token = _WORKER_QUOTE_TOTAL.set(verdict.total_minor)
+    try:
+        checkout = await rc.create_checkout(
+            quote_id=quote_id,
+            enrollment_id=partner_enrollment,
+            return_url=_stage_url(row.get("return_url"), "checkout"),
+        )
+    finally:
+        _WORKER_QUOTE_TOTAL.reset(amount_token)
     if not checkout.ok:
         detail = str(checkout.error_detail_code or "")
         # Since the 2026-09-25 spec the checkout create's state conflicts are a 409 with the

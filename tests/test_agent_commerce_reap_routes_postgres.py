@@ -1953,7 +1953,7 @@ async def test_every_spelling_of_one_merchant_reaches_the_same_row(client, reque
     row = await ledger.get_purchase_internal(resp.json()["purchase_id"])
     assert row["product_key"] == PRODUCT_KEY and row["variant_key"] == SKU_KEY
     assert row["our_price_minor"] == 4250
-    assert row["merchant_domain"] == requested.lower()
+    assert row["merchant_domain"] == DOMAIN
 
 
 async def test_an_eligibility_row_typed_with_the_www_still_matches(client):
@@ -2968,6 +2968,7 @@ async def test_malformed_pilot_configuration_fails_closed(client, monkeypatch, c
 
 
 async def test_matching_pilot_scope_allows_create_and_later_scope_change_preserves_existing_attempt(client, monkeypatch):
+    monkeypatch.setenv("PIVOTA_ENV", "staging")
     await _seed_all()
     monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "true")
     monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps({
@@ -2996,3 +2997,54 @@ async def test_a_partial_pilot_allowlist_fails_closed(client, monkeypatch, missi
     response = await client.post(f"{BASE}/purchases", json=_body())
     assert response.status_code == 404 and _error(response) == "not_available_on_this_rail", response.text
     assert svc.is_create_enabled() is False
+
+
+@pytest.mark.parametrize("field,value", [("variant_keys", ["other-sku"]), ("currency", "EUR"), ("max_total_minor", 4249)])
+async def test_full_pilot_resolved_scope_precedes_identity_and_consent(client, monkeypatch, field, value):
+    await _seed_all()
+    scope = {"agent_ids": [AGENT], "merchant_domains": [DOMAIN], "markets": ["US"],
+             "product_keys": [PRODUCT_KEY], "quantities": [1], "variant_keys": [SKU_KEY],
+             "currency": "USD", "max_total_minor": 4500}
+    scope[field] = value
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(scope))
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("resolved outside-scope request reached buyer writes")
+    monkeypatch.setattr(routes_reap, "_buyer_id_for", forbidden)
+    monkeypatch.setattr(routes_reap, "_record_consent", forbidden)
+    response = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="bounded-resolved-denied"))
+    assert response.status_code == 404 and _error(response) == "not_available_on_this_rail", response.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+@pytest.mark.parametrize("quantity", [True, 1.0, "1"])
+async def test_authenticated_recovery_preserves_original_coerced_quantity_body(client, monkeypatch, quantity):
+    await _seed_all()
+    body = _body(quantity=1, idempotency_key="legacy-quantity-recover")
+    created = await client.post(f"{BASE}/purchases", json=body)
+    assert created.status_code == 202, created.text
+    original = await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "0")
+    body["quantity"] = quantity
+    recovered = await client.post(f"{BASE}/purchases/recover", json=body)
+    assert recovered.status_code == 200 and recovered.json()["id"] == created.json()["purchase_id"], recovered.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == original
+
+
+@pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
+async def test_full_production_pilot_admits_resolved_primary_route_and_replays(client, monkeypatch, lane):
+    await _seed_atomic_request_lane(monkeypatch, lane)
+    identity = "shopify:50041364447509" if lane == "cart_link" else SKU_KEY
+    scope = {"agent_ids": [AGENT], "merchant_domains": [DOMAIN], "markets": ["US"],
+             "product_keys": [PRODUCT_KEY], "quantities": [1], "variant_keys": [identity],
+             "currency": "USD", "max_total_minor": 4500}
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(scope))
+    body = _body(item_source=lane, merchant_domain=("www." + DOMAIN if lane == "reap_variant" else DOMAIN), idempotency_key="bounded-primary-route")
+    created = await client.post(f"{BASE}/purchases", json=body)
+    assert created.status_code == 202, created.text
+    purchase = await ledger.get_purchase_internal(created.json()["purchase_id"])
+    assert purchase["variant_key"] == identity and purchase["currency"] == "USD"
+    replayed = await client.post(f"{BASE}/purchases", json=body)
+    assert replayed.status_code == 202 and replayed.json()["purchase_id"] == purchase["id"], replayed.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1

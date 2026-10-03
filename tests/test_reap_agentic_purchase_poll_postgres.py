@@ -1103,6 +1103,7 @@ async def test_narrowed_pilot_scope_prevents_queued_provider_work_but_reads_expo
 
 
 async def test_matching_pilot_scope_allows_queued_provider_progress(monkeypatch, reap):
+    monkeypatch.setenv("PIVOTA_ENV", "staging")
     import json
     import db.reap_agentic_ledger as ledger
     purchase = await _start()

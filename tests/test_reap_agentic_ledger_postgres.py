@@ -220,7 +220,7 @@ async def _raw_connection():
 
 async def _run_on(conn, sql: str, params: dict):
     positional, order = _to_positional(sql)
-    params = dict(params, reconciliation_only=params.get("reconciliation_only", 0))
+    params = dict(params, reconciliation_only=params.get("reconciliation_only", 0), pilot_scope=params.get("pilot_scope"), precheckout_enabled=params.get("precheckout_enabled", 1))
     return await conn.fetch(positional, *[params[name] for name in order])
 
 
@@ -1270,7 +1270,7 @@ async def test_the_candidate_select_does_not_offer_already_claimed_rows_on_postg
 
     offered = {
         r["id"]
-        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50, "reconciliation_only": 0})
+        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50, "reconciliation_only": 0, "pilot_scope": None})
     }
     assert free["id"] in offered and held["id"] not in offered
 
@@ -3986,7 +3986,7 @@ async def test_the_stuck_count_can_be_served_by_the_state_poll_index():
     for n in range(5):
         await _mk(buyer_ref=f"bref_{n}")
     positional, order = _to_positional(ledger._COUNT_STUCK_PURCHASES_SQL)
-    params = {"reconciliation_only": 0, "stuck_seconds": 1800, "stuck_grace_seconds": 1980, "stuck_max_age_seconds": 5400}
+    params = {"reconciliation_only": 0, "pilot_scope": None, "stuck_seconds": 1800, "stuck_grace_seconds": 1980, "stuck_max_age_seconds": 5400}
     conn = await _raw_connection()
     try:
         async with conn.transaction():

@@ -884,7 +884,7 @@ async def test_the_candidate_select_does_not_offer_already_claimed_rows():
         if IS_POSTGRES
         else ledger._SELECT_DUE_PURCHASES_SQL_SQLITE
     )
-    offered = {r["id"] for r in await database.fetch_all(sql, {"limit": 50, "reconciliation_only": 0})}
+    offered = {r["id"] for r in await database.fetch_all(sql, {"limit": 50, "reconciliation_only": 0, "pilot_scope": None})}
     assert free["id"] in offered
     assert held["id"] not in offered, (
         "a row somebody already holds must not be offered as a candidate — the claim would "
@@ -928,7 +928,7 @@ async def test_the_claim_statement_refuses_a_row_that_went_terminal_after_the_se
     )
 
     sql = ledger._CLAIM_PURCHASE_SQL if IS_POSTGRES else ledger._CLAIM_PURCHASE_SQL_SQLITE
-    row = await database.fetch_one(sql, {"id": purchase["id"], "worker_id": "worker_a", "reconciliation_only": 0})
+    row = await database.fetch_one(sql, {"id": purchase["id"], "worker_id": "worker_a", "reconciliation_only": 0, "pilot_scope": None})
     assert row is None, (
         "the claim UPDATE must re-check the state: between the candidate SELECT and this "
         "statement the row reached a terminal state, and a poller must never be handed one"

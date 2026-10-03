@@ -360,11 +360,12 @@ async def test_the_requeue_and_fail_sweeps_also_run_with_the_rail_off(monkeypatc
 
     assert report.skipped_disabled == 1
     assert report.requeued == 1
-    assert report.failed_exhausted == 1
+    assert report.failed_exhausted == 0
+    assert report.precheckout_paused == 2
     assert report.claimed == 0
     assert reap.calls == []
     failed = await _get(exhausted)
-    assert failed["state"] == "failed" and failed["buyer_email"] is None
+    assert failed["state"] == "resolving" and failed["attempts"] == 9
     assert (await _get(dead))["claimed_by"] is None
 
 
@@ -422,6 +423,7 @@ async def test_outside_production_step_4_runs_only_against_an_exact_sandbox_host
     Outside production, step 4 needs an exact sandbox host; the sweeps still run either way."""
     await _start()
     monkeypatch.setenv("PIVOTA_ENV", pivota_env)
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", "unrestricted")
     monkeypatch.setenv("REAP_API_BASE_URL", base)
     report = await _run()
     if armed:
@@ -761,7 +763,7 @@ async def test_a_partial_batch_ends_the_sweep_loop(monkeypatch, reap):
         calls.append(limit)
         return [f"id_{n}" for n in range(limit if len(calls) == 1 else 3)]
 
-    async def _shim(max_attempts, *, limit, include_processing=False):
+    async def _shim(max_attempts, *, limit, include_processing=False, precheckout_enabled=True, pilot_scope=None):
         return await _one_full_then_partial(limit=limit, include_processing=include_processing)
 
     monkeypatch.setattr(job.ledger, "fail_exhausted_purchases", _shim)
@@ -810,7 +812,7 @@ async def test_a_row_terminated_before_the_step_reads_it_is_counted_as_terminal(
     purchase_id = await _start()
     real_claim = job.ledger.claim_due_purchases
 
-    async def _claim_then_terminate(worker, *, limit):
+    async def _claim_then_terminate(worker, *, limit, pilot_scope=None):
         rows = await real_claim(worker, limit=limit)
         await ledger.fail_exhausted_purchases(1, limit=10)
         return rows
@@ -1638,7 +1640,7 @@ async def test_the_report_carries_only_integers(reap):
     fields = vars(report)
     assert set(fields) == {
         "requeued", "expired", "failed_exhausted", "processing_over_attempts",
-        "stuck_over_age", "contact_retention_blocked", "checkout_needs_human", "claimed", "advanced", "released", "abandoned_budget",
+        "stuck_over_age", "precheckout_paused", "contact_retention_blocked", "checkout_needs_human", "claimed", "advanced", "released", "abandoned_budget",
         "lost_claim", "terminal", "errors", "skipped_disabled", "duration_ms",
     }
     assert all(isinstance(v, int) for v in fields.values())
@@ -2011,6 +2013,7 @@ async def test_the_stuck_read_is_given_the_windows_the_expire_sweep_was_given(mo
     assert seen["count"] == {
         "stuck_after_seconds": job.STUCK_AFTER_SECONDS,
         "reconciliation_only": False,
+        "pilot_scope": None,
         "max_age_seconds": 7200,
         "enrollment_grace_seconds": 240,
     }
@@ -2212,6 +2215,7 @@ async def test_narrowed_pilot_scope_prevents_queued_provider_work_but_reads_expo
 
 
 async def test_matching_pilot_scope_allows_queued_provider_progress(monkeypatch, reap):
+    monkeypatch.setenv("PIVOTA_ENV", "staging")
     import json
     import db.reap_agentic_ledger as ledger
     purchase = await _start()
