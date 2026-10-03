@@ -302,6 +302,28 @@ def is_already_cart_join(ctx: Optional[Dict[str, Any]]) -> bool:
     return str(ctx.get("join_mode") or "").strip().lower() == "cart_permalink"
 
 
+#: The signed-ctx key a mint stamps when the MERCHANT PURCHASABILITY fact declined the cart for
+#: this merchant x buyer market (`db.merchant_purchasability`, under
+#: MERCHANT_PURCHASABILITY_ENFORCE). ABSENT on every other token, so a token the fact did not
+#: decline is byte-identical to one minted before this key existed.
+PURCHASABILITY_TIER_KEY = "purchasability_tier"
+PURCHASABILITY_BROWSE_ONLY = "browse_only"
+
+
+def is_purchase_declined(ctx: Optional[Dict[str, Any]]) -> bool:
+    """True when the signed token says the mint DECLINED a cart for this merchant x market.
+
+    The mint (routes/agent_shop_gateway offers.resolve) asks the purchasability fact before it
+    builds a cart permalink and, on `browse_only`, signs a PDP with `join_mode: referral_only`.
+    Without this knockout that PDP is exactly the cold population this lane upgrades, so the
+    click would build the very cart the mint refused — a decline that lasted until the click.
+    Like `join_mode`, it rides inside the HMAC, so a click cannot forge it away.
+    """
+    if not isinstance(ctx, dict):
+        return False
+    return str(ctx.get(PURCHASABILITY_TIER_KEY) or "").strip().lower() == PURCHASABILITY_BROWSE_ONLY
+
+
 def evaluate_warm_eligibility(
     *,
     dest: str,
@@ -380,6 +402,11 @@ def evaluate_warm_eligibility(
     # single future writer of a cart-shaped destination_url would silently reopen the defect.
     if is_already_cart_join(ctx) or _is_cart_shaped_path(_path_of(dest)):
         return False, "already_cart"
+    # PURCHASE-DECLINED knockout, last for the same reason as `already_cart`: it counts only
+    # clicks that would otherwise have been warmed. The mint already asked the purchasability
+    # fact and was told `browse_only`; building a cart here would overrule it.
+    if is_purchase_declined(ctx):
+        return False, "purchase_declined"
     return True, eligible_reason
 
 

@@ -884,6 +884,19 @@ def test_the_request_market_edges_into_the_mint_sites_are_request_carriers() -> 
         ("routes/agent_api.py", "_schedule_external_seed_cache_refresh", "request_market"): {"param:market"},
         ("routes/agent_shop_gateway.py", "_build_prefetched_external_seed_wrappers", "request_market"): {
             "call:_request_market_for_multi", "param:payload", "param:request_metadata"},
+        # The connected-card purchasability gate's input — a keyword of its own, so the served
+        # `market` (forbidden below) stays unpassed. From the find_products_multi wrapper, and
+        # from the find_products / get_product_detail handlers' own `request_market`.
+        ("routes/agent_shop_gateway.py", "_attach_connected_product_redirects", "request_market"): {
+            "call:_request_market_for_multi", "param:payload", "param:request_metadata",
+            "param:request_market"},
+        # ...which the invoke door reads off the envelope's metadata (neither payload has a market).
+        ("routes/agent_shop_gateway.py", "_handle_find_products", "request_market"): {
+            "call:_request_market_for_multi", "call:_normalize_gateway_request_metadata",
+            "request.metadata", "request.payload"},
+        ("routes/agent_shop_gateway.py", "_handle_get_product_detail", "request_market"): {
+            "call:_request_market_for_multi", "call:_normalize_gateway_request_metadata",
+            "request.metadata", "request.payload"},
     }
     forbidden_kw = {
         ("routes/agent_shop_gateway.py", "_attach_connected_product_redirects", "market"),
@@ -905,3 +918,43 @@ def test_the_request_market_edges_into_the_mint_sites_are_request_carriers() -> 
                         f"{key}: {ast.unparse(kw.value)} resolves to {sorted(leaves)}"
                     )
     assert seen_edges == set(allowed), set(allowed) - seen_edges
+
+
+# ── the purchasability gate's market, at every construction site ─────────────────────────────
+#
+# `_CartPurchasabilityGate(market)` decides whether a mint may build a cart, keyed on the fact for
+# (cart host, market). A served / row / defaulted market here answers a non-US buyer with the US
+# fact, exactly the failure the provenance guard above exists for — so the same resolution runs on
+# its argument, against an EXACT list: a site added, removed or moved fails.
+
+#: enclosing function path -> the leaves the gate's market argument must resolve to
+_GATE_SITES: Dict[str, Set[str]] = {
+    "_handle_offers_resolve": {"payload.market"},
+    "mint_external_seed_links": {"body.market"},
+    "_handle_find_products_multi_inner": {
+        "call:_request_market_for_multi", "param:payload", "param:request_metadata"},
+    "_build_prefetched_external_seed_wrappers": {
+        "call:_request_market_for_multi", "param:request_market", "param:request_metadata"},
+    "_attach_connected_product_redirects": {"param:request_market"},
+}
+
+
+def test_every_purchasability_gate_is_built_on_the_request_market() -> None:
+    tree = ast.parse((ROOT / "routes/agent_shop_gateway.py").read_text())
+    found: Dict[str, Set[str]] = {}
+    for node, chain in _functions_chain(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_CartPurchasabilityGate"):
+            continue
+        where = "/".join(f.name for f in chain)
+        assert where not in found, f"{where}: a second gate in one lane splits its per-host memo"
+        assert len(node.args) == 1 and not node.keywords, ast.unparse(node)
+        found[where] = _leaves(node.args[0], chain)
+    assert found == _GATE_SITES
+
+
+def test_no_other_mint_file_builds_a_purchasability_gate() -> None:
+    for rel in _MINT_FILES:
+        if rel == "routes/agent_shop_gateway.py":
+            continue
+        assert "_CartPurchasabilityGate" not in (ROOT / rel).read_text(), rel
