@@ -23,7 +23,7 @@ schedule:
 | Job | Lane | Writer (the only proof logic) | Writes | Valid for | Schedule (UTC) |
 |---|---|---|---|---|---|
 | `reap-cart-proof-enrichment` | `enrichment` | `jobs/enrichment_cart_variant_proof.py` (#2464) | `enrichment_cart_variant_proofs`, one row per (product_key, sku_key): `ok` or a recorded refusal | 72 h | 06:41 daily |
-| `reap-cart-proof-mirror` | `mirror` | `scripts/backfill_shopify_variant_ids.py` (#2459) | `external_product_seeds.seed_data.snapshot.shopify_cart_proof` (sole or named variant; JSON `null` revokes), plus stamped variant ids | 7 days | 10:13 daily |
+| `reap-cart-proof-mirror` | `mirror` | `scripts/backfill_shopify_variant_ids.py` (#2459) | `external_product_seeds.seed_data.snapshot.shopify_cart_proof` and `shopify_cart_variant_proofs` (sole or named variant; JSON `null` revokes), plus stamped variant ids | 7 days | 10:13 daily |
 
 | Piece | Where |
 |---|---|
@@ -482,3 +482,20 @@ only not coincided with.
 
 `tests/test_setup_reap_cart_proof_jobs.py` re-derives the neighbour windows from their scripts (and
 pins the two live-only ones) and fails if a schedule or timeout moves into one.
+
+
+Buyer-selected multi-variant mirror products
+-------------------------------------------
+
+A named catalog SKU may use `snapshot.shopify_cart_variant_proofs[shopify_variant_id]`.
+The existing mirror writer authors all selector proofs from one complete products.js response,
+records the response time, and replaces the map on every successful fetch to revoke removed,
+unavailable or contradictory choices. The reader checks the source, same product URL, host,
+freshness, selected identity and captured-id agreement. A selector proof never prices a product
+placeholder: each size still needs its own catalog offer, and the Reap quote must reconcile
+that price before a buyer can approve payment. The no-selector sole-variant rule is unchanged.
+
+For the KraveBeauty Matcha cleanser staging check, the stored mirror SKUs use `::v::` keys,
+not the enrichment lane's `::v:` keys. Both SKU rows exist, but their own offers and storefront
+proofs are absent, and US Tier B eligibility has expired. Refresh remains subject to the hard
+gate above; never stamp a proof timestamp or eligibility clock without measuring it.

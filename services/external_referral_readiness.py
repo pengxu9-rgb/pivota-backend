@@ -1773,7 +1773,9 @@ def refresh_queue_tier(*, is_fresh: bool, market: Any, price_currency: Any) -> T
     return (1 if is_fresh else 0, 0 if served_currency else 1)
 
 
-async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> List[str]:
+async def get_external_referral_refresh_candidate_seed_ids(
+    limit: int = 500, *, seed_ids: Optional[Sequence[str]] = None, market: Optional[str] = None
+) -> List[str]:
     """Which seeds the nightly refresh re-reads, in order: served and stale first.
 
     THE QUEUE USED TO SKIP UNATTACHED SEEDS. (The 2026-09-28 census found 0 served unattached seeds
@@ -1801,6 +1803,28 @@ async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> 
     """
     normalized_limit = max(1, min(int(limit or 500), _CANDIDATE_LIMIT_CAP))
     fresh_cutoff = datetime.now(timezone.utc) - timedelta(hours=_refresh_fresh_hours())
+    scope_sql = ""
+    scope_values: Dict[str, Any] = {"fresh_cutoff": fresh_cutoff}
+    if seed_ids is not None:
+        # Targeted operator handoff accepts only stored IDs, never URLs. Reapply the same
+        # suppression/quarantine/status guards after planning, rather than trusting a manifest.
+        ids = list(dict.fromkeys(seed_ids))
+        if len(ids) > 200 or any(not isinstance(s, str) or not s or len(s) > 255 for s in ids):
+            raise ValueError("invalid_targeted_refresh_seed_ids")
+        if not ids:
+            return []
+        expected = seed_serving_currency(market)
+        if not market or not expected:
+            raise ValueError("targeted_refresh_requires_market")
+        tokens = []
+        for index, seed_id in enumerate(ids):
+            name = f"refresh_seed_{index}"
+            tokens.append(f":{name}")
+            scope_values[name] = seed_id
+        scope_sql = f"AND id IN ({', '.join(tokens)}) AND upper(trim(market)) = :refresh_market " \
+                    "AND (price_currency IS NULL OR btrim(price_currency) = '' " \
+                    "OR upper(trim(price_currency)) = :refresh_currency)"
+        scope_values.update(refresh_market=str(market).strip().upper(), refresh_currency=expected)
     rows = await database.fetch_all(
         f"""
         SELECT id, market, price_currency,
@@ -1810,9 +1834,10 @@ async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> 
         WHERE status = 'active'
         {SEED_SUPPRESSED_PRODUCT_ANTI_JOIN}
         {build_seed_quarantine_anti_join()}
+        {scope_sql}
         ORDER BY last_crawl_attempt_at ASC NULLS FIRST, last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
         """,
-        {"fresh_cutoff": fresh_cutoff},
+        scope_values,
     )
     ranked: List[Tuple[Tuple[int, int], str]] = []
     for row in rows or []:
@@ -1933,8 +1958,12 @@ async def run_external_referral_refresh_batch(
     ip_throttle_trip_hosts: Optional[int] = None,
     ip_throttle_window_seconds: Optional[float] = None,
     ip_throttle_enabled: Optional[bool] = None,
+    candidate_seed_ids: Optional[Sequence[str]] = None,
+    market: Optional[str] = None,
 ) -> Dict[str, Any]:
-    candidate_seed_ids = await get_external_referral_refresh_candidate_seed_ids(limit=limit)
+    candidate_seed_ids = await get_external_referral_refresh_candidate_seed_ids(
+        limit=limit, **({"seed_ids": candidate_seed_ids, "market": market} if candidate_seed_ids is not None else {})
+    )
     # THE IP BREAKER, beside the per-host one and for a different failure. The per-host breaker
     # sees one host's streak; on 09-30 Shopify's shared edge throttled our one egress IP across
     # 331 hosts at once, and the per-host breaker tripped 261 times, one host at a time, while the

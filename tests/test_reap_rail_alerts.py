@@ -497,6 +497,33 @@ async def test_disarmed_reconciliation_remains_monitored_without_new_work(filter
     }
 
 
+@pytest.mark.parametrize("how", ["unset", "off"])
+async def test_disarmed_reconciliation_remains_monitored_without_new_work(filters, monkeypatch, reap, how):
+    from test_reap_agentic_purchase import _ok
+    live = await _start(buyer_ref="bref_live")
+    old = await _start(buyer_ref="bref_old")
+    await _park(old, "processing", 99999, reap_checkout_id="chk_dark")
+    if how == "unset":
+        monkeypatch.delenv("REAP_AGENTIC_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    reap.get_checkout = _ok({"status": "PROCESSING"})
+    reap.calls.clear()
+    with worker_log() as lines:
+        for tick in range(3):
+            await _raw("UPDATE reap_agentic_purchases SET next_poll_at = CURRENT_TIMESTAMP WHERE id = :id", {"id": old})
+            report = await _run(worker_id=f"disarmed-{tick}")
+            assert report.skipped_disabled == 1 and report.claimed == 1
+    assert reap.sequence() == ["get_checkout"] * 3
+    assert (await _get(live))["state"] == "resolving"
+    assert _counts(filters, lines) == {
+        "reap_agentic_poll_report": 3, "reap_agentic_poll_stuck": 3,
+        "reap_agentic_poll_failing": 0,
+    }
+
+
 async def test_an_armed_staging_pointed_at_a_real_host_is_failing_not_silent(
     filters, monkeypatch, reap
 ):

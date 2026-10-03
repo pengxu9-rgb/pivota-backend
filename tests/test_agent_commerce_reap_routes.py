@@ -247,6 +247,8 @@ async def _db():
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
+    monkeypatch.delenv("REAP_AGENTIC_CREATE_ENABLED", raising=False)
+    monkeypatch.delenv("REAP_AGENTIC_PILOT_SCOPE", raising=False)
     monkeypatch.setenv("REAP_AGENTIC_ENABLED", "1")
     monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
     monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
@@ -1658,7 +1660,7 @@ async def test_a_replay_reports_the_purchases_real_state(client):
     assert second.json()["status"] == "quoting"
 
 
-async def test_an_expired_idempotency_key_starts_a_new_purchase(client):
+async def test_an_old_idempotency_key_replays_the_same_purchase(client):
     await _seed_all()
     first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="k-1"))
     await database.execute(
@@ -1666,7 +1668,7 @@ async def test_an_expired_idempotency_key_starts_a_new_purchase(client):
         {"old": datetime.now(timezone.utc) - timedelta(hours=48)},
     )
     second = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="k-1"))
-    assert second.json()["purchase_id"] != first.json()["purchase_id"]
+    assert second.json()["purchase_id"] == first.json()["purchase_id"]
 
 
 # ── ownership ────────────────────────────────────────────────────────────────────────────────
@@ -3114,10 +3116,8 @@ async def test_a_claim_that_loses_to_a_refusal_abandons_the_purchase_it_opened(
     assert rows[0]["buyer_email"] is None and rows[0]["shipping_address"] is None
 
 
-async def test_a_key_past_its_window_is_replaced_so_the_next_retry_replays(client):
-    """R3. After 24 h a key is forgotten -- but its row used to be forgotten FOR GOOD: the INSERT hit
-    the primary key, the re-read ignored the stale row, and every later retry opened another
-    purchase. Now the claim replaces the stale row and the next retry replays."""
+async def test_a_lifetime_key_replays_without_replacement(client):
+    """An aged key must retain the same purchase and request fingerprint."""
     await _seed_all()
     first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-old"))
     assert first.status_code == 202
@@ -3126,16 +3126,16 @@ async def test_a_key_past_its_window_is_replaced_so_the_next_retry_replays(clien
         "WHERE idempotency_key = 'K-old'")
     second = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-old"))
     assert second.status_code == 202
-    assert second.json()["purchase_id"] != first.json()["purchase_id"]
+    assert second.json()["purchase_id"] == first.json()["purchase_id"]
     third = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-old"))
     assert third.json()["purchase_id"] == second.json()["purchase_id"]
-    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 2
-    # A LIVE key is never overwritten by the upsert: a different body is still a conflict.
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+    # An immutable key is never overwritten by the upsert: a different body is still a conflict.
     fourth = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-old", quantity=2))
     assert _error(fourth) == "idempotency_conflict"
 
 
-async def test_a_stale_tombstone_is_replaced_too(client):
+async def test_an_old_refusal_requires_a_new_intentional_key(client):
     await _seed_catalog()
     await _seed_link()
     assert _error(await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-t"))) == \
@@ -3145,8 +3145,10 @@ async def test_a_stale_tombstone_is_replaced_too(client):
         "WHERE idempotency_key = 'K-t'")
     await _seed_eligibility()
     resp = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-t"))
+    assert _error(resp) == "merchant_not_eligible"
+    resp = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-new"))
     assert resp.status_code == 202, resp.text
-    again = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-t"))
+    again = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-new"))
     assert again.json()["purchase_id"] == resp.json()["purchase_id"]
 
 
@@ -4022,3 +4024,291 @@ async def test_disarmed_status_read_retains_identity_checks_and_has_no_provider_
     CALLER.agent_user_ref = None
     denied = await client.get(f"{BASE}/purchases/{purchase_id}")
     assert denied.status_code == 401 and _error(denied) == "agent_user_required"
+
+
+
+
+# Durable recovery never opens another checkout or refreshes identity/consent.
+@pytest.mark.parametrize("state", ["awaiting_approval", "processing", "completed"])
+async def test_recovery_after_25_days_is_read_only_while_create_is_paused(client, monkeypatch, state):
+    await _seed_all()
+    body = _body(idempotency_key="recover-old")
+    first = await client.post(f"{BASE}/purchases", json=body)
+    purchase_id = first.json()["purchase_id"]
+    old = datetime.now(timezone.utc) - timedelta(days=25)
+    await database.execute("UPDATE reap_agentic_purchase_keys SET created_at=:old", {"old": old})
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET state=:state, reap_checkout_id=:checkout WHERE id=:id",
+        {"state": state, "checkout": "synthetic-paid-checkout", "id": purchase_id})
+    key_before = dict(await database.fetch_one("SELECT * FROM reap_agentic_purchase_keys"))
+    purchase_before = dict(await database.fetch_one("SELECT * FROM reap_agentic_purchases WHERE id=:id", {"id": purchase_id}))
+    monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    monkeypatch.delenv("REAP_API_KEY", raising=False)
+    monkeypatch.setenv("REAP_CART_LINK_ENABLED", "0")
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("read-only recovery attempted a write or create")
+    monkeypatch.setattr(database, "execute", forbidden)
+    monkeypatch.setattr(routes_reap, "_record_consent", forbidden)
+    monkeypatch.setattr(routes_reap, "_buyer_id_for", forbidden)
+    monkeypatch.setattr(svc, "start_purchase", forbidden)
+    for _ in range(2):
+        recovered = await client.post(f"{BASE}/purchases/recover", json=body)
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["id"] == purchase_id
+        assert recovered.json()["state"] == state
+        for pii in PII_STRINGS:
+            assert pii not in recovered.text
+    assert dict(await database.fetch_one("SELECT * FROM reap_agentic_purchase_keys")) == key_before
+    assert dict(await database.fetch_one("SELECT * FROM reap_agentic_purchases WHERE id=:id", {"id": purchase_id})) == purchase_before
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+
+
+@pytest.mark.parametrize("state", ["awaiting_approval", "processing", "completed"])
+async def test_create_after_25_days_replays_even_a_possibly_paid_attempt(client, monkeypatch, state):
+    await _seed_all()
+    body = _body(idempotency_key="create-lifetime")
+    first = await client.post(f"{BASE}/purchases", json=body)
+    purchase_id = first.json()["purchase_id"]
+    await database.execute("UPDATE reap_agentic_purchase_keys SET created_at=:old",
+                           {"old": datetime.now(timezone.utc) - timedelta(days=25)})
+    await database.execute("UPDATE reap_agentic_purchases SET state=:state, reap_checkout_id=:checkout WHERE id=:id",
+                           {"state": state, "checkout": "synthetic-checkout", "id": purchase_id})
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("lifetime replay started a new purchase")
+    monkeypatch.setattr(svc, "start_purchase", forbidden)
+    again = await client.post(f"{BASE}/purchases", json=body)
+    assert again.status_code == 202, again.text
+    assert again.json()["purchase_id"] == purchase_id
+    assert again.json()["status"] == state
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+    conflict = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="create-lifetime", quantity=2))
+    assert conflict.status_code == 409 and _error(conflict) == "idempotency_conflict"
+
+
+@pytest.mark.parametrize("changed", ["quantity", "address", "variant", "source", "offer", "return_url"])
+async def test_recovery_requires_the_original_request_fingerprint(client, monkeypatch, changed):
+    await _seed_all()
+    body = _body(idempotency_key="recover-fingerprint")
+    assert (await client.post(f"{BASE}/purchases", json=body)).status_code == 202
+    monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    if changed == "quantity":
+        body["quantity"] = 2
+    elif changed == "address":
+        body["buyer"]["shipping_address"]["addressLine1"] = "1 Other Street"
+    elif changed == "variant":
+        body["variant_key"] = SECOND_SKU_KEY
+    elif changed == "source":
+        body["item_source"] = "cart_link"
+    elif changed == "offer":
+        body["offer_code"] = "BUYER-CODE"
+    else:
+        body["return_url"] = "https://shop.example/reap/changed"
+    response = await client.post(f"{BASE}/purchases/recover", json=body)
+    assert response.status_code == 409 and _error(response) == "idempotency_conflict", response.text
+
+
+@pytest.mark.parametrize("owner", ["agent", "buyer", "missing_user"])
+async def test_recovery_keeps_the_existing_identity_and_owner_checks(client, owner):
+    await _seed_all()
+    body = _body(idempotency_key="recover-owner")
+    assert (await client.post(f"{BASE}/purchases", json=body)).status_code == 202
+    if owner == "agent":
+        CALLER.agent_id = OTHER_AGENT
+    elif owner == "buyer":
+        CALLER.agent_user_ref = OTHER_USER_REF
+    else:
+        CALLER.agent_user_ref = None
+    response = await client.post(f"{BASE}/purchases/recover", json=body)
+    assert response.status_code == (401 if owner == "missing_user" else 404), response.text
+
+
+@pytest.mark.parametrize("key", [None, "", "   "])
+async def test_recovery_requires_an_opaque_attempt_key(client, key):
+    response = await client.post(f"{BASE}/purchases/recover", json=_body(idempotency_key=key))
+    assert response.status_code == 400, response.text
+
+
+@pytest.mark.parametrize("mapping", ["missing", "tombstone", "deleted", "unowned", "unverifiable"])
+async def test_recovery_missing_or_unverifiable_evidence_cannot_create(client, monkeypatch, mapping):
+    body = _body(idempotency_key="recover-evidence")
+    if mapping == "tombstone":
+        await _seed_catalog()
+        await _seed_link()
+        assert _error(await client.post(f"{BASE}/purchases", json=body)) == "merchant_not_eligible"
+    elif mapping != "missing":
+        await _seed_all()
+        assert (await client.post(f"{BASE}/purchases", json=body)).status_code == 202
+        if mapping == "deleted":
+            await database.execute("DELETE FROM reap_agentic_purchases")
+        elif mapping == "unowned":
+            await database.execute("UPDATE reap_agentic_purchases SET agent_id=:agent", {"agent": OTHER_AGENT})
+        else:
+            await database.execute("UPDATE reap_agentic_purchase_keys SET request_hash=''")
+    monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    response = await client.post(f"{BASE}/purchases/recover", json=body)
+    expected = 409 if mapping == "unverifiable" else 404
+    assert response.status_code == expected, response.text
+    if mapping == "unverifiable":
+        assert _error(response) == "idempotency_conflict"
+    if mapping in {"deleted", "unowned"}:
+        monkeypatch.setenv("REAP_AGENTIC_ENABLED", "1")
+        replay = await client.post(f"{BASE}/purchases", json=body)
+        assert replay.status_code == 404, replay.text
+
+
+async def test_an_aged_key_cannot_be_overwritten_at_the_sql_write_seam(client):
+    await _seed_all()
+    assert (await client.post(f"{BASE}/purchases", json=_body(idempotency_key="immutable-seam"))).status_code == 202
+    await database.execute("UPDATE reap_agentic_purchase_keys SET created_at=:old",
+                           {"old": datetime.now(timezone.utc) - timedelta(days=25)})
+    before = dict(await database.fetch_one("SELECT * FROM reap_agentic_purchase_keys"))
+    landed = await routes_reap._write_idempotency_key(
+        agent_id=AGENT, agent_user_ref_hash=hash_agent_user_ref(USER_REF),
+        idempotency_key="immutable-seam", purchase_id="replacement-forbidden", request_hash="x"*64)
+    assert landed is False
+    assert dict(await database.fetch_one("SELECT * FROM reap_agentic_purchase_keys")) == before
+
+
+async def test_recovery_accepts_a_new_valid_consent_tag_without_rewriting_original_consent(client, monkeypatch):
+    await _seed_all()
+    body = _body(idempotency_key="recover-consent", buyer=_buyer(consent_version="v1"))
+    purchase_id = (await client.post(f"{BASE}/purchases", json=body)).json()["purchase_id"]
+    buyer_before = dict(await database.fetch_one("SELECT * FROM reap_agentic_buyer_refs"))
+    original = dict(await database.fetch_one("SELECT consent_version, consented_at FROM reap_agentic_purchases WHERE id=:id", {"id": purchase_id}))
+    monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    body["buyer"]["consent_version"] = "v2"
+    response = await client.post(f"{BASE}/purchases/recover", json=body)
+    assert response.status_code == 200 and response.json()["id"] == purchase_id, response.text
+    assert response.json()["consent_version"] == "v1"
+    assert dict(await database.fetch_one("SELECT * FROM reap_agentic_buyer_refs")) == buyer_before
+    assert dict(await database.fetch_one("SELECT consent_version, consented_at FROM reap_agentic_purchases WHERE id=:id", {"id": purchase_id})) == original
+
+
+async def test_recovery_does_not_silently_recompute_a_changed_default_return_url(client, monkeypatch):
+    await _seed_all()
+    body = _body(idempotency_key="recover-return-default")
+    assert (await client.post(f"{BASE}/purchases", json=body)).status_code == 202
+    monkeypatch.setenv("REAP_AGENTIC_RETURN_URL", "https://shop.example/reap/changed")
+    response = await client.post(f"{BASE}/purchases/recover", json=body)
+    assert response.status_code == 409 and _error(response) == "idempotency_conflict", response.text
+
+
+@pytest.mark.parametrize("flag", ["0", "false", "", "ture", "arbitrary"])
+async def test_create_only_pause_precedes_buyer_writes_and_preserves_read_recovery(client, monkeypatch, flag):
+    await _seed_all()
+    body = _body(idempotency_key="pilot-pause-read")
+    purchase_id = (await client.post(f"{BASE}/purchases", json=body)).json()["purchase_id"]
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", flag)
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("paused create reached a buyer write")
+    monkeypatch.setattr(routes_reap, "_buyer_id_for", forbidden)
+    monkeypatch.setattr(routes_reap, "_record_consent", forbidden)
+    response = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pilot-new"))
+    assert response.status_code == 404 and _error(response) == "create_disabled", response.text
+    assert (await client.get(f"{BASE}/purchases/{purchase_id}")).status_code == 200
+    recovered = await client.post(f"{BASE}/purchases/recover", json=body)
+    assert recovered.status_code == 200 and recovered.json()["id"] == purchase_id
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+
+
+@pytest.mark.parametrize("field,value", [
+    ("agent_ids", "other-agent"), ("merchant_domains", "other.example"),
+    ("markets", "CA"), ("product_keys", "other-product"), ("quantities", 2),
+])
+async def test_exact_pilot_scope_refuses_each_wrong_dimension_before_buyer_writes(client, monkeypatch, field, value):
+    await _seed_all()
+    scope = {"agent_ids": [AGENT], "merchant_domains": [DOMAIN], "markets": ["US"],
+             "product_keys": [PRODUCT_KEY], "quantities": [1]}
+    scope[field] = [value]
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(scope))
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("outside-pilot request reached buyer writes")
+    monkeypatch.setattr(routes_reap, "_buyer_id_for", forbidden)
+    monkeypatch.setattr(routes_reap, "_record_consent", forbidden)
+    response = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="pilot-denied"))
+    assert response.status_code == 404 and _error(response) == "pilot_scope_refused", response.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 0
+
+
+@pytest.mark.parametrize("configured", ["", "not-json", "null", "[]", "{}", '{"unknown":[1]}',
+    '{"agent_ids":[]}', '{"agent_ids":"x"}', '{"agent_ids":[""]}', '{"agent_ids":[" x"]}',
+    '{"markets":["us"]}', '{"markets":["USA"]}', '{"merchant_domains":["https://brand.example"]}',
+    '{"quantities":[true]}', '{"quantities":[0]}', '{"quantities":[1.0]}',
+    '{"agent_ids":["a"],"agent_ids":["b"]}'])
+async def test_malformed_pilot_configuration_fails_closed(client, monkeypatch, configured):
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", configured)
+    response = await client.post(f"{BASE}/purchases", json=_body())
+    assert response.status_code == 404 and _error(response) == "create_disabled", response.text
+    assert svc.is_create_enabled() is False
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_matching_pilot_scope_allows_create_and_later_scope_change_preserves_existing_attempt(client, monkeypatch):
+    await _seed_all()
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "true")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps({
+        "agent_ids": [AGENT], "merchant_domains": [DOMAIN], "markets": ["US"],
+        "product_keys": [PRODUCT_KEY], "quantities": [1]}))
+    body = _body(idempotency_key="pilot-allowed")
+    created = await client.post(f"{BASE}/purchases", json=body)
+    assert created.status_code == 202, created.text
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps({
+        "agent_ids": ["different-agent"], "merchant_domains": [DOMAIN], "markets": ["US"],
+        "product_keys": [PRODUCT_KEY], "quantities": [1]}))
+    replay = await client.post(f"{BASE}/purchases", json=body)
+    assert replay.status_code == 202 and replay.json()["purchase_id"] == created.json()["purchase_id"]
+    recovered = await client.post(f"{BASE}/purchases/recover", json=body)
+    assert recovered.status_code == 200 and recovered.json()["id"] == created.json()["purchase_id"]
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", "malformed")
+    assert (await client.post(f"{BASE}/purchases/recover", json=body)).status_code == 200
+
+
+@pytest.mark.parametrize("missing", ["agent_ids", "merchant_domains", "markets", "product_keys", "quantities"])
+async def test_a_partial_pilot_allowlist_fails_closed(client, monkeypatch, missing):
+    scope = {"agent_ids": [AGENT], "merchant_domains": [DOMAIN], "markets": ["US"],
+             "product_keys": [PRODUCT_KEY], "quantities": [1]}
+    del scope[missing]
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(scope))
+    response = await client.post(f"{BASE}/purchases", json=_body())
+    assert response.status_code == 404 and _error(response) == "create_disabled", response.text
+    assert svc.is_create_enabled() is False
+
+@pytest.mark.parametrize("selection,expected", [("proven", 202), ("other", 409), ("missing", 409)])
+async def test_explicit_multi_variant_mirror_selection_keeps_proof_authoritative(client, monkeypatch, selection, expected):
+    other_variant = "49819267301654"
+    other_key = f"{LIVE_PK}::v:{other_variant}"
+    await _seed_named_variant_mirror(env="prod", skus=LIVE_PROD_SKUS + ((other_key, other_variant),), seed_data=_named_variant_seed())
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    selected = {"proven": LIVE_SKU_PROMOTED, "other": other_key, "missing": None}[selection]
+    response = await client.post(f"{BASE}/purchases", json={**_live_body(), "variant_key": selected, "idempotency_key": "selected-variant-replay"})
+    assert response.status_code == expected, response.text
+    if expected == 202:
+        row = await _purchase_row(response.json()["purchase_id"])
+        replay = await client.post(f"{BASE}/purchases", json={**_live_body(), "variant_key": selected, "idempotency_key": "selected-variant-replay"})
+        assert replay.status_code == 202 and replay.json()["purchase_id"] == response.json()["purchase_id"]
+        changed = await client.post(f"{BASE}/purchases", json={**_live_body(), "variant_key": other_key, "idempotency_key": "selected-variant-replay"})
+        assert changed.status_code == 409 and _error(changed) == "idempotency_conflict"
+        assert f"/cart/{LIVE_VARIANT}:1?" in row["cart_url"]
+        assert row["our_price_minor"] == 1399
+    else:
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+@pytest.mark.parametrize('choice', [0, 1])
+async def test_two_selected_mirror_sizes_have_independent_proofs_and_prices(client, monkeypatch, choice):
+    from scripts.backfill_shopify_variant_ids import build_selected_variant_proofs
+    second='42199434526795'
+    second_key=f'{KRAVE_PK}::v::{second}'
+    await _seed_krave_mirror(offers=[(KRAVE_REAL, KRAVE_MERCHANT, '16.00'),(second_key, KRAVE_MERCHANT, '27.00')])
+    await database.execute("INSERT INTO catalog_skus (sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency) VALUES (:sk,:pk,:m,'external_seed',:ext,:vid,'2 Pack','USD')", {'sk':second_key,'pk':KRAVE_PK,'m':KRAVE_MERCHANT,'ext':KRAVE_EXT,'vid':second})
+    ids=[KRAVE_VARIANT,second]
+    variants=[{'shopify_variant_id':vid,'variant_id':vid} for vid in ids]
+    payload={'handle':'24-carrot-retinal','variants':[{'id':int(vid),'available':True,'title':title,'price':price} for vid,title,price in zip(ids,['1 Pack','2 Pack'],[1600,2700])]}
+    seed={'snapshot':{'brand':'KraveBeauty','variants':variants,'storefront_platform':'shopify','storefront_platform_source':'products_js_v1','shopify_cart_variant_proofs':build_selected_variant_proofs(variants,payload,js_url=f'https://{KRAVE_DOMAIN}/products/24-carrot-retinal.js',checked_at=datetime.now(timezone.utc))}}
+    await database.execute('UPDATE external_product_seeds SET seed_data=:data WHERE id=:id',{'data':json.dumps(seed),'id':KRAVE_SEED})
+    monkeypatch.setenv('REAP_AGENTIC_CART_LINK_ENABLED','1')
+    response=await client.post(f'{BASE}/purchases',json={**_krave_body(),'variant_key':[KRAVE_REAL,second_key][choice]})
+    assert response.status_code==202,response.text
+    row=await _purchase_row(response.json()['purchase_id'])
+    assert row['our_price_minor']==[1600,2700][choice]
+    assert f'/cart/{ids[choice]}:1?' in row['cart_url']

@@ -1163,7 +1163,7 @@ try/except, because production deploys skip `db/migrations/`.
 |---|---|
 | `reap_agentic_eligibility` | the allowlist. `(merchant_domain, market_country, product_key, variant_key)` |
 | `reap_agentic_buyer_refs` | `buyer_id` → the opaque `owner.id` we send Reap. Minted once, never exposed. Migration **227** adds `consent_version VARCHAR(32)` and `consented_at TIMESTAMPTZ` — the terms the buyer's enrollment was established under, rewritten on every purchase so the pair is always the latest. Nullable only because rows minted before 227 exist; nothing written from now on can be NULL, because the route refuses `consent_required` before it writes. |
-| `reap_agentic_purchase_keys` | idempotency, 24 h, scoped to `(agent_id, agent_user_ref_hash, idempotency_key)`, carrying a hash of the request the key was used for — the same key on a different body is `idempotency_conflict`, not a 202 about somebody else's purchase |
+| `reap_agentic_purchase_keys` | immutable lifetime-attempt idempotency, scoped to `(agent_id, agent_user_ref_hash, idempotency_key)`, carrying a hash of the request the key was used for — the same key on a different body is `idempotency_conflict`, not a 202 about somebody else's purchase |
 
 `reap_buyer_ref` is a **third** identifier, not the global buyer id and not
 `buyer_agent_links.agent_scoped_buyer_ref`. An enrollment is a CARD: an agent-scoped ref would
@@ -1831,3 +1831,43 @@ Source merge does not install or activate cloud policies. Before activation, ins
 chosen environment, read back exact filters and recipient, and confirm actual delivery.
 Do not automatically retry, recreate a checkout, or restore scrubbed contact to clear an alert.
 Queue clearing must follow the authenticated evidence and audit requirements above.
+
+
+### Enrollment links without provider expiry
+
+If Reap omits optional enrollment expiresAt, the purchase carries a stable estimate from the
+originating enrollment attempt created_at plus the existing HOSTED_SESSION_SECONDS policy
+(900 seconds). A reused attempt keeps that deadline; reads and reloads never restamp it.
+An explicit valid provider expiresAt wins. A malformed supplied expiry is refused, rather
+than silently treated as omitted. The originating created_at is available only on internal
+enrollment reads, not in public purchase responses.
+
+For legacy needs_enrollment purchases with NULL deadline, owner GET derives the same estimate
+from the original enrollment row, after checking enrollment ID, buyer_ref and exact stored
+link. No row is changed. Missing/unreadable/wrong-owner provenance or an expired estimate
+withholds the hosted action. Owner data passes public_purchase_view before response building;
+no identity, buyer contact or enrollment ID is added to the public contract.
+
+### Lost response recovery and durable attempt keys
+
+Use authenticated `POST /agent/v2/commerce/reap/purchases/recover` with the original create body and opaque key while creates are paused. The read-only endpoint checks the original canonical request fingerprint and returns the owner view without merchant freshness checks, provider calls or consent/PII writes. Preserve the explicit original return URL: if a caller omitted it and the default changes, fingerprint conflict keeps the attempt uncertain. Never resolve that conflict by creating with a new key until the original outcome is authoritatively reconciled.
+
+Mappings and refusal tombstones are immutable regardless of age, including completed purchases. The old 24-hour rollover is removed from both lookup and SQL insertion. Existing mappings require no migration; historical overwritten mappings cannot be reconstructed by this fix and remain an operator audit gate. Roll out to every create-serving instance before relying on this guarantee; do not delete old keys as cleanup. Normal enabled create replays retain existing consent-write semantics; use recover when a read-only replay is required.
+
+
+### Create pause and complete pilot scope
+
+`REAP_AGENTIC_CREATE_ENABLED` is an optional create-only dial. Unset preserves the master dial's existing behavior. `0`, `false`, an empty string or an unrecognized spelling pauses direct creates before buyer identity/consent/purchase writes and limits the worker to exposed checkout reconciliation. Truthy values require the master dial too. Keep host, credentials, worker scheduling, buyer GET and recover available. The queued resolving/needs_enrollment/quoting states do not make new provider side effects while paused; local abandoned-row/PII retention sweeps still apply.
+
+Optional `REAP_AGENTIC_PILOT_SCOPE` JSON must contain exactly five nonempty arrays: `agent_ids`, `merchant_domains`, `markets`, `product_keys`, `quantities`. Use exact authenticated agent IDs, canonical lower-case merchant domains without www, uppercase two-letter markets, exact product keys and integer quantities. Unknown, missing, duplicate, empty or malformed configuration fails closed for new work. Omit the entire variable to retain existing unrestricted behavior; that is not an exclusive pilot. No live pilot IDs are supplied by this PR.
+
+Fresh API creates enforce all five dimensions before identity/consent writes. Precheckout advance checks stored values and fenced-releases outside-scope rows as `pilot_scope_refused` without provider work; it preserves the attempt rather than failing an uncertain outcome. Scope narrowing never blocks exposed awaiting_approval/processing reconciliation or authenticated GET/recover. Valid-scope normal same-key replays keep the existing purchase even after scope narrowing, while a globally paused create uses the read-only recover route. Deploy this capability everywhere before enabling an explicit scope; web and worker require the same reviewed scope and create-pause settings. Environment changes require the platform's normal service restart/revision process; no live setting was changed here.
+
+Staging acceptance must prove one exact allowlisted request succeeds, each of the five wrong dimensions refuses without buyer/key/purchase writes, partial/malformed scope fails closed, queued out-of-scope rows make no provider calls, and an exposed checkout completes through disarming/narrowing while GET/recover remain readable. No schema migration is required.
+
+
+### Proposed staging cadence acceptance (configuration only)
+
+For the single scoped staging pilot, propose worker `REAP_AGENTIC_POLL_INTERVAL_SECONDS=5`, the existing supported minimum, with the reviewed pilot scope mirrored on web and worker. Keep the global default unchanged. Keep per-row `next_poll_at`, 15-second processing cadence, 30-second approval cadence and transport backoff intact; never claim future-due rows to meet a UI timing target. Service revision/restart is required for the scheduler interval. No live configuration has been changed.
+
+A five-second trigger reduces the extra scheduling quantization of the default 30-second trigger. It does not bound actual lag when serial batches, slow resolution/quote calls, worker downtime or APScheduler max_instances/coalescing skip a trigger. Measure original provider outcome time, actual row claim, advance/release, next_poll_at, backend/gateway read and UI observation timestamps in staging before promising a timing contract. Observe job duration, due-row age, scheduling skips, database statement rate and provider call rate. Increasing empty-tick frequency costs roughly six times the baseline job/DB overhead; provider reads remain governed by per-row due/backoff. Start with one scoped checkout and accept five-second additional trigger lag only while job duration stays below the trigger and the queue stays bounded. If batches exceed five seconds, tune scoped batch volume or isolate expensive precheckout work in a separately reviewed change; do not poll early.
