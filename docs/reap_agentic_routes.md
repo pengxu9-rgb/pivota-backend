@@ -1,6 +1,6 @@
 # `/agent/v2/commerce/reap` — the contract, for the gateway (WP5)
 
-Three routes. `routes/agent_commerce_reap.py` is the implementation and
+Four routes. `routes/agent_commerce_reap.py` is the implementation and
 `docs/runbooks/reap_agentic_purchase.md` is the operational half; this page is the wire.
 
 **New purchases are disabled by default.** The base gate or missing credentials make
@@ -119,7 +119,7 @@ poller drives the state machine afterwards, on another process, over the next mi
 
 | field | required | notes |
 |---|---|---|
-| `item_source` | no (default `reap_variant`) | Set to `cart_link` for Tier B. Choose the source explicitly before the first POST; never retry a refused variant purchase as cart-link. The cart-link lane remains unavailable (404) until `REAP_AGENTIC_CART_LINK_ENABLED` is on (it and `REAP_AGENTIC_ENABLED` are the only switches; the quote uses Reap's published `externalCheckout` body since 2026-09-28). |
+| `item_source` | no (default `reap_variant`) | Set to `cart_link` for Tier B. Choose the source explicitly before the first POST; never retry a refused variant purchase as cart-link. The cart-link lane remains unavailable (404) until `REAP_AGENTIC_CART_LINK_ENABLED` is on (the base and create gates, bounded pilot scope and fresh eligibility/proof checks must also pass; the quote uses Reap's published `externalCheckout` body since 2026-09-28). |
 | `offer_code` | no | the buyer's own offer (coupon) code, either lane: a string of 1..128 characters with at least one non-whitespace character and no control character, sent to Reap **exactly as given** (not trimmed, not upper-cased). Empty, whitespace-only, over-long or control characters ⇒ `400 invalid_offer_code`; a non-string ⇒ `400 invalid_request`. Part of the idempotency hash when present (a retry that adds or changes a code is a different purchase). If Reap refuses the code (`OFFER_CODE_INVALID` / `OFFER_CODE_EXPIRED`) the purchase is re-quoted **once without it** and `offer_code_outcome` says so — tell your user before they approve. |
 | `merchant_domain` | yes | a bare host name, sent as observed (`www.brand.example` or `brand.example`); anything else — a scheme, port, path, userinfo, IP or single label — is `400 invalid_request`. Matched **canonically**: lower case, one leading `www.` removed, so `www.brand.example` and `brand.example` are the same merchant (`wwwbrand.example` is not). Variant lane: must be enabled in `reap_agentic_eligibility`. Cart-link lane: must have a fresh `tierb_cart_link_eligibility` verdict, and builds its cart URL on the host as sent. Both are checked in the buyer's market. |
 | `product_key` | yes | our catalog key (`catalog_products.product_key`). |

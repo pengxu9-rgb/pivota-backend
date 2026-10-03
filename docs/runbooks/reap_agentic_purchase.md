@@ -1095,6 +1095,7 @@ and what the routes decide.
 | `POST /purchases` | opens a purchase and returns `202` at once. **Makes no partner call.** |
 | `GET /purchases/{id}` | the owner's read: state, totals, the current hosted URL, the order reference |
 | `GET /purchases?limit=` | the same, for this buyer's recent purchases |
+| `POST /purchases/recover` | read-only lookup of the original buyer-owned request and key; makes no provider call |
 
 ### Admission gates and original-attempt reads
 

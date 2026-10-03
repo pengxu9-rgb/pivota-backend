@@ -1,6 +1,6 @@
 """The agent-facing door onto the Reap agentic purchase rail (WP4).
 
-Three routes over the machinery WP1–WP3 built. This module owns NO state and makes NO partner
+Four routes over the machinery WP1–WP3 built. This module owns NO state and makes NO partner
 call: it decides whether a purchase may be opened, builds the one `PurchaseRow` that
 `services.reap_agentic_purchase.start_purchase` will trust, and reads rows back to the buyer they
 belong to. Everything that talks to Reap happens later, in the poller, on another process.
