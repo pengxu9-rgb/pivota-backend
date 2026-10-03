@@ -2122,6 +2122,8 @@ async def _still_ours(row: Mapping[str, Any], worker_id: str) -> Optional[Dict[s
         return None
     if str(fresh.get("state") or "") != str(row.get("state") or ""):
         return None
+    if fresh.get("attempts") != row.get("attempts") or fresh.get("claimed_at") != row.get("claimed_at"):
+        return None
     return fresh
 
 
@@ -2299,9 +2301,10 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
     try:
         return await handler(row, worker_id)
     except rc.ProviderOperationStopped:
-        fresh = await ledger.get_purchase_internal(str(row["id"])) or row
         if scope_stopped:
-            return await _pause_precheckout(fresh, worker_id)
+            # Never adopt a replacement claim's counter, state or timestamp after an await.
+            return await _pause_precheckout(row, worker_id)
+        fresh = await ledger.get_purchase_internal(str(row["id"])) or row
         return await _release(fresh, worker_id, error_code=fresh.get("last_error_code") or "reconciliation_disabled")
     finally:
         rc.worker_provider_permission.reset(token)

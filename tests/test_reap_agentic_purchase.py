@@ -5231,3 +5231,88 @@ async def test_pilot_dispatch_permission_uses_authoritative_quote_total(monkeypa
     row = await _get(purchase)
     assert row["reap_checkout_id"] is None and row["claimed_by"] is None
     assert svc._WORKER_QUOTE_TOTAL.get() is None
+
+import db.reap_agentic_ledger as ledger
+
+
+_PILOT_REAL_CREATE_CHECKOUT = rc.create_checkout
+
+
+@pytest.mark.parametrize("replacement", ["same_holder_attempt", "foreign_holder", "same_holder_clock", "exposed_checkout"])
+async def test_scope_pause_actual_dispatch_does_not_adopt_replacement_claim(monkeypatch, reap, replacement):
+    import httpx
+    from db.database import IS_POSTGRES
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_RECONCILE_ENABLED", "1")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot()))
+    purchase = await _start()
+    await _active_enrollment()
+    await database.execute("UPDATE reap_agentic_purchases SET state='quoting' WHERE id=:id", {"id": purchase})
+    assert len(await ledger.claim_due_purchases("fence-worker", pilot_scope=svc.pilot_admission_scope())) == 1
+    captured = {}
+    dispatched = []
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self):
+            if replacement == "same_holder_clock":
+                clock = "claimed_at + INTERVAL '1 second'" if IS_POSTGRES else "datetime(claimed_at, '+1 second')"
+                await database.execute("UPDATE reap_agentic_purchases SET claimed_at=" + clock + " WHERE id=:id", {"id": purchase})
+            elif replacement == "exposed_checkout":
+                await database.execute("UPDATE reap_agentic_purchases SET state='awaiting_approval', reap_checkout_id='replacement-checkout' WHERE id=:id", {"id": purchase})
+            else:
+                holder = "foreign-worker" if replacement == "foreign_holder" else "fence-worker"
+                await database.execute("UPDATE reap_agentic_purchases SET attempts=attempts+1,claimed_by=:holder WHERE id=:id", {"id": purchase, "holder": holder})
+            captured.update(await ledger.get_purchase_internal(purchase))
+            monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "0")
+            return self
+        async def __aexit__(self, *args): return False
+        def stream(self, *args, **kwargs):
+            dispatched.append(args)
+            raise AssertionError("checkout dispatched after a scope stop")
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    monkeypatch.setattr(rc, "create_checkout", _PILOT_REAL_CREATE_CHECKOUT)
+    result = await svc.advance(purchase, "fence-worker")
+    assert dispatched == [] and result.outcome == "lost_claim"
+    after = await ledger.get_purchase_internal(purchase)
+    for field in ["attempts", "claimed_by", "claimed_at", "state", "state_entered_at", "last_error_code", "next_poll_at", "reap_checkout_id"]:
+        assert after[field] == captured[field], field
+
+
+_PILOT_REAL_GET_ENROLLMENT = rc.get_enrollment
+
+
+@pytest.mark.parametrize("state", ["needs_enrollment", "resolving"])
+async def test_scope_pause_attempt_exempt_claim_timestamp_generation(monkeypatch, reap, state):
+    import httpx
+    from db.database import IS_POSTGRES
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_RECONCILE_ENABLED", "1")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot()))
+    purchase = await _start()
+    assert (await _step(purchase)).state == "needs_enrollment"
+    await database.execute("UPDATE reap_agentic_purchases SET state=:state,last_error_code=:error,next_poll_at=CURRENT_TIMESTAMP WHERE id=:id",
+                           {"id": purchase, "state": state, "error": "enrollment_settling" if state == "resolving" else None})
+    original = await ledger.get_purchase_internal(purchase)
+    claimed = await ledger.claim_due_purchases("fence-worker", pilot_scope=svc.pilot_admission_scope())
+    assert len(claimed) == 1 and claimed[0]["attempts"] == original["attempts"]
+    captured = {}
+    dispatched = []
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self):
+            clock = "claimed_at + INTERVAL '1 second'" if IS_POSTGRES else "datetime(claimed_at, '+1 second')"
+            await database.execute("UPDATE reap_agentic_purchases SET claimed_at=" + clock + " WHERE id=:id", {"id": purchase})
+            captured.update(await ledger.get_purchase_internal(purchase))
+            monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "0")
+            return self
+        async def __aexit__(self, *args): return False
+        def stream(self, *args, **kwargs):
+            dispatched.append(args)
+            raise AssertionError("enrollment GET dispatched after scope stop")
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    monkeypatch.setattr(rc, "get_enrollment", _PILOT_REAL_GET_ENROLLMENT)
+    result = await svc.advance(purchase, "fence-worker")
+    assert dispatched == [] and result.outcome == "lost_claim"
+    after = await ledger.get_purchase_internal(purchase)
+    for field in ["attempts", "claimed_by", "claimed_at", "state", "last_error_code", "next_poll_at"]:
+        assert after[field] == captured[field], field

@@ -2009,6 +2009,7 @@ _RELEASE_PAUSED_CLAIM_SQL = """
                        AND NOT (state = 'resolving' AND COALESCE(last_error_code,'') = 'enrollment_settling')
                      THEN attempts - 1 ELSE attempts END
      WHERE id = :id AND claimed_by = :worker_id AND state = :state AND attempts = :attempts
+       AND claimed_at = :claimed_at
     RETURNING *
 """
 
@@ -2020,12 +2021,13 @@ _RELEASE_PAUSED_CLAIM_SQL_SQLITE = """
                        AND NOT (state = 'resolving' AND COALESCE(last_error_code,'') = 'enrollment_settling')
                      THEN attempts - 1 ELSE attempts END
      WHERE id = :id AND claimed_by = :worker_id AND state = :state AND attempts = :attempts
+       AND julianday(claimed_at) = julianday(:claimed_at)
     RETURNING *
 """
 
 async def release_paused_claim(row, worker_id):
     _require_worker_id(worker_id, "worker_id")
-    params = {"id": str(row["id"]), "worker_id": worker_id, "state": str(row["state"]), "attempts": row["attempts"]}
+    params = {"id": str(row["id"]), "worker_id": worker_id, "state": str(row["state"]), "attempts": row["attempts"], "claimed_at": row.get("claimed_at")}
     if IS_POSTGRES:
         released = await database.fetch_one(_RELEASE_PAUSED_CLAIM_SQL, params)
     else:
