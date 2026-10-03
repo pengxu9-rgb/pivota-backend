@@ -637,11 +637,17 @@ reported at least once more.
    everything else and exits 1 naming it. The nine existing policies are written before the Reap
    ones are attempted, and a Reap policy that already exists is replaced only after its
    replacement was accepted, so a deferred run leaves nothing worse than it found it.
-5. **The script exits 1 on a successful run today**, with `WARNING: channel is 'UNSET', not
-   VERIFIED` and `FAILED: alerts are configured but the channel cannot receive them`: the prod
-   email channels report no `verificationStatus`. That is existing behaviour and is not caused by
-   these policies; judge the run by the `policies: 12` list, and treat the channel warning as the
-   separate open question it already was.
+5. **Separate channel API state from actual delivery.** The script reads and validates the exact
+   enabled email channel after both create and reuse. Failed, missing, malformed or error responses,
+   mismatched resources/recipients and disabled channels stop the run before policy reconciliation.
+   Explicit `UNVERIFIED` requires verification and stops the run before uptime, metric or policy
+   reconciliation. An omitted status or
+   `VERIFICATION_STATUS_UNSPECIFIED` can mean verification is not required; it is not evidence of
+   delivery failure or receipt. [Google's channel API contract](https://docs.cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.notificationChannels)
+   distinguishes these states. Before marking delivery ready, use an authorized, isolated controlled
+   notification and confirm receipt with the intended person. Do not infer delivery from a channel
+   creation response, a `VERIFIED` field, the policy count, or an incident alone. Requesting a
+   verification email is a separate send and must not silently replace or add to an authorized test.
 
 ---
 
@@ -1847,7 +1853,21 @@ Only checkout-backed `awaiting_approval`/`processing` rows explicitly classified
 
 Migration 253 and both startup self-heal dialects create `reap_checkout_manual_resolution_audit`. It stores one decision per purchase: checkout, original state/version, terminal status, operator/evidence handles, verified source, observed time/origin and normalized evidence SHA256. It stores no full provider body or buyer contact. The audit append, conditional terminal decision, terminal lease clearing, click claim and attribution edge call share one short database transaction; unexpected failures or suppression roll back that unit. A deterministic existing merchant-channel click claim is legitimate: completion keeps `attribution_closed_by_other_channel`, preserves that claim, writes no Reap edge, and audits `attribution_outcome=closed_by_other_channel`. Other completions audit `edge_closed` only after rereading the durable attribution edge and checking exact merchant, external and synthetic order, amount/currency, click/agent, converted source/state and the purchase/checkout partner provenance. A synthesized close receipt after `ON CONFLICT DO NOTHING` is insufficient: a missing edge or conflicting existing order slot rolls back the terminal outcome and audit without overwriting the edge. Failed/expired decisions audit `not_applicable`. Ancillary commerce event/interaction emission retains its existing best-effort semantics and requires a separate receipt check; this primitive does not promise those receipts exist. Exact-evidence replay is read-only and cannot create another audit or edge. Do not delete the audit table when rolling back runtime code; removing this function leaves classified rows safely unresolved.
 
-`contact_retention_blocked` is a separate owner/operator queue, covering privacy-held resolving, needs_enrollment and quoting work. Resuming flags does not restore discarded contact or mint another checkout. An operator must inspect whether an external checkout may exist and use a separately reviewed recovery/contact-reauthorization procedure; there is no automatic quoting cleanup or blind retry. `checkout_needs_human` is a separate payment uncertainty queue. The existing three metrics match heartbeat, ordinary stuck and errors only: before arming, these two cohorts need an explicitly owned, reviewed alert/runbook. No cloud policy is created or enabled by this source change.
+`contact_retention_blocked` is a separate owner/operator queue, covering privacy-held resolving, needs_enrollment and quoting work. Resuming flags does not restore discarded contact or mint another checkout. An operator must inspect whether an external checkout may exist and use a separately reviewed recovery/contact-reauthorization procedure; there is no automatic quoting cleanup or blind retry. `checkout_needs_human` is a separate payment uncertainty queue. The original three metrics match heartbeat, ordinary stuck and errors only; the dedicated queue alerts below cover these two cohorts. Before arming, install and verify them in the selected environment with an explicitly owned recipient. No cloud policy is created or enabled by source merge.
+
+
+### Dedicated human and privacy queue alerts
+
+The installer now prepares `prod: Reap checkout needs human reconciliation` and
+`prod: Reap buyer contact retention blocked`, with names normalized to the selected environment.
+Each counts its own positive PollReport field on the worker, uses a 900-second window and
+a zero-duration threshold. A zero or unavailable count does not falsely signal a queue; a
+failed diagnostic remains an error alert. These remain separate from ordinary stuck work.
+The policies share the verified configured notification channel and installer retry safeguards.
+Source merge does not install or activate cloud policies. Before activation, install in the
+chosen environment, read back exact filters and recipient, and confirm actual delivery.
+Do not automatically retry, recreate a checkout, or restore scrubbed contact to clear an alert.
+Queue clearing must follow the authenticated evidence and audit requirements above.
 
 
 ### Atomic purchase and immutable key acceptance
@@ -1907,3 +1927,9 @@ A five-second trigger reduces the extra scheduling quantization of the default 3
 
 
 Bounded pilot rollout acceptance: test an admitted stable variant and an explicitly selected cart permalink, then deny each cohort/variant/currency/cap dimension. A quote whose items fit but shipping/tax exceed the cap must create no checkout. Hold each precheckout state outside scope for more than the attempt ceiling, including enrollment settling; attempts and state clocks must remain unchanged, while existing checkout GET reconciliation proceeds. Verify old authenticated recovery bodies remain readable while create is paused. Deploy only after independent review and CI, then verify the actual deployed revisions and primary route without automatic cart, kernel or storefront fallback.
+
+
+For a separately named rehearsal worker, pass `REAP_WORKER_SERVICE_NAME` as its exact Cloud Run
+service name. The default is `worker`; invalid names stop before cloud reads. All five Reap
+log metrics bind that service, so shared staging reports cannot satisfy the rehearsal heartbeat
+or hide its queues. Read back the installed worker selector before activation.
