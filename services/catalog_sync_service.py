@@ -67,6 +67,7 @@ from services.catalog_offer_writer_guard import (
     WriterAuditAccumulator,
     make_batch_id,
     validate_catalog_offer_rows,
+    guard_catalog_offer_rows,
     write_writer_audit_log,
 )
 from services.pdp_lifecycle import compute_lifecycle_stage
@@ -972,6 +973,10 @@ async def _upsert_by_pk(
 ) -> Optional[Dict[str, Any]]:
     table_name = _table_debug_name(table)
     try:
+        if table_name == "catalog_offers":
+            accepted, _, _ = await guard_catalog_offer_rows([values], db=database, require_live_links=True)
+            if not accepted:
+                raise ValueError("invalid_live_catalog_offer_link_or_price")
         pk_value = values[pk_name]
         existing = await _fetch_one_by_pk(table, pk_name, pk_value)
         payload = dict(values)
