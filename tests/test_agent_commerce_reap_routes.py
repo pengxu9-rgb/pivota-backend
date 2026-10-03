@@ -516,15 +516,15 @@ async def test_post_answers_404_while_the_dial_is_off(client, monkeypatch):
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
-async def test_get_answers_404_while_the_dial_is_off(client, monkeypatch):
+async def test_get_recovers_stored_status_while_the_dial_is_off(client, monkeypatch):
     await _seed_all()
     created = await client.post(f"{BASE}/purchases", json=_body())
     purchase_id = created.json()["purchase_id"]
 
     monkeypatch.delenv("REAP_AGENTIC_ENABLED", raising=False)
     resp = await client.get(f"{BASE}/purchases/{purchase_id}")
-    assert resp.status_code == 404
-    assert _error(resp) == "not_available_on_this_rail"
+    assert resp.status_code == 200
+    assert resp.json()["id"] == purchase_id
 
 
 async def test_list_answers_404_while_the_dial_is_off(client, monkeypatch):
@@ -544,11 +544,13 @@ async def test_an_unconfigured_client_is_as_absent_as_a_dial_that_is_off(client,
     for coro in (
         client.post(f"{BASE}/purchases", json=_body()),
         client.get(f"{BASE}/purchases"),
-        client.get(f"{BASE}/purchases/rp_nope"),
     ):
         resp = await coro
         assert resp.status_code == 404
         assert _error(resp) == "not_available_on_this_rail"
+
+    missing = await client.get(f"{BASE}/purchases/rp_nope")
+    assert missing.status_code == 404 and _error(missing) == "purchase_not_found"
 
 
 async def test_cart_link_stays_dark_when_its_dial_is_off(client, monkeypatch):
@@ -3989,3 +3991,34 @@ async def test_a_shopify_row_is_never_priced_from_a_placeholder(client, monkeypa
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
     resp = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link", variant_key=None))
     assert resp.status_code == 409 and _error(resp) == "row_unpriced"
+
+
+@pytest.mark.parametrize("missing_credentials", [False, True])
+async def test_disarmed_status_read_retains_identity_checks_and_has_no_provider_work(client, monkeypatch, missing_credentials):
+    await _seed_all()
+    purchase_id = (await client.post(f"{BASE}/purchases", json=_body())).json()["purchase_id"]
+    monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    if missing_credentials:
+        monkeypatch.delenv("REAP_API_KEY", raising=False)
+    import services.reap_agentic_purchase as purchase_svc
+    import services.reap_agentic_client as reap_client
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("stored status read attempted provider work")
+    monkeypatch.setattr(purchase_svc, "advance", forbidden)
+    for name in ("get_checkout", "create_checkout", "create_enrollment", "request_quote"):
+        monkeypatch.setattr(reap_client, name, forbidden)
+    response = await client.get(f"{BASE}/purchases/{purchase_id}")
+    assert response.status_code == 200 and response.json()["id"] == purchase_id
+    # A create remains dark; neither owner conjunct nor required user session is relaxed.
+    assert (await client.post(f"{BASE}/purchases", json=_body())).status_code == 404
+    CALLER.agent_user_ref = OTHER_USER_REF
+    denied = await client.get(f"{BASE}/purchases/{purchase_id}")
+    assert denied.status_code == 404 and _error(denied) == "purchase_not_found"
+    CALLER.agent_user_ref = USER_REF
+    CALLER.agent_id = OTHER_AGENT
+    denied = await client.get(f"{BASE}/purchases/{purchase_id}")
+    assert denied.status_code == 404 and _error(denied) == "purchase_not_found"
+    CALLER.agent_id = AGENT
+    CALLER.agent_user_ref = None
+    denied = await client.get(f"{BASE}/purchases/{purchase_id}")
+    assert denied.status_code == 401 and _error(denied) == "agent_user_required"

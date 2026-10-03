@@ -271,11 +271,9 @@ upsert_log_metric retailer_ingest_drain_failed \
 # no level name in the text and no severity on the entry. A filter with `severity>=ERROR` would
 # be an enabled metric that can never count; these match text only.
 #
-#   REPORT   every report line. A report is printed ONLY by an armed run (REAP_AGENTIC_ENABLED on,
-#            client configured): a disarmed tick returns before it and prints nothing at all. So
-#            this is the rail's heartbeat, and it has no series in an environment that has never
-#            been armed. It is the input of the "went silent" policy below, not an alert itself.
-#   STUCK    a report whose `stuck_over_age` is >= 1. A STANDING condition: every armed tick
+#   REPORT   every report line. A report is printed by every completed maintenance tick, including missing
+#            credentials and disabled provider reads. This is job/retention heartbeat, not arming. It is the input of the "went silent" policy below, not an alert itself.
+#   STUCK    a report whose `stuck_over_age` is >= 1. A STANDING condition: every completed maintenance tick
 #            repeats it until the purchase moves. `[1-9]` cannot match `stuck_over_age=0`, nor the
 #            `stuck_over_age=-1` the job prints when the count could not be taken - that tick is
 #            FAILING's (errors=1), not a claim that nothing is stuck.
@@ -306,7 +304,7 @@ REAP_POLL_REPORT_FILTER='resource.type="cloud_run_revision" AND resource.labels.
 REAP_POLL_STUCK_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND textPayload:"reap_agentic_poll: PollReport(" AND textPayload=~"stuck_over_age=[1-9]"'
 REAP_POLL_FAILING_FILTER='resource.type="cloud_run_revision" AND resource.labels.service_name="worker" AND ((textPayload:"reap_agentic_poll: " AND (textPayload=~", errors=[1-9]" OR NOT textPayload:"PollReport(") AND NOT textPayload:"released on cancellation") OR (textPayload=~"scheduler job .reap_agentic_purchase_poll." AND NOT textPayload:"wrapper cancelled"))'
 upsert_log_metric reap_agentic_poll_report \
-  "Reap agentic purchase poller report lines - one per ARMED run; a disarmed poller prints none" \
+  "Reap agentic purchase poller report lines - one per completed maintenance run, including provider/create pauses" \
   "$REAP_POLL_REPORT_FILTER"
 upsert_log_metric reap_agentic_poll_stuck \
   "Reap agentic purchase poller reports that counted a purchase stuck more than 30 minutes past its deadline" \

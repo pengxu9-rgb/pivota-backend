@@ -55,8 +55,8 @@ What the rail does now:
    the enrollment's end. The expire sweep gives `needs_enrollment` an **enrollment grace**
    (`REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS`, default **180**) past `hosted_url_expires_at`, and
    the poller keeps reading the enrollment during it; ACTIVE in the grace → `quoting`.
-   `awaiting_approval` gets **no** grace: its QUOTE dies at the expiry. The absolute
-   `REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` fallback is unchanged.
+   Checkout-backed `awaiting_approval` remains recoverable after either deadline; only an
+   authoritative checkout read decides its outcome. Contact retention has its own deadline.
 2. **`resolving` reconciles before it mints.** No active row, but `pending` rows that have a
    `reap_enrollment_id` (a link was handed out): **every** such row, **oldest first**, gets one
    guarded `get_enrollment` (`_still_ours` in front of it, like every partner call):
@@ -304,21 +304,38 @@ full https URL on an allowlisted host, or put a different host first in `REAP_RE
 purchase already in flight must be allowed to finish (or fail cleanly) after the dial is turned
 off — stranding a row in `awaiting_approval` after the buyer has paid is worse than finishing it.
 
-> **The poller re-checks it, but ONLY for the partner-facing half.**
-> `run_reap_agentic_purchase_poll` gates **step 4 only** (claim + `advance`). With the rail off
-> it returns `skipped_disabled=1`, takes no claim and makes no partner call — and **the three
-> sweeps above it run anyway**, including the PII deadline.
->
-> The first cut gated the whole run, and that was a measured retention bug: with the rail off, an
-> `awaiting_approval` row 99,999 s old kept `buyer_email` and `shipping_address` across three
-> consecutive ticks. Because the gate is `is_enabled() **and** `is_configured()`, one unset
-> credential had the same effect as an operator switching the feature off.
->
-> The rule is: **the dial stops us talking to a partner. It is not permission to stop forgetting
-> people.** That is safe because none of steps 1–3 calls a partner (they are three UPDATEs in
-> `db/reap_agentic_ledger.py`) and none can touch a row whose payment is in flight —
-> `expire_overdue_purchases` names only the two waiting states and `fail_exhausted_purchases`
-> runs `include_processing=False`, both parsed out of the SQL that enforces them.
+With the rail off, the poller still claims checkout-backed `awaiting_approval` and `processing`
+rows and makes **GET-only checkout reads**. Candidate selection and claim UPDATE both enforce
+this scope. It does not resolve, enroll, quote or create another checkout. Keep the worker,
+correct-host credentials and reconciliation schedule running when rolling back new purchases.
+`skipped_disabled=1` means new-purchase work is disabled, not that checkout reads stopped.
+A missing credential or a non-sandbox host outside production blocks provider reads; cleanup
+still runs. The authenticated owner-scoped purchase-by-ID GET remains available from stored
+data with the create flag off, even during credential outages; it makes no provider call.
+
+**Payment uncertainty and contact retention are separate.** Clock/attempt sweeps never terminally
+expire/fail a checkout-backed buyer-facing row. The bounded PII scrub clears shipping address,
+buyer email and offer code after `REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` in that state, retaining
+checkout/quote/order IDs, amounts/currency, consent and attribution evidence. Neither this scrub
+nor a provider outage clears a live claim or marks the row terminal. Provider `FAILED`/`EXPIRED`
+responses still terminate unapproved checkouts with ordinary terminal cleanup. Unknown/error
+responses remain due for retries and visible to stuck-purchase monitoring.
+
+**Historical recovery is a separate release gate.** This change prevents future clock-sweep
+losses; it intentionally does not automatically reopen terminal rows created by old versions.
+Before live rollout, use a read-only census of expired checkout-backed rows, reconcile each
+candidate with authenticated Reap GET and record purchase/checkout IDs, provider status and
+observation time in an operator audit. `last_error_code` alone cannot identify the old sweep
+because its COALESCE preserved earlier errors. Do not revive authoritative FAILED/EXPIRED
+outcomes. For a provider PROCESSING/COMPLETED contradicting our terminal row, a separately
+reviewed, dry-run-first repair must preserve identity/amount/consent evidence, fence updates,
+clear only the erroneous terminal marker, and close conversion under the existing unique
+merchant/order and click-claim constraints. No bulk reopening or provider writes are authorized
+by this code. Never claim “unpaid” solely because a local hosted deadline passed.
+
+No schema migration or new state is required. Deployment must replace all old poller replicas
+before relying on this invariant: an old replica still has the unsafe terminal sweep. Rolling
+back to the old code reintroduces the loss risk and is unsafe while exposed checkouts remain.
 
 ### The poller's dials
 
@@ -331,11 +348,13 @@ bad setting, it would be an exception out of a scheduled job on every tick.
 
 | variable | default | bounds | effect |
 |---|---|---|---|
-| `REAP_AGENTIC_ENABLED` | **unset = off** | truthy allowlist | the gate, inside the job, over **step 4 only**. Off ⇒ `skipped_disabled=1`, no claim, no partner call — the sweeps still run |
+| `REAP_AGENTIC_ENABLED` | **unset = off** | truthy allowlist | the gate, inside the job, over **step 4 only**. Off ⇒ precheckout frozen, exposed checkout reads continue; independent reconcile flag stops provider I/O |
 | `REAP_AGENTIC_POLL_INTERVAL_SECONDS` | 30 | 5–3600 | the `interval` trigger **and** `misfire_grace_time`. Registration-time only — changing it needs a restart |
 | `REAP_AGENTIC_CLAIM_BATCH` | 10 | 1–100 | rows claimed per run. Capped at 100 because each row is a serial partner chain |
 | `REAP_AGENTIC_LEASE_SECONDS` | 300 | **180**–3600 | what `requeue_stale_claims` measures against. The floor is 180, not the ledger's 30: a lease shorter than one step gets a LIVE worker's row requeued underneath it, and both workers then call the partner |
-| `REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` | 3600 | 60–2592000 | the absolute PII deadline in `expire_overdue_purchases`, measured from `state_entered_at` |
+| `REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` | 3600 | 60–2592000 | abandoned enrollment/local-hosted expiry bound; not the contact-retention cap |
+| `REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS` | 900 | 60–3600 | independent creation-age contact cap; live leases defer cleanup |
+| `REAP_AGENTIC_RECONCILE_ENABLED` | 1 | truthy allowlist | off stops all new provider calls while maintenance continues |
 | `REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS` | 180 | 0–3600 | how long past `hosted_url_expires_at` the sweep leaves a **`needs_enrollment`** row alone (Reap flips ACTIVE at/after the link dies); also how long `resolving` holds instead of retiring a pending enrollment. `awaiting_approval` never gets it. 0 = Reap's exact expiry. Read by `services.reap_agentic_purchase.enrollment_grace_seconds()` — ONE reader, which the job calls — not a job dial |
 | `REAP_AGENTIC_MAX_ATTEMPTS` | 50 | 1–10000 | attempts ceiling. `attempts` counts **claims**, and only in `resolving`/`quoting`/`processing` |
 | `REAP_AGENTIC_ERROR_BACKOFF_SECONDS` | 120 | 1–3600 | how long a row waits after `advance` **raised**. Not the state machine's table — this is the path where it did not get to choose |
@@ -387,7 +406,7 @@ run deadline **600 s** in `_JOB_RUN_DEADLINES` (see the derivation above).
 | 2 | `expire_overdue_purchases(max_age_seconds=REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS, enrollment_grace_seconds=REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS)` | 200 per statement, looped until a partial batch, hard cap 20 iterations |
 | 3 | `fail_exhausted_purchases(REAP_AGENTIC_MAX_ATTEMPTS, include_processing=False)` | same |
 | 4 | `claim_due_purchases(worker, limit=REAP_AGENTIC_CLAIM_BATCH)` → per row `advance` → `release_claim` | **sequential**, one partner chain at a time, stopped by `REAP_AGENTIC_POLL_BUDGET_SECONDS` |
-| 5 | `count_stuck_purchases(stuck_after_seconds=1800, …)` → `stuck_over_age`, then the report line | **read-only**, one `COUNT` over the non-terminal rows; **armed runs only** — a disarmed tick stops before step 4 and issues neither the read nor the line. Taken on every armed run that gets this far, **including one that is over its budget**, and bounded by its own 10 s timeout (`STUCK_COUNT_TIMEOUT_SECONDS`): 240 budget + 170 slowest step + 10 + up to 120 for the DB layer to hand the connection back = 540 s, inside the 600 s run deadline |
+| 5 | Independent read-only `contact_retention_blocked`, `checkout_needs_human`, and `stuck_over_age` diagnostics, then report | Every completed maintenance tick, including stop/missing credentials. Each diagnostic has its own 10 s timeout; they run concurrently so an unavailable one cannot hide the others. Database cancellation/unwind can exceed that timeout; the 600 s outer job deadline remains the backstop. A timed-out field is `-1`, never zero. Paused precheckout and classified operator-held work are excluded from ordinary stuck. |
 
 **The sweeps run before the claim** because a row held by a dead pod is not claimable until the
 requeue frees it — a claim-first run would skip exactly the rows that most need attention, every
@@ -396,9 +415,9 @@ tick, forever, on a pod that keeps dying.
 **Step 3 never touches `processing`.** A purchase in `processing` has been approved by the buyer
 and its payment is in flight with Reap; auto-failing it on a counter writes `failed` over a
 charge whose outcome we do not know. **A payment stuck in `processing` is a human decision** —
-reconcile the checkout with Reap by hand, then either transition the row or call
-`fail_exhausted_purchases(..., include_processing=True)` yourself. There is deliberately no env
-var for it: a dial would let somebody arm it once and forget.
+reconcile the checkout with Reap using the authoritative read step or an audited repair.
+Checkout-backed states are excluded even with `include_processing=True`; counters cannot
+substitute for provider evidence.
 
 **After the loop this worker holds no claims**, and that is *checked with a query*, not asserted.
 Anything left over is released and counted under `errors`.
@@ -415,7 +434,7 @@ ERROR lines an operator must act on.
 | `expired` | purchases the buyer abandoned; PII NULLed | normal; a spike means hosted pages are expiring before buyers use them |
 | `failed_exhausted` | rows that hit the attempt ceiling | look at `last_error_code` on those rows — the rail is failing the same way repeatedly |
 | `processing_over_attempts` | **read-only.** Purchases in `processing` at or past `max_attempts` — the exact set the fail sweep refuses to terminate because a payment is in flight | **any non-zero value that does not fall needs a human.** Reconcile the checkout with Reap; the counter will never resolve these. See below |
-| `stuck_over_age` | **read-only, armed runs only.** Purchases more than 30 minutes past the last moment the rail's own rules let them stay in their state — see [Alerts](#alerts) for the definition. `-1` = **not counted**, never "zero": the count timed out (10 s) or raised, and `errors` is raised with it | **any value ≥ 1 pages** (`prod: Reap purchase stuck over 30 minutes`) |
+| `stuck_over_age` | **read-only, every completed maintenance tick.** Purchases more than 30 minutes past the last moment the rail's own rules let them stay in their state — see [Alerts](#alerts) for the definition. `-1` = **not counted**, never "zero": the count timed out (10 s) or raised, and `errors` is raised with it | **any value ≥ 1 pages** (`prod: Reap purchase stuck over 30 minutes`) |
 | `claimed` | leases taken this run | `== REAP_AGENTIC_CLAIM_BATCH` every tick means the backlog is growing; raise the batch or the interval |
 | `advanced` | rows that changed state | — |
 | `released` | rows that made no progress because **the partner was not ready** | — |
@@ -747,35 +766,40 @@ the ERROR line.
 
 ### Stopping it
 
-**Pause and dial-off are not interchangeable, and the difference is the PII deadline.** A paused
-job never fires, so pausing stops *everything* — including the sweep that forgets abandoned
-buyers. Turning the dial off stops only the partner-facing half.
+Creation pause and provider stop are separate controls. `REAP_AGENTIC_ENABLED=0` freezes
+precheckout work while exposed checkout reads, ledger completion and attribution continue.
+Set `REAP_AGENTIC_RECONCILE_ENABLED=0` for a true provider-I/O stop (default1). The gate is
+checked before claiming/advancing; a request already in flight may finish. Requeue, safe expiry,
+attempt maintenance and contact retention continue. Job pause stops all maintenance and should
+be brief. Never infer failed/expired payment from a clock, attempt counter or unreadable checkout.
 
-| lever | stops partner calls | sweeps keep running | use when |
-|---|---|---|---|
-| `REAP_AGENTIC_ENABLED` off | **yes** | **yes** — requeue, expire (the PII deadline) and fail all still run | **the normal stop.** Reach for this first. |
-| `POST .../reap_agentic_purchase_poll/pause` | yes | **NO — nothing runs at all** | only briefly: the database is in trouble, or the job itself is misbehaving. **Resume it, or the PII deadline stays off.** |
-| `POST .../cancel-running` | frees a wedged in-flight run only | yes | a run has wedged; it never starts work |
-| redeploy the worker without the env var | yes | yes | equivalent to the dial, plus it abandons the in-flight run |
+| lever | provider reads/new work | maintenance |
+|---|---|---|
+| master/create gate off | exposed checkout reads continue; precheckout frozen | runs |
+| `REAP_AGENTIC_RECONCILE_ENABLED=0` | no new provider call of any kind | runs |
+| scheduler pause/worker disabled | no new tick | stopped, including privacy sweeps |
+| cancel-running | cancels current run and releases its claims | later ticks still run |
 
-With the dial off, purchases already in flight **stall** — nothing advances them — but they are
-still expired on the clock and still have their PII nulled, and their claims are still recovered.
-That is the intended resting state for a disarmed rail.
+Every completed tick emits a heartbeat, including missing-credential and provider-stop ticks.
+The heartbeat proves maintenance, not arming. Deploying this change can start report-series
+history on a previously dark environment; a later stopped job can trigger “poller went silent”.
+Paused precheckout rows are excluded from ordinary stuck counts. Contact-expired precheckout
+rows are preserved, separately counted as `contact_retention_blocked`, and make no provider
+call on resume. Do not solve an uncertain quoting row by minting another checkout: retain the
+original request/key/quote/enrollment and obtain an authoritative provider reconciliation first.
 
-A disarmed poller also stops **reporting**, so `stuck_over_age` is no longer taken and
-`prod: Reap purchase poller went silent` opens ~20 minutes later and re-sends hourly
-([Alerts](#alerts)). That is the alert working. It cannot be closed while its condition holds —
-snooze the policy, and end the snooze when you re-arm.
+`REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS` is an independent creation-based contact cap: default900,
+range60–3600. State transitions never reset it. Exposed checkout rows also scrub at explicit
+hosted expiry if earlier. A live lease defers the scrub until released/requeued. Contact cleanup
+preserves quote/amount/currency/checkout/order/consent/attribution evidence and never declares a
+payment outcome. Restoring buyer contact or restarting a blocked attempt requires separate
+owner/operator review; this worker does not silently refill PII or create a replacement.
 
 #### The order to disarm in — an operator rule
 
-**Turning `REAP_AGENTIC_ENABLED` off while purchases are in flight can mark a purchase the buyer
-has PAID for as `expired`.** The dial gates step 4 only; the expire sweep keeps running, unfenced,
-and it expires an `awaiting_approval` row at its hosted deadline on its own clock. With step 4 off
-nothing has read that checkout from Reap — so a buyer who approved on Reap's page while the
-poller was dark is written `expired` (and their address and email nulled) with **zero** reads of
-the payment's outcome. The same happens whenever step 4 is skipped while the sweeps run — the
-client losing its configuration, most notably; disarming is simply the case an operator chooses.
+Preserve owner GET/recovery and exposed reconciliation when pausing new purchases. Use the
+independent reconcile stop only when provider calls themselves must cease. Historic gateway
+facts below are pinned to their named source revision and require current-source review.
 
 So, for a planned stop. The gateway facts below are the gateway's (PIVOTA-Agent) behaviour as
 read at its commit `873b60727`, not something this repository can check — re-read the gateway
@@ -849,10 +873,8 @@ To resolve one:
 1. `SELECT id, reap_checkout_id, attempts, state_entered_at FROM reap_agentic_purchases
    WHERE state = 'processing' AND attempts >= <max_attempts>;`
 2. Ask Reap what that checkout did. This rail has **no webhooks**, so this is a manual lookup.
-3. Then, and only then, transition the row by hand — or, if you have confirmed the charge did not
-   happen, call `fail_exhausted_purchases(..., include_processing=True)` yourself. There is no
-   env var for that flag on purpose: a dial would let somebody arm it once and forget, which is
-   the same as not having decided.
+3. Apply the authoritative outcome through the fenced checkout read step or a reviewed repair.
+   Never use an attempt count to decide whether a checkout was paid.
 
 Both `run-now` and `pause`/`resume` are **allowlists** in `routes/admin_scheduler_jobs.py`
 (`_RUNNABLE_JOB_IDS`, `_MANAGEABLE_JOB_IDS`); `reap_agentic_purchase_poll` was added to both, and
@@ -901,10 +923,10 @@ Obligations, in order of how expensive they are to get wrong:
    and doubled again for each consecutive failure, up to `MAX_BACKOFF_SECONDS` (600). The counter
    is the ledger's `attempts`, which is exempt in the two human-wait states — so those stay at
    interval × 2 and are bounded by `expire_overdue_purchases` on a clock instead.
-5. **Run the two sweeps.** They are the only bounds on the waiting states:
-   * `expire_overdue_purchases(max_age_seconds=…)` — the PII deadline. `attempts` is exempt in
-     `needs_enrollment` and `awaiting_approval`, so without this a buyer who walks away keeps
-     their address and email on the row indefinitely.
+5. **Run cleanup separately from checkout outcome reconciliation.**
+   * `expire_overdue_purchases(max_age_seconds=…)` — abandoned pre-checkout expiry.
+   * `scrub_reconciling_purchase_pii(max_age_seconds=…)` — the independent contact deadline
+     for approval/processing rows with a checkout; retains state and evidence for recovery.
    * `fail_exhausted_purchases(max_attempts=…)` — bounds `resolving` / `quoting` / `processing`.
      `include_processing` defaults **False** on purpose: a purchase in `processing` has been
      approved and its payment is in flight, and auto-failing it writes a terminal state over a
@@ -1770,3 +1792,28 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp3_test 
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_reap_wp4b_test \
     .venv/bin/python -m pytest tests/test_agent_commerce_reap_routes_postgres.py
 ```
+
+
+### Checkout reads requiring human reconciliation
+
+Three consecutive permanent-shaped reads (404, unknown checkout status or unsafe hosted URL)
+produce `checkout_unresolvable:<count>:<reason>` and a 15-minute retry, capped at count99.
+This is an observation category, not evidence of payment failure. These rows remain recoverable
+and are counted in `checkout_needs_human`, separately from ordinary `stuck_over_age`; errors
+that are not explicitly classified still count as ordinary stuck work. A transient outage does
+not clear the human category; a valid provider waiting/processing/terminal outcome does.
+The report also exposes `contact_retention_blocked` for preserved precheckout work whose contact
+cap elapsed. Both figures need an operator review queue; no new cloud policy is provisioned here.
+
+The reconciliation stop is checked before every worker-scoped HTTP transport operation, including resolver search/details/variant subrequests. An already in-flight request may finish, but its successor must not start. Context is reset after each step; standalone client callers retain their existing contract. Privacy-expired `needs_enrollment` rows also hold without new provider preparation; stored enrollment evidence is retained for operator review.
+
+
+### Audited manual resolution of classified checkout uncertainty
+
+`services.reap_checkout_recovery.resolve_checkout_manually` is a service-only primitive; there is no admin HTTP route or executable operator CLI. Its default `dry_run=True` preview writes nothing. Applying it requires an explicitly privileged caller, an opaque operator handle, independently authenticated Reap read or verified support evidence, a same-environment provider origin, an exact checkout ID and recognized terminal status, and evidence observed within the last 24 hours and after this purchase was created. The verification attestation is a caller contract, not automatic cryptographic validation; an operator must verify the authentic evidence before setting it.
+
+Only checkout-backed `awaiting_approval`/`processing` rows explicitly classified `checkout_unresolvable:` are eligible. The original state, checkout ID, error classification, `updated_at`, and absent lease are checked again by a conditional claim. Missing reads, 404s, elapsed clocks and a missing checkout ID are never terminal proof. COMPLETED additionally requires a valid order ID, currency and charged total within the existing one-minor-unit quote tolerance. Provider EXPIRED while processing becomes failed under the existing state transition contract. Terminal historical rows cannot be reopened.
+
+Migration 253 and both startup self-heal dialects create `reap_checkout_manual_resolution_audit`. It stores one decision per purchase: checkout, original state/version, terminal status, operator/evidence handles, verified source, observed time/origin and normalized evidence SHA256. It stores no full provider body or buyer contact. The audit append, conditional terminal decision, terminal lease clearing, click claim and attribution edge call share one short database transaction; unexpected failures or suppression roll back that unit. A deterministic existing merchant-channel click claim is legitimate: completion keeps `attribution_closed_by_other_channel`, preserves that claim, writes no Reap edge, and audits `attribution_outcome=closed_by_other_channel`. Other completions audit `edge_closed` only after rereading the durable attribution edge and checking exact merchant, external and synthetic order, amount/currency, click/agent, converted source/state and the purchase/checkout partner provenance. A synthesized close receipt after `ON CONFLICT DO NOTHING` is insufficient: a missing edge or conflicting existing order slot rolls back the terminal outcome and audit without overwriting the edge. Failed/expired decisions audit `not_applicable`. Ancillary commerce event/interaction emission retains its existing best-effort semantics and requires a separate receipt check; this primitive does not promise those receipts exist. Exact-evidence replay is read-only and cannot create another audit or edge. Do not delete the audit table when rolling back runtime code; removing this function leaves classified rows safely unresolved.
+
+`contact_retention_blocked` is a separate owner/operator queue, covering privacy-held resolving, needs_enrollment and quoting work. Resuming flags does not restore discarded contact or mint another checkout. An operator must inspect whether an external checkout may exist and use a separately reviewed recovery/contact-reauthorization procedure; there is no automatic quoting cleanup or blind retry. `checkout_needs_human` is a separate payment uncertainty queue. The existing three metrics match heartbeat, ordinary stuck and errors only: before arming, these two cohorts need an explicitly owned, reviewed alert/runbook. No cloud policy is created or enabled by this source change.

@@ -1638,7 +1638,7 @@ async def test_the_report_carries_only_integers(reap):
     fields = vars(report)
     assert set(fields) == {
         "requeued", "expired", "failed_exhausted", "processing_over_attempts",
-        "stuck_over_age", "claimed", "advanced", "released", "abandoned_budget",
+        "stuck_over_age", "contact_retention_blocked", "checkout_needs_human", "claimed", "advanced", "released", "abandoned_budget",
         "lost_claim", "terminal", "errors", "skipped_disabled", "duration_ms",
     }
     assert all(isinstance(v, int) for v in fields.values())
@@ -1810,10 +1810,8 @@ def _watch_the_stuck_read(monkeypatch) -> list:
     return calls
 
 
-async def test_a_disarmed_run_does_not_issue_the_stuck_read(monkeypatch, reap):
-    """THE RAIL IS DARK IN PRODUCTION. Deploying this must add no statement to a disarmed tick:
-    the read is step 5, below the gate. The report says NOT COUNTED, never 0 — and a disarmed run
-    prints no report line at all, so the alert has nothing to read either way."""
+async def test_a_disarmed_run_reconciles_and_reports_stuck_checkouts(monkeypatch, reap):
+    """Disarming stops new work while reconciliation and its alerts remain observable."""
     stuck = await _start()
     await _park(stuck, "processing", 99999, reap_checkout_id="chk_dark")
     reads = _watch_the_stuck_read(monkeypatch)
@@ -1822,32 +1820,32 @@ async def test_a_disarmed_run_does_not_issue_the_stuck_read(monkeypatch, reap):
     with root_as_in_prod(), capture_pivota_stdout() as out:
         report = await _run()
 
-    assert reads == [], "a disarmed run issued the stuck-count read"
+    assert len(reads) == 1, "disarmed reconciliation must retain monitoring"
     assert report.skipped_disabled == 1
-    assert report.stuck_over_age == job.NOT_COUNTED == -1
+    assert report.stuck_over_age == 0
     assert report.errors == 0
-    assert not [line for line in pivota_lines(out) if "PollReport(" in line]
+    assert [line for line in pivota_lines(out) if "PollReport(" in line]
 
 
-async def test_an_unconfigured_client_does_not_issue_the_stuck_read(monkeypatch, reap):
+async def test_an_unconfigured_client_counts_only_exposed_stuck_rows(monkeypatch, reap):
     await _start()
     reads = _watch_the_stuck_read(monkeypatch)
     monkeypatch.delenv("REAP_API_KEY", raising=False)
     report = await _run()
-    assert reads == []
+    assert len(reads) == 1 and reads[0]["reconciliation_only"] is True
     assert report.skipped_disabled == 1
-    assert report.stuck_over_age == job.NOT_COUNTED
+    assert report.stuck_over_age == 0
 
 
-async def test_the_non_sandbox_refusal_does_not_issue_the_stuck_read(monkeypatch, reap):
+async def test_the_non_sandbox_refusal_still_counts_exposed_stuck_rows(monkeypatch, reap):
     await _start()
     reads = _watch_the_stuck_read(monkeypatch)
     monkeypatch.setenv("PIVOTA_ENV", "staging")
     monkeypatch.setenv("REAP_API_BASE_URL", "https://prod.api.reap.global")
     report = await _run()
-    assert reads == []
+    assert len(reads) == 1 and reads[0]["reconciliation_only"] is True
     assert report.skipped_disabled == 1
-    assert report.stuck_over_age == job.NOT_COUNTED
+    assert report.stuck_over_age == 0
 
 
 async def test_a_failed_stuck_read_is_not_counted_not_zero_and_the_run_still_reports(
@@ -2012,6 +2010,7 @@ async def test_the_stuck_read_is_given_the_windows_the_expire_sweep_was_given(mo
 
     assert seen["count"] == {
         "stuck_after_seconds": job.STUCK_AFTER_SECONDS,
+        "reconciliation_only": False,
         "max_age_seconds": 7200,
         "enrollment_grace_seconds": 240,
     }
