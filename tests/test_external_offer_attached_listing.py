@@ -257,11 +257,17 @@ def test_an_attached_seed_without_a_mirror_writes_its_listing_row(monkeypatch):
 
 
 def test_the_mirror_still_wins_when_the_seed_has_one(monkeypatch):
+    from unittest.mock import AsyncMock
+    from services import catalog_variant_offer_projection
+
+    project = AsyncMock(return_value={"planned": 0, "inserted": 0, "skips": {}})
+    monkeypatch.setattr(catalog_variant_offer_projection, "project_missing_variant_offers", project)
     fake = FakeDB(seed=_seed(), mirror={"product_key": "prod::merch_obs_x::external_seed::e",
                                         "merchant_id": "merch_obs_x"}, offers=[_offer("of_canon")])
     result = _sync(monkeypatch, fake)
     assert result["status"] == "synced" and result["target"] == "mirror"
     assert fake.updates == [] and len(fake.executed) == 1
+    project.assert_awaited_once_with(fake.mirror["product_key"], apply=True, db=fake)
 
 
 def test_an_unattached_seed_without_a_mirror_is_still_no_mirror_product(monkeypatch):
