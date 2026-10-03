@@ -1,7 +1,7 @@
 import copy
 import json
 import pytest
-from services.catalog_variant_offer_projection import plan_offers, variants_from_seed, own_availability
+from services.catalog_variant_offer_projection import plan_offers, variants_from_seed, own_availability, seed_scope
 
 P = {
     "product_key": "p",
@@ -76,6 +76,29 @@ def test_duplicate_variant_identity_is_refused():
     assert len(rows) == 1 and skips["missing_or_ambiguous_variant"] == 1
 
 
+@pytest.mark.parametrize("key", ["id", "shopify_variant_id"])
+def test_conflicting_merchant_variant_alias_cannot_supply_sibling_price(key):
+    variants = copy.deepcopy(V)
+    variants[0].update({key: "42199434526795", "price": "27"})
+    rows, skips = plan_offers(P, variants, S, T, [])
+    assert [r["sku_key"] for r in rows] == ["p::v::42199434526795"]
+    assert skips["conflicting_variant_identity"] == 1
+
+
+def test_equivalent_numeric_and_gid_aliases_are_not_conflicting():
+    variants = copy.deepcopy(V)
+    variants[0]["id"] = "gid://shopify/ProductVariant/677289689108"
+    assert len(plan_offers(P, variants, S, T, [])[0]) == 2
+
+
+@pytest.mark.parametrize("alias", ["123", "555555555555"])
+def test_numeric_alias_is_checked_even_when_not_a_merchant_variant(alias):
+    variants = copy.deepcopy(V)
+    variants[0]["id"] = alias
+    rows, skips = plan_offers(dict(P, source_product_id="555555555555"), variants, S, T, [])
+    assert len(rows) == 1 and skips["conflicting_variant_identity"] == 1
+
+
 @pytest.mark.parametrize("payload", [None, [], "[]", "broken", 5])
 def test_malformed_destination_payload_is_refused(payload):
     rows, skips = plan_offers(P, V, S, [dict(T[0], offer_payload=payload)], [])
@@ -107,6 +130,18 @@ def test_no_inherited_availability_and_serialized_seed():
     assert variants_from_seed(json.dumps({"snapshot": {"variants": V}})) == V
 
 
+@pytest.mark.parametrize(
+    "variant",
+    [
+        {"stock": "In Stock", "available": False},
+        {"availability": "in_stock", "stock": "Out of Stock"},
+        {"available": True, "availability": "sold_out"},
+    ],
+)
+def test_unavailability_wins_over_contradictory_positive_signals(variant):
+    assert own_availability(variant) == "out_of_stock"
+
+
 def test_withdrawn_offer_in_other_currency_or_market_blocks_replacement():
     rows, skips = plan_offers(
         P,
@@ -125,3 +160,43 @@ def test_withdrawn_offer_in_other_currency_or_market_blocks_replacement():
     )
     assert [r["sku_key"] for r in rows] == ["p::v::42199434526795"]
     assert skips["existing_offer_preserved"] == 1
+
+
+def test_seed_scope_uses_current_seller_domain_listing_and_market():
+    seed = {
+        "seller_ref": "m",
+        "domain": "brand.example",
+        "market": "US",
+        "destination_url": "https://brand.example/products/x",
+    }
+    scoped = seed_scope(P, seed)
+    assert scoped == {"seed_listing_identities": {("brand.example", "/products/x")}, "seed_market": "US"}
+    for change in [
+        {"seller_ref": "other"},
+        {"domain": "other.example"},
+        {"market": None},
+        {"destination_url": "https://other.example/products/x"},
+        {"canonical_url": "https://other.example/products/x"},
+    ]:
+        assert seed_scope(P, dict(seed, **change)) is None
+    assert plan_offers(dict(P, **scoped), V, S, [dict(T[0], market="CA")], [])[0] == []
+    assert (
+        plan_offers(
+            dict(P, **scoped),
+            V,
+            S,
+            [dict(T[0], offer_payload={"destination_url": "https://brand.example/products/other"})],
+            [],
+        )[0]
+        == []
+    )
+
+
+def test_missing_seller_ref_requires_matching_observed_seller_identity():
+    from services.seller_identity import resolve_seed_seller_identity
+
+    seller = resolve_seed_seller_identity(brand="Brand", domain="brand.example")["merchant_id"]
+    product = dict(P, merchant_id=seller, brand="Brand")
+    seed = {"domain": "brand.example", "market": "US", "destination_url": "https://brand.example/products/x"}
+    assert seed_scope(product, seed)
+    assert seed_scope(product, dict(seed, seed_data={"snapshot": {"brand": "Another"}})) is None

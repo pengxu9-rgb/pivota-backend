@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import uuid
 import pytest
 from services import catalog_variant_offer_projection as mod
 
@@ -24,6 +26,8 @@ async def db():
     await database.execute(
         "CREATE TABLE IF NOT EXISTS external_product_seeds(id text,attached_product_key text,status text,seed_data jsonb)"
     )
+    for column in ("seller_ref", "domain", "canonical_url", "destination_url", "market"):
+        await database.execute(f"ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS {column} text")
     await database.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_skus_source_identity_v2 ON catalog_skus(merchant_id,platform,product_key,source_variant_id)"
     )
@@ -54,6 +58,11 @@ async def db():
                     }
                 ),
             },
+        )
+        await database.execute(
+            """UPDATE external_product_seeds SET seller_ref=:m,domain='brand.example',
+            destination_url='https://brand.example/products/test',market='US' WHERE id=:seed""",
+            {"m": M, "seed": SEED},
         )
         for vid in ["677289689108", "42199434526795"]:
             await database.execute(
@@ -124,6 +133,29 @@ async def test_suppressed_sku_and_wrong_seed_attachment_refused(db):
     assert result["inserted"] == 0 and result["skips"]["active_attached_seed_missing"] == 1
 
 
+async def test_current_seed_seller_correction_cannot_price_the_old_mirror(db):
+    await db.execute("UPDATE external_product_seeds SET seller_ref='another-seller' WHERE id=:seed", {"seed": SEED})
+    result = await mod.project_missing_variant_offers(PK, apply=True, db=db)
+    assert result["inserted"] == 0 and result["skips"]["seed_listing_or_seller_mismatch"] == 1
+
+
+async def test_conflicting_variant_alias_is_not_written(db):
+    await db.execute(
+        """UPDATE external_product_seeds SET seed_data=jsonb_set(seed_data,
+        '{snapshot,variants,0,id}', '"42199434526795"'::jsonb) WHERE id=:seed""",
+        {"seed": SEED},
+    )
+    result = await mod.project_missing_variant_offers(PK, apply=True, db=db)
+    assert result["inserted"] == 1 and result["skips"]["conflicting_variant_identity"] == 1
+    assert (
+        await db.fetch_val(
+            "SELECT count(*) FROM catalog_offers WHERE sku_key=:sk AND source_system=:src",
+            {"sk": PK + "::v::677289689108", "src": mod.SOURCE},
+        )
+        == 0
+    )
+
+
 async def test_write_failure_rolls_back_all_new_offers(db, monkeypatch):
     original = db.fetch_val
 
@@ -161,3 +193,120 @@ async def test_canonical_seed_writer_also_projects_variant_offers(db):
         await db.fetch_val("SELECT count(*) FROM catalog_offers WHERE source_system=:source", {"source": mod.SOURCE})
         == 2
     )
+
+
+async def test_concurrent_promotion_waits_for_product_before_locking_skus(db, monkeypatch):
+    """Two actual pool connections reproduce the repair/promotion lock ordering."""
+    from databases import Database
+    from services import catalog_variant_promoter as promoter
+
+    live = Database(os.environ["DATABASE_URL"])
+    promoting = Database(os.environ["DATABASE_URL"])
+    await live.connect()
+    await promoting.connect()
+    pk = "projection-concurrent-" + uuid.uuid4().hex
+    seed = pk + "-seed"
+    merchant = pk + "-merchant"
+    variants = [
+        {"variant_id": "677289689108", "price": "16", "currency": "USD", "title": "120 mL"},
+        {"variant_id": "42199434526795", "price": "27", "currency": "USD", "title": "2x120 mL"},
+    ]
+    source = {"snapshot": {"variants": variants}}
+    primary = {
+        "product_key": pk,
+        "merchant_id": merchant,
+        "platform": "external_seed",
+        "source_product_id": pk,
+        "parent_title": "Test",
+        "source_system": mod.MIRROR,
+        "catalog_track": "external_referral",
+        "seed_data": source,
+    }
+    locked = asyncio.Event()
+    promotion_waiting = asyncio.Event()
+    continue_repair = asyncio.Event()
+    tasks = []
+
+    class Proxy:
+        def __init__(self, repair=False):
+            self.repair = repair
+            self.db = live if repair else promoting
+
+        def __getattr__(self, name):
+            return getattr(self.db, name)
+
+        async def fetch_one(self, query, values=None):
+            if query == promoter.SELECT_GROUP_PRIMARY_SQL:
+                return primary
+            if not self.repair and "catalog_products" in str(query) and "FOR UPDATE" in str(query):
+                promotion_waiting.set()
+            row = await self.db.fetch_one(query, values)
+            if self.repair and query == mod.PRODUCT_SQL + " FOR UPDATE":
+                locked.set()
+                await continue_repair.wait()
+            return row
+
+    try:
+        await live.execute(
+            """INSERT INTO catalog_products(product_key,merchant_id,platform,
+            source_product_id,source_domain,source_system,source_ref,title,catalog_track)
+            VALUES(:pk,:m,'external_seed',:source_product,'brand.example',:src,:seed,'Test','external_referral')""",
+            {"pk": pk, "m": merchant, "src": mod.MIRROR, "source_product": pk, "seed": seed},
+        )
+        await live.execute(
+            """INSERT INTO external_product_seeds(id,attached_product_key,status,seed_data,
+            seller_ref,domain,destination_url,market) VALUES(:seed,:pk,'active',CAST(:data AS jsonb),
+            :m,'brand.example','https://brand.example/products/test','US')""",
+            {"seed": seed, "pk": pk, "data": json.dumps(source), "m": merchant},
+        )
+        for variant in variants:
+            await live.execute(
+                """INSERT INTO catalog_skus(sku_key,product_key,merchant_id,platform,
+                source_product_id,source_variant_id,title,currency) VALUES(:sk,:pk,:m,'external_seed',
+                :source_product,:vid,'Test','USD')""",
+                {
+                    "sk": pk + "::v::" + variant["variant_id"],
+                    "pk": pk,
+                    "m": merchant,
+                    "vid": variant["variant_id"],
+                    "source_product": pk,
+                },
+            )
+        await live.execute(
+            """INSERT INTO catalog_offers(offer_id,sku_key,product_key,merchant_id,currency,
+            market,source_domain,offer_payload) VALUES(:id,:sk,:pk,:m,'USD','US','brand.example',CAST(:payload AS jsonb))""",
+            {
+                "id": pk + "-template",
+                "sk": pk + "::canonical",
+                "pk": pk,
+                "m": merchant,
+                "payload": json.dumps({"destination_url": "https://brand.example/products/test"}),
+            },
+        )
+        monkeypatch.setattr(promoter, "database", Proxy())
+        tasks.append(asyncio.create_task(mod.project_missing_variant_offers(pk, apply=True, db=Proxy(repair=True))))
+        await asyncio.wait_for(locked.wait(), 5)
+        tasks.append(asyncio.create_task(promoter.promote_variants_for_group(group_id="concurrent", apply=True)))
+        await asyncio.wait_for(promotion_waiting.wait(), 5)
+        continue_repair.set()
+        repaired, promoted = await asyncio.wait_for(asyncio.gather(*tasks), 10)
+        assert repaired["inserted"] == 2 and promoted.variant_offers_created == 0
+        assert (
+            await live.fetch_val(
+                "SELECT count(*) FROM catalog_offers WHERE product_key=:pk AND source_system=:src",
+                {"pk": pk, "src": mod.SOURCE},
+            )
+            == 2
+        )
+    finally:
+        continue_repair.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await live.execute("DELETE FROM catalog_offers WHERE product_key=:pk", {"pk": pk})
+        await live.execute("DELETE FROM catalog_skus WHERE product_key=:pk", {"pk": pk})
+        await live.execute("DELETE FROM external_product_seeds WHERE id=:seed", {"seed": seed})
+        await live.execute("DELETE FROM catalog_products WHERE product_key=:pk", {"pk": pk})
+        await promoting.disconnect()
+        await live.disconnect()

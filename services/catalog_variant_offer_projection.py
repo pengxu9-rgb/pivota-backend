@@ -10,23 +10,26 @@ import collections
 import hashlib
 import json
 import math
+import re
 from urllib.parse import urlsplit
 
 from db.database import database
 from services.catalog_enrichment_agent.ingestion import variant_own_price
 from services.catalog_offer_writer_guard import guard_catalog_offer_rows
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
+from services.offer_seller_identity import normalize_host
+from services.seller_identity import resolve_seed_seller_identity
 
 SOURCE = "variant_offer_projection_v1"
 MIRROR = "external_product_seeds_mirror_v1"
 PRODUCT_SQL = """
-SELECT product_key, merchant_id, source_product_id, source_domain, source_ref
+SELECT product_key, merchant_id, source_product_id, source_domain, source_ref, brand
 FROM catalog_products
 WHERE product_key=:pk AND source_system=:src AND platform='external_seed'
 AND suppressed_at IS NULL AND suppression_reason IS NULL
 """
 SEED_SQL = """
-SELECT seed_data FROM external_product_seeds
+SELECT seed_data, seller_ref, domain, canonical_url, destination_url, market FROM external_product_seeds
 WHERE attached_product_key=:pk AND status='active' AND id::text=:seed_id
 """
 SKUS_SQL = """
@@ -84,12 +87,55 @@ def variants_from_seed(seed):
     return [v for v in variants or [] if isinstance(v, dict)] if isinstance(variants, list) else []
 
 
+def listing_identity(value):
+    try:
+        url = urlsplit(value or "")
+        if (
+            url.scheme != "https"
+            or not url.hostname
+            or url.username
+            or url.password
+            or url.port not in (None, 443)
+            or not url.path
+        ):
+            return None
+        return normalize_host(url.hostname), url.path.rstrip("/") or "/"
+    except (ValueError, TypeError):
+        return None
+
+
+def seed_scope(product, seed):
+    """Validate the current listing, not only its historic attachment to a product."""
+    domain = normalize_host(product.get("source_domain"))
+    declared = normalize_host(seed.get("domain"))
+    urls = [seed.get(k) for k in ("destination_url", "canonical_url") if seed.get(k)]
+    listings = [listing_identity(value) for value in urls]
+    if (
+        not domain
+        or declared not in (None, domain)
+        or not listings
+        or any(item is None or item[0] != domain for item in listings)
+        or not seed.get("market")
+    ):
+        return None
+    seller = str(seed.get("seller_ref") or "").strip()
+    if not seller:
+        data = as_json(seed.get("seed_data"))
+        data = data if isinstance(data, dict) else {}
+        snapshot = as_json(data.get("snapshot"))
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        brand = snapshot.get("brand") or data.get("brand") or product.get("brand")
+        try:
+            seller = resolve_seed_seller_identity(brand=brand, domain=domain)["merchant_id"]
+        except ValueError:
+            return None
+    if seller != product["merchant_id"]:
+        return None
+    return {"seed_listing_identities": set(listings), "seed_market": seed["market"]}
+
+
 def own_availability(variant):
-    raw = variant.get("availability") or variant.get("stock")
-    if raw is None and isinstance(variant.get("available"), bool):
-        return "in_stock" if variant["available"] else "out_of_stock"
-    normalized = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
-    return {
+    mapping = {
         "in_stock": "in_stock",
         "instock": "in_stock",
         "available": "in_stock",
@@ -99,7 +145,19 @@ def own_availability(variant):
         "unavailable": "out_of_stock",
         "low_stock": "low_stock",
         "limited": "low_stock",
-    }.get(normalized, "unknown")
+    }
+    states = {
+        mapping.get(str(variant.get(key) or "").strip().lower().replace("-", "_").replace(" ", "_"), "unknown")
+        for key in ("availability", "stock")
+    }
+    # An explicit unavailability signal wins over any contradictory positive signal.
+    if variant.get("available") is False or "out_of_stock" in states:
+        return "out_of_stock"
+    if "low_stock" in states:
+        return "low_stock"
+    if variant.get("available") is True or "in_stock" in states:
+        return "in_stock"
+    return "unknown"
 
 
 def plan_offers(product, variants, skus, templates, existing):
@@ -130,6 +188,16 @@ def plan_offers(product, variants, skus, templates, existing):
             counts["missing_or_ambiguous_variant"] += 1
             continue
         variant = candidates[0]
+        # Numeric and Shopify GID aliases must identify the same physical variant.
+        # A label match or one preferred field must never override a conflicting ID.
+        aliases = set()
+        for key in ("variant_id", "id", "shopify_variant_id"):
+            claim = re.fullmatch(r"(?:gid://shopify/ProductVariant/)?([0-9]+)", str(variant.get(key) or "").strip())
+            if claim:
+                aliases.add(claim.group(1))
+        if aliases != {vid.rsplit("/", 1)[-1]}:
+            counts["conflicting_variant_identity"] += 1
+            continue
         price = variant_own_price(variant)
         currency = str(variant.get("price_currency") or variant.get("currency") or "").strip().upper()
         if (
@@ -177,7 +245,15 @@ def plan_offers(product, variants, skus, templates, existing):
                 )
             except (ValueError, TypeError):
                 valid = False
-            if not valid or template.get("source_domain") != product.get("source_domain"):
+            if (
+                not valid
+                or template.get("source_domain") != product.get("source_domain")
+                or ("seed_market" in product and market != product["seed_market"])
+                or (
+                    "seed_listing_identities" in product
+                    and listing_identity(destination) not in product["seed_listing_identities"]
+                )
+            ):
                 counts["destination_or_seller_mismatch"] += 1
                 continue
             row = dict(
@@ -233,6 +309,10 @@ async def project_missing_variant_offers(product_key, *, apply=False, db=None):
         )
         if len(seeds) != 1:
             return {"planned": 0, "inserted": 0, "skips": {"active_attached_seed_missing": 1}}
+        scope = seed_scope(product, dict(seeds[0]))
+        if scope is None:
+            return {"planned": 0, "inserted": 0, "skips": {"seed_listing_or_seller_mismatch": 1}}
+        product.update(scope)
         skus = [
             dict(s)
             for s in await db.fetch_all(

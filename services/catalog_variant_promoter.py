@@ -742,6 +742,13 @@ async def promote_variants_for_group(
     write_failures = 0
     if apply and rows_to_upsert:
         async with database.transaction():
+            # Match the projector's product -> seed -> SKU -> offer lock order.
+            # Taking a SKU lock first can deadlock with concurrent repair/sync.
+            if primary.get("source_system") == "external_product_seeds_mirror_v1":
+                await database.fetch_one(
+                    "SELECT product_key FROM catalog_products WHERE product_key=:pk FOR UPDATE",
+                    {"pk": primary["product_key"]},
+                )
             for r in rows_to_upsert:
                 params = {
                     "readiness_tier": readiness_tier,

@@ -552,12 +552,15 @@ async def test_mirror_promotion_projects_offer_pairs_after_sku_writes(monkeypatc
     from services import catalog_variant_offer_projection as projection
     executed = _install_fake_db(monkeypatch)
     original = promoter.database.fetch_one
+    reads = []
     async def mirror_primary(sql, params=None):
+        reads.append(str(sql))
         return dict(await original(sql, params), source_system=projection.MIRROR)
     monkeypatch.setattr(promoter.database, "fetch_one", mirror_primary)
     project = AsyncMock(return_value={"inserted": 2, "planned": 2, "skips": {}})
     monkeypatch.setattr(projection, "project_missing_variant_offers", project)
     out = await promoter.promote_variants_for_group(group_id="pg_x", apply=True)
+    assert "FOR UPDATE" in reads[1] and "catalog_products" in reads[1]
     assert len(executed) == 2
     project.assert_awaited_once_with(out.primary_product_key, apply=True, db=promoter.database)
     assert out.variant_offers_created == 2
