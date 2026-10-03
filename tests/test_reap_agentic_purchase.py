@@ -4490,7 +4490,8 @@ async def _manual_case(status='COMPLETED', state='awaiting_approval'):
     evidence={'source':'authenticated_reap_checkout_read','authoritative_verified':True,'reference':'support_case_synthetic_1','observed_at':datetime.now(timezone.utc),'provider_base_url':'https://sandbox.api.reap.global','payload':dict(CHECKOUT_COMPLETED,status=status,id=row['reap_checkout_id'])}
     return pid,row,evidence
 
-async def test_manual_preview_and_exact_replay_are_read_only(reap,attribution):
+async def test_manual_preview_and_exact_replay_are_read_only(reap,manual_attribution):
+    attribution = manual_attribution
     from services.reap_checkout_recovery import resolve_checkout_manually
     from db.database import database
     pid,row,evidence=await _manual_case()
@@ -4537,7 +4538,8 @@ async def test_manual_refuses_unverified_or_unfenced_outcomes(reap,attribution,d
     assert reap.calls==[] and attribution.calls==[]
 
 @pytest.mark.parametrize('failure',['audit','terminal','edge'])
-async def test_manual_failure_rolls_back_audit_outcome_and_claim(reap,attribution,monkeypatch,failure):
+async def test_manual_failure_rolls_back_audit_outcome_and_claim(reap,manual_attribution,monkeypatch,failure):
+    attribution = manual_attribution
     from db.database import database
     from services.reap_checkout_recovery import resolve_checkout_manually
     import services.reap_agentic_purchase as svc
@@ -4662,3 +4664,109 @@ async def test_manual_other_channel_claim_is_audited_completion_without_reap_edg
     assert audit['attribution_outcome']=='closed_by_other_channel'
     assert dict(await database.fetch_one('SELECT * FROM conversion_click_claims WHERE click_id=:click',{'click':click}))==before
     assert reap.calls==[] and attribution.calls==[]
+
+
+# Manual completion validates real persisted attribution, including replay collisions.
+import services.commerce_attribution_service as _manual_cas
+_MANUAL_REAL_EXTERNAL_CLOSE = _manual_cas.close_external_order_conversion
+
+@pytest.fixture
+async def manual_attribution(monkeypatch):
+    from db.database import IS_POSTGRES
+    from sqlalchemy.schema import CreateTable
+    from sqlalchemy.dialects import sqlite, postgresql
+    dialect = postgresql.dialect() if IS_POSTGRES else sqlite.dialect()
+    for table in (_manual_cas.commerce_attribution_edges, _manual_cas.surface_click_events):
+        await database.execute('DROP TABLE IF EXISTS ' + table.name)
+        await database.execute(str(CreateTable(table).compile(dialect=dialect)))
+    await database.execute('CREATE UNIQUE INDEX manual_ext_order ON commerce_attribution_edges(merchant_id,external_order_id)')
+    if not IS_POSTGRES:
+        original_fetch = database.fetch_one
+        async def sqlite_fetch(query, values=None):
+            if isinstance(query, str) and 'INSERT INTO commerce_attribution_edges' in query:
+                query = query.replace("'[]'::jsonb", "'[]'").replace('CAST(:metadata AS JSONB)', ':metadata')
+            return await original_fetch(query, values)
+        monkeypatch.setattr(database, 'fetch_one', sqlite_fetch)
+    recorder = Attribution()
+    async def real_close(**kwargs):
+        recorder.calls.append(kwargs)
+        if recorder.raises is not None:
+            raise recorder.raises
+        return await _MANUAL_REAL_EXTERNAL_CLOSE(**kwargs)
+    monkeypatch.setattr(_manual_cas, 'close_external_order_conversion', real_close)
+    return recorder
+
+async def _persist_manual_expected_edge(row, evidence):
+    # Use the actual attribution sink, not a fabricated success receipt.
+    completed = dict(row, reap_order_id=evidence['payload']['orderId'], final_total_minor=4500)
+    assert await svc._close_attribution(completed)
+    return dict(await database.fetch_one('SELECT * FROM commerce_attribution_edges WHERE external_order_id=:order', {'order': completed['reap_order_id']}))
+
+@pytest.mark.parametrize('defect', ['amount', 'currency', 'click', 'agent', 'order', 'state', 'source', 'purchase_provenance', 'checkout_provenance', 'partner_reported', 'metadata_missing'])
+async def test_manual_durable_edge_collision_cannot_be_audited_closed(reap, manual_attribution, defect):
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid, row, evidence = await _manual_case()
+    edge = await _persist_manual_expected_edge(row, evidence)
+    fields = {'amount': ('gross_attributed_gmv_cents',1), 'currency':('currency','EUR'), 'click':('click_id','foreign_click'), 'agent':('agent_id','foreign_agent'), 'order':('order_id','foreign_synthetic_order'), 'state':('state','refunded'), 'source':('source','other_channel')}
+    if defect in fields:
+        name, value = fields[defect]
+        await database.execute('UPDATE commerce_attribution_edges SET '+name+'=:value WHERE edge_id=:edge', {'value':value, 'edge':edge['edge_id']})
+    else:
+        metadata = edge['metadata']
+        if isinstance(metadata,str): metadata=json.loads(metadata)
+        if defect=='metadata_missing':metadata={}
+        elif defect=='purchase_provenance':metadata['partner_provenance']['purchase_id']='other_purchase'
+        elif defect=='checkout_provenance':metadata['partner_provenance']['reap_checkout_id']='other_checkout'
+        else:metadata['partner_provenance']['partner_reported']=False
+        await database.execute(_manual_cas.commerce_attribution_edges.update().where(_manual_cas.commerce_attribution_edges.c.edge_id==edge['edge_id']).values(metadata=metadata))
+    before=dict(await database.fetch_one('SELECT * FROM commerce_attribution_edges WHERE edge_id=:edge',{'edge':edge['edge_id']}))
+    reap.calls.clear()
+    with pytest.raises(RuntimeError, match='manual_attribution_persisted_'):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    assert dict(await database.fetch_one('SELECT * FROM commerce_attribution_edges WHERE edge_id=:edge',{'edge':edge['edge_id']}))==before
+    assert reap.calls==[]
+
+@pytest.mark.parametrize('defect', ['absent_edge','absent_receipt'])
+async def test_manual_durable_edge_requires_both_receipt_and_persisted_evidence(reap,manual_attribution,monkeypatch,defect):
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid,row,evidence=await _manual_case()
+    original=_manual_cas.close_external_order_conversion
+    async def missing(**kwargs):
+        if defect=='absent_receipt':
+            await original(**kwargs)
+            return None
+        return {'edge_id':_manual_cas._ext_edge_keys(kwargs['merchant_id'],kwargs['external_order_id'])[0]}
+    monkeypatch.setattr(_manual_cas,'close_external_order_conversion',missing)
+    with pytest.raises(RuntimeError,match='manual_attribution_'):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    assert await database.fetch_val('SELECT count(*) FROM commerce_attribution_edges')==0
+
+async def test_manual_durable_matching_replay_closes_exactly_one_edge(reap,manual_attribution):
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid,row,evidence=await _manual_case()
+    edge=await _persist_manual_expected_edge(row,evidence)
+    result=await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert result['state']=='completed'
+    assert await database.fetch_val('SELECT count(*) FROM commerce_attribution_edges')==1
+    assert await database.fetch_val('SELECT attribution_outcome FROM reap_checkout_manual_resolution_audit')=='edge_closed'
+    assert dict(await database.fetch_one('SELECT * FROM commerce_attribution_edges WHERE edge_id=:edge',{'edge':edge['edge_id']}))==edge
+
+async def test_manual_foreign_reap_click_claim_is_not_merchant_channel(reap,manual_attribution):
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid,row,evidence=await _manual_case()
+    click='synthetic_foreign_reap_claim'
+    cart=f'https://brand.example/cart/49922977038613:1?attributes[pivota_click_id]={click}&country=US'
+    await database.execute("UPDATE reap_agentic_purchases SET item_source='cart_link',cart_url=:cart,click_id=:click WHERE id=:id",{'id':pid,'cart':cart,'click':click})
+    assert await svc.ccc.claim_click(click,claimed_by=svc.ccc.REAP_CLAIMANT,external_order_id='foreign_reap_order')
+    before=dict(await database.fetch_one('SELECT * FROM conversion_click_claims WHERE click_id=:click',{'click':click}))
+    row=await _get(pid)
+    with pytest.raises(RuntimeError,match='manual_attribution_claim_conflict'):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    assert await database.fetch_val('SELECT count(*) FROM commerce_attribution_edges')==0
+    assert dict(await database.fetch_one('SELECT * FROM conversion_click_claims WHERE click_id=:click',{'click':click}))==before

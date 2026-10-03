@@ -101,6 +101,7 @@ the client is the only thing that can, and the tests replace it.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -3595,6 +3596,15 @@ async def _complete(
             reason = ccc.ATTRIBUTION_CLAIM_UNAVAILABLE
         else:
             if not claimed:
+                if strict_attribution:
+                    actual_claim = await database.fetch_one(
+                        _MANUAL_ATTRIBUTION_CLAIM_SQL,
+                        {"click_id": row.get("click_id")},
+                    )
+                    if (not allow_other_channel or actual_claim is None
+                            or actual_claim["claimed_by"] != ccc.MERCHANT_CLAIMANT
+                            or not str(actual_claim["external_order_id"] or "").strip()):
+                        raise RuntimeError("manual_attribution_claim_conflict")
                 reason = ccc.CLOSED_BY_OTHER_CHANNEL
 
     moved = await _move(
@@ -3750,8 +3760,12 @@ async def _close_attribution(purchase: Mapping[str, Any], *, strict: bool = Fals
             converting_shop_domain=converting_shop,
             is_self_report=False,
         )
-        if strict and (not isinstance(edge, Mapping) or not edge.get("edge_id")):
-            raise RuntimeError("manual_attribution_edge_missing")
+        if strict:
+            # A close receipt may be a synthesized replay ID after ON CONFLICT DO
+            # NOTHING. Only the durable edge can establish an audited closure.
+            if not isinstance(edge, Mapping) or not edge.get("edge_id"):
+                raise RuntimeError("manual_attribution_edge_missing")
+            await _verify_manual_attribution_edge(purchase, merchant_id, edge)
     except Exception as exc:  # noqa: BLE001 — deliberately broad; see the docstring
         if strict:
             raise
@@ -3762,6 +3776,70 @@ async def _close_attribution(purchase: Mapping[str, Any], *, strict: bool = Fals
         )
         return False
     return True
+
+
+_MANUAL_ATTRIBUTION_CLAIM_SQL = """
+    SELECT claimed_by, external_order_id
+      FROM conversion_click_claims
+     WHERE click_id = :click_id
+"""
+
+
+_MANUAL_ATTRIBUTION_EDGE_SQL = """
+    SELECT edge_id, merchant_id, order_id, external_order_id, click_id, agent_id,
+           state, source, gross_attributed_gmv_cents, currency, metadata
+      FROM commerce_attribution_edges
+     WHERE merchant_id = :merchant_id AND external_order_id = :external_order_id
+"""
+
+
+async def _verify_manual_attribution_edge(
+    purchase: Mapping[str, Any], merchant_id: str, receipt: Mapping[str, Any]
+) -> None:
+    """Validate persisted attribution inside the caller's atomic decision transaction.
+
+    Never repair/overwrite a conflicting edge. The manual transaction must roll back
+    its terminal outcome and audit when the existing order slot has different evidence.
+    """
+    from services.commerce_attribution_service import _ext_edge_keys
+
+    external_order = str(purchase.get("reap_order_id") or "")
+    raw = await database.fetch_one(
+        _MANUAL_ATTRIBUTION_EDGE_SQL,
+        {"merchant_id": merchant_id, "external_order_id": external_order},
+    )
+    if raw is None:
+        raise RuntimeError("manual_attribution_persisted_edge_missing")
+    stored = dict(raw)
+    expected_edge, expected_order = _ext_edge_keys(merchant_id, external_order)
+    expected = {
+        "edge_id": expected_edge,
+        "merchant_id": merchant_id,
+        "order_id": expected_order,
+        "external_order_id": external_order,
+        "click_id": purchase.get("click_id"),
+        "agent_id": purchase.get("agent_id"),
+        "state": "converted",
+        "source": "external_redirect",
+        "gross_attributed_gmv_cents": purchase.get("final_total_minor"),
+        "currency": purchase.get("currency"),
+    }
+    if receipt.get("edge_id") != expected_edge or any(stored.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("manual_attribution_persisted_edge_conflict")
+    metadata = stored.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (ValueError, TypeError):
+            metadata = None
+    provenance = metadata.get("partner_provenance") if isinstance(metadata, Mapping) else None
+    if (not isinstance(provenance, Mapping)
+            or provenance.get("partner_reported") is not True
+            or provenance.get("purchase_id") != purchase.get("id")
+            or provenance.get("reap_checkout_id") != purchase.get("reap_checkout_id")
+            or metadata.get("seller_mismatch") is True
+            or metadata.get("seller_domain_unverified") is True):
+        raise RuntimeError("manual_attribution_persisted_provenance_conflict")
 
 
 _RECONCILE_CART_PURCHASE_SQL = """
