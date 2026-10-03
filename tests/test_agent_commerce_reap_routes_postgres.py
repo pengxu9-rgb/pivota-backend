@@ -330,6 +330,8 @@ async def _db():
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
+    monkeypatch.delenv("REAP_AGENTIC_CREATE_ENABLED", raising=False)
+    monkeypatch.delenv("REAP_AGENTIC_PILOT_SCOPE", raising=False)
     monkeypatch.setenv("REAP_AGENTIC_ENABLED", "1")
     monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
     monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
@@ -2528,6 +2530,10 @@ async def test_disarmed_status_read_retains_identity_checks_and_has_no_provider_
     CALLER.agent_user_ref = None
     denied = await client.get(f"{BASE}/purchases/{purchase_id}")
     assert denied.status_code == 401 and _error(denied) == "agent_user_required"
+
+
+
+
 
 
 # Durable recovery never opens another checkout or refreshes identity/consent.

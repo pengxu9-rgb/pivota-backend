@@ -23,6 +23,10 @@ catalog_skus row per real variant. After this:
     under one canonical PDP — same UX as Sephora / Ulta / Tom Ford's
     own site
 
+For external-seed mirrors, successful SKU writes also project missing variant offers
+from the active attached seed. Existing offers are preserved and checkout readiness
+is never inferred from this projection.
+
 What this service does NOT do:
   - Touch catalog_products. Identity stays where it is.
   - Touch seed_data / product_payload. Variants are already there —
@@ -139,6 +143,7 @@ class GroupOutcome:
     variants_tier_held: int = 0
     skipped_reason: Optional[str] = None
     sample_variant_titles: List[str] = field(default_factory=list)
+    variant_offers_created: int = 0
     #: Rows refused by the OTHER unique constraint — same sku_key, different
     #: identity tuple. Counted rather than fatal; see the upsert loop.
     #:
@@ -162,6 +167,7 @@ class GroupOutcome:
 
 @dataclass
 class PromoterReport:
+    variant_offers_created: int = 0
     groups_considered: int = 0
     #: Groups where at least one row's tier could move. A group on the redirect lane
     #: is written but never promoted; it is `groups_tier_held`, not this.
@@ -444,6 +450,7 @@ SELECT_GROUP_PRIMARY_SQL = """
            cp.platform,
            cp.source_product_id,
            cp.catalog_track,
+           cp.source_system,
            cp.title AS parent_title,
            cp.product_payload AS product_payload,
            eps.seed_data AS seed_data
@@ -454,6 +461,10 @@ SELECT_GROUP_PRIMARY_SQL = """
      AND cp.source_product_id = pgm.platform_product_id
     LEFT JOIN external_product_seeds eps
       ON eps.external_product_id = cp.source_product_id
+     AND eps.attached_product_key = cp.product_key
+     AND eps.status = 'active'
+     AND (cp.source_system IS DISTINCT FROM 'external_product_seeds_mirror_v1'
+          OR eps.id::text = cp.source_ref)
     WHERE pgm.product_group_id = :group_id
       AND pgm.is_primary = TRUE
     LIMIT 1
@@ -724,12 +735,20 @@ async def promote_variants_for_group(
     # move, and the counter says which.
     tier_can_move = readiness_tier != "referral_only"
 
+    projected_offers = 0
     promoted = 0
     tier_held = 0
     identity_conflicts = 0
     write_failures = 0
     if apply and rows_to_upsert:
         async with database.transaction():
+            # Match the projector's product -> seed -> SKU -> offer lock order.
+            # Taking a SKU lock first can deadlock with concurrent repair/sync.
+            if primary.get("source_system") == "external_product_seeds_mirror_v1":
+                await database.fetch_one(
+                    "SELECT product_key FROM catalog_products WHERE product_key=:pk FOR UPDATE",
+                    {"pk": primary["product_key"]},
+                )
             for r in rows_to_upsert:
                 params = {
                     "readiness_tier": readiness_tier,
@@ -799,6 +818,14 @@ async def promote_variants_for_group(
                         r.source_variant_id, str(exc)[:200],
                     )
 
+            if primary.get("source_system") == "external_product_seeds_mirror_v1":
+                from services.catalog_variant_offer_projection import project_missing_variant_offers
+                offer_result = await project_missing_variant_offers(
+                    primary["product_key"], apply=True, db=database
+                )
+                projected_offers = offer_result["inserted"]
+                logger.info("variant offer projection product=%s result=%s", primary["product_key"], offer_result)
+
     return GroupOutcome(
         product_group_id=group_id,
         primary_product_key=primary["product_key"],
@@ -813,6 +840,7 @@ async def promote_variants_for_group(
             tier_held if apply else (0 if tier_can_move else len(rows_to_upsert))
         ),
         sample_variant_titles=sample_titles,
+        variant_offers_created=projected_offers,
         skus_identity_conflict=identity_conflicts,
         skus_write_failed=write_failures,
         skus_deduped_same_identity=identity_collisions,
@@ -896,6 +924,7 @@ async def promote_variants_all(
         report.groups_considered += 1
         outcome = await promote_variants_for_group(group_id=gid, apply=apply)
         report.per_group.append(outcome)
+        report.variant_offers_created += outcome.variant_offers_created
         if outcome.skipped_reason == "no_primary_for_group":
             report.groups_skipped_no_primary += 1
         elif outcome.skipped_reason == "no_real_variants":

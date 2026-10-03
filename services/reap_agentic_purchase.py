@@ -148,6 +148,8 @@ __all__ = [
     "is_create_enabled",
     "enforce_pilot_scope",
     "is_reconciliation_enabled",
+    "is_create_enabled",
+    "enforce_pilot_scope",
     "start_purchase",
     "transport_backoff_seconds",
     "verify_cart_link_quote",
@@ -2152,7 +2154,7 @@ async def _move(
 
 
 #: Release codes logged at WARNING only the first time in a row; see `_release`.
-_QUIET_WHEN_REPEATED = frozenset({"enrollment_settling"})
+_QUIET_WHEN_REPEATED = frozenset({"enrollment_settling", "enrollment_pending"})
 
 
 async def _release(
@@ -3878,7 +3880,10 @@ async def _complete(
     # `buyer_email` and `shipping_address`, so what comes back has no PII in it at all — which is
     # exactly the row the hook should see.
     completed = await ledger.get_purchase_internal(str(row["id"])) or {}
-    closed = await _close_attribution(completed, strict=strict_attribution)
+    # Preserve the ordinary completion hook contract; only audited manual resolution
+    # requests strict durable attribution validation.
+    closed = (await _close_attribution(completed, strict=True) if strict_attribution
+              else await _close_attribution(completed))
     if strict_attribution and closed is not True:
         raise RuntimeError("manual_attribution_not_closed")
     if claimed and not closed:

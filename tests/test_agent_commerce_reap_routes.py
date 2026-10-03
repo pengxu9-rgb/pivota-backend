@@ -247,6 +247,8 @@ async def _db():
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
+    monkeypatch.delenv("REAP_AGENTIC_CREATE_ENABLED", raising=False)
+    monkeypatch.delenv("REAP_AGENTIC_PILOT_SCOPE", raising=False)
     monkeypatch.setenv("REAP_AGENTIC_ENABLED", "1")
     monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
     monkeypatch.setenv("REAP_API_KEY", "sk_test_key")
@@ -4032,6 +4034,10 @@ async def test_disarmed_status_read_retains_identity_checks_and_has_no_provider_
     assert denied.status_code == 401 and _error(denied) == "agent_user_required"
 
 
+
+
+
+
 # Durable recovery never opens another checkout or refreshes identity/consent.
 @pytest.mark.parametrize("state", ["awaiting_approval", "processing", "completed"])
 async def test_recovery_after_25_days_is_read_only_while_create_is_paused(client, monkeypatch, state):
@@ -4492,3 +4498,41 @@ async def test_a_partial_pilot_allowlist_fails_closed(client, monkeypatch, missi
     response = await client.post(f"{BASE}/purchases", json=_body())
     assert response.status_code == 404 and _error(response) == "not_available_on_this_rail", response.text
     assert svc.is_create_enabled() is False
+@pytest.mark.parametrize("selection,expected", [("proven", 202), ("other", 409), ("missing", 409)])
+async def test_explicit_multi_variant_mirror_selection_keeps_proof_authoritative(client, monkeypatch, selection, expected):
+    other_variant = "49819267301654"
+    other_key = f"{LIVE_PK}::v:{other_variant}"
+    await _seed_named_variant_mirror(env="prod", skus=LIVE_PROD_SKUS + ((other_key, other_variant),), seed_data=_named_variant_seed())
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    selected = {"proven": LIVE_SKU_PROMOTED, "other": other_key, "missing": None}[selection]
+    response = await client.post(f"{BASE}/purchases", json={**_live_body(), "variant_key": selected, "idempotency_key": "selected-variant-replay"})
+    assert response.status_code == expected, response.text
+    if expected == 202:
+        row = await _purchase_row(response.json()["purchase_id"])
+        replay = await client.post(f"{BASE}/purchases", json={**_live_body(), "variant_key": selected, "idempotency_key": "selected-variant-replay"})
+        assert replay.status_code == 202 and replay.json()["purchase_id"] == response.json()["purchase_id"]
+        changed = await client.post(f"{BASE}/purchases", json={**_live_body(), "variant_key": other_key, "idempotency_key": "selected-variant-replay"})
+        assert changed.status_code == 409 and _error(changed) == "idempotency_conflict"
+        assert f"/cart/{LIVE_VARIANT}:1?" in row["cart_url"]
+        assert row["our_price_minor"] == 1399
+    else:
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+@pytest.mark.parametrize('choice', [0, 1])
+async def test_two_selected_mirror_sizes_have_independent_proofs_and_prices(client, monkeypatch, choice):
+    from scripts.backfill_shopify_variant_ids import build_selected_variant_proofs
+    second='42199434526795'
+    second_key=f'{KRAVE_PK}::v::{second}'
+    await _seed_krave_mirror(offers=[(KRAVE_REAL, KRAVE_MERCHANT, '16.00'),(second_key, KRAVE_MERCHANT, '27.00')])
+    await database.execute("INSERT INTO catalog_skus (sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency) VALUES (:sk,:pk,:m,'external_seed',:ext,:vid,'2 Pack','USD')", {'sk':second_key,'pk':KRAVE_PK,'m':KRAVE_MERCHANT,'ext':KRAVE_EXT,'vid':second})
+    ids=[KRAVE_VARIANT,second]
+    variants=[{'shopify_variant_id':vid,'variant_id':vid} for vid in ids]
+    payload={'handle':'24-carrot-retinal','variants':[{'id':int(vid),'available':True,'title':title,'price':price} for vid,title,price in zip(ids,['1 Pack','2 Pack'],[1600,2700])]}
+    seed={'snapshot':{'brand':'KraveBeauty','variants':variants,'storefront_platform':'shopify','storefront_platform_source':'products_js_v1','shopify_cart_variant_proofs':build_selected_variant_proofs(variants,payload,js_url=f'https://{KRAVE_DOMAIN}/products/24-carrot-retinal.js',checked_at=datetime.now(timezone.utc))}}
+    await database.execute('UPDATE external_product_seeds SET seed_data=:data WHERE id=:id',{'data':json.dumps(seed),'id':KRAVE_SEED})
+    monkeypatch.setenv('REAP_AGENTIC_CART_LINK_ENABLED','1')
+    response=await client.post(f'{BASE}/purchases',json={**_krave_body(),'variant_key':[KRAVE_REAL,second_key][choice]})
+    assert response.status_code==202,response.text
+    row=await _purchase_row(response.json()['purchase_id'])
+    assert row['our_price_minor']==[1600,2700][choice]
+    assert f'/cart/{ids[choice]}:1?' in row['cart_url']

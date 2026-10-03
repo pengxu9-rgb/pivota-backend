@@ -31,6 +31,14 @@ still evaluates the live expression and is untouched, and
 therefore still costs nothing; that ordering is what makes it safe to turn this
 on immediately rather than staging it.
 
+FRESHNESS FOLLOW-UP (2026-10-02). The gateway now requires a true result computed within
+seven days for uncovered-anchor priority. A drift-only queue never revisits an unchanged
+true/false row, so those correct rows eventually disappear from that pool. Candidates now
+include missing, future and older-than-48-hour timestamps, still using the existing owner
+expression/writer and a 2,000-row cap. Stale is unknown confidence, not proof of a failure:
+the age counter remains separate from IS DISTINCT FROM drift and never changes the value
+without recomputing its predicate. A current matching row stays untouched.
+
 DRIFT IS `IS DISTINCT FROM`, NOT `!=`. The column starts NULL on every row, and
 `NULL != true` is NULL — not true — so a `!=` predicate would report zero drift
 against a completely empty column. That is the exact shape of "no-op behind a
@@ -41,6 +49,7 @@ Env:
   PDP_WILL_RENDER_RECONCILE_ENABLED   default true — off without a deploy
   PDP_WILL_RENDER_RECONCILE_LIMIT     default 2000 rows per tick
   PDP_WILL_RENDER_DRIFT_ALERT_THRESHOLD  default 500 — post-pass alarm
+  PDP_WILL_RENDER_RECONCILE_STALE_HOURS default 48, clamped 1–144
 """
 
 from __future__ import annotations
@@ -64,6 +73,8 @@ logger = logging.getLogger("pdp_renderability_reconciler")
 _ENV_ENABLED = "PDP_WILL_RENDER_RECONCILE_ENABLED"
 _ENV_LIMIT = "PDP_WILL_RENDER_RECONCILE_LIMIT"
 _ENV_DRIFT_THRESHOLD = "PDP_WILL_RENDER_DRIFT_ALERT_THRESHOLD"
+_ENV_STALE_HOURS = "PDP_WILL_RENDER_RECONCILE_STALE_HOURS"
+_DEFAULT_STALE_HOURS = 48
 
 # 2000/tick against 14,104 rows converges a cold column in ~8 six-hourly passes,
 # or one afternoon of manual ticks. Deliberately not "all of it": the drift query
@@ -93,7 +104,20 @@ def _int_env(name: str, default: int, *, floor: int) -> int:
 
 
 def _limit() -> int:
-    return _int_env(_ENV_LIMIT, _DEFAULT_LIMIT, floor=1)
+    return min(_DEFAULT_LIMIT, _int_env(_ENV_LIMIT, _DEFAULT_LIMIT, floor=1))
+
+
+def _stale_hours() -> int:
+    # A consumer requires checks within seven days. Two days leaves several bounded passes
+    # to rotate the table; never let an env typo silently disable freshness or remove bounds.
+    return min(144, _int_env(_ENV_STALE_HOURS, _DEFAULT_STALE_HOURS, floor=1))
+
+
+def stale_predicate():
+    computed_at = sa.literal_column(f"catalog_products.{COLUMN_COMPUTED_AT}")
+    return sa.or_(computed_at.is_(None),
+                  computed_at < sa.func.now() - sa.text(f"interval '{_stale_hours()} hours'"),
+                  computed_at > sa.func.now())
 
 
 def _drift_alert_threshold() -> int:
@@ -128,6 +152,7 @@ def drift_select():
 def candidates_select(limit: int):
     """Stalest-first: never-computed rows before merely-outdated ones.
 
+    Includes unchanged old results: drift convergence alone cannot prove recent validation.
     NULLS FIRST is load-bearing on the first runs — without it a cold column
     would be walked in arbitrary order and the "has every row been visited yet"
     question becomes unanswerable.
@@ -135,9 +160,11 @@ def candidates_select(limit: int):
     computed_at = sa.literal_column(f"catalog_products.{COLUMN_COMPUTED_AT}")
     return (
         sa.select(catalog_products.c.product_key)
-        .where(drift_predicate())
-        .order_by(computed_at.asc().nullsfirst())
-        .limit(limit)
+        .where(sa.or_(drift_predicate(), stale_predicate()))
+        .order_by(sa.case((sa.or_(computed_at.is_(None), computed_at > sa.func.now()), sa.literal_column("0")),
+                          else_=sa.literal_column("1")),
+                  computed_at.asc().nullsfirst())
+        .limit(max(1, min(_DEFAULT_LIMIT, int(limit))))
     )
 
 
@@ -155,6 +182,7 @@ async def count_pdp_will_render_drift(db: Any) -> Dict[str, int]:
             sa.func.count().filter(drift_predicate()).label("total"),
             sa.func.count().filter(_persisted_col().is_(None)).label("never_computed"),
             sa.func.count().filter(computed_at.is_(None)).label("never_stamped"),
+            sa.func.count().filter(stale_predicate()).label("stale"),
         ).select_from(catalog_products)
     )
     total = int((row["total"] if row is not None else 0) or 0)
@@ -165,6 +193,7 @@ async def count_pdp_will_render_drift(db: Any) -> Dict[str, int]:
         "never_computed": never,
         "never_stamped": stamped,
         "disagreeing": max(0, total - never),
+        "stale": int((row["stale"] if row is not None else 0) or 0),
     }
 
 
@@ -210,6 +239,8 @@ async def run_pdp_will_render_reconcile_tick() -> Dict[str, Any]:
         "drift_before": before["total"],
         "drift_after": after["total"],
         "never_computed_after": after["never_computed"],
+        "stale_before": before["stale"],
+        "stale_after": after["stale"],
     }
 
     # Post-pass alarm, mirroring the agent_pdp_view reconciler: a pass that runs
