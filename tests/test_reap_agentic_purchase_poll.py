@@ -2043,7 +2043,7 @@ async def _start_scheduler(monkeypatch, **env):
     from unittest.mock import MagicMock
     monkeypatch.setattr(stripe, "StripeClient", MagicMock())
 
-    for k in ("AUDIT_WORKER_ENABLED", "RAILWAY_SERVICE_NAME", "RAILWAY_ENVIRONMENT"):
+    for k in ("AUDIT_WORKER_ENABLED", "RAILWAY_SERVICE_NAME", "RAILWAY_ENVIRONMENT", "PIVOTA_ENV"):
         monkeypatch.delenv(k, raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
