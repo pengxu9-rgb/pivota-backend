@@ -171,18 +171,18 @@ async def _run(args: argparse.Namespace) -> int:
 
         corrections.sort(key=lambda x: -x["usd_offers"])
         total = sum(c["usd_offers"] for c in corrections)
-        print(f"=== {len(corrections)} domains to relabel ({total} USD-stamped offers); "
+        print(f"=== {len(corrections)} domains requiring variant-level price review ({total} USD-stamped offers); "
               f"{unresolved} domains unresolved (left as-is) ===")
         for c in corrections:
             print(f"  {c['domain']:32} USD -> {c['true_currency']}/{c['true_market']} "
                   f"offers={c['usd_offers']} "
                   f"(live={c.get('live_offers', 0)} suppressed={c.get('suppressed_offers', 0)})")
         if not corrections:
-            print("\nnothing to correct.")
+            print("\nno domain-level discrepancies found.")
             return 0
         if not args.apply:
-            print(f"\n(DRY-RUN — would relabel {total} offers across "
-                  f"{len(corrections)} domains; pass --apply)")
+            print(f"\n(READ-ONLY — {total} offers across {len(corrections)} domains need "
+                  "variant-level amount and currency evidence; use repair_catalog_variant_prices)")
             return 0
         if args.max_domains and len(corrections) > args.max_domains:
             print(f"\nREFUSED: {len(corrections)} domains exceeds --max-domains "
@@ -208,20 +208,18 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Relabel external-seed offer currency/market from /meta.json.")
+    p = argparse.ArgumentParser(description="Audit domain currency hints; amount corrections require exact variant evidence.")
     p.add_argument("--min-offers", type=int, default=3)
     p.add_argument("--concurrency", type=int, default=8)
     p.add_argument("--max-domains", type=int, default=25,
-                   help="refuse --apply if more than this many domains would be relabelled (0=off)")
+                   help="legacy compatibility option; --apply is always refused")
     p.add_argument("--only-domain", action="append", metavar="DOMAIN",
-                   help="restrict --apply to this domain (repeatable). Classification still "
-                        "runs over every domain; the selection and the writes are narrowed, "
-                        "and held-back domains are listed.")
+                   help="restrict the report to this domain (repeatable); held-back domains are listed")
     p.add_argument("--live-only", action="store_true",
                    help="pre-2026-07-27 scope: skip suppressed offers. Leaves rows "
                         "suppressed FOR a currency defect permanently mislabelled — "
                         "see the module docstring before using this.")
-    p.add_argument("--apply", action="store_true", help="write corrections (else dry-run)")
+    p.add_argument("--apply", action="store_true", help="disabled: domain currency is not evidence of a captured amount's denomination")
     return asyncio.run(_run(p.parse_args(argv)))
 
 
