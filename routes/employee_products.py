@@ -4743,10 +4743,21 @@ def _seed_variant_identifiers(variant: Dict[str, Any]) -> List[str]:
 
 def _seed_variant_stored_price(variant: Dict[str, Any]) -> Any:
     """The price the serving builders read off a stored variant, same precedence."""
-    raw = variant.get("price_amount")
-    if raw is None:
-        raw = variant.get("price") or variant.get("amount") or variant.get("value")
-    return raw
+    for key in ("price_amount", "price", "amount", "value", "list_price"):
+        raw = variant.get(key)
+        if raw not in (None, ""):
+            return raw
+    return None
+
+
+def _native_refresh_variant_ids(variant: Dict[str, Any]) -> set:
+    """Numeric Shopify variant IDs, excluding numeric barcodes and other identifiers."""
+    return {
+        match.group(1)
+        for key in ("variant_id", "id", "shopify_variant_id")
+        if (match := re.fullmatch(r"(?:gid://shopify/ProductVariant/)?([0-9]{8,})",
+                                 str(variant.get(key) or "").strip()))
+    }
 
 
 _MISSING = object()
@@ -4820,8 +4831,13 @@ def _reconcile_seed_variants_with_read(
     `replaced` records every field this call changed, before and after, per variant, so an
     overwrite can be undone.
     """
+    from utils.crawled_price import parse_crawled_price, decimal_hint_from_currency
+
     read_by_id: Dict[str, List[int]] = {}
     read_variants = [rv for rv in (read or []) if isinstance(rv, dict)] if isinstance(census, dict) else []
+    read_native = set().union(*(_native_refresh_variant_ids(rv) for rv in read_variants)) if read_variants else set()
+    read_currencies = {str(rv[k]).strip().upper() for rv in read_variants
+                       for k in ("price_currency", "currency") if rv.get(k)}
     for pos, rv in enumerate(read_variants):
         key = _seed_variant_key(rv)
         if key and not _POSITIONAL_OFFER_ID.match(key):
@@ -4871,11 +4887,35 @@ def _reconcile_seed_variants_with_read(
     re_read = 0
     for idx, original in enumerate(stored):
         v = dict(original)
-        stored_amount = _as_price(_seed_variant_stored_price(v))
+        variant_currency = str(v.get("price_currency") or v.get("currency") or product_cur or "")
+        stored_raw = _seed_variant_stored_price(v)
+        stored_amount = parse_crawled_price(
+            stored_raw, currency=variant_currency,
+            decimal_hint=decimal_hint_from_currency(variant_currency),
+        ).amount
         stored_avail = str(v.get("availability") or "").strip()
-        serves_a_fact = stored_amount is not None or stored_avail.lower() not in _NO_AVAILABILITY_OBSERVATION
+        carries_price = stored_raw not in (None, "")
+        serves_a_fact = carries_price or stored_avail.lower() not in _NO_AVAILABILITY_OBSERVATION
         stored_cur = (
             str(v.get("price_currency") or v.get("currency") or "").strip().upper() or product_cur
+        )
+        # An agreeing product price cannot override an explicit different native variant ID.
+        # Normalize Shopify numeric/GID aliases; merchant SKU codes may still bridge a stored
+        # numeric ID through the existing identifier match or the single-product fallback.
+        stored_native = _native_refresh_variant_ids(v)
+        fallback_identity_ok = len(stored_native) <= 1 and not (
+            stored_native and read_native and read_native != stored_native
+        )
+        stored_codes = {str(v[k]).strip() for k in ("sku", "sku_id") if v.get(k)}
+        read_codes = {_seed_variant_key(rv) for rv in read_variants
+                      if _seed_variant_key(rv) and not _POSITIONAL_OFFER_ID.match(_seed_variant_key(rv))
+                      and not _native_refresh_variant_ids(rv)}
+        if stored_codes and read_codes and not stored_codes.intersection(read_codes):
+            fallback_identity_ok = False
+        stored_currencies = {str(v[k]).strip().upper() for k in ("price_currency", "currency") if v.get(k)}
+        fallback_currency_ok = (
+            (not stored_currencies or stored_currencies == {product_cur})
+            and (not read_currencies or read_currencies == {product_cur})
         )
 
         new_amount: Optional[float] = None
@@ -4884,7 +4924,12 @@ def _reconcile_seed_variants_with_read(
         pos = claims[idx]
         if pos is not None and claimants.get(pos) == 1:
             rv = read_variants[pos]
-            per_variant = not rv.get("id_collided") and not rv.get("offer_aggregate")
+            rv_native = _native_refresh_variant_ids(rv)
+            per_variant = (
+                not rv.get("id_collided") and not rv.get("offer_aggregate")
+                and len(stored_native) <= 1 and len(rv_native) <= 1
+                and not (stored_native and rv_native and stored_native != rv_native)
+            )
             amount = _as_price(rv.get("price_amount"))
             # The offer's OWN currency, never a fallback. The product-level currency reaching
             # this function is the column's (`resolve_external_offer` fabricated USD when the
@@ -4897,15 +4942,17 @@ def _reconcile_seed_variants_with_read(
                 and amount is not None
                 and amount > 0
                 and cur
+                and len(stored_currencies) <= 1
+                and {str(rv[k]).strip().upper() for k in ("price_currency", "currency") if rv.get(k)} == {cur}
                 and (stored_cur is None or cur == stored_cur)
             ):
                 new_amount, new_cur = amount, cur
             avail = str(rv.get("availability") or "").strip()
             if per_variant and avail.lower() not in _NO_AVAILABILITY_OBSERVATION:
                 new_avail = avail
-        if single_takes_price and new_amount is None:
+        if single_takes_price and fallback_identity_ok and fallback_currency_ok and new_amount is None:
             new_amount, new_cur = product_amount, product_cur
-        if single_takes_availability and new_avail is None:
+        if single_takes_availability and fallback_identity_ok and new_avail is None:
             new_avail = product_availability
 
         before = dict(v)
@@ -4943,7 +4990,7 @@ def _reconcile_seed_variants_with_read(
                 }
             )
 
-        was_re_read = new_amount is not None if stored_amount is not None else new_avail is not None
+        was_re_read = new_amount is not None if carries_price else new_avail is not None
         if serves_a_fact:
             if was_re_read:
                 re_read += 1
