@@ -2591,16 +2591,24 @@ async def prepare_reap_purchase_selection(
                 raise svc.PurchaseRefused("row_variant_unverified")
             if str(matches[0].get("currency") or "").strip().upper() != facts["currency"]:
                 raise svc.PurchaseRefused("row_currency_mismatch")
-            # A preparation witness cannot pick a cheapest price from conflicting own
-            # offers. It requires the selected real SKU's current offers to agree.
-            offers = [dict(row) for row in await database.fetch_all(
-                _CART_ALL_OFFERS_SQL.replace("LIMIT 20", "LIMIT 21"),
-                {"product_key": product_key, "sku_key": variant_key, "merchant_id": seller,
-                 "market_currency": _MARKET_CURRENCY.get(market)},
-            )]
-            prices = {ledger.amount_minor_or_none(row.get("price"), facts["currency"]) for row in offers}
-            if len(offers) > 20 or prices != {facts["our_price_minor"]}:
-                raise svc.PurchaseRefused("row_price_ambiguous")
+            # The enabled, source-bound enrichment loader already requires every live
+            # own-listing offer to agree with this SKU's fresh storefront proof in this
+            # read-only snapshot. Its listing owner is distinct from the product seller
+            # of record; a second query under that seller would incorrectly see no offers.
+            # Mirror/Shopify rows retain their independent seller-owned agreement check.
+            enrichment_priced = (
+                svc.is_cart_link_enrichment_enabled()
+                and product.get("source_system") == ENRICHMENT_SOURCE_SYSTEM
+            )
+            if not enrichment_priced:
+                offers = [dict(row) for row in await database.fetch_all(
+                    _CART_ALL_OFFERS_SQL.replace("LIMIT 20", "LIMIT 21"),
+                    {"product_key": product_key, "sku_key": variant_key, "merchant_id": seller,
+                     "market_currency": _MARKET_CURRENCY.get(market)},
+                )]
+                prices = {ledger.amount_minor_or_none(row.get("price"), facts["currency"]) for row in offers}
+                if len(offers) > 20 or prices != {facts["our_price_minor"]}:
+                    raise svc.PurchaseRefused("row_price_ambiguous")
             if not context.can_access_merchant(seller):
                 raise svc.PurchaseRefused("not_available_on_this_rail")
             _require_rail()

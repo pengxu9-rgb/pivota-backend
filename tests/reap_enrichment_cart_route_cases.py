@@ -1490,3 +1490,107 @@ async def test_mirror_and_shopify_rows_answer_the_same_with_the_flag_on_or_off(
     # lookup, which finds nothing) and nothing else of the branch.
     enrichment_reads = [sql for sql in seen if sql in _ENRICHMENT_SQL]
     assert enrichment_reads == ([routes_reap._CART_ENRICHMENT_PRODUCT_SQL] if dial == "1" else [])
+
+# Selected preparation uses the SAME verified enrichment price lane as create.
+# These are real mounted HTTP/catalog/proof checks collected under both engines.
+def enrichment_prepare_body():
+    return {"merchant_domain": TARTE_HOST, "product_key": TARTE_PK,
+            "variant_id": TARTE_VARIANT, "market_country": "US",
+            "quantity": 1, "item_source": "cart_link"}
+
+
+async def test_enrichment_selected_prepare_uses_listing_agreement_not_cp_offer_owner(client, monkeypatch):
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "1")
+    await seed_tarte()
+    assert await database.fetch_val(
+        "SELECT count(*) FROM catalog_offers WHERE merchant_id = :seller",
+        {"seller": TARTE_MERCHANT}) == 0
+    before = (await purchase_count(), await click_count())
+    response = await client.post(f"{BASE}/purchases/prepare", json=enrichment_prepare_body())
+    assert response.status_code == 200, response.text
+    assert response.json()["selection"] == {
+        "product_key": TARTE_PK, "variant_id": TARTE_VARIANT,
+        "variant_key": TARTE_SKU, "merchant_domain": TARTE_HOST,
+        "market": "US", "currency": "USD", "unit_price_minor": 3000,
+        "quantity": 1, "item_source": "cart_link"}
+    assert before == (await purchase_count(), await click_count()) == (0, 0)
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("feature_off", "row_variant_unverified"),
+    ("source_off", "row_variant_unverified"),
+    ("missing_proof", "row_variant_unverified"),
+    ("expired_proof", "row_variant_unverified"),
+    ("wrong_proof_variant", "row_variant_unverified"),
+    ("proof_price_drift", "row_price_stale"),
+    ("wrong_listing", "row_unpriced"),
+    ("no_listing_offers", "row_unpriced"),
+    ("conflicting_price", "row_price_ambiguous"),
+    ("conflicting_currency", "row_price_ambiguous"),
+    ("offer_limit", "row_price_ambiguous"),
+    ("sku_currency", "row_currency_mismatch"),
+    ("sku_seller", "row_variant_unverified"),
+    ("seller_derivation", "seller_identity_unverified"),
+    ("suppressed_sku", "row_variant_unverified"),
+    ("agent_acl", "not_available_on_this_rail"),
+    ("create_off", "not_available_on_this_rail"),
+])
+async def test_enrichment_selected_prepare_keeps_all_price_and_authority_guards(
+    client, monkeypatch, fault, reason,
+):
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "1")
+    await seed_tarte()
+    if fault == "feature_off":
+        monkeypatch.setenv(FLAG, "0")
+    elif fault == "source_off":
+        await database.execute("UPDATE catalog_products SET source_system='untrusted' WHERE product_key=:pk", {"pk": TARTE_PK})
+    elif fault == "missing_proof":
+        await database.execute(f"DELETE FROM {proofs.TABLE}")
+    elif fault == "expired_proof":
+        await database.execute(f"UPDATE {proofs.TABLE} SET checked_at=:old", {"old": _ts(datetime.now(timezone.utc)-timedelta(days=4))})
+    elif fault == "wrong_proof_variant":
+        await database.execute(f"UPDATE {proofs.TABLE} SET variant_id='41234567890999'")
+    elif fault == "proof_price_drift":
+        await database.execute(f"UPDATE {proofs.TABLE} SET live_price_minor=3100")
+    elif fault == "wrong_listing":
+        await database.execute("UPDATE catalog_offers SET source_ref='https://eviltartecosmetics.com/products/flat-blush-brush'")
+    elif fault == "no_listing_offers":
+        await database.execute("DELETE FROM catalog_offers")
+    elif fault in {"conflicting_price", "conflicting_currency", "offer_limit"}:
+        count = 50 if fault == "offer_limit" else 1
+        for index in range(count):
+            await seed_offer(oid=f"selected_conflict_{index}", pk=TARTE_PK, sku_key=TARTE_SKU,
+                             merchant=TARTE_OFFER_MERCHANT, source_ref=TARTE_URL,
+                             price="31.00" if fault == "conflicting_price" else "30.00",
+                             currency="SGD" if fault == "conflicting_currency" else "USD")
+    elif fault == "sku_currency":
+        await database.execute("UPDATE catalog_skus SET currency='SGD' WHERE sku_key=:sk", {"sk": TARTE_SKU})
+    elif fault == "sku_seller":
+        await database.execute("UPDATE catalog_skus SET merchant_id='different_seller' WHERE sku_key=:sk", {"sk": TARTE_SKU})
+    elif fault == "seller_derivation":
+        await database.execute("UPDATE catalog_products SET seller_ref='different_seller' WHERE product_key=:pk", {"pk": TARTE_PK})
+    elif fault == "suppressed_sku":
+        await database.execute("UPDATE catalog_skus SET suppressed_at=CURRENT_TIMESTAMP WHERE sku_key=:sk", {"sk": TARTE_SKU})
+    elif fault == "agent_acl":
+        monkeypatch.setattr(CALLER, "can_access_merchant", lambda seller: False)
+    elif fault == "create_off":
+        monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "0")
+    response = await client.post(f"{BASE}/purchases/prepare", json=enrichment_prepare_body())
+    assert response.status_code == (404 if reason == "not_available_on_this_rail" else 409), response.text
+    assert error_of(response) == reason, response.text
+    assert await purchase_count() == await click_count() == 0
+
+
+async def test_enrichment_selected_prepare_db_error_never_becomes_price_permission(client, monkeypatch):
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "1")
+    await seed_tarte()
+    original = database.fetch_all
+    async def unavailable(query, *args, **kwargs):
+        if query == routes_reap._CART_ENRICHMENT_OFFERS_SQL:
+            raise RuntimeError("synthetic database outage")
+        return await original(query, *args, **kwargs)
+    monkeypatch.setattr(database, "fetch_all", unavailable)
+    response = await client.post(f"{BASE}/purchases/prepare", json=enrichment_prepare_body())
+    assert response.status_code == 500, response.text
+    assert "selection" not in response.json()
+    assert await purchase_count() == await click_count() == 0
