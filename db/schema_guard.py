@@ -1104,6 +1104,23 @@ async def ensure_required_schema_light() -> None:
                 # call against it is an UndefinedTable 500 rather than a wrong
                 # answer, so the failure is visible from the first request.
                 pass
+            try:
+                await _heal_add_columns("""
+                    ALTER TABLE IF EXISTS reap_agentic_purchases
+                        ADD COLUMN IF NOT EXISTS dispatch_tracking_version INTEGER,
+                        ADD COLUMN IF NOT EXISTS checkout_dispatch_key VARCHAR(64),
+                        ADD COLUMN IF NOT EXISTS contact_received_at TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS contact_purged_at TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS contact_revision INTEGER NOT NULL DEFAULT 0;
+                """)
+            except Exception:
+                pass
+            # mig 256: privacy clocks and durable dispatch fence, independent of enrollment indexes.
+            try:
+                from db.reap_continuation import ensure_continuation_schema
+                await ensure_continuation_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: Reap continuation schema unavailable (%s)", type(exc).__name__)
             # mig 252: AT MOST ONE PENDING ENROLLMENT PER BUYER.
             # db/migrations/252_reap_agentic_enrollments_one_pending.sql is the
             # same index. Two purchases of one buyer, each in 'resolving' in one
@@ -3786,6 +3803,12 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 256: privacy clocks and durable dispatch fence, independent of enrollment indexes.
+            try:
+                from db.reap_continuation import ensure_continuation_schema
+                await ensure_continuation_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: Reap continuation schema unavailable (%s)", type(exc).__name__)
             # mig 252: at most one PENDING enrollment per buyer, SQLite twin of
             # the Postgres block above (same index, same reason, same own try:
             # it fails on a database that already holds two pending rows for one
