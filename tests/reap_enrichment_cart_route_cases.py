@@ -1616,3 +1616,170 @@ async def test_enrichment_selected_prepare_db_error_never_becomes_price_permissi
     assert response.status_code == 500, response.text
     assert "selection" not in response.json()
     assert await purchase_count() == await click_count() == 0
+
+
+# ── a COLD proof module under the read-only prepare snapshot (2026-10-04) ────────────────────
+# PostgreSQL refuses CREATE TABLE IF NOT EXISTS inside `SET TRANSACTION ... READ ONLY` even when
+# the table exists. Prepare used to reach the proof table's self-heal there: the DDL failed, the
+# proof read as missing (409 row_variant_unverified), and the failure armed the reader's 60s and
+# `_ddl_guard`'s 300s cooldowns, so creates on that instance refused too. The fixture above warms
+# the module; these tests start it COLD on purpose, with the table already present.
+
+_READ_ONLY_SQL = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+_PG_ONLY = pytest.mark.skipif(not IS_POSTGRES, reason="the read-only snapshot is PostgreSQL-only")
+
+
+def _is_ddl(sql: Any) -> bool:
+    return str(sql).lstrip().upper().startswith(("CREATE", "ALTER", "DROP"))
+
+
+def record_statements(monkeypatch) -> List[str]:
+    """Every `database.execute` statement, in order (the DDL self-heal executes through it)."""
+    seen: List[str] = []
+    real_execute = database.execute
+
+    async def _recording(query, *args, **kwargs):
+        seen.append(str(query))
+        return await real_execute(query, *args, **kwargs)
+
+    monkeypatch.setattr(database, "execute", _recording)
+    return seen
+
+
+def _ddl_cooldowns_armed() -> bool:
+    from db import _ddl_guard
+
+    return proofs._FETCH_DDL_FAILED_AT is not None or proofs._DDL_LABEL in _ddl_guard._state
+
+
+async def test_a_cold_proof_module_proves_a_selected_prepare(client, monkeypatch):
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "1")
+    await seed_tarte()
+    proofs._reset_for_tests()
+    response = await client.post(f"{BASE}/purchases/prepare", json=enrichment_prepare_body())
+    assert response.status_code == 200, response.text
+    assert response.json()["selection"] == {
+        "product_key": TARTE_PK, "variant_id": TARTE_VARIANT,
+        "variant_key": TARTE_SKU, "merchant_domain": TARTE_HOST,
+        "market": "US", "currency": "USD", "unit_price_minor": 3000,
+        "quantity": 1, "item_source": "cart_link"}
+    assert not _ddl_cooldowns_armed()
+
+
+async def test_a_cold_prepare_does_not_poison_the_next_prepare_or_create(client, monkeypatch):
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "1")
+    await seed_tarte()
+    proofs._reset_for_tests()
+    for _ in range(2):
+        response = await client.post(f"{BASE}/purchases/prepare", json=enrichment_prepare_body())
+        assert response.status_code == 200, response.text
+    resp = await client.post(f"{BASE}/purchases", json=body(host=TARTE_HOST, product_key=TARTE_PK))
+    assert resp.status_code == 202, resp.text
+    assert (await purchase_of(resp))["our_price_minor"] == 3000
+
+
+@_PG_ONLY
+async def test_no_ddl_runs_inside_the_read_only_prepare_snapshot(client, monkeypatch):
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "1")
+    await seed_tarte()
+    proofs._reset_for_tests()
+    seen = record_statements(monkeypatch)
+    response = await client.post(f"{BASE}/purchases/prepare", json=enrichment_prepare_body())
+    assert _READ_ONLY_SQL in seen, seen
+    inside = seen[seen.index(_READ_ONLY_SQL) + 1:]  # prepare executes nothing after its snapshot
+    assert [sql for sql in inside if _is_ddl(sql)] == [], inside
+    assert response.status_code == 200, response.text
+
+
+@_PG_ONLY
+async def test_fetch_proof_in_a_read_only_transaction_runs_no_ddl_and_arms_nothing(monkeypatch):
+    """The reader on its own, cold, inside the snapshot (no warm-up from the route): an existing
+    table is read; a missing one is no proof; neither runs DDL or arms a cooldown, and the next
+    ordinary call still creates the table."""
+    await seed_tarte()
+    proofs._reset_for_tests()
+    seen = record_statements(monkeypatch)
+    async with database.transaction():
+        await database.execute(_READ_ONLY_SQL)
+        proof = await proofs.fetch_proof(TARTE_PK, TARTE_SKU)
+    assert proof is not None and proof["variant_id"] == TARTE_VARIANT, proof
+    assert [sql for sql in seen if _is_ddl(sql)] == [] and not _ddl_cooldowns_armed(), seen
+
+    await database.execute(f"DROP TABLE {proofs.TABLE}")
+    proofs._reset_for_tests()
+    seen.clear()
+    async with database.transaction():
+        await database.execute(_READ_ONLY_SQL)
+        assert await proofs.fetch_proof(TARTE_PK, TARTE_SKU) is None
+        assert not await proofs.ensure_table()
+    assert [sql for sql in seen if _is_ddl(sql)] == [] and not _ddl_cooldowns_armed(), seen
+    assert await proofs.fetch_proof(TARTE_PK, TARTE_SKU) is None
+    assert await proofs_table_exists() and proofs._DDL_READY
+
+
+@_PG_ONLY
+async def test_a_cold_prepare_with_no_proof_table_creates_it_before_the_snapshot(client, monkeypatch):
+    """No table and a cold module: prepare's warm-up creates the table OUTSIDE the read-only
+    snapshot (the reader inside cannot), and an empty table is still a missing proof."""
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "1")
+    await seed_tarte(proof=False)
+    await _drop_proofs()
+    seen = record_statements(monkeypatch)
+    response = await client.post(f"{BASE}/purchases/prepare", json=enrichment_prepare_body())
+    assert _READ_ONLY_SQL in seen, seen
+    split = seen.index(_READ_ONLY_SQL)
+    assert [sql for sql in seen[split + 1:] if _is_ddl(sql)] == [], seen
+    assert await proofs_table_exists()  # created by the warm-up: the reader inside cannot
+    assert any(_is_ddl(sql) for sql in seen[:split]), seen
+    assert response.status_code == 409 and error_of(response) == "row_variant_unverified", response.text
+    assert not _ddl_cooldowns_armed()
+
+
+@_PG_ONLY
+async def test_a_pre_249_table_is_read_in_a_read_only_transaction_without_ddl(monkeypatch):
+    """A table built before migration 249 (no `variant_title`) is incomplete, so the cold module
+    owes DDL -- but inside the snapshot it must neither run it nor refuse an existing proof."""
+    await seed_tarte(proof=False)
+    await _drop_proofs()
+    await database.execute(proofs._CREATE_POSTGRES)  # migration 248 alone
+    await seed_proof(pk=TARTE_PK, sku_key=TARTE_SKU, shop_host=TARTE_HOST, handle=TARTE_HANDLE,
+                     variant_id=TARTE_VARIANT, price_minor=3000)
+    proofs._reset_for_tests()
+    seen = record_statements(monkeypatch)
+    async with database.transaction():
+        await database.execute(_READ_ONLY_SQL)
+        proof = await proofs.fetch_proof(TARTE_PK, TARTE_SKU)
+        assert not await proofs.ensure_table()
+    assert proof is not None and proof["variant_id"] == TARTE_VARIANT, proof
+    assert [sql for sql in seen if _is_ddl(sql)] == [] and not _ddl_cooldowns_armed(), seen
+    assert not proofs._DDL_READY
+    assert await proofs.ensure_table()  # outside the snapshot the 249 column is added
+    assert await database.fetch_val(
+        "SELECT count(*) FROM information_schema.columns "
+        "WHERE table_name = :t AND column_name = 'variant_title'", {"t": proofs.TABLE}) == 1
+
+
+@_PG_ONLY
+async def test_a_table_completed_during_the_retry_window_is_read_at_once(monkeypatch):
+    """The reader's 60s window after a failed create skips the DDL, not the read-only probe: a
+    table that is complete now is read, and its window cleared, with no DDL run."""
+    await seed_tarte()
+    proofs._reset_for_tests()
+    ddl_calls = []
+
+    async def _no_ddl(*args, **kwargs):
+        ddl_calls.append(1)
+        return False
+
+    monkeypatch.setattr(proofs, "apply_ddl_statements", _no_ddl)
+    clock = [1000.0]
+    monkeypatch.setattr(proofs.time, "monotonic", lambda: clock[0])
+    proofs._FETCH_DDL_FAILED_AT = clock[0] - 1  # inside the window
+    proof = await proofs.fetch_proof(TARTE_PK, TARTE_SKU)
+    assert proof is not None and proof["variant_id"] == TARTE_VARIANT, proof
+    assert proofs._FETCH_DDL_FAILED_AT is None and proofs._DDL_READY and ddl_calls == []
+    # Still in a window with NO table: no proof, and still no DDL.
+    await database.execute(f"DROP TABLE {proofs.TABLE}")
+    proofs._reset_for_tests()
+    proofs._FETCH_DDL_FAILED_AT = clock[0] - 1
+    assert await proofs.fetch_proof(TARTE_PK, TARTE_SKU) is None and ddl_calls == []

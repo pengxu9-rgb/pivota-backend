@@ -2535,6 +2535,12 @@ async def prepare_reap_purchase_selection(
             agent_id=agent_id, merchant_domain=merchant_domain, market_country=market,
             product_key=product_key, quantity=req.quantity, resolved=False,
         )
+        if svc.is_cart_link_enrichment_enabled():
+            # PostgreSQL refuses CREATE TABLE IF NOT EXISTS in a read-only transaction even when
+            # the table exists, so the proof table's self-heal runs HERE, before the snapshot. Its
+            # answer is not trusted: `fetch_proof` inside still decides, never runs DDL there, and
+            # a missing table or row is a missing proof (refused).
+            await enrichment_proofs.ensure_table()
         async with database.transaction():
             if IS_POSTGRES:
                 # One coherent catalog/proof snapshot, enforced read-only by PostgreSQL.
