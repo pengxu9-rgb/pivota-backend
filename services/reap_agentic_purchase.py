@@ -116,6 +116,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import db.reap_agentic_ledger as ledger
+import db.reap_continuation as continuation
 # THE ONE consent-tag shape rule, imported rather than re-implemented. The name is bound at
 # module level so `tests/test_reap_agentic_ledger.py` can assert BY IDENTITY that this module,
 # the route and the ledger call the same function object — see that function's docstring for
@@ -2270,10 +2271,14 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
         return AdvanceResult(str(row["id"]), outcome="terminal", state=state)
     if not is_reconciliation_enabled():
         return await _release(row, worker_id, error_code=row.get("last_error_code") or "reconciliation_disabled")
-    if state in {"resolving", "needs_enrollment", "quoting"} and row.get("last_error_code") == "contact_retention_elapsed":
-        # Privacy expiry never invents a payment outcome or permits a new provider operation.
+    if state == "quoting" and continuation.dispatch_state(row) != "not_dispatched":
+        # Privacy erasure cannot hide the more consequential unresolved dispatch.
+        return await _release(row, worker_id, error_code="checkout_dispatch_unresolved", seconds=900)
+    if state in {"resolving", "quoting"} and continuation.contact_required(row):
+        # Contact erasure pauses new work, not a non-sensitive read of the linked enrollment.
         return await _release(row, worker_id, error_code="contact_retention_elapsed")
-    if state in {"resolving", "needs_enrollment", "quoting"}:
+    read_only_enrollment = state == "needs_enrollment" and bool(row.get("enrollment_id"))
+    if state in {"resolving", "needs_enrollment", "quoting"} and not read_only_enrollment:
         try:
             if not is_create_enabled():
                 raise PurchaseRefused("create_disabled")
@@ -2288,7 +2293,7 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
         nonlocal scope_stopped
         if not is_reconciliation_enabled():
             return False
-        if state in {"resolving", "needs_enrollment", "quoting"}:
+        if state in {"resolving", "needs_enrollment", "quoting"} and not read_only_enrollment:
             try:
                 if not is_create_enabled():
                     raise PurchaseRefused("create_disabled")
@@ -2691,7 +2696,8 @@ async def _reconcile_one(
                       `enrollment_grace_seconds()` of its expiry → `hold`. Reap turns
                       enrollments ACTIVE up to that long after the link dies; retiring the row
                       now would orphan a card the buyer is enrolling at this moment.
-      REQUIRES_ACTION past the grace, EXPIRED, FAILED, REVOKED → retire it → `retired`.
+      REQUIRES_ACTION past the grace → hold; expiry never proves card setup failed.
+      EXPIRED, FAILED, REVOKED → retire it → `retired`.
       unrecognised    released, `unknown_enrollment_status` → `done`. Never advances.
 
     A FAILED READ (review of #2483, P2-4): a transport error releases with the doubled backoff.
@@ -2780,7 +2786,9 @@ async def _reconcile_one(
             )
         if vouched and expires is not None and _now() < expires + grace:
             return _EnrollmentDecision("hold")
-        # Past the grace (or no link we would hand anyone): Reap is not going to finish it.
+        # A consumed/expired/unsafe hosted action is not evidence that enrollment failed.
+        # Keep the provider identity and reconcile; never mint around an unresolved pending card.
+        return _EnrollmentDecision("hold")
     elif state != "dead":
         return _EnrollmentDecision("done", result=await _release(
             row, worker_id, error_code="unknown_enrollment_status"
@@ -2947,7 +2955,10 @@ async def _enrollment_row(row: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     enrollment_id = str(row.get("enrollment_id") or "").strip()
     if not enrollment_id:
         return None
-    return await ledger.get_enrollment_internal(enrollment_id)
+    enrollment = await ledger.get_enrollment_internal(enrollment_id)
+    if enrollment is None or enrollment.get("buyer_ref") != row.get("buyer_ref"):
+        return None
+    return enrollment
 
 
 async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> AdvanceResult:
@@ -2957,9 +2968,10 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
 
     THE PAGE'S EXPIRY IS NOT THIS STEP'S DEADLINE. Reap turns an enrollment ACTIVE at or after the
     hosted session expires (staging 2026-09-30: 9 s after), so this step keeps reading the
-    enrollment past `hosted_url_expires_at`, for as long as the expire sweep leaves the purchase
-    alone — `enrollment_grace_seconds()` past that expiry — and an ACTIVE read in that window
-    goes to 'quoting' like any other.
+    enrollment past `hosted_url_expires_at`. That deadline is for opening a hosted page,
+    not proof that enrollment failed. Privacy expiry removes contact data independently;
+    ACTIVE reconciles the card but cannot quote until the original owner re-enters contact.
+    Neither updatedAt nor a consumed session is interpreted as an activation timestamp.
     """
     # The buyer may have enrolled via ANOTHER purchase of theirs, in which case the card is
     # already active and there is nothing to poll. Checked first, and it is also what keeps the
@@ -2971,6 +2983,8 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
 
     active = await ledger.get_active_enrollment(str(row["buyer_ref"]))
     if active is not None:
+        if continuation.contact_required(row):
+            return await _release(row, worker_id, error_code="contact_retention_elapsed", seconds=900)
         return await _move(
             row, worker_id, ["needs_enrollment"], "quoting", enrollment_id=str(active["id"])
         )
@@ -2991,14 +3005,15 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
         )
 
     read = await rc.get_enrollment(partner_id)
+    # A read may finish after a lease was replaced. It cannot release or modify that new lease.
+    if await _still_ours(row, worker_id) is None:
+        return _lost(row)
     if not read.ok:
         code = str(read.error or "enrollment_read_failed")
         if _is_transport(code):
             return await _release(row, worker_id, error_code=code, transport=True)
-        return await _move(
-            row, worker_id, ["needs_enrollment"], "failed",
-            last_error_code=_error_code(read.error_detail_code or read.error_code or code),
-        )
+        return await _release(row, worker_id,
+            error_code=_error_code(read.error_detail_code or read.error_code or code), seconds=900)
 
     state = rc.enrollment_state(read.data)
     if state == "active":
@@ -3013,6 +3028,8 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
                 row, worker_id, ["needs_enrollment"], "failed",
                 last_error_code="enrollment_not_activatable",
             )
+        if continuation.contact_required(row):
+            return await _release(row, worker_id, error_code="contact_retention_elapsed", seconds=900)
         # The hosted link is cleared by the ledger on the way into 'quoting' (it clears on ANY
         # transition into that state), so the spent enrollment page and its expiry do not ride
         # along on a row that no longer waits on them.
@@ -3494,6 +3511,12 @@ async def _checkout_from_quote(
                            refusal_reason=exc.reason, last_error_code=exc.reason, **evidence)
     # This value reaches the client's final pre-stream permission check, including when
     # configuration changes during AsyncClient entry. Scope always bounds the actual charge.
+    dispatch_key = await continuation.begin_dispatch(
+        row, worker_id, quote_id=quote_id, enrollment_id=partner_enrollment,
+        enrollment_row_id=str(active["id"]), total=verdict.total_minor, expires=quote_expires,
+    )
+    if dispatch_key is None:
+        return await _hold(error_code="checkout_dispatch_unresolved", seconds=900)
     amount_token = _WORKER_QUOTE_TOTAL.set(verdict.total_minor)
     try:
         checkout = await rc.create_checkout(
@@ -3503,104 +3526,94 @@ async def _checkout_from_quote(
         )
     finally:
         _WORKER_QUOTE_TOTAL.reset(amount_token)
-    if not checkout.ok:
-        detail = str(checkout.error_detail_code or "")
-        # Since the 2026-09-25 spec the checkout create's state conflicts are a 409 with the
-        # code at `error.code`; before it they were a 400 with the code at `error.detail.code`.
-        # Both spellings are read, because the partner moved the field without moving the
-        # version and a client that reads one of them is a client that stops classifying.
-        top = str(checkout.error_code or "")
-        if top in rc.TEMPORARY_UNAVAILABLE_CODES:
-            # 503 CHECKOUT_TEMPORARILY_UNAVAILABLE (2026-09-28 spec): nothing was created. Same
-            # answer as an expired quote -- give the lease back, on Reap's Retry-After when it
-            # sent one, and let the next step re-quote -- never a terminal failure over a blip.
-            wait = checkout.retry_after_seconds
-            return await _hold(
-                error_code=_error_code(top),
-                transport=wait is None, seconds=max(1, wait) if wait is not None else None,
-            )
-        if "QUOTE_EXPIRED" in (detail, top):
-            # The partner's word for what the P2-9 pre-check above catches on our clock: the
-            # quote died between the quote and the create. Same answer as the pre-check -- give
-            # the lease back and let the next step re-resolve and re-quote -- rather than the
-            # generic branch below, which would END the purchase over a five-minute timer.
-            return await _hold(error_code="quote_expired")
-        if "ENROLLMENT_NOT_ACTIVE" in (detail, top):
-            # 'quoting' → 'needs_enrollment' is not a legal edge, so there is no way to send the
-            # buyer back to the card page on THIS purchase. Fail with the partner's own code; the
-            # owner starts a new purchase and enrolls again.
+    await continuation.record_dispatch_response(
+        row, worker_id, key=dispatch_key, quote_id=quote_id,
+        enrollment_id=partner_enrollment, checkout=checkout,
+    )
+    async with continuation.dispatch_response_lease(row, worker_id) as owns_response:
+        if not owns_response:
+            return _lost(row)
+        if not checkout.ok:
+            fresh = await _still_ours(row, worker_id)
+            if fresh is None:
+                return _lost(row)
+            # Dispatch has already crossed a durable boundary. Only the correlated negative
+            # receipt writer can establish that no checkout was created. Every other response,
+            # including malformed/oversized HTTP200, HTTP500 and an unsafe URL, is unresolved
+            # operator work, not an authoritative failed purchase.
+            if continuation.dispatch_state(fresh) != "not_dispatched":
+                return await _hold(error_code="checkout_dispatch_unresolved", seconds=900)
+            detail = str(checkout.error_detail_code or "")
+            # Since the 2026-09-25 spec the checkout create's state conflicts are a 409 with the
+            # code at `error.code`; before it they were a 400 with the code at `error.detail.code`.
+            # Both spellings are read, because the partner moved the field without moving the
+            # version and a client that reads one of them is a client that stops classifying.
+            top = str(checkout.error_code or "")
+            if top in rc.TEMPORARY_UNAVAILABLE_CODES:
+                # 503 CHECKOUT_TEMPORARILY_UNAVAILABLE (2026-09-28 spec): nothing was created. Same
+                # answer as an expired quote -- give the lease back, on Reap's Retry-After when it
+                # sent one, and let the next step re-quote -- never a terminal failure over a blip.
+                wait = checkout.retry_after_seconds
+                return await _hold(
+                    error_code=_error_code(top),
+                    transport=wait is None, seconds=max(1, wait) if wait is not None else None,
+                )
+            if "QUOTE_EXPIRED" in (detail, top):
+                # The partner's word for what the P2-9 pre-check above catches on our clock: the
+                # quote died between the quote and the create. Same answer as the pre-check -- give
+                # the lease back and let the next step re-resolve and re-quote -- rather than the
+                # generic branch below, which would END the purchase over a five-minute timer.
+                return await _hold(error_code="quote_expired")
+            if "ENROLLMENT_NOT_ACTIVE" in (detail, top):
+                # 'quoting' → 'needs_enrollment' is not a legal edge, so there is no way to send the
+                # buyer back to the card page on THIS purchase. Fail with the partner's own code; the
+                # owner starts a new purchase and enrolls again.
+                return await _move(
+                    row, worker_id, ["quoting"], "failed",
+                    # Lowercased like every other code in this column — see `_error_code`. The
+                    # partner spells it upper-case; the column does not care which of its three
+                    # source vocabularies a value came from.
+                    last_error_code=_error_code("ENROLLMENT_NOT_ACTIVE"), **evidence,
+                )
+            # Future explicit negative receipts may gain a named policy. Unknown errors never
+            # reach here today; they cannot be terminalized merely because no ID was decoded.
+            return await _hold(error_code="checkout_dispatch_unresolved", seconds=900)
+
+        # A LIVE CHECKOUT EXISTS AT THE PARTNER FROM THIS LINE ON, and it is recorded on every exit
+        # below — including the failures. P2-5: dropping it on the way out left a real checkout with
+        # nothing in our storage pointing at it.
+        checkout_id = _partner_id(checkout.data.get("id"), what="checkout")
+        if checkout_id is None:
+            # The provider may have created a checkout even though this response cannot name it.
+            # Preserve the append-only dispatch receipt and expose needs-human work; never retry.
+            if await _still_ours(row, worker_id) is None:
+                return _lost(row)
+            return await _hold(error_code="checkout_dispatch_unresolved", seconds=900)
+        evidence["reap_checkout_id"] = checkout_id
+
+        # The immutable dispatch intent was committed before I/O. A crash or failed transition
+        # keeps the same attempt blocked for reconciliation; missing stored provider IDs never
+        # authorizes a new quote/checkout. This log is diagnostic, not the dispatch ledger.
+        logger.info(
+            "reap_agentic: checkout created purchase=%s checkout=%s quote=%s",
+            row["id"], checkout_id, quote_id,
+        )
+
+        action = rc.hosted_action(checkout.data)
+        if action is None:
+            # A valid checkout ID is read-reconcilable even when its hosted action is absent.
+            # Keep it pollable with no payment link, and visibly classified for operator review.
             return await _move(
-                row, worker_id, ["quoting"], "failed",
-                # Lowercased like every other code in this column — see `_error_code`. The
-                # partner spells it upper-case; the column does not care which of its three
-                # source vocabularies a value came from.
-                last_error_code=_error_code("ENROLLMENT_NOT_ACTIVE"), **evidence,
+                row, worker_id, ["quoting"], "awaiting_approval",
+                last_error_code="checkout_unresolvable:3:checkout_no_hosted_action", **evidence,
             )
-        code = str(checkout.error or "checkout_create_failed")
-        if _is_transport(code):
-            # The quote is lost with the step. That is correct rather than merely tolerable: a
-            # quote we could not turn into a checkout expires in five minutes, and the next step
-            # re-resolves and re-quotes from scratch anyway.
-            #
-            # A HOSTILE HOSTED URL ALSO LANDS HERE, not below: `_refuse_unsafe_hosted_url` inside
-            # the client turns a 200 carrying a `nextAction.url` it will not vouch for into
-            # `ok=False, error="hosted_url_not_allowed"` AND DROPS `.data`, so the URL never
-            # reaches this module at all.
-            return await _hold(error_code=code, transport=True)
+        hosted_url, expires_at = action
         return await _move(
-            row, worker_id, ["quoting"], "failed",
-            last_error_code=_error_code(detail or checkout.error_code or code), **evidence,
+            row, worker_id, ["quoting"], "awaiting_approval",
+            hosted_url=hosted_url,
+            hosted_url_expires_at=_parse_ts(expires_at),
+            **evidence,
         )
-
-    # A LIVE CHECKOUT EXISTS AT THE PARTNER FROM THIS LINE ON, and it is recorded on every exit
-    # below — including the failures. P2-5: dropping it on the way out left a real checkout with
-    # nothing in our storage pointing at it.
-    checkout_id = _partner_id(checkout.data.get("id"), what="checkout")
-    if checkout_id is None:
-        # P2-6. A checkout id that cannot go in a URL path is one `rc.get_checkout` will refuse,
-        # and it would refuse it by RAISING out of `advance` on every subsequent poll —
-        # unbounded, because 'awaiting_approval' is exempt from the attempts counter. Caught at
-        # WRITE time instead: one named failure, and the malformed value is never stored.
-        return await _move(
-            row, worker_id, ["quoting"], "failed",
-            last_error_code="partner_id_malformed", **evidence,
-        )
-    evidence["reap_checkout_id"] = checkout_id
-
-    # P2-8, THE ORPHAN WINDOW, STATED RATHER THAN IMPLIED. A crash between the create above and
-    # the transition below leaves a checkout at Reap that no row of ours references. It cannot be
-    # recovered by replaying the create: the client's idempotency key for `/agentic/checkouts` is
-    # derived from `(quoteId, enrollmentId)`, and the next step re-resolves and re-quotes, so it
-    # arrives with a NEW quote id and a different key. There is no double-charge risk — the
-    # buyer only ever receives the hosted URL through a row the fence agreed to write, and an
-    # unapproved checkout expires — but the checkout is real and somebody may have to find it.
-    #
-    # THE LEDGER OFFERS NO FENCED FIELD-ONLY WRITE (`transition_as_holder` needs a state change
-    # and `release_claim` takes only `next_poll_at`), so it cannot be recorded BEFORE the
-    # transition. It is logged instead: an id, not a URL and not PII.
-    logger.info(
-        "reap_agentic: checkout created purchase=%s checkout=%s quote=%s",
-        row["id"], checkout_id, quote_id,
-    )
-
-    action = rc.hosted_action(checkout.data)
-    if action is None:
-        # NOT the hostile-URL path — that one never gets here (see the note above the `not ok`
-        # branch). This is a WELL-FORMED 200 with no next action at all, or one that is not a
-        # REDIRECT: a checkout with nowhere to send the buyer. 'awaiting_approval' exists to hold
-        # a link, so it is not entered without one, and the checkout id is kept because the
-        # checkout is real.
-        return await _move(
-            row, worker_id, ["quoting"], "failed",
-            last_error_code="checkout_no_hosted_action", **evidence,
-        )
-    hosted_url, expires_at = action
-    return await _move(
-        row, worker_id, ["quoting"], "awaiting_approval",
-        hosted_url=hosted_url,
-        hosted_url_expires_at=_parse_ts(expires_at),
-        **evidence,
-    )
 
 
 # A permanent-shaped read failure is not payment proof. Escalate observation, not outcome.
@@ -3697,6 +3710,11 @@ async def _step_checkout_poll(
             return await _release(row, worker_id, error_code=recovered_code)
         return await _move(row, worker_id, [from_state], "processing", last_error_code=recovered_code)
     if state == "awaiting_buyer":
+        if not row.get("hosted_url"):
+            # A status-only response does not recover the missing safe approval action.
+            # Continue authoritative reads, but do not hide the operator queue item.
+            return await _release(row, worker_id,
+                error_code="checkout_unresolvable:3:checkout_no_hosted_action", seconds=900)
         return await _release(row, worker_id, error_code=recovered_code)
     # unknown — never advances, in either state.
     return await _release_checkout_read_failure(row, worker_id, "unknown_checkout_status")
