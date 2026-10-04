@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -435,6 +436,11 @@ def _body(**over) -> Dict[str, Any]:
         "variant_key": SKU_KEY,
         "quantity": 1,
         "buyer": _buyer(),
+        # Both REQUIRED on create: a fresh key per body (a test about replay passes its own), and
+        # the money `_seed_catalog` prices the default row at.
+        "idempotency_key": f"k-{uuid.uuid4().hex}",
+        "expected_unit_price_minor": 4250,
+        "expected_currency": "USD",
     }
     payload.update(over)
     return payload
@@ -1683,7 +1689,8 @@ async def test_tierb_a_live_shaped_mirror_row_on_postgres(client, monkeypatch, s
         )
         monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
         response = await client.post(f"{BASE}/purchases", json=_body(
-            item_source="cart_link", merchant_domain=domain, product_key=pk, variant_key=None))
+            item_source="cart_link", merchant_domain=domain, product_key=pk, variant_key=None,
+            expected_unit_price_minor=1399))
         assert response.status_code == expected, response.text
         if expected == 202:
             purchase = await database.fetch_one(
@@ -2391,7 +2398,8 @@ async def test_tierb_a_mirror_row_priced_from_its_placeholder_on_postgres(
         )
         monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
         response = await client.post(f"{BASE}/purchases", json=_body(
-            item_source="cart_link", merchant_domain=domain, product_key=pk, variant_key=None))
+            item_source="cart_link", merchant_domain=domain, product_key=pk, variant_key=None,
+            expected_unit_price_minor=want if expected == 202 else 2800))
         assert response.status_code == expected, response.text
         if expected == 202:
             purchase = await database.fetch_one(
@@ -2464,7 +2472,8 @@ async def test_tierb_the_backfill_then_the_cart_link_buys_a_named_variant_end_to
             "(shop_domain, market, verdict, checked_at, consecutive_same) "
             "VALUES (:d, 'US', 'ELIGIBLE', now(), 1)", {"d": domain})
         monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
-        body = _body(item_source="cart_link", merchant_domain=domain, product_key=pk, variant_key=None)
+        body = _body(item_source="cart_link", merchant_domain=domain, product_key=pk, variant_key=None,
+                     expected_unit_price_minor=1399)
 
         # BEFORE the backfill: no proof -> refused, as today.
         before = await client.post(f"{BASE}/purchases", json=body)
@@ -2638,12 +2647,33 @@ async def test_recovery_requires_an_opaque_attempt_key(client, key):
     assert response.status_code == 400, response.text
 
 
+async def _plant_legacy_tombstone(monkeypatch, key: str) -> None:
+    """A `refused:merchant_not_eligible` key as the create path wrote it before the money pair was
+    required. Create no longer writes one, so it is planted -- under the hash the route computes
+    for the next request carrying `key` -- just before that request's replay lookup reads it."""
+    real = routes_reap._replayed_purchase_id
+    planted = []
+
+    async def plant_then_read(**kwargs):
+        if kwargs["idempotency_key"] == key and not planted:
+            planted.append(key)
+            await database.execute(
+                "INSERT INTO reap_agentic_purchase_keys (agent_id, agent_user_ref_hash, "
+                "idempotency_key, purchase_id, request_hash) VALUES (:a, :h, :k, :p, :r)",
+                {"a": kwargs["agent_id"], "h": kwargs["agent_user_ref_hash"], "k": key,
+                 "p": "refused:merchant_not_eligible", "r": kwargs["request_hash"]},
+            )
+        return await real(**kwargs)
+
+    monkeypatch.setattr(routes_reap, "_replayed_purchase_id", plant_then_read)
+
+
 @pytest.mark.parametrize("mapping", ["missing", "tombstone", "deleted", "unowned", "unverifiable"])
 async def test_recovery_missing_or_unverifiable_evidence_cannot_create(client, monkeypatch, mapping):
     body = _body(idempotency_key="recover-evidence")
     if mapping == "tombstone":
-        await _seed_catalog()
-        await _seed_link()
+        await _seed_all()
+        await _plant_legacy_tombstone(monkeypatch, "recover-evidence")
         assert _error(await client.post(f"{BASE}/purchases", json=body)) == "merchant_not_eligible"
     elif mapping != "missing":
         await _seed_all()
@@ -2825,38 +2855,24 @@ async def test_atomic_key_concurrent_requests_have_one_claimable_purchase(client
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases WHERE state='refused' AND (buyer_email IS NOT NULL OR shipping_address IS NOT NULL)") == 0
 
 
-async def test_atomic_key_tombstone_insert_failure_is_not_authoritative_refusal(client, monkeypatch):
+async def test_a_variant_refusal_writes_no_key(client, monkeypatch):
+    """A keyed variant-lane `merchant_not_eligible` writes nothing, the key included: the money it
+    carries has not passed admission. The key stays free for the same body once enabled."""
     await _seed_catalog()
     await _seed_link()
-    async def unavailable(**kwargs):
-        await database.execute("INSERT INTO reap_agentic_purchase_keys (purchase_id) VALUES ('synthetic-refusal-key-fault')")
-    monkeypatch.setattr(routes_reap, "_write_idempotency_key", unavailable)
-    response = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="atomic-tombstone-fault"))
-    assert response.status_code == 503, response.text
-    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+    async def forbidden(**kwargs):
+        raise AssertionError("a refusal before money admission wrote a key")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(routes_reap, "_write_idempotency_key", forbidden)
+        resp = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-free"))
+    assert resp.status_code == 409 and _error(resp) == "merchant_not_eligible", resp.text
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 0
-
-
-async def test_atomic_key_tombstone_losing_to_a_purchase_never_authorizes_cart_retry(client, monkeypatch):
-    await _seed_all()
-    first = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="atomic-original-purchase"))
-    assert first.status_code == 202
-    purchase = first.json()["purchase_id"]
-    await database.execute("DELETE FROM reap_agentic_eligibility")
-    real = routes_reap._write_idempotency_key
-    async def winner_lands(**kwargs):
-        await database.execute(
-            "INSERT INTO reap_agentic_purchase_keys (agent_id,agent_user_ref_hash,idempotency_key,purchase_id,request_hash) "
-            "VALUES (:agent_id,:agent_user_ref_hash,:idempotency_key,:purchase_id,:request_hash)",
-            {**kwargs, "purchase_id": purchase})
-        return await real(**kwargs)
-    monkeypatch.setattr(routes_reap, "_write_idempotency_key", winner_lands)
-    body = _body(idempotency_key="atomic-tombstone-race")
-    response = await client.post(f"{BASE}/purchases", json=body)
-    assert response.status_code == 503, response.text
-    recovered = await client.post(f"{BASE}/purchases/recover", json=body)
-    assert recovered.status_code == 200 and recovered.json()["id"] == purchase
-    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    await _seed_eligibility()
+    resp = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K-free"))
+    assert resp.status_code == 202, resp.text
 
 
 @pytest.mark.parametrize("lane", ["reap_variant", "cart_link"])
@@ -3077,12 +3093,19 @@ async def test_retirement_preview_apply_recover_and_old_keys_cannot_create(clien
     applied=await r.retire_unopened_attempt(**args,dry_run=False)
     assert (await r.retire_unopened_attempt(**args,dry_run=False))["status"]=="already_retired"
     for lane, name in (("reap_variant","native_key"),("cart_link","cart_key")):
+        # The retired attempts were keyed before create required the money pair: their original
+        # body carries none, so recovery is asked with that body.
         body=_body(item_source=lane,idempotency_key=args[name])
-        recovered=await client.post(f"{BASE}/purchases/recover",json=body)
+        legacy={k:v for k,v in body.items() if not k.startswith("expected_")}
+        recovered=await client.post(f"{BASE}/purchases/recover",json=legacy)
         assert recovered.status_code==200, recovered.text
         assert recovered.json()=={"recovery_status":"retired","reconciliation_id":applied["reconciliation_id"]}
+        # Neither the original body (no money: refused before the key is read) nor the key with
+        # money (a different fingerprint) can open anything.
+        created=await client.post(f"{BASE}/purchases",json=legacy)
+        assert created.status_code==400 and _error(created)=="invalid_request",created.text
         created=await client.post(f"{BASE}/purchases",json=body)
-        assert created.status_code==409 and _error(created)=="attempt_retired",created.text
+        assert created.status_code==409 and _error(created)=="idempotency_conflict",created.text
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")==0
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_unopened_attempt_retirements")==1
 

@@ -149,6 +149,8 @@ poller drives the state machine afterwards, on another process, over the next mi
   },
   "return_url": "https://api.pivota.cc/reap/return",
   "idempotency_key": "door-7f3a-2026-09-18",
+  "expected_unit_price_minor": 4250,
+  "expected_currency": "USD",
   "click_context": { "surface": "chat" }
 }
 ```
@@ -166,12 +168,13 @@ poller drives the state machine afterwards, on another process, over the next mi
 | `buyer.shipping_address` | yes | **the Reap client's field names**, not the snake_case shape `/agent/v2/commerce/checkouts` uses. Required: `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `country`. Optional: `addressLine2`, `region`, `postalCode`. Unknown keys are dropped. |
 | `buyer.name`, `buyer.phone` | no | **fallbacks only.** Used when the address omits the field; never override it. `name` splits on the last space. |
 | `return_url` | no | defaults to `REAP_AGENTIC_RETURN_URL`, else `https://<first REAP_RETURN_URL_HOSTS host>/reap/return` — with nothing set, `https://api.pivota.cc/reap/return`, a static page this backend serves. Must be https, no userinfo, on a host in `REAP_RETURN_URL_HOSTS`. |
-| `idempotency_key` | optional for create; required for recovery | immutable, scoped to `(agent, buyer)`, retained for the lifetime of the attempt. Same normalized body returns the original purchase regardless of age or terminal state; a different body is `409 idempotency_conflict`. An unverifiable legacy hash fails closed. Refusal tombstones also persist. A new intentional purchase requires a fresh key; age never permits rollover. |
+| `idempotency_key` | **yes** (create and recovery) | nonempty after trimming, ≤ 128 printable characters; missing, blank, over-long or unprintable ⇒ `400 invalid_request` before anything is read or written. One key is one attempt: it is what makes a retry of an unknown outcome (a lost `202`, a `503 checkout_outcome_unknown`) the **same** purchase, and recovery can only find a keyed attempt. Immutable, scoped to `(agent, buyer)`, retained for the lifetime of the attempt. Same normalized body returns the original purchase regardless of age or terminal state; a different body is `409 idempotency_conflict`. An unverifiable legacy hash fails closed. Refusal tombstones also persist. A new intentional purchase requires a fresh key; age never permits rollover. |
+| `expected_unit_price_minor`, `expected_currency` | **yes**, both | the unit money the buyer was shown, bound into the attempt; missing, partial or malformed ⇒ `400 invalid_request` before anything is read or written. See "Immutable selected money on new attempts" below. |
 | `click_context` | no | accepted and not forwarded. The click id this rail records is one **we** mint. |
 
-**There is no price field, and a price in the body is ignored.** The unit price comes from our
+**The expected pair is a check, never a price override.** The unit price comes from our
 catalog and is the number `verify_quote` later compares against Reap's subtotal, exactly, with no
-tolerance.
+tolerance; an expected pair that differs from it is `409 price_changed`.
 
 For `item_source: "cart_link"`, the same authenticated endpoint requires a **fresh ELIGIBLE Tier B
 verdict** for `(merchant_domain, buyer.shipping_address.country)` before reading the catalog or
@@ -309,7 +312,7 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 | 409 | `idempotency_conflict` | this key was already used for a **different** request | preserve the original key and body; recover its outcome before any new purchase intent |
 | 400 | `consent_required` | `buyer.consent_version` is **absent, blank, longer than 32 characters, or carries an unprintable character** — i.e. a string-shaped value that is not usable | show your user the terms, then resend with the tag |
 | 400 | `invalid_request` | `buyer.consent_version` is **present but not a string** (`123`, `true`, `{}`, `[]`, `1.5`) — a type error is a malformed body, not a missing act by a human, and the two codes tell you to do different things | fix the request |
-| 400 | `invalid_request` | the body is not a JSON object, did not validate, `quantity` out of range, `limit` out of range, or an identifier carries an unprintable character | fix the request |
+| 400 | `invalid_request` | the body is not a JSON object, did not validate (including a missing or blank `idempotency_key`, or a missing or partial `expected_unit_price_minor`/`expected_currency` pair), `quantity` out of range, `limit` out of range, or an identifier carries an unprintable character | fix the request |
 | 400 | `invalid_address` | the shipping address is incomplete or unprintable | fix the request |
 | 400 | `invalid_return_url` | not https, carries userinfo, or an unallowed host | fix the request |
 | 400 | `invalid_offer_code` | `offer_code` is empty, whitespace only, longer than 128 characters, or carries a control character | fix the request (or omit the code) |
@@ -769,8 +772,9 @@ A failed recovery preserves uncertainty; it never authorizes a new payment attem
 
 ### Immutable selected money on new attempts
 
-A caller using a prepared selection sends `expected_unit_price_minor` and
-`expected_currency` together in the original create body. The minor amount is a
+Every create body carries `expected_unit_price_minor` and `expected_currency`
+together (required since 2026-10-04; a body without them is `invalid_request`
+before any write). A caller using a prepared selection sends the prepared money. The minor amount is a
 positive strict integer no larger than 9007199254740991; the currency is exactly
 three uppercase letters. A partial pair, explicit null, boolean, float or numeric
 string is `invalid_request` (400). These fields constrain the selection; they
@@ -780,7 +784,8 @@ Both lanes compare the pair with the freshly resolved authoritative SKU/own offe
 before creating a buyer reference, consent record, click, key or purchase. A
 changed unit amount or currency is `price_changed` (409); existing source and
 market-currency refusals also remain in force. A bound variant request refused
-before money admission does not create an eligibility tombstone. Once accepted,
+before money admission does not create an eligibility tombstone (so no create
+writes one any more; a tombstone written earlier is still honoured). Once accepted,
 the purchase stores that authoritative unit amount/currency. The existing
 provider resolution and exact quote subtotal/currency checks continue to compare
 against that stored purchase, including shipping/tax total pilot limits.
@@ -791,8 +796,8 @@ original purchase even if today's catalog money, eligibility or proof changed.
 Adding, removing or changing either field on an existing key is an
 `idempotency_conflict` (409). Recovery performs no current selection lookup.
 
-Bodies with both fields omitted retain the prior fingerprint byte-for-byte. Old
-client attempts—including attempts whose client retained a selection witness
+Create refuses a body with both fields omitted; **recovery** still accepts one,
+and its fingerprint is the prior one byte-for-byte. Old client attempts—including attempts whose client retained a selection witness
 without putting a money pair on the original backend body—must recover with that
 original body. Do not infer or add money fields from a retained witness, do not
 remint the attempt, and do not switch checkout routes after any refusal.
