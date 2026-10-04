@@ -3997,3 +3997,162 @@ async def test_the_stuck_count_can_be_served_by_the_state_poll_index():
     text = "\n".join(row[0] for row in plan)
     assert "idx_reap_agentic_purchases_state_poll" in text, text
     assert re.search(r"Index Cond: .*state.*= ANY", text), text
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# THE CHECKOUT CREATE IN FLIGHT — `record_checkout_attempt` / `clear_checkout_attempt`
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+#
+# The purchase service records the quote a checkout create is sent for BEFORE sending it, so a
+# later step can replay the same create on the same Idempotency-Key instead of re-quoting. These
+# pin the fence: only the holder writes, only in 'quoting' with no checkout yet, and never over a
+# DIFFERENT quote already in flight.
+
+
+async def _quoting_held_by(worker_id: str, **over):
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    purchase = await _mk(state="quoting", **over)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET claimed_by = :w WHERE id = :i",
+        {"w": worker_id, "i": purchase["id"]},
+    )
+    return await ledger.get_purchase_internal(purchase["id"])
+
+
+_ATTEMPT = dict(enrollment_id="enr_1", quoted_total_minor=4500, shipping_minor=100,
+                tax_minor=150, tax_included=False, discount_minor=250,
+                offer_code_outcome="applied")
+
+
+async def test_record_checkout_attempt_writes_only_the_marker_fields_for_the_holder():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    before = await _quoting_held_by("worker_a")
+    recorded = await ledger.record_checkout_attempt(
+        before["id"], "worker_a", quote_id="q_one", **_ATTEMPT
+    )
+    assert recorded is not None
+    assert recorded["reap_quote_id"] == "q_one"
+    assert recorded["enrollment_id"] == "enr_1"
+    assert recorded["quoted_total_minor"] == 4500
+    assert recorded["discount_minor"] == 250 and recorded["offer_code_outcome"] == "applied"
+    for unchanged in ("state", "claimed_by", "claimed_at", "attempts", "state_entered_at",
+                      "last_error_code", "next_poll_at", "reap_checkout_id", "hosted_url"):
+        assert recorded[unchanged] == before[unchanged], unchanged
+    again = await ledger.record_checkout_attempt(
+        before["id"], "worker_a", quote_id="q_one", **_ATTEMPT
+    )
+    assert again is not None and again["reap_quote_id"] == "q_one", "same quote: idempotent"
+
+
+async def test_a_stale_worker_cannot_write_or_clear_the_marker():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    row = await _quoting_held_by("worker_b")
+    assert await ledger.record_checkout_attempt(
+        row["id"], "worker_a", quote_id="q_stale", **_ATTEMPT
+    ) is None
+    assert (await ledger.get_purchase_internal(row["id"]))["reap_quote_id"] is None
+    assert await ledger.record_checkout_attempt(
+        row["id"], "worker_b", quote_id="q_one", **_ATTEMPT
+    ) is not None
+    assert await ledger.clear_checkout_attempt(row["id"], "worker_a", quote_id="q_one") is None
+    assert await ledger.record_checkout_attempt(
+        row["id"], "worker_a", quote_id="q_stale", **_ATTEMPT
+    ) is None
+    assert (await ledger.get_purchase_internal(row["id"]))["reap_quote_id"] == "q_one"
+
+
+async def test_a_second_quote_cannot_replace_a_create_in_flight():
+    """THE INVARIANT, in the statement: once a create is sent for quote Q, even the holder cannot
+    record a different quote over it. Only a clear (Reap: nothing was created) makes room."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    row = await _quoting_held_by("worker_a")
+    assert await ledger.record_checkout_attempt(
+        row["id"], "worker_a", quote_id="q_one", **_ATTEMPT
+    ) is not None
+    assert await ledger.record_checkout_attempt(
+        row["id"], "worker_a", quote_id="q_two", **_ATTEMPT
+    ) is None
+    assert await ledger.clear_checkout_attempt(row["id"], "worker_a", quote_id="q_two") is None
+    assert (await ledger.get_purchase_internal(row["id"]))["reap_quote_id"] == "q_one"
+
+    cleared = await ledger.clear_checkout_attempt(row["id"], "worker_a", quote_id="q_one")
+    assert cleared is not None
+    for column in ("reap_quote_id", "quoted_total_minor", "reap_quote_expires_at",
+                   "shipping_minor", "tax_minor", "tax_included", "discount_minor",
+                   "offer_code_outcome"):
+        assert cleared[column] is None, column
+    assert cleared["enrollment_id"] == "enr_1"
+    assert await ledger.record_checkout_attempt(
+        row["id"], "worker_a", quote_id="q_two", **_ATTEMPT
+    ) is not None
+
+
+async def test_clearing_keeps_a_dropped_offer_code_outcome():
+    """A DROPPED code is what the next quote must not re-send, so it survives the clear; `applied`
+    / `no_discount` describe the quote being thrown away and do not."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    row = await _quoting_held_by("worker_a")
+    attempt = dict(_ATTEMPT, offer_code_outcome="dropped_invalid", discount_minor=None)
+    await ledger.record_checkout_attempt(row["id"], "worker_a", quote_id="q_one", **attempt)
+    cleared = await ledger.clear_checkout_attempt(row["id"], "worker_a", quote_id="q_one")
+    assert cleared["offer_code_outcome"] == "dropped_invalid"
+
+
+@pytest.mark.parametrize("state", ["resolving", "awaiting_approval", "failed"])
+async def test_the_marker_is_only_written_in_quoting(state):
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    row = await _quoting_held_by("worker_a")
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET state = :s WHERE id = :i", {"s": state, "i": row["id"]}
+    )
+    assert await ledger.record_checkout_attempt(
+        row["id"], "worker_a", quote_id="q_one", **_ATTEMPT
+    ) is None
+
+
+async def test_the_marker_is_not_written_once_a_checkout_is_recorded():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    row = await _quoting_held_by("worker_a")
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET reap_checkout_id = 'chk_1' WHERE id = :i",
+        {"i": row["id"]},
+    )
+    assert await ledger.record_checkout_attempt(
+        row["id"], "worker_a", quote_id="q_one", **_ATTEMPT
+    ) is None
+
+
+async def test_a_create_in_flight_is_never_failed_by_the_attempts_sweep_and_parks_as_needs_human():
+    """`fail_exhausted_purchases` would write 'failed' over a purchase Reap may hold a checkout
+    for. It skips those rows; the purchase service parks them as `checkout_unresolvable:` and
+    the needs-human count sees them."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    in_flight = await _quoting_held_by("worker_a")
+    await ledger.record_checkout_attempt(in_flight["id"], "worker_a", quote_id="q_one", **_ATTEMPT)
+    plain = await _mk(state="quoting", buyer_ref="bref_plain")
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET attempts = 99, claimed_by = NULL "
+        "WHERE id IN (:a, :b)", {"a": in_flight["id"], "b": plain["id"]},
+    )
+    assert await ledger.fail_exhausted_purchases(5) == [plain["id"]], "control: plain row fails"
+    assert await _state_of(in_flight["id"]) == "quoting"
+
+    assert await ledger.count_checkout_needs_human() == 0
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET last_error_code = 'checkout_create_unknown:1:x' "
+        "WHERE id = :a", {"a": in_flight["id"]},
+    )
+    assert await ledger.count_checkout_needs_human() == 0, "not parked yet"
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET last_error_code = 'checkout_unresolvable:3:x' "
+        "WHERE id = :a", {"a": in_flight["id"]},
+    )
+    assert await ledger.count_checkout_needs_human() == 1

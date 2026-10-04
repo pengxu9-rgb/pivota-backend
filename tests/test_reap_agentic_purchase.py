@@ -2137,7 +2137,12 @@ async def test_a_hostile_url_arrives_as_a_client_refusal_not_as_a_missing_action
     `nextAction.url` is refused INSIDE the client, which replaces the response with
     `ok=False, error="hosted_url_not_allowed"` and DROPS `.data` — so it lands in the `not ok`
     branch and the URL never reaches this module. `checkout_no_hosted_action` is the other thing:
-    a well-formed 200 with no action at all."""
+    a well-formed 200 with no action at all.
+
+    AND IT IS NOT A TERMINAL FAILURE ANY MORE. That 200 means a checkout EXISTS at Reap whose id the
+    client dropped with the URL, so 'failed' ended a purchase with a live checkout no row named.
+    It is parked for a human instead, with the quote still on the row, and the next step replays
+    the same create rather than re-quoting."""
     reap.create_checkout = rc.ReapResponse(
         ok=False, status=200, error="hosted_url_not_allowed"
     )
@@ -2146,10 +2151,17 @@ async def test_a_hostile_url_arrives_as_a_client_refusal_not_as_a_missing_action
     await _step(purchase_id)
     result = await _step(purchase_id)
     row = await _get(purchase_id)
-    assert result.state == "failed"
-    assert row["last_error_code"] == "hosted_url_not_allowed"
+    assert result.outcome == "released" and result.state == "quoting"
+    assert row["last_error_code"] == "checkout_unresolvable:3:hosted_url_not_allowed"
     assert row["last_error_code"] != "checkout_no_hosted_action"
+    assert result.next_poll_in_seconds == svc.CHECKOUT_HUMAN_RETRY_SECONDS
     assert row["hosted_url"] is None
+    assert row["reap_quote_id"] == "f1e2d3c4" and row["reap_checkout_id"] is None
+    assert await ledger.count_checkout_needs_human() == 1
+
+    await _step(purchase_id)
+    assert len(reap.named("request_quote")) == 1, "a parked create is replayed, never re-quoted"
+    assert [c["quote_id"] for c in reap.named("create_checkout")] == ["f1e2d3c4", "f1e2d3c4"]
 
 
 async def test_the_enrollment_the_checkout_is_bound_to_is_written_on_the_row(reap, attribution):
@@ -5320,3 +5332,352 @@ async def test_scope_pause_attempt_exempt_claim_timestamp_generation(monkeypatch
     after = await ledger.get_purchase_internal(purchase)
     for field in ["attempts", "claimed_by", "claimed_at", "state", "last_error_code", "next_poll_at"]:
         assert after[field] == captured[field], field
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# THE CHECKOUT CREATE IS REPLAYED ON ITS OWN KEY UNTIL REAP ANSWERS DEFINITIVELY
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+#
+# The Idempotency-Key for `POST /agentic/checkouts` is derived from (quoteId, enrollmentId) only.
+# Before this, an unknown create outcome (a timeout after the bytes left, a crash or a lost lease
+# after the 200) released the step, the next step RE-QUOTED, and the new quote id was a new key:
+# a possible SECOND live checkout while the first was orphaned. These tests drive the REAL
+# `rc.create_checkout` and `rc._headers` -- only `_post`, the socket, is scripted -- so the key
+# each assertion counts is the header the partner would have received.
+
+_REAL_CREATE_CHECKOUT = rc.create_checkout
+
+Q1 = "a1b2c3d4"
+Q2 = "e5f6a7b8"
+
+
+class Wire:
+    """`rc._post` for `/agentic/checkouts`: records each send's ids and Idempotency-Key, answers
+    from `answers` (consumed one per call, the last repeating; a callable is awaited)."""
+
+    def __init__(self):
+        self.sent = []
+        self.answers = [_ok(CHECKOUT_CREATED)]
+
+    def keys(self):
+        return [s["key"] for s in self.sent]
+
+    def quotes(self):
+        return [s["quote_id"] for s in self.sent]
+
+
+@pytest.fixture
+def wire(monkeypatch, reap):
+    w = Wire()
+
+    async def _post(path, body, *, timeout_seconds=None, idempotency_extra=None,
+                    extra_headers=None):
+        assert path == "/agentic/checkouts"
+        headers = rc._headers("sk_test_key", path, body, idempotency_extra=idempotency_extra,
+                              extra_headers=extra_headers)
+        w.sent.append({"quote_id": body["quoteId"], "enrollment_id": body["enrollmentId"],
+                       "key": headers["Idempotency-Key"]})
+        answer = w.answers.pop(0) if len(w.answers) > 1 else w.answers[0]
+        if callable(answer):
+            answer = await answer()
+        return answer
+
+    monkeypatch.setattr(rc, "_post", _post)
+    monkeypatch.setattr(rc, "create_checkout", _REAL_CREATE_CHECKOUT)
+    return w
+
+
+def _two_quotes(reap):
+    reap.request_quote = [_ok(dict(QUOTE_200, id=Q1)), _ok(dict(QUOTE_200, id=Q2))]
+
+
+async def _to_quoting() -> str:
+    await _active_enrollment()
+    purchase_id = await _start()
+    assert (await _step(purchase_id)).state == "quoting"
+    return purchase_id
+
+
+async def test_a_lost_create_answer_replays_the_same_key_and_never_requotes(reap, wire, attribution):
+    """THE BUG. A ReadTimeout after the request was sent: the next step re-sends the SAME create
+    (same quote, same enrollment, same key) instead of quoting again, and when the replay answers
+    with the checkout the row proceeds with exactly that checkout."""
+    _two_quotes(reap)
+    wire.answers = [_transport(), _ok(CHECKOUT_CREATED)]
+    purchase_id = await _to_quoting()
+
+    first = await _step(purchase_id)
+    assert first.outcome == "released" and first.state == "quoting"
+    assert first.last_error_code == "checkout_create_unknown:1:transport_error:readtimeout"
+    row = await _get(purchase_id)
+    assert row["reap_quote_id"] == Q1, "the create in flight is on the row"
+    assert row["reap_checkout_id"] is None
+    assert row["quoted_total_minor"] == 4500, "the ORIGINAL total, for the replay's scope check"
+
+    second = await _step(purchase_id)
+    assert second.state == "awaiting_approval"
+    row = await _get(purchase_id)
+    assert row["reap_checkout_id"] == "chk_7f3a"
+    assert row["reap_quote_id"] == Q1
+    assert row["hosted_url"] == CHECKOUT_CREATED["nextAction"]["url"]
+    assert row["last_error_code"] == svc.CHECKOUT_CREATE_REPLAYED
+    assert len(reap.named("request_quote")) == 1, "no second quote"
+    assert len(reap.named("resolve_our_row")) == 2, (
+        "'resolving' and the step that sent the create; the replay resolves nothing"
+    )
+    assert wire.quotes() == [Q1, Q1]
+    assert len(set(wire.keys())) == 1
+    assert {s["enrollment_id"] for s in wire.sent} == {ENROLLMENT_UUID}
+
+
+async def test_a_crash_after_the_create_returned_replays_and_records_that_checkout(
+    reap, wire, attribution, monkeypatch
+):
+    """P2-8, THE ORPHAN WINDOW. The create answered 200 and the worker died before the transition
+    (simulated by the transition raising). The lease ages out, another worker takes the row, and
+    replays the create: Reap answers with the same checkout, and its id is recorded. Exactly one
+    distinct key was ever sent for this purchase."""
+    _two_quotes(reap)
+    purchase_id = await _to_quoting()
+
+    actual = ledger.transition_as_holder
+    crashed = []
+
+    async def crash_once(*args, **kwargs):
+        if kwargs.get("to_state") == "awaiting_approval" and not crashed:
+            crashed.append(True)
+            raise RuntimeError("worker died after the create returned")
+        return await actual(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "transition_as_holder", crash_once)
+    await _claim(purchase_id, "w1")
+    with pytest.raises(RuntimeError):
+        await svc.advance(purchase_id, "w1")
+    row = await _get(purchase_id)
+    assert row["state"] == "quoting" and row["reap_checkout_id"] is None
+    assert row["reap_quote_id"] == Q1, "recorded BEFORE the send, so the crash cannot lose it"
+
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET claimed_at = datetime('now', '-9999 seconds') "
+        "WHERE id = :i", {"i": purchase_id},
+    )
+    assert await ledger.requeue_stale_claims(lease_seconds=30) == 1
+    result = await _step(purchase_id, "w2")
+    assert result.state == "awaiting_approval"
+    row = await _get(purchase_id)
+    assert row["reap_checkout_id"] == "chk_7f3a"
+    assert len(reap.named("request_quote")) == 1
+    assert wire.quotes() == [Q1, Q1]
+    assert len(set(wire.keys())) == 1, "one purchase, one checkout key, ever"
+
+
+async def test_quote_expired_on_a_replay_clears_the_marker_and_requotes_on_a_new_key(
+    reap, wire, attribution
+):
+    """The DEFINITIVE not-created answer. A replay after the quote's five minutes is still correct:
+    Reap either replays the checkout it made, or says QUOTE_EXPIRED -- nothing was ever created on
+    that quote -- and only then may the purchase quote again."""
+    _two_quotes(reap)
+    wire.answers = [
+        _transport(),
+        rc.ReapResponse(ok=False, status=409, error="reap_status_409", error_code="QUOTE_EXPIRED"),
+        _ok(dict(CHECKOUT_CREATED, quoteId=Q2)),
+    ]
+    purchase_id = await _to_quoting()
+    assert (await _step(purchase_id)).last_error_code.startswith("checkout_create_unknown:1:")
+
+    expired = await _step(purchase_id)
+    assert expired.outcome == "released" and expired.last_error_code == "quote_expired"
+    row = await _get(purchase_id)
+    assert row["reap_quote_id"] is None, "cleared: the next step may quote again"
+    assert row["quoted_total_minor"] is None and row["reap_quote_expires_at"] is None
+    assert len(reap.named("request_quote")) == 1
+
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    assert len(reap.named("request_quote")) == 2
+    assert wire.quotes() == [Q1, Q1, Q2]
+    keys = wire.keys()
+    assert keys[0] == keys[1] != keys[2]
+    assert (await _get(purchase_id))["reap_quote_id"] == Q2
+
+
+async def test_checkout_temporarily_unavailable_is_definitive_and_clears_the_marker(
+    reap, wire, attribution
+):
+    """The one 503 the spec says created nothing. Same answer as before (wait, re-quote), now with
+    the marker cleared so the re-quote is allowed."""
+    _two_quotes(reap)
+    wire.answers = [
+        rc.ReapResponse(ok=False, status=503, error="reap_status_503",
+                        error_code="CHECKOUT_TEMPORARILY_UNAVAILABLE", retry_after_seconds=4),
+        _ok(CHECKOUT_CREATED),
+    ]
+    purchase_id = await _to_quoting()
+    held = await _step(purchase_id)
+    assert held.last_error_code == "checkout_temporarily_unavailable"
+    assert held.next_poll_in_seconds == 4
+    assert (await _get(purchase_id))["reap_quote_id"] is None
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    assert wire.quotes() == [Q1, Q2]
+
+
+UNKNOWN_CREATE_ANSWERS = [
+    ("5xx without a code", rc.ReapResponse(ok=False, status=500, error="reap_status_500"),
+     "reap_status_500"),
+    ("502", rc.ReapResponse(ok=False, status=502, error="reap_status_502"), "reap_status_502"),
+    ("503 that does not say nothing was created",
+     rc.ReapResponse(ok=False, status=503, error="reap_status_503",
+                     error_code="AGENTIC_SERVICE_UNAVAILABLE"), "agentic_service_unavailable"),
+    ("unparseable 2xx", rc.ReapResponse(ok=False, status=200, error="unparseable_response"),
+     "unparseable_response"),
+    ("oversized 2xx", rc.ReapResponse(ok=False, status=200, error="response_too_large"),
+     "response_too_large"),
+    ("the original is still running",
+     rc.ReapResponse(ok=False, status=409, error="reap_status_409",
+                     error_code="IDEMPOTENCY_REQUEST_IN_PROGRESS"),
+     "idempotency_request_in_progress"),
+    ("rate limited", rc.ReapResponse(ok=False, status=429, error="reap_status_429"),
+     "reap_status_429"),
+]
+
+
+@pytest.mark.parametrize(
+    "answer,code", [(a, c) for _, a, c in UNKNOWN_CREATE_ANSWERS],
+    ids=[name for name, _, _ in UNKNOWN_CREATE_ANSWERS],
+)
+async def test_an_unknown_create_outcome_is_not_terminal_and_replays(
+    reap, wire, attribution, answer, code
+):
+    """Before: a non-transport 5xx, an unparseable or oversized body moved the purchase to
+    terminal 'failed' with no checkout id -- a checkout may have existed. Now: released, the
+    marker kept, and the next step replays the same create."""
+    _two_quotes(reap)
+    wire.answers = [answer, _ok(CHECKOUT_CREATED)]
+    purchase_id = await _to_quoting()
+    held = await _step(purchase_id)
+    assert held.outcome == "released" and held.state == "quoting"
+    assert held.last_error_code == f"checkout_create_unknown:1:{code}"
+    assert (await _get(purchase_id))["reap_quote_id"] == Q1
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    assert wire.quotes() == [Q1, Q1] and len(set(wire.keys())) == 1
+    assert len(reap.named("request_quote")) == 1
+
+
+async def test_a_definitive_refusal_on_the_create_is_still_terminal(reap, wire, attribution):
+    """CONTROL. A 4xx refusal is Reap saying nothing was created; it still ends the purchase."""
+    wire.answers = [rc.ReapResponse(ok=False, status=422, error="reap_status_422",
+                                    error_code="AGENTIC_REQUEST_INVALID")]
+    purchase_id = await _to_quoting()
+    result = await _step(purchase_id)
+    assert result.state == "failed"
+    assert (await _get(purchase_id))["last_error_code"] == "agentic_request_invalid"
+
+
+async def test_unknown_outcomes_park_for_a_human_and_are_never_swept_to_failed(
+    reap, wire, attribution
+):
+    """THE BOUND. After `CHECKOUT_CREATE_UNKNOWN_LIMIT` unknown answers the row is parked as
+    `checkout_unresolvable:` (counted as needs-human, retried slowly) -- still replaying the same
+    create, never re-quoted, and NOT failed by the attempts sweep, which would orphan a checkout
+    Reap may hold."""
+    _two_quotes(reap)
+    wire.answers = [_transport()]
+    purchase_id = await _to_quoting()
+    codes = [(await _step(purchase_id)).last_error_code for _ in range(4)]
+    assert codes == [
+        "checkout_create_unknown:1:transport_error:readtimeout",
+        "checkout_create_unknown:2:transport_error:readtimeout",
+        "checkout_unresolvable:3:transport_error:readtimeout",
+        "checkout_unresolvable:4:transport_error:readtimeout",
+    ]
+    row = await _get(purchase_id)
+    assert row["state"] == "quoting" and row["reap_quote_id"] == Q1
+    assert await ledger.count_checkout_needs_human() == 1
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET attempts = 999 WHERE id = :i", {"i": purchase_id}
+    )
+    assert await ledger.fail_exhausted_purchases(5) == []
+    assert (await _get(purchase_id))["state"] == "quoting"
+    assert len(reap.named("request_quote")) == 1
+    assert set(wire.quotes()) == {Q1} and len(set(wire.keys())) == 1
+
+    # The first definitive answer un-parks it.
+    wire.answers = [_ok(CHECKOUT_CREATED)]
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    row = await _get(purchase_id)
+    assert row["last_error_code"] == svc.CHECKOUT_CREATE_REPLAYED
+    assert await ledger.count_checkout_needs_human() == 0
+
+
+async def test_a_lease_lost_mid_create_hands_the_replay_to_the_new_holder(
+    reap, wire, attribution
+):
+    """Worker A sends the create; while it is in flight its lease is requeued and worker B takes
+    the row. A's 200 cannot be written (fenced), and B -- seeing the create in flight -- replays
+    it rather than quoting: one key, one checkout, recorded by B."""
+    _two_quotes(reap)
+    purchase_id = await _to_quoting()
+
+    async def lease_moves_then_200():
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET claimed_by = 'w2', claimed_at = CURRENT_TIMESTAMP "
+            "WHERE id = :i", {"i": purchase_id},
+        )
+        return _ok(CHECKOUT_CREATED)
+
+    wire.answers = [lease_moves_then_200, _ok(CHECKOUT_CREATED)]
+    lost = await _step(purchase_id, "w1")
+    assert lost.outcome == "lost_claim"
+    row = await _get(purchase_id)
+    assert row["reap_checkout_id"] is None and row["reap_quote_id"] == Q1
+
+    result = await svc.advance(purchase_id, "w2")
+    assert result.state == "awaiting_approval"
+    assert (await _get(purchase_id))["reap_checkout_id"] == "chk_7f3a"
+    assert len(reap.named("request_quote")) == 1
+    assert wire.quotes() == [Q1, Q1] and len(set(wire.keys())) == 1
+
+
+async def test_a_replay_binds_the_recorded_enrollment_not_a_newer_active_one(
+    reap, wire, attribution
+):
+    """A buyer who re-enrolled between the send and the replay has a different ACTIVE enrollment;
+    a different partner enrollment is a different key. The replay uses the one the marker
+    recorded."""
+    _two_quotes(reap)
+    wire.answers = [_transport(), _ok(CHECKOUT_CREATED)]
+    first = await _active_enrollment(reap_id="11111111-1111-1111-1111-111111111111")
+    purchase_id = await _start()
+    await _step(purchase_id)
+    await _step(purchase_id)
+    await _active_enrollment(reap_id="22222222-2222-2222-2222-222222222222")
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    assert {s["enrollment_id"] for s in wire.sent} == {"11111111-1111-1111-1111-111111111111"}
+    assert len(set(wire.keys())) == 1
+    assert (await _get(purchase_id))["enrollment_id"] == first["id"]
+
+
+async def test_the_replay_applies_the_pilot_scope_to_the_original_total(
+    reap, wire, attribution, monkeypatch
+):
+    """The scope and the provider permission still bound the charge on a replay, against the total
+    the create was SENT with. Out of scope is a pause -- the marker kept -- never a terminal
+    refusal over a checkout that may exist."""
+    wire.answers = [_transport(), _ok(CHECKOUT_CREATED)]
+    purchase_id = await _to_quoting()
+    await _step(purchase_id)
+    seen = []
+    actual = svc._row_scope
+
+    def spy(row, *, total_minor=None):
+        seen.append(total_minor)
+        if total_minor is not None:
+            raise svc.PurchaseRefused("pilot_amount_out_of_scope")
+        return actual(row, total_minor=total_minor)
+
+    monkeypatch.setattr(svc, "_row_scope", spy)
+    result = await _step(purchase_id)
+    assert result.outcome == "released" and result.state == "quoting"
+    assert 4500 in seen
+    assert len(wire.sent) == 1, "nothing sent past the scope"
+    assert (await _get(purchase_id))["reap_quote_id"] == "f1e2d3c4", "the marker is kept"

@@ -168,6 +168,8 @@ __all__ = [
     "transition_as_holder",
     "claim_due_purchases",
     "release_claim",
+    "record_checkout_attempt",
+    "clear_checkout_attempt",
     "requeue_stale_claims",
     "expire_overdue_purchases",
     "scrub_reconciling_purchase_pii",
@@ -2146,6 +2148,203 @@ async def release_claim(
     return _purchase(await database.fetch_one(_RELEASE_CLAIM_SQL_SQLITE, values))
 
 
+# ── THE CHECKOUT CREATE IN FLIGHT: a fenced field-only write, and its one undo ───────────────
+#
+# A 'quoting' row whose `reap_quote_id` is set has SENT (or is about to send) `POST
+# /agentic/checkouts` for that quote. The partner's Idempotency-Key for that create is derived
+# from (quoteId, enrollmentId) alone (services/reap_agentic_client.idempotency_material), so the
+# only way a later attempt reaches the SAME checkout -- rather than minting a second one on a
+# fresh quote -- is to re-send the same quote id with the same enrollment. These two statements
+# are what make that recoverable across a crash, a lost lease or an unknown answer.
+#
+# WHY `reap_quote_id` AND NOT A NEW COLUMN. In 'quoting' it is otherwise always NULL: the insert
+# does not write it, the transitions INTO 'quoting' (from 'resolving' / 'needs_enrollment') do not
+# pass it, 'quoting' cannot be re-entered, and `_TRANSITION_SQL` only ever COALESCEs it, so it
+# is first written on the way OUT of 'quoting'. So "state = 'quoting' AND reap_quote_id IS NOT
+# NULL" is free to mean exactly "a create for this quote may exist at Reap", and the value is the
+# same evidence the row carries afterwards.
+#
+# THE OTHER QUOTE COLUMNS RIDE ALONG, so a replayed create ends in the same row a straight-through
+# one does: the ORIGINAL total (the pilot scope re-checks it on replay), the enrollment the key
+# was built from, and the quote's evidence. `clear` restores the pre-quote shape exactly: every
+# one of these is NULL in 'quoting' before the first write, except `offer_code_outcome`, which may
+# hold a DROPPED outcome an earlier release persisted and therefore keeps `dropped_*`.
+#
+# FENCED: the holder, the state, no checkout id yet, and NO OTHER QUOTE ALREADY IN FLIGHT. The last
+# conjunct is the invariant itself, enforced where it cannot be forgotten: once a create is sent,
+# only `clear_checkout_attempt` (a definitive "nothing was created" from Reap) can make room for a
+# different quote.
+_RECORD_CHECKOUT_ATTEMPT_SQL = """
+    UPDATE reap_agentic_purchases
+       SET reap_quote_id = :quote_id,
+           enrollment_id = :enrollment_id,
+           quoted_total_minor = :quoted_total_minor,
+           reap_quote_expires_at = :reap_quote_expires_at,
+           shipping_minor = :shipping_minor,
+           tax_minor = :tax_minor,
+           tax_included = :tax_included,
+           discount_minor = :discount_minor,
+           offer_code_outcome = COALESCE(:offer_code_outcome, offer_code_outcome),
+           reap_product_id = COALESCE(:reap_product_id, reap_product_id),
+           reap_variant_id = COALESCE(:reap_variant_id, reap_variant_id),
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND claimed_by = :worker_id
+       AND state = 'quoting'
+       AND reap_checkout_id IS NULL
+       AND (reap_quote_id IS NULL OR reap_quote_id = :quote_id_probe)
+    RETURNING *
+"""
+
+_RECORD_CHECKOUT_ATTEMPT_SQL_SQLITE = """
+    UPDATE reap_agentic_purchases
+       SET reap_quote_id = :quote_id,
+           enrollment_id = :enrollment_id,
+           quoted_total_minor = :quoted_total_minor,
+           reap_quote_expires_at = :reap_quote_expires_at,
+           shipping_minor = :shipping_minor,
+           tax_minor = :tax_minor,
+           tax_included = :tax_included,
+           discount_minor = :discount_minor,
+           offer_code_outcome = COALESCE(:offer_code_outcome, offer_code_outcome),
+           reap_product_id = COALESCE(:reap_product_id, reap_product_id),
+           reap_variant_id = COALESCE(:reap_variant_id, reap_variant_id),
+           updated_at = CURRENT_TIMESTAMP
+     WHERE id = :id
+       AND claimed_by = :worker_id
+       AND state = 'quoting'
+       AND reap_checkout_id IS NULL
+       AND (reap_quote_id IS NULL OR reap_quote_id = :quote_id_probe)
+    RETURNING *
+"""
+
+_CLEAR_CHECKOUT_ATTEMPT_SQL = """
+    UPDATE reap_agentic_purchases
+       SET reap_quote_id = NULL,
+           quoted_total_minor = NULL,
+           reap_quote_expires_at = NULL,
+           shipping_minor = NULL,
+           tax_minor = NULL,
+           tax_included = NULL,
+           discount_minor = NULL,
+           offer_code_outcome = CASE WHEN offer_code_outcome IN ('applied', 'no_discount')
+                THEN NULL ELSE offer_code_outcome END,
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND claimed_by = :worker_id
+       AND state = 'quoting'
+       AND reap_checkout_id IS NULL
+       AND reap_quote_id = :quote_id
+    RETURNING *
+"""
+
+_CLEAR_CHECKOUT_ATTEMPT_SQL_SQLITE = """
+    UPDATE reap_agentic_purchases
+       SET reap_quote_id = NULL,
+           quoted_total_minor = NULL,
+           reap_quote_expires_at = NULL,
+           shipping_minor = NULL,
+           tax_minor = NULL,
+           tax_included = NULL,
+           discount_minor = NULL,
+           offer_code_outcome = CASE WHEN offer_code_outcome IN ('applied', 'no_discount')
+                THEN NULL ELSE offer_code_outcome END,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE id = :id
+       AND claimed_by = :worker_id
+       AND state = 'quoting'
+       AND reap_checkout_id IS NULL
+       AND reap_quote_id = :quote_id
+    RETURNING *
+"""
+
+
+async def record_checkout_attempt(
+    purchase_id: str,
+    worker_id: str,
+    *,
+    quote_id: str,
+    enrollment_id: str,
+    quoted_total_minor: int,
+    reap_quote_expires_at: Optional[datetime] = None,
+    shipping_minor: Optional[int] = None,
+    tax_minor: Optional[int] = None,
+    tax_included: Optional[bool] = None,
+    discount_minor: Optional[int] = None,
+    offer_code_outcome: Optional[str] = None,
+    reap_product_id: Optional[str] = None,
+    reap_variant_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Durably say "a checkout create for `quote_id` is about to be sent", BEFORE it is sent.
+
+    Returns the row, or None when this worker no longer holds a 'quoting' row without a checkout
+    -- or when a DIFFERENT quote's create is already in flight on it. None is a lost race: the
+    caller must not send the create. Re-recording the SAME quote is an idempotent success.
+
+    No state change, no `state_entered_at`, no `last_error_code`: this is the fenced field-only
+    write the poller lacked. See the note above the statement for why the column is
+    `reap_quote_id` and what the other fields are for.
+    """
+    _require_worker_id(worker_id, "worker_id")
+    quote = _require_lookup_id(quote_id, "quote_id")
+    enrollment = _require_lookup_id(enrollment_id, "enrollment_id")
+    for name, value, nullable in (
+        ("quoted_total_minor", quoted_total_minor, False),
+        ("shipping_minor", shipping_minor, True),
+        ("tax_minor", tax_minor, True),
+        ("discount_minor", discount_minor, True),
+    ):
+        if value is None and nullable:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative int")
+    if tax_included is not None and not isinstance(tax_included, bool):
+        raise ValueError("tax_included must be a bool or None")
+    values = {
+        "id": purchase_id,
+        "worker_id": worker_id,
+        "quote_id": quote,
+        "quote_id_probe": quote,
+        "enrollment_id": enrollment,
+        "quoted_total_minor": quoted_total_minor,
+        "reap_quote_expires_at": _bind_dt(reap_quote_expires_at),
+        "shipping_minor": shipping_minor,
+        "tax_minor": tax_minor,
+        "tax_included": tax_included,
+        "discount_minor": discount_minor,
+        "offer_code_outcome": _require_offer_code_outcome(offer_code_outcome),
+        "reap_product_id": reap_product_id,
+        "reap_variant_id": reap_variant_id,
+    }
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_RECORD_CHECKOUT_ATTEMPT_SQL, values))
+    return _purchase(await database.fetch_one(_RECORD_CHECKOUT_ATTEMPT_SQL_SQLITE, values))
+
+
+async def clear_checkout_attempt(
+    purchase_id: str, worker_id: str, *, quote_id: str
+) -> Optional[Dict[str, Any]]:
+    """Undo `record_checkout_attempt`, ONLY after Reap DEFINITIVELY said nothing was created.
+
+    The caller's judgement, not this function's: QUOTE_EXPIRED or CHECKOUT_TEMPORARILY_UNAVAILABLE
+    on the create. An unknown outcome (a timeout, a 5xx without a code, a body we could not read)
+    must NEVER reach here -- clearing the marker is what lets the next step re-quote, and a new
+    quote is a new Idempotency-Key and so a possible SECOND checkout.
+
+    Fenced on the holder AND on the quote being cleared, so a worker cannot clear a marker some
+    other attempt wrote. None is a lost race.
+    """
+    _require_worker_id(worker_id, "worker_id")
+    values = {
+        "id": purchase_id,
+        "worker_id": worker_id,
+        "quote_id": _require_lookup_id(quote_id, "quote_id"),
+    }
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_CLEAR_CHECKOUT_ATTEMPT_SQL, values))
+    return _purchase(await database.fetch_one(_CLEAR_CHECKOUT_ATTEMPT_SQL_SQLITE, values))
+
+
 async def requeue_stale_claims(*, lease_seconds: int = 300, limit: int = 50) -> int:
     """Free leases held past `lease_seconds`; return how many moved.
 
@@ -2314,6 +2513,7 @@ _FAIL_EXHAUSTED_SQL = """
        )
        AND (:include_processing = 1 OR state <> 'processing')
        AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
+       AND NOT (state = 'quoting' AND reap_quote_id IS NOT NULL)
        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
        AND (:precheckout_enabled = 1 OR state NOT IN ('resolving', 'needs_enrollment', 'quoting'))
        AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((CAST(agent_id AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'agent_ids')) AND CAST(CASE WHEN lower(substr(merchant_domain,1,4))='www.' THEN lower(substr(merchant_domain,5)) ELSE lower(merchant_domain) END AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'merchant_domains')) AND CAST(market_country AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'markets')) AND CAST(product_key AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'product_keys')) AND CAST(quantity AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'quantities')) AND (NOT jsonb_exists(CAST(:pilot_scope AS jsonb), 'variant_keys') OR (
@@ -2329,6 +2529,7 @@ _FAIL_EXHAUSTED_SQL = """
            )
            AND (:include_processing = 1 OR state <> 'processing')
            AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
+           AND NOT (state = 'quoting' AND reap_quote_id IS NOT NULL)
            AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
        AND (:precheckout_enabled = 1 OR state NOT IN ('resolving', 'needs_enrollment', 'quoting'))
        AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((CAST(agent_id AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'agent_ids')) AND CAST(CASE WHEN lower(substr(merchant_domain,1,4))='www.' THEN lower(substr(merchant_domain,5)) ELSE lower(merchant_domain) END AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'merchant_domains')) AND CAST(market_country AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'markets')) AND CAST(product_key AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'product_keys')) AND CAST(quantity AS TEXT) IN (SELECT value FROM jsonb_array_elements_text(CAST(:pilot_scope AS jsonb)->'quantities')) AND (NOT jsonb_exists(CAST(:pilot_scope AS jsonb), 'variant_keys') OR (
@@ -2360,6 +2561,7 @@ _FAIL_EXHAUSTED_SQL_SQLITE = """
        )
        AND (:include_processing = 1 OR state <> 'processing')
        AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
+       AND NOT (state = 'quoting' AND reap_quote_id IS NOT NULL)
        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
        AND (:precheckout_enabled = 1 OR state NOT IN ('resolving', 'needs_enrollment', 'quoting'))
        AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((agent_id IN (SELECT value FROM json_each(:pilot_scope, '$.agent_ids')) AND (CASE WHEN lower(substr(merchant_domain,1,4))='www.' THEN lower(substr(merchant_domain,5)) ELSE lower(merchant_domain) END) IN (SELECT value FROM json_each(:pilot_scope, '$.merchant_domains')) AND market_country IN (SELECT value FROM json_each(:pilot_scope, '$.markets')) AND product_key IN (SELECT value FROM json_each(:pilot_scope, '$.product_keys')) AND quantity IN (SELECT value FROM json_each(:pilot_scope, '$.quantities')) AND (json_type(:pilot_scope, '$.variant_keys') IS NULL OR (
@@ -2375,6 +2577,7 @@ _FAIL_EXHAUSTED_SQL_SQLITE = """
            )
            AND (:include_processing = 1 OR state <> 'processing')
            AND NOT ((state = 'awaiting_approval' OR state = 'processing') AND reap_checkout_id IS NOT NULL)
+           AND NOT (state = 'quoting' AND reap_quote_id IS NOT NULL)
            AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
        AND (:precheckout_enabled = 1 OR state NOT IN ('resolving', 'needs_enrollment', 'quoting'))
        AND (CAST(:pilot_scope AS TEXT) IS NULL OR state NOT IN ('resolving', 'needs_enrollment', 'quoting') OR COALESCE((agent_id IN (SELECT value FROM json_each(:pilot_scope, '$.agent_ids')) AND (CASE WHEN lower(substr(merchant_domain,1,4))='www.' THEN lower(substr(merchant_domain,5)) ELSE lower(merchant_domain) END) IN (SELECT value FROM json_each(:pilot_scope, '$.merchant_domains')) AND market_country IN (SELECT value FROM json_each(:pilot_scope, '$.markets')) AND product_key IN (SELECT value FROM json_each(:pilot_scope, '$.product_keys')) AND quantity IN (SELECT value FROM json_each(:pilot_scope, '$.quantities')) AND (json_type(:pilot_scope, '$.variant_keys') IS NULL OR (
@@ -2584,6 +2787,12 @@ async def fail_exhausted_purchases(
     The optional flag only covers processing rows without a persisted checkout. Resolve a
     genuine payment through the provider-read step or an explicitly audited repair instead.
 
+    A 'quoting' row with a checkout create IN FLIGHT (`reap_quote_id` set, see
+    `record_checkout_attempt`) is excluded for the same reason: Reap may hold a checkout for it
+    whose id we have not learned yet, and a terminal 'failed' would orphan it. The purchase
+    service bounds those rows itself and parks them as `checkout_unresolvable:` (counted by
+    `count_checkout_needs_human`), still replaying the SAME create, never re-quoting.
+
     BOUNDED, for the same reason as the expire sweep.
 
     UNFENCED, like the expire sweep: it takes no `holder` and can terminate a purchase a live
@@ -2756,20 +2965,26 @@ async def count_stuck_purchases(
 
 _COUNT_CHECKOUT_NEEDS_HUMAN_SQL = """
     SELECT count(*) AS n FROM reap_agentic_purchases
-     WHERE state IN ('awaiting_approval','processing') AND reap_checkout_id IS NOT NULL
+     WHERE ((state IN ('awaiting_approval','processing') AND reap_checkout_id IS NOT NULL)
+            OR (state = 'quoting' AND reap_quote_id IS NOT NULL AND reap_checkout_id IS NULL))
        AND substr(COALESCE(last_error_code,''),1,21)='checkout_unresolvable'
        AND substr(last_error_code,22,1)=chr(58)
 """
 _COUNT_CHECKOUT_NEEDS_HUMAN_SQL_SQLITE = """
     SELECT count(*) AS n FROM reap_agentic_purchases
-     WHERE state IN ('awaiting_approval','processing') AND reap_checkout_id IS NOT NULL
+     WHERE ((state IN ('awaiting_approval','processing') AND reap_checkout_id IS NOT NULL)
+            OR (state = 'quoting' AND reap_quote_id IS NOT NULL AND reap_checkout_id IS NULL))
        AND substr(COALESCE(last_error_code,''),1,21)='checkout_unresolvable'
        AND substr(last_error_code,22,1)=char(58)
 """
 
 
 async def count_checkout_needs_human() -> int:
-    """Only explicitly classified unresolved reads; never general transport/refusal errors."""
+    """Only explicitly classified unresolved reads; never general transport/refusal errors.
+
+    Also a 'quoting' row parked with a checkout CREATE whose outcome Reap never answered
+    definitively (`reap_quote_id` set, no checkout id): a checkout may exist that no row names.
+    """
     if IS_POSTGRES:
         row = await database.fetch_one(_COUNT_CHECKOUT_NEEDS_HUMAN_SQL)
     else:

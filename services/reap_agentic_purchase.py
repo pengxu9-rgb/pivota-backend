@@ -3195,6 +3195,14 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
         return _lost(row)
     row = guarded
 
+    # A CHECKOUT CREATE IS ALREADY IN FLIGHT for this purchase (`ledger.record_checkout_attempt`):
+    # an earlier step sent it and never learned the outcome, or learned it and died before writing
+    # it down. The re-resolve and re-quote below are exactly what must NOT happen now -- a new
+    # quote is a new Idempotency-Key and a possible second checkout -- so the same create is
+    # replayed instead, before anything else.
+    if row.get("reap_quote_id") and not row.get("reap_checkout_id"):
+        return await _replay_checkout(row, worker_id)
+
     active = await ledger.get_active_enrollment(str(row["buyer_ref"]))
     partner_enrollment = str((active or {}).get("reap_enrollment_id") or "").strip()
     if not partner_enrollment:
@@ -3480,6 +3488,10 @@ async def _checkout_from_quote(
     # was previously written and never read. Compared against this process's clock, which is the
     # clock available at this point; both sides are UTC, and the check is advisory — the partner
     # would refuse the create anyway. What it buys is a named reason and one fewer round trip.
+    #
+    # ONLY EVER ON A QUOTE NO CREATE HAS BEEN SENT FOR. A row with a create in flight never gets
+    # here (`_step_quoting` hands it to `_replay_checkout` first): once a create was sent, our
+    # clock is not allowed to decide it died -- only Reap's answer to the replay is.
     if quote_expires is not None and quote_expires <= _now():
         return await _hold(error_code="quote_expired")
 
@@ -3492,15 +3504,245 @@ async def _checkout_from_quote(
     except PurchaseRefused as exc:
         return await _move(row, worker_id, ["quoting"], "refused",
                            refusal_reason=exc.reason, last_error_code=exc.reason, **evidence)
-    # This value reaches the client's final pre-stream permission check, including when
-    # configuration changes during AsyncClient entry. Scope always bounds the actual charge.
-    amount_token = _WORKER_QUOTE_TOTAL.set(verdict.total_minor)
+    return_url = _stage_url(row.get("return_url"), "checkout")
     try:
+        # The body is built (and refused) BEFORE anything is recorded or sent: a request the
+        # client will not build must not leave an in-flight marker behind, because the marker
+        # would then replay an unbuildable request on every poll.
+        rc.build_checkout_request(
+            quote_id=quote_id, enrollment_id=partner_enrollment, return_url=return_url
+        )
+    except rc.ReapRequestError as exc:
+        code = str(getattr(exc, "code", "") or "checkout_request_unbuildable")
+        return await _move(row, worker_id, ["quoting"], "failed",
+                           last_error_code=_error_code(code), **evidence)
+
+    # THE CREATE IS RECORDED BEFORE IT IS SENT (P2-8, closed). The partner's Idempotency-Key for
+    # `/agentic/checkouts` is derived from (quoteId, enrollmentId) only, so a later attempt reaches
+    # THIS checkout -- rather than a second one -- only if it re-sends THIS quote with THIS
+    # enrollment. Re-quoting after an unknown outcome (a timeout after the bytes left, a crash or a
+    # lost lease after the 200) would arrive with a new quote id, a new key and a possible second
+    # live checkout while the first is orphaned. So the quote, the enrollment row and the quoted
+    # total go on the row first, fenced to this holder; every later step for this purchase replays
+    # the same create (`_replay_checkout`) until Reap answers definitively.
+    recorded = await ledger.record_checkout_attempt(
+        str(row["id"]),
+        worker_id,
+        quote_id=quote_id,
+        enrollment_id=str(active["id"]),
+        quoted_total_minor=verdict.total_minor,
+        reap_quote_expires_at=quote_expires,
+        shipping_minor=verdict.shipping_minor,
+        tax_minor=verdict.tax_minor,
+        tax_included=verdict.tax_included,
+        discount_minor=verdict.discount_minor,
+        offer_code_outcome=evidence.get("offer_code_outcome"),
+        reap_product_id=item_evidence.get("reap_product_id"),
+        reap_variant_id=item_evidence.get("reap_variant_id"),
+    )
+    if recorded is None:
+        return _lost(row)
+    return await _create_checkout(
+        row, worker_id,
+        quote_id=quote_id,
+        partner_enrollment=partner_enrollment,
+        total_minor=verdict.total_minor,
+        return_url=return_url,
+        evidence=evidence,
+        hold=_hold,
+    )
+
+
+# ── the checkout create, and its replay ──────────────────────────────────────────────────────
+
+#: Unknown create outcomes in a row before the purchase is PARKED for a human
+#: (`checkout_unresolvable:<n>:<code>`, retried every `CHECKOUT_HUMAN_RETRY_SECONDS`, counted by
+#: `ledger.count_checkout_needs_human`). Parked is not terminal and not a re-quote: the parked
+#: row keeps replaying the SAME create, and the first definitive answer un-parks it.
+CHECKOUT_CREATE_UNKNOWN_LIMIT = 3
+
+#: `last_error_code` prefixes carrying the unknown-create count. See `_hold_unknown_create`.
+_CREATE_UNKNOWN_PREFIX = "checkout_create_unknown"
+_CREATE_UNRESOLVABLE_PREFIX = "checkout_unresolvable"
+
+#: Written on the transition that a REPLAYED create completed, replacing the count above so the
+#: 'awaiting_approval' row does not carry a `checkout_unresolvable:` code it no longer deserves.
+CHECKOUT_CREATE_REPLAYED = "checkout_create_replayed"
+
+#: Client results that mean no answer from Reap about this create was READ. The request may have
+#: been processed; we cannot tell.
+_CREATE_UNREAD_ERRORS = frozenset({
+    "unparseable_response",
+    "response_too_large",
+    # A 200 whose `nextAction.url` the client would not vouch for: the client drops `.data`, so a
+    # checkout DOES exist and we do not have its id. Parked at once (see `_create_checkout`).
+    "hosted_url_not_allowed",
+    # Nothing was sent by THIS attempt -- but an earlier one may have been, so it is not a
+    # definitive "not created" either.
+    "reap_client_not_configured",
+})
+
+#: Partner codes that are statements about the IDEMPOTENCY KEY, not verdicts on the checkout: a
+#: request with this key is still running, or already exists with other parameters. Either way a
+#: checkout may exist.
+_CREATE_IDEMPOTENCY_CODES = frozenset({
+    "IDEMPOTENCY_REQUEST_IN_PROGRESS",
+    "IDEMPOTENT_PARAMETER_MISMATCH",
+})
+
+
+def _create_outcome_unknown(checkout: Any) -> bool:
+    """Is this failed create one whose outcome at Reap we DO NOT KNOW?
+
+    Called after the definitive answers have been taken (CHECKOUT_TEMPORARILY_UNAVAILABLE and
+    QUOTE_EXPIRED: nothing was created; ENROLLMENT_NOT_ACTIVE: nothing was created, and nothing can
+    be). What is left is unknown when nobody READ a verdict: a transport error, a body we could not
+    parse or would not read, a 2xx we refused, an idempotency statement, a 5xx (including a 503
+    that does not name itself CHECKOUT_TEMPORARILY_UNAVAILABLE), 408 or 429. A remaining 4xx is a
+    refusal of the request -- on a replay, Reap's stored answer to the original or a fresh refusal
+    of it, and in both cases nothing was created.
+    """
+    code = str(checkout.error or "")
+    if _is_transport(code) or code in _CREATE_UNREAD_ERRORS:
+        return True
+    if {str(checkout.error_code or ""), str(checkout.error_detail_code or "")} & _CREATE_IDEMPOTENCY_CODES:
+        return True
+    status = checkout.status
+    if isinstance(status, bool) or not isinstance(status, int):
+        return True
+    return status < 400 or status >= 500 or status in (408, 429)
+
+
+def _create_unknown_count(code: Any) -> int:
+    parts = str(code or "").split(":", 2)
+    if len(parts) == 3 and parts[0] in {_CREATE_UNKNOWN_PREFIX, _CREATE_UNRESOLVABLE_PREFIX}:
+        try:
+            return min(max(int(parts[1]), 0), 99)
+        except ValueError:
+            pass
+    return 0
+
+
+async def _hold_unknown_create(
+    row: Mapping[str, Any],
+    worker_id: str,
+    code: Any,
+    *,
+    retry_after: Optional[int] = None,
+    park: bool = False,
+) -> AdvanceResult:
+    """Give the lease back WITH THE CREATE STILL IN FLIGHT: the marker stays, so the next step
+    replays the same create. Counted in `last_error_code`; at `CHECKOUT_CREATE_UNKNOWN_LIMIT` (or
+    at once with `park`) the code becomes `checkout_unresolvable:<n>:<code>` and the retry slows to
+    `CHECKOUT_HUMAN_RETRY_SECONDS`. Never terminal, never a re-quote."""
+    count = min(_create_unknown_count(row.get("last_error_code")) + 1, 99)
+    if park:
+        count = max(count, CHECKOUT_CREATE_UNKNOWN_LIMIT)
+    parked = count >= CHECKOUT_CREATE_UNKNOWN_LIMIT
+    head = f"{_CREATE_UNRESOLVABLE_PREFIX if parked else _CREATE_UNKNOWN_PREFIX}:{count}:"
+    error_code = head + (_error_code(code) or "unknown")[: _CODE_MAX - len(head)]
+    if parked:
+        return await _release(row, worker_id, error_code=error_code,
+                              seconds=CHECKOUT_HUMAN_RETRY_SECONDS)
+    if retry_after is not None:
+        return await _release(row, worker_id, error_code=error_code, seconds=max(1, retry_after))
+    return await _release(row, worker_id, error_code=error_code, transport=True)
+
+
+async def _replay_checkout(row: Mapping[str, Any], worker_id: str) -> AdvanceResult:
+    """'quoting' with a create IN FLIGHT: re-send THE SAME create, and nothing else.
+
+    Same quote id, same enrollment (read back by the row's own `enrollment_id`, NOT whatever is
+    active now -- a re-enrolled buyer has a different active row, and a different partner
+    enrollment is a different Idempotency-Key), same return URL, so Reap replays its original
+    answer: the checkout it created, or the refusal it gave. No resolve, no quote, no P2-9 clock
+    check. The pilot scope and the provider permission are applied to the ORIGINAL quoted total,
+    recorded with the marker.
+
+    A request that can no longer be rebuilt (the enrollment row is gone, the stored values do not
+    validate) is PARKED rather than re-quoted: re-quoting is precisely what this exists to prevent.
+    """
+    quote_id = _partner_id(row.get("reap_quote_id"), what="quote")
+    enrollment_ref = str(row.get("enrollment_id") or "").strip()
+    enrollment = await ledger.get_enrollment_internal(enrollment_ref) if enrollment_ref else None
+    partner_enrollment = str((enrollment or {}).get("reap_enrollment_id") or "").strip()
+    total = row.get("quoted_total_minor")
+    if (
+        quote_id is None
+        or not partner_enrollment
+        or _partner_id(partner_enrollment, what="enrollment", uuid=True) is None
+        or isinstance(total, bool)
+        or not isinstance(total, int)
+    ):
+        return await _hold_unknown_create(row, worker_id, "checkout_replay_unbuildable", park=True)
+    if await _still_ours(row, worker_id) is None:
+        return _lost(row)
+    if not is_create_enabled():
+        return await _pause_precheckout(row, worker_id)
+    try:
+        _row_scope(row, total_minor=total)
+    except PurchaseRefused:
+        # NOT the fresh path's terminal 'refused': a checkout may already exist for this quote,
+        # so the row is kept, paused, for the scope to be restored or a human to look.
+        return await _pause_precheckout(row, worker_id)
+    logger.info(
+        "reap_agentic: replaying checkout create purchase=%s quote=%s", row["id"], quote_id
+    )
+
+    async def _hold(**kwargs: Any) -> AdvanceResult:
+        return await _release(row, worker_id, **kwargs)
+
+    return await _create_checkout(
+        row, worker_id,
+        quote_id=quote_id,
+        partner_enrollment=partner_enrollment,
+        total_minor=total,
+        return_url=_stage_url(row.get("return_url"), "checkout"),
+        evidence={"reap_quote_id": quote_id},
+        hold=_hold,
+        replay=True,
+    )
+
+
+async def _create_checkout(
+    row: Mapping[str, Any],
+    worker_id: str,
+    *,
+    quote_id: str,
+    partner_enrollment: str,
+    total_minor: int,
+    return_url: str,
+    evidence: Mapping[str, Any],
+    hold: Any,
+    replay: bool = False,
+) -> AdvanceResult:
+    """Send the create for a quote whose marker is ALREADY on the row, and act on the answer.
+
+    THREE KINDS OF ANSWER, and only one of them lets the marker go:
+
+      definitive, nothing created   CHECKOUT_TEMPORARILY_UNAVAILABLE (503, 2026-09-28 spec) and
+                                    QUOTE_EXPIRED: the marker is CLEARED and the lease given back,
+                                    so the next step re-quotes on a new key. ENROLLMENT_NOT_ACTIVE
+                                    and any other 4xx refusal: terminal 'failed', as before.
+      a checkout                    recorded, and the row proceeds exactly as before.
+      unknown                       `_create_outcome_unknown`: the marker STAYS, the lease is given
+                                    back, and the next step replays this create. Bounded by
+                                    `_hold_unknown_create`, which parks rather than ends.
+    """
+    amount_token = _WORKER_QUOTE_TOTAL.set(total_minor)
+    try:
+        # This value reaches the client's final pre-stream permission check, including when
+        # configuration changes during AsyncClient entry. Scope always bounds the actual charge.
         checkout = await rc.create_checkout(
             quote_id=quote_id,
             enrollment_id=partner_enrollment,
-            return_url=_stage_url(row.get("return_url"), "checkout"),
+            return_url=return_url,
         )
+    except rc.ReapRequestError:
+        # Raised by the body builder, before egress. The fresh path built this same body before
+        # recording the marker, so reaching here means the inputs changed under a create that may
+        # already have been sent (a return-URL host list edited between attempts): parked.
+        return await _hold_unknown_create(row, worker_id, "checkout_request_unbuildable", park=True)
     finally:
         _WORKER_QUOTE_TOTAL.reset(amount_token)
     if not checkout.ok:
@@ -3510,21 +3752,29 @@ async def _checkout_from_quote(
         # Both spellings are read, because the partner moved the field without moving the
         # version and a client that reads one of them is a client that stops classifying.
         top = str(checkout.error_code or "")
-        if top in rc.TEMPORARY_UNAVAILABLE_CODES:
-            # 503 CHECKOUT_TEMPORARILY_UNAVAILABLE (2026-09-28 spec): nothing was created. Same
-            # answer as an expired quote -- give the lease back, on Reap's Retry-After when it
-            # sent one, and let the next step re-quote -- never a terminal failure over a blip.
+        if top == "CHECKOUT_TEMPORARILY_UNAVAILABLE":
+            # 503 CHECKOUT_TEMPORARILY_UNAVAILABLE (2026-09-28 spec): nothing was created. The one
+            # 503 that says so; any other 503 (AGENTIC_SERVICE_UNAVAILABLE, or no code at all) is
+            # an UNKNOWN below and replays. Clear the marker, give the lease back on Reap's
+            # Retry-After when it sent one, and let the next step re-quote.
+            if await ledger.clear_checkout_attempt(
+                str(row["id"]), worker_id, quote_id=quote_id
+            ) is None:
+                return _lost(row)
             wait = checkout.retry_after_seconds
-            return await _hold(
+            return await hold(
                 error_code=_error_code(top),
                 transport=wait is None, seconds=max(1, wait) if wait is not None else None,
             )
         if "QUOTE_EXPIRED" in (detail, top):
-            # The partner's word for what the P2-9 pre-check above catches on our clock: the
-            # quote died between the quote and the create. Same answer as the pre-check -- give
-            # the lease back and let the next step re-resolve and re-quote -- rather than the
-            # generic branch below, which would END the purchase over a five-minute timer.
-            return await _hold(error_code="quote_expired")
+            # The quote died before Reap created anything from it -- on a replay, the definitive
+            # answer that no checkout was ever made on it. Clear the marker and let the next step
+            # re-resolve and re-quote, rather than END the purchase over a five-minute timer.
+            if await ledger.clear_checkout_attempt(
+                str(row["id"]), worker_id, quote_id=quote_id
+            ) is None:
+                return _lost(row)
+            return await hold(error_code="quote_expired")
         if "ENROLLMENT_NOT_ACTIVE" in (detail, top):
             # 'quoting' → 'needs_enrollment' is not a legal edge, so there is no way to send the
             # buyer back to the card page on THIS purchase. Fail with the partner's own code; the
@@ -3537,21 +3787,25 @@ async def _checkout_from_quote(
                 last_error_code=_error_code("ENROLLMENT_NOT_ACTIVE"), **evidence,
             )
         code = str(checkout.error or "checkout_create_failed")
-        if _is_transport(code):
-            # The quote is lost with the step. That is correct rather than merely tolerable: a
-            # quote we could not turn into a checkout expires in five minutes, and the next step
-            # re-resolves and re-quotes from scratch anyway.
+        if _create_outcome_unknown(checkout):
+            # NOT a terminal failure and NOT a re-quote: a checkout may exist at Reap. The marker
+            # stays, so the next step re-sends this create on the same key and learns which.
             #
-            # A HOSTILE HOSTED URL ALSO LANDS HERE, not below: `_refuse_unsafe_hosted_url` inside
-            # the client turns a 200 carrying a `nextAction.url` it will not vouch for into
-            # `ok=False, error="hosted_url_not_allowed"` AND DROPS `.data`, so the URL never
-            # reaches this module at all.
-            return await _hold(error_code=code, transport=True)
+            # A HOSTILE HOSTED URL IS ONE OF THESE, and is parked at once: `_refuse_unsafe_hosted_url`
+            # inside the client turns a 200 carrying a `nextAction.url` it will not vouch for into
+            # `ok=False, error="hosted_url_not_allowed"` AND DROPS `.data`, so the URL never reaches
+            # this module -- and neither does the id of the checkout that 200 describes.
+            return await _hold_unknown_create(
+                row, worker_id, top or detail or code,
+                retry_after=checkout.retry_after_seconds,
+                park=code == "hosted_url_not_allowed",
+            )
         return await _move(
             row, worker_id, ["quoting"], "failed",
             last_error_code=_error_code(detail or checkout.error_code or code), **evidence,
         )
 
+    evidence = dict(evidence)
     # A LIVE CHECKOUT EXISTS AT THE PARTNER FROM THIS LINE ON, and it is recorded on every exit
     # below — including the failures. P2-5: dropping it on the way out left a real checkout with
     # nothing in our storage pointing at it.
@@ -3567,21 +3821,16 @@ async def _checkout_from_quote(
         )
     evidence["reap_checkout_id"] = checkout_id
 
-    # P2-8, THE ORPHAN WINDOW, STATED RATHER THAN IMPLIED. A crash between the create above and
-    # the transition below leaves a checkout at Reap that no row of ours references. It cannot be
-    # recovered by replaying the create: the client's idempotency key for `/agentic/checkouts` is
-    # derived from `(quoteId, enrollmentId)`, and the next step re-resolves and re-quotes, so it
-    # arrives with a NEW quote id and a different key. There is no double-charge risk — the
-    # buyer only ever receives the hosted URL through a row the fence agreed to write, and an
-    # unapproved checkout expires — but the checkout is real and somebody may have to find it.
-    #
-    # THE LEDGER OFFERS NO FENCED FIELD-ONLY WRITE (`transition_as_holder` needs a state change
-    # and `release_claim` takes only `next_poll_at`), so it cannot be recorded BEFORE the
-    # transition. It is logged instead: an id, not a URL and not PII.
+    # P2-8, NOW CLOSED. A crash between the create above and the transition below no longer
+    # orphans this checkout: the quote it was made from is already on the row (see
+    # `record_checkout_attempt`), so the next holder replays the create on the same
+    # Idempotency-Key and Reap answers with THIS checkout. Logged too: an id, not a URL, not PII.
     logger.info(
-        "reap_agentic: checkout created purchase=%s checkout=%s quote=%s",
-        row["id"], checkout_id, quote_id,
+        "reap_agentic: checkout created purchase=%s checkout=%s quote=%s replay=%s",
+        row["id"], checkout_id, quote_id, replay,
     )
+    if replay:
+        evidence["last_error_code"] = CHECKOUT_CREATE_REPLAYED
 
     action = rc.hosted_action(checkout.data)
     if action is None:
@@ -3590,10 +3839,8 @@ async def _checkout_from_quote(
         # REDIRECT: a checkout with nowhere to send the buyer. 'awaiting_approval' exists to hold
         # a link, so it is not entered without one, and the checkout id is kept because the
         # checkout is real.
-        return await _move(
-            row, worker_id, ["quoting"], "failed",
-            last_error_code="checkout_no_hosted_action", **evidence,
-        )
+        evidence["last_error_code"] = "checkout_no_hosted_action"
+        return await _move(row, worker_id, ["quoting"], "failed", **evidence)
     hosted_url, expires_at = action
     return await _move(
         row, worker_id, ["quoting"], "awaiting_approval",

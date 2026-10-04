@@ -3047,3 +3047,178 @@ async def test_scope_pause_attempt_exempt_claim_timestamp_generation(monkeypatch
     after = await ledger.get_purchase_internal(purchase)
     for field in ["attempts", "claimed_by", "claimed_at", "state", "last_error_code", "next_poll_at"]:
         assert after[field] == captured[field], field
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# THE CHECKOUT CREATE IS REPLAYED ON ITS OWN KEY UNTIL REAP ANSWERS DEFINITIVELY — on Postgres
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+#
+# The SQLite arm drives the real `rc.create_checkout` down to a scripted `_post`. Here the fake
+# create computes the Idempotency-Key with the client's REAL body builder and `_headers`, so the
+# key each assertion counts is the one the partner would receive; what this arm adds is the
+# marker's fenced write, clear and sweep exclusion against the production engine.
+
+_Q1 = "a1b2c3d4"
+_Q2 = "e5f6a7b8"
+
+
+class _Wire:
+    def __init__(self, answers):
+        self.sent = []
+        self.answers = list(answers)
+
+    def __call__(self, **kwargs):
+        import services.reap_agentic_client as rc
+
+        body = rc.build_checkout_request(**kwargs)
+        key = rc._headers("sk_test_key", "/agentic/checkouts", body)["Idempotency-Key"]
+        self.sent.append((kwargs["quote_id"], kwargs["enrollment_id"], key))
+        answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        return answer() if callable(answer) else answer
+
+    def quotes(self):
+        return [q for q, _, _ in self.sent]
+
+    def keys(self):
+        return [k for _, _, k in self.sent]
+
+
+def _wire(reap, *answers):
+    wire = _Wire(answers)
+    reap.create_checkout = wire
+    reap.request_quote = [_ok(dict(QUOTE_200, id=_Q1)), _ok(dict(QUOTE_200, id=_Q2))]
+    return wire
+
+
+async def _replay_quoting() -> str:
+    await _active_enrollment()
+    purchase_id = await _start()
+    assert (await _step(purchase_id)).state == "quoting"
+    return purchase_id
+
+
+async def test_pg_a_lost_create_answer_replays_the_same_key_and_never_requotes(reap):
+    import services.reap_agentic_purchase as svc
+
+    wire = _wire(reap, _transport(), _ok(CHECKOUT_CREATED))
+    purchase_id = await _replay_quoting()
+    held = await _step(purchase_id)
+    assert held.outcome == "released"
+    assert held.last_error_code == "checkout_create_unknown:1:transport_error:readtimeout"
+    row = await _get(purchase_id)
+    assert row["reap_quote_id"] == _Q1 and row["quoted_total_minor"] == 4500
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    row = await _get(purchase_id)
+    assert row["reap_checkout_id"] == "chk_7f3a"
+    assert row["last_error_code"] == svc.CHECKOUT_CREATE_REPLAYED
+    assert len(reap.named("request_quote")) == 1
+    assert wire.quotes() == [_Q1, _Q1] and len(set(wire.keys())) == 1
+
+
+async def test_pg_a_crash_after_the_create_returned_replays_and_records_that_checkout(
+    reap, monkeypatch
+):
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_purchase as svc
+
+    wire = _wire(reap, _ok(CHECKOUT_CREATED))
+    purchase_id = await _replay_quoting()
+    actual = ledger.transition_as_holder
+    crashed = []
+
+    async def crash_once(*args, **kwargs):
+        if kwargs.get("to_state") == "awaiting_approval" and not crashed:
+            crashed.append(True)
+            raise RuntimeError("worker died after the create returned")
+        return await actual(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "transition_as_holder", crash_once)
+    await _claim(purchase_id, "w1")
+    with pytest.raises(RuntimeError):
+        await svc.advance(purchase_id, "w1")
+    assert (await _get(purchase_id))["reap_quote_id"] == _Q1
+    await _raw(
+        "UPDATE reap_agentic_purchases SET claimed_at = clock_timestamp() - INTERVAL '9999 seconds' "
+        "WHERE id = :i", {"i": purchase_id},
+    )
+    assert await ledger.requeue_stale_claims(lease_seconds=30) == 1
+    assert (await _step(purchase_id, "w2")).state == "awaiting_approval"
+    assert (await _get(purchase_id))["reap_checkout_id"] == "chk_7f3a"
+    assert len(reap.named("request_quote")) == 1
+    assert wire.quotes() == [_Q1, _Q1] and len(set(wire.keys())) == 1
+
+
+async def test_pg_quote_expired_on_a_replay_clears_the_marker_and_requotes_on_a_new_key(reap):
+    import services.reap_agentic_client as rc
+
+    wire = _wire(
+        reap,
+        _transport(),
+        rc.ReapResponse(ok=False, status=409, error="reap_status_409", error_code="QUOTE_EXPIRED"),
+        _ok(CHECKOUT_CREATED),
+    )
+    purchase_id = await _replay_quoting()
+    await _step(purchase_id)
+    assert (await _step(purchase_id)).last_error_code == "quote_expired"
+    row = await _get(purchase_id)
+    assert row["reap_quote_id"] is None and row["quoted_total_minor"] is None
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    assert wire.quotes() == [_Q1, _Q1, _Q2]
+    keys = wire.keys()
+    assert keys[0] == keys[1] != keys[2]
+
+
+@pytest.mark.parametrize("kind", ["reap_status_500", "unparseable_response", "response_too_large"])
+async def test_pg_an_unknown_create_outcome_is_not_terminal_and_replays(reap, kind):
+    import services.reap_agentic_client as rc
+
+    status = 500 if kind == "reap_status_500" else 200
+    wire = _wire(reap, rc.ReapResponse(ok=False, status=status, error=kind),
+                 _ok(CHECKOUT_CREATED))
+    purchase_id = await _replay_quoting()
+    held = await _step(purchase_id)
+    assert held.outcome == "released" and held.last_error_code == f"checkout_create_unknown:1:{kind}"
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    assert wire.quotes() == [_Q1, _Q1] and len(set(wire.keys())) == 1
+
+
+async def test_pg_unknown_outcomes_park_and_are_never_swept_to_failed(reap):
+    import db.reap_agentic_ledger as ledger
+
+    wire = _wire(reap, _transport())
+    purchase_id = await _replay_quoting()
+    codes = [(await _step(purchase_id)).last_error_code for _ in range(3)]
+    assert codes[-1] == "checkout_unresolvable:3:transport_error:readtimeout"
+    assert await ledger.count_checkout_needs_human() == 1
+    await _raw("UPDATE reap_agentic_purchases SET attempts = 999 WHERE id = :i", {"i": purchase_id})
+    assert await ledger.fail_exhausted_purchases(5) == []
+    assert (await _get(purchase_id))["state"] == "quoting"
+    assert len(reap.named("request_quote")) == 1 and len(set(wire.keys())) == 1
+
+
+async def test_pg_a_lease_lost_mid_create_hands_the_replay_to_the_new_holder(reap):
+    import services.reap_agentic_purchase as svc
+
+    purchase_id = await _replay_quoting()
+    moved = []
+
+    def lease_moves_then_200():
+        moved.append(True)
+        return _lease_moves(purchase_id)
+
+    wire = _wire(reap, lease_moves_then_200, _ok(CHECKOUT_CREATED))
+    assert (await _step(purchase_id, "w1")).outcome == "lost_claim"
+    assert moved
+    row = await _get(purchase_id)
+    assert row["reap_checkout_id"] is None and row["reap_quote_id"] == _Q1
+    assert (await svc.advance(purchase_id, "w2")).state == "awaiting_approval"
+    assert len(reap.named("request_quote")) == 1
+    assert wire.quotes() == [_Q1, _Q1] and len(set(wire.keys())) == 1
+
+
+async def _lease_moves(purchase_id):
+    await _raw(
+        "UPDATE reap_agentic_purchases SET claimed_by = 'w2', claimed_at = clock_timestamp() "
+        "WHERE id = :i", {"i": purchase_id},
+    )
+    return _ok(CHECKOUT_CREATED)
