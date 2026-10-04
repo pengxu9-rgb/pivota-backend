@@ -188,17 +188,24 @@ async def fetch_proof(product_key: str, sku_key: str) -> Optional[Dict[str, Any]
     None when there is no row, AND when the table cannot be created (`ensure_table()` False): a
     proof nobody can read is a missing proof, which `verify_enrichment_cart_proof` refuses
     (`proof_missing`). A failed `ensure_table()` is REMEMBERED for `FETCH_DDL_RETRY_SECONDS`: in
-    that window this answers None without touching the DDL or its lock, then tries once more.
+    that window this answers None without touching the DDL or its lock, then tries once more --
+    except that on Postgres the read-only probe still runs, so a table someone else completed in
+    the meantime (the writer job, prepare's warm-up) is read at once.
     Inside a read-only transaction no DDL runs (`_PROBE_POSTGRES`): an existing table is read, a
     missing one is None, and neither arms the window. A database error on the probe or the SELECT
     itself propagates, as every other read on the purchase path does.
     Returned as a plain dict because the verifier takes a Mapping and a `databases` Record is not
     one.
     """
-    global _FETCH_DDL_FAILED_AT
-    if (_FETCH_DDL_FAILED_AT is not None
+    global _DDL_READY, _FETCH_DDL_FAILED_AT
+    from db.database import database
+
+    if (_FETCH_DDL_FAILED_AT is not None and not _DDL_READY
             and time.monotonic() - _FETCH_DDL_FAILED_AT < FETCH_DDL_RETRY_SECONDS):
-        return None
+        # In the window: no DDL and no lock. Only a COMPLETE table (no DDL owed) ends it early.
+        if not IS_POSTGRES or not (await database.fetch_one(_PROBE_POSTGRES))["complete"]:
+            return None
+        _DDL_READY = True
     state = await _ensure()
     if state == _FAILED:
         _FETCH_DDL_FAILED_AT = time.monotonic()
@@ -206,8 +213,6 @@ async def fetch_proof(product_key: str, sku_key: str) -> Optional[Dict[str, Any]
     if state == _ABSENT:  # read-only and no table: no proof, and no DDL failure to remember
         return None
     _FETCH_DDL_FAILED_AT = None
-    from db.database import database
-
     row = await database.fetch_one(
         _SELECT_PROOF_SQL, {"product_key": product_key, "sku_key": sku_key}
     )
