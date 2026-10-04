@@ -56,6 +56,9 @@ _WIDEN_EVENTS_PG = f"""
 ALTER TABLE reap_checkout_dispatch_events DROP CONSTRAINT IF EXISTS {_EVENT_CHECK},
     ADD CONSTRAINT {_EVENT_CHECK} CHECK (event_type IN ('started','not_created','observed','resolved','superseded'))
 """
+# Mig 257: `recorded_at` is zoneless, and CURRENT_TIMESTAMP would store the WRITER session's
+# wall time. Written as UTC explicitly so the operator's settle-window CAS is session-independent.
+_UTC_RECORDED_AT_PG = "ALTER TABLE reap_checkout_dispatch_events ALTER COLUMN recorded_at SET DEFAULT timezone('UTC', now())"
 _EVENT_COLUMNS = "purchase_id,dispatch_key,event_type,quote_id,enrollment_id,checkout_id,provider_code,recorded_at"
 
 # One operator decision per parked dispatch key, plus at most one (decision_seq 2) that
@@ -101,6 +104,12 @@ async def _allow_resolved_events():
             "WHERE conrelid='reap_checkout_dispatch_events'::regclass AND conname=:name", {'name': _EVENT_CHECK})
         if definition is None or "'superseded'" not in definition:
             await database.execute(_WIDEN_EVENTS_PG)
+        default = await database.fetch_val(
+            "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a"
+            " ON a.attrelid=d.adrelid AND a.attnum=d.adnum"
+            " WHERE d.adrelid='reap_checkout_dispatch_events'::regclass AND a.attname='recorded_at'")
+        if default is None or "'UTC'" not in default:
+            await database.execute(_UTC_RECORDED_AT_PG)
         return
     sql = await database.fetch_val(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='reap_checkout_dispatch_events'")

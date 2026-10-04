@@ -4,6 +4,9 @@
 ALTER TABLE reap_checkout_dispatch_events DROP CONSTRAINT IF EXISTS reap_checkout_dispatch_events_event_type_check;
 ALTER TABLE reap_checkout_dispatch_events ADD CONSTRAINT reap_checkout_dispatch_events_event_type_check
     CHECK (event_type IN ('started','not_created','observed','resolved','superseded'));
+-- recorded_at is zoneless; CURRENT_TIMESTAMP would store the writer session's wall time. UTC,
+-- explicitly, so the operator's settle-window check never depends on a session TimeZone.
+ALTER TABLE reap_checkout_dispatch_events ALTER COLUMN recorded_at SET DEFAULT timezone('UTC', now());
 
 -- One operator decision per parked dispatch key, plus at most one that supersedes a
 -- not-created decision (late receipt or re-park). Opaque handles only, no buyer contact or URL.

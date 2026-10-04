@@ -178,11 +178,12 @@ def dispatch_settle_seconds() -> int:
 def _settle_sql():
     """(earliest-allowed expression over journal alias `e`, the DB clock it is compared with).
 
-    `recorded_at` is a zoneless CURRENT_TIMESTAMP: session-zone wall time on Postgres (so it is
-    read back AT that zone) and UTC text on SQLite.
+    `recorded_at` is zoneless UTC on both engines (mig 257 makes the Postgres default
+    `timezone('UTC', now())`; SQLite's CURRENT_TIMESTAMP is UTC). It is read back AT 'UTC', never
+    at the session's TimeZone, which would move the window by the zone offset.
     """
     if IS_POSTGRES:
-        return ("((e.recorded_at + (:settle * INTERVAL '1 second')) AT TIME ZONE current_setting('TimeZone'))",
+        return ("((e.recorded_at + (:settle * INTERVAL '1 second')) AT TIME ZONE 'UTC')",
                 "clock_timestamp()")
     return "datetime(e.recorded_at, :settle_window)", "CURRENT_TIMESTAMP"
 

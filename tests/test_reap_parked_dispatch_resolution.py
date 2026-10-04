@@ -68,7 +68,7 @@ async def _age_started(pid, seconds):
         await database.execute('DROP TRIGGER reap_dispatch_events_no_update')
         try:
             await database.execute("UPDATE reap_checkout_dispatch_events SET recorded_at = datetime(recorded_at, :w)"
-                                   " WHERE purchase_id=:id AND event_type='started'", {'w': f'-{seconds} seconds', 'id': pid})
+                                   " WHERE purchase_id=:id AND event_type='started'", {'w': f'{-seconds:+d} seconds', 'id': pid})
         finally:
             await database.execute(continuation._IMMUTABLE_UPDATE_SQLITE)
 
@@ -448,6 +448,11 @@ async def test_a_late_observed_receipt_lets_checkout_found_supersede_not_created
     assert (audits['confirmed_not_created']['supersedes_outcome'], audits['confirmed_not_created']['decision_seq']) == (None, 1)
     events = [e['event_type'] for e in await _events(pid)]
     assert events.count('resolved') == 1 and events.count('superseded') == 1
+    # A superseding checkout_found is operator-found too: COMPLETED holds for a human.
+    reap.get_checkout = _ok(CHECKOUT_COMPLETED)
+    await _step(pid)
+    held = await _get(pid)
+    assert held['state'] == 'awaiting_approval' and held['last_error_code'] == svc.OPERATOR_FOUND_COMPLETED
 
 
 async def test_checkout_found_without_a_late_receipt_cannot_overturn_not_created(reap):
@@ -487,8 +492,9 @@ async def test_a_checkout_id_held_by_another_purchase_is_a_named_refusal(reap, m
     other = await _quoting('bref_bob')
     await database.execute("UPDATE reap_agentic_purchases SET state='awaiting_approval', reap_checkout_id='chk_dup' WHERE id=:id", {'id': other})
     pid, row = await _parked_unknown(reap)
-    with pytest.raises(ManualResolutionRefused, match='checkout_id_attached_to_another_purchase'):
-        await _resolve(row, 'checkout_found', checkout_id='chk_dup')
+    for dry_run in (True, False):
+        with pytest.raises(ManualResolutionRefused, match='checkout_id_attached_to_another_purchase'):
+            await _resolve(row, 'checkout_found', checkout_id='chk_dup', dry_run=dry_run)
     # The unique index is the backstop when the pre-check races.
     original = database.fetch_val
 
@@ -561,3 +567,49 @@ async def test_a_refused_hosted_url_park_resolves_from_its_observed_id(reap):
     after = await _get(pid)
     assert after['reap_checkout_id'] == 'chk_refused_1' and after['hosted_url'] is None
     assert len(reap.named('create_checkout')) == 1
+
+
+async def _session_zone(zone):
+    """Every pooled connection's TimeZone, writers and the resolver alike. Throwaway DB only."""
+    if not IS_POSTGRES:
+        return
+    name = await database.fetch_val('SELECT current_database()')
+    await database.execute(f"ALTER DATABASE \"{name}\" SET TimeZone TO '{zone}'" if zone
+                           else f'ALTER DATABASE "{name}" RESET TimeZone')
+    await database.disconnect()
+    await database.connect()
+
+
+async def test_the_settle_window_is_closed_in_any_session_time_zone(reap, monkeypatch):
+    """A UTC writer read from an Asia/Singapore session used to look 8 h older: fail open."""
+    await _session_zone('Asia/Singapore')
+    try:
+        pid, row = await _parked_unknown(reap, settled=False)  # the worker writes in that zone too
+        if IS_POSTGRES:
+            assert await database.fetch_val("SELECT current_setting('TimeZone')") == 'Asia/Singapore'
+            skew = await database.fetch_val(
+                "SELECT abs(extract(epoch FROM (timezone('UTC', now()) - recorded_at))) FROM reap_checkout_dispatch_events"
+                " WHERE purchase_id=:id AND event_type='started'", {'id': pid})
+            assert skew < 60, 'recorded_at must be written as UTC whatever the writer session zone'
+        for zone in ('Asia/Singapore', 'America/Los_Angeles', None):
+            await _session_zone(zone)
+            for age in (0, dispatch_settle_seconds() - 60):
+                if age:
+                    await _age_started(pid, age)
+                with pytest.raises(ManualResolutionRefused, match='dispatch_may_still_be_in_flight'):
+                    await _resolve(row, 'confirmed_not_created', dry_run=True)
+                if age:
+                    await _age_started(pid, -age)
+        await _session_zone('Asia/Singapore')
+
+        async def lying_precheck(purchase_id, dispatch_key):
+            return datetime.now(timezone.utc) - timedelta(hours=1), True
+        honest = recovery._earliest_allowed
+        monkeypatch.setattr(recovery, '_earliest_allowed', lying_precheck)
+        with pytest.raises(ManualResolutionRefused, match='compare_and_swap_lost'):
+            await _resolve(row, 'confirmed_not_created')
+        monkeypatch.setattr(recovery, '_earliest_allowed', honest)
+        await _age_started(pid, dispatch_settle_seconds() + 60)
+        assert (await _resolve(row, 'confirmed_not_created'))['status'] == 'resolved'
+    finally:
+        await _session_zone(None)
