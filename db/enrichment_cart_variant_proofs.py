@@ -34,7 +34,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from db._ddl_guard import apply_ddl_statements
+from db._ddl_guard import apply_ddl_statements, reset_ddl_state
 from db.database import IS_POSTGRES
 from db.schema_guard import guarded_statements
 
@@ -108,24 +108,60 @@ _DDL_STATEMENTS = guarded_statements(
 )
 
 
-async def ensure_table() -> bool:
-    """Create the table if it is missing. True once it is known to exist. Memoizes only after
-    the statement succeeded, so a failure retries on a later call."""
+_DDL_LABEL = "ensure_enrichment_cart_variant_proofs"
+
+#: READ-ONLY CONTEXT (selected prepare, 2026-10-04). `POST /purchases/prepare` reads the proof inside
+#: `SET TRANSACTION ... READ ONLY`, and PostgreSQL refuses `CREATE TABLE IF NOT EXISTS` there EVEN
+#: WHEN THE TABLE EXISTS (PG 15: "cannot execute CREATE TABLE in a read-only transaction"). Run
+#: there, the DDL failed, armed both cooldowns (60s reader, 300s `_ddl_guard`), and a cold instance
+#: refused every enrichment prepare -- and, for minutes after, every create. So, before any DDL,
+#: one catalog read: the table, migration 249's column, and whether this transaction is read-only.
+#: Both present: ready, no DDL. Read-only and incomplete: NO DDL is attempted and nothing is armed.
+_PROBE_POSTGRES = f"""
+    SELECT to_regclass('{TABLE}') IS NOT NULL AS table_exists,
+           EXISTS (SELECT 1 FROM pg_attribute
+                    WHERE attrelid = to_regclass('{TABLE}') AND attname = 'variant_title'
+                      AND attnum > 0 AND NOT attisdropped) AS complete,
+           current_setting('transaction_read_only') = 'on' AS read_only
+"""
+
+#: `_ensure()` outcomes. READABLE / ABSENT happen only inside a read-only transaction (Postgres).
+_READY, _READABLE, _ABSENT, _FAILED = "ready", "readable", "absent", "failed"
+
+
+async def _ensure() -> str:
+    """READY once the table and its 249 column are known to exist (memoized). Inside a read-only
+    transaction, an incomplete table is READABLE (the table exists, the SELECT can run) or ABSENT,
+    and no DDL runs. FAILED: the DDL pass did not complete."""
     global _DDL_READY
     if _DDL_READY:
-        return True
+        return _READY
     async with _DDL_LOCK:
         if _DDL_READY:
-            return True
+            return _READY
         from db.database import database
 
+        if IS_POSTGRES:
+            probe = await database.fetch_one(_PROBE_POSTGRES)
+            if probe["complete"]:
+                _DDL_READY = True
+                return _READY
+            if probe["read_only"]:
+                return _READABLE if probe["table_exists"] else _ABSENT
         _DDL_READY = await apply_ddl_statements(
             _DDL_STATEMENTS,
-            label="ensure_enrichment_cart_variant_proofs",
+            label=_DDL_LABEL,
             logger=logger,
             execute=database.execute,
         )
-    return _DDL_READY
+    return _READY if _DDL_READY else _FAILED
+
+
+async def ensure_table() -> bool:
+    """Create the table if it is missing. True once it is known to exist. Memoizes only after
+    the statement succeeded (or the read-only probe found it complete), so a failure retries on a
+    later call. Inside a read-only transaction it never runs DDL: an incomplete table is False."""
+    return await _ensure() == _READY
 
 
 #: The ONE read of a proof (PR C): exactly the row for this (product_key, sku_key), every column
@@ -152,8 +188,10 @@ async def fetch_proof(product_key: str, sku_key: str) -> Optional[Dict[str, Any]
     None when there is no row, AND when the table cannot be created (`ensure_table()` False): a
     proof nobody can read is a missing proof, which `verify_enrichment_cart_proof` refuses
     (`proof_missing`). A failed `ensure_table()` is REMEMBERED for `FETCH_DDL_RETRY_SECONDS`: in
-    that window this answers None without touching the DDL or its lock, then tries once more. A
-    database error on the SELECT itself propagates, as every other read on the purchase path does.
+    that window this answers None without touching the DDL or its lock, then tries once more.
+    Inside a read-only transaction no DDL runs (`_PROBE_POSTGRES`): an existing table is read, a
+    missing one is None, and neither arms the window. A database error on the probe or the SELECT
+    itself propagates, as every other read on the purchase path does.
     Returned as a plain dict because the verifier takes a Mapping and a `databases` Record is not
     one.
     """
@@ -161,8 +199,11 @@ async def fetch_proof(product_key: str, sku_key: str) -> Optional[Dict[str, Any]
     if (_FETCH_DDL_FAILED_AT is not None
             and time.monotonic() - _FETCH_DDL_FAILED_AT < FETCH_DDL_RETRY_SECONDS):
         return None
-    if not await ensure_table():
+    state = await _ensure()
+    if state == _FAILED:
         _FETCH_DDL_FAILED_AT = time.monotonic()
+        return None
+    if state == _ABSENT:  # read-only and no table: no proof, and no DDL failure to remember
         return None
     _FETCH_DDL_FAILED_AT = None
     from db.database import database
@@ -177,6 +218,7 @@ def _reset_for_tests() -> None:
     global _DDL_READY, _FETCH_DDL_FAILED_AT
     _DDL_READY = False
     _FETCH_DDL_FAILED_AT = None
+    reset_ddl_state(_DDL_LABEL)
 
 
 __all__: List[str] = ["TABLE", "OUTCOME_OK", "PROOF_SOURCES", "ensure_table", "fetch_proof"]
