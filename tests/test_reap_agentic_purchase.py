@@ -5681,3 +5681,180 @@ async def test_the_replay_applies_the_pilot_scope_to_the_original_total(
     assert 4500 in seen
     assert len(wire.sent) == 1, "nothing sent past the scope"
     assert (await _get(purchase_id))["reap_quote_id"] == "f1e2d3c4", "the marker is kept"
+
+
+# ── review of #2509: the scrub, replay-only 503s, and Reap's ~24 h key retention ─────────────
+
+
+async def _park(purchase_id, wire, n=3):
+    wire.answers = [_transport()]
+    for _ in range(n):
+        await _step(purchase_id)
+
+
+async def test_a_scrubbed_marker_row_keeps_replaying_on_the_same_key_and_stays_counted(
+    reap, wire, attribution
+):
+    """P1. The contact-retention scrub used to stamp `contact_retention_elapsed` on every unclaimed
+    'quoting' row past its age, and `advance` then released it before the replay: the orphan was
+    never recovered and `count_checkout_needs_human` fell to 0. The replay needs no contact data,
+    so the scrub now nulls the PII and leaves the marker row replayable."""
+    _two_quotes(reap)
+    purchase_id = await _to_quoting()
+    await _park(purchase_id, wire)
+    assert await ledger.count_checkout_needs_human() == 1
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET created_at = datetime('now', '-99999 seconds') "
+        "WHERE id = :i", {"i": purchase_id},
+    )
+    assert await ledger.scrub_reconciling_purchase_pii(max_age_seconds=900) == [purchase_id]
+    row = await _get(purchase_id)
+    assert row["buyer_email"] is None and row["shipping_address"] is None
+    assert row["last_error_code"] == "checkout_unresolvable:3:transport_error:readtimeout"
+    assert await ledger.count_checkout_needs_human() == 1, "still counted after the scrub"
+
+    sent_before = len(wire.sent)
+    held = await _step(purchase_id)
+    assert len(wire.sent) == sent_before + 1, "exactly one replay"
+    assert held.last_error_code == "checkout_unresolvable:4:transport_error:readtimeout"
+    assert set(wire.quotes()) == {Q1} and len(set(wire.keys())) == 1
+    assert await ledger.count_checkout_needs_human() == 1
+
+    wire.answers = [_ok(CHECKOUT_CREATED)]
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    assert (await _get(purchase_id))["reap_checkout_id"] == "chk_7f3a"
+    assert len(reap.named("request_quote")) == 1
+
+
+async def test_a_scrubbed_marker_row_that_learns_nothing_was_created_does_not_requote(
+    reap, wire, attribution
+):
+    """P1, the other exit. The replay is allowed after the scrub; a RE-QUOTE is a new operation and
+    needs the contact data the scrub removed, so a definitive QUOTE_EXPIRED clears the marker and
+    blocks the row exactly as the scrub would have."""
+    _two_quotes(reap)
+    purchase_id = await _to_quoting()
+    await _park(purchase_id, wire, n=1)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET created_at = datetime('now', '-99999 seconds') "
+        "WHERE id = :i", {"i": purchase_id},
+    )
+    await ledger.scrub_reconciling_purchase_pii(max_age_seconds=900)
+    wire.answers = [rc.ReapResponse(ok=False, status=409, error="reap_status_409",
+                                    error_code="QUOTE_EXPIRED")]
+    held = await _step(purchase_id)
+    assert held.last_error_code == "contact_retention_elapsed"
+    assert (await _get(purchase_id))["reap_quote_id"] is None
+    blocked = await _step(purchase_id)
+    assert blocked.last_error_code == "contact_retention_elapsed"
+    assert len(reap.named("request_quote")) == 1, "no quote without the buyer's contact data"
+    assert len(wire.sent) == 2
+
+
+async def test_checkout_temporarily_unavailable_on_a_replay_is_unknown_not_definitive(
+    reap, wire, attribution
+):
+    """P2a. A load-shedding front door can answer 503 CHECKOUT_TEMPORARILY_UNAVAILABLE before the
+    idempotency lookup, so on a REPLAY it says nothing about the create sent first: the marker is
+    kept, the answer counted, Retry-After honoured. (On the first send it still clears -- see
+    `test_checkout_temporarily_unavailable_is_definitive_and_clears_the_marker`.)"""
+    _two_quotes(reap)
+    wire.answers = [
+        _transport(),
+        rc.ReapResponse(ok=False, status=503, error="reap_status_503",
+                        error_code="CHECKOUT_TEMPORARILY_UNAVAILABLE", retry_after_seconds=6),
+        _ok(CHECKOUT_CREATED),
+    ]
+    purchase_id = await _to_quoting()
+    await _step(purchase_id)
+    held = await _step(purchase_id)
+    assert held.last_error_code == "checkout_create_unknown:2:checkout_temporarily_unavailable"
+    assert held.next_poll_in_seconds == 6
+    assert (await _get(purchase_id))["reap_quote_id"] == Q1
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    assert wire.quotes() == [Q1, Q1, Q1] and len(set(wire.keys())) == 1
+    assert len(reap.named("request_quote")) == 1
+
+
+async def test_the_send_time_is_stamped_once_and_cleared_with_the_marker(reap, wire, attribution):
+    _two_quotes(reap)
+    wire.answers = [_transport()]
+    purchase_id = await _to_quoting()
+    await _step(purchase_id)
+    stamped = (await _get(purchase_id))["checkout_create_sent_at"]
+    assert stamped is not None
+    await _step(purchase_id)
+    assert (await _get(purchase_id))["checkout_create_sent_at"] == stamped, "a replay never moves it"
+
+
+async def test_past_the_replay_window_the_row_stops_replaying_and_parks_for_good(
+    reap, wire, attribution
+):
+    """P2b. Reap keeps an Idempotency-Key ~24 h; a replay after that is a FRESH request. At 23 h
+    after the first send the row stops replaying, never clears, never re-quotes, and parks as
+    `checkout_unresolvable:<n>:replay_window_elapsed` -- stable on later steps."""
+    _two_quotes(reap)
+    purchase_id = await _to_quoting()
+    await _park(purchase_id, wire, n=1)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET checkout_create_sent_at = "
+        "datetime('now', '-82860 seconds') WHERE id = :i", {"i": purchase_id},
+    )
+    wire.answers = [rc.ReapResponse(ok=False, status=409, error="reap_status_409",
+                                    error_code="QUOTE_EXPIRED")]
+    parked = await _step(purchase_id)
+    assert parked.last_error_code == "checkout_unresolvable:3:replay_window_elapsed"
+    assert parked.next_poll_in_seconds == svc.CHECKOUT_HUMAN_RETRY_SECONDS
+    assert len(wire.sent) == 1, "no send past the window"
+    again = await _step(purchase_id)
+    assert again.last_error_code == "checkout_unresolvable:3:replay_window_elapsed"
+    row = await _get(purchase_id)
+    assert row["state"] == "quoting" and row["reap_quote_id"] == Q1
+    assert len(reap.named("request_quote")) == 1 and len(wire.sent) == 1
+    assert await ledger.count_checkout_needs_human() == 1
+
+
+async def test_a_quote_expired_that_arrives_past_the_window_does_not_clear(
+    reap, wire, attribution, monkeypatch
+):
+    """P2b, the race: the replay left inside the window and QUOTE_EXPIRED came back after 23 h01.
+    That answer may be a fresh evaluation that knows nothing of the original create: no clear, no
+    new quote, parked for a human."""
+    _two_quotes(reap)
+    purchase_id = await _to_quoting()
+    await _park(purchase_id, wire, n=1)
+    real_now = svc._now
+
+    async def late_quote_expired():
+        later = real_now() + timedelta(seconds=82860)
+        monkeypatch.setattr(svc, "_now", lambda: later)
+        return rc.ReapResponse(ok=False, status=409, error="reap_status_409",
+                               error_code="QUOTE_EXPIRED")
+
+    wire.answers = [late_quote_expired]
+    parked = await _step(purchase_id)
+    assert parked.last_error_code == "checkout_unresolvable:3:replay_window_elapsed"
+    row = await _get(purchase_id)
+    assert row["reap_quote_id"] == Q1, "not cleared"
+    assert len(reap.named("request_quote")) == 1
+    assert len(wire.sent) == 2
+
+
+async def test_a_hosted_url_park_is_never_cleared_by_quote_expired(reap, wire, attribution):
+    """P2b(1). A 200 whose hosted URL we refused is a checkout we KNOW exists. Its park is sticky
+    across later unknowns, and a QUOTE_EXPIRED on a later replay does not clear it."""
+    _two_quotes(reap)
+    wire.answers = [
+        rc.ReapResponse(ok=False, status=200, error="hosted_url_not_allowed"),
+        _transport(),
+        rc.ReapResponse(ok=False, status=409, error="reap_status_409", error_code="QUOTE_EXPIRED"),
+    ]
+    purchase_id = await _to_quoting()
+    assert (await _step(purchase_id)).last_error_code == "checkout_unresolvable:3:hosted_url_not_allowed"
+    assert (await _step(purchase_id)).last_error_code == "checkout_unresolvable:4:hosted_url_not_allowed"
+    held = await _step(purchase_id)
+    assert held.last_error_code == "checkout_unresolvable:5:hosted_url_not_allowed"
+    row = await _get(purchase_id)
+    assert row["reap_quote_id"] == Q1, "never cleared"
+    assert len(reap.named("request_quote")) == 1
+    assert await ledger.count_checkout_needs_human() == 1

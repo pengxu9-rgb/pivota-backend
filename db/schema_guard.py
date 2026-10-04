@@ -1464,6 +1464,20 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 256: when the first checkout create for the in-flight quote was sent, so a
+            # replay on the same Idempotency-Key stops inside Reap's ~24 h key retention
+            # (services/reap_agentic_purchase.CHECKOUT_REPLAY_WINDOW_SECONDS). The ledger's
+            # record/clear statements name it, so without it every checkout create fails before
+            # the send. ITS OWN try, per this block's rule.
+            try:
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS reap_agentic_purchases
+                        ADD COLUMN IF NOT EXISTS checkout_create_sent_at TIMESTAMPTZ;
+                    """
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # mig 249: the live variant title on the enrichment cart proof (display only; the
             # proof job writes it, PR C shows it). The table itself is created on first use by
             # db/enrichment_cart_variant_proofs.ensure_table(), which also runs this ALTER; this
@@ -4123,6 +4137,17 @@ async def ensure_required_schema_light() -> None:
                         )
                     except Exception:  # noqa: BLE001
                         continue
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 256, SQLite twin: the checkout-create send time (TIMESTAMPTZ -> TIMESTAMP per
+            # this branch's convention). Duplicate column is the idempotent no-op.
+            try:
+                await database.execute(
+                    text(
+                        "ALTER TABLE reap_agentic_purchases "
+                        "ADD COLUMN checkout_create_sent_at TIMESTAMP;"
+                    )
+                )
             except Exception:  # noqa: BLE001
                 pass
             # mig 230: the per-click attribution claim, SQLite twin. Same CHECK and

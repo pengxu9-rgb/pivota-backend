@@ -83,6 +83,7 @@ _MIGRATIONS = (
     # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
+    _MIGRATIONS_DIR / "256_reap_agentic_purchase_checkout_create_sent_at.sql",  # checkout-create send time
 )
 _MIGRATION = _MIGRATIONS[0]
 
@@ -2856,6 +2857,7 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
         "offer_code_outcome",
         "discount_minor",
         "tax_included",
+        "checkout_create_sent_at",
     }, (
         f"the heal on a 224-shaped database added {sorted(after - before)}"
     )
@@ -2939,6 +2941,8 @@ async def test_the_new_columns_are_partitioned_between_public_and_never_public()
         "accept_variant_labels", "also_accept_domains", "market_country",
         # mig 229 — see the SQLite twin of this list for why neither is public.
         "item_source", "cart_url",
+        # mig 256 — the replay window's clock; see the SQLite twin.
+        "checkout_create_sent_at",
     }
     columns = await _purchase_columns()
     unclassified = columns - _EXPECTED_PUBLIC_COLUMNS - never_public
@@ -4155,4 +4159,50 @@ async def test_a_create_in_flight_is_never_failed_by_the_attempts_sweep_and_park
         "UPDATE reap_agentic_purchases SET last_error_code = 'checkout_unresolvable:3:x' "
         "WHERE id = :a", {"a": in_flight["id"]},
     )
+    assert await ledger.count_checkout_needs_human() == 1
+
+
+async def test_the_send_time_is_stamped_on_the_first_record_only_and_cleared_with_the_marker():
+    """mig 256. The replay window's clock: stamped by the server on the FIRST record, never moved
+    by a re-record of the same quote, NULLed by the clear."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    row = await _quoting_held_by("worker_a")
+    first = await ledger.record_checkout_attempt(row["id"], "worker_a", quote_id="q_one", **_ATTEMPT)
+    assert first["checkout_create_sent_at"] is not None
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET checkout_create_sent_at = clock_timestamp() - INTERVAL '99999 seconds' WHERE id = :i",
+        {"i": row["id"]},
+    )
+    aged = (await ledger.get_purchase_internal(row["id"]))["checkout_create_sent_at"]
+    again = await ledger.record_checkout_attempt(row["id"], "worker_a", quote_id="q_one", **_ATTEMPT)
+    assert again["checkout_create_sent_at"] == aged, "a re-record does not move the clock"
+    cleared = await ledger.clear_checkout_attempt(row["id"], "worker_a", quote_id="q_one")
+    assert cleared["checkout_create_sent_at"] is None
+
+
+async def test_the_scrub_nulls_a_marker_rows_pii_but_leaves_it_replayable_and_counted():
+    """Review of #2509, P1. The scrub stamps `contact_retention_elapsed` on aged pre-checkout rows
+    -- except a 'quoting' row with a checkout create in flight, whose code carries the replay count
+    and the needs-human park. Its PII is still nulled."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    in_flight = await _quoting_held_by("worker_a")
+    await ledger.record_checkout_attempt(in_flight["id"], "worker_a", quote_id="q_one", **_ATTEMPT)
+    plain = await _mk(state="quoting", buyer_ref="bref_plain")
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET claimed_by = NULL, claimed_at = NULL, "
+        "last_error_code = CASE WHEN id = :a THEN 'checkout_unresolvable:3:x' ELSE NULL END, "
+        "created_at = clock_timestamp() - INTERVAL '99999 seconds' WHERE id IN (:a, :b)",
+        {"a": in_flight["id"], "b": plain["id"]},
+    )
+    assert sorted(await ledger.scrub_reconciling_purchase_pii(max_age_seconds=900)) == sorted(
+        [in_flight["id"], plain["id"]]
+    )
+    marker = await ledger.get_purchase_internal(in_flight["id"])
+    assert marker["buyer_email"] is None and marker["shipping_address"] is None
+    assert marker["last_error_code"] == "checkout_unresolvable:3:x"
+    assert marker["reap_quote_id"] == "q_one"
+    control = await ledger.get_purchase_internal(plain["id"])
+    assert control["last_error_code"] == "contact_retention_elapsed", "control: plain row blocked"
     assert await ledger.count_checkout_needs_human() == 1

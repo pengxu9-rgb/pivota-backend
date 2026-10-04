@@ -1847,8 +1847,61 @@ cap elapsed. Both figures need an operator review queue; no new cloud policy is 
 The reconciliation stop is checked before every worker-scoped HTTP transport operation, including resolver search/details/variant subrequests. An already in-flight request may finish, but its successor must not start. Context is reset after each step; standalone client callers retain their existing contract. Privacy-expired `needs_enrollment` rows also hold without new provider preparation; stored enrollment evidence is retained for operator review.
 
 
-### Audited manual resolution of classified checkout uncertainty
+### Parked checkout creates (a checkout may exist at Reap)
 
+The checkout create is keyed at Reap on `(quoteId, enrollmentId)` only. The quoting step writes
+the quote, our enrollment row id, the quoted total and `checkout_create_sent_at` (mig 256) onto
+the `quoting` row BEFORE it sends the create (`ledger.record_checkout_attempt`). From then on
+every step for that purchase REPLAYS the same create (same quote, same enrollment, same key)
+instead of re-quoting, until Reap answers definitively: a checkout (recorded, the row proceeds),
+or nothing created (QUOTE_EXPIRED, or 503 CHECKOUT_TEMPORARILY_UNAVAILABLE on the FIRST send
+only), which clears the marker so the next step may quote again. Everything else is an unknown
+and replays.
+
+Codes on such a row (`state='quoting' AND reap_quote_id IS NOT NULL AND reap_checkout_id IS NULL`):
+
+| `last_error_code` | Meaning | Automation |
+|---|---|---|
+| `checkout_create_unknown:<n>:<code>` | n-th unknown answer (timeout, 5xx, unreadable body, idempotency in progress, a 503 on a replay) | replays on the transport backoff / Retry-After |
+| `checkout_unresolvable:<n>:<code>` (n >= 3) | parked; counted in `checkout_needs_human`, excluded from ordinary stuck | replays every 15 min; the first definitive answer un-parks it |
+| `checkout_unresolvable:<n>:hosted_url_not_allowed` | Reap answered 200 with a hosted URL we refuse: a checkout EXISTS, its id was dropped with the URL | replays every 15 min; the tail is sticky and the marker is NEVER cleared automatically |
+| `checkout_unresolvable:<n>:replay_window_elapsed` | 23 h since the first send; Reap keeps an idempotency key ~24 h, so a replay would be a fresh request | no further replay, clear or quote, ever; re-checked every 15 min with no provider call |
+| `checkout_create_replayed` (on `awaiting_approval`) | a replay recovered the checkout | none needed |
+
+What the automation never does with a marker row: re-quote it, fail it on the attempts counter
+(`fail_exhausted_purchases` skips it), or freeze it on contact retention (the scrub nulls its PII
+but leaves its code; a replay needs no contact data). If a replay then learns nothing was created
+on a scrubbed row, the row is blocked as `contact_retention_elapsed` instead of re-quoted.
+
+**Dials.** The replay honours `REAP_AGENTIC_CREATE_ENABLED` and the pilot scope (checked against
+the ORIGINAL quoted total): with creation off it pauses with the marker kept. It deliberately
+IGNORES `REAP_AGENTIC_CART_LINK_ENABLED`: that dial refuses starting and quoting cart-link
+purchases, and a replay starts and quotes nothing. Refusing it would end a purchase over a
+checkout Reap may hold.
+
+**Operator action for a parked row.** There is no admin route; this is an owner-authorized,
+audited procedure.
+
+1. Read the row: `id`, `reap_quote_id`, `enrollment_id` (ours) and that enrollment row's
+   `reap_enrollment_id`, `quoted_total_minor`, `checkout_create_sent_at`, `last_error_code`.
+   Ids only; do not copy contact data anywhere.
+2. Ask Reap (authenticated API read, or Reap support with the quote id and the partner
+   enrollment id) whether a checkout exists for that quote, and its id and status.
+3. **No checkout exists** (Reap confirms the quote produced none): end the purchase terminally
+   with an audited transition (`quoting -> failed`, a code naming the confirmation). Do not clear
+   the marker to make the worker re-quote; the buyer starts a new purchase.
+4. **A checkout exists**: its hosted URL never reached the buyer (no row named it), so it cannot
+   have been approved through us. Confirm its status at Reap; an unapproved checkout goes FAILED
+   about 5 minutes after the quote. Once Reap shows it terminal and unpaid, end the purchase as in
+   step 3, recording the checkout id in the decision. If Reap shows it COMPLETED or PROCESSING,
+   stop and escalate: a payment happened outside the expected flow.
+5. Never re-quote, create a replacement checkout, or restore buyer contact to make the row
+   progress.
+
+The `prod: Reap checkout needs human reconciliation` policy counts these rows, and its text now
+names parked creates. Its filter and metric are unchanged.
+
+### Audited manual resolution of classified checkout uncertainty
 `services.reap_checkout_recovery.resolve_checkout_manually` is a service-only primitive; there is no admin HTTP route or executable operator CLI. Its default `dry_run=True` preview writes nothing. Applying it requires an explicitly privileged caller, an opaque operator handle, independently authenticated Reap read or verified support evidence, a same-environment provider origin, an exact checkout ID and recognized terminal status, and evidence observed within the last 24 hours and after this purchase was created. The verification attestation is a caller contract, not automatic cryptographic validation; an operator must verify the authentic evidence before setting it.
 
 Only checkout-backed `awaiting_approval`/`processing` rows explicitly classified `checkout_unresolvable:` are eligible. The original state, checkout ID, error classification, `updated_at`, and absent lease are checked again by a conditional claim. Missing reads, 404s, elapsed clocks and a missing checkout ID are never terminal proof. COMPLETED additionally requires a valid order ID, currency and charged total within the existing one-minor-unit quote tolerance. Provider EXPIRED while processing becomes failed under the existing state transition contract. Terminal historical rows cannot be reopened.

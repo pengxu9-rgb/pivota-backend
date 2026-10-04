@@ -61,6 +61,7 @@ MIGRATIONS = (
     MIGRATIONS_DIR / "232_tierb_verdict_vocabulary.sql",
     MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
     MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",
+    MIGRATIONS_DIR / "256_reap_agentic_purchase_checkout_create_sent_at.sql",  # checkout-create send time
     MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
 )
 SEEDS_MIGRATION = MIGRATIONS_DIR / "044_external_product_seeds.sql"

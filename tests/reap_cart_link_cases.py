@@ -69,6 +69,7 @@ MIGRATIONS = (
     MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     MIGRATIONS_DIR / "253_reap_checkout_manual_resolution_audit.sql",
     MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
+    MIGRATIONS_DIR / "256_reap_agentic_purchase_checkout_create_sent_at.sql",  # checkout-create send time
 )
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 
@@ -3062,3 +3063,39 @@ async def test_cart_pilot_refuses_provider_or_placeholder_identity(monkeypatch, 
         await start(cart_link=item(product_key="cart_product"))
     assert exc.value.reason == "pilot_scope_refused"
     assert await count() == 0
+
+
+# ── a checkout create in flight on a cart-link row: which dials the REPLAY honours ───────────
+
+
+async def test_a_cart_link_replay_ignores_the_lane_dial_but_honours_the_create_dial(
+    reap, attribution, monkeypatch
+):
+    """REAP_AGENTIC_CART_LINK_ENABLED gates STARTING and QUOTING a cart-link purchase (a fresh step
+    with it off is refused). A replay quotes nothing: it re-sends a create that already went out,
+    and refusing it would end the purchase over a checkout Reap may hold -- so the lane dial does
+    not stop it. The GLOBAL create dial does: it pauses, the marker kept, nothing sent."""
+    reap.create_checkout = [
+        rc.ReapResponse(ok=False, error="transport_error:ReadTimeout"),
+        ok(CHECKOUT_CREATED),
+    ]
+    purchase_id = await to_quoting(reap)
+    held = await step(purchase_id)
+    assert held.outcome == "released" and held.last_error_code.startswith("checkout_create_unknown:1:")
+    in_flight = (await get(purchase_id))["reap_quote_id"]
+    assert in_flight
+
+    monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "0")
+    paused = await step(purchase_id)
+    assert paused.outcome == "released" and paused.state == "quoting"
+    assert len(reap.named("create_checkout")) == 1, "the create dial stops the replay"
+    assert (await get(purchase_id))["reap_quote_id"] == in_flight
+
+    monkeypatch.delenv("REAP_AGENTIC_CREATE_ENABLED")
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "0")
+    replayed = await step(purchase_id)
+    assert replayed.state == "awaiting_approval", replayed
+    calls = reap.named("create_checkout")
+    assert [c["quote_id"] for c in calls] == [in_flight, in_flight]
+    assert len({c["enrollment_id"] for c in calls}) == 1
+    assert len(reap.named("request_cart_link_quote")) == 1, "no second quote"

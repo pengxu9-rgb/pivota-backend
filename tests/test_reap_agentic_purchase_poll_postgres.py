@@ -77,6 +77,7 @@ _MIGRATIONS = (
     # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
+    _MIGRATIONS_DIR / "256_reap_agentic_purchase_checkout_create_sent_at.sql",  # checkout-create send time
 )
 
 # Same convention as the other gates on this rail: this file DROPS its tables, so it must be

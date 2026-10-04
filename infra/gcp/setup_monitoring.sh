@@ -662,7 +662,7 @@ upsert_on_new_metric "prod: Reap purchase poller went silent" "$(promql_policy \
 
 upsert_on_new_metric "prod: Reap checkout needs human reconciliation" "$(policy \
   "prod: Reap checkout needs human reconciliation" \
-  "The poller counted checkout_needs_human >= 1. A repeated permanent checkout read failure needs authenticated provider evidence and an audited operator decision. Keep the purchase nonterminal; do not create a replacement, fail an uncertain payment, or restore contact. Inspect purchase IDs and exact error categories through owner-authorized tooling. Runbook: docs/runbooks/reap_agentic_purchase.md, Checkout reads requiring human reconciliation and Audited manual checkout resolution." \
+  "The poller counted checkout_needs_human >= 1. Either a repeated permanent checkout read failure, or a PARKED CHECKOUT CREATE: a quoting purchase whose checkout create Reap never answered definitively, so a checkout MAY EXIST AT REAP that no row names (look it up at Reap by the row's reap_quote_id / enrollment). Both need authenticated provider evidence and an audited operator decision. Keep the purchase nonterminal; do not create a replacement or re-quote, fail an uncertain payment, or restore contact. Inspect purchase IDs and exact error categories through owner-authorized tooling. Runbook: docs/runbooks/reap_agentic_purchase.md, Checkout reads requiring human reconciliation, Parked checkout creates, and Audited manual checkout resolution." \
   'metric.type="logging.googleapis.com/user/reap_agentic_poll_human" AND resource.type="cloud_run_revision"' \
   ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 900s 0s 3600s)"
 

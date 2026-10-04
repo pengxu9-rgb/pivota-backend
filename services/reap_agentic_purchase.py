@@ -2270,8 +2270,17 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
         return AdvanceResult(str(row["id"]), outcome="terminal", state=state)
     if not is_reconciliation_enabled():
         return await _release(row, worker_id, error_code=row.get("last_error_code") or "reconciliation_disabled")
-    if state in {"resolving", "needs_enrollment", "quoting"} and row.get("last_error_code") == "contact_retention_elapsed":
+    if (state in {"resolving", "needs_enrollment", "quoting"}
+            and row.get("last_error_code") == "contact_retention_elapsed"
+            and not _create_in_flight(row)):
         # Privacy expiry never invents a payment outcome or permits a new provider operation.
+        #
+        # A CHECKOUT CREATE ALREADY IN FLIGHT IS NOT A NEW OPERATION, and is exempt: replaying it
+        # needs no contact data (quote id, recorded enrollment, return URL) and is the only way
+        # to learn what became of a checkout Reap may hold. The scrub no longer stamps such a row
+        # (`ledger.scrub_reconciling_purchase_pii`); this is the same rule for a row stamped some
+        # other way. If the replay then learns NOTHING was created, the re-quote is blocked again
+        # (`_create_checkout`), because a re-quote is a new operation and needs the contact data.
         return await _release(row, worker_id, error_code="contact_retention_elapsed")
     if state in {"resolving", "needs_enrollment", "quoting"}:
         try:
@@ -3176,6 +3185,16 @@ async def _quote_with_offer_code(
     return _QuoteAttempt(second, offer_code_sent=False, outcome=outcome)
 
 
+def _create_in_flight(row: Mapping[str, Any]) -> bool:
+    """A 'quoting' row with a checkout create sent and no checkout id recorded. See
+    `ledger.record_checkout_attempt`: `reap_quote_id` is otherwise always NULL in 'quoting'."""
+    return (
+        str(row.get("state") or "") == "quoting"
+        and bool(row.get("reap_quote_id"))
+        and not row.get("reap_checkout_id")
+    )
+
+
 async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult:
     """quoting → awaiting_approval | refused | failed.
 
@@ -3200,7 +3219,7 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
     # it down. The re-resolve and re-quote below are exactly what must NOT happen now -- a new
     # quote is a new Idempotency-Key and a possible second checkout -- so the same create is
     # replayed instead, before anything else.
-    if row.get("reap_quote_id") and not row.get("reap_checkout_id"):
+    if _create_in_flight(row):
         return await _replay_checkout(row, worker_id)
 
     active = await ledger.get_active_enrollment(str(row["buyer_ref"]))
@@ -3565,6 +3584,22 @@ CHECKOUT_CREATE_UNKNOWN_LIMIT = 3
 _CREATE_UNKNOWN_PREFIX = "checkout_create_unknown"
 _CREATE_UNRESOLVABLE_PREFIX = "checkout_unresolvable"
 
+#: HOW LONG A CREATE IS REPLAYED, from `checkout_create_sent_at` (mig 256, the server clock at the
+#: first send). Reap keeps an Idempotency-Key for about 24 h; past that a replay is a FRESH request,
+#: answered QUOTE_EXPIRED -- which would read as "nothing was created", clear the marker and
+#: re-quote beside a checkout that may exist. An hour short of the retention, so pod/DB clock skew
+#: and a slow step cannot carry a replay over the edge. Past it the row stops replaying and stops
+#: clearing: parked for a human (`checkout_unresolvable:<n>:replay_window_elapsed`), for good.
+CHECKOUT_REPLAY_WINDOW_SECONDS = 23 * 3600
+
+#: The tail of the permanent park above.
+REPLAY_WINDOW_ELAPSED = "replay_window_elapsed"
+
+#: The tail of a park on a 200 whose hosted URL the client refused: a checkout we KNOW exists. It
+#: is STICKY (`_hold_unknown_create` keeps it whatever later unknowns say) because it is what
+#: forbids ever clearing the marker on this row (`_may_clear`).
+_HOSTED_URL_REFUSED = "hosted_url_not_allowed"
+
 #: Written on the transition that a REPLAYED create completed, replacing the count above so the
 #: 'awaiting_approval' row does not carry a `checkout_unresolvable:` code it no longer deserves.
 CHECKOUT_CREATE_REPLAYED = "checkout_create_replayed"
@@ -3594,9 +3629,9 @@ _CREATE_IDEMPOTENCY_CODES = frozenset({
 def _create_outcome_unknown(checkout: Any) -> bool:
     """Is this failed create one whose outcome at Reap we DO NOT KNOW?
 
-    Called after the definitive answers have been taken (CHECKOUT_TEMPORARILY_UNAVAILABLE and
-    QUOTE_EXPIRED: nothing was created; ENROLLMENT_NOT_ACTIVE: nothing was created, and nothing can
-    be). What is left is unknown when nobody READ a verdict: a transport error, a body we could not
+    Called after the definitive answers have been taken (CHECKOUT_TEMPORARILY_UNAVAILABLE on a
+    FIRST send and QUOTE_EXPIRED: nothing was created; ENROLLMENT_NOT_ACTIVE: nothing was created,
+    and nothing can be). What is left is unknown when nobody READ a verdict: a transport error, a body we could not
     parse or would not read, a 2xx we refused, an idempotency statement, a 5xx (including a 503
     that does not name itself CHECKOUT_TEMPORARILY_UNAVAILABLE), 408 or 429. A remaining 4xx is a
     refusal of the request -- on a replay, Reap's stored answer to the original or a fresh refusal
@@ -3611,6 +3646,53 @@ def _create_outcome_unknown(checkout: Any) -> bool:
     if isinstance(status, bool) or not isinstance(status, int):
         return True
     return status < 400 or status >= 500 or status in (408, 429)
+
+
+def _hosted_url_parked(row: Mapping[str, Any]) -> bool:
+    """Was this row parked because Reap answered the create with a 200 we refused (a checkout that
+    EXISTS)? Read from the sticky tail `_hold_unknown_create` keeps."""
+    parts = str(row.get("last_error_code") or "").split(":", 2)
+    return (
+        len(parts) == 3
+        and parts[0] in {_CREATE_UNKNOWN_PREFIX, _CREATE_UNRESOLVABLE_PREFIX}
+        and parts[2] == _HOSTED_URL_REFUSED
+    )
+
+
+def _replay_window_elapsed(row: Mapping[str, Any]) -> bool:
+    """Past `CHECKOUT_REPLAY_WINDOW_SECONDS` since the first send -- or no send time at all, which
+    no row written by this code has, and which is therefore read as the unsafe side."""
+    sent_at = _parse_ts(row.get("checkout_create_sent_at"))
+    if sent_at is None:
+        return True
+    return _now() >= sent_at + timedelta(seconds=CHECKOUT_REPLAY_WINDOW_SECONDS)
+
+
+def _may_clear(row: Mapping[str, Any], *, replay: bool) -> bool:
+    """May a "nothing was created" answer to THIS send clear the marker and let the row re-quote?
+
+    The FIRST send of a quote: yes -- the answer is about that request and nothing else exists.
+    A REPLAY: only while Reap still holds the key (inside the window) and only on a row that has
+    not already shown us a checkout exists (a hosted-URL park). Outside either, a QUOTE_EXPIRED
+    says nothing about the original create.
+    """
+    if not replay:
+        return True
+    return not _hosted_url_parked(row) and not _replay_window_elapsed(row)
+
+
+async def _park_replay_window_elapsed(row: Mapping[str, Any], worker_id: str) -> AdvanceResult:
+    """The permanent park: no replay, no clear, no quote -- ever again on this row. Stable: a row
+    already carrying the code keeps it (the count does not climb every 15 minutes)."""
+    previous = str(row.get("last_error_code") or "")
+    if previous.startswith(f"{_CREATE_UNRESOLVABLE_PREFIX}:") and previous.endswith(
+        f":{REPLAY_WINDOW_ELAPSED}"
+    ):
+        code = previous
+    else:
+        count = min(max(_create_unknown_count(previous) + 1, CHECKOUT_CREATE_UNKNOWN_LIMIT), 99)
+        code = f"{_CREATE_UNRESOLVABLE_PREFIX}:{count}:{REPLAY_WINDOW_ELAPSED}"
+    return await _release(row, worker_id, error_code=code, seconds=CHECKOUT_HUMAN_RETRY_SECONDS)
 
 
 def _create_unknown_count(code: Any) -> int:
@@ -3636,6 +3718,10 @@ async def _hold_unknown_create(
     at once with `park`) the code becomes `checkout_unresolvable:<n>:<code>` and the retry slows to
     `CHECKOUT_HUMAN_RETRY_SECONDS`. Never terminal, never a re-quote."""
     count = min(_create_unknown_count(row.get("last_error_code")) + 1, 99)
+    if _hosted_url_parked(row):
+        # Sticky: once Reap has shown us a checkout exists, no later answer may make this row
+        # look like an ordinary unknown -- `_may_clear` reads this tail.
+        code, park = _HOSTED_URL_REFUSED, True
     if park:
         count = max(count, CHECKOUT_CREATE_UNKNOWN_LIMIT)
     parked = count >= CHECKOUT_CREATE_UNKNOWN_LIMIT
@@ -3675,8 +3761,16 @@ async def _replay_checkout(row: Mapping[str, Any], worker_id: str) -> AdvanceRes
         or not isinstance(total, int)
     ):
         return await _hold_unknown_create(row, worker_id, "checkout_replay_unbuildable", park=True)
+    if _replay_window_elapsed(row):
+        # Reap no longer holds the key: a replay now would be a FRESH request. Stop -- for good.
+        return await _park_replay_window_elapsed(row, worker_id)
     if await _still_ours(row, worker_id) is None:
         return _lost(row)
+    # THE GLOBAL CREATE DIAL IS HONOURED; THE CART-LINK LANE DIAL IS NOT. `is_create_enabled`
+    # pauses every provider create, replays included. REAP_AGENTIC_CART_LINK_ENABLED gates
+    # starting and quoting cart-link purchases (`_cart_link_verdict`, which REFUSES the row); a
+    # replay starts nothing and quotes nothing -- it re-sends a create that already went out, and
+    # refusing it would end the purchase over a checkout Reap may hold.
     if not is_create_enabled():
         return await _pause_precheckout(row, worker_id)
     try:
@@ -3720,10 +3814,11 @@ async def _create_checkout(
 
     THREE KINDS OF ANSWER, and only one of them lets the marker go:
 
-      definitive, nothing created   CHECKOUT_TEMPORARILY_UNAVAILABLE (503, 2026-09-28 spec) and
-                                    QUOTE_EXPIRED: the marker is CLEARED and the lease given back,
-                                    so the next step re-quotes on a new key. ENROLLMENT_NOT_ACTIVE
-                                    and any other 4xx refusal: terminal 'failed', as before.
+      definitive, nothing created   CHECKOUT_TEMPORARILY_UNAVAILABLE (503, 2026-09-28 spec) on
+                                    the FIRST send only, and QUOTE_EXPIRED while `_may_clear`: the
+                                    marker is CLEARED and the lease given back, so the next step
+                                    re-quotes on a new key. ENROLLMENT_NOT_ACTIVE and any other
+                                    4xx refusal: terminal 'failed', as before.
       a checkout                    recorded, and the row proceeds exactly as before.
       unknown                       `_create_outcome_unknown`: the marker STAYS, the lease is given
                                     back, and the next step replays this create. Bounded by
@@ -3752,11 +3847,15 @@ async def _create_checkout(
         # Both spellings are read, because the partner moved the field without moving the
         # version and a client that reads one of them is a client that stops classifying.
         top = str(checkout.error_code or "")
-        if top == "CHECKOUT_TEMPORARILY_UNAVAILABLE":
-            # 503 CHECKOUT_TEMPORARILY_UNAVAILABLE (2026-09-28 spec): nothing was created. The one
-            # 503 that says so; any other 503 (AGENTIC_SERVICE_UNAVAILABLE, or no code at all) is
-            # an UNKNOWN below and replays. Clear the marker, give the lease back on Reap's
+        if top == "CHECKOUT_TEMPORARILY_UNAVAILABLE" and not replay:
+            # 503 CHECKOUT_TEMPORARILY_UNAVAILABLE on the FIRST send of this quote (2026-09-28
+            # spec): nothing was created. Clear the marker, give the lease back on Reap's
             # Retry-After when it sent one, and let the next step re-quote.
+            #
+            # ON A REPLAY IT IS AN UNKNOWN, handled below like any other 503: a load-shedding
+            # front door can answer it before the idempotency lookup, so it says nothing about the
+            # create that was sent first. Any other 503 (AGENTIC_SERVICE_UNAVAILABLE, no code) is
+            # an unknown on every send.
             if await ledger.clear_checkout_attempt(
                 str(row["id"]), worker_id, quote_id=quote_id
             ) is None:
@@ -3767,13 +3866,24 @@ async def _create_checkout(
                 transport=wait is None, seconds=max(1, wait) if wait is not None else None,
             )
         if "QUOTE_EXPIRED" in (detail, top):
-            # The quote died before Reap created anything from it -- on a replay, the definitive
-            # answer that no checkout was ever made on it. Clear the marker and let the next step
-            # re-resolve and re-quote, rather than END the purchase over a five-minute timer.
+            # The quote died before Reap created anything from it. On the first send that is
+            # certain; on a replay it is Reap's stored answer -- or, once Reap has dropped the key
+            # (~24 h), a FRESH evaluation that knows nothing of the original. `_may_clear` admits
+            # only the first two; a hosted-URL park or an elapsed window keeps the marker and
+            # parks for a human instead of re-quoting beside a checkout that may exist.
+            if replay and _replay_window_elapsed(row):
+                return await _park_replay_window_elapsed(row, worker_id)
+            if not _may_clear(row, replay=replay):
+                return await _hold_unknown_create(row, worker_id, "quote_expired", park=True)
             if await ledger.clear_checkout_attempt(
                 str(row["id"]), worker_id, quote_id=quote_id
             ) is None:
                 return _lost(row)
+            if not row.get("buyer_email"):
+                # The contact data was scrubbed while the create was in flight (the replay needed
+                # none). A re-quote does, and is a NEW provider operation: block it exactly as the
+                # scrub would have, rather than quote with no buyer.
+                return await _release(row, worker_id, error_code="contact_retention_elapsed")
             return await hold(error_code="quote_expired")
         if "ENROLLMENT_NOT_ACTIVE" in (detail, top):
             # 'quoting' → 'needs_enrollment' is not a legal edge, so there is no way to send the

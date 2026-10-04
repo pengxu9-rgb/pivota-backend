@@ -359,6 +359,8 @@ _PURCHASE_TS_COLUMNS = (
     "state_entered_at",
     "reap_quote_expires_at",
     "hosted_url_expires_at",
+    # mig 256: when the first checkout create for the in-flight quote was sent.
+    "checkout_create_sent_at",
     "claimed_at",
     "next_poll_at",
     "created_at",
@@ -2170,6 +2172,10 @@ async def release_claim(
 # one of these is NULL in 'quoting' before the first write, except `offer_code_outcome`, which may
 # hold a DROPPED outcome an earlier release persisted and therefore keeps `dropped_*`.
 #
+# `checkout_create_sent_at` (mig 256) is stamped on the FIRST write only, on the server clock: a
+# re-record of the same quote must not move it, because it is what bounds the replay inside
+# Reap's ~24 h idempotency-key retention (services/reap_agentic_purchase).
+#
 # FENCED: the holder, the state, no checkout id yet, and NO OTHER QUOTE ALREADY IN FLIGHT. The last
 # conjunct is the invariant itself, enforced where it cannot be forgotten: once a create is sent,
 # only `clear_checkout_attempt` (a definitive "nothing was created" from Reap) can make room for a
@@ -2187,6 +2193,7 @@ _RECORD_CHECKOUT_ATTEMPT_SQL = """
            offer_code_outcome = COALESCE(:offer_code_outcome, offer_code_outcome),
            reap_product_id = COALESCE(:reap_product_id, reap_product_id),
            reap_variant_id = COALESCE(:reap_variant_id, reap_variant_id),
+           checkout_create_sent_at = COALESCE(checkout_create_sent_at, clock_timestamp()),
            updated_at = clock_timestamp()
      WHERE id = :id
        AND claimed_by = :worker_id
@@ -2209,6 +2216,7 @@ _RECORD_CHECKOUT_ATTEMPT_SQL_SQLITE = """
            offer_code_outcome = COALESCE(:offer_code_outcome, offer_code_outcome),
            reap_product_id = COALESCE(:reap_product_id, reap_product_id),
            reap_variant_id = COALESCE(:reap_variant_id, reap_variant_id),
+           checkout_create_sent_at = COALESCE(checkout_create_sent_at, CURRENT_TIMESTAMP),
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
        AND claimed_by = :worker_id
@@ -2229,6 +2237,7 @@ _CLEAR_CHECKOUT_ATTEMPT_SQL = """
            discount_minor = NULL,
            offer_code_outcome = CASE WHEN offer_code_outcome IN ('applied', 'no_discount')
                 THEN NULL ELSE offer_code_outcome END,
+           checkout_create_sent_at = NULL,
            updated_at = clock_timestamp()
      WHERE id = :id
        AND claimed_by = :worker_id
@@ -2249,6 +2258,7 @@ _CLEAR_CHECKOUT_ATTEMPT_SQL_SQLITE = """
            discount_minor = NULL,
            offer_code_outcome = CASE WHEN offer_code_outcome IN ('applied', 'no_discount')
                 THEN NULL ELSE offer_code_outcome END,
+           checkout_create_sent_at = NULL,
            updated_at = CURRENT_TIMESTAMP
      WHERE id = :id
        AND claimed_by = :worker_id
@@ -2707,6 +2717,8 @@ _SCRUB_RECONCILING_PII_SQL = """
     UPDATE reap_agentic_purchases
        SET shipping_address=NULL, buyer_email=NULL, offer_code=NULL,
            last_error_code=CASE WHEN state IN ('resolving','needs_enrollment','quoting')
+                                     AND NOT (state = 'quoting' AND reap_quote_id IS NOT NULL
+                                              AND reap_checkout_id IS NULL)
                                THEN 'contact_retention_elapsed' ELSE last_error_code END
      WHERE claimed_by IS NULL
        AND state IN ('resolving','needs_enrollment','quoting','awaiting_approval','processing')
@@ -2730,6 +2742,8 @@ _SCRUB_RECONCILING_PII_SQL_SQLITE = """
     UPDATE reap_agentic_purchases
        SET shipping_address=NULL, buyer_email=NULL, offer_code=NULL,
            last_error_code=CASE WHEN state IN ('resolving','needs_enrollment','quoting')
+                                     AND NOT (state = 'quoting' AND reap_quote_id IS NOT NULL
+                                              AND reap_checkout_id IS NULL)
                                THEN 'contact_retention_elapsed' ELSE last_error_code END
      WHERE claimed_by IS NULL
        AND state IN ('resolving','needs_enrollment','quoting','awaiting_approval','processing')
@@ -2760,6 +2774,14 @@ async def scrub_reconciling_purchase_pii(
     transition. Exposed rows also scrub at explicit hosted expiry. Live claims defer cleanup
     until released/requeued; both selection and UPDATE fence claimed_by IS NULL.
     Contact-expired precheckout rows are preserved and cannot call the provider on resume.
+
+    EXCEPT A 'quoting' ROW WITH A CHECKOUT CREATE IN FLIGHT (`reap_quote_id` set, no checkout id;
+    see `record_checkout_attempt`). Its PII is nulled like every other row's, but its
+    `last_error_code` is left alone: the purchase service must keep REPLAYING that create -- which
+    needs no email, address or offer code, only the quote, the recorded enrollment and the return
+    URL -- until Reap says what became of it, and the code carries the replay count and the
+    needs-human park. Stamping `contact_retention_elapsed` there froze the row before the replay
+    and hid it from `count_checkout_needs_human`, orphaning a checkout Reap may hold.
     """
     seconds = _require_int(max_age_seconds, "max_age_seconds", minimum=60, maximum=3600)
     capped = _sweep_limit(limit)

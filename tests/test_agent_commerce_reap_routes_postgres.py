@@ -112,6 +112,7 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
     _MIGRATIONS_DIR / "255_reap_unopened_attempt_retirements.sql",
+    _MIGRATIONS_DIR / "256_reap_agentic_purchase_checkout_create_sent_at.sql",  # checkout-create send time
 )
 
 #: Same convention as the ledger's gate: this file DROPS its tables, so it must be INCAPABLE of

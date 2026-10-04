@@ -81,6 +81,7 @@ _MIGRATIONS = (
     # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
+    _MIGRATIONS_DIR / "256_reap_agentic_purchase_checkout_create_sent_at.sql",  # checkout-create send time
 )
 
 # Same convention as tests/test_reap_agentic_ledger_postgres.py: this gate DROPS its tables, so
@@ -3222,3 +3223,111 @@ async def _lease_moves(purchase_id):
         "WHERE id = :i", {"i": purchase_id},
     )
     return _ok(CHECKOUT_CREATED)
+
+
+# ── review of #2509 on Postgres: the scrub, replay-only 503s, the ~24 h key retention ────────
+
+
+def _quote_expired():
+    import services.reap_agentic_client as rc
+
+    return rc.ReapResponse(ok=False, status=409, error="reap_status_409", error_code="QUOTE_EXPIRED")
+
+
+async def test_pg_a_scrubbed_marker_row_keeps_replaying_on_the_same_key_and_stays_counted(reap):
+    import db.reap_agentic_ledger as ledger
+
+    wire = _wire(reap, _transport())
+    purchase_id = await _replay_quoting()
+    for _ in range(3):
+        await _step(purchase_id)
+    await _raw(
+        "UPDATE reap_agentic_purchases SET created_at = clock_timestamp() - INTERVAL '99999 seconds' "
+        "WHERE id = :i", {"i": purchase_id},
+    )
+    assert await ledger.scrub_reconciling_purchase_pii(max_age_seconds=900) == [purchase_id]
+    row = await _get(purchase_id)
+    assert row["buyer_email"] is None and row["shipping_address"] is None
+    assert row["last_error_code"] == "checkout_unresolvable:3:transport_error:readtimeout"
+    assert await ledger.count_checkout_needs_human() == 1
+    sent = len(wire.sent)
+    await _step(purchase_id)
+    assert len(wire.sent) == sent + 1 and len(set(wire.keys())) == 1
+    assert await ledger.count_checkout_needs_human() == 1
+    wire.answers = [_ok(CHECKOUT_CREATED)]
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    assert len(reap.named("request_quote")) == 1
+
+
+async def test_pg_checkout_temporarily_unavailable_on_a_replay_is_unknown(reap):
+    import services.reap_agentic_client as rc
+
+    wire = _wire(
+        reap, _transport(),
+        rc.ReapResponse(ok=False, status=503, error="reap_status_503",
+                        error_code="CHECKOUT_TEMPORARILY_UNAVAILABLE", retry_after_seconds=6),
+        _ok(CHECKOUT_CREATED),
+    )
+    purchase_id = await _replay_quoting()
+    await _step(purchase_id)
+    held = await _step(purchase_id)
+    assert held.last_error_code == "checkout_create_unknown:2:checkout_temporarily_unavailable"
+    assert (await _get(purchase_id))["reap_quote_id"] == _Q1
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    assert wire.quotes() == [_Q1, _Q1, _Q1] and len(set(wire.keys())) == 1
+
+
+async def test_pg_past_the_replay_window_the_row_stops_replaying_and_parks_for_good(reap):
+    import db.reap_agentic_ledger as ledger
+
+    wire = _wire(reap, _transport())
+    purchase_id = await _replay_quoting()
+    await _step(purchase_id)
+    await _raw(
+        "UPDATE reap_agentic_purchases SET checkout_create_sent_at = "
+        "clock_timestamp() - INTERVAL '82860 seconds' WHERE id = :i", {"i": purchase_id},
+    )
+    wire.answers = [_quote_expired()]
+    parked = await _step(purchase_id)
+    assert parked.last_error_code == "checkout_unresolvable:3:replay_window_elapsed"
+    assert (await _step(purchase_id)).last_error_code == parked.last_error_code
+    assert len(wire.sent) == 1
+    assert (await _get(purchase_id))["reap_quote_id"] == _Q1
+    assert len(reap.named("request_quote")) == 1
+    assert await ledger.count_checkout_needs_human() == 1
+
+
+async def test_pg_a_quote_expired_that_arrives_past_the_window_does_not_clear(reap, monkeypatch):
+    from datetime import timedelta
+
+    import services.reap_agentic_purchase as svc
+
+    wire = _wire(reap, _transport())
+    purchase_id = await _replay_quoting()
+    await _step(purchase_id)
+    real_now = svc._now
+
+    def late():
+        later = real_now() + timedelta(seconds=82860)
+        monkeypatch.setattr(svc, "_now", lambda: later)
+        return _quote_expired()
+
+    wire.answers = [late]
+    parked = await _step(purchase_id)
+    assert parked.last_error_code == "checkout_unresolvable:3:replay_window_elapsed"
+    assert (await _get(purchase_id))["reap_quote_id"] == _Q1
+    assert len(reap.named("request_quote")) == 1
+
+
+async def test_pg_a_hosted_url_park_is_never_cleared_by_quote_expired(reap):
+    import services.reap_agentic_client as rc
+
+    _wire(reap, rc.ReapResponse(ok=False, status=200, error="hosted_url_not_allowed"),
+          _transport(), _quote_expired())
+    purchase_id = await _replay_quoting()
+    await _step(purchase_id)
+    await _step(purchase_id)
+    held = await _step(purchase_id)
+    assert held.last_error_code == "checkout_unresolvable:5:hosted_url_not_allowed"
+    assert (await _get(purchase_id))["reap_quote_id"] == _Q1
+    assert len(reap.named("request_quote")) == 1
