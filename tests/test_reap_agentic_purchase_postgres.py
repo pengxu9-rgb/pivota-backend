@@ -82,6 +82,7 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
     _MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
+    _MIGRATIONS_DIR / "257_reap_parked_dispatch_resolution.sql",
 )
 
 # Same convention as tests/test_reap_agentic_ledger_postgres.py: this gate DROPS its tables, so
@@ -232,6 +233,7 @@ async def _db():
     # Drop FIRST, so a constraint deleted from the migration cannot survive via IF NOT EXISTS
     # and leave this gate testing a schema the repo no longer declares.
     await database.execute("DROP TABLE IF EXISTS reap_checkout_manual_resolution_audit")
+    await database.execute("DROP TABLE IF EXISTS reap_checkout_dispatch_resolution_audit")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_enrollments")
     await _apply_migration()
@@ -253,7 +255,7 @@ async def _db():
         # In a `finally`, so a failing test still cleans up: a failing test is the one most
         # likely to have left a half-written row, and a cleanup that runs only on success turns
         # one red test into a cascade in another file.
-        for _table in ('reap_agentic_purchases', 'reap_agentic_enrollments'):
+        for _table in ('reap_agentic_purchases', 'reap_agentic_enrollments', 'reap_checkout_dispatch_resolution_audit'):
             try:
                 await database.execute(f"DELETE FROM {_table}")
             except Exception:  # noqa: BLE001 - a table this run never built is not a leak

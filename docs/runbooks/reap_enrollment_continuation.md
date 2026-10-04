@@ -86,6 +86,15 @@ Its `_path_id`-validated id is appended as an `observed` event and the row parks
 stored or logged anywhere. To work it, read the checkout id from
 `reap_checkout_dispatch_events` (`event_type='observed'`) and reconcile it with Reap.
 
+A parked create (`quoting` with a dispatch key, counted in `checkout_needs_human`) is resolved
+only by an operator: `services.reap_checkout_recovery.list_parked_dispatches` lists the cohort,
+and `resolve_parked_dispatch` records `checkout_found` or `confirmed_not_created` from verified
+Reap evidence, no earlier than the settle window after the latest `started`. A
+`checkout_created_hosted_url_refused` park is one of them: `checkout_found` takes its `observed`
+id and `confirmed_not_created` is refused. The append-only journal gains operator `resolved` and
+`superseded` events (migration 257). The steps, and what never to do, are in
+docs/runbooks/reap_agentic_purchase.md, Parked checkout create.
+
 Owner view `checkout_dispatch_state` values:
 - `not_dispatched`: version1 tracking with no unresolved dispatch and no stored checkout/order
 - `dispatch_started`: durable intent exists; the outcome may be unknown

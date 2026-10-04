@@ -3672,6 +3672,8 @@ async def _checkout_from_quote(
 PERMANENT_CHECKOUT_READ_ERRORS = frozenset({"reap_status_404", "hosted_url_not_allowed", "unknown_checkout_status"})
 PERMANENT_CHECKOUT_READ_LIMIT = 3
 CHECKOUT_HUMAN_RETRY_SECONDS = 900
+#: COMPLETED on a checkout an operator attached to a parked create (reap_checkout_recovery).
+OPERATOR_FOUND_COMPLETED = "checkout_unresolvable:3:operator_found_completed"
 
 
 def _checkout_failure_count(code: Any) -> int:
@@ -3741,6 +3743,11 @@ async def _step_checkout_poll(
     recovered_code = "checkout_read_recovered" if _checkout_failure_count(row.get("last_error_code")) else None
     state = rc.checkout_state(read.data)
     if state == "completed":
+        if not row.get("hosted_url") and await continuation.operator_found_checkout(str(row["id"]), checkout_id):
+            # An operator attached this checkout to a parked create; no link we delivered was
+            # approved. Payment and attribution are a human decision, never an automatic close.
+            return await _release(row, worker_id, error_code=OPERATOR_FOUND_COMPLETED,
+                                  seconds=CHECKOUT_HUMAN_RETRY_SECONDS)
         return await _complete(row, worker_id, from_state, read.data)
     if state == "failed":
         return await _move(
