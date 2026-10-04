@@ -69,6 +69,7 @@ MIGRATIONS = (
     MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     MIGRATIONS_DIR / "253_reap_checkout_manual_resolution_audit.sql",
     MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
+    MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
 )
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 
@@ -193,6 +194,8 @@ async def apply_migrations(paths=MIGRATIONS):
 
 
 async def drop_tables():
+    # Append-only evidence is removed only with the isolated fixture table, never DELETE.
+    await database.execute("DROP TABLE IF EXISTS reap_checkout_dispatch_events")
     await database.execute("DROP TABLE IF EXISTS conversion_click_claims")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_buyer_refs")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
