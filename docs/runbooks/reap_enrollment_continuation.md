@@ -70,6 +70,12 @@ CHECKOUT_TEMPORARILY_UNAVAILABLE with HTTP503. The append-only `not_created` rec
 Unknown codes/statuses and a missing checkout ID never supply that authority. A quote/enrollment
 pair with a prior started event is never dispatched a second time.
 
+A parked create (`quoting` with a dispatch key, counted in `checkout_needs_human`) is resolved
+only by an operator: `services.reap_checkout_recovery.list_parked_dispatches` lists the cohort,
+and `resolve_parked_dispatch` records `checkout_found` or `confirmed_not_created` from verified
+Reap evidence. The append-only journal gains an operator `resolved` event (migration 257). The
+steps, and what never to do, are in docs/runbooks/reap_agentic_purchase.md, Parked checkout create.
+
 Owner view `checkout_dispatch_state` values:
 - `not_dispatched`: version1 tracking with no unresolved dispatch and no stored checkout/order
 - `dispatch_started`: durable intent exists; the outcome may be unknown

@@ -17,7 +17,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS reap_checkout_dispatch_events (
     purchase_id VARCHAR(64) NOT NULL,
     dispatch_key VARCHAR(64) NOT NULL,
-    event_type VARCHAR(32) NOT NULL CHECK(event_type IN ('started','not_created','observed')),
+    event_type VARCHAR(32) NOT NULL CHECK(event_type IN ('started','not_created','observed','resolved')),
     quote_id VARCHAR(128) NOT NULL,
     enrollment_id VARCHAR(128) NOT NULL,
     checkout_id VARCHAR(128),
@@ -48,6 +48,65 @@ BEFORE DELETE ON reap_checkout_dispatch_events
 BEGIN SELECT RAISE(ABORT, 'reap dispatch evidence is append-only'); END
 """
 
+# Mig 257: an operator `resolved` event closes one parked dispatch key. Existing journal rows
+# are never rewritten; only the vocabulary widens (SQLite cannot alter a CHECK, so it rebuilds).
+_EVENT_CHECK = "reap_checkout_dispatch_events_event_type_check"
+_WIDEN_EVENTS_PG = f"""
+ALTER TABLE reap_checkout_dispatch_events DROP CONSTRAINT IF EXISTS {_EVENT_CHECK},
+    ADD CONSTRAINT {_EVENT_CHECK} CHECK (event_type IN ('started','not_created','observed','resolved'))
+"""
+_EVENT_COLUMNS = "purchase_id,dispatch_key,event_type,quote_id,enrollment_id,checkout_id,provider_code,recorded_at"
+
+# One operator decision per parked dispatch key. Opaque handles only: no buyer contact, no
+# provider body, no hosted URL. See services/reap_checkout_recovery.resolve_parked_dispatch.
+_RESOLUTION_AUDIT = """
+CREATE TABLE IF NOT EXISTS reap_checkout_dispatch_resolution_audit (
+    purchase_id VARCHAR(64) NOT NULL,
+    dispatch_key VARCHAR(64) NOT NULL,
+    outcome VARCHAR(32) NOT NULL,
+    reap_checkout_id VARCHAR(128),
+    checkout_id_source VARCHAR(32),
+    resolved_state VARCHAR(32) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    evidence_source VARCHAR(64) NOT NULL,
+    evidence_reference VARCHAR(128) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    expected_updated_at TIMESTAMPTZ NOT NULL,
+    evidence_observed_at TIMESTAMPTZ NOT NULL,
+    provider_base_url VARCHAR(255) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (purchase_id, dispatch_key),
+    CHECK (outcome IN ('checkout_found','confirmed_not_created')),
+    CHECK (checkout_id_source IN ('journal_observed','operator_supplied')),
+    CHECK (evidence_source IN ('authenticated_reap_checkout_read','verified_reap_support_statement')),
+    CHECK ((outcome = 'checkout_found' AND reap_checkout_id IS NOT NULL AND checkout_id_source IS NOT NULL
+            AND resolved_state = 'awaiting_approval')
+        OR (outcome = 'confirmed_not_created' AND reap_checkout_id IS NULL AND checkout_id_source IS NULL
+            AND resolved_state = 'quoting'))
+)
+"""
+
+
+async def _allow_resolved_events():
+    if IS_POSTGRES:
+        definition = await database.fetch_val(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid='reap_checkout_dispatch_events'::regclass AND conname=:name", {'name': _EVENT_CHECK})
+        if definition is None or "'resolved'" not in definition:
+            await database.execute(_WIDEN_EVENTS_PG)
+        return
+    sql = await database.fetch_val(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='reap_checkout_dispatch_events'")
+    if sql and "'resolved'" not in sql:
+        # DROP TABLE fires no row triggers; the append-only triggers are recreated by the caller.
+        async with database.transaction():
+            await database.execute('ALTER TABLE reap_checkout_dispatch_events RENAME TO reap_checkout_dispatch_events_pre257')
+            await database.execute(_SCHEMA)
+            await database.execute(f'INSERT INTO reap_checkout_dispatch_events ({_EVENT_COLUMNS}) '
+                                   f'SELECT {_EVENT_COLUMNS} FROM reap_checkout_dispatch_events_pre257')
+            await database.execute('DROP TABLE reap_checkout_dispatch_events_pre257')
+
+
 _COLUMNS = {
     'dispatch_tracking_version': 'INTEGER',
     'checkout_dispatch_key': 'VARCHAR(64)',
@@ -57,7 +116,7 @@ _COLUMNS = {
 }
 
 async def ensure_continuation_schema():
-    """Self-heal parity with migration 256; failure must block writes, never imply no dispatch."""
+    """Self-heal parity with migrations 256+257; failure must block writes, never imply no dispatch."""
     if IS_POSTGRES:
         await database.execute("""ALTER TABLE reap_agentic_purchases
             ADD COLUMN IF NOT EXISTS dispatch_tracking_version INTEGER,
@@ -71,12 +130,14 @@ async def ensure_continuation_schema():
             if name not in columns:
                 await database.execute(f'ALTER TABLE reap_agentic_purchases ADD COLUMN {name} {kind}')
     await database.execute(_SCHEMA)
+    await _allow_resolved_events()
     if IS_POSTGRES:
         await database.execute(_IMMUTABLE_FUNCTION)
         await database.execute(_IMMUTABLE_TRIGGER)
     else:
         await database.execute(_IMMUTABLE_UPDATE_SQLITE)
         await database.execute(_IMMUTABLE_DELETE_SQLITE)
+    await database.execute(_RESOLUTION_AUDIT if IS_POSTGRES else _RESOLUTION_AUDIT.replace('TIMESTAMPTZ', 'TIMESTAMP'))
 
 
 def contact_required(row: Mapping[str, Any]) -> bool:

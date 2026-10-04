@@ -1858,6 +1858,83 @@ Migration 253 and both startup self-heal dialects create `reap_checkout_manual_r
 `contact_retention_blocked` is a separate owner/operator queue, covering privacy-held resolving, needs_enrollment and quoting work. Resuming flags does not restore discarded contact or mint another checkout. An operator must inspect whether an external checkout may exist and use a separately reviewed recovery/contact-reauthorization procedure; there is no automatic quoting cleanup or blind retry. `checkout_needs_human` is a separate payment uncertainty queue. The original three metrics match heartbeat, ordinary stuck and errors only; the dedicated queue alerts below cover these two cohorts. Before arming, install and verify them in the selected environment with an explicitly owned recipient. No cloud policy is created or enabled by source merge.
 
 
+### Parked checkout create
+
+A parked create is a purchase in `quoting` whose worker journaled a dispatch key and a `started`
+event (#2508, `reap_checkout_dispatch_events`), sent `POST /agentic/checkouts`, and never
+established the response: a timeout, crash, lost lease, HTTP500, malformed HTTP200, or a
+missing or unsafe checkout id. The row stores no checkout id, but **a checkout may exist at
+Reap for that dispatch key**. The worker never re-creates it. Every claim re-releases it with
+`checkout_dispatch_unresolved` after 15 minutes, and `checkout_needs_human` counts it, so the
+needs-human alert stays open until an operator decides. Legacy rows with no
+`dispatch_tracking_version` count too (no key, no journal: outcome unknown).
+
+Both functions below are service-only, like `resolve_checkout_manually`. Neither has an HTTP
+route, CLI, agent tool or buyer path, and neither calls Reap. Run them from the same privileged
+operator shell.
+
+1. **Find candidates.** `await services.reap_checkout_recovery.list_parked_dispatches()` is
+   read-only. Each entry has `purchase_id`, `classification` (`dispatch_started`, or
+   `legacy_unknown`), `dispatch_key`, `quote_id`, `reap_enrollment_id` (Reap's enrollment id),
+   `observed_checkout_ids`, the journal `events`, `age_seconds` (time in `quoting`), `claimed`,
+   `last_error_code` and `updated_at`. It returns no buyer contact, buyer reference or URL.
+   This tool does not resolve `legacy_unknown` rows. Escalate them to engineering.
+2. **Look the dispatch up at Reap.**
+   - If `observed_checkout_ids` names an id, Reap returned that checkout to us. Read it with the
+     authenticated `GET /agentic/checkouts/{id}`, the read the poller already uses.
+   - Otherwise, ask Reap whether a checkout exists for `quote_id` + `reap_enrollment_id`. The
+     create's Idempotency-Key was derived from that pair, and Reap keeps idempotency keys for
+     24 hours. **Open question for Reap: we have no confirmed lookup API by quote/enrollment or
+     idempotency key.** Until Reap confirms one, the evidence is a verified Reap support
+     statement (`verified_reap_support_statement`) that names the checkout id or states that
+     none exists.
+3. **Choose one outcome.**
+   - Reap has a checkout: `outcome="checkout_found"`. If the journal holds an observed id,
+     that id is used. Pass `checkout_id` only when the journal has none. An id that differs
+     from the journal's is refused. The row moves to `awaiting_approval` with that checkout id,
+     **no approval link** (none is made up) and the code a create with no safe hosted action
+     already writes, `checkout_unresolvable:3:checkout_no_hosted_action`. It is due
+     immediately, so the worker's ordinary checkout read takes the outcome from Reap. An
+     unapproved checkout turns FAILED at Reap minutes after its quote expires, so that read
+     normally closes the purchase as `failed` and the row leaves the count. While Reap still
+     reports it waiting, the row stays in the queue as a checkout with no link. A later
+     terminal outcome can also use `resolve_checkout_manually`.
+   - Reap confirms no checkout exists for this dispatch: `outcome="confirmed_not_created"`.
+     This appends the `not_created` receipt (provider code `OPERATOR_CONFIRMED_NOT_CREATED`) and
+     releases through the same fence Reap's own explicit rejection uses. The key is cleared, the
+     code becomes `checkout_dispatch_not_created`, and the row is due now. The normal flow then
+     resumes. It re-quotes, and the new quote is a new dispatch key. The old quote/enrollment
+     pair never dispatches again. Contact retention, attempts and flags apply as usual and may
+     end the purchase. This outcome is refused when the journal holds an observed checkout.
+   - Not sure: do nothing. The row stays parked and visible.
+4. **Preview, then apply.** First call `resolve_parked_dispatch(purchase_id,
+   dispatch_key=..., outcome=..., evidence={...}, operator_ref=..., expected_updated_at=<listing
+   updated_at>)` with the default `dry_run=True`. Then repeat it with `dry_run=False`. The
+   evidence takes the same fields `resolve_checkout_manually` takes (`source`,
+   `authoritative_verified=True`, `reference`, `observed_at` within 24 hours and after the
+   purchase was created, same-environment `provider_base_url`), with no `payload`.
+   - It refuses a row that is not a version-1 `quoting` row holding exactly that key with a
+     `started` event, a row a worker holds, a stale `updated_at`, and a journal whose observed
+     evidence conflicts.
+   - An exact replay returns `already_resolved` and writes nothing. Different evidence, a
+     different operator or a different outcome for an already-resolved key is refused.
+
+The claim, journal `resolved` event (plus the `not_created` receipt), state change or release,
+and audit row are one short transaction. Migration 257 and the startup self-heal
+(`db/reap_continuation.ensure_continuation_schema`) add the `resolved` event type and
+`reap_checkout_dispatch_resolution_audit`. That table holds one decision per (purchase,
+dispatch key): outcome, checkout id and whether it came from the journal or the operator, the
+resulting state, operator and evidence handles, the observed time and origin, and the
+normalized evidence SHA256. It holds no buyer contact, provider body or hosted URL. When
+rolling back runtime code, do not drop that table or the journal rows.
+
+**Never:**
+- Re-create a checkout under a new key, or open a replacement purchase, to clear the alert.
+- Use `confirmed_not_created` without Reap's confirmation for this dispatch. An empty column,
+  an elapsed clock or a failed lookup is not that confirmation.
+- Edit the purchase row or the journal by hand in SQL.
+- Resolve while a worker holds the claim.
+
 ### Dedicated human and privacy queue alerts
 
 The installer now prepares `prod: Reap checkout needs human reconciliation` and
@@ -1869,7 +1946,10 @@ The policies share the verified configured notification channel and installer re
 Source merge does not install or activate cloud policies. Before activation, install in the
 chosen environment, read back exact filters and recipient, and confirm actual delivery.
 Do not automatically retry, recreate a checkout, or restore scrubbed contact to clear an alert.
-Queue clearing must follow the authenticated evidence and audit requirements above.
+Queue clearing must follow the authenticated evidence and audit requirements above. The
+needs-human count also includes parked checkout creates (`quoting` with a dispatch key, or
+legacy rows with no tracking version). For those, see Parked checkout create. The policy's text
+names both cohorts only after `setup_monitoring.sh` is re-run in that environment.
 
 
 ### Atomic purchase and immutable key acceptance

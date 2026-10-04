@@ -82,6 +82,7 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
     _MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
+    _MIGRATIONS_DIR / "257_reap_parked_dispatch_resolution.sql",
 )
 
 # Same convention as tests/test_reap_agentic_ledger_postgres.py: this gate DROPS its tables, so
