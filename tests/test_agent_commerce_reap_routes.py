@@ -181,6 +181,47 @@ def _body(**over) -> Dict[str, Any]:
     return payload
 
 
+def _legacy(body: Dict[str, Any]) -> Dict[str, Any]:
+    """`body` as a door sent it before the money pair was required: the key, no money."""
+    return {k: v for k, v in body.items() if not k.startswith("expected_")}
+
+
+def _legacy_request_hash(body: Dict[str, Any]) -> str:
+    """The fingerprint create stored for a MONEY-LESS body before the pair was required. Built by
+    hand from the documented facts, not through `_request_hash`, so a change there cannot move
+    it: an attempt keyed then keeps exactly this hash."""
+    buyer = routes_reap.ReapBuyer.model_validate(body["buyer"])
+    facts: Dict[str, Any] = {
+        "merchant_domain": routes_reap._merchant_domain_key(body["merchant_domain"].lower()),
+        "product_key": body["product_key"],
+        "variant_key": body.get("variant_key") or "",
+        "quantity": int(body.get("quantity", 1)),
+        "email": str(buyer.email or "").strip(),
+        "shipping_address": {str(k): str(v)
+                             for k, v in routes_reap._buyer_address_for_client(buyer).items()},
+        "return_url": body.get("return_url") or routes_reap._default_return_url(),
+    }
+    if body.get("item_source", "reap_variant") != "reap_variant":
+        facts["item_source"] = body["item_source"]
+    if body.get("offer_code") is not None:
+        facts["offer_code"] = body["offer_code"]
+    canonical = json.dumps(facts, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+async def _plant_legacy_tombstone(
+    body: Dict[str, Any], reason: str = "merchant_not_eligible"
+) -> None:
+    """A `refused:` key as create wrote it before the money pair was required -- under the
+    money-less fingerprint of `body`, which is what a door retrying that attempt sends."""
+    await database.execute(
+        "INSERT INTO reap_agentic_purchase_keys (agent_id, agent_user_ref_hash, idempotency_key, "
+        "purchase_id, request_hash) VALUES (:a, :h, :k, :p, :r)",
+        {"a": AGENT, "h": hash_agent_user_ref(USER_REF), "k": body["idempotency_key"],
+         "p": f"refused:{reason}", "r": _legacy_request_hash(body)},
+    )
+
+
 # ── fixtures ─────────────────────────────────────────────────────────────────────────────────
 
 
@@ -3052,52 +3093,32 @@ async def test_no_variant_row_is_still_merchant_not_eligible(client):
     assert resp.status_code == 409 and _error(resp) == "merchant_not_eligible"
 
 
-async def _plant_legacy_tombstone(monkeypatch, key: str) -> None:
-    """A `refused:merchant_not_eligible` key as the create path wrote it before the money pair was
-    required. Create no longer writes one, so it is planted -- under the hash the route computes
-    for the next request carrying `key` -- just before that request's replay lookup reads it."""
-    real = routes_reap._replayed_purchase_id
-    planted = []
-
-    async def plant_then_read(**kwargs):
-        if kwargs["idempotency_key"] == key and not planted:
-            planted.append(key)
-            await database.execute(
-                "INSERT INTO reap_agentic_purchase_keys (agent_id, agent_user_ref_hash, "
-                "idempotency_key, purchase_id, request_hash) VALUES (:a, :h, :k, :p, :r)",
-                {"a": kwargs["agent_id"], "h": kwargs["agent_user_ref_hash"], "k": key,
-                 "p": "refused:merchant_not_eligible", "r": kwargs["request_hash"]},
-            )
-        return await real(**kwargs)
-
-    monkeypatch.setattr(routes_reap, "_replayed_purchase_id", plant_then_read)
-
-
-async def test_a_key_tombstoned_before_money_was_required_stays_refused_after_enabling(
-    client, monkeypatch
-):
+async def test_a_key_tombstoned_before_money_was_required_stays_refused_after_enabling(client):
     """G5 (gateway review of #2425), for the tombstones that still exist. A variant-lane
     merchant_not_eligible used to be remembered against its key; create no longer writes one
-    (every create carries bound money, and a refusal before money admission writes nothing), but
-    a key tombstoned before that keeps answering its refusal after the merchant is enabled."""
+    (every new attempt carries bound money, and a refusal before money admission writes nothing),
+    but a key tombstoned before that keeps answering its refusal -- to the money-less retry it was
+    keyed for -- after the merchant is enabled, and writes nothing doing so."""
     await _seed_all()  # the operator has since enabled the merchant
-    await _plant_legacy_tombstone(monkeypatch, "K")
-    retry = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K"))
-    assert retry.status_code == 409 and _error(retry) == "merchant_not_eligible"
+    body = _body(idempotency_key="K")
+    await _plant_legacy_tombstone(body)
+    keys = await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys")
+    retry = await client.post(f"{BASE}/purchases", json=_legacy(body))
+    assert retry.status_code == 409 and _error(retry) == "merchant_not_eligible", retry.text
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == keys
 
-    # CONTROLS: a NEW key opens a variant purchase now, and K with a different body is a conflict.
+    # CONTROLS: a NEW key opens a variant purchase now, and K with money is a different request.
     fresh = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K2"))
     assert fresh.status_code == 202, fresh.text
-    other = await client.post(f"{BASE}/purchases", json=_body(idempotency_key="K", quantity=2))
+    other = await client.post(f"{BASE}/purchases", json=body)
     assert other.status_code == 409 and _error(other) == "idempotency_conflict"
 
 
-async def test_an_old_refusal_requires_a_new_intentional_key(client, monkeypatch):
+async def test_an_old_refusal_requires_a_new_intentional_key(client):
     await _seed_all()
-    await _plant_legacy_tombstone(monkeypatch, "K-t")
-    body = _body(idempotency_key="K-t")
-    assert _error(await client.post(f"{BASE}/purchases", json=body)) == "merchant_not_eligible"
+    body = _legacy(_body(idempotency_key="K-t"))
+    await _plant_legacy_tombstone(body)
     await database.execute(
         "UPDATE reap_agentic_purchase_keys SET created_at = datetime('now', '-25 hours') "
         "WHERE idempotency_key = 'K-t'")
@@ -4177,7 +4198,8 @@ async def test_recovery_missing_or_unverifiable_evidence_cannot_create(client, m
     body = _body(idempotency_key="recover-evidence")
     if mapping == "tombstone":
         await _seed_all()
-        await _plant_legacy_tombstone(monkeypatch, "recover-evidence")
+        body = _legacy(body)  # a tombstone was only ever written for a money-less body
+        await _plant_legacy_tombstone(body)
         assert _error(await client.post(f"{BASE}/purchases", json=body)) == "merchant_not_eligible"
     elif mapping != "missing":
         await _seed_all()

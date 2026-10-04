@@ -491,11 +491,12 @@ class StartPurchaseRequest(BaseModel):
     quantity: StrictInt = Field(1, ge=1, le=svc.MAX_QUANTITY)
     buyer: ReapBuyer
     return_url: Optional[str] = None
-    #: REQUIRED, on every `item_source`. One key is one attempt: it is what makes a retry of an
-    #: unknown outcome (a lost 202, a 503 `checkout_outcome_unknown`) the SAME purchase rather
-    #: than a second one, and `/recover` cannot find an attempt that was opened without one. A
-    #: missing key is `invalid_request` before anything is read or written.
-    idempotency_key: str = Field(..., max_length=128)
+    #: REQUIRED on create, every `item_source` -- by the handler (`_identifier`), not here, so a
+    #: missing key and an unprintable one are the same `invalid_request`, before any SQL. One key
+    #: is one attempt: it is what makes a retry of an unknown outcome (a lost 202, a 503
+    #: `checkout_outcome_unknown`) the SAME purchase, and `/recover` cannot find an attempt that
+    #: was opened without one.
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
     #: Accepted and NOT forwarded anywhere. The click id this rail records is one WE mint (see
     #: `new_click_id` below): a caller-supplied attribution context cannot be trusted to be
     #: unique, and the purchase row has exactly one attribution column. Kept in the schema so the
@@ -508,12 +509,13 @@ class StartPurchaseRequest(BaseModel):
     #: one owner. Sent to Reap AS GIVEN; if Reap refuses it the purchase is re-quoted without it
     #: and `offer_code_outcome` on the purchase says `dropped_invalid` / `dropped_expired`.
     offer_code: Optional[str] = None
-    # REQUIRED on create, both or neither refused: the money the buyer was shown, bound into the
-    # original attempt and checked against the current offer (`price_changed`). Neither is a
-    # client price override. Only `RecoverPurchaseRequest` still accepts a body without them,
-    # so an attempt keyed before this was required stays findable.
-    expected_unit_price_minor: StrictInt = Field(..., ge=1, le=9007199254740991)
-    expected_currency: StrictStr = Field(..., pattern=r"^[A-Z]{3}$")
+    # REQUIRED for a NEW attempt (the handler refuses a money-less one before any write): the
+    # money the buyer was shown, bound into the original attempt and checked against the current
+    # offer (`price_changed`). Neither is a client price override. Optional in the schema ONLY
+    # so a money-less retry of an attempt keyed before the pair was required still reaches its
+    # read-only replay (create) or lookup (recovery). Half a pair is refused here.
+    expected_unit_price_minor: Optional[StrictInt] = Field(None, ge=1, le=9007199254740991)
+    expected_currency: Optional[StrictStr] = Field(None, pattern=r"^[A-Z]{3}$")
 
     @model_validator(mode="after")
     def paired_expected_money(self):
@@ -527,13 +529,6 @@ class StartPurchaseRequest(BaseModel):
 class RecoverPurchaseRequest(StartPurchaseRequest):
     # Recovery must recognize bodies accepted before strict create admission; it cannot spend.
     quantity: int = Field(1, ge=1, le=svc.MAX_QUANTITY)
-    # The handler requires the key (`_identifier`, the same `invalid_request`); the model keeps
-    # the shape recovery has always accepted.
-    idempotency_key: Optional[str] = Field(default=None, max_length=128)
-    # An attempt keyed before create required the pair hashed without it; recovery is a lookup
-    # and must still find that attempt. `paired_expected_money` still refuses half a pair.
-    expected_unit_price_minor: Optional[StrictInt] = Field(None, ge=1, le=9007199254740991)
-    expected_currency: Optional[StrictStr] = Field(None, pattern=r"^[A-Z]{3}$")
 
 
 class PreparePurchaseSelectionRequest(BaseModel):
@@ -2169,8 +2164,8 @@ async def _replayed_purchase_id(
 
 #: `reap_agentic_purchase_keys.purchase_id` of a key whose request was REFUSED (not a purchase).
 _REFUSED_KEY_PREFIX = "refused:"
-#: The refusals that were remembered against a key. Create no longer writes one (every create
-#: carries bound money that has not passed admission when eligibility refuses), but a key
+#: The refusals that were remembered against a key. Create no longer writes one (every attempt
+#: reaching eligibility carries bound money that has not passed admission), but a key
 #: tombstoned before that still answers its refusal on replay and `not_found` on recovery.
 _TOMBSTONED_REFUSALS = frozenset({"merchant_not_eligible"})
 
@@ -2730,6 +2725,14 @@ async def start_reap_purchase(
             expected_currency=req.expected_currency,
         )
 
+        # A body with NEITHER money field (half a pair never validated) is not a new attempt this
+        # route will open. It may still be the retry of an attempt keyed before the pair was
+        # required -- a door that sent the key and no money -- and refusing that retry with a 400
+        # would tell the door "not created" about a purchase that exists. So it gets the
+        # read-only replay below under the money-less fingerprint it was keyed with, and a 400
+        # only when that finds nothing. The lookup is a read; nothing is written on this path.
+        legacy_retry = req.expected_unit_price_minor is None
+
         # Raises `idempotency_conflict` when this key was used for a different request.
         replayed = await _replayed_purchase_id(
             agent_id=agent_id,
@@ -2766,7 +2769,9 @@ async def start_reap_purchase(
                 replay_buyer_id = await _linked_buyer_id(
                     agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash
                 )
-                if replay_buyer_id:
+                # Not on a legacy (money-less) retry: that path is read-only end to end, and
+                # the attempt's consent was recorded when it was opened.
+                if replay_buyer_id and not legacy_retry:
                     await _record_consent(replay_buyer_id, consent_version)
                 replay_body: Dict[str, Any] = {
                     "purchase_id": replayed,
@@ -2780,6 +2785,12 @@ async def start_reap_purchase(
                 return JSONResponse(status_code=202, content=replay_body)
             # An immutable key without an owner-visible row cannot authorize a new attempt.
             return _not_found()
+        if legacy_retry:
+            # No attempt under this key and fingerprint: a NEW attempt, and a new attempt binds
+            # the money the buyer was shown. Refused before any write.
+            raise svc.PurchaseRefused(
+                "invalid_request", "expected_unit_price_minor and expected_currency are required"
+            )
 
         svc.enforce_pilot_scope(
             agent_id=agent_id, merchant_domain=merchant_domain,
@@ -2840,8 +2851,8 @@ async def start_reap_purchase(
                 market_country=market_country,
             )
         else:
-            # A refusal here writes nothing, the key included: every create carries bound money
-            # that has not passed admission yet. (A `refused:` key written before the pair was
+            # A refusal here writes nothing, the key included: every attempt that reaches here
+            # carries bound money that has not passed admission yet. (A `refused:` key written before the pair was
             # required is still honoured by `_replayed_purchase_id`.)
             eligible = await _eligibility(
                 merchant_domain=merchant_domain,
@@ -2860,8 +2871,8 @@ async def start_reap_purchase(
             )
 
         facts = cart_facts if cart_facts is not None else row
-        # The money the buyer was shown, against the money this offer has now. Every create
-        # carries the pair, so this always runs.
+        # The money the buyer was shown, against the money this offer has now. Every attempt
+        # that reaches here carries the pair (`legacy_retry` above), so this always runs.
         actual_minor = facts["our_price_minor"] if isinstance(facts, dict) else facts.our_price_minor
         actual_currency = facts["currency"] if isinstance(facts, dict) else facts.currency
         if type(actual_minor) is not int or actual_minor != req.expected_unit_price_minor or actual_currency != req.expected_currency:

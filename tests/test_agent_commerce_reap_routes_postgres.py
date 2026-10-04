@@ -49,6 +49,7 @@ arm, which never shares a process with the gate.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -444,6 +445,47 @@ def _body(**over) -> Dict[str, Any]:
     }
     payload.update(over)
     return payload
+
+
+def _legacy(body: Dict[str, Any]) -> Dict[str, Any]:
+    """`body` as a door sent it before the money pair was required: the key, no money."""
+    return {k: v for k, v in body.items() if not k.startswith("expected_")}
+
+
+def _legacy_request_hash(body: Dict[str, Any]) -> str:
+    """The fingerprint create stored for a MONEY-LESS body before the pair was required. Built by
+    hand from the documented facts, not through `_request_hash`, so a change there cannot move
+    it: an attempt keyed then keeps exactly this hash."""
+    buyer = routes_reap.ReapBuyer.model_validate(body["buyer"])
+    facts: Dict[str, Any] = {
+        "merchant_domain": routes_reap._merchant_domain_key(body["merchant_domain"].lower()),
+        "product_key": body["product_key"],
+        "variant_key": body.get("variant_key") or "",
+        "quantity": int(body.get("quantity", 1)),
+        "email": str(buyer.email or "").strip(),
+        "shipping_address": {str(k): str(v)
+                             for k, v in routes_reap._buyer_address_for_client(buyer).items()},
+        "return_url": body.get("return_url") or routes_reap._default_return_url(),
+    }
+    if body.get("item_source", "reap_variant") != "reap_variant":
+        facts["item_source"] = body["item_source"]
+    if body.get("offer_code") is not None:
+        facts["offer_code"] = body["offer_code"]
+    canonical = json.dumps(facts, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+async def _plant_legacy_tombstone(
+    body: Dict[str, Any], reason: str = "merchant_not_eligible"
+) -> None:
+    """A `refused:` key as create wrote it before the money pair was required -- under the
+    money-less fingerprint of `body`, which is what a door retrying that attempt sends."""
+    await database.execute(
+        "INSERT INTO reap_agentic_purchase_keys (agent_id, agent_user_ref_hash, idempotency_key, "
+        "purchase_id, request_hash) VALUES (:a, :h, :k, :p, :r)",
+        {"a": AGENT, "h": hash_agent_user_ref(USER_REF), "k": body["idempotency_key"],
+         "p": f"refused:{reason}", "r": _legacy_request_hash(body)},
+    )
 
 
 async def _seed_catalog(
@@ -2647,33 +2689,13 @@ async def test_recovery_requires_an_opaque_attempt_key(client, key):
     assert response.status_code == 400, response.text
 
 
-async def _plant_legacy_tombstone(monkeypatch, key: str) -> None:
-    """A `refused:merchant_not_eligible` key as the create path wrote it before the money pair was
-    required. Create no longer writes one, so it is planted -- under the hash the route computes
-    for the next request carrying `key` -- just before that request's replay lookup reads it."""
-    real = routes_reap._replayed_purchase_id
-    planted = []
-
-    async def plant_then_read(**kwargs):
-        if kwargs["idempotency_key"] == key and not planted:
-            planted.append(key)
-            await database.execute(
-                "INSERT INTO reap_agentic_purchase_keys (agent_id, agent_user_ref_hash, "
-                "idempotency_key, purchase_id, request_hash) VALUES (:a, :h, :k, :p, :r)",
-                {"a": kwargs["agent_id"], "h": kwargs["agent_user_ref_hash"], "k": key,
-                 "p": "refused:merchant_not_eligible", "r": kwargs["request_hash"]},
-            )
-        return await real(**kwargs)
-
-    monkeypatch.setattr(routes_reap, "_replayed_purchase_id", plant_then_read)
-
-
 @pytest.mark.parametrize("mapping", ["missing", "tombstone", "deleted", "unowned", "unverifiable"])
 async def test_recovery_missing_or_unverifiable_evidence_cannot_create(client, monkeypatch, mapping):
     body = _body(idempotency_key="recover-evidence")
     if mapping == "tombstone":
         await _seed_all()
-        await _plant_legacy_tombstone(monkeypatch, "recover-evidence")
+        body = _legacy(body)  # a tombstone was only ever written for a money-less body
+        await _plant_legacy_tombstone(body)
         assert _error(await client.post(f"{BASE}/purchases", json=body)) == "merchant_not_eligible"
     elif mapping != "missing":
         await _seed_all()
@@ -3100,10 +3122,10 @@ async def test_retirement_preview_apply_recover_and_old_keys_cannot_create(clien
         recovered=await client.post(f"{BASE}/purchases/recover",json=legacy)
         assert recovered.status_code==200, recovered.text
         assert recovered.json()=={"recovery_status":"retired","reconciliation_id":applied["reconciliation_id"]}
-        # Neither the original body (no money: refused before the key is read) nor the key with
-        # money (a different fingerprint) can open anything.
+        # The original money-less body replays the retirement; the key with money is a different
+        # fingerprint. Neither can open anything.
         created=await client.post(f"{BASE}/purchases",json=legacy)
-        assert created.status_code==400 and _error(created)=="invalid_request",created.text
+        assert created.status_code==409 and _error(created)=="attempt_retired",created.text
         created=await client.post(f"{BASE}/purchases",json=body)
         assert created.status_code==409 and _error(created)=="idempotency_conflict",created.text
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases")==0

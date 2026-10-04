@@ -6,9 +6,9 @@ from db.database import database, IS_POSTGRES
 import routes.agent_commerce_reap as reap
 from reap_selection_prepare_cases import seed, unchanged_state, prepare_seed_cleanup, body as prepare_body, DOMAIN, PRODUCT, SKU, SEED, BASE as PREPARE
 if IS_POSTGRES:
-    from test_agent_commerce_reap_routes_postgres import _body, _seed_catalog, _seed_eligibility, _error
+    from test_agent_commerce_reap_routes_postgres import _body, _seed_catalog, _seed_eligibility, _error, _legacy, _legacy_request_hash, _plant_legacy_tombstone
 else:
-    from test_agent_commerce_reap_routes import _body, _seed_catalog, _seed_eligibility, _error
+    from test_agent_commerce_reap_routes import _body, _seed_catalog, _seed_eligibility, _error, _legacy, _legacy_request_hash, _plant_legacy_tombstone
 async def _purchase_row(purchase_id):
     return dict(await database.fetch_one("SELECT * FROM reap_agentic_purchases WHERE id=:id", {"id":purchase_id}))
 BASE='/agent/v2/commerce/reap/purchases'
@@ -68,31 +68,71 @@ async def test_create_refuses_a_legacy_body_but_a_legacy_attempt_still_recovers(
     original=hashlib.sha256(json.dumps(facts,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()).hexdigest()
     await database.execute('UPDATE reap_agentic_purchase_keys SET request_hash=:h WHERE idempotency_key=:key',{'h':original,'key':body['idempotency_key']})
     before=await unchanged_state();monkeypatch.setenv('REAP_AGENTIC_ENABLED','0');monkeypatch.setenv('REAP_AGENTIC_CREATE_ENABLED','0');recovered=await client.post(BASE+'/recover',json=legacy);assert recovered.status_code==200 and recovered.json()['id']==purchase['id'];assert await unchanged_state()==before
-_INCOMPLETE={
+_NO_KEY={
     'no_key':lambda b:_without(b,'idempotency_key'),
     'null_key':lambda b:{**b,'idempotency_key':None},
     'blank_key':lambda b:{**b,'idempotency_key':'   '},
-    'no_money':lambda b:_without(b,*_MONEY),
-    'neither':lambda b:_without(b,'idempotency_key',*_MONEY),
+    'no_key_no_money':lambda b:_without(b,'idempotency_key',*_MONEY),
 }
 @pytest.mark.parametrize('lane',['cart_link','reap_variant'])
-@pytest.mark.parametrize('incomplete',list(_INCOMPLETE))
-async def test_create_without_key_or_money_is_refused_before_any_read_or_write(client,monkeypatch,lane,incomplete):
-    """One attempt per key, frozen original money: a create missing either is a definitive
-    `invalid_request` (the gateway's not-created class), answered before any SQL, so no purchase,
-    key, click, buyer link or consent exists for a retry to duplicate or a recovery to miss."""
-    body,minor=await lane_body(monkeypatch,lane,idempotency_key='required-key-and-money');body.update(expected_unit_price_minor=minor,expected_currency='USD')
+@pytest.mark.parametrize('incomplete',list(_NO_KEY))
+async def test_create_without_a_key_is_refused_before_any_sql(client,monkeypatch,lane,incomplete):
+    """One attempt per key: a create without one is a definitive `invalid_request` (the gateway's
+    not-created class), answered before any SQL -- nothing for a retry to duplicate."""
+    body,minor=await lane_body(monkeypatch,lane,idempotency_key='required-key');body.update(expected_unit_price_minor=minor,expected_currency='USD')
     before=await unchanged_state()
-    async def forbidden(*a,**kw):raise AssertionError('An incomplete create body reached SQL')
+    async def forbidden(*a,**kw):raise AssertionError('A keyless create reached SQL')
     with monkeypatch.context() as patch:
         for name in ('fetch_one','fetch_all','fetch_val','execute'):patch.setattr(database,name,forbidden)
-        response=await client.post(BASE,json=_INCOMPLETE[incomplete](body))
+        response=await client.post(BASE,json=_NO_KEY[incomplete](body))
     assert response.status_code==400 and _error(response)=='invalid_request',response.text
     assert await unchanged_state()==before
     # CONTROL: the complete body opens exactly one purchase, and its retry replays it.
     first=await client.post(BASE,json=body);assert first.status_code==202,first.text
     again=await client.post(BASE,json=body);assert again.status_code==202 and again.json()['purchase_id']==first.json()['purchase_id']
     assert await database.fetch_val('SELECT COUNT(*) FROM reap_agentic_purchases')==1
+def _forbid_writes(patch):
+    async def forbidden(*a,**kw):raise AssertionError('A money-less create wrote')
+    for name in ('execute','execute_many'):patch.setattr(database,name,forbidden,raising=False)
+@pytest.mark.parametrize('lane',['cart_link','reap_variant'])
+async def test_a_money_less_new_attempt_is_refused_without_writes(client,monkeypatch,lane):
+    """A fresh key with NEITHER money field is a new attempt without the money the buyer was shown:
+    `invalid_request` after only the read-only replay lookup, before any write."""
+    body,minor=await lane_body(monkeypatch,lane,idempotency_key='money-less-new-attempt')
+    before=await unchanged_state()
+    with monkeypatch.context() as patch:
+        _forbid_writes(patch);response=await client.post(BASE,json=_legacy(body))
+    assert response.status_code==400 and _error(response)=='invalid_request',response.text
+    assert await unchanged_state()==before
+@pytest.mark.parametrize('lane',['cart_link','reap_variant'])
+async def test_a_money_less_retry_of_a_legacy_attempt_replays_without_writes(client,monkeypatch,lane):
+    """P1 (review of #2510). An attempt a door keyed before the pair was required carries the
+    money-less fingerprint, and the door retries it with the same money-less body. That retry is
+    the SAME purchase (202, same id), never a 400 the door would read as "not created" -- and the
+    replay writes nothing, the consent tag included."""
+    body,minor=await lane_body(monkeypatch,lane,idempotency_key='legacy-keyed-attempt');body.update(expected_unit_price_minor=minor,expected_currency='USD')
+    opened=await client.post(BASE,json=body);assert opened.status_code==202,opened.text
+    await database.execute('UPDATE reap_agentic_purchase_keys SET request_hash=:h WHERE idempotency_key=:k',{'h':_legacy_request_hash(body),'k':body['idempotency_key']})
+    before=await unchanged_state()
+    with monkeypatch.context() as patch:
+        _forbid_writes(patch);retry=await client.post(BASE,json=_legacy(body))
+    assert retry.status_code==202 and retry.json()['purchase_id']==opened.json()['purchase_id'],retry.text
+    assert await unchanged_state()==before
+    # The key now names the money-less request: the same key WITH money is a different one.
+    changed=await client.post(BASE,json=body);assert changed.status_code==409 and _error(changed)=='idempotency_conflict',changed.text
+    assert await database.fetch_val('SELECT COUNT(*) FROM reap_agentic_purchases')==1
+async def test_a_legacy_tombstone_answers_its_refusal_without_writes(client,monkeypatch):
+    """P1 (review of #2510). A variant-lane `merchant_not_eligible` remembered against a money-less
+    key answers that refusal to the money-less retry (409, as before), not a 400, writing nothing;
+    recovery of it is `purchase_not_found`."""
+    await _seed_catalog();await _seed_eligibility()  # enabled since: the tombstone still decides
+    body=_body(idempotency_key='legacy-tombstoned');await _plant_legacy_tombstone(body)
+    before=await unchanged_state()
+    with monkeypatch.context() as patch:
+        _forbid_writes(patch);retry=await client.post(BASE,json=_legacy(body))
+    assert retry.status_code==409 and _error(retry)=='merchant_not_eligible',retry.text
+    assert await unchanged_state()==before
+    recovered=await client.post(BASE+'/recover',json=_legacy(body));assert recovered.status_code==404,recovered.text
 @pytest.mark.parametrize('pair',[{'expected_unit_price_minor':1399},{'expected_currency':'USD'},{'expected_unit_price_minor':None,'expected_currency':None},{'expected_unit_price_minor':None,'expected_currency':'USD'},{'expected_unit_price_minor':1399,'expected_currency':None},{'expected_unit_price_minor':True,'expected_currency':'USD'},{'expected_unit_price_minor':'1399','expected_currency':'USD'},{'expected_unit_price_minor':1399.0,'expected_currency':'USD'},{'expected_unit_price_minor':0,'expected_currency':'USD'},{'expected_unit_price_minor':-1,'expected_currency':'USD'},{'expected_unit_price_minor':9007199254740992,'expected_currency':'USD'},{'expected_unit_price_minor':1399,'expected_currency':'usd'},{'expected_unit_price_minor':1399,'expected_currency':'USD\n'},{'expected_unit_price_minor':1399,'expected_currency':1}])
 async def test_expected_money_strict_pair_refused_before_sql_and_recovery(client,monkeypatch,pair):
     async def forbidden(*a,**kw):raise AssertionError('Malformed money reached SQL')
