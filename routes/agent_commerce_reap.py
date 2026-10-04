@@ -497,6 +497,11 @@ class StartPurchaseRequest(BaseModel):
     quantity: StrictInt = Field(1, ge=1, le=svc.MAX_QUANTITY)
     buyer: ReapBuyer
     return_url: Optional[str] = None
+    #: REQUIRED on create, every `item_source` -- by the handler (`_identifier`), not here, so a
+    #: missing key and an unprintable one are the same `invalid_request`, before any SQL. One key
+    #: is one attempt: it is what makes a retry of an unknown outcome (a lost 202, a 503
+    #: `checkout_outcome_unknown`) the SAME purchase, and `/recover` cannot find an attempt that
+    #: was opened without one.
     idempotency_key: Optional[str] = Field(default=None, max_length=128)
     #: Accepted and NOT forwarded anywhere. The click id this rail records is one WE mint (see
     #: `new_click_id` below): a caller-supplied attribution context cannot be trusted to be
@@ -510,8 +515,11 @@ class StartPurchaseRequest(BaseModel):
     #: one owner. Sent to Reap AS GIVEN; if Reap refuses it the purchase is re-quoted without it
     #: and `offer_code_outcome` on the purchase says `dropped_invalid` / `dropped_expired`.
     offer_code: Optional[str] = None
-    # Optional only for legacy bodies. New witnessed selections bind both exact
-    # money fields into the original attempt; neither is a client price override.
+    # REQUIRED for a NEW attempt (the handler refuses a money-less one before any write): the
+    # money the buyer was shown, bound into the original attempt and checked against the current
+    # offer (`price_changed`). Neither is a client price override. Optional in the schema ONLY
+    # so a money-less retry of an attempt keyed before the pair was required still reaches its
+    # read-only replay (create) or lookup (recovery). Half a pair is refused here.
     expected_unit_price_minor: Optional[StrictInt] = Field(None, ge=1, le=9007199254740991)
     expected_currency: Optional[StrictStr] = Field(None, pattern=r"^[A-Z]{3}$")
 
@@ -2147,8 +2155,8 @@ async def _replayed_purchase_id(
         )
     stored = str(record.get("purchase_id") or "").strip()
     if stored.startswith(_REFUSED_KEY_PREFIX):
-        # A TOMBSTONE: this key, for this exact request, was refused -- see
-        # `_tombstone_idempotency_key`. The same answer again for the lifetime of this attempt key.
+        # A TOMBSTONE: this key, for this exact request, was refused (or retired). The same
+        # answer again for the lifetime of this attempt key.
         from services.reap_unopened_attempt import MARKER
         if MARKER.fullmatch(stored):
             raise svc.PurchaseRefused("attempt_retired", "this original attempt was permanently retired")
@@ -2162,45 +2170,14 @@ async def _replayed_purchase_id(
 
 #: `reap_agentic_purchase_keys.purchase_id` of a key whose request was REFUSED (not a purchase).
 _REFUSED_KEY_PREFIX = "refused:"
-#: The refusals that are remembered against a key. Only the one a door answers by trying another
-#: lane with a DIFFERENT key; see `_tombstone_idempotency_key`.
+#: The refusals that were remembered against a key. Create no longer writes one (every attempt
+#: reaching eligibility carries bound money that has not passed admission), but a key
+#: tombstoned before that still answers its refusal on replay and `not_found` on recovery.
 _TOMBSTONED_REFUSALS = frozenset({"merchant_not_eligible"})
 
 
 class _PurchasePersistenceUnavailable(Exception):
     """A keyed outcome cannot be accepted or refused authoritatively."""
-
-
-async def _tombstone_idempotency_key(
-    *, agent_id: str, agent_user_ref_hash: str, idempotency_key: str, request_hash: str,
-    reason: str,
-) -> None:
-    """A keyed merchant refusal is authoritative only when its key is durable.
-
-    A concurrent purchase winner must remain recoverable, never become a refusal
-    that lets the caller spend on another rail. Storage uncertainty is a 503.
-    """
-    if reason not in _TOMBSTONED_REFUSALS:
-        return
-    try:
-        landed = await _write_idempotency_key(
-            agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash,
-            idempotency_key=idempotency_key, purchase_id=f"{_REFUSED_KEY_PREFIX}{reason}",
-            request_hash=request_hash,
-        )
-        if landed:
-            return
-        # A matching tombstone raises its durable refusal; a hash mismatch raises
-        # conflict. A purchase (or missing mapping) cannot authorize cart fallback.
-        await _replayed_purchase_id(
-            agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash,
-            idempotency_key=idempotency_key, request_hash=request_hash,
-        )
-    except svc.PurchaseRefused:
-        raise
-    except Exception:
-        raise _PurchasePersistenceUnavailable() from None
-    raise _PurchasePersistenceUnavailable()
 
 
 # Lifetime mappings are immutable at the SQL conflict fence too, not just at lookup.
@@ -2742,11 +2719,9 @@ async def start_reap_purchase(
         if not agent_user_ref_hash:
             raise svc.PurchaseRefused("agent_user_required")
 
-        idempotency_key = (
-            _identifier(req.idempotency_key, "idempotency_key", max_chars=128)
-            if str(req.idempotency_key or "").strip()
-            else None
-        )
+        # REQUIRED, and a blank one is as missing as an absent one: refused here, before the
+        # replay lookup and before any write (see `StartPurchaseRequest.idempotency_key`).
+        idempotency_key = _identifier(req.idempotency_key, "idempotency_key", max_chars=128)
         # THE RETURN URL AND THE ADDRESS ARE RESOLVED HERE, BEFORE THE REPLAY LOOKUP, because both
         # are part of what the idempotency key is a key FOR. `start_purchase` validates the URL;
         # this line only decides which one it validates.
@@ -2768,59 +2743,74 @@ async def start_reap_purchase(
             expected_currency=req.expected_currency,
         )
 
-        if idempotency_key:
-            # Raises `idempotency_conflict` when this key was used for a different request.
-            replayed = await _replayed_purchase_id(
+        # A body with NEITHER money field (half a pair never validated) is not a new attempt this
+        # route will open. It may still be the retry of an attempt keyed before the pair was
+        # required -- a door that sent the key and no money -- and refusing that retry with a 400
+        # would tell the door "not created" about a purchase that exists. So it gets the
+        # read-only replay below under the money-less fingerprint it was keyed with, and a 400
+        # only when that finds nothing. The lookup is a read; nothing is written on this path.
+        legacy_retry = req.expected_unit_price_minor is None
+
+        # Raises `idempotency_conflict` when this key was used for a different request.
+        replayed = await _replayed_purchase_id(
+            agent_id=agent_id,
+            agent_user_ref_hash=agent_user_ref_hash,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
+        if replayed:
+            # THE SAME ID, AND THE PURCHASE'S REAL STATE. Not a hardcoded "resolving": by the
+            # time a caller retries, the row may have moved, and answering with a state it is
+            # no longer in would be a lie in the one field the caller polls on.
+            view = await _owner_view(
+                purchase_id=replayed,
                 agent_id=agent_id,
                 agent_user_ref_hash=agent_user_ref_hash,
-                idempotency_key=idempotency_key,
-                request_hash=request_hash,
             )
-            if replayed:
-                # THE SAME ID, AND THE PURCHASE'S REAL STATE. Not a hardcoded "resolving": by the
-                # time a caller retries, the row may have moved, and answering with a state it is
-                # no longer in would be a lie in the one field the caller polls on.
-                view = await _owner_view(
-                    purchase_id=replayed,
-                    agent_id=agent_id,
-                    agent_user_ref_hash=agent_user_ref_hash,
+            if view:
+                # THE CONSENT IS RECORDED ON A REPLAY TOO, and this is the whole reason
+                # `_linked_buyer_id` exists as a separate read.
+                #
+                # The contract page, the runbook and migration 227's header all say the tag
+                # is rewritten on EVERY purchase and is always the latest version the buyer
+                # accepted. Returning here without writing it made that false for exactly the
+                # requests a door retries — which is where a consent version most plausibly
+                # changes mid-flight. The prose was right and the code was wrong; this is the
+                # code catching up.
+                #
+                # A READ, NOT `_buyer_id_for`. A replay implies the buyer already exists, so
+                # the lookup finds them; using the minting version here would hand the replay
+                # path the power to CREATE an identity before eligibility has been checked,
+                # and a caller could then mint buyer rows by probing merchants we never
+                # enabled. Nothing is written when there is no link — there is nothing to
+                # record a consent against.
+                replay_buyer_id = await _linked_buyer_id(
+                    agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash
                 )
-                if view:
-                    # THE CONSENT IS RECORDED ON A REPLAY TOO, and this is the whole reason
-                    # `_linked_buyer_id` exists as a separate read.
-                    #
-                    # The contract page, the runbook and migration 227's header all say the tag
-                    # is rewritten on EVERY purchase and is always the latest version the buyer
-                    # accepted. Returning here without writing it made that false for exactly the
-                    # requests a door retries — which is where a consent version most plausibly
-                    # changes mid-flight. The prose was right and the code was wrong; this is the
-                    # code catching up.
-                    #
-                    # A READ, NOT `_buyer_id_for`. A replay implies the buyer already exists, so
-                    # the lookup finds them; using the minting version here would hand the replay
-                    # path the power to CREATE an identity before eligibility has been checked,
-                    # and a caller could then mint buyer rows by probing merchants we never
-                    # enabled. Nothing is written when there is no link — there is nothing to
-                    # record a consent against.
-                    replay_buyer_id = await _linked_buyer_id(
-                        agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash
-                    )
-                    if replay_buyer_id:
-                        await _record_consent(replay_buyer_id, consent_version)
-                    replay_body: Dict[str, Any] = {
-                        "purchase_id": replayed,
-                        "status": view.get("state"),
-                        "poll_after_seconds": view.get("poll_after_seconds"),
-                        "checkout_dispatch_state": view["checkout_dispatch_state"],
-                        "contact_reentry_required": view["contact_reentry_required"],
-                    }
-                    if req.item_source == "cart_link":
-                        # The same additive field the cart-link create answered with. The key's
-                        # request hash covers `item_source`, so a replay is always the same lane.
-                        replay_body["variant_title"] = view.get("variant_title")
-                    return JSONResponse(status_code=202, content=replay_body)
-                # An immutable key without an owner-visible row cannot authorize a new attempt.
-                return _not_found()
+                # Not on a legacy (money-less) retry: that path is read-only end to end, and
+                # the attempt's consent was recorded when it was opened.
+                if replay_buyer_id and not legacy_retry:
+                    await _record_consent(replay_buyer_id, consent_version)
+                replay_body: Dict[str, Any] = {
+                    "purchase_id": replayed,
+                    "status": view.get("state"),
+                    "poll_after_seconds": view.get("poll_after_seconds"),
+                    "checkout_dispatch_state": view["checkout_dispatch_state"],
+                    "contact_reentry_required": view["contact_reentry_required"],
+                }
+                if req.item_source == "cart_link":
+                    # The same additive field the cart-link create answered with. The key's
+                    # request hash covers `item_source`, so a replay is always the same lane.
+                    replay_body["variant_title"] = view.get("variant_title")
+                return JSONResponse(status_code=202, content=replay_body)
+            # An immutable key without an owner-visible row cannot authorize a new attempt.
+            return _not_found()
+        if legacy_retry:
+            # No attempt under this key and fingerprint: a NEW attempt, and a new attempt binds
+            # the money the buyer was shown. Refused before any write.
+            raise svc.PurchaseRefused(
+                "invalid_request", "expected_unit_price_minor and expected_currency are required"
+            )
 
         svc.enforce_pilot_scope(
             agent_id=agent_id, merchant_domain=merchant_domain,
@@ -2881,25 +2871,15 @@ async def start_reap_purchase(
                 market_country=market_country,
             )
         else:
-            try:
-                eligible = await _eligibility(
-                    merchant_domain=merchant_domain,
-                    market_country=market_country,
-                    product_key=product_key,
-                    variant_key=variant_key,
-                )
-            except svc.PurchaseRefused as exc:
-                # The key remembers this refusal, so a retry after the merchant is enabled does
-                # not open a second purchase beside a cart-link one (`_tombstone_idempotency_key`).
-                if idempotency_key and req.expected_unit_price_minor is None:
-                    # A bound-money selection has not passed authoritative money
-                    # admission yet; preserve zero business writes on this path.
-                    await _tombstone_idempotency_key(
-                        agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash,
-                        idempotency_key=idempotency_key, request_hash=request_hash,
-                        reason=exc.reason,
-                    )
-                raise
+            # A refusal here writes nothing, the key included: every attempt that reaches here
+            # carries bound money that has not passed admission yet. (A `refused:` key written before the pair was
+            # required is still honoured by `_replayed_purchase_id`.)
+            eligible = await _eligibility(
+                merchant_domain=merchant_domain,
+                market_country=market_country,
+                product_key=product_key,
+                variant_key=variant_key,
+            )
             row = await _load_catalog_row(
                 merchant_domain=merchant_domain,
                 storefront_host=merchant_host,
@@ -2911,11 +2891,12 @@ async def start_reap_purchase(
             )
 
         facts = cart_facts if cart_facts is not None else row
-        if req.expected_unit_price_minor is not None:
-            actual_minor = facts["our_price_minor"] if isinstance(facts, dict) else facts.our_price_minor
-            actual_currency = facts["currency"] if isinstance(facts, dict) else facts.currency
-            if type(actual_minor) is not int or actual_minor != req.expected_unit_price_minor or actual_currency != req.expected_currency:
-                raise svc.PurchaseRefused("price_changed", "the selected offer money changed")
+        # The money the buyer was shown, against the money this offer has now. Every attempt
+        # that reaches here carries the pair (`legacy_retry` above), so this always runs.
+        actual_minor = facts["our_price_minor"] if isinstance(facts, dict) else facts.our_price_minor
+        actual_currency = facts["currency"] if isinstance(facts, dict) else facts.currency
+        if type(actual_minor) is not int or actual_minor != req.expected_unit_price_minor or actual_currency != req.expected_currency:
+            raise svc.PurchaseRefused("price_changed", "the selected offer money changed")
         svc.enforce_pilot_scope(
             agent_id=agent_id, merchant_domain=(facts["shop_domain"] if isinstance(facts, dict) else facts.merchant_domain),
             market_country=(facts["market_country"] if isinstance(facts, dict) else facts.market_country),
@@ -2984,21 +2965,20 @@ async def start_reap_purchase(
                     offer_code=offer_code,
                 )
 
-                if idempotency_key:
-                    winner = await _claim_idempotency_key(
-                        agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash,
-                        idempotency_key=idempotency_key, purchase_id=purchase_id,
-                        request_hash=request_hash,
+                winner = await _claim_idempotency_key(
+                    agent_id=agent_id, agent_user_ref_hash=agent_user_ref_hash,
+                    idempotency_key=idempotency_key, purchase_id=purchase_id,
+                    request_hash=request_hash,
+                )
+                if winner != purchase_id:
+                    await _abandon_duplicate(purchase_id)
+                    purchase_id = winner
+                    winning_view = await _owner_view(
+                        purchase_id=winner, agent_id=agent_id,
+                        agent_user_ref_hash=agent_user_ref_hash,
                     )
-                    if winner != purchase_id:
-                        await _abandon_duplicate(purchase_id)
-                        purchase_id = winner
-                        winning_view = await _owner_view(
-                            purchase_id=winner, agent_id=agent_id,
-                            agent_user_ref_hash=agent_user_ref_hash,
-                        )
-                        if winning_view is None:
-                            raise _PurchasePersistenceUnavailable()
+                    if winning_view is None:
+                        raise _PurchasePersistenceUnavailable()
         except svc.PurchaseRefused:
             raise
         except Exception as exc:

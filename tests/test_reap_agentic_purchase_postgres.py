@@ -2732,10 +2732,13 @@ def test_create_quantity_strict_recovery_legacy_compatible(quantity):
     from pydantic import ValidationError
     import routes.agent_commerce_reap as route
     body = {"merchant_domain": "brand.example", "product_key": "pk_1", "quantity": quantity,
-            "buyer": {"email": EMAIL, "shipping_address": ADDRESS}}
+            "buyer": {"email": EMAIL, "shipping_address": ADDRESS}, "idempotency_key": "k-qty",
+            "expected_unit_price_minor": 4250, "expected_currency": "USD"}
     with pytest.raises(ValidationError):
         route.StartPurchaseRequest.model_validate(body)
     assert route.RecoverPurchaseRequest.model_validate(body).quantity == 1
+    # Create's ONLY objection is the quantity: the same body with an integer one validates.
+    assert route.StartPurchaseRequest.model_validate({**body, "quantity": 1}).quantity == 1
 
 
 @pytest.mark.parametrize("field,value", [("variant_keys", ["wrong"]), ("currency", "EUR"),

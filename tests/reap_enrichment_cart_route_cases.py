@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -218,15 +219,33 @@ def error_of(resp) -> Optional[str]:
     return None
 
 
+def shown_money(product_key: str, variant_key: Optional[str]) -> Tuple[int, str]:
+    """The unit money the buyer was shown for this selection, as the seeds below price it: a
+    named MAC shade or bluemercury size at its own price, else the product's."""
+    for n, (vid, _handle) in enumerate(MAC_SHADES):
+        if variant_key == f"{MAC_PK}::v:{vid}":
+            return MAC_SHADE_PRICES[n][1], "USD"
+    for sku_key, _vid, _title, price in BM2_SKUS:
+        if variant_key == sku_key:
+            return int(price.replace(".", "")), "USD"
+    return {MAC_PK: (3900, "USD"), MAC_STUB_PK: (2600, "USD"), BM_PK: (3600, "USD"),
+            BM2_PK: (2800, "USD"), JSM_PK: (3200, "SGD")}.get(product_key, (3000, "USD"))
+
+
 def body(*, host: str, product_key: str, variant_key: Optional[str] = None,
-         address: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+         address: Optional[Dict[str, Any]] = None, minor: Optional[int] = None) -> Dict[str, Any]:
     """What the gateway (PIVOTA-Agent #2329) sends for an enrichment row: the catalog keys, the
-    storefront target's host, NO variant_key unless a test says so."""
+    storefront target's host, NO variant_key unless a test says so, a fresh idempotency key and
+    the money the buyer was shown (both required on create)."""
+    shown_minor, shown_currency = shown_money(product_key, variant_key)
     return {
         "merchant_domain": host, "product_key": product_key, "variant_key": variant_key,
         "quantity": 1, "item_source": "cart_link",
         "buyer": {"email": EMAIL, "shipping_address": dict(address or ADDRESS_US),
                   "consent_version": CONSENT},
+        "idempotency_key": f"k-{uuid.uuid4().hex}",
+        "expected_unit_price_minor": minor or shown_minor,
+        "expected_currency": shown_currency,
     }
 
 
@@ -1474,12 +1493,12 @@ async def test_mirror_and_shopify_rows_answer_the_same_with_the_flag_on_or_off(
     monkeypatch.setenv(FLAG, dial)
     if case == "shopify_sole_variant":
         await _seed_shopify()
-        req = body(host=SHOPIFY_DOMAIN, product_key=SHOPIFY_PK)
+        req = body(host=SHOPIFY_DOMAIN, product_key=SHOPIFY_PK, minor=4250)
     else:
         await _seed_mirror(
             merchant="merch_obs_0000000000000000" if case == "mirror_wrong_seller" else LIVE_MERCHANT,
             checked_at="2026-01-01T00:00:00+00:00" if case == "mirror_stale_proof" else None)
-        req = body(host=LIVE_DOMAIN, product_key=LIVE_PK,
+        req = body(host=LIVE_DOMAIN, product_key=LIVE_PK, minor=1399,
                    variant_key=f"{LIVE_PK}::nope" if case == "mirror_named_placeholder_missing" else None)
     seen = spy_statements(monkeypatch)
     resp = await client.post(f"{BASE}/purchases", json=req)

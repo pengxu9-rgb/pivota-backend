@@ -248,6 +248,8 @@ async def test_prepare_witness_create_replay_and_paused_recovery(client, monkeyp
     original = {'item_source': 'cart_link', 'merchant_domain': witness['merchant_domain'],
                 'product_key': witness['product_key'], 'variant_key': witness['variant_key'],
                 'quantity': witness['quantity'], 'idempotency_key': 'owned-prepare-original',
+                'expected_unit_price_minor': witness['unit_price_minor'],
+                'expected_currency': witness['currency'],
                 'return_url': 'https://agent.pivota.cc/reap/return',
                 'buyer': {'email': 'selection@example.test', 'name': 'Selection Verifier',
                           'phone': '+14155550100', 'consent_version': 'selection-test-v1',
