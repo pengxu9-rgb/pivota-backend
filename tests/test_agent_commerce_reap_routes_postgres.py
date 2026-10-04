@@ -112,6 +112,7 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
     _MIGRATIONS_DIR / "255_reap_unopened_attempt_retirements.sql",
+    _MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
 )
 
 #: Same convention as the ledger's gate: this file DROPS its tables, so it must be INCAPABLE of
@@ -2064,10 +2065,14 @@ async def test_the_202_body_is_unchanged_by_canonical_matching(client):
         assert resp.status_code == 202, resp.text
         body = resp.json()
         assert body["purchase_id"].startswith("rp_")
-        assert sorted(body) == ["poll_after_seconds", "purchase_id", "status"]
+        assert sorted(body) == ["checkout_dispatch_state", "contact_reentry_required", "poll_after_seconds", "purchase_id", "status"]
+        assert body["checkout_dispatch_state"] == "not_dispatched"
+        assert body["contact_reentry_required"] is False
         assert {k: v for k, v in body.items() if k != "purchase_id"} == {
             "status": "resolving",
             "poll_after_seconds": svc.POLL_INTERVALS["resolving"],
+            "checkout_dispatch_state": "not_dispatched",
+            "contact_reentry_required": False,
         }
 
 

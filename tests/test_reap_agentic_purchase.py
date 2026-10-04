@@ -1116,11 +1116,10 @@ async def test_a_hostile_checkout_url_never_reaches_the_row(reap, attribution):
     await _step(purchase_id)
     result = await _step(purchase_id)
 
-    assert result.state == "failed"
+    assert result.state == "awaiting_approval"
     row = await _get(purchase_id)
-    assert row["state"] == "failed"
-    assert row["state"] != "awaiting_approval"
-    assert row["last_error_code"] == "checkout_no_hosted_action"
+    assert row["state"] == "awaiting_approval"
+    assert row["last_error_code"] == "checkout_unresolvable:3:checkout_no_hosted_action"
     assert row["hosted_url"] is None
     assert "evilprava.space" not in json.dumps(row, default=str)
 
@@ -2081,9 +2080,9 @@ async def test_a_partner_id_that_could_move_a_request_never_reaches_the_row(
     await _step(purchase_id)
     result = await _step(purchase_id)
 
-    assert result.state == "failed"
+    assert result.state == ("quoting" if field == "create_checkout" else "failed")
     row = await _get(purchase_id)
-    assert row["last_error_code"] == "partner_id_malformed"
+    assert row["last_error_code"] == ("checkout_dispatch_unresolved" if field == "create_checkout" else "partner_id_malformed")
     assert bad not in json.dumps(row, default=str)
 
 
@@ -2123,9 +2122,9 @@ async def test_the_checkout_id_survives_a_no_hosted_action_failure(reap, attribu
     await _step(purchase_id)
     result = await _step(purchase_id)
 
-    assert result.state == "failed"
+    assert result.state == "awaiting_approval"
     row = await _get(purchase_id)
-    assert row["last_error_code"] == "checkout_no_hosted_action"
+    assert row["last_error_code"] == "checkout_unresolvable:3:checkout_no_hosted_action"
     assert row["reap_checkout_id"] == "chk_7f3a"
     assert row["reap_quote_id"] == "f1e2d3c4"
     assert row["hosted_url"] is None
@@ -2146,8 +2145,8 @@ async def test_a_hostile_url_arrives_as_a_client_refusal_not_as_a_missing_action
     await _step(purchase_id)
     result = await _step(purchase_id)
     row = await _get(purchase_id)
-    assert result.state == "failed"
-    assert row["last_error_code"] == "hosted_url_not_allowed"
+    assert result.state == "quoting"
+    assert row["last_error_code"] == "checkout_dispatch_unresolved"
     assert row["last_error_code"] != "checkout_no_hosted_action"
     assert row["hosted_url"] is None
 
@@ -3339,7 +3338,9 @@ async def test_the_staging_sequence_a_returning_buyer_with_an_active_card_now_bu
     # Step 2/3: the link expires; 9 s later Reap says ACTIVE; 28 s after expiry the sweep runs.
     reap.get_enrollment = _ok(_enrollment_active())
     await _age_links(28)
-    assert await ledger.expire_overdue_purchases(enrollment_grace_seconds=0) == [purchase_a]
+    assert await ledger.expire_overdue_purchases(enrollment_grace_seconds=0) == []
+    # Historical terminal attempts exist from older deployments and remain terminal.
+    await database.execute("UPDATE reap_agentic_purchases SET state='expired' WHERE id=:id", {"id":purchase_a})
     assert (await _get(purchase_a))["state"] == "expired"
     [row] = await _enrollments()
     assert (row["id"], row["status"]) == (ours, "pending"), "the staging state: row still pending"
@@ -3386,10 +3387,11 @@ async def test_the_staging_sequence_with_the_grace_a_itself_proceeds(reap):
     assert (await ledger.get_active_enrollment("bref_alice"))["card_last4"] == "7847"
 
 
-async def test_still_requires_action_after_the_grace_the_sweep_expires(reap):
+async def test_still_requires_action_after_grace_is_reconciled_without_terminal_guess(reap):
     purchase_a, _ = await _purchase_a_waiting_on_a_link(reap)
     await _age_links(181)
-    assert await ledger.expire_overdue_purchases() == [purchase_a]
+    assert await ledger.expire_overdue_purchases() == []
+    assert (await _step(purchase_a)).last_error_code == "enrollment_pending"
 
 
 async def test_a_live_pending_link_is_reused_not_reminted(reap):
@@ -3439,12 +3441,12 @@ async def test_a_held_purchase_proceeds_when_reap_turns_active(reap):
 
 @pytest.mark.parametrize(
     "reap_says,seconds_past",
-    [("REQUIRES_ACTION", 400), ("EXPIRED", 400), ("FAILED", -600), ("REVOKED", 9)],
+    [("EXPIRED", 400), ("FAILED", -600), ("REVOKED", 9)],
 )
 async def test_a_dead_pending_enrollment_is_retired_and_a_new_attempt_minted(
     reap, reap_says, seconds_past
 ):
-    """The FRESH-ATTEMPT path. REQUIRES_ACTION past the grace, or a terminal status at any time:
+    """The FRESH-ATTEMPT path. Only an authoritative terminal status at any time:
     the old row goes 'dead', a NEW row (a NEW attempt id, so a new idempotency key at Reap) is
     minted, and B is handed the NEW link — never the dead one."""
     _, old = await _purchase_a_waiting_on_a_link(reap)
@@ -3474,7 +3476,7 @@ async def test_a_dead_pending_enrollment_is_retired_and_a_new_attempt_minted(
 
 async def test_a_stored_link_we_would_not_vouch_for_is_never_reused(reap):
     """REFUSING EXAMPLE: the row's link is re-checked against the allowlist before it is handed
-    to another purchase. One that fails is retired and a fresh attempt minted."""
+    to another purchase. An unsafe link is never reused, and pending enrollment is retained for reconciliation."""
     _, old = await _purchase_a_waiting_on_a_link(reap)
     await database.execute(
         "UPDATE reap_agentic_enrollments SET hosted_url = 'https://evilprava.space/enroll/x' "
@@ -3484,9 +3486,11 @@ async def test_a_stored_link_we_would_not_vouch_for_is_never_reused(reap):
         _enrollment_requires_action("33333333-3333-3333-3333-333333333333")
     )
     purchase_b = await _start()
-    assert (await _step(purchase_b)).state == "needs_enrollment"
+    reap.calls.clear()
+    assert (await _step(purchase_b)).last_error_code == "enrollment_settling"
+    assert reap.named("create_enrollment") == []
     assert "evilprava" not in str((await _get(purchase_b))["hosted_url"])
-    assert (await ledger.get_enrollment_internal(old))["status"] == "dead"
+    assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
 
 
 async def test_an_unknown_status_on_the_pending_enrollment_never_advances(reap):
@@ -3703,7 +3707,7 @@ def test_the_enrollment_grace_dial(monkeypatch, raw, expected):
 
 
 async def test_the_grace_dial_moves_the_services_hold_window(reap, monkeypatch):
-    """With the grace at 0, a link 9 s dead is past it: retired and re-minted, not held."""
+    """Grace 0 cannot turn a hosted deadline into proof of a failed enrollment."""
     monkeypatch.setenv(svc.REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS_ENV, "0")
     _, old = await _purchase_a_waiting_on_a_link(reap)
     await _age_links(9)
@@ -3711,8 +3715,8 @@ async def test_the_grace_dial_moves_the_services_hold_window(reap, monkeypatch):
         _enrollment_requires_action("66666666-6666-6666-6666-666666666666")
     )
     purchase_b = await _start()
-    assert (await _step(purchase_b)).state == "needs_enrollment"
-    assert (await ledger.get_enrollment_internal(old))["status"] == "dead"
+    assert (await _step(purchase_b)).last_error_code == "enrollment_settling"
+    assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
 
 
 # ── review of #2483 at 93f585c26: the five findings, through `advance` on the real ledger ────
@@ -3762,7 +3766,7 @@ async def test_r3_a_create_returning_an_id_we_hold_on_a_dead_row_fails_by_name(r
     `enrollment_id_conflict`, A is not resurrected — and C, the next purchase, gets the same
     named answer instead of an exception."""
     _, old = await _purchase_a_waiting_on_a_link(reap)
-    await _age_links(400)
+    await ledger.mark_enrollment_dead(old, reap_status="EXPIRED")
     for _ in range(2):  # B, then C
         reap.calls.clear()
         purchase = await _start()
@@ -3869,8 +3873,8 @@ async def _race_two_purchases(reap, monkeypatch):
     """Purchase 1 and purchase 2 of ONE buyer, stepped so that 2 runs its WHOLE step between
     1's read of the buyer's pending rows (none) and 1's INSERT — the interleaving two workers
     with two leases can produce in one poll tick."""
-    await _purchase_a_waiting_on_a_link(reap)
-    await _age_links(400)                   # A's link is dead past the grace: both will retire it
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await ledger.mark_enrollment_dead(old, reap_status="EXPIRED")  # Verified terminal fixture.
     reap.create_enrollment = _create_keyed_by_attempt()
     reap.calls.clear()
     first, second = await _start(), await _start()
@@ -3978,7 +3982,7 @@ async def test_an_active_newer_pending_row_wins_over_a_live_older_one(reap):
 
 async def test_r2_a_pending_link_with_no_expiry_is_not_reused_for_ever(reap):
     """THE REVIEWER'S REPRO. A link stored without an expiry, 7200 s old: dated from created_at
-    + Reap's 15-minute session, it is long dead — retired, and a NEW attempt is minted."""
+    + Reap's 15-minute session, it cannot be reused, but a clock cannot establish a provider terminal."""
     _, old = await _purchase_a_waiting_on_a_link(reap)
     await database.execute(
         "UPDATE reap_agentic_enrollments SET hosted_url_expires_at = NULL WHERE id = :i",
@@ -3990,9 +3994,11 @@ async def test_r2_a_pending_link_with_no_expiry_is_not_reused_for_ever(reap):
                                     url="https://pay.prava.space/enroll/FRESH")
     )
     purchase = await _start()
-    assert (await _step(purchase)).state == "needs_enrollment"
-    assert (await _get(purchase))["hosted_url"] == "https://pay.prava.space/enroll/FRESH"
-    assert (await ledger.get_enrollment_internal(old))["status"] == "dead"
+    reap.calls.clear()
+    assert (await _step(purchase)).last_error_code == "enrollment_settling"
+    assert (await _get(purchase))["hosted_url"] is None
+    assert reap.named("create_enrollment") == []
+    assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
 
 
 async def test_a_young_pending_link_with_no_expiry_is_reused_with_an_estimated_expiry(reap):
@@ -4490,7 +4496,7 @@ async def test_contact_cap_needs_enrollment_cannot_resume_quote(reap):
     reap.calls.clear()
     await _step(pid)
     await _step(pid)
-    assert reap.calls == []
+    assert reap.sequence() == ["get_enrollment"]
     assert (await _get(pid))['state'] == 'needs_enrollment'
     assert await ledger.count_contact_retention_blocked() == 1
 
@@ -5316,7 +5322,7 @@ async def test_scope_pause_attempt_exempt_claim_timestamp_generation(monkeypatch
     monkeypatch.setattr(httpx, "AsyncClient", Client)
     monkeypatch.setattr(rc, "get_enrollment", _PILOT_REAL_GET_ENROLLMENT)
     result = await svc.advance(purchase, "fence-worker")
-    assert dispatched == [] and result.outcome == "lost_claim"
+    assert len(dispatched) == (1 if state == "needs_enrollment" else 0) and result.outcome == "lost_claim"
     after = await ledger.get_purchase_internal(purchase)
     for field in ["attempts", "claimed_by", "claimed_at", "state", "last_error_code", "next_poll_at"]:
         assert after[field] == captured[field], field
