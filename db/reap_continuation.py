@@ -127,10 +127,31 @@ WHERE id=:id AND state='quoting' AND claimed_by=:worker AND claimed_at=:claimed_
 RETURNING id
 """
 
+class UnsentKeyReplayed(Exception):
+    """The quote/enrollment pair maps to a key whose only receipt is a LOCAL not-dispatched one.
+
+    Raised before any write. The key is still never dispatched a second time (its journal could
+    not represent that send), but nothing was sent under it either, so this is not human work:
+    the caller waits out the quote's idempotency window and re-quotes under a new quote id.
+    """
+
+
+_UNSENT_REPLAY = """
+SELECT 1 FROM reap_checkout_dispatch_events n
+WHERE n.purchase_id=:id AND n.dispatch_key=:key AND n.event_type='not_created'
+  AND substr(COALESCE(n.provider_code,''),1,21)='local_not_dispatched:'
+  AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events o
+                  WHERE o.purchase_id=:id AND o.event_type='observed')
+"""
+
+
 async def begin_dispatch(row, worker, *, quote_id, enrollment_id, enrollment_row_id, total, expires):
     """Atomically fence this exact dispatch and append immutable intent before any network call."""
     from db import reap_agentic_ledger as ledger
     key = hashlib.sha256(json.dumps([row['id'],quote_id,enrollment_id],separators=(',',':')).encode()).hexdigest()
+    if await database.fetch_one(_UNSENT_REPLAY, {'id':row['id'],'key':key}):
+        # Evidence is append-only, so this answer cannot be invalidated by a later write.
+        raise UnsentKeyReplayed()
     async with database.transaction():
         changed = await database.fetch_one(_BEGIN, {
             'id':row['id'], 'worker':worker, 'claimed_at':ledger._bind_dt(row.get('claimed_at')),
@@ -155,6 +176,10 @@ async def record_dispatch_response(row, worker, *, key, quote_id, enrollment_id,
     """
     from services import reap_agentic_purchase as svc
     observed = svc._partner_id(checkout.data.get('id'), what='checkout') if checkout.ok else None
+    if not checkout.ok and checkout.error == 'hosted_url_not_allowed':
+        # A refused hosted action is still a CREATED checkout. Its validated id is evidence;
+        # the URL never reached this module and is never stored.
+        observed = svc._partner_id(getattr(checkout, 'refused_checkout_id', None), what='checkout')
     codes = {str(checkout.error_code or ''), str(checkout.error_detail_code or '')}
     negative = None
     if not checkout.ok:
@@ -172,6 +197,30 @@ async def record_dispatch_response(row, worker, *, key, quote_id, enrollment_id,
             await database.execute(_PRESERVE_OBSERVED_FENCE, {'id':row['id'],'key':key})
         if negative:
             await database.fetch_one(_CLEAR_NEGATIVE, {'id':row['id'],'worker':worker,'key':key,'claimed_at':svc.ledger._bind_dt(row.get('claimed_at'))})
+
+# Journal codes for a create the client proved never left the process. Prefixed so no provider
+# code can collide with them; the suffix is the client's bounded `DispatchProbe.reason`.
+NOT_DISPATCHED_PREFIX = 'local_not_dispatched:'
+
+
+async def record_not_dispatched(row, worker, *, key, quote_id, enrollment_id, probe):
+    """The local negative receipt: the client settled `probe` before its transport call.
+
+    Same release rule as a provider rejection -- a `not_created` event for this exact key, then
+    the fenced clear -- with a local, provable reason instead of a provider code. A probe that
+    is unsettled or saw the send line is never negative proof, so this writes nothing for it.
+    The key is still never dispatched again (`begin_dispatch` refuses a key with a `started`).
+    """
+    from services import reap_agentic_purchase as svc
+    if not getattr(probe, 'not_dispatched', False):
+        return False
+    code = (NOT_DISPATCHED_PREFIX + str(probe.reason or 'local_error'))[:64]
+    async with database.transaction():
+        await database.execute(_APPEND, {'id':row['id'],'key':key,'event':'not_created','quote':quote_id,
+                                         'enrollment':enrollment_id,'checkout':None,'code':code})
+        cleared = await database.fetch_one(_CLEAR_NEGATIVE, {'id':row['id'],'worker':worker,'key':key,
+                                           'claimed_at':svc.ledger._bind_dt(row.get('claimed_at'))})
+    return cleared is not None
 
 _LOCK_RESPONSE = """
 UPDATE reap_agentic_purchases SET checkout_dispatch_key=checkout_dispatch_key

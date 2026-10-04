@@ -483,6 +483,8 @@ def is_sandbox_base_url(raw: Optional[str] = None) -> bool:
 #: does not mint a second quote) without the one we do not (a request tomorrow is not a retry).
 #: Four minutes, so a replayed key can only ever return a quote that is still inside its window.
 _IDEMPOTENCY_BUCKET_S = 240
+#: Public name for callers that must wait a quote replay out (see `_checkout_from_quote`).
+QUOTE_IDEMPOTENCY_BUCKET_S = _IDEMPOTENCY_BUCKET_S
 
 
 def idempotency_key(
@@ -1826,6 +1828,58 @@ class ReapResponse:
     #: caller is a poll step, and waiting inside it holds a lease and a worker. The spec sends it
     #: with 503 QUOTE_TEMPORARILY_UNAVAILABLE and CHECKOUT_TEMPORARILY_UNAVAILABLE.
     retry_after_seconds: Optional[int] = None
+    #: The validated `id` of a checkout the partner reports it CREATED, carried out of a 200 that
+    #: `_refuse_unsafe_hosted_url` refused (`error="hosted_url_not_allowed"`). Set only by
+    #: `create_checkout`, and only when `_path_id` accepts it. The refusal still drops `.data`, so
+    #: the hosted URL is never here; this is the one value from that body that names a real
+    #: checkout, and dropping it dropped the only pointer to a resource that exists at Reap.
+    refused_checkout_id: Optional[str] = None
+
+
+class DispatchProbe:
+    """Whether a create's request PROVABLY never left this process. Write-once, client-owned.
+
+    `create_checkout` settles it on every return and on every exception it raises.
+    `not_dispatched` is True only if `_post` never reached `mark_sending`, which sits after the
+    last local stop (the permission re-check, the header build) and immediately before the
+    transport call. From that line on any byte may be on the wire, and nothing turns the answer
+    back. A probe that is never settled (a fake client, a cancellation) reads
+    `not_dispatched=False`: unknown is never negative proof.
+    """
+
+    __slots__ = ("_sending", "_settled", "not_dispatched", "reason")
+
+    def __init__(self) -> None:
+        self._sending = False
+        self._settled = False
+        self.not_dispatched = False
+        self.reason: Optional[str] = None
+
+    def mark_sending(self) -> None:
+        self._sending = True
+        self.not_dispatched = False
+        self.reason = None
+
+    def settle(self, outcome: Any) -> None:
+        if self._settled:
+            return
+        self._settled = True
+        if not self._sending:
+            self.not_dispatched = True
+            self.reason = _not_dispatched_reason(outcome)
+
+
+def _not_dispatched_reason(outcome: Any) -> str:
+    """A bounded local vocabulary for the dispatch journal; never an exception message."""
+    if isinstance(outcome, ProviderOperationStopped):
+        return "provider_operation_stopped"
+    if isinstance(outcome, ReapConfigError):
+        return "reap_config_error"
+    if isinstance(outcome, ReapRequestError):
+        return "reap_request_error"
+    if isinstance(outcome, ReapResponse) and outcome.error == "reap_client_not_configured":
+        return "reap_client_not_configured"
+    return "local_error"
 
 
 async def _read_bounded(response: Any, *, max_bytes: int = MAX_RESPONSE_BYTES) -> Optional[bytes]:
@@ -1886,6 +1940,7 @@ async def _post(
     timeout_seconds: Optional[float] = None,
     idempotency_extra: Optional[Dict[str, Any]] = None,
     extra_headers: Optional[Dict[str, str]] = None,
+    dispatch_probe: Optional[DispatchProbe] = None,
 ) -> ReapResponse:
     """One POST. Returns a result; raises only on misconfiguration.
 
@@ -1927,11 +1982,15 @@ async def _post(
             # Opening the client is asynchronous; the stop may have changed
             # since this operation entered. Check again at the dispatch boundary.
             _check_worker_provider_permission()
-            async with client.stream(
-                "POST", f"{url}{path}", json=body,
-                headers=_headers(key, path, body, idempotency_extra=idempotency_extra,
-                                 extra_headers=extra_headers),
-            ) as resp:
+            headers = _headers(key, path, body, idempotency_extra=idempotency_extra,
+                               extra_headers=extra_headers)
+            # THE DISPATCH LINE. Everything above is local and can stop without a byte sent;
+            # everything below may have reached Reap. Nothing that can refuse locally may move
+            # below it, and nothing that can send may move above it -- `DispatchProbe` turns
+            # "never reached this line" into the journal's proof that no checkout was created.
+            if dispatch_probe is not None:
+                dispatch_probe.mark_sending()
+            async with client.stream("POST", f"{url}{path}", json=body, headers=headers) as resp:
                 if resp.status_code >= 400:
                     # The response BODY is deliberately not logged or returned to a serving
                     # caller: a partner's error payload can echo the request, and the request can
@@ -3325,7 +3384,7 @@ def _next_action_is_unsafe(node: Any) -> bool:
     return not hosted_url_is_allowed(action.get("url"))
 
 
-def _refuse_unsafe_hosted_url(result: ReapResponse) -> ReapResponse:
+def _refuse_unsafe_hosted_url(result: ReapResponse, *, keep_checkout_id: bool = False) -> ReapResponse:
     """A 200 whose `nextAction.url` we cannot vouch for is a REFUSAL, not a warning.
 
     The response is replaced rather than annotated, and `data` is dropped: a caller handed the
@@ -3337,10 +3396,20 @@ def _refuse_unsafe_hosted_url(result: ReapResponse) -> ReapResponse:
     list response was a fifth call site that nothing guarded, and a single poisoned element
     arrived with `ok=True` and its URL intact in `.data`. A guard applied to four of five sites
     is not a guard; it is a note about four of them.
+
+    `keep_checkout_id` (checkout create only): the refused 200 still CREATED a checkout, so its
+    `id` -- validated by `_path_id`, the rule every later read of it uses -- rides out on
+    `refused_checkout_id`. Nothing else from the body does, and never the URL.
     """
     if not result.ok:
         return result
     data = result.data if isinstance(result.data, dict) else {}
+    refused_id: Optional[str] = None
+    if keep_checkout_id:
+        try:
+            refused_id = _path_id(data.get("id"), what="checkout")
+        except ReapRequestError:
+            refused_id = None
     items = data.get("items")
     if items is not None and not isinstance(items, list):
         # Same rule as a non-dict `nextAction`, and missed for the same reason: the old
@@ -3349,13 +3418,15 @@ def _refuse_unsafe_hosted_url(result: ReapResponse) -> ReapResponse:
         # carried a hostile action straight through with ok=True. Anything we cannot walk, we
         # refuse; we do not get to decide a shape we do not recognise is harmless.
         logger.warning("reap returned a non-list `items`; refusing the response")
-        return ReapResponse(ok=False, status=result.status, error="hosted_url_not_allowed")
+        return ReapResponse(ok=False, status=result.status, error="hosted_url_not_allowed",
+                            refused_checkout_id=refused_id)
     candidates = [data] + (list(items) if isinstance(items, list) else [])
     if any(_next_action_is_unsafe(node) for node in candidates):
         # The URL itself is not logged: it came from a partner and it is the untrusted value.
         logger.warning("reap returned a hosted action we will not pass to a buyer; "
                        "refusing the response")
-        return ReapResponse(ok=False, status=result.status, error="hosted_url_not_allowed")
+        return ReapResponse(ok=False, status=result.status, error="hosted_url_not_allowed",
+                            refused_checkout_id=refused_id)
     return result
 
 
@@ -3709,6 +3780,7 @@ async def create_checkout(
     enrollment_id: str,
     return_url: str,
     timeout_seconds: Optional[float] = None,
+    dispatch_probe: Optional[DispatchProbe] = None,
 ) -> ReapResponse:
     """`POST /agentic/checkouts`. Already in the slow-path set: it is the leg that talks to the
     merchant, and it carries the quote's 35 s bound rather than the 12 s default.
@@ -3721,7 +3793,28 @@ async def create_checkout(
     opened without are different requests to Reap. Keyed on the body alone, a replay after the
     dial was toggled would either hit IDEMPOTENT_PARAMETER_MISMATCH or silently return the other
     checkout. With the dial unset the material -- and so the key -- is exactly what it was.
+
+    `dispatch_probe`, when given, is SETTLED on every return and every exception raised here:
+    `not_dispatched` is then True exactly when the request never reached the transport call in
+    `_post` (see `DispatchProbe`). The caller journals that as its proof that nothing was created.
     """
+    probe = dispatch_probe if dispatch_probe is not None else DispatchProbe()
+    try:
+        result = await _create_checkout(
+            quote_id=quote_id, enrollment_id=enrollment_id, return_url=return_url,
+            timeout_seconds=timeout_seconds, probe=probe,
+        )
+    except Exception as exc:
+        probe.settle(exc)
+        raise
+    probe.settle(result)
+    return result
+
+
+async def _create_checkout(
+    *, quote_id: str, enrollment_id: str, return_url: str,
+    timeout_seconds: Optional[float], probe: DispatchProbe,
+) -> ReapResponse:
     body = build_checkout_request(
         quote_id=quote_id, enrollment_id=enrollment_id, return_url=return_url
     )
@@ -3737,7 +3830,9 @@ async def create_checkout(
             extra_headers=simulate,
             idempotency_extra=(
                 {"simulate": simulate[SIMULATE_CHECKOUT_HEADER]} if simulate else None),
-        )
+            dispatch_probe=probe,
+        ),
+        keep_checkout_id=True,
     )
 
 
