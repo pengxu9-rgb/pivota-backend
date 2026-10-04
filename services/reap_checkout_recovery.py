@@ -144,19 +144,65 @@ async def resolve_checkout_manually(purchase_id: str, *, evidence: Mapping[str, 
 #   checkout_found         a checkout exists. Attach its id and continue exactly as a create
 #                          that returned no hosted action: awaiting_approval, no link, the
 #                          existing `checkout_no_hosted_action` review code, polled now, so the
-#                          worker's ordinary checkout read decides the outcome from Reap.
+#                          worker's ordinary checkout read decides the outcome from Reap. A
+#                          COMPLETED read on such a row goes to a human (OPERATOR_FOUND_COMPLETED).
 #   confirmed_not_created  Reap has no checkout for this key. Append the same `not_created`
 #                          receipt the fence already honours and release through that fence, so
 #                          the normal flow resumes (or ends) as after Reap's own explicit rejection.
+# Neither may run while the original create can still be in flight: see `dispatch_settle_seconds`.
 # Legacy rows with no tracking version have no key or journal and are listed, never resolved here.
 
 PARKED_OUTCOMES = frozenset({"checkout_found", "confirmed_not_created"})
 _DISPATCH_KEY = re.compile(r"^[0-9a-f]{64}$")
-_RESOLVED_CODE = {"checkout_found": "OPERATOR_CHECKOUT_FOUND",
+_RESOLVED_CODE = {"checkout_found": continuation.OPERATOR_CHECKOUT_FOUND,
                   "confirmed_not_created": "OPERATOR_CONFIRMED_NOT_CREATED"}
 #: What a create with a valid id and no safe hosted action writes (services/reap_agentic_purchase).
 _NO_HOSTED_ACTION = "checkout_unresolvable:3:checkout_no_hosted_action"
 _RELEASED_CODE = "checkout_dispatch_not_created"
+#: Beyond the lease and the client's timeout ceiling: httpx applies that timeout per phase.
+_SETTLE_MARGIN_SECONDS = 600
+
+
+def dispatch_settle_seconds() -> int:
+    """How long after `started` the original POST can still produce a checkout at Reap.
+
+    A late row in a claim batch can send its create near the end of its lease; the requeue then
+    frees the claim, another worker parks the row, and the late response still appends `observed`
+    (it is unfenced by design). So: the LONGEST lease the poll job accepts, plus the client's
+    timeout ceiling, plus a margin. Before then, no operator outcome is safe.
+    """
+    from jobs.reap_agentic_purchase_poll import DIALS  # lazy: the job imports this rail's services
+    return DIALS["lease_seconds"].maximum + int(rc._MAX_ENV_TIMEOUT_S) + _SETTLE_MARGIN_SECONDS
+
+
+def _settle_sql():
+    """(earliest-allowed expression over journal alias `e`, the DB clock it is compared with).
+
+    `recorded_at` is a zoneless CURRENT_TIMESTAMP: session-zone wall time on Postgres (so it is
+    read back AT that zone) and UTC text on SQLite.
+    """
+    if IS_POSTGRES:
+        return ("((e.recorded_at + (:settle * INTERVAL '1 second')) AT TIME ZONE current_setting('TimeZone'))",
+                "clock_timestamp()")
+    return "datetime(e.recorded_at, :settle_window)", "CURRENT_TIMESTAMP"
+
+
+def _settle_values():
+    seconds = dispatch_settle_seconds()
+    return {"settle": seconds} if IS_POSTGRES else {"settle_window": f"+{seconds} seconds"}
+
+
+async def _earliest_allowed(purchase_id: str, dispatch_key: str):
+    """Measured from the purchase's LATEST `started`, whatever its key; None until this key has one."""
+    earliest, now = _settle_sql()
+    row = await database.fetch_one(
+        f"SELECT {earliest} AS earliest, ({earliest} <= {now}) AS settled FROM reap_checkout_dispatch_events e"
+        " WHERE e.purchase_id=:id AND e.event_type='started'"
+        " AND EXISTS (SELECT 1 FROM reap_checkout_dispatch_events k WHERE k.purchase_id=:id"
+        " AND k.dispatch_key=:key AND k.event_type='started')"
+        " ORDER BY e.recorded_at DESC LIMIT 1",
+        {"id": purchase_id, "key": dispatch_key, **_settle_values()})
+    return (svc._parse_ts(row["earliest"]), bool(row["settled"])) if row else (None, False)
 
 
 async def _journal(purchase_id: str):
@@ -170,7 +216,8 @@ async def list_parked_dispatches(*, limit: int = 50):
     """Read-only operator view of the parked-create cohort `count_checkout_needs_human` counts.
 
     Partner and journal identifiers only: no buyer contact, buyer reference or URL. Pass a row's
-    `updated_at` back as `expected_updated_at`. `age_seconds` is the time spent in 'quoting'.
+    `updated_at` back as `expected_updated_at`. `age_seconds` is the time spent in 'quoting';
+    `earliest_resolution_at` is when the original create can no longer be in flight (UTC).
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
         raise ValueError("limit must be an int in 1..500")
@@ -186,6 +233,7 @@ async def list_parked_dispatches(*, limit: int = 50):
         key = row["checkout_dispatch_key"]
         events = await _journal(row["id"])
         started = next((e for e in events if e["dispatch_key"] == key and e["event_type"] == "started"), None)
+        earliest = (await _earliest_allowed(row["id"], key))[0] if started else None
         # Journal `recorded_at` is a zoneless server timestamp; age uses the zoned state clock.
         since = svc._parse_ts(row["state_entered_at"])
         parked.append({
@@ -199,11 +247,22 @@ async def list_parked_dispatches(*, limit: int = 50):
                         "checkout_id": e["checkout_id"], "provider_code": e["provider_code"],
                         "recorded_at": e["recorded_at"]} for e in events],
             "age_seconds": int((now - since).total_seconds()) if since else None,
+            "earliest_resolution_at": earliest,
             "claimed": row["claimed_by"] is not None,
             "last_error_code": row["last_error_code"],
             "updated_at": svc._parse_ts(row["updated_at"]),
         })
     return parked
+
+
+def _bound_payload(evidence: Mapping[str, Any], checkout_id: str, quote_id: str):
+    """An authenticated Reap read must name this checkout AND this dispatch's quote."""
+    if evidence["source"] != "authenticated_reap_checkout_read":
+        return None
+    payload = evidence.get("payload")
+    if not isinstance(payload, Mapping) or payload.get("id") != checkout_id or payload.get("quoteId") != quote_id:
+        raise ManualResolutionRefused("evidence_checkout_not_bound_to_dispatch")
+    return {"id": checkout_id, "quoteId": quote_id}
 
 
 async def resolve_parked_dispatch(purchase_id: str, *, dispatch_key: str, outcome: str,
@@ -214,7 +273,11 @@ async def resolve_parked_dispatch(purchase_id: str, *, dispatch_key: str, outcom
 
     Never called by the worker, a route, an agent or a buyer. Same authority as
     `resolve_checkout_manually`: verified evidence, opaque operator handle, CAS on `updated_at`,
-    no live claim, one transaction. An exact replay is read-only; different evidence refuses.
+    no live claim, one transaction. Refused until `dispatch_settle_seconds` after the purchase's
+    latest `started`, and the evidence must be observed after that too. An exact replay is
+    read-only; different evidence refuses. One exception, once per key: a confirmed_not_created
+    may be superseded when this key is parked again after it (a late `observed` receipt, which
+    is the only way checkout_found can overturn it, or a same-quote re-park).
     """
     if outcome not in PARKED_OUTCOMES:
         raise ManualResolutionRefused("outcome_invalid")
@@ -227,24 +290,46 @@ async def resolve_parked_dispatch(purchase_id: str, *, dispatch_key: str, outcom
         if row is None:
             raise ManualResolutionRefused("purchase_missing")
         reference, observed_at, origin = _attestation(row, evidence, operator_ref)
+        events = await _journal(purchase_id)
+        started = next((e for e in events if e["dispatch_key"] == dispatch_key and e["event_type"] == "started"), None)
 
-        def digest(checkout, source):
+        def digest(checkout, source, bound):
             return hashlib.sha256(json.dumps({"outcome": outcome, "dispatch_key": dispatch_key, "checkout_id": checkout,
-                "checkout_id_source": source, "source": evidence["source"], "reference": reference,
+                "checkout_id_source": source, "source": evidence["source"], "reference": reference, "payload": bound,
                 "observed_at": observed_at.isoformat(), "origin": origin}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
         # Replay first: the row (and a later dispatch under a new key) may have moved on since.
-        audit = await database.fetch_one(
-            "SELECT outcome,operator_ref,evidence_sha256,reap_checkout_id,checkout_id_source"
-            " FROM reap_checkout_dispatch_resolution_audit WHERE purchase_id=:id AND dispatch_key=:key",
-            {"id": purchase_id, "key": dispatch_key})
-        if audit is not None:
-            same_id = checkout_id is None or svc._partner_id(checkout_id, what="checkout") == audit["reap_checkout_id"]
-            if (same_id and audit["outcome"] == outcome and audit["operator_ref"] == operator_ref
-                    and audit["evidence_sha256"] == digest(audit["reap_checkout_id"], audit["checkout_id_source"])):
+        audits = [dict(a) for a in await database.fetch_all(
+            "SELECT outcome,operator_ref,evidence_sha256,reap_checkout_id,checkout_id_source,decision_seq"
+            " FROM reap_checkout_dispatch_resolution_audit WHERE purchase_id=:id AND dispatch_key=:key"
+            " ORDER BY decision_seq", {"id": purchase_id, "key": dispatch_key})]
+        for mine in (a for a in audits if a["outcome"] == outcome and a["operator_ref"] == operator_ref):
+            if checkout_id is not None and svc._partner_id(checkout_id, what="checkout") != mine["reap_checkout_id"]:
+                continue
+            try:
+                bound = (_bound_payload(evidence, mine["reap_checkout_id"], started["quote_id"])
+                         if mine["reap_checkout_id"] and started else None)
+            except ManualResolutionRefused:
+                continue
+            if mine["evidence_sha256"] == digest(mine["reap_checkout_id"], mine["checkout_id_source"], bound):
                 return {"status": "already_resolved", "outcome": outcome, "state": row["state"], "dry_run": dry_run}
-            raise ManualResolutionRefused("dispatch_already_resolved")
-        events = await _journal(purchase_id)
+        supersedes = None
+        if audits:
+            # A not-created decision clears the key, so finding this key parked again is new dispatch
+            # evidence after it: a late `observed` receipt, or a re-park (the same quote replayed;
+            # `begin_dispatch` re-fences the key and sends nothing). Either may be decided once more.
+            latest = audits[-1]
+            decision = next((e for e in events if e["dispatch_key"] == dispatch_key and e["event_type"] == "resolved"), None)
+            late = decision is not None and any(
+                e["dispatch_key"] == dispatch_key and e["event_type"] == "observed"
+                and svc._parse_ts(e["recorded_at"]) >= svc._parse_ts(decision["recorded_at"]) for e in events)
+            reparked = row.get("state") == "quoting" and row.get("checkout_dispatch_key") == dispatch_key
+            if latest["outcome"] != "confirmed_not_created" or not (
+                    (outcome == "checkout_found" and late) or (outcome == "confirmed_not_created" and reparked)):
+                raise ManualResolutionRefused("dispatch_already_resolved")
+            if len(audits) > 1 or any(e["dispatch_key"] == dispatch_key and e["event_type"] == "superseded" for e in events):
+                raise ManualResolutionRefused("dispatch_resolution_limit_reached")
+            supersedes = "confirmed_not_created"
         observed = [e for e in events if e["event_type"] == "observed"]
         if any(e["dispatch_key"] != dispatch_key for e in observed) or len({e["checkout_id"] for e in observed}) > 1:
             raise ManualResolutionRefused("observed_evidence_conflict")
@@ -272,20 +357,36 @@ async def resolve_parked_dispatch(purchase_id: str, *, dispatch_key: str, outcom
             raise ManualResolutionRefused("parked_dispatch_required")
         if row.get("checkout_dispatch_key") != dispatch_key or row.get("reap_checkout_id") or row.get("reap_order_id"):
             raise ManualResolutionRefused("parked_dispatch_required")
-        started = next((e for e in events if e["dispatch_key"] == dispatch_key and e["event_type"] == "started"), None)
         if started is None:
             raise ManualResolutionRefused("dispatch_journal_missing")
+        bound = _bound_payload(evidence, checkout_id, started["quote_id"]) if checkout_id else None
+        earliest, settled = await _earliest_allowed(purchase_id, dispatch_key)
+        if not settled or earliest is None:
+            raise ManualResolutionRefused("dispatch_may_still_be_in_flight")
+        if observed_at < earliest:
+            raise ManualResolutionRefused("evidence_predates_dispatch_settlement")
         if row.get("claimed_by") is not None or svc._parse_ts(row.get("updated_at")) != svc._parse_ts(expected_updated_at):
             raise ManualResolutionRefused("stale_or_claimed_purchase")
+        if checkout_id and await database.fetch_val(
+                "SELECT 1 FROM reap_agentic_purchases WHERE reap_checkout_id=:checkout AND id<>:id",
+                {"checkout": checkout_id, "id": purchase_id}):
+            raise ManualResolutionRefused("checkout_id_attached_to_another_purchase")
         if dry_run:
             return {"status": "eligible", "outcome": outcome, "state": "quoting", "proposed_state": target, "dry_run": True}
         holder = "manual:" + uuid4().hex
         clock = "clock_timestamp()" if IS_POSTGRES else "CURRENT_TIMESTAMP"
+        settle_at, settle_now = _settle_sql()
         claimed = await database.fetch_one(f"""UPDATE reap_agentic_purchases SET claimed_by=:holder,claimed_at={clock}
             WHERE id=:id AND state='quoting' AND dispatch_tracking_version=1 AND checkout_dispatch_key=:key
             AND reap_checkout_id IS NULL AND reap_order_id IS NULL
-            AND updated_at=:updated AND claimed_by IS NULL RETURNING id""",
-            {"holder": holder, "id": purchase_id, "key": dispatch_key, "updated": ledger._bind_dt(expected_updated_at)})
+            AND updated_at=:updated AND claimed_by IS NULL
+            AND EXISTS (SELECT 1 FROM reap_checkout_dispatch_events k WHERE k.purchase_id=:id
+                        AND k.dispatch_key=:key AND k.event_type='started')
+            AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events e WHERE e.purchase_id=:id
+                            AND e.event_type='started' AND NOT ({settle_at} <= {settle_now}))
+            RETURNING id""",
+            {"holder": holder, "id": purchase_id, "key": dispatch_key, "updated": ledger._bind_dt(expected_updated_at),
+             **_settle_values()})
         if claimed is None:
             raise ManualResolutionRefused("compare_and_swap_lost")
         fenced = await ledger.get_purchase_internal(purchase_id)
@@ -293,10 +394,16 @@ async def resolve_parked_dispatch(purchase_id: str, *, dispatch_key: str, outcom
         if outcome == "confirmed_not_created":
             # The receipt the existing fence honours; `ON CONFLICT DO NOTHING` keeps Reap's own.
             await database.execute(continuation._APPEND, {**append, "event": "not_created", "checkout": None, "code": _RESOLVED_CODE[outcome]})
-        await database.execute(continuation._APPEND, {**append, "event": "resolved", "checkout": checkout_id, "code": _RESOLVED_CODE[outcome]})
+        await database.execute(continuation._APPEND, {**append, "event": "superseded" if supersedes else "resolved",
+                                                      "checkout": checkout_id, "code": _RESOLVED_CODE[outcome]})
         if outcome == "checkout_found":
-            moved = await svc._move(fenced, holder, ["quoting"], "awaiting_approval", reap_checkout_id=checkout_id,
-                                    last_error_code=_NO_HOSTED_ACTION, next_poll_at=svc._now())
+            try:
+                moved = await svc._move(fenced, holder, ["quoting"], "awaiting_approval", reap_checkout_id=checkout_id,
+                                        last_error_code=_NO_HOSTED_ACTION, next_poll_at=svc._now())
+            except Exception as exc:
+                if ledger._is_unique_violation(exc):
+                    raise ManualResolutionRefused("checkout_id_attached_to_another_purchase") from exc
+                raise
             if moved.outcome != "advanced":
                 raise ManualResolutionRefused("transition_fence_lost")
             released = await ledger.release_claim(purchase_id, holder)
@@ -310,9 +417,12 @@ async def resolve_parked_dispatch(purchase_id: str, *, dispatch_key: str, outcom
             raise ManualResolutionRefused("release_fence_lost")
         await database.execute("""INSERT INTO reap_checkout_dispatch_resolution_audit
             (purchase_id,dispatch_key,outcome,reap_checkout_id,checkout_id_source,resolved_state,operator_ref,evidence_source,
-             evidence_reference,evidence_sha256,expected_updated_at,evidence_observed_at,provider_base_url)
-            VALUES (:id,:key,:outcome,:checkout,:source,:target,:operator,:evidence_source,:reference,:sha,:expected,:observed,:origin)""",
+             evidence_reference,evidence_sha256,expected_updated_at,evidence_observed_at,provider_base_url,decision_seq,supersedes_outcome)
+            VALUES (:id,:key,:outcome,:checkout,:source,:target,:operator,:evidence_source,:reference,:sha,:expected,:observed,:origin,:seq,:supersedes)""",
             {"id": purchase_id, "key": dispatch_key, "outcome": outcome, "checkout": checkout_id, "source": source,
              "target": target, "operator": operator_ref, "evidence_source": evidence["source"], "reference": reference,
-             "sha": digest(checkout_id, source), "expected": ledger._bind_dt(expected_updated_at), "observed": ledger._bind_dt(observed_at), "origin": origin})
-        return {"status": "resolved", "outcome": outcome, "state": target, "dry_run": False}
+             "sha": digest(checkout_id, source, bound), "expected": ledger._bind_dt(expected_updated_at),
+             "observed": ledger._bind_dt(observed_at), "origin": origin, "seq": 2 if supersedes else 1,
+             "supersedes": supersedes})
+        return {"status": "resolved", "outcome": outcome, "state": target, "dry_run": False,
+                **({"supersedes": supersedes} if supersedes else {})}

@@ -1876,19 +1876,32 @@ operator shell.
 1. **Find candidates.** `await services.reap_checkout_recovery.list_parked_dispatches()` is
    read-only. Each entry has `purchase_id`, `classification` (`dispatch_started`, or
    `legacy_unknown`), `dispatch_key`, `quote_id`, `reap_enrollment_id` (Reap's enrollment id),
-   `observed_checkout_ids`, the journal `events`, `age_seconds` (time in `quoting`), `claimed`,
-   `last_error_code` and `updated_at`. It returns no buyer contact, buyer reference or URL.
-   This tool does not resolve `legacy_unknown` rows. Escalate them to engineering.
-2. **Look the dispatch up at Reap.**
+   `observed_checkout_ids`, the journal `events`, `age_seconds` (time in `quoting`),
+   `earliest_resolution_at`, `claimed`, `last_error_code` and `updated_at`. It returns no buyer
+   contact, buyer reference or URL. This tool does not resolve `legacy_unknown` rows. Escalate
+   them to engineering. The tool keys on the dispatch key and journal, not on
+   `last_error_code`, so a `checkout_created_hosted_url_refused` park is handled the same way.
+2. **Wait for `earliest_resolution_at`.** The original create can still be in flight long after
+   the row parks. A late row in a claim batch can send near the end of its lease. The requeue
+   then frees it, another worker parks it, and the late response still records `observed`.
+   Both outcomes are refused (`dispatch_may_still_be_in_flight`) until
+   `dispatch_settle_seconds()` after the purchase's latest `started` event. That is the longest
+   lease the poll job accepts (3600 s), plus the client's timeout ceiling (120 s), plus a 600 s
+   margin: 72 minutes today. Evidence observed before that time is refused too
+   (`evidence_predates_dispatch_settlement`). Do the Reap lookup after it.
+3. **Look the dispatch up at Reap.**
    - If `observed_checkout_ids` names an id, Reap returned that checkout to us. Read it with the
-     authenticated `GET /agentic/checkouts/{id}`, the read the poller already uses.
+     authenticated `GET /agentic/checkouts/{id}`, the read the poller already uses. For
+     `authenticated_reap_checkout_read` evidence, pass that read as `payload`: its `id` must equal
+     the checkout id and its `quoteId` must equal this dispatch's `quote_id`, or the call is
+     refused (`evidence_checkout_not_bound_to_dispatch`).
    - Otherwise, ask Reap whether a checkout exists for `quote_id` + `reap_enrollment_id`. The
      create's Idempotency-Key was derived from that pair, and Reap keeps idempotency keys for
      24 hours. **Open question for Reap: we have no confirmed lookup API by quote/enrollment or
      idempotency key.** Until Reap confirms one, the evidence is a verified Reap support
      statement (`verified_reap_support_statement`) that names the checkout id or states that
      none exists.
-3. **Choose one outcome.**
+4. **Choose one outcome.**
    - Reap has a checkout: `outcome="checkout_found"`. If the journal holds an observed id,
      that id is used. Pass `checkout_id` only when the journal has none. An id that differs
      from the journal's is refused. The row moves to `awaiting_approval` with that checkout id,
@@ -1897,8 +1910,12 @@ operator shell.
      immediately, so the worker's ordinary checkout read takes the outcome from Reap. An
      unapproved checkout turns FAILED at Reap minutes after its quote expires, so that read
      normally closes the purchase as `failed` and the row leaves the count. While Reap still
-     reports it waiting, the row stays in the queue as a checkout with no link. A later
-     terminal outcome can also use `resolve_checkout_manually`.
+     reports it waiting, the row stays in the queue as a checkout with no link. If Reap reports
+     it COMPLETED, nobody approved it through a link we delivered. The worker does not close it
+     or write an attribution edge. It holds the row as
+     `checkout_unresolvable:3:operator_found_completed` (needs-human) for a reviewed
+     `resolve_checkout_manually` decision. An id already attached to another purchase is
+     refused (`checkout_id_attached_to_another_purchase`).
    - Reap confirms no checkout exists for this dispatch: `outcome="confirmed_not_created"`.
      This appends the `not_created` receipt (provider code `OPERATOR_CONFIRMED_NOT_CREATED`) and
      releases through the same fence Reap's own explicit rejection uses. The key is cleared, the
@@ -1907,7 +1924,7 @@ operator shell.
      pair never dispatches again. Contact retention, attempts and flags apply as usual and may
      end the purchase. This outcome is refused when the journal holds an observed checkout.
    - Not sure: do nothing. The row stays parked and visible.
-4. **Preview, then apply.** First call `resolve_parked_dispatch(purchase_id,
+5. **Preview, then apply.** First call `resolve_parked_dispatch(purchase_id,
    dispatch_key=..., outcome=..., evidence={...}, operator_ref=..., expected_updated_at=<listing
    updated_at>)` with the default `dry_run=True`. Then repeat it with `dry_run=False`. The
    evidence takes the same fields `resolve_checkout_manually` takes (`source`,
@@ -1917,13 +1934,22 @@ operator shell.
      `started` event, a row a worker holds, a stale `updated_at`, and a journal whose observed
      evidence conflicts.
    - An exact replay returns `already_resolved` and writes nothing. Different evidence, a
-     different operator or a different outcome for an already-resolved key is refused.
+     different operator or a different outcome for an already-resolved key is refused
+     (`dispatch_already_resolved`).
+   - One exception per key: a `confirmed_not_created` decision may be superseded once, when the
+     same key is parked again after it.
+     - A late `observed` receipt allows `checkout_found`, and only that.
+     - A same-quote re-park allows a fresh `confirmed_not_created`. Reap replayed the quote id;
+       `begin_dispatch` re-fences the key and sends nothing.
+     - Either is recorded as a second audit row (`decision_seq=2`, `supersedes_outcome`) and a
+       journal `superseded` event. The first decision is never rewritten. A further re-park of
+       that key is refused (`dispatch_resolution_limit_reached`). Escalate it.
 
 The claim, journal `resolved` event (plus the `not_created` receipt), state change or release,
 and audit row are one short transaction. Migration 257 and the startup self-heal
 (`db/reap_continuation.ensure_continuation_schema`) add the `resolved` event type and
 `reap_checkout_dispatch_resolution_audit`. That table holds one decision per (purchase,
-dispatch key): outcome, checkout id and whether it came from the journal or the operator, the
+dispatch key), plus at most one superseding decision: outcome, checkout id and whether it came from the journal or the operator, the
 resulting state, operator and evidence handles, the observed time and origin, and the
 normalized evidence SHA256. It holds no buyer contact, provider body or hosted URL. When
 rolling back runtime code, do not drop that table or the journal rows.
@@ -1932,6 +1958,7 @@ rolling back runtime code, do not drop that table or the journal rows.
 - Re-create a checkout under a new key, or open a replacement purchase, to clear the alert.
 - Use `confirmed_not_created` without Reap's confirmation for this dispatch. An empty column,
   an elapsed clock or a failed lookup is not that confirmation.
+- Decide before `earliest_resolution_at`, or on evidence gathered before it.
 - Edit the purchase row or the journal by hand in SQL.
 - Resolve while a worker holds the claim.
 

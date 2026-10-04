@@ -10,8 +10,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from db.database import database, IS_POSTGRES
 from db import reap_agentic_ledger as ledger, reap_continuation as continuation
+from services import reap_agentic_purchase as svc, reap_checkout_recovery as recovery
 from services.reap_checkout_recovery import (
-    ManualResolutionRefused, list_parked_dispatches, resolve_checkout_manually, resolve_parked_dispatch,
+    ManualResolutionRefused, dispatch_settle_seconds, list_parked_dispatches, resolve_checkout_manually,
+    resolve_parked_dispatch,
 )
 from test_reap_agentic_purchase import (
     _db, _env, _no_network, reap, attribution, _start, _step, _get, _claim,
@@ -53,12 +55,32 @@ async def _quoting(buyer='bref_alice'):
     return pid
 
 
-async def _parked_unknown(reap):
+async def _age_started(pid, seconds):
+    """Backdate this purchase's `started` receipt. Test-only: the journal is append-only."""
+    if IS_POSTGRES:
+        await database.execute('ALTER TABLE reap_checkout_dispatch_events DISABLE TRIGGER reap_dispatch_events_immutable')
+        try:
+            await database.execute("UPDATE reap_checkout_dispatch_events SET recorded_at = recorded_at - (:s * INTERVAL '1 second')"
+                                   " WHERE purchase_id=:id AND event_type='started'", {'s': seconds, 'id': pid})
+        finally:
+            await database.execute('ALTER TABLE reap_checkout_dispatch_events ENABLE TRIGGER reap_dispatch_events_immutable')
+    else:
+        await database.execute('DROP TRIGGER reap_dispatch_events_no_update')
+        try:
+            await database.execute("UPDATE reap_checkout_dispatch_events SET recorded_at = datetime(recorded_at, :w)"
+                                   " WHERE purchase_id=:id AND event_type='started'", {'w': f'-{seconds} seconds', 'id': pid})
+        finally:
+            await database.execute(continuation._IMMUTABLE_UPDATE_SQLITE)
+
+
+async def _parked_unknown(reap, settled=True):
     """A create whose response never arrived: started journaled, no receipt, row parked."""
     pid = await _quoting()
     reap.create_checkout = _transport()
     result = await _step(pid)
     assert result.last_error_code == 'checkout_dispatch_unresolved'
+    if settled:
+        await _age_started(pid, dispatch_settle_seconds() + 60)
     row = await _get(pid)
     assert row['state'] == 'quoting' and row['checkout_dispatch_key'] and row['claimed_by'] is None
     return pid, row
@@ -74,6 +96,7 @@ async def _parked_observed():
     await continuation.record_dispatch_response(row, 'w1', key=key, quote_id=QUOTE_200['id'],
         enrollment_id=ENROLLMENT_ACTIVE['id'], checkout=_ok(CHECKOUT_CREATED))
     await database.execute("UPDATE reap_agentic_purchases SET claimed_by=NULL, claimed_at=NULL WHERE id=:id", {'id': pid})
+    await _age_started(pid, dispatch_settle_seconds() + 60)
     row = await _get(pid)
     assert row['state'] == 'quoting' and row['checkout_dispatch_key'] == key and row['reap_checkout_id'] is None
     return pid, row
@@ -301,6 +324,8 @@ async def test_the_listing_shows_identifiers_and_age_without_pii_or_urls(reap):
     assert [e['event_type'] for e in entry['events']] == ['started'] and entry['claimed'] is False
     assert isinstance(entry['age_seconds'], int) and 0 <= entry['age_seconds'] < 600
     assert entry['updated_at'] == unknown['updated_at']
+    assert entry['earliest_resolution_at'].tzinfo is not None
+    assert entry['earliest_resolution_at'] <= datetime.now(timezone.utc) < entry['earliest_resolution_at'] + timedelta(seconds=600)
     result = await _resolve(dict(unknown, updated_at=entry['updated_at']), 'confirmed_not_created', dry_run=True)
     text = json.dumps([listing, result], default=str)
     assert all(value not in text for value in PII) and 'http' not in text and 'bref_' not in text
@@ -312,7 +337,7 @@ async def test_an_existing_journal_widens_to_accept_operator_events():
                                " ADD CONSTRAINT reap_checkout_dispatch_events_event_type_check CHECK (event_type IN ('started','not_created','observed')) NOT VALID")
     else:
         await database.execute('DROP TABLE reap_checkout_dispatch_events')
-        await database.execute(continuation._SCHEMA.replace(",'resolved'", ''))
+        await database.execute(continuation._SCHEMA.replace(",'resolved','superseded'", ''))
         await database.execute(continuation._IMMUTABLE_UPDATE_SQLITE)
         await database.execute(continuation._IMMUTABLE_DELETE_SQLITE)
     values = {'id': 'pre257_row', 'key': 'c' * 64, 'quote': 'q', 'enrollment': 'e', 'checkout': None, 'code': None}
@@ -322,10 +347,194 @@ async def test_an_existing_journal_widens_to_accept_operator_events():
     await continuation.ensure_continuation_schema()
     await continuation.ensure_continuation_schema()  # idempotent on the second boot
     await database.execute(continuation._APPEND, {**values, 'event': 'resolved'})
+    await database.execute(continuation._APPEND, {**values, 'event': 'superseded'})
     kept = await database.fetch_all("SELECT event_type FROM reap_checkout_dispatch_events WHERE purchase_id='pre257_row' ORDER BY event_type")
-    assert [r['event_type'] for r in kept] == ['resolved', 'started']
+    assert [r['event_type'] for r in kept] == ['resolved', 'started', 'superseded']
     with pytest.raises(Exception):
         await database.execute("DELETE FROM reap_checkout_dispatch_events WHERE purchase_id='pre257_row'")
     with pytest.raises(Exception):
         await database.execute("INSERT INTO reap_checkout_dispatch_events (purchase_id,dispatch_key,event_type,quote_id,enrollment_id)"
                                " VALUES ('pre257_row','d','invented','q','e')")
+
+
+# ── review of #2511 ──────────────────────────────────────────────────────────────────────────
+
+
+async def test_the_settle_window_spans_the_longest_lease_and_the_client_timeout_ceiling():
+    from jobs.reap_agentic_purchase_poll import DIALS
+    assert dispatch_settle_seconds() == DIALS['lease_seconds'].maximum + int(svc.rc._MAX_ENV_TIMEOUT_S) + 600
+
+
+@pytest.mark.parametrize('outcome,extra', [('confirmed_not_created', {}), ('checkout_found', {'checkout_id': 'chk_found_1'})])
+async def test_no_outcome_while_the_original_create_may_still_be_in_flight(reap, outcome, extra):
+    pid, row = await _parked_unknown(reap, settled=False)
+    for age in (0, dispatch_settle_seconds() - 60):
+        if age:
+            await _age_started(pid, age)
+        with pytest.raises(ManualResolutionRefused, match='dispatch_may_still_be_in_flight'):
+            await _resolve(row, outcome, dry_run=True, **extra)
+        with pytest.raises(ManualResolutionRefused, match='dispatch_may_still_be_in_flight'):
+            await _resolve(row, outcome, **extra)
+    assert (await list_parked_dispatches())[0]['earliest_resolution_at'] > datetime.now(timezone.utc)
+    assert await _get(pid) == row and await _audits(pid) == []
+    await _age_started(pid, 120)  # now just past the bound
+    assert (await _resolve(row, outcome, **extra))['status'] == 'resolved'
+
+
+async def test_the_compare_and_swap_enforces_the_settle_window_itself(reap, monkeypatch):
+    pid, row = await _parked_unknown(reap, settled=False)
+
+    async def lying_precheck(purchase_id, dispatch_key):
+        return datetime.now(timezone.utc) - timedelta(hours=1), True
+    monkeypatch.setattr(recovery, '_earliest_allowed', lying_precheck)
+    with pytest.raises(ManualResolutionRefused, match='compare_and_swap_lost'):
+        await _resolve(row, 'confirmed_not_created')
+    assert await _get(pid) == row and await _audits(pid) == []
+
+
+async def test_evidence_gathered_before_the_window_closed_is_refused(reap):
+    pid, row = await _parked_unknown(reap, settled=False)
+    await _age_started(pid, dispatch_settle_seconds() + 600)
+    await database.execute("UPDATE reap_agentic_purchases SET created_at = :t WHERE id=:id",
+                           {'t': ledger._bind_dt(datetime.now(timezone.utc) - timedelta(seconds=2 * dispatch_settle_seconds())), 'id': pid})
+    row = await _get(pid)
+    early = _evidence(observed_at=datetime.now(timezone.utc) - timedelta(seconds=700))
+    with pytest.raises(ManualResolutionRefused, match='evidence_predates_dispatch_settlement'):
+        await _resolve(row, 'confirmed_not_created', evidence=early)
+    assert (await _resolve(row, 'confirmed_not_created'))['status'] == 'resolved'
+
+
+async def test_reviewer_two_checkout_scenario_a_late_create_cannot_be_raced_by_not_created(reap):
+    """The late row's POST lands after the requeue; the operator must not release it at age 0."""
+    pid, row = await _parked_unknown(reap, settled=False)
+    original = row
+    assert len(reap.named('create_checkout')) == 1
+    with pytest.raises(ManualResolutionRefused, match='dispatch_may_still_be_in_flight'):
+        await _resolve(row, 'confirmed_not_created')
+    # The original POST now answers: Reap created chk_A for the old key. The receipt is unfenced.
+    await continuation.record_dispatch_response(original, 'w1', key=row['checkout_dispatch_key'], quote_id=QUOTE_200['id'],
+        enrollment_id=ENROLLMENT_ACTIVE['id'], checkout=_ok(CHECKOUT_CREATED))
+    reap.request_quote = _ok(dict(QUOTE_200, id='q_fresh_2'))
+    reap.create_checkout = _ok(dict(CHECKOUT_CREATED, id='chk_B'))
+    await _step(pid)
+    assert len(reap.named('create_checkout')) == 1, 'a second checkout was created'
+    assert (await _get(pid))['state'] == 'quoting' and await ledger.count_checkout_needs_human() == 1
+    await _age_started(pid, dispatch_settle_seconds() + 60)
+    row = await _get(pid)
+    with pytest.raises(ManualResolutionRefused, match='observed_checkout_exists'):
+        await _resolve(row, 'confirmed_not_created')
+    await _resolve(row, 'checkout_found')
+    assert (await _get(pid))['reap_checkout_id'] == CHECKOUT_CREATED['id']
+
+
+async def test_a_late_observed_receipt_lets_checkout_found_supersede_not_created(reap):
+    pid, row = await _parked_unknown(reap)
+    await _resolve(row, 'confirmed_not_created')
+    assert await list_parked_dispatches() == []
+    await continuation.record_dispatch_response(row, 'w1', key=row['checkout_dispatch_key'], quote_id=QUOTE_200['id'],
+        enrollment_id=ENROLLMENT_ACTIVE['id'], checkout=_ok(CHECKOUT_CREATED))
+    reparked = await _get(pid)
+    assert reparked['checkout_dispatch_key'] == row['checkout_dispatch_key'] and reparked['state'] == 'quoting'
+    assert [p['purchase_id'] for p in await list_parked_dispatches()] == [pid]
+    with pytest.raises(ManualResolutionRefused, match='observed_checkout_exists'):
+        await _resolve(reparked, 'confirmed_not_created', evidence=_evidence(reference='other_case'))
+    result = await _resolve(reparked, 'checkout_found')
+    assert result['state'] == 'awaiting_approval' and result['supersedes'] == 'confirmed_not_created'
+    after = await _get(pid)
+    assert after['reap_checkout_id'] == CHECKOUT_CREATED['id'] and await list_parked_dispatches() == []
+    audits = {a['outcome']: a for a in await _audits(pid)}
+    assert set(audits) == {'confirmed_not_created', 'checkout_found'}
+    assert (audits['checkout_found']['supersedes_outcome'], audits['checkout_found']['decision_seq']) == ('confirmed_not_created', 2)
+    assert (audits['confirmed_not_created']['supersedes_outcome'], audits['confirmed_not_created']['decision_seq']) == (None, 1)
+    events = [e['event_type'] for e in await _events(pid)]
+    assert events.count('resolved') == 1 and events.count('superseded') == 1
+
+
+async def test_checkout_found_without_a_late_receipt_cannot_overturn_not_created(reap):
+    pid, row = await _parked_unknown(reap)
+    await _resolve(row, 'confirmed_not_created')
+    await database.execute("UPDATE reap_agentic_purchases SET checkout_dispatch_key=:k WHERE id=:id",
+                           {'k': row['checkout_dispatch_key'], 'id': pid})
+    with pytest.raises(ManualResolutionRefused, match='dispatch_already_resolved'):
+        await _resolve(await _get(pid), 'checkout_found', checkout_id='chk_found_1')
+
+
+async def test_an_authenticated_read_must_name_this_checkout_and_this_quote(reap):
+    pid, row = await _parked_unknown(reap)
+    read = dict(source='authenticated_reap_checkout_read')
+    for payload in (None, {'id': 'chk_found_1'}, {'id': 'chk_found_1', 'quoteId': 'other_quote'},
+                    {'id': 'chk_other', 'quoteId': QUOTE_200['id']}):
+        with pytest.raises(ManualResolutionRefused, match='evidence_checkout_not_bound_to_dispatch'):
+            await _resolve(row, 'checkout_found', checkout_id='chk_found_1', evidence=_evidence(**read, payload=payload))
+    assert await _audits(pid) == []
+    bound = _evidence(**read, payload={'id': 'chk_found_1', 'quoteId': QUOTE_200['id'], 'status': 'FAILED'})
+    assert (await _resolve(row, 'checkout_found', checkout_id='chk_found_1', evidence=bound))['status'] == 'resolved'
+    assert (await _resolve(row, 'checkout_found', checkout_id='chk_found_1', evidence=bound))['status'] == 'already_resolved'
+
+
+async def test_completed_on_an_operator_found_checkout_goes_to_a_human(reap, attribution):
+    pid, row = await _parked_observed()
+    await _resolve(row, 'checkout_found')
+    reap.get_checkout = _ok(CHECKOUT_COMPLETED)
+    await _step(pid)
+    after = await _get(pid)
+    assert after['state'] == 'awaiting_approval' and after['claimed_by'] is None
+    assert after['last_error_code'] == svc.OPERATOR_FOUND_COMPLETED
+    assert attribution.calls == [] and await ledger.count_checkout_needs_human() == 1
+
+
+async def test_a_checkout_id_held_by_another_purchase_is_a_named_refusal(reap, monkeypatch):
+    other = await _quoting('bref_bob')
+    await database.execute("UPDATE reap_agentic_purchases SET state='awaiting_approval', reap_checkout_id='chk_dup' WHERE id=:id", {'id': other})
+    pid, row = await _parked_unknown(reap)
+    with pytest.raises(ManualResolutionRefused, match='checkout_id_attached_to_another_purchase'):
+        await _resolve(row, 'checkout_found', checkout_id='chk_dup')
+    # The unique index is the backstop when the pre-check races.
+    original = database.fetch_val
+
+    async def blind(query, *args, **kwargs):
+        if 'WHERE reap_checkout_id=:checkout AND id<>:id' in str(query):
+            return None
+        return await original(query, *args, **kwargs)
+    monkeypatch.setattr(database, 'fetch_val', blind)
+    with pytest.raises(ManualResolutionRefused, match='checkout_id_attached_to_another_purchase'):
+        await _resolve(row, 'checkout_found', checkout_id='chk_dup')
+    monkeypatch.setattr(database, 'fetch_val', original)
+    assert await _get(pid) == row and await _audits(pid) == []
+    assert {e['event_type'] for e in await _events(pid)} == {'started'}
+
+
+async def test_a_same_quote_re_park_after_not_created_can_be_released_once_more(reap):
+    pid, row = await _parked_unknown(reap)
+    first = _evidence()
+    await _resolve(row, 'confirmed_not_created', evidence=first)
+    creates = len(reap.named('create_checkout'))
+    await _step(pid)  # Reap replays the same quote id: same key, re-fenced, nothing sent
+    reparked = await _get(pid)
+    assert reparked['checkout_dispatch_key'] == row['checkout_dispatch_key'] and reparked['state'] == 'quoting'
+    assert len(reap.named('create_checkout')) == creates and await ledger.count_checkout_needs_human() == 1
+    assert (await _resolve(reparked, 'confirmed_not_created', evidence=first))['status'] == 'already_resolved'
+    with pytest.raises(ManualResolutionRefused, match='dispatch_already_resolved'):
+        await _resolve(reparked, 'checkout_found', checkout_id='chk_found_1', evidence=_evidence(reference='case_2'))
+    second = _evidence(reference='case_2')
+    result = await _resolve(reparked, 'confirmed_not_created', evidence=second)
+    assert result['status'] == 'resolved' and result['supersedes'] == 'confirmed_not_created'
+    after = await _get(pid)
+    assert after['checkout_dispatch_key'] is None and await ledger.count_checkout_needs_human() == 0
+    audits = sorted(await _audits(pid), key=lambda a: a['decision_seq'])
+    assert [(a['outcome'], a['decision_seq'], a['supersedes_outcome']) for a in audits] == \
+        [('confirmed_not_created', 1, None), ('confirmed_not_created', 2, 'confirmed_not_created')]
+    assert [e['event_type'] for e in await _events(pid)].count('superseded') == 1
+    assert (await _resolve(reparked, 'confirmed_not_created', evidence=second))['status'] == 'already_resolved'
+    await _step(pid)  # replayed again: one supersession per key, then engineering
+    with pytest.raises(ManualResolutionRefused, match='dispatch_resolution_limit_reached'):
+        await _resolve(await _get(pid), 'confirmed_not_created', evidence=_evidence(reference='case_3'))
+
+
+async def test_the_age_bound_runs_from_the_purchases_latest_started(reap):
+    pid, row = await _parked_unknown(reap)
+    await database.execute(continuation._APPEND, {'id': pid, 'key': 'e' * 64, 'event': 'started', 'quote': 'q_later',
+                                                  'enrollment': ENROLLMENT_ACTIVE['id'], 'checkout': None, 'code': None})
+    with pytest.raises(ManualResolutionRefused, match='dispatch_may_still_be_in_flight'):
+        await _resolve(row, 'confirmed_not_created')
+    assert (await list_parked_dispatches())[0]['earliest_resolution_at'] > datetime.now(timezone.utc)
