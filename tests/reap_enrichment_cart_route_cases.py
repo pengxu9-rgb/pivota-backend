@@ -63,6 +63,8 @@ MIGRATIONS = (
     MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
     MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",
     MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
+    MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
+    MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
 )
 SEEDS_MIGRATION = MIGRATIONS_DIR / "044_external_product_seeds.sql"
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
@@ -70,6 +72,7 @@ SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect"
 PARKED_SEEDS = "external_product_seeds_parked_by_enrichment_route_cases"
 
 RAIL_TABLES = (
+    "reap_checkout_dispatch_events",  # DROP fixture evidence; immutable journal forbids DELETE.
     "reap_agentic_purchase_keys",
     "reap_agentic_buyer_refs",
     "reap_agentic_eligibility",

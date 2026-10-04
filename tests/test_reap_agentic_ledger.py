@@ -559,6 +559,7 @@ _EXPECTED_PUBLIC_COLUMNS = {
     "offer_code", "offer_code_outcome", "discount_minor", "tax_included",
 }
 _EXPECTED_NEVER_PUBLIC = {
+    "dispatch_tracking_version", "checkout_dispatch_key", "contact_received_at", "contact_purged_at", "contact_revision",
     "buyer_ref", "agent_id", "agent_user_ref_hash", "buyer_email", "shipping_address",
     "enrollment_id", "click_id", "return_url", "reap_product_id", "reap_variant_id",
     "reap_quote_id", "reap_checkout_id", "queries_tried", "attempts", "next_poll_at",
@@ -3038,6 +3039,7 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
     # columns in the same run. Named explicitly rather than loosened to `<=`: "nothing else" is
     # still the assertion.
     assert after - before == set(_HINT_COLUMNS) | {
+        "dispatch_tracking_version", "checkout_dispatch_key", "contact_received_at", "contact_purged_at", "contact_revision",
         "item_source",
         "cart_url",
         "consent_version",

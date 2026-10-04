@@ -83,6 +83,7 @@ _MIGRATIONS = (
     # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
+    _MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
 )
 _MIGRATION = _MIGRATIONS[0]
 
@@ -2848,6 +2849,7 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
     # migrations' columns in the same run. Named, not loosened to `<=`: "nothing else" is still
     # the assertion.
     assert after - before == set(_HINT_COLUMNS) | {
+        "dispatch_tracking_version", "checkout_dispatch_key", "contact_received_at", "contact_purged_at", "contact_revision",
         "item_source",
         "cart_url",
         "consent_version",
@@ -2918,8 +2920,13 @@ async def test_the_migration_and_the_postgres_self_heal_run_the_same_alter():
     guard = (root / "db/schema_guard.py").read_text(encoding="utf-8")
 
     def _alter(text: str) -> str:
-        start = text.index("ALTER TABLE IF EXISTS reap_agentic_purchases")
-        return " ".join(text[start: text.index(";", start) + 1].split())
+        statements = re.findall(
+            r"ALTER TABLE IF EXISTS reap_agentic_purchases\b[^;]*;", text, re.DOTALL
+        )
+        hints = [statement for statement in statements
+                 if "ADD COLUMN IF NOT EXISTS accept_variant_labels" in statement]
+        assert len(hints) == 1, "expected exactly one complete migration-225 ALTER"
+        return " ".join(hints[0].split())
 
     assert _alter(migration) == _alter(guard), (
         "the mig-225 ALTER in db/schema_guard.py is not the one in the migration:\n"
@@ -2939,6 +2946,9 @@ async def test_the_new_columns_are_partitioned_between_public_and_never_public()
         "accept_variant_labels", "also_accept_domains", "market_country",
         # mig 229 — see the SQLite twin of this list for why neither is public.
         "item_source", "cart_url",
+        # mig 256 — raw dispatch identity and contact retention metadata stay private.
+        "dispatch_tracking_version", "checkout_dispatch_key", "contact_received_at",
+        "contact_purged_at", "contact_revision",
     }
     columns = await _purchase_columns()
     unclassified = columns - _EXPECTED_PUBLIC_COLUMNS - never_public

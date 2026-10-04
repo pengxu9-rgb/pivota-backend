@@ -98,6 +98,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, StrictInt, StrictStr, model_validator
 
 import db.reap_agentic_ledger as ledger
+import db.reap_continuation as continuation
 # THE ONE consent-tag shape rule, imported rather than re-implemented. Bound at module level
 # so tests can assert BY IDENTITY that this module, services/reap_agentic_purchase and the
 # ledger call the same function object — see that function's docstring for the production
@@ -166,6 +167,11 @@ router = APIRouter(prefix="/agent/v2/commerce/reap", tags=["agent-commerce-reap"
 #: we chose to make; answering 500 would page somebody for a decision the code made on purpose,
 #: and answering 422 would tell the caller to edit a request that may be perfectly well-formed.
 _REFUSAL_STATUS: Dict[str, int] = {
+    "checkout_dispatch_unresolved": 409,
+    "contact_reentry_not_required": 409,
+    "resume_raced": 409,
+    "resume_selection_changed": 409,
+    "terminal_purchase_not_resumable": 409,
     # The rail is not here. Indistinguishable from the dial being off, deliberately: both mean
     # "unavailable", and a caller that could tell them apart would learn our configuration.
     "not_available_on_this_rail": 404,
@@ -2455,7 +2461,13 @@ async def _owner_public_body(row):
             row.pop("hosted_url_expires_at", None)
         else:
             row["hosted_url_expires_at"] = deadline
-    return _public_body(ledger.public_purchase_view(row))
+    body = _public_body(ledger.public_purchase_view(row))
+    body["checkout_dispatch_state"] = continuation.dispatch_state(row)
+    body["contact_reentry_required"] = (
+        row.get("state") in {"resolving", "needs_enrollment", "quoting"}
+        and continuation.contact_required(row)
+    )
+    return body
 
 
 def _not_found() -> JSONResponse:
@@ -2777,6 +2789,8 @@ async def start_reap_purchase(
                     "purchase_id": replayed,
                     "status": view.get("state"),
                     "poll_after_seconds": view.get("poll_after_seconds"),
+                    "checkout_dispatch_state": view["checkout_dispatch_state"],
+                    "contact_reentry_required": view["contact_reentry_required"],
                 }
                 if req.item_source == "cart_link":
                     # The same additive field the cart-link create answered with. The key's
@@ -2971,18 +2985,143 @@ async def start_reap_purchase(
             merchant_domain,
             agent_id,
         )
+        # Read committed owner-scoped facts, including a concurrent winner's actual state.
+        # A successful INSERT alone cannot prove absence of a later worker dispatch.
+        if winning_view is None:
+            try:
+                winning_view = await _owner_view(
+                    purchase_id=purchase_id, agent_id=agent_id,
+                    agent_user_ref_hash=agent_user_ref_hash,
+                )
+            except Exception:
+                raise _PurchasePersistenceUnavailable() from None
+        if winning_view is None:
+            raise _PurchasePersistenceUnavailable()
         accepted: Dict[str, Any] = {
             "purchase_id": purchase_id,
-            "status": winning_view["state"] if winning_view else "resolving",
-            "poll_after_seconds": winning_view.get("poll_after_seconds") if winning_view else svc.POLL_INTERVALS.get("resolving"),
+            "status": winning_view["state"],
+            "poll_after_seconds": winning_view.get("poll_after_seconds"),
+            "checkout_dispatch_state": winning_view["checkout_dispatch_state"],
+            "contact_reentry_required": winning_view["contact_reentry_required"],
         }
         if cart_link_item is not None:
             # ADDITIVE, CART-LINK LANE ONLY, display only: the variant this link buys, in the live
             # storefront's words ("07 BURGUNDY INK") -- the buyer never picks it on this lane.
             # The stored row's `variant_title`, as GET returns it; null when the proof has none.
-            # The variant lane's 202 body is unchanged.
-            accepted["variant_title"] = winning_view.get("variant_title") if winning_view else cart_link_item.variant_title
+            accepted["variant_title"] = winning_view.get("variant_title")
         return JSONResponse(status_code=202, content=accepted)
+    except _PurchasePersistenceUnavailable:
+        return JSONResponse(status_code=503, content={"error": "checkout_outcome_unknown"})
+    except svc.PurchaseRefused as exc:
+        return _refused(exc)
+
+
+async def _validate_resume_selection(req, row, merchant, host, product, variant, market):
+    """Fresh admission for the SAME immutable item and price; creates no buyer/click/attempt."""
+    if purchasability.is_enforcement_enabled() and not await purchasability.is_purchasable(merchant, market):
+        raise svc.PurchaseRefused("merchant_not_purchasable")
+    if req.item_source == "cart_link":
+        if not svc.is_cart_link_enabled():
+            raise svc.PurchaseRefused("not_available_on_this_rail")
+        await _refuse_if_merchant_disabled(merchant_domain=merchant, market_country=market)
+        if not await tierb_eligibility.is_cart_link_eligible(host, market):
+            raise svc.PurchaseRefused("merchant_not_eligible")
+        facts, _, selected_variant, _ = await _load_cart_link_item(
+            merchant_domain=host, product_key=product, variant_key=variant, market_country=market)
+        selected_key = "shopify:" + str(selected_variant)
+        price, currency = facts["our_price_minor"], facts["currency"]
+        # The stored cart (including attribution) survives; only compare its immutable line.
+        line = svc.cart_link_line(row.get("cart_url"))
+        if line is None or str(line[0]) != str(selected_variant) or line[1] != req.quantity:
+            raise svc.PurchaseRefused("resume_selection_changed")
+    else:
+        eligible = await _eligibility(merchant_domain=merchant, market_country=market,
+                                      product_key=product, variant_key=variant)
+        facts = await _load_catalog_row(merchant_domain=merchant, storefront_host=host,
+            product_key=product, variant_key=variant, market_country=eligible.market_country,
+            accept_variant_labels=eligible.accept_variant_labels, also_accept_domains=eligible.also_accept_domains)
+        selected_key, price, currency = facts.variant_key, facts.our_price_minor, facts.currency
+    if (selected_key != row.get("variant_key") or product != row.get("product_key")
+            or _merchant_domain_key(row.get("merchant_domain")) != merchant
+            or market != row.get("market_country") or req.quantity != row.get("quantity")
+            or req.item_source != row.get("item_source", "reap_variant")):
+        raise svc.PurchaseRefused("resume_selection_changed")
+    if type(price) is not int or price != row.get("our_price_minor") or currency != row.get("currency"):
+        raise svc.PurchaseRefused("price_changed")
+    svc.enforce_pilot_scope(agent_id=row["agent_id"], merchant_domain=merchant,
+        market_country=market, product_key=product, quantity=req.quantity,
+        variant_key=selected_key, currency=currency, total_minor=price * req.quantity)
+
+
+@router.post("/purchases/{purchase_id}/resume")
+async def resume_reap_purchase(purchase_id: str, request: Request,
+    context: AgentContext = Depends(get_agent_context),
+    agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context)):
+    """Explicit contact re-entry for one owner/request/attempt; never a replacement/recovery write.
+
+    The original canonical request (including the original contact) is required. Its key already
+    maps to this purchase. Terminal and legacy/unknown dispatch rows cannot be rehydrated.
+    Repeated accepted submissions return the same view without renewing the contact clock.
+    """
+    try:
+        _require_rail()
+        if not svc.is_create_enabled():
+            raise svc.PurchaseRefused("create_disabled")
+        owner = hash_agent_user_ref(_require_agent_user(agent_user))
+        agent = str(context.agent_id)
+        try:
+            req = StartPurchaseRequest.model_validate(await request.json())
+        except (ValueError, ValidationError):
+            raise svc.PurchaseRefused("invalid_request") from None
+        key = _identifier(req.idempotency_key, "idempotency_key", max_chars=128)
+        host = _identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower()
+        merchant = _merchant_domain_key(host)
+        product = _identifier(req.product_key, "product_key", max_chars=1024)
+        variant = _identifier(req.variant_key, "variant_key", max_chars=1024) if str(req.variant_key or "").strip() else None
+        consent = _consent_version(req.buyer.consent_version)
+        offer = _offer_code(req.offer_code)
+        address = _buyer_address_for_client(req.buyer)
+        email = str(req.buyer.email or "").strip()
+        request_hash = _request_hash(merchant_domain=merchant, product_key=product, variant_key=variant,
+            quantity=int(req.quantity), email=email, shipping_address=address,
+            return_url=str(req.return_url or "").strip() or _default_return_url(), item_source=req.item_source,
+            offer_code=offer, expected_unit_price_minor=req.expected_unit_price_minor, expected_currency=req.expected_currency)
+        bound = await _replayed_purchase_id(agent_id=agent, agent_user_ref_hash=owner,
+                                           idempotency_key=key, request_hash=request_hash)
+        if bound != purchase_id:
+            return _not_found()
+        row = await ledger.get_purchase_for_owner(purchase_id, agent, owner, include_private=True)
+        if row is None:
+            return _not_found()
+        if row["state"] in ledger.TERMINAL_STATES:
+            raise svc.PurchaseRefused("terminal_purchase_not_resumable")
+        if continuation.dispatch_state(row) != "not_dispatched":
+            raise svc.PurchaseRefused("checkout_dispatch_unresolved")
+        if not continuation.contact_required(row):
+            if row.get("contact_revision", 0) > 0:
+                return await _owner_public_body(row)
+            raise svc.PurchaseRefused("contact_reentry_not_required")
+        if row["state"] not in {"resolving", "needs_enrollment", "quoting"}:
+            raise svc.PurchaseRefused("contact_reentry_not_required")
+        if consent != row.get("consent_version"):
+            raise svc.PurchaseRefused("consent_required")
+        buyer_id = await _linked_buyer_id(agent_id=agent, agent_user_ref_hash=owner)
+        linked = await database.fetch_one("SELECT reap_buyer_ref FROM reap_agentic_buyer_refs WHERE buyer_id=:buyer", {"buyer":buyer_id}) if buyer_id else None
+        if linked is None or linked["reap_buyer_ref"] != row.get("buyer_ref"):
+            raise svc.PurchaseRefused("buyer_unlinked")
+        market = purchasability.normalize_market(req.buyer.shipping_address.country)
+        await _validate_resume_selection(req, row, merchant, host, product, variant, market)
+        email, address = svc._validated_buyer(svc.BuyerContact(email=email, shipping_address=address))
+        restored = await continuation.restore_contact(row, agent_id=agent, owner_hash=owner,
+            request_key=key, request_hash=request_hash, email=email, address=address, offer_code=offer)
+        if restored is None:
+            fresh = await ledger.get_purchase_for_owner(purchase_id, agent, owner, include_private=True)
+            if (fresh and fresh["state"] not in ledger.TERMINAL_STATES
+                    and fresh.get("contact_revision", 0) > row.get("contact_revision", 0)
+                    and not continuation.contact_required(fresh)):
+                return await _owner_public_body(fresh)
+            raise svc.PurchaseRefused("resume_raced")
+        return await _owner_public_body(restored)
     except _PurchasePersistenceUnavailable:
         return JSONResponse(status_code=503, content={"error": "checkout_outcome_unknown"})
     except svc.PurchaseRefused as exc:

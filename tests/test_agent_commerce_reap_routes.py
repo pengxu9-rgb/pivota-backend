@@ -2843,7 +2843,7 @@ async def test_the_offer_seller_is_still_a_conjunct_under_the_www_spelling(clien
 
 
 async def test_the_202_body_is_unchanged_by_canonical_matching(client):
-    """A SNAPSHOT of the accepted body: the same three keys and the same values, whichever
+    """A SNAPSHOT of the accepted body: the same five keys and the same values, whichever
     spelling was sent. Only `purchase_id` varies, and only in value."""
     await _seed_www_world()
     bodies = []
@@ -2856,8 +2856,12 @@ async def test_the_202_body_is_unchanged_by_canonical_matching(client):
         assert {k: v for k, v in body.items() if k != "purchase_id"} == {
             "status": "resolving",
             "poll_after_seconds": svc.POLL_INTERVALS["resolving"],
+            "checkout_dispatch_state": "not_dispatched",
+            "contact_reentry_required": False,
         }
-        assert sorted(body) == ["poll_after_seconds", "purchase_id", "status"]
+        assert sorted(body) == ["checkout_dispatch_state", "contact_reentry_required", "poll_after_seconds", "purchase_id", "status"]
+        assert body["checkout_dispatch_state"] == "not_dispatched"
+        assert body["contact_reentry_required"] is False
 
 
 async def test_a_retry_in_the_other_spelling_replays_the_same_purchase(client):
