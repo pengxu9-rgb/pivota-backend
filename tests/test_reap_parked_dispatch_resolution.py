@@ -538,3 +538,26 @@ async def test_the_age_bound_runs_from_the_purchases_latest_started(reap):
     with pytest.raises(ManualResolutionRefused, match='dispatch_may_still_be_in_flight'):
         await _resolve(row, 'confirmed_not_created')
     assert (await list_parked_dispatches())[0]['earliest_resolution_at'] > datetime.now(timezone.utc)
+
+
+async def test_a_refused_hosted_url_park_resolves_from_its_observed_id(reap):
+    """#2512 parks a 200 whose hosted action was refused; the resolver keys on the journal, not the code."""
+    pid = await _quoting()
+    reap.create_checkout = svc.rc.ReapResponse(ok=False, status=200, error='hosted_url_not_allowed',
+                                               refused_checkout_id='chk_refused_1')
+    await _step(pid)
+    parked = await _get(pid)
+    assert parked['state'] == 'quoting' and parked['last_error_code'] == svc.CHECKOUT_CREATED_HOSTED_URL_REFUSED
+    await _age_started(pid, dispatch_settle_seconds() + 60)
+    row = await _get(pid)
+    [entry] = await list_parked_dispatches()
+    assert entry['observed_checkout_ids'] == ['chk_refused_1']
+    with pytest.raises(ManualResolutionRefused, match='observed_checkout_exists'):
+        await _resolve(row, 'confirmed_not_created')
+    result = await _resolve(row, 'checkout_found')
+    assert result['state'] == 'awaiting_approval'
+    [audit] = await _audits(pid)
+    assert (audit['reap_checkout_id'], audit['checkout_id_source']) == ('chk_refused_1', 'journal_observed')
+    after = await _get(pid)
+    assert after['reap_checkout_id'] == 'chk_refused_1' and after['hosted_url'] is None
+    assert len(reap.named('create_checkout')) == 1
