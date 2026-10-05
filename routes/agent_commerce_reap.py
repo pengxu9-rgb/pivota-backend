@@ -2308,12 +2308,19 @@ _PRICE_WITNESS_KEYS = (
 )
 
 
+#: The states before any approval quote exists: the only ones a preflight's totals describe.
+_PREFLIGHT_VISIBLE_STATES = frozenset({"resolving", "needs_enrollment"})
+#: The refusals whose cause IS the quoted item price (services/reap_agentic_purchase).
+_LIVE_PRICE_CODES = frozenset({"quote_items_subtotal_mismatch", "quote_price_increased_corroborated"})
+
+
 def _price_witness_fields(body: Dict[str, Any], *, state: str, currency: Any) -> None:
     """Pop the mig-258 keys from `body` and add, only when each applies:
 
-      preflight    the buy-intent quote CONFIRMED the price (`preflight_outcome == 'ok'`): its
-                   totals, so the door can show them before the card page.
-      live_price   the purchase ENDED `price_changed` and a quote's live price is recorded: the
+      preflight    the buy-intent quote CONFIRMED the price (`preflight_outcome == 'ok'`) and no
+                   approval quote exists yet ('resolving' / 'needs_enrollment'): its totals.
+      live_price   the purchase ENDED `price_changed` BECAUSE OF the quoted item price (the
+                   subtotal / corroborated-increase codes) and a live price is recorded: the
                    merchant's live unit price (null when the subtotal is not a multiple of the
                    quantity), the quoted items subtotal and total, and the stage that saw it.
       price_rebound  the purchase continued at a LOWER live unit price our own store read
@@ -2322,7 +2329,10 @@ def _price_witness_fields(body: Dict[str, Any], *, state: str, currency: Any) ->
     A row the dark dials never touched has none of the three, so the body is exactly what it was.
     """
     witness = {key: body.pop(key, None) for key in _PRICE_WITNESS_KEYS}
-    if witness["preflight_outcome"] == "ok" and witness["preflight_total_minor"] is not None:
+    # ONLY BEFORE ANY LATER QUOTE: from 'quoting' on, the approval quote's own totals (`totals`)
+    # supersede the witness's, so a door can never show two different confirmed totals.
+    if (state in _PREFLIGHT_VISIBLE_STATES and witness["preflight_outcome"] == "ok"
+            and witness["preflight_total_minor"] is not None):
         body["preflight"] = {
             "checked_at": witness["preflight_checked_at"],
             "totals": {
@@ -2334,7 +2344,10 @@ def _price_witness_fields(body: Dict[str, Any], *, state: str, currency: Any) ->
                 "total_minor": witness["preflight_total_minor"],
             },
         }
+    # ONLY WHEN THE REFUSAL IS THE QUOTE-PRICE REFUSAL ITSELF: another `price_changed` (the
+    # resolver's `_price_verdict`, a reconcile/shipping/currency failure) is not "the price is X".
     if (state == "refused" and body.get("refusal_reason") == "price_changed"
+            and body.get("last_error_code") in _LIVE_PRICE_CODES
             and witness["live_items_subtotal_minor"] is not None):
         body["live_price"] = {
             "currency": currency,

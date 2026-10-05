@@ -27,6 +27,12 @@ import db.reap_agentic_ledger as ledger
 PREFLIGHT_PENDING = "pending"
 PREFLIGHT_OUTCOMES = frozenset({"ok", "price_changed", "refused", "unverified"})
 LIVE_PRICE_STAGES = frozenset({"preflight", "approval"})
+#: The columns `record_live_price` writes (the price PICTURE of the latest quote).
+PRICE_PICTURE_COLUMNS = (
+    "live_unit_price_minor", "live_items_subtotal_minor", "live_quoted_total_minor",
+    "live_price_stage", "price_rebound_from_minor", "price_rebound_to_minor",
+    "price_corroboration_source", "price_corroborated_at",
+)
 CORROBORATION_SOURCES = frozenset({"enrichment_proof", "mirror_proof"})
 
 #: Every column mig 258 adds, in the migration's order (the self-heal adds them in this order,

@@ -851,11 +851,13 @@ async def test_the_client_keys_the_witness_apart_and_sends_the_same_body(monkeyp
 
 def test_the_view_shows_a_live_price_only_on_a_price_changed_refusal():
     base = {"id": "rp_1", "state": "refused", "refusal_reason": "price_changed", "currency": "USD",
+            "last_error_code": "quote_items_subtotal_mismatch",
             "our_price_minor": 2800, "live_unit_price_minor": 3000, "live_items_subtotal_minor": 3000,
             "live_quoted_total_minor": 3500, "live_price_stage": "approval"}
     assert public_body(base)["live_price"]["unit_price_minor"] == 3000
     for other in ({"state": "quoting"}, {"refusal_reason": "variant_unavailable"},
-                  {"state": "failed"}, {"live_items_subtotal_minor": None}):
+                  {"state": "failed"}, {"live_items_subtotal_minor": None},
+                  {"last_error_code": None}, {"last_error_code": "quote_shipping_not_reconciled"}):
         assert "live_price" not in public_body({**base, **other}), other
     # never the flat columns
     assert not set(witness.COLUMNS) & set(public_body(base))
@@ -1129,3 +1131,130 @@ def test_the_mirror_proofs_must_agree():
         seed["snapshot"]["shopify_cart_variant_proofs"] = {
             JUDY_VARIANT: {**selected[JUDY_VARIANT], "price_minor": price, "currency": "USD"}}
         assert _mirror(seed) == expected
+
+
+
+# ══ 6. second review round (#2515): stale view, superseded totals, fences, foreign echo ═══════
+
+
+async def test_a_resolver_refusal_at_quoting_drops_the_witness_live_price(reap, monkeypatch):
+    """P2-1, the reviewer's probe: the witness saw 45.00 (shadow, continue); at 'quoting' the
+    re-resolve says 44.00 and `_price_verdict` refuses BEFORE any quote. The view must not say
+    "price updated to $45.00"."""
+    preflight(monkeypatch, "shadow")
+
+    def _resolution(price):
+        return rc.VariantResolution(ok=True, variant_id="var_abc123", product_id="prd_abc123",
+                                    price=(price, "USD"), available=True, queries_tried=["q"])
+
+    reap.resolve_our_row = [_resolution(42.50), _resolution(44.00)]
+    reap.request_quote = ok(tarte_quote(45.0, shipping=2.5))
+    purchase_id = await _variant_lane_purchase()
+    assert (await step(purchase_id)).state == "needs_enrollment"
+    assert (await get(purchase_id))["live_unit_price_minor"] == 4500  # precondition
+    assert (await step(purchase_id)).state == "quoting"
+    result = await step(purchase_id)
+    assert (result.state, result.refusal_reason) == ("refused", "price_changed")
+    row = await get(purchase_id)
+    assert picture(row) == NO_PICTURE
+    assert "live_price" not in public_body(row)
+    assert reap.named("request_quote") and len(reap.named("request_quote")) == 1  # no approval quote
+
+
+async def test_the_witness_totals_are_gone_once_an_approval_quote_exists(reap, monkeypatch):
+    """P2-2: witness corroborated lower (3000, total 3500); the approval quote is at our 3200
+    (total 3700). From 'quoting' on, only the approval quote's totals are shown."""
+    preflight(monkeypatch, "shadow")
+    corroboration_on(monkeypatch)
+    await write_enrichment_proof()
+    reap.request_cart_link_quote = [ok(tarte_quote(30.0, quote_id="q_witness")), ok(tarte_quote(32.0))]
+    purchase_id = await open_tarte(3200, enrolled=False)
+    assert (await step(purchase_id)).state == "needs_enrollment"
+    assert public_body(await get(purchase_id))["preflight"]["totals"]["total_minor"] == 3500
+    assert (await step(purchase_id)).state == "quoting"
+    assert "preflight" not in public_body(await get(purchase_id))
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    body = public_body(await get(purchase_id))
+    assert "preflight" not in body and body["totals"]["quoted_total_minor"] == 3700
+
+
+async def _claimed(purchase_id, worker="w1"):
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET claimed_by = :w, claimed_at = CURRENT_TIMESTAMP WHERE id = :i",
+        {"w": worker, "i": purchase_id})
+    return await ledger.get_purchase_internal(purchase_id)
+
+
+async def test_begin_is_fenced_on_the_exact_claim_not_only_the_holder(reap):
+    """M36: the same worker id re-claimed the row (a new lease): the old step's begin is refused."""
+    purchase_id = await open_tarte(3000, enrolled=False)
+    row = await _claimed(purchase_id)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET claimed_at = :t WHERE id = :i",
+        {"t": ledger._bind_dt(datetime(2001, 1, 1, tzinfo=timezone.utc)), "i": purchase_id})
+    assert await witness.begin_preflight(row, "w1") is False
+    assert (await get(purchase_id))["preflight_outcome"] is None
+
+
+async def test_a_recorded_outcome_is_never_overwritten(reap):
+    """M37: the record lands only over 'pending'."""
+    purchase_id = await open_tarte(3000, enrolled=False)
+    row = await _claimed(purchase_id)
+    await database.execute("UPDATE reap_agentic_purchases SET preflight_outcome = 'ok' WHERE id = :i",
+                           {"i": purchase_id})
+    assert await witness.record_preflight(row, "w1", outcome="price_changed",
+                                          error_code="quote_items_subtotal_mismatch") is False
+    assert (await get(purchase_id))["preflight_outcome"] == "ok"
+
+
+async def test_a_lost_live_price_write_at_approval_stops_the_step(reap, monkeypatch):
+    """M43: the approval quote's picture could not be written under our claim: nothing more."""
+    corroboration_on(monkeypatch)
+    await write_enrichment_proof()
+
+    async def _lost_write(row, worker_id, picture):
+        return False
+
+    monkeypatch.setattr(witness, "record_live_price", _lost_write)
+    purchase_id, result = await quote_with(reap, tarte_quote(30.0), our_price=3200)
+    assert result.outcome == "lost_claim", result
+    assert reap.named("create_checkout") == []
+    assert (await get(purchase_id))["state"] == "quoting"
+
+
+async def test_the_reconciliation_stop_is_checked_right_before_the_witness(reap, monkeypatch):
+    """M44 (the duplicate re-read was removed): the stop raised after the step began, before the
+    witness, still sends nothing -- the re-read that precedes the witness catches it."""
+    preflight(monkeypatch, "enforce")
+    purchase_id = await open_tarte(3000, enrolled=False)
+    calls = []
+
+    def _enabled():
+        calls.append(1)
+        return len(calls) <= 2  # advance's own check and the step's first re-read
+
+    monkeypatch.setattr(svc, "is_reconciliation_enabled", _enabled)
+    result = await step(purchase_id)
+    assert result.outcome == "lost_claim" and reap.sequence() == []
+    assert (await get(purchase_id))["preflight_outcome"] is None
+
+
+@pytest.mark.parametrize("mode,state", [("enforce", "refused"), ("shadow", "needs_enrollment")])
+async def test_a_foreign_items_echo_at_the_preflight_is_definitive(reap, monkeypatch, mode, state):
+    """P2-5: Reap echoed a line that is not ours -- it priced another item."""
+    preflight(monkeypatch, mode)
+    reap.request_cart_link_quote = ok(tarte_quote(30.0, items=[{"variantId": "var_x", "quantity": 2}]))
+    purchase_id = await open_tarte(3000, enrolled=False)
+    result = await step(purchase_id)
+    assert result.state == state, result
+    row = await get(purchase_id)
+    assert (row["preflight_outcome"], row["preflight_error_code"]) == ("refused", "quote_items_mismatch")
+    if mode == "enforce":
+        assert (result.refusal_reason, result.last_error_code) == ("price_unverifiable", "quote_items_mismatch")
+        assert reap.named("create_enrollment") == []
+
+
+def test_an_ok_witness_without_totals_shows_nothing():
+    """A row some other writer left `ok` with no totals is not a confirmed price."""
+    assert "preflight" not in public_body({"id": "rp_1", "state": "needs_enrollment", "currency": "USD",
+                                           "preflight_outcome": "ok", "preflight_total_minor": None})
