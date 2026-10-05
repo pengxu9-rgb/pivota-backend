@@ -41,6 +41,7 @@ from services.outbound_warm_handoff import could_upgrade_at_click_time
 from services.offer_buyability import (
     OFFER_UNAVAILABLE_AVAILABILITIES,
     availability_is_known_unavailable,
+    expected_currency_for_market,
 )
 from services import market_telemetry
 from db.database import database
@@ -7795,13 +7796,20 @@ async def _handle_find_products_multi_via_pivot(
     if not query:
         return None
 
+    # Resolved once, and the SAME value is both recorded and handed to recall, so the record is
+    # what recall received rather than a second derivation of it (services/market_telemetry.py).
+    pivot_market = _pivot_market_from_payload(payload, request_metadata)
+
     # Canonical dispatch precedes the legacy budget parser. Keep retrieval
     # nouns separate from enforceable money constraints on this actual path.
+    # The market's own currency prices an untyped "under 30", as the legacy
+    # parser did; a currency the caller or shopper wrote always wins.
     canonical_query = prepare_canonical_search_query(
         query,
         price_min=filters.price_min,
         price_max=filters.price_max,
         currency=(filters.currency or filters.request_context.get("currency") or (request_metadata or {}).get("currency")),
+        market_currency=expected_currency_for_market(pivot_market),
     ) if canonical_sig_mode else None
     requested_seller_id = str(filters.merchant_id or "").strip()
     requested_seller_ids = list(dict.fromkeys(str(value).strip() for value in filters.merchant_ids if str(value).strip()))
@@ -8028,9 +8036,6 @@ async def _handle_find_products_multi_via_pivot(
     # candidate set that never contained a single row of that brand.
     brand_anchor_terms, brand_anchor_source = await _resolve_brand_anchor_terms(query)
 
-    # Resolved once, and the SAME value is both recorded and handed to recall, so the record is
-    # what recall received rather than a second derivation of it (services/market_telemetry.py).
-    pivot_market = _pivot_market_from_payload(payload, request_metadata)
     market_telemetry.observe_resolved(request_metadata, pivot_market)
 
     pivot_result = await search_pivot_catalog(

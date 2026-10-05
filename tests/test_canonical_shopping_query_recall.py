@@ -119,12 +119,30 @@ def catalog(monkeypatch):
 
 
 async def run_query(query, **fields):
+    metadata = {"source": "shopping_agent", "catalog_surface": "agent_api", "commerce_surface": "agent_api"}
+    if "market" in fields:
+        metadata["market"] = fields.pop("market")
     return await gateway._handle_find_products_multi_inner(
         gateway.FindProductsMultiPayload(search=gateway.MultiSearchFilters(
             query=query, catalog_entity_mode="canonical_sig", commerce_surface="agent_api",
             in_stock_only=True, limit=fields.pop("limit", 12), **fields,
-        )), {"source": "shopping_agent", "catalog_surface": "agent_api", "commerce_surface": "agent_api"}, BackgroundTasks(),
+        )), metadata, BackgroundTasks(),
     )
+
+
+ALL_USD_MOISTURIZERS = {"sig_test_cheap", "sig_test_mid", "sig_test_boundary", "sig_test_expensive"}
+
+
+def assert_budget_reported_not_enforced(result, query):
+    """A money clause we cannot represent is never enforced as a wrong bound,
+    never empties the search, and is handed back as an unverified constraint."""
+    metadata = result["metadata"]
+    plan = metadata["canonical_query"]
+    assert "strict_empty_reason" not in metadata
+    assert (plan["price_min"], plan["price_max"], plan["error"]) == (None, None, None)
+    assert plan["unparsed_budget_clause"] is True
+    assert metadata["unverified_constraints"] == [query]
+    assert ALL_USD_MOISTURIZERS <= {p["product_id"] for p in result["products"]}
 
 
 @pytest.mark.asyncio
@@ -159,14 +177,12 @@ async def test_budget_currency_and_boundaries_before_page_slice(catalog):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("query,fields,error", [
-    ("moisturizers under 30", {}, "budget_currency_required"),
-    ("moisturizers under USD 30", {"currency": "EUR"}, "conflicting_budget_currencies"),
     ("moisturizers over USD 30 under USD 20", {}, "empty_budget_range"),
     ("under USD 30", {}, "missing_product_query"),
-    ("moisturizers under USD -30", {}, "unsupported_budget_clause"),
-    ("moisturizers under USD 1,000", {}, "unsupported_budget_clause"),
+    # A caller's own invalid API bound is its error, not a shopper's phrasing.
+    ("moisturizers", {"price_max": -5}, "invalid_budget_amount"),
 ])
-async def test_ambiguous_constraints_do_not_become_broad_catalog_recall(catalog, query, fields, error):
+async def test_contradictory_or_invalid_bounds_return_empty(catalog, query, fields, error):
     result = await run_query(query, **fields)
     assert result["products"] == []
     assert result["metadata"]["strict_empty_reason"] == error
@@ -207,17 +223,26 @@ async def test_lower_budget_paraphrases_keep_direction(catalog, clause):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("query,fields", [
+    ("moisturizers under USD 30", {"currency": "EUR"}),
+    ("moisturizers under USD -30", {}),
+    ("moisturizers under USD 1,000", {}),
+    ("moisturizers under 30", {"market": "ZZ"}),
+])
+async def test_unrepresentable_budgets_are_reported_not_enforced(catalog, query, fields):
+    assert_budget_reported_not_enforced(await run_query(query, **fields), query)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("clause", [
     "under about USD30", "maximum around USD30", "budget is USD30", "budget = 30",
     "price<=30", "priced at USD30", "around USD30", "for 30 dollars", "under USD30cm",
     "not under USD30", "not above USD30", "costing around USD30", "under USD1e3",
     "budget of 30cm", "price below 30cm",
 ])
-async def test_unrepresented_numeric_money_clauses_fail_closed(catalog, clause):
-    result = await run_query(f"moisturizers {clause}")
-    assert result["products"] == []
-    assert result["metadata"]["strict_empty_reason"] == "unsupported_budget_clause"
-    assert catalog == []
+async def test_unrepresented_numeric_money_clauses_are_reported_not_enforced(catalog, clause):
+    query = f"moisturizers {clause}"
+    assert_budget_reported_not_enforced(await run_query(query), query)
 
 
 @pytest.mark.asyncio
@@ -286,11 +311,9 @@ async def test_recognized_negation_does_not_invalidate_a_following_bound(catalog
     "budget of thirty dollars", "under several euros", "under XYZ30",
     "I do not want to spend more than USD30 on", "with no price over USD30",
 ])
-async def test_unsupported_full_money_clauses_refuse_before_recall(catalog, clause):
-    result = await run_query(f"moisturizers {clause}")
-    assert result["products"] == []
-    assert result["metadata"]["strict_empty_reason"] == "unsupported_budget_clause"
-    assert catalog == []
+async def test_unsupported_full_money_clauses_are_reported_not_enforced(catalog, clause):
+    query = f"moisturizers {clause}"
+    assert_budget_reported_not_enforced(await run_query(query), query)
 
 
 @pytest.mark.asyncio
@@ -300,11 +323,9 @@ async def test_unsupported_full_money_clauses_refuse_before_recall(catalog, clau
     "under infinityUSD", "under USD inf", "under USD +inf", "budget of NaN",
     "at most USD sNaN", "maximum USD ∞", "under thirty dollars and under USDNaN",
 ])
-async def test_nonfinite_text_money_is_not_an_unbounded_search(catalog, clause):
-    result = await run_query(f"moisturizers {clause}")
-    assert result["products"] == []
-    assert result["metadata"]["strict_empty_reason"] == "invalid_budget_amount"
-    assert catalog == []
+async def test_nonfinite_text_money_is_reported_not_enforced(catalog, clause):
+    query = f"moisturizers {clause}"
+    assert_budget_reported_not_enforced(await run_query(query), query)
 
 
 @pytest.mark.asyncio
@@ -335,11 +356,23 @@ async def test_three_letter_attributes_are_not_invented_currencies(catalog, cons
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("query", ["moisturizers under 5 under USD30", "moisturizers above 2 frobs under USD30"])
-async def test_an_untyped_bound_cannot_borrow_a_later_currency(catalog, query):
+async def test_an_unclear_number_beside_a_written_budget_stays_text(catalog, query):
+    # Only the written USD bound is enforced; the unclear number is reported.
     result = await run_query(query)
-    assert result["products"] == []
-    assert result["metadata"]["strict_empty_reason"] == "budget_currency_required"
-    assert catalog == []
+    plan = result["metadata"]["canonical_query"]
+    assert (plan["price_min"], plan["price_max"], plan["budget_currency"]) == (None, "30", "USD")
+    assert plan["unparsed_budget_clause"] is True
+    assert result["metadata"]["unverified_constraints"] == [query]
+    assert {p["product_id"] for p in result["products"]} == {"sig_test_cheap", "sig_test_mid"}
+
+
+@pytest.mark.asyncio
+async def test_an_untyped_bound_never_takes_a_different_written_currency(catalog):
+    query = "moisturizers under 30 and over 10 euros"
+    result = await run_query(query)
+    plan = result["metadata"]["canonical_query"]
+    assert (plan["price_min"], plan["price_max"], plan["budget_currency"]) == (None, None, None)
+    assert plan["unparsed_budget_clause"] is True
 
 
 def test_nonfinite_words_without_monetary_context_remain_product_text():
@@ -352,13 +385,11 @@ def test_nonfinite_words_without_monetary_context_remain_product_text():
 @pytest.mark.parametrize("code", ["NOK", "SEK", "AED", "nok", "sek", "aed"])
 @pytest.mark.parametrize("position", ["prefix", "suffix"])
 @pytest.mark.parametrize("context_currency", [None, "USD"])
-async def test_unrecognized_currency_codes_cannot_become_unbounded_or_usd_budgets(catalog, code, position, context_currency):
+async def test_unrecognized_currency_codes_never_become_usd_budgets(catalog, code, position, context_currency):
     clause = f"under {code}30" if position == "prefix" else f"under 30 {code}"
     fields = {"currency": context_currency} if context_currency else {}
-    result = await run_query(f"moisturizers {clause}", **fields)
-    assert result["products"] == []
-    assert result["metadata"]["strict_empty_reason"] in {"unsupported_budget_clause", "budget_currency_required"}
-    assert catalog == []
+    query = f"moisturizers {clause}"
+    assert_budget_reported_not_enforced(await run_query(query, **fields), query)
 
 
 @pytest.mark.asyncio
@@ -386,11 +417,9 @@ async def test_budget_adjective_does_not_turn_model_or_size_into_money(catalog, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("clause", ["do not have a price above USD30", "no dearer than thirty dollars"])
-async def test_other_negated_money_predicates_are_explicitly_unsupported(catalog, clause):
-    result = await run_query(f"moisturizers {clause}")
-    assert result["products"] == []
-    assert result["metadata"]["strict_empty_reason"] == "unsupported_budget_clause"
-    assert catalog == []
+async def test_other_negated_money_predicates_are_reported_not_enforced(catalog, clause):
+    query = f"moisturizers {clause}"
+    assert_budget_reported_not_enforced(await run_query(query), query)
 
 
 @pytest.mark.asyncio
@@ -399,8 +428,11 @@ async def test_residual_qualifiers_are_not_certified_by_category_recall(catalog,
     original = f"{qualifier} moisturizers under USD30"
     result = await run_query(original)
     assert result["metadata"]["canonical_query"]["original_query"] == original
+    # The qualifier is always handed back unverified: alone, or inside the
+    # shopper's full query when a nearby negation left the budget unenforced.
+    # Existing SPF/ingredient gates may reject these plain test products.
     if result["products"]:
-        assert result["metadata"]["unverified_constraints"] == [f"{qualifier} moisturizer"]
+        assert any(qualifier in constraint for constraint in result["metadata"]["unverified_constraints"])
 
 
 @pytest.mark.asyncio
@@ -503,11 +535,9 @@ def test_flat_multi_payload_keeps_seller_and_currency_scope():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("clause", ["under thirty NOK", "under NOK thirty", "budget of thirty AED", "maximum SEK forty", "under thirty"])
-async def test_word_amount_does_not_require_a_known_currency_to_be_refused(catalog, clause):
-    result = await run_query(f"moisturizers {clause}")
-    assert result["products"] == []
-    assert result["metadata"]["strict_empty_reason"] == "unsupported_budget_clause"
-    assert catalog == []
+async def test_word_amounts_are_reported_whatever_the_currency(catalog, clause):
+    query = f"moisturizers {clause}"
+    assert_budget_reported_not_enforced(await run_query(query), query)
 
 
 def test_word_valued_measurement_stays_non_monetary():
@@ -528,11 +558,9 @@ def test_word_valued_measurement_stays_non_monetary():
     "under around thirty USD", "below roughly forty dollars",
     "price should be around thirty", "budget would be about thirty XYZ",
 ])
-async def test_modified_word_money_clauses_fail_closed_before_catalog(catalog, clause):
-    result = await run_query(f"moisturizers {clause}")
-    assert result["products"] == []
-    assert result["metadata"]["strict_empty_reason"] == "unsupported_budget_clause"
-    assert catalog == []
+async def test_modified_word_money_clauses_are_reported_not_enforced(catalog, clause):
+    query = f"moisturizers {clause}"
+    assert_budget_reported_not_enforced(await run_query(query), query)
 
 
 @pytest.mark.parametrize("constraint", [
@@ -556,3 +584,85 @@ def test_word_amount_refusal_keeps_budget_adjectives_and_typed_sizes(query):
     plan = prepare_canonical_search_query(query)
     assert plan.error is None
     assert plan.price_min is None and plan.price_max is None
+
+
+# --- 2026-10-05 review regressions: real shopper phrasing ------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query", [
+    "moisturizers for women over 50", "moisturizers for skin over 40",
+    "moisturizers for over 40s", "moisturizers for over 60 skin",
+    "moisturizers for women over 50s", "moisturizers for under 18s",
+])
+async def test_age_and_audience_numbers_are_never_price_floors(catalog, query):
+    # Before the fix "women over 50" became price > $50 and "over 40s" emptied
+    # the search. Neither is money: every moisturizer is still offered.
+    result = await run_query(query)
+    plan = result["metadata"]["canonical_query"]
+    assert (plan["price_min"], plan["price_max"], plan["error"]) == (None, None, None)
+    assert "strict_empty_reason" not in result["metadata"]
+    assert ALL_USD_MOISTURIZERS <= {p["product_id"] for p in result["products"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clause", [
+    "between $20 and $30", "$20-$30", "$20 - $30", "$20 to $30", "from 20 to 30 dollars",
+    "between USD 20 and USD 30", "20-30 dollars", "between 20 and 30", "between $30 and $20",
+])
+async def test_price_ranges_are_enforced_inclusively(catalog, clause):
+    result = await run_query(f"moisturizers {clause}")
+    plan = result["metadata"]["canonical_query"]
+    assert (plan["price_min"], plan["price_max"], plan["budget_currency"]) == ("20", "30", "USD")
+    assert (plan["min_exclusive"], plan["max_exclusive"], plan["unparsed_budget_clause"]) == (False, False, False)
+    assert plan["retrieval_query"] == "moisturizer"
+    assert {p["product_id"] for p in result["products"]} == {"sig_test_mid", "sig_test_boundary"}
+
+
+@pytest.mark.parametrize("query", [
+    "toner 100-200ml", "SPF 30-50 sunscreen", "lip 2-3 pack", "k18-20 mask", "moisturizers 20-30",
+])
+def test_ranges_without_money_markers_stay_text(query):
+    plan = prepare_canonical_search_query(query, market_currency="USD")
+    assert (plan.price_min, plan.price_max, plan.error) == (None, None, None)
+    assert plan.retrieval_query == normalize_catalog_query(query)
+
+
+@pytest.mark.asyncio
+async def test_market_currency_prices_an_untyped_bound(catalog):
+    # The UI and Aurora send "under 30" with no currency. US -> USD.
+    result = await run_query("moisturizers under 30")
+    plan = result["metadata"]["canonical_query"]
+    assert (plan["price_max"], plan["budget_currency"], plan["unparsed_budget_clause"]) == ("30", "USD", False)
+    assert {p["product_id"] for p in result["products"]} == {"sig_test_cheap", "sig_test_mid"}
+
+
+@pytest.mark.asyncio
+async def test_market_currency_prices_explicit_api_bounds(catalog):
+    result = await run_query("moisturizers", price_max=25)
+    plan = result["metadata"]["canonical_query"]
+    assert (Decimal(plan["price_max"]), plan["budget_currency"]) == (Decimal(25), "USD")
+    assert {p["product_id"] for p in result["products"]} == {"sig_test_cheap", "sig_test_mid"}
+
+
+@pytest.mark.asyncio
+async def test_a_written_currency_beats_the_market_currency(catalog):
+    result = await run_query("moisturizers under 30 euros")
+    assert result["metadata"]["canonical_query"]["budget_currency"] == "EUR"
+    assert [p["product_id"] for p in result["products"]] == ["sig_test_eur"]
+
+
+@pytest.mark.asyncio
+async def test_a_non_us_market_prices_in_its_own_currency(catalog):
+    result = await run_query("moisturizers under 30", market="SG")
+    plan = result["metadata"]["canonical_query"]
+    assert (plan["price_max"], plan["budget_currency"]) == ("30", "SGD")
+    # The test catalog has no SGD offers; USD rows are never compared as SGD.
+    assert result["products"] == []
+    assert "strict_empty_reason" not in result["metadata"]
+
+
+@pytest.mark.parametrize("query", ["best price on k18", "k18 under SPF 30", "moisturizers under age30"])
+def test_model_numbers_and_attributes_are_not_unparsed_money(query):
+    plan = prepare_canonical_search_query(query, market_currency="USD")
+    assert (plan.price_min, plan.price_max, plan.error, plan.unparsed_budget) == (None, None, None, False)
