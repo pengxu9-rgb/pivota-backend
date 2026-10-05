@@ -70,6 +70,31 @@ CHECKOUT_TEMPORARILY_UNAVAILABLE with HTTP503. The append-only `not_created` rec
 Unknown codes/statuses and a missing checkout ID never supply that authority. A quote/enrollment
 pair with a prior started event is never dispatched a second time.
 
+The one local release: the client settles a `DispatchProbe` on every exit of `create_checkout`,
+and `not_dispatched` is true only when `_post` never reached the line immediately before the
+transport call (the final permission/scope re-check, missing configuration, an unbuildable
+request or header). That appends a `not_created` event with provider code
+`local_not_dispatched:<reason>` and goes through the same fenced clear. The cause keeps its own
+semantics (pause, reconciliation release, or hold with its own code). If Reap replays the same
+quote id inside its 240 s quote idempotency bucket, the key is still not dispatched again; the
+row holds as `checkout_quote_replayed` past the bucket and re-quotes, without becoming human work.
+Any failure after the send line, including an exception from the transport, stays parked.
+
+A 200 whose hosted action is refused (`hosted_url_not_allowed`) certainly created a checkout.
+Its `_path_id`-validated id is appended as an `observed` event and the row parks in `quoting` as
+`checkout_created_hosted_url_refused` (counted as needs-human, never re-sent). The URL is not
+stored or logged anywhere. To work it, read the checkout id from
+`reap_checkout_dispatch_events` (`event_type='observed'`) and reconcile it with Reap.
+
+A parked create (`quoting` with a dispatch key, counted in `checkout_needs_human`) is resolved
+only by an operator: `services.reap_checkout_recovery.list_parked_dispatches` lists the cohort,
+and `resolve_parked_dispatch` records `checkout_found` or `confirmed_not_created` from verified
+Reap evidence, no earlier than the settle window after the latest `started`. A
+`checkout_created_hosted_url_refused` park is one of them: `checkout_found` takes its `observed`
+id and `confirmed_not_created` is refused. The append-only journal gains operator `resolved` and
+`superseded` events (migration 257). The steps, and what never to do, are in
+docs/runbooks/reap_agentic_purchase.md, Parked checkout create.
+
 Owner view `checkout_dispatch_state` values:
 - `not_dispatched`: version1 tracking with no unresolved dispatch and no stored checkout/order
 - `dispatch_started`: durable intent exists; the outcome may be unknown

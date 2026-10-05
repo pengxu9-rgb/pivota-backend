@@ -188,6 +188,12 @@ REAP_AGENTIC_PILOT_SCOPE_ENV = "REAP_AGENTIC_PILOT_SCOPE"
 _SCOPE_POSTURES: set = set()
 _WORKER_QUOTE_TOTAL = ContextVar("reap_worker_quote_total", default=None)
 
+#: Human work in 'quoting' after a checkout create crossed the dispatch fence. The second names
+#: the one case where a checkout certainly exists at Reap (a 200 whose hosted action we refused);
+#: its id is in `reap_checkout_dispatch_events` as an `observed` event.
+CHECKOUT_DISPATCH_UNRESOLVED = "checkout_dispatch_unresolved"
+CHECKOUT_CREATED_HOSTED_URL_REFUSED = "checkout_created_hosted_url_refused"
+
 
 def _pilot_scope() -> Optional[Dict[str, Any]]:
     """A bounded production cohort. Only literal unrestricted is an explicit opt-out."""
@@ -2272,8 +2278,11 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
     if not is_reconciliation_enabled():
         return await _release(row, worker_id, error_code=row.get("last_error_code") or "reconciliation_disabled")
     if state == "quoting" and continuation.dispatch_state(row) != "not_dispatched":
-        # Privacy erasure cannot hide the more consequential unresolved dispatch.
-        return await _release(row, worker_id, error_code="checkout_dispatch_unresolved", seconds=900)
+        # Privacy erasure cannot hide the more consequential unresolved dispatch. A park that
+        # already names a KNOWN checkout keeps that name on every later poll.
+        parked = row.get("last_error_code")
+        return await _release(row, worker_id, seconds=900, error_code=(
+            parked if parked == CHECKOUT_CREATED_HOSTED_URL_REFUSED else CHECKOUT_DISPATCH_UNRESOLVED))
     if state in {"resolving", "quoting"} and continuation.contact_required(row):
         # Contact erasure pauses new work, not a non-sensitive read of the linked enrollment.
         return await _release(row, worker_id, error_code="contact_retention_elapsed")
@@ -3511,21 +3520,46 @@ async def _checkout_from_quote(
                            refusal_reason=exc.reason, last_error_code=exc.reason, **evidence)
     # This value reaches the client's final pre-stream permission check, including when
     # configuration changes during AsyncClient entry. Scope always bounds the actual charge.
-    dispatch_key = await continuation.begin_dispatch(
-        row, worker_id, quote_id=quote_id, enrollment_id=partner_enrollment,
-        enrollment_row_id=str(active["id"]), total=verdict.total_minor, expires=quote_expires,
-    )
+    try:
+        dispatch_key = await continuation.begin_dispatch(
+            row, worker_id, quote_id=quote_id, enrollment_id=partner_enrollment,
+            enrollment_row_id=str(active["id"]), total=verdict.total_minor, expires=quote_expires,
+        )
+    except continuation.UnsentKeyReplayed:
+        # Reap replayed the quote of a create that provably never left this process (its quote
+        # key is time-bucketed). Wait out that bucket so the next step gets a new quote id.
+        return await _hold(error_code="checkout_quote_replayed",
+                           seconds=rc.QUOTE_IDEMPOTENCY_BUCKET_S + 30)
     if dispatch_key is None:
         return await _hold(error_code="checkout_dispatch_unresolved", seconds=900)
     amount_token = _WORKER_QUOTE_TOTAL.set(verdict.total_minor)
+    # The client settles this on every exit. `not_dispatched` means its request provably never
+    # reached the transport call: the final permission/scope re-check, a missing configuration
+    # or a request it could not build stopped it locally. That -- and only that -- is journalled
+    # as a local `not_created` receipt, so the fence's one release rule applies to a create that
+    # was never sent instead of parking it forever as human work.
+    probe = rc.DispatchProbe()
     try:
         checkout = await rc.create_checkout(
             quote_id=quote_id,
             enrollment_id=partner_enrollment,
             return_url=_stage_url(row.get("return_url"), "checkout"),
+            dispatch_probe=probe,
         )
+    except Exception:
+        # Released by whoever handles the exception (`advance` pauses a scope stop and releases
+        # a reconciliation stop), exactly as before; only the fence is no longer left behind.
+        await continuation.record_not_dispatched(
+            row, worker_id, key=dispatch_key, quote_id=quote_id,
+            enrollment_id=partner_enrollment, probe=probe,
+        )
+        raise
     finally:
         _WORKER_QUOTE_TOTAL.reset(amount_token)
+    await continuation.record_not_dispatched(
+        row, worker_id, key=dispatch_key, quote_id=quote_id,
+        enrollment_id=partner_enrollment, probe=probe,
+    )
     await continuation.record_dispatch_response(
         row, worker_id, key=dispatch_key, quote_id=quote_id,
         enrollment_id=partner_enrollment, checkout=checkout,
@@ -3542,7 +3576,25 @@ async def _checkout_from_quote(
             # including malformed/oversized HTTP200, HTTP500 and an unsafe URL, is unresolved
             # operator work, not an authoritative failed purchase.
             if continuation.dispatch_state(fresh) != "not_dispatched":
-                return await _hold(error_code="checkout_dispatch_unresolved", seconds=900)
+                refused_checkout = (
+                    _partner_id(checkout.refused_checkout_id, what="checkout")
+                    if checkout.error == "hosted_url_not_allowed" else None
+                )
+                if refused_checkout is not None:
+                    # A checkout CERTAINLY exists: Reap answered 200 with an id, and only its
+                    # hosted action was refused. The id is in the dispatch journal; the URL is
+                    # nowhere. Parked under its own name so the operator knows what to look for.
+                    logger.warning(
+                        "reap_agentic: checkout created behind a refused hosted action "
+                        "purchase=%s checkout=%s quote=%s", row["id"], refused_checkout, quote_id,
+                    )
+                    return await _hold(error_code=CHECKOUT_CREATED_HOSTED_URL_REFUSED, seconds=900)
+                return await _hold(error_code=CHECKOUT_DISPATCH_UNRESOLVED, seconds=900)
+            if probe.not_dispatched:
+                # Nothing left this process, and the local receipt released the fence. The cause
+                # keeps its own name and backoff; the next step re-quotes under a new key.
+                code = str(checkout.error or "checkout_create_failed")
+                return await _hold(error_code=code, transport=_is_transport(code))
             detail = str(checkout.error_detail_code or "")
             # Since the 2026-09-25 spec the checkout create's state conflicts are a 409 with the
             # code at `error.code`; before it they were a 400 with the code at `error.detail.code`.
@@ -3620,6 +3672,8 @@ async def _checkout_from_quote(
 PERMANENT_CHECKOUT_READ_ERRORS = frozenset({"reap_status_404", "hosted_url_not_allowed", "unknown_checkout_status"})
 PERMANENT_CHECKOUT_READ_LIMIT = 3
 CHECKOUT_HUMAN_RETRY_SECONDS = 900
+#: COMPLETED on a checkout an operator attached to a parked create (reap_checkout_recovery).
+OPERATOR_FOUND_COMPLETED = "checkout_unresolvable:3:operator_found_completed"
 
 
 def _checkout_failure_count(code: Any) -> int:
@@ -3689,6 +3743,11 @@ async def _step_checkout_poll(
     recovered_code = "checkout_read_recovered" if _checkout_failure_count(row.get("last_error_code")) else None
     state = rc.checkout_state(read.data)
     if state == "completed":
+        if not row.get("hosted_url") and await continuation.operator_found_checkout(str(row["id"]), checkout_id):
+            # An operator attached this checkout to a parked create; no link we delivered was
+            # approved. Payment and attribution are a human decision, never an automatic close.
+            return await _release(row, worker_id, error_code=OPERATOR_FOUND_COMPLETED,
+                                  seconds=CHECKOUT_HUMAN_RETRY_SECONDS)
         return await _complete(row, worker_id, from_state, read.data)
     if state == "failed":
         return await _move(

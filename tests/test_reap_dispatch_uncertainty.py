@@ -209,7 +209,8 @@ async def test_real_checkout_client_ambiguous_response_stays_nonterminal(reap, m
     after=await _get(pid)
     assert len(seen)==1 and after['checkout_dispatch_key']
     events=await _events(pid)
-    assert {e['event_type'] for e in events}=={'started'}
+    # A refused hosted action is still a CREATED checkout: its id is journalled, never its URL.
+    assert {e['event_type'] for e in events}==({'started','observed'} if kind=='unsafe_action' else {'started'})
     assert after['state'] not in ledger.TERMINAL_STATES, (kind,result,await ledger.count_checkout_needs_human())
 
 async def test_ambiguous_dispatch_owner_projection_is_nonterminal_and_never_no_dispatch(reap):

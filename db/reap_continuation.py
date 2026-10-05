@@ -17,7 +17,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS reap_checkout_dispatch_events (
     purchase_id VARCHAR(64) NOT NULL,
     dispatch_key VARCHAR(64) NOT NULL,
-    event_type VARCHAR(32) NOT NULL CHECK(event_type IN ('started','not_created','observed')),
+    event_type VARCHAR(32) NOT NULL CHECK(event_type IN ('started','not_created','observed','resolved','superseded')),
     quote_id VARCHAR(128) NOT NULL,
     enrollment_id VARCHAR(128) NOT NULL,
     checkout_id VARCHAR(128),
@@ -48,6 +48,81 @@ BEFORE DELETE ON reap_checkout_dispatch_events
 BEGIN SELECT RAISE(ABORT, 'reap dispatch evidence is append-only'); END
 """
 
+# Mig 257: an operator `resolved` event closes one parked dispatch key, and `superseded` records
+# a later checkout_found that a late `observed` receipt forced over a not-created decision.
+# Existing journal rows are never rewritten; only the vocabulary widens (SQLite rebuilds).
+_EVENT_CHECK = "reap_checkout_dispatch_events_event_type_check"
+_WIDEN_EVENTS_PG = f"""
+ALTER TABLE reap_checkout_dispatch_events DROP CONSTRAINT IF EXISTS {_EVENT_CHECK},
+    ADD CONSTRAINT {_EVENT_CHECK} CHECK (event_type IN ('started','not_created','observed','resolved','superseded'))
+"""
+# Mig 257: `recorded_at` is zoneless, and CURRENT_TIMESTAMP would store the WRITER session's
+# wall time. Written as UTC explicitly so the operator's settle-window CAS is session-independent.
+_UTC_RECORDED_AT_PG = "ALTER TABLE reap_checkout_dispatch_events ALTER COLUMN recorded_at SET DEFAULT timezone('UTC', now())"
+_EVENT_COLUMNS = "purchase_id,dispatch_key,event_type,quote_id,enrollment_id,checkout_id,provider_code,recorded_at"
+
+# One operator decision per parked dispatch key, plus at most one (decision_seq 2) that
+# supersedes a not-created decision after a late receipt or a re-park, matching the journal's
+# single `superseded` row per key. Opaque handles only: no buyer contact, no provider
+# body, no hosted URL. See services/reap_checkout_recovery.resolve_parked_dispatch.
+_RESOLUTION_AUDIT = """
+CREATE TABLE IF NOT EXISTS reap_checkout_dispatch_resolution_audit (
+    purchase_id VARCHAR(64) NOT NULL,
+    dispatch_key VARCHAR(64) NOT NULL,
+    outcome VARCHAR(32) NOT NULL,
+    reap_checkout_id VARCHAR(128),
+    checkout_id_source VARCHAR(32),
+    resolved_state VARCHAR(32) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    evidence_source VARCHAR(64) NOT NULL,
+    evidence_reference VARCHAR(128) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    expected_updated_at TIMESTAMPTZ NOT NULL,
+    evidence_observed_at TIMESTAMPTZ NOT NULL,
+    provider_base_url VARCHAR(255) NOT NULL,
+    decision_seq INTEGER NOT NULL,
+    supersedes_outcome VARCHAR(32),
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (purchase_id, dispatch_key, decision_seq),
+    CHECK (outcome IN ('checkout_found','confirmed_not_created')),
+    CHECK ((decision_seq = 1 AND supersedes_outcome IS NULL)
+        OR (decision_seq = 2 AND supersedes_outcome = 'confirmed_not_created')),
+    CHECK (checkout_id_source IN ('journal_observed','operator_supplied')),
+    CHECK (evidence_source IN ('authenticated_reap_checkout_read','verified_reap_support_statement')),
+    CHECK ((outcome = 'checkout_found' AND reap_checkout_id IS NOT NULL AND checkout_id_source IS NOT NULL
+            AND resolved_state = 'awaiting_approval')
+        OR (outcome = 'confirmed_not_created' AND reap_checkout_id IS NULL AND checkout_id_source IS NULL
+            AND resolved_state = 'quoting'))
+)
+"""
+
+
+async def _allow_resolved_events():
+    if IS_POSTGRES:
+        definition = await database.fetch_val(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid='reap_checkout_dispatch_events'::regclass AND conname=:name", {'name': _EVENT_CHECK})
+        if definition is None or "'superseded'" not in definition:
+            await database.execute(_WIDEN_EVENTS_PG)
+        default = await database.fetch_val(
+            "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a"
+            " ON a.attrelid=d.adrelid AND a.attnum=d.adnum"
+            " WHERE d.adrelid='reap_checkout_dispatch_events'::regclass AND a.attname='recorded_at'")
+        if default is None or "'UTC'" not in default:
+            await database.execute(_UTC_RECORDED_AT_PG)
+        return
+    sql = await database.fetch_val(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='reap_checkout_dispatch_events'")
+    if sql and "'superseded'" not in sql:
+        # DROP TABLE fires no row triggers; the append-only triggers are recreated by the caller.
+        async with database.transaction():
+            await database.execute('ALTER TABLE reap_checkout_dispatch_events RENAME TO reap_checkout_dispatch_events_pre257')
+            await database.execute(_SCHEMA)
+            await database.execute(f'INSERT INTO reap_checkout_dispatch_events ({_EVENT_COLUMNS}) '
+                                   f'SELECT {_EVENT_COLUMNS} FROM reap_checkout_dispatch_events_pre257')
+            await database.execute('DROP TABLE reap_checkout_dispatch_events_pre257')
+
+
 _COLUMNS = {
     'dispatch_tracking_version': 'INTEGER',
     'checkout_dispatch_key': 'VARCHAR(64)',
@@ -57,7 +132,7 @@ _COLUMNS = {
 }
 
 async def ensure_continuation_schema():
-    """Self-heal parity with migration 256; failure must block writes, never imply no dispatch."""
+    """Self-heal parity with migrations 256+257; failure must block writes, never imply no dispatch."""
     if IS_POSTGRES:
         await database.execute("""ALTER TABLE reap_agentic_purchases
             ADD COLUMN IF NOT EXISTS dispatch_tracking_version INTEGER,
@@ -71,12 +146,14 @@ async def ensure_continuation_schema():
             if name not in columns:
                 await database.execute(f'ALTER TABLE reap_agentic_purchases ADD COLUMN {name} {kind}')
     await database.execute(_SCHEMA)
+    await _allow_resolved_events()
     if IS_POSTGRES:
         await database.execute(_IMMUTABLE_FUNCTION)
         await database.execute(_IMMUTABLE_TRIGGER)
     else:
         await database.execute(_IMMUTABLE_UPDATE_SQLITE)
         await database.execute(_IMMUTABLE_DELETE_SQLITE)
+    await database.execute(_RESOLUTION_AUDIT if IS_POSTGRES else _RESOLUTION_AUDIT.replace('TIMESTAMPTZ', 'TIMESTAMP'))
 
 
 def contact_required(row: Mapping[str, Any]) -> bool:
@@ -127,10 +204,31 @@ WHERE id=:id AND state='quoting' AND claimed_by=:worker AND claimed_at=:claimed_
 RETURNING id
 """
 
+class UnsentKeyReplayed(Exception):
+    """The quote/enrollment pair maps to a key whose only receipt is a LOCAL not-dispatched one.
+
+    Raised before any write. The key is still never dispatched a second time (its journal could
+    not represent that send), but nothing was sent under it either, so this is not human work:
+    the caller waits out the quote's idempotency window and re-quotes under a new quote id.
+    """
+
+
+_UNSENT_REPLAY = """
+SELECT 1 FROM reap_checkout_dispatch_events n
+WHERE n.purchase_id=:id AND n.dispatch_key=:key AND n.event_type='not_created'
+  AND substr(COALESCE(n.provider_code,''),1,21)='local_not_dispatched:'
+  AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events o
+                  WHERE o.purchase_id=:id AND o.event_type='observed')
+"""
+
+
 async def begin_dispatch(row, worker, *, quote_id, enrollment_id, enrollment_row_id, total, expires):
     """Atomically fence this exact dispatch and append immutable intent before any network call."""
     from db import reap_agentic_ledger as ledger
     key = hashlib.sha256(json.dumps([row['id'],quote_id,enrollment_id],separators=(',',':')).encode()).hexdigest()
+    if await database.fetch_one(_UNSENT_REPLAY, {'id':row['id'],'key':key}):
+        # Evidence is append-only, so this answer cannot be invalidated by a later write.
+        raise UnsentKeyReplayed()
     async with database.transaction():
         changed = await database.fetch_one(_BEGIN, {
             'id':row['id'], 'worker':worker, 'claimed_at':ledger._bind_dt(row.get('claimed_at')),
@@ -155,6 +253,10 @@ async def record_dispatch_response(row, worker, *, key, quote_id, enrollment_id,
     """
     from services import reap_agentic_purchase as svc
     observed = svc._partner_id(checkout.data.get('id'), what='checkout') if checkout.ok else None
+    if not checkout.ok and checkout.error == 'hosted_url_not_allowed':
+        # A refused hosted action is still a CREATED checkout. Its validated id is evidence;
+        # the URL never reached this module and is never stored.
+        observed = svc._partner_id(getattr(checkout, 'refused_checkout_id', None), what='checkout')
     codes = {str(checkout.error_code or ''), str(checkout.error_detail_code or '')}
     negative = None
     if not checkout.ok:
@@ -172,6 +274,30 @@ async def record_dispatch_response(row, worker, *, key, quote_id, enrollment_id,
             await database.execute(_PRESERVE_OBSERVED_FENCE, {'id':row['id'],'key':key})
         if negative:
             await database.fetch_one(_CLEAR_NEGATIVE, {'id':row['id'],'worker':worker,'key':key,'claimed_at':svc.ledger._bind_dt(row.get('claimed_at'))})
+
+# Journal codes for a create the client proved never left the process. Prefixed so no provider
+# code can collide with them; the suffix is the client's bounded `DispatchProbe.reason`.
+NOT_DISPATCHED_PREFIX = 'local_not_dispatched:'
+
+
+async def record_not_dispatched(row, worker, *, key, quote_id, enrollment_id, probe):
+    """The local negative receipt: the client settled `probe` before its transport call.
+
+    Same release rule as a provider rejection -- a `not_created` event for this exact key, then
+    the fenced clear -- with a local, provable reason instead of a provider code. A probe that
+    is unsettled or saw the send line is never negative proof, so this writes nothing for it.
+    The key is still never dispatched again (`begin_dispatch` refuses a key with a `started`).
+    """
+    from services import reap_agentic_purchase as svc
+    if not getattr(probe, 'not_dispatched', False):
+        return False
+    code = (NOT_DISPATCHED_PREFIX + str(probe.reason or 'local_error'))[:64]
+    async with database.transaction():
+        await database.execute(_APPEND, {'id':row['id'],'key':key,'event':'not_created','quote':quote_id,
+                                         'enrollment':enrollment_id,'checkout':None,'code':code})
+        cleared = await database.fetch_one(_CLEAR_NEGATIVE, {'id':row['id'],'worker':worker,'key':key,
+                                           'claimed_at':svc.ledger._bind_dt(row.get('claimed_at'))})
+    return cleared is not None
 
 _LOCK_RESPONSE = """
 UPDATE reap_agentic_purchases SET checkout_dispatch_key=checkout_dispatch_key
@@ -225,3 +351,14 @@ async def restore_contact(row, *, agent_id, owner_hash, request_key, request_has
     else:
         result = await database.fetch_one(_RESTORE_SQLITE, values)
     return ledger._purchase(result)
+
+
+OPERATOR_CHECKOUT_FOUND = 'OPERATOR_CHECKOUT_FOUND'
+
+
+async def operator_found_checkout(purchase_id: str, checkout_id: str) -> bool:
+    """Was this checkout attached by an operator, rather than handed to the buyer through a link we sent?"""
+    return await database.fetch_val(
+        "SELECT 1 FROM reap_checkout_dispatch_events WHERE purchase_id=:id AND checkout_id=:checkout"
+        " AND event_type IN ('resolved','superseded') AND provider_code=:code LIMIT 1",
+        {'id': purchase_id, 'checkout': checkout_id, 'code': OPERATOR_CHECKOUT_FOUND}) is not None
