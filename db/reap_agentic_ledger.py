@@ -364,6 +364,9 @@ _PURCHASE_TS_COLUMNS = (
     "terminal_at",
     "contact_received_at",
     "contact_purged_at",
+    # mig 258 (db/reap_price_witness.py)
+    "preflight_checked_at",
+    "price_corroborated_at",
 )
 _ENROLLMENT_TS_COLUMNS = ("hosted_url_expires_at", "created_at", "updated_at")
 
@@ -804,6 +807,8 @@ def _normalize_row(row: Any, ts_columns: Sequence[str]) -> Optional[Dict[str, An
     # SQLite hands a BOOLEAN back as 0/1; one shape out on both engines (mig 247).
     if out.get("tax_included") is not None:
         out["tax_included"] = bool(out["tax_included"])
+    if out.get("preflight_tax_included") is not None:  # mig 258, the same rule
+        out["preflight_tax_included"] = bool(out["preflight_tax_included"])
     return out
 
 
@@ -888,6 +893,14 @@ def _is_unique_violation(exc: BaseException) -> bool:
 # buyer-ENTERED, so the terminal write NULLs it with the email and the address, and only the
 # outcome and the discount survive. `discount_minor` is what Reap took off, and `tax_included`
 # says whether `tax_minor` is already inside the prices, next to the totals they explain.
+#
+# HERE, AND WHY — the price witness (mig 258, db/reap_price_witness.py). Facts about what Reap
+# QUOTED for the owner's own purchase -- the confirmed totals of the buy-intent preflight, the
+# merchant's live price when a quote disagreed with ours, and a corroborated lower price the
+# purchase continued at -- so the door can say "price updated to $X" or show the confirmed total
+# before the card page. None is PII, a partner id, or our plumbing (the witness's quote id is
+# never stored at all). The route nests them (`preflight`, `live_price`, `price_rebound`) and
+# emits each ONLY when it applies, so a row the dark dials never touched answers exactly as before.
 PUBLIC_PURCHASE_COLUMNS = (
     "id",
     "state",
@@ -920,6 +933,22 @@ PUBLIC_PURCHASE_COLUMNS = (
     "created_at",
     "updated_at",
     "terminal_at",
+    "preflight_outcome",
+    "preflight_error_code",
+    "preflight_checked_at",
+    "preflight_items_subtotal_minor",
+    "preflight_shipping_minor",
+    "preflight_tax_minor",
+    "preflight_tax_included",
+    "preflight_total_minor",
+    "live_unit_price_minor",
+    "live_items_subtotal_minor",
+    "live_quoted_total_minor",
+    "live_price_stage",
+    "price_rebound_from_minor",
+    "price_rebound_to_minor",
+    "price_corroboration_source",
+    "price_corroborated_at",
 )
 
 

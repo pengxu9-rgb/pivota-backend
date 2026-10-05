@@ -78,6 +78,7 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
     _MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
+    _MIGRATIONS_DIR / "258_reap_price_witness.sql",  # the price witness (dark dials)
 )
 
 # Same convention as the other gates on this rail: this file DROPS its tables, so it must be

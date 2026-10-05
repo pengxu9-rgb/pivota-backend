@@ -65,6 +65,7 @@ MIGRATIONS = (
     MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
     MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
+    MIGRATIONS_DIR / "258_reap_price_witness.sql",  # the price witness (dark dials)
 )
 SEEDS_MIGRATION = MIGRATIONS_DIR / "044_external_product_seeds.sql"
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")

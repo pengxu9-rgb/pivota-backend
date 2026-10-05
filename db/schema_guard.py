@@ -1121,6 +1121,38 @@ async def ensure_required_schema_light() -> None:
                 await ensure_continuation_schema()
             except Exception as exc:
                 logger.warning("schema_guard: Reap continuation schema unavailable (%s)", type(exc).__name__)
+            # mig 258: the price witness (preflight quote + corroborated price change). Its own
+            # try: the columns are read and written only behind dark dials, and a failure here must
+            # not starve what follows. The same statement as
+            # db/reap_price_witness._ADD_COLUMNS_PG, spelled here for the coverage gate
+            # (tests/test_schema_guard_migration_coverage.py).
+            try:
+                await _heal_add_columns("""
+                    ALTER TABLE IF EXISTS reap_agentic_purchases
+                        ADD COLUMN IF NOT EXISTS preflight_outcome VARCHAR(16),
+                        ADD COLUMN IF NOT EXISTS preflight_error_code VARCHAR(64),
+                        ADD COLUMN IF NOT EXISTS preflight_checked_at TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS preflight_items_subtotal_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS preflight_shipping_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS preflight_tax_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS preflight_tax_included BOOLEAN,
+                        ADD COLUMN IF NOT EXISTS preflight_total_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS live_unit_price_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS live_items_subtotal_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS live_quoted_total_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS live_price_stage VARCHAR(16),
+                        ADD COLUMN IF NOT EXISTS price_rebound_from_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS price_rebound_to_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS price_corroboration_source VARCHAR(32),
+                        ADD COLUMN IF NOT EXISTS price_corroborated_at TIMESTAMPTZ;
+                """)
+            except Exception:
+                pass
+            try:
+                from db.reap_price_witness import ensure_price_witness_schema
+                await ensure_price_witness_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: Reap price witness schema unavailable (%s)", type(exc).__name__)
             # mig 252: AT MOST ONE PENDING ENROLLMENT PER BUYER.
             # db/migrations/252_reap_agentic_enrollments_one_pending.sql is the
             # same index. Two purchases of one buyer, each in 'resolving' in one
@@ -3809,6 +3841,14 @@ async def ensure_required_schema_light() -> None:
                 await ensure_continuation_schema()
             except Exception as exc:
                 logger.warning("schema_guard: Reap continuation schema unavailable (%s)", type(exc).__name__)
+            # mig 258: the price witness (preflight quote + corroborated price change). Its own
+            # try: the columns are read and written only behind dark dials, and a failure here must
+            # not starve what follows.
+            try:
+                from db.reap_price_witness import ensure_price_witness_schema
+                await ensure_price_witness_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: Reap price witness schema unavailable (%s)", type(exc).__name__)
             # mig 252: at most one PENDING enrollment per buyer, SQLite twin of
             # the Postgres block above (same index, same reason, same own try:
             # it fails on a database that already holds two pending rows for one

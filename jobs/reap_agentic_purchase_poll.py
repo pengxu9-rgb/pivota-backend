@@ -111,6 +111,12 @@ write AND pool as that value EACH — the same trap `agent_card_revocation_sweep
 in services/audit_scheduler.py describes. Typical is ~30–40 s; 170 s is the number to size
 bounds against, and ~680 s is the number to remember before calling any bound here a guarantee.
 
+'resolving' WITH THE PREFLIGHT WITNESS (mig 258, `REAP_AGENTIC_PREFLIGHT_MODE`) is held to the
+same figure rather than raising it: the witness quote gets only what remains of
+`services/reap_agentic_purchase.RESOLVING_STEP_BUDGET_S` (= 170) minus `ENROLLMENT_RESERVE_S`
+(50, the enrollment read + create) after the resolve, capped at 35 s, and is skipped as
+`unverified` below 22 s. So resolve (100) + witness (<= 20 then) + enrollment (50) stays <= 170.
+
 Everything downstream follows from that one figure: the lease FLOOR (180), the run deadline
 (600 = the 240 s budget + 170 s worst step + margin for the sweeps), and the standing caveat
 that the deadline is a backstop against a WEDGE, not a promise that a batch completes.

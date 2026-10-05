@@ -109,7 +109,7 @@ import json
 import time
 import unicodedata
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
@@ -350,6 +350,74 @@ def is_cart_link_enrichment_enabled() -> bool:
     return is_cart_link_enabled() and (
         (os.getenv(REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED_ENV) or "").strip().lower() in _TRUTHY
     )
+
+
+#: THE CORROBORATED PRICE CHANGE (owner decision 2026-10-05). Default OFF, the same strict parse,
+#: read at call time. When on, a quote whose items subtotal differs from ours -- and that passes
+#: EVERY other check `verify_quote` makes -- is compared with an INDEPENDENT live unit price of
+#: this purchase's own variant from our storefront proofs (services/reap_price_corroboration.py):
+#:
+#:   agrees and LOWER  -> the purchase continues at Reap's (lower) quote; the rebind is recorded
+#:   agrees and HIGHER -> refused `price_changed` / `quote_price_increased_corroborated`
+#:   anything else     -> refused `price_changed` / `quote_items_subtotal_mismatch`, as today
+#:
+#: and in every case the live unit price / quote total is recorded for the buyer (GET view).
+#: Off: `verify_quote` returns on the subtotal exactly as before and nothing new is read or
+#: written. Applies to whichever quote is being checked: the approval quote ('quoting') and, when
+#: `REAP_AGENTIC_PREFLIGHT_MODE` is armed, the preflight witness ('resolving').
+REAP_AGENTIC_PRICE_CORROBORATION_ENV = "REAP_AGENTIC_PRICE_CORROBORATION"
+
+
+def is_price_corroboration_enabled() -> bool:
+    """Is a corroborated price change allowed? Default OFF; unrecognised spellings are off."""
+    return (os.getenv(REAP_AGENTIC_PRICE_CORROBORATION_ENV) or "").strip().lower() in _TRUTHY
+
+
+#: How old an independent storefront read may be to corroborate a price (hours). 72 is the
+#: enrichment proof's own design bound (`services.reap_enrichment_cart_proof.MAX_PROOF_AGE`).
+#: Unset/empty/non-integer/outside 1..168 = the default, warned once per process.
+REAP_AGENTIC_CORROBORATION_MAX_AGE_HOURS_ENV = "REAP_AGENTIC_CORROBORATION_MAX_AGE_HOURS"
+CORROBORATION_MAX_AGE_HOURS_DEFAULT = 72
+CORROBORATION_MAX_AGE_HOURS_MAX = 168
+_WARNED_CORROBORATION_AGE: set = set()
+
+
+def corroboration_max_age() -> timedelta:
+    raw = (os.getenv(REAP_AGENTIC_CORROBORATION_MAX_AGE_HOURS_ENV) or "").strip()
+    hours = CORROBORATION_MAX_AGE_HOURS_DEFAULT
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = None
+        if value is None or not 1 <= value <= CORROBORATION_MAX_AGE_HOURS_MAX:
+            if raw not in _WARNED_CORROBORATION_AGE:
+                _WARNED_CORROBORATION_AGE.add(raw)
+                logger.warning(
+                    "reap_agentic: %s=%r is not an integer in 1..%d; using the default %d",
+                    REAP_AGENTIC_CORROBORATION_MAX_AGE_HOURS_ENV, raw,
+                    CORROBORATION_MAX_AGE_HOURS_MAX, CORROBORATION_MAX_AGE_HOURS_DEFAULT,
+                )
+        else:
+            hours = value
+    return timedelta(hours=hours)
+
+
+#: THE BUY-INTENT PREFLIGHT (owner decision 2026-10-05): off | shadow | enforce, default off,
+#: anything else = off, read at call time. When not off, 'resolving' takes ONE witness quote
+#: (`POST /agentic/quotes`, no enrollment needed) with the SAME body the approval quote will send,
+#: before the buyer is sent to a card page, and runs the same check on it. The witness id is never
+#: stored and never checked out. shadow: record and always continue. enforce: a definitive
+#: refusal (price changed, currency, an unpurchasable item) ends the purchase BEFORE any
+#: enrollment; an unknown (transport, timeout, 429, 5xx, unreadable) is recorded `unverified` and
+#: the purchase continues -- the approval quote still decides. See `_preflight`.
+REAP_AGENTIC_PREFLIGHT_MODE_ENV = "REAP_AGENTIC_PREFLIGHT_MODE"
+PREFLIGHT_MODES = ("off", "shadow", "enforce")
+
+
+def preflight_mode() -> str:
+    value = (os.getenv(REAP_AGENTIC_PREFLIGHT_MODE_ENV) or "").strip().lower()
+    return value if value in PREFLIGHT_MODES else "off"
 
 
 #: THE ENROLLMENT GRACE (seconds). Reap turns an enrollment ACTIVE at or AFTER its hosted
@@ -1093,6 +1161,11 @@ class QuoteCheck:
     #: prices and was NOT added in (c). Stored beside `tax_minor` (mig 247) so a reader of the
     #: totals does not add it a second time.
     tax_included: Optional[bool] = None
+    #: True ONLY on a `quote_items_subtotal_mismatch` refusal from a check run with
+    #: `defer_subtotal_mismatch=True` whose EVERY other rule passed: the one refusal a corroborated
+    #: price change may overturn (mig 258). The amounts above are then filled. Always False when the
+    #: corroboration dial is off.
+    subtotal_mismatch_only: bool = False
 
 
 def verify_quote(
@@ -1101,8 +1174,15 @@ def verify_quote(
     *,
     variant_id: Optional[str] = None,
     offer_code_sent: bool = False,
+    defer_subtotal_mismatch: bool = False,
 ) -> QuoteCheck:
     """Does this quote describe the purchase we opened, at the price we opened it at?
+
+    `defer_subtotal_mismatch` (mig 258, only ever True while REAP_AGENTIC_PRICE_CORROBORATION is
+    on): a subtotal that differs from ours does NOT return at (b); (c) and (h) still run, so any
+    other failure wins, and only a quote that passes everything else comes back as the (b)
+    refusal with its amounts and `subtotal_mismatch_only=True`. False is exactly the behaviour
+    below, unchanged.
 
     ── WHY THIS EXISTS, WHICH IS A DEFECT THIS PACKAGE SHIPPED ─────────────────────────────
 
@@ -1287,7 +1367,8 @@ def verify_quote(
     if discount_minor is None or (discount_minor and not offer_code_sent):
         return QuoteCheck(False, "price_unverifiable", "quote_adjustments_unsupported")
 
-    if subtotal_minor != unit * quantity:
+    subtotal_differs = subtotal_minor != unit * quantity
+    if subtotal_differs and not defer_subtotal_mismatch:
         return QuoteCheck(False, "price_changed", "quote_items_subtotal_mismatch")
 
     # (c) — tax is a component only when it is not already inside the prices.
@@ -1303,6 +1384,22 @@ def verify_quote(
     if isinstance(options, list) and options:
         if not _shipping_reconciles(options, shipping_minor, currency):
             return QuoteCheck(False, "price_changed", "quote_shipping_not_reconciled")
+
+    if subtotal_differs:
+        # Deferred (b): every other rule passed. Still a refusal -- only a corroboration may
+        # overturn it (`_corroborated_verdict`), and only this one.
+        return QuoteCheck(
+            False,
+            "price_changed",
+            "quote_items_subtotal_mismatch",
+            total_minor=total_minor,
+            subtotal_minor=subtotal_minor,
+            shipping_minor=shipping_minor,
+            tax_minor=tax_minor,
+            discount_minor=discount_minor if offer_code_sent else None,
+            tax_included=tax_included,
+            subtotal_mismatch_only=True,
+        )
 
     return QuoteCheck(
         True,
@@ -1362,7 +1459,11 @@ def _single_variant_verdict(resolution: Any, row: Mapping[str, Any]) -> Optional
 
 
 def verify_cart_link_quote(
-    payload: Any, row: Mapping[str, Any], *, offer_code_sent: bool = False
+    payload: Any,
+    row: Mapping[str, Any],
+    *,
+    offer_code_sent: bool = False,
+    defer_subtotal_mismatch: bool = False,
 ) -> QuoteCheck:
     """Does this CART-LINK quote describe the purchase we opened, at our price, with shipping?
 
@@ -1426,7 +1527,10 @@ def verify_cart_link_quote(
     ):
         return QuoteCheck(False, "no_shipping_option", "quote_no_shipping_option")
 
-    return verify_quote(data, row, variant_id=None, offer_code_sent=offer_code_sent)
+    return verify_quote(
+        data, row, variant_id=None, offer_code_sent=offer_code_sent,
+        defer_subtotal_mismatch=defer_subtotal_mismatch,
+    )
 
 
 def _shipping_reconciles(options: Sequence[Any], shipping_minor: int, currency: str) -> bool:
@@ -2335,6 +2439,9 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
     handles (five searches for the same product on one day returned five different `prd_` ids),
     so the quote step re-resolves rather than trusting them.
     """
+    # The preflight witness's deadline (mig 258): see `RESOLVING_STEP_BUDGET_S`. Read from the
+    # step's own clock so a slow resolve leaves the witness less time, never the lease.
+    witness_deadline = _monotonic() + RESOLVING_STEP_BUDGET_S - ENROLLMENT_RESERVE_S
     guarded = await _still_ours(row, worker_id)
     if guarded is None:
         return _lost(row)
@@ -2351,7 +2458,9 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
                 row, worker_id, ["resolving"], "refused",
                 refusal_reason=verdict[0], last_error_code=verdict[1],
             )
-        return await _resolving_to_enrollment(row, worker_id, {})
+        return await _resolving_to_enrollment(
+            row, worker_id, {}, witness_deadline=witness_deadline
+        )
 
     # A HOLD RE-CHECKS THE ENROLLMENT, NOT THE CATALOG. A row released as `enrollment_settling`
     # is waiting for Reap to settle the buyer's pending enrollment; its re-check every 30 s used
@@ -2390,11 +2499,19 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
         "reap_variant_id": _cap(resolution.variant_id),
         "queries_tried": queries,
     }
-    return await _resolving_to_enrollment(row, worker_id, evidence)
+    return await _resolving_to_enrollment(
+        row, worker_id, evidence, variant_id=resolution.variant_id,
+        witness_deadline=witness_deadline,
+    )
 
 
 async def _resolving_to_enrollment(
-    row: Mapping[str, Any], worker_id: str, evidence: Mapping[str, Any]
+    row: Mapping[str, Any],
+    worker_id: str,
+    evidence: Mapping[str, Any],
+    *,
+    variant_id: Optional[str] = None,
+    witness_deadline: Optional[float] = None,
 ) -> AdvanceResult:
     """The second half of 'resolving', shared by both item sources: does the buyer have a card?
 
@@ -2429,6 +2546,16 @@ async def _resolving_to_enrollment(
             row, worker_id, ["resolving"], "failed",
             last_error_code="buyer_email_missing", **evidence,
         )
+
+    # THE BUY-INTENT PREFLIGHT (mig 258), BEFORE ANY ENROLLMENT IS CREATED, REUSED OR REPLAYED:
+    # nothing below this line has sent the buyer to a card page yet. Off: returns None without a
+    # read or a write, and the step is exactly what it was. `variant_id` is the resolver's handle
+    # on the variant lane (the same one the approval quote would send), None on the cart-link lane.
+    stopped = await _preflight(
+        row, worker_id, evidence, variant_id=variant_id, deadline=witness_deadline
+    )
+    if stopped is not None:
+        return stopped
 
     # RECONCILE BEFORE MINTING. A pending row that already carries a partner id was handed to
     # this buyer as a hosted link, and they may have FINISHED it: on staging 2026-09-30 a
@@ -3202,6 +3329,308 @@ async def _quote_with_offer_code(
     return _QuoteAttempt(second, offer_code_sent=False, outcome=outcome)
 
 
+# ── the price witness: one quote builder, one check, corroboration, preflight (mig 258) ───────
+
+
+def _price_witness_armed() -> bool:
+    """Either price-witness dial is armed. With both off nothing in this section runs."""
+    return is_price_corroboration_enabled() or preflight_mode() != "off"
+
+
+def _quote_call(
+    row: Mapping[str, Any],
+    variant_id: Optional[str],
+    *,
+    idempotency_extra: Optional[Mapping[str, Any]] = None,
+) -> Any:
+    """THE lane's quote call, `call(code, timeout)`: ONE builder for the approval quote
+    (`_step_quoting` / `_quote_cart_link`) and the preflight witness, so the two cannot send
+    different bodies. Variant lane: `rc.request_quote` with the resolver's `variantId`; cart-link
+    lane: `rc.request_cart_link_quote` with the stored URL.
+
+    `idempotency_extra` is passed ONLY by the preflight: it keys the witness apart from the
+    approval quote (the body is identical, and the quote key is body + a 4-minute bucket), so the
+    approval quote can never be Reap's replay of the witness and the witness id can never reach
+    a checkout. Absent, the call is byte-for-byte the one the lanes always made.
+    """
+    extra: Dict[str, Any] = (
+        {"idempotency_extra": dict(idempotency_extra)} if idempotency_extra else {}
+    )
+    if _is_cart_link(row):
+        def _call(code: Optional[str], timeout: Optional[float]) -> Any:
+            return rc.request_cart_link_quote(
+                cart_url=row.get("cart_url"),
+                email=row.get("buyer_email"),
+                shipping_address=row.get("shipping_address"),
+                **_code_and_timeout(code, timeout),
+                **extra,
+            )
+        return _call
+
+    def _call(code: Optional[str], timeout: Optional[float]) -> Any:
+        return rc.request_quote(
+            items=[{"variantId": variant_id, "quantity": int(row.get("quantity") or 1)}],
+            email=row.get("buyer_email"),
+            shipping_address=row.get("shipping_address"),
+            **_code_and_timeout(code, timeout),
+            **extra,
+        )
+    return _call
+
+
+def _quote_check(row: Mapping[str, Any], variant_id: Optional[str], *, offer_code_sent: bool) -> Any:
+    """THE lane's verdict on a quote payload, shared by the approval quote and the preflight.
+
+    With a price-witness dial armed, (b) is DEFERRED (`defer_subtotal_mismatch`) so the amounts of
+    a subtotal-only mismatch reach `_settle_price_change`; with both off the keyword is not even
+    passed, and the call is exactly the one the lanes always made.
+    """
+    defer = {"defer_subtotal_mismatch": True} if _price_witness_armed() else {}
+    if _is_cart_link(row):
+        return lambda data: verify_cart_link_quote(
+            data, row, offer_code_sent=offer_code_sent, **defer
+        )
+    return lambda data: verify_quote(
+        data, row, variant_id=variant_id, offer_code_sent=offer_code_sent, **defer
+    )
+
+
+#: `last_error_code` of a quote whose HIGHER live price our own store read corroborates: the
+#: merchant really did raise the price of THIS variant, so the buyer is told the new one.
+QUOTE_PRICE_INCREASED_CORROBORATED = "quote_price_increased_corroborated"
+
+
+async def _settle_price_change(
+    row: Mapping[str, Any], verdict: QuoteCheck, *, stage: str
+) -> Tuple[QuoteCheck, Dict[str, Any]]:
+    """Decide a SUBTOTAL-ONLY mismatch (`verdict.subtotal_mismatch_only`): `(verdict, picture)`.
+
+    `picture` is the live-price record for the row (always: the buyer is told the live price).
+    The verdict is:
+
+      * ok, at Reap's quote          -- corroboration dial on, the subtotal is an exact multiple
+                                        of the quantity, our independent store read of THIS
+                                        variant states the same unit price, and it is LOWER than
+                                        ours. `picture` names the rebind.
+      * `quote_price_increased_corroborated` -- the same, but HIGHER.
+      * the deferred (b) refusal      -- everything else: dial off, not divisible, no proof, a
+                                        stale/disagreeing/foreign-currency proof, a mirror proof
+                                        with no recorded currency.
+
+    `our_price_minor` is NEVER rewritten here (see docs/reap_agentic_routes.md, "Price witness").
+    """
+    quantity = row.get("quantity")
+    ours = row.get("our_price_minor")
+    subtotal = verdict.subtotal_minor
+    live = subtotal // quantity if subtotal % quantity == 0 else None
+    picture: Dict[str, Any] = {
+        "live_unit": live,
+        "live_subtotal": subtotal,
+        "live_total": verdict.total_minor,
+        "live_stage": stage,
+    }
+    refused = replace(verdict, subtotal_mismatch_only=False)
+    if live is None or not is_price_corroboration_enabled():
+        return refused, picture
+    import services.reap_price_corroboration as corroboration
+
+    now = _now()
+    found = await corroboration.independent_unit_price(
+        row, now=now, max_age=corroboration_max_age()
+    )
+    if found is None or found.unit_price_minor != live:
+        return refused, picture
+    if live < ours:
+        picture.update(
+            rebound_from=ours, rebound_to=live, source=found.source,
+            corroborated_at=found.corroborated_at,
+        )
+        logger.info(
+            "reap_agentic: purchase=%s %s price lowered %s -> %s, corroborated by %s",
+            row.get("id"), stage, ours, live, found.source,
+        )
+        return replace(verdict, ok=True, refusal_reason=None, last_error_code=None,
+                       subtotal_mismatch_only=False), picture
+    if live > ours:
+        return replace(refused, last_error_code=QUOTE_PRICE_INCREASED_CORROBORATED), picture
+    return refused, picture  # pragma: no cover -- equal is unreachable: the subtotal differs
+
+
+def _has_price_picture(row: Mapping[str, Any]) -> bool:
+    return any(row.get(column) is not None for column in (
+        "live_items_subtotal_minor", "price_rebound_to_minor"))
+
+
+#: Provider refusals at the preflight that say THIS ITEM is not purchasable for this buyer -- a
+#: fact a card will not change. Anything else unreadable or unclassified is `unverified`, and the
+#: offer-code refusals are left to the approval quote's own drop-and-requote policy.
+_PREFLIGHT_REFUSAL_KINDS = frozenset({
+    "variant_unavailable", "quote_unfulfillable", "checkout_url_invalid", "card_payment_unavailable",
+})
+#: The two outcomes `enforce` ends a purchase on.
+_PREFLIGHT_DEFINITIVE = frozenset({"price_changed", "refused"})
+
+
+def _preflight_refusal_reason(outcome: str, code: Optional[str]) -> str:
+    """The `refusal_reason` of an enforced preflight refusal, derived from what was recorded so a
+    retry that finds the outcome already stored refuses with the same words."""
+    if outcome == "price_changed":
+        return "price_changed"
+    kind = str(code or "").split(":", 1)[0]
+    if kind == "quote_no_shipping_option":
+        return "no_shipping_option"
+    return _QUOTE_REFUSAL_KINDS.get(kind, "preflight_refused")
+
+
+async def _judge_preflight(
+    row: Mapping[str, Any], response: Any, variant_id: Optional[str], *, offer_code_sent: bool
+) -> Tuple[str, Optional[str], Optional[Dict[str, Any]], Dict[str, Any]]:
+    """`(outcome, error_code, confirmed_totals, price_picture)` for one witness response."""
+    if not response.ok:
+        code = str(response.error or "quote_failed")
+        if _is_transport(code):
+            return "unverified", _error_code(code), None, {}
+        rejection = rc.classify_quote_rejection(response)
+        if rejection is not None and rejection.kind in _PREFLIGHT_REFUSAL_KINDS:
+            return "refused", _error_code(rejection.error_code), None, {}
+        # 429, a 5xx, a readable code that is not about the item: unknown, never a mismatch.
+        return "unverified", _error_code(rejection.error_code if rejection else code), None, {}
+    verdict = _quote_check(row, variant_id, offer_code_sent=offer_code_sent)(response.data)
+    picture: Dict[str, Any] = {}
+    if verdict.subtotal_mismatch_only:
+        verdict, picture = await _settle_price_change(row, verdict, stage="preflight")
+    if verdict.ok:
+        totals = {
+            "subtotal": verdict.subtotal_minor, "shipping": verdict.shipping_minor,
+            "tax": verdict.tax_minor, "tax_included": verdict.tax_included,
+            "total": verdict.total_minor,
+        }
+        return "ok", None, totals, picture
+    if verdict.refusal_reason == "price_changed":
+        return "price_changed", verdict.last_error_code, None, picture
+    if verdict.refusal_reason == "no_shipping_option":
+        return "refused", verdict.last_error_code, None, picture
+    return "unverified", verdict.last_error_code, None, picture
+
+
+class _NoWitnessBudget(Exception):
+    """Internal: the step has too little time left for the witness quote."""
+
+
+#: THE RESOLVING STEP'S WALL-CLOCK BUDGET once a witness is taken (mig 258), kept equal to the
+#: worst 'quoting' step (`QUOTING_STEP_BUDGET_S`, 170 s) that jobs/reap_agentic_purchase_poll.py
+#: sizes its 180 s lease floor against. Without a witness 'resolving' is at most the resolve
+#: (~100 s) + the enrollment reconcile/create (`ENROLLMENT_RESERVE_S`); the witness gets only what
+#: is left of `RESOLVING_STEP_BUDGET_S - ENROLLMENT_RESERVE_S` after the resolve, capped at the
+#: slow-path 35 s, and is skipped (`unverified` / `preflight_no_budget`) below `MIN_QUOTE_BUDGET_S`.
+RESOLVING_STEP_BUDGET_S = QUOTING_STEP_BUDGET_S
+#: Held back for `_decide_pending`'s enrollment read (25 s) and `create_enrollment` (25 s).
+ENROLLMENT_RESERVE_S = 50.0
+
+
+async def _take_preflight_witness(
+    row: Mapping[str, Any], worker_id: str, variant_id: Optional[str], *,
+    deadline: Optional[float] = None,
+) -> Any:
+    """Send the ONE witness quote and record its outcome over the 'pending' marker.
+
+    Returns `(outcome, error_code)`, or an AdvanceResult when the claim was lost. The witness
+    response's quote id is read by nothing: only the verdict and the amounts survive.
+    """
+    from db import reap_price_witness as witness
+
+    try:
+        offer_code = rc.validate_offer_code(row.get("offer_code"))
+    except rc.ReapRequestError:
+        offer_code = None  # the approval step refuses a malformed code itself
+    call = _quote_call(
+        row, variant_id,
+        idempotency_extra={"pivotaWitness": "preflight", "purchaseId": str(row["id"])},
+    )
+    remaining = (deadline - _monotonic()) if deadline is not None else rc._QUOTE_TIMEOUT_S
+    try:
+        if remaining < MIN_QUOTE_BUDGET_S:
+            # The resolve already spent the step's witness budget. NOT SENT: an unknown, never a
+            # mismatch -- and never retried, so a slow resolver cannot hold the purchase here.
+            raise _NoWitnessBudget()
+        response = await call(offer_code, min(rc._QUOTE_TIMEOUT_S, remaining))
+    except _NoWitnessBudget:
+        outcome, code, totals, picture = "unverified", "preflight_no_budget", None, {}
+    except rc.ReapRequestError as exc:
+        # Raised by the body builder BEFORE egress. Unknown, not a mismatch.
+        outcome, code, totals, picture = (
+            "unverified", _error_code(getattr(exc, "code", None) or "preflight_quote_unbuildable"),
+            None, {},
+        )
+    else:
+        outcome, code, totals, picture = await _judge_preflight(
+            row, response, variant_id, offer_code_sent=offer_code is not None
+        )
+    if not await witness.record_preflight(
+        row, worker_id, outcome=outcome, error_code=code, totals=totals, picture=picture
+    ):
+        return _lost(row)
+    logger.info(
+        "reap_agentic: purchase=%s preflight=%s code=%s mode=%s",
+        row.get("id"), outcome, code, preflight_mode(),
+    )
+    return outcome, code
+
+
+async def _preflight(
+    row: Mapping[str, Any],
+    worker_id: str,
+    evidence: Mapping[str, Any],
+    *,
+    variant_id: Optional[str],
+    deadline: Optional[float] = None,
+) -> Optional[AdvanceResult]:
+    """The buy-intent witness in 'resolving'. None = carry on to the enrollment, as today.
+
+    ONCE PER ATTEMPT. `preflight_outcome` is set to 'pending' by a fenced write BEFORE the call
+    (`begin_preflight`: this holder, this claim, no witness yet), so a retry, a second worker or a
+    worker that lost its lease mid-call never quotes again: a recorded outcome is re-used, and a
+    'pending' left by an interrupted tick becomes `unverified` (`preflight_interrupted`) without
+    a second call. A LOCAL stop (`rc.ProviderOperationStopped`: the reconciliation stop, the create
+    pause or the pilot scope, re-checked by the client before the request leaves) withdraws the
+    marker -- nothing was sent -- and propagates to `advance`, which pauses or releases as for any
+    other provider call.
+    """
+    mode = preflight_mode()
+    if mode == "off":
+        return None
+    from db import reap_price_witness as witness
+
+    recorded = row.get("preflight_outcome")
+    code = row.get("preflight_error_code")
+    if recorded is None:
+        if await _still_ours(row, worker_id) is None:
+            return _lost(row)
+        if not await witness.begin_preflight(row, worker_id):
+            return _lost(row)
+        try:
+            taken = await _take_preflight_witness(row, worker_id, variant_id, deadline=deadline)
+        except rc.ProviderOperationStopped:
+            await witness.withdraw_preflight(row, worker_id)
+            raise
+        if isinstance(taken, AdvanceResult):
+            return taken
+        recorded, code = taken
+    elif recorded == witness.PREFLIGHT_PENDING:
+        code = "preflight_interrupted"
+        if not await witness.record_preflight(row, worker_id, outcome="unverified", error_code=code):
+            return _lost(row)
+        recorded = "unverified"
+    if mode == "enforce" and recorded in _PREFLIGHT_DEFINITIVE:
+        return await _move(
+            row, worker_id, ["resolving"], "refused",
+            refusal_reason=_preflight_refusal_reason(recorded, code),
+            last_error_code=_error_code(code) or recorded,
+            **evidence,
+        )
+    return None
+
+
 async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult:
     """quoting → awaiting_approval | refused | failed.
 
@@ -3279,14 +3708,7 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
         "queries_tried": queries,
     }
 
-    def _call(code: Optional[str], timeout: Optional[float]) -> Any:
-        return rc.request_quote(
-            items=[{"variantId": resolution.variant_id,
-                    "quantity": int(row.get("quantity") or 1)}],
-            email=row.get("buyer_email"),
-            shipping_address=row.get("shipping_address"),
-            **_code_and_timeout(code, timeout),
-        )
+    _call = _quote_call(row, resolution.variant_id)
 
     attempt = await _quote_with_offer_code(
         row, worker_id, _call, offer_code, deadline, dropped=dropped
@@ -3300,9 +3722,7 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
         partner_enrollment,
         attempt.response,
         item_evidence=item_evidence,
-        check=lambda data: verify_quote(
-            data, row, variant_id=resolution.variant_id, offer_code_sent=attempt.offer_code_sent
-        ),
+        check=_quote_check(row, resolution.variant_id, offer_code_sent=attempt.offer_code_sent),
         offer_code_outcome=attempt.outcome,
     )
 
@@ -3332,13 +3752,7 @@ async def _quote_cart_link(
             refusal_reason=verdict[0], last_error_code=verdict[1],
         )
 
-    def _call(code: Optional[str], timeout: Optional[float]) -> Any:
-        return rc.request_cart_link_quote(
-            cart_url=row.get("cart_url"),
-            email=row.get("buyer_email"),
-            shipping_address=row.get("shipping_address"),
-            **_code_and_timeout(code, timeout),
-        )
+    _call = _quote_call(row, None)
 
     try:
         attempt = await _quote_with_offer_code(
@@ -3364,9 +3778,7 @@ async def _quote_cart_link(
         partner_enrollment,
         attempt.response,
         item_evidence={},
-        check=lambda data: verify_cart_link_quote(
-            data, row, offer_code_sent=attempt.offer_code_sent
-        ),
+        check=_quote_check(row, None, offer_code_sent=attempt.offer_code_sent),
         offer_code_outcome=attempt.outcome,
     )
 
@@ -3389,6 +3801,16 @@ async def _checkout_from_quote(
     mapping, the quote id rules, the expiry check, the checkout create and every evidence write
     on the way out — is ONE body, moved here unchanged from `_step_quoting`.
     """
+    if _price_witness_armed() and _has_price_picture(row):
+        # mig 258: THIS quote supersedes every earlier price picture (the preflight's live price,
+        # its rebind, an earlier approval quote's). Cleared before the quote is judged, whatever
+        # it says, so the view can never show "price updated to X" from a quote that is no longer
+        # the latest; a subtotal-only mismatch below records this quote's own picture.
+        from db import reap_price_witness as witness
+
+        if not await witness.record_live_price(row, worker_id, {}):
+            return _lost(row)
+
     # What the buyer's offer code came to, written on EVERY exit below (a refused or failed
     # purchase whose code was dropped still says so). Absent when no code was sent.
     code_evidence: Dict[str, Any] = (
@@ -3480,6 +3902,15 @@ async def _checkout_from_quote(
     # created. See `verify_quote` for the three measured ways the previous code reached a live
     # hosted checkout without ever comparing it to the purchase we opened.
     verdict = check(quote.data)
+    if verdict.subtotal_mismatch_only:
+        # mig 258, a price-witness dial armed: the ONLY failing rule was the exact subtotal. A
+        # corroborated lower price continues; everything else still refuses below -- and the live
+        # price the buyer must be told is recorded first, on this row, under this claim.
+        verdict, picture = await _settle_price_change(row, verdict, stage="approval")
+        from db import reap_price_witness as witness
+
+        if not await witness.record_live_price(row, worker_id, picture):
+            return _lost(row)
     if not verdict.ok:
         return await _move(
             row, worker_id, ["quoting"], "refused",
