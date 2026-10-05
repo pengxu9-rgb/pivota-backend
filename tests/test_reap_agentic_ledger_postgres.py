@@ -84,6 +84,8 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
     _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
     _MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
+    # 258: the price witness columns (the self-heal adds them too).
+    _MIGRATIONS_DIR / "258_reap_price_witness.sql",
 )
 _MIGRATION = _MIGRATIONS[0]
 
@@ -684,6 +686,14 @@ _EXPECTED_PUBLIC_COLUMNS = {
     "consent_version", "consented_at",
     # mig 247 — the buyer's own offer code, its outcome and the discount; see the SQLite twin.
     "offer_code", "offer_code_outcome", "discount_minor", "tax_included",
+    # mig 258 — the price witness; see the SQLite twin.
+    "preflight_outcome", "preflight_error_code", "preflight_checked_at",
+    "preflight_items_subtotal_minor", "preflight_shipping_minor", "preflight_tax_minor",
+    "preflight_tax_included", "preflight_total_minor",
+    "live_unit_price_minor", "live_items_subtotal_minor", "live_quoted_total_minor",
+    "live_price_stage",
+    "price_rebound_from_minor", "price_rebound_to_minor", "price_corroboration_source",
+    "price_corroborated_at",
 }
 
 
@@ -2858,6 +2868,14 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
         "offer_code_outcome",
         "discount_minor",
         "tax_included",
+        # mig 258, the price witness (see the SQLite twin's _PRICE_WITNESS_COLUMNS).
+        "preflight_outcome", "preflight_error_code", "preflight_checked_at",
+        "preflight_items_subtotal_minor", "preflight_shipping_minor", "preflight_tax_minor",
+        "preflight_tax_included", "preflight_total_minor",
+        "live_unit_price_minor", "live_items_subtotal_minor", "live_quoted_total_minor",
+        "live_price_stage",
+        "price_rebound_from_minor", "price_rebound_to_minor", "price_corroboration_source",
+        "price_corroborated_at",
     }, (
         f"the heal on a 224-shaped database added {sorted(after - before)}"
     )

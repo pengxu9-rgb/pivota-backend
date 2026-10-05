@@ -557,6 +557,27 @@ _EXPECTED_PUBLIC_COLUMNS = {
     # buyer input), what it came to (a code Reap refused is dropped and the buyer must be told
     # before approving), what Reap took off, and whether tax_minor is already in the prices.
     "offer_code", "offer_code_outcome", "discount_minor", "tax_included",
+    # mig 258. The price witness: what Reap QUOTED for the owner's own purchase (the preflight's
+    # confirmed totals, the live price when a quote disagreed, a corroborated lower price). Not
+    # PII, not a partner id (the witness quote id is never stored), not plumbing. The route nests
+    # them and shows each only when it applies.
+    "preflight_outcome", "preflight_error_code", "preflight_checked_at",
+    "preflight_items_subtotal_minor", "preflight_shipping_minor", "preflight_tax_minor",
+    "preflight_tax_included", "preflight_total_minor",
+    "live_unit_price_minor", "live_items_subtotal_minor", "live_quoted_total_minor",
+    "live_price_stage",
+    "price_rebound_from_minor", "price_rebound_to_minor", "price_corroboration_source",
+    "price_corroborated_at",
+}
+#: mig 258, written out (not imported from db/reap_price_witness.COLUMNS) for the allowlist's reason.
+_PRICE_WITNESS_COLUMNS = {
+    "preflight_outcome", "preflight_error_code", "preflight_checked_at",
+    "preflight_items_subtotal_minor", "preflight_shipping_minor", "preflight_tax_minor",
+    "preflight_tax_included", "preflight_total_minor",
+    "live_unit_price_minor", "live_items_subtotal_minor", "live_quoted_total_minor",
+    "live_price_stage",
+    "price_rebound_from_minor", "price_rebound_to_minor", "price_corroboration_source",
+    "price_corroborated_at",
 }
 _EXPECTED_NEVER_PUBLIC = {
     "dispatch_tracking_version", "checkout_dispatch_key", "contact_received_at", "contact_purged_at", "contact_revision",
@@ -3048,9 +3069,9 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
         "offer_code_outcome",
         "discount_minor",
         "tax_included",
-    }, (
-        "the heal added something other than the three mig-225, two mig-229, two mig-233 and "
-        "four mig-247 columns"
+    } | _PRICE_WITNESS_COLUMNS, (
+        "the heal added something other than the three mig-225, two mig-229, two mig-233, "
+        "four mig-247 and sixteen mig-258 columns"
     )
 
     # And the rail works on the healed table.

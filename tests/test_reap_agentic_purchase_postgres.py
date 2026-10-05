@@ -83,6 +83,7 @@ _MIGRATIONS = (
     _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
     _MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
     _MIGRATIONS_DIR / "257_reap_parked_dispatch_resolution.sql",
+    _MIGRATIONS_DIR / "258_reap_price_witness.sql",  # the price witness (dark dials)
 )
 
 # Same convention as tests/test_reap_agentic_ledger_postgres.py: this gate DROPS its tables, so

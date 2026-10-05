@@ -554,6 +554,74 @@ if the poller is dark, or `completed` when an approval landed inside the last po
   `reap_checkout_id`; `enrollment_id`, `click_id`, `return_url`; any Reap media or image URL.
   The body is built from `db/reap_agentic_ledger.PUBLIC_PURCHASE_COLUMNS`, an allowlist.
 
+### Price witness: preflight quote, corroborated price change, live price (mig 258, dark)
+
+Owner decision 2026-10-05. Three dials, **all default off**; with every one off nothing below
+happens, no new key appears in any body, and the refusals are exactly the ones documented above.
+
+| dial | values (default) | what it does |
+|---|---|---|
+| `REAP_AGENTIC_PRICE_CORROBORATION` | `on`/`1`/`true`/`yes` arm it; anything else is off (off) | a quote whose items subtotal differs from `our_price_minor × quantity`, and that passes **every other** quote check, is compared with an **independent** live unit price of the purchase's own Shopify variant from our own storefront reads (below). Corroborated **lower** → the purchase continues at Reap's quote. Corroborated **higher** → terminal `refused` / `price_changed` with `last_error_code: "quote_price_increased_corroborated"`. Anything else → `price_changed` / `quote_items_subtotal_mismatch`, as today. |
+| `REAP_AGENTIC_CORROBORATION_MAX_AGE_HOURS` | integer 1..168 (72) | how old an independent read may be. Out of range or not an integer → 72, warned once. |
+| `REAP_AGENTIC_PREFLIGHT_MODE` | `off` / `shadow` / `enforce`, anything else is off (off) | in `resolving`, after the item resolves and **before any enrollment is created, reused or replayed**, one buy-intent `POST /agentic/quotes` (same body the approval quote sends, keyed apart from it; its quote id is never stored or checked out) is checked like the approval quote (with corroboration when that dial is on). `shadow`: recorded, the purchase always continues. `enforce`: a definitive refusal ends the purchase before any card page; an unknown continues. A buyer who already has an active card goes straight to `quoting` and is not preflighted. |
+
+**What corroborates.** Only cart-link purchases (the variant lane's opaque Reap handles name no
+storefront variant; its own resolver price check, `_price_verdict`, is unchanged). The read must
+name the numeric variant in the purchase's own cart URL:
+
+* `enrichment_cart_variant_proofs` rows for (product, that variant): outcome `ok`, a known source,
+  available, the same storefront host, `currency` equal to the purchase's, a positive price, and
+  `checked_at` not in the future and inside the window. All usable rows must agree.
+* the mirror seed's storefront proof (`snapshot.shopify_cart_proof` /
+  `shopify_cart_variant_proofs`). **It corroborates only if the proof itself records a `currency`
+  equal to the purchase's — and no writer records one today, so today it never does.**
+  `products.js` carries no currency (its price is in whatever presentment currency the storefront
+  chose for our crawler, ×100 even for zero-decimal currencies); the seed's price currency and the
+  market currency describe other numbers. An assumed currency is how a substituted variant's
+  price would slip through, so it is not assumed.
+
+With either witness dial armed, a quote that fails the subtotal AND another check now reports the other check's code (`quote_total_not_reconciled`, `quote_shipping_not_reconciled`, ...) — still `price_changed` / `price_unverifiable`, never a continue. Both lanes yielding different prices is not corroboration. The subtotal must be an exact multiple
+of the quantity. `our_price_minor` is **never rewritten**: it stays the price the buyer selected
+(and the money pair bound into the attempt's fingerprint). After a lower rebind the charge is
+Reap's own quote total (`quoted_total_minor`, `finalAmount`), the pilot `max_total_minor` cap is
+still enforced on that total, and `final_total_minor` / attribution read the charge as before.
+
+**Preflight outcomes** (`preflight_outcome`, recorded once per attempt; a second tick never quotes
+again): `ok`; `price_changed` (subtotal, currency, or a corroborated increase — definitive);
+`refused` (definitive: `VARIANT_UNAVAILABLE`, `QUOTE_UNFULFILLABLE`, `CHECKOUT_URL_INVALID`,
+`CARD_PAYMENT_UNAVAILABLE`, or no shipping option on the cart-link lane → `refusal_reason`
+`variant_unavailable` / `quote_unfulfillable` / `cart_link_rejected` / `card_payment_unavailable`
+/ `no_shipping_option`); `unverified` (transport error, timeout, 429, 5xx, an offer-code refusal,
+an unreadable quote, or a witness interrupted mid-call: `preflight_interrupted`) — `enforce`
+continues on `unverified`, and the approval quote still decides. An enforced refusal is the
+ordinary terminal `refused` (email, address and offer code are cleared).
+
+**New GET keys** (owner GET, list and replay; built from `PUBLIC_PURCHASE_COLUMNS`, each present
+**only when it applies**, otherwise absent):
+
+```json
+"preflight": {"checked_at": "2026-10-05T08:00:01.123456+00:00",
+              "totals": {"currency": "USD", "items_subtotal_minor": 3000, "shipping_minor": 500,
+                         "tax_minor": 0, "tax_included": false, "total_minor": 3500}},
+"live_price": {"currency": "USD", "unit_price_minor": 3000, "items_subtotal_minor": 3000,
+               "quoted_total_minor": 3500, "stage": "preflight"},
+"price_rebound": {"currency": "USD", "from_unit_price_minor": 3200, "to_unit_price_minor": 3000,
+                  "source": "enrichment_proof", "corroborated_at": "2026-10-05T08:00:01.123456+00:00"}
+```
+
+* `preflight` — the buy-intent quote confirmed the price (`ok`): show these totals before the
+  card page. `tax_included: true` means `tax_minor` is already inside the prices.
+* `live_price` — only on `state: "refused"` with `refusal_reason: "price_changed"` when a quote's
+  live price was recorded: tell the buyer "price updated to X". `unit_price_minor` is `null` when
+  the subtotal is not an exact multiple of the quantity; `stage` is `preflight` or `approval`.
+  A new purchase at the new price needs a fresh key and the new expected money pair.
+* `price_rebound` — the purchase continued at a lower live unit price our own read corroborated
+  (`source`: `enrichment_proof` | `mirror_proof`). `totals.our_price_minor` still shows the
+  selected price; the buyer approves `totals.quoted_total_minor`.
+
+`refusal_reason` / `last_error_code` added: `preflight_refused` (fallback reason, not expected),
+`quote_price_increased_corroborated`, `preflight_interrupted` (recorded, never terminal).
+
 ### States the door will see
 
 `resolving` → `needs_enrollment` (buyer must enrol a card) → `quoting` → `awaiting_approval`

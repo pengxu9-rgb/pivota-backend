@@ -2377,8 +2377,18 @@ async def resolve_variant(*, product_id: str, option_ids: Sequence[str], timeout
 
 
 async def request_quote(**kwargs: Any) -> ReapResponse:
+    """`POST /agentic/quotes`, "Reap discovery" branch.
+
+    `idempotency_extra` (optional, mig 258) is merged into the quote's Idempotency-Key material and
+    is NOT sent in the body: the purchase service's preflight witness passes one so its key can
+    never collide with the approval quote's (identical body, same 4-minute bucket). Absent, the
+    request and its key are exactly what they always were."""
     timeout = kwargs.pop("timeout_seconds", None)
-    return await _post("/agentic/quotes", build_quote_request(**kwargs), timeout_seconds=timeout)
+    extra = kwargs.pop("idempotency_extra", None)
+    return await _post(
+        "/agentic/quotes", build_quote_request(**kwargs), timeout_seconds=timeout,
+        **({"idempotency_extra": extra} if extra else {}),
+    )
 
 
 # --- the cart-link quote (Tier B): `externalCheckout` -----------------------------------------
@@ -2477,8 +2487,10 @@ async def request_cart_link_quote(**kwargs: Any) -> ReapResponse:
     streaming size cap and the no-redirects rule are all the ones `request_quote` gets. Only the
     body builder differs."""
     timeout = kwargs.pop("timeout_seconds", None)
+    extra = kwargs.pop("idempotency_extra", None)  # see `request_quote`
     return await _post(
-        "/agentic/quotes", build_cart_link_quote_request(**kwargs), timeout_seconds=timeout
+        "/agentic/quotes", build_cart_link_quote_request(**kwargs), timeout_seconds=timeout,
+        **({"idempotency_extra": extra} if extra else {}),
     )
 
 

@@ -2295,6 +2295,64 @@ _TOTAL_KEYS = (
 )
 
 
+#: The price-witness columns (mig 258). Popped out of the flat view and re-emitted, nested, ONLY
+#: when they apply -- see `_price_witness_fields`.
+_PRICE_WITNESS_KEYS = (
+    "preflight_outcome", "preflight_error_code", "preflight_checked_at",
+    "preflight_items_subtotal_minor", "preflight_shipping_minor", "preflight_tax_minor",
+    "preflight_tax_included", "preflight_total_minor",
+    "live_unit_price_minor", "live_items_subtotal_minor", "live_quoted_total_minor",
+    "live_price_stage",
+    "price_rebound_from_minor", "price_rebound_to_minor", "price_corroboration_source",
+    "price_corroborated_at",
+)
+
+
+def _price_witness_fields(body: Dict[str, Any], *, state: str, currency: Any) -> None:
+    """Pop the mig-258 keys from `body` and add, only when each applies:
+
+      preflight    the buy-intent quote CONFIRMED the price (`preflight_outcome == 'ok'`): its
+                   totals, so the door can show them before the card page.
+      live_price   the purchase ENDED `price_changed` and a quote's live price is recorded: the
+                   merchant's live unit price (null when the subtotal is not a multiple of the
+                   quantity), the quoted items subtotal and total, and the stage that saw it.
+      price_rebound  the purchase continued at a LOWER live unit price our own store read
+                   corroborated: from / to unit prices, the corroborating source, when.
+
+    A row the dark dials never touched has none of the three, so the body is exactly what it was.
+    """
+    witness = {key: body.pop(key, None) for key in _PRICE_WITNESS_KEYS}
+    if witness["preflight_outcome"] == "ok" and witness["preflight_total_minor"] is not None:
+        body["preflight"] = {
+            "checked_at": witness["preflight_checked_at"],
+            "totals": {
+                "currency": currency,
+                "items_subtotal_minor": witness["preflight_items_subtotal_minor"],
+                "shipping_minor": witness["preflight_shipping_minor"],
+                "tax_minor": witness["preflight_tax_minor"],
+                "tax_included": witness["preflight_tax_included"],
+                "total_minor": witness["preflight_total_minor"],
+            },
+        }
+    if (state == "refused" and body.get("refusal_reason") == "price_changed"
+            and witness["live_items_subtotal_minor"] is not None):
+        body["live_price"] = {
+            "currency": currency,
+            "unit_price_minor": witness["live_unit_price_minor"],
+            "items_subtotal_minor": witness["live_items_subtotal_minor"],
+            "quoted_total_minor": witness["live_quoted_total_minor"],
+            "stage": witness["live_price_stage"],
+        }
+    if witness["price_rebound_to_minor"] is not None:
+        body["price_rebound"] = {
+            "currency": currency,
+            "from_unit_price_minor": witness["price_rebound_from_minor"],
+            "to_unit_price_minor": witness["price_rebound_to_minor"],
+            "source": witness["price_corroboration_source"],
+            "corroborated_at": witness["price_corroborated_at"],
+        }
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -2378,6 +2436,7 @@ def _public_body(view: Mapping[str, Any]) -> Dict[str, Any]:
         totals[key] = body.pop(key, None)
     body.pop("currency", None)
     body["totals"] = totals
+    _price_witness_fields(body, state=state, currency=currency)
 
     # THE HOSTED URL IS RE-VETTED AT READ TIME, against the same allowlist that let it be stored.
     # Defence in depth, and not theatre: the value in the column came from a partner, it is the
