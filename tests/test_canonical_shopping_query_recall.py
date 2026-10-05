@@ -666,3 +666,35 @@ async def test_a_non_us_market_prices_in_its_own_currency(catalog):
 def test_model_numbers_and_attributes_are_not_unparsed_money(query):
     plan = prepare_canonical_search_query(query, market_currency="USD")
     assert (plan.price_min, plan.price_max, plan.error, plan.unparsed_budget) == (None, None, None, False)
+
+
+@pytest.mark.asyncio
+async def test_recent_same_category_rows_cannot_crowd_out_products_that_name_the_query(catalog):
+    # 2026-10-05 prod: "moisturizer" recalled 48 category rows, 37 of them one
+    # brand's recently ingested creams, and the route's category-word filter
+    # then served 3 products. Rows whose own text names the query must win the
+    # candidate slots ahead of mere recency within the category.
+    for index in range(210):
+        key = f"zeta_{index}"
+        title = f"Zeta Glow Cream {index}"
+        catalog.insert("catalog_products", {
+            "product_key": key, "pivota_signature_id": "sig_test_" + key, "source_product_id": key,
+            "title": title, "description": title, "brand": "Zeta", "product_type": "cream",
+            "category": "cream", "merchant_id": "test_owner", "sync_status": "live",
+            "category_path": "beauty/skincare/moisturize/cream", "updated_at": "2026-10-05T00:00:00",
+            "catalog_track": "external_referral", "truth_tier": "primary", "readiness_tier": "knowledge_ready",
+            "canonical_url": "https://merchant.example/test/" + key, "image_url": "https://merchant.example/test.png",
+            "pdp_scope": "multi_merchant_canonical", "pdp_lifecycle_stage": "published",
+        })
+        catalog.insert("catalog_skus", {"sku_key": key, "product_key": key, "title": title, "sku": key,
+            "source_variant_id": "variant_" + key, "updated_at": "2026-10-05T00:00:00",
+            "visible_attributes": json.dumps({}), "visible_option_labels": "[]", "ingredient_ids": "[]"})
+        catalog.insert("catalog_offers", {"offer_id": "offer_" + key, "sku_key": key, "merchant_id": "test_seller",
+            "catalog_track": "external_referral", "truth_tier": "primary", "readiness_tier": "knowledge_ready",
+            "offer_mode": "external_redirect", "availability": "in_stock", "inventory_quantity": 2,
+            "currency": "USD", "list_price": 20, "merchant_effective_price": 20,
+            "estimated_best_price": 20, "price_confidence": 1, "market": "US"})
+    result = await run_query("moisturizers")
+    served = {p["product_id"] for p in result["products"]}
+    # Every older product whose title says "moisturizer" is still served.
+    assert {"sig_test_cheap", "sig_test_mid", "sig_test_boundary", "sig_test_expensive"} <= served

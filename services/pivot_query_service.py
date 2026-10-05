@@ -911,7 +911,8 @@ def _canonical_match_reason(row: Dict[str, Any], query: str) -> Dict[str, Any]:
     # rank_score when the lane emits no split (e.g. the citable lane, which has no
     # structural boost, so its rank_score is already ~text).
     score_for_candidate = raw_rank_score
-    if _recall_relevance_v2_enabled() and row.get("text_score") is not None:
+    relevance_first = _recall_relevance_v2_enabled() or bool(row.get("relevance_first"))
+    if relevance_first and row.get("text_score") is not None:
         score_for_candidate = row.get("text_score")
     try:
         normalized_candidate_score = round(
@@ -939,6 +940,7 @@ def _canonical_match_reason(row: Dict[str, Any], query: str) -> Dict[str, Any]:
         # Structural/scope quality, kept separate from relevance. _sort_items uses
         # it only as a SECONDARY tie-break when v2 is on (0 / ignored otherwise).
         "structure_score": structure_score,
+        "relevance_first": relevance_first,
         "source_boost": 0.0,
         "quality_penalties_total": 0.0,
         "price_tie_break": row.get("estimated_best_price") or row.get("merchant_effective_price") or row.get("list_price"),
@@ -1473,6 +1475,20 @@ async def _fetch_canonical_search_rows(
             token_where = f"\n                OR (({_overlap_expr}) >= :cctok_min)\n"
             token_score = f"\n                    + (({_overlap_expr}) * 25)\n"
 
+    # Canonical shopping picks its candidates by RELEVANCE first: what the row's
+    # text says (exact + partial title/sku matches, tokens, brand anchor) plus
+    # whether its taxonomy is the query's category. Without this every row in a
+    # recognised category ties on rank_score (+90 category, +60 published, +200
+    # canonical scope), so the candidate_limit slots went to the most recently
+    # updated rows and the route's category-word filter then dropped them: on
+    # 2026-10-05 "moisturizer" recalled 48 category rows, 37 of them one recently
+    # ingested brand's creams, and served 3 products while a plain text search
+    # found 32 moisturizers across 10 brands. Signature-required rows are all
+    # canonical identities, so the private-listing pollution the +200 scope
+    # boost guards against cannot arise here. Other callers keep their order.
+    relevance_order = "(text_score + category_relevance) DESC, " if require_signature else ""
+    relevance_order_ms = "(ms.text_score + ms.category_relevance) DESC, " if require_signature else ""
+    relevance_order_c = "(c.text_score + c.category_relevance) DESC, " if require_signature else ""
     rows = await database.fetch_all(
         f"""
         WITH matched_skus AS (
@@ -1545,6 +1561,7 @@ async def _fetch_canonical_search_rows(
                     {token_score}
                 ) AS rank_score,
                 {brand_priority_score} AS brand_priority,
+                (0 {category_score}) AS category_relevance,
                 -- RECALL_RELEVANCE_V2: TEXT relevance only (exact + partial LIKE
                 -- + vertical term hits), with NO structural/scope boost. Used to
                 -- order results when v2 is on so the +200 canonical boost can't
@@ -1616,13 +1633,13 @@ async def _fetch_canonical_search_rows(
                     ms.*,
                     ROW_NUMBER() OVER (
                         PARTITION BY ms.product_key
-                        ORDER BY ms.brand_priority DESC, ms.rank_score DESC,
+                        ORDER BY ms.brand_priority DESC, {relevance_order_ms}ms.rank_score DESC,
                                  ms.sku_updated_at DESC, ms.sku_key
                     ) AS product_sku_rank
                 FROM matched_skus ms
             ) ranked
             WHERE ranked.product_sku_rank <= :per_product_sku_cap
-            ORDER BY brand_priority DESC, rank_score DESC,
+            ORDER BY brand_priority DESC, {relevance_order}rank_score DESC,
                      product_updated_at DESC, sku_updated_at DESC
             LIMIT :candidate_limit
         )
@@ -1700,12 +1717,18 @@ async def _fetch_canonical_search_rows(
         LEFT JOIN catalog_merchants bm
           ON bm.merchant_id = o.merchant_id
         {offer_seller_where}
-        ORDER BY c.brand_priority DESC, rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
+        ORDER BY c.brand_priority DESC, {relevance_order_c}rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
         LIMIT :row_limit
         """,
         params,
     )
-    return [_row_dict(row) for row in rows]
+    rows = [_row_dict(row) for row in rows]
+    if require_signature:
+        # Serve in the same relevance-first order the candidates were chosen in
+        # (RECALL_RELEVANCE_V2 semantics for canonical shopping only).
+        for row in rows:
+            row["relevance_first"] = True
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -2636,7 +2659,7 @@ def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
         # ties among similarly-relevant rows but can't leapfrog a more relevant
         # one. 0 when v2 is off ⇒ this key is inert and ordering is unchanged.
         structure_boost = 0.0
-        if _recall_relevance_v2_enabled():
+        if _recall_relevance_v2_enabled() or item.match_explanation.get("relevance_first"):
             try:
                 structure_boost = float(item.match_explanation.get("structure_score") or 0.0)
             except Exception:
