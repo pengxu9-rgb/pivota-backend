@@ -3458,7 +3458,7 @@ async def _settle_price_change(
 
 def _has_price_picture(row: Mapping[str, Any]) -> bool:
     return any(row.get(column) is not None for column in (
-        "live_items_subtotal_minor", "price_rebound_to_minor"))
+        "live_items_subtotal_minor", "live_unit_price_minor", "price_rebound_to_minor"))
 
 
 #: Provider refusals at the preflight that say THIS ITEM is not purchasable for this buyer -- a
@@ -3479,6 +3479,8 @@ def _preflight_refusal_reason(outcome: str, code: Optional[str]) -> str:
     kind = str(code or "").split(":", 1)[0]
     if kind == "quote_no_shipping_option":
         return "no_shipping_option"
+    if kind == "quote_items_mismatch":
+        return "price_unverifiable"  # the approval quote's own reason for the same echo
     return _QUOTE_REFUSAL_KINDS.get(kind, "preflight_refused")
 
 
@@ -3509,6 +3511,11 @@ async def _judge_preflight(
     if verdict.refusal_reason == "price_changed":
         return "price_changed", verdict.last_error_code, None, picture
     if verdict.refusal_reason == "no_shipping_option":
+        return "refused", verdict.last_error_code, None, picture
+    if verdict.last_error_code == "quote_items_mismatch":
+        # Reap echoed a line that is not ours (another variant, another quantity): it priced a
+        # DIFFERENT ITEM. Definitive, not unknown -- enforce must not send the buyer to a card
+        # page for it (review of #2515, P2-5).
         return "refused", verdict.last_error_code, None, picture
     return "unverified", verdict.last_error_code, None, picture
 
@@ -3604,8 +3611,10 @@ async def _preflight(
     recorded = row.get("preflight_outcome")
     code = row.get("preflight_error_code")
     if recorded is None:
-        if await _still_ours(row, worker_id) is None:
-            return _lost(row)
+        # No `_still_ours` here: `_resolving_to_enrollment` re-read the row immediately before
+        # this call with no await between, and `begin_preflight` is itself the claim fence (this
+        # holder, this claimed_at, 'resolving'). The reconciliation/create/scope stops are
+        # re-checked by the client before the witness leaves (`rc.ProviderOperationStopped`).
         if not await witness.begin_preflight(row, worker_id):
             return _lost(row)
         try:
@@ -3649,6 +3658,21 @@ async def _step_quoting(row: Mapping[str, Any], worker_id: str) -> AdvanceResult
     if guarded is None:
         return _lost(row)
     row = guarded
+
+    if _has_price_picture(row):
+        # mig 258: a 'quoting' step SUPERSEDES every earlier price picture (the preflight's live
+        # price and rebind, an earlier approval quote's), on EVERY exit -- the re-resolve's
+        # `_price_verdict`, a cart-link verdict, a missing card, a transport hold -- not only on a
+        # quote judged in `_checkout_from_quote`, which records this step's own picture if its
+        # quote disagrees. Without this the view showed the witness's "price updated to X" on a
+        # purchase a later, different check refused. Gated on a picture existing, not on a dial: a
+        # dial turned off after the witness must not leave its picture behind; a row no dial
+        # touched has none, and this writes nothing.
+        from db import reap_price_witness as witness
+
+        if not await witness.record_live_price(row, worker_id, {}):
+            return _lost(row)
+        row = {**row, **{column: None for column in witness.PRICE_PICTURE_COLUMNS}}
 
     active = await ledger.get_active_enrollment(str(row["buyer_ref"]))
     partner_enrollment = str((active or {}).get("reap_enrollment_id") or "").strip()
@@ -3801,16 +3825,6 @@ async def _checkout_from_quote(
     mapping, the quote id rules, the expiry check, the checkout create and every evidence write
     on the way out — is ONE body, moved here unchanged from `_step_quoting`.
     """
-    if _price_witness_armed() and _has_price_picture(row):
-        # mig 258: THIS quote supersedes every earlier price picture (the preflight's live price,
-        # its rebind, an earlier approval quote's). Cleared before the quote is judged, whatever
-        # it says, so the view can never show "price updated to X" from a quote that is no longer
-        # the latest; a subtotal-only mismatch below records this quote's own picture.
-        from db import reap_price_witness as witness
-
-        if not await witness.record_live_price(row, worker_id, {}):
-            return _lost(row)
-
     # What the buyer's offer code came to, written on EVERY exit below (a refused or failed
     # purchase whose code was dropped still says so). Absent when no code was sent.
     code_evidence: Dict[str, Any] = (

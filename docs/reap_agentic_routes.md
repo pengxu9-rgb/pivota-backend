@@ -589,9 +589,10 @@ still enforced on that total, and `final_total_minor` / attribution read the cha
 **Preflight outcomes** (`preflight_outcome`, recorded once per attempt; a second tick never quotes
 again): `ok`; `price_changed` (subtotal, currency, or a corroborated increase — definitive);
 `refused` (definitive: `VARIANT_UNAVAILABLE`, `QUOTE_UNFULFILLABLE`, `CHECKOUT_URL_INVALID`,
-`CARD_PAYMENT_UNAVAILABLE`, or no shipping option on the cart-link lane → `refusal_reason`
+`CARD_PAYMENT_UNAVAILABLE`, no shipping option on the cart-link lane, or an `items` echo that is
+not our line — Reap priced another item, `quote_items_mismatch` → `refusal_reason`
 `variant_unavailable` / `quote_unfulfillable` / `cart_link_rejected` / `card_payment_unavailable`
-/ `no_shipping_option`); `unverified` (transport error, timeout, 429, 5xx, an offer-code refusal,
+/ `no_shipping_option` / `price_unverifiable`); `unverified` (transport error, timeout, 429, 5xx, an offer-code refusal,
 an unreadable quote, or a witness interrupted mid-call: `preflight_interrupted`) — `enforce`
 continues on `unverified`, and the approval quote still decides. An enforced refusal is the
 ordinary terminal `refused` (email, address and offer code are cleared).
@@ -609,10 +610,16 @@ ordinary terminal `refused` (email, address and offer code are cleared).
                   "source": "enrichment_proof", "corroborated_at": "2026-10-05T08:00:01.123456+00:00"}
 ```
 
-* `preflight` — the buy-intent quote confirmed the price (`ok`): show these totals before the
-  card page. `tax_included: true` means `tax_minor` is already inside the prices.
-* `live_price` — only on `state: "refused"` with `refusal_reason: "price_changed"` when a quote's
-  live price was recorded: tell the buyer "price updated to X". `unit_price_minor` is `null` when
+* `preflight` — the buy-intent quote confirmed the price (`ok`), present ONLY while no approval
+  quote exists (`state` `resolving` or `needs_enrollment`). These are the totals the witness saw
+  before the card page, not a promise: from `quoting` on the key is gone and `totals` (the
+  approval quote's `quoted_total_minor`) is the only number to show; the approval quote may
+  differ. `tax_included: true` means `tax_minor` is already inside the prices.
+* `live_price` — only on `state: "refused"` with `refusal_reason: "price_changed"` AND
+  `last_error_code` `quote_items_subtotal_mismatch` or `quote_price_increased_corroborated` (the
+  refusal is the quoted item price itself), when that quote's live price was recorded: tell the
+  buyer "price updated to X". Every `quoting` step discards the witness's live price and rebind
+  first, so a later refusal never carries an earlier quote's price. `unit_price_minor` is `null` when
   the subtotal is not an exact multiple of the quantity; `stage` is `preflight` or `approval`.
   **Do not auto-retry at the live price.** `POST /purchases` compares the expected pair with the
   CATALOG offer price (`our_price_minor`, read fresh at create), so a new attempt carrying the live
