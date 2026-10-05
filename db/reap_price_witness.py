@@ -74,7 +74,13 @@ _ADD_COLUMNS_PG = """
 async def ensure_price_witness_schema() -> None:
     """Self-heal parity with migration 258 (production deploys skip db/migrations/)."""
     if IS_POSTGRES:
-        await database.execute(_ADD_COLUMNS_PG)
+        # GUARDED, like every boot-time heal (db/schema_guard.guarded_add_columns): the ALTER runs
+        # only while a column is missing, read from pg_attribute without taking a lock, so a
+        # healed table never sees an ACCESS EXCLUSIVE request on every boot.
+        from db.schema_guard import guarded_add_columns
+
+        for statement in guarded_add_columns(_ADD_COLUMNS_PG):
+            await database.execute(statement)
         return
     present = {r["name"] for r in await database.fetch_all("PRAGMA table_info(reap_agentic_purchases)")}
     if not present:

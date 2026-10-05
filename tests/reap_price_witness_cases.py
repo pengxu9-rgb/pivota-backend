@@ -875,3 +875,257 @@ def test_the_allowlist_carries_every_witness_column_and_nothing_private():
     assert set(witness.COLUMNS) <= set(ledger.PUBLIC_PURCHASE_COLUMNS)
     view = ledger.public_purchase_view({"id": "rp_1", "buyer_email": "x@y.z", **{c: 1 for c in witness.COLUMNS}})
     assert set(view) == {"id"} | set(witness.COLUMNS)
+
+
+# ══ 5. review round: every corroboration guard, the two-dial boundary, the stale view, budget ═
+
+
+PINK = "63530896753009"  # sold out in the real fixture
+
+
+def producer_proof(*, variant=BERRY, js_price=None, available=None, age=timedelta(hours=1),
+                   currency="USD"):
+    """The proof row the JOB's own `evidence_from_product` -> `decide_proof` builds, as the dict
+    the table holds (not written). `available` overrides that ONE variant's storefront flag in
+    the `.js` body before the job reads it."""
+    checked = datetime.now(timezone.utc) - age
+    body = tarte_js(js_price)
+    for entry in body["variants"]:
+        if str(entry["id"]) == variant and available is not None:
+            entry["available"] = available
+    evidence = evidence_from_product(body, requested_handle=body["handle"], source=SOURCE_PRODUCTS_JS,
+                                     checked_at=checked, currency=currency, currency_problem=None)
+    row = decide_proof(target(TARTE, "::v:" + variant), evidence, market_currency=currency)
+    assert row.outcome == "ok", row.outcome
+    return {k: v for k, v in row.__dict__.items() if k not in ("shopify_product_id", "variant_title",
+                                                                "live_variant_count")}
+
+
+def unit_price(proofs, variant=BERRY, host=TARTE_HOST, currency="USD"):
+    return corroboration.enrichment_unit_price(
+        proofs, variant_id=variant, shop_host=host, currency=currency,
+        now=datetime.now(timezone.utc), max_age=timedelta(hours=72))
+
+
+def test_control_a_producer_proof_corroborates():
+    assert unit_price([producer_proof()]) == 3000
+
+
+def test_a_sibling_variants_proof_never_corroborates():
+    """Pink, made available on the storefront, priced $30.00 like the quote: it is another shade."""
+    sibling = producer_proof(variant=PINK, available=True)
+    assert sibling["variant_id"] == PINK and sibling["live_price_minor"] == 3000
+    assert unit_price([sibling], variant=BERRY) is None
+
+
+def test_a_sold_out_variant_never_corroborates():
+    """The job writes `ok` with available=False and a price for a sold-out shade (real fixture)."""
+    sold_out = producer_proof(variant=PINK)
+    assert sold_out["available"] is False and sold_out["live_price_minor"] == 3000
+    assert unit_price([sold_out], variant=PINK) is None
+
+
+def test_only_an_ok_outcome_corroborates():
+    """The job never writes a price on a refusal; a row that carries one anyway is not evidence."""
+    assert unit_price([{**producer_proof(), "outcome": "variant_gone"}]) is None
+
+
+@pytest.mark.parametrize("host,expected", [
+    ("tartecosmetics.com", 3000), ("www.tartecosmetics.com", 3000),
+    ("uk.tartecosmetics.com", None), ("eviltartecosmetics.com", None),
+])
+def test_the_proof_must_be_the_same_storefront(host, expected):
+    assert unit_price([{**producer_proof(), "shop_host": host}]) == expected
+
+
+def test_usable_proofs_must_agree():
+    """Two sku spellings of one variant, read at different prices: neither corroborates."""
+    a = producer_proof()
+    b = {**producer_proof(js_price=2900), "sku_key": a["sku_key"] + "_alias"}
+    assert unit_price([a, b]) is None
+    assert unit_price([a, {**a, "sku_key": a["sku_key"] + "_alias"}]) == 3000
+
+
+async def test_the_proof_read_is_scoped_to_the_purchases_variant():
+    """The SQL join itself: a sibling's proof row is never handed to the verifier."""
+    import db.enrichment_cart_variant_proofs as proofs
+
+    assert await proofs.ensure_table()
+    await write_enrichment_proof()
+    body = tarte_js()
+    for entry in body["variants"]:
+        if str(entry["id"]) == PINK:
+            entry["available"] = True
+    checked = datetime.now(timezone.utc) - timedelta(hours=1)
+    evidence = evidence_from_product(body, requested_handle=body["handle"], source=SOURCE_PRODUCTS_JS,
+                                     checked_at=checked, currency="USD", currency_problem=None)
+    assert await upsert_proof(database, decide_proof(target(TARTE, "::v:" + PINK), evidence,
+                                                     market_currency="USD"), written_at=checked)
+    rows = await witness.enrichment_proofs_for_variant(TARTE_PK, BERRY)
+    assert [r["variant_id"] for r in rows] == [BERRY]
+
+
+@pytest.mark.parametrize("mirror,expected", [(2900, None), (3000, 3000)])
+async def test_both_lanes_must_agree(monkeypatch, mirror, expected):
+    await write_enrichment_proof()
+
+    async def _seed(product_key, market):
+        return {"seed_data": {}, "canonical_url": "https://tartecosmetics.com/products/x"}
+
+    monkeypatch.setattr(witness, "mirror_seed_for_product", _seed)
+    monkeypatch.setattr(corroboration, "mirror_unit_price", lambda *a, **k: mirror)
+    row = {"item_source": "cart_link", "cart_url": tarte_url(), "variant_key": "shopify:" + BERRY,
+           "product_key": TARTE_PK, "currency": "USD", "merchant_domain": TARTE_HOST,
+           "market_country": "US"}
+    found = await corroboration.independent_unit_price(
+        row, now=datetime.now(timezone.utc), max_age=timedelta(hours=72))
+    assert (found.unit_price_minor if found else None) == expected
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+async def test_preflight_alone_never_continues_at_a_lower_price(reap, monkeypatch, mode):
+    """The two-dial boundary: the witness is armed, corroboration is NOT. A matching proof and a
+    lower quote are a price change, not a rebind."""
+    preflight(monkeypatch, mode)
+    await write_enrichment_proof()
+    reap.request_cart_link_quote = ok(tarte_quote(30.0))
+    purchase_id = await open_tarte(3200, enrolled=False)
+    result = await step(purchase_id)
+    row = await get(purchase_id)
+    assert row["preflight_outcome"] == "price_changed" and row["price_rebound_to_minor"] is None
+    assert result.state == ("refused" if mode == "enforce" else "needs_enrollment")
+
+
+async def test_preflight_alone_refuses_the_lower_approval_quote(reap, monkeypatch):
+    preflight(monkeypatch, "shadow")
+    await write_enrichment_proof()
+    _purchase_id, result = await quote_with(reap, tarte_quote(30.0), our_price=3200)
+    assert (result.state, result.last_error_code) == ("refused", "quote_items_subtotal_mismatch")
+
+
+async def test_a_later_refusal_never_shows_the_preflights_live_price(reap, monkeypatch):
+    """The reviewer's case: the witness saw $30.00 against our $28.00 (shadow, continue); the
+    approval quote is at OUR $28.00 but its shipping does not reconcile. The view must not tell the
+    buyer "price updated to $30"."""
+    preflight(monkeypatch, "shadow")
+    bad_shipping = tarte_quote(28.0)
+    bad_shipping["shippingOptions"][0]["price"]["amount"] = 7.0
+    reap.request_cart_link_quote = [ok(tarte_quote(30.0, quote_id="q_witness")), ok(bad_shipping)]
+    purchase_id = await open_tarte(2800, enrolled=False)
+    assert (await step(purchase_id)).state == "needs_enrollment"
+    assert (await get(purchase_id))["live_unit_price_minor"] == 3000  # precondition
+    assert (await step(purchase_id)).state == "quoting"
+    result = await step(purchase_id)
+    assert (result.state, result.last_error_code) == ("refused", "quote_shipping_not_reconciled")
+    row = await get(purchase_id)
+    assert picture(row) == NO_PICTURE
+    assert "live_price" not in public_body(row)
+
+
+async def test_a_later_quote_drops_the_preflights_rebind(reap, monkeypatch):
+    preflight(monkeypatch, "shadow")
+    corroboration_on(monkeypatch)
+    await write_enrichment_proof()
+    reap.request_cart_link_quote = [ok(tarte_quote(30.0, quote_id="q_witness")),
+                                    ok(tarte_quote(32.0))]
+    purchase_id = await open_tarte(3200, enrolled=False)
+    assert (await step(purchase_id)).state == "needs_enrollment"
+    assert (await get(purchase_id))["price_rebound_to_minor"] == 3000  # precondition
+    assert (await step(purchase_id)).state == "quoting"
+    assert (await step(purchase_id)).state == "awaiting_approval"  # at our own price
+    row = await get(purchase_id)
+    assert picture(row) == NO_PICTURE and "price_rebound" not in public_body(row)
+
+
+async def _variant_lane_purchase():
+    from reap_cart_link_cases import ADDRESS, EMAIL, RETURN_URL, CONSENT
+
+    return await svc.start_purchase(
+        agent_id="agent_one", agent_user_ref_hash="hash_alice", buyer_ref="bref_alice",
+        row=svc.PurchaseRow(merchant_domain="brand.example", product_key="pk_1", variant_key="vk_1",
+                            product_name="Standard", variant_title="Standard", brand="Brand",
+                            category="fragrance", our_price_minor=4250, currency="USD",
+                            market_country="US"),
+        buyer=svc.BuyerContact(email=EMAIL, shipping_address=dict(ADDRESS)), quantity=1,
+        click_id="click_abc", return_url=RETURN_URL, consent_version=CONSENT)
+
+
+@pytest.mark.parametrize("resolve_seconds,expected_timeout", [(110.0, None), (90.0, 30.0), (10.0, 35.0)])
+async def test_the_witness_fits_inside_the_resolving_step_budget(reap, monkeypatch, resolve_seconds,
+                                                                 expected_timeout):
+    """resolve + witness + enrollment reserve <= 170 s (the lease floor's derivation): a slow
+    resolve shortens the witness, and below 22 s left it is not sent at all."""
+    preflight(monkeypatch, "enforce")
+    clock = [1000.0]
+    monkeypatch.setattr(svc, "_monotonic", lambda: clock[0])
+
+    def _resolve(**kwargs):
+        clock[0] += resolve_seconds
+        return rc.VariantResolution(ok=True, variant_id="var_abc123", product_id="prd_abc123",
+                                    price=(42.50, "USD"), available=True, queries_tried=["q"])
+
+    reap.resolve_our_row = _resolve
+    reap.request_quote = ok(tarte_quote(42.5, shipping=2.5))
+    purchase_id = await _variant_lane_purchase()
+    assert (await step(purchase_id)).state == "needs_enrollment"
+    sent = reap.named("request_quote")
+    row = await get(purchase_id)
+    if expected_timeout is None:
+        assert sent == [] and (row["preflight_outcome"], row["preflight_error_code"]) == (
+            "unverified", "preflight_no_budget")
+    else:
+        assert [s["timeout_seconds"] for s in sent] == [expected_timeout]
+        assert row["preflight_outcome"] == "ok"
+    assert svc.RESOLVING_STEP_BUDGET_S == svc.QUOTING_STEP_BUDGET_S == 170.0
+
+
+def test_only_the_proof_jobs_sources_corroborate():
+    assert unit_price([{**producer_proof(), "source": "cart_js"}]) is None
+
+
+def _mirror(seed, **over):
+    kwargs = dict(variant_id=JUDY_VARIANT, product_urls=[JUDY_SEED["canonical_url"]],
+                  shop_domain=JUDY_HOST, currency="USD", now=datetime.now(timezone.utc),
+                  max_age=timedelta(hours=72))
+    kwargs.update(over)
+    return corroboration.mirror_unit_price(seed, **kwargs)
+
+
+def _currency_seed(**proof_over):
+    seed = backfilled_seed(checked_at=datetime.now(timezone.utc) - timedelta(hours=1), currency="USD")
+    seed["snapshot"]["shopify_cart_proof"].update(proof_over)
+    return seed
+
+
+def test_mirror_control_and_each_guard():
+    """The mirror reader's guards one by one, on the backfill's own proof (+ the currency key)."""
+    assert _mirror(_currency_seed()) == 1399
+    assert _mirror(_currency_seed(), variant_id="49819267170581") is None   # a sibling shade
+    assert _mirror(_currency_seed(available=False)) is None
+    assert _mirror(_currency_seed(source="cart_js")) is None
+    assert _mirror(_currency_seed(), shop_domain="evil.example") is None    # the fetch rule
+    assert _mirror(_currency_seed(), currency="EUR") is None
+    assert _mirror(_currency_seed(price_minor=0)) is None
+    assert _mirror(json.dumps(_currency_seed())) == 1399                     # jsonb as text
+
+
+@pytest.mark.parametrize("price", [0, -1, True, 30.0, None])
+def test_only_a_positive_integer_price_corroborates(price):
+    assert unit_price([{**producer_proof(), "live_price_minor": price}]) is None
+    seed = _currency_seed(price_minor=price)
+    assert _mirror(seed) is None
+
+
+def test_the_mirror_proofs_must_agree():
+    """The backfill's per-variant proof beside its named proof: once both state a price (the
+    forward contract), they must state the same one."""
+    from scripts.backfill_shopify_variant_ids import build_selected_variant_proofs
+
+    seed = _currency_seed()
+    selected = build_selected_variant_proofs(seed["snapshot"]["variants"], JUDY_JS, js_url=JUDY_JS_URL,
+                                             checked_at=datetime.now(timezone.utc) - timedelta(hours=1))
+    assert set(selected) == {JUDY_VARIANT}, selected  # the real producer's shape
+    for price, expected in ((1499, None), (1399, 1399)):
+        seed["snapshot"]["shopify_cart_variant_proofs"] = {
+            JUDY_VARIANT: {**selected[JUDY_VARIANT], "price_minor": price, "currency": "USD"}}
+        assert _mirror(seed) == expected

@@ -2439,6 +2439,9 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
     handles (five searches for the same product on one day returned five different `prd_` ids),
     so the quote step re-resolves rather than trusting them.
     """
+    # The preflight witness's deadline (mig 258): see `RESOLVING_STEP_BUDGET_S`. Read from the
+    # step's own clock so a slow resolve leaves the witness less time, never the lease.
+    witness_deadline = _monotonic() + RESOLVING_STEP_BUDGET_S - ENROLLMENT_RESERVE_S
     guarded = await _still_ours(row, worker_id)
     if guarded is None:
         return _lost(row)
@@ -2455,7 +2458,9 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
                 row, worker_id, ["resolving"], "refused",
                 refusal_reason=verdict[0], last_error_code=verdict[1],
             )
-        return await _resolving_to_enrollment(row, worker_id, {})
+        return await _resolving_to_enrollment(
+            row, worker_id, {}, witness_deadline=witness_deadline
+        )
 
     # A HOLD RE-CHECKS THE ENROLLMENT, NOT THE CATALOG. A row released as `enrollment_settling`
     # is waiting for Reap to settle the buyer's pending enrollment; its re-check every 30 s used
@@ -2495,7 +2500,8 @@ async def _step_resolving(row: Mapping[str, Any], worker_id: str) -> AdvanceResu
         "queries_tried": queries,
     }
     return await _resolving_to_enrollment(
-        row, worker_id, evidence, variant_id=resolution.variant_id
+        row, worker_id, evidence, variant_id=resolution.variant_id,
+        witness_deadline=witness_deadline,
     )
 
 
@@ -2505,6 +2511,7 @@ async def _resolving_to_enrollment(
     evidence: Mapping[str, Any],
     *,
     variant_id: Optional[str] = None,
+    witness_deadline: Optional[float] = None,
 ) -> AdvanceResult:
     """The second half of 'resolving', shared by both item sources: does the buyer have a card?
 
@@ -2544,7 +2551,9 @@ async def _resolving_to_enrollment(
     # nothing below this line has sent the buyer to a card page yet. Off: returns None without a
     # read or a write, and the step is exactly what it was. `variant_id` is the resolver's handle
     # on the variant lane (the same one the approval quote would send), None on the cart-link lane.
-    stopped = await _preflight(row, worker_id, evidence, variant_id=variant_id)
+    stopped = await _preflight(
+        row, worker_id, evidence, variant_id=variant_id, deadline=witness_deadline
+    )
     if stopped is not None:
         return stopped
 
@@ -3504,8 +3513,24 @@ async def _judge_preflight(
     return "unverified", verdict.last_error_code, None, picture
 
 
+class _NoWitnessBudget(Exception):
+    """Internal: the step has too little time left for the witness quote."""
+
+
+#: THE RESOLVING STEP'S WALL-CLOCK BUDGET once a witness is taken (mig 258), kept equal to the
+#: worst 'quoting' step (`QUOTING_STEP_BUDGET_S`, 170 s) that jobs/reap_agentic_purchase_poll.py
+#: sizes its 180 s lease floor against. Without a witness 'resolving' is at most the resolve
+#: (~100 s) + the enrollment reconcile/create (`ENROLLMENT_RESERVE_S`); the witness gets only what
+#: is left of `RESOLVING_STEP_BUDGET_S - ENROLLMENT_RESERVE_S` after the resolve, capped at the
+#: slow-path 35 s, and is skipped (`unverified` / `preflight_no_budget`) below `MIN_QUOTE_BUDGET_S`.
+RESOLVING_STEP_BUDGET_S = QUOTING_STEP_BUDGET_S
+#: Held back for `_decide_pending`'s enrollment read (25 s) and `create_enrollment` (25 s).
+ENROLLMENT_RESERVE_S = 50.0
+
+
 async def _take_preflight_witness(
-    row: Mapping[str, Any], worker_id: str, variant_id: Optional[str]
+    row: Mapping[str, Any], worker_id: str, variant_id: Optional[str], *,
+    deadline: Optional[float] = None,
 ) -> Any:
     """Send the ONE witness quote and record its outcome over the 'pending' marker.
 
@@ -3522,8 +3547,15 @@ async def _take_preflight_witness(
         row, variant_id,
         idempotency_extra={"pivotaWitness": "preflight", "purchaseId": str(row["id"])},
     )
+    remaining = (deadline - _monotonic()) if deadline is not None else rc._QUOTE_TIMEOUT_S
     try:
-        response = await call(offer_code, rc._QUOTE_TIMEOUT_S)
+        if remaining < MIN_QUOTE_BUDGET_S:
+            # The resolve already spent the step's witness budget. NOT SENT: an unknown, never a
+            # mismatch -- and never retried, so a slow resolver cannot hold the purchase here.
+            raise _NoWitnessBudget()
+        response = await call(offer_code, min(rc._QUOTE_TIMEOUT_S, remaining))
+    except _NoWitnessBudget:
+        outcome, code, totals, picture = "unverified", "preflight_no_budget", None, {}
     except rc.ReapRequestError as exc:
         # Raised by the body builder BEFORE egress. Unknown, not a mismatch.
         outcome, code, totals, picture = (
@@ -3551,6 +3583,7 @@ async def _preflight(
     evidence: Mapping[str, Any],
     *,
     variant_id: Optional[str],
+    deadline: Optional[float] = None,
 ) -> Optional[AdvanceResult]:
     """The buy-intent witness in 'resolving'. None = carry on to the enrollment, as today.
 
@@ -3576,7 +3609,7 @@ async def _preflight(
         if not await witness.begin_preflight(row, worker_id):
             return _lost(row)
         try:
-            taken = await _take_preflight_witness(row, worker_id, variant_id)
+            taken = await _take_preflight_witness(row, worker_id, variant_id, deadline=deadline)
         except rc.ProviderOperationStopped:
             await witness.withdraw_preflight(row, worker_id)
             raise
@@ -3768,6 +3801,16 @@ async def _checkout_from_quote(
     mapping, the quote id rules, the expiry check, the checkout create and every evidence write
     on the way out — is ONE body, moved here unchanged from `_step_quoting`.
     """
+    if _price_witness_armed() and _has_price_picture(row):
+        # mig 258: THIS quote supersedes every earlier price picture (the preflight's live price,
+        # its rebind, an earlier approval quote's). Cleared before the quote is judged, whatever
+        # it says, so the view can never show "price updated to X" from a quote that is no longer
+        # the latest; a subtotal-only mismatch below records this quote's own picture.
+        from db import reap_price_witness as witness
+
+        if not await witness.record_live_price(row, worker_id, {}):
+            return _lost(row)
+
     # What the buyer's offer code came to, written on EVERY exit below (a refused or failed
     # purchase whose code was dropped still says so). Absent when no code was sent.
     code_evidence: Dict[str, Any] = (
@@ -3867,12 +3910,6 @@ async def _checkout_from_quote(
         from db import reap_price_witness as witness
 
         if not await witness.record_live_price(row, worker_id, picture):
-            return _lost(row)
-    elif verdict.ok and _price_witness_armed() and _has_price_picture(row):
-        # This quote is at OUR price: a live price recorded by an earlier quote is stale now.
-        from db import reap_price_witness as witness
-
-        if not await witness.record_live_price(row, worker_id, {}):
             return _lost(row)
     if not verdict.ok:
         return await _move(

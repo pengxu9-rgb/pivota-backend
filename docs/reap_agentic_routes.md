@@ -614,7 +614,12 @@ ordinary terminal `refused` (email, address and offer code are cleared).
 * `live_price` — only on `state: "refused"` with `refusal_reason: "price_changed"` when a quote's
   live price was recorded: tell the buyer "price updated to X". `unit_price_minor` is `null` when
   the subtotal is not an exact multiple of the quantity; `stage` is `preflight` or `approval`.
-  A new purchase at the new price needs a fresh key and the new expected money pair.
+  **Do not auto-retry at the live price.** `POST /purchases` compares the expected pair with the
+  CATALOG offer price (`our_price_minor`, read fresh at create), so a new attempt carrying the live
+  price is refused `409 price_changed` until the catalog offer itself is corrected (on the
+  enrichment lane the offer must also equal the storefront proof, else `row_price_stale`), and a
+  new attempt at the old catalog price meets the same quote refusal. Show the buyer the live
+  price; a retry is only meaningful after the catalog has caught up, with a fresh key.
 * `price_rebound` — the purchase continued at a lower live unit price our own read corroborated
   (`source`: `enrichment_proof` | `mirror_proof`). `totals.our_price_minor` still shows the
   selected price; the buyer approves `totals.quoted_total_minor`.

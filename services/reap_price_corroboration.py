@@ -48,10 +48,8 @@ from services.curated_brand_feed import _same_storefront_host
 from services.reap_cart_link import cart_link_line
 # The mirror proof's own FETCH rule (https, the shop's own host, the seed's own product URL,
 # fresh, not from the future) -- the one the cart-link lane already trusts. Reused, not restated.
-from services.shopify_variant_identity import (
-    CART_PROOF_SOURCE,
-    _cart_proof_fetch_is_trusted,
-)
+# It also pins `source == products_js_v1`, so that rule is not restated below.
+from services.shopify_variant_identity import _cart_proof_fetch_is_trusted
 
 ENRICHMENT_SOURCE = "enrichment_proof"
 MIRROR_SOURCE = "mirror_proof"
@@ -170,8 +168,6 @@ def mirror_unit_price(
         candidates.append(selected[variant_id])
     prices = set()
     for candidate in candidates:
-        if candidate.get("source") != CART_PROOF_SOURCE:
-            continue
         if str(candidate.get("variant_id") or "") != variant_id:
             continue
         if candidate.get("available") is not True:
