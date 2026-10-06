@@ -1,13 +1,16 @@
 """Persistence for the Reap rail's PRICE WITNESS (migration 258): the buy-intent preflight quote,
 the merchant's live price when a quote disagrees with ours, and a corroborated lower price.
 
-Owner decision 2026-10-05. Every statement here runs ONLY while a dial is armed
+Owner decision 2026-10-05. Every statement here runs only while a dial is armed
 (`REAP_AGENTIC_PREFLIGHT_MODE` shadow|enforce, `REAP_AGENTIC_PRICE_CORROBORATION` on; see
-services/reap_agentic_purchase.py). With both off no caller reaches this module, and the
-ledger's own statements (`create_purchase`, `transition`) never name these columns -- so a
-database whose mig-258 heal failed still opens and advances purchases exactly as before. That is
-deliberately the OPPOSITE of mig 247's choice (name the columns in every write so a missing heal
-is loud): these columns are dark-dial evidence, and a failed heal must not stop the live rail.
+services/reap_agentic_purchase.py) -- with ONE exception: the 'quoting' step clears a price
+picture an earlier dial left on the row (`record_live_price` with an empty picture) with the
+dials off too, and only on a row that HAS a picture. A row no dial ever touched has none, so with
+both dials off and no earlier picture no caller reaches this module, and the ledger's own
+statements (`create_purchase`, `transition`) never name these columns -- so a database whose
+mig-258 heal failed still opens and advances purchases exactly as before. That is deliberately
+the OPPOSITE of mig 247's choice (name the columns in every write so a missing heal is loud):
+these columns are dark-dial evidence, and a failed heal must not stop the live rail.
 
 FENCED LIKE EVERY POLLER WRITE. Each UPDATE carries `claimed_by = :worker` and the source state,
 and RETURNS the id (property 1 of db/reap_agentic_ledger.py: an UPDATE's `execute` has no
@@ -146,9 +149,12 @@ _RECORD_PREFLIGHT_SQL = """
 """
 _RECORD_PREFLIGHT_SQL_SQLITE = _RECORD_PREFLIGHT_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
 
-#: The approval quote's price picture (stage 'approval'), in 'quoting'. Written whenever the
-#: corroboration dial is on and the picture changed, including back to all-NULL when a later
-#: quote matched our price exactly.
+#: The price picture of the latest check, in 'quoting'. Two writers: the approval quote's own
+#: picture when its subtotal disagrees with ours and a dial is armed, and the 'quoting' step's
+#: CLEAR (all-NULL) whenever a picture exists -- that one runs with every dial OFF too, so a dial
+#: turned off after the witness leaves nothing behind. Fenced on the exact claim (holder AND
+#: claimed_at, like `_BEGIN_PREFLIGHT_SQL`): a stale step under the same worker id must not write
+#: its picture over the one a fresh step wrote or cleared.
 _RECORD_LIVE_PRICE_SQL = """
     UPDATE reap_agentic_purchases
        SET live_unit_price_minor = :live_unit,
@@ -159,7 +165,7 @@ _RECORD_LIVE_PRICE_SQL = """
            price_rebound_to_minor = :rebound_to,
            price_corroboration_source = :source,
            price_corroborated_at = :corroborated_at
-     WHERE id = :id AND state = 'quoting' AND claimed_by = :worker
+     WHERE id = :id AND state = 'quoting' AND claimed_by = :worker AND claimed_at = :claimed_at
     RETURNING id
 """
 
@@ -235,8 +241,10 @@ async def record_preflight(
 
 
 async def record_live_price(row: Mapping[str, Any], worker_id: str, picture: Mapping[str, Any]) -> bool:
-    """Write the approval quote's price picture on a 'quoting' row we hold. False = lost claim."""
-    values = {"id": str(row["id"]), "worker": worker_id, **_price_binds(picture)}
+    """Write (or, with an empty picture, clear) the price picture on a 'quoting' row we hold under
+    the exact claim `row` was read with. False = lost claim."""
+    values = {"id": str(row["id"]), "worker": worker_id,
+              "claimed_at": ledger._bind_dt(row.get("claimed_at")), **_price_binds(picture)}
     found = await database.fetch_one(_RECORD_LIVE_PRICE_SQL, values)
     return found is not None
 
