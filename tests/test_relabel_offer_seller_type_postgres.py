@@ -26,6 +26,8 @@ async def catalog(monkeypatch):
     import db.catalog  # noqa: F401 -- registers the catalog tables on the shared metadata
     from scripts import relabel_offer_seller_type as tool
     from scripts import restamp_offer_market as restamp
+    from db import merchant_domain_attestations as attest_mod
+    attest_mod.reset_ddl_ready_for_tests()  # each test builds its own schema
 
     refreshed = []
 
@@ -190,3 +192,103 @@ async def test_nothing_to_label_writes_nothing(catalog):
     with pytest.raises(SystemExit, match="nothing to label"):
         await tool.apply(database, await tool.plan(database))
     assert await admin.fetchval("SELECT count(*) FROM identity_resolution_events") == 0
+
+
+# ------------------------------------------------------------------ operator attestations (migration 259)
+
+APPROVED = {"attested_by": "reviewer@example.com", "review_ref": "test review",
+            "evidence": {"sources": ["https://example.com/evidence"]}}
+
+
+async def _attest(database, tool, tmp_path, entries, *, apply=True):
+    path = tmp_path / "attest.json"
+    path.write_text(__import__("json").dumps(entries))
+    return await tool.attest(database, str(path), apply=apply)
+
+
+async def test_an_attested_store_is_labelled_by_the_rules_official_domain_branch(catalog, tmp_path):
+    database, admin, tool, _ = catalog
+    await _seed_rows(admin)
+    out = await _attest(database, tool, tmp_path, [{"merchant_id": "agent_seed::tarte", "domain": "tartecosmetics.com",
+                                                    **APPROVED}])
+    assert out["written"] == 1
+    p = await tool.plan(database)
+    by_id = {o["offer_id"]: o for o in p["offers"]}
+    assert sorted(by_id) == sorted(PLANNED + ["o_tarte"])
+    assert by_id["o_tarte"]["rule"] == "operator_attested"
+    assert by_id["o_mac"]["rule"] == "brand_in_domain"
+    assert tool.summary(p)["by_rule"] == {"brand_in_domain": 2, "operator_attested": 1}
+
+
+async def test_an_attestation_for_another_seller_or_domain_or_a_revoked_one_labels_nothing(catalog, tmp_path):
+    database, admin, tool, _ = catalog
+    await _seed_rows(admin)
+    # The other seller has a candidate offer of its own, so its attestations ARE loaded: only the
+    # seller-scoped lookup keeps its tartecosmetics.com attestation away from Tarte's offer.
+    await _offer(admin, "o_someone_else", "ext:mac::1", merchant="agent_seed::someone-else", domain="maccosmetics.com")
+    await _attest(database, tool, tmp_path, [
+        {"merchant_id": "agent_seed::someone-else", "domain": "tartecosmetics.com", **APPROVED},
+        {"merchant_id": "agent_seed::tarte", "domain": "tarte.com", **APPROVED},
+    ])
+    assert "o_tarte" not in {o["offer_id"] for o in (await tool.plan(database))["offers"]}
+    await _attest(database, tool, tmp_path, [{"merchant_id": "agent_seed::tarte", "domain": "tartecosmetics.com",
+                                              **APPROVED}])
+    await admin.execute("UPDATE merchant_domain_attestations SET revoked_at = now() "
+                        "WHERE merchant_id = 'agent_seed::tarte' AND domain = 'tartecosmetics.com'")
+    assert "o_tarte" not in {o["offer_id"] for o in (await tool.plan(database))["offers"]}
+
+
+async def test_attest_is_a_dry_run_by_default_idempotent_and_never_revives_a_revocation(catalog, tmp_path):
+    database, admin, tool, _ = catalog
+    entry = {"merchant_id": "agent_seed::tarte", "domain": "https://www.TarteCosmetics.com/", **APPROVED}
+    dry = await _attest(database, tool, tmp_path, [entry], apply=False)
+    assert dry["new"] == 1 and "written" not in dry
+    assert await admin.fetchval("SELECT count(*) FROM merchant_domain_attestations") == 0
+    assert (await _attest(database, tool, tmp_path, [entry]))["written"] == 1
+    row = await admin.fetchrow("SELECT * FROM merchant_domain_attestations")
+    assert (row["domain"], row["attested_by"], row["review_ref"]) == ("tartecosmetics.com", "reviewer@example.com",
+                                                                      "test review")
+    again = await _attest(database, tool, tmp_path, [entry])
+    assert (again["new"], again["already_active"]) == (0, 1)
+    await admin.execute("UPDATE merchant_domain_attestations SET revoked_at = now()")
+    revived = await _attest(database, tool, tmp_path, [entry])
+    assert revived["new"] == 0
+    assert revived["revoked_not_revived"] == [("agent_seed::tarte", "tartecosmetics.com")]
+    assert await admin.fetchval("SELECT count(*) FROM merchant_domain_attestations WHERE revoked_at IS NULL") == 0
+
+
+@pytest.mark.parametrize("bad", [
+    {"merchant_id": "agent_seed::tarte", "domain": "tartecosmetics.com", "attested_by": "", "review_ref": "r",
+     "evidence": {"sources": ["x"]}},
+    {"merchant_id": "agent_seed::tarte", "domain": "tartecosmetics.com", "attested_by": "a", "review_ref": "r",
+     "evidence": {}},
+    {"merchant_id": "", "domain": "tartecosmetics.com", **APPROVED},
+    {"merchant_id": "agent_seed::tarte", "domain": "not-a-host", **APPROVED},
+])
+async def test_an_incomplete_attestation_is_refused_before_anything_is_written(catalog, tmp_path, bad):
+    database, admin, tool, _ = catalog
+    with pytest.raises(ValueError):
+        await _attest(database, tool, tmp_path, [bad])
+
+
+def test_the_approved_attestation_list_in_the_repo_is_valid():
+    import json
+    from pathlib import Path
+    from db.merchant_domain_attestations import validate_entries
+    path = Path(__file__).resolve().parents[1] / "scripts" / "attestations" / "2026-10-06-public-brand-stores.json"
+    entries = validate_entries(json.loads(path.read_text()))
+    assert len(entries) == 11
+    assert {e["domain"] for e in entries} >= {"tartecosmetics.com", "misshaus.com", "kajabeauty.com", "us.balibodyco.com"}
+    assert all(not e["domain"].startswith("www.") for e in entries)
+
+
+async def test_the_writer_itself_never_revives_a_row_revoked_after_the_plan(catalog):
+    database, admin, tool, _ = catalog
+    from db import merchant_domain_attestations as attest_mod
+    entry = attest_mod.validate_entries([{"merchant_id": "agent_seed::tarte", "domain": "tartecosmetics.com",
+                                          **APPROVED}])[0]
+    assert await attest_mod.write_attestations([entry], db=database) == 1
+    await admin.execute("UPDATE merchant_domain_attestations SET revoked_at = now()")
+    # A plan taken before the revocation would still list it as new: the write must not undo the revocation.
+    assert await attest_mod.write_attestations([entry], db=database) == 0
+    assert await admin.fetchval("SELECT count(*) FROM merchant_domain_attestations WHERE revoked_at IS NULL") == 0
