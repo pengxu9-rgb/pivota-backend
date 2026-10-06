@@ -1573,8 +1573,10 @@ _CART_ENRICHMENT_VARIANT_SKU_COUNT_SQL = """
 # in the wrong money, which `enrichment_offer_price_ok` names `row_currency_mismatch` rather than
 # `row_unpriced`. The source_ref's host and handle are checked in Python (`_enrichment_listing_offer`),
 # exactly, by the same URL reader the verifier uses. Bounded: more than 50 is not one listing.
+# `offer_id` is not read here: services/reap_price_writeback selects the rows it may write through
+# this same statement, so the price it corrects is exactly the one this route reads.
 _CART_ENRICHMENT_OFFERS_SQL = """
-    SELECT o.currency,
+    SELECT o.offer_id, o.currency,
            CAST(coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price)
                 AS TEXT) AS price,
            o.source_ref

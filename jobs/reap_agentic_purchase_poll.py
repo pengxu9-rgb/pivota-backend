@@ -683,6 +683,8 @@ async def run_reap_agentic_purchase_poll(
         return gate() and os.getenv("REAP_AGENTIC_CREATE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
 
     async def _finish() -> PollReport:
+        await _price_writeback(_budget_spent)
+
         async def _diagnostic(name, awaitable):
             try:
                 counts[name] = await asyncio.wait_for(awaitable, timeout=STUCK_COUNT_TIMEOUT_SECONDS)
@@ -969,6 +971,34 @@ async def run_reap_agentic_purchase_poll(
         counts["errors"] += await _release_leftovers(worker, cancelled=cancelled)
 
     return await _finish()
+
+
+#: The price write-back pass's own ceiling inside one poll run (services/reap_price_writeback).
+PRICE_WRITEBACK_TIMEOUT_SECONDS = 60
+
+
+async def _price_writeback(budget_spent: Callable[[], bool]) -> None:
+    """The price write-back pass (dial REAP_AGENTIC_PRICE_WRITEBACK, default off), after the run's
+    own work and only while its budget lasts.
+
+    KEPT OUT OF `PollReport` ON PURPOSE. That line is a monitoring contract (`errors=[1-9]` pages
+    for the PURCHASE rail); a catalog correction that failed is not a purchase in trouble, so it
+    logs its own lines and never moves `errors`. It never raises into the run.
+    """
+    import services.reap_price_writeback as writeback
+
+    if writeback.writeback_mode() == "off" or budget_spent():
+        return
+    try:
+        outcomes = await asyncio.wait_for(
+            writeback.run_writeback_pass(), timeout=PRICE_WRITEBACK_TIMEOUT_SECONDS
+        )
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        operator_logger.error("reap_price_writeback: pass failed (error_type=%s)", type(exc).__name__)
+        return
+    if outcomes:
+        operator_logger.info("reap_price_writeback: mode=%s outcomes=%s",
+                             writeback.writeback_mode(), outcomes)
 
 
 async def _release_guarded(purchase_id: str, worker: str, counts: Dict[str, int]) -> bool:
