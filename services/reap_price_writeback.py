@@ -297,13 +297,17 @@ def _variant_id_of(variant: Mapping[str, Any]) -> Optional[str]:
 
 def plan_seed_write(
     seed_data: Any, *, variant_id: str, old_minor: int, new_minor: int, currency: str,
-    purchase_id: str, observed: Optional[datetime],
+    purchase_id: str, observed: Optional[datetime], sole_live_variant: bool = False,
 ) -> Tuple[Optional[Dict[str, Any]], bool, str]:
     """Pure: `(new_seed_data | None, product_level, reason)`.
 
     Every listed copy of THIS variant (`variants`, `snapshot.variants`) takes the new price, and
-    only where its price is the old one. `product_level` -- the seed's own price -- moves only when
-    the seed lists this one variant and nothing else. A copy at some third price, or a variant the
+    only where its price is the old one (a copy already at the new price is left as it is: an
+    earlier write). `product_level` -- the seed's own price -- moves when the seed lists this one
+    variant and nothing else, OR when `sole_live_variant` (the placeholder offer is being written:
+    the storefront proof shows this as the one live variant, so its price IS the product's, and
+    the seed->offer projection re-copies `price_amount` onto that placeholder -- leaving it behind
+    would undo the write; review of #2519, round 2). A copy at some third price, or a variant the
     seed does not list, writes nothing (`seed_price_unexpected` / `variant_not_on_seed`)."""
     document = corroboration._seed_document(seed_data)
     if document is None:
@@ -320,6 +324,9 @@ def plan_seed_write(
             for key in _VARIANT_PRICE_KEYS:
                 if key not in variant or variant[key] in (None, ""):
                     continue
+                if _same_price(variant[key], new_minor, currency):
+                    touched += 1
+                    continue
                 if not _same_price(variant[key], old_minor, currency):
                     return None, False, "seed_price_unexpected"
                 variant[key] = str(new_major) if isinstance(variant[key], str) else float(new_major)
@@ -327,7 +334,7 @@ def plan_seed_write(
     if not touched:
         return None, False, "variant_not_on_seed"
     listed = {(_variant_id_of(v) if isinstance(v, dict) else None) for vs in lists for v in vs}
-    product_level = listed == {variant_id}
+    product_level = listed == {variant_id} or bool(sole_live_variant)
     if product_level:
         for holder in (snapshot, document):
             if holder.get("price_amount") not in (None, "") and _same_price(holder["price_amount"], old_minor, currency):
@@ -343,9 +350,12 @@ def plan_seed_write(
 
 
 async def _mirror_offer_targets(row: Mapping[str, Any], product: Mapping[str, Any], seed_data: Any,
-                                variant_id: str) -> Tuple[List[Dict[str, Any]], str]:
-    """The offers `_load_cart_link_item` reads for this purchase: the variant's own skus, and the
-    placeholder when the storefront proof shows one live variant."""
+                                variant_id: str) -> Tuple[List[Dict[str, Any]], str, bool]:
+    """The offers `_load_cart_link_item` PRICES this purchase from: `(offers, reason, placeholder)`.
+
+    The route's rule exactly: the variant's own skus' offers whenever there is one; the `::canonical`
+    placeholder ONLY when there is none and the storefront proof shows one live variant. A
+    placeholder the route does not read is not written (a stale one must not block the write)."""
     import routes.agent_commerce_reap as route
     import services.reap_agentic_purchase as svc
 
@@ -355,20 +365,27 @@ async def _mirror_offer_targets(row: Mapping[str, Any], product: Mapping[str, An
     try:
         sku_variant, candidates, placeholder = route._cart_sku_choice(skus, product_key)
     except svc.PurchaseRefused:
-        return [], "sku_ambiguous"
+        return [], "sku_ambiguous", False
     if candidates and sku_variant != variant_id:
-        return [], "sku_names_another_variant"
-    sku_keys = [c["sku_key"] for c in candidates]
-    if placeholder and route._proof_live_variant_count(corroboration._seed_document(seed_data)) == 1:
-        sku_keys.append(placeholder["sku_key"])
-    offers: List[Dict[str, Any]] = []
-    for sku_key in sku_keys:
-        offers.extend(dict(o) for o in await database.fetch_all(_MIRROR_OFFERS_SQL, {
+        return [], "sku_names_another_variant", False
+
+    async def _offers(sku_key: str) -> List[Dict[str, Any]]:
+        return [dict(o) for o in await database.fetch_all(_MIRROR_OFFERS_SQL, {
             "product_key": product_key, "sku_key": sku_key,
             "merchant_id": str(product.get("merchant_id") or ""),
             "market_currency": str(row["currency"]).upper(),
-        }))
-    return offers, "planned"
+        })]
+
+    offers: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if placeholder and candidate["sku_key"] == placeholder["sku_key"]:
+            continue
+        offers.extend(await _offers(candidate["sku_key"]))
+    if offers:
+        return offers, "planned", False
+    if placeholder and route._proof_live_variant_count(corroboration._seed_document(seed_data)) == 1:
+        return await _offers(placeholder["sku_key"]), "planned", True
+    return [], "planned", False
 
 
 # ── enrichment ───────────────────────────────────────────────────────────────────────────────
@@ -499,13 +516,15 @@ async def apply_one(row: Mapping[str, Any], *, mode: str, now: datetime) -> str:
         earlier_at = corroboration._aware((earlier or {}).get("observed_at")) if isinstance(earlier, dict) else None
         if earlier_at is not None and (observed is None or earlier_at > observed):
             return "catalog_write_newer"
+        offers, reason, placeholder_priced = await _mirror_offer_targets(
+            row, product, seed.get("seed_data"), variant_id)
+        if reason != "planned":
+            return reason
         document, product_level, reason = plan_seed_write(
             seed.get("seed_data"), variant_id=variant_id, old_minor=ours, new_minor=live,
-            currency=currency, purchase_id=str(row["id"]), observed=observed)
+            currency=currency, purchase_id=str(row["id"]), observed=observed,
+            sole_live_variant=placeholder_priced)
         if document is None:
-            return reason
-        offers, reason = await _mirror_offer_targets(row, product, seed.get("seed_data"), variant_id)
-        if reason != "planned":
             return reason
     else:
         offers = await _enrichment_offer_targets(row, proof_skus)

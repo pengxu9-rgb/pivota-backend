@@ -481,3 +481,54 @@ async def test_a_real_sku_that_now_names_another_variant_is_not_written(client, 
     outcome = await writeback.run_writeback_pass()
     assert outcome == {"route_prices_another_variant": 1}, outcome
     assert await offer_prices() == ["13.99"]
+
+
+async def test_a_placeholder_write_survives_the_seed_to_offer_reprojection(client, monkeypatch):
+    """Review of #2519 round 2 (F-A): the seed lists two variants, the proof shows one live; the
+    route prices from the placeholder. The seed->offer projection re-copies `price_amount` onto the
+    placeholder, so the write must move it too, or the next projection undoes the fix for good."""
+    from services.external_offer_dual_write import derive_mirror_offer_id
+
+    await refused_at(client, monkeypatch, live=1499)
+    await _to_placeholder_only()
+    mirror_id = derive_mirror_offer_id(PRODUCT)
+    await database.execute("UPDATE catalog_offers SET offer_id = :m WHERE offer_id = 'ph-offer'", {"m": mirror_id})
+    await _edit_seed(lambda d: d.update(variants=[
+        dict(d["snapshot"]["variants"][0]),
+        {"title": "Sold out shade", "price": "20.00", "shopify_variant_id": OTHER_VARIANT, "available": False}]))
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert (await seed_state())[0] == 14.99
+    # What MIRROR_OFFER_UPSERT_SQL's conflict branch does: the offer takes the seed's price_amount.
+    await database.execute(
+        "UPDATE catalog_offers SET merchant_effective_price = (SELECT price_amount FROM external_product_seeds "
+        "WHERE id = :s) WHERE offer_id = :m", {"s": SEED, "m": mirror_id})
+    assert await offer_prices() == ["14.99"]
+    assert await writeback.run_writeback_pass() == {"already_current": 1}
+
+
+async def test_a_stale_placeholder_the_route_does_not_read_does_not_block_the_write(client, monkeypatch):
+    """Round 2 (P5): the route prices the real sku's offer; the placeholder holds a stale 12.50. The
+    placeholder is not what the route reads, so it is neither written nor a reason to refuse."""
+    await refused_at(client, monkeypatch, live=1499)
+    await database.execute(
+        "INSERT INTO catalog_skus (sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency) "
+        "VALUES (:sku,:pk,:seller,'external_seed','x',:pk,'Default','USD')",
+        {"sku": PLACEHOLDER, "pk": PRODUCT, "seller": SELLER})
+    await database.execute(
+        "INSERT INTO catalog_offers (offer_id,sku_key,product_key,merchant_id,currency,merchant_effective_price,availability) "
+        "VALUES ('ph-offer',:sku,:pk,:seller,'USD','12.50','in_stock')",
+        {"sku": PLACEHOLDER, "pk": PRODUCT, "seller": SELLER})
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await offer_prices() == ["12.5", "14.99"]
+
+
+def test_a_seed_copy_already_at_the_new_price_is_an_earlier_write_not_a_conflict():
+    seed = {"variants": [{"id": "111", "price": "14.99"}],
+            "snapshot": {"variants": [{"variant_id": "111", "price": "13.99"}]}}
+    plan, _product_level, reason = writeback.plan_seed_write(
+        seed, variant_id="111", old_minor=1399, new_minor=1499, currency="USD",
+        purchase_id="rp_1", observed=None)
+    assert reason == "planned"
+    assert (plan["variants"][0]["price"], plan["snapshot"]["variants"][0]["price"]) == ("14.99", "14.99")
