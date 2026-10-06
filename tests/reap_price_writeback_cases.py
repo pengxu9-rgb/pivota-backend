@@ -656,3 +656,101 @@ def test_a_product_level_price_copy_at_a_third_price_refuses_the_plan():
         seed, variant_id="111", old_minor=1399, new_minor=1499, currency="USD",
         purchase_id="rp_1", observed=None)
     assert (plan, reason) == (None, "seed_price_unexpected")
+
+
+# ── review of #2520: the seed price column's compare-and-set and the sole-variant gate ───────
+
+
+async def _seed_column():
+    row = await database.fetch_one("SELECT price_amount FROM external_product_seeds WHERE id = :id", {"id": SEED})
+    return row["price_amount"]
+
+
+def _two_listed(d):
+    d["variants"] = [dict(d["snapshot"]["variants"][0]),
+                     {"title": "Other", "price": "20.00", "shopify_variant_id": OTHER_VARIANT}]
+
+
+async def test_a_null_seed_price_column_is_compared_as_null_and_stays_null(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499)
+    await database.execute("UPDATE external_product_seeds SET price_amount = NULL WHERE id = :id", {"id": SEED})
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await _seed_column() is None
+
+
+@pytest.mark.parametrize("before,during", [(None, 15.49), (13.99, None)], ids=["null_to_value", "value_to_null"])
+async def test_a_seed_price_column_that_moves_to_or_from_null_wins(client, monkeypatch, before, during):
+    await refused_at(client, monkeypatch, live=1499)
+    await database.execute("UPDATE external_product_seeds SET price_amount = :p WHERE id = :id", {"p": before, "id": SEED})
+    real = writeback._mirror_offer_targets
+
+    async def racing(*args, **kwargs):
+        found = await real(*args, **kwargs)
+        await database.execute("UPDATE external_product_seeds SET price_amount = :p WHERE id = :id",
+                               {"p": during, "id": SEED})
+        return found
+
+    monkeypatch.setattr(writeback, "_mirror_offer_targets", racing)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"raced": 1}
+    assert await offer_prices() == ["13.99"]
+
+
+async def test_a_seed_price_column_already_at_the_new_price_is_not_a_conflict(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499)
+    await database.execute("UPDATE external_product_seeds SET price_amount = 14.99 WHERE id = :id", {"id": SEED})
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await _seed_column() == 14.99
+
+
+async def test_a_placeholder_already_at_the_new_price_beside_a_real_sku_at_the_old(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499)
+    await _add_placeholder("14.99")
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await offer_prices() == ["14.99", "14.99"]
+
+
+async def test_a_placeholder_is_not_written_beside_a_real_sku_under_a_multi_variant_proof(client, monkeypatch):
+    """The placeholder is the product-level price only when ONE variant is live."""
+    await refused_at(client, monkeypatch, live=1499)
+    await _add_placeholder("13.99")
+
+    def named(d):
+        _two_listed(d)
+        d["snapshot"]["shopify_cart_proof"].update(scope="named_variant", available=True, live_variant_count=3)
+    await _edit_seed(named)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    placeholder = await database.fetch_one(
+        "SELECT CAST(merchant_effective_price AS TEXT) AS p FROM catalog_offers WHERE offer_id = 'ph-offer'")
+    assert float(placeholder["p"]) == 13.99 and await _seed_column() == 13.99
+
+
+async def test_a_sole_variant_placeholder_beside_a_real_sku_moves_the_seed_column(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499)
+    await _add_placeholder("13.99")
+    await _edit_seed(_two_listed)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await _seed_column() == 14.99
+
+
+async def test_a_seed_listing_several_variants_never_judges_its_product_price(client, monkeypatch):
+    """Not product-level (several listed, no placeholder written): the column is not this
+    variant's, so a third price there neither moves nor refuses."""
+    await refused_at(client, monkeypatch, live=1499)
+    await _edit_seed(_two_listed)
+    await database.execute("UPDATE external_product_seeds SET price_amount = 12.00 WHERE id = :id", {"id": SEED})
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await _seed_column() == 12.0
+
+
+async def test_a_snapshot_price_already_at_the_new_price_is_not_a_conflict(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499)
+    await _edit_seed(lambda d: d["snapshot"].update(price_amount=14.99))
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}

@@ -130,3 +130,63 @@ async def test_every_sku_our_proof_confirms_takes_the_price_whatever_it_said_bef
     outcome = await writeback.run_writeback_pass()
     assert outcome == {"written": 1}, outcome
     assert await listing_prices() == [32.0, 32.0]
+
+
+# ── review of #2520: all-or-nothing on the enrichment lane, and what is never touched ────────
+
+
+async def _listing_prices_by_id():
+    rows = await database.fetch_all(
+        "SELECT offer_id, CAST(merchant_effective_price AS TEXT) AS p FROM catalog_offers "
+        "WHERE product_key = :pk ORDER BY offer_id", {"pk": TARTE_PK})
+    return {r["offer_id"]: r["p"] for r in rows}
+
+
+async def _proof_on_placeholder_too():
+    from reap_enrichment_cart_route_cases import TARTE_PLACEHOLDER
+
+    await seed_proof(pk=TARTE_PK, sku_key=TARTE_PLACEHOLDER, shop_host=TARTE_HOST, handle=TARTE_HANDLE,
+                     variant_id=TARTE_VARIANT, price_minor=3200)
+    return TARTE_PLACEHOLDER
+
+
+@pytest.mark.parametrize("bad", ["0.00", "-1.00"])
+@pytest.mark.parametrize("first", [False, True], ids=["after_a_good_offer", "sorted_first"])
+async def test_an_unreadable_offer_refuses_before_any_write(client, bad, first):
+    """F1: refusing after one offer was written committed that write and reported nothing."""
+    await refused_at(client, live=3200)
+    placeholder = await _proof_on_placeholder_too()
+    await seed_offer(oid="off_tarte_a0" if first else "off_tarte_c2", pk=TARTE_PK, sku_key=placeholder,
+                     merchant=TARTE_OFFER_MERCHANT, price=bad, source_ref=TARTE_URL)
+    await our_proof_reads(3200)
+    before = await _listing_prices_by_id()
+    outcome = await writeback.run_writeback_pass()
+    assert outcome == {"offer_price_unreadable": 1}, outcome
+    assert await _listing_prices_by_id() == before
+
+
+async def test_an_offer_in_another_currency_rolls_the_whole_write_back(client):
+    await refused_at(client, live=3200)
+    placeholder = await _proof_on_placeholder_too()
+    await seed_offer(oid="off_tarte_c2", pk=TARTE_PK, sku_key=placeholder, merchant=TARTE_OFFER_MERCHANT,
+                     price="31.00", source_ref=TARTE_URL, currency="EUR")
+    await our_proof_reads(3200)
+    before = await _listing_prices_by_id()
+    assert await writeback.run_writeback_pass() == {"raced": 1}
+    assert await _listing_prices_by_id() == before
+
+
+async def test_offers_that_are_not_the_listings_own_live_ones_are_never_touched(client):
+    await refused_at(client, live=3200)
+    placeholder = await _proof_on_placeholder_too()
+    for oid, extra in (("off_other_seller", {"merchant": "merch_obs_someoneelse"}),
+                       ("off_mirror_sys", {"source_system": "external_product_seeds_mirror_v1"}),
+                       ("off_oos", {"availability": "out_of_stock"}),
+                       ("off_supp", {"suppressed_at": True})):
+        await seed_offer(oid=oid, pk=TARTE_PK, sku_key=placeholder, price="27.00", source_ref=TARTE_URL,
+                         **{"merchant": TARTE_OFFER_MERCHANT, **extra})
+    await our_proof_reads(3200)
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    after = await _listing_prices_by_id()
+    for oid in ("off_other_seller", "off_mirror_sys", "off_oos", "off_supp"):
+        assert float(after[oid]) == 27.0, oid

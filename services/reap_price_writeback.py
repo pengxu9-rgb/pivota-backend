@@ -447,6 +447,10 @@ async def _write_offers(offers: List[Mapping[str, Any]], *, old: int, new: int, 
     (review of #2519 round 2, R2-3)."""
     if not offers:
         return 0, "no_offer"
+    # EVERY refusal comes BEFORE the first UPDATE: a return after one would commit it (the caller's
+    # transaction rolls back only on an exception). Review of #2520, F1.
+    if any(ledger.amount_minor_or_none(_decimal_text(o.get("price")), currency) is None for o in offers):
+        return 0, "offer_price_unreadable"
     if not any_prior and any(
             not _same_price(o.get("price"), old, currency) and not _same_price(o.get("price"), new, currency)
             for o in offers):
@@ -456,8 +460,6 @@ async def _write_offers(offers: List[Mapping[str, Any]], *, old: int, new: int, 
         if _same_price(offer.get("price"), new, currency):
             continue
         read_minor = ledger.amount_minor_or_none(_decimal_text(offer.get("price")), currency)
-        if read_minor is None:
-            return 0, "offer_price_unreadable"
         found = await database.fetch_one(_WRITE_OFFER_SQL, {
             "price": _major(new, currency), "offer_id": offer["offer_id"], "currency": currency,
             "scale": _scale(currency), "old_minor": int(read_minor)})
