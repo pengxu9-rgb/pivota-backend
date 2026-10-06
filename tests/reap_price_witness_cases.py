@@ -1258,3 +1258,140 @@ def test_an_ok_witness_without_totals_shows_nothing():
     """A row some other writer left `ok` with no totals is not a confirmed price."""
     assert "preflight" not in public_body({"id": "rp_1", "state": "needs_enrollment", "currency": "USD",
                                            "preflight_outcome": "ok", "preflight_total_minor": None})
+
+
+# ══ 7. before enforce (review of #2516): the fences a mutant could remove unseen ══════════════
+
+
+async def _quoting_with_stale_picture():
+    """An enrolled purchase in 'quoting' carrying the picture a shadow witness left behind."""
+    purchase_id = await open_tarte(3000)
+    assert (await step(purchase_id)).state == "quoting"
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET live_unit_price_minor = 2800, live_items_subtotal_minor = 2800, "
+        "live_price_stage = 'preflight' WHERE id = :i", {"i": purchase_id})
+    return purchase_id
+
+
+async def test_a_lost_begin_inside_the_step_sends_no_witness(reap, monkeypatch):
+    """M13: the same worker id re-claimed the row between the step's re-read and the begin. The
+    begin's claim fence is the ONLY one left before the witness leaves (the duplicate re-read went
+    in #2516), so the step must stop on its False: no quote, no enrollment, no marker."""
+    preflight(monkeypatch, "shadow")
+    reap.request_cart_link_quote = ok(tarte_quote(30.0))
+    purchase_id = await open_tarte(3000, enrolled=False)
+    real_begin = witness.begin_preflight
+
+    async def _reclaimed_then_begin(row, worker_id):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET claimed_at = :t WHERE id = :i",
+            {"t": ledger._bind_dt(datetime(2001, 1, 1, tzinfo=timezone.utc)), "i": purchase_id})
+        return await real_begin(row, worker_id)
+
+    monkeypatch.setattr(witness, "begin_preflight", _reclaimed_then_begin)
+    result = await step(purchase_id)
+    assert result.outcome == "lost_claim", result
+    assert reap.sequence() == []
+    row = await get(purchase_id)
+    assert (row["state"], row["preflight_outcome"], row["enrollment_id"]) == ("resolving", None, None)
+
+
+@pytest.mark.parametrize("lane", ["variant", "cart_link"])
+async def test_a_lost_clear_at_quoting_stops_the_step(reap, monkeypatch, lane):
+    """M4 (and M20 through the real write): another worker took the row between the step's
+    re-read and the clear. The step stops THERE. On the variant lane nothing else would stop it:
+    the re-resolve (a Reap call) follows the clear with no re-read in between."""
+    if lane == "variant":
+        resolution = rc.VariantResolution(ok=True, variant_id="var_abc123", product_id="prd_abc123",
+                                          price=(42.50, "USD"), available=True, queries_tried=["q"])
+        reap.resolve_our_row = [resolution, resolution]
+        reap.request_quote = ok(tarte_quote(42.5))
+        await active_enrollment()
+        purchase_id = await _variant_lane_purchase()
+        assert (await step(purchase_id)).state == "quoting"
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET live_unit_price_minor = 4000, live_price_stage = 'preflight' "
+            "WHERE id = :i", {"i": purchase_id})
+    else:
+        reap.request_cart_link_quote = ok(tarte_quote(30.0))
+        purchase_id = await _quoting_with_stale_picture()
+    calls_before = list(reap.sequence())
+    real_record = witness.record_live_price
+
+    async def _taken_then_clear(row, worker_id, picture):
+        await database.execute("UPDATE reap_agentic_purchases SET claimed_by = 'w2' WHERE id = :i",
+                               {"i": purchase_id})
+        return await real_record(row, worker_id, picture)
+
+    monkeypatch.setattr(witness, "record_live_price", _taken_then_clear)
+    result = await step(purchase_id)
+    assert result.outcome == "lost_claim", result
+    assert reap.sequence() == calls_before  # no re-resolve, no quote, no checkout
+    row = await get(purchase_id)
+    assert row["state"] == "quoting"
+    assert row["live_unit_price_minor"] is not None  # the holder's to clear, not ours
+
+
+async def test_the_clear_runs_with_every_dial_off(reap):
+    """M2: a dial turned off after the witness must not leave its picture behind. Every dial is
+    off here (the autouse fixture); the approval quote matches our price exactly."""
+    reap.request_cart_link_quote = ok(tarte_quote(30.0))
+    purchase_id = await _quoting_with_stale_picture()
+    assert svc.preflight_mode() == "off" and not svc.is_price_corroboration_enabled()
+    assert (await step(purchase_id)).state == "awaiting_approval"
+    row = await get(purchase_id)
+    assert picture(row) == NO_PICTURE
+    assert "live_price" not in public_body(row)
+
+
+async def test_the_record_is_fenced_on_the_holder(reap):
+    """M18: a begin under w1, then the lease went to w2: w1's record lands nowhere."""
+    purchase_id = await open_tarte(3000, enrolled=False)
+    row = await _claimed(purchase_id)
+    assert await witness.begin_preflight(row, "w1") is True
+    await database.execute("UPDATE reap_agentic_purchases SET claimed_by = 'w2' WHERE id = :i",
+                           {"i": purchase_id})
+    assert await witness.record_preflight(row, "w1", outcome="ok", error_code=None) is False
+    assert (await get(purchase_id))["preflight_outcome"] == "pending"
+
+
+@pytest.mark.parametrize("fence", ["holder", "state", "claim"])
+async def test_the_live_price_write_is_fenced_on_the_exact_claim_and_state(reap, fence):
+    """M19 (state), M20 (holder), and the claim itself: a stale step under the SAME worker id
+    must not write its picture over a fresh step's (review of #2516, item 5)."""
+    purchase_id = await open_tarte(3000)
+    assert (await step(purchase_id)).state == "quoting"
+    row = await _claimed(purchase_id)
+    change = {
+        "holder": "claimed_by = 'w2'",
+        "state": "state = 'awaiting_approval'",
+        "claim": "claimed_at = :t",
+    }[fence]
+    await database.execute(f"UPDATE reap_agentic_purchases SET {change} WHERE id = :i",
+                           {"i": purchase_id, **({"t": ledger._bind_dt(datetime(2001, 1, 1, tzinfo=timezone.utc))}
+                                                 if fence == "claim" else {})})
+    written = await witness.record_live_price(row, "w1", {"live_unit": 2800, "live_stage": "approval"})
+    assert written is False
+    assert picture(await get(purchase_id)) == NO_PICTURE
+
+
+async def test_the_live_price_write_lands_under_the_claim_it_was_read_with(reap):
+    """Control for the fence above: the same write, nothing moved, lands."""
+    purchase_id = await open_tarte(3000)
+    assert (await step(purchase_id)).state == "quoting"
+    row = await _claimed(purchase_id)
+    assert await witness.record_live_price(row, "w1", {"live_unit": 2800, "live_stage": "approval"}) is True
+    assert (await get(purchase_id))["live_unit_price_minor"] == 2800
+
+
+@pytest.mark.parametrize("change", ["preflight_outcome = 'ok'", "claimed_by = 'w2'"])
+async def test_a_withdraw_touches_only_our_own_pending_marker(reap, change):
+    """M22: a withdraw may only take back a 'pending' marker this holder wrote -- never a recorded
+    outcome (the next tick would quote again) and never another holder's marker."""
+    purchase_id = await open_tarte(3000, enrolled=False)
+    row = await _claimed(purchase_id)
+    assert await witness.begin_preflight(row, "w1") is True
+    await database.execute(f"UPDATE reap_agentic_purchases SET {change} WHERE id = :i", {"i": purchase_id})
+    expected = (await get(purchase_id))["preflight_outcome"]
+    assert await witness.withdraw_preflight(row, "w1") is False
+    assert (await get(purchase_id))["preflight_outcome"] == expected

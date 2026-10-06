@@ -557,7 +557,11 @@ if the poller is dark, or `completed` when an approval landed inside the last po
 ### Price witness: preflight quote, corroborated price change, live price (mig 258, dark)
 
 Owner decision 2026-10-05. Three dials, **all default off**; with every one off nothing below
-happens, no new key appears in any body, and the refusals are exactly the ones documented above.
+happens, no new key appears in any body, and the refusals are exactly the ones documented above --
+with one exception: a purchase that reaches `quoting` still carrying a live price an earlier
+witness recorded (a dial armed then, off now) has that price cleared, so the view never shows a
+"price updated" that no current check stands behind. A purchase no dial ever touched carries none,
+and nothing is written for it.
 
 | dial | values (default) | what it does |
 |---|---|---|
