@@ -269,12 +269,14 @@ _WRITE_SEED_SQL = """
     UPDATE external_product_seeds
        SET seed_data = CAST(:seed_data AS jsonb), price_amount = :price_amount
      WHERE id = :id AND status = 'active' AND seed_data = CAST(:old_seed_data AS jsonb)
+       AND price_amount IS NOT DISTINCT FROM :old_price_amount
     RETURNING id
 """
 _WRITE_SEED_SQL_SQLITE = """
     UPDATE external_product_seeds
        SET seed_data = :seed_data, price_amount = :price_amount
      WHERE id = :id AND status = 'active' AND seed_data = :old_seed_data
+       AND price_amount IS :old_price_amount
     RETURNING id
 """
 
@@ -337,9 +339,14 @@ def plan_seed_write(
     product_level = listed == {variant_id} or bool(sole_live_variant)
     if product_level:
         for holder in (snapshot, document):
-            if holder.get("price_amount") not in (None, "") and _same_price(holder["price_amount"], old_minor, currency):
-                holder["price_amount"] = (str(new_major) if isinstance(holder["price_amount"], str)
-                                          else float(new_major))
+            if holder.get("price_amount") in (None, "") or _same_price(holder["price_amount"], new_minor, currency):
+                continue
+            if not _same_price(holder["price_amount"], old_minor, currency):
+                # The product-level price is the projection's source for the placeholder: moving
+                # the offer but not a holder at some third price would be undone (R2-2).
+                return None, False, "seed_price_unexpected"
+            holder["price_amount"] = (str(new_major) if isinstance(holder["price_amount"], str)
+                                      else float(new_major))
     snapshot["price_writeback"] = {
         "source": SOURCE, "purchase_id": purchase_id, "from_minor": int(old_minor),
         "to_minor": int(new_minor), "currency": currency,
@@ -350,12 +357,16 @@ def plan_seed_write(
 
 
 async def _mirror_offer_targets(row: Mapping[str, Any], product: Mapping[str, Any], seed_data: Any,
-                                variant_id: str) -> Tuple[List[Dict[str, Any]], str, bool]:
-    """The offers `_load_cart_link_item` PRICES this purchase from: `(offers, reason, placeholder)`.
+                                variant_id: str, *, old: int, new: int,
+                                currency: str) -> Tuple[List[Dict[str, Any]], str, bool]:
+    """The offers to write: `(offers, reason, placeholder_written)`.
 
-    The route's rule exactly: the variant's own skus' offers whenever there is one; the `::canonical`
-    placeholder ONLY when there is none and the storefront proof shows one live variant. A
-    placeholder the route does not read is not written (a stale one must not block the write)."""
+    What `_load_cart_link_item` PRICES from: the variant's own skus' offers whenever there is one,
+    the `::canonical` placeholder only when there is none and the storefront proof shows one live
+    variant. Under that sole-variant proof the placeholder IS this variant's product-level price,
+    so beside real-sku offers it is written too when it still says the old (or already the new)
+    price -- else the PDP view keeps showing the old price (review of #2519 round 2, R2-1); a
+    placeholder at some third price is left as it is and never blocks the write (P5)."""
     import routes.agent_commerce_reap as route
     import services.reap_agentic_purchase as svc
 
@@ -381,11 +392,16 @@ async def _mirror_offer_targets(row: Mapping[str, Any], product: Mapping[str, An
         if placeholder and candidate["sku_key"] == placeholder["sku_key"]:
             continue
         offers.extend(await _offers(candidate["sku_key"]))
-    if offers:
+    sole = bool(placeholder) and route._proof_live_variant_count(
+        corroboration._seed_document(seed_data)) == 1
+    if not sole:
         return offers, "planned", False
-    if placeholder and route._proof_live_variant_count(corroboration._seed_document(seed_data)) == 1:
-        return await _offers(placeholder["sku_key"]), "planned", True
-    return [], "planned", False
+    on_placeholder = await _offers(placeholder["sku_key"])
+    if not offers:
+        return on_placeholder, "planned", bool(on_placeholder)
+    beside = [o for o in on_placeholder
+              if _same_price(o.get("price"), old, currency) or _same_price(o.get("price"), new, currency)]
+    return offers + beside, "planned", bool(beside)
 
 
 # ── enrichment ───────────────────────────────────────────────────────────────────────────────
@@ -422,21 +438,29 @@ def _scale(currency: str) -> int:
     return int(1 / minor_to_major(1, currency))
 
 
-async def _write_offers(offers: List[Mapping[str, Any]], *, old: int, new: int, currency: str) -> Tuple[int, str]:
-    """Every target must carry the old (or already the new) price when read, and each UPDATE
-    compares the old price again in SQL; one that lands nowhere raises `_Raced` (roll back)."""
+async def _write_offers(offers: List[Mapping[str, Any]], *, old: int, new: int, currency: str,
+                        any_prior: bool = False) -> Tuple[int, str]:
+    """Each UPDATE compares, IN SQL, the price that offer was READ at; one that lands nowhere raises
+    `_Raced` (roll back). Mirror (`any_prior` False): every target must have been read at the old
+    (or already the new) price. Enrichment (`any_prior` True): every target is on a sku whose OWN
+    fresh proof says the new price, so a prior third price is a stale offer our read corrects
+    (review of #2519 round 2, R2-3)."""
     if not offers:
         return 0, "no_offer"
-    if any(not _same_price(o.get("price"), old, currency) and not _same_price(o.get("price"), new, currency)
-           for o in offers):
+    if not any_prior and any(
+            not _same_price(o.get("price"), old, currency) and not _same_price(o.get("price"), new, currency)
+            for o in offers):
         return 0, "offer_price_unexpected"
     written = 0
     for offer in offers:
         if _same_price(offer.get("price"), new, currency):
             continue
+        read_minor = ledger.amount_minor_or_none(_decimal_text(offer.get("price")), currency)
+        if read_minor is None:
+            return 0, "offer_price_unreadable"
         found = await database.fetch_one(_WRITE_OFFER_SQL, {
             "price": _major(new, currency), "offer_id": offer["offer_id"], "currency": currency,
-            "scale": _scale(currency), "old_minor": int(old)})
+            "scale": _scale(currency), "old_minor": int(read_minor)})
         if found is None:
             raise _Raced("offer")
         written += 1
@@ -517,7 +541,7 @@ async def apply_one(row: Mapping[str, Any], *, mode: str, now: datetime) -> str:
         if earlier_at is not None and (observed is None or earlier_at > observed):
             return "catalog_write_newer"
         offers, reason, placeholder_priced = await _mirror_offer_targets(
-            row, product, seed.get("seed_data"), variant_id)
+            row, product, seed.get("seed_data"), variant_id, old=ours, new=live, currency=currency)
         if reason != "planned":
             return reason
         document, product_level, reason = plan_seed_write(
@@ -526,6 +550,10 @@ async def apply_one(row: Mapping[str, Any], *, mode: str, now: datetime) -> str:
             sole_live_variant=placeholder_priced)
         if document is None:
             return reason
+        column = seed.get("price_amount")
+        if product_level and column is not None and not (
+                _same_price(column, ours, currency) or _same_price(column, live, currency)):
+            return "seed_price_unexpected"  # the column the projection copies (R2-2)
     else:
         offers = await _enrichment_offer_targets(row, proof_skus)
 
@@ -539,7 +567,8 @@ async def apply_one(row: Mapping[str, Any], *, mode: str, now: datetime) -> str:
 
     try:
         async with database.transaction():
-            written, reason = await _write_offers(offers, old=ours, new=live, currency=currency)
+            written, reason = await _write_offers(offers, old=ours, new=live, currency=currency,
+                                                  any_prior=(lane == "enrichment"))
             if reason != "planned":
                 return reason  # refused before its first write: nothing to roll back
             if lane == "mirror":
@@ -549,7 +578,8 @@ async def apply_one(row: Mapping[str, Any], *, mode: str, now: datetime) -> str:
                 found = await database.fetch_one(
                     _WRITE_SEED_SQL if IS_POSTGRES else _WRITE_SEED_SQL_SQLITE, {
                         "id": seed["id"], "seed_data": json.dumps(document),
-                        "old_seed_data": _raw_json(seed.get("seed_data")), "price_amount": seed_price})
+                        "old_seed_data": _raw_json(seed.get("seed_data")), "price_amount": seed_price,
+                        "old_price_amount": seed.get("price_amount")})
                 if found is None:
                     raise _Raced("seed")
     except _Raced as raced:

@@ -113,3 +113,20 @@ async def test_a_sku_whose_own_proof_is_stale_is_not_written(client):
     row = await database.fetch_one(
         "SELECT CAST(merchant_effective_price AS TEXT) AS p FROM catalog_offers WHERE offer_id = 'off_tarte_alt'")
     assert float(row["p"]) == 30.0  # ...and the stale-proof spelling is not
+
+
+async def test_every_sku_our_proof_confirms_takes_the_price_whatever_it_said_before(client):
+    """R2-3: the real sku and the placeholder both carry a fresh proof at 32.00 (so no single sku is
+    named); the placeholder's offer says 31.00. Our own read confirms both: both move."""
+    from reap_enrichment_cart_route_cases import TARTE_PLACEHOLDER
+
+    await refused_at(client, live=3200)
+    await database.execute("UPDATE catalog_offers SET merchant_effective_price = 31.00, "
+                           "estimated_best_price = 31.00, list_price = 31.00 WHERE sku_key = :s",
+                           {"s": TARTE_PLACEHOLDER})
+    await seed_proof(pk=TARTE_PK, sku_key=TARTE_PLACEHOLDER, shop_host=TARTE_HOST, handle=TARTE_HANDLE,
+                     variant_id=TARTE_VARIANT, price_minor=3200)
+    await our_proof_reads(3200)
+    outcome = await writeback.run_writeback_pass()
+    assert outcome == {"written": 1}, outcome
+    assert await listing_prices() == [32.0, 32.0]

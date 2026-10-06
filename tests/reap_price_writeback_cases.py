@@ -236,7 +236,7 @@ async def test_a_write_the_route_does_not_see_is_reported_not_effective(client, 
     write that landed nowhere the route reads (here: the offers write is lost) says so."""
     await refused_at(client, monkeypatch, live=1499)
 
-    async def lost(offers, *, old, new, currency):
+    async def lost(offers, **kwargs):
         return 0, "planned"
 
     monkeypatch.setattr(writeback, "_write_offers", lost)
@@ -532,3 +532,127 @@ def test_a_seed_copy_already_at_the_new_price_is_an_earlier_write_not_a_conflict
         purchase_id="rp_1", observed=None)
     assert reason == "planned"
     assert (plan["variants"][0]["price"], plan["snapshot"]["variants"][0]["price"]) == ("14.99", "14.99")
+
+
+# ── review of #2519 round 2 (follow-up): the LOW findings and the unpinned guards ────────────
+
+
+async def _add_placeholder(price):
+    await database.execute(
+        "INSERT INTO catalog_skus (sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency) "
+        "VALUES (:sku,:pk,:seller,'external_seed','x',:pk,'Default','USD')",
+        {"sku": PLACEHOLDER, "pk": PRODUCT, "seller": SELLER})
+    await database.execute(
+        "INSERT INTO catalog_offers (offer_id,sku_key,product_key,merchant_id,currency,merchant_effective_price,availability) "
+        "VALUES ('ph-offer',:sku,:pk,:seller,'USD',:p,'in_stock')",
+        {"sku": PLACEHOLDER, "pk": PRODUCT, "seller": SELLER, "p": price})
+
+
+async def test_a_placeholder_still_at_the_old_price_moves_with_the_real_sku(client, monkeypatch):
+    """R2-1: real sku and its projected placeholder both at 13.99 (sole-variant proof). Both move,
+    and so does the seed's price, so the projection keeps the placeholder at the new price."""
+    await refused_at(client, monkeypatch, live=1499)
+    await _add_placeholder("13.99")
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await offer_prices() == ["14.99", "14.99"]
+    assert (await seed_state())[0] == 14.99
+
+
+async def test_a_sole_variant_write_refuses_a_seed_price_column_at_a_third_price(client, monkeypatch):
+    """R2-2: the column the projection copies onto the placeholder is at 12.00; moving the offer
+    alone would be undone, so nothing is written."""
+    await refused_at(client, monkeypatch, live=1499)
+    await _to_placeholder_only()
+    await database.execute("UPDATE external_product_seeds SET price_amount = 12.00 WHERE id = :id", {"id": SEED})
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    before = await unchanged_state()
+    assert await writeback.run_writeback_pass() == {"seed_price_unexpected": 1}
+    assert await unchanged_state() == before
+
+
+async def test_a_seed_price_column_moved_between_read_and_write_wins(client, monkeypatch):
+    """INFO: the column has its own compare-and-set (an employee edit keeping seed_data equal)."""
+    await refused_at(client, monkeypatch, live=1499)
+    real = writeback._mirror_offer_targets
+
+    async def racing(*args, **kwargs):
+        found = await real(*args, **kwargs)
+        await database.execute("UPDATE external_product_seeds SET price_amount = 15.49 WHERE id = :id", {"id": SEED})
+        return found
+
+    monkeypatch.setattr(writeback, "_mirror_offer_targets", racing)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"raced": 1}
+    assert (await seed_state())[0] == 15.49
+    assert await offer_prices() == ["13.99"]
+
+
+async def test_the_seed_keeps_its_updated_at_and_moves_its_top_level_price(client, monkeypatch):
+    """Round 1 F6: no updated_at bump (the gateway picks a market's seed by it); the top-level
+    seed_data.price_amount moves with the product-level price."""
+    await refused_at(client, monkeypatch, live=1499)
+    stamp = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    await database.execute("UPDATE external_product_seeds SET updated_at = :t WHERE id = :id",
+                           {"t": _ts(stamp), "id": SEED})
+    await _edit_seed(lambda d: d.update(price_amount="13.99"))
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    row = await database.fetch_one("SELECT updated_at FROM external_product_seeds WHERE id = :id", {"id": SEED})
+    import services.reap_price_corroboration as corroboration
+    assert corroboration._aware(row["updated_at"]) == stamp
+    assert (await seed_state())[2]["price_amount"] == "14.99"
+
+
+async def test_the_after_check_requires_the_purchases_own_variant(client, monkeypatch):
+    """After the write the route must price THIS variant at the live price, not just any variant."""
+    await refused_at(client, monkeypatch, live=1499)
+    real = writeback._priced_now
+    calls = []
+
+    async def other_after(lane, row, *, sku_key):
+        calls.append(1)
+        found = await real(lane, row, sku_key=sku_key)
+        return found if len(calls) == 1 else (found[0], found[1], OTHER_VARIANT)
+
+    monkeypatch.setattr(writeback, "_priced_now", other_after)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written_not_effective": 1}
+
+
+def test_a_rebinds_quote_time_is_its_corroboration_stamp_not_its_later_transitions():
+    quote = datetime(2026, 10, 6, 1, 0, tzinfo=timezone.utc)
+    row = {"live_price_stage": "approval", "price_rebound_to_minor": 1299,
+           "price_corroborated_at": quote, "terminal_at": quote + timedelta(hours=2)}
+    assert writeback.observed_at(row) == quote
+    refused = {"live_price_stage": "approval", "terminal_at": quote}
+    assert writeback.observed_at(refused) == quote
+    preflight = {"live_price_stage": "preflight", "preflight_checked_at": quote, "terminal_at": quote + timedelta(hours=1)}
+    assert writeback.observed_at(preflight) == quote
+
+
+async def test_a_quote_dated_in_the_future_is_not_an_observation(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499, age=-timedelta(hours=1))
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "shadow")
+    assert await writeback.run_writeback_pass() == {}
+
+
+async def test_a_write_from_the_same_quote_instant_is_not_newer(client, monkeypatch):
+    """`catalog_write_newer` is strict: a provenance stamped at exactly this quote's time (a replay
+    of the same observation) does not block it."""
+    _body, purchase_id = await refused_at(client, monkeypatch, live=1499)
+    row = await database.fetch_one("SELECT terminal_at FROM reap_agentic_purchases WHERE id = :id", {"id": purchase_id})
+    import services.reap_price_corroboration as corroboration
+    same = corroboration._aware(row["terminal_at"])
+    await _edit_seed(lambda d: d["snapshot"].update(price_writeback={"observed_at": same.isoformat()}))
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+
+
+def test_a_product_level_price_copy_at_a_third_price_refuses_the_plan():
+    """R2-2 inside the document: the seed lists only this variant, but its snapshot price says 12.00."""
+    seed = {"snapshot": {"price_amount": 12.0, "variants": [{"variant_id": "111", "price": "13.99"}]}}
+    plan, _pl, reason = writeback.plan_seed_write(
+        seed, variant_id="111", old_minor=1399, new_minor=1499, currency="USD",
+        purchase_id="rp_1", observed=None)
+    assert (plan, reason) == (None, "seed_price_unexpected")
