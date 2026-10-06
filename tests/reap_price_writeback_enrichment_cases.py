@@ -80,3 +80,36 @@ async def test_the_proof_is_never_written(client):
     before = [dict(r) for r in await database.fetch_all(f"SELECT * FROM {proofs.TABLE}")]
     await writeback.run_writeback_pass()
     assert [dict(r) for r in await database.fetch_all(f"SELECT * FROM {proofs.TABLE}")] == before
+
+
+from reap_enrichment_cart_route_cases import (  # noqa: E402
+    TARTE_HANDLE, TARTE_OFFER_MERCHANT, TARTE_URL, TARTE_VARIANT, seed_offer, seed_proof, seed_sku,
+)
+
+
+async def test_an_offer_that_is_not_the_listings_own_is_never_written(client):
+    await refused_at(client, live=3200)
+    await seed_offer(oid="off_tarte_elsewhere", pk=TARTE_PK, sku_key=TARTE_SKU, merchant=TARTE_OFFER_MERCHANT,
+                     price="30.00", source_ref=f"https://{TARTE_HOST}/products/another-handle")
+    await our_proof_reads(3200)
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    row = await database.fetch_one(
+        "SELECT CAST(merchant_effective_price AS TEXT) AS p FROM catalog_offers WHERE offer_id = 'off_tarte_elsewhere'")
+    assert float(row["p"]) == 30.0
+
+
+async def test_a_sku_whose_own_proof_is_stale_is_not_written(client):
+    """Review F5: only skus whose OWN proof row corroborates take the price."""
+    await refused_at(client, live=3200)
+    alt = f"{TARTE_PK}::sku_alt_spelling"
+    await seed_sku(pk=TARTE_PK, sku_key=alt, merchant=TARTE_OFFER_MERCHANT, svid=TARTE_VARIANT, title="Default Title")
+    await seed_offer(oid="off_tarte_alt", pk=TARTE_PK, sku_key=alt, merchant=TARTE_OFFER_MERCHANT,
+                     price="30.00", source_ref=TARTE_URL)
+    await seed_proof(pk=TARTE_PK, sku_key=alt, shop_host=TARTE_HOST, handle=TARTE_HANDLE,
+                     variant_id=TARTE_VARIANT, price_minor=3200, age=timedelta(hours=200))
+    await our_proof_reads(3200)
+    outcome = await writeback.run_writeback_pass()
+    assert outcome == {"written": 1}, outcome  # the corroborating sku is written...
+    row = await database.fetch_one(
+        "SELECT CAST(merchant_effective_price AS TEXT) AS p FROM catalog_offers WHERE offer_id = 'off_tarte_alt'")
+    assert float(row["p"]) == 30.0  # ...and the stale-proof spelling is not

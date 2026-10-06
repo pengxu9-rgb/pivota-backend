@@ -37,6 +37,9 @@ async def _production_seed_columns():
     for column, kind in (("price_amount", "DOUBLE PRECISION"), ("last_crawled_at", stamp),
                          ("updated_at", stamp)):
         await database.execute(f"ALTER TABLE external_product_seeds ADD COLUMN {column} {kind}")
+    if IS_POSTGRES:  # production's type (migration 044); the write-back compares the document
+        await database.execute(
+            "ALTER TABLE external_product_seeds ALTER COLUMN seed_data TYPE JSONB USING seed_data::jsonb")
     await database.execute("UPDATE external_product_seeds SET price_amount = 13.99 WHERE id = :id",
                            {"id": SEED})
 
@@ -239,3 +242,242 @@ async def test_a_write_the_route_does_not_see_is_reported_not_effective(client, 
     monkeypatch.setattr(writeback, "_write_offers", lost)
     monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
     assert await writeback.run_writeback_pass() == {"written_not_effective": 1}
+
+
+# ── review of #2519: the production row shape, races, quote order, filters ───────────────────
+
+from reap_selection_prepare_cases import SELLER, SKU, VARIANT  # noqa: E402
+
+PLACEHOLDER = PRODUCT + "::canonical"
+OTHER_VARIANT = "49819267309999"
+
+
+async def _to_placeholder_only():
+    """Production's dominant mirror shape (6,395 of 7,858): the offer on the `::canonical`
+    placeholder, none on the real sku."""
+    await database.execute("DELETE FROM catalog_offers WHERE product_key = :pk", {"pk": PRODUCT})
+    await database.execute(
+        "INSERT INTO catalog_skus (sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency) "
+        "VALUES (:sku,:pk,:seller,'external_seed','x',:pk,'Default','USD')",
+        {"sku": PLACEHOLDER, "pk": PRODUCT, "seller": SELLER})
+    await database.execute(
+        "INSERT INTO catalog_offers (offer_id,sku_key,product_key,merchant_id,currency,merchant_effective_price,availability) "
+        "VALUES ('ph-offer',:sku,:pk,:seller,'USD','13.99','in_stock')",
+        {"sku": PLACEHOLDER, "pk": PRODUCT, "seller": SELLER})
+
+
+async def _edit_seed(change):
+    row = await database.fetch_one("SELECT seed_data FROM external_product_seeds WHERE id = :id", {"id": SEED})
+    data = row["seed_data"] if isinstance(row["seed_data"], dict) else json.loads(row["seed_data"])
+    change(data)
+    await database.execute("UPDATE external_product_seeds SET seed_data = :d WHERE id = :id",
+                           {"d": json.dumps(data), "id": SEED})
+
+
+async def test_a_placeholder_priced_row_takes_the_increase(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499)
+    await _to_placeholder_only()
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await offer_prices() == ["14.99"]
+
+
+async def test_a_placeholder_that_now_stands_for_another_variant_is_not_written(client, monkeypatch):
+    """Review F1: the proof now names another shade as the sole live variant, so the placeholder
+    prices THAT shade. This purchase's quote must not be written onto it."""
+    await refused_at(client, monkeypatch, live=1499)
+    await _to_placeholder_only()
+    await database.execute("DELETE FROM catalog_skus WHERE sku_key = :s", {"s": SKU})
+
+    def other_shade(d):
+        d["snapshot"]["variants"].append({"title": "New shade", "price": "13.99", "shopify_variant_id": OTHER_VARIANT})
+        d["snapshot"]["shopify_cart_proof"]["variant_id"] = OTHER_VARIANT
+    await _edit_seed(other_shade)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    outcome = await writeback.run_writeback_pass()
+    assert set(outcome) <= {"route_refuses", "route_prices_another_variant"}, outcome
+    assert await offer_prices() == ["13.99"]
+
+
+async def test_an_offer_moved_between_read_and_write_is_not_overwritten(client, monkeypatch):
+    """Review F3: the compare-and-set is in SQL; the whole write rolls back."""
+    await refused_at(client, monkeypatch, live=1499)
+    real = writeback._mirror_offer_targets
+
+    async def racing(*args, **kwargs):
+        found = await real(*args, **kwargs)
+        await database.execute("UPDATE catalog_offers SET merchant_effective_price = 15.99")
+        return found
+
+    monkeypatch.setattr(writeback, "_mirror_offer_targets", racing)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"raced": 1}
+    assert await offer_prices() == ["15.99"]
+    assert (await seed_state())[1] == ["13.99"]  # the seed write rolled back with it
+
+
+async def test_a_crawl_between_read_and_write_wins(client, monkeypatch):
+    """Review F3: the seed write is a compare-and-set on the document as read."""
+    await refused_at(client, monkeypatch, live=1499)
+    real = writeback._mirror_offer_targets
+
+    async def racing(*args, **kwargs):
+        found = await real(*args, **kwargs)
+        await _edit_seed(lambda d: d["snapshot"].update(title="CRAWLED"))
+        return found
+
+    monkeypatch.setattr(writeback, "_mirror_offer_targets", racing)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"raced": 1}
+    _amount, _variants, data = await seed_state()
+    assert data["snapshot"]["title"] == "CRAWLED"
+    assert await offer_prices() == ["13.99"]  # the offers rolled back with it
+
+
+async def _corroborated(monkeypatch, price):
+    async def our_read(row, *, now, max_age):
+        import services.reap_price_corroboration as corroboration
+
+        return corroboration.Corroboration(price, corroboration.MIRROR_SOURCE, now)
+
+    monkeypatch.setattr(writeback.corroboration, "independent_unit_price", our_read)
+
+
+async def test_the_newest_quote_wins_not_the_newest_row(client, monkeypatch):
+    """Review F2: R's quote is 60 min old but its row moved 1 min ago (it completed); F's quote is
+    10 min old. F (14.99) is applied; R (an older 12.99) must never be written back over it."""
+    body, f_id = await refused_at(client, monkeypatch, live=1499, key="order-F")
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    later = await client.post(BASE, json={**body, "idempotency_key": "order-R", "expected_unit_price_minor": 1499})
+    assert later.status_code == 202, later.text
+    now = datetime.now(timezone.utc)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET state = 'completed', live_unit_price_minor = 1299, "
+        "live_price_stage = 'preflight', preflight_checked_at = :q, price_rebound_from_minor = 1499, "
+        "price_rebound_to_minor = 1299, terminal_at = :u, state_entered_at = :u, updated_at = :u WHERE id = :id",
+        {"q": _ts(now - timedelta(minutes=60)), "u": _ts(now - timedelta(minutes=1)),
+         "id": later.json()["purchase_id"]})
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET our_price_minor = 1299, terminal_at = :t, updated_at = :t WHERE id = :id",
+        {"t": _ts(now - timedelta(minutes=10)), "id": f_id})
+    await _corroborated(monkeypatch, 1299)
+    await writeback.run_writeback_pass()
+    assert await offer_prices() == ["14.99"]
+
+
+async def test_a_corroborated_rebind_that_continued_is_written(client, monkeypatch):
+    """A purchase that continued on a corroborated lower price (not refused) is an observation."""
+    body, purchase_id = await refused_at(client, monkeypatch, live=1299)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET state = 'completed', refusal_reason = NULL, "
+        "price_rebound_from_minor = 1399, price_rebound_to_minor = 1299, price_corroborated_at = terminal_at "
+        "WHERE id = :id", {"id": purchase_id})
+    await _corroborated(monkeypatch, 1299)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await offer_prices() == ["12.99"]
+
+
+@pytest.mark.parametrize("hours,read", [(71, True), (73, False)])
+async def test_the_window_is_seventy_two_hours_of_quote_time(client, monkeypatch, hours, read):
+    await refused_at(client, monkeypatch, live=1499, age=timedelta(hours=hours))
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "shadow")
+    assert await writeback.run_writeback_pass() == ({"would_write": 1} if read else {})
+
+
+@pytest.mark.parametrize("other", ["currency", "seller"])
+async def test_another_currency_or_sellers_offer_on_the_sku_is_never_written(client, monkeypatch, other):
+    await refused_at(client, monkeypatch, live=1499)
+    await database.execute(
+        "INSERT INTO catalog_offers (offer_id,sku_key,product_key,merchant_id,currency,merchant_effective_price,availability) "
+        "VALUES ('other-offer',:sku,:pk,:seller,:cur,'13.99','in_stock')",
+        {"sku": SKU, "pk": PRODUCT, "seller": "merch_obs_another" if other == "seller" else SELLER,
+         "cur": "EUR" if other == "currency" else "USD"})
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    other_price = await database.fetch_one(
+        "SELECT CAST(merchant_effective_price AS TEXT) AS p FROM catalog_offers WHERE offer_id = 'other-offer'")
+    assert float(other_price["p"]) == 13.99
+
+
+async def test_the_seed_price_moves_only_when_it_lists_only_this_variant(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499)
+    # The top-level list (the gateway reads it after `snapshot.variants`); the route's sole-variant
+    # proof reads the snapshot, so the row stays buyable.
+    await _edit_seed(lambda d: d.update(variants=[
+        {"title": "Selected shade", "price": "13.99", "shopify_variant_id": VARIANT},
+        {"title": "Another shade", "price": "20.00", "shopify_variant_id": OTHER_VARIANT}]))
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    outcome = await writeback.run_writeback_pass()
+    assert outcome == {"written": 1}, outcome
+    price_amount, variant_prices, data = await seed_state()
+    assert (price_amount, variant_prices) == (13.99, ["14.99"])
+    assert [v["price"] for v in data["variants"]] == ["14.99", "20.00"]
+
+
+async def test_an_older_quote_never_overwrites_a_newer_quotes_write(client, monkeypatch):
+    """Across passes: F (10 min old, 14.99) was written; only R (60 min old, corroborated 12.99)
+    is still an observation. The seed's own record of F's quote stops R."""
+    body, f_id = await refused_at(client, monkeypatch, live=1499, key="across-F")
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    await database.execute("UPDATE reap_agentic_purchases SET live_unit_price_minor = NULL WHERE id = :id",
+                           {"id": f_id})
+    later = await client.post(BASE, json={**body, "idempotency_key": "across-R", "expected_unit_price_minor": 1499})
+    assert later.status_code == 202, later.text
+    now = datetime.now(timezone.utc)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET state = 'refused', refusal_reason = 'price_changed', "
+        "live_unit_price_minor = 1299, live_price_stage = 'preflight', preflight_checked_at = :q, "
+        "terminal_at = :u, updated_at = :u WHERE id = :id",
+        {"q": _ts(now - timedelta(minutes=60)), "u": _ts(now), "id": later.json()["purchase_id"]})
+    await _corroborated(monkeypatch, 1299)
+    outcome = await writeback.run_writeback_pass()
+    assert outcome == {"catalog_write_newer": 1}, outcome
+    assert await offer_prices() == ["14.99"]
+
+
+async def test_a_recently_touched_row_with_an_old_quote_is_outside_the_window(client, monkeypatch):
+    """The window is quote time: a row whose quote is 73 h old but which moved a minute ago."""
+    _body, purchase_id = await refused_at(client, monkeypatch, live=1499, age=timedelta(hours=73))
+    await database.execute("UPDATE reap_agentic_purchases SET updated_at = :t WHERE id = :id",
+                           {"t": _ts(datetime.now(timezone.utc)), "id": purchase_id})
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "shadow")
+    assert await writeback.run_writeback_pass() == {}
+
+
+async def test_of_two_pending_quotes_the_newer_is_applied(client, monkeypatch):
+    """Neither applied yet: F (quote 10 min ago, increase to 14.99, row last moved 10 min ago) and R
+    (quote 60 min ago, corroborated 12.99, row moved 1 min ago). The newest QUOTE is F."""
+    body, f_id = await refused_at(client, monkeypatch, live=1499, key="pending-F", age=timedelta(minutes=10))
+    later = await client.post(BASE, json={**body, "idempotency_key": "pending-R"})
+    assert later.status_code == 202, later.text
+    now = datetime.now(timezone.utc)
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET state = 'refused', refusal_reason = 'price_changed', "
+        "live_unit_price_minor = 1299, live_price_stage = 'preflight', preflight_checked_at = :q, "
+        "terminal_at = :u, updated_at = :u WHERE id = :id",
+        {"q": _ts(now - timedelta(minutes=60)), "u": _ts(now - timedelta(minutes=1)),
+         "id": later.json()["purchase_id"]})
+    await _corroborated(monkeypatch, 1299)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await offer_prices() == ["14.99"]
+
+
+async def test_a_real_sku_that_now_names_another_variant_is_not_written(client, monkeypatch):
+    """Review F1: the route now prices ANOTHER variant (the catalog's sku and the proof both name
+    it). The first refusal is the route's own answer, not a downstream guard."""
+    await refused_at(client, monkeypatch, live=1499)
+    await database.execute("UPDATE catalog_skus SET source_variant_id = :v WHERE sku_key = :s",
+                           {"v": "ext_0f95730ee5ba05a6b7957ada:" + OTHER_VARIANT, "s": SKU})
+
+    def other_shade(d):
+        d["snapshot"]["variants"] = [{"title": "New shade", "price": "13.99", "shopify_variant_id": OTHER_VARIANT}]
+        d["snapshot"]["shopify_cart_proof"]["variant_id"] = OTHER_VARIANT
+    await _edit_seed(other_shade)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    outcome = await writeback.run_writeback_pass()
+    assert outcome == {"route_prices_another_variant": 1}, outcome
+    assert await offer_prices() == ["13.99"]

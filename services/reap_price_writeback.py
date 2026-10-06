@@ -32,11 +32,18 @@ WHAT IS WRITTEN, per lane -- exactly where the two price readers look:
     the gateway's `get_product` and create check read.
   * ENRICHMENT: the listing's own offers on the proof's sku spellings (the route's selection).
 
-Every write is a compare-and-set on the OLD price (`our_price_minor`): a row that moved since the
-purchase read it is a newer fact than this observation and is left alone. A seed our crawler
-re-read after the quote is also left alone (`catalog_read_newer`). The result is then checked AT
-THE SINK: the route's own loader must now price the purchase at the live price, else the outcome
-is `written_not_effective` and says so.
+GUARDS (review of #2519):
+  * THE ROUTE MUST BE PRICING THIS VARIANT, before and after: the route's own loader is run and
+    its variant must be the purchase's (a placeholder whose proof now names another shade is not
+    this observation's row). Mirror rows it refuses are left alone; enrichment rows may only be
+    refused as `row_price_stale` (offers behind our proof -- the case this heals).
+  * NEWEST QUOTE WINS, by quote time (`observed_at`), never `updated_at`; a seed that already holds
+    a write from a newer quote (`snapshot.price_writeback.observed_at`) or a crawl after the quote
+    (`last_crawled_at`) is left alone.
+  * COMPARE-AND-SET IN SQL: offers on the old price in integer minor units, the seed on the
+    document as read; any row that moved rolls the whole write back (`raced`).
+  * CHECKED AT THE SINK: after the write the route must price the purchase at the live price, else
+    `written_not_effective`.
 
 DIAL `REAP_AGENTIC_PRICE_WRITEBACK` = off (default) | shadow (decide and log, write nothing) | on.
 Run from the poll job (jobs/reap_agentic_purchase_poll.py) after its own work, bounded.
@@ -66,8 +73,11 @@ REAP_AGENTIC_PRICE_WRITEBACK_ENV = "REAP_AGENTIC_PRICE_WRITEBACK"
 WRITEBACK_MODES = ("off", "shadow", "on")
 #: How far back an observation is still worth acting on. After this the nightly refresh owns it.
 WINDOW = timedelta(hours=72)
-#: Purchases read per pass, newest first. One product is acted on once per pass.
+#: Observations acted on per pass, newest QUOTE first; one per (product, variant).
 BATCH_LIMIT = 20
+#: Rows read to find them. `updated_at` (the SQL bound) moves on every claim and transition, so the
+#: newest quote is chosen in Python from a wider read, never from SQL order.
+SCAN_LIMIT = 200
 MIRROR_SOURCE_SYSTEM = "external_product_seeds_mirror_v1"
 #: Where each write came from, recorded on the seed for review and for the next reader.
 SOURCE = "reap_quote"
@@ -81,12 +91,14 @@ def writeback_mode() -> str:
 # ── the observations ─────────────────────────────────────────────────────────────────────────
 
 #: Cart-link purchases whose quote named a live price we did not have: refused `price_changed`
-#: (the buyer must re-confirm), or continued on a corroborated lower price (a rebind). Newest
-#: first; `updated_at` bounds the scan (a terminal row stops moving at its last transition).
+#: (the buyer must re-confirm), or continued on a corroborated lower price (a rebind).
+#: `updated_at >= since` is only a COARSE bound: it is never earlier than the quote, so it drops
+#: nothing inside the window; the window and the order are applied to the quote time in Python.
 _OBSERVATIONS_SQL = """
     SELECT id, product_key, variant_key, cart_url, item_source, merchant_domain, market_country,
            currency, quantity, our_price_minor, live_unit_price_minor, live_price_stage,
-           price_rebound_to_minor, preflight_checked_at, terminal_at, state_entered_at, updated_at
+           price_rebound_to_minor, price_corroborated_at, preflight_checked_at, terminal_at,
+           state_entered_at, updated_at
       FROM reap_agentic_purchases
      WHERE item_source = 'cart_link'
        AND live_unit_price_minor IS NOT NULL AND live_price_stage IS NOT NULL
@@ -99,28 +111,42 @@ _OBSERVATIONS_SQL = """
 
 
 def observed_at(row: Mapping[str, Any]) -> Optional[datetime]:
-    """When the quote that named this price was taken: the preflight's own stamp, else the
-    transition the approval quote caused."""
-    stage = row.get("live_price_stage")
-    value = row.get("preflight_checked_at") if stage == "preflight" else (
-        row.get("terminal_at") or row.get("state_entered_at"))
+    """When the quote that named this price was TAKEN (never `updated_at`, which every claim moves):
+      * preflight stage -- the witness's own stamp, `preflight_checked_at`;
+      * approval stage, a corroborated rebind that continued -- `price_corroborated_at`, written in
+        the same step as the quote (the row's later transitions are not the quote);
+      * approval stage, refused -- `terminal_at`, the transition that quote caused."""
+    if row.get("live_price_stage") == "preflight":
+        value = row.get("preflight_checked_at")
+    elif row.get("price_rebound_to_minor") is not None:
+        value = row.get("price_corroborated_at")
+    else:
+        value = row.get("terminal_at")
     return corroboration._aware(value)
 
 
 async def observations(*, now: datetime, limit: int = BATCH_LIMIT) -> List[Dict[str, Any]]:
-    """The newest observation per (product, variant) inside the window."""
+    """The newest QUOTE per (product, variant) taken inside the window, newest first."""
+    since = now - WINDOW
     rows = await database.fetch_all(
-        _OBSERVATIONS_SQL, {"since": ledger._bind_dt(now - WINDOW), "limit": int(limit)}
+        _OBSERVATIONS_SQL, {"since": ledger._bind_dt(since), "limit": SCAN_LIMIT}
     )
-    seen, newest = set(), []
+    dated = []
     for row in rows:
         row = dict(row)
+        observed = observed_at(row)
+        if observed is None or observed < since or observed > now:
+            continue
+        dated.append((observed, str(row["id"]), row))
+    dated.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    seen, newest = set(), []
+    for _observed, _id, row in dated:
         key = (row.get("product_key"), corroboration.purchase_variant_id(row))
         if key in seen:
             continue
         seen.add(key)
         newest.append(row)
-    return newest
+    return newest[:limit]
 
 
 # ── the decision ─────────────────────────────────────────────────────────────────────────────
@@ -162,10 +188,13 @@ async def _lane(product_key: str) -> Tuple[Optional[str], Optional[Dict[str, Any
     return None, product
 
 
-async def _priced_now(lane: str, row: Mapping[str, Any], *, sku_key: Optional[str]) -> Tuple[Optional[int], str]:
-    """What the PURCHASE ROUTE would price this purchase at now: `(minor, reason)`.
+async def _priced_now(
+    lane: str, row: Mapping[str, Any], *, sku_key: Optional[str]
+) -> Tuple[Optional[int], str, Optional[str]]:
+    """What the PURCHASE ROUTE would price this purchase at now: `(minor, reason, variant_id)`.
 
-    The route's own loader, read-only. `reason` is its refusal code when it refuses."""
+    The route's own loader, read-only. `reason` is its refusal code when it refuses; `variant_id`
+    is the Shopify variant the route would buy -- a write is only for THIS purchase's variant."""
     import routes.agent_commerce_reap as route
     import services.reap_agentic_purchase as svc
 
@@ -176,19 +205,19 @@ async def _priced_now(lane: str, row: Mapping[str, Any], *, sku_key: Optional[st
                 {"product_key": row["product_key"], "source_system": route.ENRICHMENT_SOURCE_SYSTEM},
             )
             if product is None:
-                return None, "row_not_found"
-            facts, *_ = await route._load_enrichment_cart_link_item(
+                return None, "row_not_found", None
+            facts, _seller, variant, _kind = await route._load_enrichment_cart_link_item(
                 product=dict(product), merchant_host=str(row["merchant_domain"]),
                 variant_key=sku_key, market_country=str(row["market_country"]),
             )
         else:
-            facts, *_ = await route._load_cart_link_item(
+            facts, _seller, variant, _kind = await route._load_cart_link_item(
                 merchant_domain=str(row["merchant_domain"]), product_key=str(row["product_key"]),
                 variant_key=None, market_country=str(row["market_country"]),
             )
     except svc.PurchaseRefused as refused:
-        return None, str(refused.reason)
-    return int(facts["our_price_minor"]), "priced"
+        return None, str(refused.reason), None
+    return int(facts["our_price_minor"]), "priced", (str(variant) if variant else None)
 
 
 # ── mirror ───────────────────────────────────────────────────────────────────────────────────
@@ -218,6 +247,8 @@ _MIRROR_OFFERS_SQL = """
      LIMIT 20
 """
 
+#: COMPARE-AND-SET IN SQL: the row must still carry the old price, compared in integer minor units
+#: (`:scale` = 10^exponent of the currency), never a float equality. No RETURNING row = it moved.
 _WRITE_OFFER_SQL = """
     UPDATE catalog_offers
        SET list_price = :price, merchant_effective_price = :price, estimated_best_price = :price,
@@ -225,15 +256,31 @@ _WRITE_OFFER_SQL = """
      WHERE offer_id = :offer_id
        AND upper(trim(coalesce(currency, ''))) = :currency
        AND suppression_reason IS NULL AND suppressed_at IS NULL
+       AND ROUND(coalesce(merchant_effective_price, estimated_best_price, list_price) * :scale) = :old_minor
     RETURNING offer_id
 """
 
+#: COMPARE-AND-SET on the whole document as read: a crawl (or any writer) that changed `seed_data`
+#: since the read wins, and this write lands nowhere. `updated_at` is deliberately NOT bumped: the
+#: gateway serves the seed of one `external_product_id` by `updated_at DESC` across markets, so a
+#: bump here could change WHICH market's seed it serves. The provenance is in
+#: `snapshot.price_writeback` instead.
 _WRITE_SEED_SQL = """
     UPDATE external_product_seeds
-       SET seed_data = :seed_data, price_amount = :price_amount, updated_at = CURRENT_TIMESTAMP
-     WHERE id = :id AND status = 'active'
+       SET seed_data = CAST(:seed_data AS jsonb), price_amount = :price_amount
+     WHERE id = :id AND status = 'active' AND seed_data = CAST(:old_seed_data AS jsonb)
     RETURNING id
 """
+_WRITE_SEED_SQL_SQLITE = """
+    UPDATE external_product_seeds
+       SET seed_data = :seed_data, price_amount = :price_amount
+     WHERE id = :id AND status = 'active' AND seed_data = :old_seed_data
+    RETURNING id
+"""
+
+
+class _Raced(Exception):
+    """A row moved between the read and the write: roll the whole write back."""
 
 _VARIANT_ID_KEYS = ("shopify_variant_id", "variant_id", "id")
 _VARIANT_PRICE_KEYS = ("price", "price_amount")
@@ -281,10 +328,11 @@ def plan_seed_write(
         return None, False, "variant_not_on_seed"
     listed = {(_variant_id_of(v) if isinstance(v, dict) else None) for vs in lists for v in vs}
     product_level = listed == {variant_id}
-    if product_level and "price_amount" in snapshot and snapshot["price_amount"] not in (None, ""):
-        if _same_price(snapshot["price_amount"], old_minor, currency):
-            snapshot["price_amount"] = (str(new_major) if isinstance(snapshot["price_amount"], str)
-                                        else float(new_major))
+    if product_level:
+        for holder in (snapshot, document):
+            if holder.get("price_amount") not in (None, "") and _same_price(holder["price_amount"], old_minor, currency):
+                holder["price_amount"] = (str(new_major) if isinstance(holder["price_amount"], str)
+                                          else float(new_major))
     snapshot["price_writeback"] = {
         "source": SOURCE, "purchase_id": purchase_id, "from_minor": int(old_minor),
         "to_minor": int(new_minor), "currency": currency,
@@ -353,8 +401,13 @@ async def _enrichment_offer_targets(row: Mapping[str, Any], sku_keys: Iterable[s
 # ── one observation ──────────────────────────────────────────────────────────────────────────
 
 
+def _scale(currency: str) -> int:
+    return int(1 / minor_to_major(1, currency))
+
+
 async def _write_offers(offers: List[Mapping[str, Any]], *, old: int, new: int, currency: str) -> Tuple[int, str]:
-    """Compare-and-set: every target must still carry the old price, or nothing is written."""
+    """Every target must carry the old (or already the new) price when read, and each UPDATE
+    compares the old price again in SQL; one that lands nowhere raises `_Raced` (roll back)."""
     if not offers:
         return 0, "no_offer"
     if any(not _same_price(o.get("price"), old, currency) and not _same_price(o.get("price"), new, currency)
@@ -365,9 +418,21 @@ async def _write_offers(offers: List[Mapping[str, Any]], *, old: int, new: int, 
         if _same_price(offer.get("price"), new, currency):
             continue
         found = await database.fetch_one(_WRITE_OFFER_SQL, {
-            "price": _major(new, currency), "offer_id": offer["offer_id"], "currency": currency})
-        written += found is not None
+            "price": _major(new, currency), "offer_id": offer["offer_id"], "currency": currency,
+            "scale": _scale(currency), "old_minor": int(old)})
+        if found is None:
+            raise _Raced("offer")
+        written += 1
     return written, "planned"
+
+
+def _raw_json(value: Any) -> str:
+    """The document exactly as read, for the compare-and-set (`databases` returns jsonb as text)."""
+    return value if isinstance(value, str) else json.dumps(value)
+
+
+#: Purchases this process already logged a shadow decision for (one WARNING each, not one a tick).
+_SHADOW_LOGGED: set = set()
 
 
 async def apply_one(row: Mapping[str, Any], *, mode: str, now: datetime) -> str:
@@ -396,15 +461,28 @@ async def apply_one(row: Mapping[str, Any], *, mode: str, now: datetime) -> str:
         )
         if agrees != live:
             return "proof_disagrees"
-        proof_skus = [str(p["sku_key"]) for p in proofs if p.get("sku_key")]
+        # Only the skus whose OWN proof row corroborates (fresh, ok, same host and variant).
+        proof_skus = sorted({
+            str(p["sku_key"]) for p in proofs if p.get("sku_key") and corroboration.enrichment_unit_price(
+                [p], variant_id=variant_id, shop_host=str(row["merchant_domain"]).lower(),
+                currency=currency, now=now, max_age=max_age) == live})
     elif live < ours:
         found = await corroboration.independent_unit_price(row, now=now, max_age=max_age)
         if found is None or found.unit_price_minor != live:
             return "decrease_unconfirmed"
 
-    priced, _reason = await _priced_now(lane, row, sku_key=(proof_skus[0] if len(set(proof_skus)) == 1 else None))
+    named_sku = proof_skus[0] if len(proof_skus) == 1 else None
+    # THE ROUTE MUST BE PRICING THIS PURCHASE'S VARIANT. A mirror row the route refuses, or prices
+    # for another variant (a placeholder whose proof now names a different shade), is not this
+    # observation's row. Enrichment may be refused only as `row_price_stale` -- offers behind our
+    # own proof, exactly what this heals; its identity was proven before the price was compared.
+    priced, reason, routed = await _priced_now(lane, row, sku_key=named_sku)
+    if priced is not None and routed != variant_id:
+        return "route_prices_another_variant"
     if priced == live:
         return "already_current"
+    if priced is None and not (lane == "enrichment" and reason == "row_price_stale"):
+        return "route_refuses"
 
     if lane == "mirror":
         seed = await database.fetch_one(_MIRROR_SEED_SQL, {
@@ -416,6 +494,11 @@ async def apply_one(row: Mapping[str, Any], *, mode: str, now: datetime) -> str:
         crawled = corroboration._aware(seed.get("last_crawled_at"))
         if crawled is not None and (observed is None or crawled > observed):
             return "catalog_read_newer"
+        document = corroboration._seed_document(seed.get("seed_data")) or {}
+        earlier = (document.get("snapshot") or {}).get("price_writeback") if isinstance(document.get("snapshot"), dict) else None
+        earlier_at = corroboration._aware((earlier or {}).get("observed_at")) if isinstance(earlier, dict) else None
+        if earlier_at is not None and (observed is None or earlier_at > observed):
+            return "catalog_write_newer"
         document, product_level, reason = plan_seed_write(
             seed.get("seed_data"), variant_id=variant_id, old_minor=ours, new_minor=live,
             currency=currency, purchase_id=str(row["id"]), observed=observed)
@@ -428,30 +511,39 @@ async def apply_one(row: Mapping[str, Any], *, mode: str, now: datetime) -> str:
         offers = await _enrichment_offer_targets(row, proof_skus)
 
     if mode != "on":
-        logger.warning(
-            "reap_price_writeback: WOULD write purchase=%s product=%s %s %s -> %s offers=%d",
-            row["id"], row["product_key"], lane, ours, live, len(offers))
+        if row["id"] not in _SHADOW_LOGGED:
+            _SHADOW_LOGGED.add(row["id"])
+            logger.warning(
+                "reap_price_writeback: WOULD write purchase=%s product=%s %s %s -> %s offers=%d",
+                row["id"], row["product_key"], lane, ours, live, len(offers))
         return "would_write"
 
-    async with database.transaction():
-        written, reason = await _write_offers(offers, old=ours, new=live, currency=currency)
-        if reason != "planned":
-            # `_write_offers` refuses before its first write, so nothing is written here.
-            return reason
-        if lane == "mirror":
-            seed_price = seed.get("price_amount")
-            if product_level and seed_price is not None and _same_price(seed_price, ours, currency):
-                seed_price = _major(live, currency)
-            await database.fetch_one(_WRITE_SEED_SQL, {
-                "id": seed["id"], "seed_data": json.dumps(document), "price_amount": seed_price})
+    try:
+        async with database.transaction():
+            written, reason = await _write_offers(offers, old=ours, new=live, currency=currency)
+            if reason != "planned":
+                return reason  # refused before its first write: nothing to roll back
+            if lane == "mirror":
+                seed_price = seed.get("price_amount")
+                if product_level and seed_price is not None and _same_price(seed_price, ours, currency):
+                    seed_price = _major(live, currency)
+                found = await database.fetch_one(
+                    _WRITE_SEED_SQL if IS_POSTGRES else _WRITE_SEED_SQL_SQLITE, {
+                        "id": seed["id"], "seed_data": json.dumps(document),
+                        "old_seed_data": _raw_json(seed.get("seed_data")), "price_amount": seed_price})
+                if found is None:
+                    raise _Raced("seed")
+    except _Raced as raced:
+        logger.warning("reap_price_writeback: raced purchase=%s product=%s on %s; nothing written",
+                       row["id"], row["product_key"], raced)
+        return "raced"
     await _refresh_pdp(lane, product, seed_id=(seed["id"] if lane == "mirror" else None))
     logger.warning(
         "reap_price_writeback: wrote purchase=%s product=%s %s %s -> %s offers=%d",
         row["id"], row["product_key"], lane, ours, live, written)
 
-    after, after_reason = await _priced_now(
-        lane, row, sku_key=(proof_skus[0] if len(set(proof_skus)) == 1 else None))
-    if after != live:
+    after, after_reason, after_variant = await _priced_now(lane, row, sku_key=named_sku)
+    if after != live or after_variant != variant_id:
         logger.warning(
             "reap_price_writeback: NOT EFFECTIVE purchase=%s product=%s route now %s (%s)",
             row["id"], row["product_key"], after, after_reason)
