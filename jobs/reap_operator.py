@@ -16,11 +16,23 @@ module owns NONE of that logic: it parses arguments, refuses to apply without th
 explicit guards, calls the function, and prints its result. It never calls Reap, never reads a
 buyer's contact and never edits a row itself.
 
-DRY RUN BY DEFAULT. Every decision is a preview (`dry_run=True`) unless `--apply` is given, and
-`--apply` additionally requires `--operator <handle>` (recorded in the audit row) and
-`--expect-env <PIVOTA_ENV>` equal to this process's PIVOTA_ENV, so a command pasted into the
-wrong environment refuses before it connects. A dry run without `--operator` previews as
-`dry-run-preview`; pass `--operator` to preview exactly what will be audited.
+DRY RUN BY DEFAULT. Every decision is a preview (`dry_run=True`) unless `--apply` is given.
+`--apply` additionally requires:
+
+  * `--operator <handle>`, recorded in the audit row;
+  * `--expect-env <PIVOTA_ENV>`, EXACTLY this process's PIVOTA_ENV (no case folding, no strip);
+  * `--expect-database <identity JSON>`, compared after connecting with
+    `services.reap_unopened_attempt.database_identity()` -- what the SERVER says it is
+    (`current_database()`, `inet_server_addr()`, `current_schema()`), which no argument or
+    environment variable typed into the job can change. Both of the first two are typed by the
+    same hand, so they only catch a paste into the wrong job; this one catches the wrong database;
+  * for `resolve-*`, a Reap host that matches the environment: a sandbox host
+    (`rc.REAP_SANDBOX_HOSTS`) is refused when the environment resolves to production
+    (`config.platform.is_production`, the poller's own test) and required otherwise;
+  * for `resolve-*`, `--evidence-verified`.
+
+A dry run without `--operator` previews as `dry-run-preview`; pass `--operator` to preview
+exactly what will be audited.
 
 THE LISTS ARE READ-ONLY AND PII-FREE. They print one JSON object per line: ids, states,
 classification codes, ages, dispatch-key presence, checkout ids and the opaque partner/journal
@@ -29,7 +41,8 @@ code, buyer reference or any URL: the SELECT names its columns, and nothing else
 
 EXIT CODES
   0  ok (a list, an eligible preview, a resolution, an exact replay)
-  2  bad arguments, or a refused precondition (missing/mismatched apply guards)
+  2  bad arguments, or a refused precondition (missing/mismatched apply guards, including a
+     database identity that does not match --expect-database)
   3  the service refused the decision; its reason code is printed
   1  anything unexpected (the database is unreachable, a crash)
 """
@@ -148,7 +161,10 @@ def build_parser() -> argparse.ArgumentParser:
     def guards(p: argparse.ArgumentParser) -> None:
         p.add_argument("--apply", action="store_true", help="write the decision (default: preview only)")
         p.add_argument("--operator", help="opaque operator handle recorded in the audit row; required with --apply")
-        p.add_argument("--expect-env", help="must equal this process's PIVOTA_ENV; required with --apply")
+        p.add_argument("--expect-env", help="must equal this process's PIVOTA_ENV exactly; required with --apply")
+        p.add_argument("--expect-database", type=_json_object,
+                       help="the database identity JSON this decision was reviewed against; required with "
+                            "--apply and compared with what the connected server reports")
 
     def evidence(p: argparse.ArgumentParser, *, payload_required: bool) -> None:
         p.add_argument("--evidence-source", required=True, choices=EVIDENCE_SOURCES)
@@ -196,9 +212,11 @@ def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
 def check_guards(args: argparse.Namespace, environ: Mapping[str, str]) -> str:
     """The operator handle for this run, or `Refused`. Applying needs every guard; a preview
     refuses only a stated environment that is not this one."""
-    actual = str(environ.get("PIVOTA_ENV") or "").strip()
-    expected = None if args.expect_env is None else str(args.expect_env).strip()
-    if expected is not None and expected.lower() != actual.lower():
+    # EXACT, like scripts/ops/reap_staging_preflight.py: ' production', 'Production' and
+    # 'production2' are not a statement that this is production.
+    actual = environ.get("PIVOTA_ENV") or ""
+    expected = args.expect_env
+    if expected is not None and expected != actual:
         raise Refused(f"--expect-env {expected!r} does not match PIVOTA_ENV={actual!r}")
     if args.command.startswith("resolve-") and not str(environ.get("REAP_API_BASE_URL") or "").strip():
         # The services compare the evidence's origin with THIS process's configured Reap origin.
@@ -212,9 +230,49 @@ def check_guards(args: argparse.Namespace, environ: Mapping[str, str]) -> str:
         raise Refused("--apply requires --expect-env")
     if not actual:
         raise Refused("--apply requires PIVOTA_ENV to be set in this process")
+    if args.expect_database is None:
+        raise Refused("--apply requires --expect-database")
     if getattr(args, "evidence_verified", True) is not True:
         raise Refused("--apply requires --evidence-verified")
+    if args.command.startswith("resolve-"):
+        _check_reap_host_posture(environ)
     return str(args.operator).strip()
+
+
+def _check_reap_host_posture(environ: Mapping[str, str]) -> None:
+    """Production must not decide on sandbox evidence, and nothing else may decide on production's.
+
+    The same rule the poller applies before it calls Reap (`is_production()` and
+    `rc.is_sandbox_base_url()`), and the same single host list. Staging is a restored copy of
+    production, so a staging decision pointed at a production Reap host is refused too.
+    """
+    from config.platform import is_production
+    from services import reap_agentic_client as rc
+
+    sandbox = rc.is_sandbox_base_url(str(environ.get("REAP_API_BASE_URL") or ""))
+    if is_production(environ) and sandbox:
+        raise Refused("PIVOTA_ENV resolves to production but REAP_API_BASE_URL is a Reap sandbox host")
+    if not is_production(environ) and not sandbox:
+        raise Refused("outside production REAP_API_BASE_URL must be exactly a Reap sandbox host")
+
+
+async def check_database(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    """None when this decision may run here, else the refusal line. Applying only.
+
+    The identity is what the connected server reports, so it is the one guard that does not come
+    from the same hand as the command. The refusal names the differing KEYS, not the values.
+    """
+    if not args.apply:
+        return None
+    from services.reap_unopened_attempt import database_identity
+
+    actual = await database_identity()
+    expected = args.expect_database
+    if actual == expected:
+        return None
+    differing = sorted(key for key in set(actual) | set(expected) if actual.get(key) != expected.get(key))
+    return {"status": "refused", "reason": "database_identity_mismatch", "fields": differing,
+            "command": args.command, "dry_run": False}
 
 
 def _evidence(args: argparse.Namespace) -> Dict[str, Any]:
@@ -325,6 +383,10 @@ async def run(args: argparse.Namespace, *, operator: Optional[str] = None,
         return EXIT_OK
     from services.reap_agentic_client import ReapConfigError
 
+    mismatch = await check_database(args)
+    if mismatch is not None:
+        emit(_json(mismatch))
+        return EXIT_BAD_ARGS
     try:
         result = await _decide(args, operator or DRY_RUN_OPERATOR)
     except _service_refusals() as exc:

@@ -1883,10 +1883,27 @@ The lists print one JSON object per row: purchase id, state, cohort/classificati
 to ask Reap (`dispatch_key`, `quote_id`, `reap_enrollment_id`), and `updated_at`. Never buyer
 email, address, offer code, buyer reference or a URL.
 
-**Every decision previews unless `--apply` is given.** Applying also requires `--operator
-<handle>` (the audit row's `operator_ref`) and `--expect-env <value>` equal to the job's
-`PIVOTA_ENV`; `resolve-*` additionally requires `--evidence-verified`, your attestation that you
-verified the evidence yourself. A preview writes nothing. Without `--operator` it runs as
+**Every decision previews unless `--apply` is given.** Applying also requires:
+
+* `--operator <handle>` (the audit row's `operator_ref`);
+* `--expect-env <value>`, **exactly** the job's `PIVOTA_ENV` (`Production` or `production ` is
+  refused). You type both of these, so they only catch a command pasted into the wrong job;
+* `--expect-database '<identity JSON>'`, the database you reviewed the decision against:
+  `{"dialect": "postgres", "database": "<database name>", "host": "<the Cloud SQL instance's
+  private IP>", "schema": "public"}`, taken from the Cloud SQL instance itself, never from the
+  job's `DATABASE_URL` or from an earlier run's output. After connecting, the command compares it
+  with what the server reports (`current_database()`, `inet_server_addr()`, `current_schema()`,
+  `services.reap_unopened_attempt.database_identity`) and refuses on any difference (exit 2,
+  `database_identity_mismatch`, naming the differing keys only) before the service runs. This
+  is the guard that does not come from your own typing. Every apply subcommand requires it,
+  `retire-unopened` included (its `--expected-database-json` is the service's own, separate check);
+* for `resolve-*`, a Reap host that fits the environment: a sandbox host (`rc.REAP_SANDBOX_HOSTS`)
+  is refused when `PIVOTA_ENV` resolves to production, and required in every other environment
+  (the poller's own rule);
+* for `resolve-*`, `--evidence-verified`, your attestation that you verified the evidence
+  yourself.
+
+A preview writes nothing and is not compared with `--expect-database`. Without `--operator` it runs as
 `dry-run-preview`; an exact replay is matched on the operator handle, so pass the same
 `--operator` you will apply with to preview exactly what will happen.
 
@@ -1901,7 +1918,8 @@ Evidence arguments (`resolve-checkout`, `resolve-parked`): `--evidence-source`
 `--expected-database-json` and `--provenance-json` (its `checked_at` must be within 5 minutes).
 
 Exit codes: `0` ok (list, eligible preview, resolution, exact replay); `2` bad arguments or a
-refused guard (nothing connected), or an unusable `REAP_API_BASE_URL`; `3` the service refused,
+refused guard (nothing connected), a database identity that differs from `--expect-database`
+(connected, nothing written), or an unusable `REAP_API_BASE_URL`; `3` the service refused,
 with `{"status": "refused", "reason": "<code>"}` on stdout; `1` unexpected. The one-off runner
 reports any non-zero container exit as `1`, so read the printed line for the reason.
 
@@ -1922,7 +1940,8 @@ ENV_VARS=...same... scripts/ops/run_oneoff_job.sh -m jobs.reap_operator resolve-
   --evidence-verified --operator <your handle>
 
 # apply: the same arguments plus
-  --apply --expect-env production
+  --apply --expect-env production \
+  --expect-database '{"dialect":"postgres","database":"<db name>","host":"<instance private IP>","schema":"public"}'
 ```
 
 A worker claim moves `updated_at`, and parked rows are re-released every 15 minutes, so a preview

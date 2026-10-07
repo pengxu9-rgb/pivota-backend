@@ -50,6 +50,14 @@ def _parked_argv(row, outcome="confirmed_not_created", *extra):
             *_evidence_args(), *extra]
 
 
+async def _apply_args(env="staging"):
+    """The full apply guard set, with THIS test database's real identity."""
+    from services.reap_unopened_attempt import database_identity
+
+    return ["--apply", "--operator", "ops_alice", "--expect-env", env,
+            "--expect-database", json.dumps(await database_identity())]
+
+
 async def _run(argv, environ=ENV):
     """What `main` does after parsing, on the fixture's open connection."""
     lines = []
@@ -85,27 +93,55 @@ def test_bad_arguments_exit_2_before_connecting(no_db, argv):
     assert op.main(argv, environ=ENV) == op.EXIT_BAD_ARGS
 
 
+#: A database identity that passes the pre-connect guards (it is compared only after connecting).
+SOME_DB = ["--expect-database", '{"dialect": "sqlite", "database": "x"}']
+PROD_URL = "https://prod.api.reap.global"
+
+
 @pytest.mark.parametrize("extra,environ", [
-    (["--apply"], ENV),
-    (["--apply", "--operator", "ops_alice"], ENV),
-    (["--apply", "--operator", "ops_alice", "--expect-env", "production"], ENV),
-    (["--apply", "--operator", "ops_alice", "--expect-env", "staging"], {"REAP_API_BASE_URL": BASE_URL}),
-    (["--apply", "--operator", "  ", "--expect-env", "staging"], ENV),
+    (["--apply", *SOME_DB], ENV),
+    (["--apply", "--operator", "ops_alice", *SOME_DB], ENV),
+    (["--apply", "--operator", "ops_alice", "--expect-env", "production", *SOME_DB], ENV),
+    (["--apply", "--operator", "ops_alice", "--expect-env", "staging", *SOME_DB], {"REAP_API_BASE_URL": BASE_URL}),
+    (["--apply", "--operator", "  ", "--expect-env", "staging", *SOME_DB], ENV),
     (["--expect-env", "production"], ENV),
     ([], {"PIVOTA_ENV": "staging"}),
+    (["--apply", "--operator", "ops_alice", "--expect-env", "staging"], ENV),
+    (["--apply", "--operator", "ops_alice", "--expect-env", "STAGING", *SOME_DB], ENV),
+    (["--apply", "--operator", "ops_alice", "--expect-env", "staging", *SOME_DB],
+     {"PIVOTA_ENV": "staging ", "REAP_API_BASE_URL": BASE_URL}),
+    (["--expect-env", "Staging"], ENV),
+    (["--apply", "--operator", "ops_alice", "--expect-env", "production", *SOME_DB],
+     {"PIVOTA_ENV": "production", "REAP_API_BASE_URL": BASE_URL}),
+    (["--apply", "--operator", "ops_alice", "--expect-env", "staging", *SOME_DB],
+     {"PIVOTA_ENV": "staging", "REAP_API_BASE_URL": PROD_URL}),
+    (["--apply", "--operator", "ops_alice", "--expect-env", "staging", *SOME_DB],
+     {"PIVOTA_ENV": "staging", "REAP_API_BASE_URL": "https://x.sandbox.api.reap.global"}),
 ], ids=["no_operator", "no_expect_env", "env_mismatch", "env_unset", "blank_operator", "preview_wrong_env",
-        "no_reap_origin"])
-def test_apply_guards_refuse_with_exit_2(no_db, extra, environ):
+        "no_reap_origin", "no_expect_database", "env_case_differs", "env_has_whitespace",
+        "preview_env_case_differs", "production_on_sandbox_host", "staging_on_production_host",
+        "staging_on_lookalike_host"])
+def test_apply_guards_refuse_with_exit_2(no_db, capsys, request, extra, environ):
     argv = ["resolve-parked", "--purchase-id", "rp_1", "--dispatch-key", "a" * 64, "--outcome",
             "confirmed_not_created", "--expected-updated-at", "2026-10-07T00:00:00+00:00",
             *_evidence_args(), *extra]
     assert op.main(argv, environ=environ) == op.EXIT_BAD_ARGS
+    # Refused by the guard the case names, not by an earlier usage error.
+    reason = {"no_operator": "requires --operator", "no_expect_env": "requires --expect-env",
+              "env_unset": "does not match PIVOTA_ENV", "blank_operator": "requires --operator",
+              "no_reap_origin": "REAP_API_BASE_URL is not set", "no_expect_database": "requires --expect-database",
+              "production_on_sandbox_host": "is a Reap sandbox host",
+              "staging_on_production_host": "must be exactly a Reap sandbox host",
+              "staging_on_lookalike_host": "must be exactly a Reap sandbox host",
+              }.get(request.node.callspec.id, "does not match PIVOTA_ENV")
+    assert reason in capsys.readouterr().err
 
 
 def test_apply_requires_the_evidence_attestation(no_db):
     argv = ["resolve-parked", "--purchase-id", "rp_1", "--dispatch-key", "a" * 64, "--outcome",
             "confirmed_not_created", "--expected-updated-at", "2026-10-07T00:00:00+00:00",
-            *_evidence_args(verified=False), "--apply", "--operator", "ops_alice", "--expect-env", "staging"]
+            *_evidence_args(verified=False), "--apply", "--operator", "ops_alice", "--expect-env", "staging",
+            *SOME_DB]
     assert op.main(argv, environ=ENV) == op.EXIT_BAD_ARGS
 
 
@@ -114,8 +150,23 @@ def test_the_guards_pass_and_return_the_operator():
             "--native-request-hash", "e", "--cart-request-hash", "f", "--expected-database-json", "{}",
             "--provenance-json", "{}"]
     assert op.check_guards(op.parse_args(argv), ENV) == op.DRY_RUN_OPERATOR
-    applied = op.parse_args(argv + ["--apply", "--operator", "ops_alice", "--expect-env", "STAGING"])
+    applied = op.parse_args(argv + ["--apply", "--operator", "ops_alice", "--expect-env", "staging", *SOME_DB])
     assert op.check_guards(applied, ENV) == "ops_alice"
+    # retire-unopened makes no Reap call, so it has no Reap host to check.
+    assert op.check_guards(applied, {"PIVOTA_ENV": "staging"}) == "ops_alice"
+
+
+@pytest.mark.parametrize("environ", [
+    {"PIVOTA_ENV": "production", "REAP_API_BASE_URL": PROD_URL},
+    {"PIVOTA_ENV": "staging", "REAP_API_BASE_URL": BASE_URL},
+    {"PIVOTA_ENV": "staging", "REAP_API_BASE_URL": "https://sg.sandbox.api.reap.global"},
+], ids=["production_on_production_host", "staging_on_sandbox", "staging_on_sg_sandbox"])
+def test_a_matching_reap_host_posture_passes(environ):
+    argv = ["resolve-parked", "--purchase-id", "rp_1", "--dispatch-key", "a" * 64, "--outcome",
+            "confirmed_not_created", "--expected-updated-at", "2026-10-07T00:00:00+00:00",
+            *_evidence_args(), "--apply", "--operator", "ops_alice", "--expect-env", environ["PIVOTA_ENV"],
+            *SOME_DB]
+    assert op.check_guards(op.parse_args(argv), environ) == "ops_alice"
 
 
 def test_an_unexpected_failure_exits_1(monkeypatch):
@@ -199,7 +250,7 @@ async def test_resolve_parked_previews_by_default_then_applies_with_the_guards(r
     assert preview == {"status": "eligible", "outcome": "confirmed_not_created", "state": "quoting",
                        "proposed_state": "quoting", "dry_run": True}
     assert await _get(pid) == row and await _audits(pid) == []
-    code, [result] = await _run(argv + ["--apply", "--operator", "ops_alice", "--expect-env", "staging"])
+    code, [result] = await _run(argv + await _apply_args())
     assert code == op.EXIT_OK
     assert result == {"status": "resolved", "outcome": "confirmed_not_created", "state": "quoting", "dry_run": False}
     [audit] = await _audits(pid)
@@ -215,8 +266,7 @@ async def test_a_service_refusal_exits_3_and_prints_its_reason(reap):
     assert code == op.EXIT_REFUSED
     assert line == {"status": "refused", "reason": "dispatch_may_still_be_in_flight",
                     "command": "resolve-parked", "dry_run": True}
-    code, [line] = await _run(_parked_argv(row, "confirmed_not_created", "--apply", "--operator", "ops_alice",
-                                           "--expect-env", "staging"))
+    code, [line] = await _run(_parked_argv(row, "confirmed_not_created", *await _apply_args()))
     assert code == op.EXIT_REFUSED and line["dry_run"] is False
     assert await _get(pid) == row and await _audits(pid) == [] and reap.calls == []
 
@@ -230,7 +280,7 @@ async def test_resolve_checkout_previews_then_applies(reap, attribution):
     assert code == op.EXIT_OK and preview["status"] == "eligible" and preview["dry_run"] is True
     assert await _get(pid) == row
     assert await database.fetch_val("SELECT count(*) FROM reap_checkout_manual_resolution_audit") == 0
-    code, [result] = await _run(argv + ["--apply", "--operator", "ops_alice", "--expect-env", "staging"])
+    code, [result] = await _run(argv + await _apply_args())
     assert code == op.EXIT_OK and result == {"status": "resolved", "state": "failed", "dry_run": False}
     assert await database.fetch_val("SELECT operator_ref FROM reap_checkout_manual_resolution_audit") == "ops_alice"
     assert reap.calls == []
@@ -286,6 +336,8 @@ def test_the_runbook_invocation_matches_the_parser():
     assert "scripts/ops/run_oneoff_job.sh -m jobs.reap_operator list-parked" in section
     assert "REAP_API_BASE_URL" in section and "PIVOTA_ENV=production" in section
     assert "--apply --expect-env production" in section
+    assert "--expect-database '{\"dialect\":\"postgres\"" in section
+    assert "database_identity_mismatch" in section and "REAP_SANDBOX_HOSTS" in section
     parser = op.build_parser()
     subcommands = set(parser._subparsers._group_actions[0].choices)
     named = set(re.findall(r"`(list-[a-z-]+|resolve-[a-z]+|retire-[a-z]+)", section))
@@ -297,3 +349,50 @@ def test_the_runbook_invocation_matches_the_parser():
     assert "no admin HTTP route or executable operator CLI" not in runbook
     script = (ROOT / "scripts" / "ops" / "run_oneoff_job.sh").read_text(encoding="utf-8")
     assert 'ENV_VARS="${ENV_VARS:-PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600}"' in script
+
+
+# ── the database identity: checked against the SERVER after connecting, on every apply ─────────
+
+def _retire_argv(identity, provenance_checked_at=None):
+    provenance = {key: True for key in ("original_authority_verified", "owner_lineage_verified",
+                                        "historical_ledgers_reconciled", "atomic_producers_verified",
+                                        "history_retention_verified", "no_provider_handoff_verified")}
+    provenance.update(evidence_sha256="e" * 64, checked_at=provenance_checked_at or _now())
+    return ["retire-unopened", "--agent-id", "agent_1", "--owner-hash", "a" * 64,
+            "--native-key", "ucp-reap-v1-" + "3" * 48, "--cart-key", "ucp-reap-v1-" + "4" * 48,
+            "--native-request-hash", "b" * 64, "--cart-request-hash", "c" * 64,
+            "--expected-database-json", json.dumps(identity), "--provenance-json", json.dumps(provenance)]
+
+
+@pytest.mark.parametrize("command", ["resolve-checkout", "resolve-parked", "retire-unopened"])
+async def test_apply_against_another_database_is_refused_before_the_service(reap, attribution, command):
+    from services.reap_unopened_attempt import database_identity
+
+    identity = await database_identity()
+    if command == "resolve-checkout":
+        pid, row, evidence = await _manual_case(status="FAILED")
+        argv = ["resolve-checkout", "--purchase-id", pid, "--expected-updated-at", row["updated_at"].isoformat(),
+                *_evidence_args(source="authenticated_reap_checkout_read", payload=evidence["payload"])]
+    elif command == "resolve-parked":
+        pid, row = await _parked_unknown(reap)
+        argv = _parked_argv(row)
+    else:
+        pid, row, argv = None, None, _retire_argv(identity)
+    reap.calls.clear()
+    wrong = dict(identity, database="some_other_database")
+    guards = ["--apply", "--operator", "ops_alice", "--expect-env", "staging"]
+    code, [line] = await _run(argv + guards + ["--expect-database", json.dumps(wrong)])
+    assert code == op.EXIT_BAD_ARGS
+    assert line == {"status": "refused", "reason": "database_identity_mismatch", "fields": ["database"],
+                    "command": command, "dry_run": False}
+    assert "some_other_database" not in json.dumps(line)
+    if pid is not None:
+        assert await _get(pid) == row
+    assert await database.fetch_val("SELECT count(*) FROM reap_checkout_manual_resolution_audit") == 0
+    assert await database.fetch_val(
+        "SELECT count(*) FROM reap_agentic_purchase_keys WHERE idempotency_key IN (:a, :b)",
+        {"a": "ucp-reap-v1-" + "3" * 48, "b": "ucp-reap-v1-" + "4" * 48}) == 0
+    assert reap.calls == []
+    # A preview is not compared: it writes nothing, and it is how the identity is first reviewed.
+    code, _ = await _run(argv + ["--expect-database", json.dumps(wrong)])
+    assert code in (op.EXIT_OK, op.EXIT_REFUSED)
