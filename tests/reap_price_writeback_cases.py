@@ -754,3 +754,121 @@ async def test_a_snapshot_price_already_at_the_new_price_is_not_a_conflict(clien
     await _edit_seed(lambda d: d["snapshot"].update(price_amount=14.99))
     monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
     assert await writeback.run_writeback_pass() == {"written": 1}
+
+
+# ── display copies of the price (staging, 2026-10-07: they stayed at the old price) ──────────
+
+
+def _facts(amount, display, captured="2026-01-01T00:00:00+00:00"):
+    return {"amount": amount, "currency": "USD", "display_raw": display, "captured_at": captured,
+            "confidence": "high", "market_switch_status": "ok"}
+
+
+async def _set_offer_payload(offer_id, payload):
+    cast = "CAST(:p AS jsonb)" if IS_POSTGRES else ":p"
+    await database.execute(f"UPDATE catalog_offers SET offer_payload = {cast} WHERE offer_id = :o",
+                           {"p": json.dumps(payload), "o": offer_id})
+
+
+async def _offer_payload(offer_id):
+    row = await database.fetch_one("SELECT offer_payload FROM catalog_offers WHERE offer_id = :o", {"o": offer_id})
+    value = row["offer_payload"]
+    return value if isinstance(value, dict) else json.loads(value)
+
+
+def test_the_facts_move_only_from_the_old_price_and_keep_their_format():
+    observed = datetime(2026, 10, 7, 0, 18, tzinfo=timezone.utc)
+    holder = {"price": "13.99", "price_amount": 13.99,
+              "commerce_facts_v1": {"regional_price": _facts(13.99, "$13.99")},
+              "agent_safe_commerce_facts": {"price": _facts("13.99", "13.99 USD")},
+              "commerce_facts": {"regional_price": _facts(15.0, "$15.00")}}
+    moved = writeback.move_price_facts(holder, old_minor=1399, new_minor=1499, currency="USD",
+                                       observed=observed, top_keys=("price", "price_amount"))
+    assert moved == 4
+    assert (holder["price"], holder["price_amount"]) == ("14.99", 14.99)
+    regional = holder["commerce_facts_v1"]["regional_price"]
+    assert (regional["amount"], regional["display_raw"], regional["captured_at"]) == (
+        14.99, "$14.99", observed.isoformat())
+    safe = holder["agent_safe_commerce_facts"]["price"]
+    assert (safe["amount"], safe["display_raw"]) == ("14.99", "14.99 USD")
+    assert holder["commerce_facts"]["regional_price"]["amount"] == 15.0  # a third price: another writer's fact
+    again = writeback.move_price_facts(holder, old_minor=1399, new_minor=1499, currency="USD",
+                                       observed=observed, top_keys=("price", "price_amount"))
+    assert again == 0  # already new: nothing to move
+
+
+def test_a_display_text_without_the_old_number_becomes_the_new_number():
+    holder = {"commerce_facts_v1": {"regional_price": {"amount": 13.99, "display_raw": "thirteen ninety-nine"}}}
+    writeback.move_price_facts(holder, old_minor=1399, new_minor=1499, currency="USD", observed=None)
+    assert holder["commerce_facts_v1"]["regional_price"] == {"amount": 14.99, "display_raw": "14.99"}
+
+
+async def test_the_written_offers_payload_and_the_seeds_facts_move_with_the_price(client, monkeypatch):
+    _body, purchase_id = await refused_at(client, monkeypatch, live=1499)
+    await _set_offer_payload("prepare-offer", {
+        "price": "13.99", "price_amount": 13.99, "source": "external_seed",
+        "commerce_facts_v1": {"regional_price": _facts(13.99, "13.99")},
+        "agent_safe_commerce_facts": {"price": _facts(13.99, "13.99")}})
+    await _edit_seed(lambda d: [h.update(commerce_facts_v1={"regional_price": _facts(13.99, "13.99")})
+                                for h in (d, d["snapshot"])])
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    payload = await _offer_payload("prepare-offer")
+    assert (payload["price"], payload["price_amount"], payload["source"]) == ("14.99", 14.99, "external_seed")
+    assert payload["commerce_facts_v1"]["regional_price"]["amount"] == 14.99
+    assert payload["agent_safe_commerce_facts"]["price"]["display_raw"] == "14.99"
+    row = await database.fetch_one("SELECT terminal_at FROM reap_agentic_purchases WHERE id = :id", {"id": purchase_id})
+    import services.reap_price_corroboration as corroboration
+    assert corroboration._aware(payload["commerce_facts_v1"]["regional_price"]["captured_at"]) == \
+        corroboration._aware(row["terminal_at"])
+    _amount, _variants, data = await seed_state()
+    for holder in (data, data["snapshot"]):
+        assert holder["commerce_facts_v1"]["regional_price"]["amount"] == 14.99
+
+
+async def test_a_seed_listing_several_variants_keeps_its_product_facts(client, monkeypatch):
+    """The seed's facts are product-level: not this variant's when it lists others."""
+    await refused_at(client, monkeypatch, live=1499)
+    await _edit_seed(lambda d: (_two_listed(d), d.update(commerce_facts_v1={"regional_price": _facts(13.99, "13.99")})))
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert (await seed_state())[2]["commerce_facts_v1"]["regional_price"]["amount"] == 13.99
+
+
+async def test_a_payload_that_moved_between_read_and_write_rolls_everything_back(client, monkeypatch):
+    """The payload's compare-and-set is on the document as read. The concurrent edit is injected
+    right after the read; in this single-connection test it runs inside the pass's transaction, so
+    the rollback undoes it too -- what matters is that the price write is undone with it."""
+    await refused_at(client, monkeypatch, live=1499)
+    await _set_offer_payload("prepare-offer", {"price": "13.99"})
+    original = writeback.database.fetch_one
+    cast = "CAST(:p AS jsonb)" if IS_POSTGRES else ":p"
+
+    async def fetch_then_move(query, values=None):
+        found = await original(query, values)
+        if query == writeback._READ_OFFER_PAYLOAD_SQL:
+            await database.execute(f"UPDATE catalog_offers SET offer_payload = {cast} WHERE offer_id = :o",
+                                   {"p": json.dumps({"price": "15.49"}), "o": values["offer_id"]})
+        return found
+
+    monkeypatch.setattr(writeback.database, "fetch_one", fetch_then_move)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"raced": 1}
+    monkeypatch.setattr(writeback.database, "fetch_one", original)
+    assert await offer_prices() == ["13.99"]
+    assert (await _offer_payload("prepare-offer"))["price"] == "13.99"
+    assert (await seed_state())[1] == ["13.99"]
+
+
+async def test_a_seed_about_this_variant_moves_its_placeholder_beside_a_real_sku(client, monkeypatch):
+    """Staging, 2026-10-07 (Judydoll): the seed lists ONE of the storefront's live shades (a named
+    proof, 8 live) and the placeholder -- the projection of the seed's price, which moves -- stayed
+    at the old price, so the product view kept showing it."""
+    await refused_at(client, monkeypatch, live=1499)
+    await _add_placeholder("13.99")
+    await _edit_seed(lambda d: d["snapshot"]["shopify_cart_proof"].update(
+        scope="named_variant", available=True, live_variant_count=8))
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await offer_prices() == ["14.99", "14.99"]
+    assert await _seed_column() == 14.99
