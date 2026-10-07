@@ -985,3 +985,76 @@ async def test_the_rest_of_a_payload_is_preserved(client, monkeypatch):
     payload = await _offer_payload("prepare-offer")
     assert payload["price"] == "14.99" and payload["zz"] == {"b": 1, "a": "円"} and payload["aa"] == [3, 2, 1]
     assert payload["agent_safe_commerce_facts"]["price"] == {"status": "unverified"}
+
+
+# ── round-2 review of #2523: the LOW / INFO follow-ups ───────────────────────────────────────
+
+
+@pytest.mark.parametrize("key", ["compare_at_price", "compare_at", "compareAt", "original_price",
+                                 "originalPrice", "list_price"])
+def test_a_seed_variants_was_price_the_new_price_reaches_is_cleared(key):
+    """Finding A: the backend serves compare_at_price as original_price; once the price reaches it
+    the sale is over -- an "original price" at or below the price is wrong."""
+    seed = {"snapshot": {"variants": [{"variant_id": "111", "price": "13.99", key: "14.49"}]}}
+    plan, _pl, reason = writeback.plan_seed_write(
+        seed, variant_id="111", old_minor=1399, new_minor=1499, currency="USD",
+        purchase_id="rp_1", observed=None)
+    assert reason == "planned" and plan["snapshot"]["variants"][0][key] is None
+
+
+def test_a_seed_variants_was_price_above_the_new_price_stays():
+    seed = {"snapshot": {"variants": [{"variant_id": "111", "price": "13.99", "compare_at_price": "19.99"},
+                                      {"variant_id": "222", "price": "9.99", "compare_at_price": "12.00"}]}}
+    plan, _pl, _reason = writeback.plan_seed_write(
+        seed, variant_id="111", old_minor=1399, new_minor=1499, currency="USD",
+        purchase_id="rp_1", observed=None)
+    variants = plan["snapshot"]["variants"]
+    assert variants[0]["compare_at_price"] == "19.99"  # still a discount at the new price
+    assert variants[1]["compare_at_price"] == "12.00"  # another variant is never touched
+
+
+@pytest.mark.parametrize("where,status", [("block", "MISMATCH"), ("block", " mismatch "), ("block", "Failed"),
+                                          ("facts", "mismatch"), ("facts", " FAILED ")])
+def test_a_mismatch_status_in_any_case_or_at_the_facts_level_is_not_this_price(where, status):
+    """Findings B/C: the status as the gateway reads it -- case/space-insensitive, the block's own
+    first, else the facts object's."""
+    price = {"amount": 13.99}
+    facts = {"regional_price": price}
+    (price if where == "block" else facts)["market_switch_status"] = status
+    holder = {"commerce_facts_v1": facts}
+    assert writeback.move_price_facts(holder, old_minor=1399, new_minor=1499, currency="USD", observed=None) == 0
+    assert holder["commerce_facts_v1"]["regional_price"]["amount"] == 13.99
+
+
+def test_an_ok_status_at_the_facts_level_still_moves():
+    holder = {"commerce_facts_v1": {"market_switch_status": "ok", "regional_price": {"amount": 13.99}}}
+    assert writeback.move_price_facts(holder, old_minor=1399, new_minor=1499, currency="USD", observed=None) == 1
+
+
+def test_a_padded_sale_price_type_is_recognised():
+    """Finding D: ' Sale ' is a sale (the gateway trims)."""
+    holder = {"commerce_facts_v1": {"regional_price": {"amount": 12.99, "price_type": " Sale ",
+                                                       "compare_at_amount": 15.0}}}
+    writeback.move_price_facts(holder, old_minor=1299, new_minor=1349, currency="USD", observed=None)
+    price = holder["commerce_facts_v1"]["regional_price"]
+    assert (price["price_type"], price["compare_at_amount"]) == ("unknown", None)
+
+
+@pytest.mark.parametrize("display,old,new,want", [
+    ("US$ 13.50", 1350, 100000, "US$ 1,000.00"),
+    ("$999.99", 99999, 123456, "$1,234.56"),
+    ("$13.50", 1350, 99999, "$999.99"),
+])
+def test_a_four_digit_amount_reads_with_thousands_grouping(display, old, new, want):
+    """Finding F: the old text had no grouping only because it was under 1,000."""
+    holder = {"commerce_facts_v1": {"regional_price": {"amount": old / 100, "display_raw": display}}}
+    writeback.move_price_facts(holder, old_minor=old, new_minor=new, currency="USD", observed=None)
+    assert holder["commerce_facts_v1"]["regional_price"]["display_raw"] == want
+
+
+async def test_the_seed_variants_was_price_clears_end_to_end(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499)
+    await _edit_seed(lambda d: d["snapshot"]["variants"][0].update(compare_at_price="14.49"))
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert (await seed_state())[2]["snapshot"]["variants"][0]["compare_at_price"] is None

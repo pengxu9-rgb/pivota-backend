@@ -301,6 +301,13 @@ class _Raced(Exception):
 
 _VARIANT_ID_KEYS = ("shopify_variant_id", "variant_id", "id")
 _VARIANT_PRICE_KEYS = ("price", "price_amount")
+#: A seed variant's "was" price, in every spelling a reader takes it from: the backend serves
+#: `original_price or compare_at_price or originalPrice` (routes/agent_shop_gateway.py), the gateway
+#: `compare_at ?? compareAt ?? compare_at_price ?? list_price` (PIVOTA-Agent src/pdpBuilder.js). Once
+#: the price reaches it the sale is over: left behind, it is an "original price" at or below the
+#: price (review of #2523, round 2, finding A).
+_VARIANT_WAS_PRICE_KEYS = ("compare_at_price", "compare_at", "compareAt", "original_price",
+                           "originalPrice", "list_price")
 
 
 def _variant_id_of(variant: Mapping[str, Any]) -> Optional[str]:
@@ -354,6 +361,11 @@ def _rewrite_display(raw: str, *, old_minor: int, new_minor: int, currency: str)
         # The old number is absent, or another number sits beside it (a range, a bundle price, a
         # thousands-grouped amount): which number is this product's is not ours to guess.
         return None
+    if "." in new and len(new.split(".")[0]) > 3:
+        # The old text had no grouping only because it was under 1,000 (a grouped old number is
+        # refused above); a 4+ digit amount reads with it (review of #2523, round 2, finding F).
+        whole, cents = new.split(".")
+        new = f"{int(whole):,}.{cents}"
     return pattern.sub(new, raw)
 
 
@@ -382,7 +394,10 @@ def move_price_facts(
         # A block in another currency, or one its writer already marked a market mismatch, is not
         # this price whatever its number says (review of #2523, F3).
         stated = {str(price.get(k)).strip().upper() for k in ("currency", "observed_currency") if price.get(k)}
-        if (stated and stated != {currency}) or str(price.get("market_switch_status") or "") in ("mismatch", "failed"):
+        # The status as the gateway reads it: case- and space-insensitive, the block's own first,
+        # else the facts object's (PIVOTA-Agent src/commerce/commerceFacts.js).
+        status = str(price.get("market_switch_status") or block.get("market_switch_status") or "").strip().lower()
+        if (stated and stated != {currency}) or status in ("mismatch", "failed"):
             continue
         price["amount"] = _as_type_of(price["amount"], new_minor, currency)
         raw = price.get("display_raw")
@@ -392,7 +407,7 @@ def move_price_facts(
         for key in _PRICE_CONTEXT_KEYS:
             if key in price:
                 price[key] = None
-        if str(price.get("price_type") or "").lower() in _SALE_PRICE_TYPES:
+        if str(price.get("price_type") or "").strip().lower() in _SALE_PRICE_TYPES:
             price["price_type"] = "unknown"
         if observed is not None and "captured_at" in price:
             price["captured_at"] = observed.isoformat()
@@ -443,6 +458,10 @@ def plan_seed_write(
                     return None, False, "seed_price_unexpected"
                 variant[key] = _as_type_of(variant[key], new_minor, currency)
                 touched += 1
+            for key in _VARIANT_WAS_PRICE_KEYS:
+                was = ledger.amount_minor_or_none(_decimal_text(variant.get(key)), currency)
+                if was is not None and was <= int(new_minor):
+                    variant[key] = None
     if not touched:
         return None, False, "variant_not_on_seed"
     listed = {(_variant_id_of(v) if isinstance(v, dict) else None) for vs in lists for v in vs}
