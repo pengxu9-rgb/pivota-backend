@@ -32,7 +32,9 @@ DRY RUN BY DEFAULT. Every decision is a preview (`dry_run=True`) unless `--apply
   * for `resolve-*`, `--evidence-verified`.
 
 A dry run without `--operator` previews as `dry-run-preview`; pass `--operator` to preview
-exactly what will be audited.
+exactly what will be audited. A preview runs every check the service makes except the write, so
+a `resolve-*` preview ALSO needs `--evidence-verified`: without it the evidence is passed as
+unverified and the service refuses with `authoritative_evidence_required` (exit 3).
 
 THE LISTS ARE READ-ONLY AND PII-FREE. They print one JSON object per line: ids, states,
 classification codes, ages, dispatch-key presence, checkout ids and the opaque partner/journal

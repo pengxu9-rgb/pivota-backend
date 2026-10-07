@@ -156,3 +156,82 @@ def test_the_resume_section_states_the_window_the_code_runs():
     lapse = RESUME.split("**If nobody resumes.**", 1)[1]
     assert_states_the_window(lapse, where="resume")
     assert "terminal_purchase_not_resumable" in lapse
+
+
+# ── /resume: the table is in the order the handler checks ─────────────────────────────────────
+
+def _resume_check_sequence() -> list:
+    """The refusals `resume_reap_purchase` reaches, in source order, with the fresh admission
+    (`_validate_resume_selection`) inlined where it is called. Helpers that answer a fixed public
+    code are mapped to it: `_require_rail`/the create gate and the pilot scope to the 404,
+    `_not_found()` to `purchase_not_found`, `_PurchasePersistenceUnavailable` to the 503."""
+    def tokens(name):
+        pattern = (r'PurchaseRefused\(\s*"([a-z_]+)"|(_require_rail\(\))|(_not_found\(\))'
+                   r'|(enforce_pilot_scope\()|(await _validate_resume_selection\()|(except _PurchasePersistenceUnavailable)')
+        out = []
+        for m in re.finditer(pattern, _function_source(name)):
+            reason, rail, missing, pilot, admission, unavailable = m.groups()
+            if admission:
+                out += tokens("_validate_resume_selection")
+            elif reason:
+                out.append("not_available_on_this_rail" if reason == "create_disabled" else reason)
+            elif rail or pilot:
+                out.append("not_available_on_this_rail")
+            elif missing:
+                out.append("purchase_not_found")
+            elif unavailable:
+                pass  # the handler's catch, not a check; the 503 row is placed by the key lookup
+        return out
+    return tokens("resume_reap_purchase")
+
+
+def test_the_resume_table_is_in_the_order_the_handler_checks():
+    assert "in the order the handler checks them" in RESUME
+    rows = [line for line in RESUME.splitlines() if re.match(r"^\| \d{3} \| `", line)]
+    sequence = _resume_check_sequence()
+    assert sequence[0] == "not_available_on_this_rail" and sequence[-1] == "resume_raced", sequence
+    assert sequence.index("purchase_not_found") < sequence.index("terminal_purchase_not_resumable") \
+        < sequence.index("checkout_dispatch_unresolved") < sequence.index("contact_reentry_not_required") \
+        < sequence.index("consent_required") < sequence.index("buyer_unlinked") \
+        < sequence.index("merchant_not_purchasable") < sequence.index("price_changed")
+    # Every check maps to a table row at or after the previous check's row (a reason checked twice,
+    # like the 404 or `consent_required`, has a row at each position).
+    at = 0
+    for reason in sequence:
+        later = [i for i, row in enumerate(rows) if i >= at and f"`{reason}`" in row.split("|")[2]]
+        assert later, (reason, "no table row at or after", rows[at] if at < len(rows) else None)
+        at = later[0]
+    # The late 404s are said to be late.
+    gates = RESUME.split("**Gates and authentication.**", 1)[1].split("\n\n", 1)[0]
+    assert "fresh admission" in gates
+
+
+# ── /recover: what the 200 can be, and which failures are 503 ────────────────────────────────
+
+RECOVER = _section("### Recover a lost create response")
+
+
+def test_recover_documents_the_retired_receipt_and_its_keys():
+    import services.reap_unopened_attempt as retirement
+
+    src = Path(retirement.__file__).read_text(encoding="utf-8")
+    receipt = re.search(r'return \{"recovery_status": "([a-z_]+)", "reconciliation_id": [^}]+\}', src)
+    assert receipt, "the retired receipt shape moved; re-pin this test"
+    for key in ("recovery_status", "reconciliation_id", receipt.group(1)):
+        assert f"`{key}`" in RECOVER or f'"{key}"' in RECOVER, key
+    assert "no `checkout_dispatch_state`" in " ".join(RECOVER.split())
+    rules = " ".join(_section("### Field rules the door must not guess at").split())
+    assert "except a retired attempt's `/recover` receipt" in rules
+
+
+def test_recover_names_which_failures_are_503_and_which_are_500():
+    flat = " ".join(RECOVER.split())
+    line = next(l for l in RECOVER.splitlines() if l.startswith("* `503 checkout_outcome_unknown`"))
+    assert "retirement receipt" in line and "refusal marker" in line
+    assert "key mapping or retirement receipt could not be read" not in flat
+    assert "`500`" in flat
+    # The /recover handler: only the receipt read is wrapped; the key lookup is not.
+    src = _function_source("recover_reap_purchase")
+    assert re.search(r"retired_receipt\(.*?\)\s*except Exception:\s*raise _PurchasePersistenceUnavailable", src, re.S)
+    lookup = src.split("purchase_id = await _replayed_purchase_id", 1)[1]
+    assert "except Exception" not in lookup.split("except _PurchasePersistenceUnavailable", 1)[0]

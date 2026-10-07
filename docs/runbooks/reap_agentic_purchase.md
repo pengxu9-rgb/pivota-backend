@@ -1903,7 +1903,10 @@ email, address, offer code, buyer reference or a URL.
 * for `resolve-*`, `--evidence-verified`, your attestation that you verified the evidence
   yourself.
 
-A preview writes nothing and is not compared with `--expect-database`. Without `--operator` it runs as
+A preview writes nothing and is not compared with `--expect-database`, but it runs every other
+check the service makes. So a `resolve-*` preview **also needs `--evidence-verified`**: without
+it the evidence goes to the service as unverified and the preview is refused with
+`authoritative_evidence_required` (exit 3). Verify the evidence before you preview. Without `--operator` it runs as
 `dry-run-preview`; an exact replay is matched on the operator handle, so pass the same
 `--operator` you will apply with to preview exactly what will happen.
 

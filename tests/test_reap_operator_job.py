@@ -347,6 +347,11 @@ def test_the_runbook_invocation_matches_the_parser():
     assert "--apply --expect-env production" in section
     assert "--expect-database '{\"dialect\":\"postgres\"" in section
     assert "database_identity_mismatch" in section and "REAP_SANDBOX_HOSTS" in section
+    # A resolve-* preview needs the attestation too (the service refuses unverified evidence).
+    flat = " ".join(section.split())
+    assert "preview **also needs `--evidence-verified`**" in flat and "`authoritative_evidence_required` (exit 3)" in flat
+    doc = " ".join(op.__doc__.split())
+    assert "preview ALSO needs `--evidence-verified`" in doc and "`authoritative_evidence_required` (exit 3)" in doc
     parser = op.build_parser()
     subcommands = set(parser._subparsers._group_actions[0].choices)
     named = set(re.findall(r"`(list-[a-z-]+|resolve-[a-z]+|retire-[a-z]+)", section))

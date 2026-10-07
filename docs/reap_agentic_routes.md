@@ -547,8 +547,9 @@ if the poller is dark, or `completed` when an approval landed inside the last po
 * **`order_reference` appears only on `completed`.**
 * **`poll_after_seconds`** is the rail's interval for the current state, and `null` on a terminal
   state (`completed`, `failed`, `refused`, `expired`).
-* **`checkout_dispatch_state`** is always present (GET, list, `/recover`, `/resume`, and the
-  create `202` and its replays). It says what the durable record proves about a Reap checkout
+* **`checkout_dispatch_state`** is always present on a purchase (GET, list, `/recover`,
+  `/resume`, and the create `202` and its replays), except a retired attempt's `/recover` receipt,
+  which is not a purchase (see Recover a lost create response). It says what the durable record proves about a Reap checkout
   for this purchase (`db/reap_continuation.dispatch_state`), never more:
 
   | value | meaning |
@@ -888,11 +889,12 @@ There are **no webhooks on this rail**. The poll is the only way an outcome is e
 
 The canonical hash is identical to create: merchant domain, product/variant, quantity, normalized buyer email/address, resolved return URL, item source and optional offer code. Keep the exact original body and resolved return URL; a changed configured default after an omitted return URL safely causes a conflict. Consent version is validated but is not hashed or rewritten by recovery. Click context is not hashed.
 
-* `200`: the same redacted owner purchase view as GET-by-ID, including `checkout_dispatch_state` and `contact_reentry_required`.
+* `200`: normally the same redacted owner purchase view as GET-by-ID, including `checkout_dispatch_state` and `contact_reentry_required`. **Except** for an attempt an operator retired before it opened a purchase: then the body is only `{"recovery_status": "retired", "reconciliation_id": "<id>"}`, with no `checkout_dispatch_state`, no `contact_reentry_required` and no purchase fields. Branch on `recovery_status` first. A retired attempt opened no purchase and cannot continue; a new purchase needs new buyer intent and a fresh key.
 * `404 purchase_not_found`: unknown key, refusal tombstone, missing purchase or unowned purchase.
 * `409 idempotency_conflict`: a changed request or unverifiable stored fingerprint.
 * `400`: malformed original body or missing/invalid key; `401`: missing end-user identity.
-* `503 checkout_outcome_unknown`: the key mapping or retirement receipt could not be read. Retry recovery with the same body and key; never re-POST.
+* `503 checkout_outcome_unknown`: the retirement receipt could not be read, or the key's stored mapping is a refusal marker this server cannot interpret. Retry recovery with the same body and key; never re-POST.
+* `500`: any other database error (for example while reading the key mapping or the purchase). It says nothing about the outcome; retry recovery the same way, never re-POST.
 
 A failed recovery preserves uncertainty; it never authorizes a new payment attempt. Retry read-only recovery or escalate with the original key. On the enabled create route, a same-body replay still returns `202` for the existing purchase and follows the established consent update contract. Disabled create remains disabled; use recover for a read-only lookup. No schema migration is needed. Do not delete or overwrite the key mapping merely because 24 hours elapsed. Older application versions can still perform rollover, so replace all create handlers before relying on the lifetime guarantee.
 
@@ -913,8 +915,11 @@ checkout may already exist: keep polling, and never open a replacement.
 
 **Gates and authentication.** Same headers as create. The base rail, credentials, the create gate
 and (for a `cart_link` body) the cart-link gate must all be on, and the pilot scope must admit the
-purchase; otherwise `404 not_available_on_this_rail`, exactly like create. **While create is
-paused, resume is unavailable** and the re-entry window keeps running.
+purchase; otherwise `404 not_available_on_this_rail`, exactly like create. The rail and the create
+gate are checked first; the cart-link gate and the pilot scope are checked late, as part of the
+fresh admission, so a purchase can get a `409` (for example `terminal_purchase_not_resumable`)
+before their `404`. **While create is paused, resume is unavailable** and the re-entry window
+keeps running.
 
 **Request.** The **original create body, unchanged**: the same JSON that opened the purchase,
 including the same `idempotency_key`, the same buyer email and shipping address (the server
@@ -943,28 +948,33 @@ purchase:
 the current view and does **not** restart the contact clock. Concurrent re-entries have one
 winner; a loser that finds the winner's re-entry answers `200` with the same view. An accepted re-entry restarts the contact-retention cap
 (`REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS`), so a buyer who leaves it again can be paused again and
-resume again. A repeat after the purchase has moved on is answered by the checks below in order
-(for example `checkout_dispatch_unresolved` once a checkout create has started).
+resume again. A repeat after the purchase has moved on is answered by the first check below that
+fails (for example `checkout_dispatch_unresolved` once a checkout create has started). The table
+lists the refusals **in the order the handler checks them**; the first that applies is the answer.
 
 | status | `detail.error` | meaning | what the door should do |
 |---|---|---|---|
-| 404 | `not_available_on_this_rail` | rail dark or unconfigured, create gate off, pilot scope invalid or refusing this purchase, or a `cart_link` body with the cart-link lane off | show unavailable; keep polling `GET`. The re-entry window is still running |
+| 404 | `not_available_on_this_rail` | rail dark or unconfigured, or the create gate off | show unavailable; keep polling `GET`. The re-entry window is still running |
 | 401 | `agent_user_required` | no `X-Agent-User-JWT` | obtain the original buyer session |
 | 400 | `invalid_request` | the body is not JSON or does not validate as a create body, or an identifier is malformed | send the exact original body |
-| 400 | `consent_required` | `buyer.consent_version` is unusable, **or differs from the one the purchase was opened under** | send the original tag |
-| 400 | `invalid_address`, `invalid_offer_code` | the re-entered contact does not validate | send the exact original body |
-| 404 | `purchase_not_found` | the key is unknown for this agent and buyer, maps to another purchase, or the purchase is not theirs | do not create; check you hold the original key and buyer session |
+| 400 | `consent_required` | `buyer.consent_version` is unusable | send the original tag |
+| 400 | `invalid_offer_code`, `invalid_address` | the re-entered contact does not validate | send the exact original body |
 | 409 | `idempotency_conflict` | the key was used for a **different** body (a changed email, address, price pair, return url, offer code, ...) | send the exact original body |
 | 409 | `merchant_not_eligible`, `attempt_retired` | the key names a remembered refusal or a retired attempt, not a purchase | do not create; this attempt cannot continue |
+| 503 | `checkout_outcome_unknown` | the key's stored mapping is a refusal marker this server cannot interpret (a database error reading it is a `500`) | call `POST /purchases/recover` with the same body and key, never re-POST |
+| 404 | `purchase_not_found` | the key is unknown for this agent and buyer, maps to another purchase, or the purchase is not theirs | do not create; check you hold the original key and buyer session |
 | 409 | `terminal_purchase_not_resumable` | the purchase is `completed`, `failed`, `refused` or `expired` (including `contact_reentry_lapsed`) | show the outcome; a new purchase needs new buyer intent and a fresh key |
 | 409 | `checkout_dispatch_unresolved` | `checkout_dispatch_state` is not `not_dispatched`: a checkout create started, a checkout exists, or the purchase predates tracking | keep polling `GET`; never re-create |
-| 409 | `contact_reentry_not_required` | the contact was never erased (or the purchase is not in `resolving` / `needs_enrollment` / `quoting`) | keep polling `GET` |
+| 409 | `contact_reentry_not_required` | the contact was never erased (or the purchase is not in `resolving` / `needs_enrollment` / `quoting`). An already accepted re-entry answers `200` here instead | keep polling `GET` |
+| 400 | `consent_required` | `buyer.consent_version` **differs from the one the purchase was opened under** | send the original tag |
 | 409 | `buyer_unlinked` | the buyer's identity link no longer names this purchase's buyer reference (for example it was repointed by a hosted sign-in) | do not create; escalate |
-| 409 | `merchant_not_purchasable`, `merchant_disabled`, `merchant_not_eligible`, `row_*`, `seller_identity_unverified` | the fresh admission refused the same selection | show blocked; do not switch routes |
+| 409 | `merchant_not_purchasable` | fresh admission: the merchant is not purchasable in the buyer's market | show blocked; do not switch routes |
+| 404 | `not_available_on_this_rail` | fresh admission, `cart_link` body only: the cart-link lane is off | show unavailable; keep polling `GET` |
+| 409 | `merchant_disabled`, `merchant_not_eligible`, `row_*`, `seller_identity_unverified` | fresh admission refused the same selection (merchant, eligibility, catalog row or variant, cart-link storefront proof) | show blocked; do not switch routes |
 | 409 | `resume_selection_changed` | the catalog now resolves to a different selection than the purchase holds | show blocked; do not switch routes |
 | 409 | `price_changed` | the catalog unit price or currency differs from the purchase's | show the change; never resume or retry at another price |
+| 404 | `not_available_on_this_rail` | fresh admission, last: the pilot scope is invalid or refuses this purchase | show unavailable; keep polling `GET` |
 | 409 | `resume_raced` | the single conditional write lost: a worker holds the purchase, or its state, dispatch fence or contact revision changed in between, and no concurrent re-entry succeeded | wait `poll_after_seconds`, `GET`, and resume again only if it still says so |
-| 503 | `checkout_outcome_unknown` | the key's stored mapping is unreadable | call `POST /purchases/recover` with the same body and key, never re-POST |
 
 **If nobody resumes.** The purchase stays paused and visible to `GET`; nothing is quoted or
 dispatched. The re-entry window (`REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS`, default
