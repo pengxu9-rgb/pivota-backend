@@ -112,6 +112,30 @@ def test_the_documented_owner_views_carry_the_two_continuation_fields():
 # below is read from the ledger and the poller, so the page cannot state a dial, a default, a
 # bound, an anchor, a terminal code or a transition the code does not implement.
 
+def lapse_sql_facts(statements) -> dict:
+    """Read the lapse UPDATE's terminal code, transitions and clock out of its SQL text.
+
+    `anchor` is the column the window is measured from; `legacy_anchor` is the fallback a
+    COALESCE gives rows with no `anchor` (None when there is no fallback), and `legacy_states`
+    the states that fallback admits."""
+    codes, cases, anchors, legacy_states = set(), set(), set(), set()
+    for sql in statements:
+        head = sql.split("WHERE", 1)[0]  # the SET clause: the code the row is GIVEN
+        codes |= set(re.findall(r"last_error_code = '([a-z_]+)'", head))
+        cases.add(re.search(r"SET state = CASE WHEN state = '([a-z_]+)' THEN '([a-z_]+)' ELSE '([a-z_]+)' END",
+                            head).groups())
+        anchors |= set(re.findall(
+            r"AND (?:COALESCE\()?(?:p\.)?([a-z_]+)(?:, (?:p\.)?([a-z_]+)\))? < (?:clock_timestamp\(\) -|datetime\('now')",
+            sql))
+        for states in re.findall(r"OR \((?:p\.)?state IN \(([^)]*)\)", sql):
+            legacy_states.add(tuple(re.findall(r"'([a-z_]+)'", states)))
+    [code], [(special, special_to, other_to)], [(anchor, legacy_anchor)] = codes, cases, anchors
+    assert len(legacy_states) <= 1, legacy_states
+    return {"code": code, "special": (special, special_to), "other_to": other_to, "anchor": anchor,
+            "legacy_anchor": legacy_anchor or None,
+            "legacy_states": next(iter(legacy_states), ())}
+
+
 def lapse_facts():
     """What `ledger.lapse_contact_reentry` actually does, read out of its own SQL and the dial."""
     from db import reap_agentic_ledger as ledger
@@ -121,18 +145,21 @@ def lapse_facts():
     assert (dial.default, dial.minimum, dial.maximum) == (
         ledger.CONTACT_REENTRY_WINDOW_SECONDS_DEFAULT, ledger.CONTACT_REENTRY_WINDOW_SECONDS_MIN,
         ledger.CONTACT_REENTRY_WINDOW_SECONDS_MAX)
-    codes, cases, anchors = set(), set(), set()
-    for sql in (ledger._LAPSE_CONTACT_REENTRY_SQL, ledger._LAPSE_CONTACT_REENTRY_SQL_SQLITE):
-        codes |= set(re.findall(r"last_error_code = '([a-z_]+)'", sql))
-        cases.add(re.search(r"SET state = CASE WHEN state = '([a-z_]+)' THEN '([a-z_]+)' ELSE '([a-z_]+)' END",
-                            sql).groups())
-        anchors |= set(re.findall(r"AND (?:p\.)?([a-z_]+) < (?:clock_timestamp\(\) -|datetime\('now')", sql))
-    [code], [(special, special_to, other_to)], [anchor] = codes, cases, anchors
+    facts = lapse_sql_facts((ledger._LAPSE_CONTACT_REENTRY_SQL, ledger._LAPSE_CONTACT_REENTRY_SQL_SQLITE))
+    (special, special_to), other_to = facts["special"], facts["other_to"]
     transitions = {state: (special_to if state == special else other_to)
                    for state in ledger._LAPSE_CONTACT_REENTRY_SOURCE_STATES}
     assert transitions == {"needs_enrollment": "expired", "resolving": "failed", "quoting": "failed"}
-    assert code in poll.PollReport.__dataclass_fields__
-    return dial, code, anchor, transitions
+    assert facts["code"] in poll.PollReport.__dataclass_fields__
+    return dial, facts["code"], facts["anchor"], transitions
+
+
+def lapse_legacy():
+    """(fallback anchor, states it admits) for rows paused before `contact_purged_at`, or (None, ())."""
+    from db import reap_agentic_ledger as ledger
+
+    facts = lapse_sql_facts((ledger._LAPSE_CONTACT_REENTRY_SQL, ledger._LAPSE_CONTACT_REENTRY_SQL_SQLITE))
+    return facts["legacy_anchor"], facts["legacy_states"]
 
 
 def assert_states_the_window(text: str, *, where: str) -> None:

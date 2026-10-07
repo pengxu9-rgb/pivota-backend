@@ -985,7 +985,9 @@ contact was erased, not from creation. Once it has passed, the poller ends the p
 It never ends a purchase that has any dispatch evidence (a checkout create started and not
 proven not-created, a stored checkout or order, an observed checkout, or a `quoting` purchase
 that predates dispatch tracking), nor one a worker holds at that moment: those stay paused for
-the operator queue. An accepted resume clears `contact_purged_at`; if the buyer leaves again and
+the operator queue. A `resolving` / `needs_enrollment` purchase paused before dispatch tracking
+existed (migration 256), which has no `contact_purged_at`, is timed from when it entered its
+state instead; such a `quoting` purchase never lapses. An accepted resume clears `contact_purged_at`; if the buyer leaves again and
 the contact is erased again, a new window starts from that erasure. A lost `/resume` response is
 recovered by `GET`, not by a new purchase.
 

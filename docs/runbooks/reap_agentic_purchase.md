@@ -361,6 +361,15 @@ bad setting, it would be an exception out of a scheduled job on every tick.
 | `REAP_AGENTIC_ERROR_BACKOFF_SECONDS` | 120 | 1–3600 | how long a row waits after `advance` **raised**. Not the state machine's table — this is the path where it did not get to choose |
 | `REAP_AGENTIC_POLL_BUDGET_SECONDS` | 240 | 10–3600 | wall-clock budget. It stops the job **starting** work — a row already in flight finishes — so the run deadline is sized as budget + one whole step |
 
+**Claim timing.** The claim takes only rows whose `next_poll_at <= now`, never early. What moves
+is the schedule a row is released with: only the plain per-state cadence (a release with no
+explicit hold) is stored up to `min(interval/2, poller tick/2, 15)` seconds early
+(`services.reap_agentic_purchase.cadence_slack_seconds`), so a 30 s state is taken on the next tick
+instead of every other one. Every explicit hold is exact: Reap's `Retry-After`, transport backoff,
+the 120 s error backoff (`REAP_AGENTIC_ERROR_BACKOFF_SECONDS`), the 270 s hold after a definitive
+"checkout not created", the 900 s holds and the settling hold. The first look after a row enters a
+human-wait state still waits the full interval.
+
 ### How slow one step really is
 
 The `~40 s for quoting` figure that used to live here was inherited and is **wrong** for
@@ -2097,13 +2106,25 @@ How a row leaves the count:
    lapsed row is terminal, so it leaves `contact_retention_blocked`. It never touches a row with
    any dispatch evidence: a `checkout_dispatch_key`, a stored checkout or order id, an `observed`
    journal event, a `started` event without its own `not_created` receipt, or a `quoting` row
-   without version-1 dispatch tracking. Those stay in the count until case 3 settles them. A
-   legacy row marked only by `last_error_code = 'contact_retention_elapsed'` with no
-   `contact_purged_at` has no anchor and does not lapse either.
+   without version-1 dispatch tracking. Those stay in the count until case 3 settles them.
+   **Legacy rows** paused before migration 256 (no `contact_purged_at`, no dispatch tracking
+   version, `last_error_code = 'contact_retention_elapsed'`) have no purge time: in `resolving` /
+   `needs_enrollment` their window is timed from `state_entered_at` instead; a legacy `quoting`
+   row is never lapsed (its dispatch is unknown, so it stays in checkout needs human).
 3. **An operator resolves the dispatch.** A row whose `checkout_dispatch_state` is
    `dispatch_started` (or `unknown`, legacy) cannot be resumed: `/resume` answers
    `409 checkout_dispatch_unresolved`. In `quoting` it is also in `checkout_needs_human`; work it
    as a parked checkout create.
+
+**Why a Reap 503 burst raises this count.** After a definitive "checkout not created" answer
+(`503 CHECKOUT_TEMPORARILY_UNAVAILABLE`, `QUOTE_EXPIRED`) a `quoting` row waits at least 270 s
+before it re-quotes, so its dispatch comes later. The contact scrub fires
+`REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS` (default 900 s) after the contact was received, however
+long the row has been in its state. A burst of Reap 503s therefore makes contact-paused `quoting`
+rows more likely: they are `contact_retention_blocked`, wait for the owner's `/resume`, and lapse
+after `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` if nobody resumes. Its earlier dispatch was
+answered definitively "not created", so it is **not** dispatch uncertainty and does not
+belong in checkout needs human.
 
 Operator actions: usually none, because this is a buyer who has not come back yet. Pausing the
 create gate also pauses re-entry while the window keeps running, so a long create pause turns

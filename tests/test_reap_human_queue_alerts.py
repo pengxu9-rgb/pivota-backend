@@ -136,3 +136,18 @@ def test_contact_policy_and_runbook_state_the_window_the_code_runs():
         assert phrase in flat, phrase
     for source, target in transitions.items():
         assert f'`{source}` → `{target}`' in flat, (source, target)
+
+
+def test_the_runbook_states_the_legacy_lapse_the_code_runs():
+    # Rows paused before contact_purged_at existed: the ledger's COALESCE fallback, if it has one.
+    from test_reap_agentic_routes_doc import lapse_legacy
+    legacy_anchor, legacy_states = lapse_legacy()
+    section = RUNBOOK.read_text(encoding='utf-8').split('### Contact-paused purchases', 1)[1].split('\n### ', 1)[0]
+    flat = ' '.join(section.split())
+    if legacy_anchor is None:
+        return  # no fallback in this build: rows without contact_purged_at do not lapse
+    assert f'timed from `{legacy_anchor}`' in flat
+    for state in legacy_states:
+        assert f'`{state}`' in flat.split('**Legacy rows**', 1)[1].split('timed from', 1)[0], state
+    if 'quoting' not in legacy_states:
+        assert 'a legacy `quoting` row is never lapsed' in flat
