@@ -54,3 +54,57 @@ async def test_queue_diagnostic_unavailable_pages_error_never_fabricates_queue(s
     assert report.checkout_needs_human==-1 and report.errors==1
     assert not any(matches(_filter(source,'REAP_POLL_HUMAN_FILTER'),_entry(x)) for x in lines)
     assert any(matches(_filter(source,'REAP_POLL_FAILING_FILTER'),_entry(x)) for x in lines)
+
+
+# ── the policy text an operator reads when the queue pages ─────────────────────────────────────
+#
+# The contact policy used to say flags cannot restore contact and a "separately reviewed
+# procedure" was needed. That predates POST /purchases/{purchase_id}/resume: the owner restores
+# contact within the re-entry window, and an unresumed row lapses on its own. Pinned so the
+# operator text cannot drift back behind the code.
+
+from pathlib import Path
+
+RUNBOOK = Path(__file__).resolve().parents[1] / 'docs' / 'runbooks' / 'reap_agentic_purchase.md'
+
+
+def _runbook_headings():
+    import re
+    return {m.strip() for m in re.findall(r'^#{2,4} (.+)$', RUNBOOK.read_text(encoding='utf-8'), re.M)}
+
+
+@pytest.mark.parametrize('label,sections', [
+    ('checkout needs human reconciliation', ['Checkout reads requiring human reconciliation',
+                                             'Audited manual resolution of classified checkout uncertainty',
+                                             'Parked checkout create']),
+    ('buyer contact retention blocked', ['Contact-paused purchases']),
+])
+def test_queue_policy_names_runbook_sections_that_exist(label, sections):
+    content = reap_policies()['prod: Reap ' + label]['documentation']['content']
+    tail = content.split('Runbook: docs/runbooks/reap_agentic_purchase.md, ', 1)[1]
+    headings = _runbook_headings()
+    for section in sections:
+        assert section in tail, section
+        assert section in headings, section
+
+
+def test_contact_policy_describes_owner_resume_and_the_lapse_not_an_operator_procedure():
+    content = reap_policies()['prod: Reap buyer contact retention blocked']['documentation']['content']
+    for phrase in ('/purchases/{purchase_id}/resume', 'contact_reentry_required=true',
+                   'REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS', 'contact_reentry_lapsed',
+                   'needs_enrollment to expired', 'resolving or quoting to failed',
+                   'create gate', 'checkout needs human'):
+        assert phrase in content, phrase
+    for stale in ('Resuming flags cannot restore contact', 'reauthorization', 'independently reviewed'):
+        assert stale not in content, stale
+    runbook = RUNBOOK.read_text(encoding='utf-8')
+    assert 'separately reviewed recovery/contact-reauthorization procedure' not in runbook
+    assert 'Restoring buyer contact or restarting a blocked attempt requires separate' not in runbook
+
+
+def test_needs_human_policy_names_both_cohorts():
+    content = reap_policies()['prod: Reap checkout needs human reconciliation']['documentation']['content']
+    for phrase in ('Two cohorts', 'checkout_unresolvable', 'permanent checkout read failures',
+                   'parked checkout create', 'MAY EXIST', 'legacy quoting rows',
+                   'list_parked_dispatches', 'resolve_parked_dispatch', 'resolve_checkout_manually'):
+        assert phrase in content, phrase
