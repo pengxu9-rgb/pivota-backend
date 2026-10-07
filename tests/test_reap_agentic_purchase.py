@@ -926,7 +926,9 @@ async def test_quote_expired_on_the_checkout_create_releases_for_a_fresh_quote(
     assert result.outcome == "released"
     assert result.state == "quoting"
     assert result.last_error_code == "quote_expired"
-    assert result.next_poll_in_seconds == svc.POLL_INTERVALS["quoting"]
+    # Held past the quote idempotency bucket (not the 60 s quoting interval): a re-quote inside
+    # the bucket would replay the same quote id and park the row as needs-human work.
+    assert result.next_poll_in_seconds == svc.PROVIDER_NOT_CREATED_HOLD_S
     row = await _get(purchase_id)
     assert row["state"] == "quoting"
     assert row["last_error_code"] == "quote_expired"

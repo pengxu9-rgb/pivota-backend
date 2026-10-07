@@ -523,6 +523,21 @@ POLL_INTERVALS: Dict[str, int] = {
     "processing": 15,
 }
 
+#: The SHORTEST hold after Reap answered a checkout create with a definitive "not created"
+#: (503 CHECKOUT_TEMPORARILY_UNAVAILABLE, or QUOTE_EXPIRED on HTTP 400/409).
+#:
+#: That answer clears the dispatch fence, and the next step re-quotes. The quote's idempotency
+#: key is bucketed by `rc.QUOTE_IDEMPOTENCY_BUCKET_S` (240 s), so a re-quote inside the bucket
+#: gets the SAME quote id back -- and the same (quote, enrollment) pair maps to the same dispatch
+#: key, which already has a `started` event. `continuation.begin_dispatch` then (correctly)
+#: refuses to send it again, and the row parked as `checkout_dispatch_unresolved` needs-human work
+#: although Reap had said nothing was created. Waiting the whole bucket plus a margin makes the
+#: re-quote land in a later bucket, so it carries a NEW quote id and a new dispatch key.
+#:
+#: This only delays; it relaxes nothing. The fence still never sends a key twice, so if Reap
+#: ever replayed the old quote id anyway the row would park exactly as before.
+PROVIDER_NOT_CREATED_HOLD_S = rc.QUOTE_IDEMPOTENCY_BUCKET_S + 30
+
 #: A transport failure is not a schedule: it is an unknown. The state's own interval, DOUBLED on
 #: the first failure and doubled AGAIN for each consecutive one, capped at `MAX_BACKOFF_SECONDS`.
 #:
@@ -3985,7 +4000,7 @@ async def _checkout_from_quote(
         # Reap replayed the quote of a create that provably never left this process (its quote
         # key is time-bucketed). Wait out that bucket so the next step gets a new quote id.
         return await _hold(error_code="checkout_quote_replayed",
-                           seconds=rc.QUOTE_IDEMPOTENCY_BUCKET_S + 30)
+                           seconds=PROVIDER_NOT_CREATED_HOLD_S)
     if dispatch_key is None:
         return await _hold(error_code="checkout_dispatch_unresolved", seconds=900)
     amount_token = _WORKER_QUOTE_TOTAL.set(verdict.total_minor)
@@ -4061,17 +4076,19 @@ async def _checkout_from_quote(
                 # 503 CHECKOUT_TEMPORARILY_UNAVAILABLE (2026-09-28 spec): nothing was created. Same
                 # answer as an expired quote -- give the lease back, on Reap's Retry-After when it
                 # sent one, and let the next step re-quote -- never a terminal failure over a blip.
+                # Never sooner than `PROVIDER_NOT_CREATED_HOLD_S`: see its note.
                 wait = checkout.retry_after_seconds
-                return await _hold(
-                    error_code=_error_code(top),
-                    transport=wait is None, seconds=max(1, wait) if wait is not None else None,
-                )
+                seconds = (max(1, wait) if wait is not None
+                           else transport_backoff_seconds(str(row["state"]), row.get("attempts")))
+                return await _hold(error_code=_error_code(top),
+                                   seconds=max(seconds, PROVIDER_NOT_CREATED_HOLD_S))
             if "QUOTE_EXPIRED" in (detail, top):
                 # The partner's word for what the P2-9 pre-check above catches on our clock: the
                 # quote died between the quote and the create. Same answer as the pre-check -- give
                 # the lease back and let the next step re-resolve and re-quote -- rather than the
                 # generic branch below, which would END the purchase over a five-minute timer.
-                return await _hold(error_code="quote_expired")
+                # Held past the quote bucket for the same reason as the 503 above.
+                return await _hold(error_code="quote_expired", seconds=PROVIDER_NOT_CREATED_HOLD_S)
             if "ENROLLMENT_NOT_ACTIVE" in (detail, top):
                 # 'quoting' → 'needs_enrollment' is not a legal edge, so there is no way to send the
                 # buyer back to the card page on THIS purchase. Fail with the partner's own code; the
