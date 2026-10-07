@@ -1,0 +1,109 @@
+"""docs/reap_agentic_routes.md documents the re-entry contract the routes actually implement.
+
+The gateway codes against that page. These checks pin the parts that drifted once already:
+`POST /purchases/{purchase_id}/resume`, `contact_reentry_required`, `checkout_dispatch_state`,
+and the `503 checkout_outcome_unknown` instruction. They read the code's own vocabularies, so a
+new refusal or dispatch state the page does not name fails here instead of in a client.
+"""
+import ast
+import json
+import re
+from pathlib import Path
+
+import db.reap_continuation as continuation
+import routes.agent_commerce_reap as routes_reap
+
+ROOT = Path(__file__).resolve().parents[1]
+DOC = (ROOT / "docs" / "reap_agentic_routes.md").read_text(encoding="utf-8")
+ROUTE_SRC = (ROOT / "routes" / "agent_commerce_reap.py").read_text(encoding="utf-8")
+
+
+def _section(heading: str) -> str:
+    """From `heading` to the next heading of the same or a higher level."""
+    start = DOC.index(heading)
+    level = len(heading) - len(heading.lstrip("#"))
+    nxt = re.search(rf"^#{{1,{level}}} ", DOC[start + len(heading):], flags=re.M)
+    return DOC[start: start + len(heading) + (nxt.start() if nxt else len(DOC))]
+
+
+def _function_source(name: str) -> str:
+    tree = ast.parse(ROUTE_SRC)
+    node = next(n for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
+    return ast.get_source_segment(ROUTE_SRC, node)
+
+
+def _raised_reasons(name: str) -> set:
+    return set(re.findall(r'PurchaseRefused\(\s*"([a-z_]+)"', _function_source(name)))
+
+
+RESUME = _section("### Resume a contact-paused purchase")
+
+
+def test_the_resume_route_is_documented_with_its_path():
+    assert "@router.post(\"/purchases/{purchase_id}/resume\")" in ROUTE_SRC
+    assert "`POST /agent/v2/commerce/reap/purchases/{purchase_id}/resume`" in RESUME
+
+
+def test_every_refusal_the_resume_handler_raises_itself_is_in_its_table():
+    raised = _raised_reasons("resume_reap_purchase") | _raised_reasons("_validate_resume_selection")
+    # The create gate's private reason is answered as the public 404 (`_refused`).
+    raised.discard("create_disabled")
+    assert raised, "the parser found no refusals; the test is broken"
+    missing = sorted(r for r in raised if f"`{r}`" not in RESUME)
+    assert not missing, f"resume refusals missing from the contract page: {missing}"
+    for reason in raised:
+        status = routes_reap._REFUSAL_STATUS.get(reason, routes_reap._DEFAULT_REFUSAL_STATUS)
+        assert re.search(rf"^\| {status} \| [^\n]*`{reason}`", RESUME, flags=re.M), (reason, status)
+
+
+def test_resume_documents_its_binding_window_and_terminal_outcome():
+    for phrase in ("idempotency_key", "same agent and the same buyer", "`purchase_not_found`",
+                   "`price_changed`", "`consent_required`", "contact_reentry_lapsed",
+                   "REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS", "86400",
+                   "| 503 | `checkout_outcome_unknown` |"):
+        assert phrase in RESUME, phrase
+    assert "`needs_enrollment` → `expired`" in RESUME
+    assert "`quoting` → `failed`" in RESUME
+
+
+def test_every_dispatch_state_value_is_documented_and_no_other():
+    values = set(re.findall(r"return '([a-z_]+)'", ast.get_source_segment(
+        Path(continuation.__file__).read_text(encoding="utf-8"),
+        next(n for n in ast.walk(ast.parse(Path(continuation.__file__).read_text(encoding="utf-8")))
+             if isinstance(n, ast.FunctionDef) and n.name == "dispatch_state"))))
+    assert values == {"dispatched", "dispatch_started", "not_dispatched", "unknown"}
+    rules = _section("### Field rules the door must not guess at")
+    documented = set(re.findall(r"^  \| `([a-z_]+)` \|", rules, flags=re.M))
+    assert documented == values
+    assert "**`contact_reentry_required`**" in rules
+    assert "contact_reentry_lapsed" in rules
+
+
+def test_the_create_refusal_table_says_recover_never_repost_on_503():
+    create = _section("## `POST /agent/v2/commerce/reap/purchases`")
+    row = next(line for line in create.splitlines() if line.startswith("| 503 | `checkout_outcome_unknown`"))
+    assert "POST /purchases/recover" in row and "same body and key" in row and "never re-POST" in row
+
+
+def test_the_documented_202_bodies_carry_exactly_the_keys_the_route_returns():
+    create = _section("### Response — `202 Accepted`")
+    bodies = [json.loads(block) for block in re.findall(r"```json\n(.*?)\n```", create, flags=re.S)]
+    variant, cart = bodies[0], bodies[1]
+    # The same key sets tests/test_reap_contact_resume.py pins against the live route.
+    assert list(variant) == ["purchase_id", "status", "poll_after_seconds",
+                             "checkout_dispatch_state", "contact_reentry_required"]
+    assert list(cart) == list(variant) + ["variant_title"]
+    accepted = _function_source("start_reap_purchase")
+    for key in variant:
+        assert f'"{key}"' in accepted, key
+
+
+def test_the_documented_owner_views_carry_the_two_continuation_fields():
+    get = _section("## `GET /agent/v2/commerce/reap/purchases/{purchase_id}`")
+    views = [json.loads(block) for block in re.findall(r"```json\n(\{\n  \"id\".*?)\n```", get, flags=re.S)]
+    assert len(views) == 3
+    for view in views:
+        assert list(view)[-2:] == ["checkout_dispatch_state", "contact_reentry_required"]
+        assert view["contact_reentry_required"] is False
+    assert [v["checkout_dispatch_state"] for v in views] == ["not_dispatched", "dispatched", "dispatched"]
