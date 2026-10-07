@@ -575,7 +575,10 @@ if the poller is dark, or `completed` when an approval landed inside the last po
   erased the contact) and carries no dispatch evidence of any kind is ended by the poller with
   `last_error_code: "contact_reentry_lapsed"`: `needs_enrollment` → `expired`,
   `resolving` → `failed`, `quoting` → `failed`. An accepted resume clears `contact_purged_at`, so
-  a purchase paused again later starts a new window from its new erasure.
+  a purchase paused again later starts a new window from its new erasure. A purchase whose contact
+  was erased while its checkout create was unresolved does not lapse while it stays unresolved;
+  when an operator confirms that create was never made (`confirmed_not_created`),
+  `contact_purged_at` restarts at that moment, so the buyer gets a full window from then.
 * **`refusal_reason`** (on `refused`) is our vocabulary, sometimes carrying the resolver's own
   reason verbatim (e.g. `options:sole_label_differs:size`). Diagnostic, not an enum to branch on.
 * **`consent_version` / `consented_at`** (migration **233**) are the tag your door sent as
@@ -988,7 +991,10 @@ that predates dispatch tracking), nor one a worker holds at that moment: those s
 the operator queue. A `resolving` / `needs_enrollment` purchase paused before dispatch tracking
 existed (migration 256), which has no `contact_purged_at`, is timed from when it entered its
 state instead; such a `quoting` purchase never lapses. An accepted resume clears `contact_purged_at`; if the buyer leaves again and
-the contact is erased again, a new window starts from that erasure. A lost `/resume` response is
+the contact is erased again, a new window starts from that erasure. A purchase erased while its
+checkout create was unresolved (`dispatch_started`) is not lapsed while it stays unresolved; an
+operator's `confirmed_not_created` restarts `contact_purged_at` at that moment, so the buyer's full
+window runs from then and `/resume` is still required. A lost `/resume` response is
 recovered by `GET`, not by a new purchase.
 
 

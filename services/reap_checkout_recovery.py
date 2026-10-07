@@ -415,7 +415,7 @@ async def resolve_parked_dispatch(purchase_id: str, *, dispatch_key: str, outcom
                 raise ManualResolutionRefused("transition_fence_lost")
             released = await ledger.release_claim(purchase_id, holder)
         else:
-            cleared = await database.fetch_one(continuation._CLEAR_NEGATIVE, {"id": purchase_id, "worker": holder,
+            cleared = await database.fetch_one(continuation._CLEAR_NEGATIVE if IS_POSTGRES else continuation._CLEAR_NEGATIVE_SQLITE, {"id": purchase_id, "worker": holder,
                 "key": dispatch_key, "claimed_at": ledger._bind_dt(fenced.get("claimed_at"))})
             if cleared is None:
                 raise ManualResolutionRefused("release_fence_lost")

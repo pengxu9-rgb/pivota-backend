@@ -280,6 +280,70 @@ def test_reentry_dial_matches_the_ledger_bounds():
     assert (dial.default, dial.minimum, dial.maximum) == (86400, 3600, 604800)
 
 
+async def _parked_then_purged(client):
+    """A quoting row parked on an unanswered create, whose contact the scrub erases while parked."""
+    from db.database import IS_POSTGRES
+    from db import reap_continuation as continuation
+    from services.reap_checkout_recovery import dispatch_settle_seconds
+    await continuation.ensure_continuation_schema()  # the operator's audit table (257) is not in this gate's list
+    await _seed_all()
+    body = _body(idempotency_key='parked-then-purged')
+    response = await client.post(BASE + '/purchases', json=body)
+    assert response.status_code == 202, response.text
+    pid, key = response.json()['purchase_id'], 'a' * 64
+    ago = "clock_timestamp()-INTERVAL '{} seconds'" if IS_POSTGRES else "datetime('now','-{} seconds')"
+    sent = "timezone('UTC', now())-INTERVAL '{} seconds'" if IS_POSTGRES else "datetime('now','-{} seconds')"
+    await database.execute(f"UPDATE reap_agentic_purchases SET state='quoting', checkout_dispatch_key=:key, "
+                           f"last_error_code='checkout_dispatch_unresolved', created_at={ago.format(4 * _DAY)} "
+                           f"WHERE id=:id", {'id': pid, 'key': key})
+    await database.execute("INSERT INTO reap_checkout_dispatch_events (purchase_id,dispatch_key,event_type,quote_id,"
+                           f"enrollment_id,recorded_at) VALUES (:id,:key,'started','q_fixture','e_fixture',"
+                           f"{sent.format(dispatch_settle_seconds() + 3600)})", {'id': pid, 'key': key})
+    assert await ledger.scrub_reconciling_purchase_pii() == [pid]
+    row = await ledger.get_purchase_internal(pid)
+    assert row['contact_purged_at'] is not None and row['last_error_code'] == 'checkout_dispatch_unresolved'
+    return pid, key, body
+
+
+async def _shift_purge(pid, seconds):
+    from db.database import IS_POSTGRES
+    expr = (f"contact_purged_at-INTERVAL '{int(seconds)} seconds'" if IS_POSTGRES
+            else f"datetime(contact_purged_at,'-{int(seconds)} seconds')")
+    await database.execute(f'UPDATE reap_agentic_purchases SET contact_purged_at={expr} WHERE id=:id', {'id': pid})
+
+
+async def test_an_operator_not_created_restarts_the_reentry_window_of_a_row_purged_while_parked(client):
+    """Reviewer's scenario: parked, scrubbed while parked, released by an operator days later. The
+    release must not hand the buyer an already-spent window; it restarts at the un-park."""
+    from datetime import datetime, timezone
+    from services.reap_checkout_recovery import resolve_parked_dispatch
+    pid, key, body = await _parked_then_purged(client)
+    parked = await client.post(BASE + f'/purchases/{pid}/resume', json=body)
+    assert parked.status_code == 409 and _error(parked) == 'checkout_dispatch_unresolved'
+    await _age_purge(pid, 3 * _DAY)
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == []
+    row = await ledger.get_purchase_internal(pid)
+    evidence = {'source': 'verified_reap_support_statement', 'authoritative_verified': True,
+                'reference': 'reap_support_case_1', 'observed_at': datetime.now(timezone.utc),
+                'provider_base_url': 'https://sandbox.api.reap.global'}
+    result = await resolve_parked_dispatch(pid, dispatch_key=key, outcome='confirmed_not_created', evidence=evidence,
+                                           operator_ref='operator_test', expected_updated_at=row['updated_at'],
+                                           dry_run=False)
+    assert result['status'] == 'resolved'
+    released = await ledger.get_purchase_internal(pid)
+    assert released['state'] == 'quoting' and released['checkout_dispatch_key'] is None
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == []
+    assert released['contact_purged_at'] is not None and released['contact_purged_at'] > row['contact_purged_at']
+    assert (await client.get(BASE + f'/purchases/{pid}')).json()['contact_reentry_required'] is True
+    await _shift_purge(pid, _DAY - 60)
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == []
+    assert (await ledger.get_purchase_internal(pid))['state'] == 'quoting'
+    await _shift_purge(pid, 120)
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == [pid]
+    row = await ledger.get_purchase_internal(pid)
+    assert row['state'] == 'failed' and row['last_error_code'] == 'contact_reentry_lapsed'
+
+
 # -- the lapse's post-lock re-check, across two connections ------------------------------------
 #
 # The candidate subquery is materialised before the UPDATE waits on a row lock, so only the

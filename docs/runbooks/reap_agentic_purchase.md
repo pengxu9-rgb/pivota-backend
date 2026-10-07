@@ -354,7 +354,7 @@ bad setting, it would be an exception out of a scheduled job on every tick.
 | `REAP_AGENTIC_LEASE_SECONDS` | 300 | **180**–3600 | what `requeue_stale_claims` measures against. The floor is 180, not the ledger's 30: a lease shorter than one step gets a LIVE worker's row requeued underneath it, and both workers then call the partner |
 | `REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` | 3600 | 60–2592000 | abandoned enrollment/local-hosted expiry bound; not the contact-retention cap |
 | `REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS` | 900 | 60–3600 | independent creation-age contact cap; live leases defer cleanup |
-| `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` | 86400 | 3600–604800 | how long a contact-paused `resolving`/`needs_enrollment`/`quoting` row waits for the owner's `/resume`, **measured from `contact_purged_at`** (when the scrub erased the contact; `/resume` clears it, so a later pause starts a new window). Past it, `lapse_contact_reentry` ends it (`needs_enrollment`→`expired`, `resolving`/`quoting`→`failed`) with `contact_reentry_lapsed`, every tick, rail on or off; counted as `contact_reentry_lapsed` on `PollReport`. Never touches a claimed row or a row with any dispatch evidence: a dispatch key, a checkout or order id, an `observed` journal event, a `started` event without its `not_created` receipt, or a `quoting` row without version-1 dispatch tracking |
+| `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` | 86400 | 3600–604800 | how long a contact-paused `resolving`/`needs_enrollment`/`quoting` row waits for the owner's `/resume`, **measured from `contact_purged_at`** (when the scrub erased the contact; `/resume` clears it, so a later pause starts a new window; an operator's `confirmed_not_created` on a row erased while parked restarts it at the un-park). Past it, `lapse_contact_reentry` ends it (`needs_enrollment`→`expired`, `resolving`/`quoting`→`failed`) with `contact_reentry_lapsed`, every tick, rail on or off; counted as `contact_reentry_lapsed` on `PollReport`. Never touches a claimed row or a row with any dispatch evidence: a dispatch key, a checkout or order id, an `observed` journal event, a `started` event without its `not_created` receipt, or a `quoting` row without version-1 dispatch tracking |
 | `REAP_AGENTIC_RECONCILE_ENABLED` | 1 | truthy allowlist | off stops all new provider calls while maintenance continues |
 | `REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS` | 180 | 0–3600 | how long past `hosted_url_expires_at` the sweep leaves a **`needs_enrollment`** row alone (Reap flips ACTIVE at/after the link dies); also how long `resolving` holds instead of retiring a pending enrollment. `awaiting_approval` never gets it. 0 = Reap's exact expiry. Read by `services.reap_agentic_purchase.enrollment_grace_seconds()` — ONE reader, which the job calls — not a job dial |
 | `REAP_AGENTIC_MAX_ATTEMPTS` | 50 | 1–10000 | attempts ceiling. `attempts` counts **claims**, and only in `resolving`/`quoting`/`processing` |
@@ -2038,7 +2038,8 @@ HTTP route, agent tool or buyer path, and neither calls Reap. Operators run them
      code becomes `checkout_dispatch_not_created`, and the row is due now. The normal flow then
      resumes. It re-quotes, and the new quote is a new dispatch key. The old quote/enrollment
      pair never dispatches again. Contact retention, attempts and flags apply as usual and may
-     end the purchase. This outcome is refused when the journal holds an observed checkout.
+     end the purchase. A row whose contact was erased while parked stays contact-paused, and its
+     re-entry window restarts now (`contact_purged_at` is set to the un-park time). This outcome is refused when the journal holds an observed checkout.
    - Not sure: do nothing. The row stays parked and visible.
 5. **Preview, then apply.** First call `resolve_parked_dispatch(purchase_id,
    dispatch_key=..., outcome=..., evidence={...}, operator_ref=..., expected_updated_at=<listing
@@ -2099,7 +2100,9 @@ How a row leaves the count:
 2. **The re-entry window lapses.** `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` (default
    86400, 24 h; bounds 3600–604800) is **measured from `contact_purged_at`**, the moment the scrub
    erased the contact. `/resume` clears `contact_purged_at`, so a row paused again later starts a
-   new window from the new erasure. Once the window has passed, `ledger.lapse_contact_reentry`
+   new window from the new erasure. A row erased while parked on a dispatch key (case 3) is not
+   lapsed while parked; an operator's `confirmed_not_created` restarts `contact_purged_at` at the
+   un-park, so the buyer's full window runs from then. Once the window has passed, `ledger.lapse_contact_reentry`
    (every poller tick, rail on or off) ends an unclaimed row with
    `last_error_code = 'contact_reentry_lapsed'`: `needs_enrollment` → `expired`, `resolving` →
    `failed`, `quoting` → `failed`. `PollReport` counts them as `contact_reentry_lapsed`, and a
@@ -2114,7 +2117,9 @@ How a row leaves the count:
 3. **An operator resolves the dispatch.** A row whose `checkout_dispatch_state` is
    `dispatch_started` (or `unknown`, legacy) cannot be resumed: `/resume` answers
    `409 checkout_dispatch_unresolved`. In `quoting` it is also in `checkout_needs_human`; work it
-   as a parked checkout create.
+   as a parked checkout create. `confirmed_not_created` on such a row clears the key and restarts
+   `contact_purged_at` at that moment: the buyer gets a full re-entry window from the un-park (not
+   from the old erasure, which would lapse it on the next tick) and still needs `/resume`.
 
 **Why a Reap 503 burst raises this count.** After a definitive "checkout not created" answer
 (`503 CHECKOUT_TEMPORARILY_UNAVAILABLE`, `QUOTE_EXPIRED`) a `quoting` row waits at least 270 s
