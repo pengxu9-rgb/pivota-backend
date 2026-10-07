@@ -16,7 +16,11 @@ websockets   # for WebSocket support
 aiohttp      # for async HTTP requests in admin routes
 email-validator  # for email validation in auth routes
 supabase>=2.0.0  # for Supabase integration
-asyncpg      # for PostgreSQL async connections (Supabase)
+# PINNED 2026-10-07: asyncpg 0.32.0 (PyPI 2026-10-06 20:30Z) changed connection cancel/terminate internals;
+# the Postgres dialect gate's deadline tests (test_transaction_end_is_bounded_postgres,
+# test_scheduler_zombie_connection_terminate_postgres) fail on it. 0.31.0 is what production runs.
+# Move only with those two tests green on the new version.
+asyncpg==0.31.0  # for PostgreSQL async connections (Supabase)
 psycopg2-binary  # for PostgreSQL synchronous connections (Supabase)
 python-multipart  # for form data handling
 pypdf>=4.0  # lab-report (PDF) text extraction for evidence intake (pure-Python)
