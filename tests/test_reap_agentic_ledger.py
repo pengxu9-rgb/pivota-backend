@@ -906,7 +906,7 @@ async def test_the_candidate_select_does_not_offer_already_claimed_rows():
         if IS_POSTGRES
         else ledger._SELECT_DUE_PURCHASES_SQL_SQLITE
     )
-    offered = {r["id"] for r in await database.fetch_all(sql, {"limit": 50, "reconciliation_only": 0, "pilot_scope": None, **({"due_within_seconds": 0} if IS_POSTGRES else {"due_within_window": "+0 seconds"})})}
+    offered = {r["id"] for r in await database.fetch_all(sql, {"limit": 50, "reconciliation_only": 0, "pilot_scope": None})}
     assert free["id"] in offered
     assert held["id"] not in offered, (
         "a row somebody already holds must not be offered as a candidate — the claim would "
@@ -4724,54 +4724,28 @@ async def test_the_reentry_lapse_only_takes_legal_terminal_edges_and_guards_at_t
             target = "expired" if src == "needs_enrollment" else "failed"
             assert target in ledger.ALLOWED_TRANSITIONS[src], (name, src)
         inner = sql[sql.index("SELECT p.id FROM reap_agentic_purchases p"):]
+        outer = sql[:sql.index("AND id IN (")]
         assert ledger._states_in(inner, "WHERE p.state IN (") == sources, name
-        for guard in ("claimed_by IS NULL", "checkout_dispatch_key IS NULL", "reap_checkout_id IS NULL",
-                      "reap_order_id IS NULL", "dispatch_tracking_version = 1"):
-            assert sql.count(guard) == 2, (name, guard)
-# ── the claim lookahead (`due_within_seconds`) ───────────────────────────────────────────────
-#
-# `next_poll_at` is stamped at release as `release + interval`; a poller ticking every interval
-# lands a hair short of it, so a 30 s state was only taken on every OTHER tick (~60 s). The
-# poller now passes half its interval as a lookahead. Bounded: never earlier than that.
-
-
-def _in_seconds(seconds: int) -> str:
-    if IS_POSTGRES:
-        return f"clock_timestamp() + INTERVAL '{int(seconds)} seconds'"
-    return f"datetime('now', '+{int(seconds)} seconds')"
-
-
-async def test_a_row_due_within_the_lookahead_is_claimed_and_not_without_it():
-    purchase = await _mk(state="awaiting_approval")
-    await _set_clock_column(purchase["id"], "next_poll_at", _in_seconds(8))
-    assert await ledger.claim_due_purchases("worker_a", limit=5) == []
-    assert await ledger.claim_due_purchases("worker_a", limit=5, due_within_seconds=0) == []
-    claimed = await ledger.claim_due_purchases("worker_a", limit=5, due_within_seconds=15)
-    assert [c["id"] for c in claimed] == [purchase["id"]]
-
-
-@pytest.mark.parametrize("ahead", [60, 120, 600])
-async def test_the_lookahead_never_claims_a_row_further_out_than_itself(ahead):
-    """A hold (an error backoff, Retry-After, the re-quote bucket wait) is shortened by at most the
-    lookahead and never skipped."""
-    purchase = await _mk(state="quoting")
-    await _set_clock_column(purchase["id"], "next_poll_at", _in_seconds(ahead))
-    assert await ledger.claim_due_purchases("worker_a", limit=5, due_within_seconds=15) == []
-    assert (await ledger.get_purchase_internal(purchase["id"]))["attempts"] == 0
-
-
-async def test_truly_due_rows_are_taken_before_lookahead_rows():
-    soon = await _mk(state="awaiting_approval")
-    due = await _mk(state="awaiting_approval", buyer_ref="bref_due")
-    await _set_clock_column(soon["id"], "next_poll_at", _in_seconds(10))
-    await _set_clock_column(due["id"], "next_poll_at", _PAST)
-    claimed = await ledger.claim_due_purchases("worker_a", limit=1, due_within_seconds=15)
-    assert [c["id"] for c in claimed] == [due["id"]]
-
-
-@pytest.mark.parametrize("bad", [-1, ledger.CLAIM_DUE_WITHIN_SECONDS_MAX + 1, True, 1.5, "15", None])
-async def test_the_lookahead_is_a_strict_bounded_int(bad):
-    await _make_due()
-    with pytest.raises(ValueError):
-        await ledger.claim_due_purchases("worker_a", limit=5, due_within_seconds=bad)
-    assert (await ledger.claim_due_purchases("worker_b", limit=5))[0]["claimed_by"] == "worker_b"
+        window = ("datetime('now', :window)" if name.endswith("_SQLITE")
+                  else "clock_timestamp() - (:window_seconds * INTERVAL '1 second')")
+        # The OUTER copy of every guard is the post-lock re-check: it is what keeps a row that a
+        # concurrent resume, dispatch or claim changed while this UPDATE waited on its lock from
+        # being lapsed (tests/test_reap_contact_resume_postgres.py races each one). The inner copy
+        # selects the candidates. Both must be present, separately.
+        for guard in ("{a}claimed_by IS NULL", "{a}checkout_dispatch_key IS NULL", "{a}reap_checkout_id IS NULL",
+                      "{a}reap_order_id IS NULL", "({a}state <> 'quoting' OR {a}dispatch_tracking_version = 1)",
+                      "({a}contact_purged_at IS NOT NULL",
+                      "OR ({a}state IN ('resolving', 'needs_enrollment')",
+                      "{a}contact_purged_at IS NULL AND {a}dispatch_tracking_version IS NULL",
+                      "{a}last_error_code = 'contact_retention_elapsed'))",
+                      f"COALESCE({{a}}contact_purged_at, {{a}}state_entered_at) < {window}"):
+            assert guard.format(a="") in outer, (name, guard)
+            assert guard.format(a="p.") in inner, (name, guard)
+        # The journal exclusions are in BOTH places too: in the outer re-check, and in the
+        # candidate subquery so a row they exclude cannot fill the LIMIT batch and starve rows
+        # behind it.
+        for ref, part in (("reap_agentic_purchases.id", outer), ("p.id", inner)):
+            for journal in (f"o.purchase_id = {ref} AND o.event_type = 'observed'",
+                            f"s.purchase_id = {ref} AND s.event_type = 'started'"):
+                assert journal in part, (name, journal)
+        assert inner.count("n.event_type = 'not_created'") == 1, name

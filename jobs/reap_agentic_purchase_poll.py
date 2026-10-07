@@ -382,18 +382,6 @@ def job_interval_seconds() -> int:
     return _env_int(DIALS["poll_interval_seconds"])
 
 
-def claim_lookahead_seconds() -> int:
-    """How far ahead of `next_poll_at` a row counts as due for this job: HALF the job interval.
-
-    `next_poll_at` is stamped at RELEASE as `release + interval`, and the next tick lands about one
-    interval later, a little short of it, so a 30 s state used to be taken on every OTHER 30 s
-    tick. Half an interval of lookahead takes it on the tick nearest its time. It never claims a
-    row more than this before its `next_poll_at`, so a backoff hold is shortened by at most this
-    much (see `ledger.claim_due_purchases`).
-    """
-    return min(job_interval_seconds() // 2, ledger.CLAIM_DUE_WITHIN_SECONDS_MAX)
-
-
 # ── the report ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -895,7 +883,6 @@ async def run_reap_agentic_purchase_poll(
         # Include acquisition in cleanup: cancellation may land after a partial batch claim.
         rows = await ledger.claim_due_purchases(
             worker, limit=claim_batch, pilot_scope=purchase_svc.pilot_admission_scope(),
-            due_within_seconds=claim_lookahead_seconds(),
             **({"reconciliation_only": True} if reconciliation_only else {})
         )
         counts["claimed"] = len(rows)

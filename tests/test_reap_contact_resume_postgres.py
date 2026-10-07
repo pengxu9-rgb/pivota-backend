@@ -278,3 +278,143 @@ def test_reentry_dial_matches_the_ledger_bounds():
     dial = job.DIALS['contact_reentry_window_seconds']
     assert dial.env == 'REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS'
     assert (dial.default, dial.minimum, dial.maximum) == (86400, 3600, 604800)
+
+
+# -- the lapse's post-lock re-check, across two connections ------------------------------------
+#
+# The candidate subquery is materialised before the UPDATE waits on a row lock, so only the
+# OUTER copy of each guard can see what a concurrent writer committed in the meantime. Each case
+# holds the row lock on a second connection with a write the lapse must respect, starts the lapse
+# (it blocks), commits, and checks the row was NOT lapsed.
+
+import re as _re
+
+
+def _positional(sql):
+    names = []
+
+    def _sub(match):
+        if match.group(1) not in names:
+            names.append(match.group(1))
+        return f'${names.index(match.group(1)) + 1}'
+    return _re.sub(r'(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)', _sub, sql), names
+
+
+async def _raw():
+    import asyncpg
+    import os
+    return await asyncpg.connect(os.environ['DATABASE_URL'])
+
+
+async def _wait_until_blocked(probe):
+    for _ in range(200):
+        waiting = await probe.fetchval(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+            "AND wait_event_type = 'Lock' AND query ILIKE '%contact_reentry_lapsed%'")
+        if waiting:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError('the lapse never blocked on the row lock')
+
+
+@pytest.mark.parametrize('writer', ['resume', 'dispatch_key', 'checkout_id', 'order_id', 'claimed'])
+async def test_a_concurrent_writer_holding_the_row_wins_over_the_lapse(client, writer):
+    from db import reap_continuation as continuation
+    pid, body = await _paused(client)
+    await _age_purge(pid, 2 * 3600)
+    row = await ledger.get_purchase_internal(pid)
+    holder, probe = await _raw(), await _raw()
+    try:
+        tx = holder.transaction()
+        await tx.start()
+        if writer == 'resume':
+            key = await database.fetch_one(
+                'SELECT idempotency_key, request_hash FROM reap_agentic_purchase_keys WHERE purchase_id=:id', {'id': pid})
+            sql, names = _positional(continuation._RESTORE)
+            values = {'id': pid, 'agent': row['agent_id'], 'owner': row['agent_user_ref_hash'],
+                      'state': row['state'], 'revision': row['contact_revision'],
+                      'request_key': key['idempotency_key'], 'request_hash': key['request_hash'],
+                      'email': 'buyer@example.test', 'address': '{"line1": "1 Test Way"}', 'offer': None}
+            assert await holder.fetchrow(sql, *[values[n] for n in names]) is not None
+        else:
+            column, value = {'dispatch_key': ('checkout_dispatch_key', 'k-racing'),
+                             'checkout_id': ('reap_checkout_id', 'chk_racing'),
+                             'order_id': ('reap_order_id', 'ord_racing'),
+                             'claimed': ('claimed_by', 'racing-worker')}[writer]
+            await holder.execute(f'UPDATE reap_agentic_purchases SET {column}=$1 WHERE id=$2', value, pid)
+        lapse = asyncio.create_task(ledger.lapse_contact_reentry(window_seconds=3600))
+        await _wait_until_blocked(probe)
+        await tx.commit()
+        assert await asyncio.wait_for(lapse, 10) == []
+    finally:
+        await holder.close()
+        await probe.close()
+    after = await ledger.get_purchase_internal(pid)
+    assert after['state'] == 'resolving' and after['terminal_at'] is None
+    assert after['last_error_code'] != 'contact_reentry_lapsed'
+    if writer == 'resume':
+        assert after['contact_purged_at'] is None and after['contact_revision'] == 1
+
+
+# -- legacy (pre-migration-256) paused rows: no contact_purged_at, no tracking version ---------
+
+
+async def _legacy_paused(client, state, entered_ago):
+    from db.database import IS_POSTGRES
+    pid, _ = await _paused(client)
+    expr = (f"clock_timestamp()-INTERVAL '{int(entered_ago)} seconds'" if IS_POSTGRES
+            else f"datetime('now','-{int(entered_ago)} seconds')")
+    await database.execute(
+        f'UPDATE reap_agentic_purchases SET state=:s, contact_purged_at=NULL, dispatch_tracking_version=NULL, '
+        f'state_entered_at={expr} WHERE id=:id', {'s': state, 'id': pid})
+    row = await ledger.get_purchase_internal(pid)
+    assert row['last_error_code'] == 'contact_retention_elapsed' and row['contact_purged_at'] is None
+    return pid
+
+
+@pytest.mark.parametrize('state,terminal', [('resolving', 'failed'), ('needs_enrollment', 'expired')])
+async def test_a_legacy_paused_row_lapses_on_its_state_clock(client, state, terminal):
+    pid = await _legacy_paused(client, state, _DAY + 60)
+    assert await ledger.count_contact_retention_blocked() == 1
+    # A claim and release (every poll) bumps updated_at and must not move the anchor.
+    await database.execute("UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id", {'id': pid})
+    assert [r['id'] for r in await ledger.claim_due_purchases('legacy-poll')] == [pid]
+    assert await ledger.release_claim(pid, 'legacy-poll') is not None
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == [pid]
+    row = await ledger.get_purchase_internal(pid)
+    assert row['state'] == terminal and row['last_error_code'] == 'contact_reentry_lapsed'
+    assert await ledger.count_contact_retention_blocked() == 0
+
+
+async def test_a_legacy_paused_row_inside_the_window_is_untouched(client):
+    pid = await _legacy_paused(client, 'resolving', _DAY - 600)
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == []
+    assert (await ledger.get_purchase_internal(pid))['state'] == 'resolving'
+
+
+@pytest.mark.parametrize('variant', ['legacy_quoting', 'versioned_without_purge', 'other_code'])
+async def test_the_legacy_branch_takes_nothing_else(client, variant):
+    pid = await _legacy_paused(client, 'quoting' if variant == 'legacy_quoting' else 'resolving', 30 * _DAY)
+    if variant == 'versioned_without_purge':
+        await database.execute('UPDATE reap_agentic_purchases SET dispatch_tracking_version=1 WHERE id=:id', {'id': pid})
+    if variant == 'other_code':
+        await database.execute("UPDATE reap_agentic_purchases SET last_error_code='transport_error:readtimeout' WHERE id=:id", {'id': pid})
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == []
+    assert (await ledger.get_purchase_internal(pid))['terminal_at'] is None
+
+
+@pytest.mark.parametrize('evidence', ['observed', 'started_unanswered'])
+async def test_an_excluded_row_cannot_starve_the_lapse_batch(client, evidence):
+    """The journal exclusions are in the candidate subquery too, so an older row they exclude does
+    not take the only LIMIT slot and leave an eligible row behind it for ever."""
+    blocked, _ = await _paused(client)
+    eligible, _ = await _paused_again(client)
+    await database.execute("UPDATE reap_agentic_purchases SET state='quoting' WHERE id=:id", {'id': blocked})
+    await _journal(blocked, 'k-blocked', 'started')
+    if evidence == 'observed':
+        await _journal(blocked, 'k-blocked', 'not_created', code='CHECKOUT_TEMPORARILY_UNAVAILABLE')
+        await _journal(blocked, 'k-blocked', 'observed', checkout='chk_late')
+    await _age_purge(blocked, 3 * _DAY)
+    await _age_purge(eligible, 2 * _DAY)
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY, limit=1) == [eligible]
+    assert (await ledger.get_purchase_internal(blocked))['state'] == 'quoting'
