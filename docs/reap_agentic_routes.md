@@ -570,9 +570,11 @@ if the poller is dark, or `completed` when an approval landed inside the last po
   `awaiting_approval` / `processing`, whose contact is erased by the same sweep but which need
   nothing more from the buyer than the approval link. A contact-paused purchase that is not
   re-entered within the re-entry window (`REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS`, default
-  86400 = 24 h) and has no dispatched checkout is ended by the poller with
-  `last_error_code: "contact_reentry_lapsed"`: `needs_enrollment` becomes `expired`,
-  `resolving` / `quoting` become `failed`.
+  86400 = 24 h, settable 3600–604800, **measured from `contact_purged_at`**, the moment the sweep
+  erased the contact) and carries no dispatch evidence of any kind is ended by the poller with
+  `last_error_code: "contact_reentry_lapsed"`: `needs_enrollment` → `expired`,
+  `resolving` → `failed`, `quoting` → `failed`. An accepted resume clears `contact_purged_at`, so
+  a purchase paused again later starts a new window from its new erasure.
 * **`refusal_reason`** (on `refused`) is our vocabulary, sometimes carrying the resolver's own
   reason verbatim (e.g. `options:sole_label_differs:size`). Diagnostic, not an enum to branch on.
 * **`consent_version` / `consented_at`** (migration **233**) are the tag your door sent as
@@ -965,11 +967,17 @@ resume again. A repeat after the purchase has moved on is answered by the checks
 | 503 | `checkout_outcome_unknown` | the key's stored mapping is unreadable | call `POST /purchases/recover` with the same body and key, never re-POST |
 
 **If nobody resumes.** The purchase stays paused and visible to `GET`; nothing is quoted or
-dispatched. After the re-entry window (`REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS`, default
-86400 = 24 h) a contact-paused purchase with no dispatched checkout is ended by the poller with
-`last_error_code: "contact_reentry_lapsed"` (`needs_enrollment` → `expired`, `resolving` /
-`quoting` → `failed`), and `/resume` then answers `409 terminal_purchase_not_resumable`. A lost
-`/resume` response is recovered by `GET`, not by a new purchase.
+dispatched. The re-entry window (`REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS`, default
+86400 = 24 h, settable 3600–604800) is **measured from `contact_purged_at`**, the moment the
+contact was erased, not from creation. Once it has passed, the poller ends the purchase with
+`last_error_code: "contact_reentry_lapsed"` (`needs_enrollment` → `expired`, `resolving` →
+`failed`, `quoting` → `failed`), and `/resume` then answers `409 terminal_purchase_not_resumable`.
+It never ends a purchase that has any dispatch evidence (a checkout create started and not
+proven not-created, a stored checkout or order, an observed checkout, or a `quoting` purchase
+that predates dispatch tracking), nor one a worker holds at that moment: those stay paused for
+the operator queue. An accepted resume clears `contact_purged_at`; if the buyer leaves again and
+the contact is erased again, a new window starts from that erasure. A lost `/resume` response is
+recovered by `GET`, not by a new purchase.
 
 
 

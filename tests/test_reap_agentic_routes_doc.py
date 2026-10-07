@@ -57,14 +57,12 @@ def test_every_refusal_the_resume_handler_raises_itself_is_in_its_table():
         assert re.search(rf"^\| {status} \| [^\n]*`{reason}`", RESUME, flags=re.M), (reason, status)
 
 
-def test_resume_documents_its_binding_window_and_terminal_outcome():
+def test_resume_documents_its_binding_and_the_503():
+    # The window and its terminal outcome are pinned to the code below
+    # (test_the_resume_section_states_the_window_the_code_runs).
     for phrase in ("idempotency_key", "same agent and the same buyer", "`purchase_not_found`",
-                   "`price_changed`", "`consent_required`", "contact_reentry_lapsed",
-                   "REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS", "86400",
-                   "| 503 | `checkout_outcome_unknown` |"):
+                   "`price_changed`", "`consent_required`", "| 503 | `checkout_outcome_unknown` |"):
         assert phrase in RESUME, phrase
-    assert "`needs_enrollment` → `expired`" in RESUME
-    assert "`quoting` → `failed`" in RESUME
 
 
 def test_every_dispatch_state_value_is_documented_and_no_other():
@@ -77,7 +75,6 @@ def test_every_dispatch_state_value_is_documented_and_no_other():
     documented = set(re.findall(r"^  \| `([a-z_]+)` \|", rules, flags=re.M))
     assert documented == values
     assert "**`contact_reentry_required`**" in rules
-    assert "contact_reentry_lapsed" in rules
 
 
 def test_the_create_refusal_table_says_recover_never_repost_on_503():
@@ -107,3 +104,55 @@ def test_the_documented_owner_views_carry_the_two_continuation_fields():
         assert list(view)[-2:] == ["checkout_dispatch_state", "contact_reentry_required"]
         assert view["contact_reentry_required"] is False
     assert [v["checkout_dispatch_state"] for v in views] == ["not_dispatched", "dispatched", "dispatched"]
+
+
+# ── the re-entry window, pinned to the CODE that runs it ──────────────────────────────────────
+#
+# The page once stated the window and its terminal code before the sweep existed. Every value
+# below is read from the ledger and the poller, so the page cannot state a dial, a default, a
+# bound, an anchor, a terminal code or a transition the code does not implement.
+
+def lapse_facts():
+    """What `ledger.lapse_contact_reentry` actually does, read out of its own SQL and the dial."""
+    from db import reap_agentic_ledger as ledger
+    from jobs import reap_agentic_purchase_poll as poll
+
+    dial = poll.DIALS["contact_reentry_window_seconds"]
+    assert (dial.default, dial.minimum, dial.maximum) == (
+        ledger.CONTACT_REENTRY_WINDOW_SECONDS_DEFAULT, ledger.CONTACT_REENTRY_WINDOW_SECONDS_MIN,
+        ledger.CONTACT_REENTRY_WINDOW_SECONDS_MAX)
+    codes, cases, anchors = set(), set(), set()
+    for sql in (ledger._LAPSE_CONTACT_REENTRY_SQL, ledger._LAPSE_CONTACT_REENTRY_SQL_SQLITE):
+        codes |= set(re.findall(r"last_error_code = '([a-z_]+)'", sql))
+        cases.add(re.search(r"SET state = CASE WHEN state = '([a-z_]+)' THEN '([a-z_]+)' ELSE '([a-z_]+)' END",
+                            sql).groups())
+        anchors |= set(re.findall(r"AND (?:p\.)?([a-z_]+) < (?:clock_timestamp\(\) -|datetime\('now')", sql))
+    [code], [(special, special_to, other_to)], [anchor] = codes, cases, anchors
+    transitions = {state: (special_to if state == special else other_to)
+                   for state in ledger._LAPSE_CONTACT_REENTRY_SOURCE_STATES}
+    assert transitions == {"needs_enrollment": "expired", "resolving": "failed", "quoting": "failed"}
+    assert code in poll.PollReport.__dataclass_fields__
+    return dial, code, anchor, transitions
+
+
+def assert_states_the_window(text: str, *, where: str) -> None:
+    dial, code, anchor, transitions = lapse_facts()
+    text = " ".join(text.split())
+    for phrase in (f"`{dial.env}`", f"default {dial.default}", f"{dial.minimum}–{dial.maximum}",
+                   f"measured from `{anchor}`", "dispatch evidence"):
+        assert phrase in text, (where, phrase)
+    assert f'last_error_code: "{code}"' in text, (where, code)
+    for source, target in transitions.items():
+        assert f"`{source}` → `{target}`" in text, (where, source, target)
+
+
+def test_the_field_rule_states_the_window_the_code_runs():
+    rules = _section("### Field rules the door must not guess at")
+    bullet = rules.split("* **`contact_reentry_required`**", 1)[1].split("\n* ", 1)[0]
+    assert_states_the_window(bullet, where="field rules")
+
+
+def test_the_resume_section_states_the_window_the_code_runs():
+    lapse = RESUME.split("**If nobody resumes.**", 1)[1]
+    assert_states_the_window(lapse, where="resume")
+    assert "terminal_purchase_not_resumable" in lapse

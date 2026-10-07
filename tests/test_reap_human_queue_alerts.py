@@ -109,3 +109,29 @@ def test_needs_human_policy_names_both_cohorts():
                    'list_parked_dispatches', 'resolve_parked_dispatch', 'resolve_checkout_manually',
                    'python -m jobs.reap_operator', 'list-needs-human', 'resolve-parked', 'resolve-checkout'):
         assert phrase in content, phrase
+
+
+def test_contact_policy_and_runbook_state_the_window_the_code_runs():
+    # Every value from the code: the poller's dial (name, default, bounds), the lapse sweep's
+    # anchor column, terminal code and transitions, and the PollReport field.
+    from test_reap_agentic_routes_doc import lapse_facts
+    dial, code, anchor, transitions = lapse_facts()
+    content = reap_policies()['prod: Reap buyer contact retention blocked']['documentation']['content']
+    for phrase in (dial.env, f'default {dial.default}', f'measured from {anchor}', code,
+                   'no dispatch evidence'):
+        assert phrase in content, phrase
+    for target in sorted(set(transitions.values())):
+        sources = ' or '.join(s for s, t in transitions.items() if t == target)
+        assert f'{sources} to {target}' in content, (sources, target)
+    runbook = RUNBOOK.read_text(encoding='utf-8')
+    row = next(line for line in runbook.splitlines() if line.startswith(f'| `{dial.env}` |'))
+    cells = [c.strip() for c in row.strip('|').split('|')]
+    assert cells[1] == str(dial.default) and cells[2] == f'{dial.minimum}–{dial.maximum}', cells[:3]
+    assert f'measured from `{anchor}`' in cells[3] and f'`{code}`' in cells[3] and 'PollReport' in cells[3]
+    section = runbook.split('### Contact-paused purchases', 1)[1].split('\n### ', 1)[0]
+    flat = ' '.join(section.split())
+    for phrase in (f'`{dial.env}`', f'default {dial.default}', f'{dial.minimum}–{dial.maximum}',
+                   f'measured from `{anchor}`', f"'{code}'", 'PollReport', 'dispatch evidence'):
+        assert phrase in flat, phrase
+    for source, target in transitions.items():
+        assert f'`{source}` → `{target}`' in flat, (source, target)

@@ -354,7 +354,7 @@ bad setting, it would be an exception out of a scheduled job on every tick.
 | `REAP_AGENTIC_LEASE_SECONDS` | 300 | **180**–3600 | what `requeue_stale_claims` measures against. The floor is 180, not the ledger's 30: a lease shorter than one step gets a LIVE worker's row requeued underneath it, and both workers then call the partner |
 | `REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` | 3600 | 60–2592000 | abandoned enrollment/local-hosted expiry bound; not the contact-retention cap |
 | `REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS` | 900 | 60–3600 | independent creation-age contact cap; live leases defer cleanup |
-| `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` | 86400 | 3600–604800 | how long a contact-paused `resolving`/`needs_enrollment`/`quoting` row (contact scrubbed, no checkout dispatched) waits for the owner's `/resume`, measured from `contact_purged_at`. Past it, `lapse_contact_reentry` ends it (`needs_enrollment`→`expired`, otherwise `failed`) with `contact_reentry_lapsed`, every tick, rail on or off; counted as `contact_reentry_lapsed` on `PollReport`. Never touches a row with any dispatch evidence or a live lease |
+| `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` | 86400 | 3600–604800 | how long a contact-paused `resolving`/`needs_enrollment`/`quoting` row waits for the owner's `/resume`, **measured from `contact_purged_at`** (when the scrub erased the contact; `/resume` clears it, so a later pause starts a new window). Past it, `lapse_contact_reentry` ends it (`needs_enrollment`→`expired`, `resolving`/`quoting`→`failed`) with `contact_reentry_lapsed`, every tick, rail on or off; counted as `contact_reentry_lapsed` on `PollReport`. Never touches a claimed row or a row with any dispatch evidence: a dispatch key, a checkout or order id, an `observed` journal event, a `started` event without its `not_created` receipt, or a `quoting` row without version-1 dispatch tracking |
 | `REAP_AGENTIC_RECONCILE_ENABLED` | 1 | truthy allowlist | off stops all new provider calls while maintenance continues |
 | `REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS` | 180 | 0–3600 | how long past `hosted_url_expires_at` the sweep leaves a **`needs_enrollment`** row alone (Reap flips ACTIVE at/after the link dies); also how long `resolving` holds instead of retiring a pending enrollment. `awaiting_approval` never gets it. 0 = Reap's exact expiry. Read by `services.reap_agentic_purchase.enrollment_grace_seconds()` — ONE reader, which the job calls — not a job dial |
 | `REAP_AGENTIC_MAX_ATTEMPTS` | 50 | 1–10000 | attempts ceiling. `attempts` counts **claims**, and only in `resolving`/`quoting`/`processing` |
@@ -797,7 +797,8 @@ cleanup preserves quote/amount/currency/checkout/order/consent/attribution evide
 declares a payment outcome. Only the buyer's own agent restores contact, through
 `POST /agent/v2/commerce/reap/purchases/{purchase_id}/resume` with the identical original request,
 within the re-entry window. After `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` (default 86400,
-24 h) the poller ends an unresumed row with no dispatched checkout as `contact_reentry_lapsed`.
+24 h; 3600–604800), measured from `contact_purged_at`, the poller ends an unresumed row that has
+no dispatch evidence as `contact_reentry_lapsed`.
 This worker never refills PII or creates a replacement. See Contact-paused purchases.
 
 #### The order to disarm in — an operator rule
@@ -1860,7 +1861,7 @@ Only checkout-backed `awaiting_approval`/`processing` rows explicitly classified
 
 Migration 253 and both startup self-heal dialects create `reap_checkout_manual_resolution_audit`. It stores one decision per purchase: checkout, original state/version, terminal status, operator/evidence handles, verified source, observed time/origin and normalized evidence SHA256. It stores no full provider body or buyer contact. The audit append, conditional terminal decision, terminal lease clearing, click claim and attribution edge call share one short database transaction; unexpected failures or suppression roll back that unit. A deterministic existing merchant-channel click claim is legitimate: completion keeps `attribution_closed_by_other_channel`, preserves that claim, writes no Reap edge, and audits `attribution_outcome=closed_by_other_channel`. Other completions audit `edge_closed` only after rereading the durable attribution edge and checking exact merchant, external and synthetic order, amount/currency, click/agent, converted source/state and the purchase/checkout partner provenance. A synthesized close receipt after `ON CONFLICT DO NOTHING` is insufficient: a missing edge or conflicting existing order slot rolls back the terminal outcome and audit without overwriting the edge. Failed/expired decisions audit `not_applicable`. Ancillary commerce event/interaction emission retains its existing best-effort semantics and requires a separate receipt check; this primitive does not promise those receipts exist. Exact-evidence replay is read-only and cannot create another audit or edge. Do not delete the audit table when rolling back runtime code; removing this function leaves classified rows safely unresolved.
 
-`contact_retention_blocked` is a separate owner/operator queue, covering privacy-held resolving, needs_enrollment and quoting work. Resuming flags does not restore discarded contact or mint another checkout. The owner restores it with `/resume` within the re-entry window; after the window an unresumed row with no dispatched checkout lapses automatically (`contact_reentry_lapsed`). A row whose dispatch is unresolved cannot be resumed and is worked through the needs-human queue (Parked checkout create); there is no blind retry. See Contact-paused purchases. `checkout_needs_human` is a separate payment uncertainty queue. The original three metrics match heartbeat, ordinary stuck and errors only; the dedicated queue alerts below cover these two cohorts. Before arming, install and verify them in the selected environment with an explicitly owned recipient. No cloud policy is created or enabled by source merge.
+`contact_retention_blocked` is a separate owner/operator queue, covering privacy-held resolving, needs_enrollment and quoting work. Resuming flags does not restore discarded contact or mint another checkout. The owner restores it with `/resume` within the re-entry window; once the window (measured from `contact_purged_at`) has passed, an unresumed row with no dispatch evidence lapses automatically (`contact_reentry_lapsed`). A row whose dispatch is unresolved cannot be resumed and is worked through the needs-human queue (Parked checkout create); there is no blind retry. See Contact-paused purchases. `checkout_needs_human` is a separate payment uncertainty queue. The original three metrics match heartbeat, ordinary stuck and errors only; the dedicated queue alerts below cover these two cohorts. Before arming, install and verify them in the selected environment with an explicitly owned recipient. No cloud policy is created or enabled by source merge.
 
 
 ### Running the operator decisions
@@ -2051,10 +2052,19 @@ How a row leaves the count:
    selection at the same price. One conditional write restores the contact, increments
    `contact_revision`, clears `last_error_code`, restarts the contact cap and makes the row due now.
    Same purchase id, click, enrollment, key; nothing is created.
-2. **The re-entry window lapses.** After `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` (default
-   86400, 24 h) without a re-entry, the poller ends a row with no dispatched checkout with
-   `last_error_code = 'contact_reentry_lapsed'`: `needs_enrollment` becomes `expired`,
-   `resolving` / `quoting` become `failed`.
+2. **The re-entry window lapses.** `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` (default
+   86400, 24 h; bounds 3600–604800) is **measured from `contact_purged_at`**, the moment the scrub
+   erased the contact. `/resume` clears `contact_purged_at`, so a row paused again later starts a
+   new window from the new erasure. Once the window has passed, `ledger.lapse_contact_reentry`
+   (every poller tick, rail on or off) ends an unclaimed row with
+   `last_error_code = 'contact_reentry_lapsed'`: `needs_enrollment` → `expired`, `resolving` →
+   `failed`, `quoting` → `failed`. `PollReport` counts them as `contact_reentry_lapsed`, and a
+   lapsed row is terminal, so it leaves `contact_retention_blocked`. It never touches a row with
+   any dispatch evidence: a `checkout_dispatch_key`, a stored checkout or order id, an `observed`
+   journal event, a `started` event without its own `not_created` receipt, or a `quoting` row
+   without version-1 dispatch tracking. Those stay in the count until case 3 settles them. A
+   legacy row marked only by `last_error_code = 'contact_retention_elapsed'` with no
+   `contact_purged_at` has no anchor and does not lapse either.
 3. **An operator resolves the dispatch.** A row whose `checkout_dispatch_state` is
    `dispatch_started` (or `unknown`, legacy) cannot be resumed: `/resume` answers
    `409 checkout_dispatch_unresolved`. In `quoting` it is also in `checkout_needs_human`; work it
@@ -2080,7 +2090,8 @@ Source merge does not install or activate cloud policies. Before activation, ins
 chosen environment, read back exact filters and recipient, and confirm actual delivery.
 Do not automatically retry, recreate a checkout, or restore scrubbed contact to clear an alert.
 Queue clearing must follow the authenticated evidence and audit requirements above. The contact
-queue clears on its own, by owner `/resume` or by the re-entry window lapsing (Contact-paused
+queue mostly clears on its own, by owner `/resume` or by the re-entry window lapsing; a row with
+dispatch evidence never lapses and is worked as checkout needs human (Contact-paused
 purchases); expect it to open whenever a buyer leaves a purchase for longer than the contact cap. The
 needs-human count also includes parked checkout creates (`quoting` with a dispatch key, or
 legacy rows with no tracking version). For those, see Parked checkout create. The policy's text
