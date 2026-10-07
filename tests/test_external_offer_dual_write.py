@@ -391,3 +391,29 @@ async def test_absent_is_re_asked_on_an_interval_and_present_is_final(monkeypatc
     clock[0] += 10 * mod.PRICE_CHECK_RECHECK_SECONDS
     assert await mod.price_check_column_present() is True
     assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value,called", [(None, True), ("1", True), ("0", False), ("false", False), ("Off", False)])
+async def test_variant_offer_projection_follows_its_switch(monkeypatch, value, called):
+    """CATALOG_VARIANT_OFFER_PROJECTION_ENABLED gates this call site too. Default ON (the
+    behaviour before the switch existed); 0/false/off skip the projection and nothing else."""
+    from unittest.mock import AsyncMock
+    from services import catalog_variant_offer_projection as projection
+
+    if value is None:
+        monkeypatch.delenv("CATALOG_VARIANT_OFFER_PROJECTION_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("CATALOG_VARIANT_OFFER_PROJECTION_ENABLED", value)
+    project = AsyncMock(return_value={"inserted": 0, "planned": 0, "skips": {}})
+    monkeypatch.setattr(projection, "project_missing_variant_offers", project)
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK,
+        {"id": "s1", "external_product_id": "ext1", "price_amount": 12.0,
+         "snapshot_variants": [{"variant_id": "677289689108"}]},
+        merchant_id=_REAL_SELLER,
+    )
+    assert len(fake.executed) == 1  # the canonical offer is written either way
+    assert project.await_count == (1 if called else 0)

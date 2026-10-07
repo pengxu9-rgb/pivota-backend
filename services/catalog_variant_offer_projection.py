@@ -10,6 +10,7 @@ import collections
 import hashlib
 import json
 import math
+import os
 import re
 from urllib.parse import urlsplit
 
@@ -23,6 +24,18 @@ from services.seller_identity import resolve_seed_seller_identity
 
 SOURCE = "variant_offer_projection_v1"
 MIRROR = "external_product_seeds_mirror_v1"
+
+#: The kill switch for the two automatic callers of `project_missing_variant_offers` (the variant
+#: promoter and the external-offer dual write). DEFAULT ON, which is what production ran before
+#: the switch existed; only "0", "false" or "off" (any case) turn it off. Read on every call, so
+#: an operator can stop the projection without a deploy. Direct callers (repair scripts, tests)
+#: are not gated: they asked for the projection by name.
+PROJECTION_ENABLED_ENV = "CATALOG_VARIANT_OFFER_PROJECTION_ENABLED"
+_PROJECTION_OFF = frozenset({"0", "false", "off"})
+
+
+def projection_enabled() -> bool:
+    return os.getenv(PROJECTION_ENABLED_ENV, "").strip().lower() not in _PROJECTION_OFF
 PRODUCT_SQL = """
 SELECT product_key, merchant_id, source_product_id, source_domain, source_ref, brand
 FROM catalog_products
