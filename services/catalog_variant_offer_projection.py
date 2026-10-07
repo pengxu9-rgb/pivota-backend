@@ -9,6 +9,7 @@ from __future__ import annotations
 import collections
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -22,20 +23,38 @@ from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 from services.offer_seller_identity import normalize_host
 from services.seller_identity import resolve_seed_seller_identity
 
+logger = logging.getLogger(__name__)
+
 SOURCE = "variant_offer_projection_v1"
 MIRROR = "external_product_seeds_mirror_v1"
 
 #: The kill switch for the two automatic callers of `project_missing_variant_offers` (the variant
 #: promoter and the external-offer dual write). DEFAULT ON, which is what production ran before
-#: the switch existed; only "0", "false" or "off" (any case) turn it off. Read on every call, so
-#: an operator can stop the projection without a deploy. Direct callers (repair scripts, tests)
-#: are not gated: they asked for the projection by name.
+#: the switch existed. Parsed like the repo's `_env_bool` (services/payment_routing_service.py,
+#: services/product_query_service.py): "0", "false", "no", "off" (any case, surrounding space
+#: ignored) turn it off; unset, empty, "1", "true", "yes", "on" leave it on. Any OTHER value also
+#: leaves it on, as before, but says so in one WARNING per value per process, because a switch
+#: someone set that silently does nothing is a debugging session. Read on every call, so an
+#: operator can stop the projection without a deploy. Direct callers (repair scripts, tests) are
+#: not gated: they asked for the projection by name.
 PROJECTION_ENABLED_ENV = "CATALOG_VARIANT_OFFER_PROJECTION_ENABLED"
-_PROJECTION_OFF = frozenset({"0", "false", "off"})
+_PROJECTION_OFF = frozenset({"0", "false", "no", "off"})
+_PROJECTION_ON = frozenset({"", "1", "true", "yes", "on"})
+_WARNED_VALUES: set = set()
 
 
 def projection_enabled() -> bool:
-    return os.getenv(PROJECTION_ENABLED_ENV, "").strip().lower() not in _PROJECTION_OFF
+    raw = (os.getenv(PROJECTION_ENABLED_ENV) or "").strip().lower()
+    if raw in _PROJECTION_OFF:
+        return False
+    if raw not in _PROJECTION_ON and raw not in _WARNED_VALUES:
+        _WARNED_VALUES.add(raw)
+        logger.warning(
+            "%s=%r is not a recognised switch value (off: 0/false/no/off; on: 1/true/yes/on); "
+            "treating it as ON, the default",
+            PROJECTION_ENABLED_ENV, raw[:32],
+        )
+    return True
 PRODUCT_SQL = """
 SELECT product_key, merchant_id, source_product_id, source_domain, source_ref, brand
 FROM catalog_products

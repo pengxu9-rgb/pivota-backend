@@ -605,7 +605,7 @@ def _mirror_group(monkeypatch, project):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("value", ["0", "false", "OFF", " off "])
+@pytest.mark.parametrize("value", ["0", "false", "OFF", " off ", "no", "NO"])
 async def test_projection_switched_off_is_never_called(monkeypatch, value) -> None:
     from unittest.mock import AsyncMock
 

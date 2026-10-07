@@ -26,7 +26,7 @@ catalog_skus row per real variant. After this:
 For external-seed mirrors, successful SKU writes also project missing variant offers
 from the active attached seed. Existing offers are preserved and checkout readiness
 is never inferred from this projection. CATALOG_VARIANT_OFFER_PROJECTION_ENABLED=0
-(or false/off) skips it; a projection error is contained in the projection's own
+(or false/no/off) skips it; a projection error is contained in the projection's own
 savepoint, logged, and never rolls back the group's SKU writes or stops the run.
 
 What this service does NOT do:

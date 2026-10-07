@@ -394,10 +394,12 @@ async def test_absent_is_re_asked_on_an_interval_and_present_is_final(monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("value,called", [(None, True), ("1", True), ("0", False), ("false", False), ("Off", False)])
+@pytest.mark.parametrize("value,called", [(None, True), ("1", True), ("0", False), ("false", False), ("Off", False),
+                                          ("no", False), ("maybe", True)])
 async def test_variant_offer_projection_follows_its_switch(monkeypatch, value, called):
     """CATALOG_VARIANT_OFFER_PROJECTION_ENABLED gates this call site too. Default ON (the
-    behaviour before the switch existed); 0/false/off skip the projection and nothing else."""
+    behaviour before the switch existed); 0/false/no/off skip the projection and nothing else;
+    an unrecognised value stays on (with a WARNING)."""
     from unittest.mock import AsyncMock
     from services import catalog_variant_offer_projection as projection
 

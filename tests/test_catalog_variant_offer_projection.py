@@ -1,6 +1,8 @@
 import copy
 import json
+import logging
 import pytest
+from services import catalog_variant_offer_projection as _projection
 from services.catalog_variant_offer_projection import plan_offers, variants_from_seed, own_availability, seed_scope
 
 P = {
@@ -200,3 +202,42 @@ def test_missing_seller_ref_requires_matching_observed_seller_identity():
     seed = {"domain": "brand.example", "market": "US", "destination_url": "https://brand.example/products/x"}
     assert seed_scope(product, seed)
     assert seed_scope(product, dict(seed, seed_data={"snapshot": {"brand": "Another"}})) is None
+
+
+# ── CATALOG_VARIANT_OFFER_PROJECTION_ENABLED: the repo's _env_bool vocabulary, default ON ──────
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "NO", " No ", "FALSE", " off "])
+def test_projection_switch_off_values(monkeypatch, caplog, value):
+    monkeypatch.setenv(_projection.PROJECTION_ENABLED_ENV, value)
+    with caplog.at_level(logging.WARNING, logger=_projection.logger.name):
+        assert _projection.projection_enabled() is False
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("value", [None, "", "  ", "1", "true", "yes", "on", "YES", " On "])
+def test_projection_switch_on_values_are_silent(monkeypatch, caplog, value):
+    if value is None:
+        monkeypatch.delenv(_projection.PROJECTION_ENABLED_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_projection.PROJECTION_ENABLED_ENV, value)
+    with caplog.at_level(logging.WARNING, logger=_projection.logger.name):
+        assert _projection.projection_enabled() is True
+    assert not caplog.records
+
+
+def test_an_unrecognised_switch_value_stays_on_and_warns_once(monkeypatch, caplog):
+    monkeypatch.setattr(_projection, "_WARNED_VALUES", set())
+    monkeypatch.setenv(_projection.PROJECTION_ENABLED_ENV, "disabled")
+    with caplog.at_level(logging.WARNING, logger=_projection.logger.name):
+        assert _projection.projection_enabled() is True
+        assert _projection.projection_enabled() is True
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    message = record.getMessage()
+    assert _projection.PROJECTION_ENABLED_ENV in message and "'disabled'" in message and "ON" in message
+    caplog.clear()
+    monkeypatch.setenv(_projection.PROJECTION_ENABLED_ENV, "enabled")
+    with caplog.at_level(logging.WARNING, logger=_projection.logger.name):
+        assert _projection.projection_enabled() is True
+    assert len(caplog.records) == 1 and "'enabled'" in caplog.records[0].getMessage()
