@@ -1911,8 +1911,21 @@ Evidence arguments (`resolve-checkout`, `resolve-parked`): `--evidence-source`
 (`authenticated_reap_checkout_read` | `verified_reap_support_statement`), `--evidence-reference`,
 `--evidence-observed-at` (ISO-8601 with offset), `--provider-base-url` (must equal the job's
 `REAP_API_BASE_URL`), `--expected-updated-at` (the list's `updated_at`, verbatim), and
-`--evidence-payload-json` (the authenticated checkout read as one JSON object; required for
-`resolve-checkout`). `resolve-parked` adds `--dispatch-key`, `--outcome` and, only for
+`--evidence-payload-json` (required for `resolve-checkout`; for `resolve-parked` with an
+authenticated read).
+
+**`--evidence-payload-json` is NOT the checkout read.** Job arguments are written into the Cloud
+Run job spec and from there into Cloud Audit Logs, and a full checkout read carries
+`nextAction.url` (the buyer's hosted payment page) and can carry buyer data. Copy only the keys
+the services read, as one JSON object: `id`, `status`, and for a `COMPLETED` checkout `orderId`
+plus `finalAmount` (or `amount`) as `{"amount": ..., "currency": "..."}`; for `resolve-parked`
+`checkout_found`, `id` and `quoteId`. For example
+`{"id":"chk_...","status":"COMPLETED","orderId":"ord_...","finalAmount":{"amount":45.00,"currency":"USD"}}`.
+The command refuses any other key, or any other key inside the money object (exit 2, naming the
+key, never echoing its value): never a URL, `nextAction`, email, name, address or card detail.
+Keep the full read in the support record that `--evidence-reference` names.
+
+`resolve-parked` adds `--dispatch-key`, `--outcome` and, only for
 `checkout_found` with no journal id, `--checkout-id`. `retire-unopened` takes `--agent-id`,
 `--owner-hash`, `--native-key`, `--cart-key`, `--native-request-hash`, `--cart-request-hash`,
 `--expected-database-json` and `--provenance-json` (its `checked_at` must be within 5 minutes).

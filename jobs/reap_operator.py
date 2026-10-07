@@ -53,6 +53,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional
@@ -131,6 +132,47 @@ def _json_object(text: str) -> Dict[str, Any]:
     return value
 
 
+#: The ONLY keys `--evidence-payload-json` may carry: the ones the services read
+#: (services/reap_checkout_recovery.py: `_evidence` reads id, status, orderId and
+#: finalAmount / amount; `_bound_payload` reads id and quoteId), and inside a money object only
+#: `amount` and `currency` (`services.reap_agentic_purchase._money`). Arguments of a one-off job
+#: land in its Cloud Run job spec and so in Cloud Audit Logs, and a full checkout read carries
+#: `nextAction.url` (the buyer's hosted payment page) and may carry buyer data, so anything else
+#: is refused rather than passed through and ignored.
+PAYLOAD_KEYS = frozenset({"id", "status", "orderId", "finalAmount", "amount", "quoteId"})
+PAYLOAD_STRING_KEYS = frozenset({"id", "status", "orderId", "quoteId"})
+PAYLOAD_MONEY_KEYS = frozenset({"finalAmount", "amount"})
+MONEY_KEYS = frozenset({"amount", "currency"})
+_SAFE_KEY_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+
+
+def _key_names(keys: Any) -> str:
+    """Offending key NAMES for the refusal (never values); an odd-looking name is only counted."""
+    shown = sorted(str(k) for k in keys if isinstance(k, str) and _SAFE_KEY_NAME.fullmatch(k))
+    hidden = len(list(keys)) - len(shown)
+    return ", ".join(shown + ([f"{hidden} unprintable"] if hidden else []))
+
+
+def _evidence_payload(text: str) -> Dict[str, Any]:
+    """`--evidence-payload-json`: a JSON object of allowlisted keys only. No value is ever echoed."""
+    value = _json_object(text)
+    extra = set(value) - PAYLOAD_KEYS
+    if extra:
+        raise argparse.ArgumentTypeError(
+            f"only {', '.join(sorted(PAYLOAD_KEYS))} may be passed (never a URL or buyer data); "
+            f"refused key(s): {_key_names(extra)}")
+    for key in PAYLOAD_STRING_KEYS & set(value):
+        if not isinstance(value[key], str):
+            raise argparse.ArgumentTypeError(f"{key} must be a string")
+    for key in PAYLOAD_MONEY_KEYS & set(value):
+        money = value[key]
+        if not isinstance(money, dict) or set(money) - MONEY_KEYS:
+            raise argparse.ArgumentTypeError(f"{key} must be an object with only amount and currency")
+        if any(isinstance(v, (dict, list)) for v in money.values()):
+            raise argparse.ArgumentTypeError(f"{key}.amount and {key}.currency must be scalars")
+    return value
+
+
 def _limit(text: str) -> int:
     try:
         value = int(text)
@@ -175,8 +217,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="the Reap API origin the evidence came from; must be this environment's")
         p.add_argument("--evidence-verified", action="store_true",
                        help="attest that you independently verified the evidence; required with --apply")
-        p.add_argument("--evidence-payload-json", type=_json_object, required=payload_required,
-                       help="the authenticated Reap checkout read, as a JSON object")
+        p.add_argument("--evidence-payload-json", type=_evidence_payload, required=payload_required,
+                       help="ONLY these keys of the authenticated Reap checkout read: id, status, orderId, "
+                            "finalAmount/amount {amount, currency}, quoteId. Never a URL or buyer data")
         p.add_argument("--expected-updated-at", required=True, type=_aware,
                        help="the purchase's updated_at exactly as the list printed it")
 

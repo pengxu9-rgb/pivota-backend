@@ -44,6 +44,15 @@ def _evidence_args(source="verified_reap_support_statement", payload=None, verif
     return args
 
 
+#: What the runbook tells an operator to copy out of a checkout read: these keys and no others.
+CLI_PAYLOAD_KEYS = ("id", "status", "orderId", "finalAmount", "amount", "quoteId")
+
+
+def _cli_payload(evidence):
+    """The allowlisted part of a full checkout read (which also carries `nextAction`)."""
+    return {k: v for k, v in evidence["payload"].items() if k in CLI_PAYLOAD_KEYS}
+
+
 def _parked_argv(row, outcome="confirmed_not_created", *extra):
     return ["resolve-parked", "--purchase-id", row["id"], "--dispatch-key", row["checkout_dispatch_key"],
             "--outcome", outcome, "--expected-updated-at", row["updated_at"].isoformat(),
@@ -274,7 +283,7 @@ async def test_a_service_refusal_exits_3_and_prints_its_reason(reap):
 async def test_resolve_checkout_previews_then_applies(reap, attribution):
     pid, row, evidence = await _manual_case(status="FAILED")
     argv = ["resolve-checkout", "--purchase-id", pid, "--expected-updated-at", row["updated_at"].isoformat(),
-            *_evidence_args(source="authenticated_reap_checkout_read", payload=evidence["payload"])]
+            *_evidence_args(source="authenticated_reap_checkout_read", payload=_cli_payload(evidence))]
     reap.calls.clear()
     code, [preview] = await _run(argv)
     assert code == op.EXIT_OK and preview["status"] == "eligible" and preview["dry_run"] is True
@@ -291,7 +300,7 @@ async def test_resolve_checkout_with_another_environments_origin_is_refused(reap
     argv = ["resolve-checkout", "--purchase-id", pid, "--expected-updated-at", row["updated_at"].isoformat(),
             "--evidence-source", "authenticated_reap_checkout_read", "--evidence-reference", "r1",
             "--evidence-observed-at", _now(), "--provider-base-url", "https://api.reap.global",
-            "--evidence-verified", "--evidence-payload-json", json.dumps(evidence["payload"])]
+            "--evidence-verified", "--evidence-payload-json", json.dumps(_cli_payload(evidence))]
     code, [line] = await _run(argv)
     assert code == op.EXIT_REFUSED and line["reason"].startswith("evidence_provider_origin")
     assert await _get(pid) == row
@@ -372,7 +381,7 @@ async def test_apply_against_another_database_is_refused_before_the_service(reap
     if command == "resolve-checkout":
         pid, row, evidence = await _manual_case(status="FAILED")
         argv = ["resolve-checkout", "--purchase-id", pid, "--expected-updated-at", row["updated_at"].isoformat(),
-                *_evidence_args(source="authenticated_reap_checkout_read", payload=evidence["payload"])]
+                *_evidence_args(source="authenticated_reap_checkout_read", payload=_cli_payload(evidence))]
     elif command == "resolve-parked":
         pid, row = await _parked_unknown(reap)
         argv = _parked_argv(row)
@@ -396,3 +405,53 @@ async def test_apply_against_another_database_is_refused_before_the_service(reap
     # A preview is not compared: it writes nothing, and it is how the identity is first reviewed.
     code, _ = await _run(argv + ["--expect-database", json.dumps(wrong)])
     assert code in (op.EXIT_OK, op.EXIT_REFUSED)
+
+
+# ── the evidence payload: allowlisted keys only, because job arguments reach the audit log ─────
+
+SECRET_URL = "https://pay.reap.example/hosted/tok_SECRET123"
+SECRET_EMAIL = "alice.buyer@example.com"
+
+
+@pytest.mark.parametrize("payload", [
+    {"id": "chk_1", "status": "FAILED", "nextAction": {"type": "REDIRECT", "url": SECRET_URL}},
+    {"id": "chk_1", "status": "FAILED", "buyer": {"email": SECRET_EMAIL}},
+    {"id": "chk_1", "status": "FAILED", "redirectUrl": SECRET_URL},
+    {"id": "chk_1", "status": "COMPLETED", "orderId": "ord_1",
+     "finalAmount": {"amount": 45, "currency": "USD", "billingEmail": SECRET_EMAIL}},
+    {"id": "chk_1", "status": "COMPLETED", "orderId": "ord_1", "amount": {"amount": {"u": SECRET_URL}}},
+    {"id": {"href": SECRET_URL}, "status": "FAILED"},
+    {"id": "chk_1", "status": "FAILED", SECRET_URL: 1},
+], ids=["next_action_url", "buyer_email", "url_key", "money_extra_key", "money_nested", "non_string_id",
+        "url_as_key"])
+@pytest.mark.parametrize("command", ["resolve-checkout", "resolve-parked"])
+def test_a_payload_key_outside_the_allowlist_is_refused_without_echoing_it(no_db, capsys, command, payload):
+    argv = [command, "--purchase-id", "rp_1", "--expected-updated-at", "2026-10-07T00:00:00+00:00",
+            *_evidence_args(source="authenticated_reap_checkout_read", payload=payload)]
+    if command == "resolve-parked":
+        argv += ["--dispatch-key", "a" * 64, "--outcome", "checkout_found"]
+    assert op.main(argv, environ=ENV) == op.EXIT_BAD_ARGS
+    out = capsys.readouterr()
+    assert "evidence-payload-json" in out.err
+    for secret in (SECRET_URL, SECRET_EMAIL, "tok_SECRET123"):
+        assert secret not in out.err and secret not in out.out
+
+
+def test_an_allowlisted_payload_is_accepted_as_given():
+    payload = {"id": "chk_1", "status": "COMPLETED", "orderId": "ord_1",
+               "finalAmount": {"amount": "45.00", "currency": "USD"}, "amount": {"amount": 45, "currency": "USD"},
+               "quoteId": "q_1"}
+    assert set(payload) == set(CLI_PAYLOAD_KEYS)
+    args = op.parse_args(["resolve-checkout", "--purchase-id", "rp_1", "--expected-updated-at",
+                          "2026-10-07T00:00:00+00:00",
+                          *_evidence_args(source="authenticated_reap_checkout_read", payload=payload)])
+    assert args.evidence_payload_json == payload
+    assert op._evidence(args)["payload"] == payload
+
+
+def test_the_runbook_names_exactly_the_payload_keys():
+    runbook = (ROOT / "docs" / "runbooks" / "reap_agentic_purchase.md").read_text(encoding="utf-8")
+    section = " ".join(runbook.split("### Running the operator decisions", 1)[1].split("\n### ", 1)[0].split())
+    for key in CLI_PAYLOAD_KEYS:
+        assert f"`{key}`" in section, key
+    assert "never a URL" in section and "nextAction" in section
