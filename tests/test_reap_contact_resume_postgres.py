@@ -134,3 +134,147 @@ async def test_acceptance_owner_read_failure_is_unknown_without_replacement(clie
     assert replay.status_code == 202 and replay.json()['purchase_id'] == row['id']
     assert replay.json()['checkout_dispatch_state'] == 'not_dispatched'
     assert await database.fetch_val('SELECT count(*) FROM reap_agentic_purchases') == 1
+
+
+# -- the re-entry window: a contact-paused row whose owner never comes back ends -----------------
+#
+# `ledger.lapse_contact_reentry` (REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS, default 86400).
+# Before it, a paused row was exempt from every sweep and `contact_retention_blocked` never fell.
+
+_DAY = 86400
+
+
+async def _age_purge(pid, seconds):
+    from db.database import IS_POSTGRES
+    expr = (f"clock_timestamp()-INTERVAL '{int(seconds)} seconds'" if IS_POSTGRES
+            else f"datetime('now','-{int(seconds)} seconds')")
+    await database.execute(f'UPDATE reap_agentic_purchases SET contact_purged_at={expr} WHERE id=:id', {'id': pid})
+
+
+async def _journal(pid, key, event, code=None, checkout=None):
+    from db import reap_continuation as continuation
+    await database.execute(continuation._APPEND, {'id': pid, 'key': key, 'event': event, 'quote': 'q_fixture',
+                                                  'enrollment': 'e_fixture', 'checkout': checkout, 'code': code})
+
+
+@pytest.mark.parametrize('state,terminal', [('resolving', 'failed'), ('needs_enrollment', 'expired'),
+                                            ('quoting', 'failed')])
+async def test_paused_row_past_the_reentry_window_ends_with_its_own_code(client, state, terminal):
+    pid, body = await _paused(client)
+    await database.execute('UPDATE reap_agentic_purchases SET state=:s WHERE id=:id', {'s': state, 'id': pid})
+    assert await ledger.count_contact_retention_blocked() == 1
+    await _age_purge(pid, _DAY + 60)
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == [pid]
+    row = await ledger.get_purchase_internal(pid)
+    assert row['state'] == terminal and row['last_error_code'] == 'contact_reentry_lapsed'
+    assert row['terminal_at'] is not None and row['claimed_by'] is None
+    assert row['buyer_email'] is None and row['shipping_address'] is None
+    assert terminal in ledger.ALLOWED_TRANSITIONS[state]
+    assert await ledger.count_contact_retention_blocked() == 0
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == []
+    # A terminal row cannot be hydrated by a late resume.
+    late = await client.post(BASE + f'/purchases/{pid}/resume', json=body)
+    assert late.status_code == 409 and _error(late) == 'terminal_purchase_not_resumable'
+    assert await database.fetch_val('SELECT count(*) FROM reap_agentic_purchases') == 1
+
+
+async def test_paused_row_inside_the_reentry_window_is_untouched(client):
+    pid, _ = await _paused(client)
+    await _age_purge(pid, _DAY - 600)
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == []
+    row = await ledger.get_purchase_internal(pid)
+    assert row['state'] == 'resolving' and row['last_error_code'] == 'contact_retention_elapsed'
+    assert await ledger.count_contact_retention_blocked() == 1
+
+
+@pytest.mark.parametrize('evidence', ['dispatch_key', 'checkout_id', 'order_id', 'observed',
+                                      'started_unanswered', 'legacy_quoting', 'claimed'])
+async def test_reentry_lapse_never_touches_a_row_with_dispatch_evidence_or_a_lease(client, evidence):
+    pid, _ = await _paused(client)
+    await database.execute("UPDATE reap_agentic_purchases SET state='quoting' WHERE id=:id", {'id': pid})
+    if evidence == 'dispatch_key':
+        await database.execute("UPDATE reap_agentic_purchases SET checkout_dispatch_key='k-held' WHERE id=:id", {'id': pid})
+    if evidence == 'checkout_id':
+        await database.execute("UPDATE reap_agentic_purchases SET reap_checkout_id='chk_fixture' WHERE id=:id", {'id': pid})
+    if evidence == 'order_id':
+        await database.execute("UPDATE reap_agentic_purchases SET reap_order_id='ord_fixture' WHERE id=:id", {'id': pid})
+    if evidence == 'observed':
+        await _journal(pid, 'k-observed', 'started')
+        await _journal(pid, 'k-observed', 'not_created', code='CHECKOUT_TEMPORARILY_UNAVAILABLE')
+        await _journal(pid, 'k-observed', 'observed', checkout='chk_late')
+    if evidence == 'started_unanswered':
+        await _journal(pid, 'k-unanswered', 'started')
+    if evidence == 'legacy_quoting':
+        await database.execute('UPDATE reap_agentic_purchases SET dispatch_tracking_version=NULL WHERE id=:id', {'id': pid})
+    if evidence == 'claimed':
+        await database.execute("UPDATE reap_agentic_purchases SET claimed_by='live-worker' WHERE id=:id", {'id': pid})
+    before = await ledger.get_purchase_internal(pid)
+    await _age_purge(pid, 30 * _DAY)
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == []
+    row = await ledger.get_purchase_internal(pid)
+    assert row['state'] == 'quoting' and row['last_error_code'] == before['last_error_code']
+    assert row['terminal_at'] is None
+
+
+async def test_reentry_lapse_takes_a_quoting_row_whose_every_send_was_answered_not_created(client):
+    pid, _ = await _paused(client)
+    await database.execute("UPDATE reap_agentic_purchases SET state='quoting' WHERE id=:id", {'id': pid})
+    await _journal(pid, 'k-answered', 'started')
+    await _journal(pid, 'k-answered', 'not_created', code='CHECKOUT_TEMPORARILY_UNAVAILABLE')
+    await _age_purge(pid, _DAY + 60)
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == [pid]
+    assert (await ledger.get_purchase_internal(pid))['state'] == 'failed'
+
+
+async def test_resume_inside_the_window_still_works_and_is_never_lapsed(client):
+    pid, body = await _paused(client)
+    await _age_purge(pid, _DAY - 600)
+    response = await client.post(BASE + f'/purchases/{pid}/resume', json=body)
+    assert response.status_code == 200, response.text
+    row = await ledger.get_purchase_internal(pid)
+    assert row['contact_purged_at'] is None and row['contact_revision'] == 1
+    assert await ledger.lapse_contact_reentry(window_seconds=ledger.CONTACT_REENTRY_WINDOW_SECONDS_MIN) == []
+    assert (await ledger.get_purchase_internal(pid))['state'] == 'resolving'
+    assert await ledger.count_contact_retention_blocked() == 0
+
+
+@pytest.mark.parametrize('bad', [0, 3599, 604801, True, 3600.5, '86400'])
+async def test_reentry_window_bound_is_strict(bad):
+    with pytest.raises(ValueError):
+        await ledger.lapse_contact_reentry(window_seconds=bad)
+
+
+@pytest.mark.parametrize('dials', [{'REAP_AGENTIC_RECONCILE_ENABLED': '0'}, {'REAP_AGENTIC_ENABLED': '0'}])
+async def test_poller_lapses_on_every_tick_even_with_the_rail_off(client, monkeypatch, dials):
+    import jobs.reap_agentic_purchase_poll as job
+    pid, _ = await _paused(client)
+    young, _ = await _paused_again(client)
+    await _age_purge(pid, _DAY + 60)
+    for name, value in dials.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv('REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS', str(_DAY))
+    report = await job.run_reap_agentic_purchase_poll(worker_id='reentry-lapse')
+    assert report.contact_reentry_lapsed == 1 and report.contact_retention_blocked == 1
+    assert report.errors == 0
+    assert (await ledger.get_purchase_internal(pid))['last_error_code'] == 'contact_reentry_lapsed'
+    assert (await ledger.get_purchase_internal(young))['state'] == 'resolving'
+
+
+async def _paused_again(client):
+    """A second paused purchase for the same owner, under another idempotency key."""
+    body = _body(idempotency_key='same-attempt-contact-2')
+    response = await client.post(BASE + '/purchases', json=body)
+    assert response.status_code == 202, response.text
+    pid = response.json()['purchase_id']
+    from db.database import IS_POSTGRES
+    old = "clock_timestamp()-INTERVAL '1000 seconds'" if IS_POSTGRES else "datetime('now','-1000 seconds')"
+    await database.execute(f'UPDATE reap_agentic_purchases SET created_at={old} WHERE id=:id', {'id': pid})
+    assert await ledger.scrub_reconciling_purchase_pii() == [pid]
+    return pid, body
+
+
+def test_reentry_dial_matches_the_ledger_bounds():
+    import jobs.reap_agentic_purchase_poll as job
+    dial = job.DIALS['contact_reentry_window_seconds']
+    assert dial.env == 'REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS'
+    assert (dial.default, dial.minimum, dial.maximum) == (86400, 3600, 604800)

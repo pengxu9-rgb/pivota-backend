@@ -1547,8 +1547,9 @@ async def test_the_expire_fallback_reads_state_entered_at_not_updated_at():
 
 
 async def test_only_state_changing_statements_stamp_state_entered_at():
-    """`state_entered_at` may be written by exactly three kinds of statement — the transition and
-    the two sweeps — and by no other."""
+    """`state_entered_at` may be written by exactly four kinds of statement — the transition and
+    the three terminal sweeps (expire, fail-exhausted, and the contact re-entry lapse) — and by
+    no other."""
     stamps = {
         name: value.count("state_entered_at =")
         for name, value in vars(ledger).items()
@@ -1559,6 +1560,7 @@ async def test_only_state_changing_statements_stamp_state_entered_at():
         "_TRANSITION_SQL", "_TRANSITION_SQL_SQLITE",
         "_EXPIRE_OVERDUE_SQL", "_EXPIRE_OVERDUE_SQL_SQLITE",
         "_FAIL_EXHAUSTED_SQL", "_FAIL_EXHAUSTED_SQL_SQLITE",
+        "_LAPSE_CONTACT_REENTRY_SQL", "_LAPSE_CONTACT_REENTRY_SQL_SQLITE",
     }, f"unexpected writers of state_entered_at: {sorted(writers)}"
 
 
@@ -4705,3 +4707,24 @@ async def test_the_stuck_count_takes_strict_bounded_ints(bad):
 
 def test_the_stuck_count_is_exported():
     assert "count_stuck_purchases" in ledger.__all__
+
+
+# ── the contact re-entry lapse (A1) ──────────────────────────────────────────────────────────
+
+
+async def test_the_reentry_lapse_only_takes_legal_terminal_edges_and_guards_at_the_top_level():
+    """Like the other terminal sweeps it bypasses `transition`, so its edges are checked here,
+    against the state list parsed out of the statement itself, on both dialects."""
+    for name in ("_LAPSE_CONTACT_REENTRY_SQL", "_LAPSE_CONTACT_REENTRY_SQL_SQLITE"):
+        sql = getattr(ledger, name)
+        sources = ledger._states_in(sql, "WHERE state IN (")
+        assert sources == ("resolving", "needs_enrollment", "quoting"), name
+        assert "CASE WHEN state = 'needs_enrollment' THEN 'expired' ELSE 'failed' END" in sql, name
+        for src in sources:
+            target = "expired" if src == "needs_enrollment" else "failed"
+            assert target in ledger.ALLOWED_TRANSITIONS[src], (name, src)
+        inner = sql[sql.index("SELECT p.id FROM reap_agentic_purchases p"):]
+        assert ledger._states_in(inner, "WHERE p.state IN (") == sources, name
+        for guard in ("claimed_by IS NULL", "checkout_dispatch_key IS NULL", "reap_checkout_id IS NULL",
+                      "reap_order_id IS NULL", "dispatch_tracking_version = 1"):
+            assert sql.count(guard) == 2, (name, guard)

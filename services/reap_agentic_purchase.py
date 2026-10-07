@@ -511,6 +511,10 @@ def _effective_expiry(
 #:                          them a "processing" screen after they have already paid.
 #:   processing        15 — Reap is placing the order and there are NO WEBHOOKS on this rail, so
 #:                          this poll is the only way the outcome is ever learned.
+#: How often a contact-paused pre-checkout row is looked at while it waits for its owner's
+#: resume. See `advance`; `_step_needs_enrollment` uses the same number.
+CONTACT_PAUSED_RECHECK_SECONDS = 900
+
 POLL_INTERVALS: Dict[str, int] = {
     "resolving": 60,
     "needs_enrollment": 30,
@@ -2389,7 +2393,12 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
             parked if parked == CHECKOUT_CREATED_HOSTED_URL_REFUSED else CHECKOUT_DISPATCH_UNRESOLVED))
     if state in {"resolving", "quoting"} and continuation.contact_required(row):
         # Contact erasure pauses new work, not a non-sensitive read of the linked enrollment.
-        return await _release(row, worker_id, error_code="contact_retention_elapsed")
+        # Nothing changes until the owner resumes (which makes the row due at once) or the
+        # re-entry window lapses it, so a paused row is looked at every 15 minutes -- the same
+        # cadence a contact-paused 'needs_enrollment' row gets -- rather than taking a claim
+        # slot from live work every 60 s.
+        return await _release(row, worker_id, error_code="contact_retention_elapsed",
+                              seconds=CONTACT_PAUSED_RECHECK_SECONDS)
     read_only_enrollment = state == "needs_enrollment" and bool(row.get("enrollment_id"))
     if state in {"resolving", "needs_enrollment", "quoting"} and not read_only_enrollment:
         try:
@@ -3120,7 +3129,8 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
     active = await ledger.get_active_enrollment(str(row["buyer_ref"]))
     if active is not None:
         if continuation.contact_required(row):
-            return await _release(row, worker_id, error_code="contact_retention_elapsed", seconds=900)
+            return await _release(row, worker_id, error_code="contact_retention_elapsed",
+                                  seconds=CONTACT_PAUSED_RECHECK_SECONDS)
         return await _move(
             row, worker_id, ["needs_enrollment"], "quoting", enrollment_id=str(active["id"])
         )
@@ -3165,7 +3175,8 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
                 last_error_code="enrollment_not_activatable",
             )
         if continuation.contact_required(row):
-            return await _release(row, worker_id, error_code="contact_retention_elapsed", seconds=900)
+            return await _release(row, worker_id, error_code="contact_retention_elapsed",
+                                  seconds=CONTACT_PAUSED_RECHECK_SECONDS)
         # The hosted link is cleared by the ledger on the way into 'quoting' (it clears on ANY
         # transition into that state), so the spent enrollment page and its expiry do not ride
         # along on a row that no longer waits on them.

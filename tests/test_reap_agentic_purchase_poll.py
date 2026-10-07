@@ -1639,7 +1639,7 @@ async def test_the_report_carries_only_integers(reap):
     report = await _run(worker_id="w1")
     fields = vars(report)
     assert set(fields) == {
-        "requeued", "expired", "failed_exhausted", "processing_over_attempts",
+        "requeued", "expired", "contact_reentry_lapsed", "failed_exhausted", "processing_over_attempts",
         "stuck_over_age", "precheckout_paused", "contact_retention_blocked", "checkout_needs_human", "claimed", "advanced", "released", "abandoned_budget",
         "lost_claim", "terminal", "errors", "skipped_disabled", "duration_ms",
     }

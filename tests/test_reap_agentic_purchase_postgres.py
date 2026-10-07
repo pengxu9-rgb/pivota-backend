@@ -2172,6 +2172,24 @@ async def test_mid_claim_stop_preserves_contact_pause_and_attempt_exemption(reap
     assert (await _get(pid))['state']=='quoting' and (await _get(pid))['attempts']==0
     assert await ledger.count_contact_retention_blocked()==1 and reap.calls==[]
 
+@pytest.mark.parametrize('state', ['resolving', 'quoting'])
+async def test_contact_paused_precheckout_is_rechecked_every_15_minutes_not_every_minute(reap, state):
+    """A contact-paused row changes only when its owner resumes (which makes it due at once) or
+    the re-entry window lapses it, so it must not take a claim slot from live work every 60 s."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_purchase as svc
+    pid = await _start()
+    await database.execute("UPDATE reap_agentic_purchases SET state=:s,buyer_email=NULL,shipping_address=NULL,"
+                           "last_error_code='contact_retention_elapsed' WHERE id=:id", {'s': state, 'id': pid})
+    await _claim(pid, 'paused-backoff')
+    reap.calls.clear()
+    result = await svc.advance(pid, 'paused-backoff')
+    assert result.outcome == 'released' and result.last_error_code == 'contact_retention_elapsed'
+    assert result.next_poll_in_seconds == svc.CONTACT_PAUSED_RECHECK_SECONDS == 900
+    assert reap.calls == []
+    assert [r for r in await ledger.claim_due_purchases('paused-next', limit=10) if r['id'] == pid] == []
+
 async def test_hung_contact_diagnostic_does_not_hide_other_health(reap, monkeypatch):
     import asyncio
     import db.reap_agentic_ledger as ledger
