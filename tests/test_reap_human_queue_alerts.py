@@ -107,7 +107,8 @@ def test_needs_human_policy_names_both_cohorts():
     for phrase in ('Two cohorts', 'checkout_unresolvable', 'permanent checkout read failures',
                    'parked checkout create', 'MAY EXIST', 'legacy quoting rows',
                    'list_parked_dispatches', 'resolve_parked_dispatch', 'resolve_checkout_manually',
-                   'python -m jobs.reap_operator', 'list-needs-human', 'resolve-parked', 'resolve-checkout'):
+                   'python -m jobs.reap_operator', 'list-needs-human', 'resolve-parked', 'resolve-checkout',
+                   '--apply needs --operator, --expect-env, --expect-database and --evidence-verified'):
         assert phrase in content, phrase
 
 
