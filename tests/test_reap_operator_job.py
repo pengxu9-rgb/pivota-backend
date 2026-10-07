@@ -185,6 +185,23 @@ def test_an_unexpected_failure_exits_1(monkeypatch):
     assert op.main(["list-parked"], environ=ENV) == op.EXIT_UNEXPECTED
 
 
+def test_a_crash_names_only_the_exception_type(monkeypatch, capsys, caplog):
+    """asyncpg puts the failing row in its message (`DETAIL: Failing row contains (...)`), and that
+    row can carry the buyer's email or address: neither the message nor a traceback may be printed."""
+    async def crash(*_a, **_k):
+        raise RuntimeError('new row violates check constraint\nDETAIL:  Failing row contains '
+                           '(rp_1, alice.crash@example.com, {"line1": "900 Brannan St"})')
+    monkeypatch.setattr(op, "_connected", crash)
+    with caplog.at_level("DEBUG"):
+        assert op.main(["list-parked"], environ=ENV) == op.EXIT_UNEXPECTED
+    out = capsys.readouterr()
+    assert "REAP_OPERATOR_CRASH RuntimeError" in out.err
+    printed = out.out + out.err + caplog.text
+    for leaked in ("alice.crash@example.com", "DETAIL", "900 Brannan St", "Traceback"):
+        assert leaked not in printed, leaked
+    assert all(r.exc_info is None for r in caplog.records)
+
+
 def test_the_module_runs_as_a_module():
     proc = subprocess.run([sys.executable, "-m", "jobs.reap_operator", "--help"], cwd=ROOT,
                           capture_output=True, text=True, timeout=120)

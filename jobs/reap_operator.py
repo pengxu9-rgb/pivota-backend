@@ -54,14 +54,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import logging
 import os
 import re
 import sys
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional
-
-logger = logging.getLogger(__name__)
 
 EXIT_OK = 0
 EXIT_UNEXPECTED = 1
@@ -472,7 +469,8 @@ def main(argv: Optional[List[str]] = None, *, environ: Optional[Mapping[str, str
     try:
         return asyncio.run(_connected(args, operator, emit))
     except Exception as exc:  # noqa: BLE001 - the verdict is the exit code; the type names the cause
-        logger.exception("reap operator command crashed")
+        # The type only: a driver's message can quote the failing row (`DETAIL: Failing row
+        # contains (...)`), buyer contact included, and a traceback repeats it.
         print(f"REAP_OPERATOR_CRASH {type(exc).__name__}", file=sys.stderr, flush=True)
         return EXIT_UNEXPECTED
 
