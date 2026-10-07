@@ -26,8 +26,8 @@ catalog_skus row per real variant. After this:
 For external-seed mirrors, successful SKU writes also project missing variant offers
 from the active attached seed. Existing offers are preserved and checkout readiness
 is never inferred from this projection. CATALOG_VARIANT_OFFER_PROJECTION_ENABLED=0
-(or false/off) skips it; a projection error is contained in a savepoint, logged, and
-never rolls back the group's SKU writes or stops the run.
+(or false/off) skips it; a projection error is contained in the projection's own
+savepoint, logged, and never rolls back the group's SKU writes or stops the run.
 
 What this service does NOT do:
   - Touch catalog_products. Identity stays where it is.
@@ -669,7 +669,7 @@ def _extract_variants_for_primary(primary: Dict[str, Any]) -> List[Dict[str, Any
 
 
 async def _project_variant_offers(product_key: str) -> Tuple[int, bool]:
-    """Project the group's missing variant offers, INSIDE the group transaction, in a SAVEPOINT.
+    """Project the group's missing variant offers, INSIDE the group transaction.
 
     Returns (offers inserted, failed). Runs where it always ran -- after the SKU upserts, under
     the product lock the group took first, so the projector's product -> seed -> SKU -> offer
@@ -677,10 +677,18 @@ async def _project_variant_offers(product_key: str) -> Tuple[int, bool]:
 
     A PROJECTION FAILURE IS NOT A GROUP FAILURE. It used to propagate: the group's transaction
     rolled back every SKU write it had just made, and the exception ended `promote_variants_all`
-    with every later group unvisited. The savepoint rolls back only the projection's own writes
-    (on Postgres it also clears the aborted-transaction state, so the group can still commit); the
-    failure is logged at WARNING with the product and the error TYPE, counted on the outcome, and
-    the next run retries it. `CATALOG_VARIANT_OFFER_PROJECTION_ENABLED=0` skips it entirely.
+    with every later group unvisited. Now it is caught here, logged at WARNING with the product
+    and the error TYPE, counted on the outcome, and retried by the next run.
+
+    THE ISOLATION IS THE PROJECTION'S OWN TRANSACTION, NOT ONE OPENED HERE.
+    `project_missing_variant_offers` does all of its database work inside its own
+    `db.transaction()`, which, nested in the group's transaction, is a SAVEPOINT: an error rolls
+    back only the projection's writes and (on Postgres) clears the aborted-transaction state, so
+    the group can still commit. A second savepoint around the call would add nothing, so there
+    is none; tests/test_catalog_variant_promoter.py pins that the projection opens its own, and
+    tests/test_catalog_variant_offer_projection_postgres.py fails the real projection on a real
+    Postgres error and checks the group's SKUs commit. `CATALOG_VARIANT_OFFER_PROJECTION_ENABLED=0`
+    skips the projection entirely.
     """
     from services.catalog_variant_offer_projection import (
         project_missing_variant_offers, projection_enabled,
@@ -691,12 +699,11 @@ async def _project_variant_offers(product_key: str) -> Tuple[int, bool]:
                     product_key)
         return 0, False
     try:
-        async with database.transaction():
-            offer_result = await project_missing_variant_offers(product_key, apply=True, db=database)
-    except Exception as exc:  # noqa: BLE001 - isolated by the savepoint; see the docstring
+        offer_result = await project_missing_variant_offers(product_key, apply=True, db=database)
+    except Exception as exc:  # noqa: BLE001 - isolated by the projection's own savepoint; see above
         logger.warning(
             "variant offer projection failed product_key=%s error_type=%s -- its writes rolled "
-            "back to the savepoint; the group's SKU writes are kept and the run continues",
+            "back to its savepoint; the group's SKU writes are kept and the run continues",
             product_key, type(exc).__name__,
         )
         return 0, True

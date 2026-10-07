@@ -632,8 +632,9 @@ async def test_projection_is_on_by_default_and_for_any_other_value(monkeypatch, 
     out = await promoter.promote_variants_for_group(group_id="pg_x", apply=True)
     project.assert_awaited_once()
     assert out.variant_offers_created == 2
-    # Inside the group transaction AND its own savepoint.
-    assert depth["at_projection"] == 2
+    # Called inside the group transaction, and nothing more: the projection opens its own
+    # savepoint (test_the_projection_does_all_its_database_work_in_its_own_transaction).
+    assert depth["at_projection"] == 1
 
 
 @pytest.mark.asyncio
@@ -648,7 +649,7 @@ async def test_a_projection_error_keeps_the_group_and_is_logged(monkeypatch, cap
         out = await promoter.promote_variants_for_group(group_id="pg_x", apply=True)
     assert len(executed) == 2 and out.variants_tier_held == 2
     assert out.variant_offer_projection_failed is True and out.variant_offers_created == 0
-    assert depth["now"] == 0 and depth["at_projection"] == 2
+    assert depth["now"] == 0 and depth["at_projection"] == 1
     [record] = [r for r in caplog.records if "variant offer projection failed" in r.getMessage()]
     assert record.levelno == logging.WARNING
     assert out.primary_product_key in record.getMessage() and "RuntimeError" in record.getMessage()
@@ -676,3 +677,47 @@ async def test_a_projection_error_does_not_abort_the_run(monkeypatch) -> None:
     assert report.groups_considered == 2 and len(calls) == 2 and len(executed) == 4
     assert report.variant_offer_projection_failures == 1 and report.variant_offers_created == 1
     assert [g.variant_offer_projection_failed for g in report.per_group] == [True, False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("product", [None, {"merchant_id": "m_1", "source_ref": "seed_1", "product_key": "pk"}],
+                         ids=["refused_at_once", "reads_further"])
+async def test_the_projection_does_all_its_database_work_in_its_own_transaction(product) -> None:
+    """The promoter's isolation from a projection failure IS this transaction: nested in the
+    group's, it is a savepoint. Every statement the real projection sends must be inside it."""
+    from services import catalog_variant_offer_projection as projection
+
+    depth = {"now": 0}
+    seen = []
+
+    class _Txn:
+        async def __aenter__(self):
+            depth["now"] += 1
+            return self
+
+        async def __aexit__(self, *exc):
+            depth["now"] -= 1
+            return False
+
+    class _DB:
+        def transaction(self):
+            return _Txn()
+
+        async def fetch_one(self, sql, params=None):
+            seen.append(depth["now"])
+            return product
+
+        async def fetch_all(self, sql, params=None):
+            seen.append(depth["now"])
+            return []
+
+        async def fetch_val(self, sql, params=None):
+            seen.append(depth["now"])
+            return None
+
+        async def execute(self, sql, params=None):
+            seen.append(depth["now"])
+
+    out = await projection.project_missing_variant_offers("pk", apply=True, db=_DB())
+    assert out["inserted"] == 0 and seen and all(level == 1 for level in seen), seen
+    assert depth["now"] == 0

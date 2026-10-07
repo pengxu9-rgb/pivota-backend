@@ -338,9 +338,10 @@ async def test_expected_manifest_refuses_source_disappearance(db):
 
 
 async def test_a_projection_failure_keeps_the_groups_sku_writes(db, monkeypatch, caplog):
-    """A real Postgres error inside the projection (which aborts the transaction it runs in)
-    rolls back only the projection: the savepoint restores the group's transaction, the group's
-    new SKUs commit, and the connection is usable for the next group."""
+    """The REAL projection hits a real Postgres error after it has inserted an offer (which
+    aborts the transaction it runs in). Its own transaction, a savepoint inside the group's,
+    is the only isolation: the projection's insert is rolled back, the group's new SKUs commit,
+    and the connection is usable for the next group. The promoter opens no savepoint of its own."""
     import logging
     from services import catalog_variant_promoter as promoter
 
@@ -353,6 +354,7 @@ async def test_a_projection_failure_keeps_the_groups_sku_writes(db, monkeypatch,
         "source_product_id": "external-product", "parent_title": "Test", "source_system": mod.MIRROR,
         "catalog_track": "external_referral", "seed_data": {"snapshot": {"variants": new_variants}},
     }
+    offer_inserts = []
 
     class Proxy:
         def __getattr__(self, name):
@@ -363,18 +365,18 @@ async def test_a_projection_failure_keeps_the_groups_sku_writes(db, monkeypatch,
                 return primary
             return await db.fetch_one(query, values)
 
-    async def failing(product_key, *, apply, db):
-        async with db.transaction():
-            await db.execute(
-                """INSERT INTO catalog_offers(offer_id,sku_key,product_key,merchant_id,currency,market,
-                source_domain,offer_payload) VALUES('doomed-offer',:sk,:pk,:m,'USD','US','brand.example',
-                CAST('{}' AS jsonb))""", {"sk": PK + "::v::900000000001", "pk": product_key, "m": M})
-            await db.fetch_val("SELECT 1/0")  # a real error: Postgres aborts the transaction here
+        async def fetch_val(self, query, values=None):
+            result = await db.fetch_val(query, values)
+            if query == mod.INSERT_SQL:
+                offer_inserts.append(result)
+                if len(offer_inserts) == 2:
+                    await db.fetch_val("SELECT 1/0")  # a real error, after a real offer insert
+            return result
 
     monkeypatch.setattr(promoter, "database", Proxy())
-    monkeypatch.setattr(mod, "project_missing_variant_offers", failing)
     with caplog.at_level(logging.WARNING, logger=promoter.logger.name):
         out = await promoter.promote_variants_for_group(group_id="projection-failure", apply=True)
+    assert len(offer_inserts) == 2 and offer_inserts[0]  # the projection really wrote first
     assert out.variant_offer_projection_failed is True and out.variant_offers_created == 0
     assert out.variants_tier_held == 2 and out.skus_write_failed == 0
     assert any("variant offer projection failed" in r.getMessage() and PK in r.getMessage()
@@ -383,7 +385,7 @@ async def test_a_projection_failure_keeps_the_groups_sku_writes(db, monkeypatch,
     assert await db.fetch_val(
         "SELECT count(*) FROM catalog_skus WHERE product_key=:pk AND source_variant_id IN ('900000000001','900000000002')",
         {"pk": PK}) == 2
-    assert await db.fetch_val("SELECT count(*) FROM catalog_offers WHERE offer_id='doomed-offer'") == 0
+    assert await db.fetch_val("SELECT count(*) FROM catalog_offers WHERE source_system=:src", {"src": mod.SOURCE}) == 0
 
 
 async def test_a_switched_off_projection_writes_no_offers_from_the_promoter(db, monkeypatch):
