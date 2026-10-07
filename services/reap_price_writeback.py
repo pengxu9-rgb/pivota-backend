@@ -57,6 +57,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -324,8 +325,36 @@ def _price_like(value: Any, minor: int, currency: str) -> bool:
     return value not in (None, "") and _same_price(value, minor, currency)
 
 
-def _as_type_of(original: Any, major: Decimal) -> Any:
-    return str(major) if isinstance(original, str) else float(major)
+def _fixed(minor: int, currency: str) -> str:
+    """The amount at the currency's own exponent: 1350 USD -> '13.50', 1500 JPY -> '1500'.
+    (`str(Decimal)` drops trailing zeros: '13.5', '13' -- review of #2523, F1.)"""
+    exponent = 0 if minor_to_major(1, currency) == 1 else 2
+    return f"{minor_to_major(int(minor), currency):.{exponent}f}"
+
+
+def _as_type_of(original: Any, minor: int, currency: str) -> Any:
+    return _fixed(minor, currency) if isinstance(original, str) else float(minor_to_major(int(minor), currency))
+
+
+#: Sale / range context that describes the OLD price (review of #2523, F2): kept beside a moved
+#: amount it would say "on sale" at the regular price, or a range that no longer contains it.
+_PRICE_CONTEXT_KEYS = ("compare_at_amount", "compare_at_currency", "compare_at_display_raw",
+                       "range_min", "range_max")
+_SALE_PRICE_TYPES = frozenset({"sale", "discounted", "promo", "promotion", "clearance"})
+
+
+def _rewrite_display(raw: str, *, old_minor: int, new_minor: int, currency: str) -> Optional[str]:
+    """The display text with the old number replaced, or None when that cannot be done exactly:
+    the old number at the currency's exponent must occur, bounded by non-digits, and be the only
+    number in the text (so '113.99', a range '12.99 - 13.99' or '1,299.00' are never
+    half-rewritten). None is honest; a guess is not."""
+    old, new = _fixed(old_minor, currency), _fixed(new_minor, currency)
+    pattern = re.compile(r"(?<![\d.,])" + re.escape(old) + r"(?![\d])")
+    if not pattern.search(raw) or re.search(r"\d", pattern.sub("", raw)):
+        # The old number is absent, or another number sits beside it (a range, a bundle price, a
+        # thousands-grouped amount): which number is this product's is not ours to guess.
+        return None
+    return pattern.sub(new, raw)
 
 
 def move_price_facts(
@@ -340,22 +369,31 @@ def move_price_facts(
     purchase is checked against, so they never refuse the write. `display_raw` keeps its own
     formatting with the number replaced; `captured_at` becomes the quote's time, the moment this
     price was observed."""
-    old_major, new_major = minor_to_major(int(old_minor), currency), minor_to_major(int(new_minor), currency)
     moved = 0
     for key in top_keys:
         if _price_like(holder.get(key), old_minor, currency):
-            holder[key] = _as_type_of(holder[key], new_major)
+            holder[key] = _as_type_of(holder[key], new_minor, currency)
             moved += 1
     for outer, inner in _FACT_BLOCKS:
         block = holder.get(outer)
         price = block.get(inner) if isinstance(block, dict) else None
         if not isinstance(price, dict) or not _price_like(price.get("amount"), old_minor, currency):
             continue
-        price["amount"] = _as_type_of(price["amount"], new_major)
+        # A block in another currency, or one its writer already marked a market mismatch, is not
+        # this price whatever its number says (review of #2523, F3).
+        stated = {str(price.get(k)).strip().upper() for k in ("currency", "observed_currency") if price.get(k)}
+        if (stated and stated != {currency}) or str(price.get("market_switch_status") or "") in ("mismatch", "failed"):
+            continue
+        price["amount"] = _as_type_of(price["amount"], new_minor, currency)
         raw = price.get("display_raw")
         if isinstance(raw, str) and raw.strip():
-            replaced = raw.replace(str(old_major), str(new_major))
-            price["display_raw"] = replaced if replaced != raw else str(new_major)
+            price["display_raw"] = _rewrite_display(raw, old_minor=old_minor, new_minor=new_minor,
+                                                    currency=currency)
+        for key in _PRICE_CONTEXT_KEYS:
+            if key in price:
+                price[key] = None
+        if str(price.get("price_type") or "").lower() in _SALE_PRICE_TYPES:
+            price["price_type"] = "unknown"
         if observed is not None and "captured_at" in price:
             price["captured_at"] = observed.isoformat()
         moved += 1
@@ -390,7 +428,6 @@ def plan_seed_write(
     document = json.loads(json.dumps(document))
     snapshot = document.get("snapshot") if isinstance(document.get("snapshot"), dict) else {}
     lists = [v for v in (document.get("variants"), snapshot.get("variants")) if isinstance(v, list)]
-    new_major = minor_to_major(int(new_minor), currency)
     touched = 0
     for variants in lists:
         for variant in variants:
@@ -404,7 +441,7 @@ def plan_seed_write(
                     continue
                 if not _same_price(variant[key], old_minor, currency):
                     return None, False, "seed_price_unexpected"
-                variant[key] = str(new_major) if isinstance(variant[key], str) else float(new_major)
+                variant[key] = _as_type_of(variant[key], new_minor, currency)
                 touched += 1
     if not touched:
         return None, False, "variant_not_on_seed"
@@ -418,8 +455,7 @@ def plan_seed_write(
                 # The product-level price is the projection's source for the placeholder: moving
                 # the offer but not a holder at some third price would be undone (R2-2).
                 return None, False, "seed_price_unexpected"
-            holder["price_amount"] = (str(new_major) if isinstance(holder["price_amount"], str)
-                                      else float(new_major))
+            holder["price_amount"] = _as_type_of(holder["price_amount"], new_minor, currency)
         for holder in (snapshot, document):
             move_price_facts(holder, old_minor=old_minor, new_minor=new_minor, currency=currency,
                              observed=observed)

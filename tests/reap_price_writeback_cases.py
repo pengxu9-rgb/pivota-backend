@@ -797,10 +797,70 @@ def test_the_facts_move_only_from_the_old_price_and_keep_their_format():
     assert again == 0  # already new: nothing to move
 
 
-def test_a_display_text_without_the_old_number_becomes_the_new_number():
+def test_a_display_text_without_the_old_number_is_dropped_not_guessed():
     holder = {"commerce_facts_v1": {"regional_price": {"amount": 13.99, "display_raw": "thirteen ninety-nine"}}}
     writeback.move_price_facts(holder, old_minor=1399, new_minor=1499, currency="USD", observed=None)
-    assert holder["commerce_facts_v1"]["regional_price"] == {"amount": 14.99, "display_raw": "14.99"}
+    assert holder["commerce_facts_v1"]["regional_price"] == {"amount": 14.99, "display_raw": None}
+
+
+@pytest.mark.parametrize("display,old,new,want", [
+    ("$13.50", 1350, 1400, "$14.00"),          # review of #2523, F1: was "$140"
+    ("$13.00", 1300, 1450, "$14.50"),          # was "$14.5.00"
+    ("$13.50", 1350, 1375, "$13.75"),          # was "$13.750"
+    ("13.50 USD", 1350, 1600, "16.00 USD"),    # was "160 USD"
+    ("US$13.99", 1399, 1499, "US$14.99"),
+    ("$12.99 - $13.99", 1299, 1399, None),     # a range: was "$13.99 - $13.99"
+    ("Now $13.99, bundle $113.99", 1399, 1499, None),  # another number beside it
+    ("$1,299.00", 129900, 139900, None),       # thousands-grouped: was a bare "1399"
+    ("12,99 €", 1299, 1349, None),             # decimal comma
+])
+def test_a_display_text_is_rewritten_exactly_or_not_at_all(display, old, new, want):
+    holder = {"commerce_facts_v1": {"regional_price": {"amount": old / 100, "display_raw": display}}}
+    writeback.move_price_facts(holder, old_minor=old, new_minor=new, currency="USD", observed=None)
+    assert holder["commerce_facts_v1"]["regional_price"]["display_raw"] == want
+
+
+def test_a_zero_decimal_currency_keeps_its_format():
+    holder = {"price": "1500", "commerce_facts_v1": {"regional_price": {"amount": "1500", "display_raw": "¥1500"}}}
+    writeback.move_price_facts(holder, old_minor=1500, new_minor=1600, currency="JPY", observed=None,
+                               top_keys=("price",))
+    assert (holder["price"], holder["commerce_facts_v1"]["regional_price"]["amount"],
+            holder["commerce_facts_v1"]["regional_price"]["display_raw"]) == ("1600", "1600", "¥1600")
+
+
+def test_sale_and_range_context_of_the_old_price_is_cleared():
+    """Review of #2523, F2: a sale that ended is the usual reason a price rises."""
+    holder = {"commerce_facts_v1": {"regional_price": {
+        "amount": 12.99, "price_type": "sale", "compare_at_amount": 13.49, "compare_at_currency": "USD",
+        "compare_at_display_raw": "$13.49", "range_min": 12.99, "range_max": 13.99}}}
+    writeback.move_price_facts(holder, old_minor=1299, new_minor=1349, currency="USD", observed=None)
+    price = holder["commerce_facts_v1"]["regional_price"]
+    assert price["amount"] == 13.49 and price["price_type"] == "unknown"
+    assert all(price[k] is None for k in ("compare_at_amount", "compare_at_currency",
+                                          "compare_at_display_raw", "range_min", "range_max"))
+
+
+@pytest.mark.parametrize("block", [
+    {"amount": 13.99, "currency": "SGD"},
+    {"amount": 13.99, "observed_currency": "EUR"},
+    {"amount": 13.99, "currency": "USD", "market_switch_status": "mismatch"},
+])
+def test_a_block_in_another_currency_or_marked_a_mismatch_is_not_this_price(block):
+    """Review of #2523, F3."""
+    holder = {"commerce_facts_v1": {"regional_price": dict(block)}}
+    assert writeback.move_price_facts(holder, old_minor=1399, new_minor=1499, currency="USD", observed=None) == 0
+    assert holder["commerce_facts_v1"]["regional_price"] == block
+
+
+def test_the_legacy_commerce_facts_block_moves_too():
+    holder = {"commerce_facts": {"regional_price": {"amount": "13.99"}}}
+    assert writeback.move_price_facts(holder, old_minor=1399, new_minor=1499, currency="USD", observed=None) == 1
+    assert holder["commerce_facts"]["regional_price"]["amount"] == "14.99"
+
+
+def test_an_unverified_agent_safe_price_is_left_as_it_is():
+    holder = {"agent_safe_commerce_facts": {"price": {"status": "unverified", "reason": "x"}}}
+    assert writeback.move_price_facts(holder, old_minor=1399, new_minor=1499, currency="USD", observed=None) == 0
 
 
 async def test_the_written_offers_payload_and_the_seeds_facts_move_with_the_price(client, monkeypatch):
@@ -872,3 +932,56 @@ async def test_a_seed_about_this_variant_moves_its_placeholder_beside_a_real_sku
     assert await writeback.run_writeback_pass() == {"written": 1}
     assert await offer_prices() == ["14.99", "14.99"]
     assert await _seed_column() == 14.99
+
+
+
+# ── review of #2523: the placeholder's payload, and payload shapes left alone ────────────────
+
+
+def _named8(d):
+    d["snapshot"]["shopify_cart_proof"].update(scope="named_variant", available=True, live_variant_count=8)
+
+
+async def test_the_placeholders_payload_moves_with_it(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499)
+    await _add_placeholder("13.99")
+    await _set_offer_payload("ph-offer", {"price_amount": 13.99,
+                                          "commerce_facts_v1": {"regional_price": _facts(13.99, "$13.99")}})
+    await _edit_seed(_named8)
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    payload = await _offer_payload("ph-offer")
+    assert payload["price_amount"] == 14.99
+    assert payload["commerce_facts_v1"]["regional_price"]["display_raw"] == "$14.99"
+
+
+async def test_a_placeholder_and_payload_of_a_seed_listing_several_variants_stay(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499)
+    await _add_placeholder("13.99")
+    await _set_offer_payload("ph-offer", {"price_amount": 13.99})
+    await _edit_seed(lambda d: (_two_listed(d), _named8(d)))
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await offer_prices() == ["13.99", "14.99"]
+    assert (await _offer_payload("ph-offer"))["price_amount"] == 13.99
+
+
+async def test_a_payload_that_is_not_an_object_is_left_and_the_price_still_moves(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499)
+    cast = "CAST(:p AS jsonb)" if IS_POSTGRES else ":p"
+    await database.execute(f"UPDATE catalog_offers SET offer_payload = {cast} WHERE offer_id = 'prepare-offer'",
+                           {"p": json.dumps([13.99])})
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    assert await offer_prices() == ["14.99"]
+
+
+async def test_the_rest_of_a_payload_is_preserved(client, monkeypatch):
+    await refused_at(client, monkeypatch, live=1499)
+    await _set_offer_payload("prepare-offer", {"zz": {"b": 1, "a": "円"}, "price": "13.99", "aa": [3, 2, 1],
+                                               "agent_safe_commerce_facts": {"price": {"status": "unverified"}}})
+    monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    payload = await _offer_payload("prepare-offer")
+    assert payload["price"] == "14.99" and payload["zz"] == {"b": 1, "a": "円"} and payload["aa"] == [3, 2, 1]
+    assert payload["agent_safe_commerce_facts"]["price"] == {"status": "unverified"}
