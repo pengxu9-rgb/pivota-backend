@@ -278,3 +278,79 @@ def test_reentry_dial_matches_the_ledger_bounds():
     dial = job.DIALS['contact_reentry_window_seconds']
     assert dial.env == 'REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS'
     assert (dial.default, dial.minimum, dial.maximum) == (86400, 3600, 604800)
+
+
+# -- the lapse's post-lock re-check, across two connections ------------------------------------
+#
+# The candidate subquery is materialised before the UPDATE waits on a row lock, so only the
+# OUTER copy of each guard can see what a concurrent writer committed in the meantime. Each case
+# holds the row lock on a second connection with a write the lapse must respect, starts the lapse
+# (it blocks), commits, and checks the row was NOT lapsed.
+
+import re as _re
+
+
+def _positional(sql):
+    names = []
+
+    def _sub(match):
+        if match.group(1) not in names:
+            names.append(match.group(1))
+        return f'${names.index(match.group(1)) + 1}'
+    return _re.sub(r'(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)', _sub, sql), names
+
+
+async def _raw():
+    import asyncpg
+    import os
+    return await asyncpg.connect(os.environ['DATABASE_URL'])
+
+
+async def _wait_until_blocked(probe):
+    for _ in range(200):
+        waiting = await probe.fetchval(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+            "AND wait_event_type = 'Lock' AND query ILIKE '%contact_reentry_lapsed%'")
+        if waiting:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError('the lapse never blocked on the row lock')
+
+
+@pytest.mark.parametrize('writer', ['resume', 'dispatch_key', 'checkout_id', 'order_id', 'claimed'])
+async def test_a_concurrent_writer_holding_the_row_wins_over_the_lapse(client, writer):
+    from db import reap_continuation as continuation
+    pid, body = await _paused(client)
+    await _age_purge(pid, 2 * 3600)
+    row = await ledger.get_purchase_internal(pid)
+    holder, probe = await _raw(), await _raw()
+    try:
+        tx = holder.transaction()
+        await tx.start()
+        if writer == 'resume':
+            key = await database.fetch_one(
+                'SELECT idempotency_key, request_hash FROM reap_agentic_purchase_keys WHERE purchase_id=:id', {'id': pid})
+            sql, names = _positional(continuation._RESTORE)
+            values = {'id': pid, 'agent': row['agent_id'], 'owner': row['agent_user_ref_hash'],
+                      'state': row['state'], 'revision': row['contact_revision'],
+                      'request_key': key['idempotency_key'], 'request_hash': key['request_hash'],
+                      'email': 'buyer@example.test', 'address': '{"line1": "1 Test Way"}', 'offer': None}
+            assert await holder.fetchrow(sql, *[values[n] for n in names]) is not None
+        else:
+            column, value = {'dispatch_key': ('checkout_dispatch_key', 'k-racing'),
+                             'checkout_id': ('reap_checkout_id', 'chk_racing'),
+                             'order_id': ('reap_order_id', 'ord_racing'),
+                             'claimed': ('claimed_by', 'racing-worker')}[writer]
+            await holder.execute(f'UPDATE reap_agentic_purchases SET {column}=$1 WHERE id=$2', value, pid)
+        lapse = asyncio.create_task(ledger.lapse_contact_reentry(window_seconds=3600))
+        await _wait_until_blocked(probe)
+        await tx.commit()
+        assert await asyncio.wait_for(lapse, 10) == []
+    finally:
+        await holder.close()
+        await probe.close()
+    after = await ledger.get_purchase_internal(pid)
+    assert after['state'] == 'resolving' and after['terminal_at'] is None
+    assert after['last_error_code'] != 'contact_reentry_lapsed'
+    if writer == 'resume':
+        assert after['contact_purged_at'] is None and after['contact_revision'] == 1

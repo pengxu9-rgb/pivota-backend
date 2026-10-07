@@ -4724,7 +4724,17 @@ async def test_the_reentry_lapse_only_takes_legal_terminal_edges_and_guards_at_t
             target = "expired" if src == "needs_enrollment" else "failed"
             assert target in ledger.ALLOWED_TRANSITIONS[src], (name, src)
         inner = sql[sql.index("SELECT p.id FROM reap_agentic_purchases p"):]
+        outer = sql[:sql.index("AND id IN (")]
         assert ledger._states_in(inner, "WHERE p.state IN (") == sources, name
+        window = ("datetime('now', :window)" if name.endswith("_SQLITE")
+                  else "clock_timestamp() - (:window_seconds * INTERVAL '1 second')")
+        # The OUTER copy of every guard is the post-lock re-check: it is what keeps a row that a
+        # concurrent resume, dispatch or claim changed while this UPDATE waited on its lock from
+        # being lapsed (tests/test_reap_contact_resume_postgres.py races each one). The inner copy
+        # selects the candidates. Both must be present, separately.
         for guard in ("claimed_by IS NULL", "checkout_dispatch_key IS NULL", "reap_checkout_id IS NULL",
-                      "reap_order_id IS NULL", "dispatch_tracking_version = 1"):
+                      "reap_order_id IS NULL", "dispatch_tracking_version = 1",
+                      "contact_purged_at IS NOT NULL", f"contact_purged_at < {window}"):
+            assert f"AND {guard}" in outer or f"WHERE {guard}" in outer or f"OR {guard}" in outer, (name, guard)
+            assert f"p.{guard}" in inner, (name, guard)
             assert sql.count(guard) == 2, (name, guard)
