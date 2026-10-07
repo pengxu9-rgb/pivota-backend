@@ -365,10 +365,13 @@ bad setting, it would be an exception out of a scheduled job on every tick.
 is the schedule a row is released with: only the plain per-state cadence (a release with no
 explicit hold) is stored up to `min(interval/2, poller tick/2, 15)` seconds early
 (`services.reap_agentic_purchase.cadence_slack_seconds`), so a 30 s state is taken on the next tick
-instead of every other one. Every explicit hold is exact: Reap's `Retry-After`, transport backoff,
-the 120 s error backoff (`REAP_AGENTIC_ERROR_BACKOFF_SECONDS`), the 270 s hold after a definitive
-"checkout not created", the 900 s holds and the settling hold. The first look after a row enters a
-human-wait state still waits the full interval.
+instead of every other one. Every explicit hold is exact: transport backoff, the 120 s error
+backoff (`REAP_AGENTIC_ERROR_BACKOFF_SECONDS`), the 270 s hold after a definitive "checkout not
+created", the 900 s holds and the settling hold, and Reap's `Retry-After` where a step honours it:
+the quote, enrollment-create and checkout-create paths. A failed checkout status read
+(`_release_checkout_read_failure`) does not take `Retry-After`: it is released on the regular
+cadence plus slack, or on the transport backoff for a transport error. The first look after a row
+enters a human-wait state still waits the full interval.
 
 ### How slow one step really is
 

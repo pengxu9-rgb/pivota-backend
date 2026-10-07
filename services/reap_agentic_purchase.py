@@ -515,10 +515,6 @@ def _effective_expiry(
 #:                          them a "processing" screen after they have already paid.
 #:   processing        15 — Reap is placing the order and there are NO WEBHOOKS on this rail, so
 #:                          this poll is the only way the outcome is ever learned.
-#: How often a contact-paused pre-checkout row is looked at while it waits for its owner's
-#: resume. See `advance`; `_step_needs_enrollment` uses the same number.
-CONTACT_PAUSED_RECHECK_SECONDS = 900
-
 POLL_INTERVALS: Dict[str, int] = {
     "resolving": 60,
     "needs_enrollment": 30,
@@ -526,6 +522,10 @@ POLL_INTERVALS: Dict[str, int] = {
     "awaiting_approval": 30,
     "processing": 15,
 }
+
+#: How often a contact-paused pre-checkout row is looked at while it waits for its owner's
+#: resume. See `advance`; `_step_needs_enrollment` uses the same number.
+CONTACT_PAUSED_RECHECK_SECONDS = 900
 
 #: The SHORTEST hold after Reap answered a checkout create with a definitive "not created"
 #: (503 CHECKOUT_TEMPORARILY_UNAVAILABLE, or QUOTE_EXPIRED on HTTP 400/409).
