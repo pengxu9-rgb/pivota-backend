@@ -2927,7 +2927,9 @@ async def test_checkout_temporarily_unavailable_is_released_not_failed(reap, att
         error_code="CHECKOUT_TEMPORARILY_UNAVAILABLE", retry_after_seconds=9)
     moved = await step(purchase_id)
     assert moved.outcome == "released" and moved.state == "quoting"
-    assert moved.next_poll_in_seconds == 9
+    # Reap's 9 s is shorter than the quote idempotency bucket, so the hold is the bucket plus a
+    # margin: a re-quote inside the bucket would replay the same quote id and park the row.
+    assert moved.next_poll_in_seconds == svc.PROVIDER_NOT_CREATED_HOLD_S
 
 
 @pytest.mark.parametrize("bad", ["", "   ", "x" * 129, "A\x00B"])

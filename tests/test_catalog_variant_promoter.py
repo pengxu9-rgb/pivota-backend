@@ -564,3 +564,160 @@ async def test_mirror_promotion_projects_offer_pairs_after_sku_writes(monkeypatc
     assert len(executed) == 2
     project.assert_awaited_once_with(out.primary_product_key, apply=True, db=promoter.database)
     assert out.variant_offers_created == 2
+
+
+# ---------------------------------------------------------------------------
+# The variant-offer projection: a kill switch, and a failure that stays its own
+# ---------------------------------------------------------------------------
+
+
+def _mirror_group(monkeypatch, project):
+    """The fake DB with a MIRROR primary, the projection replaced by `project`, and the nesting
+    depth of every transaction the projection runs inside recorded."""
+    from services import catalog_variant_offer_projection as projection
+
+    executed = _install_fake_db(monkeypatch)
+    original = promoter.database.fetch_one
+
+    async def mirror_primary(sql, params=None):
+        return dict(await original(sql, params), source_system=projection.MIRROR)
+
+    monkeypatch.setattr(promoter.database, "fetch_one", mirror_primary)
+    depth = {"now": 0, "at_projection": None}
+
+    class _CountingTxn(_FakeTxn):
+        async def __aenter__(self):
+            depth["now"] += 1
+            return self
+
+        async def __aexit__(self, *exc):
+            depth["now"] -= 1
+            return False
+
+    monkeypatch.setattr(type(promoter.database), "transaction", lambda self: _CountingTxn())
+
+    async def recorded(*args, **kwargs):
+        depth["at_projection"] = depth["now"]
+        return await project(*args, **kwargs)
+
+    monkeypatch.setattr(projection, "project_missing_variant_offers", recorded)
+    return executed, depth
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["0", "false", "OFF", " off ", "no", "NO"])
+async def test_projection_switched_off_is_never_called(monkeypatch, value) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("CATALOG_VARIANT_OFFER_PROJECTION_ENABLED", value)
+    project = AsyncMock(return_value={"inserted": 2, "planned": 2, "skips": {}})
+    executed, depth = _mirror_group(monkeypatch, project)
+    out = await promoter.promote_variants_for_group(group_id="pg_x", apply=True)
+    project.assert_not_awaited()
+    assert len(executed) == 2 and out.variant_offers_created == 0
+    assert out.variant_offer_projection_failed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, "", "1", "true", "on", "yes"])
+async def test_projection_is_on_by_default_and_for_any_other_value(monkeypatch, value) -> None:
+    from unittest.mock import AsyncMock
+
+    if value is None:
+        monkeypatch.delenv("CATALOG_VARIANT_OFFER_PROJECTION_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("CATALOG_VARIANT_OFFER_PROJECTION_ENABLED", value)
+    project = AsyncMock(return_value={"inserted": 2, "planned": 2, "skips": {}})
+    _, depth = _mirror_group(monkeypatch, project)
+    out = await promoter.promote_variants_for_group(group_id="pg_x", apply=True)
+    project.assert_awaited_once()
+    assert out.variant_offers_created == 2
+    # Called inside the group transaction, and nothing more: the projection opens its own
+    # savepoint (test_the_projection_does_all_its_database_work_in_its_own_transaction).
+    assert depth["at_projection"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_projection_error_keeps_the_group_and_is_logged(monkeypatch, caplog) -> None:
+    import logging
+
+    async def broken(*_a, **_k):
+        raise RuntimeError("synthetic projection failure")
+
+    executed, depth = _mirror_group(monkeypatch, broken)
+    with caplog.at_level(logging.WARNING, logger=promoter.logger.name):
+        out = await promoter.promote_variants_for_group(group_id="pg_x", apply=True)
+    assert len(executed) == 2 and out.variants_tier_held == 2
+    assert out.variant_offer_projection_failed is True and out.variant_offers_created == 0
+    assert depth["now"] == 0 and depth["at_projection"] == 1
+    [record] = [r for r in caplog.records if "variant offer projection failed" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    assert out.primary_product_key in record.getMessage() and "RuntimeError" in record.getMessage()
+    assert "synthetic projection failure" not in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_a_projection_error_does_not_abort_the_run(monkeypatch) -> None:
+    calls = []
+
+    async def broken_once(product_key, **_k):
+        calls.append(product_key)
+        if len(calls) == 1:
+            raise RuntimeError("synthetic projection failure")
+        return {"inserted": 1, "planned": 1, "skips": {}}
+
+    executed, _ = _mirror_group(monkeypatch, broken_once)
+
+    async def groups(sql, params=None):
+        return [{"group_id": "pg_a"}, {"group_id": "pg_b"}]
+
+    monkeypatch.setattr(type(promoter.database), "fetch_all", lambda self, sql, params=None: groups(sql, params),
+                        raising=False)
+    report = await promoter.promote_variants_all(apply=True)
+    assert report.groups_considered == 2 and len(calls) == 2 and len(executed) == 4
+    assert report.variant_offer_projection_failures == 1 and report.variant_offers_created == 1
+    assert [g.variant_offer_projection_failed for g in report.per_group] == [True, False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("product", [None, {"merchant_id": "m_1", "source_ref": "seed_1", "product_key": "pk"}],
+                         ids=["refused_at_once", "reads_further"])
+async def test_the_projection_does_all_its_database_work_in_its_own_transaction(product) -> None:
+    """The promoter's isolation from a projection failure IS this transaction: nested in the
+    group's, it is a savepoint. Every statement the real projection sends must be inside it."""
+    from services import catalog_variant_offer_projection as projection
+
+    depth = {"now": 0}
+    seen = []
+
+    class _Txn:
+        async def __aenter__(self):
+            depth["now"] += 1
+            return self
+
+        async def __aexit__(self, *exc):
+            depth["now"] -= 1
+            return False
+
+    class _DB:
+        def transaction(self):
+            return _Txn()
+
+        async def fetch_one(self, sql, params=None):
+            seen.append(depth["now"])
+            return product
+
+        async def fetch_all(self, sql, params=None):
+            seen.append(depth["now"])
+            return []
+
+        async def fetch_val(self, sql, params=None):
+            seen.append(depth["now"])
+            return None
+
+        async def execute(self, sql, params=None):
+            seen.append(depth["now"])
+
+    out = await projection.project_missing_variant_offers("pk", apply=True, db=_DB())
+    assert out["inserted"] == 0 and seen and all(level == 1 for level in seen), seen
+    assert depth["now"] == 0
