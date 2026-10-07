@@ -300,14 +300,19 @@ class _Raced(Exception):
     """A row moved between the read and the write: roll the whole write back."""
 
 _VARIANT_ID_KEYS = ("shopify_variant_id", "variant_id", "id")
-_VARIANT_PRICE_KEYS = ("price", "price_amount")
-#: A seed variant's "was" price, in every spelling a reader takes it from: the backend serves
-#: `original_price or compare_at_price or originalPrice` (routes/agent_shop_gateway.py), the gateway
-#: `compare_at ?? compareAt ?? compare_at_price ?? list_price` (PIVOTA-Agent src/pdpBuilder.js). Once
-#: the price reaches it the sale is over: left behind, it is an "original price" at or below the
-#: price (review of #2523, round 2, finding A).
+#: A seed variant's CURRENT price, in every spelling its readers fall back through: `price_amount`,
+#: `price`, then `list_price` (services/catalog_enrichment_agent/ingestion.variant_own_price, the
+#: dual-write's alias-conflict check, catalog_variant_price_repair, routes/employee_products).
+#: `list_price` is a current-price alias here, never a "was" price: it moves with `price` (review of
+#: #2526) -- left behind, the projection refuses the variant as `variant_price_alias_conflict`.
+_VARIANT_PRICE_KEYS = ("price", "price_amount", "list_price")
+#: A seed variant's "was" price, in every spelling a reader of the seed variant takes it from: the
+#: backend serves `original_price or compare_at_price or originalPrice` as the buyer-facing
+#: original price (routes/agent_shop_gateway.py). Once the price reaches it the sale is over: left
+#: behind, it is an "original price" at or below the price (review of #2523, round 2, finding A).
+#: (The gateway's PDP reads its compare-at from the variant's nested `price` object, not these.)
 _VARIANT_WAS_PRICE_KEYS = ("compare_at_price", "compare_at", "compareAt", "original_price",
-                           "originalPrice", "list_price")
+                           "originalPrice")
 
 
 def _variant_id_of(variant: Mapping[str, Any]) -> Optional[str]:

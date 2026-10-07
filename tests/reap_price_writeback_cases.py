@@ -991,11 +991,12 @@ async def test_the_rest_of_a_payload_is_preserved(client, monkeypatch):
 
 
 @pytest.mark.parametrize("key", ["compare_at_price", "compare_at", "compareAt", "original_price",
-                                 "originalPrice", "list_price"])
-def test_a_seed_variants_was_price_the_new_price_reaches_is_cleared(key):
+                                 "originalPrice"])
+@pytest.mark.parametrize("was", ["14.49", "14.99"], ids=["below", "equal"])
+def test_a_seed_variants_was_price_the_new_price_reaches_is_cleared(key, was):
     """Finding A: the backend serves compare_at_price as original_price; once the price reaches it
     the sale is over -- an "original price" at or below the price is wrong."""
-    seed = {"snapshot": {"variants": [{"variant_id": "111", "price": "13.99", key: "14.49"}]}}
+    seed = {"snapshot": {"variants": [{"variant_id": "111", "price": "13.99", key: was}]}}
     plan, _pl, reason = writeback.plan_seed_write(
         seed, variant_id="111", old_minor=1399, new_minor=1499, currency="USD",
         purchase_id="rp_1", observed=None)
@@ -1058,3 +1059,30 @@ async def test_the_seed_variants_was_price_clears_end_to_end(client, monkeypatch
     monkeypatch.setenv(writeback.REAP_AGENTIC_PRICE_WRITEBACK_ENV, "on")
     assert await writeback.run_writeback_pass() == {"written": 1}
     assert (await seed_state())[2]["snapshot"]["variants"][0]["compare_at_price"] is None
+
+
+
+def test_a_seed_variants_list_price_is_a_current_price_alias_and_moves_with_price():
+    """Review of #2526: in the backend `list_price` is the fallback CURRENT price of a seed variant
+    (variant_own_price; the dual-write refuses a variant whose aliases disagree), never a was-price:
+    it moves with `price` -- up or down -- and a copy whose only price is `list_price` keeps one."""
+    for old, new in ((1399, 1499), (1350, 1100)):
+        old_s, new_s = f"{old / 100:.2f}", f"{new / 100:.2f}"
+        seed = {"variants": [{"id": "111", "price": old_s, "list_price": old_s}],
+                "snapshot": {"variants": [{"variant_id": "111", "list_price": old_s}]}}
+        plan, _pl, reason = writeback.plan_seed_write(
+            seed, variant_id="111", old_minor=old, new_minor=new, currency="USD",
+            purchase_id="rp_1", observed=None)
+        assert reason == "planned", (old, new)
+        assert plan["variants"][0]["list_price"] == new_s
+        assert plan["snapshot"]["variants"][0]["list_price"] == new_s
+
+
+def test_a_list_price_alias_at_a_third_price_refuses_like_price_would():
+    """Aliases that disagree are already a variant the backend refuses (variant_price_alias_conflict);
+    write-back leaves it for a read rather than pick one."""
+    seed = {"variants": [{"id": "111", "price": "13.99", "list_price": "19.99"}]}
+    plan, _pl, reason = writeback.plan_seed_write(
+        seed, variant_id="111", old_minor=1399, new_minor=1499, currency="USD",
+        purchase_id="rp_1", observed=None)
+    assert (plan, reason) == (None, "seed_price_unexpected")
