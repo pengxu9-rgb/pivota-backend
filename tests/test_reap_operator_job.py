@@ -18,7 +18,7 @@ import jobs.reap_operator as op
 from test_reap_agentic_purchase import (  # noqa: F401 - autouse fixtures
     _db, _env, _no_network, reap, attribution, _start, _get, CHECKOUT_CREATED,
 )
-from test_reap_agentic_purchase import _manual_case
+from test_reap_agentic_purchase import _manual_case, manual_attribution  # noqa: F401 - fixture
 from test_reap_parked_dispatch_resolution import (
     _parked_unknown, _parked_observed, _audits, PII,
 )
@@ -460,3 +460,129 @@ def test_the_runbook_names_exactly_the_payload_keys():
     for key in CLI_PAYLOAD_KEYS:
         assert f"`{key}`" in section, key
     assert "never a URL" in section and "nextAction" in section
+
+
+# ── a preview is a preview: never verified by the command, never applied ──────────────────────
+
+@pytest.mark.parametrize("command", ["resolve-checkout", "resolve-parked"])
+async def test_a_preview_without_the_attestation_is_refused_by_the_service_as_unverified(reap, attribution, command):
+    """The command passes `authoritative_verified` exactly as the operator attested it, never
+    True on its own, so a resolve-* preview without --evidence-verified is the service's
+    `authoritative_evidence_required` (exit 3) and writes nothing."""
+    if command == "resolve-checkout":
+        pid, row, evidence = await _manual_case(status="FAILED")
+        argv = ["resolve-checkout", "--purchase-id", pid, "--expected-updated-at", row["updated_at"].isoformat(),
+                *_evidence_args(source="authenticated_reap_checkout_read", payload=_cli_payload(evidence),
+                                verified=False)]
+    else:
+        pid, row = await _parked_unknown(reap)
+        argv = ["resolve-parked", "--purchase-id", pid, "--dispatch-key", row["checkout_dispatch_key"],
+                "--outcome", "confirmed_not_created", "--expected-updated-at", row["updated_at"].isoformat(),
+                *_evidence_args(verified=False)]
+    reap.calls.clear()
+    code, [line] = await _run(argv)
+    assert code == op.EXIT_REFUSED
+    assert line == {"status": "refused", "reason": "authoritative_evidence_required",
+                    "command": command, "dry_run": True}
+    assert await _get(pid) == row and await _audits(pid) == []
+    assert await database.fetch_val("SELECT count(*) FROM reap_checkout_manual_resolution_audit") == 0
+    assert reap.calls == [] and attribution.calls == []
+
+
+@pytest.mark.parametrize("verified", [False, True])
+@pytest.mark.parametrize("command", ["resolve-checkout", "resolve-parked", "retire-unopened"])
+async def test_what_the_command_hands_the_service(monkeypatch, command, verified):
+    """Without --apply: dry_run is the boolean True and the attestation is exactly the flag.
+    With --apply: dry_run is the boolean False. Nothing else turns a preview into a write."""
+    import services.reap_checkout_recovery as recovery
+    import services.reap_unopened_attempt as retirement
+    from services.reap_unopened_attempt import database_identity
+
+    calls = []
+
+    async def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return {"status": "eligible", "dry_run": kwargs["dry_run"]}
+
+    monkeypatch.setattr(recovery, "resolve_checkout_manually", spy)
+    monkeypatch.setattr(recovery, "resolve_parked_dispatch", spy)
+    monkeypatch.setattr(retirement, "retire_unopened_attempt", spy)
+    if command == "resolve-checkout":
+        argv = ["resolve-checkout", "--purchase-id", "rp_1", "--expected-updated-at", "2026-10-07T00:00:00+00:00",
+                *_evidence_args(source="authenticated_reap_checkout_read",
+                                payload={"id": "chk_1", "status": "FAILED"}, verified=verified)]
+    elif command == "resolve-parked":
+        argv = ["resolve-parked", "--purchase-id", "rp_1", "--dispatch-key", "a" * 64, "--outcome",
+                "confirmed_not_created", "--expected-updated-at", "2026-10-07T00:00:00+00:00",
+                *_evidence_args(verified=verified)]
+    else:
+        argv = _retire_argv(await database_identity())
+    code, _ = await _run(argv)
+    assert code == op.EXIT_OK
+    [preview] = calls
+    assert preview["dry_run"] is True
+    if command != "retire-unopened":
+        assert preview["evidence"]["authoritative_verified"] is verified
+    if command != "retire-unopened" and not verified:
+        with pytest.raises(op.Refused):  # an apply without the attestation never reaches the service
+            await _run(argv + await _apply_args())
+        assert len(calls) == 1
+        return
+    code, _ = await _run(argv + await _apply_args())
+    assert code == op.EXIT_OK
+    assert calls[1]["dry_run"] is False
+
+
+# ── a COMPLETED resolution through the command: the service's order and amount rules hold ─────
+
+@pytest.mark.parametrize("defect,change", [
+    ("no_order", lambda p: p.pop("orderId")),
+    ("order_not_a_string", lambda p: p.update(orderId=12345)),
+    ("no_amount", lambda p: p.pop("finalAmount")),
+    ("amount_differs", lambda p: p.update(finalAmount={"amount": 100, "currency": "USD"})),
+    ("currency_differs", lambda p: p.update(finalAmount={"amount": 45, "currency": "SGD"})),
+], ids=lambda v: v if isinstance(v, str) else "")
+async def test_a_completed_resolution_needs_the_order_and_the_quoted_amount(reap, manual_attribution, defect, change):
+    pid, row, evidence = await _manual_case(status="COMPLETED")
+    payload = _cli_payload(evidence)
+    change(payload)
+    argv = ["resolve-checkout", "--purchase-id", pid, "--expected-updated-at", row["updated_at"].isoformat(),
+            *_evidence_args(source="authenticated_reap_checkout_read", payload=payload)]
+    reap.calls.clear()
+    if defect == "order_not_a_string":
+        # Refused by the command's own payload check before the service: still never resolved.
+        assert op.main(argv, environ=ENV) == op.EXIT_BAD_ARGS
+    else:
+        for extra in ([], await _apply_args()):
+            code, [line] = await _run(argv + extra)
+            assert code == op.EXIT_REFUSED and line["reason"] == "completed_value_or_order_unverified", line
+    assert await _get(pid) == row
+    assert await database.fetch_val("SELECT count(*) FROM reap_checkout_manual_resolution_audit") == 0
+    assert reap.calls == [] and manual_attribution.calls == []
+
+
+async def test_a_completed_resolution_previews_then_applies(reap, manual_attribution):
+    pid, row, evidence = await _manual_case(status="COMPLETED")
+    payload = _cli_payload(evidence)
+    assert set(payload) == {"id", "status", "orderId", "finalAmount"}
+    argv = ["resolve-checkout", "--purchase-id", pid, "--expected-updated-at", row["updated_at"].isoformat(),
+            *_evidence_args(source="authenticated_reap_checkout_read", payload=payload), "--operator", "ops_alice"]
+    reap.calls.clear()
+    code, [preview] = await _run(argv)
+    assert code == op.EXIT_OK
+    assert preview == {"status": "eligible", "state": row["state"], "proposed_state": "completed", "dry_run": True}
+    assert await _get(pid) == row and manual_attribution.calls == []
+    assert await database.fetch_val("SELECT count(*) FROM reap_checkout_manual_resolution_audit") == 0
+    code, [result] = await _run(argv + await _apply_args())
+    assert code == op.EXIT_OK and result == {"status": "resolved", "state": "completed", "dry_run": False}
+    done = await _get(pid)
+    assert done["state"] == "completed" and done["reap_order_id"] == payload["orderId"]
+    assert done["buyer_email"] is None and done["claimed_by"] is None
+    audit = await database.fetch_one("SELECT * FROM reap_checkout_manual_resolution_audit WHERE purchase_id=:id",
+                                     {"id": pid})
+    assert audit["operator_ref"] == "ops_alice" and audit["resolved_state"] == "completed"
+    assert audit["provider_status"] == "COMPLETED"
+    assert len(manual_attribution.calls) == 1 and reap.calls == []
+    # An exact replay through the command is read-only.
+    code, [replay] = await _run(argv + await _apply_args())
+    assert code == op.EXIT_OK and replay["status"] == "already_resolved" and await _get(pid) == done
