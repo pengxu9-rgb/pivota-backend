@@ -22,16 +22,22 @@ WHAT COUNTS AS INDEPENDENT. Two writers of ours read Shopify storefronts:
     scripts/backfill_shopify_variant_ids.py from one `/products/<handle>.js` fetch.
 
     THE CURRENCY DECISION: A MIRROR PROOF CORROBORATES ONLY IF THE PROOF ITSELF RECORDS A
-    `currency` EQUAL TO THE PURCHASE'S. No writer records one today, so today a mirror proof
-    NEVER corroborates. Why not infer it: `products.js` carries no currency; its `price` is in
-    whatever PRESENTMENT currency the storefront chose for the crawler's request (Shopify Markets
-    localises by IP, and our crawl egress has its own NAT), and it is always x100 -- even for
-    zero-decimal currencies -- so for JPY/KRW it is not minor units at all. The seed's
-    `price_currency` and the market currency are statements about OTHER numbers (the seed's
-    catalog price, the buyer's market); neither says what currency THIS fetch's price was in.
-    Accepting on them would be accepting on an assumption, and an assumed currency is exactly
-    how a substituted-variant price slips through. If the backfill later records the currency it
-    read, this reader starts accepting with no further change.
+    `currency` EQUAL TO THE PURCHASE'S. Never inferred: `products.js` carries no currency; its
+    `price` is in whatever PRESENTMENT currency the storefront chose for the crawler's request
+    (Shopify Markets localises by IP, and our crawl egress has its own NAT), and it is always x100
+    -- even for zero-decimal currencies -- so for JPY/KRW it is not minor units at all. The
+    seed's `price_currency` and the market currency are statements about OTHER numbers (the
+    seed's catalog price, the buyer's market); neither says what currency THIS fetch's price was
+    in. Accepting on them would be accepting on an assumption, and an assumed currency is exactly
+    how a substituted-variant price slips through.
+
+    WHO RECORDS IT (2026-10-08). The backfill reads the currency by THE CURRENCY RULE the
+    enrichment proof job uses -- one function, services/shopify_presentment.py: it asks
+    `?country=<market>`, sends no cookie, takes the `cart_currency` Set-Cookie of the same final
+    response, and keeps it only when it is the market's own currency. It then writes `currency`
+    and `price_minor` (ISO minor units of that currency) TOGETHER, or neither, on every proof
+    scope, plus the variant's live `available`. A proof written before that change, or from a
+    fetch whose currency was not verified, has no currency and never corroborates.
 
 NOTHING HERE TALKS TO THE NETWORK. Reads only, through db/reap_price_witness.py.
 """

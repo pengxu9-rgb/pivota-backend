@@ -628,11 +628,18 @@ name the numeric variant in the purchase's own cart URL:
   `checked_at` not in the future and inside the window. All usable rows must agree.
 * the mirror seed's storefront proof (`snapshot.shopify_cart_proof` /
   `shopify_cart_variant_proofs`). **It corroborates only if the proof itself records a `currency`
-  equal to the purchase's — and no writer records one today, so today it never does.**
-  `products.js` carries no currency (its price is in whatever presentment currency the storefront
-  chose for our crawler, ×100 even for zero-decimal currencies); the seed's price currency and the
-  market currency describe other numbers. An assumed currency is how a substituted variant's
-  price would slip through, so it is not assumed.
+  equal to the purchase's**, it says `available: true`, and it passes the cart-proof fetch rule and
+  the window. `products.js` carries no currency (its price is in whatever presentment currency the
+  storefront chose for our crawler, ×100 even for zero-decimal currencies); the seed's price
+  currency and the market currency describe other numbers, so neither is assumed. Since
+  2026-10-08 the mirror backfill (scripts/backfill_shopify_variant_ids.py, run nightly per store by
+  the `reap-cart-proof-mirror` job) records it by the enrichment job's own rule
+  (services/shopify_presentment.py): `?country=<seed market>`, no cookie on any request, the final
+  response's `cart_currency` Set-Cookie, and only the market's currency counts. Each proof then
+  carries `price_minor` (ISO minor units) and `currency` together, or neither; the run report's
+  `proof_currency` counts each fetch's currency or why it was not verified (`cookie_absent`,
+  `currency_not_market`, ...). Proofs written before that, or by a fetch whose currency was not
+  verified, carry none and never corroborate.
 
 With either witness dial armed, a quote that fails the subtotal AND another check now reports the other check's code (`quote_total_not_reconciled`, `quote_shipping_not_reconciled`, ...) — still `price_changed` / `price_unverifiable`, never a continue. Both lanes yielding different prices is not corroboration. The subtotal must be an exact multiple
 of the quantity. `our_price_minor` is **never rewritten**: it stays the price the buyer selected

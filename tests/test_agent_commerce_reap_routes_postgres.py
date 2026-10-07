@@ -2527,21 +2527,28 @@ async def test_tierb_the_backfill_then_the_cart_link_buys_a_named_variant_end_to
         before = await client.post(f"{BASE}/purchases", json=body)
         assert before.status_code == 409 and _error(before) == "row_variant_unverified", before.text
 
+        import httpx
+
         class _Resp:
             status_code = 200
-            headers = {"content-type": "text/javascript; charset=utf-8"}
+            headers = httpx.Headers([("content-type", "text/javascript; charset=utf-8"),
+                                     ("set-cookie", "cart_currency=USD; path=/")])
 
             @staticmethod
             def json():
                 return products_js
 
+        requested = []
+
         class _Client:
             async def get(self, url, **kwargs):
-                assert url == "https://judydoll.com/products/silky-matte-lip-ink.js"
+                requested.append(url)
                 return _Resp()
 
         summary = await backfill(limit=10, domain=domain, apply=True, client=_Client())
+        assert requested == ["https://judydoll.com/products/silky-matte-lip-ink.js?country=US"]
         assert summary["cart_proofs"] == {"named_variant": 1} and summary["write_conflicts"] == 0
+        assert summary["proof_currency"] == {"USD": 1}
 
         response = await client.post(f"{BASE}/purchases", json={**body, "idempotency_key": f"pg-named-{env}"})
         assert response.status_code == 202, response.text

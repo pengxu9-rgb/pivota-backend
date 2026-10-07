@@ -1,0 +1,282 @@
+"""THE CURRENCY RULE (services/shopify_presentment.py), shared by both storefront-proof writers,
+and the mirror backfill's use of it (PR 3: a mirror proof records the currency it read, so it
+can corroborate a changed Reap price). Pure + mock transport; the Postgres end-to-end cases are
+in tests/test_backfill_shopify_variant_ids_postgres.py ("proof currency")."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List
+
+import httpx
+import pytest
+
+from scripts import backfill_shopify_variant_ids as backfill
+from services import reap_price_corroboration as corroboration
+from services.shopify_presentment import (
+    market_read_currency,
+    no_cookie_client,
+    presentment_currency,
+    products_js_price_minor,
+)
+from services.shopify_variant_identity import parse_product_js, stamp_variant_ids
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+JUDY_JS = json.loads((_FIXTURES / "judydoll_silky_matte_lip_ink_products_js_2026_09_29.json").read_text())
+JUDY_SEED = json.loads((_FIXTURES / "judydoll_silky_matte_lip_ink_seed_2026_09_29.json").read_text())
+JUDY_VARIANT = "49819267301653"
+JUDY_JS_URL = "https://judydoll.com/products/silky-matte-lip-ink.js"
+
+
+# ── the rule ────────────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("cookies, market, expected", [
+    (["cart_currency=USD; path=/"], "US", ("USD", None)),
+    (["cart_currency=USD; path=/"], " us ", ("USD", None)),
+    (["cart_currency=SGD"], "SG", ("SGD", None)),
+    (["cart_currency=JPY"], "JP", ("JPY", None)),
+    ([], "US", (None, "cookie_absent")),
+    (["localization=US"], "US", (None, "cookie_absent")),
+    (["cart_currency=USD", "cart_currency=GBP"], "US", (None, "cookie_conflict")),
+    (["cart_currency=USD", "cart_currency=USD"], "US", ("USD", None)),
+    (["cart_currency=usd"], "US", (None, "cookie_malformed")),
+    (["cart_currency=USDX"], "US", (None, "cookie_malformed")),
+    (["cart_currency=SGD"], "US", (None, "currency_not_market")),
+    (["cart_currency=USD"], "SG", (None, "currency_not_market")),
+    (["cart_currency=EUR"], "DE", (None, "market_unknown")),
+    (["cart_currency=USD"], None, (None, "market_unknown")),
+])
+def test_only_the_markets_own_verified_currency_counts(cookies, market, expected):
+    assert market_read_currency(cookies, market) == expected
+
+
+def test_the_job_and_the_backfill_use_one_function():
+    """One rule, one function: the enrichment job imports the shared rule, it does not restate it."""
+    from jobs import enrichment_cart_variant_proof as job
+
+    assert job.presentment_currency is presentment_currency
+    assert job.no_cookie_client is no_cookie_client
+
+
+@pytest.mark.parametrize("price, currency, expected", [
+    (1399, "USD", 1399),
+    (220000, "JPY", 2200),       # .js is x100 even for zero-decimal currencies
+    (220050, "JPY", None),       # half a yen: refused, never rounded
+    (2990, "SGD", 2990),
+    (13.99, "USD", None),
+    ("1399", "USD", None),
+    (True, "USD", None),
+    (None, "USD", None),
+])
+def test_a_js_price_becomes_iso_minor_units(price, currency, expected):
+    assert products_js_price_minor(price, currency) == expected
+
+
+@pytest.mark.parametrize("market, expected", [
+    ("US", JUDY_JS_URL + "?country=US"),
+    ("sg", JUDY_JS_URL + "?country=SG"),
+    ("JP", JUDY_JS_URL + "?country=JP"),
+    ("DE", JUDY_JS_URL),
+    (None, JUDY_JS_URL),
+    ("", JUDY_JS_URL),
+])
+def test_the_request_asks_for_the_market_only_when_the_lane_prices_it(market, expected):
+    assert backfill.fetch_url_for_market(JUDY_JS_URL, market) == expected
+
+
+# ── the fetch: the final response's cookie, and no cookie on any request ──────────────────────
+
+
+def _hop_then_final(sent: List[httpx.Request], *, final_cookie: str = "cart_currency=USD; path=/"):
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        if request.url.host == "judydoll.com":
+            # A hop that sets a currency AND a localization: neither may steer the final response.
+            return httpx.Response(301, headers=[
+                ("location", str(request.url).replace("://judydoll.com", "://www.judydoll.com")),
+                ("set-cookie", "cart_currency=GBP; path=/; domain=judydoll.com"),
+                ("set-cookie", "localization=GB; path=/; domain=judydoll.com")])
+        return httpx.Response(200, headers=[("content-type", "text/javascript"), ("set-cookie", final_cookie)],
+                              json=JUDY_JS)
+    return handler
+
+
+def test_the_read_currency_is_the_final_responses_and_no_cookie_rides_the_redirect():
+    sent: List[httpx.Request] = []
+
+    async def go():
+        async with no_cookie_client(transport=httpx.MockTransport(_hop_then_final(sent))) as client:
+            return await backfill.fetch_product_js_read(client, JUDY_JS_URL + "?country=US")
+
+    payload, outcome, cookies = asyncio.run(go())
+    assert outcome == "ok" and payload["handle"] == JUDY_JS["handle"]
+    assert market_read_currency(cookies, "US") == ("USD", None)
+    assert [r.url.host for r in sent] == ["judydoll.com", "www.judydoll.com"]
+    assert all("cookie" not in r.headers for r in sent), [dict(r.headers) for r in sent]
+
+
+def test_a_default_client_would_have_carried_the_hops_cookie():
+    """The control for the test above: without the refusing jar the hop's cookies DO ride the
+    redirect, which is why both writers build their client with `no_cookie_client`."""
+    sent: List[httpx.Request] = []
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_hop_then_final(sent))) as client:
+            return await backfill.fetch_product_js_read(client, JUDY_JS_URL + "?country=US")
+
+    asyncio.run(go())
+    assert "cart_currency=GBP" in sent[1].headers.get("cookie", "")
+
+
+def test_a_failed_fetch_carries_no_cookie_evidence():
+    async def go(status):
+        transport = httpx.MockTransport(lambda r: httpx.Response(status, headers={"set-cookie": "cart_currency=USD"}))
+        async with no_cookie_client(transport=transport) as client:
+            return await backfill.fetch_product_js_read(client, JUDY_JS_URL)
+
+    for status in (404, 429, 403):
+        assert asyncio.run(go(status))[2] == ()
+    # and the classification the refresh job reads is unchanged
+    assert backfill._set_cookie_headers({"set-cookie": "cart_currency=USD"}) == ()
+
+
+# ── the proofs: price + currency together, true minor units, and the reader accepts them ──────
+
+
+def _proof(payload: Dict[str, Any], read_currency, *, checked_at=None):
+    seed = copy.deepcopy(JUDY_SEED["seed_data"])
+    live = parse_product_js(payload)
+    new_variants, _ = stamp_variant_ids(seed["snapshot"]["variants"], live)
+    proof = backfill.build_cart_proof(
+        seed, new_variants, payload, live, js_url=JUDY_JS_URL, page_url=JUDY_SEED["canonical_url"],
+        shop_host="judydoll.com", checked_at=checked_at or datetime.now(timezone.utc) - timedelta(hours=1),
+        read_currency=read_currency)
+    seed["snapshot"].update({"variants": new_variants, "shopify_cart_proof": proof})
+    return seed, proof
+
+
+def _mirror(seed, currency):
+    return corroboration.mirror_unit_price(
+        seed, variant_id=JUDY_VARIANT, product_urls=[JUDY_SEED["canonical_url"]], shop_domain="judydoll.com",
+        currency=currency, now=datetime.now(timezone.utc), max_age=timedelta(hours=72))
+
+
+def _sole(**over):
+    variant = dict(next(v for v in JUDY_JS["variants"] if str(v["id"]) == JUDY_VARIANT), **over)
+    return {**JUDY_JS, "variants": [variant]}
+
+
+def test_a_sole_variant_proof_now_corroborates():
+    """The sole proof carried no `available` and no price before, so it could never corroborate."""
+    seed, proof = _proof(_sole(), "USD")
+    assert "scope" not in proof and (proof["available"], proof["price_minor"], proof["currency"]) == (True, 1399, "USD")
+    assert _mirror(seed, "USD") == 1399
+
+
+def test_a_sold_out_sole_variant_keeps_its_cart_proof_but_never_corroborates():
+    seed, proof = _proof(_sole(available=False), "USD")
+    assert proof is not None and proof["available"] is False
+    assert _mirror(seed, "USD") is None
+
+
+def test_a_yen_price_is_written_in_yen_minor_units():
+    seed, proof = _proof(_sole(price=220000), "JPY")
+    assert (proof["price_minor"], proof["currency"]) == (2200, "JPY")
+    assert _mirror(seed, "JPY") == 2200
+
+
+def test_an_unconvertible_price_writes_neither_price_nor_currency():
+    _seed, proof = _proof(_sole(price=220050), "JPY")
+    assert (proof["price_minor"], proof["currency"]) == (None, None)
+    _seed, proof = _proof(_sole(price="13.99"), "USD")
+    assert (proof["price_minor"], proof["currency"]) == (None, None)
+
+
+def test_the_selected_variant_proofs_carry_the_same_price():
+    seed, _proof_ = _proof(JUDY_JS, "USD")
+    selected = backfill.build_selected_variant_proofs(
+        seed["snapshot"]["variants"], JUDY_JS, js_url=JUDY_JS_URL,
+        checked_at=datetime.now(timezone.utc) - timedelta(hours=1), read_currency="USD")
+    assert {vid: (p["price_minor"], p["currency"]) for vid, p in selected.items()} == {JUDY_VARIANT: (1399, "USD")}
+    unverified = backfill.build_selected_variant_proofs(
+        seed["snapshot"]["variants"], JUDY_JS, js_url=JUDY_JS_URL, checked_at=datetime.now(timezone.utc))
+    assert {vid: (p["price_minor"], p["currency"]) for vid, p in unverified.items()} == {JUDY_VARIANT: (None, None)}
+
+
+# ── the scheduled caller: the refresh job's mirror lane sends no cookie either ────────────────
+
+
+def test_the_refresh_lane_builds_its_client_without_cookies(monkeypatch):
+    """run_lane's mirror client is `no_cookie_client`: through the REAL lane, a hop's cookie never
+    reaches the next request and the run reports the final response's currency."""
+    from jobs import reap_cart_proof_refresh as refresh
+    from tests.test_reap_cart_proof_refresh import MemoryDb
+
+    t0 = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+    seeds = [{"id": "epsv_j000", "domain": "judydoll.com", "market": "US", "updated_at": None,
+              "canonical_url": JUDY_SEED["canonical_url"], "destination_url": JUDY_SEED["destination_url"],
+              "seed_data": copy.deepcopy(JUDY_SEED["seed_data"])}]
+
+    async def fake_select(limit, domain, after=None, seed_ids=None):
+        return [dict(r) for r in seeds if after is None or r["id"] > after][:limit]
+
+    sent: List[httpx.Request] = []
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(backfill, "select_candidates", fake_select)
+    monkeypatch.setattr(backfill, "GLOBAL_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(backfill, "PER_DOMAIN_MIN_GAP_S", 0.0)
+    # kwargs PRESERVED (cookies= included), unlike the lane tests' transport swap
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda *a, **k: real_client(*a, transport=httpx.MockTransport(_hop_then_final(sent)), **k))
+    lines: List[str] = []
+    plan = refresh.LanePlan(lane="mirror", domains=["judydoll.com"], writer=backfill, gap_s=0.0,
+                            proof_max_age=timedelta(days=7))
+    state = refresh.RunState()
+    asyncio.run(refresh.run_lane(plan, apply=False, budget_s=600, emit=lines.append, state=state,
+                                 db=MemoryDb(), now=lambda: t0))
+    # robots.txt is fetched by crawl_politeness on ITS OWN client (patched here too); its cookies
+    # stay in that client and say nothing about a price. The product requests are the evidence.
+    product = [r for r in sent if r.url.path.endswith(".js")]
+    assert [r.url.host for r in product] == ["judydoll.com", "www.judydoll.com"]
+    assert str(product[0].url).endswith("/products/silky-matte-lip-ink.js?country=US")
+    assert all("cookie" not in r.headers for r in product), [dict(r.headers) for r in product]
+    assert state.results["judydoll.com"].writer["proof_currency"] == {"USD": 1}
+
+
+@pytest.mark.parametrize("market, cookie, expected", [
+    ("SG", "cart_currency=SGD", {"SGD": 1}),
+    ("SG", "cart_currency=USD", {"currency_not_market": 1}),
+    ("US", "cart_currency=USD", {"USD": 1}),
+])
+def test_run_reads_each_seed_against_its_own_market(monkeypatch, market, cookie, expected):
+    """The REAL `run()` (selection faked, no DB write): the request asks the seed's market and the
+    answer is judged against THAT market's currency, not a default."""
+    seeds = [{"id": "epsv_m000", "domain": "judydoll.com", "market": market, "updated_at": None,
+              "canonical_url": JUDY_SEED["canonical_url"], "destination_url": JUDY_SEED["destination_url"],
+              "seed_data": copy.deepcopy(JUDY_SEED["seed_data"])}]
+
+    async def fake_select(limit, domain, after=None, seed_ids=None):
+        return [dict(r) for r in seeds]
+
+    sent: List[str] = []
+
+    def handler(request):
+        sent.append(str(request.url))
+        return httpx.Response(200, headers=[("content-type", "text/javascript"), ("set-cookie", cookie)], json=JUDY_JS)
+
+    monkeypatch.setattr(backfill, "select_candidates", fake_select)
+    monkeypatch.setattr(backfill, "GLOBAL_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(backfill, "PER_DOMAIN_MIN_GAP_S", 0.0)
+
+    async def go():
+        async with no_cookie_client(transport=httpx.MockTransport(handler)) as client:
+            return await backfill.run(limit=10, domain="judydoll.com", apply=False, client=client)
+
+    summary = asyncio.run(go())
+    assert sent == [JUDY_JS_URL + f"?country={market}"]
+    assert summary["proof_currency"] == expected
