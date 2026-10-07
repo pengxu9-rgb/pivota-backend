@@ -188,7 +188,7 @@ async def test_paused_row_inside_the_reentry_window_is_untouched(client):
 
 
 @pytest.mark.parametrize('evidence', ['dispatch_key', 'checkout_id', 'order_id', 'observed',
-                                      'started_unanswered', 'legacy_quoting', 'claimed'])
+                                      'started_unanswered', 'other_key_receipt', 'legacy_quoting', 'claimed'])
 async def test_reentry_lapse_never_touches_a_row_with_dispatch_evidence_or_a_lease(client, evidence):
     pid, _ = await _paused(client)
     await database.execute("UPDATE reap_agentic_purchases SET state='quoting' WHERE id=:id", {'id': pid})
@@ -204,6 +204,9 @@ async def test_reentry_lapse_never_touches_a_row_with_dispatch_evidence_or_a_lea
         await _journal(pid, 'k-observed', 'observed', checkout='chk_late')
     if evidence == 'started_unanswered':
         await _journal(pid, 'k-unanswered', 'started')
+    if evidence == 'other_key_receipt':
+        await _journal(pid, 'k-sent', 'started')
+        await _journal(pid, 'k-other', 'not_created', code='CHECKOUT_TEMPORARILY_UNAVAILABLE')
     if evidence == 'legacy_quoting':
         await database.execute('UPDATE reap_agentic_purchases SET dispatch_tracking_version=NULL WHERE id=:id', {'id': pid})
     if evidence == 'claimed':

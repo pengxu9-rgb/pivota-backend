@@ -468,6 +468,21 @@ async def test_one_run_drives_a_purchase_one_step_and_holds_no_claim(reap):
     assert len(reap.named("resolve_our_row")) == 1
 
 
+async def test_a_failing_reentry_lapse_is_one_error_and_the_claim_loop_still_runs(monkeypatch, reap):
+    """The lapse is the one sweep that reads the dispatch journal; any failure of it is counted,
+    and the due row behind it is still claimed and advanced in the same tick."""
+    async def broken(**_kwargs):
+        raise RuntimeError("reap_checkout_dispatch_events is unavailable")
+    monkeypatch.setattr(ledger, "lapse_contact_reentry", broken)
+    purchase_id = await _start()
+
+    report = await _run(worker_id="w1")
+
+    assert report.errors == 1 and report.contact_reentry_lapsed == 0
+    assert report.claimed == 1 and report.advanced == 1
+    assert (await _get(purchase_id))["state"] == "needs_enrollment"
+
+
 async def test_a_second_run_continues_it(reap):
     purchase_id = await _start()
     await _run(worker_id="w1")
