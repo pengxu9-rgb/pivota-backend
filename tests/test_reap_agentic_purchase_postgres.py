@@ -3157,3 +3157,113 @@ async def test_bounded_pilot_posture_is_logged_at_warning_once_per_process(monke
     lines = [r for r in caplog.records if 'pilot posture=' in r.getMessage()]
     assert len(lines) == 1 and lines[0].levelno == logging.ERROR
     assert 'posture=invalid_or_missing' in lines[0].getMessage()
+
+
+# -- claim timing: the regular cadence is due on the next tick; every hold stays exact ---------
+#
+# The claim is `next_poll_at <= now`. Only `_release`'s regular-cadence fallback (and a move into
+# a human-wait state) is scheduled `svc.cadence_slack_seconds` early; holds are exact.
+
+
+def _seconds_ago(seconds):
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=seconds)
+
+
+async def _awaiting_buyer(reap):
+    reap.get_checkout = _ok(CHECKOUT_CREATED)  # REQUIRES_ACTION: the buyer is still looking
+    await _active_enrollment()
+    pid = await _start()
+    await _step(pid)
+    await _step(pid)
+    assert (await _get(pid))['state'] == 'awaiting_approval'
+    await ledger.release_claim(pid, 'w1')
+    return pid
+
+
+@pytest.mark.parametrize('into_tick', [1, 14])
+async def test_a_regular_cadence_row_is_due_on_the_next_tick(reap, monkeypatch, into_tick):
+    """Released `into_tick` seconds after a tick began, 30 s ago: the tick now must take it."""
+    from datetime import timedelta
+    monkeypatch.delenv('REAP_AGENTIC_POLL_INTERVAL_SECONDS', raising=False)
+    assert svc.cadence_slack_seconds(30) == 15 and svc.cadence_slack_seconds(15) == 7
+    pid = await _awaiting_buyer(reap)
+    released_at = _seconds_ago(30 - into_tick)
+    monkeypatch.setattr(svc, '_now', lambda: released_at)
+    result = await _step(pid)
+    assert (result.outcome, result.state, result.next_poll_in_seconds) == ('released', 'awaiting_approval', 30)
+    assert (await _get(pid))['next_poll_at'] == released_at + timedelta(seconds=15)
+    assert [r['id'] for r in await ledger.claim_due_purchases('next-tick')] == [pid]
+
+
+def test_the_cadence_slack_follows_a_fast_tick_and_never_exceeds_half_the_interval(monkeypatch):
+    monkeypatch.setenv('REAP_AGENTIC_POLL_INTERVAL_SECONDS', '5')
+    assert svc.cadence_slack_seconds(30) == 2
+    monkeypatch.setenv('REAP_AGENTIC_POLL_INTERVAL_SECONDS', '600')
+    assert [svc.cadence_slack_seconds(i) for i in (15, 30, 60)] == [7, 15, 15]
+
+
+async def test_a_retry_after_is_not_claimable_before_it_ends(reap, monkeypatch):
+    """Reap asked for 20 s; the poller must not call it again 5 s later."""
+    import jobs.reap_agentic_purchase_poll as job
+    from datetime import timedelta
+    monkeypatch.delenv('REAP_AGENTIC_POLL_INTERVAL_SECONDS', raising=False)
+    await _active_enrollment()
+    pid = await _start()
+    await _step(pid)
+    reap.request_quote = rc.ReapResponse(ok=False, status=503, error='reap_status_503',
+                                         error_code='QUOTE_TEMPORARILY_UNAVAILABLE', retry_after_seconds=20)
+    released_at = _seconds_ago(5)
+    real_now = svc._now
+    monkeypatch.setattr(svc, '_now', lambda: released_at)
+    held = await _step(pid)
+    assert (held.outcome, held.next_poll_in_seconds) == ('released', 20)
+    assert (await _get(pid))['next_poll_at'] == released_at + timedelta(seconds=20)
+    monkeypatch.setattr(svc, '_now', real_now)
+    reap.calls.clear()
+    report = await job.run_reap_agentic_purchase_poll(worker_id='retry-after-plus-5')
+    assert report.claimed == 0 and reap.calls == []
+
+
+async def test_the_error_backoff_is_not_claimable_before_it_ends(reap, monkeypatch):
+    """`advance` raised 105 s ago; its 120 s backoff has 15 s left."""
+    import jobs.reap_agentic_purchase_poll as job
+    from datetime import timedelta
+    monkeypatch.delenv('REAP_AGENTIC_POLL_INTERVAL_SECONDS', raising=False)
+    pid = await _start()
+    real_advance = svc.advance
+
+    async def _raises(purchase_id, worker_id):
+        raise RuntimeError('synthetic')
+
+    monkeypatch.setattr(svc, 'advance', _raises)
+    raised_at = _seconds_ago(105)
+    report = await job.run_reap_agentic_purchase_poll(worker_id='raised', now=raised_at)
+    assert report.errors == 1
+    assert (await _get(pid))['next_poll_at'] == raised_at + timedelta(seconds=120)
+    monkeypatch.setattr(svc, 'advance', real_advance)
+    report = await job.run_reap_agentic_purchase_poll(worker_id='backoff-plus-105')
+    assert report.claimed == 0 and reap.calls == []
+
+
+async def test_the_not_created_hold_is_never_claimed_early_even_with_a_long_tick(reap, monkeypatch):
+    """With a 120 s tick the 270 s hold (A2) must still land in a later quote bucket."""
+    import jobs.reap_agentic_purchase_poll as job
+    from datetime import timedelta
+    monkeypatch.setenv('REAP_AGENTIC_POLL_INTERVAL_SECONDS', '120')
+    await _active_enrollment()
+    pid = await _start()
+    await _step(pid)
+    reap.create_checkout = rc.ReapResponse(ok=False, status=503, error='reap_status_503',
+                                           error_code='CHECKOUT_TEMPORARILY_UNAVAILABLE')
+    held_at = _seconds_ago(230)
+    real_now = svc._now
+    monkeypatch.setattr(svc, '_now', lambda: held_at)
+    held = await _step(pid)
+    assert held.next_poll_in_seconds == svc.PROVIDER_NOT_CREATED_HOLD_S == 270
+    assert (await _get(pid))['next_poll_at'] == held_at + timedelta(seconds=270)
+    monkeypatch.setattr(svc, '_now', real_now)
+    reap.calls.clear()
+    report = await job.run_reap_agentic_purchase_poll(worker_id='tick-120')
+    assert report.claimed == 0 and reap.calls == []
+    assert len(reap.named('create_checkout')) == 0

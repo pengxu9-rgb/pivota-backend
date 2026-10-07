@@ -565,6 +565,43 @@ MAX_BACKOFF_SECONDS = 600
 _MAX_BACKOFF_DOUBLINGS = 16
 
 
+#: The most the regular cadence is pulled forward; see `cadence_slack_seconds`.
+CADENCE_SLACK_MAX_SECONDS = 15
+
+
+def cadence_slack_seconds(interval: int) -> int:
+    """How much EARLIER than `release + interval` a regular-cadence row is scheduled.
+
+    THE PROBLEM. `next_poll_at` is stamped at release, a few seconds INTO a poller tick, and the
+    poller ticks every `REAP_AGENTIC_POLL_INTERVAL_SECONDS`. With `next_poll_at = release + 30`
+    the tick 30 s later finds the row a few seconds short of due, so a 30 s state was polled on
+    every OTHER tick (~60 s). The fix lives here, at release, and ONLY for the regular cadence
+    (`POLL_INTERVALS[state]`): the claim stays `next_poll_at <= now`, so a deliberate hold --
+    Retry-After, transport backoff, the error backoff, the 270 s not-created hold, the 900 s
+    holds -- is never claimed a second early.
+
+    THE SLACK is `min(interval // 2, tick // 2, CADENCE_SLACK_MAX_SECONDS)`:
+      * a row released up to `slack` seconds after its tick started is due on the tick
+        `interval` later (15 s of step time covered at the default 30 s tick);
+      * never more than half the interval, so the gap between two looks at a row can never
+        fall below `interval / 2`, even with several workers ticking at different phases;
+      * never more than half the job TICK, so a fast tick (5 s on the staging pilot) does not
+        turn a 30 s cadence into ~15 s -- it misses by at most one short tick instead.
+    The tick is the poller's own reader (`job_interval_seconds`), imported lazily: the job
+    module imports this one.
+
+    Applied by `_release`'s regular-cadence fallback ONLY. The first look after a transition
+    into a human-wait state (`_next_poll_for`) keeps its full interval.
+    """
+    try:
+        from jobs.reap_agentic_purchase_poll import job_interval_seconds
+
+        tick = int(job_interval_seconds())
+    except Exception:  # noqa: BLE001 -- a schedule must never fail a step; no slack is safe
+        return 0
+    return max(0, min(int(interval) // 2, tick // 2, CADENCE_SLACK_MAX_SECONDS))
+
+
 def transport_backoff_seconds(state: str, attempts: Any = None) -> int:
     """Seconds to wait after a transport failure in `state`, given the row's `attempts`.
 
@@ -730,6 +767,9 @@ class AdvanceResult:
     `outcome` is one of:
         advanced    the row moved to `state`
         released    the row did not move; the claim was given back with `next_poll_in_seconds`
+                    (for the regular cadence that is the state's interval: the row's stored
+                    `next_poll_at` is `cadence_slack_seconds` earlier so that the tick at that
+                    interval finds it due; for every hold it is exact)
         lost_claim  a fenced write answered None — somebody else owns this row, or a sweep
                     terminated it. NOTHING was written. Re-read, never retry.
         terminal    the row was already terminal on entry. No calls were made.
@@ -2317,17 +2357,21 @@ async def _release(
     Fenced like every other write: None means the lease moved and the answer is `lost_claim`.
     """
     state = str(row["state"])
+    # Only the REGULAR cadence is pulled forward by `cadence_slack_seconds`. Every deliberate
+    # wait -- an explicit `seconds` (Retry-After, the 270 s not-created hold, the 900 s human and
+    # contact holds) or a transport backoff -- is scheduled exactly as asked.
+    slack = 0
     if seconds is None:
-        seconds = (
-            transport_backoff_seconds(state, row.get("attempts"))
-            if transport
-            else POLL_INTERVALS[state]
-        )
+        if transport:
+            seconds = transport_backoff_seconds(state, row.get("attempts"))
+        else:
+            seconds = POLL_INTERVALS[state]
+            slack = cadence_slack_seconds(seconds)
     error_code = _error_code(error_code)
     released = await ledger.release_claim(
         str(row["id"]),
         worker_id,
-        next_poll_at=_now() + timedelta(seconds=seconds),
+        next_poll_at=_now() + timedelta(seconds=seconds - slack),
         # PERSISTED NOW. `release_claim` used to take `next_poll_at` and nothing else, so a
         # transport failure recorded its schedule and NOT its reason: the code lived only on the
         # returned `AdvanceResult` and in one log line, and a human looking at a stalled row saw
