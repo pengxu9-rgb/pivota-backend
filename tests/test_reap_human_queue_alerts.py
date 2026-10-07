@@ -106,5 +106,6 @@ def test_needs_human_policy_names_both_cohorts():
     content = reap_policies()['prod: Reap checkout needs human reconciliation']['documentation']['content']
     for phrase in ('Two cohorts', 'checkout_unresolvable', 'permanent checkout read failures',
                    'parked checkout create', 'MAY EXIST', 'legacy quoting rows',
-                   'list_parked_dispatches', 'resolve_parked_dispatch', 'resolve_checkout_manually'):
+                   'list_parked_dispatches', 'resolve_parked_dispatch', 'resolve_checkout_manually',
+                   'python -m jobs.reap_operator', 'list-needs-human', 'resolve-parked', 'resolve-checkout'):
         assert phrase in content, phrase
