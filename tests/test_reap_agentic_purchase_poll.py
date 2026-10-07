@@ -812,8 +812,8 @@ async def test_a_row_terminated_before_the_step_reads_it_is_counted_as_terminal(
     purchase_id = await _start()
     real_claim = job.ledger.claim_due_purchases
 
-    async def _claim_then_terminate(worker, *, limit, pilot_scope=None):
-        rows = await real_claim(worker, limit=limit)
+    async def _claim_then_terminate(worker, *, limit, pilot_scope=None, due_within_seconds=0):
+        rows = await real_claim(worker, limit=limit, due_within_seconds=due_within_seconds)
         await ledger.fail_exhausted_purchases(1, limit=10)
         return rows
 
@@ -2225,3 +2225,46 @@ async def test_matching_pilot_scope_allows_queued_provider_progress(monkeypatch,
     await _run()
     assert (await ledger.get_purchase_internal(purchase))["state"] == "needs_enrollment"
     assert "create_enrollment" in [name for name, _ in reap.calls]
+
+
+# ══ the claim lookahead ═══════════════════════════════════════════════════════════════════════
+#
+# `next_poll_at` is stamped at release (`release + interval`), so a 30 s state used to be due a
+# hair after the next 30 s tick and was taken on the one after (~60 s). The job now claims rows
+# due within HALF its interval, and never further out than that.
+
+
+@pytest.mark.parametrize("interval,lookahead", [(None, 15), ("30", 15), ("5", 2), ("3600", 1800)])
+def test_the_claim_lookahead_is_half_the_job_interval(monkeypatch, interval, lookahead):
+    if interval is None:
+        monkeypatch.delenv("REAP_AGENTIC_POLL_INTERVAL_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("REAP_AGENTIC_POLL_INTERVAL_SECONDS", interval)
+    assert job.claim_lookahead_seconds() == lookahead
+
+
+def _in_seconds(seconds):
+    if IS_POSTGRES:
+        return f"clock_timestamp() + INTERVAL '{int(seconds)} seconds'"
+    return f"datetime('now', '+{int(seconds)} seconds')"
+
+
+async def test_the_poller_takes_a_row_due_within_half_an_interval_and_no_further(reap, monkeypatch):
+    monkeypatch.delenv("REAP_AGENTIC_POLL_INTERVAL_SECONDS", raising=False)
+    seen = []
+    real_claim = job.ledger.claim_due_purchases
+
+    async def _recording(*args, **kwargs):
+        seen.append(kwargs.get("due_within_seconds"))
+        return await real_claim(*args, **kwargs)
+
+    monkeypatch.setattr(job.ledger, "claim_due_purchases", _recording)
+    soon = await _start()
+    later = await _start(buyer_ref="bref_later")
+    await database.execute(f"UPDATE reap_agentic_purchases SET next_poll_at = {_in_seconds(10)} WHERE id = :i", {"i": soon})
+    await database.execute(f"UPDATE reap_agentic_purchases SET next_poll_at = {_in_seconds(60)} WHERE id = :i", {"i": later})
+    report = await _run(worker_id="w1")
+    assert seen == [15]
+    assert report.claimed == 1
+    assert reap.calls, "the row due within the lookahead was stepped"
+    assert (await _get(later))["attempts"] == 0, "a row further out than the lookahead is not claimed"

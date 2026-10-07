@@ -1773,7 +1773,7 @@ _SELECT_DUE_PURCHASES_SQL = """
      WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
        AND claimed_by IS NULL
        AND next_poll_at IS NOT NULL
-       AND next_poll_at <= clock_timestamp()
+       AND next_poll_at <= clock_timestamp() + (:due_within_seconds * INTERVAL '1 second')
        AND (:reconciliation_only = 0 OR
             (state IN ('awaiting_approval', 'processing') AND reap_checkout_id IS NOT NULL)
             OR (state = 'needs_enrollment' AND enrollment_id IS NOT NULL))
@@ -1791,7 +1791,7 @@ _SELECT_DUE_PURCHASES_SQL_SQLITE = """
      WHERE state IN ('resolving', 'needs_enrollment', 'quoting', 'awaiting_approval', 'processing')
        AND claimed_by IS NULL
        AND next_poll_at IS NOT NULL
-       AND next_poll_at <= CURRENT_TIMESTAMP
+       AND next_poll_at <= datetime('now', :due_within_window)
        AND (:reconciliation_only = 0 OR
             (state IN ('awaiting_approval', 'processing') AND reap_checkout_id IS NOT NULL)
             OR (state = 'needs_enrollment' AND enrollment_id IS NOT NULL))
@@ -2072,10 +2072,24 @@ async def release_paused_claim(row, worker_id):
     return _purchase(released)
 
 
+#: The largest claim lookahead `claim_due_purchases` accepts: half the poller's longest interval.
+CLAIM_DUE_WITHIN_SECONDS_MAX = 1800
+
+
 async def claim_due_purchases(
-    worker_id: str, *, limit: int = 10, reconciliation_only: bool = False, pilot_scope: Optional[Mapping[str, Any]] = None
+    worker_id: str, *, limit: int = 10, reconciliation_only: bool = False,
+    pilot_scope: Optional[Mapping[str, Any]] = None, due_within_seconds: int = 0,
 ) -> List[Dict[str, Any]]:
     """Take a lease on up to `limit` purchases whose next_poll_at has come.
+
+    `due_within_seconds` is a bounded LOOKAHEAD: a row whose next_poll_at falls within that many
+    seconds from now counts as due. The service schedules `next_poll_at = release + interval`,
+    and a poller ticking every `interval` seconds finds such a row a hair short of due on the
+    tick that should take it, so a 30 s state was polled every ~60 s. The poller passes half its
+    own interval. A row is therefore never claimed more than `due_within_seconds` before its
+    `next_poll_at`, which bounds what the lookahead can do to a deliberate hold (a backoff of
+    600 s is still at least 600 - due_within). Default 0: exactly the old predicate.
+    Candidates are still ordered by next_poll_at, so rows truly due are taken first.
 
     reconciliation_only filters both SELECT and UPDATE to checkout-backed approval/processing
     rows, permitting safe GET-only recovery while new purchase work is disabled.
@@ -2098,15 +2112,20 @@ async def claim_due_purchases(
     """
     _require_worker_id(worker_id, "worker_id")
     capped = _sweep_limit(limit)
+    lookahead = _require_int(
+        due_within_seconds, "due_within_seconds", minimum=0, maximum=CLAIM_DUE_WITHIN_SECONDS_MAX
+    )
     if IS_POSTGRES:
         candidates = await database.fetch_all(
             _SELECT_DUE_PURCHASES_SQL,
-            {"limit": capped, "reconciliation_only": int(reconciliation_only), "pilot_scope": _scope_param(pilot_scope)},
+            {"limit": capped, "reconciliation_only": int(reconciliation_only), "pilot_scope": _scope_param(pilot_scope),
+             "due_within_seconds": lookahead},
         )
     else:
         candidates = await database.fetch_all(
             _SELECT_DUE_PURCHASES_SQL_SQLITE,
-            {"limit": capped, "reconciliation_only": int(reconciliation_only), "pilot_scope": _scope_param(pilot_scope)},
+            {"limit": capped, "reconciliation_only": int(reconciliation_only), "pilot_scope": _scope_param(pilot_scope),
+             "due_within_window": f"+{lookahead} seconds"},
         )
     claimed: List[Dict[str, Any]] = []
     for candidate in candidates:

@@ -1281,7 +1281,7 @@ async def test_the_candidate_select_does_not_offer_already_claimed_rows_on_postg
 
     offered = {
         r["id"]
-        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50, "reconciliation_only": 0, "pilot_scope": None})
+        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50, "reconciliation_only": 0, "pilot_scope": None, "due_within_seconds": 0})
     }
     assert free["id"] in offered and held["id"] not in offered
 
@@ -4025,3 +4025,59 @@ async def test_the_stuck_count_can_be_served_by_the_state_poll_index():
     text = "\n".join(row[0] for row in plan)
     assert "idx_reap_agentic_purchases_state_poll" in text, text
     assert re.search(r"Index Cond: .*state.*= ANY", text), text
+
+
+# ── the claim lookahead (`due_within_seconds`) ───────────────────────────────────────────────
+#
+# `next_poll_at` is stamped at release as `release + interval`; a poller ticking every interval
+# lands a hair short of it, so a 30 s state was only taken on every OTHER tick (~60 s). The
+# poller now passes half its interval as a lookahead. Bounded: never earlier than that.
+
+
+def _in_seconds(seconds: int) -> str:
+    return f"clock_timestamp() + INTERVAL '{int(seconds)} seconds'"
+
+
+#: `ledger.CLAIM_DUE_WITHIN_SECONDS_MAX`, written out: this module imports the ledger per test.
+_LOOKAHEAD_MAX = 1800
+
+
+async def test_a_row_due_within_the_lookahead_is_claimed_and_not_without_it():
+    import db.reap_agentic_ledger as ledger
+    purchase = await _mk(state="awaiting_approval")
+    await _set_clock_column(purchase["id"], "next_poll_at", _in_seconds(8))
+    assert await ledger.claim_due_purchases("worker_a", limit=5) == []
+    assert await ledger.claim_due_purchases("worker_a", limit=5, due_within_seconds=0) == []
+    claimed = await ledger.claim_due_purchases("worker_a", limit=5, due_within_seconds=15)
+    assert [c["id"] for c in claimed] == [purchase["id"]]
+
+
+@pytest.mark.parametrize("ahead", [60, 120, 600])
+async def test_the_lookahead_never_claims_a_row_further_out_than_itself(ahead):
+    """A hold (an error backoff, Retry-After, the re-quote bucket wait) is shortened by at most the
+    lookahead and never skipped."""
+    import db.reap_agentic_ledger as ledger
+    purchase = await _mk(state="quoting")
+    await _set_clock_column(purchase["id"], "next_poll_at", _in_seconds(ahead))
+    assert await ledger.claim_due_purchases("worker_a", limit=5, due_within_seconds=15) == []
+    assert (await ledger.get_purchase_internal(purchase["id"]))["attempts"] == 0
+
+
+async def test_truly_due_rows_are_taken_before_lookahead_rows():
+    import db.reap_agentic_ledger as ledger
+    soon = await _mk(state="awaiting_approval")
+    due = await _mk(state="awaiting_approval", buyer_ref="bref_due")
+    await _set_clock_column(soon["id"], "next_poll_at", _in_seconds(10))
+    await _set_clock_column(due["id"], "next_poll_at", _PAST)
+    claimed = await ledger.claim_due_purchases("worker_a", limit=1, due_within_seconds=15)
+    assert [c["id"] for c in claimed] == [due["id"]]
+
+
+@pytest.mark.parametrize("bad", [-1, _LOOKAHEAD_MAX + 1, True, 1.5, "15", None])
+async def test_the_lookahead_is_a_strict_bounded_int(bad):
+    import db.reap_agentic_ledger as ledger
+    assert ledger.CLAIM_DUE_WITHIN_SECONDS_MAX == _LOOKAHEAD_MAX
+    await _make_due()
+    with pytest.raises(ValueError):
+        await ledger.claim_due_purchases("worker_a", limit=5, due_within_seconds=bad)
+    assert (await ledger.claim_due_purchases("worker_b", limit=5))[0]["claimed_by"] == "worker_b"
