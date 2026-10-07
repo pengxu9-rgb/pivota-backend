@@ -23,9 +23,10 @@ DRY RUN BY DEFAULT. Every decision is a preview (`dry_run=True`) unless `--apply
   * `--expect-env <PIVOTA_ENV>`, EXACTLY this process's PIVOTA_ENV (no case folding, no strip);
   * `--expect-database <identity JSON>`, compared after connecting with
     `services.reap_unopened_attempt.database_identity()` -- what the SERVER says it is
-    (`current_database()`, `inet_server_addr()`, `current_schema()`), which no argument or
-    environment variable typed into the job can change. Both of the first two are typed by the
-    same hand, so they only catch a paste into the wrong job; this one catches the wrong database;
+    (`current_database()`, `inet_server_addr()`, `current_schema()`), not a label in the job's
+    configuration. The first two are typed by the same hand as PIVOTA_ENV, so they only catch a
+    paste into the wrong job; this one, taken from the Cloud SQL instance the decision was
+    reviewed against, catches a job that reaches a different database;
   * for `resolve-*`, a Reap host that matches the environment: a sandbox host
     (`rc.REAP_SANDBOX_HOSTS`) is refused when the environment resolves to production
     (`config.platform.is_production`, the poller's own test) and required otherwise;
