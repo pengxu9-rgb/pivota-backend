@@ -257,18 +257,27 @@ not prove shipping for this buyer or every SKU.
 {
   "purchase_id": "rp_283fba3ce85c4e59bb331e54",
   "status": "resolving",
-  "poll_after_seconds": 60
+  "poll_after_seconds": 60,
+  "checkout_dispatch_state": "not_dispatched",
+  "contact_reentry_required": false
 }
 ```
 
+`status`, `poll_after_seconds`, `checkout_dispatch_state` and `contact_reentry_required` are read
+back from the **committed** purchase after the key is bound, not assumed, so a fresh create
+normally answers `not_dispatched` / `false` but reports whatever a worker has already done. The two
+last fields mean exactly what they mean on `GET` (see "Field rules" below).
+
 **Cart-link lane only**, the body also carries **`variant_title`** (additive; no other field
-changes, and the variant lane's body is exactly the three keys above):
+changes, and the variant lane's body is exactly the five keys above):
 
 ```json
 {
   "purchase_id": "rp_283fba3ce85c4e59bb331e54",
   "status": "resolving",
   "poll_after_seconds": 60,
+  "checkout_dispatch_state": "not_dispatched",
+  "contact_reentry_required": false,
   "variant_title": "07 BURGUNDY INK"
 }
 ```
@@ -317,6 +326,7 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 | 400 | `invalid_return_url` | not https, carries userinfo, or an unallowed host | fix the request |
 | 400 | `invalid_offer_code` | `offer_code` is empty, whitespace only, longer than 128 characters, or carries a control character | fix the request (or omit the code) |
 | 400 | `currency_unsupported` | a three-decimal currency; this rail's converter assumes two | show blocked; resolve the refusal before any new purchase intent |
+| 503 | `checkout_outcome_unknown` | storage could not establish the outcome: the purchase-and-key transaction failed, the read-back of the committed purchase failed, or the key's stored mapping is unreadable. The attempt **may** exist | show unknown; call `POST /purchases/recover` with the **same body and key**, never re-POST — and never under a new key. See "Recover a lost create response" |
 
 No refusal ever carries the buyer's email or address, and none carries Reap's text.
 
@@ -377,7 +387,7 @@ including a body that is not JSON, the wrong content-type, and `?limit=500`:
 }
 ```
 
-> **`/openapi.json` still lists these three paths while the rail is dark.** The routes are mounted
+> **`/openapi.json` still lists these paths while the rail is dark.** The routes are mounted
 > at import and the schema is built from the router, so the *schema* is not gated even though every
 > *response* is. That residue is known and deliberate — a router mounted only when a dial is on is
 > a router whose mounting is never exercised — and it is the only way to tell from outside that the
@@ -423,7 +433,9 @@ one that does not exist, so this endpoint cannot be used to probe for ids.
   },
   "hosted_url": "https://pay.prava.space/enroll/3fa85f64",
   "hosted_url_expires_at": "2026-09-18T08:15:49.957734+00:00",
-  "poll_after_seconds": 30
+  "poll_after_seconds": 30,
+  "checkout_dispatch_state": "not_dispatched",
+  "contact_reentry_required": false
 }
 ```
 
@@ -460,7 +472,9 @@ one that does not exist, so this endpoint cannot be used to probe for ids.
   "hosted_url": "https://pay.prava.space/checkout/chk_7f3a",
   "hosted_url_expires_at": "2026-09-18T08:15:49.964985+00:00",
   "approval_deadline": "2026-09-18T07:20:49.964987+00:00",
-  "poll_after_seconds": 30
+  "poll_after_seconds": 30,
+  "checkout_dispatch_state": "dispatched",
+  "contact_reentry_required": false
 }
 ```
 
@@ -508,7 +522,9 @@ if the poller is dark, or `completed` when an approval landed inside the last po
     "tax_minor": 150
   },
   "order_reference": "ord_991",
-  "poll_after_seconds": null
+  "poll_after_seconds": null,
+  "checkout_dispatch_state": "dispatched",
+  "contact_reentry_required": false
 }
 ```
 
@@ -531,6 +547,38 @@ if the poller is dark, or `completed` when an approval landed inside the last po
 * **`order_reference` appears only on `completed`.**
 * **`poll_after_seconds`** is the rail's interval for the current state, and `null` on a terminal
   state (`completed`, `failed`, `refused`, `expired`).
+* **`checkout_dispatch_state`** is always present on a purchase (GET, list, `/recover`,
+  `/resume`, and the create `202` and its replays), except a retired attempt's `/recover` receipt,
+  which is not a purchase (see Recover a lost create response). It says what the durable record proves about a Reap checkout
+  for this purchase (`db/reap_continuation.dispatch_state`), never more:
+
+  | value | meaning |
+  |---|---|
+  | `not_dispatched` | tracked purchase (opened since migration 256) with no checkout create in flight and no checkout or order stored |
+  | `dispatch_started` | we committed to a checkout create and its outcome is not established — **a checkout may exist at Reap** |
+  | `dispatched` | a Reap checkout or order is stored on the purchase |
+  | `unknown` | a purchase opened before dispatch tracking: no evidence either way, which is **never** proof that nothing was sent |
+
+  Only `not_dispatched` is negative evidence. Treat the other three as "a payment page may
+  exist": keep polling, never open a replacement purchase.
+* **`contact_reentry_required`** is always present and is `true` only when the purchase is in
+  `resolving`, `needs_enrollment` or `quoting` **and** the buyer's contact (email, address,
+  offer code) was erased by the contact-retention sweep. The sweep runs on the poller: a purchase
+  nobody holds whose contact is older than `REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS` (default 900,
+  measured from creation or from the last accepted re-entry) loses it. Such a purchase makes no
+  new quote or checkout until the buyer re-enters the same contact through
+  `POST /purchases/{purchase_id}/resume` (below). It is `false` on every other state, including
+  `awaiting_approval` / `processing`, whose contact is erased by the same sweep but which need
+  nothing more from the buyer than the approval link. A contact-paused purchase that is not
+  re-entered within the re-entry window (`REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS`, default
+  86400 = 24 h, settable 3600–604800, **measured from `contact_purged_at`**, the moment the sweep
+  erased the contact) and carries no dispatch evidence of any kind is ended by the poller with
+  `last_error_code: "contact_reentry_lapsed"`: `needs_enrollment` → `expired`,
+  `resolving` → `failed`, `quoting` → `failed`. An accepted resume clears `contact_purged_at`, so
+  a purchase paused again later starts a new window from its new erasure. A purchase whose contact
+  was erased while its checkout create was unresolved does not lapse while it stays unresolved;
+  when an operator confirms that create was never made (`confirmed_not_created`),
+  `contact_purged_at` restarts at that moment, so the buyer gets a full window from then.
 * **`refusal_reason`** (on `refused`) is our vocabulary, sometimes carrying the resolver's own
   reason verbatim (e.g. `options:sole_label_differs:size`). Diagnostic, not an enum to branch on.
 * **`consent_version` / `consented_at`** (migration **233**) are the tag your door sent as
@@ -646,6 +694,8 @@ ordinary terminal `refused` (email, address and offer code are cleared).
 (buyer must approve) → `processing` → `completed`. Also `refused`, `failed`, `expired`.
 `resolving` may go straight to `quoting` when the buyer is already enrolled. The buyer needs a
 link in exactly the two states named above.
+In `resolving`, `needs_enrollment` or `quoting` the buyer may instead be needed to re-enter their
+contact: `contact_reentry_required: true` (see "Resume a contact-paused purchase" below).
 
 ---
 
@@ -686,7 +736,9 @@ not a number — is **400 `invalid_request`**, not a silent clamp, because a cal
         "tax_minor": 150
       },
       "order_reference": "ord_991",
-      "poll_after_seconds": null
+      "poll_after_seconds": null,
+      "checkout_dispatch_state": "dispatched",
+      "contact_reentry_required": false
     }
   ],
   "limit": 20
@@ -840,14 +892,110 @@ There are **no webhooks on this rail**. The poll is the only way an outcome is e
 
 The canonical hash is identical to create: merchant domain, product/variant, quantity, normalized buyer email/address, resolved return URL, item source and optional offer code. Keep the exact original body and resolved return URL; a changed configured default after an omitted return URL safely causes a conflict. Consent version is validated but is not hashed or rewritten by recovery. Click context is not hashed.
 
-* `200`: the same redacted owner purchase view as GET-by-ID.
+* `200`: normally the same redacted owner purchase view as GET-by-ID, including `checkout_dispatch_state` and `contact_reentry_required`. **Except** for an attempt an operator retired before it opened a purchase: then the body is only `{"recovery_status": "retired", "reconciliation_id": "<id>"}`, with no `checkout_dispatch_state`, no `contact_reentry_required` and no purchase fields. Branch on `recovery_status` first. A retired attempt opened no purchase and cannot continue; a new purchase needs new buyer intent and a fresh key.
 * `404 purchase_not_found`: unknown key, refusal tombstone, missing purchase or unowned purchase.
 * `409 idempotency_conflict`: a changed request or unverifiable stored fingerprint.
 * `400`: malformed original body or missing/invalid key; `401`: missing end-user identity.
+* `503 checkout_outcome_unknown`: the retirement receipt could not be read, or the key's stored mapping is a refusal marker this server cannot interpret. Retry recovery with the same body and key; never re-POST.
+* `500`: any other database error (for example while reading the key mapping or the purchase). It says nothing about the outcome; retry recovery the same way, never re-POST.
 
 A failed recovery preserves uncertainty; it never authorizes a new payment attempt. Retry read-only recovery or escalate with the original key. On the enabled create route, a same-body replay still returns `202` for the existing purchase and follows the established consent update contract. Disabled create remains disabled; use recover for a read-only lookup. No schema migration is needed. Do not delete or overwrite the key mapping merely because 24 hours elapsed. Older application versions can still perform rollover, so replace all create handlers before relying on the lifetime guarantee.
 
 
+
+
+### Resume a contact-paused purchase — `POST /agent/v2/commerce/reap/purchases/{purchase_id}/resume`
+
+The one way to continue a purchase whose `contact_reentry_required` is `true`. It puts the buyer's
+contact back on **the same purchase** — same id, buyer reference, click, cart URL, enrollment,
+consent and key — and makes it due for the poller now. It never opens a purchase, mints a key,
+calls Reap or changes the item, quantity or price. There is no create fallback.
+
+**When to call it.** Only when a `GET` (or list, recover, or create replay) shows
+`contact_reentry_required: true` **and** `checkout_dispatch_state: "not_dispatched"`. Ask your
+user to continue, then send the request below. Any other dispatch state is refused, because a
+checkout may already exist: keep polling, and never open a replacement.
+
+**Gates and authentication.** Same headers as create. The base rail, credentials, the create gate
+and (for a `cart_link` body) the cart-link gate must all be on, and the pilot scope must admit the
+purchase; otherwise `404 not_available_on_this_rail`, exactly like create. The rail and the create
+gate are checked first; the cart-link gate and the pilot scope are checked late, as part of the
+fresh admission, so a purchase can get a `409` (for example `terminal_purchase_not_resumable`)
+before their `404`. **While create is paused, resume is unavailable** and the re-entry window
+keeps running.
+
+**Request.** The **original create body, unchanged**: the same JSON that opened the purchase,
+including the same `idempotency_key`, the same buyer email and shipping address (the server
+erased them and cannot fill them in), the same `return_url` (or the same omission), the same
+`offer_code` (or the same omission), the same `item_source`, and the same
+`expected_unit_price_minor` / `expected_currency` pair. It is checked with create's canonical
+request hash, so a different body is `409 idempotency_conflict`; changing an address or email is
+outside this endpoint's authority. Three further conditions, each checked against the stored
+purchase:
+
+* the key must belong to **the same agent and the same buyer** (`X-Agent-User-JWT`) and map to
+  **this** `purchase_id`; anything else is `404 purchase_not_found`, the same answer as a
+  purchase that does not exist;
+* `buyer.consent_version` must equal the tag the purchase was opened under (`consent_version` on
+  `GET`), else `400 consent_required`, and the buyer identity link must still name the purchase's
+  buyer reference, else `409 buyer_unlinked`;
+* a **fresh admission** of the same selection: purchasability and eligibility of the merchant in
+  the buyer's market, the catalog row and variant (cart-link: the current Tier B verdict and
+  storefront proof), and the pilot scope, exactly as create checks them. The selection must
+  resolve to the **same** product, variant, merchant, market, quantity and item source
+  (`409 resume_selection_changed`) at the **same** unit price and currency
+  (`409 price_changed`).
+
+**Response — `200 OK`.** The same owner view as `GET /purchases/{purchase_id}`, now with
+`contact_reentry_required: false`. A repeat of an accepted re-entry (same body) answers `200` with
+the current view and does **not** restart the contact clock. Concurrent re-entries have one
+winner; a loser that finds the winner's re-entry answers `200` with the same view. An accepted re-entry restarts the contact-retention cap
+(`REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS`), so a buyer who leaves it again can be paused again and
+resume again. A repeat after the purchase has moved on is answered by the first check below that
+fails (for example `checkout_dispatch_unresolved` once a checkout create has started). The table
+lists the refusals **in the order the handler checks them**; the first that applies is the answer.
+
+| status | `detail.error` | meaning | what the door should do |
+|---|---|---|---|
+| 404 | `not_available_on_this_rail` | rail dark or unconfigured, or the create gate off | show unavailable; keep polling `GET`. The re-entry window is still running |
+| 401 | `agent_user_required` | no `X-Agent-User-JWT` | obtain the original buyer session |
+| 400 | `invalid_request` | the body is not JSON or does not validate as a create body, or an identifier is malformed | send the exact original body |
+| 400 | `consent_required` | `buyer.consent_version` is unusable | send the original tag |
+| 400 | `invalid_offer_code`, `invalid_address` | the re-entered contact does not validate | send the exact original body |
+| 409 | `idempotency_conflict` | the key was used for a **different** body (a changed email, address, price pair, return url, offer code, ...) | send the exact original body |
+| 409 | `merchant_not_eligible`, `attempt_retired` | the key names a remembered refusal or a retired attempt, not a purchase | do not create; this attempt cannot continue |
+| 503 | `checkout_outcome_unknown` | the key's stored mapping is a refusal marker this server cannot interpret (a database error reading it is a `500`) | call `POST /purchases/recover` with the same body and key, never re-POST |
+| 404 | `purchase_not_found` | the key is unknown for this agent and buyer, maps to another purchase, or the purchase is not theirs | do not create; check you hold the original key and buyer session |
+| 409 | `terminal_purchase_not_resumable` | the purchase is `completed`, `failed`, `refused` or `expired` (including `contact_reentry_lapsed`) | show the outcome; a new purchase needs new buyer intent and a fresh key |
+| 409 | `checkout_dispatch_unresolved` | `checkout_dispatch_state` is not `not_dispatched`: a checkout create started, a checkout exists, or the purchase predates tracking | keep polling `GET`; never re-create |
+| 409 | `contact_reentry_not_required` | the contact was never erased (or the purchase is not in `resolving` / `needs_enrollment` / `quoting`). An already accepted re-entry answers `200` here instead | keep polling `GET` |
+| 400 | `consent_required` | `buyer.consent_version` **differs from the one the purchase was opened under** | send the original tag |
+| 409 | `buyer_unlinked` | the buyer's identity link no longer names this purchase's buyer reference (for example it was repointed by a hosted sign-in) | do not create; escalate |
+| 409 | `merchant_not_purchasable` | fresh admission: the merchant is not purchasable in the buyer's market | show blocked; do not switch routes |
+| 404 | `not_available_on_this_rail` | fresh admission, `cart_link` body only: the cart-link lane is off | show unavailable; keep polling `GET` |
+| 409 | `merchant_disabled`, `merchant_not_eligible`, `row_*`, `seller_identity_unverified` | fresh admission refused the same selection (merchant, eligibility, catalog row or variant, cart-link storefront proof) | show blocked; do not switch routes |
+| 409 | `resume_selection_changed` | the catalog now resolves to a different selection than the purchase holds | show blocked; do not switch routes |
+| 409 | `price_changed` | the catalog unit price or currency differs from the purchase's | show the change; never resume or retry at another price |
+| 404 | `not_available_on_this_rail` | fresh admission, last: the pilot scope is invalid or refuses this purchase | show unavailable; keep polling `GET` |
+| 409 | `resume_raced` | the single conditional write lost: a worker holds the purchase, or its state, dispatch fence or contact revision changed in between, and no concurrent re-entry succeeded | wait `poll_after_seconds`, `GET`, and resume again only if it still says so |
+
+**If nobody resumes.** The purchase stays paused and visible to `GET`; nothing is quoted or
+dispatched. The re-entry window (`REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS`, default
+86400 = 24 h, settable 3600–604800) is **measured from `contact_purged_at`**, the moment the
+contact was erased, not from creation. Once it has passed, the poller ends the purchase with
+`last_error_code: "contact_reentry_lapsed"` (`needs_enrollment` → `expired`, `resolving` →
+`failed`, `quoting` → `failed`), and `/resume` then answers `409 terminal_purchase_not_resumable`.
+It never ends a purchase that has any dispatch evidence (a checkout create started and not
+proven not-created, a stored checkout or order, an observed checkout, or a `quoting` purchase
+that predates dispatch tracking), nor one a worker holds at that moment: those stay paused for
+the operator queue. A `resolving` / `needs_enrollment` purchase paused before dispatch tracking
+existed (migration 256), which has no `contact_purged_at`, is timed from when it entered its
+state instead; such a `quoting` purchase never lapses. An accepted resume clears `contact_purged_at`; if the buyer leaves again and
+the contact is erased again, a new window starts from that erasure. A purchase erased while its
+checkout create was unresolved (`dispatch_started`) is not lapsed while it stays unresolved; an
+operator's `confirmed_not_created` restarts `contact_purged_at` at that moment, so the buyer's full
+window runs from then and `/resume` is still required. A lost `/resume` response is
+recovered by `GET`, not by a new purchase.
 
 
 

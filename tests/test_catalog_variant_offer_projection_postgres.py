@@ -335,3 +335,85 @@ async def test_expected_manifest_refuses_source_disappearance(db):
  with pytest.raises(RuntimeError,match='plan_changed'):
   await mod.project_missing_variant_offers(PK,db=db,apply=True,expected_plan_hash=dry['plan_sha256'])
  assert await db.fetch_val("SELECT count(*) FROM catalog_offers WHERE source_system=:src",{'src':mod.SOURCE})==0
+
+
+async def test_a_projection_failure_keeps_the_groups_sku_writes(db, monkeypatch, caplog):
+    """The REAL projection hits a real Postgres error after it has inserted an offer (which
+    aborts the transaction it runs in). Its own transaction, a savepoint inside the group's,
+    is the only isolation: the projection's insert is rolled back, the group's new SKUs commit,
+    and the connection is usable for the next group. The promoter opens no savepoint of its own."""
+    import logging
+    from services import catalog_variant_promoter as promoter
+
+    new_variants = [
+        {"variant_id": "900000000001", "price": "16", "currency": "USD", "title": "Shade One"},
+        {"variant_id": "900000000002", "price": "27", "currency": "USD", "title": "Shade Two"},
+    ]
+    primary = {
+        "product_key": PK, "merchant_id": M, "platform": "external_seed",
+        "source_product_id": "external-product", "parent_title": "Test", "source_system": mod.MIRROR,
+        "catalog_track": "external_referral", "seed_data": {"snapshot": {"variants": new_variants}},
+    }
+    offer_inserts = []
+
+    class Proxy:
+        def __getattr__(self, name):
+            return getattr(db, name)
+
+        async def fetch_one(self, query, values=None):
+            if query == promoter.SELECT_GROUP_PRIMARY_SQL:
+                return primary
+            return await db.fetch_one(query, values)
+
+        async def fetch_val(self, query, values=None):
+            result = await db.fetch_val(query, values)
+            if query == mod.INSERT_SQL:
+                offer_inserts.append(result)
+                if len(offer_inserts) == 2:
+                    await db.fetch_val("SELECT 1/0")  # a real error, after a real offer insert
+            return result
+
+    monkeypatch.setattr(promoter, "database", Proxy())
+    with caplog.at_level(logging.WARNING, logger=promoter.logger.name):
+        out = await promoter.promote_variants_for_group(group_id="projection-failure", apply=True)
+    assert len(offer_inserts) == 2 and offer_inserts[0]  # the projection really wrote first
+    assert out.variant_offer_projection_failed is True and out.variant_offers_created == 0
+    assert out.variants_tier_held == 2 and out.skus_write_failed == 0
+    assert any("variant offer projection failed" in r.getMessage() and PK in r.getMessage()
+               and "DivisionByZeroError" in r.getMessage() for r in caplog.records)
+    # The group's own writes are in, the projection's are not, and the connection still works.
+    assert await db.fetch_val(
+        "SELECT count(*) FROM catalog_skus WHERE product_key=:pk AND source_variant_id IN ('900000000001','900000000002')",
+        {"pk": PK}) == 2
+    assert await db.fetch_val("SELECT count(*) FROM catalog_offers WHERE source_system=:src", {"src": mod.SOURCE}) == 0
+
+
+async def test_a_switched_off_projection_writes_no_offers_from_the_promoter(db, monkeypatch):
+    from services import catalog_variant_promoter as promoter
+
+    primary = {
+        "product_key": PK, "merchant_id": M, "platform": "external_seed",
+        "source_product_id": "external-product", "parent_title": "Test", "source_system": mod.MIRROR,
+        "catalog_track": "external_referral",
+        "seed_data": {"snapshot": {"variants": [
+            {"variant_id": "677289689108", "price": "16", "currency": "USD", "title": "120 mL"},
+            {"variant_id": "42199434526795", "price": "27", "currency": "USD", "title": "2x120 mL"}]}},
+    }
+
+    class Proxy:
+        def __getattr__(self, name):
+            return getattr(db, name)
+
+        async def fetch_one(self, query, values=None):
+            if query == promoter.SELECT_GROUP_PRIMARY_SQL:
+                return primary
+            return await db.fetch_one(query, values)
+
+    monkeypatch.setattr(promoter, "database", Proxy())
+    monkeypatch.setenv("CATALOG_VARIANT_OFFER_PROJECTION_ENABLED", "0")
+    off = await promoter.promote_variants_for_group(group_id="projection-off", apply=True)
+    assert off.variant_offers_created == 0
+    assert await db.fetch_val("SELECT count(*) FROM catalog_offers WHERE source_system=:src", {"src": mod.SOURCE}) == 0
+    monkeypatch.delenv("CATALOG_VARIANT_OFFER_PROJECTION_ENABLED")
+    on = await promoter.promote_variants_for_group(group_id="projection-on", apply=True)
+    assert on.variant_offers_created == 2

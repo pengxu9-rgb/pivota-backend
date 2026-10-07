@@ -171,6 +171,8 @@ __all__ = [
     "requeue_stale_claims",
     "expire_overdue_purchases",
     "scrub_reconciling_purchase_pii",
+    "lapse_contact_reentry",
+    "CONTACT_REENTRY_WINDOW_SECONDS_DEFAULT",
     "fail_exhausted_purchases",
     "count_stuck_purchases",
     "count_contact_retention_blocked",
@@ -2039,6 +2041,7 @@ async def count_precheckout_paused(*, precheckout_enabled=True, pilot_scope=None
 _RELEASE_PAUSED_CLAIM_SQL = """
     UPDATE reap_agentic_purchases
        SET claimed_by = NULL, claimed_at = NULL, updated_at = clock_timestamp(),
+           next_poll_at = clock_timestamp() + (:next_poll_in_seconds * INTERVAL '1 second'),
            attempts = CASE WHEN state IN ('resolving', 'quoting') AND attempts > 0
                        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
                        AND NOT (state = 'resolving' AND COALESCE(last_error_code,'') = 'enrollment_settling')
@@ -2051,6 +2054,7 @@ _RELEASE_PAUSED_CLAIM_SQL = """
 _RELEASE_PAUSED_CLAIM_SQL_SQLITE = """
     UPDATE reap_agentic_purchases
        SET claimed_by = NULL, claimed_at = NULL, updated_at = CURRENT_TIMESTAMP,
+           next_poll_at = datetime('now', :next_poll_window),
            attempts = CASE WHEN state IN ('resolving', 'quoting') AND attempts > 0
                        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
                        AND NOT (state = 'resolving' AND COALESCE(last_error_code,'') = 'enrollment_settling')
@@ -2060,13 +2064,22 @@ _RELEASE_PAUSED_CLAIM_SQL_SQLITE = """
     RETURNING *
 """
 
-async def release_paused_claim(row, worker_id):
+async def release_paused_claim(row, worker_id, *, next_poll_in_seconds: int):
+    """Refund an unadvanced claim on a paused pre-checkout row and schedule its next look.
+
+    `next_poll_in_seconds` (the state's poll interval; the caller owns that table) moves
+    `next_poll_at` forward. Without it a paused row kept its old, already-due `next_poll_at`
+    and sat at the head of the claim order (`ORDER BY next_poll_at`), taking a claim slot
+    ahead of live work on every tick for as long as the pause lasted.
+    """
     _require_worker_id(worker_id, "worker_id")
+    seconds = _require_int(next_poll_in_seconds, "next_poll_in_seconds", minimum=1, maximum=3600)
     params = {"id": str(row["id"]), "worker_id": worker_id, "state": str(row["state"]), "attempts": row["attempts"], "claimed_at": row.get("claimed_at")}
     if IS_POSTGRES:
-        released = await database.fetch_one(_RELEASE_PAUSED_CLAIM_SQL, params)
+        released = await database.fetch_one(_RELEASE_PAUSED_CLAIM_SQL, {**params, "next_poll_in_seconds": seconds})
     else:
-        released = await database.fetch_one(_RELEASE_PAUSED_CLAIM_SQL_SQLITE, params)
+        released = await database.fetch_one(
+            _RELEASE_PAUSED_CLAIM_SQL_SQLITE, {**params, "next_poll_window": f"+{seconds} seconds"})
     return _purchase(released)
 
 
@@ -2625,6 +2638,185 @@ async def scrub_reconciling_purchase_pii(
         rows = await database.fetch_all(
             _SCRUB_RECONCILING_PII_SQL_SQLITE,
             {"max_age_window": f"-{seconds} seconds", "limit": capped},
+        )
+    return [str(r["id"]) for r in rows]
+
+
+# ── the contact re-entry window: the exit for a contact-paused pre-checkout row ─────────────────
+#
+# The privacy scrub above pauses a 'resolving' / 'needs_enrollment' / 'quoting' row whose contact
+# it erased, and only the owner's POST /purchases/{id}/resume can restore it. Every other sweep
+# exempts that row (it is not abandoned, it is waiting on its owner), so before this a row whose
+# owner never came back stayed non-terminal for ever and `contact_retention_blocked` never fell.
+#
+# This sweep gives that wait a bound: `contact_purged_at` older than the re-entry window moves the
+# row to a terminal state ALREADY ALLOWED by ALLOWED_TRANSITIONS — 'needs_enrollment' → 'expired'
+# (the buyer did not come back, like an abandoned hosted page), 'resolving' / 'quoting' → 'failed'
+# — with `contact_reentry_lapsed`. It does not widen the state machine.
+#
+# IT NEVER TOUCHES A ROW WITH ANY DISPATCH EVIDENCE. A quoting row may have created a checkout,
+# and terminalising it locally would be our ledger deciding a payment outcome on a clock. So the
+# predicate requires all of: no dispatch fence (`checkout_dispatch_key IS NULL`), no stored
+# checkout or order id, version-1 dispatch tracking for 'quoting' (a legacy row is unknown, never
+# negative proof; 'resolving' and 'needs_enrollment' cannot have dispatched, because no edge leads
+# back to them from 'quoting'), no `observed` journal event, and no `started` journal event without
+# its own `not_created` receipt. An unclaimed row only: a live worker's lease is left alone.
+#
+# LEGACY ROWS (paused before migration 256): `last_error_code = 'contact_retention_elapsed'` with
+# `contact_purged_at` NULL and `dispatch_tracking_version` NULL. They cannot be resumed (restore
+# requires tracking version 1), so without this they would hold `contact_retention_blocked` above
+# zero for ever. Only 'resolving' / 'needs_enrollment' qualify -- nothing in those states can have
+# dispatched, while a legacy 'quoting' row may have and stays excluded -- and their window is
+# measured from `state_entered_at`, which no claim, release, requeue, scrub or resume rewrites
+# (only a state change does; tests/test_reap_agentic_ledger.py pins both facts). NOT
+# `updated_at`, which every release bumps. The scrub stamps `contact_purged_at` on every row it
+# pauses since 256, so a modern row never takes the legacy branch.
+#
+# The predicate is repeated at the top level for the same post-lock re-check reason the other
+# sweeps carry it; that is also what makes it race cleanly with the owner's resume, which clears
+# `contact_purged_at` (and with a dispatch, which sets the fence) in its own single UPDATE.
+_LAPSE_CONTACT_REENTRY_SQL = """
+    UPDATE reap_agentic_purchases
+       SET state = CASE WHEN state = 'needs_enrollment' THEN 'expired' ELSE 'failed' END,
+           last_error_code = 'contact_reentry_lapsed',
+           shipping_address = NULL,
+           buyer_email = NULL,
+           offer_code = NULL,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           terminal_at = clock_timestamp(),
+           state_entered_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+     WHERE state IN ('resolving', 'needs_enrollment', 'quoting')
+       AND claimed_by IS NULL
+       AND (contact_purged_at IS NOT NULL
+            OR (state IN ('resolving', 'needs_enrollment')
+                AND contact_purged_at IS NULL AND dispatch_tracking_version IS NULL
+                AND last_error_code = 'contact_retention_elapsed'))
+       AND COALESCE(contact_purged_at, state_entered_at) < clock_timestamp() - (:window_seconds * INTERVAL '1 second')
+       AND checkout_dispatch_key IS NULL AND reap_checkout_id IS NULL AND reap_order_id IS NULL
+       AND (state <> 'quoting' OR dispatch_tracking_version = 1)
+       AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events o
+                        WHERE o.purchase_id = reap_agentic_purchases.id AND o.event_type = 'observed')
+       AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events s
+                        WHERE s.purchase_id = reap_agentic_purchases.id AND s.event_type = 'started'
+                          AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events n
+                                           WHERE n.purchase_id = s.purchase_id
+                                             AND n.dispatch_key = s.dispatch_key
+                                             AND n.event_type = 'not_created'))
+       AND id IN (
+        SELECT p.id FROM reap_agentic_purchases p
+         WHERE p.state IN ('resolving', 'needs_enrollment', 'quoting')
+           AND p.claimed_by IS NULL
+           AND (p.contact_purged_at IS NOT NULL
+                OR (p.state IN ('resolving', 'needs_enrollment')
+                    AND p.contact_purged_at IS NULL AND p.dispatch_tracking_version IS NULL
+                    AND p.last_error_code = 'contact_retention_elapsed'))
+           AND COALESCE(p.contact_purged_at, p.state_entered_at) < clock_timestamp() - (:window_seconds * INTERVAL '1 second')
+           AND p.checkout_dispatch_key IS NULL AND p.reap_checkout_id IS NULL AND p.reap_order_id IS NULL
+           AND (p.state <> 'quoting' OR p.dispatch_tracking_version = 1)
+           AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events o
+                            WHERE o.purchase_id = p.id AND o.event_type = 'observed')
+           AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events s
+                            WHERE s.purchase_id = p.id AND s.event_type = 'started'
+                              AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events n
+                                               WHERE n.purchase_id = s.purchase_id
+                                                 AND n.dispatch_key = s.dispatch_key
+                                                 AND n.event_type = 'not_created'))
+         ORDER BY COALESCE(p.contact_purged_at, p.state_entered_at) ASC, p.id ASC
+         LIMIT :limit
+     )
+    RETURNING id
+"""
+
+_LAPSE_CONTACT_REENTRY_SQL_SQLITE = """
+    UPDATE reap_agentic_purchases
+       SET state = CASE WHEN state = 'needs_enrollment' THEN 'expired' ELSE 'failed' END,
+           last_error_code = 'contact_reentry_lapsed',
+           shipping_address = NULL,
+           buyer_email = NULL,
+           offer_code = NULL,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           terminal_at = CURRENT_TIMESTAMP,
+           state_entered_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE state IN ('resolving', 'needs_enrollment', 'quoting')
+       AND claimed_by IS NULL
+       AND (contact_purged_at IS NOT NULL
+            OR (state IN ('resolving', 'needs_enrollment')
+                AND contact_purged_at IS NULL AND dispatch_tracking_version IS NULL
+                AND last_error_code = 'contact_retention_elapsed'))
+       AND COALESCE(contact_purged_at, state_entered_at) < datetime('now', :window)
+       AND checkout_dispatch_key IS NULL AND reap_checkout_id IS NULL AND reap_order_id IS NULL
+       AND (state <> 'quoting' OR dispatch_tracking_version = 1)
+       AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events o
+                        WHERE o.purchase_id = reap_agentic_purchases.id AND o.event_type = 'observed')
+       AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events s
+                        WHERE s.purchase_id = reap_agentic_purchases.id AND s.event_type = 'started'
+                          AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events n
+                                           WHERE n.purchase_id = s.purchase_id
+                                             AND n.dispatch_key = s.dispatch_key
+                                             AND n.event_type = 'not_created'))
+       AND id IN (
+        SELECT p.id FROM reap_agentic_purchases p
+         WHERE p.state IN ('resolving', 'needs_enrollment', 'quoting')
+           AND p.claimed_by IS NULL
+           AND (p.contact_purged_at IS NOT NULL
+                OR (p.state IN ('resolving', 'needs_enrollment')
+                    AND p.contact_purged_at IS NULL AND p.dispatch_tracking_version IS NULL
+                    AND p.last_error_code = 'contact_retention_elapsed'))
+           AND COALESCE(p.contact_purged_at, p.state_entered_at) < datetime('now', :window)
+           AND p.checkout_dispatch_key IS NULL AND p.reap_checkout_id IS NULL AND p.reap_order_id IS NULL
+           AND (p.state <> 'quoting' OR p.dispatch_tracking_version = 1)
+           AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events o
+                            WHERE o.purchase_id = p.id AND o.event_type = 'observed')
+           AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events s
+                            WHERE s.purchase_id = p.id AND s.event_type = 'started'
+                              AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events n
+                                               WHERE n.purchase_id = s.purchase_id
+                                                 AND n.dispatch_key = s.dispatch_key
+                                                 AND n.event_type = 'not_created'))
+         ORDER BY COALESCE(p.contact_purged_at, p.state_entered_at) ASC, p.id ASC
+         LIMIT :limit
+     )
+    RETURNING id
+"""
+
+_LAPSE_CONTACT_REENTRY_SOURCE_STATES = _states_in(_LAPSE_CONTACT_REENTRY_SQL, "WHERE state IN (")
+
+#: The contact re-entry window's bounds (seconds). The poller's dial
+#: (REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS) uses the same numbers.
+CONTACT_REENTRY_WINDOW_SECONDS_DEFAULT = 86400
+CONTACT_REENTRY_WINDOW_SECONDS_MIN = 3600
+CONTACT_REENTRY_WINDOW_SECONDS_MAX = 604800
+
+
+async def lapse_contact_reentry(
+    *, window_seconds: int = CONTACT_REENTRY_WINDOW_SECONDS_DEFAULT, limit: int = 200
+) -> List[str]:
+    """Terminate contact-paused pre-checkout rows whose owner did not re-enter contact in time.
+
+    Returns the ids that moved. One bounded, guarded UPDATE, no provider call, no transaction.
+    'needs_enrollment' → 'expired'; 'resolving' / 'quoting' → 'failed'; both with
+    `last_error_code = 'contact_reentry_lapsed'`. Rows with ANY dispatch evidence, a live claim,
+    or a contact purge younger than `window_seconds` are untouched; see the note above the
+    statement. The owner's resume inside the window is unaffected. Legacy (pre-256) paused
+    'resolving' / 'needs_enrollment' rows with no `contact_purged_at` are measured from
+    `state_entered_at` instead.
+    """
+    seconds = _require_int(
+        window_seconds, "window_seconds",
+        minimum=CONTACT_REENTRY_WINDOW_SECONDS_MIN, maximum=CONTACT_REENTRY_WINDOW_SECONDS_MAX,
+    )
+    capped = _sweep_limit(limit)
+    if IS_POSTGRES:
+        rows = await database.fetch_all(
+            _LAPSE_CONTACT_REENTRY_SQL, {"window_seconds": seconds, "limit": capped}
+        )
+    else:
+        rows = await database.fetch_all(
+            _LAPSE_CONTACT_REENTRY_SQL_SQLITE, {"window": f"-{seconds} seconds", "limit": capped}
         )
     return [str(r["id"]) for r in rows]
 

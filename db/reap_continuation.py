@@ -194,8 +194,11 @@ UPDATE reap_agentic_purchases SET checkout_dispatch_key=COALESCE(checkout_dispat
 WHERE id=:id
 """
 
+# A row the scrub paused while parked gets its whole re-entry window from the un-park: the lapse
+# (ledger.lapse_contact_reentry) skipped it while the key was held. Never NULLed: /resume is still due.
 _CLEAR_NEGATIVE = """
-UPDATE reap_agentic_purchases SET checkout_dispatch_key=NULL
+UPDATE reap_agentic_purchases SET checkout_dispatch_key=NULL,
+    contact_purged_at=CASE WHEN contact_purged_at IS NULL THEN NULL ELSE clock_timestamp() END
 WHERE id=:id AND state='quoting' AND claimed_by=:worker AND claimed_at=:claimed_at AND checkout_dispatch_key=:key
   AND reap_checkout_id IS NULL AND reap_order_id IS NULL
   AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events e WHERE e.purchase_id=:id AND e.event_type='observed')
@@ -203,6 +206,7 @@ WHERE id=:id AND state='quoting' AND claimed_by=:worker AND claimed_at=:claimed_
               WHERE e.purchase_id=:id AND e.dispatch_key=:key AND e.event_type='not_created')
 RETURNING id
 """
+_CLEAR_NEGATIVE_SQLITE = _CLEAR_NEGATIVE.replace('clock_timestamp()', 'CURRENT_TIMESTAMP')
 
 class UnsentKeyReplayed(Exception):
     """The quote/enrollment pair maps to a key whose only receipt is a LOCAL not-dispatched one.
@@ -273,7 +277,7 @@ async def record_dispatch_response(row, worker, *, key, quote_id, enrollment_id,
             # previously recorded rejection. It never changes purchase state or revives it.
             await database.execute(_PRESERVE_OBSERVED_FENCE, {'id':row['id'],'key':key})
         if negative:
-            await database.fetch_one(_CLEAR_NEGATIVE, {'id':row['id'],'worker':worker,'key':key,'claimed_at':svc.ledger._bind_dt(row.get('claimed_at'))})
+            await database.fetch_one(_CLEAR_NEGATIVE if IS_POSTGRES else _CLEAR_NEGATIVE_SQLITE, {'id':row['id'],'worker':worker,'key':key,'claimed_at':svc.ledger._bind_dt(row.get('claimed_at'))})
 
 # Journal codes for a create the client proved never left the process. Prefixed so no provider
 # code can collide with them; the suffix is the client's bounded `DispatchProbe.reason`.
@@ -295,7 +299,7 @@ async def record_not_dispatched(row, worker, *, key, quote_id, enrollment_id, pr
     async with database.transaction():
         await database.execute(_APPEND, {'id':row['id'],'key':key,'event':'not_created','quote':quote_id,
                                          'enrollment':enrollment_id,'checkout':None,'code':code})
-        cleared = await database.fetch_one(_CLEAR_NEGATIVE, {'id':row['id'],'worker':worker,'key':key,
+        cleared = await database.fetch_one(_CLEAR_NEGATIVE if IS_POSTGRES else _CLEAR_NEGATIVE_SQLITE, {'id':row['id'],'worker':worker,'key':key,
                                            'claimed_at':svc.ledger._bind_dt(row.get('claimed_at'))})
     return cleared is not None
 
