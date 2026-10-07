@@ -207,8 +207,12 @@ def _pilot_scope() -> Optional[Dict[str, Any]]:
         key = (kind, fingerprint)
         if key not in _SCOPE_POSTURES:
             _SCOPE_POSTURES.add(key)
-            (logger.error if error else logger.info)(
-                "reap_agentic pilot posture=%s fingerprint=%s", kind, fingerprint)
+            # Once per process per (posture, fingerprint). `bounded` is WARNING, not INFO: nothing
+            # configures root in these processes, so INFO is dropped in production, and this line
+            # is how an operator compares the web and worker scope fingerprints. Invalid/missing
+            # stays ERROR. Never the scope itself -- only its hash.
+            level = logging.ERROR if error else logging.WARNING if kind == "bounded" else logging.INFO
+            logger.log(level, "reap_agentic pilot posture=%s fingerprint=%s", kind, fingerprint)
     def no_duplicates(pairs):
         result = {}
         for key, value in pairs:
@@ -2370,7 +2374,8 @@ async def _release(
 async def _pause_precheckout(row, worker_id):
     # Only refund this still-owned, unadvanced claim. Preserve attempts accumulated by work,
     # enrollment settling provenance and the state clock; pausing is not an error transition.
-    released = await ledger.release_paused_claim(row, worker_id)
+    released = await ledger.release_paused_claim(
+        row, worker_id, next_poll_in_seconds=POLL_INTERVALS[str(row["state"])])
     if released is None:
         return _lost(row)
     return AdvanceResult(str(row["id"]), outcome="released", state=str(row["state"]),
@@ -4169,6 +4174,12 @@ async def _release_checkout_read_failure(row, worker_id, code):
     if previous.startswith("checkout_unresolvable:"):
         # Only a valid provider outcome clears human review; an outage cannot hide it.
         return await _release(row, worker_id, error_code=previous, seconds=CHECKOUT_HUMAN_RETRY_SECONDS)
+    if previous.startswith("checkout_read_permanent:"):
+        # Keep the permanent-failure count across an interleaved transient error. Writing the
+        # transient code here reset it, so 404 / timeout / 404 / timeout ... never reached
+        # PERMANENT_CHECKOUT_READ_LIMIT and never surfaced as human work. Only a valid read
+        # clears it (`checkout_read_recovered`). The transient error keeps its own backoff.
+        return await _release(row, worker_id, error_code=previous, transport=_is_transport(code))
     return await _release(row, worker_id, error_code=code, transport=_is_transport(code))
 
 

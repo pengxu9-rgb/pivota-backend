@@ -91,6 +91,9 @@ async def resolve_checkout_manually(purchase_id: str, *, evidence: Mapping[str, 
     authentic provider response/support record. All DB writes share one short transaction.
     A successful exact-evidence replay is read-only. Changed evidence or stale fences refuse.
     """
+    if type(dry_run) is not bool:
+        # `dry_run=0` must not apply: a falsy non-bool is a caller mistake, not a decision.
+        raise ManualResolutionRefused("explicit_boolean_preview_required")
     if not isinstance(expected_updated_at, datetime):
         raise ManualResolutionRefused("expected_timestamp_required")
     async with database.transaction():
@@ -280,6 +283,9 @@ async def resolve_parked_dispatch(purchase_id: str, *, dispatch_key: str, outcom
     may be superseded when this key is parked again after it (a late `observed` receipt, which
     is the only way checkout_found can overturn it, or a same-quote re-park).
     """
+    if type(dry_run) is not bool:
+        # `dry_run=0` must not apply: a falsy non-bool is a caller mistake, not a decision.
+        raise ManualResolutionRefused("explicit_boolean_preview_required")
     if outcome not in PARKED_OUTCOMES:
         raise ManualResolutionRefused("outcome_invalid")
     if not isinstance(dispatch_key, str) or not _DISPATCH_KEY.fullmatch(dispatch_key):

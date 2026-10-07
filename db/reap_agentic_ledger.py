@@ -2041,6 +2041,7 @@ async def count_precheckout_paused(*, precheckout_enabled=True, pilot_scope=None
 _RELEASE_PAUSED_CLAIM_SQL = """
     UPDATE reap_agentic_purchases
        SET claimed_by = NULL, claimed_at = NULL, updated_at = clock_timestamp(),
+           next_poll_at = clock_timestamp() + (:next_poll_in_seconds * INTERVAL '1 second'),
            attempts = CASE WHEN state IN ('resolving', 'quoting') AND attempts > 0
                        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
                        AND NOT (state = 'resolving' AND COALESCE(last_error_code,'') = 'enrollment_settling')
@@ -2053,6 +2054,7 @@ _RELEASE_PAUSED_CLAIM_SQL = """
 _RELEASE_PAUSED_CLAIM_SQL_SQLITE = """
     UPDATE reap_agentic_purchases
        SET claimed_by = NULL, claimed_at = NULL, updated_at = CURRENT_TIMESTAMP,
+           next_poll_at = datetime('now', :next_poll_window),
            attempts = CASE WHEN state IN ('resolving', 'quoting') AND attempts > 0
                        AND COALESCE(last_error_code,'') <> 'contact_retention_elapsed'
                        AND NOT (state = 'resolving' AND COALESCE(last_error_code,'') = 'enrollment_settling')
@@ -2062,13 +2064,22 @@ _RELEASE_PAUSED_CLAIM_SQL_SQLITE = """
     RETURNING *
 """
 
-async def release_paused_claim(row, worker_id):
+async def release_paused_claim(row, worker_id, *, next_poll_in_seconds: int):
+    """Refund an unadvanced claim on a paused pre-checkout row and schedule its next look.
+
+    `next_poll_in_seconds` (the state's poll interval; the caller owns that table) moves
+    `next_poll_at` forward. Without it a paused row kept its old, already-due `next_poll_at`
+    and sat at the head of the claim order (`ORDER BY next_poll_at`), taking a claim slot
+    ahead of live work on every tick for as long as the pause lasted.
+    """
     _require_worker_id(worker_id, "worker_id")
+    seconds = _require_int(next_poll_in_seconds, "next_poll_in_seconds", minimum=1, maximum=3600)
     params = {"id": str(row["id"]), "worker_id": worker_id, "state": str(row["state"]), "attempts": row["attempts"], "claimed_at": row.get("claimed_at")}
     if IS_POSTGRES:
-        released = await database.fetch_one(_RELEASE_PAUSED_CLAIM_SQL, params)
+        released = await database.fetch_one(_RELEASE_PAUSED_CLAIM_SQL, {**params, "next_poll_in_seconds": seconds})
     else:
-        released = await database.fetch_one(_RELEASE_PAUSED_CLAIM_SQL_SQLITE, params)
+        released = await database.fetch_one(
+            _RELEASE_PAUSED_CLAIM_SQL_SQLITE, {**params, "next_poll_window": f"+{seconds} seconds"})
     return _purchase(released)
 
 

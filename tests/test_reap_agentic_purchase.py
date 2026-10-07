@@ -5084,8 +5084,15 @@ async def test_scope_change_after_claim_refunds_only_unadvanced_claim(monkeypatc
     assert result.outcome == "released"
     after = await ledger.get_purchase_internal(purchase)
     assert after["claimed_by"] is None
-    for name in ["state", "attempts", "state_entered_at", "last_error_code", "next_poll_at"]:
+    for name in ["state", "attempts", "state_entered_at", "last_error_code"]:
         assert after[name] == before[name]
+    from datetime import datetime, timedelta, timezone
+    # The paused row goes to the back of the claim order for one poll interval instead of
+    # staying at its old, already-due next_poll_at.
+    interval = timedelta(seconds=svc.POLL_INTERVALS[state])
+    assert before["next_poll_at"] + interval - timedelta(seconds=2) <= after["next_poll_at"]
+    assert after["next_poll_at"] <= datetime.now(timezone.utc) + interval + timedelta(seconds=2)
+    assert await ledger.claim_due_purchases("scope-worker-2") == []
     assert reap.calls == []
 
 
@@ -5114,9 +5121,9 @@ async def test_pause_refund_cannot_touch_changed_attempt_or_foreign_holder():
     assert len(rows) == 1
     stale = rows[0]
     await database.execute("UPDATE reap_agentic_purchases SET attempts=attempts+1 WHERE id=:id", {"id": purchase})
-    assert await ledger.release_paused_claim(stale, "scope-worker") is None
+    assert await ledger.release_paused_claim(stale, "scope-worker", next_poll_in_seconds=60) is None
     current = await ledger.get_purchase_internal(purchase)
-    assert await ledger.release_paused_claim(current, "foreign-worker") is None
+    assert await ledger.release_paused_claim(current, "foreign-worker", next_poll_in_seconds=60) is None
     assert (await ledger.get_purchase_internal(purchase))["claimed_by"] == "scope-worker"
 
 
@@ -5349,3 +5356,71 @@ async def test_scope_pause_attempt_exempt_claim_timestamp_generation(monkeypatch
     after = await ledger.get_purchase_internal(purchase)
     for field in ["attempts", "claimed_by", "claimed_at", "state", "last_error_code", "next_poll_at"]:
         assert after[field] == captured[field], field
+
+
+async def test_an_interleaved_transient_read_error_does_not_reset_the_permanent_count(reap):
+    import services.reap_agentic_client as rc
+    pid = await _recovery_checkout()
+    permanent = rc.ReapResponse(ok=False, status=404, error='reap_status_404')
+    codes = []
+    for answer in (permanent, _transport(), permanent, rc.ReapResponse(ok=False, status=500, error='reap_status_500'),
+                   permanent):
+        reap.get_checkout = answer
+        await _step(pid)
+        codes.append((await _get(pid))['last_error_code'])
+    assert codes == ['checkout_read_permanent:1:reap_status_404', 'checkout_read_permanent:1:reap_status_404',
+                     'checkout_read_permanent:2:reap_status_404', 'checkout_read_permanent:2:reap_status_404',
+                     'checkout_unresolvable:3:reap_status_404']
+    assert (await _get(pid))['state'] == 'awaiting_approval'
+    # A valid provider read still clears it.
+    reap.get_checkout = _ok({'status': 'PROCESSING'})
+    await _step(pid)
+    assert (await _get(pid))['state'] == 'processing'
+
+
+async def test_a_transient_hold_after_a_permanent_read_keeps_the_transient_backoff(reap):
+    import services.reap_agentic_client as rc
+    pid = await _recovery_checkout()
+    reap.get_checkout = rc.ReapResponse(ok=False, status=404, error='reap_status_404')
+    await _step(pid)
+    reap.get_checkout = _transport()
+    held = await _step(pid)
+    assert held.last_error_code == 'checkout_read_permanent:1:reap_status_404'
+    assert held.next_poll_in_seconds == svc.transport_backoff_seconds('awaiting_approval', (await _get(pid))['attempts'])
+
+
+@pytest.mark.parametrize('dry_run', [0, 1, None, 'false', ''])
+async def test_recovery_resolvers_require_an_explicit_boolean_dry_run(dry_run):
+    from datetime import datetime, timezone
+    from services import reap_checkout_recovery as recovery
+    at = datetime.now(timezone.utc)
+    with pytest.raises(recovery.ManualResolutionRefused, match='explicit_boolean_preview_required'):
+        await recovery.resolve_checkout_manually('rp_any', evidence={}, operator_ref='op', expected_updated_at=at,
+                                                 dry_run=dry_run)
+    with pytest.raises(recovery.ManualResolutionRefused, match='explicit_boolean_preview_required'):
+        await recovery.resolve_parked_dispatch('rp_any', dispatch_key='0' * 64, outcome='confirmed_not_created',
+                                               evidence={}, operator_ref='op', expected_updated_at=at,
+                                               dry_run=dry_run)
+
+
+async def test_bounded_pilot_posture_is_logged_at_warning_once_per_process(monkeypatch, caplog):
+    import json
+    import logging
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setattr(svc, "_SCOPE_POSTURES", set())
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot()))
+    caplog.set_level(logging.DEBUG, logger=svc.logger.name)
+    for _ in range(3):
+        assert svc.pilot_admission_scope() is not None
+    lines = [r for r in caplog.records if 'pilot posture=' in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.WARNING
+    assert 'posture=bounded fingerprint=' in lines[0].getMessage()
+    assert 'agent_one' not in caplog.text
+    caplog.clear()
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", "{not json")
+    for _ in range(2):
+        with pytest.raises(svc.PurchaseRefused):
+            svc._pilot_scope()
+    lines = [r for r in caplog.records if 'pilot posture=' in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.ERROR
+    assert 'posture=invalid_or_missing' in lines[0].getMessage()
