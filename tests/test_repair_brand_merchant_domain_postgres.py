@@ -52,13 +52,13 @@ async def catalog():
         await admin.close()
 
 
-async def _merchant(admin, mid, ref, *, lane=LANE, extra=None):
-    md = {"domain": ref, "agent_version": LANE, **(extra or {})}
+async def _merchant(admin, mid, ref, *, lane=LANE, extra=None, metadata=...):
+    md = {"domain": ref, "agent_version": LANE, **(extra or {})} if metadata is ... else metadata
     await admin.execute(
         """INSERT INTO catalog_merchants (merchant_id, merchant_name, primary_platform, status, source_system,
-                                          source_ref, metadata_json)
-           VALUES ($1, $1, 'external_seed', 'active', $2, $3, CAST($4 AS jsonb))""",
-        mid, lane, ref, json.dumps(md))
+                                          source_ref, metadata_json, updated_at)
+           VALUES ($1, $1, 'external_seed', 'active', $2, $3, CAST($4 AS jsonb), NOW() - INTERVAL '30 days')""",
+        mid, lane, ref, None if md is None else json.dumps(md))
 
 
 async def _listing(admin, key, domain, url):
@@ -69,13 +69,16 @@ async def _listing(admin, key, domain, url):
         key, url, domain, LANE)
 
 
-async def _offer(admin, oid, key, merchant, url, *, suppressed=False, lane=LANE):
+async def _offer(admin, oid, key, merchant, url, *, suppressed=False, lane=LANE, canonical=None, offer_type=None):
+    # The lane writes the destination as source_ref and keeps the canonical URL in the payload.
+    payload = {"destination_url": url, "canonical_url": canonical or url}
     await admin.execute(
         """INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, channel, market, currency,
-                                       source_domain, source_ref, catalog_track, source_system, suppressed_at)
+                                       source_domain, source_ref, catalog_track, source_system, suppressed_at,
+                                       offer_payload, offer_type)
            VALUES ($1, $2, $3, $4, 'default', 'US', 'USD', NULL, $5, 'external_referral', $6,
-                   CASE WHEN $7 THEN NOW() ELSE NULL END)""",
-        oid, f"sku:{oid}", key, merchant, url, lane, suppressed)
+                   CASE WHEN $7 THEN NOW() ELSE NULL END, CAST($8 AS jsonb), $9)""",
+        oid, f"sku:{oid}", key, merchant, url, lane, suppressed, json.dumps(payload), offer_type)
 
 
 async def _seed(admin):
@@ -92,12 +95,12 @@ async def _seed(admin):
     await _merchant(admin, "agent_seed::tower-28", "cocomo.sg")
     await _listing(admin, "ext:t28::1", "www.tower28beauty.com", "https://www.tower28beauty.com/products/x")
     await _offer(admin, "o_t28", "ext:t28::1", "agent_seed::tower-28", "https://www.tower28beauty.com/products/x")
-    # Only the cocomo run ever sold under it: no evidence of the store (66 such rows in prod).
+    # Only the cocomo run ever sold under it: no evidence of the store (65 such rows in prod).
     await _merchant(admin, "agent_seed::aalok", "cocomo.sg")
     await _listing(admin, "ext:retailer:c2", "cocomo.sg", "https://cocomo.sg/products/aalok")
     await _offer(admin, "o_aalok", "ext:retailer:c2", "agent_seed::aalok", "https://cocomo.sg/products/aalok",
                  suppressed=True)
-    # Two live hosts (Medicube): ambiguous.
+    # Two live hosts: ambiguous.
     await _merchant(admin, "agent_seed::medicube", "cocomo.sg")
     await _listing(admin, "ext:mc::1", "medicube.us", "https://medicube.us/p/1")
     await _listing(admin, "ext:mc::2", "themedicube.us.com", "https://themedicube.us.com/p/2")
@@ -201,3 +204,74 @@ async def test_without_an_incident_host_nothing_is_planned(catalog):
     p = await tool.plan(database, ["sokoglam.com"])
     # round-lab's row says sokoglam.com and its live store is roundlab.com: a different incident, named explicitly.
     assert [(r["merchant_id"], r["to_host"]) for r in p["repairs"]] == [("agent_seed::round-lab", "roundlab.com")]
+
+
+async def _one_store(admin, mid, *, listing_domain="axis-y.com", url="https://axis-y.com/products/a", **offer):
+    await _listing(admin, f"ext:{mid}::1", listing_domain, url)
+    await _offer(admin, f"o_{mid}", f"ext:{mid}::1", mid, url, **offer)
+
+
+async def test_rows_without_a_trustworthy_single_store_host_are_left(catalog):
+    database, admin, tool = catalog
+    # Medicube's prod path: the listing carries no domain.
+    await _merchant(admin, "agent_seed::nohost", "cocomo.sg")
+    await _one_store(admin, "agent_seed::nohost", listing_domain=None)
+    # The lane keys the seller row on the CANONICAL url; a destination on another host is not the store.
+    await _merchant(admin, "agent_seed::split", "cocomo.sg")
+    await _one_store(admin, "agent_seed::split", listing_domain="shop.split.com",
+                     url="https://shop.split.com/p", canonical="https://split.com/p")
+    # A retailer is never a brand's own store: by the offer's label, or by the known-retailer list.
+    await _merchant(admin, "agent_seed::labelled", "cocomo.sg")
+    await _one_store(admin, "agent_seed::labelled", offer_type="retailer")
+    await _merchant(admin, "agent_seed::listed", "cocomo.sg")
+    await _one_store(admin, "agent_seed::listed", listing_domain="sephora.com", url="https://www.sephora.com/p/1")
+    # Metadata that is the JSON value null is not an object to merge into.
+    await _merchant(admin, "agent_seed::nullmeta", "cocomo.sg", metadata="null")
+    await _one_store(admin, "agent_seed::nullmeta")
+    # LIKE's underscore would have matched this id; the brand prefix is literal.
+    await _merchant(admin, "agentXseed::lookalike", "cocomo.sg")
+    await _one_store(admin, "agentXseed::lookalike")
+    p = await tool.plan(database, POLLUTED)
+    assert p["repairs"] == []
+    assert p["skipped"] == {"host_missing": 1, "offers_from_several_hosts": 1, "target_is_a_retailer": 2,
+                            "metadata_not_an_object": 1}
+    assert p["rows_on_polluted_host"] == 5
+
+
+async def test_the_dry_run_shows_whether_the_restored_row_can_serve(catalog):
+    database, admin, tool = catalog
+    await _merchant(admin, "agent_seed::axis-y", "cocomo.sg")
+    await _one_store(admin, "agent_seed::axis-y")
+    await admin.execute("UPDATE catalog_merchants SET indexable = FALSE")
+    s = tool.summary(await tool.plan(database, POLLUTED))
+    assert [list(r) for r in s["repairs"]] == [["agent_seed::axis-y", "cocomo.sg", "axis-y.com", 1, "active", False]]
+
+
+@pytest.mark.parametrize("touch", [
+    # A re-run of the brand's own store writes the SAME host and bumps updated_at.
+    "UPDATE catalog_merchants SET updated_at = NOW() WHERE merchant_id = 'agent_seed::axis-y'",
+    "UPDATE catalog_merchants SET source_ref = 'axis-y.co' WHERE merchant_id = 'agent_seed::axis-y'",
+    "UPDATE catalog_merchants SET metadata_json = metadata_json || '{\"domain\": \"axis-y.co\"}' "
+    "WHERE merchant_id = 'agent_seed::axis-y'",
+])
+async def test_revert_never_overwrites_a_row_any_writer_touched_since(catalog, touch):
+    database, admin, tool = catalog
+    await _merchant(admin, "agent_seed::axis-y", "cocomo.sg")
+    await _one_store(admin, "agent_seed::axis-y")
+    run_id = (await tool.apply(database, await tool.plan(database, POLLUTED)))["run_id"]
+    await admin.execute(touch)
+    touched = await _rows(admin)
+    out = await tool.revert(database, run_id)
+    assert out["reverted"] == 0 and out["changed_since"] == ["agent_seed::axis-y"]
+    assert await _rows(admin) == touched
+
+
+async def test_revert_restores_null_metadata_exactly(catalog):
+    database, admin, tool = catalog
+    await _merchant(admin, "agent_seed::bare", "cocomo.sg", metadata=None)
+    await _one_store(admin, "agent_seed::bare")
+    before = await _rows(admin)
+    run_id = (await tool.apply(database, await tool.plan(database, POLLUTED)))["run_id"]
+    assert (await _rows(admin))["agent_seed::bare"][:2] == ("axis-y.com", {"domain": "axis-y.com"})
+    assert (await tool.revert(database, run_id))["reverted"] == 1
+    assert await _rows(admin) == before
