@@ -401,3 +401,20 @@ async def test_the_legacy_branch_takes_nothing_else(client, variant):
         await database.execute("UPDATE reap_agentic_purchases SET last_error_code='transport_error:readtimeout' WHERE id=:id", {'id': pid})
     assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == []
     assert (await ledger.get_purchase_internal(pid))['terminal_at'] is None
+
+
+@pytest.mark.parametrize('evidence', ['observed', 'started_unanswered'])
+async def test_an_excluded_row_cannot_starve_the_lapse_batch(client, evidence):
+    """The journal exclusions are in the candidate subquery too, so an older row they exclude does
+    not take the only LIMIT slot and leave an eligible row behind it for ever."""
+    blocked, _ = await _paused(client)
+    eligible, _ = await _paused_again(client)
+    await database.execute("UPDATE reap_agentic_purchases SET state='quoting' WHERE id=:id", {'id': blocked})
+    await _journal(blocked, 'k-blocked', 'started')
+    if evidence == 'observed':
+        await _journal(blocked, 'k-blocked', 'not_created', code='CHECKOUT_TEMPORARILY_UNAVAILABLE')
+        await _journal(blocked, 'k-blocked', 'observed', checkout='chk_late')
+    await _age_purge(blocked, 3 * _DAY)
+    await _age_purge(eligible, 2 * _DAY)
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY, limit=1) == [eligible]
+    assert (await ledger.get_purchase_internal(blocked))['state'] == 'quoting'

@@ -2715,6 +2715,14 @@ _LAPSE_CONTACT_REENTRY_SQL = """
            AND COALESCE(p.contact_purged_at, p.state_entered_at) < clock_timestamp() - (:window_seconds * INTERVAL '1 second')
            AND p.checkout_dispatch_key IS NULL AND p.reap_checkout_id IS NULL AND p.reap_order_id IS NULL
            AND (p.state <> 'quoting' OR p.dispatch_tracking_version = 1)
+           AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events o
+                            WHERE o.purchase_id = p.id AND o.event_type = 'observed')
+           AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events s
+                            WHERE s.purchase_id = p.id AND s.event_type = 'started'
+                              AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events n
+                                               WHERE n.purchase_id = s.purchase_id
+                                                 AND n.dispatch_key = s.dispatch_key
+                                                 AND n.event_type = 'not_created'))
          ORDER BY COALESCE(p.contact_purged_at, p.state_entered_at) ASC, p.id ASC
          LIMIT :limit
      )
@@ -2761,6 +2769,14 @@ _LAPSE_CONTACT_REENTRY_SQL_SQLITE = """
            AND COALESCE(p.contact_purged_at, p.state_entered_at) < datetime('now', :window)
            AND p.checkout_dispatch_key IS NULL AND p.reap_checkout_id IS NULL AND p.reap_order_id IS NULL
            AND (p.state <> 'quoting' OR p.dispatch_tracking_version = 1)
+           AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events o
+                            WHERE o.purchase_id = p.id AND o.event_type = 'observed')
+           AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events s
+                            WHERE s.purchase_id = p.id AND s.event_type = 'started'
+                              AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events n
+                                               WHERE n.purchase_id = s.purchase_id
+                                                 AND n.dispatch_key = s.dispatch_key
+                                                 AND n.event_type = 'not_created'))
          ORDER BY COALESCE(p.contact_purged_at, p.state_entered_at) ASC, p.id ASC
          LIMIT :limit
      )

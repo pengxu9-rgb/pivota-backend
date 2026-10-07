@@ -4741,3 +4741,11 @@ async def test_the_reentry_lapse_only_takes_legal_terminal_edges_and_guards_at_t
                       f"COALESCE({{a}}contact_purged_at, {{a}}state_entered_at) < {window}"):
             assert guard.format(a="") in outer, (name, guard)
             assert guard.format(a="p.") in inner, (name, guard)
+        # The journal exclusions are in BOTH places too: in the outer re-check, and in the
+        # candidate subquery so a row they exclude cannot fill the LIMIT batch and starve rows
+        # behind it.
+        for ref, part in (("reap_agentic_purchases.id", outer), ("p.id", inner)):
+            for journal in (f"o.purchase_id = {ref} AND o.event_type = 'observed'",
+                            f"s.purchase_id = {ref} AND s.event_type = 'started'"):
+                assert journal in part, (name, journal)
+        assert inner.count("n.event_type = 'not_created'") == 1, name
