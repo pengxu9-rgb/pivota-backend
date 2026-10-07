@@ -981,43 +981,6 @@ async def ensure_required_schema_light() -> None:
                     "ON reap_agentic_enrollments (buyer_ref) "
                     "WHERE status = 'active';"
                 )
-                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_unopened_attempt_retirements (
-    receipt_id VARCHAR(32) PRIMARY KEY,
-    agent_id VARCHAR(128) NOT NULL,
-    agent_user_ref_hash VARCHAR(64) NOT NULL,
-    native_key VARCHAR(128) NOT NULL,
-    cart_key VARCHAR(128) NOT NULL,
-    native_request_hash VARCHAR(64) NOT NULL,
-    cart_request_hash VARCHAR(64) NOT NULL,
-    authority_sha256 VARCHAR(64) NOT NULL,
-    evidence_sha256 VARCHAR(64) NOT NULL,
-    operator_ref VARCHAR(128) NOT NULL,
-    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (agent_id, agent_user_ref_hash, native_key, cart_key),
-    CHECK (native_key <> cart_key)
-);
-"""))
-                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_checkout_manual_resolution_audit (
-    purchase_id VARCHAR(64) PRIMARY KEY,
-    reap_checkout_id VARCHAR(128) NOT NULL,
-    from_state VARCHAR(32) NOT NULL,
-    resolved_state VARCHAR(32) NOT NULL,
-    attribution_outcome VARCHAR(32) NOT NULL,
-    operator_ref VARCHAR(128) NOT NULL,
-    evidence_source VARCHAR(64) NOT NULL,
-    evidence_reference VARCHAR(128) NOT NULL,
-    evidence_sha256 VARCHAR(64) NOT NULL,
-    expected_updated_at TIMESTAMPTZ NOT NULL,
-    evidence_observed_at TIMESTAMPTZ NOT NULL,
-    provider_base_url VARCHAR(255) NOT NULL,
-    provider_status VARCHAR(32) NOT NULL,
-    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CHECK (from_state IN ('awaiting_approval','processing')),
-    CHECK (resolved_state IN ('completed','failed','expired')),
-    CHECK (provider_status IN ('COMPLETED','FAILED','EXPIRED')),
-    CHECK (attribution_outcome IN ('edge_closed','closed_by_other_channel','not_applicable')),
-    CHECK (evidence_source IN ('authenticated_reap_checkout_read','verified_reap_support_statement'))
-);"""))
                 await database.execute(
                     text(
                         """
@@ -1104,6 +1067,58 @@ async def ensure_required_schema_light() -> None:
                 # call against it is an UndefinedTable 500 rather than a wrong
                 # answer, so the failure is visible from the first request.
                 pass
+            # mig 255 and mig 253: the operator audit tables
+            # (reap_unopened_attempt_retirements, reap_checkout_manual_resolution_audit).
+            # EACH IN ITS OWN try, AFTER the mig-224 block. They used to sit inside it,
+            # between the enrollments and the purchases DDL: a failure in either abandoned
+            # the purchases table, and a failure in the enrollment indexes abandoned both
+            # audit tables, which the operator decisions refuse to run without. Neither
+            # depends on the other or on the mig-224 tables. DDL text unchanged.
+            try:
+                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_unopened_attempt_retirements (
+    receipt_id VARCHAR(32) PRIMARY KEY,
+    agent_id VARCHAR(128) NOT NULL,
+    agent_user_ref_hash VARCHAR(64) NOT NULL,
+    native_key VARCHAR(128) NOT NULL,
+    cart_key VARCHAR(128) NOT NULL,
+    native_request_hash VARCHAR(64) NOT NULL,
+    cart_request_hash VARCHAR(64) NOT NULL,
+    authority_sha256 VARCHAR(64) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (agent_id, agent_user_ref_hash, native_key, cart_key),
+    CHECK (native_key <> cart_key)
+);
+"""))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema_guard: reap_unopened_attempt_retirements (mig 255) unavailable (%s)",
+                               type(exc).__name__)
+            try:
+                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_checkout_manual_resolution_audit (
+    purchase_id VARCHAR(64) PRIMARY KEY,
+    reap_checkout_id VARCHAR(128) NOT NULL,
+    from_state VARCHAR(32) NOT NULL,
+    resolved_state VARCHAR(32) NOT NULL,
+    attribution_outcome VARCHAR(32) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    evidence_source VARCHAR(64) NOT NULL,
+    evidence_reference VARCHAR(128) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    expected_updated_at TIMESTAMPTZ NOT NULL,
+    evidence_observed_at TIMESTAMPTZ NOT NULL,
+    provider_base_url VARCHAR(255) NOT NULL,
+    provider_status VARCHAR(32) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (from_state IN ('awaiting_approval','processing')),
+    CHECK (resolved_state IN ('completed','failed','expired')),
+    CHECK (provider_status IN ('COMPLETED','FAILED','EXPIRED')),
+    CHECK (attribution_outcome IN ('edge_closed','closed_by_other_channel','not_applicable')),
+    CHECK (evidence_source IN ('authenticated_reap_checkout_read','verified_reap_support_statement'))
+);"""))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema_guard: reap_checkout_manual_resolution_audit (mig 253) unavailable (%s)",
+                               type(exc).__name__)
             try:
                 await _heal_add_columns("""
                     ALTER TABLE IF EXISTS reap_agentic_purchases
@@ -1121,6 +1136,17 @@ async def ensure_required_schema_light() -> None:
                 await ensure_continuation_schema()
             except Exception as exc:
                 logger.warning("schema_guard: Reap continuation schema unavailable (%s)", type(exc).__name__)
+            # mig 257: reap_checkout_dispatch_resolution_audit, the parked-dispatch decision
+            # audit, in its OWN try as well. `ensure_continuation_schema` creates it LAST, after
+            # the column adds, the journal, its widening and its triggers, so any of those
+            # failing skipped it. Re-issued here on its own (CREATE TABLE IF NOT EXISTS, a no-op
+            # when the call above succeeded), with the module's own DDL text.
+            try:
+                from db.reap_continuation import _RESOLUTION_AUDIT
+                await database.execute(_RESOLUTION_AUDIT)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema_guard: reap_checkout_dispatch_resolution_audit (mig 257) unavailable (%s)",
+                               type(exc).__name__)
             # mig 258: the price witness (preflight quote + corroborated price change). Its own
             # try: the columns are read and written only behind dark dials, and a failure here must
             # not starve what follows. The same statement as
@@ -3708,43 +3734,6 @@ async def ensure_required_schema_light() -> None:
                         "WHERE status = 'active';"
                     )
                 )
-                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_unopened_attempt_retirements (
-    receipt_id VARCHAR(32) PRIMARY KEY,
-    agent_id VARCHAR(128) NOT NULL,
-    agent_user_ref_hash VARCHAR(64) NOT NULL,
-    native_key VARCHAR(128) NOT NULL,
-    cart_key VARCHAR(128) NOT NULL,
-    native_request_hash VARCHAR(64) NOT NULL,
-    cart_request_hash VARCHAR(64) NOT NULL,
-    authority_sha256 VARCHAR(64) NOT NULL,
-    evidence_sha256 VARCHAR(64) NOT NULL,
-    operator_ref VARCHAR(128) NOT NULL,
-    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (agent_id, agent_user_ref_hash, native_key, cart_key),
-    CHECK (native_key <> cart_key)
-);
-"""))
-                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_checkout_manual_resolution_audit (
-    purchase_id VARCHAR(64) PRIMARY KEY,
-    reap_checkout_id VARCHAR(128) NOT NULL,
-    from_state VARCHAR(32) NOT NULL,
-    resolved_state VARCHAR(32) NOT NULL,
-    attribution_outcome VARCHAR(32) NOT NULL,
-    operator_ref VARCHAR(128) NOT NULL,
-    evidence_source VARCHAR(64) NOT NULL,
-    evidence_reference VARCHAR(128) NOT NULL,
-    evidence_sha256 VARCHAR(64) NOT NULL,
-    expected_updated_at TIMESTAMP NOT NULL,
-    evidence_observed_at TIMESTAMP NOT NULL,
-    provider_base_url VARCHAR(255) NOT NULL,
-    provider_status VARCHAR(32) NOT NULL,
-    recorded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CHECK (from_state IN ('awaiting_approval','processing')),
-    CHECK (resolved_state IN ('completed','failed','expired')),
-    CHECK (provider_status IN ('COMPLETED','FAILED','EXPIRED')),
-    CHECK (attribution_outcome IN ('edge_closed','closed_by_other_channel','not_applicable')),
-    CHECK (evidence_source IN ('authenticated_reap_checkout_read','verified_reap_support_statement'))
-);"""))
                 await database.execute(
                     text(
                         """
@@ -3835,12 +3824,76 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 255 and mig 253: the operator audit tables
+            # (reap_unopened_attempt_retirements, reap_checkout_manual_resolution_audit).
+            # EACH IN ITS OWN try, AFTER the mig-224 block. They used to sit inside it,
+            # between the enrollments and the purchases DDL: a failure in either abandoned
+            # the purchases table, and a failure in the enrollment indexes abandoned both
+            # audit tables, which the operator decisions refuse to run without. Neither
+            # depends on the other or on the mig-224 tables. DDL text unchanged. SQLite twin.
+            try:
+                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_unopened_attempt_retirements (
+    receipt_id VARCHAR(32) PRIMARY KEY,
+    agent_id VARCHAR(128) NOT NULL,
+    agent_user_ref_hash VARCHAR(64) NOT NULL,
+    native_key VARCHAR(128) NOT NULL,
+    cart_key VARCHAR(128) NOT NULL,
+    native_request_hash VARCHAR(64) NOT NULL,
+    cart_request_hash VARCHAR(64) NOT NULL,
+    authority_sha256 VARCHAR(64) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (agent_id, agent_user_ref_hash, native_key, cart_key),
+    CHECK (native_key <> cart_key)
+);
+"""))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema_guard: reap_unopened_attempt_retirements (mig 255) unavailable (%s)",
+                               type(exc).__name__)
+            try:
+                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_checkout_manual_resolution_audit (
+    purchase_id VARCHAR(64) PRIMARY KEY,
+    reap_checkout_id VARCHAR(128) NOT NULL,
+    from_state VARCHAR(32) NOT NULL,
+    resolved_state VARCHAR(32) NOT NULL,
+    attribution_outcome VARCHAR(32) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    evidence_source VARCHAR(64) NOT NULL,
+    evidence_reference VARCHAR(128) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    expected_updated_at TIMESTAMP NOT NULL,
+    evidence_observed_at TIMESTAMP NOT NULL,
+    provider_base_url VARCHAR(255) NOT NULL,
+    provider_status VARCHAR(32) NOT NULL,
+    recorded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (from_state IN ('awaiting_approval','processing')),
+    CHECK (resolved_state IN ('completed','failed','expired')),
+    CHECK (provider_status IN ('COMPLETED','FAILED','EXPIRED')),
+    CHECK (attribution_outcome IN ('edge_closed','closed_by_other_channel','not_applicable')),
+    CHECK (evidence_source IN ('authenticated_reap_checkout_read','verified_reap_support_statement'))
+);"""))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema_guard: reap_checkout_manual_resolution_audit (mig 253) unavailable (%s)",
+                               type(exc).__name__)
             # mig 256: privacy clocks and durable dispatch fence, independent of enrollment indexes.
             try:
                 from db.reap_continuation import ensure_continuation_schema
                 await ensure_continuation_schema()
             except Exception as exc:
                 logger.warning("schema_guard: Reap continuation schema unavailable (%s)", type(exc).__name__)
+            # mig 257: reap_checkout_dispatch_resolution_audit, the parked-dispatch decision
+            # audit, in its OWN try as well. `ensure_continuation_schema` creates it LAST, after
+            # the column adds, the journal, its widening and its triggers, so any of those
+            # failing skipped it. Re-issued here on its own (CREATE TABLE IF NOT EXISTS, a no-op
+            # when the call above succeeded), with the module's own DDL text. SQLite twin: the
+            # same TIMESTAMPTZ -> TIMESTAMP spelling the module applies.
+            try:
+                from db.reap_continuation import _RESOLUTION_AUDIT
+                await database.execute(_RESOLUTION_AUDIT.replace('TIMESTAMPTZ', 'TIMESTAMP'))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema_guard: reap_checkout_dispatch_resolution_audit (mig 257) unavailable (%s)",
+                               type(exc).__name__)
             # mig 258: the price witness (preflight quote + corroborated price change). Its own
             # try: the columns are read and written only behind dark dials, and a failure here must
             # not starve what follows.

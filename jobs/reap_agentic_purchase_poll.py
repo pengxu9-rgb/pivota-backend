@@ -12,6 +12,8 @@ bookkeeping SELECTs, no HTTP, and no transitions — it is a LOOP and a set of B
 
   1. `requeue_stale_claims`     free the leases of workers that died mid-step.       ALWAYS
   2. `expire_overdue_purchases` pre-checkout expiry and independent checkout PII scrubbing. ALWAYS
+  2b. `lapse_contact_reentry`   end contact-paused pre-checkout rows past the re-entry window.
+                                                                                     ALWAYS
   3. `fail_exhausted_purchases` the attempt ceiling for the states where a claim means we TRIED.
                                                                                      ALWAYS
   3b. count the 'processing' rows at or over the attempt ceiling — READ ONLY.         ALWAYS
@@ -235,6 +237,15 @@ DIALS: Dict[str, _Dial] = {
     # The PII deadline for `needs_enrollment` / `awaiting_approval`. The ledger's floor is 60.
     "contact_max_age_seconds": _Dial("REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS", 900, 60, 3600),
     "hosted_max_age_seconds": _Dial("REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS", 3600, 60, 2592000),
+    # How long a contact-paused pre-checkout row (its contact scrubbed, no checkout dispatched)
+    # waits for its owner's POST /purchases/{id}/resume before `ledger.lapse_contact_reentry`
+    # ends it as `contact_reentry_lapsed`. The bounds are the ledger's own.
+    "contact_reentry_window_seconds": _Dial(
+        "REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS",
+        ledger.CONTACT_REENTRY_WINDOW_SECONDS_DEFAULT,
+        ledger.CONTACT_REENTRY_WINDOW_SECONDS_MIN,
+        ledger.CONTACT_REENTRY_WINDOW_SECONDS_MAX,
+    ),
     # Attempts are counted at CLAIM and only in resolving/quoting/processing, so this is a count
     # of tries, not of ticks. The ledger's floor is 1.
     "max_attempts": _Dial("REAP_AGENTIC_MAX_ATTEMPTS", 50, 1, 10000),
@@ -399,6 +410,7 @@ class PollReport:
 
     requeued: int = 0
     expired: int = 0
+    contact_reentry_lapsed: int = 0
     failed_exhausted: int = 0
     processing_over_attempts: int = 0
     stuck_over_age: int = -1
@@ -422,6 +434,7 @@ _COUNTS = (
     "contact_retention_blocked",
     "requeued",
     "expired",
+    "contact_reentry_lapsed",
     "failed_exhausted",
     "processing_over_attempts",
     "claimed",
@@ -664,6 +677,7 @@ async def run_reap_agentic_purchase_poll(
     lease_seconds = _env_int(DIALS["lease_seconds"])
     hosted_max_age = _env_int(DIALS["hosted_max_age_seconds"])
     contact_max_age = _env_int(DIALS["contact_max_age_seconds"])
+    contact_reentry_window = _env_int(DIALS["contact_reentry_window_seconds"])
     max_attempts = _env_int(DIALS["max_attempts"])
     error_backoff = _env_int(DIALS["error_backoff_seconds"])
     budget_seconds = _env_int(DIALS["poll_budget_seconds"])
@@ -750,6 +764,25 @@ async def run_reap_agentic_purchase_poll(
     scrubbed = await _sweep_until_drained(_scrub, SWEEP_BATCH, "scrub_reconciling_pii", _budget_spent)
     if scrubbed:
         logger.info("reap_agentic_poll: contact rows scrubbed=%d", scrubbed)
+
+    # The exit for a contact-paused pre-checkout row whose owner never re-entered contact. No
+    # provider call, so it runs whatever the rail/reconciliation dials say, like the scrub. It
+    # never touches a row with dispatch evidence (see the ledger). GUARDED: it is the one sweep
+    # that reads the dispatch journal, and a journal the self-heal could not build must cost
+    # this sweep, counted under `errors`, not the claim loop behind it.
+    async def _lapse_reentry(limit: int) -> List[str]:
+        return await ledger.lapse_contact_reentry(window_seconds=contact_reentry_window, limit=limit)
+
+    try:
+        counts["contact_reentry_lapsed"] = await _sweep_until_drained(
+            _lapse_reentry, SWEEP_BATCH, "lapse_contact_reentry", _budget_spent
+        )
+    except Exception as exc:  # noqa: BLE001 — a maintenance sweep must not end the run
+        counts["errors"] += 1
+        logger.error(
+            "reap_agentic_poll: the contact re-entry lapse sweep failed (error_type=%s)",
+            type(exc).__name__,
+        )
 
     # ── 3. the attempt ceiling — ALWAYS, ARMED OR NOT ────────────────────────────────────────
     async def _fail_exhausted(limit: int) -> List[str]:

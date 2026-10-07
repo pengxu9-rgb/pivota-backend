@@ -271,3 +271,75 @@ def test_probe_is_write_once_and_the_send_line_wins():
     settled.mark_sending()
     assert settled.not_dispatched is False
     assert rc.DispatchProbe().not_dispatched is False
+
+
+# -- 3. a definitive provider "not created" re-quotes past the quote bucket --------------------
+#
+# Reap's 503 CHECKOUT_TEMPORARILY_UNAVAILABLE (and QUOTE_EXPIRED on 400/409) say no checkout was
+# created; the receipt clears the fence. The re-quote must land in a LATER quote idempotency
+# bucket, or Reap replays the same quote id, the same dispatch key is refused (it has a
+# `started`), and the row parked as needs-human work for nothing.
+
+
+class _BucketedQuotes:
+    """Reap's quote idempotency as the client keys it: one quote id per 240 s wall-clock bucket."""
+
+    def __init__(self, t):
+        self.t = t
+
+    def __call__(self, **kwargs):
+        return _ok({**QUOTE_200, 'id': f'qb{int(self.t // rc.QUOTE_IDEMPOTENCY_BUCKET_S)}'})
+
+
+def _not_created(kind, retry_after=None):
+    if kind == '503':
+        return rc.ReapResponse(ok=False, status=503, error='reap_status_503',
+                               error_code='CHECKOUT_TEMPORARILY_UNAVAILABLE',
+                               retry_after_seconds=retry_after)
+    return rc.ReapResponse(ok=False, status=409, error='reap_status_409', error_code='QUOTE_EXPIRED')
+
+
+@pytest.mark.parametrize('kind,retry_after,code', [
+    ('503', None, 'checkout_temporarily_unavailable'),
+    ('503', 9, 'checkout_temporarily_unavailable'),
+    ('409', None, 'quote_expired'),
+])
+@pytest.mark.parametrize('t0', [0, 239])
+async def test_provider_not_created_requotes_under_a_new_quote_id_instead_of_parking(reap, kind, retry_after, code, t0):
+    pid = await _quoting()
+    quotes = _BucketedQuotes(t0)
+    reap.request_quote = quotes
+    reap.create_checkout = [_not_created(kind, retry_after), _ok(CHECKOUT_CREATED)]
+    held = await _step(pid)
+    assert (held.outcome, held.state, held.last_error_code) == ('released', 'quoting', code)
+    assert held.next_poll_in_seconds >= svc.PROVIDER_NOT_CREATED_HOLD_S == rc.QUOTE_IDEMPOTENCY_BUCKET_S + 30
+    row = await _get(pid)
+    assert row['checkout_dispatch_key'] is None and continuation.dispatch_state(row) == 'not_dispatched'
+    assert {e['event_type'] for e in await _events(pid)} == {'started', 'not_created'}
+    assert await ledger.count_checkout_needs_human() == 0
+    # The next look is no sooner than the hold, which is always a later quote bucket.
+    quotes.t = t0 + held.next_poll_in_seconds
+    moved = await _step(pid)
+    assert moved.state == 'awaiting_approval', moved
+    sent = [c['quote_id'] for c in reap.named('create_checkout')]
+    assert len(sent) == 2 and sent[0] != sent[1]
+    assert (await _get(pid))['reap_checkout_id'] == CHECKOUT_CREATED['id']
+    assert await ledger.count_checkout_needs_human() == 0
+
+
+async def test_provider_retry_after_longer_than_the_bucket_is_kept(reap):
+    pid = await _quoting()
+    reap.create_checkout = _not_created('503', retry_after=900)
+    assert (await _step(pid)).next_poll_in_seconds == 900
+
+
+async def test_a_quote_replayed_after_a_not_created_answer_still_never_sends_its_key_twice(reap):
+    """The guarantee the hold leans on: if Reap ever returned the old quote id anyway, the fence
+    refuses the key that already has a `started` event and parks; no second create is sent."""
+    pid = await _quoting()
+    reap.create_checkout = [_not_created('503'), _ok(CHECKOUT_CREATED)]
+    await _step(pid)
+    again = await _step(pid)
+    assert again.last_error_code == svc.CHECKOUT_DISPATCH_UNRESOLVED
+    assert len(reap.named('create_checkout')) == 1
+    assert (await _get(pid))['checkout_dispatch_key'] and await ledger.count_checkout_needs_human() == 1

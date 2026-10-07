@@ -417,9 +417,9 @@ async def upsert_catalog_offer_from_seed_row(
 
     # Repair newly priced variants without overwriting existing supply or stamping freshness.
     from services.catalog_variant_offer_projection import (
-        as_json, variants_from_seed, project_missing_variant_offers,
+        as_json, variants_from_seed, project_missing_variant_offers, projection_enabled,
     )
-    if (
+    if projection_enabled() and (
         variants_from_seed(row_dict.get("seed_data"))
         or as_json(row_dict.get("seed_variants"))
         or as_json(row_dict.get("snapshot_variants"))

@@ -25,7 +25,9 @@ catalog_skus row per real variant. After this:
 
 For external-seed mirrors, successful SKU writes also project missing variant offers
 from the active attached seed. Existing offers are preserved and checkout readiness
-is never inferred from this projection.
+is never inferred from this projection. CATALOG_VARIANT_OFFER_PROJECTION_ENABLED=0
+(or false/no/off) skips it; a projection error is contained in the projection's own
+savepoint, logged, and never rolls back the group's SKU writes or stops the run.
 
 What this service does NOT do:
   - Touch catalog_products. Identity stays where it is.
@@ -144,6 +146,9 @@ class GroupOutcome:
     skipped_reason: Optional[str] = None
     sample_variant_titles: List[str] = field(default_factory=list)
     variant_offers_created: int = 0
+    #: The mirror variant-offer projection raised. Its own writes were rolled back to a
+    #: savepoint; this group's SKU writes were kept. Retried by the next run.
+    variant_offer_projection_failed: bool = False
     #: Rows refused by the OTHER unique constraint — same sku_key, different
     #: identity tuple. Counted rather than fatal; see the upsert loop.
     #:
@@ -168,6 +173,8 @@ class GroupOutcome:
 @dataclass
 class PromoterReport:
     variant_offers_created: int = 0
+    #: Groups whose variant-offer projection raised (see `GroupOutcome.variant_offer_projection_failed`).
+    variant_offer_projection_failures: int = 0
     groups_considered: int = 0
     #: Groups where at least one row's tier could move. A group on the redirect lane
     #: is written but never promoted; it is `groups_tier_held`, not this.
@@ -661,6 +668,49 @@ def _extract_variants_for_primary(primary: Dict[str, Any]) -> List[Dict[str, Any
     return payload_variants
 
 
+async def _project_variant_offers(product_key: str) -> Tuple[int, bool]:
+    """Project the group's missing variant offers, INSIDE the group transaction.
+
+    Returns (offers inserted, failed). Runs where it always ran -- after the SKU upserts, under
+    the product lock the group took first, so the projector's product -> seed -> SKU -> offer
+    lock order is unchanged and the new offers commit atomically with the SKUs they hang off.
+
+    A PROJECTION FAILURE IS NOT A GROUP FAILURE. It used to propagate: the group's transaction
+    rolled back every SKU write it had just made, and the exception ended `promote_variants_all`
+    with every later group unvisited. Now it is caught here, logged at WARNING with the product
+    and the error TYPE, counted on the outcome, and retried by the next run.
+
+    THE ISOLATION IS THE PROJECTION'S OWN TRANSACTION, NOT ONE OPENED HERE.
+    `project_missing_variant_offers` does all of its database work inside its own
+    `db.transaction()`, which, nested in the group's transaction, is a SAVEPOINT: an error rolls
+    back only the projection's writes and (on Postgres) clears the aborted-transaction state, so
+    the group can still commit. A second savepoint around the call would add nothing, so there
+    is none; tests/test_catalog_variant_promoter.py pins that the projection opens its own, and
+    tests/test_catalog_variant_offer_projection_postgres.py fails the real projection on a real
+    Postgres error and checks the group's SKUs commit. `CATALOG_VARIANT_OFFER_PROJECTION_ENABLED=0`
+    skips the projection entirely.
+    """
+    from services.catalog_variant_offer_projection import (
+        project_missing_variant_offers, projection_enabled,
+    )
+
+    if not projection_enabled():
+        logger.info("variant offer projection disabled (CATALOG_VARIANT_OFFER_PROJECTION_ENABLED) product=%s",
+                    product_key)
+        return 0, False
+    try:
+        offer_result = await project_missing_variant_offers(product_key, apply=True, db=database)
+    except Exception as exc:  # noqa: BLE001 - isolated by the projection's own savepoint; see above
+        logger.warning(
+            "variant offer projection failed product_key=%s error_type=%s -- its writes rolled "
+            "back to its savepoint; the group's SKU writes are kept and the run continues",
+            product_key, type(exc).__name__,
+        )
+        return 0, True
+    logger.info("variant offer projection product=%s result=%s", product_key, offer_result)
+    return int(offer_result.get("inserted") or 0), False
+
+
 async def promote_variants_for_group(
     *, group_id: str, apply: bool = False
 ) -> GroupOutcome:
@@ -741,6 +791,7 @@ async def promote_variants_for_group(
     tier_can_move = readiness_tier != "referral_only"
 
     projected_offers = 0
+    projection_failed = False
     promoted = 0
     tier_held = 0
     identity_conflicts = 0
@@ -824,12 +875,7 @@ async def promote_variants_for_group(
                     )
 
             if primary.get("source_system") == "external_product_seeds_mirror_v1":
-                from services.catalog_variant_offer_projection import project_missing_variant_offers
-                offer_result = await project_missing_variant_offers(
-                    primary["product_key"], apply=True, db=database
-                )
-                projected_offers = offer_result["inserted"]
-                logger.info("variant offer projection product=%s result=%s", primary["product_key"], offer_result)
+                projected_offers, projection_failed = await _project_variant_offers(primary["product_key"])
 
     return GroupOutcome(
         product_group_id=group_id,
@@ -846,6 +892,7 @@ async def promote_variants_for_group(
         ),
         sample_variant_titles=sample_titles,
         variant_offers_created=projected_offers,
+        variant_offer_projection_failed=projection_failed,
         skus_identity_conflict=identity_conflicts,
         skus_write_failed=write_failures,
         skus_deduped_same_identity=identity_collisions,
@@ -930,6 +977,7 @@ async def promote_variants_all(
         outcome = await promote_variants_for_group(group_id=gid, apply=apply)
         report.per_group.append(outcome)
         report.variant_offers_created += outcome.variant_offers_created
+        report.variant_offer_projection_failures += int(outcome.variant_offer_projection_failed)
         if outcome.skipped_reason == "no_primary_for_group":
             report.groups_skipped_no_primary += 1
         elif outcome.skipped_reason == "no_real_variants":

@@ -354,11 +354,25 @@ bad setting, it would be an exception out of a scheduled job on every tick.
 | `REAP_AGENTIC_LEASE_SECONDS` | 300 | **180**–3600 | what `requeue_stale_claims` measures against. The floor is 180, not the ledger's 30: a lease shorter than one step gets a LIVE worker's row requeued underneath it, and both workers then call the partner |
 | `REAP_AGENTIC_HOSTED_MAX_AGE_SECONDS` | 3600 | 60–2592000 | abandoned enrollment/local-hosted expiry bound; not the contact-retention cap |
 | `REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS` | 900 | 60–3600 | independent creation-age contact cap; live leases defer cleanup |
+| `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` | 86400 | 3600–604800 | how long a contact-paused `resolving`/`needs_enrollment`/`quoting` row waits for the owner's `/resume`, **measured from `contact_purged_at`** (when the scrub erased the contact; `/resume` clears it, so a later pause starts a new window; an operator's `confirmed_not_created` on a row erased while parked restarts it at the un-park). Past it, `lapse_contact_reentry` ends it (`needs_enrollment`→`expired`, `resolving`/`quoting`→`failed`) with `contact_reentry_lapsed`, every tick, rail on or off; counted as `contact_reentry_lapsed` on `PollReport`. Never touches a claimed row or a row with any dispatch evidence: a dispatch key, a checkout or order id, an `observed` journal event, a `started` event without its `not_created` receipt, or a `quoting` row without version-1 dispatch tracking |
 | `REAP_AGENTIC_RECONCILE_ENABLED` | 1 | truthy allowlist | off stops all new provider calls while maintenance continues |
 | `REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS` | 180 | 0–3600 | how long past `hosted_url_expires_at` the sweep leaves a **`needs_enrollment`** row alone (Reap flips ACTIVE at/after the link dies); also how long `resolving` holds instead of retiring a pending enrollment. `awaiting_approval` never gets it. 0 = Reap's exact expiry. Read by `services.reap_agentic_purchase.enrollment_grace_seconds()` — ONE reader, which the job calls — not a job dial |
 | `REAP_AGENTIC_MAX_ATTEMPTS` | 50 | 1–10000 | attempts ceiling. `attempts` counts **claims**, and only in `resolving`/`quoting`/`processing` |
 | `REAP_AGENTIC_ERROR_BACKOFF_SECONDS` | 120 | 1–3600 | how long a row waits after `advance` **raised**. Not the state machine's table — this is the path where it did not get to choose |
 | `REAP_AGENTIC_POLL_BUDGET_SECONDS` | 240 | 10–3600 | wall-clock budget. It stops the job **starting** work — a row already in flight finishes — so the run deadline is sized as budget + one whole step |
+
+**Claim timing.** The claim takes only rows whose `next_poll_at <= now`, never early. What moves
+is the schedule a row is released with: only the plain per-state cadence (a release with no
+explicit hold) is stored up to `min(interval/2, poller tick/2, 15)` seconds early
+(`services.reap_agentic_purchase.cadence_slack_seconds`), so a 30 s state is taken on the next tick
+instead of every other one. Every explicit hold is exact: transport backoff, the 120 s error
+backoff (`REAP_AGENTIC_ERROR_BACKOFF_SECONDS`), the 270 s hold after a definitive "checkout not
+created", the 900 s holds and the settling hold, and Reap's `Retry-After` where a step honours it:
+the quote, enrollment-create and checkout-create paths. A failed checkout status read
+(`_release_checkout_read_failure`) does not take `Retry-After`: it is released on the regular
+cadence (stored up to the slack early, as above), on the transport backoff for a transport error, or
+on the exact 900 s hold (`CHECKOUT_HUMAN_RETRY_SECONDS`) once the row is `checkout_unresolvable`. The first look after a row
+enters a human-wait state still waits the full interval.
 
 ### How slow one step really is
 
@@ -784,16 +798,21 @@ Every completed tick emits a heartbeat, including missing-credential and provide
 The heartbeat proves maintenance, not arming. Deploying this change can start report-series
 history on a previously dark environment; a later stopped job can trigger “poller went silent”.
 Paused precheckout rows are excluded from ordinary stuck counts. Contact-expired precheckout
-rows are preserved, separately counted as `contact_retention_blocked`, and make no provider
-call on resume. Do not solve an uncertain quoting row by minting another checkout: retain the
+rows are preserved, separately counted as `contact_retention_blocked`, and make no new quote or
+checkout when flags are turned back on (see Contact-paused purchases). Do not solve an uncertain quoting row by minting another checkout: retain the
 original request/key/quote/enrollment and obtain an authoritative provider reconciliation first.
 
-`REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS` is an independent creation-based contact cap: default900,
-range60–3600. State transitions never reset it. Exposed checkout rows also scrub at explicit
-hosted expiry if earlier. A live lease defers the scrub until released/requeued. Contact cleanup
-preserves quote/amount/currency/checkout/order/consent/attribution evidence and never declares a
-payment outcome. Restoring buyer contact or restarting a blocked attempt requires separate
-owner/operator review; this worker does not silently refill PII or create a replacement.
+`REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS` is an independent contact cap: default900,
+range60–3600, measured from creation or from the last accepted owner re-entry
+(`contact_received_at`). State transitions never reset it. Exposed checkout rows also scrub at
+explicit hosted expiry if earlier. A live lease defers the scrub until released/requeued. Contact
+cleanup preserves quote/amount/currency/checkout/order/consent/attribution evidence and never
+declares a payment outcome. Only the buyer's own agent restores contact, through
+`POST /agent/v2/commerce/reap/purchases/{purchase_id}/resume` with the identical original request,
+within the re-entry window. After `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` (default 86400,
+24 h; 3600–604800), measured from `contact_purged_at`, the poller ends an unresumed row that has
+no dispatch evidence as `contact_reentry_lapsed`.
+This worker never refills PII or creates a replacement. See Contact-paused purchases.
 
 #### The order to disarm in — an operator rule
 
@@ -1849,14 +1868,115 @@ The reconciliation stop is checked before every worker-scoped HTTP transport ope
 
 ### Audited manual resolution of classified checkout uncertainty
 
-`services.reap_checkout_recovery.resolve_checkout_manually` is a service-only primitive; there is no admin HTTP route or executable operator CLI. Its default `dry_run=True` preview writes nothing. Applying it requires an explicitly privileged caller, an opaque operator handle, independently authenticated Reap read or verified support evidence, a same-environment provider origin, an exact checkout ID and recognized terminal status, and evidence observed within the last 24 hours and after this purchase was created. The verification attestation is a caller contract, not automatic cryptographic validation; an operator must verify the authentic evidence before setting it.
+`services.reap_checkout_recovery.resolve_checkout_manually` is a service primitive with no admin HTTP route; operators run it through `python -m jobs.reap_operator resolve-checkout` (Running the operator decisions, below). Its default `dry_run=True` preview writes nothing. Applying it requires an explicitly privileged caller, an opaque operator handle, independently authenticated Reap read or verified support evidence, a same-environment provider origin, an exact checkout ID and recognized terminal status, and evidence observed within the last 24 hours and after this purchase was created. The verification attestation is a caller contract, not automatic cryptographic validation; an operator must verify the authentic evidence before setting it.
 
 Only checkout-backed `awaiting_approval`/`processing` rows explicitly classified `checkout_unresolvable:` are eligible. The original state, checkout ID, error classification, `updated_at`, and absent lease are checked again by a conditional claim. Missing reads, 404s, elapsed clocks and a missing checkout ID are never terminal proof. COMPLETED additionally requires a valid order ID, currency and charged total within the existing one-minor-unit quote tolerance. Provider EXPIRED while processing becomes failed under the existing state transition contract. Terminal historical rows cannot be reopened.
 
 Migration 253 and both startup self-heal dialects create `reap_checkout_manual_resolution_audit`. It stores one decision per purchase: checkout, original state/version, terminal status, operator/evidence handles, verified source, observed time/origin and normalized evidence SHA256. It stores no full provider body or buyer contact. The audit append, conditional terminal decision, terminal lease clearing, click claim and attribution edge call share one short database transaction; unexpected failures or suppression roll back that unit. A deterministic existing merchant-channel click claim is legitimate: completion keeps `attribution_closed_by_other_channel`, preserves that claim, writes no Reap edge, and audits `attribution_outcome=closed_by_other_channel`. Other completions audit `edge_closed` only after rereading the durable attribution edge and checking exact merchant, external and synthetic order, amount/currency, click/agent, converted source/state and the purchase/checkout partner provenance. A synthesized close receipt after `ON CONFLICT DO NOTHING` is insufficient: a missing edge or conflicting existing order slot rolls back the terminal outcome and audit without overwriting the edge. Failed/expired decisions audit `not_applicable`. Ancillary commerce event/interaction emission retains its existing best-effort semantics and requires a separate receipt check; this primitive does not promise those receipts exist. Exact-evidence replay is read-only and cannot create another audit or edge. Do not delete the audit table when rolling back runtime code; removing this function leaves classified rows safely unresolved.
 
-`contact_retention_blocked` is a separate owner/operator queue, covering privacy-held resolving, needs_enrollment and quoting work. Resuming flags does not restore discarded contact or mint another checkout. An operator must inspect whether an external checkout may exist and use a separately reviewed recovery/contact-reauthorization procedure; there is no automatic quoting cleanup or blind retry. `checkout_needs_human` is a separate payment uncertainty queue. The original three metrics match heartbeat, ordinary stuck and errors only; the dedicated queue alerts below cover these two cohorts. Before arming, install and verify them in the selected environment with an explicitly owned recipient. No cloud policy is created or enabled by source merge.
+`contact_retention_blocked` is a separate owner/operator queue, covering privacy-held resolving, needs_enrollment and quoting work. Resuming flags does not restore discarded contact or mint another checkout. The owner restores it with `/resume` within the re-entry window; once the window (measured from `contact_purged_at`) has passed, an unresumed row with no dispatch evidence lapses automatically (`contact_reentry_lapsed`). A row whose dispatch is unresolved cannot be resumed and is worked through the needs-human queue (Parked checkout create); there is no blind retry. See Contact-paused purchases. `checkout_needs_human` is a separate payment uncertainty queue. The original three metrics match heartbeat, ordinary stuck and errors only; the dedicated queue alerts below cover these two cohorts. Before arming, install and verify them in the selected environment with an explicitly owned recipient. No cloud policy is created or enabled by source merge.
 
+
+### Running the operator decisions
+
+`jobs/reap_operator.py` is the only way to run the three audited decisions in production. It
+holds no decision logic: it parses arguments, refuses to apply without its guards, calls the
+service function and prints the function's result as one JSON line. It never calls Reap.
+
+| subcommand | calls | writes |
+|---|---|---|
+| `list-needs-human [--limit N]` | its own SELECT of the `checkout_needs_human` cohort | nothing |
+| `list-parked [--limit N]` | `list_parked_dispatches` | nothing |
+| `resolve-checkout` | `resolve_checkout_manually` | only with `--apply` |
+| `resolve-parked` | `resolve_parked_dispatch` | only with `--apply` |
+| `retire-unopened` | `services.reap_unopened_attempt.retire_unopened_attempt` | only with `--apply` |
+
+The lists print one JSON object per row: purchase id, state, cohort/classification and
+`last_error_code`, ages, `has_dispatch_key`, checkout ids, the journal and partner handles needed
+to ask Reap (`dispatch_key`, `quote_id`, `reap_enrollment_id`), and `updated_at`. Never buyer
+email, address, offer code, buyer reference or a URL.
+
+**Every decision previews unless `--apply` is given.** Applying also requires:
+
+* `--operator <handle>` (the audit row's `operator_ref`);
+* `--expect-env <value>`, **exactly** the job's `PIVOTA_ENV` (`Production` or `production ` is
+  refused). You type both of these, so they only catch a command pasted into the wrong job;
+* `--expect-database '<identity JSON>'`, the database you reviewed the decision against:
+  `{"dialect": "postgres", "database": "<database name>", "host": "<the Cloud SQL instance's
+  private IP>", "schema": "public"}`, taken from the Cloud SQL instance itself, never from the
+  job's `DATABASE_URL` or from an earlier run's output. After connecting, the command compares it
+  with what the server reports (`current_database()`, `inet_server_addr()`, `current_schema()`,
+  `services.reap_unopened_attempt.database_identity`) and refuses on any difference (exit 2,
+  `database_identity_mismatch`, naming the differing keys only) before the service runs. This
+  is the guard that does not come from your own typing. Every apply subcommand requires it,
+  `retire-unopened` included (its `--expected-database-json` is the service's own, separate check);
+* for `resolve-*`, a Reap host that fits the environment: a sandbox host (`rc.REAP_SANDBOX_HOSTS`)
+  is refused when `PIVOTA_ENV` resolves to production, and required in every other environment
+  (the poller's own rule);
+* for `resolve-*`, `--evidence-verified`, your attestation that you verified the evidence
+  yourself.
+
+A preview writes nothing and is not compared with `--expect-database`, but it runs every other
+check the service makes. So a `resolve-*` preview **also needs `--evidence-verified`**: without
+it the evidence goes to the service as unverified and the preview is refused with
+`authoritative_evidence_required` (exit 3). Verify the evidence before you preview. Without `--operator` it runs as
+`dry-run-preview`; an exact replay is matched on the operator handle, so pass the same
+`--operator` you will apply with to preview exactly what will happen.
+
+Evidence arguments (`resolve-checkout`, `resolve-parked`): `--evidence-source`
+(`authenticated_reap_checkout_read` | `verified_reap_support_statement`), `--evidence-reference`,
+`--evidence-observed-at` (ISO-8601 with offset), `--provider-base-url` (must equal the job's
+`REAP_API_BASE_URL`), `--expected-updated-at` (the list's `updated_at`, verbatim), and
+`--evidence-payload-json` (required for `resolve-checkout`; for `resolve-parked` with an
+authenticated read).
+
+**`--evidence-payload-json` is NOT the checkout read.** Job arguments are written into the Cloud
+Run job spec and from there into Cloud Audit Logs, and a full checkout read carries
+`nextAction.url` (the buyer's hosted payment page) and can carry buyer data. Copy only the keys
+the services read, as one JSON object: `id`, `status`, and for a `COMPLETED` checkout `orderId`
+plus `finalAmount` (or `amount`) as `{"amount": ..., "currency": "..."}`; for `resolve-parked`
+`checkout_found`, `id` and `quoteId`. For example
+`{"id":"chk_...","status":"COMPLETED","orderId":"ord_...","finalAmount":{"amount":45.00,"currency":"USD"}}`.
+The command refuses any other key, or any other key inside the money object (exit 2, naming the
+key, never echoing its value): never a URL, `nextAction`, email, name, address or card detail.
+Keep the full read in the support record that `--evidence-reference` names.
+
+`resolve-parked` adds `--dispatch-key`, `--outcome` and, only for
+`checkout_found` with no journal id, `--checkout-id`. `retire-unopened` takes `--agent-id`,
+`--owner-hash`, `--native-key`, `--cart-key`, `--native-request-hash`, `--cart-request-hash`,
+`--expected-database-json` and `--provenance-json` (its `checked_at` must be within 5 minutes).
+
+Exit codes: `0` ok (list, eligible preview, resolution, exact replay); `2` bad arguments or a
+refused guard (nothing connected), a database identity that differs from `--expect-database`
+(connected, nothing written), or an unusable `REAP_API_BASE_URL`; `3` the service refused,
+with `{"status": "refused", "reason": "<code>"}` on stdout; `1` unexpected. The one-off runner
+reports any non-zero container exit as `1`, so read the printed line for the reason.
+
+**In production, as a one-off job.** A job inherits no environment: re-supply the runner's default
+`ENV_VARS` and add `REAP_API_BASE_URL`, read off the running `worker` service (never typed from
+memory). Always list, then preview, then apply, each as its own run:
+
+```bash
+ENV_VARS=PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,REAP_API_BASE_URL=<worker's value> \
+  scripts/ops/run_oneoff_job.sh -m jobs.reap_operator list-parked
+
+# preview (no --apply): prints {"status": "eligible", ...} and writes nothing
+ENV_VARS=...same... scripts/ops/run_oneoff_job.sh -m jobs.reap_operator resolve-parked \
+  --purchase-id rp_... --dispatch-key <64 hex> --outcome confirmed_not_created \
+  --expected-updated-at <updated_at from the list> \
+  --evidence-source verified_reap_support_statement --evidence-reference <case id> \
+  --evidence-observed-at <ISO-8601 with offset> --provider-base-url <same REAP_API_BASE_URL> \
+  --evidence-verified --operator <your handle>
+
+# apply: the same arguments plus
+  --apply --expect-env production \
+  --expect-database '{"dialect":"postgres","database":"<db name>","host":"<instance private IP>","schema":"public"}'
+```
+
+A worker claim moves `updated_at`, and parked rows are re-released every 15 minutes, so a preview
+can go stale before the apply. `stale_or_claimed_purchase` or `compare_and_swap_lost` means: list
+again and repeat with the new `updated_at`. Do not run the decisions from a laptop against the
+production database, and do not put buyer contact in any argument.
 
 ### Parked checkout create
 
@@ -1869,9 +1989,9 @@ Reap for that dispatch key**. The worker never re-creates it. Every claim re-rel
 needs-human alert stays open until an operator decides. Legacy rows with no
 `dispatch_tracking_version` count too (no key, no journal: outcome unknown).
 
-Both functions below are service-only, like `resolve_checkout_manually`. Neither has an HTTP
-route, CLI, agent tool or buyer path, and neither calls Reap. Run them from the same privileged
-operator shell.
+Both functions below are service functions, like `resolve_checkout_manually`. Neither has an
+HTTP route, agent tool or buyer path, and neither calls Reap. Operators run them through
+`python -m jobs.reap_operator list-parked` / `resolve-parked` (Running the operator decisions).
 
 1. **Find candidates.** `await services.reap_checkout_recovery.list_parked_dispatches()` is
    read-only. Each entry has `purchase_id`, `classification` (`dispatch_started`, or
@@ -1922,7 +2042,8 @@ operator shell.
      code becomes `checkout_dispatch_not_created`, and the row is due now. The normal flow then
      resumes. It re-quotes, and the new quote is a new dispatch key. The old quote/enrollment
      pair never dispatches again. Contact retention, attempts and flags apply as usual and may
-     end the purchase. This outcome is refused when the journal holds an observed checkout.
+     end the purchase. A row whose contact was erased while parked stays contact-paused, and its
+     re-entry window restarts now (`contact_purged_at` is set to the un-park time). This outcome is refused when the journal holds an observed checkout.
    - Not sure: do nothing. The row stays parked and visible.
 5. **Preview, then apply.** First call `resolve_parked_dispatch(purchase_id,
    dispatch_key=..., outcome=..., evidence={...}, operator_ref=..., expected_updated_at=<listing
@@ -1962,6 +2083,66 @@ rolling back runtime code, do not drop that table or the journal rows.
 - Edit the purchase row or the journal by hand in SQL.
 - Resolve while a worker holds the claim.
 
+### Contact-paused purchases
+
+`contact_retention_blocked` counts `resolving`, `needs_enrollment` and `quoting` purchases whose
+buyer contact (email, shipping address, offer code) the retention cap erased
+(`contact_purged_at` set, or `last_error_code = 'contact_retention_elapsed'`). The purchase keeps
+its quote, enrollment, consent, click and key. It makes no new quote or checkout; a
+`needs_enrollment` row may still read its linked enrollment. The owner view says
+`contact_reentry_required: true` (docs/reap_agentic_routes.md, Resume a contact-paused purchase).
+
+How a row leaves the count:
+
+1. **The buyer resumes.** The buyer's own agent sends the identical original create body and key
+   to `POST /agent/v2/commerce/reap/purchases/{purchase_id}/resume`. It needs the base rail,
+   credentials and **the create gate** on (`404` otherwise), the same agent and buyer, the same
+   consent tag, `checkout_dispatch_state: not_dispatched`, and a fresh admission of the same
+   selection at the same price. One conditional write restores the contact, increments
+   `contact_revision`, clears `last_error_code`, restarts the contact cap and makes the row due now.
+   Same purchase id, click, enrollment, key; nothing is created.
+2. **The re-entry window lapses.** `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` (default
+   86400, 24 h; bounds 3600–604800) is **measured from `contact_purged_at`**, the moment the scrub
+   erased the contact. `/resume` clears `contact_purged_at`, so a row paused again later starts a
+   new window from the new erasure. A row erased while parked on a dispatch key (case 3) is not
+   lapsed while parked; an operator's `confirmed_not_created` restarts `contact_purged_at` at the
+   un-park, so the buyer's full window runs from then. Once the window has passed, `ledger.lapse_contact_reentry`
+   (every poller tick, rail on or off) ends an unclaimed row with
+   `last_error_code = 'contact_reentry_lapsed'`: `needs_enrollment` → `expired`, `resolving` →
+   `failed`, `quoting` → `failed`. `PollReport` counts them as `contact_reentry_lapsed`, and a
+   lapsed row is terminal, so it leaves `contact_retention_blocked`. It never touches a row with
+   any dispatch evidence: a `checkout_dispatch_key`, a stored checkout or order id, an `observed`
+   journal event, a `started` event without its own `not_created` receipt, or a `quoting` row
+   without version-1 dispatch tracking. Those stay in the count until case 3 settles them.
+   **Legacy rows** paused before migration 256 (no `contact_purged_at`, no dispatch tracking
+   version, `last_error_code = 'contact_retention_elapsed'`) have no purge time: in `resolving` /
+   `needs_enrollment` their window is timed from `state_entered_at` instead; a legacy `quoting`
+   row is never lapsed (its dispatch is unknown, so it stays in checkout needs human).
+3. **An operator resolves the dispatch.** A row whose `checkout_dispatch_state` is
+   `dispatch_started` (or `unknown`, legacy) cannot be resumed: `/resume` answers
+   `409 checkout_dispatch_unresolved`. In `quoting` it is also in `checkout_needs_human`; work it
+   as a parked checkout create. `confirmed_not_created` on such a row clears the key and restarts
+   `contact_purged_at` at that moment: the buyer gets a full re-entry window from the un-park (not
+   from the old erasure, which would lapse it on the next tick) and still needs `/resume`.
+
+**Why a Reap 503 burst raises this count.** After a definitive "checkout not created" answer
+(`503 CHECKOUT_TEMPORARILY_UNAVAILABLE`, `QUOTE_EXPIRED`) a `quoting` row waits at least 270 s
+before it re-quotes, so its dispatch comes later. The contact scrub fires
+`REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS` (default 900 s) after the contact was received, however
+long the row has been in its state. A burst of Reap 503s therefore makes contact-paused `quoting`
+rows more likely: they are `contact_retention_blocked`, wait for the owner's `/resume`, and lapse
+after `REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS` if nobody resumes. Its earlier dispatch was
+answered definitively "not created", so it is **not** dispatch uncertainty and does not
+belong in checkout needs human.
+
+Operator actions: usually none, because this is a buyer who has not come back yet. Pausing the
+create gate also pauses re-entry while the window keeps running, so a long create pause turns
+paused purchases into `contact_reentry_lapsed` outcomes. There is no operator re-entry path.
+
+**Never:** copy buyer contact back from any other source, edit the row or its
+`contact_received_at`/`contact_purged_at` in SQL to extend the window, or open a replacement
+purchase for the buyer.
+
 ### Dedicated human and privacy queue alerts
 
 The installer now prepares `prod: Reap checkout needs human reconciliation` and
@@ -1973,7 +2154,10 @@ The policies share the verified configured notification channel and installer re
 Source merge does not install or activate cloud policies. Before activation, install in the
 chosen environment, read back exact filters and recipient, and confirm actual delivery.
 Do not automatically retry, recreate a checkout, or restore scrubbed contact to clear an alert.
-Queue clearing must follow the authenticated evidence and audit requirements above. The
+Queue clearing must follow the authenticated evidence and audit requirements above. The contact
+queue mostly clears on its own, by owner `/resume` or by the re-entry window lapsing; a row with
+dispatch evidence never lapses and is worked as checkout needs human (Contact-paused
+purchases); expect it to open whenever a buyer leaves a purchase for longer than the contact cap. The
 needs-human count also includes parked checkout creates (`quoting` with a dispatch key, or
 legacy rows with no tracking version). For those, see Parked checkout create. The policy's text
 names both cohorts only after `setup_monitoring.sh` is re-run in that environment.

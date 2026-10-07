@@ -207,8 +207,12 @@ def _pilot_scope() -> Optional[Dict[str, Any]]:
         key = (kind, fingerprint)
         if key not in _SCOPE_POSTURES:
             _SCOPE_POSTURES.add(key)
-            (logger.error if error else logger.info)(
-                "reap_agentic pilot posture=%s fingerprint=%s", kind, fingerprint)
+            # Once per process per (posture, fingerprint). `bounded` is WARNING, not INFO: nothing
+            # configures root in these processes, so INFO is dropped in production, and this line
+            # is how an operator compares the web and worker scope fingerprints. Invalid/missing
+            # stays ERROR. Never the scope itself -- only its hash.
+            level = logging.ERROR if error else logging.WARNING if kind == "bounded" else logging.INFO
+            logger.log(level, "reap_agentic pilot posture=%s fingerprint=%s", kind, fingerprint)
     def no_duplicates(pairs):
         result = {}
         for key, value in pairs:
@@ -519,6 +523,25 @@ POLL_INTERVALS: Dict[str, int] = {
     "processing": 15,
 }
 
+#: How often a contact-paused pre-checkout row is looked at while it waits for its owner's
+#: resume. See `advance`; `_step_needs_enrollment` uses the same number.
+CONTACT_PAUSED_RECHECK_SECONDS = 900
+
+#: The SHORTEST hold after Reap answered a checkout create with a definitive "not created"
+#: (503 CHECKOUT_TEMPORARILY_UNAVAILABLE, or QUOTE_EXPIRED on HTTP 400/409).
+#:
+#: That answer clears the dispatch fence, and the next step re-quotes. The quote's idempotency
+#: key is bucketed by `rc.QUOTE_IDEMPOTENCY_BUCKET_S` (240 s), so a re-quote inside the bucket
+#: gets the SAME quote id back -- and the same (quote, enrollment) pair maps to the same dispatch
+#: key, which already has a `started` event. `continuation.begin_dispatch` then (correctly)
+#: refuses to send it again, and the row parked as `checkout_dispatch_unresolved` needs-human work
+#: although Reap had said nothing was created. Waiting the whole bucket plus a margin makes the
+#: re-quote land in a later bucket, so it carries a NEW quote id and a new dispatch key.
+#:
+#: This only delays; it relaxes nothing. The fence still never sends a key twice, so if Reap
+#: ever replayed the old quote id anyway the row would park exactly as before.
+PROVIDER_NOT_CREATED_HOLD_S = rc.QUOTE_IDEMPOTENCY_BUCKET_S + 30
+
 #: A transport failure is not a schedule: it is an unknown. The state's own interval, DOUBLED on
 #: the first failure and doubled AGAIN for each consecutive one, capped at `MAX_BACKOFF_SECONDS`.
 #:
@@ -540,6 +563,43 @@ MAX_BACKOFF_SECONDS = 600
 #: Exponent ceiling before the multiplication, so a pathological `attempts` cannot build a
 #: thousand-digit integer on the way to being capped at 600.
 _MAX_BACKOFF_DOUBLINGS = 16
+
+
+#: The most the regular cadence is pulled forward; see `cadence_slack_seconds`.
+CADENCE_SLACK_MAX_SECONDS = 15
+
+
+def cadence_slack_seconds(interval: int) -> int:
+    """How much EARLIER than `release + interval` a regular-cadence row is scheduled.
+
+    THE PROBLEM. `next_poll_at` is stamped at release, a few seconds INTO a poller tick, and the
+    poller ticks every `REAP_AGENTIC_POLL_INTERVAL_SECONDS`. With `next_poll_at = release + 30`
+    the tick 30 s later finds the row a few seconds short of due, so a 30 s state was polled on
+    every OTHER tick (~60 s). The fix lives here, at release, and ONLY for the regular cadence
+    (`POLL_INTERVALS[state]`): the claim stays `next_poll_at <= now`, so a deliberate hold --
+    Retry-After, transport backoff, the error backoff, the 270 s not-created hold, the 900 s
+    holds -- is never claimed a second early.
+
+    THE SLACK is `min(interval // 2, tick // 2, CADENCE_SLACK_MAX_SECONDS)`:
+      * a row released up to `slack` seconds after its tick started is due on the tick
+        `interval` later (15 s of step time covered at the default 30 s tick);
+      * never more than half the interval, so the gap between two looks at a row can never
+        fall below `interval / 2`, even with several workers ticking at different phases;
+      * never more than half the job TICK, so a fast tick (5 s on the staging pilot) does not
+        turn a 30 s cadence into ~15 s -- it misses by at most one short tick instead.
+    The tick is the poller's own reader (`job_interval_seconds`), imported lazily: the job
+    module imports this one.
+
+    Applied by `_release`'s regular-cadence fallback ONLY. The first look after a transition
+    into a human-wait state (`_next_poll_for`) keeps its full interval.
+    """
+    try:
+        from jobs.reap_agentic_purchase_poll import job_interval_seconds
+
+        tick = int(job_interval_seconds())
+    except Exception:  # noqa: BLE001 -- a schedule must never fail a step; no slack is safe
+        return 0
+    return max(0, min(int(interval) // 2, tick // 2, CADENCE_SLACK_MAX_SECONDS))
 
 
 def transport_backoff_seconds(state: str, attempts: Any = None) -> int:
@@ -707,6 +767,9 @@ class AdvanceResult:
     `outcome` is one of:
         advanced    the row moved to `state`
         released    the row did not move; the claim was given back with `next_poll_in_seconds`
+                    (for the regular cadence that is the state's interval: the row's stored
+                    `next_poll_at` is `cadence_slack_seconds` earlier so that the tick at that
+                    interval finds it due; for every hold it is exact)
         lost_claim  a fenced write answered None — somebody else owns this row, or a sweep
                     terminated it. NOTHING was written. Re-read, never retry.
         terminal    the row was already terminal on entry. No calls were made.
@@ -2294,17 +2357,21 @@ async def _release(
     Fenced like every other write: None means the lease moved and the answer is `lost_claim`.
     """
     state = str(row["state"])
+    # Only the REGULAR cadence is pulled forward by `cadence_slack_seconds`. Every deliberate
+    # wait -- an explicit `seconds` (Retry-After, the 270 s not-created hold, the 900 s human and
+    # contact holds) or a transport backoff -- is scheduled exactly as asked.
+    slack = 0
     if seconds is None:
-        seconds = (
-            transport_backoff_seconds(state, row.get("attempts"))
-            if transport
-            else POLL_INTERVALS[state]
-        )
+        if transport:
+            seconds = transport_backoff_seconds(state, row.get("attempts"))
+        else:
+            seconds = POLL_INTERVALS[state]
+            slack = cadence_slack_seconds(seconds)
     error_code = _error_code(error_code)
     released = await ledger.release_claim(
         str(row["id"]),
         worker_id,
-        next_poll_at=_now() + timedelta(seconds=seconds),
+        next_poll_at=_now() + timedelta(seconds=seconds - slack),
         # PERSISTED NOW. `release_claim` used to take `next_poll_at` and nothing else, so a
         # transport failure recorded its schedule and NOT its reason: the code lived only on the
         # returned `AdvanceResult` and in one log line, and a human looking at a stalled row saw
@@ -2351,7 +2418,8 @@ async def _release(
 async def _pause_precheckout(row, worker_id):
     # Only refund this still-owned, unadvanced claim. Preserve attempts accumulated by work,
     # enrollment settling provenance and the state clock; pausing is not an error transition.
-    released = await ledger.release_paused_claim(row, worker_id)
+    released = await ledger.release_paused_claim(
+        row, worker_id, next_poll_in_seconds=POLL_INTERVALS[str(row["state"])])
     if released is None:
         return _lost(row)
     return AdvanceResult(str(row["id"]), outcome="released", state=str(row["state"]),
@@ -2389,7 +2457,12 @@ async def advance(purchase_id: str, worker_id: str) -> AdvanceResult:
             parked if parked == CHECKOUT_CREATED_HOSTED_URL_REFUSED else CHECKOUT_DISPATCH_UNRESOLVED))
     if state in {"resolving", "quoting"} and continuation.contact_required(row):
         # Contact erasure pauses new work, not a non-sensitive read of the linked enrollment.
-        return await _release(row, worker_id, error_code="contact_retention_elapsed")
+        # Nothing changes until the owner resumes (which makes the row due at once) or the
+        # re-entry window lapses it, so a paused row is looked at every 15 minutes -- the same
+        # cadence a contact-paused 'needs_enrollment' row gets -- rather than taking a claim
+        # slot from live work every 60 s.
+        return await _release(row, worker_id, error_code="contact_retention_elapsed",
+                              seconds=CONTACT_PAUSED_RECHECK_SECONDS)
     read_only_enrollment = state == "needs_enrollment" and bool(row.get("enrollment_id"))
     if state in {"resolving", "needs_enrollment", "quoting"} and not read_only_enrollment:
         try:
@@ -3120,7 +3193,8 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
     active = await ledger.get_active_enrollment(str(row["buyer_ref"]))
     if active is not None:
         if continuation.contact_required(row):
-            return await _release(row, worker_id, error_code="contact_retention_elapsed", seconds=900)
+            return await _release(row, worker_id, error_code="contact_retention_elapsed",
+                                  seconds=CONTACT_PAUSED_RECHECK_SECONDS)
         return await _move(
             row, worker_id, ["needs_enrollment"], "quoting", enrollment_id=str(active["id"])
         )
@@ -3165,7 +3239,8 @@ async def _step_needs_enrollment(row: Mapping[str, Any], worker_id: str) -> Adva
                 last_error_code="enrollment_not_activatable",
             )
         if continuation.contact_required(row):
-            return await _release(row, worker_id, error_code="contact_retention_elapsed", seconds=900)
+            return await _release(row, worker_id, error_code="contact_retention_elapsed",
+                                  seconds=CONTACT_PAUSED_RECHECK_SECONDS)
         # The hosted link is cleared by the ledger on the way into 'quoting' (it clears on ANY
         # transition into that state), so the spent enrollment page and its expiry do not ride
         # along on a row that no longer waits on them.
@@ -3974,7 +4049,7 @@ async def _checkout_from_quote(
         # Reap replayed the quote of a create that provably never left this process (its quote
         # key is time-bucketed). Wait out that bucket so the next step gets a new quote id.
         return await _hold(error_code="checkout_quote_replayed",
-                           seconds=rc.QUOTE_IDEMPOTENCY_BUCKET_S + 30)
+                           seconds=PROVIDER_NOT_CREATED_HOLD_S)
     if dispatch_key is None:
         return await _hold(error_code="checkout_dispatch_unresolved", seconds=900)
     amount_token = _WORKER_QUOTE_TOTAL.set(verdict.total_minor)
@@ -4050,17 +4125,19 @@ async def _checkout_from_quote(
                 # 503 CHECKOUT_TEMPORARILY_UNAVAILABLE (2026-09-28 spec): nothing was created. Same
                 # answer as an expired quote -- give the lease back, on Reap's Retry-After when it
                 # sent one, and let the next step re-quote -- never a terminal failure over a blip.
+                # Never sooner than `PROVIDER_NOT_CREATED_HOLD_S`: see its note.
                 wait = checkout.retry_after_seconds
-                return await _hold(
-                    error_code=_error_code(top),
-                    transport=wait is None, seconds=max(1, wait) if wait is not None else None,
-                )
+                seconds = (max(1, wait) if wait is not None
+                           else transport_backoff_seconds(str(row["state"]), row.get("attempts")))
+                return await _hold(error_code=_error_code(top),
+                                   seconds=max(seconds, PROVIDER_NOT_CREATED_HOLD_S))
             if "QUOTE_EXPIRED" in (detail, top):
                 # The partner's word for what the P2-9 pre-check above catches on our clock: the
                 # quote died between the quote and the create. Same answer as the pre-check -- give
                 # the lease back and let the next step re-resolve and re-quote -- rather than the
                 # generic branch below, which would END the purchase over a five-minute timer.
-                return await _hold(error_code="quote_expired")
+                # Held past the quote bucket for the same reason as the 503 above.
+                return await _hold(error_code="quote_expired", seconds=PROVIDER_NOT_CREATED_HOLD_S)
             if "ENROLLMENT_NOT_ACTIVE" in (detail, top):
                 # 'quoting' → 'needs_enrollment' is not a legal edge, so there is no way to send the
                 # buyer back to the card page on THIS purchase. Fail with the partner's own code; the
@@ -4141,6 +4218,12 @@ async def _release_checkout_read_failure(row, worker_id, code):
     if previous.startswith("checkout_unresolvable:"):
         # Only a valid provider outcome clears human review; an outage cannot hide it.
         return await _release(row, worker_id, error_code=previous, seconds=CHECKOUT_HUMAN_RETRY_SECONDS)
+    if previous.startswith("checkout_read_permanent:"):
+        # Keep the permanent-failure count across an interleaved transient error. Writing the
+        # transient code here reset it, so 404 / timeout / 404 / timeout ... never reached
+        # PERMANENT_CHECKOUT_READ_LIMIT and never surfaced as human work. Only a valid read
+        # clears it (`checkout_read_recovered`). The transient error keeps its own backoff.
+        return await _release(row, worker_id, error_code=previous, transport=_is_transport(code))
     return await _release(row, worker_id, error_code=code, transport=_is_transport(code))
 
 

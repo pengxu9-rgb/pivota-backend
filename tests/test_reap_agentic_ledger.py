@@ -1547,8 +1547,9 @@ async def test_the_expire_fallback_reads_state_entered_at_not_updated_at():
 
 
 async def test_only_state_changing_statements_stamp_state_entered_at():
-    """`state_entered_at` may be written by exactly three kinds of statement — the transition and
-    the two sweeps — and by no other."""
+    """`state_entered_at` may be written by exactly four kinds of statement — the transition and
+    the three terminal sweeps (expire, fail-exhausted, and the contact re-entry lapse) — and by
+    no other."""
     stamps = {
         name: value.count("state_entered_at =")
         for name, value in vars(ledger).items()
@@ -1559,6 +1560,7 @@ async def test_only_state_changing_statements_stamp_state_entered_at():
         "_TRANSITION_SQL", "_TRANSITION_SQL_SQLITE",
         "_EXPIRE_OVERDUE_SQL", "_EXPIRE_OVERDUE_SQL_SQLITE",
         "_FAIL_EXHAUSTED_SQL", "_FAIL_EXHAUSTED_SQL_SQLITE",
+        "_LAPSE_CONTACT_REENTRY_SQL", "_LAPSE_CONTACT_REENTRY_SQL_SQLITE",
     }, f"unexpected writers of state_entered_at: {sorted(writers)}"
 
 
@@ -4705,3 +4707,45 @@ async def test_the_stuck_count_takes_strict_bounded_ints(bad):
 
 def test_the_stuck_count_is_exported():
     assert "count_stuck_purchases" in ledger.__all__
+
+
+# ── the contact re-entry lapse (A1) ──────────────────────────────────────────────────────────
+
+
+async def test_the_reentry_lapse_only_takes_legal_terminal_edges_and_guards_at_the_top_level():
+    """Like the other terminal sweeps it bypasses `transition`, so its edges are checked here,
+    against the state list parsed out of the statement itself, on both dialects."""
+    for name in ("_LAPSE_CONTACT_REENTRY_SQL", "_LAPSE_CONTACT_REENTRY_SQL_SQLITE"):
+        sql = getattr(ledger, name)
+        sources = ledger._states_in(sql, "WHERE state IN (")
+        assert sources == ("resolving", "needs_enrollment", "quoting"), name
+        assert "CASE WHEN state = 'needs_enrollment' THEN 'expired' ELSE 'failed' END" in sql, name
+        for src in sources:
+            target = "expired" if src == "needs_enrollment" else "failed"
+            assert target in ledger.ALLOWED_TRANSITIONS[src], (name, src)
+        inner = sql[sql.index("SELECT p.id FROM reap_agentic_purchases p"):]
+        outer = sql[:sql.index("AND id IN (")]
+        assert ledger._states_in(inner, "WHERE p.state IN (") == sources, name
+        window = ("datetime('now', :window)" if name.endswith("_SQLITE")
+                  else "clock_timestamp() - (:window_seconds * INTERVAL '1 second')")
+        # The OUTER copy of every guard is the post-lock re-check: it is what keeps a row that a
+        # concurrent resume, dispatch or claim changed while this UPDATE waited on its lock from
+        # being lapsed (tests/test_reap_contact_resume_postgres.py races each one). The inner copy
+        # selects the candidates. Both must be present, separately.
+        for guard in ("{a}claimed_by IS NULL", "{a}checkout_dispatch_key IS NULL", "{a}reap_checkout_id IS NULL",
+                      "{a}reap_order_id IS NULL", "({a}state <> 'quoting' OR {a}dispatch_tracking_version = 1)",
+                      "({a}contact_purged_at IS NOT NULL",
+                      "OR ({a}state IN ('resolving', 'needs_enrollment')",
+                      "{a}contact_purged_at IS NULL AND {a}dispatch_tracking_version IS NULL",
+                      "{a}last_error_code = 'contact_retention_elapsed'))",
+                      f"COALESCE({{a}}contact_purged_at, {{a}}state_entered_at) < {window}"):
+            assert guard.format(a="") in outer, (name, guard)
+            assert guard.format(a="p.") in inner, (name, guard)
+        # The journal exclusions are in BOTH places too: in the outer re-check, and in the
+        # candidate subquery so a row they exclude cannot fill the LIMIT batch and starve rows
+        # behind it.
+        for ref, part in (("reap_agentic_purchases.id", outer), ("p.id", inner)):
+            for journal in (f"o.purchase_id = {ref} AND o.event_type = 'observed'",
+                            f"s.purchase_id = {ref} AND s.event_type = 'started'"):
+                assert journal in part, (name, journal)
+        assert inner.count("n.event_type = 'not_created'") == 1, name
