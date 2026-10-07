@@ -4732,9 +4732,12 @@ async def test_the_reentry_lapse_only_takes_legal_terminal_edges_and_guards_at_t
         # concurrent resume, dispatch or claim changed while this UPDATE waited on its lock from
         # being lapsed (tests/test_reap_contact_resume_postgres.py races each one). The inner copy
         # selects the candidates. Both must be present, separately.
-        for guard in ("claimed_by IS NULL", "checkout_dispatch_key IS NULL", "reap_checkout_id IS NULL",
-                      "reap_order_id IS NULL", "dispatch_tracking_version = 1",
-                      "contact_purged_at IS NOT NULL", f"contact_purged_at < {window}"):
-            assert f"AND {guard}" in outer or f"WHERE {guard}" in outer or f"OR {guard}" in outer, (name, guard)
-            assert f"p.{guard}" in inner, (name, guard)
-            assert sql.count(guard) == 2, (name, guard)
+        for guard in ("{a}claimed_by IS NULL", "{a}checkout_dispatch_key IS NULL", "{a}reap_checkout_id IS NULL",
+                      "{a}reap_order_id IS NULL", "({a}state <> 'quoting' OR {a}dispatch_tracking_version = 1)",
+                      "({a}contact_purged_at IS NOT NULL",
+                      "OR ({a}state IN ('resolving', 'needs_enrollment')",
+                      "{a}contact_purged_at IS NULL AND {a}dispatch_tracking_version IS NULL",
+                      "{a}last_error_code = 'contact_retention_elapsed'))",
+                      f"COALESCE({{a}}contact_purged_at, {{a}}state_entered_at) < {window}"):
+            assert guard.format(a="") in outer, (name, guard)
+            assert guard.format(a="p.") in inner, (name, guard)

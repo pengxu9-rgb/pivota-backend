@@ -2662,6 +2662,16 @@ async def scrub_reconciling_purchase_pii(
 # back to them from 'quoting'), no `observed` journal event, and no `started` journal event without
 # its own `not_created` receipt. An unclaimed row only: a live worker's lease is left alone.
 #
+# LEGACY ROWS (paused before migration 256): `last_error_code = 'contact_retention_elapsed'` with
+# `contact_purged_at` NULL and `dispatch_tracking_version` NULL. They cannot be resumed (restore
+# requires tracking version 1), so without this they would hold `contact_retention_blocked` above
+# zero for ever. Only 'resolving' / 'needs_enrollment' qualify -- nothing in those states can have
+# dispatched, while a legacy 'quoting' row may have and stays excluded -- and their window is
+# measured from `state_entered_at`, which no claim, release, requeue, scrub or resume rewrites
+# (only a state change does; tests/test_reap_agentic_ledger.py pins both facts). NOT
+# `updated_at`, which every release bumps. The scrub stamps `contact_purged_at` on every row it
+# pauses since 256, so a modern row never takes the legacy branch.
+#
 # The predicate is repeated at the top level for the same post-lock re-check reason the other
 # sweeps carry it; that is also what makes it race cleanly with the owner's resume, which clears
 # `contact_purged_at` (and with a dispatch, which sets the fence) in its own single UPDATE.
@@ -2679,8 +2689,11 @@ _LAPSE_CONTACT_REENTRY_SQL = """
            updated_at = clock_timestamp()
      WHERE state IN ('resolving', 'needs_enrollment', 'quoting')
        AND claimed_by IS NULL
-       AND contact_purged_at IS NOT NULL
-       AND contact_purged_at < clock_timestamp() - (:window_seconds * INTERVAL '1 second')
+       AND (contact_purged_at IS NOT NULL
+            OR (state IN ('resolving', 'needs_enrollment')
+                AND contact_purged_at IS NULL AND dispatch_tracking_version IS NULL
+                AND last_error_code = 'contact_retention_elapsed'))
+       AND COALESCE(contact_purged_at, state_entered_at) < clock_timestamp() - (:window_seconds * INTERVAL '1 second')
        AND checkout_dispatch_key IS NULL AND reap_checkout_id IS NULL AND reap_order_id IS NULL
        AND (state <> 'quoting' OR dispatch_tracking_version = 1)
        AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events o
@@ -2695,11 +2708,14 @@ _LAPSE_CONTACT_REENTRY_SQL = """
         SELECT p.id FROM reap_agentic_purchases p
          WHERE p.state IN ('resolving', 'needs_enrollment', 'quoting')
            AND p.claimed_by IS NULL
-           AND p.contact_purged_at IS NOT NULL
-           AND p.contact_purged_at < clock_timestamp() - (:window_seconds * INTERVAL '1 second')
+           AND (p.contact_purged_at IS NOT NULL
+                OR (p.state IN ('resolving', 'needs_enrollment')
+                    AND p.contact_purged_at IS NULL AND p.dispatch_tracking_version IS NULL
+                    AND p.last_error_code = 'contact_retention_elapsed'))
+           AND COALESCE(p.contact_purged_at, p.state_entered_at) < clock_timestamp() - (:window_seconds * INTERVAL '1 second')
            AND p.checkout_dispatch_key IS NULL AND p.reap_checkout_id IS NULL AND p.reap_order_id IS NULL
            AND (p.state <> 'quoting' OR p.dispatch_tracking_version = 1)
-         ORDER BY p.contact_purged_at ASC, p.id ASC
+         ORDER BY COALESCE(p.contact_purged_at, p.state_entered_at) ASC, p.id ASC
          LIMIT :limit
      )
     RETURNING id
@@ -2719,8 +2735,11 @@ _LAPSE_CONTACT_REENTRY_SQL_SQLITE = """
            updated_at = CURRENT_TIMESTAMP
      WHERE state IN ('resolving', 'needs_enrollment', 'quoting')
        AND claimed_by IS NULL
-       AND contact_purged_at IS NOT NULL
-       AND contact_purged_at < datetime('now', :window)
+       AND (contact_purged_at IS NOT NULL
+            OR (state IN ('resolving', 'needs_enrollment')
+                AND contact_purged_at IS NULL AND dispatch_tracking_version IS NULL
+                AND last_error_code = 'contact_retention_elapsed'))
+       AND COALESCE(contact_purged_at, state_entered_at) < datetime('now', :window)
        AND checkout_dispatch_key IS NULL AND reap_checkout_id IS NULL AND reap_order_id IS NULL
        AND (state <> 'quoting' OR dispatch_tracking_version = 1)
        AND NOT EXISTS (SELECT 1 FROM reap_checkout_dispatch_events o
@@ -2735,11 +2754,14 @@ _LAPSE_CONTACT_REENTRY_SQL_SQLITE = """
         SELECT p.id FROM reap_agentic_purchases p
          WHERE p.state IN ('resolving', 'needs_enrollment', 'quoting')
            AND p.claimed_by IS NULL
-           AND p.contact_purged_at IS NOT NULL
-           AND p.contact_purged_at < datetime('now', :window)
+           AND (p.contact_purged_at IS NOT NULL
+                OR (p.state IN ('resolving', 'needs_enrollment')
+                    AND p.contact_purged_at IS NULL AND p.dispatch_tracking_version IS NULL
+                    AND p.last_error_code = 'contact_retention_elapsed'))
+           AND COALESCE(p.contact_purged_at, p.state_entered_at) < datetime('now', :window)
            AND p.checkout_dispatch_key IS NULL AND p.reap_checkout_id IS NULL AND p.reap_order_id IS NULL
            AND (p.state <> 'quoting' OR p.dispatch_tracking_version = 1)
-         ORDER BY p.contact_purged_at ASC, p.id ASC
+         ORDER BY COALESCE(p.contact_purged_at, p.state_entered_at) ASC, p.id ASC
          LIMIT :limit
      )
     RETURNING id
@@ -2763,7 +2785,9 @@ async def lapse_contact_reentry(
     'needs_enrollment' → 'expired'; 'resolving' / 'quoting' → 'failed'; both with
     `last_error_code = 'contact_reentry_lapsed'`. Rows with ANY dispatch evidence, a live claim,
     or a contact purge younger than `window_seconds` are untouched; see the note above the
-    statement. The owner's resume inside the window is unaffected.
+    statement. The owner's resume inside the window is unaffected. Legacy (pre-256) paused
+    'resolving' / 'needs_enrollment' rows with no `contact_purged_at` are measured from
+    `state_entered_at` instead.
     """
     seconds = _require_int(
         window_seconds, "window_seconds",

@@ -354,3 +354,50 @@ async def test_a_concurrent_writer_holding_the_row_wins_over_the_lapse(client, w
     assert after['last_error_code'] != 'contact_reentry_lapsed'
     if writer == 'resume':
         assert after['contact_purged_at'] is None and after['contact_revision'] == 1
+
+
+# -- legacy (pre-migration-256) paused rows: no contact_purged_at, no tracking version ---------
+
+
+async def _legacy_paused(client, state, entered_ago):
+    from db.database import IS_POSTGRES
+    pid, _ = await _paused(client)
+    expr = (f"clock_timestamp()-INTERVAL '{int(entered_ago)} seconds'" if IS_POSTGRES
+            else f"datetime('now','-{int(entered_ago)} seconds')")
+    await database.execute(
+        f'UPDATE reap_agentic_purchases SET state=:s, contact_purged_at=NULL, dispatch_tracking_version=NULL, '
+        f'state_entered_at={expr} WHERE id=:id', {'s': state, 'id': pid})
+    row = await ledger.get_purchase_internal(pid)
+    assert row['last_error_code'] == 'contact_retention_elapsed' and row['contact_purged_at'] is None
+    return pid
+
+
+@pytest.mark.parametrize('state,terminal', [('resolving', 'failed'), ('needs_enrollment', 'expired')])
+async def test_a_legacy_paused_row_lapses_on_its_state_clock(client, state, terminal):
+    pid = await _legacy_paused(client, state, _DAY + 60)
+    assert await ledger.count_contact_retention_blocked() == 1
+    # A claim and release (every poll) bumps updated_at and must not move the anchor.
+    await database.execute("UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id", {'id': pid})
+    assert [r['id'] for r in await ledger.claim_due_purchases('legacy-poll')] == [pid]
+    assert await ledger.release_claim(pid, 'legacy-poll') is not None
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == [pid]
+    row = await ledger.get_purchase_internal(pid)
+    assert row['state'] == terminal and row['last_error_code'] == 'contact_reentry_lapsed'
+    assert await ledger.count_contact_retention_blocked() == 0
+
+
+async def test_a_legacy_paused_row_inside_the_window_is_untouched(client):
+    pid = await _legacy_paused(client, 'resolving', _DAY - 600)
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == []
+    assert (await ledger.get_purchase_internal(pid))['state'] == 'resolving'
+
+
+@pytest.mark.parametrize('variant', ['legacy_quoting', 'versioned_without_purge', 'other_code'])
+async def test_the_legacy_branch_takes_nothing_else(client, variant):
+    pid = await _legacy_paused(client, 'quoting' if variant == 'legacy_quoting' else 'resolving', 30 * _DAY)
+    if variant == 'versioned_without_purge':
+        await database.execute('UPDATE reap_agentic_purchases SET dispatch_tracking_version=1 WHERE id=:id', {'id': pid})
+    if variant == 'other_code':
+        await database.execute("UPDATE reap_agentic_purchases SET last_error_code='transport_error:readtimeout' WHERE id=:id", {'id': pid})
+    assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == []
+    assert (await ledger.get_purchase_internal(pid))['terminal_at'] is None
