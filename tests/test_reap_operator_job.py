@@ -126,10 +126,11 @@ PROD_URL = "https://prod.api.reap.global"
      {"PIVOTA_ENV": "staging", "REAP_API_BASE_URL": PROD_URL}),
     (["--apply", "--operator", "ops_alice", "--expect-env", "staging", *SOME_DB],
      {"PIVOTA_ENV": "staging", "REAP_API_BASE_URL": "https://x.sandbox.api.reap.global"}),
+    (["--apply", "--operator", "ops_alice", "--expect-env", "", *SOME_DB], {"REAP_API_BASE_URL": BASE_URL}),
 ], ids=["no_operator", "no_expect_env", "env_mismatch", "env_unset", "blank_operator", "preview_wrong_env",
         "no_reap_origin", "no_expect_database", "env_case_differs", "env_has_whitespace",
         "preview_env_case_differs", "production_on_sandbox_host", "staging_on_production_host",
-        "staging_on_lookalike_host"])
+        "staging_on_lookalike_host", "empty_expect_env_with_env_unset"])
 def test_apply_guards_refuse_with_exit_2(no_db, capsys, request, extra, environ):
     argv = ["resolve-parked", "--purchase-id", "rp_1", "--dispatch-key", "a" * 64, "--outcome",
             "confirmed_not_created", "--expected-updated-at", "2026-10-07T00:00:00+00:00",
@@ -142,6 +143,7 @@ def test_apply_guards_refuse_with_exit_2(no_db, capsys, request, extra, environ)
               "production_on_sandbox_host": "is a Reap sandbox host",
               "staging_on_production_host": "must be exactly a Reap sandbox host",
               "staging_on_lookalike_host": "must be exactly a Reap sandbox host",
+              "empty_expect_env_with_env_unset": "requires PIVOTA_ENV to be set",
               }.get(request.node.callspec.id, "does not match PIVOTA_ENV")
     assert reason in capsys.readouterr().err
 
@@ -427,6 +429,32 @@ async def test_apply_against_another_database_is_refused_before_the_service(reap
     # A preview is not compared: it writes nothing, and it is how the identity is first reviewed.
     code, _ = await _run(argv + ["--expect-database", json.dumps(wrong)])
     assert code in (op.EXIT_OK, op.EXIT_REFUSED)
+
+
+PG_IDENTITY = {"dialect": "postgres", "database": "pivota", "host": "10.0.0.5", "schema": "public"}
+
+
+@pytest.mark.parametrize("field,value", [("host", "10.0.0.6"), ("schema", "restored_copy")])
+async def test_apply_refuses_an_identity_that_differs_only_in_host_or_schema(monkeypatch, field, value):
+    """Same database name on another server, or another schema of it, is another database."""
+    import services.reap_unopened_attempt as unopened
+
+    served = dict(PG_IDENTITY, **{field: value})
+
+    async def identity():
+        return served
+    monkeypatch.setattr(unopened, "database_identity", identity)
+    argv = ["resolve-parked", "--purchase-id", "rp_1", "--dispatch-key", "a" * 64, "--outcome",
+            "confirmed_not_created", "--expected-updated-at", "2026-10-07T00:00:00+00:00", *_evidence_args(),
+            "--apply", "--operator", "ops_alice", "--expect-env", "staging",
+            "--expect-database", json.dumps(PG_IDENTITY)]
+    code, [line] = await _run(argv)
+    assert code == op.EXIT_BAD_ARGS
+    assert line == {"status": "refused", "reason": "database_identity_mismatch", "fields": [field],
+                    "command": "resolve-parked", "dry_run": False}
+    assert value not in json.dumps(line)
+    served = dict(PG_IDENTITY)
+    assert await op.check_database(op.parse_args(argv)) is None
 
 
 # ── the evidence payload: allowlisted keys only, because job arguments reach the audit log ─────
