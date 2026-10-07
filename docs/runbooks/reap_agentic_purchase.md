@@ -370,7 +370,8 @@ backoff (`REAP_AGENTIC_ERROR_BACKOFF_SECONDS`), the 270 s hold after a definitiv
 created", the 900 s holds and the settling hold, and Reap's `Retry-After` where a step honours it:
 the quote, enrollment-create and checkout-create paths. A failed checkout status read
 (`_release_checkout_read_failure`) does not take `Retry-After`: it is released on the regular
-cadence plus slack, or on the transport backoff for a transport error. The first look after a row
+cadence (stored up to the slack early, as above), on the transport backoff for a transport error, or
+on the exact 900 s hold (`CHECKOUT_HUMAN_RETRY_SECONDS`) once the row is `checkout_unresolvable`. The first look after a row
 enters a human-wait state still waits the full interval.
 
 ### How slow one step really is

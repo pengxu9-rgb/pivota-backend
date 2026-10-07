@@ -471,8 +471,11 @@ async def test_one_run_drives_a_purchase_one_step_and_holds_no_claim(reap):
 async def test_a_failing_reentry_lapse_is_one_error_and_the_claim_loop_still_runs(monkeypatch, reap):
     """The lapse is the one sweep that reads the dispatch journal; any failure of it is counted,
     and the due row behind it is still claimed and advanced in the same tick."""
+    class JournalUnavailable(Exception):  # a bare Exception subclass, as a driver error is
+        pass
+
     async def broken(**_kwargs):
-        raise RuntimeError("reap_checkout_dispatch_events is unavailable")
+        raise JournalUnavailable("reap_checkout_dispatch_events is unavailable")
     monkeypatch.setattr(ledger, "lapse_contact_reentry", broken)
     purchase_id = await _start()
 
