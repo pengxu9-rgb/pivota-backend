@@ -35,8 +35,13 @@ fingerprint or UA disguise) is out of scope.
 | curated brand feed, retailer-ingest drain, destination sweep | NOT YET |
 
 To wire a lane, pass `**crawl_identity.transport_kwargs()` to its `httpx.AsyncClient(...)`. Or wrap
-its existing transport with `crawl_identity.crawl_transport(inner)`. Signing happens in the
-transport, so manually followed redirect hops are signed too.
+the transport that actually sends: `crawl_identity.crawl_transport(httpx.AsyncHTTPTransport(...))`.
+Signing happens in the transport, so manually followed redirect hops are signed too.
+
+**Sign innermost.** A transport that WAITS (Tier B's `PacedTransport` sleeps inside
+`handle_async_request`) must wrap the signer, not be wrapped by it:
+`PacedTransport(crawl_transport(httpx.AsyncHTTPTransport()))`. Signing outside the wait can let the
+60 s `expires` lapse before the request leaves.
 
 A signed client ignores `HTTP(S)_PROXY` env vars: httpx applies them only when no transport is
 passed. No crawl job sets them (checked 2026-10-08). If a lane needs a proxy, wrap its explicit
@@ -68,7 +73,10 @@ the directory check passes, try `dictionary` on one job before concluding anythi
    gcloud secrets create WEB_BOT_AUTH_PRIVATE_KEY --project pivota-prod --data-file="$HOME/web_bot_auth_key.pem" && rm -P ~/web_bot_auth_key.pem
    ```
 3. Grant read access to the identities that use it: `sa-backend` (web), `sa-worker` (the cart-proof
-   and Tier B jobs), and the default compute SA that `external-referral-refresh` runs as.
+   and Tier B jobs), and the default compute SA that `external-referral-refresh` runs as. That SA
+   was read from `gcloud run jobs describe external-referral-refresh` on 2026-10-08; nothing in
+   this repo sets it, so re-check before granting. The cart-proof setup script refuses `on` until
+   `sa-worker` holds the grant.
    ```bash
    for sa in sa-backend@pivota-prod.iam.gserviceaccount.com sa-worker@pivota-prod.iam.gserviceaccount.com 388293626878-compute@developer.gserviceaccount.com; do gcloud secrets add-iam-policy-binding WEB_BOT_AUTH_PRIVATE_KEY --project pivota-prod --member "serviceAccount:$sa" --role roles/secretmanager.secretAccessor; done
    ```
@@ -80,10 +88,17 @@ the directory check passes, try `dictionary` on one job before concluding anythi
    ```bash
    ~/dev/pivota-backend-quality-gate/.venv/bin/python scripts/ops/check_web_bot_auth_directory.py https://api.pivota.cc
    ```
-6. Measure before enabling at scale. Run one signed request from the crawl subnet to a store that
-   429s today, next to an unsigned one (experiment E3 in the report). If the signed request gets
-   200 where the unsigned one gets `local_rate_limited`, signing works. If both get 429, Shopify
-   wants the higher-tier form first. Either way, file the form (step 8).
+6. Measure before enabling at scale: one unsigned and one signed request per store, from the crawl
+   subnet, to stores that answer `local_rate_limited` today (experiment E3 in the report). The
+   script is in the image once this PR is merged; `<backend-tag>` is that image's full sha:
+   ```bash
+   SUBNET=pivota-crawl SERVICE_ACCOUNT=sa-worker@pivota-prod.iam.gserviceaccount.com SECRETS=WEB_BOT_AUTH_PRIVATE_KEY=WEB_BOT_AUTH_PRIVATE_KEY:latest ENV_VARS=PIVOTA_ENV=production,CRAWL_WEB_BOT_AUTH_ENABLED=true IMAGE=us-west1-docker.pkg.dev/pivota-shared/pivota/backend:<backend-tag> bash scripts/ops/run_oneoff_job.sh scripts/ops/web_bot_auth_probe.py flowerknows.co dermalogica.com
+   ```
+   Read the `E3` lines:
+   - Signed 200 where unsigned gets `local_rate_limited`: signing works.
+   - Both 429: Shopify may want the higher-tier form first, or may not accept this
+     `Signature-Agent` form. Try `WEB_BOT_AUTH_AGENT_FORMAT=dictionary` in `ENV_VARS` once.
+   - Either way, file the form (step 8).
 7. Enable on the jobs:
    - Cart proofs, through their setup script (a plain re-run keeps the setting):
      ```bash
@@ -97,17 +112,25 @@ the directory check passes, try `dictionary` on one job before concluding anythi
    - The cart-proof run report carries `web_bot_auth: signed | off | unsigned_<reason>`.
 8. File https://forms.gle/V88RD31uAVirqE4e9 with:
    - the directory URL;
-   - the User-Agent (`PivotaBot/1.0; +https://pivota.cc`);
+   - the User-Agent: `Mozilla/5.0 (compatible; PivotaBot/1.0; +https://pivota.cc)`, unless
+     `EXTERNAL_OFFER_USER_AGENT` overrides it on a job;
    - the egress IP 34.82.199.35;
    - the request rate (the shared pacer: 2 req/s overall, about 1 req/host/s);
    - the purpose: commerce discovery feeding UCP checkout on the merchant's own store.
 
 ## Rotation
 
-Generate a new key, add it as a new secret version, and redeploy `web` (directory) and the jobs.
-This module serves one key, so for a few minutes the directory and the jobs may disagree. A request
-signed by a key the directory no longer lists fails verification and gets the unsigned tier: nothing
-breaks, it is slower for those minutes. Re-run the directory check after rotating.
+1. Generate a new key and add it as a new version of the secret.
+2. Roll `web` to a new revision so the directory serves the new key. The jobs read `:latest` at
+   each execution, so they pick it up on their next run without a redeploy.
+3. Re-run the directory check.
+
+Cost: this module lists ONE key, and the directory is served with `Cache-Control: max-age=3600`. A
+verifier holding the old directory can reject new signatures for up to an hour. During that hour our
+requests may be treated as unsigned. That is the best case: whether Shopify treats a FAILED
+signature like no signature, or worse, is unverified. So rotate outside the nightly crawl windows,
+or extend the module to list the old and new keys together for one cache lifetime
+(http-message-signatures-directory §5.1) before relying on rotation.
 
 ## Off
 

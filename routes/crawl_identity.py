@@ -12,6 +12,7 @@ whether a crawl lane signs.
 """
 from __future__ import annotations
 
+import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
@@ -30,8 +31,13 @@ async def http_message_signatures_directory(request: Request) -> Response:
         # Always https: TLS ends at the load balancer, so the app sees http, but verifiers reach this
         # origin over https only (a Signature-Agent must be https).
         authority = crawl_identity.authority_of_host_header(host, "https")
+        # ONLY for the origin our requests name. The directory signature binds the key to the
+        # authority it covers; signing whatever Host a caller sends would hand anyone a proof that
+        # our key belongs to THEIR domain.
+        if authority != crawl_identity.authority_of(httpx.URL(signer.signature_agent)):
+            return JSONResponse(status_code=404, content={"error": "not_found"})
+        body, headers = signer.directory(authority=authority)
     except Exception:
         return JSONResponse(status_code=404, content={"error": "not_found"})
-    body, headers = signer.directory(authority=authority)
     media_type = headers.pop("Content-Type")
     return Response(content=body, media_type=media_type, headers=headers)

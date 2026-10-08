@@ -193,9 +193,9 @@ except Exception:
     print("unknown")
 '
 }
-job_signed(){ # job -> true | false   (CRAWL_WEB_BOT_AUTH_ENABLED as the job carries it; absent = false)
+job_signed(){ # job -> true | false | absent | unknown   (CRAWL_WEB_BOT_AUTH_ENABLED as the job carries it)
   local json
-  json=$("$GCLOUD" run jobs describe "$1" --region "$REGION" --format=json 2>/dev/null) || { echo false; return 0; }
+  json=$("$GCLOUD" run jobs describe "$1" --region "$REGION" --format=json 2>/dev/null) || { echo absent; return 0; }
   printf '%s' "$json" | python3 -c '
 import json, sys
 try:
@@ -203,7 +203,7 @@ try:
     values = [e.get("value") for e in env if e.get("name") == "CRAWL_WEB_BOT_AUTH_ENABLED"]
     print("true" if values and str(values[0]).strip().lower() in ("1", "true", "yes", "on") else "false")
 except Exception:
-    print("false")
+    print("unknown")
 '
 }
 trigger_state(){ # job -> ENABLED | PAUSED | absent | <other>
@@ -251,12 +251,37 @@ esac
 case "${WEB_BOT_AUTH:-}" in
   on) SIGNED=true ;;
   off) SIGNED=false ;;
-  *) SIGNED=false
-     for job in "$ENRICHMENT_JOB" "$MIRROR_JOB"; do [ "$(job_signed "$job")" = true ] && SIGNED=true; done ;;
+  *) SIGNED_STATES=""
+     for job in "$ENRICHMENT_JOB" "$MIRROR_JOB"; do SIGNED_STATES="$SIGNED_STATES $(job_signed "$job")"; done
+     # The gate's rules, for the same reason: a plain re-run never guesses. Unreadable -> refuse;
+     # one job signed and the other not -> refuse (say WEB_BOT_AUTH=on or off); a missing job takes
+     # the other's setting.
+     case "$SIGNED_STATES" in
+       *unknown*)
+         echo "REFUSING: could not read a job's CRAWL_WEB_BOT_AUTH_ENABLED. Nothing was changed. Set WEB_BOT_AUTH=on or off." >&2
+         exit 1 ;;
+       *true*false*|*false*true*)
+         echo "REFUSING: one job signs (Web Bot Auth) and the other does not. Nothing was changed. Set WEB_BOT_AUTH=on or off." >&2
+         exit 1 ;;
+       *true*) SIGNED=true ;;
+       *) SIGNED=false ;;
+     esac ;;
 esac
 if [ "$SIGNED" = true ]; then
   have "$GCLOUD" secrets describe WEB_BOT_AUTH_PRIVATE_KEY \
     || { echo "REFUSING: Web Bot Auth requested but secret WEB_BOT_AUTH_PRIVATE_KEY does not exist. Nothing was changed." >&2; exit 1; }
+  # A mounted secret the job's identity cannot read stops the job from STARTING (not "unsigned").
+  "$GCLOUD" secrets get-iam-policy WEB_BOT_AUTH_PRIVATE_KEY --format=json 2>/dev/null | SA="$SA" python3 -c '
+import json, os, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+member = "serviceAccount:" + os.environ["SA"]
+ok = any(b.get("role") == "roles/secretmanager.secretAccessor" and member in (b.get("members") or [])
+         for b in doc.get("bindings") or [])
+sys.exit(0 if ok else 1)
+' || { echo "REFUSING: $SA has no roles/secretmanager.secretAccessor on WEB_BOT_AUTH_PRIVATE_KEY (docs/runbooks/crawl_identity.md step 3). Nothing was changed." >&2; exit 1; }
 fi
 echo "== web bot auth: signed=$SIGNED (WEB_BOT_AUTH=${WEB_BOT_AUTH:-unset, kept})"
 if [ "$REQUEST" = disable ]; then

@@ -114,6 +114,10 @@ def test_a22_dictionary_form_base_matches_the_draft_and_verifies():
     ("https://example.com:443/x", "example.com"),
     ("https://example.com:8443/x", "example.com:8443"),
     ("http://example.com:80/x", "example.com"),
+    ("https://xn--mnchen-3ya.de/x", "xn--mnchen-3ya.de"),
+    ("https://M\u00fcnchen.de/x", "xn--mnchen-3ya.de"),
+    ("https://[::1]:8443/x", "[::1]:8443"),
+    ("https://[2001:DB8::1]/x", "[2001:db8::1]"),
 ])
 def test_authority_is_lowercased_and_drops_only_the_default_port(url, authority):
     assert ci.authority_of(httpx.URL(url)) == authority
@@ -165,6 +169,37 @@ async def test_every_request_including_each_redirect_hop_is_signed_for_its_own_h
         assert _verify(key, base, request.headers["signature"]), request.url.host
     nonces = [q.headers["signature-input"].split(';nonce="', 1)[1].split('"', 1)[0] for q in seen]
     assert len(set(nonces)) == 2 and all(len(base64.b64decode(n)) == 64 for n in nonces)
+
+
+async def test_an_idn_host_is_signed_for_its_ascii_authority():
+    key = Ed25519PrivateKey.generate()
+    seen = []
+    transport = ci.SigningTransport(httpx.MockTransport(lambda r: seen.append(r) or httpx.Response(200)),
+                                    ci.Signer(key))
+    async with httpx.AsyncClient(transport=transport) as client:
+        await client.get("https://M\u00fcnchen.de/products.json")
+    sig_input = seen[0].headers["signature-input"]
+    base = (f'"@authority": xn--mnchen-3ya.de\n"signature-agent": "https://api.pivota.cc"\n'
+            f'"@signature-params": {sig_input[len("sig1="):]}')
+    assert _verify(key, base, seen[0].headers["signature"])
+
+
+async def test_a_request_that_cannot_be_signed_still_leaves_unsigned(caplog):
+    class _Broken(ci.Signer):
+        def sign(self, request):
+            request.headers["Signature"] = "sig1=:half-written:"
+            raise RuntimeError("boom")
+
+    seen = []
+    transport = ci.SigningTransport(httpx.MockTransport(lambda r: seen.append(r) or httpx.Response(200)),
+                                    _Broken(Ed25519PrivateKey.generate()))
+    with caplog.at_level(logging.ERROR, logger=ci.__name__):
+        async with httpx.AsyncClient(transport=transport) as client:
+            r1 = await client.get("https://a.test/")
+            r2 = await client.get("https://b.test/")
+    assert r1.status_code == r2.status_code == 200 and len(seen) == 2
+    assert all("signature" not in q.headers and "signature-input" not in q.headers for q in seen)
+    assert len([r for r in caplog.records if "could not sign" in r.getMessage()]) == 1
 
 
 # ── configuration: dark by default, never fails a crawl ─────────────────────────────────────────
@@ -230,6 +265,21 @@ def _directory_client() -> TestClient:
     return TestClient(app)
 
 
+@pytest.mark.parametrize("host", ["evil.test", "api.pivota.cc.evil.test", "xn--mnchen-3ya.de", "[::1]", "api.pivota.cc:8443"])
+def test_directory_signs_only_for_our_own_origin(monkeypatch, host):
+    monkeypatch.setenv(ci.KEY_ENV, _pem(Ed25519PrivateKey.generate()))
+    r = _directory_client().get(ci.DIRECTORY_PATH, headers={"host": host})
+    assert r.status_code == 404 and "signature" not in r.headers
+
+
+def test_directory_follows_a_configured_signature_agent(monkeypatch):
+    monkeypatch.setenv(ci.KEY_ENV, _pem(Ed25519PrivateKey.generate()))
+    monkeypatch.setenv(ci.AGENT_ENV, "https://crawl.pivota.test")
+    client = _directory_client()
+    assert client.get(ci.DIRECTORY_PATH, headers={"host": "api.pivota.cc"}).status_code == 404
+    assert client.get(ci.DIRECTORY_PATH, headers={"host": "crawl.pivota.test"}).status_code == 200
+
+
 def test_directory_is_404_until_a_key_is_configured():
     r = _directory_client().get(ci.DIRECTORY_PATH, headers={"host": "api.pivota.cc"})
     assert r.status_code == 404
@@ -266,6 +316,11 @@ def test_our_own_directory_check_passes_the_served_directory_and_catches_tamperi
     other = Ed25519PrivateKey.generate()
     swapped = ('{"keys":[%s]}' % __import__("json").dumps(ci.public_jwk(other))).encode()
     assert not ci.verify_directory(swapped, headers, authority="api.pivota.cc")["ok"]
+    bad_kid = ('{"keys":[%s]}' % __import__("json").dumps({**ci.public_jwk(key), "kid": "not-the-thumbprint"})).encode()
+    assert "a key's kid is not the RFC 7638 thumbprint of its x" in ci.verify_directory(
+        bad_kid, headers, authority="api.pivota.cc")["problems"]
+    no_alg = {**headers, "signature-input": headers["signature-input"].replace(';alg="ed25519"', "")}
+    assert 'alg is not "ed25519"' in ci.verify_directory(r.content, no_alg, authority="api.pivota.cc")["problems"]
     wrong_type = {**headers, "content-type": "application/json"}
     assert ci.verify_directory(r.content, wrong_type, authority="api.pivota.cc")["problems"] == [
         "content-type is 'application/json'"]
@@ -336,3 +391,15 @@ def test_the_mirror_lane_clients_take_the_signing_transport(path, needle):
     from pathlib import Path
 
     assert needle in (Path(__file__).resolve().parents[1] / path).read_text()
+
+
+async def test_the_probe_refuses_to_compare_two_unsigned_requests(capsys):
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "ops" / "web_bot_auth_probe.py"
+    spec = importlib.util.spec_from_file_location("web_bot_auth_probe", path)
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    assert await probe.main(["shop.test"]) == 2  # flag off: no request is made at all
+    assert capsys.readouterr().out.strip() == "E3 signing off"

@@ -139,9 +139,13 @@ def signature_base(lines: Sequence[Tuple[Component, str]], signature_params: str
 
 
 def authority_of(url: httpx.URL) -> str:
-    """RFC 9421 §2.2.3: the target host, lowercased, with the port only when it is not the scheme's
-    default."""
-    host = (url.host or "").lower()
+    """RFC 9421 §2.2.3: the target host as it goes on the wire (ASCII: an IDN in its xn-- form, an
+    IPv6 literal in brackets), lowercased, with the port only when it is not the scheme's default.
+    `raw_host`, not `host`: httpx decodes `host` to Unicode (xn--mnchen-3ya.de -> münchen.de), which
+    is neither what the server sees nor encodable in a signature base."""
+    host = url.raw_host.decode("ascii").lower()
+    if ":" in host:
+        host = f"[{host}]"
     port = url.port
     default = {"https": 443, "http": 80}.get(url.scheme)
     return f"{host}:{port}" if port is not None and port != default else host
@@ -271,7 +275,16 @@ class SigningTransport(httpx.AsyncBaseTransport):
         self._signer = signer
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        self._signer.sign(request)
+        try:
+            self._signer.sign(request)
+        except Exception as exc:
+            # FAIL OPEN: a request we cannot sign goes out unsigned (today's bytes), never not at all.
+            # A crawl must not stop because of its identity. Type only: the message could quote the URL.
+            for name in _SIGNED_HEADERS:
+                if name in request.headers:
+                    del request.headers[name]
+            _log_once(f"sign_failed:{type(exc).__name__}",
+                      "crawl_identity: could not sign a request (%s); sent unsigned", type(exc).__name__)
         return await self._inner.handle_async_request(request)
 
     async def aclose(self) -> None:
@@ -375,6 +388,12 @@ def verify_directory(body: bytes, headers: Dict[str, str], *, authority: str, no
         public = {jwk.get("kid") or "": _jwk_public_key(jwk) for jwk in keys}
     except Exception as exc:
         return {"ok": False, "problems": problems + [f"body is not a public Ed25519 JWKS ({type(exc).__name__})"], "keyids": []}
+    for kid, pub in public.items():
+        x = _b64url(pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw))
+        expected = _b64url(hashlib.sha256(json.dumps({"crv": "Ed25519", "kty": "OKP", "x": x},
+                                                     separators=(",", ":"), sort_keys=True).encode()).digest())
+        if kid != expected:
+            problems.append("a key's kid is not the RFC 7638 thumbprint of its x")
     sig_input, sig = h.get("signature-input") or "", h.get("signature") or ""
     if not sig_input.startswith(f"{SIGNATURE_LABEL}=") or not sig.startswith(f"{SIGNATURE_LABEL}=:"):
         problems.append("missing sig1 Signature-Input / Signature")
@@ -384,6 +403,8 @@ def verify_directory(body: bytes, headers: Dict[str, str], *, authority: str, no
     keyid = fields.get("keyid", "").strip('"')
     if not params.startswith('("@authority";req)'):
         problems.append("covered components are not (\"@authority\";req)")
+    if fields.get("alg", "").strip('"') != "ed25519":
+        problems.append('alg is not "ed25519"')
     if fields.get("tag", "").strip('"') != DIRECTORY_TAG:
         problems.append("tag is not http-message-signatures-directory")
     now = time.time() if now is None else now
