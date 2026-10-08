@@ -632,8 +632,9 @@ name the numeric variant in the purchase's own cart URL:
   the window. `products.js` carries no currency (its price is in whatever presentment currency the
   storefront chose for our crawler, ×100 even for zero-decimal currencies); the seed's price
   currency and the market currency describe other numbers, so neither is assumed. Since
-  2026-10-08 the mirror backfill (scripts/backfill_shopify_variant_ids.py, run nightly per store by
-  the `reap-cart-proof-mirror` job) records it by the enrichment job's own rule
+  2026-10-08 the mirror backfill (scripts/backfill_shopify_variant_ids.py: a hand run, or the
+  `reap-cart-proof-mirror` job's mirror lane where that job is provisioned -- not in prod as of
+  2026-10-08, and its staging cron is paused) records it by the enrichment job's own rule
   (services/shopify_presentment.py): `?country=<seed market>`, no cookie on any request, the final
   response's `cart_currency` Set-Cookie, and only the market's currency counts. A store that sends
   no `cart_currency` cookie at all (judydoll.com, the pilot, measured 2026-10-08) is priced from one
@@ -642,8 +643,11 @@ name the numeric variant in the purchase's own cart URL:
   product id and handle as the `.js`, and it is sent only when a proof that could corroborate is
   about to be written. Each proof then carries `price_minor` (ISO minor units), `currency` and
   `price_source` (`products_js_v1` / `products_json_v1`) together, or none; the run report's
-  `proof_currency` counts `cookie:USD` / `json:USD` or why not (`currency_not_market`,
-  `json_other_product`, ...), and `json_price_fetches` counts the extra requests. Proofs written
+  `proof_currency` counts `cookie:USD` / `json:USD` (what the written proofs carry) or why not
+  (`currency_not_market`, `json_other_product`, `json_variant_unpriced`, ...), and
+  `json_price_fetches` counts the extra requests. A blocked `.json` answer counts toward the
+  store's block streak like a `.js` one, and the store is not asked for `.json` again that run.
+  A payload that repeats a variant id prices nothing. Proofs written
   before that, or by a fetch whose currency was not verified, carry none and never corroborate.
 
 With either witness dial armed, a quote that fails the subtotal AND another check now reports the other check's code (`quote_total_not_reconciled`, `quote_shipping_not_reconciled`, ...) — still `price_changed` / `price_unverifiable`, never a continue. Both lanes yielding different prices is not corroboration. The subtotal must be an exact multiple

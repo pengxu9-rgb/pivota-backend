@@ -409,3 +409,107 @@ def test_the_json_request_is_paced_like_the_js_one(monkeypatch):
     monkeypatch.setattr(backfill.Pacer, "wait", recording_wait)
     _summary, sent = _run_storefront(monkeypatch, js_cookies=())
     assert len(sent) == 2 and waited == ["judydoll.com", "judydoll.com"]
+
+
+# ── review of f4d3b7db3 ─────────────────────────────────────────────────────────────────────────
+
+
+def test_a_repeated_variant_id_prices_nothing():
+    """P2-1: an entry past parse_product_js's 100-entry cap repeating the proven id with another
+    price must not price the proof (the identity was read from the first entry)."""
+    filler = [{"id": 10_000 + i, "title": f"f{i}", "price": 999, "available": True} for i in range(100)]
+    original = next(v for v in JUDY_JS["variants"] if str(v["id"]) == JUDY_VARIANT)
+    payload = {**JUDY_JS, "variants": [*JUDY_JS["variants"], *filler, dict(original, price=100)]}
+    assert backfill.js_live_prices(payload, "USD") == {}
+    _seed, proof = _proof(payload, "USD")
+    assert proof is not None and (proof["price_minor"], proof["currency"]) == (None, None)
+    body = _json()
+    body["product"]["variants"].append(dict(body["product"]["variants"][0]))
+    assert backfill.json_live_prices(body, JUDY_JS, "US") == ({}, "json_malformed")
+
+
+def test_equal_string_ids_are_still_not_shopifys_shape():
+    """LOW-3: the integer rule, not the inequality, refuses a string id (both sides equal strings)."""
+    js = {**JUDY_JS, "id": "9493095285013"}
+    assert backfill.json_live_prices(_json(id="9493095285013"), js, "US") == ({}, "json_other_product")
+
+
+def test_the_evidence_is_what_the_written_proof_carries(monkeypatch):
+    """LOW-2: the .json priced the other shades but refused the proven one -> not `json:USD`."""
+    summary, _sent = _run_storefront(monkeypatch, js_cookies=(), json_body=_json(variant={"price_currency": "SGD"}))
+    assert summary["proof_currency"] == {"json_variant_unpriced": 1}
+
+
+def _rows(n):
+    return [{"id": f"epsv_b{i:03d}", "domain": "judydoll.com", "market": "US", "updated_at": None,
+             "canonical_url": JUDY_SEED["canonical_url"], "destination_url": JUDY_SEED["destination_url"],
+             "seed_data": copy.deepcopy(JUDY_SEED["seed_data"])} for i in range(n)]
+
+
+def _run_rows(monkeypatch, rows, handler):
+    async def fake_select(limit, domain, after=None, seed_ids=None):
+        return [dict(r) for r in rows]
+
+    monkeypatch.setattr(backfill, "select_candidates", fake_select)
+    monkeypatch.setattr(backfill, "GLOBAL_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(backfill, "PER_DOMAIN_MIN_GAP_S", 0.0)
+
+    async def go():
+        async with no_cookie_client(transport=httpx.MockTransport(handler)) as client:
+            return await backfill.run(limit=100, domain="judydoll.com", apply=False, client=client)
+
+    return asyncio.run(go())
+
+
+def test_a_blocked_json_is_counted_and_not_asked_again(monkeypatch):
+    """P2-2: one .json 429 is a block of the store: counted in most_blocked_domains, and the
+    store is not sent another .json this run (the .js rows still proceed and are written)."""
+    sent: List[str] = []
+
+    def handler(request):
+        sent.append(request.url.path)
+        if request.url.path.endswith(".json"):
+            return httpx.Response(429, headers={"retry-after": "120"})
+        return httpx.Response(200, headers={"content-type": "text/javascript"}, json=JUDY_JS)
+
+    summary = _run_rows(monkeypatch, _rows(5), handler)
+    assert [p.endswith(".json") for p in sent].count(True) == 1
+    assert summary["json_price_fetches"] == {"rate_limited": 1}
+    assert summary["proof_currency"] == {"json_rate_limited": 1, "json_skipped_after_block": 4}
+    assert summary["most_blocked_domains"] == {"judydoll.com": 1}
+    assert summary["aborted_on_block"] is False and summary["rows_with_new_ids"] == 5
+
+
+def test_json_blocks_reach_the_abort_streak(monkeypatch):
+    """A .json block feeds the same streak the .js blocks do: one clean .js, a .json 403 (1), then
+    .js 403s -- the run aborts one .js block sooner than it would have without the .json one."""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if request.url.path.endswith(".json"):
+            return httpx.Response(403)
+        if calls["n"] > 2:
+            return httpx.Response(403)  # the store now blocks the .js too
+        return httpx.Response(200, headers={"content-type": "text/javascript"}, json=JUDY_JS)
+
+    summary = _run_rows(monkeypatch, _rows(20), handler)
+    # .js ok (reset) -> .json 403 (1) -> then .js 403s: the .json block counted toward the streak
+    assert summary["aborted_on_block"] is True
+    assert summary["fetch_outcomes"]["http_403"] == backfill.CONSECUTIVE_BLOCK_ABORT - 1
+    assert summary["next_cursor"] is None
+
+
+def test_a_json_block_on_the_streak_limit_stops_after_writing_that_row(monkeypatch):
+    monkeypatch.setattr(backfill, "CONSECUTIVE_BLOCK_ABORT", 1)
+    sent: List[str] = []
+
+    def handler(request):
+        sent.append(request.url.path)
+        if request.url.path.endswith(".json"):
+            return httpx.Response(429)
+        return httpx.Response(200, headers={"content-type": "text/javascript"}, json=JUDY_JS)
+
+    summary = _run_rows(monkeypatch, _rows(3), handler)
+    assert len(sent) == 2 and summary["aborted_on_block"] is True
+    assert summary["rows_with_new_ids"] == 1 and summary["next_cursor"] is None

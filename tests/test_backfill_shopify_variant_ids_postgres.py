@@ -1048,7 +1048,7 @@ def _json_with(**over: Any) -> Dict[str, Any]:
     (_json_with(id=1), "json_other_product"),
     (_json_with(handle="another-product"), "json_other_product"),
     ({"products": []}, "json_malformed"),
-    (_json_with(variant={"price_currency": "SGD"}), "json:USD"),   # the OTHER variants still price
+    (_json_with(variant={"price_currency": "SGD"}), "json_variant_unpriced"),  # others priced, not this one
 ], ids=["404", "other_id", "other_handle", "not_a_product", "variant_in_another_currency"])
 async def test_the_json_fallback_prices_only_the_same_product_in_the_markets_currency(_db, json_payload, evidence) -> None:
     from scripts.backfill_shopify_variant_ids import run

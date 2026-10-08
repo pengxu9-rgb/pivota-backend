@@ -145,7 +145,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -467,6 +466,10 @@ def js_live_prices(payload: Any, currency: Optional[str]) -> LivePrices:
     currency (`products_js_price_minor`), so JPY 2,200 is 2200, not 220000."""
     prices: LivePrices = {}
     raw = payload.get("variants") if isinstance(payload, dict) and currency else None
+    if _has_repeated_variant_id(raw):
+        # Shopify never repeats a variant id. A payload that does cannot say WHICH entry's price
+        # belongs to the variant the proof's identity and availability were read from.
+        return {}
     for entry in raw if isinstance(raw, list) else []:
         vid = _numeric_id(entry.get("id")) if isinstance(entry, dict) else None
         minor = products_js_price_minor(entry.get("price"), currency) if vid else None
@@ -504,7 +507,7 @@ def json_live_prices(json_payload: Any, js_payload: Any, market: Any) -> Tuple[L
             or product.get("id") != js_payload.get("id")):
         return {}, "json_other_product"
     variants = product.get("variants")
-    if not isinstance(variants, list):
+    if not isinstance(variants, list) or _has_repeated_variant_id(variants):
         return {}, "json_malformed"
     prices: LivePrices = {}
     currencies = set()
@@ -526,6 +529,13 @@ def json_live_prices(json_payload: Any, js_payload: Any, market: Any) -> Tuple[L
     if prices:
         return prices, None
     return {}, ("json_currency_not_market" if currencies and expected not in currencies else "json_price_unreadable")
+
+
+def _has_repeated_variant_id(raw: Any) -> bool:
+    """Whether any variant id appears twice (compared as its numeric string, so 7 and "7" clash)."""
+    ids = [_numeric_id(entry.get("id")) for entry in raw if isinstance(entry, dict)] if isinstance(raw, list) else []
+    ids = [vid for vid in ids if vid]
+    return len(ids) != len(set(ids))
 
 
 def _shopify_int_id(value: Any) -> bool:
@@ -706,8 +716,13 @@ async def run(
     conflicts = 0
     consecutive_blocks = 0
     aborted = False
+    abort_after_row = False
+    json_blocked_hosts: set = set()
 
     for row in rows:
+        if abort_after_row:
+            aborted = True
+            break
         seed_data = seed_data_of(row)
         if seed_data is None:
             outcomes["unreadable_seed_data"] += 1
@@ -774,7 +789,11 @@ async def run(
             )
 
         cart_proof, variant_proofs = _proofs(live_prices)
-        if currency_problem == "cookie_absent" and _has_available_proof(cart_proof, variant_proofs):
+        if (currency_problem == "cookie_absent" and _has_available_proof(cart_proof, variant_proofs)
+                and host in json_blocked_hosts):
+            # This store already blocked a .json request this run: do not ask it again.
+            evidence = "json_skipped_after_block"
+        elif currency_problem == "cookie_absent" and _has_available_proof(cart_proof, variant_proofs):
             # THE .json FALLBACK (`json_live_prices`): only for a store that sent no currency
             # cookie, and only when a proof that could corroborate is about to be written. Paced
             # and sent like the `.js` (the refresh job's client gates it the same way).
@@ -782,15 +801,31 @@ async def run(
             json_payload, json_outcome, _json_cookies = await fetch_product_js_read(
                 client, fetch_url_for_market(product_json_url(js_url), row.get("market")))
             json_fetches[json_outcome] += 1
+            if _is_block(json_outcome) or json_outcome == "not_json":
+                # A .json block is a block of THIS store, counted exactly like a .js one (the streak,
+                # the per-domain table, the abort). The row is still written -- its proof is valid,
+                # only unpriced -- and the run stops before the next row if the streak is reached.
+                per_domain_blocks[host] += 1
+                json_blocked_hosts.add(host)
+                if json_outcome != "not_json":
+                    consecutive_blocks += 1
+                    abort_after_row = consecutive_blocks >= CONSECUTIVE_BLOCK_ABORT
             if json_outcome == "ok":
                 json_prices, json_problem = json_live_prices(json_payload, payload, row.get("market"))
                 if json_prices:
                     cart_proof, variant_proofs = _proofs(json_prices)
-                    evidence = f"json:{next(iter(json_prices.values()))[1]}"
+                    evidence = "json"
                 else:
                     evidence = json_problem
             else:
                 evidence = f"json_{json_outcome}"
+        if evidence in ("json", f"cookie:{read_currency}"):
+            # Named by what the WRITTEN proofs carry, not by what the response priced: a proof
+            # whose own variant was refused a price says so.
+            written = {p.get("currency") for p in [cart_proof, *variant_proofs.values()]
+                       if isinstance(p, dict) and p.get("currency")}
+            source = "json" if evidence == "json" else "cookie"
+            evidence = f"{source}:{written.pop()}" if len(written) == 1 else f"{source}_variant_unpriced"
         if cart_proof is not None:
             proof_scopes[cart_proof.get("scope") or CART_PROOF_SCOPE_SOLE] += 1
         if cart_proof is not None or variant_proofs:
@@ -821,6 +856,8 @@ async def run(
                 conflicts += 1
                 changed_rows -= 1
                 stamped_total -= report["stamped"]
+    if abort_after_row:
+        aborted = True
 
     return {
         "mode": "apply" if apply else "dry_run",
@@ -839,11 +876,13 @@ async def run(
         # proof; `named_variant` attests the one variant a seed names on a multi-variant product.
         "cart_proofs": dict(proof_scopes),
         # Per fetch that produced a proof: where its verified market currency came from
-        # (`cookie:USD` -- the .js response's cart_currency; `json:USD` -- the .json fallback), so
-        # its proofs carry a price that can corroborate; or why not (cookie_conflict,
-        # cookie_malformed, currency_not_market, market_unknown, json_<outcome>,
-        # json_other_product, json_currency_not_market, json_price_unreadable, and cookie_absent
-        # when no proof could corroborate so no fallback was sent).
+        # (`cookie:USD` -- the .js response's cart_currency; `json:USD` -- the .json fallback), read
+        # off the WRITTEN proofs; or why not (cookie_conflict, cookie_malformed,
+        # currency_not_market, market_unknown, json_<fetch outcome>, json_malformed,
+        # json_other_product, json_currency_not_market, json_price_unreadable,
+        # json_skipped_after_block, cookie_/json_variant_unpriced when the response priced other
+        # variants but not the proven one, and cookie_absent when no proof could corroborate so
+        # no fallback was sent).
         "proof_currency": dict(proof_currency),
         # The .json fallback requests this run SENT, by fetch outcome (they count toward the
         # crawl budget: one per product on a cookieless store).

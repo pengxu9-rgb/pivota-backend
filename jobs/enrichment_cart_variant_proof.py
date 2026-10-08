@@ -174,7 +174,6 @@ import json
 import logging
 import math
 import os
-import re
 import sys
 import time
 import unicodedata
@@ -190,7 +189,6 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import httpx  # noqa: E402
 
 from db.enrichment_cart_variant_proofs import OUTCOME_OK, PROOF_SOURCES, TABLE  # noqa: E402
 from db.reap_agentic_ledger import amount_minor_or_none  # noqa: E402

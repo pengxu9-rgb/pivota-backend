@@ -611,11 +611,13 @@ def test_mirror_pages_are_summed_per_domain():
     refresh.merge_mirror(total, {"candidates": 7, "rows_with_new_ids": 1, "variant_ids_stamped": 0,
                                  "write_conflicts": 0, "fetch_outcomes": {"ok": 7},
                                  "cart_proofs": {"named_variant": 1, "sole_variant": 1},
-                                 "proof_currency": {"USD": 1, "cookie_absent": 1}})
+                                 "proof_currency": {"cookie:USD": 1, "cookie_absent": 1},
+                                 "json_price_fetches": {"ok": 1}})
     assert total == {"candidates": 57, "rows_with_new_ids": 4, "variant_ids_stamped": 4, "write_conflicts": 1,
                      "fetch_outcomes": {"ok": 47, "dead_handle": 10},
                      "cart_proofs": {"sole_variant": 3, "named_variant": 1}, "match_reasons": {"x": 1},
-                     "proof_currency": {"USD": 1, "cookie_absent": 1}, "most_blocked_domains": {}}
+                     "proof_currency": {"cookie:USD": 1, "cookie_absent": 1}, "json_price_fetches": {"ok": 1},
+                     "most_blocked_domains": {}}
 
 
 # ── the real backfill, paged by the driver (no DB, no network) ──────────────────────────────────

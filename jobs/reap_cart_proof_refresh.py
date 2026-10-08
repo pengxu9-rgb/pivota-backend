@@ -589,7 +589,8 @@ def cursor_row_for(result: DomainResult, final: bool, now: datetime,
 
 #: The mirror writer's report keys that are plain counts or count maps, summed over pages.
 _MIRROR_COUNTS = ("candidates", "rows_with_new_ids", "variant_ids_stamped", "write_conflicts")
-_MIRROR_COUNT_MAPS = ("fetch_outcomes", "match_reasons", "cart_proofs", "proof_currency", "most_blocked_domains")
+_MIRROR_COUNT_MAPS = ("fetch_outcomes", "match_reasons", "cart_proofs", "proof_currency", "json_price_fetches",
+                      "most_blocked_domains")
 
 
 def merge_mirror(total: Dict[str, Any], page: Dict[str, Any]) -> None:
