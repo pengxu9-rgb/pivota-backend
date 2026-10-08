@@ -1099,11 +1099,13 @@ def test_the_script_wires_the_first_run_safely(source):
     first_policy = body.index('\nupsert "')
     for metric in METRICS:
         assert body.index(f"upsert_log_metric {metric} ") < first_policy
-    # The policies over a log metric THIS script creates, and only they, take the waiting path: the
-    # purchasability sweep's IP-throttle policy, then the Reap ones. They come after every `upsert`,
-    # so a deferral cannot leave one of the nine existing policies unwritten.
+    # Every policy over a log metric THIS script creates takes the waiting path, and nothing else does
+    # (test_no_plain_upsert_reads_a_log_metric holds that from the filters): the pool and retailer-ingest
+    # policies, the purchasability sweep's, then the Reap ones. They come after every plain `upsert`, so
+    # a deferral can only ever leave a waiting-path policy unwritten, never a plain one.
     waited = re.findall(r'^upsert_on_new_metric "([^"]+)"', body, re.M)
-    assert waited == ["prod: purchasability sweep IP-throttled",
+    assert waited == ["prod: database pool exhausted", "prod: retailer ingest held for review",
+                      "prod: retailer ingest job failed", "prod: purchasability sweep IP-throttled",
                       STUCK_POLICY, FAILING_POLICY, SILENT_POLICY,
                       "prod: Reap checkout needs human reconciliation",
                       "prod: Reap buyer contact retention blocked"]
@@ -1183,6 +1185,32 @@ def test_plain_upsert_also_aborts_on_an_error_list_and_on_a_nameless_create(tmp_
     assert "   prod: A" in proc.stdout
 
 
+def test_no_plain_upsert_reads_a_log_metric(source):
+    """THE RULE, from the filters themselves: a policy whose condition reads a user log metric
+    (`logging.googleapis.com/user/<m>`, or `logging_googleapis_com:user_<m>` in PromQL) goes through
+    `upsert_on_new_metric`, and `<m>` is created by this script BEFORE the first policy. Monitoring takes
+    up to 10 minutes to see a new log metric; through plain `upsert` such a policy aborts a brand-new
+    project's first run (it aborted prod's on 2026-10-08, at the purchasability sweep's policy)."""
+    body = _uncommented(source)
+    calls = re.findall(r'^(upsert|upsert_on_new_metric) "([^"]+)" "\$\((?:policy|promql_policy) (.*?)\)"$',
+                       body, re.S | re.M)
+    assert len(calls) == 15, [n for _, n, _ in calls]
+    first_policy = min(body.index('\nupsert "'), body.index('\nupsert_on_new_metric "'))
+    readers = 0
+    for writer, name, args in calls:
+        metrics = set(re.findall(r'logging\.googleapis\.com/user/(\w+)', args))
+        metrics |= set(re.findall(r'logging_googleapis_com:user_(\w+)', args))
+        if not metrics:
+            continue
+        readers += 1
+        assert writer == "upsert_on_new_metric", f"{name} reads {sorted(metrics)} through plain upsert"
+        for metric in metrics:
+            created = [m.start() for m in re.finditer(
+                rf'(?:^upsert_log_metric {metric} |^METRIC={metric}$)', body, re.M)]
+            assert created and created[0] < first_policy, f"{metric} is not created before the policies"
+    assert readers == 9
+
+
 def test_the_nine_existing_policies_render_exactly_as_before_this_change():
     """`upsert` was edited, and it deletes and re-creates: what it SENDS for the nine policies
     that exist in prod must not have moved by a byte. The digest is of the generators' raw output
@@ -1196,15 +1224,26 @@ def test_the_nine_existing_policies_render_exactly_as_before_this_change():
         name: source.split(name + "() {", 1)[1].split("python3 -c '\n", 1)[1].split("' \"$@\"", 1)[0]
         for name in ("policy", "promql_policy")
     }
+    # THE SAME NINE, by name, whichever writer they go through now: three of them moved to
+    # `upsert_on_new_metric` (their log metrics are created by this script), which changes how a policy
+    # is written, never what is written. Before that move this read `^upsert "` alone.
+    nine = {
+        "prod: host is down", "prod: TLS certificate expiring", "prod: load balancer 5xx",
+        "prod: Cloud Run job failing", "prod: relgraph-sync running over two hours",
+        "prod: Cloud SQL connections high", "prod: database pool exhausted",
+        "prod: retailer ingest held for review", "prod: retailer ingest job failed",
+    }
     rendered = {}
     for name, generator, body in re.findall(
-        r'^upsert "([^"]+)" "\$\((policy|promql_policy) (.*?)\)"$', source, re.S | re.M
+        r'^upsert(?:_on_new_metric)? "([^"]+)" "\$\((policy|promql_policy) (.*?)\)"$', source, re.S | re.M
     ):
+        if name not in nine:
+            continue
         args = shlex.split(body.replace("\\\n", "").replace("\\`", "`"))
         rendered[name] = subprocess.run(
             [sys.executable, "-c", generators[generator], *args, CHANNEL],
             text=True, capture_output=True, check=True,
         ).stdout
-    assert len(rendered) == 9, sorted(rendered)
+    assert set(rendered) == nine, sorted(rendered)
     digest = hashlib.sha256(json.dumps(rendered, sort_keys=True).encode()).hexdigest()
     assert digest == "9ff583df92b8d4a70c771356c6ec7bc4b6336f17c50a907ab4f323beca2b3186"
