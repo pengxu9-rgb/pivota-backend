@@ -589,7 +589,8 @@ def cursor_row_for(result: DomainResult, final: bool, now: datetime,
 
 #: The mirror writer's report keys that are plain counts or count maps, summed over pages.
 _MIRROR_COUNTS = ("candidates", "rows_with_new_ids", "variant_ids_stamped", "write_conflicts")
-_MIRROR_COUNT_MAPS = ("fetch_outcomes", "match_reasons", "cart_proofs", "most_blocked_domains")
+_MIRROR_COUNT_MAPS = ("fetch_outcomes", "match_reasons", "cart_proofs", "proof_currency", "json_price_fetches",
+                      "most_blocked_domains")
 
 
 def merge_mirror(total: Dict[str, Any], page: Dict[str, Any]) -> None:
@@ -1223,7 +1224,11 @@ async def run_lane(plan: LanePlan, *, apply: bool, budget_s: float, emit: Callab
         try:
             with crawl_ip_throttle.installed(breaker):
                 if plan.lane == "mirror":
-                    async with httpx.AsyncClient() as raw_client:
+                    # No cookie rides any request (a hop's cart_currency/localization would steer the
+                    # presentment currency the proofs now record): services/shopify_presentment.py.
+                    from services.shopify_presentment import no_cookie_client
+
+                    async with no_cookie_client() as raw_client:
                         client = BlockStreakClient(raw_client, plan.writer, breaker=breaker)
                         try:
                             await drive(domains, mirror_page_fn(plan.writer, client, apply=apply), merge_mirror,
