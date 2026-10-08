@@ -53,7 +53,7 @@ proxy transport: `crawl_transport(httpx.AsyncHTTPTransport(proxy=...))`.
 |---|---|---|
 | `WEB_BOT_AUTH_PRIVATE_KEY` | secret; on `web` and on every signing job | Ed25519 PKCS#8 PEM. On `web` it makes the directory answer; elsewhere it is the signing key |
 | `CRAWL_WEB_BOT_AUTH_ENABLED` | the crawl jobs only | `true` = sign. Unset = today's bytes exactly. On without a usable key = unsigned, plus one ERROR line |
-| `WEB_BOT_AUTH_SIGNATURE_AGENT` | optional | default `https://api.pivota.cc`, the origin serving the directory |
+| `WEB_BOT_AUTH_SIGNATURE_AGENT` | optional; IDENTICAL on `web` and every signing job | default `https://api.pivota.cc`, the origin serving the directory. The directory answers only for this authority, so a job naming another origin gets a 404 from a verifier |
 | `WEB_BOT_AUTH_AGENT_FORMAT` | optional | `string` (default) or `dictionary`; see below |
 
 **The two `Signature-Agent` formats.** Cloudflare's live docs require the sf-string
@@ -94,6 +94,9 @@ the directory check passes, try `dictionary` on one job before concluding anythi
    ```bash
    SUBNET=pivota-crawl SERVICE_ACCOUNT=sa-worker@pivota-prod.iam.gserviceaccount.com SECRETS=WEB_BOT_AUTH_PRIVATE_KEY=WEB_BOT_AUTH_PRIVATE_KEY:latest ENV_VARS=PIVOTA_ENV=production,CRAWL_WEB_BOT_AUTH_ENABLED=true IMAGE=us-west1-docker.pkg.dev/pivota-shared/pivota/backend:<backend-tag> bash scripts/ops/run_oneoff_job.sh scripts/ops/web_bot_auth_probe.py flowerknows.co dermalogica.com
    ```
+   It sends at most 10 requests and bypasses the crawl pacers, so run it outside the nightly crawl
+   windows (02:20–04:20 and 05:15–06:15 UTC). It needs no database: `SECRETS` above deliberately
+   mounts only the key.
    Read the `E3` lines:
    - Signed 200 where unsigned gets `local_rate_limited`: signing works.
    - Both 429: Shopify may want the higher-tier form first, or may not accept this
