@@ -156,3 +156,46 @@ async def test_the_preflight_without_a_client_signs_through_its_own(monkeypatch)
     _sign_on(monkeypatch)
     await pf.preflight("judydoll.com", market="US", variant_id="49819267301653", click_id="c_test")
     _assert_every_request_signed_as_pivotabot(seen)
+
+
+def test_robots_are_evaluated_for_the_ua_the_wire_will_carry(monkeypatch):
+    override = "SomeOtherBot/2.0"
+    assert ci.robots_user_agent(override) == override
+    _sign_on(monkeypatch)
+    assert ci.robots_user_agent(override) == ci.DECLARED_USER_AGENT
+
+
+async def test_the_external_offer_fetch_asks_robots_about_pivotabot_when_signing(monkeypatch):
+    from services import external_offers_service as eos
+
+    asked = []
+
+    async def _spy(url, *, user_agent, max_wait=None):
+        asked.append(user_agent)
+
+    monkeypatch.setattr(eos.crawl_politeness, "before_request", _spy)
+    monkeypatch.setattr(eos.crawl_politeness, "note_response", lambda *a, **k: None)
+    monkeypatch.setattr(eos.shopify_edge_pacer, "learn_from_response", lambda *a, **k: None)
+    monkeypatch.setattr(eos, "DEFAULT_UA", "SomeOtherBot/2.0")
+    _mock_http(monkeypatch, lambda r: httpx.Response(200, text="<html></html>", headers={"content-type": "text/html"}))
+    _sign_on(monkeypatch)
+    await eos._fetch_html("https://shop.test/products/x")
+    assert asked == [ci.DECLARED_USER_AGENT]
+
+
+def test_the_preflights_own_signed_client_keeps_the_operators_https_proxy(monkeypatch):
+    from services import shopify_cart_link_preflight as pf
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://laptop-proxy.example:8080")
+    _sign_on(monkeypatch)
+    transport = pf._own_client_transport()["transport"]
+    assert transport._inner._pool._proxy_url.host == b"laptop-proxy.example"
+
+
+def test_on_without_a_key_the_preflight_builds_nothing(monkeypatch):
+    from services import shopify_cart_link_preflight as pf
+
+    monkeypatch.setenv(ci.FLAG_ENV, "1")
+    built = []
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda *a, **k: built.append(1))
+    assert pf._own_client_transport() == {} and built == []

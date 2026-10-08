@@ -171,7 +171,7 @@ def _own_client_transport() -> dict:
     Auth) when this process signs -- the transport then also sets the declared PivotaBot UA -- else
     `{}`, today's call exactly. The process HTTPS proxy is honoured explicitly, because passing a
     transport switches off httpx's environment-proxy lookup."""
-    if not crawl_identity.enabled():
+    if crawl_identity.status() != "signed":
         return {}
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
     return crawl_identity.transport_kwargs(httpx.AsyncHTTPTransport(proxy=proxy))

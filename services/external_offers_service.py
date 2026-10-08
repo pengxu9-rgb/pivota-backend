@@ -1478,7 +1478,7 @@ async def _fetch_html(
     # script's `except Exception` would silently record the row as fetch_failed. A host that 429s
     # four times in a row would then void the rest of the run in milliseconds while looking like
     # the host was down.
-    await crawl_politeness.before_request(url, user_agent=DEFAULT_UA, max_wait=max_wait)
+    await crawl_politeness.before_request(url, user_agent=crawl_identity.robots_user_agent(DEFAULT_UA), max_wait=max_wait)
 
     timeout = httpx.Timeout(10.0, connect=5.0)
     # Signed (Web Bot Auth) when CRAWL_WEB_BOT_AUTH_ENABLED and a key are set; every redirect hop is

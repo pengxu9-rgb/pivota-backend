@@ -435,6 +435,13 @@ def verify_directory(body: bytes, headers: Dict[str, str], *, authority: str, no
     return {"ok": not problems, "problems": problems, "keyids": list(public)}
 
 
+def robots_user_agent(lane_user_agent: str) -> str:
+    """The User-Agent robots.txt and Crawl-delay must be evaluated for: the one the request will
+    actually carry. While signing, that is DECLARED_USER_AGENT (SigningTransport sets it), whatever a
+    lane's own string or an EXTERNAL_OFFER_USER_AGENT override says; otherwise the lane's own."""
+    return DECLARED_USER_AGENT if status() == "signed" else lane_user_agent
+
+
 def transport_kwargs(inner: Optional[httpx.AsyncBaseTransport] = None) -> Dict[str, httpx.AsyncBaseTransport]:
     """`{"transport": ...}` to splat into an `httpx.AsyncClient(...)` call, or `{}` when nothing
     changes -- so a lane's flag-off call is literally the call it made before."""

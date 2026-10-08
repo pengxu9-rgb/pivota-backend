@@ -52,6 +52,11 @@ questions (review of #2532, 2026-10-08):
    out of the cart-link lane. Before enabling, run the Tier B job twice in dry-run (flag off, then on)
    over the same cohort and compare verdicts.
 
+The flag is PROCESS-WIDE: a shell that exported `CRAWL_WEB_BOT_AUTH_ENABLED=true` and the key (for
+example to run `scripts/backfill_shopify_variant_ids.py` signed) also signs anything else it runs,
+including `scripts/ops/refresh_tierb_seed_hints.py` and `scripts/ops/tierb_cart_link_preflight.py`.
+Unset it before running those.
+
 On purpose, neither job's setup script has a `WEB_BOT_AUTH` switch yet (unlike
 `setup_reap_cart_proof_jobs.sh`): `--set-env-vars` there would wipe a flag set by hand, and there
 should be no supported way to enable these lanes until both questions are answered.
@@ -137,8 +142,8 @@ the directory check passes, try `dictionary` on one job before concluding anythi
    - The cart-proof run report carries `web_bot_auth: signed | off | unsigned_<reason>`.
 8. File https://forms.gle/V88RD31uAVirqE4e9 with:
    - the directory URL;
-   - the User-Agent: `Mozilla/5.0 (compatible; PivotaBot/1.0; +https://pivota.cc)`, unless
-     `EXTERNAL_OFFER_USER_AGENT` overrides it on a job;
+   - the User-Agent: `Mozilla/5.0 (compatible; PivotaBot/1.0; +https://pivota.cc)` (every signed
+     request carries it, and robots.txt is evaluated for it, whatever `EXTERNAL_OFFER_USER_AGENT` says);
    - the egress IP 34.82.199.35;
    - the request rate (the shared pacer: 2 req/s overall, about 1 req/host/s);
    - the purpose: commerce discovery feeding UCP checkout on the merchant's own store.
