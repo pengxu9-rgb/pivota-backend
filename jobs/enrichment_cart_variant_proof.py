@@ -197,7 +197,7 @@ from db.enrichment_cart_variant_proofs import OUTCOME_OK, PROOF_SOURCES, TABLE  
 from db.reap_agentic_ledger import amount_minor_or_none  # noqa: E402
 # The map the purchase lane prices with. One map, so the proof's currency and the lane's agree.
 from routes.agent_commerce_reap import _MARKET_CURRENCY  # noqa: E402
-from services import crawl_politeness, shopify_edge_pacer  # noqa: E402
+from services import crawl_identity, crawl_politeness, shopify_edge_pacer  # noqa: E402
 from services.curated_brand_feed import _same_storefront_host  # noqa: E402
 from services.reap_enrichment_cart_proof import (  # noqa: E402
     ENRICHMENT_SOURCE_SYSTEM,
@@ -326,6 +326,9 @@ def no_cookie_client(**kwargs: Any) -> httpx.AsyncClient:
     ride a later request (a redirect hop included)."""
     jar = CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
     # The JAR itself, not httpx.Cookies(jar): httpx copies a Cookies object into a fresh default jar.
+    # Signed (Web Bot Auth) when its flag and key are set, unless the caller brought a transport.
+    if "transport" not in kwargs:
+        kwargs.update(crawl_identity.transport_kwargs())
     return httpx.AsyncClient(cookies=jar, **kwargs)
 
 

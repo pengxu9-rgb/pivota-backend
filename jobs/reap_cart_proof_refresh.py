@@ -1213,7 +1213,9 @@ async def run_lane(plan: LanePlan, *, apply: bool, budget_s: float, emit: Callab
         info["backed_off"] = {d: str(cursors[d].blocked_until) for d in backed_off}
         for domain in backed_off:
             state.results[domain] = DomainResult(status=BACKED_OFF)
-        from services import crawl_ip_throttle, shopify_edge_pacer
+        from services import crawl_identity, crawl_ip_throttle, shopify_edge_pacer
+        # What every store request of this run carries: off | signed | unsigned_<reason>.
+        info["web_bot_auth"] = crawl_identity.status()
 
         # What the cursor table says about each store: health from a previous run is evidence the
         # address went bad; a store it already blames is not (`StoreStreakWindow`).
@@ -1223,7 +1225,7 @@ async def run_lane(plan: LanePlan, *, apply: bool, budget_s: float, emit: Callab
         try:
             with crawl_ip_throttle.installed(breaker):
                 if plan.lane == "mirror":
-                    async with httpx.AsyncClient() as raw_client:
+                    async with httpx.AsyncClient(**crawl_identity.transport_kwargs()) as raw_client:
                         client = BlockStreakClient(raw_client, plan.writer, breaker=breaker)
                         try:
                             await drive(domains, mirror_page_fn(plan.writer, client, apply=apply), merge_mirror,

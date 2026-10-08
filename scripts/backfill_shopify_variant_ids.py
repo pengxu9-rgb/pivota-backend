@@ -142,6 +142,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.database import database  # noqa: E402
+from services import crawl_identity  # noqa: E402
 from services.shopify_variant_identity import (  # noqa: E402
     CART_PROOF_SCOPE_NAMED,
     CART_PROOF_SCOPE_SOLE,
@@ -661,7 +662,7 @@ def main() -> int:
     async def _main() -> Dict[str, Any]:
         await database.connect()
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(**crawl_identity.transport_kwargs()) as client:
                 return await run(
                     limit=args.limit, domain=args.domain, apply=args.apply,
                     client=client, after=args.after, seed_ids=args.seed_ids,
