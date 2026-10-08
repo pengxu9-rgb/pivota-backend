@@ -155,7 +155,7 @@ def _proof(payload: Dict[str, Any], read_currency, *, checked_at=None):
     proof = backfill.build_cart_proof(
         seed, new_variants, payload, live, js_url=JUDY_JS_URL, page_url=JUDY_SEED["canonical_url"],
         shop_host="judydoll.com", checked_at=checked_at or datetime.now(timezone.utc) - timedelta(hours=1),
-        read_currency=read_currency)
+        live_prices=backfill.js_live_prices(payload, read_currency))
     seed["snapshot"].update({"variants": new_variants, "shopify_cart_proof": proof})
     return seed, proof
 
@@ -201,7 +201,7 @@ def test_the_selected_variant_proofs_carry_the_same_price():
     seed, _proof_ = _proof(JUDY_JS, "USD")
     selected = backfill.build_selected_variant_proofs(
         seed["snapshot"]["variants"], JUDY_JS, js_url=JUDY_JS_URL,
-        checked_at=datetime.now(timezone.utc) - timedelta(hours=1), read_currency="USD")
+        checked_at=datetime.now(timezone.utc) - timedelta(hours=1), live_prices=backfill.js_live_prices(JUDY_JS, "USD"))
     assert {vid: (p["price_minor"], p["currency"]) for vid, p in selected.items()} == {JUDY_VARIANT: (1399, "USD")}
     unverified = backfill.build_selected_variant_proofs(
         seed["snapshot"]["variants"], JUDY_JS, js_url=JUDY_JS_URL, checked_at=datetime.now(timezone.utc))
@@ -245,13 +245,13 @@ def test_the_refresh_lane_builds_its_client_without_cookies(monkeypatch):
     assert [r.url.host for r in product] == ["judydoll.com", "www.judydoll.com"]
     assert str(product[0].url).endswith("/products/silky-matte-lip-ink.js?country=US")
     assert all("cookie" not in r.headers for r in product), [dict(r.headers) for r in product]
-    assert state.results["judydoll.com"].writer["proof_currency"] == {"USD": 1}
+    assert state.results["judydoll.com"].writer["proof_currency"] == {"cookie:USD": 1}
 
 
 @pytest.mark.parametrize("market, cookie, expected", [
-    ("SG", "cart_currency=SGD", {"SGD": 1}),
+    ("SG", "cart_currency=SGD", {"cookie:SGD": 1}),
     ("SG", "cart_currency=USD", {"currency_not_market": 1}),
-    ("US", "cart_currency=USD", {"USD": 1}),
+    ("US", "cart_currency=USD", {"cookie:USD": 1}),
 ])
 def test_run_reads_each_seed_against_its_own_market(monkeypatch, market, cookie, expected):
     """The REAL `run()` (selection faked, no DB write): the request asks the seed's market and the
@@ -280,3 +280,132 @@ def test_run_reads_each_seed_against_its_own_market(monkeypatch, market, cookie,
     summary = asyncio.run(go())
     assert sent == [JUDY_JS_URL + f"?country={market}"]
     assert summary["proof_currency"] == expected
+
+
+# ── the .json fallback for a store that sends no cart_currency cookie (judydoll, measured) ────
+
+JUDY_JSON = json.loads((_FIXTURES / "judydoll_silky_matte_lip_ink_product_json_2026_10_08.json").read_text())
+
+
+def _json(**over):
+    body = copy.deepcopy(JUDY_JSON)
+    variant = over.pop("variant", None)
+    body["product"].update(over)
+    for entry in body["product"]["variants"]:
+        if variant and str(entry["id"]) == JUDY_VARIANT:
+            entry.update(variant)
+    return body
+
+
+def test_the_product_json_prices_every_variant_in_the_markets_currency():
+    prices, problem = backfill.json_live_prices(JUDY_JSON, JUDY_JS, "US")
+    assert problem is None and len(prices) == 8
+    assert prices[JUDY_VARIANT] == (1399, "USD", backfill.PRICE_SOURCE_JSON)
+
+
+@pytest.mark.parametrize("body, market, problem", [
+    (_json(id=1), "US", "json_other_product"),
+    (_json(handle="other"), "US", "json_other_product"),
+    (_json(id="9493095285013"), "US", "json_other_product"),   # a string id is not Shopify's
+    ({"product": None}, "US", "json_malformed"),
+    ({"products": [JUDY_JSON["product"]]}, "US", "json_malformed"),
+    (JUDY_JSON, "SG", "json_currency_not_market"),
+    (JUDY_JSON, "DE", "market_unknown"),
+])
+def test_the_product_json_refuses_another_product_or_currency(body, market, problem):
+    assert backfill.json_live_prices(body, JUDY_JS, market) == ({}, problem)
+
+
+@pytest.mark.parametrize("variant, expected", [
+    ({"price": "13.99"}, (1399, "USD")),
+    ({"price": "13.999"}, None),          # a fraction of a cent: refused, never rounded
+    ({"price": 13.99}, None),             # the .json price is a string; a number is not this shape
+    ({"price": "abc"}, None),
+    ({"price_currency": "SGD"}, None),    # this variant in another currency
+    ({"price_currency": None}, None),
+])
+def test_a_json_variant_counts_only_with_a_readable_price_in_the_markets_currency(variant, expected):
+    prices, _problem = backfill.json_live_prices(_json(variant=variant), JUDY_JS, "US")
+    found = prices.get(JUDY_VARIANT)
+    assert (found[:2] if found else None) == expected
+    assert len(prices) == (8 if expected else 7)   # the other shades still price
+
+
+def test_a_yen_json_price_is_yen_minor_units():
+    body = _json(variant={"price": "2200", "price_currency": "JPY"})
+    for entry in body["product"]["variants"]:
+        entry["price_currency"] = "JPY"
+    prices, _ = backfill.json_live_prices(body, JUDY_JS, "JP")
+    assert prices[JUDY_VARIANT][:2] == (2200, "JPY")
+
+
+def _run_storefront(monkeypatch, *, js_cookies, json_body=JUDY_JSON, js_body=None, market="US"):
+    seeds = [{"id": "epsv_f000", "domain": "judydoll.com", "market": market, "updated_at": None,
+              "canonical_url": JUDY_SEED["canonical_url"], "destination_url": JUDY_SEED["destination_url"],
+              "seed_data": copy.deepcopy(JUDY_SEED["seed_data"])}]
+
+    async def fake_select(limit, domain, after=None, seed_ids=None):
+        return [dict(r) for r in seeds]
+
+    sent: List[str] = []
+
+    def handler(request):
+        sent.append(str(request.url))
+        if request.url.path.endswith(".json"):
+            return httpx.Response(200, json=json_body) if json_body is not None else httpx.Response(404)
+        return httpx.Response(200, headers=[("content-type", "text/javascript")]
+                              + [("set-cookie", c) for c in js_cookies], json=js_body or JUDY_JS)
+
+    monkeypatch.setattr(backfill, "select_candidates", fake_select)
+    monkeypatch.setattr(backfill, "GLOBAL_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(backfill, "PER_DOMAIN_MIN_GAP_S", 0.0)
+
+    async def go():
+        async with no_cookie_client(transport=httpx.MockTransport(handler)) as client:
+            return await backfill.run(limit=10, domain="judydoll.com", apply=False, client=client)
+
+    return asyncio.run(go()), sent
+
+
+def test_a_cookieless_store_gets_one_json_request_and_a_price(monkeypatch):
+    summary, sent = _run_storefront(monkeypatch, js_cookies=())
+    assert sent == [JUDY_JS_URL + "?country=US", JUDY_JS_URL[:-3] + ".json?country=US"]
+    assert summary["proof_currency"] == {"json:USD": 1} and summary["json_price_fetches"] == {"ok": 1}
+
+
+@pytest.mark.parametrize("cookies, evidence", [
+    (("cart_currency=USD",), "cookie:USD"),
+    (("cart_currency=SGD",), "currency_not_market"),
+    (("cart_currency=USD", "cart_currency=GBP"), "cookie_conflict"),
+])
+def test_a_store_that_names_a_currency_is_not_asked_again(monkeypatch, cookies, evidence):
+    summary, sent = _run_storefront(monkeypatch, js_cookies=cookies)
+    assert sent == [JUDY_JS_URL + "?country=US"]
+    assert summary["proof_currency"] == {evidence: 1} and summary["json_price_fetches"] == {}
+
+
+def test_no_json_request_when_no_proof_could_corroborate(monkeypatch):
+    sold_out = copy.deepcopy(JUDY_JS)
+    for entry in sold_out["variants"]:
+        if str(entry["id"]) == JUDY_VARIANT:
+            entry["available"] = False
+    summary, sent = _run_storefront(monkeypatch, js_cookies=(), js_body=sold_out)
+    assert len(sent) == 1 and summary["json_price_fetches"] == {}
+
+
+def test_a_failed_json_request_writes_no_price(monkeypatch):
+    summary, _sent = _run_storefront(monkeypatch, js_cookies=(), json_body=None)
+    assert summary["proof_currency"] == {"json_dead_handle": 1}
+    assert summary["json_price_fetches"] == {"dead_handle": 1}
+
+
+def test_the_json_request_is_paced_like_the_js_one(monkeypatch):
+    """The fallback is a second storefront request: it waits on the same pacer (host spacing)."""
+    waited: List[str] = []
+
+    async def recording_wait(self, domain):
+        waited.append(domain)
+
+    monkeypatch.setattr(backfill.Pacer, "wait", recording_wait)
+    _summary, sent = _run_storefront(monkeypatch, js_cookies=())
+    assert len(sent) == 2 and waited == ["judydoll.com", "judydoll.com"]

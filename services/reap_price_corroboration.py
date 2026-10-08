@@ -34,10 +34,14 @@ WHAT COUNTS AS INDEPENDENT. Two writers of ours read Shopify storefronts:
     WHO RECORDS IT (2026-10-08). The backfill reads the currency by THE CURRENCY RULE the
     enrichment proof job uses -- one function, services/shopify_presentment.py: it asks
     `?country=<market>`, sends no cookie, takes the `cart_currency` Set-Cookie of the same final
-    response, and keeps it only when it is the market's own currency. It then writes `currency`
-    and `price_minor` (ISO minor units of that currency) TOGETHER, or neither, on every proof
-    scope, plus the variant's live `available`. A proof written before that change, or from a
-    fetch whose currency was not verified, has no currency and never corroborates.
+    response, and keeps it only when it is the market's own currency. A store that sends NO such
+    cookie (judydoll.com, measured 2026-10-08) is priced instead from one
+    `/products/<handle>.json` request, whose variants name their own `price_currency` in the same
+    response (same product id + handle as the `.js`, market currency only). It then writes
+    `currency`, `price_minor` (ISO minor units of that currency) and `price_source` TOGETHER, or
+    none, on every proof scope, plus the variant's live `available`. A proof written before that
+    change, or from a fetch whose currency was not verified, has no currency and never
+    corroborates.
 
 NOTHING HERE TALKS TO THE NETWORK. Reads only, through db/reap_price_witness.py.
 """

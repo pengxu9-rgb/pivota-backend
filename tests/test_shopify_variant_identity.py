@@ -807,7 +807,7 @@ import copy  # noqa: E402
 import json  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from scripts.backfill_shopify_variant_ids import build_cart_proof  # noqa: E402
+from scripts.backfill_shopify_variant_ids import build_cart_proof, js_live_prices  # noqa: E402
 from services.shopify_variant_identity import (  # noqa: E402
     CART_PROOF_SCOPE_NAMED,
     CART_PROOF_SCOPE_SOLE,
@@ -848,7 +848,7 @@ def _backfilled(payload: Dict[str, Any] | None = None, *, page_url: str | None =
     proof = build_cart_proof(
         seed, new_variants, payload, live, js_url=JUDY_JS_URL,
         page_url=page_url or JUDY_SEED["canonical_url"], shop_host=JUDY_HOST, checked_at=checked_at,
-        read_currency=read_currency,
+        live_prices=js_live_prices(payload, read_currency),
     )
     seed["snapshot"].update({"variants": new_variants, "storefront_platform": "shopify",
                              "storefront_platform_source": "products_js_v1",
@@ -871,7 +871,8 @@ def test_the_live_judydoll_fetch_writes_a_named_variant_proof() -> None:
     assert seed["snapshot"]["shopify_cart_proof"] == {
         "source": "products_js_v1", "scope": "named_variant", "product_js_url": JUDY_JS_URL,
         "variant_id": JUDY_VARIANT, "variant_title": "07 BURGUNDY INK", "available": True,
-        "live_variant_count": 8, "price_minor": 1399, "currency": "USD", "checked_at": T0.isoformat(),
+        "live_variant_count": 8, "price_minor": 1399, "currency": "USD", "price_source": "products_js_v1",
+        "checked_at": T0.isoformat(),
     }
     unverified = _backfilled()["snapshot"]["shopify_cart_proof"]
     assert (unverified["price_minor"], unverified["currency"]) == (None, None)
@@ -908,7 +909,7 @@ def test_the_sole_variant_path_is_unchanged() -> None:
     assert seed["snapshot"]["shopify_cart_proof"] == {
         "source": "products_js_v1", "product_js_url": JUDY_JS_URL, "live_variant_count": 1,
         "variant_id": JUDY_VARIANT, "variant_title": "07 BURGUNDY INK", "available": True,
-        "price_minor": 1399, "currency": "USD", "checked_at": T0.isoformat(),
+        "price_minor": 1399, "currency": "USD", "price_source": "products_js_v1", "checked_at": T0.isoformat(),
     }
     assert _verify(seed) == (JUDY_VARIANT, CART_PROOF_SCOPE_SOLE, "07 BURGUNDY INK")
     assert _verify(seed, catalog=None) == (JUDY_VARIANT, CART_PROOF_SCOPE_SOLE, "07 BURGUNDY INK")

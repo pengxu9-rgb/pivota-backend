@@ -635,11 +635,16 @@ name the numeric variant in the purchase's own cart URL:
   2026-10-08 the mirror backfill (scripts/backfill_shopify_variant_ids.py, run nightly per store by
   the `reap-cart-proof-mirror` job) records it by the enrichment job's own rule
   (services/shopify_presentment.py): `?country=<seed market>`, no cookie on any request, the final
-  response's `cart_currency` Set-Cookie, and only the market's currency counts. Each proof then
-  carries `price_minor` (ISO minor units) and `currency` together, or neither; the run report's
-  `proof_currency` counts each fetch's currency or why it was not verified (`cookie_absent`,
-  `currency_not_market`, ...). Proofs written before that, or by a fetch whose currency was not
-  verified, carry none and never corroborate.
+  response's `cart_currency` Set-Cookie, and only the market's currency counts. A store that sends
+  no `cart_currency` cookie at all (judydoll.com, the pilot, measured 2026-10-08) is priced from one
+  `/products/<handle>.json?country=<market>` request instead: its variants name `price_currency` in
+  the same response (it follows presentment: tarte `?country=GB` → 29.00 GBP), it must be the same
+  product id and handle as the `.js`, and it is sent only when a proof that could corroborate is
+  about to be written. Each proof then carries `price_minor` (ISO minor units), `currency` and
+  `price_source` (`products_js_v1` / `products_json_v1`) together, or none; the run report's
+  `proof_currency` counts `cookie:USD` / `json:USD` or why not (`currency_not_market`,
+  `json_other_product`, ...), and `json_price_fetches` counts the extra requests. Proofs written
+  before that, or by a fetch whose currency was not verified, carry none and never corroborate.
 
 With either witness dial armed, a quote that fails the subtotal AND another check now reports the other check's code (`quote_total_not_reconciled`, `quote_shipping_not_reconciled`, ...) — still `price_changed` / `price_unverifiable`, never a continue. Both lanes yielding different prices is not corroboration. The subtotal must be an exact multiple
 of the quantity. `our_price_minor` is **never rewritten**: it stays the price the buyer selected

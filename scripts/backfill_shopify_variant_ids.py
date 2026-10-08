@@ -19,11 +19,13 @@ stamps into `seed_data.snapshot`:
           lists it, available. Written from the SAME fetch; see `build_cart_proof`.
       JSON null when the fetch supports neither: that REVOKES any earlier proof.
     shopify_cart_variant_proofs[<id>]                <- each explicitly selectable variant's proof
-    every proof also records the variant's live `available`, and `price_minor` + `currency`
-    TOGETHER (or neither): the market currency this fetch was verifiably read in, by THE
-    CURRENCY RULE shared with the enrichment proof job (services/shopify_presentment.py: the
+    every proof also records the variant's live `available`, and `price_minor` + `currency` +
+    `price_source` TOGETHER (or none): the market currency this fetch was verifiably read in, by
+    THE CURRENCY RULE shared with the enrichment proof job (services/shopify_presentment.py: the
     request asks `?country=<seed market>`, carries no cookie, and the final response's
-    `cart_currency` Set-Cookie must be the market's own currency). That is what lets a mirror
+    `cart_currency` Set-Cookie must be the market's own currency). A store that sends no such
+    cookie is priced from ONE `/products/<handle>.json` request instead (`json_live_prices`),
+    only when a proof that could corroborate is about to be written. That is what lets a mirror
     proof corroborate a changed Reap price (services/reap_price_corroboration.py).
 
 A successful `/products/<handle>.js` parse IS the proof of Shopify-ness: only Shopify serves
@@ -134,6 +136,7 @@ import argparse
 import asyncio
 import json
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import os
 import sys
 import time
@@ -149,6 +152,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db.database import database  # noqa: E402
+from db.reap_agentic_ledger import amount_minor_or_none  # noqa: E402
 from services.shopify_presentment import (  # noqa: E402
     market_currency,
     market_read_currency,
@@ -446,17 +450,107 @@ def fetch_url_for_market(js_url: str, market: Any) -> str:
     return f"{js_url}?country={code}" if market_currency(code) else js_url
 
 
-def _priced(raw_variant: Optional[Dict[str, Any]], read_currency: Optional[str]) -> Dict[str, Any]:
-    """`price_minor` and `currency`, WRITTEN TOGETHER OR BOTH None.
+#: Where a proof's price was read. The `.js` itself when its response carried a verified
+#: `cart_currency` cookie; else `/products/<handle>.json`, whose variants name their own
+#: `price_currency` in the same response (`json_live_prices`).
+PRICE_SOURCE_JS = "products_js_v1"
+PRICE_SOURCE_JSON = "products_json_v1"
 
-    `price_minor` is ISO minor units of `currency` -- the `.js` x100 converted
-    (`products_js_price_minor`), so JPY 2,200 is 2200, not 220000. With no verified market
-    currency there is no price: a number without the currency it was read in is exactly what
-    services/reap_price_corroboration.py refuses to trust, so it is not written at all."""
-    price = None
-    if read_currency and isinstance(raw_variant, dict):
-        price = products_js_price_minor(raw_variant.get("price"), read_currency)
-    return {"price_minor": price, "currency": read_currency if price is not None else None}
+#: {variant id: (price_minor, currency, price_source)} -- the live prices one fetch read, each in
+#: ISO minor units of the market currency it was VERIFIABLY read in.
+LivePrices = Dict[str, Tuple[int, str, str]]
+
+
+def js_live_prices(payload: Any, currency: Optional[str]) -> LivePrices:
+    """The `.js` response's own prices, in `currency` -- the market currency its `cart_currency`
+    cookie verified (`market_read_currency`), or None for no prices. `.js` is x100 for every
+    currency (`products_js_price_minor`), so JPY 2,200 is 2200, not 220000."""
+    prices: LivePrices = {}
+    raw = payload.get("variants") if isinstance(payload, dict) and currency else None
+    for entry in raw if isinstance(raw, list) else []:
+        vid = _numeric_id(entry.get("id")) if isinstance(entry, dict) else None
+        minor = products_js_price_minor(entry.get("price"), currency) if vid else None
+        if vid and minor is not None:
+            prices[vid] = (minor, currency, PRICE_SOURCE_JS)
+    return prices
+
+
+def product_json_url(js_url: str) -> str:
+    """`.../products/<handle>.js` -> `.../products/<handle>.json` (the classic product JSON)."""
+    return js_url[: -len(".js")] + ".json"
+
+
+def json_live_prices(json_payload: Any, js_payload: Any, market: Any) -> Tuple[LivePrices, Optional[str]]:
+    """`(prices, None)` from a `/products/<handle>.json` response, or `({}, problem)`.
+
+    THE FALLBACK FOR A STORE THAT SENDS NO `cart_currency` COOKIE (measured 2026-10-08:
+    judydoll.com sets only `_shopify_essential`/analytics/marketing). The classic product JSON
+    names each variant's `price_currency` IN THE SAME RESPONSE as its `price`, and it follows the
+    presentment currency (tartecosmetics.com `?country=US` 32.00 USD, `?country=GB` 29.00 GBP,
+    each equal to that response's own cookie). It carries no `available`, so the `.js` stays the
+    proof of identity and availability; this only prices it.
+
+    It must be THE SAME PRODUCT as the `.js` answer (product id and handle equal), or nothing
+    is read. A variant counts only when its `price_currency` is exactly the market's currency and
+    its `price` is a major-unit string the ledger converter accepts (refused, never rounded)."""
+    expected = market_currency(market)
+    if expected is None:
+        return {}, "market_unknown"
+    product = json_payload.get("product") if isinstance(json_payload, dict) else None
+    if not isinstance(product, dict) or not isinstance(js_payload, dict):
+        return {}, "json_malformed"
+    if (product.get("handle") != js_payload.get("handle")
+            or not _shopify_int_id(product.get("id"))
+            or product.get("id") != js_payload.get("id")):
+        return {}, "json_other_product"
+    variants = product.get("variants")
+    if not isinstance(variants, list):
+        return {}, "json_malformed"
+    prices: LivePrices = {}
+    currencies = set()
+    for entry in variants:
+        if not isinstance(entry, dict):
+            continue
+        vid = str(entry["id"]) if _shopify_int_id(entry.get("id")) else None
+        currency = entry.get("price_currency")
+        currencies.add(currency)
+        price = entry.get("price")
+        if not vid or currency != expected or not isinstance(price, str):
+            continue
+        try:
+            minor = amount_minor_or_none(Decimal(price.strip()), currency)
+        except (InvalidOperation, ValueError):
+            minor = None
+        if minor is not None:
+            prices[vid] = (minor, currency, PRICE_SOURCE_JSON)
+    if prices:
+        return prices, None
+    return {}, ("json_currency_not_market" if currencies and expected not in currencies else "json_price_unreadable")
+
+
+def _shopify_int_id(value: Any) -> bool:
+    """A Shopify id as the storefront sends it: a positive JSON integer (never a bool or a string)."""
+    return type(value) is int and value > 0
+
+
+def _priced(variant_id: Optional[str], live_prices: Optional[LivePrices]) -> Dict[str, Any]:
+    """`price_minor`, `currency` and `price_source`, WRITTEN TOGETHER OR ALL None.
+
+    With no verified market currency there is no price: a number without the currency it was
+    read in is exactly what services/reap_price_corroboration.py refuses to trust, so it is not
+    written at all."""
+    found = (live_prices or {}).get(str(variant_id or ""))
+    if found is None:
+        return {"price_minor": None, "currency": None, "price_source": None}
+    minor, currency, source = found
+    return {"price_minor": minor, "currency": currency, "price_source": source}
+
+
+def _has_available_proof(cart_proof: Optional[Dict[str, Any]], variant_proofs: Dict[str, Dict[str, Any]]) -> bool:
+    """Whether any proof this fetch would write says `available: true` -- the only kind a price
+    could make corroborate (services/reap_price_corroboration.mirror_unit_price)."""
+    return any(isinstance(p, dict) and p.get("available") is True
+               for p in [cart_proof, *variant_proofs.values()])
 
 
 def _live_available(raw_variant: Optional[Dict[str, Any]]) -> Optional[bool]:
@@ -490,7 +584,7 @@ def _live_title(raw_variant: Optional[Dict[str, Any]]) -> Optional[str]:
 def build_cart_proof(
     seed_data: Dict[str, Any], new_variants: List[Dict[str, Any]], payload: Any,
     live: List[Dict[str, Any]], *, js_url: str, page_url: Optional[str], shop_host: str,
-    checked_at: datetime, read_currency: Optional[str] = None,
+    checked_at: datetime, live_prices: Optional[LivePrices] = None,
 ) -> Optional[Dict[str, Any]]:
     """The `snapshot.shopify_cart_proof` ONE products.js fetch supports, or None (= revoke).
 
@@ -508,10 +602,10 @@ def build_cart_proof(
     3. ELSE None, which the caller writes as JSON null: a prior proof whose variant has vanished,
        gone unavailable, or is no longer the one the seed names is REVOKED by the same fetch.
 
-    PRICE AND CURRENCY (both scopes). `read_currency` is the market currency this fetch was
-    verifiably read in (`market_read_currency`), or None. Each proof carries `price_minor` and
-    `currency` from `_priced` (both set, or both None), and its variant's live `available`. Those
-    three are what lets a mirror proof CORROBORATE a changed Reap price
+    PRICE AND CURRENCY (both scopes). `live_prices` are the prices this fetch read in a verified
+    market currency (`js_live_prices` / `json_live_prices`), or None. Each proof carries
+    `price_minor`, `currency` and `price_source` from `_priced` (all set, or all None), and its
+    variant's live `available`. Those are what let a mirror proof CORROBORATE a changed Reap price
     (services/reap_price_corroboration.mirror_unit_price); none of them gates the cart identity.
     """
     raw_live = payload.get("variants") if isinstance(payload, dict) else None
@@ -529,7 +623,7 @@ def build_cart_proof(
             "variant_id": live[0]["shopify_variant_id"],
             "variant_title": _live_title(raw_sole),
             "available": _live_available(raw_sole),
-            **_priced(raw_sole, read_currency),
+            **_priced(live[0]["shopify_variant_id"], live_prices),
             "checked_at": stamp,
         }
     stamped_seed = {**seed_data, "snapshot": {**(seed_data.get("snapshot") or {}),
@@ -549,20 +643,21 @@ def build_cart_proof(
         "variant_title": _live_title(raw_hit),
         "available": True,
         "live_variant_count": live_count,
-        **_priced(raw_hit, read_currency),
+        **_priced(named, live_prices),
         "checked_at": stamp,
     }
 
 
 def build_selected_variant_proofs(
     new_variants: List[Dict[str, Any]], payload: Any, *, js_url: str, checked_at: datetime,
-    read_currency: Optional[str] = None,
+    live_prices: Optional[LivePrices] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Prove each explicitly selectable variant from ONE complete product.js response.
 
     No fetches or prices are invented. A bad/full-list ambiguity revokes every
     prior selector proof; a removed, unavailable or contradictory entry gets none.
-    Each proof carries `price_minor` + `currency` exactly as `build_cart_proof` does (`_priced`).
+    Each proof carries `price_minor` + `currency` + `price_source` exactly as `build_cart_proof`
+    does (`_priced`).
     """
     path = urlparse(js_url).path
     expected_handle = path[len("/products/"):-3] if path.startswith("/products/") and path.endswith(".js") else None
@@ -589,7 +684,7 @@ def build_selected_variant_proofs(
         result[vid] = {"source": STOREFRONT_PLATFORM_SOURCE, "scope": "buyer_selected_variant",
             "product_js_url": js_url, "variant_id": vid, "available": True,
             "live_variant_count": len(raw), "variant_title": _live_title(hit),
-            **_priced(hit, read_currency),
+            **_priced(vid, live_prices),
             "checked_at": checked_at.isoformat()}
     return result
 
@@ -605,6 +700,7 @@ async def run(
     per_domain_blocks: Counter = Counter()
     proof_scopes: Counter = Counter()
     proof_currency: Counter = Counter()
+    json_fetches: Counter = Counter()
     stamped_total = 0
     changed_rows = 0
     conflicts = 0
@@ -664,18 +760,41 @@ async def run(
         live = parse_product_js(payload)
         new_variants, report = stamp_variant_ids(variants, live)
         reasons[report["reason"]] += 1
+        checked_at = datetime.now(timezone.utc)
         read_currency, currency_problem = market_read_currency(set_cookies, row.get("market"))
-        cart_proof = build_cart_proof(
-            seed_data, new_variants, payload, live,
-            js_url=js_url, page_url=page_url, shop_host=host,
-            checked_at=datetime.now(timezone.utc), read_currency=read_currency,
-        )
+        live_prices = js_live_prices(payload, read_currency)
+        evidence = f"cookie:{read_currency}" if read_currency else currency_problem
+
+        def _proofs(prices: LivePrices) -> Tuple[Optional[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+            return (
+                build_cart_proof(seed_data, new_variants, payload, live, js_url=js_url, page_url=page_url,
+                                 shop_host=host, checked_at=checked_at, live_prices=prices),
+                build_selected_variant_proofs(new_variants, payload, js_url=js_url, checked_at=checked_at,
+                                              live_prices=prices),
+            )
+
+        cart_proof, variant_proofs = _proofs(live_prices)
+        if currency_problem == "cookie_absent" and _has_available_proof(cart_proof, variant_proofs):
+            # THE .json FALLBACK (`json_live_prices`): only for a store that sent no currency
+            # cookie, and only when a proof that could corroborate is about to be written. Paced
+            # and sent like the `.js` (the refresh job's client gates it the same way).
+            await pacer.wait(host)
+            json_payload, json_outcome, _json_cookies = await fetch_product_js_read(
+                client, fetch_url_for_market(product_json_url(js_url), row.get("market")))
+            json_fetches[json_outcome] += 1
+            if json_outcome == "ok":
+                json_prices, json_problem = json_live_prices(json_payload, payload, row.get("market"))
+                if json_prices:
+                    cart_proof, variant_proofs = _proofs(json_prices)
+                    evidence = f"json:{next(iter(json_prices.values()))[1]}"
+                else:
+                    evidence = json_problem
+            else:
+                evidence = f"json_{json_outcome}"
         if cart_proof is not None:
             proof_scopes[cart_proof.get("scope") or CART_PROOF_SCOPE_SOLE] += 1
-        variant_proofs = build_selected_variant_proofs(new_variants, payload, js_url=js_url, checked_at=datetime.now(timezone.utc),
-                                                       read_currency=read_currency)
         if cart_proof is not None or variant_proofs:
-            proof_currency[read_currency or currency_problem] += 1
+            proof_currency[evidence] += 1
         prior_variant_proofs = (seed_data.get("snapshot") or {}).get("shopify_cart_variant_proofs")
         prior_proof = (seed_data.get("snapshot") or {}).get("shopify_cart_proof")
         if report["stamped"] <= 0 and not cart_proof and not prior_proof and not variant_proofs and not prior_variant_proofs:
@@ -719,10 +838,16 @@ async def run(
         # Proofs this run computed, by scope (a dry run too). `sole_variant` is the unscoped
         # proof; `named_variant` attests the one variant a seed names on a multi-variant product.
         "cart_proofs": dict(proof_scopes),
-        # Per fetch that produced a proof: the market currency it was verifiably read in (so its
-        # proofs carry a price that can corroborate), or why not (cookie_absent, cookie_conflict,
-        # cookie_malformed, currency_not_market, market_unknown). See _priced.
+        # Per fetch that produced a proof: where its verified market currency came from
+        # (`cookie:USD` -- the .js response's cart_currency; `json:USD` -- the .json fallback), so
+        # its proofs carry a price that can corroborate; or why not (cookie_conflict,
+        # cookie_malformed, currency_not_market, market_unknown, json_<outcome>,
+        # json_other_product, json_currency_not_market, json_price_unreadable, and cookie_absent
+        # when no proof could corroborate so no fallback was sent).
         "proof_currency": dict(proof_currency),
+        # The .json fallback requests this run SENT, by fetch outcome (they count toward the
+        # crawl budget: one per product on a cookieless store).
+        "json_price_fetches": dict(json_fetches),
         "most_blocked_domains": dict(per_domain_blocks.most_common(10)),
     }
 

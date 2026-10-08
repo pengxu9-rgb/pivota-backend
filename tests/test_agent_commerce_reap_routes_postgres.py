@@ -2548,7 +2548,7 @@ async def test_tierb_the_backfill_then_the_cart_link_buys_a_named_variant_end_to
         summary = await backfill(limit=10, domain=domain, apply=True, client=_Client())
         assert requested == ["https://judydoll.com/products/silky-matte-lip-ink.js?country=US"]
         assert summary["cart_proofs"] == {"named_variant": 1} and summary["write_conflicts"] == 0
-        assert summary["proof_currency"] == {"USD": 1}
+        assert summary["proof_currency"] == {"cookie:USD": 1}
 
         response = await client.post(f"{BASE}/purchases", json={**body, "idempotency_key": f"pg-named-{env}"})
         assert response.status_code == 202, response.text
