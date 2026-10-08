@@ -57,6 +57,13 @@
 # `WEB_BOT_AUTH=off` removes both. UNSET KEEPS what the jobs have now, like the gate: --set-env-vars
 # and --set-secrets replace everything, so a flag set by hand would be wiped by the next re-run.
 #
+# SCOPE (`--only`): each job KEEPS the `--only <domain>` list its current definition carries -- a
+# plain re-run, --enable and --disable alike. On 2026-10-08 an --enable silently replaced a mirror
+# job limited to `--only judydoll.com` with the full 42-store pass; this is the fix. To change it:
+# `MIRROR_ONLY=a.com,b.com` / `ENRICHMENT_ONLY=...` sets the list, `=all` removes it (every store
+# on the lane's list). The wrapper refuses a domain not on its lane's list at run time (exit 2).
+# A job whose current args cannot be read refuses, writing nothing.
+#
 # --max-retries 0: a failed execution is not re-run automatically. A re-run re-crawls every store
 # (another burst on the crawl address); the next day's run is soon enough, or a human decides.
 #
@@ -152,6 +159,17 @@ case "${WEB_BOT_AUTH:-}" in
   ""|on|off) ;;
   *) echo "WEB_BOT_AUTH must be on, off or unset (got '$WEB_BOT_AUTH')" >&2; exit 2 ;;
 esac
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+for scope_var in MIRROR_ONLY ENRICHMENT_ONLY; do
+  scope_val="${!scope_var:-}"
+  case "$scope_val" in
+    ""|all) ;;
+    *) IFS=, read -r -a scope_list <<< "$scope_val"
+       for d in "${scope_list[@]}"; do
+         [[ "$d" =~ $DOMAIN_RE ]] || { echo "$scope_var must be 'all' or comma-separated lowercase domains (got '$scope_val')" >&2; exit 2; }
+       done ;;
+  esac
+done
 
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; SHARED=pivota-shared
 SUBNET=pivota-crawl
@@ -202,6 +220,28 @@ try:
     env = json.load(sys.stdin)["spec"]["template"]["spec"]["template"]["spec"]["containers"][0].get("env") or []
     values = [e.get("value") for e in env if e.get("name") == "CRAWL_WEB_BOT_AUTH_ENABLED"]
     print("true" if values and str(values[0]).strip().lower() in ("1", "true", "yes", "on") else "false")
+except Exception:
+    print("unknown")
+'
+}
+job_only(){ # job -> absent | unknown | none | <comma-separated --only domains> (from the job's current args)
+  local json
+  json=$("$GCLOUD" run jobs describe "$1" --region "$REGION" --format=json 2>/dev/null) || { echo absent; return 0; }
+  printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+    args = json.load(sys.stdin)["spec"]["template"]["spec"]["template"]["spec"]["containers"][0].get("args") or []
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise ValueError
+    only = []
+    for i, a in enumerate(args):
+        if a == "--only":
+            only.append(args[i + 1])
+        elif a.startswith("--only="):
+            only.append(a[len("--only="):])
+    if any(not d or "," in d for d in only):
+        raise ValueError
+    print(",".join(only) if only else "none")
 except Exception:
     print("unknown")
 '
@@ -284,12 +324,29 @@ sys.exit(0 if ok else 1)
 ' || { echo "REFUSING: $SA has no roles/secretmanager.secretAccessor on WEB_BOT_AUTH_PRIVATE_KEY (docs/runbooks/crawl_identity.md step 3). Nothing was changed." >&2; exit 1; }
 fi
 echo "== web bot auth: signed=$SIGNED (WEB_BOT_AUTH=${WEB_BOT_AUTH:-unset, kept})"
+scope_for(){ # job requested-value -> "" (every store) | comma list; exits on an unreadable current scope
+  local job="$1" requested="$2" current
+  case "$requested" in
+    all) echo ""; return 0 ;;
+    ?*) echo "$requested"; return 0 ;;
+  esac
+  current=$(job_only "$job")
+  case "$current" in
+    unknown) echo "REFUSING: could not read $job's current --only args. Nothing was changed. Set ${3}=all or a domain list." >&2; return 1 ;;
+    absent|none) echo "" ;;
+    *) echo "$current" ;;
+  esac
+}
+ENRICHMENT_SCOPE=$(scope_for "$ENRICHMENT_JOB" "${ENRICHMENT_ONLY:-}" ENRICHMENT_ONLY) || exit 1
+MIRROR_SCOPE=$(scope_for "$MIRROR_JOB" "${MIRROR_ONLY:-}" MIRROR_ONLY) || exit 1
+echo "== scope: $ENRICHMENT_JOB only=${ENRICHMENT_SCOPE:-all stores} (ENRICHMENT_ONLY=${ENRICHMENT_ONLY:-unset, kept})"
+echo "== scope: $MIRROR_JOB only=${MIRROR_SCOPE:-all stores} (MIRROR_ONLY=${MIRROR_ONLY:-unset, kept})"
 if [ "$REQUEST" = disable ]; then
   echo "!!!!!!!! DISARMING $ENRICHMENT_JOB AND $MIRROR_JOB: triggers paused, REAP_CART_PROOF_APPLY=false !!!!!!!!"
 fi
 
-mkproofjob(){ # job lane budget-seconds task-timeout
-  local job="$1" lane="$2" budget="$3" timeout="$4"
+mkproofjob(){ # job lane budget-seconds task-timeout scope
+  local job="$1" lane="$2" budget="$3" timeout="$4" scope="$5"
   # PIVOTA_ENV is required (a Job inherits nothing; see scripts/ops/run_oneoff_job.sh).
   local env_vars="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=$job,PIVOTA_COMMIT_SHA=$BACKEND_TAG"
   env_vars="$env_vars,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2"
@@ -301,7 +358,12 @@ mkproofjob(){ # job lane budget-seconds task-timeout
     env_vars="$env_vars,CRAWL_WEB_BOT_AUTH_ENABLED=true"
     secrets="$secrets,WEB_BOT_AUTH_PRIVATE_KEY=WEB_BOT_AUTH_PRIVATE_KEY:latest"
   fi
-  echo "== job: $job (lane $lane, subnet $SUBNET, apply $ENABLED)"
+  local args="-m,jobs.reap_cart_proof_refresh,$lane,--on-crawl-egress,--budget-seconds,$budget"
+  if [ -n "$scope" ]; then
+    local d; IFS=, read -r -a scope_domains <<< "$scope"
+    for d in "${scope_domains[@]}"; do args="$args,--only,$d"; done
+  fi
+  echo "== job: $job (lane $lane, subnet $SUBNET, apply $ENABLED, only ${scope:-all stores})"
   local verb=create; have "$GCLOUD" run jobs describe "$job" --region "$REGION" && verb=update
   # --args= in the EQUALS form: the value starts with a dash, and `--args "-m,..."` is parsed by
   # gcloud as a second flag ("argument --args: expected one argument") — #2367.
@@ -311,7 +373,7 @@ mkproofjob(){ # job lane budget-seconds task-timeout
     --labels "env=$ENV,managed-by=infra-gcp,lane=reap-cart-proof" \
     --set-secrets "$secrets" \
     --set-env-vars "$env_vars" \
-    --command python --args="-m,jobs.reap_cart_proof_refresh,$lane,--on-crawl-egress,--budget-seconds,$budget" \
+    --command python --args="$args" \
     --quiet
 }
 
@@ -348,8 +410,8 @@ if [ "$ENABLED" = false ]; then
     if [ "$(trigger_state "$job")" != absent ]; then settrigger "$job"; fi
   done
 fi
-mkproofjob "$ENRICHMENT_JOB" enrichment "$ENRICHMENT_BUDGET_SECONDS" "$ENRICHMENT_TASK_TIMEOUT"
-mkproofjob "$MIRROR_JOB" mirror "$MIRROR_BUDGET_SECONDS" "$MIRROR_TASK_TIMEOUT"
+mkproofjob "$ENRICHMENT_JOB" enrichment "$ENRICHMENT_BUDGET_SECONDS" "$ENRICHMENT_TASK_TIMEOUT" "$ENRICHMENT_SCOPE"
+mkproofjob "$MIRROR_JOB" mirror "$MIRROR_BUDGET_SECONDS" "$MIRROR_TASK_TIMEOUT" "$MIRROR_SCOPE"
 mktrigger "$ENRICHMENT_JOB" "$ENRICHMENT_SCHEDULE"
 mktrigger "$MIRROR_JOB" "$MIRROR_SCHEDULE"
 # A trigger CREATED above starts ENABLED: set both explicitly, last.

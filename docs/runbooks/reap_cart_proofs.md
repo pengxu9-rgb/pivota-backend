@@ -240,6 +240,17 @@ first.** Announce each prod apply to the owner of the lane it writes (the Reap r
 `--wait` returns non-zero for any non-zero exit; the exit code alone does not say which (gcloud
 reports every failure as 1). Read the report line for the job's own code.
 
+**Scope (`--only`) is kept across re-runs.** A job limited to some stores, e.g. the mirror at
+`--only judydoll.com`, keeps that list on a plain re-run, on `--enable` and on `--disable`. On
+2026-10-08 an `--enable` silently widened a judydoll-only mirror to all 42 stores; this is the
+fix. To change the scope:
+
+- `MIRROR_ONLY=judydoll.com,fentybeauty.com` (or `ENRICHMENT_ONLY=...`) sets it;
+- `MIRROR_ONLY=all` removes it.
+
+The script prints `== scope: <job> only=...` for each job before writing. It refuses, writing
+nothing, when a job's current args cannot be read.
+
 A backend deploy **never re-images these jobs**: they run `<backend-tag>` until the setup script is
 re-run with a newer one (no flag: the current armed/dark state is kept).
 

@@ -39,6 +39,7 @@ JOBS = ("reap-cart-proof-enrichment", "reap-cart-proof-mirror")
 #   ENRICHMENT_SIGNED / MIRROR_SIGNED    the job's CRAWL_WEB_BOT_AUTH_ENABLED (unset = absent)
 #   SECRET_EXISTS=0                      `secrets describe` fails
 #   SECRET_GRANTED=0                     the secret's IAM policy has no accessor binding for sa-worker
+#   MIRROR_ARGS / ENRICHMENT_ARGS        the job's current container args, as a JSON value (unset = absent)
 FAKE_GCLOUD = textwrap.dedent(
     """\
     #!/usr/bin/env bash
@@ -46,12 +47,13 @@ FAKE_GCLOUD = textwrap.dedent(
     case "$1 $2 $3" in
       "run jobs describe")
         case "$4" in
-          reap-cart-proof-mirror) e="${MIRROR_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${MIRROR_GATE:-false}"; w="${MIRROR_SIGNED:-}" ;;
-          *) e="${ENRICHMENT_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${ENRICHMENT_GATE:-false}"; w="${ENRICHMENT_SIGNED:-}" ;;
+          reap-cart-proof-mirror) e="${MIRROR_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${MIRROR_GATE:-false}"; w="${MIRROR_SIGNED:-}"; a="${MIRROR_ARGS:-}" ;;
+          *) e="${ENRICHMENT_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${ENRICHMENT_GATE:-false}"; w="${ENRICHMENT_SIGNED:-}"; a="${ENRICHMENT_ARGS:-}" ;;
         esac
         [ "$e" = 1 ] || exit 1
         extra=""; [ -n "$w" ] && extra=",{\\"name\\":\\"CRAWL_WEB_BOT_AUTH_ENABLED\\",\\"value\\":\\"$w\\"}"
-        printf '{"spec":{"template":{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"PIVOTA_ENV","value":"production"},{"name":"REAP_CART_PROOF_APPLY","value":"%s"}%s]}]}}}}}}' "$g" "$extra"
+        argsjson=""; [ -n "$a" ] && argsjson=",\\"args\\":$a"
+        printf '{"spec":{"template":{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"PIVOTA_ENV","value":"production"},{"name":"REAP_CART_PROOF_APPLY","value":"%s"}%s]%s}]}}}}}}' "$g" "$extra" "$argsjson"
         exit 0 ;;
       "scheduler jobs describe")
         case "$4" in
@@ -614,3 +616,73 @@ def test_the_web_bot_auth_names_are_the_signers_own():
     text = SCRIPT.read_text()
     assert f"{crawl_identity.FLAG_ENV}=true" in text
     assert f"{crawl_identity.KEY_ENV}={crawl_identity.KEY_ENV}:latest" in text
+
+
+# ── scope: a job's `--only` list is kept unless changed on purpose ──────────────────────────────
+
+JUDYDOLL_ARGS = '["-m","jobs.reap_cart_proof_refresh","mirror","--on-crawl-egress","--budget-seconds","10800","--only","judydoll.com"]'
+FULL_ARGS = '["-m","jobs.reap_cart_proof_refresh","enrichment","--on-crawl-egress","--budget-seconds","3600"]'
+SPLIT_JUDYDOLL = {"JOB_EXISTS": "1", "TRIGGER_EXISTS": "1", "MIRROR_GATE": "true", "MIRROR_TRIGGER": "ENABLED",
+                  "MIRROR_ARGS": JUDYDOLL_ARGS, "ENRICHMENT_ARGS": FULL_ARGS}
+
+
+def _only(argv: List[str]) -> List[str]:
+    args = _args(argv)
+    return [args[i + 1] for i, a in enumerate(args) if a == "--only"]
+
+
+@pytest.mark.parametrize("flag", ["--enable", "--disable"])
+def test_the_2026_10_08_case_enable_or_disable_keeps_a_judydoll_only_mirror(tmp_path, flag):
+    """Peng's mirror ran `--only judydoll.com`, enrichment was dark; `--enable` widened it to 42 stores."""
+    proc, calls = _run(tmp_path, "prod", TAG, flag, env=SPLIT_JUDYDOLL)
+    assert proc.returncode == 0, proc.stderr
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-mirror")) == ["judydoll.com"]
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-enrichment")) == []
+    assert "== scope: reap-cart-proof-mirror only=judydoll.com (MIRROR_ONLY=unset, kept)" in proc.stdout
+
+
+def test_a_plain_rerun_keeps_each_jobs_own_scope(tmp_path):
+    env = {**DARK, "MIRROR_ARGS": JUDYDOLL_ARGS,
+           "ENRICHMENT_ARGS": FULL_ARGS.replace('"3600"]', '"3600","--only","stilacosmetics.com","--only=bluemercury.com"]')}
+    proc, calls = _run(tmp_path, "prod", TAG, env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-mirror")) == ["judydoll.com"]
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-enrichment")) == [
+        "stilacosmetics.com", "bluemercury.com"]
+
+
+@pytest.mark.parametrize("value,expect", [("all", []), ("judydoll.com,fentybeauty.com", ["judydoll.com", "fentybeauty.com"])])
+def test_mirror_only_sets_or_clears_the_scope_explicitly(tmp_path, value, expect):
+    proc, calls = _run(tmp_path, "prod", TAG, "--enable", env={**SPLIT_JUDYDOLL, "MIRROR_ONLY": value})
+    assert proc.returncode == 0, proc.stderr
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-mirror")) == expect
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-enrichment")) == []
+
+
+def test_new_jobs_walk_every_store(tmp_path):
+    proc, calls = _run(tmp_path, "prod", TAG)
+    for name in JOBS:
+        assert _only(_one(calls, "run", "jobs", "create", name)) == []
+
+
+@pytest.mark.parametrize("value", ["JudyDoll.com", "judydoll", "a.com;rm", "a.com,,b.com", "https://a.com", " a.com"])
+def test_a_bad_scope_value_exits_2_before_touching_anything(tmp_path, value):
+    proc, calls = _run(tmp_path, "prod", TAG, env={"MIRROR_ONLY": value})
+    assert proc.returncode == 2 and "MIRROR_ONLY must be" in proc.stderr and calls == []
+
+
+@pytest.mark.parametrize("args", ['"not-a-list"', '["-m","x","--only"]', '["--only",""]'])
+def test_an_unreadable_scope_refuses_before_any_write(tmp_path, args):
+    proc, calls = _run(tmp_path, "prod", TAG, env={**DARK, "MIRROR_ARGS": args})
+    assert proc.returncode == 1 and "could not read reap-cart-proof-mirror's current --only args" in proc.stderr
+    assert not [c for c in calls if c[:3] in (["run", "jobs", "create"], ["run", "jobs", "update"])]
+
+
+def test_kept_scope_args_still_parse_as_the_wrapper_cli(tmp_path):
+    from jobs import reap_cart_proof_refresh as wrapper
+
+    _proc, calls = _run(tmp_path, "prod", TAG, "--enable", env=SPLIT_JUDYDOLL)
+    args = _args(_one(calls, "run", "jobs", "update", "reap-cart-proof-mirror"))
+    assert args[:2] == ["-m", "jobs.reap_cart_proof_refresh"]
+    parsed = wrapper._parse(args[2:])
+    assert parsed.lane == "mirror" and parsed.only == ["judydoll.com"] and parsed.on_crawl_egress
