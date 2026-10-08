@@ -155,6 +155,10 @@ class Storefronts:
         if kind == "flaky_once" and host not in self.flaked:
             self.flaked.add(host)
             raise httpx.ConnectError("proxy flake", request=request)
+        if kind == "throttled":
+            # Measured 2026-10-08 from a fresh crawl NAT IP, on the very first request.
+            return httpx.Response(429, text="local_rate_limited", headers={
+                "server": "cloudflare", "retry-after": "60", "content-type": "text/plain"})
         vid = VIDS[host]
         if path == "/products.json":
             return httpx.Response(200, json={"products": [{
@@ -172,6 +176,9 @@ class Storefronts:
                 return httpx.Response(302, headers={"location": "https://shopify.com/authentication/1/login"})
             return httpx.Response(302, headers={"location": f"https://{host}/checkouts/cn/{TOKEN}/information"})
         if path.startswith("/checkouts/cn/"):
+            if kind == "challenged":
+                return httpx.Response(403, text="<html>Just a moment...</html>", headers={
+                    "server": "cloudflare", "cf-mitigated": "challenge"})
             if kind == "not_accepting":
                 return httpx.Response(403, text="<h1>This store isn&rsquo;t set up to receive orders yet</h1>")
             return httpx.Response(200, text=self.checkout_page(host, vid),
@@ -739,3 +746,34 @@ def test_the_default_transport_honours_an_https_proxy_only_when_one_is_set(monke
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
     proxied = job._default_inner_transport()
     assert isinstance(proxied._pool, httpcore.AsyncHTTPProxy)
+
+
+async def test_a_throttle_is_not_retried_and_only_a_challenged_checkout_moves_the_verdict(db):
+    """A 429 (or a Cloudflare challenge) is the edge throttling our address. Retrying it 2 s later only
+    adds to the volume that keeps the address throttled, so it is asked ONCE.
+
+    What it RECORDS is what this lane always recorded. A 429 is indefinite (it was VARIANT_UNVERIFIED /
+    UNCLASSIFIED, now TRANSPORT_ERROR), so ELIGIBLE stands. A challenged CHECKOUT stays BLOCKED_UNKNOWN,
+    which is DEFINITE here and replaces ELIGIBLE: a checkout that challenges automated clients is one
+    Reap's automated checkout may meet too, so the money path stays fail-closed."""
+    await elig.record_result("judydoll.com", "US", result("ELIGIBLE", host="judydoll.com"))
+    await elig.record_result("podl.us", "US", result("ELIGIBLE", host="podl.us"))
+    clock = FakeClock()
+    store = Storefronts(clock, {"judydoll.com": "throttled", "podl.us": "challenged"})
+    summary = await run(clock=clock, dry_run=False, merchants=merchants("judydoll.com", "podl.us"),
+                        transport=store.transport())
+
+    by_host = {o.merchant.domain: o for o in summary.outcomes}
+    for host in ("judydoll.com", "podl.us"):
+        outcome = by_host[host]
+        assert outcome.attempts == 1, f"{host}: a throttle was retried"
+        assert outcome.result.throttled is True and outcome.result.retryable is True
+    assert by_host["judydoll.com"].result.verdict is Verdict.TRANSPORT_ERROR
+    assert (await elig.get_eligibility("judydoll.com", "US"))["verdict"] == "ELIGIBLE"
+    assert await elig.is_cart_link_eligible("judydoll.com", "US") is True
+    assert by_host["podl.us"].result.verdict is Verdict.BLOCKED_UNKNOWN
+    moved = await elig.get_eligibility("podl.us", "US")
+    assert moved["verdict"] == "BLOCKED_UNKNOWN" and moved["previous_verdict"] == "ELIGIBLE"
+    assert await elig.is_cart_link_eligible("podl.us", "US") is False
+    assert len([u for u in store.urls() if "judydoll.com" in u]) == 1, "one request: no retry, no permalink"
+    assert 2.0 not in clock.sleeps, "no retry delay was slept"

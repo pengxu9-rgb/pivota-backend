@@ -269,3 +269,16 @@ def test_staging_targets_the_staging_project(tmp_path):
     job = _one(calls, "run", "jobs", "create", "merchant-purchasability-sweep")
     assert _flag(job, "--service-account") == "sa-worker@pivota-staging.iam.gserviceaccount.com"
     assert _env_vars(job)["PIVOTA_ENV"] == "staging"
+
+
+def test_the_job_shares_the_shopify_edge_budget_like_the_reap_proof_jobs(tmp_path):
+    """#2474: the sweep's every request already goes through `PacedTransport(shopify_edge=True)`, which is
+    a no-op unless the flag is on in the process. Set exactly as setup_reap_cart_proof_jobs.sh sets it,
+    and the shared RATE is never set here (every job on the address must use one rate). The IP breaker's
+    dials are not pinned: the module's defaults are the documented ones."""
+    proc, calls = _run(tmp_path, "prod", TAG)
+    assert proc.returncode == 0, proc.stderr
+    env = _env_vars(_one(calls, "run", "jobs", "create", "merchant-purchasability-sweep"))
+    assert env["CRAWL_SHOPIFY_EDGE_PACER_ENABLED"] == "true" and env["CRAWL_SHOPIFY_EDGE_LEASE"] == "2"
+    assert "CRAWL_SHOPIFY_EDGE_RPS" not in env
+    assert not [k for k in env if k.startswith("MERCHANT_PURCHASABILITY_IP_THROTTLE_")]

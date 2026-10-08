@@ -2982,3 +2982,287 @@ async def test_the_census_scans_fresh_and_touches_no_cache(_db, _scans):
     lanes = await sweep.collect_population(fresh_cart_mint_scan=True)
     assert calls["scans"] == 1 and set(lanes["cart-mint"]) == _CART_MINT_EXPECTED
     assert await mint_scans.latest(complete_only=False) is None
+
+
+# ══ an IP-level throttle stops the run and demotes nobody ═════════════════════════════════
+#
+# Prod, 2026-10-07 07:08Z onward: 17-20 of the 20 merchants unverifiable every hour, 163 of ~196 checks
+# answering `products_json_page_1_status_429` across unrelated stores, and the sweep kept asking all 20
+# every hour. 2026-10-08 ~00:20Z: a FRESH crawl NAT IP got the same 429 on its very first request (the
+# headers below, measured). Everything here is driven through the REAL preflight over a MockTransport, so
+# the guard is tested against what the producer actually emits.
+
+_MEASURED_429 = {"server": "cloudflare", "retry-after": "60", "content-type": "text/plain"}
+_CHALLENGE = {"server": "cloudflare", "cf-mitigated": "challenge", "content-type": "text/html"}
+_EXTRA_STORES = tuple(f"store{i}.example" for i in range(1, 7))  # + flowerbeauty + judydoll = 8
+_LONG_AGO = "2026-10-01 12:00:00"  # a literal: Postgres reads it in the session's zone, SQLite as UTC
+
+
+async def _throttle_population():
+    """The `_population` fixture's two merchants plus six more Reap merchants, each holding a LIVE
+    positive window, every one last checked long ago (so the due order is by key)."""
+    for domain in _EXTRA_STORES:
+        await database.execute(
+            "INSERT INTO reap_agentic_eligibility (merchant_domain, product_key, variant_key, "
+            "market_country, enabled) VALUES (:d, '', '', 'US', TRUE)", {"d": domain})
+    domains = ("flowerbeauty.com", "judydoll.com") + _EXTRA_STORES
+    for domain in domains:
+        await mp.record_check(domain, "US", res("ELIGIBLE", card=True, host=domain))
+    # One earlier CONFIRMED negative on one store, so a throttle visibly does not touch the count.
+    await mp.record_check("store1.example", "US", res("PRICE_DRIFT", card=True, host="store1.example"))
+    await database.execute(f"UPDATE {TABLE} SET checked_at = '{_LONG_AGO}'")
+    return domains
+
+
+def _fake_clock_pacer(monkeypatch, interval_s=None):
+    """ONE fake clock for the pacer AND the breaker's window (`crawl_ip_throttle._now`), so request
+    spacing is what the breaker measures -- with the real monotonic clock every test throttle would
+    land within milliseconds and no window could ever be shown to matter."""
+    import services.crawl_ip_throttle as cit
+    from jobs.tierb_cart_link_eligibility import MIN_REQUEST_INTERVAL_S, RequestPacer
+
+    clock = {"t": 1000.0}
+
+    async def _sleep(seconds):
+        clock["t"] += seconds
+
+    monkeypatch.setattr(cit, "_now", lambda: clock["t"])
+    monkeypatch.setattr(sweep, "_new_pacer", lambda: RequestPacer(
+        interval_s or MIN_REQUEST_INTERVAL_S, clock=lambda: clock["t"], sleep=_sleep))
+    return clock
+
+
+def _storefront(monkeypatch, answer):
+    """Every request of the run goes to `answer(request)`; returns the list of requests seen."""
+    seen = []
+
+    def _handler(request):
+        seen.append(request)
+        return answer(request)
+
+    monkeypatch.setattr(sweep, "_inner_transport", lambda via: httpx.MockTransport(_handler))
+    return seen
+
+
+def _ip_throttle_line(out: str) -> dict:
+    lines = [line for line in out.splitlines() if line.startswith(sweep.IP_THROTTLE_PREFIX)]
+    assert len(lines) == 1, out[-3000:]
+    return json.loads(lines[0][len(sweep.IP_THROTTLE_PREFIX):])
+
+
+@pytest.fixture
+def _armed(monkeypatch):
+    import services.crawl_ip_throttle as cit
+    import services.crawl_politeness as cp
+
+    cp.reset_for_tests()
+    cit.reset_for_tests()
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    for name in ("MERCHANT_PURCHASABILITY_IP_THROTTLE_TRIP_HOSTS",
+                 "MERCHANT_PURCHASABILITY_IP_THROTTLE_WINDOW_SECONDS",
+                 "CRAWL_IP_THROTTLE_BREAKER_ENABLED", "CRAWL_SHOPIFY_EDGE_PACER_ENABLED"):
+        monkeypatch.delenv(name, raising=False)
+    _fake_clock_pacer(monkeypatch)
+    yield
+    cp.reset_for_tests()
+    cit.reset_for_tests()
+
+
+@pytest.mark.parametrize("status, headers, detail", [
+    (429, _MEASURED_429, "resolve:throttled_429"),
+    (403, _CHALLENGE, "resolve:throttled_challenge_403"),
+    # Cloudflare can serve its challenge with a 200: the preflight says throttled, and the breaker counts it.
+    (200, _CHALLENGE, "resolve:throttled_challenge_200"),
+])
+async def test_an_ip_throttle_stops_the_run_and_demotes_nobody(
+    _db, _population, _armed, monkeypatch, capsys, status, headers, detail
+):
+    domains = await _throttle_population()
+    seen = _storefront(monkeypatch, lambda r: httpx.Response(status, headers=headers, text="local_rate_limited"))
+
+    report = await sweep.run_merchant_purchasability_sweep()
+
+    # THE RUN STOPPED after the third distinct merchant: three requests, not eight (or 20 an hour).
+    assert len(seen) == 3 and len({r.url.host for r in seen}) == 3
+    assert (report.ip_throttled, report.checked, report.throttled, report.unverifiable) == (1, 3, 3, 3)
+    assert (report.written, report.skipped_ip_throttle, report.errors) == (3, 5, 0)
+    assert report.positive == report.negative == 0
+    # A TRIP IS NOT A FAILURE: the job runs hourly and "Cloud Run job failing" pages on any failed task,
+    # so a 14-17 h throttle window would page every hour. The IP_THROTTLE line is the signal.
+    assert sweep.exit_code_for(report) == sweep.EXIT_OK
+    assert not hasattr(sweep, "EXIT_IP_THROTTLED")
+
+    contacted = {r.url.host for r in seen}
+    for domain in domains:
+        row = await _row(domain)
+        # NOBODY IS DEMOTED: every window stands, every failure count is what it was.
+        assert row["positive_until"] is not None, domain
+        assert await mp.is_purchasable(domain, "US"), domain
+        assert row["consecutive_failures"] == (1 if domain == "store1.example" else 0), domain
+        if domain in contacted:
+            assert row["verdict"] == "TRANSPORT_ERROR"
+            assert row["evidence"]["retryable"] is True and row["evidence"]["detail"] == detail
+        else:
+            # NOTHING WRITTEN for a merchant the stopped run did not contact.
+            assert row["verdict"] == "ELIGIBLE"
+            assert row["checked_at"] < datetime(2026, 10, 5, tzinfo=timezone.utc), "its checked_at moved"
+
+    line = _ip_throttle_line(capsys.readouterr().out)
+    assert line["job"] == "merchant-purchasability-sweep" and line["status"] == "ip_throttled"
+    assert line["ip_throttled"] is True and line["ip_throttle_trip_host_count"] == 3
+    assert line["ip_throttle_tripped_at"] and line["ip_throttle_first_429_at"]
+    assert (line["throttled_checks"], line["skipped_for_ip_throttle"]) == (3, 5)
+    assert line["throttle_diagnostics"]["responses"] == 3
+    assert line["throttle_diagnostics"]["cf_mitigated"] == (3 if "cf-mitigated" in headers else 0)
+    assert not any(domain in json.dumps(line) for domain in domains), "the line lists no host"
+
+
+async def test_the_next_run_starts_with_the_merchants_a_stopped_run_did_not_reach(
+    _db, _population, _armed, monkeypatch
+):
+    """THE STARVATION GUARD. A stopped run writes its throttled checks, so their `checked_at` moves and
+    they sink to the back of the due list; the next run probes the address with OTHER merchants. Were
+    they left unwritten, the same few stores would head every run and trip it before anyone else."""
+    await _throttle_population()
+    seen = _storefront(monkeypatch, lambda r: httpx.Response(429, headers=_MEASURED_429))
+
+    first = await sweep.run_merchant_purchasability_sweep()
+    hosts_first = {r.url.host for r in seen}
+    seen.clear()
+    second = await sweep.run_merchant_purchasability_sweep()
+    hosts_second = {r.url.host for r in seen}
+
+    assert first.ip_throttled == second.ip_throttled == 1
+    assert len(hosts_first) == len(hosts_second) == 3
+    assert not hosts_first & hosts_second, (hosts_first, hosts_second)
+    # And the merchants throttled in BOTH halves still hold their windows.
+    for host in hosts_first | hosts_second:
+        assert await mp.is_purchasable(host, "US"), host
+
+
+async def test_two_throttled_merchants_do_not_stop_the_run(_db, _population, _armed, monkeypatch, capsys):
+    """Below the trip count the run carries on: every merchant is asked, the two throttled checks are
+    recorded as unverifiable, and the run exits 0."""
+    domains = await _throttle_population()
+    throttling = {"store1.example", "store2.example"}
+
+    def _answer(request):
+        if request.url.host in throttling:
+            return httpx.Response(429, headers=_MEASURED_429)
+        return httpx.Response(404, text="not found")  # the store answered; nothing to do with a throttle
+
+    seen = _storefront(monkeypatch, _answer)
+    report = await sweep.run_merchant_purchasability_sweep()
+
+    assert {r.url.host for r in seen} == set(domains)
+    assert (report.ip_throttled, report.throttled, report.skipped_ip_throttle) == (0, 2, 0)
+    assert report.checked == len(domains) and sweep.exit_code_for(report) == sweep.EXIT_OK
+    line = _ip_throttle_line(capsys.readouterr().out)
+    assert line["status"] == "ok" and line["ip_throttled"] is False
+    assert line["ip_throttle_hosts"] == 2
+
+
+@pytest.mark.parametrize("env", [
+    {"MERCHANT_PURCHASABILITY_IP_THROTTLE_TRIP_HOSTS": "0"},
+    {"CRAWL_IP_THROTTLE_BREAKER_ENABLED": "false"},
+])
+async def test_the_breaker_kill_switches_let_the_run_finish(_db, _population, _armed, monkeypatch, capsys, env):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    domains = await _throttle_population()
+    seen = _storefront(monkeypatch, lambda r: httpx.Response(429, headers=_MEASURED_429))
+    report = await sweep.run_merchant_purchasability_sweep()
+
+    assert {r.url.host for r in seen} == set(domains)
+    assert (report.ip_throttled, report.throttled, report.skipped_ip_throttle) == (0, len(domains), 0)
+    for domain in domains:
+        assert await mp.is_purchasable(domain, "US"), "disarmed or not, a throttle demotes nobody"
+    line = _ip_throttle_line(capsys.readouterr().out)
+    assert line["ip_throttle_breaker_armed"] is False and line["ip_throttle_hosts"] == len(domains)
+
+
+async def test_proxy_vantage_throttles_do_not_trip_the_crawl_ip_breaker(_db, _population, _armed, monkeypatch):
+    """The proxy vantage leaves from another address: its 429s say nothing about the crawl IP."""
+    monkeypatch.setenv("VANTAGE_PROXY_URL", "http://vantage-proxy.example:3128")
+    domains = await _throttle_population()
+    seen = []
+
+    def _transport(via):
+        def _handler(request):
+            seen.append((via, request.url.host))
+            if via:
+                return httpx.Response(429, headers=_MEASURED_429)
+            return httpx.Response(404, text="not found")
+        return httpx.MockTransport(_handler)
+
+    monkeypatch.setattr(sweep, "_inner_transport", _transport)
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.ip_throttled == 0 and report.throttled == len(domains)
+    assert {host for via, host in seen if via is None} == set(domains)
+
+
+def test_the_sweep_breaker_folds_www_and_counts_a_challenge():
+    """One merchant answering from its apex and its `www.` twin is ONE key; a Cloudflare challenge
+    counts as a throttle (the parent breaker counts 429 / 503 + Retry-After only)."""
+    from services.crawl_ip_throttle import capture_throttle_headers
+
+    breaker = sweep.SweepThrottleBreaker(trip_hosts=2, window_seconds=600)
+    throttle = capture_throttle_headers(httpx.Headers(_MEASURED_429))
+    breaker.observe("www.a.example", 429, throttle)
+    breaker.observe("a.example", 429, throttle)
+    assert not breaker.tripped, "apex + www is one merchant"
+    breaker.observe("b.example", 403, capture_throttle_headers(httpx.Headers({"server": "cloudflare"})))
+    assert not breaker.tripped, "a plain 403 is not a throttle"
+    breaker.observe("b.example", 403, capture_throttle_headers(httpx.Headers(_CHALLENGE)))
+    assert breaker.tripped and breaker.trip_host_count == 2
+
+
+async def test_a_trip_refuses_the_rest_of_that_merchants_vantages_and_writes_nothing_for_them(
+    _db, _population, _armed, monkeypatch
+):
+    """With a proxy vantage, the merchant whose crawl-IP answer trips the breaker still has its proxy
+    check to run. It is refused LOCALLY (no request leaves), and the refusal is not written as a fact."""
+    monkeypatch.setenv("VANTAGE_PROXY_URL", "http://vantage-proxy.example:3128")
+    await _throttle_population()
+    seen = []
+
+    def _transport(via):
+        def _handler(request):
+            seen.append((via, request.url.host))
+            return httpx.Response(404, text="nf") if via else httpx.Response(429, headers=_MEASURED_429)
+        return httpx.MockTransport(_handler)
+
+    monkeypatch.setattr(sweep, "_inner_transport", _transport)
+    report = await sweep.run_merchant_purchasability_sweep()
+
+    direct = [host for via, host in seen if via is None]
+    proxied = [host for via, host in seen if via]
+    assert len(direct) == 3 and proxied == direct[:2], seen
+    assert report.ip_throttled == 1 and report.checked == 5 and report.written == 5
+    # 8 merchants x 2 vantages = 16 pairs: 5 checked, the tripping merchant's proxy pair refused, 10 not started.
+    assert report.skipped_ip_throttle == 11 and report.errors == 0
+    tripper = direct[2]
+    proxy_rows = [r for r in await mp.list_facts(tripper, "US") if r["vantage"] == "proxy"]
+    assert proxy_rows == [], "a locally refused check was written as a fact"
+
+
+def test_the_breaker_defaults_are_three_merchants_within_one_run():
+    """Pinned: the setup script does not set them, so these ARE prod's values."""
+    assert sweep.DIALS["ip_throttle_trip_hosts"].default == 3
+    assert sweep.DIALS["ip_throttle_window_seconds"].default == 1200
+    breaker = sweep._new_breaker()
+    assert (breaker.trip_hosts, breaker.window_seconds, breaker.enabled) == (3, 1200.0, True)
+
+
+@pytest.mark.parametrize("window, trips", [("60", False), ("1200", True)])
+async def test_the_window_is_measured_on_the_request_clock(_db, _population, _armed, monkeypatch, window, trips):
+    """Merchants 40 s apart on the request clock: 3 throttles span 80 s, so a 60 s window never holds three,
+    and the default window does. A breaker whose window could not see the spacing would trip both or neither."""
+    _fake_clock_pacer(monkeypatch, interval_s=40.0)
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_IP_THROTTLE_WINDOW_SECONDS", window)
+    domains = await _throttle_population()
+    seen = _storefront(monkeypatch, lambda r: httpx.Response(429, headers=_MEASURED_429))
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.ip_throttled == int(trips)
+    assert len(seen) == (3 if trips else len(domains))

@@ -307,7 +307,10 @@ async def _check_merchant(
             outcome.status, outcome.error = "crashed", type(exc).__name__
             return outcome
         outcome.result = result
-        if not result.retryable:
+        # A THROTTLE IS RETRYABLE, BUT NOT 2 s LATER: the edge throttling our address is not
+        # over by then, and asking again only adds to the volume that keeps it throttled. The
+        # result is indefinite either way, so the row keeps the verdict it had.
+        if not result.retryable or result.throttled:
             break
         if outcome.attempts < MAX_ATTEMPTS:
             await sleep(retry_delay_s)
