@@ -585,7 +585,13 @@ upsert "prod: Cloud SQL connections high" "$(policy \
   'metric.type="cloudsql.googleapis.com/database/postgresql/num_backends" AND resource.type="cloudsql_database"' \
   ALIGN_MAX REDUCE_SUM "" COMPARISON_GT 240 300s 300s 3600s)"
 
-upsert "prod: database pool exhausted" "$(policy \
+# EVERY POLICY OVER A LOG METRIC THIS SCRIPT CREATES goes through `upsert_on_new_metric`, from here
+# down: Monitoring takes up to 10 minutes to see a new log metric, and plain `upsert` aborts the run
+# on "Cannot find metric(s)" (2026-10-08, the purchasability policy below). In prod these three
+# metrics are long-standing, but a brand-new project's first run would abort right here, before every
+# policy after it. The waiting writer retries, defers past its budget, and creates before it deletes.
+# tests/test_reap_rail_alerts.py holds the rule from the filters: no plain `upsert` reads a user metric.
+upsert_on_new_metric "prod: database pool exhausted" "$(policy \
   "prod: database pool exhausted" \
   "The backend cannot get a connection from its own pool (PoolCheckoutTimeout). Check Cloud SQL num_backends FIRST: if it is low - it was 28/300 on 2026-08-28 - the database is fine and the application is leaking pool slots, so restarting the revision restores service while the leak is found. There is no liveness probe on the web service, so a wedged instance is never recycled on its own." \
   'metric.type="logging.googleapis.com/user/pool_checkout_timeout" AND resource.type="cloud_run_revision"' \
@@ -600,13 +606,13 @@ upsert "prod: database pool exhausted" "$(policy \
 # approved or cancelled. It also closes if the trigger is PAUSED - no executions, no lines - so a
 # disarmed drain with a held store is silent: check the ledger before disarming.
 # FAILED is a one-off event and keeps the 300s window.
-upsert "prod: retailer ingest held for review" "$(policy \
+upsert_on_new_metric "prod: retailer ingest held for review" "$(policy \
   "prod: retailer ingest held for review" \
   "At least one retailer ingest job is HELD: a BLOCK flag stopped the store and nothing is written until someone decides. This stays open while any job is held. Read the flags: \`SELECT id, domain, brand, status_reason FROM retailer_ingest_jobs WHERE status = 'held'\` and the job's latest retailer_ingest_runs row (checks, flags). Then approve (optionally excluding handles or accepting flag keys) or cancel it via db/retailer_ingest.py approve()/cancel()." \
   'metric.type="logging.googleapis.com/user/retailer_ingest_drain_held" AND resource.type="cloud_run_job"' \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 3600s 0s 3600s)"
 
-upsert "prod: retailer ingest job failed" "$(policy \
+upsert_on_new_metric "prod: retailer ingest job failed" "$(policy \
   "prod: retailer ingest job failed" \
   "A retailer-ingest-drain stage left a job FAILED: crawl capped or failed, currency unproven, retry budget spent, apply refused (MAY BE PARTIAL), or the apply gate / read-back disagreed. The execution itself exited 0, so the Cloud Run job-failing policy does not fire for this. Read \`SELECT id, domain, brand, status_reason FROM retailer_ingest_jobs WHERE status = 'failed' ORDER BY updated_at DESC\` and the job's latest retailer_ingest_runs row." \
   'metric.type="logging.googleapis.com/user/retailer_ingest_drain_failed" AND resource.type="cloud_run_job"' \
