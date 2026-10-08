@@ -628,11 +628,32 @@ name the numeric variant in the purchase's own cart URL:
   `checked_at` not in the future and inside the window. All usable rows must agree.
 * the mirror seed's storefront proof (`snapshot.shopify_cart_proof` /
   `shopify_cart_variant_proofs`). **It corroborates only if the proof itself records a `currency`
-  equal to the purchase's — and no writer records one today, so today it never does.**
-  `products.js` carries no currency (its price is in whatever presentment currency the storefront
-  chose for our crawler, ×100 even for zero-decimal currencies); the seed's price currency and the
-  market currency describe other numbers. An assumed currency is how a substituted variant's
-  price would slip through, so it is not assumed.
+  equal to the purchase's**, it says `available: true`, and it passes the cart-proof fetch rule and
+  the window. `products.js` carries no currency (its price is in whatever presentment currency the
+  storefront chose for our crawler, ×100 even for zero-decimal currencies); the seed's price
+  currency and the market currency describe other numbers, so neither is assumed. Since
+  2026-10-08 the mirror backfill (scripts/backfill_shopify_variant_ids.py: a hand run, or the
+  `reap-cart-proof-mirror` job's mirror lane where that job is provisioned -- not in prod as of
+  2026-10-08, and its staging cron is paused) records it by the enrichment job's own rule
+  (services/shopify_presentment.py): `?country=<seed market>`, no cookie on any request, the final
+  response's `cart_currency` Set-Cookie, and only the market's currency counts. A store that sends
+  no `cart_currency` cookie at all (judydoll.com, the pilot, measured 2026-10-08) is priced from one
+  `/products/<handle>.json?country=<market>` request instead: its variants name `price_currency` in
+  the same response (it follows presentment: tarte `?country=GB` → 29.00 GBP), it must be the same
+  product id and handle as the `.js`, and it is sent only when a proof that could corroborate is
+  about to be written. Each proof then carries `price_minor` (ISO minor units), `currency` and
+  `price_source` (`products_js_v1` / `products_json_v1`) together, or none; the run report's
+  `proof_currency` counts `cookie:USD` / `json:USD` (what the written proofs carry) or why not
+  (`currency_not_market`, `json_other_product`, `json_variant_unpriced`, ...), and
+  `json_price_fetches` counts the extra requests. A blocked `.json` answer counts toward the
+  store's block streak like a `.js` one, and the store is not asked for `.json` again that run.
+  Known limit (scheduled lane only): a `.json` 429 whose Retry-After outlasts the lane's patience
+  holds that store's next `.js`, so the page ends held and its cursor does not advance; a store
+  that throttles `.json` but not `.js` on every run would then not get past its first page. Not
+  measured on any store; watch `json_price_fetches` / `held_by_politeness` before provisioning the
+  mirror job in prod.
+  A payload that repeats a variant id prices nothing. Proofs written
+  before that, or by a fetch whose currency was not verified, carry none and never corroborate.
 
 With either witness dial armed, a quote that fails the subtotal AND another check now reports the other check's code (`quote_total_not_reconciled`, `quote_shipping_not_reconciled`, ...) — still `price_changed` / `price_unverifiable`, never a continue. Both lanes yielding different prices is not corroboration. The subtotal must be an exact multiple
 of the quantity. `our_price_minor` is **never rewritten**: it stays the price the buyer selected

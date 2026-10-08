@@ -807,7 +807,7 @@ import copy  # noqa: E402
 import json  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from scripts.backfill_shopify_variant_ids import build_cart_proof  # noqa: E402
+from scripts.backfill_shopify_variant_ids import build_cart_proof, js_live_prices  # noqa: E402
 from services.shopify_variant_identity import (  # noqa: E402
     CART_PROOF_SCOPE_NAMED,
     CART_PROOF_SCOPE_SOLE,
@@ -836,9 +836,11 @@ def _judy_js(**variant_overrides: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _backfilled(payload: Dict[str, Any] | None = None, *, page_url: str | None = None,
-                seed_data: Dict[str, Any] | None = None, checked_at: datetime = T0) -> Dict[str, Any]:
+                seed_data: Dict[str, Any] | None = None, checked_at: datetime = T0,
+                read_currency: str | None = None) -> Dict[str, Any]:
     """What `scripts/backfill_shopify_variant_ids.run` writes into seed_data for this fetch: the
-    stamped variants and the proof, both from the backfill's own functions."""
+    stamped variants and the proof, both from the backfill's own functions. `read_currency` is
+    the fetch's verified market currency, as `run()` passes it (None = not verified)."""
     seed = copy.deepcopy(seed_data if seed_data is not None else JUDY_SEED["seed_data"])
     payload = payload if payload is not None else JUDY_JS
     live = parse_product_js(payload)
@@ -846,6 +848,7 @@ def _backfilled(payload: Dict[str, Any] | None = None, *, page_url: str | None =
     proof = build_cart_proof(
         seed, new_variants, payload, live, js_url=JUDY_JS_URL,
         page_url=page_url or JUDY_SEED["canonical_url"], shop_host=JUDY_HOST, checked_at=checked_at,
+        live_prices=js_live_prices(payload, read_currency),
     )
     seed["snapshot"].update({"variants": new_variants, "storefront_platform": "shopify",
                              "storefront_platform_source": "products_js_v1",
@@ -861,14 +864,19 @@ def _verify(seed_data: Any, urls: List[str] = JUDY_STAGING_URLS, *, catalog: str
 
 def test_the_live_judydoll_fetch_writes_a_named_variant_proof() -> None:
     """The backfill's ACTUAL output on the live shapes: a label match stamps the seed's one entry
-    (07 BURGUNDY INK), and the 8-variant storefront yields a named proof, never a sole one."""
-    seed = _backfilled()
+    (07 BURGUNDY INK), and the 8-variant storefront yields a named proof, never a sole one. The
+    price is written only with the currency the fetch was verifiably read in."""
+    seed = _backfilled(read_currency="USD")
     assert seed["snapshot"]["variants"][0]["shopify_variant_id"] == JUDY_VARIANT
     assert seed["snapshot"]["shopify_cart_proof"] == {
         "source": "products_js_v1", "scope": "named_variant", "product_js_url": JUDY_JS_URL,
         "variant_id": JUDY_VARIANT, "variant_title": "07 BURGUNDY INK", "available": True,
-        "live_variant_count": 8, "price_minor": 1399, "checked_at": T0.isoformat(),
+        "live_variant_count": 8, "price_minor": 1399, "currency": "USD", "price_source": "products_js_v1",
+        "checked_at": T0.isoformat(),
     }
+    unverified = _backfilled()["snapshot"]["shopify_cart_proof"]
+    assert (unverified["price_minor"], unverified["currency"]) == (None, None)
+    assert _verify(_backfilled()) == _verify(seed)  # the cart identity never depends on it
 
 
 @pytest.mark.parametrize("urls", [JUDY_STAGING_URLS, JUDY_PROD_URLS], ids=["staging", "prod"])
@@ -894,12 +902,14 @@ def test_the_sole_path_refuses_a_named_proof_and_the_named_path_refuses_a_sole_o
 
 
 def test_the_sole_variant_path_is_unchanged() -> None:
-    """A one-variant storefront still writes the UNSCOPED proof (byte-for-byte the old keys) and is
-    accepted as SOLE -- with or without a catalog variant, exactly as before."""
-    seed = _backfilled({"variants": [JUDY_JS["variants"][4]]})
+    """A one-variant storefront still writes the UNSCOPED proof (the old keys, plus the variant's
+    live `available` and the currency-bound price that let it corroborate) and is accepted as
+    SOLE -- with or without a catalog variant, exactly as before."""
+    seed = _backfilled({"variants": [JUDY_JS["variants"][4]]}, read_currency="USD")
     assert seed["snapshot"]["shopify_cart_proof"] == {
         "source": "products_js_v1", "product_js_url": JUDY_JS_URL, "live_variant_count": 1,
-        "variant_id": JUDY_VARIANT, "variant_title": "07 BURGUNDY INK", "checked_at": T0.isoformat(),
+        "variant_id": JUDY_VARIANT, "variant_title": "07 BURGUNDY INK", "available": True,
+        "price_minor": 1399, "currency": "USD", "price_source": "products_js_v1", "checked_at": T0.isoformat(),
     }
     assert _verify(seed) == (JUDY_VARIANT, CART_PROOF_SCOPE_SOLE, "07 BURGUNDY INK")
     assert _verify(seed, catalog=None) == (JUDY_VARIANT, CART_PROOF_SCOPE_SOLE, "07 BURGUNDY INK")
@@ -1309,8 +1319,8 @@ def test_a_non_string_storefront_title_is_no_title(title: Any) -> None:
 
 def test_the_writer_reads_the_title_and_price_of_the_proven_variant_only() -> None:
     """The raw-entry lookup is by numeric id: a sibling's title or price never lands in the proof."""
-    proof = _backfilled(_judy_js(**{JUDY_OTHER: {"title": "01 PETAL INK", "price": 1}}))[
-        "snapshot"]["shopify_cart_proof"]
+    proof = _backfilled(_judy_js(**{JUDY_OTHER: {"title": "01 PETAL INK", "price": 1}}),
+                        read_currency="USD")["snapshot"]["shopify_cart_proof"]
     assert proof["variant_title"] == "07 BURGUNDY INK" and proof["price_minor"] == 1399
 
 

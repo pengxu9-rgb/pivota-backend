@@ -382,14 +382,19 @@ def test_enrichment_client_signs_when_on_and_keeps_a_callers_transport(monkeypat
 
 
 @pytest.mark.parametrize("path,needle", [
-    ("jobs/reap_cart_proof_refresh.py", "httpx.AsyncClient(**crawl_identity.transport_kwargs()) as raw_client"),
-    ("scripts/backfill_shopify_variant_ids.py", "httpx.AsyncClient(**crawl_identity.transport_kwargs()) as client"),
+    ("jobs/reap_cart_proof_refresh.py", "async with no_cookie_client() as raw_client"),
+    ("scripts/backfill_shopify_variant_ids.py", "async with no_cookie_client() as client"),
 ])
-def test_the_mirror_lane_clients_take_the_signing_transport(path, needle):
-    # The mirror lane's two client constructions live inside a job runner and a CLI main; their
-    # behaviour is the transport's (tested above), so this pins only that they ask for it.
+def test_the_mirror_lane_clients_are_the_shared_signing_client(path, needle):
+    # The mirror lane's two client constructions live inside a job runner and a CLI main. They take
+    # services/shopify_presentment.no_cookie_client (#2527), whose signing is tested above through
+    # the enrichment job's import of the same function; this pins only that they still use it.
     from pathlib import Path
 
+    from services import shopify_presentment
+    from jobs import enrichment_cart_variant_proof as job
+
+    assert job.no_cookie_client is shopify_presentment.no_cookie_client
     assert needle in (Path(__file__).resolve().parents[1] / path).read_text()
 
 

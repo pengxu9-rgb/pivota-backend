@@ -174,7 +174,6 @@ import json
 import logging
 import math
 import os
-import re
 import sys
 import time
 import unicodedata
@@ -182,7 +181,6 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from http.cookiejar import CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote, urljoin, urlsplit
@@ -191,13 +189,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import httpx  # noqa: E402
 
 from db.enrichment_cart_variant_proofs import OUTCOME_OK, PROOF_SOURCES, TABLE  # noqa: E402
 from db.reap_agentic_ledger import amount_minor_or_none  # noqa: E402
 # The map the purchase lane prices with. One map, so the proof's currency and the lane's agree.
 from routes.agent_commerce_reap import _MARKET_CURRENCY  # noqa: E402
-from services import crawl_identity, crawl_politeness, shopify_edge_pacer  # noqa: E402
+from services import crawl_politeness, shopify_edge_pacer  # noqa: E402
 from services.curated_brand_feed import _same_storefront_host  # noqa: E402
 from services.reap_enrichment_cart_proof import (  # noqa: E402
     ENRICHMENT_SOURCE_SYSTEM,
@@ -207,6 +204,12 @@ from services.reap_enrichment_cart_proof import (  # noqa: E402
     _sku_variant,
     enrichment_offer_price_ok,
     storefront_page,
+)
+from services.shopify_presentment import (  # noqa: E402
+    CURRENCY_NOT_MARKET,
+    no_cookie_client,
+    presentment_currency,
+    products_js_price_minor,
 )
 from services.shopify_variant_identity import MAX_VARIANTS, clean_variant_title  # noqa: E402
 from services.text_normalization import clean_display_text  # noqa: E402
@@ -237,7 +240,6 @@ PLACEHOLDER_MULTI_VARIANT = "placeholder_multi_variant"
 SKU_VARIANT_UNVERIFIED = "sku_variant_unverified"
 VARIANT_GONE = "variant_gone"
 CURRENCY_UNVERIFIED = "currency_unverified"
-CURRENCY_NOT_MARKET = "currency_not_market"
 PRICE_UNREADABLE = "price_unreadable"
 WRITTEN_OUTCOMES = frozenset({
     OUTCOME_OK, REVOKED_404, HOST_REDIRECTED, HANDLE_MISMATCH, PRODUCT_CHANGED, PAYLOAD_MALFORMED,
@@ -273,8 +275,6 @@ _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 NEUTRAL_OUTCOMES = frozenset({"not_json", "robots_disallowed", "crawl_paced", "crawl_delay_too_long"})
 DEFAULT_LIMIT = 2000
 
-_CURRENCY = re.compile(r"[A-Z]{3}")
-_CART_CURRENCY_COOKIE = "cart_currency"
 #: MAC's product-code sku prefix on its parent stubs (P2000_120613); real shade skus are SRMX11.
 _MAC_PARENT_SKU_PREFIX = "P2000_"
 
@@ -321,41 +321,8 @@ def is_block(outcome: str) -> bool:
     return outcome in BLOCK_OUTCOMES or outcome.startswith("error:")
 
 
-def no_cookie_client(**kwargs: Any) -> httpx.AsyncClient:
-    """An httpx client whose jar accepts NO cookie from any domain, so nothing a response sets can
-    ride a later request (a redirect hop included)."""
-    jar = CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
-    # The JAR itself, not httpx.Cookies(jar): httpx copies a Cookies object into a fresh default jar.
-    # Signed (Web Bot Auth) when its flag and key are set, unless the caller brought a transport.
-    if "transport" not in kwargs:
-        kwargs.update(crawl_identity.transport_kwargs())
-    return httpx.AsyncClient(cookies=jar, **kwargs)
-
-
-# ── pure: the currency a response was read in ───────────────────────────────────────────────────
-
-
-def presentment_currency(set_cookie_headers: Sequence[str]) -> Tuple[Optional[str], Optional[str]]:
-    """`(currency, None)` from the `cart_currency` Set-Cookie of ONE response, or `(None, problem)`.
-
-    Exactly one distinct value, exactly three upper-case ASCII letters. Absent, two different
-    values, or anything else is a problem, never a default."""
-    values = set()
-    for header in set_cookie_headers or ():
-        if not isinstance(header, str):
-            continue
-        name, sep, rest = header.partition("=")
-        if not sep or name.strip() != _CART_CURRENCY_COOKIE:
-            continue
-        values.add(rest.split(";", 1)[0].strip())
-    if not values:
-        return None, "cookie_absent"
-    if len(values) > 1:
-        return None, "cookie_conflict"
-    (value,) = values
-    if not _CURRENCY.fullmatch(value):
-        return None, "cookie_malformed"
-    return value, None
+# `no_cookie_client` and `presentment_currency` (THE CURRENCY RULE's two halves) live in
+# services/shopify_presentment.py, shared with the mirror backfill; imported above.
 
 
 # ── pure: one storefront product, parsed strictly ───────────────────────────────────────────────
@@ -460,10 +427,7 @@ def title_key(value: Any) -> Optional[str]:
 def live_price_minor(price: Any, currency: str, source: str) -> Optional[int]:
     """The variant's price in ISO minor units of `currency`, or None (refused, never rounded)."""
     if source == SOURCE_PRODUCTS_JS:
-        # `.js` is x100 for EVERY currency. An int only: a float or a string is not this shape.
-        if type(price) is not int:
-            return None
-        return amount_minor_or_none(Decimal(price) / Decimal(100), currency)
+        return products_js_price_minor(price, currency)
     if source == SOURCE_PRODUCTS_JSON:
         # Major units, as a string. A JSON number is accepted only as a Decimal (the fetch parses
         # floats as Decimal); a binary float is refused by the converter itself.

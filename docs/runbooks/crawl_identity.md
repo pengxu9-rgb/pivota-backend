@@ -29,8 +29,7 @@ fingerprint or UA disguise) is out of scope.
 | lane | signed when the flag is on |
 |---|---|
 | external-offer fetch (`services/external_offers_service.py::_fetch_html`): the referral refresh and the HTML repair scripts | yes, every redirect hop |
-| Reap cart proofs, enrichment (`jobs/enrichment_cart_variant_proof.py::no_cookie_client`) | yes |
-| Reap cart proofs, mirror (`jobs/reap_cart_proof_refresh.py`, `scripts/backfill_shopify_variant_ids.py`) | yes |
+| Reap cart proofs, enrichment and mirror, and `scripts/backfill_shopify_variant_ids.py`: all through `services/shopify_presentment.py::no_cookie_client` (#2527) | yes |
 | Tier B, purchasability sweep (`jobs/tierb_cart_link_eligibility.py::PacedTransport`) | NOT YET: separate PR, after the sweep throttle fix lands. They also still send a desktop-Chrome UA |
 | curated brand feed, retailer-ingest drain, destination sweep | NOT YET |
 
