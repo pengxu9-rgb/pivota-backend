@@ -67,7 +67,7 @@ _CREDENTIAL = re.compile(
 # Names that end like a credential but hold a flag, a counter, a pagination
 # cursor or a typed confirmation phrase.
 _NOT_A_CREDENTIAL = re.compile(
-    r"^(?:has|is|num|n|max|min)_|(?:^|_)(?:page|continuation)_token$|(?:^|_)confirm_token$",
+    r"^(?:has|is|num|n|max|min)_|(?:^|_)(?:page|continuation)_token$|^(?:prod_)?confirm_token$",
     re.IGNORECASE,
 )
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
@@ -292,6 +292,7 @@ FLAGGED = [
     'logger.info(f"{request.headers.get(\'X-API-Key\')}")',
     'print(f"{stripeApiKey[:6]}")',
     'logger.info(f"{bearer}")',
+    'logger.info(f"{email_confirm_token}")',  # a secret link token, unlike CONFIRM_TOKEN
 ]
 
 NOT_FLAGGED = [

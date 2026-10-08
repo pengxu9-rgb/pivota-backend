@@ -28,6 +28,7 @@ def test_fingerprint_of_a_missing_or_non_string_value_is_absent(value) -> None:
         ("postgresql+asyncpg://app:pw@/pivota?host=/cloudsql/p:r:i", "postgresql+asyncpg://app:***@/pivota?host=/cloudsql/p:r:i"),
         ("postgresql://app:p@ss/w?rd@10.0.0.1/db", "postgresql://app:***@10.0.0.1/db"),
         ("postgresql://app@h/db?password=hunter2&sslmode=require", "postgresql://app@h/db?password=***&sslmode=require"),
+        ("postgresql://app@h/db?sslpassword=hunter2", "postgresql://app@h/db?sslpassword=***"),
         ("postgresql://app@host/db", "postgresql://app@host/db"),
         ("sqlite+aiosqlite:///./pivota.db", "sqlite+aiosqlite:///./pivota.db"),
         (None, ""),
@@ -38,3 +39,23 @@ def test_redact_url_credentials(url, expected) -> None:
     assert out == expected
     for secret in ("hunter2", "p@ss", "w?rd"):
         assert secret not in out
+
+
+def test_db_database_rejects_a_bad_scheme_without_echoing_the_password() -> None:
+    """The call site, not just the helper: db/database.py raised with DATABASE_URL[:80]."""
+    import os
+    import pathlib
+    import subprocess
+    import sys
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
+    env["DATABASE_URL"] = "mysql://app:hunter2@db.internal/pivota"
+    proc = subprocess.run(
+        [sys.executable, "-c", "import db.database"],
+        cwd=root, env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode != 0
+    assert "Invalid DATABASE_URL" in proc.stderr
+    assert "mysql://app:***@db.internal/pivota" in proc.stderr
+    assert "hunter2" not in proc.stderr + proc.stdout

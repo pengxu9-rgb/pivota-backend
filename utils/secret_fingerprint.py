@@ -38,7 +38,7 @@ def secret_fingerprint(value: object) -> str:
 # Greedy to the LAST "@": an unencoded "@" in a password must not leave its tail
 # behind. Over-redacting a query that contains "@" is harmless in an error message.
 _URL_USERINFO_PASSWORD = re.compile(r"(://[^:/@?#]*):.*@")
-_URL_QUERY_PASSWORD = re.compile(r"(?i)([?&](?:password|passwd|pwd)=)[^&#]*")
+_URL_QUERY_PASSWORD = re.compile(r"(?i)([?&][a-z_]*(?:password|passwd|pwd)=)[^&#]*")
 
 
 def redact_url_credentials(url: object) -> str:
@@ -46,6 +46,7 @@ def redact_url_credentials(url: object) -> str:
 
     `postgresql://user:pass@host/db`[:60] puts the password in a log line; this
     keeps scheme, user, host and database, which is what an error message needs.
+    URL form only: a libpq key=value DSN (`host=h password=pw`) is not handled.
     """
     text = url if isinstance(url, str) else str(url or "")
     text = _URL_USERINFO_PASSWORD.sub(r"\1:***@", text)
