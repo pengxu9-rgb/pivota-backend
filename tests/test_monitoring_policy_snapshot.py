@@ -85,3 +85,34 @@ def test_every_live_policy_is_compared_and_only_reported_drift_remains():
         for key in ['displayName', 'documentation', 'combiner', 'notificationChannels', 'alertStrategy']:
             assert generated[name][key] == live[key], (name, key)
     assert drifts == {}
+
+
+def test_purchasability_sweep_ip_throttle_policy_pages_once_per_window():
+    """The sweep is HOURLY and a trip exits 0. The policy counts the IP_THROTTLE line's
+    `"ip_throttled":true` (compact JSON: no space after the colon), keyed on the job, and aligns over
+    twice the cadence so a 14-17 h throttle window is ONE incident, not one page per hour."""
+    source = (ROOT / 'infra/gcp/setup_monitoring.sh').read_text()
+    assert ('MPS_THROTTLED_FILTER=\'resource.type="cloud_run_job" AND resource.labels.job_name='
+            '"merchant-purchasability-sweep" AND textPayload:"IP_THROTTLE " AND '
+            'textPayload:"\\"ip_throttled\\":true"\'') in source
+    policy = generated_policies()['prod: purchasability sweep IP-throttled']
+    condition = policy['conditions'][0]['conditionThreshold']
+    assert condition['filter'] == ('metric.type="logging.googleapis.com/user/'
+                                   'merchant_purchasability_sweep_ip_throttled" AND resource.type="cloud_run_job"')
+    assert condition['aggregations'][0]['alignmentPeriod'] == '7200s'
+    assert condition['comparison'] == 'COMPARISON_GT' and condition.get('thresholdValue', 0) == 0
+    assert policy['alertStrategy'] == {'autoClose': '7200s'}
+
+
+def test_the_ip_throttle_filter_matches_the_line_the_sweep_prints():
+    """The filter's literal must be a substring of what `ip_throttle_line` + json.dumps really emit."""
+    import json as _json
+    sys.path.insert(0, str(ROOT))
+    import jobs.merchant_purchasability_sweep as sweep
+
+    breaker = sweep.SweepThrottleBreaker(trip_hosts=1, window_seconds=60)
+    breaker.observe("a.example", 429, {"retry-after": "60"})
+    line = sweep.IP_THROTTLE_PREFIX + _json.dumps(sweep.ip_throttle_line(breaker, {}), separators=(",", ":"), default=str)
+    assert line.startswith("IP_THROTTLE ") and '"ip_throttled":true' in line
+    quiet = sweep.ip_throttle_line(sweep.SweepThrottleBreaker(), {})
+    assert '"ip_throttled":true' not in _json.dumps(quiet, separators=(",", ":"), default=str)

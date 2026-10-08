@@ -732,7 +732,8 @@ async def test_the_sweep_paces_only_the_crawl_egress_vantage(monkeypatch) -> Non
         before = sep.stats()["granted"]
         for _ in range(3):
             await client.get(f"https://{domain}/products.json")
-        per_vantage[str(client._transport._shopify_edge)] = sep.stats()["granted"] - before
+        # The sweep's outermost transport is the IP-throttle watcher; the pacer is inside it.
+        per_vantage[str(client._transport._inner._shopify_edge)] = sep.stats()["granted"] - before
         return None
 
     monkeypatch.setattr(sweep, "_preflight", fake_preflight)
