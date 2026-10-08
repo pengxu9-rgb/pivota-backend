@@ -26,6 +26,7 @@ from typing import Any, Optional, Sequence, Tuple
 import httpx
 
 from db.reap_agentic_ledger import amount_minor_or_none
+from services import crawl_identity
 
 _CURRENCY = re.compile(r"[A-Z]{3}")
 _CART_CURRENCY_COOKIE = "cart_currency"
@@ -40,6 +41,10 @@ def no_cookie_client(**kwargs: Any) -> httpx.AsyncClient:
     ride a later request (a redirect hop included)."""
     jar = CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
     # The JAR itself, not httpx.Cookies(jar): httpx copies a Cookies object into a fresh default jar.
+    # Signed (Web Bot Auth, services/crawl_identity.py) when its flag and key are set, unless the
+    # caller brought a transport. Flag off: the same call as before.
+    if "transport" not in kwargs:
+        kwargs.update(crawl_identity.transport_kwargs())
     return httpx.AsyncClient(cookies=jar, **kwargs)
 
 

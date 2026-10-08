@@ -14,6 +14,7 @@ from sqlalchemy import and_, select, update
 
 from db.database import database
 from db.external_offers import external_offer_snapshots
+from services import crawl_identity
 from services import crawl_politeness
 from services import shopify_edge_pacer
 from utils.availability_vocabulary import normalize_availability
@@ -1480,7 +1481,10 @@ async def _fetch_html(
     await crawl_politeness.before_request(url, user_agent=DEFAULT_UA, max_wait=max_wait)
 
     timeout = httpx.Timeout(10.0, connect=5.0)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": DEFAULT_UA}) as client:
+    # Signed (Web Bot Auth) when CRAWL_WEB_BOT_AUTH_ENABLED and a key are set; every redirect hop is
+    # signed for its own host. Off: the same client as before (services/crawl_identity.py).
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": DEFAULT_UA},
+                                 **crawl_identity.transport_kwargs()) as client:
         resp = await client.get(url)
         # BEFORE raise_for_status: a 429 IS the signal the backoff exists to consume, and
         # raise_for_status would leave with it unrecorded — so the next call would hit the same
