@@ -348,10 +348,15 @@ MIRROR_SCOPE=$(scope_for "$MIRROR_JOB" "${MIRROR_ONLY:-}" MIRROR_ONLY "$MIRROR_C
 # A failed `describe` reads as "absent" (no scope). If that job EXISTS, the read failed rather than
 # the job being missing, and writing the full pass would silently widen it. Checked for BOTH jobs
 # before either is written, against the scope read itself (not a second read).
-for pair in "$ENRICHMENT_JOB:${ENRICHMENT_ONLY:-}:ENRICHMENT_ONLY:$ENRICHMENT_CURRENT" \
-            "$MIRROR_JOB:${MIRROR_ONLY:-}:MIRROR_ONLY:$MIRROR_CURRENT"; do
-  IFS=: read -r pjob preq pvar pcur <<< "$pair"
-  if [ -z "$preq" ] && [ "$pcur" = absent ] && have "$GCLOUD" run jobs describe "$pjob" --region "$REGION"; then
+# Existence is recorded HERE, once per job, and mkproofjob takes create/update from this record, so a
+# job that read as missing is CREATED (which fails loudly if it exists) and never silently updated
+# with a scope that was not read.
+ENRICHMENT_VERB=create; have "$GCLOUD" run jobs describe "$ENRICHMENT_JOB" --region "$REGION" && ENRICHMENT_VERB=update
+MIRROR_VERB=create; have "$GCLOUD" run jobs describe "$MIRROR_JOB" --region "$REGION" && MIRROR_VERB=update
+for pair in "$ENRICHMENT_JOB:${ENRICHMENT_ONLY:-}:ENRICHMENT_ONLY:$ENRICHMENT_VERB:$ENRICHMENT_CURRENT" \
+            "$MIRROR_JOB:${MIRROR_ONLY:-}:MIRROR_ONLY:$MIRROR_VERB:$MIRROR_CURRENT"; do
+  IFS=: read -r pjob preq pvar pverb pcur <<< "$pair"
+  if [ -z "$preq" ] && [ "$pcur" = absent ] && [ "$pverb" = update ]; then
     echo "REFUSING: $pjob read as missing, then exists. Its --only scope was not read. Nothing was changed. Re-run, or set $pvar." >&2
     exit 1
   fi
@@ -362,8 +367,8 @@ if [ "$REQUEST" = disable ]; then
   echo "!!!!!!!! DISARMING $ENRICHMENT_JOB AND $MIRROR_JOB: triggers paused, REAP_CART_PROOF_APPLY=false !!!!!!!!"
 fi
 
-mkproofjob(){ # job lane budget-seconds task-timeout scope
-  local job="$1" lane="$2" budget="$3" timeout="$4" scope="$5"
+mkproofjob(){ # job lane budget-seconds task-timeout scope create|update
+  local job="$1" lane="$2" budget="$3" timeout="$4" scope="$5" verb="$6"
   # PIVOTA_ENV is required (a Job inherits nothing; see scripts/ops/run_oneoff_job.sh).
   local env_vars="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=$job,PIVOTA_COMMIT_SHA=$BACKEND_TAG"
   env_vars="$env_vars,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2"
@@ -381,7 +386,6 @@ mkproofjob(){ # job lane budget-seconds task-timeout scope
     for d in "${scope_domains[@]}"; do args="$args,--only,$d"; done
   fi
   echo "== job: $job (lane $lane, subnet $SUBNET, apply $ENABLED, only ${scope:-all stores})"
-  local verb=create; have "$GCLOUD" run jobs describe "$job" --region "$REGION" && verb=update
   # --args= in the EQUALS form: the value starts with a dash, and `--args "-m,..."` is parsed by
   # gcloud as a second flag ("argument --args: expected one argument") — #2367.
   "$GCLOUD" run jobs "$verb" "$job" --region "$REGION" --image "$BACKEND_IMAGE" --service-account "$SA" \
@@ -427,8 +431,8 @@ if [ "$ENABLED" = false ]; then
     if [ "$(trigger_state "$job")" != absent ]; then settrigger "$job"; fi
   done
 fi
-mkproofjob "$ENRICHMENT_JOB" enrichment "$ENRICHMENT_BUDGET_SECONDS" "$ENRICHMENT_TASK_TIMEOUT" "$ENRICHMENT_SCOPE"
-mkproofjob "$MIRROR_JOB" mirror "$MIRROR_BUDGET_SECONDS" "$MIRROR_TASK_TIMEOUT" "$MIRROR_SCOPE"
+mkproofjob "$ENRICHMENT_JOB" enrichment "$ENRICHMENT_BUDGET_SECONDS" "$ENRICHMENT_TASK_TIMEOUT" "$ENRICHMENT_SCOPE" "$ENRICHMENT_VERB"
+mkproofjob "$MIRROR_JOB" mirror "$MIRROR_BUDGET_SECONDS" "$MIRROR_TASK_TIMEOUT" "$MIRROR_SCOPE" "$MIRROR_VERB"
 mktrigger "$ENRICHMENT_JOB" "$ENRICHMENT_SCHEDULE"
 mktrigger "$MIRROR_JOB" "$MIRROR_SCHEDULE"
 # A trigger CREATED above starts ENABLED: set both explicitly, last.

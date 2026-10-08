@@ -41,6 +41,7 @@ JOBS = ("reap-cart-proof-enrichment", "reap-cart-proof-mirror")
 #   SECRET_GRANTED=0                     the secret's IAM policy has no accessor binding for sa-worker
 #   MIRROR_ARGS / ENRICHMENT_ARGS        the job's current container args, as a JSON value (unset = absent)
 #   JSON_FAIL_NTH=<name>:<n>             that job's n-th `run jobs describe --format=json` fails (1-based)
+#   PLAIN_FAIL_NTH=<name>:<n>            that job's n-th plain (existence) `run jobs describe` fails
 FAKE_GCLOUD = textwrap.dedent(
     """\
     #!/usr/bin/env bash
@@ -50,6 +51,10 @@ FAKE_GCLOUD = textwrap.dedent(
         if [ -n "${JSON_FAIL_NTH:-}" ] && [ "$4" = "${JSON_FAIL_NTH%%:*}" ] && [ "${*: -1}" = "--format=json" ]; then
           n=$(( $(cat "$GCLOUD_LOG.n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GCLOUD_LOG.n"
           [ "$n" = "${JSON_FAIL_NTH##*:}" ] && exit 1
+        fi
+        if [ -n "${PLAIN_FAIL_NTH:-}" ] && [ "$4" = "${PLAIN_FAIL_NTH%%:*}" ] && [ "${*: -1}" != "--format=json" ]; then
+          m=$(( $(cat "$GCLOUD_LOG.m" 2>/dev/null || echo 0) + 1 )); echo "$m" > "$GCLOUD_LOG.m"
+          [ "$m" = "${PLAIN_FAIL_NTH##*:}" ] && exit 1
         fi
         case "$4" in
           reap-cart-proof-mirror) e="${MIRROR_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${MIRROR_GATE:-false}"; w="${MIRROR_SIGNED:-}"; a="${MIRROR_ARGS:-}" ;;
@@ -95,6 +100,8 @@ def _run(tmp_path: Path, *args: str, env: Optional[Dict[str, str]] = None, shell
     fake.chmod(0o755)
     log = tmp_path / "calls.log"
     log.write_text("")
+    for counter in ("calls.log.n", "calls.log.m"):  # the fake's JSON_FAIL_NTH / PLAIN_FAIL_NTH counters
+        (tmp_path / counter).unlink(missing_ok=True)
     proc = subprocess.run(
         [shell, str(SCRIPT), *args],
         capture_output=True, text=True, cwd=str(REPO),
@@ -741,3 +748,13 @@ def test_the_2026_10_08_case_under_the_systems_own_bash(tmp_path):
     assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-mirror")) == ["judydoll.com"]
     bad, calls = _run(tmp_path, "prod", TAG, env={"MIRROR_ONLY": "\njudydoll.com"}, shell="/bin/bash")
     assert bad.returncode == 2 and calls == []
+
+
+def test_a_scope_read_and_an_existence_check_both_failing_never_update_without_the_scope(tmp_path):
+    """Two transient failures in a row: the scope read AND the one existence check. The job is then
+    CREATED (which real gcloud refuses for an existing job, loudly), never updated with no --only."""
+    proc, calls = _run(tmp_path, "prod", TAG, "--enable", env={
+        **SPLIT_JUDYDOLL, "JSON_FAIL_NTH": "reap-cart-proof-mirror:3", "PLAIN_FAIL_NTH": "reap-cart-proof-mirror:1"})
+    assert not [c for c in calls if c[:4] == ["run", "jobs", "update", "reap-cart-proof-mirror"]], proc.stdout
+    plain = [c for c in calls if c[:4] == ["run", "jobs", "describe", "reap-cart-proof-mirror"] and c[-1] != "--format=json"]
+    assert len(plain) == 1  # existence is checked once, and the write's verb comes from that check
