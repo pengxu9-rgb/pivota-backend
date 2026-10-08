@@ -1539,12 +1539,13 @@ async def _amain(args: argparse.Namespace) -> int:
     # DATABASE_URL in the environment before any import runs (see `main`). Assert the
     # binding matches so a stale sqlite binding can never silently win.
     from db.database import DATABASE_URL as _BOUND_URL, database
+    from utils.secret_fingerprint import redact_url_credentials
     from services import seller_identity as si_mod
 
     if args.db_url not in (_BOUND_URL, _BOUND_URL.replace("postgresql+asyncpg://", "postgresql://", 1)):
         print(
-            f"ERROR: db.database is bound to {_BOUND_URL[:60]!r} but --db-url is "
-            f"{args.db_url[:60]!r}. Invoke with DATABASE_URL set in the environment, "
+            f"ERROR: db.database is bound to {redact_url_credentials(_BOUND_URL)[:60]!r} but --db-url is "
+            f"{redact_url_credentials(args.db_url)[:60]!r}. Invoke with DATABASE_URL set in the environment, "
             f"or let this script re-exec.",
             file=sys.stderr,
         )

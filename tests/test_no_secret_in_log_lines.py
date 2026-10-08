@@ -26,6 +26,13 @@ LOOK like credentials (`has_secret`, `next_page_token`, `CONFIRM_TOKEN`,
 `max_tokens`) are excluded by `_NOT_A_CREDENTIAL` — see the matcher tests below
 for both sides of the rule.
 
+KNOWN BLIND SPOTS (deliberate; review catches these, not this file). A slice
+first assigned to a neutrally named variable (`prefix = api_key[:12]` then
+`log(prefix)`) is not traced: about 25 legitimate `key_prefix = api_key[:10]`
+STORAGE sites would trip a rule that flagged every credential slice. Output
+through a receiver without "log" in its name (`console.print`, `audit.info`,
+`warnings.warn`) and exception messages are not modelled either.
+
 It parses the AST rather than grepping because the Adyen leak was a multi-line
 `print(` the one-line grep missed. It walks the whole repo (minus tests/,
 `test_*.py`, conftest.py and dot/venv dirs), because the gate runs it as
@@ -36,6 +43,8 @@ blind spot.
 from __future__ import annotations
 
 import ast
+import functools
+import os
 import pathlib
 import re
 import warnings
@@ -46,34 +55,43 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 _SKIP_DIRS = {"tests", "__pycache__", "node_modules", "venv", "site-packages"}
 
+# Matched against the name after camelCase -> snake_case and `-` -> `_`, so
+# `stripeApiKey` and the `X-API-Key` header both reach it. `psp_key` is this
+# repo's own name for the merchant's PSP secret (merchant_onboarding_routes).
 _CREDENTIAL = re.compile(
     r"(?:^|_)(?:api_?key|secret|secret_key|client_secret|password|passwd|"
-    r"token|access_token|refresh_token|private_key|webhook_secret)$",
+    r"token|access_token|refresh_token|private_key|webhook_secret|"
+    r"psp_key|signing_key|hmac_key|encryption_key|jwt|bearer|authorization)$",
     re.IGNORECASE,
 )
 # Names that end like a credential but hold a flag, a counter, a pagination
 # cursor or a typed confirmation phrase.
 _NOT_A_CREDENTIAL = re.compile(
-    r"^(?:has|is|num|n|max|min)_|(?:^|_)page_token$|^confirm_token$",
+    r"^(?:has|is|num|n|max|min)_|(?:^|_)(?:page|continuation)_token$|(?:^|_)confirm_token$",
     re.IGNORECASE,
 )
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 _LOG_LEVELS = {"debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log"}
 _STR_METHODS = {"strip", "lstrip", "rstrip", "lower", "upper", "casefold", "title", "replace", "encode", "decode"}
 
-# (repo-relative path, name) -> why printing it is the point or it is not a
-# credential. Every entry must still match a site (see the stale-entry test),
-# so this list can only shrink.
+# (repo-relative path, enclosing function, name) -> why printing it is the
+# point or it is not a credential. Scoped to the FUNCTION so a new leak of the
+# same name elsewhere in the file is still caught. Every entry must still match
+# a site (see the stale-entry test), so this list can only shrink.
 ALLOWED = {
-    ("middleware/cors.py", "token"): "loop variable over ALLOWED_ORIGINS entries: an origin string, not a credential",
-    ("scripts/mint_employee_jwt.py", "token"): "the script's job is to print the JWT it just minted for the operator",
-    ("scripts/ops/reap_local_e2e.py", "jwt_token"): "local-only rig; prints the agent-user JWT it minted so the operator can curl the local server",
-    ("scripts/ops/reap_local_e2e.py", "agent_api_key"): "local-only rig; prints the agent key it seeded into a local SQLite/localhost DB",
+    ("middleware/cors.py", "parse_origins", "token"): "loop variable over ALLOWED_ORIGINS entries: an origin string, not a credential",
+    ("scripts/mint_employee_jwt.py", "main", "token"): "the script's job is to print the JWT it just minted for the operator",
+    ("scripts/ops/reap_local_e2e.py", "cmd_seed", "jwt_token"): "local-only rig; prints the agent-user JWT it minted so the operator can curl the local server",
+    ("scripts/ops/reap_local_e2e.py", "cmd_seed", "agent_api_key"): "local-only rig; prints the agent key it seeded into a local SQLite/localhost DB",
 }
 
 
 def _is_credential_name(name: str | None) -> bool:
-    return bool(name) and bool(_CREDENTIAL.search(name)) and not _NOT_A_CREDENTIAL.search(name)
+    if not name:
+        return False
+    name = _CAMEL_BOUNDARY.sub("_", name).replace("-", "_")
+    return bool(_CREDENTIAL.search(name)) and not _NOT_A_CREDENTIAL.search(name)
 
 
 def _credential_name(node: ast.AST) -> str | None:
@@ -87,14 +105,21 @@ def _credential_name(node: ast.AST) -> str | None:
         name = node.slice.value
     elif (
         isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "get"
+        and _callee_name(node.func) in {"get", "getenv"}
         and node.args
         and isinstance(node.args[0], ast.Constant)
         and isinstance(node.args[0].value, str)
     ):
         name = node.args[0].value
     return name if _is_credential_name(name) else None
+
+
+def _callee_name(func: ast.AST) -> str | None:
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
 
 
 def _rendered_credentials(node: ast.AST | None) -> list[str]:
@@ -160,44 +185,55 @@ def _is_output_call(call: ast.Call) -> bool:
     return func.attr == "echo"
 
 
-def _leaks_in_source(source: str) -> list[tuple[int, str]]:
+def _leaks_in_source(source: str) -> list[tuple[int, str, str]]:
+    """(line, innermost enclosing function or `<module>`, credential name) per leak."""
     with warnings.catch_warnings():
         # invalid escapes in unrelated strings (DeprecationWarning on 3.11, SyntaxWarning on 3.12+)
         warnings.simplefilter("ignore", SyntaxWarning)
         warnings.simplefilter("ignore", DeprecationWarning)
         tree = ast.parse(source)
     leaks = []
-    for node in ast.walk(tree):
+
+    def visit(node: ast.AST, scope: str) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope = node.name
         if isinstance(node, ast.Call) and _is_output_call(node):
             for arg in [*node.args, *(k.value for k in node.keywords)]:
                 for name in _rendered_credentials(arg):
-                    leaks.append((node.lineno, name))
+                    leaks.append((node.lineno, scope, name))
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+
+    visit(tree, "<module>")
     return leaks
 
 
-def _production_python_files():
-    for path in sorted(REPO_ROOT.rglob("*.py")):
-        rel = path.relative_to(REPO_ROOT)
-        if any(part in _SKIP_DIRS or part.startswith(".") for part in rel.parts[:-1]):
-            continue
-        if rel.name.startswith("test_") or rel.name == "conftest.py":
-            continue
-        yield rel
+def _production_python_files() -> list[pathlib.Path]:
+    """Prunes skipped dirs during the walk: a dev checkout holds a .venv and nested
+    worktrees with ~150k .py files that an rglob would list before filtering."""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            if name.endswith(".py") and not name.startswith("test_") and name != "conftest.py":
+                out.append((pathlib.Path(dirpath) / name).relative_to(REPO_ROOT))
+    return sorted(out)
 
 
-def _all_leaks() -> list[tuple[str, int, str]]:
+@functools.lru_cache(maxsize=1)
+def _all_leaks() -> tuple[tuple[str, int, str, str], ...]:
     out = []
     for rel in _production_python_files():
-        for lineno, name in _leaks_in_source((REPO_ROOT / rel).read_text(encoding="utf-8")):
-            out.append((rel.as_posix(), lineno, name))
-    return out
+        for lineno, scope, name in _leaks_in_source((REPO_ROOT / rel).read_text(encoding="utf-8")):
+            out.append((rel.as_posix(), lineno, scope, name))
+    return tuple(out)
 
 
 def test_no_production_module_prints_or_logs_a_credential() -> None:
     offenders = [
-        f"{path}:{lineno} renders `{name}`"
-        for path, lineno, name in _all_leaks()
-        if (path, name) not in ALLOWED
+        f"{path}:{lineno} ({scope}) renders `{name}`"
+        for path, lineno, scope, name in _all_leaks()
+        if (path, scope, name) not in ALLOWED
     ]
     assert not offenders, (
         "These lines print or log a credential (or a slice of one). Cloud Run ships stdout to "
@@ -207,7 +243,7 @@ def test_no_production_module_prints_or_logs_a_credential() -> None:
 
 
 def test_every_allowlist_entry_still_matches_a_site() -> None:
-    seen = {(path, name) for path, _, name in _all_leaks()}
+    seen = {(path, scope, name) for path, _, scope, name in _all_leaks()}
     stale = sorted(key for key in ALLOWED if key not in seen)
     assert not stale, f"Remove these ALLOWED entries; nothing matches them any more: {stale}"
 
@@ -247,6 +283,15 @@ FLAGGED = [
     'print(f"{x if ok else webhook_secret}")',
     'sys.stderr.write(f"{private_key}\\n")',
     'click.echo(api_key)',
+    'print(f"psp={psp_key[:20]}")',
+    'logger.info("k=%s", signing_key)',
+    'logger.info("k=%s", self._adyen_hmac_key)',
+    'print(os.getenv("STRIPE_SECRET_KEY")[:12])',
+    'print(os.environ["STRIPE_SECRET_KEY"][:12])',
+    'logger.info(f"{headers[\'Authorization\'][:20]}")',
+    'logger.info(f"{request.headers.get(\'X-API-Key\')}")',
+    'print(f"{stripeApiKey[:6]}")',
+    'logger.info(f"{bearer}")',
 ]
 
 NOT_FLAGGED = [
@@ -259,6 +304,9 @@ NOT_FLAGGED = [
     'print(f"--confirm {CONFIRM_TOKEN}")',
     'logger.info(f"max_tokens={max_tokens}")',
     'logger.info(f"tokens={tokens}")',
+    'logger.info(f"--confirm {PROD_CONFIRM_TOKEN}")',
+    'logger.info(f"cursor={continuation_token}")',
+    'logger.info(f"has_api_key={hasApiKey}")',
     'headers = {"Authorization": f"Bearer {api_key}"}',  # not an output call
     'raise ValueError(f"{api_key}")',  # out of scope here: not a log line
 ]
