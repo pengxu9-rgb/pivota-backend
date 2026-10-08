@@ -1203,6 +1203,10 @@ def test_the_nine_existing_policies_render_exactly_as_before_this_change():
             [sys.executable, "-c", generators[generator], *args, CHANNEL],
             text=True, capture_output=True, check=True,
         ).stdout
+    # Policies ADDED after this digest was taken are not "existing"; each is pinned by its own test
+    # (the sweep's: tests/test_monitoring_policy_snapshot.py). Popped by name, so the nine stay exact.
+    for added in ("prod: purchasability sweep IP-throttled",):
+        assert rendered.pop(added, None) is not None, added
     assert len(rendered) == 9, sorted(rendered)
     digest = hashlib.sha256(json.dumps(rendered, sort_keys=True).encode()).hexdigest()
     assert digest == "9ff583df92b8d4a70c771356c6ec7bc4b6336f17c50a907ab4f323beca2b3186"

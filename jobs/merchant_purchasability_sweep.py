@@ -182,6 +182,71 @@ that job holds on the same crawl address. Before, only merchants were spaced (th
 one merchant's catalog pages and permalink hops went back to back. The pause dial still applies,
 between merchants, on top.
 
+With `CRAWL_SHOPIFY_EDGE_PACER_ENABLED` (set on the job by the setup script, as on the Reap proof
+jobs) every direct-vantage request also takes a slot of the aggregate Shopify-edge budget shared by
+every crawl job that sets the flag (services/shopify_edge_pacer.py, #2474): `PacedTransport(...,
+shopify_edge=True)`. Every merchant here is a Shopify store, so no host learning is needed. This
+job's pacer has NO deadline, so a shared wait is bounded by the edge pacer's horizon (~60 s at
+lease 2), not by the run budget; and its own spacing is already under the shared rate, so the flag
+mostly keeps the other jobs' share honest.
+
+── AN IP THROTTLE STOPS THE RUN ─────────────────────────────────────────────────────────────
+
+Measured on prod, 2026-10-07 07:08Z onward (and 10-05 10:07Z -> 10-06 00:08Z): 17-20 of the 20
+merchants unverifiable every hour, 163 of ~196 checks in 24 h answering
+`products_json_page_1_status_429` across unrelated stores: an edge limiter in front of every
+store, not 20 stores each deciding (the 2026-09-30 signature, services/crawl_ip_throttle.py). And
+the sweep kept asking all 20 stores every hour, adding to the volume the limiter counts.
+
+NOT THE ADDRESS'S HISTORY. At 23:56Z on 10-07 the crawl NAT was swapped to a spare IP
+(34.82.242.65); the 00:07Z sweep was still 17/20 unverifiable, and a one-off probe from the fresh
+address, with this module's exact headers, got `429`, `server: cloudflare`, `retry-after: 60`,
+text/plain `local_rate_limited`, no `cf-mitigated`, on its FIRST request to flowerknows.co and
+dermalogica.com. So a new IP does not help, and the only lever is ours: ask less, and stop asking
+once the limiter is evidently on. (Changing how the crawler presents itself is out of scope.)
+"IP_THROTTLE" is the shared name of the line and the breaker; what it measures is "many distinct
+stores throttling THIS crawler at once", whatever the limiter keys on. Two changes:
+
+  * THE PREFLIGHT NAMES A THROTTLE (`shopify_cart_link_preflight.throttle_signal`): a 429, a 503
+    with Retry-After, or a Cloudflare `cf-mitigated` challenge, on ANY request, comes back
+    retryable=True, `throttled=True`, verdict TRANSPORT_ERROR (a challenged CHECKOUT keeps its old
+    BLOCKED_UNKNOWN, which the Tier B lane needs definite). Before, a throttled catalog page was
+    VARIANT_UNVERIFIED with retryable=False. A login or password wall reached first still wins:
+    LOGIN_REQUIRED stays the confirmed negative it is. Both are unverifiable, so rule 3 of
+    db/merchant_purchasability.py already held -- no throttle ever advanced
+    `consecutive_failures` or cleared `positive_until` -- and it still does; what changes is that
+    the row says what happened. NOTE what rule 3 cannot do: a positive window is only RENEWED by a
+    positive check, so a throttle that lasts longer than the TTL (72 h) still ages every merchant
+    out to browse_only. Stopping the hammering is what shortens the throttle.
+  * ONE BREAKER PER RUN (`SweepThrottleBreaker`, #2473's `IpThrottleBreaker`), installed for the
+    loop and fed every answer with its headers through `crawl_politeness.note_response`. It trips
+    when `MERCHANT_PURCHASABILITY_IP_THROTTLE_TRIP_HOSTS` (3) DISTINCT hosts (`www.` folded) are throttled
+    within `..._WINDOW_SECONDS` (1200 s, the task timeout: "in one run"). #2473's default of 10
+    in 60 s is calibrated on a lane reaching hundreds of hosts at ~4 req/s; this one reaches ~20
+    stores one at a time, ~3 s apart, and on 10-07 that rule would have let 10 of the 20 through
+    before stopping. A trip STOPS THE RUN: no further merchant is contacted, nothing is written
+    for them (`skipped_ip_throttle`), the run prints `IP_THROTTLE {json}` (the refresh's fields,
+    so one log filter alerts on both) and EXITS 0. A false trip costs one hour's renewal for the
+    merchants not reached, against a 72 h TTL.
+
+WHY A TRIP EXITS 0, unlike the nightly external-referral refresh's 3. "prod: Cloud Run job
+failing" (infra/gcp/setup_monitoring.sh) fires on ANY failed task, per job, in 300 s windows, and
+this job runs HOURLY: the throttle windows measured so far lasted 14-17 h, so a non-zero trip
+would page every hour of every window -- for a condition nothing on our side can fix in the hour.
+That policy's own description sets the convention: an outcome the job RECORDS exits 0 and pages
+through its own policy. The trip is recorded (the `IP_THROTTLE` line, `ip_throttled=1` in the
+report); the page is "prod: purchasability sweep IP-throttled" on that line (setup_monitoring.sh),
+one incident per window, not the job's exit. Non-zero stays for
+what IS broken: an unreadable population (1) and a check or write that failed (4).
+
+THE CHECKS THAT DID COMPLETE ARE WRITTEN, throttled ones included, as unverifiable rows. That is
+deliberate. A throttled row keeps its window and its failure count (rule 3), so writing it costs
+the merchant nothing, and it moves the row's `checked_at`, which is what rotates the due list.
+Left unwritten, a few stores that throttle us ON THEIR OWN (a store-level Cloudflare rule) would
+stay first in line forever, trip the breaker at the head of every run, and starve every merchant
+behind them until their windows lapsed. Written, they sink to the back, and next hour the run
+starts with the merchants this one did not reach.
+
 ── PII ──────────────────────────────────────────────────────────────────────────────────────
 
 `SweepReport` carries COUNTS AND A DURATION. No domains, no variant ids, nothing from a row. The
@@ -202,6 +267,7 @@ freshness arithmetic is in docs/runbooks/merchant_purchasability.md ("Politeness
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -232,7 +298,10 @@ from services.shopify_cart_link_preflight import (
     USER_AGENT,
     PreflightResult,
     preflight,
+    throttle_signal,
 )
+# #2473's IP breaker and the response funnel that feeds it. See "AN IP THROTTLE STOPS THE RUN".
+from services import crawl_ip_throttle, crawl_politeness
 # THE Tier B job's pacer, not a second one: both jobs share the crawl address, and one spacing
 # rule for it is the point. See "PACING" above.
 from jobs.tierb_cart_link_eligibility import MIN_REQUEST_INTERVAL_S, PacedTransport, RequestPacer
@@ -293,6 +362,12 @@ DIALS: Dict[str, _Dial] = {
     # Seconds to wait between merchants. One store at a time, unhurried: this rail has no
     # latency requirement and a burst of checkout creations against one platform does not help us.
     "pause_ms": _Dial("MERCHANT_PURCHASABILITY_PAUSE_MS", 1500, 0, 60000),
+    # THE IP BREAKER (see "AN IP THROTTLE STOPS THE RUN"): this many DISTINCT hosts throttled
+    # within the window stops the run. 0 disarms it (diagnostics and the IP_THROTTLE line stay);
+    # so does CRAWL_IP_THROTTLE_BREAKER_ENABLED=false, the switch every crawl lane shares.
+    "ip_throttle_trip_hosts": _Dial("MERCHANT_PURCHASABILITY_IP_THROTTLE_TRIP_HOSTS", 3, 0, 50),
+    # The default is the job's task timeout (setup script), i.e. "within one run".
+    "ip_throttle_window_seconds": _Dial("MERCHANT_PURCHASABILITY_IP_THROTTLE_WINDOW_SECONDS", 1200, 60, 3600),
 }
 
 _WARNED: set = set()
@@ -1118,6 +1193,15 @@ class SweepReport:
     abandoned_budget: int = 0
     errors: int = 0
     skipped_disabled: int = 0
+    #: Of `unverifiable`, the checks the EDGE THROTTLED (`PreflightResult.throttled`: a 429, a 503
+    #: with Retry-After, a Cloudflare challenge). Recorded like any unverifiable result (rule 3:
+    #: nothing advanced, nothing cleared). Many of these in one run is the ADDRESS, not the stores.
+    throttled: int = 0
+    #: 1 when the IP breaker tripped and stopped the run. NOT an exit code: see "WHY A TRIP EXITS 0".
+    ip_throttled: int = 0
+    #: Merchant x vantage pairs NOT contacted because the breaker had tripped. Nothing is written
+    #: for them; they are first in line next hour.
+    skipped_ip_throttle: int = 0
     duration_ms: int = 0
 
 
@@ -1126,7 +1210,7 @@ _COUNTS = (
     "population_skipped_test_merchant", "population_unreadable", "population_total", "population_never_checked",
     "cart_mint_population_age_min", "checked",
     "positive", "negative", "unverifiable", "written", "abandoned_budget", "errors",
-    "skipped_disabled",
+    "skipped_disabled", "throttled", "ip_throttled", "skipped_ip_throttle",
 )
 
 #: Indirected so a test can make the budget elapse without sleeping. MONOTONIC: the budget must
@@ -1142,6 +1226,93 @@ def _new_pacer() -> RequestPacer:
     """ONE pacer per run, shared by every merchant and every vantage. Indirected so a test can
     hand in a fake clock and sleep and prove the spacing without waiting."""
     return RequestPacer(MIN_REQUEST_INTERVAL_S)
+
+
+#: The prefix of the run's breaker line, the same one `jobs.external_referral_refresh` prints, so
+#: one log filter (`textPayload:"IP_THROTTLE "`) alerts on every crawl lane.
+IP_THROTTLE_PREFIX = "IP_THROTTLE "
+JOB_NAME = "merchant-purchasability-sweep"
+
+
+class SweepThrottleBreaker(crawl_ip_throttle.IpThrottleBreaker):
+    """#2473's breaker with this job's two differences; everything else (the window, the latch,
+    `summary()`, the header histograms) is the parent's.
+
+      * IT COUNTS WHAT THE PREFLIGHT CALLS A THROTTLE (`throttle_signal`), so a Cloudflare
+        challenge counts as well as a 429 / 503 + Retry-After. The parent counts only the latter;
+        a challenge is handed to it as a 429.
+      * ONE MERCHANT IS ONE KEY: `www.` is folded, so a store answering from its apex and its
+        `www.` twin cannot count twice.
+    """
+
+    def observe(self, host: str, status_code: int, diag: Any) -> None:
+        key = str(host or "").strip().lower().rstrip(".")
+        if key.startswith("www."):
+            key = key[4:]
+        status = int(status_code)
+        if throttle_signal(status, diag) and not crawl_ip_throttle.is_ip_throttle_signal(status, diag):
+            status = 429
+        super().observe(key, status, diag)
+
+
+def _new_breaker() -> SweepThrottleBreaker:
+    """ONE breaker per run, from the job's dials. Indirected so a test can shrink the window."""
+    # `from_env` with both numbers given reads only the shared kill switch.
+    return SweepThrottleBreaker.from_env(
+        trip_hosts=_env_int(DIALS["ip_throttle_trip_hosts"]),
+        window_seconds=float(_env_int(DIALS["ip_throttle_window_seconds"])),
+    )
+
+
+class IpThrottleTripped(httpx.TransportError):
+    """A request the sweep did not send because the IP breaker had tripped. A transport error, so
+    the preflight reports TRANSPORT_ERROR for it like any request that never got an answer."""
+
+
+class _ThrottleWatchingTransport(httpx.AsyncBaseTransport):
+    """The outermost transport of every check: refuses a request once the breaker has tripped
+    (BEFORE the pacer, so a refused request takes no slot), and reports every answer to
+    `crawl_politeness.note_response` WITH ITS HEADERS -- the funnel that feeds the installed
+    breaker, and that logs each 429 with its Retry-After / server / cf-mitigated headers.
+
+    `observe=False` for the PROXY vantage: it leaves from another address, so its answers say
+    nothing about the crawl IP and must not trip the crawl IP's breaker. It is still refused once
+    the breaker has tripped: the run is stopped, not just the crawl IP's half of it."""
+
+    def __init__(
+        self, inner: httpx.AsyncBaseTransport, breaker: SweepThrottleBreaker, *, observe: bool = True
+    ) -> None:
+        self._inner = inner
+        self._breaker = breaker
+        self._observe = observe
+        self.refused = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self._breaker.tripped:
+            self.refused += 1
+            raise IpThrottleTripped("the crawl IP is throttled; request not sent", request=request)
+        response = await self._inner.handle_async_request(request)
+        if self._observe:
+            crawl_politeness.note_response(
+                str(request.url), response.status_code,
+                retry_after=response.headers.get("retry-after"), headers=response.headers,
+            )
+        return response
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+def ip_throttle_line(breaker: SweepThrottleBreaker, counts: Dict[str, int]) -> Dict[str, Any]:
+    """The `IP_THROTTLE` line: the breaker's own fields, exactly as `summary()` names them (the
+    external-referral refresh prints the same ones), plus this run's counts."""
+    summary = breaker.summary()
+    line: Dict[str, Any] = {"job": JOB_NAME, "status": "ip_throttled" if breaker.tripped else "ok"}
+    line.update({k: v for k, v in summary.items() if k.startswith("ip_throttle")})
+    line["throttle_diagnostics"] = summary.get("throttle_diagnostics")
+    line["throttled_checks"] = counts.get("throttled", 0)
+    line["skipped_for_ip_throttle"] = counts.get("skipped_ip_throttle", 0)
+    return line
 
 
 def _inner_transport(via: Optional[str]) -> httpx.AsyncBaseTransport:
@@ -1258,22 +1429,72 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
 
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
     pacer = _new_pacer()
+    breaker = _new_breaker()
+    with crawl_ip_throttle.installed(breaker):
+        await _sweep_targets(targets, vantages, headers, pacer, breaker, counts, pause_s, _budget_spent)
+    counts["ip_throttled"] = int(breaker.tripped)
+
+    report = _report()
+    # THE BREAKER LINE, every armed run, tripped or not: a text prefix on stdout, so it lands in
+    # textPayload (a bare JSON line would land in jsonPayload and read blank in
+    # scripts/ops/run_oneoff_job.sh). Counts and timestamps only -- no host is ever listed.
+    print(IP_THROTTLE_PREFIX + json.dumps(ip_throttle_line(breaker, counts), separators=(",", ":"),
+                                          default=str), flush=True)
+    if breaker.tripped:
+        operator_logger.warning(
+            "merchant_purchasability_sweep: stopped ip_throttled: %d distinct hosts throttled "
+            "within %.0fs (first throttle %s, tripped %s); %d merchant x vantage check(s) not "
+            "started. Nothing was written for them, and no throttled check demotes or fails a "
+            "merchant (rule 3)",
+            breaker.trip_host_count, breaker.window_seconds, breaker.first_throttle_at,
+            breaker.tripped_at, counts["skipped_ip_throttle"],
+        )
+    # THE PROOF LINE. Lands on the worker's stdout as
+    # `[ts] INFO - merchant_purchasability_sweep: SweepReport(...)`; see the logger note at the
+    # top of the module for why it cannot go through `logger`.
+    operator_logger.info("merchant_purchasability_sweep: %s", report)
+    return report
+
+
+async def _sweep_targets(
+    targets: List[Target],
+    vantages: List[Tuple[str, Optional[str]]],
+    headers: Dict[str, str],
+    pacer: RequestPacer,
+    breaker: SweepThrottleBreaker,
+    counts: Dict[str, int],
+    pause_s: float,
+    budget_spent: Callable[[], bool],
+) -> None:
+    """The per-merchant loop. Mutates `counts`; never raises for anything a merchant did."""
     for target in targets:
-        if _budget_spent():
+        if breaker.tripped:
+            # THE RUN IS STOPPED: contact nobody else. Every pair left is counted, nothing is
+            # written for it, and it is first in line next hour (its `checked_at` did not move).
+            # The ENFORCEMENT is `_ThrottleWatchingTransport`, which refuses every request after a
+            # trip (the rest of this merchant's vantages included); this only saves building a
+            # client per pair to be refused.
+            counts["skipped_ip_throttle"] += len(vantages)
+            continue
+        if budget_spent():
             # Stop STARTING merchants. The rest are picked up next tick, least-recently-checked
             # first, so nothing is starved — and no merchant is contacted for a run we cannot
             # finish, which on this rail means no abandoned checkout we did not need.
             counts["abandoned_budget"] += 1
             continue
         for vantage, via in vantages:
+            watch: Optional[_ThrottleWatchingTransport] = None
             # PER-MERCHANT, PER-VANTAGE try/except. One store that hangs, 403s or returns
             # something nobody has classified must not end the batch behind it.
             try:
                 # The shared Shopify-edge budget models the CRAWL egress IP only: the direct
                 # vantage (via=None) leaves from it; the proxy vantage does not.
-                transport = PacedTransport(_inner_transport(via), pacer, shopify_edge=via is None)
+                watch = _ThrottleWatchingTransport(
+                    PacedTransport(_inner_transport(via), pacer, shopify_edge=via is None), breaker,
+                    observe=via is None,
+                )
                 async with httpx.AsyncClient(
-                    headers=headers, timeout=REQUEST_TIMEOUT_S, transport=transport
+                    headers=headers, timeout=REQUEST_TIMEOUT_S, transport=watch
                 ) as client:
                     result = await _check_one(target, vantage=vantage, client=client)
             except Exception as exc:  # noqa: BLE001 — never BaseException; see the docstring
@@ -1288,7 +1509,17 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
             if result is None:
                 counts["errors"] += 1
                 continue
+            if watch is not None and watch.refused:
+                # A request of this check was refused locally because the breaker had tripped
+                # (a later vantage of the merchant whose answer tripped it, or a trip part way
+                # through a check): the result describes our refusal, not the store. Not written.
+                counts["skipped_ip_throttle"] += 1
+                continue
             counts["checked"] += 1
+            # Counted BESIDE positive/negative/unverifiable, not instead: a throttled result is
+            # unverifiable (rule 3), and it is recorded as one -- see "AN IP THROTTLE STOPS THE RUN"
+            # for why it is written at all.
+            counts["throttled"] += int(bool(result.throttled))
             if facts.is_positive(result):
                 counts["positive"] += 1
             elif facts.is_negative(result):
@@ -1311,15 +1542,8 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
                 counts["errors"] += 1
             else:
                 counts["written"] += 1
-        if pause_s:
+        if pause_s and not breaker.tripped:
             await asyncio.sleep(pause_s)
-
-    report = _report()
-    # THE PROOF LINE. Lands on the worker's stdout as
-    # `[ts] INFO - merchant_purchasability_sweep: SweepReport(...)`; see the logger note at the
-    # top of the module for why it cannot go through `logger`.
-    operator_logger.info("merchant_purchasability_sweep: %s", report)
-    return report
 
 
 # ── CLI: the Cloud Run Job's entry point ───────────────────────────────────────────────────
@@ -1347,7 +1571,9 @@ EXIT_ERRORS = 4
 
 def exit_code_for(report: SweepReport) -> int:
     """The execution's exit code, from the report alone. An unreadable population outranks
-    per-merchant errors: it is the one that says the run did not see what it had to."""
+    per-merchant errors: it is the one that says the run did not see what it had to. A run the IP
+    breaker stopped is NOT a failure (`ip_throttled` decides nothing here): see "WHY A TRIP EXITS 0"
+    in the module header."""
     if report.population_unreadable:
         return EXIT_POPULATION_UNREADABLE
     if report.errors:

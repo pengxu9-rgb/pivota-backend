@@ -149,7 +149,7 @@ negatives, `positive_until` is cleared.
 | `PRICE_DRIFT` | the landed line charges a different price than our indexed one — exact, minor units, no tolerance | **YES — confirmed negative** |
 | `ELIGIBLE` | landed on a checkout carrying our merchandise line, our click id and the right market. With `card_available is True` this is the **POSITIVE** fact that arms the window and resets the counter; with `card_available is None` it is unverifiable and changes nothing | no |
 | `BLOCKED_UNKNOWN` | **any other 403.** The preflight's own docstring calls it "not evidence of anything in particular" — a bot challenge as often as anything. **UNVERIFIABLE, never a negative** | no |
-| `TRANSPORT_ERROR` | connect error, timeout, proxy flake. Retryable. **UNVERIFIABLE, never a negative** and never proof of ineligibility | no |
+| `TRANSPORT_ERROR` | connect error, timeout, proxy flake. Retryable. **UNVERIFIABLE, never a negative** and never proof of ineligibility. **Also an edge THROTTLE** (since 2026-10-08): a 429, a 503 with Retry-After, or a Cloudflare `cf-mitigated` challenge on any request of the check — evidence `detail` `resolve:throttled_429` / `permalink:throttled_429`, `retryable: true`. Before, a throttled catalog page was `VARIANT_UNVERIFIED` (`products_json_page_1_status_429`, `retryable: false`). Two exceptions: a **challenged checkout** keeps `BLOCKED_UNKNOWN` (detail `permalink:throttled_challenge_403`, now retryable; definite in the Tier B lane), and a throttle on a hop **after a login or password wall** is that wall (`LOGIN_REQUIRED` / `PASSWORD_PAGE`), never a throttle. See §9 "An IP throttle stops the run" | no |
 | `VARIANT_UNAVAILABLE` | the storefront lists the variant (or product) but nothing is available to buy | no |
 | `VARIANT_UNVERIFIED` | the storefront would not let us confirm the variant (non-200, non-JSON, or the scan cap was reached) — absence is not proven | no |
 | `CHECKOUT_MARKET_MISMATCH` | our line and click id landed, but in another market than the buyer's, or the checkout's market could not be read | no |
@@ -184,6 +184,9 @@ arrival).
 | `MERCHANT_PURCHASABILITY_BATCH` | `20` (**pinned on the job** by the setup script) | `1`–`200` | merchants per run. Each is a full redirect chain plus up to 20 catalog pages, and each leaves an abandoned checkout behind — this is a politeness bound as much as a time bound |
 | `MERCHANT_PURCHASABILITY_BUDGET_SECONDS` | `600` (**pinned on the job** by the setup script) | `30`–`3600` | wall-clock budget for one run. It stops the job **STARTING** a new merchant; one already in flight runs to completion, so a run can exceed this by one merchant's worth of fetches. The job's Cloud Run **task timeout is 1200 s** (budget + one merchant, doubled); change the two together, in the script |
 | `MERCHANT_PURCHASABILITY_PAUSE_MS` | `1500` | `0`–`60000` | seconds (in ms) to wait between merchants. One store at a time, unhurried: this rail has no latency requirement and a burst of checkout creations against one platform does not help us |
+| `MERCHANT_PURCHASABILITY_IP_THROTTLE_TRIP_HOSTS` | `3` | `0`–`50` | the IP breaker: this many DISTINCT hosts (`www.` folded) throttled (429, 503 + Retry-After, Cloudflare challenge) within the window stops the run (§9). `0` disarms it; so does `CRAWL_IP_THROTTLE_BREAKER_ENABLED=false`, the switch every crawl lane shares. Disarmed, the `IP_THROTTLE` line is still printed |
+| `MERCHANT_PURCHASABILITY_IP_THROTTLE_WINDOW_SECONDS` | `1200` | `60`–`3600` | the breaker's sliding window. The default is the task timeout, i.e. "within one run" |
+| `CRAWL_SHOPIFY_EDGE_PACER_ENABLED` / `CRAWL_SHOPIFY_EDGE_LEASE` | `true` / `2` (**set on the job** by the setup script since 2026-10-08) | — | the shared Shopify-edge budget (#2474), exactly as on the Reap proof jobs: every direct-vantage request also takes a slot of the aggregate rate shared by every crawl job that sets the flag (in this repo today: the two Reap proof jobs and this one). `CRAWL_SHOPIFY_EDGE_RPS` is NOT set: every job must share one rate. This job's own spacing (~0.67 req/s) is already under the 2 req/s shared rate, so the flag mostly protects the OTHER jobs' share. The sweep's pacer has no deadline, so a shared wait is bounded by the pacer's horizon (~60 s at lease 2), not by the run budget |
 
 Two things are deliberately **not** dials: `DEMOTE_AFTER_FAILURES` (2) and the card-brand set.
 Nor is the cadence any more: `MERCHANT_PURCHASABILITY_INTERVAL_SECONDS` was the scheduler
@@ -793,7 +796,7 @@ execution and trips the "Cloud Run job failing" alert:
 
 | Exit | Meaning | Do |
 |---|---|---|
-| 0 | done — including a dark run (gate off, nobody contacted), an empty population, and a run the budget cut short (the rest are first next hour) | nothing |
+| 0 | done — including a dark run (gate off, nobody contacted), an empty population, a run the budget cut short (the rest are first next hour), and **a run the IP breaker stopped** (`ip_throttled=1`; its `IP_THROTTLE` line is the signal, see §9 "An IP throttle stops the run") | nothing per merchant; for a trip, read the `IP_THROTTLE` lines |
 | 1 | a population lane could not be read or came back incomplete, or the staleness read failed (`population_unreadable > 0`), the population could not be built at all, or the database could not be connected to (`could not connect to the database` on the job's stdout; nothing was read). Whatever *was* read was still swept. Python's own exit on an uncaught traceback is also 1 — the log tells them apart; every case means "the population was not read" | read the log's `population lane(s) could not be read` line and the WARNING before it (it names the lane and the error type); with `ENFORCE` on, merchants on the unread allowlist are ageing towards a 409 |
 | 4 | the population was read, but a check raised or a fact could not be written (`errors > 0`) | read the job log; the per-check lines carry the vantage and the error type, never the merchant |
 
@@ -846,6 +849,73 @@ down: `tests/pivota_log_capture.py` reads the pivota handler's own stream with r
 WARNING; the `*_lands_on_pivota_stdout_*` and `*_does_not_depend_on_the_root_logger` tests in
 both job suites fail on a module-logger emit (4 of 5 sweep tests and all 3 poller tests on a plain
 revert, measured).
+
+### An IP throttle stops the run (2026-10-08)
+
+**Measured.** From 2026-10-07 07:08Z (and 10-05 10:07Z → 10-06 00:08Z) 17–20 of the 20 merchants
+came back unverifiable every hour: 163 of ~196 checks in 24 h read
+`products_json_page_1_status_429`, across unrelated stores, with `consecutive_failures` up to
+16–17 on some rows. Swapping the crawl NAT to the spare IP (34.82.242.65, 10-07 23:56Z) did not
+help: a probe from the fresh address got `429`, `server: cloudflare`, `retry-after: 60`,
+`local_rate_limited` on its **first** request. The limiter is in front of every store and is not
+keyed on the address's history, so a new IP is not a fix; asking less is.
+
+**What a throttle does to a fact: nothing a reader acts on.** Every reader decides on
+`positive_until` through `is_purchasable` — the Reap route's `merchant_not_purchasable` refusal,
+the cart-link and variant admission in `routes/agent_commerce_reap.py`, and the gateway's
+cart-mint / offers gate, which acts only on this route's `tier`. A throttle is unverifiable
+(rule 3): it never advanced `consecutive_failures` and never cleared `positive_until`, before or
+after this change — a row's `consecutive_failures` of 16 came from earlier **confirmed
+negatives** (only `NEGATIVE_VERDICTS` advance it, in every version of the upsert), carried through
+the throttle, not caused by it. §7's SQL names those rows; a 16 is a store that answered about
+itself negatively 16 times with no positive between, worth reading on its own. **The one real harm:** a
+positive window is renewed only by a positive check, so a throttle longer than the TTL (72 h)
+still ages every merchant out to `browse_only`. The 10-07 throttle reaches that at about
+10-10 07Z for a merchant whose last positive was just before it began.
+
+**The breaker.** One per run (`SweepThrottleBreaker`, #2473's `IpThrottleBreaker`), fed every
+direct-vantage answer with its headers through `crawl_politeness.note_response` (which also logs
+each 429 as `crawl backoff: <host> returned 429 ... [retry-after=60 server=cloudflare]`). It trips
+at `..._TRIP_HOSTS` (3) distinct hosts (`www.` folded) throttled within the window; after that no request
+leaves (refused before the pacer), nothing more is written, and the run EXITS 0. Not 3 like the
+nightly referral refresh: this job is hourly, "prod: Cloud Run job failing" pages on any failed
+task, and the windows measured so far lasted 14-17 h, so a non-zero trip would page every hour of
+one. Alert on the line instead (below), rate-limited. The checks that
+completed before the trip ARE written, as unverifiable rows: that costs the merchant nothing
+(rule 3) and moves `checked_at`, so next hour starts with the merchants this run did not reach.
+Left unwritten, a few stores that throttle us on their own would head every run and starve the
+rest. The proxy vantage's answers never feed it (another address).
+
+**The line**, every armed run, a text prefix on stdout (lands in `textPayload`):
+
+```
+IP_THROTTLE {"job":"merchant-purchasability-sweep","status":"ip_throttled","ip_throttled":true,"ip_throttle_breaker_armed":true,"ip_throttle_trip_hosts":3,"ip_throttle_window_seconds":1200.0,"ip_throttle_tripped_at":"...","ip_throttle_trip_host_count":3,...,"throttle_diagnostics":{"responses":3,"by_server":{"cloudflare":3},...,"retry_after":{"60":3},"cf_mitigated":0},"throttled_checks":3,"skipped_for_ip_throttle":17}
+```
+
+```sh
+gcloud logging read 'resource.type="cloud_run_job"
+  AND resource.labels.job_name="merchant-purchasability-sweep"
+  AND textPayload:"IP_THROTTLE "' \
+  --project pivota-prod --freshness 24h --limit 30 --format 'value(timestamp,textPayload)'
+```
+
+The fields are the external-referral refresh's, so `textPayload:"IP_THROTTLE " AND
+textPayload:"\"ip_throttled\":true"` matches every crawl lane at once. No host is ever listed.
+
+**The page: "prod: purchasability sweep IP-throttled"** (`infra/gcp/setup_monitoring.sh`, log
+metric `merchant_purchasability_sweep_ip_throttled`, keyed on this job). Aligned over 7200 s,
+twice the hourly cadence, so a throttle window is ONE incident that closes ~2 h after the last
+tripped run, not a page an hour. It exists once `setup_monitoring.sh prod` is re-run.
+
+Notes on the fields: `ip_throttle_first_429_at` / `_last_429_at` are #2473's names and cover
+every counted signal, challenges included. The breaker counts distinct HOSTS with `www.` folded:
+a store reached under two different hosts (a custom domain and its myshopify host) counts twice.
+
+**Hosts in WARNING lines.** `crawl_politeness.note_response` logs each throttled request as
+`crawl backoff: <host> returned 429 (consecutive=N), holding Ns [retry-after=60 server=cloudflare]`
+on stderr. That is a merchant HOST (no path, no query, no buyer data), deliberately: it is the
+per-host header evidence #2473 added so a throttle can be told from a challenge. The report and
+the `IP_THROTTLE` line stay counts-only.
 
 ### The coverage census: which hosts have a fact (2026-09-28)
 
