@@ -38,6 +38,10 @@ To wire a lane, pass `**crawl_identity.transport_kwargs()` to its `httpx.AsyncCl
 its existing transport with `crawl_identity.crawl_transport(inner)`. Signing happens in the
 transport, so manually followed redirect hops are signed too.
 
+A signed client ignores `HTTP(S)_PROXY` env vars: httpx applies them only when no transport is
+passed. No crawl job sets them (checked 2026-10-08). If a lane needs a proxy, wrap its explicit
+proxy transport: `crawl_transport(httpx.AsyncHTTPTransport(proxy=...))`.
+
 ## Switches
 
 | env | where | effect |

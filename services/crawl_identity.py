@@ -335,6 +335,11 @@ def crawl_transport(inner: Optional[httpx.AsyncBaseTransport] = None) -> Optiona
     Flag off (or no usable key): `inner` unchanged -- None when the caller passed none, so
     `httpx.AsyncClient(transport=crawl_transport())` is byte-for-byte the client it was before.
     Flag on with a key: `inner` (or httpx's default transport) wrapped so every request is signed.
+
+    NOTE: httpx honours HTTP(S)_PROXY from the environment only when no transport is passed
+    (`allow_env_proxies = trust_env and ... transport is None`, httpx 0.27). A signed client therefore
+    ignores proxy env vars. No crawl job sets them (checked 2026-10-08); a lane that needs a proxy
+    must pass `inner=httpx.AsyncHTTPTransport(proxy=...)` explicitly, as the sweep's vantages do.
     """
     if not enabled():
         return inner
