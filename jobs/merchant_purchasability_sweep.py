@@ -1322,8 +1322,12 @@ def _inner_transport(via: Optional[str]) -> httpx.AsyncBaseTransport:
     proxy lookup, so a process HTTPS proxy (an operator's laptop) is honoured here explicitly for
     the direct vantage, exactly as before. Indirected so a test can mount a mock transport."""
     proxy = via or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
-    # Signed (Web Bot Auth) innermost, under the pacer (see jobs/tierb_cart_link_eligibility.py).
-    return crawl_identity.crawl_transport(httpx.AsyncHTTPTransport(proxy=proxy))
+    transport = httpx.AsyncHTTPTransport(proxy=proxy)
+    # The DIRECT vantage is signed (Web Bot Auth) innermost, under the pacer, and then declares
+    # PivotaBot (see jobs/tierb_cart_link_eligibility.py). The proxy vantage stands in for a buyer's
+    # network (docs/runbooks/merchant_purchasability.md) and leaves from an unregistered address:
+    # it is never signed and keeps its lane User-Agent.
+    return transport if via else crawl_identity.crawl_transport(transport)
 
 
 def _click_id() -> str:
@@ -1429,8 +1433,7 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
     if proxy:
         vantages.append((facts.PROXY_VANTAGE, proxy))
 
-    # The declared PivotaBot UA exactly when this process signs (services/crawl_identity.py).
-    headers = {"User-Agent": crawl_identity.user_agent(USER_AGENT), "Accept-Language": "en-US,en;q=0.9"}
+    headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
     pacer = _new_pacer()
     breaker = _new_breaker()
     with crawl_ip_throttle.installed(breaker):

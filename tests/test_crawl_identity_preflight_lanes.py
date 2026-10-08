@@ -34,28 +34,40 @@ def _sign_on(monkeypatch):
     monkeypatch.setenv(ci.KEY_ENV, _pem())
 
 
-def test_user_agent_switches_only_while_signing(monkeypatch):
-    chrome = "Mozilla/5.0 (Macintosh) Chrome/128.0"
-    assert ci.user_agent(chrome) == chrome
-    monkeypatch.setenv(ci.FLAG_ENV, "1")  # on, no key: unsigned, so the old UA stays
-    assert ci.user_agent(chrome) == chrome
-    monkeypatch.setenv(ci.KEY_ENV, _pem())
-    assert ci.user_agent(chrome) == ci.DECLARED_USER_AGENT
-    assert "PivotaBot/1.0" in ci.DECLARED_USER_AGENT
+CHROME = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/128.0"
 
 
-def test_preflight_headers_are_unchanged_off_and_declared_when_signing(monkeypatch):
+async def test_a_signed_request_declares_pivotabot_and_an_unsigned_one_keeps_its_lane_ua():
+    seen = []
+    signed = ci.SigningTransport(httpx.MockTransport(lambda r: seen.append(r) or httpx.Response(200)),
+                                 ci.Signer(Ed25519PrivateKey.generate()))
+    async with httpx.AsyncClient(transport=signed, headers={"User-Agent": CHROME}) as client:
+        await client.get("https://shop.test/products.json")
+    assert seen[-1].headers["user-agent"] == ci.DECLARED_USER_AGENT and "signature" in seen[-1].headers
+
+    class _Broken(ci.Signer):
+        def sign(self, request):
+            request.headers["User-Agent"] = "half-written"
+            raise RuntimeError("boom")
+
+    failing = ci.SigningTransport(httpx.MockTransport(lambda r: seen.append(r) or httpx.Response(200)),
+                                  _Broken(Ed25519PrivateKey.generate()))
+    async with httpx.AsyncClient(transport=failing, headers={"User-Agent": CHROME}) as client:
+        await client.get("https://shop.test/products.json")
+    assert seen[-1].headers["user-agent"] == CHROME and "signature" not in seen[-1].headers
+
+
+def test_the_preflights_own_client_is_signed_only_when_on(monkeypatch):
     from services import shopify_cart_link_preflight as pf
 
-    assert pf._headers() == pf._HEADERS and "Chrome/128.0" in pf._headers()["User-Agent"]
+    assert pf._own_client_transport() == {}
     _sign_on(monkeypatch)
-    assert pf._headers() == {**pf._HEADERS, "User-Agent": ci.DECLARED_USER_AGENT}
+    assert isinstance(pf._own_client_transport()["transport"], ci.SigningTransport)
 
 
 @pytest.mark.parametrize("factory", [
     lambda: __import__("jobs.tierb_cart_link_eligibility", fromlist=["x"])._default_inner_transport(),
     lambda: __import__("jobs.merchant_purchasability_sweep", fromlist=["x"])._inner_transport(None),
-    lambda: __import__("jobs.merchant_purchasability_sweep", fromlist=["x"])._inner_transport("http://vantage.test:3128"),
 ])
 def test_the_inner_transports_sign_only_when_on(monkeypatch, factory):
     monkeypatch.delenv("HTTPS_PROXY", raising=False)
@@ -89,9 +101,58 @@ async def test_signing_is_innermost_so_the_signature_is_made_after_the_pacing_wa
     assert created == int(now["t"])  # signed AFTER the wait, so still valid when it leaves
 
 
-def test_the_sweep_builds_its_headers_through_the_switch():
-    from pathlib import Path
+def test_the_sweeps_proxy_vantage_is_never_signed(monkeypatch):
+    """It stands in for a buyer's network and leaves from an unregistered address."""
+    from jobs import merchant_purchasability_sweep as sweep
 
-    src = (Path(__file__).resolve().parents[1] / "jobs" / "merchant_purchasability_sweep.py").read_text()
-    assert '"User-Agent": crawl_identity.user_agent(USER_AGENT)' in src
-    assert '"User-Agent": USER_AGENT,' not in src
+    _sign_on(monkeypatch)
+    via = sweep._inner_transport("http://vantage.test:3128")
+    assert isinstance(via, httpx.AsyncHTTPTransport) and not isinstance(via, ci.SigningTransport)
+
+
+def _mock_http(monkeypatch, handler):
+    """Every httpx.AsyncHTTPTransport the code under test builds becomes a mock, so the signing
+    wrapper the code itself adds around it is what is exercised."""
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda *a, **k: httpx.MockTransport(handler))
+
+
+def _assert_every_request_signed_as_pivotabot(seen):
+    assert seen, "no request went out"
+    for request in seen:
+        assert request.headers["user-agent"] == ci.DECLARED_USER_AGENT, request.url
+        assert request.headers["signature"].startswith("sig1=:") and "signature-input" in request.headers, request.url
+
+
+async def test_a_real_tierb_run_signs_every_request_it_sends(monkeypatch):
+    """The real job.run and the real preflight, flag on: every request, redirect hops included."""
+    from jobs import tierb_cart_link_eligibility as job
+    from services.tierb_cart_link_merchants import Merchant
+
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if request.url.path.startswith("/cart/"):
+            return httpx.Response(302, headers={"location": "https://judydoll.com/checkouts/cn/T"})
+        return httpx.Response(200, text="<html></html>")
+
+    _mock_http(monkeypatch, handler)
+    _sign_on(monkeypatch)
+    now = {"t": 1000.0}
+
+    async def _sleep(s):
+        now["t"] += s
+
+    await job.run(environ={job.GATE_ENV: "true"}, dry_run=True, merchants=[Merchant("judydoll.com", "US", "49819267301653")],
+                  clock=lambda: now["t"], sleep=_sleep, emit=lambda line: None, stamp="T", retry_delay_s=0)
+    _assert_every_request_signed_as_pivotabot(seen)
+
+
+async def test_the_preflight_without_a_client_signs_through_its_own(monkeypatch):
+    from services import shopify_cart_link_preflight as pf
+
+    seen = []
+    _mock_http(monkeypatch, lambda r: seen.append(r) or httpx.Response(200, text="<html></html>"))
+    _sign_on(monkeypatch)
+    await pf.preflight("judydoll.com", market="US", variant_id="49819267301653", click_id="c_test")
+    _assert_every_request_signed_as_pivotabot(seen)

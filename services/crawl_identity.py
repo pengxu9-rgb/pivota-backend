@@ -79,6 +79,12 @@ REQUEST_TTL_S = 60
 DIRECTORY_TTL_S = 86400
 DIRECTORY_MAX_AGE_S = 3600
 _SIGNED_HEADERS = ("signature", "signature-input", "signature-agent")
+#: The User-Agent EVERY signed request carries: the one Shopify's Web Bot Auth registration names, and
+#: the one the external-offer / cart-proof lanes already send. SigningTransport sets it on exactly the
+#: requests it signs, so "signed" and "declares PivotaBot" are the same set on every lane, by
+#: construction. A request that goes out unsigned (flag off, no key, fail-open, the sweep's proxy
+#: vantage) keeps whatever User-Agent its lane set.
+DECLARED_USER_AGENT = "Mozilla/5.0 (compatible; PivotaBot/1.0; +https://pivota.cc)"
 #: An https ORIGIN and nothing else: the verifier fetches DIRECTORY_PATH from it, so a path, query,
 #: userinfo or a character an sf-string would have to escape can only make that fetch go wrong.
 _ORIGIN_RE = re.compile(r"https://[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?")
@@ -275,14 +281,18 @@ class SigningTransport(httpx.AsyncBaseTransport):
         self._signer = signer
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        unsigned_user_agent = request.headers.get("user-agent")
         try:
             self._signer.sign(request)
+            request.headers["User-Agent"] = DECLARED_USER_AGENT
         except Exception as exc:
             # FAIL OPEN: a request we cannot sign goes out unsigned (today's bytes), never not at all.
             # A crawl must not stop because of its identity. Type only: the message could quote the URL.
             for name in _SIGNED_HEADERS:
                 if name in request.headers:
                     del request.headers[name]
+            if unsigned_user_agent is not None:
+                request.headers["User-Agent"] = unsigned_user_agent
             _log_once(f"sign_failed:{type(exc).__name__}",
                       "crawl_identity: could not sign a request (%s); sent unsigned", type(exc).__name__)
         return await self._inner.handle_async_request(request)
@@ -423,18 +433,6 @@ def verify_directory(body: bytes, headers: Dict[str, str], *, authority: str, no
         except Exception:
             problems.append("signature does not verify")
     return {"ok": not problems, "problems": problems, "keyids": list(public)}
-
-
-#: The User-Agent a SIGNED request carries: the one Shopify's Web Bot Auth registration names, and the
-#: one the external-offer / cart-proof lanes already send. A lane that otherwise sends a browser-like
-#: string (the Tier B / purchasability preflight) switches to this exactly when it signs, so a
-#: registration's "User-Agent string" is true of every signed request.
-DECLARED_USER_AGENT = "Mozilla/5.0 (compatible; PivotaBot/1.0; +https://pivota.cc)"
-
-
-def user_agent(unsigned: str) -> str:
-    """`DECLARED_USER_AGENT` while this process signs, else `unsigned` (today's string, unchanged)."""
-    return DECLARED_USER_AGENT if status() == "signed" else unsigned
 
 
 def transport_kwargs(inner: Optional[httpx.AsyncBaseTransport] = None) -> Dict[str, httpx.AsyncBaseTransport]:

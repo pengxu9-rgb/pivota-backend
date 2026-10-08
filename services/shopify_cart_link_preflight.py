@@ -126,6 +126,7 @@ import html
 import ipaddress
 import json
 import logging
+import os
 import re
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation
@@ -165,10 +166,15 @@ USER_AGENT = (
 _HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
 
 
-def _headers() -> dict:
-    """The request headers: `_HEADERS`, with the declared PivotaBot UA while this process signs
-    (Web Bot Auth, services/crawl_identity.py), so a signed request never claims to be a browser."""
-    return {**_HEADERS, "User-Agent": crawl_identity.user_agent(USER_AGENT)}
+def _own_client_transport() -> dict:
+    """`transport=` for the client `preflight` builds itself when none is passed: signed (Web Bot
+    Auth) when this process signs -- the transport then also sets the declared PivotaBot UA -- else
+    `{}`, today's call exactly. The process HTTPS proxy is honoured explicitly, because passing a
+    transport switches off httpx's environment-proxy lookup."""
+    if not crawl_identity.enabled():
+        return {}
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
+    return crawl_identity.transport_kwargs(httpx.AsyncHTTPTransport(proxy=proxy))
 
 _CHECKOUT_PATH = re.compile(r"^/checkouts/(?:cn|c|co)/")
 _NOT_ACCEPTING_TEXT = "set up to receive orders"
@@ -500,7 +506,7 @@ async def _fetch_following(
             refusal = _hop_refusal(current)
             if refusal:
                 raise _HopRefused(refusal, chain)
-            request = client.build_request("GET", current, headers=_headers(), timeout=REQUEST_TIMEOUT_S)
+            request = client.build_request("GET", current, headers=_HEADERS, timeout=REQUEST_TIMEOUT_S)
         except (httpx.InvalidURL, UnicodeError, ValueError):
             # A `Location` httpx cannot parse (`:abc` port, `https://xn--/` IDNA): not a network
             # failure and not retryable, but never an exception that sinks the caller's batch.
@@ -1245,7 +1251,7 @@ async def preflight(
                 host, market, variant_id, product_handle, quantity, buyer, click_id, client, expected
             )
         else:
-            async with httpx.AsyncClient(headers=_headers(), timeout=REQUEST_TIMEOUT_S) as own:
+            async with httpx.AsyncClient(headers=_HEADERS, timeout=REQUEST_TIMEOUT_S, **_own_client_transport()) as own:
                 result = await _preflight(
                     host, market, variant_id, product_handle, quantity, buyer, click_id, own, expected
                 )
