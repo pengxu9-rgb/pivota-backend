@@ -647,6 +647,11 @@ name the numeric variant in the purchase's own cart URL:
   (`currency_not_market`, `json_other_product`, `json_variant_unpriced`, ...), and
   `json_price_fetches` counts the extra requests. A blocked `.json` answer counts toward the
   store's block streak like a `.js` one, and the store is not asked for `.json` again that run.
+  Known limit (scheduled lane only): a `.json` 429 whose Retry-After outlasts the lane's patience
+  holds that store's next `.js`, so the page ends held and its cursor does not advance; a store
+  that throttles `.json` but not `.js` on every run would then not get past its first page. Not
+  measured on any store; watch `json_price_fetches` / `held_by_politeness` before provisioning the
+  mirror job in prod.
   A payload that repeats a variant id prices nothing. Proofs written
   before that, or by a fetch whose currency was not verified, carry none and never corroborate.
 

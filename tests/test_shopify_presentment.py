@@ -513,3 +513,32 @@ def test_a_json_block_on_the_streak_limit_stops_after_writing_that_row(monkeypat
     summary = _run_rows(monkeypatch, _rows(3), handler)
     assert len(sent) == 2 and summary["aborted_on_block"] is True
     assert summary["rows_with_new_ids"] == 1 and summary["next_cursor"] is None
+
+
+def test_a_not_json_answer_to_the_json_is_recorded_but_is_not_a_block(monkeypatch):
+    """A challenge page / soft 404 for the .json: recorded per store and not asked again, but it
+    never feeds the abort streak (the same rule `not_json` has for the .js)."""
+    monkeypatch.setattr(backfill, "CONSECUTIVE_BLOCK_ABORT", 1)
+
+    def handler(request):
+        if request.url.path.endswith(".json"):
+            return httpx.Response(200, headers={"content-type": "text/html"}, text="<html>challenge</html>")
+        return httpx.Response(200, headers={"content-type": "text/javascript"}, json=JUDY_JS)
+
+    summary = _run_rows(monkeypatch, _rows(3), handler)
+    assert summary["aborted_on_block"] is False and summary["rows_with_new_ids"] == 3
+    assert summary["most_blocked_domains"] == {"judydoll.com": 1}
+    assert summary["proof_currency"] == {"json_not_json": 1, "json_skipped_after_block": 2}
+
+
+def test_a_json_block_on_the_last_row_still_reports_the_abort(monkeypatch):
+    monkeypatch.setattr(backfill, "CONSECUTIVE_BLOCK_ABORT", 1)
+
+    def handler(request):
+        if request.url.path.endswith(".json"):
+            return httpx.Response(429)
+        return httpx.Response(200, headers={"content-type": "text/javascript"}, json=JUDY_JS)
+
+    summary = _run_rows(monkeypatch, _rows(1), handler)
+    assert summary["aborted_on_block"] is True and summary["next_cursor"] is None
+    assert summary["rows_with_new_ids"] == 1
