@@ -36,6 +36,9 @@ JOBS = ("reap-cart-proof-enrichment", "reap-cart-proof-mirror")
 #   SUBNET_EXISTS=0                      the crawl-subnet preflight fails
 #   RESUME_FAILS=1                       every `scheduler jobs resume` fails
 #   FAIL_UPDATE_JOB=<name>               `run jobs create|update <name>` fails
+#   ENRICHMENT_SIGNED / MIRROR_SIGNED    the job's CRAWL_WEB_BOT_AUTH_ENABLED (unset = absent)
+#   SECRET_EXISTS=0                      `secrets describe` fails
+#   SECRET_GRANTED=0                     the secret's IAM policy has no accessor binding for sa-worker
 FAKE_GCLOUD = textwrap.dedent(
     """\
     #!/usr/bin/env bash
@@ -43,11 +46,12 @@ FAKE_GCLOUD = textwrap.dedent(
     case "$1 $2 $3" in
       "run jobs describe")
         case "$4" in
-          reap-cart-proof-mirror) e="${MIRROR_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${MIRROR_GATE:-false}" ;;
-          *) e="${ENRICHMENT_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${ENRICHMENT_GATE:-false}" ;;
+          reap-cart-proof-mirror) e="${MIRROR_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${MIRROR_GATE:-false}"; w="${MIRROR_SIGNED:-}" ;;
+          *) e="${ENRICHMENT_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${ENRICHMENT_GATE:-false}"; w="${ENRICHMENT_SIGNED:-}" ;;
         esac
         [ "$e" = 1 ] || exit 1
-        printf '{"spec":{"template":{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"PIVOTA_ENV","value":"production"},{"name":"REAP_CART_PROOF_APPLY","value":"%s"}]}]}}}}}}' "$g"
+        extra=""; [ -n "$w" ] && extra=",{\\"name\\":\\"CRAWL_WEB_BOT_AUTH_ENABLED\\",\\"value\\":\\"$w\\"}"
+        printf '{"spec":{"template":{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"PIVOTA_ENV","value":"production"},{"name":"REAP_CART_PROOF_APPLY","value":"%s"}%s]}]}}}}}}' "$g" "$extra"
         exit 0 ;;
       "scheduler jobs describe")
         case "$4" in
@@ -57,6 +61,14 @@ FAKE_GCLOUD = textwrap.dedent(
         [ "$e" = 1 ] || exit 1
         echo "$t"; exit 0 ;;
       "compute networks subnets") [ "${SUBNET_EXISTS:-1}" = 1 ] && exit 0 || exit 1 ;;
+      "secrets describe WEB_BOT_AUTH_PRIVATE_KEY") [ "${SECRET_EXISTS:-1}" = 1 ] && exit 0 || exit 1 ;;
+      "secrets get-iam-policy WEB_BOT_AUTH_PRIVATE_KEY")
+        if [ "${SECRET_GRANTED:-1}" = 1 ]; then
+          printf '{"bindings":[{"role":"roles/secretmanager.secretAccessor","members":["serviceAccount:sa-worker@pivota-prod.iam.gserviceaccount.com"]}]}'
+        else
+          printf '{"bindings":[{"role":"roles/secretmanager.secretAccessor","members":["serviceAccount:someone-else@pivota-prod.iam.gserviceaccount.com"]}]}'
+        fi
+        exit 0 ;;
       "scheduler jobs resume") [ "${RESUME_FAILS:-0}" = 1 ] && exit 1 || exit 0 ;;
       "run jobs create"|"run jobs update") [ "$4" = "${FAIL_UPDATE_JOB:-}" ] && exit 1 || exit 0 ;;
     esac
@@ -555,3 +567,50 @@ def test_the_shared_pacer_rate_is_left_unset_on_both_jobs(tmp_path, flag):
         assert shopify_edge_pacer.FALLBACK_RATE_ENV not in env, env
     code = "\n".join(line for line in SCRIPT.read_text().splitlines() if not line.lstrip().startswith("#"))
     assert "CRAWL_SHOPIFY_EDGE_RPS" not in code
+
+
+# ── Web Bot Auth (services/crawl_identity.py) ───────────────────────────────────────────────────
+
+def _signed_state(job: List[str]) -> Tuple[Optional[str], str]:
+    return _env_vars(job).get("CRAWL_WEB_BOT_AUTH_ENABLED"), _flag(job, "--set-secrets")
+
+
+@pytest.mark.parametrize("env,expect", [
+    ({"WEB_BOT_AUTH": "on"}, ("true", "DATABASE_URL=DATABASE_URL:latest,WEB_BOT_AUTH_PRIVATE_KEY=WEB_BOT_AUTH_PRIVATE_KEY:latest")),
+    ({"WEB_BOT_AUTH": "off", **DARK, "MIRROR_SIGNED": "true", "ENRICHMENT_SIGNED": "true"}, (None, "DATABASE_URL=DATABASE_URL:latest")),
+    ({**DARK, "MIRROR_SIGNED": "true", "ENRICHMENT_SIGNED": "true"}, ("true", "DATABASE_URL=DATABASE_URL:latest,WEB_BOT_AUTH_PRIVATE_KEY=WEB_BOT_AUTH_PRIVATE_KEY:latest")),
+    ({"MIRROR_JOB_EXISTS": "1", "MIRROR_SIGNED": "true"}, ("true", "DATABASE_URL=DATABASE_URL:latest,WEB_BOT_AUTH_PRIVATE_KEY=WEB_BOT_AUTH_PRIVATE_KEY:latest")),
+    ({**DARK}, (None, "DATABASE_URL=DATABASE_URL:latest")),
+])
+def test_web_bot_auth_is_set_removed_or_kept_on_both_jobs_together(tmp_path, env, expect):
+    proc, calls = _run(tmp_path, "prod", TAG, env=env)
+    assert proc.returncode == 0, proc.stderr
+    for name in JOBS:
+        exists = env.get("JOB_EXISTS") == "1" or (name.endswith("mirror") and env.get("MIRROR_JOB_EXISTS") == "1")
+        assert _signed_state(_one(calls, "run", "jobs", "update" if exists else "create", name)) == expect
+
+
+@pytest.mark.parametrize("env,message", [
+    ({"WEB_BOT_AUTH": "on", "SECRET_EXISTS": "0"}, "WEB_BOT_AUTH_PRIVATE_KEY does not exist"),
+    ({"WEB_BOT_AUTH": "on", "SECRET_GRANTED": "0"}, "has no roles/secretmanager.secretAccessor"),
+    ({**DARK, "MIRROR_SIGNED": "true", "ENRICHMENT_SIGNED": "false"}, "one job signs"),
+    ({**DARK, "MIRROR_SIGNED": "true", "ENRICHMENT_SIGNED": "true", "SECRET_GRANTED": "0"}, "has no roles/secretmanager.secretAccessor"),
+])
+def test_web_bot_auth_refuses_before_any_write(tmp_path, env, message):
+    proc, calls = _run(tmp_path, "prod", TAG, env=env)
+    assert proc.returncode == 1 and message in proc.stderr, proc.stderr
+    assert not [c for c in calls if c[:3] in (["run", "jobs", "create"], ["run", "jobs", "update"])
+                or c[:3] in (["scheduler", "jobs", "create"], ["scheduler", "jobs", "pause"])]
+
+
+def test_a_bad_web_bot_auth_value_exits_2_before_touching_anything(tmp_path):
+    proc, calls = _run(tmp_path, "prod", TAG, env={"WEB_BOT_AUTH": "yes"})
+    assert proc.returncode == 2 and calls == []
+
+
+def test_the_web_bot_auth_names_are_the_signers_own():
+    from services import crawl_identity
+
+    text = SCRIPT.read_text()
+    assert f"{crawl_identity.FLAG_ENV}=true" in text
+    assert f"{crawl_identity.KEY_ENV}={crawl_identity.KEY_ENV}:latest" in text
