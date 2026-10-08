@@ -136,6 +136,7 @@ import httpx
 
 from utils.money import ZERO_DECIMAL_CURRENCIES
 
+from services import crawl_identity
 from services.crawl_ip_throttle import capture_throttle_headers, is_ip_throttle_signal
 
 from services.outbound_links_service import (
@@ -162,6 +163,12 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
 )
 _HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+
+
+def _headers() -> dict:
+    """The request headers: `_HEADERS`, with the declared PivotaBot UA while this process signs
+    (Web Bot Auth, services/crawl_identity.py), so a signed request never claims to be a browser."""
+    return {**_HEADERS, "User-Agent": crawl_identity.user_agent(USER_AGENT)}
 
 _CHECKOUT_PATH = re.compile(r"^/checkouts/(?:cn|c|co)/")
 _NOT_ACCEPTING_TEXT = "set up to receive orders"
@@ -493,7 +500,7 @@ async def _fetch_following(
             refusal = _hop_refusal(current)
             if refusal:
                 raise _HopRefused(refusal, chain)
-            request = client.build_request("GET", current, headers=_HEADERS, timeout=REQUEST_TIMEOUT_S)
+            request = client.build_request("GET", current, headers=_headers(), timeout=REQUEST_TIMEOUT_S)
         except (httpx.InvalidURL, UnicodeError, ValueError):
             # A `Location` httpx cannot parse (`:abc` port, `https://xn--/` IDNA): not a network
             # failure and not retryable, but never an exception that sinks the caller's batch.
@@ -1238,7 +1245,7 @@ async def preflight(
                 host, market, variant_id, product_handle, quantity, buyer, click_id, client, expected
             )
         else:
-            async with httpx.AsyncClient(headers=_HEADERS, timeout=REQUEST_TIMEOUT_S) as own:
+            async with httpx.AsyncClient(headers=_headers(), timeout=REQUEST_TIMEOUT_S) as own:
                 result = await _preflight(
                     host, market, variant_id, product_handle, quantity, buyer, click_id, own, expected
                 )

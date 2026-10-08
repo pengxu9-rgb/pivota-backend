@@ -285,6 +285,7 @@ from db.database import database
 # THE ONE merchant-host canonicaliser — the same function `routes/agent_commerce_reap` validates
 # the purchase request with and `tierb_cart_link_eligibility` keys its rows by. See
 # `_population_key` for how it is used here.
+from services import crawl_identity
 from services.tierb_cart_link_merchants import canonical_merchant_domain
 # THE host a connected Shopify card's cart permalink is built on (`shopify_cart_base_url` reduces
 # the connected store domain with it), so a connected-store fact is keyed on the host the card
@@ -1321,7 +1322,8 @@ def _inner_transport(via: Optional[str]) -> httpx.AsyncBaseTransport:
     proxy lookup, so a process HTTPS proxy (an operator's laptop) is honoured here explicitly for
     the direct vantage, exactly as before. Indirected so a test can mount a mock transport."""
     proxy = via or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
-    return httpx.AsyncHTTPTransport(proxy=proxy)
+    # Signed (Web Bot Auth) innermost, under the pacer (see jobs/tierb_cart_link_eligibility.py).
+    return crawl_identity.crawl_transport(httpx.AsyncHTTPTransport(proxy=proxy))
 
 
 def _click_id() -> str:
@@ -1427,7 +1429,8 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
     if proxy:
         vantages.append((facts.PROXY_VANTAGE, proxy))
 
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+    # The declared PivotaBot UA exactly when this process signs (services/crawl_identity.py).
+    headers = {"User-Agent": crawl_identity.user_agent(USER_AGENT), "Accept-Language": "en-US,en;q=0.9"}
     pacer = _new_pacer()
     breaker = _new_breaker()
     with crawl_ip_throttle.installed(breaker):

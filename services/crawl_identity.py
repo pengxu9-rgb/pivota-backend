@@ -425,6 +425,18 @@ def verify_directory(body: bytes, headers: Dict[str, str], *, authority: str, no
     return {"ok": not problems, "problems": problems, "keyids": list(public)}
 
 
+#: The User-Agent a SIGNED request carries: the one Shopify's Web Bot Auth registration names, and the
+#: one the external-offer / cart-proof lanes already send. A lane that otherwise sends a browser-like
+#: string (the Tier B / purchasability preflight) switches to this exactly when it signs, so a
+#: registration's "User-Agent string" is true of every signed request.
+DECLARED_USER_AGENT = "Mozilla/5.0 (compatible; PivotaBot/1.0; +https://pivota.cc)"
+
+
+def user_agent(unsigned: str) -> str:
+    """`DECLARED_USER_AGENT` while this process signs, else `unsigned` (today's string, unchanged)."""
+    return DECLARED_USER_AGENT if status() == "signed" else unsigned
+
+
 def transport_kwargs(inner: Optional[httpx.AsyncBaseTransport] = None) -> Dict[str, httpx.AsyncBaseTransport]:
     """`{"transport": ...}` to splat into an `httpx.AsyncClient(...)` call, or `{}` when nothing
     changes -- so a lane's flag-off call is literally the call it made before."""

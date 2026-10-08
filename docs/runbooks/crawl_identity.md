@@ -30,7 +30,7 @@ fingerprint or UA disguise) is out of scope.
 |---|---|
 | external-offer fetch (`services/external_offers_service.py::_fetch_html`): the referral refresh and the HTML repair scripts | yes, every redirect hop |
 | Reap cart proofs, enrichment and mirror, and `scripts/backfill_shopify_variant_ids.py`: all through `services/shopify_presentment.py::no_cookie_client` (#2527) | yes |
-| Tier B, purchasability sweep (`jobs/tierb_cart_link_eligibility.py::PacedTransport`) | NOT YET: separate PR, after the sweep throttle fix lands. They also still send a desktop-Chrome UA |
+| Tier B, purchasability sweep (`jobs/tierb_cart_link_eligibility.py::_default_inner_transport`, `jobs/merchant_purchasability_sweep.py::_inner_transport`) | yes, signed innermost (under the pacer), and the preflight switches from its desktop-Chrome UA to `crawl_identity.DECLARED_USER_AGENT` exactly when it signs |
 | curated brand feed, retailer-ingest drain, destination sweep | NOT YET |
 
 To wire a lane, pass `**crawl_identity.transport_kwargs()` to its `httpx.AsyncClient(...)`. Or wrap
