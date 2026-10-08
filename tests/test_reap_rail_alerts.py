@@ -1099,10 +1099,12 @@ def test_the_script_wires_the_first_run_safely(source):
     first_policy = body.index('\nupsert "')
     for metric in METRICS:
         assert body.index(f"upsert_log_metric {metric} ") < first_policy
-    # The three Reap policies, and only they, take the waiting path; they come after every
-    # `upsert`, so a deferral cannot leave one of the nine existing policies unwritten.
+    # The policies over a log metric THIS script creates, and only they, take the waiting path: the
+    # purchasability sweep's IP-throttle policy, then the Reap ones. They come after every `upsert`,
+    # so a deferral cannot leave one of the nine existing policies unwritten.
     waited = re.findall(r'^upsert_on_new_metric "([^"]+)"', body, re.M)
-    assert waited == [STUCK_POLICY, FAILING_POLICY, SILENT_POLICY,
+    assert waited == ["prod: purchasability sweep IP-throttled",
+                      STUCK_POLICY, FAILING_POLICY, SILENT_POLICY,
                       "prod: Reap checkout needs human reconciliation",
                       "prod: Reap buyer contact retention blocked"]
     assert body.rindex('\nupsert "') < body.index('\nupsert_on_new_metric "')
@@ -1203,10 +1205,6 @@ def test_the_nine_existing_policies_render_exactly_as_before_this_change():
             [sys.executable, "-c", generators[generator], *args, CHANNEL],
             text=True, capture_output=True, check=True,
         ).stdout
-    # Policies ADDED after this digest was taken are not "existing"; each is pinned by its own test
-    # (the sweep's: tests/test_monitoring_policy_snapshot.py). Popped by name, so the nine stay exact.
-    for added in ("prod: purchasability sweep IP-throttled",):
-        assert rendered.pop(added, None) is not None, added
     assert len(rendered) == 9, sorted(rendered)
     digest = hashlib.sha256(json.dumps(rendered, sort_keys=True).encode()).hexdigest()
     assert digest == "9ff583df92b8d4a70c771356c6ec7bc4b6336f17c50a907ab4f323beca2b3186"
