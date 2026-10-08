@@ -246,7 +246,11 @@ reports every failure as 1). Read the report line for the job's own code.
 fix. To change the scope:
 
 - `MIRROR_ONLY=judydoll.com,fentybeauty.com` (or `ENRICHMENT_ONLY=...`) sets it;
-- `MIRROR_ONLY=all` removes it.
+- `MIRROR_ONLY=all` removes it;
+- unset or empty (`MIRROR_ONLY=`) keeps the job's current scope.
+
+The value must be lowercase domains joined by commas, with no spaces or newlines. A domain must also
+be on the lane's list, or the job exits 2 when it runs.
 
 The script prints `== scope: <job> only=...` for each job before writing. It refuses, writing
 nothing, when a job's current args cannot be read.

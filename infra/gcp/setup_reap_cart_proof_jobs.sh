@@ -159,15 +159,17 @@ case "${WEB_BOT_AUTH:-}" in
   ""|on|off) ;;
   *) echo "WEB_BOT_AUTH must be on, off or unset (got '$WEB_BOT_AUTH')" >&2; exit 2 ;;
 esac
-DOMAIN_RE='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+# The WHOLE value is matched, anchored, before anything splits it: `read` keeps only a value's first
+# line, so validating per piece after a split let `$'\njudydoll.com'` through as an empty scope (=
+# every store) while the log printed judydoll.com. A newline or any whitespace now fails here.
+DOMAIN_PART='[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+'
+SCOPE_RE="^${DOMAIN_PART}(,${DOMAIN_PART})*\$"
 for scope_var in MIRROR_ONLY ENRICHMENT_ONLY; do
   scope_val="${!scope_var:-}"
   case "$scope_val" in
     ""|all) ;;
-    *) IFS=, read -r -a scope_list <<< "$scope_val"
-       for d in "${scope_list[@]}"; do
-         [[ "$d" =~ $DOMAIN_RE ]] || { echo "$scope_var must be 'all' or comma-separated lowercase domains (got '$scope_val')" >&2; exit 2; }
-       done ;;
+    *) [[ "$scope_val" =~ $SCOPE_RE ]] \
+         || { echo "$scope_var must be 'all' or comma-separated lowercase domains, no spaces (got '$scope_val')" >&2; exit 2; } ;;
   esac
 done
 
@@ -239,7 +241,9 @@ try:
             only.append(args[i + 1])
         elif a.startswith("--only="):
             only.append(a[len("--only="):])
-    if any(not d or "," in d for d in only):
+    import re
+    part = r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+"
+    if any(not re.fullmatch(part, d, re.IGNORECASE) for d in only):
         raise ValueError
     print(",".join(only) if only else "none")
 except Exception:
@@ -324,21 +328,34 @@ sys.exit(0 if ok else 1)
 ' || { echo "REFUSING: $SA has no roles/secretmanager.secretAccessor on WEB_BOT_AUTH_PRIVATE_KEY (docs/runbooks/crawl_identity.md step 3). Nothing was changed." >&2; exit 1; }
 fi
 echo "== web bot auth: signed=$SIGNED (WEB_BOT_AUTH=${WEB_BOT_AUTH:-unset, kept})"
-scope_for(){ # job requested-value -> "" (every store) | comma list; exits on an unreadable current scope
-  local job="$1" requested="$2" current
+scope_for(){ # job requested-value var current -> "" (every store) | comma list; fails on an unreadable scope
+  local job="$1" requested="$2" current="$4"
   case "$requested" in
     all) echo ""; return 0 ;;
     ?*) echo "$requested"; return 0 ;;
   esac
-  current=$(job_only "$job")
   case "$current" in
     unknown) echo "REFUSING: could not read $job's current --only args. Nothing was changed. Set ${3}=all or a domain list." >&2; return 1 ;;
     absent|none) echo "" ;;
     *) echo "$current" ;;
   esac
 }
-ENRICHMENT_SCOPE=$(scope_for "$ENRICHMENT_JOB" "${ENRICHMENT_ONLY:-}" ENRICHMENT_ONLY) || exit 1
-MIRROR_SCOPE=$(scope_for "$MIRROR_JOB" "${MIRROR_ONLY:-}" MIRROR_ONLY) || exit 1
+# Each job's current scope is read ONCE, and that one read is what is kept.
+ENRICHMENT_CURRENT=$(job_only "$ENRICHMENT_JOB")
+MIRROR_CURRENT=$(job_only "$MIRROR_JOB")
+ENRICHMENT_SCOPE=$(scope_for "$ENRICHMENT_JOB" "${ENRICHMENT_ONLY:-}" ENRICHMENT_ONLY "$ENRICHMENT_CURRENT") || exit 1
+MIRROR_SCOPE=$(scope_for "$MIRROR_JOB" "${MIRROR_ONLY:-}" MIRROR_ONLY "$MIRROR_CURRENT") || exit 1
+# A failed `describe` reads as "absent" (no scope). If that job EXISTS, the read failed rather than
+# the job being missing, and writing the full pass would silently widen it. Checked for BOTH jobs
+# before either is written, against the scope read itself (not a second read).
+for pair in "$ENRICHMENT_JOB:${ENRICHMENT_ONLY:-}:ENRICHMENT_ONLY:$ENRICHMENT_CURRENT" \
+            "$MIRROR_JOB:${MIRROR_ONLY:-}:MIRROR_ONLY:$MIRROR_CURRENT"; do
+  IFS=: read -r pjob preq pvar pcur <<< "$pair"
+  if [ -z "$preq" ] && [ "$pcur" = absent ] && have "$GCLOUD" run jobs describe "$pjob" --region "$REGION"; then
+    echo "REFUSING: $pjob read as missing, then exists. Its --only scope was not read. Nothing was changed. Re-run, or set $pvar." >&2
+    exit 1
+  fi
+done
 echo "== scope: $ENRICHMENT_JOB only=${ENRICHMENT_SCOPE:-all stores} (ENRICHMENT_ONLY=${ENRICHMENT_ONLY:-unset, kept})"
 echo "== scope: $MIRROR_JOB only=${MIRROR_SCOPE:-all stores} (MIRROR_ONLY=${MIRROR_ONLY:-unset, kept})"
 if [ "$REQUEST" = disable ]; then
