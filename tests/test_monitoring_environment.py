@@ -56,15 +56,31 @@ else:
         s[kind] = [x for x in s.get(kind, []) if x["name"] != "projects/" + project + "/" + path]
         out = {}
     else:
-        out = {**body, "name": "projects/" + project + "/" + path + "/" + str(len(s["calls"]))}
-        s.setdefault(path, []).append(out)
+        # A log metric Monitoring cannot see yet (MONITORING_UNSEEN_METRICS, comma-separated): a policy
+        # POST that reads one is answered with Monitoring's own error, as on 2026-10-08, for the first
+        # MONITORING_UNSEEN_REJECTS posts of that metric (-1 = always).
+        unseen = [m for m in os.environ.get("MONITORING_UNSEEN_METRICS", "").split(",") if m]
+        text = json.dumps(body) if path == "alertPolicies" else ""
+        hit = next((m for m in unseen if "logging.googleapis.com/user/" + m + chr(92) in text
+                    or "logging_googleapis_com:user_" + m + "{" in text), None)
+        limit = int(os.environ.get("MONITORING_UNSEEN_REJECTS", "-1"))
+        seen = s.setdefault("rejected", {})
+        if hit and (limit < 0 or seen.get(hit, 0) < limit):
+            seen[hit] = seen.get(hit, 0) + 1
+            out = {"error": {"code": 404, "message": "Cannot find metric(s) that match type = "
+                             + chr(34) + "logging.googleapis.com/user/" + hit + chr(34)
+                             + ". If a metric was created recently, it could take up to 10 minutes "
+                             "to become available. Please try again soon."}}
+        else:
+            out = {**body, "name": "projects/" + project + "/" + path + "/" + str(len(s["calls"]))}
+            s.setdefault(path, []).append(out)
 p.write_text(json.dumps(s))
 print(out if isinstance(out, str) else json.dumps(out))
 '''
 
 
 def run_script(tmp_path, env, *, repeat=False, channel_mode="verified",
-               channel_existing=False, return_process=False, worker_service="worker"):
+               channel_existing=False, return_process=False, worker_service="worker", extra_env=None):
     state = tmp_path / "state.json"
     if not repeat:
         initial = {"calls": [], "gcloud": []}
@@ -86,7 +102,7 @@ def run_script(tmp_path, env, *, repeat=False, channel_mode="verified",
              "GCLOUD": str(tmp_path / "gcloud"), "ALERT_EMAIL": "monitored@example.com",
              "MONITORING_TEST_STATE": str(state), "NEW_METRIC_TRIES": "0",
              "MONITORING_CHANNEL_MODE": channel_mode,
-             "REAP_WORKER_SERVICE_NAME": worker_service},
+             "REAP_WORKER_SERVICE_NAME": worker_service, **(extra_env or {})},
     )
     if return_process:
         return json.loads(state.read_text()), proc
@@ -197,3 +213,46 @@ def test_invalid_worker_target_fails_before_cloud_reads(tmp_path,worker):
     state,proc=run_script(tmp_path,"staging",worker_service=worker,return_process=True)
     assert proc.returncode==2 and "one exact Cloud Run service name" in proc.stderr
     assert state["calls"]==[] and state["gcloud"]==[]
+
+
+# Every log metric this script creates, i.e. what a brand-new project has never seen.
+SCRIPT_METRICS = ",".join([
+    "pool_checkout_timeout", "retailer_ingest_drain_held", "retailer_ingest_drain_failed",
+    "merchant_purchasability_sweep_ip_throttled", "reap_agentic_poll_report", "reap_agentic_poll_stuck",
+    "reap_agentic_poll_failing", "reap_agentic_poll_human", "reap_agentic_poll_contact",
+])
+WAITING_POLICIES = [
+    "database pool exhausted", "retailer ingest held for review", "retailer ingest job failed",
+    "purchasability sweep IP-throttled", "Reap purchase stuck over 30 minutes",
+    "Reap purchase poller failing", "Reap purchase poller went silent",
+    "Reap checkout needs human reconciliation", "Reap buyer contact retention blocked",
+]
+
+
+@pytest.mark.parametrize("env, plain", [("prod", 6), ("staging", 4)])
+def test_a_brand_new_project_writes_every_other_policy_and_defers_the_rest(tmp_path, env, plain):
+    """THE 2026-10-08 FAILURE, END TO END. Monitoring cannot see ANY metric this script creates (a
+    brand-new project's first run). Every policy that does not read one is still written, every one
+    that does is named in NOT CREATED, and the run exits 1 so nobody mistakes it for done. Before,
+    plain `upsert` aborted at the first such policy and wrote nothing after it."""
+    state, proc = run_script(tmp_path, env, return_process=True,
+                             extra_env={"MONITORING_UNSEEN_METRICS": SCRIPT_METRICS})
+    assert proc.returncode == 1, proc.stderr[-2000:]
+    names = {p["displayName"] for p in state.get("alertPolicies", [])}
+    assert len(names) == plain and not any(n.endswith(tuple(WAITING_POLICIES)) for n in names), names
+    deferred = proc.stderr.split("NOT CREATED: ", 1)[1].splitlines()[0].split(", ")
+    assert deferred == [f"{env}: {name}" for name in WAITING_POLICIES], deferred
+    assert "FAILED" not in proc.stderr
+
+
+def test_a_metric_that_becomes_visible_within_the_budget_is_waited_for(tmp_path):
+    """Rejected once per metric, then accepted: the run waits (the retry budget is shared), writes all
+    fifteen and exits 0."""
+    state, proc = run_script(tmp_path, "prod", return_process=True, extra_env={
+        "MONITORING_UNSEEN_METRICS": SCRIPT_METRICS, "MONITORING_UNSEEN_REJECTS": "1",
+        "NEW_METRIC_TRIES": "20", "NEW_METRIC_RETRY_SECONDS": "0"})
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert len(state["alertPolicies"]) == 15 and "NOT CREATED" not in proc.stderr
+    # Every metric this script creates is read by some policy ("went silent" reads the report metric through
+    # PromQL), so each was really rejected once and really waited for.
+    assert state["rejected"] == {m: 1 for m in SCRIPT_METRICS.split(",")}
