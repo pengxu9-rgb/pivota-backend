@@ -32,6 +32,8 @@ from readiness.summary import build_readiness_summary
 from utils.auth import ADMIN_ROLES, EMPLOYEE_STAFF_ROLES, get_current_employee, get_current_user, require_admin
 from routes.manage_integrations import sync_legacy_primary_store_fields
 from urllib.parse import urlparse
+from utils.logger import logger as pivota_logger
+from utils.secret_fingerprint import secret_fingerprint
 # from utils.r2_storage import upload_file_to_r2, get_presigned_url  # R2 存储功能推迟实现
 from fastapi.responses import StreamingResponse
 import io
@@ -122,12 +124,15 @@ def validate_stripe_key_sync(api_key: str) -> bool:
     """Validate Stripe API key by calling Stripe HTTP API (sync)."""
     # 1) 格式快速校验
     if not api_key or not (api_key.startswith("sk_test_") or api_key.startswith("sk_live_")):
-        print(f"🔒 Invalid Stripe key format: {api_key[:15] if api_key else 'empty'} (len={len(api_key) if api_key else 0})")
+        # Never characters of the key: a rejected value can still be a real secret
+        # pasted into the wrong field.
+        pivota_logger.warning(f"🔒 Invalid Stripe key format: key={secret_fingerprint(api_key)}")
         return False
 
     # 2) 真实请求 Stripe /v1/account 以验证密钥有效性
     try:
-        print(f"🔍 Validating Stripe key via HTTP: {api_key[:20]}...")
+        mode = "live" if api_key.startswith("sk_live_") else "test"
+        pivota_logger.info(f"🔍 Validating Stripe key via HTTP: mode={mode} key={secret_fingerprint(api_key)}")
         resp = httpx.get(
             "https://api.stripe.com/v1/account",
             headers={"Authorization": f"Bearer {api_key}"},

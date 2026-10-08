@@ -28,6 +28,7 @@ References:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -102,7 +103,7 @@ def main() -> int:
     print("§A merchant subscription signup shakeout")
     print(f"  base_url    : {base_url}")
     print(f"  price_id    : {price_id}")
-    print(f"  api_key     : ***{api_key[-4:]}")
+    print(f"  api_key     : sha256:{hashlib.sha256(api_key.encode()).hexdigest()[:8]}")
     print("=" * 78)
 
     body = {
