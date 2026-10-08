@@ -615,7 +615,11 @@ upsert "prod: retailer ingest job failed" "$(policy \
 # ONE INCIDENT PER THROTTLE WINDOW, not one per hour: aligned over 7200 s, twice the sweep's hourly
 # cadence, so while every run trips the sum never drops to 0 between runs (the same reasoning as
 # "held for review" above, at the sweep's cadence). It closes ~2 h after the last tripped run.
-upsert "prod: purchasability sweep IP-throttled" "$(policy \
+# `upsert_on_new_metric`, NOT `upsert`: its log metric is created by THIS script (above), and
+# Monitoring takes up to 10 minutes to see a new metric. With plain `upsert` the first prod run
+# (2026-10-08) aborted here with "Cannot find metric(s)", before the five Reap policies below; this
+# defers the policy instead, and creates before it deletes, so a re-run can never leave it missing.
+upsert_on_new_metric "prod: purchasability sweep IP-throttled" "$(policy \
   "prod: purchasability sweep IP-throttled" \
   "The hourly merchant-purchasability-sweep stopped itself: enough distinct Shopify stores throttled the crawl egress (429 / 503 + Retry-After / Cloudflare challenge) that it stopped contacting merchants. The execution exited 0 on purpose. Nothing is demoted by a throttle, but a positive window is only RENEWED by a positive check: a throttle longer than the 72 h TTL ages every merchant to browse_only, and with MERCHANT_PURCHASABILITY_ENFORCE on, the Reap rail then refuses them. A fresh NAT IP did not help on 2026-10-07. Read the job's IP_THROTTLE lines and docs/runbooks/merchant_purchasability.md, \"An IP throttle stops the run\"." \
   'metric.type="logging.googleapis.com/user/merchant_purchasability_sweep_ip_throttled" AND resource.type="cloud_run_job"' \

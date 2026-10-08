@@ -17,7 +17,9 @@ def generated_policies():
         generators[name] = source.split(name + '() {', 1)[1].split("python3 -c '\n", 1)[1].split("' \"$@\"", 1)[0]
     channel = LIVE[0]['notificationChannels'][0]
     result = {}
-    for name, generator, body in re.findall(r'upsert "([^"]+)" "\$\((policy|promql_policy) (.*?)\)"', source, re.S):
+    # Both writers: `upsert` and `upsert_on_new_metric` (a policy over a log metric this script creates).
+    for name, generator, body in re.findall(
+            r'upsert(?:_on_new_metric)? "([^"]+)" "\$\((policy|promql_policy) (.*?)\)"', source, re.S):
         args = shlex.split(body.replace('\\\n', '').replace('\\`', '`'))
         proc = subprocess.run([sys.executable, '-c', generators[generator], *args, channel],
                               text=True, capture_output=True, check=True)
@@ -102,6 +104,13 @@ def test_purchasability_sweep_ip_throttle_policy_pages_once_per_window():
     assert condition['aggregations'][0]['alignmentPeriod'] == '7200s'
     assert condition['comparison'] == 'COMPARISON_GT' and condition.get('thresholdValue', 0) == 0
     assert policy['alertStrategy'] == {'autoClose': '7200s'}
+    # ITS METRIC IS CREATED BY THIS SCRIPT, so it must go through the waiting writer: Monitoring takes up to
+    # 10 minutes to see a new log metric, and on 2026-10-08 the plain `upsert` aborted the first prod run
+    # here ("Cannot find metric(s)"), before the policies after it. And the metric comes first.
+    assert re.search(r'^upsert_on_new_metric "prod: purchasability sweep IP-throttled"', source, re.M)
+    assert not re.search(r'^upsert "prod: purchasability sweep IP-throttled"', source, re.M)
+    assert (source.index('upsert_log_metric merchant_purchasability_sweep_ip_throttled ')
+            < source.index('\nupsert "'))
 
 
 def test_the_ip_throttle_filter_matches_the_line_the_sweep_prints():
