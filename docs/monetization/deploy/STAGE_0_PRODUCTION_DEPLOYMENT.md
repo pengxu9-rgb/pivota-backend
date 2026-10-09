@@ -15,6 +15,9 @@ Linear deployment plan. Every step has an exact command and an exact verificatio
 - **Commit to ship**: `73d4631` (current `origin/main` HEAD). Includes monetization-v1.3 (PR #581), Step 6 fixes v1.3.1 (PR #586 + #587), and migration 121 alignment (PR #590).
 - **Pre-deploy production commit**: `5838210` (deployment `a020a3e9`). Next merge or `railway up` triggers a new deploy automatically.
 - **Single-DB tenancy**: production and staging share one Postgres (`postgres-xmr6`); schema migrations 100–120 are already live from staging deploys. Only **migration 121** has not yet run against the shared DB.
+  *(Historical, Railway era. Since the GCP cutover prod and staging run separate Cloud SQL
+  instances — see `infra/gcp/README.md` — so a staging deploy no longer applies migrations to
+  prod. Every "shared DB" below describes 2026-05.)*
 
 ## 1. Pre-deployment inventory
 

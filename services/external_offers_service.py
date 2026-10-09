@@ -14,8 +14,18 @@ from sqlalchemy import and_, select, update
 
 from db.database import database
 from db.external_offers import external_offer_snapshots
+from services import crawl_identity
 from services import crawl_politeness
+from services import shopify_edge_pacer
 from utils.availability_vocabulary import normalize_availability
+from utils.crawled_price import (
+    agreed_hint,
+    decimal_hint_from_currency,
+    decimal_hint_from_locale,
+    decimal_hint_from_money_format,
+    parse_crawled_price,
+    read_currency_code,
+)
 
 
 MAX_BODY_BYTES = int(os.getenv("EXTERNAL_OFFER_MAX_BODY_BYTES") or "1200000")  # ~1.2MB
@@ -36,10 +46,14 @@ class _MetaParser(HTMLParser):
         self._jsonld_buf: list[str] = []
         self.img_attrs: list[Dict[str, str]] = []
         self.preload_images: list[str] = []
+        self.html_lang: Optional[str] = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         a = {k.lower(): (v or "") for k, v in attrs}
-        if tag.lower() == "meta":
+        if tag.lower() == "html":
+            if self.html_lang is None and a.get("lang"):
+                self.html_lang = a.get("lang")
+        elif tag.lower() == "meta":
             key = ""
             if a.get("property"):
                 key = f"property:{a.get('property')}"
@@ -150,17 +164,71 @@ def _as_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
     except Exception:
         return dt
 
-def _parse_price(value: Optional[str]) -> Optional[float]:
-    if not value:
+@dataclass(frozen=True)
+class PriceSignals:
+    """What the page says about how it writes numbers. Only a price whose text is ambiguous on
+    its own ("1,234", "2.400") consults these; see utils/crawled_price.py.
+
+    `money_format` is the Shopify storefront money format's hint, `locale` the `og:locale` /
+    `<html lang>` hint. Each is "." or "," or None (absent, or the page's own copies disagree).
+    """
+
+    money_format: Optional[str] = None
+    locale: Optional[str] = None
+
+    def hint_for(self, currency: Optional[str], *, jsonld: bool = False) -> Optional[str]:
+        # JSON-LD adds the schema.org rule ("use '.' ... to indicate a decimal point") as one
+        # more signal that must agree. Without it, a German page's spec-conforming `"28.000"`
+        # would read as 28000 on the page's `,` locale; with it, the two disagree and it is
+        # refused. Meta tags get no such signal: EU themes print the shop's own format there.
+        return agreed_hint(
+            (self.money_format, self.locale, decimal_hint_from_currency(currency), "." if jsonld else None)
+        )
+
+
+NO_SIGNALS = PriceSignals()
+
+_MONEY_FORMAT_RE = re.compile(
+    r"money_?(?:with_currency_)?format[^{}]{0,40}?(\{\{\s*amount\w*\s*\}\})", re.IGNORECASE
+)
+
+
+def _page_price_signals(p: "_MetaParser", html: str) -> PriceSignals:
+    formats = {decimal_hint_from_money_format(m.group(1)) for m in _MONEY_FORMAT_RE.finditer(html)}
+    locales = {
+        decimal_hint_from_locale(tag)
+        for tag in (p.meta.get(("meta", "property:og:locale")), p.html_lang)
+        if tag
+    }
+    return PriceSignals(money_format=agreed_hint(formats), locale=agreed_hint(locales))
+
+
+def _read_price(
+    raw: Any, currency: Optional[str], signals: PriceSignals, *, jsonld: bool = False
+) -> Tuple[Optional[float], str]:
+    """(amount, status) for one crawled price, read with the page's own separator signals.
+
+    Replaces `_parse_price`, which kept digits and dots and dropped everything else: "28,80"
+    read as 2880 and "1.234,56" as 1.23456. A refusal is (None, reason), never a guess.
+    """
+    if not _has_price_raw(raw):
+        return None, "empty"
+    read = parse_crawled_price(raw, currency=currency, decimal_hint=signals.hint_for(currency, jsonld=jsonld))
+    return read.amount, read.status
+
+
+def _has_price_raw(raw: Any) -> bool:
+    return raw is not None and raw != ""
+
+
+def _raw_price_value(price: Any) -> Any:
+    """A JSON-LD price as the page typed it: a JSON number stays a number (already unambiguous;
+    stringifying 1.234 would make it look like "1.234"), anything else becomes stripped text."""
+    if price is None:
         return None
-    # Keep digits and dot.
-    cleaned = re.sub(r"[^0-9.]", "", value)
-    if not cleaned:
-        return None
-    try:
-        return float(cleaned)
-    except Exception:
-        return None
+    if isinstance(price, (int, float)) and not isinstance(price, bool):
+        return price
+    return str(price).strip()
 
 
 MAX_VARIANTS = int(os.getenv("EXTERNAL_OFFER_MAX_VARIANTS") or "50")
@@ -336,7 +404,9 @@ def _iter_jsonld_nodes(obj: Any):
             yield from _iter_jsonld_nodes(it)
 
 
-def _offer_price_and_currency(offer: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+def _offer_price_and_currency(offer: Dict[str, Any]) -> Tuple[Any, Optional[str]]:
+    """(raw price, ISO currency) of one offer. The price stays as the page typed it (see
+    `_raw_price_value`); the currency is None unless the offer states one we can read."""
     price = offer.get("price") or offer.get("lowPrice") or offer.get("highPrice")
     currency = offer.get("priceCurrency")
 
@@ -350,7 +420,7 @@ def _offer_price_and_currency(offer: Dict[str, Any]) -> Tuple[Optional[str], Opt
             price = price or first.get("price") or first.get("minPrice") or first.get("maxPrice")
             currency = currency or first.get("priceCurrency")
 
-    return (str(price).strip() if price is not None else None, str(currency).strip().upper() if currency else None)
+    return (_raw_price_value(price), read_currency_code(currency))
 
 
 def _is_aggregate_offer(offer: Dict[str, Any]) -> bool:
@@ -395,7 +465,9 @@ def seed_variants_from_evidence(evidence: Any) -> Optional[list[Dict[str, Any]]]
     return [{k: val for k, val in v.items() if k not in READ_PROVENANCE_KEYS} for v in raw if isinstance(v, dict)]
 
 
-def _offer_variants_from_node(offers: Any, product_name: Optional[str]) -> list[Dict[str, Any]]:
+def _offer_variants_from_node(
+    offers: Any, product_name: Optional[str], signals: PriceSignals = NO_SIGNALS
+) -> list[Dict[str, Any]]:
     if offers is None:
         return []
 
@@ -458,6 +530,7 @@ def _offer_variants_from_node(offers: Any, product_name: Optional[str]) -> list[
                 title = size_like
 
         price_raw, currency = _offer_price_and_currency(offer)
+        price_amount, price_status = _read_price(price_raw, currency, signals, jsonld=True)
         availability_raw = offer.get("availability") or item.get("availability")
         availability = _availability_from_raw(str(availability_raw)) if availability_raw else "unknown"
 
@@ -465,10 +538,12 @@ def _offer_variants_from_node(offers: Any, product_name: Optional[str]) -> list[
             {
                 "variant_id": str(variant_id),
                 "title": str(title).strip() if title else None,
-                "price_amount": _parse_price(price_raw) if price_raw else None,
+                "price_amount": price_amount,
                 "price_currency": currency,
                 "availability": availability,
-                "price_exact": bool(price_raw) and _offer_price_is_exact(offer),
+                "price_exact": price_amount is not None and _offer_price_is_exact(offer),
+                # Transient, popped with `_offer_ref`: why a price the page carried was not read.
+                "_price_refused": price_status if _has_price_raw(price_raw) and price_amount is None else None,
                 **({"offer_aggregate": True} if _is_aggregate_offer(offer) else {}),
                 # Transient: WHICH offer object this came from. `_iter_jsonld_nodes` visits a
                 # Product's offers twice (via the Product, then as Offer nodes), so only object
@@ -487,8 +562,8 @@ def _detect_currency_from_text(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return None
     text = raw.strip()
-    if text.startswith("$"):
-        return "USD"
+    # No "$" case: "$" is USD, CAD, AUD, SGD, HKD... A bare "$" read as USD is the same invented
+    # currency `resolve_external_offer` used to write (see `read_currency_code`).
     if text.startswith("€"):
         return "EUR"
     if text.startswith("£"):
@@ -500,7 +575,9 @@ def _detect_currency_from_text(raw: Optional[str]) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str], base_url: str) -> list[Dict[str, Any]]:
+def _extract_variants_from_data_attrs(
+    html: str, fallback_currency: Optional[str], base_url: str, signals: PriceSignals = NO_SIGNALS
+) -> list[Dict[str, Any]]:
     payload = _extract_skus_payload_from_data_attrs(html)
     if not payload:
         return []
@@ -557,12 +634,12 @@ def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str
         if price_amount is None:
             price_amount = sku.get("price_with_discount_with_currency_code") or sku.get("price_with_currency_code")
         currency = (
-            sku.get("price_currency")
-            or sku.get("priceCurrency")
+            read_currency_code(sku.get("price_currency") or sku.get("priceCurrency"))
             or _detect_currency_from_text(sku.get("price_with_discount_with_currency_code"))
             or _detect_currency_from_text(sku.get("price_with_currency_code"))
             or fallback_currency
         )
+        read_amount, _status = _read_price(_raw_price_value(price_amount), currency, signals)
 
         availability_raw = sku.get("inventory_status") or sku.get("availability")
         availability = _availability_from_raw(str(availability_raw)) if availability_raw else "unknown"
@@ -601,10 +678,10 @@ def _extract_variants_from_data_attrs(html: str, fallback_currency: Optional[str
             {
                 "variant_id": variant_id,
                 "title": str(title).strip() if title else None,
-                "price_amount": _parse_price(str(price_amount)) if price_amount is not None else None,
+                "price_amount": read_amount,
                 "price_currency": str(currency).strip().upper() if currency else None,
                 "availability": availability,
-                "price_exact": price_amount is not None,
+                "price_exact": read_amount is not None,
                 **({"image_url": image_url} if image_url else {}),
                 **({"label_image_url": label_image_url} if label_image_url else {}),
             }
@@ -692,7 +769,7 @@ def _extract_jsonld_variants(parsed_objs: list[Any]) -> list[Dict[str, Any]]:
 
 
 def _extract_jsonld_variants_with_census(
-    parsed_objs: list[Any],
+    parsed_objs: list[Any], signals: PriceSignals = NO_SIGNALS
 ) -> Tuple[list[Dict[str, Any]], Dict[str, Any]]:
     """The page's JSON-LD variants, one per id, plus what the de-dupe would otherwise hide.
 
@@ -718,9 +795,9 @@ def _extract_jsonld_variants_with_census(
 
             product_name = node.get("name") if isinstance(node.get("name"), str) else None
             if "product" in tset:
-                variants += _offer_variants_from_node(node.get("offers"), product_name)
+                variants += _offer_variants_from_node(node.get("offers"), product_name, signals)
             elif "offer" in tset:
-                variants += _offer_variants_from_node(node, product_name)
+                variants += _offer_variants_from_node(node, product_name, signals)
 
             if len(variants) >= MAX_VARIANTS:
                 break
@@ -761,9 +838,13 @@ def _extract_jsonld_variants_with_census(
         "aggregate": any(v.get("offer_aggregate") for v in distinct),
         "duplicate_ids": sum(1 for refs in refs_by_id.values() if len(refs) > 1),
         "truncated": truncated,
+        # Offers whose price text was refused (ambiguous separator, two numbers, ...): counted so
+        # a page that stops yielding prices is visible, not just priceless.
+        "price_refused": sum(1 for v in distinct if v.get("_price_refused")),
     }
     for v in variants:
         v.pop("_offer_ref", None)
+        v.pop("_price_refused", None)
     return normalized, census
 
 
@@ -1143,8 +1224,37 @@ def _parse_aggregate_rating(node: Any) -> tuple[Optional[float], Optional[int]]:
     return rating_value, rating_count
 
 
+def _variant_parent_names(parsed_objs: list[Any]) -> Dict[int, str]:
+    """`id(variant node) -> its product's name`, for variants nested in a `hasVariant` list.
+
+    A Shopify ProductGroup page (tatcha.com, 2026-09-29) is
+    `{"@type": "ProductGroup", "name": "The Dewy Serum", "hasVariant": [{"@type": "Product",
+    "name": "30 ml | 1.0 oz", "offers": ...}, ...]}`. The group is not a `product` type below, so
+    only its variants compete, and a variant's `name` is its OPTION LABEL ("30 ml | 1.0 oz",
+    "Default Title", "Black"), not the product's. Keyed by object identity because a variant
+    carries no reliable back-reference (`isVariantOf` is usually a bare `@id`).
+    """
+    names: Dict[int, str] = {}
+    for root in parsed_objs:
+        for node in _iter_jsonld_nodes(root):
+            if not isinstance(node, dict):
+                continue
+            group_name = node.get("name")
+            children = node.get("hasVariant")
+            if not isinstance(group_name, str) or not group_name.strip():
+                continue
+            if isinstance(children, dict):
+                children = [children]
+            if isinstance(children, list):
+                for child in children:
+                    if isinstance(child, dict):
+                        names[id(child)] = group_name.strip()
+    return names
+
+
 def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
     best: Dict[str, Any] = {}
+    parent_names = _variant_parent_names(parsed_objs)
     for root in parsed_objs:
         for node in _iter_jsonld_nodes(root):
             t = node.get("@type") if isinstance(node, dict) else None
@@ -1155,7 +1265,14 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
             if "product" not in tset and "offer" not in tset:
                 continue
 
-            name = node.get("name") if isinstance(node, dict) else None
+            # A variant's own `name` is its option label; the product is named by its group.
+            parent = node.get("isVariantOf") if isinstance(node, dict) else None
+            parent_name = parent.get("name") if isinstance(parent, dict) else None
+            name = (
+                parent_names.get(id(node))
+                or (parent_name if isinstance(parent_name, str) and parent_name.strip() else None)
+                or (node.get("name") if isinstance(node, dict) else None)
+            )
             description = node.get("description") if isinstance(node, dict) else None
             brand = None
             b = node.get("brand") if isinstance(node, dict) else None
@@ -1201,10 +1318,10 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
                     "description": str(description).strip() if isinstance(description, str) else None,
                     "brand": str(brand).strip() if brand else None,
                     "image_url": str(image_url).strip() if image_url else None,
-                    "price_raw": str(price).strip() if price is not None else None,
+                    "price_raw": _raw_price_value(price),
                     # False for an AggregateOffer's lowPrice/highPrice: a range bound, not a price.
                     "price_exact": price_exact,
-                    "currency": str(currency).strip().upper() if currency else None,
+                    "currency": read_currency_code(currency),
                     "availability_raw": str(availability).strip() if availability else None,
                     # Optional review signal off the winning Product node — null when
                     # the page carries no aggregateRating (never fabricated).
@@ -1361,21 +1478,28 @@ async def _fetch_html(
     # script's `except Exception` would silently record the row as fetch_failed. A host that 429s
     # four times in a row would then void the rest of the run in milliseconds while looking like
     # the host was down.
-    await crawl_politeness.before_request(url, user_agent=DEFAULT_UA, max_wait=max_wait)
+    await crawl_politeness.before_request(url, user_agent=crawl_identity.robots_user_agent(DEFAULT_UA), max_wait=max_wait)
 
     timeout = httpx.Timeout(10.0, connect=5.0)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": DEFAULT_UA}) as client:
+    # Signed (Web Bot Auth) when CRAWL_WEB_BOT_AUTH_ENABLED and a key are set; every redirect hop is
+    # signed for its own host. Off: the same client as before (services/crawl_identity.py).
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": DEFAULT_UA},
+                                 **crawl_identity.transport_kwargs()) as client:
         resp = await client.get(url)
         # BEFORE raise_for_status: a 429 IS the signal the backoff exists to consume, and
         # raise_for_status would leave with it unrecorded — so the next call would hit the same
         # host at the same rate that just got us throttled.
         crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
+            url, resp.status_code, retry_after=resp.headers.get("retry-after"),
+            headers=resp.headers,
         )
         if observed is not None:
             observed["status_code"] = resp.status_code
             observed["final_url"] = str(resp.url)
             observed["bot_challenged"] = bool(resp.headers.get("cf-mitigated"))
+        # Teaches the shared Shopify-edge budget which hosts it covers, keyed by the host that
+        # ANSWERED (the final URL after redirects). A no-op with its flag off.
+        shopify_edge_pacer.learn_from_response(str(resp.url), resp.headers)
         # WAS `resp.raise_for_status()`. Same control flow — every existing caller
         # catches `Exception` — but the status and the final URL now survive the throw,
         # which is what lets the refresh record "this product is gone" instead of
@@ -1400,6 +1524,44 @@ async def _fetch_html(
         return text, content_type
 
 
+def _read_product_price(
+    jsonld: Dict[str, Any], meta_price: Optional[str], meta_currency: Optional[str], signals: PriceSignals
+) -> Dict[str, Any]:
+    """The product-level amount: JSON-LD's, else the `product:price:amount` meta tag's.
+
+    Each is read with the currency the page pairs with IT. The meta tag is where EU Shopify
+    themes print `money_without_currency` ("28,80"), which the old parser read as 2880. A
+    JSON-LD text the parser refuses falls back to the meta tag (a different rendering of the
+    same price); when both are present and refused, the JSON-LD refusal is the one reported.
+
+    Returns {"amount", "source", "raw", "status", "decimal_hint"}; `raw` is the text the amount
+    came from (or was refused from), truncated, kept on the snapshot evidence.
+    """
+    attempts = []
+    if _has_price_raw(jsonld.get("price_raw")):
+        attempts.append(("jsonld", jsonld.get("price_raw"), jsonld.get("currency") or meta_currency))
+    if _has_price_raw(meta_price):
+        attempts.append(("meta", meta_price, meta_currency or jsonld.get("currency")))
+    first_refusal: Optional[Dict[str, Any]] = None
+    for source, raw, cur in attempts:
+        amount, status = _read_price(raw, cur, signals, jsonld=source == "jsonld")
+        outcome = {
+            "amount": amount,
+            "source": source,
+            "raw": str(raw)[:64],
+            "status": status,
+            "decimal_hint": signals.hint_for(cur, jsonld=source == "jsonld"),
+        }
+        # `amount` falsy, not None: as the old `_parse_price(jsonld) or _parse_price(meta)` did, a
+        # 0 falls through to the meta tag and, with nothing after it, is no amount at all (a 0 is
+        # a broken-offer shape here; the refresh reports it `unavailable`).
+        if amount:
+            return outcome
+        if first_refusal is None:
+            first_refusal = dict(outcome, amount=None)
+    return first_refusal or {"amount": None, "source": None, "raw": None, "status": "empty", "decimal_hint": None}
+
+
 def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     p = _MetaParser()
     p.feed(html)
@@ -1418,7 +1580,8 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     detailed_description = _extract_long_description_from_html(html)
 
     price = meta("property:product:price:amount", "property:og:price:amount", "property:product:price") or None
-    currency = meta("property:product:price:currency", "property:og:price:currency") or None
+    currency = read_currency_code(meta("property:product:price:currency", "property:og:price:currency"))
+    signals = _page_price_signals(p, html)
 
     parsed_jsonld = _parse_jsonld_texts(p.jsonld)
     jsonld = _extract_jsonld_offer(parsed_jsonld)
@@ -1426,9 +1589,10 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     meta_image_urls = _extract_meta_image_urls(p, canonical)
     data_attr_image_urls = _extract_image_urls_from_data_attrs(html, canonical)
     dom_image_urls = _extract_dom_image_urls(p, canonical)
-    variants_jsonld, jsonld_census = _extract_jsonld_variants_with_census(parsed_jsonld)
-    fallback_currency = (jsonld.get("currency") or currency or "").strip().upper() or None
-    variants_data_attr = _extract_variants_from_data_attrs(html, fallback_currency, canonical)
+    variants_jsonld, jsonld_census = _extract_jsonld_variants_with_census(parsed_jsonld, signals)
+    fallback_currency = jsonld.get("currency") or currency
+    variants_data_attr = _extract_variants_from_data_attrs(html, fallback_currency, canonical, signals)
+    price_read = _read_product_price(jsonld, price, currency, signals)
 
     variants: list[Dict[str, Any]] = []
     if variants_jsonld and variants_data_attr:
@@ -1515,11 +1679,14 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
         "brand": jsonld.get("brand") or None,
         "image_url": (image_urls[0] if image_urls else None) or jsonld.get("image_url") or image,
         "image_urls": image_urls,
-        "price_amount": _parse_price(jsonld.get("price_raw")) or _parse_price(price),
-        "price_currency": (jsonld.get("currency") or currency or "").strip().upper() or None,
+        "price_amount": price_read["amount"],
+        "price_currency": fallback_currency,
+        # How the product price was read, so a refusal can be counted and a stored amount traced
+        # back to the text it came from. See `_read_product_price`.
+        "price_read": {k: v for k, v in price_read.items() if k != "amount"},
         "availability": _availability_from_raw(jsonld.get("availability_raw")),
         "evidence_provider": "jsonld"
-        if jsonld.get("price_raw") or jsonld.get("title")
+        if _has_price_raw(jsonld.get("price_raw")) or jsonld.get("title")
         else ("data_attr" if variants else ("og" if title or image else "manual")),
         "variants": variants,
         # What the variant list alone cannot say (see `_extract_jsonld_variants_with_census`).
@@ -1536,10 +1703,29 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
             "data_attr_duplicate_ids": sum(1 for v in variants_data_attr if v.get("id_collided")),
             # The product-level amount above: JSON-LD's own when it has one (exact unless it is an
             # AggregateOffer bound), else a meta-tag `product:price:amount`, which names one price.
-            "product_price_exact": bool(jsonld.get("price_exact")) if jsonld.get("price_raw") else True,
+            "product_price_exact": bool(jsonld.get("price_exact")) if price_read.get("source") == "jsonld" else True,
         },
     }
     return out
+
+
+def snapshot_price_fields(extracted: Dict[str, Any]) -> Tuple[Optional[float], Optional[str], Dict[str, Any]]:
+    """(amount, currency, price_read) as a snapshot stores them, from one `_extract_from_html`.
+
+    A PRICE IS A PAIR, AND AN UNREAD CURRENCY IS NOT THE MARKET'S. `resolve_external_offer` used
+    to write `"JPY" if market == "JP" else "USD"` when the page stated no currency, so a ₩24,000
+    or 28,80 € page was stored as 24000 USD / 28.80 USD, and the seed refresh applied it whenever
+    the stored currency was USD too. An amount whose currency was not read is now not stored at
+    all; `price_read["status"]` says `currency_unread` and the refresh counts it. One function so
+    the refresh's tests build snapshots exactly as production does.
+    """
+    currency = (extracted.get("price_currency") or "").strip().upper() or None
+    amount = extracted.get("price_amount")
+    price_read = dict(extracted.get("price_read") or {})
+    if amount is not None and currency is None:
+        price_read["status"] = "currency_unread"
+        amount = None
+    return amount, currency, price_read
 
 
 def evidence_variant_fields(extracted: Dict[str, Any]) -> Dict[str, Any]:
@@ -1687,10 +1873,7 @@ async def resolve_external_offer(
         canonical_url = _normalize_url(extracted.get("canonical_url") or url_norm)
         domain = _domain(canonical_url) or _domain(url_norm)
 
-        currency = (extracted.get("price_currency") or "").strip().upper() or None
-        amount = extracted.get("price_amount")
-        if currency is None:
-            currency = "JPY" if market_norm == "JP" else "USD"
+        amount, currency, price_read = snapshot_price_fields(extracted)
 
         rid = f"eo_{url_hash[:24]}"
         now = _now()
@@ -1699,11 +1882,17 @@ async def resolve_external_offer(
             "provider": extracted.get("evidence_provider") or "manual",
             "fetchedAt": now.isoformat(),
             "snapshotId": (existing or {}).get("id") or rid,
+            # Where the currency came from, as the seed refresh's canonical-offer projection
+            # (#2416) reads it: it projects only "page". There is no `market_default` any more:
+            # an unread currency voids the amount (`snapshot_price_fields`).
+            "price_currency_source": "page" if currency else "unread",
         }
         description = extracted.get("description")
         if isinstance(description, str) and description.strip():
             evidence["description"] = description.strip()
         evidence.update(evidence_variant_fields(extracted))
+        if price_read:
+            evidence["price_read"] = price_read
         image_urls = extracted.get("image_urls") or []
         if isinstance(image_urls, list):
             cleaned = [str(u).strip() for u in image_urls if isinstance(u, str) and str(u).strip()]

@@ -10,7 +10,7 @@ here is the set of properties whose truth depends on the ENGINE:
      INTERLEAVING — databases==0.7.0 serialises everything onto one connection there, so it
      cannot say anything about two POD PROCESSES. Here a second worker runs on its own asyncpg
      connection and commits, which is the deployment this job actually has: the worker service
-     may be scaled past one replica, and prod and staging share one Postgres.
+     may be scaled past one replica, and its replicas share one Postgres.
 
   2. THE JOB'S OWN STATEMENT PLANS. `_LEFTOVER_CLAIMS_SQL` is the only SQL this package adds, and
      an unplannable statement on a live path is the #1588 shape this repo has already paid for.
@@ -73,6 +73,12 @@ _MIGRATIONS = (
     # would fail on an UndefinedColumn. See
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
+    _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
+    # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
+    _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
+    _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
+    _MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
+    _MIGRATIONS_DIR / "258_reap_price_witness.sql",  # the price witness (dark dials)
 )
 
 # Same convention as the other gates on this rail: this file DROPS its tables, so it must be
@@ -939,3 +945,173 @@ async def test_no_pii_reaches_the_report_on_any_path(reap):
         assert all(isinstance(v, int) for v in vars(report).values())
         for secret in PII_STRINGS:
             assert secret not in repr(report)
+
+
+# ── the stuck count, end to end on the production dialect ────────────────────────────────────
+
+
+async def test_an_armed_run_reports_stuck_purchases_on_postgres(reap):
+    """Step 5 through the JOB, on real `timestamptz` columns and the server's clock: a payment
+    30 minutes in flight is counted, a buyer on a live hosted page is not, and nothing the run
+    could not step is touched."""
+    paid = await _start(buyer_ref="bref_paid")
+    waiting = await _start(buyer_ref="bref_wait")
+    for purchase_id, state, checkout in ((paid, "processing", "chk_paid"),
+                                         (waiting, "awaiting_approval", "chk_wait")):
+        await _raw(
+            "UPDATE reap_agentic_purchases SET state = :s, reap_checkout_id = :c, "
+            "state_entered_at = clock_timestamp() - INTERVAL '1900 seconds', "
+            "hosted_url_expires_at = clock_timestamp() + INTERVAL '600 seconds', "
+            "next_poll_at = clock_timestamp() + INTERVAL '3600 seconds' WHERE id = :i",
+            {"i": purchase_id, "s": state, "c": checkout},
+        )
+
+    report = await _run(worker_id="pod-a")
+
+    assert report.stuck_over_age == 1
+    assert report.errors == 0 and report.claimed == 0
+    assert (await _get(paid))["state"] == "processing"
+    assert (await _get(waiting))["state"] == "awaiting_approval"
+
+
+async def test_a_disarmed_run_still_counts_reconciliation_on_postgres(monkeypatch, reap):
+    """Disarmed reconciliation must keep stuck-checkout monitoring active."""
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+
+    stuck = await _start()
+    await _raw(
+        "UPDATE reap_agentic_purchases SET state = 'processing', "
+        "state_entered_at = clock_timestamp() - INTERVAL '99999 seconds' WHERE id = :i",
+        {"i": stuck},
+    )
+
+    reads = []
+
+    async def _recorded(**kwargs):
+        # Recorded, not raised: the job's `except Exception` would swallow a raise into `errors`.
+        reads.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(ledger, "count_stuck_purchases", _recorded)
+    monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+
+    report = await _run()
+
+    assert len(reads) == 1, "disarmed reconciliation must retain monitoring"
+    assert report.skipped_disabled == 1
+    assert report.stuck_over_age == 0
+
+
+async def test_a_timed_out_count_leaves_no_statement_and_no_held_connection(monkeypatch, reap):
+    """WHAT `asyncio.wait_for` REALLY DOES TO A STATEMENT ON THIS DRIVER, measured rather than
+    assumed. Step 5's count runs under a timeout; a second backend takes an ACCESS EXCLUSIVE lock
+    on the table just before it, so the count genuinely blocks on the server.
+
+    When the timeout fires the read is cancelled and `wait_for` waits for it to unwind. With
+    db/database.py's cancellation-safe exit that means: asyncpg sends the server a cancel for
+    the statement, the connection goes back to the pool, and only then does the timeout surface.
+    So when the run returns there must be NO backend still running or waiting on the count, NO
+    pool connection checked out, and the `databases` Connection this context keeps must still
+    work ("Connection is already acquired" is what a half-released one says)."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+
+    await _start()
+    locker = await _raw_connection()
+    held = locker.transaction()
+    real_count = ledger.count_stuck_purchases
+    calls = []
+
+    async def _behind_a_lock(**kwargs):
+        calls.append(kwargs)
+        await held.start()
+        await locker.execute("LOCK TABLE reap_agentic_purchases IN ACCESS EXCLUSIVE MODE")
+        return await real_count(**kwargs)
+
+    monkeypatch.setattr(ledger, "count_stuck_purchases", _behind_a_lock)
+    monkeypatch.setattr(job, "STUCK_COUNT_TIMEOUT_SECONDS", 1)
+    loop = asyncio.get_running_loop()
+    try:
+        began = loop.time()
+        report = await _run(worker_id="pod-a")
+        elapsed = loop.time() - began
+
+        assert len(calls) == 1
+        assert report.stuck_over_age == job.NOT_COUNTED == -1
+        assert report.errors == sum(value == job.NOT_COUNTED for value in (report.stuck_over_age, report.contact_retention_blocked, report.checkout_needs_human)), "every timed-out independent count must be an error, never a silent -1"
+        assert report.advanced == 1
+        assert 1.0 <= elapsed < 10, f"the run took {elapsed:.1f}s around a 1s timeout"
+
+        still_there = await locker.fetch(
+            "SELECT pid, state, wait_event_type FROM pg_stat_activity "
+            "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+            "AND state <> 'idle' AND query ILIKE '%COUNT(*) AS stuck%'"
+        )
+        assert still_there == [], "the timed-out count is still running or waiting on the server"
+        pool = database._backend._pool
+        assert pool.get_idle_size() == pool.get_size(), "a pool connection is still checked out"
+    finally:
+        await held.rollback()
+        await locker.close()
+
+    # The lock is gone: the same context's Connection takes the count straight away.
+    assert await real_count(stuck_after_seconds=1800) == 0
+    assert await _all_claims() == {}
+
+
+@pytest.mark.parametrize("pause", ["off", "malformed_scope"])
+@pytest.mark.parametrize("queued_state", ["resolving", "needs_enrollment", "quoting"])
+async def test_create_pause_keeps_precheckout_queued_and_reconciles_exposed_checkout(monkeypatch, reap, pause, queued_state):
+    import db.reap_agentic_ledger as ledger
+    queued = await _start(buyer_ref="bref_queue_pause")
+    await _raw("UPDATE reap_agentic_purchases SET state=:state WHERE id=:id", {"state": queued_state, "id": queued})
+    exposed = await _start(buyer_ref="bref_checkout_pause")
+    await _raw("UPDATE reap_agentic_purchases SET state='awaiting_approval', reap_checkout_id='chk_paused', next_poll_at=:due WHERE id=:id",
+               {"id": exposed, "due": datetime.now(timezone.utc) - timedelta(seconds=1)})
+    if pause == "off":
+        monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "0")
+    else:
+        monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", "malformed")
+    report = await _run()
+    assert report.skipped_disabled == 1
+    assert (await ledger.get_purchase_internal(queued))["state"] == queued_state
+    assert (await ledger.get_purchase_internal(queued))["attempts"] == 0
+    assert (await ledger.get_purchase_internal(exposed))["state"] == "completed"
+    assert [name for name, _ in reap.calls] == ["get_checkout"]
+
+
+@pytest.mark.parametrize("queued_state", ["resolving", "needs_enrollment", "quoting"])
+async def test_narrowed_pilot_scope_prevents_queued_provider_work_but_reads_exposed_checkout(monkeypatch, reap, queued_state):
+    monkeypatch.setenv("PIVOTA_ENV", "staging")
+    import json
+    import db.reap_agentic_ledger as ledger
+    queued = await _start(buyer_ref="bref_queue_scope")
+    exposed = await _start(buyer_ref="bref_checkout_scope")
+    await _raw("UPDATE reap_agentic_purchases SET state=:state WHERE id=:id", {"state": queued_state, "id": queued})
+    await _raw("UPDATE reap_agentic_purchases SET state='awaiting_approval', reap_checkout_id='chk_scope', next_poll_at=:due WHERE id=:id",
+               {"id": exposed, "due": datetime.now(timezone.utc) - timedelta(seconds=1)})
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps({
+        "agent_ids": ["different-agent"], "merchant_domains": ["brand.example"], "markets": ["US"],
+        "product_keys": ["pk_1"], "quantities": [1]}))
+    await _run()
+    pending = await ledger.get_purchase_internal(queued)
+    assert pending["state"] == queued_state
+    assert pending["last_error_code"] is None
+    assert pending["attempts"] == 0
+    assert (await ledger.get_purchase_internal(exposed))["state"] == "completed"
+    assert [name for name, _ in reap.calls] == ["get_checkout"]
+
+
+async def test_matching_pilot_scope_allows_queued_provider_progress(monkeypatch, reap):
+    monkeypatch.setenv("PIVOTA_ENV", "staging")
+    import json
+    import db.reap_agentic_ledger as ledger
+    purchase = await _start()
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps({
+        "agent_ids": ["agent_one"], "merchant_domains": ["brand.example"], "markets": ["US"],
+        "product_keys": ["pk_1"], "quantities": [1]}))
+    await _run()
+    assert (await ledger.get_purchase_internal(purchase))["state"] == "needs_enrollment"
+    assert "create_enrollment" in [name for name, _ in reap.calls]

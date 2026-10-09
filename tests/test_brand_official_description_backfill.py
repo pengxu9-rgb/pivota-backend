@@ -1216,3 +1216,179 @@ def test_ONE_short_body_is_enough_to_buy_the_blurb(monkeypatch):
                               pdp_fallback=True)) == 0
     assert ("blurb", "jsmbeauty.sg") in fetched
     assert sorted(u["product_key"] for u in db.updates) == ["pk1", "pk2"]
+
+
+# -- (4) a storefront SEO template with each product's name dropped in (2026-09-28) -------------
+
+_PERFUMANIA = "Elevate your fragrance game with {} . Get this luxurious scent at a discounted price."
+_SENSA = ("Discover exclusive deals on {} at SensaBeauty. Shop now for the best prices and find your "
+          "perfect scent today.")
+
+
+def _templated(template, names):
+    return ({f"pk{i}": template.format(n) for i, n in enumerate(names)},
+            {f"pk{i}": n for i, n in enumerate(names)},
+            {f"pk{i}": f"h{i}" for i, n in enumerate(names)})
+
+
+@pytest.mark.parametrize("template", [_PERFUMANIA, _SENSA])
+def test_a_title_template_across_unrelated_pages_is_dropped(template):
+    """perfumania.com 6 of 6 sampled: the name differs on every page, so plain repetition (2)
+    never fires, and the remainder is long, so the title echo (3) passes it."""
+    cands, titles, handles = _templated(template, ["CH Birds of Paradise Cologne",
+                                                   "Pride Art of Arabia I Cologne",
+                                                   "Eclat De Nuit EDP"])
+    for v, t in zip(cands.values(), titles.values()):
+        assert not bf._is_title_echo(v, t)  # mechanism 3 alone would admit it
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles, handles=handles) == {}
+
+
+def test_real_copy_that_names_its_product_survives_beside_a_template():
+    """sensabeauty.com: most pages carry real scent notes that also contain the product name."""
+    cands, titles, handles = _templated(_SENSA, ["Eclat De Nuit EDP", "Club De Nuit EDT"])
+    real = ("Lattafa Najdia Tribute EDP delivers lively freshness with a smooth masculine trail, a "
+            "versatile fragrance for workdays and weekends.")
+    cands["pkr"], titles["pkr"], handles["pkr"] = real, "Najdia Tribute EDP", "najdia"
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles, handles=handles) == {"pkr": real}
+
+
+def test_a_retailer_wrapper_around_a_real_sentence_is_not_a_template():
+    """bluemercury.com: "Shop {brand} {title} on Bluemercury. <the product's own sentence>. Enjoy
+    free samples ..." -- the wrapper repeats, the middle does not, so the cut-out value differs."""
+    a = ("Shop Clinique Take The Day Off Cleansing Balm on Bluemercury. Our #1 makeup remover in a "
+         "silky balm formula. Enjoy free samples with all orders.")
+    b = ("Shop Aesop Eleos Nourishing Body Cleanser on Bluemercury. A gentle cream cleanser, ideal "
+         "for dry skin. Enjoy free samples with all orders.")
+    titles = {"a": "Take The Day Off Cleansing Balm", "b": "Eleos Nourishing Body Cleanser"}
+    kept = bf.drop_shared_boilerplate({"a": a, "b": b}, _BLURB, titles=titles, handles={"a": "a", "b": "b"})
+    assert kept == {"a": a, "b": b}
+
+
+def test_a_template_on_ONE_page_is_not_yet_a_template():
+    """Repetition is the evidence; a single page has none (the blurb and echo checks still apply)."""
+    cands, titles, handles = _templated(_PERFUMANIA, ["CH Birds of Paradise Cologne"])
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles, handles=handles) == cands
+
+
+def test_a_template_shared_only_by_editions_of_one_product_is_that_products_copy():
+    """The same exception as mechanism 2: a base product and its bracketed edition."""
+    base, edition = "New Classic Glaze Lipstick", "[Special Set] New Classic Glaze Lipstick"
+    tpl = "{} glides on in one swipe with a glassy finish that lasts all day without drying lips."
+    cands = {"a": tpl.format(base), "b": tpl.format(edition)}
+    kept = bf.drop_shared_boilerplate(cands, _BLURB, titles={"a": base, "b": edition},
+                                      handles={"a": "new-classic-glaze-lipstick", "b": "new-classic-glaze-lipstick-special-set"})
+    assert "a" in kept
+
+
+def test_two_rows_behind_ONE_page_are_not_a_template():
+    """The repetition unit is the product page (handles), as for mechanism 2."""
+    cands = {"pk1": _PERFUMANIA.format("CH Birds of Paradise Cologne"),
+             "pk2": _PERFUMANIA.format("CH Birds of Paradise Cologne")}
+    titles = {"pk1": "CH Birds of Paradise Cologne", "pk2": "CH Birds of Paradise Cologne"}
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles,
+                                      handles={"pk1": "same", "pk2": "same"}) == cands
+
+
+def test_a_suppressed_row_is_never_in_the_population():
+    """Filling a withdrawn row would move it to 'published' (mintree.us: 160 of 160 suppressed)."""
+    assert "suppressed_at IS NULL" in bf._SELECT_ROWS
+
+
+
+def test_a_sibling_row_whose_title_is_not_in_the_text_cannot_carry_the_template():
+    """Review #2429 A: two rows behind one page; only one row's title appears in the value. The
+    value is judged against every name its product goes by, as mechanism 3 is."""
+    cands = {"pk1": _PERFUMANIA.format("CH Birds of Paradise Cologne"),
+             "pk2": _PERFUMANIA.format("CH Birds of Paradise Cologne"),
+             "o1": _PERFUMANIA.format("Pride Art of Arabia I Cologne"),
+             "o2": _PERFUMANIA.format("Eclat De Nuit EDP")}
+    titles = {"pk1": "CH Birds of Paradise Cologne", "pk2": "Carolina Herrera CH Birds of Paradise Cologne",
+              "o1": "Pride Art of Arabia I Cologne", "o2": "Eclat De Nuit EDP"}
+    handles = {"pk1": "ch-birds", "pk2": "ch-birds", "o1": "pride", "o2": "eclat"}
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles, handles=handles) == {}
+
+
+def test_an_edition_whose_title_is_not_in_the_text_cannot_carry_the_template():
+    """Review #2429 B: a base and its [Special Set] edition share a value naming the base; an
+    unrelated page shares the template. Mechanism 2 admits the pair as one family; 4 must not."""
+    base, edition = "New Classic Glaze Lipstick", "[Special Set] New Classic Glaze Lipstick"
+    cands = {"a": _PERFUMANIA.format(base), "b": _PERFUMANIA.format(base),
+             "z": _PERFUMANIA.format("Pride Art of Arabia I Cologne")}
+    titles = {"a": base, "b": edition, "z": "Pride Art of Arabia I Cologne"}
+    handles = {"a": "new-classic-glaze-lipstick", "b": "new-classic-glaze-lipstick-special-set", "z": "pride"}
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=titles, handles=handles) == {}
+
+
+def test_the_storefront_title_catches_a_template_the_catalog_title_misses():
+    """Review #2429 D: the catalog row's title carries a size the theme does not render; the
+    storefront's own title (from /products.json) is the string the template interpolates."""
+    cands, store, handles = _templated(_PERFUMANIA, ["CH Birds of Paradise Cologne", "Pride Art of Arabia I Cologne"])
+    catalog = {pk: f"{t} 3.4 oz" for pk, t in store.items()}
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=catalog, handles=handles) == cands  # blind
+    assert bf.drop_shared_boilerplate(cands, _BLURB, titles=catalog, handles=handles, store_titles=store) == {}
+
+
+def test_the_feed_loader_keeps_the_storefront_titles(monkeypatch):
+    feed = [{"handle": "h1", "title": "CH Birds of Paradise Cologne", "body_html": "<p>x</p>"},
+            {"handle": "h2", "body_html": "<p>y</p>"}]
+
+    async def _feed(domain, max_products=None, **k):
+        return feed
+
+    monkeypatch.setattr(bf, "fetch_shopify_products", _feed)
+    body_map, _ = asyncio.run(bf._load_body_map("perfumania.com", 800))
+    assert body_map == {"h1": "x", "h2": "y"}
+    assert body_map.titles == {"h1": "CH Birds of Paradise Cologne"}
+
+
+def test_the_write_never_publishes_a_row_suppressed_mid_run():
+    """Review #2429: a paced --pdp-fallback run is long; the UPDATE re-checks suppression."""
+    assert "suppressed_at IS NULL" in bf._UPDATE_ROW
+
+
+
+def test_the_verdict_does_not_depend_on_candidate_order_with_store_titles():
+    """Review #2429 (a1): a base, its sized sibling row and a [Special Set] page share one value.
+    Every ordering must reach the same verdict (the #2097 determinism invariant)."""
+    import itertools
+
+    tpl = "{} glides on in one swipe with a glassy finish that lasts all day without drying lips."
+    rows = [("p1", "glaze-lip", "Glaze Lipstick"), ("p2", "glaze-lip", "Glaze Lipstick 3.5g"),
+            ("p3", "holiday-glaze-duo", "[Special Set] Glaze Lipstick")]
+    # Both shapes: one identical value on every page (mechanism 2's census), and each page naming
+    # itself so only the value with its name cut out repeats (mechanism 4's census).
+    shapes = (lambda pk, t: tpl.format("Glaze Lipstick"),
+              lambda pk, t: tpl.format(t if pk == "p3" else "Glaze Lipstick"))
+    for shape, store_titles in itertools.product(shapes, (None, {
+            "p1": "Glaze Lipstick", "p2": "Glaze Lipstick", "p3": "[Special Set] Glaze Lipstick"})):
+        verdicts = set()
+        for perm in itertools.permutations(rows):
+            cands = {pk: shape(pk, t) for pk, _h, t in perm}
+            kept = bf.drop_shared_boilerplate(
+                cands, _BLURB, titles={pk: t for pk, _h, t in perm},
+                handles={pk: h for pk, h, _t in perm}, store_titles=store_titles)
+            verdicts.add(tuple(sorted(kept)))
+        assert len(verdicts) == 1, (store_titles, verdicts)
+
+
+def test_run_hands_the_storefront_titles_to_the_boilerplate_census(monkeypatch):
+    """Review #2429: the loader keeps the store titles and the census uses them; run() must pass
+    them between the two. Only the STORE title reveals this template."""
+    rows = [_row("pk1", "ck1", "ch-birds", title="CH Birds of Paradise Cologne 3.4 oz"),
+            _row("pk2", "ck2", "pride", title="Pride Art of Arabia I Cologne 3.4 oz")]
+    for r in rows:
+        r["canonical_url"] = r["canonical_url"].replace("jsmbeauty.sg", "perfumania.com")
+        r["source_domain"] = "perfumania.com"
+    body = bf._FeedBodies({"ch-birds": "tiny", "pride": "tiny"})
+    body.titles = {"ch-birds": "CH Birds of Paradise Cologne", "pride": "Pride Art of Arabia I Cologne"}
+    db, refreshed, _fetched = _harness(
+        monkeypatch, rows, body_map=body,
+        pdp={"ch-birds": _PERFUMANIA.format("CH Birds of Paradise Cologne"),
+             "pride": _PERFUMANIA.format("Pride Art of Arabia I Cologne")})
+
+    async def _load(domain, max_products):
+        return body, False
+
+    monkeypatch.setattr(bf, "_load_body_map", _load)
+    asyncio.run(bf.run(True, ["perfumania.com"], 800, pdp_fallback=True))
+    assert db.updates == []

@@ -121,7 +121,17 @@ async def test_get_review_summary_preview_items_include_media_when_available(
     assert first["title"] == "Amazing set"
     assert first["has_media"] is True
     assert first["media_count"] == 2
-    assert first["media"] == [{"type": "image", "url": "/signed/pub_9311"}]
+    assert first["media"][0]["type"] == "image"
+    assert first["media"][0]["url"] == "/signed/pub_9311"
+    assert first["media"][0]["role"] == "customer_review"
+    assert first["media"][0]["provenance"] == {
+        "source_type": "customer_review", "review_id": "9311", "source_record_id": "pub_9311",
+        "verification_status": "review_linked", "moderation_status": "active",
+        "merchant_id": "m_demo", "scope": "unknown",
+    }
+    assert summary["availability_state"] == "ready"
+    assert summary["review_scope"] == "linked_review_store"
+    assert "r.product_key" in captured["preview_query"]
 
     second = preview_items[1]
     assert second["review_id"] == 9310
@@ -256,3 +266,32 @@ async def test_get_review_summary_runs_independent_reads_concurrently(
 
     # Head wave gathers 3 coroutines; scope wave gathers 3. Sequential code => max 1.
     assert max_active >= 2, f"expected concurrent DB reads, max in-flight was {max_active}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_listing,group_id,expected_scope", [(True, None, "exact_item"), (False, 42, "review_group"), (False, None, "unknown")])
+async def test_review_media_preserves_exact_identity_without_group_family_aliasing(monkeypatch, same_listing, group_id, expected_scope):
+    product_key = reviews_service.build_product_key(merchant_id="m_demo", platform="shopify", platform_product_id="p_demo")
+    rows = [{"id": 88, "merchant_id": "m_demo", "product_key": product_key if same_listing else "different_product",
+        "group_id": group_id, "rating": 5, "created_at": datetime.now(timezone.utc), "media_count": 1}]
+    _install_summary_stubs(monkeypatch, preview_rows=rows, preview_media_rows=[{
+        "id": 89, "review_id": 88, "type": "image", "public_id": "asset_89", "status": "active"}])
+    summary = await reviews_service.get_review_summary_for_sku(merchant_id="m_demo", platform="shopify", platform_product_id="p_demo", variant_id=None)
+    provenance = summary["preview_items"][0]["media"][0]["provenance"]
+    assert provenance["scope"] == expected_scope
+    assert "review_family_id" not in provenance
+    assert "source_observed_at" not in provenance  # review creation is not source capture
+    if same_listing:
+        assert provenance["product_id"] == "p_demo"
+    elif group_id:
+        assert provenance["review_group_id"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_missing_review_store_read_is_not_reported_as_empty(monkeypatch):
+    _install_summary_stubs(monkeypatch, preview_rows=[], preview_media_rows=[])
+    async def broken(*args, **kwargs):
+        raise RuntimeError("review store unavailable")
+    monkeypatch.setattr(reviews_service.database, "fetch_one", broken)
+    with pytest.raises(RuntimeError, match="review store unavailable"):
+        await reviews_service.get_review_summary_for_sku(merchant_id="m_demo", platform="shopify", platform_product_id="p_demo", variant_id=None)

@@ -94,6 +94,22 @@ physical object.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
+
+class ProviderOperationStopped(RuntimeError):
+    """A worker stop was raised before a new transport operation."""
+
+
+# Worker-scoped: direct clients retain their existing behavior; child resolver calls inherit it.
+worker_provider_permission = ContextVar("reap_worker_provider_permission", default=None)
+
+
+def _check_worker_provider_permission():
+    permission = worker_provider_permission.get()
+    if permission is not None and not permission():
+        raise ProviderOperationStopped("reconciliation_disabled")
+
 import hashlib
 import json
 import logging
@@ -107,7 +123,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 # Stdlib-only, like this module; the structural check `build_cart_link_quote_request` applies.
-from services.reap_cart_link import cart_link_line
+from services.reap_cart_link import cart_link_host, cart_link_line
 # The `pivota` logger (stdlib-only too) has its own stdout handler. Used for the sandbox-simulate
 # dial so its lines land WITH a level and logger prefix, and so INFO would land too. With no root
 # logging config, a module logger's WARNING still reaches stderr via Python's last-resort handler,
@@ -370,8 +386,8 @@ def validate_base_url(raw: Optional[str] = None) -> str:
 # FAILED the un-simulated sandbox returns. That is what makes our own rail runnable end to end.
 #
 # It must never reach production, however an operator sets the environment. So the header is
-# emitted only when BOTH the dial is the exact string and the base URL's host is one of the two
-# sandbox hosts, compared as an exact string. `ALLOWED_HOST_SUFFIXES` is NOT reused for this: it
+# emitted only when BOTH the dial is the exact string and the base URL's host is one of Reap's
+# sandbox hosts (`REAP_SANDBOX_HOSTS`), compared as an exact string. `ALLOWED_HOST_SUFFIXES` is NOT reused for this: it
 # admits `prod.api.reap.global` by design. Reap rejecting the header in production is the second
 # lock, not the first.
 
@@ -381,9 +397,24 @@ SIMULATE_CHECKOUT_HEADER = "X-Simulate-Checkout"
 #: The ONLY accepted dial value, and the only value the spec admits for the header. Case-sensitive
 #: and not coerced: `completed`, `1`, `true` are ignored rather than read as "on".
 SIMULATE_CHECKOUT_VALUE = "COMPLETED"
-#: Exact hostnames, from the spec's `servers` block. Exact, not suffix: `x.sandbox.api.reap.global`
-#: is not one of them, and `prod.api.reap.global` must never be.
-SIMULATE_CHECKOUT_SANDBOX_HOSTS = frozenset({"sandbox.api.reap.global", "mx.sandbox.api.reap.global"})
+#: Reap's SANDBOX hosts: the ONE list. Exact hostnames, from the spec's `servers` block
+#: (tests/fixtures/reap_openapi_agentic_2026_09_28.json: sg.sandbox, mx.sandbox, and the
+#: `sandbox` alias of sg.sandbox; the three `prod` entries are the production servers). Exact, not
+#: suffix: `x.sandbox.api.reap.global` is not one of them, and no `prod` host may ever be.
+#: tests/test_reap_agentic_client_simulate_checkout.py derives this set from that fixture, so a
+#: servers change fails a test instead of drifting.
+#:
+#: Two gates read it, and they must agree, so there is deliberately no second list:
+#:   * `simulate_checkout_header` — the sandbox-only `X-Simulate-Checkout` header;
+#:   * `is_sandbox_base_url` — outside production the poller calls the partner only here.
+#: sg.sandbox was verified live for externalCheckout (cart-link) quotes on 2026-09-28.
+REAP_SANDBOX_HOSTS = frozenset({
+    "sandbox.api.reap.global",
+    "sg.sandbox.api.reap.global",
+    "mx.sandbox.api.reap.global",
+})
+#: The simulate header's host set IS the sandbox set (an alias, not a copy).
+SIMULATE_CHECKOUT_SANDBOX_HOSTS = REAP_SANDBOX_HOSTS
 
 
 def simulate_checkout_header(
@@ -427,6 +458,24 @@ def simulate_checkout_header(
     return {SIMULATE_CHECKOUT_HEADER: SIMULATE_CHECKOUT_VALUE}
 
 
+def is_sandbox_base_url(raw: Optional[str] = None) -> bool:
+    """True only when the base URL (`raw`, else REAP_API_BASE_URL) passes `validate_base_url` AND
+    its hostname is EXACTLY one of `REAP_SANDBOX_HOSTS`. Never raises.
+
+    The poller's outside-production guard (jobs/reap_agentic_purchase_poll.py): staging is a
+    restored copy of production, so an armed staging poller pointed at `prod.api.reap.global`
+    would drive production buyers' rows against the real rail.
+    """
+    url = raw if raw is not None else base_url()
+    if not url or not url.strip():
+        return False
+    try:
+        host = (urlparse(validate_base_url(url.strip())).hostname or "").lower()
+    except ReapConfigError:
+        return False
+    return host in REAP_SANDBOX_HOSTS
+
+
 #: Reap retains an idempotency key for 24 h, but a quote's `expiresAt` is roughly 5 minutes. A
 #: key derived from the body ALONE therefore replays a long-dead quote to the same cart the next
 #: day -- the caller gets a 200 carrying an expired `expiresAt` and prices that may have moved.
@@ -434,6 +483,8 @@ def simulate_checkout_header(
 #: does not mint a second quote) without the one we do not (a request tomorrow is not a retry).
 #: Four minutes, so a replayed key can only ever return a quote that is still inside its window.
 _IDEMPOTENCY_BUCKET_S = 240
+#: Public name for callers that must wait a quote replay out (see `_checkout_from_quote`).
+QUOTE_IDEMPOTENCY_BUCKET_S = _IDEMPOTENCY_BUCKET_S
 
 
 def idempotency_key(
@@ -1646,11 +1697,54 @@ def build_shipping_address(address: Optional[Dict[str, Any]]) -> Optional[Dict[s
     return out
 
 
+#: `offerCode`'s published bounds (2026-09-28 spec, both quote branches): a string of 1..128
+#: characters matching `\S` -- at least one non-whitespace character.
+MAX_OFFER_CODE_LENGTH = 128
+_OFFER_CODE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+class OfferCodeInvalid(ReapRequestError):
+    """An offer code that cannot be sent at all. Raised before egress; the message never
+    carries the code."""
+
+    code = "offer_code_malformed"
+
+
+def validate_offer_code(value: Any) -> Optional[str]:
+    """THE offer-code rule, and the only one: the route, the purchase service and the ledger
+    all call this function object (one rule, one function).
+
+    None (or absent) means "no code" and returns None. Anything else must be a `str` of
+    1..`MAX_OFFER_CODE_LENGTH` characters containing at least one non-whitespace character
+    (the spec's `minLength: 1, maxLength: 128, pattern: \\S`), and carrying no control
+    character -- a stricter rule than the spec's, because a code is stored on the purchase row
+    and read back to the buyer, and nobody types a control character into a coupon field.
+
+    RETURNED AS GIVEN. Not stripped, not upper-cased: Reap matched `peachie20` and `PEACHIE20`
+    identically live (2026-09-28), so case is the merchant's business and not ours to rewrite,
+    and a code we altered would be a code the buyer did not enter. An empty string is REFUSED
+    rather than read as "no code": a door that sent `""` meant something, and it was not
+    "nothing".
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise OfferCodeInvalid(f"offer_code must be a string, got {type(value).__name__}")
+    if not value.strip():
+        raise OfferCodeInvalid("offer_code must contain a non-whitespace character")
+    if len(value) > MAX_OFFER_CODE_LENGTH:
+        raise OfferCodeInvalid(f"offer_code must be at most {MAX_OFFER_CODE_LENGTH} characters")
+    if _OFFER_CODE_CONTROL_RE.search(value):
+        raise OfferCodeInvalid("offer_code contains a control character")
+    return value
+
+
 def build_quote_request(
     *,
     items: Sequence[Dict[str, Any]],
     email: str,
     shipping_address: Optional[Dict[str, Any]] = None,
+    offer_code: Optional[str] = None,
 ) -> Dict[str, Any]:
     """`POST /agentic/quotes`. Required: `items`, `email`.
 
@@ -1679,6 +1773,12 @@ def build_quote_request(
     shipping = build_shipping_address(shipping_address)
     if shipping:
         body["shippingAddress"] = shipping
+    # `offerCode` is on BOTH quote branches since the 2026-09-28 spec. It is part of the body, so
+    # it is part of the quote's Idempotency-Key material (`idempotency_material` keys a quote on
+    # its whole body): a retry WITHOUT the code is a different request, not a replay.
+    code = validate_offer_code(offer_code)
+    if code is not None:
+        body["offerCode"] = code
     return body
 
 
@@ -1710,13 +1810,76 @@ class ReapResponse:
     #: create means "send the buyer back to the hosted card page", `AGENTIC_RESOURCE_NOT_FOUND`
     #: means "this id is gone, start again", and a bare `reap_status_400` collapses both into
     #: "something went wrong" and leaves a buyer stuck. So exactly two scalar fields are
-    #: extracted, both are shape-checked against `^[A-Z_]{3,64}$` before being kept, and
+    #: extracted, both are shape-checked against `_ERROR_CODE_RE` before being kept, and
     #: everything else in the body -- including `error.message`, which is free text and can echo
     #: anything -- is discarded unread.
     error_code: Optional[str] = None
     #: `error.detail.code`. Where the specific reason lives: 400 AGENTIC_REQUEST_REJECTED with
     #: `detail.code = ENROLLMENT_NOT_ACTIVE` is the failure seen live.
     error_detail_code: Optional[str] = None
+    #: `error.detail.reason`, same shape check. The QUOTE leg spells its specific reason here, not
+    #: at `detail.code`: CHECKOUT_URL_INVALID carries NOT_FOUND | EXPIRED | INVALID |
+    #: MERCHANT_CONTEXT_UNVERIFIED, QUOTE_UNFULFILLABLE carries INVALID_PHONE |
+    #: STATE_OR_PROVINCE_REQUIRED | ITEMS_UNSHIPPABLE | ADDRESS_LINE_2_REQUIRED (2026-09-28 spec).
+    #: `detail.message` beside it is free text and is never read.
+    error_detail_reason: Optional[str] = None
+    #: The `Retry-After` header of a failed response, in whole seconds, bounded to
+    #: [0, `MAX_RETRY_AFTER_S`]; None when absent or unparseable. RECORDED, NEVER SLEPT ON: the
+    #: caller is a poll step, and waiting inside it holds a lease and a worker. The spec sends it
+    #: with 503 QUOTE_TEMPORARILY_UNAVAILABLE and CHECKOUT_TEMPORARILY_UNAVAILABLE.
+    retry_after_seconds: Optional[int] = None
+    #: The validated `id` of a checkout the partner reports it CREATED, carried out of a 200 that
+    #: `_refuse_unsafe_hosted_url` refused (`error="hosted_url_not_allowed"`). Set only by
+    #: `create_checkout`, and only when `_path_id` accepts it. The refusal still drops `.data`, so
+    #: the hosted URL is never here; this is the one value from that body that names a real
+    #: checkout, and dropping it dropped the only pointer to a resource that exists at Reap.
+    refused_checkout_id: Optional[str] = None
+
+
+class DispatchProbe:
+    """Whether a create's request PROVABLY never left this process. Write-once, client-owned.
+
+    `create_checkout` settles it on every return and on every exception it raises.
+    `not_dispatched` is True only if `_post` never reached `mark_sending`, which sits after the
+    last local stop (the permission re-check, the header build) and immediately before the
+    transport call. From that line on any byte may be on the wire, and nothing turns the answer
+    back. A probe that is never settled (a fake client, a cancellation) reads
+    `not_dispatched=False`: unknown is never negative proof.
+    """
+
+    __slots__ = ("_sending", "_settled", "not_dispatched", "reason")
+
+    def __init__(self) -> None:
+        self._sending = False
+        self._settled = False
+        self.not_dispatched = False
+        self.reason: Optional[str] = None
+
+    def mark_sending(self) -> None:
+        self._sending = True
+        self.not_dispatched = False
+        self.reason = None
+
+    def settle(self, outcome: Any) -> None:
+        if self._settled:
+            return
+        self._settled = True
+        if not self._sending:
+            self.not_dispatched = True
+            self.reason = _not_dispatched_reason(outcome)
+
+
+def _not_dispatched_reason(outcome: Any) -> str:
+    """A bounded local vocabulary for the dispatch journal; never an exception message."""
+    if isinstance(outcome, ProviderOperationStopped):
+        return "provider_operation_stopped"
+    if isinstance(outcome, ReapConfigError):
+        return "reap_config_error"
+    if isinstance(outcome, ReapRequestError):
+        return "reap_request_error"
+    if isinstance(outcome, ReapResponse) and outcome.error == "reap_client_not_configured":
+        return "reap_client_not_configured"
+    return "local_error"
 
 
 async def _read_bounded(response: Any, *, max_bytes: int = MAX_RESPONSE_BYTES) -> Optional[bytes]:
@@ -1777,6 +1940,7 @@ async def _post(
     timeout_seconds: Optional[float] = None,
     idempotency_extra: Optional[Dict[str, Any]] = None,
     extra_headers: Optional[Dict[str, str]] = None,
+    dispatch_probe: Optional[DispatchProbe] = None,
 ) -> ReapResponse:
     """One POST. Returns a result; raises only on misconfiguration.
 
@@ -1785,6 +1949,7 @@ async def _post(
     wrong host or a missing key is an operator error that must be visible rather than degrade
     quietly into "Reap is unavailable" on every request forever.
     """
+    _check_worker_provider_permission()
     if not is_configured():
         return ReapResponse(ok=False, error="reap_client_not_configured")
     # The allowlist is enforced HERE, on the call, and not only in a helper an operator might run.
@@ -1814,11 +1979,18 @@ async def _post(
             # while having read all of it, which is the part that costs. `stream` plus
             # `_read_bounded` makes the bound real: DECODED bytes are counted as they arrive, in
             # steps of at most 64 KiB, and the read is abandoned once the cap is passed.
-            async with client.stream(
-                "POST", f"{url}{path}", json=body,
-                headers=_headers(key, path, body, idempotency_extra=idempotency_extra,
-                                 extra_headers=extra_headers),
-            ) as resp:
+            # Opening the client is asynchronous; the stop may have changed
+            # since this operation entered. Check again at the dispatch boundary.
+            _check_worker_provider_permission()
+            headers = _headers(key, path, body, idempotency_extra=idempotency_extra,
+                               extra_headers=extra_headers)
+            # THE DISPATCH LINE. Everything above is local and can stop without a byte sent;
+            # everything below may have reached Reap. Nothing that can refuse locally may move
+            # below it, and nothing that can send may move above it -- `DispatchProbe` turns
+            # "never reached this line" into the journal's proof that no checkout was created.
+            if dispatch_probe is not None:
+                dispatch_probe.mark_sending()
+            async with client.stream("POST", f"{url}{path}", json=body, headers=headers) as resp:
                 if resp.status_code >= 400:
                     # The response BODY is deliberately not logged or returned to a serving
                     # caller: a partner's error payload can echo the request, and the request can
@@ -1832,21 +2004,32 @@ async def _post(
                     # same cap as a success body and there is still exactly ONE bound per
                     # response; an oversized failure yields None and therefore no codes, which is
                     # the right way round.
-                    code, detail_code = (
+                    code, detail_code, detail_reason = _codes_for(
+                        path,
                         _error_codes(await _read_bounded(resp))
-                        if _reads_error_codes(path) else (None, None)
+                        if _reads_error_codes(path) else (None, None, None),
                     )
-                    logger.warning("reap %s rejected: status=%s code=%s detail=%s",
-                                   path, resp.status_code, code, detail_code)
+                    retry_after = _retry_after_seconds(
+                        (resp.headers or {}).get("retry-after"))
+                    _log_rejection("reap", path, resp.status_code, code, detail_code,
+                                   detail_reason)
                     return ReapResponse(
                         ok=False, status=resp.status_code,
                         error=f"reap_status_{resp.status_code}",
                         error_code=code, error_detail_code=detail_code,
+                        error_detail_reason=detail_reason,
+                        retry_after_seconds=retry_after,
+                        # A 503 that NAMES itself temporary is not the non-UCP-merchant signal:
+                        # QUOTE_/CHECKOUT_TEMPORARILY_UNAVAILABLE say "try again", with a
+                        # Retry-After, and must not be read as "this merchant cannot complete".
                         merchant_probably_not_completable=(
-                            resp.status_code == 503 and path in _SLOW_PATHS),
+                            resp.status_code == 503 and path in _SLOW_PATHS
+                            and code not in TEMPORARY_UNAVAILABLE_CODES),
                     )
                 raw = await _read_bounded(resp)
                 status = resp.status_code
+    except ProviderOperationStopped:
+        raise
     except Exception as exc:  # noqa: BLE001
         # The exception TYPE only. Never the request: the body can carry a shipping address and
         # the headers carry the key, and an exception string is the easiest place for either to
@@ -1885,7 +2068,12 @@ async def _post(
 #: that body -- `error.message`, echoed request fields, a partner's stack trace -- is discarded
 #: unread. Bounded and charset-restricted so that a value from a partner cannot become a long
 #: string of arbitrary content in our logs or in a response of ours.
-_ERROR_CODE_RE = re.compile(r"^[A-Z_]{3,64}$")
+#:
+#: DIGITS ADMITTED AFTER THE FIRST CHARACTER since 2026-09-28: the spec's quote reason
+#: `ADDRESS_LINE_2_REQUIRED` failed `^[A-Z_]{3,64}$` and was silently dropped. A digit cannot
+#: spell an address line any more than a letter can; the bound and the no-lowercase, no-space,
+#: no-punctuation rules are what keep this field from being a content channel.
+_ERROR_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
 
 #: The ONLY paths whose failure body is read at all. Everywhere else a 4xx body is never pulled
 #: off the socket.
@@ -1904,7 +2092,26 @@ _ERROR_CODE_RE = re.compile(r"^[A-Z_]{3,64}$")
 #: two we do read are the two with a state machine and nothing much to leak.
 #:
 #: Prefix-matched so the reads (`/agentic/enrollments/{id}`) are covered with the creates.
-_ERROR_CODE_PATH_PREFIXES = ("/agentic/enrollments", "/agentic/checkouts")
+#:
+#: THE QUOTE JOINED THEM ON 2026-09-28, and the argument above had to be re-run rather than
+#: waved through, because the quote is the leg whose REQUEST carries the buyer's address. What
+#: changed is that the quote now has a state machine too: an offer code that Reap refuses
+#: (400 OFFER_CODE_INVALID / OFFER_CODE_EXPIRED, ~15 s after the merchant round trip) has to be
+#: told apart from every other 400 so the purchase can re-quote WITHOUT the code, and a
+#: QUOTE_TEMPORARILY_UNAVAILABLE 503 has to be told apart from the non-UCP-merchant 503 so it is
+#: retried rather than refused. A bare `reap_status_400` cannot drive either.
+#:
+#: What it costs is bounded by `_error_codes`, not by this list: the body is read through
+#: `_read_bounded` (one cap), and exactly three scalars survive -- `error.code`,
+#: `error.detail.code`, `error.detail.reason` -- each matched against `_ERROR_CODE_RE` before it
+#: is kept. An echoed address cannot pass that shape, `error.message` and `detail.message` are
+#: never read, and nothing from the body is logged or returned except those three codes. The
+#: product endpoints (search / details / variant) are still never read.
+#:
+#: `/agentic/quotes/{id}/shipping-option` is covered by the same segment match; its 400/409
+#: codes (OFFER_CODE_*, QUOTE_REPLACEMENT_REQUIRED, QUOTE_NOT_MUTABLE) are the same kind of
+#: state-machine signal.
+_ERROR_CODE_PATH_PREFIXES = ("/agentic/enrollments", "/agentic/checkouts", "/agentic/quotes")
 
 
 def _reads_error_codes(path: str) -> bool:
@@ -1920,8 +2127,9 @@ def _reads_error_codes(path: str) -> bool:
     return any(text == p or text.startswith(p + "/") for p in _ERROR_CODE_PATH_PREFIXES)
 
 
-def _error_codes(raw: Optional[bytes]) -> Tuple[Optional[str], Optional[str]]:
-    """`(error.code, error.detail.code)` from an already-bounded body, or `(None, None)`.
+def _error_codes(raw: Optional[bytes]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """`(error.code, error.detail.code, error.detail.reason)` from an already-bounded body, or
+    `(None, None, None)`.
 
     TAKES BYTES, NOT A RESPONSE, and that is the point of the signature. The size bound lives in
     `_read_bounded` and nowhere else: this function is handed what that helper returned, so
@@ -1929,7 +2137,7 @@ def _error_codes(raw: Optional[bytes]) -> Tuple[Optional[str], Optional[str]]:
     one. `None` in means the body was over the cap, which means no codes -- we would rather lose
     a machine-readable code than read an unbounded body to find it.
 
-    Everything else in the body is discarded unread. The two values that survive are matched
+    Everything else in the body is discarded unread. The three values that survive are matched
     against `_ERROR_CODE_RE` first, so a body that puts an address (or anything else) where a
     code belongs yields None rather than a leak. `error.message` is free text and is never read.
     """
@@ -1939,22 +2147,100 @@ def _error_codes(raw: Optional[bytes]) -> Tuple[Optional[str], Optional[str]]:
     # exception handler; it is pinned by `test_the_error_code_reader_has_no_codes_without_bytes`
     # rather than by a mutant, because a mutant that deletes it changes no behaviour at all.
     if not raw:
-        return None, None
+        return None, None, None
     try:
         payload = json.loads(raw.decode("utf-8"))
     except Exception:  # noqa: BLE001
-        return None, None
+        return None, None, None
     if not isinstance(payload, dict):
-        return None, None
+        return None, None, None
     error = payload.get("error")
     if not isinstance(error, dict):
-        return None, None
+        return None, None, None
 
     def _code(value: Any) -> Optional[str]:
         return value if isinstance(value, str) and _ERROR_CODE_RE.fullmatch(value) else None
 
     detail = error.get("detail")
-    return _code(error.get("code")), _code(detail.get("code") if isinstance(detail, dict) else None)
+    detail = detail if isinstance(detail, dict) else {}
+    return _code(error.get("code")), _code(detail.get("code")), _code(detail.get("reason"))
+
+
+def _is_quote_path(path: str) -> bool:
+    text = str(path or "")
+    return text == "/agentic/quotes" or text.startswith("/agentic/quotes/")
+
+
+#: Stand-in for a quote-leg `detail.reason` that passed the shape check but is not one the spec
+#: enumerates. The value itself is dropped (see `_codes_for`).
+UNRECOGNISED_REASON = "OTHER"
+
+
+def _codes_for(
+    path: str, codes: Tuple[Optional[str], Optional[str], Optional[str]]
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """What a failure body's codes may be KEPT as, per path.
+
+    ON THE QUOTE LEG, AN ALLOWLIST, NOT A SHAPE (review of #2425). The quote request carries the
+    buyer's address, and `_ERROR_CODE_RE` cannot tell `INVALID_PHONE` from an echoed
+    `SINGAPORE`, `SW1A1AA` or `JOHN_DOE` -- all upper-case tokens. So on `/agentic/quotes*` an
+    `error.code` is kept only if it is one of `QUOTE_REJECTION_KINDS`, `detail.code` (which the
+    quote spec does not define) is never kept, and `detail.reason` only if it is one of the
+    reasons the spec enumerates -- any other reason becomes `UNRECOGNISED_REASON`, so a new
+    partner reason is visible as "something we have not reviewed" without its text. The
+    enrollment and checkout legs, whose requests carry no address, keep the shape rule.
+    """
+    code, detail_code, reason = codes
+    if not _is_quote_path(path):
+        return code, detail_code, reason
+    known_reasons = frozenset().union(*QUOTE_REJECTION_REASONS.values())
+    return (
+        code if code in QUOTE_REJECTION_KINDS else None,
+        None,
+        (reason if reason in known_reasons else UNRECOGNISED_REASON) if reason else None,
+    )
+
+
+def _log_rejection(verb: str, path: str, status: Any, code: Any, detail: Any, reason: Any) -> None:
+    """One warning per failed partner call. On the quote leg only the CLASSIFIED code is logged
+    (`kind[:reason]`, our vocabulary, or `other`) -- never a partner scalar, allowlisted or not."""
+    if _is_quote_path(path):
+        rejection = classify_quote_rejection(
+            ReapResponse(ok=False, status=status, error_code=code, error_detail_reason=reason))
+        logger.warning("%s %s rejected: status=%s code=%s", verb, path, status,
+                       rejection.error_code if rejection else "other")
+        return
+    logger.warning("%s %s rejected: status=%s code=%s detail=%s reason=%s",
+                   verb, path, status, code, detail, reason)
+
+
+#: Ceiling on a recorded `Retry-After`. A partner value above it is clamped, not trusted: it
+#: becomes a poll schedule, and "come back in a week" from one response is not a schedule.
+MAX_RETRY_AFTER_S = 3600
+
+
+def _retry_after_seconds(value: Any, *, now: Optional[float] = None) -> Optional[int]:
+    """`Retry-After` as whole seconds in [0, MAX_RETRY_AFTER_S], or None.
+
+    Both RFC 9110 forms: delay-seconds (`"30"`) and an HTTP-date. Anything else -- a negative,
+    a float, a word -- is None: an unreadable hint is no hint, never an error. The spec types it
+    as a bare string, so the form is not promised.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit() and text.isascii():
+        return min(int(text), MAX_RETRY_AFTER_S)
+    try:
+        from email.utils import parsedate_to_datetime
+
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when is None or when.tzinfo is None:
+        return None
+    delta = when.timestamp() - (now if now is not None else time.time())
+    return max(0, min(int(math.ceil(delta)), MAX_RETRY_AFTER_S))
 
 
 async def _get(
@@ -1985,6 +2271,7 @@ async def _get(
     NOTHING IS STRING-FORMATTED INTO A PATH HERE THAT HAS NOT BEEN THROUGH `_path_id`. That is
     the guard that stops a caller-supplied id from adding a segment or a query of its own.
     """
+    _check_worker_provider_permission()
     if not is_configured():
         return ReapResponse(ok=False, error="reap_client_not_configured")
     url = validate_base_url()
@@ -2005,6 +2292,9 @@ async def _get(
             # after it refuses to PARSE a body it has already fully allocated -- a cosmetic
             # bound. The read has to stop AT the cap to be one, and doing that here with a second
             # copy of the logic would give the two verbs two bounds to drift apart.
+            # Opening the client is asynchronous; the stop may have changed
+            # since this operation entered. Check again at the dispatch boundary.
+            _check_worker_provider_permission()
             async with client.stream(
                 "GET", f"{url}{path}",
                 params=params or None,
@@ -2021,17 +2311,22 @@ async def _get(
                     # The body is read only on the two scoped paths, only for the two codes, and
                     # only through `_read_bounded`; an oversized error body simply yields no
                     # codes, which is the right trade and not a different outcome.
-                    code, detail_code = (
+                    code, detail_code, detail_reason = _codes_for(
+                        path,
                         _error_codes(await _read_bounded(resp))
-                        if _reads_error_codes(path) else (None, None)
+                        if _reads_error_codes(path) else (None, None, None),
                     )
-                    logger.warning("reap GET %s rejected: status=%s code=%s detail=%s",
-                                   path, status, code, detail_code)
+                    _log_rejection("reap GET", path, status, code, detail_code, detail_reason)
                     return ReapResponse(
                         ok=False, status=status, error=f"reap_status_{status}",
                         error_code=code, error_detail_code=detail_code,
+                        error_detail_reason=detail_reason,
+                        retry_after_seconds=_retry_after_seconds(
+                            (resp.headers or {}).get("retry-after")),
                     )
                 raw = await _read_bounded(resp)
+    except ProviderOperationStopped:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("reap GET %s failed: %s", path, type(exc).__name__)
         return ReapResponse(ok=False, error=f"transport_error:{type(exc).__name__}")
@@ -2082,58 +2377,47 @@ async def resolve_variant(*, product_id: str, option_ids: Sequence[str], timeout
 
 
 async def request_quote(**kwargs: Any) -> ReapResponse:
+    """`POST /agentic/quotes`, "Reap discovery" branch.
+
+    `idempotency_extra` (optional, mig 258) is merged into the quote's Idempotency-Key material and
+    is NOT sent in the body: the purchase service's preflight witness passes one so its key can
+    never collide with the approval quote's (identical body, same 4-minute bucket). Absent, the
+    request and its key are exactly what they always were."""
     timeout = kwargs.pop("timeout_seconds", None)
-    return await _post("/agentic/quotes", build_quote_request(**kwargs), timeout_seconds=timeout)
+    extra = kwargs.pop("idempotency_extra", None)
+    return await _post(
+        "/agentic/quotes", build_quote_request(**kwargs), timeout_seconds=timeout,
+        **({"idempotency_extra": extra} if extra else {}),
+    )
 
 
-# --- the cart-link quote (Tier B), WIRE NAME NOT YET PUBLISHED ------------------------------
+# --- the cart-link quote (Tier B): `externalCheckout` -----------------------------------------
 #
-# Reap confirmed on 2026-09-18 that `POST /agentic/quotes` will accept a Shopify cart permalink
-# "as received", in place of `items`. The feature ships the following week and THE BODY FIELD
-# THAT CARRIES THE URL HAS NOT BEEN PUBLISHED. This module has guessed a field name before --
-# PR #2136 sent `ucpItemId` where the spec said `variantId`, and Reap accepts unknown keys
-# silently with a 200 and drops them -- so a guessed name here would produce a quote request
-# that LOOKS like it carries the cart, a 200, and a quote for nothing.
+# Reap confirmed on 2026-09-18 that `POST /agentic/quotes` would accept a Shopify cart permalink
+# "as received"; the wire shape was published 2026-09-28 and it is NOT the one flat field this
+# module had been waiting for. The request body is now a `oneOf`:
 #
-# So the name is a constant that is None until the spec names it, and every entry point below
-# refuses while it is None. Setting it is a one-line change that must come with a spec diff
-# (scripts/ops/reap_spec_diff.py) showing the field; nothing reads it from the environment,
-# because an operator must not be able to guess it either.
+#     "Reap discovery"    {email, items[1..20], offerCode?, shippingAddress?}
+#     "External checkout" {email, externalCheckout{merchantDomain, checkoutUrl},
+#                          shippingAddress (REQUIRED), offerCode?}
+#
+# both `additionalProperties: false`, and each branch forbids the other's key. `checkoutUrl` is
+# "preserved without rebuilding" (<= 8192 chars, format uri). `merchantDomain` (1-253) must be
+# the URL's own host: a mismatch is 400 AGENTIC_REQUEST_REJECTED with `detail: null` live
+# (2026-09-28), while the docs suggest CHECKOUT_URL_INVALID / MERCHANT_CONTEXT_UNVERIFIED -- the
+# classifier below names both. So `merchantDomain` is DERIVED from the URL here and is never a
+# caller input: a mismatch is impossible by construction rather than refused after the fact.
 
-#: The `POST /agentic/quotes` body field for the cart permalink. None = not published yet.
-CART_LINK_QUOTE_FIELD: Optional[str] = None
+#: The quote body's key for the cart-link branch, from the 2026-09-28 spec.
+EXTERNAL_CHECKOUT_FIELD = "externalCheckout"
 
-# A plain JSON identifier, and never one of the fields the quote body already carries: a value
-# of "email" would silently put the URL where the buyer's address goes.
-_CART_LINK_FIELD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}\Z")
-_QUOTE_BODY_FIELDS = frozenset({"items", "email", "shippingAddress"})
+#: `externalCheckout.checkoutUrl`'s published bound. `services.reap_cart_link` refuses anything
+#: over its own 2048 first; this is the partner's number, checked so a later loosening of the
+#: validator cannot send a body the spec says is invalid.
+MAX_CHECKOUT_URL_LENGTH = 8192
 
-
-class CartLinkQuoteUnsupported(ReapRequestError):
-    """The cart-link quote cannot be built because Reap has not published its field name.
-
-    A `ReapRequestError` so every existing `except rc.ReapRequestError` still catches it; its own
-    type (and `code`) so a caller can tell "not yet possible" from "this request was malformed".
-    """
-
-    code = "cart_link_quote_unsupported"
-
-
-def _cart_link_field() -> Optional[str]:
-    """The configured field name if it is usable, else None. Read at CALL time, so a test (or the
-    one-line change that sets it) takes effect without a re-import."""
-    name = CART_LINK_QUOTE_FIELD
-    if not isinstance(name, str) or not _CART_LINK_FIELD_RE.match(name):
-        return None
-    if name in _QUOTE_BODY_FIELDS:
-        return None
-    return name
-
-
-def supports_cart_link_quote() -> bool:
-    """Can a cart-link quote be requested at all? False while `CART_LINK_QUOTE_FIELD` is None
-    (or is not a usable field name)."""
-    return _cart_link_field() is not None
+#: `externalCheckout.merchantDomain`'s published bound.
+MAX_MERCHANT_DOMAIN_LENGTH = 253
 
 
 def build_cart_link_quote_request(
@@ -2141,50 +2425,201 @@ def build_cart_link_quote_request(
     cart_url: str,
     email: str,
     shipping_address: Optional[Dict[str, Any]] = None,
+    offer_code: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """`POST /agentic/quotes` with a cart permalink instead of `items`.
+    """`POST /agentic/quotes`, "External checkout" branch.
 
-    `{<CART_LINK_QUOTE_FIELD>: cart_url, email, shippingAddress}` -- the email and address in
-    EXACTLY the shape `build_quote_request` sends (same email rule, same field-by-field address
-    whitelist via `build_shipping_address`), because that half of the schema is published.
+    `{externalCheckout: {merchantDomain, checkoutUrl}, email, shippingAddress, offerCode?}` --
+    the email and address in EXACTLY the shape `build_quote_request` sends (same email rule,
+    same field-by-field address whitelist via `build_shipping_address`).
 
-    THREE DIFFERENCES FROM THE `items` QUOTE, each on purpose:
-      * raises `CartLinkQuoteUnsupported` while the field name is unpublished -- see above;
-      * the shipping address is REQUIRED, not optional: on this lane the quote is our only proof
-        the merchant ships to the buyer at all, and a quote without an address proves nothing;
+    FOUR RULES, each on purpose:
       * the URL is re-checked STRUCTURALLY (`services.reap_cart_link.cart_link_line`): one line,
         our click attribute, a `country=` pin, no `checkout[...]` key, no other key. The client
         cannot know the row's click id or shop, so this is not the full validation -- the ledger
         ran that before the row existed -- but it means the builder cannot be handed a URL
         carrying PII even by a caller that skipped the ledger. The URL is NEVER named in a
         message: a refused one may be carrying exactly that PII.
+      * `merchantDomain` IS THE URL'S HOST, taken from the same parse (`cart_link_host`), and
+        the URL's host must already be lowercase so the two are the same bytes. There is no
+        argument for it: a caller cannot make them disagree.
+      * `checkoutUrl` is the caller's string byte-for-byte -- Reap preserves it without
+        rebuilding, which is what carries `attributes[pivota_click_id]` to the merchant's order.
+      * the shipping address is REQUIRED (the spec requires it on this branch, and on this lane
+        the quote is our only proof the merchant ships to the buyer at all).
+
+    `offer_code` goes through `validate_offer_code` and is sent AS GIVEN when present.
     """
-    field_name = _cart_link_field()
-    if field_name is None:
-        raise CartLinkQuoteUnsupported(
-            "cart_link_quote_unsupported: Reap has not published the quote field for a cart "
-            "permalink; CART_LINK_QUOTE_FIELD is unset"
-        )
-    if cart_link_line(cart_url) is None:
+    if not isinstance(cart_url, str) or cart_link_line(cart_url) is None:
         raise ReapRequestError("cart_url is not a structurally valid cart link")
+    if len(cart_url) > MAX_CHECKOUT_URL_LENGTH:  # pragma: no cover -- the validator caps at 2048
+        raise ReapRequestError("cart_url is longer than the partner's checkoutUrl bound")
+    host = cart_link_host(cart_url)
+    if host is None or urlparse(cart_url).netloc != host:
+        # `cart_link_host` lowercases; a URL spelled `https://JudyDoll.com/...` would send a
+        # `merchantDomain` that is not byte-equal to the URL's host. Every URL this rail builds is
+        # lowercase (`validate_cart_link` canonicalises it), so a mixed-case one is refused rather
+        # than rewritten -- the URL is sent as given, never rebuilt.
+        raise ReapRequestError("cart_url host must be lowercase")
+    if len(host) > MAX_MERCHANT_DOMAIN_LENGTH:  # pragma: no cover -- the hostname rule caps it
+        raise ReapRequestError("cart_url host is longer than the partner's merchantDomain bound")
     address = str(email or "").strip()
     if not address or "@" not in address:
         raise ReapRequestError("a quote needs a buyer email")
     shipping = build_shipping_address(shipping_address)
     if not shipping:
         raise ReapRequestError("a cart-link quote needs a shipping address")
-    return {field_name: cart_url, "email": address, "shippingAddress": shipping}
+    body: Dict[str, Any] = {
+        EXTERNAL_CHECKOUT_FIELD: {"merchantDomain": host, "checkoutUrl": cart_url},
+        "email": address,
+        "shippingAddress": shipping,
+    }
+    code = validate_offer_code(offer_code)
+    if code is not None:
+        body["offerCode"] = code
+    return body
 
 
 async def request_cart_link_quote(**kwargs: Any) -> ReapResponse:
     """`request_quote`'s twin for a cart permalink. SAME TRANSPORT, not a copy of it: the same
     `_post` to the same `/agentic/quotes` path, so the timeout (`_QUOTE_TIMEOUT_S`, via the path),
-    the time-bucketed Idempotency-Key over the whole body, the body-blind error handling, the
-    503 `merchant_probably_not_completable` inference, the streaming size cap and the
-    no-redirects rule are all the ones `request_quote` gets. Only the body builder differs."""
+    the time-bucketed Idempotency-Key over the whole body, the bounded error-code read, the
+    streaming size cap and the no-redirects rule are all the ones `request_quote` gets. Only the
+    body builder differs."""
     timeout = kwargs.pop("timeout_seconds", None)
+    extra = kwargs.pop("idempotency_extra", None)  # see `request_quote`
     return await _post(
-        "/agentic/quotes", build_cart_link_quote_request(**kwargs), timeout_seconds=timeout
+        "/agentic/quotes", build_cart_link_quote_request(**kwargs), timeout_seconds=timeout,
+        **({"idempotency_extra": extra} if extra else {}),
+    )
+
+
+# --- quote failures, classified ----------------------------------------------------------------
+#
+# The 2026-09-28 spec gave the quote leg its own error vocabulary. Each code below changes what
+# the purchase does next, so each maps to its own KIND rather than collapsing into
+# `reap_status_400`. Only codes read through `_error_codes` (three shape-checked scalars) reach
+# this function; nothing else from a failure body exists in the process.
+
+#: 503s that say "try again later" rather than "this merchant cannot complete". Retried on the
+#: `Retry-After` schedule (when sent), never refused, and never read as
+#: `merchant_probably_not_completable`.
+#:
+#: AGENTIC_SERVICE_UNAVAILABLE IS HERE TOO (review of #2425). It is the code of a REAP outage, and
+#: the n=2 inference that a 503 on a quote means "not a UCP merchant" was drawn from bodies we
+#: never read. Now that we read the code, an outage that NAMES itself must not end a buyer's
+#: purchase as `merchant_not_completable`; the attempts cap bounds a merchant that really never
+#: completes. A 503 whose code we cannot read keeps the old inference.
+TEMPORARY_UNAVAILABLE_CODES = frozenset({
+    "QUOTE_TEMPORARILY_UNAVAILABLE",
+    "CHECKOUT_TEMPORARILY_UNAVAILABLE",
+    "AGENTIC_SERVICE_UNAVAILABLE",
+})
+
+#: `error.code` -> kind. Lowercase kinds are OUR vocabulary (they land in `last_error_code`,
+#: whose shape is `^[a-z0-9_:.-]{1,64}`); the partner's spelling stays on `ReapResponse`.
+QUOTE_REJECTION_KINDS: Dict[str, str] = {
+    "OFFER_CODE_INVALID": "offer_code_invalid",
+    "OFFER_CODE_EXPIRED": "offer_code_expired",
+    "CHECKOUT_URL_INVALID": "checkout_url_invalid",
+    "CARD_PAYMENT_UNAVAILABLE": "card_payment_unavailable",
+    "AGENTIC_REQUEST_REJECTED": "request_rejected",
+    "QUOTE_TEMPORARILY_UNAVAILABLE": "quote_temporarily_unavailable",
+    "AGENTIC_SERVICE_UNAVAILABLE": "service_unavailable",
+    "QUOTE_UNFULFILLABLE": "quote_unfulfillable",
+    "VARIANT_UNAVAILABLE": "variant_unavailable",
+    "IDEMPOTENCY_REQUEST_IN_PROGRESS": "idempotency_request_in_progress",
+    "IDEMPOTENT_PARAMETER_MISMATCH": "idempotent_parameter_mismatch",
+    "AGENTIC_PAYMENTS_NOT_ENABLED": "payments_not_enabled",
+    # shipping-option only
+    "QUOTE_REPLACEMENT_REQUIRED": "quote_replacement_required",
+    "QUOTE_NOT_MUTABLE": "quote_not_mutable",
+    "SHIPPING_OPTION_INVALID": "shipping_option_invalid",
+}
+
+#: Kinds the purchase gives the lease back for, rather than ending on. See `retryable`.
+_RETRYABLE_KINDS = frozenset({
+    "quote_temporarily_unavailable",
+    "service_unavailable",
+    "idempotency_request_in_progress",
+})
+
+#: The kinds that mean "the OFFER CODE was refused, the cart was not". Re-quoting once without
+#: the code is the purchase service's answer to exactly these two and to nothing else.
+OFFER_CODE_REJECTION_KINDS = frozenset({"offer_code_invalid", "offer_code_expired"})
+
+#: The reasons the spec enumerates, per code. A reason outside its code's list is still carried
+#: (it passed the `_ERROR_CODE_RE` shape check) but marked unrecognised, so a new partner reason
+#: shows up as `...:other` in our columns rather than as a word we never reviewed.
+QUOTE_REJECTION_REASONS: Dict[str, frozenset] = {
+    "CHECKOUT_URL_INVALID": frozenset({
+        "NOT_FOUND", "EXPIRED", "INVALID", "MERCHANT_CONTEXT_UNVERIFIED",
+    }),
+    "QUOTE_UNFULFILLABLE": frozenset({
+        "INVALID_PHONE", "STATE_OR_PROVINCE_REQUIRED", "ITEMS_UNSHIPPABLE",
+        "ADDRESS_LINE_2_REQUIRED",
+    }),
+}
+
+
+@dataclass(frozen=True)
+class QuoteRejection:
+    """A failed quote (or shipping-option) call, in our vocabulary.
+
+    `kind` is a value of `QUOTE_REJECTION_KINDS`; `reason` the lowercased `error.detail.reason`
+    when the code defines reasons (`"other"` for one the spec does not list), else None.
+    `retry_after_seconds` is the recorded header, for the caller to SCHEDULE on -- never to
+    sleep on.
+    """
+
+    kind: str
+    reason: Optional[str] = None
+    retry_after_seconds: Optional[int] = None
+
+    @property
+    def offer_code_rejected(self) -> bool:
+        return self.kind in OFFER_CODE_REJECTION_KINDS
+
+    @property
+    def retryable(self) -> bool:
+        """Reap's own "try again": a temporary outage (503 QUOTE_TEMPORARILY_UNAVAILABLE or
+        AGENTIC_SERVICE_UNAVAILABLE, Retry-After when sent), or the same Idempotency-Key still
+        being worked on by an earlier attempt (409). None is a fact about the cart, so none may
+        end the purchase."""
+        return self.kind in _RETRYABLE_KINDS
+
+    @property
+    def error_code(self) -> str:
+        """`kind` or `kind:reason` -- the `last_error_code` spelling (<= 64, lowercase)."""
+        return f"{self.kind}:{self.reason}" if self.reason else self.kind
+
+
+def classify_quote_rejection(result: Any) -> Optional[QuoteRejection]:
+    """The `QuoteRejection` a failed `ReapResponse` carries, or None when it names no code we
+    know (a transport error, an over-cap body, a success, an unknown code).
+
+    MERCHANT-DOMAIN MISMATCH IS TWO SHAPES. Live (2026-09-28) it is 400 AGENTIC_REQUEST_REJECTED
+    with `detail: null` -> kind `request_rejected`; the docs describe CHECKOUT_URL_INVALID with
+    reason MERCHANT_CONTEXT_UNVERIFIED -> `checkout_url_invalid:merchant_context_unverified`.
+    Both classify, and neither is an offer-code rejection. `build_cart_link_quote_request` makes
+    the mismatch impossible to SEND, so either one arriving means Reap refused the URL itself.
+    """
+    if result is None or getattr(result, "ok", True):
+        return None
+    code = getattr(result, "error_code", None)
+    kind = QUOTE_REJECTION_KINDS.get(code) if isinstance(code, str) else None
+    if kind is None:
+        return None
+    reason: Optional[str] = None
+    if code in QUOTE_REJECTION_REASONS:
+        raw = getattr(result, "error_detail_reason", None)
+        if isinstance(raw, str) and raw:
+            reason = raw.lower() if raw in QUOTE_REJECTION_REASONS[code] else "other"
+    retry_after = getattr(result, "retry_after_seconds", None)
+    return QuoteRejection(
+        kind=kind,
+        reason=reason,
+        retry_after_seconds=retry_after if isinstance(retry_after, int) else None,
     )
 
 
@@ -2780,7 +3215,7 @@ def explain_refusal(reason: Optional[str]) -> str:
 # THE SHAPE CHANGED UNDER US. Checkout creation no longer takes an `owner` block -- the owner is
 # now carried by the enrollment, and `enrollmentId` replaced it. `info.version` is still 1.0.0,
 # so the document gives no signal that anything moved. That is the whole reason
-# `tests/fixtures/reap_openapi_agentic_2026_09_25.json` and `scripts/ops/reap_spec_diff.py`
+# `tests/fixtures/reap_openapi_agentic_2026_09_28.json` and `scripts/ops/reap_spec_diff.py`
 # exist: the spec is pinned to a file in this repo, and a difference is a failing diff rather
 # than a 400 in production.
 
@@ -2961,7 +3396,7 @@ def _next_action_is_unsafe(node: Any) -> bool:
     return not hosted_url_is_allowed(action.get("url"))
 
 
-def _refuse_unsafe_hosted_url(result: ReapResponse) -> ReapResponse:
+def _refuse_unsafe_hosted_url(result: ReapResponse, *, keep_checkout_id: bool = False) -> ReapResponse:
     """A 200 whose `nextAction.url` we cannot vouch for is a REFUSAL, not a warning.
 
     The response is replaced rather than annotated, and `data` is dropped: a caller handed the
@@ -2973,10 +3408,20 @@ def _refuse_unsafe_hosted_url(result: ReapResponse) -> ReapResponse:
     list response was a fifth call site that nothing guarded, and a single poisoned element
     arrived with `ok=True` and its URL intact in `.data`. A guard applied to four of five sites
     is not a guard; it is a note about four of them.
+
+    `keep_checkout_id` (checkout create only): the refused 200 still CREATED a checkout, so its
+    `id` -- validated by `_path_id`, the rule every later read of it uses -- rides out on
+    `refused_checkout_id`. Nothing else from the body does, and never the URL.
     """
     if not result.ok:
         return result
     data = result.data if isinstance(result.data, dict) else {}
+    refused_id: Optional[str] = None
+    if keep_checkout_id:
+        try:
+            refused_id = _path_id(data.get("id"), what="checkout")
+        except ReapRequestError:
+            refused_id = None
     items = data.get("items")
     if items is not None and not isinstance(items, list):
         # Same rule as a non-dict `nextAction`, and missed for the same reason: the old
@@ -2985,13 +3430,15 @@ def _refuse_unsafe_hosted_url(result: ReapResponse) -> ReapResponse:
         # carried a hostile action straight through with ok=True. Anything we cannot walk, we
         # refuse; we do not get to decide a shape we do not recognise is harmless.
         logger.warning("reap returned a non-list `items`; refusing the response")
-        return ReapResponse(ok=False, status=result.status, error="hosted_url_not_allowed")
+        return ReapResponse(ok=False, status=result.status, error="hosted_url_not_allowed",
+                            refused_checkout_id=refused_id)
     candidates = [data] + (list(items) if isinstance(items, list) else [])
     if any(_next_action_is_unsafe(node) for node in candidates):
         # The URL itself is not logged: it came from a partner and it is the untrusted value.
         logger.warning("reap returned a hosted action we will not pass to a buyer; "
                        "refusing the response")
-        return ReapResponse(ok=False, status=result.status, error="hosted_url_not_allowed")
+        return ReapResponse(ok=False, status=result.status, error="hosted_url_not_allowed",
+                            refused_checkout_id=refused_id)
     return result
 
 
@@ -3244,7 +3691,7 @@ async def revoke_enrollment(
 ) -> ReapResponse:
     """`POST /agentic/enrollments/{id}/revoke` — tell Reap to stop honouring this card.
 
-    WP4c ADDED THIS BECAUSE THE SPEC HAS IT. `tests/fixtures/reap_openapi_agentic_2026_09_25.json`
+    WP4c ADDED THIS BECAUSE THE SPEC HAS IT. `tests/fixtures/reap_openapi_agentic_2026_09_28.json`
     carries `revokeEnrollment_agentic` on this path, taking the id and the `Reap-Version` header
     and no body. Before WP4c the runbook's orphan section said flatly that "the enrollment at
     Reap is never revoked" — we stop using it and never tell Reap to stop honouring it. This is
@@ -3345,6 +3792,7 @@ async def create_checkout(
     enrollment_id: str,
     return_url: str,
     timeout_seconds: Optional[float] = None,
+    dispatch_probe: Optional[DispatchProbe] = None,
 ) -> ReapResponse:
     """`POST /agentic/checkouts`. Already in the slow-path set: it is the leg that talks to the
     merchant, and it carries the quote's 35 s bound rather than the 12 s default.
@@ -3357,7 +3805,28 @@ async def create_checkout(
     opened without are different requests to Reap. Keyed on the body alone, a replay after the
     dial was toggled would either hit IDEMPOTENT_PARAMETER_MISMATCH or silently return the other
     checkout. With the dial unset the material -- and so the key -- is exactly what it was.
+
+    `dispatch_probe`, when given, is SETTLED on every return and every exception raised here:
+    `not_dispatched` is then True exactly when the request never reached the transport call in
+    `_post` (see `DispatchProbe`). The caller journals that as its proof that nothing was created.
     """
+    probe = dispatch_probe if dispatch_probe is not None else DispatchProbe()
+    try:
+        result = await _create_checkout(
+            quote_id=quote_id, enrollment_id=enrollment_id, return_url=return_url,
+            timeout_seconds=timeout_seconds, probe=probe,
+        )
+    except Exception as exc:
+        probe.settle(exc)
+        raise
+    probe.settle(result)
+    return result
+
+
+async def _create_checkout(
+    *, quote_id: str, enrollment_id: str, return_url: str,
+    timeout_seconds: Optional[float], probe: DispatchProbe,
+) -> ReapResponse:
     body = build_checkout_request(
         quote_id=quote_id, enrollment_id=enrollment_id, return_url=return_url
     )
@@ -3373,7 +3842,9 @@ async def create_checkout(
             extra_headers=simulate,
             idempotency_extra=(
                 {"simulate": simulate[SIMULATE_CHECKOUT_HEADER]} if simulate else None),
-        )
+            dispatch_probe=probe,
+        ),
+        keep_checkout_id=True,
     )
 
 

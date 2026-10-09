@@ -55,7 +55,11 @@ _OPTION_TYPES = {
     # gift-set shelf, not dropped -- shoppers look for gift sets; the harm was the shelf. These handles
     # are filed under REFILE_SETS_LEAF before any check runs.
     "refile_to_sets": list,
-    "accepted_flags": list, "max_scan_products": int, "max_products": int,
+    "accepted_flags": list,
+    # Accept every same_key_other_listing flag of this job at once (COCODOR raised 89): a reviewer who has
+    # read the listings left out -- each is still recorded as a flag on the run.
+    "accept_listing_collisions": bool,
+    "max_scan_products": int, "max_products": int,
     "max_pdp_identity_fetches": int, "max_pdp_inci_fetches": int, "retailer_name": str, "notes": str,
     # "storefront" (default: crawl the retailer's /products.json), "affiliate_feed" (the network's
     # product datafeed; services/retailer_ingest/affiliate_feed.py) -- for stores that block crawlers --
@@ -84,6 +88,12 @@ _OPTION_TYPES = {
     # It decides the currency the store must prove (require_currency defaults to the market's) and what
     # the readback checks every offer is stamped. Multi-market storefronts ADR, Phase 1.
     "market": str,
+    # A brand's own store re-run under its canonical spelling (Tarte, not "Tarte Cosmetics"): the spelling
+    # the store's OLD rows were written under. After a verified apply the drain retires those old keys itself
+    # (scripts/retire_superseded_brand_keys.py, the same code the CLI runs) -- only where the new key is live
+    # on this store AND, when the old row serves, the new one serves too; everything else keeps its old row.
+    # The dry run records how many old rows are live on the store (checks.stale_brand_retire_preview).
+    "retire_stale_brand": str,
 }
 SOURCES = ("storefront", "affiliate_feed", "shopify_markets")
 MARKETS_SOURCE = "shopify_markets"
@@ -92,7 +102,14 @@ DEFAULT_MARKET = "US"
 #: job's market and must be priced in that market's currency (ingestion._build_offer_inserts(market=),
 #: region_pricing.require_market_currency): the declared-destination semantics ADR-024 reserves for a
 #: writer that declares one. normalize_curated_brand_payload accepts exactly this list from this lane.
-INGEST_MARKETS = ("US", "AU", "JP")
+INGEST_MARKETS = ("US", "AU", "JP", "SG")
+#: The ingest markets that are SERVED, not acquired: a job's rows must read back serving-eligible. SG
+#: (Peng 2026-09-29): a live serving region (PIVOTA_SERVING_PRICING_REGIONS = US,SG on web; Meitu's merchant
+#: list crawled SG stores). Its rows are written like every other market's: catalog_offers.market 'SG' priced
+#: in SGD, and the seed in the "US" partition (ingestion.SEED_PARTITION_MARKET) -- where SG buyers already
+#: find SGD seeds by currency (external_seed_search serving currency, #2389). Only the offer stamp is new:
+#: jsmbeauty.sg / makeupforever.sg, written before this, carry market 'US' with SGD (INSERT-only column).
+SERVED_INGEST_MARKETS = tuple(m for m in INGEST_MARKETS if m not in ACQUISITION_MARKETS)
 #: Multi-market storefronts ADR Phase 2 (approved by Peng 2026-09-26): ACQUISITION markets. A job for
 #: one crawls the storefront's base currency (AUD/JPY) and stores its rows truthfully (market 'AU',
 #: currency 'AUD'); they are NOT served, because serving gates on the offer's currency against the
@@ -182,11 +199,18 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     if options.get("multi_brand") and (options.get("source_role", "retailer") != "retailer" or source != "storefront"):
         # A brand's own store is one brand (its domain must prove it); a feed maps one retailer listing.
         raise ValueError("options.multi_brand supports only a retailer storefront cohort")
+    if "retire_stale_brand" in options and (options.get("source_role") != "brand_official"
+                                            or source != "storefront" or options.get("multi_brand")):
+        # The retire derives each old key from (old spelling, title) and matches it to THIS store's rows: a
+        # brand's own storefront, one brand, crawled here -- the case the CLI was built and measured for.
+        raise ValueError("options.retire_stale_brand supports only a brand_official storefront cohort")
+    if "retire_stale_brand" in options and not str(options["retire_stale_brand"]).strip():
+        raise ValueError("options.retire_stale_brand must name the old spelling")
     if options.get("multi_brand") or "brands" in options:
         brands = options.get("brands")
         if not options.get("multi_brand"):
             raise ValueError("options.brands is only meaningful with options.multi_brand")
-        from services.curated_brand_feed import _retailer_brand_family, _vendor_token as fold
+        from services.curated_brand_feed import RETAILER_BRAND_CANONICAL, _retailer_brand_family, _vendor_token as fold
         if not isinstance(brands, dict) or not all(isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
                                                    for k, v in brands.items()):
             raise ValueError("options.brands must map every vendor to its canonical brand spelling")
@@ -197,14 +221,26 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         if len({fold(k) for k in brands}) != len(brands):
             raise ValueError("options.brands has two keys for the same vendor")
         # Retailer mode applies an override only to the SAME brand spelt differently (equal letters and
-        # digits) or a measured family (RETAILER_BRAND_SPELLINGS). Anything else would be silently
-        # ignored at crawl time -- refuse it here instead of letting the operator think it applied.
+        # digits). A vendor in a measured family (RETAILER_BRAND_SPELLINGS) always writes the family's
+        # canonical spelling, as it has since #2302, so for those the value may only say "no respelling"
+        # (the vendor's own spelling, which operators use to list a store's vendors) or name the
+        # canonical itself. Anything else would be silently overridden or ignored at crawl time --
+        # refuse it here, every offender at once, instead of letting the operator think it applied.
         alnum = lambda v: "".join(c for c in str(v).casefold() if c.isalnum())
-        # A measured family writes ITS spelling whatever the value says, so a family vendor may only be
-        # respelt into that same family (review of #2302: {"Kose": "Shiseido"} passed, then wrote "Kosé").
+        ws = lambda v: " ".join(str(v).split())  # the collapse _crawl applies before use
+        overridden = []
+        for vendor, spelling in brands.items():
+            family = _retailer_brand_family(alnum(vendor))
+            if family is None:
+                continue
+            canonical = RETAILER_BRAND_CANONICAL[family]
+            if ws(spelling) not in (ws(vendor), canonical):
+                overridden.append(f"{vendor!r} -> {spelling!r} (family {family!r} always writes {canonical!r})")
+        if overridden:
+            raise ValueError("options.brands cannot respell a spelling-family vendor to a value other than the "
+                             "vendor's own spelling or the family's canonical spelling: " + "; ".join(overridden))
         ignored = sorted(k for k, v in brands.items()
-                         if alnum(k) != alnum(v) and (_retailer_brand_family(alnum(k)) is None
-                                                      or _retailer_brand_family(alnum(k)) != _retailer_brand_family(alnum(v))))
+                         if _retailer_brand_family(alnum(k)) is None and alnum(k) != alnum(v))
         if ignored:
             raise ValueError(f"options.brands can only respell a vendor (same letters and digits); "
                              f"these would be ignored: {ignored}")
@@ -492,6 +528,13 @@ def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
         o = validate_options(dict(job.get("options") or {}))
     except ValueError as exc:
         raise _Stop("invalid_job", "failed", str(exc)) from exc
+    if o.get("retire_stale_brand"):
+        from services.curated_brand_feed import _vendor_token as fold
+        if fold(o["retire_stale_brand"]) == fold(job.get("brand")):
+            # The same spelling moves no key; retiring "old" keys then means retiring this run's own rows
+            # (the CLI's #2173 mode, which the drain does not do). Review of #2426.
+            raise _Stop("invalid_job", "failed",
+                        "options.retire_stale_brand must be a different spelling from the job's brand")
     return {
         # multi_brand: no override at all, so no product can be renamed to the job's label.
         "domain": job["domain"], "brand": None if o.get("multi_brand") else job["brand"],
@@ -591,12 +634,29 @@ def _require_acquisition_is_unserved(market: str) -> None:
                     f"job, then re-queue.")
 
 
+def _require_served_market_is_served(market: str) -> None:
+    """A served market's rows must read back serving-eligible, and index_pipeline_state decides that in THIS
+    process from its own PIVOTA_SERVING_PRICING_REGIONS (read at import). A drain whose env lists only US
+    would score every SGD row as priced for no served region and fail the job after its write -- so refuse
+    before any crawl, and name the env to fix (infra/gcp/setup_scheduler.sh carries US,SG for the drain)."""
+    if market not in SERVED_INGEST_MARKETS or market == DEFAULT_MARKET:
+        return
+    from services.index_pipeline_state_service import serving_pricing_regions
+    regions = serving_pricing_regions()
+    if market not in regions:
+        raise _Stop("served_market_unconfigured", "failed",
+                    f"market {market} is served, but this process serves only {regions} "
+                    f"(PIVOTA_SERVING_PRICING_REGIONS): its {market} rows would read back unserved. Set the "
+                    f"drain's env to include {market}, then re-queue.")
+
+
 async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
     from services.curated_brand_feed import (CrawlIncomplete, lash_nail_title_evidence, lip_title_evidence,
                                              records_for_brand)
     import contextlib
 
     _require_acquisition_is_unserved(job_market(job.get("options")))
+    _require_served_market_is_served(job_market(job.get("options")))
     try:
         payload = ingest_payload(job)
         if (job.get("options") or {}).get("collections"):
@@ -773,7 +833,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
 
     # Every offer is DECLARED for the job's market (catalog_offers.market) and must be priced in its
     # currency; the seed rows keep the US serving partition (ingestion.SEED_PARTITION_MARKET).
-    plan = ingest_validated_jsonl(records, market=market)
+    moves_accepted = [k.split(":", 1)[1] for k in o.get("accepted_flags") or [] if k.startswith("listing_moved:")]
+    plan = await cli._plan_with_current_listings(records, market=market, allow_moves=moves_accepted)
     inspection = inspect_primary_plan(plan)
     checks["plan"] = {k: inspection.get(k) for k in ("status", "reasons", "planned", "unresolved_category_count")}
     if inspection.get("reasons"):
@@ -782,7 +843,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
 
     legacy = await cli._legacy_listing_report(plan, check=True)
     guard = await cli._brand_host_guard_report(plan, check=True)
-    checks["legacy_listings"] = {k: legacy.get(k) for k in ("status", "conflict_count", "planned_listings")}
+    checks["legacy_listings"] = {k: legacy.get(k) for k in ("status", "conflict_count", "planned_listings",
+                                                             "retired_owner_count")}
     checks["brand_host_guard"] = {k: guard.get(k) for k in ("status", "rows_at_risk", "planned_groups")}
     for name, report in (("legacy_listings", legacy), ("brand_host_guard", guard)):
         if report.get("status") in ("conflicts", "error"):
@@ -800,13 +862,28 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
         answered = [f for f in row_flags if f.get("handle") in refiled and f.get("rule") in REFILE_RESOLVES_RULES]
         row_flags = [f for f in row_flags if f not in answered]
         checks["refile_resolved_flags"] = sorted(f["key"] for f in answered)
+    # A listing the plan left out because an earlier one on this host has its title (one content key).
+    collisions = plan.get("listing_collisions") or []
+    checks["listing_collisions"] = len(collisions)
+    checks["current_listings"] = plan.get("current_listings")
+    checks["listing_moves"] = len(plan.get("listing_moves") or [])
+    row_flags += detectors.listing_move_flags(plan.get("listing_moves") or [])
+    if (plan.get("current_listings") or {}).get("status") in ("unchecked", "error"):
+        # Without the listing each row names, a plan cannot tell a move from a first ingest.
+        flags.append({"key": "current_listings_unread", "rule": "current_listings_unread",
+                      "severity": detectors.BLOCK, "acceptable": False,
+                      "detail": f"could not read the rows' current listings: {plan['current_listings']}"})
+    row_flags += detectors.listing_collision_flags(collisions)
     # Name each row's brand on its flag: in a multi_brand cohort the reviewer must see whose row it is.
     brand_of = {detectors._handle(r): (r.get("pdp") or {}).get("brand") for r in records}
     for f in row_flags:
         if f.get("handle") and not f.get("brand"):
             f["brand"] = brand_of.get(f["handle"])
     flags.extend(row_flags)
-    blocking = detectors.blocking(flags, accepted=o.get("accepted_flags") or [])
+    accepted = list(o.get("accepted_flags") or [])
+    if o.get("accept_listing_collisions"):
+        accepted += [f["key"] for f in flags if f.get("rule") == "same_key_other_listing"]
+    blocking = detectors.blocking(flags, accepted=accepted)
     checks["flags"] = {"block": len([f for f in flags if f["severity"] == detectors.BLOCK]),
                        "info": len([f for f in flags if f["severity"] == detectors.INFO]),
                        "blocking_after_approval": len(blocking)}
@@ -848,9 +925,9 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
     USD/US siblings on the SAME host (services/retailer_ingest/shopify_markets.py, source_system
     shopify_markets_us_localization), as did the older scripts/capture_us_market_offers.py, so a re-run of
     the storefront's AU crawl would otherwise count them as its own and fail after every write (review of
-    #2358, D1). `domain=None` counts every offer of the product (a caller with no storefront). SG rows (market 'US', currency 'SGD',
-    because external_product_seeds.market is a hard serving partition) are never written by this lane:
-    SG is not an INGEST_MARKET.
+    #2358, D1). `domain=None` counts every offer of the product (a caller with no storefront). An SG job's
+    offers are stamped market 'SG' in SGD; its seeds stay in the "US" partition like every market's
+    (external_product_seeds.market is a hard serving partition -- ingestion.SEED_PARTITION_MARKET).
 
     ACQUISITION markets (AU/JP): the rows must land STORED and NOT SERVED. A row the index blocks as
     no_us_offer -- the last rung of its ladder, reached only when every content gate passed -- with its
@@ -1020,7 +1097,11 @@ async def _run_stage(job: Dict[str, Any], *, db: Any, deadline: Optional[float] 
                                   and interrupted.get("catalog_write") != ledger.CATALOG_WRITE_NOT_STARTED)
         if interrupted["stage"] == APPLY and not write_may_have_started:
             note += "; the catalog write had not started, nothing was written"
-        await ledger.finish_run(interrupted["id"], outcome="interrupted", error=note, db=db)
+        # Keep what the run recorded before it died -- the write marker and, for an apply that was retiring an
+        # old spelling, the reversal manifest it stored before that write (ledger.record_retire_manifest).
+        kept = interrupted.get("checks")
+        kept = json.loads(kept) if isinstance(kept, str) else kept
+        await ledger.finish_run(interrupted["id"], outcome="interrupted", checks=kept, error=note, db=db)
         if write_may_have_started:
             # It may have written part of the cohort. Never re-apply blindly.
             reason = f"the previous apply was interrupted and may be partial; review before re-queueing"
@@ -1049,6 +1130,8 @@ async def _run_stage(job: Dict[str, Any], *, db: Any, deadline: Optional[float] 
         with _timed(timings, "check_s"):
             result = await _check(job, records)
         result["checks"]["timings"] = timings
+        if stage == DRY_RUN and (job.get("options") or {}).get("retire_stale_brand"):
+            result["checks"]["stale_brand_retire_preview"] = await _stale_brand_retire_preview(job, records)
         if stage == APPLY:
             result["checks"].setdefault("catalog_write", ledger.CATALOG_WRITE_NOT_STARTED)
         summary = {"crawl": result["checks"].get("crawl"), "plan": result["checks"].get("plan"),
@@ -1066,7 +1149,7 @@ async def _run_stage(job: Dict[str, Any], *, db: Any, deadline: Optional[float] 
                                     reason="dry run clean; apply due", next_run_at=datetime.now(timezone.utc),
                                     db=db)
             return {"job_id": job["id"], "stage": stage, "outcome": "clean", "status": "apply_due"}
-        return await _apply(job, run_id, result, summary, timings, db=db, deadline=deadline)
+        return await _apply(job, run_id, result, summary, timings, db=db, deadline=deadline, records=records)
     except _Stop as stop:
         await ledger.finish_run(run_id, outcome=stop.outcome,
                                 checks=_with_timings(stop.checks or result.get("checks"), timings, stage),
@@ -1120,7 +1203,8 @@ async def _write_lock_wait_s(job: Dict[str, Any], deadline: Optional[float], tim
 
 
 async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summary: Dict[str, Any],
-                 timings: Dict[str, float], *, db: Any, deadline: Optional[float] = None) -> Dict[str, Any]:
+                 timings: Dict[str, float], *, db: Any, deadline: Optional[float] = None,
+                 records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     from scripts.curated_apply_gate import evaluate_apply_log
     from services.catalog_enrichment_agent.apply import apply_ingest_plan
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_apply, require_primary_plan
@@ -1173,6 +1257,14 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
                                                    for p in plan.get("pdps") or []})
     ok = bool(gate.get("ok")) and readback["ok"]
     outcome = "applied" if ok else ("gate_failed" if not gate.get("ok") else "readback_failed")
+    retire: Optional[Dict[str, Any]] = None
+    if ok and (job.get("options") or {}).get("retire_stale_brand"):
+        # Only after a VERIFIED apply: the retire keys on the new rows being live (and serving) on this store.
+        with _timed(timings, "stale_brand_retire_s"):
+            retire = await _retire_stale_brand(job, run_id, records or [], result["checks"],
+                                               applied_keys=gate.get("product_keys") or [], db=db,
+                                               deadline=deadline)
+        result["checks"]["stale_brand_retire"] = retire
     await ledger.finish_run(run_id, outcome=outcome, **summary, applied={"gate": gate}, readback=readback,
                             db=db)
     kinds = [n.get("kind") for n in readback.get("notes") or []]
@@ -1183,8 +1275,169 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
             if kinds.count(k)]
     reason = ("; ".join(["applied and verified", *said]) if ok else
               f"{outcome}: gate {gate.get('reasons')}; readback {readback.get('problems')}")
-    await _move(job, status="done" if ok else "failed", run_id=run_id, reason=reason, db=db)
-    return {"job_id": job["id"], "stage": APPLY, "outcome": outcome, "status": "done" if ok else "failed"}
+    status = "done" if ok else "failed"
+    if retire is not None:
+        reason = f"{reason}; {_retire_reason(retire)}"
+        if retire["outcome"] in RETIRE_FAILED_OUTCOMES:
+            # The catalog apply stands (verified above); the retire did not. Failed reaches a human through the
+            # drain's failed alert; nothing is re-applied, and the old rows are all still live.
+            status = "failed"
+    await _move(job, status=status, run_id=run_id, reason=reason, db=db)
+    out = {"job_id": job["id"], "stage": APPLY, "outcome": outcome, "status": status}
+    if retire is not None:
+        out["stale_brand_retire"] = retire["outcome"]
+    return out
+
+
+#: A retire that wrote nothing and needs a human: its error, or a read-back that disagreed with the plan.
+RETIRE_FAILED_OUTCOMES = ("error", "readback_failed")
+
+
+def _retire_counts(p: Dict[str, Any]) -> Dict[str, int]:
+    return {"cohort": len(p["cohort"]), "present": len(p["present"]), "retirable": len(p["live"]),
+            "waiting_for_new_key": len(p["waiting_for_new_key"]),
+            "new_not_serving": len(p.get("new_not_serving") or []), "foreign": len(p["foreign"]),
+            "already_suppressed": len(p.get("already_suppressed") or [])}
+
+
+async def _stale_brand_retire_preview(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Dry run: how many of this store's rows are live under the old spelling (the retire's upper bound; the
+    apply retires only those whose new row is live and, where the old row serves, serving). Read-only."""
+    from scripts import retire_superseded_brand_keys as retire_tool
+    stale = str(job["options"]["retire_stale_brand"]).strip()
+    try:
+        cohort = retire_tool.cohort_from_records(records, job["brand"], stale)
+        p = await retire_tool.plan_for_cohort(cohort, job["domain"], job["brand"],
+                                              job["options"].get("category_path") or "beauty", stale,
+                                              before_rewrite=True)
+    except Exception as exc:  # noqa: BLE001 -- a preview never fails the dry run; the apply re-plans anyway
+        return {"stale_brand": stale, "error": f"{type(exc).__name__}: {exc}"[:500]}
+    counts = _retire_counts(p)
+    return {"stale_brand": stale, "cohort": counts["cohort"], "old_rows_live_on_store": counts["retirable"],
+            "foreign": counts["foreign"]}
+
+
+async def _retire_stale_brand(job: Dict[str, Any], run_id: str, records: List[Dict[str, Any]],
+                              checks: Dict[str, Any], *, applied_keys: List[str], db: Any,
+                              deadline: Optional[float]) -> Dict[str, Any]:
+    """Retire the store's old-spelling keys after a verified apply: under the catalog write lock, the CLI's own
+    plan (serving-guarded) on the records this stage just applied, the manifest stored on the run BEFORE the
+    write, the write, then a read-back. Never raises: the outcome says what happened."""
+    from scripts import retire_superseded_brand_keys as retire_tool
+    stale = str(job["options"]["retire_stale_brand"]).strip()
+    out: Dict[str, Any] = {"stale_brand": stale}
+    wait_s = float(WRITE_LOCK_WAIT_S)
+    if deadline is not None:
+        wait_s = min(wait_s, deadline - time.monotonic() - RETIRE_LOCK_MARGIN_S)
+        if wait_s <= 0:
+            # A write the task timeout kills leaves a verified apply reading "may be partial". Not started.
+            out.update(outcome="deferred", error="no time left in this execution")
+            return _deferred(job, out)
+    written = False
+    try:
+        # Plan INSIDE the lock: no other writer can suppress or restore these keys between the plan (and the
+        # manifest built from it) and the write (review of #2426).
+        async with ledger.catalog_write_lock(wait_s=wait_s, poll_s=WRITE_LOCK_POLL_S):
+            # The keys this apply just wrote are this run's products: never an "old" row (review of #2426).
+            protected = set(applied_keys)
+            cohort = [c for c in retire_tool.cohort_from_records(records, job["brand"], stale)
+                      if c["stale_key"] not in protected]
+            p = await retire_tool.plan_for_cohort(cohort, job["domain"], job["brand"],
+                                                  job["options"].get("category_path") or "beauty", stale)
+            out.update(_retire_counts(p))
+            prepared = retire_tool.prepare_retire(p)
+            if not prepared:
+                out["outcome"] = "nothing_to_retire"
+                return out
+            # Durable before the write, and kept in the run's final checks too (finish_run rewrites the column).
+            await ledger.record_retire_manifest(run_id, prepared["manifest"], db=db)
+            checks["stale_brand_retire_manifest"] = prepared["manifest"]
+            out["retire_run_id"] = prepared["run_id"]
+            out["counts"] = await retire_tool.write_retire(prepared)
+            written = True
+    except (CatalogWriteLockBusy, CatalogWriteLockUnavailable) as exc:
+        out.update(outcome="deferred", error=f"catalog write lock: {type(exc).__name__}")
+        return _deferred(job, out)
+    except Exception as exc:  # noqa: BLE001 -- write_retire is one transaction: an error before it returns wrote nothing
+        if not written:
+            checks.pop("stale_brand_retire_manifest", None)  # nothing to revert; revert refuses this run anyway
+            out.update(outcome="error", error=f"{type(exc).__name__}: {exc}"[:600])
+            logger.warning(f"retailer_ingest_drain: stale-brand retire FAILED for {job['id']} "
+                           f"({job['domain']}), nothing retired: {out['error']}")
+            return out
+        out["post_write_error"] = f"{type(exc).__name__}: {exc}"[:600]
+    try:
+        out["readback"] = await _retire_readback(p, retire_tool)
+    except Exception as exc:  # noqa: BLE001 -- the write committed; an unreadable result is for a human
+        out["readback"] = {"ok": False, "problems": [f"read-back raised {type(exc).__name__}: {exc}"[:300]]}
+    out["outcome"] = "retired" if out["readback"]["ok"] and "post_write_error" not in out else "readback_failed"
+    return out
+
+
+def _deferred(job: Dict[str, Any], out: Dict[str, Any]) -> Dict[str, Any]:
+    # The job stays done (its apply verified); this line is what a deferred retire leaves besides the status.
+    logger.warning(f"retailer_ingest_drain: stale-brand retire DEFERRED for {job['id']} ({job['domain']}), "
+                   f"nothing retired: {out.get('error')}")
+    return out
+
+
+def _retire_reason(r: Dict[str, Any]) -> str:
+    """The job's status line for the retire, e.g. "old spelling 'Tarte Cosmetics': retired 51 key(s)
+    (retire_7983ba6a31bb); kept 19 waiting for a live new key, 1 whose new key does not serve yet"."""
+    head = f"old spelling {r['stale_brand']!r}: "
+    kept = [f"{r[k]} {label}" for k, label in (("waiting_for_new_key", "waiting for a live new key"),
+                                                ("new_not_serving", "whose new key does not serve yet"),
+                                                ("foreign", "owned by another source"))
+            if r.get(k)]
+    tail = f"; kept {', '.join(kept)}" if kept else ""
+    if r["outcome"] == "retired":
+        return f"{head}retired {r['counts']['products']} key(s) ({r['retire_run_id']}){tail}"
+    if r["outcome"] == "nothing_to_retire":
+        return f"{head}nothing to retire{tail}"
+    if r["outcome"] == "deferred":
+        return (f"{head}retire DEFERRED, nothing retired ({r.get('error')}); run "
+                f"scripts/retire_superseded_brand_keys.py --stale-brand by hand")
+    if r["outcome"] == "readback_failed":
+        return (f"{head}retired {r['counts']['products']} key(s) ({r['retire_run_id']}) but the read-back "
+                f"disagrees: {r['readback']['problems'][:3]}; revert with retire_superseded_brand_keys revert "
+                f"--ingest-run <this run>, THEN services.catalog_offer_suppression.revert_offer_suppression("
+                f"<the manifest's product_keys>) -- restored rows have no live offers until it runs")
+    return f"{head}retire FAILED, nothing retired: {r.get('error')}"
+
+
+#: Seconds of the task the retire leaves unused when it waits for the write lock: its write is small, but it
+#: must not be the thing the task timeout kills.
+RETIRE_LOCK_MARGIN_S = 120
+
+
+async def _retire_readback(p: Dict[str, Any], retire_tool: Any) -> Dict[str, Any]:
+    """Every retired old key is suppressed, and its new key is live on this store -- and serving wherever the
+    old row served. Measured, not assumed: the plan was read before the write."""
+    from db.database import database
+    retired = p["live"]
+    old = {r["product_key"]: dict(r) for r in await database.fetch_all(
+        retire_tool.LIVE_ROWS_SQL, {"keys": [c["stale_key"] for c in retired]})}
+    new_rows = [dict(r) for r in await database.fetch_all(
+        retire_tool.LIVE_ROWS_SQL, {"keys": [c["new_key"] for c in retired]})]
+    host = retire_tool._host(p["domain"])
+    new_live = {r["product_key"] for r in new_rows
+                if not r.get("suppression_reason") and retire_tool._host(r.get("source_domain")) == host}
+    serving = await retire_tool.load_serving({}, [r for r in new_rows if r["product_key"] in new_live])
+    searchable = await retire_tool.load_searchable(sorted(new_live))
+    was_serving = {c["stale_key"] for c in retired} & set(p.get("serving") or [])
+    was_searchable = {c["stale_key"] for c in retired} & set(p.get("searchable") or [])
+    problems = []
+    for c in retired:
+        if not (old.get(c["stale_key"]) or {}).get("suppression_reason"):
+            problems.append(f"old key still live: {c['stale_key']}")
+        if c["new_key"] not in new_live:
+            problems.append(f"new key not live: {c['new_key']}")
+        elif c["stale_key"] in was_serving and c["new_key"] not in serving:
+            problems.append(f"served before, new key not serving: {c['new_key']}")
+        elif c["stale_key"] in was_searchable and c["new_key"] not in searchable:
+            problems.append(f"searchable before, new key not searchable: {c['new_key']}")
+    return {"ok": not problems, "retired": len(retired), "new_live": len(new_live),
+            "new_serving": len(serving), "new_searchable": len(searchable), "problems": problems[:20]}
 
 
 async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timings: Dict[str, float],

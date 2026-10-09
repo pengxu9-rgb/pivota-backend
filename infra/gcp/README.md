@@ -69,6 +69,9 @@ Data-bound secrets (`CONNECTOR_CREDENTIALS_KEY`, `REVIEWS_*_SIGNING_SECRET`) are
 prod dump stays readable. Third-party LIVE credentials (Stripe, SendGrid, Shopify, Adyen, AWS, …) are
 still prod values in staging until test-mode keys are put in the overrides file — side-effect flags
 (`REVIEWS_INVITATION_WORKER_ENABLED`, `AGENT_ACP_ALLOW_LIVE_CAPTURE`, `ALLOW_SHAKEOUT_ON_PROD`) are off.
+Outbound agent/merchant webhook **retries** do not deliver outside production unless
+`WEBHOOK_RETRY_DELIVERY_ENABLED=true` (`services/webhook_retry_delivery_gate.py`): a `retrying` row
+restored from prod points at a real customer endpoint. Leave it unset on staging.
 
 ### One-time project plumbing that bootstrap_env.sh does NOT do (done by hand 2026-08-19)
 - `pivota-shared`: compute default SA → `roles/cloudbuild.builds.builder` + AR writer (Cloud Build runs as it)
@@ -93,6 +96,14 @@ at the repo root because that is the build context root.
 | **Egress IP** | **`8.231.167.230`** — RESERVED (not ephemeral), via Cloud NAT `pivota-nat` on router `pivota-router` |
 | service accounts | `sa-backend`, `sa-gateway`, `sa-worker` @ `pivota-prod.iam.gserviceaccount.com` |
 | secrets | `pivota-db-password`, `DATABASE_URL`, `REDIS_URL` |
+
+**Staging has its OWN Postgres, not a database on this instance.** `pivota-staging:us-west1:pivota-pg`
+— POSTGRES_17, `db-custom-1-3840`, ZONAL, private IP `10.122.0.3`. The staging `web` and `worker`
+services read `pivota-staging`'s own `DATABASE_URL` secret, whose host and database name both
+differ from prod's (verified 2026-09-29). Comments older than the GCP cutover that say "prod and
+staging share one Postgres" describe the Railway era (`postgres-xmr6`) and are not true here. The
+pre-flight that survives: before arming any worker, confirm its `DATABASE_URL` host is its own
+project's instance — a staging service handed prod's URL would recreate the shared-DB hazard.
 
 **`8.231.167.230` is the address to give Antom and Adyen for IP allowlisting.** It is a reserved
 static address, so it survives NAT/router/instance changes. Staging's equivalent is

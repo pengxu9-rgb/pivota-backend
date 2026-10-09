@@ -7,6 +7,8 @@ a capped crawl and a partial apply stop for a human, and an apply re-runs every 
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import json
+
 import pytest
 
 import scripts.onboard_curated_brands as cli
@@ -165,6 +167,13 @@ def env(monkeypatch):
         return {"status": "clear", "conflict_count": 0, "rows_at_risk": 0}
     monkeypatch.setattr(cli, "_legacy_listing_report", clear)
     monkeypatch.setattr(cli, "_brand_host_guard_report", clear)
+
+    class EmptyCatalog:  # apply.current_listings reads it: no row names a listing yet
+        is_connected = True
+
+        async def fetch_all(self, query, values=None):
+            return []
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (EmptyCatalog(), None))
 
     from services.catalog_enrichment_agent import apply as apply_mod, primary_ingestion as pi
 
@@ -357,8 +366,21 @@ async def test_an_interrupted_apply_fails_and_is_never_reapplied(env):
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
     assert out["status"] == "failed" and out["outcome"] == "interrupted"
     assert env.applied == []
-    assert env.ledger.runs == {"run_killed": {"outcome": "interrupted",
+    assert env.ledger.runs == {"run_killed": {"outcome": "interrupted", "checks": None,
                                               "error": env.ledger.runs["run_killed"]["error"]}}
+
+
+async def test_an_interrupted_run_keeps_what_it_recorded_before_it_died(env):
+    """An apply killed mid-retire must keep the reversal manifest it stored before the write: finish_run
+    rewrites the checks column, so the interrupted finish passes the recorded checks back."""
+    kept = {"catalog_write": "started", "stale_brand_retire_manifest": {"run_id": "retire_x", "products": []}}
+    env.ledger.unfinished = {"id": "run_killed", "stage": "apply", "catalog_write": "started", "checks": kept}
+    await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert env.ledger.runs["run_killed"]["checks"] == kept
+    env.ledger.unfinished = {"id": "run_killed2", "stage": "apply", "catalog_write": "started",
+                             "checks": json.dumps(kept)}  # the driver may hand jsonb back as text
+    await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert env.ledger.runs["run_killed2"]["checks"] == kept
 
 
 async def test_an_apply_interrupted_after_its_write_marker_fails_as_may_be_partial(env):
@@ -1110,7 +1132,7 @@ async def test_multi_brand_writes_each_vendors_canonical_spelling(env, monkeypat
          "product_type": "LIP TINT", "body_html": "<p>A lip colour for soft, velvet lips.</p>",
          "images": [{"src": "https://cdn.example/i.jpg"}],
          "variants": [{"id": 45000000000001, "price": "48.00", "available": True, "sku": "cica"}]},
-        {"id": 9100002, "vendor": "SKIN1004", "title": "Centella Lip Tint", "handle": "ampoule",
+        {"id": 9100002, "vendor": "3CE", "title": "3CE Lip Tint", "handle": "ampoule",
          "product_type": "LIP TINT", "body_html": "<p>A lip colour for soft, velvet lips.</p>",
          "images": [{"src": "https://cdn.example/i.jpg"}],
          "variants": [{"id": 45000000000002, "price": "20.00", "available": True, "sku": "amp"}]},
@@ -1125,13 +1147,14 @@ async def test_multi_brand_writes_each_vendors_canonical_spelling(env, monkeypat
     monkeypatch.setattr(feed, "fetch_shopify_products", fetch_products)
     monkeypatch.setattr(feed, "fetch_shopify_shop_locale", locale)
     monkeypatch.setattr(feed, "records_for_brand", _REAL_RECORDS_FOR_BRAND)
-    opts = dict(multi_brand=True, vendors=["Dr. Jart+", "SKIN1004"],
-                brands={"Dr. Jart+": "Dr.Jart+", "SKIN1004": "Skin1004"})
+    opts = dict(multi_brand=True, max_pdp_inci_fetches=0, vendors=["Dr. Jart+", "3CE"],
+                brands={"Dr. Jart+": "Dr.Jart+", "3CE": "3ce"})
     first = await pipeline.run_stage({**job(**opts), "brand": "store (2 brands)"}, db=env.db)
     assert first["status"] == "apply_due", list(env.ledger.runs.values())[-1]
     out = await pipeline.run_stage({**job("apply_due", **opts), "brand": "store (2 brands)"}, db=env.db)
     assert out["status"] == "done", env.ledger.runs
-    assert sorted(p["brand"] for p in env.applied[-1]["pdps"]) == ["Dr.Jart+", "Skin1004"]
+    # Both vendors are outside spelling families, so the operator mappings reach the crawl.
+    assert sorted(p["brand"] for p in env.applied[-1]["pdps"]) == ["3ce", "Dr.Jart+"]
 
 
 @pytest.mark.parametrize("options", [
@@ -1197,7 +1220,7 @@ def test_a_family_vendor_can_only_be_mapped_within_its_family(brands, ok):
     if ok:
         pipeline.validate_options(options)
     else:
-        with pytest.raises(ValueError, match="ignored"):
+        with pytest.raises(ValueError, match="respell"):
             pipeline.validate_options(options)
 
 
@@ -1503,3 +1526,72 @@ async def test_a_lip_pass_keeps_a_refiled_lip_set_instead_of_dropping_it(env):
     paths = {p["canonical_url"].rsplit("/", 1)[-1]: p["category_path"] for p in env.applied[0]["pdps"]}
     assert paths["lip-duo-set"] == pipeline.REFILE_SETS_LEAF and "velvet-lip-tint-plush" in paths
     assert list(env.ledger.runs.values())[-1]["checks"]["refiled_kept_outside_filter"] == ["lip-duo-set"]
+
+
+async def test_the_run_records_how_many_retired_legacy_owners_it_admitted(env, monkeypatch):
+    """A retired chain is admitted silently at apply (#2448): the run's checks are the only record of how many."""
+    async def retired(plan, *, check):
+        return {"status": "clear", "conflict_count": 0, "planned_listings": 3, "retired_owner_count": 2}
+    monkeypatch.setattr(cli, "_legacy_listing_report", retired)
+    await pipeline.run_stage(job(), db=env.db)
+    run = list(env.ledger.runs.values())[-1]
+    assert run["checks"]["legacy_listings"] == {"status": "clear", "conflict_count": 0, "planned_listings": 3,
+                                                "retired_owner_count": 2}
+
+
+# A third spelling: neither the vendor's own nor the family's canonical. The crawl would write the
+# canonical anyway, so accepting it would let the operator think "Skin1004" applied.
+@pytest.mark.parametrize("vendor,override", [("SKIN1004", "Skin1004"), ("Etude House", "ETUDE HOUSE"),
+                                             ("Lancome", "LANCOME")])
+def test_a_family_vendor_cannot_be_respelt_to_a_third_spelling(vendor, override):
+    with pytest.raises(ValueError, match="value other than the vendor's own spelling.*family .* always writes"):
+        pipeline.validate_options({"vendors": [vendor], "multi_brand": True, "brands": {vendor: override}})
+
+
+# The vendor's own spelling (how operators list a store's vendors: 31 prod jobs from meitu_retailers,
+# meitu_recrawl and us_top100 map e.g. {"MISSHA": "MISSHA"}) or the canonical, whitespace collapsed
+# the way the crawl collapses it. Pre-#2482 these were accepted; re-enqueuing them must keep working.
+@pytest.mark.parametrize("vendor,value", [("MISSHA", "MISSHA"), ("ETUDE HOUSE", "ETUDE HOUSE"),
+                                          ("Lancome", "Lancome"), ("SKIN1004", "SKIN1004"),
+                                          ("MISSHA", "Missha"), ("MISSHA", "Missha  "), ("MISSHA", " MISSHA")])
+def test_a_family_vendor_accepts_its_own_spelling_or_the_canonical(vendor, value):
+    pipeline.validate_options({"vendors": [vendor], "multi_brand": True, "brands": {vendor: value}})
+
+
+def test_every_family_canonical_is_already_whitespace_collapsed():
+    # validate_options compares the collapsed value against the RAW canonical; a new family entry with a
+    # double space would make its own canonical unacceptable.
+    from services.curated_brand_feed import RETAILER_BRAND_CANONICAL
+    assert all(" ".join(c.split()) == c for c in RETAILER_BRAND_CANONICAL.values())
+
+
+def test_every_third_spelling_is_reported_in_one_error():
+    brands = {"SKIN1004": "Skin1004", "Etude House": "ETUDE HOUSE", "MISSHA": "MISSHA", "3CE": "3CE"}
+    with pytest.raises(ValueError) as err:
+        pipeline.validate_options({"vendors": list(brands), "multi_brand": True, "brands": brands})
+    message = str(err.value)
+    assert "'SKIN1004' -> 'Skin1004'" in message and "'SKIN1004'" in message
+    assert "'Etude House' -> 'ETUDE HOUSE'" in message and "'ETUDE'" in message
+    assert "'MISSHA' ->" not in message
+
+
+def test_non_family_override_is_accepted():
+    pipeline.validate_options({"vendors": ["3CE"], "multi_brand": True, "brands": {"3CE": "3ce"}})
+
+
+@pytest.mark.parametrize("host,vendor,canonical", [("cocomo.sg", "SKIN1004", "SKIN1004"),
+                                                    ("dodoskin.com", "MISSHA", "Missha")])
+def test_family_without_options_brands_writes_canonical(host, vendor, canonical):
+    # Vendor strings are in the saved census; host/vendor pairs are in its family regression tests.
+    from pathlib import Path
+    census = json.loads((Path(__file__).parents[1] / "fixtures/catalog_brand_spellings_2026_09_30.json").read_text())
+    assert vendor in census["brands"]
+    pipeline.validate_options({"vendors": [vendor]})
+    row = feed.shopify_product_to_record(
+        {"id": 9100099, "vendor": vendor, "title": "Centella Cleanser", "handle": "cleanser",
+         "product_type": "Cleanser", "body_html": "<p>Ingredients: Water, Glycerin</p>",
+         "images": [{"src": "https://cdn.example/i.jpg"}],
+         "variants": [{"id": 45000000000099, "price": "20.00", "available": True, "sku": "cleanser"}]},
+        domain=host, category_path="beauty/skincare", currency="USD", source_role="retailer", retailer_name=host,
+    )
+    assert row["pdp"]["brand"] == canonical

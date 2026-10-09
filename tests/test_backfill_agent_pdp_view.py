@@ -408,6 +408,14 @@ def test_pick_gtin13_rejects_malformed_15_plus_digit_inputs() -> None:
     assert backfill.pick_gtin13(skus) is None
 
 
+def test_pick_gtin13_never_picks_an_all_zero_barcode() -> None:
+    """Even as the modal value: catalog_products.gtin is backfilled from this
+    pick, and "00000000000000" there is a GLOBAL Tier-0 match key."""
+    skus = [{"barcode": "0"}, {"barcode": "00000000"}, {"barcode": "773602443796"}]
+    assert backfill.pick_gtin13(skus) == "00773602443796"
+    assert backfill.pick_gtin13([{"barcode": "0000000000000"}]) is None
+
+
 def test_pick_gtin13_picks_modal_when_skus_disagree() -> None:
     """When SKUs in the same content_key group carry different
     barcodes (data noise / cross-merchant disagreement), pick the
@@ -417,7 +425,7 @@ def test_pick_gtin13_picks_modal_when_skus_disagree() -> None:
     skus = [
         {"barcode": "773602443796"},      # GTIN-A: 00773602443796
         {"barcode": "773602443796"},      # GTIN-A
-        {"barcode": "999999999999"},      # GTIN-B: 00999999999999
+        {"barcode": "999999999993"},      # GTIN-B: 00999999999993
     ]
     assert backfill.pick_gtin13(skus) == "00773602443796"
 
@@ -426,10 +434,10 @@ def test_pick_gtin13_lex_smallest_wins_on_count_tie() -> None:
     """Two distinct GTINs each appearing once — sort tiebreak picks
     lex-smallest so re-runs are byte-identical."""
     skus = [
-        {"barcode": "999999999999"},
-        {"barcode": "111111111111"},
+        {"barcode": "999999999993"},
+        {"barcode": "111111111117"},
     ]
-    assert backfill.pick_gtin13(skus) == "00111111111111"
+    assert backfill.pick_gtin13(skus) == "00111111111117"
 
 
 # ---------------------------------------------------------------------------

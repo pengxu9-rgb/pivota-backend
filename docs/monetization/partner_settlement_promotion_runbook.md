@@ -212,10 +212,13 @@ If a transfer fails, the staff-only retry endpoint is
 
 ## DB isolation caveat
 
-Historically staging shared a single Postgres with production
-(`project_pivota_infra_single_db`, 2026-05-23). **Confirm current isolation
-before treating any "staging" run as safe** — if the DB is shared, a "staging"
-settlement run writes real snapshots. The Step 0 dry-run is safe regardless
+Historically (Railway, `project_pivota_infra_single_db`, 2026-05-23) staging
+shared a single Postgres with production. Since the GCP cutover they are
+separate Cloud SQL instances — prod `10.25.0.2`, staging `10.122.0.3`
+(`infra/gcp/README.md`, verified 2026-09-29). **Still confirm the
+`DATABASE_URL` host of the service you run against before treating any
+"staging" run as safe** — a "staging" run pointed at prod's URL writes real
+snapshots. The Step 0 dry-run is safe regardless
 because it is SELECT-only.
 
 ## Follow-up worth building

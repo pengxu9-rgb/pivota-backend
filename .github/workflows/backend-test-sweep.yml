@@ -149,24 +149,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  sweep:
+  # THE SWEEP RUNS AS SHARDS, THEN ONE `sweep` JOB MERGES AND GATES.
+  #
+  # One pytest process took 31m21s for 26,182 tests on 2026-09-29 (run
+  # 36551976177, push of #2449), and deploy-prod waits for this workflow on every
+  # main commit, so the sweep's wall time WAS the deploy latency. The suite is
+  # split across the `sweep-shard` matrix below; each shard collects the whole
+  # suite with the exact command the single job used and keeps only the tests
+  # whose node id hashes to it (tests/sweep_shard.py). The `sweep` job then
+  # proves the shards add up to one complete run (scripts/merge_sweep_shards.py)
+  # and runs the floor assert, UNCHANGED, over the merged sweep.xml.
+  #
+  # Two names are load-bearing and must not change:
+  #   * the workflow `name:` "Backend Test Sweep" — deploy-prod.yml's test-gate
+  #     finds this workflow's run on the SHA by that exact string;
+  #   * the final job `sweep`, which owns the floors and fails when any shard
+  #     failed, timed out or never reported.
+  # CI Entrypoint expands the single-key static matrix into `sweep-shard (1)` ..
+  # `sweep-shard (N)` and requires each of them too; keep the matrix a literal
+  # list for that reason (a `fromJSON` matrix is not statically expandable).
+  #
+  # SWEEP_SHARDS must equal the length of the matrix; the shard option and the
+  # merger both read it, and tests/test_sweep_shards_add_up_to_one_run.py pins it.
+  # Four, sized from that run: ~31 min of test time over 4 is ~8 min per shard,
+  # plus ~1 min of collection (every shard collects everything) and ~35 s of
+  # setup, which lands the workflow near 10-11 minutes. Three would leave ~12-13.
+  sweep-shard:
     runs-on: ubuntu-latest
-    # #2213's sweep took 12m30s; #2214's larger suite hit the 15m job timeout
-    # before finishing. Keep the full suite and its floor checks, with room for
-    # the added cart-link cases and runner variance.
-    timeout-minutes: 25
+    # 30 is ~3x a shard's expected ~10 min, the same slack ratio the single job
+    # had when it was sized at 40 against 18-23 min green runs (2026-09-28;
+    # #2421 and #2434 were cancelled at 25 with no failures). 30 here plus 10 for
+    # `sweep` is the workflow's 40-minute critical path, the same as before and
+    # inside deploy-prod's 50-minute poll deadline.
+    timeout-minutes: 30
+    strategy:
+      # Every shard runs to its end even when another fails: `sweep` needs all of
+      # their results to say what failed, and a cancelled sibling looks like a
+      # missing shard.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      SWEEP_SHARDS: 4
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-
-      - name: Run Shopify Web Pixel mapper contract
-        run: node --test tests/shopify_web_pixel_mapper.node.test.mjs
 
       - name: Install dependencies
         run: |
@@ -270,8 +300,17 @@ jobs:
       # ⚠️ A denylist entry is a promise to come back, not a resolution. If this
       # list is the same length in a month, this job has become the thing it
       # replaced.
+      #
+      # SHARDED 2026-09-29: the command below is the single job's command with
+      # three additions and nothing removed. `-p tests.sweep_shard --sweep-shard
+      # K/N` keeps this shard's slice AFTER the ignores and the deselect above
+      # have applied, so the quarantine means exactly what it meant unsharded;
+      # the manifest is what lets `sweep` prove no test was dropped or doubled;
+      # the XML and log are named per shard so the artifacts cannot collide.
       - name: Run the uncovered suite
         id: sweep
+        env:
+          SWEEP_SHARD: ${{ matrix.shard }}
         run: |
           set -o pipefail
           python -m pytest tests readiness/tests \
@@ -280,7 +319,72 @@ jobs:
             --deselect 'readiness/tests/test_summary.py::test_build_readiness_optimization_serves_stale_then_refreshes_in_background' \
             --ignore-glob='tests/test_*_postgres.py' \
             -q --no-header -p no:randomly \
-            --junitxml=sweep.xml 2>&1 | tee sweep.log
+            -p tests.sweep_shard --sweep-shard "${SWEEP_SHARD}/${SWEEP_SHARDS}" \
+            --sweep-shard-manifest "sweep-shard-${SWEEP_SHARD}.manifest.json" \
+            --junitxml="sweep-shard-${SWEEP_SHARD}.xml" 2>&1 | tee "sweep-shard-${SWEEP_SHARD}.log"
+
+      # Uploaded on failure too: `sweep` reports a red shard's counts, and the log
+      # is where its traceback is.
+      - name: Upload this shard's results
+        if: '!cancelled()'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep-shard-${{ matrix.shard }}
+          path: |
+            sweep-shard-${{ matrix.shard }}.xml
+            sweep-shard-${{ matrix.shard }}.manifest.json
+            sweep-shard-${{ matrix.shard }}.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  sweep:
+    needs: sweep-shard
+    # `!cancelled()`, not `always()`: this job must run when a shard FAILED, so
+    # the failure is reported against `sweep` with the merged counts beside it,
+    # but not when the whole run was cancelled by a newer push to the same PR —
+    # `always()` would keep a superseded run's runner busy to report a result
+    # nobody reads. A shard that hit its own timeout is not a cancelled
+    # workflow; this job still runs, and fails on its result.
+    if: '!cancelled()'
+    runs-on: ubuntu-latest
+    # Download, merge and assert take well under a minute; nothing is installed.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Run Shopify Web Pixel mapper contract
+        run: node --test tests/shopify_web_pixel_mapper.node.test.mjs
+
+      # Continue on error so a missing artifact is reported by the merger, which
+      # names WHICH shard is absent, rather than by this step's generic failure.
+      - name: Download the shards' results
+        if: '!cancelled()'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sweep-shard-*
+          path: shards
+          merge-multiple: true
+
+      # FAILS unless the shards add up to exactly one run of the suite: every
+      # shard succeeded and reported; all of them collected the identical suite;
+      # their kept tests are disjoint and their union is that suite; and each
+      # shard's JUnit testcases are exactly the tests it kept. It still writes
+      # the merged sweep.xml on failure, so the assert below prints the counts.
+      - name: Merge the shards and prove they are one complete run
+        if: '!cancelled()'
+        env:
+          SHARD_RESULT: ${{ needs.sweep-shard.result }}
+          SWEEP_SHARDS: 4
+        run: |
+          python scripts/merge_sweep_shards.py --shards-dir shards \
+            --num-shards "${SWEEP_SHARDS}" --needs-result "${SHARD_RESULT}" --out sweep.xml
 
       # ASSERT THE GATE ACTUALLY GATED.
       #
@@ -392,7 +496,17 @@ jobs:
           # 2026-09-26: 23,509 executed on main at 604de3021 (#2353), 471 under this cap while the
           # services subtree tripped its own (below). Re-floated ahead of the trip at the same ~97%:
           # 22,800, cap 25,080.
-          FLOOR = 22800
+          # 2026-09-28: 25,108 executed on main at d37073fab (#2416), 28 OVER this cap -- tripped on the
+          # push run with every test PASSING, so the deploy gate refused #2416. Re-floated within the printed
+          # window (22,826..25,108) at the same ~97%: 24,350, cap 26,785.
+          # 2026-09-30: 26,917 executed on main at dd3efaf54 (the sharded sweep's merged count), 132 OVER
+          # this cap -- tripped on the push runs of 49634899d (#2464) and dd3efaf54 (#2468) with every test
+          # PASSING, so the deploy gate refused both and prod stayed on bac3753a0. Re-floated within the
+          # printed window (24,470..26,917) at the same ~97%: 26,100, cap 28,710.
+          # 2026-10-07: 28,737 executed on main at 29f1e3b6f (#2519), 27 OVER this cap -- tripped on the push
+          # run with every test PASSING, so the deploy gate refused #2519 and prod stayed on d78a70433.
+          # Re-floated within the printed window (26,125..28,737) at the same ~97%: 27,875, cap 30,662.
+          FLOOR = 27875
           # Slack allowance, global and per-subtree: 10% of the floor, but never
           # fewer than ABS_SLACK tests. The absolute term is not decoration — a
           # pure percentage is unusable on a small tree. readiness.tests
@@ -500,7 +614,18 @@ jobs:
           # 11b4d843e) against the 3,940 floor (cap 4,334) -- tripped on the push run with every test PASSING, so
           # the deploy gate refused #2402. Re-floated within the printed window (4,097..4,506) at the same
           # ~97%-of-measured: 4,370, ~136 of deletion headroom, cap 4,807.
-          SUBTREES = {'tests.services': 4370, 'readiness.tests': 120}
+          # tests.services: 4,628 executed on 2026-09-28 at d37073fab against the 4,370 floor (cap 4,807), 179
+          # under its cap. Re-floated ahead of the trip, with the global re-float above, at the same ~97%:
+          # 4,490, cap 4,939.
+          # tests.services: 4,988 executed on 2026-09-29 at 30cdc798e (#2438/#2443/#2444/#2445/#2441 added ~360
+          # tests there) against the 4,490 floor (cap 4,939) -- tripped on the push runs of e583702c8, b1cbdb5a4
+          # and 30cdc798e with every test PASSING, so the deploy gate refused all three and prod stayed on
+          # 75b6f3cd6. Re-floated within the printed window (4,535..4,988) at the same ~97%-of-measured:
+          # 4,838, ~150 of deletion headroom, cap 5,322.
+          # tests.services: 5,177 executed on 2026-10-07 at 29f1e3b6f against the 4,838 floor (cap 5,322), 145
+          # under its cap. Re-floated ahead of the trip, with the global re-float above, at the same ~97%:
+          # 5,020, cap 5,522.
+          SUBTREES = {'tests.services': 5020, 'readiness.tests': 120}
           try:
               root = ET.parse('sweep.xml').getroot()
           except Exception as e:

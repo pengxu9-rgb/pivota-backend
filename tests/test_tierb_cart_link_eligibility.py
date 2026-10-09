@@ -119,10 +119,10 @@ async def eligibility_db():
 def test_the_repo_merchant_list_loads_and_matches_the_measured_population():
     merchants = load_merchants()
     # 40 measured on 2026-09-18, plus the rows in _ADDED_AFTER_POPULATION.
-    assert len(merchants) == 41
-    assert len({(m.domain, m.market) for m in merchants}) == 41
+    assert len(merchants) == 42
+    assert len({(m.domain, m.market) for m in merchants}) == 42
     assert {m.market for m in merchants} == {"US", "JP", "SG"}
-    assert sum(1 for m in merchants if m.variant_id) == 37
+    assert sum(1 for m in merchants if m.variant_id) == 38
     by_domain = {m.domain: m for m in merchants}
     for known in ("forbeaut.us", "podl.us", "luafee.jp", "judydoll.com", "robinsons.com.sg"):
         assert known in by_domain
@@ -162,7 +162,10 @@ _REPLACED = {
 _ADDED_AFTER_POPULATION = {
     # the Reap entry-link variant ("Tap Secret Refill"); card checkout via Shopify Payments
     # verified 2026-09-23 by the purchasability sweep
-    ("idewcare.com", "US"): "46722440036604",
+    ("idewcare.com", "US"): ("46722440036604", None),
+    # Lip Pression Glowy Tint, 30 SGD; Reap quoted the externalCheckout cart link 30 + 4 = 34 SGD
+    # on sg.sandbox (2026-09-28), matching the storefront price
+    ("jsmbeauty.sg", "SG"): ("51905273004353", "lip-pression-glowy-tint"),
 }
 
 
@@ -171,9 +174,9 @@ def test_the_repo_merchant_list_carries_a_handle_for_every_seeded_variant():
     added = {domain for domain, _market in _ADDED_AFTER_POPULATION}
     seeded = [m for m in merchants.values() if m.variant_id and m.domain not in added]
     assert len(seeded) == 36 and all(m.product_handle for m in seeded)
-    for (domain, market), variant in _ADDED_AFTER_POPULATION.items():
+    for (domain, market), (variant, handle) in _ADDED_AFTER_POPULATION.items():
         assert (merchants[domain].market, merchants[domain].variant_id, merchants[domain].product_handle) == \
-            (market, variant, None)
+            (market, variant, handle)
     assert all(m.product_handle is None for m in merchants.values() if not m.variant_id)
     for domain, (_old, new, handle) in _REPLACED.items():
         assert (merchants[domain].variant_id, merchants[domain].product_handle) == (new, handle)
@@ -205,8 +208,8 @@ def test_the_repo_merchant_list_is_the_2026_09_18_population_row_for_row():
         assert not any((r["domain"], r["market"]) in _ADDED_AFTER_POPULATION for r in theirs)
         for domain, (old, _new, _handle) in _REPLACED.items():
             assert any(r["domain"] == domain and r.get("variant") == old for r in theirs)
-    added = {(r["domain"], r["market"]): r.get("variant_id") for r in ours
-             if (r["domain"], r["market"]) in _ADDED_AFTER_POPULATION}
+    added = {(r["domain"], r["market"]): (r.get("variant_id"), r.get("product_handle"))
+             for r in ours if (r["domain"], r["market"]) in _ADDED_AFTER_POPULATION}
     assert added == _ADDED_AFTER_POPULATION
 
 

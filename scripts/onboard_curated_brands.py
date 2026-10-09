@@ -224,6 +224,13 @@ def _record_handle(record: Dict[str, Any]) -> Optional[str]:
 #: Printed once per record --exclude-handle removed. Greppable.
 EXCLUDED_PDP_PREFIX = "    excluded pdp "
 
+#: Printed once per listing the plan left out because an earlier listing on the same host has its
+#: title, and so its content key (ingestion.ingest_validated_jsonl). Greppable.
+LISTING_COLLISION_PREFIX = "    left out, same title as another listing "
+
+#: Printed once per row the plan did not move off the listing it names (ingestion.ingest_validated_jsonl).
+LISTING_MOVE_PREFIX = "    held, row names a listing this crawl does not carry "
+
 
 def _exclude_by_handle(records: List[Dict[str, Any]], handles: set, *, domain: str) -> tuple:
     """Drop the records whose storefront handle is in `handles`; return (kept, handles that matched).
@@ -402,6 +409,34 @@ def _preflight_database() -> tuple:
     return db_module.database, None
 
 
+async def _plan_with_current_listings(records: List[Dict[str, Any]], *, market: Optional[str] = None,
+                                     allow_moves: Any = ()) -> Dict[str, Any]:
+    """The plan, made with the listing each of its rows names today (apply.plan_with_current_listings), read
+    through the SELECT-only preflight handle. Without a Postgres catalog, or when the read fails, the plan is
+    made without them and `current_listings.status` says so -- the drain holds on that (it cannot see a move)."""
+    from services.catalog_enrichment_agent.apply import content_keys_of, plan_with_current_listings
+
+    records = list(records)
+    database, reason = _preflight_database()
+    if database is None:
+        plan = ingest_validated_jsonl(records, market=market)
+        status = {"status": "unchecked", "reason": reason} if content_keys_of(plan) else {"status": "not_applicable"}
+        return {**plan, "current_listings": status}
+    connected_here = False
+    try:
+        if not getattr(database, "is_connected", False):
+            await database.connect()
+            connected_here = True
+        return await plan_with_current_listings(records, db=_SelectOnlyHandle(database), market=market,
+                                                allow_moves=allow_moves)
+    except Exception as exc:  # noqa: BLE001 -- reported; the class only (a driver error can quote its URL)
+        return {**ingest_validated_jsonl(records, market=market),
+                "current_listings": {"status": "error", "error": type(exc).__name__}}
+    finally:
+        if connected_here and getattr(database, "is_connected", False):
+            await database.disconnect()
+
+
 async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[str, Any]:
     """Which planned listings an older, non-`ext:retailer:` catalog row already owns.
 
@@ -410,7 +445,8 @@ async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[s
     (--check-legacy-listings): when not requested, the report says `unchecked` rather than going
     silent, because a silent dry run is how Wave 1 read `ready_to_apply` for a cohort (haruharu
     wonder at ohlolly.com) that the apply then refused. Suppressed owners are listed and COUNTED as
-    conflicts, because the apply refuses on them too.
+    conflicts, because the apply refuses on them too -- except an owner whose whole chain is retired
+    (apply.legacy_chain_retired), which the apply admits: counted in `retired_owner_count`, not a conflict.
     """
     listings = planned_retailer_listings(plan)
     report: Dict[str, Any] = {"planned_listings": len(listings)}
@@ -435,6 +471,8 @@ async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[s
         if connected_here and getattr(database, "is_connected", False):
             await database.disconnect()
 
+    retired = [f for f in findings if f["kind"] == "retired_owner"]
+    findings = [f for f in findings if f["kind"] != "retired_owner"]  # the apply admits a retired chain
     by_listing: Dict[str, Dict[str, Any]] = {}
     for finding in findings:
         if finding["kind"] != "conflict":
@@ -457,6 +495,7 @@ async def _legacy_listing_report(plan: Dict[str, Any], *, check: bool) -> Dict[s
         "suppressed_conflict_count": sum(1 for o in owners if o["suppressed"]),
         "listings_with_conflicts": len(by_listing),
         "conflicts": list(by_listing.values()),
+        "retired_owner_count": len(retired),
         "unproven_legacy_rows": [
             {"product_key": f["legacy_product_key"], "canonical_url": f["canonical_url"]}
             for f in findings if f["kind"] == "identity_unproven"
@@ -668,12 +707,30 @@ async def _run(args: argparse.Namespace) -> int:
     if excluded_handles - matched_handles:
         raise ValueError(f"--exclude-handle values matched no product in this run: "
                          f"{sorted(excluded_handles - matched_handles)}")
-    plan = ingest_validated_jsonl(all_records)
+    if args.apply or args.check_current_listings:
+        # An apply always reads the listing each row names (it must never move one); a dry run only when asked.
+        plan = await _plan_with_current_listings(all_records, allow_moves=args.allow_listing_move)
+        if args.apply and (plan.get("current_listings") or {}).get("status") in ("unchecked", "error"):
+            print(json.dumps({"error": "current_listings_unread", "current_listings": plan["current_listings"]}),
+                  file=sys.stderr)
+            return 2
+    else:
+        plan = ingest_validated_jsonl(all_records)
+        plan["current_listings"] = {"status": "unchecked",
+                                    "hint": "pass --check-current-listings (a SELECT on catalog_products)"}
+    print("current listings: " + json.dumps(plan.get("current_listings"), sort_keys=True))
     print(
         f"plan: pdps={len(plan.get('pdps') or [])} skus={len(plan.get('skus') or [])} "
         f"offers={len(plan.get('offers') or [])} seeds={len(plan.get('seeds') or [])} "
         f"skipped={plan.get('skipped')}"
     )
+    for move in plan.get("listing_moves") or []:
+        # Held: the row names a listing this crawl does not carry. --allow-listing-move <product_key> moves it.
+        print(LISTING_MOVE_PREFIX + json.dumps(move, sort_keys=True, ensure_ascii=False))
+    for collision in plan.get("listing_collisions") or []:
+        # Left out of the plan: another listing on this host has its title (one content key).
+        # --exclude-handle the kept listing to write this one instead.
+        print(LISTING_COLLISION_PREFIX + json.dumps(collision, sort_keys=True, ensure_ascii=False))
     print("primary ingestion: " + json.dumps(inspect_primary_plan(plan), sort_keys=True))
     legacy = brand_guard = None
     if not args.apply:
@@ -794,6 +851,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             "Every requested GTIN must be valid and must match somewhere in the run, and a host "
             "matching none of them is an error, not an empty run. It narrows the PLAN only: the "
             "crawl still reads the whole feed and GTIN recovery still spends its budget first."
+        ),
+    )
+    p.add_argument(
+        "--check-current-listings",
+        action="store_true",
+        help=("dry run: read the listing each planned row names today (a SELECT on catalog_products), so the plan "
+              "shows which rows it holds instead of moving (an --apply always reads it)"),
+    )
+    p.add_argument(
+        "--allow-listing-move",
+        action="append",
+        default=[],
+        metavar="PRODUCT_KEY",
+        help=(
+            "let this row move off the listing it names today (the plan otherwise holds a row whose listing "
+            "the crawl does not carry, and prints it as held)"
         ),
     )
     p.add_argument(

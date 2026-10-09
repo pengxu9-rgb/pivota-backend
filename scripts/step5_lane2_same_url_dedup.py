@@ -63,6 +63,9 @@ DETAIL_SQL = """
 SELECT cp.product_key, cp.merchant_id, cp.content_key, cp.platform,
        cp.canonical_url, cp.source_ref, cp.pivota_signature_id,
        cp.title, cp.created_at,
+       -- pick_canonical's content bar (rung 0c) reads these: the keeper must be the row serving
+       -- would pick, or an auto-approved dedup suppresses the row that is being served.
+       cp.description, cp.image_url, cp.sync_status, cp.suppressed_at,
        length(coalesce(cp.product_payload::text, '')) AS payload_bytes,
        pgm.is_primary AS group_is_primary
 FROM catalog_products cp

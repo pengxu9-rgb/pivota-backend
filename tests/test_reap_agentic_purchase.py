@@ -84,7 +84,10 @@ ENROLLMENT_CREATED = {
     "nextAction": {
         "type": "REDIRECT",
         "url": "https://pay.prava.space/enroll/3fa85f64",
-        "expiresAt": "2026-09-17T21:00:00Z",
+        # FAR future on purpose: a create whose link is already dead is now RETIRED rather than
+        # handed to the buyer (a replayed attempt; see `_link_is_usable`). The dead-link
+        # case has its own tests.
+        "expiresAt": "2099-01-01T00:00:00Z",
     },
 }
 
@@ -223,6 +226,7 @@ async def _db():
     Prod never runs db/migrations, so the self-heal IS the schema that ships."""
     if not database.is_connected:
         await database.connect()
+    await database.execute("DROP TABLE IF EXISTS reap_checkout_manual_resolution_audit")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_enrollments")
     await ensure_required_schema_light()
@@ -329,7 +333,7 @@ class Attribution:
         self.calls.append(kwargs)
         if self.raises is not None:
             raise self.raises
-        return {"id": "edge_1"}
+        return {"id": "edge_1", "edge_id": "edge_1"}
 
 
 @pytest.fixture(autouse=True)
@@ -922,7 +926,9 @@ async def test_quote_expired_on_the_checkout_create_releases_for_a_fresh_quote(
     assert result.outcome == "released"
     assert result.state == "quoting"
     assert result.last_error_code == "quote_expired"
-    assert result.next_poll_in_seconds == svc.POLL_INTERVALS["quoting"]
+    # Held past the quote idempotency bucket (not the 60 s quoting interval): a re-quote inside
+    # the bucket would replay the same quote id and park the row as needs-human work.
+    assert result.next_poll_in_seconds == svc.PROVIDER_NOT_CREATED_HOLD_S
     row = await _get(purchase_id)
     assert row["state"] == "quoting"
     assert row["last_error_code"] == "quote_expired"
@@ -1112,11 +1118,10 @@ async def test_a_hostile_checkout_url_never_reaches_the_row(reap, attribution):
     await _step(purchase_id)
     result = await _step(purchase_id)
 
-    assert result.state == "failed"
+    assert result.state == "awaiting_approval"
     row = await _get(purchase_id)
-    assert row["state"] == "failed"
-    assert row["state"] != "awaiting_approval"
-    assert row["last_error_code"] == "checkout_no_hosted_action"
+    assert row["state"] == "awaiting_approval"
+    assert row["last_error_code"] == "checkout_unresolvable:3:checkout_no_hosted_action"
     assert row["hosted_url"] is None
     assert "evilprava.space" not in json.dumps(row, default=str)
 
@@ -1142,7 +1147,7 @@ async def test_the_good_url_does_reach_the_row(reap, attribution):
     await _step(purchase_id)
     row = await _get(purchase_id)
     assert row["hosted_url"] == "https://pay.prava.space/enroll/3fa85f64"
-    assert row["hosted_url_expires_at"] == datetime(2026, 9, 17, 21, 0, tzinfo=timezone.utc)
+    assert row["hosted_url_expires_at"] == datetime(2099, 1, 1, 0, 0, tzinfo=timezone.utc)
 
 
 # ── 6. transport failures: release, do not move ──────────────────────────────────────────────
@@ -1269,7 +1274,7 @@ async def test_an_unrecognised_checkout_status_never_advances(reap, attribution)
     await _step(purchase_id)
     result = await _step(purchase_id)
     assert result.outcome == "released"
-    assert result.last_error_code == "unknown_checkout_status"
+    assert result.last_error_code == "checkout_read_permanent:1:unknown_checkout_status"
     assert (await _get(purchase_id))["state"] == "awaiting_approval"
     assert attribution.calls == []
 
@@ -2077,9 +2082,9 @@ async def test_a_partner_id_that_could_move_a_request_never_reaches_the_row(
     await _step(purchase_id)
     result = await _step(purchase_id)
 
-    assert result.state == "failed"
+    assert result.state == ("quoting" if field == "create_checkout" else "failed")
     row = await _get(purchase_id)
-    assert row["last_error_code"] == "partner_id_malformed"
+    assert row["last_error_code"] == ("checkout_dispatch_unresolved" if field == "create_checkout" else "partner_id_malformed")
     assert bad not in json.dumps(row, default=str)
 
 
@@ -2119,9 +2124,9 @@ async def test_the_checkout_id_survives_a_no_hosted_action_failure(reap, attribu
     await _step(purchase_id)
     result = await _step(purchase_id)
 
-    assert result.state == "failed"
+    assert result.state == "awaiting_approval"
     row = await _get(purchase_id)
-    assert row["last_error_code"] == "checkout_no_hosted_action"
+    assert row["last_error_code"] == "checkout_unresolvable:3:checkout_no_hosted_action"
     assert row["reap_checkout_id"] == "chk_7f3a"
     assert row["reap_quote_id"] == "f1e2d3c4"
     assert row["hosted_url"] is None
@@ -2142,8 +2147,8 @@ async def test_a_hostile_url_arrives_as_a_client_refusal_not_as_a_missing_action
     await _step(purchase_id)
     result = await _step(purchase_id)
     row = await _get(purchase_id)
-    assert result.state == "failed"
-    assert row["last_error_code"] == "hosted_url_not_allowed"
+    assert result.state == "quoting"
+    assert row["last_error_code"] == "checkout_dispatch_unresolved"
     assert row["last_error_code"] != "checkout_no_hosted_action"
     assert row["hosted_url"] is None
 
@@ -3144,3 +3149,2388 @@ async def test_an_uncanonicalisable_stored_domain_still_closes_as_stored(attribu
          "final_total_minor": 4500, "currency": "USD", "click_id": "clk_leg"}
     )
     assert [c["merchant_id"] for c in attribution.calls] == ["legacy.example."]
+
+
+# ── offer codes on the VARIANT lane (2026-09-28) ─────────────────────────────────────────────
+# The fallback helper is shared with the cart-link lane (tests/reap_cart_link_cases.py carries
+# the full table); these pin that the items quote goes through it too.
+
+
+def _offer_rejected(code):
+    return rc.ReapResponse(ok=False, status=400, error="reap_status_400", error_code=code)
+
+
+def _discounted(amount=-4.25, final=40.75):
+    quote = json.loads(json.dumps(QUOTE_200))
+    quote["amountBreakdown"]["discounts"] = [
+        {"name": "Offer code", "amount": {"amount": amount, "currency": "USD"}}]
+    quote["amountBreakdown"]["finalAmount"] = {"amount": final, "currency": "USD"}
+    return quote
+
+
+async def _to_quoting_with_code(code):
+    purchase_id = await _start(offer_code=code)
+    await _step(purchase_id)  # resolving -> needs_enrollment
+    await _step(purchase_id)  # needs_enrollment -> quoting
+    return purchase_id
+
+
+async def test_the_items_quote_carries_the_code_and_records_the_discount(reap, attribution):
+    purchase_id = await _to_quoting_with_code("SAVE10")
+    reap.calls.clear()
+    reap.request_quote = _ok(_discounted())
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    (call,) = reap.named("request_quote")
+    assert call["offer_code"] == "SAVE10"
+    row = await ledger.get_purchase_internal(purchase_id)
+    assert (row["offer_code_outcome"], row["discount_minor"], row["quoted_total_minor"]) == (
+        "applied", 425, 4075)
+
+
+async def test_the_items_quote_drops_a_refused_code_and_requotes_once(reap, attribution):
+    purchase_id = await _to_quoting_with_code("BOGUS")
+    reap.calls.clear()
+    reap.request_quote = [_offer_rejected("OFFER_CODE_INVALID"), _ok(QUOTE_200)]
+    assert (await _step(purchase_id)).state == "awaiting_approval"
+    first, second = reap.named("request_quote")
+    assert first["offer_code"] == "BOGUS" and "offer_code" not in second
+    assert first["items"] == second["items"]
+    # The step re-resolves ONCE, not once per quote.
+    assert reap.sequence().count("resolve_our_row") == 1
+    row = await ledger.get_purchase_internal(purchase_id)
+    assert row["offer_code_outcome"] == "dropped_invalid" and row["quoted_total_minor"] == 4500
+
+
+@pytest.mark.parametrize("resolve_seconds,expect_quotes", [(114.0, 0), (112.0, 1)])
+async def test_a_slow_resolve_leaves_no_budget_for_a_coded_quote(
+    reap, attribution, monkeypatch, resolve_seconds, expect_quotes
+):
+    """B2(a), #2425 review. The variant lane resolves BEFORE it quotes, inside the same step
+    budget (135 s for quoting). A resolve that ate more than 113 s leaves under
+    MIN_QUOTE_BUDGET_S (22 s): the step is released as `quote_budget_exhausted` and NO quote is
+    sent. 112 s is the control: 23 s left, one quote."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(svc, "_monotonic", lambda: clock["now"])
+    purchase_id = await _to_quoting_with_code("SAVE10")
+    reap.calls.clear()
+
+    def _slow_resolve(**kwargs):
+        clock["now"] += resolve_seconds
+        return _resolved()
+
+    reap.resolve_our_row = _slow_resolve
+    reap.request_quote = _ok(_discounted())
+    moved = await _step(purchase_id)
+    assert len(reap.named("request_quote")) == expect_quotes
+    if expect_quotes == 0:
+        assert moved.outcome == "released" and moved.state == "quoting"
+        assert moved.last_error_code == "quote_budget_exhausted"
+    else:
+        assert moved.state == "awaiting_approval"
+        assert reap.named("request_quote")[0]["timeout_seconds"] == pytest.approx(23.0)
+
+
+# ── 2026-09-30: a returning buyer whose card IS active at Reap could never buy ───────────────
+#
+# Staging, all UTC, one demo buyer:
+#   11:21:34  purchase A -> needs_enrollment; our row re_…, Reap enrollment 9041ef1a-…, link
+#             expires 11:36:34.
+#   ~11:23    buyer completes Reap's page. GET keeps saying REQUIRES_ACTION…
+#   11:36:43  …until now: ACTIVE, last4 7847. 9 s AFTER the link expired.
+#   11:37:02  the sweep expires A (hosted_url_expired). Our row stays 'pending'.
+#   11:37:38  purchase B. No active row; `upsert_pending_enrollment` hands back the SAME pending
+#             row; `create_enrollment` replays the SAME attempt and returns the OLD dead link;
+#             B enters needs_enrollment already expired and is swept 54 s later.
+#   11:41     purchase C, the same.
+# The sequence below replays that against the real ledger and a fake Reap, then shows the fix.
+
+STAGING_ENROLLMENT = "9041ef1a-1377-45f6-b09a-95d5eb07f908"
+STAGING_LINK = "https://pay.prava.space/enroll/ses_01M3S0RSP39FEXTT7ZRYHSRDJQ"
+
+
+def _iso_in(seconds: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _enrollment_requires_action(
+    reap_id: str = STAGING_ENROLLMENT, url: str = STAGING_LINK, expires_in: float = 900
+) -> dict:
+    return {
+        "id": reap_id,
+        "status": "REQUIRES_ACTION",
+        "nextAction": {"type": "REDIRECT", "url": url, "expiresAt": _iso_in(expires_in)},
+    }
+
+
+def _enrollment_active(reap_id: str = STAGING_ENROLLMENT, last4: str = "7847") -> dict:
+    return {
+        "id": reap_id,
+        "status": "ACTIVE",
+        "paymentMethod": {"type": "CARD", "network": "VISA", "last4": last4},
+        "nextAction": None,
+    }
+
+
+async def _age_links(seconds_past: int) -> None:
+    """Move EVERY hosted-link expiry (enrollment rows and purchase rows) to `seconds_past` ago —
+    the server-side way to let time pass for both the sweep and the service."""
+    for table in ("reap_agentic_enrollments", "reap_agentic_purchases"):
+        await database.execute(
+            f"UPDATE {table} SET hosted_url_expires_at = datetime('now', :shift) "
+            "WHERE hosted_url_expires_at IS NOT NULL",
+            # SIGNED, so a negative `seconds_past` (time LEFT) is '+30 seconds', not the
+            # '--30 seconds' SQLite reads as NULL — which would erase the expiry, not move it.
+            {"shift": f"{-int(seconds_past):+d} seconds"},
+        )
+
+
+async def _enrollments(buyer_ref: str = "bref_alice"):
+    return [
+        dict(r) for r in await database.fetch_all(
+            "SELECT * FROM reap_agentic_enrollments WHERE buyer_ref = :b ORDER BY created_at, id",
+            {"b": buyer_ref},
+        )
+    ]
+
+
+def _reap_echoes_the_session():
+    """A `get_enrollment` that answers REQUIRES_ACTION with the SAME session it created — the
+    stored link and the stored expiry, read back from our row — the way Reap's GET echoes a
+    session that is still open (or has just died). Moving our row's clock (`_age_links`) moves
+    what this fake says, so a test ages ONE clock and not two."""
+
+    async def _read(**kwargs):
+        stored = await database.fetch_one(
+            "SELECT hosted_url, hosted_url_expires_at FROM reap_agentic_enrollments "
+            "WHERE reap_enrollment_id = :r",
+            {"r": kwargs["id"]},
+        )
+        action = None
+        if stored is not None and stored["hosted_url"]:
+            expires = ledger._decode_dt(stored["hosted_url_expires_at"])
+            action = {"type": "REDIRECT", "url": stored["hosted_url"]}
+            if expires is not None:
+                action["expiresAt"] = expires.isoformat().replace("+00:00", "Z")
+        return _ok({"id": kwargs["id"], "status": "REQUIRES_ACTION", "nextAction": action})
+
+    return _read
+
+
+async def _purchase_a_waiting_on_a_link(reap) -> tuple:
+    """Step 1 and 2: A reaches needs_enrollment; Reap keeps saying REQUIRES_ACTION."""
+    reap.create_enrollment = _ok(_enrollment_requires_action())
+    reap.get_enrollment = _reap_echoes_the_session()
+    purchase_a = await _start()
+    assert (await _step(purchase_a)).state == "needs_enrollment"
+    ours = (await _get(purchase_a))["enrollment_id"]
+    result = await _step(purchase_a)
+    assert (result.outcome, result.last_error_code) == ("released", "enrollment_pending")
+    return purchase_a, ours
+
+
+async def test_the_staging_sequence_a_returning_buyer_with_an_active_card_now_buys(reap):
+    """Steps 1–5 exactly, then the fix. A is expired the way staging expired it (the sweep on
+    Reap's exact expiry, `enrollment_grace_seconds=0`), our row is left 'pending' while Reap
+    says ACTIVE — and B now RECONCILES instead of replaying: one GET, the row is activated with
+    last4 7847, B goes to 'quoting', and NO enrollment is minted at Reap."""
+    purchase_a, ours = await _purchase_a_waiting_on_a_link(reap)
+
+    # Step 2/3: the link expires; 9 s later Reap says ACTIVE; 28 s after expiry the sweep runs.
+    reap.get_enrollment = _ok(_enrollment_active())
+    await _age_links(28)
+    assert await ledger.expire_overdue_purchases(enrollment_grace_seconds=0) == []
+    # Historical terminal attempts exist from older deployments and remain terminal.
+    await database.execute("UPDATE reap_agentic_purchases SET state='expired' WHERE id=:id", {"id":purchase_a})
+    assert (await _get(purchase_a))["state"] == "expired"
+    [row] = await _enrollments()
+    assert (row["id"], row["status"]) == (ours, "pending"), "the staging state: row still pending"
+
+    # Step 4: purchase B, same buyer.
+    reap.calls.clear()
+    purchase_b = await _start()
+    result = await _step(purchase_b)
+
+    assert result.state == "quoting"
+    assert reap.named("create_enrollment") == [], "no new enrollment minted at Reap"
+    assert [c["id"] for c in reap.named("get_enrollment")] == [STAGING_ENROLLMENT]
+    b = await _get(purchase_b)
+    assert b["enrollment_id"] == ours
+    assert b["hosted_url"] is None and b["hosted_url_expires_at"] is None
+    active = await ledger.get_active_enrollment("bref_alice")
+    assert (active["id"], active["card_last4"], active["card_network"]) == (ours, "7847", "VISA")
+    assert active["hosted_url"] is None
+
+    # Step 5: purchase C goes straight to quoting on the active row; not even a GET.
+    reap.calls.clear()
+    purchase_c = await _start()
+    assert (await _step(purchase_c)).state == "quoting"
+    assert reap.calls == [("resolve_our_row", reap.calls[0][1])]
+    assert (await _get(purchase_c))["enrollment_id"] == ours
+
+    # And B completes on that card.
+    assert (await _step(purchase_b)).state == "awaiting_approval"
+    assert reap.named("create_checkout")[-1]["enrollment_id"] == STAGING_ENROLLMENT
+
+
+async def test_the_staging_sequence_with_the_grace_a_itself_proceeds(reap):
+    """The same timeline with the DEFAULT sweep: A is NOT expired 28 s after its link, the
+    poller reads ACTIVE, and A goes to 'quoting' with its hosted link cleared."""
+    purchase_a, ours = await _purchase_a_waiting_on_a_link(reap)
+    reap.get_enrollment = _ok(_enrollment_active())
+    await _age_links(28)
+    assert await ledger.expire_overdue_purchases() == []
+    result = await _step(purchase_a)
+    assert result.state == "quoting"
+    a = await _get(purchase_a)
+    assert a["enrollment_id"] == ours
+    assert a["hosted_url"] is None and a["hosted_url_expires_at"] is None
+    assert (await ledger.get_active_enrollment("bref_alice"))["card_last4"] == "7847"
+
+
+async def test_still_requires_action_after_grace_is_reconciled_without_terminal_guess(reap):
+    purchase_a, _ = await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(181)
+    assert await ledger.expire_overdue_purchases() == []
+    assert (await _step(purchase_a)).last_error_code == "enrollment_pending"
+
+
+async def test_a_live_pending_link_is_reused_not_reminted(reap):
+    """REQUIRES_ACTION with the link still live: B waits on the SAME row and the SAME link. One
+    pending row per buyer; no second enrollment at Reap."""
+    purchase_a, ours = await _purchase_a_waiting_on_a_link(reap)
+    reap.calls.clear()
+    purchase_b = await _start()
+    result = await _step(purchase_b)
+    assert result.state == "needs_enrollment"
+    assert reap.named("create_enrollment") == []
+    b = await _get(purchase_b)
+    assert b["enrollment_id"] == ours
+    assert b["hosted_url"] == STAGING_LINK
+    assert b["hosted_url_expires_at"] == (await _get(purchase_a))["hosted_url_expires_at"]
+    assert len(await _enrollments()) == 1
+
+
+async def test_a_dying_link_is_not_reused_inside_the_grace_the_purchase_holds(reap):
+    """REFUSING EXAMPLE, twice: a link with < 60 s left, and one 9 s dead, are not handed to B —
+    and inside the grace the row is not retired either (Reap may still turn it ACTIVE). B holds
+    in 'resolving' on the needs_enrollment cadence and mints nothing."""
+    await _purchase_a_waiting_on_a_link(reap)
+    for seconds_past in (-30, 9):  # 30 s LEFT, then 9 s PAST
+        await _age_links(seconds_past)
+        reap.calls.clear()
+        purchase_b = await _start()
+        result = await _step(purchase_b)
+        assert (result.outcome, result.state) == ("released", "resolving")
+        assert result.last_error_code == "enrollment_settling"
+        assert result.next_poll_in_seconds == 30
+        assert reap.named("create_enrollment") == []
+        assert [r["status"] for r in await _enrollments()] == ["pending"]
+        b = await _get(purchase_b)
+        assert b["hosted_url"] is None and b["enrollment_id"] is None
+
+
+async def test_a_held_purchase_proceeds_when_reap_turns_active(reap):
+    await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(9)
+    purchase_b = await _start()
+    assert (await _step(purchase_b)).last_error_code == "enrollment_settling"
+    reap.get_enrollment = _ok(_enrollment_active())
+    assert (await _step(purchase_b)).state == "quoting"
+    assert reap.named("create_enrollment") == [reap.named("create_enrollment")[0]], "only A's"
+
+
+@pytest.mark.parametrize(
+    "reap_says,seconds_past",
+    [("EXPIRED", 400), ("FAILED", -600), ("REVOKED", 9)],
+)
+async def test_a_dead_pending_enrollment_is_retired_and_a_new_attempt_minted(
+    reap, reap_says, seconds_past
+):
+    """The FRESH-ATTEMPT path. Only an authoritative terminal status at any time:
+    the old row goes 'dead', a NEW row (a NEW attempt id, so a new idempotency key at Reap) is
+    minted, and B is handed the NEW link — never the dead one."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(seconds_past)
+    if reap_says != "REQUIRES_ACTION":
+        reap.get_enrollment = _ok(dict(_enrollment_requires_action(), status=reap_says, nextAction=None))
+    new_reap_id = "22222222-2222-2222-2222-222222222222"
+    new_link = "https://pay.prava.space/enroll/ses_NEW"
+    reap.create_enrollment = _ok(_enrollment_requires_action(new_reap_id, new_link))
+    reap.calls.clear()
+
+    purchase_b = await _start()
+    result = await _step(purchase_b)
+
+    assert result.state == "needs_enrollment"
+    [created] = reap.named("create_enrollment")
+    assert created["attempt_id"] != old
+    rows = {r["id"]: r for r in await _enrollments()}
+    assert rows[old]["status"] == "dead"
+    assert rows[old]["reap_status"] == reap_says
+    fresh = rows[created["attempt_id"]]
+    assert (fresh["status"], fresh["reap_enrollment_id"]) == ("pending", new_reap_id)
+    assert sum(r["status"] == "pending" for r in rows.values()) == 1
+    b = await _get(purchase_b)
+    assert (b["enrollment_id"], b["hosted_url"]) == (created["attempt_id"], new_link)
+
+
+async def test_a_stored_link_we_would_not_vouch_for_is_never_reused(reap):
+    """REFUSING EXAMPLE: the row's link is re-checked against the allowlist before it is handed
+    to another purchase. An unsafe link is never reused, and pending enrollment is retained for reconciliation."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET hosted_url = 'https://evilprava.space/enroll/x' "
+        "WHERE id = :i", {"i": old},
+    )
+    reap.create_enrollment = _ok(
+        _enrollment_requires_action("33333333-3333-3333-3333-333333333333")
+    )
+    purchase_b = await _start()
+    reap.calls.clear()
+    assert (await _step(purchase_b)).last_error_code == "enrollment_settling"
+    assert reap.named("create_enrollment") == []
+    assert "evilprava" not in str((await _get(purchase_b))["hosted_url"])
+    assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
+
+
+async def test_an_unknown_status_on_the_pending_enrollment_never_advances(reap):
+    """REFUSING EXAMPLE: not reused, not retired, not activated, nothing minted."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    reap.get_enrollment = _ok(dict(_enrollment_active(), status="SOMETHING_NEW"))
+    reap.calls.clear()
+    purchase_b = await _start()
+    result = await _step(purchase_b)
+    assert (result.outcome, result.last_error_code) == ("released", "unknown_enrollment_status")
+    assert reap.named("create_enrollment") == []
+    assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
+    assert await ledger.get_active_enrollment("bref_alice") is None
+
+
+async def test_a_transport_failure_reading_the_pending_enrollment_releases(reap):
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    reap.get_enrollment = _transport()
+    reap.calls.clear()
+    purchase_b = await _start()
+    result = await _step(purchase_b)
+    assert (result.outcome, result.state) == ("released", "resolving")
+    assert result.last_error_code == "transport_error:readtimeout"
+    assert result.next_poll_in_seconds == 120
+    assert reap.named("create_enrollment") == []
+    assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
+
+
+@pytest.mark.parametrize("status,code", [(500, "reap_status_500"), (404, "reap_status_404")])
+async def test_a_failed_read_inside_the_grace_releases_without_minting(reap, status, code):
+    """Review of #2483, P2-4. Inside the grace the row may yet settle: a failed read — any
+    status, even a 404 — RELEASES with backoff. Nothing is minted around it, nothing retired."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    reap.get_enrollment = rc.ReapResponse(ok=False, status=status, error=code)
+    reap.calls.clear()
+    purchase_b = await _start()
+    result = await _step(purchase_b)
+    assert (result.outcome, result.state, result.last_error_code) == ("released", "resolving", code)
+    assert result.next_poll_in_seconds == 120, "the doubled backoff, not the plain interval"
+    assert reap.named("create_enrollment") == []
+    assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
+
+
+async def test_a_partner_error_past_the_grace_fails_without_minting(reap):
+    """FAIL CLOSED: past the grace, a failure that is NOT "no such enrollment" fails the
+    purchase by the partner's code; the row stays for an operator (runbook)."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(400)
+    reap.get_enrollment = rc.ReapResponse(ok=False, status=500, error="reap_status_500")
+    reap.calls.clear()
+    purchase_b = await _start()
+    result = await _step(purchase_b)
+    assert (result.state, result.last_error_code) == ("failed", "reap_status_500")
+    assert reap.named("create_enrollment") == []
+    assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        rc.ReapResponse(ok=False, status=404, error="reap_status_404"),
+        rc.ReapResponse(ok=False, status=410, error="reap_status_410"),
+        rc.ReapResponse(ok=False, status=400, error="reap_status_400",
+                        error_code="AGENTIC_RESOURCE_NOT_FOUND"),
+    ],
+    ids=["404", "410", "not_found_code"],
+)
+async def test_no_such_enrollment_past_the_grace_retires_the_row_and_mints_fresh(reap, response):
+    """Review of #2483, P2-4. The sticky mode: a pending row Reap no longer knows used to fail
+    EVERY later purchase of the buyer. Past the grace it is retired with the partner's code and
+    a new attempt is minted."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(400)
+    reap.get_enrollment = response
+    reap.create_enrollment = _ok(
+        _enrollment_requires_action("99999999-9999-9999-9999-999999999999")
+    )
+    reap.calls.clear()
+    purchase_b = await _start()
+    assert (await _step(purchase_b)).state == "needs_enrollment"
+    retired = await ledger.get_enrollment_internal(old)
+    assert retired["status"] == "dead"
+    [created] = reap.named("create_enrollment")
+    assert created["attempt_id"] != old
+
+
+async def test_a_malformed_partner_id_on_the_pending_row_fails_without_a_read(reap):
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET reap_enrollment_id = 'not/a-uuid' WHERE id = :i",
+        {"i": old},
+    )
+    reap.calls.clear()
+    purchase_b = await _start()
+    result = await _step(purchase_b)
+    assert (result.state, result.last_error_code) == ("failed", "partner_id_malformed")
+    assert reap.named("get_enrollment") == [] and reap.named("create_enrollment") == []
+
+
+async def test_the_reconcile_read_is_guarded_by_the_ownership_re_read(reap, monkeypatch):
+    """A worker whose lease moved AFTER the step's earlier re-read (here: while the pending row
+    was being read) spends no GET on the pending enrollment — the re-read in front of the GET is
+    what catches it, not the one before the email check."""
+    await _purchase_a_waiting_on_a_link(reap)
+    purchase_b = await _start()
+    await _claim(purchase_b, "w1")
+    real = ledger.get_pending_enrollments
+
+    async def _steal_then_read(buyer_ref):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET claimed_by = 'worker-b' WHERE id = :i",
+            {"i": purchase_b},
+        )
+        return await real(buyer_ref)
+
+    monkeypatch.setattr(ledger, "get_pending_enrollments", _steal_then_read)
+    reap.calls.clear()
+    result = await svc.advance(purchase_b, "w1")
+    assert result.outcome == "lost_claim"
+    assert reap.named("get_enrollment") == []
+    assert reap.named("create_enrollment") == []
+
+
+async def test_activation_that_loses_to_a_retire_does_not_quote(reap, monkeypatch):
+    """FAIL CLOSED. Reap says ACTIVE but our row was retired between the read and the write, and
+    the buyer has no other active card: 'resolving' holds, 'needs_enrollment' fails — neither
+    quotes on a card our ledger calls dead."""
+    purchase_a, old = await _purchase_a_waiting_on_a_link(reap)
+    reap.get_enrollment = _ok(_enrollment_active())
+    real = ledger.mark_enrollment_active
+
+    async def _retired_first(enrollment_id, **kwargs):
+        await ledger.mark_enrollment_dead(enrollment_id)
+        return await real(enrollment_id, **kwargs)
+
+    monkeypatch.setattr(ledger, "mark_enrollment_active", _retired_first)
+    result = await _step(purchase_a)
+    assert (result.state, result.last_error_code) == ("failed", "enrollment_not_activatable")
+
+
+async def test_activation_that_loses_to_another_card_quotes_on_that_card(reap, monkeypatch):
+    """The control: the concurrent winner IS an active card for this buyer, so it is the one."""
+    purchase_a, old = await _purchase_a_waiting_on_a_link(reap)
+    reap.get_enrollment = _ok(_enrollment_active())
+    winner = await _active_enrollment(reap_id="44444444-4444-4444-4444-444444444444")
+
+    async def _lost(enrollment_id, **kwargs):
+        return None
+
+    monkeypatch.setattr(ledger, "mark_enrollment_active", _lost)
+    # The step reads get_active_enrollment FIRST and would short-circuit; hide the winner from
+    # that first read only, so the activation path is the one under test.
+    real_get = ledger.get_active_enrollment
+    reads = []
+
+    async def _hidden_once(buyer_ref):
+        reads.append(buyer_ref)
+        return None if len(reads) == 1 else await real_get(buyer_ref)
+
+    monkeypatch.setattr(ledger, "get_active_enrollment", _hidden_once)
+    result = await _step(purchase_a)
+    assert result.state == "quoting"
+    assert (await _get(purchase_a))["enrollment_id"] == winner["id"]
+
+
+async def test_a_replayed_create_with_a_dead_link_is_retired_not_handed_out(reap):
+    """THE OTHER REPLAY. A pending row with NO partner id (its create's response was lost) is
+    replayed, as it should be — but the replay can come back with a link that is already dead.
+    That link is recorded, retired, and never reaches the purchase; the next step mints a NEW
+    attempt."""
+    stale = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    reap.create_enrollment = _ok(_enrollment_requires_action(expires_in=-600))
+    purchase = await _start()
+    result = await _step(purchase)
+    assert (result.outcome, result.state) == ("released", "resolving")
+    assert result.last_error_code == "enrollment_link_expired"
+    assert reap.named("create_enrollment")[0]["attempt_id"] == stale["id"]
+    row = await ledger.get_enrollment_internal(stale["id"])
+    assert (row["status"], row["reap_enrollment_id"]) == ("dead", STAGING_ENROLLMENT)
+    assert (await _get(purchase))["hosted_url"] is None
+
+    reap.create_enrollment = _ok(
+        _enrollment_requires_action("55555555-5555-5555-5555-555555555555")
+    )
+    assert (await _step(purchase)).state == "needs_enrollment"
+    assert reap.named("create_enrollment")[1]["attempt_id"] != stale["id"]
+
+
+async def test_a_pending_row_the_ledger_refuses_holds_the_purchase(reap):
+    """A pending row with a DEAD link but no partner id cannot be reconciled (nothing to read)
+    and the ledger will not hand it back as an attempt. The purchase holds with a named code."""
+    stale = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET hosted_url_expires_at = datetime('now', '-60 seconds') "
+        "WHERE id = :i", {"i": stale["id"]},
+    )
+    purchase = await _start()
+    result = await _step(purchase)
+    assert (result.outcome, result.last_error_code) == ("released", "enrollment_pending_expired")
+    assert reap.named("create_enrollment") == []
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [(None, 180), ("", 180), ("0", 0), ("600", 600), ("3600", 3600),
+     ("-1", 180), ("3601", 180), ("abc", 180), ("1.5", 180)],
+)
+def test_the_enrollment_grace_dial(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv(svc.REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(svc.REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS_ENV, raw)
+    assert svc.enrollment_grace_seconds() == expected
+
+
+async def test_the_grace_dial_moves_the_services_hold_window(reap, monkeypatch):
+    """Grace 0 cannot turn a hosted deadline into proof of a failed enrollment."""
+    monkeypatch.setenv(svc.REAP_AGENTIC_ENROLLMENT_GRACE_SECONDS_ENV, "0")
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(9)
+    reap.create_enrollment = _ok(
+        _enrollment_requires_action("66666666-6666-6666-6666-666666666666")
+    )
+    purchase_b = await _start()
+    assert (await _step(purchase_b)).last_error_code == "enrollment_settling"
+    assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
+
+
+# ── review of #2483 at 93f585c26: the five findings, through `advance` on the real ledger ────
+
+
+def _create_keyed_by_attempt():
+    """`create_enrollment` as Reap's idempotency makes it: ONE enrollment per attempt id, and the
+    same answer every time that attempt is replayed."""
+    import uuid as _uuid
+
+    def _create(**kwargs):
+        attempt = str(kwargs["attempt_id"])
+        enrollment = str(_uuid.uuid5(_uuid.NAMESPACE_OID, attempt))
+        return _ok(_enrollment_requires_action(
+            enrollment, url=f"https://pay.prava.space/enroll/{attempt}"
+        ))
+
+    return _create
+
+
+async def _set_created_at(enrollment_id: str, seconds_ago: int) -> None:
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET created_at = datetime('now', :shift) WHERE id = :i",
+        {"shift": f"-{int(seconds_ago)} seconds", "i": enrollment_id},
+    )
+
+
+async def _pending_count(buyer_ref: str = "bref_alice") -> int:
+    return int(await database.fetch_val(
+        "SELECT COUNT(*) FROM reap_agentic_enrollments WHERE buyer_ref = :b AND status = 'pending'",
+        {"b": buyer_ref},
+    ))
+
+
+async def _drop_one_pending_index() -> None:
+    """A database migration 252 has not reached (prod applies migrations by hand)."""
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
+
+
+# P1-1 — a create that answers with an enrollment id another row of ours already holds.
+
+
+async def test_r3_a_create_returning_an_id_we_hold_on_a_dead_row_fails_by_name(reap):
+    """THE REVIEWER'S REPRO. A is retired past the grace (it keeps its partner id); B mints N;
+    Reap answers N's create with A's enrollment. That used to be a raw IntegrityError out of
+    `advance` on every poll, for every later purchase. Now: N is retired, B fails
+    `enrollment_id_conflict`, A is not resurrected — and C, the next purchase, gets the same
+    named answer instead of an exception."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await ledger.mark_enrollment_dead(old, reap_status="EXPIRED")
+    for _ in range(2):  # B, then C
+        reap.calls.clear()
+        purchase = await _start()
+        result = await _step(purchase)
+        assert (result.state, result.last_error_code) == ("failed", "enrollment_id_conflict")
+        [created] = reap.named("create_enrollment")
+        attempt = await ledger.get_enrollment_internal(created["attempt_id"])
+        assert attempt["status"] == "dead" and attempt["reap_enrollment_id"] is None
+        assert (await ledger.get_enrollment_internal(old))["status"] == "dead"
+        assert await _pending_count() == 0
+        assert await ledger.get_active_enrollment("bref_alice") is None
+
+
+async def test_a_create_returning_another_buyers_enrollment_fails_and_touches_nothing(reap):
+    """REFUSING EXAMPLE: the holder is ANOTHER buyer's row. Nothing of theirs is written."""
+    bob = await ledger.upsert_pending_enrollment(
+        buyer_ref="bref_bob", reap_enrollment_id=STAGING_ENROLLMENT,
+        hosted_url=STAGING_LINK,
+        hosted_url_expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+    reap.create_enrollment = _ok(_enrollment_requires_action())
+    purchase = await _start()
+    result = await _step(purchase)
+    assert (result.state, result.last_error_code) == ("failed", "enrollment_id_conflict")
+    after = await ledger.get_enrollment_internal(bob["id"])
+    assert (after["status"], after["hosted_url"]) == ("pending", STAGING_LINK)
+    assert await _pending_count() == 0
+
+
+async def test_a_create_returning_another_buyers_ACTIVE_card_never_quotes_on_it(reap):
+    """FAIL CLOSED, the case that matters: the holder is another buyer's ACTIVE card. Quoting on
+    it would charge THEIR card for OUR buyer's purchase. Refused by name; their row untouched."""
+    theirs = "55555555-5555-5555-5555-555555555555"
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id, "
+        "card_last4) VALUES ('re_bobs_card', 'bref_bob', 'active', :r, '1111')",
+        {"r": theirs},
+    )
+    reap.create_enrollment = _ok(_enrollment_requires_action(theirs))
+    purchase = await _start()
+    result = await _step(purchase)
+    assert (result.state, result.last_error_code) == ("failed", "enrollment_id_conflict")
+    assert (await _get(purchase))["enrollment_id"] != "re_bobs_card"
+    assert reap.named("create_checkout") == []
+    bob = await ledger.get_active_enrollment("bref_bob")
+    assert (bob["id"], bob["card_last4"]) == ("re_bobs_card", "1111")
+
+
+async def test_a_create_returning_this_buyers_active_enrollment_quotes_on_it(reap):
+    """The holder became this buyer's ACTIVE card while we were creating (a concurrent step
+    activated it). The purchase quotes on that card; our attempt is retired."""
+    held = "66666666-6666-6666-6666-666666666666"
+
+    async def _create(**kwargs):
+        await database.execute(
+            "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id) "
+            "VALUES ('re_winner', 'bref_alice', 'active', :r)",
+            {"r": held},
+        )
+        return _ok(_enrollment_requires_action(held))
+
+    reap.create_enrollment = _create
+    purchase = await _start()
+    result = await _step(purchase)
+    assert result.state == "quoting"
+    assert (await _get(purchase))["enrollment_id"] == "re_winner"
+    [created] = reap.named("create_enrollment")
+    assert (await ledger.get_enrollment_internal(created["attempt_id"]))["status"] == "dead"
+
+
+async def test_a_create_returning_this_buyers_pending_enrollment_reuses_it(reap):
+    """The holder is this buyer's PENDING row (created concurrently; possible only without
+    migration 252's index). It is reconciled like any pending row — here its link is live, so
+    the purchase waits on IT and our attempt is retired."""
+    await _drop_one_pending_index()
+    holder_link = "https://pay.prava.space/enroll/HOLDER"
+    holder_id = "77777777-7777-7777-7777-777777777777"
+
+    async def _create(**kwargs):
+        # A concurrent mint's recorded answer, landing while our create is in flight.
+        await database.execute(
+            "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id, "
+            "hosted_url, hosted_url_expires_at) VALUES ('re_holder', 'bref_alice', 'pending', "
+            ":r, :u, datetime('now', '+600 seconds'))",
+            {"r": holder_id, "u": holder_link},
+        )
+        return _ok(_enrollment_requires_action(holder_id, url=holder_link))
+
+    reap.create_enrollment = _create
+    reap.get_enrollment = _reap_echoes_the_session()
+    purchase = await _start()
+    result = await _step(purchase)
+    assert result.state == "needs_enrollment"
+    row = await _get(purchase)
+    assert (row["enrollment_id"], row["hosted_url"]) == ("re_holder", holder_link)
+    [created] = reap.named("create_enrollment")
+    assert (await ledger.get_enrollment_internal(created["attempt_id"]))["status"] == "dead"
+
+
+# P2-1 — two purchases of one buyer in one tick.
+
+
+async def _race_two_purchases(reap, monkeypatch):
+    """Purchase 1 and purchase 2 of ONE buyer, stepped so that 2 runs its WHOLE step between
+    1's read of the buyer's pending rows (none) and 1's INSERT — the interleaving two workers
+    with two leases can produce in one poll tick."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await ledger.mark_enrollment_dead(old, reap_status="EXPIRED")  # Verified terminal fixture.
+    reap.create_enrollment = _create_keyed_by_attempt()
+    reap.calls.clear()
+    first, second = await _start(), await _start()
+    real = ledger.get_pending_enrollments
+    calls = {"n": 0}
+
+    async def _interleaved(buyer_ref):
+        rows = await real(buyer_ref)
+        calls["n"] += 1
+        if calls["n"] == 2:                 # purchase 1, inside its mint, after A was retired
+            await _step(second, "w2")
+        return rows
+
+    monkeypatch.setattr(ledger, "get_pending_enrollments", _interleaved)
+    one = await _step(first, "w1")
+    monkeypatch.setattr(ledger, "get_pending_enrollments", real)
+    return first, second, one
+
+
+async def test_r1_two_purchases_of_one_buyer_share_one_attempt(reap, monkeypatch):
+    """THE REVIEWER'S REPRO, with migration 252's index: the second INSERT is refused, the
+    ledger hands back the winner, and both purchases wait on ONE row, ONE enrollment, ONE link."""
+    first, second, one = await _race_two_purchases(reap, monkeypatch)
+    assert one.state == "needs_enrollment"
+    assert (await _get(second))["state"] == "needs_enrollment"
+    assert await _pending_count() == 1
+    a, b = await _get(first), await _get(second)
+    assert a["enrollment_id"] == b["enrollment_id"]
+    assert a["hosted_url"] == b["hosted_url"]
+    attempts = {c["attempt_id"] for c in reap.named("create_enrollment")}
+    assert attempts == {a["enrollment_id"]}, "a replay of the winner's attempt, not a second one"
+
+
+async def test_without_the_index_the_race_mints_two_and_the_next_purchase_reconciles_both(
+    reap, monkeypatch
+):
+    """BEFORE MIGRATION 252 IS APPLIED the race still mints two pending rows (the index is the
+    only thing that can prevent it) — but nothing is stranded: the next purchase reconciles
+    EVERY pending row, and the one the buyer finished is activated."""
+    await _drop_one_pending_index()
+    first, second, _ = await _race_two_purchases(reap, monkeypatch)
+    assert await _pending_count() == 2
+    finished = (await _get(first))["enrollment_id"]
+    finished_row = await ledger.get_enrollment_internal(finished)
+
+    async def _reap_says(**kwargs):
+        if kwargs["id"] == finished_row["reap_enrollment_id"]:
+            return _ok(_enrollment_active(kwargs["id"]))
+        return await _reap_echoes_the_session()(**kwargs)
+
+    reap.get_enrollment = _reap_says
+    third = await _start()
+    assert (await _step(third)).state == "quoting"
+    assert (await _get(third))["enrollment_id"] == finished
+    assert (await ledger.get_active_enrollment("bref_alice"))["id"] == finished
+
+
+async def _two_pending_rows_without_the_index():
+    await _drop_one_pending_index()
+    rows = []
+    for n, (reap_id, age) in enumerate((
+        ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 120),
+        ("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 60),
+    )):
+        await database.execute(
+            "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id, "
+            "hosted_url, hosted_url_expires_at) VALUES (:i, 'bref_alice', 'pending', :r, :u, "
+            "datetime('now', '+600 seconds'))",
+            {"i": f"re_dup{n}", "r": reap_id, "u": f"https://pay.prava.space/enroll/dup{n}"},
+        )
+        await _set_created_at(f"re_dup{n}", age)
+        rows.append((f"re_dup{n}", reap_id))
+    return rows
+
+
+async def test_with_two_live_pending_rows_the_oldest_is_reused_deterministically(reap):
+    (older, _), (newer, _) = await _two_pending_rows_without_the_index()
+    reap.get_enrollment = _reap_echoes_the_session()
+    purchase = await _start()
+    assert (await _step(purchase)).state == "needs_enrollment"
+    assert (await _get(purchase))["enrollment_id"] == older
+    assert reap.named("create_enrollment") == []
+    assert [r["id"] for r in await ledger.get_pending_enrollments("bref_alice")] == [older, newer]
+
+
+async def test_an_active_newer_pending_row_wins_over_a_live_older_one(reap):
+    """ACTIVE anywhere wins: the buyer finished the NEWER link; reusing the older one would ask
+    for the card again and leave the finished one pending here, ACTIVE at Reap."""
+    (older, _), (newer, newer_reap) = await _two_pending_rows_without_the_index()
+
+    async def _reap_says(**kwargs):
+        if kwargs["id"] == newer_reap:
+            return _ok(_enrollment_active(newer_reap))
+        return await _reap_echoes_the_session()(**kwargs)
+
+    reap.get_enrollment = _reap_says
+    purchase = await _start()
+    assert (await _step(purchase)).state == "quoting"
+    assert (await _get(purchase))["enrollment_id"] == newer
+    assert (await ledger.get_active_enrollment("bref_alice"))["id"] == newer
+
+
+# P2-2 — a stored link with NO expiry.
+
+
+async def test_r2_a_pending_link_with_no_expiry_is_not_reused_for_ever(reap):
+    """THE REVIEWER'S REPRO. A link stored without an expiry, 7200 s old: dated from created_at
+    + Reap's 15-minute session, it cannot be reused, but a clock cannot establish a provider terminal."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET hosted_url_expires_at = NULL WHERE id = :i",
+        {"i": old},
+    )
+    await _set_created_at(old, 7200)
+    reap.create_enrollment = _ok(
+        _enrollment_requires_action("12121212-1212-1212-1212-121212121212",
+                                    url="https://pay.prava.space/enroll/FRESH")
+    )
+    purchase = await _start()
+    reap.calls.clear()
+    assert (await _step(purchase)).last_error_code == "enrollment_settling"
+    assert (await _get(purchase))["hosted_url"] is None
+    assert reap.named("create_enrollment") == []
+    assert (await ledger.get_enrollment_internal(old))["status"] == "pending"
+
+
+async def test_a_young_pending_link_with_no_expiry_is_reused_with_an_estimated_expiry(reap):
+    """The control: 100 s old, no expiry → still live (created + 15 min). It is reused, and the
+    purchase carries the ESTIMATE so the sweep bounds it by the link's life."""
+    _, old = await _purchase_a_waiting_on_a_link(reap)
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET hosted_url_expires_at = NULL WHERE id = :i",
+        {"i": old},
+    )
+    await _set_created_at(old, 100)
+    reap.calls.clear()
+    purchase = await _start()
+    assert (await _step(purchase)).state == "needs_enrollment"
+    row = await _get(purchase)
+    assert row["enrollment_id"] == old and reap.named("create_enrollment") == []
+    created = (await ledger.get_pending_enrollments("bref_alice"))[0]["created_at"]
+    assert row["hosted_url_expires_at"] == created + timedelta(seconds=ledger.HOSTED_SESSION_SECONDS)
+
+
+# P2-3 — the hold re-check does not resolve again, and does not spend attempts.
+
+
+async def test_a_settling_re_check_does_not_re_run_the_resolve(reap):
+    await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(9)
+    purchase = await _start()
+    assert (await _step(purchase)).last_error_code == "enrollment_settling"
+    reap.calls.clear()
+    again = await _step(purchase)
+    assert again.last_error_code == "enrollment_settling"
+    assert reap.named("resolve_our_row") == [], "the hold re-check asks the enrollment question only"
+    assert len(reap.named("get_enrollment")) == 1
+    # And when the hold ends, the WHOLE step runs: resolve, then the decision, then quoting.
+    reap.get_enrollment = _ok(_enrollment_active())
+    reap.calls.clear()
+    assert (await _step(purchase)).state == "quoting"
+    assert reap.named("resolve_our_row"), "a hold that ends runs the resolve and its refusals"
+
+
+async def test_a_settling_hold_does_not_spend_the_attempt_ceiling(reap):
+    """Claims of a held row are EXEMPT from `attempts`; any other 'resolving' release counts."""
+    await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(9)
+    purchase = await _start()
+
+    async def _claim_for_real():
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET next_poll_at = datetime('now', '-1 seconds') "
+            "WHERE id = :i", {"i": purchase},
+        )
+        claimed = [r for r in await ledger.claim_due_purchases("w1") if r["id"] == purchase]
+        assert claimed, "the row must be claimable"
+        return claimed[0]["attempts"]
+
+    first = await _claim_for_real()                      # a fresh row: counts
+    assert (await svc.advance(purchase, "w1")).last_error_code == "enrollment_settling"
+    for _ in range(3):
+        assert await _claim_for_real() == first, "a settling claim is not an attempt"
+        assert (await svc.advance(purchase, "w1")).last_error_code == "enrollment_settling"
+    reap.get_enrollment = _transport()
+    await _claim_for_real()
+    assert (await svc.advance(purchase, "w1")).last_error_code == "transport_error:readtimeout"
+    assert await _claim_for_real() == first + 1, "any other release in 'resolving' still counts"
+
+
+# Nits.
+
+
+async def test_a_fresher_link_from_reaps_read_is_used_over_the_stored_one(reap):
+    """Reap's GET carries a `nextAction`: it is vetted by the allowlist and used — link and
+    expiry — instead of the stored one, which here has already died."""
+    await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(9)
+    fresh = "https://pay.prava.space/enroll/ses_REFRESHED"
+    reap.get_enrollment = _ok(_enrollment_requires_action(url=fresh, expires_in=600))
+    purchase = await _start()
+    assert (await _step(purchase)).state == "needs_enrollment"
+    row = await _get(purchase)
+    assert row["hosted_url"] == fresh
+    assert row["hosted_url_expires_at"] > datetime.now(timezone.utc) + timedelta(seconds=500)
+
+
+async def test_a_fresher_link_we_would_not_vouch_for_is_not_used(reap):
+    await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(9)
+    reap.get_enrollment = _ok(
+        _enrollment_requires_action(url="https://evilprava.space/enroll/x", expires_in=600)
+    )
+    purchase = await _start()
+    result = await _step(purchase)
+    assert result.last_error_code == "enrollment_settling", "stored link (dead, in grace) → hold"
+
+
+async def test_a_repeated_settling_hold_logs_warning_once_then_info(reap, caplog):
+    await _purchase_a_waiting_on_a_link(reap)
+    await _age_links(9)
+    purchase = await _start()
+    caplog.set_level(logging.INFO, logger=svc.logger.name)
+    for _ in range(3):
+        await _step(purchase)
+    held = [r for r in caplog.records if "enrollment_settling" in r.getMessage()]
+    assert [r.levelno for r in held] == [logging.WARNING, logging.INFO, logging.INFO]
+
+
+async def test_a_buyer_on_the_enrollment_page_logs_warning_once_then_info(reap, caplog):
+    caplog.set_level(logging.INFO, logger=svc.logger.name)
+    purchase, _ = await _purchase_a_waiting_on_a_link(reap)
+    for _ in range(3):
+        result = await _step(purchase)
+        assert result.last_error_code == "enrollment_pending"
+    held = [r for r in caplog.records if "held at enrollment_pending," in r.getMessage()]
+    assert [r.levelno for r in held] == [logging.WARNING, logging.INFO, logging.INFO, logging.INFO]
+
+
+# ── round-2 review of #2483 at 8df71dd6e, P2-A: two creates of ONE attempt, concurrently ─────
+
+
+def _in_progress() -> rc.ReapResponse:
+    """Reap's 409 for an Idempotency-Key whose first call is still running — the shape the
+    client builds from the error body (`error.code`, shape-checked)."""
+    return rc.ReapResponse(
+        ok=False, status=409, error="reap_status_409",
+        error_code="IDEMPOTENCY_REQUEST_IN_PROGRESS",
+    )
+
+
+def _concurrent_create():
+    """A `create_enrollment` whose FIRST call blocks until a SECOND call for the same attempt
+    arrives, and answers that second one 409 IDEMPOTENCY_REQUEST_IN_PROGRESS — two workers
+    creating the winner's attempt at the same moment, as Reap sees it."""
+    import asyncio
+
+    state = {"calls": [], "second_arrived": asyncio.Event()}
+
+    async def _create(**kwargs):
+        state["calls"].append(kwargs["attempt_id"])
+        if len(state["calls"]) == 1:
+            await asyncio.wait_for(state["second_arrived"].wait(), timeout=20)
+            return _ok(_enrollment_requires_action())
+        state["second_arrived"].set()
+        return _in_progress()
+
+    return _create, state
+
+
+@pytest.mark.parametrize("second_answer", ["IDEMPOTENCY_REQUEST_IN_PROGRESS",
+                                           "IDEMPOTENT_PARAMETER_MISMATCH"])
+async def test_two_purchases_creating_one_attempt_concurrently_both_wait_on_one_link(
+    reap, second_answer
+):
+    """P2-A. Both purchases of one first-time buyer step AT ONCE (asyncio.gather): one mints the
+    buyer's pending row, the other is handed it (or loses the INSERT and is handed the winner),
+    and both call `create_enrollment` with the SAME attempt while the first is still in flight.
+    Reap's 409 for the second is a RELEASE, not a failure; on its next poll that purchase
+    reuses the winner's stored session. One pending row, one enrollment at Reap, one link."""
+    import asyncio
+
+    create, state = _concurrent_create()
+    if second_answer != "IDEMPOTENCY_REQUEST_IN_PROGRESS":
+        async def _mismatch(**kwargs):
+            answer = await create(**kwargs)
+            if not answer.ok:
+                return rc.ReapResponse(ok=False, status=422, error="reap_status_422",
+                                       error_code=second_answer)
+            return answer
+        reap.create_enrollment = _mismatch
+    else:
+        reap.create_enrollment = create
+    reap.get_enrollment = _reap_echoes_the_session()
+    first, second = await _start(), await _start()
+    await _claim(first, "w1")
+    await _claim(second, "w2")
+
+    results = await asyncio.gather(svc.advance(first, "w1"), svc.advance(second, "w2"))
+
+    assert len(state["calls"]) == 2 and len(set(state["calls"])) == 1, "ONE attempt, created twice"
+    outcomes = sorted((r.outcome, r.state, r.last_error_code) for r in results)
+    loser_code = "idempotency_request_in_progress" if second_answer.startswith("IDEMPOTENCY") \
+        else "idempotent_parameter_mismatch"
+    assert outcomes == sorted([("advanced", "needs_enrollment", None),
+                               ("released", "resolving", loser_code)])
+    loser = next(pid for pid, r in zip((first, second), results) if r.outcome == "released")
+    assert (await _get(loser))["state"] == "resolving", "released, not failed"
+
+    reap.calls.clear()
+    assert (await _step(loser, "w3")).state == "needs_enrollment"
+    assert reap.named("create_enrollment") == [], "the next poll REUSES the winner's session"
+    a, b = await _get(first), await _get(second)
+    assert a["enrollment_id"] == b["enrollment_id"] == state["calls"][0]
+    assert a["hosted_url"] == b["hosted_url"] == STAGING_LINK
+    assert await _pending_count() == 1
+    assert "failed" not in {a["state"], b["state"]}
+
+
+# Checkout outcome reconciliation: local clocks never decide whether the buyer paid.
+async def _recovery_checkout():
+    await _active_enrollment()
+    purchase_id = await _start()
+    await _step(purchase_id)
+    await _step(purchase_id)
+    assert (await _get(purchase_id))["state"] == "awaiting_approval"
+    from db.database import database, IS_POSTGRES
+    old = "clock_timestamp() - INTERVAL '25 days'" if IS_POSTGRES else "datetime('now', '-25 days')"
+    await database.execute(
+        f"UPDATE reap_agentic_purchases SET hosted_url_expires_at = {old}, "
+        f"state_entered_at = {old}, next_poll_at = {old}, attempts = 1005 WHERE id = :id",
+        {"id": purchase_id},
+    )
+    import db.reap_agentic_ledger as ledger
+    await ledger.release_claim(purchase_id, "w1")
+    return purchase_id
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("PROCESSING", "processing"), ("COMPLETED", "completed"),
+    ("FAILED", "failed"), ("EXPIRED", "expired"),
+])
+async def test_recovery_late_authoritative_outcome_survives_all_local_sweeps(reap, attribution, status, expected):
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_purchase as svc
+    purchase_id = await _recovery_checkout()
+    before = await _get(purchase_id)
+    assert await ledger.expire_overdue_purchases() == []
+    assert await ledger.fail_exhausted_purchases(50, include_processing=True) == []
+    assert await ledger.scrub_reconciling_purchase_pii() == [purchase_id]
+    scrubbed = await _get(purchase_id)
+    for key in ("reap_checkout_id", "reap_quote_id", "quoted_total_minor", "currency", "click_id", "consent_version", "consented_at"):
+        assert scrubbed[key] == before[key]
+    assert scrubbed["shipping_address"] is None and scrubbed["buyer_email"] is None
+    assert await ledger.scrub_reconciling_purchase_pii() == []
+    reap.get_checkout = _ok(dict(CHECKOUT_COMPLETED, status=status))
+    result = await _step(purchase_id)
+    assert result.state == expected
+    assert (await _get(purchase_id))["state"] == expected
+    if expected == "completed":
+        assert len(attribution.calls) == 1
+        assert (await svc.advance(purchase_id, "other-worker")).outcome == "terminal"
+        assert len(attribution.calls) == 1
+
+
+async def test_recovery_prolonged_outage_and_disarm_do_not_strand_a_checkout(reap, attribution, monkeypatch):
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+    purchase_id = await _recovery_checkout()
+    # A new pre-checkout purchase must remain untouched while creates are disarmed.
+    untouched = await _start(agent_user_ref_hash="another-user", buyer_ref="another-buyer")
+    monkeypatch.setenv("REAP_AGENTIC_ENABLED", "0")
+    reap.get_checkout = _transport()
+    reap.calls.clear()
+    for n in range(3):
+        await database.execute("UPDATE reap_agentic_purchases SET next_poll_at = CURRENT_TIMESTAMP WHERE id = :id", {"id": purchase_id})
+        report = await job.run_reap_agentic_purchase_poll(worker_id=f"recovery-{n}")
+        assert report.claimed == 1 and report.expired == 0
+        assert (await _get(purchase_id))["state"] == "awaiting_approval"
+    row = await _get(purchase_id)
+    assert row["reap_checkout_id"] and row["buyer_email"] is None and row["shipping_address"] is None
+    assert (await _get(untouched))["state"] == "resolving"
+    assert reap.sequence() == ["get_checkout"] * 3
+    reap.get_checkout = _ok(CHECKOUT_COMPLETED)
+    await database.execute("UPDATE reap_agentic_purchases SET next_poll_at = CURRENT_TIMESTAMP WHERE id = :id", {"id": purchase_id})
+    await job.run_reap_agentic_purchase_poll(worker_id="recovered")
+    assert (await _get(purchase_id))["state"] == "completed"
+    assert len(attribution.calls) == 1
+
+
+async def test_recovery_sweep_during_provider_read_preserves_claim_and_one_conversion(reap, attribution, monkeypatch):
+    import asyncio
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_purchase as svc
+    purchase_id = await _recovery_checkout()
+    entered, resume = asyncio.Event(), asyncio.Event()
+    async def read(**kwargs):
+        entered.set()
+        await resume.wait()
+        return _ok(CHECKOUT_COMPLETED)
+    reap.get_checkout = read
+    await _claim(purchase_id, "reader")
+    task = asyncio.create_task(svc.advance(purchase_id, "reader"))
+    await asyncio.wait_for(entered.wait(), 5)
+    try:
+        assert await ledger.expire_overdue_purchases() == []
+        assert await ledger.fail_exhausted_purchases(50) == []
+        assert await ledger.scrub_reconciling_purchase_pii() == []
+        assert (await _get(purchase_id))["claimed_by"] == "reader"
+    finally:
+        resume.set()
+    assert (await task).state == "completed"
+    assert len(attribution.calls) == 1
+
+
+async def test_recovery_partial_claim_cancellation_releases_lease(reap, monkeypatch):
+    import asyncio
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+    purchase_id = await _recovery_checkout()
+    real = ledger.claim_due_purchases
+    async def partial(*args, **kwargs):
+        rows = await real(*args, **kwargs)
+        assert rows
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(ledger, "claim_due_purchases", partial)
+    with pytest.raises(asyncio.CancelledError):
+        await job.run_reap_agentic_purchase_poll(worker_id="cancelled-claim")
+    assert (await _get(purchase_id))["claimed_by"] is None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Independent stop, privacy and partial-acquisition regressions (#2490 follow-up).
+async def test_reconciliation_stop_blocks_provider_but_keeps_privacy(reap, monkeypatch):
+    import jobs.reap_agentic_purchase_poll as job
+    purchase_id = await _recovery_checkout()
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED', '0')
+    reap.calls.clear()
+    report = await job.run_reap_agentic_purchase_poll(worker_id='stop-all-provider')
+    assert report.claimed == 0 and reap.calls == []
+    row = await _get(purchase_id)
+    assert row['state'] == 'awaiting_approval' and row['buyer_email'] is None
+
+async def test_contact_scrub_uses_expired_link_before_max_age(reap):
+    from db.database import database, IS_POSTGRES
+    import db.reap_agentic_ledger as ledger
+    await _active_enrollment()
+    pid = await _start()
+    await _step(pid)
+    await _step(pid)
+    old = "clock_timestamp() - INTERVAL '20 minutes'" if IS_POSTGRES else "datetime('now','-20 minutes')"
+    await database.execute(f'UPDATE reap_agentic_purchases SET hosted_url_expires_at={old} WHERE id=:id', {'id':pid})
+    assert await ledger.scrub_reconciling_purchase_pii(max_age_seconds=3600) == []
+    await ledger.release_claim(pid, 'w1')
+    assert await ledger.scrub_reconciling_purchase_pii(max_age_seconds=3600) == [pid]
+    assert (await _get(pid))['state'] == 'awaiting_approval'
+
+async def test_paused_precheckout_rows_do_not_feed_stuck_count(reap, monkeypatch):
+    from db.database import database, IS_POSTGRES
+    import jobs.reap_agentic_purchase_poll as job
+    for state in ('resolving','quoting'):
+        pid = await _start(buyer_ref='paused_'+state)
+        old = "clock_timestamp() - INTERVAL '3 days'" if IS_POSTGRES else "datetime('now','-3 days')"
+        await database.execute(f'UPDATE reap_agentic_purchases SET state=:state,state_entered_at={old} WHERE id=:id', {'state':state,'id':pid})
+    monkeypatch.setenv('REAP_AGENTIC_ENABLED', '0')
+    reap.calls.clear()
+    report = await job.run_reap_agentic_purchase_poll(worker_id='paused-precheckout')
+    assert report.claimed == 0 and report.stuck_over_age == 0 and reap.calls == []
+
+async def test_missing_credentials_still_counts_exposed_stuck(reap, monkeypatch):
+    import jobs.reap_agentic_purchase_poll as job
+    await _recovery_checkout()
+    monkeypatch.delenv('REAP_API_KEY', raising=False)
+    reap.calls.clear()
+    report = await job.run_reap_agentic_purchase_poll(worker_id='no-credentials')
+    assert report.claimed == 0 and report.stuck_over_age == 1 and reap.calls == []
+
+async def test_partial_acquisition_cancellation_releases_first_lease(reap, monkeypatch):
+    import asyncio
+    from db.database import database, IS_POSTGRES
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+    for n in range(2): await _start(buyer_ref='partial_'+str(n))
+    real = database.fetch_one
+    seen = 0
+    sql = ledger._CLAIM_PURCHASE_SQL if IS_POSTGRES else ledger._CLAIM_PURCHASE_SQL_SQLITE
+    async def cancel_second(query, *args, **kwargs):
+        nonlocal seen
+        if query == sql:
+            seen += 1
+            if seen == 2: raise asyncio.CancelledError()
+        return await real(query, *args, **kwargs)
+    monkeypatch.setattr(database, 'fetch_one', cancel_second)
+    with pytest.raises(asyncio.CancelledError):
+        await job.run_reap_agentic_purchase_poll(worker_id='partial-real-loop')
+    assert seen == 2
+    rows = await database.fetch_all('SELECT claimed_by FROM reap_agentic_purchases')
+    assert all(row['claimed_by'] is None for row in rows)
+
+async def test_creation_privacy_cap_does_not_reset_and_resume_calls_no_provider(reap, monkeypatch):
+    from db.database import database, IS_POSTGRES
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_purchase as svc
+    old = "clock_timestamp() - INTERVAL '2 hours'" if IS_POSTGRES else "datetime('now','-2 hours')"
+    pid = await _start()
+    await database.execute(f"UPDATE reap_agentic_purchases SET state='quoting',created_at={old},attempts=55 WHERE id=:id", {'id':pid})
+    assert await ledger.scrub_reconciling_purchase_pii(max_age_seconds=900) == [pid]
+    row = await _get(pid)
+    assert row['state'] == 'quoting' and row['last_error_code'] == 'contact_retention_elapsed'
+    assert await ledger.fail_exhausted_purchases(50) == []
+    reap.calls.clear()
+    await _claim(pid, 'resume-no-contact')
+    result = await svc.advance(pid, 'resume-no-contact')
+    assert result.last_error_code == 'contact_retention_elapsed' and result.state == 'quoting'
+    assert (await _get(pid))['attempts'] == 55 and reap.calls == []
+
+@pytest.mark.parametrize('reason', ['reap_status_404','hosted_url_not_allowed','unknown_checkout_status'])
+async def test_permanent_checkout_read_enters_human_review_without_terminalizing(reap, monkeypatch, reason):
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+    import services.reap_agentic_client as rc
+    pid = await _recovery_checkout()
+    if reason == 'unknown_checkout_status':
+        reap.get_checkout = _ok({'status':'UNRECOGNIZED'})
+    else:
+        reap.get_checkout = rc.ReapResponse(ok=False,status=404,error=reason)
+    # SQLite persists second precision; assert the scheduled interval against a
+    # fixed service clock instead of subtracting wall time spent on later checks.
+    fixed_now = datetime.now(timezone.utc).replace(microsecond=0)
+    monkeypatch.setattr(svc, '_now', lambda: fixed_now)
+    for n in range(5):
+        await database.execute('UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id', {'id':pid})
+        report = await job.run_reap_agentic_purchase_poll(worker_id='permanent-'+str(n))
+    row = await _get(pid)
+    assert row['state'] == 'awaiting_approval'
+    assert row['last_error_code'].startswith('checkout_unresolvable:')
+    assert report.checkout_needs_human == 1 and report.stuck_over_age == 0
+    assert await ledger.fail_exhausted_purchases(1,include_processing=True) == []
+    assert row['next_poll_at'] == fixed_now + timedelta(minutes=15)
+    # A transient failure cannot silently remove the human-review classification.
+    reap.get_checkout = _transport()
+    await database.execute('UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id', {'id':pid})
+    await job.run_reap_agentic_purchase_poll(worker_id='human-outage')
+    assert (await _get(pid))['last_error_code'].startswith('checkout_unresolvable:')
+    # A valid provider waiting/processing outcome restores normal reconciliation.
+    reap.get_checkout = _ok({'status':'PROCESSING'})
+    await database.execute('UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id', {'id':pid})
+    report = await job.run_reap_agentic_purchase_poll(worker_id='provider-recovers')
+    assert (await _get(pid))['state'] == 'processing' and report.checkout_needs_human == 0
+
+async def test_mid_claim_stop_preserves_contact_pause_and_attempt_exemption(reap, monkeypatch):
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_purchase as svc
+    pid = await _start()
+    await database.execute("UPDATE reap_agentic_purchases SET state='quoting',buyer_email=NULL,shipping_address=NULL,last_error_code='contact_retention_elapsed' WHERE id=:id", {'id':pid})
+    await _claim(pid, 'pause-flips')
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','0')
+    reap.calls.clear()
+    result = await svc.advance(pid,'pause-flips')
+    assert result.last_error_code == 'contact_retention_elapsed'
+    assert (await _get(pid))['last_error_code'] == 'contact_retention_elapsed'
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','1')
+    await database.execute('UPDATE reap_agentic_purchases SET next_poll_at=CURRENT_TIMESTAMP WHERE id=:id', {'id':pid})
+    await _claim(pid,'resume-pause')
+    await svc.advance(pid,'resume-pause')
+    assert (await _get(pid))['state']=='quoting' and (await _get(pid))['attempts']==0
+    assert await ledger.count_contact_retention_blocked()==1 and reap.calls==[]
+
+@pytest.mark.parametrize('state', ['resolving', 'quoting'])
+async def test_contact_paused_precheckout_is_rechecked_every_15_minutes_not_every_minute(reap, state):
+    """A contact-paused row changes only when its owner resumes (which makes it due at once) or
+    the re-entry window lapses it, so it must not take a claim slot from live work every 60 s."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import services.reap_agentic_purchase as svc
+    pid = await _start()
+    await database.execute("UPDATE reap_agentic_purchases SET state=:s,buyer_email=NULL,shipping_address=NULL,"
+                           "last_error_code='contact_retention_elapsed' WHERE id=:id", {'s': state, 'id': pid})
+    await _claim(pid, 'paused-backoff')
+    reap.calls.clear()
+    result = await svc.advance(pid, 'paused-backoff')
+    assert result.outcome == 'released' and result.last_error_code == 'contact_retention_elapsed'
+    assert result.next_poll_in_seconds == svc.CONTACT_PAUSED_RECHECK_SECONDS == 900
+    assert reap.calls == []
+    assert [r for r in await ledger.claim_due_purchases('paused-next', limit=10) if r['id'] == pid] == []
+
+async def test_hung_contact_diagnostic_does_not_hide_other_health(reap, monkeypatch):
+    import asyncio
+    import db.reap_agentic_ledger as ledger
+    import jobs.reap_agentic_purchase_poll as job
+    await _recovery_checkout()
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','0')
+    monkeypatch.setattr(job,'STUCK_COUNT_TIMEOUT_SECONDS',0.02)
+    async def hang():await asyncio.Event().wait()
+    monkeypatch.setattr(ledger,'count_contact_retention_blocked',hang)
+    report=await asyncio.wait_for(job.run_reap_agentic_purchase_poll(worker_id='health-independence'),0.5)
+    assert report.contact_retention_blocked==-1 and report.stuck_over_age==1
+    assert report.errors==1 and report.checkout_needs_human==0
+
+async def test_stop_after_quote_prevents_next_checkout(reap, monkeypatch):
+    await _active_enrollment()
+    pid = await _start()
+    await _step(pid)
+    def stop_after_quote(**kwargs):
+        monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED', '0')
+        return _ok(QUOTE_200)
+    reap.request_quote = stop_after_quote
+    reap.calls.clear()
+    await _step(pid)
+    assert reap.sequence() == ['resolve_our_row', 'request_quote']
+    assert (await _get(pid))['state'] == 'quoting'
+
+async def test_contact_cap_needs_enrollment_cannot_resume_quote(reap):
+    from db.database import database, IS_POSTGRES
+    import db.reap_agentic_ledger as ledger
+    pid = await _start()
+    await _step(pid)
+    await ledger.release_claim(pid, 'w1')
+    assert (await _get(pid))['state'] == 'needs_enrollment'
+    old = "clock_timestamp() - INTERVAL '2 hours'" if IS_POSTGRES else "datetime('now','-2 hours')"
+    await database.execute(f"UPDATE reap_agentic_purchases SET created_at={old} WHERE id=:id", {'id':pid})
+    assert await ledger.scrub_reconciling_purchase_pii(max_age_seconds=900) == [pid]
+    reap.calls.clear()
+    await _step(pid)
+    await _step(pid)
+    assert reap.sequence() == ["get_enrollment"]
+    assert (await _get(pid))['state'] == 'needs_enrollment'
+    assert await ledger.count_contact_retention_blocked() == 1
+
+async def test_worker_stop_guards_nested_real_client_transport(reap, monkeypatch):
+    import services.reap_agentic_client as rc
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','0')
+    from services.reap_agentic_purchase import is_reconciliation_enabled
+    token = rc.worker_provider_permission.set(is_reconciliation_enabled)
+    try:
+        for operation in (rc._post('/agentic/products/search', {'query':'fixture'}), rc._get('/agentic/checkouts/fixture')):
+            with pytest.raises(rc.ProviderOperationStopped):
+                await operation
+    finally:
+        rc.worker_provider_permission.reset(token)
+    assert rc.worker_provider_permission.get() is None
+
+async def _manual_case(status='COMPLETED', state='awaiting_approval'):
+    from datetime import datetime,timezone
+    from db.database import database
+    pid=await _recovery_checkout()
+    await database.execute("UPDATE reap_agentic_purchases SET state=:state,last_error_code='checkout_unresolvable:3:reap_status_404' WHERE id=:id",{'id':pid,'state':state})
+    row=await _get(pid)
+    evidence={'source':'authenticated_reap_checkout_read','authoritative_verified':True,'reference':'support_case_synthetic_1','observed_at':datetime.now(timezone.utc),'provider_base_url':'https://sandbox.api.reap.global','payload':dict(CHECKOUT_COMPLETED,status=status,id=row['reap_checkout_id'])}
+    return pid,row,evidence
+
+async def test_manual_preview_and_exact_replay_are_read_only(reap,manual_attribution):
+    attribution = manual_attribution
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    from db.database import database
+    pid,row,evidence=await _manual_case()
+    reap.calls.clear();attribution.calls.clear()
+    args=dict(evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'])
+    preview=await resolve_checkout_manually(pid,**args)
+    assert preview['status']=='eligible' and await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    assert reap.calls==[] and attribution.calls==[]
+    result=await resolve_checkout_manually(pid,**args,dry_run=False)
+    assert result['state']=='completed' and len(attribution.calls)==1
+    terminal=await _get(pid)
+    assert terminal['buyer_email'] is None and terminal['shipping_address'] is None and terminal['claimed_by'] is None
+    assert terminal['consent_version']==row['consent_version'] and terminal['consented_at']==row['consented_at']
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==1
+    replay=await resolve_checkout_manually(pid,**args,dry_run=False)
+    assert replay['status']=='already_resolved' and await _get(pid)==terminal
+    assert len(attribution.calls)==1 and reap.calls==[]
+
+@pytest.mark.parametrize('defect',['unverified','checkout','status','amount','currency','order','old','future','claimed','stale','origin_absent','origin_other'])
+async def test_manual_refuses_unverified_or_unfenced_outcomes(reap,attribution,defect):
+    from datetime import timedelta
+    from db.database import database
+    from services.reap_checkout_recovery import resolve_checkout_manually,ManualResolutionRefused
+    pid,row,evidence=await _manual_case()
+    expected=row['updated_at']
+    if defect=='unverified':evidence['authoritative_verified']=False
+    elif defect=='checkout':evidence['payload']['id']='another_checkout'
+    elif defect=='status':evidence['payload']['status']='PROCESSING'
+    elif defect=='amount':evidence['payload']['finalAmount']={'amount':100,'currency':'USD'}
+    elif defect=='currency':evidence['payload']['finalAmount']={'amount':45,'currency':'SGD'}
+    elif defect=='order':evidence['payload']['orderId']=True
+    elif defect=='old':evidence['observed_at']-=timedelta(days=2)
+    elif defect=='future':evidence['observed_at']+=timedelta(minutes=1)
+    elif defect=='claimed':await _claim(pid,'actual_worker')
+    elif defect=='stale':expected-=timedelta(seconds=1)
+    elif defect=='origin_absent':evidence.pop('provider_base_url')
+    elif defect=='origin_other':evidence['provider_base_url']='https://api.reap.global'
+    before=await _get(pid);reap.calls.clear();attribution.calls.clear()
+    with pytest.raises(ManualResolutionRefused):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=expected,dry_run=False)
+    assert await _get(pid)==before
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    assert reap.calls==[] and attribution.calls==[]
+
+@pytest.mark.parametrize('failure',['audit','terminal','edge'])
+async def test_manual_failure_rolls_back_audit_outcome_and_claim(reap,manual_attribution,monkeypatch,failure):
+    attribution = manual_attribution
+    from db.database import database
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    import services.reap_agentic_purchase as svc
+    pid,row,evidence=await _manual_case();reap.calls.clear()
+    if failure=='audit':
+        original=database.execute
+        async def broken(query,*args,**kwargs):
+            if 'INSERT INTO reap_checkout_manual_resolution_audit' in str(query):raise RuntimeError('synthetic_audit_failure')
+            return await original(query,*args,**kwargs)
+        monkeypatch.setattr(database,'execute',broken)
+    elif failure=='terminal':
+        original=svc._move
+        async def broken(*args,**kwargs):
+            result=await original(*args,**kwargs)
+            raise RuntimeError('synthetic_after_terminal_failure')
+        monkeypatch.setattr(svc,'_move',broken)
+    else:attribution.raises=RuntimeError('synthetic_edge_failure')
+    with pytest.raises(RuntimeError):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    assert reap.calls==[]
+
+@pytest.mark.parametrize('status,state,target',[('FAILED','awaiting_approval','failed'),('EXPIRED','awaiting_approval','expired'),('EXPIRED','processing','failed')])
+async def test_manual_authoritative_unpaid_terminal_evidence(reap,status,state,target):
+    from db.database import database
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid,row,evidence=await _manual_case(status,state);reap.calls.clear()
+    result=await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert result['state']==target and (await _get(pid))['claimed_by'] is None and reap.calls==[]
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==1
+
+async def test_manual_compare_and_swap_loses_without_audit_or_outcome(reap,monkeypatch):
+    from db.database import database
+    from services.reap_checkout_recovery import resolve_checkout_manually,ManualResolutionRefused
+    pid,row,evidence=await _manual_case()
+    original=database.fetch_one
+    async def moved(query,*args,**kwargs):
+        if 'UPDATE reap_agentic_purchases SET claimed_by=:holder' in str(query):return None
+        return await original(query,*args,**kwargs)
+    monkeypatch.setattr(database,'fetch_one',moved)
+    with pytest.raises(ManualResolutionRefused,match='compare_and_swap_lost'):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+
+async def test_manual_sql_edge_failure_rolls_back_both_business_and_audit(reap,monkeypatch):
+    from db.database import database
+    import services.commerce_attribution_service as cas
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    await database.execute('DROP TABLE IF EXISTS synthetic_manual_edge')
+    await database.execute('CREATE TABLE synthetic_manual_edge (id INTEGER PRIMARY KEY)')
+    pid,row,evidence=await _manual_case()
+    async def real_database_writer(**kwargs):
+        await database.execute('INSERT INTO synthetic_manual_edge(id) VALUES (1)')
+        # A actual database error after an edge write must not commit either on SQLite or PG.
+        await database.execute('INSERT INTO synthetic_manual_edge(id) VALUES (1)')
+    monkeypatch.setattr(cas,'close_external_order_conversion',real_database_writer)
+    with pytest.raises(Exception):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM synthetic_manual_edge')==0
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    await database.execute('DROP TABLE synthetic_manual_edge')
+
+async def test_manual_migration_and_selfheal_have_identical_audit_contract(reap):
+    from pathlib import Path
+    from db.database import database,IS_POSTGRES
+    from db.schema_guard import ensure_required_schema_light
+    from db.sql_migrations import split_statements
+    async def columns():
+        if IS_POSTGRES:
+            rows=await database.fetch_all("SELECT column_name,data_type,is_nullable,column_default FROM information_schema.columns WHERE table_schema='public' AND table_name='reap_checkout_manual_resolution_audit' ORDER BY ordinal_position")
+            checks=await database.fetch_all("SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid='reap_checkout_manual_resolution_audit'::regclass ORDER BY pg_get_constraintdef(oid)")
+        else:
+            rows=await database.fetch_all('PRAGMA table_info(reap_checkout_manual_resolution_audit)')
+            checks=await database.fetch_all("SELECT sql FROM sqlite_master WHERE name='reap_checkout_manual_resolution_audit'")
+        return [dict(r) for r in rows],[dict(r) for r in checks]
+    await database.execute('DROP TABLE reap_checkout_manual_resolution_audit')
+    migration=(Path(__file__).parent.parent/'db/migrations/253_reap_checkout_manual_resolution_audit.sql').read_text()
+    if not IS_POSTGRES:migration=migration.replace('TIMESTAMPTZ','TIMESTAMP')
+    for statement in split_statements(migration):await database.execute(statement)
+    migrated=await columns()
+    await database.execute('DROP TABLE reap_checkout_manual_resolution_audit')
+    await ensure_required_schema_light()
+    healed=await columns()
+    assert migrated==healed
+
+@pytest.mark.parametrize('failure',['suppressed_edge','native_edge_missing'])
+async def test_manual_false_attribution_or_release_fence_rolls_back(reap,monkeypatch,failure):
+    import services.reap_agentic_purchase as svc
+    import db.reap_agentic_ledger as ledger
+    from db.database import database
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid,row,evidence=await _manual_case()
+    async def refused(*args,**kwargs):return False if failure=='suppressed_edge' else None
+    if failure=='suppressed_edge':
+        monkeypatch.setattr(svc,'_close_attribution',refused)
+    else:
+        import services.commerce_attribution_service as cas
+        monkeypatch.setattr(cas,'close_external_order_conversion',refused)
+    with pytest.raises((RuntimeError,ValueError)):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+
+async def test_manual_other_channel_claim_is_audited_completion_without_reap_edge(reap,attribution):
+    from db.database import database
+    from services import conversion_click_claims as ccc
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid,row,evidence=await _manual_case()
+    click='synthetic_manual_other_channel'
+    cart=f"https://brand.example/cart/49922977038613:1?attributes[pivota_click_id]={click}&country=US"
+    await database.execute("UPDATE reap_agentic_purchases SET item_source='cart_link',cart_url=:cart,click_id=:click WHERE id=:id",{'id':pid,'cart':cart,'click':click})
+    await database.execute('DELETE FROM conversion_click_claims WHERE click_id=:click',{'click':click})
+    assert await ccc.claim_click(click,claimed_by=ccc.MERCHANT_CLAIMANT,external_order_id='merchant_synthetic_order')
+    before=dict(await database.fetch_one('SELECT * FROM conversion_click_claims WHERE click_id=:click',{'click':click}))
+    row=await _get(pid);reap.calls.clear();attribution.calls.clear()
+    result=await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert result['state']=='completed' and (await _get(pid))['last_error_code']==ccc.CLOSED_BY_OTHER_CHANNEL
+    audit=await database.fetch_one('SELECT * FROM reap_checkout_manual_resolution_audit WHERE purchase_id=:id',{'id':pid})
+    assert audit['attribution_outcome']=='closed_by_other_channel'
+    assert dict(await database.fetch_one('SELECT * FROM conversion_click_claims WHERE click_id=:click',{'click':click}))==before
+    assert reap.calls==[] and attribution.calls==[]
+
+
+# Manual completion validates real persisted attribution, including replay collisions.
+import services.commerce_attribution_service as _manual_cas
+_MANUAL_REAL_EXTERNAL_CLOSE = _manual_cas.close_external_order_conversion
+
+@pytest.fixture
+async def manual_attribution(monkeypatch):
+    from db.database import IS_POSTGRES
+    from sqlalchemy.schema import CreateTable
+    from sqlalchemy.dialects import sqlite, postgresql
+    dialect = postgresql.dialect() if IS_POSTGRES else sqlite.dialect()
+    for table in (_manual_cas.commerce_attribution_edges, _manual_cas.surface_click_events):
+        await database.execute('DROP TABLE IF EXISTS ' + table.name)
+        await database.execute(str(CreateTable(table).compile(dialect=dialect)))
+    await database.execute('CREATE UNIQUE INDEX manual_ext_order ON commerce_attribution_edges(merchant_id,external_order_id)')
+    if not IS_POSTGRES:
+        original_fetch = database.fetch_one
+        async def sqlite_fetch(query, values=None):
+            if isinstance(query, str) and 'INSERT INTO commerce_attribution_edges' in query:
+                query = query.replace("'[]'::jsonb", "'[]'").replace('CAST(:metadata AS JSONB)', ':metadata')
+            return await original_fetch(query, values)
+        monkeypatch.setattr(database, 'fetch_one', sqlite_fetch)
+    recorder = Attribution()
+    async def real_close(**kwargs):
+        recorder.calls.append(kwargs)
+        if recorder.raises is not None:
+            raise recorder.raises
+        return await _MANUAL_REAL_EXTERNAL_CLOSE(**kwargs)
+    monkeypatch.setattr(_manual_cas, 'close_external_order_conversion', real_close)
+    return recorder
+
+async def _persist_manual_expected_edge(row, evidence):
+    # Use the actual attribution sink, not a fabricated success receipt.
+    completed = dict(row, reap_order_id=evidence['payload']['orderId'], final_total_minor=4500)
+    assert await svc._close_attribution(completed)
+    return dict(await database.fetch_one('SELECT * FROM commerce_attribution_edges WHERE external_order_id=:order', {'order': completed['reap_order_id']}))
+
+@pytest.mark.parametrize('defect', ['amount', 'currency', 'click', 'agent', 'order', 'state', 'source', 'purchase_provenance', 'checkout_provenance', 'partner_reported', 'metadata_missing'])
+async def test_manual_durable_edge_collision_cannot_be_audited_closed(reap, manual_attribution, defect):
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid, row, evidence = await _manual_case()
+    edge = await _persist_manual_expected_edge(row, evidence)
+    fields = {'amount': ('gross_attributed_gmv_cents',1), 'currency':('currency','EUR'), 'click':('click_id','foreign_click'), 'agent':('agent_id','foreign_agent'), 'order':('order_id','foreign_synthetic_order'), 'state':('state','refunded'), 'source':('source','other_channel')}
+    if defect in fields:
+        name, value = fields[defect]
+        await database.execute('UPDATE commerce_attribution_edges SET '+name+'=:value WHERE edge_id=:edge', {'value':value, 'edge':edge['edge_id']})
+    else:
+        metadata = edge['metadata']
+        if isinstance(metadata,str): metadata=json.loads(metadata)
+        if defect=='metadata_missing':metadata={}
+        elif defect=='purchase_provenance':metadata['partner_provenance']['purchase_id']='other_purchase'
+        elif defect=='checkout_provenance':metadata['partner_provenance']['reap_checkout_id']='other_checkout'
+        else:metadata['partner_provenance']['partner_reported']=False
+        await database.execute(_manual_cas.commerce_attribution_edges.update().where(_manual_cas.commerce_attribution_edges.c.edge_id==edge['edge_id']).values(metadata=metadata))
+    before=dict(await database.fetch_one('SELECT * FROM commerce_attribution_edges WHERE edge_id=:edge',{'edge':edge['edge_id']}))
+    reap.calls.clear()
+    with pytest.raises(RuntimeError, match='manual_attribution_persisted_'):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    assert dict(await database.fetch_one('SELECT * FROM commerce_attribution_edges WHERE edge_id=:edge',{'edge':edge['edge_id']}))==before
+    assert reap.calls==[]
+
+@pytest.mark.parametrize('defect', ['absent_edge','absent_receipt'])
+async def test_manual_durable_edge_requires_both_receipt_and_persisted_evidence(reap,manual_attribution,monkeypatch,defect):
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid,row,evidence=await _manual_case()
+    original=_manual_cas.close_external_order_conversion
+    async def missing(**kwargs):
+        if defect=='absent_receipt':
+            await original(**kwargs)
+            return None
+        return {'edge_id':_manual_cas._ext_edge_keys(kwargs['merchant_id'],kwargs['external_order_id'])[0]}
+    monkeypatch.setattr(_manual_cas,'close_external_order_conversion',missing)
+    with pytest.raises(RuntimeError,match='manual_attribution_'):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    assert await database.fetch_val('SELECT count(*) FROM commerce_attribution_edges')==0
+
+async def test_manual_durable_matching_replay_closes_exactly_one_edge(reap,manual_attribution):
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid,row,evidence=await _manual_case()
+    edge=await _persist_manual_expected_edge(row,evidence)
+    result=await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert result['state']=='completed'
+    assert await database.fetch_val('SELECT count(*) FROM commerce_attribution_edges')==1
+    assert await database.fetch_val('SELECT attribution_outcome FROM reap_checkout_manual_resolution_audit')=='edge_closed'
+    assert dict(await database.fetch_one('SELECT * FROM commerce_attribution_edges WHERE edge_id=:edge',{'edge':edge['edge_id']}))==edge
+
+async def test_manual_foreign_reap_click_claim_is_not_merchant_channel(reap,manual_attribution):
+    from services.reap_checkout_recovery import resolve_checkout_manually
+    pid,row,evidence=await _manual_case()
+    click='synthetic_foreign_reap_claim'
+    cart=f'https://brand.example/cart/49922977038613:1?attributes[pivota_click_id]={click}&country=US'
+    await database.execute("UPDATE reap_agentic_purchases SET item_source='cart_link',cart_url=:cart,click_id=:click WHERE id=:id",{'id':pid,'cart':cart,'click':click})
+    assert await svc.ccc.claim_click(click,claimed_by=svc.ccc.REAP_CLAIMANT,external_order_id='foreign_reap_order')
+    before=dict(await database.fetch_one('SELECT * FROM conversion_click_claims WHERE click_id=:click',{'click':click}))
+    row=await _get(pid)
+    with pytest.raises(RuntimeError,match='manual_attribution_claim_conflict'):
+        await resolve_checkout_manually(pid,evidence=evidence,operator_ref='operator_test',expected_updated_at=row['updated_at'],dry_run=False)
+    assert await _get(pid)==row
+    assert await database.fetch_val('SELECT count(*) FROM reap_checkout_manual_resolution_audit')==0
+    assert await database.fetch_val('SELECT count(*) FROM commerce_attribution_edges')==0
+    assert dict(await database.fetch_one('SELECT * FROM conversion_click_claims WHERE click_id=:click',{'click':click}))==before
+
+from datetime import timedelta
+import services.reap_agentic_client as rc
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+async def test_deadline_all_owner_reads_share_original_clock_and_redaction(reap,monkeypatch,legacy):
+    from types import SimpleNamespace
+    from starlette.requests import Request
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route
+    pid=await _deadline_missing_provider_expiry(reap)
+    if legacy:await database.execute('UPDATE reap_agentic_purchases SET hosted_url_expires_at=NULL WHERE id=:id',{'id':pid})
+    before=await _get(pid)
+    enrollment=await ledger.get_enrollment_internal(before['enrollment_id'])
+    expected=enrollment['created_at']+timedelta(seconds=ledger.HOSTED_SESSION_SECONDS)
+    monkeypatch.setattr(route,'_require_rail',lambda:None)
+    monkeypatch.setattr(route,'_require_agent_user',lambda _: 'synthetic-user')
+    monkeypatch.setattr(route,'hash_agent_user_ref',lambda _: 'hash_alice')
+    request=Request({'type':'http','method':'GET','path':'/purchases','query_string':b''})
+    for _ in range(2):
+        listed=await route.list_reap_purchases(request,SimpleNamespace(agent_id='agent_one'),None)
+        owner=await route._owner_view(purchase_id=pid,agent_id='agent_one',agent_user_ref_hash='hash_alice')
+        assert listed['purchases'][0]==owner
+        assert owner['hosted_url_expires_at']==expected and owner['hosted_url']
+        for key in ['buyer_ref','enrollment_id','buyer_email','shipping_address','hosted_url_expiry_invalid']:assert key not in owner
+    assert await _get(pid)==before
+    assert await ledger.get_enrollment_internal(enrollment['id'])==enrollment
+
+@pytest.mark.parametrize('defect',['superseded','returned_id','wrong_buyer'])
+async def test_deadline_recording_named_attempt_never_mints_a_new_clock(reap,monkeypatch,defect):
+    import copy
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    payload=copy.deepcopy(ENROLLMENT_CREATED);payload['nextAction'].pop('expiresAt');reap.create_enrollment=_ok(payload)
+    actual=ledger.upsert_pending_enrollment
+    seen=[]
+    async def changed(**kwargs):
+        if kwargs.get('reap_enrollment_id'):
+            seen.append(kwargs['enrollment_id'])
+            if defect=='superseded':await database.execute("UPDATE reap_agentic_enrollments SET status='dead' WHERE id=:id",{'id':kwargs['enrollment_id']})
+            if defect=='wrong_buyer':kwargs['buyer_ref']='foreign_buyer'
+        result=await actual(**kwargs)
+        if kwargs.get('reap_enrollment_id') and defect=='returned_id':result=dict(result,id='another_attempt')
+        return result
+    monkeypatch.setattr(ledger,'upsert_pending_enrollment',changed)
+    pid=await _start();result=await _step(pid)
+    assert result.outcome=='released' and result.state=='resolving'
+    assert not (await _get(pid))['hosted_url'] and (await _get(pid))['hosted_url_expires_at'] is None
+    rows=await database.fetch_all('SELECT * FROM reap_agentic_enrollments')
+    assert len(rows)==1 and rows[0]['id']==seen[0]
+    assert rows[0]['buyer_ref']=='bref_alice'
+
+@pytest.mark.parametrize('later',['malformed','omitted','missing404'])
+async def test_deadline_invalid_provenance_survives_age_and_new_purchase_without_remint(reap,later):
+    import copy
+    from db.database import database,IS_POSTGRES
+    import db.reap_agentic_ledger as ledger
+    bad=copy.deepcopy(ENROLLMENT_CREATED);bad['nextAction']['expiresAt']='malformed'
+    reap.create_enrollment=_ok(bad)
+    first=await _start();result=await _step(first)
+    assert result.outcome=='released' and result.last_error_code=='enrollment_deadline_invalid'
+    attempt=(await ledger.get_pending_enrollments('bref_alice'))[0]
+    assert attempt['hosted_url_expiry_invalid']
+    age="clock_timestamp()-INTERVAL '1 day'" if IS_POSTGRES else "datetime('now','-1 day')"
+    await database.execute(f'UPDATE reap_agentic_enrollments SET created_at={age} WHERE id=:id',{'id':attempt['id']})
+    reply=copy.deepcopy(bad)
+    if later=='omitted':reply['nextAction'].pop('expiresAt')
+    reap.get_enrollment=rc.ReapResponse(ok=False,status=404,error='reap_status_404') if later=='missing404' else _ok(reply)
+    second=await _start()
+    for pid in (first,second,second):
+        result=await _step(pid)
+        assert result.outcome=='released' and result.state=='resolving'
+        assert not (await _get(pid))['hosted_url']
+    assert len(reap.named('create_enrollment'))==1
+    assert await database.fetch_val("SELECT count(*) FROM reap_agentic_enrollments WHERE status='pending'")==1
+    assert await database.fetch_val("SELECT count(*) FROM reap_agentic_enrollments WHERE status='dead'")==0
+
+@pytest.mark.parametrize('later',['valid_expiry','active'])
+async def test_deadline_authoritative_response_can_resolve_retained_invalid_attempt(reap,later):
+    import copy
+    import db.reap_agentic_ledger as ledger
+    bad=copy.deepcopy(ENROLLMENT_CREATED);bad['nextAction']['expiresAt']='malformed';reap.create_enrollment=_ok(bad)
+    pid=await _start();await _step(pid)
+    attempt=(await ledger.get_pending_enrollments('bref_alice'))[0]
+    reap.get_enrollment=_ok(ENROLLMENT_ACTIVE if later=='active' else ENROLLMENT_CREATED)
+    result=await _step(pid)
+    assert result.state==('quoting' if later=='active' else 'needs_enrollment')
+    recorded=await ledger.get_enrollment_internal(attempt['id'])
+    assert not recorded['hosted_url_expiry_invalid'] and recorded['created_at']==attempt['created_at']
+    assert len(reap.named('create_enrollment'))==1
+
+async def test_deadline_malformed_read_suppresses_previously_valid_link_and_preserves_attempt(reap):
+    import copy
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route
+    pid=await _deadline_missing_provider_expiry(reap);before=await _get(pid)
+    bad=copy.deepcopy(ENROLLMENT_CREATED);bad['nextAction']['expiresAt']='malformed';reap.get_enrollment=_ok(bad)
+    result=await _step(pid)
+    assert result.last_error_code=='enrollment_deadline_invalid'
+    public=await route._owner_view(purchase_id=pid,agent_id='agent_one',agent_user_ref_hash='hash_alice')
+    assert not public.get('hosted_url') and not public.get('hosted_url_expires_at')
+    recorded=await ledger.get_enrollment_internal(before['enrollment_id'])
+    assert recorded['status']=='pending' and recorded['hosted_url_expiry_invalid']
+    assert (await _get(pid))['hosted_url_expires_at']==before['hosted_url_expires_at']
+
+async def test_deadline_allowlisted_authoritative_refresh_is_visible_to_existing_purchase(reap):
+    import copy
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route
+    pid=await _deadline_missing_provider_expiry(reap);before=await _get(pid)
+    refreshed=copy.deepcopy(ENROLLMENT_CREATED);refreshed['nextAction']['url']='https://pay.prava.space/enroll/session_refreshed'
+    reap.get_enrollment=_ok(refreshed)
+    assert (await _step(pid)).outcome=='released'
+    public=await route._owner_view(purchase_id=pid,agent_id='agent_one',agent_user_ref_hash='hash_alice')
+    assert public['hosted_url']==refreshed['nextAction']['url'] and public['hosted_url_expires_at'].year==2099
+    row=await _get(pid);enrollment=await ledger.get_enrollment_internal(row['enrollment_id'])
+    assert row['enrollment_id']==before['enrollment_id'] and row['state_entered_at']==before['state_entered_at']
+    assert enrollment['created_at']<=before['created_at']+timedelta(seconds=1)
+
+async def test_deadline_expiry_provenance_selfheal_and_migration_physical_parity(reap):
+    from pathlib import Path
+    from db.database import database,IS_POSTGRES
+    from db.sql_migrations import split_statements
+    from db.schema_guard import ensure_required_schema_light
+    async def column():
+        if IS_POSTGRES:
+            rows=await database.fetch_all("SELECT column_name,data_type,is_nullable,column_default FROM information_schema.columns WHERE table_schema='public' AND table_name='reap_agentic_enrollments' AND column_name='hosted_url_expiry_invalid'")
+        else:
+            rows=[x for x in await database.fetch_all('PRAGMA table_info(reap_agentic_enrollments)') if x['name']=='hosted_url_expiry_invalid']
+        return [dict(x) for x in rows]
+    await database.execute('ALTER TABLE reap_agentic_enrollments DROP COLUMN hosted_url_expiry_invalid')
+    migration=(Path(__file__).parent.parent/'db/migrations/254_reap_enrollment_expiry_provenance.sql').read_text()
+    if not IS_POSTGRES:migration=migration.replace('ALTER TABLE IF EXISTS','ALTER TABLE').replace('ADD COLUMN IF NOT EXISTS','ADD COLUMN')
+    for statement in split_statements(migration):await database.execute(statement)
+    migrated=await column();assert migrated
+    await database.execute('ALTER TABLE reap_agentic_enrollments DROP COLUMN hosted_url_expiry_invalid')
+    await ensure_required_schema_light();assert await column()==migrated
+    await ensure_required_schema_light();assert await column()==migrated
+
+
+async def test_deadline_refresh_losing_lease_preserves_next_holders_recoverable_action(reap,monkeypatch):
+    import copy
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route
+    pid=await _deadline_missing_provider_expiry(reap)
+    fresh=copy.deepcopy(ENROLLMENT_CREATED);fresh['nextAction']['url']='https://pay.prava.space/enroll/lease_refreshed'
+    reap.get_enrollment=_ok(fresh)
+    original=ledger.record_enrollment_expiry_provenance
+    async def lose_after_provenance(**kwargs):
+        result=await original(**kwargs)
+        await database.execute("UPDATE reap_agentic_purchases SET claimed_by='next_holder' WHERE id=:id",{'id':pid})
+        return result
+    monkeypatch.setattr(ledger,'record_enrollment_expiry_provenance',lose_after_provenance)
+    assert (await _step(pid)).outcome=='lost_claim'
+    assert (await _get(pid))['claimed_by']=='next_holder'
+    public=await route._owner_view(purchase_id=pid,agent_id='agent_one',agent_user_ref_hash='hash_alice')
+    assert not public.get('hosted_url')
+    monkeypatch.setattr(ledger,'record_enrollment_expiry_provenance',original)
+    assert (await svc.advance(pid,'next_holder')).outcome=='released'
+    public=await route._owner_view(purchase_id=pid,agent_id='agent_one',agent_user_ref_hash='hash_alice')
+    assert public['hosted_url']==fresh['nextAction']['url'] and public['hosted_url_expires_at'].year==2099
+    assert len(reap.named('create_enrollment'))==1
+
+
+# Bounded production pilot admission: durable query behavior and real quote totals.
+def _bounded_pilot(**over):
+    scope = {"agent_ids": ["agent_one"], "merchant_domains": ["brand.example"], "markets": ["US"],
+             "product_keys": ["pk_1"], "quantities": [1], "variant_keys": ["vk_1"],
+             "currency": "USD", "max_total_minor": 4500}
+    scope.update(over)
+    return scope
+
+
+def test_production_pilot_requires_all_bounds_or_literal_optout(monkeypatch):
+    import json
+    import services.reap_agentic_purchase as svc
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    for value in [None, "", "UNRESTRICTED", " unrestricted", "null", json.dumps({
+            k: v for k, v in _bounded_pilot().items() if k not in {"variant_keys", "currency", "max_total_minor"}})]:
+        if value is None:
+            monkeypatch.delenv("REAP_AGENTIC_PILOT_SCOPE", raising=False)
+        else:
+            monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", value)
+        assert not svc.is_create_enabled()
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", "unrestricted")
+    assert svc.is_create_enabled()
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot()))
+    assert svc.is_create_enabled()
+
+
+@pytest.mark.parametrize("quantity", [True, 1.0, "1"])
+def test_create_quantity_strict_recovery_legacy_compatible(quantity):
+    from pydantic import ValidationError
+    import routes.agent_commerce_reap as route
+    body = {"merchant_domain": "brand.example", "product_key": "pk_1", "quantity": quantity,
+            "buyer": {"email": EMAIL, "shipping_address": ADDRESS}, "idempotency_key": "k-qty",
+            "expected_unit_price_minor": 4250, "expected_currency": "USD"}
+    with pytest.raises(ValidationError):
+        route.StartPurchaseRequest.model_validate(body)
+    assert route.RecoverPurchaseRequest.model_validate(body).quantity == 1
+    # Create's ONLY objection is the quantity: the same body with an integer one validates.
+    assert route.StartPurchaseRequest.model_validate({**body, "quantity": 1}).quantity == 1
+
+
+@pytest.mark.parametrize("field,value", [("variant_keys", ["wrong"]), ("currency", "EUR"),
+                                         ("max_total_minor", 4249)])
+async def test_resolved_production_scope_refuses_before_insert(monkeypatch, field, value):
+    import json
+    import services.reap_agentic_purchase as svc
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot(**{field: value})))
+    with pytest.raises(svc.PurchaseRefused) as exc:
+        await _start()
+    assert exc.value.reason == "pilot_scope_refused"
+
+
+@pytest.mark.parametrize("state", ["resolving", "quoting", "needs_enrollment"])
+@pytest.mark.parametrize("settling", [False, True])
+async def test_scope_paused_rows_never_claim_or_exhaust_after_52_ticks(monkeypatch, reap, state, settling):
+    import json
+    import db.reap_agentic_ledger as ledger
+    from db.database import database
+    import services.reap_agentic_purchase as svc
+    purchase = await _start()
+    await database.execute("UPDATE reap_agentic_purchases SET state=:state, attempts=51, last_error_code=:error WHERE id=:id",
+                           {"id": purchase, "state": state, "error": "enrollment_settling" if settling else None})
+    before = await ledger.get_purchase_internal(purchase)
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot(agent_ids=["other-agent"])))
+    for _ in range(52):
+        assert await ledger.claim_due_purchases("scope-worker", pilot_scope=svc.pilot_admission_scope()) == []
+        assert await ledger.fail_exhausted_purchases(50, pilot_scope=svc.pilot_admission_scope()) == []
+    after = await ledger.get_purchase_internal(purchase)
+    for name in ["state", "attempts", "state_entered_at", "last_error_code", "next_poll_at", "claimed_by"]:
+        assert after[name] == before[name]
+    assert reap.calls == []
+    assert await ledger.count_precheckout_paused(pilot_scope=svc.pilot_admission_scope()) == 1
+    assert await ledger.count_stuck_purchases(stuck_after_seconds=60, pilot_scope=svc.pilot_admission_scope()) == 0
+
+
+@pytest.mark.parametrize("state", ["resolving", "quoting", "needs_enrollment"])
+@pytest.mark.parametrize("settling", [False, True])
+async def test_scope_change_after_claim_refunds_only_unadvanced_claim(monkeypatch, reap, state, settling):
+    import json
+    import db.reap_agentic_ledger as ledger
+    from db.database import database
+    import services.reap_agentic_purchase as svc
+    purchase = await _start()
+    await database.execute("UPDATE reap_agentic_purchases SET state=:state, attempts=7, last_error_code=:error WHERE id=:id",
+                           {"id": purchase, "state": state, "error": "enrollment_settling" if settling else None})
+    before = await ledger.get_purchase_internal(purchase)
+    rows = await ledger.claim_due_purchases("scope-worker")
+    assert len(rows) == 1
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot(agent_ids=["other-agent"])))
+    result = await svc.advance(purchase, "scope-worker")
+    assert result.outcome == "released"
+    after = await ledger.get_purchase_internal(purchase)
+    assert after["claimed_by"] is None
+    for name in ["state", "attempts", "state_entered_at", "last_error_code"]:
+        assert after[name] == before[name]
+    from datetime import datetime, timedelta, timezone
+    # The paused row goes to the back of the claim order for one poll interval instead of
+    # staying at its old, already-due next_poll_at.
+    interval = timedelta(seconds=svc.POLL_INTERVALS[state])
+    assert before["next_poll_at"] + interval - timedelta(seconds=2) <= after["next_poll_at"]
+    assert after["next_poll_at"] <= datetime.now(timezone.utc) + interval + timedelta(seconds=2)
+    assert await ledger.claim_due_purchases("scope-worker-2") == []
+    assert reap.calls == []
+
+
+@pytest.mark.parametrize("cap,allowed", [(4250, False), (4499, False), (4500, True)])
+async def test_quote_tax_shipping_authoritative_total_bounded_before_checkout(monkeypatch, reap, cap, allowed):
+    import json
+    import services.reap_agentic_purchase as svc
+    from db.database import database
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot(max_total_minor=cap)))
+    purchase = await _start()
+    await _active_enrollment()
+    await database.execute("UPDATE reap_agentic_purchases SET state='quoting' WHERE id=:id", {"id": purchase})
+    result = await _step(purchase)
+    assert bool(reap.named("create_checkout")) is allowed
+    assert result.state == ("awaiting_approval" if allowed else "refused")
+    if not allowed:
+        assert result.refusal_reason == "pilot_scope_refused"
+
+
+async def test_pause_refund_cannot_touch_changed_attempt_or_foreign_holder():
+    import db.reap_agentic_ledger as ledger
+    from db.database import database
+    purchase = await _start()
+    rows = await ledger.claim_due_purchases("scope-worker")
+    assert len(rows) == 1
+    stale = rows[0]
+    await database.execute("UPDATE reap_agentic_purchases SET attempts=attempts+1 WHERE id=:id", {"id": purchase})
+    assert await ledger.release_paused_claim(stale, "scope-worker", next_poll_in_seconds=60) is None
+    current = await ledger.get_purchase_internal(purchase)
+    assert await ledger.release_paused_claim(current, "foreign-worker", next_poll_in_seconds=60) is None
+    assert (await ledger.get_purchase_internal(purchase))["claimed_by"] == "scope-worker"
+
+
+
+
+async def _deadline_missing_provider_expiry(reap):
+    import copy
+    payload = copy.deepcopy(ENROLLMENT_CREATED)
+    payload["nextAction"].pop("expiresAt")
+    reap.create_enrollment = _ok(payload)
+    reap.get_enrollment = _ok(payload)
+    purchase_id = await _start()
+    assert (await _step(purchase_id)).state == "needs_enrollment"
+    return purchase_id
+
+
+async def test_enrollment_deadline_initial_reuse_and_repeated_owner_read_are_stable(reap):
+    from datetime import timedelta
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route
+    purchase_id = await _deadline_missing_provider_expiry(reap)
+    row = await _get(purchase_id)
+    enrollment = await ledger.get_enrollment_internal(row["enrollment_id"])
+    expected = enrollment["created_at"] + timedelta(seconds=ledger.HOSTED_SESSION_SECONDS)
+    assert row["hosted_url_expires_at"] == expected
+    reused = await _start()
+    assert (await _step(reused)).state == "needs_enrollment"
+    assert (await _get(reused))["hosted_url_expires_at"] == expected
+    for _ in range(2):
+        public = await route._owner_view(purchase_id=purchase_id, agent_id="agent_one", agent_user_ref_hash="hash_alice")
+        assert public["hosted_url_expires_at"] == expected
+        assert "buyer_ref" not in public and "enrollment_id" not in public
+        assert "buyer_email" not in public and "shipping_address" not in public
+    assert await route._owner_view(purchase_id=purchase_id, agent_id="wrong-agent", agent_user_ref_hash="hash_alice") is None
+    assert await route._owner_view(purchase_id=purchase_id, agent_id="agent_one", agent_user_ref_hash="wrong-buyer") is None
+
+
+async def test_enrollment_deadline_legacy_owner_view_uses_originating_attempt_without_writes(reap):
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route
+    purchase_id = await _deadline_missing_provider_expiry(reap)
+    expected = (await _get(purchase_id))["hosted_url_expires_at"]
+    await database.execute("UPDATE reap_agentic_purchases SET hosted_url_expires_at = NULL WHERE id = :id", {"id": purchase_id})
+    for _ in range(2):
+        public = await route._owner_view(purchase_id=purchase_id, agent_id="agent_one", agent_user_ref_hash="hash_alice")
+        assert public["hosted_url_expires_at"] == expected
+        assert public["hosted_url"]
+    assert (await _get(purchase_id))["hosted_url_expires_at"] is None
+
+
+@pytest.mark.parametrize("bad", ["expired", "wrong_buyer", "wrong_id", "wrong_link", "unavailable", "malformed_clock", "dead", "active"])
+async def test_enrollment_deadline_legacy_fails_closed_when_provenance_cannot_support_link(reap, monkeypatch, bad):
+    from db.database import database, IS_POSTGRES
+    import db.reap_agentic_ledger as ledger
+    import routes.agent_commerce_reap as route
+    purchase_id = await _deadline_missing_provider_expiry(reap)
+    row = await _get(purchase_id)
+    await database.execute("UPDATE reap_agentic_purchases SET hosted_url_expires_at = NULL WHERE id = :id", {"id": purchase_id})
+    if bad == "expired":
+        past = "clock_timestamp() - INTERVAL '25 days'" if IS_POSTGRES else "datetime('now', '-25 days')"
+        await database.execute(f"UPDATE reap_agentic_enrollments SET created_at = {past} WHERE id = :id", {"id": row["enrollment_id"]})
+    else:
+        original = await ledger.get_enrollment_internal(row["enrollment_id"])
+        if bad == "wrong_buyer": original["buyer_ref"] = "some-other-buyer"
+        if bad == "wrong_id": original["id"] = "some-other-attempt"
+        if bad == "wrong_link": original["hosted_url"] = "https://pay.prava.space/enroll/some-other-link"
+        if bad == "malformed_clock": original["created_at"] = "not-a-timestamp"
+        if bad in {"dead", "active"}: original["status"] = bad
+        async def record(*args): return None if bad == "unavailable" else original
+        monkeypatch.setattr(ledger, "get_enrollment_internal", record)
+    for _ in range(2):
+        public = await route._owner_view(purchase_id=purchase_id, agent_id="agent_one", agent_user_ref_hash="hash_alice")
+        assert "hosted_url" not in public
+    assert (await _get(purchase_id))["hosted_url_expires_at"] is None
+
+
+@pytest.mark.parametrize("bad", ["invalid-date", "", 123])
+async def test_enrollment_deadline_malformed_provider_expiry_is_not_treated_as_omitted(reap, bad):
+    import copy
+    payload = copy.deepcopy(ENROLLMENT_CREATED)
+    payload["nextAction"]["expiresAt"] = bad
+    reap.create_enrollment = _ok(payload)
+    purchase_id = await _start()
+    result = await _step(purchase_id)
+    assert result.outcome == "released" and result.last_error_code == "enrollment_deadline_invalid"
+    assert not (await _get(purchase_id))["hosted_url"]
+
+
+async def test_enrollment_deadline_authoritative_expiry_still_wins(reap):
+    import db.reap_agentic_ledger as ledger
+    purchase_id = await _start()
+    assert (await _step(purchase_id)).state == "needs_enrollment"
+    row = await _get(purchase_id)
+    assert row["hosted_url_expires_at"].year == 2099
+    enrollment = await ledger.get_enrollment_internal(row["enrollment_id"])
+    assert row["hosted_url_expires_at"] == enrollment["hosted_url_expires_at"]
+
+
+async def test_enrollment_deadline_malformed_response_cannot_retire_new_holders_attempt(reap, monkeypatch):
+    import copy
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+    payload = copy.deepcopy(ENROLLMENT_CREATED)
+    payload["nextAction"]["expiresAt"] = "invalid-date"
+    reap.create_enrollment = _ok(payload)
+    purchase_id = await _start()
+    actual = ledger.upsert_pending_enrollment
+    recorded = []
+    async def record_then_lose(**kwargs):
+        row = await actual(**kwargs)
+        if kwargs.get("reap_enrollment_id"):
+            recorded.append(row["id"])
+            await database.execute("UPDATE reap_agentic_purchases SET claimed_by = 'new-holder' WHERE id = :id", {"id": purchase_id})
+        return row
+    monkeypatch.setattr(ledger, "upsert_pending_enrollment", record_then_lose)
+    assert (await _step(purchase_id)).outcome == "lost_claim"
+    assert (await ledger.get_enrollment_internal(recorded[0]))["status"] == "pending"
+    assert (await _get(purchase_id))["claimed_by"] == "new-holder"
+
+
+async def test_pilot_dispatch_permission_uses_authoritative_quote_total(monkeypatch, reap):
+    import json
+    import services.reap_agentic_purchase as svc
+    import services.reap_agentic_client as rc
+    from db.database import database
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot()))
+    purchase = await _start()
+    await _active_enrollment()
+    await database.execute("UPDATE reap_agentic_purchases SET state='quoting' WHERE id=:id", {"id": purchase})
+    dispatched = []
+    async def final_boundary(**kwargs):
+        # Item remains admitted at4250, but authoritative4500 charge no longer fits.
+        monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot(max_total_minor=4400)))
+        assert rc.worker_provider_permission.get()() is False
+        rc._check_worker_provider_permission()
+        dispatched.append(kwargs)
+        return _ok(CHECKOUT_CREATED)
+    monkeypatch.setattr(rc, "create_checkout", final_boundary)
+    result = await _step(purchase)
+    assert result.outcome == "released" and result.state == "quoting"
+    assert dispatched == []
+    row = await _get(purchase)
+    assert row["reap_checkout_id"] is None and row["claimed_by"] is None
+    assert svc._WORKER_QUOTE_TOTAL.get() is None
+
+import db.reap_agentic_ledger as ledger
+
+
+_PILOT_REAL_CREATE_CHECKOUT = rc.create_checkout
+
+
+@pytest.mark.parametrize("replacement", ["same_holder_attempt", "foreign_holder", "same_holder_clock", "exposed_checkout"])
+async def test_scope_pause_actual_dispatch_does_not_adopt_replacement_claim(monkeypatch, reap, replacement):
+    import httpx
+    from db.database import IS_POSTGRES
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_RECONCILE_ENABLED", "1")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot()))
+    purchase = await _start()
+    await _active_enrollment()
+    await database.execute("UPDATE reap_agentic_purchases SET state='quoting' WHERE id=:id", {"id": purchase})
+    assert len(await ledger.claim_due_purchases("fence-worker", pilot_scope=svc.pilot_admission_scope())) == 1
+    captured = {}
+    dispatched = []
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self):
+            if replacement == "same_holder_clock":
+                clock = "claimed_at + INTERVAL '1 second'" if IS_POSTGRES else "datetime(claimed_at, '+1 second')"
+                await database.execute("UPDATE reap_agentic_purchases SET claimed_at=" + clock + " WHERE id=:id", {"id": purchase})
+            elif replacement == "exposed_checkout":
+                await database.execute("UPDATE reap_agentic_purchases SET state='awaiting_approval', reap_checkout_id='replacement-checkout' WHERE id=:id", {"id": purchase})
+            else:
+                holder = "foreign-worker" if replacement == "foreign_holder" else "fence-worker"
+                await database.execute("UPDATE reap_agentic_purchases SET attempts=attempts+1,claimed_by=:holder WHERE id=:id", {"id": purchase, "holder": holder})
+            captured.update(await ledger.get_purchase_internal(purchase))
+            monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "0")
+            return self
+        async def __aexit__(self, *args): return False
+        def stream(self, *args, **kwargs):
+            dispatched.append(args)
+            raise AssertionError("checkout dispatched after a scope stop")
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    monkeypatch.setattr(rc, "create_checkout", _PILOT_REAL_CREATE_CHECKOUT)
+    result = await svc.advance(purchase, "fence-worker")
+    assert dispatched == [] and result.outcome == "lost_claim"
+    after = await ledger.get_purchase_internal(purchase)
+    for field in ["attempts", "claimed_by", "claimed_at", "state", "state_entered_at", "last_error_code", "next_poll_at", "reap_checkout_id"]:
+        assert after[field] == captured[field], field
+
+
+_PILOT_REAL_GET_ENROLLMENT = rc.get_enrollment
+
+
+@pytest.mark.parametrize("state", ["needs_enrollment", "resolving"])
+async def test_scope_pause_attempt_exempt_claim_timestamp_generation(monkeypatch, reap, state):
+    import httpx
+    from db.database import IS_POSTGRES
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_RECONCILE_ENABLED", "1")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot()))
+    purchase = await _start()
+    assert (await _step(purchase)).state == "needs_enrollment"
+    assert await ledger.release_claim(purchase, "w1") is not None
+    await database.execute("UPDATE reap_agentic_purchases SET state=:state,last_error_code=:error,next_poll_at=CURRENT_TIMESTAMP WHERE id=:id",
+                           {"id": purchase, "state": state, "error": "enrollment_settling" if state == "resolving" else None})
+    original = await ledger.get_purchase_internal(purchase)
+    claimed = await ledger.claim_due_purchases("fence-worker", pilot_scope=svc.pilot_admission_scope())
+    assert len(claimed) == 1 and claimed[0]["attempts"] == original["attempts"]
+    captured = {}
+    dispatched = []
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self):
+            clock = "claimed_at + INTERVAL '1 second'" if IS_POSTGRES else "datetime(claimed_at, '+1 second')"
+            await database.execute("UPDATE reap_agentic_purchases SET claimed_at=" + clock + " WHERE id=:id", {"id": purchase})
+            captured.update(await ledger.get_purchase_internal(purchase))
+            monkeypatch.setenv("REAP_AGENTIC_CREATE_ENABLED", "0")
+            return self
+        async def __aexit__(self, *args): return False
+        def stream(self, *args, **kwargs):
+            dispatched.append(args)
+            raise AssertionError("enrollment GET dispatched after scope stop")
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    monkeypatch.setattr(rc, "get_enrollment", _PILOT_REAL_GET_ENROLLMENT)
+    result = await svc.advance(purchase, "fence-worker")
+    assert len(dispatched) == (1 if state == "needs_enrollment" else 0) and result.outcome == "lost_claim"
+    after = await ledger.get_purchase_internal(purchase)
+    for field in ["attempts", "claimed_by", "claimed_at", "state", "last_error_code", "next_poll_at"]:
+        assert after[field] == captured[field], field
+
+
+async def test_an_interleaved_transient_read_error_does_not_reset_the_permanent_count(reap):
+    import services.reap_agentic_client as rc
+    pid = await _recovery_checkout()
+    permanent = rc.ReapResponse(ok=False, status=404, error='reap_status_404')
+    codes = []
+    for answer in (permanent, _transport(), permanent, rc.ReapResponse(ok=False, status=500, error='reap_status_500'),
+                   permanent):
+        reap.get_checkout = answer
+        await _step(pid)
+        codes.append((await _get(pid))['last_error_code'])
+    assert codes == ['checkout_read_permanent:1:reap_status_404', 'checkout_read_permanent:1:reap_status_404',
+                     'checkout_read_permanent:2:reap_status_404', 'checkout_read_permanent:2:reap_status_404',
+                     'checkout_unresolvable:3:reap_status_404']
+    assert (await _get(pid))['state'] == 'awaiting_approval'
+    # A valid provider read still clears it.
+    reap.get_checkout = _ok({'status': 'PROCESSING'})
+    await _step(pid)
+    assert (await _get(pid))['state'] == 'processing'
+
+
+async def test_a_transient_hold_after_a_permanent_read_keeps_the_transient_backoff(reap):
+    import services.reap_agentic_client as rc
+    pid = await _recovery_checkout()
+    reap.get_checkout = rc.ReapResponse(ok=False, status=404, error='reap_status_404')
+    await _step(pid)
+    reap.get_checkout = _transport()
+    held = await _step(pid)
+    assert held.last_error_code == 'checkout_read_permanent:1:reap_status_404'
+    assert held.next_poll_in_seconds == svc.transport_backoff_seconds('awaiting_approval', (await _get(pid))['attempts'])
+
+
+@pytest.mark.parametrize('dry_run', [0, 1, None, 'false', ''])
+async def test_recovery_resolvers_require_an_explicit_boolean_dry_run(dry_run):
+    from datetime import datetime, timezone
+    from services import reap_checkout_recovery as recovery
+    at = datetime.now(timezone.utc)
+    with pytest.raises(recovery.ManualResolutionRefused, match='explicit_boolean_preview_required'):
+        await recovery.resolve_checkout_manually('rp_any', evidence={}, operator_ref='op', expected_updated_at=at,
+                                                 dry_run=dry_run)
+    with pytest.raises(recovery.ManualResolutionRefused, match='explicit_boolean_preview_required'):
+        await recovery.resolve_parked_dispatch('rp_any', dispatch_key='0' * 64, outcome='confirmed_not_created',
+                                               evidence={}, operator_ref='op', expected_updated_at=at,
+                                               dry_run=dry_run)
+
+
+async def test_bounded_pilot_posture_is_logged_at_warning_once_per_process(monkeypatch, caplog):
+    import json
+    import logging
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setattr(svc, "_SCOPE_POSTURES", set())
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(_bounded_pilot()))
+    caplog.set_level(logging.DEBUG, logger=svc.logger.name)
+    for _ in range(3):
+        assert svc.pilot_admission_scope() is not None
+    lines = [r for r in caplog.records if 'pilot posture=' in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.WARNING
+    assert 'posture=bounded fingerprint=' in lines[0].getMessage()
+    assert 'agent_one' not in caplog.text
+    caplog.clear()
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", "{not json")
+    for _ in range(2):
+        with pytest.raises(svc.PurchaseRefused):
+            svc._pilot_scope()
+    lines = [r for r in caplog.records if 'pilot posture=' in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.ERROR
+    assert 'posture=invalid_or_missing' in lines[0].getMessage()
+
+
+# -- claim timing: the regular cadence is due on the next tick; every hold stays exact ---------
+#
+# The claim is `next_poll_at <= now`. Only `_release`'s regular-cadence fallback (and a move into
+# a human-wait state) is scheduled `svc.cadence_slack_seconds` early; holds are exact.
+
+
+def _seconds_ago(seconds):
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=seconds)
+
+
+async def _awaiting_buyer(reap):
+    reap.get_checkout = _ok(CHECKOUT_CREATED)  # REQUIRES_ACTION: the buyer is still looking
+    await _active_enrollment()
+    pid = await _start()
+    await _step(pid)
+    await _step(pid)
+    assert (await _get(pid))['state'] == 'awaiting_approval'
+    await ledger.release_claim(pid, 'w1')
+    return pid
+
+
+@pytest.mark.parametrize('into_tick', [1, 14])
+async def test_a_regular_cadence_row_is_due_on_the_next_tick(reap, monkeypatch, into_tick):
+    """Released `into_tick` seconds after a tick began, 30 s ago: the tick now must take it."""
+    from datetime import timedelta
+    monkeypatch.delenv('REAP_AGENTIC_POLL_INTERVAL_SECONDS', raising=False)
+    assert svc.cadence_slack_seconds(30) == 15 and svc.cadence_slack_seconds(15) == 7
+    pid = await _awaiting_buyer(reap)
+    released_at = _seconds_ago(30 - into_tick)
+    monkeypatch.setattr(svc, '_now', lambda: released_at)
+    result = await _step(pid)
+    assert (result.outcome, result.state, result.next_poll_in_seconds) == ('released', 'awaiting_approval', 30)
+    assert (await _get(pid))['next_poll_at'] == released_at + timedelta(seconds=15)
+    assert [r['id'] for r in await ledger.claim_due_purchases('next-tick')] == [pid]
+
+
+def test_the_cadence_slack_follows_a_fast_tick_and_never_exceeds_half_the_interval(monkeypatch):
+    monkeypatch.setenv('REAP_AGENTIC_POLL_INTERVAL_SECONDS', '5')
+    assert svc.cadence_slack_seconds(30) == 2
+    monkeypatch.setenv('REAP_AGENTIC_POLL_INTERVAL_SECONDS', '600')
+    assert [svc.cadence_slack_seconds(i) for i in (15, 30, 60)] == [7, 15, 15]
+
+
+async def test_a_retry_after_is_not_claimable_before_it_ends(reap, monkeypatch):
+    """Reap asked for 20 s; the poller must not call it again 5 s later."""
+    import jobs.reap_agentic_purchase_poll as job
+    from datetime import timedelta
+    monkeypatch.delenv('REAP_AGENTIC_POLL_INTERVAL_SECONDS', raising=False)
+    await _active_enrollment()
+    pid = await _start()
+    await _step(pid)
+    reap.request_quote = rc.ReapResponse(ok=False, status=503, error='reap_status_503',
+                                         error_code='QUOTE_TEMPORARILY_UNAVAILABLE', retry_after_seconds=20)
+    released_at = _seconds_ago(5)
+    real_now = svc._now
+    monkeypatch.setattr(svc, '_now', lambda: released_at)
+    held = await _step(pid)
+    assert (held.outcome, held.next_poll_in_seconds) == ('released', 20)
+    assert (await _get(pid))['next_poll_at'] == released_at + timedelta(seconds=20)
+    monkeypatch.setattr(svc, '_now', real_now)
+    reap.calls.clear()
+    report = await job.run_reap_agentic_purchase_poll(worker_id='retry-after-plus-5')
+    assert report.claimed == 0 and reap.calls == []
+
+
+async def test_the_error_backoff_is_not_claimable_before_it_ends(reap, monkeypatch):
+    """`advance` raised 105 s ago; its 120 s backoff has 15 s left."""
+    import jobs.reap_agentic_purchase_poll as job
+    from datetime import timedelta
+    monkeypatch.delenv('REAP_AGENTIC_POLL_INTERVAL_SECONDS', raising=False)
+    pid = await _start()
+    real_advance = svc.advance
+
+    async def _raises(purchase_id, worker_id):
+        raise RuntimeError('synthetic')
+
+    monkeypatch.setattr(svc, 'advance', _raises)
+    raised_at = _seconds_ago(105)
+    report = await job.run_reap_agentic_purchase_poll(worker_id='raised', now=raised_at)
+    assert report.errors == 1
+    assert (await _get(pid))['next_poll_at'] == raised_at + timedelta(seconds=120)
+    monkeypatch.setattr(svc, 'advance', real_advance)
+    report = await job.run_reap_agentic_purchase_poll(worker_id='backoff-plus-105')
+    assert report.claimed == 0 and reap.calls == []
+
+
+async def test_the_not_created_hold_is_never_claimed_early_even_with_a_long_tick(reap, monkeypatch):
+    """With a 120 s tick the 270 s hold (A2) must still land in a later quote bucket."""
+    import jobs.reap_agentic_purchase_poll as job
+    from datetime import timedelta
+    monkeypatch.setenv('REAP_AGENTIC_POLL_INTERVAL_SECONDS', '120')
+    await _active_enrollment()
+    pid = await _start()
+    await _step(pid)
+    reap.create_checkout = rc.ReapResponse(ok=False, status=503, error='reap_status_503',
+                                           error_code='CHECKOUT_TEMPORARILY_UNAVAILABLE')
+    held_at = _seconds_ago(230)
+    real_now = svc._now
+    monkeypatch.setattr(svc, '_now', lambda: held_at)
+    held = await _step(pid)
+    assert held.next_poll_in_seconds == svc.PROVIDER_NOT_CREATED_HOLD_S == 270
+    assert (await _get(pid))['next_poll_at'] == held_at + timedelta(seconds=270)
+    monkeypatch.setattr(svc, '_now', real_now)
+    reap.calls.clear()
+    report = await job.run_reap_agentic_purchase_poll(worker_id='tick-120')
+    assert report.claimed == 0 and reap.calls == []
+    assert len(reap.named('create_checkout')) == 0

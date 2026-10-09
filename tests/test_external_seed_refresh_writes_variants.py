@@ -33,6 +33,7 @@ from services.external_offers_service import (
     _extract_from_html,
     _extract_jsonld_variants_with_census,
     evidence_variant_fields,
+    snapshot_price_fields,
 )
 
 DEST = "https://eyurs.com/products/round-lab-birch-juice-moisturizing-sunscreen"
@@ -89,17 +90,22 @@ def _page(offers: Any = None, *, html: Optional[str] = None) -> SimpleNamespace:
     """What `resolve_external_offer` hands the refresh for this page (ExternalOfferSnapshot's
     real field set; see test_refresh_clears_stale_snapshot)."""
     extracted = _extract_from_html(DEST, html if html is not None else _html(offers))
+    # resolve_external_offer's own pairing (it used to default USD here, as the producer did).
+    amount, currency, price_read = snapshot_price_fields(extracted)
     return SimpleNamespace(
         canonical_url=DEST,
         domain="eyurs.com",
         title=extracted.get("title"),
         image_url=extracted.get("image_url"),
-        price_amount=extracted.get("price_amount"),
-        # resolve_external_offer's own defaulting, reproduced: USD for a US market.
-        price_currency=(extracted.get("price_currency") or "USD"),
+        price_amount=amount,
+        price_currency=currency,
         availability=extracted.get("availability") or "unknown",
         last_checked_at=_NOW,
-        evidence={"provider": extracted.get("evidence_provider"), **evidence_variant_fields(extracted)},
+        evidence={
+            "provider": extracted.get("evidence_provider"),
+            **evidence_variant_fields(extracted),
+            "price_read": price_read,
+        },
     )
 
 
@@ -1122,3 +1128,61 @@ def test_the_reset_pins_the_id_the_gateway_serves_today():
     sql = script._RESET_SQL
     assert "'{external_product_id}'" in sql and "THEN to_jsonb(CAST(:served_id AS TEXT))" in sql
     assert "ELSE seed_data::jsonb->'external_product_id' END" in sql, "an existing id is never replaced"
+
+
+def test_single_variant_fallback_refuses_a_different_native_sibling(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563',32,'out_of_stock')],price=32,availability='out_of_stock')
+    result, stored = _refresh(monkeypatch,row,_page([_offer(20,IN,sku='46536716517564')]))
+    variant = stored['seed_data']['variants'][0]
+    assert (variant['price_amount'],variant['availability']) == (32,'out_of_stock')
+    assert result['variant_refresh']['not_re_read_count'] == 1
+    assert not _trusted(_serve(stored))
+
+
+def test_single_variant_fallback_never_overwrites_an_explicit_other_currency(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563',32,'out_of_stock',price_currency='EUR',currency='EUR')],price=32,availability='out_of_stock')
+    result, stored = _refresh(monkeypatch,row,_page([_offer(20,IN,sku='46536716517563')]))
+    variant = stored['seed_data']['variants'][0]
+    assert (variant['price_amount'],variant['price_currency'],variant['currency']) == (32,'EUR','EUR')
+    assert result['variant_refresh']['not_re_read_count'] == 1
+    assert not _trusted(_serve(stored))
+
+
+def test_single_variant_fallback_accepts_an_equivalent_shopify_gid(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563',32,'out_of_stock')],price=32,availability='out_of_stock')
+    result, stored = _refresh(monkeypatch,row,_page([_offer(20,IN,sku='gid://shopify/ProductVariant/46536716517563')]))
+    assert stored['seed_data']['variants'][0]['price_amount'] == 20
+    assert result['variant_refresh']['status'] == 'all_re_read'
+
+
+def test_a_localized_stored_price_requires_its_own_price_read(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563','20,00','out_of_stock',price_currency='EUR'),
+                             _variant('46536716517564',25,'in_stock')],price=25,availability='in_stock')
+    result, stored = _refresh(monkeypatch,row,_page([
+        {'@type':'Offer','sku':'46536716517563','availability':IN,'priceCurrency':'EUR'},
+        _offer(25,IN,sku='46536716517564'),
+    ]))
+    assert stored['seed_data']['variants'][0]['price_amount'] == '20,00'
+    assert '46536716517563' in result['variant_refresh']['not_re_read']
+    assert not _trusted(_serve(stored))
+
+
+def test_empty_primary_money_does_not_make_a_priced_variant_stock_only(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563','','out_of_stock',price=20),
+                             _variant('46536716517564',25,'in_stock')],price=25,availability='in_stock')
+    result, stored = _refresh(monkeypatch,row,_page([
+        _offer(25,IN,sku='46536716517564'),
+        {'@type':'Offer','sku':'46536716517563','availability':IN,'priceCurrency':'USD'},
+    ]))
+    assert stored['seed_data']['variants'][0]['price'] == 20
+    assert '46536716517563' in result['variant_refresh']['not_re_read']
+    assert not _trusted(_serve(stored))
+
+
+def test_known_stored_sku_refuses_a_different_explicit_page_sku(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563',32,'out_of_stock',sku='ABC')],price=32,availability='out_of_stock')
+    result, stored = _refresh(monkeypatch,row,_page([_offer(20,IN,sku='DEF')]))
+    variant = stored['seed_data']['variants'][0]
+    assert (variant['price_amount'],variant['availability'],variant['sku']) == (32,'out_of_stock','ABC')
+    assert result['variant_refresh']['not_re_read_count'] == 1
+    assert not _trusted(_serve(stored))

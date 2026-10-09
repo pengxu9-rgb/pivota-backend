@@ -64,6 +64,14 @@ if _IS_PG:
         # The sweep's catalog-hint case (`www.`-spelled Shopify product), which needs the catalog
         # tables: the fixture builds them from the repo's own metadata and deletes its own rows.
         _www_catalog,
+        # The connected-store lane's rows (merchant_stores / merchant_onboarding / products_cache).
+        _connected,
+        # The cart-mint lane's rows (external_product_seeds + the catalog rows the resolver reads).
+        _cart_seeds,
+        # The cart-mint scan-cache cases: a moved clock and a counted scan.
+        _scans,
+        # The IP-throttle cases: the sweep armed, a fake-clock pacer, the breaker state reset.
+        _armed,
         page,
         res,
     )
@@ -597,3 +605,94 @@ async def test_a_merchant_with_no_fact_is_browse_only_but_not_enforced(_migratio
     monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
     body = (await _get(_app, "/ops/merchant-purchasability?domain=never-seen.com&market=US")).json()
     assert body["tier"] == "browse_only" and body["enforced"] is False
+
+
+# ══ the coverage census: READ ONLY at the database ═══════════════════════════════════════════
+#
+# scripts/merchant_purchasability_census.py runs in ONE `SET TRANSACTION READ ONLY` transaction,
+# which only Postgres can express. These drive its `census()` over the sweep's real population
+# (the cart-mint seeds included), after a real armed sweep.
+
+
+async def test_the_census_reports_each_key_in_the_state_the_gate_would_read(_db, _cart_seeds, monkeypatch):
+    import db.merchant_purchasability as mp
+    import jobs.merchant_purchasability_sweep as sweep
+    from scripts import merchant_purchasability_census as census
+    from tests.test_merchant_purchasability import _ALLOWLISTS, _CART_MINT_EXPECTED, _Fetcher
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_BATCH", "6")
+    monkeypatch.setattr(sweep, "_preflight", _Fetcher({
+        "flowerbeauty.com": res("NO_CARD_PAYMENT", card=False, host="flowerbeauty.com"),
+        "catalog-brand-0.example": res("BLOCKED_UNKNOWN", host="catalog-brand-0.example"),
+    }))
+    await sweep.run_merchant_purchasability_sweep()
+
+    report = await census.census()
+    assert report["incomplete"] is False
+    states = {(r["host"], r["market"]): r["state"] for r in report["rows"]}
+    assert set(states) == _ALLOWLISTS | _CART_MINT_EXPECTED
+    for key, state in states.items():
+        assert (state == "positive") is await mp.is_purchasable(*key), key
+    assert states[("catalog-brand-0.example", "US")] == "unverifiable"
+    assert states[("flowerbeauty.com", "US")] == "confirmed_negative"
+    assert list(states.values()).count("never_checked") == len(states) - 6
+    assert report["summary"]["cart_mint_lane"]["complete"] is True
+
+
+async def test_the_census_transaction_refuses_a_write(_db, _cart_seeds, monkeypatch):
+    """Read-only AT THE SERVER, not by convention: a write attempted inside the census's
+    transaction fails, and nothing lands."""
+    import db.merchant_purchasability as mp
+    import jobs.merchant_purchasability_sweep as sweep
+    from db.database import database
+    from scripts import merchant_purchasability_census as census
+
+    async def _writes(**_k):
+        await database.execute(
+            "INSERT INTO merchant_purchasability (merchant_domain, market_country, vantage) "
+            "VALUES ('census-write.example', 'US', 'worker')"
+        )
+        return {}
+
+    monkeypatch.setattr(sweep, "collect_population", _writes)
+    with pytest.raises(Exception, match="read-only"):
+        await census.census()
+    assert await mp.get_fact("census-write.example", "US") is None
+
+
+# ══ the cart-mint scan cache: the migration and the first-use CREATE build one table ═══════════
+
+
+async def test_the_scan_cache_self_heal_builds_what_migration_245_builds(_db):
+    """Production never runs db/migrations; `ensure_table()` is what creates the table there. So
+    the two must build the same thing — compared through the catalog, not by reading SQL."""
+    import db.merchant_purchasability_cart_mint_scans as mint_scans
+    from db.database import database
+
+    table = mint_scans.TABLE
+    shape_sql = (
+        "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = :t ORDER BY ordinal_position"
+    )
+    key_sql = (
+        "SELECT kcu.column_name FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name "
+        "AND kcu.table_schema = tc.table_schema WHERE tc.table_name = :t "
+        "AND tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = current_schema()"
+    )
+
+    async def _shape():
+        cols = [tuple(dict(r).values()) for r in await database.fetch_all(shape_sql, {"t": table})]
+        keys = [dict(r)["column_name"] for r in await database.fetch_all(key_sql, {"t": table})]
+        return cols, keys
+
+    await database.execute(f"DROP TABLE IF EXISTS {table}")
+    await database.execute((_MIGRATIONS_DIR / "245_merchant_purchasability_cart_mint_scans.sql").read_text())
+    from_migration = await _shape()
+    await database.execute((_MIGRATIONS_DIR / "down" / "245_merchant_purchasability_cart_mint_scans_down.sql").read_text())
+    assert (await _shape())[0] == [], "the down migration removes it"
+    mint_scans._reset_for_tests()
+    assert await mint_scans.ensure_table()
+    assert await _shape() == from_migration and from_migration[1] == ["scan_id"]

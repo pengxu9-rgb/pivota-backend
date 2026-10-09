@@ -291,51 +291,7 @@ async def _bg_consume_quote_best_effort(
 
 
 router = APIRouter(prefix="/orders", tags=["orders"])
-_PG_SHOPIFY_LOCK_SUPPORTED: Optional[bool] = None
 _SUPPORTED_ORDER_PROVIDER_HINTS = {"stripe", "adyen", "checkout", "paypal"}
-
-
-def _shopify_order_lock_key(order_id: str) -> int:
-    digest = hashlib.sha256(f"shopify_order:{order_id}".encode("utf-8")).hexdigest()
-    # Keep within signed int64 range for pg advisory lock.
-    return int(digest[:16], 16) & 0x7FFFFFFFFFFFFFFF
-
-
-async def _try_acquire_shopify_order_lock(order_id: str) -> Tuple[bool, Optional[int]]:
-    global _PG_SHOPIFY_LOCK_SUPPORTED
-
-    if _PG_SHOPIFY_LOCK_SUPPORTED is False:
-        return True, None
-
-    lock_key = _shopify_order_lock_key(order_id)
-    try:
-        row = await database.fetch_one(
-            "SELECT pg_try_advisory_lock(:lock_key) AS locked",
-            {"lock_key": lock_key},
-        )
-        _PG_SHOPIFY_LOCK_SUPPORTED = True
-        locked = False
-        if row is not None:
-            try:
-                locked = bool(row["locked"])
-            except Exception:
-                locked = bool(getattr(row, "locked", False))
-        return locked, lock_key
-    except Exception:
-        _PG_SHOPIFY_LOCK_SUPPORTED = False
-        return True, None
-
-
-async def _release_shopify_order_lock(lock_key: Optional[int], *, lock_acquired: bool) -> None:
-    if not lock_acquired or lock_key is None or _PG_SHOPIFY_LOCK_SUPPORTED is not True:
-        return
-    try:
-        await database.execute(
-            "SELECT pg_advisory_unlock(:lock_key)",
-            {"lock_key": lock_key},
-        )
-    except Exception:
-        pass
 
 
 def _normalize_order_provider_hint(
@@ -1341,20 +1297,35 @@ async def _pg_advisory_lock_best_effort(*, lock_key: int):
         yield True
         return
 
+    # The lock is session-scoped, so the connection stays PINNED until after the unlock: a bare
+    # database.fetch_val would hand its pool connection back at once, and asyncpg's reset on
+    # release runs pg_advisory_unlock_all(). Only the acquire is best-effort; an exception from
+    # the caller's block propagates as itself (a `yield` inside the `except` used to turn it into
+    # "RuntimeError: generator didn't stop after athrow()").
+    conn = database.connection()
     try:
-        async with database.connection() as conn:
-            acquired = bool(
+        await conn.__aenter__()
+    except Exception:
+        # If advisory locks aren't available for any reason, proceed without blocking order creation.
+        yield True
+        return
+    try:
+        try:
+            acquired: Optional[bool] = bool(
                 await conn.fetch_val(
                     "SELECT pg_try_advisory_lock(:lock_key)",
                     {"lock_key": int(lock_key)},
                 )
             )
-            if not acquired:
-                yield False
-                return
-            try:
-                yield True
-            finally:
+        except Exception:
+            acquired = None  # unavailable: proceed unlocked, as above
+        if acquired is False:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            if acquired:
                 try:
                     await conn.execute(
                         "SELECT pg_advisory_unlock(:lock_key)",
@@ -1362,9 +1333,8 @@ async def _pg_advisory_lock_best_effort(*, lock_key: int):
                     )
                 except Exception:
                     pass
-    except Exception:
-        # If advisory locks aren't available for any reason, proceed without blocking order creation.
-        yield True
+    finally:
+        await conn.__aexit__(None, None, None)
 
 
 def _build_shopify_cart_permalink_best_effort(
@@ -6217,17 +6187,11 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
     - 失败不影响 Pivota 订单状态
     - 记录事件日志用于后续重试
     """
-    lock_key: Optional[int] = None
-    lock_acquired = True
+    # The one concurrency guard is the pinned advisory lock around the create below (see
+    # "Concurrency guard"), which re-reads the order once it holds the lock. An outer lock here
+    # used to be taken with a bare database.fetch_one: its pool connection went back to the pool
+    # at once, asyncpg's reset ran pg_advisory_unlock_all(), and so it never suppressed anything.
     try:
-        lock_acquired, lock_key = await _try_acquire_shopify_order_lock(order_id)
-        if not lock_acquired:
-            logger.info(
-                "[Shopify] Duplicate create suppressed by advisory lock: order_id=%s",
-                order_id,
-            )
-            return True
-
         logger.info("[Shopify] Starting order creation for %s", order_id)
 
         order = await get_order(order_id)
@@ -6945,8 +6909,6 @@ async def _create_shopify_order_impl(order_id: str) -> bool:
             logger.error(f"[Shopify] Failed to log order event: {log_error}")
             
         return False
-    finally:
-        await _release_shopify_order_lock(lock_key, lock_acquired=lock_acquired)
 
 
 # ============================================================================

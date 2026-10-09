@@ -194,6 +194,40 @@ WHERE cp.product_key = $1
           AND lower(coalesce(e.status, '')) = 'active')
 """
 
+# NEVER SUPPRESS THE SERVED ROW (review #2423). The served row is the catalog_products row carrying the
+# content_key's agent_pdp_view signature (signatures are unique, migration 071). This predicate is
+# correlated on `p`, an identity_resolution_proposals row, and yields the served row's key when that
+# row is one the proposal would SUPPRESS. A served row outside the proposal holds nothing. The sweep's
+# approve step (identity_reconcile_sweep.APPROVE_ALLOWLIST_SQL) and apply both read this one text.
+A_LOSER_IS_SERVED_SQL = """
+    SELECT cp.product_key FROM agent_pdp_view av
+    JOIN catalog_products cp ON cp.pivota_signature_id = av.pivota_signature_id
+    WHERE av.content_key = p.content_key
+      AND cp.product_key = ANY(p.subject_product_keys)
+      AND cp.product_key <> p.keeper_product_key
+"""
+
+# The strategies approved without a human decision (identity_reconcile_sweep.AUTO_APPROVE_STRATEGIES,
+# test-pinned equal). The guard runs at APPLY time too: an approval can predate the guard (#2423) or
+# the serving pick can move onto a loser after approval, while a drift skip left the proposal
+# 'approved' and retried on every apply.
+SERVED_ROW_GUARDED_STRATEGIES: Tuple[str, ...] = ("same_url_dup", "junk_url")
+
+SERVED_LOSER_SQL = """
+SELECT (""" + A_LOSER_IS_SERVED_SQL + """ LIMIT 1) AS served_loser
+FROM identity_resolution_proposals p
+WHERE p.proposal_id = $1
+"""
+
+# A held proposal goes back to 'proposed', which is where the sweep's approve step holds it and its
+# review step (REVIEW_HELD_SQL) enqueues it. The approval it had is kept in evidence.apply_held.
+HOLD_FOR_REVIEW_SQL = """
+UPDATE identity_resolution_proposals
+SET status = 'proposed', decided_by = NULL, decided_at = NULL,
+    evidence = COALESCE(evidence, '{}'::jsonb) || jsonb_build_object('apply_held', $2::jsonb)
+WHERE proposal_id = $1 AND status = 'approved'
+"""
+
 MARK_APPLIED_SQL = """
 UPDATE identity_resolution_proposals
 SET status = 'applied', run_id = $2, applied_at = NOW()
@@ -320,8 +354,18 @@ async def _apply_suppress_dup(conn, p: Dict[str, Any], run_id: str) -> Dict[str,
     keeper = p["keeper_product_key"]
     if keeper not in live:
         return {"skipped": "keeper_not_live"}
+    if p["strategy"] in SERVED_ROW_GUARDED_STRATEGIES:
+        served = await conn.fetchval(SERVED_LOSER_SQL, p["proposal_id"])
+        if served:
+            held = {"reason": "a_loser_is_served", "served_product_key": served, "run_id": run_id,
+                    "held_at": datetime.now(timezone.utc).isoformat(),
+                    "was_decided_by": p.get("decided_by"),
+                    "was_decided_at": str(p["decided_at"]) if p.get("decided_at") else None}
+            await conn.execute(HOLD_FOR_REVIEW_SQL, p["proposal_id"], json.dumps(held))
+            await conn.execute(INSERT_EVENT_SQL, p["proposal_id"], "held", run_id, json.dumps(held))
+            return {"skipped": "a_loser_is_served"}
 
-    losers = [k for k in p["subject_product_keys"] if k != keeper]
+    losers =[k for k in p["subject_product_keys"] if k != keeper]
     refs = [
         r["source_ref"]
         for r in await conn.fetch(LOSER_SOURCE_REFS_SQL, losers)
@@ -405,7 +449,9 @@ async def apply_approved(
     strategies: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Apply all approved proposals (optionally filtered by strategy) in one
-    transaction. Drifted proposals are skipped (left approved) and reported."""
+    transaction. Drifted proposals are skipped (left approved) and reported. A
+    guarded-strategy proposal that would suppress the served row is skipped and
+    returned to 'proposed' for review (see SERVED_ROW_GUARDED_STRATEGIES)."""
     run_id = run_id or _now_run_id()
     proposals = [dict(r) for r in await conn.fetch(FETCH_APPROVED_SQL)]
     if strategies is not None:

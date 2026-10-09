@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import math
 import os
 import re
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from fastapi import HTTPException
 from urllib.parse import urlparse
@@ -31,8 +32,12 @@ from services.external_seed_destination_liveness import (
     CONFIRMED_DEAD_VERDICTS,
     RETIREMENT_STREAK,
 )
-from services import crawl_politeness
-from services.external_seed_search import SEED_SUPPRESSED_PRODUCT_ANTI_JOIN
+from services import crawl_ip_throttle, crawl_politeness
+from services.external_seed_search import (
+    SEED_SUPPRESSED_PRODUCT_ANTI_JOIN,
+    build_seed_quarantine_anti_join,
+    seed_serving_currency,
+)
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
@@ -111,6 +116,69 @@ def host_backoff_tripped(consecutive_blocks: int, trip: int) -> bool:
     return trip > 0 and int(consecutive_blocks or 0) >= trip
 
 
+# Degraded-reason buckets that mean the host gave NO ANSWER: nothing came back that says anything
+# about the product. `_degraded_reason_bucket` names them.
+_UNREACHABLE_REASON_BUCKETS = frozenset({"connection", "timeout", "dns", "tls"})
+
+# A host that gave no answer this many rows IN A ROW is skipped for the rest of the run. `<= 0`
+# disables. It exists for hosts that truly never answer; it CANNOT tell those apart from our own
+# egress failing, and until 2026-09-28 almost every `connection` failure was our own egress.
+#
+# THE MEASURED CAUSE. `pivota-crawl-nat` ran on Cloud NAT defaults: 64 ports per VM, no dynamic
+# allocation, 120s TCP TIME_WAIT. `_fetch_html` opens a fresh connection per fetch, and most
+# storefronts sit behind Shopify's shared edge (23.227.38.x:443), which is ONE destination to NAT.
+# 64 ports / 120s = ~0.53 new connections a second to it. The serial loop asked ~1/s, so ~half
+# connected. That is ichibanm.com's "55% read", which an earlier version of this comment called
+# a flaky host. NAT DROPPED logs matched the refresh's connection failures one for one:
+# 1,431/1,431 on 09-26, 1,023/1,014 on 09-27, ~7,900/~7,650 on 09-28. On 09-28, four lanes pushed
+# ~3.7/s, and this breaker skipped 2,764 rows on 20 HEALTHY hosts (kissusa, tarte, holiholic, ...).
+# The NAT was widened on 09-28 (min 1024 / max 16384 ports, dynamic, 30s TIME_WAIT).
+#
+# 20, not 5, still stands, on the old arithmetic: at any interleaved failure rate f a false trip
+# costs ~f^n per row. Re-derive it from post-widening runs before relying on the breaker, or on
+# any per-host "unreachable" statistic measured before then.
+_HOST_UNREACHABLE_TRIP_DEFAULT = 20
+
+# Hosts read at once. 1 is the serial loop. Capped at 8: a host is never read by two workers at
+# once, but every worker holds an event-loop slice for HTML parsing on a 1-vCPU job, and the
+# DB pool (DB_POOL_MAX_SIZE) is shared.
+_HOST_CONCURRENCY_DEFAULT = 1
+_HOST_CONCURRENCY_MAX = 8
+
+
+def _host_unreachable_trip() -> int:
+    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_HOST_UNREACHABLE_TRIP", "").strip()
+    try:
+        return int(raw) if raw else _HOST_UNREACHABLE_TRIP_DEFAULT
+    except ValueError:
+        return _HOST_UNREACHABLE_TRIP_DEFAULT
+
+
+def _refresh_host_concurrency(explicit: Optional[int]) -> int:
+    """The flag wins, then EXTERNAL_REFERRAL_REFRESH_HOST_CONCURRENCY, then 1. Clamped to [1, 8]."""
+    raw: Any = explicit
+    if raw is None:
+        raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_HOST_CONCURRENCY", "").strip() or None
+    try:
+        value = int(raw) if raw is not None else _HOST_CONCURRENCY_DEFAULT
+    except (TypeError, ValueError):
+        value = _HOST_CONCURRENCY_DEFAULT
+    return min(max(value, 1), _HOST_CONCURRENCY_MAX)
+
+
+_MAX_STRUCTURAL_SHARE_DEFAULT = 0.2
+
+
+def _max_structural_share() -> float:
+    """Above this share of attempted projections, structural skips with no attached write degrade
+    the run. EXTERNAL_REFERRAL_REFRESH_MAX_STRUCTURAL_SHARE; >= 1 disables the rule."""
+    raw = (os.getenv("EXTERNAL_REFERRAL_REFRESH_MAX_STRUCTURAL_SHARE") or "").strip()
+    try:
+        return float(raw) if raw else _MAX_STRUCTURAL_SHARE_DEFAULT
+    except ValueError:
+        return _MAX_STRUCTURAL_SHARE_DEFAULT
+
+
 def batch_run_status(
     *,
     failed: int,
@@ -121,6 +189,8 @@ def batch_run_status(
     projections_attempted: int = 0,
     projections_written: int = 0,
     projections_errored: int = 0,
+    projections_structural_skips: int = 0,
+    projections_written_attached: int = 0,
     candidate_count: int = 0,
     skipped_for_budget: int = 0,
 ) -> str:
@@ -155,7 +225,25 @@ def batch_run_status(
     # drifting from the seed, which is the whole defect this hook exists to close. Silent
     # before, because the outcome dicts were discarded — `no_mirror_product` x2,000 and
     # `synced` x2,000 read identically.
-    if price_changes and projections_attempted and projections_written == 0:
+    #
+    # Judged on the projections that SHOULD write. A structural skip (the seed has no offer row
+    # the writer may touch: OFFER_SYNC_STRUCTURAL_SKIP_STATUSES) is the catalogue's shape, not a
+    # failed write. Counting them made 09-27 exit 1 on `no_mirror_product` 2,220/2,220 with
+    # nothing broken, and a job that fails every night hides the night something does break.
+    projections_expected = max(0, projections_attempted - max(0, projections_structural_skips))
+    if price_changes and projections_expected and projections_written == 0:
+        return "degraded"
+    # ...BUT A NIGHT THAT IS MOSTLY STRUCTURAL AND WROTE NO CANONICAL OFFER IS NOT HEALTHY EITHER.
+    # Since the attached lane exists, 19,782 of 19,808 served attached seeds have a listing row to
+    # write (2026-09-28), so a structural skip is the exception. A run where they dominate and the
+    # attached lane wrote nothing is 09-27 again (2,220 skips, 0 writes, 16 prices moved): the lane
+    # did not run, or the queue holds only rows it cannot reach. Without this, the rule above
+    # would report that night as success.
+    if (
+        projections_attempted
+        and projections_written_attached == 0
+        and max(0, projections_structural_skips) / projections_attempted > _max_structural_share()
+    ):
         return "degraded"
     # Every projection that was attempted raised. Distinct from the rule above: prices may
     # not have moved (so `price_changes` is 0) and the writer may still have blown up on
@@ -1650,90 +1738,121 @@ async def should_block_external_referral_runtime(
     return blocked, status
 
 
-async def get_external_referral_refresh_candidate_seed_ids(limit: int = 500) -> List[str]:
-    """Pick the seeds we have spent a request on least recently.
+# A served seed read within this window is FRESH and waits behind every stale one. Sized for the
+# launch target -- every served seed re-read from its origin within 3 days: a row crosses into the
+# stale tier at 48h, and a nightly run that drains the stale tier reaches it before 72h.
+_FRESH_HOURS_DEFAULT = 48.0
 
-    ORDERED ON `last_crawl_attempt_at`, NOT `updated_at` and NOT `last_crawled_at`. The two are not the same question and
-    this function asked the wrong one until migration 202. `updated_at` answers "when was
-    this row last WRITTEN", and it is bumped by writers that never contact the origin:
-    `external_seed_servability` on attach, `identity_resolution` on a status flip,
-    `pdp_governance_service`, and any operator PATCH. Ordering the refresh queue by it
-    starves rows in proportion to how much OTHER attention they get — and the sharpest
-    case is the first query below, which selects `attached_product_key IS NOT NULL` while
-    the act of attaching is itself an `updated_at` bump. A seed becoming servable, the
-    moment its price starts being quoted, went to the back of the queue that keeps its
-    price honest.
+# The candidate slice cap. The old 5000 sat far under the ~23.8k active seeds; it only bounded a
+# SQL LIMIT, and the queue is now tiered in Python over every eligible row, so this is a sanity cap.
+_CANDIDATE_LIMIT_CAP = 30000
 
-    `updated_at` is kept only as a tiebreak beneath the real signal, so rows that share a
-    `last_crawled_at` (notably the NULL cohort — today, all of them) still come out in a
-    stable, sensible order rather than whatever the index happens to return.
 
-    A seed attached to a SUPPRESSED catalog product is not a candidate: the seed lane no longer
-    serves it (SEED_SUPPRESSED_PRODUCT_ANTI_JOIN), so a request spent keeping its price honest is
-    a request spent on nothing. Measured prod 2026-09-27: 682 active seeds attach to suppressed
-    products. Lifting the suppression (suppressed_at back to NULL) returns the seed to the queue,
-    and its stale `last_crawl_attempt_at` puts it near the head.
+def _refresh_fresh_hours() -> float:
+    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_FRESH_HOURS", "").strip()
+    try:
+        value = float(raw) if raw else _FRESH_HOURS_DEFAULT
+    except ValueError:
+        return _FRESH_HOURS_DEFAULT
+    return value if math.isfinite(value) and value >= 0 else _FRESH_HOURS_DEFAULT
+
+
+def refresh_queue_tier(*, is_fresh: bool, market: Any, price_currency: Any) -> Tuple[int, int]:
+    """Where a candidate sits in the refresh queue. Pure; lower sorts first.
+
+    Stale before fresh, then a row priced in its own market's currency before one that is not.
+    The second key is the seed lane's currency filter (`seed_serving_currency`, Peng 2026-09-26):
+    a row in the wrong currency is not served, and a refresh cannot make it so, because
+    `_refresh_external_seed_by_id` refuses a currency switch (`skipped_currency_mismatch`). It is
+    kept rather than dropped. A NULL currency can still be filled by a read, and SG rows live in
+    the US partition on purpose.
     """
-    normalized_limit = max(1, min(int(limit or 500), 5000))
-    attached_rows = await database.fetch_all(
+    expected = seed_serving_currency(market)
+    currency = str(price_currency or "").strip().upper()
+    served_currency = expected is not None and currency == expected
+    return (1 if is_fresh else 0, 0 if served_currency else 1)
+
+
+async def get_external_referral_refresh_candidate_seed_ids(
+    limit: int = 500, *, seed_ids: Optional[Sequence[str]] = None, market: Optional[str] = None
+) -> List[str]:
+    """Which seeds the nightly refresh re-reads, in order: served and stale first.
+
+    THE QUEUE USED TO SKIP UNATTACHED SEEDS. (The 2026-09-28 census found 0 served unattached seeds
+    -- all 19,808 served seeds are attached -- so this is a latent fix, not a coverage one.) It took `attached_product_key IS NOT NULL` rows
+    first, then UNATTACHED rows only when their domain matched a connected merchant store, and
+    only when the attached rows left room under the limit. With ~14k attached rows and a 4,000-row
+    limit, there was never room. The seed lanes serve unattached seeds
+    (`fetch_external_seed_rows`, `only_unattached` True by default and False on the multi and
+    shop lanes), so an unattached seed was served on its ingest-time price and never re-read. Now
+    every active seed the seed lane can serve is a candidate.
+
+    NOT candidates, filtered in SQL with the seed lane's own fragments:
+      * a seed attached to a SUPPRESSED catalog product (SEED_SUPPRESSED_PRODUCT_ANTI_JOIN).
+        Measured prod 2026-09-27: 682. Lifting the suppression puts it back, near the head;
+      * a seed whose domain is QUARANTINED (`build_seed_quarantine_anti_join`), for the same reason;
+      * a RETIRED seed. The destination sweep sets `status = 'inactive'`.
+
+    ORDER: `refresh_queue_tier` (stale before fresh, served currency before not), then within a
+    tier `last_crawl_attempt_at` NULLS FIRST, as before. The tier uses `last_crawled_at`, the
+    origin-read clock. The within-tier order uses the ATTEMPT clock, so a seed that can never be
+    read still rotates behind the others instead of heading the queue forever (migration 202). The
+    SQL keeps that order and a stable Python sort applies the tiers on top.
+
+    `updated_at` stays only as the last tiebreak (see migration 202 for why it never leads).
+    """
+    normalized_limit = max(1, min(int(limit or 500), _CANDIDATE_LIMIT_CAP))
+    fresh_cutoff = datetime.now(timezone.utc) - timedelta(hours=_refresh_fresh_hours())
+    scope_sql = ""
+    scope_values: Dict[str, Any] = {"fresh_cutoff": fresh_cutoff}
+    if seed_ids is not None:
+        # Targeted operator handoff accepts only stored IDs, never URLs. Reapply the same
+        # suppression/quarantine/status guards after planning, rather than trusting a manifest.
+        ids = list(dict.fromkeys(seed_ids))
+        if len(ids) > 200 or any(not isinstance(s, str) or not s or len(s) > 255 for s in ids):
+            raise ValueError("invalid_targeted_refresh_seed_ids")
+        if not ids:
+            return []
+        expected = seed_serving_currency(market)
+        if not market or not expected:
+            raise ValueError("targeted_refresh_requires_market")
+        tokens = []
+        for index, seed_id in enumerate(ids):
+            name = f"refresh_seed_{index}"
+            tokens.append(f":{name}")
+            scope_values[name] = seed_id
+        scope_sql = f"AND id IN ({', '.join(tokens)}) AND upper(trim(market)) = :refresh_market " \
+                    "AND (price_currency IS NULL OR btrim(price_currency) = '' " \
+                    "OR upper(trim(price_currency)) = :refresh_currency)"
+        scope_values.update(refresh_market=str(market).strip().upper(), refresh_currency=expected)
+    rows = await database.fetch_all(
         f"""
-        SELECT id
+        SELECT id, market, price_currency,
+               CASE WHEN last_crawled_at IS NOT NULL AND last_crawled_at >= :fresh_cutoff
+                    THEN 1 ELSE 0 END AS is_fresh
         FROM external_product_seeds
         WHERE status = 'active'
-          AND attached_product_key IS NOT NULL
         {SEED_SUPPRESSED_PRODUCT_ANTI_JOIN}
+        {build_seed_quarantine_anti_join()}
+        {scope_sql}
         ORDER BY last_crawl_attempt_at ASC NULLS FIRST, last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
-        LIMIT :limit
         """,
-        {"limit": normalized_limit},
+        scope_values,
     )
-    attached_ids = [str(_row_to_dict(row).get("id") or "").strip() for row in attached_rows or []]
-    attached_ids = [seed_id for seed_id in attached_ids if seed_id]
-    remaining = max(0, normalized_limit - len(attached_ids))
-    if remaining <= 0:
-        return attached_ids[:normalized_limit]
-
-    merchant_domains_rows = await database.fetch_all(
-        """
-        SELECT domain
-        FROM merchant_stores
-        WHERE domain IS NOT NULL
-          AND TRIM(domain) != ''
-        """,
-        {},
-    )
-    merchant_domains = {
-        normalize_referral_domain(_row_to_dict(row).get("domain"))
-        for row in merchant_domains_rows or []
-    }
-    merchant_domains = {domain for domain in merchant_domains if domain}
-    if not merchant_domains:
-        return attached_ids[:normalized_limit]
-
-    unattached_rows = await database.fetch_all(
-        """
-        SELECT id, domain
-        FROM external_product_seeds
-        WHERE status = 'active'
-          AND attached_product_key IS NULL
-          AND domain IS NOT NULL
-          AND TRIM(domain) != ''
-        ORDER BY last_crawl_attempt_at ASC NULLS FIRST, last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
-        LIMIT :limit
-        """,
-        {"limit": normalized_limit * 4},
-    )
-    domain_unattached_ids: List[str] = []
-    for row in unattached_rows or []:
+    ranked: List[Tuple[Tuple[int, int], str]] = []
+    for row in rows or []:
         row_dict = _row_to_dict(row)
         seed_id = str(row_dict.get("id") or "").strip()
         if not seed_id:
             continue
-        if _match_seed_domain_to_merchant_domains(row_dict.get("domain"), list(merchant_domains)):
-            domain_unattached_ids.append(seed_id)
-        if len(domain_unattached_ids) >= remaining:
-            break
-    return (attached_ids + domain_unattached_ids)[:normalized_limit]
+        tier = refresh_queue_tier(
+            is_fresh=bool(int(row_dict.get("is_fresh") or 0)),
+            market=row_dict.get("market"),
+            price_currency=row_dict.get("price_currency"),
+        )
+        ranked.append((tier, seed_id))
+    ranked.sort(key=lambda item: item[0])  # stable: keeps the SQL order inside a tier
+    return [seed_id for _tier, seed_id in ranked[:normalized_limit]]
 
 
 # The wall-clock ceiling for one refresh run, and it is not a nicety. Every row here is a
@@ -1811,18 +1930,59 @@ async def _fetch_refresh_candidate_hosts(seed_ids: Sequence[str]) -> Dict[str, s
     return hosts
 
 
+async def _run_workers(worker: Callable[[], Awaitable[None]], concurrency: int) -> None:
+    if concurrency <= 1:
+        # Inline, in this task's own context: exactly the serial loop this replaced.
+        await worker()
+        return
+    # A FRESH CONTEXT PER WORKER. `databases` 0.7.0 parks its Connection in a ContextVar and
+    # this task has already queried, so a plain child task would share that one Connection
+    # and silently join a sibling's open transaction (reference: services/scheduler_job_runner
+    # `spawn_isolated`). Isolated, each worker checks its own connection out of the pool,
+    # whose size (DB_POOL_MAX_SIZE, 2 on the job) caps the DB concurrency whatever this is.
+    from services.scheduler_job_runner import spawn_isolated
+
+    workers = [
+        spawn_isolated(worker(), name=f"external-referral-refresh-worker-{index}")
+        for index in range(concurrency)
+    ]
+    await asyncio.gather(*workers)
+
+
 async def run_external_referral_refresh_batch(
     *,
     refresh_seed_by_id: Callable[[str], Awaitable[Dict[str, Any]]],
     limit: int = 500,
     budget_seconds: Optional[float] = None,
+    host_concurrency: Optional[int] = None,
+    ip_throttle_trip_hosts: Optional[int] = None,
+    ip_throttle_window_seconds: Optional[float] = None,
+    ip_throttle_enabled: Optional[bool] = None,
+    candidate_seed_ids: Optional[Sequence[str]] = None,
+    market: Optional[str] = None,
 ) -> Dict[str, Any]:
-    candidate_seed_ids = await get_external_referral_refresh_candidate_seed_ids(limit=limit)
+    candidate_seed_ids = await get_external_referral_refresh_candidate_seed_ids(
+        limit=limit, **({"seed_ids": candidate_seed_ids, "market": market} if candidate_seed_ids is not None else {})
+    )
+    # THE IP BREAKER, beside the per-host one and for a different failure. The per-host breaker
+    # sees one host's streak; on 09-30 Shopify's shared edge throttled our one egress IP across
+    # 331 hosts at once, and the per-host breaker tripped 261 times, one host at a time, while the
+    # run kept asking. It trips on DISTINCT hosts throttling inside a window, whatever edge they
+    # sit behind. See `services.crawl_ip_throttle`.
+    ip_breaker = crawl_ip_throttle.IpThrottleBreaker.from_env(
+        trip_hosts=ip_throttle_trip_hosts,
+        window_seconds=ip_throttle_window_seconds,
+        enabled=ip_throttle_enabled,
+    )
+    ip_throttle_skips: Dict[str, int] = {}
+    skipped_for_ip_throttle = 0
     budget = _refresh_budget_seconds(budget_seconds)
     host_trip = _host_block_trip()
-    candidate_hosts = (
-        await _fetch_refresh_candidate_hosts(candidate_seed_ids) if host_trip > 0 else {}
-    )
+    unreachable_trip = _host_unreachable_trip()
+    concurrency = _refresh_host_concurrency(host_concurrency)
+    # Looked up whatever the breakers say: the host is also the concurrency key (one row in
+    # flight per host) and the per-host timing key. Without hosts every row is its own lane.
+    candidate_hosts = await _fetch_refresh_candidate_hosts(candidate_seed_ids)
     # Hosts this run has stopped asking, and how many of their rows it passed over. Those rows
     # are NOT stamped (`refresh_seed_by_id` is never called), so they keep their place at the
     # head of tomorrow's queue instead of being recorded as an attempt that never happened.
@@ -1838,6 +1998,8 @@ async def run_external_referral_refresh_batch(
     proj_errored = 0
     proj_seconds = 0.0
     proj_skips: Dict[str, int] = {}
+    proj_writes: Dict[str, int] = {}
+    proj_offer_skips: Dict[str, int] = {}
     pdp_refreshed = 0
     pdp_errored = 0
     pdp_skips: Dict[str, int] = {}
@@ -1869,38 +2031,50 @@ async def run_external_referral_refresh_batch(
     # A scraped currency that disagrees with the stored one is refused rather than
     # applied (see routes/employee_products._refresh_external_seed_by_id). This counter
     # is the visible cost of that refusal: if it is non-trivial, the currency EXTRACTOR
-    # needs work — `_detect_currency_from_text` has no KRW case and the caller defaults
-    # by market — not the writer.
+    # needs work, not the writer. (Its main source, `resolve_external_offer` defaulting an
+    # unread currency by market, is gone: that now lands in `price_skipped_unreadable`.)
     price_skipped_currency_mismatch = 0
     # A fetch that produced a non-positive amount. Distinct from `unavailable` (no
     # reading at all) because it means the extractor read something and got a broken
     # offer shape — a different problem with a different fix.
     price_skipped_non_positive = 0
+    # The page carried a price the extractor would not read (utils/crawled_price.py refuses an
+    # ambiguous separator rather than guessing; an unread currency is no longer invented). By
+    # reason, so a rising count points at the signal the extractor is missing.
+    price_skipped_unreadable = 0
+    price_unreadable_reasons: Dict[str, int] = {}
+    price_unreadable_hosts: Dict[str, int] = {}
     availability_changed = 0
-    for index, seed_id in enumerate(candidate_seed_ids):
-        # CHECKED BEFORE THE ROW, not after: the point is to stop STARTING work, and a check
-        # after the call would still pay one more full row past the budget. It cannot interrupt
-        # a row already in flight either, so the true ceiling is `budget` plus the cost of the
-        # single slowest row — bounded, since `crawl_politeness` now caps what one row can cost.
-        if budget > 0 and (time.monotonic() - started) >= budget:
-            stopped_early = True
-            skipped_for_budget = len(candidate_seed_ids) - index
-            # LOUD, because a silent truncation reads exactly like a completed sweep: the
-            # summary would otherwise show a smaller `refreshed` with no reason attached.
-            logger.warning(
-                "external referral refresh hit its %.0fs wall-clock budget after %d/%d rows; "
-                "%d candidates left unrefreshed this run",
-                budget, index, len(candidate_seed_ids), skipped_for_budget,
-            )
-            break
-        host = candidate_hosts.get(seed_id, "")
-        if host and host in tripped_hosts:
-            tripped_hosts[host] += 1
-            skipped_for_host_backoff += 1
-            continue
+    # Hosts the run stopped asking because they did not answer at all (connection refused or
+    # reset, timeout, DNS, TLS), with how many of their rows it passed over. Kept apart from the
+    # 429 breaker because the cause and the fix differ.
+    unreachable_hosts: Dict[str, int] = {}
+    unreachable_streak: Dict[str, int] = {}
+    # One error per no-answer host, URLs stripped: enough to tell a connection failure from a DNS or
+    # TLS one without reading per-row logs. "All connection attempts failed" on many hosts at once
+    # is our NAT (see _HOST_UNREACHABLE_TRIP_DEFAULT), not the hosts: every top no-answer host of
+    # 09-26/27 answered a plain HEAD from outside the crawl egress.
+    unreachable_samples: Dict[str, str] = {}
+    skipped_for_unreachable_host = 0
+    # Per-host cost, measured around the refresh call: the fetch, the pacing wait it includes,
+    # the writes and the projection. This is how to see which hosts the budget goes to.
+    host_stats: Dict[str, Dict[str, float]] = {}
+    rows_started = 0
+
+    async def _process(seed_id: str, host: str) -> None:
+        nonlocal refreshed, refreshed_from_cache, degraded, failed, unprocessable
+        nonlocal price_changed, price_filled, price_unchanged, price_unavailable
+        nonlocal price_skipped_incomplete_pair, price_skipped_currency_mismatch
+        nonlocal price_skipped_non_positive, price_skipped_unreadable, availability_changed
+        nonlocal proj_attempted, proj_written, proj_errored, proj_seconds
+        nonlocal pdp_refreshed, pdp_errored
+        outcome = "failed"
+        outcome_bucket = ""
+        row_started = time.monotonic()
         try:
             result = await refresh_seed_by_id(seed_id)
             status = str(result.get("status") or "success")
+            outcome = status
             if status == "success":
                 refreshed += 1
                 if result.get("snapshot_from_cache"):
@@ -1922,6 +2096,11 @@ async def run_external_referral_refresh_batch(
                     price_skipped_currency_mismatch += 1
                 elif price_status == "skipped_non_positive":
                     price_skipped_non_positive += 1
+                elif price_status == "skipped_unreadable":
+                    price_skipped_unreadable += 1
+                    reason = str(price.get("reason") or "unknown")
+                    price_unreadable_reasons[reason] = price_unreadable_reasons.get(reason, 0) + 1
+                    price_unreadable_hosts[host or "unknown"] = price_unreadable_hosts.get(host or "unknown", 0) + 1
                 elif price_status == "unavailable":
                     price_unavailable += 1
                 proj = result.get("projection")
@@ -1937,6 +2116,11 @@ async def run_external_referral_refresh_batch(
                             _bump(pdp_skips, _k[len("pdp_skip_"):])
                         elif _k.startswith("skip_"):
                             _bump(proj_skips, _k[5:])
+                        elif _k.startswith("wrote_"):
+                            _bump(proj_writes, _k[len("wrote_"):])
+                        elif _k.startswith("offer_skip_"):
+                            _key = _k[len("offer_skip_"):]
+                            proj_offer_skips[_key] = proj_offer_skips.get(_key, 0) + int(_v or 0)
                 availability = result.get("availability_refresh")
                 if isinstance(availability, dict) and availability.get("status") == "applied":
                     availability_changed += 1
@@ -1947,7 +2131,8 @@ async def run_external_referral_refresh_batch(
                 # read — so a night with 1,353 degraded rows reported a bare count and no way
                 # to tell a bot-challenge from a TLS error from a 404. Bucketed rather than
                 # raw so the histogram stays small enough to read in a log line.
-                _bump(degraded_reasons, _degraded_reason_bucket(result.get("error")))
+                outcome_bucket = _degraded_reason_bucket(result.get("error"))
+                _bump(degraded_reasons, outcome_bucket)
                 _bump(degraded_hosts, str(result.get("domain") or "unknown"))
             else:
                 failed += 1
@@ -1961,6 +2146,7 @@ async def run_external_referral_refresh_batch(
             # code; a broad `except HTTPException` would silently reclassify those as permanent.
             detail = str(getattr(exc, "detail", "") or "").strip()
             if getattr(exc, "status_code", None) in (400, 404) and detail in _UNPROCESSABLE_SEED_DETAILS:
+                outcome = "unprocessable"
                 unprocessable += 1
                 _bump(unprocessable_reasons, detail[:40])
             else:
@@ -1983,6 +2169,144 @@ async def run_external_referral_refresh_batch(
                 "external referral refresh: %s answered %d 429/503s in a row; skipping its "
                 "remaining rows this run", host, crawl_politeness.consecutive_blocks(host),
             )
+        if not host:
+            return
+        stats = host_stats.setdefault(
+            host, {"rows": 0, "origin_reads": 0, "degraded": 0, "seconds": 0.0}
+        )
+        stats["rows"] += 1
+        stats["seconds"] += max(0.0, time.monotonic() - row_started)
+        if outcome == "success" and not (isinstance(result, dict) and result.get("snapshot_from_cache")):
+            stats["origin_reads"] += 1
+        elif outcome == "degraded":
+            stats["degraded"] += 1
+        # NO ANSWER AT ALL, row after row: stop asking for the rest of the run. Any answer --
+        # a read, a 404, a 429 -- proves the host is reachable and breaks the streak. An
+        # exception or an unprocessable seed says nothing about the host and leaves it alone.
+        if outcome == "degraded" and outcome_bucket in _UNREACHABLE_REASON_BUCKETS:
+            unreachable_streak[host] = unreachable_streak.get(host, 0) + 1
+            if host not in unreachable_samples and len(unreachable_samples) < 20:
+                unreachable_samples[host] = re.sub(
+                    r"https?://\S+", "<url>", str(result.get("error") or "")
+                )[:160]
+        elif outcome in ("success", "degraded"):
+            unreachable_streak[host] = 0
+        if (
+            host not in unreachable_hosts
+            and host not in tripped_hosts
+            and host_backoff_tripped(unreachable_streak.get(host, 0), unreachable_trip)
+        ):
+            unreachable_hosts[host] = 0
+            logger.warning(
+                "external referral refresh: %s gave no answer %d rows in a row (%s); skipping "
+                "its remaining rows this run", host, unreachable_streak[host], outcome_bucket,
+            )
+
+    # THE SCHEDULER. One lane per host, holding that host's rows in queue order. A worker takes
+    # the lane whose next row is EARLIEST in the queue among lanes with nothing in flight, so:
+    #   * no host ever has two requests in flight. `crawl_politeness` still paces every request
+    #     on its own (it reserves the slot before sleeping, which is safe across tasks), and the
+    #     breakers see one row at a time per host, exactly as in the serial loop;
+    #   * with one worker this IS the serial loop: nothing is in flight at take time, so the
+    #     earliest head is simply the next row in the queue.
+    # What concurrency buys is the idle time. On a serial loop, every second one host spends
+    # waiting out its interval, its Crawl-delay, a slow TLS handshake or a timeout is a second
+    # no other host is read. The sibling destination sweep already reads 4 hosts at once from the
+    # same crawl egress, daily at 03:15Z (`SWEEP_HOST_CONCURRENCY`).
+    queue_position = {seed_id: index for index, seed_id in enumerate(candidate_seed_ids)}
+    lanes: Dict[str, Deque[str]] = {}
+    for seed_id in candidate_seed_ids:
+        lane_host = candidate_hosts.get(seed_id, "")
+        # A row with no host has no pacing key, so it is its own lane.
+        lanes.setdefault(lane_host or f"\x00{seed_id}", deque()).append(seed_id)
+    ready: List[Tuple[int, str]] = [(queue_position[lane[0]], key) for key, lane in lanes.items()]
+    heapq.heapify(ready)
+    in_flight = 0
+    lane_freed = asyncio.Condition()
+
+    def _drain_ip_throttled_lane(key: str) -> None:
+        nonlocal skipped_for_ip_throttle
+        # Unstamped, exactly like the per-host breaker's skips: `refresh_seed_by_id` is never
+        # called for these rows, so `last_crawl_attempt_at` is untouched and they lead tomorrow.
+        remaining = len(lanes.pop(key, ()))
+        ip_throttle_skips[key] = ip_throttle_skips.get(key, 0) + remaining
+        skipped_for_ip_throttle += remaining
+
+    def _drain_tripped_lane(key: str) -> None:
+        nonlocal skipped_for_host_backoff, skipped_for_unreachable_host
+        # Passed-over rows are NOT stamped (`refresh_seed_by_id` is never called), so they keep
+        # their place at the head of tomorrow's queue instead of being recorded as an attempt
+        # that never happened.
+        remaining = len(lanes.pop(key, ()))
+        if key in tripped_hosts:
+            tripped_hosts[key] += remaining
+            skipped_for_host_backoff += remaining
+        else:
+            unreachable_hosts[key] += remaining
+            skipped_for_unreachable_host += remaining
+
+    async def _worker() -> None:
+        nonlocal in_flight, stopped_early, rows_started
+        while True:
+            async with lane_freed:
+                while not ready and in_flight:
+                    await lane_freed.wait()
+                # CHECKED BEFORE THE ROW, and after any wait: the point is to stop STARTING work,
+                # and a check after the call would still pay one more full row past the budget.
+                # It cannot interrupt rows already in flight, so the true ceiling is `budget`
+                # plus the slowest in-flight row -- bounded, since `crawl_politeness` caps what
+                # one row can cost.
+                if budget > 0 and (time.monotonic() - started) >= budget:
+                    stopped_early = True
+                    return
+                if not ready:
+                    return
+                _position, key = heapq.heappop(ready)
+                # AT TAKE TIME, the one place it needs to be: a host whose lane is back in
+                # `ready` has no row in flight. Once the IP breaker has tripped, a host that has
+                # throttled us this run, or is known to be Shopify-served, is not asked again. A
+                # host first seen after the trip costs one request; if it throttles, that is its
+                # last.
+                if ip_breaker.blocks(key):
+                    _drain_ip_throttled_lane(key)
+                    lane_freed.notify_all()
+                    continue
+                seed_id = lanes[key].popleft()
+                in_flight += 1
+                rows_started += 1
+            try:
+                await _process(seed_id, candidate_hosts.get(seed_id, ""))
+            finally:
+                async with lane_freed:
+                    in_flight -= 1
+                    if key in tripped_hosts or key in unreachable_hosts:
+                        _drain_tripped_lane(key)
+                    elif lanes.get(key):
+                        heapq.heappush(ready, (queue_position[lanes[key][0]], key))
+                    else:
+                        lanes.pop(key, None)
+                    lane_freed.notify_all()
+
+    with crawl_ip_throttle.installed(ip_breaker):
+        await _run_workers(_worker, concurrency)
+    if ip_breaker.tripped:
+        logger.warning(
+            "external referral refresh: IP throttled at %s (%d distinct hosts, %d Shopify-served, "
+            "429'd within %.0fs); %d rows on throttled or Shopify-served hosts deferred to the "
+            "next run",
+            ip_breaker.tripped_at, ip_breaker.trip_host_count, ip_breaker.trip_shopify_host_count,
+            ip_breaker.window_seconds, skipped_for_ip_throttle,
+        )
+    if stopped_early:
+        skipped_for_budget = sum(len(lane) for lane in lanes.values())
+        # LOUD, because a silent truncation reads exactly like a completed sweep: the summary
+        # would otherwise show a smaller `refreshed` with no reason attached.
+        logger.warning(
+            "external referral refresh hit its %.0fs wall-clock budget after %d/%d rows; "
+            "%d candidates left unrefreshed this run",
+            budget, rows_started, len(candidate_seed_ids), skipped_for_budget,
+        )
+    elapsed = time.monotonic() - started
     # Real origin contact, not the success count: `refreshed` includes rows served from the
     # cached snapshot because the gate refused, timed out or paced out. This ratio is the one
     # number that says whether the run did its job.
@@ -1996,7 +2320,13 @@ async def run_external_referral_refresh_batch(
     # Rows the host breaker passed over leave it too, for the same reason as budget skips: they
     # were never tried.
     attempted_count = max(
-        0, len(candidate_seed_ids) - skipped_for_budget - unprocessable - skipped_for_host_backoff
+        0,
+        len(candidate_seed_ids)
+        - skipped_for_budget
+        - unprocessable
+        - skipped_for_host_backoff
+        - skipped_for_unreachable_host
+        - skipped_for_ip_throttle,
     )
     origin_yield = (origin_reads / attempted_count) if attempted_count else 1.0
     min_yield = _min_origin_yield()
@@ -2008,24 +2338,41 @@ async def run_external_referral_refresh_batch(
             "snapshot without reaching the origin (paced-out host, robots, timeout or TLS)",
             refreshed_from_cache, refreshed,
         )
+    # Derived from the skip histogram with the WRITER's set, never restated here and never a
+    # second counter: skips with no offer row the writer may touch.
+    from services.external_offer_dual_write import OFFER_SYNC_STRUCTURAL_SKIP_STATUSES
+
+    proj_structural = sum(
+        n for status, n in proj_skips.items() if status in OFFER_SYNC_STRUCTURAL_SKIP_STATUSES
+    )
+    base_status = batch_run_status(
+        failed=failed,
+        stopped_early=stopped_early,
+        attempted_count=attempted_count,
+        origin_reads=origin_reads,
+        price_changes=price_changed,
+        projections_attempted=proj_attempted,
+        projections_written=proj_written,
+        projections_errored=proj_errored,
+        projections_structural_skips=proj_structural,
+        projections_written_attached=int(proj_writes.get("attached") or 0),
+        candidate_count=len(candidate_seed_ids),
+        skipped_for_budget=skipped_for_budget,
+    )
     return {
         # HONEST STATUS. This used to be `success if failed == 0`, and `failed` only counts
         # exceptions — so a run that stopped on budget, or that served half its rows from cache
         # without reaching a single origin, reported success. The job then exited 0 and Cloud
         # Run showed a green tick over a night that refreshed almost nothing. `stopped_early`
         # and `low_origin_yield` are the two ways that happens in practice.
-        "status": batch_run_status(
-            failed=failed,
-            stopped_early=stopped_early,
-            attempted_count=attempted_count,
-            origin_reads=origin_reads,
-            price_changes=price_changed,
-            projections_attempted=proj_attempted,
-            projections_written=proj_written,
-            projections_errored=proj_errored,
-            candidate_count=len(candidate_seed_ids),
-            skipped_for_budget=skipped_for_budget,
-        ),
+        #
+        # `ip_throttled` OUTRANKS the other rules, and says so. The 429s before the trip drag the
+        # yield under its floor, so the yield rule would call every IP-throttled night
+        # "degraded" and hide the cause again. What the other rules would have said is kept in
+        # `status_without_ip_throttle`, so a night that was ALSO broken for another reason
+        # (failed rows, a starved budget) is still visible.
+        "status": "ip_throttled" if ip_breaker.tripped else base_status,
+        "status_without_ip_throttle": base_status,
         # "healed 2,000" vs "healed 0" — the projection OUTCOME, not just that it was called.
         "unprocessable": unprocessable,
         "unprocessable_reasons": dict(sorted(unprocessable_reasons.items(), key=lambda kv: -kv[1])[:8]),
@@ -2039,6 +2386,15 @@ async def run_external_referral_refresh_batch(
         # means the OFFER landed, and the view rebuild can silently no-op or fail independently.
         "projections_errored": proj_errored,
         "projection_skips": dict(sorted(proj_skips.items(), key=lambda kv: -kv[1])[:8]),
+        # Skips with no offer row to write (a subset of `projection_skips`). The status rule
+        # judges `projections_attempted - projection_structural_skips`, the ones that should write.
+        "projection_structural_skips": proj_structural,
+        # Written rows by target: `mirror` (the seed's mirror product) or `attached` (the
+        # canonical's offer for the seed's listing).
+        "projection_writes": dict(sorted(proj_writes.items())),
+        # Offer ROWS the attached lane refused, by reason (a seed can write its product-level row
+        # and refuse a variant the page did not list).
+        "projection_offer_skips": dict(sorted(proj_offer_skips.items(), key=lambda kv: -kv[1])[:8]),
         "pdp_refreshed": pdp_refreshed,
         "pdp_errored": pdp_errored,
         "pdp_skips": dict(sorted(pdp_skips.items(), key=lambda kv: -kv[1])[:8]),
@@ -2056,7 +2412,11 @@ async def run_external_referral_refresh_batch(
         # leaving a short run looking like a complete one.
         "stopped_early": stopped_early,
         "budget_seconds": budget,
-        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "elapsed_seconds": round(elapsed, 3),
+        # Hosts read at once, one row in flight per host. 1 = the serial loop.
+        "host_concurrency": concurrency,
+        "rows_started": rows_started,
+        "rows_per_second": round(rows_started / elapsed, 3) if elapsed > 0 else None,
         "skipped_for_budget": skipped_for_budget,
         # Share of candidates the loop got to before the budget ran out; `batch_run_status`
         # degrades a budget stop below `min_budget_reach`.
@@ -2070,7 +2430,31 @@ async def run_external_referral_refresh_batch(
         "skipped_for_host_backoff": skipped_for_host_backoff,
         "host_backoff_skips": dict(sorted(tripped_hosts.items(), key=lambda kv: -kv[1])[:10]),
         "host_block_trip": host_trip,
-        "host_breaker_armed": bool(candidate_hosts),
+        "host_breaker_armed": bool(candidate_hosts) and host_trip > 0,
+        # Rows NOT attempted because their host gave no answer (connection, timeout, DNS, TLS)
+        # `host_unreachable_trip` rows in a row. Unstamped, like the 429 breaker's skips.
+        "skipped_for_unreachable_host": skipped_for_unreachable_host,
+        "unreachable_host_skips": dict(sorted(unreachable_hosts.items(), key=lambda kv: -kv[1])[:10]),
+        "host_unreachable_trip": unreachable_trip,
+        "unreachable_host_errors": unreachable_samples,
+        # Rows NOT attempted because the IP breaker tripped and their host had throttled us or is
+        # Shopify-served.
+        # Unstamped, like the per-host skips, so they lead tomorrow's queue.
+        "skipped_for_ip_throttle": skipped_for_ip_throttle,
+        "ip_throttle_skips": dict(sorted(ip_throttle_skips.items(), key=lambda kv: -kv[1])[:10]),
+        # `ip_throttled`, the trip time, host counts, first/last 429 and the 429/503 header
+        # aggregate (`throttle_diagnostics`): see `crawl_ip_throttle.IpThrottleBreaker.summary`.
+        **ip_breaker.summary(),
+        # Where the budget went, per host: the 15 hosts that cost the most wall-clock.
+        "host_seconds": {
+            host: {
+                "rows": int(v["rows"]),
+                "origin_reads": int(v["origin_reads"]),
+                "degraded": int(v["degraded"]),
+                "seconds": round(v["seconds"], 1),
+            }
+            for host, v in sorted(host_stats.items(), key=lambda kv: -kv[1]["seconds"])[:15]
+        },
         "refreshed": refreshed,
         # SUBSET of `refreshed`, not a separate bucket: these rows took the success path on a
         # cached snapshot without reaching the origin. `refreshed - refreshed_from_cache` is
@@ -2085,6 +2469,13 @@ async def run_external_referral_refresh_batch(
         "price_skipped_incomplete_pair": price_skipped_incomplete_pair,
         "price_skipped_currency_mismatch": price_skipped_currency_mismatch,
         "price_skipped_non_positive": price_skipped_non_positive,
+        "price_skipped_unreadable": price_skipped_unreadable,
+        "price_unreadable_reasons": price_unreadable_reasons,
+        # Which hosts' pages the extractor would not price, so night one says WHERE (a host whose
+        # pages name no currency shows up here every night until it is looked at).
+        "price_unreadable_top_hosts": dict(
+            sorted(price_unreadable_hosts.items(), key=lambda kv: (-kv[1], kv[0]))[:25]
+        ),
         "availability_changed": availability_changed,
         "errors": errors[:20],
     }

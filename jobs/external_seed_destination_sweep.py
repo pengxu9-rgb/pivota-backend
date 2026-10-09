@@ -30,6 +30,7 @@ import logging
 from typing import Any, Dict
 
 from db.database import database
+from services import shopify_edge_pacer
 from services.external_seed_destination_liveness import coverage_alarm, run_destination_sweep
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,9 @@ DEFAULT_LIMIT = 1700
 
 async def run_daily_destination_sweep(*, limit: int = DEFAULT_LIMIT, retire: bool = True) -> Dict[str, Any]:
     summary = await run_destination_sweep(limit=limit, retire=retire)
+    if shopify_edge_pacer.enabled():
+        # Only with the flag on, so the summary is unchanged while the pacer is dark.
+        summary["shopify_edge_pacer"] = shopify_edge_pacer.stats()
     alarm = coverage_alarm(summary)
     if alarm:
         summary["coverage_alarm"] = alarm

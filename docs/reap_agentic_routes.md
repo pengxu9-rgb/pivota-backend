@@ -1,12 +1,14 @@
 # `/agent/v2/commerce/reap` — the contract, for the gateway (WP5)
 
-Three routes. `routes/agent_commerce_reap.py` is the implementation and
+`routes/agent_commerce_reap.py` implements this contract.
 `docs/runbooks/reap_agentic_purchase.md` is the operational half; this page is the wire.
 
-**The rail is DARK.** `REAP_AGENTIC_ENABLED` is unset in production, so every route below answers
-**404 `not_available_on_this_rail`** today. That is the state to build the fallback against: the
-door should treat a 404 from this prefix as "this rail is not available for this purchase" and go
-somewhere else, exactly as it would for a merchant that is not eligible.
+**New purchases are disabled by default.** The base gate or missing credentials make
+create and list return **404 `not_available_on_this_rail`**; the create-only gate blocks
+new purchases independently. Owner-scoped purchase GET and exact original-attempt recovery
+remain available while create is paused. After the buyer selects Reap, no refusal,
+unavailable response or uncertain outcome authorizes another checkout route or a cart-link
+retry. Preserve the original body, key and buyer session for read-only recovery.
 
 ---
 
@@ -79,6 +81,42 @@ answers **400**, not 422. Do not treat 400 as a transport error.
 
 ---
 
+## `POST /agent/v2/commerce/reap/purchases/prepare`
+
+Resolves a buyer-selected numeric Shopify variant to its **existing catalog SKU key** before
+creating the original purchase body or idempotency key. Both agent and buyer authentication
+apply. Master, credentials, create and cart-link gates must be live; a paused create refuses
+preparation. The request has exactly `item_source: "cart_link"`, `merchant_domain`,
+`product_key`, `variant_id`, `quantity` and `market_country`. Selector IDs are positive decimal
+strings; quantity is a strict integer. Extra keys, caller price, buyer contact, consent,
+idempotency and variant-key assertions are refused with `invalid_request`.
+
+Success is HTTP 200 with a `selection` object containing `product_key`, `variant_id`,
+`variant_key`, `merchant_domain`, `market`, `currency`, `unit_price_minor`, `quantity` and
+`item_source`. `variant_key` is the stored SKU key, not a key constructed from `variant_id`.
+The merchant field preserves the validated observed storefront host needed by the create
+lane; pilot and merchant eligibility use the existing canonical merchant rule.
+
+The selected numeric ID must resolve to exactly one unsuppressed, nonplaceholder SKU of that
+product and seller/source. Duplicate aliases refuse `row_variant_ambiguous`; no SKU is chosen
+by ordering or a default variant. The existing cart-link reader validates active attached
+source, seller identity, current storefront proof and the selected SKU's own offer. Missing,
+expired or contradictory evidence refuses. Preparation requires its usable own offers to
+agree on exact currency and minor price, and enforces the same current agent, domain, market,
+product, quantity, variant, currency and item-total pilot bound as create. The later provider
+quote must still satisfy the authoritative full total cap, including shipping, tax and fees.
+
+This endpoint performs only catalog/eligibility/proof reads: no buyer link, consent, key,
+click, enrollment or purchase writes, and no provider, merchant, crawl or enrichment network
+request. PostgreSQL enforces a read-only repeatable-read transaction. A witness is a current
+selection description, **not a reservation or permission to skip create's checks**. The door
+checks the selected witness before its first create dispatch, then saves the original body,
+key and buyer session. A missing, refused or uncertain preparation never authorizes another
+checkout route. Original-attempt recovery does not prepare again and remains independent of
+current catalog/proof/scope while create is paused.
+
+---
+
 ## `POST /agent/v2/commerce/reap/purchases`
 
 Opens a purchase and returns **immediately**. **No partner call is made in this request** — the
@@ -111,13 +149,16 @@ poller drives the state machine afterwards, on another process, over the next mi
   },
   "return_url": "https://api.pivota.cc/reap/return",
   "idempotency_key": "door-7f3a-2026-09-18",
+  "expected_unit_price_minor": 4250,
+  "expected_currency": "USD",
   "click_context": { "surface": "chat" }
 }
 ```
 
 | field | required | notes |
 |---|---|---|
-| `item_source` | no (default `reap_variant`) | Set to `cart_link` for Tier B. The entire cart-link lane remains a 404 fallback until `REAP_AGENTIC_CART_LINK_ENABLED` is on **and** Reap publishes the quote body field (`CART_LINK_QUOTE_FIELD`, currently unset). |
+| `item_source` | no (default `reap_variant`) | Set to `cart_link` for Tier B. Choose the source explicitly before the first POST; never retry a refused variant purchase as cart-link. The cart-link lane remains unavailable (404) until `REAP_AGENTIC_CART_LINK_ENABLED` is on (the base and create gates, bounded pilot scope and fresh eligibility/proof checks must also pass; the quote uses Reap's published `externalCheckout` body since 2026-09-28). |
+| `offer_code` | no | the buyer's own offer (coupon) code, either lane: a string of 1..128 characters with at least one non-whitespace character and no control character, sent to Reap **exactly as given** (not trimmed, not upper-cased). Empty, whitespace-only, over-long or control characters ⇒ `400 invalid_offer_code`; a non-string ⇒ `400 invalid_request`. Part of the idempotency hash when present (a retry that adds or changes a code is a different purchase). If Reap refuses the code (`OFFER_CODE_INVALID` / `OFFER_CODE_EXPIRED`) the purchase is re-quoted **once without it** and `offer_code_outcome` says so — tell your user before they approve. |
 | `merchant_domain` | yes | a bare host name, sent as observed (`www.brand.example` or `brand.example`); anything else — a scheme, port, path, userinfo, IP or single label — is `400 invalid_request`. Matched **canonically**: lower case, one leading `www.` removed, so `www.brand.example` and `brand.example` are the same merchant (`wwwbrand.example` is not). Variant lane: must be enabled in `reap_agentic_eligibility`. Cart-link lane: must have a fresh `tierb_cart_link_eligibility` verdict, and builds its cart URL on the host as sent. Both are checked in the buyer's market. |
 | `product_key` | yes | our catalog key (`catalog_products.product_key`). |
 | `variant_key` | no | our sku key (`catalog_skus.sku_key`), matched **exactly**. Omit only when the product has exactly one variant; a multi-variant product with no `variant_key` is `row_not_found`. |
@@ -127,12 +168,13 @@ poller drives the state machine afterwards, on another process, over the next mi
 | `buyer.shipping_address` | yes | **the Reap client's field names**, not the snake_case shape `/agent/v2/commerce/checkouts` uses. Required: `firstName`, `lastName`, `phone`, `addressLine1`, `city`, `country`. Optional: `addressLine2`, `region`, `postalCode`. Unknown keys are dropped. |
 | `buyer.name`, `buyer.phone` | no | **fallbacks only.** Used when the address omits the field; never override it. `name` splits on the last space. |
 | `return_url` | no | defaults to `REAP_AGENTIC_RETURN_URL`, else `https://<first REAP_RETURN_URL_HOSTS host>/reap/return` — with nothing set, `https://api.pivota.cc/reap/return`, a static page this backend serves. Must be https, no userinfo, on a host in `REAP_RETURN_URL_HOSTS`. |
-| `idempotency_key` | no | honoured for **24 hours**, scoped to `(agent, buyer)`. |
+| `idempotency_key` | **yes** (create and recovery) | nonempty after trimming, ≤ 128 printable characters; missing, blank, over-long or unprintable ⇒ `400 invalid_request` before anything is read or written. One key is one attempt: it is what makes a retry of an unknown outcome (a lost `202`, a `503 checkout_outcome_unknown`) the **same** purchase, and recovery can only find a keyed attempt. Immutable, scoped to `(agent, buyer)`, retained for the lifetime of the attempt. Same normalized body returns the original purchase regardless of age or terminal state; a different body is `409 idempotency_conflict`. An unverifiable legacy hash fails closed. Refusal tombstones also persist. A new intentional purchase requires a fresh key; age never permits rollover. |
+| `expected_unit_price_minor`, `expected_currency` | **yes**, both | the unit money the buyer was shown, bound into the attempt. Partial or malformed ⇒ `400 invalid_request` before anything is read. **Both** omitted ⇒ `400 invalid_request` before any write, unless the key already names an attempt keyed without money (before 2026-10-04): that retry gets the read-only replay (see below). See "Immutable selected money on new attempts" below. |
 | `click_context` | no | accepted and not forwarded. The click id this rail records is one **we** mint. |
 
-**There is no price field, and a price in the body is ignored.** The unit price comes from our
+**The expected pair is a check, never a price override.** The unit price comes from our
 catalog and is the number `verify_quote` later compares against Reap's subtotal, exactly, with no
-tolerance.
+tolerance; an expected pair that differs from it is `409 price_changed`.
 
 For `item_source: "cart_link"`, the same authenticated endpoint requires a **fresh ELIGIBLE Tier B
 verdict** for `(merchant_domain, buyer.shipping_address.country)` before reading the catalog or
@@ -140,11 +182,71 @@ minting a buyer. It constructs the single-line Shopify permalink itself, includi
 an owned `pivota_click_id`; the caller cannot provide a URL, variant ID, seller identity or price.
 The catalog SKU must identify a numeric Shopify variant. For a mirrored external seed, a numeric
 operator-entered `attached_variant_id` is **not** enough: the active same-market seed must be
-attached to this catalog product and carry a dedicated, at-most-seven-day-old proof from the
-same Shopify `.js` fetch that the live storefront had exactly one variant. The proof's product
-URL and numeric id must agree with the seed snapshot. A contradictory attached id, a
-multi-variant snapshot, or a synthetic canonical SKU
-without that evidence is refused. The seller's own offer supplies the exact price and currency.
+attached to this catalog product and carry a dedicated, at-most-seven-day-old storefront proof
+from one Shopify `.js` fetch (`scripts/backfill_shopify_variant_ids.py` is its only writer), of
+one of two kinds:
+
+* **sole variant** — the live storefront had exactly one variant, and it is the seed's; or
+* **named variant** (`scope: "named_variant"`, 2026-09-29) — the product has several variants
+  (shades, sizes), the seed **names exactly one** of them, and the live storefront lists that one,
+  `available: true`. A seed names a variant by its single snapshot entry's stamped id and/or one
+  numeric `variant=` on its own product URL on the shop host; the two must agree, and so must
+  every numeric variant id the seed itself records (the entry's `variant_id` / `id`, and
+  `selected_variant_id` / `default_variant_id`). A snapshot with two or more entries names none.
+  The catalog's chosen sku must name **that same** variant — a row carrying only the synthetic
+  `::canonical` placeholder is refused — and it is priced **only** from that variant's own sku
+  offer, never from the product-level placeholder offer.
+
+The proof's product URL must be the seed's own, over https on the shop's host. A contradictory
+attached id, an unproven multi-variant product, or a synthetic canonical SKU without that evidence
+is refused. The seller's own offer supplies the exact price and currency.
+
+**Enrichment rows (option 2, dark).** A `catalog_enrichment_agent_v1` row (`product_key`
+`ext:<slug>::<8hex>`, or `ext:retailer:<32hex>` for the retailer lane) is refused on this lane
+while `REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED` is off (default), exactly as before the flag
+existed (`row_variant_unverified`, or `row_not_found` when the posted host differs from the row's
+`source_domain`). The flag arms nothing on its own: it is read only inside the cart-link lane and
+also requires `REAP_AGENTIC_CART_LINK_ENABLED`. It is not an in-flight kill switch; the cart-link
+dial remains that. With it on, such a row is bought only when all of these hold:
+
+* **Store.** `merchant_domain` is the same storefront as the row's `canonical_url` host **and**
+  its `source_domain`, after one `www.` fold on each side (`www.brand.example` = `brand.example`;
+  a subdomain, suffix or lookalike is `row_not_found`). The cart URL is built on the host as sent.
+* **Seller.** The row's `merchant_id` is exactly the observed seller id our own minting functions
+  re-derive from it (`ext:retailer:` → the retailer's domain; otherwise brand + host), and a
+  non-null `seller_ref` agrees. The offer's `agent_seed::…` owner and a seed's seller are never
+  the seller. Else `seller_identity_unverified`.
+* **Key.** The legacy collapsed key `ext:unknown::<8 hex>` (shared by many products) is
+  `row_not_found`; the distinct `ext:unknown::<16 hex>` keys are ordinary keys.
+* **Sku.** A `variant_key` must be one of the product's live skus (`row_not_found`). Without one,
+  the product must be single-variant **in the catalog and on the storefront**, else
+  **`row_variant_ambiguous`** (the lane never picks a variant nobody named):
+  * the catalog may know at most ONE `::v:` sku, **suppressed ones counted** (a 3-shade line with
+    two shades suppressed, or a two-size product with one size suppressed, is not single-variant);
+  * that one sku is used if it is live, and its storefront proof must then be **sole-variant**
+    (the handle has exactly one variant); a catalog holding one of a storefront's two sizes is
+    refused;
+  * a **folded shade** (its `sku_payload.source_handle` names another handle than the
+    `canonical_url`'s, e.g. MAC `<parent>-nc10`) is one choice among a family and is never bought
+    without a `variant_key`, even when it is the only shade the catalog holds; named, it is;
+  * with no live real sku, the `<product_key>::canonical` placeholder is used, which the proof
+    step accepts only when the product has **no** `::v:` sku at all, suppressed ones included,
+    and the storefront handle has exactly one variant.
+* **Proof.** A row in `enrichment_cart_variant_proofs` for exactly that (product, sku), written by
+  the storefront proof job (the route creates the empty table on first use; if that CREATE fails,
+  it refuses for 60 s without retrying the DDL), at most 72 hours old, `ok`, available, on the same store and handle,
+  naming the sku's own Shopify id (`services/reap_enrichment_cart_proof.verify_enrichment_cart_proof`).
+  The variant in the cart URL is the one this proof names and nothing else. Any refusal is
+  `row_variant_unverified`.
+* **Price.** The listing's own offers on that sku (the enrichment lane's, under its `agent_seed::`
+  namespace, live, available, `source_ref` on the same store and the product's handle) must agree
+  on one price in the buyer market's currency, and it must equal the price the proof read live.
+  Otherwise `row_unpriced`, `row_price_ambiguous`, `row_currency_mismatch`, or **`row_price_stale`**
+  (the catalog price moved since the proof). All of these are answered before a click or a
+  purchase row exists.
+
+`variant_title` on the 202 is whatever the sku's payload carries as `variant_title`; no live
+enrichment row carries one today, so it is `null`.
 A click row is recorded before the purchase opens so the later conversion has verified seller identity. The
 cart-link quote checks shipping options and totals, but an ELIGIBLE merchant verdict alone does
 not prove shipping for this buyer or every SKU.
@@ -155,13 +257,42 @@ not prove shipping for this buyer or every SKU.
 {
   "purchase_id": "rp_283fba3ce85c4e59bb331e54",
   "status": "resolving",
-  "poll_after_seconds": 60
+  "poll_after_seconds": 60,
+  "checkout_dispatch_state": "not_dispatched",
+  "contact_reentry_required": false
 }
 ```
 
-A **replay** (same `idempotency_key`, same agent, same buyer, inside 24 h, **and the same
+`status`, `poll_after_seconds`, `checkout_dispatch_state` and `contact_reentry_required` are read
+back from the **committed** purchase after the key is bound, not assumed, so a fresh create
+normally answers `not_dispatched` / `false` but reports whatever a worker has already done. The two
+last fields mean exactly what they mean on `GET` (see "Field rules" below).
+
+**Cart-link lane only**, the body also carries **`variant_title`** (additive; no other field
+changes, and the variant lane's body is exactly the five keys above):
+
+```json
+{
+  "purchase_id": "rp_283fba3ce85c4e59bb331e54",
+  "status": "resolving",
+  "poll_after_seconds": 60,
+  "checkout_dispatch_state": "not_dispatched",
+  "contact_reentry_required": false,
+  "variant_title": "07 BURGUNDY INK"
+}
+```
+
+It is the live storefront's own title for the variant the permalink buys, recorded by the
+storefront proof. On this lane **the buyer never picks the variant** — the seed names it — so show
+it to the buyer before they approve ("Silky Matte Lip Ink — 07 BURGUNDY INK"). Display only: the
+numeric variant in the cart URL is what is bought. `null` when the proof recorded no title
+(proofs written before 2026-09-29). A single-variant product's title is often Shopify's literal
+`Default Title`, returned as is. The same value is stored as the purchase's `variant_title`, so
+`GET` returns it too.
+
+A **replay** (same `idempotency_key`, same agent, same buyer, at any age, **and the same
 request**) returns the same `purchase_id` and the purchase's **current** state, which may not be
-`resolving`.
+`resolving` (and, on the cart-link lane, the same `variant_title`).
 
 The key is compared together with a hash of the request it was used for: item source, merchant, product,
 variant, quantity, buyer email, shipping address and return url. Reuse a key on a **different**
@@ -173,23 +304,29 @@ or that supplies the recipient through `buyer.name` rather than in the address, 
 
 | status | `detail.error` | meaning | what the door should do |
 |---|---|---|---|
-| 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured | fall back |
-| 401 | `agent_user_required` | no `X-Agent-User-JWT` | get a user token, or fall back |
-| 409 | `merchant_not_eligible` | no enabled variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market** | fall back |
-| 409 | `buyer_unlinked` | **you should never see this.** Since WP4b the buyer identity is created on the first purchase, so this no longer means "no link" — it is the fail-closed answer when the identity or the opaque ref could not be *stored* (a storage fault, not a request fault). Retrying is reasonable; editing the body will not help. | retry once, then fall back |
-| 409 | `row_not_found` | no such product under this domain, or the variant is not this product's, or no variant named and the product has more than one | fall back |
-| 409 | `row_not_shopify` | the catalog row's intake lane is not `shopify` | fall back |
-| 409 | `row_variant_unverified` | Tier B has no numeric Shopify variant verified from our catalog or active same-market seed | fall back |
-| 409 | `seller_identity_unverified` | the catalog seller identity does not agree with the offer owner | fall back |
-| 409 | `row_unpriced` | **this merchant** has no usable offer of its own on the sku, or the price is not exactly representable in minor units | fall back |
-| 409 | `row_currency_mismatch` | the offer is priced in a currency the buyer's market does not use | fall back |
-| 409 | `idempotency_conflict` | this key was already used for a **different** request | use a new key, or re-send the original request |
+| 404 | `not_available_on_this_rail` | the dial is off, or the Reap client is unconfigured | show unavailable; preserve the selected route and original attempt |
+| 401 | `agent_user_required` | no `X-Agent-User-JWT` | obtain the original buyer session; do not switch routes |
+| 409 | `merchant_not_eligible` | no variant-lane row, or no fresh ELIGIBLE cart-link verdict, for this domain **in the buyer's market** | show blocked; do not retry through cart-link |
+| 409 | `merchant_disabled` | an operator turned this merchant off: a variant-lane merchant row for this domain and market is disabled. Answered on **both** lanes | show blocked; do not try another Reap lane |
+| 409 | `buyer_unlinked` | **you should never see this.** Since WP4b the buyer identity is created on the first purchase, so this no longer means "no link" — it is the fail-closed answer when the identity or the opaque ref could not be *stored* (a storage fault, not a request fault). Retrying is reasonable; editing the body will not help. | show unknown or unavailable; recover the exact original attempt before retrying |
+| 409 | `row_not_found` | no such product under this domain, or the variant is not this product's, or no variant named and the product has more than one | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_not_shopify` | the catalog row's intake lane is not `shopify` | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_variant_unverified` | Tier B has no numeric Shopify variant verified from our catalog or active same-market seed | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `seller_identity_unverified` | the catalog seller identity does not agree with the offer owner | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_unpriced` | **this merchant** has no usable offer of its own on the sku, or the price is not exactly representable in minor units. On the **cart-link lane** "usable" includes "priced in the buyer market's currency", so a row whose offers are all in another currency answers `row_unpriced` here, not `row_currency_mismatch` | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_price_ambiguous` | cart-link lane, no `variant_key`: the catalog spells the ONE chosen Shopify variant with several skus, and this merchant's usable offers on them carry different prices | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_currency_mismatch` | the offer is priced in a currency the buyer's market does not use (variant lane, and the cart-link lane's enrichment rows; the cart-link lane otherwise reads only offers in the market's currency and answers `row_unpriced` instead) | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_price_stale` | cart-link lane, **enrichment rows only** (dark flag): the catalog offer's price differs from the price the storefront proof read live | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `row_variant_ambiguous` | cart-link lane, **enrichment rows only** (dark flag): no `variant_key`, and the product is not single-variant: two or more `::v:` skus in the catalog (suppressed ones counted), or a storefront handle with several variants | show blocked; resolve the refusal before any new purchase intent |
+| 409 | `idempotency_conflict` | this key was already used for a **different** request | preserve the original key and body; recover its outcome before any new purchase intent |
 | 400 | `consent_required` | `buyer.consent_version` is **absent, blank, longer than 32 characters, or carries an unprintable character** — i.e. a string-shaped value that is not usable | show your user the terms, then resend with the tag |
 | 400 | `invalid_request` | `buyer.consent_version` is **present but not a string** (`123`, `true`, `{}`, `[]`, `1.5`) — a type error is a malformed body, not a missing act by a human, and the two codes tell you to do different things | fix the request |
-| 400 | `invalid_request` | the body is not a JSON object, did not validate, `quantity` out of range, `limit` out of range, or an identifier carries an unprintable character | fix the request |
+| 400 | `invalid_request` | the body is not a JSON object, did not validate (including a missing or blank `idempotency_key`, a partial `expected_unit_price_minor`/`expected_currency` pair, or no pair on a key that names no earlier money-less attempt), `quantity` out of range, `limit` out of range, or an identifier carries an unprintable character | fix the request |
 | 400 | `invalid_address` | the shipping address is incomplete or unprintable | fix the request |
 | 400 | `invalid_return_url` | not https, carries userinfo, or an unallowed host | fix the request |
-| 400 | `currency_unsupported` | a three-decimal currency; this rail's converter assumes two | fall back |
+| 400 | `invalid_offer_code` | `offer_code` is empty, whitespace only, longer than 128 characters, or carries a control character | fix the request (or omit the code) |
+| 400 | `currency_unsupported` | a three-decimal currency; this rail's converter assumes two | show blocked; resolve the refusal before any new purchase intent |
+| 503 | `checkout_outcome_unknown` | storage could not establish the outcome: the purchase-and-key transaction failed, the read-back of the committed purchase failed, or the key's stored mapping is unreadable. The attempt **may** exist | show unknown; call `POST /purchases/recover` with the **same body and key**, never re-POST — and never under a new key. See "Recover a lost create response" |
 
 No refusal ever carries the buyer's email or address, and none carries Reap's text.
 
@@ -250,7 +387,7 @@ including a body that is not JSON, the wrong content-type, and `?limit=500`:
 }
 ```
 
-> **`/openapi.json` still lists these three paths while the rail is dark.** The routes are mounted
+> **`/openapi.json` still lists these paths while the rail is dark.** The routes are mounted
 > at import and the schema is built from the router, so the *schema* is not gated even though every
 > *response* is. That residue is known and deliberate — a router mounted only when a dial is on is
 > a router whose mounting is never exercised — and it is the only way to tell from outside that the
@@ -296,7 +433,9 @@ one that does not exist, so this endpoint cannot be used to probe for ids.
   },
   "hosted_url": "https://pay.prava.space/enroll/3fa85f64",
   "hosted_url_expires_at": "2026-09-18T08:15:49.957734+00:00",
-  "poll_after_seconds": 30
+  "poll_after_seconds": 30,
+  "checkout_dispatch_state": "not_dispatched",
+  "contact_reentry_required": false
 }
 ```
 
@@ -333,7 +472,9 @@ one that does not exist, so this endpoint cannot be used to probe for ids.
   "hosted_url": "https://pay.prava.space/checkout/chk_7f3a",
   "hosted_url_expires_at": "2026-09-18T08:15:49.964985+00:00",
   "approval_deadline": "2026-09-18T07:20:49.964987+00:00",
-  "poll_after_seconds": 30
+  "poll_after_seconds": 30,
+  "checkout_dispatch_state": "dispatched",
+  "contact_reentry_required": false
 }
 ```
 
@@ -381,7 +522,9 @@ if the poller is dark, or `completed` when an approval landed inside the last po
     "tax_minor": 150
   },
   "order_reference": "ord_991",
-  "poll_after_seconds": null
+  "poll_after_seconds": null,
+  "checkout_dispatch_state": "dispatched",
+  "contact_reentry_required": false
 }
 ```
 
@@ -404,16 +547,167 @@ if the poller is dark, or `completed` when an approval landed inside the last po
 * **`order_reference` appears only on `completed`.**
 * **`poll_after_seconds`** is the rail's interval for the current state, and `null` on a terminal
   state (`completed`, `failed`, `refused`, `expired`).
+* **`checkout_dispatch_state`** is always present on a purchase (GET, list, `/recover`,
+  `/resume`, and the create `202` and its replays), except a retired attempt's `/recover` receipt,
+  which is not a purchase (see Recover a lost create response). It says what the durable record proves about a Reap checkout
+  for this purchase (`db/reap_continuation.dispatch_state`), never more:
+
+  | value | meaning |
+  |---|---|
+  | `not_dispatched` | tracked purchase (opened since migration 256) with no checkout create in flight and no checkout or order stored |
+  | `dispatch_started` | we committed to a checkout create and its outcome is not established — **a checkout may exist at Reap** |
+  | `dispatched` | a Reap checkout or order is stored on the purchase |
+  | `unknown` | a purchase opened before dispatch tracking: no evidence either way, which is **never** proof that nothing was sent |
+
+  Only `not_dispatched` is negative evidence. Treat the other three as "a payment page may
+  exist": keep polling, never open a replacement purchase.
+* **`contact_reentry_required`** is always present and is `true` only when the purchase is in
+  `resolving`, `needs_enrollment` or `quoting` **and** the buyer's contact (email, address,
+  offer code) was erased by the contact-retention sweep. The sweep runs on the poller: a purchase
+  nobody holds whose contact is older than `REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS` (default 900,
+  measured from creation or from the last accepted re-entry) loses it. Such a purchase makes no
+  new quote or checkout until the buyer re-enters the same contact through
+  `POST /purchases/{purchase_id}/resume` (below). It is `false` on every other state, including
+  `awaiting_approval` / `processing`, whose contact is erased by the same sweep but which need
+  nothing more from the buyer than the approval link. A contact-paused purchase that is not
+  re-entered within the re-entry window (`REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS`, default
+  86400 = 24 h, settable 3600–604800, **measured from `contact_purged_at`**, the moment the sweep
+  erased the contact) and carries no dispatch evidence of any kind is ended by the poller with
+  `last_error_code: "contact_reentry_lapsed"`: `needs_enrollment` → `expired`,
+  `resolving` → `failed`, `quoting` → `failed`. An accepted resume clears `contact_purged_at`, so
+  a purchase paused again later starts a new window from its new erasure. A purchase whose contact
+  was erased while its checkout create was unresolved does not lapse while it stays unresolved;
+  when an operator confirms that create was never made (`confirmed_not_created`),
+  `contact_purged_at` restarts at that moment, so the buyer gets a full window from then.
 * **`refusal_reason`** (on `refused`) is our vocabulary, sometimes carrying the resolver's own
   reason verbatim (e.g. `options:sole_label_differs:size`). Diagnostic, not an enum to branch on.
 * **`consent_version` / `consented_at`** (migration **233**) are the tag your door sent as
   `buyer.consent_version` on the `POST` that opened *this* purchase, and when. Never rewritten —
   a later purchase under a newer tag does not move them, and a terminal state does not clear
   them. `null` only on purchases opened before 233.
+* **`offer_code` / `offer_code_outcome` / `totals.discount_minor` / `totals.tax_included`**
+  (migration **247**). `offer_code` is what your door sent, as sent, while the purchase is in
+  flight; it is buyer input, so a terminal state (`completed`, `failed`, `refused`, `expired`)
+  clears it to `null` with the email and the address. `offer_code_outcome` is `null` until the
+  quote, then one of: `applied` (Reap took `discount_minor` off), `no_discount` (Reap accepted the
+  code and took nothing off), `dropped_invalid` / `dropped_expired` (Reap refused the code; the
+  purchase is re-quoted without it — **the price the buyer approves has no discount**). A dropped
+  code is never sent again on that purchase; if the step had no time left for the re-quote it is
+  released and the next poll re-quotes without the code. `quoted_total_minor` is always Reap's own
+  `finalAmount`, already net of any discount; we never compute one. `tax_included` is `true` when
+  `tax_minor` is already inside the prices (tax-inclusive markets such as SG): do **not** add it to
+  subtotal + shipping in that case.
 * **What is never here:** the buyer's email or address; `buyer_ref`, `agent_id`,
   `agent_user_ref_hash`; `reap_product_id`, `reap_variant_id`, `reap_quote_id`,
   `reap_checkout_id`; `enrollment_id`, `click_id`, `return_url`; any Reap media or image URL.
   The body is built from `db/reap_agentic_ledger.PUBLIC_PURCHASE_COLUMNS`, an allowlist.
+
+### Price witness: preflight quote, corroborated price change, live price (mig 258, dark)
+
+Owner decision 2026-10-05. Three dials, **all default off**; with every one off nothing below
+happens, no new key appears in any body, and the refusals are exactly the ones documented above --
+with one exception: a purchase that reaches `quoting` still carrying a live price an earlier
+witness recorded (a dial armed then, off now) has that price cleared, so the view never shows a
+"price updated" that no current check stands behind. A purchase no dial ever touched carries none,
+and nothing is written for it.
+
+| dial | values (default) | what it does |
+|---|---|---|
+| `REAP_AGENTIC_PRICE_CORROBORATION` | `on`/`1`/`true`/`yes` arm it; anything else is off (off) | a quote whose items subtotal differs from `our_price_minor × quantity`, and that passes **every other** quote check, is compared with an **independent** live unit price of the purchase's own Shopify variant from our own storefront reads (below). Corroborated **lower** → the purchase continues at Reap's quote. Corroborated **higher** → terminal `refused` / `price_changed` with `last_error_code: "quote_price_increased_corroborated"`. Anything else → `price_changed` / `quote_items_subtotal_mismatch`, as today. |
+| `REAP_AGENTIC_CORROBORATION_MAX_AGE_HOURS` | integer 1..168 (72) | how old an independent read may be. Out of range or not an integer → 72, warned once. |
+| `REAP_AGENTIC_PREFLIGHT_MODE` | `off` / `shadow` / `enforce`, anything else is off (off) | in `resolving`, after the item resolves and **before any enrollment is created, reused or replayed**, one buy-intent `POST /agentic/quotes` (same body the approval quote sends, keyed apart from it; its quote id is never stored or checked out) is checked like the approval quote (with corroboration when that dial is on). `shadow`: recorded, the purchase always continues. `enforce`: a definitive refusal ends the purchase before any card page; an unknown continues. A buyer who already has an active card goes straight to `quoting` and is not preflighted. |
+
+**Write-back: the live price corrects the catalog** (`REAP_AGENTIC_PRICE_WRITEBACK` = `off` (default) / `shadow` / `on`, services/reap_price_writeback.py). After each poll run, cart-link purchases from the last 72 h that were refused `price_changed` (or continued on a corroborated lower price) are read, newest per product. Without it a buyer told "the price is now X" cannot re-confirm: the gateway and this route still price the product at the old number. Owner rules (2026-10-06): an **increase** is written on the quote alone (the cart URL is ours and names one variant); a **decrease** only when our own store read of the variant says the same price; an **enrichment** listing's offers only when our fresh proof already says it, in either direction (the route requires offers = proof, and the proof is never written from a quote). Mirror rows write the seller's offers on the variant's skus (+ the `::canonical` placeholder under a sole-variant proof, or when the seed lists only that variant -- the placeholder is the projection of the seed's product price) and the seed's own variant price (+ `price_amount` when the seed lists only that variant); every written offer's payload copies of the price (`price`, `price_amount`, `commerce_facts_v1.regional_price`, `agent_safe_commerce_facts.price`) and, for a seed about that one variant, the seed's own `commerce_facts_v1` price move with it, each only from the old price; enrichment rows write the listing's offers on the proof's skus. Every write is compare-and-set on the old price, a seed crawled after the quote is left alone (`catalog_read_newer`), and the result is checked with this route's own loader (`written` vs `written_not_effective`). `shadow` decides and logs (`would_write`) and writes nothing. Outcomes are logged as `reap_price_writeback: mode=... outcomes={...}` and never enter `PollReport`. The gateway caches mirror product detail up to 10 min, so `get_product` can lag a write by that long.
+
+**What corroborates.** Only cart-link purchases (the variant lane's opaque Reap handles name no
+storefront variant; its own resolver price check, `_price_verdict`, is unchanged). The read must
+name the numeric variant in the purchase's own cart URL:
+
+* `enrichment_cart_variant_proofs` rows for (product, that variant): outcome `ok`, a known source,
+  available, the same storefront host, `currency` equal to the purchase's, a positive price, and
+  `checked_at` not in the future and inside the window. All usable rows must agree.
+* the mirror seed's storefront proof (`snapshot.shopify_cart_proof` /
+  `shopify_cart_variant_proofs`). **It corroborates only if the proof itself records a `currency`
+  equal to the purchase's**, it says `available: true`, and it passes the cart-proof fetch rule and
+  the window. `products.js` carries no currency (its price is in whatever presentment currency the
+  storefront chose for our crawler, ×100 even for zero-decimal currencies); the seed's price
+  currency and the market currency describe other numbers, so neither is assumed. Since
+  2026-10-08 the mirror backfill (scripts/backfill_shopify_variant_ids.py: a hand run, or the
+  `reap-cart-proof-mirror` job's mirror lane where that job is provisioned -- not in prod as of
+  2026-10-08, and its staging cron is paused) records it by the enrichment job's own rule
+  (services/shopify_presentment.py): `?country=<seed market>`, no cookie on any request, the final
+  response's `cart_currency` Set-Cookie, and only the market's currency counts. A store that sends
+  no `cart_currency` cookie at all (judydoll.com, the pilot, measured 2026-10-08) is priced from one
+  `/products/<handle>.json?country=<market>` request instead: its variants name `price_currency` in
+  the same response (it follows presentment: tarte `?country=GB` → 29.00 GBP), it must be the same
+  product id and handle as the `.js`, and it is sent only when a proof that could corroborate is
+  about to be written. Each proof then carries `price_minor` (ISO minor units), `currency` and
+  `price_source` (`products_js_v1` / `products_json_v1`) together, or none; the run report's
+  `proof_currency` counts `cookie:USD` / `json:USD` (what the written proofs carry) or why not
+  (`currency_not_market`, `json_other_product`, `json_variant_unpriced`, ...), and
+  `json_price_fetches` counts the extra requests. A blocked `.json` answer counts toward the
+  store's block streak like a `.js` one, and the store is not asked for `.json` again that run.
+  Known limit (scheduled lane only): a `.json` 429 whose Retry-After outlasts the lane's patience
+  holds that store's next `.js`, so the page ends held and its cursor does not advance; a store
+  that throttles `.json` but not `.js` on every run would then not get past its first page. Not
+  measured on any store; watch `json_price_fetches` / `held_by_politeness` before provisioning the
+  mirror job in prod.
+  A payload that repeats a variant id prices nothing. Proofs written
+  before that, or by a fetch whose currency was not verified, carry none and never corroborate.
+
+With either witness dial armed, a quote that fails the subtotal AND another check now reports the other check's code (`quote_total_not_reconciled`, `quote_shipping_not_reconciled`, ...) — still `price_changed` / `price_unverifiable`, never a continue. Both lanes yielding different prices is not corroboration. The subtotal must be an exact multiple
+of the quantity. `our_price_minor` is **never rewritten**: it stays the price the buyer selected
+(and the money pair bound into the attempt's fingerprint). After a lower rebind the charge is
+Reap's own quote total (`quoted_total_minor`, `finalAmount`), the pilot `max_total_minor` cap is
+still enforced on that total, and `final_total_minor` / attribution read the charge as before.
+
+**Preflight outcomes** (`preflight_outcome`, recorded once per attempt; a second tick never quotes
+again): `ok`; `price_changed` (subtotal, currency, or a corroborated increase — definitive);
+`refused` (definitive: `VARIANT_UNAVAILABLE`, `QUOTE_UNFULFILLABLE`, `CHECKOUT_URL_INVALID`,
+`CARD_PAYMENT_UNAVAILABLE`, no shipping option on the cart-link lane, or an `items` echo that is
+not our line — Reap priced another item, `quote_items_mismatch` → `refusal_reason`
+`variant_unavailable` / `quote_unfulfillable` / `cart_link_rejected` / `card_payment_unavailable`
+/ `no_shipping_option` / `price_unverifiable`); `unverified` (transport error, timeout, 429, 5xx, an offer-code refusal,
+an unreadable quote, or a witness interrupted mid-call: `preflight_interrupted`) — `enforce`
+continues on `unverified`, and the approval quote still decides. An enforced refusal is the
+ordinary terminal `refused` (email, address and offer code are cleared).
+
+**New GET keys** (owner GET, list and replay; built from `PUBLIC_PURCHASE_COLUMNS`, each present
+**only when it applies**, otherwise absent):
+
+```json
+"preflight": {"checked_at": "2026-10-05T08:00:01.123456+00:00",
+              "totals": {"currency": "USD", "items_subtotal_minor": 3000, "shipping_minor": 500,
+                         "tax_minor": 0, "tax_included": false, "total_minor": 3500}},
+"live_price": {"currency": "USD", "unit_price_minor": 3000, "items_subtotal_minor": 3000,
+               "quoted_total_minor": 3500, "stage": "preflight"},
+"price_rebound": {"currency": "USD", "from_unit_price_minor": 3200, "to_unit_price_minor": 3000,
+                  "source": "enrichment_proof", "corroborated_at": "2026-10-05T08:00:01.123456+00:00"}
+```
+
+* `preflight` — the buy-intent quote confirmed the price (`ok`), present ONLY while no approval
+  quote exists (`state` `resolving` or `needs_enrollment`). These are the totals the witness saw
+  before the card page, not a promise: from `quoting` on the key is gone and `totals` (the
+  approval quote's `quoted_total_minor`) is the only number to show; the approval quote may
+  differ. `tax_included: true` means `tax_minor` is already inside the prices.
+* `live_price` — only on `state: "refused"` with `refusal_reason: "price_changed"` AND
+  `last_error_code` `quote_items_subtotal_mismatch` or `quote_price_increased_corroborated` (the
+  refusal is the quoted item price itself), when that quote's live price was recorded: tell the
+  buyer "price updated to X". Every `quoting` step discards the witness's live price and rebind
+  first, so a later refusal never carries an earlier quote's price. `unit_price_minor` is `null` when
+  the subtotal is not an exact multiple of the quantity; `stage` is `preflight` or `approval`.
+  **Do not auto-retry at the live price.** `POST /purchases` compares the expected pair with the
+  CATALOG offer price (`our_price_minor`, read fresh at create), so a new attempt carrying the live
+  price is refused `409 price_changed` until the catalog offer itself is corrected (on the
+  enrichment lane the offer must also equal the storefront proof, else `row_price_stale`), and a
+  new attempt at the old catalog price meets the same quote refusal. Show the buyer the live
+  price; a retry is only meaningful after the catalog has caught up, with a fresh key.
+* `price_rebound` — the purchase continued at a lower live unit price our own read corroborated
+  (`source`: `enrichment_proof` | `mirror_proof`). `totals.our_price_minor` still shows the
+  selected price; the buyer approves `totals.quoted_total_minor`.
+
+`refusal_reason` / `last_error_code` added: `preflight_refused` (fallback reason, not expected),
+`quote_price_increased_corroborated`, `preflight_interrupted` (recorded, never terminal).
 
 ### States the door will see
 
@@ -421,6 +715,8 @@ if the poller is dark, or `completed` when an approval landed inside the last po
 (buyer must approve) → `processing` → `completed`. Also `refused`, `failed`, `expired`.
 `resolving` may go straight to `quoting` when the buyer is already enrolled. The buyer needs a
 link in exactly the two states named above.
+In `resolving`, `needs_enrollment` or `quoting` the buyer may instead be needed to re-enter their
+contact: `contact_reentry_required: true` (see "Resume a contact-paused purchase" below).
 
 ---
 
@@ -461,7 +757,9 @@ not a number — is **400 `invalid_request`**, not a silent clamp, because a cal
         "tax_minor": 150
       },
       "order_reference": "ord_991",
-      "poll_after_seconds": null
+      "poll_after_seconds": null,
+      "checkout_dispatch_state": "dispatched",
+      "contact_reentry_required": false
     }
   ],
   "limit": 20
@@ -607,3 +905,159 @@ same as to every other request, so this field cannot be used to probe whether th
 the POST — `resolving` has no page yet.
 
 There are **no webhooks on this rail**. The poll is the only way an outcome is ever learned.
+
+
+### Recover a lost create response
+
+`POST /agent/v2/commerce/reap/purchases/recover` takes the original `StartPurchaseRequest` body and a required nonempty `idempotency_key`. It uses the same API-key and end-user authentication and exact owner pair as create/GET. It is available while create flags or provider credentials are disabled. It does not check current merchant/catalog eligibility, call Reap, create identities/purchases, write consent, refresh keys or retain new buyer PII.
+
+The canonical hash is identical to create: merchant domain, product/variant, quantity, normalized buyer email/address, resolved return URL, item source and optional offer code. Keep the exact original body and resolved return URL; a changed configured default after an omitted return URL safely causes a conflict. Consent version is validated but is not hashed or rewritten by recovery. Click context is not hashed.
+
+* `200`: normally the same redacted owner purchase view as GET-by-ID, including `checkout_dispatch_state` and `contact_reentry_required`. **Except** for an attempt an operator retired before it opened a purchase: then the body is only `{"recovery_status": "retired", "reconciliation_id": "<id>"}`, with no `checkout_dispatch_state`, no `contact_reentry_required` and no purchase fields. Branch on `recovery_status` first. A retired attempt opened no purchase and cannot continue; a new purchase needs new buyer intent and a fresh key.
+* `404 purchase_not_found`: unknown key, refusal tombstone, missing purchase or unowned purchase.
+* `409 idempotency_conflict`: a changed request or unverifiable stored fingerprint.
+* `400`: malformed original body or missing/invalid key; `401`: missing end-user identity.
+* `503 checkout_outcome_unknown`: the retirement receipt could not be read, or the key's stored mapping is a refusal marker this server cannot interpret. Retry recovery with the same body and key; never re-POST.
+* `500`: any other database error (for example while reading the key mapping or the purchase). It says nothing about the outcome; retry recovery the same way, never re-POST.
+
+A failed recovery preserves uncertainty; it never authorizes a new payment attempt. Retry read-only recovery or escalate with the original key. On the enabled create route, a same-body replay still returns `202` for the existing purchase and follows the established consent update contract. Disabled create remains disabled; use recover for a read-only lookup. No schema migration is needed. Do not delete or overwrite the key mapping merely because 24 hours elapsed. Older application versions can still perform rollover, so replace all create handlers before relying on the lifetime guarantee.
+
+
+
+
+### Resume a contact-paused purchase — `POST /agent/v2/commerce/reap/purchases/{purchase_id}/resume`
+
+The one way to continue a purchase whose `contact_reentry_required` is `true`. It puts the buyer's
+contact back on **the same purchase** — same id, buyer reference, click, cart URL, enrollment,
+consent and key — and makes it due for the poller now. It never opens a purchase, mints a key,
+calls Reap or changes the item, quantity or price. There is no create fallback.
+
+**When to call it.** Only when a `GET` (or list, recover, or create replay) shows
+`contact_reentry_required: true` **and** `checkout_dispatch_state: "not_dispatched"`. Ask your
+user to continue, then send the request below. Any other dispatch state is refused, because a
+checkout may already exist: keep polling, and never open a replacement.
+
+**Gates and authentication.** Same headers as create. The base rail, credentials, the create gate
+and (for a `cart_link` body) the cart-link gate must all be on, and the pilot scope must admit the
+purchase; otherwise `404 not_available_on_this_rail`, exactly like create. The rail and the create
+gate are checked first; the cart-link gate and the pilot scope are checked late, as part of the
+fresh admission, so a purchase can get a `409` (for example `terminal_purchase_not_resumable`)
+before their `404`. **While create is paused, resume is unavailable** and the re-entry window
+keeps running.
+
+**Request.** The **original create body, unchanged**: the same JSON that opened the purchase,
+including the same `idempotency_key`, the same buyer email and shipping address (the server
+erased them and cannot fill them in), the same `return_url` (or the same omission), the same
+`offer_code` (or the same omission), the same `item_source`, and the same
+`expected_unit_price_minor` / `expected_currency` pair. It is checked with create's canonical
+request hash, so a different body is `409 idempotency_conflict`; changing an address or email is
+outside this endpoint's authority. Three further conditions, each checked against the stored
+purchase:
+
+* the key must belong to **the same agent and the same buyer** (`X-Agent-User-JWT`) and map to
+  **this** `purchase_id`; anything else is `404 purchase_not_found`, the same answer as a
+  purchase that does not exist;
+* `buyer.consent_version` must equal the tag the purchase was opened under (`consent_version` on
+  `GET`), else `400 consent_required`, and the buyer identity link must still name the purchase's
+  buyer reference, else `409 buyer_unlinked`;
+* a **fresh admission** of the same selection: purchasability and eligibility of the merchant in
+  the buyer's market, the catalog row and variant (cart-link: the current Tier B verdict and
+  storefront proof), and the pilot scope, exactly as create checks them. The selection must
+  resolve to the **same** product, variant, merchant, market, quantity and item source
+  (`409 resume_selection_changed`) at the **same** unit price and currency
+  (`409 price_changed`).
+
+**Response — `200 OK`.** The same owner view as `GET /purchases/{purchase_id}`, now with
+`contact_reentry_required: false`. A repeat of an accepted re-entry (same body) answers `200` with
+the current view and does **not** restart the contact clock. Concurrent re-entries have one
+winner; a loser that finds the winner's re-entry answers `200` with the same view. An accepted re-entry restarts the contact-retention cap
+(`REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS`), so a buyer who leaves it again can be paused again and
+resume again. A repeat after the purchase has moved on is answered by the first check below that
+fails (for example `checkout_dispatch_unresolved` once a checkout create has started). The table
+lists the refusals **in the order the handler checks them**; the first that applies is the answer.
+
+| status | `detail.error` | meaning | what the door should do |
+|---|---|---|---|
+| 404 | `not_available_on_this_rail` | rail dark or unconfigured, or the create gate off | show unavailable; keep polling `GET`. The re-entry window is still running |
+| 401 | `agent_user_required` | no `X-Agent-User-JWT` | obtain the original buyer session |
+| 400 | `invalid_request` | the body is not JSON or does not validate as a create body, or an identifier is malformed | send the exact original body |
+| 400 | `consent_required` | `buyer.consent_version` is unusable | send the original tag |
+| 400 | `invalid_offer_code`, `invalid_address` | the re-entered contact does not validate | send the exact original body |
+| 409 | `idempotency_conflict` | the key was used for a **different** body (a changed email, address, price pair, return url, offer code, ...) | send the exact original body |
+| 409 | `merchant_not_eligible`, `attempt_retired` | the key names a remembered refusal or a retired attempt, not a purchase | do not create; this attempt cannot continue |
+| 503 | `checkout_outcome_unknown` | the key's stored mapping is a refusal marker this server cannot interpret (a database error reading it is a `500`) | call `POST /purchases/recover` with the same body and key, never re-POST |
+| 404 | `purchase_not_found` | the key is unknown for this agent and buyer, maps to another purchase, or the purchase is not theirs | do not create; check you hold the original key and buyer session |
+| 409 | `terminal_purchase_not_resumable` | the purchase is `completed`, `failed`, `refused` or `expired` (including `contact_reentry_lapsed`) | show the outcome; a new purchase needs new buyer intent and a fresh key |
+| 409 | `checkout_dispatch_unresolved` | `checkout_dispatch_state` is not `not_dispatched`: a checkout create started, a checkout exists, or the purchase predates tracking | keep polling `GET`; never re-create |
+| 409 | `contact_reentry_not_required` | the contact was never erased (or the purchase is not in `resolving` / `needs_enrollment` / `quoting`). An already accepted re-entry answers `200` here instead | keep polling `GET` |
+| 400 | `consent_required` | `buyer.consent_version` **differs from the one the purchase was opened under** | send the original tag |
+| 409 | `buyer_unlinked` | the buyer's identity link no longer names this purchase's buyer reference (for example it was repointed by a hosted sign-in) | do not create; escalate |
+| 409 | `merchant_not_purchasable` | fresh admission: the merchant is not purchasable in the buyer's market | show blocked; do not switch routes |
+| 404 | `not_available_on_this_rail` | fresh admission, `cart_link` body only: the cart-link lane is off | show unavailable; keep polling `GET` |
+| 409 | `merchant_disabled`, `merchant_not_eligible`, `row_*`, `seller_identity_unverified` | fresh admission refused the same selection (merchant, eligibility, catalog row or variant, cart-link storefront proof) | show blocked; do not switch routes |
+| 409 | `resume_selection_changed` | the catalog now resolves to a different selection than the purchase holds | show blocked; do not switch routes |
+| 409 | `price_changed` | the catalog unit price or currency differs from the purchase's | show the change; never resume or retry at another price |
+| 404 | `not_available_on_this_rail` | fresh admission, last: the pilot scope is invalid or refuses this purchase | show unavailable; keep polling `GET` |
+| 409 | `resume_raced` | the single conditional write lost: a worker holds the purchase, or its state, dispatch fence or contact revision changed in between, and no concurrent re-entry succeeded | wait `poll_after_seconds`, `GET`, and resume again only if it still says so |
+
+**If nobody resumes.** The purchase stays paused and visible to `GET`; nothing is quoted or
+dispatched. The re-entry window (`REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS`, default
+86400 = 24 h, settable 3600–604800) is **measured from `contact_purged_at`**, the moment the
+contact was erased, not from creation. Once it has passed, the poller ends the purchase with
+`last_error_code: "contact_reentry_lapsed"` (`needs_enrollment` → `expired`, `resolving` →
+`failed`, `quoting` → `failed`), and `/resume` then answers `409 terminal_purchase_not_resumable`.
+It never ends a purchase that has any dispatch evidence (a checkout create started and not
+proven not-created, a stored checkout or order, an observed checkout, or a `quoting` purchase
+that predates dispatch tracking), nor one a worker holds at that moment: those stay paused for
+the operator queue. A `resolving` / `needs_enrollment` purchase paused before dispatch tracking
+existed (migration 256), which has no `contact_purged_at`, is timed from when it entered its
+state instead; such a `quoting` purchase never lapses. An accepted resume clears `contact_purged_at`; if the buyer leaves again and
+the contact is erased again, a new window starts from that erasure. A purchase erased while its
+checkout create was unresolved (`dispatch_started`) is not lapsed while it stays unresolved; an
+operator's `confirmed_not_created` restarts `contact_purged_at` at that moment, so the buyer's full
+window runs from then and `/resume` is still required. A lost `/resume` response is
+recovered by `GET`, not by a new purchase.
+
+
+
+
+### Optional direct-create pilot controls
+
+`REAP_AGENTIC_CREATE_ENABLED` pauses fresh work independently of status and authenticated recovery. Production requires `REAP_AGENTIC_PILOT_SCOPE` with all five cohort lists plus `variant_keys`, `currency` and `max_total_minor`; the exact literal `unrestricted` is the only explicit opt-out. Missing, malformed, incomplete or outside-scope create admission returns the private `404 not_available_on_this_rail` before buyer identity/consent writes. Quantity is a strict integer for create; authenticated recovery retains the earlier accepted numeric-body normalization. Existing owner GET/recover and checkout reconciliation remain independent of current create scope. See the runbook for variant namespaces, quote caps and worker pause diagnostics.
+
+### Immutable selected money on new attempts
+
+Every NEW attempt carries `expected_unit_price_minor` and `expected_currency`
+together (required since 2026-10-04; a body without them is `invalid_request`
+before any write, after one read-only replay lookup). A caller using a prepared selection sends the prepared money. The minor amount is a
+positive strict integer no larger than 9007199254740991; the currency is exactly
+three uppercase letters. A partial pair, explicit null, boolean, float or numeric
+string is `invalid_request` (400). These fields constrain the selection; they
+never override the server's own offer price.
+
+Both lanes compare the pair with the freshly resolved authoritative SKU/own offer
+before creating a buyer reference, consent record, click, key or purchase. A
+changed unit amount or currency is `price_changed` (409); existing source and
+market-currency refusals also remain in force. A bound variant request refused
+before money admission does not create an eligibility tombstone (so no create
+writes one any more; a tombstone written earlier is still honoured). Once accepted,
+the purchase stores that authoritative unit amount/currency. The existing
+provider resolution and exact quote subtotal/currency checks continue to compare
+against that stored purchase, including shipping/tax total pilot limits.
+
+The supplied pair is included in the immutable request fingerprint. A same-key
+retry or authenticated recovery compares the original pair and returns the
+original purchase even if today's catalog money, eligibility or proof changed.
+Adding, removing or changing either field on an existing key is an
+`idempotency_conflict` (409). Recovery performs no current selection lookup.
+
+A body with both fields omitted is hashed with the prior fingerprint
+byte-for-byte. On **create** it only replays: if its key names an attempt keyed
+that way, the answer is that attempt's (`202` with the same purchase, its
+remembered refusal, `attempt_retired`, or `idempotency_conflict`), and nothing is
+written -- not even the consent tag a money-bearing replay rewrites. If the key
+names nothing, it is `400 invalid_request` and nothing is written. **Recovery**
+accepts it as before. Old client attempts—including attempts whose client retained a selection witness
+without putting a money pair on the original backend body—must recover with that
+original body. Do not infer or add money fields from a retained witness, do not
+remint the attempt, and do not switch checkout routes after any refusal.

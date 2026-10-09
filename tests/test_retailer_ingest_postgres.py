@@ -480,6 +480,29 @@ async def test_an_apply_run_carries_its_write_marker_until_the_write_starts(db):
     assert (await ledger.unfinished_run(old, db=db))["catalog_write"] is None
 
 
+async def test_a_retire_manifest_is_stored_on_the_unfinished_run_and_survives_an_interrupt(db):
+    """pipeline._retire_stale_brand stores the old-spelling retire's reversal manifest BEFORE its write; an
+    execution killed after that must not lose it (the interrupted finish passes the recorded checks back)."""
+    job_id = await _enqueue(db, brand="RETIRE-MANIFEST", options={"vendors": ["X"]})
+    run_id = await ledger.start_run(job_id=job_id, stage="apply", image_sha=None, execution=None, db=db)
+    await ledger.mark_write_started(run_id, db=db)
+    manifest = {"run_id": "retire_abc", "products": [{"product_key": "ext:x::1", "prior_suppression_reason": None}],
+                "seeds": [{"id": "7", "prior_status": "active"}]}
+    await ledger.record_retire_manifest(run_id, manifest, db=db)
+    found = await ledger.unfinished_run(job_id, db=db)
+    import json as _json
+    checks = found["checks"] if isinstance(found["checks"], dict) else _json.loads(found["checks"])
+    assert found["catalog_write"] == "started"                       # the marker is merged, not replaced
+    assert checks["stale_brand_retire_manifest"] == manifest
+    await ledger.finish_run(run_id, outcome="interrupted", checks=checks, db=db)
+    row = await db.fetch_one("SELECT checks -> 'stale_brand_retire_manifest' AS m FROM retailer_ingest_runs "
+                             "WHERE id = :id", {"id": run_id})
+    m = row["m"] if isinstance(row["m"], dict) else _json.loads(row["m"])
+    assert m == manifest
+    with pytest.raises(RuntimeError):  # a finished run takes no manifest: the retire never writes without one
+        await ledger.record_retire_manifest(run_id, manifest, db=db)
+
+
 async def test_consecutive_outcomes_counts_the_newest_finished_streak(db):
     job_id = await _enqueue(db, brand="STREAK", options={"vendors": ["X"]})
     busy = ("write_lock_busy", "write_lock_unavailable")

@@ -12,11 +12,11 @@ operational endpoints, mirroring /__scheduler_health and /__build).
 **Production safety.** Every endpoint refuses to run in production, as
 resolved by `config.platform.is_production()` (which fails CLOSED to
 production on a managed host that cannot name its environment, so these
-endpoints stay shut on a misconfigured deploy). The shared-DB tenancy with
-prod means
-DB writes from these endpoints would land in the same Postgres as prod
-traffic, but the shakeout merchant id pattern (`merch_shakeout_*`) is
-filterable. The endpoints additionally require a shared-secret header
+endpoints stay shut on a misconfigured deploy). When staging shared prod's
+Postgres (Railway era), DB writes from these endpoints landed alongside prod
+traffic; on GCP staging has its own instance (infra/gcp/README.md). The
+shakeout merchant id pattern (`merch_shakeout_*`) keeps the rows filterable
+either way. The endpoints additionally require a shared-secret header
 to keep curious traffic out of the staging surface.
 
 Header required: `X-Shakeout-Token: <SHAKEOUT_DEBUG_TOKEN env var>`.

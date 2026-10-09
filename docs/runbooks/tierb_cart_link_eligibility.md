@@ -8,7 +8,7 @@ The lane remains **dark** while the Reap cart-link dial is off or its quote fiel
 
 | Piece | Where |
 |---|---|
-| Merchant list (40 rows) | `config/tierb_cart_link_merchants.json`, validated by `services/tierb_cart_link_merchants.py` |
+| Merchant list (42 rows: the 40 measured 2026-09-18, idewcare.com, jsmbeauty.sg) | `config/tierb_cart_link_merchants.json`, validated by `services/tierb_cart_link_merchants.py` |
 | Job | `python -m jobs.tierb_cart_link_eligibility` |
 | Storage + read API | `db/tierb_cart_link_eligibility.py` (`record_result`, `get_eligibility`, `is_cart_link_eligible`) |
 | Schema | `db/migrations/228_*` and the self-heal `db/tierb_cart_link_eligibility_schema.py` |
@@ -118,6 +118,13 @@ SELECT shop_domain, market, verdict, checked_at, consecutive_same, previous_verd
   is the older verdict". `verdict IS NULL` means no run has ever produced a definite verdict.
 - `is_cart_link_eligible(domain, market)` is true only for ELIGIBLE with `checked_at` within 48 h.
   Two missed days turn a merchant off on their own.
+- **An edge throttle** (since 2026-10-08; `PreflightResult.throttled`, see
+  docs/runbooks/merchant_purchasability.md "An IP throttle stops the run"): a 429 or a 503 with
+  Retry-After is TRANSPORT_ERROR (`last_error_code` `TRANSPORT_ERROR:resolve:throttled_429`),
+  indefinite exactly as the VARIANT_UNVERIFIED / UNCLASSIFIED it used to read as. A Cloudflare
+  challenge on the CHECKOUT is still BLOCKED_UNKNOWN, definite: it replaces ELIGIBLE, as before.
+  A throttle on a hop after a login or password wall is that wall. What changed is the retry: a
+  throttled result is asked ONCE (no 2 s retry), since asking again only adds to the volume.
 
 **ELIGIBLE does not prove shipping.** The checkout loads shipping rates with JavaScript, so an
 HTTP check cannot see them: heartpercent.us (no US delivery) and anua.us / skin1004.com (qty 1

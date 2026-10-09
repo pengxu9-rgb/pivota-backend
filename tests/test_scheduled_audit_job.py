@@ -399,7 +399,7 @@ async def test_re_audit_merchant_skips_when_lock_not_acquired(monkeypatch):
     from jobs import scheduled_audit_job as job
 
     async def fake_try_acquire(_merchant_id):
-        return False
+        return False, None
 
     body_calls = {"count": 0}
 
@@ -440,12 +440,12 @@ async def test_re_audit_merchant_releases_lock_when_body_returns_early(
     from jobs import scheduled_audit_job as job
 
     async def fake_try_acquire(_merchant_id):
-        return True
+        return True, "held-lock"
 
     releases: list = []
 
-    async def fake_release(merchant_id):
-        releases.append(merchant_id)
+    async def fake_release(lock):
+        releases.append(lock)
 
     monkeypatch.setattr(
         job, "_try_acquire_scheduler_lock", fake_try_acquire,
@@ -461,7 +461,7 @@ async def test_re_audit_merchant_releases_lock_when_body_returns_early(
         "last_audit_run_id": None,
     })
     assert result.get("reason") == "no prior succeeded audit; skipped"
-    assert releases == ["merch_alpha"], (
+    assert releases == ["held-lock"], (
         "Lock release must fire even when the body returns early"
     )
 
@@ -474,15 +474,15 @@ async def test_re_audit_merchant_releases_lock_when_body_raises(monkeypatch):
     from jobs import scheduled_audit_job as job
 
     async def fake_try_acquire(_merchant_id):
-        return True
+        return True, "held-lock"
 
     async def fake_locked_body(**kwargs):
         raise RuntimeError("synthetic body failure")
 
     releases: list = []
 
-    async def fake_release(merchant_id):
-        releases.append(merchant_id)
+    async def fake_release(lock):
+        releases.append(lock)
 
     monkeypatch.setattr(
         job, "_try_acquire_scheduler_lock", fake_try_acquire,
@@ -500,7 +500,7 @@ async def test_re_audit_merchant_releases_lock_when_body_raises(monkeypatch):
             "cadence_days": 7,
             "last_audit_run_id": "run-old",
         })
-    assert releases == ["merch_alpha"], (
+    assert releases == ["held-lock"], (
         "Lock release must fire even when the locked body raises"
     )
 

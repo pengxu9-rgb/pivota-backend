@@ -11,7 +11,7 @@
 | Surface | State |
 |---|---|
 | Production (`api.pivota.cc`) | Commit `770b6ed` (latest main), `db_ok=true`, 13 scheduler jobs registered (T6 active, T5 reaper active, T9 reaper active, T7/T8 paused) |
-| Staging (`web-staging-staging-5257.up.railway.app`) | Redeployed 2026-05-23 to `770b6ed`. Stripe Test keys (`sk_test_*`). `STRIPE_BILLING_WEBHOOK_SECRET` provisioned via `we_1Ta1gd...` Test endpoint. Single Postgres shared with prod per `project_pivota_infra_single_db` |
+| Staging (`web-staging-staging-5257.up.railway.app`) | Redeployed 2026-05-23 to `770b6ed`. Stripe Test keys (`sk_test_*`). `STRIPE_BILLING_WEBHOOK_SECRET` provisioned via `we_1Ta1gd...` Test endpoint. Single Postgres shared with prod per `project_pivota_infra_single_db` (Railway era; on GCP staging has its own instance — `infra/gcp/README.md`) |
 | Stripe Test mode | 3 Test Prices exist (starter/growth/scale), webhook endpoint subscribes to 6 events (checkout.session.completed, customer.subscription.{updated,deleted,created}, invoice.{paid,payment_failed}) |
 | Stripe Live mode | 3 Live Prices rotated 2026-05-22; webhook endpoint TBD (Live billing webhook secret + endpoint not yet provisioned — Stage 3 prerequisite) |
 

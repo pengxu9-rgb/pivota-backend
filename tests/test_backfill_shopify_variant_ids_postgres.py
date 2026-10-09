@@ -101,15 +101,17 @@ async def _insert(
     domain: str = "brand.com",
     status: str = "active",
     canonical: Optional[str] = None,
+    market: str = "US",
 ) -> None:
     # CAST via ::jsonb from text so a deliberately malformed shape can be stored.
     await db.execute(
         """
         INSERT INTO external_product_seeds
-            (id, destination_url, canonical_url, domain, seed_data, status)
-        VALUES (:id, :url, :canonical, :domain, CAST(:seed_data AS jsonb), :status)
+            (id, destination_url, canonical_url, domain, seed_data, status, market)
+        VALUES (:id, :url, :canonical, :domain, CAST(:seed_data AS jsonb), :status, :market)
         """,
         {
+            "market": market,
             "id": seed_id,
             "url": url,
             "canonical": canonical,
@@ -257,6 +259,7 @@ async def _stamp(db, seed_id: str, variants: List[Dict[str, Any]], updated_at: A
             "platform": STOREFRONT_PLATFORM,
             "platform_source": STOREFRONT_PLATFORM_SOURCE,
             "cart_proof": json.dumps(cart_proof),
+            "variant_proofs": json.dumps({}),
             "updated_at": updated_at,
         },
     )
@@ -433,7 +436,11 @@ async def test_run_end_to_end_against_postgres_with_a_faked_storefront(_db) -> N
 
     summary = await run(limit=10, domain=None, apply=True, client=_Client())
 
-    assert _Client.calls == ["https://brand.com/products/serum.js"]
+    # The fake sends no currency cookie, so the run asks the product's .json for its price (and
+    # gets the same .js body back, which is not a product JSON: no price is written).
+    assert _Client.calls == ["https://brand.com/products/serum.js?country=US",
+                             "https://brand.com/products/serum.json?country=US"]
+    assert summary["proof_currency"] == {"json_malformed": 1}
     assert summary["rows_with_new_ids"] == 1
     assert summary["variant_ids_stamped"] == 1
     assert summary["write_conflicts"] == 0
@@ -729,3 +736,384 @@ async def test_an_aborted_run_reports_no_resume_point(_db) -> None:
 
     assert summary["aborted_on_block"] is True
     assert summary["next_cursor"] is None, "an aborted run must not advance the cursor"
+
+
+# ---------------------------------------------------------------------------- named-variant proof
+#
+# Option 1 (2026-09-29): a multi-variant product whose seed NAMES one variant gets a
+# `scope: named_variant` proof from the same fetch. Driven with the REAL shapes: the live
+# judydoll products.js (8 shades) and the live seed row (tests/fixtures/judydoll_*).
+
+from pathlib import Path  # noqa: E402
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+_JUDY_JS = json.loads((_FIXTURES / "judydoll_silky_matte_lip_ink_products_js_2026_09_29.json").read_text())
+_JUDY_ROW = json.loads((_FIXTURES / "judydoll_silky_matte_lip_ink_seed_2026_09_29.json").read_text())
+_JUDY_VARIANT = "49819267301653"
+
+
+_JUDY_JSON = json.loads((_FIXTURES / "judydoll_silky_matte_lip_ink_product_json_2026_10_08.json").read_text())
+
+
+def _judy_client(payload: Dict[str, Any], *, set_cookies=("cart_currency=USD; path=/; SameSite=Lax",),
+                 json_payload: Optional[Dict[str, Any]] = _JUDY_JSON):
+    """The storefront: `.js` with `set_cookies` on its response; `/products/<handle>.json` (the
+    cookieless-store price fallback) with `json_payload`, or a 404 when None. judydoll itself
+    really sends NO cart_currency cookie (measured 2026-10-08); USD is the default here so the
+    cases above exercise the cookie path."""
+    import httpx
+
+    class _Resp:
+        def __init__(self, body: Any, headers: List[Any], status_code: int = 200) -> None:
+            self._body, self.headers, self.status_code = body, httpx.Headers(headers), status_code
+
+        def json(self) -> Any:
+            return self._body
+
+    class _Client:
+        calls: List[str] = []
+
+        async def get(self, url, **kwargs):
+            _Client.calls.append(url)
+            if url.split("?", 1)[0].endswith(".json"):
+                if json_payload is None:
+                    return _Resp(None, [("content-type", "text/html")], status_code=404)
+                return _Resp(json_payload, [("content-type", "application/json; charset=utf-8")])
+            # what judydoll really sends, plus the presentment-currency cookie(s) of this response
+            return _Resp(payload, [("content-type", "text/javascript; charset=utf-8")]
+                         + [("set-cookie", value) for value in set_cookies])
+
+    return _Client()
+
+
+async def _insert_judy(db, seed_data: Optional[Dict[str, Any]] = None, *, canonical: Optional[str] = None,
+                       market: str = "US") -> None:
+    await _insert(db, _JUDY_ROW["id"], seed_data if seed_data is not None else _JUDY_ROW["seed_data"],
+                  url=_JUDY_ROW["destination_url"], domain=_JUDY_ROW["domain"],
+                  canonical=canonical if canonical is not None else _JUDY_ROW["canonical_url"], market=market)
+
+
+def _judy_js(**overrides: Dict[str, Any]) -> Dict[str, Any]:
+    payload = json.loads(json.dumps(_JUDY_JS))
+    for variant in payload["variants"]:
+        variant.update(overrides.get(str(variant["id"]), {}))
+    return payload
+
+
+@pytest.mark.parametrize("canonical", [None, "prod"], ids=["staging_canonical", "prod_canonical"])
+async def test_the_live_judydoll_seed_gets_a_named_variant_proof_end_to_end(_db, canonical) -> None:
+    from scripts.backfill_shopify_variant_ids import run
+    from services.shopify_variant_identity import verified_cart_variant_id
+
+    await _insert_judy(_db, canonical=_JUDY_ROW["destination_url"] if canonical else None)
+    client = _judy_client(_JUDY_JS)
+    summary = await run(limit=10, domain="judydoll.com", apply=True, client=client)
+
+    assert client.calls == ["https://judydoll.com/products/silky-matte-lip-ink.js?country=US"]
+    assert summary["cart_proofs"] == {"named_variant": 1}
+    assert summary["write_conflicts"] == 0 and summary["match_reasons"] == {"label_match": 1}
+    after = await _seed_data(_db, _JUDY_ROW["id"])
+    proof = after["snapshot"]["shopify_cart_proof"]
+    assert after["snapshot"]["variants"][0]["shopify_variant_id"] == _JUDY_VARIANT
+    assert {k: proof[k] for k in ("source", "scope", "variant_id", "available", "live_variant_count",
+                                  "price_minor", "currency", "product_js_url")} == {
+        "source": "products_js_v1", "scope": "named_variant", "variant_id": _JUDY_VARIANT,
+        "available": True, "live_variant_count": 8, "price_minor": 1399, "currency": "USD",
+        "product_js_url": "https://judydoll.com/products/silky-matte-lip-ink.js"}
+    assert summary["proof_currency"] == {"cookie:USD": 1}
+    # what was WRITTEN is what the Reap route accepts
+    row = await _db.fetch_one("SELECT canonical_url, destination_url FROM external_product_seeds WHERE id = :id",
+                              {"id": _JUDY_ROW["id"]})
+    proven = verified_cart_variant_id(
+        after, product_urls=[row["canonical_url"] or row["destination_url"]],
+        shop_domain="judydoll.com", catalog_variant_id=_JUDY_VARIANT)
+    assert proven == (_JUDY_VARIANT, "named_variant", "07 BURGUNDY INK")
+
+
+@pytest.mark.parametrize("change", ["unavailable", "delisted"])
+async def test_a_named_proof_is_revoked_when_its_variant_goes_away(_db, change) -> None:
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert_judy(_db)
+    await run(limit=10, domain="judydoll.com", apply=True, client=_judy_client(_JUDY_JS))
+    assert (await _seed_data(_db, _JUDY_ROW["id"]))["snapshot"]["shopify_cart_proof"]["scope"] == "named_variant"
+
+    payload = _judy_js(**{_JUDY_VARIANT: {"available": False}})
+    if change == "delisted":
+        payload["variants"] = [v for v in _JUDY_JS["variants"] if str(v["id"]) != _JUDY_VARIANT]
+    # the row with a proof is RE-SELECTED (a named seed must stay in the backfill's cohort)
+    assert [r["id"] for r in await _select(domain="judydoll.com")] == [_JUDY_ROW["id"]]
+    summary = await run(limit=10, domain="judydoll.com", apply=True, client=_judy_client(payload))
+    assert summary["cart_proofs"] == {}
+    assert (await _seed_data(_db, _JUDY_ROW["id"]))["snapshot"]["shopify_cart_proof"] is None
+
+
+async def test_a_valid_sole_proof_is_never_downgraded_to_a_named_one(_db) -> None:
+    """A one-variant storefront keeps writing the UNSCOPED proof even when the seed's URL also
+    names that variant -- the sole proof is tried first, from the same fetch."""
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert_judy(_db, canonical=_JUDY_ROW["destination_url"])
+    sole = {"variants": [v for v in _JUDY_JS["variants"] if str(v["id"]) == _JUDY_VARIANT]}
+    for _ in range(2):  # first write, then the re-check of a row that already holds a sole proof
+        summary = await run(limit=10, domain="judydoll.com", apply=True, client=_judy_client(sole))
+        assert summary["cart_proofs"] == {"sole_variant": 1}
+        proof = (await _seed_data(_db, _JUDY_ROW["id"]))["snapshot"]["shopify_cart_proof"]
+        assert "scope" not in proof and proof["live_variant_count"] == 1
+        assert proof["variant_id"] == _JUDY_VARIANT
+
+
+async def test_named_variant_seeds_are_selected_in_every_state(_db) -> None:
+    """Selection stays in step: unstamped (never fetched), stamped single entry without a proof
+    key (prod's 1,933 rows stamped before proofs existed), a named proof, and a revoked (null)
+    proof are ALL candidates. A 2+ entry snapshot names nothing -- it is selected only while it
+    has unstamped entries, exactly as before."""
+    entry = _JUDY_ROW["seed_data"]["snapshot"]["variants"][0]
+    stamped = dict(entry, shopify_variant_id=_JUDY_VARIANT)
+    named_proof = {"source": "products_js_v1", "scope": "named_variant", "variant_id": _JUDY_VARIANT}
+    await _insert(_db, "a_unstamped", _snapshot(entry))
+    await _insert(_db, "b_stamped_no_proof", _snapshot(stamped))
+    await _insert(_db, "c_named_proof", _snapshot(stamped, shopify_cart_proof=named_proof))
+    await _insert(_db, "d_revoked", _snapshot(stamped, shopify_cart_proof=None))
+    await _insert(_db, "e_two_stamped", _snapshot(stamped, dict(stamped, shopify_variant_id="1")))
+
+    assert [r["id"] for r in await _select()] == [
+        "a_unstamped", "b_stamped_no_proof", "c_named_proof", "d_revoked", "e_two_stamped"]
+
+
+async def test_a_dry_run_reports_the_named_proof_without_writing_it(_db) -> None:
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert_judy(_db)
+    summary = await run(limit=10, domain="judydoll.com", apply=False, client=_judy_client(_JUDY_JS))
+    assert summary["mode"] == "dry_run" and summary["cart_proofs"] == {"named_variant": 1}
+    assert "shopify_cart_proof" not in (await _seed_data(_db, _JUDY_ROW["id"]))["snapshot"]
+
+
+async def test_seed_id_targets_exactly_the_named_seeds_under_the_same_eligibility(_db) -> None:
+    """F3 (#2459 review): `--seed-id` restricts selection to those ids and to nothing else -- it
+    never widens past the eligibility rules, and it composes with --domain / --after / --limit."""
+    from scripts.backfill_shopify_variant_ids import run
+
+    entry = _JUDY_ROW["seed_data"]["snapshot"]["variants"][0]
+    await _insert(_db, "epsv_0first", _snapshot(entry), url=_JUDY_ROW["canonical_url"], domain="judydoll.com")
+    await _insert_judy(_db)
+    await _insert(_db, "epsv_zlast", _snapshot(entry), url=_JUDY_ROW["canonical_url"], domain="judydoll.com")
+    await _insert(_db, "epsv_inactive", _snapshot(entry), url=_JUDY_ROW["canonical_url"],
+                  domain="judydoll.com", status="inactive")
+    await _insert(_db, "epsv_other_shop", _snapshot(entry), url="https://brand.com/products/x",
+                  domain="brand.com")
+    target = _JUDY_ROW["id"]
+
+    assert [r["id"] for r in await _select(domain="judydoll.com", limit=1)] == ["epsv_0first"], \
+        "without targeting, ORDER BY id LIMIT 1 walks the wrong seed"
+    from scripts.backfill_shopify_variant_ids import select_candidates
+    pick = lambda **kw: select_candidates(**{"limit": 50, "domain": None, **kw})  # noqa: E731
+    assert [r["id"] for r in await pick(seed_ids=[target], limit=1)] == [target]
+    assert [r["id"] for r in await pick(seed_ids=[target, "epsv_zlast", target])] == [target, "epsv_zlast"]
+    assert [r["id"] for r in await pick(seed_ids=["epsv_inactive"])] == [], "eligibility still applies"
+    assert [r["id"] for r in await pick(seed_ids=[target], domain="brand.com")] == []
+    assert [r["id"] for r in await pick(seed_ids=["epsv_other_shop", target], domain="judydoll.com")] == [target]
+    assert [r["id"] for r in await pick(seed_ids=[target], after=target)] == []
+    assert [r["id"] for r in await pick(seed_ids=["x' OR '1'='1"])] == [], "bound, never interpolated"
+
+    client = _judy_client(_JUDY_JS)
+    summary = await run(limit=1, domain="judydoll.com", apply=False, client=client, seed_ids=[target])
+    assert client.calls == ["https://judydoll.com/products/silky-matte-lip-ink.js?country=US"]
+    assert summary["candidates"] == 1 and summary["next_cursor"] == target
+    assert summary["cart_proofs"] == {"named_variant": 1}
+
+
+def test_seed_id_is_a_repeatable_cli_flag(monkeypatch) -> None:
+    import scripts.backfill_shopify_variant_ids as backfill
+
+    seen: Dict[str, Any] = {}
+
+    async def fake_run(**kwargs):
+        seen.update(kwargs)
+        return {"aborted_on_block": False}
+
+    class _Db:
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(backfill, "run", fake_run)
+    monkeypatch.setattr(backfill, "database", _Db())
+    monkeypatch.setattr("sys.argv", ["backfill", "--seed-id", "epsv_a", "--seed-id", "epsv_b",
+                                     "--domain", "judydoll.com", "--limit", "2"])
+    assert backfill.main() == 0
+    assert seen["seed_ids"] == ["epsv_a", "epsv_b"] and seen["domain"] == "judydoll.com"
+    monkeypatch.setattr("sys.argv", ["backfill"])
+    backfill.main()
+    assert seen["seed_ids"] is None
+
+
+async def test_fully_stamped_multivariant_row_needs_selector_proof_refresh(_db):
+    await _insert(_db, "selectable", _snapshot({"shopify_variant_id":"11"},{"shopify_variant_id":"22"}))
+    assert [r["id"] for r in await _select()] == ["selectable"]
+
+
+# ---------------------------------------------------------------------------- proof currency (PR 3)
+#
+# A mirror proof CORROBORATES a changed Reap price only when it records the currency its price
+# was read in (services/reap_price_corroboration.py, THE CURRENCY DECISION). The writer reads it
+# by THE CURRENCY RULE (services/shopify_presentment.py): `?country=<market>` on the request, the
+# `cart_currency` Set-Cookie of the same response, and only the market's own currency counts.
+# Every case runs the REAL writer into Postgres and the REAL reader over what it wrote.
+
+
+def _mirror_price(seed_data: Dict[str, Any], *, currency: str = "USD") -> Optional[int]:
+    from datetime import datetime, timedelta, timezone
+
+    from services import reap_price_corroboration as corroboration
+
+    return corroboration.mirror_unit_price(
+        seed_data, variant_id=_JUDY_VARIANT, product_urls=[_JUDY_ROW["canonical_url"]],
+        shop_domain="judydoll.com", currency=currency, now=datetime.now(timezone.utc),
+        max_age=timedelta(hours=72))
+
+
+async def test_the_written_proof_corroborates_the_live_price(_db) -> None:
+    """The writer's own proof, read back from Postgres, is what the purchase lane accepts: 1399
+    in USD for the US market. Not a hand-added currency key."""
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert_judy(_db)
+    summary = await run(limit=10, domain="judydoll.com", apply=True, client=_judy_client(_JUDY_JS))
+    assert summary["proof_currency"] == {"cookie:USD": 1}
+    after = await _seed_data(_db, _JUDY_ROW["id"])
+    assert _mirror_price(after) == 1399
+    assert _mirror_price(after, currency="SGD") is None
+
+
+@pytest.mark.parametrize("set_cookies, problem", [
+    (("cart_currency=USD", "cart_currency=GBP"), "cookie_conflict"),
+    (("cart_currency=usd",), "cookie_malformed"),
+    (("cart_currency=SGD",), "currency_not_market"),
+], ids=["conflict", "malformed", "not_market"])
+async def test_an_unverified_currency_writes_no_price(_db, set_cookies, problem) -> None:
+    """A cookie that is present but not the market's one verified currency -> the proof is still
+    written (the cart identity does not depend on price) but carries NO price and NO currency, so
+    it never corroborates. No .json fallback: the store did name a currency, just not this one."""
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert_judy(_db)
+    client = _judy_client(_JUDY_JS, set_cookies=set_cookies)
+    summary = await run(limit=10, domain="judydoll.com", apply=True, client=client)
+    assert summary["cart_proofs"] == {"named_variant": 1}
+    assert summary["proof_currency"] == {problem: 1} and summary["json_price_fetches"] == {}
+    assert len(client.calls) == 1
+    after = await _seed_data(_db, _JUDY_ROW["id"])
+    proof = after["snapshot"]["shopify_cart_proof"]
+    assert (proof["price_minor"], proof["currency"], proof["available"]) == (None, None, True)
+    assert _mirror_price(after) is None
+
+
+@pytest.mark.parametrize("set_cookies", [(), ("localization=US; path=/",)], ids=["no_cookie", "other_cookie_only"])
+async def test_a_cookieless_store_is_priced_from_its_product_json(_db, set_cookies) -> None:
+    """judydoll's real answer: no cart_currency cookie. ONE extra request to the product's .json
+    (same market) names each variant's price_currency in the same response -> the proof carries
+    1399 USD from `products_json_v1`, and it corroborates."""
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert_judy(_db)
+    client = _judy_client(_JUDY_JS, set_cookies=set_cookies)
+    summary = await run(limit=10, domain="judydoll.com", apply=True, client=client)
+    assert client.calls == ["https://judydoll.com/products/silky-matte-lip-ink.js?country=US",
+                            "https://judydoll.com/products/silky-matte-lip-ink.json?country=US"]
+    assert summary["proof_currency"] == {"json:USD": 1} and summary["json_price_fetches"] == {"ok": 1}
+    after = await _seed_data(_db, _JUDY_ROW["id"])
+    proof = after["snapshot"]["shopify_cart_proof"]
+    assert (proof["price_minor"], proof["currency"], proof["price_source"]) == (1399, "USD", "products_json_v1")
+    assert proof["product_js_url"] == "https://judydoll.com/products/silky-matte-lip-ink.js"
+    assert _mirror_price(after) == 1399
+
+
+def _json_with(**over: Any) -> Dict[str, Any]:
+    body = json.loads(json.dumps(_JUDY_JSON))
+    variant = over.pop("variant", None)
+    body["product"].update(over)
+    if variant:
+        for entry in body["product"]["variants"]:
+            if str(entry["id"]) == _JUDY_VARIANT:
+                entry.update(variant)
+    return body
+
+
+@pytest.mark.parametrize("json_payload, evidence", [
+    (None, "json_dead_handle"),
+    (_json_with(id=1), "json_other_product"),
+    (_json_with(handle="another-product"), "json_other_product"),
+    ({"products": []}, "json_malformed"),
+    (_json_with(variant={"price_currency": "SGD"}), "json_variant_unpriced"),  # others priced, not this one
+], ids=["404", "other_id", "other_handle", "not_a_product", "variant_in_another_currency"])
+async def test_the_json_fallback_prices_only_the_same_product_in_the_markets_currency(_db, json_payload, evidence) -> None:
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert_judy(_db)
+    summary = await run(limit=10, domain="judydoll.com", apply=True,
+                        client=_judy_client(_JUDY_JS, set_cookies=(), json_payload=json_payload))
+    assert summary["proof_currency"] == {evidence: 1}
+    after = await _seed_data(_db, _JUDY_ROW["id"])
+    proof = after["snapshot"]["shopify_cart_proof"]
+    assert (proof["price_minor"], proof["currency"], proof["price_source"]) == (None, None, None)
+    assert _mirror_price(after) is None
+
+
+async def test_no_fallback_request_when_no_proof_could_corroborate(_db) -> None:
+    """A sold-out named variant writes no proof, so the cookieless store is not asked again."""
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert_judy(_db)
+    client = _judy_client(_judy_js(**{_JUDY_VARIANT: {"available": False}}), set_cookies=())
+    summary = await run(limit=10, domain="judydoll.com", apply=True, client=client)
+    assert len(client.calls) == 1 and summary["json_price_fetches"] == {}
+
+
+async def test_the_request_asks_the_seeds_own_market(_db) -> None:
+    """An SG seed asks `?country=SG`, and an SGD answer is that market's currency."""
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert_judy(_db, market="sg")
+    client = _judy_client(_JUDY_JS, set_cookies=("cart_currency=SGD; path=/",))
+    summary = await run(limit=10, domain="judydoll.com", apply=True, client=client)
+    assert client.calls == ["https://judydoll.com/products/silky-matte-lip-ink.js?country=SG"]
+    assert summary["proof_currency"] == {"cookie:SGD": 1}
+    after = await _seed_data(_db, _JUDY_ROW["id"])
+    assert after["snapshot"]["shopify_cart_proof"]["product_js_url"] == \
+        "https://judydoll.com/products/silky-matte-lip-ink.js"  # the fetch rule's URL, no query
+    assert _mirror_price(after, currency="SGD") == 1399 and _mirror_price(after) is None
+
+
+async def test_a_market_the_lane_does_not_price_asks_no_country_and_writes_no_price(_db) -> None:
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert_judy(_db, market="DE")
+    client = _judy_client(_JUDY_JS, set_cookies=("cart_currency=EUR",))
+    summary = await run(limit=10, domain="judydoll.com", apply=True, client=client)
+    assert client.calls == ["https://judydoll.com/products/silky-matte-lip-ink.js"]
+    assert summary["proof_currency"] == {"market_unknown": 1}
+    proof = (await _seed_data(_db, _JUDY_ROW["id"]))["snapshot"]["shopify_cart_proof"]
+    assert (proof["price_minor"], proof["currency"]) == (None, None)
+
+
+async def test_a_currency_verified_refresh_replaces_an_old_uncurrencied_price(_db) -> None:
+    """A proof from before this change (x100 `price_minor`, no currency) is overwritten whole by
+    the next fetch: the write replaces the proof object, it never merges into it."""
+    from scripts.backfill_shopify_variant_ids import run
+
+    await _insert_judy(_db)
+    await run(limit=10, domain="judydoll.com", apply=True,
+              client=_judy_client(_JUDY_JS, set_cookies=(), json_payload=None))
+    await _db.execute(
+        "UPDATE external_product_seeds SET seed_data = jsonb_set(seed_data, "
+        "'{snapshot,shopify_cart_proof,price_minor}', '1399'::jsonb) WHERE id = :id", {"id": _JUDY_ROW["id"]})
+    assert _mirror_price(await _seed_data(_db, _JUDY_ROW["id"])) is None  # no currency, no trust
+    await run(limit=10, domain="judydoll.com", apply=True, client=_judy_client(_judy_js(**{_JUDY_VARIANT: {"price": 1299}})))
+    after = await _seed_data(_db, _JUDY_ROW["id"])
+    assert (after["snapshot"]["shopify_cart_proof"]["price_minor"],
+            after["snapshot"]["shopify_cart_proof"]["currency"]) == (1299, "USD")
+    assert _mirror_price(after) == 1299

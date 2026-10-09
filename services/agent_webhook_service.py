@@ -18,6 +18,7 @@ from config.settings import resolve_public_api_base_url
 from db.database import database
 from db.schema_guard import guarded_statements, is_lock_timeout
 from db.startup_ddl import execute_ddl
+from services import webhook_retry_delivery_gate
 
 
 logger = logging.getLogger(__name__)
@@ -1262,6 +1263,10 @@ async def process_due_retries(
     Nothing is lost by stopping early: an undelivered retry stays `retrying` with its
     `next_retry_at` unchanged, so the next instance picks it up on its next poll.
     """
+    if not webhook_retry_delivery_gate.retry_delivery_enabled():
+        # Outside production (or with the kill switch off) nothing is selected and nothing is
+        # sent; due rows stay exactly as they are. See services/webhook_retry_delivery_gate.py.
+        return 0
     await ensure_agent_webhook_tables()
     rows = await database.fetch_all(
         """
@@ -1295,6 +1300,15 @@ async def process_due_retries(
 
 
 async def _retry_worker_loop(stop_event: asyncio.Event) -> None:
+    if not webhook_retry_delivery_gate.retry_delivery_enabled():
+        # WARNING, not INFO: prod drops module-logger INFO, and this line is the only sign on a
+        # staging process that its retries are deliberately parked rather than broken.
+        logger.warning(
+            "agent webhook retry worker NOT started: retry delivery is disabled on this process "
+            "(%s). Due retries stay due. Set %s=true to deliver them.",
+            webhook_retry_delivery_gate.describe(), webhook_retry_delivery_gate.ENV_VAR,
+        )
+        return
     while not stop_event.is_set():
         try:
             if getattr(database, "is_connected", False):
@@ -1310,6 +1324,10 @@ async def _retry_worker_loop(stop_event: asyncio.Event) -> None:
 async def start_agent_webhook_retry_worker() -> None:
     global _retry_worker_task, _retry_worker_stop
     if _retry_worker_task and not _retry_worker_task.done():
+        return
+    # SCHEDULER_JOB_ALLOWLIST: a no-op unless set; when set, this loop starts only if listed.
+    from services import scheduler_job_allowlist as job_allowlist
+    if not job_allowlist.process_loop_allowed(job_allowlist.AGENT_WEBHOOK_RETRY_WORKER):
         return
     _retry_worker_stop = asyncio.Event()
     # Fresh context => own `databases` Connection (issue #1754: startup-spawned

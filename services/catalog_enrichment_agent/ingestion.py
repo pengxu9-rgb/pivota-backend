@@ -18,7 +18,8 @@ This revision writes the full chain at ingestion time so agent PDPs are
 shaped identically to merchant-sync PDPs.
 
 Idempotency contract:
-- An official PDP keeps its historical (brand_normalized, canonical_product_name) key.
+- An official PDP keeps its historical (brand_normalized, canonical_product_name) key, except that a
+  name whose slug dropped non-Latin text hashes its full-script identity (derive_product_key).
 - An explicit retailer PDP is keyed by its storefront listing URL; content identity is separate.
 - An SKU is identified by (product_key + '::canonical') — one per PDP.
 - An offer is identified by a deterministic id derived from
@@ -38,6 +39,7 @@ import hashlib
 import json
 import logging
 import re
+import unicodedata
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from services.beauty_external_ranking import (
@@ -65,6 +67,7 @@ from services.strong_identifier import (
 )
 from services.text_normalization.brand_case import proper_case_brand
 from services.variant_identity import MERCHANT_ISSUED, PRODUCT_DERIVED, variant_id_provenance
+from utils.crawled_price import decimal_hint_from_currency, parse_crawled_price
 
 
 def variant_own_price(variant: Dict[str, Any]) -> Optional[float]:
@@ -81,16 +84,21 @@ def variant_own_price(variant: Dict[str, Any]) -> Optional[float]:
     is never projected as an offer, because the serving price gate and recall
     both read catalog_offers and a priceless row there is at best inert and at
     worst a 0.00 on a PDP.
+
+    A TEXT amount is read by utils.crawled_price, the crawl's own rule. This used to drop every
+    comma, so a stored "28,80" projected as 2880 and "1.234,56" as 1.23456. The variant's own
+    currency is the only signal here; an amount that needs more ("1,234" with no currency) is
+    refused rather than guessed.
     """
+    currency = variant.get("price_currency") or variant.get("currency")
     for key in ("price_amount", "price", "list_price"):
         raw = variant.get(key)
         if raw is None or raw == "":
             continue
-        try:
-            value = float(str(raw).replace(",", ""))
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
+        value = parse_crawled_price(
+            raw, currency=currency, decimal_hint=decimal_hint_from_currency(currency)
+        ).amount
+        if value is not None and value > 0:
             return value
     return None
 
@@ -154,9 +162,123 @@ def canonical_product_name(brand: Optional[str], product_name: Optional[str]) ->
     """Stable (brand_normalized, product_name_normalized) key. Two PDPs
     with identical brand + product name (modulo punctuation/case) collapse
     to the same key — by design, so the agent can re-run without
-    duplicating rows."""
-    norm = _normalize_token(f"{brand or ''} {product_name or ''}").replace(" ", "-")
+    duplicating rows.
+
+    NFC first: a decomposed "crème" (e + U+0300) would otherwise slug to "cre-me", not the "cr-me"
+    of the composed spelling (prod census 2026-09-29: 2 of 17,315 stored names are not NFC, and
+    NFC moves neither key)."""
+    text = unicodedata.normalize("NFC", f"{brand or ''} {product_name or ''}")
+    norm = _normalize_token(text).replace(" ", "-")
     return norm or "unknown"
+
+
+#: Dropped before anything else: invisible format characters (zero-width space/joiner, soft hyphen,
+#: bidi marks -- category Cf), variation selectors and the keycap mark, none of which the eye sees,
+#: so "자음\u200b생크림" and "자음생크림" are one product.
+_INVISIBLE_RANGES = ((0xFE00, 0xFE0F), (0xE0100, 0xE01EF), (0x20E3, 0x20E3))
+#: Spacing modifier letters (ʼ ʻ ʹ ˆ): apostrophe-like punctuation in Latin names ("Kiehlʼs",
+#: "Hawaiʻi"), read as a word break exactly as the ASCII slug reads "'".
+_MODIFIER_LETTERS = (0x02B0, 0x02FF)
+#: Letters Vietnamese spells words with: diacritics there are lexical everywhere ("mắt" eye / "mặt"
+#: face), unlike the occasional crème, and the ASCII slug reduces both to "m-t".
+_VIETNAMESE_LETTERS = frozenset("ơưđƠƯĐ") | frozenset(chr(c) for c in range(0x1EA0, 0x1EFA))
+
+
+def _is_invisible(ch: str) -> bool:
+    code = ord(ch)
+    return unicodedata.category(ch) == "Cf" or any(lo <= code <= hi for lo, hi in _INVISIBLE_RANGES)
+
+
+def _unit_or_nothing(symbol: str) -> str:
+    """A symbol drops out of the identity -- except a unit sign, which is its letters: "50㎖" is
+    "50ml", "㎎" is "mg". The trademark signs spell letters too ("™" -> "TM") and are dropped."""
+    if symbol in "™℠":
+        return ""
+    spelled = unicodedata.normalize("NFKC", symbol)
+    return spelled if any(ch.isalnum() for ch in spelled) else ""
+
+
+def product_identity_text(brand: Optional[str], product_name: Optional[str]) -> str:
+    """(brand, product name) in every script: symbols and invisible characters dropped (so "Glow™" is
+    "Glow"), NFKC (fullwidth ＭＶ is MV, Ⅱ is ii), casefolded, runs of letters/marks/digits joined by
+    "-". `canonical_product_name` is its ASCII shadow, which keeps nothing of "설화수 자음생크림".
+
+    The digest this feeds depends on the Unicode tables of the running Python
+    (unicodedata.unidata_version); an upgrade that re-categorises a code point in a stored name would
+    move that key."""
+    text = "".join(
+        " " if _MODIFIER_LETTERS[0] <= ord(ch) <= _MODIFIER_LETTERS[1] else _unit_or_nothing(ch)
+        if unicodedata.category(ch).startswith("S") else ch
+        for ch in f"{brand or ''} {product_name or ''}"
+        if not _is_invisible(ch)
+    )
+    text = unicodedata.normalize("NFKC", text).casefold()
+    words = "".join(ch if unicodedata.category(ch)[0] in "LMN" else " " for ch in text)
+    return "-".join(words.split())
+
+
+#: Hex digits of the full-identity digest. The ASCII prefix of an all-Hangul/CJK name is "unknown",
+#: so this digest alone tells such products apart: 8 hex (32 bits) would expect a birthday collision
+#: within ~77k of them, 16 hex needs ~5 billion.
+_IDENTITY_DIGEST_HEX = 16
+
+
+def _script_identity(brand: Optional[str], product_name: Optional[str]) -> Optional[Tuple[str, str]]:
+    """(ASCII prefix, 16-hex sha1 of `product_identity_text`) when the legacy slug cannot stand for
+    the product; None otherwise, and the legacy key applies unchanged.
+
+    The legacy digest hashes the slug, so it carried nothing the slug had lost: ("Sulwhasoo", "자음생크림")
+    and ("Sulwhasoo", "윤조에센스") were both ext:sulwhasoo::971a96b9, every all-CJK name was
+    ext:unknown::50d8b4a9, and ingest UPSERTs by key -- the second product landed its offers, SKUs,
+    URL and image on the first one's row (adversarial review 2026-09-29).
+
+    "Cannot stand for" = the name has a character `_names_the_product` counts, or its slug is empty
+    ("é è" would be ext:unknown:: too). Every existing key not at risk stays byte-identical. Measured on
+    prod 2026-09-29, 6,191 content-keyed enrichment rows: 580 carry non-ASCII; 497 only lose symbols
+    (™ ® –), 82 lose Latin diacritics or superscripts (crème, B², 360º), none has a Vietnamese letter,
+    Roman numeral, circled number, fraction or modifier letter, and 1 (a Cos de BAHA Japanese title,
+    draft) loses non-Latin text -- the only key this changes. The other Latin cases stay on the legacy
+    digest: they collide only when two names differ in nothing but accented letters, and moving 80
+    live keys to close that would duplicate every one of them on its next ingest.
+
+    The prefix is the ASCII slug of the identity text, not of the raw name, so width variants of one
+    product ("ＭＶマルチビタ" / "MVマルチビタ") share the whole key, not only the digest."""
+    # NFC so a decomposed Vietnamese "mặt" (a + U+0323 + U+0302) is the precomposed letter it spells --
+    # after dropping invisibles, which product_identity_text drops too and which would block composition.
+    text = unicodedata.normalize("NFC", "".join(
+        ch for ch in f"{brand or ''} {product_name or ''}" if not _is_invisible(ch)))
+    if not any(_names_the_product(ch) for ch in text) and _normalize_token(text):
+        return None
+    identity = product_identity_text(brand, product_name)
+    if not identity:
+        return None
+    prefix = _normalize_token(identity).replace(" ", "-") or "unknown"
+    return prefix, hashlib.sha1(identity.encode("utf-8")).hexdigest()[:_IDENTITY_DIGEST_HEX]
+
+
+def _names_the_product(ch: str) -> bool:
+    """A character the ASCII slug drops that tells products apart: a letter of a script other than
+    Latin (Hangul, Kana, CJK, Thai, Cyrillic, ... and fullwidth Ｇｌｏｗ), a Vietnamese letter, a
+    non-ASCII digit or numeral (５, Ⅱ, ①, ½). Superscript/subscript forms ("²", the "º" of "360º") and
+    modifier letters (ʼ) are Latin-class residue and stay on the legacy key."""
+    if ch.isascii() or _MODIFIER_LETTERS[0] <= ord(ch) <= _MODIFIER_LETTERS[1]:
+        return False
+    if ch in _VIETNAMESE_LETTERS:
+        return True
+    category = unicodedata.category(ch)
+    if category in ("Nd", "Nl"):
+        return True
+    superscript = unicodedata.decomposition(ch).startswith(("<super>", "<sub>"))
+    if category == "No":
+        return not superscript
+    if category not in ("Lu", "Ll", "Lt", "Lo"):   # Lm (ー, 々) rides with the script letters it modifies
+        return False
+    return not unicodedata.name(ch, "").startswith("LATIN ") and not superscript
+
+
+#: The legacy key of every name whose ASCII slug is empty or literally "unknown". Ingest refuses it
+#: (_build_pdp_payload); the gateway's Reap cart-link lane refuses it too (PIVOTA-Agent #2329/#2330).
+SHARED_UNKNOWN_PRODUCT_KEY = "ext:unknown::" + hashlib.sha1(b"unknown").hexdigest()[:8]
 
 
 #: catalog_products / catalog_skus.source_product_id is VARCHAR(128) (migration 058).
@@ -172,6 +294,12 @@ def bounded_source_product_id(brand: Optional[str], product_name: Optional[str])
     insert failed on the column, and one missing product marked the whole 362-product store job partial.
     No stored row changes: a longer id could never have been written."""
     canonical = canonical_product_name(brand, product_name)
+    script_identity = _script_identity(brand, product_name)
+    if script_identity:
+        # Two same-merchant products that differ only in non-Latin text share `canonical`; without the
+        # digest they would share (merchant_id, platform, source_product_id), a unique index.
+        prefix, digest = script_identity
+        return f"{prefix[:SOURCE_PRODUCT_ID_MAX - 1 - len(digest)]}-{digest}"
     if len(canonical) <= SOURCE_PRODUCT_ID_MAX:
         return canonical
     digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:8]
@@ -189,8 +317,14 @@ def derive_product_key(brand: Optional[str], product_name: Optional[str]) -> str
     """Stable product_key derived from (brand, product_name). Uses a
     deterministic hash to bound the length to the catalog_products
     VARCHAR(255) limit while preserving readability of the prefix.
-    Format: 'ext:<canonical>::<8-char-hash>'."""
+    Format: 'ext:<canonical>::<8-char-hash>', or 'ext:<canonical>::<16-char-hash>' when the ASCII
+    slug cannot stand for the product (see _script_identity) -- the only case where the slug is not
+    the product. Both are at most 214 chars."""
     canonical = canonical_product_name(brand, product_name)
+    script_identity = _script_identity(brand, product_name)
+    if script_identity:
+        prefix, digest = script_identity
+        return f"ext:{prefix[:208 - len(digest)]}::{digest}"
     digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:8]
     # Truncate canonical prefix to keep total length sensible.
     prefix = canonical[:200]
@@ -253,6 +387,27 @@ def listing_handle(canonical_url: Optional[str]) -> Optional[str]:
     if marker not in url:
         return None
     return url.split(marker, 1)[1].split("?", 1)[0].split("#", 1)[0].strip("/").casefold() or None
+
+
+def content_listing(canonical_url: Optional[str]) -> Optional[Tuple[str, str]]:
+    """(host, listing) of a storefront URL: the host without `www.`, and the listing's handle
+    (listing_handle), else its casefolded path. None when the URL names no host or no path.
+
+    The handle, not the path, so one listing stays one listing under a market subfolder
+    (/en-gb/products/x and /products/x), and percent-decoded, so one listing is one listing however a
+    lane spelled it (`makewaves%C2%AE-mascara` and `makewaves®-mascara`)."""
+    from urllib.parse import unquote, urlsplit
+
+    url = str(canonical_url or "").strip()
+    try:
+        host = (urlsplit(url).hostname or "").lower().removeprefix("www.")
+        path = urlsplit(url).path
+    except ValueError:
+        return None
+    listing = unquote(listing_handle(url) or path.strip("/").casefold()).casefold()
+    if not host or not listing:
+        return None
+    return host, listing
 
 
 def _normalize_url(url: Optional[str]) -> str:
@@ -387,6 +542,16 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         "variants": [v for v in (pdp.get("variants") or []) if isinstance(v, dict)],
     }
     if not payload["brand"] or not payload["product_name"]:
+        return {}
+    # A brand + name made only of symbols ("™" "—") identifies nothing.
+    if not product_identity_text(payload["brand"], payload["product_name"]):
+        return {}
+    # A content-keyed row whose brand + name slug to nothing or to literally "unknown" ("Unknown" "™")
+    # would land on the one key all such rows share. Retailer rows are keyed by their URL
+    # (_build_pdp_insert) and never use this key, so they are not refused for it: a refused record
+    # fails the whole store's primary apply (primary_ingestion: records_skipped).
+    if (pdp.get("source_role") != "retailer"
+            and derive_product_key(payload["brand"], payload["product_name"]) == SHARED_UNKNOWN_PRODUCT_KEY):
         return {}
     return payload
 
@@ -1592,6 +1757,8 @@ def ingest_validated_jsonl(
     *,
     source_jsonl: Optional[str] = None,
     market: Optional[str] = None,
+    current_listings: Optional[Dict[str, Tuple[str, str]]] = None,
+    allow_moves: Iterable[str] = (),
 ) -> Dict[str, Any]:
     """Drive ingest_validated_record across an iterable of records and
     return all five row collections plus skipped_count. Pure — no DB
@@ -1600,9 +1767,36 @@ def ingest_validated_jsonl(
     `market` (optional): the destination market the caller DECLARES for every offer (see
     `_build_offer_inserts`); a record priced in another currency fails the whole plan.
 
+    `current_listings` (optional): product_key -> the (host, listing) its catalog row names today
+    (apply.current_listings). A plan NEVER MOVES A ROW OFF THE LISTING IT NAMES: that listing keeps
+    the key whenever the crawl carries it, in or out of stock; when the crawl does not (unpublished, a
+    renamed handle, a page the crawl dropped), every record of that key on that host is left out and
+    named in `listing_moves` -- unless the key is in `allow_moves` (a reviewer accepted the move).
+    Measured by the review of #2463: one out-of-stock crawl elected another page, re-pointed the row
+    and re-activated that page's seed while the old offer stayed live and the new one suppressed.
+    Only a row with no listing yet on the host, or an accepted move, is elected
+    (scripts/repair_same_title_listings.py moves rows on purpose, under review).
+
     Returns a dict with keys: pdps, skus, merchants, offers, seeds,
-    skipped. Lists are de-duped by their natural primary key so re-runs
+    skipped, listing_collisions, listing_moves. Lists are de-duped by their natural primary key so re-runs
     across files don't stack duplicate row dicts.
+
+    ONE LISTING PER CONTENT KEY PER HOST. A content-keyed row (derive_product_key: brand + title,
+    merchant-agnostic) is the SAME row for every record with that title, so a second listing on
+    the same host with the same title used to land its offers and seeds under the first one's PDP:
+    first-wins kept the title, the upsert re-pointed canonical_url/image_url, and the offers of
+    both pages sat under one product. Measured 2026-09-29: 189 live rows carried offers from more
+    than one page of one host -- COCODOR titles every diffuser, refill and candle of a scent with
+    the scent alone ("Black Cherry": 16 pages, $6.99-$19.59), Mr. Smith's full size, mini and
+    sachet share a title, beautyofjoseon.com lists each set once per region at different prices.
+    One listing per (key, host) keeps the key -- elected by `elect_listing_keeper`, never by record
+    order -- and every record naming another listing on that host for the same key is left out WHOLE
+    (pdp, skus, offers, seeds) and named in `listing_collisions`, with the evidence a reviewer needs
+    to tell a duplicate page of one product (same price, same merchant type) from a different
+    product wearing its title. Not
+    counted in `skipped`: the plan is still ready, and the drain decides what holds
+    (services/retailer_ingest/detectors.listing_collision_flags). An `ext:retailer:` row is keyed
+    by its listing URL, so it never meets another listing under its key.
     """
     pdp_rows: List[Dict[str, Any]] = []
     sku_rows: List[Dict[str, Any]] = []
@@ -1613,6 +1807,8 @@ def ingest_validated_jsonl(
     audit_reasons: Dict[str, int] = {}
     skipped = 0
     skipped_reasons: Dict[str, int] = {}
+    planned: List[Tuple[Dict[str, Any], Optional[Tuple[str, str]], Optional[Dict[str, Any]]]] = []
+    listings: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
     for record in rows:
         result = ingest_validated_record(record, source_jsonl=source_jsonl, market=market)
         if result is None:
@@ -1622,6 +1818,43 @@ def ingest_validated_jsonl(
             skipped += 1
             reason = str(result["skipped_reason"]).split(":")[0]
             skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+            continue
+        listing = content_listing(result["pdp"].get("canonical_url"))
+        group = evidence = None
+        if listing is not None:
+            group = (str(result["pdp"].get("product_key") or ""), listing[0])
+            evidence = listings.setdefault(group, {}).setdefault(listing[1], _listing_evidence(record, listing[1]))
+        planned.append((result, group, evidence))
+
+    def _current(group: Tuple[str, str]) -> Optional[str]:
+        named = (current_listings or {}).get(group[0])
+        return named[1] if named and named[0] == group[1] else None
+
+    allowed = {str(k) for k in allow_moves or ()}
+    keepers: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
+    listing_moves: List[Dict[str, Any]] = []
+    for group, by_handle in listings.items():
+        current = _current(group)
+        if current is not None and current in by_handle:
+            keepers[group] = by_handle[current]
+        elif current is not None and group[0] not in allowed:
+            keepers[group] = None  # held: the row stays on the listing it names
+            would_keep = elect_listing_keeper(list(by_handle.values()), market=market)["handle"]
+            listing_moves.append({"product_key": group[0], "host": group[1], "current": current,
+                                  "crawled": sorted(by_handle), "would_keep": would_keep})
+        else:
+            keepers[group] = elect_listing_keeper(list(by_handle.values()), market=market)
+    listing_collisions: List[Dict[str, Any]] = []
+    for group, by_handle in listings.items():
+        kept = keepers[group]
+        if kept is None:
+            continue
+        for handle, evidence in by_handle.items():
+            if handle != kept["handle"]:
+                listing_collisions.append({"product_key": group[0], "host": group[1],
+                                           "kept": kept, "dropped": evidence})
+    for result, group, evidence in planned:
+        if group is not None and (keepers[group] is None or evidence["handle"] != keepers[group]["handle"]):
             continue
         pdp_rows.append(result["pdp"])
         sku_rows.append(result["sku"])
@@ -1664,4 +1897,98 @@ def ingest_validated_jsonl(
         "skipped": skipped,
         "skipped_reasons": skipped_reasons,
         "audit_reasons": audit_reasons,
+        "listing_collisions": listing_collisions,
+        "listing_moves": listing_moves,
     }
+
+
+def _listing_evidence(record: Dict[str, Any], handle: str) -> Dict[str, Any]:
+    """What a reviewer compares across two listings that share a content key -- the storefront's own
+    product type, every price the record carries (its variants', else its offers'), its first image --
+    and what elect_listing_keeper ranks on: whether any of it is in stock, and its lowest storefront
+    variant id (its age)."""
+    pdp = record.get("pdp") if isinstance(record.get("pdp"), dict) else {}
+    variants = [v for v in pdp.get("variants") or [] if isinstance(v, dict)]
+    offers = [o for o in record.get("offers") or [] if isinstance(o, dict)]
+    prices = set()
+    for source in (variants, offers):
+        for item in source:
+            try:
+                price = round(float(item.get("price")), 2)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                prices.add(price)
+        if prices:
+            break
+    stock = [item.get("in_stock") for item in variants + offers if isinstance(item.get("in_stock"), bool)]
+    variant_ids = [int(str(v.get("variant_id")).strip()) for v in variants
+                   if str(v.get("variant_id") or "").strip().isdigit()]
+    image = next((str(o.get("image_url") or "") for o in offers if o.get("image_url")), "")
+    product_type = str(pdp.get("category_source_product_type") or "").strip()
+    return {"handle": handle, "product_name": pdp.get("product_name"),
+            "product_type": product_type or None, "prices": sorted(prices),
+            "image": image.split("?", 1)[0].rsplit("/", 1)[-1].casefold() or None,
+            "available": any(stock) if stock else None,
+            "oldest_variant_id": min(variant_ids) if variant_ids else None}
+
+
+#: Handle suffixes a store uses to name a region's copy of a listing, by the job market they serve.
+#: Measured 2026-09-29: meritbeauty.com -ukeu/-uk/-eu/-ca, beautyofjoseon.com -us/-uk/-eu/-global,
+#: iliabeauty.com -ca/-uk/-gb. `-global` names no region: it is never "another region's copy".
+REGION_HANDLE_SUFFIXES = {
+    "US": ("us",), "CA": ("ca",), "AU": ("au",), "JP": ("jp",), "SG": ("sg",), "KR": ("kr",),
+    "GB": ("uk", "ukeu", "gb"), "EU": ("eu", "ukeu"),
+}
+_EU_MARKETS = frozenset({"AT", "BE", "DE", "DK", "ES", "FI", "FR", "IE", "IT", "NL", "PL", "PT", "SE"})
+
+
+def _region_suffixes(market: Optional[str]) -> Tuple[str, ...]:
+    code = str(market or "US").strip().upper()
+    return REGION_HANDLE_SUFFIXES.get("EU" if code in _EU_MARKETS else "GB" if code == "UK" else code, ())
+
+
+def _region_copy(handle: str, handles: List[str], suffixes: Iterable[str]) -> bool:
+    """`handle` is `<stem>-<suffix>` for one of `suffixes` AND another listing of the group shares that
+    stem (is it, or `<stem>-...`): a region copy, not a product whose name ends in "-us"."""
+    for suffix in suffixes:
+        if handle.endswith("-" + suffix):
+            stem = handle[:-len(suffix) - 1]
+            if any(o != handle and (o == stem or o.startswith(stem + "-")) for o in handles):
+                return True
+    return False
+
+
+def elect_listing_keeper(listings: List[Dict[str, Any]], *, market: Optional[str] = None,
+                         current: Optional[str] = None) -> Dict[str, Any]:
+    """Which of a host's same-title listings keeps the content key. `listings` are _listing_evidence
+    dicts (the repair builds the same shape from the catalog); `current` is the handle the row names today.
+
+    Never record order: Shopify's /products.json lists newest-published first, so first-wins kept
+    whatever the merchant published last -- measured 2026-09-29 on meritbeauty.com, 32 of 36
+    price-identical pairs kept a `-ukeu`/`-ca`/`-eu` copy that 404s for a US shopper over the US page,
+    and every new ad-landing clone would have moved the key's listing again. In order:
+      1. the region copy named for the market (`<stem>-us` for US; the CLI and Path C declare none: US);
+      2. available: in stock first, unknown next, out of stock last (a stale base never beats a live relist,
+         and the repair, which often knows nothing of an ad clone, never trades a selling page for it);
+      3. not another region's copy (`-ukeu` for a US job; `-global` is no region);
+      4. a base listing: not another listing's handle plus a suffix (`serum` over `serum-sachet`);
+      5. `current`, the listing the row names today: the repair's tie-break (the ingest never elects for
+         a row that names a listing on the host -- it keeps it, see ingest_validated_jsonl);
+      6. the oldest listing: lowest storefront variant id (issued in creation order); none ranks last;
+      7. the handle, so the choice is total.
+    ONE function for the ingest and scripts/repair_same_title_listings.py, so the two keep one page."""
+    own = _region_suffixes(market)
+    foreign = {s for suffixes in REGION_HANDLE_SUFFIXES.values() for s in suffixes} - set(own)
+    handles = [str(item["handle"]) for item in listings]
+
+    def rank(item: Dict[str, Any]) -> tuple:
+        handle = str(item["handle"])
+        derived = any(handle != other and handle.startswith(other + "-") for other in handles)
+        oldest = item.get("oldest_variant_id")
+        stock = {True: 0, None: 1, False: 2}.get(item.get("available"), 1)
+        return (not _region_copy(handle, handles, own), stock,
+                _region_copy(handle, handles, foreign), derived, handle != current,
+                oldest is None, oldest or 0, handle)
+
+    return min(listings, key=rank)

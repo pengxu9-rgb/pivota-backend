@@ -46,6 +46,7 @@ import db.merchant_purchasability as merchant_purchasability
 from services.offer_buyability import (
     OFFER_UNAVAILABLE_AVAILABILITIES,
     availability_is_known_unavailable,
+    expected_currency_for_market,
 )
 from services import market_telemetry
 from db.database import database
@@ -76,6 +77,7 @@ from services.pivot_query_service import (
     search_pivot_catalog,
 )
 from services.query_semantic_class import classify_query_semantic_class
+from services.canonical_search_query import prepare_canonical_search_query
 from services.similarity_service import (
     SimilarityService,
     SimilarityStrategy,
@@ -2977,6 +2979,11 @@ class MultiSearchFilters(BaseModel):
     category: Optional[str] = Field(None, description="Optional category filter")
     price_min: Optional[float] = Field(None, description="Minimum price filter")
     price_max: Optional[float] = Field(None, description="Maximum price filter")
+    currency: Optional[str] = Field(None, description="Currency for explicit canonical price bounds")
+    request_context: Dict[str, Any] = Field(default_factory=dict)
+    merchant_id: Optional[str] = Field(None, alias="merchantId")
+    merchant_ids: List[str] = Field(default_factory=list, alias="merchantIds", max_length=50)
+    search_all_merchants: Optional[bool] = Field(None, alias="searchAllMerchants")
     page: int = Field(1, ge=1, description="Page number (1-based)")
     # Front-ends may request above 200; we clamp internally to 200.
     limit: int = Field(20, ge=1, description="Page size (internally clamped to max 200)")
@@ -3111,6 +3118,14 @@ def _normalize_find_products_multi_payload(raw_payload: Dict[str, Any]) -> Dict[
             "category",
             "price_min",
             "price_max",
+            "currency",
+            "request_context",
+            "merchant_id",
+            "merchantId",
+            "merchant_ids",
+            "merchantIds",
+            "search_all_merchants",
+            "searchAllMerchants",
             "page",
             "limit",
             "in_stock_only",
@@ -7839,9 +7854,57 @@ async def _handle_find_products_multi_via_pivot(
     if not query:
         return None
 
+    # Resolved once, and the SAME value is both recorded and handed to recall, so the record is
+    # what recall received rather than a second derivation of it (services/market_telemetry.py).
+    pivot_market = _pivot_market_from_payload(payload, request_metadata)
+
+    # Canonical dispatch precedes the legacy budget parser. Keep retrieval
+    # nouns separate from enforceable money constraints on this actual path.
+    # The market's own currency prices an untyped "under 30", as the legacy
+    # parser did; a currency the caller or shopper wrote always wins.
+    canonical_query = prepare_canonical_search_query(
+        query,
+        price_min=filters.price_min,
+        price_max=filters.price_max,
+        currency=(filters.currency or filters.request_context.get("currency") or (request_metadata or {}).get("currency")),
+        market_currency=expected_currency_for_market(pivot_market),
+    ) if canonical_sig_mode else None
+    requested_seller_id = str(filters.merchant_id or "").strip()
+    requested_seller_ids = list(dict.fromkeys(str(value).strip() for value in filters.merchant_ids if str(value).strip()))
+    scope_error = "seller_scope_required" if (
+        canonical_sig_mode and filters.search_all_merchants is False
+        and not requested_seller_id and not requested_seller_ids
+    ) else None
+    if canonical_query:
+        query = canonical_query.retrieval_query
+        if canonical_query.error or not query or scope_error:
+            return {
+                "products": [], "total": 0, "page": filters.page or 1,
+                "page_size": 0, "reply": None,
+                "metadata": {
+                    "query_source": "pivot_catalog_sig_multi",
+                    "catalog_entity_mode": "canonical_sig",
+                    "canonical_identity_required": True,
+                    "direct_external_seed_lane": False,
+                    "fallback_triggered": False,
+                    "strict_empty_reason": canonical_query.error or scope_error or "missing_product_query",
+                    "canonical_query": canonical_query.metadata(),
+                },
+            }
+
     page = filters.page or 1
     limit = _clamp_search_limit(filters.limit, fallback=20)
     raw_limit = min(max(limit * page * PIVOT_MULTI_LIMIT_MULTIPLIER, limit), 100)
+    canonical_recall_metadata = {
+        "canonical_query": canonical_query.metadata(),
+        "unverified_constraints": canonical_query.unverified_constraints(),
+        "canonical_recall": {
+            "exhaustive": False,
+            "candidate_result_limit": raw_limit,
+            "budget_applied_before_candidate_limit": canonical_query.price_min is not None or canonical_query.price_max is not None,
+            "seller_scope_applied_before_candidate_limit": bool(requested_seller_id or requested_seller_ids),
+        },
+    } if canonical_query else {}
 
     # ADR-007 SLICE 3: resolve the commerce-intent signal here (same derivation as
     # _handle_find_products_multi / line ~6870) so the OFFER-FREE citable lane in
@@ -8031,9 +8094,6 @@ async def _handle_find_products_multi_via_pivot(
     # candidate set that never contained a single row of that brand.
     brand_anchor_terms, brand_anchor_source = await _resolve_brand_anchor_terms(query)
 
-    # Resolved once, and the SAME value is both recorded and handed to recall, so the record is
-    # what recall received rather than a second derivation of it (services/market_telemetry.py).
-    pivot_market = _pivot_market_from_payload(payload, request_metadata)
     market_telemetry.observe_resolved(request_metadata, pivot_market)
 
     pivot_result = await search_pivot_catalog(
@@ -8043,7 +8103,13 @@ async def _handle_find_products_multi_via_pivot(
             # decision that this query has no brand — into "no opinion, derive it yourself",
             # the exact opposite, and contradict the contract the field documents.
             brand_anchor_terms=brand_anchor_terms,
-            merchant_id=None,
+            merchant_id=(requested_seller_id or None) if canonical_sig_mode else None,
+            merchant_ids=(requested_seller_ids if canonical_sig_mode and not requested_seller_id else None),
+            price_min=canonical_query.price_min if canonical_query else None,
+            price_max=canonical_query.price_max if canonical_query else None,
+            price_currency=canonical_query.currency if canonical_query else None,
+            price_min_exclusive=canonical_query.min_exclusive if canonical_query else False,
+            price_max_exclusive=canonical_query.max_exclusive if canonical_query else False,
             market=pivot_market,
             limit=raw_limit,
             include_external=(
@@ -8186,13 +8252,15 @@ async def _handle_find_products_multi_via_pivot(
             if category in str(product.get("product_type") or "").lower()
         ]
 
-    if filters.price_min is not None:
+    if canonical_query:
+        products = [product for product in products if canonical_query.allows_price(product.get("price"), product.get("currency"))]
+    elif filters.price_min is not None:
         products = [
             product
             for product in products
             if product.get("price") is not None and float(product["price"]) >= float(filters.price_min)
         ]
-    if filters.price_max is not None:
+    if not canonical_query and filters.price_max is not None:
         products = [
             product
             for product in products
@@ -8225,6 +8293,7 @@ async def _handle_find_products_multi_via_pivot(
                 "canonical_identity_required": True,
                 "direct_external_seed_lane": False,
                 "fallback_triggered": False,
+                **canonical_recall_metadata,
             },
         }
 
@@ -8245,6 +8314,7 @@ async def _handle_find_products_multi_via_pivot(
             "catalog_entity_mode": "canonical_sig" if canonical_sig_mode else None,
             "canonical_identity_required": canonical_sig_mode,
             "direct_external_seed_lane": not canonical_sig_mode,
+            **canonical_recall_metadata,
             "query_semantic_class": query_semantic_class,
             "brand_category_anchor_terms": brand_anchor_terms,
             "brand_category_anchor_matched": brand_anchor_matched,

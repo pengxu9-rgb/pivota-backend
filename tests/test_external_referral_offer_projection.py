@@ -26,7 +26,7 @@ import services.external_referral_readiness as err
 # --------------------------------------------------------------------------- projection
 
 def _arm(monkeypatch, calls, *, sync_status="synced"):
-    async def fake_sync(seed_id):
+    async def fake_sync(seed_id, **kwargs):
         calls.append(f"offers:{seed_id}")
         return {"status": sync_status}
 
@@ -116,7 +116,7 @@ def test_the_projection_never_breaks_the_refresh_that_produced_a_good_price(monk
     A cache projection that raises must not turn a successful price read into a failed refresh —
     the same isolation `agent_pdp_view_assembler` documents for its own writes.
     """
-    async def boom_sync(seed_id):
+    async def boom_sync(seed_id, **kwargs):
         raise RuntimeError("offers table on fire")
 
     async def boom_pdp(*, seed_id, proposal_id, refresh_source):
@@ -131,7 +131,7 @@ def test_the_projection_never_breaks_the_refresh_that_produced_a_good_price(monk
 
 def test_an_empty_seed_id_projects_nothing(monkeypatch):
     called = []
-    async def fake_sync(seed_id):
+    async def fake_sync(seed_id, **kwargs):
         called.append(seed_id)
     monkeypatch.setattr("services.external_offer_dual_write.dual_write_enabled", lambda: True)
     monkeypatch.setattr("services.external_offer_dual_write.sync_offer_for_seed", fake_sync)
@@ -302,7 +302,8 @@ def test_a_reason_bucket_never_echoes_the_raw_error():
 
 # ------------------------------------------------- the CALL SITE, not just the helper
 
-def _drive_refresh(monkeypatch, *, stored_price, fresh_price, from_cache=False):
+def _drive_refresh(monkeypatch, *, stored_price, fresh_price, from_cache=False, evidence=None,
+                   calls=None):
     """Drive the REAL `_refresh_external_seed_by_id` and report which seeds it projected.
 
     The helper tests above pin the projection in isolation; nothing pinned that the refresh
@@ -315,8 +316,10 @@ def _drive_refresh(monkeypatch, *, stored_price, fresh_price, from_cache=False):
 
     projected: List[str] = []
 
-    async def fake_project(seed_id):
+    async def fake_project(seed_id, **kwargs):
         projected.append(seed_id)
+        if calls is not None:
+            calls.append(kwargs)
         return {"attempted": 1, "projected": 1, "skipped": 0, "errored": 0}
 
     async def fake_fetch_one(_q, values=None):
@@ -339,7 +342,7 @@ def _drive_refresh(monkeypatch, *, stored_price, fresh_price, from_cache=False):
         return SimpleNamespace(
             canonical_url="https://brand.com/products/toner", domain="brand.com",
             title="toner", image_url=None, price_amount=fresh_price,
-            price_currency="USD", availability="in_stock", evidence={},
+            price_currency="USD", availability="in_stock", evidence=dict(evidence or {}),
         )
 
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
@@ -443,7 +446,7 @@ def test_the_pdp_half_reports_its_own_outcome(monkeypatch):
     raising rebuild left `projected: 1` and no skip."""
     import asyncio as _asyncio
 
-    async def fake_sync(seed_id):
+    async def fake_sync(seed_id, **kwargs):
         return {"status": "synced"}
 
     async def skipped_pdp(**kw):
@@ -471,7 +474,7 @@ def test_projection_seconds_include_the_pdp_rebuild(monkeypatch):
     and reports a budget cost that is not there."""
     import asyncio as _asyncio
 
-    async def fake_sync(seed_id):
+    async def fake_sync(seed_id, **kwargs):
         return {"status": "synced"}
 
     async def slow_pdp(**kw):
@@ -511,3 +514,20 @@ def test_an_invalid_url_seed_is_stamped_before_it_is_refused(monkeypatch):
     assert excinfo.value.status_code == 400 and "INVALID_URL" in str(excinfo.value.detail)
     stamp.assert_awaited_once()
     assert stamp.await_args.args[0] == "eps_nourl"
+
+
+def test_the_refresh_vouches_for_its_price_and_says_whether_it_read_the_currency(monkeypatch):
+    """`resolve_external_offer` records whether it read the currency (`page`); snapshots written
+    before it stopped filling in the market's currency say `market_default`. The refresh must pass that through: the canonical-offer projection
+    refuses a price whose currency it did not read."""
+    calls: List[Dict[str, Any]] = []
+    _drive_refresh(monkeypatch, stored_price=28.0, fresh_price=31.0,
+                   evidence={"price_currency_source": "page"}, calls=calls)
+    _drive_refresh(monkeypatch, stored_price=28.0, fresh_price=31.0,
+                   evidence={"price_currency_source": "market_default"}, calls=calls)
+    _drive_refresh(monkeypatch, stored_price=28.0, fresh_price=31.0, evidence={}, calls=calls)
+    assert calls == [
+        {"price_source": "refresh", "currency_read": True},
+        {"price_source": "refresh", "currency_read": False},
+        {"price_source": "refresh", "currency_read": False},
+    ]

@@ -23,13 +23,17 @@ def _sqlite(seeds, products):
     conn = sqlite3.connect(":memory:")
     conn.execute(
         "CREATE TABLE external_product_seeds (id TEXT, status TEXT, attached_product_key TEXT,"
-        " domain TEXT, last_crawl_attempt_at TEXT, last_crawled_at TEXT, updated_at TEXT)"
+        " domain TEXT, market TEXT, price_currency TEXT,"
+        " last_crawl_attempt_at TEXT, last_crawled_at TEXT, updated_at TEXT)"
     )
     conn.execute("CREATE TABLE catalog_products (product_key TEXT, suppressed_at TEXT)")
-    conn.execute("CREATE TABLE merchant_stores (domain TEXT)")
-    conn.execute("INSERT INTO merchant_stores VALUES ('brand.com')")
+    conn.execute(
+        "CREATE TABLE catalog_source_quarantine (match_type TEXT, match_value TEXT, state TEXT,"
+        " expires_at TEXT)"
+    )
     conn.executemany(
-        "INSERT INTO external_product_seeds VALUES (?, 'active', ?, 'brand.com', ?, NULL, '2026-01-01')",
+        "INSERT INTO external_product_seeds VALUES"
+        " (?, 'active', ?, 'brand.com', 'US', 'USD', ?, NULL, '2026-01-01')",
         seeds,
     )
     conn.executemany("INSERT INTO catalog_products VALUES (?, ?)", products)
@@ -65,15 +69,16 @@ PRODUCTS = [("prod::withdrawn", "2026-07-18 00:00:00"), ("prod::live", None)]
 def test_a_seed_on_a_suppressed_product_is_not_queued(monkeypatch: pytest.MonkeyPatch) -> None:
     ids = _candidates(monkeypatch, SEEDS, PRODUCTS)
     assert "eps_suppressed" not in ids
-    # attached first (oldest attempt first), then the domain-matched unattached rows
-    assert ids == ["eps_live", "eps_dangling", "eps_unattached"]
+    # Oldest attempt first, attached or not: the never-attempted unattached seed leads.
+    assert ids == ["eps_unattached", "eps_live", "eps_dangling"]
 
 
 def test_a_lifted_suppression_returns_the_seed_to_the_head_of_the_queue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ids = _candidates(monkeypatch, SEEDS, [("prod::withdrawn", None), ("prod::live", None)])
-    assert ids[0] == "eps_suppressed"
+    # Both never-attempted rows lead; the tie breaks on updated_at, equal here, so either order.
+    assert set(ids[:2]) == {"eps_suppressed", "eps_unattached"}
 
 
 def test_suppressed_seeds_do_not_consume_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:

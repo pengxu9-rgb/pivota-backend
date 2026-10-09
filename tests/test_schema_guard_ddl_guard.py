@@ -163,6 +163,7 @@ async def test_nothing_the_boot_sends_is_a_bare_alter_table_or_create_index(_pos
     )
     # Positive control: the boot really sent the guarded forms (60 index guards and these six
     # heals when this was written). One added later raises the count; one dropped lowers it.
+    # catalog_offers: mig 246's price_checked_at trigger (2026-09-28).
     assert sum(s.startswith("DO $index$") for s in db.statements) >= 60
     guarded = [
         m.group(1)
@@ -171,6 +172,7 @@ async def test_nothing_the_boot_sends_is_a_bare_alter_table_or_create_index(_pos
         if m
     ]
     assert sorted(guarded) == [
+        "catalog_offers",
         "commerce_interactions",
         "merchant_audit_runs",
         "merchant_onboarding",

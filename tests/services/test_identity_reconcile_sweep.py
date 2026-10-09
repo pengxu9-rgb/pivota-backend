@@ -20,6 +20,13 @@ class TestAllowlist:
         # test surprises you, read the phase plan §4 before touching it.
         assert AUTO_APPROVE_STRATEGIES == ("same_url_dup", "junk_url")
 
+    def test_apply_guards_every_strategy_the_sweep_approves_unreviewed(self):
+        # The approve step holds a proposal whose loser is the served row; apply must hold the same
+        # set, or an approval that predates the guard (or a served row that moved since) slips through.
+        from services.identity_resolution import SERVED_ROW_GUARDED_STRATEGIES
+
+        assert set(AUTO_APPROVE_STRATEGIES) <= set(SERVED_ROW_GUARDED_STRATEGIES)
+
     def test_approve_sql_scopes_to_proposed_and_allowlist(self):
         assert "status = 'proposed'" in APPROVE_ALLOWLIST_SQL
         assert "strategy = ANY($1::text[])" in APPROVE_ALLOWLIST_SQL

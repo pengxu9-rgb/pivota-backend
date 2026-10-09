@@ -23,6 +23,7 @@ from db.agents import (
     update_agent_stats
 )
 from utils.logger import logger
+from utils.secret_fingerprint import secret_fingerprint
 from utils.transient_errors import db_busy_http_exception
 import os
 import base64
@@ -454,7 +455,7 @@ async def get_agent_context(
     except Exception:
         pass
     if not agent:
-        logger.warning(f"Invalid API key attempted: {api_key[:10]}...")
+        logger.warning(f"Invalid API key attempted: key={secret_fingerprint(api_key)}")
         raise HTTPException(
             status_code=401,
             detail="Invalid API Key"
@@ -559,7 +560,15 @@ def _checkout_token_secret() -> str:
     return (os.getenv("CHECKOUT_TOKEN_SECRET") or os.getenv("AGENT_CHECKOUT_TOKEN_SECRET") or "").strip()
 
 
-async def _get_agent_context_from_checkout_token(request: Request, token: str) -> AgentContext:
+def verify_checkout_token_claims(token: str) -> Dict[str, Any]:
+    """Signature, expiry and agent_id of a checkout token; returns its payload or raises.
+
+    The ONE verifier for tokens minted by routes.agent_checkout_intents.mint_checkout_token. The
+    agent-API auth dependency below and the internal introspect endpoint the gateway calls
+    (routes.agent_internal_auth) both go through it, so the two cannot drift on what "valid" means.
+    It does not look the agent up; callers do that, because they answer a missing or deactivated
+    agent differently (401/403 here, a verdict body there).
+    """
     raw = (token or "").strip()
     if not raw:
         raise HTTPException(status_code=401, detail="Missing checkout token")
@@ -586,17 +595,26 @@ async def _get_agent_context_from_checkout_token(request: Request, token: str) -
     try:
         payload_raw = _base64url_decode(payload_b64).decode("utf-8")
         payload = json.loads(payload_raw)
+        if not isinstance(payload, dict):
+            raise ValueError("payload is not an object")
+        exp = int(payload.get("exp") or 0)
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid checkout token payload")
 
     now = int(time.time())
-    exp = int(payload.get("exp") or 0)
     if exp and now > exp:
         raise HTTPException(status_code=401, detail="Checkout token expired")
 
     agent_id = str(payload.get("agent_id") or "").strip()
     if not agent_id:
         raise HTTPException(status_code=401, detail="Checkout token missing agent_id")
+
+    return payload
+
+
+async def _get_agent_context_from_checkout_token(request: Request, token: str) -> AgentContext:
+    payload = verify_checkout_token_claims(token)
+    agent_id = str(payload.get("agent_id") or "").strip()
 
     agent = await get_agent(agent_id)
     if not agent:

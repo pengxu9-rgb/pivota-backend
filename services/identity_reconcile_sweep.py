@@ -2,7 +2,8 @@
 
 Weekly tick (wired in services/audit_scheduler.py, prod-worker-gated there,
 and DORMANT unless ENABLE_IDENTITY_RECONCILE_SWEEP=1 — same defense-in-depth
-as the payment-reconcile tick, because staging shares the prod DB):
+as the payment-reconcile tick; written when staging shared the prod DB, which
+on GCP it no longer does — see infra/gcp/README.md):
 
   1. gauges     — the D-1 duplication numbers (same-merchant / cross-merchant
                   dup keys), the sweep's scoreboard;
@@ -44,6 +45,7 @@ from scripts.step5_working_set import (
     build_report,
 )
 from services.identity_resolution import (
+    A_LOSER_IS_SERVED_SQL,
     INSERT_EVENT_SQL,
     apply_approved,
     upsert_proposals,
@@ -81,11 +83,41 @@ GAUGES_SQL = {
     """,
 }
 
+# NEVER SUPPRESS THE SERVED ROW. The keeper is pick_canonical over DETAIL_SQL's raw columns; serving
+# picks over rows annotated with their overlays (agent_pdp_view_assembler.annotate_served_copy).
+# They agree on every key measured (2026-09-28), but where an overlay decides -- a thin row whose
+# overlay serves 800 chars beside a 60-char twin -- the keeper would be the twin, and an unreviewed
+# apply would suppress the row being served, overlay and all (review #2423). So a mechanical
+# proposal is auto-approved only when none of the rows it would suppress is the content_key's served
+# row (agent_pdp_view's signature; signatures are unique, migration 071). A served row outside the
+# proposal -- another merchant's -- holds nothing. A held proposal stays 'proposed', is counted into
+# the sweep summary, and goes to the review rail (REVIEW_HELD_SQL) instead of waiting unseen.
+# The predicate is the engine's (identity_resolution.A_LOSER_IS_SERVED_SQL): apply re-checks it, so a
+# proposal approved before this guard, or whose served row moved after approval, is held there too.
+_A_LOSER_IS_SERVED = A_LOSER_IS_SERVED_SQL
+
 APPROVE_ALLOWLIST_SQL = """
-UPDATE identity_resolution_proposals
+UPDATE identity_resolution_proposals p
 SET status = 'approved', decided_by = 'sweep_auto_allowlist', decided_at = NOW()
-WHERE status = 'proposed' AND strategy = ANY($1::text[])
-RETURNING proposal_id
+WHERE p.status = 'proposed' AND p.strategy = ANY($1::text[])
+  AND NOT EXISTS (""" + _A_LOSER_IS_SERVED + """)
+RETURNING p.proposal_id
+"""
+
+HELD_AUTO_APPROVE_SQL = """
+SELECT count(*) AS n FROM identity_resolution_proposals p
+WHERE p.status = 'proposed' AND p.strategy = ANY($1::text[])
+  AND EXISTS (""" + _A_LOSER_IS_SERVED + """)
+"""
+
+REVIEW_HELD_SQL = """
+SELECT p.proposal_id, p.kind, p.strategy, p.merchant_id, p.content_key,
+       p.subject_product_keys, p.keeper_product_key, p.confidence, p.evidence,
+       'a_loser_is_served' AS hold_reason,
+       (""" + _A_LOSER_IS_SERVED + """ LIMIT 1) AS served_product_key
+FROM identity_resolution_proposals p
+WHERE p.status = 'proposed' AND p.strategy = ANY($1::text[])
+  AND EXISTS (""" + _A_LOSER_IS_SERVED + """)
 """
 
 REVIEW_CANDIDATES_SQL = """
@@ -136,7 +168,9 @@ LIMIT $1
 
 JUDGE_ROWS_SQL = """
 SELECT product_key, title, brand, canonical_url, source_ref, platform,
-       pivota_signature_id, source_product_id
+       pivota_signature_id, source_product_id,
+       -- pick_canonical's content bar (rung 0c) reads these (see DETAIL_SQL)
+       description, image_url, sync_status, suppressed_at
 FROM catalog_products
 WHERE product_key = ANY($1::text[])
 """
@@ -283,7 +317,7 @@ def review_task_row(proposal: Dict[str, Any]) -> Tuple[str, str, str, str]:
     task_id = f"pdptask_ir_{proposal['proposal_id']}"[:96]
     pdp_id = str(proposal.get("keeper_product_key")
                  or (proposal.get("subject_product_keys") or [""])[0])[:96]
-    checklist = json.dumps({
+    checklist = {
         "source": "identity_reconcile_sweep",
         "proposal_id": proposal["proposal_id"],
         "kind": proposal["kind"],
@@ -293,9 +327,14 @@ def review_task_row(proposal: Dict[str, Any]) -> Tuple[str, str, str, str]:
         "confidence": (float(proposal["confidence"])
                        if proposal.get("confidence") is not None else None),
         "evidence": proposal.get("evidence"),
-    })
+    }
+    if proposal.get("hold_reason"):
+        # Why a mechanical proposal is here instead of applied (REVIEW_HELD_SQL). One held at apply
+        # time also carries the approval it lost, in evidence.apply_held.
+        checklist["hold_reason"] = proposal["hold_reason"]
+        checklist["served_product_key"] = proposal.get("served_product_key")
     labels = json.dumps(["entity_resolution", "identity_reconcile_sweep"])
-    return task_id, pdp_id, checklist, labels
+    return task_id, pdp_id, json.dumps(checklist), labels
 
 
 async def _connect_with_retry(dsn: str, attempts: int = 6):
@@ -316,7 +355,9 @@ async def _gauges(conn) -> Dict[str, int]:
 
 
 async def _enqueue_review_tasks(conn) -> List[str]:
-    rows = await conn.fetch(REVIEW_CANDIDATES_SQL, list(AUTO_APPROVE_STRATEGIES))
+    rows = list(await conn.fetch(REVIEW_CANDIDATES_SQL, list(AUTO_APPROVE_STRATEGIES)))
+    # Mechanical proposals the approve step held (a row they would suppress is the served row).
+    rows += list(await conn.fetch(REVIEW_HELD_SQL, list(AUTO_APPROVE_STRATEGIES)))
     enqueued = []
     for r in rows:
         p = dict(r)
@@ -370,6 +411,7 @@ async def run_identity_reconcile_sweep_tick(
 
         applied: Dict[str, Any] = {"applied": [], "skipped": []}
         approved: List[str] = []
+        held_loser_served = 0
         if apply_allowlist:
             approved = [
                 r["proposal_id"]
@@ -377,6 +419,13 @@ async def run_identity_reconcile_sweep_tick(
                     APPROVE_ALLOWLIST_SQL, list(AUTO_APPROVE_STRATEGIES)
                 )
             ]
+            held_row = await conn.fetchrow(HELD_AUTO_APPROVE_SQL, list(AUTO_APPROVE_STRATEGIES))
+            held_loser_served = int(held_row["n"]) if held_row else 0
+            if held_loser_served:
+                logger.warning(
+                    "identity_reconcile_sweep: %d mechanical proposal(s) held for review -- a row "
+                    "they would suppress is the served row", held_loser_served,
+                )
             if approved:
                 applied = await apply_approved(
                     conn, strategies=AUTO_APPROVE_STRATEGIES
@@ -404,8 +453,11 @@ async def run_identity_reconcile_sweep_tick(
             "proposed": proposed,
             "tier3_judge": judge_summary,
             "auto_approved": len(approved),
+            "auto_approve_held_loser_served": held_loser_served,
             "applied": applied.get("applied", []),
             "apply_skipped": applied.get("skipped", []),
+            "apply_held_loser_served": sum(
+                1 for _, why in applied.get("skipped", []) if why == "a_loser_is_served"),
             "review_tasks_enqueued": review_tasks,
             "alerts": alerts,
         }

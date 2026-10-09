@@ -1472,9 +1472,10 @@ async def handle_stripe_webhook(
         else:
             # No Stripe webhook secret configured for this psp_id. We REFUSE to
             # fail open in ANY environment. Accepting unsigned payloads in
-            # dev/staging used to be the convenience escape hatch, but staging
-            # shares the production Postgres (single-DB tenancy), so an unsigned
-            # event accepted on staging mutates real production orders. Configure
+            # dev/staging used to be the convenience escape hatch, but when
+            # staging shared the production Postgres (Railway era) an unsigned
+            # event accepted on staging mutated real production orders, and an
+            # unsigned write path is unsafe in any environment. Configure
             # STRIPE_WEBHOOK_SECRET (or the per-psp webhook_endpoint_secret) for
             # every deployment, including local, to exercise this path.
             logger.error(

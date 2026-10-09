@@ -58,8 +58,8 @@ def normalize_curated_brand_payload(payload: Dict[str, Any], *,
 
     `markets`: the markets the CALLER can write truthfully. The default is US only, because this
     queue's own drain (`_process_curated_brand`) stamps no market on its offers. The retailer_ingest
-    lane passes its INGEST_MARKETS (US plus the AU/JP acquisition markets of the multi-market
-    storefronts ADR, Phase 2): it declares the job's market on every offer it writes
+    lane passes its INGEST_MARKETS (US and SG served, plus the AU/JP acquisition markets of the
+    multi-market storefronts ADR, Phase 2): it declares the job's market on every offer it writes
     (ingestion._build_offer_inserts(market=...)) and keeps the seed partition at US.
     """
     if not isinstance(payload, dict):
@@ -232,9 +232,17 @@ async def _process_curated_brand(payload: Dict[str, Any], *, apply: bool, db: An
     from services.catalog_enrichment_agent.primary_ingestion import (
         inspect_primary_plan, require_primary_plan, require_primary_apply,
     )
-    plan = ingest_validated_jsonl(records)
+    if db is not None:
+        # Unattended: never move a row off the listing it names (held rows are reported, not moved).
+        from services.catalog_enrichment_agent.apply import plan_with_current_listings
+        plan = await plan_with_current_listings(records, db=db, planner=ingest_validated_jsonl)
+    else:
+        plan = ingest_validated_jsonl(records)
     out = {"records": len(records), "plan_pdps": len(plan.get("pdps") or []), "applied": None,
-           "crawl": crawl_report, "primary_ingestion": inspect_primary_plan(plan)}
+           "crawl": crawl_report, "primary_ingestion": inspect_primary_plan(plan),
+           # Listings left out: another listing on this host has the same title (one content key).
+           "listing_collisions": plan.get("listing_collisions") or [],
+           "listing_moves": plan.get("listing_moves") or []}
     if apply:
         preflight = require_primary_plan(plan)
     if apply and plan.get("pdps"):

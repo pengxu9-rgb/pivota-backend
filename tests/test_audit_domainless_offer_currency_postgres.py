@@ -69,6 +69,10 @@ _SEED_COLUMNS = (
 _LIGHTWEIGHT_DDL = "CREATE TABLE IF NOT EXISTS external_product_seeds (id text);\n" + "\n".join(
     f"ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS {name} {typ};"
     for name, typ in _SEED_COLUMNS
+) + (
+    # create_all(checkfirst) cannot widen a catalog_offers an earlier gate file made; the mirror
+    # upsert writes price_checked_at (mig 246, healed by schema_guard in prod).
+    "\nALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS price_checked_at TIMESTAMPTZ;"
 )
 
 _PREFIX = "dla-gate-"
@@ -97,6 +101,8 @@ def _cleanup(engine):
 
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM catalog_offers WHERE offer_id LIKE :p"),
+                     {"p": f"{_PREFIX}%"})
+        conn.execute(text("DELETE FROM catalog_skus WHERE product_key LIKE :p"),
                      {"p": f"{_PREFIX}%"})
         conn.execute(text("DELETE FROM catalog_products WHERE product_key LIKE :p"),
                      {"p": f"{_PREFIX}%"})
@@ -271,6 +277,15 @@ async def test_dual_write_upsert_stamps_source_domain_fill_only(pg_schema):
     _seed_fixtures(pg_schema)
     product_key = f"{_PREFIX}pk-dualwrite"
     offer_id = derive_mirror_offer_id(product_key)
+    with pg_schema.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO catalog_products(product_key,merchant_id,platform,source_product_id,title)"
+            " VALUES(:pk,'external_seed_gate','external_seed','dualwrite','gate fixture')"),
+            {"pk": product_key})
+        conn.execute(text(
+            "INSERT INTO catalog_skus(sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency)"
+            " VALUES(:sku,:pk,'external_seed_gate','external_seed','dualwrite','canonical','gate fixture','USD')"),
+            {"sku": product_key + "::canonical", "pk": product_key})
     seed_row = {
         "id": f"{_PREFIX}seed-dw",
         "domain": "https://www.Oiad.com/",   # normalization exercised

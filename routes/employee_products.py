@@ -749,6 +749,80 @@ def _best_variant_title_score(variants: List[Dict[str, Any]], product_title: Opt
     return best
 
 
+# Words, and numbers with their decimal point: "50 ml | 1.7 fl. oz." -> 1.7, 50, fl, ml, oz.
+_LABEL_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?|[^\W\d_]+", re.UNICODE)
+_LABEL_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+_LABEL_UNIT_TOKENS = frozenset(
+    {"ml", "l", "oz", "fl", "floz", "g", "kg", "mg", "lb", "lbs", "cm", "mm", "in", "inch", "inches",
+     "ct", "count", "pc", "pcs", "pack", "x"}
+)
+# Shopify's name for the only variant of a product with no options.
+_PLACEHOLDER_VARIANT_TITLES = frozenset({"default title"})
+
+
+def _label_tokens(text: Any) -> Tuple[str, ...]:
+    """A label's tokens as a sorted multiset, so "1.7 fl oz / 50 mL" == "50 ml | 1.7 fl. oz."."""
+    return tuple(sorted(_LABEL_TOKEN_RE.findall(str(text or "").lower())))
+
+
+def _name_words(tokens: Tuple[str, ...]) -> set:
+    return {t for t in tokens if t not in _LABEL_UNIT_TOKENS and not _LABEL_NUMBER_RE.fullmatch(t)}
+
+
+def _variant_option_labels(*variant_lists: Any) -> set:
+    """Every option label the variants carry (title, options values, option1..3), as tokens.
+
+    A LONE variant's title is often the product's own name, not a label: the extractor names an
+    offer with no size/colour by the page's product (`_offer_variants_from_node`). So a list with
+    one distinct title contributes it only when it names nothing ("50 ml", "1 pack").
+    """
+    labels: set = set()
+    for variants in variant_lists:
+        if not isinstance(variants, list):
+            continue
+        titles: set = set()
+        for v in variants:
+            if not isinstance(v, dict):
+                continue
+            title = _label_tokens(v.get("title")) if isinstance(v.get("title"), str) else ()
+            if title:
+                titles.add(title)
+            values = [v.get(k) for k in ("option1", "option2", "option3")]
+            options = v.get("options")
+            if isinstance(options, dict):
+                values.extend(options.values())
+            elif isinstance(options, list):
+                values.extend(o.get("value") if isinstance(o, dict) else o for o in options)
+            for value in values:
+                tokens = _label_tokens(value) if isinstance(value, str) else ()
+                if tokens:
+                    labels.add(tokens)
+        labels |= titles if len(titles) > 1 else {t for t in titles if not _name_words(t)}
+    return labels
+
+
+def _is_variant_label_not_product_title(
+    title: Any, *, variant_lists: Tuple[Any, ...], product_names: Tuple[Any, ...]
+) -> bool:
+    """Is `title` one of the product's OPTION LABELS rather than the product's name?
+
+    True when it matches a variant's option label (exactly or as a token permutation) and shares
+    no word with any of the product's own names -- "50 ml | 1.7 fl. oz.", "Default Title", "Black".
+    A variant-qualified title that still names the product ("Cica Cream - 50ml") is not a label.
+    """
+    tokens = _label_tokens(title)
+    if not tokens:
+        return False
+    if " ".join(str(title).lower().split()) in _PLACEHOLDER_VARIANT_TITLES:
+        return True
+    if tokens not in _variant_option_labels(*variant_lists):
+        return False
+    known_words: set = set()
+    for name in product_names:
+        known_words |= _name_words(_label_tokens(name))
+    return not (_name_words(tokens) & known_words)
+
+
 def _distinct_variant_titles(variants: List[Dict[str, Any]]) -> List[str]:
     out: List[str] = []
     for v in variants:
@@ -4497,9 +4571,23 @@ async def update_external_seed(
     # a mirror, and failing to mirror must never fail the authorized edit the
     # employee just made.
     projected: Dict[str, int] = {}
+    # THE PRICE IS THE EMPLOYEE'S ONLY WHEN THIS EDIT CHANGED IT. An availability-only edit still
+    # projects (the mirror offer carries availability), but must not let the attached lane stamp
+    # the seed's unverified price onto the canonical's listing rows as fresh.
+    row_dict = dict(row)
+    price_edited = (
+        "price_amount" in updates
+        and _as_price(updates["price_amount"]) != _as_price(row_dict.get("price_amount"))
+    ) or (
+        "price_currency" in updates
+        and str(updates["price_currency"] or "").strip().upper()
+        != str(row_dict.get("price_currency") or "").strip().upper()
+    )
     if any(k in updates for k in ("price_amount", "price_currency", "availability")):
         try:
-            projected = await _project_refreshed_seed_to_serving_surfaces(seed_id)
+            projected = await _project_refreshed_seed_to_serving_surfaces(
+                seed_id, price_source="employee_edit" if price_edited else None
+            )
         except Exception:  # noqa: BLE001
             logger.warning(
                 "employee seed edit: serving-surface projection failed for seed_id=%r",
@@ -4655,10 +4743,21 @@ def _seed_variant_identifiers(variant: Dict[str, Any]) -> List[str]:
 
 def _seed_variant_stored_price(variant: Dict[str, Any]) -> Any:
     """The price the serving builders read off a stored variant, same precedence."""
-    raw = variant.get("price_amount")
-    if raw is None:
-        raw = variant.get("price") or variant.get("amount") or variant.get("value")
-    return raw
+    for key in ("price_amount", "price", "amount", "value", "list_price"):
+        raw = variant.get(key)
+        if raw not in (None, ""):
+            return raw
+    return None
+
+
+def _native_refresh_variant_ids(variant: Dict[str, Any]) -> set:
+    """Numeric Shopify variant IDs, excluding numeric barcodes and other identifiers."""
+    return {
+        match.group(1)
+        for key in ("variant_id", "id", "shopify_variant_id")
+        if (match := re.fullmatch(r"(?:gid://shopify/ProductVariant/)?([0-9]{8,})",
+                                 str(variant.get(key) or "").strip()))
+    }
 
 
 _MISSING = object()
@@ -4732,8 +4831,13 @@ def _reconcile_seed_variants_with_read(
     `replaced` records every field this call changed, before and after, per variant, so an
     overwrite can be undone.
     """
+    from utils.crawled_price import parse_crawled_price, decimal_hint_from_currency
+
     read_by_id: Dict[str, List[int]] = {}
     read_variants = [rv for rv in (read or []) if isinstance(rv, dict)] if isinstance(census, dict) else []
+    read_native = set().union(*(_native_refresh_variant_ids(rv) for rv in read_variants)) if read_variants else set()
+    read_currencies = {str(rv[k]).strip().upper() for rv in read_variants
+                       for k in ("price_currency", "currency") if rv.get(k)}
     for pos, rv in enumerate(read_variants):
         key = _seed_variant_key(rv)
         if key and not _POSITIONAL_OFFER_ID.match(key):
@@ -4783,11 +4887,35 @@ def _reconcile_seed_variants_with_read(
     re_read = 0
     for idx, original in enumerate(stored):
         v = dict(original)
-        stored_amount = _as_price(_seed_variant_stored_price(v))
+        variant_currency = str(v.get("price_currency") or v.get("currency") or product_cur or "")
+        stored_raw = _seed_variant_stored_price(v)
+        stored_amount = parse_crawled_price(
+            stored_raw, currency=variant_currency,
+            decimal_hint=decimal_hint_from_currency(variant_currency),
+        ).amount
         stored_avail = str(v.get("availability") or "").strip()
-        serves_a_fact = stored_amount is not None or stored_avail.lower() not in _NO_AVAILABILITY_OBSERVATION
+        carries_price = stored_raw not in (None, "")
+        serves_a_fact = carries_price or stored_avail.lower() not in _NO_AVAILABILITY_OBSERVATION
         stored_cur = (
             str(v.get("price_currency") or v.get("currency") or "").strip().upper() or product_cur
+        )
+        # An agreeing product price cannot override an explicit different native variant ID.
+        # Normalize Shopify numeric/GID aliases; merchant SKU codes may still bridge a stored
+        # numeric ID through the existing identifier match or the single-product fallback.
+        stored_native = _native_refresh_variant_ids(v)
+        fallback_identity_ok = len(stored_native) <= 1 and not (
+            stored_native and read_native and read_native != stored_native
+        )
+        stored_codes = {str(v[k]).strip() for k in ("sku", "sku_id") if v.get(k)}
+        read_codes = {_seed_variant_key(rv) for rv in read_variants
+                      if _seed_variant_key(rv) and not _POSITIONAL_OFFER_ID.match(_seed_variant_key(rv))
+                      and not _native_refresh_variant_ids(rv)}
+        if stored_codes and read_codes and not stored_codes.intersection(read_codes):
+            fallback_identity_ok = False
+        stored_currencies = {str(v[k]).strip().upper() for k in ("price_currency", "currency") if v.get(k)}
+        fallback_currency_ok = (
+            (not stored_currencies or stored_currencies == {product_cur})
+            and (not read_currencies or read_currencies == {product_cur})
         )
 
         new_amount: Optional[float] = None
@@ -4796,11 +4924,16 @@ def _reconcile_seed_variants_with_read(
         pos = claims[idx]
         if pos is not None and claimants.get(pos) == 1:
             rv = read_variants[pos]
-            per_variant = not rv.get("id_collided") and not rv.get("offer_aggregate")
+            rv_native = _native_refresh_variant_ids(rv)
+            per_variant = (
+                not rv.get("id_collided") and not rv.get("offer_aggregate")
+                and len(stored_native) <= 1 and len(rv_native) <= 1
+                and not (stored_native and rv_native and stored_native != rv_native)
+            )
             amount = _as_price(rv.get("price_amount"))
             # The offer's OWN currency, never a fallback. The product-level currency reaching
-            # this function is the column's (`resolve_external_offer` fabricates USD when the
-            # page states none), so inheriting it would read "3600" off a geo-served page as
+            # this function is the column's (`resolve_external_offer` fabricated USD when the
+            # page stated none; it no longer does), so inheriting it would read "3600" off a geo-served page as
             # $3,600 -- seen in the #2340 spot-check against a JPY-served sigmabeauty page.
             cur = str(rv.get("price_currency") or "").strip().upper() or None
             if (
@@ -4809,15 +4942,17 @@ def _reconcile_seed_variants_with_read(
                 and amount is not None
                 and amount > 0
                 and cur
+                and len(stored_currencies) <= 1
+                and {str(rv[k]).strip().upper() for k in ("price_currency", "currency") if rv.get(k)} == {cur}
                 and (stored_cur is None or cur == stored_cur)
             ):
                 new_amount, new_cur = amount, cur
             avail = str(rv.get("availability") or "").strip()
             if per_variant and avail.lower() not in _NO_AVAILABILITY_OBSERVATION:
                 new_avail = avail
-        if single_takes_price and new_amount is None:
+        if single_takes_price and fallback_identity_ok and fallback_currency_ok and new_amount is None:
             new_amount, new_cur = product_amount, product_cur
-        if single_takes_availability and new_avail is None:
+        if single_takes_availability and fallback_identity_ok and new_avail is None:
             new_avail = product_availability
 
         before = dict(v)
@@ -4855,7 +4990,7 @@ def _reconcile_seed_variants_with_read(
                 }
             )
 
-        was_re_read = new_amount is not None if stored_amount is not None else new_avail is not None
+        was_re_read = new_amount is not None if carries_price else new_avail is not None
         if serves_a_fact:
             if was_re_read:
                 re_read += 1
@@ -4875,7 +5010,9 @@ def _reconcile_seed_variants_with_read(
     }
 
 
-async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str, int]:
+async def _project_refreshed_seed_to_serving_surfaces(
+    seed_id: str, *, price_source: Optional[str] = None, currency_read: bool = False
+) -> Dict[str, int]:
     """Push a freshly re-read seed onto the surfaces a BUYER reads.
 
     THE BUG THIS CLOSES. `_refresh_external_seed_by_id` writes `external_product_seeds` and
@@ -4899,10 +5036,11 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
     did not move is what makes the nightly rotation self-healing for rows that already drifted,
     instead of needing a separate backfill pass.
 
-    Returns counters so the batch can tell "healed 2,000" from "healed 0" — `sync_offer_for_seed`
-    has seven statuses and six of them mean "did nothing" (`no_mirror_product` is expected to be
-    common: the mirror is insert-only and matches on `source_ref = seed_id`). Dropping that dict
-    is how a run that projected nothing would still have reported success.
+    Returns counters so the batch can tell "healed 2,000" from "healed 0" — only `synced` means
+    `sync_offer_for_seed` wrote a row; `wrote_mirror` / `wrote_attached` say which one. A skip in
+    OFFER_SYNC_STRUCTURAL_SKIP_STATUSES (no offer row this seed may touch) is one the batch does
+    not count as a projection that failed to write.
+    Dropping that dict is how a run that projected nothing would still have reported success.
 
     Best-effort and non-raising, mirroring the `seed_data_writer` hooks it stands in for: the
     seed row is the committed source of truth, so a projection failure must never turn a good
@@ -4929,7 +5067,13 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
             OFFER_SYNC_WRITTEN_STATUSES,
         )
 
-        outcome = await sync_offer_for_seed(seed_id)
+        # `price_source` is the caller vouching for the seed's price: `refresh` (a re-read, with
+        # `currency_read` saying the page named the currency) or `employee_edit` (the PATCH changed
+        # the price). None -- an availability-only edit -- keeps the attached lane off, so a price
+        # nobody re-read is never stamped fresh on the canonical's listing rows.
+        outcome = await sync_offer_for_seed(
+            seed_id, attached_price_source=price_source, currency_read=currency_read
+        )
         status = str((outcome or {}).get("status") or "").strip().lower()
         # Derived from the writer, never restated here. The first version guessed
         # {"synced","inserted","updated","ok"} — three statuses it cannot emit — and the tests
@@ -4937,6 +5081,9 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
         # never produces.
         if status in OFFER_SYNC_WRITTEN_STATUSES:
             counts["projected"] = 1
+            # Which offer row: the seed's mirror product, or the attached canonical's offer for
+            # the listing the seed reads. The summary reports the split.
+            counts["wrote_" + str((outcome or {}).get("target") or "mirror")] = 1
         elif status in OFFER_SYNC_ERROR_STATUSES:
             # The writer swallowed an exception. That is an error, not a skip: a skip means
             # "nothing to do", and counting a failed write as one hides it from the summary.
@@ -4944,7 +5091,15 @@ async def _project_refreshed_seed_to_serving_surfaces(seed_id: str) -> Dict[str,
             counts["skip_" + (status or "unknown")] = 1
         else:
             counts["skipped"] = 1
+            # A status in OFFER_SYNC_STRUCTURAL_SKIP_STATUSES (nothing this writer may touch) is
+            # left out of "should have written" by the batch, which reads it off this key.
             counts["skip_" + (status or "unknown")] = 1
+        # Per-row refusals inside the attached lane (a variant the page did not re-read, a row in
+        # another currency), reported whether or not a sibling row was written.
+        offer_skips = (outcome or {}).get("offer_skips")
+        if isinstance(offer_skips, dict):
+            for reason, n in offer_skips.items():
+                counts["offer_skip_" + str(reason)] = int(n or 0)
     except Exception as exc:  # noqa: BLE001 - a cache write must not break the source of truth
         counts["errored"] = 1
         logger.warning(
@@ -5136,6 +5291,30 @@ async def _refresh_external_seed_by_id(
 
     seed_data = _ensure_json_obj(row.get("seed_data"))
     seed_data.setdefault("snapshot", {})
+    # THE PAGE'S "TITLE" CAN BE A VARIANT'S OPTION LABEL. tatcha.com's ProductGroup JSON-LD
+    # named every variant "50 ml | 1.7 fl. oz.", the extractor took it, and the gateway serves
+    # `snapshot.title` ahead of the row's own title -- so two different Tatcha products shared
+    # one label and the identity backfill merged them (2026-09-29, sig_1b52c3ff0045a6d39c40dd7d).
+    # The extractor now names a variant by its group; this refuses whatever shape comes next.
+    snapshot_title_refused = None
+    product_names = (row.get("title"), seed_data.get("product_name"), seed_data.get("title"))
+    variant_lists = (snap_variants, _seed_variants(seed_data), seed_data["snapshot"].get("variants"))
+    if snap_title and _is_variant_label_not_product_title(
+        snap_title, variant_lists=variant_lists, product_names=product_names
+    ):
+        snapshot_title_refused = snap_title
+        snap_title = next(
+            (
+                str(name).strip()
+                for name in (*product_names, seed_data["snapshot"].get("title"))
+                if isinstance(name, str)
+                and name.strip()
+                and not _is_variant_label_not_product_title(
+                    name, variant_lists=variant_lists, product_names=product_names
+                )
+            ),
+            None,
+        )
     seed_data["snapshot"].update(
         {
             "canonical_url": canonical_url,
@@ -5214,8 +5393,11 @@ async def _refresh_external_seed_by_id(
     # correction is dictated by it. It gated on `snap_price_currency is None` and on
     # `snap_availability is None`, having read `_extract_from_html`. Neither is ever
     # None by the time it arrives here — the CALLER post-processes both:
-    #   * services/external_offers_service.resolve_external_offer FABRICATES a
+    #   * services/external_offers_service.resolve_external_offer FABRICATED a
     #     currency when extraction found none: `"JPY" if market=="JP" else "USD"`.
+    #     (Fixed since: an unread currency now voids the amount and arrives here as
+    #     `skipped_unreadable` / `currency_unread`. The guards below stay: the stored
+    #     rows it wrote are still in the table.)
     #     `_detect_currency_from_text` has no `₩`/KRW case, so a Korean page priced
     #     ₩24,000 arrives as 24000.0 **USD**. The old COALESCE kept the stored KRW;
     #     a naive fix writes the fabricated USD and reports it as a correction.
@@ -5247,20 +5429,32 @@ async def _refresh_external_seed_by_id(
     # rather than swallowed so the rate is measurable. A genuine merchant currency
     # change therefore needs a human, which is the right cost: the alternative is
     # silently restating a ₩24,000 product as $24,000.
-    if fresh_amount is None:
+    # WHY the page gave no amount, when it carried a price we would not read: an ambiguous
+    # separator ("1,234" with no locale signal), two numbers in one field, or no readable
+    # currency (`resolve_external_offer` no longer invents one). Counted apart from
+    # `unavailable` (the page had no price at all) because the fix is in the extractor.
+    price_read = evidence.get("price_read") if isinstance(evidence, dict) else None
+    unreadable_reason = (
+        str(price_read.get("status") or "")
+        if isinstance(price_read, dict) and price_read.get("status") not in (None, "", "parsed", "empty")
+        else None
+    )
+    if fresh_amount is None and unreadable_reason:
+        next_amount, next_currency = prev_amount, prev_currency
+        price_status = "skipped_unreadable"
+    elif fresh_amount is None:
         next_amount, next_currency = prev_amount, prev_currency
         price_status = "unavailable"
     elif fresh_amount <= 0:
         # `price: 0` IS A DOCUMENTED BROKEN-OFFER SHAPE IN THIS CATALOG, not a free
-        # product. `_parse_price` strips every non-digit, so an unrenderable or
-        # sold-out PDP that emits `product:price:amount = 0` (or a currency glyph with
-        # no number) arrives here as a clean 0.0 — and "$0 / EUR price for US users"
+        # product. An unrenderable or sold-out PDP that emits
+        # `product:price:amount = 0` arrives here as a clean 0.0 — and "$0 / EUR price for US users"
         # is recorded a few hundred lines up as an OBSERVED production symptom, not a
         # hypothetical. The old COALESCE preserved the stored price in this cell, so
         # writing it would be a regression introduced by the very change meant to make
         # prices trustworthy — and it lands hardest on the out-of-stock cohort this
-        # work targets. Negative is unreachable (the minus sign is stripped upstream)
-        # but is covered by the same comparison rather than left to be discovered.
+        # work targets. Negative is unreachable (utils/crawled_price refuses a minus
+        # sign) but is covered by the same comparison rather than left to be discovered.
         next_amount, next_currency = prev_amount, prev_currency
         price_status = "skipped_non_positive"
     elif fresh_currency is None:
@@ -5320,6 +5514,7 @@ async def _refresh_external_seed_by_id(
 
     price_refresh = {
         "status": price_status,
+        **({"reason": unreadable_reason} if price_status == "skipped_unreadable" else {}),
         "changed": price_status == "applied",
         "previous_amount": prev_amount,
         "previous_currency": prev_currency,
@@ -5523,7 +5718,14 @@ async def _refresh_external_seed_by_id(
     # catalog_offers.updated_at = NOW() on a row nobody re-read — claiming a freshness we did not
     # earn, which is exactly what the projection exists to stop.
     if read_the_served_product and price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE:
-        projection = await _project_refreshed_seed_to_serving_surfaces(seed_id)
+        projection = await _project_refreshed_seed_to_serving_surfaces(
+            seed_id,
+            price_source="refresh",
+            # The reader substitutes the market's currency when the page names none; that is not
+            # a reading, and the attached lane refuses it (external_offers_service).
+            currency_read=isinstance(evidence, dict)
+            and evidence.get("price_currency_source") == "page",
+        )
 
     return {
         "status": "success",
@@ -5536,6 +5738,8 @@ async def _refresh_external_seed_by_id(
         "canonical_url": served_canonical,
         "domain": domain,
         "seed_data": seed_data,
+        # The page's title, when it was a variant's option label and was not written.
+        "snapshot_title_refused": snapshot_title_refused,
         # DID THIS "SUCCESS" ACTUALLY CONTACT THE ORIGIN? Often not, and the status alone
         # cannot say. `resolve_external_offer` honours `raise_on_unavailable` ONLY in its
         # `except ExternalOfferUnavailable` arm; anything else — a timeout, TLS, robots, and

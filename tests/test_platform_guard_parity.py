@@ -607,7 +607,7 @@ def test_main_startup_explicit_override_wins(monkeypatch, value, expected):
 
 
 # ---------------------------------------------------------------------------
-# GUARD: shared-queue scheduler worker (staging must not poach prod runs)
+# GUARD: queue-drain scheduler worker (prod worker only; staging/preview off)
 # ---------------------------------------------------------------------------
 
 

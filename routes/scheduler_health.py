@@ -36,6 +36,9 @@ async def scheduler_health() -> Dict[str, Any]:
             running).
         jobs: list of {id, next_run_time (ISO 8601 or null), trigger}
             for each registered job.
+        job_allowlist / skipped_by_allowlist / job_allowlist_unknown_ids:
+            only when SCHEDULER_JOB_ALLOWLIST is set (ids only); see
+            docs/runbooks/scheduler_job_allowlist.md.
     """
     try:
         from services.audit_scheduler import get_scheduler
