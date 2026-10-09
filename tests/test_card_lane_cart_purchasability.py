@@ -6,7 +6,7 @@ offers.resolve asks `_CartPurchasabilityGate` before it mints a `cart_permalink`
 lane, `_build_prefetched_external_seed_wrappers`, and `_attach_connected_product_redirects`. Every
 test below drives the lane's REAL entry point with the REAL `_make_external_redirect_url`, and
 reads the answer off the card the lane emitted and the token it signed. Only the fact read
-(`db.merchant_purchasability.is_purchasable`) and the stores the lanes read from are faked.
+(`db.merchant_purchasability.human_handoff_allowed`) and the stores the lanes read from are faked.
 
 What a decline must look like, on every lane:
   * the card's `cart_url` is gone and its `tracking.join_mode` is `referral_only` — which also
@@ -75,11 +75,11 @@ def _fact(monkeypatch: pytest.MonkeyPatch, *, purchasable: bool) -> List[tuple]:
 
     calls: List[tuple] = []
 
-    async def fake_is_purchasable(domain, market, *, now=None):
+    async def fake_human_handoff_allowed(domain, market):
         calls.append((domain, market))
         return purchasable
 
-    monkeypatch.setattr(mp, "is_purchasable", fake_is_purchasable)
+    monkeypatch.setattr(mp, "human_handoff_allowed", fake_human_handoff_allowed)
     return calls
 
 

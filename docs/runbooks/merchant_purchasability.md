@@ -756,7 +756,8 @@ abandoned checkouts double). A dark job executed by hand exits 0 and contacts no
    something, and §6 is where to look.
 5. **Verify coverage merchant by merchant** through
    `GET /ops/merchant-purchasability?domain=…&market=…`. Every merchant you expect to be
-   purchasable must read `"tier": "purchase"`. If one stays `browse_only`, the response's `note`
+   purchasable must read `"tier": "purchase"` (and `"human_handoff_tier": "purchase"` for a cart
+   handed to a human — `NO_CARD_PAYMENT` reads `browse_only` / `purchase`). If one stays `browse_only`, the response's `note`
    names the three candidate reasons — a positive row under a DIFFERENT vantage, an expired
    window, or two consecutive negatives — and §7's demotion query tells you which. **Do not skip
    this step:** it is the only thing standing between step 6 and a 409 on a live merchant.
@@ -1110,14 +1111,33 @@ as a one-click cart. Measured on prod 2026-09-27: 432 active-seed offers mint a 
 (47 of 53 hosts) with no positive fact in any market**.
 
 Under `MERCHANT_PURCHASABILITY_ENFORCE` the mint (`routes/agent_shop_gateway._CartPurchasabilityGate`)
-now asks first, with **this route's semantics**:
+now asks first. **It asks the HUMAN cart's question, `human_handoff_allowed`, not the Reap rail's
+`is_purchasable`** (Peng, 2026-10-09):
 
 | state | cart? | DB read |
 |---|---|---|
 | dial off | kept — byte-identical token and payload | none |
 | dial on, request names no ISO-2 market (`market_unknown`) | **declined** | none |
-| dial on, `is_purchasable(cart host, request market)` true | kept | one per host per request |
-| dial on, anything else (no row, expired, wrong vantage, DB error) | **declined** | one per host per request |
+| dial on, a fresh fact from the buyer vantage with verdict `ELIGIBLE`, `NO_CARD_PAYMENT` or `PRICE_DRIFT` | kept | one per host per request |
+| dial on, a fresh fact nobody can buy under: `LOGIN_REQUIRED`, `PASSWORD_PAGE`, `NOT_ACCEPTING_ORDERS`, `VARIANT_GONE` | **declined** | one per host per request |
+| dial on, anything else (no row, last check older than the TTL, an unverifiable verdict, wrong vantage, DB error) | **declined** | one per host per request |
+
+**Why the two readers part on `NO_CARD_PAYMENT`.** That verdict means the checkout's accept-list
+was read and holds no *on-site* card line. For the Reap rail — a card paid with nobody present —
+that is a confirmed negative. For a human it is nothing: the PR controller's spot-check on
+2026-10-09 found **643 of 839 negative cart seeds (26 hosts) were `NO_CARD_PAYMENT`**, and most of
+those checkouts take cards through an *offsite* provider (Eximbay, Payfast, "Pay via Cards /
+Wallets / Bank Transfer") that a human completes without noticing; the rest take PayPal. The
+first cut of this gate (`is_purchasable`) would have turned every one of them into a referral.
+Freshness for the human reader is the **last check inside the TTL** (`checked_at`), because
+`positive_until` is armed only by `ELIGIBLE` + card and the whole point is a verdict that never
+arms it. The preflight, the sweep and the fact's three write rules are unchanged; `is_purchasable`
+and the Reap rail are unchanged.
+
+The ops route publishes both answers: `tier` (the rail's) and `human_handoff_tier` (the mints').
+**The gateway's own gate (`PIVOTA-Agent src/offers/offersPriority.js`) strips `execution_spec.cart_url`
+on `tier`** — the rail's field — so when armed it has the same defect on human carts; it must read
+`human_handoff_tier` instead.
 
 A decline removes the **cart**, never the offer: `execution_spec.cart_url` / `variant_id` null,
 `rail: referral`, `tracking.join_mode: referral_only`, `cart_prefilled: false`, and the `/r` hop

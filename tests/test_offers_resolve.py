@@ -5115,17 +5115,17 @@ def test_no_coverage_line_when_the_preflight_is_off(
 
 
 def _purchasability_fake(monkeypatch: pytest.MonkeyPatch, *, purchasable: bool) -> list:
-    """Replace ONLY the fact read (`is_purchasable`) with a recording answer. The gate, the
+    """Replace ONLY the fact read (`human_handoff_allowed`) with a recording answer. The gate, the
     route and the mint around it are the real ones."""
     import db.merchant_purchasability as mp
 
     calls: list = []
 
-    async def fake_is_purchasable(domain, market, *, now=None):
+    async def fake_human_handoff_allowed(domain, market):
         calls.append((domain, market))
         return purchasable
 
-    monkeypatch.setattr(mp, "is_purchasable", fake_is_purchasable)
+    monkeypatch.setattr(mp, "human_handoff_allowed", fake_human_handoff_allowed)
     return calls
 
 
@@ -5318,22 +5318,14 @@ def test_one_request_asks_once_per_merchant(
         _assert_referral_only(offer)
 
 
-async def test_the_gate_answers_what_the_ops_route_answers_for_the_same_fact() -> None:
-    """ONE contract: for every (merchant, market) the mint allows a cart exactly when
-    `GET /ops/merchant-purchasability` would say `tier: purchase` under enforcement. Real fact
-    table, real `record_check` writes, the ops handler called directly."""
+@pytest.fixture
+async def purchasability_table():
+    """The REAL fact table, built the way production does (the schema guard's own DDL), empty,
+    with enforcement armed and the buyer vantage at its default. Dropped afterwards."""
     import os
 
-    import db.merchant_purchasability as mp
     from db.database import database
     from db.schema_guard import ensure_required_schema_light
-    from routes.agent_shop_gateway import _CartPurchasabilityGate
-    from routes.merchant_purchasability_ops import merchant_purchasability as ops_read
-    from services.shopify_cart_link_preflight import PreflightResult, Verdict
-
-    def res(verdict, card):
-        return PreflightResult(host="x", verdict=Verdict(verdict), market="US", variant_id="1",
-                               card_available=card)
 
     was_connected = database.is_connected
     if not was_connected:
@@ -5345,25 +5337,7 @@ async def test_the_gate_answers_what_the_ops_route_answers_for_the_same_fact() -
         await ensure_required_schema_light()
         os.environ["MERCHANT_PURCHASABILITY_ENFORCE"] = "1"
         os.environ.pop("MERCHANT_PURCHASABILITY_BUYER_VANTAGE", None)
-        await mp.record_check("good.com", "US", res("ELIGIBLE", True))
-        await mp.record_check("nocard.com", "US", res("ELIGIBLE", None))
-        await mp.record_check("proxyonly.com", "US", res("ELIGIBLE", True), vantage="proxy")
-
-        cases = [
-            ("https://good.com/cart/1:1", "good.com", "US"),
-            ("https://www.good.com/cart/1:1", "good.com", "US"),
-            ("https://good.com/cart/1:1", "good.com", "SG"),
-            ("https://good.com/cart/1:1", "good.com", None),
-            ("https://nocard.com/cart/1:1", "nocard.com", "US"),
-            ("https://proxyonly.com/cart/1:1", "proxyonly.com", "US"),
-            ("https://never-checked.com/cart/1:1", "never-checked.com", "US"),
-        ]
-        for cart, domain, market in cases:
-            route = await ops_read(domain=domain, market=market, _principal={})
-            assert route.enforced is True
-            allowed = await _CartPurchasabilityGate(market).allows_cart(cart)
-            assert allowed is (route.tier == "purchase"), (cart, market, route.tier)
-        assert await _CartPurchasabilityGate("US").allows_cart("https://good.com/cart/1:1") is True
+        yield
     finally:
         for k, v in saved.items():
             if v is None:
@@ -5374,3 +5348,93 @@ async def test_the_gate_answers_what_the_ops_route_answers_for_the_same_fact() -
         await ensure_required_schema_light()
         if not was_connected and database.is_connected:
             await database.disconnect()
+
+
+def _fact(verdict, card):
+    from services.shopify_cart_link_preflight import PreflightResult, Verdict
+
+    return PreflightResult(host="x", verdict=Verdict(verdict), market="US", variant_id="1",
+                           card_available=card)
+
+
+async def test_the_gate_answers_what_the_ops_route_answers_for_the_same_fact(purchasability_table) -> None:
+    """ONE contract: for every (merchant, market) the mint allows a cart exactly when
+    `GET /ops/merchant-purchasability` would say `human_handoff_tier: purchase` under
+    enforcement — the HUMAN cart's field, not the Reap rail's `tier`. Real fact table, real
+    `record_check` writes, the ops handler called directly.
+
+    THE TWO FIELDS PART ON NO_CARD_PAYMENT (Peng, 2026-10-09): a checkout read with no on-site
+    card line refuses the headless card rail and KEEPS the human cart. Pinned here as the one
+    case where `tier` and `human_handoff_tier` disagree, in that direction and no other."""
+    import db.merchant_purchasability as mp
+    from routes.agent_shop_gateway import _CartPurchasabilityGate
+    from routes.merchant_purchasability_ops import merchant_purchasability as ops_read
+
+    await mp.record_check("good.com", "US", _fact("ELIGIBLE", True))
+    await mp.record_check("nocard.com", "US", _fact("ELIGIBLE", None))
+    await mp.record_check("paypal-only.com", "US", _fact("NO_CARD_PAYMENT", False))
+    await mp.record_check("drift.com", "US", _fact("PRICE_DRIFT", True))
+    await mp.record_check("login.com", "US", _fact("LOGIN_REQUIRED", None))
+    await mp.record_check("password.com", "US", _fact("PASSWORD_PAGE", None))
+    await mp.record_check("closed.com", "US", _fact("NOT_ACCEPTING_ORDERS", None))
+    await mp.record_check("gone.com", "US", _fact("VARIANT_GONE", None))
+    await mp.record_check("blocked.com", "US", _fact("BLOCKED_UNKNOWN", None))
+    await mp.record_check("proxyonly.com", "US", _fact("ELIGIBLE", True), vantage="proxy")
+
+    cases = [
+        ("https://good.com/cart/1:1", "good.com", "US"),
+        ("https://www.good.com/cart/1:1", "good.com", "US"),
+        ("https://good.com/cart/1:1", "good.com", "SG"),
+        ("https://good.com/cart/1:1", "good.com", None),
+        ("https://nocard.com/cart/1:1", "nocard.com", "US"),
+        ("https://paypal-only.com/cart/1:1", "paypal-only.com", "US"),
+        ("https://drift.com/cart/1:1", "drift.com", "US"),
+        ("https://login.com/cart/1:1", "login.com", "US"),
+        ("https://password.com/cart/1:1", "password.com", "US"),
+        ("https://closed.com/cart/1:1", "closed.com", "US"),
+        ("https://gone.com/cart/1:1", "gone.com", "US"),
+        ("https://blocked.com/cart/1:1", "blocked.com", "US"),
+        ("https://proxyonly.com/cart/1:1", "proxyonly.com", "US"),
+        ("https://never-checked.com/cart/1:1", "never-checked.com", "US"),
+    ]
+    seen = {}
+    for cart, domain, market in cases:
+        route = await ops_read(domain=domain, market=market, _principal={})
+        assert route.enforced is True
+        allowed = await _CartPurchasabilityGate(market).allows_cart(cart)
+        assert allowed is (route.human_handoff_tier == "purchase"), (cart, market, route.human_handoff_tier)
+        seen[(domain, market)] = (route.tier, route.human_handoff_tier, allowed)
+    assert seen[("good.com", "US")] == ("purchase", "purchase", True)
+    assert seen[("paypal-only.com", "US")] == ("browse_only", "purchase", True), (
+        "NO_CARD_PAYMENT: the rail refuses, the human keeps the cart")
+    assert seen[("nocard.com", "US")] == ("browse_only", "purchase", True), (
+        "ELIGIBLE with an unread card line: a checkout with our line on it")
+    assert seen[("drift.com", "US")] == ("browse_only", "purchase", True)
+    for domain in ("login.com", "password.com", "closed.com", "gone.com", "blocked.com",
+                   "proxyonly.com", "never-checked.com"):
+        assert seen[(domain, "US")] == ("browse_only", "browse_only", False), domain
+    assert seen[("good.com", None)] == ("browse_only", "browse_only", False)
+    assert seen[("good.com", "SG")] == ("browse_only", "browse_only", False)
+    assert not any(t == "purchase" and h == "browse_only" for t, h, _a in seen.values()), (
+        "the human tier is never STRICTER than the rail's")
+
+
+async def test_a_no_card_payment_merchant_keeps_its_cart_and_a_login_wall_loses_it(
+    purchasability_table, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through the real route, on real fact rows. The NO_CARD_PAYMENT offer's token must be
+    byte-identical to an ungated one (no `purchasability_tier` key); the LOGIN_REQUIRED offer
+    is the referral the first cut would have given both."""
+    import db.merchant_purchasability as mp
+
+    await mp.record_check("brand.com", "US", _fact("NO_CARD_PAYMENT", False))
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+    _assert_cart(offer)
+    assert offer["execution_spec"]["rail"] == "shopify_cart"
+
+    await mp.record_check("brand.com", "US", _fact("LOGIN_REQUIRED", None))
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+    _assert_referral_only(offer)
+    assert offer["cart_prefilled"] is False

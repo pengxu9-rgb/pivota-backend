@@ -9202,16 +9202,26 @@ class _CartPurchasabilityGate:
     and never an `or "US"` default. `tests/test_purchase_gate_market_not_defaulted.py`
     resolves every construction site's argument and pins it.
 
-    THE SAME SEMANTICS AS THE OPS ROUTE (`GET /ops/merchant-purchasability`), which is the
-    gateway's contract, so the two cannot answer differently for one merchant x market:
-      * dial OFF -> every cart is allowed. That route says `enforced: false` and its consumers
-        keep their previous behaviour; so does this. Nothing is asked, nothing changes.
+    THE HUMAN CART'S QUESTION, NOT THE REAP RAIL'S (Peng, 2026-10-09). This gate hands a
+    prefilled cart to a HUMAN, who pays however the checkout lets them; the Reap rail pays by
+    card with nobody present. The two read the same fact through two readers that part on
+    NO_CARD_PAYMENT — see "TWO QUESTIONS, TWO READERS" in `db/merchant_purchasability.py`:
+      * dial OFF -> every cart is allowed. The ops route says `enforced: false` and its
+        consumers keep their previous behaviour; so does this. Nothing is asked, nothing changes.
       * dial ON, no usable request market -> declined, WITHOUT a database read. The route's
-        `reason: market_unknown`, `tier: browse_only`. The market is never defaulted: the
-        `used_market` a seed row is served under is its LISTING market, and an `or "US"`
-        placeholder would gate a non-US buyer against the US fact.
-      * dial ON, market known -> `is_purchasable`, the function the route and the rail call.
-        It fails CLOSED on a database error, and so does this.
+        `reason: market_unknown`. The market is never defaulted: the `used_market` a seed row
+        is served under is its LISTING market, and an `or "US"` placeholder would gate a non-US
+        buyer against the US fact.
+      * dial ON, market known -> `human_handoff_allowed`: a fresh fact from the buyer vantage
+        whose verdict a human can check out under (ELIGIBLE, NO_CARD_PAYMENT, PRICE_DRIFT).
+        Declined when nobody can buy — LOGIN_REQUIRED, PASSWORD_PAGE, NOT_ACCEPTING_ORDERS,
+        VARIANT_GONE — or when there is no fact, a stale one, or an unverifiable one. It fails
+        CLOSED on a database error, and so does this. The ops route publishes the same answer as
+        `human_handoff_tier`, beside the rail's `tier`, so the gateway's gate can read it too.
+    A NO_CARD_PAYMENT merchant therefore KEEPS its cart here while the Reap rail refuses it:
+    measured 2026-10-09, 643 of 839 negative cart seeds were NO_CARD_PAYMENT, most of them
+    checkouts that take cards through an offsite provider — a decline here would have turned
+    all of them into referrals for a human who could have paid.
     A decline FAILS OPEN FOR LINKS-OUT: it removes the cart, never the offer. The buyer still
     gets the attributed PDP through the same `/r` hop — the route's "leaves browse and
     links-out untouched".
@@ -9237,7 +9247,9 @@ class _CartPurchasabilityGate:
             host = merchant_purchasability.normalize_domain(cart_base_url)
             if host not in self._memo:
                 self.stats["asked"] += 1
-                self._memo[host] = await merchant_purchasability.is_purchasable(host, self.market)
+                self._memo[host] = await merchant_purchasability.human_handoff_allowed(
+                    host, self.market
+                )
             allowed = self._memo[host]
         if not allowed:
             self.stats["declined"] += 1

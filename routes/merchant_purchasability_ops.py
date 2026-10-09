@@ -82,6 +82,13 @@ class PurchasabilityResponse(BaseModel):
     #: way (fail-open for browse / links-out, never a purchase). Null whenever a market was keyed,
     #: so a keyed response differs from the pre-field one only by this one null key.
     reason: Optional[str] = None
+    #: What the HUMAN-CART mints would answer (offers.resolve and the product-card lanes,
+    #: `routes/agent_shop_gateway._CartPurchasabilityGate`): `purchase` when a fresh fact from the
+    #: buyer vantage carries a verdict a human can check out under, `browse_only` otherwise. It
+    #: PARTS from `tier` on NO_CARD_PAYMENT, which refuses the headless card rail and keeps the
+    #: human cart (`db.merchant_purchasability.human_handoff_allowed`). A gateway gating a cart
+    #: handed to a human must read THIS field; `tier` is the Reap rail's answer.
+    human_handoff_tier: str = "browse_only"
     #: THE GATEWAY CONTRACT. False means the backend is NOT refusing on this fact yet, so a
     #: consumer must keep its previous behaviour and treat `tier` as advisory. A gateway that
     #: acted on `tier` without reading this would turn the whole catalogue browse-only on the
@@ -157,6 +164,7 @@ async def merchant_purchasability(
 
     rows = await purchasability.list_facts(normalized, normalized_market)
     purchasable = await purchasability.is_purchasable(normalized, normalized_market)
+    human_cart = await purchasability.human_handoff_allowed(normalized, normalized_market)
 
     facts = [
         PurchasabilityFact(
@@ -200,6 +208,7 @@ async def merchant_purchasability(
         domain=normalized,
         market=normalized_market,
         tier=("purchase" if purchasable else "browse_only"),
+        human_handoff_tier=("purchase" if human_cart else "browse_only"),
         enforced=purchasability.is_enforcement_enabled(),
         buyer_vantage=vantage,
         sweep_enabled=purchasability.is_sweep_enabled(),
