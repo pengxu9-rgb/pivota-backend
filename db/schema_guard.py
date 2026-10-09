@@ -558,6 +558,10 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "destination_http_status",
             "destination_verdict",
             "destination_failure_streak",
+            # Migration 260. When the streak last stepped on a corroborated dead
+            # observation: the retirement gap is measured from here, because
+            # destination_checked_at is re-stamped by uncorroborated refresh observations.
+            "destination_corroborated_dead_at",
             # Content freshness (migration 202). Written ONLY by the success path of
             # _refresh_external_seed_by_id, so the refresh queue can order by "when did
             # we last re-read this PRICE" instead of `updated_at`, which an attach, a
@@ -2916,6 +2920,14 @@ async def ensure_required_schema_light() -> None:
                   ADD COLUMN IF NOT EXISTS destination_http_status INTEGER,
                   ADD COLUMN IF NOT EXISTS destination_verdict TEXT,
                   ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;
+                """
+            )
+            # Migration 260: the clock the retirement gap is measured from. The writer
+            # SELECTs it on every observation, so a database without it fails every sweep.
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS external_product_seeds
+                  ADD COLUMN IF NOT EXISTS destination_corroborated_dead_at TIMESTAMPTZ;
                 """
             )
             await database.execute(
