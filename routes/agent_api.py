@@ -79,6 +79,7 @@ from services.external_referral_readiness import (
     should_block_external_referral_runtime,
 )
 from services.offer_buyability import expected_currency_for_market
+from utils.market_code import iso2_market
 from services.agent_ranking_service import (
     AgentRankingFeatures,
     get_agent_ranking_config,
@@ -3016,10 +3017,12 @@ async def _load_external_seed_products_with_cache(
     serving_market: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     normalized_market = str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
-    # THE MARKET THE BUYER NAMED: the partition when the request named one, else the serving market
-    # (a request may name only `serving_market`, reading the served partitions for an SG buyer).
-    # It is what the minted `/r` token may stamp as observed, and what splits the cache key.
-    named_market = market if market else serving_market
+    # `serving_market` NEVER becomes `request_market`. The minted `/r` token's market is the seed
+    # ROW's (US for every SGD seed), and `request_market_observed` would stamp it observed from a
+    # request that named only a serving market -- a token saying "US, observed" for an SG buyer,
+    # which the warm lane then forwards to the purchasability gate. A wrong observed market is
+    # strictly worse than none (services/outbound_links_service, MARKET PROVENANCE), so a
+    # serving-market-only request keeps its tokens UNOBSERVED, exactly like a market-less one.
     metrics = metrics_out if isinstance(metrics_out, dict) else {}
     metrics.setdefault("executed", False)
     metrics.setdefault("skip_reason", "not_attempted")
@@ -3066,7 +3069,7 @@ async def _load_external_seed_products_with_cache(
             brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
             metrics_out=metrics,
-            request_market=named_market,
+            request_market=market,
             serving_market=serving_market,
         )
 
@@ -3091,7 +3094,7 @@ async def _load_external_seed_products_with_cache(
             brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
             metrics_out=metrics,
-            request_market=named_market,
+            request_market=market,
             serving_market=serving_market,
         )
 
@@ -3111,7 +3114,7 @@ async def _load_external_seed_products_with_cache(
     cache_key = _build_external_seed_cache_key(
         query=query,
         market=normalized_market,
-        request_market_named=request_market_observed(named_market),
+        request_market_named=request_market_observed(market),
         serving_market=serving_market,
         strategy=normalized_seed_strategy,
         surface=normalized_catalog_surface,
@@ -3190,7 +3193,7 @@ async def _load_external_seed_products_with_cache(
                     brand_required_terms=normalized_brand_required_terms,
                     brand_prefer_terms=normalized_brand_prefer_terms,
                     brand_query_detected=brand_query_detected,
-                    request_market=named_market,
+                    request_market=market,
                     serving_market=serving_market,
                 )
             )
@@ -3214,7 +3217,7 @@ async def _load_external_seed_products_with_cache(
         brand_prefer_terms=normalized_brand_prefer_terms,
         brand_query_detected=brand_query_detected,
         metrics_out=metrics,
-        request_market=named_market,
+        request_market=market,
         serving_market=serving_market,
     )
     metrics["executed"] = True
@@ -3246,7 +3249,7 @@ async def _load_external_seed_products_with_cache(
             brand_required_terms=normalized_brand_required_terms,
             brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
-            request_market=named_market,
+            request_market=market,
             serving_market=serving_market,
         )
     return sync_rows[:limit]
@@ -5049,13 +5052,12 @@ async def agent_get_shopify_webhook_events(
 # ============================================================================
 
 def _normalize_serving_market_param(raw: Any) -> Optional[str]:
-    """ONE ISO-2 market the backend can price, upper-cased, else None (ignored). Validated like
-    the other doors: a locale ('en-US'), a list ('US,SG'), a three-letter code ('USA') or a
-    well-formed code nothing is priced for ('ZZ', 'DE') makes no claim about the buyer."""
-    code = str(raw or "").strip().upper()
-    if not re.fullmatch(r"[A-Z]{2}", code):
-        return None
-    return code if expected_currency_for_market(code) else None
+    """ONE ISO-2 market the backend can price, upper-cased, else None (ignored). The repo's one
+    ISO-2 normaliser (utils.market_code.iso2_market) plus the pricing map: a locale ('en-US'), a
+    list ('US,SG'), a three-letter code ('USA') or a well-formed code nothing is priced for
+    ('ZZ', 'DE') makes no claim about the buyer."""
+    code = iso2_market(raw)
+    return code if code and expected_currency_for_market(code) else None
 
 
 async def agent_search_products(
