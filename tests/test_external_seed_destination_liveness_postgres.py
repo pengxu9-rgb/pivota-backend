@@ -437,25 +437,17 @@ async def test_the_sweep_queue_skips_retired_seeds(_db):
 
 # --------------------------------------------------------------------------- the pending step
 #
-# catalog_offers is SHARED with the other files of this gate (one database, see the dialect-gate
-# convention): ensure only the columns used here, never drop it, and clean rows by this prefix.
+# catalog_offers is SHARED with the other files of this gate (one database): it is built from the
+# MODEL (tests/model_schema.ensure_model_tables), never as a hand-written narrow table that would
+# poison later files, never dropped, and this file cleans only its own rows, by prefix.
 _OFFER_PREFIX = "offer::dlp_"
 
 
 async def _ensure_offers(db):
-    await db.execute(
-        "CREATE TABLE IF NOT EXISTS catalog_offers (offer_id TEXT PRIMARY KEY)"
-    )
-    for ddl in (
-        "ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS sku_key TEXT",
-        "ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS product_key TEXT",
-        "ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS merchant_id TEXT",
-        "ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS suppressed_at TIMESTAMPTZ",
-        "ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS suppression_reason TEXT",
-        "ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS suppression_metadata JSONB",
-        "ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
-    ):
-        await db.execute(ddl)
+    from db.catalog import catalog_offers
+    from tests.model_schema import ensure_model_tables
+
+    await ensure_model_tables([catalog_offers])
     await db.execute("DELETE FROM catalog_offers WHERE offer_id LIKE :p", {"p": _OFFER_PREFIX + "%"})
 
 
