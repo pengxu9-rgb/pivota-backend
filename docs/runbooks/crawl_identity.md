@@ -30,8 +30,36 @@ fingerprint or UA disguise) is out of scope.
 |---|---|
 | external-offer fetch (`services/external_offers_service.py::_fetch_html`): the referral refresh and the HTML repair scripts | yes, every redirect hop |
 | Reap cart proofs, enrichment and mirror, and `scripts/backfill_shopify_variant_ids.py`: all through `services/shopify_presentment.py::no_cookie_client` (#2527) | yes |
-| Tier B, purchasability sweep (`jobs/tierb_cart_link_eligibility.py::PacedTransport`) | NOT YET: separate PR, after the sweep throttle fix lands. They also still send a desktop-Chrome UA |
+| Tier B, purchasability sweep, `scripts/ops/refresh_tierb_seed_hints.py` (`jobs/tierb_cart_link_eligibility.py::_default_inner_transport`, `jobs/merchant_purchasability_sweep.py::_inner_transport`, the preflight's own client) | WIRED, DO NOT ENABLE YET (see below). Signed innermost; the sweep's proxy vantage is never signed |
 | curated brand feed, retailer-ingest drain, destination sweep | NOT YET |
+
+**Every signed request declares PivotaBot.** `SigningTransport` sets `User-Agent` to
+`crawl_identity.DECLARED_USER_AGENT` on exactly the requests it signs. A request that goes out
+unsigned (flag off, no key, fail-open, the sweep's proxy vantage) keeps its lane's User-Agent. So the
+registration's "User-Agent string" holds for every signed request, on every lane.
+
+**Tier B and the purchasability sweep: wired, but do NOT turn the flag on for them yet.** Two open
+questions (review of #2532, 2026-10-08):
+
+1. **robots.txt.** The preflight fetches `/cart/<variant>:1` and the `/checkouts/...` page it
+   redirects to, to confirm a product can be bought. Shopify's default robots.txt disallows `/cart`
+   and `/checkouts/` for every User-Agent. A declared, signed PivotaBot fetching them contradicts the
+   registration form's attestation ("will operate in accordance with ... the robots.txt directives
+   published by individual stores"). This is for Peng and counsel
+   (reports/shopify_crawl_access_2026_10_08/LEGAL_QUESTIONS.md, question 7).
+2. **Tier B verdicts.** A checkout that answers a declared bot with a challenge is recorded
+   `BLOCKED_UNKNOWN`, which is a definite verdict and overwrites ELIGIBLE. That would drop merchants
+   out of the cart-link lane. Before enabling, run the Tier B job twice in dry-run (flag off, then on)
+   over the same cohort and compare verdicts.
+
+The flag is PROCESS-WIDE: a shell that exported `CRAWL_WEB_BOT_AUTH_ENABLED=true` and the key (for
+example to run `scripts/backfill_shopify_variant_ids.py` signed) also signs anything else it runs,
+including `scripts/ops/refresh_tierb_seed_hints.py` and `scripts/ops/tierb_cart_link_preflight.py`.
+Unset it before running those.
+
+On purpose, neither job's setup script has a `WEB_BOT_AUTH` switch yet (unlike
+`setup_reap_cart_proof_jobs.sh`): `--set-env-vars` there would wipe a flag set by hand, and there
+should be no supported way to enable these lanes until both questions are answered.
 
 To wire a lane, pass `**crawl_identity.transport_kwargs()` to its `httpx.AsyncClient(...)`. Or wrap
 the transport that actually sends: `crawl_identity.crawl_transport(httpx.AsyncHTTPTransport(...))`.
@@ -114,8 +142,8 @@ the directory check passes, try `dictionary` on one job before concluding anythi
    - The cart-proof run report carries `web_bot_auth: signed | off | unsigned_<reason>`.
 8. File https://forms.gle/V88RD31uAVirqE4e9 with:
    - the directory URL;
-   - the User-Agent: `Mozilla/5.0 (compatible; PivotaBot/1.0; +https://pivota.cc)`, unless
-     `EXTERNAL_OFFER_USER_AGENT` overrides it on a job;
+   - the User-Agent: `Mozilla/5.0 (compatible; PivotaBot/1.0; +https://pivota.cc)` (every signed
+     request carries it, and robots.txt is evaluated for it, whatever `EXTERNAL_OFFER_USER_AGENT` says);
    - the egress IP 34.82.199.35;
    - the request rate (the shared pacer: 2 req/s overall, about 1 req/host/s);
    - the purpose: commerce discovery feeding UCP checkout on the merchant's own store.

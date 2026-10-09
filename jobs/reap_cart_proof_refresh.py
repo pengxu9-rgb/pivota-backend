@@ -176,6 +176,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from db import reap_cart_proof_refresh_cursors as cursor_store  # noqa: E402
+from services import crawl_identity  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -974,7 +975,7 @@ class BlockStreakClient:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise crawl_politeness.CrawlPaced("the request's patience ran out between hops")
-                await crawl_politeness.before_request(current, user_agent=user_agent, max_wait=remaining)
+                await crawl_politeness.before_request(current, user_agent=crawl_identity.robots_user_agent(user_agent), max_wait=remaining)
             except crawl_politeness.RobotsDisallowed:
                 self.robots_disallowed += 1
                 return self._local(current, LOCAL_REFUSED_STATUS, "robots")

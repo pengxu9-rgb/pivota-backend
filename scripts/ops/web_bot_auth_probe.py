@@ -6,8 +6,8 @@ flag on, against stores that answer `429 local_rate_limited` today:
 
     python scripts/ops/web_bot_auth_probe.py flowerknows.co dermalogica.com
 
-Per store: ONE unsigned and ONE signed GET /products.json?limit=1, 3 s apart, same User-Agent
-(the external-offer lane's). The ORDER alternates per store (signed first on the 1st, 3rd, ...): a
+Per store: ONE unsigned and ONE signed GET /products.json?limit=1, 3 s apart, both with the
+declared PivotaBot User-Agent, so the signature is the only difference. The ORDER alternates per store (signed first on the 1st, 3rd, ...): a
 limit the first request draws could otherwise carry over to the second and read as "both 429".
 It bypasses the crawl pacers (10 requests at most), so do not run it inside the nightly crawl
 windows (02:20-04:20, 05:15-06:15 UTC). At most 5 stores. Prints `E3 <host> <unsigned|signed> <status>
@@ -22,7 +22,6 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from services import crawl_identity  # noqa: E402
-from services.external_offers_service import DEFAULT_UA  # noqa: E402
 
 GAP_S = 3.0
 
@@ -30,7 +29,9 @@ GAP_S = 3.0
 async def _one(host: str, label: str, kwargs) -> None:
     async with httpx.AsyncClient(timeout=15.0, **kwargs) as client:
         try:
-            r = await client.get(f"https://{host}/products.json?limit=1", headers={"User-Agent": DEFAULT_UA})
+            # BOTH arms send the declared UA, so the only difference between them is the signature.
+            r = await client.get(f"https://{host}/products.json?limit=1",
+                                 headers={"User-Agent": crawl_identity.DECLARED_USER_AGENT})
             snippet = r.text[:40].replace("\n", " ")
             print("E3", host, label, r.status_code, r.headers.get("retry-after") or "-", repr(snippet))
         except Exception as exc:
