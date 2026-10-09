@@ -1135,9 +1135,14 @@ arms it. The preflight, the sweep and the fact's three write rules are unchanged
 and the Reap rail are unchanged.
 
 The ops route publishes both answers: `tier` (the rail's) and `human_handoff_tier` (the mints').
-**The gateway's own gate (`PIVOTA-Agent src/offers/offersPriority.js`) strips `execution_spec.cart_url`
+~~**The gateway's own gate (`PIVOTA-Agent src/offers/offersPriority.js`) strips `execution_spec.cart_url`
 on `tier`** — the rail's field — so when armed it has the same defect on human carts; it must read
-`human_handoff_tier` instead.
+`human_handoff_tier` instead.~~ **Fixed in PIVOTA-Agent (client "rule 7", 2026-10-09):**
+`merchantPurchasabilityClient.shouldOfferPurchase` takes a `rail`; its three human seams (the offer
+stamp and `offers.resolve`, the warm cart, the escalation `continue_url`) name `RAIL.human` and act
+on `human_handoff_tier` when the answer carries it (else `tier`, so a backend before #2411 reads as
+before); the Reap agentic lane names `RAIL.card` and acts on `tier`. An unnamed rail is the card
+rail. One read serves both. The gateway's gate is still unarmed in prod.
 
 A decline removes the **cart**, never the offer: `execution_spec.cart_url` / `variant_id` null,
 `rail: referral`, `tracking.join_mode: referral_only`, `cart_prefilled: false`, and the `/r` hop
