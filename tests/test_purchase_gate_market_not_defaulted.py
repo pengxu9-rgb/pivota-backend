@@ -879,9 +879,13 @@ def test_the_request_market_edges_into_the_mint_sites_are_request_carriers() -> 
     allowed = {
         # (file, callee, keyword) -> allowed leaves of the argument at every call site
         ("routes/agent_api.py", "_build_external_seed_product", "request_market"): {"param:request_market"},
+        # `serving_market` is the buyer's market as the route's own query parameter (validated by
+        # `_normalize_serving_market_param`): a request carrier, never a served or defaulted value.
+        # The cached loader hands the mint the partition when the request named one, else it.
         ("routes/agent_api.py", "_load_external_seed_products_for_search", "request_market"): {
-            "param:market", "param:request_market"},
-        ("routes/agent_api.py", "_schedule_external_seed_cache_refresh", "request_market"): {"param:market"},
+            "param:market", "param:request_market", "param:serving_market"},
+        ("routes/agent_api.py", "_schedule_external_seed_cache_refresh", "request_market"): {
+            "param:market", "param:serving_market"},
         ("routes/agent_shop_gateway.py", "_build_prefetched_external_seed_wrappers", "request_market"): {
             "call:_request_market_for_multi", "param:payload", "param:request_metadata"},
         # The connected-card purchasability gate's input — a keyword of its own, so the served

@@ -2842,11 +2842,17 @@ def _build_external_seed_cache_key(
     limit: int,
     page_offset: int = 0,
     request_market_named: bool = True,
+    serving_market: Optional[str] = None,
 ) -> str:
     """`request_market_named=False` (the request named no market) appends ONE extra component
     after the integer offset bucket. A key built for a named market always ENDS in that integer,
     so no market value — however spelled — can produce the unnamed key; and a named request's key
-    is byte-identical to the key this function built before the flag existed."""
+    is byte-identical to the key this function built before the flag existed.
+
+    `serving_market` (the buyer's market, distinct from the `market` PARTITION -- see
+    `agent_search_products`) appends its own LAST component only when named: a page served for
+    an SG buyer out of the US partition must never share an entry with the US buyer's page, and a
+    request naming no serving market builds exactly the key it always did."""
     normalized_query = _normalize_external_seed_cache_query(query)
     normalized_market = str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     normalized_strategy = str(strategy or "legacy").strip().lower() or "legacy"
@@ -2870,7 +2876,9 @@ def _build_external_seed_cache_key(
         f"{normalized_surface}|{normalized_semantic_class}|{expansion_hash}|{required_terms_hash}|"
         f"{prune_token}|{limit_bucket}|{offset_bucket}"
     )
-    return key if request_market_named else f"{key}|market_unnamed"
+    key = key if request_market_named else f"{key}|market_unnamed"
+    normalized_serving = str(serving_market or "").strip().upper()
+    return f"{key}|serving:{normalized_serving}" if normalized_serving else key
 
 
 def _get_cached_external_seed_products(cache_key: str) -> Optional[List[Dict[str, Any]]]:
@@ -2945,6 +2953,7 @@ def _schedule_external_seed_cache_refresh(
     brand_prefer_terms: Optional[List[str]],
     brand_query_detected: bool,
     request_market: Optional[str] = None,
+    serving_market: Optional[str] = None,
 ) -> bool:
     existing = _EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT.get(cache_key)
     if existing is not None and not existing.done():
@@ -2971,6 +2980,7 @@ def _schedule_external_seed_cache_refresh(
                 brand_query_detected=brand_query_detected,
                 metrics_out=refresh_metrics,
                 request_market=request_market,
+                serving_market=serving_market,
             )
             if _should_cache_external_seed_result(products=refreshed or [], metrics=refresh_metrics):
                 _put_cached_external_seed_products(cache_key, refreshed or [])
@@ -3003,8 +3013,13 @@ async def _load_external_seed_products_with_cache(
     brand_prefer_terms: Optional[List[str]] = None,
     brand_query_detected: bool = False,
     metrics_out: Optional[Dict[str, Any]] = None,
+    serving_market: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     normalized_market = str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
+    # THE MARKET THE BUYER NAMED: the partition when the request named one, else the serving market
+    # (a request may name only `serving_market`, reading the served partitions for an SG buyer).
+    # It is what the minted `/r` token may stamp as observed, and what splits the cache key.
+    named_market = market if market else serving_market
     metrics = metrics_out if isinstance(metrics_out, dict) else {}
     metrics.setdefault("executed", False)
     metrics.setdefault("skip_reason", "not_attempted")
@@ -3051,7 +3066,8 @@ async def _load_external_seed_products_with_cache(
             brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
             metrics_out=metrics,
-            request_market=market,
+            request_market=named_market,
+            serving_market=serving_market,
         )
 
     is_first_screen = int(page_offset or 0) == 0
@@ -3075,7 +3091,8 @@ async def _load_external_seed_products_with_cache(
             brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
             metrics_out=metrics,
-            request_market=market,
+            request_market=named_market,
+            serving_market=serving_market,
         )
 
     cache_scope = (
@@ -3094,7 +3111,8 @@ async def _load_external_seed_products_with_cache(
     cache_key = _build_external_seed_cache_key(
         query=query,
         market=normalized_market,
-        request_market_named=request_market_observed(market),
+        request_market_named=request_market_observed(named_market),
+        serving_market=serving_market,
         strategy=normalized_seed_strategy,
         surface=normalized_catalog_surface,
         scope=cache_scope,
@@ -3172,7 +3190,8 @@ async def _load_external_seed_products_with_cache(
                     brand_required_terms=normalized_brand_required_terms,
                     brand_prefer_terms=normalized_brand_prefer_terms,
                     brand_query_detected=brand_query_detected,
-                    request_market=market,
+                    request_market=named_market,
+                    serving_market=serving_market,
                 )
             )
         return cached_products[:limit]
@@ -3195,7 +3214,8 @@ async def _load_external_seed_products_with_cache(
         brand_prefer_terms=normalized_brand_prefer_terms,
         brand_query_detected=brand_query_detected,
         metrics_out=metrics,
-        request_market=market,
+        request_market=named_market,
+        serving_market=serving_market,
     )
     metrics["executed"] = True
     if sync_rows:
@@ -3226,7 +3246,8 @@ async def _load_external_seed_products_with_cache(
             brand_required_terms=normalized_brand_required_terms,
             brand_prefer_terms=normalized_brand_prefer_terms,
             brand_query_detected=brand_query_detected,
-            request_market=market,
+            request_market=named_market,
+            serving_market=serving_market,
         )
     return sync_rows[:limit]
 
@@ -4058,13 +4079,17 @@ async def _load_external_seed_products_for_search(
     brand_query_detected: bool = False,
     metrics_out: Optional[Dict[str, Any]] = None,
     request_market: Optional[str] = None,
+    serving_market: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Load employee-managed external products (unattached external seeds) and surface as first-class products.
 
     `market` selects the seed partition (and is defaulted to DEFAULT_EXTERNAL_SEED_MARKET for
     serving); `request_market` is the RAW market the buyer's request named, if any, and is the
-    only thing the minted `/r` token may stamp as observed.
+    only thing the minted `/r` token may stamp as observed. `serving_market` is the market the
+    BUYER is served in: it decides the currency every seed row must be priced in
+    (fetch_external_seed_rows), while the partition read stays `market`. Absent, every fetch
+    behaves exactly as before (the partition's own currency).
     """
     metrics = metrics_out if isinstance(metrics_out, dict) else None
     if metrics is not None:
@@ -4130,6 +4155,7 @@ async def _load_external_seed_products_for_search(
     stage_a_result = await fetch_external_seed_rows(
         database=database,
         market=normalized_market,
+        serving_market=serving_market,
         query=query,
         limit=limit,
         offset=max(0, int(page_offset or 0)),
@@ -4168,6 +4194,7 @@ async def _load_external_seed_products_for_search(
         lean_rescue_result = await fetch_external_seed_rows(
             database=database,
             market=normalized_market,
+            serving_market=serving_market,
             query=query,
             limit=limit,
             offset=max(0, int(page_offset or 0)),
@@ -4220,6 +4247,7 @@ async def _load_external_seed_products_for_search(
         stage_b_result = await fetch_external_seed_rows(
             database=database,
             market=normalized_market,
+            serving_market=serving_market,
             query=stage_b_query,
             limit=stage_b_limit,
             offset=0,
@@ -4306,6 +4334,7 @@ async def _load_external_seed_products_for_search(
         broad_fetch_result = await fetch_external_seed_rows(
             database=database,
             market=normalized_market,
+            serving_market=serving_market,
             query=query,
             limit=broad_limit,
             offset=0,
@@ -5019,6 +5048,16 @@ async def agent_get_shopify_webhook_events(
 # 产品搜索和浏览
 # ============================================================================
 
+def _normalize_serving_market_param(raw: Any) -> Optional[str]:
+    """ONE ISO-2 market the backend can price, upper-cased, else None (ignored). Validated like
+    the other doors: a locale ('en-US'), a list ('US,SG'), a three-letter code ('USA') or a
+    well-formed code nothing is priced for ('ZZ', 'DE') makes no claim about the buyer."""
+    code = str(raw or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", code):
+        return None
+    return code if expected_currency_for_market(code) else None
+
+
 async def agent_search_products(
     req: Request,
     background_tasks: BackgroundTasks,
@@ -5046,6 +5085,14 @@ async def agent_search_products(
     external_seed_strategy: str = Query(default="legacy"),
     fast_mode: bool = Query(default=False),
     market: Optional[str] = Query(default=None),
+    serving_market: Optional[str] = Query(
+        default=None,
+        description=(
+            "The BUYER's market (ISO-2). Decides the currency every served row must be priced in; "
+            "the seed partitions read stay the deployment's (`market`). `market` alone is the storage "
+            "partition, unchanged. Unpriceable or malformed values are ignored."
+        ),
+    ),
     psp: Optional[str] = Query(default=None),
     payment_method_type: Optional[str] = Query(default=None),
     card_network: Optional[str] = Query(default=None),
@@ -5074,7 +5121,15 @@ async def agent_search_products(
             or "inStockOnly" in req.query_params
         )
     in_stock_only = bool(in_stock_only and in_stock_filter_explicit)
-    expected_price_currency = expected_currency_for_market(market)
+    # TWO MARKETS, TWO MEANINGS (2026-10-09, the PIVOTA-Agent discovery feed's buyer-market
+    # fallback). `market` is the storage PARTITION to read, as it always was. `serving_market` is
+    # the market the BUYER is served in: every SGD seed is filed under the 'US' partition and the
+    # 'SG' partition holds zero rows, so a caller that named `market=SG` got nothing, while the
+    # gateway's find_products_multi lane -- which binds the deployment's partitions and filters by
+    # the buyer's currency -- serves SGD rows. This surfaces the same split on this door. The
+    # expected currency follows the serving market when named, else the partition, as before.
+    normalized_serving_market = _normalize_serving_market_param(serving_market)
+    expected_price_currency = expected_currency_for_market(normalized_serving_market or market)
     started = time.perf_counter()
     auth_lookup_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_lookup_ms", 0) or 0))
     auth_total_ms = max(0, int(getattr(getattr(req, "state", None), "agent_auth_total_ms", 0) or 0))
@@ -5596,6 +5651,7 @@ async def agent_search_products(
                         req=req,
                         query=query,
                         market=market,
+                        serving_market=normalized_serving_market,
                         query_semantic_class=query_semantic_class,
                         limit=ext_limit,
                         build_budget_ms=AGENT_EXTERNAL_SEED_FAST_SUPPLEMENT_BUDGET_MS,
@@ -6068,6 +6124,7 @@ async def agent_search_products(
                     req=req,
                     query=query,
                     market=market,
+                    serving_market=normalized_serving_market,
                     query_semantic_class=query_semantic_class,
                     limit=external_seed_limit,
                     build_budget_ms=AGENT_EXTERNAL_SEED_GENERAL_BUDGET_MS,
@@ -6914,6 +6971,7 @@ async def agent_search_products_beauty(
     external_seed_strategy: str = Query(default="legacy"),
     fast_mode: bool = Query(default=False),
     market: Optional[str] = Query(default=None),
+    serving_market: Optional[str] = Query(default=None, description="The BUYER's market (ISO-2); `market` stays the storage partition."),
     psp: Optional[str] = Query(default=None),
     payment_method_type: Optional[str] = Query(default=None),
     card_network: Optional[str] = Query(default=None),
@@ -7038,6 +7096,7 @@ async def agent_search_products_beauty(
         external_seed_strategy=external_seed_strategy,
         fast_mode=fast_mode,
         market=market,
+        serving_market=serving_market,
         psp=psp,
         payment_method_type=payment_method_type,
         card_network=card_network,
