@@ -70,6 +70,7 @@ _INSIGHT_REFRESH_WORKER_EXPLICIT="${INSIGHT_REFRESH_WORKER+set}"
 _STORE_AUDIT_UCP_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_UCP_REPROBE_WORKER+set}"
 _STORE_AUDIT_COMMERCE_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_COMMERCE_REPROBE_WORKER+set}"
 _EXTERNAL_SEED_DESTINATION_SWEEP_EXPLICIT="${EXTERNAL_SEED_DESTINATION_SWEEP+set}"
+_CATALOG_DESTINATION_SWEEP_EXPLICIT="${CATALOG_DESTINATION_SWEEP+set}"
 # Did the CALLER ask for a WORKERS value, or is this the default? The summary at the end needs
 # that distinction to tell "you asked and we ignored it" from "nobody mentioned it".
 WORKERS_REQUESTED="${WORKERS-}"
@@ -101,6 +102,11 @@ case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (
 # dead observation, lifted by the next live answer. Only meaningful with RETIRE (the sweep passes
 # suppress=retire). Default false: a new nightly write lane is armed deliberately.
 : "${EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION:=false}"
+# The catalog-enrichment twin (jobs.catalog_destination_sweep, migration 261): rows with no seed.
+# OBSERVES unless SUPPRESS is armed; with it, a first corroborated dead observation hides the row
+# (pending, lifted by the next live answer) and a second withdraws it.
+: "${CATALOG_DESTINATION_SWEEP:=false}"
+: "${CATALOG_DESTINATION_SWEEP_SUPPRESS:=false}"
 case "$WORKERS" in true|false) ;; *) echo "WORKERS must be exactly true or false (got '$WORKERS')" >&2; exit 2 ;; esac
 case "$PAUSED"  in 0|1)         ;; *) echo "PAUSED must be exactly 0 or 1 (got '$PAUSED')" >&2; exit 2 ;; esac
 case "$RELGRAPH_PUBLICATION_WORKER" in true|false) ;; *) echo "RELGRAPH_PUBLICATION_WORKER must be exactly true or false (got '$RELGRAPH_PUBLICATION_WORKER')" >&2; exit 2 ;; esac
@@ -114,6 +120,8 @@ case "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" in true|false) ;; *) echo "STORE_AUDI
 case "$EXTERNAL_SEED_DESTINATION_SWEEP" in true|false) ;; *) echo "EXTERNAL_SEED_DESTINATION_SWEEP must be exactly true or false (got '$EXTERNAL_SEED_DESTINATION_SWEEP')" >&2; exit 2 ;; esac
 case "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" in true|false) ;; *) echo "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE must be exactly true or false (got '$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE')" >&2; exit 2 ;; esac
 case "$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION" in true|false) ;; *) echo "EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION must be exactly true or false (got '$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION')" >&2; exit 2 ;; esac
+case "$CATALOG_DESTINATION_SWEEP" in true|false) ;; *) echo "CATALOG_DESTINATION_SWEEP must be exactly true or false (got '$CATALOG_DESTINATION_SWEEP')" >&2; exit 2 ;; esac
+case "$CATALOG_DESTINATION_SWEEP_SUPPRESS" in true|false) ;; *) echo "CATALOG_DESTINATION_SWEEP_SUPPRESS must be exactly true or false (got '$CATALOG_DESTINATION_SWEEP_SUPPRESS')" >&2; exit 2 ;; esac
 # relgraph-sync WRITES (build + AI review apply). Unlike the lanes above, these are LIVE in prod
 # (armed by hand 2026-09-27, verified green 2026-09-30), and the job's --set-env-vars REPLACES its
 # whole env, so a reconcile that left them out would silently turn the graph back into a dry run.
@@ -135,6 +143,9 @@ if [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] && [ "$EXTERNAL_SEED_DES
 fi
 if [ "$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION" = true ] && [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" != true ]; then
   echo "EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION=true requires EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true" >&2; exit 2
+fi
+if [ "$CATALOG_DESTINATION_SWEEP_SUPPRESS" = true ] && [ "$CATALOG_DESTINATION_SWEEP" != true ]; then
+  echo "CATALOG_DESTINATION_SWEEP_SUPPRESS=true requires CATALOG_DESTINATION_SWEEP=true" >&2; exit 2
 fi
 if [ "$STORE_AUDIT_UCP_REPROBE_ARMED" = true ] && [ "$STORE_AUDIT_UCP_REPROBE_WORKER" != true ]; then
   echo "STORE_AUDIT_UCP_REPROBE_ARMED=true requires STORE_AUDIT_UCP_REPROBE_WORKER=true" >&2; exit 2
@@ -872,6 +883,21 @@ else
   echo "== external-seed destination sweep not created (EXTERNAL_SEED_DESTINATION_SWEEP=false)"
 fi
 
+# ---- catalog destination sweep (rows with no seed) ------------------------------------------
+# Same crawl egress and pacing as the seed sweep above, for catalog_enrichment_agent_v1 rows.
+if [ "$CATALOG_DESTINATION_SWEEP" = true ]; then
+  echo "== job: catalog-destination-sweep (suppress=$CATALOG_DESTINATION_SWEEP_SUPPRESS)"
+  CATALOG_SWEEP_ARGS="-m,jobs.catalog_destination_sweep,--limit,4000"
+  [ "$CATALOG_DESTINATION_SWEEP_SUPPRESS" = true ] && CATALOG_SWEEP_ARGS="$CATALOG_SWEEP_ARGS,--suppress"
+  mkcrawljob catalog-destination-sweep "$BACKEND_IMAGE" "$SA" \
+    --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
+    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=catalog-destination-sweep,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+    --task-timeout 3600s \
+    --command python --args="$CATALOG_SWEEP_ARGS"
+else
+  echo "== catalog destination sweep not created (CATALOG_DESTINATION_SWEEP=false)"
+fi
+
 # ---- retailer ingest drain -----------------------------------------------------------------
 # One (brand, retailer) ingest stage per execution - dry run, or apply + read-back - claimed from
 # the retailer_ingest_jobs ledger (migration 234). See jobs/retailer_ingest_drain.py.
@@ -943,6 +969,15 @@ else
   if [ -n "$_EXTERNAL_SEED_DESTINATION_SWEEP_EXPLICIT" ] && have "$GCLOUD" scheduler jobs describe external-seed-destination-sweep-cron --location "$REGION"; then
     "$GCLOUD" scheduler jobs pause external-seed-destination-sweep-cron --location "$REGION" --quiet
     echo "   (paused: external-seed-destination-sweep-cron; EXTERNAL_SEED_DESTINATION_SWEEP=false)"
+  fi
+fi
+if [ "$CATALOG_DESTINATION_SWEEP" = true ]; then
+  # 04:10 UTC: after the seed sweep and the 03:30 cart-link job, before the 05:15 referral refresh.
+  sched catalog-destination-sweep-cron "10 4 * * *" catalog-destination-sweep
+else
+  if [ -n "$_CATALOG_DESTINATION_SWEEP_EXPLICIT" ] && have "$GCLOUD" scheduler jobs describe catalog-destination-sweep-cron --location "$REGION"; then
+    "$GCLOUD" scheduler jobs pause catalog-destination-sweep-cron --location "$REGION" --quiet
+    echo "   (paused: catalog-destination-sweep-cron; CATALOG_DESTINATION_SWEEP=false)"
   fi
 fi
 sched reviews-invitation-send-cron "* * * * *" reviews-invitation-send
