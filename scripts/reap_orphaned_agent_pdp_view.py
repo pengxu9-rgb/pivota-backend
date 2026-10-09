@@ -27,6 +27,15 @@ Usage:
   # by hand against prod — dry-run first, since the Job's baked args include --apply
   gcloud run jobs execute agent-pdp-orphan-reaper --region us-west1 --project pivota-prod --wait \
     --args 'scripts/reap_orphaned_agent_pdp_view.py,--limit,0'
+
+--unbuildable switches to the OTHER class: view rows whose content_key still has
+catalog rows, none of which the builder may use (all source-quarantined or all
+title-less), so every refresh declines them and they keep serving an old snapshot.
+See reap_unbuildable_agent_pdp_view_rows. The scheduled Job does not pass it; the
+backlog is removed by hand, dry-run first:
+
+  python -m scripts.reap_orphaned_agent_pdp_view --unbuildable            # dry-run
+  python -m scripts.reap_orphaned_agent_pdp_view --unbuildable --apply
 """
 
 from __future__ import annotations
@@ -50,6 +59,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.database import database  # noqa: E402
 from services.agent_pdp_view_assembler import (  # noqa: E402
     reap_orphaned_agent_pdp_view_rows,
+    reap_unbuildable_agent_pdp_view_rows,
 )
 
 logger = logging.getLogger("reap_orphaned_agent_pdp_view")
@@ -70,6 +80,10 @@ async def _disconnect_if_needed(db: Any, was: bool) -> None:
 async def _drive(args: argparse.Namespace, *, db: Any = database) -> Dict[str, Any]:
     was = await _connect_if_needed(db)
     try:
+        if getattr(args, "unbuildable", False):
+            return await reap_unbuildable_agent_pdp_view_rows(
+                db=db, limit=args.limit, dry_run=not args.apply
+            )
         return await reap_orphaned_agent_pdp_view_rows(
             db=db, limit=args.limit, dry_run=not args.apply
         )
@@ -87,6 +101,11 @@ def _parse_args() -> argparse.Namespace:
         "--limit", type=int, default=0,
         help="Max orphans to process this run (0 = all). Default 0.",
     )
+    p.add_argument(
+        "--unbuildable", action="store_true",
+        help="Reap view rows whose catalog rows all fail the builder (quarantined / "
+        "title-less) instead of orphans. Default: orphans.",
+    )
     return p.parse_args()
 
 
@@ -95,6 +114,9 @@ def main() -> int:
     args = _parse_args()
     report = asyncio.run(_drive(args))
     print(json.dumps(report, indent=2, default=str))
+    if args.unbuildable:
+        # reap_unbuildable_agent_pdp_view_rows logs its own WARNING line.
+        return 0
 
     # Emitted at WARNING so it carries a severity into Cloud Logging, where this
     # sweep now runs. The GitHub workflow it replaces uploaded both reports as a
