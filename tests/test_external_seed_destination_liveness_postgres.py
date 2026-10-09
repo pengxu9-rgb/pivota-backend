@@ -393,13 +393,15 @@ async def test_the_sweep_queue_puts_a_dead_verdict_ahead_of_an_older_live_one(_d
                 destination_verdict="redirected_off_product", destination_failure_streak=1)
     await _seed(_db, "eps_renamed", destination_checked_at=NOW - timedelta(days=40),
                 destination_verdict="redirected_to_product")
+    await _seed(_db, "eps_delisted", destination_checked_at=NOW - timedelta(days=20),
+                destination_verdict="live_delisted")
 
     candidates = await liveness.get_sweep_candidates(10)
     assert [c["id"] for c in candidates] == [
         # every confirmed-dead verdict, oldest answer first ...
         "eps_off_older", "eps_dead_recent",
         # ... then the clock exactly as before (a rename is not a failure)
-        "eps_never", "eps_renamed", "eps_live_old",
+        "eps_never", "eps_renamed", "eps_live_old", "eps_delisted",
     ]
 
 

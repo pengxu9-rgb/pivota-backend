@@ -803,3 +803,23 @@ def test_retirement_cascades_to_the_products_offers(monkeypatch):
     assert offer_params["reason"] == "product_suppressed"
     assert offer_params["product_keys"] == ["prod::pg1"]
     assert result["offers_suppressed"] == 1
+
+
+def test_the_sweep_queue_spells_out_exactly_the_confirmed_dead_verdicts():
+    """The queue SQL is a literal so the static PREPARE sweep can plan it; this keeps it honest."""
+    import re
+
+    spelled = re.search(r"destination_verdict IN \(([^)]*)\)", liveness.SWEEP_CANDIDATES_SQL).group(1)
+    assert {v.strip().strip("'") for v in spelled.split(",")} == set(liveness.CONFIRMED_DEAD_VERDICTS)
+
+
+def test_the_sweep_summary_counts_the_dead_first_bucket(monkeypatch):
+    seeds = [
+        {"id": "eps_dead", "canonical_url": "https://brand.com/products/gone", "domain": "brand.com",
+         "destination_verdict": "dead_404"},
+        {"id": "eps_live", "canonical_url": "https://brand.com/products/kept", "domain": "brand.com",
+         "destination_verdict": "live"},
+    ]
+    client = _SweepClient(["kept"], {"https://brand.com/products/gone": httpx.Response(404)})
+    summary, _recorded, _retired = _sweep(monkeypatch, seeds, client)
+    assert summary["dead_first_candidates"] == 1
