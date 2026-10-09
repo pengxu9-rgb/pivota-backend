@@ -1150,6 +1150,22 @@ The market is the **request's** (`payload.market`), never the seed row's listing
 the `or "US"` serving default. So a market-less caller (the UCP `get_offers` tool today) loses its
 carts even on merchants that are positive for US — the same answer the gateway's own gate gives.
 
+**A declared storefront market is a market; a per-request fallback is not** (Peng, 2026-10-09).
+"Never default a market" forbids a *fallback*: a value a door fills in when the caller said nothing
+(`or "US"`, a browser language, a geo-IP guess made on the caller's behalf). It does not forbid a
+*declaration*: a surface that serves exactly one market may state that market on every call, and
+the door then has a real buyer market to key on. agent.pivota.cc's `STOREFRONT_MARKET = 'US'`
+(agent-ui #376) is such a declaration — the storefront prices everything in USD and offers no
+other market — and it keys this gate correctly. The distinction is *who decided*: the surface that
+owns the buyer relationship declares; a door downstream never guesses. When agent-ui starts
+serving a buyer's own market (from their location, as the partner surfaces do with
+`buyer_region`), it declares that market per request instead; the rule and the gate do not change.
+
+Measured 2026-10-09, 7 days: of 242 find_products_multi requests reaching this door, the 216
+market-less ones were CI gates and probes, the gateway's own re-invokes and the Aurora chat skill —
+not buyers (see the PIVOTA-Agent follow-ups). Real buyers through agent.pivota.cc already carry
+the declaration.
+
 ### The product-card lanes (2026-09-27)
 
 The card lanes mint the same seeds' cart links, and now ask the same gate with the same table
