@@ -97,6 +97,10 @@ case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (
 # the mirrored catalog rows, which is a different blast radius and gets its own switch.
 : "${EXTERNAL_SEED_DESTINATION_SWEEP:=false}"
 : "${EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE:=false}"
+# The PENDING step (services/destination_dead_suppression): hide a mirror on its first corroborated
+# dead observation, lifted by the next live answer. Only meaningful with RETIRE (the sweep passes
+# suppress=retire). Default false: a new nightly write lane is armed deliberately.
+: "${EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION:=false}"
 case "$WORKERS" in true|false) ;; *) echo "WORKERS must be exactly true or false (got '$WORKERS')" >&2; exit 2 ;; esac
 case "$PAUSED"  in 0|1)         ;; *) echo "PAUSED must be exactly 0 or 1 (got '$PAUSED')" >&2; exit 2 ;; esac
 case "$RELGRAPH_PUBLICATION_WORKER" in true|false) ;; *) echo "RELGRAPH_PUBLICATION_WORKER must be exactly true or false (got '$RELGRAPH_PUBLICATION_WORKER')" >&2; exit 2 ;; esac
@@ -109,6 +113,7 @@ case "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" in true|false) ;; *) echo "STORE_AUD
 case "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_REPROBE_ARMED must be exactly true or false (got '$STORE_AUDIT_COMMERCE_REPROBE_ARMED')" >&2; exit 2 ;; esac
 case "$EXTERNAL_SEED_DESTINATION_SWEEP" in true|false) ;; *) echo "EXTERNAL_SEED_DESTINATION_SWEEP must be exactly true or false (got '$EXTERNAL_SEED_DESTINATION_SWEEP')" >&2; exit 2 ;; esac
 case "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" in true|false) ;; *) echo "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE must be exactly true or false (got '$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE')" >&2; exit 2 ;; esac
+case "$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION" in true|false) ;; *) echo "EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION must be exactly true or false (got '$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION')" >&2; exit 2 ;; esac
 # relgraph-sync WRITES (build + AI review apply). Unlike the lanes above, these are LIVE in prod
 # (armed by hand 2026-09-27, verified green 2026-09-30), and the job's --set-env-vars REPLACES its
 # whole env, so a reconcile that left them out would silently turn the graph back into a dry run.
@@ -127,6 +132,9 @@ if [ "$ENV" = staging ] && [ "$RELGRAPH_SYNC_WRITES" = true ]; then
 fi
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] && [ "$EXTERNAL_SEED_DESTINATION_SWEEP" != true ]; then
   echo "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true requires EXTERNAL_SEED_DESTINATION_SWEEP=true" >&2; exit 2
+fi
+if [ "$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION" = true ] && [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" != true ]; then
+  echo "EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION=true requires EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true" >&2; exit 2
 fi
 if [ "$STORE_AUDIT_UCP_REPROBE_ARMED" = true ] && [ "$STORE_AUDIT_UCP_REPROBE_WORKER" != true ]; then
   echo "STORE_AUDIT_UCP_REPROBE_ARMED=true requires STORE_AUDIT_UCP_REPROBE_WORKER=true" >&2; exit 2
@@ -852,12 +860,12 @@ sched(){ # name schedule job-name [invoker] [paused-on-CREATE: 0|1]
 # task-timeout is raised over the crawl default because per-host pacing is the point: ~1,700 seeds
 # a day is a full corpus pass inside the 7-day staleness window.
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
-  echo "== job: external-seed-destination-sweep (retire=$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE)"
+  echo "== job: external-seed-destination-sweep (retire=$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE pending=$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION)"
   SWEEP_ARGS="-m,jobs.external_seed_destination_sweep,--limit,1700"
   [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] || SWEEP_ARGS="$SWEEP_ARGS,--no-retire"
   mkcrawljob external-seed-destination-sweep "$BACKEND_IMAGE" "$SA" \
     --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
-    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-seed-destination-sweep,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-seed-destination-sweep,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3,EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION_ENABLED=$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION" \
     --task-timeout 3600s \
     --command python --args="$SWEEP_ARGS"
 else

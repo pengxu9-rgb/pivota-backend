@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -47,6 +48,7 @@ from db.database import database
 from services import crawl_politeness
 from services import shopify_edge_pacer
 from services.catalog_offer_suppression import cascade_offer_suppression
+from services import destination_dead_suppression
 from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
 from services.outbound_warm_handoff import extract_product_handle
 
@@ -85,6 +87,17 @@ OBSERVED_VERDICTS = frozenset(set(ALL_VERDICTS) - {VERDICT_UNVERIFIABLE})
 RETIREMENT_STREAK = 2
 RETIREMENT_MIN_GAP = timedelta(hours=24)
 SUPPRESSION_REASON = "external_seed_destination_dead"
+# THE PENDING STEP (services/destination_dead_suppression). The first CORROBORATED confirmed-dead
+# observation hides the mirror under this reason; the next answer from the origin that the page is
+# alive lifts exactly it; retirement converts it to SUPPRESSION_REASON. Written only by the sweep
+# (`suppress=True`) and only with the switch on; lifted whatever the switch says, because a lift
+# can only undo this lane's own reason.
+PENDING_SUPPRESSION_REASON = "external_seed_destination_dead_pending"
+PENDING_SUPPRESSION_FLAG = "EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION_ENABLED"
+
+
+def pending_suppression_enabled() -> bool:
+    return str(os.getenv(PENDING_SUPPRESSION_FLAG) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 PAGE_LIMIT = 250
 MAX_CATALOGUE_PAGES = 80
@@ -373,6 +386,7 @@ async def record_destination_observation(
     observation: DestinationObservation,
     *,
     now: Optional[datetime] = None,
+    suppress: bool = False,
 ) -> Dict[str, Any]:
     """Write one observation. Returns what the row now says.
 
@@ -394,10 +408,14 @@ async def record_destination_observation(
       withdraw a row.
     * any non-dead ANSWER resets the streak to 0. An `unverifiable` does not: it is not
       evidence the link came back.
+
+    And one action (services/destination_dead_suppression): with `suppress=True` (the sweep) and
+    PENDING_SUPPRESSION_FLAG on, a corroborated confirmed-dead observation that leaves the streak at
+    1 hides the mirror under PENDING_SUPPRESSION_REASON; any non-dead answer that resets a streak
+    lifts exactly that reason, switch or no switch. The refresh route never passes `suppress`,
+    and its observations are never corroborated anyway.
     """
     stamp = now or _now()
-    advance_streak = observation.confirmed_dead
-    gap_cutoff = stamp - RETIREMENT_MIN_GAP
 
     row = await database.fetch_one(
         """
@@ -412,37 +430,7 @@ async def record_destination_observation(
         return {"seed_id": seed_id, "status": "missing"}
     current = dict(row)
     streak = int(current.get("destination_failure_streak") or 0)
-    corroborated_dead_at = current.get("destination_corroborated_dead_at")
-    next_corroborated_dead_at = corroborated_dead_at
-
-    if not observation.reached_origin:
-        next_streak = streak
-    elif not advance_streak:
-        next_streak = 0
-        # The streak is gone, so the clock that spaces its steps goes with it.
-        next_corroborated_dead_at = None
-    elif not observation.corroborated:
-        # A CONFIRMED-DEAD PROBE WITH NO SECOND WITNESS HOLDS THE STREAK WHERE IT IS.
-        # It is recorded (the verdict is real and worth serving on) but it may not push the
-        # seed toward retirement on its own, because a 404 from a WAF and a 404 from a deleted
-        # product are the same bytes. Only the sweep, which has just read this brand's
-        # catalogue and found the handle missing, sets `corroborated`. See
-        # `DestinationObservation.corroborated` for why repetition is not a substitute.
-        next_streak = streak
-    else:
-        # A second look inside the gap is not a second observation.
-        anchor = _gap_anchor(current)
-        within_gap = anchor is not None and _as_utc(anchor) > gap_cutoff
-        if not within_gap:
-            next_streak = streak + 1
-            next_corroborated_dead_at = stamp
-        else:
-            next_streak = streak
-            if corroborated_dead_at is None:
-                # A streak earned before this column existed, whose last check of any kind is
-                # too recent to prove the gap. Start its clock HERE, the conservative end: the
-                # streak was really earned earlier, so this can only delay a retirement.
-                next_corroborated_dead_at = stamp
+    next_streak, next_corroborated_dead_at = next_streak_state(current, observation, stamp)
 
     await database.execute(
         """
@@ -473,14 +461,92 @@ async def record_destination_observation(
             "checked_at": stamp,
         },
     )
-    return {
+    retire = should_retire(observation.verdict, next_streak)
+    result: Dict[str, Any] = {
         "seed_id": seed_id,
         "verdict": observation.verdict,
         "http_status": observation.http_status,
         "failure_streak": next_streak,
         "checked_at": stamp.isoformat() if observation.reached_origin else None,
-        "retire": should_retire(observation.verdict, next_streak),
+        "retire": retire,
     }
+    # THE PENDING STEP. Hide on a corroborated confirmed-dead observation that leaves the streak
+    # at 1 or more (retirement itself handles 2); lift on any answer from the origin that the
+    # page is alive, when there was a streak for a pending row to have come from.
+    if (
+        suppress
+        and not retire
+        and observation.confirmed_dead
+        and observation.corroborated
+        and next_streak >= 1
+        and pending_suppression_enabled()
+    ):
+        moved = await destination_dead_suppression.suppress_pending(
+            await _mirror_product_keys(seed_id), reason=PENDING_SUPPRESSION_REASON, stamp=stamp,
+            db=database,  # the SAME handle as the observation write, as retirement does
+        )
+        result["pending_suppressed"] = len(moved["products"])
+    elif observation.reached_origin and not observation.confirmed_dead and streak > 0:
+        moved = await destination_dead_suppression.lift_pending(
+            await _mirror_product_keys(seed_id), reason=PENDING_SUPPRESSION_REASON, db=database,
+        )
+        result["pending_lifted"] = len(moved["products"])
+    return result
+
+
+#: The seed -> mirror link is the PAIR (source_ref, source_system); see retirement below.
+MIRROR_PRODUCT_KEYS_SQL = """
+    SELECT product_key
+      FROM catalog_products
+     WHERE source_ref = :id
+       AND source_system = :source_system
+"""
+
+
+async def _mirror_product_keys(seed_id: str) -> List[str]:
+    rows = await database.fetch_all(
+        MIRROR_PRODUCT_KEYS_SQL, {"id": seed_id, "source_system": MIRROR_SOURCE_SYSTEM}
+    )
+    return [str(r["product_key"]) for r in (rows or [])]
+
+
+def next_streak_state(
+    current: Dict[str, Any], observation: DestinationObservation, stamp: datetime
+) -> Tuple[int, Optional[Any]]:
+    """The failure streak and its clock after `observation`. Pure; one rule for every lane.
+
+    `current` carries `destination_failure_streak`, `destination_corroborated_dead_at` and
+    `destination_checked_at` (the legacy fallback, see `_gap_anchor`). The rules are the ones
+    `record_destination_observation` documents.
+    """
+    streak = int(current.get("destination_failure_streak") or 0)
+    corroborated_dead_at = current.get("destination_corroborated_dead_at")
+    gap_cutoff = stamp - RETIREMENT_MIN_GAP
+
+    if not observation.reached_origin:
+        return streak, corroborated_dead_at
+    if not observation.confirmed_dead:
+        # The streak is gone, so the clock that spaces its steps goes with it.
+        return 0, None
+    if not observation.corroborated:
+        # A CONFIRMED-DEAD PROBE WITH NO SECOND WITNESS HOLDS THE STREAK WHERE IT IS.
+        # It is recorded (the verdict is real and worth serving on) but it may not push the
+        # seed toward retirement on its own, because a 404 from a WAF and a 404 from a deleted
+        # product are the same bytes. Only the sweep, which has just read this brand's
+        # catalogue and found the handle missing, sets `corroborated`. See
+        # `DestinationObservation.corroborated` for why repetition is not a substitute.
+        return streak, corroborated_dead_at
+    # A second look inside the gap is not a second observation.
+    anchor = _gap_anchor(current)
+    within_gap = anchor is not None and _as_utc(anchor) > gap_cutoff
+    if not within_gap:
+        return streak + 1, stamp
+    if corroborated_dead_at is None:
+        # A streak earned before this column existed, whose last check of any kind is
+        # too recent to prove the gap. Start its clock HERE, the conservative end: the
+        # streak was really earned earlier, so this can only delay a retirement.
+        return streak, stamp
+    return streak, corroborated_dead_at
 
 
 def _gap_anchor(current: Dict[str, Any]) -> Optional[Any]:
@@ -532,7 +598,9 @@ async def retire_seed_for_dead_destination(
 
       * `get_sweep_candidates` selects `WHERE status = 'active'`, so a retired seed is never
         looked at again — if the brand puts the product back, nothing here notices;
-      * nothing clears `suppressed_at` / `suppression_reason` for `SUPPRESSION_REASON`.
+      * nothing clears `suppressed_at` / `suppression_reason` for `SUPPRESSION_REASON`. (The
+        PENDING step before it is reversible — see `record_destination_observation` — and a
+        row pending under it is taken over here, not left pending.)
         Compare `services/identity_resolution.REVERT_ROWS_SQL`, which exists precisely so a
         suppression can be lifted.
 
@@ -575,13 +643,16 @@ async def retire_seed_for_dead_destination(
             updated_at = NOW()
         WHERE source_ref = :id
           AND source_system = :source_system
-          AND suppressed_at IS NULL
+          AND (suppressed_at IS NULL OR suppression_reason = :pending_reason)
         RETURNING product_key
         """,
         {
             "id": seed_id,
             "stamp": stamp,
             "reason": SUPPRESSION_REASON,
+            # A row hidden by the pending step is OURS: retirement takes it over (and its pending
+            # offers become ordinary cascaded offers below) instead of leaving it pending forever.
+            "pending_reason": PENDING_SUPPRESSION_REASON,
             # `source_ref` ALONE IS NOT THE LINK. services/external_offer_dual_write states the
             # contract: "catalog_products.source_ref = external_product_seeds.id WITH THIS
             # source_system — that pair is the stable seed->product link", and
@@ -605,9 +676,11 @@ async def retire_seed_for_dead_destination(
     # import. In production they are one object; in a test they are not, and a
     # helper that reached past the caller's handle would write to a different
     # database than the statement above.
-    cascaded = await cascade_offer_suppression(
-        [str(row["product_key"]) for row in (suppressed or [])], db=database
+    gated_keys = [str(row["product_key"]) for row in (suppressed or [])]
+    relabeled = await destination_dead_suppression.relabel_pending_offers(
+        gated_keys, pending_reason=PENDING_SUPPRESSION_REASON, db=database
     )
+    cascaded = relabeled + await cascade_offer_suppression(gated_keys, db=database)
     logger.info(
         "external seed retired for dead destination",
         extra={"seed_id": seed_id, "verdict": observation.verdict,
@@ -685,6 +758,8 @@ async def run_destination_sweep(
         "probed": 0,
         "dead_links_found": 0,
         "seeds_retired": 0,
+        "pending_suppressed": 0,
+        "pending_lifted": 0,
         "verdicts": {v: 0 for v in ALL_VERDICTS},
         "catalogue_status": {},
     }
@@ -732,7 +807,11 @@ async def run_destination_sweep(
                 summary["verdicts"][observation.verdict] = (
                     summary["verdicts"].get(observation.verdict, 0) + 1
                 )
-                result = await record_destination_observation(seed["id"], observation, now=now)
+                result = await record_destination_observation(
+                    seed["id"], observation, now=now, suppress=retire
+                )
+                summary["pending_suppressed"] += int(result.get("pending_suppressed") or 0)
+                summary["pending_lifted"] += int(result.get("pending_lifted") or 0)
                 if observation.confirmed_dead:
                     summary["dead_links_found"] += 1
                 if retire and result.get("retire"):
@@ -784,6 +863,8 @@ __all__: Iterable[str] = (
     "DestinationObservation",
     "RETIREMENT_MIN_GAP",
     "RETIREMENT_STREAK",
+    "PENDING_SUPPRESSION_FLAG",
+    "PENDING_SUPPRESSION_REASON",
     "SUPPRESSION_REASON",
     "VERDICT_DEAD_404",
     "VERDICT_LIVE",
@@ -794,6 +875,8 @@ __all__: Iterable[str] = (
     "classify_destination",
     "coverage_alarm",
     "get_sweep_candidates",
+    "next_streak_state",
+    "pending_suppression_enabled",
     "group_by_host",
     "probe_destination",
     "read_brand_catalogue",
