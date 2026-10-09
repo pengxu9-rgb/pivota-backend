@@ -433,3 +433,129 @@ async def test_the_sweep_queue_skips_retired_seeds(_db):
     await _seed(_db, "eps_inactive", status="inactive")
     candidates = await liveness.get_sweep_candidates(10)
     assert [c["id"] for c in candidates] == ["eps_active"]
+
+
+# --------------------------------------------------------------------------- the pending step
+#
+# catalog_offers is SHARED with the other files of this gate (one database): it is built from the
+# MODEL (tests/model_schema.ensure_model_tables), never as a hand-written narrow table that would
+# poison later files, never dropped, and this file cleans only its own rows, by prefix.
+_OFFER_PREFIX = "offer::dlp_"
+
+
+async def _ensure_offers(db):
+    from db.catalog import catalog_offers
+    from tests.model_schema import ensure_model_tables
+
+    await ensure_model_tables([catalog_offers])
+    await db.execute("DELETE FROM catalog_offers WHERE offer_id LIKE :p", {"p": _OFFER_PREFIX + "%"})
+
+
+async def _offer(db, suffix, product_key, *, reason=None, meta=None):
+    await db.execute(
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, suppressed_at, "
+        "suppression_reason, suppression_metadata) VALUES (:id, :sku, :pk, 'merch_obs_test', "
+        ":at, :reason, CAST(:meta AS jsonb))",
+        {"id": _OFFER_PREFIX + suffix, "sku": f"{product_key}::sku", "pk": product_key,
+         "at": NOW if reason else None, "reason": reason, "meta": meta},
+    )
+
+
+async def _offer_row(db, suffix):
+    return dict(await db.fetch_one(
+        "SELECT * FROM catalog_offers WHERE offer_id = :id", {"id": _OFFER_PREFIX + suffix}))
+
+
+async def _product_row(db, key):
+    return dict(await db.fetch_one("SELECT * FROM catalog_products WHERE product_key = :k", {"k": key}))
+
+
+@pytest.mark.asyncio
+async def test_pending_hides_on_a_corroborated_death_and_a_live_answer_lifts_exactly_it(_db, monkeypatch):
+    from services import external_seed_destination_liveness as liveness
+    from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
+
+    monkeypatch.setenv(liveness.PENDING_SUPPRESSION_FLAG, "1")
+    await _ensure_offers(_db)
+    await _seed(_db, "eps_pend")
+    await _db.execute(
+        "INSERT INTO catalog_products (product_key, source_ref, source_system) VALUES "
+        "('prod::pend', 'eps_pend', :mirror), ('prod::pend_other_door', 'eps_pend', 'some_other_intake_v3')",
+        {"mirror": MIRROR_SOURCE_SYSTEM},
+    )
+    await _offer(_db, "live", "prod::pend")
+    # another lane's decision on the same product, already standing
+    await _offer(_db, "theirs", "prod::pend", reason="duplicate_offer", meta='{"reconcile_pass": "x"}')
+
+    dead = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=True)
+    result = await liveness.record_destination_observation("eps_pend", dead, now=NOW, suppress=True)
+    assert result["failure_streak"] == 1 and result["pending_suppressed"] == 1
+
+    hidden = await _product_row(_db, "prod::pend")
+    assert hidden["suppressed_at"] is not None
+    assert hidden["suppression_reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert (await _product_row(_db, "prod::pend_other_door"))["suppressed_at"] is None
+    offer = await _offer_row(_db, "live")
+    assert offer["suppression_reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert offer["suppression_metadata"] and "catalog_offer_suppression" in str(offer["suppression_metadata"])
+
+    # the refresh, two hours later, finds the page alive: exactly our pending reason is lifted
+    alive = liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None)
+    lifted = await liveness.record_destination_observation("eps_pend", alive, now=NOW + timedelta(hours=2))
+    assert lifted["failure_streak"] == 0 and lifted["pending_lifted"] == 1
+    back = await _product_row(_db, "prod::pend")
+    assert back["suppressed_at"] is None and back["suppression_reason"] is None
+    offer = await _offer_row(_db, "live")
+    assert offer["suppressed_at"] is None and offer["suppression_reason"] is None
+    theirs = await _offer_row(_db, "theirs")
+    assert theirs["suppression_reason"] == "duplicate_offer" and theirs["suppressed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_a_lift_never_clears_a_product_another_lane_suppressed(_db):
+    from services import external_seed_destination_liveness as liveness
+    from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
+
+    await _ensure_offers(_db)
+    await _seed(_db, "eps_theirs", destination_verdict="dead_404", destination_failure_streak=1,
+                destination_checked_at=NOW - timedelta(hours=3))
+    await _db.execute(
+        "INSERT INTO catalog_products (product_key, source_ref, source_system, suppressed_at, suppression_reason) "
+        "VALUES ('prod::theirs', 'eps_theirs', :mirror, :at, 'identity_merge_loser')",
+        {"mirror": MIRROR_SOURCE_SYSTEM, "at": NOW - timedelta(days=1)},
+    )
+    await liveness.record_destination_observation(
+        "eps_theirs", liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), now=NOW)
+    row = await _product_row(_db, "prod::theirs")
+    assert row["suppression_reason"] == "identity_merge_loser" and row["suppressed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_retirement_takes_over_a_pending_row_and_its_offers_on_real_postgres(_db, monkeypatch):
+    from services import external_seed_destination_liveness as liveness
+    from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
+
+    monkeypatch.setenv(liveness.PENDING_SUPPRESSION_FLAG, "1")
+    await _ensure_offers(_db)
+    await _seed(_db, "eps_take")
+    await _db.execute(
+        "INSERT INTO catalog_products (product_key, source_ref, source_system) VALUES ('prod::take', 'eps_take', :m)",
+        {"m": MIRROR_SOURCE_SYSTEM},
+    )
+    await _offer(_db, "take", "prod::take")
+    dead = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=True)
+    await liveness.record_destination_observation("eps_take", dead, now=NOW, suppress=True)
+    second = await liveness.record_destination_observation("eps_take", dead, now=NOW + timedelta(days=1), suppress=True)
+    assert second["retire"] is True and "pending_suppressed" not in second
+    await liveness.retire_seed_for_dead_destination("eps_take", dead, now=NOW + timedelta(days=1))
+
+    row = await _product_row(_db, "prod::take")
+    assert row["suppression_reason"] == liveness.SUPPRESSION_REASON, "a pending row must not stay pending forever"
+    offer = await _offer_row(_db, "take")
+    assert offer["suppressed_at"] is not None
+    assert offer["suppression_reason"] == "product_suppressed"
+    # and a later live answer does NOT resurrect a retired row
+    await liveness.record_destination_observation(
+        "eps_take", liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), now=NOW + timedelta(days=2))
+    assert (await _product_row(_db, "prod::take"))["suppression_reason"] == liveness.SUPPRESSION_REASON
+    await _db.execute("DELETE FROM catalog_offers WHERE offer_id LIKE :p", {"p": _OFFER_PREFIX + "%"})

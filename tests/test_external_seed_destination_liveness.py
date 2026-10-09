@@ -279,6 +279,8 @@ class _FakeDb:
         self.executed.append((query, params))
         if "RETURNING" in str(query).upper():
             return [{"product_key": "prod::pg1", "offer_id": "offer::pg1"}]
+        if "SELECT product_key" in str(query) and "FROM catalog_products" in str(query):
+            return [{"product_key": "prod::pg1"}]  # the seed's mirror row
         return []
 
 
@@ -624,12 +626,15 @@ class _SweepClient:
 def _sweep(monkeypatch, seeds, client, **kwargs):
     recorded: List[Any] = []
     retired: List[str] = []
+    suppress_flags: List[bool] = []
+    _sweep.suppress_flags = suppress_flags
 
     async def fake_candidates(limit):
         return seeds
 
-    async def fake_record(seed_id, observation, *, now=None):
+    async def fake_record(seed_id, observation, *, now=None, suppress=False):
         recorded.append((seed_id, observation))
+        suppress_flags.append(suppress)
         return {"seed_id": seed_id, "verdict": observation.verdict, "retire": False}
 
     async def fake_retire(seed_id, observation, *, now=None):
@@ -954,8 +959,10 @@ def test_retirement_cascades_to_the_products_offers(monkeypatch):
     mirror_sql = next(sql for sql, _ in db.executed if "catalog_products" in sql)
     assert "RETURNING product_key" in mirror_sql
 
+    # The CASCADE statement (a pending row's offers are relabeled by a separate statement first).
     offer_sql, offer_params = next(
-        (sql, params) for sql, params in db.executed if "catalog_offers" in sql
+        (sql, params) for sql, params in db.executed
+        if "catalog_offers" in sql and "suppressed_at = NOW()" in sql
     )
     assert "suppressed_at = NOW()" in offer_sql
     assert "suppression_reason" in offer_sql
@@ -965,4 +972,117 @@ def test_retirement_cascades_to_the_products_offers(monkeypatch):
     )
     assert offer_params["reason"] == "product_suppressed"
     assert offer_params["product_keys"] == ["prod::pg1"]
-    assert result["offers_suppressed"] == 1
+    # this fake answers every RETURNING with one row: one relabeled pending offer + one cascaded
+    assert result["offers_suppressed"] == 2
+
+
+# ------------------------------------------------- the pending step: hide on the first corroborated death
+
+def _statements(db, needle):
+    return [(sql, params) for sql, params in db.executed if needle in " ".join(str(sql).split())]
+
+
+def test_a_first_corroborated_death_hides_the_mirror_under_the_pending_reason(monkeypatch):
+    monkeypatch.setenv(liveness.PENDING_SUPPRESSION_FLAG, "1")
+    row = {"destination_checked_at": None, "destination_corroborated_dead_at": None,
+           "destination_verdict": None, "destination_failure_streak": 0, "status": "active"}
+    db = _FakeDb(row)
+    monkeypatch.setattr(liveness, "database", db)
+    result = _run(liveness.record_destination_observation(
+        "eps_1", _CORROBORATED_DEAD, now=NOW, suppress=True))
+    assert result["failure_streak"] == 1 and result["retire"] is False
+    hide = _statements(db, "UPDATE catalog_products SET suppressed_at = :stamp")
+    assert len(hide) == 1
+    assert hide[0][1]["reason"] == liveness.PENDING_SUPPRESSION_REASON
+    cascade = _statements(db, "UPDATE catalog_offers SET suppressed_at = NOW()")
+    assert cascade and cascade[0][1]["reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert result["pending_suppressed"] == 1
+
+
+@pytest.mark.parametrize(
+    "flag, suppress, observation, streak",
+    [
+        (None, True, None, 0),          # switch off
+        ("1", False, None, 0),          # not the sweep (the refresh route, or --no-retire)
+        ("1", True, "uncorroborated", 0),  # no second witness
+        ("1", True, "uncorroborated", 1),  # no second witness, on a seed already at streak 1
+        ("1", True, None, 1),           # this step retires: retirement does it, not pending
+    ],
+)
+def test_nothing_is_hidden_without_switch_sweep_witness_or_when_retiring(monkeypatch, flag, suppress, observation, streak):
+    if flag:
+        monkeypatch.setenv(liveness.PENDING_SUPPRESSION_FLAG, flag)
+    else:
+        monkeypatch.delenv(liveness.PENDING_SUPPRESSION_FLAG, raising=False)
+    obs = _REFRESH_DEAD if observation == "uncorroborated" else _CORROBORATED_DEAD
+    row = {"destination_checked_at": NOW - timedelta(days=3),
+           "destination_corroborated_dead_at": NOW - timedelta(days=3) if streak else None,
+           "destination_verdict": liveness.VERDICT_DEAD_404, "destination_failure_streak": streak,
+           "status": "active"}
+    db = _FakeDb(row)
+    monkeypatch.setattr(liveness, "database", db)
+    result = _run(liveness.record_destination_observation("eps_1", obs, now=NOW, suppress=suppress))
+    assert _statements(db, "UPDATE catalog_products") == []
+    assert "pending_suppressed" not in result
+
+
+@pytest.mark.parametrize("flag", [None, "1"])
+def test_a_live_answer_after_a_streak_lifts_the_pending_reason_switch_or_no_switch(monkeypatch, flag):
+    if flag:
+        monkeypatch.setenv(liveness.PENDING_SUPPRESSION_FLAG, flag)
+    else:
+        monkeypatch.delenv(liveness.PENDING_SUPPRESSION_FLAG, raising=False)
+    row = {"destination_checked_at": NOW - timedelta(hours=3),
+           "destination_corroborated_dead_at": NOW - timedelta(hours=20),
+           "destination_verdict": liveness.VERDICT_DEAD_404, "destination_failure_streak": 1,
+           "status": "active"}
+    db = _FakeDb(row)
+    monkeypatch.setattr(liveness, "database", db)
+    result = _run(liveness.record_destination_observation(
+        "eps_1", liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), now=NOW))
+    lift = _statements(db, "UPDATE catalog_products SET suppressed_at = NULL")
+    assert len(lift) == 1
+    assert lift[0][1]["reason"] == liveness.PENDING_SUPPRESSION_REASON
+    sql = " ".join(lift[0][0].split())
+    assert "suppression_reason = CAST(:reason AS text)" in sql, "a lift must be scoped to OUR reason"
+    revert = _statements(db, "UPDATE catalog_offers SET suppressed_at = NULL")
+    assert revert and revert[0][1]["reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert result["pending_lifted"] == 1
+
+
+@pytest.mark.parametrize(
+    "observation, streak",
+    [
+        (liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), 0),  # nothing to lift
+        (liveness.DestinationObservation(liveness.VERDICT_UNVERIFIABLE, 429, None, "bot_challenge"), 1),
+        (_REFRESH_DEAD, 1),
+    ],
+)
+def test_no_lift_without_a_streak_or_without_an_answer_that_the_page_is_alive(monkeypatch, observation, streak):
+    row = {"destination_checked_at": NOW - timedelta(hours=3), "destination_corroborated_dead_at": None,
+           "destination_verdict": liveness.VERDICT_DEAD_404, "destination_failure_streak": streak,
+           "status": "active"}
+    db = _FakeDb(row)
+    monkeypatch.setattr(liveness, "database", db)
+    _run(liveness.record_destination_observation("eps_1", observation, now=NOW))
+    assert _statements(db, "UPDATE catalog_products") == []
+
+
+def test_retirement_takes_over_a_pending_row_and_relabels_its_offers(monkeypatch):
+    db = _FakeDb({"status": "active"})
+    monkeypatch.setattr(liveness, "database", db)
+    _run(liveness.retire_seed_for_dead_destination("eps_1", _CORROBORATED_DEAD, now=NOW))
+    mirror_sql, mirror_params = next((sql, p) for sql, p in db.executed if "UPDATE catalog_products" in sql)
+    assert "suppression_reason = :pending_reason" in " ".join(mirror_sql.split())
+    assert mirror_params["pending_reason"] == liveness.PENDING_SUPPRESSION_REASON
+    relabel = _statements(db, "UPDATE catalog_offers SET suppression_reason = CAST(:final_reason AS text)")
+    assert relabel and relabel[0][1]["pending_reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert relabel[0][1]["final_reason"] == "product_suppressed"
+
+
+@pytest.mark.parametrize("retire", [True, False])
+def test_the_sweep_asks_for_the_pending_step_exactly_when_it_may_retire(monkeypatch, retire):
+    seeds = [{"id": "eps_gone", "canonical_url": "https://brand.com/products/gone", "domain": "brand.com"}]
+    client = _SweepClient(["other"], {"https://brand.com/products/gone": httpx.Response(404)})
+    _sweep(monkeypatch, seeds, client, retire=retire)
+    assert _sweep.suppress_flags == [retire]
