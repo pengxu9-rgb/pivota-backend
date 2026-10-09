@@ -1328,8 +1328,9 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
     return out
 
 
-#: A retire that wrote nothing and needs a human: its error, or a read-back that disagreed with the plan.
-RETIRE_FAILED_OUTCOMES = ("error", "readback_failed")
+#: A retire that needs a human: its error (wrote nothing), a read-back that disagreed with the plan, or a
+#: committed retire whose rows' catalog_row_trust was not refreshed (they stay publicly listed).
+RETIRE_FAILED_OUTCOMES = ("error", "readback_failed", "trust_not_refreshed")
 
 
 def _retire_counts(p: Dict[str, Any]) -> Dict[str, int]:
@@ -1410,6 +1411,9 @@ async def _retire_stale_brand(job: Dict[str, Any], run_id: str, records: List[Di
     except Exception as exc:  # noqa: BLE001 -- the write committed; an unreadable result is for a human
         out["readback"] = {"ok": False, "problems": [f"read-back raised {type(exc).__name__}: {exc}"[:300]]}
     out["outcome"] = "retired" if out["readback"]["ok"] and "post_write_error" not in out else "readback_failed"
+    if out["outcome"] == "retired" and out["counts"].get("trust_problems"):
+        # The tombstones are right; only their trust rows lag. Not a revert -- a re-run of the refresh.
+        out["outcome"] = "trust_not_refreshed"
     return out
 
 
@@ -1436,11 +1440,17 @@ def _retire_reason(r: Dict[str, Any]) -> str:
     if r["outcome"] == "deferred":
         return (f"{head}retire DEFERRED, nothing retired ({r.get('error')}); run "
                 f"scripts/retire_superseded_brand_keys.py --stale-brand by hand")
+    if r["outcome"] == "trust_not_refreshed":
+        return (f"{head}retired {r['counts']['products']} key(s) ({r['retire_run_id']}) but their catalog_row_trust "
+                f"was not refreshed: {r['counts']['trust_problems'][:3]}; they stay publicly listed until "
+                f"retire_superseded_brand_keys refresh-trust --ingest-run <this run> (or the trust backfill cron)")
     if r["outcome"] == "readback_failed":
         return (f"{head}retired {r['counts']['products']} key(s) ({r['retire_run_id']}) but the read-back "
                 f"disagrees: {r['readback']['problems'][:3]}; revert with retire_superseded_brand_keys revert "
                 f"--ingest-run <this run>, THEN services.catalog_offer_suppression.revert_offer_suppression("
-                f"<the manifest's product_keys>) -- restored rows have no live offers until it runs")
+                f"<the manifest's product_keys>) -- restored rows have no live offers until it runs -- THEN "
+                f"retire_superseded_brand_keys refresh-trust --ingest-run <this run>, or their trust stays blocked "
+                f"until the trust backfill cron")
     return f"{head}retire FAILED, nothing retired: {r.get('error')}"
 
 

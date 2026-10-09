@@ -58,6 +58,22 @@ DRY-RUN BY DEFAULT. Nothing is written without --apply.
   # 3. undo the whole run
   DATABASE_URL=... python3 scripts/retire_superseded_brand_keys.py \
       revert --manifest /tmp/retire_misshaus.json
+
+TRUST. A tombstone is invisible to discovery only once the row's catalog_row_trust is recomputed
+(catalog_trust_policy reads any suppression_reason as blocked ROW_TOMBSTONED); until then the gateway's public
+discovery, entity feed and sitemap keep serving it on its old `public` decision. So `write_retire` and
+`revert_manifest` recompute trust for exactly the keys they changed, right after their transaction commits
+(measured 2026-09-28: retire_b9cd3948eef2 tombstoned 26 Tower 28 rows at 14:02Z, their trust caught up at
+18:19Z on the 6-hourly backfill cron). A trust refresh that fails is printed and logged at ERROR and returned in
+the counts; re-run it alone with
+
+  DATABASE_URL=... python3 scripts/retire_superseded_brand_keys.py \
+      refresh-trust --manifest /tmp/retire_misshaus.json      # or --ingest-run rir_...
+
+`refresh-trust` needs no --apply: it changes no catalog row, only recomputes the derived trust rows from the rows
+as they are (idempotent, what the backfill cron does on its own schedule). Run it again AFTER
+services.catalog_offer_suppression.revert_offer_suppression when undoing a run: a restored row whose offers are
+still suppressed is recomputed blocked (no priced offer) by the revert itself.
 """
 
 from __future__ import annotations
@@ -65,6 +81,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 import uuid
@@ -82,7 +99,10 @@ from services.catalog_enrichment_agent.ingestion import derive_product_key  # no
 from services.catalog_offer_suppression import (  # noqa: E402
     cascade_for_suppressed_product_keys,
 )
+from services.catalog_row_trust_upserter import upsert_catalog_row_trust_many  # noqa: E402
 from services.curated_brand_feed import records_for_brand  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 REASON = "brand_attribution_key_supersede"
 
@@ -157,6 +177,20 @@ RETURNING product_key
 REACTIVATE_SEED_SQL = """
 UPDATE external_product_seeds SET status = :status, updated_at = NOW()
 WHERE id = :id AND attached_product_key = ANY(:keys)
+"""
+
+
+# The manifest keys that still carry THIS run's tombstone (not reverted, not re-retired by another run).
+STILL_RETIRED_SQL = """
+SELECT product_key FROM catalog_products
+WHERE product_key = ANY(:keys) AND suppression_reason = :reason AND suppression_metadata ->> 'run_id' = :run_id
+"""
+
+# A retired key whose PRODUCT trust row still reads public after the refresh: the surfaces that gate on
+# serving_decision = 'public' (PIVOTA-Agent catalogServingIndex) would still list it. Joined the way they join.
+PUBLIC_TRUST_SQL = """
+SELECT subject_key FROM catalog_row_trust
+WHERE subject_type = 'product' AND subject_key = ANY(:keys) AND serving_decision = 'public'
 """
 
 
@@ -382,9 +416,9 @@ def prepare_retire(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return {"run_id": run_id, "keys": keys, "metadata": metadata, "manifest": manifest}
 
 
-async def write_retire(prepared: Dict[str, Any]) -> Dict[str, int]:
+async def write_retire(prepared: Dict[str, Any]) -> Dict[str, Any]:
     """The tombstone write, one transaction: rows, their active seeds, the offer cascade. Raises (rolled back)
-    unless every key ends suppressed."""
+    unless every key ends suppressed. Then, after the commit, the retired rows' trust (`refresh_trust`)."""
     keys = prepared["keys"]
     async with database.transaction():
         await database.execute(SUPPRESS_SQL, {"reason": REASON, "metadata": prepared["metadata"], "keys": keys})
@@ -394,7 +428,46 @@ async def write_retire(prepared: Dict[str, Any]) -> Dict[str, int]:
         unsuppressed = [r["product_key"] for r in after if not r["suppression_reason"]]
         if unsuppressed:
             raise RuntimeError(f"tombstone did not land on {len(unsuppressed)} row(s): {unsuppressed[:5]}")
-    return {"products": len(keys), "seeds": len(seed_rows), "offers": len(offer_ids)}
+    return {"products": len(keys), "seeds": len(seed_rows), "offers": len(offer_ids),
+            **await refresh_trust(keys, run_id=prepared["run_id"], after="retire", retired=keys)}
+
+
+async def refresh_trust(keys: List[str], *, run_id: str, after: str, retired: List[str]) -> Dict[str, Any]:
+    """Recompute catalog_row_trust for exactly the rows a run just tombstoned (or restored), with the backend's
+    own upserter so the policy is not restated here.
+
+    AFTER the commit, never inside it: a trust statement that fails inside the transaction aborts it, and the
+    upserter swallows the error -- so the COMMIT would quietly roll the retire back. And never raises: the retire
+    has committed, and the drain reads a raise from `write_retire` as "nothing retired"
+    (services.retailer_ingest.pipeline._retire_stale_brand). Matches withdraw_catalog_rows and brand_relabel,
+    which refresh trust after their write as well.
+
+    Loud instead: a key the upserter did not rewrite, or a `retired` key still `public`, is printed, logged at
+    ERROR and returned as `trust_problems` (the drain fails the job on it). The rows then keep their old decision
+    until `refresh-trust` is re-run or jobs/catalog_row_trust_backfill_cron.py reaches them."""
+    out: Dict[str, Any] = {"trust": 0}
+    if not keys:
+        return out
+    problems: List[str] = []
+    try:
+        out["trust"] = int(await upsert_catalog_row_trust_many(db=database, product_keys=keys) or 0)
+        if out["trust"] < len(keys):
+            problems.append(f"{len(keys) - out['trust']} of {len(keys)} key(s) not rewritten")
+        if retired:
+            still = sorted(r["subject_key"] for r in await database.fetch_all(PUBLIC_TRUST_SQL, {"keys": retired}))
+            if still:
+                problems.append(f"{len(still)} retired key(s) still public: {still[:5]}")
+    except Exception as exc:  # noqa: BLE001 -- the write committed; a trust failure is reported, never raised
+        problems.append(f"{type(exc).__name__}: {exc}"[:300])
+    if problems:
+        out["trust_problems"] = problems
+        msg = (f"catalog_row_trust refresh FAILED after {after} {run_id}: "
+               f"{'; '.join(problems)}. The rows keep their old trust decision until "
+               f"`retire_superseded_brand_keys.py refresh-trust` is re-run for this run, or the backfill cron "
+               f"reaches them.")
+        logger.error(msg)
+        print(f"  ! {msg}", file=sys.stderr)
+    return out
 
 
 async def apply(p: Dict[str, Any], manifest_path: str) -> Dict[str, Any]:
@@ -434,6 +507,11 @@ async def revert(manifest_path: str) -> None:
 
 async def revert_ingest_run(ingest_run_id: str) -> None:
     """Revert the old-spelling retire a drain apply run did, from the manifest it stored before writing."""
+    await revert_manifest(await ingest_run_manifest(ingest_run_id))
+
+
+async def ingest_run_manifest(ingest_run_id: str) -> Dict[str, Any]:
+    """The manifest a drain apply run stored before its retire wrote; exits when that retire never wrote."""
     row = await database.fetch_one(INGEST_RUN_MANIFEST_SQL, {"id": ingest_run_id})
     m = row and row["manifest"]
     if isinstance(m, str):
@@ -442,7 +520,21 @@ async def revert_ingest_run(ingest_run_id: str) -> None:
         raise SystemExit(f"no stale-brand retire manifest on ingest run {ingest_run_id}")
     if row["outcome"] in UNWRITTEN_OUTCOMES:
         raise SystemExit(f"ingest run {ingest_run_id}'s retire was {row['outcome']!r}: it wrote nothing to revert")
-    await revert_manifest(m)
+    return m
+
+
+async def refresh_trust_for_manifest(m: Dict[str, Any]) -> Dict[str, Any]:
+    """Re-run only the trust refresh for a run's keys -- the follow-up a failed `refresh_trust` asks for, and the
+    last step of a revert (after revert_offer_suppression). Every key the manifest names, retired or since
+    restored: the upserter derives each from the row as it is now. The keys that still carry this run's tombstone
+    must end non-public, the same check `write_retire` makes."""
+    keys = [row["product_key"] for row in m["products"]]
+    retired = [r["product_key"] for r in await database.fetch_all(STILL_RETIRED_SQL, {
+        "keys": keys, "reason": m.get("reason") or REASON, "run_id": m["run_id"]})]
+    out = await refresh_trust(keys, run_id=m["run_id"], after="refresh-trust", retired=retired)
+    print(f"trust {'refresh FAILED' if out.get('trust_problems') else 'refreshed'} for run {m['run_id']} "
+          f"({len(retired)} of {len(keys)} key(s) still retired by it): {out}")
+    return out
 
 
 async def revert_manifest(m: Dict[str, Any]) -> None:
@@ -477,17 +569,25 @@ async def revert_manifest(m: Dict[str, Any]) -> None:
         for s in m.get("seeds") or []:
             await database.execute(REACTIVATE_SEED_SQL, {"id": s["id"], "status": s["prior_status"],
                                                          "keys": restored})
+    # After the commit, the rows it restored only (see refresh_trust): a key left alone keeps its trust row.
+    trust = await refresh_trust(restored, run_id=m["run_id"], after="revert", retired=[])
     skipped = len(m["products"]) - len(restored) - len(owned)
     print(f"reverted run {m['run_id']}: {len(restored)} product(s)"
           + (f" ({skipped} no longer carry this run's tombstone, left alone)" if skipped else "")
           + (f" ({len(owned)} skipped: a live listing owns the URL)" if owned else "")
-          + f", seeds on those rows. "
-          "Offer suppression is reverted by services.catalog_offer_suppression.revert_offer_suppression.")
+          + f", seeds on those rows, trust on {trust['trust']}. "
+          "Offer suppression is reverted by services.catalog_offer_suppression.revert_offer_suppression; until it "
+          "runs the restored rows' trust stays blocked (no priced offer). After it, re-run "
+          f"`retire_superseded_brand_keys.py refresh-trust` for run {m['run_id']}.")
 
 
 async def run(args: argparse.Namespace) -> int:
     await database.connect()
     try:
+        if args.command == "refresh-trust":
+            m = (await ingest_run_manifest(args.ingest_run) if args.ingest_run
+                 else json.loads(Path(args.manifest).read_text()))
+            return 1 if (await refresh_trust_for_manifest(m)).get("trust_problems") else 0
         if args.command == "revert":
             if args.ingest_run:
                 await revert_ingest_run(args.ingest_run)
@@ -511,7 +611,7 @@ async def run(args: argparse.Namespace) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("command", nargs="?", default="plan", choices=["plan", "revert"])
+    p.add_argument("command", nargs="?", default="plan", choices=["plan", "revert", "refresh-trust"])
     p.add_argument("--domain")
     p.add_argument("--brand")
     p.add_argument("--category", default="beauty/skincare")
@@ -522,12 +622,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--apply", action="store_true")
     p.add_argument("--manifest")
     p.add_argument("--ingest-run", dest="ingest_run",
-                   help="revert: the retailer-ingest apply run (rir_...) whose old-spelling retire to undo")
+                   help="revert / refresh-trust: the retailer-ingest apply run (rir_...) whose old-spelling retire "
+                        "to act on")
     a = p.parse_args(argv)
-    if a.command != "revert" and not (a.domain and a.brand):
+    if a.command == "plan" and not (a.domain and a.brand):
         p.error("--domain and --brand are required")
-    if a.command == "revert" and not (a.manifest or a.ingest_run):
-        p.error("revert requires --manifest or --ingest-run")
+    if a.command != "plan" and not (a.manifest or a.ingest_run):
+        p.error(f"{a.command} requires --manifest or --ingest-run")
     return asyncio.run(run(a))
 
 
