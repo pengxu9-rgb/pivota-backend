@@ -449,7 +449,7 @@ async def derive_seed_seller(
     destination_domain: Optional[str],
     source_system: str,
     primary_platform: Optional[str] = None,
-    brand_official_domain: Optional[str] = None,
+    verified_storefront_domain: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Derive `(seller_ref, seed_kind)` for a NEW external_product_seeds row.
 
@@ -457,9 +457,9 @@ async def derive_seed_seller(
       - `(anchor_merchant_id, 'self')` when the destination belongs to the anchor
         AND is not a known retailer/marketplace host;
       - `(observed_seller_id, 'self')` when there is no owning anchor but the
-        destination IS ``brand_official_domain`` — the brand's own storefront the
-        caller wrote as source_role=brand_official — and is not a known-retailer
-        host. The observed seller is then the brand's own D2C seller;
+        destination IS ``verified_storefront_domain`` — a storefront the
+        retailer-ingest drain PROVED is the brand's own — and is not a
+        known-retailer host. The observed seller is then the brand's own D2C seller;
       - `(observed_seller_id, 'cross')` when it belongs to a different seller OR is
         a known-retailer host (a marketplace is never a brand's own store, so it
         must not become a brand-official 'self'/public seed);
@@ -470,16 +470,18 @@ async def derive_seed_seller(
     the seed is attached to (see ``anchor_merchant_from_product_key``); pass None
     for a standalone seed with no anchor (→ CROSS).
 
-    ``brand_official_domain`` is the storefront host of a planned row stamped
-    source_role=brand_official (Path C, catalog_enrichment_agent.apply). Such a row
-    has a synthetic `pk_<hash>` key, so it never has a tenant anchor, and without
-    this it was filed CROSS: all 3,540 IDENTITY_LIVE_READ_DISABLED rows in prod on
-    2026-09-28 were merch_obs_ + 'cross', 1,937 of them the brand's own store
-    (tartecosmetics.com, stilacosmetics.com, tower28beauty.com, ...). 'cross' is
-    what strips the observed-seller identity-coverage exemption in
-    catalog_trust_policy, so every brand-official cohort landed shadow. The match
-    is on the registrable domain of THIS seed's destination, not on the role
-    alone: a brand-official row's offer from another host stays CROSS.
+    ``verified_storefront_domain`` is the host of a storefront the drain proved
+    (catalog_enrichment_agent.apply.VerifiedBrandStorefront: Tier A/B or a
+    human-accepted brand_official_domain_unproven flag), passed only for seeds of
+    a planned row of a proven brand on that host. A Path-C row has a synthetic
+    `pk_<hash>` key, so it never has a tenant anchor, and without this it was filed
+    CROSS: all 3,540 IDENTITY_LIVE_READ_DISABLED rows in prod on 2026-09-28 were
+    merch_obs_ + 'cross', 1,937 of them the brand's own store. 'cross' strips the
+    observed-seller identity-coverage exemption in catalog_trust_policy. Callers
+    must NOT pass a host on source_role alone: the curated onboard queue defaults
+    to brand_official with no domain proof, and is_known_retailer misses resellers.
+    The match is on the registrable domain of THIS seed's destination: an offer
+    from another host stays CROSS.
 
     No-fallback (ADR-009 D3): a missing destination logs at DEBUG and returns
     NULL (there is simply nothing to key a seller on — not an error, and A9-4
@@ -516,7 +518,7 @@ async def derive_seed_seller(
     ):
         return (anchor, "self")
 
-    own_storefront = etld1(brand_official_domain) if brand_official_domain else None
+    own_storefront = etld1(verified_storefront_domain) if verified_storefront_domain else None
     seed_kind = (
         "self"
         if own_storefront and own_storefront == registrable and not is_known_retailer(registrable)

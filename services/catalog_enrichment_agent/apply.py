@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from services.catalog_enrichment_agent.bulk_writer import bulk_upsert
 from services.catalog_enrichment_agent.ingestion import AGENT_VERSION, _domain_of, derive_offer_id
@@ -524,14 +525,14 @@ def _seed_with_served_canonical(seed: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _derive_seed_seller_for_plan_row(
-    seed: Dict[str, Any], *, brand_official_domain: Optional[str] = None,
+    seed: Dict[str, Any], *, verified_storefront_domain: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Derive `(seller_ref, seed_kind)` for one enrichment plan seed row (ADR-009
     D3). Brand comes from the seed_data JSON (`_build_seed_inserts` stores it),
     the destination from `domain`/`destination_url`, and the anchor from
     `attached_product_key` (synthetic here → no tenant anchor → CROSS, unless the
-    seed's destination is the brand-official storefront of the planned row it
-    attaches to: see `_brand_official_storefronts`)."""
+    seed's destination is the VERIFIED brand storefront of the planned row it
+    attaches to: see `_verified_storefronts_by_key`)."""
     import json as _json
 
     from services.seller_identity import (
@@ -553,24 +554,63 @@ async def _derive_seed_seller_for_plan_row(
         brand=brand,
         destination_domain=seed.get("domain") or seed.get("destination_url"),
         source_system=str(seed.get("tool") or AGENT_VERSION),
-        brand_official_domain=brand_official_domain,
+        verified_storefront_domain=verified_storefront_domain,
     )
 
 
-def _brand_official_storefronts(pdps: List[Dict[str, Any]]) -> Dict[str, str]:
-    """product_key -> storefront host, for the planned rows a brand's own storefront writes.
+def brand_official_label(brand: Any) -> str:
+    """One brand's label as the drain's domain proof keys it: whitespace collapsed, casefolded. NOT
+    normalize_brand, which strips every non-ASCII letter (설화수 and 헤라 would share one label, and one
+    acceptance would pass both). The proof (retailer_ingest.pipeline.brand_official_domain_review) and
+    the consumer below (_verified_storefronts_by_key) both call this; neither restates it."""
+    return " ".join(str(brand or "").split()).casefold()
 
-    A seed attaches to its planned row by attached_product_key. When that row is
-    source_role=brand_official and the seed's destination is the row's own
-    storefront, the seed is the brand selling on its own store: 'self', not 'cross'
-    (derive_seed_seller). 'cross' shadowed every brand-official cohort in trust
-    (IDENTITY_LIVE_READ_DISABLED, 2026-09-28)."""
+
+@dataclass(frozen=True)
+class VerifiedBrandStorefront:
+    """A storefront the retailer-ingest drain PROVED is the brand's own, for these brands only.
+
+    Built by retailer_ingest.pipeline.verified_brand_storefront from the run's
+    checks.brand_official_evidence: a brand is in `brand_labels` when Tier A (the domain's name is the
+    brand) or Tier B (the store's /meta.json names it for the market) admitted it, or a human accepted
+    its brand_official_domain_unproven flag. source_role=brand_official alone is NOT proof: the curated
+    onboard queue defaults a role-less job to brand_official and auto-applies with no domain check, and
+    is_known_retailer misses resellers (luxiface.com, tripletraders.com, perfumania.com ...)."""
+
+    host: str
+    brand_labels: FrozenSet[str]
+
+
+def _verified_storefronts_by_key(
+    pdps: List[Dict[str, Any]], verified: Optional[VerifiedBrandStorefront],
+) -> Dict[str, str]:
+    """product_key -> verified storefront host, for the planned rows a PROVEN brand storefront writes.
+
+    A seed attaches to its planned row by attached_product_key, and is looked up by its OWN row's key:
+    a cohort can hold rows of a brand the drain did not prove on the same host (a multi-brand store),
+    and those keep 'cross'. A row qualifies only when it is source_role=brand_official, sits on the
+    verified host, and its brand is one the drain proved. With no proof (every caller but the drain's
+    apply) the map is empty and every seed derives exactly as before: 'cross'.
+
+    Measured 2026-09-28: all 3,540 IDENTITY_LIVE_READ_DISABLED rows were merch_obs_ + 'cross', 1,937 of
+    them the brand's own store, because Path C's synthetic pk_<hash> never has a tenant anchor.
+
+    MIXED KINDS UNDER ONE KEY: a verified row can also carry a seed on another registrable domain (the
+    brand's second storefront attaching its offer, _guard_canonical_owner); that seed stays 'cross'.
+    catalog_row_trust reads ONE seed per minted row (catalog_row_trust_upserter.minted_seed_one: a seed
+    with an identity listing first, then SEED_PICK_ORDER), so such a row's trust follows that pick."""
+    if verified is None or not verified.host or not verified.brand_labels:
+        return {}
     out: Dict[str, str] = {}
     for pdp in pdps or []:
         key = str(pdp.get("product_key") or "")
-        host = _storefront_host(pdp.get("source_domain"))
-        if key and host and _is_brand_official_pdp(pdp):
-            out[key] = host
+        if (
+            key
+            and _is_brand_official_pdp(pdp)
+            and _storefront_host(pdp.get("source_domain")) == verified.host
+            and brand_official_label(pdp.get("brand")) in verified.brand_labels
+        ):
+            out[key] = verified.host
     return out
 
 
@@ -2118,6 +2158,7 @@ async def apply_ingest_plan(
     batch: bool = False,
     primary_readiness: bool = False,
     market: str = DEFAULT_CANONICAL_MARKET,
+    verified_storefront: Optional[VerifiedBrandStorefront] = None,
 ) -> Dict[str, Any]:
     """Persist an ingest plan, optionally handing curated rows to serving policy.
 
@@ -2133,7 +2174,8 @@ async def apply_ingest_plan(
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply
 
     preflight = require_primary_plan(plan) if primary_readiness else None
-    counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch, market=market)
+    counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch, market=market,
+                                      verified_storefront=verified_storefront)
     if not primary_readiness:
         return counts
     from services.catalog_enrichment_agent.primary_readiness import (
@@ -2161,6 +2203,7 @@ async def _apply_ingest_plan(
     db: Any = None,
     batch: bool = False,
     market: str = DEFAULT_CANONICAL_MARKET,
+    verified_storefront: Optional[VerifiedBrandStorefront] = None,
 ) -> Dict[str, int]:
     """Execute an ingest plan (from `ingest_validated_jsonl`) against the DB in FK
     order. Returns counts. Per-row failures are logged and skipped (never abort the
@@ -2185,7 +2228,8 @@ async def _apply_ingest_plan(
     owner_counts = {**owner_counts, **stage_counts}
 
     if batch:
-        counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database)
+        counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database,
+                                                  verified_storefront=verified_storefront)
         counts.update(owner_counts)
         return counts
 
@@ -2308,7 +2352,7 @@ async def _apply_ingest_plan(
                 logger.exception("insert offer failed for offer_id=%s — %s", offer.get("offer_id"), exc)
 
     # 5. external_product_seeds — audit + legacy compatibility.
-    own_storefronts = _brand_official_storefronts(pdps)
+    own_storefronts = _verified_storefronts_by_key(pdps, verified_storefront)
     for seed in seeds:
         try:
             # ADR-009 D3 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY
@@ -2319,7 +2363,7 @@ async def _apply_ingest_plan(
             # when unmintable (derive logs loudly).
             seed = _seed_with_served_canonical(seed)
             seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(
-                seed, brand_official_domain=own_storefronts.get(str(seed.get("attached_product_key") or "")),
+                seed, verified_storefront_domain=own_storefronts.get(str(seed.get("attached_product_key") or "")),
             )
             await database.execute(
                 _SEED_UPSERT_SQL,
@@ -2350,6 +2394,7 @@ async def _apply_ingest_plan_batched(
     *,
     batch_label: str,
     database: Any,
+    verified_storefront: Optional[VerifiedBrandStorefront] = None,
 ) -> Dict[str, int]:
     """Round-trip-eliminating executor. Same SQL constants, same offer guard, same
     WriterAuditAccumulator as the per-row path; each stage upserts in chunked
@@ -2508,12 +2553,12 @@ async def _apply_ingest_plan_batched(
 
     # 5. external_product_seeds — per-row seller derivation (ADR-009 D3), then bulk.
     seed_rows = []
-    own_storefronts = _brand_official_storefronts(pdps)
+    own_storefronts = _verified_storefronts_by_key(pdps, verified_storefront)
     for seed in seeds:
         seed = _seed_with_served_canonical(seed)
         try:
             seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(
-                seed, brand_official_domain=own_storefronts.get(str(seed.get("attached_product_key") or "")),
+                seed, verified_storefront_domain=own_storefronts.get(str(seed.get("attached_product_key") or "")),
             )
         except Exception as exc:  # noqa: BLE001 — same skip semantics as the per-row
             # path: one seed's derivation failure must not abort the apply AFTER

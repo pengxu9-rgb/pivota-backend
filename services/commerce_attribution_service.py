@@ -1522,10 +1522,13 @@ async def close_external_order_conversion(
 
     # The edge's conversion SUBJECT (merchant_id on the edge) is the SELLER
     # (seller_ref) when the click is seller-keyed, else the converting store's own
-    # tenant merchant (== today's behavior). SELF seeds have
+    # tenant merchant (== today's behavior). An ANCHORED self seed has
     # seller_ref==anchor==converting merchant, so the subject — and therefore the
     # (merchant_id, external_order_id) idempotency key + the deterministic edge
-    # keys — is UNCHANGED. CROSS seeds re-subject to seller_ref; a replay under the
+    # keys — is UNCHANGED. A self seed from a drain-verified brand storefront has
+    # NO anchor: its seller_ref is the brand's observed seller (merch_obs_), and it
+    # re-subjects exactly like a CROSS seed. Re-subjecting keys on seller_ref, not
+    # on seed_kind. CROSS seeds re-subject to seller_ref; a replay under the
     # same seller stays idempotent because click_id → seller_ref is stable, so the
     # subject is stable across redeliveries. A DIFFERENT converting store replaying
     # the same (seller, order) collides on the same guard (still one edge).
