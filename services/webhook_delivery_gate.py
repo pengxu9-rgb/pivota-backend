@@ -52,6 +52,11 @@ logger = logging.getLogger(__name__)
 
 ENV_VAR = "WEBHOOK_DELIVERY_ENABLED"
 SKIP_REASON = "delivery_disabled_in_this_environment"
+# What a user-facing route (test send, per-row retry) answers instead of a misleading "success".
+SKIP_HTTP_STATUS = 409
+SKIP_DETAIL = (
+    "Webhook delivery is disabled in this environment (WEBHOOK_DELIVERY_ENABLED); nothing was sent."
+)
 
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
@@ -81,6 +86,16 @@ def skipped_result(*, event_type: str, delivery_id: Optional[str]) -> Dict[str, 
         "event_type": event_type,
         "delivery_id": delivery_id,
     }
+
+
+def skipped_by_environment(result: Any) -> bool:
+    """True only for THIS gate's skip, not for webhook_not_configured / event_not_subscribed. In
+    production with the variable unset it is never true, so routes that check it are unchanged."""
+    return (
+        isinstance(result, dict)
+        and result.get("status") == "skipped"
+        and result.get("reason") == SKIP_REASON
+    )
 
 
 def describe(env: Optional[Mapping[str, str]] = None) -> str:

@@ -457,3 +457,95 @@ def test_attempt_delivery_checks_the_gate_before_anything_else(modname):
     first = fn.body[0]
     assert isinstance(first, ast.If), ast.dump(first)[:200]
     assert "delivery_enabled" in ast.unparse(first.test)
+
+
+# ── the user-facing routes say so, instead of a top-level "success" ──────────────────────
+
+
+@pytest.mark.parametrize(
+    "result, expected",
+    [
+        ({"status": "skipped", "reason": gate.SKIP_REASON, "event_type": "x", "delivery_id": None}, True),
+        # the services' OTHER skips are not this gate's, and keep their old route behaviour
+        ({"status": "skipped", "reason": "webhook_not_configured", "event_type": "x"}, False),
+        ({"status": "skipped", "reason": "event_not_subscribed", "event_type": "x"}, False),
+        ({"status": "delivered", "reason": gate.SKIP_REASON}, False),
+        ({"status": "delivered"}, False),
+        (None, False),
+        ("skipped", False),
+    ],
+)
+def test_skipped_by_environment_matches_only_this_gates_skip(result, expected):
+    assert gate.skipped_by_environment(result) is expected
+
+
+def _agent_client():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import routes.agent_webhooks as routes_mod
+
+    app = FastAPI()
+    app.include_router(routes_mod.router)
+    app.dependency_overrides[routes_mod.get_current_user] = lambda: {"role": "agent", "agent_id": "owner_1"}
+    return TestClient(app)
+
+
+def _merchant_client(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import routes.merchant_dashboard_routes as routes_mod
+
+    async def resolve(*a, **k):
+        return "owner_1"
+
+    monkeypatch.setattr(routes_mod, "_resolve_merchant_id", resolve)
+    app = FastAPI()
+    app.include_router(routes_mod.router)
+    app.dependency_overrides[routes_mod.get_current_user] = lambda: {"role": "merchant", "merchant_id": "owner_1"}
+    return TestClient(app)
+
+
+def _route_calls(monkeypatch):
+    """(service module, zero-arg call returning an HTTP response) for each user-facing route that
+    reaches `_attempt_delivery`. The REAL service functions run underneath; only their DB and
+    httpx are stubbed (see _arm_paths)."""
+    agent = importlib.import_module("services.agent_webhook_service")
+    merchant = importlib.import_module("services.merchant_webhook_service")
+    return {
+        "agent test": (agent, lambda: _agent_client().post("/agents/owner_1/webhooks/test")),
+        "agent retry": (agent, lambda: _agent_client().post("/agents/owner_1/webhooks/deliveries/d1/retry")),
+        "merchant test": (
+            merchant,
+            lambda: _merchant_client(monkeypatch).post("/merchant/webhooks/test", json={"event_type": "order.created"}),
+        ),
+    }
+
+
+ROUTES = ["agent test", "agent retry", "merchant test"]
+
+
+@pytest.mark.parametrize("route", ROUTES)
+def test_outside_production_the_route_answers_409_not_success(monkeypatch, route):
+    _set(monkeypatch, "staging")
+    mod, call = _route_calls(monkeypatch)[route]
+    _arm_paths(mod, monkeypatch)
+    response = call()
+    assert response.status_code == gate.SKIP_HTTP_STATUS, response.text
+    assert response.json()["detail"] == gate.SKIP_DETAIL
+    assert _FakeHttp.posts == []
+
+
+@pytest.mark.parametrize("route", ROUTES)
+def test_in_production_the_route_still_answers_success(monkeypatch, route):
+    """The counterpart: prod with the variable unset delivers and answers exactly as before."""
+    _set(monkeypatch, "production")
+    mod, call = _route_calls(monkeypatch)[route]
+    _arm_paths(mod, monkeypatch)
+    response = call()
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "success"
+    assert (body.get("delivery") or body.get("data"))["status"] == "delivered"
+    assert _FakeHttp.posts == [DEST]
