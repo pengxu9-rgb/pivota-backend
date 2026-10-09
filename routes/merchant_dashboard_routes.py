@@ -34,6 +34,7 @@ from services.merchant_webhook_service import (
     send_test_webhook as send_merchant_test_webhook,
     update_webhook_config as update_merchant_webhook_config,
 )
+from services import webhook_delivery_gate
 from services.merchant_psp_config_service import (
     build_runtime_adapter_kwargs,
     build_provider_connect_record,
@@ -1410,14 +1411,19 @@ async def test_webhook(
             event_type=payload.event_type or "order.created",
             request_id=request.headers.get("x-request-id"),
         )
-        return {
-            "status": "success",
-            "data": delivery,
-        }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to send test webhook: {exc}")
+    if webhook_delivery_gate.skipped_by_environment(delivery):
+        raise HTTPException(
+            status_code=webhook_delivery_gate.SKIP_HTTP_STATUS,
+            detail=webhook_delivery_gate.SKIP_DETAIL,
+        )
+    return {
+        "status": "success",
+        "data": delivery,
+    }
 
 @router.post("/merchant/psp/{psp_id}/test")
 async def test_psp_connection(
