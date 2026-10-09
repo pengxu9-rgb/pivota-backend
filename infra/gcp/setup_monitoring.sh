@@ -268,6 +268,17 @@ upsert_log_metric retailer_ingest_drain_failed \
   "Retailer ingest drain stages that left a job FAILED - the ledger gave up on that store" \
   "$RID_FAILED_FILTER"
 
+# The hourly purchasability sweep's IP breaker (jobs/merchant_purchasability_sweep.py, "AN IP
+# THROTTLE STOPS THE RUN"). A trip EXITS 0 - the job is hourly and the job-failing policy pages
+# per failed task, so a 14-17 h throttle window would page every hour - and prints one
+# `IP_THROTTLE {...}` line whose `"ip_throttled":true` is what this counts. json.dumps there uses
+# separators=(",", ":"), hence no space after the colon. Keyed on the JOB too: the nightly
+# referral refresh prints the same line and already fails its execution on a trip.
+MPS_THROTTLED_FILTER='resource.type="cloud_run_job" AND resource.labels.job_name="merchant-purchasability-sweep" AND textPayload:"IP_THROTTLE " AND textPayload:"\"ip_throttled\":true"'
+upsert_log_metric merchant_purchasability_sweep_ip_throttled \
+  "Merchant purchasability sweep runs stopped by the IP breaker - many distinct stores throttled the crawl egress at once" \
+  "$MPS_THROTTLED_FILTER"
+
 # The Reap agentic purchase rail (jobs/reap_agentic_purchase_poll.py) is a scheduler job on the
 # `worker` SERVICE, not a Cloud Run job: it has no task to fail, so "prod: Cloud Run job failing"
 # cannot see it, and Cloud Monitoring cannot read the ledger. Everything below keys on the lines
@@ -574,7 +585,13 @@ upsert "prod: Cloud SQL connections high" "$(policy \
   'metric.type="cloudsql.googleapis.com/database/postgresql/num_backends" AND resource.type="cloudsql_database"' \
   ALIGN_MAX REDUCE_SUM "" COMPARISON_GT 240 300s 300s 3600s)"
 
-upsert "prod: database pool exhausted" "$(policy \
+# EVERY POLICY OVER A LOG METRIC THIS SCRIPT CREATES goes through `upsert_on_new_metric`, from here
+# down: Monitoring takes up to 10 minutes to see a new log metric, and plain `upsert` aborts the run
+# on "Cannot find metric(s)" (2026-10-08, the purchasability policy below). In prod these three
+# metrics are long-standing, but a brand-new project's first run would abort right here, before every
+# policy after it. The waiting writer retries, defers past its budget, and creates before it deletes.
+# tests/test_reap_rail_alerts.py holds the rule from the filters: no plain `upsert` reads a user metric.
+upsert_on_new_metric "prod: database pool exhausted" "$(policy \
   "prod: database pool exhausted" \
   "The backend cannot get a connection from its own pool (PoolCheckoutTimeout). Check Cloud SQL num_backends FIRST: if it is low - it was 28/300 on 2026-08-28 - the database is fine and the application is leaking pool slots, so restarting the revision restores service while the leak is found. There is no liveness probe on the web service, so a wedged instance is never recycled on its own." \
   'metric.type="logging.googleapis.com/user/pool_checkout_timeout" AND resource.type="cloud_run_revision"' \
@@ -589,17 +606,30 @@ upsert "prod: database pool exhausted" "$(policy \
 # approved or cancelled. It also closes if the trigger is PAUSED - no executions, no lines - so a
 # disarmed drain with a held store is silent: check the ledger before disarming.
 # FAILED is a one-off event and keeps the 300s window.
-upsert "prod: retailer ingest held for review" "$(policy \
+upsert_on_new_metric "prod: retailer ingest held for review" "$(policy \
   "prod: retailer ingest held for review" \
   "At least one retailer ingest job is HELD: a BLOCK flag stopped the store and nothing is written until someone decides. This stays open while any job is held. Read the flags: \`SELECT id, domain, brand, status_reason FROM retailer_ingest_jobs WHERE status = 'held'\` and the job's latest retailer_ingest_runs row (checks, flags). Then approve (optionally excluding handles or accepting flag keys) or cancel it via db/retailer_ingest.py approve()/cancel()." \
   'metric.type="logging.googleapis.com/user/retailer_ingest_drain_held" AND resource.type="cloud_run_job"' \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 3600s 0s 3600s)"
 
-upsert "prod: retailer ingest job failed" "$(policy \
+upsert_on_new_metric "prod: retailer ingest job failed" "$(policy \
   "prod: retailer ingest job failed" \
   "A retailer-ingest-drain stage left a job FAILED: crawl capped or failed, currency unproven, retry budget spent, apply refused (MAY BE PARTIAL), or the apply gate / read-back disagreed. The execution itself exited 0, so the Cloud Run job-failing policy does not fire for this. Read \`SELECT id, domain, brand, status_reason FROM retailer_ingest_jobs WHERE status = 'failed' ORDER BY updated_at DESC\` and the job's latest retailer_ingest_runs row." \
   'metric.type="logging.googleapis.com/user/retailer_ingest_drain_failed" AND resource.type="cloud_run_job"' \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 0s 3600s)"
+
+# ONE INCIDENT PER THROTTLE WINDOW, not one per hour: aligned over 7200 s, twice the sweep's hourly
+# cadence, so while every run trips the sum never drops to 0 between runs (the same reasoning as
+# "held for review" above, at the sweep's cadence). It closes ~2 h after the last tripped run.
+# `upsert_on_new_metric`, NOT `upsert`: its log metric is created by THIS script (above), and
+# Monitoring takes up to 10 minutes to see a new metric. With plain `upsert` the first prod run
+# (2026-10-08) aborted here with "Cannot find metric(s)", before the five Reap policies below; this
+# defers the policy instead, and creates before it deletes, so a re-run can never leave it missing.
+upsert_on_new_metric "prod: purchasability sweep IP-throttled" "$(policy \
+  "prod: purchasability sweep IP-throttled" \
+  "The hourly merchant-purchasability-sweep stopped itself: enough distinct Shopify stores throttled the crawl egress (429 / 503 + Retry-After / Cloudflare challenge) that it stopped contacting merchants. The execution exited 0 on purpose. Nothing is demoted by a throttle, but a positive window is only RENEWED by a positive check: a throttle longer than the 72 h TTL ages every merchant to browse_only, and with MERCHANT_PURCHASABILITY_ENFORCE on, the Reap rail then refuses them. A fresh NAT IP did not help on 2026-10-07. Read the job's IP_THROTTLE lines and docs/runbooks/merchant_purchasability.md, \"An IP throttle stops the run\"." \
+  'metric.type="logging.googleapis.com/user/merchant_purchasability_sweep_ip_throttled" AND resource.type="cloud_run_job"' \
+  ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 7200s 0s 7200s)"
 
 # The Reap agentic purchase rail. Five policies over the five log metrics above; the runbook
 # for all of them is docs/runbooks/reap_agentic_purchase.md, "Alerts".

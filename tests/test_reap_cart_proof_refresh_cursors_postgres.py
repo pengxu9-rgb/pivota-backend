@@ -62,7 +62,8 @@ async def pg():
     await database.execute("CREATE TABLE IF NOT EXISTS external_product_seeds (id TEXT)")
     for name, column_type in (("domain", "TEXT"), ("seed_data", "JSONB DEFAULT '{}'::jsonb"),
                               ("status", "TEXT DEFAULT 'active'"), ("canonical_url", "TEXT"),
-                              ("destination_url", "TEXT"), ("updated_at", "TIMESTAMPTZ DEFAULT NOW()")):
+                              ("destination_url", "TEXT"), ("updated_at", "TIMESTAMPTZ DEFAULT NOW()"),
+                              ("market", "TEXT DEFAULT 'US'")):
         await database.execute(f"ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS {name} {column_type}")
     await database.execute("DELETE FROM external_product_seeds WHERE id LIKE :p", {"p": _PREFIX + "%"})
     yield database

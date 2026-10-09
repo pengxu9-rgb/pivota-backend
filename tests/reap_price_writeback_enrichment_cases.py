@@ -190,3 +190,28 @@ async def test_offers_that_are_not_the_listings_own_live_ones_are_never_touched(
     after = await _listing_prices_by_id()
     for oid in ("off_other_seller", "off_mirror_sys", "off_oos", "off_supp"):
         assert float(after[oid]) == 27.0, oid
+
+
+async def test_an_enrichment_offers_payload_moves_from_the_price_it_was_read_at(client):
+    """The offer was read at 31.00 (a stale listing price our fresh proof corrects): its payload's
+    facts move from 31.00, not from the purchase's 30.00 (review of #2523, M18)."""
+    import json as _json
+
+    from reap_enrichment_cart_route_cases import TARTE_PLACEHOLDER
+    from db.database import IS_POSTGRES
+
+    await refused_at(client, live=3200)
+    await database.execute("UPDATE catalog_offers SET merchant_effective_price = 31.00, "
+                           "estimated_best_price = 31.00, list_price = 31.00 WHERE sku_key = :s",
+                           {"s": TARTE_PLACEHOLDER})
+    cast = "CAST(:p AS jsonb)" if IS_POSTGRES else ":p"
+    await database.execute(f"UPDATE catalog_offers SET offer_payload = {cast} WHERE sku_key = :s",
+                           {"p": _json.dumps({"price": "31.00"}), "s": TARTE_PLACEHOLDER})
+    await seed_proof(pk=TARTE_PK, sku_key=TARTE_PLACEHOLDER, shop_host=TARTE_HOST, handle=TARTE_HANDLE,
+                     variant_id=TARTE_VARIANT, price_minor=3200)
+    await our_proof_reads(3200)
+    assert await writeback.run_writeback_pass() == {"written": 1}
+    row = await database.fetch_one("SELECT offer_payload FROM catalog_offers WHERE sku_key = :s",
+                                   {"s": TARTE_PLACEHOLDER})
+    payload = row["offer_payload"] if isinstance(row["offer_payload"], dict) else _json.loads(row["offer_payload"])
+    assert payload["price"] == "32.00"

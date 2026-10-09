@@ -617,7 +617,7 @@ and nothing is written for it.
 | `REAP_AGENTIC_CORROBORATION_MAX_AGE_HOURS` | integer 1..168 (72) | how old an independent read may be. Out of range or not an integer → 72, warned once. |
 | `REAP_AGENTIC_PREFLIGHT_MODE` | `off` / `shadow` / `enforce`, anything else is off (off) | in `resolving`, after the item resolves and **before any enrollment is created, reused or replayed**, one buy-intent `POST /agentic/quotes` (same body the approval quote sends, keyed apart from it; its quote id is never stored or checked out) is checked like the approval quote (with corroboration when that dial is on). `shadow`: recorded, the purchase always continues. `enforce`: a definitive refusal ends the purchase before any card page; an unknown continues. A buyer who already has an active card goes straight to `quoting` and is not preflighted. |
 
-**Write-back: the live price corrects the catalog** (`REAP_AGENTIC_PRICE_WRITEBACK` = `off` (default) / `shadow` / `on`, services/reap_price_writeback.py). After each poll run, cart-link purchases from the last 72 h that were refused `price_changed` (or continued on a corroborated lower price) are read, newest per product. Without it a buyer told "the price is now X" cannot re-confirm: the gateway and this route still price the product at the old number. Owner rules (2026-10-06): an **increase** is written on the quote alone (the cart URL is ours and names one variant); a **decrease** only when our own store read of the variant says the same price; an **enrichment** listing's offers only when our fresh proof already says it, in either direction (the route requires offers = proof, and the proof is never written from a quote). Mirror rows write the seller's offers on the variant's skus (+ the `::canonical` placeholder under a sole-variant proof) and the seed's own variant price (+ `price_amount` when the seed lists only that variant); enrichment rows write the listing's offers on the proof's skus. Every write is compare-and-set on the old price, a seed crawled after the quote is left alone (`catalog_read_newer`), and the result is checked with this route's own loader (`written` vs `written_not_effective`). `shadow` decides and logs (`would_write`) and writes nothing. Outcomes are logged as `reap_price_writeback: mode=... outcomes={...}` and never enter `PollReport`. The gateway caches mirror product detail up to 10 min, so `get_product` can lag a write by that long.
+**Write-back: the live price corrects the catalog** (`REAP_AGENTIC_PRICE_WRITEBACK` = `off` (default) / `shadow` / `on`, services/reap_price_writeback.py). After each poll run, cart-link purchases from the last 72 h that were refused `price_changed` (or continued on a corroborated lower price) are read, newest per product. Without it a buyer told "the price is now X" cannot re-confirm: the gateway and this route still price the product at the old number. Owner rules (2026-10-06): an **increase** is written on the quote alone (the cart URL is ours and names one variant); a **decrease** only when our own store read of the variant says the same price; an **enrichment** listing's offers only when our fresh proof already says it, in either direction (the route requires offers = proof, and the proof is never written from a quote). Mirror rows write the seller's offers on the variant's skus (+ the `::canonical` placeholder under a sole-variant proof, or when the seed lists only that variant -- the placeholder is the projection of the seed's product price) and the seed's own variant price (+ `price_amount` when the seed lists only that variant); every written offer's payload copies of the price (`price`, `price_amount`, `commerce_facts_v1.regional_price`, `agent_safe_commerce_facts.price`) and, for a seed about that one variant, the seed's own `commerce_facts_v1` price move with it, each only from the old price; enrichment rows write the listing's offers on the proof's skus. Every write is compare-and-set on the old price, a seed crawled after the quote is left alone (`catalog_read_newer`), and the result is checked with this route's own loader (`written` vs `written_not_effective`). `shadow` decides and logs (`would_write`) and writes nothing. Outcomes are logged as `reap_price_writeback: mode=... outcomes={...}` and never enter `PollReport`. The gateway caches mirror product detail up to 10 min, so `get_product` can lag a write by that long.
 
 **What corroborates.** Only cart-link purchases (the variant lane's opaque Reap handles name no
 storefront variant; its own resolver price check, `_price_verdict`, is unchanged). The read must
@@ -628,11 +628,32 @@ name the numeric variant in the purchase's own cart URL:
   `checked_at` not in the future and inside the window. All usable rows must agree.
 * the mirror seed's storefront proof (`snapshot.shopify_cart_proof` /
   `shopify_cart_variant_proofs`). **It corroborates only if the proof itself records a `currency`
-  equal to the purchase's — and no writer records one today, so today it never does.**
-  `products.js` carries no currency (its price is in whatever presentment currency the storefront
-  chose for our crawler, ×100 even for zero-decimal currencies); the seed's price currency and the
-  market currency describe other numbers. An assumed currency is how a substituted variant's
-  price would slip through, so it is not assumed.
+  equal to the purchase's**, it says `available: true`, and it passes the cart-proof fetch rule and
+  the window. `products.js` carries no currency (its price is in whatever presentment currency the
+  storefront chose for our crawler, ×100 even for zero-decimal currencies); the seed's price
+  currency and the market currency describe other numbers, so neither is assumed. Since
+  2026-10-08 the mirror backfill (scripts/backfill_shopify_variant_ids.py: a hand run, or the
+  `reap-cart-proof-mirror` job's mirror lane where that job is provisioned -- not in prod as of
+  2026-10-08, and its staging cron is paused) records it by the enrichment job's own rule
+  (services/shopify_presentment.py): `?country=<seed market>`, no cookie on any request, the final
+  response's `cart_currency` Set-Cookie, and only the market's currency counts. A store that sends
+  no `cart_currency` cookie at all (judydoll.com, the pilot, measured 2026-10-08) is priced from one
+  `/products/<handle>.json?country=<market>` request instead: its variants name `price_currency` in
+  the same response (it follows presentment: tarte `?country=GB` → 29.00 GBP), it must be the same
+  product id and handle as the `.js`, and it is sent only when a proof that could corroborate is
+  about to be written. Each proof then carries `price_minor` (ISO minor units), `currency` and
+  `price_source` (`products_js_v1` / `products_json_v1`) together, or none; the run report's
+  `proof_currency` counts `cookie:USD` / `json:USD` (what the written proofs carry) or why not
+  (`currency_not_market`, `json_other_product`, `json_variant_unpriced`, ...), and
+  `json_price_fetches` counts the extra requests. A blocked `.json` answer counts toward the
+  store's block streak like a `.js` one, and the store is not asked for `.json` again that run.
+  Known limit (scheduled lane only): a `.json` 429 whose Retry-After outlasts the lane's patience
+  holds that store's next `.js`, so the page ends held and its cursor does not advance; a store
+  that throttles `.json` but not `.js` on every run would then not get past its first page. Not
+  measured on any store; watch `json_price_fetches` / `held_by_politeness` before provisioning the
+  mirror job in prod.
+  A payload that repeats a variant id prices nothing. Proofs written
+  before that, or by a fetch whose currency was not verified, carry none and never corroborate.
 
 With either witness dial armed, a quote that fails the subtotal AND another check now reports the other check's code (`quote_total_not_reconciled`, `quote_shipping_not_reconciled`, ...) — still `price_changed` / `price_unverifiable`, never a continue. Both lanes yielding different prices is not corroboration. The subtotal must be an exact multiple
 of the quantity. `our_price_minor` is **never rewritten**: it stays the price the buyer selected

@@ -57,6 +57,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -281,11 +282,37 @@ _WRITE_SEED_SQL_SQLITE = """
 """
 
 
+_READ_OFFER_PAYLOAD_SQL = "SELECT offer_payload FROM catalog_offers WHERE offer_id = :offer_id"
+
+_WRITE_OFFER_PAYLOAD_SQL = """
+    UPDATE catalog_offers SET offer_payload = CAST(:payload AS jsonb)
+     WHERE offer_id = :offer_id AND offer_payload = CAST(:old_payload AS jsonb)
+    RETURNING offer_id
+"""
+_WRITE_OFFER_PAYLOAD_SQL_SQLITE = """
+    UPDATE catalog_offers SET offer_payload = :payload
+     WHERE offer_id = :offer_id AND offer_payload = :old_payload
+    RETURNING offer_id
+"""
+
+
 class _Raced(Exception):
     """A row moved between the read and the write: roll the whole write back."""
 
 _VARIANT_ID_KEYS = ("shopify_variant_id", "variant_id", "id")
-_VARIANT_PRICE_KEYS = ("price", "price_amount")
+#: A seed variant's CURRENT price, in every spelling its readers fall back through: `price_amount`,
+#: `price`, then `list_price` (services/catalog_enrichment_agent/ingestion.variant_own_price, the
+#: dual-write's alias-conflict check, catalog_variant_price_repair, routes/employee_products).
+#: `list_price` is a current-price alias here, never a "was" price: it moves with `price` (review of
+#: #2526) -- left behind, the projection refuses the variant as `variant_price_alias_conflict`.
+_VARIANT_PRICE_KEYS = ("price", "price_amount", "list_price")
+#: A seed variant's "was" price, in every spelling a reader of the seed variant takes it from: the
+#: backend serves `original_price or compare_at_price or originalPrice` as the buyer-facing
+#: original price (routes/agent_shop_gateway.py). Once the price reaches it the sale is over: left
+#: behind, it is an "original price" at or below the price (review of #2523, round 2, finding A).
+#: (The gateway's PDP reads its compare-at from the variant's nested `price` object, not these.)
+_VARIANT_WAS_PRICE_KEYS = ("compare_at_price", "compare_at", "compareAt", "original_price",
+                           "originalPrice")
 
 
 def _variant_id_of(variant: Mapping[str, Any]) -> Optional[str]:
@@ -295,6 +322,110 @@ def _variant_id_of(variant: Mapping[str, Any]) -> Optional[str]:
         if text:
             ids.add(text.rsplit("/", 1)[-1])
     return ids.pop() if len(ids) == 1 else None
+
+
+#: Where the catalog keeps DISPLAY copies of a price beside the column the purchase route reads:
+#: the gateway serves `commerce_facts_v1.regional_price` (and its `agent_safe_commerce_facts.price`
+#: copy, built by PIVOTA-Agent src/commerce/commerceFacts.js) to agents with the product, and an
+#: offer's payload carries `price` / `price_amount`. Named explicitly -- never "any key that looks
+#: like a price".
+_FACT_BLOCKS = (("commerce_facts_v1", "regional_price"), ("commerce_facts", "regional_price"),
+                ("agent_safe_commerce_facts", "price"))
+
+
+def _price_like(value: Any, minor: int, currency: str) -> bool:
+    return value not in (None, "") and _same_price(value, minor, currency)
+
+
+def _fixed(minor: int, currency: str) -> str:
+    """The amount at the currency's own exponent: 1350 USD -> '13.50', 1500 JPY -> '1500'.
+    (`str(Decimal)` drops trailing zeros: '13.5', '13' -- review of #2523, F1.)"""
+    exponent = 0 if minor_to_major(1, currency) == 1 else 2
+    return f"{minor_to_major(int(minor), currency):.{exponent}f}"
+
+
+def _as_type_of(original: Any, minor: int, currency: str) -> Any:
+    return _fixed(minor, currency) if isinstance(original, str) else float(minor_to_major(int(minor), currency))
+
+
+#: Sale / range context that describes the OLD price (review of #2523, F2): kept beside a moved
+#: amount it would say "on sale" at the regular price, or a range that no longer contains it.
+_PRICE_CONTEXT_KEYS = ("compare_at_amount", "compare_at_currency", "compare_at_display_raw",
+                       "range_min", "range_max")
+_SALE_PRICE_TYPES = frozenset({"sale", "discounted", "promo", "promotion", "clearance"})
+
+
+def _rewrite_display(raw: str, *, old_minor: int, new_minor: int, currency: str) -> Optional[str]:
+    """The display text with the old number replaced, or None when that cannot be done exactly:
+    the old number at the currency's exponent must occur, bounded by non-digits, and be the only
+    number in the text (so '113.99', a range '12.99 - 13.99' or '1,299.00' are never
+    half-rewritten). None is honest; a guess is not."""
+    old, new = _fixed(old_minor, currency), _fixed(new_minor, currency)
+    pattern = re.compile(r"(?<![\d.,])" + re.escape(old) + r"(?![\d])")
+    if not pattern.search(raw) or re.search(r"\d", pattern.sub("", raw)):
+        # The old number is absent, or another number sits beside it (a range, a bundle price, a
+        # thousands-grouped amount): which number is this product's is not ours to guess.
+        return None
+    if "." in new and len(new.split(".")[0]) > 3:
+        # The old text had no grouping only because it was under 1,000 (a grouped old number is
+        # refused above); a 4+ digit amount reads with it (review of #2523, round 2, finding F).
+        whole, cents = new.split(".")
+        new = f"{int(whole):,}.{cents}"
+    return pattern.sub(new, raw)
+
+
+def move_price_facts(
+    holder: Dict[str, Any], *, old_minor: int, new_minor: int, currency: str,
+    observed: Optional[datetime], top_keys: Iterable[str] = (),
+) -> int:
+    """Pure, in place: move the display copies of the price in `holder` from the old price to the
+    new one. Returns how many fields moved.
+
+    Only a copy that still says the OLD price moves; one already at the new price, or at some third
+    price (another writer's fact), is left as it is -- these are display facts, not the price the
+    purchase is checked against, so they never refuse the write. `display_raw` keeps its own
+    formatting with the number replaced; `captured_at` becomes the quote's time, the moment this
+    price was observed."""
+    moved = 0
+    for key in top_keys:
+        if _price_like(holder.get(key), old_minor, currency):
+            holder[key] = _as_type_of(holder[key], new_minor, currency)
+            moved += 1
+    for outer, inner in _FACT_BLOCKS:
+        block = holder.get(outer)
+        price = block.get(inner) if isinstance(block, dict) else None
+        if not isinstance(price, dict) or not _price_like(price.get("amount"), old_minor, currency):
+            continue
+        # A block in another currency, or one its writer already marked a market mismatch, is not
+        # this price whatever its number says (review of #2523, F3).
+        stated = {str(price.get(k)).strip().upper() for k in ("currency", "observed_currency") if price.get(k)}
+        # The status as the gateway reads it: case- and space-insensitive, the block's own first,
+        # else the facts object's (PIVOTA-Agent src/commerce/commerceFacts.js).
+        status = str(price.get("market_switch_status") or block.get("market_switch_status") or "").strip().lower()
+        if (stated and stated != {currency}) or status in ("mismatch", "failed"):
+            continue
+        price["amount"] = _as_type_of(price["amount"], new_minor, currency)
+        raw = price.get("display_raw")
+        if isinstance(raw, str) and raw.strip():
+            price["display_raw"] = _rewrite_display(raw, old_minor=old_minor, new_minor=new_minor,
+                                                    currency=currency)
+        for key in _PRICE_CONTEXT_KEYS:
+            if key in price:
+                price[key] = None
+        if str(price.get("price_type") or "").strip().lower() in _SALE_PRICE_TYPES:
+            price["price_type"] = "unknown"
+        if observed is not None and "captured_at" in price:
+            price["captured_at"] = observed.isoformat()
+        moved += 1
+    return moved
+
+
+def listed_variant_ids(seed_data: Any) -> set:
+    """The variant ids the seed lists (`variants`, `snapshot.variants`)."""
+    document = corroboration._seed_document(seed_data) or {}
+    snapshot = document.get("snapshot") if isinstance(document.get("snapshot"), dict) else {}
+    lists = [v for v in (document.get("variants"), snapshot.get("variants")) if isinstance(v, list)]
+    return {(_variant_id_of(v) if isinstance(v, dict) else None) for vs in lists for v in vs}
 
 
 def plan_seed_write(
@@ -317,7 +448,6 @@ def plan_seed_write(
     document = json.loads(json.dumps(document))
     snapshot = document.get("snapshot") if isinstance(document.get("snapshot"), dict) else {}
     lists = [v for v in (document.get("variants"), snapshot.get("variants")) if isinstance(v, list)]
-    new_major = minor_to_major(int(new_minor), currency)
     touched = 0
     for variants in lists:
         for variant in variants:
@@ -331,8 +461,12 @@ def plan_seed_write(
                     continue
                 if not _same_price(variant[key], old_minor, currency):
                     return None, False, "seed_price_unexpected"
-                variant[key] = str(new_major) if isinstance(variant[key], str) else float(new_major)
+                variant[key] = _as_type_of(variant[key], new_minor, currency)
                 touched += 1
+            for key in _VARIANT_WAS_PRICE_KEYS:
+                was = ledger.amount_minor_or_none(_decimal_text(variant.get(key)), currency)
+                if was is not None and was <= int(new_minor):
+                    variant[key] = None
     if not touched:
         return None, False, "variant_not_on_seed"
     listed = {(_variant_id_of(v) if isinstance(v, dict) else None) for vs in lists for v in vs}
@@ -345,8 +479,10 @@ def plan_seed_write(
                 # The product-level price is the projection's source for the placeholder: moving
                 # the offer but not a holder at some third price would be undone (R2-2).
                 return None, False, "seed_price_unexpected"
-            holder["price_amount"] = (str(new_major) if isinstance(holder["price_amount"], str)
-                                      else float(new_major))
+            holder["price_amount"] = _as_type_of(holder["price_amount"], new_minor, currency)
+        for holder in (snapshot, document):
+            move_price_facts(holder, old_minor=old_minor, new_minor=new_minor, currency=currency,
+                             observed=observed)
     snapshot["price_writeback"] = {
         "source": SOURCE, "purchase_id": purchase_id, "from_minor": int(old_minor),
         "to_minor": int(new_minor), "currency": currency,
@@ -394,11 +530,18 @@ async def _mirror_offer_targets(row: Mapping[str, Any], product: Mapping[str, An
         offers.extend(await _offers(candidate["sku_key"]))
     sole = bool(placeholder) and route._proof_live_variant_count(
         corroboration._seed_document(seed_data)) == 1
-    if not sole:
+    # The placeholder is a projection of the seed's product-level price (MIRROR_OFFER_UPSERT_SQL
+    # copies `price_amount` onto it). That price moves when the storefront shows one live variant OR
+    # when the seed lists only this variant, so in both cases the placeholder moves with it -- else
+    # the product view aggregates the old price (staging, 2026-10-07: Judydoll lists one of 8 live
+    # shades; its placeholder stayed at 12.99 beside the written 13.99).
+    seed_is_this_variant = bool(placeholder) and listed_variant_ids(seed_data) == {variant_id}
+    if not (sole or seed_is_this_variant):
         return offers, "planned", False
     on_placeholder = await _offers(placeholder["sku_key"])
     if not offers:
-        return on_placeholder, "planned", bool(on_placeholder)
+        # Priced from the placeholder only under a sole proof (the route's rule).
+        return (on_placeholder, "planned", bool(on_placeholder)) if sole else ([], "planned", False)
     beside = [o for o in on_placeholder
               if _same_price(o.get("price"), old, currency) or _same_price(o.get("price"), new, currency)]
     return offers + beside, "planned", bool(beside)
@@ -438,8 +581,28 @@ def _scale(currency: str) -> int:
     return int(1 / minor_to_major(1, currency))
 
 
+async def _write_offer_payload(offer_id: str, *, old: int, new: int, currency: str,
+                               observed: Optional[datetime]) -> None:
+    """The offer's payload copies of the price (`move_price_facts`), compare-and-set on the payload
+    as read inside the same transaction; a payload that moved raises `_Raced`."""
+    found = await database.fetch_one(_READ_OFFER_PAYLOAD_SQL, {"offer_id": offer_id})
+    raw = found["offer_payload"] if found is not None else None
+    payload = corroboration._seed_document(raw)
+    if payload is None:
+        return
+    payload = json.loads(json.dumps(payload))
+    if not move_price_facts(payload, old_minor=old, new_minor=new, currency=currency,
+                            observed=observed, top_keys=("price", "price_amount")):
+        return
+    written = await database.fetch_one(
+        _WRITE_OFFER_PAYLOAD_SQL if IS_POSTGRES else _WRITE_OFFER_PAYLOAD_SQL_SQLITE,
+        {"offer_id": offer_id, "payload": json.dumps(payload), "old_payload": _raw_json(raw)})
+    if written is None:
+        raise _Raced("offer_payload")
+
+
 async def _write_offers(offers: List[Mapping[str, Any]], *, old: int, new: int, currency: str,
-                        any_prior: bool = False) -> Tuple[int, str]:
+                        any_prior: bool = False, observed: Optional[datetime] = None) -> Tuple[int, str]:
     """Each UPDATE compares, IN SQL, the price that offer was READ at; one that lands nowhere raises
     `_Raced` (roll back). Mirror (`any_prior` False): every target must have been read at the old
     (or already the new) price. Enrichment (`any_prior` True): every target is on a sku whose OWN
@@ -465,6 +628,8 @@ async def _write_offers(offers: List[Mapping[str, Any]], *, old: int, new: int, 
             "scale": _scale(currency), "old_minor": int(read_minor)})
         if found is None:
             raise _Raced("offer")
+        await _write_offer_payload(offer["offer_id"], old=int(read_minor), new=new, currency=currency,
+                                   observed=observed)
         written += 1
     return written, "planned"
 
@@ -570,7 +735,7 @@ async def apply_one(row: Mapping[str, Any], *, mode: str, now: datetime) -> str:
     try:
         async with database.transaction():
             written, reason = await _write_offers(offers, old=ours, new=live, currency=currency,
-                                                  any_prior=(lane == "enrichment"))
+                                                  any_prior=(lane == "enrichment"), observed=observed)
             if reason != "planned":
                 return reason  # refused before its first write: nothing to roll back
             if lane == "mirror":

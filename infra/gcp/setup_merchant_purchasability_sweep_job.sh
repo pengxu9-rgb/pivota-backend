@@ -108,6 +108,14 @@ ENV_VARS="$ENV_VARS,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=6
 ENV_VARS="$ENV_VARS,MERCHANT_PURCHASABILITY_BUDGET_SECONDS=$BUDGET_SECONDS"
 ENV_VARS="$ENV_VARS,MERCHANT_PURCHASABILITY_BATCH=$BATCH"
 ENV_VARS="$ENV_VARS,MERCHANT_PURCHASABILITY_SWEEP_ENABLED=$ENABLED"
+# THE SHARED SHOPIFY-EDGE PACER (#2474), exactly as the Reap cart-proof setup script sets it on the
+# Reap proof jobs: every request (all to Shopify stores) also takes a slot of the aggregate budget
+# every crawl job on the crawl IP shares, and the lease cap of 2 bounds what this job can ever
+# hold of that shared schedule. CRAWL_SHOPIFY_EDGE_RPS is deliberately NOT set: every job on the
+# address must use the same shared rate. The IP breaker's dials
+# (MERCHANT_PURCHASABILITY_IP_THROTTLE_*) are NOT set either: their defaults are the ones the
+# module documents (MERCHANT_PURCHASABILITY_IP_THROTTLE_TRIP_HOSTS=0 disarms it).
+ENV_VARS="$ENV_VARS,CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true,CRAWL_SHOPIFY_EDGE_LEASE=2"
 
 echo "== job: $JOB (subnet $SUBNET, gate $ENABLED)"
 verb=create; have "$GCLOUD" run jobs describe "$JOB" --region "$REGION" && verb=update

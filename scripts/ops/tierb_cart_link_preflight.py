@@ -133,7 +133,9 @@ async def run_rows(
                     product_handle=row["product_handle"], quantity=1, buyer=buyer,
                     click_id=click_id_for(row["domain"], stamp),
                 )
-                if result.verdict is not Verdict.TRANSPORT_ERROR:
+                # A throttle is TRANSPORT_ERROR too, but asking again seconds later only adds to the
+                # volume that keeps the address throttled (jobs/tierb_cart_link_eligibility: same rule).
+                if result.verdict is not Verdict.TRANSPORT_ERROR or result.throttled:
                     break
                 if attempts < 2:
                     await asyncio.sleep(retry_delay_s)

@@ -36,18 +36,34 @@ JOBS = ("reap-cart-proof-enrichment", "reap-cart-proof-mirror")
 #   SUBNET_EXISTS=0                      the crawl-subnet preflight fails
 #   RESUME_FAILS=1                       every `scheduler jobs resume` fails
 #   FAIL_UPDATE_JOB=<name>               `run jobs create|update <name>` fails
+#   ENRICHMENT_SIGNED / MIRROR_SIGNED    the job's CRAWL_WEB_BOT_AUTH_ENABLED (unset = absent)
+#   SECRET_EXISTS=0                      `secrets describe` fails
+#   SECRET_GRANTED=0                     the secret's IAM policy has no accessor binding for sa-worker
+#   MIRROR_ARGS / ENRICHMENT_ARGS        the job's current container args, as a JSON value (unset = absent)
+#   JSON_FAIL_NTH=<name>:<n>             that job's n-th `run jobs describe --format=json` fails (1-based)
+#   PLAIN_FAIL_NTH=<name>:<n>            that job's n-th plain (existence) `run jobs describe` fails
 FAKE_GCLOUD = textwrap.dedent(
     """\
     #!/usr/bin/env bash
     printf '%s\\x1f' "$@" >> "$GCLOUD_LOG"; printf '\\n' >> "$GCLOUD_LOG"
     case "$1 $2 $3" in
       "run jobs describe")
+        if [ -n "${JSON_FAIL_NTH:-}" ] && [ "$4" = "${JSON_FAIL_NTH%%:*}" ] && [ "${*: -1}" = "--format=json" ]; then
+          n=$(( $(cat "$GCLOUD_LOG.n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GCLOUD_LOG.n"
+          [ "$n" = "${JSON_FAIL_NTH##*:}" ] && exit 1
+        fi
+        if [ -n "${PLAIN_FAIL_NTH:-}" ] && [ "$4" = "${PLAIN_FAIL_NTH%%:*}" ] && [ "${*: -1}" != "--format=json" ]; then
+          m=$(( $(cat "$GCLOUD_LOG.m" 2>/dev/null || echo 0) + 1 )); echo "$m" > "$GCLOUD_LOG.m"
+          [ "$m" = "${PLAIN_FAIL_NTH##*:}" ] && exit 1
+        fi
         case "$4" in
-          reap-cart-proof-mirror) e="${MIRROR_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${MIRROR_GATE:-false}" ;;
-          *) e="${ENRICHMENT_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${ENRICHMENT_GATE:-false}" ;;
+          reap-cart-proof-mirror) e="${MIRROR_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${MIRROR_GATE:-false}"; w="${MIRROR_SIGNED:-}"; a="${MIRROR_ARGS:-}" ;;
+          *) e="${ENRICHMENT_JOB_EXISTS:-${JOB_EXISTS:-0}}"; g="${ENRICHMENT_GATE:-false}"; w="${ENRICHMENT_SIGNED:-}"; a="${ENRICHMENT_ARGS:-}" ;;
         esac
         [ "$e" = 1 ] || exit 1
-        printf '{"spec":{"template":{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"PIVOTA_ENV","value":"production"},{"name":"REAP_CART_PROOF_APPLY","value":"%s"}]}]}}}}}}' "$g"
+        extra=""; [ -n "$w" ] && extra=",{\\"name\\":\\"CRAWL_WEB_BOT_AUTH_ENABLED\\",\\"value\\":\\"$w\\"}"
+        argsjson=""; [ -n "$a" ] && argsjson=",\\"args\\":$a"
+        printf '{"spec":{"template":{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"PIVOTA_ENV","value":"production"},{"name":"REAP_CART_PROOF_APPLY","value":"%s"}%s]%s}]}}}}}}' "$g" "$extra" "$argsjson"
         exit 0 ;;
       "scheduler jobs describe")
         case "$4" in
@@ -57,6 +73,14 @@ FAKE_GCLOUD = textwrap.dedent(
         [ "$e" = 1 ] || exit 1
         echo "$t"; exit 0 ;;
       "compute networks subnets") [ "${SUBNET_EXISTS:-1}" = 1 ] && exit 0 || exit 1 ;;
+      "secrets describe WEB_BOT_AUTH_PRIVATE_KEY") [ "${SECRET_EXISTS:-1}" = 1 ] && exit 0 || exit 1 ;;
+      "secrets get-iam-policy WEB_BOT_AUTH_PRIVATE_KEY")
+        if [ "${SECRET_GRANTED:-1}" = 1 ]; then
+          printf '{"bindings":[{"role":"roles/secretmanager.secretAccessor","members":["serviceAccount:sa-worker@pivota-prod.iam.gserviceaccount.com"]}]}'
+        else
+          printf '{"bindings":[{"role":"roles/secretmanager.secretAccessor","members":["serviceAccount:someone-else@pivota-prod.iam.gserviceaccount.com"]}]}'
+        fi
+        exit 0 ;;
       "scheduler jobs resume") [ "${RESUME_FAILS:-0}" = 1 ] && exit 1 || exit 0 ;;
       "run jobs create"|"run jobs update") [ "$4" = "${FAIL_UPDATE_JOB:-}" ] && exit 1 || exit 0 ;;
     esac
@@ -69,15 +93,17 @@ ARMED = {"JOB_EXISTS": "1", "TRIGGER_EXISTS": "1", "ENRICHMENT_GATE": "true", "M
 DARK = {"JOB_EXISTS": "1", "TRIGGER_EXISTS": "1"}
 
 
-def _run(tmp_path: Path, *args: str, env: Optional[Dict[str, str]] = None
+def _run(tmp_path: Path, *args: str, env: Optional[Dict[str, str]] = None, shell: str = "bash"
          ) -> Tuple[subprocess.CompletedProcess, List[List[str]]]:
     fake = tmp_path / "fake-gcloud"
     fake.write_text(FAKE_GCLOUD)
     fake.chmod(0o755)
     log = tmp_path / "calls.log"
     log.write_text("")
+    for counter in ("calls.log.n", "calls.log.m"):  # the fake's JSON_FAIL_NTH / PLAIN_FAIL_NTH counters
+        (tmp_path / counter).unlink(missing_ok=True)
     proc = subprocess.run(
-        ["bash", str(SCRIPT), *args],
+        [shell, str(SCRIPT), *args],
         capture_output=True, text=True, cwd=str(REPO),
         env={**os.environ, "GCLOUD": str(fake), "GCLOUD_LOG": str(log), **(env or {})},
     )
@@ -555,3 +581,180 @@ def test_the_shared_pacer_rate_is_left_unset_on_both_jobs(tmp_path, flag):
         assert shopify_edge_pacer.FALLBACK_RATE_ENV not in env, env
     code = "\n".join(line for line in SCRIPT.read_text().splitlines() if not line.lstrip().startswith("#"))
     assert "CRAWL_SHOPIFY_EDGE_RPS" not in code
+
+
+# ── Web Bot Auth (services/crawl_identity.py) ───────────────────────────────────────────────────
+
+def _signed_state(job: List[str]) -> Tuple[Optional[str], str]:
+    return _env_vars(job).get("CRAWL_WEB_BOT_AUTH_ENABLED"), _flag(job, "--set-secrets")
+
+
+@pytest.mark.parametrize("env,expect", [
+    ({"WEB_BOT_AUTH": "on"}, ("true", "DATABASE_URL=DATABASE_URL:latest,WEB_BOT_AUTH_PRIVATE_KEY=WEB_BOT_AUTH_PRIVATE_KEY:latest")),
+    ({"WEB_BOT_AUTH": "off", **DARK, "MIRROR_SIGNED": "true", "ENRICHMENT_SIGNED": "true"}, (None, "DATABASE_URL=DATABASE_URL:latest")),
+    ({**DARK, "MIRROR_SIGNED": "true", "ENRICHMENT_SIGNED": "true"}, ("true", "DATABASE_URL=DATABASE_URL:latest,WEB_BOT_AUTH_PRIVATE_KEY=WEB_BOT_AUTH_PRIVATE_KEY:latest")),
+    ({"MIRROR_JOB_EXISTS": "1", "MIRROR_SIGNED": "true"}, ("true", "DATABASE_URL=DATABASE_URL:latest,WEB_BOT_AUTH_PRIVATE_KEY=WEB_BOT_AUTH_PRIVATE_KEY:latest")),
+    ({**DARK}, (None, "DATABASE_URL=DATABASE_URL:latest")),
+])
+def test_web_bot_auth_is_set_removed_or_kept_on_both_jobs_together(tmp_path, env, expect):
+    proc, calls = _run(tmp_path, "prod", TAG, env=env)
+    assert proc.returncode == 0, proc.stderr
+    for name in JOBS:
+        exists = env.get("JOB_EXISTS") == "1" or (name.endswith("mirror") and env.get("MIRROR_JOB_EXISTS") == "1")
+        assert _signed_state(_one(calls, "run", "jobs", "update" if exists else "create", name)) == expect
+
+
+@pytest.mark.parametrize("env,message", [
+    ({"WEB_BOT_AUTH": "on", "SECRET_EXISTS": "0"}, "WEB_BOT_AUTH_PRIVATE_KEY does not exist"),
+    ({"WEB_BOT_AUTH": "on", "SECRET_GRANTED": "0"}, "has no roles/secretmanager.secretAccessor"),
+    ({**DARK, "MIRROR_SIGNED": "true", "ENRICHMENT_SIGNED": "false"}, "one job signs"),
+    ({**DARK, "MIRROR_SIGNED": "true", "ENRICHMENT_SIGNED": "true", "SECRET_GRANTED": "0"}, "has no roles/secretmanager.secretAccessor"),
+])
+def test_web_bot_auth_refuses_before_any_write(tmp_path, env, message):
+    proc, calls = _run(tmp_path, "prod", TAG, env=env)
+    assert proc.returncode == 1 and message in proc.stderr, proc.stderr
+    assert not [c for c in calls if c[:3] in (["run", "jobs", "create"], ["run", "jobs", "update"])
+                or c[:3] in (["scheduler", "jobs", "create"], ["scheduler", "jobs", "pause"])]
+
+
+def test_a_bad_web_bot_auth_value_exits_2_before_touching_anything(tmp_path):
+    proc, calls = _run(tmp_path, "prod", TAG, env={"WEB_BOT_AUTH": "yes"})
+    assert proc.returncode == 2 and calls == []
+
+
+def test_the_web_bot_auth_names_are_the_signers_own():
+    from services import crawl_identity
+
+    text = SCRIPT.read_text()
+    assert f"{crawl_identity.FLAG_ENV}=true" in text
+    assert f"{crawl_identity.KEY_ENV}={crawl_identity.KEY_ENV}:latest" in text
+
+
+# ── scope: a job's `--only` list is kept unless changed on purpose ──────────────────────────────
+
+JUDYDOLL_ARGS = '["-m","jobs.reap_cart_proof_refresh","mirror","--on-crawl-egress","--budget-seconds","10800","--only","judydoll.com"]'
+FULL_ARGS = '["-m","jobs.reap_cart_proof_refresh","enrichment","--on-crawl-egress","--budget-seconds","3600"]'
+SPLIT_JUDYDOLL = {"JOB_EXISTS": "1", "TRIGGER_EXISTS": "1", "MIRROR_GATE": "true", "MIRROR_TRIGGER": "ENABLED",
+                  "MIRROR_ARGS": JUDYDOLL_ARGS, "ENRICHMENT_ARGS": FULL_ARGS}
+
+
+def _only(argv: List[str]) -> List[str]:
+    args = _args(argv)
+    return [args[i + 1] for i, a in enumerate(args) if a == "--only"]
+
+
+@pytest.mark.parametrize("flag", ["--enable", "--disable"])
+def test_the_2026_10_08_case_enable_or_disable_keeps_a_judydoll_only_mirror(tmp_path, flag):
+    """Peng's mirror ran `--only judydoll.com`, enrichment was dark; `--enable` widened it to 42 stores."""
+    proc, calls = _run(tmp_path, "prod", TAG, flag, env=SPLIT_JUDYDOLL)
+    assert proc.returncode == 0, proc.stderr
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-mirror")) == ["judydoll.com"]
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-enrichment")) == []
+    assert "== scope: reap-cart-proof-mirror only=judydoll.com (MIRROR_ONLY=unset, kept)" in proc.stdout
+
+
+def test_a_plain_rerun_keeps_each_jobs_own_scope(tmp_path):
+    env = {**DARK, "MIRROR_ARGS": JUDYDOLL_ARGS,
+           "ENRICHMENT_ARGS": FULL_ARGS.replace('"3600"]', '"3600","--only","stilacosmetics.com","--only=bluemercury.com"]')}
+    proc, calls = _run(tmp_path, "prod", TAG, env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-mirror")) == ["judydoll.com"]
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-enrichment")) == [
+        "stilacosmetics.com", "bluemercury.com"]
+
+
+@pytest.mark.parametrize("value,expect", [("all", []), ("judydoll.com,fentybeauty.com", ["judydoll.com", "fentybeauty.com"])])
+def test_mirror_only_sets_or_clears_the_scope_explicitly(tmp_path, value, expect):
+    proc, calls = _run(tmp_path, "prod", TAG, "--enable", env={**SPLIT_JUDYDOLL, "MIRROR_ONLY": value})
+    assert proc.returncode == 0, proc.stderr
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-mirror")) == expect
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-enrichment")) == []
+
+
+@pytest.mark.parametrize("value,expect", [("all", []), ("stilacosmetics.com", ["stilacosmetics.com"])])
+def test_enrichment_only_sets_or_clears_its_own_scope_only(tmp_path, value, expect):
+    env = {**SPLIT_JUDYDOLL, "ENRICHMENT_ARGS": FULL_ARGS.replace('"3600"]', '"3600","--only","bluemercury.com"]'),
+           "ENRICHMENT_ONLY": value}
+    proc, calls = _run(tmp_path, "prod", TAG, "--enable", env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-enrichment")) == expect
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-mirror")) == ["judydoll.com"]
+
+
+def test_new_jobs_walk_every_store(tmp_path):
+    proc, calls = _run(tmp_path, "prod", TAG)
+    for name in JOBS:
+        assert _only(_one(calls, "run", "jobs", "create", name)) == []
+
+
+@pytest.mark.parametrize("var", ["MIRROR_ONLY", "ENRICHMENT_ONLY"])
+@pytest.mark.parametrize("value", ["JudyDoll.com", "judydoll", "a.com;rm", "a.com,,b.com", "https://a.com", " a.com",
+                                   "\njudydoll.com", "judydoll.com\nfentybeauty.com", "judydoll.com\n", "a.com, b.com",
+                                   "a.com,", ",a.com", "a.com,--budget-seconds,1"])
+def test_a_bad_scope_value_exits_2_before_touching_anything(tmp_path, var, value):
+    proc, calls = _run(tmp_path, "prod", TAG, "--enable", env={**SPLIT_JUDYDOLL, var: value})
+    assert proc.returncode == 2 and f"{var} must be" in proc.stderr and calls == []
+
+
+@pytest.mark.parametrize("args", ['"not-a-list"', '["-m","x","--only"]', '["--only",""]',
+                                  '["--only","--budget-seconds"]', '["--only","a.com,b.com"]', '["--only","a b.com"]'])
+def test_an_unreadable_scope_refuses_before_any_write(tmp_path, args):
+    proc, calls = _run(tmp_path, "prod", TAG, env={**DARK, "MIRROR_ARGS": args})
+    assert proc.returncode == 1 and "could not read reap-cart-proof-mirror's current --only args" in proc.stderr
+    assert not [c for c in calls if c[:3] in (["run", "jobs", "create"], ["run", "jobs", "update"])]
+
+
+def test_kept_scope_args_still_parse_as_the_wrapper_cli(tmp_path):
+    from jobs import reap_cart_proof_refresh as wrapper
+
+    _proc, calls = _run(tmp_path, "prod", TAG, "--enable", env=SPLIT_JUDYDOLL)
+    args = _args(_one(calls, "run", "jobs", "update", "reap-cart-proof-mirror"))
+    assert args[:2] == ["-m", "jobs.reap_cart_proof_refresh"]
+    parsed = wrapper._parse(args[2:])
+    assert parsed.lane == "mirror" and parsed.only == ["judydoll.com"] and parsed.on_crawl_egress
+
+
+def _mirror_json_reads(tmp_path) -> int:
+    """How many `run jobs describe reap-cart-proof-mirror --format=json` calls a clean --enable makes."""
+    _proc, calls = _run(tmp_path, "prod", TAG, "--enable", env=SPLIT_JUDYDOLL)
+    return sum(1 for c in calls if c[:4] == ["run", "jobs", "describe", "reap-cart-proof-mirror"] and c[-1] == "--format=json")
+
+
+def test_a_failed_scope_read_on_an_existing_job_refuses_instead_of_widening(tmp_path):
+    """The SCOPE read of the mirror fails (reads as "absent") while every other read works: writing would
+    replace a judydoll-only job with all 42 stores. It must refuse before any write."""
+    # The mirror's json reads are, in order, the gate, signing and SCOPE reads, and nothing else: a
+    # second scope read would let one transient failure be papered over by the next answer.
+    (tmp_path / "count").mkdir()
+    assert _mirror_json_reads(tmp_path / "count") == 3
+    proc, calls = _run(tmp_path, "prod", TAG, "--enable",
+                       env={**SPLIT_JUDYDOLL, "JSON_FAIL_NTH": "reap-cart-proof-mirror:3"})
+    assert proc.returncode == 1 and "read as missing, then exists" in proc.stderr, proc.stderr
+    assert not [c for c in calls if c[:3] in (["run", "jobs", "create"], ["run", "jobs", "update"])]
+
+
+@pytest.mark.parametrize("nth", [1, 2])
+def test_a_failed_earlier_read_never_writes_the_mirror_without_its_scope(tmp_path, nth):
+    proc, calls = _run(tmp_path, "prod", TAG, "--enable", env={**SPLIT_JUDYDOLL, "JSON_FAIL_NTH": f"reap-cart-proof-mirror:{nth}"})
+    updates = [c for c in calls if c[:4] == ["run", "jobs", "update", "reap-cart-proof-mirror"]]
+    assert all(_only(c) == ["judydoll.com"] for c in updates), (proc.returncode, proc.stderr)
+
+
+@pytest.mark.skipif(not Path("/bin/bash").exists(), reason="no /bin/bash")
+def test_the_2026_10_08_case_under_the_systems_own_bash(tmp_path):
+    """The operator runs `bash` from a Mac (/bin/bash 3.2); the harness's PATH bash may be 5.x."""
+    proc, calls = _run(tmp_path, "prod", TAG, "--enable", env=SPLIT_JUDYDOLL, shell="/bin/bash")
+    assert proc.returncode == 0, proc.stderr
+    assert _only(_one(calls, "run", "jobs", "update", "reap-cart-proof-mirror")) == ["judydoll.com"]
+    bad, calls = _run(tmp_path, "prod", TAG, env={"MIRROR_ONLY": "\njudydoll.com"}, shell="/bin/bash")
+    assert bad.returncode == 2 and calls == []
+
+
+def test_a_scope_read_and_an_existence_check_both_failing_never_update_without_the_scope(tmp_path):
+    """Two transient failures in a row: the scope read AND the one existence check. The job is then
+    CREATED (which real gcloud refuses for an existing job, loudly), never updated with no --only."""
+    proc, calls = _run(tmp_path, "prod", TAG, "--enable", env={
+        **SPLIT_JUDYDOLL, "JSON_FAIL_NTH": "reap-cart-proof-mirror:3", "PLAIN_FAIL_NTH": "reap-cart-proof-mirror:1"})
+    assert not [c for c in calls if c[:4] == ["run", "jobs", "update", "reap-cart-proof-mirror"]], proc.stdout
+    plain = [c for c in calls if c[:4] == ["run", "jobs", "describe", "reap-cart-proof-mirror"] and c[-1] != "--format=json"]
+    assert len(plain) == 1  # existence is checked once, and the write's verb comes from that check

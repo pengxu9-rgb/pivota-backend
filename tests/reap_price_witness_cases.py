@@ -422,7 +422,7 @@ async def test_an_exact_quote_clears_a_stale_live_price(reap, monkeypatch):
 
 # ── the mirror lane: no recorded currency, no corroboration ──────────────────────────────────
 
-from scripts.backfill_shopify_variant_ids import build_cart_proof  # noqa: E402
+from scripts.backfill_shopify_variant_ids import build_cart_proof, js_live_prices  # noqa: E402
 from services.shopify_variant_identity import parse_product_js, stamp_variant_ids  # noqa: E402
 
 JUDY_JS = json.loads((FIXTURES / "judydoll_silky_matte_lip_ink_products_js_2026_09_29.json").read_text())
@@ -436,16 +436,20 @@ JUDY_SEED_ID = "price_witness_judy_seed"
 
 def backfilled_seed(*, checked_at, currency=None):
     """What the backfill writes into seed_data for this fetch: its own functions, its own proof.
-    `currency` adds the key NO writer records today -- the forward contract only."""
+    `currency` is the market currency the fetch was verifiably read in (`market_read_currency`),
+    priced by the writer's own `js_live_prices` exactly as `run()` does; None = a fetch whose
+    currency was not verified, which the writer records with no price at all."""
     seed = copy.deepcopy(JUDY_SEED["seed_data"])
     live = parse_product_js(JUDY_JS)
     new_variants, _ = stamp_variant_ids(seed["snapshot"]["variants"], live)
     proof = build_cart_proof(seed, new_variants, JUDY_JS, live, js_url=JUDY_JS_URL,
                              page_url=JUDY_SEED["canonical_url"], shop_host=JUDY_HOST,
-                             checked_at=checked_at)
-    assert proof["price_minor"] == 1399 and "currency" not in proof  # the real shape
-    if currency is not None:
-        proof["currency"] = currency
+                             checked_at=checked_at,
+                             live_prices=js_live_prices(JUDY_JS, currency))
+    if currency is None:
+        assert (proof["price_minor"], proof["currency"], proof["price_source"]) == (None, None, None)
+    else:
+        assert (proof["price_minor"], proof["currency"], proof["price_source"]) == (1399, currency, "products_js_v1")
     seed["snapshot"].update({"variants": new_variants, "shopify_cart_proof": proof})
     return seed
 
@@ -506,19 +510,22 @@ async def judy_quote(reap, our_price):
 @pytest.mark.parametrize("our_price", [1499, 1299], ids=["lower", "higher"])
 async def test_a_mirror_proof_without_a_recorded_currency_never_corroborates(
         reap, monkeypatch, mirror_tables, our_price):
-    """THE CURRENCY DECISION. The backfill's real proof carries `price_minor` 1399 and no
-    currency (products.js has none). Accepting it on the row's or the seed's currency would be an
-    assumption, so it refuses as today -- the mutant that drops the currency rule continues."""
+    """THE CURRENCY DECISION. A fetch whose currency was not verified (no `cart_currency` cookie,
+    or not the market's) writes a proof with no price and no currency, so it refuses. And a
+    proof that states a price but no currency (an older writer's x100 audit number) refuses too:
+    accepting it on the row's or the seed's currency would be an assumption."""
     corroboration_on(monkeypatch)
-    await seed_mirror(backfilled_seed(checked_at=datetime.now(timezone.utc) - timedelta(hours=1)))
+    seed = backfilled_seed(checked_at=datetime.now(timezone.utc) - timedelta(hours=1))
+    seed["snapshot"]["shopify_cart_proof"]["price_minor"] = 1399  # the pre-currency writer's shape
+    await seed_mirror(seed)
     purchase_id, result = await judy_quote(reap, our_price)
     assert result.last_error_code == "quote_items_subtotal_mismatch", result
     assert (await get(purchase_id))["live_unit_price_minor"] == 1399
 
 
 async def test_a_mirror_proof_that_records_its_currency_corroborates(reap, monkeypatch, mirror_tables):
-    """The forward contract: once the writer records the currency it read, the reader accepts it
-    (and the read itself -- product -> seed, both dialects -- is the one exercised here)."""
+    """The writer records the currency it read, so the reader accepts its price (and the read
+    itself -- product -> seed, both dialects -- is the one exercised here)."""
     corroboration_on(monkeypatch)
     await seed_mirror(backfilled_seed(checked_at=datetime.now(timezone.utc) - timedelta(hours=1),
                                       currency="USD"))
@@ -1100,7 +1107,7 @@ def _currency_seed(**proof_over):
 
 
 def test_mirror_control_and_each_guard():
-    """The mirror reader's guards one by one, on the backfill's own proof (+ the currency key)."""
+    """The mirror reader's guards one by one, on the backfill's own currency-verified proof."""
     assert _mirror(_currency_seed()) == 1399
     assert _mirror(_currency_seed(), variant_id="49819267170581") is None   # a sibling shade
     assert _mirror(_currency_seed(available=False)) is None
@@ -1119,18 +1126,21 @@ def test_only_a_positive_integer_price_corroborates(price):
 
 
 def test_the_mirror_proofs_must_agree():
-    """The backfill's per-variant proof beside its named proof: once both state a price (the
-    forward contract), they must state the same one."""
+    """The backfill's per-variant proof beside its named proof: both state a price, and they must
+    state the same one."""
     from scripts.backfill_shopify_variant_ids import build_selected_variant_proofs
 
     seed = _currency_seed()
     selected = build_selected_variant_proofs(seed["snapshot"]["variants"], JUDY_JS, js_url=JUDY_JS_URL,
-                                             checked_at=datetime.now(timezone.utc) - timedelta(hours=1))
+                                             checked_at=datetime.now(timezone.utc) - timedelta(hours=1),
+                                             live_prices=js_live_prices(JUDY_JS, "USD"))
     assert set(selected) == {JUDY_VARIANT}, selected  # the real producer's shape
-    for price, expected in ((1499, None), (1399, 1399)):
-        seed["snapshot"]["shopify_cart_variant_proofs"] = {
-            JUDY_VARIANT: {**selected[JUDY_VARIANT], "price_minor": price, "currency": "USD"}}
-        assert _mirror(seed) == expected
+    assert (selected[JUDY_VARIANT]["price_minor"], selected[JUDY_VARIANT]["currency"]) == (1399, "USD")
+    seed["snapshot"]["shopify_cart_variant_proofs"] = selected
+    assert _mirror(seed) == 1399
+    seed["snapshot"]["shopify_cart_variant_proofs"] = {
+        JUDY_VARIANT: {**selected[JUDY_VARIANT], "price_minor": 1499}}
+    assert _mirror(seed) is None
 
 
 
