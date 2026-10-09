@@ -177,7 +177,7 @@ arrival).
 | variable | default | bounds | what it does |
 |---|---|---|---|
 | `MERCHANT_PURCHASABILITY_SWEEP_ENABLED` | **unset = off** | truthy allowlist: `1`, `true`, `on`, `yes` (case/space-insensitive) | **DIAL 1 of 2** (`db.merchant_purchasability.is_sweep_enabled`). Gates the sweep JOB and nothing else. Off = the job contacts no merchant, which matters because every check creates an abandoned checkout on a live store. **Set on the sweep's Cloud Run Job by `setup_merchant_purchasability_sweep_job.sh` — `--enable` sets it true, a run without the flag sets it false.** A value on `web` or `worker` does nothing to the sweep (on `web` it only feeds the ops route's informational `sweep_enabled`) |
-| `MERCHANT_PURCHASABILITY_ENFORCE` | **unset = off** | same truthy allowlist | **DIAL 2 of 2** (`db.merchant_purchasability.is_enforcement_enabled`). Gates the CONSUMERS and nothing else: the Reap route's `merchant_not_purchasable` refusal and the checkout tier's downgrade. Off = a missing fact refuses nothing. Also the `enforced` field the gateway reads |
+| `MERCHANT_PURCHASABILITY_ENFORCE` | **unset = off** | same truthy allowlist | **DIAL 2 of 2** (`db.merchant_purchasability.is_enforcement_enabled`). Gates the CONSUMERS and nothing else: the Reap route's `merchant_not_purchasable` refusal, the checkout tier's downgrade, and the offers.resolve and product-card cart mints (a browse-only merchant is minted a `referral_only` PDP instead of a prefilled cart — see "The offers.resolve mint" and "The product-card lanes" in §9). Off = a missing fact refuses nothing. Also the `enforced` field the gateway reads |
 | `MERCHANT_PURCHASABILITY_TTL_HOURS` | `72` | `1`–`720` | how long one positive fact stays positive. 720 h is 30 days; past that "fresh" is not a word that means anything |
 | `MERCHANT_PURCHASABILITY_BUYER_VANTAGE` | `worker` | any string, truncated to 32 chars | the vantage `is_purchasable` demands a positive fact **FROM**. See §6 — this is the dial that decides whose question the gate is answering |
 | `VANTAGE_PROXY_URL` | **unset** | must start `http://` or `https://`, else ignored | when set, every merchant is ALSO checked through that proxy and recorded under vantage `proxy`. Anything else is ignored rather than handed to httpx, which would raise inside the run |
@@ -756,7 +756,8 @@ abandoned checkouts double). A dark job executed by hand exits 0 and contacts no
    something, and §6 is where to look.
 5. **Verify coverage merchant by merchant** through
    `GET /ops/merchant-purchasability?domain=…&market=…`. Every merchant you expect to be
-   purchasable must read `"tier": "purchase"`. If one stays `browse_only`, the response's `note`
+   purchasable must read `"tier": "purchase"` (and `"human_handoff_tier": "purchase"` for a cart
+   handed to a human — `NO_CARD_PAYMENT` reads `browse_only` / `purchase`). If one stays `browse_only`, the response's `note`
    names the three candidate reasons — a positive row under a DIFFERENT vantage, an expired
    window, or two consecutive negatives — and §7's demotion query tells you which. **Do not skip
    this step:** it is the only thing standing between step 6 and a 409 on a live merchant.
@@ -1099,6 +1100,101 @@ carries no market today, so it cannot be keyed and keeps failing open; it must f
 market carrier (the buyer's shipping country, or the market the session was created for) before
 the re-read can ask this route. Once it does, it may call this route with no `market` and will get
 the explicit `market_unknown` answer instead of a 422.
+
+### The offers.resolve mint (2026-09-27)
+
+`offers.resolve` mints an `/r` link per external-seed offer, and where it can build a Shopify cart
+permalink the link lands the buyer **in a prefilled cart** (`join_mode: cart_permalink`). The
+warm-handoff click lane deliberately skips a cart join (`is_already_cart_join`), so nothing between
+the mint and the buyer ever asked this fact — a merchant the Reap rail refuses was still handed out
+as a one-click cart. Measured on prod 2026-09-27: 432 active-seed offers mint a cart, **358 of them
+(47 of 53 hosts) with no positive fact in any market**.
+
+Under `MERCHANT_PURCHASABILITY_ENFORCE` the mint (`routes/agent_shop_gateway._CartPurchasabilityGate`)
+now asks first. **It asks the HUMAN cart's question, `human_handoff_allowed`, not the Reap rail's
+`is_purchasable`** (Peng, 2026-10-09):
+
+| state | cart? | DB read |
+|---|---|---|
+| dial off | kept — byte-identical token and payload | none |
+| dial on, request names no ISO-2 market (`market_unknown`) | **declined** | none |
+| dial on, a fresh fact from the buyer vantage with verdict `ELIGIBLE`, `NO_CARD_PAYMENT` or `PRICE_DRIFT` | kept | one per host per request |
+| dial on, a fresh fact nobody can buy under: `LOGIN_REQUIRED`, `PASSWORD_PAGE`, `NOT_ACCEPTING_ORDERS`, `VARIANT_GONE` | **declined** | one per host per request |
+| dial on, anything else (no row, last check older than the TTL, an unverifiable verdict, wrong vantage, DB error) | **declined** | one per host per request |
+
+**Why the two readers part on `NO_CARD_PAYMENT`.** That verdict means the checkout's accept-list
+was read and holds no *on-site* card line. For the Reap rail — a card paid with nobody present —
+that is a confirmed negative. For a human it is nothing: the PR controller's spot-check on
+2026-10-09 found **643 of 839 negative cart seeds (26 hosts) were `NO_CARD_PAYMENT`**, and most of
+those checkouts take cards through an *offsite* provider (Eximbay, Payfast, "Pay via Cards /
+Wallets / Bank Transfer") that a human completes without noticing; the rest take PayPal. The
+first cut of this gate (`is_purchasable`) would have turned every one of them into a referral.
+Freshness for the human reader is the **last check inside the TTL** (`checked_at`), because
+`positive_until` is armed only by `ELIGIBLE` + card and the whole point is a verdict that never
+arms it. The preflight, the sweep and the fact's three write rules are unchanged; `is_purchasable`
+and the Reap rail are unchanged.
+
+The ops route publishes both answers: `tier` (the rail's) and `human_handoff_tier` (the mints').
+**The gateway's own gate (`PIVOTA-Agent src/offers/offersPriority.js`) strips `execution_spec.cart_url`
+on `tier`** — the rail's field — so when armed it has the same defect on human carts; it must read
+`human_handoff_tier` instead.
+
+A decline removes the **cart**, never the offer: `execution_spec.cart_url` / `variant_id` null,
+`rail: referral`, `tracking.join_mode: referral_only`, `cart_prefilled: false`, and the `/r` hop
+signs the attributed PDP. The token ctx carries `purchasability_tier: browse_only`, and
+`evaluate_warm_eligibility` knocks such a token out (`warm_reason=purchase_declined`) — otherwise
+the warm lane would rebuild the refused cart at click time. The key is absent on every other
+token.
+
+The market is the **request's** (`payload.market`), never the seed row's listing market and never
+the `or "US"` serving default. So a market-less caller (the UCP `get_offers` tool today) loses its
+carts even on merchants that are positive for US — the same answer the gateway's own gate gives.
+
+**A declared storefront market is a market; a per-request fallback is not** (Peng, 2026-10-09).
+"Never default a market" forbids a *fallback*: a value a door fills in when the caller said nothing
+(`or "US"`, a browser language, a geo-IP guess made on the caller's behalf). It does not forbid a
+*declaration*: a surface that serves exactly one market may state that market on every call, and
+the door then has a real buyer market to key on. agent.pivota.cc's `STOREFRONT_MARKET = 'US'`
+(agent-ui #376) is such a declaration — the storefront prices everything in USD and offers no
+other market — and it keys this gate correctly. The distinction is *who decided*: the surface that
+owns the buyer relationship declares; a door downstream never guesses. When agent-ui starts
+serving a buyer's own market (from their location, as the partner surfaces do with
+`buyer_region`), it declares that market per request instead; the rule and the gate do not change.
+
+Measured 2026-10-09, 7 days: of 242 find_products_multi requests reaching this door, the 216
+market-less ones were CI gates and probes, the gateway's own re-invokes and the Aurora chat skill —
+not buyers (see the PIVOTA-Agent follow-ups). Real buyers through agent.pivota.cc already carry
+the declaration.
+
+### The product-card lanes (2026-09-27)
+
+The card lanes mint the same seeds' cart links, and now ask the same gate with the same table
+above. Each builds **one gate per request on its request carrier** — the value its
+`request_market_observed` reads — and decides **before** the mint, so the nulled cart id feeds
+both the mint and `_seed_attribution_from_redirect` (which refuses unless its recomposed primary
+equals the signed dest). A declined card has no `cart_url`, `tracking.join_mode: referral_only`,
+an attributed PDP `destination_url`, and the same `purchasability_tier: browse_only` in its token.
+
+| lane | request market | volume, 14 days to 2026-09-27 |
+|---|---|---|
+| `POST /attribution/external-seed-links` (`mint_external_seed_links`) | `body.market` (never `candidate.market`, which is the seed row's) | 477 calls from the gateway (464 × 200, 13 × 504) |
+| find_products_multi seed cards + `_build_prefetched_external_seed_wrappers` | `_request_market_for_multi` (`search.market`, then `metadata.market`); **one gate shared by both** | 2,658 at the gateway door; 404 caller requests reached this door, **389 (96%) named no market** (`multi.invoke.market`) |
+| `_attach_connected_product_redirects` | its `request_market` keyword: `_request_market_for_multi` from the find_products_multi wrapper, `metadata.market` from find_products / get_product_detail | find_products 0, get_product_detail 1 |
+
+What that means under enforcement:
+
+* **A market-less find_products_multi request gets no seed carts at all** — 96% of them today,
+  until the UI sends `metadata.market` (agent-ui #376). With a market, only hosts with a fresh
+  positive worker fact keep their cart.
+* **Connected-store cards are referrals** until the sweep covers them: its population is the Reap
+  variant ledger plus the Tier B cart-link allowlist, and connected stores are in neither.
+  Measured 2026-09-27: 2 active connected Shopify stores (one host, 2 cached products), 0 facts.
+  The connected lane's served `market` and its `market_observed` are unchanged; only the gate reads
+  `request_market`.
+* A link the caller hands the prefetched lane already minted (`external_redirect_url` on the
+  candidate) is left as minted. The gateway's JS-built candidates carry none today.
+* `tests/test_purchase_gate_market_not_defaulted.py::test_every_purchasability_gate_is_built_on_the_request_market`
+  resolves every `_CartPurchasabilityGate(...)` argument back to its leaves against an exact list.
 
 ### Rolling back
 

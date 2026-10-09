@@ -2126,13 +2126,14 @@ async def test_the_ops_route_normalises_a_present_market_instead_of_refusing_it(
 
 
 async def test_the_ops_route_with_a_market_is_unchanged_apart_from_a_null_reason(_db, ops_app):
-    """Zero-diff for a keyed request: the only new key is `reason`, and it is null. PINNED
-    LITERALS — the key set and note below are main's response (2a590bb9c) plus `reason`."""
+    """Zero-diff for a keyed request: the only new keys are `reason` (null) and, since
+    2026-10-09, `human_handoff_tier`. PINNED LITERALS — the key set and note below are main's
+    response (2a590bb9c) plus those two."""
     await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
     body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=judydoll.com&market=us")).json()
     assert set(body) == {
-        "domain", "market", "tier", "reason", "enforced", "buyer_vantage", "sweep_enabled",
-        "ttl_hours", "facts", "note",
+        "domain", "market", "tier", "human_handoff_tier", "reason", "enforced", "buyer_vantage",
+        "sweep_enabled", "ttl_hours", "facts", "note",
     }
     assert body["reason"] is None
     assert (body["domain"], body["market"], body["tier"]) == ("judydoll.com", "US", "purchase")
@@ -3303,3 +3304,120 @@ async def test_web_bot_auth_signs_the_direct_vantage_and_leaves_the_proxy_vantag
     assert all(r.headers["user-agent"] == crawl_identity.DECLARED_USER_AGENT and "signature" in r.headers for r in direct)
     assert all(r.headers["user-agent"] == sweep.USER_AGENT and "signature" not in r.headers for r in via_proxy)
     crawl_identity.reset_for_tests()
+
+
+# ══ the HUMAN-HANDOFF reader (2026-10-09) ═══════════════════════════════════════════════════
+#
+# `is_purchasable` answers the headless card rail; `human_handoff_allowed` answers the cart mints
+# that hand a prefilled cart to a human. They part on NO_CARD_PAYMENT: a checkout read with no
+# on-site card line refuses the rail and keeps the human cart, because a human pays by whatever the
+# checkout offers (PayPal, an offsite card provider, a bank transfer). Measured 2026-10-09: 643 of
+# 839 negative cart seeds were NO_CARD_PAYMENT. Peng's decision.
+
+_HUMAN_ALLOWED = {"ELIGIBLE", "NO_CARD_PAYMENT", "PRICE_DRIFT"}
+
+
+def test_the_human_allow_list_partitions_every_verdict_with_the_rails_sets():
+    """Every verdict is exactly one of: human-allowed, a nobody-can-buy negative, or unverifiable
+    — so a verdict added to the enum lands in a test, not in a silent default."""
+    every = {v.value for v in Verdict}
+    assert mp.HUMAN_HANDOFF_VERDICTS == _HUMAN_ALLOWED
+    nobody_can_buy = set(mp.NEGATIVE_VERDICTS) - mp.HUMAN_HANDOFF_VERDICTS
+    assert nobody_can_buy == {"LOGIN_REQUIRED", "NOT_ACCEPTING_ORDERS", "VARIANT_GONE"}
+    assert mp.HUMAN_HANDOFF_VERDICTS.isdisjoint(UNVERIFIABLE)
+    assert mp.HUMAN_HANDOFF_VERDICTS | nobody_can_buy | set(UNVERIFIABLE) == every, (
+        every - (mp.HUMAN_HANDOFF_VERDICTS | nobody_can_buy | set(UNVERIFIABLE)))
+    assert "PASSWORD_PAGE" in UNVERIFIABLE, "a password wall declines the human cart too"
+
+
+@pytest.mark.parametrize("verdict", sorted(v.value for v in Verdict))
+async def test_every_verdict_answers_the_human_reader_from_a_real_row(_db, verdict):
+    """CONTRACT over real `record_check` rows: one fresh row per verdict, from the buyer vantage.
+    The card flag is whatever that verdict would carry (False for NO_CARD_PAYMENT, True for
+    ELIGIBLE, unknown otherwise); it never decides the human answer."""
+    card = {"ELIGIBLE": True, "NO_CARD_PAYMENT": False}.get(verdict)
+    assert await mp.record_check("judydoll.com", "US", res(verdict, card=card)) is not None
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is (verdict in _HUMAN_ALLOWED), verdict
+    # The rail's reader is unchanged: only ELIGIBLE + card opens it.
+    assert await mp.is_purchasable("judydoll.com", "US") is (verdict == "ELIGIBLE")
+
+
+async def test_a_no_card_payment_row_keeps_the_human_cart_however_many_times_it_repeats(_db):
+    """Two consecutive NO_CARD_PAYMENT checks DEMOTE the rail (rule 2) — and the human cart stays,
+    because demotion is `positive_until`, which this reader does not consult."""
+    for _ in range(3):
+        await mp.record_check("flowerbeauty.com", "US", res("NO_CARD_PAYMENT", card=False))
+    row = await _row("flowerbeauty.com")
+    assert row["consecutive_failures"] == 3 and row["positive_until"] is None
+    assert await mp.is_purchasable("flowerbeauty.com", "US") is False
+    assert await mp.human_handoff_allowed("flowerbeauty.com", "US") is True
+
+
+async def test_a_stale_fact_does_not_open_the_human_cart(_db):
+    """Freshness is the LAST CHECK inside the TTL, not `positive_until`. A row nobody has
+    re-checked for longer than the TTL says nothing about today's checkout."""
+    await mp.record_check("judydoll.com", "US", res("NO_CARD_PAYMENT", card=False))
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+    past = datetime.now(timezone.utc) - timedelta(hours=mp.ttl_hours() + 1)
+    await _set("checked_at", past.strftime("%Y-%m-%d %H:%M:%S") if not IS_POSTGRES else past)
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is False
+    # Just inside the window still answers.
+    recent = datetime.now(timezone.utc) - timedelta(hours=mp.ttl_hours() - 1)
+    await _set("checked_at", recent.strftime("%Y-%m-%d %H:%M:%S") if not IS_POSTGRES else recent)
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+
+
+async def test_the_human_reader_reads_the_buyer_vantage_only(_db, monkeypatch):
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True), vantage="proxy")
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is False, "default vantage is worker"
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_BUYER_VANTAGE", "proxy")
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+
+
+async def test_the_human_reader_is_per_market_and_never_defaults_one(_db, monkeypatch):
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+    assert await mp.human_handoff_allowed("judydoll.com", "SG") is False
+    calls = []
+    real = database.fetch_one
+
+    async def _spy(*a, **k):
+        calls.append(a)
+        return await real(*a, **k)
+
+    monkeypatch.setattr(database, "fetch_one", _spy)
+    for unknown in (None, "", "  ", "USA", "U1"):
+        assert await mp.human_handoff_allowed("judydoll.com", unknown) is False
+    assert calls == [], "an unknown market is answered without a database read"
+
+
+async def test_the_human_reader_fails_closed_when_the_database_raises(_db, monkeypatch):
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+
+    async def _explode(*args, **kwargs):
+        raise RuntimeError("pool exhausted")
+
+    monkeypatch.setattr(database, "fetch_one", _explode)
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is False
+
+
+async def test_the_ops_route_publishes_the_human_tier_beside_the_rails(_db, ops_app, monkeypatch):
+    """The gateway's gate strips a human cart on `tier`; it must have the human answer to read
+    instead. The two part on NO_CARD_PAYMENT and nowhere else in this table."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("flowerbeauty.com", "US", res("NO_CARD_PAYMENT", card=False))
+    await mp.record_check("luafee.com", "US", res("NOT_ACCEPTING_ORDERS"))
+    expected = {
+        "judydoll.com": ("purchase", "purchase"),
+        "flowerbeauty.com": ("browse_only", "purchase"),
+        "luafee.com": ("browse_only", "browse_only"),
+        "never-seen.com": ("browse_only", "browse_only"),
+    }
+    for domain, (tier, human) in expected.items():
+        body = (await ops_get(ops_app, f"/ops/merchant-purchasability?domain={domain}&market=US")).json()
+        assert (body["tier"], body["human_handoff_tier"]) == (tier, human), domain
+    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=judydoll.com")).json()
+    assert (body["tier"], body["human_handoff_tier"], body["reason"]) == (
+        "browse_only", "browse_only", "market_unknown")

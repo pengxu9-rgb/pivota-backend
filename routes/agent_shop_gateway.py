@@ -37,7 +37,12 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
-from services.outbound_warm_handoff import could_upgrade_at_click_time
+from services.outbound_warm_handoff import (
+    PURCHASABILITY_BROWSE_ONLY,
+    PURCHASABILITY_TIER_KEY,
+    could_upgrade_at_click_time,
+)
+import db.merchant_purchasability as merchant_purchasability
 from services.offer_buyability import (
     OFFER_UNAVAILABLE_AVAILABILITIES,
     availability_is_known_unavailable,
@@ -4532,6 +4537,10 @@ async def _handle_offers_resolve(
     # per call would re-ask for product keys the previous call already loaded. It holds only a
     # memo and counters; every lookup failure inside it answers "no id", never a wrong one.
     _handover_resolver = HandoverVariantResolver()
+    # ONE purchasability gate for the WHOLE request, for the same reason: its memo is per host,
+    # and its dial is read once. Keyed on the REQUEST's market (`market_hint`), never a row's —
+    # the same provenance `market_observed` below is decided by.
+    _cart_purchasability = _CartPurchasabilityGate(market_hint)
 
     async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
         # ONE statement for every product key this batch is about to hand over, BEFORE the
@@ -4840,6 +4849,17 @@ async def _handle_offers_resolve(
                         redirect_identity = dict(redirect_identity)
                         redirect_identity["cart_variant_id"] = None
 
+                # MERCHANT PURCHASABILITY — would this cart land a buyer on a store the fact
+                # says cannot take their card in this market? Asked on the cart the mint WOULD
+                # build (the same `resolve_cart_permalink` it calls, on the same inputs), so a
+                # referral-only offer never asks. A decline takes the preflight's road — null
+                # the cart id, so the mint, the published spec and `cart_prefilled` all follow
+                # from the one value — and is signed into the token so the warm lane cannot
+                # rebuild the cart at click time. See `_CartPurchasabilityGate`.
+                redirect_identity, _purchasability_tier = await _cart_purchasability.gate_identity(
+                    redirect_identity, destination_url=str(canonical_url or destination_url),
+                )
+
                 # COUNTED AFTER THE GATE, not before it. Its comment defines it as "how many
                 # hand-overs actually got a cart"; counted at `_cart_vid` above it also counted
                 # the ones this very request then withdrew, so the number contradicted its own
@@ -4873,6 +4893,7 @@ async def _handle_offers_resolve(
                         "source": "offers.resolve",
                         **({"skuId": sku_id} if sku_id else {}),
                         **({"productId": product_id} if product_id else {}),
+                        **({PURCHASABILITY_TIER_KEY: _purchasability_tier} if _purchasability_tier else {}),
                     },
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
@@ -4929,6 +4950,7 @@ async def _handle_offers_resolve(
                     # The link we JUST minted, so the resolve-time rollout bucket is computed
                     # from the very token the click will carry.
                     redirect_url=redirect_url,
+                    purchasability_tier=_purchasability_tier,
                 )
 
                 offer_spec = {
@@ -6392,7 +6414,11 @@ async def _handle_offers_resolve(
             _coverage["preflight_degraded_to_referral"],
             _coverage["preflight_answered_fraction"],
         ) if _coverage else ""
-    ) + handover_coverage_message(_handover_fields)
+    ) + handover_coverage_message(_handover_fields) + (
+        " purchasability asked=%d declined=%d" % (
+            _cart_purchasability.stats["asked"], _cart_purchasability.stats["declined"],
+        ) if _cart_purchasability.stats["declined"] or _cart_purchasability.stats["asked"] else ""
+    )
     logger.info(
         _summary_msg,
         extra={
@@ -6890,6 +6916,11 @@ async def _attach_connected_product_redirects(
     *,
     market: Optional[str] = None,
     tool: Optional[str] = None,
+    # THE BUYER REQUEST'S market, raw, for the purchasability gate ONLY. Separate from `market`
+    # on purpose: `market` is what the token SERVES (and its provenance), which no caller names,
+    # and threading the request market through it would change every connected token. Absent =
+    # no usable market, which under MERCHANT_PURCHASABILITY_ENFORCE declines every cart here.
+    request_market: Optional[str] = None,
 ) -> None:
     """P2b (attributed-redirect lane): stamp signed /r attribution links onto
     CONNECTED-merchant product cards, in place. External-seed cards are already
@@ -6911,6 +6942,13 @@ async def _attach_connected_product_redirects(
     connection IS the policy) — market allowlists govern external seeds, not
     connected merchants. Fail-soft: any error leaves cards unchanged; one
     domain lookup per merchant and one mint per (dest, variant) per request.
+
+    MERCHANT PURCHASABILITY: a cart is minted only when `_CartPurchasabilityGate`
+    (on `request_market`) allows its host, exactly as on the seed lanes. The sweep
+    that writes the facts does not visit connected stores (its population is the
+    Reap and Tier B allowlists), so under enforcement a connected Shopify card is a
+    referral until one is added there. Measured 2026-09-27: 2 active connected
+    Shopify stores, one host, 2 cached products, 0 facts.
     """
     try:
         if not isinstance(products, list):
@@ -6949,6 +6987,7 @@ async def _attach_connected_product_redirects(
                 store_domains[merchant_id] = by_platform
 
         mint_cache: Dict[str, Optional[str]] = {}
+        cart_purchasability = _CartPurchasabilityGate(request_market)
         for p in candidates:
             merchant_id = str(p.get("merchant_id") or "").strip()
             platform = str(p.get("platform") or "").strip().lower()
@@ -6984,7 +7023,22 @@ async def _attach_connected_product_redirects(
                     variant_id = str(v.get("variant_id") or v.get("id")).strip()
                     break
 
-            cache_key = "||".join([used_market, used_tool, dest, variant_id or ""])
+            # Decided BEFORE the mint. `cart_variant_id` is the cart's ONLY input (see the note
+            # at the mint), so nulling it here gives the referral; `variant_id` stays the
+            # attribution value it always was. The same nulled id feeds the recompose below.
+            cart_variant_id: Optional[str] = variant_id
+            purchasability_tier = await cart_purchasability.decline_tier(
+                destination_url=dest,
+                shop_domain=shop_domain,
+                platform=platform or None,
+                cart_variant_id=cart_variant_id,
+            )
+            if purchasability_tier:
+                cart_variant_id = None
+
+            cache_key = "||".join(
+                [used_market, used_tool, dest, variant_id or "", str(purchasability_tier or "")]
+            )
             if cache_key in mint_cache:
                 redirect_url = mint_cache[cache_key]
             else:
@@ -6998,7 +7052,10 @@ async def _attach_connected_product_redirects(
                     tool=used_tool,
                     destination_url=dest,
                     utm_template=None,
-                    ctx={"source": "connected_catalog"},
+                    ctx={
+                        "source": "connected_catalog",
+                        **({PURCHASABILITY_TIER_KEY: purchasability_tier} if purchasability_tier else {}),
+                    },
                     # The merchant's own connected store is the trust basis. Allow both the
                     # destination host and the connected shop domain — online_store_url may
                     # live on a custom domain while the connection stores the .myshopify one.
@@ -7010,7 +7067,8 @@ async def _attach_connected_product_redirects(
                     # catalog sync (p["variants"][].variant_id), so for a shopify-platform
                     # store it is the Shopify-issued variant id. Passed explicitly because the
                     # builder has no fallback — a caller that cannot justify its id passes None.
-                    cart_variant_id=variant_id,
+                    # None too when the purchasability fact declined this cart (above).
+                    cart_variant_id=cart_variant_id,
                     shop_domain=shop_domain,
                     platform=platform or None,
                 )
@@ -7028,7 +7086,7 @@ async def _attach_connected_product_redirects(
                     tool=used_tool,
                     shop_domain=shop_domain,
                     platform=platform or None,
-                    cart_variant_id=variant_id,
+                    cart_variant_id=cart_variant_id,
                 )
                 if attribution and p.get("destination_url"):
                     attribution = {**attribution, "destination_url": None}
@@ -9124,11 +9182,139 @@ def _redirect_token_from_url(redirect_url: str) -> str:
     return ""
 
 
+class _CartPurchasabilityGate:
+    """MAY THIS RESOLVE HAND THE BUYER A PREFILLED CART ON THIS MERCHANT? One per request.
+
+    WHY. The Reap rail refuses a merchant with no fresh positive purchasability fact
+    (`db.merchant_purchasability`, under MERCHANT_PURCHASABILITY_ENFORCE), but offers.resolve
+    kept minting `cart_permalink` `/r` links for the same merchant — and the warm-handoff lane
+    skips the gateway's gate for a cart join (`is_already_cart_join`), so the buyer landed
+    straight in the prefilled cart of a store we had measured as unable to take their card.
+    Measured 2026-09-27 on prod: 432 active-seed offers mint a cart, 358 of them (47 of 53
+    hosts) with no positive fact in any market. The gateway's own gate (PIVOTA-Agent #2308)
+    strips these only when armed and only on get_offers/annotate; this is the door that mints.
+
+    EVERY CART MINT IN THIS MODULE ASKS IT — offers.resolve and the four product-card lanes:
+    `mint_external_seed_links` (on `body.market`), the find_products_multi seed lane and
+    `_build_prefetched_external_seed_wrappers` (one shared gate on `_request_market_for_multi`),
+    and `_attach_connected_product_redirects` (its `request_market`). Each builds it on the
+    REQUEST's market, the carrier its `request_market_observed` reads; never a row's market
+    and never an `or "US"` default. `tests/test_purchase_gate_market_not_defaulted.py`
+    resolves every construction site's argument and pins it.
+
+    THE HUMAN CART'S QUESTION, NOT THE REAP RAIL'S (Peng, 2026-10-09). This gate hands a
+    prefilled cart to a HUMAN, who pays however the checkout lets them; the Reap rail pays by
+    card with nobody present. The two read the same fact through two readers that part on
+    NO_CARD_PAYMENT — see "TWO QUESTIONS, TWO READERS" in `db/merchant_purchasability.py`:
+      * dial OFF -> every cart is allowed. The ops route says `enforced: false` and its
+        consumers keep their previous behaviour; so does this. Nothing is asked, nothing changes.
+      * dial ON, no usable request market -> declined, WITHOUT a database read. The route's
+        `reason: market_unknown`. The market is never defaulted: the `used_market` a seed row
+        is served under is its LISTING market, and an `or "US"` placeholder would gate a non-US
+        buyer against the US fact.
+      * dial ON, market known -> `human_handoff_allowed`: a fresh fact from the buyer vantage
+        whose verdict a human can check out under (ELIGIBLE, NO_CARD_PAYMENT, PRICE_DRIFT).
+        Declined when nobody can buy — LOGIN_REQUIRED, PASSWORD_PAGE, NOT_ACCEPTING_ORDERS,
+        VARIANT_GONE — or when there is no fact, a stale one, or an unverifiable one. It fails
+        CLOSED on a database error, and so does this. The ops route publishes the same answer as
+        `human_handoff_tier`, beside the rail's `tier`, so the gateway's gate can read it too.
+    A NO_CARD_PAYMENT merchant therefore KEEPS its cart here while the Reap rail refuses it:
+    measured 2026-10-09, 643 of 839 negative cart seeds were NO_CARD_PAYMENT, most of them
+    checkouts that take cards through an offsite provider — a decline here would have turned
+    all of them into referrals for a human who could have paid.
+    A decline FAILS OPEN FOR LINKS-OUT: it removes the cart, never the offer. The buyer still
+    gets the attributed PDP through the same `/r` hop — the route's "leaves browse and
+    links-out untouched".
+
+    KEYED ON THE CART'S HOST — the host `resolve_cart_permalink` would build the cart on, which
+    is the host the buyer would land on and the one the gateway reads first
+    (`execution_spec.cart_url`). Asked only where a cart would exist, and once per host per
+    request, so a referral-only resolve (the majority) never touches the fact table.
+    """
+
+    def __init__(self, request_market: Any) -> None:
+        # Read ONCE, so one request cannot straddle a dial flip and serve two answers.
+        self.enforced = merchant_purchasability.is_enforcement_enabled()
+        self.market = merchant_purchasability.normalize_market(request_market)
+        self._memo: Dict[str, bool] = {}
+        self.stats: Dict[str, int] = {"asked": 0, "declined": 0}
+
+    async def allows_cart(self, cart_base_url: str) -> bool:
+        if not self.enforced:
+            return True
+        allowed = False
+        if self.market is not None:
+            host = merchant_purchasability.normalize_domain(cart_base_url)
+            if host not in self._memo:
+                self.stats["asked"] += 1
+                self._memo[host] = await merchant_purchasability.human_handoff_allowed(
+                    host, self.market
+                )
+            allowed = self._memo[host]
+        if not allowed:
+            self.stats["declined"] += 1
+        return allowed
+
+    async def decline_tier(
+        self,
+        *,
+        destination_url: str,
+        shop_domain: Optional[str],
+        platform: Optional[str],
+        cart_variant_id: Optional[str],
+    ) -> Optional[str]:
+        """`browse_only` when the cart these mint inputs WOULD build is declined, else None.
+
+        Asked on the cart the mint would build — the same `resolve_cart_permalink` that
+        `compose_attributed_destinations` calls, on the same inputs — so an input that would mint
+        a referral anyway never asks, and a declined one is keyed on the host the buyer would
+        have landed on. Dial off answers None without building anything.
+        """
+        if not self.enforced:
+            return None
+        would_be_cart = resolve_cart_permalink(
+            destination_url=destination_url,
+            shop_domain=shop_domain,
+            platform=platform,
+            cart_variant_id=cart_variant_id,
+        )
+        if not would_be_cart or await self.allows_cart(would_be_cart):
+            return None
+        return PURCHASABILITY_BROWSE_ONLY
+
+    async def gate_identity(
+        self, redirect_identity: Dict[str, Any], *, destination_url: str
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        """The identity a seed mint must use, and the tier it must sign.
+
+        ON A DECLINE the returned identity has `cart_variant_id` None — a COPY, the caller's dict
+        is untouched — and every consumer downstream reads that one value: the mint builds the
+        PDP referral, and a recompose (`_seed_attribution_from_redirect`, which refuses unless
+        its primary equals the signed dest) builds the same PDP. Handing the mint the nulled id
+        and the recompose the original would make the recompose disagree and publish nothing.
+        The tier goes into the token ctx so the warm lane cannot rebuild the cart at click time.
+        """
+        tier = await self.decline_tier(
+            destination_url=destination_url,
+            shop_domain=redirect_identity.get("shop_domain"),
+            platform=redirect_identity.get("platform"),
+            cart_variant_id=redirect_identity.get("cart_variant_id"),
+        )
+        if tier is None:
+            return redirect_identity, None
+        return {**redirect_identity, "cart_variant_id": None}, tier
+
+
 def _cart_prefilled_claim(
     *,
     cart_url: Optional[str],
     destination_url: str,
     redirect_url: str,
+    # Set when the purchasability fact declined this offer's cart. The mint signed the same
+    # value into the token, and the warm lane knocks such a token out, so `False` becomes
+    # provable where it would otherwise be `None`. Defaulted because omitting it errs SAFE:
+    # the claim stays `None` ("unknown"), never a wrong `False`.
+    purchasability_tier: Optional[str] = None,
 ) -> Optional[bool]:
     """TRI-STATE: True = prefilled cart, False = bare PDP, None = we cannot promise either.
 
@@ -9195,8 +9381,12 @@ def _cart_prefilled_claim(
         # EXACT, not conservative: this line is unreachable unless `if cart_url` above fell
         # through, and the mint stamps `join_mode` from that same `cart_url` decision — so the
         # token for this branch provably carries `referral_only`, and the already-a-cart
-        # knockout provably cannot fire on it.
-        ctx={"join_mode": "referral_only"},
+        # knockout provably cannot fire on it. The purchasability tier is the value the caller
+        # also handed the mint, so it is in that token's ctx too.
+        ctx={
+            "join_mode": "referral_only",
+            **({PURCHASABILITY_TIER_KEY: purchasability_tier} if purchasability_tier else {}),
+        },
         settings=settings,
     ):
         return None
@@ -9703,6 +9893,11 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
         _handover_product_key(c.model_dump(), _ensure_seed_data_obj(c.seed_data))
         for c in body.candidates
     )
+    # ONE purchasability gate for the body, keyed on the REQUEST's market (`body.market`) — the
+    # same carrier `market_observed` below reads. `candidate.market` is where the seed is LISTED
+    # and `default_market` is an `or "US"` placeholder; gating on either would answer a non-US
+    # buyer with the US fact. No body market = every cart declined, with no database read.
+    _cart_purchasability = _CartPurchasabilityGate(body.market)
     # ONE MINT PER CANDIDATE, DELIBERATELY NO CACHE. The signed token carries per-seed context
     # (seedId, merchant/product/variant identity, shop domain), so two candidates that share
     # a destination are still two different tokens. Review of the first cut reproduced a
@@ -9733,6 +9928,10 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
                 offer_variant_id=candidate.variant_id,
             ),
         )
+        # Decided BEFORE the mint, and the SAME identity feeds the mint and the recompose below.
+        redirect_identity, purchasability_tier = await _cart_purchasability.gate_identity(
+            redirect_identity, destination_url=destination_url,
+        )
         redirect_url = await _make_external_redirect_url(
             market=market,
             # THE REQUEST'S market (`body.market`) only. `candidate.market` is the SEED ROW's
@@ -9743,7 +9942,11 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
             tool=tool,
             destination_url=destination_url,
             utm_template=candidate.utm_template,
-            ctx={"seedId": candidate.external_seed_id, "source": "external_seed_links"},
+            ctx={
+                "seedId": candidate.external_seed_id,
+                "source": "external_seed_links",
+                **({PURCHASABILITY_TIER_KEY: purchasability_tier} if purchasability_tier else {}),
+            },
             allowed_domains=None,
             merchant_id=redirect_identity["merchant_id"],
             product_id=redirect_identity["product_id"],
@@ -9812,7 +10015,9 @@ def _request_market_for_multi(
     named no market mints tokens the warm-handoff lane will not key the purchasability gate on.
     It is also the seed lane's `serving_market` -- the currency a served seed must be priced in --
     and there `fetch_external_seed_rows` answers a None as a US request. A seed row's own `market`
-    is the market the row is LISTED in; it is never read here.
+    is the market the row is LISTED in; it is never read here. With `payload=None` it is the
+    metadata-only read the find_products / get_product_detail doors use for their
+    purchasability gate, since neither payload carries a market.
     """
     search = getattr(payload, "search", None)
     raw = getattr(search, "market", None)
@@ -9855,14 +10060,21 @@ async def _build_prefetched_external_seed_wrappers(
     request_metadata: Optional[Dict[str, Any]],
     *,
     request_market: Optional[str] = None,
+    cart_purchasability: Optional["_CartPurchasabilityGate"] = None,
 ) -> List[Dict[str, Any]]:
     """`request_market` is the raw market the buyer's request named (the find_products_multi
-    handler passes `_request_market_for_multi`); absent, it is read from `metadata.market`."""
+    handler passes `_request_market_for_multi`); absent, it is read from `metadata.market`.
+
+    `cart_purchasability` is the request's gate when the caller already holds one (the
+    find_products_multi handler shares its seed lane's, so one host is asked once per request);
+    absent, one is built on `request_market` — never on a candidate's market."""
     if request_market is None:
         request_market = _request_market_for_multi(None, request_metadata)
     candidates = _normalize_prefetched_external_seed_candidates(request_metadata)
     if not candidates:
         return []
+    if cart_purchasability is None:
+        cart_purchasability = _CartPurchasabilityGate(request_market)
 
     wrappers: List[Dict[str, Any]] = []
     redirect_cache: Dict[str, Optional[str]] = {}
@@ -9913,6 +10125,13 @@ async def _build_prefetched_external_seed_wrappers(
             ),
         )
         if not redirect_url:
+            # MERCHANT PURCHASABILITY, decided before the mint. The gated identity replaces the
+            # hoisted one, so the recompose below is handed the same (possibly nulled) cart id
+            # the mint signs. A link the CALLER already minted is left as it was minted: this
+            # lane did not build it, and a recompose with a different cart id would only refuse.
+            redirect_identity, purchasability_tier = await cart_purchasability.gate_identity(
+                redirect_identity, destination_url=destination_url,
+            )
             # PROVENANCE. The served `market` above is the CANDIDATE's (a seed row the caller
             # handed us — where it is LISTED), else the US fallback. So the flag may be stamped
             # only when the REQUEST named a market AND the candidate names the SAME one: a
@@ -9925,11 +10144,13 @@ async def _build_prefetched_external_seed_wrappers(
             # hit must not reuse a redirect built for a different seller. Include
             # them in the key (cheap — read from the already-loaded row). The provenance flag
             # is in the key too: two candidates that serve the same market can differ in it.
+            # So is the purchasability tier, which rides in the ctx as well.
             redirect_cache_key = "||".join([
                 market, tool, destination_url, str(utm_template or ""),
                 str(redirect_identity.get("seller_ref") or ""),
                 str(redirect_identity.get("seed_kind") or ""),
                 "observed" if observed else "unobserved",
+                str(purchasability_tier or ""),
             ])
             if redirect_cache_key in redirect_cache:
                 redirect_url = redirect_cache[redirect_cache_key]
@@ -9940,7 +10161,10 @@ async def _build_prefetched_external_seed_wrappers(
                     tool=tool,
                     destination_url=destination_url,
                     utm_template=utm_template,
-                    ctx={"seedId": candidate.get("external_seed_id")},
+                    ctx={
+                        "seedId": candidate.get("external_seed_id"),
+                        **({PURCHASABILITY_TIER_KEY: purchasability_tier} if purchasability_tier else {}),
+                    },
                     allowed_domains=None,
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
@@ -10198,6 +10422,10 @@ async def _load_products_by_ids(product_ids: List[str]) -> Dict[str, StandardPro
 async def _handle_find_products(
     filters: SearchFilters,
     background_tasks: BackgroundTasks,
+    *,
+    # The buyer request's raw market (`metadata.market`), for the connected-card purchasability
+    # gate only. Absent = no usable market.
+    request_market: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Implementation of the find_products operation.
@@ -10360,7 +10588,9 @@ async def _handle_find_products(
         market=None,
     )
     # P2b: attributed /r links on connected cards (fail-soft, additive).
-    await _attach_connected_product_redirects(product_payloads, tool="find_products")
+    await _attach_connected_product_redirects(
+        product_payloads, tool="find_products", request_market=request_market
+    )
 
     result = {
         "products": product_payloads,
@@ -10597,7 +10827,11 @@ async def _handle_find_products_multi(
         _enforce_search_price_contract(result)
     try:
         if isinstance(result, dict):
-            await _attach_connected_product_redirects(result.get("products"), tool="find_products_multi")
+            await _attach_connected_product_redirects(
+                result.get("products"),
+                tool="find_products_multi",
+                request_market=_request_market_for_multi(payload, request_metadata),
+            )
     except Exception:
         pass  # never let attribution stamping break search
     # Phase 0 (convergence): deposit the served slate into the decision-layer
@@ -10633,6 +10867,10 @@ async def _handle_find_products_multi_inner(
     # The BUYER's market, raw (search.market, then metadata.market), or None. Provenance only —
     # it decides `market_observed` on the seed-lane `/r` tokens below and serves nothing.
     buyer_request_market = _request_market_for_multi(payload, request_metadata)
+    # ONE purchasability gate for this request's seed cards — the ranked seed lane AND the
+    # prefetched wrappers — on the same request carrier. A seed row's `market` (where it is
+    # LISTED, and the `market` this lane SERVES, defaulted "US") is never its input.
+    cart_purchasability = _CartPurchasabilityGate(buyer_request_market)
     user_ctx = payload.user
     creator_meta = payload.metadata or None
     # Prefer top-level metadata for creator context when provided by caller.
@@ -12293,6 +12531,12 @@ async def _handle_find_products_multi_inner(
                     offer_variant_id=getattr(candidate, "variant_id", None),
                 ),
             )
+            # MERCHANT PURCHASABILITY, decided before the mint; the gated identity feeds BOTH
+            # the mint and `_seed_attribution_from_redirect` below, which refuses unless its
+            # recomposed primary equals the signed dest.
+            redirect_identity, purchasability_tier = await cart_purchasability.gate_identity(
+                redirect_identity, destination_url=dest,
+            )
             # PROVENANCE: the REQUEST's market turns the flag on, never the row's (this lane
             # fetches seeds with `market=None`, so the row's market is only where it is LISTED).
             # The row's raw market can only turn it OFF: a row with no market serves the US
@@ -12312,6 +12556,7 @@ async def _handle_find_products_multi_inner(
                     str(redirect_identity.get("seller_ref") or ""),
                     str(redirect_identity.get("seed_kind") or ""),
                     "observed" if observed else "unobserved",
+                    str(purchasability_tier or ""),
                 ]
             )
             if redirect_cache_key in external_redirect_cache:
@@ -12323,7 +12568,10 @@ async def _handle_find_products_multi_inner(
                     tool=tool,
                     destination_url=dest,
                     utm_template=utm_template,
-                    ctx={"seedId": row_dict.get("id")},
+                    ctx={
+                        "seedId": row_dict.get("id"),
+                        **({PURCHASABILITY_TIER_KEY: purchasability_tier} if purchasability_tier else {}),
+                    },
                     allowed_domains=None,
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
@@ -12390,7 +12638,9 @@ async def _handle_find_products_multi_inner(
         prefetched_external_seed_wrappers = []
         if semantic_external_seed_fallback_allowed:
             prefetched_external_seed_wrappers = await _build_prefetched_external_seed_wrappers(
-                request_metadata, request_market=buyer_request_market
+                request_metadata,
+                request_market=buyer_request_market,
+                cart_purchasability=cart_purchasability,
             )
         elif external_seed_skip_reason is None:
             external_seed_skip_reason = "semantic_class_blocked"
@@ -15023,6 +15273,9 @@ async def get_creator_task_status(task_id: str) -> CreatorTaskStatus:
 async def _handle_get_product_detail(
     ref: ProductRef,
     background_tasks: BackgroundTasks,
+    *,
+    # As on `_handle_find_products`: the request's raw market, for the purchasability gate only.
+    request_market: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Implementation of the get_product_detail operation.
@@ -15218,7 +15471,9 @@ async def _handle_get_product_detail(
     # (in place on the single-card list; fail-soft; external/pre-stamped cards
     # skipped, connected cards with a derivable destination get cart_permalink
     # or referral_only).
-    await _attach_connected_product_redirects([base], tool="get_product_detail")
+    await _attach_connected_product_redirects(
+        [base], tool="get_product_detail", request_market=request_market
+    )
 
     review_summary = None
     seller_feedback_summary = None
@@ -15538,7 +15793,11 @@ async def invoke_shop_operation(
         if merchant_id:
             search_payload["merchant_id"] = merchant_id
             payload = FindProductsPayload(search=SearchFilters(**search_payload))
-            return await _handle_find_products(payload.search, background_tasks)
+            return await _handle_find_products(
+                payload.search,
+                background_tasks,
+                request_market=_request_market_for_multi(None, normalized_metadata),
+            )
 
         # Backward-compatible fallback: treat non-merchant-scoped find_products as multi-search.
         multi_payload = FindProductsMultiPayload(
@@ -15582,7 +15841,11 @@ async def invoke_shop_operation(
         status_code = 200
         error_detail = None
         try:
-            return await _handle_get_product_detail(payload.product, background_tasks)
+            return await _handle_get_product_detail(
+                payload.product,
+                background_tasks,
+                request_market=_request_market_for_multi(None, normalized_metadata),
+            )
         except HTTPException as e:
             status_code = int(e.status_code)
             error_detail = str(e.detail)

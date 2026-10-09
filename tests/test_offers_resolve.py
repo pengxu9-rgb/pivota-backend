@@ -5100,3 +5100,341 @@ def test_no_coverage_line_when_the_preflight_is_off(
                 if getattr(r, "event", None) == "offers.resolve.summary"), None)
     assert rec is None or not hasattr(rec, "preflight_answered_fraction"), (
         "off must not attach coverage fields")
+
+
+# ---------------------------------------------------------------------------
+# MERCHANT PURCHASABILITY at the mint (offers.resolve)
+#
+# A `cart_permalink` /r link hands the buyer a PREFILLED CART, and the warm-handoff lane skips
+# the gateway's gate for a cart join — so the cart was served even for a merchant whose
+# purchasability fact is `browse_only`. Under MERCHANT_PURCHASABILITY_ENFORCE the mint now asks
+# the fact first and, on a decline, mints the PDP referral instead. Every test below drives the
+# real route with the real `_make_external_redirect_url`, and reads the answer off the offer and
+# the signed token the route actually emitted — never off a hand-built offer.
+# ---------------------------------------------------------------------------
+
+
+def _purchasability_fake(monkeypatch: pytest.MonkeyPatch, *, purchasable: bool) -> list:
+    """Replace ONLY the fact read (`human_handoff_allowed`) with a recording answer. The gate, the
+    route and the mint around it are the real ones."""
+    import db.merchant_purchasability as mp
+
+    calls: list = []
+
+    async def fake_human_handoff_allowed(domain, market):
+        calls.append((domain, market))
+        return purchasable
+
+    monkeypatch.setattr(mp, "human_handoff_allowed", fake_human_handoff_allowed)
+    return calls
+
+
+def _resolve_seed_offers(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    *,
+    rows: list,
+    market=None,
+) -> list:
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return rows
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+    payload = {"product": {"sku_id": "SKU-1"}, "limit": 10, "tool": "*"}
+    if market is not None:
+        payload["market"] = market
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve", "payload": payload,
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200, res.text
+    offers = [o for o in (res.json().get("offers") or [])
+              if o.get("purchase_route") == "affiliate_outbound"]
+    assert offers, "the external offer must be returned for this to prove anything"
+    return offers
+
+
+def _assert_referral_only(offer: dict) -> None:
+    spec = offer["execution_spec"]
+    assert spec["cart_url"] is None, spec
+    assert spec["variant_id"] is None, spec
+    assert spec["tracking"]["join_mode"] == "referral_only", spec
+    assert "/cart/" not in _dest_of(offer), "the signed /r destination must be the PDP"
+    assert _ctx_of(offer)["join_mode"] == "referral_only"
+    assert _ctx_of(offer)["purchasability_tier"] == "browse_only"
+
+
+def _assert_cart(offer: dict) -> None:
+    assert offer["cart_prefilled"] is True
+    assert offer["execution_spec"]["cart_url"], offer["execution_spec"]
+    assert "/cart/" in _dest_of(offer)
+    assert _ctx_of(offer)["join_mode"] == "cart_permalink"
+    assert "purchasability_tier" not in _ctx_of(offer), (
+        "an undeclined token must be byte-identical to a pre-gate one")
+
+
+def test_a_browse_only_merchant_is_minted_a_referral_not_a_prefilled_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """The defect, end to end, in PROD POSTURE: enforcement armed and the warm lane allowlisting
+    this very host. Before the gate this offer was `cart_prefilled: true` with a /cart/ dest.
+
+    `cart_prefilled` must be `False`, not `None`: `None` is what the warm-eligible PDP population
+    gets, because the click lane could still build a cart. The decline is signed into the token
+    and the lane knocks it out, so here `False` is provable."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    calls = _purchasability_fake(monkeypatch, purchasable=False)
+
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+
+    assert calls == [("brand.com", "US")], "keyed on the cart's host x the REQUEST market"
+    _assert_referral_only(offer)
+    assert offer["cart_prefilled"] is False
+    assert offer["execution_spec"]["rail"] == "referral"
+    assert offer["execution_spec"]["pdp_url"], "a decline removes the cart, never the product page"
+    assert offer["affiliate_url"], "and never the offer"
+
+
+def test_the_declined_link_really_does_land_on_the_pdp_when_followed(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """Follow the minted link through the real `GET /r`. Without the knockout the warm lane
+    upgrades this cold PDP into the prefilled cart the mint just refused — the decline would
+    last exactly until the click."""
+    import routes.outbound_links as outbound_routes
+    import services.outbound_warm_handoff as warm
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    _purchasability_fake(monkeypatch, purchasable=False)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+
+    eligible, reason = warm.evaluate_warm_eligibility(
+        dest=_dest_of(offer), user_agent=_WARM_HUMAN_UA, token=_token_of(offer),
+        ctx=_ctx_of(offer), settings=warm_lane,
+    )
+    assert (eligible, reason) == (False, "purchase_declined")
+
+    asked: list = []
+
+    async def _fake_resolve(**kwargs):
+        asked.append(kwargs)
+        return {"continue_url": "https://brand.myshopify.com/cart/c/abc123?key=k", "cart_id": "c_1"}
+
+    async def _fake_log(**kwargs):
+        return None
+
+    warm.memo_clear()
+    monkeypatch.setattr(outbound_routes, "resolve_warm_handoff", _fake_resolve)
+    monkeypatch.setattr(outbound_routes, "log_outbound_click", _fake_log)
+    try:
+        res = client.get("/r", params={"token": _token_of(offer)},
+                         headers={"user-agent": _WARM_HUMAN_UA}, follow_redirects=False)
+    finally:
+        warm.memo_clear()
+    assert res.status_code == 302, res.text
+    assert res.headers["location"] == _dest_of(offer)
+    assert "/cart/" not in res.headers["location"]
+    assert asked == [], "the warm lane must not even ask the gateway for a declined merchant"
+
+
+def test_a_purchasable_merchant_keeps_its_prefilled_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="us")[0]
+    assert calls == [("brand.com", "US")]
+    _assert_cart(offer)
+    assert offer["execution_spec"]["rail"] == "shopify_cart"
+
+
+def test_the_dial_off_mints_exactly_what_it_minted_before(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """MERCHANT_PURCHASABILITY_ENFORCE unset: the ops route says `enforced: false` and its
+    consumers keep their previous behaviour. So does the mint — and it asks nothing."""
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    calls = _purchasability_fake(monkeypatch, purchasable=False)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+    assert calls == []
+    _assert_cart(offer)
+
+
+@pytest.mark.parametrize("market", [None, "", "  "])
+def test_no_usable_market_is_no_fact_and_declines_without_asking(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, market
+) -> None:
+    """The ops route's `reason: market_unknown`, `tier: browse_only`. The seed row is LISTED in
+    US and is served under `used_market` "US" — neither is the buyer's market, and gating on
+    either would answer a non-US buyer with the US fact."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market=market)[0]
+    assert calls == [], "no market is answered without a database read"
+    _assert_referral_only(offer)
+    assert offer["cart_prefilled"] is False
+
+
+def test_a_referral_only_offer_never_asks_the_fact(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """No storefront evidence -> no cart would be built -> nothing to gate. The majority of
+    seeds; they must not cost a query each."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    calls = _purchasability_fake(monkeypatch, purchasable=False)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=False)], market="US")[0]
+    assert calls == []
+    assert offer["execution_spec"]["cart_url"] is None
+    assert "purchasability_tier" not in _ctx_of(offer), "only a DECLINE is signed"
+
+
+def test_one_request_asks_once_per_merchant(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    calls = _purchasability_fake(monkeypatch, purchasable=False)
+    second = _seed_row_for_exec_spec(evidence=True)
+    second.update({"id": "eps_spec_2", "external_product_id": "ext_spec_2",
+                   "destination_url": "https://brand.com/products/toner",
+                   "canonical_url": "https://brand.com/products/toner"})
+    offers = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True), second], market="US")
+    assert len(offers) == 2
+    assert calls == [("brand.com", "US")]
+    for offer in offers:
+        _assert_referral_only(offer)
+
+
+@pytest.fixture
+async def purchasability_table():
+    """The REAL fact table, built the way production does (the schema guard's own DDL), empty,
+    with enforcement armed and the buyer vantage at its default. Dropped afterwards."""
+    import os
+
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    was_connected = database.is_connected
+    if not was_connected:
+        await database.connect()
+    saved = {k: os.environ.get(k) for k in ("MERCHANT_PURCHASABILITY_ENFORCE",
+                                            "MERCHANT_PURCHASABILITY_BUYER_VANTAGE")}
+    try:
+        await database.execute("DROP TABLE IF EXISTS merchant_purchasability")
+        await ensure_required_schema_light()
+        os.environ["MERCHANT_PURCHASABILITY_ENFORCE"] = "1"
+        os.environ.pop("MERCHANT_PURCHASABILITY_BUYER_VANTAGE", None)
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        await database.execute("DROP TABLE IF EXISTS merchant_purchasability")
+        await ensure_required_schema_light()
+        if not was_connected and database.is_connected:
+            await database.disconnect()
+
+
+def _fact(verdict, card):
+    from services.shopify_cart_link_preflight import PreflightResult, Verdict
+
+    return PreflightResult(host="x", verdict=Verdict(verdict), market="US", variant_id="1",
+                           card_available=card)
+
+
+async def test_the_gate_answers_what_the_ops_route_answers_for_the_same_fact(purchasability_table) -> None:
+    """ONE contract: for every (merchant, market) the mint allows a cart exactly when
+    `GET /ops/merchant-purchasability` would say `human_handoff_tier: purchase` under
+    enforcement — the HUMAN cart's field, not the Reap rail's `tier`. Real fact table, real
+    `record_check` writes, the ops handler called directly.
+
+    THE TWO FIELDS PART ON NO_CARD_PAYMENT (Peng, 2026-10-09): a checkout read with no on-site
+    card line refuses the headless card rail and KEEPS the human cart. Pinned here as the one
+    case where `tier` and `human_handoff_tier` disagree, in that direction and no other."""
+    import db.merchant_purchasability as mp
+    from routes.agent_shop_gateway import _CartPurchasabilityGate
+    from routes.merchant_purchasability_ops import merchant_purchasability as ops_read
+
+    await mp.record_check("good.com", "US", _fact("ELIGIBLE", True))
+    await mp.record_check("nocard.com", "US", _fact("ELIGIBLE", None))
+    await mp.record_check("paypal-only.com", "US", _fact("NO_CARD_PAYMENT", False))
+    await mp.record_check("drift.com", "US", _fact("PRICE_DRIFT", True))
+    await mp.record_check("login.com", "US", _fact("LOGIN_REQUIRED", None))
+    await mp.record_check("password.com", "US", _fact("PASSWORD_PAGE", None))
+    await mp.record_check("closed.com", "US", _fact("NOT_ACCEPTING_ORDERS", None))
+    await mp.record_check("gone.com", "US", _fact("VARIANT_GONE", None))
+    await mp.record_check("blocked.com", "US", _fact("BLOCKED_UNKNOWN", None))
+    await mp.record_check("proxyonly.com", "US", _fact("ELIGIBLE", True), vantage="proxy")
+
+    cases = [
+        ("https://good.com/cart/1:1", "good.com", "US"),
+        ("https://www.good.com/cart/1:1", "good.com", "US"),
+        ("https://good.com/cart/1:1", "good.com", "SG"),
+        ("https://good.com/cart/1:1", "good.com", None),
+        ("https://nocard.com/cart/1:1", "nocard.com", "US"),
+        ("https://paypal-only.com/cart/1:1", "paypal-only.com", "US"),
+        ("https://drift.com/cart/1:1", "drift.com", "US"),
+        ("https://login.com/cart/1:1", "login.com", "US"),
+        ("https://password.com/cart/1:1", "password.com", "US"),
+        ("https://closed.com/cart/1:1", "closed.com", "US"),
+        ("https://gone.com/cart/1:1", "gone.com", "US"),
+        ("https://blocked.com/cart/1:1", "blocked.com", "US"),
+        ("https://proxyonly.com/cart/1:1", "proxyonly.com", "US"),
+        ("https://never-checked.com/cart/1:1", "never-checked.com", "US"),
+    ]
+    seen = {}
+    for cart, domain, market in cases:
+        route = await ops_read(domain=domain, market=market, _principal={})
+        assert route.enforced is True
+        allowed = await _CartPurchasabilityGate(market).allows_cart(cart)
+        assert allowed is (route.human_handoff_tier == "purchase"), (cart, market, route.human_handoff_tier)
+        seen[(domain, market)] = (route.tier, route.human_handoff_tier, allowed)
+    assert seen[("good.com", "US")] == ("purchase", "purchase", True)
+    assert seen[("paypal-only.com", "US")] == ("browse_only", "purchase", True), (
+        "NO_CARD_PAYMENT: the rail refuses, the human keeps the cart")
+    assert seen[("nocard.com", "US")] == ("browse_only", "purchase", True), (
+        "ELIGIBLE with an unread card line: a checkout with our line on it")
+    assert seen[("drift.com", "US")] == ("browse_only", "purchase", True)
+    for domain in ("login.com", "password.com", "closed.com", "gone.com", "blocked.com",
+                   "proxyonly.com", "never-checked.com"):
+        assert seen[(domain, "US")] == ("browse_only", "browse_only", False), domain
+    assert seen[("good.com", None)] == ("browse_only", "browse_only", False)
+    assert seen[("good.com", "SG")] == ("browse_only", "browse_only", False)
+    assert not any(t == "purchase" and h == "browse_only" for t, h, _a in seen.values()), (
+        "the human tier is never STRICTER than the rail's")
+
+
+async def test_a_no_card_payment_merchant_keeps_its_cart_and_a_login_wall_loses_it(
+    purchasability_table, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through the real route, on real fact rows. The NO_CARD_PAYMENT offer's token must be
+    byte-identical to an ungated one (no `purchasability_tier` key); the LOGIN_REQUIRED offer
+    is the referral the first cut would have given both."""
+    import db.merchant_purchasability as mp
+
+    await mp.record_check("brand.com", "US", _fact("NO_CARD_PAYMENT", False))
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+    _assert_cart(offer)
+    assert offer["execution_spec"]["rail"] == "shopify_cart"
+
+    await mp.record_check("brand.com", "US", _fact("LOGIN_REQUIRED", None))
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+    _assert_referral_only(offer)
+    assert offer["cart_prefilled"] is False
