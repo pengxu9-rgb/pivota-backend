@@ -18,6 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
 
+from tests._rate_limit_clock import freeze_rate_limiter_clock
 from middleware.rate_limiter import (
     RateLimitMiddleware,
     _constant_time_match,
@@ -63,6 +64,9 @@ def backend(request, monkeypatch):
 
 
 def _app(monkeypatch, *, ceiling=_CEIL, per_ip=0, enabled="true", **env) -> FastAPI:
+    # Fixed windows on the wall clock: a burst that straddles a boundary restarts the
+    # count mid-assertion (tests/_rate_limit_clock.py).
+    freeze_rate_limiter_clock(monkeypatch)
     monkeypatch.setenv("ANON_RATE_LIMIT_ENABLED", enabled)
     monkeypatch.setenv("ANON_RATE_LIMIT_GLOBAL_RPM", str(ceiling))
     monkeypatch.setenv("ANON_RATE_LIMIT_PER_IP_RPM", str(per_ip))
