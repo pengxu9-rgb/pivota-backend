@@ -69,9 +69,9 @@ Data-bound secrets (`CONNECTOR_CREDENTIALS_KEY`, `REVIEWS_*_SIGNING_SECRET`) are
 prod dump stays readable. Third-party LIVE credentials (Stripe, SendGrid, Shopify, Adyen, AWS, …) are
 still prod values in staging until test-mode keys are put in the overrides file — side-effect flags
 (`REVIEWS_INVITATION_WORKER_ENABLED`, `AGENT_ACP_ALLOW_LIVE_CAPTURE`, `ALLOW_SHAKEOUT_ON_PROD`) are off.
-Outbound agent/merchant webhook **retries** do not deliver outside production unless
-`WEBHOOK_RETRY_DELIVERY_ENABLED=true` (`services/webhook_retry_delivery_gate.py`): a `retrying` row
-restored from prod points at a real customer endpoint. Leave it unset on staging.
+Outbound agent/merchant webhooks (first sends, retries, the retry loops, test sends) do not deliver
+outside production unless `WEBHOOK_DELIVERY_ENABLED=true` (`services/webhook_delivery_gate.py`):
+every config restored from prod points at a real customer endpoint. Leave it unset on staging.
 
 ### One-time project plumbing that bootstrap_env.sh does NOT do (done by hand 2026-08-19)
 - `pivota-shared`: compute default SA → `roles/cloudbuild.builds.builder` + AR writer (Cloud Build runs as it)
