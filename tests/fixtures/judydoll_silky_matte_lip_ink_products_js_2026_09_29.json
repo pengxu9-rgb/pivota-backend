@@ -1,0 +1,203 @@
+{
+ "_fixture_note": "Trimmed live GET https://judydoll.com/products/silky-matte-lip-ink.js, fetched 2026-09-29 for the Reap named-variant cart proof tests. Product-level description/images/media/selling plans dropped; per-variant image/media dropped. Public storefront data, no PII.",
+ "id": 9493095285013,
+ "title": "Silky Matte Lip Ink",
+ "handle": "silky-matte-lip-ink",
+ "vendor": "Judydoll-JOY GROUP",
+ "type": "",
+ "published_at": "2026-04-21T02:56:19-07:00",
+ "created_at": "2026-03-20T00:28:55-07:00",
+ "price": 1399,
+ "price_min": 1399,
+ "price_max": 1399,
+ "available": true,
+ "price_varies": false,
+ "options": [
+  {
+   "name": "Color",
+   "position": 1,
+   "values": [
+    "01 PETAL INK",
+    "02 PEACH INK",
+    "03 SAND INK",
+    "05 ROSY INK",
+    "07 BURGUNDY INK",
+    "08 BERRY INK",
+    "09 MULBERRY INK",
+    "10 TERRA INK"
+   ]
+  }
+ ],
+ "url": "/products/silky-matte-lip-ink",
+ "requires_selling_plan": false,
+ "variants": [
+  {
+   "id": 49819267170581,
+   "title": "01 PETAL INK",
+   "option1": "01 PETAL INK",
+   "option2": null,
+   "option3": null,
+   "sku": "6978647800823",
+   "requires_shipping": true,
+   "taxable": true,
+   "available": true,
+   "name": "Silky Matte Lip Ink - 01 PETAL INK",
+   "public_title": "01 PETAL INK",
+   "options": [
+    "01 PETAL INK"
+   ],
+   "price": 1399,
+   "weight": 0,
+   "compare_at_price": null,
+   "inventory_management": "shopify",
+   "barcode": null
+  },
+  {
+   "id": 49819267203349,
+   "title": "02 PEACH INK",
+   "option1": "02 PEACH INK",
+   "option2": null,
+   "option3": null,
+   "sku": "6978647800830",
+   "requires_shipping": true,
+   "taxable": true,
+   "available": true,
+   "name": "Silky Matte Lip Ink - 02 PEACH INK",
+   "public_title": "02 PEACH INK",
+   "options": [
+    "02 PEACH INK"
+   ],
+   "price": 1399,
+   "weight": 0,
+   "compare_at_price": null,
+   "inventory_management": "shopify",
+   "barcode": null
+  },
+  {
+   "id": 49819267236117,
+   "title": "03 SAND INK",
+   "option1": "03 SAND INK",
+   "option2": null,
+   "option3": null,
+   "sku": "6978647800847",
+   "requires_shipping": true,
+   "taxable": true,
+   "available": true,
+   "name": "Silky Matte Lip Ink - 03 SAND INK",
+   "public_title": "03 SAND INK",
+   "options": [
+    "03 SAND INK"
+   ],
+   "price": 1399,
+   "weight": 0,
+   "compare_at_price": null,
+   "inventory_management": "shopify",
+   "barcode": null
+  },
+  {
+   "id": 49819267268885,
+   "title": "05 ROSY INK",
+   "option1": "05 ROSY INK",
+   "option2": null,
+   "option3": null,
+   "sku": "6978647800861",
+   "requires_shipping": true,
+   "taxable": true,
+   "available": true,
+   "name": "Silky Matte Lip Ink - 05 ROSY INK",
+   "public_title": "05 ROSY INK",
+   "options": [
+    "05 ROSY INK"
+   ],
+   "price": 1399,
+   "weight": 0,
+   "compare_at_price": null,
+   "inventory_management": "shopify",
+   "barcode": null
+  },
+  {
+   "id": 49819267301653,
+   "title": "07 BURGUNDY INK",
+   "option1": "07 BURGUNDY INK",
+   "option2": null,
+   "option3": null,
+   "sku": "6978647800885",
+   "requires_shipping": true,
+   "taxable": true,
+   "available": true,
+   "name": "Silky Matte Lip Ink - 07 BURGUNDY INK",
+   "public_title": "07 BURGUNDY INK",
+   "options": [
+    "07 BURGUNDY INK"
+   ],
+   "price": 1399,
+   "weight": 0,
+   "compare_at_price": null,
+   "inventory_management": "shopify",
+   "barcode": null
+  },
+  {
+   "id": 49819267334421,
+   "title": "08 BERRY INK",
+   "option1": "08 BERRY INK",
+   "option2": null,
+   "option3": null,
+   "sku": "6978647800892",
+   "requires_shipping": true,
+   "taxable": true,
+   "available": true,
+   "name": "Silky Matte Lip Ink - 08 BERRY INK",
+   "public_title": "08 BERRY INK",
+   "options": [
+    "08 BERRY INK"
+   ],
+   "price": 1399,
+   "weight": 0,
+   "compare_at_price": null,
+   "inventory_management": "shopify",
+   "barcode": null
+  },
+  {
+   "id": 49819267367189,
+   "title": "09 MULBERRY INK",
+   "option1": "09 MULBERRY INK",
+   "option2": null,
+   "option3": null,
+   "sku": "6978647800908",
+   "requires_shipping": true,
+   "taxable": true,
+   "available": true,
+   "name": "Silky Matte Lip Ink - 09 MULBERRY INK",
+   "public_title": "09 MULBERRY INK",
+   "options": [
+    "09 MULBERRY INK"
+   ],
+   "price": 1399,
+   "weight": 0,
+   "compare_at_price": null,
+   "inventory_management": "shopify",
+   "barcode": null
+  },
+  {
+   "id": 49819267399957,
+   "title": "10 TERRA INK",
+   "option1": "10 TERRA INK",
+   "option2": null,
+   "option3": null,
+   "sku": "6978647800922",
+   "requires_shipping": true,
+   "taxable": true,
+   "available": true,
+   "name": "Silky Matte Lip Ink - 10 TERRA INK",
+   "public_title": "10 TERRA INK",
+   "options": [
+    "10 TERRA INK"
+   ],
+   "price": 1399,
+   "weight": 0,
+   "compare_at_price": null,
+   "inventory_management": "shopify",
+   "barcode": null
+  }
+ ]
+}

@@ -78,6 +78,10 @@ jobs otherwise SHARE the Connection this startup context created, the root
 cause of the #1754 all-jobs wedge) and is bounded by `_JOB_RUN_DEADLINES`.
 Per-run state is on /__scheduler_health (`runs`, `stalled`); an operator can
 force a run with POST /admin/scheduler/jobs/{id}/run-now.
+
+SCHEDULER_JOB_ALLOWLIST (services/scheduler_job_allowlist.py) narrows a worker to
+the job ids it names; unset or empty it filters nothing. Skipped ids are
+reported on /__scheduler_health. Runbook: docs/runbooks/scheduler_job_allowlist.md.
 """
 
 from __future__ import annotations
@@ -89,6 +93,7 @@ import os
 from typing import Optional
 
 from config.platform import is_deployed, platform_env, service_name
+from services.worker_flag import worker_flag_override  # the one AUDIT_WORKER_ENABLED parser
 
 logger = logging.getLogger(__name__)
 
@@ -305,27 +310,46 @@ def scheduler_diagnostics() -> dict:
         "fireable_job_count": fireable,
         "runs": runs,
         "stalled": stalled,
+        # job_allowlist / skipped_by_allowlist / job_allowlist_unknown_ids — present ONLY when
+        # SCHEDULER_JOB_ALLOWLIST is set, so this payload is unchanged everywhere else.
+        **_allowlist_diagnostics(),
     }
+
+
+def _allowlist_diagnostics() -> dict:
+    try:
+        from services.scheduler_job_allowlist import diagnostics
+        return diagnostics()
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never break the health endpoint
+        # NOT `{}`: that is exactly what an unset allowlist reports, so a broken read would
+        # look like "no filter" on the one page an operator checks. Type only, no message.
+        return {"job_allowlist_error": type(exc).__name__}
 
 
 def _queue_worker_enabled() -> bool:
     """Whether THIS process should drain the shared async-run queues
     (audit / executor / verification worker ticks + their lease reapers).
 
-    Production and staging SHARE one Postgres (single-DB tenancy by design), and
-    these workers claim work by polling the shared tables with NO environment
-    filter. So a staging service running them POACHES production-enqueued runs it
-    can't complete — it lacks prod secrets (e.g. PROMOTIONS_ADMIN_KEY) and may run
-    older code — then silently fails them (0 probes, "succeeded" empty audit).
-    Gate the drainers so only the production worker claims the shared queue.
+    These workers claim work by polling the queue tables with NO environment
+    filter, so the database boundary is what keeps one environment's worker off
+    another's runs. This gate was written in
+    the Railway era, when production and staging SHARED one Postgres and a
+    staging service running the drainers POACHED production-enqueued runs it
+    couldn't complete (no prod secrets such as PROMOTIONS_ADMIN_KEY, possibly
+    older code), then silently failed them (0 probes, "succeeded" empty audit).
+    On GCP they no longer share one: prod and staging each run their own Cloud
+    SQL instance (infra/gcp/README.md, verified 2026-09-29). The gate still
+    keeps the singleton crons and drainers off staging/preview services by
+    default, and the claim still has no environment filter — so verify a
+    worker's DATABASE_URL host is its own project's instance before arming it.
 
     Fail-safe toward ENABLED: only disable when this is clearly a staging/preview
     service, or AUDIT_WORKER_ENABLED is explicitly false — so a detection miss
     can never accidentally stop the PRODUCTION worker (worst case = no change).
     """
-    override = (os.getenv("AUDIT_WORKER_ENABLED") or "").strip().lower()
-    if override:
-        return override in ("1", "true", "yes", "on")
+    override = worker_flag_override()
+    if override is not None:
+        return override
     service = (service_name() or "").lower()
     if "staging" in service or "preview" in service:
         return False
@@ -363,8 +387,9 @@ async def start_scheduler() -> None:
 
     try:
         scheduler = AsyncIOScheduler(timezone="UTC")
-        # Only the production worker drains the SHARED async-run queues; a
-        # staging service on the same DB must not poach prod-enqueued runs.
+        # Only the production worker drains the async-run queues by default.
+        # (Written when staging shared prod's DB and would have poached
+        # prod-enqueued runs; each environment now has its own instance.)
         worker_enabled = _queue_worker_enabled()
         if not worker_enabled:
             logger.warning(
@@ -377,12 +402,24 @@ async def start_scheduler() -> None:
             )
 
         from services.scheduler_job_runner import wrap_job
+        from services import scheduler_job_allowlist as job_allowlist
+
+        # SCHEDULER_JOB_ALLOWLIST (services/scheduler_job_allowlist.py): None when unset/empty,
+        # which is NO FILTER — every branch below that consults it is then a no-op. Outside
+        # production with AUDIT_WORKER_ENABLED explicitly true, unset means ALLOW-NOTHING.
+        allowlist, allowlist_source = job_allowlist.resolve_allowlist()
+        job_allowlist.begin_scheduler_boot()
+        # Every id `_add_job` is asked for on a worker, registered or not — what an allowlist
+        # entry is checked against, so a typo is reported rather than silently starting nothing.
+        seen_job_ids: set = set()
 
         def _add_job(func, *args, **kwargs):
-            # Register a scheduled job ONLY on the production worker. Prod+staging
-            # share one Postgres, so a staging service must NOT double-fire these
-            # singleton prod crons (daily audit check, settlement, billing,
-            # reconcile, backfills) or drain the shared queues. Gates everything
+            # Register a scheduled job ONLY on the production worker, so a
+            # staging service does not run these singleton crons (daily audit
+            # check, settlement, billing, reconcile, backfills) or drain the
+            # queues. Written when prod+staging shared one Postgres and staging
+            # would have double-fired them against prod's rows; staging now has
+            # its own instance (infra/gcp/README.md). Gates everything
             # uniformly — the explicit `if worker_enabled:` blocks below are now
             # redundant but harmless.
             #
@@ -394,6 +431,12 @@ async def start_scheduler() -> None:
             # completes cannot make `max_instances=1` skip every future tick.
             if worker_enabled:
                 job_id = kwargs.get("id") or getattr(func, "__name__", repr(func))
+                seen_job_ids.add(job_id)
+                # Skipped BEFORE wrap_job, so a skipped id is also absent from the runner's
+                # registry: run-now answers 404 job_not_registered for it, not a forced run.
+                if not job_allowlist.is_allowed(job_id, allowlist):
+                    job_allowlist.note_skipped(job_id, job_allowlist.KIND_SCHEDULER_JOB)
+                    return
                 wrapped = wrap_job(
                     job_id, func, deadline_seconds=run_deadline_for(job_id),
                 )
@@ -475,8 +518,8 @@ async def start_scheduler() -> None:
         # 05:00 UTC (after nightly_index_health). Min-sample-gated, so it surfaces
         # nothing until real transaction volume exists — a safe no-op pre-launch.
         from services.outcome_aggregation_service import refresh_all_outcomes
-        # _add_job (NOT scheduler.add_job) so staging — which shares prod's
-        # Postgres — does not double-fire this singleton cron. It used the raw
+        # _add_job (NOT scheduler.add_job) so this singleton cron runs only on
+        # the production worker, like every other job. It used the raw
         # add_job and slipped the env gate every other job respects.
         _add_job(
             refresh_all_outcomes,
@@ -1256,7 +1299,7 @@ async def start_scheduler() -> None:
         # missing/mis-correlated webhook can't strand a real charge. 5min keeps
         # recovery latency low without hammering the PSP API. The tick is DORMANT
         # unless PAYMENT_RECONCILE_SWEEP_ENABLED is set — it auto-finalizes
-        # payments, and staging shares the prod DB, so enable deliberately.
+        # payments, so enable deliberately.
         from services.payment_reconcile import run_payment_reconcile_tick
         _add_job(
             run_payment_reconcile_tick,
@@ -1275,8 +1318,8 @@ async def start_scheduler() -> None:
         # refund state close to real time; the claim is SKIP LOCKED so a second
         # drainer would be safe, and `_add_job` already restricts this to the
         # production worker. NOT flag-gated: unlike the reconcile sweep this
-        # only acts on rows a request explicitly enqueued, so a staging service
-        # sharing the prod DB cannot invent work — and gating it would recreate
+        # only acts on rows a request explicitly enqueued, so a drainer cannot
+        # invent work — and gating it would recreate
         # the silent-loss failure it exists to remove.
         from services.merchant_order_sync_drain import (
             run_merchant_order_sync_lease_reaper_tick,
@@ -1323,9 +1366,9 @@ async def start_scheduler() -> None:
         # ENQUEUES rather than creating, and skips any order that already has a
         # create job in any state, so it cannot re-attempt work the queue owns.
         #
-        # Flag-gated anyway: it writes on the money path, staging shares the
-        # prod Postgres, and its first prod run will pick up the pre-queue
-        # backlog. Arm it deliberately after a `--dry-run` has sized that.
+        # Flag-gated anyway: it writes on the money path, and its first prod
+        # run will pick up the pre-queue backlog. Arm it deliberately after a
+        # `--dry-run` has sized that.
         from jobs.agentic_commerce_reconciliation import (
             run_merchant_order_create_reconcile_tick,
         )
@@ -1362,7 +1405,7 @@ async def start_scheduler() -> None:
         # (same_url_dup, junk_url) -> review batches for the rest -> alert
         # if a duplication gauge rises. DORMANT unless
         # ENABLE_IDENTITY_RECONCILE_SWEEP is set (the tick checks the flag
-        # itself); staging shares the prod DB, so enable deliberately.
+        # itself), so enable deliberately.
         # docs/plans/adr010_d2_catalog_reconciliation_at_scale.md.
         from services.identity_reconcile_sweep import (
             run_identity_reconcile_sweep_tick,
@@ -1379,6 +1422,9 @@ async def start_scheduler() -> None:
             max_instances=1,
             misfire_grace_time=21600,  # fire up to 6h late rather than skip a week
         )
+
+        if allowlist_source != job_allowlist.SOURCE_UNSET:
+            _report_allowlist(allowlist, seen_job_ids, worker_enabled, scheduler)
 
         scheduler.start()
         _SCHEDULER = scheduler
@@ -1482,6 +1528,46 @@ async def start_scheduler() -> None:
             "audit_scheduler: start failed (continuing degraded): %s",
             exc,
         )
+
+
+def _report_allowlist(allowlist, seen_job_ids, worker_enabled: bool, scheduler) -> None:
+    """Boot-time report for an ACTIVE SCHEDULER_JOB_ALLOWLIST — a list, `*`, or the
+    non-production fail-closed. Never called when it is unset (source "unset").
+
+    Through the "pivota" logger at WARNING: prod leaves root at WARNING, so a module logger's
+    lines here could be dropped, and "which jobs did this worker decline to start" is exactly the
+    question someone arming a single-purpose worker needs answered from the logs alone.
+    """
+    from services import scheduler_job_allowlist as job_allowlist
+    from utils.logger import logger as operator_logger
+
+    # Only on a worker: with the worker gate off `_add_job` records no ids (and the
+    # `if worker_enabled:` blocks never call it), so every entry would read as a typo.
+    # allowlist None here means `*` (source "all"): no ids to check, but still an ACTIVE line.
+    unknown = (
+        job_allowlist.unknown_ids(allowlist, seen_job_ids)
+        if worker_enabled and allowlist is not None else []
+    )
+    job_allowlist.record_unknown(unknown)
+    if unknown:
+        operator_logger.warning(
+            "audit_scheduler: %s names %d id(s) that match no scheduler job or process loop: "
+            "%s (matching is exact and case-sensitive; known ids are on /__scheduler_health "
+            "and in docs/runbooks/scheduler_job_allowlist.md)",
+            job_allowlist.ENV_VAR, len(unknown), unknown,
+        )
+    try:
+        registered = sorted(j.id for j in scheduler.get_jobs())
+    except Exception:  # noqa: BLE001 — a report must never break boot
+        registered = []
+    operator_logger.warning(
+        "audit_scheduler: %s ACTIVE allowlist=%s worker_enabled=%s registered=%s "
+        "skipped_by_allowlist=%d",
+        job_allowlist.ENV_VAR,
+        [job_allowlist.ALL_JOBS] if allowlist is None else sorted(allowlist),
+        worker_enabled, registered,
+        len(job_allowlist.skipped_ids()),
+    )
 
 
 async def restart_scheduler() -> dict:

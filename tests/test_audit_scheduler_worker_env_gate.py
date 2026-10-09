@@ -1,8 +1,9 @@
 """The shared-queue worker ticks must only run on the production worker.
 
-Prod + staging share one Postgres, and claim_next_pending_run has no env filter,
-so a staging service draining the queue poaches prod-enqueued runs it can't
-complete. The gate disables drainers on staging while staying fail-safe toward
+claim_next_pending_run has no env filter. When prod + staging shared one
+Postgres (Railway era) a staging service draining the queue poached prod-enqueued
+runs it couldn't complete; each now has its own instance, and the gate still
+keeps staging/preview services from draining by default. The gate disables drainers on staging while staying fail-safe toward
 ENABLED so a detection miss never stops the prod worker.
 """
 from __future__ import annotations

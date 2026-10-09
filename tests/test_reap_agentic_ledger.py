@@ -59,6 +59,8 @@ _REACHES_TERMINAL = {
 
 _PAST = "datetime('now', '-120 seconds')"
 _FUTURE = "datetime('now', '+3600 seconds')"
+#: Past Reap's expiry AND the default enrollment grace (180 s).
+_PAST_GRACE = "datetime('now', '-400 seconds')"
 
 
 @pytest.fixture(autouse=True)
@@ -555,8 +557,30 @@ _EXPECTED_PUBLIC_COLUMNS = {
     # buyer input), what it came to (a code Reap refused is dropped and the buyer must be told
     # before approving), what Reap took off, and whether tax_minor is already in the prices.
     "offer_code", "offer_code_outcome", "discount_minor", "tax_included",
+    # mig 258. The price witness: what Reap QUOTED for the owner's own purchase (the preflight's
+    # confirmed totals, the live price when a quote disagreed, a corroborated lower price). Not
+    # PII, not a partner id (the witness quote id is never stored), not plumbing. The route nests
+    # them and shows each only when it applies.
+    "preflight_outcome", "preflight_error_code", "preflight_checked_at",
+    "preflight_items_subtotal_minor", "preflight_shipping_minor", "preflight_tax_minor",
+    "preflight_tax_included", "preflight_total_minor",
+    "live_unit_price_minor", "live_items_subtotal_minor", "live_quoted_total_minor",
+    "live_price_stage",
+    "price_rebound_from_minor", "price_rebound_to_minor", "price_corroboration_source",
+    "price_corroborated_at",
+}
+#: mig 258, written out (not imported from db/reap_price_witness.COLUMNS) for the allowlist's reason.
+_PRICE_WITNESS_COLUMNS = {
+    "preflight_outcome", "preflight_error_code", "preflight_checked_at",
+    "preflight_items_subtotal_minor", "preflight_shipping_minor", "preflight_tax_minor",
+    "preflight_tax_included", "preflight_total_minor",
+    "live_unit_price_minor", "live_items_subtotal_minor", "live_quoted_total_minor",
+    "live_price_stage",
+    "price_rebound_from_minor", "price_rebound_to_minor", "price_corroboration_source",
+    "price_corroborated_at",
 }
 _EXPECTED_NEVER_PUBLIC = {
+    "dispatch_tracking_version", "checkout_dispatch_key", "contact_received_at", "contact_purged_at", "contact_revision",
     "buyer_ref", "agent_id", "agent_user_ref_hash", "buyer_email", "shipping_address",
     "enrollment_id", "click_id", "return_url", "reap_product_id", "reap_variant_id",
     "reap_quote_id", "reap_checkout_id", "queries_tried", "attempts", "next_poll_at",
@@ -649,6 +673,23 @@ async def test_public_view_handles_none_and_partial_rows():
     assert ledger.public_purchase_view(None) is None
     # A partial row projects to a partial view, not to one padded with None.
     assert ledger.public_purchase_view({"id": "rp_1", "buyer_email": "x@y.z"}) == {"id": "rp_1"}
+
+
+async def test_public_view_cleans_the_two_merchant_names_and_nothing_else():
+    """#2462 follow-up: a row written before the display rule is shown clean; the row dict passed
+    in is not modified; absent keys stay absent; other text columns are projected as stored."""
+    row = {"id": "rp_1", "product_name": "\u202eSilky\nMatte\u200b", "variant_title": "07\ue000 INK\t",
+           "brand": "Judy\u200bdoll"}
+    view = ledger.public_purchase_view(row)
+    assert view == {"id": "rp_1", "product_name": "Silky Matte", "variant_title": "07 INK",
+                    "brand": "Judy\u200bdoll"}
+    assert row["product_name"] == "\u202eSilky\nMatte\u200b"
+    assert ledger.public_purchase_view({"id": "rp_2", "variant_title": "\u202e"}) == {
+        "id": "rp_2", "variant_title": None}
+    assert ledger.public_purchase_view({"id": "rp_3", "product_name": "P" * 300}) == {
+        "id": "rp_3", "product_name": "P" * 255}                      # no variant_title key added
+    assert ledger.public_purchase_view({"id": "rp_4", "variant_title": "07"}) == {
+        "id": "rp_4", "variant_title": "07"}                           # no product_name key added
 
 
 async def test_get_purchase_internal_is_named_internal_and_is_not_exported():
@@ -750,7 +791,9 @@ async def test_a_naive_datetime_is_read_as_utc_not_as_local_time(tz):
         moved = await ledger.transition(
             purchase["id"],
             from_states=["resolving"],
-            to_state="quoting",
+            # 'needs_enrollment', not 'quoting': a transition INTO 'quoting' clears the hosted
+            # link by rule (and refuses one passed in), so it cannot carry this probe.
+            to_state="needs_enrollment",
             reap_quote_expires_at=naive,
             hosted_url_expires_at=naive,
         )
@@ -863,7 +906,7 @@ async def test_the_candidate_select_does_not_offer_already_claimed_rows():
         if IS_POSTGRES
         else ledger._SELECT_DUE_PURCHASES_SQL_SQLITE
     )
-    offered = {r["id"] for r in await database.fetch_all(sql, {"limit": 50})}
+    offered = {r["id"] for r in await database.fetch_all(sql, {"limit": 50, "reconciliation_only": 0, "pilot_scope": None})}
     assert free["id"] in offered
     assert held["id"] not in offered, (
         "a row somebody already holds must not be offered as a candidate — the claim would "
@@ -907,7 +950,7 @@ async def test_the_claim_statement_refuses_a_row_that_went_terminal_after_the_se
     )
 
     sql = ledger._CLAIM_PURCHASE_SQL if IS_POSTGRES else ledger._CLAIM_PURCHASE_SQL_SQLITE
-    row = await database.fetch_one(sql, {"id": purchase["id"], "worker_id": "worker_a"})
+    row = await database.fetch_one(sql, {"id": purchase["id"], "worker_id": "worker_a", "reconciliation_only": 0, "pilot_scope": None})
     assert row is None, (
         "the claim UPDATE must re-check the state: between the candidate SELECT and this "
         "statement the row reached a terminal state, and a poller must never be handed one"
@@ -1189,7 +1232,11 @@ async def test_the_expire_sweep_never_touches_an_approved_purchase():
 @pytest.mark.parametrize("state", ["needs_enrollment", "awaiting_approval"])
 async def test_expire_moves_an_overdue_hosted_page_and_scrubs_it(state):
     purchase = await _mk(state=state)
-    await _set_clock_column(purchase["id"], "hosted_url_expires_at", _PAST)
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at",
+        # A 'needs_enrollment' page is overdue only once the ENROLLMENT GRACE (180 s by
+        # default) has passed too; see test_the_enrollment_grace_* for the window itself.
+        _PAST_GRACE if state == "needs_enrollment" else _PAST,
+    )
     await database.execute(
         "UPDATE reap_agentic_purchases SET claimed_by = 'w1', "
         "claimed_at = CURRENT_TIMESTAMP WHERE id = :i",
@@ -1312,7 +1359,7 @@ async def test_fail_exhausted_takes_a_row_at_EXACTLY_max_attempts():
 
 
 async def test_expire_is_bounded_by_limit_and_the_caller_loops():
-    """Prod and staging share one Postgres. An unbounded UPDATE on first arming — when the whole
+    """Prod's Postgres serves live traffic. An unbounded UPDATE on first arming — when the whole
     backlog qualifies at once — locks every matching row simultaneously."""
     ids = []
     for index in range(7):
@@ -1500,8 +1547,9 @@ async def test_the_expire_fallback_reads_state_entered_at_not_updated_at():
 
 
 async def test_only_state_changing_statements_stamp_state_entered_at():
-    """`state_entered_at` may be written by exactly three kinds of statement — the transition and
-    the two sweeps — and by no other."""
+    """`state_entered_at` may be written by exactly four kinds of statement — the transition and
+    the three terminal sweeps (expire, fail-exhausted, and the contact re-entry lapse) — and by
+    no other."""
     stamps = {
         name: value.count("state_entered_at =")
         for name, value in vars(ledger).items()
@@ -1512,6 +1560,7 @@ async def test_only_state_changing_statements_stamp_state_entered_at():
         "_TRANSITION_SQL", "_TRANSITION_SQL_SQLITE",
         "_EXPIRE_OVERDUE_SQL", "_EXPIRE_OVERDUE_SQL_SQLITE",
         "_FAIL_EXHAUSTED_SQL", "_FAIL_EXHAUSTED_SQL_SQLITE",
+        "_LAPSE_CONTACT_REENTRY_SQL", "_LAPSE_CONTACT_REENTRY_SQL_SQLITE",
     }, f"unexpected writers of state_entered_at: {sorted(writers)}"
 
 
@@ -2734,9 +2783,10 @@ async def test_release_still_schedules_the_next_poll_alongside_the_code():
 # compared against the module's own idea of itself cannot notice that idea changing.
 _ENROLLMENT_PROJECTION = {
     "id", "buyer_ref", "reap_enrollment_id", "status", "hosted_url", "hosted_url_expires_at",
-    "card_network", "card_last4",
+    "card_network", "card_last4", "created_at",
+    "hosted_url_expiry_invalid",
 }
-_ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "created_at", "updated_at"}
+_ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "updated_at"}
 
 
 async def test_get_enrollment_internal_reads_a_pending_row_by_id():
@@ -3012,6 +3062,7 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
     # columns in the same run. Named explicitly rather than loosened to `<=`: "nothing else" is
     # still the assertion.
     assert after - before == set(_HINT_COLUMNS) | {
+        "dispatch_tracking_version", "checkout_dispatch_key", "contact_received_at", "contact_purged_at", "contact_revision",
         "item_source",
         "cart_url",
         "consent_version",
@@ -3020,9 +3071,9 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
         "offer_code_outcome",
         "discount_minor",
         "tax_included",
-    }, (
-        "the heal added something other than the three mig-225, two mig-229, two mig-233 and "
-        "four mig-247 columns"
+    } | _PRICE_WITNESS_COLUMNS, (
+        "the heal added something other than the three mig-225, two mig-229, two mig-233, "
+        "four mig-247 and sixteen mig-258 columns"
     )
 
     # And the rail works on the healed table.
@@ -4035,3 +4086,666 @@ async def test_a_tag_the_route_accepts_is_never_refused_further_down():
         # No exception is the assertion.
         assert svc_mod._require_consent_version(tag) == tag
         assert ledger.require_consent_version(tag, required=True) == tag
+
+
+# ── 2026-09-30: the enrollment grace, the pending read, and the dead-link guard ─────────────
+#
+# Staging, one demo buyer: Reap flipped an enrollment to ACTIVE 9 s AFTER its hosted session
+# expired; the sweep had already expired the purchase on the exact expiry; our enrollment row
+# stayed 'pending'; and every later purchase by that buyer got the SAME pending row back from
+# `upsert_pending_enrollment`, replayed the SAME attempt id, and was handed the SAME dead link.
+# These are the ledger halves of the fix; the service halves are in
+# tests/test_reap_agentic_purchase.py.
+
+
+async def _set_enrollment_expiry(enrollment_id: str, sql_expr: str) -> None:
+    await database.execute(
+        f"UPDATE reap_agentic_enrollments SET hosted_url_expires_at = {sql_expr} WHERE id = :i",
+        {"i": enrollment_id},
+    )
+
+
+async def _pending_with_link(buyer_ref: str = "bref_alice", reap_id: str = "9041ef1a-1377-45f6-b09a-95d5eb07f908"):
+    return await ledger.upsert_pending_enrollment(
+        buyer_ref=buyer_ref,
+        reap_enrollment_id=reap_id,
+        hosted_url="https://pay.prava.space/enroll/9041ef1a",
+        hosted_url_expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+
+
+async def _enrollment_count(buyer_ref: str = "bref_alice", status: str = "pending") -> int:
+    row = await database.fetch_one(
+        "SELECT COUNT(*) AS n FROM reap_agentic_enrollments WHERE buyer_ref = :b AND status = :s",
+        {"b": buyer_ref, "s": status},
+    )
+    return int(row["n"])
+
+
+async def test_the_enrollment_grace_keeps_a_needs_enrollment_row_9_seconds_past_its_link():
+    """THE STAGING TIMELINE. The link expired at 11:36:34, Reap said ACTIVE at 11:36:43, the
+    sweep ran at 11:37:02. With the grace the purchase is still there for the poller."""
+    purchase = await _mk(state="needs_enrollment")
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", "datetime('now', '-28 seconds')")
+    assert await ledger.expire_overdue_purchases() == []
+    assert await _state_of(purchase["id"]) == "needs_enrollment"
+
+
+async def test_the_enrollment_grace_ends_and_the_row_expires():
+    """Still REQUIRES_ACTION after the grace: the sweep takes it, exactly as before."""
+    purchase = await _mk(state="needs_enrollment")
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", "datetime('now', '-181 seconds')")
+    assert await ledger.expire_overdue_purchases() == [purchase["id"]]
+    row = await ledger.get_purchase_internal(purchase["id"])
+    assert row["state"] == "expired"
+    assert row["last_error_code"] == "hosted_url_expired"
+    assert row["buyer_email"] is None
+
+
+async def test_the_enrollment_grace_is_the_argument_not_a_constant_in_the_sql():
+    """0 is 'Reap's exact expiry' — the pre-fix behaviour, which is how the staging sequence is
+    reproduced; 60 leaves a row 28 s past alone."""
+    purchase = await _mk(state="needs_enrollment")
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", "datetime('now', '-28 seconds')")
+    assert await ledger.expire_overdue_purchases(enrollment_grace_seconds=60) == []
+    assert await ledger.expire_overdue_purchases(enrollment_grace_seconds=0) == [purchase["id"]]
+
+
+async def test_awaiting_approval_gets_no_enrollment_grace():
+    """REFUSING EXAMPLE. The QUOTE dies at the approval page's expiry; a grace there would hold a
+    purchase whose checkout can no longer complete."""
+    purchase = await _mk(state="awaiting_approval")
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", "datetime('now', '-9 seconds')")
+    assert await ledger.expire_overdue_purchases() == [purchase["id"]]
+
+
+async def test_the_absolute_fallback_still_bounds_a_row_inside_its_grace():
+    """The grace moves the hosted-expiry clock only; `state_entered_at + max_age` still fires."""
+    purchase = await _mk(state="needs_enrollment")
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", "datetime('now', '-9 seconds')")
+    await _set_clock_column(purchase["id"], "state_entered_at", "datetime('now', '-99999 seconds')")
+    assert await ledger.expire_overdue_purchases(max_age_seconds=3600) == [purchase["id"]]
+
+
+@pytest.mark.parametrize("bad", [-1, 3601, True, 2.5, "180", None])
+async def test_the_enrollment_grace_is_a_strict_bounded_int(bad):
+    with pytest.raises(ValueError):
+        await ledger.expire_overdue_purchases(enrollment_grace_seconds=bad)
+
+
+async def test_the_default_grace_is_the_one_constant():
+    import inspect as _inspect
+
+    default = _inspect.signature(ledger.expire_overdue_purchases).parameters[
+        "enrollment_grace_seconds"
+    ].default
+    assert default == ledger.ENROLLMENT_GRACE_SECONDS_DEFAULT == 180
+
+
+async def test_upsert_refuses_to_hand_back_a_pending_row_whose_link_is_dead():
+    """THE REPLAY. Returning this row makes its id the attempt id again, so Reap's idempotency
+    replays the SAME enrollment and its dead page. Refused, and nothing is written."""
+    pending = await _pending_with_link()
+    await _set_enrollment_expiry(pending["id"], "datetime('now', '-64 seconds')")
+    with pytest.raises(ledger.PendingEnrollmentExpired) as caught:
+        await ledger.upsert_pending_enrollment(buyer_ref="bref_alice", agent_id="agent_one")
+    assert caught.value.enrollment_id == pending["id"]
+    assert await _enrollment_count() == 1, "no second pending row"
+    again = await ledger.get_enrollment_internal(pending["id"])
+    assert again["status"] == "pending", "not retired either: Reap may say it is ACTIVE"
+
+
+async def test_upsert_still_returns_a_pending_row_whose_link_is_live_or_unknown():
+    """The controls. A live link, and a row with no expiry at all (a create whose response was
+    lost), are both the attempt to replay."""
+    pending = await _pending_with_link()
+    again = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    assert again["id"] == pending["id"]
+
+    no_expiry = await ledger.upsert_pending_enrollment(buyer_ref="bref_bob")
+    assert (await ledger.upsert_pending_enrollment(buyer_ref="bref_bob"))["id"] == no_expiry["id"]
+
+
+async def test_upsert_with_an_explicit_id_is_not_blocked_by_the_expiry():
+    """The second call of a mint records what the partner said onto the attempt it holds."""
+    pending = await _pending_with_link()
+    await _set_enrollment_expiry(pending["id"], "datetime('now', '-64 seconds')")
+    updated = await ledger.upsert_pending_enrollment(
+        buyer_ref="bref_alice", enrollment_id=pending["id"], reap_status="REQUIRES_ACTION"
+    )
+    assert updated["id"] == pending["id"]
+
+
+async def test_upsert_mints_fresh_once_the_dead_row_is_retired():
+    pending = await _pending_with_link()
+    await _set_enrollment_expiry(pending["id"], "datetime('now', '-400 seconds')")
+    await ledger.mark_enrollment_dead(pending["id"], reap_status="EXPIRED")
+    fresh = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    assert fresh["id"] != pending["id"]
+    assert await _enrollment_count() == 1
+
+
+async def test_get_pending_enrollment_reads_the_newest_pending_row_and_its_expiry_flag():
+    assert await ledger.get_pending_enrollment("bref_alice") is None
+    pending = await _pending_with_link()
+    read = await ledger.get_pending_enrollment("bref_alice")
+    assert read["id"] == pending["id"]
+    assert read["reap_enrollment_id"] == "9041ef1a-1377-45f6-b09a-95d5eb07f908"
+    assert read["hosted_url_expired"] is False
+    await _set_enrollment_expiry(pending["id"], "datetime('now', '-1 seconds')")
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is True
+    # Not an active or dead row, and not another buyer's.
+    await ledger.mark_enrollment_active(pending["id"])
+    assert await ledger.get_pending_enrollment("bref_alice") is None
+    await _pending_with_link(buyer_ref="bref_bob", reap_id="11111111-1111-1111-1111-111111111111")
+    assert await ledger.get_pending_enrollment("bref_alice") is None
+
+
+@pytest.mark.parametrize("bad", ["", "   ", None, 123])
+async def test_get_pending_enrollment_refuses_a_non_id(bad):
+    with pytest.raises(ValueError):
+        await ledger.get_pending_enrollment(bad)
+
+
+async def test_a_transition_into_quoting_clears_the_hosted_link():
+    """The spent ENROLLMENT link and its expiry do not ride along into 'quoting'."""
+    purchase = await _mk()
+    waiting = await ledger.transition(
+        purchase["id"], from_states=["resolving"], to_state="needs_enrollment",
+        hosted_url="https://pay.prava.space/enroll/9041ef1a",
+        hosted_url_expires_at=datetime.now(timezone.utc) - timedelta(seconds=9),
+    )
+    assert waiting["hosted_url"] and waiting["hosted_url_expires_at"]
+    quoting = await ledger.transition(
+        purchase["id"], from_states=["needs_enrollment"], to_state="quoting"
+    )
+    assert quoting["hosted_url"] is None
+    assert quoting["hosted_url_expires_at"] is None
+
+
+async def test_a_transition_elsewhere_keeps_the_hosted_link():
+    """The control: only 'quoting' clears. An approval page stays on the row into 'processing'."""
+    purchase = await _mk(state="awaiting_approval")
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET hosted_url = 'https://pay.prava.space/checkout/x', "
+        "hosted_url_expires_at = datetime('now', '+600 seconds') WHERE id = :i",
+        {"i": purchase["id"]},
+    )
+    moved = await ledger.transition(
+        purchase["id"], from_states=["awaiting_approval"], to_state="processing"
+    )
+    assert moved["hosted_url"] == "https://pay.prava.space/checkout/x"
+    assert moved["hosted_url_expires_at"] is not None
+
+
+@pytest.mark.parametrize("field", ["hosted_url", "hosted_url_expires_at"])
+async def test_a_transition_into_quoting_refuses_a_hosted_link(field):
+    """REFUSING EXAMPLE: the statement would drop it, so the call is refused before any SQL."""
+    purchase = await _mk()
+    value = (
+        "https://pay.prava.space/enroll/x" if field == "hosted_url"
+        else datetime.now(timezone.utc) + timedelta(minutes=5)
+    )
+    with pytest.raises(ValueError):
+        await ledger.transition(
+            purchase["id"], from_states=["resolving"], to_state="quoting", **{field: value}
+        )
+    assert await _state_of(purchase["id"]) == "resolving"
+
+
+# ── review of #2483 at 93f585c26: the ledger halves ─────────────────────────────────────────
+
+
+async def _raw_pending(id_: str, buyer_ref: str = "bref_alice", **cols) -> None:
+    names = ["id", "buyer_ref", "status", *cols]
+    await database.execute(
+        f"INSERT INTO reap_agentic_enrollments ({', '.join(names)}) VALUES "
+        f"({', '.join(':' + n for n in names)})",
+        {"id": id_, "buyer_ref": buyer_ref, "status": "pending", **cols},
+    )
+
+
+async def test_the_self_heal_refuses_a_second_pending_row_for_one_buyer():
+    """Migration 252's index, as the SELF-HEAL builds it, tested behaviourally — and its
+    partial predicate: other buyers, and dead/active rows of the same buyer, do not collide."""
+    await _raw_pending("re_one")
+    with pytest.raises(sqlite3.IntegrityError):
+        await _raw_pending("re_two")
+    await _raw_pending("re_bob", buyer_ref="bref_bob")
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status) "
+        "VALUES ('re_dead', 'bref_alice', 'dead')"
+    )
+    assert await _enrollment_count() == 1
+
+
+async def test_the_migration_and_the_self_heal_declare_the_same_one_pending_index():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    migration = (root / "db/migrations/252_reap_agentic_enrollments_one_pending.sql").read_text()
+    guard = (root / "db/schema_guard.py").read_text()
+    down = (root / "db/migrations/down/252_reap_agentic_enrollments_one_pending_down.sql").read_text()
+    assert "uq_reap_agentic_enrollments_one_pending" in migration
+    assert "ON reap_agentic_enrollments (buyer_ref)" in migration
+    assert "WHERE status = 'pending'" in migration
+    assert guard.count('"uq_reap_agentic_enrollments_one_pending "') == 2, "both dialects"
+    assert "DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending" in down
+
+
+async def test_a_concurrent_mint_hands_the_loser_the_winner(monkeypatch):
+    """P2-1. The race inside `upsert_pending_enrollment`: our read saw no pending row, another
+    writer inserted one, our INSERT is refused by the index — and we get THE WINNER back, not a
+    raw IntegrityError and not a second row."""
+    real = ledger.get_pending_enrollments
+    calls = {"n": 0}
+
+    async def _stale_then_real(buyer_ref):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await _raw_pending("re_winner")      # the other writer, between our read and INSERT
+            return []
+        return await real(buyer_ref)
+
+    monkeypatch.setattr(ledger, "get_pending_enrollments", _stale_then_real)
+    got = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    assert got["id"] == "re_winner"
+    assert await _enrollment_count() == 1
+
+
+async def test_a_concurrent_mint_carrying_partner_fields_is_refused_by_name(monkeypatch):
+    """The same refusal on an INSERT that carried a partner's answer: the winner is NOT returned
+    (that would drop the answer silently) — `PendingEnrollmentTaken` names it."""
+    real = ledger.get_pending_enrollments
+    calls = {"n": 0}
+
+    async def _stale_then_real(buyer_ref):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await _raw_pending("re_winner")
+            return []
+        return await real(buyer_ref)
+
+    monkeypatch.setattr(ledger, "get_pending_enrollments", _stale_then_real)
+    with pytest.raises(ledger.PendingEnrollmentTaken) as caught:
+        await ledger.upsert_pending_enrollment(
+            buyer_ref="bref_alice", hosted_url="https://pay.prava.space/enroll/x"
+        )
+    assert caught.value.winner_id == "re_winner"
+
+
+async def test_a_partner_id_held_by_another_row_is_a_named_conflict_on_update_and_insert():
+    """P1-1. `uq_reap_agentic_enrollments_reap_id` refusing the write is `EnrollmentIdConflict`
+    carrying the holder — on the UPDATE (recording a create's answer on our attempt) and on the
+    INSERT — never a raw driver error."""
+    held = "9041ef1a-1377-45f6-b09a-95d5eb07f908"
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id) "
+        "VALUES ('re_old', 'bref_alice', 'dead', :r)", {"r": held},
+    )
+    ours = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    with pytest.raises(ledger.EnrollmentIdConflict) as on_update:
+        await ledger.upsert_pending_enrollment(
+            buyer_ref="bref_alice", enrollment_id=ours["id"], reap_enrollment_id=held
+        )
+    assert on_update.value.enrollment_id == ours["id"]
+    assert (on_update.value.holder["id"], on_update.value.holder["status"]) == ("re_old", "dead")
+    await ledger.mark_enrollment_dead(ours["id"])
+    with pytest.raises(ledger.EnrollmentIdConflict) as on_insert:
+        await ledger.upsert_pending_enrollment(buyer_ref="bref_alice", reap_enrollment_id=held)
+    assert on_insert.value.enrollment_id is None
+    assert on_insert.value.holder["id"] == "re_old"
+
+
+async def test_a_linked_pending_row_with_no_expiry_dies_with_reaps_session():
+    """P2-2. No recorded expiry is not "never expires": a row WITH a link is judged against
+    created_at + HOSTED_SESSION_SECONDS; a row with NO link (a lost create response) never is."""
+    await _raw_pending("re_linked", hosted_url="https://pay.prava.space/enroll/x")
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET created_at = datetime('now', '-100 seconds')"
+    )
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is False
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET created_at = datetime('now', :s)",
+        {"s": f"-{ledger.HOSTED_SESSION_SECONDS + 1} seconds"},
+    )
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is True
+    with pytest.raises(ledger.PendingEnrollmentExpired):
+        await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    await database.execute("UPDATE reap_agentic_enrollments SET hosted_url = NULL")
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is False
+
+
+async def test_pending_enrollments_are_every_row_oldest_first_with_the_whole_row():
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
+    await _raw_pending("re_b", agent_id="agent_one", reap_status="REQUIRES_ACTION")
+    await _raw_pending("re_a")
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET created_at = datetime('now', '-60 seconds') "
+        "WHERE id = 're_a'"
+    )
+    rows = await ledger.get_pending_enrollments("bref_alice")
+    assert [r["id"] for r in rows] == ["re_a", "re_b"]
+    assert {"agent_id", "reap_status", "created_at", "updated_at"} <= set(rows[1])
+    assert (rows[1]["agent_id"], rows[1]["reap_status"]) == ("agent_one", "REQUIRES_ACTION")
+    assert (await ledger.get_pending_enrollment("bref_alice"))["id"] == "re_a"
+    # ANY dead link among them stops the upsert, whichever row it would have picked.
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET hosted_url_expires_at = datetime('now', '-5 seconds') "
+        "WHERE id = 're_b'"
+    )
+    with pytest.raises(ledger.PendingEnrollmentExpired) as caught:
+        await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    assert caught.value.enrollment_id == "re_b"
+
+
+async def test_a_settling_claim_is_not_an_attempt_and_other_resolving_claims_are():
+    """P2-3, at the statement: `enrollment_settling` on a 'resolving' row exempts the claim;
+    any other code (or none) counts; the exemption is 'resolving'-only."""
+    held = await _mk()
+    other = await _mk(buyer_ref="bref_other")
+    quoting = await _mk(state="quoting", buyer_ref="bref_q")
+    for row, code in ((held, "enrollment_settling"), (other, "transport_error:readtimeout"),
+                      (quoting, "enrollment_settling")):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET last_error_code = :c, "
+            "next_poll_at = datetime('now', '-1 seconds') WHERE id = :i",
+            {"c": code, "i": row["id"]},
+        )
+    claimed = {r["id"]: r["attempts"] for r in await ledger.claim_due_purchases("w1")}
+    assert claimed[held["id"]] == 0
+    assert claimed[other["id"]] == 1
+    assert claimed[quoting["id"]] == 1
+
+
+async def test_the_self_heal_warns_when_the_one_pending_index_cannot_be_built(caplog):
+    """Round-2 nit. A database that already holds two pending rows for one buyer cannot take
+    migration 252's index. The self-heal still swallows that (startup must not fail) — but it
+    SAYS so, naming the index and the runbook census, because this is the one index whose
+    absence changes behaviour. The control: a clean rebuild says nothing."""
+    import logging as _logging
+
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
+    caplog.set_level(_logging.WARNING, logger="db.schema_guard")
+    await ensure_required_schema_light()
+    assert not [r for r in caplog.records if "one_pending" in r.getMessage()], "control"
+
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
+    await _raw_pending("re_dup1")
+    await _raw_pending("re_dup2")
+    caplog.clear()
+    await ensure_required_schema_light()
+    warned = [r for r in caplog.records if "uq_reap_agentic_enrollments_one_pending" in r.getMessage()]
+    assert len(warned) == 1 and warned[0].levelno == _logging.WARNING
+    assert "census" in warned[0].getMessage(), "a UNIQUE violation names the duplicates"
+    assert "IntegrityError" in warned[0].getMessage(), "the real exception, not a guess"
+    assert "re_dup" not in warned[0].getMessage(), "DDL text only, never row values"
+    assert await _enrollment_count() == 2, "swallowed: startup went on, nothing was deleted"
+
+
+async def test_the_self_heal_does_not_blame_duplicates_for_another_failure(caplog, monkeypatch):
+    """Deploy-safety nit on e426d3b34: a failure that is NOT a unique violation (here a locked
+    database) is reported as itself — "could not build <index>: <exc>" — without the census
+    advice, which would send an operator looking for duplicates that do not exist."""
+    import logging as _logging
+
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
+    real = database.execute
+
+    async def _locked(query, *args, **kwargs):
+        if "uq_reap_agentic_enrollments_one_pending" in str(query):
+            raise sqlite3.OperationalError("database is locked")
+        return await real(query, *args, **kwargs)
+
+    monkeypatch.setattr(database, "execute", _locked)
+    caplog.set_level(_logging.WARNING, logger="db.schema_guard")
+    await ensure_required_schema_light()
+    warned = [r for r in caplog.records if "uq_reap_agentic_enrollments_one_pending" in r.getMessage()]
+    assert len(warned) == 1
+    text = warned[0].getMessage()
+    assert "could not build uq_reap_agentic_enrollments_one_pending" in text
+    assert "OperationalError: database is locked" in text
+    assert "census" not in text and "duplicate" not in text
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+# The stuck count — `count_stuck_purchases`, the number the "purchase stuck" alert reads
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+#
+# READ ONLY, so there is no row to read back: every test is a count, and every counted case has a
+# control one second (or one rule) on the other side of it. The three windows used throughout:
+# stuck_after = 1800, the sweep's max age = 3600, the enrollment grace = 180.
+
+_STUCK = dict(stuck_after_seconds=1800, max_age_seconds=3600, enrollment_grace_seconds=180)
+
+
+def _ago(seconds: int) -> str:
+    return f"datetime('now', '-{int(seconds)} seconds')"
+
+
+async def _stuck_row(state: str, *, entered=None, hosted=None, code=None, buyer_ref="bref_alice"):
+    purchase = await _mk(state=state, buyer_ref=buyer_ref)
+    if entered is not None:
+        await _set_clock_column(purchase["id"], "state_entered_at", _ago(entered))
+    if hosted is not None:
+        await _set_clock_column(purchase["id"], "hosted_url_expires_at", _ago(hosted))
+    if code is not None:
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET last_error_code = :c WHERE id = :i",
+            {"c": code, "i": purchase["id"]},
+        )
+    return purchase
+
+
+#: (state, seconds since state_entered_at, seconds since hosted_url_expires_at, last_error_code).
+#: A NEGATIVE hosted value is a page that is still live.
+_STUCK_ROWS = [
+    # OUR work, 30 minutes old. 'processing' is the buyer-approved-and-nothing-happened row.
+    ("processing", 1801, None, None),
+    ("quoting", 1801, None, None),
+    ("resolving", 1801, None, None),  # last_error_code NULL: must not fall through a NULL compare
+    ("resolving", 1801, None, "transport_error:readtimeout"),
+    # The settling hold gets the grace and no more.
+    ("resolving", 1800 + 180 + 1, None, "enrollment_settling"),
+    # The marker survives a transition (COALESCE), so it must only exempt a 'resolving' row.
+    ("processing", 1801, None, "enrollment_settling"),
+    ("quoting", 1801, None, "enrollment_settling"),
+    # The waiting states: 30 minutes past the deadline the expire sweep enforces.
+    ("awaiting_approval", 2800, 1801, None),
+    ("needs_enrollment", 2800, 1800 + 180 + 1, None),
+    ("awaiting_approval", 3600 + 1800 + 1, None, None),
+    ("needs_enrollment", 3600 + 1800 + 1, None, None),
+    # A live page does not excuse a row past the absolute fallback: the sweep takes it there too.
+    ("needs_enrollment", 3600 + 1800 + 1, -3600, None),
+]
+
+_NOT_STUCK_ROWS = [
+    ("processing", 1700, None, None),
+    ("quoting", 1700, None, None),
+    ("resolving", 1700, None, None),
+    # Inside stuck_after + grace: the hold is still allowed to be holding.
+    ("resolving", 1900, None, "enrollment_settling"),
+    # A BUYER WITH A LIVE PAGE, 50 minutes in. The case the definition exists for.
+    ("awaiting_approval", 3000, -600, None),
+    ("needs_enrollment", 3000, -600, None),
+    # Overdue, but inside the margin: that is the expire sweep's row, not a stuck one.
+    ("awaiting_approval", 3000, 600, None),
+    ("needs_enrollment", 3000, 1900, None),  # past stuck_after, inside the grace on top of it
+    # No hosted deadline: the absolute fallback, plus the margin, has not passed.
+    ("awaiting_approval", 5000, None, None),
+    ("needs_enrollment", 5000, None, None),
+    # Brand new, every countable state.
+    ("resolving", 0, None, None),
+    ("needs_enrollment", 0, None, None),
+    ("quoting", 0, None, None),
+    ("awaiting_approval", 0, None, None),
+    ("processing", 0, None, None),
+]
+
+
+@pytest.mark.parametrize("state,entered,hosted,code", _STUCK_ROWS)
+async def test_a_purchase_past_its_deadline_by_the_margin_is_counted(state, entered, hosted, code):
+    await _stuck_row(state, entered=entered, hosted=hosted, code=code)
+    assert await ledger.count_stuck_purchases(**_STUCK) == 1
+
+
+@pytest.mark.parametrize("state,entered,hosted,code", _NOT_STUCK_ROWS)
+async def test_a_purchase_that_is_allowed_to_be_where_it_is_is_not_counted(
+    state, entered, hosted, code
+):
+    """The controls. Without them a count that returned the number of non-terminal rows would
+    pass every case above."""
+    await _stuck_row(state, entered=entered, hosted=hosted, code=code)
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+
+
+@pytest.mark.parametrize("state", _TERMINALS)
+async def test_a_terminal_purchase_is_never_stuck_however_old(state):
+    purchase = await _mk(state=state)
+    await _set_clock_column(purchase["id"], "state_entered_at", _ago(999999))
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", _ago(999999))
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+
+
+async def test_the_stuck_count_is_a_count_of_rows_not_a_flag():
+    for n in range(3):
+        await _stuck_row("processing", entered=4000, buyer_ref=f"bref_{n}")
+    await _stuck_row("processing", entered=10, buyer_ref="bref_fresh")
+    assert await ledger.count_stuck_purchases(**_STUCK) == 3
+
+
+async def test_each_stuck_window_is_the_argument_not_a_constant_in_the_sql():
+    """Three binds, three ways for one of them to be a literal that happens to match the default."""
+    work = await _stuck_row("processing", entered=700, buyer_ref="bref_w")
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+    assert await ledger.count_stuck_purchases(**dict(_STUCK, stuck_after_seconds=600)) == 1
+    await database.execute("DELETE FROM reap_agentic_purchases WHERE id = :i", {"i": work["id"]})
+
+    # needs_enrollment 1900 s past its link: inside 1800 + 180, outside 1800 + 60.
+    held = await _stuck_row("needs_enrollment", entered=2800, hosted=1900, buyer_ref="bref_g")
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+    assert await ledger.count_stuck_purchases(**dict(_STUCK, enrollment_grace_seconds=60)) == 1
+    await database.execute("DELETE FROM reap_agentic_purchases WHERE id = :i", {"i": held["id"]})
+
+    # No hosted deadline, 5000 s in: inside 3600 + 1800, outside 600 + 1800.
+    await _stuck_row("awaiting_approval", entered=5000, buyer_ref="bref_m")
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+    assert await ledger.count_stuck_purchases(**dict(_STUCK, max_age_seconds=600)) == 1
+
+
+async def test_a_waiting_row_is_only_ever_stuck_if_the_expire_sweep_would_take_it():
+    """THE DEFINITION, AS A PROPERTY: in the two states that wait on a buyer, "stuck" is a strict
+    subset of "the sweep's own deadline has passed". Run the real sweep with the same max age and
+    grace and nothing waiting is left to count — so the alert can never fire on a buyer who is
+    still allowed to be on the hosted page."""
+    n = 0
+    for state in ("needs_enrollment", "awaiting_approval"):
+        for entered in (0, 1700, 3000, 5000, 5500, 99999):
+            for hosted in (None, -3600, 100, 1700, 1900, 2100, 99999):
+                n += 1
+                await _stuck_row(state, entered=entered, hosted=hosted, buyer_ref=f"bref_{n}")
+    assert await ledger.count_stuck_purchases(**_STUCK) > 0, "the grid counted nothing at all"
+
+    while await ledger.expire_overdue_purchases(
+        max_age_seconds=3600, enrollment_grace_seconds=180, limit=500
+    ):
+        pass
+
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+    left = await database.fetch_all(
+        "SELECT id FROM reap_agentic_purchases WHERE state IN ('needs_enrollment', "
+        "'awaiting_approval')",
+        {},
+    )
+    assert left, "the sweep took every row — the grid has no legitimately waiting buyer in it"
+
+
+async def test_the_stuck_count_writes_nothing():
+    await _stuck_row("processing", entered=4000)
+    await _stuck_row("needs_enrollment", entered=9000, buyer_ref="bref_b")
+    before = [dict(r) for r in await database.fetch_all(
+        "SELECT * FROM reap_agentic_purchases ORDER BY id", {}
+    )]
+    assert await ledger.count_stuck_purchases(**_STUCK) == 2
+    after = [dict(r) for r in await database.fetch_all(
+        "SELECT * FROM reap_agentic_purchases ORDER BY id", {}
+    )]
+    assert after == before
+
+
+def test_the_stuck_count_covers_exactly_the_states_the_machine_can_wait_in():
+    """Parsed out of the statement, like the sweeps' lists. A state added to the machine must
+    land on one side of the count or the other, and the waiting side must be the expire sweep's
+    own list — that is what makes a waiting row's deadline the sweep's."""
+    counted = set(ledger._STUCK_COUNTED_STATES)
+    assert counted == set(ledger._POLLABLE_STATES) == ledger.PURCHASE_STATES - ledger.TERMINAL_STATES
+    assert set(ledger._STUCK_HUMAN_WAIT_STATES) == set(ledger._EXPIRE_SOURCE_STATES)
+    assert set(ledger._STUCK_WORK_STATES) == counted - set(ledger._EXPIRE_SOURCE_STATES)
+    for anchor in ("WHERE state IN (", "(state IN (", "OR (state IN ("):
+        assert ledger._states_in(ledger._COUNT_STUCK_PURCHASES_SQL, anchor) == ledger._states_in(
+            ledger._COUNT_STUCK_PURCHASES_SQL_SQLITE, anchor
+        ), f"the dialect twins disagree after {anchor!r}"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        dict(stuck_after_seconds=59),
+        dict(stuck_after_seconds=True),
+        dict(stuck_after_seconds="1800"),
+        dict(stuck_after_seconds=1800.0),
+        dict(max_age_seconds=59),
+        dict(max_age_seconds=None),
+        dict(enrollment_grace_seconds=-1),
+        dict(enrollment_grace_seconds=3601),
+    ],
+)
+async def test_the_stuck_count_takes_strict_bounded_ints(bad):
+    with pytest.raises(ValueError):
+        await ledger.count_stuck_purchases(**dict(_STUCK, **bad))
+
+
+def test_the_stuck_count_is_exported():
+    assert "count_stuck_purchases" in ledger.__all__
+
+
+# ── the contact re-entry lapse (A1) ──────────────────────────────────────────────────────────
+
+
+async def test_the_reentry_lapse_only_takes_legal_terminal_edges_and_guards_at_the_top_level():
+    """Like the other terminal sweeps it bypasses `transition`, so its edges are checked here,
+    against the state list parsed out of the statement itself, on both dialects."""
+    for name in ("_LAPSE_CONTACT_REENTRY_SQL", "_LAPSE_CONTACT_REENTRY_SQL_SQLITE"):
+        sql = getattr(ledger, name)
+        sources = ledger._states_in(sql, "WHERE state IN (")
+        assert sources == ("resolving", "needs_enrollment", "quoting"), name
+        assert "CASE WHEN state = 'needs_enrollment' THEN 'expired' ELSE 'failed' END" in sql, name
+        for src in sources:
+            target = "expired" if src == "needs_enrollment" else "failed"
+            assert target in ledger.ALLOWED_TRANSITIONS[src], (name, src)
+        inner = sql[sql.index("SELECT p.id FROM reap_agentic_purchases p"):]
+        outer = sql[:sql.index("AND id IN (")]
+        assert ledger._states_in(inner, "WHERE p.state IN (") == sources, name
+        window = ("datetime('now', :window)" if name.endswith("_SQLITE")
+                  else "clock_timestamp() - (:window_seconds * INTERVAL '1 second')")
+        # The OUTER copy of every guard is the post-lock re-check: it is what keeps a row that a
+        # concurrent resume, dispatch or claim changed while this UPDATE waited on its lock from
+        # being lapsed (tests/test_reap_contact_resume_postgres.py races each one). The inner copy
+        # selects the candidates. Both must be present, separately.
+        for guard in ("{a}claimed_by IS NULL", "{a}checkout_dispatch_key IS NULL", "{a}reap_checkout_id IS NULL",
+                      "{a}reap_order_id IS NULL", "({a}state <> 'quoting' OR {a}dispatch_tracking_version = 1)",
+                      "({a}contact_purged_at IS NOT NULL",
+                      "OR ({a}state IN ('resolving', 'needs_enrollment')",
+                      "{a}contact_purged_at IS NULL AND {a}dispatch_tracking_version IS NULL",
+                      "{a}last_error_code = 'contact_retention_elapsed'))",
+                      f"COALESCE({{a}}contact_purged_at, {{a}}state_entered_at) < {window}"):
+            assert guard.format(a="") in outer, (name, guard)
+            assert guard.format(a="p.") in inner, (name, guard)
+        # The journal exclusions are in BOTH places too: in the outer re-check, and in the
+        # candidate subquery so a row they exclude cannot fill the LIMIT batch and starve rows
+        # behind it.
+        for ref, part in (("reap_agentic_purchases.id", outer), ("p.id", inner)):
+            for journal in (f"o.purchase_id = {ref} AND o.event_type = 'observed'",
+                            f"s.purchase_id = {ref} AND s.event_type = 'started'"):
+                assert journal in part, (name, journal)
+        assert inner.count("n.event_type = 'not_created'") == 1, name

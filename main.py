@@ -139,6 +139,7 @@ from routes.demo_data_routes import router as demo_data_router
 from routes.auth_routes import router as auth_router
 from routes.auth import router as auth_api_router  # API auth endpoints
 from routes.mcp_oauth_as import router as mcp_oauth_as_router  # MCP OAuth Authorization Server (flag-gated)
+from routes.crawl_identity import router as crawl_identity_router  # Web Bot Auth key directory (404 until keyed)
 from routes.agent_account import router as agent_account_router  # Agent account management
 from routes.agent_commerce import router as agent_commerce_router
 from routes.agent_commerce_reap import router as agent_commerce_reap_router
@@ -1090,6 +1091,7 @@ app.include_router(psp_router)
 app.include_router(payment_router)
 app.include_router(auth_router)  # New authentication system
 app.include_router(mcp_oauth_as_router)  # MCP OAuth Authorization Server (returns 404 unless MCP_OAUTH_AS_ENABLED=1)
+app.include_router(crawl_identity_router)  # GET /.well-known/http-message-signatures-directory (404 unless WEB_BOT_AUTH_PRIVATE_KEY)
 app.include_router(auth_api_router)  # API auth endpoints (/api/auth/*)
 app.include_router(admin_migrations_router)  # Admin migrations
 app.include_router(admin_apply_agent_center_migration_router)  # Agent Center V1 migration apply/verify

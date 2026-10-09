@@ -64,7 +64,8 @@ def _positive_decimal(value: Any) -> bool:
     if value is None or value == "":
         return False
     try:
-        return Decimal(str(value)) > 0
+        amount = Decimal(str(value))
+        return amount.is_finite() and amount > 0
     except (InvalidOperation, ValueError, TypeError):
         return False
 
@@ -133,6 +134,14 @@ LIVE_SKU_KEYS_SQL = """
         """
 
 
+LIVE_OFFER_LINKS_SQL = """
+ SELECT s.sku_key,s.product_key FROM catalog_skus s JOIN catalog_products p
+ ON p.product_key=s.product_key WHERE s.sku_key=ANY(:sku_keys)
+ AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL
+ AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+ """
+
+
 def _normalized_sku_keys(sku_keys: Iterable[str]) -> List[str]:
     return sorted({str(sku_key or "").strip() for sku_key in sku_keys if str(sku_key or "").strip()})
 
@@ -169,6 +178,7 @@ async def guard_catalog_offer_rows(
     *,
     db: Any = None,
     live_only: bool = False,
+    require_live_links: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int], List[Dict[str, Any]]]:
     """Reject offer rows with no price and offer rows with no SKU behind them.
 
@@ -179,6 +189,22 @@ async def guard_catalog_offer_rows(
     asks for it explicitly.
     """
     rows = [dict(row) for row in offer_rows or []]
+    if require_live_links:
+        read_db = db or database
+        keys = _normalized_sku_keys(row.get("sku_key") or row.get("sku_id") for row in rows)
+        links = await read_db.fetch_all(LIVE_OFFER_LINKS_SQL, {"sku_keys": keys}) if keys else []
+        live = {(str(r["sku_key"]), str(r["product_key"])) for r in links}
+        accepted, reasons, rejected = validate_catalog_offer_rows(rows, existing_sku_keys={k for k,p in live})
+        safe = []
+        for row in accepted:
+            identity = (str(row.get("sku_key") or row.get("sku_id") or ""), str(row.get("product_key") or ""))
+            if identity not in live:
+                reason = "invalid_live_product_sku_link"
+                reasons[reason] = reasons.get(reason, 0) + 1
+                rejected.append({"offer_id": row.get("offer_id"), "reasons": [reason]})
+            else:
+                safe.append(row)
+        return safe, reasons, rejected
     fetch = fetch_live_catalog_sku_keys if live_only else fetch_existing_catalog_sku_keys
     existing_sku_keys = await fetch(
         [row.get("sku_key") or row.get("sku_id") for row in rows],

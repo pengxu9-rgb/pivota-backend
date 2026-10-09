@@ -80,6 +80,12 @@ _MIGRATIONS = (
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     _MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
     _MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
+    # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
+    _MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
+    _MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
+    _MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
+    # 258: the price witness columns (the self-heal adds them too).
+    _MIGRATIONS_DIR / "258_reap_price_witness.sql",
 )
 _MIGRATION = _MIGRATIONS[0]
 
@@ -113,6 +119,8 @@ _EXPECTED_UNIQUE_INDEXES = {
 
 _PAST = "CURRENT_TIMESTAMP - INTERVAL '120 seconds'"
 _FUTURE = "CURRENT_TIMESTAMP + INTERVAL '3600 seconds'"
+#: Past Reap's expiry AND the default enrollment grace (180 s).
+_PAST_GRACE = "CURRENT_TIMESTAMP - INTERVAL '400 seconds'"
 
 
 def _assert_throwaway_database() -> None:
@@ -215,6 +223,7 @@ async def _raw_connection():
 
 async def _run_on(conn, sql: str, params: dict):
     positional, order = _to_positional(sql)
+    params = dict(params, reconciliation_only=params.get("reconciliation_only", 0), pilot_scope=params.get("pilot_scope"), precheckout_enabled=params.get("precheckout_enabled", 1))
     return await conn.fetch(positional, *[params[name] for name in order])
 
 
@@ -241,8 +250,9 @@ def _transition_params(purchase_id: str, from_states, to_state: str, holder=None
     return params
 
 
-def _sweep_params(max_age_seconds: int = 3600, limit: int = 200):
-    return {"max_age_seconds": max_age_seconds, "limit": limit}
+def _sweep_params(max_age_seconds: int = 3600, limit: int = 200, enrollment_grace_seconds: int = 180):
+    return {"max_age_seconds": max_age_seconds, "limit": limit,
+            "enrollment_grace_seconds": enrollment_grace_seconds}
 
 
 def _fail_params(max_attempts: int = 5, limit: int = 200, include_processing: int = 1):
@@ -676,6 +686,14 @@ _EXPECTED_PUBLIC_COLUMNS = {
     "consent_version", "consented_at",
     # mig 247 — the buyer's own offer code, its outcome and the discount; see the SQLite twin.
     "offer_code", "offer_code_outcome", "discount_minor", "tax_included",
+    # mig 258 — the price witness; see the SQLite twin.
+    "preflight_outcome", "preflight_error_code", "preflight_checked_at",
+    "preflight_items_subtotal_minor", "preflight_shipping_minor", "preflight_tax_minor",
+    "preflight_tax_included", "preflight_total_minor",
+    "live_unit_price_minor", "live_items_subtotal_minor", "live_quoted_total_minor",
+    "live_price_stage",
+    "price_rebound_from_minor", "price_rebound_to_minor", "price_corroboration_source",
+    "price_corroborated_at",
 }
 
 
@@ -956,7 +974,9 @@ async def test_a_naive_datetime_is_read_as_utc_not_as_local_time_on_postgres(tz)
         moved = await ledger.transition(
             purchase["id"],
             from_states=["resolving"],
-            to_state="quoting",
+            # 'needs_enrollment', not 'quoting': a transition INTO 'quoting' clears the hosted
+            # link by rule (and refuses one passed in), so it cannot carry this probe.
+            to_state="needs_enrollment",
             reap_quote_expires_at=naive,
             hosted_url_expires_at=naive,
         )
@@ -988,7 +1008,11 @@ async def test_expire_moves_an_overdue_hosted_page_and_scrubs_it_on_postgres(sta
     import db.reap_agentic_ledger as ledger
 
     purchase = await _mk(state=state)
-    await _set_clock_column(purchase["id"], "hosted_url_expires_at", _PAST)
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at",
+        # A 'needs_enrollment' page is overdue only once the ENROLLMENT GRACE (180 s by
+        # default) has passed too; see test_the_enrollment_grace_* for the window itself.
+        _PAST_GRACE if state == "needs_enrollment" else _PAST,
+    )
     await database.execute(
         "UPDATE reap_agentic_purchases SET claimed_by = 'w1', "
         "claimed_at = CURRENT_TIMESTAMP WHERE id = :i",
@@ -1123,7 +1147,7 @@ async def test_the_expire_sweep_never_touches_an_approved_purchase_on_postgres()
 
 
 async def test_expire_is_bounded_by_limit_on_postgres():
-    """Prod and staging share one Postgres. An unbounded UPDATE on first arming locks every
+    """Prod's Postgres serves live traffic. An unbounded UPDATE on first arming locks every
     qualifying row at once."""
     import db.reap_agentic_ledger as ledger
 
@@ -1257,7 +1281,7 @@ async def test_the_candidate_select_does_not_offer_already_claimed_rows_on_postg
 
     offered = {
         r["id"]
-        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50})
+        for r in await database.fetch_all(ledger._SELECT_DUE_PURCHASES_SQL, {"limit": 50, "reconciliation_only": 0, "pilot_scope": None})
     }
     assert free["id"] in offered and held["id"] not in offered
 
@@ -1531,6 +1555,10 @@ async def test_a_blocked_activation_resolves_without_raising_at_the_caller():
     import db.reap_agentic_ledger as ledger
 
     mine = await ledger.upsert_pending_enrollment(buyer_ref="bref_race")
+    # TWO PENDING ROWS FOR ONE BUYER is what migration 252's index now refuses — and what a
+    # database that has not had 252 applied can still hold. `mark_enrollment_active` must keep
+    # surviving it there, so this test builds that database.
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
     await database.execute(
         "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status) "
         "VALUES ('re_theirs', 'bref_race', 'pending')"
@@ -1620,6 +1648,10 @@ async def test_same_buyer_two_targets_at_once_on_the_shared_database_leaves_one_
     import db.reap_agentic_ledger as ledger
 
     first = await ledger.upsert_pending_enrollment(buyer_ref="buyer_same")
+    # TWO PENDING ROWS FOR ONE BUYER is what migration 252's index now refuses — and what a
+    # database that has not had 252 applied can still hold. `mark_enrollment_active` must keep
+    # surviving it there, so this test builds that database.
+    await database.execute("DROP INDEX IF EXISTS uq_reap_agentic_enrollments_one_pending")
     await database.execute(
         "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status) "
         "VALUES ('re_second', 'buyer_same', 'pending')"
@@ -2602,9 +2634,10 @@ async def test_release_claim_has_no_attempts_delta_on_postgres():
 
 _ENROLLMENT_PROJECTION = {
     "id", "buyer_ref", "reap_enrollment_id", "status", "hosted_url", "hosted_url_expires_at",
-    "card_network", "card_last4",
+    "card_network", "card_last4", "created_at",
+    "hosted_url_expiry_invalid",
 }
-_ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "created_at", "updated_at"}
+_ENROLLMENT_NEVER_PROJECTED = {"agent_id", "reap_status", "updated_at"}
 
 
 async def test_get_enrollment_internal_reads_a_pending_row_on_postgres():
@@ -2826,6 +2859,7 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
     # migrations' columns in the same run. Named, not loosened to `<=`: "nothing else" is still
     # the assertion.
     assert after - before == set(_HINT_COLUMNS) | {
+        "dispatch_tracking_version", "checkout_dispatch_key", "contact_received_at", "contact_purged_at", "contact_revision",
         "item_source",
         "cart_url",
         "consent_version",
@@ -2834,6 +2868,14 @@ async def test_the_self_heal_adds_the_hint_columns_to_a_224_shaped_database():
         "offer_code_outcome",
         "discount_minor",
         "tax_included",
+        # mig 258, the price witness (see the SQLite twin's _PRICE_WITNESS_COLUMNS).
+        "preflight_outcome", "preflight_error_code", "preflight_checked_at",
+        "preflight_items_subtotal_minor", "preflight_shipping_minor", "preflight_tax_minor",
+        "preflight_tax_included", "preflight_total_minor",
+        "live_unit_price_minor", "live_items_subtotal_minor", "live_quoted_total_minor",
+        "live_price_stage",
+        "price_rebound_from_minor", "price_rebound_to_minor", "price_corroboration_source",
+        "price_corroborated_at",
     }, (
         f"the heal on a 224-shaped database added {sorted(after - before)}"
     )
@@ -2896,8 +2938,13 @@ async def test_the_migration_and_the_postgres_self_heal_run_the_same_alter():
     guard = (root / "db/schema_guard.py").read_text(encoding="utf-8")
 
     def _alter(text: str) -> str:
-        start = text.index("ALTER TABLE IF EXISTS reap_agentic_purchases")
-        return " ".join(text[start: text.index(";", start) + 1].split())
+        statements = re.findall(
+            r"ALTER TABLE IF EXISTS reap_agentic_purchases\b[^;]*;", text, re.DOTALL
+        )
+        hints = [statement for statement in statements
+                 if "ADD COLUMN IF NOT EXISTS accept_variant_labels" in statement]
+        assert len(hints) == 1, "expected exactly one complete migration-225 ALTER"
+        return " ".join(hints[0].split())
 
     assert _alter(migration) == _alter(guard), (
         "the mig-225 ALTER in db/schema_guard.py is not the one in the migration:\n"
@@ -2917,6 +2964,9 @@ async def test_the_new_columns_are_partitioned_between_public_and_never_public()
         "accept_variant_labels", "also_accept_domains", "market_country",
         # mig 229 — see the SQLite twin of this list for why neither is public.
         "item_source", "cart_url",
+        # mig 256 — raw dispatch identity and contact retention metadata stay private.
+        "dispatch_tracking_version", "checkout_dispatch_key", "contact_received_at",
+        "contact_purged_at", "contact_revision",
     }
     columns = await _purchase_columns()
     unclassified = columns - _EXPECTED_PUBLIC_COLUMNS - never_public
@@ -3619,3 +3669,359 @@ async def test_none_is_refused_by_the_doors_and_accepted_by_the_column():
 
     purchase = await _mk(consent_version=None)
     assert purchase["consent_version"] is None and purchase["consented_at"] is None
+
+
+# ── 2026-09-30: the enrollment grace, the pending read, and the dead-link guard, on Postgres ──
+#
+# The SQLite arm is in tests/test_reap_agentic_ledger.py. Here the ENGINE is what is under test:
+# `clock_timestamp()` arithmetic with a bound integer grace, the CASE-computed expiry flag, and
+# the `:to_state_probe = 'quoting'` CASE that clears the hosted link — all planned by asyncpg.
+
+
+async def _set_enrollment_expiry(enrollment_id: str, sql_expr: str) -> None:
+    from db.database import database
+
+    await database.execute(
+        f"UPDATE reap_agentic_enrollments SET hosted_url_expires_at = {sql_expr} WHERE id = :i",
+        {"i": enrollment_id},
+    )
+
+
+async def _pending_with_link(buyer_ref: str = "bref_alice", reap_id: str = "9041ef1a-1377-45f6-b09a-95d5eb07f908"):
+    import db.reap_agentic_ledger as ledger
+
+    return await ledger.upsert_pending_enrollment(
+        buyer_ref=buyer_ref,
+        reap_enrollment_id=reap_id,
+        hosted_url="https://pay.prava.space/enroll/9041ef1a",
+        hosted_url_expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+
+
+async def test_the_enrollment_grace_window_on_postgres():
+    """28 s past the link (the staging sweep): kept by the default grace, taken with grace 0;
+    181 s past: taken by the default."""
+    import db.reap_agentic_ledger as ledger
+
+    inside = await _mk(state="needs_enrollment")
+    await _set_clock_column(inside["id"], "hosted_url_expires_at", "clock_timestamp() - INTERVAL '28 seconds'")
+    past = await _mk(state="needs_enrollment", buyer_ref="bref_past")
+    await _set_clock_column(past["id"], "hosted_url_expires_at", "clock_timestamp() - INTERVAL '181 seconds'")
+
+    assert await ledger.expire_overdue_purchases() == [past["id"]]
+    assert await _state_of(inside["id"]) == "needs_enrollment"
+    assert await ledger.expire_overdue_purchases(enrollment_grace_seconds=0) == [inside["id"]]
+
+
+async def test_awaiting_approval_gets_no_enrollment_grace_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="awaiting_approval")
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", "clock_timestamp() - INTERVAL '9 seconds'")
+    assert await ledger.expire_overdue_purchases() == [purchase["id"]]
+
+
+async def test_the_raw_expire_statement_binds_the_grace_on_postgres():
+    """The statement itself, on a second connection, with the grace as a bound integer."""
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk(state="needs_enrollment")
+    await _set_clock_column(purchase["id"], "hosted_url_expires_at", "clock_timestamp() - INTERVAL '28 seconds'")
+    conn = await _raw_connection()
+    try:
+        kept = await _run_on(conn, ledger._EXPIRE_OVERDUE_SQL, _sweep_params(enrollment_grace_seconds=60))
+        taken = await _run_on(conn, ledger._EXPIRE_OVERDUE_SQL, _sweep_params(enrollment_grace_seconds=0))
+    finally:
+        await conn.close()
+    assert kept == []
+    assert [r["id"] for r in taken] == [purchase["id"]]
+
+
+async def test_upsert_refuses_a_pending_row_whose_link_is_dead_on_postgres():
+    """The expiry flag is decided on the SERVER clock."""
+    import db.reap_agentic_ledger as ledger
+
+    pending = await _pending_with_link()
+    assert (await ledger.upsert_pending_enrollment(buyer_ref="bref_alice"))["id"] == pending["id"]
+    await _set_enrollment_expiry(pending["id"], "clock_timestamp() - INTERVAL '64 seconds'")
+    read = await ledger.get_pending_enrollment("bref_alice")
+    assert read["hosted_url_expired"] is True
+    with pytest.raises(ledger.PendingEnrollmentExpired) as caught:
+        await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    assert caught.value.enrollment_id == pending["id"]
+    await ledger.mark_enrollment_dead(pending["id"], reap_status="EXPIRED")
+    fresh = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    assert fresh["id"] != pending["id"]
+    assert (await ledger.get_pending_enrollment("bref_alice"))["id"] == fresh["id"]
+
+
+async def test_a_transition_into_quoting_clears_the_hosted_link_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    purchase = await _mk()
+    await ledger.transition(
+        purchase["id"], from_states=["resolving"], to_state="needs_enrollment",
+        hosted_url="https://pay.prava.space/enroll/9041ef1a",
+        hosted_url_expires_at=datetime.now(timezone.utc) - timedelta(seconds=9),
+    )
+    quoting = await ledger.transition(
+        purchase["id"], from_states=["needs_enrollment"], to_state="quoting"
+    )
+    assert quoting["hosted_url"] is None and quoting["hosted_url_expires_at"] is None
+    other = await _mk(buyer_ref="bref_q")
+    with pytest.raises(ValueError):
+        await ledger.transition(
+            other["id"], from_states=["resolving"], to_state="quoting",
+            hosted_url="https://pay.prava.space/enroll/x",
+        )
+    moved = await ledger.transition(
+        purchase["id"], from_states=["quoting"], to_state="awaiting_approval",
+        hosted_url="https://pay.prava.space/checkout/x",
+    )
+    assert moved["hosted_url"] == "https://pay.prava.space/checkout/x"
+
+
+async def test_get_pending_enrollment_reads_only_pending_rows_on_postgres():
+    """An ACTIVE or DEAD row is never 'the pending row', whatever its timestamps say."""
+    import db.reap_agentic_ledger as ledger
+
+    pending = await _pending_with_link()
+    assert (await ledger.get_pending_enrollment("bref_alice"))["id"] == pending["id"]
+    await ledger.mark_enrollment_active(pending["id"])
+    assert await ledger.get_pending_enrollment("bref_alice") is None
+    dead = await _pending_with_link(buyer_ref="bref_bob", reap_id="11111111-1111-1111-1111-111111111111")
+    await ledger.mark_enrollment_dead(dead["id"])
+    assert await ledger.get_pending_enrollment("bref_bob") is None
+
+
+# ── review of #2483 at 93f585c26: the ledger halves, on Postgres ────────────────────────────
+#
+# What the engine decides here: asyncpg's unique-violation SHAPE (UniqueViolationError, 23505)
+# reaching `EnrollmentIdConflict` / the winner hand-back; migration 252's partial index as the
+# migration builds it; the NULL-expiry rule's `clock_timestamp()` arithmetic; and the claim's
+# settling exemption.
+
+
+async def _raw_pending_pg(id_: str, buyer_ref: str = "bref_alice", reap_id=None, hosted_url=None):
+    from db.database import database
+
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id, "
+        "hosted_url) VALUES (:i, :b, 'pending', :r, :u)",
+        {"i": id_, "b": buyer_ref, "r": reap_id, "u": hosted_url},
+    )
+
+
+async def test_migration_252_refuses_a_second_pending_row_on_postgres():
+    import asyncpg
+
+    await _raw_pending_pg("re_one")
+    with pytest.raises(asyncpg.exceptions.UniqueViolationError):
+        await _raw_pending_pg("re_two")
+    await _raw_pending_pg("re_bob", buyer_ref="bref_bob")
+
+
+async def test_a_concurrent_mint_hands_the_loser_the_winner_on_postgres(monkeypatch):
+    import db.reap_agentic_ledger as ledger
+
+    real = ledger.get_pending_enrollments
+    calls = {"n": 0}
+
+    async def _stale_then_real(buyer_ref):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await _raw_pending_pg("re_winner")
+            return []
+        return await real(buyer_ref)
+
+    monkeypatch.setattr(ledger, "get_pending_enrollments", _stale_then_real)
+    assert (await ledger.upsert_pending_enrollment(buyer_ref="bref_alice"))["id"] == "re_winner"
+
+
+async def test_a_held_partner_id_is_a_named_conflict_on_postgres():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    held = "9041ef1a-1377-45f6-b09a-95d5eb07f908"
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, status, reap_enrollment_id) "
+        "VALUES ('re_old', 'bref_alice', 'dead', :r)", {"r": held},
+    )
+    ours = await ledger.upsert_pending_enrollment(buyer_ref="bref_alice")
+    with pytest.raises(ledger.EnrollmentIdConflict) as caught:
+        await ledger.upsert_pending_enrollment(
+            buyer_ref="bref_alice", enrollment_id=ours["id"], reap_enrollment_id=held
+        )
+    assert caught.value.holder["id"] == "re_old"
+
+
+async def test_a_linked_pending_row_with_no_expiry_dies_with_reaps_session_on_postgres():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    await _raw_pending_pg("re_linked", hosted_url="https://pay.prava.space/enroll/x")
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET created_at = clock_timestamp() - INTERVAL '100 seconds'"
+    )
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is False
+    await database.execute(
+        "UPDATE reap_agentic_enrollments SET created_at = clock_timestamp() - INTERVAL '901 seconds'"
+    )
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is True
+    await database.execute("UPDATE reap_agentic_enrollments SET hosted_url = NULL")
+    assert (await ledger.get_pending_enrollment("bref_alice"))["hosted_url_expired"] is False
+
+
+async def test_a_settling_claim_is_not_an_attempt_on_postgres():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    held = await _mk()
+    other = await _mk(buyer_ref="bref_other")
+    for row, code in ((held, "enrollment_settling"), (other, "transport_error:readtimeout")):
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET last_error_code = :c, "
+            "next_poll_at = clock_timestamp() - INTERVAL '1 second' WHERE id = :i",
+            {"c": code, "i": row["id"]},
+        )
+    claimed = {r["id"]: r["attempts"] for r in await ledger.claim_due_purchases("w1")}
+    assert (claimed[held["id"]], claimed[other["id"]]) == (0, 1)
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+# The stuck count — `count_stuck_purchases`, on REAL Postgres
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+#
+# The row-level table lives in the SQLite arm. What only this arm can say: the statement BINDS
+# (three integer parameters, each multiplied into an interval, two of them used twice), its
+# cutoffs compare against real `timestamptz` columns on the server's clock, the planner can
+# serve it from `idx_reap_agentic_purchases_state_poll`, and it is the same answer SQLite gives.
+
+_STUCK = dict(stuck_after_seconds=1800, max_age_seconds=3600, enrollment_grace_seconds=180)
+
+
+def _ago(seconds: int) -> str:
+    return f"clock_timestamp() - INTERVAL '{int(seconds)} seconds'"
+
+
+async def _stuck_row(state, *, entered=None, hosted=None, code=None, buyer_ref="bref_alice"):
+    from db.database import database
+
+    purchase = await _mk(state=state, buyer_ref=buyer_ref)
+    if entered is not None:
+        await _set_clock_column(purchase["id"], "state_entered_at", _ago(entered))
+    if hosted is not None:
+        await _set_clock_column(purchase["id"], "hosted_url_expires_at", _ago(hosted))
+    if code is not None:
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET last_error_code = :c WHERE id = :i",
+            {"c": code, "i": purchase["id"]},
+        )
+    return purchase
+
+
+@pytest.mark.parametrize(
+    "state,entered,hosted,code,expected",
+    [
+        ("processing", 1801, None, None, 1),
+        ("processing", 1700, None, None, 0),
+        ("quoting", 1801, None, None, 1),
+        ("resolving", 1801, None, None, 1),  # a NULL last_error_code must not hide the row
+        ("resolving", 1900, None, "enrollment_settling", 0),
+        ("resolving", 1981, None, "enrollment_settling", 1),
+        ("processing", 1801, None, "enrollment_settling", 1),  # the marker only exempts 'resolving'
+        ("awaiting_approval", 3000, -600, None, 0),  # a buyer on a LIVE page, 50 minutes in
+        ("awaiting_approval", 3000, 600, None, 0),   # overdue: the sweep's row, not a stuck one
+        ("awaiting_approval", 3000, 1801, None, 1),
+        ("needs_enrollment", 3000, 1900, None, 0),   # inside the grace on top of the margin
+        ("needs_enrollment", 3000, 1981, None, 1),
+        ("awaiting_approval", 5000, None, None, 0),
+        ("awaiting_approval", 5401, None, None, 1),
+        ("needs_enrollment", 5401, -3600, None, 1),  # the absolute fallback beats a live page
+        ("completed", 999999, 999999, None, 0),
+        ("expired", 999999, 999999, None, 0),
+    ],
+)
+async def test_the_stuck_count_on_postgres(state, entered, hosted, code, expected):
+    import db.reap_agentic_ledger as ledger
+
+    await _stuck_row(state, entered=entered, hosted=hosted, code=code)
+    assert await ledger.count_stuck_purchases(**_STUCK) == expected
+
+
+async def test_each_stuck_window_is_bound_not_baked_in_on_postgres():
+    import db.reap_agentic_ledger as ledger
+
+    await _stuck_row("processing", entered=700, buyer_ref="bref_w")
+    await _stuck_row("needs_enrollment", entered=2000, hosted=1900, buyer_ref="bref_g")
+    await _stuck_row("awaiting_approval", entered=5000, buyer_ref="bref_m")
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+    assert await ledger.count_stuck_purchases(**dict(_STUCK, stuck_after_seconds=600)) == 3
+    assert await ledger.count_stuck_purchases(**dict(_STUCK, enrollment_grace_seconds=60)) == 1
+    assert await ledger.count_stuck_purchases(**dict(_STUCK, max_age_seconds=600)) == 1
+
+
+async def test_a_waiting_row_is_only_stuck_if_the_expire_sweep_would_take_it_on_postgres():
+    """The definition as a property, against the REAL sweep statement: with the same max age and
+    grace, once the sweep has run nothing in the two waiting states is left to count."""
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    n = 0
+    for state in ("needs_enrollment", "awaiting_approval"):
+        for entered in (0, 3000, 5000, 5500):
+            for hosted in (None, -3600, 100, 1900, 2100):
+                n += 1
+                await _stuck_row(state, entered=entered, hosted=hosted, buyer_ref=f"bref_{n}")
+    assert await ledger.count_stuck_purchases(**_STUCK) > 0
+    while await ledger.expire_overdue_purchases(
+        max_age_seconds=3600, enrollment_grace_seconds=180, limit=500
+    ):
+        pass
+    assert await ledger.count_stuck_purchases(**_STUCK) == 0
+    left = await database.fetch_all(
+        "SELECT id FROM reap_agentic_purchases "
+        "WHERE state IN ('needs_enrollment', 'awaiting_approval')"
+    )
+    assert left, "the grid has no legitimately waiting buyer in it"
+
+
+async def test_the_stuck_count_writes_nothing_on_postgres():
+    from db.database import database
+    import db.reap_agentic_ledger as ledger
+
+    await _stuck_row("processing", entered=4000)
+    before = [dict(r) for r in await database.fetch_all(
+        "SELECT *, xmin::text AS row_version FROM reap_agentic_purchases ORDER BY id"
+    )]
+    assert await ledger.count_stuck_purchases(**_STUCK) == 1
+    after = [dict(r) for r in await database.fetch_all(
+        "SELECT *, xmin::text AS row_version FROM reap_agentic_purchases ORDER BY id"
+    )]
+    assert after == before, "a row version moved: the count wrote something"
+
+
+async def test_the_stuck_count_can_be_served_by_the_state_poll_index():
+    """`state IN (…)` at the top level is an index condition on
+    `idx_reap_agentic_purchases_state_poll (state, next_poll_at)`: the count reads the
+    non-terminal rows and never the terminal history, which is everything else in the table.
+
+    Sequential scans are switched off for the EXPLAIN only, so this asks "CAN the planner use
+    the index for this statement" rather than "does it choose to on five rows" — on a table this
+    small it would not, and that says nothing about the shape production has."""
+    import db.reap_agentic_ledger as ledger
+
+    for n in range(5):
+        await _mk(buyer_ref=f"bref_{n}")
+    positional, order = _to_positional(ledger._COUNT_STUCK_PURCHASES_SQL)
+    params = {"reconciliation_only": 0, "pilot_scope": None, "stuck_seconds": 1800, "stuck_grace_seconds": 1980, "stuck_max_age_seconds": 5400}
+    conn = await _raw_connection()
+    try:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL enable_seqscan = off")
+            plan = await conn.fetch("EXPLAIN " + positional, *[params[name] for name in order])
+    finally:
+        await conn.close()
+    text = "\n".join(row[0] for row in plan)
+    assert "idx_reap_agentic_purchases_state_poll" in text, text
+    assert re.search(r"Index Cond: .*state.*= ANY", text), text

@@ -2,7 +2,8 @@
 
 Weekly tick (wired in services/audit_scheduler.py, prod-worker-gated there,
 and DORMANT unless ENABLE_IDENTITY_RECONCILE_SWEEP=1 — same defense-in-depth
-as the payment-reconcile tick, because staging shares the prod DB):
+as the payment-reconcile tick; written when staging shared the prod DB, which
+on GCP it no longer does — see infra/gcp/README.md):
 
   1. gauges     — the D-1 duplication numbers (same-merchant / cross-merchant
                   dup keys), the sweep's scoreboard;

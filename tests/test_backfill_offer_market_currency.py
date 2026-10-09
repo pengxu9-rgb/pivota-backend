@@ -191,69 +191,14 @@ def _drive(monkeypatch, argv, scan_rows):
     return rc, fake
 
 
-def test_only_domain_writes_exactly_the_named_domains(monkeypatch):
-    """The inverse mutation (write everything EXCEPT the named domains) must fail
-    here. It survived the entire suite before this test existed."""
-    rc, fake = _drive(
-        monkeypatch,
-        ["--apply", "--max-domains", "5", "--only-domain", "mintree.us"],
-        [_scan_row("mintree.us"), _scan_row("reddane.co.za"),
-         _scan_row("lasavonneriedupilonduroy.com", live=57, suppressed=0)],
-    )
-    assert rc == 0
-    written = sorted(d for d, _c, _m, _s in fake.updates)
-    assert written == ["mintree.us"]
 
 
-def test_only_domain_is_case_insensitive_on_the_CLI_side(monkeypatch):
-    rc, fake = _drive(
-        monkeypatch,
-        ["--apply", "--max-domains", "5", "--only-domain", "MinTree.US"],
-        [_scan_row("mintree.us"), _scan_row("reddane.co.za")],
-    )
-    assert rc == 0
-    assert [d for d, *_ in fake.updates] == ["mintree.us"]
 
 
-def test_only_domain_is_case_insensitive_on_the_ROW_side(monkeypatch):
-    """The other half, and the half that can actually regress.
-
-    The CLI values are lowercased at parse time, so dropping `.lower()` from the
-    ROW comparison leaves the sibling test above green — it was a test that could
-    not fail on the thing it named. Uppercase domain groups are real: the scan
-    groups on raw `source_domain` with no `lower()`, and the Path-C writer stores
-    that column `.strip()`-only.
-    """
-    rc, fake = _drive(
-        monkeypatch,
-        ["--apply", "--max-domains", "5", "--only-domain", "mintree.us"],
-        [_scan_row("MinTree.US"), _scan_row("reddane.co.za")],
-    )
-    assert rc == 0
-    assert [d for d, *_ in fake.updates] == ["MinTree.US"]
 
 
-def test_only_domain_repeats_accumulate(monkeypatch):
-    rc, fake = _drive(
-        monkeypatch,
-        ["--apply", "--max-domains", "5",
-         "--only-domain", "mintree.us", "--only-domain", "reddane.co.za"],
-        [_scan_row("mintree.us"), _scan_row("reddane.co.za"),
-         _scan_row("lasavonneriedupilonduroy.com", live=57, suppressed=0)],
-    )
-    assert rc == 0
-    assert sorted(d for d, *_ in fake.updates) == ["mintree.us", "reddane.co.za"]
 
 
-def test_only_domain_writes_the_currency_the_storefront_reported(monkeypatch):
-    """Correct-only is about WHICH rows; this is about WHAT value lands."""
-    _rc, fake = _drive(
-        monkeypatch,
-        ["--apply", "--max-domains", "5", "--only-domain", "reddane.co.za"],
-        [_scan_row("reddane.co.za")],
-    )
-    assert fake.updates[0][1] == "ZAR"
-    assert fake.updates[0][2] == "ZA"
 
 
 def test_dry_run_writes_nothing(monkeypatch):
@@ -261,61 +206,14 @@ def test_dry_run_writes_nothing(monkeypatch):
     assert fake.updates == []
 
 
-def test_max_domains_refuses_and_writes_nothing(monkeypatch):
-    """The circuit breaker must actually break the circuit, not just print."""
-    rc, fake = _drive(
-        monkeypatch,
-        ["--apply", "--max-domains", "1"],
-        [_scan_row("mintree.us"), _scan_row("reddane.co.za")],
-    )
-    assert rc == 2
-    assert fake.updates == []
 
 
-def test_live_only_reaches_the_UPDATE_not_just_the_scan(monkeypatch):
-    """A `--live-only` honoured in the scan but dropped from the UPDATE survived
-    the whole suite. Assert the flag on the SQL that actually writes."""
-    _rc, fake = _drive(
-        monkeypatch,
-        ["--apply", "--max-domains", "5", "--live-only", "--only-domain", "mintree.us"],
-        [_scan_row("mintree.us")],
-    )
-    assert "o.suppressed_at IS NULL" in fake.scan_sql
-    assert "o.suppressed_at IS NULL" in fake.updates[0][3]
 
 
-def test_default_scope_reaches_the_UPDATE_without_the_filter(monkeypatch):
-    _rc, fake = _drive(
-        monkeypatch,
-        ["--apply", "--max-domains", "5", "--only-domain", "mintree.us"],
-        [_scan_row("mintree.us")],
-    )
-    assert "suppressed_at" not in fake.scan_sql or "IS NULL" not in fake.scan_sql
-    assert "suppressed_at" not in fake.updates[0][3]
 
 
-def test_unresolvable_storefront_is_never_written(monkeypatch):
-    """`fetch_storefront_meta` returning None means UNKNOWN. Never assume USD,
-    and never fabricate a currency — that is the bug this whole lane exists for."""
-    _rc, fake = _drive(
-        monkeypatch,
-        ["--apply", "--max-domains", "5"],
-        [_scan_row("loaskin.com")],   # absent from _META -> unresolved
-    )
-    assert fake.updates == []
 
 
-def test_usd_storefront_is_never_written(monkeypatch):
-    """A store that really IS USD is not a correction."""
-    monkeypatch.setitem(_META, "genuinely-us.com", {"currency": "USD", "country": "US"})
-    try:
-        _rc, fake = _drive(
-            monkeypatch, ["--apply", "--max-domains", "5"],
-            [_scan_row("genuinely-us.com")],
-        )
-        assert fake.updates == []
-    finally:
-        _META.pop("genuinely-us.com", None)
 
 
 def test_report_maps_live_and_suppressed_to_the_right_columns(monkeypatch, capsys):
@@ -329,37 +227,8 @@ def test_report_maps_live_and_suppressed_to_the_right_columns(monkeypatch, capsy
     assert "live=57 suppressed=0" in out
 
 
-def test_only_domain_typo_warns_loudly(monkeypatch, capsys):
-    """The silent failure mode is 'operator typed a domain, saw 0 written, read it
-    as already-corrected'."""
-    _rc, fake = _drive(
-        monkeypatch,
-        ["--apply", "--max-domains", "5", "--only-domain", "mintree.co"],
-        [_scan_row("mintree.us")],
-    )
-    assert fake.updates == []
-    assert "WARNING" in capsys.readouterr().out
 
 
-def test_only_domain_narrowing_can_bring_a_refused_run_under_max_domains(monkeypatch):
-    """`--max-domains` is checked AFTER `--only-domain` narrows, which is the
-    right order — but it means an operator who hits REFUSED can proceed by naming
-    a subset. That is the intended escape valve; pin the ordering so it does not
-    silently invert into "refuse based on the unnarrowed set", which would make
-    `--only-domain` useless exactly when it is needed."""
-    rows = [_scan_row("mintree.us"), _scan_row("reddane.co.za"),
-            _scan_row("lasavonneriedupilonduroy.com", live=57, suppressed=0)]
-
-    rc_wide, fake_wide = _drive(monkeypatch, ["--apply", "--max-domains", "1"], rows)
-    assert rc_wide == 2 and fake_wide.updates == []
-
-    rc_narrow, fake_narrow = _drive(
-        monkeypatch,
-        ["--apply", "--max-domains", "1", "--only-domain", "mintree.us"],
-        rows,
-    )
-    assert rc_narrow == 0
-    assert [d for d, *_ in fake_narrow.updates] == ["mintree.us"]
 
 
 def test_seed_fallback_carries_a_deterministic_tiebreaker():
@@ -391,3 +260,20 @@ def test_scan_and_update_resolve_the_domain_identically():
         assert _domain_expr(mod.domains_sql(live_only)) == _domain_expr(
             mod.update_offers_sql(live_only)
         )
+
+@pytest.mark.parametrize("flags",[[],["--live-only"],["--only-domain","MinTree.US","--max-domains","1"]])
+def test_apply_refuses_domain_relabelling_before_any_io(monkeypatch,flags):
+ fake=_FakeDB([_scan_row("mintree.us")]);monkeypatch.setattr(mod,"database",fake)
+ async def forbidden(*a,**kw):raise AssertionError("store metadata must not authorize changing money")
+ monkeypatch.setattr(mod,"fetch_storefront_meta",forbidden)
+ with pytest.raises(ValueError,match="domain_currency_is_not_price_evidence"):
+  mod.main(["--apply",*flags])
+ assert fake.updates==[] and fake.scan_sql is None
+
+def test_legacy_update_helper_cannot_change_any_rows():
+ assert "WHERE FALSE" in mod.update_offers_sql()
+
+def test_readonly_domain_selection_still_reports_held_back_groups(monkeypatch,capsys):
+ rc,fake=_drive(monkeypatch,["--only-domain","MinTree.US"],[_scan_row("mintree.us"),_scan_row("reddane.co.za")])
+ assert rc==0 and not fake.updates
+ assert "HELD BACK reddane.co.za" in capsys.readouterr().out

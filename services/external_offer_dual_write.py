@@ -36,7 +36,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import time
 from decimal import Decimal
 from typing import Any, Dict, Optional
@@ -133,6 +135,7 @@ async def resolve_mirror_product(seed_id: str) -> Optional[Dict[str, str]]:
         SELECT product_key, merchant_id
         FROM catalog_products
         WHERE source_ref = :seed_id AND source_system = :src
+          AND suppressed_at IS NULL AND suppression_reason IS NULL
         ORDER BY updated_at DESC NULLS LAST
         LIMIT 1
         """,
@@ -224,19 +227,23 @@ MIRROR_OFFER_UPSERT_SQL = """
           (offer_id, sku_key, product_key, merchant_id,
            catalog_track, truth_tier, readiness_tier,
            offer_type, is_first_party, offer_mode,
-           channel, availability, inventory_quantity, currency,
+           channel, availability, inventory_quantity, currency, market,
            list_price, merchant_effective_price, estimated_best_price,
            price_confidence, source_system, source_ref, source_domain,
            offer_payload, price_checked_at)
-        VALUES
-          (:offer_id, :sku_key, :product_key, :merchant_id,
+        SELECT
+          :offer_id, CAST(:sku_key AS VARCHAR), CAST(:product_key AS VARCHAR), :merchant_id,
            :catalog_track, :truth_tier, :readiness_tier,
            :offer_type, :is_first_party, :offer_mode,
-           :channel, :availability, :inventory_quantity, :currency,
+           :channel, :availability, :inventory_quantity, :currency, CAST(:market AS VARCHAR),
            :list_price, :merchant_effective_price, :estimated_best_price,
            :price_confidence, :source_system, :source_ref, :source_domain,
            CAST(:offer_payload AS jsonb),
-           CASE WHEN CAST(:price_read AS BOOLEAN) THEN NOW() END)
+           CASE WHEN CAST(:price_read AS BOOLEAN) THEN NOW() END
+        WHERE EXISTS (SELECT 1 FROM catalog_products p JOIN catalog_skus s ON s.product_key=p.product_key
+          WHERE p.product_key=CAST(:product_key AS VARCHAR) AND s.sku_key=CAST(:sku_key AS VARCHAR)
+          AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+          AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL)
         ON CONFLICT (offer_id) DO UPDATE SET
           -- A KNOWN-retailer host is AUTHORITATIVE third-party evidence, so it
           -- corrects a wrongly-stored value (demotes a bad brand_direct/first-party):
@@ -270,11 +277,14 @@ MIRROR_OFFER_UPSERT_SQL = """
             ELSE catalog_offers.price_checked_at
           END,
           updated_at = NOW()
+        WHERE catalog_offers.suppressed_at IS NULL AND catalog_offers.suppression_reason IS NULL
+          AND catalog_offers.market=EXCLUDED.market
+          AND NOT (COALESCE(catalog_offers.offer_payload,CAST('{}' AS jsonb)) ? 'price_repair')
 """
 MIRROR_OFFER_UPSERT_SQL_WITHOUT_PRICE_CHECK = _without_price_check(MIRROR_OFFER_UPSERT_SQL, (
     ("offer_payload, price_checked_at)", "offer_payload)"),
-    ("CAST(:offer_payload AS jsonb),\n           CASE WHEN CAST(:price_read AS BOOLEAN) THEN NOW() END)",
-     "CAST(:offer_payload AS jsonb))"),
+    ("CAST(:offer_payload AS jsonb),\n           CASE WHEN CAST(:price_read AS BOOLEAN) THEN NOW() END",
+     "CAST(:offer_payload AS jsonb)"),
     ("          price_checked_at = CASE\n            WHEN CAST(:price_read AS BOOLEAN) THEN NOW()\n"
      "            ELSE catalog_offers.price_checked_at\n          END,\n", ""),
 ))
@@ -387,6 +397,7 @@ async def upsert_catalog_offer_from_seed_row(
             "availability": row_dict.get("availability"),
             "inventory_quantity": None,
             "currency": row_dict.get("price_currency") or "USD",
+            "market": row_dict.get("market") or "US",
             "list_price": list_price_value,
             "merchant_effective_price": list_price_value,
             "estimated_best_price": list_price_value,
@@ -403,6 +414,17 @@ async def upsert_catalog_offer_from_seed_row(
             **({"price_read": bool(price_read)} if with_check else {}),
         },
     )
+
+    # Repair newly priced variants without overwriting existing supply or stamping freshness.
+    from services.catalog_variant_offer_projection import (
+        as_json, variants_from_seed, project_missing_variant_offers, projection_enabled,
+    )
+    if projection_enabled() and (
+        variants_from_seed(row_dict.get("seed_data"))
+        or as_json(row_dict.get("seed_variants"))
+        or as_json(row_dict.get("snapshot_variants"))
+    ):
+        await project_missing_variant_offers(product_key, apply=True, db=database)
 
 
 _SEED_OFFER_COLUMNS = (
@@ -485,7 +507,7 @@ def max_price_ratio() -> float:
     except ValueError:
         return _DEFAULT_MAX_PRICE_RATIO
     # A ratio at or under 1 would refuse every change; treat it as a typo, not a policy.
-    return value if value > 1 else _DEFAULT_MAX_PRICE_RATIO
+    return value if math.isfinite(value) and value > 1 else _DEFAULT_MAX_PRICE_RATIO
 
 
 ATTACHED_LISTING_OFFERS_SQL = """
@@ -493,11 +515,17 @@ SELECT o.offer_id, o.sku_key, o.merchant_id, o.currency, o.source_ref,
        o.list_price, o.merchant_effective_price,
        o.offer_payload ->> 'destination_url' AS payload_destination_url,
        o.offer_payload ->> 'external_seed_id' AS payload_seed_id,
-       o.suppressed_at IS NOT NULL AS suppressed,
+       (COALESCE(o.offer_payload,CAST('{}' AS jsonb)) ? 'price_repair') AS price_repaired,
+       to_jsonb(o)::text AS read_offer, to_jsonb(sk)::text AS read_sku,
+       to_jsonb(p)::text AS read_product, sk.currency AS sku_currency,
+       (o.suppressed_at IS NOT NULL OR o.suppression_reason IS NOT NULL) AS suppressed,
        sk.source_variant_id
 FROM catalog_offers o
-LEFT JOIN catalog_skus sk ON sk.sku_key = o.sku_key
+JOIN catalog_skus sk ON sk.sku_key = o.sku_key AND sk.product_key=o.product_key
+JOIN catalog_products p ON p.product_key=o.product_key
 WHERE o.product_key = :product_key
+ AND sk.suppressed_at IS NULL AND sk.suppression_reason IS NULL
+ AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
 """
 
 # Guarded on what the row was when read: a concurrent writer that moved the currency or suppressed
@@ -512,7 +540,15 @@ SET list_price = :price,
     updated_at = NOW()
 WHERE offer_id = :offer_id
   AND upper(trim(coalesce(currency, ''))) = :currency
-  AND suppressed_at IS NULL
+  AND suppressed_at IS NULL AND suppression_reason IS NULL
+  AND NOT (COALESCE(offer_payload,CAST('{}' AS jsonb)) ? 'price_repair')
+  AND to_jsonb(catalog_offers) = CAST(:read_offer AS jsonb)
+  AND EXISTS (SELECT 1 FROM catalog_skus sk JOIN catalog_products p ON p.product_key=sk.product_key
+    WHERE sk.sku_key=catalog_offers.sku_key AND sk.product_key=catalog_offers.product_key
+    AND sk.suppressed_at IS NULL AND sk.suppression_reason IS NULL
+    AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+    AND to_jsonb(sk) = CAST(:read_sku AS jsonb)
+    AND to_jsonb(p) = CAST(:read_product AS jsonb))
 RETURNING offer_id
 """
 ATTACHED_LISTING_OFFER_UPDATE_SQL_WITHOUT_PRICE_CHECK = _without_price_check(ATTACHED_LISTING_OFFER_UPDATE_SQL, (
@@ -548,9 +584,20 @@ def is_listing_offer(offer: Dict[str, Any], seed: Dict[str, Any]) -> bool:
     from services.seed_served_url import same_destination
 
     seed_id = str(seed.get("id") or "")
+    dest = seed.get("destination_url")
+    payload_seed = offer.get("payload_seed_id")
+    if payload_seed and payload_seed != seed_id:
+        return False
+    # A seed ID never overrides a contradictory explicit listing URL. Retargeting a seed
+    # leaves old listing offers behind; pricing those from the new destination buys a sibling.
+    listing_urls = [offer.get("payload_destination_url")]
+    source_ref = str(offer.get("source_ref") or "").strip()
+    if source_ref.lower().startswith(("https://", "http://")):
+        listing_urls.append(source_ref)
+    if any(url and (not dest or not same_destination(url, dest)) for url in listing_urls):
+        return False
     if seed_id and seed_id in (offer.get("source_ref"), offer.get("payload_seed_id")):
         return True
-    dest = seed.get("destination_url")
     return bool(dest) and any(
         candidate and same_destination(candidate, dest)
         for candidate in (offer.get("source_ref"), offer.get("payload_destination_url"))
@@ -563,6 +610,12 @@ def _current_price(offer: Dict[str, Any]) -> Optional[float]:
         if price is not None:
             return price
     return None
+
+
+def _attached_variant_id(value: Any) -> str:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"gid://shopify/ProductVariant/([0-9]+)", text)
+    return match.group(1) if match else text
 
 
 def plan_attached_listing_offer_writes(
@@ -601,10 +654,29 @@ def plan_attached_listing_offer_writes(
         source == "refresh" and str(seed.get("variant_refresh_status") or "") == "all_re_read"
     )
     variant_prices: Dict[str, Optional[float]] = {}
+    variant_refusals: Dict[str, str] = {}
     for variant in _served_seed_variants(seed):
-        vid = str(variant.get("variant_id") or variant.get("id") or "").strip()[:128]
-        if vid:
-            variant_prices.setdefault(vid, variant_own_price(variant))
+        ids = {_attached_variant_id(variant.get(k)) for k in ("variant_id", "id", "shopify_variant_id") if variant.get(k)}
+        if len(ids) > 1:
+            for vid in ids:
+                variant_refusals[vid] = "variant_identity_conflict"
+            continue
+        vid = next(iter(ids), "")
+        if not vid:
+            continue
+        if vid in variant_prices:
+            variant_refusals[vid] = "ambiguous_variant_identity"
+            continue
+        own_currencies = {str(variant.get(k)).strip().upper() for k in ("price_currency", "currency")
+                          if variant.get(k)}
+        if own_currencies and own_currencies != {currency}:
+            variant_refusals[vid] = "variant_currency_mismatch"
+        price = _positive_price(variant_own_price(variant))
+        aliases = [_positive_price(variant_own_price({k: variant[k], "currency": currency}))
+                   for k in ("price_amount", "price", "list_price") if variant.get(k) not in (None, "")]
+        if price is not None and any(p is None or round(p, 2) != round(price, 2) for p in aliases):
+            variant_refusals[vid] = "variant_price_alias_conflict"
+        variant_prices[vid] = price
 
     writes = []
     refused = []
@@ -614,8 +686,15 @@ def plan_attached_listing_offer_writes(
         skips[reason] = skips.get(reason, 0) + 1
 
     for offer in live:
+        if offer.get("price_repaired"):
+            # A generic listing read cannot supersede reviewed native-variant evidence.
+            _skip("reviewed_price_repair")
+            continue
         if not currency or str(offer.get("currency") or "").strip().upper() != currency:
             _skip("currency_mismatch")
+            continue
+        if offer.get("sku_currency") and str(offer["sku_currency"]).strip().upper() != currency:
+            _skip("sku_currency_mismatch")
             continue
         if offer.get("sku_key") == f"{product_key}{SKU_SUFFIX}":
             price = _positive_price(seed.get("price_amount"))
@@ -623,7 +702,10 @@ def plan_attached_listing_offer_writes(
                 _skip("no_seed_price")
                 continue
         else:
-            vid = str(offer.get("source_variant_id") or "").strip()
+            vid = _attached_variant_id(offer.get("source_variant_id"))
+            if vid in variant_refusals:
+                _skip(variant_refusals[vid])
+                continue
             if not vid or vid not in variant_prices:
                 _skip("variant_not_on_seed")
                 continue
@@ -649,7 +731,7 @@ def _positive_price(value: Any) -> Optional[float]:
         price = float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
-    return price if price is not None and price > 0 else None
+    return price if price is not None and math.isfinite(price) and 0 < price <= 9999999999.99 and round(price, 2) > 0 else None
 
 
 async def sync_attached_listing_offers(
@@ -692,9 +774,11 @@ async def sync_attached_listing_offers(
         else ATTACHED_LISTING_OFFER_UPDATE_SQL_WITHOUT_PRICE_CHECK
     )
     for write in plan["writes"]:
+        read = next(o for o in rows if o["offer_id"] == write["offer_id"])
+        values = {**write, **{key: read[key] for key in ("read_offer", "read_sku", "read_product")}}
         # RETURNING, because `execute` reports no row count: a row the guard no longer matches
         # (currency moved, offer suppressed since the read) is a skip, not a write.
-        if await database.fetch_one(update_sql, write):
+        if await database.fetch_one(update_sql, values):
             written += 1
         else:
             skips["changed_since_read"] = skips.get("changed_since_read", 0) + 1

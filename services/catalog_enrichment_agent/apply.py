@@ -385,8 +385,9 @@ def _offer_upsert_sql_with_market(sql: str) -> str:
     Derived from the one statement rather than spelled twice, so the two can never drift, and
     refused unless it changed exactly the two places it must. `market` is written on INSERT only,
     like `currency`: ON CONFLICT refreshes neither, so a re-ingest never restamps an existing row's
-    market (the SG rows' deliberate 'US' stays put, and a legacy row this plan collides with keeps
-    its stamp -- the retailer_ingest readback then reports the disagreement instead of hiding it).
+    market (a legacy row this plan collides with keeps its stamp -- the retailer_ingest readback then
+    reports the disagreement instead of hiding it; scripts/restamp_offer_market.py is the reviewed way to
+    move an existing row's market, e.g. the SG stores' default-'US' offers).
     Rows that declare no market keep using `_OFFER_UPSERT_SQL` itself, byte for byte."""
     cols_old = "offer_type, is_first_party,\n"
     vals_old = ":offer_type, :is_first_party,\n"
@@ -1700,15 +1701,46 @@ async def _prepare_seller_of_record(plan: Dict[str, Any], database: Any) -> Dict
 
 #: Every row on a planned listing's host. Shared by the apply guard and the dry-run
 #: preflight (`find_legacy_retailer_listing_owners`) so that the preflight reports
-#: exactly the rows the apply will refuse on. The suppression columns are read only
-#: for disclosure: the WHERE clause deliberately does NOT exclude suppressed rows
-#: (see `_refuse_parallel_retailer_listings` for why a suppressed owner still blocks).
+#: exactly the rows the apply will refuse on. The WHERE clause deliberately does NOT exclude
+#: suppressed rows: a suppressed owner still blocks unless its WHOLE chain is retired -- the
+#: seed / offer columns feed `legacy_chain_retired` (see `_refuse_parallel_retailer_listings`).
 _LEGACY_LISTING_OWNERS_SQL = """
-        SELECT product_key, source_domain, canonical_url, suppressed_at, suppression_reason
-        FROM catalog_products
-        WHERE lower(split_part(regexp_replace(canonical_url,
+        SELECT cp.product_key, cp.source_domain, cp.canonical_url, cp.suppressed_at, cp.suppression_reason,
+               -- "this row's seed" is either link, as identity_resolution's DEACTIVATE_SEEDS_SQL reads it: the
+               -- attach back-link, OR the mirror's provenance (source_ref = seed id) -- older mirror rows were
+               -- written without the back-link, and such a seed serves while it is active (review of #2448).
+               -- "Active" is the SERVING predicate's (services/pdp_renderability.py, acceptable_only): a NULL,
+               -- blank or padded status serves too, so it is never evidence of retirement (queue review of #2448).
+               EXISTS (SELECT 1 FROM external_product_seeds s
+                        WHERE (s.attached_product_key = cp.product_key OR s.id = cp.source_ref)
+                         AND coalesce(lower(trim(s.status)), '') IN ('', 'active')) AS has_active_seed,
+               EXISTS (SELECT 1 FROM catalog_offers o WHERE o.product_key = cp.product_key
+                         AND o.suppressed_at IS NULL) AS has_live_offer
+        FROM catalog_products cp
+        WHERE lower(split_part(regexp_replace(cp.canonical_url,
                              '^https?://(www[.])?', '', 'i'), '/', 1)) = ANY(:hosts)
         """
+
+
+#: Suppressions their own lane lifts again, so never a retirement (review of #2448): catalog_sync_service clears a
+#: `stale_after_sync` tombstone on the next re-sync (STALE_AFTER_SYNC), and identity_resolution.revert_run revives
+#: every `d2_<strategy>` row of the run it reverts, seeds included. Admitting a new listing onto either URL would
+#: leave two live listings on it the moment that lane runs.
+SELF_REVIVING_SUPPRESSION_REASONS = ("stale_after_sync",)
+SELF_REVIVING_SUPPRESSION_PREFIXES = ("d2_",)
+
+
+def legacy_chain_retired(row: Dict[str, Any]) -> bool:
+    """The legacy owner's WHOLE chain is retired: the product suppressed WITH a reason no lane lifts on its own, no
+    active seed (attached to it, or its source_ref), no live offer. A suppressed product row alone proves nothing
+    (its seeds carry their own status, its offers their own suppression) -- this checks each link. Measured
+    2026-09-29: cocomo.sg's 421 old brand-style rows (suppressed 09-27, reason sg_retailer_filed_under_us_partition)
+    had 421 inactive seeds and 491 suppressed offers, and still blocked the store's SG re-file on 286 URLs."""
+    reason = str(row.get("suppression_reason") or "").strip()
+    if not reason or reason in SELF_REVIVING_SUPPRESSION_REASONS or reason.startswith(SELF_REVIVING_SUPPRESSION_PREFIXES):
+        return False
+    return (row.get("suppressed_at") is not None
+            and row.get("has_active_seed") is False and row.get("has_live_offer") is False)
 
 
 def planned_retailer_listings(plan: Dict[str, Any]) -> Dict[str, str]:
@@ -1757,7 +1789,10 @@ async def find_legacy_retailer_listing_owners(plan: Dict[str, Any], database: An
             continue
         if identity in listings and row.get("product_key") != listings[identity]:
             findings.append({
-                "kind": "conflict",
+                # A retired chain is reported, never refused: nothing of it can serve, so the new listing is the
+                # URL's only live row. Anything short of that -- a live row, an active seed, a live offer, a
+                # suppression without a reason -- is still the conflict it always was.
+                "kind": "retired_owner" if legacy_chain_retired(row) else "conflict",
                 "listing": identity,
                 "planned_product_key": listings[identity],
                 "legacy_product_key": row.get("product_key"),
@@ -1765,6 +1800,42 @@ async def find_legacy_retailer_listing_owners(plan: Dict[str, Any], database: An
                 "suppression_reason": row.get("suppression_reason"),
             })
     return findings
+
+
+_LIVE_RETAILER_LISTINGS_ON_HOST_SQL = """
+        SELECT product_key, canonical_url FROM catalog_products
+        WHERE product_key LIKE 'ext:retailer:%' AND suppressed_at IS NULL
+          AND lower(split_part(regexp_replace(canonical_url, '^https?://(www[.])?', '', 'i'), '/', 1)) = :host
+        """
+
+
+async def live_retailer_listing_owner(database: Any, canonical_url: Optional[str]) -> Optional[str]:
+    """The live `ext:retailer:` product that now owns this URL's listing, or None. A tool that REVERTS a retired
+    legacy chain asks this first: the apply admitted a new listing on that URL (legacy_chain_retired), so
+    reviving the old row would put two live listings on one URL (review of #2448). Cost: one scan of the host's
+    live `ext:retailer:` rows per call (the host is an expression, not indexed) -- fine for a revert's handful of
+    rows, not for a bulk loop."""
+    from urllib.parse import urlsplit
+
+    from services.catalog_enrichment_agent.ingestion import retailer_listing_identity
+
+    url = str(canonical_url or "")
+    try:  # a malformed legacy URL ("https://[bad/") must not abort the caller's revert loop
+        host = (urlsplit(url).hostname or "").lower()
+        host = host[4:] if host.startswith("www.") else host
+        identity = retailer_listing_identity(host, url) if host else None
+    except ValueError:
+        return None
+    if not host or identity is None:
+        return None
+    for row in await database.fetch_all(_LIVE_RETAILER_LISTINGS_ON_HOST_SQL, {"host": host}) or []:
+        row = dict(row)
+        try:
+            if retailer_listing_identity(host, row.get("canonical_url") or "") == identity:
+                return row["product_key"]
+        except ValueError:
+            continue
+    return None
 
 
 def legacy_listing_refusal(finding: Dict[str, Any]) -> str:
@@ -1783,14 +1854,24 @@ async def _refuse_parallel_retailer_listings(plan: Dict[str, Any], database: Any
     The reviewed cohort migration owns retiring old children and seed rows. Both
     executors refuse before any merchant or catalog write when that work remains.
 
-    A SUPPRESSED legacy owner still refuses (unchanged since the guard landed).
-    `catalog_products.suppressed_at` is reversible -- scripts/withdraw_catalog_rows.py
-    --revert and services/identity_resolution.py REVERT_ROWS_SQL both clear it -- and it
-    says nothing about the row's seed/sku/offer chain (external_product_seeds carries
-    its own `status`), so a suppressed product row is not proof its legacy chain is
-    retired. Admitting it would let a revert put two live listings on one URL.
+    A SUPPRESSED legacy owner still refuses -- unless its WHOLE chain is proven retired (legacy_chain_retired:
+    suppressed with a reason no lane lifts on its own, no active seed, no live offer; 2026-09-29).
+    `catalog_products.suppressed_at` is reversible and says nothing about the row's seed/sku/offer chain
+    (external_product_seeds carries its own `status`), so a suppressed product row alone is not proof.
+    Reviving an admitted chain would put two live listings on one URL. The product-row revivers are closed:
+      - catalog_sync re-sync (`stale_after_sync`) and identity_resolution.revert_run (`d2_*`): those reasons
+        never count as retired (SELF_REVIVING_SUPPRESSION_*);
+      - scripts/withdraw_catalog_rows.py, remediate_unpublished_crawl_rows.py and retire_superseded_brand_keys.py
+        reverts skip a row whose URL a live listing now owns (live_retailer_listing_owner).
+    KNOWN LIMITS (review of #2448), each needing the new listing retired first:
+      - a hand-run revert (e.g. the SQL in scripts/step5_*.py docstrings);
+      - a SEED revived without its product -- the seed lane serves without joining catalog_products: a
+        revert_run reactivating a d2 loser's seed that is also this row's source_ref, or
+        onboard_external_brand_from_crawl re-run on the legacy store (its upsert sets status 'active');
+      - a new offer catalog_sync inserts under the suppressed product (it then reads as a live link);
+      - a mirror seed linked only by external_product_id is not followed (the mirror insert is DO NOTHING).
     """
-    findings = await find_legacy_retailer_listing_owners(plan, database)
+    findings = [f for f in await find_legacy_retailer_listing_owners(plan, database) if f["kind"] != "retired_owner"]
     if findings:
         raise ValueError(legacy_listing_refusal(findings[0]))
 
@@ -1954,6 +2035,81 @@ async def _guard_canonical_owner(
     return plan, counts
 
 
+#: What the upsert KEEPS on an existing row: `_PDP_UPSERT_SQL`'s DO UPDATE never sets title or description,
+#: so a re-crawl leaves the stored copy (e.g. a description a backfill filled from the product page) in place.
+#: A SUPPRESSED row is left out: a thin re-crawl must not re-stage a tombstone from its stored copy (the
+#: description backfill refuses them for the same reason, #2429); it keeps the plan's stage as before.
+_KEPT_COPY_SQL = """
+                SELECT product_key, title, description
+                FROM catalog_products
+                WHERE product_key = ANY(:keys) AND suppressed_at IS NULL
+                """
+
+
+async def _stage_from_kept_copy(
+    plan: Dict[str, Any], database: Any,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Judge each existing row's lifecycle stage by the copy the upsert will actually leave on it. Returns
+    (plan, counts).
+
+    WHY. The plan's pdp_lifecycle_stage is computed at ingest from the CRAWLED body
+    (ingestion._lifecycle_stage_for_agent_pdp), but `_PDP_UPSERT_SQL` keeps the stored title and
+    description and writes that stage. A store whose body_html is its title plus images (koolseoul,
+    tartecosmetics.com) therefore re-crawled a backfilled row -- stored copy 140+ chars, published --
+    back to draft, and nothing restores it: the description backfill selects only rows under 50 chars.
+    Measured 2026-09-29: 279 rows filled that day were one re-crawl from that.
+
+    The stage is recomputed with compute_lifecycle_stage over the planned row with the STORED title and
+    description, for rows that exist. Everything else stays the plan's -- image, category, tags -- so a
+    product that loses its image or its category still drops, and the ingest's own category rule is
+    kept: a planned row whose category does not resolve stays draft whatever its copy. A new row, or one
+    whose stored copy is the planned copy, is untouched and triggers nothing but the one lookup.
+
+    `counts["pdp_stage_from_kept_copy_planned"]` tallies PLANNED rows whose stage changed (a row the identity
+    gate or an insert failure later skips is still counted); it is present only when a stage changed, so an
+    apply with nothing to say reports as before.
+
+    Measured before shipping (prod, 2026-09-29, 15,301 live ingest rows): 0 rows are under-staged against
+    their stored copy (nothing to restore), and 0 rows at candidate or above hold a blank title or a
+    description under 50 chars (nothing this demotes on its next re-crawl). The 2,128 stored rows whose stage
+    exceeds what their copy earns all fail only ingestion's category rule, which this does not change."""
+    counts: Dict[str, Any] = {}
+    pdps = plan.get("pdps") or []
+    keys = sorted({str(p.get("product_key")) for p in pdps if p.get("product_key")})
+    if not keys:
+        return plan, counts
+    rows = await database.fetch_all(_KEPT_COPY_SQL, {"keys": keys})
+    stored_by_key = {str(dict(r).get("product_key") or ""): dict(r) for r in rows or []}
+    if not stored_by_key:
+        return plan, counts
+    from services.category_path_aliases import resolve
+    from services.pdp_lifecycle import compute_lifecycle_stage
+
+    changed: Dict[str, int] = {}
+    out_pdps = []
+    for pdp in pdps:
+        stored = stored_by_key.get(str(pdp.get("product_key") or ""))
+        if stored is None or not resolve(pdp.get("category_path")):
+            out_pdps.append(pdp)
+            continue
+        kept_title, kept_description = stored.get("title"), stored.get("description")
+        if kept_title == pdp.get("title") and kept_description == pdp.get("description"):
+            out_pdps.append(pdp)
+            continue
+        stage = compute_lifecycle_stage({**pdp, "title": kept_title, "description": kept_description})
+        if stage != pdp.get("pdp_lifecycle_stage"):
+            key = f"{pdp.get('pdp_lifecycle_stage')}->{stage}"
+            changed[key] = changed.get(key, 0) + 1
+            pdp = {**pdp, "pdp_lifecycle_stage": stage}
+        out_pdps.append(pdp)
+    if not changed:
+        return plan, counts
+    plan = dict(plan)
+    plan["pdps"] = out_pdps
+    counts["pdp_stage_from_kept_copy_planned"] = dict(sorted(changed.items()))
+    return plan, counts
+
+
 async def apply_ingest_plan(
     plan: Dict[str, Any],
     *,
@@ -2024,6 +2180,9 @@ async def _apply_ingest_plan(
     plan = await _prepare_seller_of_record(plan, database)
     # BOTH executors: the guard rewrites the planned rows before either one writes them.
     plan, owner_counts = await _guard_canonical_owner(plan, database, market=market)
+    # BOTH executors too: the stage the upsert writes must describe the copy the upsert keeps.
+    plan, stage_counts = await _stage_from_kept_copy(plan, database)
+    owner_counts = {**owner_counts, **stage_counts}
 
     if batch:
         counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database)
@@ -2125,7 +2284,7 @@ async def _apply_ingest_plan(
         # `_filter_children_of_skipped` applies to the children of a skipped PDP.
         offers = _drop_offers_of_refused_skus(offers, refused_sku_keys, counts)
 
-        accepted_offers, skip_reasons, _rejected_offers = await guard_catalog_offer_rows(offers)
+        accepted_offers, skip_reasons, _rejected_offers = await guard_catalog_offer_rows(offers, require_live_links=True)
         if skip_reasons:
             audit.record_skips(skip_reasons)
             counts["offers_skipped"] = sum(skip_reasons.values())
@@ -2329,7 +2488,7 @@ async def _apply_ingest_plan_batched(
     )
 
     # 4. catalog_offers — SAME guard + audit as the per-row path.
-    accepted_offers, skip_reasons, _rejected_offers = await guard_catalog_offer_rows(offers)
+    accepted_offers, skip_reasons, _rejected_offers = await guard_catalog_offer_rows(offers, require_live_links=True)
     if skip_reasons:
         audit.record_skips(skip_reasons)
         counts["offers_skipped"] = sum(skip_reasons.values())
@@ -2384,3 +2543,56 @@ async def _apply_ingest_plan_batched(
     # The list can be thousands of rows; one log entry past 256 KiB is dropped by Cloud Logging.
     logger.info("apply_ingest_plan(batch) applied: %s", {**counts, "skipped_products": len(counts["skipped_products"])})
     return counts
+
+
+_CURRENT_LISTINGS_SQL = """
+                SELECT product_key, canonical_url FROM catalog_products
+                WHERE product_key = ANY(:product_keys)
+                """
+
+
+async def current_listings(product_keys: List[str], *, db: Any) -> Dict[str, Any]:
+    """product_key -> the (host, listing) its catalog row names today (ingestion.content_listing of its
+    canonical_url), for ingestion.elect_listing_keeper's tie-break: a re-ingest keeps the listing a row
+    already names -- the one scripts/repair_same_title_listings.py aligned it to -- unless a stronger
+    rule says otherwise. Read-only; keys with no row or no readable URL are absent."""
+    from services.catalog_enrichment_agent.ingestion import content_listing
+
+    keys = sorted({str(k) for k in product_keys if k})
+    if not keys:
+        return {}
+    rows = await db.fetch_all(_CURRENT_LISTINGS_SQL, {"product_keys": keys})
+    out = {}
+    for row in rows:
+        listing = content_listing(row["canonical_url"])
+        if listing:
+            out[str(row["product_key"])] = listing
+    return out
+
+
+def content_keys_of(plan: Dict[str, Any]) -> List[str]:
+    """Every content-keyed row a plan writes (a row a listing was left out of keeps another; `ext:retailer:`
+    rows are keyed by their URL and never move)."""
+    keys = {str(p.get("product_key") or "") for p in plan.get("pdps") or []}
+    return sorted(k for k in keys if k and not k.startswith("ext:retailer:"))
+
+
+async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, market: Optional[str] = None,
+                                     source_jsonl: Optional[str] = None,
+                                     allow_moves: Any = (), planner: Any = None) -> Dict[str, Any]:
+    """ingestion.ingest_validated_jsonl with the listing each of its rows names today, so the plan never
+    moves a row off it (`listing_moves`) -- the one way every lane that holds a catalog handle plans.
+    `current_listings.status` says what was read. `planner` is the caller's own ingest_validated_jsonl
+    (the name its tests patch)."""
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
+
+    planner = planner or ingest_validated_jsonl
+    records = list(records)
+    given = {k: v for k, v in (("market", market), ("source_jsonl", source_jsonl)) if v is not None}
+    first = planner(records, **given)
+    keys = content_keys_of(first)
+    if not keys:
+        return {**first, "current_listings": {"status": "not_applicable"}}
+    current = await current_listings(keys, db=db)
+    replanned = planner(records, **given, current_listings=current, allow_moves=allow_moves)
+    return {**replanned, "current_listings": {"status": "read", "rows": len(current)}}

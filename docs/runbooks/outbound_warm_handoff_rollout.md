@@ -296,6 +296,12 @@ established that neither alone is sufficient:
   only fire on something already a cart) and because those four minters mean one future
   writer of a cart-shaped `destination_url` would silently reopen the hole.
 
+**`purchase_declined`** (2026-09-27) is the sibling knockout, run right after `already_cart`: a
+token whose ctx says `purchasability_tier: browse_only` was minted as a PDP *because* the
+merchant-purchasability fact declined the cart (`docs/runbooks/merchant_purchasability.md`,
+"The offers.resolve mint" and "The product-card lanes"). Warming it would build the cart the mint
+refused.
+
 **Knockout ORDER: last, not first.** It runs after the affiliate, bot and allowlist gates so
 that `warm_reason=already_cart` counts **only clicks that would otherwise have been warmed**.
 Ordered first it also swallowed bot/prefetch traffic (heavy on `/r`, and an absent UA counts

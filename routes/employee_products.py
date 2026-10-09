@@ -749,6 +749,80 @@ def _best_variant_title_score(variants: List[Dict[str, Any]], product_title: Opt
     return best
 
 
+# Words, and numbers with their decimal point: "50 ml | 1.7 fl. oz." -> 1.7, 50, fl, ml, oz.
+_LABEL_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?|[^\W\d_]+", re.UNICODE)
+_LABEL_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+_LABEL_UNIT_TOKENS = frozenset(
+    {"ml", "l", "oz", "fl", "floz", "g", "kg", "mg", "lb", "lbs", "cm", "mm", "in", "inch", "inches",
+     "ct", "count", "pc", "pcs", "pack", "x"}
+)
+# Shopify's name for the only variant of a product with no options.
+_PLACEHOLDER_VARIANT_TITLES = frozenset({"default title"})
+
+
+def _label_tokens(text: Any) -> Tuple[str, ...]:
+    """A label's tokens as a sorted multiset, so "1.7 fl oz / 50 mL" == "50 ml | 1.7 fl. oz."."""
+    return tuple(sorted(_LABEL_TOKEN_RE.findall(str(text or "").lower())))
+
+
+def _name_words(tokens: Tuple[str, ...]) -> set:
+    return {t for t in tokens if t not in _LABEL_UNIT_TOKENS and not _LABEL_NUMBER_RE.fullmatch(t)}
+
+
+def _variant_option_labels(*variant_lists: Any) -> set:
+    """Every option label the variants carry (title, options values, option1..3), as tokens.
+
+    A LONE variant's title is often the product's own name, not a label: the extractor names an
+    offer with no size/colour by the page's product (`_offer_variants_from_node`). So a list with
+    one distinct title contributes it only when it names nothing ("50 ml", "1 pack").
+    """
+    labels: set = set()
+    for variants in variant_lists:
+        if not isinstance(variants, list):
+            continue
+        titles: set = set()
+        for v in variants:
+            if not isinstance(v, dict):
+                continue
+            title = _label_tokens(v.get("title")) if isinstance(v.get("title"), str) else ()
+            if title:
+                titles.add(title)
+            values = [v.get(k) for k in ("option1", "option2", "option3")]
+            options = v.get("options")
+            if isinstance(options, dict):
+                values.extend(options.values())
+            elif isinstance(options, list):
+                values.extend(o.get("value") if isinstance(o, dict) else o for o in options)
+            for value in values:
+                tokens = _label_tokens(value) if isinstance(value, str) else ()
+                if tokens:
+                    labels.add(tokens)
+        labels |= titles if len(titles) > 1 else {t for t in titles if not _name_words(t)}
+    return labels
+
+
+def _is_variant_label_not_product_title(
+    title: Any, *, variant_lists: Tuple[Any, ...], product_names: Tuple[Any, ...]
+) -> bool:
+    """Is `title` one of the product's OPTION LABELS rather than the product's name?
+
+    True when it matches a variant's option label (exactly or as a token permutation) and shares
+    no word with any of the product's own names -- "50 ml | 1.7 fl. oz.", "Default Title", "Black".
+    A variant-qualified title that still names the product ("Cica Cream - 50ml") is not a label.
+    """
+    tokens = _label_tokens(title)
+    if not tokens:
+        return False
+    if " ".join(str(title).lower().split()) in _PLACEHOLDER_VARIANT_TITLES:
+        return True
+    if tokens not in _variant_option_labels(*variant_lists):
+        return False
+    known_words: set = set()
+    for name in product_names:
+        known_words |= _name_words(_label_tokens(name))
+    return not (_name_words(tokens) & known_words)
+
+
 def _distinct_variant_titles(variants: List[Dict[str, Any]]) -> List[str]:
     out: List[str] = []
     for v in variants:
@@ -4669,10 +4743,21 @@ def _seed_variant_identifiers(variant: Dict[str, Any]) -> List[str]:
 
 def _seed_variant_stored_price(variant: Dict[str, Any]) -> Any:
     """The price the serving builders read off a stored variant, same precedence."""
-    raw = variant.get("price_amount")
-    if raw is None:
-        raw = variant.get("price") or variant.get("amount") or variant.get("value")
-    return raw
+    for key in ("price_amount", "price", "amount", "value", "list_price"):
+        raw = variant.get(key)
+        if raw not in (None, ""):
+            return raw
+    return None
+
+
+def _native_refresh_variant_ids(variant: Dict[str, Any]) -> set:
+    """Numeric Shopify variant IDs, excluding numeric barcodes and other identifiers."""
+    return {
+        match.group(1)
+        for key in ("variant_id", "id", "shopify_variant_id")
+        if (match := re.fullmatch(r"(?:gid://shopify/ProductVariant/)?([0-9]{8,})",
+                                 str(variant.get(key) or "").strip()))
+    }
 
 
 _MISSING = object()
@@ -4746,8 +4831,13 @@ def _reconcile_seed_variants_with_read(
     `replaced` records every field this call changed, before and after, per variant, so an
     overwrite can be undone.
     """
+    from utils.crawled_price import parse_crawled_price, decimal_hint_from_currency
+
     read_by_id: Dict[str, List[int]] = {}
     read_variants = [rv for rv in (read or []) if isinstance(rv, dict)] if isinstance(census, dict) else []
+    read_native = set().union(*(_native_refresh_variant_ids(rv) for rv in read_variants)) if read_variants else set()
+    read_currencies = {str(rv[k]).strip().upper() for rv in read_variants
+                       for k in ("price_currency", "currency") if rv.get(k)}
     for pos, rv in enumerate(read_variants):
         key = _seed_variant_key(rv)
         if key and not _POSITIONAL_OFFER_ID.match(key):
@@ -4797,11 +4887,35 @@ def _reconcile_seed_variants_with_read(
     re_read = 0
     for idx, original in enumerate(stored):
         v = dict(original)
-        stored_amount = _as_price(_seed_variant_stored_price(v))
+        variant_currency = str(v.get("price_currency") or v.get("currency") or product_cur or "")
+        stored_raw = _seed_variant_stored_price(v)
+        stored_amount = parse_crawled_price(
+            stored_raw, currency=variant_currency,
+            decimal_hint=decimal_hint_from_currency(variant_currency),
+        ).amount
         stored_avail = str(v.get("availability") or "").strip()
-        serves_a_fact = stored_amount is not None or stored_avail.lower() not in _NO_AVAILABILITY_OBSERVATION
+        carries_price = stored_raw not in (None, "")
+        serves_a_fact = carries_price or stored_avail.lower() not in _NO_AVAILABILITY_OBSERVATION
         stored_cur = (
             str(v.get("price_currency") or v.get("currency") or "").strip().upper() or product_cur
+        )
+        # An agreeing product price cannot override an explicit different native variant ID.
+        # Normalize Shopify numeric/GID aliases; merchant SKU codes may still bridge a stored
+        # numeric ID through the existing identifier match or the single-product fallback.
+        stored_native = _native_refresh_variant_ids(v)
+        fallback_identity_ok = len(stored_native) <= 1 and not (
+            stored_native and read_native and read_native != stored_native
+        )
+        stored_codes = {str(v[k]).strip() for k in ("sku", "sku_id") if v.get(k)}
+        read_codes = {_seed_variant_key(rv) for rv in read_variants
+                      if _seed_variant_key(rv) and not _POSITIONAL_OFFER_ID.match(_seed_variant_key(rv))
+                      and not _native_refresh_variant_ids(rv)}
+        if stored_codes and read_codes and not stored_codes.intersection(read_codes):
+            fallback_identity_ok = False
+        stored_currencies = {str(v[k]).strip().upper() for k in ("price_currency", "currency") if v.get(k)}
+        fallback_currency_ok = (
+            (not stored_currencies or stored_currencies == {product_cur})
+            and (not read_currencies or read_currencies == {product_cur})
         )
 
         new_amount: Optional[float] = None
@@ -4810,7 +4924,12 @@ def _reconcile_seed_variants_with_read(
         pos = claims[idx]
         if pos is not None and claimants.get(pos) == 1:
             rv = read_variants[pos]
-            per_variant = not rv.get("id_collided") and not rv.get("offer_aggregate")
+            rv_native = _native_refresh_variant_ids(rv)
+            per_variant = (
+                not rv.get("id_collided") and not rv.get("offer_aggregate")
+                and len(stored_native) <= 1 and len(rv_native) <= 1
+                and not (stored_native and rv_native and stored_native != rv_native)
+            )
             amount = _as_price(rv.get("price_amount"))
             # The offer's OWN currency, never a fallback. The product-level currency reaching
             # this function is the column's (`resolve_external_offer` fabricated USD when the
@@ -4823,15 +4942,17 @@ def _reconcile_seed_variants_with_read(
                 and amount is not None
                 and amount > 0
                 and cur
+                and len(stored_currencies) <= 1
+                and {str(rv[k]).strip().upper() for k in ("price_currency", "currency") if rv.get(k)} == {cur}
                 and (stored_cur is None or cur == stored_cur)
             ):
                 new_amount, new_cur = amount, cur
             avail = str(rv.get("availability") or "").strip()
             if per_variant and avail.lower() not in _NO_AVAILABILITY_OBSERVATION:
                 new_avail = avail
-        if single_takes_price and new_amount is None:
+        if single_takes_price and fallback_identity_ok and fallback_currency_ok and new_amount is None:
             new_amount, new_cur = product_amount, product_cur
-        if single_takes_availability and new_avail is None:
+        if single_takes_availability and fallback_identity_ok and new_avail is None:
             new_avail = product_availability
 
         before = dict(v)
@@ -4869,7 +4990,7 @@ def _reconcile_seed_variants_with_read(
                 }
             )
 
-        was_re_read = new_amount is not None if stored_amount is not None else new_avail is not None
+        was_re_read = new_amount is not None if carries_price else new_avail is not None
         if serves_a_fact:
             if was_re_read:
                 re_read += 1
@@ -5170,6 +5291,30 @@ async def _refresh_external_seed_by_id(
 
     seed_data = _ensure_json_obj(row.get("seed_data"))
     seed_data.setdefault("snapshot", {})
+    # THE PAGE'S "TITLE" CAN BE A VARIANT'S OPTION LABEL. tatcha.com's ProductGroup JSON-LD
+    # named every variant "50 ml | 1.7 fl. oz.", the extractor took it, and the gateway serves
+    # `snapshot.title` ahead of the row's own title -- so two different Tatcha products shared
+    # one label and the identity backfill merged them (2026-09-29, sig_1b52c3ff0045a6d39c40dd7d).
+    # The extractor now names a variant by its group; this refuses whatever shape comes next.
+    snapshot_title_refused = None
+    product_names = (row.get("title"), seed_data.get("product_name"), seed_data.get("title"))
+    variant_lists = (snap_variants, _seed_variants(seed_data), seed_data["snapshot"].get("variants"))
+    if snap_title and _is_variant_label_not_product_title(
+        snap_title, variant_lists=variant_lists, product_names=product_names
+    ):
+        snapshot_title_refused = snap_title
+        snap_title = next(
+            (
+                str(name).strip()
+                for name in (*product_names, seed_data["snapshot"].get("title"))
+                if isinstance(name, str)
+                and name.strip()
+                and not _is_variant_label_not_product_title(
+                    name, variant_lists=variant_lists, product_names=product_names
+                )
+            ),
+            None,
+        )
     seed_data["snapshot"].update(
         {
             "canonical_url": canonical_url,
@@ -5593,6 +5738,8 @@ async def _refresh_external_seed_by_id(
         "canonical_url": served_canonical,
         "domain": domain,
         "seed_data": seed_data,
+        # The page's title, when it was a variant's option label and was not written.
+        "snapshot_title_refused": snapshot_title_refused,
         # DID THIS "SUCCESS" ACTUALLY CONTACT THE ORIGIN? Often not, and the status alone
         # cannot say. `resolve_external_offer` honours `raise_on_unavailable` ONLY in its
         # `except ExternalOfferUnavailable` arm; anything else — a timeout, TLS, robots, and

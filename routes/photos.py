@@ -501,6 +501,10 @@ def start_photo_cleanup_loop() -> None:
         return
     if _photo_cleanup_task and not _photo_cleanup_task.done():
         return
+    # SCHEDULER_JOB_ALLOWLIST: a no-op unless set; when set, this loop starts only if listed.
+    from services import scheduler_job_allowlist as job_allowlist
+    if not job_allowlist.process_loop_allowed(job_allowlist.PHOTO_CLEANUP_LOOP):
+        return
     # Fresh context => own `databases` Connection (issue #1754).
     from services.scheduler_job_runner import spawn_isolated
     _photo_cleanup_task = spawn_isolated(_photo_cleanup_loop(), name="photo_cleanup_loop")

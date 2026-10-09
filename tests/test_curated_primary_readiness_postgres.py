@@ -275,3 +275,53 @@ async def test_changed_source_with_same_snapshot_timestamp_uses_latest_real_scor
         assert scores[1]["content_quality_score"] < scores[0]["content_quality_score"]
         assert state["index"]["content_quality_score"] == pytest.approx(scores[1]["content_quality_score"])
         assert state["index"]["index_eligible"] is False
+
+
+@pytest.mark.parametrize("batch", [False, True])
+async def test_a_recrawl_with_a_thin_body_keeps_the_stage_its_kept_copy_earns(readiness_db, batch):
+    """The upsert keeps the stored description; the stage it writes must describe that copy, not the
+    crawl's. koolseoul/tartecosmetics.com shape: the store's body_html is its title plus images, and a
+    backfill has filled the row from the product page. A re-crawl used to move it published -> draft."""
+    from services.catalog_enrichment_agent.apply import apply_ingest_plan
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
+    db = readiness_db
+    plan = source_plan()
+    await apply_ingest_plan(copy.deepcopy(plan), db=db, batch=batch, batch_label="kept_copy_pg")
+    key = plan["pdps"][0]["product_key"]
+    before = dict(await db.fetch_one(
+        "SELECT description, pdp_lifecycle_stage FROM catalog_products WHERE product_key=:k", {"k": key}))
+    assert before["pdp_lifecycle_stage"] == "published" and len(before["description"]) >= 50
+
+    record = copy.deepcopy(source_plan(return_record=True))
+    record["pdp"]["attribute_summary"] = record["pdp"]["product_name"]  # title-only body
+    thin = ingest_validated_jsonl([record])
+    assert thin["pdps"][0]["product_key"] == key
+    assert thin["pdps"][0]["pdp_lifecycle_stage"] == "draft"  # what the crawl alone earns
+
+    counts = await apply_ingest_plan(thin, db=db, batch=batch, batch_label="kept_copy_pg")
+    after = dict(await db.fetch_one(
+        "SELECT description, pdp_lifecycle_stage FROM catalog_products WHERE product_key=:k", {"k": key}))
+    assert after["description"] == before["description"]  # the upsert kept the copy...
+    assert after["pdp_lifecycle_stage"] == "published"    # ...and the stage now says so
+    assert counts["pdp_stage_from_kept_copy_planned"] == {"draft->published": 1}
+
+
+async def test_a_thin_recrawl_never_re_stages_a_suppressed_row_from_its_stored_copy(readiness_db):
+    """Review #2438 (M13): the kept-copy lookup filters suppressed rows in SQL; only a real database shows
+    that filter runs. A tombstone with rich stored copy keeps the crawl's stage."""
+    from services.catalog_enrichment_agent.apply import apply_ingest_plan
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
+    db = readiness_db
+    plan = source_plan()
+    await apply_ingest_plan(copy.deepcopy(plan), db=db, batch=False, batch_label="kept_copy_pg")
+    key = plan["pdps"][0]["product_key"]
+    await db.execute("UPDATE catalog_products SET suppressed_at = NOW(), pdp_lifecycle_stage = 'draft' "
+                     "WHERE product_key = :k", {"k": key})
+
+    record = copy.deepcopy(source_plan(return_record=True))
+    record["pdp"]["attribute_summary"] = record["pdp"]["product_name"]
+    thin = ingest_validated_jsonl([record])
+    counts = await apply_ingest_plan(thin, db=db, batch=False, batch_label="kept_copy_pg")
+    stage = await db.fetch_val("SELECT pdp_lifecycle_stage FROM catalog_products WHERE product_key=:k", {"k": key})
+    assert stage == "draft"
+    assert "pdp_stage_from_kept_copy_planned" not in counts

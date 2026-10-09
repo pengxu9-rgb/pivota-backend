@@ -126,8 +126,9 @@ def require_market_currency(market: str, currency: Optional[str]) -> str:
     services/catalog_invariant_checks' market/currency disagreement is the same rule at rest.
 
     Writers that never declare a market (every other lane: the column's DEFAULT 'US' is not a
-    declaration) do not call this -- the deliberate SG exception (market 'US', currency 'SGD',
-    because external_product_seeds.market is a hard serving partition) is one of them. An unknown
+    declaration) do not call this -- the older SG rows (market 'US', currency 'SGD', e.g. jsmbeauty.sg) came
+    from such a lane. The retailer_ingest lane declares market 'SG' for SG stores since 2026-09-29, keeping
+    the SEED partition at 'US' (external_product_seeds.market is a hard serving partition). An unknown
     market or a missing currency is refused, never defaulted."""
     normalized = normalize_region(market)
     expected = pricing_currency_for_region(normalized)

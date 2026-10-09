@@ -1,84 +1,10 @@
 #!/usr/bin/env python3
-"""Correct external-seed offer currency/market from the real storefront (/meta.json).
+"""Audit storefront currency hints without rewriting money.
 
-Ingest stamps external-seed offers `market='US', currency='USD'` from a DEFAULT, not
-from the store: `mintree.us` is an Indian store (INR), `upcirclebeauty.com` is UK
-(GBP). This asks each storefront what currency it actually uses (Shopify /meta.json,
-keyed on the offer's source_domain, falling back to the attached seed's domain — which
-reaches the source_domain-less mirror rows) and relabels the default-stamped offers.
-
-SCOPE — deliberately narrow (this is a DATA-honesty fix, not a serving change):
-  * Only rewrites offers still stamped the default `currency='USD'`. A row already
-    bearing a real non-USD currency is NEVER touched — so this cannot corrupt a
-    correctly-labelled offer, nor collapse a mixed-currency domain.
-  * Only touches external-seed source_systems — never a real merchant's own sync,
-    whose currency already comes from its Shopify /shop.json.
-  * Never fabricates: writes only when the store's real currency is KNOWN (from
-    /meta.json) and is non-USD. An unresolvable storefront is left as-is + counted.
-  * Does NOT recompute serving. Serving off a currency change is reconciled by the
-    existing index/trust drift machinery (and only gates once the currency-derived
-    US-buyable gate is enabled). Keeping this data-only avoids a partial-run leaving
-    serving half-updated.
-
-SUPPRESSED ROWS ARE IN SCOPE — and until 2026-07-27 they were not, which was a
-SELF-DEFEATING SCOPE BUG. Both the candidate scan and the UPDATE carried
-`o.suppressed_at IS NULL`, so the rows suppressed *for* a currency defect were
-structurally invisible to the tool built to correct currency defects. MEASURED on
-prod the day it was found: Mintree (213 offers) and RED DANE (71) — the two stores
-whose INR/ZAR-priced-as-USD listings started this whole workstream — were still
-stamped `currency='USD', market='US'` months after being suppressed under
-`source_currency_or_channel_defect`. They had been HIDDEN, never CORRECTED, and no
-scheduled pass could ever reach them.
-
-Why including them is safe, and why it is the honest thing to do:
-  * A suppressed row does not serve, so relabelling it cannot change what a buyer
-    or an agent sees. The write is strictly data-honesty.
-  * It removes a live landmine: `has_us_offer` now derives from `currency='USD'`
-    (#1568), so a suppressed row left stamped USD would re-enter the index as
-    "US-buyable" the instant suppression is lifted — reintroducing the original
-    defect through the back door.
-  * The correct-only guard is UNCHANGED and is what keeps this safe: the UPDATE
-    still requires `upper(trim(coalesce(currency,''))) = 'USD'` — the same
-    predicate `has_us_offer` uses, so the two cannot disagree about what counts
-    as USD — and a row already bearing a real currency remains structurally
-    untouchable, suppressed or not.
-    Widening WHICH rows are visible must never widen WHICH rows are writable.
-`--live-only` restores the pre-fix behaviour if an operator ever wants it.
-
-CAVEAT the operator must weigh: base currency != a US buyer's price for a Shopify
-Markets store that sells to the US in USD (the stamped USD number may be a genuine
-US-converted price). currency-mismatch cannot tell that apart from a mislabelled
-foreign price, so the WEEKLY cron is DRY-RUN ONLY — a human reviews the by-domain
-report and runs --apply (workflow_dispatch) for the writes.
-
-KNOWN LIMIT OF THE DOMAIN ATTRIBUTION, stated because the correct-only guard does
-NOT cover it. "Correct-only" guarantees we only ever overwrite a DEFAULT-`USD`
-row; it does NOT guarantee the replacement currency is the right one, because the
-domain an offer is attributed to may not be its own. When `source_domain` is NULL
-the domain comes from a seed joined on `attached_product_key`, and the Path-C lane
-(`catalog_enrichment_agent_v1`) attaches SEVERAL seeds — with different domains —
-to one product_key. An offer can therefore be grouped under, and stamped with the
-currency of, a SIBLING seed's storefront.
-
-`ORDER BY eps.updated_at DESC, eps.id DESC` at least makes the choice
-deterministic and identical in the scan and the UPDATE. Without the `eps.id`
-tiebreaker two seeds sharing an `updated_at` could resolve differently between the
-dry-run a human reviewed and the --apply they then dispatched. It does not make
-the attribution CORRECT. Two consequences to hold in mind:
-  * a seed refresh between the dry-run and the apply can move offers between
-    domain groups — re-run the dry-run if the two are far apart in time;
-  * a domain's offer count can cross the `--min-offers` floor in either direction
-    as offers migrate, so a storefront reviewed last week can silently stop
-    appearing this week.
-The real fix is to attribute each offer to ITS OWN seed (`catalog_offers.
-source_ref` holds the seed id the dual-write projected from) rather than to the
-most-recent sibling. That changes which rows land in which group, so it needs its
-own measured change — it is not a scope tweak.
-
-Dry-run by default; --apply writes (guarded by --max-domains).
-
-  DATABASE_URL=... python -m scripts.backfill_offer_market_currency
-  DATABASE_URL=... python -m scripts.backfill_offer_market_currency --apply
+A storefront's base currency cannot prove the currency of a captured amount.
+An amount may be a Shopify Markets price or a converted seed snapshot. Relabelling
+it without its own source amount changes its value, so this command refuses
+--apply. Use repair_catalog_variant_prices with exact variant evidence instead.
 """
 from __future__ import annotations
 
@@ -157,7 +83,8 @@ _DOMAINS_SQL_TEMPLATE = """
 _UPDATE_OFFERS_SQL_TEMPLATE = """
     UPDATE catalog_offers o
        SET currency = :cur, market = :mkt, updated_at = NOW()
-     WHERE o.source_system = ANY(:sources)
+     WHERE FALSE /* domain base currency is not amount evidence */
+       AND o.source_system = ANY(:sources)
        AND o.list_price > 0
        {suppressed_filter}
        AND upper(trim(coalesce(o.currency,''))) = 'USD'
@@ -186,6 +113,8 @@ _UPDATE_OFFERS_SQL = update_offers_sql()
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if args.apply:
+        raise ValueError("domain_currency_is_not_price_evidence: use repair_catalog_variant_prices")
     own = not getattr(database, "is_connected", False)
     if own:
         await database.connect()
@@ -242,18 +171,18 @@ async def _run(args: argparse.Namespace) -> int:
 
         corrections.sort(key=lambda x: -x["usd_offers"])
         total = sum(c["usd_offers"] for c in corrections)
-        print(f"=== {len(corrections)} domains to relabel ({total} USD-stamped offers); "
+        print(f"=== {len(corrections)} domains requiring variant-level price review ({total} USD-stamped offers); "
               f"{unresolved} domains unresolved (left as-is) ===")
         for c in corrections:
             print(f"  {c['domain']:32} USD -> {c['true_currency']}/{c['true_market']} "
                   f"offers={c['usd_offers']} "
                   f"(live={c.get('live_offers', 0)} suppressed={c.get('suppressed_offers', 0)})")
         if not corrections:
-            print("\nnothing to correct.")
+            print("\nno domain-level discrepancies found.")
             return 0
         if not args.apply:
-            print(f"\n(DRY-RUN — would relabel {total} offers across "
-                  f"{len(corrections)} domains; pass --apply)")
+            print(f"\n(READ-ONLY — {total} offers across {len(corrections)} domains need "
+                  "variant-level amount and currency evidence; use repair_catalog_variant_prices)")
             return 0
         if args.max_domains and len(corrections) > args.max_domains:
             print(f"\nREFUSED: {len(corrections)} domains exceeds --max-domains "
@@ -279,20 +208,18 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Relabel external-seed offer currency/market from /meta.json.")
+    p = argparse.ArgumentParser(description="Audit domain currency hints; amount corrections require exact variant evidence.")
     p.add_argument("--min-offers", type=int, default=3)
     p.add_argument("--concurrency", type=int, default=8)
     p.add_argument("--max-domains", type=int, default=25,
-                   help="refuse --apply if more than this many domains would be relabelled (0=off)")
+                   help="legacy compatibility option; --apply is always refused")
     p.add_argument("--only-domain", action="append", metavar="DOMAIN",
-                   help="restrict --apply to this domain (repeatable). Classification still "
-                        "runs over every domain; the selection and the writes are narrowed, "
-                        "and held-back domains are listed.")
+                   help="restrict the report to this domain (repeatable); held-back domains are listed")
     p.add_argument("--live-only", action="store_true",
                    help="pre-2026-07-27 scope: skip suppressed offers. Leaves rows "
                         "suppressed FOR a currency defect permanently mislabelled — "
                         "see the module docstring before using this.")
-    p.add_argument("--apply", action="store_true", help="write corrections (else dry-run)")
+    p.add_argument("--apply", action="store_true", help="disabled: domain currency is not evidence of a captured amount's denomination")
     return asyncio.run(_run(p.parse_args(argv)))
 
 

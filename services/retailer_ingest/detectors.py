@@ -361,6 +361,61 @@ def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True,
     return flags
 
 
+def listing_collision_flags(collisions: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """same_key_other_listing: one flag per listing the plan left out because an earlier listing on
+    the same host carries the same title, and so the same content key (ingestion.ingest_validated_jsonl).
+
+    Leaving it out is what keeps a buyer from seeing one page and buying another; the flag says what
+    was left out. INFO only when both pages look like one product listed twice -- the same prices, the
+    same merchant product type AND the same image (an ad landing clone, a region copy). Otherwise BLOCK,
+    and a reviewer decides: a different price or type is how a different product wearing the same title
+    shows (COCODOR "Black Cherry" refill $6.99 vs diffuser $11.19; Mr. Smith full size vs sachet), and a
+    different image at one price is a shade (us.mcobeauty.com lists each "Dream Liquid Dewy Blush" shade
+    as its own $5.99 product). Accepting the key (or options.accept_listing_collisions) applies the cohort
+    without that listing; exclude_handles on the KEPT listing makes the other one the row's listing."""
+    flags = []
+    for c in collisions or []:
+        kept, dropped = c.get("kept") or {}, c.get("dropped") or {}
+        same = (bool(kept.get("prices")) and kept.get("prices") == dropped.get("prices")
+                and kept.get("product_type") == dropped.get("product_type")
+                and bool(kept.get("image")) and kept.get("image") == dropped.get("image"))
+        flags.append({
+            "key": f"same_key_other_listing:{dropped.get('handle')}",
+            "rule": "same_key_other_listing",
+            "severity": INFO if same else BLOCK,
+            "handle": dropped.get("handle"),
+            "product_name": dropped.get("product_name"),
+            "category_path": None,
+            "merchant_product_type": dropped.get("product_type"),
+            "detail": (f"left out: {c.get('host')} lists {dropped.get('handle')!r} (type "
+                       f"{dropped.get('product_type')!r}, prices {(dropped.get('prices') or [])[:4]}, image "
+                       f"{dropped.get('image')!r}) under the same title as {kept.get('handle')!r} (type "
+                       f"{kept.get('product_type')!r}, prices {(kept.get('prices') or [])[:4]}, image "
+                       f"{kept.get('image')!r}), which keeps {c.get('product_key')}"),
+        })
+    return flags
+
+
+def listing_move_flags(moves: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """listing_moved: a row names a listing on this host that the crawl does not carry, so the plan held
+    every record of it (ingestion.ingest_validated_jsonl never moves a row). Always BLOCK and never covered
+    by options.accept_listing_collisions: accepting `listing_moved:<product_key>` is what lets the row move
+    to the listing named in the detail (a renamed handle, an unpublished page); a crawl that merely dropped
+    the page is answered by re-running it."""
+    return [{
+        "key": f"listing_moved:{m.get('product_key')}",
+        "rule": "listing_moved",
+        "severity": BLOCK,
+        "handle": m.get("would_keep"),
+        "product_name": None,
+        "category_path": None,
+        "merchant_product_type": None,
+        "detail": (f"held: {m.get('host')} row {m.get('product_key')} names {m.get('current')!r}, which this "
+                   f"crawl does not carry; accepting moves it to {m.get('would_keep')!r} "
+                   f"(crawled {list(m.get('crawled') or [])[:5]})"),
+    } for m in moves or []]
+
+
 def blocking(flags: Iterable[Dict[str, Any]], *, accepted: Iterable[str] = ()) -> List[Dict[str, Any]]:
     """The BLOCK flags an approval has not accepted by key (cohort-level flags are never accepted)."""
     ok = set(accepted or ())

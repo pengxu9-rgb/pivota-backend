@@ -103,9 +103,16 @@ def test_every_family_has_exactly_one_canonical_spelling():
 
 
 def test_case_and_punctuation_variants_still_collapse_as_before():
-    for vendor in ("ETUDE", "Etude", "etude"):
-        assert brand_on("retailer.com", vendor, "Etude") == "Etude"
+    for vendor in ("LANEIGE", "Laneige", "laneige"):
+        assert brand_on("retailer.com", vendor, "Laneige") == "Laneige"
     assert brand_on("retailer.com", "TONY MOLY", "TONYMOLY") == "TONYMOLY"
+
+
+@pytest.mark.parametrize("vendor", ["ETUDE HOUSE", "Etude House", "ETUDE", "Etude", "etude", "Étude House", "ÉTUDE"])
+@pytest.mark.parametrize("override", [None, "ETUDE HOUSE", "Etude", "ETUDE"])
+def test_etude_is_one_brand_written_as_its_current_name(vendor, override):
+    """Measured 2026-09-28: 293 retailer rows "ETUDE HOUSE" vs 184 "ETUDE"/"Etude" -- one maker, renamed in 2023."""
+    assert brand_on("retailer.com", vendor, override) == "ETUDE"
 
 
 def test_no_override_writes_an_unlisted_vendor_as_is():
@@ -223,7 +230,8 @@ def test_a_neighbour_of_an_accent_family_keeps_its_own_name(vendor):
 
 @pytest.mark.parametrize("brands,ok", [
     ({"Kose": "Kosé"}, True),              # the family's own spelling
-    ({"Kose": "KOSE"}, True),              # same letters: a plain respelling
+    ({"Kose": "KOSE"}, False),              # same letters, but neither the vendor's spelling nor the family's
+    ({"Kose": "Kose"}, True),               # the vendor's own spelling: no respelling asked; the family writes "Kosé"
     ({"Kose": "Shiseido"}, False),         # review of #2302: a family vendor accepted ANY value, then wrote "Kosé"
     ({"Kose": "Bioré"}, False),            # another family's spelling: would be silently ignored too
 ])

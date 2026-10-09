@@ -4,9 +4,9 @@ Each JSONL row: {"domain": "k-touch.us", "brand": "3CE", "vendors": ["3CE"],
                  "options": {"lip_title_evidence": true, "only_category": "beauty/makeup/lip"},
                  "priority": 10}
 `vendors` is required (a retailer cohort is selected by vendor). Everything else in `options` is
-optional: market (ISO alpha-2, default US; allowed US, and AU/JP as acquisition markets whose rows are
-stored but not served), require_currency (default and only allowed value: the market's currency, USD for
-US, AUD for AU, JPY for JP), source (storefront | affiliate_feed | shopify_markets), category_path,
+optional: market (ISO alpha-2, default US; allowed US and SG as served markets, and AU/JP as acquisition
+markets whose rows are stored but not served), require_currency (default and only allowed value: the market's
+currency, USD for US, SGD for SG, AUD for AU, JPY for JP), source (storefront | affiliate_feed | shopify_markets), category_path,
 only_category, only_resolved_category, lip_title_evidence, lash_nail_title_evidence, exclude_handles,
 max_scan_products, max_products, retailer_name.
 

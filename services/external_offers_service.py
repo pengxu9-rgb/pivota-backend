@@ -14,7 +14,9 @@ from sqlalchemy import and_, select, update
 
 from db.database import database
 from db.external_offers import external_offer_snapshots
+from services import crawl_identity
 from services import crawl_politeness
+from services import shopify_edge_pacer
 from utils.availability_vocabulary import normalize_availability
 from utils.crawled_price import (
     agreed_hint,
@@ -1222,8 +1224,37 @@ def _parse_aggregate_rating(node: Any) -> tuple[Optional[float], Optional[int]]:
     return rating_value, rating_count
 
 
+def _variant_parent_names(parsed_objs: list[Any]) -> Dict[int, str]:
+    """`id(variant node) -> its product's name`, for variants nested in a `hasVariant` list.
+
+    A Shopify ProductGroup page (tatcha.com, 2026-09-29) is
+    `{"@type": "ProductGroup", "name": "The Dewy Serum", "hasVariant": [{"@type": "Product",
+    "name": "30 ml | 1.0 oz", "offers": ...}, ...]}`. The group is not a `product` type below, so
+    only its variants compete, and a variant's `name` is its OPTION LABEL ("30 ml | 1.0 oz",
+    "Default Title", "Black"), not the product's. Keyed by object identity because a variant
+    carries no reliable back-reference (`isVariantOf` is usually a bare `@id`).
+    """
+    names: Dict[int, str] = {}
+    for root in parsed_objs:
+        for node in _iter_jsonld_nodes(root):
+            if not isinstance(node, dict):
+                continue
+            group_name = node.get("name")
+            children = node.get("hasVariant")
+            if not isinstance(group_name, str) or not group_name.strip():
+                continue
+            if isinstance(children, dict):
+                children = [children]
+            if isinstance(children, list):
+                for child in children:
+                    if isinstance(child, dict):
+                        names[id(child)] = group_name.strip()
+    return names
+
+
 def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
     best: Dict[str, Any] = {}
+    parent_names = _variant_parent_names(parsed_objs)
     for root in parsed_objs:
         for node in _iter_jsonld_nodes(root):
             t = node.get("@type") if isinstance(node, dict) else None
@@ -1234,7 +1265,14 @@ def _extract_jsonld_offer(parsed_objs: list[Any]) -> Dict[str, Any]:
             if "product" not in tset and "offer" not in tset:
                 continue
 
-            name = node.get("name") if isinstance(node, dict) else None
+            # A variant's own `name` is its option label; the product is named by its group.
+            parent = node.get("isVariantOf") if isinstance(node, dict) else None
+            parent_name = parent.get("name") if isinstance(parent, dict) else None
+            name = (
+                parent_names.get(id(node))
+                or (parent_name if isinstance(parent_name, str) and parent_name.strip() else None)
+                or (node.get("name") if isinstance(node, dict) else None)
+            )
             description = node.get("description") if isinstance(node, dict) else None
             brand = None
             b = node.get("brand") if isinstance(node, dict) else None
@@ -1440,21 +1478,28 @@ async def _fetch_html(
     # script's `except Exception` would silently record the row as fetch_failed. A host that 429s
     # four times in a row would then void the rest of the run in milliseconds while looking like
     # the host was down.
-    await crawl_politeness.before_request(url, user_agent=DEFAULT_UA, max_wait=max_wait)
+    await crawl_politeness.before_request(url, user_agent=crawl_identity.robots_user_agent(DEFAULT_UA), max_wait=max_wait)
 
     timeout = httpx.Timeout(10.0, connect=5.0)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": DEFAULT_UA}) as client:
+    # Signed (Web Bot Auth) when CRAWL_WEB_BOT_AUTH_ENABLED and a key are set; every redirect hop is
+    # signed for its own host. Off: the same client as before (services/crawl_identity.py).
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": DEFAULT_UA},
+                                 **crawl_identity.transport_kwargs()) as client:
         resp = await client.get(url)
         # BEFORE raise_for_status: a 429 IS the signal the backoff exists to consume, and
         # raise_for_status would leave with it unrecorded — so the next call would hit the same
         # host at the same rate that just got us throttled.
         crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
+            url, resp.status_code, retry_after=resp.headers.get("retry-after"),
+            headers=resp.headers,
         )
         if observed is not None:
             observed["status_code"] = resp.status_code
             observed["final_url"] = str(resp.url)
             observed["bot_challenged"] = bool(resp.headers.get("cf-mitigated"))
+        # Teaches the shared Shopify-edge budget which hosts it covers, keyed by the host that
+        # ANSWERED (the final URL after redirects). A no-op with its flag off.
+        shopify_edge_pacer.learn_from_response(str(resp.url), resp.headers)
         # WAS `resp.raise_for_status()`. Same control flow — every existing caller
         # catches `Exception` — but the status and the final URL now survive the throw,
         # which is what lets the refresh record "this product is gone" instead of

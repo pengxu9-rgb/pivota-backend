@@ -46,6 +46,8 @@ from urllib.robotparser import RobotFileParser
 
 import httpx
 
+from services import crawl_ip_throttle
+
 ROBOTS_TRANSPORT_FACTORY = ContextVar("robots_transport_factory", default=None)
 
 logger = logging.getLogger(__name__)
@@ -317,6 +319,17 @@ def _robots_delay_cap() -> float:
     return _f("CRAWL_MAX_ROBOTS_DELAY_SECONDS", _MAX_ROBOTS_DELAY_DEFAULT)
 
 
+def _shopify_edge(url: str) -> Any:
+    """The shared Shopify-edge budget (services/shopify_edge_pacer.py) when it applies to `url`,
+    else None. It applies only with `CRAWL_SHOPIFY_EDGE_PACER_ENABLED` on AND `url`'s host known to
+    be Shopify-served; with the flag off this touches no pacer state and `await_slot` runs exactly
+    the pre-pacer path.
+    """
+    from services import shopify_edge_pacer  # noqa: PLC0415 - it imports this module
+
+    return shopify_edge_pacer if shopify_edge_pacer.applies(url) else None
+
+
 async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = None) -> None:
     """Sleep until this host may be hit again, then reserve the slot.
 
@@ -386,19 +399,61 @@ async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = N
         raise CrawlPaced(
             f"{host} next free in {start - now:.1f}s, over the {ceiling:.1f}s the caller allows"
         )
+    edge = _shopify_edge(url)
+    if edge is not None and not unbounded:
+        # THE SHARED SHOPIFY-EDGE SLOT, FOR A BOUNDED CALLER: BOTH SLOTS OR NEITHER. The shared
+        # slot is taken with no await between it and the host reservation below, and a refusal
+        # (`EdgePaced`, a `CrawlPaced`) is raised before either is reserved -- this function's
+        # contract. Only a lease refill awaits, and everything is re-read after it.
+        # The caller's patience is a deadline: time spent waiting on a refill counts against it.
+        deadline = now + ceiling
+        slot = edge.take_nowait(max_wait=ceiling)
+        while slot is None:
+            await edge.refill()
+            now = time.monotonic()
+            start = max(now, state.next_allowed, state.backoff_until)
+            if start > deadline:
+                raise CrawlPaced(
+                    f"{host} next free in {start - now:.1f}s, over the {ceiling:.1f}s the caller "
+                    f"allows"
+                )
+            slot = edge.take_nowait(max_wait=deadline - now)
+        start = max(start, slot)
     # Reserve BEFORE sleeping. Read-then-write with no await between them is atomic on one loop,
     # so N concurrent callers take N distinct slots instead of all waking at the same instant.
     state.next_allowed = start + interval
     delay = start - now
     if delay > 0:
         await asyncio.sleep(delay)
+    if edge is not None and unbounded:
+        # AN UNBOUNDED CALLER (every batch job) takes the shared slot AFTER its host slot, so no
+        # shared slot is spent while the host's own interval is still running. It can never be
+        # refused, so nothing reserved above is ever abandoned. If the shared slot made us start
+        # later than the host slot, the host's next slot moves with it: the host interval is
+        # measured from when the request really started.
+        if await edge.acquire() > 0:
+            state.next_allowed = max(state.next_allowed, time.monotonic() + interval)
 
 
-def note_response(url: str, status_code: int, *, retry_after: Optional[str] = None) -> None:
-    """Feed a response back in so the next request to this host is paced accordingly."""
+def note_response(
+    url: str,
+    status_code: int,
+    *,
+    retry_after: Optional[str] = None,
+    headers: Any = None,
+) -> None:
+    """Feed a response back in so the next request to this host is paced accordingly.
+
+    `headers` is optional and never changes the pacing. When given it is (a) forwarded to any
+    installed `crawl_ip_throttle` breaker, for every status, and (b) on a 429/503 its allowlisted
+    headers are appended to the backoff line, so an IP throttle (`retry-after=60`) can be told
+    from a bot challenge (`cf-mitigated=challenge`) from the log alone.
+    """
     host = host_of(url)
     if not host:
         return
+    if headers is not None:
+        crawl_ip_throttle.observe_response(host, status_code, headers)
     # Bounded here too, not only in await_slot: note_response CREATES state, and a caller that
     # only ever records responses (or one whose requests are all refused) would otherwise grow
     # this cache past the ceiling without await_slot ever running.
@@ -427,9 +482,15 @@ def note_response(url: str, status_code: int, *, retry_after: Optional[str] = No
         wait = max(wait, min(ceiling, parsed))
 
     state.backoff_until = time.monotonic() + wait
+    # OUR hold first, unchanged, so existing log parsing keeps working; then what the host said.
+    # Before 2026-09-30 only the hold was logged, and a `Retry-After: 60` IP throttle read the
+    # same as a bot challenge.
+    diag = crawl_ip_throttle.format_throttle_headers(
+        crawl_ip_throttle.capture_throttle_headers(headers)
+    )
     logger.warning(
-        "crawl backoff: %s returned %s (consecutive=%d), holding %.1fs",
-        host, status_code, state.consecutive_blocks, wait,
+        "crawl backoff: %s returned %s (consecutive=%d), holding %.1fs%s",
+        host, status_code, state.consecutive_blocks, wait, f" [{diag}]" if diag else "",
     )
 
 

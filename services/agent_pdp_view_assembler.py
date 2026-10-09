@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import unicodedata
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -236,6 +238,111 @@ async def fetch_external_seed_by_id(
     return dict(row) if row else None
 
 
+async def fetch_own_seed_copy_for_keys(
+    product_keys: List[str],
+    *,
+    db: Any = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Each product's OWN newest active seed: its storefront, how its description was chosen,
+    whether a person reviewed it, and the brand-page sections the crawl captured
+    -> {product_key: {...}}.
+
+    Keyed per row, unlike fetch_external_seed_for_keys (one seed for the whole cluster, chosen by
+    the caller), so what compose_brand_section_description serves depends only on the winner. The
+    id breaks an updated_at tie, so two seeds written in one transaction never alternate.
+    """
+    if not product_keys:
+        return {}
+    read_db = db or database
+    rows = await read_db.fetch_all(
+        """
+        SELECT DISTINCT ON (attached_product_key)
+               attached_product_key,
+               domain,
+               canonical_url,
+               coalesce(seed_data->>'seed_description_origin',
+                        seed_data->'snapshot'->>'seed_description_origin', '') AS description_origin,
+               (seed_data->'snapshot_quarantine'->'pivota_description_rollback_v1') IS NOT NULL
+                 AS description_reviewed,
+               seed_data->'pdp_details_sections' AS details_sections
+        FROM external_product_seeds
+        WHERE attached_product_key = ANY(:keys)
+          AND status = 'active'
+        ORDER BY attached_product_key, updated_at DESC, id DESC
+        """,
+        {"keys": product_keys},
+    )
+    return {str(r["attached_product_key"]): dict(r) for r in rows or []}
+
+
+async def fetch_shared_section_lines(
+    host: str,
+    lines: List[str],
+    *,
+    exclude_product_keys: List[str],
+    own_base_title: str,
+    db: Any = None,
+) -> set:
+    """Of `lines`, those the page sections of at least _SHARED_LINE_MIN_OTHER_PRODUCTS other
+    products on the same storefront also carry: the store's copy, not this product's -- plus every
+    line past _SHARED_LINE_CHECK_MAX, which is not checked and so is treated as shared.
+
+    The storefront is the normalised host, matched with and without "www." (seed domains are
+    stored both ways). Other editions of the product itself -- its shades, "Pro Filt'r … — #265"
+    beside "— #210" -- are one product, not boilerplate: they share its base title
+    (_product_base_title, computed the same way in SQL) and are not counted.
+
+    BOUNDED, because it runs inside a rebuild on the 2-vCPU primary (review #2443): at most
+    _SHARED_LINE_SEED_SCAN_MAX seeds, both CTEs MATERIALIZED so each body is normalised once rather
+    than once per line, and a _SHARED_LINE_TIMEOUT_MS statement_timeout on Postgres. A timeout
+    raises; build_agent_pdp_view_row then appends nothing.
+    """
+    if not lines:
+        return set()
+    if not host:
+        raise ValueError("fetch_shared_section_lines needs the storefront's host")
+    checked, unchecked = list(lines[:_SHARED_LINE_CHECK_MAX]), set(lines[_SHARED_LINE_CHECK_MAX:])
+    read_db = db or database
+    query = """
+        WITH seeds AS MATERIALIZED (
+          SELECT s.title, s.seed_data->'pdp_details_sections' AS sections
+          FROM external_product_seeds s
+          WHERE s.domain = ANY(CAST(:domains AS text[]))
+            AND s.status = 'active'
+            AND (s.attached_product_key IS NULL OR s.attached_product_key <> ALL(:keys))
+          ORDER BY s.id
+          LIMIT :seed_limit
+        ),
+        bodies AS MATERIALIZED (
+          SELECT lower(btrim(regexp_replace(coalesce(seeds.title, ''), '\\s+[—–-]\\s+.*$', ''))) AS base,
+                 regexp_replace(e->>'body', '\\s+', ' ', 'g') AS body
+          FROM seeds
+          CROSS JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(seeds.sections) = 'array'
+                 THEN seeds.sections ELSE CAST('[]' AS jsonb) END) e
+        )
+        SELECT l.line, count(DISTINCT b.base) AS products
+        FROM unnest(CAST(:lines AS text[])) AS l(line)
+        JOIN bodies b ON strpos(b.body, l.line) > 0 AND b.base <> :own_base
+        GROUP BY l.line
+        """
+    params = {
+        "domains": [host, f"www.{host}"],
+        "lines": checked,
+        "keys": list(exclude_product_keys),
+        "own_base": own_base_title,
+        "seed_limit": _SHARED_LINE_SEED_SCAN_MAX,
+    }
+    if hasattr(read_db, "transaction") and str(getattr(read_db, "url", "")).lower().startswith("postgres"):
+        async with read_db.transaction():
+            await read_db.execute(f"SET LOCAL statement_timeout = {int(_SHARED_LINE_TIMEOUT_MS)}")
+            rows = await read_db.fetch_all(query, params)
+    else:
+        rows = await read_db.fetch_all(query, params)
+    shared = {str(r["line"]) for r in rows or [] if int(r["products"] or 0) >= _SHARED_LINE_MIN_OTHER_PRODUCTS}
+    return shared | unchecked
+
+
 async def fetch_evidence_for_keys(
     product_keys: List[str],
     *,
@@ -366,12 +473,324 @@ def _is_brand_store_row(row: Dict[str, Any]) -> bool:
         return False
     if not _passes_serving_content_bar(row):
         return False
+    return _is_brand_owned_row(row)
+
+
+def _is_brand_owned_row(row: Dict[str, Any]) -> bool:
+    """The brand's own store sells this row: not a retailer listing, a host that is not a known
+    retailer, and a brand_direct offer (the ingest pipeline's seller verdict) or the brand's domain."""
+    if _is_retailer_listing(row):
+        return False
     from services.offer_seller_identity import brand_owns_domain, host_from_url, is_known_retailer, normalize_host
 
     host = normalize_host(row.get("source_domain")) or host_from_url(row.get("canonical_url"))
     if not host or is_known_retailer(host):
         return False
     return bool(row.get("has_brand_direct_offer")) or brand_owns_domain(row.get("brand"), host)
+
+
+# ---------------------------------------------------------------------
+# Brand section copy: a thin brand-store description, filled from the brand's own page sections
+# ---------------------------------------------------------------------
+#
+# Measured on prod 2026-09-29: 1,849 of 8,117 served brand-store products serve under 200 chars,
+# mostly the store's one-line tagline (the crawl's pdp_variant_description), while the same row's
+# own seed already holds the brand's Details / Overview / Benefits sections from its page (Fenty's
+# accordions, Rare Beauty, Pixi, Jurlique, Ole Henriksen...). The public PDP renders those sections;
+# the served description -- what agents read and the serving gate measures -- never saw them.
+#
+# THE PICK DOES NOT SEE THEM, deliberately: _passes_serving_content_bar judges a row by its overlay
+# and its own column, so a row whose column is under MIN_DESCRIPTION_LENGTH still loses to a sibling
+# that passes. The sections only lengthen whichever row already won. The GATE does see them (it reads
+# agent_pdp_view.description), so a winner that was blocked short_description can start serving.
+
+# Set by build_agent_pdp_view_row. Never persisted.
+_OWN_SEED_COPY = "_own_seed_copy"            # fetch_own_seed_copy_for_keys, per row
+_SHARED_SECTION_LINES = "_shared_section_lines"  # fetch_shared_section_lines, on the winner
+
+# canonical_pdp_enrichment's own "thin enough to be worth more copy" line.
+_THIN_SERVED_DESCRIPTION_CHARS = 200
+_BRAND_SECTION_MAX_CHARS = 900
+_COMPOSED_DESCRIPTION_MAX_CHARS = 1600
+_BRAND_SECTION_MAX_COUNT = 3
+_BRAND_SECTION_MIN_CHARS = 80
+# A line other products of the same storefront also carry is the store's copy, not this product's
+# (scripts/backfill_brand_official_descriptions.drop_shared_boilerplate, mechanism 2). Counted in
+# distinct OTHER products -- title before " — " -- so the shades of one product sharing its copy
+# are one product, not boilerplate.
+_SHARED_LINE_MIN_OTHER_PRODUCTS = 2
+# Bounds on that check (fetch_shared_section_lines): lines judged per rebuild (the rest count as
+# shared, i.e. are not appended), seeds scanned per storefront, and its statement_timeout.
+_SHARED_LINE_CHECK_MAX = 24
+_SHARED_LINE_SEED_SCAN_MAX = 3000
+_SHARED_LINE_TIMEOUT_MS = 2000
+# Two sentences this alike (word-set Jaccard) say the same thing twice.
+_NEAR_DUPLICATE_JACCARD = 0.8
+
+# The crawl's tags for a description taken as-is from the brand's page. Any other origin was chosen
+# by a person -- the reviewed Pivota-intel rollbacks (pivota.description.rollback.v1, which replaced
+# junk and wrong-variant copy), reviewed content patches, manual text -- and is served as reviewed.
+_CRAWLED_DESCRIPTION_ORIGINS = frozenset({"", "pdp_variant_description", "pdp_product_description"})
+
+# Matched against the heading's lowercased words. Descriptive sections only: never how-to,
+# ingredients, FAQ, claims / clinical results, taxonomy ("Product Type"), "About the brand", or
+# "Features" (murad.com's is a concern list ending in an item number).
+_BRAND_COPY_HEADING = re.compile(
+    r"(?:product )?(?:details|overview|description)|(?:key |product )?benefits?|what it (?:is|does)"
+    r"|why (?:we made it|we love it|you ll love it|you will love it)|highlights"
+)
+# Storefront tags and image alt text are captured as "sections" but are not prose.
+_NON_PROSE_SECTION_KIND = re.compile(r"tags?$|media_alt")
+
+# A line of any of these classes is not product copy and is dropped from the section. The classes
+# are what prod sections and review #2443 showed sitting beside real copy under a "Details" heading.
+_NOT_PRODUCT_COPY: Tuple[Tuple[str, "re.Pattern[str]"], ...] = tuple(
+    (name, re.compile(pattern, re.I))
+    for name, pattern in (
+        ("markup", r"<\s*/?\s*[a-z!]|&[a-z]+;|&#\d+;"),
+        ("link", r"https?://|www\.|\]\(|\b[a-z0-9-]+\.(?:com|us|co|net|org|io|shop|store|beauty|kr|jp|uk|au|ca|sg|de|fr)\b"),
+        ("contact", r"\S@\S|@\w|\b\w+ \[?at\]? \w+ \[?dot\]? (?:com|net|org|co)\b"
+                    r"|(?<!\w)\+?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}(?!\w)|\b(?:call|text|email|dm) us\b"),
+        ("price", r"[$€£¥₩₹]\s?\d|\d\s?(?:円|원)|\b\d[\d,.]*\s?(?:usd|eur|gbp|krw|jpy|sgd|aud|cad|myr|won|yen)\b"
+                  r"|\b(?:usd|eur|gbp|krw|jpy|sgd|aud|cad|myr|rm)\s?\d"),
+        ("promo", r"\d+\s?%\s?off|\b(?:percent|half) off\b|\b(?:sale|promo|coupon|discount|bogo|deal"
+                  r"|buy (?:one|1|two|2)|save (?:up to )?\S*\d|limited[- ]edition|while supplies last|limited time"
+                  r"|gift with purchase|free (?:shipping|gift|sample|returns?)|complimentary|with (?:every|any) (?:purchase|order)"
+                  r"|deluxe (?:sample|mini)|as seen (?:on|in)|featured in)\b"),
+        ("store", r"\b(?:price|sold out|in stock|out of stock|add to (?:bag|cart)|shop now|available only"
+                  r"|exclusively (?:at|on)|rewards?|refer a friend|privacy policy|terms of (?:use|service)"
+                  r"|log ?in|sign in|my account|gift card|store locator|contact us|subscribe|sign up"
+                  r"|newsletter|klarna|afterpay|affirm|sezzle|shop pay|pay in (?:4|four)|installments?|loyalty"
+                  r"|(?:earn|redeem|bonus|reward) points?|points? (?:program|per|on every))\b"),
+        ("shipping", r"\b(?:shipping|ships (?:in|within|free|from|to)|free returns|returns? (?:within|policy)"
+                     r"|return policy|refunds?|business days|delivery (?:in|within|times?))\b"),
+        ("reviews", r"\b(?:reviews?|reviewers|rated|ratings?|verified (?:customers|buyers|purchasers)|out of 5"
+                    r"|\d(?:\.\d)? stars?)\b"),
+        ("cross_sell", r"\b(?:pair (?:it|this|with)|pairs (?:well|perfectly|beautifully) with"
+                       r"|complete (?:the|your) (?:look|routine|regimen)|you may also|also try|try it with"
+                       r"|shop (?:the|our))\b"),
+        ("legal", r"^\W*(?:full )?(?:ingredients|warnings?|caution|directions)\s*:|\b(?:for external use only"
+                  r"|keep out of (?:the )?reach|discontinue use|consult (?:a|your) (?:doctor|physician)"
+                  r"|prop(?:osition)? 65|avoid contact with (?:the )?eyes|not been evaluated by the (?:food and drug"
+                  r" administration|fda)|not intended to diagnose)\b"),
+        ("ingredient_list", r"^(?=(?:[^,]*,){8})(?=.*\b(?:aqua|water|glycerin|alcohol|parfum|fragrance|dimethicone)\b)"),
+        ("call_to_action", r"\b(?:learn (?:more|how)|click|tap here|find out more|tiktok|instagram|follow us"
+                           r"|(?:our|the) (?:blog|journal))\b"),
+    )
+)
+# Two first-person words: a customer review captured beside the product copy.
+_FIRST_PERSON = re.compile(r"\b(?:i|i'm|i've|my|me)\b", re.I)
+# Our own generated summaries sometimes sit in the sections too ("positioned for brightening",
+# "…from reviewed source evidence"); they are not the brand's copy.
+_SYNTHETIC_SUMMARY = re.compile(r"\bpositioned (?:as|for|around)\b|\bpositioning\b|\breviewed source", re.I)
+# "…trouble spotsUnique Feature: …" -- labels the crawl ran together; split them onto their own line.
+_RUN_TOGETHER_LABEL = re.compile(r"(?<=[a-z0-9.)])(?=(?:[A-Z][a-z]+ ){0,3}[A-Z][a-z]+:)")
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+# "Pro Filt'r Soft Matte Longwear Foundation — #265" -> the product, without its shade or edition.
+_EDITION_SUFFIX = re.compile(r"\s+[—–-]\s+.*$")
+
+
+def _norm_words(text: Any) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+
+
+def _product_base_title(title: Any) -> str:
+    return _EDITION_SUFFIX.sub("", str(title or "")).strip().lower()
+
+
+def _section_heading(value: Any) -> str:
+    """The heading's first non-empty line (the crawl sometimes doubles it: "Details\\n\\nDetails")."""
+    for line in str(value or "").splitlines():
+        line = line.strip().rstrip(":?+").strip()
+        if line:
+            return line
+    return ""
+
+
+def _is_label_line(line: str) -> bool:
+    """A heading-like line with no sentence end, most words capitalised: "What Else You Need To
+    Know", "Skin Concerns - Dryness, Dullness", a run-together list of set contents."""
+    if line.rstrip().endswith((".", "!", "?")):
+        return False
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z'’-]*", line) if len(w) >= 3]
+    return bool(words) and sum(w[0].isupper() for w in words) >= 0.75 * len(words)
+
+
+# Latin lookalikes NFKC leaves alone ("frее ѕhipping" in Cyrillic): folded before classifying.
+_CONFUSABLES = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "ѕ": "s", "і": "i", "ј": "j",
+    "ԁ": "d", "һ": "h", "ӏ": "l", "ԛ": "q", "ԝ": "w", "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M",
+    "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T", "Х": "X", "Ѕ": "S", "І": "I", "Ј": "J",
+    "ο": "o", "α": "a", "ε": "e", "ι": "i", "κ": "k", "ν": "v", "ρ": "p", "τ": "t", "υ": "u", "χ": "x",
+})
+# A footnote line: the marker a claim's fine print starts with.
+_FOOTNOTE_MARKERS = ("*", "†", "‡", "§", "¹", "²", "³")
+
+
+def _fold(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).translate(_CONFUSABLES)
+
+
+def _not_product_copy(line: str) -> Optional[str]:
+    """The class of non-product text the line is (_NOT_PRODUCT_COPY), or None. Judged on the line
+    NFKC-normalised with Latin lookalikes folded, so "＄ 25" and "frее ѕhipping" read as written."""
+    probe = _fold(line)
+    for name, pattern in _NOT_PRODUCT_COPY:
+        if pattern.search(probe):
+            return name
+    return None
+
+
+def _section_lines(body: Any) -> List[str]:
+    """The section's candidate lines: five words or more, not a "*Based on…" / "†" footnote, not a label
+    line, not any _NOT_PRODUCT_COPY class. Nothing is judged against what is served yet."""
+    lines = []
+    for raw in _RUN_TOGETHER_LABEL.sub("\n", str(body or "")).splitlines():
+        line = " ".join(raw.split())
+        if len(re.findall(r"[A-Za-z][A-Za-z'’-]*", line)) < 5:
+            continue
+        if line.startswith(_FOOTNOTE_MARKERS) or _is_label_line(line) or _not_product_copy(line):
+            continue
+        lines.append(line)
+    return lines
+
+
+def _clip_at_sentence(text: str, limit: int) -> str:
+    """At most `limit` chars, ending on a sentence or line; "" rather than a fragment."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "), cut.rfind("\n"))
+    return cut[: end + 1].strip() if end >= limit // 3 else ""
+
+
+def _brand_section_plan(
+    canonical: Dict[str, Any], enrichment: Optional[Dict[str, Any]]
+) -> List[Tuple[str, List[str]]]:
+    """[(heading, candidate lines)] for each section compose_brand_section_description may use, in
+    page order -- or [] when the rule does not apply to this winner.
+
+    It applies only when all hold:
+      * no overlay description (curated or generated copy is served as written);
+      * the winner's own column is under _THIN_SERVED_DESCRIPTION_CHARS;
+      * the winner's own seed took it from the brand's page (_CRAWLED_DESCRIPTION_ORIGINS) and no
+        reviewed rollback replaced it;
+      * that seed is on the winner's own storefront (its domain, else its canonical URL's host);
+      * the winner is the brand's own store (_is_brand_owned_row) -- a retailer's sections are the
+        retailer's copy.
+    Sections: descriptive headings only (_BRAND_COPY_HEADING), each heading once, prose kinds only,
+    none containing a script, none in a reviewer's voice or our own generated summary's.
+    """
+    own = canonical.get(_OWN_SEED_COPY)
+    if not isinstance(own, dict):
+        return []
+    if coalesce_first((enrichment or {}).get("description_markdown")):
+        return []
+    base = coalesce_first(canonical.get("description"))
+    if not isinstance(base, str) or len(base) >= _THIN_SERVED_DESCRIPTION_CHARS:
+        return []
+    if own.get("description_reviewed") or str(own.get("description_origin") or "") not in _CRAWLED_DESCRIPTION_ORIGINS:
+        return []
+    if not _is_brand_owned_row(canonical):
+        return []
+    from services.offer_seller_identity import host_from_url, normalize_host
+
+    row_host = normalize_host(canonical.get("source_domain")) or host_from_url(canonical.get("canonical_url"))
+    seed_host = normalize_host(own.get("domain")) or host_from_url(own.get("canonical_url"))
+    if not row_host or seed_host != row_host:
+        return []
+    sections = _parse_jsonish(own.get("details_sections"))
+    if not isinstance(sections, list):
+        return []
+
+    plan: List[Tuple[str, List[str]]] = []
+    headings_used = set()
+    for section in sections:
+        if not isinstance(section, dict) or _NON_PROSE_SECTION_KIND.search(str(section.get("source_kind") or "")):
+            continue
+        heading = _section_heading(section.get("heading"))
+        heading_words = _norm_words(heading)
+        if heading_words in headings_used or not _BRAND_COPY_HEADING.fullmatch(heading_words):
+            continue
+        body = str(section.get("body") or "")
+        if re.search(r"<\s*script", body, re.I):
+            continue
+        lines = _section_lines(body)
+        text = "\n".join(lines)
+        if not lines or len(_FIRST_PERSON.findall(text)) >= 2 or _SYNTHETIC_SUMMARY.search(text):
+            continue
+        headings_used.add(heading_words)
+        plan.append((heading, lines))
+    return plan
+
+
+def brand_section_candidate_lines(canonical: Dict[str, Any], enrichment: Optional[Dict[str, Any]]) -> List[str]:
+    """Every line compose_brand_section_description might serve for this winner, in page order --
+    the lines the storefront repetition check (fetch_shared_section_lines) must look up first."""
+    return list(dict.fromkeys(line for _, lines in _brand_section_plan(canonical, enrichment) for line in lines))
+
+
+def _near_duplicate(words: frozenset, served: List[frozenset]) -> bool:
+    return any(len(words & other) >= _NEAR_DUPLICATE_JACCARD * len(words | other) for other in served)
+
+
+def compose_brand_section_description(
+    canonical: Dict[str, Any],
+    description: Optional[str],
+    enrichment: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """The served description, followed by the brand's own descriptive page sections when the
+    winner is a thin crawled tagline on the brand's own store row (_brand_section_plan). Otherwise
+    the description, unchanged.
+
+    Only onto the winner's own column (the plan requires it and no overlay, so assemble_row serves
+    exactly that column; a seed fallback, which depends on the caller, never qualifies). Only after the
+    storefront repetition check ran (build_agent_pdp_view_row sets _SHARED_SECTION_LINES); without
+    it nothing is added. Then, per line: dropped if other products of the storefront carry it;
+    sentences dropped when they repeat, or nearly repeat, anything already served (the tagline
+    included). A section needs _BRAND_SECTION_MIN_CHARS left, is cut at a sentence to
+    _BRAND_SECTION_MAX_CHARS; at most _BRAND_SECTION_MAX_COUNT sections and
+    _COMPOSED_DESCRIPTION_MAX_CHARS in all.
+    """
+    if not isinstance(description, str):
+        return description
+    plan = _brand_section_plan(canonical, enrichment)
+    shared = canonical.get(_SHARED_SECTION_LINES)
+    if not plan or shared is None:
+        return description
+
+    served: List[frozenset] = [frozenset(_norm_words(s).split()) for s in _SENTENCE_END.split(description)]
+    served = [s for s in served if s]
+    blocks: List[str] = []
+    total = len(description)
+    for heading, lines in plan:
+        if len(blocks) >= _BRAND_SECTION_MAX_COUNT:
+            break
+        kept_lines: List[str] = []
+        kept_sets: List[frozenset] = []
+        for line in lines:
+            if line in shared:
+                continue
+            sentences = []
+            for sentence in _SENTENCE_END.split(line):
+                words = frozenset(_norm_words(sentence).split())
+                if not words or _near_duplicate(words, served + kept_sets):
+                    continue
+                sentences.append(sentence)
+                kept_sets.append(words)
+            rest = " ".join(sentences)
+            if len(re.findall(r"[A-Za-z][A-Za-z'’-]*", rest)) >= 5:
+                kept_lines.append(rest)
+        prose = _clip_at_sentence("\n".join(kept_lines), _BRAND_SECTION_MAX_CHARS)
+        if len(prose) < _BRAND_SECTION_MIN_CHARS:
+            continue
+        block = f"{heading.capitalize() if heading.isupper() else heading}\n{prose}"
+        if total + 2 + len(block) > _COMPOSED_DESCRIPTION_MAX_CHARS:
+            break
+        blocks.append(block)
+        total += 2 + len(block)
+        served.extend(kept_sets)
+    return "\n\n".join([description, *blocks]) if blocks else description
 
 
 def pick_canonical(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -962,6 +1381,7 @@ def assemble_row(
         seed_data.get("description"),
         seed_data.get("short_description"),
     )
+    description = compose_brand_section_description(canonical, description, enrichment)
 
     image_url = coalesce_first(
         canonical.get("image_url"),
@@ -1319,6 +1739,14 @@ def annotate_served_copy(
     between two refreshes of unchanged rows (review #2423). Rows and their overlays are the same
     for every caller.
 
+    NOR THE BRAND SECTIONS compose_brand_section_description appends from the winner's own seed.
+    Those are per row, so they would not flip between callers; they are left out on purpose. The
+    bar ranks rows by the copy each would serve without them, so a thin row never outranks a
+    sibling that passes because of its page sections -- the sections only lengthen whichever row
+    already won. The gate reads the composed description, so the one place this differs is a winner
+    the bar judged thin that serves once its sections are appended (1 of the 353 keys the sections
+    reached on the 2026-09-29 replay was blocked short_description).
+
     A FAILED overlay read judges every row as if it had no overlay -- the answer a successful read
     gives almost every key -- rather than waving thin rows through: the rebuild then preserves the
     published title/description, and a pick that differed from the successful read's would write
@@ -1488,6 +1916,16 @@ async def build_agent_pdp_view_row(
         if external_seed_id
         else await fetch_external_seed_for_keys(product_keys, db=read_db)
     )
+    # Each row's OWN seed, for compose_brand_section_description. Best-effort: without it the
+    # description is served exactly as before.
+    try:
+        own_seed_copy = await fetch_own_seed_copy_for_keys(product_keys, db=read_db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("agent_pdp_view own-seed copy fetch failed (best-effort): %s", str(exc)[:200])
+        own_seed_copy = {}
+    for product in products:
+        if product.get("product_key") in own_seed_copy:
+            product[_OWN_SEED_COPY] = own_seed_copy[product["product_key"]]
     # BEFORE the first pick_canonical below (evidence_safe_product_keys picks too): every pick in
     # this rebuild must judge each row by what it would serve, overlay included, and all of them
     # must see the same annotated rows. The overlays read here are reused for the enrichment pick.
@@ -1509,6 +1947,29 @@ async def build_agent_pdp_view_row(
     # description_markdown) so it reaches the served PDP AND the
     # serving-eligibility gate. Best-effort; None keeps the raw description.
     enrichment = await _fetch_enrichment_for_canonical(products)
+    # The storefront repetition check for compose_brand_section_description, on the winner only and
+    # only when it has a line to judge. A failed read leaves _SHARED_SECTION_LINES unset, and then
+    # nothing is appended: the check is what keeps store copy out, so it fails closed.
+    if enrichment is not FETCH_FAILED:
+        winner = pick_canonical(products)
+        candidate_lines = brand_section_candidate_lines(winner, enrichment)
+        from services.offer_seller_identity import normalize_host
+
+        seed_host = normalize_host((winner.get(_OWN_SEED_COPY) or {}).get("domain")) or ""
+        if candidate_lines and seed_host:  # no domain: nothing to count against, nothing appended
+            try:
+                winner[_SHARED_SECTION_LINES] = await fetch_shared_section_lines(
+                    seed_host,
+                    candidate_lines,
+                    exclude_product_keys=product_keys,
+                    own_base_title=_product_base_title(winner.get("title")),
+                    db=read_db,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent_pdp_view shared section line check failed; no sections appended: %s",
+                    str(exc)[:200],
+                )
     # W8: attach the outcome-derived seller-trust signal to each offer's merchant.
     # Best-effort — a trust-store hiccup must never block the served PDP, and a
     # merchant with no transacted outcomes simply carries no trust key.
