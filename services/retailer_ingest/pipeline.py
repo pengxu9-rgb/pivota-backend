@@ -486,6 +486,7 @@ def brand_official_domain_review(domain: str, brands: List[str], *, storefront: 
     Returns (flags, evidence): `evidence` says which tier admitted each brand (or what Tier B read
     when none did) and is recorded on the run as checks.brand_official_evidence.
     """
+    from services.catalog_enrichment_agent.apply import brand_official_label
     from services.offer_seller_identity import brand_owns_domain, is_known_retailer
 
     if is_known_retailer(domain):
@@ -500,7 +501,7 @@ def brand_official_domain_review(domain: str, brands: List[str], *, storefront: 
     for brand in brands:
         # The brand's own casefolded spelling, NOT normalize_brand: that strips every non-ASCII
         # letter, so 설화수 and 헤라 would share one key and one acceptance would pass both.
-        label = " ".join(str(brand).split()).casefold()
+        label = brand_official_label(brand)
         if brand_owns_domain(brand, domain):
             evidence["brands"].setdefault(label, {"tier": "A"})
             continue
@@ -509,7 +510,7 @@ def brand_official_domain_review(domain: str, brands: List[str], *, storefront: 
             evidence["brands"].setdefault(label, {"tier": "B", **tier_b})
             continue
         evidence["brands"].setdefault(label, {"tier": None, "tier_b": tier_b})
-        key = f"brand_official_domain_unproven:{domain}:{label}"
+        key = unproven_domain_flag_key(domain, label)
         flags.setdefault(key, {
             "key": key, "rule": "brand_official_domain_unproven", "severity": detectors.BLOCK,
             "detail": f"the domain name of {domain} is not the brand {brand!r}, and its /meta.json does not "
@@ -521,6 +522,39 @@ def brand_official_domain_review(domain: str, brands: List[str], *, storefront: 
                       f"accept this key only if {domain} is {brand}'s own store (its rows become {brand}'s "
                       f"canonical rows)"})
     return list(flags.values()), evidence
+
+
+def unproven_domain_flag_key(domain: str, label: str) -> str:
+    """The key of the flag a human accepts to vouch that `domain` is the store of the brand `label`."""
+    return f"brand_official_domain_unproven:{domain}:{label}"
+
+
+def verified_brand_storefront(job: Dict[str, Any], checks: Optional[Dict[str, Any]]):
+    """The storefront this run PROVED is the brand's own, and for which brands, or None.
+
+    Read from what brand_official_domain_review recorded on this run (checks.brand_official_evidence):
+    a brand is proven when Tier A or Tier B admitted it, or when the job's accepted_flags carry its
+    brand_official_domain_unproven key (a human vouched). A known retailer, a job that is not
+    source_role=brand_official, or evidence for another domain proves nothing. Only a proven brand's
+    rows on this host get 'self' seeds (catalog_enrichment_agent.apply.VerifiedBrandStorefront), which
+    lets trust serve them without a manual live-read promotion (Peng, 2026-09-29)."""
+    from services.catalog_enrichment_agent.apply import VerifiedBrandStorefront, _storefront_host
+
+    o = job.get("options") or {}
+    domain = str(job.get("domain") or "")
+    evidence = (checks or {}).get("brand_official_evidence")
+    if o.get("source_role") != "brand_official" or not domain or not isinstance(evidence, dict):
+        return None
+    if evidence.get("known_retailer") or evidence.get("domain") != domain:
+        return None
+    accepted = set(o.get("accepted_flags") or [])
+    proven = frozenset(
+        label for label, seen in (evidence.get("brands") or {}).items()
+        if (seen or {}).get("tier") in ("A", "B") or unproven_domain_flag_key(domain, label) in accepted
+    )
+    if not proven:
+        return None
+    return VerifiedBrandStorefront(host=_storefront_host(domain), brand_labels=proven)
 
 
 def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -1211,6 +1245,10 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
 
     plan = result["plan"]
     preflight = require_primary_plan(plan)
+    # The storefront this run proved is the brand's own; only its proven brands' seeds become 'self'.
+    verified = verified_brand_storefront(job, result.get("checks"))
+    result["checks"]["verified_storefront"] = (
+        {"host": verified.host, "brands": sorted(verified.brand_labels)} if verified else None)
     wait_s = await _write_lock_wait_s(job, deadline, timings, db=db)
     waiting = time.monotonic()
     try:
@@ -1224,7 +1262,8 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
             result["checks"]["catalog_write"] = ledger.CATALOG_WRITE_STARTED  # kept when the run finishes
             with _timed(timings, "write_s"):
                 counts = await apply_ingest_plan(plan, batch_label=f"retailer_ingest:{job['id']}", db=db,
-                                                 primary_readiness=True, market=job_market(job.get("options")))
+                                                 primary_readiness=True, market=job_market(job.get("options")),
+                                                 verified_storefront=verified)
         report = require_primary_apply(preflight, counts)
     except CatalogWriteLockBusy as busy:
         timings["write_lock_wait_s"] = round(time.monotonic() - waiting, 3)
