@@ -126,6 +126,7 @@ import html
 import ipaddress
 import json
 import logging
+import os
 import re
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation
@@ -136,6 +137,7 @@ import httpx
 
 from utils.money import ZERO_DECIMAL_CURRENCIES
 
+from services import crawl_identity
 from services.crawl_ip_throttle import capture_throttle_headers, is_ip_throttle_signal
 
 from services.outbound_links_service import (
@@ -162,6 +164,17 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
 )
 _HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+
+
+def _own_client_transport() -> dict:
+    """`transport=` for the client `preflight` builds itself when none is passed: signed (Web Bot
+    Auth) when this process signs -- the transport then also sets the declared PivotaBot UA -- else
+    `{}`, today's call exactly. The process HTTPS proxy is honoured explicitly, because passing a
+    transport switches off httpx's environment-proxy lookup."""
+    if crawl_identity.status() != "signed":
+        return {}
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
+    return crawl_identity.transport_kwargs(httpx.AsyncHTTPTransport(proxy=proxy))
 
 _CHECKOUT_PATH = re.compile(r"^/checkouts/(?:cn|c|co)/")
 _NOT_ACCEPTING_TEXT = "set up to receive orders"
@@ -1238,7 +1251,7 @@ async def preflight(
                 host, market, variant_id, product_handle, quantity, buyer, click_id, client, expected
             )
         else:
-            async with httpx.AsyncClient(headers=_HEADERS, timeout=REQUEST_TIMEOUT_S) as own:
+            async with httpx.AsyncClient(headers=_HEADERS, timeout=REQUEST_TIMEOUT_S, **_own_client_transport()) as own:
                 result = await _preflight(
                     host, market, variant_id, product_handle, quantity, buyer, click_id, own, expected
                 )

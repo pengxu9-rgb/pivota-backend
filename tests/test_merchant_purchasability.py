@@ -3266,3 +3266,40 @@ async def test_the_window_is_measured_on_the_request_clock(_db, _population, _ar
     report = await sweep.run_merchant_purchasability_sweep()
     assert report.ip_throttled == int(trips)
     assert len(seen) == (3 if trips else len(domains))
+
+
+async def test_web_bot_auth_signs_the_direct_vantage_and_leaves_the_proxy_vantage_a_buyer(_db, monkeypatch, _population):
+    """CRAWL_WEB_BOT_AUTH_ENABLED + key: a real sweep run. Requests from the crawl egress (direct
+    vantage) are signed and declare PivotaBot; the proxy vantage, which stands in for a buyer's network
+    and leaves from an unregistered address, stays unsigned with the lane's own User-Agent."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from services import crawl_identity
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    monkeypatch.setenv("VANTAGE_PROXY_URL", "http://vantage-proxy.example:3128")
+    monkeypatch.setenv(crawl_identity.FLAG_ENV, "true")
+    monkeypatch.setenv(crawl_identity.KEY_ENV, Ed25519PrivateKey.generate().private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode())
+    crawl_identity.reset_for_tests()
+    seen = []
+
+    def _transport(*a, proxy=None, **k):
+        return httpx.MockTransport(lambda r: seen.append((proxy, r)) or httpx.Response(200, text="ok"))
+
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", _transport)
+
+    async def _two_requests(host, **kwargs):
+        for path in ("/cart/1:1", "/checkouts/cn/T"):
+            await kwargs["client"].get(f"https://{host}{path}")
+        return res("ELIGIBLE", card=True, host=host)
+
+    monkeypatch.setattr(sweep, "_preflight", _two_requests)
+    await sweep.run_merchant_purchasability_sweep()
+    direct = [r for proxy, r in seen if proxy is None]
+    via_proxy = [r for proxy, r in seen if proxy]
+    assert direct and via_proxy
+    assert all(r.headers["user-agent"] == crawl_identity.DECLARED_USER_AGENT and "signature" in r.headers for r in direct)
+    assert all(r.headers["user-agent"] == sweep.USER_AGENT and "signature" not in r.headers for r in via_proxy)
+    crawl_identity.reset_for_tests()

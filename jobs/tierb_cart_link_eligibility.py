@@ -84,7 +84,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequ
 import httpx
 
 from db.tierb_cart_link_eligibility import DEFINITE_VERDICTS
-from services import shopify_edge_pacer
+from services import crawl_identity, shopify_edge_pacer
 from services.outbound_links_service import redact_cart_permalink
 from services.shopify_cart_link_preflight import (
     REQUEST_TIMEOUT_S,
@@ -254,7 +254,9 @@ def _default_inner_transport() -> httpx.AsyncBaseTransport:
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
     if proxy:
         logger.info("tierb eligibility: using the process HTTPS proxy")
-    return httpx.AsyncHTTPTransport(proxy=proxy)
+    # Signed (Web Bot Auth) INNERMOST, under PacedTransport: the signature is made when the request
+    # leaves, after any pacing wait, so a long wait cannot lapse its 60 s `expires`. Flag off: as before.
+    return crawl_identity.crawl_transport(httpx.AsyncHTTPTransport(proxy=proxy))
 
 
 # ── one merchant ────────────────────────────────────────────────────────────────────────────

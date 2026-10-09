@@ -194,7 +194,7 @@ from db.enrichment_cart_variant_proofs import OUTCOME_OK, PROOF_SOURCES, TABLE  
 from db.reap_agentic_ledger import amount_minor_or_none  # noqa: E402
 # The map the purchase lane prices with. One map, so the proof's currency and the lane's agree.
 from routes.agent_commerce_reap import _MARKET_CURRENCY  # noqa: E402
-from services import crawl_politeness, shopify_edge_pacer  # noqa: E402
+from services import crawl_identity, crawl_politeness, shopify_edge_pacer  # noqa: E402
 from services.curated_brand_feed import _same_storefront_host  # noqa: E402
 from services.reap_enrichment_cart_proof import (  # noqa: E402
     ENRICHMENT_SOURCE_SYSTEM,
@@ -688,7 +688,7 @@ async def fetch_json(client: Any, url: str, *, requested_host: str, pacer: Pacer
         # host still shares its backoff, because every answer is noted for both (below).
         await pacer.wait()
         try:
-            await crawl_politeness.before_request(polite_urls[0], user_agent=USER_AGENT,
+            await crawl_politeness.before_request(polite_urls[0], user_agent=crawl_identity.robots_user_agent(USER_AGENT),
                                                   max_wait=max_polite_wait_s())
         except crawl_politeness.RobotsDisallowed:
             return Fetched(outcome="robots_disallowed")
