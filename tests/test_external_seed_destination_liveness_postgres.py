@@ -377,6 +377,47 @@ async def test_the_sweep_queue_puts_never_verified_rows_first(_db):
 
 
 @pytest.mark.asyncio
+async def test_the_sweep_queue_puts_a_dead_verdict_ahead_of_an_older_live_one(_db):
+    """Only the sweep can corroborate a 404, and the refresh re-stamps the clock of the very
+    seeds it found dead — so a clock-only queue put them last. A dead seed checked an hour ago
+    must still come before a live seed nobody has looked at in a month, and before a
+    never-verified one."""
+    from services import external_seed_destination_liveness as liveness
+
+    await _seed(_db, "eps_live_old", destination_checked_at=NOW - timedelta(days=30),
+                destination_verdict="live")
+    await _seed(_db, "eps_never", destination_checked_at=None)
+    await _seed(_db, "eps_dead_recent", destination_checked_at=NOW - timedelta(hours=1),
+                destination_verdict="dead_404", destination_http_status=404)
+    await _seed(_db, "eps_off_older", destination_checked_at=NOW - timedelta(days=2),
+                destination_verdict="redirected_off_product", destination_failure_streak=1)
+    await _seed(_db, "eps_renamed", destination_checked_at=NOW - timedelta(days=40),
+                destination_verdict="redirected_to_product")
+
+    candidates = await liveness.get_sweep_candidates(10)
+    assert [c["id"] for c in candidates] == [
+        # every confirmed-dead verdict, oldest answer first ...
+        "eps_off_older", "eps_dead_recent",
+        # ... then the clock exactly as before (a rename is not a failure)
+        "eps_never", "eps_renamed", "eps_live_old",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_dead_first_queue_still_respects_the_limit_and_skips_retired_seeds(_db):
+    from services import external_seed_destination_liveness as liveness
+
+    await _seed(_db, "eps_dead_retired", status="inactive", destination_verdict="dead_404",
+                destination_checked_at=NOW - timedelta(days=5))
+    await _seed(_db, "eps_dead", destination_verdict="dead_404",
+                destination_checked_at=NOW - timedelta(hours=2))
+    await _seed(_db, "eps_never", destination_checked_at=None)
+
+    candidates = await liveness.get_sweep_candidates(1)
+    assert [c["id"] for c in candidates] == ["eps_dead"]
+
+
+@pytest.mark.asyncio
 async def test_the_sweep_queue_skips_retired_seeds(_db):
     from services import external_seed_destination_liveness as liveness
 
