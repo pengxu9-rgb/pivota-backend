@@ -36,7 +36,8 @@ async def db():
     try:
         await conn.execute(f"DROP SCHEMA IF EXISTS {_SCHEMA} CASCADE; CREATE SCHEMA {_SCHEMA};")
         await conn.execute(f"""
-            CREATE TABLE {_SCHEMA}.catalog_products (product_key TEXT PRIMARY KEY, pdp_lifecycle_stage TEXT);
+            CREATE TABLE {_SCHEMA}.catalog_products (product_key TEXT PRIMARY KEY, pdp_lifecycle_stage TEXT,
+                                                      suppression_reason TEXT, suppression_metadata JSONB);
             CREATE TABLE {_SCHEMA}.catalog_row_trust (
                 subject_type TEXT NOT NULL CHECK (subject_type IN ('product','offer','listing','content_key')),
                 subject_key TEXT NOT NULL, product_key TEXT NULL, serving_decision TEXT NOT NULL,
@@ -112,3 +113,18 @@ async def test_the_post_retire_trust_check_reads_only_the_product_s_own_public_r
     rows = await db.fetch_all(tool.PUBLIC_TRUST_SQL,
                               {"keys": ["k_public", "k_blocked", "k_offer_only", "k_none", "k_absent"]})
     assert [r["subject_key"] for r in rows] == ["k_public"]
+
+
+async def test_still_retired_reads_only_this_run_s_tombstone(db):
+    """STILL_RETIRED_SQL (refresh-trust's set of keys that must end non-public): this run's reason AND run id.
+    A key reverted, re-retired by another run, or tombstoned for another reason is not this run's."""
+    rows = [("k_ours", tool.REASON, '{"run_id": "retire_t"}'),
+            ("k_reverted", None, None),
+            ("k_other_run", tool.REASON, '{"run_id": "retire_other"}'),
+            ("k_other_reason", "step5_test_rig_retirement", '{"run_id": "retire_t"}')]
+    for key, reason, meta in rows:
+        await db.execute("INSERT INTO catalog_products (product_key, suppression_reason, suppression_metadata) "
+                         "VALUES (:k, :r, CAST(:m AS jsonb))", {"k": key, "r": reason, "m": meta})
+    got = await db.fetch_all(tool.STILL_RETIRED_SQL, {"keys": [r[0] for r in rows] + ["k_absent"],
+                                                      "reason": tool.REASON, "run_id": "retire_t"})
+    assert [r["product_key"] for r in got] == ["k_ours"]

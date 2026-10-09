@@ -8,6 +8,7 @@ discovery, entity feed and sitemap (all gated on serving_decision = 'public') ke
 These run the REAL write_retire / revert_manifest against an in-memory stand-in for the three tables they
 write; only the trust upserter is replaced, by a recorder of the keys it is asked for.
 """
+import json
 import logging
 
 import pytest
@@ -34,7 +35,7 @@ class RetireDB:
     """catalog_products by product_key, the trust rows' decisions, and a log of transaction events."""
 
     def __init__(self, rows, public=(), stuck=()):
-        self.rows = {k: {"product_key": k, "suppression_reason": None} for k in rows}
+        self.rows = {k: {"product_key": k, "suppression_reason": None, "run_id": None} for k in rows}
         self.public = set(public)       # product keys whose trust row reads 'public'
         self.stuck = set(stuck)         # keys the tombstone UPDATE does not land on
         self.events = []
@@ -49,12 +50,17 @@ class RetireDB:
         for k in values["keys"]:
             if k in self.rows and k not in self.stuck and not self.rows[k]["suppression_reason"]:
                 self.rows[k]["suppression_reason"] = values["reason"]
+                self.rows[k]["run_id"] = json.loads(values["metadata"]).get("run_id")
 
     async def fetch_all(self, sql, values):
         if sql == tool.DEACTIVATE_SEEDS_SQL:
             return [{"id": "s0"}]
         if sql == tool.LIVE_ROWS_SQL:
             return [dict(self.rows[k]) for k in values["keys"] if k in self.rows]
+        if sql == tool.STILL_RETIRED_SQL:
+            return [{"product_key": k} for k in values["keys"] if k in self.rows
+                    and self.rows[k]["suppression_reason"] == values["reason"]
+                    and self.rows[k]["run_id"] == values["run_id"]]
         if sql == tool.PUBLIC_TRUST_SQL:
             return [{"subject_key": k} for k in values["keys"] if k in self.public]
         raise AssertionError(f"unexpected SQL: {sql[:80]}")
@@ -86,7 +92,7 @@ def trust(monkeypatch):
 
 
 def _prepared(keys):
-    return {"run_id": "retire_t", "keys": list(keys), "metadata": "{}"}
+    return {"run_id": "retire_t", "keys": list(keys), "metadata": json.dumps({"run_id": "retire_t"})}
 
 
 async def test_a_retire_refreshes_trust_for_exactly_its_keys_after_the_commit(monkeypatch, trust):
@@ -202,6 +208,16 @@ async def test_a_revert_refreshes_trust_for_exactly_the_rows_it_restored(monkeyp
     assert db.events == ["begin", "commit"]  # the refresh ran after it (trust.db unset: not logged here)
 
 
+async def test_the_revert_says_to_refresh_trust_again_after_the_offer_revert(monkeypatch, trust, capsys):
+    """Review of #2542 (P2-a): the revert's own refresh runs while the rows' offers are still suppressed, so it
+    computes them blocked (no priced offer). The operator must re-run the refresh after revert_offer_suppression."""
+    monkeypatch.setattr(tool, "database", RevertDB(ours={"k_ours"}))
+    await tool.revert_manifest(_manifest(["k_ours"]))
+    out = capsys.readouterr().out
+    assert "revert_offer_suppression; until it runs the restored rows' trust stays blocked" in out
+    assert "After it, re-run `retire_superseded_brand_keys.py refresh-trust` for run retire_t" in out
+
+
 async def test_a_revert_that_restored_nothing_refreshes_nothing(monkeypatch, trust):
     monkeypatch.setattr(tool, "database", RevertDB(ours=()))
     await tool.revert_manifest(_manifest(["k_again"]))
@@ -223,10 +239,56 @@ async def test_refresh_trust_re_runs_the_manifest_s_keys_only(monkeypatch, trust
     assert trust.calls == [["k0", "k1"]] and out == {"trust": 2}
 
 
+async def _retired_then(monkeypatch, trust, *, public):
+    """old0..old2 retired by run retire_t; their trust rows read `public` (the refresh never landed)."""
+    db = RetireDB(["old0", "old1", "old2", "other"], public=public)
+    monkeypatch.setattr(tool, "database", db)
+    await tool.write_retire(_prepared(["old0", "old1", "old2"]))
+    trust.calls.clear()
+    return db
+
+
+async def test_refresh_trust_fails_on_a_key_still_retired_by_the_run_and_still_public(monkeypatch, trust, capsys):
+    """Review of #2542 (P2-b): the re-run must not report success while this run's tombstones still read public."""
+    await _retired_then(monkeypatch, trust, public={"old0", "old1"})
+    out = await tool.refresh_trust_for_manifest(_manifest(["old0", "old1", "old2"]))
+    assert out["trust_problems"] == ["2 retired key(s) still public: ['old0', 'old1']"]
+    io = capsys.readouterr()
+    assert "catalog_row_trust refresh FAILED after refresh-trust retire_t" in io.err
+    assert "trust refresh FAILED for run retire_t (3 of 3 key(s) still retired by it)" in io.out
+
+
+async def test_refresh_trust_checks_only_the_keys_this_run_still_retires(monkeypatch, trust):
+    """Refusing side: a key since restored (by the revert) and a key re-retired by ANOTHER run may be public or
+    not -- neither is this run's tombstone, so neither is flagged."""
+    # old2 is still this run's tombstone and reads non-public. old0 was reverted and old1 re-retired by another
+    # run; both still read public, and neither is this run's to answer for.
+    db = await _retired_then(monkeypatch, trust, public={"old0", "old1"})
+    db.rows["old0"].update(suppression_reason=None, run_id=None)
+    db.rows["old1"].update(run_id="retire_other")
+    out = await tool.refresh_trust_for_manifest(_manifest(["old0", "old1", "old2"]))
+    assert trust.calls == [["old0", "old1", "old2"]]
+    assert "trust_problems" not in out
+
+
+@pytest.mark.parametrize("public, code", [(set(), 0), ({"old0"}, 1)])
+def test_the_cli_refresh_trust_exits_nonzero_while_a_retired_key_is_public(monkeypatch, trust, tmp_path, public,
+                                                                          code):
+    async def noop():
+        return None
+    db = RetireDB(["old0"], public=public)
+    db.rows["old0"].update(suppression_reason=tool.REASON, run_id="retire_t")
+    path = tmp_path / "m.json"
+    path.write_text(json.dumps(_manifest(["old0"])))
+    monkeypatch.setattr(tool, "database", db)
+    monkeypatch.setattr(tool.database, "connect", noop, raising=False)
+    monkeypatch.setattr(tool.database, "disconnect", noop, raising=False)
+    assert tool.main(["refresh-trust", "--manifest", str(path)]) == code
+    assert trust.calls == [["old0"]]
+
+
 @pytest.mark.parametrize("wrote, code", [(None, 0), (1, 1)])
 def test_the_cli_refresh_trust_exits_nonzero_on_a_shortfall(monkeypatch, trust, tmp_path, wrote, code):
-    import json
-
     async def noop():
         return None
     path = tmp_path / "m.json"

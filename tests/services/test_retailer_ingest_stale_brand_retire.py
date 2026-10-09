@@ -577,3 +577,5 @@ def test_a_failed_readback_names_the_offer_revert_too():
          "readback": {"problems": ["new key not live: new1"]}}
     line = pipeline._retire_reason(r)
     assert "revert --ingest-run" in line and "revert_offer_suppression" in line
+    # Review of #2542 (P2-a): the trust refresh comes last, after the offers are back.
+    assert line.index("revert_offer_suppression") < line.index("refresh-trust --ingest-run")

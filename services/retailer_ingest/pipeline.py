@@ -1448,7 +1448,9 @@ def _retire_reason(r: Dict[str, Any]) -> str:
         return (f"{head}retired {r['counts']['products']} key(s) ({r['retire_run_id']}) but the read-back "
                 f"disagrees: {r['readback']['problems'][:3]}; revert with retire_superseded_brand_keys revert "
                 f"--ingest-run <this run>, THEN services.catalog_offer_suppression.revert_offer_suppression("
-                f"<the manifest's product_keys>) -- restored rows have no live offers until it runs")
+                f"<the manifest's product_keys>) -- restored rows have no live offers until it runs -- THEN "
+                f"retire_superseded_brand_keys refresh-trust --ingest-run <this run>, or their trust stays blocked "
+                f"until the trust backfill cron")
     return f"{head}retire FAILED, nothing retired: {r.get('error')}"
 
 
