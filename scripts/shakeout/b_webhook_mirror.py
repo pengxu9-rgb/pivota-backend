@@ -159,7 +159,7 @@ def main() -> int:
     print(f"  base_url       : {base_url}")
     print(f"  merchant       : {SHAKEOUT_MERCHANT_ID}")
     print(f"  customer       : {SHAKEOUT_CUSTOMER_ID}")
-    print(f"  webhook secret : whsec_***{secret[-4:]}")
+    print(f"  webhook secret : sha256:{hashlib.sha256(secret.encode()).hexdigest()[:8]}")
     print("=" * 78)
 
     all_ok = True
