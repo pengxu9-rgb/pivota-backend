@@ -33,6 +33,7 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from middleware.rate_limiter import RateLimitMiddleware, _positive_int
+from tests._rate_limit_clock import freeze_rate_limiter_clock
 
 _GLOBAL_CAP = 5
 _PER_IP_CAP = 3
@@ -47,6 +48,9 @@ def _app(
     trusted: str | None = None,
     admin_key: str | None = None,
 ) -> FastAPI:
+    # Fixed windows on the wall clock: a burst that straddles a boundary restarts the
+    # count mid-assertion (tests/_rate_limit_clock.py).
+    freeze_rate_limiter_clock(monkeypatch)
     monkeypatch.setenv("ANON_RATE_LIMIT_ENABLED", enabled)
     monkeypatch.setenv("ANON_RATE_LIMIT_GLOBAL_RPM", str(global_rpm))
     monkeypatch.setenv("ANON_RATE_LIMIT_PER_IP_RPM", str(per_ip_rpm))
