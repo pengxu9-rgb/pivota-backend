@@ -126,6 +126,7 @@ import html
 import ipaddress
 import json
 import logging
+import os
 import re
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation
@@ -135,6 +136,9 @@ from urllib.parse import quote, unquote_plus, urljoin, urlparse, urlunparse
 import httpx
 
 from utils.money import ZERO_DECIMAL_CURRENCIES
+
+from services import crawl_identity
+from services.crawl_ip_throttle import capture_throttle_headers, is_ip_throttle_signal
 
 from services.outbound_links_service import (
     CartPrefill,
@@ -160,6 +164,17 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
 )
 _HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+
+
+def _own_client_transport() -> dict:
+    """`transport=` for the client `preflight` builds itself when none is passed: signed (Web Bot
+    Auth) when this process signs -- the transport then also sets the declared PivotaBot UA -- else
+    `{}`, today's call exactly. The process HTTPS proxy is honoured explicitly, because passing a
+    transport switches off httpx's environment-proxy lookup."""
+    if crawl_identity.status() != "signed":
+        return {}
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
+    return crawl_identity.transport_kwargs(httpx.AsyncHTTPTransport(proxy=proxy))
 
 _CHECKOUT_PATH = re.compile(r"^/checkouts/(?:cn|c|co)/")
 _NOT_ACCEPTING_TEXT = "set up to receive orders"
@@ -200,7 +215,10 @@ class Verdict(str, enum.Enum):
     # A checkout with our line and click id, but in another market than the buyer's (or one
     # whose market cannot be read off the page). Definite: not eligible.
     CHECKOUT_MARKET_MISMATCH = "CHECKOUT_MARKET_MISMATCH"
-    # Connect error, timeout, proxy flake. RETRYABLE, and never proof of ineligibility.
+    # Connect error, timeout, proxy flake. RETRYABLE, and never proof of ineligibility. ALSO an
+    # edge THROTTLE (`PreflightResult.throttled`): a 429, a 503 with Retry-After, or a Cloudflare
+    # `cf-mitigated` challenge, on any request of the preflight -- bar a challenged checkout,
+    # which stays BLOCKED_UNKNOWN. See `throttle_signal`.
     TRANSPORT_ERROR = "TRANSPORT_ERROR"
     # The caller's arguments were refused before any request was made.
     INVALID_INPUT = "INVALID_INPUT"
@@ -257,6 +275,14 @@ class PreflightResult:
     landed_currency: Optional[str] = None
     # landed - expected, exact minor units. None when either side is unknown; 0 means parity.
     price_drift_minor: Optional[int] = None
+    # The edge THROTTLED us (see `throttle_signal`), so the store said nothing about itself.
+    # retryable=True, verdict TRANSPORT_ERROR -- except a challenge at the permalink stage, which
+    # keeps its old BLOCKED_UNKNOWN (see `_preflight`). `detail` names the stage and the signal
+    # (`resolve:throttled_429`, `permalink:throttled_challenge_403`). A login / password wall
+    # reached before the throttle is classified as the wall, never as a throttle. A caller that runs a batch
+    # from one egress IP should treat a run of these as the ADDRESS being throttled, not the
+    # merchants (jobs/merchant_purchasability_sweep.py).
+    throttled: bool = False
     shipping_verified: bool = field(default=False, init=False)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -347,6 +373,51 @@ class _TransportFailure(Exception):
         super().__init__(type(exc).__name__)
         self.kind = type(exc).__name__
         self.chain = chain
+
+
+class _Throttled(Exception):
+    """The edge throttled a request (`throttle_signal`). Raised out of `_fetch_following` so that
+    EVERY stage -- the handle read, each catalog page, the permalink and its hops -- reports it the
+    same way, instead of each stage reading the status as something about the store."""
+
+    def __init__(self, signal: str, status: int, chain: List[Hop]):
+        super().__init__(signal)
+        self.signal = signal
+        self.status = status
+        self.chain = chain
+
+
+def throttle_signal(status_code: int, headers: Any) -> Optional[str]:
+    """`"429"`, `"503"` or `"challenge_<status>"` when this response is the edge throttling the
+    REQUESTER rather than the store answering about itself; None otherwise.
+
+    WHY A THROTTLE IS NOT A STATEMENT ABOUT THE STORE. On 2026-10-07 the hourly purchasability
+    sweep read `products_json_page_1_status_429` from 17-20 of its 20 unrelated Shopify stores
+    every hour (flowerknows.co, dermalogica.com, essenherb.us, easydew.us ...): Shopify's shared
+    edge throttling our one crawl-egress IP, the 2026-09-30 signature. Each one was recorded
+    VARIANT_UNVERIFIED with retryable=False, i.e. "this store would not let us confirm a variant,
+    and asking again will not help" -- both halves wrong.
+
+    THE SIGNALS, and only these:
+      * 429, or 503 WITH a Retry-After: `crawl_ip_throttle.is_ip_throttle_signal`, the one rule
+        every crawl lane's IP breaker counts by. A bare 503 is an outage, not a throttle, and
+        keeps the verdict it had.
+      * a `cf-mitigated` header, on any status: Cloudflare (which fronts Shopify) sends it only
+        on a response it MITIGATED -- a challenge page instead of the store's answer. A
+        challenged catalog page was VARIANT_UNVERIFIED and is now TRANSPORT_ERROR; a challenged
+        checkout keeps BLOCKED_UNKNOWN (see `_preflight`); both are now retryable and
+        `throttled`. A plain 403 with no such header is NOT a throttle: it may be the store
+        (luafee's "not set up to receive orders" is a 403), and keeps the classification it had.
+
+    A signal on a hop AFTER a login / password wall is not a throttle either: see
+    `_fetch_following`.
+    """
+    diag = capture_throttle_headers(headers)
+    if diag.get("cf-mitigated"):
+        return f"challenge_{int(status_code)}"
+    if is_ip_throttle_signal(int(status_code), diag):
+        return str(int(status_code))
+    return None
 
 
 class _HopRefused(Exception):
@@ -456,8 +527,17 @@ async def _fetch_following(
         try:
             chain.append((response.status_code, redact_cart_permalink(str(response.url))))
             logger.debug("cart-link preflight hop %s %s", response.status_code, chain[-1][1])
+            # Before the redirect test, so that no hop the edge throttled is ever followed.
+            signal = throttle_signal(response.status_code, response.headers)
+            # A WALL STILL WINS. Being sent to a login or a password page is the STORE answering
+            # (its redirect put us there), and `classify_landing` / `_landing_wall` read it off the
+            # chain whatever the last hop's status: shopify.com/authentication answering us with a
+            # 429 or a challenge must stay LOGIN_REQUIRED, a confirmed negative, never a throttle.
+            # So a throttled wall hop is returned as the landing and classified as before.
+            if signal and not _chain_reached_a_wall(chain):
+                raise _Throttled(signal, response.status_code, chain)
             location = response.headers.get("location")
-            if response.status_code in _REDIRECT_STATUSES and location:
+            if not signal and response.status_code in _REDIRECT_STATUSES and location:
                 current = urljoin(str(response.url), location)
                 continue
             body = await _read_bounded(response)
@@ -471,6 +551,15 @@ async def _fetch_following(
 
 
 # --- classification --------------------------------------------------------------------------
+
+
+def _chain_reached_a_wall(chain: List[Hop]) -> bool:
+    """Did the chain reach a login hop, or end on a password page? The two walls `_landing_wall`
+    and `classify_landing` read off the chain; see `_fetch_following` for why a throttle on one is
+    not a throttle."""
+    if any(_is_login_hop(url) for _, url in chain):
+        return True
+    return bool(chain) and urlparse(chain[-1][1]).path.startswith("/password")
 
 
 def _is_login_hop(redacted_url: str) -> bool:
@@ -1150,7 +1239,8 @@ async def preflight(
 
     Only for hosts on Pivota's internal merchant list — see the module docstring. Creates one
     abandoned checkout per call that reaches the permalink step. Never raises for a network
-    outcome: transport failures come back as TRANSPORT_ERROR with retryable=True.
+    outcome: transport failures come back as TRANSPORT_ERROR with retryable=True, and so does an
+    edge throttle on any request, with `throttled=True` (see `throttle_signal`).
     `shipping_verified` is always False.
     """
     token = _PREFLIGHT_ACTIVE.set(True)
@@ -1161,7 +1251,7 @@ async def preflight(
                 host, market, variant_id, product_handle, quantity, buyer, click_id, client, expected
             )
         else:
-            async with httpx.AsyncClient(headers=_HEADERS, timeout=REQUEST_TIMEOUT_S) as own:
+            async with httpx.AsyncClient(headers=_HEADERS, timeout=REQUEST_TIMEOUT_S, **_own_client_transport()) as own:
                 result = await _preflight(
                     host, market, variant_id, product_handle, quantity, buyer, click_id, own, expected
                 )
@@ -1203,6 +1293,13 @@ async def _preflight(
             host=host, verdict=Verdict.UNCLASSIFIED, resolve_chain=tuple(exc.chain),
             detail=f"resolve:{exc.reason}",
         ))
+    except _Throttled as exc:
+        # No permalink was followed, so no checkout was created: the throttle stopped us first.
+        return _done(PreflightResult(
+            host=host, verdict=Verdict.TRANSPORT_ERROR, retryable=True, throttled=True,
+            variant_id=named, resolve_chain=tuple(exc.chain), final_status=exc.status,
+            detail=f"resolve:throttled_{exc.signal}",
+        ))
     resolve_chain = tuple(resolution.chain)
     chosen = resolution.chosen
     if chosen is None:
@@ -1238,6 +1335,19 @@ async def _preflight(
     except _HopRefused as exc:
         return _done(PreflightResult(
             verdict=Verdict.UNCLASSIFIED, chain=tuple(exc.chain), detail=f"permalink:{exc.reason}", **known,
+        ))
+    except _Throttled as exc:
+        # A CHALLENGED CHECKOUT KEEPS THE VERDICT IT ALWAYS HAD, BLOCKED_UNKNOWN: unverifiable for
+        # the purchasability facts (never a negative there), but DEFINITE in the Tier B lane
+        # (db/tierb_cart_link_eligibility.py), where it takes a store off the cart-link rail. A
+        # checkout that challenges an automated client is one Reap's automated checkout may meet
+        # too, so that lane stays fail-closed. `throttled` and the detail still say what it was,
+        # and the sweep's breaker counts it either way (it reads the response, not the verdict).
+        challenged = exc.signal.startswith("challenge")
+        return _done(PreflightResult(
+            verdict=Verdict.BLOCKED_UNKNOWN if challenged else Verdict.TRANSPORT_ERROR,
+            retryable=True, throttled=True, chain=tuple(exc.chain),
+            final_status=exc.status, detail=f"permalink:throttled_{exc.signal}", **known,
         ))
 
     final_url = landing.chain[-1][1] if landing.chain else None

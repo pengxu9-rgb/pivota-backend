@@ -86,6 +86,7 @@ from services.payment_offer_evidence_service import (
 )
 from services.savings_presentation_service import build_savings_presentation
 from services.query_semantic_class import classify_query_semantic_class
+from services.canonical_search_query import normalize_catalog_query
 from services.quote_service import QuoteService
 
 
@@ -910,7 +911,8 @@ def _canonical_match_reason(row: Dict[str, Any], query: str) -> Dict[str, Any]:
     # rank_score when the lane emits no split (e.g. the citable lane, which has no
     # structural boost, so its rank_score is already ~text).
     score_for_candidate = raw_rank_score
-    if _recall_relevance_v2_enabled() and row.get("text_score") is not None:
+    relevance_first = _recall_relevance_v2_enabled() or bool(row.get("relevance_first"))
+    if relevance_first and row.get("text_score") is not None:
         score_for_candidate = row.get("text_score")
     try:
         normalized_candidate_score = round(
@@ -938,6 +940,7 @@ def _canonical_match_reason(row: Dict[str, Any], query: str) -> Dict[str, Any]:
         # Structural/scope quality, kept separate from relevance. _sort_items uses
         # it only as a SECONDARY tie-break when v2 is on (0 / ignored otherwise).
         "structure_score": structure_score,
+        "relevance_first": relevance_first,
         "source_boost": 0.0,
         "quality_penalties_total": 0.0,
         "price_tie_break": row.get("estimated_best_price") or row.get("merchant_effective_price") or row.get("list_price"),
@@ -968,7 +971,23 @@ async def _fetch_canonical_search_rows(
     limit: int,
     require_signature: bool = False,
     brand_anchor_terms: Optional[List[str]] = None,
+    merchant_ids: Optional[List[str]] = None,
+    price_min: Optional[Decimal] = None,
+    price_max: Optional[Decimal] = None,
+    price_currency: Optional[str] = None,
+    price_min_exclusive: bool = False,
+    price_max_exclusive: bool = False,
 ) -> List[Dict[str, Any]]:
+    # The direct canonical query endpoint shares the same category inflection
+    # rule as find_products_multi. Do not alter brands or unknown descriptors.
+    if require_signature:
+        query = normalize_catalog_query(query)
+    # Canonical shopping scopes supply by offer seller. Keep the historical
+    # product-owner scope only for non-canonical callers, including its gates.
+    seller_ids = ([merchant_id] if merchant_id else (merchant_ids or [])) if require_signature else []
+    seller_ids = list(dict.fromkeys(str(value).strip() for value in seller_ids if str(value or "").strip()))[:50]
+    if require_signature:
+        merchant_id = None
     lowered = _normalize_query(query)
     if not lowered:
         return []
@@ -990,6 +1009,62 @@ async def _fetch_canonical_search_rows(
         "row_limit": row_limit,
         "per_product_sku_cap": RECALL_MAX_SKUS_PER_PRODUCT,
     }
+    has_budget = require_signature and (price_min is not None or price_max is not None)
+    if has_budget:
+        price_currency = str(price_currency or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", price_currency):
+            return []
+        params["canonical_budget_currency"] = price_currency
+        for name, value in (("canonical_budget_min", price_min), ("canonical_budget_max", price_max)):
+            if value is not None:
+                parsed = _to_decimal(value)
+                if parsed is None or not parsed.is_finite() or parsed < 0:
+                    return []
+                params[name] = str(parsed)
+    for index, seller_id in enumerate(seller_ids):
+        params[f"canonical_seller_{index}"] = seller_id
+
+    def eligible_offer_predicate(alias: str) -> str:
+        clauses = []
+        if seller_ids:
+            placeholders = ", ".join(f":canonical_seller_{index}" for index in range(len(seller_ids)))
+            clauses.append(f"{alias}.merchant_id IN ({placeholders})")
+        if has_budget:
+            # Mirror _pivot_price_value's selected own-offer amount. Zero is
+            # falsey there, hence NULLIF before the fallback. Currency and the
+            # bound must apply to this same offer, never another seller's price.
+            money = f"COALESCE(NULLIF(CAST({alias}.estimated_best_price AS NUMERIC), 0), NULLIF(CAST({alias}.merchant_effective_price AS NUMERIC), 0), CAST({alias}.list_price AS NUMERIC))"
+            numeric = f"CAST({money} AS NUMERIC)"
+            for field in ("estimated_best_price", "merchant_effective_price", "list_price", "price_confidence"):
+                clauses.append(
+                    f"({alias}.{field} IS NULL OR LOWER(CAST({alias}.{field} AS TEXT)) NOT IN ('nan', 'infinity', '-infinity', '+infinity', 'inf', '-inf', '+inf'))"
+                )
+            clauses.extend([
+                f"{numeric} > 0",
+                f"UPPER(TRIM({alias}.currency)) = :canonical_budget_currency",
+            ])
+            if price_min is not None:
+                clauses.append(f"{numeric} {'>' if price_min_exclusive else '>='} CAST(:canonical_budget_min AS NUMERIC)")
+            if price_max is not None:
+                clauses.append(f"{numeric} {'<' if price_max_exclusive else '<='} CAST(:canonical_budget_max AS NUMERIC)")
+        return " AND ".join(clauses)
+
+    eligible_offer = eligible_offer_predicate("qo")
+    offer_eligibility_clause = ""
+    if eligible_offer:
+        # Gate before both candidate limits, then repeat at projection. A price
+        # or seller filter only on the final page can never recover eligible
+        # rows that 200 unrelated/over-budget candidates already displaced.
+        offer_eligibility_clause = f"""
+            AND EXISTS (
+                SELECT 1 FROM catalog_offers qo
+                LEFT JOIN catalog_merchants qm ON qm.merchant_id = qo.merchant_id
+                WHERE qo.sku_key = s.sku_key AND qo.suppressed_at IS NULL
+                  AND lower(COALESCE(qm.status, 'active')) <> 'inactive'
+                  AND COALESCE(qm.indexable, TRUE) IS TRUE
+                  AND {eligible_offer}
+            )
+        """
     merchant_clause = ""
     if merchant_id:
         merchant_clause = "AND p.merchant_id = :merchant_id"
@@ -1101,6 +1176,8 @@ async def _fetch_canonical_search_rows(
             "WHERE lower(COALESCE(bm.status, 'active')) <> 'inactive' "
             "AND COALESCE(bm.indexable, TRUE) IS TRUE"
         )
+    if eligible_offer:
+        offer_seller_where += " AND " + eligible_offer_predicate("o")
 
     # H3 (#1648) — the recall CTE joins catalog_skus and ignores its suppression
     # columns. No live gap today (38 suppressed skus on prod, 0 of them under an
@@ -1398,6 +1475,20 @@ async def _fetch_canonical_search_rows(
             token_where = f"\n                OR (({_overlap_expr}) >= :cctok_min)\n"
             token_score = f"\n                    + (({_overlap_expr}) * 25)\n"
 
+    # Canonical shopping picks its candidates by RELEVANCE first: what the row's
+    # text says (exact + partial title/sku matches, tokens, brand anchor) plus
+    # whether its taxonomy is the query's category. Without this every row in a
+    # recognised category ties on rank_score (+90 category, +60 published, +200
+    # canonical scope), so the candidate_limit slots went to the most recently
+    # updated rows and the route's category-word filter then dropped them: on
+    # 2026-10-05 "moisturizer" recalled 48 category rows, 37 of them one recently
+    # ingested brand's creams, and served 3 products while a plain text search
+    # found 32 moisturizers across 10 brands. Signature-required rows are all
+    # canonical identities, so the private-listing pollution the +200 scope
+    # boost guards against cannot arise here. Other callers keep their order.
+    relevance_order = "(text_score + category_relevance) DESC, " if require_signature else ""
+    relevance_order_ms = "(ms.text_score + ms.category_relevance) DESC, " if require_signature else ""
+    relevance_order_c = "(c.text_score + c.category_relevance) DESC, " if require_signature else ""
     rows = await database.fetch_all(
         f"""
         WITH matched_skus AS (
@@ -1470,6 +1561,7 @@ async def _fetch_canonical_search_rows(
                     {token_score}
                 ) AS rank_score,
                 {brand_priority_score} AS brand_priority,
+                (0 {category_score}) AS category_relevance,
                 -- RECALL_RELEVANCE_V2: TEXT relevance only (exact + partial LIKE
                 -- + vertical term hits), with NO structural/scope boost. Used to
                 -- order results when v2 is on so the +200 canonical boost can't
@@ -1525,6 +1617,7 @@ async def _fetch_canonical_search_rows(
             {signature_clause}
             {indexable_clause}
             {sku_suppression_clause}
+            {offer_eligibility_clause}
         ),
         -- Cap each product's contribution BEFORE the budget is spent, then take
         -- the top `candidate_limit` rows exactly as before. The window ordering
@@ -1540,13 +1633,13 @@ async def _fetch_canonical_search_rows(
                     ms.*,
                     ROW_NUMBER() OVER (
                         PARTITION BY ms.product_key
-                        ORDER BY ms.brand_priority DESC, ms.rank_score DESC,
+                        ORDER BY ms.brand_priority DESC, {relevance_order_ms}ms.rank_score DESC,
                                  ms.sku_updated_at DESC, ms.sku_key
                     ) AS product_sku_rank
                 FROM matched_skus ms
             ) ranked
             WHERE ranked.product_sku_rank <= :per_product_sku_cap
-            ORDER BY brand_priority DESC, rank_score DESC,
+            ORDER BY brand_priority DESC, {relevance_order}rank_score DESC,
                      product_updated_at DESC, sku_updated_at DESC
             LIMIT :candidate_limit
         )
@@ -1624,12 +1717,18 @@ async def _fetch_canonical_search_rows(
         LEFT JOIN catalog_merchants bm
           ON bm.merchant_id = o.merchant_id
         {offer_seller_where}
-        ORDER BY c.brand_priority DESC, rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
+        ORDER BY c.brand_priority DESC, {relevance_order_c}rank_score DESC, c.product_updated_at DESC, o.updated_at DESC
         LIMIT :row_limit
         """,
         params,
     )
-    return [_row_dict(row) for row in rows]
+    rows = [_row_dict(row) for row in rows]
+    if require_signature:
+        # Serve in the same relevance-first order the candidates were chosen in
+        # (RECALL_RELEVANCE_V2 semantics for canonical shopping only).
+        for row in rows:
+            row["relevance_first"] = True
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -2560,7 +2659,7 @@ def _sort_items(items: List[PivotResultItem]) -> List[PivotResultItem]:
         # ties among similarly-relevant rows but can't leapfrog a more relevant
         # one. 0 when v2 is off ⇒ this key is inert and ordering is unchanged.
         structure_boost = 0.0
-        if _recall_relevance_v2_enabled():
+        if _recall_relevance_v2_enabled() or item.match_explanation.get("relevance_first"):
             try:
                 structure_boost = float(item.match_explanation.get("structure_score") or 0.0)
             except Exception:
@@ -2648,7 +2747,23 @@ async def search_pivot_catalog(request: PivotQueryRequest) -> PivotQueryResponse
         limit=request.limit,
         require_signature=request.canonical_entities_only,
         brand_anchor_terms=request.brand_anchor_terms,
+        **({
+            "merchant_ids": request.merchant_ids,
+            "price_min": request.price_min,
+            "price_max": request.price_max,
+            "price_currency": request.price_currency,
+            "price_min_exclusive": request.price_min_exclusive,
+            "price_max_exclusive": request.price_max_exclusive,
+        } if request.canonical_entities_only else {}),
     )
+    if request.canonical_entities_only:
+        # Reject corrupt catalog money before Decimal comparisons, savings
+        # projection or Pydantic can throw and take valid neighboring rows down.
+        canonical_rows = [row for row in canonical_rows if all(
+            row.get(field) in (None, "")
+            or ((value := _to_decimal(row.get(field))) is not None and value.is_finite())
+            for field in ("list_price", "merchant_effective_price", "estimated_best_price", "price_confidence")
+        )]
     canonical_items = await _build_canonical_items(
         canonical_rows,
         query=request.query,

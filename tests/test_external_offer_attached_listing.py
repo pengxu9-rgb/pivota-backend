@@ -62,6 +62,7 @@ def _offer(offer_id, *, sku=None, vid=None, currency="USD", merchant=SELLER, sou
         "payload_seed_id": payload_seed,
         "suppressed": suppressed,
         "source_variant_id": vid,
+        "read_offer": "{}", "read_sku": "{}", "read_product": "{}",
     }
 
 
@@ -252,16 +253,23 @@ def test_an_attached_seed_without_a_mirror_writes_its_listing_row(monkeypatch):
     result = _sync(monkeypatch, fake)
     assert result["status"] == "synced" and result["target"] == "attached"
     assert result["status"] in mod.OFFER_SYNC_WRITTEN_STATUSES
-    assert fake.updates == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD"}]
+    assert fake.updates == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD",
+                             "read_offer": "{}", "read_sku": "{}", "read_product": "{}"}]
     assert fake.executed == [], "the attached lane never upserts: it only prices existing rows"
 
 
 def test_the_mirror_still_wins_when_the_seed_has_one(monkeypatch):
+    from unittest.mock import AsyncMock
+    from services import catalog_variant_offer_projection
+
+    project = AsyncMock(return_value={"planned": 0, "inserted": 0, "skips": {}})
+    monkeypatch.setattr(catalog_variant_offer_projection, "project_missing_variant_offers", project)
     fake = FakeDB(seed=_seed(), mirror={"product_key": "prod::merch_obs_x::external_seed::e",
                                         "merchant_id": "merch_obs_x"}, offers=[_offer("of_canon")])
     result = _sync(monkeypatch, fake)
     assert result["status"] == "synced" and result["target"] == "mirror"
     assert fake.updates == [] and len(fake.executed) == 1
+    project.assert_awaited_once_with(fake.mirror["product_key"], apply=True, db=fake)
 
 
 def test_an_unattached_seed_without_a_mirror_is_still_no_mirror_product(monkeypatch):
@@ -376,3 +384,62 @@ def test_the_ratio_env_knob_refuses_nonsense(monkeypatch):
     for bad in ("0.5", "1", "abc"):
         monkeypatch.setenv("EXTERNAL_OFFER_PROJECTION_MAX_PRICE_RATIO", bad)
         assert mod.max_price_ratio() == 3.0
+
+@pytest.mark.parametrize('variants,reason', [
+    ([{'variant_id':'47761881301180','price_amount':38,'price_currency':'EUR'}], 'variant_currency_mismatch'),
+    ([{'variant_id':'47761881301180','price_amount':38,'price_currency':'USD','currency':'EUR'}], 'variant_currency_mismatch'),
+    ([{'variant_id':'47761881301180','price_amount':38,'price':39}], 'variant_price_alias_conflict'),
+    ([{'variant_id':'47761881301180','price_amount':38}, {'variant_id':'47761881301180','price_amount':38}], 'ambiguous_variant_identity'),
+    ([{'variant_id':'47761881301180','id':'47761881301181','price_amount':38}], 'variant_identity_conflict'),
+    ([{'variant_id':'47761881301180','price_amount':float('inf')}], 'no_variant_price'),
+])
+def test_contradictory_variant_evidence_never_prices_an_offer(variants,reason):
+    offer = _offer('of_v2',sku=f'{PK}::v:47761881301180',vid='47761881301180')
+    plan = _plan(_seed(seed_variants=variants),[offer])
+    assert plan['writes'] == [] and plan['skips'] == {reason:1}
+
+@pytest.mark.parametrize('price',[float('inf'),float('nan'),1e11,0.0001])
+def test_unrepresentable_seed_money_is_never_stamped_fresh(price):
+    plan = _plan(_seed(price_amount=price),[_offer('of_canon')])
+    assert plan['writes'] == [] and plan['skips'] == {'no_seed_price':1}
+
+@pytest.mark.parametrize('source',['refresh','employee_edit'])
+def test_listing_projection_cannot_supersede_reviewed_native_money(source):
+    offer = _offer('of_canon'); offer['price_repaired'] = True
+    plan = _plan(_seed(),[offer],source=source)
+    assert plan['writes'] == [] and plan['skips'] == {'reviewed_price_repair':1}
+
+def test_an_offer_whose_sku_currency_disagrees_is_not_repriced():
+    offer = _offer('of_canon'); offer['sku_currency'] = 'EUR'
+    plan = _plan(_seed(),[offer])
+    assert plan['writes'] == [] and plan['skips'] == {'sku_currency_mismatch':1}
+
+@pytest.mark.parametrize('raw',['inf','nan','-inf'])
+def test_nonfinite_projection_ratio_uses_the_conservative_default(monkeypatch,raw):
+    monkeypatch.setenv('EXTERNAL_OFFER_PROJECTION_MAX_PRICE_RATIO',raw)
+    assert mod.max_price_ratio() == 3
+
+@pytest.mark.parametrize('change',[
+    {'payload_dest':DEST+'-other','source_ref':None},
+    {'source_ref':DEST+'-other','payload_dest':DEST},
+    {'payload_seed':'another-seed'},
+])
+def test_seed_identity_does_not_override_a_conflicting_listing(change):
+    seed=_seed()
+    offer=_offer('old-listing',payload_seed=seed['id'])
+    offer.update({'payload_destination_url' if k=='payload_dest' else 'payload_seed_id' if k=='payload_seed' else k:v
+                  for k,v in change.items()})
+    assert _plan(seed,[offer])['status'] == 'no_listing_offer'
+
+
+def test_equivalent_numeric_and_gid_aliases_name_the_same_variant():
+    seed=_seed(seed_variants=[{'variant_id':'47761881301180',
+                             'id':'gid://shopify/ProductVariant/47761881301180',
+                             'price_amount':38,'price_currency':'USD'}])
+    offer=_offer('of_v2',sku=f'{PK}::v:47761881301180',vid='47761881301180')
+    assert _plan(seed,[offer])['writes'] == [{'offer_id':'of_v2','price':38,'currency':'USD'}]
+
+@pytest.mark.parametrize('source_ref',['HTTPS://missha.us/products/other','  https://missha.us/products/other  '])
+def test_url_formatting_cannot_hide_a_conflicting_listing_claim(source_ref):
+    seed=_seed();offer=_offer('other',source_ref=source_ref,payload_dest=None,payload_seed=seed['id'])
+    assert _plan(seed,[offer])['status'] == 'no_listing_offer'

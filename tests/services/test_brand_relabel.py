@@ -339,6 +339,22 @@ def test_the_family_lists_its_accented_spellings():
     assert canonical == "ETUDE" and {"etudehouse", "etude", "étudehouse", "étude"} <= keys
 
 
+def test_every_relabel_family_writes_the_ingest_familys_canonical_spelling():
+    """One spelling per brand has one owner (curated_brand_feed.RETAILER_BRAND_CANONICAL): a relabel to any
+    other spelling would be undone -- in display -- by the next ingest. A relabel family whose spelling family
+    is not live yet (identity-changing: relabel FIRST, family after) must at least cover its own spellings."""
+    from scripts.relabel_retailer_brand import FAMILIES
+    from services import curated_brand_feed as feed
+    for name, (canonical, spellings) in FAMILIES.items():
+        assert canonical in spellings, name
+        family = feed._retailer_brand_family(feed._brand_key(canonical))
+        if family is not None:
+            assert feed.RETAILER_BRAND_CANONICAL[family] == canonical, name
+            assert all(feed._retailer_brand_family(feed._brand_key(s)) == family for s in spellings), name
+    # Every identity-changing relabel family is now live as a spelling family, each added only after its rows were
+    # relabelled (services/brand_relabel.py ORDER): jungsaemmool (relabel_6239d93b1080), ohui (relabel_fad2cefd5223).
+
+
 def test_the_losing_side_of_every_move_is_rebuilt_before_any_gaining_side():
     moves = [{"from_ck": "ck_a", "to_ck": "ck_m"}, {"from_ck": "ck_b", "to_ck": "ck_a"}]
     assert rl.touched_keys(moves) == ["ck_a", "ck_b", "ck_m"]

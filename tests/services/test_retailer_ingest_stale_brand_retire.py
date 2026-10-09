@@ -421,6 +421,9 @@ async def test_revert_restores_only_rows_still_carrying_its_tombstone(monkeypatc
     class DB:
         def transaction(self): return Tx()
 
+        async def fetch_all(self, sql, values):
+            return []  # no key's URL is owned by a live retailer listing
+
         async def fetch_one(self, sql, values):
             calls.append(("unsuppress", values["key"], values["run_id"], values["retired_reason"]))
             assert "suppression_metadata ->> 'run_id' = :run_id" in sql
@@ -438,6 +441,42 @@ async def test_revert_restores_only_rows_still_carrying_its_tombstone(monkeypatc
     assert calls == [("unsuppress", "k_ours", "retire_x", retire_tool.REASON),
                      ("unsuppress", "k_retired_again", "retire_x", retire_tool.REASON),
                      ("seed", "s1", ("k_ours",))]
+
+
+async def test_revert_never_revives_a_row_whose_url_a_live_retailer_listing_now_owns(monkeypatch):
+    """Review of #2448: the retailer apply admits a new ext:retailer: listing onto a URL whose chain is retired.
+    Reviving that row -- or its seeds -- would put two live listings on one URL."""
+    calls = []
+
+    class Tx:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+    class DB:
+        def transaction(self): return Tx()
+
+        async def fetch_all(self, sql, values):
+            q = " ".join(sql.split())
+            if "product_key LIKE 'ext:retailer:%'" in q:
+                assert values == {"host": "brand.com"}
+                return [{"product_key": "ext:retailer:new", "canonical_url": "https://brand.com/products/a"}]
+            assert sorted(values["keys"]) == ["k_owned", "k_free"][::-1]
+            return [{"product_key": "k_owned", "canonical_url": "https://www.brand.com/products/a"},
+                    {"product_key": "k_free", "canonical_url": "https://brand.com/products/b"}]
+
+        async def fetch_one(self, sql, values):
+            calls.append(("unsuppress", values["key"]))
+            return {"product_key": values["key"]}
+
+        async def execute(self, sql, values):
+            calls.append(("seed", values["id"], tuple(values["keys"])))
+    monkeypatch.setattr(retire_tool, "database", DB())
+    m = {"run_id": "retire_x", "reason": retire_tool.REASON,
+         "products": [{"product_key": k, "prior_suppression_reason": None, "prior_suppressed_at": None,
+                       "prior_suppression_metadata": None} for k in ("k_owned", "k_free")],
+         "seeds": [{"id": "s1", "prior_status": "active"}]}
+    await retire_tool.revert_manifest(m)
+    assert calls == [("unsuppress", "k_free"), ("seed", "s1", ("k_free",))]
 
 
 # --- queue review of #2426: search is a second surface, gated per ROW --------------------------------------

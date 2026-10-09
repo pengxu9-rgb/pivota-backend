@@ -149,7 +149,7 @@ negatives, `positive_until` is cleared.
 | `PRICE_DRIFT` | the landed line charges a different price than our indexed one — exact, minor units, no tolerance | **YES — confirmed negative** |
 | `ELIGIBLE` | landed on a checkout carrying our merchandise line, our click id and the right market. With `card_available is True` this is the **POSITIVE** fact that arms the window and resets the counter; with `card_available is None` it is unverifiable and changes nothing | no |
 | `BLOCKED_UNKNOWN` | **any other 403.** The preflight's own docstring calls it "not evidence of anything in particular" — a bot challenge as often as anything. **UNVERIFIABLE, never a negative** | no |
-| `TRANSPORT_ERROR` | connect error, timeout, proxy flake. Retryable. **UNVERIFIABLE, never a negative** and never proof of ineligibility | no |
+| `TRANSPORT_ERROR` | connect error, timeout, proxy flake. Retryable. **UNVERIFIABLE, never a negative** and never proof of ineligibility. **Also an edge THROTTLE** (since 2026-10-08): a 429, a 503 with Retry-After, or a Cloudflare `cf-mitigated` challenge on any request of the check — evidence `detail` `resolve:throttled_429` / `permalink:throttled_429`, `retryable: true`. Before, a throttled catalog page was `VARIANT_UNVERIFIED` (`products_json_page_1_status_429`, `retryable: false`). Two exceptions: a **challenged checkout** keeps `BLOCKED_UNKNOWN` (detail `permalink:throttled_challenge_403`, now retryable; definite in the Tier B lane), and a throttle on a hop **after a login or password wall** is that wall (`LOGIN_REQUIRED` / `PASSWORD_PAGE`), never a throttle. See §9 "An IP throttle stops the run" | no |
 | `VARIANT_UNAVAILABLE` | the storefront lists the variant (or product) but nothing is available to buy | no |
 | `VARIANT_UNVERIFIED` | the storefront would not let us confirm the variant (non-200, non-JSON, or the scan cap was reached) — absence is not proven | no |
 | `CHECKOUT_MARKET_MISMATCH` | our line and click id landed, but in another market than the buyer's, or the checkout's market could not be read | no |
@@ -177,13 +177,16 @@ arrival).
 | variable | default | bounds | what it does |
 |---|---|---|---|
 | `MERCHANT_PURCHASABILITY_SWEEP_ENABLED` | **unset = off** | truthy allowlist: `1`, `true`, `on`, `yes` (case/space-insensitive) | **DIAL 1 of 2** (`db.merchant_purchasability.is_sweep_enabled`). Gates the sweep JOB and nothing else. Off = the job contacts no merchant, which matters because every check creates an abandoned checkout on a live store. **Set on the sweep's Cloud Run Job by `setup_merchant_purchasability_sweep_job.sh` — `--enable` sets it true, a run without the flag sets it false.** A value on `web` or `worker` does nothing to the sweep (on `web` it only feeds the ops route's informational `sweep_enabled`) |
-| `MERCHANT_PURCHASABILITY_ENFORCE` | **unset = off** | same truthy allowlist | **DIAL 2 of 2** (`db.merchant_purchasability.is_enforcement_enabled`). Gates the CONSUMERS and nothing else: the Reap route's `merchant_not_purchasable` refusal and the checkout tier's downgrade. Off = a missing fact refuses nothing. Also the `enforced` field the gateway reads |
+| `MERCHANT_PURCHASABILITY_ENFORCE` | **unset = off** | same truthy allowlist | **DIAL 2 of 2** (`db.merchant_purchasability.is_enforcement_enabled`). Gates the CONSUMERS and nothing else: the Reap route's `merchant_not_purchasable` refusal, the checkout tier's downgrade, and the offers.resolve and product-card cart mints (a browse-only merchant is minted a `referral_only` PDP instead of a prefilled cart — see "The offers.resolve mint" and "The product-card lanes" in §9). Off = a missing fact refuses nothing. Also the `enforced` field the gateway reads |
 | `MERCHANT_PURCHASABILITY_TTL_HOURS` | `72` | `1`–`720` | how long one positive fact stays positive. 720 h is 30 days; past that "fresh" is not a word that means anything |
 | `MERCHANT_PURCHASABILITY_BUYER_VANTAGE` | `worker` | any string, truncated to 32 chars | the vantage `is_purchasable` demands a positive fact **FROM**. See §6 — this is the dial that decides whose question the gate is answering |
 | `VANTAGE_PROXY_URL` | **unset** | must start `http://` or `https://`, else ignored | when set, every merchant is ALSO checked through that proxy and recorded under vantage `proxy`. Anything else is ignored rather than handed to httpx, which would raise inside the run |
 | `MERCHANT_PURCHASABILITY_BATCH` | `20` (**pinned on the job** by the setup script) | `1`–`200` | merchants per run. Each is a full redirect chain plus up to 20 catalog pages, and each leaves an abandoned checkout behind — this is a politeness bound as much as a time bound |
 | `MERCHANT_PURCHASABILITY_BUDGET_SECONDS` | `600` (**pinned on the job** by the setup script) | `30`–`3600` | wall-clock budget for one run. It stops the job **STARTING** a new merchant; one already in flight runs to completion, so a run can exceed this by one merchant's worth of fetches. The job's Cloud Run **task timeout is 1200 s** (budget + one merchant, doubled); change the two together, in the script |
 | `MERCHANT_PURCHASABILITY_PAUSE_MS` | `1500` | `0`–`60000` | seconds (in ms) to wait between merchants. One store at a time, unhurried: this rail has no latency requirement and a burst of checkout creations against one platform does not help us |
+| `MERCHANT_PURCHASABILITY_IP_THROTTLE_TRIP_HOSTS` | `3` | `0`–`50` | the IP breaker: this many DISTINCT hosts (`www.` folded) throttled (429, 503 + Retry-After, Cloudflare challenge) within the window stops the run (§9). `0` disarms it; so does `CRAWL_IP_THROTTLE_BREAKER_ENABLED=false`, the switch every crawl lane shares. Disarmed, the `IP_THROTTLE` line is still printed |
+| `MERCHANT_PURCHASABILITY_IP_THROTTLE_WINDOW_SECONDS` | `1200` | `60`–`3600` | the breaker's sliding window. The default is the task timeout, i.e. "within one run" |
+| `CRAWL_SHOPIFY_EDGE_PACER_ENABLED` / `CRAWL_SHOPIFY_EDGE_LEASE` | `true` / `2` (**set on the job** by the setup script since 2026-10-08) | — | the shared Shopify-edge budget (#2474), exactly as on the Reap proof jobs: every direct-vantage request also takes a slot of the aggregate rate shared by every crawl job that sets the flag (in this repo today: the two Reap proof jobs and this one). `CRAWL_SHOPIFY_EDGE_RPS` is NOT set: every job must share one rate. This job's own spacing (~0.67 req/s) is already under the 2 req/s shared rate, so the flag mostly protects the OTHER jobs' share. The sweep's pacer has no deadline, so a shared wait is bounded by the pacer's horizon (~60 s at lease 2), not by the run budget |
 
 Two things are deliberately **not** dials: `DEMOTE_AFTER_FAILURES` (2) and the card-brand set.
 Nor is the cadence any more: `MERCHANT_PURCHASABILITY_INTERVAL_SECONDS` was the scheduler
@@ -486,6 +489,12 @@ unions a third lane (`_CONNECTED_LANE_SQL`):
   store (which the card lane uses whatever `mcp_connected` says). Shopify only, and only for a
   merchant with at least one `products_cache` row, since a store that serves no card makes a fact
   that gates nothing.
+* **Not a test merchant** (2026-09-29). A merchant `services.test_merchant_policy` excludes (the
+  static rig ids plus every `pivota-review-demo*` store) is skipped and counted in
+  `population_skipped_test_merchant`. That is the set search already hides from buyers, so its
+  fact gates no card anyone is served, and each check only leaves an abandoned checkout on our
+  own store. The skip runs before the market rule, so a rig's junk region is not counted as
+  market-unknown.
 * **Host.** `normalize_shop_host(domain)`, the host `shopify_cart_base_url` builds the card's cart
   on.
 * **Market.** The merchant's declared `merchant_onboarding.region`, only when it is an ISO-2
@@ -494,11 +503,25 @@ unions a third lane (`_CONNECTED_LANE_SQL`):
   they are never defaulted. A wrong region costs one abandoned checkout and a negative fact,
   which is the same answer as no fact.
 
-Measured 2026-09-28: `region` is US ×40, `shopify` ×12, APAC ×6, CA ×3, Other ×1, NULL ×1. The lane
-adds **2 targets** (`ijaqit-v9.myshopify.com` from two live store rows, `i9j3i0-kj.myshopify.com`
-legacy, both US). It also adds **+3 to `population_skipped_market_unknown` on every run**: three
-legacy stores whose region reads `shopify`, two of them `pivota-review-demo*` rigs. That count is
-expected and is not an alert.
+**Every connected store is a test store today** (Peng, 2026-09-29). There is no real
+outside-merchant connection yet; the lane exists so the first one is covered on day one.
+
+Measured on prod 2026-09-29, applying the policy to the lane's own rows: **6 rows → 4
+`population_skipped_test_merchant`, 1 market-unknown, 1 target**.
+
+| merchant | store | region | outcome |
+|---|---|---|---|
+| `merch_efbc46b4619cfbdf` ("Chydan") | ijaqit-v9 (live) | US | skipped: test merchant |
+| `merch_bbd34645bc1950cc` | i9j3i0-kj (legacy) | US | skipped: test merchant |
+| `merch_shopify_00d4a720d67d96c5dcba` | pivota-review-demo (legacy) | shopify | skipped: test merchant |
+| `merch_shopify_0584b37f7a8be00a5223` | pivota-review-demo-2 (legacy) | shopify | skipped: test merchant |
+| `merch_c5e24a8d3738d73b` ("Pivota Live Demo Store") | ijaqit-v9 (live) | US | **swept** (not on the list) |
+| `merch_shopify_0c74768217e098809ab3` | mec3xu-zd (legacy) | shopify | market-unknown (not on the list) |
+
+Both counts are expected and are not alerts. Adding the last two merchants to
+`KNOWN_TEST_MERCHANT_IDS` would also hide them from search, so that is a product call, not a sweep
+fix. The first sweep of these stores (2026-09-29 06:08Z) read ijaqit-v9 `NO_CARD_PAYMENT` and
+i9j3i0-kj `VARIANT_UNVERIFIED` (a 401 from its `products.json`).
 
 **To give a connected store a cart in another market,** set its onboarding `region` to that
 country. One region per merchant is all this lane reads.
@@ -733,7 +756,8 @@ abandoned checkouts double). A dark job executed by hand exits 0 and contacts no
    something, and §6 is where to look.
 5. **Verify coverage merchant by merchant** through
    `GET /ops/merchant-purchasability?domain=…&market=…`. Every merchant you expect to be
-   purchasable must read `"tier": "purchase"`. If one stays `browse_only`, the response's `note`
+   purchasable must read `"tier": "purchase"` (and `"human_handoff_tier": "purchase"` for a cart
+   handed to a human — `NO_CARD_PAYMENT` reads `browse_only` / `purchase`). If one stays `browse_only`, the response's `note`
    names the three candidate reasons — a positive row under a DIFFERENT vantage, an expired
    window, or two consecutive negatives — and §7's demotion query tells you which. **Do not skip
    this step:** it is the only thing standing between step 6 and a 409 on a live merchant.
@@ -773,7 +797,7 @@ execution and trips the "Cloud Run job failing" alert:
 
 | Exit | Meaning | Do |
 |---|---|---|
-| 0 | done — including a dark run (gate off, nobody contacted), an empty population, and a run the budget cut short (the rest are first next hour) | nothing |
+| 0 | done — including a dark run (gate off, nobody contacted), an empty population, a run the budget cut short (the rest are first next hour), and **a run the IP breaker stopped** (`ip_throttled=1`; its `IP_THROTTLE` line is the signal, see §9 "An IP throttle stops the run") | nothing per merchant; for a trip, read the `IP_THROTTLE` lines |
 | 1 | a population lane could not be read or came back incomplete, or the staleness read failed (`population_unreadable > 0`), the population could not be built at all, or the database could not be connected to (`could not connect to the database` on the job's stdout; nothing was read). Whatever *was* read was still swept. Python's own exit on an uncaught traceback is also 1 — the log tells them apart; every case means "the population was not read" | read the log's `population lane(s) could not be read` line and the WARNING before it (it names the lane and the error type); with `ENFORCE` on, merchants on the unread allowlist are ageing towards a 409 |
 | 4 | the population was read, but a check raised or a fact could not be written (`errors > 0`) | read the job log; the per-check lines carry the vantage and the error type, never the merchant |
 
@@ -784,7 +808,7 @@ abandoned checkouts); the next hour's run is the retry.
 Logging → Cloud Run Jobs → `merchant-purchasability-sweep`, severity INFO):
 
 ```
-[2026-09-23 09:43:20,118] INFO - merchant_purchasability_sweep: SweepReport(population=20, population_skipped_unusable=0, population_skipped_market_unknown=0, population_unreadable=0, population_total=74, population_never_checked=12, checked=20, positive=14, negative=2, unverifiable=4, written=20, abandoned_budget=0, errors=0, skipped_disabled=0, duration_ms=148213)
+[2026-09-23 09:43:20,118] INFO - merchant_purchasability_sweep: SweepReport(population=20, population_skipped_unusable=0, population_skipped_market_unknown=0, population_skipped_test_merchant=0, population_unreadable=0, population_total=74, population_never_checked=12, checked=20, positive=14, negative=2, unverifiable=4, written=20, abandoned_budget=0, errors=0, skipped_disabled=0, duration_ms=148213)
 ```
 
 ```sh
@@ -796,14 +820,15 @@ gcloud logging read 'resource.type="cloud_run_job"
 
 (The sample's counts are illustrative; its shape is current. `population_skipped_market_unknown`
 was added on 2026-09-26, `population_unreadable` on 2026-09-27, and `population_total` /
-`population_never_checked` on 2026-09-28; the line is emitted on a run whose population could not
-be built too.) Read it as: `population` merchants taken this run (≤ `BATCH`) out of
+`population_never_checked` on 2026-09-28, and `population_skipped_test_merchant` on 2026-09-29;
+the line is emitted on a run whose population could not be built too.) Read it as: `population` merchants taken this run (≤ `BATCH`) out of
 `population_total` in all lanes, of which `population_never_checked` have no fact yet (see
 "Capacity"); `checked` fetched; `positive / negative / unverifiable` partition `checked`;
 `written` facts upserted; `abandoned_budget` not started because the budget ran out. With the
 gate off the run logs `merchant_purchasability_sweep: disabled; no merchant was contacted` and
 exits 0. A skipped allowlist row (a `merchant_domain` that is not a bare host name, §7's census
-query; or a non-ISO-2 market) logs once per run, as a count, at WARNING on the same channel.
+query; or a non-ISO-2 market) logs once per run, as a count, at WARNING on the same channel. A
+skipped test merchant logs nothing: it is policy, and it shows only in its count.
 
 **Why the line goes through `utils.logger`.** Measured 2026-09-23 on the worker:
 `/__scheduler_health` showed `runs_ok=1` and Cloud Logging held **zero**
@@ -825,6 +850,73 @@ down: `tests/pivota_log_capture.py` reads the pivota handler's own stream with r
 WARNING; the `*_lands_on_pivota_stdout_*` and `*_does_not_depend_on_the_root_logger` tests in
 both job suites fail on a module-logger emit (4 of 5 sweep tests and all 3 poller tests on a plain
 revert, measured).
+
+### An IP throttle stops the run (2026-10-08)
+
+**Measured.** From 2026-10-07 07:08Z (and 10-05 10:07Z → 10-06 00:08Z) 17–20 of the 20 merchants
+came back unverifiable every hour: 163 of ~196 checks in 24 h read
+`products_json_page_1_status_429`, across unrelated stores, with `consecutive_failures` up to
+16–17 on some rows. Swapping the crawl NAT to the spare IP (34.82.242.65, 10-07 23:56Z) did not
+help: a probe from the fresh address got `429`, `server: cloudflare`, `retry-after: 60`,
+`local_rate_limited` on its **first** request. The limiter is in front of every store and is not
+keyed on the address's history, so a new IP is not a fix; asking less is.
+
+**What a throttle does to a fact: nothing a reader acts on.** Every reader decides on
+`positive_until` through `is_purchasable` — the Reap route's `merchant_not_purchasable` refusal,
+the cart-link and variant admission in `routes/agent_commerce_reap.py`, and the gateway's
+cart-mint / offers gate, which acts only on this route's `tier`. A throttle is unverifiable
+(rule 3): it never advanced `consecutive_failures` and never cleared `positive_until`, before or
+after this change — a row's `consecutive_failures` of 16 came from earlier **confirmed
+negatives** (only `NEGATIVE_VERDICTS` advance it, in every version of the upsert), carried through
+the throttle, not caused by it. §7's SQL names those rows; a 16 is a store that answered about
+itself negatively 16 times with no positive between, worth reading on its own. **The one real harm:** a
+positive window is renewed only by a positive check, so a throttle longer than the TTL (72 h)
+still ages every merchant out to `browse_only`. The 10-07 throttle reaches that at about
+10-10 07Z for a merchant whose last positive was just before it began.
+
+**The breaker.** One per run (`SweepThrottleBreaker`, #2473's `IpThrottleBreaker`), fed every
+direct-vantage answer with its headers through `crawl_politeness.note_response` (which also logs
+each 429 as `crawl backoff: <host> returned 429 ... [retry-after=60 server=cloudflare]`). It trips
+at `..._TRIP_HOSTS` (3) distinct hosts (`www.` folded) throttled within the window; after that no request
+leaves (refused before the pacer), nothing more is written, and the run EXITS 0. Not 3 like the
+nightly referral refresh: this job is hourly, "prod: Cloud Run job failing" pages on any failed
+task, and the windows measured so far lasted 14-17 h, so a non-zero trip would page every hour of
+one. Alert on the line instead (below), rate-limited. The checks that
+completed before the trip ARE written, as unverifiable rows: that costs the merchant nothing
+(rule 3) and moves `checked_at`, so next hour starts with the merchants this run did not reach.
+Left unwritten, a few stores that throttle us on their own would head every run and starve the
+rest. The proxy vantage's answers never feed it (another address).
+
+**The line**, every armed run, a text prefix on stdout (lands in `textPayload`):
+
+```
+IP_THROTTLE {"job":"merchant-purchasability-sweep","status":"ip_throttled","ip_throttled":true,"ip_throttle_breaker_armed":true,"ip_throttle_trip_hosts":3,"ip_throttle_window_seconds":1200.0,"ip_throttle_tripped_at":"...","ip_throttle_trip_host_count":3,...,"throttle_diagnostics":{"responses":3,"by_server":{"cloudflare":3},...,"retry_after":{"60":3},"cf_mitigated":0},"throttled_checks":3,"skipped_for_ip_throttle":17}
+```
+
+```sh
+gcloud logging read 'resource.type="cloud_run_job"
+  AND resource.labels.job_name="merchant-purchasability-sweep"
+  AND textPayload:"IP_THROTTLE "' \
+  --project pivota-prod --freshness 24h --limit 30 --format 'value(timestamp,textPayload)'
+```
+
+The fields are the external-referral refresh's, so `textPayload:"IP_THROTTLE " AND
+textPayload:"\"ip_throttled\":true"` matches every crawl lane at once. No host is ever listed.
+
+**The page: "prod: purchasability sweep IP-throttled"** (`infra/gcp/setup_monitoring.sh`, log
+metric `merchant_purchasability_sweep_ip_throttled`, keyed on this job). Aligned over 7200 s,
+twice the hourly cadence, so a throttle window is ONE incident that closes ~2 h after the last
+tripped run, not a page an hour. It exists once `setup_monitoring.sh prod` is re-run.
+
+Notes on the fields: `ip_throttle_first_429_at` / `_last_429_at` are #2473's names and cover
+every counted signal, challenges included. The breaker counts distinct HOSTS with `www.` folded:
+a store reached under two different hosts (a custom domain and its myshopify host) counts twice.
+
+**Hosts in WARNING lines.** `crawl_politeness.note_response` logs each throttled request as
+`crawl backoff: <host> returned 429 (consecutive=N), holding Ns [retry-after=60 server=cloudflare]`
+on stderr. That is a merchant HOST (no path, no query, no buyer data), deliberately: it is the
+per-host header evidence #2473 added so a throttle can be told from a challenge. The report and
+the `IP_THROTTLE` line stay counts-only.
 
 ### The coverage census: which hosts have a fact (2026-09-28)
 
@@ -1008,6 +1100,106 @@ carries no market today, so it cannot be keyed and keeps failing open; it must f
 market carrier (the buyer's shipping country, or the market the session was created for) before
 the re-read can ask this route. Once it does, it may call this route with no `market` and will get
 the explicit `market_unknown` answer instead of a 422.
+
+### The offers.resolve mint (2026-09-27)
+
+`offers.resolve` mints an `/r` link per external-seed offer, and where it can build a Shopify cart
+permalink the link lands the buyer **in a prefilled cart** (`join_mode: cart_permalink`). The
+warm-handoff click lane deliberately skips a cart join (`is_already_cart_join`), so nothing between
+the mint and the buyer ever asked this fact — a merchant the Reap rail refuses was still handed out
+as a one-click cart. Measured on prod 2026-09-27: 432 active-seed offers mint a cart, **358 of them
+(47 of 53 hosts) with no positive fact in any market**.
+
+Under `MERCHANT_PURCHASABILITY_ENFORCE` the mint (`routes/agent_shop_gateway._CartPurchasabilityGate`)
+now asks first. **It asks the HUMAN cart's question, `human_handoff_allowed`, not the Reap rail's
+`is_purchasable`** (Peng, 2026-10-09):
+
+| state | cart? | DB read |
+|---|---|---|
+| dial off | kept — byte-identical token and payload | none |
+| dial on, request names no ISO-2 market (`market_unknown`) | **declined** | none |
+| dial on, a fresh fact from the buyer vantage with verdict `ELIGIBLE`, `NO_CARD_PAYMENT` or `PRICE_DRIFT` | kept | one per host per request |
+| dial on, a fresh fact nobody can buy under: `LOGIN_REQUIRED`, `PASSWORD_PAGE`, `NOT_ACCEPTING_ORDERS`, `VARIANT_GONE` | **declined** | one per host per request |
+| dial on, anything else (no row, last check older than the TTL, an unverifiable verdict, wrong vantage, DB error) | **declined** | one per host per request |
+
+**Why the two readers part on `NO_CARD_PAYMENT`.** That verdict means the checkout's accept-list
+was read and holds no *on-site* card line. For the Reap rail — a card paid with nobody present —
+that is a confirmed negative. For a human it is nothing: the PR controller's spot-check on
+2026-10-09 found **643 of 839 negative cart seeds (26 hosts) were `NO_CARD_PAYMENT`**, and most of
+those checkouts take cards through an *offsite* provider (Eximbay, Payfast, "Pay via Cards /
+Wallets / Bank Transfer") that a human completes without noticing; the rest take PayPal. The
+first cut of this gate (`is_purchasable`) would have turned every one of them into a referral.
+Freshness for the human reader is the **last check inside the TTL** (`checked_at`), because
+`positive_until` is armed only by `ELIGIBLE` + card and the whole point is a verdict that never
+arms it. The preflight, the sweep and the fact's three write rules are unchanged; `is_purchasable`
+and the Reap rail are unchanged.
+
+The ops route publishes both answers: `tier` (the rail's) and `human_handoff_tier` (the mints').
+~~**The gateway's own gate (`PIVOTA-Agent src/offers/offersPriority.js`) strips `execution_spec.cart_url`
+on `tier`** — the rail's field — so when armed it has the same defect on human carts; it must read
+`human_handoff_tier` instead.~~ **Fixed in PIVOTA-Agent (client "rule 7", 2026-10-09):**
+`merchantPurchasabilityClient.shouldOfferPurchase` takes a `rail`; its three human seams (the offer
+stamp and `offers.resolve`, the warm cart, the escalation `continue_url`) name `RAIL.human` and act
+on `human_handoff_tier` when the answer carries it (else `tier`, so a backend before #2411 reads as
+before); the Reap agentic lane names `RAIL.card` and acts on `tier`. An unnamed rail is the card
+rail. One read serves both. The gateway's gate is still unarmed in prod.
+
+A decline removes the **cart**, never the offer: `execution_spec.cart_url` / `variant_id` null,
+`rail: referral`, `tracking.join_mode: referral_only`, `cart_prefilled: false`, and the `/r` hop
+signs the attributed PDP. The token ctx carries `purchasability_tier: browse_only`, and
+`evaluate_warm_eligibility` knocks such a token out (`warm_reason=purchase_declined`) — otherwise
+the warm lane would rebuild the refused cart at click time. The key is absent on every other
+token.
+
+The market is the **request's** (`payload.market`), never the seed row's listing market and never
+the `or "US"` serving default. So a market-less caller (the UCP `get_offers` tool today) loses its
+carts even on merchants that are positive for US — the same answer the gateway's own gate gives.
+
+**A declared storefront market is a market; a per-request fallback is not** (Peng, 2026-10-09).
+"Never default a market" forbids a *fallback*: a value a door fills in when the caller said nothing
+(`or "US"`, a browser language, a geo-IP guess made on the caller's behalf). It does not forbid a
+*declaration*: a surface that serves exactly one market may state that market on every call, and
+the door then has a real buyer market to key on. agent.pivota.cc's `STOREFRONT_MARKET = 'US'`
+(agent-ui #376) is such a declaration — the storefront prices everything in USD and offers no
+other market — and it keys this gate correctly. The distinction is *who decided*: the surface that
+owns the buyer relationship declares; a door downstream never guesses. When agent-ui starts
+serving a buyer's own market (from their location, as the partner surfaces do with
+`buyer_region`), it declares that market per request instead; the rule and the gate do not change.
+
+Measured 2026-10-09, 7 days: of 242 find_products_multi requests reaching this door, the 216
+market-less ones were CI gates and probes, the gateway's own re-invokes and the Aurora chat skill —
+not buyers (see the PIVOTA-Agent follow-ups). Real buyers through agent.pivota.cc already carry
+the declaration.
+
+### The product-card lanes (2026-09-27)
+
+The card lanes mint the same seeds' cart links, and now ask the same gate with the same table
+above. Each builds **one gate per request on its request carrier** — the value its
+`request_market_observed` reads — and decides **before** the mint, so the nulled cart id feeds
+both the mint and `_seed_attribution_from_redirect` (which refuses unless its recomposed primary
+equals the signed dest). A declined card has no `cart_url`, `tracking.join_mode: referral_only`,
+an attributed PDP `destination_url`, and the same `purchasability_tier: browse_only` in its token.
+
+| lane | request market | volume, 14 days to 2026-09-27 |
+|---|---|---|
+| `POST /attribution/external-seed-links` (`mint_external_seed_links`) | `body.market` (never `candidate.market`, which is the seed row's) | 477 calls from the gateway (464 × 200, 13 × 504) |
+| find_products_multi seed cards + `_build_prefetched_external_seed_wrappers` | `_request_market_for_multi` (`search.market`, then `metadata.market`); **one gate shared by both** | 2,658 at the gateway door; 404 caller requests reached this door, **389 (96%) named no market** (`multi.invoke.market`) |
+| `_attach_connected_product_redirects` | its `request_market` keyword: `_request_market_for_multi` from the find_products_multi wrapper, `metadata.market` from find_products / get_product_detail | find_products 0, get_product_detail 1 |
+
+What that means under enforcement:
+
+* **A market-less find_products_multi request gets no seed carts at all** — 96% of them today,
+  until the UI sends `metadata.market` (agent-ui #376). With a market, only hosts with a fresh
+  positive worker fact keep their cart.
+* **Connected-store cards are referrals** until the sweep covers them: its population is the Reap
+  variant ledger plus the Tier B cart-link allowlist, and connected stores are in neither.
+  Measured 2026-09-27: 2 active connected Shopify stores (one host, 2 cached products), 0 facts.
+  The connected lane's served `market` and its `market_observed` are unchanged; only the gate reads
+  `request_market`.
+* A link the caller hands the prefetched lane already minted (`external_redirect_url` on the
+  candidate) is left as minted. The gateway's JS-built candidates carry none today.
+* `tests/test_purchase_gate_market_not_defaulted.py::test_every_purchasability_gate_is_built_on_the_request_market`
+  resolves every `_CartPurchasabilityGate(...)` argument back to its leaves against an exact list.
 
 ### Rolling back
 

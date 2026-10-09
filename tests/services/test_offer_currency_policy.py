@@ -387,7 +387,7 @@ def _lane(monkeypatch):
                 (result or {}).get("products", []) if isinstance(result, dict) else []
             )
 
-        async def _record_redirects(products, tool=None):
+        async def _record_redirects(products, tool=None, request_market=None):
             seen["redirects"].extend(products or [])
             return None
 

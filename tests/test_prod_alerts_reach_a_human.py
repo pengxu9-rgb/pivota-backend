@@ -86,12 +86,10 @@ def test_the_inferred_default_is_not_reachable_from_prod(source: str) -> None:
 
 
 def test_the_verification_check_covers_the_create_branch(source: str) -> None:
-    """The CREATE arm is the one that manufactures an undeliverable channel.
+    """Both newly created and reused channels need an actual resource read.
 
-    An API-created email channel is born UNVERIFIED. Putting the check only in the
-    reuse arm instruments the branch that observes the damage and stays silent on
-    the branch that causes it — which is exactly how the live 08-28 channel came to
-    exist while the script printed a clean summary.
+    Either can explicitly require verification or have no applicable verification
+    state; neither is evidence of receipt by the intended person.
 
     Asserts by position: the check must sit after the `fi` that closes the
     create/reuse if-else, not inside either arm.
@@ -106,45 +104,31 @@ def test_the_verification_check_covers_the_create_branch(source: str) -> None:
 
 
 def test_an_unverified_channel_is_surfaced(source: str) -> None:
-    """Cloud Monitoring delivers nothing to an unverified email channel.
-
-    The live channel on 2026-08-28 reported no verificationStatus at all, so every policy was
-    firing into the void with no signal anywhere that this was happening.
-    """
+    """Explicit UNVERIFIED fails, distinct from an omitted/exempt state."""
     body = _uncommented(source)
     assert "verificationStatus" in body
-    assert '[ "$CHANNEL_VERIFIED" != VERIFIED ]' in body
+    assert '[ "$CHANNEL_VERIFIED" = UNVERIFIED ]' in body
+    assert '"VERIFICATION_STATUS_UNSPECIFIED"' in body
     # SHORTEST-prefix strip. `##` yields a bare channel id, the GET 404s, the
     # status reads empty and the warning fires on every run including a genuinely
     # verified channel — a permanent false alarm is worse than no alarm, because
     # it teaches the operator to skip the one line that matters.
     assert '${CHANNEL#projects/*/}' in body
     assert '${CHANNEL##projects/*/}' not in body
-    # An undeliverable channel must fail the run, not just print to stderr.
-    assert "CHANNEL_UNDELIVERABLE" in body and "exit 1" in body
+    # A nonfunctioning channel must fail BEFORE any policy/metric/uptime writes.
+    unverified = body.split('if [ "$CHANNEL_VERIFIED" = UNVERIFIED ]; then', 1)[1]
+    assert "exit 1" in unverified.split("elif", 1)[0]
+    assert body.index('if [ "$CHANNEL_VERIFIED" = UNVERIFIED ]; then') < body.index('UP="$(api GET uptimeCheckConfigs)"')
 
 
 def test_the_lb_5xx_threshold_is_reachable_at_real_traffic(source: str) -> None:
-    """0.2 req/s asks for 12 5xx per second on an API serving ~0.03 req/s.
-
-    A total outage returning 5xx to every caller still sat an order of magnitude under it, which
-    is why this policy had never fired once. The assertion is on the *magnitude* rather than an
-    exact number so the threshold stays tunable — what must not come back is a value that no
-    achievable failure can reach.
-    """
-    body = _uncommented(source)
-    assert "COMPARISON_GT 0.2 300s" not in body, "the unreachable threshold is back"
-    marker = "prod: load balancer 5xx"
-    idx = body.rindex(marker)
-    tail = body[idx : idx + 800]
-    threshold = float(tail.split("COMPARISON_GT")[1].split()[0])
-    assert threshold <= 0.05, (
-        f"threshold {threshold}/s is unreachable at ~0.03 req/s baseline traffic"
-    )
-    # The window is half the claim: 0.01/s over 300s needs 4 errors, over 600s
-    # needs 7. The comment justifies the 600s figure, so a silent revert to 300s
-    # makes the rationale describe a policy that no longer exists.
-    assert "COMPARISON_GT %s 600s 600s" % tail.split("COMPARISON_GT")[1].split()[0] in tail
+    """Preserve the live 1% ratio and its 10-minute window as traffic changes."""
+    call = source.split('upsert "prod: load balancer 5xx"', 1)[1].split(')"', 1)[0]
+    assert '$(promql_policy' in call
+    assert 'response_code_class="500"}[10m]' in call
+    assert 'https_request_count{monitored_resource="https_lb_rule"}[10m]' in call
+    assert '> 0.01' in call
+    assert '600s 60s 3600s' in call
 
 
 def test_pool_exhaustion_has_its_own_alert(source: str) -> None:

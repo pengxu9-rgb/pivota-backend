@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 import stripe
 import httpx
 from config.settings import settings
+from utils.secret_fingerprint import secret_fingerprint
 
 
 _STRIPE_REQUEST_TIMEOUT_SECONDS = max(
@@ -723,7 +724,7 @@ class AdyenAdapter(PSPAdapter):
             # Debug info to verify which credentials are actually used in production
             print(
                 f"🔍 Adyen: Creating payment for {amount} {currency} | "
-                f"merchant={self.merchant_account} | key_prefix={self.api_key[:12]} | len={len(self.api_key)}"
+                f"merchant={self.merchant_account} | key={secret_fingerprint(self.api_key)}"
             )
             
             headers = {

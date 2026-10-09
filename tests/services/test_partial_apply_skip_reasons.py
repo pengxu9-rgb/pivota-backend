@@ -120,7 +120,11 @@ def real_resolver(monkeypatch):
     monkeypatch.setattr(identity, "resolve_or_attach_content_identity", tracking)
     monkeypatch.setattr(writer, "write_writer_audit_log", AsyncMock())
     # Stages after the PDP one read the process pool; they are not what these tests are about.
-    monkeypatch.setattr(writer, "guard_catalog_offer_rows", AsyncMock(side_effect=lambda offers: (offers, {}, [])))
+    async def accept_live_offers(offers, *, require_live_links=False):
+        assert require_live_links is True
+        return offers, {}, []
+
+    monkeypatch.setattr(writer, "guard_catalog_offer_rows", AsyncMock(side_effect=accept_live_offers))
     monkeypatch.setattr(writer, "_derive_seed_seller_for_plan_row", AsyncMock(return_value=("seller", "cross")))
     monkeypatch.setattr(writer, "_apply_inci_rows", AsyncMock(return_value={}))
     return state

@@ -23,6 +23,7 @@ from db.agents import (
     update_agent_stats
 )
 from utils.logger import logger
+from utils.secret_fingerprint import secret_fingerprint
 from utils.transient_errors import db_busy_http_exception
 import os
 import base64
@@ -454,7 +455,7 @@ async def get_agent_context(
     except Exception:
         pass
     if not agent:
-        logger.warning(f"Invalid API key attempted: {api_key[:10]}...")
+        logger.warning(f"Invalid API key attempted: key={secret_fingerprint(api_key)}")
         raise HTTPException(
             status_code=401,
             detail="Invalid API Key"

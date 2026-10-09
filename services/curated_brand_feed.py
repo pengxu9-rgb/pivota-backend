@@ -35,10 +35,27 @@ from services.catalog_identity import validated_source_gtin
 from services import storefront_currency
 
 from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
-from services import crawl_politeness
+from services import crawl_politeness, shopify_edge_pacer
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 
 logger = logging.getLogger("curated_brand_feed")
+
+
+def _note_response(url: str, resp: Any) -> None:
+    """Feed one storefront response back to the crawl gates -- the ONE place this module does it.
+
+    crawl_politeness paces the next request to this host (unchanged) and, given the headers, forwards
+    them to any installed IP-throttle breaker and puts their throttle diagnostics on a 429/503
+    backoff line (#2473). The shared Shopify-edge pacer (#2474) learns the host that ANSWERED as
+    Shopify-served from its response headers, so later requests to it share the crawl IP's budget.
+    Both pacer calls are no-ops unless CRAWL_SHOPIFY_EDGE_PACER_ENABLED is on."""
+    headers = getattr(resp, "headers", None)
+    crawl_politeness.note_response(
+        url, resp.status_code,
+        retry_after=headers.get("retry-after") if headers is not None else None,
+        headers=headers,
+    )
+    shopify_edge_pacer.learn_from_response(str(getattr(resp, "url", None) or url), headers)
 
 _UA = "PivotaCommerceIndex/1.0 (+https://pivota.cc; catalog coverage)"
 _PER_PAGE = 250  # Shopify max
@@ -258,6 +275,9 @@ async def fetch_shopify_shop_locale(
     host = _clean_domain(domain)
     if not host:
         return {"currency": None}
+    # /meta.json is a Shopify storefront endpoint: pace it on the shared Shopify-edge budget from
+    # the first request (a no-op with the pacer off).
+    shopify_edge_pacer.mark_shopify_host(host)
 
     async def _gated_fetch(url: str) -> Optional[str]:
         headers = {"User-Agent": _UA, "Accept": "application/json"}
@@ -268,9 +288,7 @@ async def fetch_shopify_shop_locale(
             ) as client:
                 await crawl_politeness.before_request(url, user_agent=_UA, max_wait=0)
                 resp = await client.get(url)
-                crawl_politeness.note_response(
-                    url, resp.status_code, retry_after=resp.headers.get("retry-after")
-                )
+                _note_response(url, resp)
                 if not _same_storefront_host(host, getattr(getattr(resp, "url", None), "host", None)):
                     return None
                 if resp.status_code != 200:
@@ -503,6 +521,14 @@ async def fetch_shopify_products(
     scanned = 0
     page = 1
     seen_pages: set = set()
+    # /products.json (and a collection's) is Shopify's storefront feed: this host is Shopify-served
+    # by construction, so every page of the crawl -- the first included -- is paced on the crawl IP's
+    # shared Shopify-edge budget (a no-op with CRAWL_SHOPIFY_EDGE_PACER_ENABLED off).
+    # MARKED BEFORE THE ANSWER, on purpose: page 1 is where pacing matters under a throttle. The cost
+    # is that a non-Shopify brand domain probed here (records_for_brand tries this first; such a
+    # domain returns nothing) spends one or two requests of the shared budget and stays cached as
+    # Shopify for this process. That can only slow its requests, never cause a 429 (review of #2477).
+    shopify_edge_pacer.mark_shopify_host(host)
     timeout = httpx.Timeout(timeout_s, connect=5.0)
     headers = {"User-Agent": _UA, "Accept": "application/json"}
     attempts = _page_attempts()
@@ -530,9 +556,7 @@ async def fetch_shopify_products(
                             raise
                         await asyncio.sleep(0.5 * (2 ** attempt))
                         continue
-                    crawl_politeness.note_response(
-                        url, resp.status_code, retry_after=resp.headers.get("retry-after")
-                    )
+                    _note_response(url, resp)
                     actual_host = getattr(getattr(resp, "url", None), "host", None)
                     if not _same_storefront_host(host, actual_host):
                         # A regional/sibling store can have a different catalog and
@@ -658,7 +682,8 @@ def _missing_barcode(variant: Dict[str, Any]) -> bool:
 
 
 async def _fetch_missing_variant_gtins(
-    product: Dict[str, Any], *, domain: str, client: httpx.AsyncClient,
+    product: Dict[str, Any], *, domain: str, client: httpx.AsyncClient, deadline: Optional[float] = None,
+    hosts: Optional[set] = None,
 ) -> Tuple[Dict[str, str], int]:
     """Return only validated (native variant ID -> GTIN), never detail-page copy.
 
@@ -683,13 +708,22 @@ async def _fetch_missing_variant_gtins(
             or any(source_ids.count(vid) != 1 for vid in wanted)):
         return {}, requests
     url = f"https://{host}/products/{quote(handle, safe='')}.js"
+    shopify_edge_pacer.mark_shopify_host(host)  # /products/<handle>.js is a Shopify endpoint
     try:
         for redirect in range(3):
-            await crawl_politeness.before_request(url, user_agent=_UA, max_wait=10.0)
+            # A request the shared Shopify-edge budget paces waits for its turn, bounded by what is left
+            # of the recovery's budget: a fixed 10s refused every product once that schedule was more
+            # than 10s out, while an unbounded wait slept out a 429'ing host's growing backoff product
+            # after product (~16h for 200). Any other request keeps main's 10s bound, so with the pacer
+            # off this is main exactly. A refusal (CrawlPaced) propagates to
+            # recover_missing_variant_gtins, which stops the batch and counts why (review of #2477).
+            if hosts is not None:
+                hosts.add(crawl_politeness.host_of(url))  # the redirect target too: blocks are its own
+            wait = _remaining_wait(deadline) if shopify_edge_pacer.applies(url) else 10.0
+            await crawl_politeness.before_request(url, user_agent=_UA, max_wait=wait)
             requests += 1
             response = await client.get(url)
-            crawl_politeness.note_response(url, response.status_code,
-                                           retry_after=response.headers.get("retry-after"))
+            _note_response(url, response)
             if not _same_storefront_host(host, getattr(getattr(response, "url", None), "host", None)):
                 return {}, requests
             if response.status_code in {301, 302, 303, 307, 308}:
@@ -722,18 +756,56 @@ async def _fetch_missing_variant_gtins(
                 if gtin:
                     recovered[vid] = gtin
             return recovered, requests
+    except crawl_politeness.CrawlPaced:
+        if requests:  # refused on a redirect hop: this product did ask, so it failed like any other
+            return {}, requests
+        raise  # refused before asking: not this product's failure; the caller stops and counts why
     except Exception as exc:
         logger.debug("GTIN recovery refused for %s/%s: %s", host, handle, type(exc).__name__)
     return {}, requests
 
 
+#: A GTIN recovery never runs longer than this (seconds). Above what the unthrottled path needs at the
+#: drain's pacing (200 products x CRAWL_MIN_INTERVAL_SECONDS 4 = 800s), so it bounds only a backed-up
+#: Shopify-edge schedule or a slow host; the INCI step's budget (pipeline.DRAIN_PDP_INCI_BUDGET_S) is
+#: the same 900s.
+GTIN_RECOVERY_BUDGET_S = 900.0
+#: Stop asking a host after this many 429/503s in a row: one, as on main, where the first throttle
+#: ended the batch after a single request. Asking again only feeds the throttle (2026-09-30).
+GTIN_RECOVERY_STOP_AFTER_BLOCKS = 1
+
+
+def _clock() -> float:
+    """The recovery budget's clock -- a seam, so a test can move it without moving asyncio's."""
+    return time.monotonic()
+
+
+def _remaining_wait(deadline: Optional[float]) -> float:
+    """The longest a paced request may wait for its turn: the rest of the budget. 0 means unbounded in
+    crawl_politeness, so no deadline -> 0, and an exhausted one raises rather than going unbounded."""
+    if deadline is None:
+        return 0
+    left = deadline - _clock()
+    if left <= 0:
+        raise crawl_politeness.CrawlPaced("GTIN recovery budget exhausted")
+    return left
+
+
 async def recover_missing_variant_gtins(
     products: List[Dict[str, Any]], *, domain: str, max_fetches: int = 100,
+    budget_s: Optional[float] = GTIN_RECOVERY_BUDGET_S,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Recover selected products only, before shade folding changes product identity.
 
-    attempted/recovered/failed/capped count PRODUCTS; recovered_gtins counts variant
-    barcodes and http_requests includes bounded redirect hops. A failed observation
+    attempted/recovered/failed/capped/paced count PRODUCTS; recovered_gtins counts variant
+    barcodes and http_requests includes bounded redirect hops. The batch STOPS, and the products it
+    did not attempt are counted by why -- never `failed`:
+      * blocked_stopped: the host, or a host it redirected to, answered GTIN_RECOVERY_STOP_AFTER_BLOCKS
+        429/503s in a row;
+      * budget_stopped: `budget_s` (GTIN_RECOVERY_BUDGET_S, 900s) ran out. It applies only with the
+        shared Shopify-edge pacer on, bounding each paced request's wait to what is left of it;
+      * paced: the crawl gate refused to wait (a Crawl-delay longer than we honour, or main's 10s
+        bound on a request the shared pacer does not gate). A failed observation
     never changes its product. Each attempt has at most three requests with the
     client's ten-second timeout, paced by the shared merchant crawl gate.
     """
@@ -743,15 +815,38 @@ async def recover_missing_variant_gtins(
               for p in products]
     candidates = [p for p in copied if any(isinstance(v, dict) and _missing_barcode(v)
                                           for v in p["variants"])]
-    report = {"attempted": 0, "recovered": 0, "failed": 0,
+    report = {"attempted": 0, "recovered": 0, "failed": 0, "paced": 0, "budget_stopped": 0,
+              "blocked_stopped": 0,
               "capped": max(0, len(candidates) - max_fetches), "recovered_gtins": 0, "http_requests": 0}
     if not candidates or not max_fetches:
         return copied, report
     async with httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(10.0, connect=5.0),
                                  headers={"User-Agent": _UA, "Accept": "application/json"}) as client:
-        for product in candidates[:max_fetches]:
+        batch = candidates[:max_fetches]
+        hosts = {_clean_domain(domain)}
+        # The budget bounds the shared pacer's waits; with the pacer off there is none, as on main.
+        deadline = _clock() + budget_s if budget_s and shopify_edge_pacer.enabled() else None
+        for index, product in enumerate(batch):
+            left = len(batch) - index
+            if max(crawl_politeness.consecutive_blocks(h) for h in hosts) >= GTIN_RECOVERY_STOP_AFTER_BLOCKS:
+                report["blocked_stopped"] = left
+                logger.warning("GTIN recovery for %s stopped: the host is throttling (429/503); %d "
+                               "product(s) not attempted", domain, left)
+                break
+            try:
+                _remaining_wait(deadline)  # raises once the budget is spent, before counting an attempt
+                recovered, requests = await _fetch_missing_variant_gtins(
+                    product, domain=domain, client=client, deadline=deadline, hosts=hosts)
+            except crawl_politeness.CrawlPaced as exc:
+                # Refused before any request for this product: it is not attempted, and neither is
+                # anything after it.
+                budget_spent = deadline is not None and not isinstance(exc, crawl_politeness.CrawlDelayTooLong)
+                key = "budget_stopped" if budget_spent else "paced"
+                report[key] = left
+                logger.warning("GTIN recovery for %s stopped (%s: %s); %d product(s) not attempted",
+                               domain, key, type(exc).__name__, left)
+                break
             report["attempted"] += 1
-            recovered, requests = await _fetch_missing_variant_gtins(product, domain=domain, client=client)
             report["http_requests"] += requests
             applied = 0
             for variant in product["variants"]:
@@ -1245,9 +1340,7 @@ async def fetch_pdp_description(
                 follow_redirects=True, timeout=timeout, headers=headers
             ) as c:
                 resp = await c.get(url)
-        crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
-        )
+        _note_response(url, resp)
         if resp.status_code != 200:
             return None
         return description_from_pdp_html(resp.text)
@@ -1291,9 +1384,7 @@ async def fetch_shop_description(
                 follow_redirects=True, timeout=timeout, headers=headers
             ) as c:
                 resp = await c.get(url)
-        crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
-        )
+        _note_response(url, resp)
         if resp.status_code != 200:
             return None
         return description_from_pdp_html(resp.text)
@@ -1330,6 +1421,7 @@ async def fetch_shop_description_from_meta(
     if not host:
         return None
     url = f"https://{host}/meta.json"
+    shopify_edge_pacer.mark_shopify_host(host)  # a Shopify storefront endpoint
     timeout = httpx.Timeout(timeout_s, connect=5.0)
     headers = {"User-Agent": _UA, "Accept": "application/json"}
     try:
@@ -1341,9 +1433,7 @@ async def fetch_shop_description_from_meta(
                 follow_redirects=True, timeout=timeout, headers=headers
             ) as c:
                 resp = await c.get(url)
-        crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
-        )
+        _note_response(url, resp)
         if resp.status_code != 200:
             return None
         # THE ANSWER MUST COME FROM THE HOST WE ASKED. `follow_redirects=True` with no check
@@ -1407,9 +1497,7 @@ async def fetch_pdp_inci(
                 follow_redirects=True, timeout=timeout, headers=headers
             ) as c:
                 resp = await c.get(url)
-        crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
-        )
+        _note_response(url, resp)
         if resp.status_code != 200:
             return None
         return inci_from_pdp_html(resp.text)
@@ -1534,6 +1622,34 @@ RETAILER_BRAND_SPELLINGS = {
     "etudehouse": "etude", "etude": "etude",
     # _brand_key keeps accents (isalnum), so the accented spellings are keys of their own (review of #2440).
     "étudehouse": "etude", "étude": "etude",
+    # K-beauty / US wave, measured in prod 2026-09-30 over the 13,337 rows ingested 09-23..09-29: each brand
+    # below was stored under two or three spellings that differ ONLY in case (normalize_brand lowercases, so
+    # every spelling of one brand already shares a content_key -- these families move no identity, and so,
+    # unlike ETUDE, may reach the drain before the old rows are relabelled). The vendor's case decided the
+    # display brand: dodoskin.com/holiholic.com "MISSHA" (413 retailer rows) vs misshaus.com "Missha" (149);
+    # eyurs.com "ROUND LAB" vs roundlab.com "Round Lab"; skin1004.com itself writes both "SKIN1004" and
+    # "Skin1004"; cocomo.sg "ANUA"/"ISNTREE"/"GENABELLE"/"MOLVANY"/"ARENCIA". "Centellian 24" (one merchant
+    # row, not a crawl lane) splits by a space; the crawl lanes only ever wrote "Centellian24"/"CENTELLIAN24",
+    # so that family moves no stored crawl row's identity either.
+    # NOT here yet, because they DO move identity (see services/brand_relabel.py ORDER): "O HUI (오휘)" /
+    # "Jung Saem Mool" (smkoreabeauty.com retailer rows -- relabel first), "APIEU" (misshaus.com brand rows --
+    # the product_key moves too), "Supergoop" (supergoop.com brand rows -- no relabel tool reaches them).
+    "missha": "missha", "mixsoon": "mixsoon", "roundlab": "roundlab", "anua": "anua", "arencia": "arencia",
+    "skin1004": "skin1004", "medicube": "medicube", "beautyofjoseon": "beautyofjoseon",
+    "theordinary": "theordinary", "isntree": "isntree", "centellian24": "centellian24",
+    "makeupforever": "makeupforever", "genabelle": "genabelle", "maybelline": "maybelline",
+    "bobbibrown": "bobbibrown", "molvany": "molvany", "byterry": "byterry",
+    # Identity-changing, added only AFTER its rows were relabelled (services/brand_relabel.py ORDER): smkoreabeauty.com
+    # wrote "Jung Saem Mool" (5 retailer rows; normalize_brand keeps the spaces, so its content_key differed from
+    # jsmbeauty.sg's "JUNGSAEMMOOL"). Relabelled by scripts/relabel_retailer_brand.py --family jungsaemmool (run id
+    # in this change's PR); a re-crawl now writes "JUNGSAEMMOOL" onto the relabelled key instead of the old one.
+    "jungsaemmool": "jungsaemmool",
+    # Same ORDER: smkoreabeauty.com wrote "O HUI (오휘)" on 20 retailer rows (_brand_key keeps the Hangul, so its key
+    # differs from "O HUI"). 18 were relabelled (relabel_retailer_brand.py --family ohui, run relabel_fad2cefd5223);
+    # the 2 the relabel held -- a 2-piece and a 3-piece Extreme White set sharing one GTIN, hence one content_key --
+    # were withdrawn first (withdraw_catalog_rows.py, reason ohui_set_gtin_collision). Neither had a product group,
+    # so a re-crawl that re-keys them cannot trip _ensure_primary_retailer_group.
+    "ohui": "ohui", "ohui오휘": "ohui",
 }
 # The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
 # --brand. content_key is
@@ -1577,6 +1693,29 @@ RETAILER_BRAND_CANONICAL = {
     "lukbeautifood": "Lük Beautifood",
     # The brand's own current name (etude.com). Every family member is relabelled to it (see the spellings note).
     "etude": "ETUDE",
+    # 2026-09-30 wave. Rule: the spelling the catalog already carries on the rows the retailer relabel tool
+    # cannot reach (brand-official / merchant rows, not ext:retailer:), so repairing the existing rows is the
+    # reviewed relabel of retailer rows alone. Rows per spelling outside ext:retailer: in parentheses. It
+    # agrees with the brand's own styling where that is clear (SKIN1004, The Ordinary, Beauty of Joseon).
+    "missha": "Missha",                     # misshaus.com 149 (vs "MISSHA" 0; 413 retailer rows)
+    "mixsoon": "Mixsoon",                   # 225 (vs "MIXSOON" 4, mixsoon.us)
+    "roundlab": "Round Lab",                # roundlab.com 88 (vs "ROUND LAB" 42)
+    "anua": "Anua",                         # anua.com/anua.us 86 (vs "ANUA" 6, all suppressed)
+    "arencia": "Arencia",                   # 126 (vs "ARENCIA" 21)
+    "skin1004": "SKIN1004",                 # skin1004.com 93 (vs "Skin1004" 48)
+    "medicube": "MEDICUBE",                 # 66 (vs "Medicube" 17, medicube.us)
+    "beautyofjoseon": "Beauty of Joseon",   # beautyofjoseon.com 103 (vs "BEAUTY OF JOSEON" 2, suppressed)
+    "theordinary": "The Ordinary",          # 109 (vs "the ordinary" 5)
+    "isntree": "Isntree",                   # isntree-global.com 58 (vs "ISNTREE" 5, suppressed)
+    "centellian24": "Centellian24",         # centellian24usa.com 106 (vs "Centellian 24" 1, "CENTELLIAN24" 1)
+    "makeupforever": "MAKE UP FOR EVER",    # makeupforever.sg 74 (vs "Make Up For Ever" 0; 4 retailer rows)
+    "genabelle": "Genabelle",               # 31 (vs "GENABELLE" 8, suppressed)
+    "maybelline": "Maybelline",             # 25 (vs "MAYBELLINE" 0; 12 retailer rows)
+    "bobbibrown": "Bobbi Brown",            # 9 (vs "BOBBI BROWN" 0; 17 retailer rows)
+    "molvany": "Molvany",                   # 10 (vs "MOLVANY" 4, suppressed)
+    "byterry": "BY TERRY",                  # retailer rows only (11 vs "By Terry" 4): the brand's own styling
+    "jungsaemmool": "JUNGSAEMMOOL",         # jsmbeauty.sg 171 (vs smkoreabeauty.com "Jung Saem Mool" 5, relabelled)
+    "ohui": "O HUI",                        # 409 retailer rows (vs smkoreabeauty.com "O HUI (오휘)" 20: 18 relabelled, 2 withdrawn)
 }
 
 
