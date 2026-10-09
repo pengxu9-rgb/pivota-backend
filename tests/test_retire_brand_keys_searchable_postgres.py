@@ -98,3 +98,17 @@ async def test_a_new_key_public_only_through_an_offer_row_is_kept(db, monkeypatc
                                 {"old0": {"suppression_reason": None, "source_domain": "store.example"}},
                                 {"new0"}, "store.example", serving={"old0", "new0"}, searchable=searchable)
     assert out["live"] == [] and [c["stale_key"] for c in out["new_not_serving"]] == ["old0"]
+
+
+async def test_the_post_retire_trust_check_reads_only_the_product_s_own_public_row(db, monkeypatch):
+    """PUBLIC_TRUST_SQL (write_retire's check after the trust refresh) joins the way the gateway's serving index
+    does: a retired key reads still-public only by ITS product trust row, never by an offer / listing row that
+    names it, and a key with no trust row is not public."""
+    await _seed(db, products=[("k_public", None), ("k_blocked", None), ("k_offer_only", None), ("k_none", None)],
+                trust=[("product", "k_public", "k_public", "public"),
+                       ("product", "k_blocked", "k_blocked", "blocked"),
+                       ("offer", "off_1", "k_offer_only", "public"),
+                       ("listing", "lst_1", "k_blocked", "public")])
+    rows = await db.fetch_all(tool.PUBLIC_TRUST_SQL,
+                              {"keys": ["k_public", "k_blocked", "k_offer_only", "k_none", "k_absent"]})
+    assert [r["subject_key"] for r in rows] == ["k_public"]

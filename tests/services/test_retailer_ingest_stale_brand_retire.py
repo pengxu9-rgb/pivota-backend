@@ -55,6 +55,7 @@ def retire(env, monkeypatch):  # noqa: F811
         return feed.ShopifyProductBatch([official(*TINT)], scanned_products=1, pages=1)
     monkeypatch.setattr(feed, "records_for_brand", fetch)
     st = SimpleNamespace(plan=fake_plan(), plans=[], writes=[], write_error=None, events=[], manifests={},
+                         trust={"trust": 2},
                          readback={"ok": True, "retired": 2, "new_live": 2, "new_serving": 2, "problems": []},
                          preview_error=None)
 
@@ -72,7 +73,7 @@ def retire(env, monkeypatch):  # noqa: F811
         if st.write_error:
             raise st.write_error
         st.writes.append(prepared["keys"])
-        return {"products": len(prepared["keys"]), "seeds": 1, "offers": 3}
+        return {"products": len(prepared["keys"]), "seeds": 1, "offers": 3, **st.trust}
 
     async def record_retire_manifest(run_id, manifest, db=None):
         st.events.append(("manifest", run_id))
@@ -168,6 +169,26 @@ async def test_a_readback_that_disagrees_fails_the_job_for_a_human(env, retire):
     out = await pipeline.run_stage(rjob(), db=env.db)
     assert out["status"] == "failed" and out["stale_brand_retire"] == "readback_failed"
     assert "revert with retire_superseded_brand_keys revert --ingest-run" in env.ledger.transitions[-1]["reason"]
+
+
+async def test_a_retire_whose_trust_did_not_refresh_fails_the_job_with_the_re_run(env, retire):  # noqa: F811
+    """The tombstones committed; their catalog_row_trust rows still read public. Not 'nothing retired', not a
+    revert: the job fails for a human with the refresh to re-run."""
+    retire.trust = {"trust": 1, "trust_problems": ["1 of 2 key(s) not rewritten"]}
+    out = await pipeline.run_stage(rjob(), db=env.db)
+    assert out["status"] == "failed" and out["outcome"] == "applied"
+    assert out["stale_brand_retire"] == "trust_not_refreshed"
+    reason = env.ledger.transitions[-1]["reason"]
+    assert "retired 2 key(s)" in reason and "refresh-trust --ingest-run" in reason
+    assert "1 of 2 key(s) not rewritten" in reason and "revert" not in reason
+
+
+async def test_a_readback_failure_outranks_a_trust_failure(env, retire):  # noqa: F811
+    retire.trust = {"trust": 1, "trust_problems": ["1 of 2 key(s) not rewritten"]}
+    retire.readback = {"ok": False, "retired": 2, "new_live": 1, "new_serving": 1,
+                       "problems": ["new key not live: new1"]}
+    out = await pipeline.run_stage(rjob(), db=env.db)
+    assert out["stale_brand_retire"] == "readback_failed"
 
 
 async def test_an_apply_that_did_not_verify_never_retires(env, retire):  # noqa: F811
@@ -437,10 +458,17 @@ async def test_revert_restores_only_rows_still_carrying_its_tombstone(monkeypatc
          "products": [{"product_key": k, "prior_suppression_reason": None, "prior_suppressed_at": None,
                        "prior_suppression_metadata": None} for k in ("k_ours", "k_retired_again")],
          "seeds": [{"id": "s1", "prior_status": "active"}]}
+    refreshed = []
+
+    async def trust_many(*, db, product_keys):
+        refreshed.append(list(product_keys))
+        return len(product_keys)
+    monkeypatch.setattr(retire_tool, "upsert_catalog_row_trust_many", trust_many)
     await retire_tool.revert_manifest(m)
     assert calls == [("unsuppress", "k_ours", "retire_x", retire_tool.REASON),
                      ("unsuppress", "k_retired_again", "retire_x", retire_tool.REASON),
                      ("seed", "s1", ("k_ours",))]
+    assert refreshed == [["k_ours"]]
 
 
 async def test_revert_never_revives_a_row_whose_url_a_live_retailer_listing_now_owns(monkeypatch):
@@ -475,8 +503,15 @@ async def test_revert_never_revives_a_row_whose_url_a_live_retailer_listing_now_
          "products": [{"product_key": k, "prior_suppression_reason": None, "prior_suppressed_at": None,
                        "prior_suppression_metadata": None} for k in ("k_owned", "k_free")],
          "seeds": [{"id": "s1", "prior_status": "active"}]}
+    refreshed = []
+
+    async def trust_many(*, db, product_keys):
+        refreshed.append(list(product_keys))
+        return len(product_keys)
+    monkeypatch.setattr(retire_tool, "upsert_catalog_row_trust_many", trust_many)
     await retire_tool.revert_manifest(m)
     assert calls == [("unsuppress", "k_free"), ("seed", "s1", ("k_free",))]
+    assert refreshed == [["k_free"]]
 
 
 # --- queue review of #2426: search is a second surface, gated per ROW --------------------------------------
