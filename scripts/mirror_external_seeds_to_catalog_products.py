@@ -483,6 +483,26 @@ def _seed_gtin(seed_data: Any) -> Optional[str]:
     return None
 
 
+def _seed_variants(seed_data: Any) -> List[Dict[str, Any]]:
+    """Every barcoded variant in the crawled seed_data snapshot, as [{barcode, title}] for the
+    resolve-or-attach primitive's `variants` (F2, 2026-10-10). _seed_gtin reads the FIRST variant
+    only; a multi-shade snapshot's other barcodes were never matched. Titles travel with the
+    barcodes so a barcode the store reuses across shades is recognized and not matched on."""
+    if not isinstance(seed_data, dict):
+        return []
+    variants = seed_data.get("variants")
+    out: List[Dict[str, Any]] = []
+    for v in variants if isinstance(variants, list) else []:
+        if not isinstance(v, dict):
+            continue
+        for key in ("barcode", "gtin", "upc", "ean"):
+            value = str(v.get(key) or "").strip()
+            if value:
+                out.append({"barcode": value, "title": v.get("title")})
+                break
+    return out
+
+
 async def _ensure_external_seed_merchant() -> None:
     """Phase 7d: idempotent UPSERT of the singleton 'external_seed'
     merchant row. Path B has all mirrored products under one synthetic
@@ -1458,6 +1478,7 @@ async def _apply(limit: int) -> Dict[str, Any]:
                     "source_domain": row_dict.get("domain"),
                     "product_key": product_key,
                 },
+                variants=_seed_variants(row_dict.get("seed_data")),
             )
             if ident.get("action") == _IDENTITY_SKIP:
                 skipped_brand_guard += 1
