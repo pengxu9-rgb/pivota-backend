@@ -55,6 +55,12 @@ _OPTION_TYPES = {
     # gift-set shelf, not dropped -- shoppers look for gift sets; the harm was the shelf. These handles
     # are filed under REFILE_SETS_LEAF before any check runs.
     "refile_to_sets": list,
+    # Reviewer decision, one product at a time: {handle: taxonomy leaf}. For a product the taxonomy
+    # cannot place from what the store says (Tower 28's "ShineOn Plumping Lip Jelly": blank type, and
+    # "lip jelly" names no leaf) and that a reviewer has read -- the brand calls it "a pain-free lip
+    # plumping gloss". Filed before any check runs, like refile_to_sets; never a pattern, so it moves
+    # only the rows it names. Sets go through refile_to_sets, which answers the set flags.
+    "refile_to_leaf": dict,
     "accepted_flags": list,
     # Accept every same_key_other_listing flag of this job at once (COCODOR raised 89): a reviewer who has
     # read the listings left out -- each is still recorded as a flag on the run.
@@ -135,6 +141,11 @@ CATEGORY_CONFIDENCE_REVIEW_REFILE = 0.74
 #: shelf" and "the title names another shelf" (its contents) are resolved. Every other flag still runs
 #: -- on the row as the STORE filed it too, since the lip rules key on the store's shelf.
 REFILE_RESOLVES_RULES = frozenset({"set_filed_as_single_product", "title_contradicts_category"})
+#: ...and the flag a re-file to a named leaf answers: the reviewer chose the shelf. A set flag on such a row
+#: still holds -- a set goes through refile_to_sets.
+REFILE_LEAF_RESOLVES_RULES = frozenset({"title_contradicts_category"})
+#: A re-file to a leaf is a per-product decision, not a cohort rule.
+MAX_REFILE_TO_LEAF = 50
 
 _handle_key = ledger.handle_key
 MAX_PDP_IDENTITY_FETCHES = 300
@@ -166,6 +177,33 @@ WRITE_LOCK_RETRY_OUTCOMES = ("write_lock_busy", "write_lock_unavailable")
 WRITE_LOCK_STARVED_AFTER = 12
 # Integer options where 0 is meaningful ("fetch none"); every other integer option must be >= 1.
 _ZERO_ALLOWED_INT_OPTIONS = frozenset({"max_pdp_inci_fetches"})
+
+
+def _validate_refile_to_leaf(options: Dict[str, Any]) -> None:
+    """options.refile_to_leaf: non-empty handles, each to a real taxonomy leaf; no handle also excluded or
+    re-filed to sets. Leaves are stored as given after normalisation (trimmed, no edge slashes, lower case)."""
+    mapping = options.get("refile_to_leaf")
+    if mapping is None:
+        return
+    from services.category_path_aliases import TAXONOMY_LEAVES
+    if len(mapping) > MAX_REFILE_TO_LEAF:
+        raise ValueError(f"options.refile_to_leaf names at most {MAX_REFILE_TO_LEAF} products")
+    normalised = {}
+    for handle, leaf in mapping.items():
+        if not isinstance(handle, str) or not handle.strip() or not isinstance(leaf, str):
+            raise ValueError("options.refile_to_leaf must map non-empty handles to taxonomy leaves")
+        path = leaf.strip().strip("/").lower()
+        if path not in TAXONOMY_LEAVES:
+            raise ValueError(f"options.refile_to_leaf: {leaf!r} is not a taxonomy leaf")
+        if path == REFILE_SETS_LEAF:
+            raise ValueError("options.refile_to_leaf: re-file a set with options.refile_to_sets")
+        normalised[handle] = path
+    options["refile_to_leaf"] = normalised
+    keys = {_handle_key(h) for h in normalised}
+    for other in ("exclude_handles", "refile_to_sets"):
+        both = sorted(keys & {_handle_key(h) for h in options.get(other) or []})
+        if both:
+            raise ValueError(f"a handle cannot be both re-filed to a leaf and in options.{other}: {both}")
 
 
 def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
@@ -255,6 +293,7 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
                      & {_handle_key(h) for h in options.get("exclude_handles") or []})
     if overlap:
         raise ValueError(f"a handle cannot be both re-filed and excluded: {overlap}")
+    _validate_refile_to_leaf(options)
     if int(options.get("max_pdp_identity_fetches") or 0) > MAX_PDP_IDENTITY_FETCHES:
         # Each fetch waits CRAWL_MIN_INTERVAL_SECONDS (4s): 300 is ~20 min of one stage already.
         raise ValueError(f"options.max_pdp_identity_fetches must be at most {MAX_PDP_IDENTITY_FETCHES}")
@@ -800,6 +839,36 @@ def _refile_to_sets(records: List[Dict[str, Any]], handles: Any, checks: Dict[st
     return matched, as_filed
 
 
+def _refile_to_leaf(records: List[Dict[str, Any]], mapping: Any, checks: Dict[str, Any],
+                    flags: List[Dict[str, Any]]) -> tuple:
+    """File each reviewer-named product under its named leaf; returns (handles re-filed, each re-filed record
+    AS THE STORE FILED IT, for the detectors). A named handle the crawl no longer carries blocks, like an
+    unmatched exclusion -- accept its key to go on."""
+    import copy
+    import scripts.onboard_curated_brands as cli
+    # normalised here too: execution validates a COPY of the options, so the stored spelling arrives as given
+    wanted = {_handle_key(h): str(leaf).strip().strip("/").lower()
+              for h, leaf in (mapping or {}).items() if str(h).strip()}
+    if not wanted:
+        return set(), []
+    matched, as_filed = {}, []
+    for record in records:
+        handle = cli._record_handle(record)
+        pdp = record.get("pdp")
+        if handle in wanted and isinstance(pdp, dict):
+            as_filed.append(copy.deepcopy(record))
+            pdp["category_path"] = wanted[handle]
+            pdp["category_resolution_status"] = "resolved"
+            pdp["category_confidence"] = CATEGORY_CONFIDENCE_REVIEW_REFILE
+            matched[handle] = wanted[handle]
+    checks["refiled_to_leaf"] = dict(sorted(matched.items()))
+    for handle in sorted(set(wanted) - set(matched)):
+        flags.append({"key": f"refile_leaf_handle_unmatched:{handle}", "rule": "refile_leaf_handle_unmatched",
+                      "severity": detectors.BLOCK, "handle": handle,
+                      "detail": "an approved re-file to a leaf no longer matches any product"})
+    return set(matched), as_filed
+
+
 async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Narrow, plan and run every check. Returns the plan plus a verdict; never writes."""
     import scripts.onboard_curated_brands as cli
@@ -842,7 +911,9 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
             flags.append({"key": f"exclude_handle_unmatched:{handle}", "rule": "exclude_handle_unmatched",
                           "severity": detectors.BLOCK, "handle": handle,
                           "detail": "an approved exclusion no longer matches any product"})
-    refiled, refiled_as_filed = _refile_to_sets(records, o.get("refile_to_sets"), checks, flags)
+    set_refiled, refiled_as_filed = _refile_to_sets(records, o.get("refile_to_sets"), checks, flags)
+    leaf_refiled, leaf_refiled_as_filed = _refile_to_leaf(records, o.get("refile_to_leaf"), checks, flags)
+    refiled, refiled_as_filed = set_refiled | leaf_refiled, refiled_as_filed + leaf_refiled_as_filed
     if o.get("only_category") or o.get("only_resolved_category"):
         selected = len(records)
         # A reviewer's re-file is kept whatever the cohort's category filter: a lip pass that re-files a
@@ -893,7 +964,9 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
         # the shelf, never the price), and the re-filed handful is not a store (20 $1 sets must not read as one).
         seen = {f["key"] for f in row_flags}
         row_flags += [f for f in detectors.detect(refiled_as_filed, store_level=False) if f["key"] not in seen]
-        answered = [f for f in row_flags if f.get("handle") in refiled and f.get("rule") in REFILE_RESOLVES_RULES]
+        answered = [f for f in row_flags
+                    if (f.get("handle") in set_refiled and f.get("rule") in REFILE_RESOLVES_RULES)
+                    or (f.get("handle") in leaf_refiled and f.get("rule") in REFILE_LEAF_RESOLVES_RULES)]
         row_flags = [f for f in row_flags if f not in answered]
         checks["refile_resolved_flags"] = sorted(f["key"] for f in answered)
     # A listing the plan left out because an earlier one on this host has its title (one content key).

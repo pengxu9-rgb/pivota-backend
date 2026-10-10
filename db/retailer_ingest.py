@@ -44,7 +44,7 @@ def scope_key(domain: str, brand: str, options: Dict[str, Any]) -> str:
     """One open job per (host, brand, scope). Operator bookkeeping (approvals, accepted flags,
     exclusions added at review) is NOT scope: approving a job must not let a duplicate enqueue."""
     scope = {k: v for k, v in (options or {}).items()
-             if k not in {"accepted_flags", "exclude_handles", "refile_to_sets", "notes"}}
+             if k not in {"accepted_flags", "exclude_handles", "refile_to_sets", "refile_to_leaf", "notes"}}
     # options.market IS scope ((host, brand, market) is one cohort), but an absent market MEANS "US"
     # (pipeline.DEFAULT_MARKET; a literal here because the pipeline imports this module). So "US" in any
     # case is dropped and every other value upper-cased: {"market": "US"} and no market at all are one
