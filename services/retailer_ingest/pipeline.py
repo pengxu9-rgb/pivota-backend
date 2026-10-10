@@ -1386,6 +1386,10 @@ async def _retire_stale_brand(job: Dict[str, Any], run_id: str, records: List[Di
             p = await retire_tool.plan_for_cohort(cohort, job["domain"], job["brand"],
                                                   job["options"].get("category_path") or "beauty", stale)
             out.update(_retire_counts(p))
+            if p.get("handover_error"):
+                # The plan handed nothing over and kept those pairs as "new key does not serve yet"; without this
+                # the status line would read like an ordinary wait, not a failed check.
+                out["handover_error"] = p["handover_error"]
             prepared = retire_tool.prepare_retire(p)
             if not prepared:
                 out["outcome"] = "nothing_to_retire"
@@ -1434,6 +1438,9 @@ def _retire_reason(r: Dict[str, Any]) -> str:
                                                 ("foreign", "owned by another source"))
             if r.get(k)]
     tail = f"; kept {', '.join(kept)}" if kept else ""
+    if r.get("handover_error"):
+        tail += (f"; the canonical handover check FAILED ({r['handover_error']}), so a pair whose old row holds its "
+                 "content_key's canonical URL was kept, not handed over")
     if r["outcome"] == "retired":
         handed = r["counts"].get("canonical_handovers")
         moved = f", {handed} with the canonical URL handed to the new key" if handed else ""
@@ -1445,7 +1452,8 @@ def _retire_reason(r: Dict[str, Any]) -> str:
                 f"scripts/retire_superseded_brand_keys.py --stale-brand by hand")
     if r["outcome"] == "trust_not_refreshed":
         return (f"{head}retired {r['counts']['products']} key(s) ({r['retire_run_id']}) but their catalog_row_trust "
-                f"was not refreshed: {r['counts']['trust_problems'][:3]}; they stay publicly listed until "
+                f"was not refreshed: {r['counts']['trust_problems'][:3]}; their trust rows keep the old decision (a retired "
+                f"row stays publicly listed, a new row the canonical URL was handed to stays unlisted) until "
                 f"retire_superseded_brand_keys refresh-trust --ingest-run <this run> (or the trust backfill cron)")
     if r["outcome"] == "readback_failed":
         return (f"{head}retired {r['counts']['products']} key(s) ({r['retire_run_id']}) but the read-back "
