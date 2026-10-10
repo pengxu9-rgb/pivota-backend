@@ -621,3 +621,30 @@ def test_the_counts_and_the_status_line_name_the_handovers():
     assert "retired 2 key(s) (retire_x), 1 with the canonical URL handed to the new key" in pipeline._retire_reason(r)
     r["counts"].pop("canonical_handovers")
     assert "canonical URL" not in pipeline._retire_reason(r)
+
+
+async def test_a_failed_handover_check_is_named_in_the_run_and_the_status_line(env, retire):  # noqa: F811
+    """The plan hands nothing over when its check fails and keeps those pairs as "new key does not serve yet" -- the
+    Tower 28 stalemate's own wording. The status line must say the check failed, not read like an ordinary wait."""
+    retire.plan = {**fake_plan(live=1, new_not_serving=1), "handover_error": "TimeoutError: trust join"}
+    await pipeline.run_stage(rjob(), db=env.db)
+    [run_id] = [k for k, r in env.ledger.runs.items() if r.get("stage") == "apply"]
+    assert env.ledger.runs[run_id]["checks"]["stale_brand_retire"]["handover_error"] == "TimeoutError: trust join"
+    reason = env.ledger.transitions[-1]["reason"]
+    assert "1 whose new key does not serve yet; the canonical handover check FAILED (TimeoutError: trust join)" in reason
+
+
+async def test_a_clean_handover_check_adds_nothing_to_the_status_line(env, retire):  # noqa: F811
+    retire.plan = {**fake_plan(live=1, new_not_serving=1), "handover_error": None}
+    await pipeline.run_stage(rjob(), db=env.db)
+    [run_id] = [k for k, r in env.ledger.runs.items() if r.get("stage") == "apply"]
+    assert "handover_error" not in env.ledger.runs[run_id]["checks"]["stale_brand_retire"]
+    assert "handover check" not in env.ledger.transitions[-1]["reason"]
+
+
+def test_an_unrefreshed_trust_line_names_both_directions():
+    r = {"stale_brand": STALE, "outcome": "trust_not_refreshed", "retire_run_id": "retire_x",
+         "counts": {"products": 1, "trust_problems": ["1 handed-over key(s) not public: ['new0']"]}}
+    line = pipeline._retire_reason(r)
+    assert "a retired row stays publicly listed, a new row the canonical URL was handed to stays unlisted" in line
+    assert "they stay publicly listed until" not in line
