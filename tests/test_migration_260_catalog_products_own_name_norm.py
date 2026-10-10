@@ -41,9 +41,18 @@ def _sql(path: Path) -> str:
 
 
 def test_both_files_are_invisible_to_the_boot_runner_and_say_why() -> None:
-    from db.sql_migrations import list_migration_files, needs_autocommit
+    from db.sql_migrations import (
+        HAND_APPLIED_MARKER, list_hand_applied_migration_files, list_migration_files, needs_autocommit,
+    )
 
     active = {Path(f).name for f in list_migration_files(str(REPO))}
+    # The schema-rebuilding test fixtures (tests/test_repo_sql_prepare_postgres.py) apply these two
+    # in version order with the active files, keyed on the first-line marker: production has them, so SQL written
+    # against their columns must be planned against a schema that has them. The retired .disabled
+    # files carry no marker and stay out of everything.
+    assert HAND_APPLIED_MARKER == "-- HAND-APPLIED ONLY"
+    assert [Path(f).name for f in list_hand_applied_migration_files(str(REPO))] == [UP_260.name, UP_261.name]
+    assert not (set(Path(f).name for f in list_hand_applied_migration_files(str(REPO))) & active)
     assert UP_260.exists() and UP_261.exists()
     for name in ("260_catalog_products_own_name_norm.sql", "261_catalog_products_name_norm_trgm_index.sql"):
         assert name not in active, f"{name} would be applied on the next boot"
