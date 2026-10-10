@@ -2087,7 +2087,14 @@ async def test_ingest_standard_products_never_stores_or_matches_an_all_zero_barc
         return 0
 
     monkeypatch.setenv("ENABLE_INTAKE_IDENTITY_SYNC", "1")
+    barcode_lookups = []
+
+    async def fake_rows_by_barcodes(barcodes, _prefer_merchant_id):
+        barcode_lookups.extend(barcodes)
+        return []
+
     monkeypatch.setattr(ii, "_rows_by_gtin", fake_rows_by_gtin)
+    monkeypatch.setattr(ii, "_rows_by_barcodes", fake_rows_by_barcodes)
     monkeypatch.setattr(ii, "_rows_by_content_key", no_rows)
     monkeypatch.setattr(ii, "_candidates_by_canonical_url", no_rows)
     monkeypatch.setattr(ii, "_candidates_by_source_id", no_rows)
@@ -2126,3 +2133,5 @@ async def test_ingest_standard_products_never_stores_or_matches_an_all_zero_barc
 
     assert [row["gtin"] for row in product_writes] == [expected_gtin]
     assert gtin_lookups == ([expected_gtin] if expected_gtin else [])
+    # The widened (variant-barcode) lookup applies the same canonical_gtin rule.
+    assert barcode_lookups == gtin_lookups
