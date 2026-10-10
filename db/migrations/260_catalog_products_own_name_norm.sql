@@ -1,0 +1,91 @@
+-- 260: the row's OWN NAME, folded once at write time, for the gateway's category browse (PIVOTA-Agent #2404).
+--
+-- WHY. The gateway's canonical catalog search (PIVOTA-Agent src/services/canonicalSearchQualitySql.js,
+-- `identitySql`) folds a row's own name AT QUERY TIME -- middle dots removed, Latin accents folded,
+-- lower-cased, every non-alphanumeric run collapsed to one space -- for two predicates on every
+-- category browse: the own-name / form regex over every row the category index yields, and the
+-- name-evidence carrier CTE over the whole table. Measured on prod 2026-10-10 (EXPLAIN ANALYZE,
+-- BUFFERS, 'barrier moisturizer', one run, warm): 1.85 s, of which 1.04 s is that fold detoasting
+-- product_payload (canonical_title / canonical_name) on all 4,807 category rows, and 0.40 s is the
+-- carrier CTE's Seq Scan of 28k rows running the same fold. Under four concurrent calls (a deploy's
+-- instances warming the buyer-market pool together) it stretched to 5-11 s and the primary to 40%.
+--
+-- WHAT. Two nullable TEXT columns on catalog_products, stamped by triggers with the SAME fold the
+-- gateway's SQL applies, over the same inputs:
+--   name_norm      = fold(concat_ws(' ', title, product_type))
+--                    -- what the carrier CTE folds (searchNameEvidence: own name is title +
+--                    -- product_type only; the LIKE prefilter and the regex both read this).
+--   own_name_norm  = fold(concat_ws(' ', title, product_type,
+--                                    product_payload->>'canonical_title', product_payload->>'canonical_name'))
+--                    -- what the category WHERE's own-name / form / conflicting-type regexes fold.
+-- The fold lives in ONE SQL function, catalog_products_identity_fold(text), byte-for-byte the
+-- gateway's identitySql, so the equality `own_name_norm = identitySql(...)` is a test, not a hope
+-- (tests/test_migration_260_catalog_products_own_name_norm.py pins the expression text against the
+-- gateway's and, on Postgres, the column against the live expression over accented / dotted names).
+--
+-- TRIGGERS. BEFORE INSERT always stamps. BEFORE UPDATE stamps only when an input changed or a column
+-- is NULL (WHEN clause), so a write to an unrelated column (sync_status, lifecycle, audit) does not
+-- pay two regexp folds; a row the columns were added under (NULL) is repaired by its next write; and
+-- `UPDATE ... SET name_norm = NULL, own_name_norm = NULL` re-folds a row in one statement, which is
+-- how the backfill script's --refold-all works after a CREATE OR REPLACE of the fold.
+--
+-- THESE COLUMNS ARE OWNED BY THIS MIGRATION, NOT BY THE BACKEND'S TABLE. Nothing in pivota-backend
+-- reads them, so they are deliberately NOT on db/catalog.py's catalog_products Table and NOT in
+-- db/schema_guard.py: a column the shared Table names must exist before the new image serves, and
+-- the boot heal's ADD COLUMN (ACCESS EXCLUSIVE, 500 ms lock_timeout) can lose that race to the
+-- gateway's multi-second category reads on both boot passes -- the new image's
+-- catalog_products.select() callers would then hit UndefinedColumn and /health would 503. The only
+-- reader is the gateway, behind CANONICAL_CATALOG_STORED_NAME_NORM (PIVOTA-Agent #2406), which is
+-- flipped only after this migration and the backfill have been applied and verified.
+-- schema-guard-exempt: columns read only by the gateway (PIVOTA-Agent #2406, behind a flag); no backend
+-- Table names them, so no runtime self-heal must land them -- the migration is applied by hand first.
+--
+-- EXISTING ROWS ARE NOT BACKFILLED HERE: that is scripts/backfill_catalog_products_name_norm.py --
+-- bounded, resumable, throttled batches (FOR UPDATE SKIP LOCKED, lock_timeout + statement_timeout per
+-- batch) that touch each unstamped row so the UPDATE trigger stamps it (the script never restates the
+-- fold), dry-run by default, run by hand with the primary under 35%. This file stays a short
+-- transaction: function, columns, triggers. It must run as ONE transaction, so it does not contain
+-- the word that puts the runner on its statement-at-a-time path (261 does: the index is built
+-- outside a transaction, in its own file, AFTER the backfill).
+
+CREATE OR REPLACE FUNCTION catalog_products_identity_fold(expression TEXT)
+RETURNS TEXT
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+  SELECT trim(regexp_replace(lower(translate(regexp_replace(coalesce(expression, ''), '[·•]', '', 'g'), 'ÀÁÂÃÄÅÈÉÊËÌÍÎÏÒÓÔÕÖÙÚÛÜÝàáâãäåèéêëìíîïòóôõöùúûüýÿ', 'AAAAAAEEEEIIIIOOOOOUUUUYaaaaaaeeeeiiiiooooouuuuyy')), '[^[:alnum:]]+', ' ', 'g'))
+$$;
+
+ALTER TABLE catalog_products
+  ADD COLUMN IF NOT EXISTS name_norm TEXT,
+  ADD COLUMN IF NOT EXISTS own_name_norm TEXT;
+
+CREATE OR REPLACE FUNCTION catalog_products_stamp_name_norm()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.name_norm := catalog_products_identity_fold(concat_ws(' ', NEW.title, NEW.product_type));
+  NEW.own_name_norm := catalog_products_identity_fold(
+    concat_ws(' ', NEW.title, NEW.product_type,
+              NEW.product_payload->>'canonical_title', NEW.product_payload->>'canonical_name'));
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_catalog_products_stamp_name_norm ON catalog_products;
+DROP TRIGGER IF EXISTS trg_catalog_products_stamp_name_norm_insert ON catalog_products;
+DROP TRIGGER IF EXISTS trg_catalog_products_stamp_name_norm_update ON catalog_products;
+
+CREATE TRIGGER trg_catalog_products_stamp_name_norm_insert
+  BEFORE INSERT ON catalog_products
+  FOR EACH ROW
+  EXECUTE FUNCTION catalog_products_stamp_name_norm();
+
+CREATE TRIGGER trg_catalog_products_stamp_name_norm_update
+  BEFORE UPDATE ON catalog_products
+  FOR EACH ROW
+  WHEN (NEW.name_norm IS NULL OR NEW.own_name_norm IS NULL
+        OR OLD.title IS DISTINCT FROM NEW.title
+        OR OLD.product_type IS DISTINCT FROM NEW.product_type
+        OR OLD.product_payload IS DISTINCT FROM NEW.product_payload)
+  EXECUTE FUNCTION catalog_products_stamp_name_norm();

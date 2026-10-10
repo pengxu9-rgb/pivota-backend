@@ -103,6 +103,11 @@ catalog_products = Table(
     Column("canonical_url", Text, nullable=True),
     Column("image_url", Text, nullable=True),
     Column("product_payload", JSONB_TYPE, nullable=True),
+    # NOT HERE ON PURPOSE: the two folded-name columns of migration 260 are read only by the
+    # PIVOTA-Agent gateway. A column this Table names must exist before the new image serves, and the
+    # boot heal's ADD COLUMN can lose its 500 ms lock race to the gateway's multi-second category reads
+    # (see the warning at the end of this file); so the migration owns those columns, applied by hand,
+    # and no backend code names them (a test pins that).
     Column("freshness_json", JSONB_TYPE, nullable=True),
     # Phase O-1 — free-form merchant-provided tags from StandardProduct.tags[]
     # (Shopify/Wix/WooCommerce sync). JSONB array; NULL on rows predating
