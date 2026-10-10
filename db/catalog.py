@@ -285,7 +285,7 @@ catalog_skus = Table(
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index("idx_catalog_skus_product_key", "product_key"),
-    # mig 260 (F2, 2026-10-10): intake identity's Tier-0a matches variant barcodes here
+    # mig 262 (F2, 2026-10-10): intake identity's Tier-0a matches variant barcodes here
     # (services/intake_identity.barcode_lookup_sql). Partial: most SKUs carry none.
     Index(
         "idx_catalog_skus_barcode",

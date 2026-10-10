@@ -442,7 +442,7 @@ async def test_a_cut_short_lookup_is_not_matched_on(catalog, monkeypatch):
 @pytest.mark.parametrize("value", ["0", None])
 async def test_the_flag_off_or_unset_is_product_gtin_only_matching(catalog, monkeypatch, value):
     if value is None:
-        monkeypatch.delenv(ii.VARIANT_BARCODE_MATCH_ENV, raising=False)  # the prod default until 260 lands
+        monkeypatch.delenv(ii.VARIANT_BARCODE_MATCH_ENV, raising=False)  # the prod default until 262 lands
     else:
         monkeypatch.setenv(ii.VARIANT_BARCODE_MATCH_ENV, value)
     catalog.add(plan_for("perfumania.com", "Shalimar Perfume", "Guerlain", [_variant("Default Title", SHALIMAR)]))

@@ -1,4 +1,4 @@
-"""F2 (2026-10-10) on the production dialect: the widened Tier-0a lookup, migration 260's index,
+"""F2 (2026-10-10) on the production dialect: the widened Tier-0a lookup, migration 262's index,
 the review dedupe, and the backfill proposer's SQL.
 
 The unit matrix (tests/services/test_intake_identity_variant_barcode.py) answers the lookups from a
@@ -13,7 +13,7 @@ idx_catalog_skus_barcode for both arms.
 ISOLATION as in test_catalog_products_category_path_index_postgres.py: a per-process scratch schema,
 reached through connections whose search_path is that schema ALONE, dropped at teardown. The tables
 are the model's own DDL (catalog_products, catalog_skus) plus the migrations that own the rest
-(178's gtin index, 260, 045 product_group_members, 179 proposals + pdp_review_tasks).
+(178's gtin index, 262, 045 product_group_members, 179 proposals + pdp_review_tasks).
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_UR
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 _MIGRATIONS = Path(__file__).resolve().parent.parent / "db/migrations"
-_UP = _MIGRATIONS / "260_catalog_skus_barcode_index.sql"
-_DOWN = _MIGRATIONS / "down/260_catalog_skus_barcode_index_down.sql"
+_UP = _MIGRATIONS / "262_catalog_skus_barcode_index.sql"
+_DOWN = _MIGRATIONS / "down/262_catalog_skus_barcode_index_down.sql"
 _MORE = ("178_catalog_products_gtin.sql", "045_product_groups.sql", "179_identity_resolution_d2.sql")
 _INDEX = "idx_catalog_skus_barcode"
 _SCHEMA = f"intake_barcode_lookup_test_{os.getpid()}"
@@ -148,7 +148,7 @@ async def _index_def(db):
     )
 
 
-async def test_migration_260_builds_partial_drops_and_reruns(db):
+async def test_migration_262_builds_partial_drops_and_reruns(db):
     from db.sql_migrations import needs_autocommit
 
     assert needs_autocommit(_UP.read_text(encoding="utf-8"))
@@ -229,7 +229,7 @@ async def test_the_resolver_attaches_a_new_listing_through_the_real_sql(db, monk
     and land in tables this schema lacks or has)."""
     from services.intake_identity import ACTION_FLAG, VARIANT_BARCODE_MATCH_ENV, resolve_or_attach_content_identity
 
-    monkeypatch.setenv(VARIANT_BARCODE_MATCH_ENV, "1")  # default OFF until migration 260 lands
+    monkeypatch.setenv(VARIANT_BARCODE_MATCH_ENV, "1")  # default OFF until migration 262 lands
 
     await _product(db, "pf_shalimar", "m_perfumania", "Shalimar Perfume", "ck_pf", gtin="03346470113541")
     out = await resolve_or_attach_content_identity(

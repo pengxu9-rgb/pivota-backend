@@ -1,4 +1,4 @@
--- 260: a btree on catalog_skus.barcode, for intake identity's widened GTIN tier (F2, 2026-10-10).
+-- 262: a btree on catalog_skus.barcode, for intake identity's widened GTIN tier (F2, 2026-10-10).
 --
 -- services/intake_identity.py Tier-0a used to read catalog_products.gtin only, and the crawl lane
 -- sets that column only for a product with ONE barcoded variant -- every multi-variant row keeps its
