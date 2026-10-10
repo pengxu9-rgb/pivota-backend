@@ -525,6 +525,11 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             # Source-level provenance — see migration 133. Lets new
             # ingests distinguish stores under the same merchant/platform.
             "source_domain",
+            # Own name folded at write time — see migration 260. The
+            # gateway's category browse reads these; the model names them,
+            # so a SELECT of the model would fail without them.
+            "name_norm",
+            "own_name_norm",
         },
     ),
     RequiredTableColumns(
@@ -2591,6 +2596,18 @@ async def ensure_required_schema_light() -> None:
                 """
                 ALTER TABLE IF EXISTS catalog_products
                   ADD COLUMN IF NOT EXISTS source_domain TEXT;
+                """
+            )
+            # Own name folded at write time (migration 260). The COLUMNS land
+            # here on boot; the fold function, the stamping trigger and the
+            # backfill are the migration's and are applied by hand, so a row
+            # may carry NULL until then -- the gateway reader falls back to
+            # today's per-row expression on NULL.
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS catalog_products
+                  ADD COLUMN IF NOT EXISTS name_norm TEXT,
+                  ADD COLUMN IF NOT EXISTS own_name_norm TEXT;
                 """
             )
             # Durable top-level vertical (migration 173). Railway fast-mode

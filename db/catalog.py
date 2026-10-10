@@ -103,6 +103,15 @@ catalog_products = Table(
     Column("canonical_url", Text, nullable=True),
     Column("image_url", Text, nullable=True),
     Column("product_payload", JSONB_TYPE, nullable=True),
+    # The row's own name, folded ONCE at write time by the trigger of migration 260
+    # (catalog_products_identity_fold = the gateway's identitySql, byte for byte):
+    # name_norm over title + product_type, own_name_norm over those plus
+    # product_payload->>'canonical_title' / 'canonical_name'. Read by the
+    # PIVOTA-Agent category browse instead of folding (and detoasting the
+    # payload) per row per query. NULL until the trigger or the backfill ran.
+    # Also in schema_guard's REQUIRED_SCHEMA for catalog_products.
+    Column("name_norm", Text, nullable=True),
+    Column("own_name_norm", Text, nullable=True),
     Column("freshness_json", JSONB_TYPE, nullable=True),
     # Phase O-1 — free-form merchant-provided tags from StandardProduct.tags[]
     # (Shopify/Wix/WooCommerce sync). JSONB array; NULL on rows predating
