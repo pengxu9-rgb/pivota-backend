@@ -1,3 +1,8 @@
+-- HAND-APPLIED ONLY (the *.sql.disabled suffix is load-bearing): the boot runner would otherwise build
+-- this index on the next deploy, BEFORE the backfill. Apply it from a one-off job AFTER the backfill
+-- has reached `remaining: 0`, on an autocommit connection statement at a time (the build runs outside
+-- a transaction), and check pg_index.indisvalid afterwards. See #2549 / #2404.
+--
 -- 261: trigram index on catalog_products.name_norm (the column migration 260 stamps), for the
 -- gateway's name-evidence carrier CTE (PIVOTA-Agent #2404).
 --
