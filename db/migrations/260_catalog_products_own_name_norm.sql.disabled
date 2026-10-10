@@ -1,3 +1,13 @@
+-- HAND-APPLIED ONLY (the *.sql.disabled suffix is load-bearing). main.startup() runs
+-- db.sql_migrations.run_sql_migrations at EVERY boot over every active db/migrations/*.sql file not yet
+-- in the ledger, with NO lock_timeout. As an active file this would have been applied by the next
+-- deploy: an ALTER TABLE ... ADD COLUMN + CREATE TRIGGER on catalog_products takes an ACCESS EXCLUSIVE
+-- lock, and queued behind the gateway's 5-11 s category reads it would have piled every reader and
+-- writer of the hottest table behind the boot (pivota-backend #2549 deploy 38046794859, cancelled).
+-- Apply it from a one-off job that reads THIS file through db.sql_migrations.split_statements and runs
+-- the statements in ONE transaction with `SET LOCAL lock_timeout = '3s'` (retry the whole file on a
+-- lock timeout), with the primary under 35% CPU. The runbook is in #2549 / #2404.
+--
 -- 260: the row's OWN NAME, folded once at write time, for the gateway's category browse (PIVOTA-Agent #2404).
 --
 -- WHY. The gateway's canonical catalog search (PIVOTA-Agent src/services/canonicalSearchQualitySql.js,
