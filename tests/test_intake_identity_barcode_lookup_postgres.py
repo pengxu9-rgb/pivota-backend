@@ -224,10 +224,12 @@ async def test_the_review_dedupe_reads_the_task_enqueue_writes(db):
     assert await _open_identity_review_exists("ext:retailer:abc", "gtin_reused_within_seller") is False
 
 
-async def test_the_resolver_attaches_a_new_listing_through_the_real_sql(db):
+async def test_the_resolver_attaches_a_new_listing_through_the_real_sql(db, monkeypatch):
     """End to end on Postgres: every Tier-0a lookup is real (provenance/review writes are best-effort
     and land in tables this schema lacks or has)."""
-    from services.intake_identity import ACTION_FLAG, resolve_or_attach_content_identity
+    from services.intake_identity import ACTION_FLAG, VARIANT_BARCODE_MATCH_ENV, resolve_or_attach_content_identity
+
+    monkeypatch.setenv(VARIANT_BARCODE_MATCH_ENV, "1")  # default OFF until migration 260 lands
 
     await _product(db, "pf_shalimar", "m_perfumania", "Shalimar Perfume", "ck_pf", gtin="03346470113541")
     out = await resolve_or_attach_content_identity(

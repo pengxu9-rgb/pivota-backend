@@ -2087,6 +2087,7 @@ async def test_ingest_standard_products_never_stores_or_matches_an_all_zero_barc
         return 0
 
     monkeypatch.setenv("ENABLE_INTAKE_IDENTITY_SYNC", "1")
+    monkeypatch.setenv(ii.VARIANT_BARCODE_MATCH_ENV, "1")  # default OFF until migration 260 lands
     barcode_lookups = []
 
     async def fake_rows_by_barcodes(barcodes, _prefer_merchant_id):

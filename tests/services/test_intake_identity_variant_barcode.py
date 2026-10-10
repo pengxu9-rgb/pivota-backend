@@ -159,7 +159,7 @@ def catalog(monkeypatch: pytest.MonkeyPatch):
 
     import services.audit_index_intake as intake
 
-    monkeypatch.delenv(ii.VARIANT_BARCODE_MATCH_ENV, raising=False)
+    monkeypatch.setenv(ii.VARIANT_BARCODE_MATCH_ENV, "1")
     monkeypatch.setattr(ii, "_rows_by_gtin", cat.rows_by_gtin)
     monkeypatch.setattr(ii, "_rows_by_barcodes", cat.rows_by_barcodes)
     monkeypatch.setattr(ii, "_rows_by_content_key", cat.rows_by_content_key)
@@ -439,8 +439,12 @@ async def test_a_cut_short_lookup_is_not_matched_on(catalog, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_kill_switch_restores_product_gtin_only_matching(catalog, monkeypatch):
-    monkeypatch.setenv(ii.VARIANT_BARCODE_MATCH_ENV, "0")
+@pytest.mark.parametrize("value", ["0", None])
+async def test_the_flag_off_or_unset_is_product_gtin_only_matching(catalog, monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv(ii.VARIANT_BARCODE_MATCH_ENV, raising=False)  # the prod default until 260 lands
+    else:
+        monkeypatch.setenv(ii.VARIANT_BARCODE_MATCH_ENV, value)
     catalog.add(plan_for("perfumania.com", "Shalimar Perfume", "Guerlain", [_variant("Default Title", SHALIMAR)]))
     out = await crawl(plan_for("beautyencounter.com", "Shalimar by Guerlain for Women", "Guerlain",
                                SHALIMAR_FAMILY))

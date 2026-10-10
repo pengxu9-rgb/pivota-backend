@@ -160,10 +160,13 @@ _UNTITLED_VARIANTS = {"", "default title", "default"}
 
 
 def variant_barcode_match_enabled() -> bool:
-    """Kill switch for the widened (SKU-barcode) lookup. Default ON: every intake door is enabled
-    in prod, so this is the one-env rollback to product-gtin-only matching. The reuse guard stays on
-    either way -- it is a fix to the product-gtin path too, not part of the widening."""
-    return os.getenv(VARIANT_BARCODE_MATCH_ENV, "1").strip().lower() not in {"0", "false", "no", "off"}
+    """Rollout flag for the widened (SKU-barcode) lookup. Default OFF: every intake door is enabled
+    in prod, and until migration 260's index exists (numbered migrations do not self-apply in prod)
+    the SKU arm is a sequential scan of catalog_skus on EVERY barcoded intake call, on the 2-vCPU
+    primary. Order: merge -> apply 260 (CONCURRENTLY) and confirm the index is valid -> set this
+    to 1 on the drain, then web/worker. The reuse guard stays on either way -- it is a fix to the
+    product-gtin path too, not part of the widening."""
+    return os.getenv(VARIANT_BARCODE_MATCH_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def gtin_spellings(gtin14: str) -> List[str]:
