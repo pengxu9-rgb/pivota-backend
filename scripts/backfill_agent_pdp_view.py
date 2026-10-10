@@ -42,6 +42,14 @@ Apply it:
 Dry-run / apply over the whole corpus, paginated:
   python3 scripts/backfill_agent_pdp_view.py --limit 200 --offset 0
   python3 scripts/backfill_agent_pdp_view.py --apply --limit 200 --offset 0
+
+Fill agent_pdp_view.market_prices (migration 263) on the rows that do not carry
+it yet. Requires AGENT_PDP_VIEW_MARKET_PRICES=on in the job's env (the script
+refuses otherwise: it would rewrite rows without the column). Keyset-paged on
+content_key, because the --apply set shrinks as it fills; pass the report's
+`next_after` back as --after until `content_keys_considered` is 0:
+  AGENT_PDP_VIEW_MARKET_PRICES=on python3 scripts/backfill_agent_pdp_view.py \
+      --scope market_prices_missing --limit 500 --apply [--after <content_key>]
 """
 
 from __future__ import annotations
@@ -59,9 +67,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.database import database  # noqa: E402
 from services.agent_pdp_view_assembler import (  # noqa: E402
     BACKFILL_REFRESH_SOURCE,
-    UPSERT_SQL,
     build_agent_pdp_view_row,
+    market_prices_enabled,
     row_to_upsert_params,
+    upsert_sql_for_row,
 )
 
 logger = logging.getLogger("backfill_agent_pdp_view")
@@ -94,16 +103,31 @@ _ENRICHED_KEYS_SQL = """
     ORDER BY cp.content_key ASC
 """
 
+# Served rows that have never had market_prices computed (NULL = not computed;
+# {} = computed, nothing priced for a served region). Keyset on content_key: the
+# PK index serves both the predicate's order and the `> :after` seek.
+_MARKET_PRICES_MISSING_KEYS_SQL = """
+    SELECT content_key
+    FROM agent_pdp_view
+    WHERE market_prices IS NULL
+      AND content_key > :after
+    ORDER BY content_key ASC
+"""
+
 
 def build_content_key_query(
-    *, scope: str, limit: int, offset: int
+    *, scope: str, limit: int, offset: int, after: str = ""
 ) -> Tuple[str, Dict[str, Any]]:
     """(sql, params) for the content_key window. A pure builder so the driven
     PREPARE gate can plan every shape it emits against real Postgres — the
     assembled string lives in a function local, which the static sweep in
     tests/test_repo_sql_prepare_postgres.py cannot follow."""
-    sql = _ENRICHED_KEYS_SQL if scope == "enriched" else _ALL_KEYS_SQL
     params: Dict[str, Any] = {}
+    if scope == "market_prices_missing":
+        sql = _MARKET_PRICES_MISSING_KEYS_SQL
+        params["after"] = str(after or "")
+    else:
+        sql = _ENRICHED_KEYS_SQL if scope == "enriched" else _ALL_KEYS_SQL
     if limit > 0:
         sql += "\n        LIMIT :limit"
         params["limit"] = int(limit)
@@ -113,11 +137,13 @@ def build_content_key_query(
     return sql, params
 
 
-async def _fetch_content_keys(*, scope: str, limit: int, offset: int) -> List[str]:
+async def _fetch_content_keys(
+    *, scope: str, limit: int, offset: int, after: str = ""
+) -> List[str]:
     """Stable content_key window. Paged by content_key ASC so each chunk is a
     disjoint slice — no double-writes, safe to resume on partial failures.
     """
-    sql, params = build_content_key_query(scope=scope, limit=limit, offset=offset)
+    sql, params = build_content_key_query(scope=scope, limit=limit, offset=offset, after=after)
     rows = await database.fetch_all(sql, params)
     return [r["content_key"] for r in rows or []]
 
@@ -175,6 +201,12 @@ def _overlay_flags(row: Dict[str, Any]) -> Dict[str, bool]:
 # ---------------------------------------------------------------------
 
 async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
+    if args.scope == "market_prices_missing" and not market_prices_enabled():
+        # Without the flag the assembled row carries no market_prices, the
+        # upsert leaves the column NULL, and the next pass selects the same keys.
+        raise SystemExit(
+            "--scope market_prices_missing needs AGENT_PDP_VIEW_MARKET_PRICES=on"
+        )
     if not getattr(database, "is_connected", False):
         await database.connect()
 
@@ -182,7 +214,8 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         ENRICHED_REFRESH_SOURCE if args.scope == "enriched" else BACKFILL_REFRESH_SOURCE
     )
     content_keys = await _fetch_content_keys(
-        scope=args.scope, limit=args.limit, offset=args.offset
+        scope=args.scope, limit=args.limit, offset=args.offset,
+        after=getattr(args, "after", "") or "",
     )
     logger.info(
         "loaded %d content_keys (scope=%s limit=%d offset=%d)",
@@ -243,7 +276,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         if not args.apply:
             outcomes["rows_skipped_no_op_in_dry_run"] += 1
             continue
-        await database.execute(UPSERT_SQL, row_to_upsert_params(row))
+        await database.execute(upsert_sql_for_row(row), row_to_upsert_params(row))
         outcomes["rows_upserted"] += 1
 
     return {
@@ -253,6 +286,9 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         "outcome_counts": outcomes,
         "samples": samples,
         "skipped_would_downgrade_sample": downgrades,
+        # Keyset cursor for --scope market_prices_missing: rows this pass skipped
+        # stay NULL, so the next pass must start after them, not at offset 0.
+        "next_after": content_keys[-1] if content_keys else None,
     }
 
 
@@ -263,12 +299,18 @@ def _parse_args() -> argparse.Namespace:
         help="Actually UPSERT agent_pdp_view rows. Default: dry-run.",
     )
     p.add_argument(
-        "--scope", choices=("all", "enriched"), default="all",
+        "--scope", choices=("all", "enriched", "market_prices_missing"), default="all",
         help=(
             "'all' = every content_key (default). 'enriched' = only the "
             "content_keys carrying a product_enrichment overlay — the cohort "
-            "stranded before the SERVE_PDP_ENRICHMENT_ON_WRITE flip."
+            "stranded before the SERVE_PDP_ENRICHMENT_ON_WRITE flip. "
+            "'market_prices_missing' = served rows whose market_prices is NULL "
+            "(migration 263; needs AGENT_PDP_VIEW_MARKET_PRICES=on; page with --after)."
         ),
+    )
+    p.add_argument(
+        "--after", default="",
+        help="market_prices_missing only: start after this content_key (keyset page).",
     )
     p.add_argument(
         "--limit", type=int, default=200,
