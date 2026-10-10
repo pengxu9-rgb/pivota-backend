@@ -925,18 +925,9 @@ def aggregate_offers(
     injected onto each offer like `url` is. Absent/None → offers carry no trust
     key (the honest empty state — no transacted outcomes, no claim).
     """
-    trust_by_id = seller_trust_by_id or {}
-    normalized: List[Dict[str, Any]] = []
-    for o in offers:
-        n = normalize_offer(o, primary_merchant_id)
-        if not n:
-            continue
-        merchant_id = n.get("merchant_id") or ""
-        n["url"] = merchant_url_by_id.get(merchant_id)
-        trust = trust_by_id.get(merchant_id)
-        if trust:
-            n["seller_trust"] = trust
-        normalized.append(n)
+    normalized = _normalized_offers(
+        offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id
+    )
 
     if not normalized:
         return None, None, None, 0, []
@@ -986,16 +977,134 @@ def aggregate_offers(
     # offer's `availability` is what catalog_sync wrote from the gate's own stock verdict
     # (standard_variant_in_stock: `available` first, then quantity), so an untracked or
     # keep-selling variant is in_stock here and a sold-out one is not.
-    def sort_key(o: Dict[str, Any]) -> Tuple[int, int, float, str]:
-        return (
-            1 if availability_is_known_unavailable(o.get("availability")) else 0,
-            0 if o.get("is_primary") else 1,
-            float(o.get("price") or 0.0),
-            o.get("merchant_id") or "",
-        )
-
-    top = sorted(normalized, key=sort_key)[:OFFER_TOP_N]
+    top = sorted(normalized, key=_offer_sort_key)[:OFFER_TOP_N]
     return currency, price_min, price_max, len(normalized), top
+
+
+def _normalized_offers(
+    offers: List[Dict[str, Any]],
+    primary_merchant_id: Optional[str],
+    merchant_url_by_id: Dict[str, Optional[str]],
+    seller_trust_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """normalize_offer over every row, with the url and seller_trust injected.
+    The one projection both aggregate_offers and build_market_prices read, so
+    the per-market summaries can never describe a different offer set."""
+    trust_by_id = seller_trust_by_id or {}
+    normalized: List[Dict[str, Any]] = []
+    for o in offers:
+        n = normalize_offer(o, primary_merchant_id)
+        if not n:
+            continue
+        merchant_id = n.get("merchant_id") or ""
+        n["url"] = merchant_url_by_id.get(merchant_id)
+        trust = trust_by_id.get(merchant_id)
+        if trust:
+            n["seller_trust"] = trust
+        normalized.append(n)
+    return normalized
+
+
+def _offer_sort_key(o: Dict[str, Any]) -> Tuple[int, int, float, str]:
+    """The stored-offer order (see the comment in aggregate_offers): sellable
+    first, then primary, then price ASC, then merchant_id ASC."""
+    return (
+        1 if availability_is_known_unavailable(o.get("availability")) else 0,
+        0 if o.get("is_primary") else 1,
+        float(o.get("price") or 0.0),
+        o.get("merchant_id") or "",
+    )
+
+
+# ---------------------------------------------------------------------
+# Per-market price summary (agent_pdp_view.market_prices, migration 263)
+# ---------------------------------------------------------------------
+#
+# WHY. The row-level currency / price_min / price_max above are ONE currency:
+# the modal one, ties to the higher code. A product carrying USD offers and
+# their SGD siblings (retailer_ingest shopify_markets, market 'SG') is therefore
+# a USD row, and every reader that serves an SG buyer from those columns drops
+# it; and the top-N cut sorts raw prices across currencies, so the SGD offers
+# can be cut from `offers` altogether.
+#
+# THE CONTRACT. A jsonb map keyed by SERVED pricing region
+# (PIVOTA_SERVING_PRICING_REGIONS, e.g. US,SG):
+#
+#   {"US": {"currency": "USD", "price_min": 18.0, "price_max": 24.0,
+#           "offer_count": 3, "offers": [<top-N USD offers>]},
+#    "SG": {"currency": "SGD", ...}}
+#
+#   * A region's entry covers exactly the offers priced in that region's
+#     currency (services/region_pricing) -- currency, never offers.market, which
+#     is a DEFAULT 'US' most writers never set (region_pricing's docstring).
+#     No conversion: an entry only ever compares amounts in its own currency.
+#   * offer_count counts every such offer, unavailable ones included, like the
+#     row-level offer_count; `offers` is that currency's top OFFER_TOP_N in the
+#     stored order (_offer_sort_key), the same offer dicts `offers` carries.
+#   * A region with no offer in its currency has NO key. {} = computed, nothing
+#     priced for any served region. NULL (the column default) = not computed
+#     yet: every reader must fall back to the legacy columns.
+#
+# The legacy columns (currency, price_min, price_max, offer_count, offers) are
+# computed exactly as before and never read from here, so every existing reader
+# sees byte-identical values. Written only while AGENT_PDP_VIEW_MARKET_PRICES is
+# on: with it off, assemble_row emits no `market_prices` key and the upsert does
+# not name the column, so a database without migration 263 keeps working.
+
+MARKET_PRICES_FLAG_ENV = "AGENT_PDP_VIEW_MARKET_PRICES"
+
+
+def market_prices_enabled() -> bool:
+    """Write flag for agent_pdp_view.market_prices. Default OFF."""
+    return (os.getenv(MARKET_PRICES_FLAG_ENV) or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _served_pricing_regions() -> List[str]:
+    # Lazy: index_pipeline_state_service is the owner of the served-region list
+    # (PIVOTA_SERVING_PRICING_REGIONS) and a heavy import.
+    from services.index_pipeline_state_service import serving_pricing_regions
+
+    return serving_pricing_regions()
+
+
+def build_market_prices(
+    offers: List[Dict[str, Any]],
+    primary_merchant_id: Optional[str],
+    merchant_url_by_id: Dict[str, Optional[str]],
+    seller_trust_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    *,
+    regions: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """The per-served-region price summary (contract above). Pure."""
+    from services.region_pricing import pricing_currency_for_region_or_none
+
+    normalized = sorted(
+        _normalized_offers(offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id),
+        key=_offer_sort_key,
+    )
+    summary: Dict[str, Dict[str, Any]] = {}
+    for region in (regions if regions is not None else _served_pricing_regions()):
+        code = str(region or "").strip().upper()
+        currency = pricing_currency_for_region_or_none(code)
+        if not currency or code in summary:
+            continue
+        in_currency = [
+            n for n in normalized
+            if str(n.get("currency") or "").strip().upper() == currency
+        ]
+        if not in_currency:
+            continue
+        prices = [Decimal(str(n["price"])) for n in in_currency]
+        summary[code] = {
+            "currency": currency,
+            "price_min": float(min(prices)),
+            "price_max": float(max(prices)),
+            "offer_count": len(in_currency),
+            "offers": in_currency[:OFFER_TOP_N],
+        }
+    return summary
 
 
 def aggregate_variants(skus: List[Dict[str, Any]], canonical_source_product_id: Optional[str]) -> Tuple[List[Dict[str, Any]], int]:
@@ -1420,6 +1529,11 @@ def assemble_row(
     currency, price_min, price_max, offer_count, top_offers = aggregate_offers(
         offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id
     )
+    market_prices = (
+        build_market_prices(offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id)
+        if market_prices_enabled()
+        else None
+    )
 
     variants_capped, variants_count = aggregate_variants(
         skus, canonical.get("source_product_id")
@@ -1434,7 +1548,7 @@ def assemble_row(
 
     fashion = coalesce_fashion_fields(products, external_seed)
 
-    return {
+    row = {
         "content_key": content_key,
         "pivota_signature_id": sig,
         "product_group_id": product_group_id,
@@ -1486,6 +1600,11 @@ def assemble_row(
         "rating_count": canonical.get("rating_count"),
         "refresh_source": refresh_source,
     }
+    # Only while the write flag is on: the key's presence is what selects the
+    # upsert that names the column (upsert_sql_for_row).
+    if market_prices is not None:
+        row["market_prices"] = market_prices
+    return row
 
 
 UPSERT_SQL = """
@@ -1590,6 +1709,32 @@ UPSERT_SQL = """
 """
 
 
+def _upsert_sql_with_market_prices(base: str) -> str:
+    """UPSERT_SQL plus the market_prices column (migration 263), derived from it
+    so the two can never drift in any other column."""
+    insert_anchor = "      rating_value, rating_count,\n      refreshed_at,"
+    values_anchor = "      :rating_value, :rating_count,\n      NOW(),"
+    update_anchor = "      rating_count = EXCLUDED.rating_count,\n"
+    for anchor in (insert_anchor, values_anchor, update_anchor):
+        if base.count(anchor) != 1:
+            raise RuntimeError("UPSERT_SQL changed shape; update _upsert_sql_with_market_prices")
+    return (
+        base.replace(insert_anchor, "      rating_value, rating_count, market_prices,\n      refreshed_at,")
+        .replace(values_anchor, "      :rating_value, :rating_count, CAST(:market_prices AS jsonb),\n      NOW(),")
+        .replace(update_anchor, update_anchor + "      market_prices = EXCLUDED.market_prices,\n")
+    )
+
+
+UPSERT_SQL_WITH_MARKET_PRICES = _upsert_sql_with_market_prices(UPSERT_SQL)
+
+
+def upsert_sql_for_row(row: Dict[str, Any]) -> str:
+    """The upsert for an assembled row: the market_prices variant only when the
+    row carries the key (AGENT_PDP_VIEW_MARKET_PRICES on), else UPSERT_SQL byte
+    for byte -- which never names the column, so it runs before migration 263."""
+    return UPSERT_SQL_WITH_MARKET_PRICES if "market_prices" in row else UPSERT_SQL
+
+
 def to_jsonb(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -1614,6 +1759,11 @@ def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
     # passes it through verbatim. Re-encode for the SQLAlchemy bind. Other
     # fashion fields are plain text + float and pass through unchanged.
     params["size_guide"] = to_jsonb(row.get("size_guide"))
+    if "market_prices" in row:
+        # {} (computed, nothing priced for a served region) is written as '{}',
+        # never NULL: NULL means "not computed yet" to every reader.
+        mp = row.get("market_prices")
+        params["market_prices"] = to_jsonb(mp if mp is not None else {})
     params["refreshed_by_proposal_id"] = row.get("refreshed_by_proposal_id")
     # Default FALSE, so every existing caller that builds a row without going
     # through build_agent_pdp_view_row keeps the previous overwrite semantics
@@ -1857,7 +2007,7 @@ async def refresh_agent_pdp_view_for_content_key(
     )
     if row is None:
         return False
-    await read_db.execute(UPSERT_SQL, row_to_upsert_params(row))
+    await read_db.execute(upsert_sql_for_row(row), row_to_upsert_params(row))
     return True
 
 

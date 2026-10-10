@@ -772,6 +772,9 @@ agent_pdp_view = Table(
     # Review signal mirrored from catalog_products for the serve path (mig 186).
     Column("rating_value", Numeric, nullable=True),
     Column("rating_count", Integer, nullable=True),
+    # Per-served-market price summary (mig 263): {"US": {currency, price_min,
+    # price_max, offer_count, offers}, "SG": {...}}. NULL = not computed yet.
+    Column("market_prices", JSONB_TYPE, nullable=True),
     Column(
         "refreshed_at", DateTime(timezone=True), server_default=func.now(), nullable=False
     ),
