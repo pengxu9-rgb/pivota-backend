@@ -95,6 +95,7 @@ def real_resolver(monkeypatch):
     monkeypatch.delenv("DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", raising=False)
     monkeypatch.setattr(identity, "_write_provenance", AsyncMock())
     monkeypatch.setattr(identity, "_rows_by_gtin", AsyncMock(return_value=[]))
+    monkeypatch.setattr(identity, "_rows_by_barcodes", AsyncMock(return_value=[]))
     monkeypatch.setattr(identity, "_candidates_by_canonical_url", AsyncMock(return_value=[]))
     monkeypatch.setattr(identity, "_candidates_by_source_id", AsyncMock(return_value=[]))
     monkeypatch.setattr(identity, "_existing_pg_for_listing", AsyncMock(return_value="pg_existing"))
