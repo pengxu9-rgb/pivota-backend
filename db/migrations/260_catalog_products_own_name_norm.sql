@@ -10,8 +10,8 @@
 -- carrier CTE's Seq Scan of 28k rows running the same fold. Under four concurrent calls (a deploy's
 -- instances warming the buyer-market pool together) it stretched to 5-11 s and the primary to 40%.
 --
--- WHAT. Two nullable TEXT columns on catalog_products, stamped by a BEFORE INSERT OR UPDATE trigger
--- with the SAME fold the gateway's SQL applies, over the same inputs:
+-- WHAT. Two nullable TEXT columns on catalog_products, stamped by triggers with the SAME fold the
+-- gateway's SQL applies, over the same inputs:
 --   name_norm      = fold(concat_ws(' ', title, product_type))
 --                    -- what the carrier CTE folds (searchNameEvidence: own name is title +
 --                    -- product_type only; the LIKE prefilter and the regex both read this).
@@ -23,24 +23,30 @@
 -- (tests/test_migration_260_catalog_products_own_name_norm.py pins the expression text against the
 -- gateway's and, on Postgres, the column against the live expression over accented / dotted names).
 --
--- The trigger recomputes BOTH columns on EVERY insert and update (not only when the inputs change):
--- a row schema_guard pre-created the columns on (NULL) is repaired by its next write, and the cost is
--- two regexp_replace calls per row write. EXISTING ROWS ARE NOT BACKFILLED HERE: that is
--- scripts/backfill_catalog_products_name_norm.py -- bounded, resumable, throttled batches that touch
--- each unstamped row so THIS trigger stamps it (the script never restates the fold), dry-run by
--- default, run by hand with the primary under 35%. This file stays a short transaction: function,
--- columns, trigger.
+-- TRIGGERS. BEFORE INSERT always stamps. BEFORE UPDATE stamps only when an input changed or a column
+-- is NULL (WHEN clause), so a write to an unrelated column (sync_status, lifecycle, audit) does not
+-- pay two regexp folds; a row the columns were added under (NULL) is repaired by its next write; and
+-- `UPDATE ... SET name_norm = NULL, own_name_norm = NULL` re-folds a row in one statement, which is
+-- how the backfill script's --refold-all works after a CREATE OR REPLACE of the fold.
 --
--- READERS. Nothing reads these columns until the gateway does (a flagged change in
--- canonicalSearchQualitySql.js, with today's expression as the fallback for NULL -- a row that
--- schema_guard created the column on and no write has touched yet). The trigram index that serves
--- the carrier CTE's LIKE prefilter is migration 261 (built outside a transaction, so its own file:
--- the runner sends any file that names that build mode statement-at-a-time on autocommit, and THIS
--- file must run as ONE transaction -- function, trigger and backfill together -- so that word stays out of it).
+-- THESE COLUMNS ARE OWNED BY THIS MIGRATION, NOT BY THE BACKEND'S TABLE. Nothing in pivota-backend
+-- reads them, so they are deliberately NOT on db/catalog.py's catalog_products Table and NOT in
+-- db/schema_guard.py: a column the shared Table names must exist before the new image serves, and
+-- the boot heal's ADD COLUMN (ACCESS EXCLUSIVE, 500 ms lock_timeout) can lose that race to the
+-- gateway's multi-second category reads on both boot passes -- the new image's
+-- catalog_products.select() callers would then hit UndefinedColumn and /health would 503. The only
+-- reader is the gateway, behind CANONICAL_CATALOG_STORED_NAME_NORM (PIVOTA-Agent #2406), which is
+-- flipped only after this migration and the backfill have been applied and verified.
+-- schema-guard-exempt: columns read only by the gateway (PIVOTA-Agent #2406, behind a flag); no backend
+-- Table names them, so no runtime self-heal must land them -- the migration is applied by hand first.
 --
--- Columns are registered in db/catalog.py and db/schema_guard.py (REQUIRED_SCHEMA + the self-heal
--- ALTER): schema_guard lands the COLUMNS on a prod boot; this migration lands the function and the
--- trigger and must be applied by hand (db/migrations do not self-apply in prod); the script backfills.
+-- EXISTING ROWS ARE NOT BACKFILLED HERE: that is scripts/backfill_catalog_products_name_norm.py --
+-- bounded, resumable, throttled batches (FOR UPDATE SKIP LOCKED, lock_timeout + statement_timeout per
+-- batch) that touch each unstamped row so the UPDATE trigger stamps it (the script never restates the
+-- fold), dry-run by default, run by hand with the primary under 35%. This file stays a short
+-- transaction: function, columns, triggers. It must run as ONE transaction, so it does not contain
+-- the word that puts the runner on its statement-at-a-time path (261 does: the index is built
+-- outside a transaction, in its own file, AFTER the backfill).
 
 CREATE OR REPLACE FUNCTION catalog_products_identity_fold(expression TEXT)
 RETURNS TEXT
@@ -67,7 +73,19 @@ END;
 $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_catalog_products_stamp_name_norm ON catalog_products;
-CREATE TRIGGER trg_catalog_products_stamp_name_norm
-  BEFORE INSERT OR UPDATE ON catalog_products
+DROP TRIGGER IF EXISTS trg_catalog_products_stamp_name_norm_insert ON catalog_products;
+DROP TRIGGER IF EXISTS trg_catalog_products_stamp_name_norm_update ON catalog_products;
+
+CREATE TRIGGER trg_catalog_products_stamp_name_norm_insert
+  BEFORE INSERT ON catalog_products
   FOR EACH ROW
+  EXECUTE FUNCTION catalog_products_stamp_name_norm();
+
+CREATE TRIGGER trg_catalog_products_stamp_name_norm_update
+  BEFORE UPDATE ON catalog_products
+  FOR EACH ROW
+  WHEN (NEW.name_norm IS NULL OR NEW.own_name_norm IS NULL
+        OR OLD.title IS DISTINCT FROM NEW.title
+        OR OLD.product_type IS DISTINCT FROM NEW.product_type
+        OR OLD.product_payload IS DISTINCT FROM NEW.product_payload)
   EXECUTE FUNCTION catalog_products_stamp_name_norm();

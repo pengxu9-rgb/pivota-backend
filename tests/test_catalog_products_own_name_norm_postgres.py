@@ -136,7 +136,7 @@ async def _scratch_db():
         # (the gate shares one database across files; see the sibling gate tests).
         await scoped.execute(
             "CREATE TABLE catalog_products ("
-            " product_key TEXT PRIMARY KEY, title TEXT NOT NULL, product_type TEXT, product_payload JSONB)"
+            " product_key TEXT PRIMARY KEY, title TEXT NOT NULL, product_type TEXT, product_payload JSONB, note TEXT)"
         )
         yield scoped
     finally:
@@ -178,6 +178,16 @@ async def test_the_trigger_restamps_on_title_and_payload_updates_and_only_own_na
     assert row["name_norm"] == "new name serum"  # the carrier column never reads the payload
     assert row["own_name_norm"] == "new name serum canonical name"
     assert await _mismatches(scoped) == []
+    # An UPDATE that touches none of the inputs does not re-fold (the WHEN clause): a hand-set value
+    # survives a write to an unrelated column and is replaced only when an input changes ...
+    await scoped.execute("UPDATE catalog_products SET name_norm = 'hand set' WHERE product_key = 'k_u'")
+    await scoped.execute("UPDATE catalog_products SET note = 'audit touched this row' WHERE product_key = 'k_u'")
+    assert await scoped.fetch_val("SELECT name_norm FROM catalog_products WHERE product_key = 'k_u'") == "hand set"
+    await scoped.execute("UPDATE catalog_products SET product_type = 'Essence' WHERE product_key = 'k_u'")
+    assert await scoped.fetch_val("SELECT name_norm FROM catalog_products WHERE product_key = 'k_u'") == "new name essence"
+    # ... or when a column is set to NULL: the one-statement re-fold the script's --refold-all relies on.
+    await scoped.execute("UPDATE catalog_products SET name_norm = NULL, own_name_norm = NULL WHERE product_key = 'k_u'")
+    assert await _mismatches(scoped) == []
 
 
 async def test_rows_that_predate_the_trigger_are_backfilled_by_the_script_in_bounded_resumable_batches(_scratch_db):
@@ -193,7 +203,9 @@ async def test_rows_that_predate_the_trigger_are_backfilled_by_the_script_in_bou
     assert await scoped.fetch_val("SELECT count(*) FROM catalog_products WHERE own_name_norm IS NULL") == len(ROWS)
     # Dry run: counts and the plan, no writes.
     dry = await backfill.run_backfill(apply=False, batch_size=3, db=scoped)
-    assert dry == {"apply": False, "batch_size": 3, "max_batches": 10, "sleep_ms": 500, "unstamped_before": len(ROWS), "batches_needed": 3, "batches_run": 0, "rows_touched": 0, "remaining": len(ROWS)}
+    assert {k: dry[k] for k in ("mode", "apply", "batch_size", "unstamped_before", "batches_needed", "batches_run", "rows_touched", "remaining")} == {
+        "mode": "backfill_unstamped", "apply": False, "batch_size": 3, "unstamped_before": len(ROWS), "batches_needed": 3, "batches_run": 0, "rows_touched": 0, "remaining": len(ROWS)}
+    assert dry["lock_timeout"] == "2s" and dry["statement_timeout"] == "30s"
     assert await scoped.fetch_val("SELECT count(*) FROM catalog_products WHERE own_name_norm IS NULL") == len(ROWS)
     # Bounded: one batch of three, five left, in product_key order.
     one = await backfill.run_backfill(apply=True, batch_size=3, max_batches=1, sleep_ms=0, db=scoped)
@@ -213,10 +225,68 @@ async def test_rows_that_predate_the_trigger_are_backfilled_by_the_script_in_bou
     assert [tuple(r) for r in before] == [tuple(r) for r in after]
     triggers = await scoped.fetch_val(
         "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
-        "WHERE t.tgname = 'trg_catalog_products_stamp_name_norm' AND c.relname = 'catalog_products' AND n.nspname = :schema AND NOT t.tgisinternal",
+        "WHERE t.tgname IN ('trg_catalog_products_stamp_name_norm_insert', 'trg_catalog_products_stamp_name_norm_update') "
+        "AND c.relname = 'catalog_products' AND n.nspname = :schema AND NOT t.tgisinternal",
         {"schema": _SCHEMA},
     )
-    assert triggers == 1
+    assert triggers == 2
+    assert one["all_locked_batches"] == 0 and one["lock_timeouts"] == 0 and one.get("stalled") is None
+
+
+async def test_rows_a_writer_holds_are_skipped_not_waited_on_and_an_all_locked_run_says_so(_scratch_db):
+    import asyncpg
+    import scripts.backfill_catalog_products_name_norm as backfill
+
+    scoped = _scratch_db
+    await scoped.execute("ALTER TABLE catalog_products ADD COLUMN IF NOT EXISTS name_norm TEXT, ADD COLUMN IF NOT EXISTS own_name_norm TEXT")
+    await _insert(scoped, ROWS)
+    await _apply_260(scoped)
+    # A "writer" holds row locks on the first three keys in an open transaction.
+    locker = await asyncpg.connect(DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://"), server_settings={"search_path": f"{_SCHEMA}, public"})
+    tx = locker.transaction()
+    await tx.start()
+    try:
+        held = sorted(k for k, *_ in ROWS)[:3]
+        await locker.fetch("SELECT product_key FROM catalog_products WHERE product_key = ANY($1::text[]) FOR UPDATE", held)
+        # One batch of three: the held rows are SKIPPED, the next three are stamped; nothing waited.
+        one = await backfill.run_backfill(apply=True, batch_size=3, max_batches=1, sleep_ms=0, db=scoped)
+        assert (one["rows_touched"], one["remaining"], one["all_locked_batches"], one["lock_timeouts"]) == (3, len(ROWS) - 3, 0, 0)
+        stamped = {r["product_key"] for r in await scoped.fetch_all("SELECT product_key FROM catalog_products WHERE own_name_norm IS NOT NULL")}
+        assert stamped == set(sorted(k for k, *_ in ROWS)[3:6])
+        # Finish the rest that is not held, then only the held rows remain: every batch is all-locked.
+        rest = await backfill.run_backfill(apply=True, batch_size=3, max_batches=10, sleep_ms=0, db=scoped)
+        assert rest["remaining"] == 3
+        assert rest["all_locked"] is True and rest["all_locked_batches"] >= 1 and rest.get("stalled") is None
+    finally:
+        await tx.rollback()
+        await locker.close()
+    # The writer is gone: the held rows are stamped on the next run.
+    done = await backfill.run_backfill(apply=True, batch_size=3, max_batches=10, sleep_ms=0, db=scoped)
+    assert (done["rows_touched"], done["remaining"], done["all_locked"]) == (3, 0, False)
+    assert await _mismatches(scoped) == []
+
+
+async def test_refold_all_rewrites_every_stored_value_through_the_trigger_resumably(_scratch_db):
+    import scripts.backfill_catalog_products_name_norm as backfill
+
+    scoped = _scratch_db
+    await _apply_260(scoped)
+    await _insert(scoped, ROWS)
+    # Simulate a fold change that left every stored value stale (and NOT NULL).
+    await scoped.execute("UPDATE catalog_products SET own_name_norm = 'stale', name_norm = 'stale'")
+    assert await scoped.fetch_val("SELECT count(*) FROM catalog_products WHERE own_name_norm = 'stale'") == len(ROWS)
+    # The NULL-driven backfill has nothing to do; --refold-all does.
+    nothing = await backfill.run_backfill(apply=True, batch_size=3, max_batches=10, sleep_ms=0, db=scoped)
+    assert nothing["rows_touched"] == 0
+    dry = await backfill.run_refold_all(apply=False, batch_size=3, db=scoped)
+    assert (dry["rows_ahead"], dry["batches_needed"], dry["batches_run"]) == (len(ROWS), 3, 0)
+    first = await backfill.run_refold_all(apply=True, batch_size=3, max_batches=1, sleep_ms=0, db=scoped)
+    assert first["rows_refolded"] == 3 and first["last_key"] == sorted(k for k, *_ in ROWS)[2]
+    assert await scoped.fetch_val("SELECT count(*) FROM catalog_products WHERE own_name_norm = 'stale'") == len(ROWS) - 3
+    # Resume from the printed cursor.
+    rest = await backfill.run_refold_all(apply=True, batch_size=3, max_batches=10, sleep_ms=0, after_key=first["last_key"], db=scoped)
+    assert rest["rows_refolded"] == len(ROWS) - 3 and rest.get("done") is True and rest["remaining_after_cursor"] == 0
+    assert await _mismatches(scoped) == []
 
 
 async def test_the_script_refuses_to_run_without_the_trigger(_scratch_db):
@@ -229,6 +299,8 @@ async def test_the_script_refuses_to_run_without_the_trigger(_scratch_db):
         await backfill.run_backfill(apply=False, db=scoped)
     with pytest.raises(backfill.TriggerMissing):
         await backfill.run_backfill(apply=True, db=scoped)
+    with pytest.raises(backfill.TriggerMissing):
+        await backfill.run_refold_all(apply=True, db=scoped)
     assert await scoped.fetch_val("SELECT count(*) FROM catalog_products WHERE own_name_norm IS NULL") == 2
 
 
