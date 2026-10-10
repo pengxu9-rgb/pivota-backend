@@ -1528,6 +1528,96 @@ async def test_a_lip_pass_keeps_a_refiled_lip_set_instead_of_dropping_it(env):
     assert list(env.ledger.runs.values())[-1]["checks"]["refiled_kept_outside_filter"] == ["lip-duo-set"]
 
 
+# ------------------------------------------------------------------ refile_to_leaf (2026-10-10)
+# One reviewed product filed on a named leaf: Tower 28's "ShineOn Plumping Lip Jelly" has a blank type and
+# "lip jelly" names no leaf, so a resolved-only cohort left it out every run; the brand calls it "a
+# pain-free lip plumping gloss".
+
+def lip_product(title, handle, ptype=""):
+    return feed.shopify_product_to_record(
+        {"id": abs(hash(handle)) % 10**9, "vendor": "3CE", "title": title, "handle": handle,
+         "product_type": ptype, "body_html": "<p>A pain-free plumping gloss for lips. 5 mL.</p>",
+         "images": [{"src": "https://cdn.example/i.jpg"}],
+         "variants": [{"id": abs(hash(handle + "v")) % 10**12, "price": "18.00", "available": True, "sku": handle}]},
+        domain="k-touch.us", category_path="beauty", brand_override="3CE", currency="USD",
+        source_role="retailer", retailer_name="k-touch.us", emit_native_variants=True,
+    )
+
+
+GLOSS = "beauty/makeup/lip/gloss"
+
+
+async def test_without_a_refile_a_resolved_only_cohort_leaves_the_jelly_out(sets_env):
+    sets_env.products = [lip_product("3CE Plumping Lip Jelly", "plumping-lip-jelly"),
+                         product("3CE Velvet Cream", "Moisturizer", "velvet-cream")]
+    out = await pipeline.run_stage(job("apply_due", only_resolved_category=True), db=sets_env.db)
+    assert out["status"] == "done"
+    assert [p["canonical_url"].rsplit("/", 1)[-1] for p in sets_env.applied[0]["pdps"]] == ["velvet-cream"]
+    assert _last_run(sets_env)["checks"]["left_out"]["by_reason"] == {"category_unresolved": 1}
+
+
+async def test_a_refile_to_a_leaf_keeps_the_product_and_files_it_there(sets_env):
+    sets_env.products = [lip_product("3CE Plumping Lip Jelly", "plumping-lip-jelly"),
+                         product("3CE Velvet Cream", "Moisturizer", "velvet-cream")]
+    out = await pipeline.run_stage(
+        job("apply_due", only_resolved_category=True, refile_to_leaf={"Plumping-Lip-Jelly/": "Beauty/Makeup/Lip/Gloss/"}),
+        db=sets_env.db)
+    assert out["status"] == "done" and out["outcome"] == "applied"
+    pdps = {p["canonical_url"].rsplit("/", 1)[-1]: p for p in sets_env.applied[0]["pdps"]}
+    assert set(pdps) == {"plumping-lip-jelly", "velvet-cream"}
+    assert pdps["plumping-lip-jelly"]["category_path"] == GLOSS
+    assert pdps["velvet-cream"]["category_path"] != GLOSS  # only the named row moves
+    run = _last_run(sets_env)
+    assert run["checks"]["refiled_to_leaf"] == {"plumping-lip-jelly": GLOSS}
+    assert run["checks"]["left_out"]["count"] == 0
+
+
+async def test_a_refile_to_a_leaf_does_not_answer_a_set_flag(sets_env):
+    # A set goes through refile_to_sets; naming a leaf for one must not wave its set flag through.
+    sets_env.products = [lip_product("3CE Lip Gloss Duo Gift Set", "gloss-duo-gift-set", ptype="Lip Gloss")]
+    out = await pipeline.run_stage(job("apply_due", refile_to_leaf={"gloss-duo-gift-set": GLOSS}), db=sets_env.db)
+    assert out["status"] == "held"
+    assert "set_filed_as_single_product" in {f["rule"] for f in _last_run(sets_env)["flags"]}
+
+
+async def test_a_refile_to_a_leaf_the_store_no_longer_carries_blocks_until_accepted(sets_env):
+    sets_env.products = [product("3CE Velvet Cream", "Moisturizer", "velvet-cream")]
+    out = await pipeline.run_stage(job("apply_due", refile_to_leaf={"gone-jelly": GLOSS}), db=sets_env.db)
+    assert out["status"] == "held"
+    assert [f["key"] for f in _last_run(sets_env)["flags"]] == ["refile_leaf_handle_unmatched:gone-jelly"]
+    out = await pipeline.run_stage(job("apply_due", refile_to_leaf={"gone-jelly": GLOSS},
+                                       accepted_flags=["refile_leaf_handle_unmatched:gone-jelly"]), db=sets_env.db)
+    assert out["status"] == "done"
+
+
+@pytest.mark.parametrize("mapping,match", [
+    ({"a": "beauty/makeup/lip"}, "not a taxonomy leaf"),               # an interior node
+    ({"a": "beauty/makeup/lips/lip-gloss"}, "not a taxonomy leaf"),    # an off-taxonomy spelling
+    ({"a": pipeline.REFILE_SETS_LEAF}, "refile_to_sets"),
+    ({" ": GLOSS}, "non-empty handles"),
+    ({"a": 3}, "non-empty handles"),
+    ({f"h{i}": GLOSS for i in range(pipeline.MAX_REFILE_TO_LEAF + 1)}, "at most"),
+])
+def test_a_refile_to_a_leaf_names_real_leaves_only(mapping, match):
+    with pytest.raises(ValueError, match=match):
+        pipeline.validate_options({"vendors": ["3CE"], "refile_to_leaf": mapping})
+
+
+def test_a_handle_re_filed_to_a_leaf_cannot_also_be_excluded_or_re_filed_to_sets():
+    for other in ("exclude_handles", "refile_to_sets"):
+        with pytest.raises(ValueError, match=f"options.{other}"):
+            pipeline.validate_options({"vendors": ["3CE"], "refile_to_leaf": {"Jelly/": GLOSS}, other: ["jelly"]})
+    options = {"vendors": ["3CE"], "refile_to_leaf": {"jelly": " Beauty/Makeup/Lip/Gloss/ "}}
+    assert pipeline.validate_options(options)["refile_to_leaf"] == {"jelly": GLOSS}
+
+
+def test_a_refile_to_a_leaf_is_review_bookkeeping_not_cohort_scope():
+    from db.retailer_ingest import scope_key
+    base = {"vendors": ["3CE"]}
+    assert scope_key("k-touch.us", "3CE", base) == scope_key(
+        "k-touch.us", "3CE", {**base, "refile_to_leaf": {"jelly": GLOSS}})
+
+
 async def test_the_run_records_how_many_retired_legacy_owners_it_admitted(env, monkeypatch):
     """A retired chain is admitted silently at apply (#2448): the run's checks are the only record of how many."""
     async def retired(plan, *, check):
