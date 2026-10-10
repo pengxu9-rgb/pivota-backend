@@ -1,0 +1,16 @@
+-- 261: trigram index on catalog_products.name_norm (the column migration 260 stamps), for the
+-- gateway's name-evidence carrier CTE (PIVOTA-Agent #2404).
+--
+-- The carrier CTE prefilters with `name LIKE '%token%' AND name LIKE '%token2%'` before its regex;
+-- today `name` is an expression over title + product_type folded per row, so the prefilter is a Seq
+-- Scan of the whole table (28k rows, 0.40 s per query on prod 2026-10-10). On the stored column a
+-- GIN trigram index serves both LIKEs as bitmap scans, and the regex runs on the handful of rows left.
+--
+-- pg_trgm is already installed (051). CONCURRENTLY, like 243: the runner sends this file on an
+-- AUTOCOMMIT connection, statement at a time, and the build does not block the catalog sync writers.
+-- schema-guard-exempt: index only, no column added.
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_catalog_products_name_norm_trgm
+  ON catalog_products USING GIN (name_norm gin_trgm_ops);
