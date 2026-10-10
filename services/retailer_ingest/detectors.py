@@ -131,6 +131,29 @@ def _handle(record: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# Placeholder price bounds were written in dollars (a $999,999,999 TEST product; a $1 "see store" token) and
+# were applied to every currency's numbers as-is, so any JPY or KRW row priced 1,000 or more -- nearly every
+# real one -- was a placeholder_product BLOCK (found 2026-10-10 building the SG capture: JPY base crawls of
+# Japanese retailers could never apply unattended). The bounds now scale by the currency's ORDER OF MAGNITUDE
+# against the dollar. This is a coarse unit, not FX: no price is converted, compared across currencies or
+# written; a 10x margin either way still separates a token or a test row from a real price list. A currency
+# not listed (or none) keeps the dollar bounds, exactly today's behaviour.
+_PRICE_MAGNITUDE = {
+    "JPY": 100.0, "KRW": 1000.0, "HKD": 10.0, "CNY": 10.0, "TWD": 30.0, "THB": 30.0, "PHP": 50.0,
+    "INR": 100.0, "IDR": 10000.0, "VND": 10000.0, "MYR": 5.0, "SEK": 10.0, "NOK": 10.0, "DKK": 10.0,
+    "MXN": 20.0, "ZAR": 20.0,
+}
+
+
+def _currency(record: Dict[str, Any]) -> str:
+    return str(_pdp(record).get("currency") or "").strip().upper()
+
+
+def price_magnitude(currency: Optional[str]) -> float:
+    """How many units of `currency` sit where one dollar does in the placeholder bounds (1.0 if unknown)."""
+    return _PRICE_MAGNITUDE.get(str(currency or "").strip().upper(), 1.0)
+
+
 def _prices(record: Dict[str, Any]) -> List[float]:
     out = []
     for offer in record.get("offers") or []:
@@ -162,8 +185,13 @@ def placeholder_price_store_verdict(population: Iterable[Dict[str, Any]]) -> Opt
     minimum and applied the other 19 unanswered, and an only_category lip slice of an all-$1 store kept
     10 rows and applied them at $1. It is still NOT the whole store: records_for_brand's vendor filter
     has already scoped the crawl to the job's brands."""
-    every = [p for record in population or [] if _pdp(record) for p in _variant_prices(record)]
+    population = [record for record in population or [] if _pdp(record)]
+    every = [p for record in population for p in _variant_prices(record)]
     total = len(every)
+    # One storefront prices in one currency (its /meta.json); the most common one decides the scale.
+    currencies = [_currency(record) for record in population]
+    scale = price_magnitude(max(set(currencies), key=currencies.count) if currencies else None)
+    token_price, modal_ceiling = _STORE_TOKEN_PRICE * scale, _STORE_MODAL_CEILING * scale
     if total < _STORE_MIN_VARIANTS:
         return None
     counts: Dict[float, int] = {}
@@ -171,17 +199,17 @@ def placeholder_price_store_verdict(population: Iterable[Dict[str, Any]]) -> Opt
         counts[p] = counts.get(p, 0) + 1
     # Ties go to the LOWER price: the placeholder is the cheap one.
     modal, modal_n = min(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    token_n = sum(1 for p in every if p <= _STORE_TOKEN_PRICE)
+    token_n = sum(1 for p in every if p <= token_price)
     ceilings = []
-    if modal_n / total >= _STORE_MODAL_SHARE and modal <= _STORE_MODAL_CEILING:
+    if modal_n / total >= _STORE_MODAL_SHARE and modal <= modal_ceiling:
         ceilings.append(modal)
     if token_n / total >= _STORE_TOKEN_SHARE:
-        ceilings.append(_STORE_TOKEN_PRICE)
+        ceilings.append(token_price)
     if not ceilings:
         return None
     return {"ceiling": max(ceilings),
             "evidence": (f"store-wide placeholder pricing: {modal_n}/{total} variants at {modal:.2f}, "
-                         f"{token_n}/{total} at or below {_STORE_TOKEN_PRICE:.2f}")}
+                         f"{token_n}/{total} at or below {token_price:.2f}")}
 
 
 def placeholder_price_store_flags(records: Iterable[Dict[str, Any]],
@@ -351,8 +379,9 @@ def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True,
 
         prices = _prices(record)
         vendor = str(pdp.get("brand") or "")
+        scale = price_magnitude(_currency(record))
         if (_PLACEHOLDER.search(title) or re.search(r"\bdev\b", vendor, re.I)
-                or any(p <= 0.5 or p >= 1000 for p in prices)):
+                or any(p <= 0.5 * scale or p >= 1000 * scale for p in prices)):
             flags.append(_flag("placeholder_product", BLOCK, record,
                                f"looks like a test/placeholder row (prices {sorted(set(prices))[:4]})"))
     if store_level:
