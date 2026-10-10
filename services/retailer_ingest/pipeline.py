@@ -1337,7 +1337,8 @@ def _retire_counts(p: Dict[str, Any]) -> Dict[str, int]:
     return {"cohort": len(p["cohort"]), "present": len(p["present"]), "retirable": len(p["live"]),
             "waiting_for_new_key": len(p["waiting_for_new_key"]),
             "new_not_serving": len(p.get("new_not_serving") or []), "foreign": len(p["foreign"]),
-            "already_suppressed": len(p.get("already_suppressed") or [])}
+            "already_suppressed": len(p.get("already_suppressed") or []),
+            **({"canonical_handovers": len(p["handovers"])} if p.get("handovers") else {})}
 
 
 async def _stale_brand_retire_preview(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1434,7 +1435,9 @@ def _retire_reason(r: Dict[str, Any]) -> str:
             if r.get(k)]
     tail = f"; kept {', '.join(kept)}" if kept else ""
     if r["outcome"] == "retired":
-        return f"{head}retired {r['counts']['products']} key(s) ({r['retire_run_id']}){tail}"
+        handed = r["counts"].get("canonical_handovers")
+        moved = f", {handed} with the canonical URL handed to the new key" if handed else ""
+        return f"{head}retired {r['counts']['products']} key(s) ({r['retire_run_id']}){moved}{tail}"
     if r["outcome"] == "nothing_to_retire":
         return f"{head}nothing to retire{tail}"
     if r["outcome"] == "deferred":
@@ -1461,7 +1464,8 @@ RETIRE_LOCK_MARGIN_S = 120
 
 async def _retire_readback(p: Dict[str, Any], retire_tool: Any) -> Dict[str, Any]:
     """Every retired old key is suppressed, and its new key is live on this store -- and serving wherever the
-    old row served. Measured, not assumed: the plan was read before the write."""
+    old row served -- and every content_key whose canonical URL the retire handed over now elects the new key.
+    Measured, not assumed: the plan was read before the write."""
     from db.database import database
     retired = p["live"]
     old = {r["product_key"]: dict(r) for r in await database.fetch_all(
@@ -1485,6 +1489,12 @@ async def _retire_readback(p: Dict[str, Any], retire_tool: Any) -> Dict[str, Any
             problems.append(f"served before, new key not serving: {c['new_key']}")
         elif c["stale_key"] in was_searchable and c["new_key"] not in searchable:
             problems.append(f"searchable before, new key not searchable: {c['new_key']}")
+    handovers = p.get("handovers") or []
+    if handovers:
+        elected = {r["content_key"]: r["canonical_sig_id"] for r in await database.fetch_all(
+            retire_tool.ELECTIONS_SQL, {"keys": sorted({h["content_key"] for h in handovers})})}
+        problems += [f"canonical not handed over: {h['content_key']} still elects {elected.get(h['content_key'])}"
+                     for h in handovers if elected.get(h["content_key"]) != h["to_sig"]]
     return {"ok": not problems, "retired": len(retired), "new_live": len(new_live),
             "new_serving": len(serving), "new_searchable": len(searchable), "problems": problems[:20]}
 

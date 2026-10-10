@@ -503,6 +503,43 @@ async def upsert_catalog_row_trust_many(
     return wrote
 
 
+async def preview_serving_decisions(
+    *,
+    db: Any,
+    product_keys: Sequence[str],
+    row_is_elected_canonical: Optional[bool] = None,
+    now: Optional[datetime] = None,
+) -> dict[str, str]:
+    """``serving_decision`` per product_key as an upsert would write it NOW, writing
+    nothing. Same join, same input shape, same policy as the upsert.
+
+    ``row_is_elected_canonical`` replaces that one input for every key: "would this
+    row be public if it held its content_key's canonical URL?". That is the question
+    a caller asks before handing the URL over (scripts/retire_superseded_brand_keys.py),
+    and asking the policy rather than reading NON_CANONICAL_DUPLICATE off a stored
+    trust row keeps the rule in one place.
+
+    Raises on a failed read, unlike the upserts: a caller deciding on the answer must
+    not mistake a failure for "not public" or for "public".
+    """
+    keys = [str(k) for k in product_keys if k]
+    if not keys:
+        return {}
+    rows = await _fetch_all(
+        db, _SELECT_BY_PRODUCT_KEYS_SQL, {"product_keys": keys, "limit": len(keys)}
+    )
+    quarantines = await _load_active_quarantines(db)
+    out: dict[str, str] = {}
+    for row in rows:
+        inputs = _joined_row_to_inputs(row, quarantines, now)
+        if not inputs.get("subject_key"):
+            continue
+        if row_is_elected_canonical is not None:
+            inputs["row_is_elected_canonical"] = row_is_elected_canonical
+        out[inputs["subject_key"]] = derive_trust(inputs)["serving_decision"]
+    return out
+
+
 async def upsert_catalog_row_trust_for_quarantine_match(
     *,
     db: Any,
@@ -790,6 +827,7 @@ async def _execute(db: Any, sql: str, values: Mapping[str, Any]) -> Any:
 
 
 __all__ = [
+    "preview_serving_decisions",
     "upsert_catalog_row_trust",
     "upsert_catalog_row_trust_many",
     "upsert_catalog_row_trust_for_quarantine_match",

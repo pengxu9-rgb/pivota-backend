@@ -579,3 +579,45 @@ def test_a_failed_readback_names_the_offer_revert_too():
     assert "revert --ingest-run" in line and "revert_offer_suppression" in line
     # Review of #2542 (P2-a): the trust refresh comes last, after the offers are back.
     assert line.index("revert_offer_suppression") < line.index("refresh-trust --ingest-run")
+
+
+# --- the canonical handover (scripts/retire_superseded_brand_keys.select_handovers) ------------------------------
+
+class ElectionFakeDB(FakeDB):
+    def __init__(self, *a, elected, **kw):
+        super().__init__(*a, **kw)
+        self.elected = elected
+
+    async def fetch_all(self, sql, values):
+        if sql == retire_tool.ELECTIONS_SQL:
+            return [{"content_key": ck, "canonical_sig_id": sig, "election_reason": "dedupe_keeper"}
+                    for ck, sig in self.elected.items() if ck in values["keys"]]
+        return await super().fetch_all(sql, values)
+
+
+@pytest.mark.parametrize("elected,want_problem", [
+    ("sig_new0", None),
+    ("sig_old0", "canonical not handed over: ck_0 still elects sig_old0"),
+])
+async def test_the_readback_checks_a_handed_over_url_now_elects_the_new_key(monkeypatch, elected, want_problem):
+    import db.database as dbmod
+    fake = ElectionFakeDB({"old0": row("old0", suppressed=True), "new0": row("new0")}, {"ck_new0"},
+                          elected={"ck_0": elected})
+    monkeypatch.setattr(dbmod, "database", fake)
+    monkeypatch.setattr(retire_tool, "database", fake)
+    p = {**fake_plan(live=1, serving=["old0"]), "searchable": ["old0"],
+         "handovers": [{"content_key": "ck_0", "stale_key": "old0", "new_key": "new0", "from_sig": "sig_old0",
+                        "to_sig": "sig_new0"}]}
+    out = await pipeline._retire_readback(p, retire_tool)
+    assert out["problems"] == ([] if want_problem is None else [want_problem])
+
+
+def test_the_counts_and_the_status_line_name_the_handovers():
+    p = {**fake_plan(live=2), "handovers": [{"content_key": "ck_0"}]}
+    assert pipeline._retire_counts(p)["canonical_handovers"] == 1
+    assert "canonical_handovers" not in pipeline._retire_counts(fake_plan(live=2))
+    r = {"stale_brand": STALE, "outcome": "retired", "counts": {"products": 2, "canonical_handovers": 1},
+         "retire_run_id": "retire_x", "new_not_serving": 0}
+    assert "retired 2 key(s) (retire_x), 1 with the canonical URL handed to the new key" in pipeline._retire_reason(r)
+    r["counts"].pop("canonical_handovers")
+    assert "canonical URL" not in pipeline._retire_reason(r)
