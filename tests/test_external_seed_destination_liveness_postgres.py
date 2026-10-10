@@ -38,7 +38,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 _REPO = Path(__file__).resolve().parent.parent
-_MIGRATION = _REPO / "db/migrations/200_external_seed_destination_liveness.sql"
+_MIGRATIONS = (
+    _REPO / "db/migrations/200_external_seed_destination_liveness.sql",
+    # The retirement gap's clock (destination_corroborated_dead_at); the writer reads it.
+    _REPO / "db/migrations/260_external_seed_destination_corroborated_dead_at.sql",
+)
 
 # This gate DROPS `external_product_seeds` and `catalog_products`, so it must be incapable of
 # running anywhere but a throwaway. `skipif(_IS_PG)` only asks "is this Postgres" — pointed at
@@ -110,10 +114,10 @@ async def _db():
     # Apply the DDL UNDER TEST, not a hand-written copy of it — a fixture that redeclared the
     # columns would be testing the fixture. Applied TWICE: the migration has to be idempotent
     # because schema_guard runs the same statements on every boot.
-    sql = _MIGRATION.read_text()
     for _ in range(2):
-        for statement in split_statements(sql):
-            await database.execute(statement)
+        for migration in _MIGRATIONS:
+            for statement in split_statements(migration.read_text()):
+                await database.execute(statement)
 
     yield database
 
@@ -290,6 +294,51 @@ async def test_a_live_observation_resets_the_streak(_db):
     row = await _read(_db, "eps_back")
     assert row["destination_failure_streak"] == 0
     assert row["destination_verdict"] == liveness.VERDICT_LIVE
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_stamp_does_not_hold_back_the_next_nights_corroborated_step(_db):
+    """The production cadence on real Postgres: sweep steps the streak, the refresh re-stamps
+    `destination_checked_at` two hours later, and the next night's sweep must still step it."""
+    from services import external_seed_destination_liveness as liveness
+
+    await _seed(_db, "eps_cadence")
+    night1 = NOW
+    corroborated = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=True)
+    refresh = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=False)
+
+    first = await liveness.record_destination_observation("eps_cadence", corroborated, now=night1)
+    assert first["failure_streak"] == 1
+    assert (await _read(_db, "eps_cadence"))["destination_corroborated_dead_at"] == night1
+
+    await liveness.record_destination_observation("eps_cadence", refresh, now=night1 + timedelta(hours=2))
+    row = await _read(_db, "eps_cadence")
+    assert row["destination_checked_at"] == night1 + timedelta(hours=2)
+    assert row["destination_corroborated_dead_at"] == night1, "the refresh must not move the anchor"
+
+    second = await liveness.record_destination_observation(
+        "eps_cadence", corroborated, now=night1 + timedelta(days=1)
+    )
+    assert second["failure_streak"] == 2
+    assert second["retire"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_live_answer_clears_the_anchor_on_real_postgres(_db):
+    from services import external_seed_destination_liveness as liveness
+
+    await _seed(_db, "eps_clear", destination_verdict="dead_404", destination_failure_streak=1,
+                destination_checked_at=NOW - timedelta(hours=3))
+    await _db.execute(
+        "UPDATE external_product_seeds SET destination_corroborated_dead_at = :t WHERE id = 'eps_clear'",
+        {"t": NOW - timedelta(hours=30)},
+    )
+    await liveness.record_destination_observation(
+        "eps_clear", liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), now=NOW
+    )
+    row = await _read(_db, "eps_clear")
+    assert row["destination_failure_streak"] == 0
+    assert row["destination_corroborated_dead_at"] is None
 
 
 # --------------------------------------------------------------------------- retirement

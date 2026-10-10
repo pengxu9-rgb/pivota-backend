@@ -385,9 +385,10 @@ async def record_destination_observation(
       confirmed 404 with a full streak, handing its dead link straight back to the serving
       lane. The row keeps its last CONCLUSIVE answer until a new one arrives.
     * the failure streak advances only on a confirmed-dead verdict that stage 1 CORROBORATED
-      (see `DestinationObservation.corroborated`), and only when the previous observation is
-      at least `RETIREMENT_MIN_GAP` old — two probes in one run cannot retire a seed, which is
-      what makes a sweep re-run free.
+      (see `DestinationObservation.corroborated`), and only when the previous CORROBORATED
+      observation is at least `RETIREMENT_MIN_GAP` old — two probes in one run cannot retire a
+      seed, which is what makes a sweep re-run free. See `_gap_anchor` for why the gap is not
+      measured from `destination_checked_at`.
     * an uncorroborated confirmed-dead verdict is recorded but HOLDS the streak. It is a real
       observation and the serving lane may act on it; it is just not, on its own, enough to
       withdraw a row.
@@ -400,7 +401,8 @@ async def record_destination_observation(
 
     row = await database.fetch_one(
         """
-        SELECT destination_checked_at, destination_verdict, destination_failure_streak, status
+        SELECT destination_checked_at, destination_verdict, destination_failure_streak,
+               destination_corroborated_dead_at, status
         FROM external_product_seeds
         WHERE id = :id
         """,
@@ -409,13 +411,16 @@ async def record_destination_observation(
     if not row:
         return {"seed_id": seed_id, "status": "missing"}
     current = dict(row)
-    previous_checked_at = current.get("destination_checked_at")
     streak = int(current.get("destination_failure_streak") or 0)
+    corroborated_dead_at = current.get("destination_corroborated_dead_at")
+    next_corroborated_dead_at = corroborated_dead_at
 
     if not observation.reached_origin:
         next_streak = streak
     elif not advance_streak:
         next_streak = 0
+        # The streak is gone, so the clock that spaces its steps goes with it.
+        next_corroborated_dead_at = None
     elif not observation.corroborated:
         # A CONFIRMED-DEAD PROBE WITH NO SECOND WITNESS HOLDS THE STREAK WHERE IT IS.
         # It is recorded (the verdict is real and worth serving on) but it may not push the
@@ -426,8 +431,18 @@ async def record_destination_observation(
         next_streak = streak
     else:
         # A second look inside the gap is not a second observation.
-        within_gap = previous_checked_at is not None and _as_utc(previous_checked_at) > gap_cutoff
-        next_streak = streak if within_gap else streak + 1
+        anchor = _gap_anchor(current)
+        within_gap = anchor is not None and _as_utc(anchor) > gap_cutoff
+        if not within_gap:
+            next_streak = streak + 1
+            next_corroborated_dead_at = stamp
+        else:
+            next_streak = streak
+            if corroborated_dead_at is None:
+                # A streak earned before this column existed, whose last check of any kind is
+                # too recent to prove the gap. Start its clock HERE, the conservative end: the
+                # streak was really earned earlier, so this can only delay a retirement.
+                next_corroborated_dead_at = stamp
 
     await database.execute(
         """
@@ -441,6 +456,7 @@ async def record_destination_observation(
                 ELSE destination_http_status
             END,
             destination_failure_streak = :streak,
+            destination_corroborated_dead_at = :corroborated_dead_at,
             destination_checked_at = CASE
                 WHEN CAST(:reached_origin AS BOOLEAN) THEN :checked_at
                 ELSE destination_checked_at
@@ -452,6 +468,7 @@ async def record_destination_observation(
             "verdict": observation.verdict,
             "http_status": observation.http_status,
             "streak": next_streak,
+            "corroborated_dead_at": next_corroborated_dead_at,
             "reached_origin": bool(observation.reached_origin),
             "checked_at": stamp,
         },
@@ -464,6 +481,32 @@ async def record_destination_observation(
         "checked_at": stamp.isoformat() if observation.reached_origin else None,
         "retire": should_retire(observation.verdict, next_streak),
     }
+
+
+def _gap_anchor(current: Dict[str, Any]) -> Optional[Any]:
+    """When did the streak last step? The retirement gap is measured from here.
+
+    NOT `destination_checked_at`. That column is stamped by EVERY observation that reached the
+    origin, including the refresh route's uncorroborated ones, and the refresh runs at 05:15Z
+    over ~10k seeds while the sweep runs at 03:15Z. So the sweep almost always found a check
+    less than 24h old, and the streak almost never stepped: on 2026-10-09, 157 of the 160
+    active seeds at streak 1 had last been stamped by the refresh, and auto-retirements had
+    fallen to 0-12 a day while 562 active seeds sat at `dead_404`. An observation that is not
+    allowed to ADVANCE the streak must not be able to hold it back either.
+
+    `destination_corroborated_dead_at` is written when the streak steps and cleared when it
+    resets, so it measures exactly the gap the rule is about. A streak earned before that
+    column existed falls back to `destination_checked_at`: the streak was earned at or before
+    that stamp, so a gap measured from it is never shorter than the real one (and if that gap
+    is not yet long enough, the caller starts the new clock then, which can only delay). A
+    streak of 0 has no anchor: the first corroborated observation needs no gap, only the second
+    one does.
+    """
+    if current.get("destination_corroborated_dead_at") is not None:
+        return current["destination_corroborated_dead_at"]
+    if int(current.get("destination_failure_streak") or 0) > 0:
+        return current.get("destination_checked_at")
+    return None
 
 
 def _as_utc(value: Any) -> datetime:

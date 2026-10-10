@@ -397,6 +397,8 @@ async def _ensure_external_seeds_table() -> None:
         "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_http_status INTEGER;",
         "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_verdict TEXT;",
         "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;",
+        # Migration 260 / schema_guard: the retirement gap's clock, read on every observation.
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_corroborated_dead_at TIMESTAMPTZ;",
     ]):
         deferred |= not await _execute_heal(statement)
     # The CHECK and the two partial indexes travel WITH the columns. Migration 199 and
