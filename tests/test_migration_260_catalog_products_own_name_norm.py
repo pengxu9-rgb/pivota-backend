@@ -15,8 +15,10 @@ import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-# *.sql.disabled: the boot runner (main.startup -> run_sql_migrations) applies every ACTIVE *.sql file
-# it has not ledgered, with no lock_timeout; these two are applied by hand, in order, from a one-off job.
+# *.sql.disabled: deploys skip startup migrations (main.startup returns early in fast mode,
+# SKIP_HEAVY_STARTUP_INIT=true on every Cloud Run deploy), so these two are applied by hand, in order,
+# from a one-off job; the suffix also keeps them out of the boot runner in any environment that runs
+# the full startup, which applies every ACTIVE *.sql file it has not ledgered, with no lock_timeout.
 UP_260 = REPO / "db" / "migrations" / "260_catalog_products_own_name_norm.sql.disabled"
 UP_261 = REPO / "db" / "migrations" / "261_catalog_products_name_norm_trgm_index.sql.disabled"
 DOWN_260 = REPO / "db" / "migrations" / "down" / "260_catalog_products_own_name_norm_down.sql"
