@@ -55,6 +55,7 @@ def retire(env, monkeypatch):  # noqa: F811
         return feed.ShopifyProductBatch([official(*TINT)], scanned_products=1, pages=1)
     monkeypatch.setattr(feed, "records_for_brand", fetch)
     st = SimpleNamespace(plan=fake_plan(), plans=[], writes=[], write_error=None, events=[], manifests={},
+                         trust={"trust": 2},
                          readback={"ok": True, "retired": 2, "new_live": 2, "new_serving": 2, "problems": []},
                          preview_error=None)
 
@@ -72,7 +73,7 @@ def retire(env, monkeypatch):  # noqa: F811
         if st.write_error:
             raise st.write_error
         st.writes.append(prepared["keys"])
-        return {"products": len(prepared["keys"]), "seeds": 1, "offers": 3}
+        return {"products": len(prepared["keys"]), "seeds": 1, "offers": 3, **st.trust}
 
     async def record_retire_manifest(run_id, manifest, db=None):
         st.events.append(("manifest", run_id))
@@ -168,6 +169,26 @@ async def test_a_readback_that_disagrees_fails_the_job_for_a_human(env, retire):
     out = await pipeline.run_stage(rjob(), db=env.db)
     assert out["status"] == "failed" and out["stale_brand_retire"] == "readback_failed"
     assert "revert with retire_superseded_brand_keys revert --ingest-run" in env.ledger.transitions[-1]["reason"]
+
+
+async def test_a_retire_whose_trust_did_not_refresh_fails_the_job_with_the_re_run(env, retire):  # noqa: F811
+    """The tombstones committed; their catalog_row_trust rows still read public. Not 'nothing retired', not a
+    revert: the job fails for a human with the refresh to re-run."""
+    retire.trust = {"trust": 1, "trust_problems": ["1 of 2 key(s) not rewritten"]}
+    out = await pipeline.run_stage(rjob(), db=env.db)
+    assert out["status"] == "failed" and out["outcome"] == "applied"
+    assert out["stale_brand_retire"] == "trust_not_refreshed"
+    reason = env.ledger.transitions[-1]["reason"]
+    assert "retired 2 key(s)" in reason and "refresh-trust --ingest-run" in reason
+    assert "1 of 2 key(s) not rewritten" in reason and "revert" not in reason
+
+
+async def test_a_readback_failure_outranks_a_trust_failure(env, retire):  # noqa: F811
+    retire.trust = {"trust": 1, "trust_problems": ["1 of 2 key(s) not rewritten"]}
+    retire.readback = {"ok": False, "retired": 2, "new_live": 1, "new_serving": 1,
+                       "problems": ["new key not live: new1"]}
+    out = await pipeline.run_stage(rjob(), db=env.db)
+    assert out["stale_brand_retire"] == "readback_failed"
 
 
 async def test_an_apply_that_did_not_verify_never_retires(env, retire):  # noqa: F811
@@ -437,10 +458,17 @@ async def test_revert_restores_only_rows_still_carrying_its_tombstone(monkeypatc
          "products": [{"product_key": k, "prior_suppression_reason": None, "prior_suppressed_at": None,
                        "prior_suppression_metadata": None} for k in ("k_ours", "k_retired_again")],
          "seeds": [{"id": "s1", "prior_status": "active"}]}
+    refreshed = []
+
+    async def trust_many(*, db, product_keys):
+        refreshed.append(list(product_keys))
+        return len(product_keys)
+    monkeypatch.setattr(retire_tool, "upsert_catalog_row_trust_many", trust_many)
     await retire_tool.revert_manifest(m)
     assert calls == [("unsuppress", "k_ours", "retire_x", retire_tool.REASON),
                      ("unsuppress", "k_retired_again", "retire_x", retire_tool.REASON),
                      ("seed", "s1", ("k_ours",))]
+    assert refreshed == [["k_ours"]]
 
 
 async def test_revert_never_revives_a_row_whose_url_a_live_retailer_listing_now_owns(monkeypatch):
@@ -475,8 +503,15 @@ async def test_revert_never_revives_a_row_whose_url_a_live_retailer_listing_now_
          "products": [{"product_key": k, "prior_suppression_reason": None, "prior_suppressed_at": None,
                        "prior_suppression_metadata": None} for k in ("k_owned", "k_free")],
          "seeds": [{"id": "s1", "prior_status": "active"}]}
+    refreshed = []
+
+    async def trust_many(*, db, product_keys):
+        refreshed.append(list(product_keys))
+        return len(product_keys)
+    monkeypatch.setattr(retire_tool, "upsert_catalog_row_trust_many", trust_many)
     await retire_tool.revert_manifest(m)
     assert calls == [("unsuppress", "k_free"), ("seed", "s1", ("k_free",))]
+    assert refreshed == [["k_free"]]
 
 
 # --- queue review of #2426: search is a second surface, gated per ROW --------------------------------------
@@ -542,3 +577,74 @@ def test_a_failed_readback_names_the_offer_revert_too():
          "readback": {"problems": ["new key not live: new1"]}}
     line = pipeline._retire_reason(r)
     assert "revert --ingest-run" in line and "revert_offer_suppression" in line
+    # Review of #2542 (P2-a): the trust refresh comes last, after the offers are back.
+    assert line.index("revert_offer_suppression") < line.index("refresh-trust --ingest-run")
+
+
+# --- the canonical handover (scripts/retire_superseded_brand_keys.select_handovers) ------------------------------
+
+class ElectionFakeDB(FakeDB):
+    def __init__(self, *a, elected, **kw):
+        super().__init__(*a, **kw)
+        self.elected = elected
+
+    async def fetch_all(self, sql, values):
+        if sql == retire_tool.ELECTIONS_SQL:
+            return [{"content_key": ck, "canonical_sig_id": sig, "election_reason": "dedupe_keeper"}
+                    for ck, sig in self.elected.items() if ck in values["keys"]]
+        return await super().fetch_all(sql, values)
+
+
+@pytest.mark.parametrize("elected,want_problem", [
+    ("sig_new0", None),
+    ("sig_old0", "canonical not handed over: ck_0 still elects sig_old0"),
+])
+async def test_the_readback_checks_a_handed_over_url_now_elects_the_new_key(monkeypatch, elected, want_problem):
+    import db.database as dbmod
+    fake = ElectionFakeDB({"old0": row("old0", suppressed=True), "new0": row("new0")}, {"ck_new0"},
+                          elected={"ck_0": elected})
+    monkeypatch.setattr(dbmod, "database", fake)
+    monkeypatch.setattr(retire_tool, "database", fake)
+    p = {**fake_plan(live=1, serving=["old0"]), "searchable": ["old0"],
+         "handovers": [{"content_key": "ck_0", "stale_key": "old0", "new_key": "new0", "from_sig": "sig_old0",
+                        "to_sig": "sig_new0"}]}
+    out = await pipeline._retire_readback(p, retire_tool)
+    assert out["problems"] == ([] if want_problem is None else [want_problem])
+
+
+def test_the_counts_and_the_status_line_name_the_handovers():
+    p = {**fake_plan(live=2), "handovers": [{"content_key": "ck_0"}]}
+    assert pipeline._retire_counts(p)["canonical_handovers"] == 1
+    assert "canonical_handovers" not in pipeline._retire_counts(fake_plan(live=2))
+    r = {"stale_brand": STALE, "outcome": "retired", "counts": {"products": 2, "canonical_handovers": 1},
+         "retire_run_id": "retire_x", "new_not_serving": 0}
+    assert "retired 2 key(s) (retire_x), 1 with the canonical URL handed to the new key" in pipeline._retire_reason(r)
+    r["counts"].pop("canonical_handovers")
+    assert "canonical URL" not in pipeline._retire_reason(r)
+
+
+async def test_a_failed_handover_check_is_named_in_the_run_and_the_status_line(env, retire):  # noqa: F811
+    """The plan hands nothing over when its check fails and keeps those pairs as "new key does not serve yet" -- the
+    Tower 28 stalemate's own wording. The status line must say the check failed, not read like an ordinary wait."""
+    retire.plan = {**fake_plan(live=1, new_not_serving=1), "handover_error": "TimeoutError: trust join"}
+    await pipeline.run_stage(rjob(), db=env.db)
+    [run_id] = [k for k, r in env.ledger.runs.items() if r.get("stage") == "apply"]
+    assert env.ledger.runs[run_id]["checks"]["stale_brand_retire"]["handover_error"] == "TimeoutError: trust join"
+    reason = env.ledger.transitions[-1]["reason"]
+    assert "1 whose new key does not serve yet; the canonical handover check FAILED (TimeoutError: trust join)" in reason
+
+
+async def test_a_clean_handover_check_adds_nothing_to_the_status_line(env, retire):  # noqa: F811
+    retire.plan = {**fake_plan(live=1, new_not_serving=1), "handover_error": None}
+    await pipeline.run_stage(rjob(), db=env.db)
+    [run_id] = [k for k, r in env.ledger.runs.items() if r.get("stage") == "apply"]
+    assert "handover_error" not in env.ledger.runs[run_id]["checks"]["stale_brand_retire"]
+    assert "handover check" not in env.ledger.transitions[-1]["reason"]
+
+
+def test_an_unrefreshed_trust_line_names_both_directions():
+    r = {"stale_brand": STALE, "outcome": "trust_not_refreshed", "retire_run_id": "retire_x",
+         "counts": {"products": 1, "trust_problems": ["1 handed-over key(s) not public: ['new0']"]}}
+    line = pipeline._retire_reason(r)
+    assert "a retired row stays publicly listed, a new row the canonical URL was handed to stays unlisted" in line
+    assert "they stay publicly listed until" not in line

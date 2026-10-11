@@ -72,25 +72,9 @@ def build_proposals(
     snaps its content_key back and has its group refused (review of the attach_membership PR)."""
     listings = list(listings)
     candidates, counts = _candidates(listings, families, groups)
-    moving = {c["listing"]["product_key"] for c in candidates}
-    moving_by_group: Dict[str, int] = {}
-    for c in candidates:
-        moving_by_group[c["from_group"]] = moving_by_group.get(c["from_group"], 0) + 1
     proposals: List[Dict[str, Any]] = []
-    for c in candidates:
+    for c in whole_moves(candidates, from_family_keys, group_sizes, counts):
         row, keeper = c["listing"], c["keeper"]
-        # A content_key missing from the map was not read: treat it as unknown, never as empty.
-        on_old_key = from_family_keys.get(row.get("content_key"))
-        if on_old_key is None:
-            counts["old_content_key_not_read"] = counts.get("old_content_key_not_read", 0) + 1
-            continue
-        left_behind = set(on_old_key) - moving
-        if left_behind:
-            counts["rows_left_on_old_content_key"] = counts.get("rows_left_on_old_content_key", 0) + 1
-            continue
-        if group_sizes.get(c["from_group"], 0) != moving_by_group[c["from_group"]]:
-            counts["old_group_has_other_members"] = counts.get("old_group_has_other_members", 0) + 1
-            continue
         proposals.append(new_proposal(
             kind="attach_membership", strategy=STRATEGY,
             subject_product_keys=[row["product_key"], keeper["product_key"]],
@@ -103,6 +87,40 @@ def build_proposals(
         ))
         counts["proposed"] = counts.get("proposed", 0) + 1
     return proposals, counts
+
+
+def whole_moves(
+    candidates: List[Dict[str, Any]],
+    from_family_keys: Mapping[str, List[str]],
+    group_sizes: Mapping[str, int],
+    counts: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    """The candidate moves ({listing, from_group, ...}) that leave nothing behind: every live row on
+    the listing's current content_key moves in this batch, and its group holds only moving listings.
+    Otherwise the next crawl resolves the listing back to the row left behind (exact content_key
+    tier), snaps its content_key back and has its group refused. Skips are tallied into `counts`.
+    Shared with services.identity_barcode_link, which moves listings by the same engine."""
+    moving = {c["listing"]["product_key"] for c in candidates}
+    moving_by_group: Dict[str, int] = {}
+    for c in candidates:
+        moving_by_group[c["from_group"]] = moving_by_group.get(c["from_group"], 0) + 1
+    out: List[Dict[str, Any]] = []
+    for c in candidates:
+        row = c["listing"]
+        # A content_key missing from the map was not read: treat it as unknown, never as empty.
+        on_old_key = from_family_keys.get(row.get("content_key"))
+        if on_old_key is None:
+            counts["old_content_key_not_read"] = counts.get("old_content_key_not_read", 0) + 1
+            continue
+        left_behind = set(on_old_key) - moving
+        if left_behind:
+            counts["rows_left_on_old_content_key"] = counts.get("rows_left_on_old_content_key", 0) + 1
+            continue
+        if group_sizes.get(c["from_group"], 0) != moving_by_group[c["from_group"]]:
+            counts["old_group_has_other_members"] = counts.get("old_group_has_other_members", 0) + 1
+            continue
+        out.append(c)
+    return out
 
 
 def _candidates(

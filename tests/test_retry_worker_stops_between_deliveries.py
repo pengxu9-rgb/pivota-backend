@@ -43,11 +43,11 @@ def _rows(mod, n):
 @pytest.fixture(params=MODULES)
 def svc(request, monkeypatch):
     mod = importlib.import_module(request.param)
-    # Production with WEBHOOK_RETRY_DELIVERY_ENABLED unset: the configuration every case here
+    # Production with WEBHOOK_DELIVERY_ENABLED unset: the configuration every case here
     # describes. Outside production retries do not deliver at all
-    # (tests/test_webhook_retry_delivery_gate.py), so without this the cases would pass vacuously.
+    # (tests/test_webhook_delivery_gate.py), so without this the cases would pass vacuously.
     monkeypatch.setenv("PIVOTA_ENV", "production")
-    monkeypatch.delenv("WEBHOOK_RETRY_DELIVERY_ENABLED", raising=False)
+    monkeypatch.delenv("WEBHOOK_DELIVERY_ENABLED", raising=False)
     monkeypatch.setattr(mod, "_db_now", lambda: 0, raising=False)
     ensure = [n for n in ("ensure_agent_webhook_tables", "ensure_merchant_webhook_tables")
               if hasattr(mod, n)]

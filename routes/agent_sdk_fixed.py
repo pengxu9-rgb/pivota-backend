@@ -853,6 +853,10 @@ async def search_products(
     external_seed_strategy: str = Query(default="legacy"),
     fast_mode: bool = Query(default=False),
     market: Optional[str] = Query(default=None),
+    serving_market: Optional[str] = Query(
+        default=None,
+        description="The BUYER's market (ISO-2): decides the served currency; `market` stays the storage partition.",
+    ),
     context: AgentContext = Depends(get_agent_context)
 ):
     """
@@ -1185,6 +1189,7 @@ async def search_products(
                 external_seed_strategy=external_seed_strategy,
                 fast_mode=fast_mode,
                 market=market,
+                serving_market=serving_market,
                 context=context,
             ),
             delegate_timeout_s,
