@@ -15,7 +15,7 @@ Every rule here has a test that fails when the rule is removed (each section nam
      price -> /products/<handle>.js in-session, re-checked; siblings for base-crawl rows only.
   6. End to end, in the operator's order: an AUD-base store's AU crawl lands unservable; the capture adds
      USD siblings; the content_keys become serving-eligible for US only.
-Store shapes are the ADR's measured ones (section 1.1: Go-To, gotoskincare.com, AUD base, ships to 227
+Store shapes are the ADR's measured ones (section 1.1: a brand store with an AUD base, ships to 227
 countries, prices USD to US visitors via Shopify Markets).
 """
 from __future__ import annotations
@@ -41,8 +41,8 @@ from services.retailer_ingest import pipeline, shopify_markets as markets
 from tests.services.test_retailer_ingest_explicit_market import _Catalog, quiet_writer  # noqa: F401 -- fixture
 from tests.services.test_retailer_ingest_pipeline import env, job  # noqa: F401 -- the state-machine fixture
 
-HOST, BRAND = "gotoskincare.com", "Go-To"
-GOTO_META = {"name": "Go-To Skin Care", "myshopify_domain": "go-to-skincare.myshopify.com", "currency": "AUD",
+HOST, BRAND = "aud-brand.example.com", "Example AUD Brand"
+GOTO_META = {"name": "Example AUD Brand", "myshopify_domain": "example-aud.myshopify.com", "currency": "AUD",
              "ships_to_countries": ["AU", "NZ", "US"]}
 
 
@@ -66,7 +66,7 @@ def goto_product(handle, title, variants, *, currency="AUD", pid=None, ptype="Fa
     return feed.shopify_product_to_record(
         {"id": pid or abs(hash(handle)) % 10**9, "vendor": BRAND, "title": title, "handle": handle,
          "product_type": ptype, "body_html": body,
-         "images": [{"src": f"https://cdn.shopify.com/goto/{handle}.jpg"}], "variants": variants},
+         "images": [{"src": f"https://cdn.shopify.com/example-aud/{handle}.jpg"}], "variants": variants},
         domain=HOST, category_path="beauty", brand_override=BRAND, currency=currency,
         source_role="brand_official", emit_native_variants=True)
 
@@ -349,8 +349,8 @@ async def test_the_leak_detector_asks_the_served_regions_on_the_content_key(monk
 
 async def test_the_readback_counts_only_the_jobs_storefronts_offers():
     db = _RB()
-    await pipeline._readback(["p1"], "AUD", db, market="AU", domain="www.GoToSkincare.com")
-    assert db.values["hosts"] == ["gotoskincare.com", "www.gotoskincare.com"]
+    await pipeline._readback(["p1"], "AUD", db, market="AU", domain="www.AUD-Brand.example.com")
+    assert db.values["hosts"] == ["aud-brand.example.com", "www.aud-brand.example.com"]
     assert db.sql.count("lower(o.source_domain) = ANY(:hosts)") == 3
     # ...and to the offers THIS lane writes there: a shopify_markets sibling on the same host is not the
     # crawl's (review of #2358, D1).
@@ -463,12 +463,19 @@ async def test_a_retailer_capture_job_fails_before_any_request(env, monkeypatch)
 
 class Store:
     """A Shopify-Markets storefront: AUD base; a session whose multipart PUT to /localization names US gets
-    a localization cookie, and then /cart.js and /products/<h>.js answer in USD."""
+    a localization cookie, and then /cart.js and /products/<h>.js answer in USD. As measured for SG (ADR-026
+    Appendix B; assumed alike for US, which a US canary must confirm), a cookie-less
+    `/products/<h>.js?country=US` is presented in USD too (`pins`), and every
+    `.js` answer sets `cart_currency` to the currency it was presented in (`sends_cookie`).
+    The DEFAULT is `pins=False`, a store whose `?country=` read stays in its base currency: the session
+    fallback's case, so the session tests below exercise the session. The pinned read's tests set pins=True."""
 
-    def __init__(self, *, meta=None, honors_localization=True, overrides=None, loses_session_after=None):
+    def __init__(self, *, meta=None, honors_localization=True, overrides=None, loses_session_after=None,
+                 pins=False, sends_cookie=True):
         self.meta = {**GOTO_META, **(meta or {})}
         self.honors, self.overrides = honors_localization, dict(overrides or {})
         self.loses_session_after = loses_session_after
+        self.pins, self.sends_cookie = pins, sends_cookie
         self.log, self.carts = [], 0
 
     def handler(self, request):
@@ -501,13 +508,19 @@ class Store:
             handle = path[len("/products/"):-3]
             if handle not in HANDLE_VARIANTS:
                 return httpx.Response(404, text="not found", headers={"content-type": "text/html"})
+            if self.pins and request.url.params.get("country") == "US":
+                us = True
             cents = USD_CENTS if us else AUD_CENTS
+            headers = [("content-type", "text/javascript; charset=utf-8")]
+            if self.sends_cookie:
+                headers.append(("set-cookie", f"cart_currency={'USD' if us else self.meta['currency']}; path=/; "
+                                              f"expires=Sun, 25 Oct 2026 10:00:00 GMT; SameSite=Lax"))
             # As Shopify serves it: a JSON body typed text/javascript (2026-10-11: the application/json this fake
             # used to send is not what a storefront sends, and it hid a refusal of every real capture).
             return httpx.Response(200, content=json.dumps({
                 "id": 1, "handle": handle, "price": min(cents[v] for v in HANDLE_VARIANTS[handle]),
                 "variants": [{"id": v, "price": cents[v], "available": v != 44101000000002} for v in HANDLE_VARIANTS[handle]]}).encode(),
-                headers={"content-type": "text/javascript; charset=utf-8"})
+                headers=headers)
         return httpx.Response(404)
 
     def paths(self):
@@ -576,9 +589,11 @@ async def test_a_proven_us_session_prices_every_base_offer_in_usd():
     ev = out["checks"]["markets_capture"]
     assert (ev["cart_currency"], ev["localization_status"], ev["storefront"]["ships_to_countries"]) == (
         "USD", 302, ["AU", "NZ", "US"])
-    assert ev["robots"] == {"session_paths_checked": ["/localization", "/cart.js"]}
+    assert ev["robots"] == {"session_paths_checked": ["/localization", "/cart.js"], "session_paths_allowed": True}
+    assert (ev["proof"], ev["pinned"]["cart_currency"]) == (markets.PROOF_SESSION, "AUD")
     payload = json.loads(out["planned"][0]["offer_payload"])
     assert payload["cart_currency"] == "USD" and payload["base_currency"] == "AUD"
+    assert payload["proof"] == markets.PROOF_SESSION
 
 
 async def test_each_sibling_hangs_on_its_base_offer_and_is_stable_across_runs():
@@ -595,15 +610,16 @@ async def test_each_sibling_hangs_on_its_base_offer_and_is_stable_across_runs():
     assert [r["offer_id"] for r in again["planned"]] == [r["offer_id"] for r in out["planned"]]
 
 
-async def test_the_cart_is_proven_usd_before_any_price_is_read_and_no_country_query_is_ever_sent():
+async def test_in_the_fallback_the_cart_is_proven_usd_before_any_session_price_is_read():
     store = Store()
     await _capture(store)
-    paths = store.paths()
+    # Exactly one pinned probe (it presented AUD: not proof), then the session; no session read is pinned.
+    assert [(p, q) for _m, _h, p, q in store.log if "country=" in q] == [("/products/exceptionally-clever-cleanser.js", "country=US")]
+    paths = [(m, p) for m, _h, p, q in store.log if "country=" not in q]
     first_price = next(i for i, (m, p) in enumerate(paths) if p.startswith("/products/"))
     first_cart = paths.index(("GET", "/cart.js"))
     assert paths.index(("POST", "/localization")) < first_cart < first_price
     assert paths[-1] == ("GET", "/cart.js")  # the final re-check commits what was read
-    assert all("country" not in q for _m, _h, _p, q in store.log)
 
 
 async def test_a_store_whose_cart_stays_aud_is_a_clean_refusal_with_no_price_read():
@@ -614,7 +630,8 @@ async def test_a_store_whose_cart_stays_aud_is_a_clean_refusal_with_no_price_rea
     assert (r.outcome, r.status, r.transient) == ("us_session_unproven", "nothing", False)
     assert "reports AUD" in r.reason
     assert r.checks["markets_capture"]["cart_currency"] == "AUD"
-    assert not any(p.startswith("/products/") for _m, p in store.paths())
+    # Only the pinned probe read a product; the unproven session read none.
+    assert [(p, q) for _m, _h, p, q in store.log if p.startswith("/products/")] == [("/products/exceptionally-clever-cleanser.js", "country=US")]
 
 
 async def test_a_urlencoded_localization_is_not_a_us_session():
@@ -676,12 +693,12 @@ async def test_a_bot_wall_that_answers_200_html_is_unverifiable():
 async def test_a_redirect_to_another_regional_store_is_unverifiable():
     def geo_router(request):
         if request.url.host == HOST:
-            return httpx.Response(302, headers={"location": "https://us.gotoskincare.com/"})
+            return httpx.Response(302, headers={"location": "https://us.aud-brand.example.com/"})
         return httpx.Response(200, text="<html>US store</html>", headers={"content-type": "text/html"})
     store = Store(overrides={("GET", "/"): geo_router})
     with pytest.raises(markets.MarketsRefused) as refused:
         await _capture(store)
-    assert refused.value.outcome == "capture_unverifiable" and "us.gotoskincare.com" in refused.value.reason
+    assert refused.value.outcome == "capture_unverifiable" and "us.aud-brand.example.com" in refused.value.reason
 
 
 async def test_a_session_that_stops_reporting_usd_voids_the_capture(monkeypatch):
@@ -714,15 +731,18 @@ async def test_every_request_is_robots_checked_and_paced_with_no_special_case():
 
 
 @pytest.mark.parametrize("path", ["/localization", "/cart.js"])
-async def test_a_store_that_disallows_a_session_path_is_refused_before_any_request(path):
+async def test_a_disallowed_session_path_leaves_only_the_pinned_read_and_is_never_requested(path):
+    """robots.txt is asked about both session paths before the first request. A Disallow rules out the session
+    fallback (never worked around); this store's pinned read presents AUD, so nothing proves a USD price."""
     store = Store()
     with pytest.raises(markets.MarketsRefused) as refused:
         await _capture(store, polite=Polite(disallow={path}))
     r = refused.value
-    assert (r.outcome, r.status, r.transient) == ("robots_disallowed", "nothing", False)
-    assert r.reason.startswith(f"robots_disallowed:{path} ")
-    assert r.checks["markets_capture"]["robots"]["disallowed"] == path
-    assert store.log == []  # not one request to the store, least of all to the disallowed path
+    assert (r.outcome, r.status, r.transient) == ("robots_disallows_cart", "nothing", False)
+    assert r.reason.startswith(f"robots_disallows_cart:{path} ") and "presented in AUD" in r.reason
+    assert r.checks["markets_capture"]["robots"] == {
+        "session_paths_checked": ["/localization", "/cart.js"], "disallowed": path, "session_paths_allowed": False}
+    assert store.paths() == [("GET", "/meta.json"), ("GET", "/products/exceptionally-clever-cleanser.js")]  # no session path, ever
 
 
 async def test_a_robots_disallowed_product_read_is_refused():
@@ -783,8 +803,9 @@ async def test_the_real_gate_refuses_a_disallowed_session_path(real_gate, path, 
     store = Store()
     with pytest.raises(markets.MarketsRefused) as refused:
         await _real_capture(store)
-    assert (refused.value.outcome, refused.value.status) == ("robots_disallowed", "nothing")
-    assert refused.value.reason.startswith(f"robots_disallowed:{path} ") and store.log == []
+    assert (refused.value.outcome, refused.value.status) == ("robots_disallows_cart", "nothing")
+    assert refused.value.reason.startswith(f"robots_disallows_cart:{path} ")
+    assert not any(p in ("/localization", "/cart.js", "/") for _m, p in store.paths())
 
 
 async def test_shopify_default_cart_rule_does_not_block_cart_js(real_gate):
@@ -811,8 +832,8 @@ async def test_a_robots_fetch_failure_is_what_the_crawl_gate_does_everywhere_fai
 
 async def test_only_this_brands_rows_on_this_host_in_the_stores_base_currency_are_captured():
     rows = base_rows()
-    other_brand = {**rows[0], "brand": "Sukin", "base_offer_id": "o-sukin"}
-    other_host = {**rows[0], "source_ref": "https://us.gotoskincare.com/products/face-hero", "base_offer_id": "o-us"}
+    other_brand = {**rows[0], "brand": "Other Brand", "base_offer_id": "o-other-brand"}
+    other_host = {**rows[0], "source_ref": "https://us.aud-brand.example.com/products/face-hero", "base_offer_id": "o-us"}
     stale = {**rows[0], "currency": "NZD", "base_offer_id": "o-nzd"}
     out = await _capture(Store(), rows + [other_brand, other_host, stale])
     assert {r["base_offer_id"] for r in out["planned"]} == {r["base_offer_id"] for r in rows}
@@ -1153,7 +1174,7 @@ async def test_the_runbook_re_runs_base_capture_base_capture_and_every_run_ends_
 
     await both(au_job)
     await both(markets_job)
-    await both(au_job)        # the refresh: 5 AUD/AU base offers + 5 USD/US siblings on gotoskincare.com
+    await both(au_job)        # the refresh: 5 AUD/AU base offers + 5 USD/US siblings on aud-brand.example.com
     await both(markets_job)   # and the capture refreshes its siblings in place
     assert len(catalog.offers("market = 'AU'")) == 5 and len(catalog.offers("market = 'US'")) == 5
 
@@ -1178,11 +1199,12 @@ async def test_a_robots_refusal_leaves_the_base_job_done_and_writes_no_sibling(t
     au_done = env.ledger.transitions[-1]
     monkeypatch.setattr(markets, "crawl_politeness", Polite(disallow={path}))
     out = await pipeline.run_stage(markets_job(), db=catalog)
-    assert (out["status"], out["outcome"]) == ("nothing", "robots_disallowed")
+    assert (out["status"], out["outcome"]) == ("nothing", "robots_disallows_cart")
     run = list(env.ledger.runs.values())[-1]
-    assert run["error"].startswith(f"robots_disallowed:{path} ")
+    assert run["error"].startswith(f"robots_disallows_cart:{path} ")
     assert run["checks"]["markets_capture"]["robots"]["disallowed"] == path
-    assert catalog.offers("market = 'US'") == [] and store.log == []
+    assert catalog.offers("market = 'US'") == []
+    assert not any(p in ("/localization", "/cart.js") for _m, p in store.paths())
     assert au_done["status"] == "done" and len(catalog.offers("market = 'AU'")) == 5  # untouched
 
 

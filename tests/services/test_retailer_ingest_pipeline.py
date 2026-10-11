@@ -347,6 +347,17 @@ async def test_a_record_in_another_currency_stops_the_stage(env):
     assert out["status"] == "failed" and out["outcome"] == "currency_unproven"
 
 
+async def test_a_crawl_presented_in_another_currency_stops_the_stage(env):
+    """ADR-026 4.4 (P0): the store presented the crawl a currency other than its /meta.json one, so the read
+    is held: a terminal outcome naming the presented currency, no apply, no retry."""
+    env.crawl_error = feed.PresentedCurrencyMismatch(
+        "store.example: /products.json was presented in QAR ... but /meta.json proved USD")
+    out = await pipeline.run_stage(job(), db=env.db)
+    assert out["status"] == "failed" and out["outcome"] == "presented_currency_mismatch"
+    assert env.applied == []
+    assert "QAR" in list(env.ledger.runs.values())[-1]["error"]
+
+
 async def test_a_cancel_while_the_crawl_ran_is_not_overwritten(env):
     env.ledger.current_status = "cancelled"  # an operator cancelled mid-stage
     out = await pipeline.run_stage(job(), db=env.db)

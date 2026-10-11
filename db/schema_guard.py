@@ -1188,6 +1188,13 @@ async def ensure_required_schema_light() -> None:
                 await ensure_agent_purchase_schema()
             except Exception as exc:
                 logger.warning("schema_guard: agent_purchases (mig 264) unavailable (%s)", type(exc).__name__)
+            # mig 265: durable purchase events for agent platforms (payment orchestration P1). Own try:
+            # written only behind AGENT_PURCHASE_WEBHOOKS_ENABLED; DDL in db/agent_purchase_events.
+            try:
+                from db.agent_purchase_events import ensure_agent_purchase_events_schema
+                await ensure_agent_purchase_events_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchase_events (mig 265) unavailable (%s)", type(exc).__name__)
             # mig 252: AT MOST ONE PENDING ENROLLMENT PER BUYER.
             # db/migrations/252_reap_agentic_enrollments_one_pending.sql is the
             # same index. Two purchases of one buyer, each in 'resolving' in one
@@ -3930,6 +3937,13 @@ async def ensure_required_schema_light() -> None:
                 await ensure_agent_purchase_schema()
             except Exception as exc:
                 logger.warning("schema_guard: agent_purchases (mig 264) unavailable (%s)", type(exc).__name__)
+            # mig 265: durable purchase events for agent platforms (payment orchestration P1). Own try:
+            # written only behind AGENT_PURCHASE_WEBHOOKS_ENABLED; DDL in db/agent_purchase_events.
+            try:
+                from db.agent_purchase_events import ensure_agent_purchase_events_schema
+                await ensure_agent_purchase_events_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchase_events (mig 265) unavailable (%s)", type(exc).__name__)
             # mig 252: at most one PENDING enrollment per buyer, SQLite twin of
             # the Postgres block above (same index, same reason, same own try:
             # it fails on a database that already holds two pending rows for one

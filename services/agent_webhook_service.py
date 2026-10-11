@@ -59,6 +59,25 @@ WEBHOOK_EVENT_CATALOG: List[Dict[str, Any]] = [
         "category": "orders",
         "description": "An order was cancelled.",
     },
+    # Rail purchases (agent_purchases ledger, payment orchestration). Emitted durably by
+    # services/payment_orchestration/purchase_events.py with a stable event id per event, so a
+    # receiver de-duplicates retries on `id`. `data` is the unified purchase view, the same body as
+    # GET /agent/v2/commerce/purchases/{id}.
+    {
+        "event_type": "purchase.action_required",
+        "category": "purchases",
+        "description": "The buyer must open a rail-hosted page (add a card, or approve the purchase).",
+    },
+    {
+        "event_type": "purchase.completed",
+        "category": "purchases",
+        "description": "The merchant order was placed; carries the order reference.",
+    },
+    {
+        "event_type": "purchase.failed",
+        "category": "purchases",
+        "description": "The purchase ended without an order (failed, refused, or expired).",
+    },
     {
         "event_type": "api.auth_failed",
         "category": "api",
@@ -1023,7 +1042,10 @@ async def emit_agent_webhook_event(
     event_type: str,
     payload: Dict[str, Any],
     request_id: Optional[str] = None,
+    event_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """`event_id`, when given, is the caller's stored id for this event; every delivery of it then
+    carries the same `id`, so a receiver can de-duplicate. Omitted, a fresh id is minted per call."""
     config = await _get_or_create_raw_config(agent_id)
     destination_url = _normalize_destination_url(agent_id, config.get("destination_url")) or ""
     enabled = bool(config.get("enabled") and destination_url)
@@ -1069,6 +1091,7 @@ async def emit_agent_webhook_event(
         destination_url=destination_url,
         signing_secret=signing_secret,
         request_id=request_id,
+        event_id=event_id,
     )
 
 
