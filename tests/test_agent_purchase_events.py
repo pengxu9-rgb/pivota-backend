@@ -614,3 +614,17 @@ async def test_one_failing_candidate_does_not_stall_the_rest(monkeypatch):
     assert [e["purchase_id"] for e in await _events()] == [good]
     monkeypatch.setattr(purchase_view, "unified_purchase", real)
     assert (await purchase_events.detect()) == {"recorded": 1}  # nothing was written for it: retried
+
+
+
+async def test_the_heal_adds_checked_at_to_a_table_built_before_it():
+    await database.execute("DROP TABLE agent_purchase_events")
+    old = events_db._CREATE_TABLE_SQLITE.replace("    handed_over_at TIMESTAMP,\n    checked_at TIMESTAMP\n", "    handed_over_at TIMESTAMP\n")
+    assert old != events_db._CREATE_TABLE_SQLITE
+    await database.execute(old)
+    await events_db.ensure_agent_purchase_events_schema()
+    await events_db.ensure_agent_purchase_events_schema()  # idempotent
+    cols = {r["name"] for r in await database.fetch_all("SELECT name FROM pragma_table_info('agent_purchase_events')")}
+    assert "checked_at" in cols
+    await _purchase("completed", reap_order_id="ord_9")
+    assert (await purchase_events.detect()) == {"recorded": 1}

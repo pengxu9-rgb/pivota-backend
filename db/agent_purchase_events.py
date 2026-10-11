@@ -84,12 +84,23 @@ CREATE INDEX IF NOT EXISTS idx_agent_purchase_events_status_created
 """
 
 
+#: `checked_at` arrived after the table's first shape: a table built before it gets the column
+#: here (the candidate read references it, so without it every tick would fail once armed).
+_ADD_CHECKED_AT_PG = "ALTER TABLE agent_purchase_events ADD COLUMN IF NOT EXISTS checked_at TIMESTAMPTZ"
+_ADD_CHECKED_AT_SQLITE = "ALTER TABLE agent_purchase_events ADD COLUMN checked_at TIMESTAMP"
+_SQLITE_COLUMNS = "SELECT name FROM pragma_table_info('agent_purchase_events')"
+
+
 async def ensure_agent_purchase_events_schema() -> None:
     """Self-heal parity with migration 265. Idempotent; called at every startup."""
     if IS_POSTGRES:
         await database.execute(_CREATE_TABLE_PG)
+        await database.execute(_ADD_CHECKED_AT_PG)
     else:
         await database.execute(_CREATE_TABLE_SQLITE)
+        columns = {row["name"] for row in await database.fetch_all(_SQLITE_COLUMNS)}
+        if "checked_at" not in columns:
+            await database.execute(_ADD_CHECKED_AT_SQLITE)
     await database.execute(_CREATE_UNIQUE_INDEX)
     await database.execute(_CREATE_PENDING_INDEX)
 

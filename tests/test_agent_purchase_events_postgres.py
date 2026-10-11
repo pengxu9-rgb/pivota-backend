@@ -102,7 +102,7 @@ async def test_the_lease_and_lookback_intervals_plan_and_behave():
     await database.execute("UPDATE agent_purchase_events SET claimed_at = now() - interval '10 minutes'")
     [again] = await events_db.claim_pending(worker="w2", lease_seconds=300)
     assert again["event_id"] == held["event_id"] == event_id and again["attempts"] == 0
-    assert await events_db.reap_candidates(lookback_hours=24) == []
+    # (the database is shared with other test files: only the rows this file made are asserted)
 
 
 async def test_release_backs_off_on_a_failure_and_returns_an_untried_event_at_once():
@@ -129,6 +129,8 @@ async def test_the_candidate_read_skips_dead_pages_and_keys_the_window_on_state_
     import db.agent_purchase_ledger as purchases
     import db.reap_agentic_ledger as reap_ledger
 
+    made = []
+
     async def purchase(state, set_sql=""):
         rp = (await reap_ledger.create_purchase(
             buyer_ref="bref_pg", agent_id="agent_pg", agent_user_ref_hash="h" * 64,
@@ -137,7 +139,8 @@ async def test_the_candidate_read_skips_dead_pages_and_keys_the_window_on_state_
         ))["id"]
         await database.execute(f"UPDATE reap_agentic_purchases SET state = :s{set_sql} WHERE id = :i",
                                {"s": state, "i": rp})
-        return await purchases.ensure_reap_parent(rp)
+        made.append(await purchases.ensure_reap_parent(rp))
+        return made[-1]
 
     url = ", hosted_url = 'https://pay.prava.space/a'"
     live = await purchase("awaiting_approval", url + ", hosted_url_expires_at = now() + interval '1 hour'")
@@ -148,8 +151,9 @@ async def test_the_candidate_read_skips_dead_pages_and_keys_the_window_on_state_
                                               ", reap_quote_expires_at = now() - interval '1 minute'")
     await purchase("completed", ", state_entered_at = now() - interval '3 days', updated_at = now()")
     fresh = await purchase("completed", ", updated_at = now() - interval '3 days'")
-    got = {row["id"] for row in await events_db.reap_candidates(lookback_hours=24)}
-    assert got == {live, fresh}
+    # Only this test's rows are judged: the dialect gate shares one database across test files.
+    got = {row["id"] for row in await events_db.reap_candidates(lookback_hours=24, limit=1000)}
+    assert got & set(made) == {live, fresh}
 
 
 async def test_a_no_action_skip_is_rechecked_and_upgraded_in_place_and_others_are_final():
@@ -172,4 +176,18 @@ async def test_a_no_action_skip_is_rechecked_and_upgraded_in_place_and_others_ar
     row = await database.fetch_one("SELECT * FROM agent_purchase_events WHERE purchase_id = :p", {"p": other})
     assert (row["status"], row["skip_reason"]) == ("skipped", "not_found")
     # the candidate read's recheck window compiles and runs on Postgres
+    assert isinstance(await events_db.reap_candidates(lookback_hours=24), list)
+
+
+
+async def test_the_heal_adds_checked_at_to_a_table_built_before_it():
+    from db.database import database
+    import db.agent_purchase_events as events_db
+
+    await database.execute("ALTER TABLE agent_purchase_events DROP COLUMN IF EXISTS checked_at")
+    await events_db.ensure_agent_purchase_events_schema()
+    await events_db.ensure_agent_purchase_events_schema()  # idempotent
+    cols = {r["column_name"] for r in await database.fetch_all(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'agent_purchase_events'")}
+    assert "checked_at" in cols
     assert isinstance(await events_db.reap_candidates(lookback_hours=24), list)
