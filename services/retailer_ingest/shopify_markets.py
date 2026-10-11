@@ -292,10 +292,11 @@ def _capture_currency(market: str = CAPTURE_MARKET) -> str:
 def _is_json(resp: Any) -> bool:
     """A JSON-shaped answer: application/json, or Shopify's own `text/javascript` (2026-10-11).
 
-    Shopify serves the AJAX product endpoint `/products/<handle>.js` as `text/javascript; charset=utf-8`
-    with a JSON body. Requiring "json" in the content type refused every storefront as a bot wall, so the
-    capture never produced one offer in prod (0 shopify_markets_* siblings; the tests' fake answered
-    application/json, which Shopify does not send). JavaScript-typed answers are accepted HERE only as a
+    Shopify serves its AJAX endpoints -- `/cart.js` and `/products/<handle>.js` -- as
+    `text/javascript; charset=utf-8` with a JSON body. Requiring "json" in the content type refused every
+    storefront as a bot wall at the first `/cart.js` read (the session proof), so the capture never produced
+    one offer in prod (0 shopify_markets_* siblings; the tests' fakes answered application/json, which
+    Shopify does not send). JavaScript-typed answers are accepted HERE only as a
     candidate: `_Session.json` still requires the body to parse to a JSON object or array, so a JS challenge
     page is refused exactly like the HTML wall it stands in for."""
     ctype = str(resp.headers.get("content-type") or "").lower()

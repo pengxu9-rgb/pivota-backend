@@ -34,15 +34,18 @@ from services import curated_brand_feed as feed, storefront_currency
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
 from services.retailer_ingest import pipeline, shopify_markets as markets
 
-
-def _shopify_js(body):
-    """A Shopify AJAX `.js` answer as the storefront sends it: a JSON body typed text/javascript."""
-    return httpx.Response(200, content=json.dumps(body).encode(), headers={"content-type": "text/javascript; charset=utf-8"})
 from tests.services.test_retailer_ingest_markets_phase2 import (  # noqa: F401 -- fixtures
     Polite, ReadbackDB, SqliteCatalog, base_rows, gates_on, markets_job)
 from tests.services.test_retailer_ingest_pipeline import env  # noqa: F401 -- the state-machine fixture
 
 HOST, RETAILER = "kbeauty-retailer.example.com", "K-Beauty Retailer"
+
+
+def _shopify_js(body):
+    """A Shopify AJAX `.js` answer as the storefront sends it: a JSON body typed text/javascript."""
+    return httpx.Response(200, content=json.dumps(body).encode(), headers={"content-type": "text/javascript; charset=utf-8"})
+
+
 USD_META = {"name": RETAILER, "myshopify_domain": "example-retailer.myshopify.com", "currency": "USD",
             "ships_to_countries": ["CA", "SG", "US"]}
 JP_HOST = "jbeauty-retailer.example.com"
@@ -133,14 +136,14 @@ class MarketStore:
             self.carts += 1
             if self.loses_session_after is not None and self.carts > self.loses_session_after:
                 currency = self.meta["currency"]
-            return httpx.Response(200, json={"currency": currency, "item_count": 0})
+            return _shopify_js({"currency": currency, "item_count": 0})  # Shopify types /cart.js text/javascript too
         if path.startswith("/products/") and path.endswith(".js"):
             handle = path[len("/products/"):-3]
             if handle not in self.catalog:
                 return httpx.Response(404, text="not found", headers={"content-type": "text/html"})
             _vendor, _ptype, variants = self.catalog[handle]
-            # As Shopify serves it: a JSON body typed text/javascript (the shape that refused every capture
-            # while this fake answered application/json).
+            # As Shopify serves its AJAX endpoints (/cart.js, /products/<handle>.js): a JSON body typed
+            # text/javascript -- the shape that refused every capture while this fake answered application/json.
             return _shopify_js({"id": 1, "handle": handle, "variants": [
                 {"id": vid, "price": prices[currency], "available": True} for vid, prices in variants]})
         return httpx.Response(404)

@@ -494,7 +494,9 @@ class Store:
             self.carts += 1
             if self.loses_session_after is not None and self.carts > self.loses_session_after:
                 us = False
-            return httpx.Response(200, json={"currency": "USD" if us else self.meta["currency"], "item_count": 0})
+            # Shopify types /cart.js text/javascript (2026-10-11), like /products/<handle>.js below.
+            return httpx.Response(200, content=json.dumps({"currency": "USD" if us else self.meta["currency"], "item_count": 0}).encode(),
+                                  headers={"content-type": "text/javascript; charset=utf-8"})
         if path.startswith("/products/") and path.endswith(".js"):
             handle = path[len("/products/"):-3]
             if handle not in HANDLE_VARIANTS:
