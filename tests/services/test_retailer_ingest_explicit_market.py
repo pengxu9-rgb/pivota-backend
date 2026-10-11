@@ -5,7 +5,7 @@ Five rules, each with a refusing twin (a case that must NOT pass) so removing th
   2. the apply readback checks every offer is stamped the job's market.
   3. the run records WHICH Shopify store it crawled (/meta.json name, myshopify_domain, ships_to).
   4. Tier B: a brand_official host whose /meta.json names the brand, ships to the market and prices in
-     its currency is accepted without a human (Sukin, Bali Body); anything less is held as before.
+     its currency is accepted without a human (Example Brand, Other Brand); anything less is held as before.
   5. the canonical-owner guard: a second brand_official storefront attaches offers but does not take
      over a product row another brand_official storefront owns.
 Store shapes are the measured ones (2026-09-26 probes, ADR section 1.1).
@@ -29,10 +29,10 @@ from tests.services.test_retailer_ingest_pipeline import env, job  # noqa: F401 
 _REAL_APPLY = writer.apply_ingest_plan  # the env fixture replaces both with fakes; one test needs the real ones
 from services.catalog_enrichment_agent.primary_ingestion import require_primary_apply as _REAL_REQUIRE_APPLY  # noqa: E402
 
-SUKIN_US = {"name": "Sukin Naturals USA", "myshopify_domain": "sukin-naturals-dev.myshopify.com",
+BRAND_US = {"name": "Example Brand Naturals USA", "myshopify_domain": "example-brand.myshopify.com",
             "currency": "USD", "ships_to_countries": ["US"]}
-BALI_US = {"name": "Bali Body US", "myshopify_domain": "bali-body-u-s.myshopify.com",
-           "currency": "USD", "ships_to_countries": ["US"]}
+OTHER_US = {"name": "Other Brand US", "myshopify_domain": "other-brand-us.myshopify.com",
+            "currency": "USD", "ships_to_countries": ["US"]}
 
 
 @pytest.fixture(autouse=True)
@@ -205,17 +205,17 @@ async def test_the_crawl_report_names_the_store_it_read_without_a_second_fetch(m
     async def locale(domain):
         async def fetch(url):
             fetched.append(url)
-            return json.dumps({**SUKIN_US, "country": "US"})
+            return json.dumps({**BRAND_US, "country": "US"})
         meta = await storefront_currency.fetch_storefront_meta(domain, fetch=fetch)
         return {"currency": meta["currency"]}
 
     monkeypatch.setattr(feed, "fetch_shopify_products", AsyncMock(return_value=feed.ShopifyProductBatch(
-        [product(vendor="Sukin")], scanned_products=1, pages=1)))
+        [product(vendor="Example Brand")], scanned_products=1, pages=1)))
     monkeypatch.setattr(feed, "fetch_shopify_shop_locale", locale)
-    records = await feed.records_for_brand(domain="sukinnaturals.com", brand="Sukin", category_path="beauty",
+    records = await feed.records_for_brand(domain="brand-store.example.com", brand="Example Brand", category_path="beauty",
                                           source_role="brand_official", require_currency="USD")
-    assert records.crawl_report["storefront"] == SUKIN_US
-    assert fetched == ["https://sukinnaturals.com/meta.json"]  # one request: the currency proof's
+    assert records.crawl_report["storefront"] == BRAND_US
+    assert fetched == ["https://brand-store.example.com/meta.json"]  # one request: the currency proof's
 
 
 async def test_a_store_whose_meta_was_not_proven_records_no_storefront(monkeypatch):
@@ -252,12 +252,12 @@ def _crawl_with(env, monkeypatch, storefront, *, domain, brand, vendor=None, tit
 
 
 async def test_the_run_records_which_store_it_crawled(env, monkeypatch):  # noqa: F811
-    j = _crawl_with(env, monkeypatch, {**SUKIN_US, "ships_to_countries": ["CA", "MX", "US"]},
-                    domain="sukinnaturals.com", brand="Sukin")
+    j = _crawl_with(env, monkeypatch, {**BRAND_US, "ships_to_countries": ["CA", "MX", "US"]},
+                    domain="brand-store.example.com", brand="Example Brand")
     await pipeline.run_stage(j, db=env.db)
     run = list(env.ledger.runs.values())[-1]
     assert run["checks"]["storefront"] == {
-        "name": "Sukin Naturals USA", "myshopify_domain": "sukin-naturals-dev.myshopify.com", "currency": "USD",
+        "name": "Example Brand Naturals USA", "myshopify_domain": "example-brand.myshopify.com", "currency": "USD",
         "market": "US", "ships_to_count": 3, "ships_to_market": True}
 
 
@@ -269,8 +269,8 @@ def _us(name):
 
 @pytest.mark.parametrize("domain,brand,storefront", [
     # Measured prod /meta.json names (2026-09-26); each host fails Tier A.
-    ("sukinnaturals.com", "Sukin", SUKIN_US),
-    ("us.balibodyco.com", "Bali Body", BALI_US),
+    ("brand-store.example.com", "Example Brand", BRAND_US),
+    ("other-store.example.com", "Other Brand", OTHER_US),
     ("moogoousa.com", "MooGoo", _us("MooGoo USA")),
     ("ecotan.com", "Eco By Sonya", _us("Eco By Sonya USA")),
     ("esmiskin.com", "esmi", _us("esmi Skin")),
@@ -295,26 +295,26 @@ def test_tier_b_accepts_the_measured_us_stores(domain, brand, storefront):
     ("karensbeautyshop.com", "REN", "Karen's Beauty Shop", "name_starts_with_brand"),
     ("tulanepharmacy.com", "Tula", "Tulane Pharmacy", "name_starts_with_brand"),
     ("selfcaresupply.com", "e.l.f.", "Self Care Supply Co", "name_starts_with_brand"),
-    ("sukinny.com", "Sukin", "Sukinny USA", "name_starts_with_brand"),             # a longer first word
-    ("naturalsusa.com", "Sukin", "Naturals by Sukin USA", "name_starts_with_brand"),  # brand not first
+    ("brandy.example.com", "Example Brand", "Example Brandy USA", "name_starts_with_brand"),  # a longer word
+    ("naturals-usa.example.com", "Example Brand", "Naturals by Example Brand USA", "name_starts_with_brand"),  # brand not first
     # Leading with the brand is not enough when the name says it resells it.
-    ("sukinstockistusa.com", "Sukin", "Sukin Stockist USA", "name_has_no_reseller_token"),
-    ("sukinoutlet.com", "Sukin", "Sukin Outlet", "name_has_no_reseller_token"),
-    ("sukinwholesale.com", "Sukin", "Sukin Wholesale Distribution", "name_has_no_reseller_token"),
+    ("stockist-usa.example.com", "Example Brand", "Example Brand Stockist USA", "name_has_no_reseller_token"),
+    ("outlet.example.com", "Example Brand", "Example Brand Outlet", "name_has_no_reseller_token"),
+    ("wholesale.example.com", "Example Brand", "Example Brand Wholesale Distribution", "name_has_no_reseller_token"),
     # Re-review of #2353: a store named for where it sells the brand.
-    ("sukinbeautywarehouse.com", "Sukin", "Sukin Beauty Warehouse", "name_has_no_reseller_token"),
-    ("sukinwarehouses.com", "Sukin", "Sukin Warehouses", "name_has_no_reseller_token"),
-    ("beautybay.shop", "Sukin", "Sukin | Shop Sukin at Beauty Bay", "name_has_no_reseller_token"),
-    ("adorebeauty.shop", "Sukin", "Sukin @ Adore Beauty", "name_has_no_reseller_token"),
-    ("adorebeauty.store", "Sukin", "Sukin @Adore Beauty", "name_has_no_reseller_token"),
-    ("adorebeauty.jp", "Sukin", "Sukin ＠ Adore Beauty", "name_has_no_reseller_token"),        # full-width @
-    ("adorebeauty.au", "Sukin", "Sukin\ufe6bAdore Beauty", "name_has_no_reseller_token"),      # small @
-    ("sukinretailers.com", "Sukin", "Sukin Retailers USA", "name_has_no_reseller_token"),
-    ("sukinoutlets.com", "Sukin", "Sukin Outlets", "name_has_no_reseller_token"),
-    ("sukinchemists.com", "Sukin", "Sukin Chemists", "name_has_no_reseller_token"),
-    ("sukinpharmacies.com", "Sukin", "Sukin Pharmacies", "name_has_no_reseller_token"),
-    ("sukinwholesaler.com", "Sukin", "Sukin Wholesaler", "name_has_no_reseller_token"),
-    ("sukinwholesalers.com", "Sukin", "Sukin Wholesalers", "name_has_no_reseller_token"),
+    ("beauty-warehouse.example.com", "Example Brand", "Example Brand Beauty Warehouse", "name_has_no_reseller_token"),
+    ("warehouses.example.com", "Example Brand", "Example Brand Warehouses", "name_has_no_reseller_token"),
+    ("other-shop.example.com", "Example Brand", "Example Brand | Shop Example Brand at Other Shop", "name_has_no_reseller_token"),
+    ("second-store.example.com", "Example Brand", "Example Brand @ Second Store", "name_has_no_reseller_token"),
+    ("second-store-2.example.com", "Example Brand", "Example Brand @Second Store", "name_has_no_reseller_token"),
+    ("second-store-3.example.com", "Example Brand", "Example Brand ＠ Second Store", "name_has_no_reseller_token"),        # full-width @
+    ("second-store-4.example.com", "Example Brand", "Example Brand\ufe6bSecond Store", "name_has_no_reseller_token"),      # small @
+    ("retailers.example.com", "Example Brand", "Example Brand Retailers USA", "name_has_no_reseller_token"),
+    ("outlets.example.com", "Example Brand", "Example Brand Outlets", "name_has_no_reseller_token"),
+    ("chemists.example.com", "Example Brand", "Example Brand Chemists", "name_has_no_reseller_token"),
+    ("pharmacies.example.com", "Example Brand", "Example Brand Pharmacies", "name_has_no_reseller_token"),
+    ("wholesaler.example.com", "Example Brand", "Example Brand Wholesaler", "name_has_no_reseller_token"),
+    ("wholesalers.example.com", "Example Brand", "Example Brand Wholesalers", "name_has_no_reseller_token"),
     ("ccpharmacy.com", "Chemist Confessions", "Chemist Confessions Pharmacy", "name_has_no_reseller_token"),
 ])
 def test_tier_b_refuses_a_name_that_does_not_lead_with_the_brand_or_resells_it(domain, brand, name, failed):
@@ -324,30 +324,30 @@ def test_tier_b_refuses_a_name_that_does_not_lead_with_the_brand_or_resells_it(d
 
 
 @pytest.mark.parametrize("storefront,failed", [
-    ({**SUKIN_US, "name": "Naturals USA"}, "name_starts_with_brand"),                       # name lacks the brand
-    ({**SUKIN_US, "name": None}, "name_starts_with_brand"),
-    ({**SUKIN_US, "name": "Sukin Naturals | Adore Beauty"}, "name_is_one_store_name"),
-    ({**SUKIN_US, "ships_to_countries": ["AU", "NF"]}, "ships_to_market"),                   # the AU home store's reach
-    ({**SUKIN_US, "ships_to_countries": None}, "ships_to_market"),                           # reach unknown
-    ({**SUKIN_US, "currency": "AUD"}, "currency_is_market_currency"),                        # AUD base, even shipping US
+    ({**BRAND_US, "name": "Naturals USA"}, "name_starts_with_brand"),                       # name lacks the brand
+    ({**BRAND_US, "name": None}, "name_starts_with_brand"),
+    ({**BRAND_US, "name": "Example Brand Naturals | Second Store"}, "name_is_one_store_name"),
+    ({**BRAND_US, "ships_to_countries": ["AU", "NF"]}, "ships_to_market"),                   # the AU home store's reach
+    ({**BRAND_US, "ships_to_countries": None}, "ships_to_market"),                           # reach unknown
+    ({**BRAND_US, "currency": "AUD"}, "currency_is_market_currency"),                        # AUD base, even shipping US
     (None, "name_starts_with_brand"),                                                        # no /meta.json read
 ])
 def test_tier_b_holds_unless_every_conjunct_holds(storefront, failed):
-    flags, evidence = pipeline.brand_official_domain_review("sukinnaturals.com", ["Sukin"], storefront=storefront)
+    flags, evidence = pipeline.brand_official_domain_review("brand-store.example.com", ["Example Brand"], storefront=storefront)
     # Exactly today's flag, same key: an operator's accepted_flags still match it.
-    assert [f["key"] for f in flags] == ["brand_official_domain_unproven:sukinnaturals.com:sukin"]
+    assert [f["key"] for f in flags] == ["brand_official_domain_unproven:brand-store.example.com:example brand"]
     assert flags[0]["severity"] == "block" and "acceptable" not in flags[0]
-    tier_b = evidence["brands"]["sukin"]["tier_b"]
-    assert evidence["brands"]["sukin"]["tier"] is None and tier_b[failed] is False and tier_b["passed"] is False
+    tier_b = evidence["brands"]["example brand"]["tier_b"]
+    assert evidence["brands"]["example brand"]["tier"] is None and tier_b[failed] is False and tier_b["passed"] is False
 
 
 @pytest.mark.parametrize("brand,name", [
-    ("Sukin", "Sukin by Adore Beauty"),
-    ("Sukin", "Sukin Naturals by Adore Beauty"),
-    ("Sukin", "Sukin from Adore Beauty"),
-    ("Sukin", "Sukin FROM Adore Beauty"),
-    ("Sukin", "Sukin Beauty Supply"),
-    ("Sukin", "Sukin Supplies USA"),
+    ("Example Brand", "Example Brand by Second Store"),
+    ("Example Brand", "Example Brand Naturals by Second Store"),
+    ("Example Brand", "Example Brand from Second Store"),
+    ("Example Brand", "Example Brand FROM Second Store"),
+    ("Example Brand", "Example Brand Beauty Supply"),
+    ("Example Brand", "Example Brand Supplies USA"),
 ])
 def test_tier_b_refuses_a_name_that_says_who_sells_the_brand(brand, name):
     tier_b = pipeline.storefront_tier_b(brand, _us(name), "US")
@@ -356,38 +356,38 @@ def test_tier_b_refuses_a_name_that_says_who_sells_the_brand(brand, name):
 
 # At least one name per separator category, so dropping any one from TIER_B_SEPARATOR_CATEGORIES fails.
 @pytest.mark.parametrize("name", [
-    "Sukin | Beauty Bay", "Sukin ¦ Beauty Bay", "Sukin: Adore Beauty", "Sukin • Beauty Bay",     # Po, So
-    "Sukin · Beauty Bay", "Sukin / Adore Beauty", "Sukin \\ Adore Beauty", "Sukin; Adore Beauty",  # Po
-    "Sukin – Adore Beauty", "Sukin — Adore Beauty", "Sukin - Adore Beauty", "Sukin ‒ Adore Beauty",  # Pd
-    "Sukin ― Adore Beauty", "Sukin -- Adore Beauty", "Sukin -Adore Beauty", "Sukin- Adore Beauty",  # Pd
-    "Sukin–Adore Beauty",         # an unspaced DASH is still a separator; only a hyphen joins words
-    "Sukin\u200b-\u200bAdore Beauty",   # a hyphen between zero-width spaces is not inside a word
-    "Sukin » Beauty Bay", "Sukin « Beauty Bay",                                     # Pf, Pi
-    "Sukin (Adore Beauty)", "Sukin) Adore Beauty",                                  # Ps, Pe
-    "Sukin_Adore Beauty",                                                           # Pc
-    "Sukin ∣ Adore Beauty", "Sukin − Adore Beauty", "Sukin > Adore Beauty",         # Sm
-    "Sukin │ Adore Beauty", "Sukin ● Adore Beauty",                                 # So
-    "Sukin・Adore Beauty", "Sukin ･ Adore Beauty",   # katakana middle dot, and its half-width form (NFKC)
-    "Sukin ǀ Adore Beauty",                          # U+01C0, a bar Unicode files as a letter
-    "Sukin｜Beauty Bay",                             # full-width bar, NFKC-folded to "|"
-    "Sukin ǁ Adore Beauty",                          # U+01C1, also a letter
-    "Sukin ^ Adore Beauty", "Sukin ꞉ Adore Beauty", "Sukin ˗ Adore Beauty",   # Sk
+    "Example Brand | Other Shop", "Example Brand ¦ Other Shop", "Example Brand: Second Store", "Example Brand • Other Shop",     # Po, So
+    "Example Brand · Other Shop", "Example Brand / Second Store", "Example Brand \\ Second Store", "Example Brand; Second Store",  # Po
+    "Example Brand – Second Store", "Example Brand — Second Store", "Example Brand - Second Store", "Example Brand ‒ Second Store",  # Pd
+    "Example Brand ― Second Store", "Example Brand -- Second Store", "Example Brand -Second Store", "Example Brand- Second Store",  # Pd
+    "Example Brand–Second Store",         # an unspaced DASH is still a separator; only a hyphen joins words
+    "Example Brand\u200b-\u200bSecond Store",   # a hyphen between zero-width spaces is not inside a word
+    "Example Brand » Other Shop", "Example Brand « Other Shop",                                     # Pf, Pi
+    "Example Brand (Second Store)", "Example Brand) Second Store",                                  # Ps, Pe
+    "Example Brand_Second Store",                                                           # Pc
+    "Example Brand ∣ Second Store", "Example Brand − Second Store", "Example Brand > Second Store",         # Sm
+    "Example Brand │ Second Store", "Example Brand ● Second Store",                                 # So
+    "Example Brand・Second Store", "Example Brand ･ Second Store",   # katakana middle dot, and its half-width form (NFKC)
+    "Example Brand ǀ Second Store",                          # U+01C0, a bar Unicode files as a letter
+    "Example Brand｜Other Shop",                             # full-width bar, NFKC-folded to "|"
+    "Example Brand ǁ Second Store",                          # U+01C1, also a letter
+    "Example Brand ^ Second Store", "Example Brand ꞉ Second Store", "Example Brand ˗ Second Store",   # Sk
     # A joiner standing alone between spaces is a separator, one per TIER_B_NAME_JOINERS entry but "&":
-    "Sukin + Beauty Bay", "Sukin ++ Beauty Bay", "Sukin . Beauty Bay", "Sukin ! Beauty Bay",
-    "Sukin # Beauty Bay", "Sukin ® Beauty Bay", "Sukin © Beauty Bay", "Sukin ' Beauty Bay",
-    "Sukin ’ Beauty Bay", "Sukin ‘ Beauty Bay",
-    "Sukin Naturals USA | Official Store",           # a tagline is held too: nothing tells it from a retailer
+    "Example Brand + Other Shop", "Example Brand ++ Other Shop", "Example Brand . Other Shop", "Example Brand ! Other Shop",
+    "Example Brand # Other Shop", "Example Brand ® Other Shop", "Example Brand © Other Shop", "Example Brand ' Other Shop",
+    "Example Brand ’ Other Shop", "Example Brand ‘ Other Shop",
+    "Example Brand Naturals USA | Official Store",           # a tagline is held too: nothing tells it from a retailer
 ])
 def test_tier_b_refuses_a_name_that_splits_into_a_second_name(name):
-    tier_b = pipeline.storefront_tier_b("Sukin", _us(name), "US")
+    tier_b = pipeline.storefront_tier_b("Example Brand", _us(name), "US")
     assert tier_b["name_starts_with_brand"] is True and tier_b["name_has_no_reseller_token"] is True
     assert tier_b["name_is_one_store_name"] is False and tier_b["passed"] is False
 
 
 @pytest.mark.parametrize("brand,name", [
     # Letters used as a dash or bar in JP/KR names, as a word of their own (review of #2373).
-    ("Sukin", "Sukin ー 公式"), ("Sukin", "Sukin ｰ Adore Beauty"),          # ー, half-width ｰ
-    ("Sukin", "Sukin 丨 Adore Beauty"), ("Sukin", "Sukin ⼁ Adore Beauty"),   # 丨, radical ⼁
+    ("Example Brand", "Example Brand ー 公式"), ("Example Brand", "Example Brand ｰ Second Store"),          # ー, half-width ｰ
+    ("Example Brand", "Example Brand 丨 Second Store"), ("Example Brand", "Example Brand ⼁ Second Store"),   # 丨, radical ⼁
     ("설화수", "설화수 ㅣ 공식몰"), ("설화수", "설화수 ㅡ 공식몰"),              # Hangul ㅣ / ㅡ
 ])
 def test_tier_b_refuses_a_letter_used_as_a_separator(brand, name):
@@ -400,10 +400,10 @@ def test_tier_b_refuses_a_letter_used_as_a_separator(brand, name):
 # ("Mario Badescu™" -> "badescutm"), which failed the brand prefix; each reads as "®" instead.
 @pytest.mark.parametrize("brand,name", [
     ("Mario Badescu", "Mario Badescu™"), ("Mario Badescu", "Mario Badescu™ Skin Care"),
-    ("Sukin", "Sukin℠ USA"), ("Sukin", "SukinⓇ USA"), ("Sukin", "Sukin🄬 USA"), ("Sukin", "Sukin🄫 USA"),
-    ("Sukin", "Sukin🅪 USA"), ("Sukin", "Sukin🅫 USA"), ("Sukin", "Sukin🅬 USA"), ("Sukin", "Sukin℗ USA"),
-    ("Sukin", "Sukinⓡ USA"), ("Sukin", "SukinⒸ USA"), ("Sukin", "Sukinⓒ USA"), ("Sukin", "Sukin🅁 USA"),
-    ("Sukin", "Sukin™USA"),                       # glued on both sides
+    ("Example Brand", "Example Brand℠ USA"), ("Example Brand", "Example BrandⓇ USA"), ("Example Brand", "Example Brand🄬 USA"), ("Example Brand", "Example Brand🄫 USA"),
+    ("Example Brand", "Example Brand🅪 USA"), ("Example Brand", "Example Brand🅫 USA"), ("Example Brand", "Example Brand🅬 USA"), ("Example Brand", "Example Brand℗ USA"),
+    ("Example Brand", "Example Brandⓡ USA"), ("Example Brand", "Example BrandⒸ USA"), ("Example Brand", "Example Brandⓒ USA"), ("Example Brand", "Example Brand🅁 USA"),
+    ("Example Brand", "Example Brand™USA"),                       # glued on both sides
     ("Mario Badescu™", "Mario Badescu USA"),      # the brand side reads it the same way
     ("Bio-Oil", "Bio™Oil US"),
 ])
@@ -413,14 +413,14 @@ def test_a_trademark_mark_on_the_brand_is_not_a_hold(brand, name):
 
 
 @pytest.mark.parametrize("name,failed", [
-    ("Sukin ™ Beauty Bay", "name_is_one_store_name"),   # standing alone, it separates like "®"
-    ("Sukin ℠ Beauty Bay", "name_is_one_store_name"),
-    ("Sukin™ | Beauty Bay", "name_is_one_store_name"),
-    ("Sukin™ Stockist USA", "name_has_no_reseller_token"),
-    ("Sukin™ by Adore Beauty", "name_has_no_reseller_token"),
+    ("Example Brand ™ Other Shop", "name_is_one_store_name"),   # standing alone, it separates like "®"
+    ("Example Brand ℠ Other Shop", "name_is_one_store_name"),
+    ("Example Brand™ | Other Shop", "name_is_one_store_name"),
+    ("Example Brand™ Stockist USA", "name_has_no_reseller_token"),
+    ("Example Brand™ by Second Store", "name_has_no_reseller_token"),
 ])
 def test_a_trademark_mark_does_not_hide_a_second_store(name, failed):
-    tier_b = pipeline.storefront_tier_b("Sukin", _us(name), "US")
+    tier_b = pipeline.storefront_tier_b("Example Brand", _us(name), "US")
     assert tier_b[failed] is False and tier_b["passed"] is False
 
 
@@ -452,14 +452,14 @@ def test_a_second_name_is_held_with_the_reason_in_the_flag():
     ("19／99 Beauty", "19/99 Beauty USA"),  # ... read NFKC-folded on the brand side too
     ("L:A Bruket", "L:A Bruket US"),
     ("M·A·C Cosmetics", "M·A·C Cosmetics US"),
-    ("Sukin", "Sukin Naturals USA |"),     # nothing after the separator
+    ("Example Brand", "Example Brand Naturals USA |"),     # nothing after the separator
     # TIER_B_NAME_JOINERS, one each:
-    ("Head & Shoulders", "Head & Shoulders"), ("Bali Body", "Bali Body & Co USA"), ("Sukin", "Sukin's Naturals"), ("Sukin", "Sukin’s Naturals"),
-    ("Sukin", "Sukin Naturals Pty. Ltd."), ("Sukin", "Sukin+ US"),
-    ("Sukin", "Sukin! USA"), ("Sukin", "Sukin #1 USA"), ("Sukin", "Sukin® USA"), ("Sukin", "Sukin© USA"),
+    ("Head & Shoulders", "Head & Shoulders"), ("Other Brand", "Other Brand & Co USA"), ("Example Brand", "Example Brand's Naturals"), ("Example Brand", "Example Brand’s Naturals"),
+    ("Example Brand", "Example Brand Naturals Pty. Ltd."), ("Example Brand", "Example Brand+ US"),
+    ("Example Brand", "Example Brand! USA"), ("Example Brand", "Example Brand #1 USA"), ("Example Brand", "Example Brand® USA"), ("Example Brand", "Example Brand© USA"),
     ("I'm From", "I'm From USA"),          # "from" inside the brand's own name
     ("Supply Skincare", "Supply Skincare USA"),  # ... and "supply"
-    ("Sukin", "Sukin‘s Naturals"),         # U+2018, autocorrect's apostrophe
+    ("Example Brand", "Example Brand‘s Naturals"),         # U+2018, autocorrect's apostrophe
     ("コーセー", "コーセー USA"),            # ー inside a word is a letter
     ("R + Co", "R + Co US"),               # a free-standing joiner the brand has too
     ("L:A Bruket", "L A Bruket US"),       # a name may leave out a split the brand has
@@ -472,13 +472,13 @@ def test_a_separator_that_starts_no_second_name_is_not_a_refusal(brand, name):
 @pytest.mark.parametrize("brand,name", [
     # A brand's own separator allows a split only WHERE the brand splits (review of #2373: counting
     # splits let the name spend the brand's allowance after it).
-    ("19/99 Beauty", "19/99 Beauty | Beauty Bay"),
-    ("19/99 Beauty", "19 99 Beauty | Beauty Bay"),
-    ("19/99 Beauty", "19-99 Beauty | Beauty Bay"),
+    ("19/99 Beauty", "19/99 Beauty | Other Shop"),
+    ("19/99 Beauty", "19 99 Beauty | Other Shop"),
+    ("19/99 Beauty", "19-99 Beauty | Other Shop"),
     ("ma:nyo", "ma-nyo | Stylevana"),
-    ("L:A Bruket", "L A Bruket | Beauty Bay"),
-    ("K–Beauty", "K-Beauty | Beauty Bay"),
-    ("M·A·C Cosmetics", "M.A.C Cosmetics | Beauty Bay | Official"),
+    ("L:A Bruket", "L A Bruket | Other Shop"),
+    ("K–Beauty", "K-Beauty | Other Shop"),
+    ("M·A·C Cosmetics", "M.A.C Cosmetics | Other Shop | Official"),
     ("Dr﹒Jart+", "Dr | Jart+ Beauty"),  # the brand's "﹒" is NFKC "." -- a joiner, not a split
 ])
 def test_the_brand_may_carry_its_separator_but_no_other(brand, name):
@@ -505,7 +505,7 @@ def test_a_reseller_word_inside_the_brands_own_name_is_not_a_refusal():
         "ccskin.com", ["Chemist Confessions"], storefront=_us("Chemist Confessions USA"), market="US")
     assert flags == [] and evidence["brands"]["chemist confessions"]["tier"] == "B"
     # A name that does not lead with the brand is read whole, so the held flag's detail stays true.
-    tier_b = pipeline.storefront_tier_b("Sukin", _us("Pharmacy Sukin USA"), "US")
+    tier_b = pipeline.storefront_tier_b("Example Brand", _us("Pharmacy Example Brand USA"), "US")
     assert tier_b["name_starts_with_brand"] is False and tier_b["name_has_no_reseller_token"] is False
 
 
@@ -515,21 +515,21 @@ def test_a_brand_too_short_to_be_evidence_is_held():
 
 
 def test_a_known_retailer_that_names_the_brand_is_still_refused():
-    storefront = {"name": "Sephora Sukin", "currency": "USD", "ships_to_countries": ["US"]}
-    flags, evidence = pipeline.brand_official_domain_review("sephora.com", ["Sukin"], storefront=storefront)
+    storefront = {"name": "Sephora Example Brand", "currency": "USD", "ships_to_countries": ["US"]}
+    flags, evidence = pipeline.brand_official_domain_review("sephora.com", ["Example Brand"], storefront=storefront)
     assert [(f["rule"], f["acceptable"]) for f in flags] == [("brand_official_on_a_retailer", False)]
     assert evidence == {"domain": "sephora.com", "known_retailer": True}
 
 
 @pytest.mark.parametrize("domain,storefront,market", [
-    ("beautybay.com", {"name": "Sukin Naturals UK", "currency": "USD", "ships_to_countries": ["US"]}, "US"),
-    ("adorebeauty.com.au", {"name": "Sukin Naturals", "currency": "AUD", "ships_to_countries": ["AU"]}, "AU"),
-    ("chemistwarehouse.com.au", {"name": "Sukin Naturals", "currency": "AUD", "ships_to_countries": ["AU"]}, "AU"),
+    ("beautybay.com", {"name": "Example Brand Naturals UK", "currency": "USD", "ships_to_countries": ["US"]}, "US"),
+    ("adorebeauty.com.au", {"name": "Example Brand Naturals", "currency": "AUD", "ships_to_countries": ["AU"]}, "AU"),
+    ("chemistwarehouse.com.au", {"name": "Example Brand Naturals", "currency": "AUD", "ships_to_countries": ["AU"]}, "AU"),
 ])
 def test_a_retailer_whose_meta_would_pass_tier_b_is_refused(domain, storefront, market):
     # The /meta.json alone would admit the store; only the known-retailer list stops it.
-    assert pipeline.storefront_tier_b("Sukin", storefront, market)["passed"] is True
-    flags, evidence = pipeline.brand_official_domain_review(domain, ["Sukin"], storefront=storefront, market=market)
+    assert pipeline.storefront_tier_b("Example Brand", storefront, market)["passed"] is True
+    flags, evidence = pipeline.brand_official_domain_review(domain, ["Example Brand"], storefront=storefront, market=market)
     assert [(f["rule"], f["acceptable"]) for f in flags] == [("brand_official_on_a_retailer", False)]
     assert evidence == {"domain": domain, "known_retailer": True}
 
@@ -546,40 +546,40 @@ def test_tier_a_reads_an_ampersand_as_and():
 
 
 def test_tier_b_is_judged_against_the_jobs_market():
-    au_home = {"name": "Sukin Naturals", "currency": "AUD", "ships_to_countries": ["AU", "NF"]}
-    assert pipeline.storefront_tier_b("Sukin", au_home, "AU")["passed"] is True
-    assert pipeline.storefront_tier_b("Sukin", au_home, "US")["passed"] is False
-    assert pipeline.storefront_tier_b("Sukin", SUKIN_US, "AU")["passed"] is False
+    au_home = {"name": "Example Brand Naturals", "currency": "AUD", "ships_to_countries": ["AU", "NF"]}
+    assert pipeline.storefront_tier_b("Example Brand", au_home, "AU")["passed"] is True
+    assert pipeline.storefront_tier_b("Example Brand", au_home, "US")["passed"] is False
+    assert pipeline.storefront_tier_b("Example Brand", BRAND_US, "AU")["passed"] is False
 
 
 def test_every_written_brand_needs_its_own_proof():
-    # A store that names Sukin proves nothing about a sibling vendor its crawl would also write.
-    flags = pipeline.brand_official_domain_flags("sukinnaturals.com", ["Sukin", "Grown Alchemist"], storefront=SUKIN_US)
-    assert [f["key"] for f in flags] == ["brand_official_domain_unproven:sukinnaturals.com:grown alchemist"]
+    # A store that names Example Brand proves nothing about a sibling vendor its crawl would also write.
+    flags = pipeline.brand_official_domain_flags("brand-store.example.com", ["Example Brand", "Sibling Brand"], storefront=BRAND_US)
+    assert [f["key"] for f in flags] == ["brand_official_domain_unproven:brand-store.example.com:sibling brand"]
 
 
 async def test_a_tier_b_store_advances_without_a_human_and_says_why(env, monkeypatch):  # noqa: F811
-    j = _crawl_with(env, monkeypatch, SUKIN_US, domain="sukinnaturals.com", brand="Sukin")
+    j = _crawl_with(env, monkeypatch, BRAND_US, domain="brand-store.example.com", brand="Example Brand")
     out = await pipeline.run_stage(j, db=env.db)
     assert (out["status"], out["outcome"]) == ("apply_due", "clean")
     evidence = list(env.ledger.runs.values())[-1]["checks"]["brand_official_evidence"]
-    assert evidence["brands"]["sukin"]["tier"] == "B"
-    assert evidence["brands"]["sukin"]["myshopify_domain"] == "sukin-naturals-dev.myshopify.com"
+    assert evidence["brands"]["example brand"]["tier"] == "B"
+    assert evidence["brands"]["example brand"]["myshopify_domain"] == "example-brand.myshopify.com"
 
 
 async def test_a_store_that_fails_tier_b_is_held_as_before(env, monkeypatch):  # noqa: F811
-    j = _crawl_with(env, monkeypatch, {**SUKIN_US, "ships_to_countries": ["AU"]}, domain="sukinnaturals.com",
-                    brand="Sukin")
+    j = _crawl_with(env, monkeypatch, {**BRAND_US, "ships_to_countries": ["AU"]}, domain="brand-store.example.com",
+                    brand="Example Brand")
     out = await pipeline.run_stage(j, db=env.db)
     assert out["status"] == "held"
     run = list(env.ledger.runs.values())[-1]
     assert [f["key"] for f in run["flags"] if f["rule"].startswith("brand_official")] == [
-        "brand_official_domain_unproven:sukinnaturals.com:sukin"]
+        "brand_official_domain_unproven:brand-store.example.com:example brand"]
 
 
-async def test_a_bali_body_us_store_advances_on_tier_b(env, monkeypatch):  # noqa: F811
-    j = _crawl_with(env, monkeypatch, BALI_US, domain="us.balibodyco.com", brand="Bali Body",
-                    vendor="Bali Body US")  # the store's own vendor carries the market; the job brand wins
+async def test_a_second_brand_us_store_advances_on_tier_b(env, monkeypatch):  # noqa: F811
+    j = _crawl_with(env, monkeypatch, OTHER_US, domain="other-store.example.com", brand="Other Brand",
+                    vendor="Other Brand US")  # the store's own vendor carries the market; the job brand wins
     assert (await pipeline.run_stage(j, db=env.db))["status"] == "apply_due"
 
 
