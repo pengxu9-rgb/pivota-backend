@@ -9,23 +9,29 @@ THE RULES THIS MODULE ENFORCES, each measured against the provider's sandbox on 
 
 1. NO CARD DATA LEAVES THIS MODULE. `payment.token-result` returns `networkToken.value` and
    `networkToken.cryptogram` in cleartext, by design on the provider's side. `_strip_credentials`
-   removes every credential-shaped field from every card BEFORE a card is returned, so nothing above this
-   module can log or store one. Each removal is counted (`credential_fields_stripped`), so an
-   operator can see that the provider is still sending them.
+   removes every credential-shaped field from every card BEFORE a card is returned, so nothing
+   above this module can log or store one. Each removal is counted (`credential_fields_stripped`),
+   so an operator can see that the provider is still sending them. The provider's free-text parts
+   are never returned at all (only how many there were): prose is not a shape a stripper can trust.
 2. ONLY ALLOWLISTED ACTIONS ARE SENT. `ALLOWED_ACTIONS` holds the payment-method and token steps
    Pivota uses. The provider's standalone money skills (`payment.pay-*`, `payment.charge-token-*`,
-   `payment.token-result#charge`, refunds without an order, the trip cart) charge under the
-   DEVELOPER's key, which would make Pivota the payee; they are not on the list, so they raise
-   `ActionNotAllowed` before any byte is sent.
+   `payment.token-result#charge`, refunds without an order) charge under the DEVELOPER's key,
+   which would make Pivota the payee; they are not on the list, so they raise `ActionNotAllowed`
+   before any byte is sent. Two allowed steps (`action-required#paid`, `await#poll`) are shared
+   with a money flow, so (a) a conversation id must be one this client signed (`context_for`),
+   and (b) any money-result card in an answer is `money_result`, logged at ERROR, never `ok`.
 3. STRUCTURED ACTIONS ONLY, NEVER FREE TEXT. The provider's intent detection is an LLM. A free-text
    request is not deterministic, so this module has no way to send one. A free-text ANSWER where a
    card was expected (measured: `payment.method-add` without `user_email` answers "What's your
    email address?") is `unexpected_text`, and it fails closed.
 4. NEVER RESEND A MAYBE-WRITE. The provider injects its own idempotency key per call
    ("new_per_call"), so a resent write after a timeout is a NEW write. A timeout or transport error on an action
-   that may change state is `outcome_unknown`: the caller must read the state, never resend.
-5. TRANSPORT HYGIENE, as in services/reap_agentic_client.py: an https allowlist of rail hosts
-   checked on every call (the API key goes in a header addressed to that URL); redirects never
+   that may change state is `outcome_unknown`: the caller must read the state, never resend. So
+   is any answer on such an action that does not prove the write was refused: a 5xx, a 408, an
+   oversized or unparseable body. Only a 4xx is a definite "not done".
+5. TRANSPORT HYGIENE, as in services/reap_agentic_client.py: the base URL is checked against an
+   https host allowlist when the client is built, and every request goes to that fixed origin
+   (the API key goes in a header addressed to it); no environment proxy or netrc; redirects never
    followed; response bodies read with a hard size cap; no body, payload, token, key or member id
    is ever logged.
 
@@ -37,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -68,12 +75,14 @@ DEFAULT_TIMEOUT_S = 30.0
 MAX_BODY_BYTES = 1024 * 1024
 #: Re-mint an access token this long before the provider says it expires (tokens last 3600 s).
 TOKEN_REFRESH_MARGIN_S = 120.0
+#: Members whose access token is cached at once.
+_TOKEN_CACHE_MAX = 10_000
 
 #: (component, action) pairs this client may send. Everything else raises `ActionNotAllowed`.
 ALLOWED_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
     # list the buyer's cards
     ("payment.method-view", "submit"),
-    # bind a card on the provider's hosted page (non-UnionPay and UnionPay)
+    # bind a card on the provider's hosted page (two card-scheme variants)
     ("payment.method-add", "submit"),
     ("payment.method-add-required-card", "bound"),
     ("payment.method-add-await-card", "poll"),
@@ -86,7 +95,7 @@ ALLOWED_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
     ("payment.method-remove", "submit"),
     ("payment.method-remove-confirm", "confirm"),
     ("payment.method-remove-confirm", "cancel"),
-    # mint a token bound to an order (no charge), and wait for the buyer's passkey
+    # mint a token bound to an order (no charge), and wait for the buyer's approval
     ("payment.token-setup", "submit"),
     ("payment.action-required", "paid"),
     ("payment.await", "poll"),
@@ -101,16 +110,35 @@ READ_ONLY_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
     ("payment.await", "poll"),
 })
 
-#: Keys whose whole subtree is a payment credential. Matched case-insensitively with `_` and `-`
-#: removed, at any depth.
-_CREDENTIAL_SUBTREE_KEYS = frozenset({"networktoken"})
-#: Keys whose value is a credential wherever they appear.
+#: Key prefixes whose whole subtree is a payment credential. Matched case-insensitively with `_`,
+#: `-` and `.` removed, at any depth.
+_CREDENTIAL_SUBTREE_PREFIXES = ("networktoken",)
+#: Keys whose value is a credential wherever they appear (same matching).
 _CREDENTIAL_LEAF_KEYS = frozenset({
-    "cryptogram", "tokencryptogram", "pan", "cardnumber", "cvv", "cvc", "cvv2", "cvc2", "tavv",
+    "cryptogram", "tokencryptogram", "cryptogramvalue", "pan", "dpan", "fpan", "cardnumber",
+    "primaryaccountnumber", "accountnumber", "tokenvalue", "cvv", "cvc", "cvv2", "cvc2", "cvn",
+    "securitycode", "tavv", "track1", "track2",
 })
-_CARD_DIGITS_RE = re.compile(r"(?<!\d)\d{13,19}(?!\d)")
+#: 13-19 digits, optionally grouped by single spaces or dashes: a PAN or DPAN in any spelling.
+_CARD_DIGITS_RE = re.compile(r"(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)")
+#: Padded base64 of 15+ bytes: the shape of a cryptogram/TAVV. Not applied to URL strings.
+_BASE64_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{20,}={1,2}")
+#: Keys whose value is an order/charge reference, which may legitimately be 13-19 digits (matched on
+#: the canonical key's ending). Only digits are spared there: the base64 rule still applies.
+_REFERENCE_KEY_SUFFIXES = ("orderno", "ordernumber", "orderid", "tradeno", "chargeno", "reference", "ref")
+#: Past this depth a subtree is dropped (and counted): nothing legitimate nests this deep.
+_MAX_STRIP_DEPTH = 24
+_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}\Z")
+#: Card components that report money having moved. One of these in an answer means a money flow
+#: ran in a conversation this client touched: `money_result`, logged at ERROR.
+_MONEY_RESULT_PREFIXES = (
+    "payment.pay-", "payment.card-result", "payment.charge", "payment.refund", "payment.capture",
+)
+#: Hex digits of the HMAC that binds a conversation id to this client's key.
+_CONTEXT_SIG_HEX = 16
 _MEMBER_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
 _CONTEXT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
+_CONTEXT_REF_RE = re.compile(r"^[A-Za-z0-9_]{1,80}\Z")
 _ERROR_CODE_RE = re.compile(r"^[A-Z0-9_]{1,64}\Z")
 
 
@@ -165,26 +193,31 @@ class Card:
         return tuple(a.id for a in self.actions)
 
 
+_FAILED_TASK_STATES = frozenset({"failed", "rejected", "canceled"})
+
+
 @dataclass
 class A2AResult:
     """The outcome of one call. `ok` only for `kind == "cards"`.
 
     kind:
-      cards             one or more structured cards (`cards`)
+      cards             one or more structured cards (`cards`); `ok` unless the task failed
       error_card        the provider answered with its `error` card (`error_code`, `recoverable`)
+      money_result      an answer carried a money-result card; never `ok`, logged at ERROR
       unexpected_text   free text where a card was expected; fail closed
       outcome_unknown   a maybe-write did not get a definite answer; read state, never resend
       timeout           a read-only action timed out (safe to retry)
       transport         a read-only action failed to connect (safe to retry)
-      http_error        a non-2xx (redirects included)
-      protocol_error    a JSON-RPC `error`, or a body that is not the documented shape
-      too_large         the body exceeded `MAX_BODY_BYTES`
+      http_error        a non-2xx (redirects included); on a maybe-write only a 4xx other than 408
+      protocol_error    a JSON-RPC `error`, or a body that is not the documented shape (read-only)
+      too_large         the body exceeded `MAX_BODY_BYTES` (read-only)
       auth_failed       the token exchange failed
     """
 
     kind: str
     cards: List[Card] = field(default_factory=list)
-    texts: List[str] = field(default_factory=list)
+    #: How many free-text parts the answer had. Their content is never returned (rule 1).
+    text_parts: int = 0
     task_state: Optional[str] = None
     error_code: Optional[str] = None
     recoverable: Optional[bool] = None
@@ -194,7 +227,7 @@ class A2AResult:
 
     @property
     def ok(self) -> bool:
-        return self.kind == "cards"
+        return self.kind == "cards" and self.task_state not in _FAILED_TASK_STATES
 
     def card(self, component: str) -> Optional[Card]:
         for card in self.cards:
@@ -207,20 +240,49 @@ class A2AResult:
 
 
 def _canon(key: Any) -> str:
-    return str(key).lower().replace("_", "").replace("-", "")
+    return str(key).lower().replace("_", "").replace("-", "").replace(".", "")
 
 
-def _strip_credentials(value: Any) -> Tuple[Any, int]:
+def _is_credential_key(key: Any) -> bool:
+    canon = _canon(key)
+    return (
+        canon in _CREDENTIAL_LEAF_KEYS
+        or canon.startswith(_CREDENTIAL_SUBTREE_PREFIXES)
+        or bool(_CARD_DIGITS_RE.search(str(key)))
+    )
+
+
+def _is_reference_key(key: Any) -> bool:
+    canon = _canon(key)
+    return canon.endswith(_REFERENCE_KEY_SUFFIXES) and canon not in _CREDENTIAL_LEAF_KEYS
+
+
+def _strip_string(value: str, *, digits: bool = True) -> Tuple[str, int]:
+    removed = 0
+    if digits and _CARD_DIGITS_RE.search(value):
+        value, removed = _CARD_DIGITS_RE.sub("[REMOVED]", value), removed + 1
+    if not value.startswith(("https://", "http://")) and _BASE64_BLOB_RE.search(value):
+        value, removed = _BASE64_BLOB_RE.sub("[REMOVED]", value), removed + 1
+    return value, removed
+
+
+def _strip_credentials(value: Any, depth: int = 0) -> Tuple[Any, int]:
     """A copy of `value` with every credential field removed, and how many were removed."""
+    if depth > _MAX_STRIP_DEPTH:
+        return None, 1
     if isinstance(value, dict):
         out: Dict[str, Any] = {}
         removed = 0
         for key, item in value.items():
-            canon = _canon(key)
-            if canon in _CREDENTIAL_SUBTREE_KEYS or canon in _CREDENTIAL_LEAF_KEYS:
+            if _is_credential_key(key):
                 removed += 1
                 continue
-            cleaned, count = _strip_credentials(item)
+            if isinstance(item, str) and _is_reference_key(key):
+                cleaned, count = _strip_string(item, digits=False)
+                out[key] = cleaned
+                removed += count
+                continue
+            cleaned, count = _strip_credentials(item, depth + 1)
             out[key] = cleaned
             removed += count
         return out, removed
@@ -228,46 +290,67 @@ def _strip_credentials(value: Any) -> Tuple[Any, int]:
         items = []
         removed = 0
         for item in value:
-            cleaned, count = _strip_credentials(item)
+            cleaned, count = _strip_credentials(item, depth + 1)
             items.append(cleaned)
             removed += count
         return items, removed
-    if isinstance(value, str) and _CARD_DIGITS_RE.search(value):
-        return _CARD_DIGITS_RE.sub("[REMOVED]", value), 1
+    if isinstance(value, str):
+        return _strip_string(value)
+    if isinstance(value, int) and not isinstance(value, bool) and 13 <= len(str(abs(value))) <= 19:
+        return None, 1
+    if isinstance(value, float) and value.is_integer() and 13 <= len(str(int(abs(value)))) <= 19:
+        return None, 1
     return value, 0
+
+
+def _name(value: Any) -> Optional[str]:
+    """A provider-supplied identifier (component, kind, action id), or None if it is not one."""
+    if isinstance(value, str) and _NAME_RE.match(value) and not _CARD_DIGITS_RE.search(value):
+        return value
+    return None
+
+
+def _is_money_result(component: str) -> bool:
+    return component.startswith(_MONEY_RESULT_PREFIXES)
 
 
 # ── response parsing ─────────────────────────────────────────────────────────────────────────
 
 
 def _latest_agent_parts(task: Mapping[str, Any]) -> List[Mapping[str, Any]]:
-    """The parts of the agent's answer to THIS message: agent messages after the last user one."""
+    """The parts of the agent's answer to THIS message: agent messages after the last user one,
+    or, when the history ends with the user's own message, the task's `status.message`."""
     history = task.get("history") if isinstance(task.get("history"), list) else []
     last_user = -1
     for index, message in enumerate(history):
         if isinstance(message, dict) and message.get("role") == "user":
             last_user = index
+    messages = [m for m in history[last_user + 1:] if isinstance(m, dict) and m.get("role") == "agent"]
+    status = task.get("status") if isinstance(task.get("status"), dict) else {}
+    if not messages and isinstance(status.get("message"), dict) and status["message"].get("role") == "agent":
+        messages = [status["message"]]
     parts: List[Mapping[str, Any]] = []
-    for message in history[last_user + 1:]:
-        if isinstance(message, dict) and message.get("role") == "agent":
-            parts.extend(p for p in (message.get("parts") or []) if isinstance(p, dict))
+    for message in messages:
+        if isinstance(message.get("parts"), list):
+            parts.extend(p for p in message["parts"] if isinstance(p, dict))
     return parts
 
 
 def _card_from(data: Mapping[str, Any]) -> Tuple[Card, int]:
+    """Identifiers must look like identifiers (a PAN in an action id is dropped, not returned)."""
+    raw_actions = data.get("actions") if isinstance(data.get("actions"), list) else []
     actions = tuple(
-        CardAction(id=str(a.get("id")), dispatch=a.get("dispatch"), role=a.get("role"))
-        for a in (data.get("actions") or [])
-        if isinstance(a, dict) and a.get("id")
+        CardAction(id=action_id, dispatch=_name(a.get("dispatch")), role=_name(a.get("role")))
+        for a in raw_actions
+        if isinstance(a, dict) and (action_id := _name(a.get("id")))
     )
     inner = data.get("data") if isinstance(data.get("data"), dict) else {}
     cleaned, removed = _strip_credentials(inner)
-    return Card(
-        component=str(data.get("component") or ""),
-        kind=data.get("kind") if isinstance(data.get("kind"), str) else None,
-        data=cleaned,
-        actions=actions,
-    ), removed
+    component = _name(data.get("component")) or ""
+    if not component and isinstance(data.get("component"), str) and _CARD_DIGITS_RE.search(data["component"]):
+        removed += 1
+    kind = _name(data.get("kind"))
+    return Card(component=component, kind=kind, data=cleaned, actions=actions), removed
 
 
 def parse_response(body: Any) -> A2AResult:
@@ -281,6 +364,7 @@ def parse_response(body: Any) -> A2AResult:
         return A2AResult(kind="protocol_error")
     status = task.get("status") if isinstance(task.get("status"), dict) else {}
     result = A2AResult(kind="cards", task_state=status.get("state") if isinstance(status.get("state"), str) else None)
+    money = False
     for part in _latest_agent_parts(task):
         if part.get("kind") == "data" and isinstance(part.get("data"), dict):
             card, removed = _card_from(part["data"])
@@ -290,13 +374,14 @@ def parse_response(body: Any) -> A2AResult:
                 result.kind = "error_card"
                 result.error_code = code if _ERROR_CODE_RE.match(code) else "UNKNOWN"
                 result.recoverable = bool(card.data.get("recoverable"))
+            money = money or _is_money_result(card.component)
             result.cards.append(card)
-        elif part.get("kind") == "text" and isinstance(part.get("text"), str):
-            text, removed = _strip_credentials(part["text"][:2000])
-            result.credential_fields_stripped += removed
-            result.texts.append(text)
-    if result.kind == "cards" and not result.cards:
-        result.kind = "unexpected_text" if result.texts else "protocol_error"
+        elif part.get("kind") == "text":
+            result.text_parts += 1
+    if money:
+        result.kind = "money_result"
+    elif result.kind == "cards" and not result.cards:
+        result.kind = "unexpected_text" if result.text_parts else "protocol_error"
     return result
 
 
@@ -323,15 +408,35 @@ class A2ARailClient:
         self._transport = transport
         self._clock = clock
         self._tokens: Dict[str, Tuple[str, float]] = {}
-        self._token_lock = asyncio.Lock()
+        # One lock per member: a slow exchange for one buyer must not stall every other buyer.
+        self._token_locks: Dict[str, asyncio.Lock] = {}
+
+    def context_for(self, ref: str) -> str:
+        """The conversation id for one Pivota purchase (`ref`), bound to this client's key.
+
+        `send_action` accepts only ids made here, so a caller cannot continue a conversation this
+        client did not start (rule 2: some allowed steps are shared with a money flow).
+        """
+        if not _CONTEXT_REF_RE.match(str(ref or "")):
+            raise ValueError("context ref must be 1..80 of [A-Za-z0-9_]")
+        return f"pvt-{ref}-{self._context_sig(ref)}"
+
+    def _context_sig(self, ref: str) -> str:
+        digest = hmac.new(self._api_key.encode("utf-8"), f"a2a-context:{ref}".encode("utf-8"), hashlib.sha256)
+        return digest.hexdigest()[:_CONTEXT_SIG_HEX]
+
+    def _is_own_context(self, context_id: str) -> bool:
+        match = re.fullmatch(r"pvt-([A-Za-z0-9_]{1,80})-([0-9a-f]{%d})" % _CONTEXT_SIG_HEX, context_id)
+        return bool(match) and hmac.compare_digest(match.group(2), self._context_sig(match.group(1)))
 
     def _client(self):
         import httpx
 
         # `follow_redirects=False` explicitly: a 3xx re-sends the bearer token wherever Location
         # points, past the host allowlist. A redirect is a visible http_error instead.
+        # `trust_env=False`: no environment proxy and no .netrc credentials for this host.
         return httpx.AsyncClient(
-            timeout=self._timeout_s, follow_redirects=False, transport=self._transport
+            timeout=self._timeout_s, follow_redirects=False, transport=self._transport, trust_env=False
         )
 
     async def _post_json(self, path: str, body: Mapping[str, Any], headers: Mapping[str, str]):
@@ -351,11 +456,12 @@ class A2ARailClient:
                 raw = b"".join(chunks)
         try:
             return resp.status_code, json.loads(raw.decode("utf-8")) if raw else None, False
-        except (UnicodeDecodeError, ValueError):
+        except (UnicodeDecodeError, ValueError, RecursionError):
             return resp.status_code, None, False
 
     async def _access_token(self, member_id: str) -> Optional[str]:
-        async with self._token_lock:
+        lock = self._token_locks.setdefault(member_id, asyncio.Lock())
+        async with lock:
             cached = self._tokens.get(member_id)
             if cached and cached[1] - self._clock() > TOKEN_REFRESH_MARGIN_S:
                 return cached[0]
@@ -374,7 +480,17 @@ class A2ARailClient:
                 expires_in = float(body.get("expires_in") or 0)
             except (TypeError, ValueError):
                 expires_in = 0.0
-            self._tokens[member_id] = (token, self._clock() + max(0.0, expires_in))
+            now = self._clock()
+            if len(self._tokens) >= _TOKEN_CACHE_MAX:
+                # Bounded: drop expired entries, then the soonest-expiring, never the one being set.
+                for stale in [m for m, (_, exp) in self._tokens.items() if exp <= now]:
+                    self._tokens.pop(stale, None)
+                while len(self._tokens) >= _TOKEN_CACHE_MAX:
+                    self._tokens.pop(min(self._tokens, key=lambda m: self._tokens[m][1]), None)
+                for idle in [m for m, lk in self._token_locks.items()
+                             if m not in self._tokens and m != member_id and not lk.locked()]:
+                    self._token_locks.pop(idle, None)
+            self._tokens[member_id] = (token, now + max(0.0, expires_in))
             return token
 
     async def send_action(
@@ -393,6 +509,8 @@ class A2ARailClient:
             raise ValueError("member_id must be an opaque id of 1..128 safe characters")
         if not _CONTEXT_ID_RE.match(str(context_id or "")):
             raise ValueError("context_id must be 1..128 safe characters")
+        if not self._is_own_context(context_id):
+            raise ValueError("context_id was not made by this client's context_for()")
         body = {
             "jsonrpc": "2.0",
             "id": str(uuid.uuid4()),
@@ -428,24 +546,37 @@ class A2ARailClient:
         except httpx.HTTPError:
             kind = "outcome_unknown" if may_write else "transport"
             return self._done(A2AResult(kind=kind), component, action, started)
-        if too_large:
-            return self._done(A2AResult(kind="too_large", http_status=status), component, action, started)
+        except Exception:  # noqa: BLE001 - anything else mid-request: same rule, classified not raised
+            kind = "outcome_unknown" if may_write else "transport"
+            return self._done(A2AResult(kind=kind), component, action, started)
         if status == 401:
-            # The cached token was refused: forget it so the next call re-mints.
+            # The cached token was refused: forget it so the next call re-mints. Never resent here.
             self._tokens.pop(member_id, None)
+        if too_large:
+            kind = "outcome_unknown" if may_write else "too_large"
+            return self._done(A2AResult(kind=kind, http_status=status), component, action, started)
         if status != 200:
-            return self._done(A2AResult(kind="http_error", http_status=status), component, action, started)
+            # A 5xx or 408 does not prove a write was refused; any other 4xx does.
+            kind = "outcome_unknown" if may_write and (status >= 500 or status == 408) else "http_error"
+            return self._done(A2AResult(kind=kind, http_status=status), component, action, started)
         result = parse_response(parsed)
         result.http_status = status
+        if may_write and result.kind == "protocol_error":
+            result.kind = "outcome_unknown"
         return self._done(result, component, action, started)
 
     def _done(self, result: A2AResult, component: str, action: str, started: float) -> A2AResult:
         result.elapsed_s = round(self._clock() - started, 3)
         logger.info(
             "a2a_rail: action=%s#%s kind=%s cards=%s http_status=%s stripped=%s elapsed_s=%s",
-            component, action, result.kind, ",".join(c.component for c in result.cards),
+            component, action, result.kind, ",".join(c.component for c in result.cards[:8]),
             result.http_status, result.credential_fields_stripped, result.elapsed_s,
         )
+        if result.kind == "money_result":
+            logger.error(
+                "a2a_rail: a money-result card came back on %s#%s; nothing may act on this answer",
+                component, action,
+            )
         if result.credential_fields_stripped:
             logger.warning(
                 "a2a_rail: removed %s credential field(s) from %s#%s (the provider still sends them)",
