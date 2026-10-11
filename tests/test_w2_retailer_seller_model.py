@@ -286,7 +286,7 @@ class TestPrepareSellerOfRecord:
         plan = _plan(merchant_id="merch_obs_dddd0000dddd0000", ensure_id="merch_obs_dddd0000dddd0000")
         dispatched = []
 
-        async def batch_dispatch(prepared, *, batch_label, database):
+        async def batch_dispatch(prepared, *, batch_label, database, **_):
             assert database is db
             assert batch_label == "seller_order_regression"
             assert prepared["pdps"][0]["merchant_id"] == "merch_tenant_1"

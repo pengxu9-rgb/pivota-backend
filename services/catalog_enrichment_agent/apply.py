@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from services.catalog_enrichment_agent.bulk_writer import bulk_upsert
 from services.catalog_enrichment_agent.ingestion import AGENT_VERSION, _domain_of, derive_offer_id
@@ -523,11 +524,15 @@ def _seed_with_served_canonical(seed: Dict[str, Any]) -> Dict[str, Any]:
     return {**seed, "canonical_url": served, "domain": _domain_of(served)}
 
 
-async def _derive_seed_seller_for_plan_row(seed: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+async def _derive_seed_seller_for_plan_row(
+    seed: Dict[str, Any], *, verified_storefront_domain: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
     """Derive `(seller_ref, seed_kind)` for one enrichment plan seed row (ADR-009
     D3). Brand comes from the seed_data JSON (`_build_seed_inserts` stores it),
     the destination from `domain`/`destination_url`, and the anchor from
-    `attached_product_key` (synthetic here → no tenant anchor → CROSS)."""
+    `attached_product_key` (synthetic here → no tenant anchor → CROSS, unless the
+    seed's destination is the VERIFIED brand storefront of the planned row it
+    attaches to: see `_verified_storefronts_by_key`)."""
     import json as _json
 
     from services.seller_identity import (
@@ -549,7 +554,64 @@ async def _derive_seed_seller_for_plan_row(seed: Dict[str, Any]) -> tuple[Option
         brand=brand,
         destination_domain=seed.get("domain") or seed.get("destination_url"),
         source_system=str(seed.get("tool") or AGENT_VERSION),
+        verified_storefront_domain=verified_storefront_domain,
     )
+
+
+def brand_official_label(brand: Any) -> str:
+    """One brand's label as the drain's domain proof keys it: whitespace collapsed, casefolded. NOT
+    normalize_brand, which strips every non-ASCII letter (설화수 and 헤라 would share one label, and one
+    acceptance would pass both). The proof (retailer_ingest.pipeline.brand_official_domain_review) and
+    the consumer below (_verified_storefronts_by_key) both call this; neither restates it."""
+    return " ".join(str(brand or "").split()).casefold()
+
+
+@dataclass(frozen=True)
+class VerifiedBrandStorefront:
+    """A storefront the retailer-ingest drain PROVED is the brand's own, for these brands only.
+
+    Built by retailer_ingest.pipeline.verified_brand_storefront from the run's
+    checks.brand_official_evidence: a brand is in `brand_labels` when Tier A (the domain's name is the
+    brand) or Tier B (the store's /meta.json names it for the market) admitted it, or a human accepted
+    its brand_official_domain_unproven flag. source_role=brand_official alone is NOT proof: the curated
+    onboard queue defaults a role-less job to brand_official and auto-applies with no domain check, and
+    is_known_retailer misses resellers (luxiface.com, tripletraders.com, perfumania.com ...)."""
+
+    host: str
+    brand_labels: FrozenSet[str]
+
+
+def _verified_storefronts_by_key(
+    pdps: List[Dict[str, Any]], verified: Optional[VerifiedBrandStorefront],
+) -> Dict[str, str]:
+    """product_key -> verified storefront host, for the planned rows a PROVEN brand storefront writes.
+
+    A seed attaches to its planned row by attached_product_key, and is looked up by its OWN row's key:
+    a cohort can hold rows of a brand the drain did not prove on the same host (a multi-brand store),
+    and those keep 'cross'. A row qualifies only when it is source_role=brand_official, sits on the
+    verified host, and its brand is one the drain proved. With no proof (every caller but the drain's
+    apply) the map is empty and every seed derives exactly as before: 'cross'.
+
+    Measured 2026-09-28: all 3,540 IDENTITY_LIVE_READ_DISABLED rows were merch_obs_ + 'cross', 1,937 of
+    them the brand's own store, because Path C's synthetic pk_<hash> never has a tenant anchor.
+
+    MIXED KINDS UNDER ONE KEY: a verified row can also carry a seed on another registrable domain (the
+    brand's second storefront attaching its offer, _guard_canonical_owner); that seed stays 'cross'.
+    catalog_row_trust reads ONE seed per minted row (catalog_row_trust_upserter.minted_seed_one: a seed
+    with an identity listing first, then SEED_PICK_ORDER), so such a row's trust follows that pick."""
+    if verified is None or not verified.host or not verified.brand_labels:
+        return {}
+    out: Dict[str, str] = {}
+    for pdp in pdps or []:
+        key = str(pdp.get("product_key") or "")
+        if (
+            key
+            and _is_brand_official_pdp(pdp)
+            and _storefront_host(pdp.get("source_domain")) == verified.host
+            and brand_official_label(pdp.get("brand")) in verified.brand_labels
+        ):
+            out[key] = verified.host
+    return out
 
 
 def _note_pdp_refusal(
@@ -586,10 +648,27 @@ def _skipped_products(refusals: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any
     return [refusals[k] for k in sorted(refusals)]
 
 
+def _plan_variants_by_product(skus: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """The plan's planned SKU rows per product_key, as the identity gate's `variants`.
+
+    F2 (2026-10-10): the crawl lane promotes a variant barcode to the product `gtin` only for a
+    product with exactly one barcoded variant, so a family's barcodes reach catalog_skus.barcode
+    and nowhere else -- and Tier-0a never saw them. The SKU rows are passed exactly as planned
+    (barcode as the source gave it, the shade title, sku_key): intake_identity canonicalizes the
+    barcode and skips the synthetic `::canonical` row itself."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for sku in skus or []:
+        key = str(sku.get("product_key") or "")
+        if key and sku.get("barcode"):
+            out.setdefault(key, []).append(sku)
+    return out
+
+
 async def _apply_pdp_identity_gate(
     pdp: Dict[str, Any], *, identity_gate_on: bool,
     group_targets: Optional[Dict[str, str]] = None,
     refusals: Optional[Dict[str, Dict[str, Any]]] = None,
+    variants: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
     """Shared pre-insert step for a PDP row (both executors). Mutates `pdp` in
     place: canonicalizes the source barcode into the `gtin` match-attribute column
@@ -625,6 +704,7 @@ async def _apply_pdp_identity_gate(
             "product_key": pdp.get("product_key"),
             "strict_group_resolution": True,
         },
+        variants=variants,
     )
     # The shared resolver serves legacy doors that may return an error-shaped
     # MINT. This primary writer cannot publish that substituted identity.
@@ -2096,6 +2176,7 @@ async def apply_ingest_plan(
     batch: bool = False,
     primary_readiness: bool = False,
     market: str = DEFAULT_CANONICAL_MARKET,
+    verified_storefront: Optional[VerifiedBrandStorefront] = None,
 ) -> Dict[str, Any]:
     """Persist an ingest plan, optionally handing curated rows to serving policy.
 
@@ -2111,7 +2192,8 @@ async def apply_ingest_plan(
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply
 
     preflight = require_primary_plan(plan) if primary_readiness else None
-    counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch, market=market)
+    counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch, market=market,
+                                      verified_storefront=verified_storefront)
     if not primary_readiness:
         return counts
     from services.catalog_enrichment_agent.primary_readiness import (
@@ -2139,6 +2221,7 @@ async def _apply_ingest_plan(
     db: Any = None,
     batch: bool = False,
     market: str = DEFAULT_CANONICAL_MARKET,
+    verified_storefront: Optional[VerifiedBrandStorefront] = None,
 ) -> Dict[str, int]:
     """Execute an ingest plan (from `ingest_validated_jsonl`) against the DB in FK
     order. Returns counts. Per-row failures are logged and skipped (never abort the
@@ -2163,7 +2246,8 @@ async def _apply_ingest_plan(
     owner_counts = {**owner_counts, **stage_counts}
 
     if batch:
-        counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database)
+        counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database,
+                                                  verified_storefront=verified_storefront)
         counts.update(owner_counts)
         return counts
 
@@ -2196,6 +2280,7 @@ async def _apply_ingest_plan(
     )
 
     identity_gate_on = intake_identity_enabled(DOOR_CATALOG_ENRICHMENT)
+    plan_variants = _plan_variants_by_product(skus)
     group_targets: Dict[str, str] = {}
     counts["product_groups_failed"] = 0
     counts["pdps_skipped_identity"] = 0
@@ -2205,7 +2290,8 @@ async def _apply_ingest_plan(
     # 2. catalog_products — UPSERT by product_key.
     for pdp in pdps:
         if not await _apply_pdp_identity_gate(pdp, identity_gate_on=identity_gate_on, group_targets=group_targets,
-                                              refusals=refusals):
+                                              refusals=refusals,
+                                              variants=plan_variants.get(str(pdp.get("product_key") or ""))):
             counts["pdps_skipped_identity"] += 1
             skipped_product_keys.add(pdp.get("product_key"))
             continue
@@ -2286,16 +2372,19 @@ async def _apply_ingest_plan(
                 logger.exception("insert offer failed for offer_id=%s — %s", offer.get("offer_id"), exc)
 
     # 5. external_product_seeds — audit + legacy compatibility.
+    own_storefronts = _verified_storefronts_by_key(pdps, verified_storefront)
     for seed in seeds:
         try:
             # ADR-009 D3 (docs/adr/ADR-009-seller-of-record-identity.md; IDENTITY
             # _REFERENCE §4): derive the seller-of-record at write time. Enrichment
-            # offers are external retailer offers whose `attached_product_key` is a
-            # synthetic `pk_<hash>` (no tenant anchor) → these resolve CROSS to an
-            # observed seller. NULL only when unmintable (derive logs loudly) —
-            # never assumed 'self'.
+            # seeds attach to a synthetic `pk_<hash>` (no tenant anchor) → they
+            # resolve CROSS to an observed seller, except a seed on the brand-
+            # official storefront of its own planned row, which is SELF. NULL only
+            # when unmintable (derive logs loudly).
             seed = _seed_with_served_canonical(seed)
-            seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(seed)
+            seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(
+                seed, verified_storefront_domain=own_storefronts.get(str(seed.get("attached_product_key") or "")),
+            )
             await database.execute(
                 _SEED_UPSERT_SQL,
                 {**seed, "seller_ref": seller_ref, "seed_kind": seed_kind},
@@ -2325,6 +2414,7 @@ async def _apply_ingest_plan_batched(
     *,
     batch_label: str,
     database: Any,
+    verified_storefront: Optional[VerifiedBrandStorefront] = None,
 ) -> Dict[str, int]:
     """Round-trip-eliminating executor. Same SQL constants, same offer guard, same
     WriterAuditAccumulator as the per-row path; each stage upserts in chunked
@@ -2364,6 +2454,7 @@ async def _apply_ingest_plan_batched(
     )
 
     identity_gate_on = intake_identity_enabled(DOOR_CATALOG_ENRICHMENT)
+    plan_variants = _plan_variants_by_product(skus)
     group_targets: Dict[str, str] = {}
     counts["product_groups_failed"] = 0
     skipped_product_keys: set = set()
@@ -2374,7 +2465,8 @@ async def _apply_ingest_plan_batched(
     insertable_pdps = []
     for pdp in pdps:
         if not await _apply_pdp_identity_gate(pdp, identity_gate_on=identity_gate_on, group_targets=group_targets,
-                                              refusals=refusals):
+                                              refusals=refusals,
+                                              variants=plan_variants.get(str(pdp.get("product_key") or ""))):
             counts["pdps_skipped_identity"] += 1
             skipped_product_keys.add(pdp.get("product_key"))
             continue
@@ -2483,10 +2575,13 @@ async def _apply_ingest_plan_batched(
 
     # 5. external_product_seeds — per-row seller derivation (ADR-009 D3), then bulk.
     seed_rows = []
+    own_storefronts = _verified_storefronts_by_key(pdps, verified_storefront)
     for seed in seeds:
         seed = _seed_with_served_canonical(seed)
         try:
-            seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(seed)
+            seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(
+                seed, verified_storefront_domain=own_storefronts.get(str(seed.get("attached_product_key") or "")),
+            )
         except Exception as exc:  # noqa: BLE001 — same skip semantics as the per-row
             # path: one seed's derivation failure must not abort the apply AFTER
             # pdps/skus/offers are committed, nor lose the writer-audit row below.

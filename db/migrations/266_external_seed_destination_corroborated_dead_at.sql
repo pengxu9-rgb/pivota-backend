@@ -1,4 +1,4 @@
--- 260_external_seed_destination_corroborated_dead_at.sql
+-- 266_external_seed_destination_corroborated_dead_at.sql
 --
 -- The clock that spaces a destination failure streak's steps.
 --

@@ -558,7 +558,7 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "destination_http_status",
             "destination_verdict",
             "destination_failure_streak",
-            # Migration 260. When the streak last stepped on a corroborated dead
+            # Migration 266. When the streak last stepped on a corroborated dead
             # observation: the retirement gap is measured from here, because
             # destination_checked_at is re-stamped by uncorroborated refresh observations.
             "destination_corroborated_dead_at",
@@ -1183,6 +1183,15 @@ async def ensure_required_schema_light() -> None:
                 await ensure_price_witness_schema()
             except Exception as exc:
                 logger.warning("schema_guard: Reap price witness schema unavailable (%s)", type(exc).__name__)
+            # mig 264: the rail-neutral purchase ledger (payment orchestration P0). Its own try:
+            # it is written only behind AGENT_PURCHASE_LEDGER_ENABLED, never inside a rail's
+            # transaction, and a failure here must not starve what follows. The DDL lives in
+            # db/agent_purchase_ledger._CREATE_TABLE_PG (dialect split there).
+            try:
+                from db.agent_purchase_ledger import ensure_agent_purchase_schema
+                await ensure_agent_purchase_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchases (mig 264) unavailable (%s)", type(exc).__name__)
             # mig 252: AT MOST ONE PENDING ENROLLMENT PER BUYER.
             # db/migrations/252_reap_agentic_enrollments_one_pending.sql is the
             # same index. Two purchases of one buyer, each in 'resolving' in one
@@ -2922,7 +2931,7 @@ async def ensure_required_schema_light() -> None:
                   ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;
                 """
             )
-            # Migration 260: the clock the retirement gap is measured from. The writer
+            # Migration 266: the clock the retirement gap is measured from. The writer
             # SELECTs it on every observation, so a database without it fails every sweep.
             await _heal_add_columns(
                 """
@@ -3184,6 +3193,16 @@ async def ensure_required_schema_light() -> None:
                 "ALTER TABLE IF EXISTS agent_pdp_view "
                 "ADD COLUMN IF NOT EXISTS rating_value NUMERIC, "
                 "ADD COLUMN IF NOT EXISTS rating_count INTEGER;"
+            )
+            # mig 263: per-currency price summary on the served view, and the
+            # stamp tying it to the write that produced it
+            # (services/agent_pdp_view_assembler.build_market_prices). Nullable,
+            # written only while AGENT_PDP_VIEW_MARKET_PRICES is on; readers use
+            # the summary only while its stamp equals refreshed_at.
+            await _heal_add_columns(
+                "ALTER TABLE IF EXISTS agent_pdp_view "
+                "ADD COLUMN IF NOT EXISTS market_prices JSONB, "
+                "ADD COLUMN IF NOT EXISTS market_prices_refreshed_at TIMESTAMPTZ;"
             )
             # mig 181: ONE canonical URL per content_key. 474 content_keys
             # carry >1 sitemap-eligible renderable sig; every sibling serves
@@ -3914,6 +3933,15 @@ async def ensure_required_schema_light() -> None:
                 await ensure_price_witness_schema()
             except Exception as exc:
                 logger.warning("schema_guard: Reap price witness schema unavailable (%s)", type(exc).__name__)
+            # mig 264: the rail-neutral purchase ledger (payment orchestration P0). Its own try:
+            # it is written only behind AGENT_PURCHASE_LEDGER_ENABLED, never inside a rail's
+            # transaction, and a failure here must not starve what follows. The DDL lives in
+            # db/agent_purchase_ledger._CREATE_TABLE_PG (dialect split there).
+            try:
+                from db.agent_purchase_ledger import ensure_agent_purchase_schema
+                await ensure_agent_purchase_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchases (mig 264) unavailable (%s)", type(exc).__name__)
             # mig 252: at most one PENDING enrollment per buyer, SQLite twin of
             # the Postgres block above (same index, same reason, same own try:
             # it fails on a database that already holds two pending rows for one

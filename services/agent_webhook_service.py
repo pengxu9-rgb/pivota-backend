@@ -18,7 +18,7 @@ from config.settings import resolve_public_api_base_url
 from db.database import database
 from db.schema_guard import guarded_statements, is_lock_timeout
 from db.startup_ddl import execute_ddl
-from services import webhook_retry_delivery_gate
+from services import webhook_delivery_gate
 
 
 logger = logging.getLogger(__name__)
@@ -185,6 +185,12 @@ def get_managed_receiver_url(agent_id: str) -> str:
 
 
 def _normalize_destination_url(agent_id: str, destination_url: Optional[str]) -> Optional[str]:
+    """Pin this agent's managed inbox to the host we serve it from TODAY, whatever host is stored.
+
+    The stored config (and every delivery row) keeps the URL as it was written, so after the API
+    host moved, a managed-inbox config still named the retired host and every send 404'd there.
+    Read paths showed the rewritten URL while emit, test send and retry POSTed the stored one, so
+    every place that resolves a send's destination must call this, not read the column raw."""
     raw = str(destination_url or "").strip()
     if not raw:
         return None
@@ -896,6 +902,10 @@ async def _attempt_delivery(
     prior_attempts: int = 0,
     created_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
+    if not webhook_delivery_gate.delivery_enabled():
+        # The one place this service POSTs, so emit, per-row retry, test send and the retry loop
+        # all stop here outside production. No HTTP, no row; a retrying row stays as it was.
+        return webhook_delivery_gate.skipped_result(event_type=event_type, delivery_id=delivery_id)
     delivery_id = delivery_id or f"whd_{uuid.uuid4().hex[:24]}"
     event_id = event_id or f"evt_{uuid.uuid4().hex[:24]}"
     created_at = created_at or _utcnow()
@@ -993,7 +1003,7 @@ async def emit_agent_webhook_event(
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     config = await _get_or_create_raw_config(agent_id)
-    destination_url = str(config.get("destination_url") or "").strip()
+    destination_url = _normalize_destination_url(agent_id, config.get("destination_url")) or ""
     enabled = bool(config.get("enabled") and destination_url)
     subscribed_events = _normalize_events(_coerce_json(config.get("subscribed_events"), []))
     signing_secret = str(config.get("signing_secret") or "").strip()
@@ -1042,7 +1052,7 @@ async def emit_agent_webhook_event(
 
 async def send_test_webhook(agent_id: str, *, request_id: Optional[str] = None) -> Dict[str, Any]:
     config = await _get_or_create_raw_config(agent_id)
-    destination_url = str(config.get("destination_url") or "").strip()
+    destination_url = _normalize_destination_url(agent_id, config.get("destination_url"))
     if not destination_url or not bool(config.get("enabled")):
         raise ValueError("Configure and enable a webhook destination before sending a test event.")
 
@@ -1146,7 +1156,11 @@ async def retry_delivery(agent_id: str, delivery_id: str) -> Dict[str, Any]:
         raise ValueError("Webhook delivery not found.")
 
     config = await _get_or_create_raw_config(agent_id)
-    destination_url = str(row["destination_url"] or config.get("destination_url") or "").strip()
+    # A row stores the URL it was first sent to, so a managed-inbox row written before a host
+    # move would retry at the old host forever; it goes to the inbox's current URL instead.
+    destination_url = _normalize_destination_url(
+        agent_id, row["destination_url"] or config.get("destination_url")
+    ) or ""
     signing_secret = str(config.get("signing_secret") or "").strip()
     if not destination_url or not signing_secret:
         raise ValueError("Webhook destination is not configured.")
@@ -1263,9 +1277,9 @@ async def process_due_retries(
     Nothing is lost by stopping early: an undelivered retry stays `retrying` with its
     `next_retry_at` unchanged, so the next instance picks it up on its next poll.
     """
-    if not webhook_retry_delivery_gate.retry_delivery_enabled():
+    if not webhook_delivery_gate.delivery_enabled():
         # Outside production (or with the kill switch off) nothing is selected and nothing is
-        # sent; due rows stay exactly as they are. See services/webhook_retry_delivery_gate.py.
+        # sent; due rows stay exactly as they are. See services/webhook_delivery_gate.py.
         return 0
     await ensure_agent_webhook_tables()
     rows = await database.fetch_all(
@@ -1300,13 +1314,13 @@ async def process_due_retries(
 
 
 async def _retry_worker_loop(stop_event: asyncio.Event) -> None:
-    if not webhook_retry_delivery_gate.retry_delivery_enabled():
+    if not webhook_delivery_gate.delivery_enabled():
         # WARNING, not INFO: prod drops module-logger INFO, and this line is the only sign on a
         # staging process that its retries are deliberately parked rather than broken.
         logger.warning(
-            "agent webhook retry worker NOT started: retry delivery is disabled on this process "
+            "agent webhook retry worker NOT started: webhook delivery is disabled on this process "
             "(%s). Due retries stay due. Set %s=true to deliver them.",
-            webhook_retry_delivery_gate.describe(), webhook_retry_delivery_gate.ENV_VAR,
+            webhook_delivery_gate.describe(), webhook_delivery_gate.ENV_VAR,
         )
         return
     while not stop_event.is_set():
