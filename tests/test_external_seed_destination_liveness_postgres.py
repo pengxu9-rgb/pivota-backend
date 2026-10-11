@@ -512,6 +512,49 @@ async def test_pending_hides_on_a_corroborated_death_and_a_live_answer_lifts_exa
 
 
 @pytest.mark.asyncio
+async def test_a_lift_that_failed_after_its_reset_committed_is_retried_by_the_next_live_answer(_db, monkeypatch):
+    from services import destination_dead_suppression
+    from services import external_seed_destination_liveness as liveness
+    from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
+
+    monkeypatch.setenv(liveness.PENDING_SUPPRESSION_FLAG, "1")
+    await _ensure_offers(_db)
+    await _seed(_db, "eps_retry")
+    await _db.execute(
+        "INSERT INTO catalog_products (product_key, source_ref, source_system) VALUES ('prod::retry', 'eps_retry', :m)",
+        {"m": MIRROR_SOURCE_SYSTEM},
+    )
+    await _offer(_db, "retry", "prod::retry")
+    dead = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=True)
+    await liveness.record_destination_observation("eps_retry", dead, now=NOW, suppress=True)
+    assert (await _product_row(_db, "prod::retry"))["suppression_reason"] == liveness.PENDING_SUPPRESSION_REASON
+
+    # the lift dies after the streak reset has committed
+    real_lift = destination_dead_suppression.lift_pending
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("connection reset mid-lift")
+
+    monkeypatch.setattr(destination_dead_suppression, "lift_pending", _boom)
+    alive = liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None)
+    with pytest.raises(RuntimeError):
+        await liveness.record_destination_observation("eps_retry", alive, now=NOW + timedelta(hours=2))
+    seed = dict(await _db.fetch_one(
+        "SELECT destination_failure_streak FROM external_product_seeds WHERE id = 'eps_retry'"))
+    assert seed["destination_failure_streak"] == 0
+    assert (await _product_row(_db, "prod::retry"))["suppression_reason"] == liveness.PENDING_SUPPRESSION_REASON
+
+    # the next live answer finds streak 0 and must still lift it
+    monkeypatch.setattr(destination_dead_suppression, "lift_pending", real_lift)
+    lifted = await liveness.record_destination_observation("eps_retry", alive, now=NOW + timedelta(hours=4))
+    assert lifted["failure_streak"] == 0 and lifted["pending_lifted"] == 1
+    back = await _product_row(_db, "prod::retry")
+    assert back["suppressed_at"] is None and back["suppression_reason"] is None
+    offer = await _offer_row(_db, "retry")
+    assert offer["suppressed_at"] is None and offer["suppression_reason"] is None
+
+
+@pytest.mark.asyncio
 async def test_a_lift_never_clears_a_product_another_lane_suppressed(_db):
     from services import external_seed_destination_liveness as liveness
     from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
