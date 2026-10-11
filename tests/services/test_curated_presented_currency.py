@@ -53,7 +53,8 @@ async def test_each_page_records_the_currency_it_was_presented_in(monkeypatch):
     _install(monkeypatch, [[_cookie("USD")], [_cookie("USD")], []])
     batch = await cbf.fetch_shopify_products(HOST, max_products=10)
     assert batch.crawl_report["presented_currency"] == {
-        "currencies": ["USD"], "pages_with_cookie": 2, "pages_without_cookie": 1, "problems": {}}
+        "currencies": ["USD"], "pages_by_currency": {"USD": 2}, "pages_without_cookie": 1, "problems": {},
+        "unproven_values": []}
 
 
 @pytest.mark.asyncio
@@ -75,8 +76,9 @@ async def test_a_page_presented_in_another_currency_refuses_the_brand(monkeypatc
 async def test_a_later_page_in_another_currency_refuses_too(monkeypatch):
     _install(monkeypatch, [[_cookie("USD")], [_cookie("GBP")], []])
     _locale(monkeypatch, "USD")
-    with pytest.raises(cbf.PresentedCurrencyMismatch, match="GBP"):
+    with pytest.raises(cbf.PresentedCurrencyMismatch, match="GBP on 1 page") as exc:
         await cbf.records_for_brand(domain=HOST, category_path="beauty/makeup", require_currency="USD")
+    assert "USD on" not in str(exc.value)  # the message counts the FOREIGN pages, not every page with a cookie
 
 
 @pytest.mark.asyncio
@@ -97,7 +99,7 @@ async def test_no_cookie_is_counted_and_changes_nothing(monkeypatch):
     assert recs and {r["pdp"]["currency"] for r in recs} == {"USD"}
     report = cbf.records_for_brand.last_crawl_report
     assert report["presented_currency"] == {
-        "currencies": [], "pages_with_cookie": 0, "pages_without_cookie": 2, "problems": {}}
+        "currencies": [], "pages_by_currency": {}, "pages_without_cookie": 2, "problems": {}, "unproven_values": []}
 
 
 @pytest.mark.asyncio
@@ -105,8 +107,51 @@ async def test_a_conflicting_or_malformed_cookie_is_no_proof_and_is_recorded(mon
     _install(monkeypatch, [[_cookie("USD"), _cookie("EUR")], ["cart_currency=usd; path=/"], []])
     batch = await cbf.fetch_shopify_products(HOST, max_products=10)
     assert batch.crawl_report["presented_currency"] == {
-        "currencies": [], "pages_with_cookie": 0, "pages_without_cookie": 1,
-        "problems": {"cookie_conflict": 1, "cookie_malformed": 1}}
+        "currencies": [], "pages_by_currency": {}, "pages_without_cookie": 1,
+        "problems": {"cookie_conflict": 1, "cookie_malformed": 1}, "unproven_values": ["EUR", "USD"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cookies", [[_cookie("USD"), _cookie("QAR")], ["cart_currency=qar; path=/"]])
+async def test_a_foreign_value_in_a_cookie_that_is_no_proof_still_refuses(monkeypatch, cookies):
+    """Two values on one response, or a lower-case one: the payload's currency is unknown there, and one
+    candidate is foreign. Fail closed: refused, never labelled USD."""
+    _install(monkeypatch, [cookies, []])
+    _locale(monkeypatch, "USD")
+    with pytest.raises(cbf.PresentedCurrencyMismatch, match="QAR in a conflicting or malformed cookie"):
+        await cbf.records_for_brand(domain=HOST, category_path="beauty/makeup", require_currency="USD")
+
+
+@pytest.mark.asyncio
+async def test_a_cookie_set_by_a_redirect_hop_never_rides_the_next_request(monkeypatch):
+    """Review of #2565: an apex->www 301 that sets cart_currency=QAR, and a store that re-sends the cookie only
+    to a request carrying none. With a cookie jar, every page would carry QAR, answer in QAR, and send no
+    cookie: zero proof, and the crawl would pass labelling QAR amounts USD. Without one, each page is presented
+    on its own and says so."""
+    sent = []
+
+    def handler(request):
+        sent.append(request.headers.get("cookie"))
+        if request.url.host == HOST:
+            return httpx.Response(301, headers=[("location", str(request.url.copy_with(host="www." + HOST))),
+                                                ("set-cookie", _cookie("QAR"))])
+        page = int(request.url.params.get("page"))
+        headers = [("content-type", "application/json")]
+        if not request.headers.get("cookie"):
+            headers.append(("set-cookie", _cookie("QAR")))
+        return httpx.Response(200, json={"products": [PRODUCT] if page == 1 else []}, headers=headers)
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+
+    async def _noop(*a, **kw):
+        return None
+    monkeypatch.setattr(cbf.crawl_politeness, "before_request", _noop)
+    monkeypatch.setattr(cbf.crawl_politeness, "note_response", lambda *a, **kw: None)
+    _locale(monkeypatch, "USD")
+    with pytest.raises(cbf.PresentedCurrencyMismatch, match="QAR on 2 page"):
+        await cbf.records_for_brand(domain=HOST, category_path="beauty/makeup", require_currency="USD")
+    assert sent and all(c is None for c in sent)
 
 
 @pytest.mark.asyncio
@@ -117,10 +162,11 @@ async def test_collections_merge_their_presented_currency(monkeypatch):
         calls.append(collection)
         cur = "USD" if collection == "a" else "JPY"
         return cbf.ShopifyProductBatch([dict(PRODUCT, id=len(calls))], scanned_products=1, pages=2,
-                                       presented={"currencies": [cur], "pages_with_cookie": 1,
-                                                  "pages_without_cookie": 1, "problems": {}})
+                                       presented={"currencies": [cur], "pages_by_currency": {cur: 1},
+                                                  "pages_without_cookie": 1, "problems": {}, "unproven_values": []})
     monkeypatch.setattr(cbf, "fetch_shopify_products", _fetch)
     batch = await cbf.fetch_shopify_collections(HOST, ["a", "b"], only_vendors=["Acme"], max_products=10,
                                                 max_scan_products=100)
     assert batch.crawl_report["presented_currency"] == {
-        "currencies": ["JPY", "USD"], "pages_with_cookie": 2, "pages_without_cookie": 2, "problems": {}}
+        "currencies": ["JPY", "USD"], "pages_by_currency": {"JPY": 1, "USD": 1}, "pages_without_cookie": 2,
+        "problems": {}, "unproven_values": []}

@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 
 from services.catalog_identity import validated_source_gtin
 from services import storefront_currency
@@ -487,10 +488,12 @@ class _PresentedCurrency:
     (`PresentedCurrencyMismatch`). A page with no cookie proves nothing either way and is only counted."""
 
     def __init__(self) -> None:
-        self.currencies: set = set()
-        self.pages_with_cookie = 0
+        self.pages: Dict[str, int] = {}  # currency -> pages presented in it
         self.pages_without_cookie = 0
         self.problems: Dict[str, int] = {}
+        #: Currency-shaped values from a response that is no proof (two different values, or e.g. `qar`): the
+        #: payload's currency is unknown there, so a foreign one among them still refuses (fail closed).
+        self.unproven_values: set = set()
 
     def note(self, resp: Any) -> None:
         from services.shopify_presentment import presentment_currency
@@ -498,27 +501,33 @@ class _PresentedCurrency:
         cookies = headers.get_list("set-cookie") if hasattr(headers, "get_list") else []
         currency, problem = presentment_currency(cookies)
         if currency is not None:
-            self.currencies.add(currency)
-            self.pages_with_cookie += 1
+            self.pages[currency] = self.pages.get(currency, 0) + 1
             return
         if problem == "cookie_absent":
             self.pages_without_cookie += 1
             return
         # Two different values on one response, or a malformed one: no proof, and recorded as such.
         self.problems[problem] = self.problems.get(problem, 0) + 1
+        for header in cookies:
+            name, sep, rest = str(header).partition("=")
+            value = rest.split(";", 1)[0].strip().upper()
+            if sep and name.strip() == "cart_currency" and _ISO_CURRENCY.fullmatch(value):
+                self.unproven_values.add(value)
 
     def merge(self, report: Optional[Dict[str, Any]]) -> None:
         if not isinstance(report, dict):
             return
-        self.currencies.update(report.get("currencies") or ())
-        self.pages_with_cookie += int(report.get("pages_with_cookie") or 0)
+        for k, v in (report.get("pages_by_currency") or {}).items():
+            self.pages[k] = self.pages.get(k, 0) + int(v or 0)
         self.pages_without_cookie += int(report.get("pages_without_cookie") or 0)
         for k, v in (report.get("problems") or {}).items():
             self.problems[k] = self.problems.get(k, 0) + int(v or 0)
+        self.unproven_values.update(report.get("unproven_values") or ())
 
     def report(self) -> Dict[str, Any]:
-        return {"currencies": sorted(self.currencies), "pages_with_cookie": self.pages_with_cookie,
-                "pages_without_cookie": self.pages_without_cookie, "problems": dict(self.problems)}
+        return {"currencies": sorted(self.pages), "pages_by_currency": dict(sorted(self.pages.items())),
+                "pages_without_cookie": self.pages_without_cookie, "problems": dict(self.problems),
+                "unproven_values": sorted(self.unproven_values)}
 
 
 #: Shopify serves /products.json pages 1..100 only: page 101 answers HTTP 400 (measured 2026-09-24 on
@@ -590,7 +599,12 @@ async def fetch_shopify_products(
                                selected_products=len(out), reason_code=reason_code)
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
+        # NO cookie jar: a cart_currency/localization cookie set by one response (a redirect hop included) must
+        # never ride a later request, or it steers what the store presents and the page answering under it may
+        # not re-send the cookie that would reveal it (`_PresentedCurrency`). Each page is its own evidence.
+        no_cookies = CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers,
+                                     cookies=no_cookies) as client:
             while True:
                 if page > SHOPIFY_MAX_PAGES:
                     raise incomplete(
@@ -3220,14 +3234,17 @@ async def records_for_brand(
                 f"page reads exactly like a missing file. If {actual or 'the proven value'} "
                 f"is genuinely right, pass --require-currency {actual or '<code>'} instead."
             )
-    presented = (crawl_report or {}).get("presented_currency") if isinstance(crawl_report, dict) else None
-    foreign = sorted(set((presented or {}).get("currencies") or ()) - {locale.get("currency")})
-    if foreign:
-        # BEFORE the records are built: every price on those pages is in `foreign`, not the label.
+    presented = ((crawl_report or {}).get("presented_currency") if isinstance(crawl_report, dict) else None) or {}
+    proven = locale.get("currency")
+    foreign = {c: n for c, n in (presented.get("pages_by_currency") or {}).items() if c != proven}
+    unproven = sorted(set(presented.get("unproven_values") or ()) - {proven})
+    if foreign or unproven:
+        # BEFORE the records are built: those pages' prices are not in the currency they would be labelled.
+        seen = ", ".join([f"{c} on {n} page(s)" for c, n in sorted(foreign.items())]
+                         + [f"{c} in a conflicting or malformed cookie" for c in unproven])
         raise PresentedCurrencyMismatch(
-            f"{domain}: /products.json was presented in {'/'.join(foreign)} (the cart_currency cookie of the "
-            f"crawl's own responses, {presented.get('pages_with_cookie')} page(s)), but /meta.json proved "
-            f"{locale.get('currency')}: those prices are not {locale.get('currency')} amounts. Refusing the "
+            f"{domain}: /products.json was presented in {seen} (the cart_currency cookie of the crawl's own "
+            f"responses), but /meta.json proved {proven}: those prices are not {proven} amounts. Refusing the "
             f"crawl; nothing is relabelled or converted.")
     if only_vendors is not None:
         # A filter that was ASKED FOR but normalises to nothing is refused, not skipped.
