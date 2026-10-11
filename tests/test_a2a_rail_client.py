@@ -124,7 +124,7 @@ def _client(rail, clock=None, **kw):
 
 async def _send(client, component="payment.method-view", action="submit", payload=None, member=MEMBER,
                 context=None):
-    return await client.send_action(member_id=member, context_id=context or client.context_for(REF),
+    return await client.send_action(member_id=member, context_id=context or client.context_for(member, REF),
                                     component=component, action=action, payload=payload or {})
 
 
@@ -196,7 +196,7 @@ async def test_only_a_structured_data_part_is_ever_sent():
     [sent] = rail.sends()
     message = sent["body"]["params"]["message"]
     assert sent["body"]["method"] == "message/send"
-    assert message["role"] == "user" and message["contextId"] == _client(rail).context_for(REF)
+    assert message["role"] == "user" and message["contextId"] == _client(rail).context_for(MEMBER, REF)
     assert message["parts"] == [{"kind": "data", "data": {
         "component": "payment.method-view", "action": "submit", "payload": {"list_statuses": "ACTIVE"}}}]
     assert sent["headers"]["authorization"] == "Bearer tok-1"
@@ -208,7 +208,7 @@ async def test_unsafe_ids_are_refused_before_any_request(member, ctx):
     rail = _Rail(METHOD_LIST)
     client = _client(rail)
     with pytest.raises(ValueError):
-        await client.send_action(member_id=member, context_id=client.context_for(REF) if ctx is None else ctx,
+        await client.send_action(member_id=member, context_id=client.context_for(MEMBER, REF) if ctx is None else ctx,
                                  component="payment.method-view", action="submit", payload={})
     assert rail.requests == []
 
@@ -388,7 +388,11 @@ def test_formatted_numeric_keyed_and_embedded_credentials_are_removed(data):
 
 def test_a_url_and_ordinary_ids_survive_the_wider_rules():
     data = {"linkUrl": "https://rail-dev.test/bind?t=QUJDREVGR0hJSktMTU5PUFFSU1Q=", "orderNo": "20261011123456",
-            "createdAt": "2026-10-11 12:00:00", "amount_cents": 4650, "ts": 1760000000}
+            "createdAt": "2026-10-11 12:00:00", "amount_cents": 4650, "ts": 1760000000,
+            # a 32-hex id whose 14-digit run fails Luhn, a ms epoch, a digits-only time, a 19-digit order id
+            "paymentTokenId": "ptk_a12345678901234bcdef0123456789ab", "createdAtMs": 1760000000123,
+            "updatedAt": "20261011123456", "orderId": 1234567890123456789,
+            "bindUrl": "https://rail-dev.test/bind?t=1760000000123&n=12345678901234"}
     cleaned, removed = a2a._strip_credentials(data)
     assert cleaned == data and removed == 0
 
@@ -397,9 +401,26 @@ def test_a_reference_key_keeps_its_digits_and_nothing_else_does():
     cleaned, removed = a2a._strip_credentials({"orderNo": "20261011123456", "note": "order 20261011123456",
                                                "merchant_order_ref": "20261011123456",
                                                "cardNumber": "20261011123456", "orderId": CRYPTOGRAM})
-    assert cleaned == {"orderNo": "20261011123456", "note": "order [REMOVED]",
-                       "merchant_order_ref": "20261011123456", "orderId": "[REMOVED]"}
+    assert cleaned == {"orderNo": "20261011123456", "note": None,
+                       "merchant_order_ref": "20261011123456", "orderId": None}
     assert removed == 3
+
+
+@pytest.mark.parametrize("key", ["cardRef", "tokenReference", "panRef", "card_number_ref",
+                                 "accountNumberReference", "createdAt_card", "cardIssuedAt", "tokenTs"])
+def test_a_card_word_in_a_reference_or_time_key_does_not_spare_a_pan(key):
+    cleaned, removed = a2a._strip_credentials({key: DPAN})
+    assert removed == 1 and DPAN not in json.dumps(cleaned)
+
+
+def test_a_cryptogram_used_as_a_key_is_removed():
+    cleaned, removed = a2a._strip_credentials({CRYPTOGRAM: "x", "ok": 1})
+    assert cleaned == {"ok": 1} and removed == 1
+
+
+def test_a_value_with_a_credential_is_dropped_whole_not_patched():
+    cleaned, _ = a2a._strip_credentials({"id": f"ptk_{DPAN}", "linkUrl": f"https://rail-dev.test/b?pan={DPAN}"})
+    assert cleaned == {"id": None, "linkUrl": None}
 
 
 def test_nesting_past_the_depth_cap_is_dropped_not_recursed():
@@ -456,14 +477,80 @@ async def test_a_context_signed_under_another_key_is_refused():
     rail = _Rail(METHOD_LIST)
     other = a2a.A2ARailClient(BASE, "sk_test_some_other_key_99", transport=httpx.MockTransport(rail.handler))
     with pytest.raises(ValueError):
-        await _send(_client(rail), context=other.context_for(REF))
+        await _send(_client(rail), context=other.context_for(MEMBER, REF))
     assert rail.requests == []
+
+
+async def test_a_conversation_is_bound_to_its_member():
+    rail = _Rail(METHOD_LIST)
+    client = _client(rail)
+    with pytest.raises(ValueError):
+        await _send(client, member="pivota-buyer-ref-2", context=client.context_for(MEMBER, REF))
+    assert rail.requests == []
+
+
+async def test_a_dedicated_context_secret_survives_an_api_key_rotation():
+    rail = _Rail(METHOD_LIST)
+    before = a2a.A2ARailClient(BASE, API_KEY, context_secret="ctx-secret-1")
+    after = a2a.A2ARailClient(BASE, "sk_test_rotated_key_000000", context_secret="ctx-secret-1",
+                              transport=httpx.MockTransport(rail.handler))
+    assert (await _send(after, context=before.context_for(MEMBER, REF))).ok
+
+
+def test_from_env_reads_the_context_secret(monkeypatch):
+    monkeypatch.setenv(a2a.A2A_RAIL_ENABLED_ENV, "1")
+    monkeypatch.setenv(a2a.A2A_RAIL_BASE_URL_ENV, BASE)
+    monkeypatch.setenv(a2a.A2A_RAIL_API_KEY_ENV, API_KEY)
+    monkeypatch.setenv(a2a.A2A_RAIL_CONTEXT_SECRET_ENV, "ctx-secret-1")
+    explicit = a2a.A2ARailClient(BASE, "another-key", context_secret="ctx-secret-1")
+    assert a2a.from_env().context_for(MEMBER, REF) == explicit.context_for(MEMBER, REF)
+
+
+async def test_the_echoed_context_and_task_state_are_validated():
+    body = _task(_card("payment.method-list", {"methods": []}), state=DPAN)
+    body["result"]["contextId"] = "pvt-pp_0001-0123456789abcdef"
+    result = await _send(_client(_Rail(body)))
+    assert result.task_state is None and result.context_id == "pvt-pp_0001-0123456789abcdef"
+    body = _task(_card("payment.method-list", {"methods": []}))
+    body["result"]["contextId"] = "bad id with spaces"
+    assert (await _send(_client(_Rail(body)))).context_id is None
+
+
+async def test_the_token_cache_is_bounded(monkeypatch):
+    monkeypatch.setattr(a2a, "_TOKEN_CACHE_MAX", 2)
+    rail = _Rail(METHOD_LIST, METHOD_LIST, METHOD_LIST)
+    client = _client(rail)
+    for member in ("m1", "m2", "m3"):
+        await _send(client, member=member)
+    assert len(client._tokens) == 2 and "m3" in client._tokens
+
+
+async def test_an_exchange_outlives_a_caller_that_gives_up_and_leaves_nothing_behind():
+    import asyncio
+
+    release = asyncio.Event()
+
+    async def handler(request):
+        if request.url.path == a2a.TOKEN_PATH:
+            await release.wait()
+            return httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
+        return httpx.Response(200, json=METHOD_LIST)
+
+    client = a2a.A2ARailClient(BASE, API_KEY, transport=httpx.MockTransport(handler))
+    impatient = asyncio.ensure_future(client._access_token("m1"))
+    await asyncio.sleep(0)
+    impatient.cancel()
+    patient = asyncio.ensure_future(client._access_token("m1"))
+    await asyncio.sleep(0)
+    release.set()
+    assert await patient == "tok-1"
+    assert client._minting == {} and client._tokens["m1"][0] == "tok-1"
 
 
 @pytest.mark.parametrize("ref", ["", "a-b", "x" * 81, "a\nb"])
 def test_context_refs_are_strict(ref):
     with pytest.raises(ValueError):
-        _client(_Rail()).context_for(ref)
+        _client(_Rail()).context_for(MEMBER, ref)
 
 
 # ── review hardening: a maybe-write without a definite answer ────────────────────────────────
@@ -482,7 +569,20 @@ async def test_a_write_without_a_definite_answer_is_outcome_unknown(answer):
 @pytest.mark.parametrize("status", [400, 403, 404, 409, 422, 429])
 async def test_a_4xx_on_a_write_is_a_definite_refusal(status):
     result = await _send(_client(_Rail(httpx.Response(status))), "payment.token-setup", "submit")
-    assert result.kind == "http_error" and result.http_status == status
+    assert result.kind == "http_error" and result.http_status == status and result.resend_safe
+
+
+@pytest.mark.parametrize("status", [201, 202, 204, 301, 302, 303, 307])
+async def test_a_non_200_success_or_redirect_on_a_write_is_outcome_unknown(status):
+    result = await _send(_client(_Rail(httpx.Response(status))), "payment.token-setup", "submit")
+    assert result.kind == "outcome_unknown" and not result.resend_safe
+
+
+async def test_resend_safety_is_reported_per_result():
+    read = await _send(_client(_Rail(httpx.ReadTimeout("slow"))))
+    text_on_write = await _send(_client(_Rail(EMAIL_QUESTION)), "payment.method-add", "submit")
+    assert read.resend_safe and not read.may_write
+    assert text_on_write.kind == "unexpected_text" and not text_on_write.resend_safe
 
 
 async def test_a_5xx_on_a_read_stays_an_http_error():

@@ -59,6 +59,8 @@ logger = logging.getLogger(__name__)
 A2A_RAIL_ENABLED_ENV = "A2A_RAIL_ENABLED"
 A2A_RAIL_BASE_URL_ENV = "A2A_RAIL_BASE_URL"
 A2A_RAIL_API_KEY_ENV = "A2A_RAIL_API_KEY"
+#: Optional: signs conversation ids. Set it so an API-key rotation does not orphan open flows.
+A2A_RAIL_CONTEXT_SECRET_ENV = "A2A_RAIL_CONTEXT_SECRET"
 _TRUTHY = frozenset({"1", "true", "on", "yes"})
 
 #: SHA-256 of the provider's production and test host names (lower case). The API key is only ever
@@ -119,13 +121,22 @@ _CREDENTIAL_LEAF_KEYS = frozenset({
     "primaryaccountnumber", "accountnumber", "tokenvalue", "cvv", "cvc", "cvv2", "cvc2", "cvn",
     "securitycode", "tavv", "track1", "track2",
 })
-#: 13-19 digits, optionally grouped by single spaces or dashes: a PAN or DPAN in any spelling.
-_CARD_DIGITS_RE = re.compile(r"(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)")
+#: 14-19 digits, optionally grouped by single spaces or dashes, that pass the Luhn check: a PAN or
+#: DPAN in any spelling. The Luhn gate keeps ids and timestamps that merely contain a long digit
+#: run (1 in 56 random 32-hex ids does) from being taken for a card. (13-digit PANs are retired.)
+_CARD_DIGITS_RE = re.compile(r"(?<!\d)\d(?:[ -]?\d){13,18}(?!\d)")
 #: Padded base64 of 15+ bytes: the shape of a cryptogram/TAVV. Not applied to URL strings.
 _BASE64_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{20,}={1,2}")
-#: Keys whose value is an order/charge reference, which may legitimately be 13-19 digits (matched on
-#: the canonical key's ending). Only digits are spared there: the base64 rule still applies.
-_REFERENCE_KEY_SUFFIXES = ("orderno", "ordernumber", "orderid", "tradeno", "chargeno", "reference", "ref")
+#: Exact keys (canonical) whose value is an order/charge reference or a time, where a long digit
+#: run is expected. Only the digit rule is relaxed there, and never for a key that names a card,
+#: token or account (`_CARD_WORDS`).
+_REFERENCE_KEYS = frozenset({
+    "orderno", "ordernumber", "orderid", "orderref", "orderreference", "merchantorderno",
+    "merchantorderid", "merchantorderref", "tradeno", "outtradeno", "chargeno",
+})
+_TIME_KEY_SUFFIXES = ("at", "time", "timestamp", "ms", "date")
+_CARD_WORDS = ("card", "pan", "token", "account", "number", "cvv", "cvc", "crypt", "track", "secret")
+_PURE_DIGITS_RE = re.compile(r"^\d{1,19}\Z")
 #: Past this depth a subtree is dropped (and counted): nothing legitimate nests this deep.
 _MAX_STRIP_DEPTH = 24
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}\Z")
@@ -194,6 +205,11 @@ class Card:
 
 
 _FAILED_TASK_STATES = frozenset({"failed", "rejected", "canceled"})
+#: A2A 0.3 task states. Anything else from the provider is reported as None, not passed upward.
+_TASK_STATES = frozenset({
+    "submitted", "working", "input-required", "completed", "canceled", "failed", "rejected",
+    "auth-required", "unknown",
+})
 
 
 @dataclass
@@ -204,7 +220,8 @@ class A2AResult:
       cards             one or more structured cards (`cards`); `ok` unless the task failed
       error_card        the provider answered with its `error` card (`error_code`, `recoverable`)
       money_result      an answer carried a money-result card; never `ok`, logged at ERROR
-      unexpected_text   free text where a card was expected; fail closed
+      unexpected_text   free text where a card was expected; fail closed (on a maybe-write it is
+                        NOT safe to resend: check `resend_safe`)
       outcome_unknown   a maybe-write did not get a definite answer; read state, never resend
       timeout           a read-only action timed out (safe to retry)
       transport         a read-only action failed to connect (safe to retry)
@@ -223,7 +240,17 @@ class A2AResult:
     recoverable: Optional[bool] = None
     http_status: Optional[int] = None
     credential_fields_stripped: int = 0
+    #: The conversation id the provider answered under (validated), to check it kept ours.
+    context_id: Optional[str] = None
+    #: Whether the action sent may have changed state on the provider's side.
+    may_write: bool = False
     elapsed_s: float = 0.0
+
+    @property
+    def resend_safe(self) -> bool:
+        """True only when sending the same action again cannot do a write twice: a read, or a
+        write the provider definitely refused (a 4xx other than 408, an error card, no token)."""
+        return not self.may_write or self.kind in ("http_error", "error_card", "auth_failed")
 
     @property
     def ok(self) -> bool:
@@ -243,27 +270,47 @@ def _canon(key: Any) -> str:
     return str(key).lower().replace("_", "").replace("-", "").replace(".", "")
 
 
+def _luhn(digits: str) -> bool:
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        n = int(char)
+        if index % 2:
+            n = n * 2 - 9 if n > 4 else n * 2
+        total += n
+    return total % 10 == 0
+
+
+def _has_card_number(text: str) -> bool:
+    return any(_luhn(re.sub(r"[ -]", "", m.group(0))) for m in _CARD_DIGITS_RE.finditer(text))
+
+
 def _is_credential_key(key: Any) -> bool:
     canon = _canon(key)
+    text = str(key)
     return (
         canon in _CREDENTIAL_LEAF_KEYS
         or canon.startswith(_CREDENTIAL_SUBTREE_PREFIXES)
-        or bool(_CARD_DIGITS_RE.search(str(key)))
+        or _has_card_number(text)
+        or bool(_BASE64_BLOB_RE.search(text))
     )
 
 
-def _is_reference_key(key: Any) -> bool:
+def _digits_expected(key: Any) -> bool:
+    """A key whose value may legitimately be a long number: an order reference or a time."""
     canon = _canon(key)
-    return canon.endswith(_REFERENCE_KEY_SUFFIXES) and canon not in _CREDENTIAL_LEAF_KEYS
+    if any(word in canon for word in _CARD_WORDS):
+        return canon in _REFERENCE_KEYS and "card" not in canon and "token" not in canon
+    return canon in _REFERENCE_KEYS or canon.endswith(_TIME_KEY_SUFFIXES)
 
 
-def _strip_string(value: str, *, digits: bool = True) -> Tuple[str, int]:
-    removed = 0
-    if digits and _CARD_DIGITS_RE.search(value):
-        value, removed = _CARD_DIGITS_RE.sub("[REMOVED]", value), removed + 1
+def _strip_string(value: str, *, digits: bool = True) -> Tuple[Optional[str], int]:
+    """The string, or None when it carries a credential. The WHOLE value goes, not a substring:
+    a mangled id would otherwise be sent back to the provider instead of failing loudly."""
+    if digits and _has_card_number(value):
+        return None, 1
     if not value.startswith(("https://", "http://")) and _BASE64_BLOB_RE.search(value):
-        value, removed = _BASE64_BLOB_RE.sub("[REMOVED]", value), removed + 1
-    return value, removed
+        return None, 1
+    return value, 0
 
 
 def _strip_credentials(value: Any, depth: int = 0) -> Tuple[Any, int]:
@@ -277,8 +324,13 @@ def _strip_credentials(value: Any, depth: int = 0) -> Tuple[Any, int]:
             if _is_credential_key(key):
                 removed += 1
                 continue
-            if isinstance(item, str) and _is_reference_key(key):
-                cleaned, count = _strip_string(item, digits=False)
+            if _digits_expected(key) and (
+                isinstance(item, str) or (isinstance(item, int) and not isinstance(item, bool))
+            ):
+                if isinstance(item, int):
+                    out[key] = item
+                    continue
+                cleaned, count = _strip_string(item, digits=not _PURE_DIGITS_RE.match(item))
                 out[key] = cleaned
                 removed += count
                 continue
@@ -296,16 +348,16 @@ def _strip_credentials(value: Any, depth: int = 0) -> Tuple[Any, int]:
         return items, removed
     if isinstance(value, str):
         return _strip_string(value)
-    if isinstance(value, int) and not isinstance(value, bool) and 13 <= len(str(abs(value))) <= 19:
+    if isinstance(value, int) and not isinstance(value, bool) and _has_card_number(str(abs(value))):
         return None, 1
-    if isinstance(value, float) and value.is_integer() and 13 <= len(str(int(abs(value)))) <= 19:
+    if isinstance(value, float) and value.is_integer() and _has_card_number(str(int(abs(value)))):
         return None, 1
     return value, 0
 
 
 def _name(value: Any) -> Optional[str]:
     """A provider-supplied identifier (component, kind, action id), or None if it is not one."""
-    if isinstance(value, str) and _NAME_RE.match(value) and not _CARD_DIGITS_RE.search(value):
+    if isinstance(value, str) and _NAME_RE.match(value) and not _has_card_number(value):
         return value
     return None
 
@@ -347,7 +399,7 @@ def _card_from(data: Mapping[str, Any]) -> Tuple[Card, int]:
     inner = data.get("data") if isinstance(data.get("data"), dict) else {}
     cleaned, removed = _strip_credentials(inner)
     component = _name(data.get("component")) or ""
-    if not component and isinstance(data.get("component"), str) and _CARD_DIGITS_RE.search(data["component"]):
+    if not component and isinstance(data.get("component"), str) and _has_card_number(data["component"]):
         removed += 1
     kind = _name(data.get("kind"))
     return Card(component=component, kind=kind, data=cleaned, actions=actions), removed
@@ -363,7 +415,13 @@ def parse_response(body: Any) -> A2AResult:
     if not isinstance(task, dict) or task.get("kind") != "task":
         return A2AResult(kind="protocol_error")
     status = task.get("status") if isinstance(task.get("status"), dict) else {}
-    result = A2AResult(kind="cards", task_state=status.get("state") if isinstance(status.get("state"), str) else None)
+    state = status.get("state")
+    echoed = task.get("contextId")
+    result = A2AResult(
+        kind="cards",
+        task_state=state if isinstance(state, str) and state in _TASK_STATES else None,
+        context_id=echoed if isinstance(echoed, str) and _CONTEXT_ID_RE.match(echoed) else None,
+    )
     money = False
     for part in _latest_agent_parts(task):
         if part.get("kind") == "data" and isinstance(part.get("data"), dict):
@@ -399,6 +457,7 @@ class A2ARailClient:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         transport: Any = None,
         clock: Callable[[], float] = time.monotonic,
+        context_secret: Optional[str] = None,
     ) -> None:
         self._base = validate_base_url(base_url)
         if not str(api_key or "").strip():
@@ -408,26 +467,34 @@ class A2ARailClient:
         self._transport = transport
         self._clock = clock
         self._tokens: Dict[str, Tuple[str, float]] = {}
-        # One lock per member: a slow exchange for one buyer must not stall every other buyer.
-        self._token_locks: Dict[str, asyncio.Lock] = {}
+        # One in-flight exchange per member: a slow exchange for one buyer stalls only that buyer,
+        # and concurrent calls for the same buyer share it. Entries leave when the exchange ends.
+        self._minting: Dict[str, "asyncio.Future[Optional[str]]"] = {}
+        # Signs conversation ids. Its own secret when configured, so rotating the API key does not
+        # orphan conversations waiting on a buyer; the API key otherwise.
+        secret = str(context_secret or "").strip() or self._api_key
+        self._context_key = secret.encode("utf-8")
 
-    def context_for(self, ref: str) -> str:
-        """The conversation id for one Pivota purchase (`ref`), bound to this client's key.
+    def context_for(self, member_id: str, ref: str) -> str:
+        """The conversation id for one Pivota purchase (`ref`) by one buyer (`member_id`), signed.
 
-        `send_action` accepts only ids made here, so a caller cannot continue a conversation this
-        client did not start (rule 2: some allowed steps are shared with a money flow).
+        `send_action` accepts only ids made here FOR THAT MEMBER, so a caller can neither continue
+        a conversation this client did not start (rule 2: some allowed steps are shared with a
+        money flow) nor continue one buyer's conversation under another buyer's token.
         """
         if not _CONTEXT_REF_RE.match(str(ref or "")):
             raise ValueError("context ref must be 1..80 of [A-Za-z0-9_]")
-        return f"pvt-{ref}-{self._context_sig(ref)}"
+        if not _MEMBER_ID_RE.match(str(member_id or "")):
+            raise ValueError("member_id must be an opaque id of 1..128 safe characters")
+        return f"pvt-{ref}-{self._context_sig(member_id, ref)}"
 
-    def _context_sig(self, ref: str) -> str:
-        digest = hmac.new(self._api_key.encode("utf-8"), f"a2a-context:{ref}".encode("utf-8"), hashlib.sha256)
-        return digest.hexdigest()[:_CONTEXT_SIG_HEX]
+    def _context_sig(self, member_id: str, ref: str) -> str:
+        message = f"a2a-context:{member_id}:{ref}".encode("utf-8")
+        return hmac.new(self._context_key, message, hashlib.sha256).hexdigest()[:_CONTEXT_SIG_HEX]
 
-    def _is_own_context(self, context_id: str) -> bool:
+    def _is_own_context(self, context_id: str, member_id: str) -> bool:
         match = re.fullmatch(r"pvt-([A-Za-z0-9_]{1,80})-([0-9a-f]{%d})" % _CONTEXT_SIG_HEX, context_id)
-        return bool(match) and hmac.compare_digest(match.group(2), self._context_sig(match.group(1)))
+        return bool(match) and hmac.compare_digest(match.group(2), self._context_sig(member_id, match.group(1)))
 
     def _client(self):
         import httpx
@@ -460,38 +527,42 @@ class A2ARailClient:
             return resp.status_code, None, False
 
     async def _access_token(self, member_id: str) -> Optional[str]:
-        lock = self._token_locks.setdefault(member_id, asyncio.Lock())
-        async with lock:
-            cached = self._tokens.get(member_id)
-            if cached and cached[1] - self._clock() > TOKEN_REFRESH_MARGIN_S:
-                return cached[0]
-            try:
-                status, body, too_large = await self._post_json(
-                    TOKEN_PATH, {"api_key": self._api_key, "member_id": member_id}, {}
-                )
-            except Exception as exc:  # noqa: BLE001 - every failure is "no token", logged by type only
-                logger.warning("a2a_rail: token exchange failed error_type=%s", type(exc).__name__)
-                return None
-            token = body.get("access_token") if isinstance(body, dict) else None
-            if status != 200 or too_large or not isinstance(token, str) or not token:
-                logger.warning("a2a_rail: token exchange refused http_status=%s", status)
-                return None
-            try:
-                expires_in = float(body.get("expires_in") or 0)
-            except (TypeError, ValueError):
-                expires_in = 0.0
-            now = self._clock()
-            if len(self._tokens) >= _TOKEN_CACHE_MAX:
-                # Bounded: drop expired entries, then the soonest-expiring, never the one being set.
-                for stale in [m for m, (_, exp) in self._tokens.items() if exp <= now]:
-                    self._tokens.pop(stale, None)
-                while len(self._tokens) >= _TOKEN_CACHE_MAX:
-                    self._tokens.pop(min(self._tokens, key=lambda m: self._tokens[m][1]), None)
-                for idle in [m for m, lk in self._token_locks.items()
-                             if m not in self._tokens and m != member_id and not lk.locked()]:
-                    self._token_locks.pop(idle, None)
-            self._tokens[member_id] = (token, now + max(0.0, expires_in))
-            return token
+        cached = self._tokens.get(member_id)
+        if cached and cached[1] - self._clock() > TOKEN_REFRESH_MARGIN_S:
+            return cached[0]
+        pending = self._minting.get(member_id)
+        if pending is None:
+            pending = asyncio.ensure_future(self._mint(member_id))
+            self._minting[member_id] = pending
+            pending.add_done_callback(lambda _f, m=member_id: self._minting.pop(m, None))
+        # Shielded: a caller that gives up does not cancel the exchange others are waiting on.
+        return await asyncio.shield(pending)
+
+    async def _mint(self, member_id: str) -> Optional[str]:
+        try:
+            status, body, too_large = await self._post_json(
+                TOKEN_PATH, {"api_key": self._api_key, "member_id": member_id}, {}
+            )
+        except Exception as exc:  # noqa: BLE001 - every failure is "no token", logged by type only
+            logger.warning("a2a_rail: token exchange failed error_type=%s", type(exc).__name__)
+            return None
+        token = body.get("access_token") if isinstance(body, dict) else None
+        if status != 200 or too_large or not isinstance(token, str) or not token:
+            logger.warning("a2a_rail: token exchange refused http_status=%s", status)
+            return None
+        try:
+            expires_in = float(body.get("expires_in") or 0)
+        except (TypeError, ValueError):
+            expires_in = 0.0
+        now = self._clock()
+        if len(self._tokens) >= _TOKEN_CACHE_MAX:
+            # Bounded: drop expired entries, then the soonest-expiring, never the one being set.
+            for stale in [m for m, (_, exp) in self._tokens.items() if exp <= now]:
+                self._tokens.pop(stale, None)
+            while len(self._tokens) >= _TOKEN_CACHE_MAX:
+                self._tokens.pop(min(self._tokens, key=lambda m: self._tokens[m][1]), None)
+        self._tokens[member_id] = (token, now + max(0.0, expires_in))
+        return token
 
     async def send_action(
         self,
@@ -509,8 +580,8 @@ class A2ARailClient:
             raise ValueError("member_id must be an opaque id of 1..128 safe characters")
         if not _CONTEXT_ID_RE.match(str(context_id or "")):
             raise ValueError("context_id must be 1..128 safe characters")
-        if not self._is_own_context(context_id):
-            raise ValueError("context_id was not made by this client's context_for()")
+        if not self._is_own_context(context_id, member_id):
+            raise ValueError("context_id was not made by this client's context_for() for this member")
         body = {
             "jsonrpc": "2.0",
             "id": str(uuid.uuid4()),
@@ -556,8 +627,10 @@ class A2ARailClient:
             kind = "outcome_unknown" if may_write else "too_large"
             return self._done(A2AResult(kind=kind, http_status=status), component, action, started)
         if status != 200:
-            # A 5xx or 408 does not prove a write was refused; any other 4xx does.
-            kind = "outcome_unknown" if may_write and (status >= 500 or status == 408) else "http_error"
+            # Only a 4xx (other than 408) proves a write was refused. A 5xx, a 408, a 202 or a 3xx
+            # does not: on a maybe-write those are outcome_unknown.
+            refused = 400 <= status < 500 and status != 408
+            kind = "outcome_unknown" if may_write and not refused else "http_error"
             return self._done(A2AResult(kind=kind, http_status=status), component, action, started)
         result = parse_response(parsed)
         result.http_status = status
@@ -566,6 +639,7 @@ class A2ARailClient:
         return self._done(result, component, action, started)
 
     def _done(self, result: A2AResult, component: str, action: str, started: float) -> A2AResult:
+        result.may_write = (component, action) not in READ_ONLY_ACTIONS
         result.elapsed_s = round(self._clock() - started, 3)
         logger.info(
             "a2a_rail: action=%s#%s kind=%s cards=%s http_status=%s stripped=%s elapsed_s=%s",
@@ -589,6 +663,7 @@ def from_env(**kwargs: Any) -> Optional[A2ARailClient]:
     """The configured client, or None while the dial is off. A set but invalid config raises."""
     if not is_enabled():
         return None
+    kwargs.setdefault("context_secret", os.getenv(A2A_RAIL_CONTEXT_SECRET_ENV) or None)
     return A2ARailClient(
         os.getenv(A2A_RAIL_BASE_URL_ENV) or "",
         os.getenv(A2A_RAIL_API_KEY_ENV) or "",

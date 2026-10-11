@@ -43,11 +43,14 @@ def _key() -> str:
 async def test_the_live_card_list_parses_into_the_documented_card():
     client = a2a.A2ARailClient(_env("A2A_RAIL_SANDBOX_BASE_URL"), _key())
     member = os.getenv("A2A_RAIL_SANDBOX_MEMBER") or "pivota-sandbox-buyer-1"
+    context = client.context_for(member, f"contract_{uuid.uuid4().hex[:12]}")
     result = await client.send_action(
-        member_id=member, context_id=client.context_for(f"contract_{uuid.uuid4().hex[:12]}"),
+        member_id=member, context_id=context,
         component="payment.method-view", action="submit", payload={"list_statuses": "ACTIVE"},
     )
     assert result.ok, (result.kind, result.http_status, result.error_code)
+    # The whole conversation-signing scheme assumes the provider keeps OUR id: prove it.
+    assert result.context_id == context
     card = result.card("payment.method-list")
     assert card is not None, [c.component for c in result.cards]
     assert set(card.action_ids()) >= {"select-method", "add-method"}
