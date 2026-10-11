@@ -327,16 +327,22 @@ def plan_elections(
     return planned
 
 
-def candidates_query(*, widen: Optional[bool] = None):
+def candidates_query(
+    *, widen: Optional[bool] = None, content_keys: Optional[Sequence[str]] = None
+):
     """SELECT (content_key, pivota_signature_id) for every advertisable row.
 
     Uses ``sitemap_electable_filter`` — the SAME eligibility + renderability
     the feed publishes — so the elector cannot crown a sig the feed will never
     emit. See services/canonical_sitemap_candidates for why that sharing is the
     load-bearing part.
+
+    ``content_keys`` narrows it to those keys with the SAME predicate, for a caller
+    that asks what the sweep would elect for a few keys (the brand-key retire's
+    canonical handover, scripts/retire_superseded_brand_keys.py).
     """
     effective_widen = sitemap_widen_enabled() if widen is None else widen
-    return (
+    query = (
         select(
             catalog_products.c.content_key,
             catalog_products.c.pivota_signature_id,
@@ -361,6 +367,9 @@ def candidates_query(*, widen: Optional[bool] = None):
             catalog_products.c.pivota_signature_id.asc(),
         )
     )
+    if content_keys is not None:
+        query = query.where(catalog_products.c.content_key.in_(list(content_keys)))
+    return query
 
 
 # The step-5 keeper for every content_key that has one, as a SIG.
@@ -374,10 +383,7 @@ def candidates_query(*, widen: Optional[bool] = None):
 # DISTINCT because a group can hold several tombstones (up to 6 in prod) all
 # naming the same keeper; ordering by sig makes a group whose tombstones somehow
 # disagree resolve deterministically rather than by scan order.
-KEEPER_SIGS_SQL = """
-SELECT DISTINCT ON (loser.content_key)
-       loser.content_key,
-       keeper.pivota_signature_id AS keeper_sig_id
+_KEEPER_JOIN_SQL = """
 FROM catalog_products loser
 JOIN catalog_products keeper
   ON keeper.product_key = loser.suppression_metadata->>'keeper_product_key'
@@ -386,7 +392,53 @@ JOIN catalog_products keeper
  AND keeper.pivota_signature_id IS NOT NULL
 WHERE loser.suppression_reason IS NOT NULL
   AND loser.content_key IS NOT NULL
+"""
+
+KEEPER_SIGS_SQL = """
+SELECT DISTINCT ON (loser.content_key)
+       loser.content_key,
+       keeper.pivota_signature_id AS keeper_sig_id""" + _KEEPER_JOIN_SQL + """\
 ORDER BY loser.content_key, keeper.pivota_signature_id
+"""
+
+# EVERY live keeper sig of the given content_keys, not just the one the DISTINCT ON
+# above keeps. Same join, so the two cannot disagree about who is a keeper. Used to
+# predict the keeper KEEPER_SIGS_SQL will compute after one keeper is tombstoned
+# (see :func:`keeper_after_retire`).
+KEEPER_SIGS_FOR_CONTENT_KEYS_SQL = """
+SELECT DISTINCT loser.content_key,
+       keeper.pivota_signature_id AS keeper_sig_id""" + _KEEPER_JOIN_SQL + """\
+  AND loser.content_key = ANY(:content_keys)
+"""
+
+
+def keeper_after_retire(
+    live_keeper_sigs: Iterable[str], *, retired_sig: str, successor_sig: str
+) -> str:
+    """The keeper KEEPER_SIGS_SQL will return once the keeper row ``retired_sig`` is
+    tombstoned with ``keeper_product_key`` naming the row of ``successor_sig``.
+
+    The tombstoned row stops being a keeper (the join requires the keeper to be
+    unsuppressed), and its own tombstone makes the successor one. Among what is
+    left, KEEPER_SIGS_SQL's ``ORDER BY ... keeper.pivota_signature_id`` keeps the
+    lowest sig, so this does too.
+    """
+    pool = {s for s in live_keeper_sigs if s and s != retired_sig}
+    pool.add(successor_sig)
+    return min(pool)
+
+
+# The brand-key retire's canonical handover (scripts/retire_superseded_brand_keys.py):
+# move ONE content_key's URL from the sig the retire is tombstoning to its successor,
+# inside the retire's transaction, and back again on its revert. Guarded on the sig
+# it replaces, so a winner that moved since the plan was read is never overwritten:
+# RETURNING says whether it landed (`databases` reports no rowcount on asyncpg).
+# `elected_at` is left alone, as the sweep's own upsert leaves it.
+HANDOVER_ELECTION_SQL = """
+UPDATE content_canonical_election
+SET canonical_sig_id = :to_sig, election_reason = :election_reason, updated_at = NOW()
+WHERE content_key = :content_key AND canonical_sig_id = :from_sig
+RETURNING content_key
 """
 
 

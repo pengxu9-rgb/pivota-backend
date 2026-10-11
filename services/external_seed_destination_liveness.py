@@ -411,9 +411,11 @@ async def record_destination_observation(
 
     And one action (services/destination_dead_suppression): with `suppress=True` (the sweep) and
     PENDING_SUPPRESSION_FLAG on, a corroborated confirmed-dead observation that leaves the streak at
-    1 hides the mirror under PENDING_SUPPRESSION_REASON; any non-dead answer that resets a streak
-    lifts exactly that reason, switch or no switch. The refresh route never passes `suppress`,
-    and its observations are never corroborated anyway.
+    1 hides the mirror under PENDING_SUPPRESSION_REASON; any non-dead answer from the origin lifts
+    exactly that reason, switch or no switch, WHATEVER THE STREAK WAS. The reset and the lift are
+    separate statements: gating the lift on the pre-observation streak meant a lift that failed
+    after its reset committed left the row hidden at streak 0 with nothing left to lift it. The
+    refresh route never passes `suppress`, and its observations are never corroborated anyway.
     """
     stamp = now or _now()
 
@@ -429,7 +431,6 @@ async def record_destination_observation(
     if not row:
         return {"seed_id": seed_id, "status": "missing"}
     current = dict(row)
-    streak = int(current.get("destination_failure_streak") or 0)
     next_streak, next_corroborated_dead_at = next_streak_state(current, observation, stamp)
 
     await database.execute(
@@ -472,7 +473,9 @@ async def record_destination_observation(
     }
     # THE PENDING STEP. Hide on a corroborated confirmed-dead observation that leaves the streak
     # at 1 or more (retirement itself handles 2); lift on any answer from the origin that the
-    # page is alive, when there was a streak for a pending row to have come from.
+    # page is alive. NOT gated on the streak this observation reset: the reset above has already
+    # committed, so a lift that failed last time must be retried by the next live answer, which
+    # sees streak 0. The lift is scoped to our pending reason, so on any other row it moves nothing.
     if (
         suppress
         and not retire
@@ -486,7 +489,7 @@ async def record_destination_observation(
             db=database,  # the SAME handle as the observation write, as retirement does
         )
         result["pending_suppressed"] = len(moved["products"])
-    elif observation.reached_origin and not observation.confirmed_dead and streak > 0:
+    elif observation.reached_origin and not observation.confirmed_dead:
         moved = await destination_dead_suppression.lift_pending(
             await _mirror_product_keys(seed_id), reason=PENDING_SUPPRESSION_REASON, db=database,
         )

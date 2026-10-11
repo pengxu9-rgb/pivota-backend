@@ -1050,15 +1050,32 @@ def test_a_live_answer_after_a_streak_lifts_the_pending_reason_switch_or_no_swit
     assert result["pending_lifted"] == 1
 
 
+def test_a_live_answer_at_streak_0_still_lifts_a_pending_row(monkeypatch):
+    """The reset and the lift are separate statements. If the lift failed after the reset
+    committed, the row sits pending at streak 0; gating the lift on the streak it reset would
+    leave it hidden forever. The next live answer must retry it."""
+    monkeypatch.delenv(liveness.PENDING_SUPPRESSION_FLAG, raising=False)
+    row = {"destination_checked_at": NOW - timedelta(hours=3), "destination_corroborated_dead_at": None,
+           "destination_verdict": liveness.VERDICT_LIVE, "destination_failure_streak": 0,
+           "status": "active"}
+    db = _FakeDb(row)
+    monkeypatch.setattr(liveness, "database", db)
+    result = _run(liveness.record_destination_observation(
+        "eps_1", liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), now=NOW))
+    lift = _statements(db, "UPDATE catalog_products SET suppressed_at = NULL")
+    assert len(lift) == 1 and lift[0][1]["reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert result["failure_streak"] == 0 and result["pending_lifted"] == 1
+
+
 @pytest.mark.parametrize(
     "observation, streak",
     [
-        (liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), 0),  # nothing to lift
         (liveness.DestinationObservation(liveness.VERDICT_UNVERIFIABLE, 429, None, "bot_challenge"), 1),
+        (liveness.DestinationObservation(liveness.VERDICT_UNVERIFIABLE, 429, None, "bot_challenge"), 0),
         (_REFRESH_DEAD, 1),
     ],
 )
-def test_no_lift_without_a_streak_or_without_an_answer_that_the_page_is_alive(monkeypatch, observation, streak):
+def test_no_lift_without_an_answer_that_the_page_is_alive(monkeypatch, observation, streak):
     row = {"destination_checked_at": NOW - timedelta(hours=3), "destination_corroborated_dead_at": None,
            "destination_verdict": liveness.VERDICT_DEAD_404, "destination_failure_streak": streak,
            "status": "active"}

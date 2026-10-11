@@ -446,8 +446,9 @@ def test_the_capture_is_brand_stores_only(role):
 
 
 @pytest.mark.parametrize("market", ["AU", "JP"])
-def test_the_capture_writes_the_us_market_only(market):
-    with pytest.raises(ValueError, match="shopify_markets captures the US market only"):
+def test_the_capture_writes_a_served_market_only(market):
+    # US only until 2026-10-10; SG since (tests/services/test_retailer_ingest_markets_sg.py).
+    with pytest.raises(ValueError, match="shopify_markets captures the US and SG markets only"):
         pipeline.validate_options({"vendors": [BRAND], "source": "shopify_markets", "source_role": "brand_official",
                                    "market": market})
 
@@ -493,15 +494,20 @@ class Store:
             self.carts += 1
             if self.loses_session_after is not None and self.carts > self.loses_session_after:
                 us = False
-            return httpx.Response(200, json={"currency": "USD" if us else self.meta["currency"], "item_count": 0})
+            # Shopify types /cart.js text/javascript (2026-10-11), like /products/<handle>.js below.
+            return httpx.Response(200, content=json.dumps({"currency": "USD" if us else self.meta["currency"], "item_count": 0}).encode(),
+                                  headers={"content-type": "text/javascript; charset=utf-8"})
         if path.startswith("/products/") and path.endswith(".js"):
             handle = path[len("/products/"):-3]
             if handle not in HANDLE_VARIANTS:
                 return httpx.Response(404, text="not found", headers={"content-type": "text/html"})
             cents = USD_CENTS if us else AUD_CENTS
-            return httpx.Response(200, json={
+            # As Shopify serves it: a JSON body typed text/javascript (2026-10-11: the application/json this fake
+            # used to send is not what a storefront sends, and it hid a refusal of every real capture).
+            return httpx.Response(200, content=json.dumps({
                 "id": 1, "handle": handle, "price": min(cents[v] for v in HANDLE_VARIANTS[handle]),
-                "variants": [{"id": v, "price": cents[v], "available": v != 44101000000002} for v in HANDLE_VARIANTS[handle]]})
+                "variants": [{"id": v, "price": cents[v], "available": v != 44101000000002} for v in HANDLE_VARIANTS[handle]]}).encode(),
+                headers={"content-type": "text/javascript; charset=utf-8"})
         return httpx.Response(404)
 
     def paths(self):
@@ -939,7 +945,7 @@ class SqliteCatalog:
             CREATE TABLE external_product_seeds (id text PRIMARY KEY, market text, price_currency text,
                 attached_product_key text);
         """)
-        self.republished = []
+        self.republished, self.republish_sources = [], []
 
     def load_plan(self, plan):
         for p in plan["pdps"]:
@@ -1081,8 +1087,9 @@ def two_jobs(env, monkeypatch, gates_on):  # noqa: F811
             "products": [{"product_key": p["product_key"], "canonical_url": p["canonical_url"]} for p in plan["pdps"]]}}}
     monkeypatch.setattr(pi, "require_primary_apply", require_apply)
 
-    async def republish(content_keys, *, db):
+    async def republish(content_keys, *, db, source_system=markets.SOURCE_SYSTEM):
         catalog.republished.extend(content_keys)
+        catalog.republish_sources.append(source_system)
         return []
     monkeypatch.setattr(markets, "republish", republish)
     store = Store()
