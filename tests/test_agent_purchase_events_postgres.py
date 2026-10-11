@@ -150,3 +150,26 @@ async def test_the_candidate_read_skips_dead_pages_and_keys_the_window_on_state_
     fresh = await purchase("completed", ", updated_at = now() - interval '3 days'")
     got = {row["id"] for row in await events_db.reap_candidates(lookback_hours=24)}
     assert got == {live, fresh}
+
+
+async def test_a_no_action_skip_is_rechecked_and_upgraded_in_place_and_others_are_final():
+    from db.database import database
+    import db.agent_purchase_events as events_db
+
+    pp = "pp_" + "c" * 24
+    kw = dict(purchase_id=pp, agent_id="agent_pg", rail="reap", rail_state="awaiting_approval",
+              unified_state="awaiting_buyer_authorization", event_type="purchase.action_required")
+    first = await events_db.record_event(**kw, payload={}, skip_reason="no_action")
+    second = await events_db.record_event(**kw, payload={"next_action": {"url": "u"}})
+    row = await database.fetch_one("SELECT * FROM agent_purchase_events WHERE purchase_id = :p", {"p": pp})
+    assert first == second == row["event_id"]
+    assert (row["status"], row["skip_reason"]) == ("pending", None)
+    # a final skip is never overwritten
+    other = "pp_" + "d" * 24
+    kw2 = {**kw, "purchase_id": other}
+    await events_db.record_event(**kw2, payload={}, skip_reason="not_found")
+    await events_db.record_event(**kw2, payload={"x": 1})
+    row = await database.fetch_one("SELECT * FROM agent_purchase_events WHERE purchase_id = :p", {"p": other})
+    assert (row["status"], row["skip_reason"]) == ("skipped", "not_found")
+    # the candidate read's recheck window compiles and runs on Postgres
+    assert isinstance(await events_db.reap_candidates(lookback_hours=24), list)

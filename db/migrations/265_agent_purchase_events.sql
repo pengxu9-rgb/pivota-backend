@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS agent_purchase_events (
     delivery_status VARCHAR(32),
     skip_reason VARCHAR(64),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    handed_over_at TIMESTAMPTZ
+    handed_over_at TIMESTAMPTZ,
+    checked_at TIMESTAMPTZ
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_purchase_events_purchase_state

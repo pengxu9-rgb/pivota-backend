@@ -309,15 +309,31 @@ async def test_an_owner_mismatch_is_recorded_skipped_once(monkeypatch):
     [row] = await _events()
     assert (row["status"], row["skip_reason"], row["agent_id"]) == ("skipped", "not_found", "agent_other")
     assert (await purchase_events.detect()) == {}
+    await database.execute("UPDATE agent_purchase_events SET checked_at = datetime('now', '-600 seconds')")
+    assert (await purchase_events.detect()) == {}  # final: only no_action is re-checked
 
 
-async def test_a_page_the_view_refuses_is_recorded_skipped_once():
-    await _purchase("awaiting_approval", hosted_url="https://evil.example/approve", hosted_url_expires_at=FUTURE,
-                    reap_quote_expires_at=FUTURE)
+async def test_a_page_the_view_refuses_is_skipped_and_rechecked_not_lost():
+    pp = await _purchase("awaiting_approval", hosted_url="https://evil.example/approve",
+                         hosted_url_expires_at=FUTURE, reap_quote_expires_at=FUTURE)
     assert (await purchase_events.detect()) == {"no_action": 1}
     [row] = await _events()
     assert (row["status"], row["skip_reason"]) == ("skipped", "no_action")
-    assert (await purchase_events.detect()) == {}
+    first_id = row["event_id"]
+    assert (await purchase_events.detect()) == {}  # not re-read every tick
+    age = "UPDATE agent_purchase_events SET checked_at = datetime('now', '-600 seconds')"
+    await database.execute(age)
+    assert (await purchase_events.detect()) == {"no_action": 1}  # re-checked, still refused
+    [row] = await _events()
+    assert row["status"] == "skipped" and row["event_id"] == first_id
+    # the rail re-publishes a good page in the SAME state: the event now goes out
+    rp = (await database.fetch_one("SELECT rail_purchase_id FROM agent_purchases WHERE id = :p", {"p": pp}))[0]
+    await database.execute("UPDATE reap_agentic_purchases SET hosted_url = :u WHERE id = :i", {"u": URL, "i": rp})
+    await database.execute(age)
+    assert (await purchase_events.detect()) == {"recorded": 1}
+    [row] = await _events()
+    assert (row["status"], row["skip_reason"], row["event_id"]) == ("pending", None, first_id)
+    assert row["event_type"] == "purchase.action_required" and row["payload"]["next_action"]["url"] == URL
 
 
 async def test_pages_that_are_missing_or_dead_never_crowd_newer_purchases_out():
@@ -435,11 +451,63 @@ async def test_a_cancelled_tick_gives_back_every_untried_claim(monkeypatch, deli
 async def test_hand_over_starts_no_new_round_after_its_budget(monkeypatch, delivery_on):
     for i in range(12):
         await _record(purchase_id=f"pp_{i}")
-    monkeypatch.setattr(webhooks, "emit_agent_webhook_event", _Recorder())
-    ticks = iter([0.0, 0.0, 999.0, 999.0])
-    counts = await purchase_events.hand_over(worker="w1", budget_seconds=150, clock=lambda: next(ticks))
-    assert counts == {"handed_over": purchase_events.HAND_OVER_BATCH}
-    assert len(await events_db.claim_pending(worker="w2")) == 12 - purchase_events.HAND_OVER_BATCH
+    recorder = _Recorder()
+    monkeypatch.setattr(webhooks, "emit_agent_webhook_event", recorder)
+    now = [0.0]
+    # the budget runs out after the third send: the rest of the round goes back untried
+    original = recorder.__call__
+
+    async def timed(*a, **k):
+        result = await original(*a, **k)
+        if len(recorder.calls) == 3:
+            now[0] = 999.0
+        return result
+
+    monkeypatch.setattr(webhooks, "emit_agent_webhook_event", timed)
+    counts = await purchase_events.hand_over(worker="w1", budget_seconds=150, clock=lambda: now[0])
+    assert counts == {"handed_over": 3}
+    rows = await _events()
+    assert sum(r["status"] == "pending" and r["claimed_by"] is None and r["attempts"] == 0 for r in rows) == 9
+    assert len(await events_db.claim_pending(worker="w2")) == 9
+
+
+async def test_a_send_that_hangs_is_cut_and_counted(monkeypatch, delivery_on):
+    import asyncio
+
+    await _record()
+
+    async def hang(*a, **k):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(webhooks, "emit_agent_webhook_event", hang)
+    monkeypatch.setattr(purchase_events, "HAND_OVER_SEND_TIMEOUT_SECONDS", 0.05)
+    started = asyncio.get_running_loop().time()
+    assert (await purchase_events.hand_over(worker="w1")) == {"released": 1}
+    assert asyncio.get_running_loop().time() - started < 5
+    [row] = await _events()
+    assert (row["status"], row["attempts"], row["claimed_by"]) == ("pending", 1, None)
+
+
+async def test_a_cancel_during_the_claim_gives_back_what_was_claimed(monkeypatch, delivery_on):
+    import asyncio
+
+    for i in range(3):
+        await _record(purchase_id=f"pp_{i}")
+    real = events_db.database.fetch_one
+    calls = [0]
+
+    async def fetch_one(query, values=None):
+        if "SET claimed_by" in str(query):
+            calls[0] += 1
+            if calls[0] == 3:
+                raise asyncio.CancelledError()
+        return await real(query, values)
+
+    monkeypatch.setattr(events_db.database, "fetch_one", fetch_one)
+    with pytest.raises(asyncio.CancelledError):
+        await purchase_events.hand_over(worker="w1")
+    monkeypatch.setattr(events_db.database, "fetch_one", real)
+    assert all(r["claimed_by"] is None for r in await _events())
 
 
 # ── the job and the sender's event id ────────────────────────────────────────────────────────
@@ -515,3 +583,34 @@ async def test_a_purchase_that_moved_between_reads_is_recorded_on_a_later_run(mo
     assert await _events() == []
     monkeypatch.setattr(purchase_view, "unified_purchase", real)
     assert (await purchase_events.detect()).get("recorded") == 1
+
+
+async def test_only_a_no_action_skip_is_ever_overwritten():
+    kw = dict(agent_id=AGENT, rail="reap", rail_state="awaiting_approval",
+              unified_state="awaiting_buyer_authorization", event_type="purchase.action_required")
+    for reason in ("not_found", "state_unmapped"):
+        await events_db.record_event(purchase_id=f"pp_{reason}", **kw, payload={}, skip_reason=reason)
+        await events_db.record_event(purchase_id=f"pp_{reason}", **kw, payload={"x": 1})
+    await events_db.record_event(purchase_id="pp_sent", **kw, payload={"x": 1})
+    await events_db.record_event(purchase_id="pp_sent", **kw, payload={"x": 2}, skip_reason="no_action")
+    rows = {r["purchase_id"]: r for r in await _events()}
+    assert rows["pp_not_found"]["skip_reason"] == "not_found"
+    assert rows["pp_state_unmapped"]["skip_reason"] == "state_unmapped"
+    assert (rows["pp_sent"]["status"], rows["pp_sent"]["payload"]) == ("pending", {"x": 1})
+
+
+async def test_one_failing_candidate_does_not_stall_the_rest(monkeypatch):
+    bad = await _purchase("completed", reap_order_id="ord_bad")
+    good = await _purchase("completed", reap_order_id="ord_good")
+    real = purchase_view.unified_purchase
+
+    async def flaky(parent, **kwargs):
+        if parent["id"] == bad:
+            raise RuntimeError("view read failed")
+        return await real(parent, **kwargs)
+
+    monkeypatch.setattr(purchase_view, "unified_purchase", flaky)
+    assert (await purchase_events.detect()) == {"error": 1, "recorded": 1}
+    assert [e["purchase_id"] for e in await _events()] == [good]
+    monkeypatch.setattr(purchase_view, "unified_purchase", real)
+    assert (await purchase_events.detect()) == {"recorded": 1}  # nothing was written for it: retried

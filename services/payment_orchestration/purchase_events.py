@@ -59,42 +59,50 @@ async def detect(*, lookback_hours: int = 24, limit: int = 200) -> Dict[str, int
     """Write one event per (purchase, rail state) that warrants one. Returns counts by outcome."""
     counts: Counter = Counter()
     for parent in await events_db.reap_candidates(lookback_hours=lookback_hours, limit=limit):
-        rail_state = parent["rail_state"]
-        state = unified_state(parent["rail"], rail_state)
-        event_type = EVENT_FOR_STATE.get(state or "")
-        if event_type is None:
-            counts["no_event_for_state"] += 1
-            continue
-        body, problem = await purchase_view.unified_purchase(
-            parent, agent_id=parent["agent_id"], agent_user_ref_hash=parent["agent_user_ref_hash"]
-        )
-        if problem:
-            # Permanent for this (purchase, state): the owner does not match, or the state has no
-            # mapping. A skipped row records that, and keeps the purchase out of the next tick's
-            # candidates instead of re-reading it (and crowding newer ones out) every 30 s.
-            await _record_skip(parent, rail_state, state, event_type, problem)
-            counts[problem] += 1
-            continue
-        if body.get("rail_state") != rail_state:
-            # The purchase moved between the candidate read and the view read. The next run sees
-            # the new state; an event must describe the state it is keyed on.
-            counts["moved"] += 1
-            continue
-        if event_type == "purchase.action_required" and "next_action" not in body:
-            # The candidate read only offers action states whose page is attached and live, so the
-            # view refusing it here means the page failed re-vetting or died in between: telling
-            # the agent "act" with nowhere to send the buyer helps nobody, and it will not change
-            # in this state. Recorded as skipped; a new state is a new candidate.
-            await _record_skip(parent, rail_state, state, event_type, "no_action")
-            counts["no_action"] += 1
-            continue
-        await events_db.record_event(
-            purchase_id=parent["id"], agent_id=parent["agent_id"], rail=parent["rail"],
-            rail_state=rail_state, unified_state=state, event_type=event_type,
-            payload=_json_ready(body),
-        )
-        counts["recorded"] += 1
+        try:
+            outcome = await _detect_one(parent)
+        except Exception as exc:  # noqa: BLE001 - one bad row must not stall every row after it
+            logger.warning("agent_purchase_events: detect failed purchase=%s error_type=%s",
+                           parent.get("id"), type(exc).__name__)
+            outcome = "error"
+        counts[outcome] += 1
     return dict(counts)
+
+
+async def _detect_one(parent: Dict[str, Any]) -> str:
+    """Judge one candidate and write what it yields. Returns the outcome to count."""
+    rail_state = parent["rail_state"]
+    state = unified_state(parent["rail"], rail_state)
+    event_type = EVENT_FOR_STATE.get(state or "")
+    if event_type is None:
+        return "no_event_for_state"
+    body, problem = await purchase_view.unified_purchase(
+        parent, agent_id=parent["agent_id"], agent_user_ref_hash=parent["agent_user_ref_hash"]
+    )
+    if problem:
+        # Permanent for this (purchase, state): the owner does not match, or the state has no
+        # mapping. A skipped row records that, and keeps the purchase out of the next tick's
+        # candidates instead of re-reading it (and crowding newer ones out) every 30 s.
+        await _record_skip(parent, rail_state, state, event_type, problem)
+        return problem
+    if body.get("rail_state") != rail_state:
+        # The purchase moved between the candidate read and the view read. The next run sees
+        # the new state; an event must describe the state it is keyed on.
+        return "moved"
+    if event_type == "purchase.action_required" and "next_action" not in body:
+        # The candidate read only offers action states whose page is attached and live, so the
+        # view refusing it here means the page failed re-vetting (an enrollment-side check)
+        # or died in between. Telling the agent "act" with nowhere to send the buyer helps
+        # nobody. Recorded as skipped `no_action`, which is re-checked every few minutes: the
+        # rail can re-publish the page in this same state, and then the event goes out.
+        await _record_skip(parent, rail_state, state, event_type, "no_action")
+        return "no_action"
+    await events_db.record_event(
+        purchase_id=parent["id"], agent_id=parent["agent_id"], rail=parent["rail"],
+        rail_state=rail_state, unified_state=state, event_type=event_type,
+        payload=_json_ready(body),
+    )
+    return "recorded"
 
 
 async def _record_skip(parent: Dict[str, Any], rail_state: str, state: Any, event_type: str, reason: str) -> None:
@@ -107,9 +115,12 @@ async def _record_skip(parent: Dict[str, Any], rail_state: str, state: Any, even
 
 #: Claimed per round. Small, so a tick cut short strands few claims (and those are released).
 HAND_OVER_BATCH = 10
-#: No new round starts after this long. One POST is bounded by the sender's own 10 s timeout, so a
-#: tick ends within this + 10 s + detect, inside the scheduler's 300 s deadline.
+#: No new event is started after this long; a tick then ends within this + one send + detect.
 HAND_OVER_BUDGET_SECONDS = 150.0
+#: One hand-over is cut after this long (the sender's httpx timeout is per phase, not per call).
+#: A cut send counts as a failed attempt; if it had reached the receiver, the re-send carries the
+#: same event id, which receivers de-duplicate on.
+HAND_OVER_SEND_TIMEOUT_SECONDS = 45.0
 
 
 async def hand_over(
@@ -132,15 +143,20 @@ async def hand_over(
     deadline = clock() + max(0.0, float(budget_seconds))
     done = 0
     while done < limit and clock() < deadline:
-        batch = await events_db.claim_pending(
-            worker=worker, limit=min(HAND_OVER_BATCH, limit - done), lease_seconds=lease_seconds
-        )
-        if not batch:
-            break
-        unfinished = list(batch)
+        unfinished: list = []
         stop = False
         try:
+            # Claimed rows land in `unfinished` one by one, so a cancel even mid-claim releases them.
+            await events_db.claim_pending(
+                worker=worker, limit=min(HAND_OVER_BATCH, limit - done), lease_seconds=lease_seconds,
+                sink=unfinished,
+            )
+            if not unfinished:
+                break
             while unfinished:
+                if clock() >= deadline:
+                    stop = True  # budget spent: the rest of this round goes back untried
+                    break
                 outcome = await _hand_one(unfinished[0], worker=worker, max_attempts=max_attempts)
                 unfinished.pop(0)
                 counts[outcome] += 1
@@ -171,11 +187,14 @@ async def _hand_one(event: Dict[str, Any], *, worker: str, max_attempts: int) ->
     from services import agent_webhook_service
 
     try:
-        result = await agent_webhook_service.emit_agent_webhook_event(
-            event["agent_id"], event_type=event["event_type"], payload=event["payload"],
-            event_id=event["event_id"],
+        result = await asyncio.wait_for(
+            agent_webhook_service.emit_agent_webhook_event(
+                event["agent_id"], event_type=event["event_type"], payload=event["payload"],
+                event_id=event["event_id"],
+            ),
+            HAND_OVER_SEND_TIMEOUT_SECONDS,
         )
-    except Exception as exc:  # noqa: BLE001 - release and retry later, never drop
+    except Exception as exc:  # noqa: BLE001 - release and retry later, never drop (timeouts included)
         status = await events_db.release(event["event_id"], worker=worker, max_attempts=max_attempts)
         logger.warning(
             "agent_purchase_events: hand-over failed event=%s error_type=%s now=%s",
@@ -196,7 +215,11 @@ async def _hand_one(event: Dict[str, Any], *, worker: str, max_attempts: int) ->
         await events_db.finish(event["event_id"], worker=worker, status="skipped",
                                skip_reason=str(result.get("reason") or "skipped")[:64])
         return "skipped"
-    await events_db.finish(event["event_id"], worker=worker, status="handed_over",
-                           delivery_id=result.get("delivery_id"),
-                           delivery_status=str(result.get("status") or "")[:32] or None)
+    finished = await events_db.finish(event["event_id"], worker=worker, status="handed_over",
+                                      delivery_id=result.get("delivery_id"),
+                                      delivery_status=str(result.get("status") or "")[:32] or None)
+    if not finished:
+        # The lease ran out mid-send and another worker holds the event: it will send it again,
+        # with the same event id (the receiver contract covers that). Worth seeing in the logs.
+        logger.warning("agent_purchase_events: lease lost after send event=%s", event["event_id"])
     return "handed_over"

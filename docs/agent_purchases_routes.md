@@ -131,15 +131,20 @@ agent asks about afterwards.
 
 Operations: events are detected and handed to the webhook sender by the worker job
 `agent_purchase_events` (every `AGENT_PURCHASE_EVENTS_INTERVAL_SECONDS`, default 30). It is dark
-unless `AGENT_PURCHASE_WEBHOOKS_ENABLED` and `AGENT_PURCHASE_LEDGER_ENABLED` are both on.
+unless `AGENT_PURCHASE_WEBHOOKS_ENABLED` and `AGENT_PURCHASE_LEDGER_ENABLED` are both on **on the
+worker service** (the job runs there; the ledger flag on `web` alone does not arm it).
 
 - Events are written to `agent_purchase_events` (migration 265) before anything is sent.
 - Only purchases that entered their current state within `AGENT_PURCHASE_EVENTS_LOOKBACK_HOURS`
-  (default 72, max 168) are considered, so switching the dial on does not replay old purchases.
+  (default 72, max 168) are considered, so switching the dial on does not replay old purchases;
+  it DOES send events for purchases that changed state within that window. For a quiet first
+  arming, set the lookback to 1 for the first run.
   **A pause or outage longer than the lookback drops the events of purchases that changed state
   during it**; they stay readable with `GET`.
-- An action state is only an event while its page is attached and live; a purchase that can never
-  yield an event in its state (owner mismatch, page refused) is recorded as `skipped`, once.
+- An action state is only an event while its page is attached and live. A purchase whose page is
+  refused is recorded `skipped` (`no_action`) and re-checked every 5 minutes, so a page the rail
+  re-publishes in the same state still produces the event. An owner mismatch or an unmapped state
+  is recorded `skipped` once, finally.
 - When webhook delivery is switched off (`WEBHOOK_DELIVERY_ENABLED`, which outside production is off
   by default), nothing is claimed: events stay `pending` and go out when delivery is on again.
 - `status = handed_over` means the sender accepted the event; `delivery_status` is its first

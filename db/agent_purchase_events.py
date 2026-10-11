@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS agent_purchase_events (
     delivery_status VARCHAR(32),
     skip_reason VARCHAR(64),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    handed_over_at TIMESTAMPTZ
+    handed_over_at TIMESTAMPTZ,
+    checked_at TIMESTAMPTZ
 )
 """
 _CREATE_TABLE_SQLITE = (
@@ -97,17 +98,26 @@ def new_event_id() -> str:
     return f"evt_{uuid.uuid4().hex[:24]}"
 
 
+#: One row per (purchase, rail state). A conflicting write changes nothing, EXCEPT over a row
+#: skipped for `no_action` (the page was not there yet): that one is re-judged, and either becomes
+#: the real event (keeping its event_id) or is stamped re-checked. Every other row is final.
 _INSERT_SQL = """
     INSERT INTO agent_purchase_events (
         event_id, purchase_id, agent_id, rail, rail_state, unified_state, event_type, payload,
-        status, skip_reason
+        status, skip_reason, checked_at
     ) VALUES (
         :event_id, :purchase_id, :agent_id, :rail, :rail_state, :unified_state, :event_type,
-        CAST(:payload AS JSONB), :status, :skip_reason
+        CAST(:payload AS JSONB), :status, :skip_reason, clock_timestamp()
     )
-    ON CONFLICT (purchase_id, rail_state) DO NOTHING
+    ON CONFLICT (purchase_id, rail_state) DO UPDATE
+       SET status = excluded.status, skip_reason = excluded.skip_reason, payload = excluded.payload,
+           unified_state = excluded.unified_state, event_type = excluded.event_type,
+           agent_id = excluded.agent_id, checked_at = excluded.checked_at
+     WHERE agent_purchase_events.status = 'skipped' AND agent_purchase_events.skip_reason = 'no_action'
 """
-_INSERT_SQL_SQLITE = _INSERT_SQL.replace("CAST(:payload AS JSONB)", ":payload")
+_INSERT_SQL_SQLITE = _INSERT_SQL.replace("CAST(:payload AS JSONB)", ":payload").replace(
+    "clock_timestamp()", "CURRENT_TIMESTAMP"
+)
 
 _SELECT_BY_PURCHASE_STATE_SQL = """
     SELECT event_id FROM agent_purchase_events WHERE purchase_id = :purchase_id AND rail_state = :rail_state
@@ -129,8 +139,10 @@ async def record_event(
     exists afterwards (this call's or a concurrent writer's).
 
     With `skip_reason` the row is written already `skipped`: detection found this (purchase,
-    state) can never yield an event (owner mismatch, no page to send the buyer to). The row is
-    the record of that decision AND what stops the detector re-reading the purchase every tick.
+    state) yields no event. The row is the record of that decision AND what stops the detector
+    re-reading the purchase every tick. `not_found` / `state_unmapped` are final; `no_action` (no
+    live page for the buyer) is re-checked every `NO_ACTION_RECHECK_SECONDS`, because the rail can
+    re-publish a page in the same state, and the card-binding event must not be lost for it.
     """
     if event_type not in EVENT_TYPES:
         raise ValueError(f"unknown purchase event type {event_type!r}")
@@ -227,14 +239,19 @@ def _event(row: Any) -> Optional[Dict[str, Any]]:
     return out
 
 
-async def claim_pending(*, worker: str, limit: int = 50, lease_seconds: int = 300) -> List[Dict[str, Any]]:
-    """Claim up to `limit` pending events for hand-over. Rows another worker holds are skipped."""
+async def claim_pending(
+    *, worker: str, limit: int = 50, lease_seconds: int = 300, sink: Optional[List[Dict[str, Any]]] = None
+) -> List[Dict[str, Any]]:
+    """Claim up to `limit` pending events for hand-over. Rows another worker holds are skipped.
+
+    Each claimed event is appended to `sink` (when given) the moment it is claimed, so a caller
+    cancelled part-way through still knows every row it holds and can give them back."""
     params = {"limit": max(1, min(500, int(limit))), "lease_seconds": int(lease_seconds)}
     if IS_POSTGRES:
         ids = await database.fetch_all(_SELECT_CLAIMABLE_SQL, params)
     else:
         ids = await database.fetch_all(_SELECT_CLAIMABLE_SQL_SQLITE, params)
-    claimed: List[Dict[str, Any]] = []
+    claimed: List[Dict[str, Any]] = sink if sink is not None else []
     for row in ids:
         values = {"event_id": row["event_id"], "worker": worker, "lease_seconds": int(lease_seconds)}
         if IS_POSTGRES:
@@ -315,6 +332,8 @@ _REAP_CANDIDATES_SQL = """
        AND NOT EXISTS (
             SELECT 1 FROM agent_purchase_events e
              WHERE e.purchase_id = p.id AND e.rail_state = r.state
+               AND NOT (e.status = 'skipped' AND e.skip_reason = 'no_action'
+                        AND e.checked_at < clock_timestamp() - (:recheck_seconds * INTERVAL '1 second'))
            )
      ORDER BY r.state_entered_at, p.id
      LIMIT :limit
@@ -339,14 +358,23 @@ _REAP_CANDIDATES_SQL_SQLITE = """
        AND NOT EXISTS (
             SELECT 1 FROM agent_purchase_events e
              WHERE e.purchase_id = p.id AND e.rail_state = r.state
+               AND NOT (e.status = 'skipped' AND e.skip_reason = 'no_action'
+                        AND e.checked_at < datetime('now', '-' || :recheck_seconds || ' seconds'))
            )
      ORDER BY r.state_entered_at, p.id
      LIMIT :limit
 """
 
+#: How long a `no_action` skip stands before the purchase is looked at again (same state).
+NO_ACTION_RECHECK_SECONDS = 300
+
 
 async def reap_candidates(*, lookback_hours: int = 24, limit: int = 200) -> List[Dict[str, Any]]:
-    params = {"lookback_hours": max(1, int(lookback_hours)), "limit": max(1, min(1000, int(limit)))}
+    params = {
+        "lookback_hours": max(1, int(lookback_hours)),
+        "limit": max(1, min(1000, int(limit))),
+        "recheck_seconds": int(NO_ACTION_RECHECK_SECONDS),
+    }
     if IS_POSTGRES:
         rows = await database.fetch_all(_REAP_CANDIDATES_SQL, params)
     else:
