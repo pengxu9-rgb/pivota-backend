@@ -110,6 +110,13 @@ async def _db():
     await database.execute("DROP TABLE IF EXISTS catalog_products CASCADE")
     await database.execute(_BASE_TABLE)
     await database.execute(_MIRROR_TABLE)
+    # Retirement cascades to catalog_offers. The table is SHARED with the other files of this gate
+    # (one database), so it is built from the MODEL, never dropped, and never hand-written narrow.
+    # Without this the file passed only when a sibling that sorts earlier had created the table.
+    from db.catalog import catalog_offers
+    from tests.model_schema import ensure_model_tables
+
+    await ensure_model_tables([catalog_offers])
 
     # Apply the DDL UNDER TEST, not a hand-written copy of it — a fixture that redeclared the
     # columns would be testing the fixture. Applied TWICE: the migration has to be idempotent
