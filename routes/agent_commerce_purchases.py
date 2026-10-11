@@ -30,7 +30,8 @@ import services.reap_agentic_purchase as reap_svc
 from db.buyer_vault import hash_agent_user_ref
 from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
-from services.payment_orchestration.rails import BUYER_ACTION_KIND, RAIL_ID_PREFIX, unified_state
+from services.payment_orchestration import purchase_view
+from services.payment_orchestration.rails import RAIL_ID_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -87,49 +88,14 @@ async def _parent_for(purchase_id: str, agent_id: str, owner: str) -> Optional[D
         raise _LedgerUnavailable() from None
 
 
-def _unified_body(parent: Mapping[str, Any], detail: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """The rail-neutral shape. None when the rail state has no unified mapping, which the caller
-    turns into a 503 rather than telling an agent something made up about the purchase."""
-    rail_state = detail.get("state")
-    state = unified_state(parent["rail"], rail_state)
-    if state is None:
-        return None
-    body: Dict[str, Any] = {
-        "purchase_id": parent["id"],
-        "rail": parent["rail"],
-        "executor": parent["executor"],
-        "rail_purchase_id": parent["rail_purchase_id"],
-        "state": state,
-        "rail_state": rail_state,
-        "created_at": parent.get("created_at"),
-        "totals": detail.get("totals"),
-        "poll_after_seconds": detail.get("poll_after_seconds"),
-    }
-    # The rail route has already vetted the hosted URL against its allowlist and its deadline and
-    # dropped it when it fails; an absent `hosted_url` therefore means "nowhere to send the buyer".
-    kind = BUYER_ACTION_KIND.get(state)
-    if kind and detail.get("hosted_url"):
-        body["next_action"] = {
-            "type": "open_url",
-            "kind": kind,
-            "url": detail["hosted_url"],
-            "expires_at": detail.get("approval_deadline") or detail.get("hosted_url_expires_at"),
-        }
-    if state == "completed" and detail.get("order_reference"):
-        body["order_reference"] = detail["order_reference"]
-    body["detail"] = dict(detail)
-    return body
-
-
 async def _unified_for(parent: Mapping[str, Any], agent_id: str, owner: str):
     """(body, None) on success, (None, response) when the purchase cannot be answered."""
-    detail = await reap_routes._owner_view(
-        purchase_id=str(parent["rail_purchase_id"]), agent_id=agent_id, agent_user_ref_hash=owner
+    body, problem = await purchase_view.unified_purchase(
+        parent, agent_id=agent_id, agent_user_ref_hash=owner
     )
-    if not detail:
+    if problem == "not_found":
         return None, reap_routes._not_found()
-    body = _unified_body(parent, detail)
-    if body is None:
+    if problem == "state_unmapped":
         logger.warning(
             "agent_purchases: unmapped rail state rail=%s purchase=%s", parent["rail"], parent["id"]
         )

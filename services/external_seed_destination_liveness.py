@@ -575,18 +575,45 @@ async def retire_seed_for_dead_destination(
             "offers_suppressed": len(cascaded)}
 
 
+#: A LITERAL, so the repo's static PREPARE sweep (tests/test_repo_sql_prepare_postgres.py) can plan
+#: it; the dead list is CONFIRMED_DEAD_VERDICTS spelled out, and a test pins the two together.
+#: `destination_verdict` is projected so the sweep can count the dead-first bucket.
+SWEEP_CANDIDATES_SQL = """
+    SELECT id, market, domain, canonical_url, destination_url, destination_checked_at,
+           destination_verdict
+      FROM external_product_seeds
+     WHERE status = 'active'
+     ORDER BY CASE WHEN destination_verdict IN ('dead_404', 'redirected_off_product') THEN 0 ELSE 1 END,
+              destination_checked_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
+     LIMIT :limit
+"""
+
+
 async def get_sweep_candidates(limit: int) -> List[Dict[str, Any]]:
-    """Active seeds, least-recently-verified first. NULLS FIRST: that is the whole corpus."""
-    rows = await database.fetch_all(
-        """
-        SELECT id, market, domain, canonical_url, destination_url, destination_checked_at
-        FROM external_product_seeds
-        WHERE status = 'active'
-        ORDER BY destination_checked_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
-        LIMIT :limit
-        """,
-        {"limit": max(1, int(limit or 1))},
-    )
+    """Active seeds whose last answer was DEAD first, then least-recently-verified first.
+
+    A DEAD VERDICT IS A QUESTION THE SWEEP ALONE CAN ANSWER. The refresh route records a 404
+    but cannot corroborate it (it never reads the brand's catalogue), so that seed sits at
+    `dead_404` holding its streak until the sweep looks. Ordering by the clock alone did not get
+    it looked at: the refresh re-stamps `destination_checked_at` on ~10k seeds every morning,
+    which puts exactly those seeds at the BACK of a clock-ordered queue. Measured 2026-10-09:
+    419 active seeds at `dead_404` streak 0 and 143 at streak 1, while the nightly pass of
+    5,000 spent its budget re-reading seeds last seen alive.
+
+    There are a few hundred such seeds and the pass is thousands, so putting them first costs
+    the rest of the queue almost nothing. A host we cannot read still produces no verdict, so a
+    dead seed on an unreadable host is re-asked nightly and never retired by being asked.
+    NULLS FIRST within each group: never-verified is still the oldest answer there is.
+
+    That bucket has no cap, so the sweep summary counts it (`dead_first_candidates`): a host whose
+    seeds the refresh keeps calling dead but the sweep can never read would grow it night after
+    night, and that is the number that shows it.
+
+    Looking is not stepping: while the retirement gap is measured from `destination_checked_at`,
+    the 05:15Z refresh's re-stamp keeps a looked-at seed inside the gap. Anchoring the gap on the
+    last corroborated step is pivota-backend #2537.
+    """
+    rows = await database.fetch_all(SWEEP_CANDIDATES_SQL, {"limit": max(1, int(limit or 1))})
     return [dict(row) for row in rows or []]
 
 
@@ -636,6 +663,9 @@ async def run_destination_sweep(
 
     summary: Dict[str, Any] = {
         "candidates": len(candidates),
+        "dead_first_candidates": sum(
+            1 for c in candidates if c.get("destination_verdict") in CONFIRMED_DEAD_VERDICTS
+        ),
         "hosts": len(grouped),
         "hosts_unverifiable": 0,
         "listed": 0,

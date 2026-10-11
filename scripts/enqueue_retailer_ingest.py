@@ -11,9 +11,9 @@ only_category, only_resolved_category, lip_title_evidence, lash_nail_title_evide
 max_scan_products, max_products, retailer_name, require_ships_to_market.
 
 A Shopify-Markets brand store (AUD base, quotes USD to US buyers) is TWO jobs, in this order:
-  1. {"domain": "gotoskincare.com", "brand": "Go-To", "vendors": ["Go-To"],
+  1. {"domain": "aud-brand.example.com", "brand": "Example AUD Brand", "vendors": ["Example AUD Brand"],
       "options": {"source_role": "brand_official", "market": "AU"}}      -- base-currency crawl, AUD rows
-  2. {"domain": "gotoskincare.com", "brand": "Go-To", "vendors": ["Go-To"],
+  2. {"domain": "aud-brand.example.com", "brand": "Example AUD Brand", "vendors": ["Example AUD Brand"],
       "options": {"source_role": "brand_official", "source": "shopify_markets"}}  -- USD siblings
 Queue 2 only after 1 is done: the capture prices only products 1 already wrote.
 
