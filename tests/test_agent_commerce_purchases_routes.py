@@ -24,6 +24,7 @@ from db.buyer_vault import hash_agent_user_ref  # noqa: E402
 import db.agent_purchase_ledger as purchases  # noqa: E402
 import db.reap_agentic_ledger as reap_ledger  # noqa: E402
 import routes.agent_commerce_purchases as unified_routes  # noqa: E402
+import services.payment_orchestration.purchase_view as purchase_view  # noqa: E402
 from routes.agent_auth import get_agent_context  # noqa: E402
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context  # noqa: E402
 
@@ -317,14 +318,14 @@ async def test_a_missing_ledger_table_is_a_503_not_a_500(client):
 
 async def test_the_list_fails_whole_on_an_unmapped_state_rather_than_dropping_the_row(client, monkeypatch):
     await _reap()
-    monkeypatch.setattr(unified_routes, "unified_state", lambda rail, state: None)
+    monkeypatch.setattr(purchase_view, "unified_state", lambda rail, state: None)
     resp = await client.get(BASE)
     assert resp.status_code == 503 and _error(resp) == "state_unmapped"
 
 
 async def test_an_unmapped_rail_state_is_a_503_not_a_guess(client, monkeypatch):
     rp = await _reap()
-    monkeypatch.setattr(unified_routes, "unified_state", lambda rail, state: None)
+    monkeypatch.setattr(purchase_view, "unified_state", lambda rail, state: None)
     resp = await client.get(f"{BASE}/{rp}")
     assert resp.status_code == 503 and _error(resp) == "state_unmapped"
 

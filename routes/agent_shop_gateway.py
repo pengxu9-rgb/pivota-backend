@@ -824,12 +824,18 @@ def _normalize_budget_currency(raw: Optional[str]) -> Optional[str]:
 
 _BUDGET_FX_CACHE_TTL_SECONDS = 900.0
 _BUDGET_FX_RATE_CACHE: Dict[Tuple[str, str], Tuple[Optional[float], Optional[str], float]] = {}
+# USD per unit; the LAST fallback after the stored snapshot and the latest-rate API. Translates a shopper's
+# budget into an offer currency, never prices an offer (ADR-024 commitment 5). Every served market's currency
+# must be here (ADR-026 P0): without SGD an SG offer's budget bound was unresolvable whenever the API was down.
+# SGD/AUD approximate 2026-10 (USD/SGD ~1.27; AUD/SGD 0.888); AGENT_SHOP_BUDGET_FX_USD_RATES overrides any entry.
 _DEFAULT_BUDGET_FX_USD_RATES: Dict[str, float] = {
     "USD": 1.0,
     "EUR": 1.09,
     "GBP": 1.27,
     "CNY": 0.14,
     "JPY": 0.0067,
+    "SGD": 0.79,
+    "AUD": 0.70,
 }
 _BUDGET_FX_LATEST_FALLBACK_ENABLED = _env_bool(
     "AGENT_SHOP_BUDGET_FX_LATEST_FALLBACK_ENABLED",

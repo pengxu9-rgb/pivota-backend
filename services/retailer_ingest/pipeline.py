@@ -705,8 +705,8 @@ def _require_served_market_is_served(market: str) -> None:
 
 
 async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
-    from services.curated_brand_feed import (CrawlIncomplete, lash_nail_title_evidence, lip_title_evidence,
-                                             records_for_brand)
+    from services.curated_brand_feed import (CrawlIncomplete, PresentedCurrencyMismatch, lash_nail_title_evidence,
+                                             lip_title_evidence, records_for_brand)
     import contextlib
 
     _require_acquisition_is_unserved(job_market(job.get("options")))
@@ -744,6 +744,10 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
         if _transient(crawl):
             raise _throttled(job, stage, str(crawl.get("reason"))) from exc
         raise _Stop("crawl_failed", "failed", f"crawl failed: {crawl.get('reason')}") from exc
+    except PresentedCurrencyMismatch as exc:
+        # The store presents our crawl another currency than its /meta.json names: the read is held, never
+        # labelled (ADR-026 4.4). Not transient -- the next tick would be presented the same.
+        raise _Stop("presented_currency_mismatch", "failed", str(exc)) from exc
     report = getattr(records, "crawl_report", None)
     if not isinstance(report, dict) or report.get("status") != "complete":
         raise _Stop("crawl_unproven", "failed", "crawl completeness was not proven")
@@ -1575,14 +1579,16 @@ async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timin
     planned = capture["planned"]
     summary = {"crawl": checks.get("markets_capture"), "plan": {"planned": len(planned)}, "checks": checks,
                "flags": []}
+    proof = checks["markets_capture"].get("proof") or "no product answered"
     if not planned:
         raise _Stop("nothing_to_capture", "nothing",
-                    f"the {market} session was proven but no base offer has a sellable {currency} price "
-                    f"({checks['markets_capture'].get('skipped')})", checks=checks)
+                    f"no base offer has a proven {currency} price for {market} (proof mode: {proof}): "
+                    f"{checks['markets_capture'].get('skipped')}", checks=checks)
     if stage == DRY_RUN:
         await ledger.finish_run(run_id, outcome="clean", **summary, db=db)
-        await _move(job, status="apply_due", run_id=run_id, reason=f"{market} session proven, {len(planned)} "
-                    f"{currency} sibling offer(s) planned; apply due", next_run_at=datetime.now(timezone.utc), db=db)
+        await _move(job, status="apply_due", run_id=run_id, reason=f"{market} {currency} proven ({proof}), "
+                    f"{len(planned)} {currency} sibling offer(s) planned; apply due",
+                    next_run_at=datetime.now(timezone.utc), db=db)
         return {"job_id": job["id"], "stage": stage, "outcome": "clean", "status": "apply_due"}
 
     checks.setdefault("catalog_write", ledger.CATALOG_WRITE_NOT_STARTED)
