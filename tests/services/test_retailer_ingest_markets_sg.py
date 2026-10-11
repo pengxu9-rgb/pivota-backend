@@ -33,6 +33,11 @@ from db import retailer_ingest as ledger_db
 from services import curated_brand_feed as feed, storefront_currency
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
 from services.retailer_ingest import pipeline, shopify_markets as markets
+
+
+def _shopify_js(body):
+    """A Shopify AJAX `.js` answer as the storefront sends it: a JSON body typed text/javascript."""
+    return httpx.Response(200, content=json.dumps(body).encode(), headers={"content-type": "text/javascript; charset=utf-8"})
 from tests.services.test_retailer_ingest_markets_phase2 import (  # noqa: F401 -- fixtures
     Polite, ReadbackDB, SqliteCatalog, base_rows, gates_on, markets_job)
 from tests.services.test_retailer_ingest_pipeline import env  # noqa: F401 -- the state-machine fixture
@@ -134,7 +139,9 @@ class MarketStore:
             if handle not in self.catalog:
                 return httpx.Response(404, text="not found", headers={"content-type": "text/html"})
             _vendor, _ptype, variants = self.catalog[handle]
-            return httpx.Response(200, json={"id": 1, "handle": handle, "variants": [
+            # As Shopify serves it: a JSON body typed text/javascript (the shape that refused every capture
+            # while this fake answered application/json).
+            return _shopify_js({"id": 1, "handle": handle, "variants": [
                 {"id": vid, "price": prices[currency], "available": True} for vid, prices in variants]})
         return httpx.Response(404)
 
@@ -615,3 +622,33 @@ def test_anything_but_a_brand_store_is_a_retailer_job(role, retailer):
     # allowed as a retailer and then selected as a brand store.
     options = {"source": "shopify_markets", "market": "SG"} | ({} if role is None else {"source_role": role})
     assert markets.is_retailer_job({"options": options}) is retailer
+
+
+# ---- 2026-10-11: Shopify serves /products/<handle>.js as text/javascript --------------------------------
+
+def _one_response(resp):
+    async def run(path):
+        polite = type("P", (), {"before_request": staticmethod(_allow), "note_response": staticmethod(lambda *a, **k: None)})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda req: resp)) as client:
+            return await markets._Session(client, "kbeauty-retailer.example.com", polite, {}, "SG").json(path)
+    return run
+
+
+async def _allow(*_a, **_k):
+    return None
+
+
+async def test_a_javascript_typed_json_body_is_read():
+    code, body = await _one_response(_shopify_js({"id": 1, "variants": [{"id": 2, "price": 1500}]}))("/products/x.js")
+    assert code == 200 and body["variants"][0]["price"] == 1500
+
+
+@pytest.mark.parametrize("resp", [
+    httpx.Response(200, text="<html>Just a moment...</html>", headers={"content-type": "text/html; charset=utf-8"}),
+    httpx.Response(200, text="window.location='/challenge';", headers={"content-type": "text/javascript"}),
+    httpx.Response(200, text='"ok"', headers={"content-type": "text/javascript"}),
+])
+async def test_a_wall_or_a_challenge_is_still_refused(resp):
+    with pytest.raises(markets.MarketsRefused) as refused:
+        await _one_response(resp)("/products/x.js")
+    assert refused.value.outcome == "capture_unverifiable"
