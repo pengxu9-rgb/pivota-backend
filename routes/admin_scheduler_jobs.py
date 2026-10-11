@@ -48,6 +48,10 @@ _MANAGEABLE_JOB_IDS = frozenset(
         # docs/runbooks/reap_agentic_purchase.md). Pausing the job instead leaves
         # the dial armed, which is the lever an operator actually wants at 3am.
         "reap_agentic_purchase_poll",
+        # Rail-purchase webhook events: pausing stops pushes to agent platforms without a deploy;
+        # on resume, written events are handed over with their ids and state changes during the
+        # pause are detected if they fall inside AGENT_PURCHASE_EVENTS_LOOKBACK_HOURS (default 72).
+        "agent_purchase_events",
     }
 )
 
@@ -77,6 +81,7 @@ _RUNNABLE_JOB_IDS = frozenset(
         # it once by hand" step in the arming procedure in
         # docs/runbooks/reap_agentic_purchase.md; without it, the first evidence
         # that arming worked would be a log line up to 30s later.
+        "agent_purchase_events",   # idempotent: detection is unique per state, hand-over is claimed
         "reap_agentic_purchase_poll",
     }
 )
