@@ -119,8 +119,11 @@ _CREDENTIAL_SUBTREE_PREFIXES = ("networktoken",)
 _CREDENTIAL_LEAF_KEYS = frozenset({
     "cryptogram", "tokencryptogram", "cryptogramvalue", "pan", "dpan", "fpan", "cardnumber",
     "primaryaccountnumber", "accountnumber", "tokenvalue", "cvv", "cvc", "cvv2", "cvc2", "cvn",
-    "securitycode", "tavv", "track1", "track2",
+    "securitycode", "tavv", "track1", "track2", "eci", "ucaf", "aav",
 })
+#: Key fragments that only ever name an authentication credential (`paymentCryptogram`, `cavv`,
+#: `authenticationValue`, ...), matched as substrings of the canonical key.
+_CREDENTIAL_KEY_PARTS = ("crypt", "cavv", "tavv", "authenticationvalue", "authvalue")
 #: 14-19 digits, optionally grouped by single spaces or dashes, that pass the Luhn check: a PAN or
 #: DPAN in any spelling. The Luhn gate keeps ids and timestamps that merely contain a long digit
 #: run (1 in 56 random 32-hex ids does) from being taken for a card. (13-digit PANs are retired.)
@@ -284,12 +287,16 @@ def _has_card_number(text: str) -> bool:
     return any(_luhn(re.sub(r"[ -]", "", m.group(0))) for m in _CARD_DIGITS_RE.finditer(text))
 
 
-def _is_credential_key(key: Any) -> bool:
+def _is_credential_key(key: Any, parent: str = "") -> bool:
+    """`parent` is the canonical key of the enclosing object (`token` for `token.number`)."""
     canon = _canon(key)
     text = str(key)
     return (
         canon in _CREDENTIAL_LEAF_KEYS
         or canon.startswith(_CREDENTIAL_SUBTREE_PREFIXES)
+        or any(part in canon for part in _CREDENTIAL_KEY_PARTS)
+        or ("token" in canon and canon.endswith(("number", "value", "pan")))
+        or ("token" in parent and canon in ("number", "value", "pan", "data"))
         or _has_card_number(text)
         or bool(_BASE64_BLOB_RE.search(text))
     )
@@ -313,7 +320,7 @@ def _strip_string(value: str, *, digits: bool = True) -> Tuple[Optional[str], in
     return value, 0
 
 
-def _strip_credentials(value: Any, depth: int = 0) -> Tuple[Any, int]:
+def _strip_credentials(value: Any, depth: int = 0, parent: str = "") -> Tuple[Any, int]:
     """A copy of `value` with every credential field removed, and how many were removed."""
     if depth > _MAX_STRIP_DEPTH:
         return None, 1
@@ -321,7 +328,7 @@ def _strip_credentials(value: Any, depth: int = 0) -> Tuple[Any, int]:
         out: Dict[str, Any] = {}
         removed = 0
         for key, item in value.items():
-            if _is_credential_key(key):
+            if _is_credential_key(key, parent):
                 removed += 1
                 continue
             if _digits_expected(key) and (
@@ -334,7 +341,7 @@ def _strip_credentials(value: Any, depth: int = 0) -> Tuple[Any, int]:
                 out[key] = cleaned
                 removed += count
                 continue
-            cleaned, count = _strip_credentials(item, depth + 1)
+            cleaned, count = _strip_credentials(item, depth + 1, _canon(key))
             out[key] = cleaned
             removed += count
         return out, removed
@@ -342,7 +349,7 @@ def _strip_credentials(value: Any, depth: int = 0) -> Tuple[Any, int]:
         items = []
         removed = 0
         for item in value:
-            cleaned, count = _strip_credentials(item, depth + 1)
+            cleaned, count = _strip_credentials(item, depth + 1, parent)
             items.append(cleaned)
             removed += count
         return items, removed
@@ -405,6 +412,18 @@ def _card_from(data: Mapping[str, Any]) -> Tuple[Card, int]:
     return Card(component=component, kind=kind, data=cleaned, actions=actions), removed
 
 
+def _artifacts_report_money(task: Mapping[str, Any]) -> bool:
+    artifacts = task.get("artifacts") if isinstance(task.get("artifacts"), list) else []
+    for artifact in artifacts:
+        parts = artifact.get("parts") if isinstance(artifact, dict) else None
+        for part in parts if isinstance(parts, list) else []:
+            data = part.get("data") if isinstance(part, dict) else None
+            component = data.get("component") if isinstance(data, dict) else None
+            if isinstance(component, str) and _is_money_result(component):
+                return True
+    return False
+
+
 def parse_response(body: Any) -> A2AResult:
     """Classify one JSON-RPC response body. Pure: no I/O, no logging."""
     if not isinstance(body, dict):
@@ -420,7 +439,10 @@ def parse_response(body: Any) -> A2AResult:
     result = A2AResult(
         kind="cards",
         task_state=state if isinstance(state, str) and state in _TASK_STATES else None,
-        context_id=echoed if isinstance(echoed, str) and _CONTEXT_ID_RE.match(echoed) else None,
+        context_id=(
+            echoed if isinstance(echoed, str) and _CONTEXT_ID_RE.match(echoed) and not _has_card_number(echoed)
+            else None
+        ),
     )
     money = False
     for part in _latest_agent_parts(task):
@@ -436,6 +458,8 @@ def parse_response(body: Any) -> A2AResult:
             result.cards.append(card)
         elif part.get("kind") == "text":
             result.text_parts += 1
+    # Artifacts are never returned, but a money-result card there is still a money flow.
+    money = money or _artifacts_report_money(task)
     if money:
         result.kind = "money_result"
     elif result.kind == "cards" and not result.cards:
@@ -458,12 +482,15 @@ class A2ARailClient:
         transport: Any = None,
         clock: Callable[[], float] = time.monotonic,
         context_secret: Optional[str] = None,
+        total_timeout_s: Optional[float] = None,
     ) -> None:
         self._base = validate_base_url(base_url)
         if not str(api_key or "").strip():
             raise A2ARailConfigError(f"{A2A_RAIL_API_KEY_ENV} is not set")
         self._api_key = str(api_key).strip()
         self._timeout_s = float(timeout_s)
+        #: Wall-clock bound on one whole call (token exchange or action), on top of httpx's.
+        self._total_timeout_s = float(total_timeout_s if total_timeout_s is not None else 2 * self._timeout_s)
         self._transport = transport
         self._clock = clock
         self._tokens: Dict[str, Tuple[str, float]] = {}
@@ -540,8 +567,9 @@ class A2ARailClient:
 
     async def _mint(self, member_id: str) -> Optional[str]:
         try:
-            status, body, too_large = await self._post_json(
-                TOKEN_PATH, {"api_key": self._api_key, "member_id": member_id}, {}
+            status, body, too_large = await asyncio.wait_for(
+                self._post_json(TOKEN_PATH, {"api_key": self._api_key, "member_id": member_id}, {}),
+                self._total_timeout_s,
             )
         except Exception as exc:  # noqa: BLE001 - every failure is "no token", logged by type only
             logger.warning("a2a_rail: token exchange failed error_type=%s", type(exc).__name__)
@@ -608,10 +636,12 @@ class A2ARailClient:
         import httpx
 
         try:
-            status, parsed, too_large = await self._post_json(
-                MESSAGE_PATH, body, {"Authorization": f"Bearer {token}"}
+            # httpx's timeout is per phase (a drip-fed answer never trips it): this bounds the call.
+            status, parsed, too_large = await asyncio.wait_for(
+                self._post_json(MESSAGE_PATH, body, {"Authorization": f"Bearer {token}"}),
+                self._total_timeout_s,
             )
-        except httpx.TimeoutException:
+        except (httpx.TimeoutException, asyncio.TimeoutError):
             kind = "outcome_unknown" if may_write else "timeout"
             return self._done(A2AResult(kind=kind), component, action, started)
         except httpx.HTTPError:

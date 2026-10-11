@@ -658,3 +658,75 @@ async def test_the_http_client_ignores_environment_proxies_and_netrc(monkeypatch
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
     async with _client(_Rail())._client() as http:
         assert http.trust_env is False and not http.follow_redirects
+
+
+@pytest.mark.parametrize("data", [
+    {"paymentCryptogram": "AOHHzRvcAAAAAAAAAAAAAAAAAAAA"},   # unpadded
+    {"cavv": "AAABBBCCCDDDEEEFFF00112233"},
+    {"authenticationValue": "x"},
+    {"auth": {"eci": "05", "ucaf": "x"}},
+    {"tokenNumber": "4111 0000 0000 0001"},                 # not Luhn, still a token number
+    {"token": {"number": "4111000000000001", "expiry": "1129"}},
+    {"token": [{"value": "opaque"}]},
+])
+def test_named_authentication_values_and_token_numbers_are_removed(data):
+    cleaned, removed = a2a._strip_credentials(data)
+    text = json.dumps(cleaned)
+    assert removed >= 1
+    for secret in ("AOHHzRvc", "AAABBBCCC", '"x"', "4111", "opaque", '"05"'):
+        assert secret not in text
+
+
+def test_token_ids_and_metadata_are_not_mistaken_for_token_numbers():
+    data = {"paymentTokenId": "ptk_8eb3e0486e5f4c689296be5d8bcff7c2", "token": {"id": "ptk_1", "status": "ACTIVE"},
+            "recipient": "shop", "decimalPlaces": 2}
+    cleaned, removed = a2a._strip_credentials(data)
+    assert cleaned == data and removed == 0
+
+
+async def test_a_money_result_card_in_the_artifacts_is_caught():
+    body = _task(_card("payment.method-list", {"methods": []}))
+    body["result"]["artifacts"] = [{"artifactId": "a1", "parts": [
+        {"kind": "data", "data": {"component": "payment.pay-result", "data": {"chargeNo": "c1"}}}]}]
+    result = await _send(_client(_Rail(body)), "payment.await", "poll")
+    assert result.kind == "money_result" and not result.ok
+
+
+async def test_a_drip_fed_answer_is_cut_by_the_total_deadline():
+    import asyncio
+
+    async def drip(request):
+        if request.url.path == a2a.TOKEN_PATH:
+            return httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
+
+        async def body():
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                yield b" "
+
+        return httpx.Response(200, content=body())
+
+    client = a2a.A2ARailClient(BASE, API_KEY, transport=httpx.MockTransport(drip), total_timeout_s=0.1)
+    started = asyncio.get_running_loop().time()
+    write = await _send(client, "payment.token-setup", "submit")
+    read = await _send(client)
+    assert write.kind == "outcome_unknown" and read.kind == "timeout"
+    assert asyncio.get_running_loop().time() - started < 1.5
+
+
+async def test_a_token_exchange_that_hangs_is_cut():
+    import asyncio
+
+    async def hang(request):
+        await asyncio.sleep(30)
+
+    client = a2a.A2ARailClient(BASE, API_KEY, transport=httpx.MockTransport(hang), total_timeout_s=0.05)
+    started = asyncio.get_running_loop().time()
+    assert (await _send(client)).kind == "auth_failed"
+    assert asyncio.get_running_loop().time() - started < 5
+
+
+async def test_an_echoed_context_carrying_a_card_number_is_dropped():
+    body = _task(_card("payment.method-list", {"methods": []}))
+    body["result"]["contextId"] = f"ctx-{DPAN}"
+    assert (await _send(_client(_Rail(body)))).context_id is None
