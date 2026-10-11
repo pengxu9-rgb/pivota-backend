@@ -19,6 +19,14 @@ Two layers, because each one alone has a hole:
    rebinding (a name that answers public for the check and private for the connect). Redirects
    are never followed by the callers. Response bodies are capped.
 
+PUBLIC IS NOT THE SAME AS OUTSIDE. The senders run with all-traffic VPC egress, under which a
+call to one of OUR OWN Cloud Run services (`*.run.app`, public anycast addresses) arrives as
+INTERNAL ingress: past the load balancer and Cloud Armor, and on services that accept internal
+traffic without auth. So names under the suffixes in `WEBHOOK_BLOCKED_HOST_SUFFIXES` (default
+`.run.app`) are refused at both layers, whatever they resolve to. The front end routes by Host and
+SNI, which the transport keeps as the registered name, so a foreign name pointed at the same
+addresses cannot reach our services.
+
 A refusal raises `DestinationBlocked`, which the delivery services record as a terminal
 failure: retrying a blocked address cannot succeed and only repeats the attempt.
 """
@@ -27,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import os
 import socket
 from typing import Awaitable, Callable, List, Optional, Union
 from urllib.parse import urlsplit
@@ -39,8 +48,15 @@ DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024
 _INTERNAL_SUFFIXES = (
     ".localhost", ".local", ".internal", ".intranet", ".lan", ".home.arpa", ".corp", ".private",
 )
-#: NAT64 well-known prefix: a "public" IPv6 address that a NAT64 gateway turns into any IPv4.
-_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+#: v6 ranges that wrap or reach an IPv4 address: NAT64 (well-known and local-use) and the
+#: deprecated IPv4-compatible block. The stdlib calls some of these global.
+_V6_WRAPPERS = tuple(ipaddress.ip_network(n) for n in ("64:ff9b::/96", "64:ff9b:1::/48", "::/96"))
+_BLOCKED_SUFFIXES_ENV = "WEBHOOK_BLOCKED_HOST_SUFFIXES"
+_DEFAULT_BLOCKED_SUFFIXES = (".run.app",)
+#: Addresses of one name tried, in order, when connecting fails (a CDN with one node down).
+_MAX_ADDRESS_ATTEMPTS = 3
+#: Seconds to wait for DNS when the request carries no connect timeout.
+DEFAULT_RESOLVE_TIMEOUT_SECONDS = 10.0
 
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 Resolver = Callable[[str, int], Awaitable[List[str]]]
@@ -57,7 +73,7 @@ class DestinationBlocked(Exception):
 def is_public_address(ip: IPAddress) -> bool:
     """Globally routable, and not a v6 wrapper around a v4 address that is not."""
     if isinstance(ip, ipaddress.IPv6Address):
-        if ip in _NAT64:
+        if ip.is_site_local or any(ip in net for net in _V6_WRAPPERS):
             return False
         for embedded in (ip.ipv4_mapped, ip.sixtofour, (ip.teredo or (None, None))[1]):
             if embedded is not None and not is_public_address(embedded):
@@ -65,12 +81,30 @@ def is_public_address(ip: IPAddress) -> bool:
     return bool(ip.is_global) and not ip.is_multicast
 
 
+def _blocked_suffixes() -> tuple:
+    raw = os.getenv(_BLOCKED_SUFFIXES_ENV)
+    if raw is None:
+        return _DEFAULT_BLOCKED_SUFFIXES
+    parts = tuple("." + p.strip().lower().lstrip(".") for p in raw.split(",") if p.strip())
+    return parts
+
+
 def _is_internal_name(host: str) -> bool:
-    return host == "localhost" or "." not in host or host.endswith(_INTERNAL_SUFFIXES)
+    host = host.rstrip(".").lower()
+    blocked = _blocked_suffixes()
+    return (
+        host == "localhost"
+        or "." not in host
+        or host.endswith(_INTERNAL_SUFFIXES)
+        or any(host == b.lstrip(".") or host.endswith(b) for b in blocked)
+    )
 
 
 def check_destination_url(raw: Optional[str]) -> str:
-    """The URL to store, or `DestinationRejected`. No DNS: the send-time transport does that."""
+    """The URL to store, or `DestinationRejected`. No DNS: the send-time transport does that.
+
+    Judged as httpx will parse it at send time (so a host the two parsers read differently, or a
+    URL httpx refuses, is caught here and not as six failed retries later)."""
     value = str(raw or "").strip()
     parts = urlsplit(value)
     if parts.scheme != "https":
@@ -79,9 +113,12 @@ def check_destination_url(raw: Optional[str]) -> str:
         raise DestinationRejected("Webhook URL must not contain credentials")
     try:
         parts.port
-    except ValueError as exc:
-        raise DestinationRejected("Webhook URL has an invalid port") from exc
-    host = (parts.hostname or "").rstrip(".").lower()
+        url = httpx.URL(value)
+    except (ValueError, httpx.InvalidURL) as exc:
+        raise DestinationRejected("Webhook URL is not a valid URL") from exc
+    if url.port == 0:
+        raise DestinationRejected("Webhook URL has an invalid port")
+    host = (url.host or "").rstrip(".").lower()
     if not host:
         raise DestinationRejected("Webhook URL must have a host")
     try:
@@ -102,15 +139,21 @@ async def _system_resolver(host: str, port: int) -> List[str]:
 
 
 class _BoundedStream(httpx.AsyncByteStream):
+    """Reads at most `limit` bytes of the answer and then stops, quietly: the status code is what
+    decides a delivery, and the services keep only the first 4000 characters of the body. (Raising
+    here would turn a 200 with a long HTML page into six retries.)"""
+
     def __init__(self, stream: httpx.AsyncByteStream, limit: int):
         self._stream, self._limit = stream, limit
 
     async def __aiter__(self):
-        total = 0
+        remaining = self._limit
         async for chunk in self._stream:
-            total += len(chunk)
-            if total > self._limit:
-                raise httpx.ReadError("Webhook destination response exceeds the size limit")
+            if len(chunk) >= remaining:
+                if remaining:
+                    yield chunk[:remaining]
+                return
+            remaining -= len(chunk)
             yield chunk
 
     async def aclose(self):
@@ -131,7 +174,7 @@ class PublicDestinationTransport(httpx.AsyncHTTPTransport):
         self._resolver = resolver or _system_resolver
         self._max_response_bytes = max_response_bytes
 
-    async def _public_address(self, host: str, port: int) -> str:
+    async def _public_addresses(self, host: str, port: int, timeout: Optional[float]) -> List[str]:
         try:
             literal = ipaddress.ip_address(host)
         except ValueError:
@@ -142,7 +185,12 @@ class PublicDestinationTransport(httpx.AsyncHTTPTransport):
             raise DestinationBlocked("destination host is internal")
         else:
             try:
-                candidates = await self._resolver(host, port)
+                # Bounded: before this transport, httpcore resolved inside its connect timeout.
+                candidates = await asyncio.wait_for(
+                    self._resolver(host, port), timeout or DEFAULT_RESOLVE_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError as exc:
+                raise httpx.ConnectTimeout("destination host did not resolve in time") from exc
             except OSError as exc:
                 # A name that does not resolve now may resolve later: transient, so retried.
                 raise httpx.ConnectError(f"destination host did not resolve: {type(exc).__name__}") from exc
@@ -156,7 +204,8 @@ class PublicDestinationTransport(httpx.AsyncHTTPTransport):
                 raise DestinationBlocked("destination resolved to an invalid address") from exc
         if not all(is_public_address(ip) for ip in addresses):
             raise DestinationBlocked("destination resolves to a non-public address")
-        return str(sorted(addresses, key=lambda ip: (ip.version, int(ip)))[0])
+        # IPv4 first (egress NAT is IPv4), then in order; tried one after another on connect errors.
+        return [str(ip) for ip in sorted(set(addresses), key=lambda ip: (ip.version, int(ip)))]
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         url = request.url
@@ -164,18 +213,30 @@ class PublicDestinationTransport(httpx.AsyncHTTPTransport):
             raise DestinationBlocked("destination scheme is not http(s)")
         if url.userinfo:
             raise DestinationBlocked("destination URL carries credentials")
+        if url.port == 0:
+            raise DestinationBlocked("destination port is invalid")
         port = url.port or (443 if url.scheme == "https" else 80)
-        address = await self._public_address(url.host, port)
+        timeout = request.extensions.get("timeout") if isinstance(request.extensions.get("timeout"), dict) else {}
+        addresses = await self._public_addresses(url.host, port, timeout.get("connect"))
         headers = request.headers.copy()
         headers["Host"] = url.netloc.decode("ascii")
         extensions = dict(request.extensions)
         if url.scheme == "https":
             # Certificate checked against the name the owner registered, not the address.
             extensions["sni_hostname"] = url.host
-        pinned = httpx.Request(
-            request.method, url.copy_with(host=address, port=port),
-            headers=headers, stream=request.stream, extensions=extensions,
-        )
-        response = await super().handle_async_request(pinned)
-        response.stream = _BoundedStream(response.stream, self._max_response_bytes)
-        return response
+        body = await request.aread()  # replayable across address attempts
+        last_error: Optional[Exception] = None
+        for address in addresses[:_MAX_ADDRESS_ATTEMPTS]:
+            pinned = httpx.Request(
+                request.method, url.copy_with(host=address, port=port),
+                headers=headers, content=body, extensions=extensions,
+            )
+            try:
+                response = await super().handle_async_request(pinned)
+            except httpx.ConnectError as exc:
+                last_error = exc  # nothing was sent to this address: the next one is safe to try
+                continue
+            response.stream = _BoundedStream(response.stream, self._max_response_bytes)
+            return response
+        assert last_error is not None
+        raise last_error

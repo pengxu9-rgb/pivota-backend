@@ -32,7 +32,7 @@ PUBLIC_V4 = "93.184.216.34"
     "https://hooks.example.com:8443/pivota",
     "https://8.8.8.8/hook",
     "https://[2001:4860:4860::8888]/hook",
-    "https://hooks.example.com./x",
+    "https://my-receiver.example.app/hook",
 ])
 def test_a_public_https_url_is_accepted_unchanged(url):
     assert guard.check_destination_url(f"  {url} ") == url
@@ -62,6 +62,14 @@ def test_a_public_https_url_is_accepted_unchanged(url):
     "https://[::ffff:127.0.0.1]/x",         # v4-mapped loopback
     "https://[64:ff9b::a00:5]/x",           # NAT64 of 10.0.0.5
     "https://[2002:a00:5::]/x",             # 6to4 of 10.0.0.5
+    "https://[64:ff9b:1::a00:5]/x",         # local-use NAT64
+    "https://[::a00:5]/x",                  # IPv4-compatible
+    "https://[fec0::1]/x",                  # site-local
+    "https://web-123456789012.us-west1.run.app/x",  # our own Cloud Run: internal under VPC egress
+    "https://gateway-abc123-uw.a.run.app/x",
+    "https://0177.0.0.1/x",                 # httpx refuses it at send time
+    "https://hooks.example.com:0/x",
+    "https://a.b\u3002localhost/x",          # ideographic full stop: httpx reads a.b.localhost
     "",
 ])
 def test_an_internal_or_insecure_url_is_rejected_with_a_value_error(url):
@@ -167,11 +175,109 @@ async def test_a_name_that_does_not_resolve_is_a_transient_connect_error(monkeyp
     assert sent.requests == []
 
 
-async def test_the_answer_is_read_with_a_size_cap(monkeypatch):
+async def test_a_long_answer_is_truncated_not_failed(monkeypatch):
     sent = _Sent(body=b"x" * 2048)
-    with pytest.raises(httpx.ReadError):
-        await _post("https://hooks.example.com/x", _resolver([PUBLIC_V4]), sent, monkeypatch,
-                    max_response_bytes=1024)
+    response = await _post("https://hooks.example.com/x", _resolver([PUBLIC_V4]), sent, monkeypatch,
+                           max_response_bytes=1024)
+    assert response.status_code == 200 and response.content == b"x" * 1024
+
+
+async def test_run_app_names_are_blocked_at_send_whatever_they_resolve_to(monkeypatch):
+    sent, calls = _Sent(), []
+    with pytest.raises(guard.DestinationBlocked):
+        await _post("https://web-123456789012.us-west1.run.app/x", _resolver([PUBLIC_V4], calls), sent, monkeypatch)
+    assert sent.requests == [] and calls == []
+
+
+def test_the_blocked_suffixes_are_configurable(monkeypatch):
+    monkeypatch.setenv("WEBHOOK_BLOCKED_HOST_SUFFIXES", "internal.example, .corp.example")
+    with pytest.raises(guard.DestinationRejected):
+        guard.check_destination_url("https://svc.internal.example/x")
+    assert guard.check_destination_url("https://svc.run.app/x") == "https://svc.run.app/x"
+
+
+async def test_a_resolver_that_hangs_is_a_connect_timeout(monkeypatch):
+    import asyncio
+
+    async def hang(host, port):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _Sent().as_method())
+    transport = guard.PublicDestinationTransport(resolver=hang)
+    async with httpx.AsyncClient(transport=transport, timeout=0.05, trust_env=False) as client:
+        with pytest.raises(httpx.ConnectTimeout):
+            await client.post("https://hooks.example.com/x", content=b"{}")
+
+
+async def test_a_dead_address_falls_through_to_the_next(monkeypatch):
+    tried = []
+
+    async def handle(transport, request):
+        tried.append(request.url.host)
+        if len(tried) == 1:
+            raise httpx.ConnectError("refused")
+        return httpx.Response(200, stream=httpx.ByteStream(b"ok"))
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
+    transport = guard.PublicDestinationTransport(resolver=_resolver(["93.184.216.35", PUBLIC_V4]))
+    async with httpx.AsyncClient(transport=transport, trust_env=False) as client:
+        response = await client.post("https://hooks.example.com/x", content=b'{"a":1}')
+    assert response.status_code == 200 and tried == [PUBLIC_V4, "93.184.216.35"]
+
+
+def test_the_interpreter_knows_the_current_special_purpose_registry():
+    import ipaddress
+
+    # 64:ff9b:1::/48 entered the stdlib registry in 3.11.10 / 3.12.4; an older interpreter would
+    # call it global, so fail loudly here rather than trust it.
+    assert not guard.is_public_address(ipaddress.ip_address("64:ff9b:1::1"))
+    assert ipaddress.ip_address("64:ff9b:1::1").is_global is False
+
+
+# ── through the real httpcore pool, with a recording network backend (no sockets) ──────────
+
+
+def _recording_backend(rec):
+    from httpcore._backends import mock
+
+    class Stream(mock.AsyncMockStream):
+        async def write(self, buffer, timeout=None):
+            rec.setdefault("written", b"")
+            rec["written"] += bytes(buffer)
+
+        async def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+            rec["sni"] = server_hostname
+            rec["check_hostname"] = ssl_context.check_hostname
+            return self
+
+        def get_extra_info(self, info):
+            return None if info == "ssl_object" else super().get_extra_info(info)
+
+    class Backend(mock.AsyncMockBackend):
+        async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+            rec["connect"] = (host, port)
+            return Stream(list(self._buffer))
+
+    return Backend([b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"])
+
+
+@pytest.mark.parametrize("url,answers,connect,host_header", [
+    ("https://hooks.example.com/p", [PUBLIC_V4], (PUBLIC_V4, 443), "hooks.example.com"),
+    ("https://hooks.example.com:8443/p", [PUBLIC_V4], (PUBLIC_V4, 8443), "hooks.example.com:8443"),
+    ("https://hooks.example.com/p", ["2001:4860:4860::8888"], ("2001:4860:4860::8888", 443), "hooks.example.com"),
+])
+async def test_real_httpcore_connects_to_the_checked_address_and_verifies_the_registered_name(
+        url, answers, connect, host_header):
+    rec = {}
+    transport = guard.PublicDestinationTransport(resolver=_resolver(answers))
+    transport._pool._network_backend = _recording_backend(rec)
+    async with httpx.AsyncClient(transport=transport, trust_env=False) as client:
+        response = await client.post(url, content=b"{}")
+    assert response.status_code == 200
+    assert rec["connect"] == connect
+    assert rec["sni"] == "hooks.example.com" and rec["check_hostname"] is True
+    head = rec["written"].split(b"\r\n\r\n", 1)[0].decode("latin1").split("\r\n")
+    assert f"Host: {host_header}" in head
 
 
 # ── the delivery services ───────────────────────────────────────────────────────────────────
@@ -304,3 +410,22 @@ async def test_the_agent_route_answers_400_for_a_rejected_url(monkeypatch):
     with pytest.raises(HTTPException) as info:
         await route.put_agent_webhook_config("agent_1", request, current_user={"role": "agent"})
     assert info.value.status_code == 400
+
+
+@pytest.mark.parametrize("modname", MODULES)
+async def test_a_2xx_with_a_long_html_body_is_delivered_not_retried(monkeypatch, modname):
+    mod = importlib.import_module(modname)
+    sent, persisted = _arm(mod, monkeypatch, [PUBLIC_V4])
+    sent.body = b"<html>" + b"x" * 200_000 + b"</html>"
+    result = await _deliver(mod, "https://hooks.example.com/hook")
+    assert result["status"] == "delivered" and result["http_status"] == 200
+    assert len(persisted[0]["response_body"]) == 4000
+
+
+async def test_the_transport_itself_refuses_a_url_with_credentials(monkeypatch):
+    sent = _Sent()
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", sent.as_method())
+    transport = guard.PublicDestinationTransport(resolver=_resolver([PUBLIC_V4]))
+    with pytest.raises(guard.DestinationBlocked):
+        await transport.handle_async_request(httpx.Request("POST", "https://u:p@hooks.example.com/x"))
+    assert sent.requests == []
