@@ -41,7 +41,7 @@ _REPO = Path(__file__).resolve().parent.parent
 _MIGRATIONS = (
     _REPO / "db/migrations/200_external_seed_destination_liveness.sql",
     # The retirement gap's clock (destination_corroborated_dead_at); the writer reads it.
-    _REPO / "db/migrations/260_external_seed_destination_corroborated_dead_at.sql",
+    _REPO / "db/migrations/266_external_seed_destination_corroborated_dead_at.sql",
 )
 
 # This gate DROPS `external_product_seeds` and `catalog_products`, so it must be incapable of
