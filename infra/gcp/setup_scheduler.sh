@@ -102,7 +102,7 @@ case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (
 # dead observation, lifted by the next live answer. Only meaningful with RETIRE (the sweep passes
 # suppress=retire). Default false: a new nightly write lane is armed deliberately.
 : "${EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION:=false}"
-# The catalog-enrichment twin (jobs.catalog_destination_sweep, migration 261): rows with no seed.
+# The catalog-enrichment twin (jobs.catalog_destination_sweep, migration 267): rows with no seed.
 # OBSERVES unless SUPPRESS is armed; with it, a first corroborated dead observation hides the row
 # (pending, lifted by the next live answer) and a second withdraws it.
 : "${CATALOG_DESTINATION_SWEEP:=false}"

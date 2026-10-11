@@ -1,4 +1,4 @@
--- 261_catalog_destination_liveness.sql
+-- 267_catalog_destination_liveness.sql
 --
 -- Is a catalog product's storefront page still there? For the rows that have no seed to ask.
 --
@@ -10,7 +10,7 @@
 --
 -- One row per catalog product, written ONLY by services/catalog_destination_liveness (the
 -- nightly jobs.catalog_destination_sweep). The verdict vocabulary, the failure streak and its
--- clock mean exactly what they mean on external_product_seeds (migrations 200 and 260), and the
+-- clock mean exactly what they mean on external_product_seeds (migrations 200 and 266), and the
 -- same pure function computes them.
 --
 -- Two clocks, as the refresh queue keeps them (migration 202):

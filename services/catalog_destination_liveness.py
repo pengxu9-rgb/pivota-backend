@@ -22,7 +22,7 @@ automate is reused, not restated:
 
 WHAT IS DIFFERENT, AND WHY.
 
-  * State lives in `catalog_destination_liveness` (migration 261), one row per product, because
+  * State lives in `catalog_destination_liveness` (migration 267), one row per product, because
     there is no seed row to carry it. The job applies that migration itself.
   * Withdrawal is by `product_key` — there is no seed to deactivate. A withdrawn row leaves the
     queue (the candidate query takes only live or pending rows), so reversal is an operator action,
@@ -67,7 +67,7 @@ logger = logging.getLogger("catalog_destination_liveness")
 LANE_SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
 PENDING_SUPPRESSION_REASON = "catalog_destination_dead_pending"
 SUPPRESSION_REASON = "catalog_destination_dead"
-MIGRATION_GLOB = "261_catalog_destination_liveness.sql"
+MIGRATION_GLOB = "267_catalog_destination_liveness.sql"
 
 #: Served rows of this lane that are still ours to judge: live, or pending under OUR reason, with at
 #: least one offer in the same state, on a URL that names a product handle (`group_by_host` drops any
@@ -147,7 +147,7 @@ def _host(url: str) -> Optional[str]:
 
 
 async def ensure_table(db: Any = None) -> None:
-    """Apply migration 261 from the deployed tree: the ONE declaration of this table."""
+    """Apply migration 267 from the deployed tree: the ONE declaration of this table."""
     from db.sql_migrations import split_statements
 
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

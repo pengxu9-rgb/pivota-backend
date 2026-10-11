@@ -1,4 +1,4 @@
-"""Production-dialect gate for catalog destination liveness (migration 261) and its writer.
+"""Production-dialect gate for catalog destination liveness (migration 267) and its writer.
 
     DATABASE_URL=postgresql://localhost/pivota_dialect_check \\
         .venv/bin/python -m pytest tests/test_catalog_destination_liveness_postgres.py
