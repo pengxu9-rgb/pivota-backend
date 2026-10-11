@@ -182,13 +182,15 @@ async def record_catalog_observation(
 
     Actions, only on a CORROBORATED confirmed-dead observation and only with `suppress`:
     streak 1 hides under PENDING_SUPPRESSION_REASON; streak 2 withdraws under SUPPRESSION_REASON
-    (converting a pending row). Any non-dead answer from the origin that resets a streak lifts
-    the pending reason, `suppress` or not — a lift only undoes this lane's own decision.
+    (converting a pending row). Any non-dead answer from the origin lifts the pending reason,
+    `suppress` or not and WHATEVER THE STREAK WAS — a lift only undoes this lane's own decision.
+    Not gated on the streak this observation reset: the reset and the lift are separate
+    statements, so a lift that failed after its reset committed must be retried by the next live
+    answer, which sees streak 0.
     """
     stamp = now or _now()
     row = await database.fetch_one(CURRENT_SQL, {"product_key": product_key})
     current = dict(row) if row else {}
-    streak = int(current.get("destination_failure_streak") or 0)
     next_streak, next_anchor = next_streak_state(current, observation, stamp)
     await database.execute(
         UPSERT_SQL,
@@ -223,7 +225,7 @@ async def record_catalog_observation(
                 [product_key], reason=PENDING_SUPPRESSION_REASON, stamp=stamp, db=database,
             )
             result["pending_suppressed"] = len(moved["products"])
-    elif observation.reached_origin and not observation.confirmed_dead and streak > 0:
+    elif observation.reached_origin and not observation.confirmed_dead:
         moved = await destination_dead_suppression.lift_pending(
             [product_key], reason=PENDING_SUPPRESSION_REASON, db=database,
         )

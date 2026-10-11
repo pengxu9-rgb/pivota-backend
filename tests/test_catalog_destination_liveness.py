@@ -134,6 +134,20 @@ def test_a_live_answer_after_a_streak_lifts_the_pending_reason_armed_or_not(monk
     assert _statements(db, "INSERT INTO catalog_destination_liveness")[0][1]["corroborated_dead_at"] is None
 
 
+@pytest.mark.parametrize("row", [
+    {"destination_failure_streak": 0, "destination_corroborated_dead_at": None,
+     "destination_verdict": "live", "destination_checked_at": NOW - timedelta(hours=20)},
+    None,  # no liveness row at all
+])
+def test_a_live_answer_at_streak_0_still_lifts_a_pending_row(monkeypatch, row):
+    """The reset and the lift are separate statements: a lift that failed after its reset committed
+    leaves the row pending at streak 0, and the next live answer must retry it."""
+    result, db = _record(monkeypatch, row, LIVE, suppress=False)
+    assert result["failure_streak"] == 0 and result["pending_lifted"] == 1
+    lift = _statements(db, "UPDATE catalog_products SET suppressed_at = NULL")
+    assert len(lift) == 1 and lift[0][1]["reason"] == "catalog_destination_dead_pending"
+
+
 def test_an_unreadable_host_stamps_only_the_attempt(monkeypatch):
     row = {"destination_failure_streak": 1, "destination_corroborated_dead_at": NOW - timedelta(hours=20),
            "destination_verdict": "dead_404", "destination_checked_at": NOW - timedelta(hours=20)}

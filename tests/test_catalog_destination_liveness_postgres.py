@@ -167,6 +167,40 @@ async def test_hide_lift_hide_withdraw_on_real_postgres(_db):
 
 
 @pytest.mark.asyncio
+async def test_a_lift_that_failed_after_its_reset_committed_is_retried_by_the_next_live_answer(_db, monkeypatch):
+    from services import catalog_destination_liveness as catalog
+    from services import destination_dead_suppression
+    from services import external_seed_destination_liveness as liveness
+
+    key = P + "retry"
+    url = "https://shop.example/products/retry"
+    await _product(_db, "retry", url=url)
+    dead = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, url, corroborated=True)
+    live = liveness.DestinationObservation(liveness.VERDICT_LIVE, None, None, "listed")
+    await catalog.record_catalog_observation(key, url, dead, now=NOW, suppress=True)
+    assert (await _row(_db, "catalog_products", "product_key", key))["suppression_reason"] == catalog.PENDING_SUPPRESSION_REASON
+
+    # the lift dies after the streak reset has committed
+    real_lift = destination_dead_suppression.lift_pending
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("connection reset mid-lift")
+
+    monkeypatch.setattr(destination_dead_suppression, "lift_pending", _boom)
+    with pytest.raises(RuntimeError):
+        await catalog.record_catalog_observation(key, url, live, now=NOW + timedelta(hours=2), suppress=True)
+    assert (await _row(_db, "catalog_destination_liveness", "product_key", key))["destination_failure_streak"] == 0
+    assert (await _row(_db, "catalog_products", "product_key", key))["suppression_reason"] == catalog.PENDING_SUPPRESSION_REASON
+
+    # the next live answer finds streak 0 and must still lift it
+    monkeypatch.setattr(destination_dead_suppression, "lift_pending", real_lift)
+    lifted = await catalog.record_catalog_observation(key, url, live, now=NOW + timedelta(hours=4), suppress=True)
+    assert lifted["failure_streak"] == 0 and lifted["pending_lifted"] == 1
+    assert (await _row(_db, "catalog_products", "product_key", key))["suppressed_at"] is None
+    assert (await _row(_db, "catalog_offers", "offer_id", P + "offer::retry"))["suppressed_at"] is None
+
+
+@pytest.mark.asyncio
 async def test_a_lift_never_clears_another_lanes_suppression(_db):
     from services import catalog_destination_liveness as catalog
     from services import external_seed_destination_liveness as liveness
