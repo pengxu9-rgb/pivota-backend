@@ -705,8 +705,8 @@ def _require_served_market_is_served(market: str) -> None:
 
 
 async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
-    from services.curated_brand_feed import (CrawlIncomplete, lash_nail_title_evidence, lip_title_evidence,
-                                             records_for_brand)
+    from services.curated_brand_feed import (CrawlIncomplete, PresentedCurrencyMismatch, lash_nail_title_evidence,
+                                             lip_title_evidence, records_for_brand)
     import contextlib
 
     _require_acquisition_is_unserved(job_market(job.get("options")))
@@ -744,6 +744,10 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
         if _transient(crawl):
             raise _throttled(job, stage, str(crawl.get("reason"))) from exc
         raise _Stop("crawl_failed", "failed", f"crawl failed: {crawl.get('reason')}") from exc
+    except PresentedCurrencyMismatch as exc:
+        # The store presents our crawl another currency than its /meta.json names: the read is held, never
+        # labelled (ADR-026 4.4). Not transient -- the next tick would be presented the same.
+        raise _Stop("presented_currency_mismatch", "failed", str(exc)) from exc
     report = getattr(records, "crawl_report", None)
     if not isinstance(report, dict) or report.get("status") != "complete":
         raise _Stop("crawl_unproven", "failed", "crawl completeness was not proven")
