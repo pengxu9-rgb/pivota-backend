@@ -30,11 +30,14 @@ module-level string literal; dialect splits are if/else statements (the PREPARE 
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from typing import Any, Dict, List, Optional
 
 from db.database import IS_POSTGRES, database
 from db.reap_agentic_ledger import _decode_dt, _decode_json
+
+logger = logging.getLogger(__name__)
 
 #: The event types. The CHECK below holds the same strings; a test parses them back out.
 EVENT_TYPES = ("purchase.action_required", "purchase.completed", "purchase.failed")
@@ -95,7 +98,16 @@ async def ensure_agent_purchase_events_schema() -> None:
     """Self-heal parity with migration 265. Idempotent; called at every startup."""
     if IS_POSTGRES:
         await database.execute(_CREATE_TABLE_PG)
-        await database.execute(_ADD_CHECKED_AT_PG)
+        # Lock-free catalog check first; the ALTER (ACCESS EXCLUSIVE) runs only while the column
+        # is missing, and then under schema_guard's lock_timeout, so a boot never queues behind
+        # the worker's transactions on this table. A timeout defers the heal to the next boot.
+        from db.schema_guard import guarded_add_columns
+
+        for statement in guarded_add_columns(_ADD_CHECKED_AT_PG + ";"):
+            try:
+                await database.execute(statement)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("agent_purchase_events: checked_at heal deferred to next boot: %s", exc)
     else:
         await database.execute(_CREATE_TABLE_SQLITE)
         columns = {row["name"] for row in await database.fetch_all(_SQLITE_COLUMNS)}

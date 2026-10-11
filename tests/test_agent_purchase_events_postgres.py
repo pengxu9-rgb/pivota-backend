@@ -191,3 +191,22 @@ async def test_the_heal_adds_checked_at_to_a_table_built_before_it():
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'agent_purchase_events'")}
     assert "checked_at" in cols
     assert isinstance(await events_db.reap_candidates(lookback_hours=24), list)
+
+
+
+async def test_the_heal_takes_no_lock_when_the_column_is_already_there():
+    """A boot must not queue behind (or ahead of) the worker's transactions on this table: with
+    another connection holding a lock that ACCESS EXCLUSIVE would wait on, the heal still returns
+    at once, because it reads the catalog and finds nothing to do."""
+    import asyncpg
+    import db.agent_purchase_events as events_db
+
+    other = await asyncpg.connect(DATABASE_URL)
+    try:
+        tx = other.transaction()
+        await tx.start()
+        await other.execute("LOCK TABLE agent_purchase_events IN ACCESS SHARE MODE")
+        await asyncio.wait_for(events_db.ensure_agent_purchase_events_schema(), timeout=5)
+        await tx.rollback()
+    finally:
+        await other.close()
