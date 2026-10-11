@@ -54,6 +54,9 @@ Job registration happens at start-up time. Currently registers:
 - `cafe24_reconciliation` — every 15 minutes, replays Cafe24 webhook and
   Data Bridge logs for a bounded least-recently-run store batch. It is dormant
   unless CAFE24_RECONCILIATION_ENABLED is explicitly enabled.
+- `agent_purchase_events` — every AGENT_PURCHASE_EVENTS_INTERVAL_SECONDS (default 30):
+  detect purchase.* webhook events from the agent_purchases ledger and hand them to the agent
+  webhook sender. Dormant unless AGENT_PURCHASE_WEBHOOKS_ENABLED and AGENT_PURCHASE_LEDGER_ENABLED.
 - `reap_agentic_purchase_poll` — every REAP_AGENTIC_POLL_INTERVAL_SECONDS
   (default 30), drives jobs/reap_agentic_purchase_poll: requeue stale claims,
   expire overdue purchases (the PII deadline), fail attempt-exhausted ones, then
@@ -260,6 +263,9 @@ _JOB_RUN_DEADLINES = {
     # try/finally that releases every claim on CancelledError, so a cut run
     # strands no leases and the next tick simply re-claims what it did not reach.
     "reap_agentic_purchase_poll": 600,
+    # Detect reads at most 200 candidates; hand-over starts no new round of 10 after 150 s and one
+    # POST is capped at 10 s, so a tick ends well inside 300 s (a cut tick releases its claims).
+    "agent_purchase_events": 300,
 }
 
 
@@ -586,6 +592,26 @@ async def start_scheduler() -> None:
             replace_existing=True,
             max_instances=1,
             misfire_grace_time=_reap_agentic_interval,
+            coalesce=True,
+        )
+
+        # Rail-purchase webhook events (payment orchestration P1): detect events from the
+        # agent_purchases ledger and hand them to the agent webhook sender. Dormant unless
+        # AGENT_PURCHASE_WEBHOOKS_ENABLED and AGENT_PURCHASE_LEDGER_ENABLED (checked inside the job).
+        # max_instances=1 + coalesce: a slow tick never stacks; the hand-over claim is the fence.
+        from jobs.agent_purchase_events import (
+            job_interval_seconds as _ape_interval_seconds,
+            run_agent_purchase_events,
+        )
+        _ape_interval = _ape_interval_seconds()
+        _add_job(
+            run_agent_purchase_events,
+            "interval",
+            seconds=_ape_interval,
+            id="agent_purchase_events",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=_ape_interval,
             coalesce=True,
         )
 

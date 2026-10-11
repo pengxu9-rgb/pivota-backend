@@ -2,8 +2,8 @@
 
   * SCHEDULER_JOB_ALLOWLIST (#2441, services/scheduler_job_allowlist.py) decides whether the loop
     STARTS on this process (`start_*_webhook_retry_worker`).
-  * WEBHOOK_RETRY_DELIVERY_ENABLED (#2445, services/webhook_retry_delivery_gate.py) decides whether
-    a started loop DELIVERS anything (`_retry_worker_loop` and `process_due_retries`).
+  * WEBHOOK_DELIVERY_ENABLED (#2445, renamed in #2446; services/webhook_delivery_gate.py) decides
+    whether a started loop DELIVERS anything (`_retry_worker_loop` and `process_due_retries`).
 
 A retry is delivered only when BOTH allow it. Each case below starts the loop through the real
 start function, then (if it spawned) runs the real loop coroutine against a recorded database and
@@ -23,7 +23,7 @@ import pytest
 
 import services.scheduler_job_allowlist as allowlist_mod
 import services.scheduler_job_runner as runner
-from services import webhook_retry_delivery_gate as gate
+from services import webhook_delivery_gate as gate
 
 MODULES = ["services.agent_webhook_service", "services.merchant_webhook_service"]
 LOOP_ID = {
@@ -45,7 +45,7 @@ _ENV = (
 LISTED = "LISTED"      # the allowlist names this loop
 EXCLUDED = "EXCLUDED"  # the allowlist is set but does not name this loop
 
-# (PIVOTA_ENV, AUDIT_WORKER_ENABLED, allowlist, WEBHOOK_RETRY_DELIVERY_ENABLED) -> (starts, delivers)
+# (PIVOTA_ENV, AUDIT_WORKER_ENABLED, allowlist, WEBHOOK_DELIVERY_ENABLED) -> (starts, delivers)
 CASES = [
     # production, both unset: main after #2445 — starts and delivers
     (("production", None, None, None), (True, True)),

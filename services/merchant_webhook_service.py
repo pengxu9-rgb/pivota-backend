@@ -15,7 +15,7 @@ import httpx
 from db.database import database
 from db.schema_guard import guarded_statements, is_lock_timeout
 from db.startup_ddl import execute_ddl
-from services import webhook_retry_delivery_gate
+from services import webhook_delivery_gate, webhook_destination_guard
 
 
 logger = logging.getLogger(__name__)
@@ -138,13 +138,17 @@ def _build_signature(secret: str, timestamp: str, raw_body: str) -> str:
     return f"v1={digest}"
 
 
-def _validate_destination_url(destination_url: Optional[str]) -> Optional[str]:
+def _validate_destination_url(
+    destination_url: Optional[str], stored_url: Optional[str] = None
+) -> Optional[str]:
+    """A NEW URL must look public (DestinationRejected is a ValueError: the route answers 400).
+    An unchanged stored one is not re-judged here; the send-time transport guards it."""
     raw = str(destination_url or "").strip()
     if not raw:
         return None
-    if not (raw.startswith("https://") or raw.startswith("http://")):
-        raise ValueError("Webhook URL must start with http:// or https://")
-    return raw
+    if raw == str(stored_url or "").strip():
+        return raw
+    return webhook_destination_guard.check_destination_url(raw)
 
 
 def _build_event_payload(
@@ -389,7 +393,7 @@ async def update_webhook_config(
 ) -> Dict[str, Any]:
     current = await _get_or_create_raw_config(merchant_id)
     now = _db_now()
-    next_url = _validate_destination_url(destination_url)
+    next_url = _validate_destination_url(destination_url, current.get("destination_url"))
     next_enabled = bool(enabled and next_url)
     next_events = _normalize_events(subscribed_events)
     current_secret = str(current.get("signing_secret") or "").strip() or _generate_signing_secret()
@@ -638,6 +642,10 @@ async def _attempt_delivery(
     prior_attempts: int = 0,
     created_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
+    if not webhook_delivery_gate.delivery_enabled():
+        # The one place this service POSTs, so emit, per-row retry, test send and the retry loop
+        # all stop here outside production. No HTTP, no row; a retrying row stays as it was.
+        return webhook_delivery_gate.skipped_result(event_type=event_type, delivery_id=delivery_id)
     delivery_id = delivery_id or f"mwh_{uuid.uuid4().hex[:24]}"
     event_id = event_id or f"evt_{uuid.uuid4().hex[:24]}"
     created_at = created_at or _utcnow()
@@ -668,7 +676,12 @@ async def _attempt_delivery(
 
     started = _utcnow()
     try:
-        async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT_SECONDS, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=DELIVERY_TIMEOUT_SECONDS,
+            follow_redirects=False,
+            transport=webhook_destination_guard.PublicDestinationTransport(),
+            trust_env=False,
+        ) as client:
             response = await client.post(destination_url, content=raw_body, headers=headers)
         latency_ms = int((_utcnow() - started).total_seconds() * 1000)
         http_status = response.status_code
@@ -682,6 +695,11 @@ async def _attempt_delivery(
             last_error = f"Webhook destination returned HTTP {response.status_code}"
         else:
             last_error = f"Webhook destination returned HTTP {response.status_code}"
+    except webhook_destination_guard.DestinationBlocked as exc:
+        # Terminal: a non-public destination stays non-public, so a retry only repeats the refusal.
+        latency_ms = int((_utcnow() - started).total_seconds() * 1000)
+        status = "failed"
+        last_error = f"Webhook destination blocked: {exc}"
     except Exception as exc:
         latency_ms = int((_utcnow() - started).total_seconds() * 1000)
         last_error = str(exc)
@@ -923,9 +941,9 @@ async def process_due_retries(
     Nothing is lost by stopping early: an undelivered retry stays `retrying` with its
     `next_retry_at` unchanged, so the next instance picks it up on its next poll.
     """
-    if not webhook_retry_delivery_gate.retry_delivery_enabled():
+    if not webhook_delivery_gate.delivery_enabled():
         # Outside production (or with the kill switch off) nothing is selected and nothing is
-        # sent; due rows stay exactly as they are. See services/webhook_retry_delivery_gate.py.
+        # sent; due rows stay exactly as they are. See services/webhook_delivery_gate.py.
         return 0
     await ensure_merchant_webhook_tables()
     rows = await database.fetch_all(
@@ -960,13 +978,13 @@ async def process_due_retries(
 
 
 async def _retry_worker_loop(stop_event: asyncio.Event) -> None:
-    if not webhook_retry_delivery_gate.retry_delivery_enabled():
+    if not webhook_delivery_gate.delivery_enabled():
         # WARNING, not INFO: prod drops module-logger INFO, and this line is the only sign on a
         # staging process that its retries are deliberately parked rather than broken.
         logger.warning(
-            "merchant webhook retry worker NOT started: retry delivery is disabled on this process "
+            "merchant webhook retry worker NOT started: webhook delivery is disabled on this process "
             "(%s). Due retries stay due. Set %s=true to deliver them.",
-            webhook_retry_delivery_gate.describe(), webhook_retry_delivery_gate.ENV_VAR,
+            webhook_delivery_gate.describe(), webhook_delivery_gate.ENV_VAR,
         )
         return
     while not stop_event.is_set():

@@ -1179,6 +1179,22 @@ async def ensure_required_schema_light() -> None:
                 await ensure_price_witness_schema()
             except Exception as exc:
                 logger.warning("schema_guard: Reap price witness schema unavailable (%s)", type(exc).__name__)
+            # mig 264: the rail-neutral purchase ledger (payment orchestration P0). Its own try:
+            # it is written only behind AGENT_PURCHASE_LEDGER_ENABLED, never inside a rail's
+            # transaction, and a failure here must not starve what follows. The DDL lives in
+            # db/agent_purchase_ledger._CREATE_TABLE_PG (dialect split there).
+            try:
+                from db.agent_purchase_ledger import ensure_agent_purchase_schema
+                await ensure_agent_purchase_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchases (mig 264) unavailable (%s)", type(exc).__name__)
+            # mig 265: durable purchase events for agent platforms (payment orchestration P1). Own try:
+            # written only behind AGENT_PURCHASE_WEBHOOKS_ENABLED; DDL in db/agent_purchase_events.
+            try:
+                from db.agent_purchase_events import ensure_agent_purchase_events_schema
+                await ensure_agent_purchase_events_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchase_events (mig 265) unavailable (%s)", type(exc).__name__)
             # mig 252: AT MOST ONE PENDING ENROLLMENT PER BUYER.
             # db/migrations/252_reap_agentic_enrollments_one_pending.sql is the
             # same index. Two purchases of one buyer, each in 'resolving' in one
@@ -3173,6 +3189,16 @@ async def ensure_required_schema_light() -> None:
                 "ADD COLUMN IF NOT EXISTS rating_value NUMERIC, "
                 "ADD COLUMN IF NOT EXISTS rating_count INTEGER;"
             )
+            # mig 263: per-currency price summary on the served view, and the
+            # stamp tying it to the write that produced it
+            # (services/agent_pdp_view_assembler.build_market_prices). Nullable,
+            # written only while AGENT_PDP_VIEW_MARKET_PRICES is on; readers use
+            # the summary only while its stamp equals refreshed_at.
+            await _heal_add_columns(
+                "ALTER TABLE IF EXISTS agent_pdp_view "
+                "ADD COLUMN IF NOT EXISTS market_prices JSONB, "
+                "ADD COLUMN IF NOT EXISTS market_prices_refreshed_at TIMESTAMPTZ;"
+            )
             # mig 181: ONE canonical URL per content_key. 474 content_keys
             # carry >1 sitemap-eligible renderable sig; every sibling serves
             # identical content under a self-referential canonical tag. The
@@ -3902,6 +3928,22 @@ async def ensure_required_schema_light() -> None:
                 await ensure_price_witness_schema()
             except Exception as exc:
                 logger.warning("schema_guard: Reap price witness schema unavailable (%s)", type(exc).__name__)
+            # mig 264: the rail-neutral purchase ledger (payment orchestration P0). Its own try:
+            # it is written only behind AGENT_PURCHASE_LEDGER_ENABLED, never inside a rail's
+            # transaction, and a failure here must not starve what follows. The DDL lives in
+            # db/agent_purchase_ledger._CREATE_TABLE_PG (dialect split there).
+            try:
+                from db.agent_purchase_ledger import ensure_agent_purchase_schema
+                await ensure_agent_purchase_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchases (mig 264) unavailable (%s)", type(exc).__name__)
+            # mig 265: durable purchase events for agent platforms (payment orchestration P1). Own try:
+            # written only behind AGENT_PURCHASE_WEBHOOKS_ENABLED; DDL in db/agent_purchase_events.
+            try:
+                from db.agent_purchase_events import ensure_agent_purchase_events_schema
+                await ensure_agent_purchase_events_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchase_events (mig 265) unavailable (%s)", type(exc).__name__)
             # mig 252: at most one PENDING enrollment per buyer, SQLite twin of
             # the Postgres block above (same index, same reason, same own try:
             # it fails on a database that already holds two pending rows for one

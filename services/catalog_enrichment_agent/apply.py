@@ -648,10 +648,27 @@ def _skipped_products(refusals: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any
     return [refusals[k] for k in sorted(refusals)]
 
 
+def _plan_variants_by_product(skus: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """The plan's planned SKU rows per product_key, as the identity gate's `variants`.
+
+    F2 (2026-10-10): the crawl lane promotes a variant barcode to the product `gtin` only for a
+    product with exactly one barcoded variant, so a family's barcodes reach catalog_skus.barcode
+    and nowhere else -- and Tier-0a never saw them. The SKU rows are passed exactly as planned
+    (barcode as the source gave it, the shade title, sku_key): intake_identity canonicalizes the
+    barcode and skips the synthetic `::canonical` row itself."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for sku in skus or []:
+        key = str(sku.get("product_key") or "")
+        if key and sku.get("barcode"):
+            out.setdefault(key, []).append(sku)
+    return out
+
+
 async def _apply_pdp_identity_gate(
     pdp: Dict[str, Any], *, identity_gate_on: bool,
     group_targets: Optional[Dict[str, str]] = None,
     refusals: Optional[Dict[str, Dict[str, Any]]] = None,
+    variants: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
     """Shared pre-insert step for a PDP row (both executors). Mutates `pdp` in
     place: canonicalizes the source barcode into the `gtin` match-attribute column
@@ -687,6 +704,7 @@ async def _apply_pdp_identity_gate(
             "product_key": pdp.get("product_key"),
             "strict_group_resolution": True,
         },
+        variants=variants,
     )
     # The shared resolver serves legacy doors that may return an error-shaped
     # MINT. This primary writer cannot publish that substituted identity.
@@ -2262,6 +2280,7 @@ async def _apply_ingest_plan(
     )
 
     identity_gate_on = intake_identity_enabled(DOOR_CATALOG_ENRICHMENT)
+    plan_variants = _plan_variants_by_product(skus)
     group_targets: Dict[str, str] = {}
     counts["product_groups_failed"] = 0
     counts["pdps_skipped_identity"] = 0
@@ -2271,7 +2290,8 @@ async def _apply_ingest_plan(
     # 2. catalog_products — UPSERT by product_key.
     for pdp in pdps:
         if not await _apply_pdp_identity_gate(pdp, identity_gate_on=identity_gate_on, group_targets=group_targets,
-                                              refusals=refusals):
+                                              refusals=refusals,
+                                              variants=plan_variants.get(str(pdp.get("product_key") or ""))):
             counts["pdps_skipped_identity"] += 1
             skipped_product_keys.add(pdp.get("product_key"))
             continue
@@ -2434,6 +2454,7 @@ async def _apply_ingest_plan_batched(
     )
 
     identity_gate_on = intake_identity_enabled(DOOR_CATALOG_ENRICHMENT)
+    plan_variants = _plan_variants_by_product(skus)
     group_targets: Dict[str, str] = {}
     counts["product_groups_failed"] = 0
     skipped_product_keys: set = set()
@@ -2444,7 +2465,8 @@ async def _apply_ingest_plan_batched(
     insertable_pdps = []
     for pdp in pdps:
         if not await _apply_pdp_identity_gate(pdp, identity_gate_on=identity_gate_on, group_targets=group_targets,
-                                              refusals=refusals):
+                                              refusals=refusals,
+                                              variants=plan_variants.get(str(pdp.get("product_key") or ""))):
             counts["pdps_skipped_identity"] += 1
             skipped_product_keys.add(pdp.get("product_key"))
             continue
