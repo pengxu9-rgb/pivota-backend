@@ -185,6 +185,12 @@ def get_managed_receiver_url(agent_id: str) -> str:
 
 
 def _normalize_destination_url(agent_id: str, destination_url: Optional[str]) -> Optional[str]:
+    """Pin this agent's managed inbox to the host we serve it from TODAY, whatever host is stored.
+
+    The stored config (and every delivery row) keeps the URL as it was written, so after the API
+    host moved, a managed-inbox config still named the retired host and every send 404'd there.
+    Read paths showed the rewritten URL while emit, test send and retry POSTed the stored one, so
+    every place that resolves a send's destination must call this, not read the column raw."""
     raw = str(destination_url or "").strip()
     if not raw:
         return None
@@ -1019,7 +1025,7 @@ async def emit_agent_webhook_event(
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     config = await _get_or_create_raw_config(agent_id)
-    destination_url = str(config.get("destination_url") or "").strip()
+    destination_url = _normalize_destination_url(agent_id, config.get("destination_url")) or ""
     enabled = bool(config.get("enabled") and destination_url)
     subscribed_events = _normalize_events(_coerce_json(config.get("subscribed_events"), []))
     signing_secret = str(config.get("signing_secret") or "").strip()
@@ -1068,7 +1074,7 @@ async def emit_agent_webhook_event(
 
 async def send_test_webhook(agent_id: str, *, request_id: Optional[str] = None) -> Dict[str, Any]:
     config = await _get_or_create_raw_config(agent_id)
-    destination_url = str(config.get("destination_url") or "").strip()
+    destination_url = _normalize_destination_url(agent_id, config.get("destination_url"))
     if not destination_url or not bool(config.get("enabled")):
         raise ValueError("Configure and enable a webhook destination before sending a test event.")
 
@@ -1172,7 +1178,11 @@ async def retry_delivery(agent_id: str, delivery_id: str) -> Dict[str, Any]:
         raise ValueError("Webhook delivery not found.")
 
     config = await _get_or_create_raw_config(agent_id)
-    destination_url = str(row["destination_url"] or config.get("destination_url") or "").strip()
+    # A row stores the URL it was first sent to, so a managed-inbox row written before a host
+    # move would retry at the old host forever; it goes to the inbox's current URL instead.
+    destination_url = _normalize_destination_url(
+        agent_id, row["destination_url"] or config.get("destination_url")
+    ) or ""
     signing_secret = str(config.get("signing_secret") or "").strip()
     if not destination_url or not signing_secret:
         raise ValueError("Webhook destination is not configured.")
