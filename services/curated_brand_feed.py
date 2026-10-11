@@ -463,13 +463,62 @@ def classify_transport_failure(exc: BaseException) -> Optional[Dict[str, str]]:
 
 class ShopifyProductBatch(list):
     """List-compatible result; successful results always represent an exhausted feed -- of the
-    store, or (scope "collection:<handle>") of one collection only, never claimed for the store."""
-    def __init__(self, products: list, *, scanned_products: int, pages: int, scope: str = "store"):
+    store, or (scope "collection:<handle>") of one collection only, never claimed for the store.
+    `presented` is the crawl's own `cart_currency` evidence (`_PresentedCurrency.report()`), when read."""
+    def __init__(self, products: list, *, scanned_products: int, pages: int, scope: str = "store",
+                 presented: Optional[Dict[str, Any]] = None):
         super().__init__(products)
         self.crawl_report = {"status": "complete", "scanned_products": scanned_products,
                              "selected_products": len(products), "pages": pages}
         if scope != "store":
             self.crawl_report["scope"] = scope
+        if presented is not None:
+            self.crawl_report["presented_currency"] = presented
+
+
+class _PresentedCurrency:
+    """The currency each `/products.json` page was PRESENTED in, from the `cart_currency` Set-Cookie of
+    that page's own response (services/shopify_presentment: the one rule for "which currency was this
+    read in"). The body carries prices but no currency, and `/meta.json` names the shop's BASE currency,
+    not the one a given requester is shown: Shopify presents by the requester's geography and the store's
+    Markets setup. ADR-026 (Appendix B, 2026-10-11) measured one served store presenting our crawl
+    egress a foreign currency while its /meta.json named USD -- a crawl would have labelled those amounts
+    USD. `records_for_brand` refuses a crawl whose pages were presented in another currency
+    (`PresentedCurrencyMismatch`). A page with no cookie proves nothing either way and is only counted."""
+
+    def __init__(self) -> None:
+        self.currencies: set = set()
+        self.pages_with_cookie = 0
+        self.pages_without_cookie = 0
+        self.problems: Dict[str, int] = {}
+
+    def note(self, resp: Any) -> None:
+        from services.shopify_presentment import presentment_currency
+        headers = getattr(resp, "headers", None)
+        cookies = headers.get_list("set-cookie") if hasattr(headers, "get_list") else []
+        currency, problem = presentment_currency(cookies)
+        if currency is not None:
+            self.currencies.add(currency)
+            self.pages_with_cookie += 1
+            return
+        if problem == "cookie_absent":
+            self.pages_without_cookie += 1
+            return
+        # Two different values on one response, or a malformed one: no proof, and recorded as such.
+        self.problems[problem] = self.problems.get(problem, 0) + 1
+
+    def merge(self, report: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(report, dict):
+            return
+        self.currencies.update(report.get("currencies") or ())
+        self.pages_with_cookie += int(report.get("pages_with_cookie") or 0)
+        self.pages_without_cookie += int(report.get("pages_without_cookie") or 0)
+        for k, v in (report.get("problems") or {}).items():
+            self.problems[k] = self.problems.get(k, 0) + int(v or 0)
+
+    def report(self) -> Dict[str, Any]:
+        return {"currencies": sorted(self.currencies), "pages_with_cookie": self.pages_with_cookie,
+                "pages_without_cookie": self.pages_without_cookie, "problems": dict(self.problems)}
 
 
 #: Shopify serves /products.json pages 1..100 only: page 101 answers HTTP 400 (measured 2026-09-24 on
@@ -521,6 +570,7 @@ async def fetch_shopify_products(
     scanned = 0
     page = 1
     seen_pages: set = set()
+    presented = _PresentedCurrency()
     # /products.json (and a collection's) is Shopify's storefront feed: this host is Shopify-served
     # by construction, so every page of the crawl -- the first included -- is paced on the crawl IP's
     # shared Shopify-edge budget (a no-op with CRAWL_SHOPIFY_EDGE_PACER_ENABLED off).
@@ -569,6 +619,7 @@ async def fetch_shopify_products(
                     raise incomplete(f"HTTP {resp.status_code}")
                 if "application/json" not in (resp.headers.get("content-type") or ""):
                     raise incomplete("storefront did not return JSON")
+                presented.note(resp)
                 body = resp.json()
                 if not isinstance(body, dict) or not isinstance(body.get("products"), list):
                     raise incomplete("invalid products.json envelope")
@@ -576,7 +627,8 @@ async def fetch_shopify_products(
                 if not all(isinstance(p, dict) for p in products):
                     raise incomplete("products.json contains a non-object product")
                 if not products:
-                    return ShopifyProductBatch(out, scanned_products=scanned, pages=page, scope=scope)
+                    return ShopifyProductBatch(out, scanned_products=scanned, pages=page, scope=scope,
+                                               presented=presented.report())
                 fingerprint = json.dumps(products, sort_keys=True, default=str)
                 if fingerprint in seen_pages:
                     raise incomplete("repeated page; pagination did not advance")
@@ -635,6 +687,7 @@ async def fetch_shopify_collections(
     merged: Dict[Any, Dict[str, Any]] = {}
     per: Dict[str, Dict[str, Any]] = {}
     scanned = pages = 0
+    presented = _PresentedCurrency()
     for handle in handles:
         remaining = max_scan_products - scanned  # the scan budget bounds ALL collections together
         if remaining < 1:
@@ -650,6 +703,7 @@ async def fetch_shopify_collections(
             exc.selected_products += len(merged)
             raise
         report = batch.crawl_report
+        presented.merge(report.get("presented_currency"))
         per[handle] = {k: report.get(k) for k in ("pages", "scanned_products", "selected_products")}
         scanned += int(report.get("scanned_products") or 0)
         pages += int(report.get("pages") or 0)
@@ -664,7 +718,7 @@ async def fetch_shopify_collections(
         raise CrawlIncomplete(f"{_clean_domain(domain)}: selected-product budget {max_products} exhausted",
                               status="capped", next_page=0, scanned_products=scanned, selected_products=len(merged))
     out = ShopifyProductBatch(list(merged.values()), scanned_products=scanned, pages=pages,
-                              scope="collections:" + ",".join(handles))
+                              scope="collections:" + ",".join(handles), presented=presented.report())
     out.crawl_report["collections"] = per
     return out
 
@@ -3019,6 +3073,12 @@ class CurrencyNotProven(RuntimeError):
     """
 
 
+class PresentedCurrencyMismatch(CurrencyNotProven):
+    """The crawl's own `/products.json` responses were presented in a currency other than the one
+    `/meta.json` proved: the prices it read are not in the currency they would be labelled with
+    (`_PresentedCurrency`). The whole brand is refused before a record is built; nothing is relabelled."""
+
+
 def _vendor_token(value: Optional[str]) -> str:
     """Comparison form of a Shopify `vendor` string: casefolded, whitespace collapsed.
 
@@ -3160,6 +3220,15 @@ async def records_for_brand(
                 f"page reads exactly like a missing file. If {actual or 'the proven value'} "
                 f"is genuinely right, pass --require-currency {actual or '<code>'} instead."
             )
+    presented = (crawl_report or {}).get("presented_currency") if isinstance(crawl_report, dict) else None
+    foreign = sorted(set((presented or {}).get("currencies") or ()) - {locale.get("currency")})
+    if foreign:
+        # BEFORE the records are built: every price on those pages is in `foreign`, not the label.
+        raise PresentedCurrencyMismatch(
+            f"{domain}: /products.json was presented in {'/'.join(foreign)} (the cart_currency cookie of the "
+            f"crawl's own responses, {presented.get('pages_with_cookie')} page(s)), but /meta.json proved "
+            f"{locale.get('currency')}: those prices are not {locale.get('currency')} amounts. Refusing the "
+            f"crawl; nothing is relabelled or converted.")
     if only_vendors is not None:
         # A filter that was ASKED FOR but normalises to nothing is refused, not skipped.
         # `--only-vendor "$VENDOR"` with the variable unset, or a jsonl row

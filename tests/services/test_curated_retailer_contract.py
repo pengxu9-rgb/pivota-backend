@@ -124,6 +124,8 @@ async def test_vendor_selection_scans_past_selected_product_budget(monkeypatch):
     assert records.crawl_report == {
         "status": "complete", "pages": 4, "scanned_products": 5, "selected_products": 1, "emitted_records": 1,
         "gift_items_dropped": 0, "gift_items_dropped_sample": [],
+        # No page carried a cart_currency cookie: no proof either way, counted (ADR-026 P0).
+        "presented_currency": {"currencies": [], "pages_with_cookie": 0, "pages_without_cookie": 4, "problems": {}},
     }
 
 
