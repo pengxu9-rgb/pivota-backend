@@ -189,11 +189,12 @@ async def test_run_app_names_are_blocked_at_send_whatever_they_resolve_to(monkey
     assert sent.requests == [] and calls == []
 
 
-def test_the_blocked_suffixes_are_configurable(monkeypatch):
+def test_extra_blocked_suffixes_are_configurable(monkeypatch):
     monkeypatch.setenv("WEBHOOK_BLOCKED_HOST_SUFFIXES", "internal.example, .corp.example")
-    with pytest.raises(guard.DestinationRejected):
-        guard.check_destination_url("https://svc.internal.example/x")
-    assert guard.check_destination_url("https://svc.run.app/x") == "https://svc.run.app/x"
+    for url in ("https://svc.internal.example/x", "https://a.corp.example/x", "https://svc.run.app/x"):
+        with pytest.raises(guard.DestinationRejected):
+            guard.check_destination_url(url)  # extra suffixes ADD to the default, never replace it
+    assert guard.check_destination_url("https://hooks.example.com/x") == "https://hooks.example.com/x"
 
 
 async def test_a_resolver_that_hangs_is_a_connect_timeout(monkeypatch):
@@ -429,3 +430,77 @@ async def test_the_transport_itself_refuses_a_url_with_credentials(monkeypatch):
     with pytest.raises(guard.DestinationBlocked):
         await transport.handle_async_request(httpx.Request("POST", "https://u:p@hooks.example.com/x"))
     assert sent.requests == []
+
+
+
+@pytest.mark.parametrize("raw", ["", " ", ",", " , .", "corp.example"])
+def test_the_run_app_block_survives_any_suffix_setting(monkeypatch, raw):
+    monkeypatch.setenv("WEBHOOK_BLOCKED_HOST_SUFFIXES", raw)
+    with pytest.raises(guard.DestinationRejected):
+        guard.check_destination_url("https://x.run.app/x")
+
+
+@pytest.mark.parametrize("url", ["https://web-1.run%2Eapp/x", "https://a%20b.example/x", "https://a\\.b/x",
+                                 "https://web-1.run.app%00.evil.example/x"])
+def test_a_host_no_resolver_can_look_up_is_rejected_at_save(url):
+    with pytest.raises(guard.DestinationRejected):
+        guard.check_destination_url(url)
+
+
+async def test_dns_tls_and_host_all_judge_the_punycode_name(monkeypatch):
+    rec = {}
+    looked_up = []
+
+    async def resolve(host, port):
+        looked_up.append(host)
+        return [PUBLIC_V4]
+
+    transport = guard.PublicDestinationTransport(resolver=resolve)
+    transport._pool._network_backend = _recording_backend(rec)
+    async with httpx.AsyncClient(transport=transport, trust_env=False) as client:
+        await client.post("https://fa\u00df.de/p", content=b"{}")
+    head = rec["written"].split(b"\r\n\r\n", 1)[0].decode("latin1").split("\r\n")
+    assert looked_up == ["xn--fa-hia.de"] and rec["sni"] == "xn--fa-hia.de"
+    assert "Host: xn--fa-hia.de" in head
+
+
+async def test_a_trailing_dot_is_not_sent_as_the_tls_name():
+    rec = {}
+    transport = guard.PublicDestinationTransport(resolver=_resolver([PUBLIC_V4]))
+    transport._pool._network_backend = _recording_backend(rec)
+    async with httpx.AsyncClient(transport=transport, trust_env=False) as client:
+        await client.post("https://hooks.example.com./p", content=b"{}")
+    assert rec["sni"] == "hooks.example.com"
+
+
+async def test_real_httpcore_falls_through_a_refused_address_without_sending_twice():
+    from httpcore._backends import mock
+
+    connects, rec = [], {}
+
+    class Stream(mock.AsyncMockStream):
+        async def write(self, buffer, timeout=None):
+            rec.setdefault("written", b"")
+            rec["written"] += bytes(buffer)
+
+        async def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+            return self
+
+        def get_extra_info(self, info):
+            return None if info == "ssl_object" else super().get_extra_info(info)
+
+    class Backend(mock.AsyncMockBackend):
+        async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+            import httpcore
+
+            connects.append(host)
+            if len(connects) == 1:
+                raise httpcore.ConnectError("refused")
+            return Stream(list(self._buffer))
+
+    transport = guard.PublicDestinationTransport(resolver=_resolver(["93.184.216.35", PUBLIC_V4]))
+    transport._pool._network_backend = Backend([b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"])
+    async with httpx.AsyncClient(transport=transport, trust_env=False) as client:
+        response = await client.post("https://hooks.example.com/p", content=b'{"event":1}')
+    assert response.status_code == 200 and connects == [PUBLIC_V4, "93.184.216.35"]
+    assert rec["written"].count(b'{"event":1}') == 1

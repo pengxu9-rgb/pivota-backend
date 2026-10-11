@@ -17,7 +17,8 @@ Two layers, because each one alone has a hole:
    address is public, and then connects to the address it checked, keeping the original Host
    header and TLS SNI. Resolving once and connecting to that address is what defeats DNS
    rebinding (a name that answers public for the check and private for the connect). Redirects
-   are never followed by the callers. Response bodies are capped.
+   are never followed by the callers. Response bodies are capped. Worst case for one send:
+   resolve (connect timeout) + up to three connects + the read, about 50 s at 10 s timeouts.
 
 PUBLIC IS NOT THE SAME AS OUTSIDE. The senders run with all-traffic VPC egress, under which a
 call to one of OUR OWN Cloud Run services (`*.run.app`, public anycast addresses) arrives as
@@ -36,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import os
+import re
 import socket
 from typing import Awaitable, Callable, List, Optional, Union
 from urllib.parse import urlsplit
@@ -53,6 +55,8 @@ _INTERNAL_SUFFIXES = (
 _V6_WRAPPERS = tuple(ipaddress.ip_network(n) for n in ("64:ff9b::/96", "64:ff9b:1::/48", "::/96"))
 _BLOCKED_SUFFIXES_ENV = "WEBHOOK_BLOCKED_HOST_SUFFIXES"
 _DEFAULT_BLOCKED_SUFFIXES = (".run.app",)
+#: What a resolvable host (punycode name, IPv4, or bracket-less IPv6 literal) is made of.
+_HOST_CHARS_RE = re.compile(r"^[a-z0-9.:-]+\Z")
 #: Addresses of one name tried, in order, when connecting fails (a CDN with one node down).
 _MAX_ADDRESS_ATTEMPTS = 3
 #: Seconds to wait for DNS when the request carries no connect timeout.
@@ -82,11 +86,11 @@ def is_public_address(ip: IPAddress) -> bool:
 
 
 def _blocked_suffixes() -> tuple:
-    raw = os.getenv(_BLOCKED_SUFFIXES_ENV)
-    if raw is None:
-        return _DEFAULT_BLOCKED_SUFFIXES
-    parts = tuple("." + p.strip().lower().lstrip(".") for p in raw.split(",") if p.strip())
-    return parts
+    """The configured suffixes, ALWAYS including the defaults: an empty or blank value (a Cloud Run
+    env entry with no value) must not silently reopen our own services. Extra suffixes add."""
+    raw = os.getenv(_BLOCKED_SUFFIXES_ENV) or ""
+    extra = tuple("." + p.strip().lower().lstrip(".") for p in raw.split(",") if p.strip().strip("."))
+    return _DEFAULT_BLOCKED_SUFFIXES + tuple(x for x in extra if x not in _DEFAULT_BLOCKED_SUFFIXES)
 
 
 def _is_internal_name(host: str) -> bool:
@@ -118,9 +122,12 @@ def check_destination_url(raw: Optional[str]) -> str:
         raise DestinationRejected("Webhook URL is not a valid URL") from exc
     if url.port == 0:
         raise DestinationRejected("Webhook URL has an invalid port")
-    host = (url.host or "").rstrip(".").lower()
+    host = url.raw_host.decode("ascii").rstrip(".").lower()
     if not host:
         raise DestinationRejected("Webhook URL must have a host")
+    if not _HOST_CHARS_RE.match(host):
+        # A host no resolver can look up (`%`, a space, a backslash) is six failed sends later.
+        raise DestinationRejected("Webhook URL has an invalid host")
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
@@ -217,13 +224,17 @@ class PublicDestinationTransport(httpx.AsyncHTTPTransport):
             raise DestinationBlocked("destination port is invalid")
         port = url.port or (443 if url.scheme == "https" else 80)
         timeout = request.extensions.get("timeout") if isinstance(request.extensions.get("timeout"), dict) else {}
-        addresses = await self._public_addresses(url.host, port, timeout.get("connect"))
+        # The ASCII (punycode) host, exactly as the Host header carries it: resolving, the suffix
+        # check and TLS must all judge the same name (`url.host` is unicode, and Python's IDNA
+        # 2003 codec maps e.g. `faß.de` to a DIFFERENT domain than httpx's `xn--fa-hia.de`).
+        host = url.raw_host.decode("ascii")
+        addresses = await self._public_addresses(host, port, timeout.get("connect"))
         headers = request.headers.copy()
         headers["Host"] = url.netloc.decode("ascii")
         extensions = dict(request.extensions)
         if url.scheme == "https":
             # Certificate checked against the name the owner registered, not the address.
-            extensions["sni_hostname"] = url.host
+            extensions["sni_hostname"] = host.rstrip(".")
         body = await request.aread()  # replayable across address attempts
         last_error: Optional[Exception] = None
         for address in addresses[:_MAX_ADDRESS_ATTEMPTS]:
