@@ -1579,14 +1579,16 @@ async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timin
     planned = capture["planned"]
     summary = {"crawl": checks.get("markets_capture"), "plan": {"planned": len(planned)}, "checks": checks,
                "flags": []}
+    proof = checks["markets_capture"].get("proof") or "no product answered"
     if not planned:
         raise _Stop("nothing_to_capture", "nothing",
-                    f"the {market} session was proven but no base offer has a sellable {currency} price "
-                    f"({checks['markets_capture'].get('skipped')})", checks=checks)
+                    f"no base offer has a proven {currency} price for {market} (proof mode: {proof}): "
+                    f"{checks['markets_capture'].get('skipped')}", checks=checks)
     if stage == DRY_RUN:
         await ledger.finish_run(run_id, outcome="clean", **summary, db=db)
-        await _move(job, status="apply_due", run_id=run_id, reason=f"{market} session proven, {len(planned)} "
-                    f"{currency} sibling offer(s) planned; apply due", next_run_at=datetime.now(timezone.utc), db=db)
+        await _move(job, status="apply_due", run_id=run_id, reason=f"{market} {currency} proven ({proof}), "
+                    f"{len(planned)} {currency} sibling offer(s) planned; apply due",
+                    next_run_at=datetime.now(timezone.utc), db=db)
         return {"job_id": job["id"], "stage": stage, "outcome": "clean", "status": "apply_due"}
 
     checks.setdefault("catalog_write", ledger.CATALOG_WRITE_NOT_STARTED)
