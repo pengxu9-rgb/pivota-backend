@@ -16,7 +16,7 @@ URL = os.getenv("DATABASE_URL", "")
 pytestmark = pytest.mark.skipif(not URL.startswith("postgres"), reason="requires test Postgres")
 
 PREFIX = "mkt-gate-"
-HOST = "mkt-gate-goto.example"
+HOST = "mkt-gate-aud-brand.example"
 #: A retailer listing key (ingestion: "ext:" + "retailer:" + digest), cleaned up like PREFIX rows.
 RETAILER_PREFIX = "ext:retailer:" + PREFIX
 #: The dialect gate runs on `pivota_dialect_check` in CI (and fails on ANY skip); local runs use *_test.
@@ -91,15 +91,15 @@ async def db():
         await database.disconnect()
 
 
-async def _product(db, key, *, content_key, brand="Go-To"):
+async def _product(db, key, *, content_key, brand="Example AUD Brand"):
     await db.execute(
         "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, brand,"
-        " category_path, image_url, pdp_scope, content_key, pdp_lifecycle_stage) VALUES (:k, 'agent_seed::go-to',"
+        " category_path, image_url, pdp_scope, content_key, pdp_lifecycle_stage) VALUES (:k, 'agent_seed::example-aud-brand',"
         " 'external_seed', :k, 'Face Hero', :b, 'beauty/skincare/face-oil', 'https://cdn.example/i.jpg',"
         " 'multi_merchant_canonical', :ck, 'published')", {"k": key, "b": brand, "ck": content_key})
     await db.execute(
         "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, source_variant_id,"
-        " title) VALUES (:s, :k, 'agent_seed::go-to', 'external_seed', :k, :k, 'Face Hero')",
+        " title) VALUES (:s, :k, 'agent_seed::example-aud-brand', 'external_seed', :k, :k, 'Face Hero')",
         {"s": key + "::canonical", "k": key})
 
 
@@ -108,7 +108,7 @@ async def _offer(db, oid, key, *, currency="AUD", market="AU", host=HOST,
     await db.execute(
         "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, offer_type, is_first_party, market,"
         " currency, list_price, merchant_effective_price, source_system, source_ref, source_domain, offer_mode)"
-        " VALUES (:o, :s, :k, 'agent_seed::go-to', 'brand_direct', TRUE, :m, :c, :p, :p, :sys, :ref, :h,"
+        " VALUES (:o, :s, :k, 'agent_seed::example-aud-brand', 'brand_direct', TRUE, :m, :c, :p, :p, :sys, :ref, :h,"
         " 'external_referral')",
         {"o": oid, "s": key + "::canonical", "k": key, "m": market, "c": currency, "p": price, "sys": source_system,
          "ref": f"https://{host}/products/face-hero", "h": host})
@@ -145,10 +145,10 @@ async def test_the_candidate_read_returns_only_this_hosts_base_currency_crawl_ro
     await _offer(db, PREFIX + "gone", key)
     await db.execute("UPDATE catalog_offers SET suppressed_at = NOW() WHERE offer_id = :o", {"o": PREFIX + "gone"})
     brand_store = {"source_role": "brand_official", "source": "shopify_markets"}  # every US capture's role
-    rows = await markets.load_candidates({"domain": "www." + HOST, "brand": "Go-To", "options": brand_store}, db)
+    rows = await markets.load_candidates({"domain": "www." + HOST, "brand": "Example AUD Brand", "options": brand_store}, db)
     assert [(r["base_offer_id"], r["currency"], r["market"], r["source_variant_id"]) for r in rows] == [
         (PREFIX + "base", "AUD", "AU", key)]
-    assert await markets.load_candidates({"domain": HOST, "brand": "Sukin", "options": brand_store}, db) == []
+    assert await markets.load_candidates({"domain": HOST, "brand": "Other Brand", "options": brand_store}, db) == []
 
 
 async def test_a_sibling_takes_its_identity_from_the_base_offer_and_never_touches_it(db):
@@ -162,7 +162,7 @@ async def test_a_sibling_takes_its_identity_from_the_base_offer_and_never_touche
                                   {"o": markets.sibling_offer_id(PREFIX + "base2")}))
     assert (sib["market"], sib["currency"], float(sib["list_price"])) == ("US", "USD", 32.0)
     assert (sib["merchant_id"], sib["offer_type"], sib["is_first_party"], sib["source_domain"], sib["sku_key"]) == (
-        "agent_seed::go-to", "brand_direct", True, HOST, key + "::canonical")
+        "agent_seed::example-aud-brand", "brand_direct", True, HOST, key + "::canonical")
     assert sib["source_ref"] == f"https://{HOST}/products/face-hero"
     assert sib["source_system"] == "shopify_markets_us_localization"
     # A re-run refreshes the price; the base AUD offer is exactly as the crawl wrote it.
@@ -211,10 +211,10 @@ async def test_the_market_declaring_offer_upsert_stamps_on_insert_and_never_rest
     from services.curated_brand_feed import shopify_product_to_record
 
     record = shopify_product_to_record(
-        {"id": 41, "vendor": "Go-To", "title": "Face Hero 30ml", "handle": "face-hero", "product_type": "Face Oil",
+        {"id": 41, "vendor": "Example AUD Brand", "title": "Face Hero 30ml", "handle": "face-hero", "product_type": "Face Oil",
          "body_html": "<p>A face oil for dry skin.</p>", "images": [{"src": "https://cdn.example/i.jpg"}],
          "variants": [{"id": 44101000000001, "price": "45.00", "available": True, "sku": "FH30"}]},
-        domain=HOST, category_path="beauty", brand_override="Go-To", currency="AUD", source_role="brand_official",
+        domain=HOST, category_path="beauty", brand_override="Example AUD Brand", currency="AUD", source_role="brand_official",
         emit_native_variants=True)
     plan = ingest_validated_jsonl([record], market="AU")
     offer = writer._with_offer_write_defaults([dict(plan["offers"][0])])[0]

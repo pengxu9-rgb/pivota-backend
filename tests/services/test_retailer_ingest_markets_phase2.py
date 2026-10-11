@@ -15,7 +15,7 @@ Every rule here has a test that fails when the rule is removed (each section nam
      price -> /products/<handle>.js in-session, re-checked; siblings for base-crawl rows only.
   6. End to end, in the operator's order: an AUD-base store's AU crawl lands unservable; the capture adds
      USD siblings; the content_keys become serving-eligible for US only.
-Store shapes are the ADR's measured ones (section 1.1: Go-To, gotoskincare.com, AUD base, ships to 227
+Store shapes are the ADR's measured ones (section 1.1: a brand store with an AUD base, ships to 227
 countries, prices USD to US visitors via Shopify Markets).
 """
 from __future__ import annotations
@@ -41,8 +41,8 @@ from services.retailer_ingest import pipeline, shopify_markets as markets
 from tests.services.test_retailer_ingest_explicit_market import _Catalog, quiet_writer  # noqa: F401 -- fixture
 from tests.services.test_retailer_ingest_pipeline import env, job  # noqa: F401 -- the state-machine fixture
 
-HOST, BRAND = "gotoskincare.com", "Go-To"
-GOTO_META = {"name": "Go-To Skin Care", "myshopify_domain": "go-to-skincare.myshopify.com", "currency": "AUD",
+HOST, BRAND = "aud-brand.example.com", "Example AUD Brand"
+GOTO_META = {"name": "Example AUD Brand", "myshopify_domain": "example-aud.myshopify.com", "currency": "AUD",
              "ships_to_countries": ["AU", "NZ", "US"]}
 
 
@@ -66,7 +66,7 @@ def goto_product(handle, title, variants, *, currency="AUD", pid=None, ptype="Fa
     return feed.shopify_product_to_record(
         {"id": pid or abs(hash(handle)) % 10**9, "vendor": BRAND, "title": title, "handle": handle,
          "product_type": ptype, "body_html": body,
-         "images": [{"src": f"https://cdn.shopify.com/goto/{handle}.jpg"}], "variants": variants},
+         "images": [{"src": f"https://cdn.shopify.com/example-aud/{handle}.jpg"}], "variants": variants},
         domain=HOST, category_path="beauty", brand_override=BRAND, currency=currency,
         source_role="brand_official", emit_native_variants=True)
 
@@ -349,8 +349,8 @@ async def test_the_leak_detector_asks_the_served_regions_on_the_content_key(monk
 
 async def test_the_readback_counts_only_the_jobs_storefronts_offers():
     db = _RB()
-    await pipeline._readback(["p1"], "AUD", db, market="AU", domain="www.GoToSkincare.com")
-    assert db.values["hosts"] == ["gotoskincare.com", "www.gotoskincare.com"]
+    await pipeline._readback(["p1"], "AUD", db, market="AU", domain="www.AUD-Brand.example.com")
+    assert db.values["hosts"] == ["aud-brand.example.com", "www.aud-brand.example.com"]
     assert db.sql.count("lower(o.source_domain) = ANY(:hosts)") == 3
     # ...and to the offers THIS lane writes there: a shopify_markets sibling on the same host is not the
     # crawl's (review of #2358, D1).
@@ -676,12 +676,12 @@ async def test_a_bot_wall_that_answers_200_html_is_unverifiable():
 async def test_a_redirect_to_another_regional_store_is_unverifiable():
     def geo_router(request):
         if request.url.host == HOST:
-            return httpx.Response(302, headers={"location": "https://us.gotoskincare.com/"})
+            return httpx.Response(302, headers={"location": "https://us.aud-brand.example.com/"})
         return httpx.Response(200, text="<html>US store</html>", headers={"content-type": "text/html"})
     store = Store(overrides={("GET", "/"): geo_router})
     with pytest.raises(markets.MarketsRefused) as refused:
         await _capture(store)
-    assert refused.value.outcome == "capture_unverifiable" and "us.gotoskincare.com" in refused.value.reason
+    assert refused.value.outcome == "capture_unverifiable" and "us.aud-brand.example.com" in refused.value.reason
 
 
 async def test_a_session_that_stops_reporting_usd_voids_the_capture(monkeypatch):
@@ -811,8 +811,8 @@ async def test_a_robots_fetch_failure_is_what_the_crawl_gate_does_everywhere_fai
 
 async def test_only_this_brands_rows_on_this_host_in_the_stores_base_currency_are_captured():
     rows = base_rows()
-    other_brand = {**rows[0], "brand": "Sukin", "base_offer_id": "o-sukin"}
-    other_host = {**rows[0], "source_ref": "https://us.gotoskincare.com/products/face-hero", "base_offer_id": "o-us"}
+    other_brand = {**rows[0], "brand": "Other Brand", "base_offer_id": "o-other-brand"}
+    other_host = {**rows[0], "source_ref": "https://us.aud-brand.example.com/products/face-hero", "base_offer_id": "o-us"}
     stale = {**rows[0], "currency": "NZD", "base_offer_id": "o-nzd"}
     out = await _capture(Store(), rows + [other_brand, other_host, stale])
     assert {r["base_offer_id"] for r in out["planned"]} == {r["base_offer_id"] for r in rows}
@@ -1153,7 +1153,7 @@ async def test_the_runbook_re_runs_base_capture_base_capture_and_every_run_ends_
 
     await both(au_job)
     await both(markets_job)
-    await both(au_job)        # the refresh: 5 AUD/AU base offers + 5 USD/US siblings on gotoskincare.com
+    await both(au_job)        # the refresh: 5 AUD/AU base offers + 5 USD/US siblings on aud-brand.example.com
     await both(markets_job)   # and the capture refreshes its siblings in place
     assert len(catalog.offers("market = 'AU'")) == 5 and len(catalog.offers("market = 'US'")) == 5
 
