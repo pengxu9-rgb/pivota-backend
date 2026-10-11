@@ -757,7 +757,7 @@ async def test_after_the_first_proven_answer_a_later_non_sgd_answer_skips_only_t
     handles = {json.loads(r["offer_payload"])["handle"] for r in out["planned"]}
     assert handles == {"cosrx-snail-essence", "purito-centella-serum"}  # sorted: cosrx answered first, in SGD
     # Counted per base offer, like every skip: the lip mask's canonical offer and its one variant's.
-    assert out["checks"]["markets_capture"]["skipped"]["pinned_not_sgd"] == 2
+    assert out["checks"]["markets_capture"]["skipped"]["pinned_presented_usd"] == 2
     assert len(sent) == 4 and all(c is None for c in sent)  # /meta.json + 3 pinned reads, none with a cookie
 
 
@@ -796,3 +796,109 @@ async def test_a_usd_retailer_becomes_sg_servable_through_pinned_sgd_siblings(sg
     assert len(siblings) == len(base) and {o["currency"] for o in siblings} == {"SGD"}
     assert {json.loads(o["offer_payload"])["proof"] for o in siblings} == {markets.PROOF_PINNED}
     assert not any(p in SESSION_ONLY for _m, p, _q in state.store.log)
+
+
+def _multi():
+    """The three-vendor retailer cohort (sorted handles: cosrx, laneige, purito) and its base rows."""
+    job = sg_job(brand="Purito", vendors=("Purito", "COSRX", "Laneige"), multi_brand=True,
+                 brands={"Purito": "Purito", "COSRX": "COSRX", "Laneige": "Laneige"})
+    rows = base_rows(ingest_validated_jsonl(retailer_records(
+        USD_CATALOG, brand_by_vendor={"purito": "Purito", "cosrx": "COSRX", "laneige": "Laneige"}), market="US"))
+    return job, rows
+
+
+def _redirecting(store, *, hop_currency, final_currency):
+    """Every pinned read 301s to the store's /en-sg/ subfolder copy (same host). The hop sets `hop_currency`;
+    the final answer is priced, and its cookie set, in `final_currency`."""
+    real = store.handler
+
+    def handler(request):
+        path = request.url.path
+        if path.startswith("/products/") and request.url.params.get("country") == "SG":
+            resp = httpx.Response(301, headers={"location": "/en-sg" + path + "?country=SG"})
+            resp.headers["set-cookie"] = f"cart_currency={hop_currency}; path=/"
+            return resp
+        if path.startswith("/en-sg/products/"):
+            handle = path[len("/en-sg/products/"):-3]
+            _v, _t, variants = USD_CATALOG[handle]
+            resp = _shopify_js({"id": 1, "handle": handle, "variants": [
+                {"id": vid, "price": prices[final_currency], "available": True} for vid, prices in variants]})
+            resp.headers["set-cookie"] = f"cart_currency={final_currency}; path=/"
+            return resp
+        return real(request)
+    store.handler = handler
+    return store
+
+
+async def test_a_pinned_redirect_is_proven_by_the_final_response_not_the_hop():
+    """Review of #2566: the price and the cookie must come from the SAME (final) response. A hop that says SGD
+    over a final USD answer proves nothing; a hop that says USD over a final SGD answer is SGD."""
+    store = _redirecting(pinned_store(), hop_currency="SGD", final_currency="USD")
+    sent = _cookies_sent(store)
+    with pytest.raises(markets.MarketsRefused) as refused:
+        await _capture(store, polite=Polite(disallow={"/cart.js"}))
+    assert refused.value.outcome == "robots_disallows_cart" and "presented in USD" in refused.value.reason
+    assert all(c is None for c in sent)  # the hop's cookie never rode the redirect
+
+    store = _redirecting(pinned_store(), hop_currency="USD", final_currency="SGD")
+    sent = _cookies_sent(store)
+    out = await _capture(store, polite=Polite(disallow={"/cart.js"}))
+    assert out["checks"]["markets_capture"]["proof"] == markets.PROOF_PINNED
+    assert sorted({r["list_price"] for r in out["planned"]}) == [26.9, 47.9]
+    assert all(c is None for c in sent)
+
+
+async def test_only_an_answered_product_can_decide_the_proof():
+    """A 404 (delisted, or not sold in SG) carrying the base-currency cookie is no probe: the first ANSWERED
+    product decides. Its skip is counted once, also when the store then falls back to the session."""
+    job, rows = _multi()
+
+    def cosrx_gone(store):
+        real = store.handler
+
+        def handler(request):
+            if request.url.path == "/products/cosrx-snail-essence.js":
+                resp = httpx.Response(404, text="not found", headers={"content-type": "text/html"})
+                resp.headers["set-cookie"] = "cart_currency=USD; path=/"
+                return resp
+            return real(request)
+        store.handler = handler
+        return store
+
+    out = await _capture(cosrx_gone(pinned_store()), job=job, rows=rows)
+    ev = out["checks"]["markets_capture"]
+    assert ev["proof"] == markets.PROOF_PINNED and ev["pinned"]["handle"] == "laneige-lip-mask"
+    assert ev["skipped"] == {"product_js_http_404": 2}
+    assert {json.loads(r["offer_payload"])["handle"] for r in out["planned"]} == {
+        "laneige-lip-mask", "purito-centella-serum"}
+
+    out = await _capture(cosrx_gone(usd_store()), job=job, rows=rows)  # pins=False: the session fallback
+    ev = out["checks"]["markets_capture"]
+    assert ev["proof"] == markets.PROOF_SESSION and ev["skipped"] == {"product_js_http_404": 2}  # not 4
+
+
+def _off_host(store):
+    real = store.handler
+
+    def handler(request):
+        if request.url.path.startswith("/products/") and request.url.params.get("country") == "SG":
+            return httpx.Response(301, headers={"location": f"https://sg.other-host.example{request.url.path}"})
+        return real(request)
+    store.handler = handler
+    return store
+
+
+async def test_a_pinned_read_that_leaves_the_host_is_never_followed_into_a_price():
+    """The SG market on another storefront (ADR-026 decision 5): this host does not present it. The probe falls
+    back to the session (as before this change); with the cart disallowed it is a clean `nothing`, not a failed
+    job."""
+    store = _off_host(pinned_store())
+    out = await _capture(store)
+    ev = out["checks"]["markets_capture"]
+    assert ev["proof"] == markets.PROOF_SESSION
+    assert ev["pinned"]["problem"] == "redirected_to:sg.other-host.example"
+    with pytest.raises(markets.MarketsRefused) as refused:
+        await _capture(_off_host(pinned_store()), polite=Polite(disallow={"/cart.js"}))
+    r = refused.value
+    assert (r.outcome, r.status) == ("market_on_another_host", "nothing")
+    assert "sg.other-host.example" in r.reason

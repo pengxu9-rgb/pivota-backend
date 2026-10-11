@@ -101,8 +101,8 @@ BASE_SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
 #: Re-verify the session every N product reads (the script's value): a decayed localization cookie
 #: would silently relabel base-currency prices as USD, the #1636/#1642 defect class.
 SESSION_RECHECK_EVERY = 25
-#: The paths the USD-session proof cannot do without. robots.txt is asked about them before the first
-#: request to the store; a Disallow on either refuses the capture (module docstring, ROBOTS.TXT).
+#: The paths the fallback session proof cannot do without. robots.txt is asked about them before the first
+#: request to the store; a Disallow on either rules the fallback out (module docstring, ROBOTS.TXT).
 SESSION_PATHS = ("/localization", "/cart.js")
 #: How a sibling's price was proven (offer_payload "proof", evidence "proof"): the market-pinned read
 #: (?country=<M> + that response's own cart_currency cookie), or the localized cookie session's cart.
@@ -308,7 +308,8 @@ def _is_json(resp: Any) -> bool:
 
 
 class _Session:
-    """One cookie session against one storefront host: every request paced through the crawl's gate,
+    """Requests against one storefront host -- cookie-less pinned reads, or the fallback's cookie session --
+    every request paced through the crawl's gate,
     every answer classified, the final host of every redirect chain checked."""
 
     def __init__(self, client: Any, host: str, polite: Any, evidence: Dict[str, Any],
@@ -346,9 +347,11 @@ class _Session:
         final = _host(str(getattr(resp, "url", "") or url))
         if final != self.host:
             # A geo-router or a sibling regional store: another catalog, another currency.
-            raise self._refuse("capture_unverifiable", "failed",
-                               f"{path}: the storefront redirected to {final or '(unknown)'}; a regional "
-                               f"store is a different store")
+            refusal = self._refuse("capture_unverifiable", "failed",
+                                   f"{path}: the storefront redirected to {final or '(unknown)'}; a regional "
+                                   f"store is a different store")
+            refusal.off_host = final or "(unknown)"
+            raise refusal
         code = resp.status_code
         if code == 429 or code >= 500:
             raise self._refuse("crawl_throttled", "queued", f"HTTP {code} at {path}", transient=True)
@@ -496,8 +499,9 @@ def _plan_product(host: str, handle: str, detail: Any, bases: List[Dict[str, Any
 async def capture(job: Dict[str, Any], *, db: Any, max_products: int, polite: Any = None,
                   transport: Any = None) -> Dict[str, Any]:
     """Read the storefront's prices in the job's market (capture_market: US, or SG) for the job's base
-    offers, each proven by its own market-pinned response, or (fallback) inside one proven session. Returns {"planned": [sibling rows], "checks": {...}};
-    raises MarketsRefused. Writes nothing. Every US outcome, reason and row is what it was before SG."""
+    offers, each proven by its own market-pinned response, or (fallback) inside one proven session.
+    Returns {"planned": [sibling rows], "checks": {...}};
+    raises MarketsRefused. Writes nothing."""
     import httpx
 
     market = capture_market(job)
@@ -596,7 +600,14 @@ async def capture(job: Dict[str, Any], *, db: Any, max_products: int, polite: An
             probe: Optional[Dict[str, Any]] = None
             for handle in sorted(by_handle):
                 path = f"/products/{quote(handle, safe='')}.js?country={market}"
-                code, detail, presented, problem = await pinned.json_presented(path)
+                try:
+                    code, detail, presented, problem = await pinned.json_presented(path)
+                except MarketsRefused as exc:
+                    if not getattr(exc, "off_host", None):
+                        raise
+                    # The market lives on another host (a regional store, ADR-026 decision 5): this host does
+                    # not present it. Never followed or priced -- the probe falls back, a later read is skipped.
+                    code, detail, presented, problem = 200, None, None, f"redirected_to:{exc.off_host}"
                 if code != 200:  # 404: delisted since the base crawl, or not sold in the market. Counted.
                     key = f"product_js_http_{code}"
                     skipped[key] = skipped.get(key, 0) + len(by_handle[handle])
@@ -609,8 +620,10 @@ async def capture(job: Dict[str, Any], *, db: Any, max_products: int, polite: An
                     evidence["proof"] = PROOF_PINNED
                     evidence["captured_at"] = datetime.now(timezone.utc).isoformat()
                 if presented != currency:
-                    # This one response is not proof (no cookie, or another currency): this product only.
-                    key = f"pinned_not_{currency.lower()}"
+                    # This one response is not proof (another currency, no cookie, an off-host redirect): this
+                    # product only, counted by why.
+                    why = f"presented_{presented.lower()}" if presented else (problem or "unproven").split(":")[0]
+                    key = f"pinned_{why}"
                     skipped[key] = skipped.get(key, 0) + len(by_handle[handle])
                     continue
                 planned.extend(_plan_product(host, handle, detail, by_handle[handle], evidence, skipped, market,
@@ -631,6 +644,12 @@ async def capture(job: Dict[str, Any], *, db: Any, max_products: int, polite: An
     if not cart_allowed:
         evidence["requests"] = requests
         path = evidence["robots"].get("disallowed")
+        if str(probe["problem"] or "").startswith("redirected_to:"):
+            raise refused(MarketsRefused(
+                "market_on_another_host", "nothing",
+                f"market_on_another_host:{path} -- {host}'s pinned ?country={market} read redirected to "
+                f"{probe['problem'].split(':', 1)[1]}: the {market} market is another storefront (never followed or "
+                f"priced here), and robots.txt disallows {path} for the session fallback"))
         if probe["cart_currency"] is None:
             raise refused(MarketsRefused(
                 "currency_unprovable", "nothing",

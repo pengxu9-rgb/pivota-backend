@@ -1578,7 +1578,7 @@ async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timin
     proof = checks["markets_capture"].get("proof") or "no product answered"
     if not planned:
         raise _Stop("nothing_to_capture", "nothing",
-                    f"no base offer has a {currency} price proven for {market} ({proof}): "
+                    f"no base offer has a proven {currency} price for {market} (proof mode: {proof}): "
                     f"{checks['markets_capture'].get('skipped')}", checks=checks)
     if stage == DRY_RUN:
         await ledger.finish_run(run_id, outcome="clean", **summary, db=db)

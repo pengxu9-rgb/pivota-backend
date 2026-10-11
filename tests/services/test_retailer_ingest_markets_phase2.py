@@ -463,8 +463,9 @@ async def test_a_retailer_capture_job_fails_before_any_request(env, monkeypatch)
 
 class Store:
     """A Shopify-Markets storefront: AUD base; a session whose multipart PUT to /localization names US gets
-    a localization cookie, and then /cart.js and /products/<h>.js answer in USD. As measured (ADR-026
-    Appendix B), a cookie-less `/products/<h>.js?country=US` is presented in USD too (`pins`), and every
+    a localization cookie, and then /cart.js and /products/<h>.js answer in USD. As measured for SG (ADR-026
+    Appendix B; assumed alike for US, which a US canary must confirm), a cookie-less
+    `/products/<h>.js?country=US` is presented in USD too (`pins`), and every
     `.js` answer sets `cart_currency` to the currency it was presented in (`sends_cookie`).
     The DEFAULT is `pins=False`, a store whose `?country=` read stays in its base currency: the session
     fallback's case, so the session tests below exercise the session. The pinned read's tests set pins=True."""
