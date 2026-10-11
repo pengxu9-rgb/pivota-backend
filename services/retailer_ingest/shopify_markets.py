@@ -290,7 +290,17 @@ def _capture_currency(market: str = CAPTURE_MARKET) -> str:
 
 
 def _is_json(resp: Any) -> bool:
-    return "json" in str(resp.headers.get("content-type") or "").lower()
+    """A JSON-shaped answer: application/json, or Shopify's own `text/javascript` (2026-10-11).
+
+    Shopify serves its AJAX endpoints -- `/cart.js` and `/products/<handle>.js` -- as
+    `text/javascript; charset=utf-8` with a JSON body. Requiring "json" in the content type refused every
+    storefront as a bot wall at the first `/cart.js` read (the session proof), so the capture never produced
+    one offer in prod (0 shopify_markets_* siblings; the tests' fakes answered application/json, which
+    Shopify does not send). JavaScript-typed answers are accepted HERE only as a
+    candidate: `_Session.json` still requires the body to parse to a JSON object or array, so a JS challenge
+    page is refused exactly like the HTML wall it stands in for."""
+    ctype = str(resp.headers.get("content-type") or "").lower()
+    return "json" in ctype or "javascript" in ctype
 
 
 class _Session:
@@ -353,9 +363,14 @@ class _Session:
         if resp.status_code != 200:
             return resp.status_code, None
         try:
-            return 200, resp.json()
+            body = resp.json()
         except ValueError:
             raise self._refuse("capture_unverifiable", "failed", f"{path} did not parse as JSON; unverifiable")
+        if not isinstance(body, (dict, list)):
+            # A JS-typed answer that is a bare string or number is no storefront JSON: a challenge or a stub.
+            raise self._refuse("capture_unverifiable", "failed",
+                               f"{path} answered {type(body).__name__}, not a JSON object; unverifiable")
+        return 200, body
 
     async def cart_currency(self) -> Optional[str]:
         _code, cart = await self.json("/cart.js")
