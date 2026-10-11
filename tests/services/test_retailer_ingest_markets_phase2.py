@@ -494,15 +494,20 @@ class Store:
             self.carts += 1
             if self.loses_session_after is not None and self.carts > self.loses_session_after:
                 us = False
-            return httpx.Response(200, json={"currency": "USD" if us else self.meta["currency"], "item_count": 0})
+            # Shopify types /cart.js text/javascript (2026-10-11), like /products/<handle>.js below.
+            return httpx.Response(200, content=json.dumps({"currency": "USD" if us else self.meta["currency"], "item_count": 0}).encode(),
+                                  headers={"content-type": "text/javascript; charset=utf-8"})
         if path.startswith("/products/") and path.endswith(".js"):
             handle = path[len("/products/"):-3]
             if handle not in HANDLE_VARIANTS:
                 return httpx.Response(404, text="not found", headers={"content-type": "text/html"})
             cents = USD_CENTS if us else AUD_CENTS
-            return httpx.Response(200, json={
+            # As Shopify serves it: a JSON body typed text/javascript (2026-10-11: the application/json this fake
+            # used to send is not what a storefront sends, and it hid a refusal of every real capture).
+            return httpx.Response(200, content=json.dumps({
                 "id": 1, "handle": handle, "price": min(cents[v] for v in HANDLE_VARIANTS[handle]),
-                "variants": [{"id": v, "price": cents[v], "available": v != 44101000000002} for v in HANDLE_VARIANTS[handle]]})
+                "variants": [{"id": v, "price": cents[v], "available": v != 44101000000002} for v in HANDLE_VARIANTS[handle]]}).encode(),
+                headers={"content-type": "text/javascript; charset=utf-8"})
         return httpx.Response(404)
 
     def paths(self):
