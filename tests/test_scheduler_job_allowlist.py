@@ -23,7 +23,8 @@ REAP = "reap_agentic_purchase_poll"
 MAIN_WORKER_JOB_IDS = [
     "daily_audit_check", "nightly_index_health", "nightly_index_health_catch_up",
     "agent_card_revocation_sweep", "outcome_aggregation_daily", "external_conversion_poll",
-    "reap_agentic_purchase_poll", "store_lifecycle_reconciliation", "cafe24_reconciliation",
+    "reap_agentic_purchase_poll", "agent_purchase_events", "store_lifecycle_reconciliation",
+    "cafe24_reconciliation",
     "audit_health_tick", "audit_stability_canary", "catalog_onboard_queue_drain",
     "audit_run_worker_tick", "audit_run_lease_reaper", "audit_run_abandoned_reaper",
     "executor_run_worker_tick", "executor_run_lease_reaper", "verification_run_worker_tick",
