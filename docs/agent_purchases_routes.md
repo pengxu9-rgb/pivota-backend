@@ -85,3 +85,51 @@ rather than leaving that purchase out (a missing row would read as a purchase th
   3. Run the backfill once more for purchases opened between steps 1 and 2.
   Reads also heal: a single read heals that purchase, and a list read heals that owner's newest 100.
 - Turn off: unset the dial. The table stays; nothing reads or writes it.
+
+## Webhook events (`purchase.*`)
+
+Agents can be told about a purchase instead of polling. Events go through the existing agent
+webhook system (`services/agent_webhook_service.py`): the same configuration (destination URL,
+subscribed events), signing, retries and delivery log as the `order.*` events.
+
+| Event | When | `data` |
+|---|---|---|
+| `purchase.action_required` | the buyer must open a rail-hosted page: `needs_payment_method` (`next_action.kind = card_binding`) or `awaiting_buyer_authorization` (`kind = approval`) | the unified purchase, with `next_action.url` |
+| `purchase.completed` | the merchant order was placed | the unified purchase, with `order_reference` |
+| `purchase.failed` | the purchase ended without an order: `failed`, `refused` or `expired` (`data.state` says which) | the unified purchase |
+
+`data` is exactly the body of `GET /agent/v2/commerce/purchases/{id}` at the moment the event was
+detected.
+
+Envelope and signature, as for every agent webhook:
+
+```
+POST <destination_url>
+X-Pivota-Event: purchase.completed
+X-Pivota-Delivery: whd_…
+X-Pivota-Timestamp: <unix seconds>
+X-Pivota-Signature: v1=<hex HMAC-SHA256(signing_secret, "<timestamp>.<raw body>")>
+
+{"id": "evt_…", "type": "purchase.completed", "created_at": "…", "data": {…}}
+```
+
+Receiver rules:
+
+- **De-duplicate on `id`.** Every delivery and every retry of one event carries the same `id`.
+  Delivery is at-least-once.
+- **Do not rely on order.** Each event carries the purchase as of its own state (`data.state`); a
+  retried delivery can arrive after a newer one. `GET /agent/v2/commerce/purchases/{id}` is always
+  the authoritative read.
+- Answer 2xx quickly. 408, 429 and 5xx are retried (60 s, 5 min, 30 min, 2 h, 12 h); other
+  statuses are not.
+
+Subscribing: `purchase.*` events are in the webhook catalog. New webhook configurations receive them
+by default; an existing configuration with an explicit event list must add them.
+
+Operations: events are detected and handed to the webhook sender by the worker job
+`agent_purchase_events` (every `AGENT_PURCHASE_EVENTS_INTERVAL_SECONDS`, default 30). It is dark
+unless `AGENT_PURCHASE_WEBHOOKS_ENABLED` and `AGENT_PURCHASE_LEDGER_ENABLED` are both on. Events are
+written to `agent_purchase_events` (migration 265) before anything is sent; only purchases whose rail
+row changed within `AGENT_PURCHASE_EVENTS_LOOKBACK_HOURS` (default 24) are considered, so switching
+the dial on does not replay old purchases. The job can be paused and run on demand from the admin
+scheduler routes. Outside production, `WEBHOOK_DELIVERY_ENABLED` decides whether anything is sent.
