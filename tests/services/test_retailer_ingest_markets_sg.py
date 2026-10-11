@@ -102,10 +102,15 @@ class MarketStore:
     country it has a market for sets the cookie; /cart.js and /products/<h>.js then answer in the
     currency `quotes` gives that country (absent: the base currency)."""
 
-    def __init__(self, *, meta, catalog, quotes=None, honors=True, loses_session_after=None, overrides=None):
+    def __init__(self, *, meta, catalog, quotes=None, honors=True, loses_session_after=None, overrides=None,
+                 pins=False, sends_cookie=True):
         self.meta, self.catalog = dict(meta), catalog
         self.quotes = {"SG": "SGD", "US": "USD"} if quotes is None else quotes
         self.honors, self.loses_session_after = honors, loses_session_after
+        # As measured (ADR-026 Appendix B): a cookie-less `.js?country=XX` is presented in that country's
+        # currency (`pins`), and each `.js` answer sets `cart_currency` to the currency it presented. DEFAULT
+        # pins=False: the session fallback's store, so the session tests exercise the session; pinned tests opt in.
+        self.pins, self.sends_cookie = pins, sends_cookie
         self.overrides, self.log, self.carts, self.countries = dict(overrides or {}), [], 0, []
 
     def _session_currency(self, request):
@@ -142,10 +147,16 @@ class MarketStore:
             if handle not in self.catalog:
                 return httpx.Response(404, text="not found", headers={"content-type": "text/html"})
             _vendor, _ptype, variants = self.catalog[handle]
+            country = request.url.params.get("country")
+            if self.pins and country:
+                currency = self.quotes.get(country, self.meta["currency"])
             # As Shopify serves its AJAX endpoints (/cart.js, /products/<handle>.js): a JSON body typed
             # text/javascript -- the shape that refused every capture while this fake answered application/json.
-            return _shopify_js({"id": 1, "handle": handle, "variants": [
+            resp = _shopify_js({"id": 1, "handle": handle, "variants": [
                 {"id": vid, "price": prices[currency], "available": True} for vid, prices in variants]})
+            if self.sends_cookie:
+                resp.headers["set-cookie"] = f"cart_currency={currency}; path=/; SameSite=Lax"
+            return resp
         return httpx.Response(404)
 
     def paths(self):
@@ -281,12 +292,17 @@ async def test_a_proven_sg_session_prices_the_retailers_base_offers_in_sgd():
     payload = json.loads(out["planned"][0]["offer_payload"])
     assert (payload["capture"], payload["cart_currency"], payload["base_currency"]) == (
         "shopify_markets_sg_localization", "SGD", "USD")
-    # The proof: PUT country_code=SG, then the cart, then the first price; never a ?country= query.
+    assert (ev["proof"], ev["pinned"]["cart_currency"]) == (markets.PROOF_SESSION, "USD")
+    assert payload["proof"] == markets.PROOF_SESSION
+    # The FALLBACK proof (this store's pinned read stays USD): one pinned probe, then PUT country_code=SG, then
+    # the cart, then the first session price -- and no session read carries a ?country= query.
     assert store.countries == ["SG"]
-    paths = store.paths()
+    pinned = [(m, p) for m, p, q in store.log if "country=" in q]
+    assert pinned == [("GET", "/products/purito-centella-serum.js")] and store.log[1][2] == "country=SG"
+    paths = [(m, p) for m, p, q in store.log if "country=" not in q]
     first_price = next(i for i, (_m, p) in enumerate(paths) if p.startswith("/products/"))
     assert paths.index(("POST", "/localization")) < paths.index(("GET", "/cart.js")) < first_price
-    assert paths[-1] == ("GET", "/cart.js") and all("country" not in q for _m, _p, q in store.log)
+    assert paths[-1] == ("GET", "/cart.js")
 
 
 async def test_a_store_whose_sg_market_prices_in_usd_is_a_clean_refusal_with_no_price_read():
@@ -297,7 +313,9 @@ async def test_a_store_whose_sg_market_prices_in_usd_is_a_clean_refusal_with_no_
     r = refused.value
     assert (r.outcome, r.status, r.transient) == ("sg_session_unproven", "nothing", False)
     assert "reports USD after localizing to SG" in r.reason and "confirm SGD" in r.reason
-    assert not any(p.startswith("/products/") for _m, p in store.paths())
+    # Only the pinned probe read a product (presented USD: not proof); the session read none.
+    assert [(p, q) for _m, p, q in store.log if p.startswith("/products/")] == [
+        ("/products/purito-centella-serum.js", "country=SG")]
 
 
 @pytest.mark.parametrize("quote", ["JPY", None])
@@ -343,7 +361,9 @@ async def test_an_sgd_base_store_is_not_captured():
 async def test_a_robots_refusal_names_the_sg_market():
     with pytest.raises(markets.MarketsRefused) as refused:
         await _capture(usd_store(), polite=Polite(disallow={"/cart.js"}))
-    assert refused.value.reason.startswith("robots_disallowed:/cart.js ") and "no SG offer" in refused.value.reason
+    r = refused.value
+    assert (r.outcome, r.status) == ("robots_disallows_cart", "nothing")
+    assert r.reason.startswith("robots_disallows_cart:/cart.js ") and "no SG offer" in r.reason
 
 
 # ================================================================== 4. retailer identity
@@ -655,3 +675,124 @@ async def test_a_wall_or_a_challenge_is_still_refused(resp):
     with pytest.raises(markets.MarketsRefused) as refused:
         await _one_response(resp)("/products/x.js")
     assert refused.value.outcome == "capture_unverifiable"
+
+
+# ================================================================== 7. the pinned read: the PRIMARY proof (ADR-026 4.4)
+# Measured 2026-10-11 on served stores (ADR-026 Appendix B): a cookie-less `.js?country=SG` is presented in
+# SGD wherever the store prices SG in SGD (more stores than the session found), and its own `cart_currency`
+# Set-Cookie names that currency. Each response proves its own price; no session, no cart path.
+
+SESSION_ONLY = {"/", "/localization", "/cart.js"}
+
+
+def pinned_store(**kw):
+    return usd_store(pins=True, **kw)
+
+
+def _cookies_sent(store):
+    """Wrap the store's handler to record every Cookie header a request carried."""
+    sent, handler = [], store.handler
+
+    def recording(request):
+        sent.append(request.headers.get("cookie"))
+        return handler(request)
+    store.handler = recording
+    return sent
+
+
+async def test_a_pinned_store_is_priced_in_sgd_by_each_responses_own_cookie_with_no_session():
+    store = pinned_store()
+    sent = _cookies_sent(store)
+    out = await _capture(store)
+    rows = base_rows(usd_plan())
+    purito = {r["base_offer_id"] for r in rows if r["brand"] == "Purito SEOUL"}
+    assert {r["base_offer_id"] for r in out["planned"]} == purito and purito
+    assert sorted({r["list_price"] for r in out["planned"]}) == [26.9, 47.9]  # the store's SGD, not FX
+    assert {(r["market"], r["currency"], r["source_system"]) for r in out["planned"]} == {
+        ("SG", "SGD", "shopify_markets_sg_localization")}
+    ev = out["checks"]["markets_capture"]
+    assert ev["proof"] == markets.PROOF_PINNED and ev["pinned"]["cart_currency"] == "SGD"
+    assert "cart_currency" not in ev and "localization_status" not in ev  # no session was opened
+    payload = json.loads(out["planned"][0]["offer_payload"])
+    assert (payload["proof"], payload["cart_currency"], payload["localization_status"]) == (
+        markets.PROOF_PINNED, "SGD", None)
+    # Every product read is pinned, no session path is ever requested, and no request carries a cookie.
+    product_reads = [q for _m, p, q in store.log if p.startswith("/products/")]
+    assert product_reads and all(q == "country=SG" for q in product_reads)
+    assert not any(p in SESSION_ONLY for _m, p, _q in store.log)
+    assert sent and all(c is None for c in sent)
+
+
+async def test_the_pinned_read_captures_a_store_whose_robots_forbid_the_cart():
+    """About a fifth of measured stores disallow /cart.js (Appendix B): the session could never run there, the pinned
+    read needs no cart path. robots.txt is still asked about every pinned URL (the gate runs per request)."""
+    store = pinned_store()
+    polite = Polite(disallow={"/cart.js"})
+    out = await _capture(store, polite=polite)
+    assert out["planned"] and {r["currency"] for r in out["planned"]} == {"SGD"}
+    assert out["checks"]["markets_capture"]["robots"]["session_paths_allowed"] is False
+    gated = [c[1] for c in polite.calls if c[0] == "robots+slot"]
+    assert gated == [p for _m, p, _q in store.log]  # every request through the gate, the pinned ones included
+    assert "/cart.js" not in gated
+
+
+async def test_after_the_first_proven_answer_a_later_non_sgd_answer_skips_only_that_product():
+    """Every price carries its own proof: once the store is proven to present SGD, a product whose own
+    response is presented in another currency is skipped and counted; the others stand on their own."""
+    store = pinned_store()
+    real = store.handler
+
+    def laneige_in_usd(request):
+        resp = real(request)
+        if request.url.path == "/products/laneige-lip-mask.js":
+            resp.headers["set-cookie"] = "cart_currency=USD; path=/"
+        return resp
+    store.handler = laneige_in_usd
+    sent = _cookies_sent(store)  # three product reads: a cookie one response set must never ride the next
+    job = sg_job(brand="Purito", vendors=("Purito", "COSRX", "Laneige"), multi_brand=True,
+                 brands={"Purito": "Purito", "COSRX": "COSRX", "Laneige": "Laneige"})
+    rows = base_rows(ingest_validated_jsonl(retailer_records(
+        USD_CATALOG, brand_by_vendor={"purito": "Purito", "cosrx": "COSRX", "laneige": "Laneige"}), market="US"))
+    out = await _capture(store, job=job, rows=rows)
+    handles = {json.loads(r["offer_payload"])["handle"] for r in out["planned"]}
+    assert handles == {"cosrx-snail-essence", "purito-centella-serum"}  # sorted: cosrx answered first, in SGD
+    # Counted per base offer, like every skip: the lip mask's canonical offer and its one variant's.
+    assert out["checks"]["markets_capture"]["skipped"]["pinned_not_sgd"] == 2
+    assert len(sent) == 4 and all(c is None for c in sent)  # /meta.json + 3 pinned reads, none with a cookie
+
+
+async def test_no_cookie_falls_back_to_the_session_where_robots_allow_it():
+    store = pinned_store(sends_cookie=False)
+    out = await _capture(store)
+    ev = out["checks"]["markets_capture"]
+    assert ev["proof"] == markets.PROOF_SESSION and ev["pinned"] == {
+        "handle": "purito-centella-serum", "cart_currency": None, "problem": "cookie_absent"}
+    assert ev["cart_currency"] == "SGD" and {r["currency"] for r in out["planned"]} == {"SGD"}
+
+
+async def test_no_cookie_and_no_cart_path_is_currency_unprovable_never_a_default():
+    """Some stores send no cart_currency cookie (Appendix B): their currency is unprovable. Never
+    defaulted to /meta.json or to the market's currency."""
+    store = pinned_store(sends_cookie=False)
+    with pytest.raises(markets.MarketsRefused) as refused:
+        await _capture(store, polite=Polite(disallow={"/localization"}))
+    r = refused.value
+    assert (r.outcome, r.status) == ("currency_unprovable", "nothing")
+    assert r.reason.startswith("currency_unprovable:/localization ") and "cookie_absent" in r.reason
+    assert not any(p in SESSION_ONLY for _m, p, _q in store.log)
+
+
+async def test_a_usd_retailer_becomes_sg_servable_through_pinned_sgd_siblings(sg_lane):
+    """End to end through pipeline.run_stage: base crawl, then the SG capture proven by the pinned read."""
+    env, catalog, applied, state = sg_lane
+    state.store = pinned_store()
+    await _both(env, catalog, lambda s="queued": base_job(s, require_ships_to_market=True))
+    base = catalog.offers()
+    await _both(env, catalog, sg_job)
+    run = list(env.ledger.runs.values())[-1]
+    assert run["checks"]["markets_capture"]["proof"] == markets.PROOF_PINNED
+    assert run["readback"]["ok"]
+    siblings = catalog.offers("market = 'SG'")
+    assert len(siblings) == len(base) and {o["currency"] for o in siblings} == {"SGD"}
+    assert {json.loads(o["offer_payload"])["proof"] for o in siblings} == {markets.PROOF_PINNED}
+    assert not any(p in SESSION_ONLY for _m, p, _q in state.store.log)
