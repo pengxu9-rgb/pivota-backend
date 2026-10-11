@@ -124,12 +124,26 @@ Receiver rules:
   statuses are not.
 
 Subscribing: `purchase.*` events are in the webhook catalog. New webhook configurations receive them
-by default; an existing configuration with an explicit event list must add them.
+by default. **An existing configuration with an explicit event list must add them**, and an event
+that happens while the agent is not subscribed (or has no destination) is recorded as `skipped` and
+is not sent later: an event is about the moment it happened, and `GET` answers for any purchase the
+agent asks about afterwards.
 
 Operations: events are detected and handed to the webhook sender by the worker job
 `agent_purchase_events` (every `AGENT_PURCHASE_EVENTS_INTERVAL_SECONDS`, default 30). It is dark
-unless `AGENT_PURCHASE_WEBHOOKS_ENABLED` and `AGENT_PURCHASE_LEDGER_ENABLED` are both on. Events are
-written to `agent_purchase_events` (migration 265) before anything is sent; only purchases whose rail
-row changed within `AGENT_PURCHASE_EVENTS_LOOKBACK_HOURS` (default 24) are considered, so switching
-the dial on does not replay old purchases. The job can be paused and run on demand from the admin
-scheduler routes. Outside production, `WEBHOOK_DELIVERY_ENABLED` decides whether anything is sent.
+unless `AGENT_PURCHASE_WEBHOOKS_ENABLED` and `AGENT_PURCHASE_LEDGER_ENABLED` are both on.
+
+- Events are written to `agent_purchase_events` (migration 265) before anything is sent.
+- Only purchases that entered their current state within `AGENT_PURCHASE_EVENTS_LOOKBACK_HOURS`
+  (default 72, max 168) are considered, so switching the dial on does not replay old purchases.
+  **A pause or outage longer than the lookback drops the events of purchases that changed state
+  during it**; they stay readable with `GET`.
+- An action state is only an event while its page is attached and live; a purchase that can never
+  yield an event in its state (owner mismatch, page refused) is recorded as `skipped`, once.
+- When webhook delivery is switched off (`WEBHOOK_DELIVERY_ENABLED`, which outside production is off
+  by default), nothing is claimed: events stay `pending` and go out when delivery is on again.
+- `status = handed_over` means the sender accepted the event; `delivery_status` is its first
+  delivery's outcome (`delivered`, `retrying`, `failed`). A non-retryable answer (for example 404)
+  ends the event as `handed_over` / `failed`: watch `delivery_status`, and the agent delivery log.
+- An event the sender raised on ten times is `abandoned` (kept, visible). The job can be paused and
+  run on demand from the admin scheduler routes.

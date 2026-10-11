@@ -101,5 +101,52 @@ async def test_the_lease_and_lookback_intervals_plan_and_behave():
     assert await events_db.claim_pending(worker="w2", lease_seconds=300) == []
     await database.execute("UPDATE agent_purchase_events SET claimed_at = now() - interval '10 minutes'")
     [again] = await events_db.claim_pending(worker="w2", lease_seconds=300)
-    assert again["event_id"] == held["event_id"] == event_id and again["attempts"] == 2
+    assert again["event_id"] == held["event_id"] == event_id and again["attempts"] == 0
     assert await events_db.reap_candidates(lookback_hours=24) == []
+
+
+async def test_release_backs_off_on_a_failure_and_returns_an_untried_event_at_once():
+    from db.database import database
+    import db.agent_purchase_events as events_db
+
+    event_id = await events_db.record_event(purchase_id="pp_" + "b" * 24, agent_id="agent_pg", rail="reap",
+                                            rail_state="completed", unified_state="completed",
+                                            event_type="purchase.completed", payload={})
+    await events_db.claim_pending(worker="w1")
+    assert await events_db.release(event_id, worker="w1", burn=False) == "pending"
+    [again] = await events_db.claim_pending(worker="w2")  # untried: claimable at once, no attempt
+    assert again["attempts"] == 0
+    assert await events_db.release(event_id, worker="w2", max_attempts=2) == "pending"
+    assert await events_db.claim_pending(worker="w3") == []  # failed: backed off for a lease
+    await database.execute("UPDATE agent_purchase_events SET claimed_at = now() - interval '10 minutes'")
+    await events_db.claim_pending(worker="w3")
+    assert await events_db.release(event_id, worker="w3", max_attempts=2) == "abandoned"
+
+
+async def test_the_candidate_read_skips_dead_pages_and_keys_the_window_on_state_entry():
+    from db.database import database
+    import db.agent_purchase_events as events_db
+    import db.agent_purchase_ledger as purchases
+    import db.reap_agentic_ledger as reap_ledger
+
+    async def purchase(state, set_sql=""):
+        rp = (await reap_ledger.create_purchase(
+            buyer_ref="bref_pg", agent_id="agent_pg", agent_user_ref_hash="h" * 64,
+            merchant_domain="brand.example", product_key="pk_1", product_name="Serum", quantity=1,
+            currency="USD", our_price_minor=4250,
+        ))["id"]
+        await database.execute(f"UPDATE reap_agentic_purchases SET state = :s{set_sql} WHERE id = :i",
+                               {"s": state, "i": rp})
+        return await purchases.ensure_reap_parent(rp)
+
+    url = ", hosted_url = 'https://pay.prava.space/a'"
+    live = await purchase("awaiting_approval", url + ", hosted_url_expires_at = now() + interval '1 hour'")
+    await purchase("needs_enrollment")
+    await purchase("needs_enrollment", url)
+    await purchase("awaiting_approval", url + ", hosted_url_expires_at = now() - interval '1 minute'")
+    await purchase("awaiting_approval", url + ", hosted_url_expires_at = now() + interval '1 hour'"
+                                              ", reap_quote_expires_at = now() - interval '1 minute'")
+    await purchase("completed", ", state_entered_at = now() - interval '3 days', updated_at = now()")
+    fresh = await purchase("completed", ", updated_at = now() - interval '3 days'")
+    got = {row["id"] for row in await events_db.reap_candidates(lookback_hours=24)}
+    assert got == {live, fresh}

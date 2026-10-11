@@ -49,7 +49,8 @@ _MANAGEABLE_JOB_IDS = frozenset(
         # the dial armed, which is the lever an operator actually wants at 3am.
         "reap_agentic_purchase_poll",
         # Rail-purchase webhook events: pausing stops pushes to agent platforms without a deploy;
-        # events keep accumulating durably and are handed over on resume (same event ids).
+        # on resume, written events are handed over with their ids and state changes during the
+        # pause are detected if they fall inside AGENT_PURCHASE_EVENTS_LOOKBACK_HOURS (default 72).
         "agent_purchase_events",
     }
 )

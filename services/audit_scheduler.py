@@ -263,7 +263,8 @@ _JOB_RUN_DEADLINES = {
     # try/finally that releases every claim on CancelledError, so a cut run
     # strands no leases and the next tick simply re-claims what it did not reach.
     "reap_agentic_purchase_poll": 600,
-    # Detect + hand over is bounded (200 candidates, 50 hand-overs, 10 s per POST); 300 s is ample.
+    # Detect reads at most 200 candidates; hand-over starts no new round of 10 after 150 s and one
+    # POST is capped at 10 s, so a tick ends well inside 300 s (a cut tick releases its claims).
     "agent_purchase_events": 300,
 }
 

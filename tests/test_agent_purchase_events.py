@@ -41,6 +41,14 @@ URL = "https://pay.prava.space/approve/abc"
 FUTURE = "2999-01-01 00:00:00"
 
 
+@pytest.fixture
+def delivery_on(monkeypatch):
+    """Webhook delivery switched on (it is off outside production by default)."""
+    from services import webhook_delivery_gate
+
+    monkeypatch.setattr(webhook_delivery_gate, "delivery_enabled", lambda *a, **k: True)
+
+
 @pytest.fixture(autouse=True)
 async def _db():
     if not database.is_connected:
@@ -164,7 +172,7 @@ async def test_two_workers_never_hold_one_event():
     mine = await events_db.claim_pending(worker="w1")
     theirs = await events_db.claim_pending(worker="w2")
     assert len(mine) == 1 and theirs == []
-    assert mine[0]["payload"] == {"x": 1} and mine[0]["attempts"] == 1
+    assert mine[0]["payload"] == {"x": 1} and mine[0]["attempts"] == 0  # a claim is not an attempt
 
 
 async def test_an_expired_lease_is_reclaimed_and_the_old_holder_cannot_finish():
@@ -172,7 +180,7 @@ async def test_an_expired_lease_is_reclaimed_and_the_old_holder_cannot_finish():
     await events_db.claim_pending(worker="w1")
     await database.execute("UPDATE agent_purchase_events SET claimed_at = datetime('now', '-600 seconds')")
     [again] = await events_db.claim_pending(worker="w2", lease_seconds=300)
-    assert again["event_id"] == event_id and again["attempts"] == 2
+    assert again["event_id"] == event_id and again["attempts"] == 0
     assert await events_db.finish(event_id, worker="w1", status="handed_over") is False
     assert await events_db.finish(event_id, worker="w2", status="handed_over", delivery_id="whd_1") is True
     [row] = await _events()
@@ -190,6 +198,7 @@ async def test_a_finished_event_is_never_claimed_again():
 async def test_release_returns_the_event_until_max_attempts_then_abandons_it():
     event_id = await _record()
     for attempt in (1, 2):
+        await database.execute("UPDATE agent_purchase_events SET claimed_at = datetime('now', '-600 seconds')")
         await events_db.claim_pending(worker="w1")
         status = await events_db.release(event_id, worker="w1", max_attempts=2)
     assert status == "abandoned"
@@ -240,7 +249,7 @@ async def test_a_new_state_is_a_new_event():
 async def test_an_approval_wait_with_no_page_yet_waits_for_one():
     pp = await _purchase("awaiting_approval")
     counts = await purchase_events.detect()
-    assert counts.get("no_action_yet") == 1 and await _events() == []
+    assert counts == {} and await _events() == []  # not even a candidate until the page is attached
     rp = (await database.fetch_one("SELECT rail_purchase_id FROM agent_purchases WHERE id = :p", {"p": pp}))[0]
     await database.execute("UPDATE reap_agentic_purchases SET hosted_url = :u, hosted_url_expires_at = :f, "
                            "reap_quote_expires_at = :f WHERE id = :i", {"u": URL, "f": FUTURE, "i": rp})
@@ -250,9 +259,24 @@ async def test_an_approval_wait_with_no_page_yet_waits_for_one():
 async def test_purchases_outside_the_lookback_are_not_replayed():
     pp = await _purchase("completed", reap_order_id="ord_old")
     rp = (await database.fetch_one("SELECT rail_purchase_id FROM agent_purchases WHERE id = :p", {"p": pp}))[0]
-    await database.execute("UPDATE reap_agentic_purchases SET updated_at = datetime('now', '-3 days') WHERE id = :i", {"i": rp})
+    await database.execute("UPDATE reap_agentic_purchases SET state_entered_at = datetime('now', '-3 days') "
+                           "WHERE id = :i", {"i": rp})
     assert (await purchase_events.detect(lookback_hours=24)).get("recorded") is None
     assert await _events() == []
+
+
+async def test_the_window_is_when_the_state_was_entered_not_the_last_touch():
+    """`updated_at` moves on every claim/release/requeue; `state_entered_at` only on a transition."""
+    old = await _purchase("completed", reap_order_id="ord_old")
+    new = await _purchase("completed", reap_order_id="ord_new")
+    ids = {pp: (await database.fetch_one("SELECT rail_purchase_id FROM agent_purchases WHERE id = :p", {"p": pp}))[0]
+           for pp in (old, new)}
+    await database.execute("UPDATE reap_agentic_purchases SET state_entered_at = datetime('now', '-3 days'), "
+                           "updated_at = CURRENT_TIMESTAMP WHERE id = :i", {"i": ids[old]})
+    await database.execute("UPDATE reap_agentic_purchases SET updated_at = datetime('now', '-3 days') "
+                           "WHERE id = :i", {"i": ids[new]})
+    await purchase_events.detect(lookback_hours=24)
+    assert [e["purchase_id"] for e in await _events()] == [new]
 
 
 async def test_the_payload_is_the_route_body_and_carries_no_pii():
@@ -268,17 +292,60 @@ async def test_the_payload_is_the_route_body_and_carries_no_pii():
         assert needle not in text
 
 
-async def test_an_unmapped_state_records_nothing(monkeypatch):
+async def test_an_unmapped_state_is_recorded_skipped_once_and_never_sent(monkeypatch):
     await _purchase("completed", reap_order_id="ord_9")
     monkeypatch.setattr(purchase_view, "unified_state", lambda rail, state: None)
-    assert (await purchase_events.detect()).get("recorded") is None
-    assert await _events() == []
+    assert (await purchase_events.detect()) == {"state_unmapped": 1}
+    [row] = await _events()
+    assert (row["status"], row["skip_reason"], row["payload"]) == ("skipped", "state_unmapped", {})
+    assert (await purchase_events.detect()) == {}  # not re-read every tick
+    assert await events_db.claim_pending(worker="w1") == []
+
+
+async def test_an_owner_mismatch_is_recorded_skipped_once(monkeypatch):
+    pp = await _purchase("completed", reap_order_id="ord_9")
+    await database.execute("UPDATE agent_purchases SET agent_id = 'agent_other' WHERE id = :p", {"p": pp})
+    assert (await purchase_events.detect()) == {"not_found": 1}
+    [row] = await _events()
+    assert (row["status"], row["skip_reason"], row["agent_id"]) == ("skipped", "not_found", "agent_other")
+    assert (await purchase_events.detect()) == {}
+
+
+async def test_a_page_the_view_refuses_is_recorded_skipped_once():
+    await _purchase("awaiting_approval", hosted_url="https://evil.example/approve", hosted_url_expires_at=FUTURE,
+                    reap_quote_expires_at=FUTURE)
+    assert (await purchase_events.detect()) == {"no_action": 1}
+    [row] = await _events()
+    assert (row["status"], row["skip_reason"]) == ("skipped", "no_action")
+    assert (await purchase_events.detect()) == {}
+
+
+async def test_pages_that_are_missing_or_dead_never_crowd_newer_purchases_out():
+    for _ in range(3):
+        await _purchase("needs_enrollment")  # no page yet
+    await _purchase("awaiting_approval", hosted_url=URL, hosted_url_expires_at="2000-01-01 00:00:00",
+                    reap_quote_expires_at=FUTURE)  # page dead
+    await _purchase("awaiting_approval", hosted_url=URL, hosted_url_expires_at=FUTURE,
+                    reap_quote_expires_at="2000-01-01 00:00:00")  # quote dead
+    await _purchase("needs_enrollment", hosted_url=URL)  # enrollment page without a deadline
+    done = await _purchase("completed", reap_order_id="ord_9")
+    assert (await purchase_events.detect(limit=3)) == {"recorded": 1}
+    assert [e["purchase_id"] for e in await _events()] == [done]
+
+
+def test_the_candidate_states_are_exactly_the_states_that_map_to_an_event():
+    from services.payment_orchestration.rails import REAP_STATE_MAP
+
+    want = {rail for rail, unified in REAP_STATE_MAP.items() if unified in purchase_events.EVENT_FOR_STATE}
+    for sql in (events_db._REAP_CANDIDATES_SQL, events_db._REAP_CANDIDATES_SQL_SQLITE):
+        listed = re.search(r"r\.state IN \(([^)]*)\)", sql).group(1)
+        assert {v.strip().strip("'") for v in listed.split(",")} == want
 
 
 # ── hand-over ────────────────────────────────────────────────────────────────────────────────
 
 
-async def test_hand_over_passes_the_stored_event_id_and_records_the_delivery(monkeypatch):
+async def test_hand_over_passes_the_stored_event_id_and_records_the_delivery(monkeypatch, delivery_on):
     await _purchase("completed", reap_order_id="ord_9")
     await purchase_events.detect()
     [event] = await _events()
@@ -293,7 +360,7 @@ async def test_hand_over_passes_the_stored_event_id_and_records_the_delivery(mon
     assert (await purchase_events.hand_over(worker="w1")) == {}
 
 
-async def test_a_skip_by_the_sender_is_recorded_not_retried(monkeypatch):
+async def test_a_skip_by_the_sender_is_recorded_not_retried(monkeypatch, delivery_on):
     await _record()
     monkeypatch.setattr(webhooks, "emit_agent_webhook_event", _Recorder({"status": "skipped", "reason": "event_not_subscribed"}))
     assert (await purchase_events.hand_over(worker="w1")) == {"skipped": 1}
@@ -301,15 +368,78 @@ async def test_a_skip_by_the_sender_is_recorded_not_retried(monkeypatch):
     assert (row["status"], row["skip_reason"]) == ("skipped", "event_not_subscribed")
 
 
-async def test_a_failing_hand_over_is_released_and_never_dropped(monkeypatch):
+async def test_a_failing_hand_over_is_released_and_never_dropped(monkeypatch, delivery_on):
     await _record()
     monkeypatch.setattr(webhooks, "emit_agent_webhook_event", _Recorder(raises=RuntimeError("db down")))
     assert (await purchase_events.hand_over(worker="w1", max_attempts=2)) == {"released": 1}
     [row] = await _events()
-    assert row["status"] == "pending" and row["claimed_by"] is None
+    assert row["status"] == "pending" and row["claimed_by"] is None and row["attempts"] == 1
+    # backed off for one lease: not re-sent in the next tick
+    assert (await purchase_events.hand_over(worker="w1", max_attempts=2)) == {}
+    await database.execute("UPDATE agent_purchase_events SET claimed_at = datetime('now', '-600 seconds')")
     assert (await purchase_events.hand_over(worker="w1", max_attempts=2)) == {"abandoned": 1}
     [row] = await _events()
     assert row["status"] == "abandoned"
+
+
+async def test_with_delivery_off_nothing_is_claimed_and_nothing_is_lost(monkeypatch):
+    """The kill switch: off means untouched, on again means delivered (not finished as skipped)."""
+    from services import webhook_delivery_gate
+
+    event_id = await _record()
+    recorder = _Recorder()
+    monkeypatch.setattr(webhooks, "emit_agent_webhook_event", recorder)
+    monkeypatch.setattr(webhook_delivery_gate, "delivery_enabled", lambda *a, **k: False)
+    assert (await purchase_events.hand_over(worker="w1")) == {"delivery_disabled": 1}
+    [row] = await _events()
+    assert (row["status"], row["claimed_by"], row["attempts"]) == ("pending", None, 0) and recorder.calls == []
+    monkeypatch.setattr(webhook_delivery_gate, "delivery_enabled", lambda *a, **k: True)
+    assert (await purchase_events.hand_over(worker="w1")) == {"handed_over": 1}
+    assert [c["event_id"] for c in recorder.calls] == [event_id]
+
+
+async def test_a_gate_skip_mid_send_is_released_without_an_attempt(monkeypatch, delivery_on):
+    from services import webhook_delivery_gate
+
+    await _record()
+    skipped = webhook_delivery_gate.skipped_result(event_type="purchase.completed", delivery_id=None)
+    monkeypatch.setattr(webhooks, "emit_agent_webhook_event", _Recorder(skipped))
+    assert (await purchase_events.hand_over(worker="w1")) == {"delivery_disabled": 1}
+    [row] = await _events()
+    assert (row["status"], row["claimed_by"], row["attempts"]) == ("pending", None, 0)
+
+
+async def test_a_cancelled_tick_gives_back_every_untried_claim(monkeypatch, delivery_on):
+    import asyncio
+
+    for i in range(3):
+        await _record(purchase_id=f"pp_{i}")
+    calls = []
+
+    async def _cut(agent_id, *, event_type, payload, request_id=None, event_id=None):
+        calls.append(event_id)
+        if len(calls) == 2:
+            raise asyncio.CancelledError()
+        return {"status": "delivered", "delivery_id": "whd_1"}
+
+    monkeypatch.setattr(webhooks, "emit_agent_webhook_event", _cut)
+    with pytest.raises(asyncio.CancelledError):
+        await purchase_events.hand_over(worker="w1")
+    rows = {r["event_id"]: r for r in await _events()}
+    assert rows[calls[0]]["status"] == "handed_over"
+    untried = [r for r in rows.values() if r["status"] == "pending"]
+    assert len(untried) == 2 and all(r["claimed_by"] is None and r["attempts"] == 0 for r in untried)
+    assert len(await events_db.claim_pending(worker="w2")) == 2  # immediately, not after a lease
+
+
+async def test_hand_over_starts_no_new_round_after_its_budget(monkeypatch, delivery_on):
+    for i in range(12):
+        await _record(purchase_id=f"pp_{i}")
+    monkeypatch.setattr(webhooks, "emit_agent_webhook_event", _Recorder())
+    ticks = iter([0.0, 0.0, 999.0, 999.0])
+    counts = await purchase_events.hand_over(worker="w1", budget_seconds=150, clock=lambda: next(ticks))
+    assert counts == {"handed_over": purchase_events.HAND_OVER_BATCH}
+    assert len(await events_db.claim_pending(worker="w2")) == 12 - purchase_events.HAND_OVER_BATCH
 
 
 # ── the job and the sender's event id ────────────────────────────────────────────────────────

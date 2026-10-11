@@ -41,7 +41,7 @@ def _worker_id() -> str:
 async def run_agent_purchase_events() -> Dict[str, Any]:
     if not (purchase_events.is_enabled() and agent_purchase_ledger.is_enabled()):
         return {"skipped": "disabled"}
-    detected = await purchase_events.detect(lookback_hours=_int_env(_LOOKBACK_ENV, 24, 1, 168))
+    detected = await purchase_events.detect(lookback_hours=_int_env(_LOOKBACK_ENV, 72, 1, 168))
     handed = await purchase_events.hand_over(worker=_worker_id())
     if detected or handed:
         logger.info("agent_purchase_events: detected=%s handed=%s", detected, handed)

@@ -99,10 +99,11 @@ def new_event_id() -> str:
 
 _INSERT_SQL = """
     INSERT INTO agent_purchase_events (
-        event_id, purchase_id, agent_id, rail, rail_state, unified_state, event_type, payload
+        event_id, purchase_id, agent_id, rail, rail_state, unified_state, event_type, payload,
+        status, skip_reason
     ) VALUES (
         :event_id, :purchase_id, :agent_id, :rail, :rail_state, :unified_state, :event_type,
-        CAST(:payload AS JSONB)
+        CAST(:payload AS JSONB), :status, :skip_reason
     )
     ON CONFLICT (purchase_id, rail_state) DO NOTHING
 """
@@ -122,9 +123,15 @@ async def record_event(
     unified_state: str,
     event_type: str,
     payload: Dict[str, Any],
+    skip_reason: Optional[str] = None,
 ) -> Optional[str]:
     """Write the event if this (purchase, rail state) has none yet. Returns the event_id that
-    exists afterwards (this call's or a concurrent writer's)."""
+    exists afterwards (this call's or a concurrent writer's).
+
+    With `skip_reason` the row is written already `skipped`: detection found this (purchase,
+    state) can never yield an event (owner mismatch, no page to send the buyer to). The row is
+    the record of that decision AND what stops the detector re-reading the purchase every tick.
+    """
     if event_type not in EVENT_TYPES:
         raise ValueError(f"unknown purchase event type {event_type!r}")
     values = {
@@ -136,6 +143,8 @@ async def record_event(
         "unified_state": unified_state,
         "event_type": event_type,
         "payload": json.dumps(payload, separators=(",", ":"), sort_keys=True),
+        "status": "skipped" if skip_reason else "pending",
+        "skip_reason": str(skip_reason)[:64] if skip_reason else None,
     }
     if IS_POSTGRES:
         await database.execute(_INSERT_SQL, values)
@@ -165,10 +174,12 @@ _SELECT_CLAIMABLE_SQL_SQLITE = """
 """
 
 #: THE claim. Conditional on the row still being pending and unclaimed (or its lease expired), so
-#: of two workers racing for one row exactly one gets it back.
+#: of two workers racing for one row exactly one gets it back. A claim is NOT an attempt: only a
+#: hand-over that actually reached the sender and failed counts (`release(..., burn=True)`), so an
+#: event claimed by a tick that was cut short does not drift toward `abandoned`.
 _CLAIM_SQL = """
     UPDATE agent_purchase_events
-       SET claimed_by = :worker, claimed_at = clock_timestamp(), attempts = attempts + 1
+       SET claimed_by = :worker, claimed_at = clock_timestamp()
      WHERE event_id = :event_id
        AND status = 'pending'
        AND (claimed_at IS NULL OR claimed_at < clock_timestamp() - (:lease_seconds * INTERVAL '1 second'))
@@ -177,7 +188,7 @@ _CLAIM_SQL = """
 """
 _CLAIM_SQL_SQLITE = """
     UPDATE agent_purchase_events
-       SET claimed_by = :worker, claimed_at = CURRENT_TIMESTAMP, attempts = attempts + 1
+       SET claimed_by = :worker, claimed_at = CURRENT_TIMESTAMP
      WHERE event_id = :event_id
        AND status = 'pending'
        AND (claimed_at IS NULL OR claimed_at < datetime('now', '-' || :lease_seconds || ' seconds'))
@@ -198,8 +209,9 @@ _FINISH_SQL_SQLITE = _FINISH_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP
 
 _RELEASE_SQL = """
     UPDATE agent_purchase_events
-       SET claimed_by = NULL, claimed_at = NULL,
-           status = CASE WHEN attempts >= :max_attempts THEN 'abandoned' ELSE status END
+       SET claimed_by = NULL, attempts = attempts + :burn,
+           claimed_at = CASE WHEN :burn = 1 THEN claimed_at ELSE NULL END,
+           status = CASE WHEN attempts + :burn >= :max_attempts THEN 'abandoned' ELSE status END
      WHERE event_id = :event_id AND claimed_by = :worker AND status = 'pending'
     RETURNING event_id, status
 """
@@ -257,11 +269,15 @@ async def finish(
     return row is not None
 
 
-async def release(event_id: str, *, worker: str, max_attempts: int = 10) -> Optional[str]:
-    """Give the claim back after a failed hand-over; past `max_attempts` the event is abandoned
-    (visible, never silently dropped). Returns the resulting status, or None if not held."""
+async def release(event_id: str, *, worker: str, max_attempts: int = 10, burn: bool = True) -> Optional[str]:
+    """Give the claim back. `burn` counts a failed hand-over as an attempt and KEEPS `claimed_at`,
+    so the event is next claimable one lease later (a back-off, not a hot loop on a failing
+    receiver); past `max_attempts` it is abandoned (visible, never silently dropped). `burn=False`
+    returns an event that was never tried (delivery switched off, tick cut short), claimable at
+    once. Returns the resulting status, or None if this worker does not hold it."""
     row = await database.fetch_one(
-        _RELEASE_SQL, {"event_id": event_id, "worker": worker, "max_attempts": int(max_attempts)}
+        _RELEASE_SQL,
+        {"event_id": event_id, "worker": worker, "max_attempts": int(max_attempts), "burn": 1 if burn else 0},
     )
     return str(row["status"]) if row else None
 
@@ -269,8 +285,16 @@ async def release(event_id: str, *, worker: str, max_attempts: int = 10) -> Opti
 # ── detection reads (per rail) ───────────────────────────────────────────────────────────────
 
 #: Reap purchases whose CURRENT state warrants an event and that have none for that state yet.
-#: Bounded by a lookback on the Reap row's `updated_at`, so turning the dial on does not replay
-#: events for purchases that settled long ago.
+#:
+#: Bounded by a lookback on `state_entered_at` (when the row entered its current state; claims,
+#: releases and requeues move `updated_at` but never this), so turning the dial on does not replay
+#: events for purchases that settled long ago. A pause LONGER than the lookback drops the events
+#: of purchases that changed state during it (documented; get_order stays authoritative).
+#:
+#: The two action states are candidates only while the page the buyer must open is attached and
+#: not past its deadline (the same conditions the view applies, so a row the view would answer
+#: "no page" for is not re-read every tick and cannot crowd newer purchases out of the LIMIT).
+#: The state list must equal the rail states `EVENT_FOR_STATE` maps; a test pins it.
 _REAP_CANDIDATES_SQL = """
     SELECT p.id, p.rail, p.executor, p.rail_purchase_id, p.agent_id, p.agent_user_ref_hash,
            p.routing_plan, p.created_at, r.state AS rail_state
@@ -280,12 +304,19 @@ _REAP_CANDIDATES_SQL = """
        AND p.agent_id IS NOT NULL
        AND p.agent_user_ref_hash IS NOT NULL
        AND r.state IN ('needs_enrollment', 'awaiting_approval', 'completed', 'failed', 'refused', 'expired')
-       AND r.updated_at > clock_timestamp() - (:lookback_hours * INTERVAL '1 hour')
+       AND r.state_entered_at > clock_timestamp() - (:lookback_hours * INTERVAL '1 hour')
+       AND (r.state NOT IN ('needs_enrollment', 'awaiting_approval') OR (
+            r.hosted_url IS NOT NULL
+            AND (r.hosted_url_expires_at IS NULL OR r.hosted_url_expires_at > clock_timestamp())
+            AND (r.state <> 'needs_enrollment' OR r.hosted_url_expires_at IS NOT NULL)
+            AND (r.state <> 'awaiting_approval' OR r.reap_quote_expires_at IS NULL
+                 OR r.reap_quote_expires_at > clock_timestamp())
+       ))
        AND NOT EXISTS (
             SELECT 1 FROM agent_purchase_events e
              WHERE e.purchase_id = p.id AND e.rail_state = r.state
            )
-     ORDER BY r.updated_at, p.id
+     ORDER BY r.state_entered_at, p.id
      LIMIT :limit
 """
 _REAP_CANDIDATES_SQL_SQLITE = """
@@ -297,12 +328,19 @@ _REAP_CANDIDATES_SQL_SQLITE = """
        AND p.agent_id IS NOT NULL
        AND p.agent_user_ref_hash IS NOT NULL
        AND r.state IN ('needs_enrollment', 'awaiting_approval', 'completed', 'failed', 'refused', 'expired')
-       AND r.updated_at > datetime('now', '-' || :lookback_hours || ' hours')
+       AND r.state_entered_at > datetime('now', '-' || :lookback_hours || ' hours')
+       AND (r.state NOT IN ('needs_enrollment', 'awaiting_approval') OR (
+            r.hosted_url IS NOT NULL
+            AND (r.hosted_url_expires_at IS NULL OR r.hosted_url_expires_at > CURRENT_TIMESTAMP)
+            AND (r.state <> 'needs_enrollment' OR r.hosted_url_expires_at IS NOT NULL)
+            AND (r.state <> 'awaiting_approval' OR r.reap_quote_expires_at IS NULL
+                 OR r.reap_quote_expires_at > CURRENT_TIMESTAMP)
+       ))
        AND NOT EXISTS (
             SELECT 1 FROM agent_purchase_events e
              WHERE e.purchase_id = p.id AND e.rail_state = r.state
            )
-     ORDER BY r.updated_at, p.id
+     ORDER BY r.state_entered_at, p.id
      LIMIT :limit
 """
 

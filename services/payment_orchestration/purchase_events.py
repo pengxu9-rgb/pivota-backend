@@ -15,12 +15,15 @@ ledger dial, AGENT_PURCHASE_LEDGER_ENABLED, since the events hang off its rows).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import time
 from collections import Counter
 from typing import Any, Dict
 
 import db.agent_purchase_events as events_db
+from services import webhook_delivery_gate
 from services.payment_orchestration import purchase_view
 from services.payment_orchestration.rails import unified_state
 
@@ -66,6 +69,10 @@ async def detect(*, lookback_hours: int = 24, limit: int = 200) -> Dict[str, int
             parent, agent_id=parent["agent_id"], agent_user_ref_hash=parent["agent_user_ref_hash"]
         )
         if problem:
+            # Permanent for this (purchase, state): the owner does not match, or the state has no
+            # mapping. A skipped row records that, and keeps the purchase out of the next tick's
+            # candidates instead of re-reading it (and crowding newer ones out) every 30 s.
+            await _record_skip(parent, rail_state, state, event_type, problem)
             counts[problem] += 1
             continue
         if body.get("rail_state") != rail_state:
@@ -74,10 +81,12 @@ async def detect(*, lookback_hours: int = 24, limit: int = 200) -> Dict[str, int
             counts["moved"] += 1
             continue
         if event_type == "purchase.action_required" and "next_action" not in body:
-            # The rail has not attached (or has already withdrawn) the page the buyer must open.
-            # Telling the agent "act" with nowhere to send the buyer helps nobody: try again on the
-            # next run, while the state is still the same.
-            counts["no_action_yet"] += 1
+            # The candidate read only offers action states whose page is attached and live, so the
+            # view refusing it here means the page failed re-vetting or died in between: telling
+            # the agent "act" with nowhere to send the buyer helps nobody, and it will not change
+            # in this state. Recorded as skipped; a new state is a new candidate.
+            await _record_skip(parent, rail_state, state, event_type, "no_action")
+            counts["no_action"] += 1
             continue
         await events_db.record_event(
             purchase_id=parent["id"], agent_id=parent["agent_id"], rail=parent["rail"],
@@ -88,36 +97,106 @@ async def detect(*, lookback_hours: int = 24, limit: int = 200) -> Dict[str, int
     return dict(counts)
 
 
-async def hand_over(*, worker: str, limit: int = 50, lease_seconds: int = 300, max_attempts: int = 10) -> Dict[str, int]:
-    """Pass claimed pending events to the agent webhook sender. Returns counts by outcome."""
+async def _record_skip(parent: Dict[str, Any], rail_state: str, state: Any, event_type: str, reason: str) -> None:
+    await events_db.record_event(
+        purchase_id=parent["id"], agent_id=parent["agent_id"], rail=parent["rail"],
+        rail_state=rail_state, unified_state=str(state or "unmapped"), event_type=event_type,
+        payload={}, skip_reason=reason,
+    )
+
+
+#: Claimed per round. Small, so a tick cut short strands few claims (and those are released).
+HAND_OVER_BATCH = 10
+#: No new round starts after this long. One POST is bounded by the sender's own 10 s timeout, so a
+#: tick ends within this + 10 s + detect, inside the scheduler's 300 s deadline.
+HAND_OVER_BUDGET_SECONDS = 150.0
+
+
+async def hand_over(
+    *,
+    worker: str,
+    limit: int = 50,
+    lease_seconds: int = 300,
+    max_attempts: int = 10,
+    budget_seconds: float = HAND_OVER_BUDGET_SECONDS,
+    clock=time.monotonic,
+) -> Dict[str, int]:
+    """Pass claimed pending events to the agent webhook sender. Returns counts by outcome.
+
+    While webhook delivery is switched off in this process (services/webhook_delivery_gate),
+    nothing is claimed: events stay pending, untouched, until delivery is on again.
+    """
+    if not webhook_delivery_gate.delivery_enabled():
+        return {"delivery_disabled": 1}
+    counts: Counter = Counter()
+    deadline = clock() + max(0.0, float(budget_seconds))
+    done = 0
+    while done < limit and clock() < deadline:
+        batch = await events_db.claim_pending(
+            worker=worker, limit=min(HAND_OVER_BATCH, limit - done), lease_seconds=lease_seconds
+        )
+        if not batch:
+            break
+        unfinished = list(batch)
+        stop = False
+        try:
+            while unfinished:
+                outcome = await _hand_one(unfinished[0], worker=worker, max_attempts=max_attempts)
+                unfinished.pop(0)
+                counts[outcome] += 1
+                done += 1
+                if outcome == "delivery_disabled":
+                    stop = True  # delivery went off mid-tick: give the rest back and stop
+                    break
+        finally:
+            if unfinished:
+                # Cut short (the scheduler deadline cancels the tick): give back what was never
+                # tried, without counting an attempt, rather than leaving it claimed for a lease.
+                await asyncio.shield(_release_untried(unfinished, worker=worker, max_attempts=max_attempts))
+        if stop:
+            break
+    return dict(counts)
+
+
+async def _release_untried(events: Any, *, worker: str, max_attempts: int) -> None:
+    for event in events:
+        try:
+            await events_db.release(event["event_id"], worker=worker, max_attempts=max_attempts, burn=False)
+        except Exception as exc:  # noqa: BLE001 - the lease returns it anyway
+            logger.warning("agent_purchase_events: release failed event=%s error_type=%s",
+                           event["event_id"], type(exc).__name__)
+
+
+async def _hand_one(event: Dict[str, Any], *, worker: str, max_attempts: int) -> str:
     from services import agent_webhook_service
 
-    counts: Counter = Counter()
-    for event in await events_db.claim_pending(worker=worker, limit=limit, lease_seconds=lease_seconds):
-        try:
-            result = await agent_webhook_service.emit_agent_webhook_event(
-                event["agent_id"], event_type=event["event_type"], payload=event["payload"],
-                event_id=event["event_id"],
-            )
-        except Exception as exc:  # noqa: BLE001 - release and retry later, never drop
-            status = await events_db.release(event["event_id"], worker=worker, max_attempts=max_attempts)
-            logger.warning(
-                "agent_purchase_events: hand-over failed event=%s error_type=%s now=%s",
-                event["event_id"], type(exc).__name__, status,
-            )
-            counts["abandoned" if status == "abandoned" else "released"] += 1
-            continue
-        if not isinstance(result, dict):
-            await events_db.release(event["event_id"], worker=worker, max_attempts=max_attempts)
-            counts["released"] += 1
-            continue
-        if result.get("status") == "skipped":
-            await events_db.finish(event["event_id"], worker=worker, status="skipped",
-                                   skip_reason=str(result.get("reason") or "skipped")[:64])
-            counts["skipped"] += 1
-            continue
-        await events_db.finish(event["event_id"], worker=worker, status="handed_over",
-                               delivery_id=result.get("delivery_id"),
-                               delivery_status=str(result.get("status") or "")[:32] or None)
-        counts["handed_over"] += 1
-    return dict(counts)
+    try:
+        result = await agent_webhook_service.emit_agent_webhook_event(
+            event["agent_id"], event_type=event["event_type"], payload=event["payload"],
+            event_id=event["event_id"],
+        )
+    except Exception as exc:  # noqa: BLE001 - release and retry later, never drop
+        status = await events_db.release(event["event_id"], worker=worker, max_attempts=max_attempts)
+        logger.warning(
+            "agent_purchase_events: hand-over failed event=%s error_type=%s now=%s",
+            event["event_id"], type(exc).__name__, status,
+        )
+        return "abandoned" if status == "abandoned" else "released"
+    if not isinstance(result, dict):
+        await events_db.release(event["event_id"], worker=worker, max_attempts=max_attempts)
+        return "released"
+    if webhook_delivery_gate.skipped_by_environment(result):
+        # Delivery went off between the check above and this send: not an attempt, not an end.
+        await events_db.release(event["event_id"], worker=worker, max_attempts=max_attempts, burn=False)
+        return "delivery_disabled"
+    if result.get("status") == "skipped":
+        # The agent's own webhook config said no (not subscribed to purchase.*, or no destination).
+        # Terminal by design: an event is about the moment it happened, and get_order answers for
+        # any purchase the agent asks about later (documented in docs/agent_purchases_routes.md).
+        await events_db.finish(event["event_id"], worker=worker, status="skipped",
+                               skip_reason=str(result.get("reason") or "skipped")[:64])
+        return "skipped"
+    await events_db.finish(event["event_id"], worker=worker, status="handed_over",
+                           delivery_id=result.get("delivery_id"),
+                           delivery_status=str(result.get("status") or "")[:32] or None)
+    return "handed_over"
