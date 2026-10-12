@@ -8,9 +8,9 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
 
   opened                -> read the buyer's cards. An ACTIVE one: record it, go to `quoting`. None: ask
                            the rail for a card-binding page and go to `needs_payment_method` with it.
-  needs_payment_method  -> read the cards. The one being bound is ACTIVE: `quoting`. It failed: `failed`.
-                           Still pending a minute after the page went out: tell the rail the buyer may
-                           be done (`bound`) and read its answer.
+  needs_payment_method  -> read the cards. The one being bound (or any other) is ACTIVE: `quoting`. It
+                           failed: `failed`. Still pending: tell the rail the buyer may be done
+                           (`bound`) on a spaced schedule (BOUND_SCHEDULE), and read its answer.
   quoting and later     -> PARKED (`shop_protocol_pending`). Quoting, the order lock, the token and the
                            pay all depend on the rail's order protocol, which is not settled; nothing
                            here guesses at a step that can move money. The lifetime ceiling in the
@@ -47,8 +47,13 @@ logger = logging.getLogger(__name__)
 
 #: How long the buyer's card-binding page is offered before the sweep may expire the purchase.
 HOSTED_PAGE_SECONDS = 1800
-#: How long after the page went out before the worker tells the rail the buyer may be done.
-BOUND_AFTER_SECONDS = 60
+#: When (seconds after the page went out) the worker tells the rail the buyer may be done: a few times,
+#: spaced, never on every poll. How many went out is kept in `last_error_code` as `bound_sent:<n>`.
+BOUND_SCHEDULE = (60, 180, 420, 900)
+#: An unseen card-binding write is reconciled for at most this long (from when it was recorded), or
+#: until the attempts cap; then the purchase fails. Such a write moves no money, so failing is safe,
+#: and without the bound a row whose reads keep failing would never end (the sweep skips it).
+RECONCILE_LIMIT_SECONDS = 1800
 #: Seconds until the next poll, by situation.
 POLL_BINDING = 20
 POLL_RETRY = 60
@@ -66,6 +71,8 @@ PARKED_STATES = frozenset({"quoting", "awaiting_authorization", "paying"})
 #: Claims of an `opened` purchase before it fails. Waiting on the buyer is not counted (the ledger),
 #: and `paying` is never capped (money may be moving; only the rail's answer ends it).
 MAX_OPENED_ATTEMPTS = 20
+#: Requeue a claim only after this long: longer than the job's 300 s run deadline.
+STALE_LEASE_SECONDS = 600
 
 
 def _now() -> datetime:
@@ -81,10 +88,27 @@ def _action(pair: Tuple[str, str]) -> str:
 
 
 def _code(prefix: str, result: Any) -> str:
-    """A ledger error code (`^[a-z0-9_:.-]{1,64}$`) naming what the rail answered."""
+    """A ledger error code (`^[a-z0-9_:.-]{1,64}$`) naming the KIND of answer. Not the rail's own error
+    vocabulary: `last_error_code` is shown to agents."""
     kind = getattr(result, "kind", "unknown")
-    detail = getattr(result, "error_code", None) or getattr(result, "http_status", None) or ""
+    detail = getattr(result, "http_status", None) or ""
     return f"{prefix}:{kind}:{detail}".lower().replace(" ", "")[:64].rstrip(":")
+
+
+def _aware(value: Any) -> Optional[datetime]:
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _bound_count(row: Mapping[str, Any]) -> int:
+    code = str(row.get("last_error_code") or "")
+    if code.startswith("bound_sent:"):
+        try:
+            return int(code.split(":", 1)[1])
+        except ValueError:
+            return 0
+    return 0
 
 
 class _Step:
@@ -130,6 +154,19 @@ def _method(methods: List[Dict[str, Any]], method_id: Optional[str]) -> Optional
 # ── the steps ────────────────────────────────────────────────────────────────────────────────
 
 
+async def _settled(s: _Step, moved: Optional[Mapping[str, Any]], outcome: str) -> str:
+    """`outcome` when the transition happened. A None transition is a lost race only if the row moved
+    on; if this worker still holds it (the ledger refused the transition, e.g. its contact was
+    purged), give the lease back with a reason instead of sitting on it until the requeue."""
+    if moved is not None:
+        return outcome
+    row = await ledger.get_purchase_internal(s.id)
+    if row is not None and row.get("claimed_by") == s.worker and row.get("state") not in ledger.TERMINAL_STATES:
+        await s.release(POLL_RETRY, "transition_refused")
+        return "transition_refused"
+    return "lost"
+
+
 async def _opened(s: _Step) -> str:
     methods, read = await s.methods()
     if methods is None:
@@ -139,12 +176,12 @@ async def _opened(s: _Step) -> str:
     if method_id:
         moved = await ledger.transition_as_holder(
             s.id, s.worker, from_states=["opened"], to_state="quoting", payment_method_id=method_id)
-        return "method_ready" if moved else "lost"
+        return await _settled(s, moved, "method_ready")
     if not s.row.get("buyer_email"):
         # The rail asks for the buyer's email to bind a card; without one there is nothing to send.
         moved = await ledger.transition_as_holder(
             s.id, s.worker, from_states=["opened"], to_state="refused", refusal_reason="buyer_email_required")
-        return "refused" if moved else "lost"
+        return await _settled(s, moved, "refused")
     return await _start_binding(s, from_state="opened")
 
 
@@ -167,14 +204,14 @@ async def _start_binding(s: _Step, *, from_state: str) -> str:
             await ledger.clear_pending_write(s.id, s.worker, action)
             moved = await ledger.transition_as_holder(
                 s.id, s.worker, from_states=[from_state], to_state="failed", last_error_code="binding_page_invalid")
-            return "failed" if moved else "lost"
-        return "binding_page_issued" if moved else "lost"
+            return await _settled(s, moved, "failed")
+        return await _settled(s, moved, "binding_page_issued")
     if result.ok:
         # A definite answer (the rail sent cards) that is not a binding page: nothing to wait for.
         await ledger.clear_pending_write(s.id, s.worker, action)
         moved = await ledger.transition_as_holder(
             s.id, s.worker, from_states=[from_state], to_state="failed", last_error_code="binding_answer_unrecognised")
-        return "failed" if moved else "lost"
+        return await _settled(s, moved, "failed")
     return await _unresolved_write(s, action, result)
 
 
@@ -188,51 +225,58 @@ async def _binding(s: _Step) -> str:
     if status == "ACTIVE":
         moved = await ledger.transition_as_holder(
             s.id, s.worker, from_states=["needs_payment_method"], to_state="quoting")
-        return "method_ready" if moved else "lost"
+        return await _settled(s, moved, "method_ready")
+    other = _active_method(methods)
+    if other:
+        # The buyer has an ACTIVE card after all (bound through another purchase's page, say): use it.
+        moved = await ledger.transition_as_holder(
+            s.id, s.worker, from_states=["needs_payment_method"], to_state="quoting", payment_method_id=other)
+        return await _settled(s, moved, "method_ready")
     if status in _DEAD_METHOD_STATUSES:
         moved = await ledger.transition_as_holder(
             s.id, s.worker, from_states=["needs_payment_method"], to_state="failed",
             last_error_code=f"card_binding_{status.lower()}")
-        return "failed" if moved else "lost"
-    entered = s.row.get("state_entered_at")
-    if method is None or not isinstance(entered, datetime) or (
-        _now() - (entered if entered.tzinfo else entered.replace(tzinfo=timezone.utc))
-    ).total_seconds() < BOUND_AFTER_SECONDS:
+        return await _settled(s, moved, "failed")
+    entered = _aware(s.row.get("state_entered_at"))
+    sent = _bound_count(s.row)
+    elapsed = (_now() - entered).total_seconds() if entered else 0.0
+    if method is None or sent >= len(BOUND_SCHEDULE) or elapsed < BOUND_SCHEDULE[sent]:
         await s.release(POLL_BINDING, None if method is not None else "method_not_listed")
         return "waiting_on_buyer"
-    return await _send_bound(s)
+    return await _send_bound(s, sent + 1)
 
 
-async def _send_bound(s: _Step) -> str:
+async def _send_bound(s: _Step, count: int) -> str:
     action = _action(BOUND)
     if await ledger.mark_pending_write(s.id, s.worker, action) is None:
         return "lost"
     result = await s.send(BOUND)
     card = result.card("payment.method-add-await-card") if result.ok else None
-    if card is not None:
-        if card.data.get("status") == "ACTIVE":
-            moved = await ledger.transition_as_holder(
-                s.id, s.worker, from_states=["needs_payment_method"], to_state="quoting", resolves_write=action)
-            return "method_ready" if moved else "lost"
-        # Definite answer: not bound yet. The buyer is still on the page (or never opened it).
+    if card is not None and card.data.get("status") == "ACTIVE":
+        moved = await ledger.transition_as_holder(
+            s.id, s.worker, from_states=["needs_payment_method"], to_state="quoting", resolves_write=action)
+        return await _settled(s, moved, "method_ready")
+    if result.ok:
+        # A definite answer (not bound yet, or another card): the buyer is still on the page.
         await ledger.clear_pending_write(s.id, s.worker, action)
-        await s.release(POLL_BINDING * 2, None)
+        await s.release(POLL_BINDING * 2, f"bound_sent:{count}")
         return "waiting_on_buyer"
-    return await _unresolved_write(s, action, result)
+    return await _unresolved_write(s, action, result, code=f"bound_sent:{count}")
 
 
-async def _unresolved_write(s: _Step, action: str, result: Any) -> str:
+async def _unresolved_write(s: _Step, action: str, result: Any, *, code: Optional[str] = None) -> str:
     """An answer that did not carry what the step needed. A definite refusal resolves the write; an
-    unseen outcome keeps it pending for `_reconcile`."""
+    unseen outcome keeps it pending for `_reconcile`. `code`, when given, replaces the recorded reason
+    (the `bound` schedule keeps its count that way)."""
     if getattr(result, "kind", None) == "money_result":
         logger.error("a2a_rail_worker: money-result card on %s purchase=%s; parked for a human", action, s.id)
         await s.release(POLL_PARKED, "money_result_seen")
         return "money_result_seen"
     if result.resend_safe:
         await ledger.clear_pending_write(s.id, s.worker, action)
-        await s.release(POLL_RETRY, _code("rail_refused", result))
+        await s.release(POLL_RETRY, code or _code("rail_refused", result))
         return "rail_refused"
-    await s.release(POLL_RETRY, _code("outcome_unknown", result))
+    await s.release(POLL_RETRY, code or _code("outcome_unknown", result))
     return "outcome_unknown"
 
 
@@ -244,28 +288,37 @@ async def _reconcile(s: _Step) -> str:
         logger.error("a2a_rail_worker: unreconcilable pending write %s purchase=%s", action, s.id)
         await s.release(POLL_PARKED, "pending_write_unreconcilable")
         return "pending_write_unreconcilable"
+    state = str(s.row["state"])
+    recorded = _aware(s.row.get("pending_write_at"))
+    if (recorded is not None and (_now() - recorded).total_seconds() > RECONCILE_LIMIT_SECONDS) or (
+        int(s.row.get("attempts") or 0) > MAX_OPENED_ATTEMPTS
+    ):
+        moved = await ledger.transition_as_holder(
+            s.id, s.worker, from_states=[state], to_state="failed", resolves_write=action,
+            last_error_code="reconcile_exhausted")
+        return await _settled(s, moved, "failed")
     methods, read = await s.methods()
     if methods is None:
         await s.release(POLL_RETRY, _code("reconcile_read", read))
         return "rail_read_failed"
-    state = str(s.row["state"])
     if state == "opened":
         method_id = _active_method(methods)
         if method_id:
             moved = await ledger.transition_as_holder(
                 s.id, s.worker, from_states=["opened"], to_state="quoting", resolves_write=action,
                 payment_method_id=method_id)
-            return "method_ready" if moved else "lost"
+            return await _settled(s, moved, "method_ready")
     elif state == "needs_payment_method":
         method = _method(methods, s.row.get("payment_method_id"))
         if (method or {}).get("status") == "ACTIVE":
             moved = await ledger.transition_as_holder(
                 s.id, s.worker, from_states=["needs_payment_method"], to_state="quoting", resolves_write=action)
-            return "method_ready" if moved else "lost"
+            return await _settled(s, moved, "method_ready")
     # No usable card: the unseen write bound nothing we can use. It moved no money, so it is resolved by
     # this read; the next poll starts over (a page the rail issued but we never saw simply lapses).
     await ledger.clear_pending_write(s.id, s.worker, action)
-    await s.release(0, "reconciled")
+    keep = str(s.row.get("last_error_code") or "")
+    await s.release(0, keep if keep.startswith("bound_sent:") else "reconciled")
     return "reconciled"
 
 
@@ -289,7 +342,12 @@ async def step(client: Any, row: Mapping[str, Any], worker: str) -> str:
     if state == "opened" and int(row.get("attempts") or 0) > MAX_OPENED_ATTEMPTS:
         moved = await ledger.transition_as_holder(
             s.id, worker, from_states=["opened"], to_state="failed", last_error_code="attempts_exhausted")
-        return "failed" if moved else "lost"
+        return await _settled(s, moved, "failed")
+    if state in ("opened", "needs_payment_method") and row.get("contact_purged_at"):
+        # The rail needs the buyer's email to bind a card and the quote needs the address: gone.
+        moved = await ledger.transition_as_holder(
+            s.id, worker, from_states=[state], to_state="failed", last_error_code="contact_purged")
+        return await _settled(s, moved, "failed")
     if state in PARKED_STATES:
         return await _parked(s)
     handler = _STEPS.get(state)
@@ -304,7 +362,7 @@ async def run_tick(
     worker: str,
     *,
     limit: int = 10,
-    budget_seconds: float = 120.0,
+    budget_seconds: float = 60.0,
     clock: Callable[[], float] = time.monotonic,
 ) -> Dict[str, int]:
     """One scheduler tick: the sweeps, then up to `limit` claimed steps within the budget."""
@@ -314,7 +372,9 @@ async def run_tick(
         counts[name] = counts.get(name, 0) + n
 
     for name, sweep in (
-        ("requeued", ledger.requeue_stale_claims),
+        # The lease outlives the run deadline (300 s): a claim is only requeued once the tick that
+        # took it has certainly ended.
+        ("requeued", lambda: ledger.requeue_stale_claims(lease_seconds=STALE_LEASE_SECONDS)),
         ("expired", ledger.expire_overdue_purchases),
         ("contact_purged", ledger.purge_stale_contact),
     ):

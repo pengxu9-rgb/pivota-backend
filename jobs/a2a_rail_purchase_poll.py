@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import uuid
 from typing import Any, Dict, Optional
 
 from services.payment_orchestration import a2a_rail, a2a_rail_worker
@@ -38,7 +39,10 @@ def job_interval_seconds() -> int:
 
 
 def _worker_id() -> str:
-    return f"a2a-{socket.gethostname()[:32]}-{os.getpid()}"
+    """Unique PER RUN, not per process: a scheduled tick and an admin run-now in one process must not
+    share a claim identity, or one could write to a row the other holds (jobs/reap_agentic_purchase_poll
+    has the same rule)."""
+    return f"a2a-{socket.gethostname()[:24]}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
 def _get_client() -> Optional[Any]:
@@ -55,6 +59,11 @@ async def run_a2a_rail_purchase_poll() -> Dict[str, Any]:
     if client is None:
         return {"skipped": "client_not_configured"}
     counts = await a2a_rail_worker.run_tick(client, _worker_id())
-    if counts:
-        logger.info("a2a_rail_purchase_poll: %s", counts)
+    if set(counts) - _QUIET_OUTCOMES:
+        # WARNING, not INFO: prod drops module-logger INFO, and an operator arming the dial needs to see
+        # that ticks stepped something. Quiet ticks (only parked or waiting rows) stay silent.
+        logger.warning("a2a_rail_purchase_poll: %s", counts)
     return counts
+
+
+_QUIET_OUTCOMES = frozenset({"parked", "waiting_on_buyer"})

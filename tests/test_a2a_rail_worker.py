@@ -262,22 +262,121 @@ async def test_a_failed_binding_fails_the_purchase():
     assert (await _row(pid))["last_error_code"] == "card_binding_failed"
 
 
-async def test_a_fresh_page_is_only_read_and_an_older_one_gets_bound_once():
+async def test_bound_goes_out_on_a_spaced_schedule_not_on_every_poll():
     pid = await _binding()
     pending = {**ACTIVE, "id": "pm_new", "status": "PENDING"}
-    rail = Rail().on("payment.method-view#submit", _methods(pending))
-    assert await _step(rail, pid) == "waiting_on_buyer"
-    assert rail.actions() == ["payment.method-view#submit"]  # no write within the first minute
-    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = datetime('now', '-120 seconds')")
     still = _task(("payment.method-add-await-card", {"status": "PENDING"}))
-    rail = Rail().on("payment.method-view#submit", _methods(pending)).on("payment.method-add-required-card#bound", still)
-    assert await _step(rail, pid) == "waiting_on_buyer"
-    assert rail.sent[1][2] == "payment.method-add-required-card#bound"  # write-ahead
-    assert (await _row(pid))["pending_write"] is None
+
+    async def poll(age_seconds):
+        await database.execute(
+            "UPDATE a2a_rail_purchases SET state_entered_at = datetime('now', :age)", {"age": f"-{age_seconds} seconds"})
+        rail = Rail().on("payment.method-view#submit", _methods(pending)).on(
+            "payment.method-add-required-card#bound", still)
+        outcome = await _step(rail, pid)
+        return outcome, rail.actions().count("payment.method-add-required-card#bound"), rail
+
+    assert (await poll(30))[1] == 0              # within the first minute: read only
+    outcome, bounds, rail = await poll(90)       # past 60 s: the first bound, write-ahead
+    assert (outcome, bounds) == ("waiting_on_buyer", 1)
+    assert rail.sent[1][2] == "payment.method-add-required-card#bound"
+    assert (await _row(pid))["last_error_code"] == "bound_sent:1" and (await _row(pid))["pending_write"] is None
+    for _ in range(4):                           # every poll before 180 s: no second bound
+        assert (await poll(150))[1] == 0
+    assert (await poll(200))[1] == 1             # the second slot
+    assert (await poll(500))[1] == 1             # the third
+    assert (await poll(1000))[1] == 1            # the fourth
+    assert (await poll(1700))[1] == 0            # schedule exhausted: reads until the page expires
     done = _task(("payment.method-add-await-card", {"status": "ACTIVE"}))
+    await database.execute("UPDATE a2a_rail_purchases SET last_error_code = 'bound_sent:0'")
     rail = Rail().on("payment.method-view#submit", _methods(pending)).on("payment.method-add-required-card#bound", done)
     assert await _step(rail, pid) == "method_ready"
-    assert (await _row(pid))["state"] == "quoting"
+
+
+async def test_an_unseen_bound_is_reconciled_by_a_read_and_keeps_its_count():
+    pid = await _binding()
+    pending = {**ACTIVE, "id": "pm_new", "status": "PENDING"}
+    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = datetime('now', '-90 seconds')")
+    rail = Rail().on("payment.method-view#submit", _methods(pending)).on(
+        "payment.method-add-required-card#bound", httpx.Response(504))
+    assert await _step(rail, pid) == "outcome_unknown"
+    row = await _row(pid)
+    assert (row["pending_write"], row["last_error_code"]) == ("payment.method-add-required-card#bound", "bound_sent:1")
+    rail = Rail().on("payment.method-view#submit", _methods({**pending, "status": "ACTIVE"}))
+    assert await _step(rail, pid) == "method_ready"  # the needs_payment_method branch of _reconcile
+    row = await _row(pid)
+    assert (row["state"], row["pending_write"]) == ("quoting", None)
+    assert rail.actions() == ["payment.method-view#submit"]
+
+
+async def test_a_binding_uses_another_active_card_the_buyer_now_has():
+    pid = await _binding()
+    rail = Rail().on("payment.method-view#submit", _methods({**ACTIVE, "id": "pm_new", "status": "PENDING"}, NEWER))
+    assert await _step(rail, pid) == "method_ready"
+    assert (await _row(pid))["payment_method_id"] == "pm_newer"
+
+
+async def test_an_unseen_binding_write_is_given_up_after_its_reconcile_limit():
+    pid = (await _open())["id"]
+    await _step(Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit",
+                                                                         httpx.Response(502)), pid)
+    await database.execute("UPDATE a2a_rail_purchases SET pending_write_at = datetime('now', '-2 hours')")
+    rail = Rail()
+    assert await _step(rail, pid) == "failed"
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["pending_write"]) == ("failed", "reconcile_exhausted", None)
+    assert rail.sent == []  # no read, no resend: the write moved no money
+
+
+async def test_a_purged_pre_pay_purchase_fails_instead_of_sitting_on_its_lease():
+    pid = (await _open())["id"]
+    await database.execute("UPDATE a2a_rail_purchases SET created_at = datetime('now', '-4 days')")
+    assert await ledger.purge_stale_contact(max_age_seconds=3 * 86400) == 1
+    rail = Rail()
+    assert await _step(rail, pid) == "failed"
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["claimed_by"]) == ("failed", "contact_purged", None)
+    assert rail.sent == []
+
+
+async def test_a_transition_the_ledger_refuses_releases_the_lease_with_a_reason(monkeypatch):
+    pid = (await _open())["id"]
+
+    async def refuse(*a, **k):
+        return None
+
+    monkeypatch.setattr(ledger, "transition_as_holder", refuse)
+    rail = Rail().on("payment.method-view#submit", _methods(ACTIVE))
+    assert await _step(rail, pid) == "transition_refused"
+    row = await _row(pid)
+    assert (row["claimed_by"], row["last_error_code"]) == (None, "transition_refused")
+
+
+async def test_a_tick_cut_mid_write_keeps_the_write_pending_and_the_lease_released():
+    pid = (await _open())["id"]
+    entered = asyncio.Event()
+
+    class Hang(Rail):
+        async def handler(self, request):
+            if request.url.path != a2a_rail.TOKEN_PATH and b"method-add" in request.content:
+                entered.set()
+                await asyncio.sleep(60)
+            return await super().handler(request)
+
+    rail = Hang().on("payment.method-view#submit", _methods())
+    await database.execute("UPDATE a2a_rail_purchases SET next_poll_at = datetime('now', '-1 seconds')")
+    task = asyncio.ensure_future(worker.run_tick(_client(rail), W))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    row = await _row(pid)
+    assert (row["pending_write"], row["claimed_by"]) == ("payment.method-add#submit", None)
+
+
+def test_each_run_gets_its_own_worker_id():
+    ids = {job._worker_id() for _ in range(5)}
+    assert len(ids) == 5 and all(len(i) <= 64 for i in ids)
+    assert worker.STALE_LEASE_SECONDS > 300  # outlives the job's run deadline
 
 
 # ── parked, capped, the tick and the job ─────────────────────────────────────────────────────
@@ -378,3 +477,15 @@ async def test_logs_carry_no_email_member_or_page(caplog):
                      if r.name.startswith(("services.payment_orchestration", "jobs.", "db.a2a_rail")))
     for secret in (EMAIL, row["member_id"], PAGE, "bind?t=abc"):
         assert secret not in ours
+
+
+async def test_reconciling_an_unseen_bound_that_bound_nothing_keeps_the_schedule_count():
+    pid = await _binding()
+    pending = {**ACTIVE, "id": "pm_new", "status": "PENDING"}
+    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = datetime('now', '-90 seconds')")
+    await _step(Rail().on("payment.method-view#submit", _methods(pending)).on(
+        "payment.method-add-required-card#bound", httpx.Response(504)), pid)
+    rail = Rail().on("payment.method-view#submit", _methods(pending))
+    assert await _step(rail, pid) == "reconciled"
+    row = await _row(pid)
+    assert (row["pending_write"], row["last_error_code"]) == (None, "bound_sent:1")  # not reset to slot 0

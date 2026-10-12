@@ -269,8 +269,10 @@ _JOB_RUN_DEADLINES = {
     # Detect reads at most 200 candidates; hand-over starts no new round of 10 after 150 s and one
     # POST is capped at 10 s, so a tick ends well inside 300 s (a cut tick releases its claims).
     "agent_purchase_events": 300,
-    # Starts no new step after 120 s; one step is a card read plus at most one write, each bounded by
-    # the client's total deadline (2 x 30 s). A cut tick releases every claim it did not step.
+    # Starts no new step after 60 s. One step is a card read plus at most one write; each call is
+    # bounded by the client's total deadline (60 s) and the first may also mint a token (another
+    # 60 s), so a step is <= 180 s and a tick <= ~240 s. A cut tick releases every claim it did not
+    # step, and a write cut mid-call stays pending for the next holder to reconcile.
     "a2a_rail_purchase_poll": 300,
 }
 
