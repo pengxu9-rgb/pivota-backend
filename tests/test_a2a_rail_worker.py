@@ -28,7 +28,21 @@ import db.a2a_rail_ledger as ledger  # noqa: E402
 import jobs.a2a_rail_purchase_poll as job  # noqa: E402
 from services.payment_orchestration import a2a_rail, a2a_rail_worker as worker  # noqa: E402
 
-pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm")
+# The SQLite arm; tests/test_a2a_rail_worker_postgres.py runs these same tests on Postgres.
+pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm; Postgres runs them from the _postgres file")
+
+
+async def _ago(column: str, seconds: int, *, purchase_id=None) -> None:
+    """Set `column` to `seconds` ago (negative: in the future), on either dialect."""
+    where = " WHERE id = :i" if purchase_id else ""
+    if IS_POSTGRES:
+        sql = f"UPDATE a2a_rail_purchases SET {column} = now() - (CAST(:age AS INTEGER) * INTERVAL '1 second'){where}"
+    else:
+        sql = f"UPDATE a2a_rail_purchases SET {column} = datetime('now', '-' || :age || ' seconds'){where}"
+    values = {"age": int(seconds)}
+    if purchase_id:
+        values["i"] = purchase_id
+    await database.execute(sql, values)
 
 HOST = "rail-dev.test"
 BASE = f"https://{HOST}"
@@ -43,10 +57,22 @@ async def _db(monkeypatch):
     monkeypatch.setattr(a2a_rail, "ALLOWED_HOST_SHA256", frozenset({hashlib.sha256(HOST.encode()).hexdigest()}))
     if not database.is_connected:
         await database.connect()
-    for table in ("agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs"):
+    # On Postgres agent_purchases is shared with other files: only this rail's tables are dropped.
+    tables = ("a2a_rail_purchases", "a2a_rail_buyer_refs") if IS_POSTGRES else (
+        "agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs")
+    for table in tables:
         await database.execute(f"DROP TABLE IF EXISTS {table}")
     await ensure_required_schema_light()
-    yield
+    if IS_POSTGRES:
+        await database.execute("DELETE FROM agent_purchases WHERE rail = 'a2a'")
+    if not IS_POSTGRES:
+        yield
+        return
+    # asyncpg's pool belongs to this test's event loop: give it back at the end of every test.
+    try:
+        yield
+    finally:
+        await database.disconnect()
 
 
 def _task(*cards, texts=()):
@@ -109,8 +135,7 @@ async def _open(**kw):
 
 
 async def _claim(pid):
-    await database.execute("UPDATE a2a_rail_purchases SET next_poll_at = datetime('now', '-1 seconds') WHERE id = :i",
-                           {"i": pid})
+    await _ago("next_poll_at", 1, purchase_id=pid)
     [row] = [r for r in await ledger.claim_due_purchases(W, limit=50) if r["id"] == pid]
     return row
 
@@ -210,14 +235,22 @@ async def test_a_write_this_worker_does_not_own_is_never_resent_or_guessed():
 
 async def test_a_definite_refusal_resolves_the_write_and_a_money_result_parks():
     pid = (await _open())["id"]
-    rail = Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit", httpx.Response(400))
-    assert await _step(rail, pid) == "rail_refused"
+    rail = Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit", httpx.Response(429))
+    assert await _step(rail, pid) == "rail_refused"  # throttled: a definite "not now", retried
     assert (await _row(pid))["pending_write"] is None
     money = _task(("payment.pay-result", {"chargeNo": "c1"}))
     rail = Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit", money)
     assert await _step(rail, pid) == "money_result_seen"
     row = await _row(pid)
     assert row["pending_write"] == "payment.method-add#submit" and row["last_error_code"] == "money_result_seen"
+    # parked FOR GOOD: later claims read nothing, reconcile nothing, resend nothing, clear nothing
+    for _ in range(3):
+        rail = Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit", ADD_PAGE)
+        assert await _step(rail, pid) == "money_result_parked"
+        assert rail.sent == []
+        row = await _row(pid)
+        assert (row["pending_write"], row["last_error_code"], row["state"]) == (
+            "payment.method-add#submit", "money_result_seen", "opened")
 
 
 async def test_an_answer_that_is_not_a_binding_page_fails_the_purchase_instead_of_looping():
@@ -268,8 +301,7 @@ async def test_bound_goes_out_on_a_spaced_schedule_not_on_every_poll():
     still = _task(("payment.method-add-await-card", {"status": "PENDING"}))
 
     async def poll(age_seconds):
-        await database.execute(
-            "UPDATE a2a_rail_purchases SET state_entered_at = datetime('now', :age)", {"age": f"-{age_seconds} seconds"})
+        await _ago("state_entered_at", age_seconds)
         rail = Rail().on("payment.method-view#submit", _methods(pending)).on(
             "payment.method-add-required-card#bound", still)
         outcome = await _step(rail, pid)
@@ -295,7 +327,7 @@ async def test_bound_goes_out_on_a_spaced_schedule_not_on_every_poll():
 async def test_an_unseen_bound_is_reconciled_by_a_read_and_keeps_its_count():
     pid = await _binding()
     pending = {**ACTIVE, "id": "pm_new", "status": "PENDING"}
-    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = datetime('now', '-90 seconds')")
+    await _ago("state_entered_at", 90)
     rail = Rail().on("payment.method-view#submit", _methods(pending)).on(
         "payment.method-add-required-card#bound", httpx.Response(504))
     assert await _step(rail, pid) == "outcome_unknown"
@@ -319,7 +351,7 @@ async def test_an_unseen_binding_write_is_given_up_after_its_reconcile_limit():
     pid = (await _open())["id"]
     await _step(Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit",
                                                                          httpx.Response(502)), pid)
-    await database.execute("UPDATE a2a_rail_purchases SET pending_write_at = datetime('now', '-2 hours')")
+    await _ago("pending_write_at", 7200)
     rail = Rail()
     assert await _step(rail, pid) == "failed"
     row = await _row(pid)
@@ -329,7 +361,7 @@ async def test_an_unseen_binding_write_is_given_up_after_its_reconcile_limit():
 
 async def test_a_purged_pre_pay_purchase_fails_instead_of_sitting_on_its_lease():
     pid = (await _open())["id"]
-    await database.execute("UPDATE a2a_rail_purchases SET created_at = datetime('now', '-4 days')")
+    await _ago("created_at", 4 * 86400)
     assert await ledger.purge_stale_contact(max_age_seconds=3 * 86400) == 1
     rail = Rail()
     assert await _step(rail, pid) == "failed"
@@ -363,7 +395,7 @@ async def test_a_tick_cut_mid_write_keeps_the_write_pending_and_the_lease_releas
             return await super().handler(request)
 
     rail = Hang().on("payment.method-view#submit", _methods())
-    await database.execute("UPDATE a2a_rail_purchases SET next_poll_at = datetime('now', '-1 seconds')")
+    await _ago("next_poll_at", 1)
     task = asyncio.ensure_future(worker.run_tick(_client(rail), W))
     await asyncio.wait_for(entered.wait(), timeout=5)
     task.cancel()
@@ -484,7 +516,7 @@ async def test_logs_carry_no_email_member_or_page(caplog):
 async def test_reconciling_an_unseen_bound_that_bound_nothing_keeps_the_schedule_count():
     pid = await _binding()
     pending = {**ACTIVE, "id": "pm_new", "status": "PENDING"}
-    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = datetime('now', '-90 seconds')")
+    await _ago("state_entered_at", 90)
     await _step(Rail().on("payment.method-view#submit", _methods(pending)).on(
         "payment.method-add-required-card#bound", httpx.Response(504)), pid)
     rail = Rail().on("payment.method-view#submit", _methods(pending))
@@ -501,7 +533,7 @@ async def test_other_releases_never_reset_the_bound_schedule():
     pid = await _binding()
     pending = {**ACTIVE, "id": "pm_new", "status": "PENDING"}
     still = _task(("payment.method-add-await-card", {"status": "PENDING"}))
-    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = datetime('now', '-90 seconds')")
+    await _ago("state_entered_at", 90)
     await _step(Rail().on("payment.method-view#submit", _methods(pending)).on(
         "payment.method-add-required-card#bound", still), pid)
     for interruption in (httpx.Response(503), _methods()):  # a failed read, then a listing without the card
@@ -512,3 +544,76 @@ async def test_other_releases_never_reset_the_bound_schedule():
             "payment.method-add-required-card#bound", still)
         await _step(rail, pid)
         assert rail.actions().count("payment.method-add-required-card#bound") == 0  # still before 180 s
+
+
+
+async def test_a_money_result_during_bound_parks_for_good_too():
+    pid = await _binding()
+    await _ago("state_entered_at", 90)
+    money = _task(("payment.charge-token-result", {"chargeNo": "c1"}))
+    rail = Rail().on("payment.method-view#submit", _methods({**ACTIVE, "id": "pm_new", "status": "PENDING"})).on(
+        "payment.method-add-required-card#bound", money)
+    assert await _step(rail, pid) == "money_result_seen"
+    for _ in range(2):
+        rail = Rail().on("payment.method-view#submit", _methods({**ACTIVE, "id": "pm_new"}))
+        assert await _step(rail, pid) == "money_result_parked" and rail.sent == []
+    assert (await _row(pid))["state"] == "needs_payment_method"
+
+
+async def test_the_other_binding_page_variant_is_accepted_and_only_read_after():
+    pid = (await _open())["id"]
+    other = _task(("payment.method-add-required", {"linkUrl": PAGE, "paymentMethodId": "pm_up", "status": "PENDING"}))
+    rail = Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit", other)
+    assert await _step(rail, pid) == "binding_page_issued"
+    row = await _row(pid)
+    assert (row["state"], row["payment_method_id"], row["buyer_action_url"]) == ("needs_payment_method", "pm_up", PAGE)
+    await ledger.release_claim(pid, W)
+    await _ago("state_entered_at", 2000)
+    rail = Rail().on("payment.method-view#submit", _methods({**ACTIVE, "id": "pm_up", "status": "PENDING"}))
+    assert await _step(rail, pid) == "waiting_on_buyer"
+    assert rail.actions() == ["payment.method-view#submit"]  # never a bound we do not know how to send
+    rail = Rail().on("payment.method-view#submit", _methods({**ACTIVE, "id": "pm_up"}))
+    assert await _step(rail, pid) == "method_ready"
+
+
+@pytest.mark.parametrize("answer,code", [
+    (httpx.Response(400), "binding_refused:http_error:400"),
+    (httpx.Response(422), "binding_refused:http_error:422"),
+    (_task(("error", {"code": "EMAIL_INVALID", "message": "x", "recoverable": False})), "binding_refused:error_card:200"),
+])
+async def test_a_definite_refusal_of_the_binding_fails_now_not_at_the_cap(answer, code):
+    pid = (await _open())["id"]
+    rail = Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit", answer)
+    assert await _step(rail, pid) == "failed"
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["pending_write"]) == ("failed", code, None)
+
+
+@pytest.mark.parametrize("answer", [httpx.Response(401), httpx.Response(403), httpx.Response(429),
+                                    _task(("error", {"code": "BUSY", "message": "x", "recoverable": True}))])
+async def test_our_own_auth_throttling_and_recoverable_errors_are_retried(answer):
+    pid = (await _open())["id"]
+    rail = Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit", answer)
+    assert await _step(rail, pid) == "rail_refused"
+    row = await _row(pid)
+    assert (row["state"], row["pending_write"]) == ("opened", None)
+
+
+async def test_card_reads_never_share_the_binding_conversation():
+    pid = await _binding()
+    contexts = {}
+
+    class Spy(Rail):
+        async def handler(self, request):
+            if request.url.path != a2a_rail.TOKEN_PATH:
+                body = json.loads(request.content)
+                data = body["params"]["message"]["parts"][0]["data"]
+                contexts.setdefault(f"{data['component']}#{data['action']}", set()).add(body["params"]["message"]["contextId"])
+            return await super().handler(request)
+
+    await _ago("state_entered_at", 90)
+    pending = {**ACTIVE, "id": "pm_new", "status": "PENDING"}
+    rail = Spy().on("payment.method-view#submit", _methods(pending)).on(
+        "payment.method-add-required-card#bound", _task(("payment.method-add-await-card", {"status": "PENDING"})))
+    await _step(rail, pid)
+    assert contexts["payment.method-view#submit"].isdisjoint(contexts["payment.method-add-required-card#bound"])
