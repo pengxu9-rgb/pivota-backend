@@ -105,7 +105,7 @@ async def test_fold_on_makes_one_product_whose_variants_are_the_shades(monkeypat
         "gel-colour-ruby-red", "gel-colour-coral-reef", "gel-colour-midnight"]
     summary = records.crawl_report["shade_fold"]
     assert (summary["bases"], summary["shades"], summary["stubs_replaced"], summary["superseded_count"]) == (1, 3, 1, 3)
-    assert summary["axes"] == {"shade": 3, "size": 0}
+    assert summary["axes"] == {"shade": 3, "size": 0, "named": 0}
     assert {s["handle"]: s["kind"] for s in records.fold_report["superseded"]} == {
         "gel-colour-ruby-red": "shade", "gel-colour-coral-reef": "shade", "gel-colour-midnight": "shade"}
 
@@ -154,7 +154,7 @@ async def test_size_siblings_fold_as_size_variants(monkeypatch):
     records = await _records(monkeypatch, products)
     assert _variants(records[0]) == [("30ml", "Size"), ("100ml", "Size")]
     assert [v["price"] for v in records[0]["pdp"]["variants"]] == [12.0, 32.0]
-    assert records.crawl_report["shade_fold"]["axes"] == {"shade": 0, "size": 2}
+    assert records.crawl_report["shade_fold"]["axes"] == {"shade": 0, "size": 2, "named": 0}
 
 
 async def test_a_size_sibling_priced_past_the_size_ratio_is_refused(monkeypatch):
@@ -226,8 +226,8 @@ async def test_an_unproven_code_suffix_is_refused_never_folded_as_a_shade(monkey
                                                     variants=copy)], extended=True)
     assert [p["handle"] for p in out] == ["glow-pair"] and report["superseded"][0]["proof"] == "variant_set"
     # ...or by a shared merchant SKU
-    out, report = feed.fold_shade_listings([product("Glow Pair", "glow-pair", sku="GP-1"),
-                                            product("Glow Pair - QWRTZ7", "gp-q", sku="gp-1")], extended=True)
+    out, report = feed.fold_shade_listings([product("Glow Pair", "glow-pair", sku="GP-1001"),
+                                            product("Glow Pair - QWRTZ7", "gp-q", sku="gp-1001")], extended=True)
     assert [p["handle"] for p in out] == ["glow-pair"] and report["superseded"][0]["proof"] == "sku"
 
 
@@ -489,3 +489,246 @@ async def test_an_unreadable_catalog_holds_the_fold(env, monkeypatch):  # noqa: 
     assert [f["rule"] for f in run["flags"] if f["severity"] == "block"] == ["fold_supersede_unread"]
     assert run["checks"]["shade_fold"]["supersede_preview"] == {"status": "unchecked", "reason": "ConnectionError",
                                                                 "superseded": 3}
+
+
+# ---- review of the first commit ------------------------------------------------------------------------------
+
+# 1. The offer re-point must not reach the LEGACY fold: the brand CLI (--fold-shades, any --source-role) and the
+#    curated onboard queue run it, and a re-pointed offer is a NEW offer_id beside the one already written.
+#    GOLDEN: these digests were produced by this exact fixture on origin/main 1c0e03ad7 (records, SKUs, and
+#    offers including offer_id and source_ref); fold off and the legacy fold must reproduce them byte for byte.
+GOLDEN_HOST = "goldenshop.example"
+GOLDEN_VENDOR = "Example Golden"
+GOLDEN_DIGESTS = {False: "f5269248dfe0aad57f57dcb1c4b2a243dc951216a9fe29f285aafca502f68c53",
+                  True: "75e042d4dd1029f2e3a5f644d6a16169ffec9dbdd68d0d1b88e5447e2b8e1fa5"}
+
+
+def _golden_product(pid, title, handle, price, barcode, variants=None, option_name="Title"):
+    variants = variants or [{"id": pid * 10, "title": "Default Title", "option1": "Default Title", "price": price,
+                             "available": True, "sku": handle.upper(), "barcode": barcode}]
+    return {"id": pid, "title": title, "handle": handle, "vendor": GOLDEN_VENDOR, "product_type": "Nail Polish",
+            "body_html": "<p>A long-wear gel colour with a high-shine finish for salon nails at home.</p>",
+            "images": [{"src": f"https://cdn.example/{handle}.jpg"}],
+            "options": [{"name": option_name, "position": 1, "values": [v["option1"] for v in variants]}],
+            "variants": variants}
+
+
+GOLDEN_PRODUCTS = [
+    _golden_product(101, "Gel Colour", "gel-colour", "15.00", "4006381333931"),
+    _golden_product(102, "Gel Colour - Ruby Red", "gel-colour-ruby-red", "15.00", "4006381333948"),
+    _golden_product(103, "Gel Colour - Coral Reef", "gel-colour-coral-reef", "15.00", "4006381333955"),
+    _golden_product(104, "Lip Oil", "lip-oil", "20.00", "", option_name="Colour", variants=[
+        {"id": 1041, "title": "Rose", "option1": "Rose", "price": "20.00", "available": True, "sku": "LO-ROSE",
+         "barcode": "4006381333962"},
+        {"id": 1042, "title": "Clear", "option1": "Clear", "price": "20.00", "available": False, "sku": "LO-CLEAR",
+         "barcode": "4006381333979"}]),
+]
+
+
+@pytest.mark.parametrize("fold", [False, True])
+async def test_retailer_records_are_byte_identical_to_main_unless_the_extended_fold_runs(monkeypatch, fold):
+    import json
+
+    async def fetch_products(domain, **kw):
+        return feed.ShopifyProductBatch(feed.filter_products_by_vendor(GOLDEN_PRODUCTS, kw.get("only_vendors")),
+                                        scanned_products=len(GOLDEN_PRODUCTS), pages=1)
+
+    async def locale(domain, **kw):
+        return {"currency": "USD"}
+    monkeypatch.setattr(feed, "fetch_shopify_products", fetch_products)
+    monkeypatch.setattr(feed, "fetch_shopify_shop_locale", locale)
+    recs = await _REAL_RECORDS_FOR_BRAND(domain=GOLDEN_HOST, category_path="beauty", source_role="retailer",
+                                         only_vendors=[GOLDEN_VENDOR], retailer_name=GOLDEN_HOST,
+                                         emit_real_variants=True, base_listings_only=fold, max_pdp_inci_fetches=0)
+    plan = ingestion.ingest_validated_jsonl(list(recs), market="US")
+    if fold:  # the legacy fold's folded offers stay on the base listing, as they always were
+        assert {o["source_ref"] for o in plan["offers"] if o["product_key"] == plan["pdps"][0]["product_key"]} == {
+            f"https://{GOLDEN_HOST}/products/gel-colour"}
+    keep = {"records": list(recs), "skus": plan["skus"], "offers": plan["offers"]}
+    assert hashlib.sha256(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest() == GOLDEN_DIGESTS[fold]
+
+
+def test_only_the_extended_fold_names_a_variants_own_listing():
+    rows = [product("Gel Colour", "g"), product("Gel Colour - Ruby", "g-ruby")]
+    legacy, _ = feed.fold_shade_listings([dict(p) for p in rows])
+    extended, _ = feed.fold_shade_listings([dict(p) for p in rows], extended=True)
+    as_record = [feed.shopify_product_to_record(out[0], domain=HOST, category_path="beauty", emit_variants=True,
+                                                currency="USD", source_role="retailer", retailer_name=HOST)
+                 for out in (legacy, extended)]
+    assert "own_listing_url" not in as_record[0]["pdp"]["variants"][0]
+    assert as_record[1]["pdp"]["variants"][0]["own_listing_url"] == f"https://{HOST}/products/g-ruby"
+
+
+@pytest.mark.parametrize("url,ok", [(f"https://{HOST}/products/g-ruby", True),
+                                    (f"https://www.{HOST}/products/g-ruby", True),
+                                    ("https://elsewhere.example/products/g-ruby", False),
+                                    (f"https://{HOST}/collections/g-ruby", False),
+                                    (f"https://{HOST}/products/", False), ("javascript:alert(1)", False)])
+def test_an_own_listing_url_must_be_a_product_page_on_the_same_store(url, ok):
+    assert (ingestion.own_listing_url(f"https://{HOST}/products/g", url) == url) is ok
+
+
+# 2. A suppression its own lane lifts again is not a retirement.
+@pytest.mark.parametrize("reason,suppressed_at,live", [
+    ("catalog_destination_dead_pending", "2026-10-11T00:00:00Z", True),
+    ("some_lane_pending", "2026-10-11T00:00:00Z", True),
+    ("stale_after_sync", "2026-10-11T00:00:00Z", True),
+    ("d2_title_merge", "2026-10-11T00:00:00Z", True),
+    (None, "2026-10-11T00:00:00Z", True),                     # suppressed with no reason: nothing says why
+    ("catalog_destination_dead", "2026-10-11T00:00:00Z", False),
+    ("brand_attribution_key_supersede", "2026-10-11T00:00:00Z", False),
+    ("brand_attribution_key_supersede", None, True),          # a reason without suppressed_at is not suppressed
+])
+async def test_a_reversible_suppression_counts_as_live(env, monkeypatch, reason, suppressed_at, live):  # noqa: F811
+    key = ingestion.retailer_product_key(HOST, f"https://{HOST}/products/gel-colour-midnight")
+    row = {"product_key": key, "canonical_url": "", "source_domain": HOST, "suppression_reason": reason,
+           "suppressed_at": suppressed_at}
+    await _lane(env, monkeypatch, LINE, catalog=Catalog([row]))
+    out = await pipeline.run_stage(fold_job(fold_shades=True), db=env.db)
+    assert out["status"] == ("held" if live else "apply_due")
+    assert _last_run(env)["checks"]["shade_fold"]["supersede_preview"]["live"] == (1 if live else 0)
+
+
+# 3. The guard is read again inside the catalog write lock.
+async def test_a_row_written_between_the_checks_and_the_write_holds_the_apply(env, monkeypatch):  # noqa: F811
+    key = ingestion.retailer_product_key(HOST, f"https://{HOST}/products/gel-colour-ruby-red")
+    lock_held = []
+
+    class Racing(Catalog):
+        reads = 0
+
+        async def fetch_all(self, query, values=None):
+            if query is pipeline.SUPERSEDED_ROWS_SQL:
+                Racing.reads += 1
+                holder = env.ledger.lock_server.holder
+                lock_held.append(holder is not None and not holder.closed)
+                if Racing.reads == 1:
+                    return []  # the checks: nothing there yet
+                return [{"product_key": key, "canonical_url": "", "source_domain": HOST,
+                         "suppression_reason": None, "suppressed_at": None}]  # another job wrote it meanwhile
+            return []
+    await _lane(env, monkeypatch, LINE, catalog=Racing())
+    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
+    assert (out["status"], out["outcome"]) == ("held", "fold_supersede_changed")
+    assert env.applied == [] and lock_held == [False, True]
+    run = _last_run(env)
+    assert run["checks"]["catalog_write"] == "not_started"
+    assert run["checks"]["shade_fold"]["supersede_recheck"]["live_rows"][0]["stale_key"] == key
+    assert env.ledger.lock_server.holder is None  # released on the way out
+
+
+async def test_an_unreadable_recheck_holds_the_apply(env, monkeypatch):  # noqa: F811
+    class Flaky(Catalog):
+        reads = 0
+
+        async def fetch_all(self, query, values=None):
+            if query is pipeline.SUPERSEDED_ROWS_SQL:
+                Flaky.reads += 1
+                if Flaky.reads > 1:
+                    raise TimeoutError("db://secret")
+            return []
+    await _lane(env, monkeypatch, LINE, catalog=Flaky())
+    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
+    assert (out["status"], out["outcome"]) == ("held", "fold_supersede_unread") and env.applied == []
+    assert _last_run(env)["checks"]["shade_fold"]["supersede_recheck"] == {"status": "unchecked",
+                                                                          "reason": "TimeoutError"}
+
+
+async def test_an_unchanged_recheck_applies(env, monkeypatch):  # noqa: F811
+    catalog = await _lane(env, monkeypatch, LINE)
+    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
+    assert out["status"] == "done"
+    assert catalog.queries.count(pipeline.SUPERSEDED_ROWS_SQL) == 2
+    assert _last_run(env)["checks"]["shade_fold"]["supersede_recheck"]["status"] == "clear"
+
+
+# 4. A copy is proven only by a real identity, at the same price.
+@pytest.mark.parametrize("base_kw,copy_kw", [
+    ({"sku": "N/A"}, {"sku": "n/a"}),                                        # a placeholder SKU
+    ({"sku": "NONE"}, {"sku": "none"}),                                      # ...long enough, still a placeholder
+    ({"sku": "A1"}, {"sku": "a1"}),                                          # too short to identify anything
+    ({"barcode": "0"}, {"barcode": "0"}),                                    # not a GTIN
+    ({"barcode": "0000000000000"}, {"barcode": "0000000000000"}),            # all zeros
+    ({"barcode": "4006381333932"}, {"barcode": "4006381333932"}),            # check digit wrong
+    ({"barcode": ean("set"), "price": "50.00"}, {"barcode": ean("set"), "price": "65.00"}),  # a real GTIN, other price
+    ({"sku": "SET-2025", "price": "50.00"}, {"sku": "set-2025", "price": "65.00"}),
+])
+def test_junk_or_mispriced_identity_does_not_prove_a_copy(base_kw, copy_kw):
+    base = product("Holiday Set", "hs", **{"price": "50.00", "barcode": "", "sku": "HS-BASE", **base_kw})
+    copy = product("Holiday Set - XMAS24", "hs-x", **{"price": "50.00", "barcode": "", "sku": "HS-COPY", **copy_kw})
+    out, report = feed.fold_shade_listings([base, copy], extended=True)
+    assert [p["handle"] for p in out] == ["hs", "hs-x"]
+    assert report["refused"][0]["reason"] == "code_suffix_unproven"
+
+
+# 5. Different products that share a title prefix.
+@pytest.mark.parametrize("suffix,reason", [
+    ("SPF 30", "formula_claim_suffix"), ("SPF50", "formula_claim_suffix"), ("PA+++", "formula_claim_suffix"),
+    ("Matte", "finish_or_formula_suffix"), ("Satin", "finish_or_formula_suffix"),
+    ("Oil Free", "finish_or_formula_suffix"), ("Waterproof", "finish_or_formula_suffix"),
+    ("Tinted", "finish_or_formula_suffix"),
+    ("30", "bare_number_suffix"), ("101", "bare_number_suffix"),
+    ("Travel", "non_shade_suffix"), ("Deluxe", "non_shade_suffix"),
+])
+def test_a_formula_finish_or_bare_number_is_not_a_shade(suffix, reason):
+    out, report = feed.fold_shade_listings([product("Sun Fluid", "b"), product(f"Sun Fluid - {suffix}", "c")],
+                                           extended=True)
+    assert len(out) == 2 and [r["reason"] for r in report["refused"]] == [reason]
+
+
+@pytest.mark.parametrize("suffix,axis_name,axis", [("Velvet Rose", "Shade", "Shade"), ("101", "Colour", "Colour"),
+                                                   ("30", "Size", "Size")])
+def test_the_shops_own_option_name_lets_a_finish_word_or_number_fold(suffix, axis_name, axis):
+    out, report = feed.fold_shade_listings([product("Lipstick", "b"),
+                                            product(f"Lipstick - {suffix}", "c", option1=suffix,
+                                                    option_name=axis_name)], extended=True)
+    assert len(out) == 1 and out[0]["variants"][0][feed.FOLD_AXIS_KEY] == axis
+
+
+def test_an_spf_claim_is_refused_even_with_a_shade_option():
+    out, report = feed.fold_shade_listings([product("Sun Fluid", "b"),
+                                            product("Sun Fluid - SPF 50", "c", option1="SPF 50", option_name="Shade")],
+                                           extended=True)
+    assert len(out) == 2 and report["refused"][0]["reason"] == "formula_claim_suffix"
+
+
+@pytest.mark.parametrize("base_type,child_type", [("Lip", ""), ("", "Lip"), ("", "")])
+def test_an_untyped_side_folds_only_with_the_shops_own_axis(base_type, child_type):
+    rows = [product("Lip Oil", "b", product_type=base_type),
+            product("Lip Oil - Cuticle Oil", "c", product_type=child_type)]
+    out, report = feed.fold_shade_listings(rows, extended=True)
+    assert len(out) == 2 and report["refused"][0]["reason"] == "product_type_unknown"
+    rows[1] = product("Lip Oil - Cherry", "c", product_type=child_type, option1="Cherry", option_name="Colour")
+    out, _ = feed.fold_shade_listings(rows, extended=True)
+    assert len(out) == 1
+
+
+# 6. Nits.
+def test_an_unsellable_stub_price_is_not_compared():
+    out, report = feed.fold_shade_listings([product("Gel", "g", price="0.50"), product("Gel - Ruby", "g-r")],
+                                           extended=True)
+    assert len(out) == 1 and report["refused"] == []
+
+
+def test_mixed_shade_and_size_axes_are_flagged():
+    rows = [product("Gel", "g"), product("Gel - Ruby", "g-r", option1="Ruby", option_name="Colour"),
+            product("Gel - 30ml", "g-30")]
+    out, report = feed.fold_shade_listings(rows, extended=True)
+    assert len(out) == 1
+    assert report["mixed_axes"] == [{"base_handle": "g", "axes": ["shade", "size"]}]
+    assert feed.fold_report_summary(report)["mixed_axes"] == report["mixed_axes"]
+    own = [variant("30ml", "20.00", "c"), variant("50ml", "28.00", "c")]
+    _, report = feed.fold_shade_listings([product("Cream", "c", option_name="Size", variants=own),
+                                          product("Cream - Rose", "c-rose", price="20.00")], extended=True)
+    assert report["mixed_axes"] == [{"base_handle": "c", "axes": ["shade", "size"]}]
+    _, report = feed.fold_shade_listings([product("Gel", "g"), product("Gel - Ruby", "g-r")], extended=True)
+    assert report["mixed_axes"] == []
+
+
+def test_an_axis_the_shop_names_otherwise_keeps_its_name():
+    rows = [product("Candle", "c", product_type="Candle"),
+            product("Candle - Fig", "c-f", option1="Fig", option_name="Scent", product_type="Candle")]
+    out, report = feed.fold_shade_listings(rows, extended=True)
+    rec = feed.shopify_product_to_record(out[0], domain=HOST, category_path="beauty", emit_variants=True)
+    assert _variants(rec) == [("Fig", "Scent")]
+    assert report["axes"] == {"shade": 0, "size": 0, "named": 1}

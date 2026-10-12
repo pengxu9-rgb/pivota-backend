@@ -2807,6 +2807,12 @@ def shopify_product_to_record(
                 ),
                 "source_handle": str(v.get(FOLDED_FROM_KEY) or "").strip() or None,
             })
+            # Only the EXTENDED fold (FOLD_AXIS_KEY) names the listing a folded variant is sold on; ingestion
+            # points that variant's offer there. The legacy fold's variants carry no such key, so every
+            # record and offer it produced before stays byte-identical.
+            own_handle = str(v.get(FOLDED_FROM_KEY) or "").strip()
+            if FOLD_AXIS_KEY in v and own_handle and "/" not in own_handle:
+                pdp_variants[-1]["own_listing_url"] = f"https://{host}/products/{own_handle}"
     raw_tags = product.get("tags")
     tags = (
         raw_tags
@@ -3101,13 +3107,35 @@ _DEFAULT_SIZE_OPTION_NAME = "Size"
 #: size sibling priced past this ratio is still a different item.
 _FOLD_SIZE_PRICE_RATIO = 4.0
 #: Suffixes that name a different product in the retailer feeds, on top of _NON_SHADE_SUFFIX_RE: nail
-#: accessories sold beside a colour line ("<Line> - Top Coat") and multi-item sets ("<Line> - Duo").
+#: accessories sold beside a colour line ("<Line> - Top Coat"), multi-item sets ("<Line> - Duo"), and the
+#: travel / deluxe / trial editions the legacy list only catches as "travel size" / "mini" / "sample".
 _EXTENDED_NON_SHADE_SUFFIX_RE = re.compile(
-    r"(?i)\b(remover|top coat|base coat|tester|brush|sharpener|case|pouch|holder|duo|trio|collection)\b"
+    r"(?i)\b(remover|top coat|base coat|tester|brush|sharpener|case|pouch|holder|duo|trio|collection|"
+    r"travel|deluxe|trial)\b"
 )
 #: A merchant's listing code, not a name: one upper-case token of letters AND digits, at least 3 letters
 #: ("AB12CD"). Shade codes that are mostly digits ("N12", "GC014", "M0N904") do not match.
 _CODE_SUFFIX_RE = re.compile(r"(?=(?:[^A-Z]*[A-Z]){3})(?=[^0-9]*[0-9])[A-Z0-9]{5,12}")
+#: A formula claim names a different product, never a shade: "<Sun Fluid> - SPF 30" beside "- SPF 50".
+#: Refused whatever the option names say.
+_FORMULA_CLAIM_SUFFIX_RE = re.compile(r"(?i)\bSPF\s*\d+|\bPA\s*\+|\bUV[AB]?\b")
+#: Finish and formula words: "<Lipstick> - Matte" / "- Satin", "<Foundation> - Oil Free" / "- Waterproof" /
+#: "- Tinted" are different formulas, not shades of one. Refused unless the child's own Shopify option
+#: names a shade or size axis ("Shade: Velvet Rose" is a shade that happens to contain "velvet").
+_FINISH_OR_FORMULA_SUFFIX_RE = re.compile(
+    r"(?i)\b(matte|satin|gloss|glossy|shimmer|metallic|sheer|velvet|cream|creme|crème|dewy|radiant|luminous|"
+    r"glitter|frost(ed)?|pearl(escent)?|oil[- ]?free|waterproof|water[- ]?resistant|tinted|fragrance[- ]?free|"
+    r"unscented|scented|hydrating|mattifying|long[- ]?wear(ing)?|vegan|original|classic|intense|light|rich|"
+    r"sensitive|extra)\b"
+)
+#: A bare number ("<Serum> - 30" / "- 50") is a size without a unit, a shade code, or a strength: the fold
+#: cannot tell which, so it folds only when the child's own option names the axis.
+_BARE_NUMBER_SUFFIX_RE = re.compile(r"\d+(?:[.,]\d+)?")
+#: SKU strings that identify nothing ("N/A", "none", "-"), and too short to: a copy is never proven by one.
+_PLACEHOLDER_SKUS = {"n/a", "na", "none", "null", "nil", "tbd", "tba", "default", "sku", "-", "0"}
+_MIN_PROOF_SKU_ALNUM = 4
+#: A proven copy of a listing is sold at the listing's price.
+_COPY_PRICE_RATIO = 1.02
 
 
 def _norm_label(value: Any) -> str:
@@ -3132,18 +3160,30 @@ def _axis_family(name: str) -> Optional[str]:
     return None
 
 
+def _proof_sku(value: Any) -> Optional[str]:
+    """A merchant SKU that can identify a product, casefolded, or None for a placeholder or a stub."""
+    sku = str(value or "").strip().casefold()
+    if sku in _PLACEHOLDER_SKUS or sum(c.isalnum() for c in sku) < _MIN_PROOF_SKU_ALNUM:
+        return None
+    return sku
+
+
 def _same_product_proof(base: Dict[str, Any], copy: Dict[str, Any]) -> Optional[str]:
     """Why `copy` is the SAME product as `base` (a re-listing under a code suffix), or None.
 
-    Identity only, never a resemblance: a shared barcode, a shared merchant SKU, or two or more variants
-    with the identical label -> price set. A shared description, image or price alone also describes
-    every shade of a colour line, so it proves nothing."""
+    Identity only, never a resemblance: a shared VALID GTIN (check digit right, not all zeros), a shared
+    merchant SKU that is not a placeholder ("N/A") or a stub, or two or more variants with the identical
+    label -> price set -- and in every case the two are sold at the same price (_COPY_PRICE_RATIO). A shared
+    description, image or price alone also describes every shade of a colour line, so it proves nothing."""
     bv = [v for v in (base.get("variants") or []) if isinstance(v, dict)]
     cv = [v for v in (copy.get("variants") or []) if isinstance(v, dict)]
-    if {str(v.get("barcode") or "").strip() for v in bv} & {str(v.get("barcode") or "").strip() for v in cv} - {""}:
+    bp, cp = _first_price(base), _first_price(copy)
+    if not bp or not cp or max(bp, cp) / min(bp, cp) > _COPY_PRICE_RATIO:
+        return None
+    gtins = [{validated_source_gtin(str(v.get("barcode") or "").strip()) for v in vs} - {None} for vs in (bv, cv)]
+    if gtins[0] & gtins[1]:
         return "barcode"
-    if ({str(v.get("sku") or "").strip().casefold() for v in bv}
-            & {str(v.get("sku") or "").strip().casefold() for v in cv} - {""}):
+    if ({_proof_sku(v.get("sku")) for v in bv} & {_proof_sku(v.get("sku")) for v in cv}) - {None}:
         return "sku"
 
     def label_prices(vs: List[Dict[str, Any]]) -> Optional[Dict[str, Optional[float]]]:
@@ -3166,30 +3206,48 @@ def _is_extended_stub(product: Dict[str, Any]) -> bool:
     return price is None or price < MIN_SELLABLE_PRICE
 
 
-def _child_axis(child: Dict[str, Any], suffix: str) -> Tuple[Optional[str], str]:
-    """(the shop's own axis name for this single-variant child, or None; its family: "size" or "shade").
+def _child_axis(child: Dict[str, Any], suffix: str) -> Tuple[Optional[str], str, bool]:
+    """(the shop's own axis name for this single-variant child, or None; its family; evidence).
 
-    The child's OWN `options[0].name` is used where it names a value the child really carries (option1 not
-    a placeholder) and the name is one the renderer reads ("Colour", "Shade", "Size", ...). Otherwise the
-    value decides: a quantity is a size, anything else a shade (the legacy fold's assumption)."""
+    The family is "shade", "size", or "named:<name>" for an axis the shop named that is neither ("Scent":
+    folded under the shop's own word, never relabelled a colour). `evidence` is True when the child's OWN
+    `options[0].name` names a shade or size axis for a value it really carries (option1 not a placeholder):
+    the merchant said what the variant is, which is what lets a finish word, a bare number or an untyped
+    product fold. Without a name the value decides: a quantity is a size, anything else a shade (the legacy
+    fold's assumption), with no evidence."""
     variant = ((child.get("variants") or [{}])[0]) or {}
     value = _variant_label(variant) or suffix
-    name = _base_option_name(child)
-    family = _axis_family(name) if _variant_label(variant) else None
+    name = _base_option_name(child) if _variant_label(variant) else ""
+    family = _axis_family(name)
     if family:
-        return name, family
-    return None, ("size" if _looks_like_a_size(value) else "shade")
+        return name, family, True
+    if name:
+        return name, f"named:{name.casefold()}", False
+    return None, ("size" if _looks_like_a_size(value) else "shade"), False
 
 
-def _fold_refused_extended(base: Dict[str, Any], child: Dict[str, Any], suffix: str, family: str) -> Optional[str]:
+def _fold_refused_extended(base: Dict[str, Any], child: Dict[str, Any], suffix: str, family: str,
+                           evidence: bool) -> Optional[str]:
     if _NON_SHADE_SUFFIX_RE.search(suffix or "") or _EXTENDED_NON_SHADE_SUFFIX_RE.search(suffix or ""):
         return "non_shade_suffix"
+    if not evidence and _FINISH_OR_FORMULA_SUFFIX_RE.search(suffix or ""):
+        return "finish_or_formula_suffix"
+    if not evidence and _BARE_NUMBER_SUFFIX_RE.fullmatch((suffix or "").strip()):
+        return "bare_number_suffix"
     bt, ct = (" ".join(str(p.get("product_type") or "").casefold().split()) for p in (base, child))
     if bt and ct and bt != ct:
         # A shade of a product is filed where the product is: "<Line> - Cuticle Oil" typed "Nail Care"
         # beside a "Nail Polish" line is another product sharing a title prefix.
         return "product_type_mismatch"
+    if not (bt and ct) and not evidence:
+        # An untyped side gives the type check nothing to compare: "<Lip Oil> - Cuticle Oil" would fold.
+        return "product_type_unknown"
     bp, cp = _first_price(base), _first_price(child)
+    if bp is not None and bp < MIN_SELLABLE_PRICE:
+        # A parent priced under the sellable floor (a 0.50 "choose a shade" stub) names no price for the line:
+        # comparing against it would refuse every child. A placeholder-labelled parent that IS priced keeps
+        # the check -- its price is the line's.
+        bp = None
     ratio = _FOLD_SIZE_PRICE_RATIO if family == "size" else _FOLD_PRICE_RATIO
     if bp and cp and (max(bp, cp) / min(bp, cp)) > ratio:
         return "price_mismatch"
@@ -3248,6 +3306,9 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
             if base is None or base is p:
                 continue
             suffix = title[len(base_title):].lstrip(" -").strip()
+            if _FORMULA_CLAIM_SUFFIX_RE.search(suffix):
+                refuse(p, "formula_claim_suffix")  # before the code test: "SPF50" is code-shaped
+                break
             if _CODE_SUFFIX_RE.fullmatch(suffix):
                 proof = _same_product_proof(base, p)
                 if proof:
@@ -3257,8 +3318,8 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
                 break
             if multi:
                 break  # a suffixed multi-variant listing is a distinct line, as in the legacy fold
-            name, family = _child_axis(p, suffix)
-            refused = _fold_refused_extended(base, p, suffix, family)
+            name, family, evidence = _child_axis(p, suffix)
+            refused = _fold_refused_extended(base, p, suffix, family, evidence)
             if refused:
                 refuse(p, refused)
             else:
@@ -3276,8 +3337,9 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
             children.setdefault(id(target[id(p)][0]), []).append(p)
 
     report: Dict[str, Any] = {"bases": 0, "shades": 0, "stubs_replaced": 0, "images_adopted": 0,
-                              "folded": {}, "refused": refusals, "axes": {"shade": 0, "size": 0},
-                              "duplicates_absorbed": {}, "copies_deduped": {}, "superseded": []}
+                              "folded": {}, "refused": refusals, "axes": {"shade": 0, "size": 0, "named": 0},
+                              "duplicates_absorbed": {}, "copies_deduped": {}, "superseded": [],
+                              "mixed_axes": []}
     out: List[Dict[str, Any]] = []
     for p in products:
         if not isinstance(p, dict):
@@ -3339,11 +3401,18 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
                 _DEFAULT_SIZE_OPTION_NAME if family == "size" else _DEFAULT_SHADE_OPTION_NAME)
             added.append(sv)
             folded_handles.append(handle_of(k))
-            report["axes"][family] += 1
-            report["superseded"].append({**superseded, "kind": family})
+            kind_of = "named" if family.startswith("named:") else family
+            report["axes"][kind_of] += 1
+            report["superseded"].append({**superseded, "kind": kind_of})
         if not added:
             out.append(p)  # only copies or repeats: the base is unchanged, and is not a folded row
             continue
+        # Two axes on one product: the seed writer then drops every label and serves the bare list
+        # (ingestion._drop_options_that_do_not_distinguish). Folded anyway, and named for the reviewer.
+        families = {_axis_family(base_axis)} - {None} if own else set()
+        families |= {target[id(k)][4] for k in kids if handle_of(k) in folded_handles}
+        if len(families) > 1:
+            report["mixed_axes"].append({"base_handle": base_handle, "axes": sorted(families)})
         base = dict(p)
         if stub and (p.get("variants") or []):
             report["stubs_replaced"] += 1
@@ -3389,6 +3458,7 @@ def fold_report_summary(report: Optional[Dict[str, Any]], *, cap: int = 200) -> 
     out["superseded_count"] = len(report.get("superseded") or [])
     out["refused_count"] = len(report.get("refused") or [])
     out["refused_by_reason"] = dict(collections.Counter(r.get("reason") for r in report.get("refused") or []))
+    out["mixed_axes"] = list(report.get("mixed_axes") or [])[:cap]
     for key in ("superseded", "refused", "baseless_groups"):
         items = list(report.get(key) or [])
         out[key] = items[:cap]

@@ -376,21 +376,26 @@ def retailer_product_key(source_domain: Optional[str], canonical_url: Optional[s
     return "ext:retailer:" + hashlib.sha256(listing.encode("utf-8")).hexdigest()[:32]
 
 
-def folded_variant_listing_url(listing_url: Optional[str], source_handle: Optional[str]) -> Optional[str]:
-    """The storefront page a FOLDED variant is sold on: its own listing (/products/<source_handle>) on the
-    base listing's host, or None when either is missing or the base URL is not a /products/ page.
+def own_listing_url(listing_url: Optional[str], candidate: Optional[str]) -> Optional[str]:
+    """`candidate` -- the listing an EXTENDED-fold variant is sold on (curated_brand_feed stamps it as
+    `own_listing_url` on the pdp variant) -- when it is a /products/ page on the same storefront host as the
+    record's own listing, else None.
 
     A folded shade is a variant taken from ANOTHER Shopify product (curated_brand_feed.fold_shade_listings),
     so its variant id is in that product's /products/<handle>.js, not the base's: an offer pointing at the
     base page sends a buyer to a page that does not sell that variant, and a shopify_markets capture (which
-    reads the .js of the handle in each offer's own URL) skips it as variant_not_in_product_js."""
+    reads the .js of the handle in each offer's own URL) skips it as variant_not_in_product_js. Only the
+    extended fold stamps the key: the legacy fold's offers (brand CLI, curated onboard queue) were written at
+    the base URL, and re-pointing them would re-key each offer (offer_id hashes the URL) beside the old one."""
     from urllib.parse import urlsplit
 
-    handle = str(source_handle or "").strip().strip("/")
-    parsed = urlsplit(str(listing_url or ""))
-    if not handle or "/" in handle or not parsed.netloc or "/products/" not in parsed.path:
+    own, base = urlsplit(str(candidate or "")), urlsplit(str(listing_url or ""))
+    host = (own.hostname or "").lower().removeprefix("www.")
+    if (not candidate or own.scheme not in {"http", "https"} or not host
+            or host != (base.hostname or "").lower().removeprefix("www.")
+            or not own.path.startswith("/products/") or not own.path[len("/products/"):].strip("/")):
         return None
-    return f"{parsed.scheme or 'https'}://{parsed.netloc}/products/{handle}"
+    return str(candidate)
 
 
 def listing_handle(canonical_url: Optional[str]) -> Optional[str]:
@@ -1712,15 +1717,11 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
                 # every recovered product whose variant carried no price of its own.
                 continue
             sold_at = primary
-            if pdp_payload.get("source_role") == "retailer":
-                # A FOLDED retailer variant is sold on its own listing page, not the base's
-                # (folded_variant_listing_url). Retailer rows only: the brand lane's folded offers were
-                # written at the base URL, and re-pointing them would re-key every offer (offer_id hashes
-                # the URL) and leave the old ones live beside the new.
-                own = folded_variant_listing_url(primary.get("canonical_url") or primary.get("destination_url"),
-                                                 v.get("source_handle"))
-                if own:
-                    sold_at = dict(primary, canonical_url=own, destination_url=own)
+            # A variant the EXTENDED fold took from another listing is sold on that listing (own_listing_url).
+            own = own_listing_url(primary.get("canonical_url") or primary.get("destination_url"),
+                                  v.get("own_listing_url"))
+            if own:
+                sold_at = dict(primary, canonical_url=own, destination_url=own)
             variant_offer_rows.extend(_build_offer_inserts(
                 product_key=pdp_row["product_key"],
                 sku_key=vsku["sku_key"],

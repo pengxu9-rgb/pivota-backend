@@ -43,6 +43,9 @@ ALTER TABLE catalog_products ADD COLUMN IF NOT EXISTS image_url text;
 ALTER TABLE catalog_products ADD COLUMN IF NOT EXISTS pdp_scope varchar(64);
 ALTER TABLE catalog_products ADD COLUMN IF NOT EXISTS pdp_lifecycle_stage varchar(32);
 ALTER TABLE catalog_products ADD COLUMN IF NOT EXISTS suppressed_at timestamptz;
+ALTER TABLE catalog_products ADD COLUMN IF NOT EXISTS suppression_reason text;
+ALTER TABLE catalog_products ADD COLUMN IF NOT EXISTS canonical_url text;
+ALTER TABLE catalog_products ADD COLUMN IF NOT EXISTS source_domain text;
 ALTER TABLE catalog_skus ADD COLUMN IF NOT EXISTS suppressed_at timestamptz;
 ALTER TABLE catalog_skus ADD COLUMN IF NOT EXISTS suppression_reason text;
 ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS offer_type varchar(16);
@@ -309,3 +312,27 @@ async def test_a_us_and_an_sg_sibling_of_one_base_offer_coexist_and_read_back(db
     await _ips(db, ck, blocker="none", serving=True)
     assert (await markets.readback(sg["written"], db=db, market="SG"))["ok"]
     assert not (await markets.readback(sg["written"], db=db))["ok"]  # an SGD/SG row is not a US sibling
+
+
+async def test_the_shade_fold_supersede_read_runs_on_postgres_and_classifies_real_rows(db, monkeypatch):
+    """options.fold_shades (services/retailer_ingest/pipeline.py): SUPERSEDED_ROWS_SQL through the preflight's
+    SELECT-only handle, on the real schema, and the live / retired split over what it returns. A pending
+    suppression (the liveness lane lifts it) and a suppression with no reason stay LIVE; a final one does not."""
+    import scripts.onboard_curated_brands as cli
+    from services.retailer_ingest import pipeline
+
+    keys = {name: RETAILER_PREFIX + "fold-" + name for name in ("live", "pending", "bare", "final")}
+    for key in keys.values():
+        await _product(db, key, content_key=PREFIX + "ck-fold")
+    for name, reason in (("pending", "catalog_destination_dead_pending"), ("bare", None),
+                         ("final", "catalog_destination_dead")):
+        await db.execute("UPDATE catalog_products SET suppressed_at = NOW(), suppression_reason = :r,"
+                         " source_domain = :h WHERE product_key = :k", {"r": reason, "h": HOST, "k": keys[name]})
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (db, None))
+    absent = RETAILER_PREFIX + "fold-absent"
+    rows, unread = await pipeline._superseded_rows([*keys.values(), absent])
+    assert unread is None and set(rows) == set(keys.values())
+    entries = [{"stale_key": k, "handle": n, "base_handle": "base"} for n, k in [*keys.items(), ("absent", absent)]]
+    live, retired, never = pipeline._classify_superseded(entries, rows)
+    assert sorted(e["handle"] for e in live) == ["bare", "live", "pending"]
+    assert (retired, never) == (1, 1)

@@ -921,8 +921,10 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
                         f"no product resolves under {o.get('only_category') or 'a resolved category'}",
                         checks=checks)
     checks["kept"] = len(records)
+    carry: Dict[str, Any] = {}
     if o.get("fold_shades"):
-        flags.extend(await _shade_fold_checks(job, getattr(records_in, "fold_report", None), records, checks))
+        flags.extend(await _shade_fold_checks(job, getattr(records_in, "fold_report", None), records, checks,
+                                              carry))
 
     # Every offer is DECLARED for the job's market (catalog_offers.market) and must be priced in its
     # currency; the seed rows keep the US serving partition (ingestion.SEED_PARTITION_MARKET).
@@ -980,7 +982,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     checks["flags"] = {"block": len([f for f in flags if f["severity"] == detectors.BLOCK]),
                        "info": len([f for f in flags if f["severity"] == detectors.INFO]),
                        "blocking_after_approval": len(blocking)}
-    return {"plan": plan, "inspection": inspection, "checks": checks, "flags": flags, "blocking": blocking}
+    return {"plan": plan, "inspection": inspection, "checks": checks, "flags": flags, "blocking": blocking,
+            "fold_supersede_entries": carry.get("fold_supersede_entries") or []}
 
 
 #: The rows a fold would supersede, as they stand: a listing whose key holds a LIVE row (suppressed_at and
@@ -1015,8 +1018,42 @@ async def _superseded_rows(keys: List[str]) -> tuple:
             await database.disconnect()
 
 
+def _superseded_row_retired(row: Dict[str, Any]) -> bool:
+    """A superseded listing's old row is out of the way only when it is suppressed for good: suppressed_at
+    AND a reason, and not a reason its own lane lifts again -- a `*_pending` suppression (the destination
+    liveness lane's catalog_destination_dead_pending is lifted when the page answers again), a
+    `stale_after_sync` / `d2_*` one (apply.SELF_REVIVING_SUPPRESSION_*). Those rows come back live beside the
+    folded base, so they count as LIVE here."""
+    from services.catalog_destination_liveness import PENDING_SUPPRESSION_REASON
+    from services.catalog_enrichment_agent.apply import (SELF_REVIVING_SUPPRESSION_PREFIXES,
+                                                         SELF_REVIVING_SUPPRESSION_REASONS)
+
+    reason = str(row.get("suppression_reason") or "").strip()
+    if row.get("suppressed_at") is None or not reason:
+        return False
+    return not (reason == PENDING_SUPPRESSION_REASON or reason.endswith("_pending")
+                or reason in SELF_REVIVING_SUPPRESSION_REASONS
+                or reason.startswith(SELF_REVIVING_SUPPRESSION_PREFIXES))
+
+
+def _classify_superseded(entries: List[Dict[str, Any]], rows: Dict[str, Dict[str, Any]]) -> tuple:
+    """(live entries, retired count, never-ingested count) of the superseded listings, by their old rows."""
+    live, retired, absent = [], 0, 0
+    for e in entries:
+        row = rows.get(e["stale_key"])
+        if row is None:
+            absent += 1
+        elif _superseded_row_retired(row):
+            retired += 1
+        else:
+            live.append({**e, "source_domain": row.get("source_domain"),
+                         "suppression_reason": row.get("suppression_reason")})
+    return live, retired, absent
+
+
 async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str, Any]],
-                             records: List[Dict[str, Any]], checks: Dict[str, Any]) -> List[Dict[str, Any]]:
+                             records: List[Dict[str, Any]], checks: Dict[str, Any],
+                             carry: Dict[str, Any]) -> List[Dict[str, Any]]:
     """options.fold_shades: what the fold did (checks.shade_fold), and the rows it would leave live.
 
     IDENTITY. A retailer row is keyed by its listing URL (ingestion.retailer_product_key), so the folded base
@@ -1027,7 +1064,12 @@ async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str
     not acceptable (fold_supersedes_live_rows); the preview names every row the retire would have to take
     (stale key -> the base key that carries it now). A listing whose old row is already suppressed, or that
     was never ingested, does not block. Unread (no catalog, or the read failed) holds too: a fold that
-    cannot prove it duplicates nothing is not applied."""
+    cannot prove it duplicates nothing is not applied. A suppression its own lane may lift (`*_pending`,
+    self-reviving) counts as live (_superseded_row_retired).
+
+    `carry["fold_supersede_entries"]`: every superseded listing with its old key, for the apply to read again
+    INSIDE the catalog write lock (_recheck_superseded_rows): this read runs unlocked, so another job's write
+    on the host can land between the two."""
     import scripts.onboard_curated_brands as cli
     from services.catalog_enrichment_agent.ingestion import retailer_product_key
     from services.curated_brand_feed import _clean_domain, fold_report_summary
@@ -1065,15 +1107,8 @@ async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str
                  "acceptable": False,
                  "detail": f"could not read the {len(entries)} listing(s) the fold supersedes ({unread}): a fold "
                            f"that cannot prove it leaves no live duplicate is not applied"}]
-    live, suppressed, absent = [], 0, 0
-    for e in entries:
-        row = rows.get(e["stale_key"])
-        if row is None:
-            absent += 1
-        elif row.get("suppressed_at") is None and not row.get("suppression_reason"):
-            live.append({**e, "source_domain": row.get("source_domain")})
-        else:
-            suppressed += 1
+    carry["fold_supersede_entries"] = entries
+    live, suppressed, absent = _classify_superseded(entries, rows)
     summary["supersede_preview"] = {
         "status": "live_rows" if live else "clear", "superseded": len(entries), "live": len(live),
         "already_suppressed": suppressed, "never_ingested": absent,
@@ -1087,6 +1122,31 @@ async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str
                        f"{len(bases)} base(s), e.g. {bases[:3]}); the fold would leave each live beside the base "
                        f"that now carries it. Retiring them is not built yet (see checks.shade_fold."
                        f"supersede_preview for every row): run this cohort without fold_shades"}]
+
+
+async def _recheck_superseded_rows(job: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """options.fold_shades, INSIDE the catalog write lock and before the write marker: read the superseded
+    listings' old rows again. The check stage read them unlocked, so a job without the fold that wrote one of
+    those listings on this host in between would otherwise be duplicated by this apply. Changed (any row now
+    live) or unreadable: hold, nothing written."""
+    entries = result.get("fold_supersede_entries") or []
+    if not entries:
+        return
+    rows, unread = await _superseded_rows(sorted({e["stale_key"] for e in entries}))
+    fold = result["checks"].setdefault("shade_fold", {})
+    if rows is None:
+        fold["supersede_recheck"] = {"status": "unchecked", "reason": unread}
+        raise _Stop("fold_supersede_unread", "held",
+                    f"options.fold_shades: could not re-read the {len(entries)} superseded listing(s) under the "
+                    f"catalog write lock ({unread}); nothing written", checks=result["checks"])
+    live, _, _ = _classify_superseded(entries, rows)
+    fold["supersede_recheck"] = {"status": "live_rows" if live else "clear", "live": len(live),
+                                 "live_rows": live[:SHADE_FOLD_PREVIEW_CAP]}
+    if live:
+        raise _Stop("fold_supersede_changed", "held",
+                    f"options.fold_shades: {len(live)} superseded listing(s) got a live row on {job['domain']} "
+                    f"after the checks ran (another job wrote them); nothing written -- see "
+                    f"checks.shade_fold.supersede_recheck", checks=result["checks"])
 
 
 #: The lifecycle stages backend global recall admits (services/pivot_query_service.py: `IN (...) OR
@@ -1421,6 +1481,7 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
         # checks above ran unlocked. The lock is released when this block exits, however it exits.
         async with ledger.catalog_write_lock(wait_s=wait_s, poll_s=WRITE_LOCK_POLL_S) as waited:
             timings["write_lock_wait_s"] = round(waited, 3)
+            await _recheck_superseded_rows(job, result)  # options.fold_shades only; holds, never writes
             # Durable BEFORE the first catalog write: an execution killed from here on is "may be
             # partial"; one killed before it (crawl, checks, lock wait) is retried, nothing written.
             await ledger.mark_write_started(run_id, db=db)
