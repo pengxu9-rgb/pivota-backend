@@ -262,13 +262,25 @@ def _optional(pattern: "re.Pattern[str]", value: Any, name: str) -> Optional[str
     return None if value is None else _require(pattern, value, name)
 
 
+#: Order references are legitimately all digits (a merchant's order number, the rail's order id), and
+#: about 1 in 10 such 14-19 digit numbers pass the Luhn check: the same exemption the transport makes
+#: (a2a_rail._REFERENCE_KEYS + _PURE_DIGITS_RE). Refusing them would strand a paid purchase in `paying`.
+_ORDER_REF_FIELDS = frozenset({"order_id", "merchant_order_id"})
+_PURE_DIGITS_RE = re.compile(r"^\d{1,128}\Z")
+
+
 def _rail_ref(value: Any, name: str) -> Optional[str]:
     """A rail id (method, token, quote, order). Never a card number: a PAN or DPAN shaped value is
-    refused before it can be stored (the transport strips them; this is the second line)."""
+    refused before it can be stored (the transport strips them; this is the second line). An order
+    reference may be all digits; a card number embedded in other text, or spaced, is still refused."""
     from services.payment_orchestration.a2a_rail import _has_card_number
 
     ref = _optional(_RAIL_REF_RE, value, name)
-    if ref is not None and _has_card_number(ref):
+    if ref is None:
+        return None
+    if name in _ORDER_REF_FIELDS and _PURE_DIGITS_RE.match(ref):
+        return ref
+    if _has_card_number(ref):
         raise ValueError(f"{name} looks like a card number")
     return ref
 

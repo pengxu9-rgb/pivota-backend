@@ -12,8 +12,9 @@
 -- THE PARENT'S CHECK. agent_purchases.ck_agent_purchases_rail is dropped and re-added with 'a2a'
 -- (named in 264 for exactly this). It locks agent_purchases briefly (ACCESS EXCLUSIVE, a validating
 -- scan of a small table); the lock_timeout below bounds the wait instead of queueing writers behind
--- it. The boot heal (db/agent_purchase_ledger.ensure_agent_purchase_schema) does the same inside
--- schema_guard.guarded_ddl, only while the constraint differs, under the same bound.
+-- it. The boot heal (db/agent_purchase_ledger.ensure_agent_purchase_schema) does it on a live table in
+-- two guarded steps instead: DROP + ADD ... NOT VALID (no scan), then VALIDATE CONSTRAINT (SHARE UPDATE
+-- EXCLUSIVE), each only while still needed and under the heal lock_timeout.
 --
 -- schema-guard-exempt: this migration adds no column to an existing table.
 

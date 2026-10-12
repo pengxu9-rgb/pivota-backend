@@ -235,16 +235,32 @@ async def test_a_terminal_write_leaves_no_pii_page_claim_or_pending_write():
     assert done["consent_version"] == "v1"  # what the purchase was opened under stays
 
 
-@pytest.mark.parametrize("field", ["payment_token_id", "quote_id", "order_id", "merchant_order_id"])
+@pytest.mark.parametrize("field", ["payment_method_id", "payment_token_id", "quote_id", "order_id", "merchant_order_id"])
 async def test_a_card_number_is_never_stored_as_a_rail_id(field):
     row = await _open()
     await _claimed(row)
-    for value in ("5204731620064587", "5204 7316 2006 4587", "tok_5204731620064587"):
+    shapes = ["5204 7316 2006 4587", "tok_5204731620064587", "5204-7316-2006-4587"]
+    if field not in ("order_id", "merchant_order_id"):
+        shapes.append("5204731620064587")
+    for value in shapes:
         with pytest.raises(ValueError):
             await ledger.transition_as_holder(row["id"], "w1", from_states=["opened"], to_state="quoting",
                                               **{field: value})
     with pytest.raises(ValueError):
         await ledger.forget_voided_token(row["id"], "w1", "5204731620064587")
+
+
+@pytest.mark.parametrize("field", ["order_id", "merchant_order_id"])
+async def test_an_all_digit_order_number_is_stored_even_when_it_passes_luhn(field):
+    """Merchant order numbers are often all digits, and 1 in 10 pass Luhn (measured: sequential
+    15-digit ids). Refusing one at completion would strand a paid purchase in `paying`."""
+    row = await _open()
+    await _claimed(row)
+    for value in ("260101000000001", "5204731620064587"):
+        assert ledger._rail_ref(value, field) == value
+    moved = await ledger.transition_as_holder(row["id"], "w1", from_states=["opened"], to_state="quoting",
+                                              order_id="260101000000001")
+    assert moved["order_id"] == "260101000000001"
 
 
 # ── write-ahead ──────────────────────────────────────────────────────────────────────────────

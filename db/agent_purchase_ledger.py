@@ -110,7 +110,10 @@ CREATE INDEX IF NOT EXISTS idx_agent_purchases_owner
 #:      scan, and the wide CHECK binds every new row from that moment;
 #:   2. VALIDATE CONSTRAINT: the scan of existing rows, under SHARE UPDATE EXCLUSIVE, which blocks
 #:      neither reads nor writes.
-#: Once the constraint is wide and validated, neither step's guard is true: the heal takes no lock.
+#: Once the constraint is wide and validated, neither step's guard is true and neither ALTER runs.
+#: (Step 1's guard calls pg_get_constraintdef, which takes ACCESS SHARE on the table: it waits only
+#: behind an ACCESS EXCLUSIVE holder, and guarded_ddl sets its lock_timeout inside the IF, after the
+#: guard, so that wait is bounded by the startup DDL deadline rather than by the heal's 500 ms.)
 #: On SQLite, which cannot alter a CHECK, by rebuilding the table (local and test databases only).
 _RAIL_CHECK_PG_DEF = (
     "CHECK (((rail)::text = ANY ((ARRAY['reap'::character varying, 'a2a'::character varying])::text[])))"
