@@ -6,19 +6,22 @@ stores that show US buyers USD prices, but only when the store's cart confirms U
 brand stores first." This is `scripts/capture_us_market_offers.py`'s mechanics (lines 19-24, 447-462)
 as a retailer_ingest source, scoped to ONE (storefront, brand) job instead of the no_us_offer cohort.
 
-THE EVIDENCE STANDARD, in order, per job (ADR section 3.3):
-  1. `/meta.json` `ships_to_countries` names US (the store's own declared reach). A USD base store is
-     refused too: its /products.json crawl already IS its US offer (source = storefront).
-  2. POST `/localization` as MULTIPART with `_method=put`, `country_code=US`, in a cookie session (a
-     urlencoded POST without `_method` silently no-ops; probed 2026-08-14).
-  3. `/cart.js` in that session reports `currency == "USD"` BEFORE any price is read. Anything else is a
-     clean refusal: a recorded reason, no rows.
-  4. `/products/<handle>.js` read inside the same session; `/cart.js` is re-checked every
-     SESSION_RECHECK_EVERY products and once at the end, and a check that no longer reports USD voids
-     the whole capture (the .js payload carries no currency, so a decayed session could only ever be
-     caught out of band).
-A `?country=US` query is never evidence (ADR section 1.3: it moved prices at 5 of 30 stores, the
-payload has no currency field, and an unmoved number proves nothing), so this module never sends one.
+THE EVIDENCE STANDARD, in order, per job (ADR-026 decision 4.4, accepted 2026-10-11):
+  1. `/meta.json` `ships_to_countries` names the market (the store's own declared reach), and the store's
+     base currency is not already the market's (then its /products.json crawl IS its market offer).
+  2. PRIMARY PROOF, the market-pinned read (services/shopify_presentment, the rule our payment proofs use):
+     each `/products/<handle>.js?country=<M>` is read with NO cookie, and its price counts only when the
+     `cart_currency` Set-Cookie of THAT SAME response names the market's currency. Every price carries its
+     own proof: no session, no cart, nothing a later response must vouch for.
+  3. FALLBACK, only when the first pinned answer does not present the market's currency and robots.txt
+     allows the cart paths: the cookie session -- a MULTIPART POST `/localization` (`_method=put`,
+     `country_code=<M>`), `/cart.js` reporting the market currency BEFORE any price is read, `.js` reads in
+     that session, and `/cart.js` re-checked every SESSION_RECHECK_EVERY products and once at the end.
+Measured (ADR-026 Appendix B, 2026-10-11, served stores): the pinned read found SGD pricing at every store the
+session did, and at more; where both worked they agreed to the cent; an SGD cookie over base-currency numbers
+never occurred; a few stores send no cookie at all (`currency_unprovable`). This REVISES the
+2026-08 rule that "a `?country=` query is never evidence": that held for the bare query, whose payload names
+no currency. With the same-response cookie, the query is the stronger proof.
 
 THE TARGET MARKET (Peng 2026-10-10, "Build the SG currency support"): the job's options.market picks it,
 from CAPTURE_MARKETS. Everything above reads with the market substituted -- ships_to names SG, the PUT says
@@ -57,16 +60,13 @@ lane's backoff, like a throttled crawl. A 403, a non-JSON answer where JSON is d
 redirect to another host is UNVERIFIABLE: the job fails with that reason, nothing is written, and
 nothing is retried or worked around.
 
-ROBOTS.TXT IS OBEYED FOR EVERY PATH, the two session endpoints included (Peng's standing rule: never scrape
-around a crawler block). Every request goes through crawl_politeness.before_request -- the crawl's own
-parser, cache and fail-open policy (a robots.txt that 404s, 5xxs or times out is "no restrictions"; only an
-explicit Disallow blocks) -- with no special case. And BEFORE the first request to the store, the capture
-asks the same gate about SESSION_PATHS (/localization, /cart.js): if the store disallows either for our user
-agent, the capture is refused whole (status `nothing`, reason `robots_disallowed:<path>`, no sibling
-offers), because without both there is no proof of a USD session at all. On a store serving Shopify's
-published default this costs nothing: the Help Center ("Editing robots.txt.liquid", 2026-09-26, "some of
-the key entries") lists `Disallow: /cart/` -- with the slash, which does not match `/cart.js` -- and no
-`/localization` rule.
+ROBOTS.TXT IS OBEYED FOR EVERY PATH (Peng's standing rule: never scrape around a crawler block). Every
+request -- the pinned `.js?country=` reads included -- goes through crawl_politeness.before_request: the crawl's
+own parser, cache and fail-open policy (a robots.txt that 404s, 5xxs or times out is "no restrictions"; only an
+explicit Disallow blocks), with no special case. The fallback session needs both SESSION_PATHS (/localization,
+/cart.js); robots.txt is asked about them up front and recorded. Where either is disallowed (about a fifth of measured
+stores, Appendix B) the pinned read is the only proof, and a store whose pinned read does not present the
+market's currency is refused as `robots_disallows_cart` (or `currency_unprovable` when it sent no cookie).
 """
 
 from __future__ import annotations
@@ -101,9 +101,13 @@ BASE_SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
 #: Re-verify the session every N product reads (the script's value): a decayed localization cookie
 #: would silently relabel base-currency prices as USD, the #1636/#1642 defect class.
 SESSION_RECHECK_EVERY = 25
-#: The paths the USD-session proof cannot do without. robots.txt is asked about them before the first
-#: request to the store; a Disallow on either refuses the capture (module docstring, ROBOTS.TXT).
+#: The paths the fallback session proof cannot do without. robots.txt is asked about them before the first
+#: request to the store; a Disallow on either rules the fallback out (module docstring, ROBOTS.TXT).
 SESSION_PATHS = ("/localization", "/cart.js")
+#: How a sibling's price was proven (offer_payload "proof", evidence "proof"): the market-pinned read
+#: (?country=<M> + that response's own cart_currency cookie), or the localized cookie session's cart.
+PROOF_PINNED = "pinned_country_cookie"
+PROOF_SESSION = "session_cart"
 HTTP_TIMEOUT_S = 20.0
 #: Tests replace this with an httpx.MockTransport; None is the real network.
 HTTP_TRANSPORT = None
@@ -304,7 +308,8 @@ def _is_json(resp: Any) -> bool:
 
 
 class _Session:
-    """One cookie session against one storefront host: every request paced through the crawl's gate,
+    """Requests against one storefront host -- cookie-less pinned reads, or the fallback's cookie session --
+    every request paced through the crawl's gate,
     every answer classified, the final host of every redirect chain checked."""
 
     def __init__(self, client: Any, host: str, polite: Any, evidence: Dict[str, Any],
@@ -342,9 +347,11 @@ class _Session:
         final = _host(str(getattr(resp, "url", "") or url))
         if final != self.host:
             # A geo-router or a sibling regional store: another catalog, another currency.
-            raise self._refuse("capture_unverifiable", "failed",
-                               f"{path}: the storefront redirected to {final or '(unknown)'}; a regional "
-                               f"store is a different store")
+            refusal = self._refuse("capture_unverifiable", "failed",
+                                   f"{path}: the storefront redirected to {final or '(unknown)'}; a regional "
+                                   f"store is a different store")
+            refusal.off_host = final or "(unknown)"
+            raise refusal
         code = resp.status_code
         if code == 429 or code >= 500:
             raise self._refuse("crawl_throttled", "queued", f"HTTP {code} at {path}", transient=True)
@@ -362,6 +369,20 @@ class _Session:
         resp = await self.request("GET", path, expect_json=True)
         if resp.status_code != 200:
             return resp.status_code, None
+        return 200, self._body(resp, path)
+
+    async def json_presented(self, path: str) -> Tuple[int, Any, Optional[str], Optional[str]]:
+        """(status, parsed body, currency, problem): `json`, plus the currency THIS response was presented in,
+        from its own `cart_currency` Set-Cookie (shopify_presentment.presentment_currency: exactly one
+        three-letter value, else `problem`)."""
+        from services.shopify_presentment import presentment_currency
+        resp = await self.request("GET", path, expect_json=True)
+        currency, problem = presentment_currency(resp.headers.get_list("set-cookie"))
+        if resp.status_code != 200:
+            return resp.status_code, None, currency, problem
+        return 200, self._body(resp, path), currency, problem
+
+    def _body(self, resp: Any, path: str) -> Any:
         try:
             body = resp.json()
         except ValueError:
@@ -370,7 +391,7 @@ class _Session:
             # A JS-typed answer that is a bare string or number is no storefront JSON: a challenge or a stub.
             raise self._refuse("capture_unverifiable", "failed",
                                f"{path} answered {type(body).__name__}, not a JSON object; unverifiable")
-        return 200, body
+        return body
 
     async def cart_currency(self) -> Optional[str]:
         _code, cart = await self.json("/cart.js")
@@ -385,15 +406,18 @@ def _robots_refusal(path: str, host: str, market: str = CAPTURE_MARKET) -> str:
             f"obeys robots.txt and never works around it, so no {market} offer is captured")
 
 
-async def _require_session_paths_allowed(polite: Any, host: str, evidence: Dict[str, Any],
-                                         market: str = CAPTURE_MARKET) -> None:
+async def _session_paths_allowed(polite: Any, host: str, evidence: Dict[str, Any]) -> bool:
     """Ask robots.txt about every SESSION_PATH before the first request to the store (the same gate, parser
-    and cache every other request uses). A Disallow on either refuses the whole capture."""
+    and cache every other request uses). Recorded; a Disallow rules out the fallback session, not the
+    pinned read (module docstring, ROBOTS.TXT)."""
     from services.curated_brand_feed import _UA
     for path in SESSION_PATHS:
         if not await polite.robots_allows(f"https://{host}{path}", user_agent=_UA):
             evidence["robots"]["disallowed"] = path
-            raise MarketsRefused("robots_disallowed", "nothing", _robots_refusal(path, host, market))
+            evidence["robots"]["session_paths_allowed"] = False
+            return False
+    evidence["robots"]["session_paths_allowed"] = True
+    return True
 
 
 def _first_sellable(variants: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
@@ -418,8 +442,9 @@ def _minor_units(cents: Any) -> Optional[float]:
 
 def _plan_product(host: str, handle: str, detail: Any, bases: List[Dict[str, Any]],
                   evidence: Dict[str, Any], skipped: Dict[str, int],
-                  market: str = CAPTURE_MARKET) -> List[Dict[str, Any]]:
-    """The sibling rows for one product's base offers, from its session-read .js payload."""
+                  market: str = CAPTURE_MARKET, *, cart_currency: Optional[str] = None) -> List[Dict[str, Any]]:
+    """The sibling rows for one product's base offers, from its market-proven .js payload. `cart_currency`:
+    the currency THIS payload's own response proved (the pinned read); else the session's /cart.js answer."""
     from services.catalog_enrichment_agent.ingestion import SKU_SUFFIX, _availability, _observed_stock
     from services.curated_brand_feed import MIN_SELLABLE_PRICE
 
@@ -462,8 +487,9 @@ def _plan_product(host: str, handle: str, detail: Any, bases: List[Dict[str, Any
                 "capture": source_system, "captured_from": host, "handle": handle,
                 "destination_url": base.get("source_ref"), "variant_id": str(variant.get("id")),
                 "price_cents": variant.get("price"), "base_offer_id": base["base_offer_id"],
-                "base_currency": base.get("currency"), "cart_currency": evidence.get("cart_currency"),
-                "localization_status": evidence.get("localization_status"),
+                "base_currency": base.get("currency"),
+                "cart_currency": cart_currency or evidence.get("cart_currency"),
+                "localization_status": evidence.get("localization_status"), "proof": evidence.get("proof"),
                 "captured_at": evidence.get("captured_at"),
             }, ensure_ascii=False, sort_keys=True),
         })
@@ -473,8 +499,9 @@ def _plan_product(host: str, handle: str, detail: Any, bases: List[Dict[str, Any
 async def capture(job: Dict[str, Any], *, db: Any, max_products: int, polite: Any = None,
                   transport: Any = None) -> Dict[str, Any]:
     """Read the storefront's prices in the job's market (capture_market: US, or SG) for the job's base
-    offers inside one proven session of that market. Returns {"planned": [sibling rows], "checks": {...}};
-    raises MarketsRefused. Writes nothing. Every US outcome, reason and row is what it was before SG."""
+    offers, each proven by its own market-pinned response, or (fallback) inside one proven session.
+    Returns {"planned": [sibling rows], "checks": {...}};
+    raises MarketsRefused. Writes nothing."""
     import httpx
 
     market = capture_market(job)
@@ -512,16 +539,24 @@ async def capture(job: Dict[str, Any], *, db: Any, max_products: int, polite: An
             f"{len(by_handle)} products to capture, over options.max_products {max_products}: raise it or "
             f"cancel the job"))
 
+    from services.shopify_presentment import no_cookie_client
+
     headers = {"User-Agent": _ua(), "Accept": "application/json"}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=HTTP_TIMEOUT_S, headers=headers,
-                                 transport=transport if transport is not None else HTTP_TRANSPORT) as client:
-        session = _Session(client, host, polite if polite is not None else crawl_politeness, evidence, market)
+    client_kw = dict(follow_redirects=True, timeout=HTTP_TIMEOUT_S, headers=headers,
+                     transport=transport if transport is not None else HTTP_TRANSPORT)
+    polite = polite if polite is not None else crawl_politeness
+    planned: List[Dict[str, Any]] = []
+    requests = 0
+    # The pinned reads carry no cookie at all: nothing a response sets may steer a later one, so every price
+    # is proven by its own response alone (shopify_presentment.no_cookie_client).
+    async with no_cookie_client(**client_kw) as pinned_client:
+        pinned = _Session(pinned_client, host, polite, evidence, market)
         try:
-            # 0. robots.txt: both session paths allowed, or no request to the store at all.
-            await _require_session_paths_allowed(session.polite, host, evidence, market)
+            # 0. robots.txt about the fallback session's paths: asked and recorded, before any request.
+            cart_allowed = await _session_paths_allowed(polite, host, evidence)
             # 1. The store's own reach and base currency.
             from services.storefront_currency import parse_meta
-            resp = await session.request("GET", "/meta.json", expect_json=True)
+            resp = await pinned.request("GET", "/meta.json", expect_json=True)
             meta = parse_meta(resp.text) if resp.status_code == 200 else None
             if not meta:
                 raise MarketsRefused("capture_unverifiable", "failed",
@@ -559,7 +594,81 @@ async def capture(job: Dict[str, Any], *, db: Any, max_products: int, polite: An
                 by_handle = {h: [c for c in rows if c.get("currency") == meta["currency"]]
                              for h, rows in by_handle.items()}
                 by_handle = {h: rows for h, rows in by_handle.items() if rows}
-            # 2. A session in the market: a cookie jar, then the multipart localization PUT.
+            # 2. The market-pinned read: each price proven by its own response's cart_currency cookie. The
+            #    first answered product decides whether the store presents the market's currency this way.
+            before_probe = dict(skipped)
+            probe: Optional[Dict[str, Any]] = None
+            for handle in sorted(by_handle):
+                path = f"/products/{quote(handle, safe='')}.js?country={market}"
+                try:
+                    code, detail, presented, problem = await pinned.json_presented(path)
+                except MarketsRefused as exc:
+                    if not getattr(exc, "off_host", None):
+                        raise
+                    # The market lives on another host (a regional store, ADR-026 decision 5): this host does
+                    # not present it. Never followed or priced -- the probe falls back, a later read is skipped.
+                    code, detail, presented, problem = 200, None, None, f"redirected_to:{exc.off_host}"
+                if code != 200:  # 404: delisted since the base crawl, or not sold in the market. Counted.
+                    key = f"product_js_http_{code}"
+                    skipped[key] = skipped.get(key, 0) + len(by_handle[handle])
+                    continue
+                if probe is None:
+                    probe = {"handle": handle, "cart_currency": presented, "problem": problem}
+                    evidence["pinned"] = dict(probe)
+                    if presented != currency:
+                        break  # the store does not present the market's currency to a pinned read
+                    evidence["proof"] = PROOF_PINNED
+                    evidence["captured_at"] = datetime.now(timezone.utc).isoformat()
+                if presented != currency:
+                    # This one response is not proof (another currency, no cookie, an off-host redirect): this
+                    # product only, counted by why.
+                    why = f"presented_{presented.lower()}" if presented else (problem or "unproven").split(":")[0]
+                    key = f"pinned_{why}"
+                    skipped[key] = skipped.get(key, 0) + len(by_handle[handle])
+                    continue
+                planned.extend(_plan_product(host, handle, detail, by_handle[handle], evidence, skipped, market,
+                                             cart_currency=presented))
+            requests = pinned.requests
+            if probe is None or evidence.get("proof") == PROOF_PINNED:
+                evidence.update(requests=requests, planned=len(planned),
+                                planned_products=len({r["product_key"] for r in planned}))
+                if probe is None:
+                    evidence["pinned"] = {"answered": 0}
+                return {"planned": planned, "checks": checks}
+        except MarketsRefused as exc:
+            evidence["requests"] = pinned.requests
+            raise refused(exc)
+
+    # 3. FALLBACK: the pinned read did not present the market's currency. Only a localized cookie session
+    #    can still prove one, and only where robots.txt allows its cart paths.
+    if not cart_allowed:
+        evidence["requests"] = requests
+        path = evidence["robots"].get("disallowed")
+        if str(probe["problem"] or "").startswith("redirected_to:"):
+            raise refused(MarketsRefused(
+                "market_on_another_host", "nothing",
+                f"market_on_another_host:{path} -- {host}'s pinned ?country={market} read redirected to "
+                f"{probe['problem'].split(':', 1)[1]}: the {market} market is another storefront (never followed or "
+                f"priced here), and robots.txt disallows {path} for the session fallback"))
+        if probe["cart_currency"] is None:
+            raise refused(MarketsRefused(
+                "currency_unprovable", "nothing",
+                f"currency_unprovable:{path} -- {host}'s pinned ?country={market} read set no usable "
+                f"cart_currency cookie ({probe['problem']}), and its robots.txt disallows {path} for the session "
+                f"fallback: no response can prove a {currency} price, so no {market} offer is captured"))
+        raise refused(MarketsRefused(
+            "robots_disallows_cart", "nothing",
+            f"robots_disallows_cart:{path} -- {host}'s pinned ?country={market} read was presented in "
+            f"{probe['cart_currency']}, not {currency}, and its robots.txt disallows {path}, which the session "
+            f"fallback needs; robots.txt is never worked around, so no {market} offer is captured"))
+    skipped.clear()
+    skipped.update(before_probe)  # the session re-reads every product; the probe's counts are not doubled
+    async with httpx.AsyncClient(**client_kw) as client:
+        session = _Session(client, host, polite, evidence, market)
+        session.requests = requests
+        evidence["proof"] = PROOF_SESSION
+        try:
+            # A session in the market: a cookie jar, then the multipart localization PUT.
             evidence["home_status"] = (await session.request("GET", "/", expect_json=False)).status_code
             # Not followed: its answer is the cookie (a 302 back to return_to), and following would be a
             # request the politeness gate never saw.
@@ -567,7 +676,7 @@ async def capture(job: Dict[str, Any], *, db: Any, max_products: int, polite: An
                 "POST", "/localization", expect_json=False, follow_redirects=False,
                 files={"_method": (None, "put"), "country_code": (None, market), "return_to": (None, "/")})
             evidence["localization_status"] = loc.status_code
-            # 3. The proof, BEFORE any price is read.
+            # The proof, BEFORE any price is read.
             evidence["cart_currency"] = await session.cart_currency()
             evidence["captured_at"] = datetime.now(timezone.utc).isoformat()
             if evidence["cart_currency"] != currency:
@@ -575,8 +684,7 @@ async def capture(job: Dict[str, Any], *, db: Any, max_products: int, polite: An
                                      f"{host}'s /cart.js reports {evidence['cart_currency'] or 'no currency'} "
                                      f"after localizing to {market}: the store does not confirm {currency} for "
                                      f"a {market} session, so no price it shows is a {currency} offer")
-            # 4. Prices, inside the proven session, committed only past a passing re-check.
-            planned: List[Dict[str, Any]] = []
+            # Prices, inside the proven session, committed only past a passing re-check.
             pending: List[Dict[str, Any]] = []
             rechecks = 0
             since = 0
