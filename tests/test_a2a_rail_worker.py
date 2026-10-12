@@ -376,7 +376,9 @@ async def test_a_tick_cut_mid_write_keeps_the_write_pending_and_the_lease_releas
 def test_each_run_gets_its_own_worker_id():
     ids = {job._worker_id() for _ in range(5)}
     assert len(ids) == 5 and all(len(i) <= 64 for i in ids)
-    assert worker.STALE_LEASE_SECONDS > 300  # outlives the job's run deadline
+    from services.audit_scheduler import run_deadline_for
+
+    assert worker.STALE_LEASE_SECONDS > run_deadline_for("a2a_rail_purchase_poll")  # outlives the run
 
 
 # ── parked, capped, the tick and the job ─────────────────────────────────────────────────────
@@ -488,4 +490,25 @@ async def test_reconciling_an_unseen_bound_that_bound_nothing_keeps_the_schedule
     rail = Rail().on("payment.method-view#submit", _methods(pending))
     assert await _step(rail, pid) == "reconciled"
     row = await _row(pid)
-    assert (row["pending_write"], row["last_error_code"]) == (None, "bound_sent:1")  # not reset to slot 0
+    assert row["pending_write"] is None
+    assert worker._bound_count(row) == 1 and row["last_error_code"].endswith(":reconciled")  # not reset
+
+
+async def test_other_releases_never_reset_the_bound_schedule():
+    """A failed read, a card missing from one listing, or a refused transition between bound slots
+    must not send the schedule back to its first slot (a flaky rail would otherwise get a bound on
+    every other poll)."""
+    pid = await _binding()
+    pending = {**ACTIVE, "id": "pm_new", "status": "PENDING"}
+    still = _task(("payment.method-add-await-card", {"status": "PENDING"}))
+    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = datetime('now', '-90 seconds')")
+    await _step(Rail().on("payment.method-view#submit", _methods(pending)).on(
+        "payment.method-add-required-card#bound", still), pid)
+    for interruption in (httpx.Response(503), _methods()):  # a failed read, then a listing without the card
+        await _step(Rail().on("payment.method-view#submit", interruption), pid)
+        row = await _row(pid)
+        assert worker._bound_count(row) == 1, row["last_error_code"]
+        rail = Rail().on("payment.method-view#submit", _methods(pending)).on(
+            "payment.method-add-required-card#bound", still)
+        await _step(rail, pid)
+        assert rail.actions().count("payment.method-add-required-card#bound") == 0  # still before 180 s

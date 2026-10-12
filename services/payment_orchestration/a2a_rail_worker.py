@@ -102,11 +102,12 @@ def _aware(value: Any) -> Optional[datetime]:
 
 
 def _bound_count(row: Mapping[str, Any]) -> int:
+    """`bound_sent:<n>` or `bound_sent:<n>:<a later reason>` -> n."""
     code = str(row.get("last_error_code") or "")
     if code.startswith("bound_sent:"):
         try:
-            return int(code.split(":", 1)[1])
-        except ValueError:
+            return int(code.split(":")[1])
+        except (ValueError, IndexError):
             return 0
     return 0
 
@@ -126,6 +127,11 @@ class _Step:
         )
 
     async def release(self, seconds: int, code: Optional[str] = None) -> None:
+        # The `bound` schedule's count rides in last_error_code; a later reason is appended to it, never
+        # written over it, or one failed read would reset the schedule to its first slot.
+        sent = _bound_count(self.row)
+        if code is not None and sent and not code.startswith("bound_sent:"):
+            code = f"bound_sent:{sent}:{code}"[:64].rstrip(":")
         await ledger.release_claim(self.id, self.worker, next_poll_at=_later(seconds), last_error_code=code)
 
     async def methods(self) -> Tuple[Optional[List[Dict[str, Any]]], Any]:
@@ -293,6 +299,9 @@ async def _reconcile(s: _Step) -> str:
     if (recorded is not None and (_now() - recorded).total_seconds() > RECONCILE_LIMIT_SECONDS) or (
         int(s.row.get("attempts") or 0) > MAX_OPENED_ATTEMPTS
     ):
+        if state not in ("opened", "needs_payment_method"):  # pragma: no cover - the only states binding writes come from
+            await s.release(POLL_PARKED, "pending_write_unreconcilable")
+            return "pending_write_unreconcilable"
         moved = await ledger.transition_as_holder(
             s.id, s.worker, from_states=[state], to_state="failed", resolves_write=action,
             last_error_code="reconcile_exhausted")
@@ -317,8 +326,7 @@ async def _reconcile(s: _Step) -> str:
     # No usable card: the unseen write bound nothing we can use. It moved no money, so it is resolved by
     # this read; the next poll starts over (a page the rail issued but we never saw simply lapses).
     await ledger.clear_pending_write(s.id, s.worker, action)
-    keep = str(s.row.get("last_error_code") or "")
-    await s.release(0, keep if keep.startswith("bound_sent:") else "reconciled")
+    await s.release(0, "reconciled")  # appended to a bound_sent count by `release`
     return "reconciled"
 
 

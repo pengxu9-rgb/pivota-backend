@@ -55,3 +55,29 @@ async def test_the_first_step_reads_the_live_card_list_and_moves_to_quoting():
     assert await worker.step(client, claimed, "sandbox-w") == "method_ready"
     after = await ledger.get_purchase_internal(row["id"])
     assert after["state"] == "quoting" and after["payment_method_id"] and after["pending_write"] is None
+
+
+
+@pytest.mark.skipif(os.getenv("A2A_RAIL_SANDBOX_WRITES") != "1",
+                    reason="writes test data on the sandbox; set A2A_RAIL_SANDBOX_WRITES=1")
+async def test_the_card_list_filter_the_worker_sends_lists_a_pending_card():
+    """Pins the measurement the binding step depends on: under the worker's own `list_statuses`, a
+    card whose binding has just started is listed as PENDING. Starts one binding (no money; the page
+    is never opened and lapses)."""
+    import uuid
+
+    member = os.getenv("A2A_RAIL_SANDBOX_MEMBER") or "pivota-sandbox-buyer-1"
+    client = a2a_rail.A2ARailClient(_env("A2A_RAIL_SANDBOX_BASE_URL"), _key())
+    added = await client.send_action(
+        member_id=member, context_id=client.context_for(member, f"contract_{uuid.uuid4().hex[:12]}"),
+        component=worker.ADD_METHOD[0], action=worker.ADD_METHOD[1],
+        payload={"user_email": _env("A2A_RAIL_SANDBOX_EMAIL")})
+    card = added.card("payment.method-add-required-card")
+    assert card is not None, added.kind
+    new_id = card.data["paymentMethodId"]
+    listed = await client.send_action(
+        member_id=member, context_id=client.context_for(member, f"contract_{uuid.uuid4().hex[:12]}"),
+        component=worker.VIEW_METHODS[0], action=worker.VIEW_METHODS[1],
+        payload={"list_statuses": worker._LIST_ALL})
+    methods = listed.card("payment.method-list").data["methods"]
+    assert any(m.get("id") == new_id and m.get("status") == "PENDING" for m in methods)
