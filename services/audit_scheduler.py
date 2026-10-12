@@ -54,6 +54,9 @@ Job registration happens at start-up time. Currently registers:
 - `cafe24_reconciliation` — every 15 minutes, replays Cafe24 webhook and
   Data Bridge logs for a bounded least-recently-run store batch. It is dormant
   unless CAFE24_RECONCILIATION_ENABLED is explicitly enabled.
+- `a2a_rail_purchase_poll` — every A2A_RAIL_POLL_INTERVAL_SECONDS (default 20): advance A2A token
+  rail purchases one step each (jobs/a2a_rail_purchase_poll). Dormant unless A2A_RAIL_WORKER_ENABLED
+  and the rail client is configured.
 - `agent_purchase_events` — every AGENT_PURCHASE_EVENTS_INTERVAL_SECONDS (default 30):
   detect purchase.* webhook events from the agent_purchases ledger and hand them to the agent
   webhook sender. Dormant unless AGENT_PURCHASE_WEBHOOKS_ENABLED and AGENT_PURCHASE_LEDGER_ENABLED.
@@ -266,6 +269,9 @@ _JOB_RUN_DEADLINES = {
     # Detect reads at most 200 candidates; hand-over starts no new round of 10 after 150 s and one
     # POST is capped at 10 s, so a tick ends well inside 300 s (a cut tick releases its claims).
     "agent_purchase_events": 300,
+    # Starts no new step after 120 s; one step is a card read plus at most one write, each bounded by
+    # the client's total deadline (2 x 30 s). A cut tick releases every claim it did not step.
+    "a2a_rail_purchase_poll": 300,
 }
 
 
@@ -612,6 +618,25 @@ async def start_scheduler() -> None:
             replace_existing=True,
             max_instances=1,
             misfire_grace_time=_ape_interval,
+            coalesce=True,
+        )
+
+        # The A2A token rail's purchase worker (payment orchestration P2b): one step per claimed
+        # purchase. Dormant unless A2A_RAIL_WORKER_ENABLED and the rail client is configured (both
+        # checked inside the job). max_instances=1 + coalesce; the ledger claim is the fence.
+        from jobs.a2a_rail_purchase_poll import (
+            job_interval_seconds as _a2a_interval_seconds,
+            run_a2a_rail_purchase_poll,
+        )
+        _a2a_interval = _a2a_interval_seconds()
+        _add_job(
+            run_a2a_rail_purchase_poll,
+            "interval",
+            seconds=_a2a_interval,
+            id="a2a_rail_purchase_poll",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=_a2a_interval,
             coalesce=True,
         )
 
