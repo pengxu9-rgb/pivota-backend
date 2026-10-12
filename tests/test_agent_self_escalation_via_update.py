@@ -78,6 +78,12 @@ class _UpdateSpy:
         self.executed.append(query)
         return None
 
+    #: The agent's stored legacy webhook_url, for the save-time destination check.
+    stored_webhook_url: Optional[str] = None
+
+    async def fetch_val(self, *a, **kw):
+        return self.stored_webhook_url
+
     async def fetch_one(self, *a, **kw):
         return None
 
@@ -226,3 +232,22 @@ def test_can_access_merchant_still_answers_for_real_targets():
     assert can_access_merchant({"role": "merchant", "merchant_id": "m1"}, "m2") is False
     assert can_access_merchant({"role": "admin"}, "m1") is True
     assert can_access_merchant({"role": "agent"}, "m1") is True
+
+
+@pytest.mark.parametrize("url", ["http://10.0.0.5/hook", "https://169.254.169.254/x", "https://web-1.us-west1.run.app/x"])
+def test_a_new_legacy_webhook_url_gets_the_destination_check(client, update_spies, url):
+    """The legacy field is migrated into agent_webhook_configs as enabled, so it must not be a way
+    around the save-time check that PUT /agents/{id}/webhooks/config applies."""
+    resp = client.put(f"/agents/{AGENT_A}", json={"webhook_url": url}, headers=_auth(_agent_token()))
+    assert resp.status_code == 400, resp.text
+    assert update_spies.executed == []
+
+
+def test_an_unchanged_or_managed_legacy_webhook_url_is_not_re_judged(client, update_spies):
+    update_spies.stored_webhook_url = "http://legacy.example/hook"
+    resp = client.put(f"/agents/{AGENT_A}", json={"webhook_url": "http://legacy.example/hook"},
+                      headers=_auth(_agent_token()))
+    assert resp.status_code == 200, resp.text
+    managed = f"https://old-host.example/agents/{AGENT_A}/webhooks/managed-inbox"
+    resp = client.put(f"/agents/{AGENT_A}", json={"webhook_url": managed}, headers=_auth(_agent_token()))
+    assert resp.status_code == 200, resp.text
