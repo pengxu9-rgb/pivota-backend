@@ -76,7 +76,11 @@ def _flag(argv: List[str], name: str) -> str:
 
 
 def _env_vars(argv: List[str]) -> Dict[str, str]:
-    return dict(pair.split("=", 1) for pair in _flag(argv, "--set-env-vars").split(","))
+    raw = _flag(argv, "--set-env-vars")
+    # gcloud's alternate-delimiter form: `^|^a=1|b=2,3` splits on `|`, so a value may hold a comma.
+    sep = raw[1] if raw.startswith("^") and raw[2:3] == "^" else ","
+    body = raw[3:] if sep != "," else raw
+    return dict(pair.split("=", 1) for pair in body.split(sep))
 
 
 def test_the_script_parses():
@@ -282,3 +286,23 @@ def test_the_job_shares_the_shopify_edge_budget_like_the_reap_proof_jobs(tmp_pat
     assert env["CRAWL_SHOPIFY_EDGE_PACER_ENABLED"] == "true" and env["CRAWL_SHOPIFY_EDGE_LEASE"] == "2"
     assert "CRAWL_SHOPIFY_EDGE_RPS" not in env
     assert not [k for k in env if k.startswith("MERCHANT_PURCHASABILITY_IP_THROTTLE_")]
+
+
+def test_the_env_is_exactly_the_live_jobs_with_both_served_markets(tmp_path):
+    """The whole env, pinned: the `^|^` separator keeps the comma inside PIVOTA_SERVING_PRICING_REGIONS=US,SG,
+    and no two variables may merge (a merged DB_POOL_MIN_SIZE/MAX_SIZE would silently fall back to the
+    default pool). The served markets match web and the drain, so no serving path ever defaults to US alone."""
+    proc, calls = _run(tmp_path, "prod", TAG)
+    assert proc.returncode == 0, proc.stderr
+    env = _env_vars(_one(calls, "run", "jobs", "create", "merchant-purchasability-sweep"))
+    assert env == {
+        "PIVOTA_ENV": "production", "PIVOTA_SERVICE_NAME": "merchant-purchasability-sweep",
+        "PIVOTA_COMMIT_SHA": TAG, "DB_POOL_MIN_SIZE": "1", "DB_POOL_MAX_SIZE": "2",
+        "DB_STATEMENT_TIMEOUT_SECONDS": "30", "DB_COMMAND_TIMEOUT_SECONDS": "600",
+        "MERCHANT_PURCHASABILITY_BUDGET_SECONDS": env["MERCHANT_PURCHASABILITY_BUDGET_SECONDS"],
+        "MERCHANT_PURCHASABILITY_BATCH": env["MERCHANT_PURCHASABILITY_BATCH"],
+        "MERCHANT_PURCHASABILITY_SWEEP_ENABLED": "false",
+        "CRAWL_SHOPIFY_EDGE_PACER_ENABLED": "true", "CRAWL_SHOPIFY_EDGE_LEASE": "2",
+        "PIVOTA_SERVING_PRICING_REGIONS": "US,SG",
+    }
+    assert env["MERCHANT_PURCHASABILITY_BUDGET_SECONDS"].isdigit() and env["MERCHANT_PURCHASABILITY_BATCH"].isdigit()
