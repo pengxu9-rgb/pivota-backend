@@ -54,6 +54,10 @@ def scope_key(domain: str, brand: str, options: Dict[str, Any]) -> str:
     # key, and it is the key every job queued before the option existed already has. require_currency is
     # NOT folded the same way: jobs stored with "USD" hold keys that include it, and dropping it now would
     # let a re-enqueue of such a cohort miss its open job and duplicate it.
+    # options.fold_shades IS scope (a folded cohort writes other rows), but false means "not folded", which
+    # is what every job queued before the option has: dropped, so those keys stay byte-identical.
+    if not scope.get("fold_shades"):
+        scope.pop("fold_shades", None)
     market = str(scope.pop("market", None) or "").strip().upper()
     if market and market != "US":
         scope["market"] = market

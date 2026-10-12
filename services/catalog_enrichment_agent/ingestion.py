@@ -367,6 +367,32 @@ def retailer_listing_identity(source_domain: str, canonical_url: str) -> str:
     return identity
 
 
+def retailer_product_key(source_domain: Optional[str], canonical_url: Optional[str]) -> str:
+    """The `ext:retailer:` product_key of a retailer listing: its listing identity (host + path), hashed.
+    The ONE derivation: the ingest key, and any tool that must name the row a listing was written under
+    (the retailer lane's shade-fold supersede preview), call this. Raises ValueError like
+    retailer_listing_identity when the URL is not on its storefront host."""
+    listing = retailer_listing_identity(str(source_domain or ""), str(canonical_url or ""))
+    return "ext:retailer:" + hashlib.sha256(listing.encode("utf-8")).hexdigest()[:32]
+
+
+def folded_variant_listing_url(listing_url: Optional[str], source_handle: Optional[str]) -> Optional[str]:
+    """The storefront page a FOLDED variant is sold on: its own listing (/products/<source_handle>) on the
+    base listing's host, or None when either is missing or the base URL is not a /products/ page.
+
+    A folded shade is a variant taken from ANOTHER Shopify product (curated_brand_feed.fold_shade_listings),
+    so its variant id is in that product's /products/<handle>.js, not the base's: an offer pointing at the
+    base page sends a buyer to a page that does not sell that variant, and a shopify_markets capture (which
+    reads the .js of the handle in each offer's own URL) skips it as variant_not_in_product_js."""
+    from urllib.parse import urlsplit
+
+    handle = str(source_handle or "").strip().strip("/")
+    parsed = urlsplit(str(listing_url or ""))
+    if not handle or "/" in handle or not parsed.netloc or "/products/" not in parsed.path:
+        return None
+    return f"{parsed.scheme or 'https'}://{parsed.netloc}/products/{handle}"
+
+
 def listing_handle(canonical_url: Optional[str]) -> Optional[str]:
     """The per-product token an operator names to exclude or accept one listing: the Shopify handle
     (/products/<handle>), or -- for a host in _LISTING_QUERY_KEYS -- the product id its URL carries
@@ -775,10 +801,8 @@ def _build_pdp_insert(
     if pdp_payload.get("source_role") == "retailer":
         # Listing identity and shared content identity are different axes. Native
         # Shopify IDs are local to a store; title/GTIN cannot own a seller's row.
-        listing = retailer_listing_identity(pdp_payload.get("source_domain"), canonical_url)
-        digest = hashlib.sha256(listing.encode("utf-8")).hexdigest()[:32]
-        source_product_id = "retailer:" + digest
-        product_key = "ext:" + source_product_id
+        product_key = retailer_product_key(pdp_payload.get("source_domain"), canonical_url)
+        source_product_id = product_key[len("ext:"):]
         pivota_fields = make_pivota_canonical_fields(
             SYNTHETIC_MERCHANT_ID, SYNTHETIC_PLATFORM, source_product_id,
         )
@@ -1687,10 +1711,20 @@ def ingest_validated_record(record: Dict[str, Any], *, source_jsonl: Optional[st
                 # lifting the count gate would have projected a None/0-priced offer for
                 # every recovered product whose variant carried no price of its own.
                 continue
+            sold_at = primary
+            if pdp_payload.get("source_role") == "retailer":
+                # A FOLDED retailer variant is sold on its own listing page, not the base's
+                # (folded_variant_listing_url). Retailer rows only: the brand lane's folded offers were
+                # written at the base URL, and re-pointing them would re-key every offer (offer_id hashes
+                # the URL) and leave the old ones live beside the new.
+                own = folded_variant_listing_url(primary.get("canonical_url") or primary.get("destination_url"),
+                                                 v.get("source_handle"))
+                if own:
+                    sold_at = dict(primary, canonical_url=own, destination_url=own)
             variant_offer_rows.extend(_build_offer_inserts(
                 product_key=pdp_row["product_key"],
                 sku_key=vsku["sku_key"],
-                offers=[dict(primary, price=price, in_stock=_observed_stock(v.get("in_stock")))],
+                offers=[dict(sold_at, price=price, in_stock=_observed_stock(v.get("in_stock")))],
                 source_domain=pdp_row.get("source_domain"),
                 # THE EIGHTH SITE. There were seven "USD" literals, and introducing the parameter
                 # created an eighth CALL that silently took the default -- so a shade line landed

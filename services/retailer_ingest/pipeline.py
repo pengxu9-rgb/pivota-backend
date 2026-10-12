@@ -100,6 +100,12 @@ _OPTION_TYPES = {
     # on this store AND, when the old row serves, the new one serves too; everything else keeps its old row.
     # The dry run records how many old rows are live on the store (checks.stale_brand_retire_preview).
     "retire_stale_brand": str,
+    # Fold a store's per-shade / per-size listings into their base listing's variants
+    # (curated_brand_feed.fold_shade_listings(extended=True): "<Line> - Ruby" beside "<Line>"). Opt-in per
+    # cohort (Peng approved 2026-10-12): a retailer storefront crawl only, and a cohort whose fold would
+    # supersede listings that already have LIVE rows on the host is held (fold_supersedes_live_rows) -- the
+    # retire of those rows is a follow-up, so a fold may only take over a store it has not ingested per shade.
+    "fold_shades": bool,
 }
 SOURCES = ("storefront", "affiliate_feed", "shopify_markets")
 MARKETS_SOURCE = "shopify_markets"
@@ -287,6 +293,10 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         if market not in INGEST_MARKETS:
             raise ValueError(f"options.market {market} is not an ingest market yet (allowed: {list(INGEST_MARKETS)})")
         options["market"] = market  # "us" and "US" are one cohort (db.retailer_ingest.scope_key agrees)
+    if options.get("fold_shades") and (source != "storefront" or options.get("source_role", "retailer") != "retailer"):
+        # The supersede preview derives each folded listing's old key as an ext:retailer: listing key; a brand's
+        # own store keys rows by (brand, title), and a feed or a capture crawls no /products.json to fold.
+        raise ValueError("options.fold_shades supports only a retailer storefront cohort")
     if "require_ships_to_market" in options and source != "storefront":
         raise ValueError("options.require_ships_to_market is only meaningful on a storefront crawl")
     if source == MARKETS_SOURCE:
@@ -603,6 +613,9 @@ def _feed_payload(job: Dict[str, Any]) -> Dict[str, Any]:
         # lane hands it (ingest_payload) -- a second lock on the allowlist; the curated onboard queue,
         # which stamps no market on its offers, still gets US only.
         "require_currency": job_currency(o), "market": job_market(o), "emit_real_variants": True,
+        # options.fold_shades: the fold runs inside the crawl, before any check, so every guard below judges
+        # the folded rows (_crawl adds fold_extended: the retailer rule set, not the brand CLI's).
+        "base_listings_only": bool(o.get("fold_shades")),
         "enrich_missing_gtin": True, "max_products": int(o.get("max_products") or 200),
         "max_scan_products": int(o.get("max_scan_products") or 20000),
         "max_pdp_identity_fetches": int(o.get("max_pdp_identity_fetches") or 200),
@@ -718,6 +731,8 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
         payload = ingest_payload(job)
         if (job.get("options") or {}).get("collections"):
             payload["collection_handles"] = list(job["options"]["collections"])
+        if payload.get("base_listings_only"):
+            payload["fold_extended"] = True
         if (job.get("options") or {}).get("multi_brand"):
             payload["brand_by_vendor"] = {" ".join(k.split()).casefold(): " ".join(v.split())
                                           for k, v in job["options"]["brands"].items()}
@@ -834,6 +849,7 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     from services.catalog_enrichment_agent.primary_ingestion import inspect_primary_plan
 
     o = job.get("options") or {}
+    records_in = records  # the crawl's batch: the narrowing below returns plain lists
     checks: Dict[str, Any] = {"crawl": getattr(records, "crawl_report", None), "selected": len(records)}
     # Judged BEFORE exclude_handles and the category filter narrow the cohort: judged after, excluding some
     # flagged rows (or an only_category slice) dropped the store under the minimum and applied the rest
@@ -905,6 +921,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
                         f"no product resolves under {o.get('only_category') or 'a resolved category'}",
                         checks=checks)
     checks["kept"] = len(records)
+    if o.get("fold_shades"):
+        flags.extend(await _shade_fold_checks(job, getattr(records_in, "fold_report", None), records, checks))
 
     # Every offer is DECLARED for the job's market (catalog_offers.market) and must be priced in its
     # currency; the seed rows keep the US serving partition (ingestion.SEED_PARTITION_MARKET).
@@ -963,6 +981,112 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
                        "info": len([f for f in flags if f["severity"] == detectors.INFO]),
                        "blocking_after_approval": len(blocking)}
     return {"plan": plan, "inspection": inspection, "checks": checks, "flags": flags, "blocking": blocking}
+
+
+#: The rows a fold would supersede, as they stand: a listing whose key holds a LIVE row (suppressed_at and
+#: suppression_reason both unset) on this host would stay live beside the folded base that now carries it.
+SUPERSEDED_ROWS_SQL = """
+SELECT product_key, canonical_url, source_domain, suppression_reason, suppressed_at
+FROM catalog_products
+WHERE product_key = ANY(:keys)
+"""
+#: At most this many superseded rows are listed on a run (all are counted, and all are read).
+SHADE_FOLD_PREVIEW_CAP = 500
+
+
+async def _superseded_rows(keys: List[str]) -> tuple:
+    """(rows by product_key, None) read through the SELECT-only preflight handle, or (None, why)."""
+    import scripts.onboard_curated_brands as cli
+
+    database, reason = cli._preflight_database()
+    if database is None:
+        return None, reason
+    connected_here = False
+    try:
+        if not getattr(database, "is_connected", False):
+            await database.connect()
+            connected_here = True
+        rows = await cli._SelectOnlyHandle(database).fetch_all(SUPERSEDED_ROWS_SQL, {"keys": keys})
+        return {r["product_key"]: dict(r) for r in rows or []}, None
+    except Exception as exc:  # noqa: BLE001 -- the class only: a driver error can quote its URL
+        return None, type(exc).__name__
+    finally:
+        if connected_here and getattr(database, "is_connected", False):
+            await database.disconnect()
+
+
+async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str, Any]],
+                             records: List[Dict[str, Any]], checks: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """options.fold_shades: what the fold did (checks.shade_fold), and the rows it would leave live.
+
+    IDENTITY. A retailer row is keyed by its listing URL (ingestion.retailer_product_key), so the folded base
+    keeps its own key and gains the shades as SKUs + offers, while every superseded listing (a shade, a size,
+    an absorbed repeat, a code-suffix copy) is simply no longer emitted. Nothing in this lane retires a row a
+    crawl stopped emitting, so a superseded listing ingested BEFORE (an earlier per-shade cohort) would stay
+    live beside the base: the same shade twice. Until a retire for those rows exists, such a fold is held,
+    not acceptable (fold_supersedes_live_rows); the preview names every row the retire would have to take
+    (stale key -> the base key that carries it now). A listing whose old row is already suppressed, or that
+    was never ingested, does not block. Unread (no catalog, or the read failed) holds too: a fold that
+    cannot prove it duplicates nothing is not applied."""
+    import scripts.onboard_curated_brands as cli
+    from services.catalog_enrichment_agent.ingestion import retailer_product_key
+    from services.curated_brand_feed import _clean_domain, fold_report_summary
+
+    summary = fold_report_summary(fold_report) or {"status": "no_fold_report"}
+    checks["shade_fold"] = summary
+    if not isinstance(fold_report, dict):
+        return [{"key": "shade_fold_unreported", "rule": "shade_fold_unreported", "severity": detectors.BLOCK,
+                 "acceptable": False, "detail": "options.fold_shades is set but the crawl returned no fold report"}]
+    host = _clean_domain(job["domain"]).removeprefix("www.")
+    # Only bases this cohort still writes: a base the review excluded (or the category filter left out)
+    # writes nothing, so its superseded listings are not taken over by anything -- reported, never previewed
+    # as retirable (their old rows, if any, stay exactly as they are).
+    kept_handles = {cli._record_handle(r) for r in records}
+    entries, not_written = [], []
+    for item in fold_report.get("superseded") or []:
+        base_url = f"https://{host}/products/{item['base_handle']}"
+        url = f"https://{host}/products/{item['handle']}"
+        if _handle_key(item["base_handle"]) not in kept_handles:
+            not_written.append(item["handle"])
+            continue
+        try:
+            entries.append({**item, "stale_key": retailer_product_key(host, url),
+                            "base_key": retailer_product_key(host, base_url)})
+        except ValueError:
+            continue  # a handle that is not a listing on this host names no row
+    summary["superseded_base_not_written"] = len(not_written)
+    if not entries:
+        summary["supersede_preview"] = {"status": "clear", "superseded": 0, "live": 0}
+        return []
+    rows, unread = await _superseded_rows(sorted({e["stale_key"] for e in entries}))
+    if rows is None:
+        summary["supersede_preview"] = {"status": "unchecked", "reason": unread, "superseded": len(entries)}
+        return [{"key": "fold_supersede_unread", "rule": "fold_supersede_unread", "severity": detectors.BLOCK,
+                 "acceptable": False,
+                 "detail": f"could not read the {len(entries)} listing(s) the fold supersedes ({unread}): a fold "
+                           f"that cannot prove it leaves no live duplicate is not applied"}]
+    live, suppressed, absent = [], 0, 0
+    for e in entries:
+        row = rows.get(e["stale_key"])
+        if row is None:
+            absent += 1
+        elif row.get("suppressed_at") is None and not row.get("suppression_reason"):
+            live.append({**e, "source_domain": row.get("source_domain")})
+        else:
+            suppressed += 1
+    summary["supersede_preview"] = {
+        "status": "live_rows" if live else "clear", "superseded": len(entries), "live": len(live),
+        "already_suppressed": suppressed, "never_ingested": absent,
+        "live_rows": live[:SHADE_FOLD_PREVIEW_CAP], "live_rows_truncated": len(live) > SHADE_FOLD_PREVIEW_CAP}
+    if not live:
+        return []
+    bases = sorted({e["base_handle"] for e in live})
+    return [{"key": "fold_supersedes_live_rows", "rule": "fold_supersedes_live_rows", "severity": detectors.BLOCK,
+             "acceptable": False,
+             "detail": f"{len(live)} listing(s) this fold supersedes already have live rows on {host} (under "
+                       f"{len(bases)} base(s), e.g. {bases[:3]}); the fold would leave each live beside the base "
+                       f"that now carries it. Retiring them is not built yet (see checks.shade_fold."
+                       f"supersede_preview for every row): run this cohort without fold_shades"}]
 
 
 #: The lifecycle stages backend global recall admits (services/pivot_query_service.py: `IN (...) OR
