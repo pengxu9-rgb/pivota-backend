@@ -9,8 +9,9 @@ re-vetted at read time, because both came from the rail and both are meant to be
                              rail's allowlist (by SHA-256, as the transport does), the kind matching
                              the state, and not past its deadline. Otherwise absent: nowhere to send
                              the buyer, which is exactly what an absent key says.
-  merchant_order_status_url  the merchant's own order page: https, on the merchant's domain (or the
-                             platform's order-status hosts). Otherwise absent.
+  merchant_order_status_url  the merchant's own order page: https, on the merchant's domain or one of
+                             its subdomains. A platform host (any store can mint one) is not
+                             evidence it is THIS merchant's page, so it is not shown.
 """
 
 from __future__ import annotations
@@ -29,10 +30,12 @@ from services.payment_orchestration import a2a_rail
 HOSTED_HOSTS_ENV = "A2A_RAIL_HOSTED_HOST_SHA256"
 
 #: The state each buyer-page kind belongs to. A page from another state is stale: not shown.
-_KIND_FOR_STATE = {"needs_payment_method": "card_binding", "awaiting_authorization": "approval"}
-
-#: Order-status pages a merchant on a hosted platform serves from the platform's hosts.
-_PLATFORM_ORDER_HOST_SUFFIXES = (".myshopify.com", ".shopify.com")
+#: `paying` carries the merchant's challenge (3DS) while the order is being placed.
+_KIND_FOR_STATE = {
+    "needs_payment_method": "card_binding",
+    "awaiting_authorization": "approval",
+    "paying": "authenticate",
+}
 
 #: How soon an agent polling should ask again, by state. None once terminal.
 _POLL_AFTER = {"opened": 5, "quoting": 5, "paying": 5, "needs_payment_method": 15, "awaiting_authorization": 15}
@@ -55,9 +58,16 @@ def _aware(value: Any) -> Optional[datetime]:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
+def _default_port(parts: Any) -> bool:
+    try:
+        return parts.port in (None, 443)
+    except ValueError:
+        return False
+
+
 def hosted_url_is_allowed(url: Any) -> bool:
     parts = urlsplit(str(url or ""))
-    if parts.scheme != "https" or "@" in parts.netloc or not parts.hostname:
+    if parts.scheme != "https" or "@" in parts.netloc or not parts.hostname or not _default_port(parts):
         return False
     host = parts.hostname.rstrip(".").lower()
     return hashlib.sha256(host.encode("utf-8")).hexdigest() in _host_digests()
@@ -65,11 +75,11 @@ def hosted_url_is_allowed(url: Any) -> bool:
 
 def merchant_order_url_is_allowed(url: Any, merchant_domain: str) -> bool:
     parts = urlsplit(str(url or ""))
-    if parts.scheme != "https" or "@" in parts.netloc or not parts.hostname:
+    if parts.scheme != "https" or "@" in parts.netloc or not parts.hostname or not _default_port(parts):
         return False
     host = parts.hostname.rstrip(".").lower()
     domain = str(merchant_domain or "").lower()
-    return host == domain or host.endswith("." + domain) or host.endswith(_PLATFORM_ORDER_HOST_SUFFIXES)
+    return bool(domain) and (host == domain or host.endswith("." + domain))
 
 
 def build_view(row: Mapping[str, Any], *, now: Optional[datetime] = None) -> Dict[str, Any]:

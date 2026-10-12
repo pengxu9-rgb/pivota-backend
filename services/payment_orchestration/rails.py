@@ -78,6 +78,9 @@ RAIL_ID_PREFIX: Dict[str, str] = {"rp_": "reap", "ap_": "a2a"}
 BUYER_ACTION_KIND: Dict[str, str] = {
     "needs_payment_method": "card_binding",
     "awaiting_buyer_authorization": "approval",
+    # The merchant's challenge (3DS) while the rail places the order. Only a rail that vets and
+    # returns such a page in this state shows one (the A2A token rail); Reap's view never does.
+    "placing": "authenticate",
 }
 
 

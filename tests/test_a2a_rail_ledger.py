@@ -94,6 +94,17 @@ def test_the_sql_state_lists_follow_the_graph():
     assert set(ledger.POLLABLE_STATES) == non_terminal
     assert set(ledger.CLAIM_ATTEMPT_EXEMPT_STATES) == {"needs_payment_method", "awaiting_authorization"}
     assert "paying" not in ledger.EXPIRE_SOURCE_STATES  # money may be moving
+    # the outer WHERE restates the subquery's predicate: that repetition is the race guard
+    assert ledger.EXPIRE_CANDIDATE_STATES == ledger.EXPIRE_SOURCE_STATES
+    def outer(sql):  # what follows the subquery: the conjuncts a blocked UPDATE re-checks
+        return sql[sql.index(")", sql.index("LIMIT :limit")):]
+
+    for sql in (ledger._EXPIRE_SQL, ledger._EXPIRE_SQL_SQLITE):
+        assert "pending_write IS NULL" in outer(sql) and "AND state IN (" in outer(sql)
+    for sql in (ledger._PURGE_CONTACT_SQL, ledger._PURGE_CONTACT_SQL_SQLITE):
+        assert "buyer_email IS NOT NULL OR shipping_address IS NOT NULL" in outer(sql)
+    for sql in (ledger._REQUEUE_STALE_SQL, ledger._REQUEUE_STALE_SQL_SQLITE):
+        assert "claimed_by IS NOT NULL" in outer(sql) and "claimed_at <" in outer(sql)
     assert set(ledger.EXPIRE_SOURCE_STATES) <= {s for s, to in ledger.ALLOWED_TRANSITIONS.items() if "expired" in to}
     assert set(ledger._states_in(ledger._MARK_PENDING_WRITE_SQL, "AND state IN (")) == non_terminal
     assert set(ledger._states_in(ledger._SELECT_DUE_SQL, "WHERE state IN (")) == non_terminal
@@ -213,7 +224,8 @@ async def test_a_terminal_write_leaves_no_pii_page_claim_or_pending_write():
                                       buyer_action_kind="approval", buyer_action_url=PAGE)
     await ledger.mark_pending_write(row["id"], "w1", "payment.token-setup#submit")
     done = await ledger.transition_as_holder(row["id"], "w1", from_states=["awaiting_authorization"],
-                                             to_state="refused", refusal_reason="buyer_declined")
+                                             to_state="refused", refusal_reason="buyer_declined",
+                                             resolves_write="payment.token-setup#submit")
     assert done["state"] == "refused" and done["terminal_at"] is not None
     for column in ("buyer_email", "shipping_address", "buyer_action_url", "buyer_action_kind",
                    "claimed_by", "claimed_at", "pending_write", "pending_write_at"):
@@ -234,6 +246,54 @@ async def test_a_write_is_recorded_before_it_is_sent_and_one_at_a_time():
     assert await ledger.clear_pending_write(row["id"], "w1", "shop.quote#confirm") is None  # not that one
     assert await ledger.clear_pending_write(row["id"], "w2", "shop.cart#submit") is None    # not the holder
     assert (await ledger.clear_pending_write(row["id"], "w1", "shop.cart#submit"))["pending_write"] is None
+
+
+async def test_a_pending_write_blocks_every_transition_that_does_not_resolve_it():
+    """A worker that gives up ("rail unreachable -> failed") must not erase the only evidence that
+    a charge may be in flight: until a transition names the write it has the answer for, it is a
+    lost race."""
+    pid = await _in_state("paying")
+    await _claimed({"id": pid})
+    await ledger.mark_pending_write(pid, "w1", "shop.order-detail#pay")
+    for resolves in (None, "shop.quote#confirm"):
+        assert await ledger.transition_as_holder(pid, "w1", from_states=["paying"], to_state="failed",
+                                                 last_error_code="rail_unreachable", resolves_write=resolves) is None
+    row = await ledger.get_purchase_internal(pid)
+    assert (row["state"], row["pending_write"]) == ("paying", "shop.order-detail#pay")
+    done = await ledger.transition_as_holder(pid, "w1", from_states=["paying"], to_state="completed",
+                                             merchant_order_id="1001", resolves_write="shop.order-detail#pay")
+    assert done["state"] == "completed" and done["pending_write"] is None
+
+
+async def test_a_transition_leaves_the_schedule_alone_and_does_not_keep_a_stale_error():
+    row = await _open()
+    await _claimed(row)
+    later = datetime.now(timezone.utc) + timedelta(hours=2)
+    await ledger.release_claim(row["id"], "w1", next_poll_at=later, last_error_code="rail_timeout")
+    await database.execute("UPDATE a2a_rail_purchases SET next_poll_at = datetime('now', '-1 seconds')")
+    await _claimed(row)
+    before = await ledger.get_purchase_internal(row["id"])
+    moved = await ledger.transition_as_holder(row["id"], "w1", from_states=["opened"], to_state="quoting")
+    assert moved["next_poll_at"] == before["next_poll_at"]
+    assert moved["last_error_code"] is None
+
+
+async def test_a_requote_replaces_the_quote_order_and_token_rather_than_keeping_them():
+    pid = await _in_state("awaiting_authorization", quote_id="q_1", quoted_total_minor=4650,
+                          buyer_action_kind="approval", buyer_action_url=PAGE)
+    await _claimed({"id": pid})
+    row = await ledger.get_purchase_internal(pid)
+    assert row["quote_id"] == "q_1"
+    await database.execute("UPDATE a2a_rail_purchases SET order_id = 'o_1', payment_token_id = 'ptk_1' WHERE id = :i",
+                           {"i": pid})
+    requoted = await ledger.transition_as_holder(pid, "w1", from_states=["awaiting_authorization"], to_state="quoting",
+                                                 last_error_code="price_changed")
+    for column in ("quote_id", "quoted_total_minor", "order_id", "payment_token_id", "buyer_action_url"):
+        assert requoted[column] is None, column
+    again = await ledger.transition_as_holder(pid, "w1", from_states=["quoting"], to_state="awaiting_authorization",
+                                              quote_id="q_2", quoted_total_minor=4900,
+                                              buyer_action_kind="approval", buyer_action_url=PAGE)
+    assert (again["quote_id"], again["quoted_total_minor"]) == ("q_2", 4900)
 
 
 async def test_a_dead_workers_unseen_write_survives_the_requeue():
@@ -275,6 +335,25 @@ async def test_the_claim_itself_refuses_a_purchase_that_is_not_due():
     assert got is None
 
 
+async def test_the_claim_itself_refuses_a_purchase_another_worker_holds():
+    row = await _open()
+    await _claimed(row)
+    got = await database.fetch_one(ledger._CLAIM_SQL_SQLITE, {"id": row["id"], "worker_id": "w2"})
+    assert got is None
+
+
+async def test_release_and_requeue_never_reset_the_expiry_clock():
+    row = await _open()
+    await _claimed(row)
+    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = '2001-01-01 00:00:00'")
+    await ledger.release_claim(row["id"], "w1", last_error_code="x")
+    await _claimed(row)
+    await database.execute("UPDATE a2a_rail_purchases SET claimed_at = datetime('now', '-600 seconds')")
+    await ledger.requeue_stale_claims(lease_seconds=300)
+    after = await ledger.get_purchase_internal(row["id"])
+    assert after["state_entered_at"].year == 2001
+
+
 async def test_a_terminal_purchase_is_never_claimed():
     row = await _open()
     await _claimed(row)
@@ -306,16 +385,54 @@ async def test_expiry_ends_a_dead_buyer_page_and_a_stale_wait_but_never_paying_o
                                 buyer_action_url=PAGE, buyer_action_expires_at=PAST)
     stale = await _in_state("quoting")
     paying = await _in_state("paying")
+    never_picked_up = (await _open())["id"]
     unseen = await _in_state("quoting")
     await _claimed({"id": unseen})
     assert (await ledger.mark_pending_write(unseen, "w1", "shop.quote#confirm"))["pending_write"]
     await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = datetime('now', '-3 days')")
-    assert await ledger.expire_overdue_purchases(max_age_seconds=86400) == 2
+    assert await ledger.expire_overdue_purchases(max_age_seconds=86400) == 3
     rows = {r["id"]: r for r in await database.fetch_all("SELECT * FROM a2a_rail_purchases")}
+    assert rows[never_picked_up]["state"] == "expired" and rows[never_picked_up]["buyer_email"] is None
     assert (rows[dead_page]["state"], rows[dead_page]["last_error_code"]) == ("expired", "buyer_action_expired")
     assert (rows[stale]["state"], rows[stale]["last_error_code"]) == ("expired", "stale")
     assert rows[paying]["state"] == "paying" and rows[unseen]["state"] == "quoting"
     assert rows[stale]["buyer_email"] is None and rows[stale]["shipping_address"] is None
+
+
+async def test_contact_is_purged_after_retention_whatever_the_state():
+    paying = await _in_state("paying")
+    fresh = (await _open())["id"]
+    await database.execute("UPDATE a2a_rail_purchases SET created_at = datetime('now', '-4 days') WHERE id = :i",
+                           {"i": paying})
+    assert await ledger.purge_stale_contact(max_age_seconds=3 * 86400) == 1
+    rows = {r["id"]: r for r in await database.fetch_all("SELECT * FROM a2a_rail_purchases")}
+    assert rows[paying]["state"] == "paying"
+    assert rows[paying]["buyer_email"] is None and rows[paying]["shipping_address"] is None
+    assert rows[paying]["contact_purged_at"] is not None
+    assert rows[fresh]["buyer_email"] == EMAIL
+
+
+async def test_a_merchant_challenge_while_paying_reaches_the_buyer_without_leaving_paying():
+    pid = await _in_state("paying")
+    assert await ledger.set_payment_challenge(pid, "w1", url=PAGE, expires_at=FUTURE) is None  # not held
+    await _claimed({"id": pid})
+    challenged = await ledger.set_payment_challenge(pid, "w1", url=PAGE, expires_at=FUTURE)
+    assert (challenged["state"], challenged["buyer_action_kind"]) == ("paying", "authenticate")
+    assert view.build_view(challenged)["hosted_url"] == PAGE
+    cleared = await ledger.set_payment_challenge(pid, "w1", url=None)
+    assert cleared["buyer_action_url"] is None and "hosted_url" not in view.build_view(cleared)
+    with pytest.raises(ValueError):
+        await ledger.set_payment_challenge(pid, "w1", url="http://pay.rail.test/x")
+    other = await _in_state("quoting")
+    await _claimed({"id": other})
+    assert await ledger.set_payment_challenge(other, "w1", url=PAGE) is None  # only while paying
+
+
+@pytest.mark.parametrize("url", ["https://", "https:///path", "https://brand.example/a\nb", "https://brand.example/ a",
+                                 "https://brand.example/\x00"])
+async def test_a_url_without_a_host_or_with_control_characters_is_refused(url):
+    with pytest.raises(ValueError):
+        await _open(checkout_url=url)
 
 
 # ── the agent view ───────────────────────────────────────────────────────────────────────────
@@ -348,12 +465,16 @@ def test_the_page_host_allowlist_includes_the_transport_hosts_and_the_configured
     assert view.hosted_url_is_allowed(PAGE)
     assert not view.hosted_url_is_allowed("https://u@pay.rail.test/x")
     assert not view.hosted_url_is_allowed("http://pay.rail.test/x")
+    assert not view.hosted_url_is_allowed("https://pay.rail.test:8443/x")
+    assert view.hosted_url_is_allowed("https://pay.rail.test:443/x")
 
 
 @pytest.mark.parametrize("url,ok", [
     ("https://brand.example/orders/1", True), ("https://shop.brand.example/o/1", True),
-    ("https://brand.myshopify.com/o/1", True), ("https://evil.example/o/1", False),
+    ("https://brand.myshopify.com/o/1", False), ("https://attacker.myshopify.com/o/1", False),
+    ("https://checkout.shopify.com/o/1", False), ("https://evil.example/o/1", False),
     ("http://brand.example/o/1", False), ("https://notbrand.example/o/1", False),
+    ("https://brand.example:8443/o/1", False),
 ])
 def test_the_order_status_page_must_be_the_merchants(url, ok):
     assert view.merchant_order_url_is_allowed(url, "brand.example") is ok
@@ -426,6 +547,10 @@ async def test_the_route_reads_an_ap_id_and_heals_its_parent(monkeypatch):
             assert by_parent.status_code == 200 and by_parent.json()["rail_purchase_id"] == row["id"]
             listed = await http.get("/agent/v2/commerce/purchases")
             assert [p["rail_purchase_id"] for p in listed.json()["purchases"]] == [row["id"]]
+            # a purchase whose parent write never happened is still in the owner's history
+            orphan = await _open(owner=owner)
+            listed = await http.get("/agent/v2/commerce/purchases")
+            assert {p["rail_purchase_id"] for p in listed.json()["purchases"]} == {row["id"], orphan["id"]}
             _Caller.agent_user_ref = "user-grace"
             assert (await http.get(f"/agent/v2/commerce/purchases/{row['id']}")).status_code == 404
             # another user's id never gets a parent written for it, even before its owner reads it

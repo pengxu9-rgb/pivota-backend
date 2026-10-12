@@ -125,6 +125,50 @@ async def test_the_sqlite_heal_rebuilds_a_table_with_the_narrow_check_and_keeps_
     assert {"uq_agent_purchases_rail_purchase", "idx_agent_purchases_owner"} <= indexes
 
 
+async def _narrow_table_with_a_row():
+    await database.execute("DROP TABLE IF EXISTS agent_purchases")
+    await database.execute("DROP TABLE IF EXISTS agent_purchases_pre267")
+    await database.execute(purchases._CREATE_TABLE_SQLITE.replace("('reap', 'a2a')", "('reap')"))
+    await database.execute(purchases._CREATE_RAIL_INDEX)
+    await database.execute(
+        "INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id) VALUES ('pp_x', 'reap', 'rail_managed', 'rp_x')"
+    )
+
+
+async def _assert_rebuilt():
+    rows = {r["id"] for r in await database.fetch_all("SELECT id FROM agent_purchases")}
+    assert rows == {"pp_x"}
+    tables = {r["name"] for r in await database.fetch_all("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert "agent_purchases_pre267" not in tables
+    indexes = {r["name"] for r in await database.fetch_all("PRAGMA index_list(agent_purchases)")}
+    assert {"uq_agent_purchases_rail_purchase", "idx_agent_purchases_owner"} <= indexes
+    assert await purchases.ensure_reap_parent("rp_missing") is None  # ON CONFLICT target exists again
+
+
+async def test_a_rebuild_interrupted_after_the_rename_is_finished_on_the_next_boot():
+    await _narrow_table_with_a_row()
+    await database.execute(purchases._SQLITE_RENAME_OLD)  # ...and the process died here
+    await purchases.ensure_agent_purchase_schema()
+    await _assert_rebuilt()
+
+
+async def test_a_rebuild_interrupted_after_the_create_is_finished_on_the_next_boot():
+    await _narrow_table_with_a_row()
+    await database.execute(purchases._SQLITE_RENAME_OLD)
+    await database.execute(purchases._CREATE_TABLE_SQLITE)  # ...and the process died here
+    await purchases.ensure_agent_purchase_schema()
+    await _assert_rebuilt()
+
+
+async def test_a_rebuild_interrupted_after_the_copy_is_finished_on_the_next_boot():
+    await _narrow_table_with_a_row()
+    await database.execute(purchases._SQLITE_RENAME_OLD)
+    await database.execute(purchases._CREATE_TABLE_SQLITE)
+    await database.execute(purchases._SQLITE_COPY_OLD)  # ...and the process died here
+    await purchases.ensure_agent_purchase_schema()
+    await _assert_rebuilt()
+
+
 async def test_the_self_heal_builds_the_table_on_sqlite():
     columns = {r["name"] for r in await database.fetch_all("PRAGMA table_info(agent_purchases)")}
     assert columns == {

@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS a2a_rail_purchases (
     claimed_at TIMESTAMPTZ,
     buyer_email TEXT,
     shipping_address JSONB,
+    contact_purged_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     state_entered_at TIMESTAMPTZ NOT NULL DEFAULT now(),

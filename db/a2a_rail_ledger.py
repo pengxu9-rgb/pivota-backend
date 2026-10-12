@@ -21,7 +21,13 @@ rail: no client, no route, no worker. Those call the shapes exported here.
   terminal: completed | failed | refused | expired
 
 `paying` is the only state in which money may be moving, so it is the only state no sweep may
-expire: it ends only on the rail's own answer (completed / failed), read by the worker.
+expire: it ends only on the rail's own answer (completed / failed), read by the worker. There is no
+`awaiting_authorization -> completed` edge (Reap has one): every completion passes through `paying`,
+where the pay write-ahead lives. A merchant challenge (3DS) during `paying` is a buyer page set with
+`set_payment_challenge`, without leaving the state. `attempts` counts every claim outside the two
+buyer states, `paying` included: a worker must never end `paying` on an attempts cap (money may be
+moving); only the rail's answer ends it. A re-quote (`awaiting_authorization -> quoting`) replaces the
+quote, order and token fields rather than keeping the stale ones.
 
 ── WRITE-AHEAD, BECAUSE THE RAIL CANNOT DEDUPLICATE (YET) ────────────────────────────────────
 
@@ -29,8 +35,13 @@ The rail mints its own idempotency key per call, so a write resent after a timeo
 Before any call that may change state on the rail, the worker records `pending_write` (the action)
 under its claim; it clears it only on a definite answer. A row found with `pending_write` set had a
 write whose outcome nobody saw: the next worker must READ the rail's state before it may send any
-other write. `mark_pending_write` / `clear_pending_write` are fenced on the claim like every worker
-write here.
+other write. The ledger enforces that, not only documents it:
+  - `mark_pending_write` refuses a second write while one is pending;
+  - `transition_as_holder` refuses to move a row with a pending write unless it names that write in
+    `resolves_write` (its outcome is known: answered, or read back from the rail). So a worker that
+    gives up ("rail unreachable -> failed") cannot erase the only evidence that a charge may be in
+    flight: its transition returns None, like any lost race;
+  - the expiry sweep never touches a row with a pending write, and the requeue keeps it.
 
 ── PROPERTIES OF THIS DRIVER (see db/reap_agentic_ledger.py, the same six apply) ────────────────
 
@@ -71,10 +82,11 @@ TERMINAL_STATES: FrozenSet[str] = frozenset({"completed", "failed", "refused", "
 #: THE ONE MAP. `transition` refuses an illegal pair before any SQL runs. A terminal state maps to
 #: the empty set: "exists and permits nothing", not "unknown".
 ALLOWED_TRANSITIONS: Dict[str, FrozenSet[str]] = {
-    "opened": frozenset({"needs_payment_method", "quoting", "refused", "failed"}),
+    "opened": frozenset({"needs_payment_method", "quoting", "refused", "failed", "expired"}),
     "needs_payment_method": frozenset({"quoting", "expired", "failed"}),
     "quoting": frozenset({"awaiting_authorization", "refused", "failed", "expired"}),
-    "awaiting_authorization": frozenset({"paying", "refused", "failed", "expired"}),
+    # -> quoting: a re-quote (the merchant's price changed) BEFORE any pay was sent.
+    "awaiting_authorization": frozenset({"paying", "quoting", "refused", "failed", "expired"}),
     # Money may be moving: only the rail's own answer ends it. No expiry, no refusal after the fact.
     "paying": frozenset({"completed", "failed"}),
     "completed": frozenset(),
@@ -171,6 +183,7 @@ CREATE TABLE IF NOT EXISTS a2a_rail_purchases (
     claimed_at TIMESTAMPTZ,
     buyer_email TEXT,
     shipping_address JSONB,
+    contact_purged_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     state_entered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -208,7 +221,7 @@ async def ensure_a2a_rail_schema() -> None:
 # ── row decoding ─────────────────────────────────────────────────────────────────────────────
 
 _TS_COLUMNS = (
-    "consented_at", "buyer_action_expires_at", "pending_write_at", "next_poll_at", "claimed_at",
+    "contact_purged_at", "consented_at", "buyer_action_expires_at", "pending_write_at", "next_poll_at", "claimed_at",
     "created_at", "updated_at", "state_entered_at", "terminal_at",
 )
 
@@ -242,8 +255,12 @@ def _require_https_url(value: Any, name: str, *, required: bool) -> Optional[str
     if value is None and not required:
         return None
     text = str(value or "").strip()
-    if not text.startswith("https://") or "@" in text.split("/", 3)[2] or len(text) > 2048:
-        raise ValueError(f"{name} must be an https URL without credentials")
+    authority = text.split("/", 3)[2] if text.startswith("https://") else ""
+    if (
+        not authority or "@" in authority or len(text) > 2048
+        or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text)
+    ):
+        raise ValueError(f"{name} must be an https URL with a host, no credentials and no control characters")
     return text
 
 
@@ -416,18 +433,27 @@ _FROM_SLOTS = 9
 
 # A transition is one statement. The buyer page is replaced or cleared on EVERY transition (a page
 # belongs to the state that issued it, so a new state never inherits the old state's link), and
-# every terminal write NULLs the PII, the page, the pending write and the claim.
+# every terminal write NULLs the PII, the page, the pending write and the claim. `last_error_code` is
+# replaced, not kept (a transient code from an earlier release must not ride into a healthy state),
+# and `next_poll_at` is left alone unless given (scheduling belongs to `release_claim`). A pending write
+# blocks the transition unless `resolves_write` names it.
 _TRANSITION_SQL = """
     UPDATE a2a_rail_purchases
        SET state = :to_state,
            payment_method_id = COALESCE(:payment_method_id, payment_method_id),
-           payment_token_id = COALESCE(:payment_token_id, payment_token_id),
-           quote_id = COALESCE(:quote_id, quote_id),
-           order_id = COALESCE(:order_id, order_id),
-           quoted_total_minor = COALESCE(:quoted_total_minor, quoted_total_minor),
+           payment_token_id = CASE WHEN :to_state_probe = 'quoting'
+                THEN CAST(:payment_token_id AS TEXT) ELSE COALESCE(:payment_token_id, payment_token_id) END,
+           quote_id = CASE WHEN :to_state_probe = 'quoting'
+                THEN CAST(:quote_id AS TEXT) ELSE COALESCE(:quote_id, quote_id) END,
+           order_id = CASE WHEN :to_state_probe = 'quoting'
+                THEN CAST(:order_id AS TEXT) ELSE COALESCE(:order_id, order_id) END,
+           quoted_total_minor = CASE WHEN :to_state_probe = 'quoting'
+                THEN CAST(:quoted_total_minor AS BIGINT) ELSE COALESCE(:quoted_total_minor, quoted_total_minor) END,
            final_total_minor = COALESCE(:final_total_minor, final_total_minor),
-           shipping_minor = COALESCE(:shipping_minor, shipping_minor),
-           tax_minor = COALESCE(:tax_minor, tax_minor),
+           shipping_minor = CASE WHEN :to_state_probe = 'quoting'
+                THEN CAST(:shipping_minor AS BIGINT) ELSE COALESCE(:shipping_minor, shipping_minor) END,
+           tax_minor = CASE WHEN :to_state_probe = 'quoting'
+                THEN CAST(:tax_minor AS BIGINT) ELSE COALESCE(:tax_minor, tax_minor) END,
            buyer_action_kind = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
                 THEN NULL ELSE CAST(:buyer_action_kind AS TEXT) END,
            buyer_action_url = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
@@ -437,9 +463,8 @@ _TRANSITION_SQL = """
            merchant_order_id = COALESCE(:merchant_order_id, merchant_order_id),
            merchant_order_status_url = COALESCE(:merchant_order_status_url, merchant_order_status_url),
            refusal_reason = COALESCE(:refusal_reason, refusal_reason),
-           last_error_code = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
-                THEN :last_error_code ELSE COALESCE(:last_error_code, last_error_code) END,
-           next_poll_at = COALESCE(:next_poll_at, clock_timestamp()),
+           last_error_code = :last_error_code,
+           next_poll_at = COALESCE(:next_poll_at, next_poll_at),
            pending_write = NULL,
            pending_write_at = NULL,
            buyer_email = CASE WHEN :to_state_probe IN ('completed', 'failed', 'refused', 'expired')
@@ -457,6 +482,7 @@ _TRANSITION_SQL = """
      WHERE id = :id
        AND state IN (:from_0, :from_1, :from_2, :from_3, :from_4, :from_5, :from_6, :from_7, :from_8)
        AND claimed_by = :holder
+       AND (pending_write IS NULL OR pending_write = :resolves_write)
     RETURNING *
 """
 # SQLite must not see CAST(... AS TIMESTAMPTZ): an unknown type name gets NUMERIC affinity and stores
@@ -472,11 +498,12 @@ async def transition_as_holder(
     *,
     from_states: Iterable[str],
     to_state: str,
+    resolves_write: Optional[str] = None,
     **fields: Any,
 ) -> Optional[Dict[str, Any]]:
     """Advance a purchase the worker holds, atomically. Returns the new row, or None when the row
-    is not in `from_states` or the claim has moved on: a lost race, never an error. Re-read, do not
-    retry the same write.
+    is not in `from_states`, the claim has moved on, or a write is pending that `resolves_write` does
+    not name: a lost race or an unseen outcome, never an error. Re-read, do not retry the same write.
 
     Illegal pairs, unknown fields and malformed values raise before any SQL. The buyer page fields
     are replaced on every transition: pass them for a state that asks the buyer to act, omit them
@@ -513,7 +540,8 @@ async def transition_as_holder(
     values["next_poll_at"] = _bind_dt(values["next_poll_at"])
     padded = sources + [sources[0]] * (_FROM_SLOTS - len(sources))
     values.update({f"from_{i}": state for i, state in enumerate(padded)})
-    values.update({"id": purchase_id, "to_state": to_state, "to_state_probe": to_state, "holder": worker_id})
+    values.update({"id": purchase_id, "to_state": to_state, "to_state_probe": to_state, "holder": worker_id,
+                   "resolves_write": _optional(_ACTION_RE, resolves_write, "resolves_write")})
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_TRANSITION_SQL, values))
     return _purchase(await database.fetch_one(_TRANSITION_SQL_SQLITE, values))
@@ -609,6 +637,11 @@ _RELEASE_SQL = """
 """
 _RELEASE_SQL_SQLITE = _RELEASE_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
 
+# THE OUTER WHERE RESTATES THE SUBQUERY'S PREDICATE, here and in the expiry sweep. Under READ
+# COMMITTED an UPDATE that waited on a row lock re-checks only its OWN qual against the row's new
+# version; `id IN (subquery)` is already decided. Without the restatement a row released and
+# re-claimed meanwhile loses its fresh lease here, and the sweep below expires a row whose worker
+# recorded a pay write while the sweep waited (db/reap_agentic_ledger.py, the same guard).
 _REQUEUE_STALE_SQL = """
     UPDATE a2a_rail_purchases
        SET claimed_by = NULL, claimed_at = NULL, updated_at = clock_timestamp()
@@ -619,6 +652,8 @@ _REQUEUE_STALE_SQL = """
              ORDER BY claimed_at
              LIMIT :limit
            )
+       AND claimed_by IS NOT NULL
+       AND claimed_at < clock_timestamp() - (:lease_seconds * INTERVAL '1 second')
     RETURNING id
 """
 _REQUEUE_STALE_SQL_SQLITE = """
@@ -631,6 +666,8 @@ _REQUEUE_STALE_SQL_SQLITE = """
              ORDER BY claimed_at
              LIMIT :limit
            )
+       AND claimed_by IS NOT NULL
+       AND claimed_at < datetime('now', '-' || :lease_seconds || ' seconds')
     RETURNING id
 """
 
@@ -706,13 +743,15 @@ _EXPIRE_SQL = """
            updated_at = clock_timestamp()
      WHERE id IN (
             SELECT id FROM a2a_rail_purchases
-             WHERE state IN ('needs_payment_method', 'quoting', 'awaiting_authorization')
+             WHERE state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
                AND pending_write IS NULL
                AND ((buyer_action_expires_at IS NOT NULL AND buyer_action_expires_at < clock_timestamp())
                     OR state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second'))
              ORDER BY state_entered_at
              LIMIT :limit
            )
+       AND state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
+       AND pending_write IS NULL
     RETURNING id
 """
 _EXPIRE_SQL_SQLITE = """
@@ -727,16 +766,20 @@ _EXPIRE_SQL_SQLITE = """
            updated_at = CURRENT_TIMESTAMP
      WHERE id IN (
             SELECT id FROM a2a_rail_purchases
-             WHERE state IN ('needs_payment_method', 'quoting', 'awaiting_authorization')
+             WHERE state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
                AND pending_write IS NULL
                AND ((buyer_action_expires_at IS NOT NULL AND buyer_action_expires_at < CURRENT_TIMESTAMP)
                     OR state_entered_at < datetime('now', '-' || :max_age_seconds || ' seconds'))
              ORDER BY state_entered_at
              LIMIT :limit
            )
+       AND state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
+       AND pending_write IS NULL
     RETURNING id
 """
-EXPIRE_SOURCE_STATES = _states_in(_EXPIRE_SQL, "WHERE state IN (")
+#: Read from the OUTER predicate (the race guard); a test holds the inner list equal to it.
+EXPIRE_SOURCE_STATES = _states_in(_EXPIRE_SQL, "AND state IN (")
+EXPIRE_CANDIDATE_STATES = _states_in(_EXPIRE_SQL, "WHERE state IN (")
 MAX_AGE_SECONDS_DEFAULT = 86400
 
 
@@ -747,3 +790,90 @@ async def expire_overdue_purchases(*, max_age_seconds: int = MAX_AGE_SECONDS_DEF
     else:
         rows = await database.fetch_all(_EXPIRE_SQL_SQLITE, values)
     return len(rows)
+
+
+# ── contact retention ────────────────────────────────────────────────────────────────────────
+#
+# The buyer's email and address are needed only until the rail has the cart. Terminal writes NULL
+# them; this purge covers the rest (a row the worker never picked up, a long `paying`), in any state,
+# without moving the state. Restated in the outer WHERE for the same reason as the sweeps above.
+_PURGE_CONTACT_SQL = """
+    UPDATE a2a_rail_purchases
+       SET buyer_email = NULL, shipping_address = NULL, contact_purged_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+     WHERE id IN (
+            SELECT id FROM a2a_rail_purchases
+             WHERE (buyer_email IS NOT NULL OR shipping_address IS NOT NULL)
+               AND created_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+             ORDER BY created_at
+             LIMIT :limit
+           )
+       AND (buyer_email IS NOT NULL OR shipping_address IS NOT NULL)
+    RETURNING id
+"""
+_PURGE_CONTACT_SQL_SQLITE = """
+    UPDATE a2a_rail_purchases
+       SET buyer_email = NULL, shipping_address = NULL, contact_purged_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE id IN (
+            SELECT id FROM a2a_rail_purchases
+             WHERE (buyer_email IS NOT NULL OR shipping_address IS NOT NULL)
+               AND created_at < datetime('now', '-' || :max_age_seconds || ' seconds')
+             ORDER BY created_at
+             LIMIT :limit
+           )
+       AND (buyer_email IS NOT NULL OR shipping_address IS NOT NULL)
+    RETURNING id
+"""
+CONTACT_RETENTION_SECONDS_DEFAULT = 3 * 86400
+
+
+async def purge_stale_contact(*, max_age_seconds: int = CONTACT_RETENTION_SECONDS_DEFAULT, limit: int = 200) -> int:
+    """NULL the email and address of purchases opened more than `max_age_seconds` ago."""
+    values = {"max_age_seconds": max(3600, _limit(max_age_seconds, 30 * 86400)), "limit": _limit(limit, 1000)}
+    if IS_POSTGRES:
+        rows = await database.fetch_all(_PURGE_CONTACT_SQL, values)
+    else:
+        rows = await database.fetch_all(_PURGE_CONTACT_SQL_SQLITE, values)
+    return len(rows)
+
+
+# ── a challenge while paying ─────────────────────────────────────────────────────────────────
+#
+# The merchant may challenge the payment (3DS) while the rail's agent is placing the order. The buyer
+# must open a page, but the purchase stays in `paying`: money may be moving, so it must not go back
+# to a state the sweep can expire. Fenced on the claim and on `paying`.
+_SET_CHALLENGE_SQL = """
+    UPDATE a2a_rail_purchases
+       SET buyer_action_kind = CASE WHEN CAST(:url AS TEXT) IS NULL THEN NULL ELSE 'authenticate' END,
+           buyer_action_url = CAST(:url AS TEXT),
+           buyer_action_expires_at = CAST(:expires_at AS TIMESTAMPTZ),
+           updated_at = clock_timestamp()
+     WHERE id = :id AND claimed_by = :holder AND state = 'paying'
+    RETURNING *
+"""
+_SET_CHALLENGE_SQL_SQLITE = """
+    UPDATE a2a_rail_purchases
+       SET buyer_action_kind = CASE WHEN CAST(:url AS TEXT) IS NULL THEN NULL ELSE 'authenticate' END,
+           buyer_action_url = CAST(:url AS TEXT),
+           buyer_action_expires_at = :expires_at,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE id = :id AND claimed_by = :holder AND state = 'paying'
+    RETURNING *
+"""
+
+
+async def set_payment_challenge(
+    purchase_id: str, worker_id: str, *, url: Optional[str], expires_at: Any = None
+) -> Optional[Dict[str, Any]]:
+    """Show the buyer the merchant's challenge page (`url`), or clear it (`url=None`). None when the
+    worker does not hold the row or it is not `paying`."""
+    values = {
+        "id": purchase_id,
+        "holder": _require(_WORKER_RE, worker_id, "worker_id"),
+        "url": _require_https_url(url, "url", required=False),
+        "expires_at": _bind_dt(expires_at) if url is not None else None,
+    }
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_SET_CHALLENGE_SQL, values))
+    return _purchase(await database.fetch_one(_SET_CHALLENGE_SQL_SQLITE, values))

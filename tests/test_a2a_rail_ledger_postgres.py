@@ -185,3 +185,101 @@ async def test_concurrent_workers_claim_disjoint_purchases():
     batches = await asyncio.gather(*(ledger.claim_due_purchases(f"w{k}", limit=12) for k in range(4)))
     claimed = [r["id"] for batch in batches for r in batch if r["id"] in made]
     assert len(claimed) == len(set(claimed)) == 12
+
+
+async def _stale_awaiting_authorization():
+    from db.database import database
+    import db.a2a_rail_ledger as ledger
+
+    row = await ledger.create_purchase(
+        agent_id=AGENT, agent_user_ref_hash="r" * 64, merchant_domain="brand.example",
+        checkout_url="https://brand.example/cart/1:1", currency="USD", our_price_minor=4650,
+        buyer_email="ada@example.test")
+    [claimed] = await ledger.claim_due_purchases("w1")
+    assert claimed["id"] == row["id"]
+    await ledger.transition_as_holder(row["id"], "w1", from_states=["opened"], to_state="quoting")
+    await ledger.transition_as_holder(row["id"], "w1", from_states=["quoting"], to_state="awaiting_authorization",
+                                      buyer_action_kind="approval", buyer_action_url=PAGE)
+    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = now() - interval '3 days' WHERE id = :i",
+                           {"i": row["id"]})
+    return row["id"]
+
+
+async def test_the_sweep_does_not_expire_a_row_whose_pay_write_was_recorded_while_it_waited():
+    """The race the outer predicate guards (reproduced by review): the sweep's subquery saw the row
+    with no pending write, then blocked on its lock while the worker recorded `pay`. Under READ
+    COMMITTED the woken UPDATE re-checks only its own WHERE."""
+    import asyncpg
+    from db.database import database
+    import db.a2a_rail_ledger as ledger
+
+    pid = await _stale_awaiting_authorization()
+    worker = await asyncpg.connect(DATABASE_URL)
+    try:
+        tx = worker.transaction()
+        await tx.start()
+        await worker.execute(
+            "UPDATE a2a_rail_purchases SET pending_write = 'shop.order-detail#pay', pending_write_at = now() "
+            "WHERE id = $1", pid)
+        sweep = asyncio.ensure_future(ledger.expire_overdue_purchases(max_age_seconds=86400))
+        await asyncio.sleep(0.5)
+        assert not sweep.done()  # blocked on the worker's row lock
+        await tx.commit()
+        assert await asyncio.wait_for(sweep, timeout=10) == 0
+    finally:
+        await worker.close()
+    row = await database.fetch_one("SELECT state, pending_write, buyer_email FROM a2a_rail_purchases WHERE id = :i",
+                                   {"i": pid})
+    assert (row["state"], row["pending_write"], row["buyer_email"]) == (
+        "awaiting_authorization", "shop.order-detail#pay", "ada@example.test")
+
+
+async def test_the_requeue_does_not_strip_a_lease_taken_while_it_waited():
+    import asyncpg
+    from db.database import database
+    import db.a2a_rail_ledger as ledger
+
+    pid = await _stale_awaiting_authorization()
+    await database.execute("UPDATE a2a_rail_purchases SET claimed_at = now() - interval '10 minutes' WHERE id = :i",
+                           {"i": pid})
+    other = await asyncpg.connect(DATABASE_URL)
+    try:
+        tx = other.transaction()
+        await tx.start()
+        await other.execute("UPDATE a2a_rail_purchases SET claimed_by = 'w2', claimed_at = now() WHERE id = $1", pid)
+        requeue = asyncio.ensure_future(ledger.requeue_stale_claims(lease_seconds=300))
+        await asyncio.sleep(0.5)
+        assert not requeue.done()
+        await tx.commit()
+        assert await asyncio.wait_for(requeue, timeout=10) == 0
+    finally:
+        await other.close()
+    row = await database.fetch_one("SELECT claimed_by FROM a2a_rail_purchases WHERE id = :i", {"i": pid})
+    assert row["claimed_by"] == "w2"
+
+
+async def test_the_new_statements_run_with_real_parameters_on_postgres():
+    from db.database import database
+    import db.a2a_rail_ledger as ledger
+
+    pid = await _stale_awaiting_authorization()
+    await ledger.mark_pending_write(pid, "w1", "payment.token-setup#submit")
+    assert await ledger.transition_as_holder(pid, "w1", from_states=["awaiting_authorization"],
+                                             to_state="paying") is None  # unresolved write
+    paying = await ledger.transition_as_holder(pid, "w1", from_states=["awaiting_authorization"], to_state="paying",
+                                               resolves_write="payment.token-setup#submit", quote_id="q_1")
+    assert paying["state"] == "paying" and paying["pending_write"] is None
+    future = datetime.now(timezone.utc) + timedelta(minutes=10)
+    challenged = await ledger.set_payment_challenge(pid, "w1", url=PAGE, expires_at=future)
+    assert challenged["buyer_action_kind"] == "authenticate" and challenged["buyer_action_expires_at"] is not None
+    cleared = await ledger.set_payment_challenge(pid, "w1", url=None)
+    assert cleared["buyer_action_url"] is None and cleared["buyer_action_expires_at"] is None
+    await database.execute("UPDATE a2a_rail_purchases SET created_at = now() - interval '4 days' WHERE id = :i",
+                           {"i": pid})
+    assert await ledger.purge_stale_contact(max_age_seconds=3 * 86400) >= 1
+    row = await ledger.get_purchase_internal(pid)
+    assert row["buyer_email"] is None and row["contact_purged_at"] is not None and row["state"] == "paying"
+    # the re-quote edge with typed NULLs on Postgres
+    other = await _stale_awaiting_authorization()
+    requoted = await ledger.transition_as_holder(other, "w1", from_states=["awaiting_authorization"], to_state="quoting")
+    assert requoted["quote_id"] is None and requoted["quoted_total_minor"] is None

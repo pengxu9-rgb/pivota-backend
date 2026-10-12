@@ -113,15 +113,43 @@ _WIDEN_RAIL_CHECK_PG = """
     ALTER TABLE agent_purchases DROP CONSTRAINT IF EXISTS ck_agent_purchases_rail;
     ALTER TABLE agent_purchases ADD CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap', 'a2a'));
 """
-_SQLITE_TABLE_SQL = "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_purchases'"
+_SQLITE_TABLES_SQL = (
+    "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+    "AND name IN ('agent_purchases', 'agent_purchases_pre267')"
+)
 _SQLITE_RENAME_OLD = "ALTER TABLE agent_purchases RENAME TO agent_purchases_pre267"
 _SQLITE_COPY_OLD = """
-    INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id, agent_id, agent_user_ref_hash,
+    INSERT OR IGNORE INTO agent_purchases (id, rail, executor, rail_purchase_id, agent_id, agent_user_ref_hash,
                                  routing_plan, created_at)
     SELECT id, rail, executor, rail_purchase_id, agent_id, agent_user_ref_hash, routing_plan, created_at
       FROM agent_purchases_pre267
 """
 _SQLITE_DROP_OLD = "DROP TABLE agent_purchases_pre267"
+
+
+async def _sqlite_tables() -> Dict[str, str]:
+    return {str(r["name"]): str(r["sql"]) for r in await database.fetch_all(_SQLITE_TABLES_SQL)}
+
+
+async def _sqlite_widen_rail_check() -> None:
+    """Rebuild a narrow-CHECK table, resumably. The four steps are separate statements, so a crash
+    can stop between any two; every boot first finishes whatever an earlier one left:
+      only `_pre267`           -> crashed after the rename: create, copy, drop;
+      both                     -> crashed after the create or the copy: copy (INSERT OR IGNORE), drop;
+      only a narrow table      -> start: rename, create, copy, drop.
+    The old table is dropped BEFORE the indexes are created: it owns their names until then."""
+    # SQLite only. The early return is also what tells the PREPARE gate the statements below are
+    # SQLite's (INSERT OR IGNORE is not Postgres).
+    if IS_POSTGRES:
+        return
+    tables = await _sqlite_tables()
+    if "agent_purchases" in tables and "'a2a'" not in tables["agent_purchases"] and "agent_purchases_pre267" not in tables:
+        await database.execute(_SQLITE_RENAME_OLD)
+        tables = await _sqlite_tables()
+    await database.execute(_CREATE_TABLE_SQLITE)
+    if "agent_purchases_pre267" in tables:
+        await database.execute(_SQLITE_COPY_OLD)
+        await database.execute(_SQLITE_DROP_OLD)
 
 
 async def ensure_agent_purchase_schema() -> None:
@@ -138,14 +166,7 @@ async def ensure_agent_purchase_schema() -> None:
             _WIDEN_RAIL_CHECK_PG,
         )
     else:
-        row = await database.fetch_one(_SQLITE_TABLE_SQL)
-        if row is not None and "'a2a'" not in str(row["sql"]):
-            await database.execute(_SQLITE_RENAME_OLD)
-            await database.execute(_CREATE_TABLE_SQLITE)
-            await database.execute(_SQLITE_COPY_OLD)
-            await database.execute(_SQLITE_DROP_OLD)
-        else:
-            await database.execute(_CREATE_TABLE_SQLITE)
+        await _sqlite_widen_rail_check()
     await database.execute(_CREATE_RAIL_INDEX)
     await database.execute(_CREATE_OWNER_INDEX)
 
@@ -306,6 +327,37 @@ async def backfill_reap_parents(*, limit: int = 500) -> int:
     )
     for row in rows:
         await ensure_reap_parent(row["id"], basis="backfill")
+    return len(rows)
+
+
+_SELECT_A2A_MISSING_PARENTS_FOR_OWNER_SQL = """
+    SELECT r.id
+      FROM a2a_rail_purchases r
+     WHERE r.agent_id = :agent_id
+       AND r.agent_user_ref_hash = :agent_user_ref_hash
+       AND NOT EXISTS (
+            SELECT 1 FROM agent_purchases p
+             WHERE p.rail = 'a2a' AND p.rail_purchase_id = r.id
+           )
+     ORDER BY r.created_at DESC, r.id DESC
+     LIMIT :limit
+"""
+
+
+async def heal_a2a_parents_for_owner(
+    agent_id: str, agent_user_ref_hash: str, *, limit: int = 100
+) -> int:
+    """The owner-scoped heal for the A2A token rail, newest first (see `heal_reap_parents_for_owner`)."""
+    rows = await database.fetch_all(
+        _SELECT_A2A_MISSING_PARENTS_FOR_OWNER_SQL,
+        {
+            "agent_id": agent_id,
+            "agent_user_ref_hash": agent_user_ref_hash,
+            "limit": _clamp(limit, maximum=500),
+        },
+    )
+    for row in rows:
+        await ensure_a2a_parent(row["id"], basis="backfill")
     return len(rows)
 
 

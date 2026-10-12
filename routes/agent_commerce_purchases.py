@@ -1,10 +1,8 @@
 """`/agent/v2/commerce/purchases`: the rail-neutral purchase read (payment orchestration P0).
 
 One id (`pp_…`) and one state vocabulary for a purchase on any payment rail, with the rail's own
-owner-facing body nested under `detail` exactly as the rail's route returns it. Reap is the only
-rail today; a Reap id (`rp_…`) is accepted too, so a caller holding the id from
-`POST /agent/v2/commerce/reap/purchases` can read the unified view without a lookup. An A2A-rail id
-(`ap_…`) is accepted the same way.
+owner-facing body nested under `detail`. Two rails: Reap and the A2A token rail. A rail's own id
+(`rp_…`, `ap_…`) is accepted too, so a caller holding it can read the unified view without a lookup.
 
 READ-ONLY, AND DARK BY DEFAULT. Nothing here creates, advances or pays for a purchase, and
 nothing calls a rail. While `AGENT_PURCHASE_LEDGER_ENABLED` is off every request answers the
@@ -155,10 +153,11 @@ async def list_purchases(
     # This owner's Reap purchases that predate the ledger (or whose post-commit write failed)
     # get their parent now, so the first page is complete. A failure here only means the page
     # may miss rows the backfill will add; it never fails the read.
-    try:
-        await purchases.heal_reap_parents_for_owner(agent_id, owner)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("agent_purchases: owner heal failed error_type=%s", type(exc).__name__)
+    for heal in (purchases.heal_reap_parents_for_owner, purchases.heal_a2a_parents_for_owner):
+        try:
+            await heal(agent_id, owner)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent_purchases: owner heal failed error_type=%s", type(exc).__name__)
 
     try:
         parents = await purchases.list_for_owner(agent_id, owner, limit=limit)
