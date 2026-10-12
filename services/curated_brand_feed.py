@@ -974,9 +974,14 @@ _HTML_ELEMENTS = frozenset(
 # AFTER the tag pass, so a literal "<br>" reached the description. Strip, unescape, and strip
 # again, for up to this many layers of escaping; a last pass drops what is left.
 _UNESCAPE_ROUNDS = 3
-_INLINE_MARK = "\x00"     # an inline tag was removed here; `_inline_gap` decides space or nothing
+_INLINE_MARK = "\x00"     # an inline OPENING tag was removed here; `_inline_gap` decides space or nothing
+_INLINE_CLOSE_MARK = "\x02"  # an inline CLOSING tag was removed here
 _ATTACHED_MARK = "\x01"   # a sub/sup tag was removed here; always nothing
-_MARK_RUN_RE = re.compile(r"[\x00\x01]+")
+_MARKS = _INLINE_MARK + _INLINE_CLOSE_MARK + _ATTACHED_MARK
+_MARK_RUN_RE = re.compile(r"[\x00\x01\x02]+")
+_PREV_FRAGMENT_RE = re.compile(r"[^\s\x00\x01\x02]*$")
+_NEXT_FRAGMENT_RE = re.compile(r"[^\s\x00\x01\x02]*")
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff66-\uff9f]")
 
 
 def _tag_replacement(m: "re.Match[str]") -> str:
@@ -985,7 +990,7 @@ def _tag_replacement(m: "re.Match[str]") -> str:
     if tag in _ATTACHED_TAGS:
         return _ATTACHED_MARK
     if tag in _INLINE_TAGS:
-        return _INLINE_MARK
+        return _INLINE_CLOSE_MARK if re.match(r"<\s*/", m.group(0)) else _INLINE_MARK
     return "\n"
 
 
@@ -999,19 +1004,22 @@ def _escaped_tag_replacement(m: "re.Match[str]") -> str:
 def _is_symbol(ch: str) -> bool:
     # & and dashes, math and other symbols ("<b>Vegan</b>&amp;<b>Cruelty free</b>",
     # "<strong>Benefits</strong>– hydrates", a decorative ✨). Not currency: "$<b>20</b>".
-    return ch == "&" or unicodedata.category(ch) in {"Sm", "Sk", "So", "Pd"}
+    # The ASCII hyphen is not one: it joins a compound ("Long<b>-</b>wear", "Non<b>-comedogenic</b>").
+    return ch == "&" or (ch != "-" and unicodedata.category(ch) in {"Sm", "Sk", "So", "Pd"})
 
 
 def _inline_gap(m: "re.Match[str]") -> str:
     """Space or nothing where inline tags were removed. Joined where the two sides continue one
     word -- "D|ue" (a drop cap), "hydra|ting", "10:|30", "$1,|000", CJK -- and spaced where a
     theme relied on the tags to separate them: "Size|50ml", "Skin type|All", "Vegan|Cruelty-free",
-    "Size:|50ml", "Vegan|&|Cruelty free"."""
-    if _ATTACHED_MARK in m.group(0):
+    "Size:|50ml", "Vegan|&|Cruelty free", "10%|Niacinamide", and between two sibling
+    elements that each hold a word: "<span>Vegan</span><span>cruelty-free</span>"."""
+    run = m.group(0)
+    if _ATTACHED_MARK in run:
         return ""
     s, i, j = m.string, m.start(), m.end()
     # The characters around the run, reading past any OTHER mark runs ("Vegan|,|Cruelty").
-    before = s[max(0, i - 8):i].replace(_INLINE_MARK, "").replace(_ATTACHED_MARK, "")
+    before = "".join(c for c in s[max(0, i - 8):i] if c not in _MARKS)
     prev = before[-1:]
     prev2 = before[-2:-1]
     nxt = s[j] if j < len(s) else ""
@@ -1023,8 +1031,18 @@ def _inline_gap(m: "re.Match[str]") -> str:
         return " "
     if (prev.isalpha() and nxt.isdigit()) or (prev.isdigit() and nxt.isalpha()):
         return " "
-    if _is_symbol(prev) or _is_symbol(nxt):
+    if _is_symbol(prev) or _is_symbol(nxt) or (prev == "%" and nxt.isalpha()):
         return " "
+    # Sibling elements -- one closes, the next opens -- each holding a word of 2+ letters. A
+    # per-letter span run ("<span>G</span><span>l</span>...", gradient text) stays joined, as
+    # does CJK, which is written without spaces.
+    close = run.find(_INLINE_CLOSE_MARK)
+    if close != -1 and _INLINE_MARK in run[close:] and prev.isalpha() and nxt.isalpha():
+        prev_frag = _PREV_FRAGMENT_RE.search(s[max(0, i - 40):i]).group(0)
+        next_frag = _NEXT_FRAGMENT_RE.match(s, j, j + 40).group(0)
+        if (len(prev_frag) >= 2 and len(next_frag) >= 2
+                and not _CJK_RE.search(prev) and not _CJK_RE.search(nxt)):
+            return " "
     return ""
 
 
@@ -1064,18 +1082,24 @@ def _split_sentences(block: str) -> List[str]:
 #
 # A matched SENTENCE (it ends in sentence punctuation) is dropped whole, up to
 # _BOILERPLATE_MAX_UNIT_LEN. A run with no sentence punctuation -- a banner, a list item, an
-# unpunctuated CJK block -- is dropped only when the WHOLE run is boilerplate: at most
-# _BOILERPLATE_MAX_RESIDUAL_WORDS words are left once the rule's matches and filler words are
-# taken out. "NOW ON SALE 25% OFF" goes; "Hydrating serum for all skin types with free shipping
-# included in the gift set edition" stays.
+# unpunctuated CJK block -- is dropped only when the WHOLE run is boilerplate: the matches cover at
+# least _BOILERPLATE_MIN_COVERAGE of its non-space characters, or at most
+# _BOILERPLATE_MAX_RESIDUAL_WORDS word is left once the matches and filler words are taken out
+# (each CJK character counts as a word: CJK is written without spaces). "NOW ON SALE 25% OFF" and
+# "Use code GLOW20 at checkout" go; "Cruelty-free, vegan, free shipping", "Hydrating Serum 50ml
+# Free Shipping" and a CJK sentence beside a URL stay.
 _BOILERPLATE_MAX_UNIT_LEN = 400
-_BOILERPLATE_MAX_RESIDUAL_WORDS = 3
+_BOILERPLATE_MIN_COVERAGE = 0.7
+_BOILERPLATE_MAX_RESIDUAL_WORDS = 1
+_RESIDUAL_TOKEN_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff66-\uff9f]"
+    r"|[^\W_\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff66-\uff9f]+")
 _BOILERPLATE_FILLER = frozenset(
     "a an the and or of to in on at by for from with is are be will may your our we you this that "
     "it its all any due please note".split())
 _CURRENCY = r"[$£€]"
 _SHIP_CONTEXT = r"(?i)\b(?:ship(?:s|ped|ping)?|deliver(?:y|ed|ies)?|dispatch(?:ed)?|orders?|carriers?|courier|mail(?:ed)?|transit|process(?:ed|ing)?|arrive)\b"
-_SALE_CONTEXT = (r"(?i)\b(?:sale|sitewide|site-wide|storewide|store-wide|everything|checkout|orders?|"
+_SALE_CONTEXT = (r"(?i)\b(?:sale|sitewide|site-wide|storewide|store-wide|checkout|orders?|subscri\w*|"
                  r"promo|coupon|discount|today\s+only|ends|limited[- ]time)\b")
 _PLATFORM = r"(?:instagram|tiktok|facebook|youtube|pinterest|twitter)"
 
@@ -1086,7 +1110,8 @@ def _rules(*rules: Sequence[str]) -> Tuple[Tuple["re.Pattern[str]", ...], ...]:
 
 _BOILERPLATE_CLASSES: Tuple[Tuple[str, Tuple[Tuple["re.Pattern[str]", ...], ...]], ...] = (
     ("shipping_returns_policy", _rules(
-        (r"(?i)\bfree\s+(?:shipping|delivery)\b(?!\s+(?:kit|set|bundle|edition|collection)\b)",),
+        (r"(?i)\bfree\s+(?:shipping|delivery)\b(?!\s+(?:kit|set|bundle|edition|collection)\b)"
+         rf"(?:\s+(?:on\s+)?(?:all\s+)?(?:orders?\s+)?(?:over|above)\s+{_CURRENCY}?\d+)?",),
         (r"(?i)\b(?:standard|express|expedited|international|domestic|ground|overnight|flat[- ]rate)\s+shipping\b",),
         (r"(?i)\b(?:shipping|returns?|refunds?|exchanges?|delivery)\s+polic(?:y|ies)\b",),
         (r"(?i)\bshipping\s+(?:times?|rates?|fees?|costs?|restrictions?|charges?)\b",),
@@ -1097,7 +1122,8 @@ _BOILERPLATE_CLASSES: Tuple[Tuple[str, Tuple[Tuple["re.Pattern[str]", ...], ...]
         (r"(?i)\bfinal\s+sale\b(?!\s+of\b)",),
         (r"(?i)\b(?:returns?|exchanges?|refunds?)\s+(?:are|is)\s+not\s+(?:accepted|possible|available|offered)\b",),
         (r"(?i)\b(?:cannot|can\s*not|can't|unable\s+to)\s+(?:be\s+)?(?:ship(?:ped)?|return(?:ed)?|refund(?:ed)?|exchang(?:e|ed))\b",),
-        (r"(?i)\b(?:hazardous\s+(?:materials?|goods|items?)|hazmat|dangerous\s+goods)\b", _SHIP_CONTEXT),
+        (r"(?i)(?<!\bno\s)(?<!\bfree\sof\s)\b(?:hazardous\s+(?:materials?|goods|items?)|hazmat|dangerous\s+goods)\b",
+         _SHIP_CONTEXT),
         (rf"(?i)\borders?\s+(?:over|above)\s+{_CURRENCY}?\d+",),
     )),
     ("promo_code", _rules(
@@ -1122,14 +1148,14 @@ _BOILERPLATE_CLASSES: Tuple[Tuple[str, Tuple[Tuple["re.Pattern[str]", ...], ...]
         (r"(?i)\bnow\s+on\s+sale\b",),
         (r"(?i)\bon\s+sale\s+(?:now|today|this\s+week|until|through|for\s+a\s+limited)\b",),
         (r"(?i)\b\d{1,3}\s*%\s*off\b", _SALE_CONTEXT),
-        (r"(?i)\b(?:save|enjoy)\s+(?:an?\s+)?(?:extra\s+)?\d{1,3}\s*%",),
+        (r"(?i)\b(?:save|enjoy)\s+(?:an?\s+)?(?:extra\s+)?\d{1,3}\s*%", _SALE_CONTEXT),
         (r"(?i)\b(?:limited[- ]time|flash|black\s+friday|cyber\s+monday|clearance)\s+(?:sale|offer|deal|discount)s?\b",),
         (r"(?i)\bsale\s+price\b",),
         (rf"(?i)\bwas\s+{_CURRENCY}\d[\d.,]*\s*,?\s*(?:now|only|today)\b",),
     )),
     ("social_embed", _rules(
         (rf"(?i)\bview\s+this\s+(?:post|photo|video|reel|profile)\s+on\s+{_PLATFORM}\b",),
-        (r"(?i)\ban?\s+(?:post|photo|video|reel)\s+shared\s+by\b", r"@[\w.]+"),
+        (r"(?i)\ban?\s+(?:post|photo|video|reel)\s+shared\s+by\b[^@]{0,80}@[\w.]+\)?",),
         (rf"(?i)\bfollow\s+us\s+(?:on\s+)?{_PLATFORM}\b",),
         (r"(?i)\bfollow\s+us\s+@[\w.]+",),
         (rf"(?i)\b(?:find|join)\s+us\s+on\s+{_PLATFORM}\b",),
@@ -1146,7 +1172,8 @@ _BOILERPLATE_CLASSES: Tuple[Tuple[str, Tuple[Tuple["re.Pattern[str]", ...], ...]
         (r"(?i)\b(?:please|kindly)\s+note\b",
          r"(?i)\b(?:packaging|packages?|labels?|outer\s+box(?:es)?|box\s+designs?|package\s+designs?)\b",
          r"(?i)\b(?:vary|varies|differ|differs|change[sd]?|updated?|receive|arrive)\b"),
-        (r"(?i)\b(?:packaging|labels?|package\s+designs?)\s+(?:may|might|can)\s+(?:vary|differ|change)\b",),
+        (r"(?i)\b(?:packaging|labels?|package\s+designs?)\s+(?:may|might)\s+(?:vary|differ|change)\b"
+         r"(?!\s+colou?r)",),
     )),
 )
 
@@ -1167,11 +1194,16 @@ def boilerplate_class(sentence: str) -> Optional[str]:
     if sentence.rstrip("\"'”’)]」』")[-1:] in _SENTENCE_TERMINAL:
         return name
     # Unpunctuated: boilerplate only if the matches of every rule that fired cover the run.
-    residual = sentence
+    covered = [False] * len(sentence)
     for _, rule in hits:
         for p in rule:
-            residual = p.sub(" ", residual)
-    words = [w for w in re.findall(r"[^\W_]+", residual.casefold()) if w not in _BOILERPLATE_FILLER]
+            for m in p.finditer(sentence):
+                covered[m.start():m.end()] = [True] * (m.end() - m.start())
+    chars = [k for k, c in enumerate(sentence) if not c.isspace()]
+    if chars and sum(covered[k] for k in chars) >= _BOILERPLATE_MIN_COVERAGE * len(chars):
+        return name
+    residual = "".join(" " if covered[k] else c for k, c in enumerate(sentence))
+    words = [w for w in _RESIDUAL_TOKEN_RE.findall(residual.casefold()) if w not in _BOILERPLATE_FILLER]
     return name if len(words) <= _BOILERPLATE_MAX_RESIDUAL_WORDS else None
 
 
@@ -1266,6 +1298,10 @@ def body_html_to_text(body_html: Optional[str]) -> str:
 #     has 5+ words (short attributes like "Vegan and cruelty free." legitimately recur);
 #   * it sits in the leading or trailing run of repeated sentences -- a template's position; line
 #     copy interleaved with the product's own sentences stays;
+#   * it is on rows of at least 2 different product kinds (product_type, else category leaf): a
+#     store template covers the whole store, while a line's copy -- twelve lipsticks over one
+#     formula paragraph that never says "lipstick" -- sits on ONE kind. A single-kind batch is
+#     therefore never touched by this pass;
 #   * it does not name the row's own product noun (its product_type or category leaf: "nail",
 #     "lipstick") -- template text is about the store, line copy is about the product;
 #   * the description keeps at least max(50 chars, half its length before the pass) -- otherwise
@@ -1277,6 +1313,7 @@ DESCRIPTION_REPEAT_MIN_COUNT = 3
 DESCRIPTION_REPEAT_MIN_WORDS = 5
 DESCRIPTION_REPEAT_MIN_KEEP_CHARS = 50
 DESCRIPTION_REPEAT_MIN_KEEP_SHARE = 0.5
+DESCRIPTION_REPEAT_MIN_KINDS = 2
 _GENERIC_NOUNS = frozenset(
     "beauty other misc general product products item items and the for with set sets kit kits".split())
 
@@ -1291,6 +1328,12 @@ def description_nouns(category_path: Optional[str], product_type: Optional[str])
     return frozenset(w for w in re.findall(r"[a-z]{3,}", " ".join(parts).casefold()) if w not in _GENERIC_NOUNS)
 
 
+def description_kind(category_path: Optional[str], product_type: Optional[str]) -> str:
+    """What kind of product a row is, for the repetition pass: its product_type, else its category leaf."""
+    kind = " ".join(re.findall(r"[^\W_]+", str(product_type or "").casefold()))
+    return kind or str(category_path or "").rsplit("/", 1)[-1].casefold()
+
+
 def _names_noun(sentence: str, nouns: FrozenSet[str]) -> bool:
     return any(re.search(rf"\b{re.escape(n)}(?:e?s)?\b", sentence, re.IGNORECASE) for n in nouns)
 
@@ -1298,13 +1341,15 @@ def _names_noun(sentence: str, nouns: FrozenSet[str]) -> bool:
 def drop_repeated_store_sentences(
     descriptions: Sequence[Sequence[str]],
     nouns: Optional[Sequence[FrozenSet[str]]] = None,
+    kinds: Optional[Sequence[str]] = None,
 ) -> Tuple[List[List[str]], Dict[str, Any]]:
     """Per crawl batch: drop the store's repeated header/footer sentences (see the guards above).
     `descriptions` is one sentence list per row (see `body_html_sentences`), `nouns` the matching
-    `description_nouns` per row; returns the lists in the same order plus a report. Pure and
-    deterministic."""
+    `description_nouns` and `kinds` the `description_kind` per row (None: every row its own kind);
+    returns the lists in the same order plus a report. Pure and deterministic."""
     rows = [list(d) for d in descriptions]
     row_nouns = list(nouns) if nouns is not None else [frozenset()] * len(rows)
+    row_kinds = list(kinds) if kinds is not None else [str(k) for k in range(len(rows))]
     described = sum(1 for d in rows if d)
     report: Dict[str, Any] = {"described_rows": described, "threshold": None,
                               "repeated_sentences": 0, "rows_changed": 0, "sample": []}
@@ -1313,9 +1358,13 @@ def drop_repeated_store_sentences(
     threshold = max(DESCRIPTION_REPEAT_MIN_COUNT, math.ceil(DESCRIPTION_REPEAT_MIN_SHARE * described))
     report["threshold"] = threshold
     counts: "collections.Counter[str]" = collections.Counter()
-    for d in rows:
-        counts.update({k for k in map(_sentence_key, d) if len(k.split()) >= DESCRIPTION_REPEAT_MIN_WORDS})
-    repeated = {k for k, c in counts.items() if c >= threshold}
+    kinds_of: Dict[str, set] = {}
+    for d, kind in zip(rows, row_kinds):
+        for k in {k for k in map(_sentence_key, d) if len(k.split()) >= DESCRIPTION_REPEAT_MIN_WORDS}:
+            counts[k] += 1
+            kinds_of.setdefault(k, set()).add(kind)
+    repeated = {k for k, c in counts.items()
+                if c >= threshold and len(kinds_of[k]) >= DESCRIPTION_REPEAT_MIN_KINDS}
     report["repeated_sentences"] = len(repeated)
     if not repeated:
         return rows, report
@@ -3736,6 +3785,8 @@ async def records_for_brand(
     cleaned, repeat_report = drop_repeated_store_sentences(
         [s for _, s in described],
         [description_nouns(r["pdp"].get("category_path"), r["pdp"].get("category_source_product_type"))
+         for r, _ in described],
+        [description_kind(r["pdp"].get("category_path"), r["pdp"].get("category_source_product_type"))
          for r, _ in described])
     for (rec, before), after in zip(described, cleaned):
         if after != before:

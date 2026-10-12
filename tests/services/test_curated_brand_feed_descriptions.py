@@ -17,6 +17,7 @@ from services.curated_brand_feed import (
     _split_sentences,
     body_html_to_text,
     boilerplate_class,
+    description_kind,
     description_nouns,
     drop_repeated_store_sentences,
     inci_from_body_html,
@@ -63,7 +64,10 @@ def _summaries(recs):
     ('<p><span class="dropcap">D</span>ue to its whipped texture, this balm melts.</p>',
      "Due to its whipped texture, this balm melts."),
     ('<p>A hydra<a href="/pages/glossary">ting</a> mist.</p>', "A hydrating mist."),
-    ("<p><b><i>Hydra</i></b><span><a>ting</a></span> mist.</p>", "Hydrating mist."),
+    ("<p><b><i>Hydra</i>ting</b> mist.</p>", "Hydrating mist."),
+    ("<p><span>G</span><span>l</span><span>o</span><span>w</span> serum</p>", "Glow serum"),  # per-letter spans
+    ("<p><span>保湿</span><span>クリーム</span></p>", "保湿クリーム"),
+    ("<p>Long<b>-</b>wear and non<b>-comedogenic</b>.</p>", "Long-wear and non-comedogenic."),
     ("<p>With vitamin B<sub>5</sub>, H<sub>2</sub>O and 10<sup>th</sup>-gen peptides.</p>",
      "With vitamin B5, H2O and 10th-gen peptides."),
     ("<p>Only $1,<b>000</b> units.</p>", "Only $1,000 units."),
@@ -75,6 +79,10 @@ def _summaries(recs):
     ("<span>Vegan</span><span>Cruelty-free</span><span>Paraben-free</span>", "Vegan Cruelty-free Paraben-free"),
     ("<p><b>Vegan</b>&amp;<b>Cruelty free</b></p>", "Vegan & Cruelty free"),
     ("<p><b>Vegan</b>,<b>Cruelty free</b></p>", "Vegan, Cruelty free"),
+    # Two sibling elements, each holding a word, read as two words even in lowercase.
+    ("<span>Vegan</span><span>cruelty-free</span><span>paraben-free</span>", "Vegan cruelty-free paraben-free"),
+    ("<span>hydrating</span><span>soothing</span>", "hydrating soothing"),
+    ("<p><b>10%</b>Niacinamide</p>", "10% Niacinamide"),
     ("<p><strong>How to use:</strong>Smooth over damp skin.</p>", "How to use: Smooth over damp skin."),
     ("<p><b>Size:</b>50ml</p>", "Size: 50ml"),
     ("<p>Hydrates.<b>Plumps</b> too.</p>", "Hydrates. Plumps too."),
@@ -347,7 +355,8 @@ def _batch(n, *, footer_on=None, header_on=0):
         body += f"<p>{_own(i)}</p>"
         if i < footer_on:
             body += f"<p>{FOOTER}</p>"
-        out.append(_product(handle=f"item-{i}", title=f"Item {i}", body_html=body, product_type="Moisturizer"))
+        out.append(_product(handle=f"item-{i}", title=f"Item {i}", body_html=body,
+                            product_type=("Moisturizer", "Cleanser", "Toner")[i % 3]))
     return out
 
 
@@ -394,7 +403,8 @@ async def test_a_single_line_store_keeps_its_line_copy_above_half_the_batch(monk
     before = {p["title"]: body_html_to_text(p["body_html"]) for p in products}
     recs = await _records(monkeypatch, products, host="nail-lacquer.example", brand="Example Lacquer",
                           category_path="beauty/nails")
-    assert recs.crawl_report["description_repeats"]["repeated_sentences"] == 3  # on 12 of 20 rows
+    # On 12 of 20 rows, but all of them nail polish: one kind, so line copy, not a store template.
+    assert recs.crawl_report["description_repeats"]["repeated_sentences"] == 0
     assert _summaries(recs) == before
     assert all(len(s) >= 50 for s in _summaries(recs).values())
 
@@ -417,8 +427,8 @@ async def test_a_lipstick_line_batch_does_not_hold_the_job(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_line_sentence_naming_the_product_noun_survives_the_batch(monkeypatch):
-    line = "Every serum in this range layers under moisturiser and sunscreen."
-    products = [_product(handle=f"serum-{i}", title=f"Serum {i}", product_type="Serum",
+    line = "Every serum and essence in this range layers under moisturiser and sunscreen."
+    products = [_product(handle=f"serum-{i}", title=f"Serum {i}", product_type=("Serum", "Essence")[i % 2],
                          body_html=f"<p>{_own(i)}</p><p>{line}</p>") for i in range(12)]
     recs = await _records(monkeypatch, products)
     assert all(s == f"{_own(int(n.split()[1]))} {line}" for n, s in _summaries(recs).items())
@@ -430,8 +440,8 @@ OWN = [f"Row {i} has a long copy line of its very own, describing the formula in
 REPEAT = "A sentence that the store prints on many of its products."
 
 
-def _pass(rows, nouns=None):
-    return drop_repeated_store_sentences(rows, nouns)
+def _pass(rows, nouns=None, kinds=None):
+    return drop_repeated_store_sentences(rows, nouns, kinds)
 
 
 def test_a_repeated_footer_is_dropped():
@@ -497,3 +507,76 @@ def test_description_nouns():
     assert description_nouns("beauty/makeup/lip/lipstick", "Lipstick") == {"lip", "lipstick"}
     assert description_nouns("beauty/nails", "Nail Polish") == {"nails", "nail", "polish"}
     assert description_nouns("beauty", None) == frozenset()
+
+
+# --- unpunctuated runs, single-kind batches, anchors -----------------------------------------
+
+@pytest.mark.parametrize("body,expected", [
+    # CJK prose beside a boilerplate span: every CJK character is a word, so the run is kept.
+    ("<p>このセラムはビタミンCを配合し肌を明るくします 詳しくは www.example.jp をご覧ください</p>",
+     "このセラムはビタミンCを配合し肌を明るくします 詳しくは www.example.jp をご覧ください"),
+    ("<p>本品采用维生素C配方让肌肤更加明亮水润 contact us</p>", "本品采用维生素C配方让肌肤更加明亮水润 contact us"),
+    # Claims beside a boilerplate span: the span covers too little and too many words are left.
+    ("<ul><li>Cruelty-free, vegan, free shipping</li></ul>", "Cruelty-free, vegan, free shipping"),
+    ("<p>Hydrating Serum 50ml Free Shipping</p>", "Hydrating Serum 50ml Free Shipping"),
+    ("<p>Niacinamide serum | 30ml | free shipping</p>", "Niacinamide serum | 30ml | free shipping"),
+])
+def test_an_unpunctuated_run_with_product_words_is_kept(body, expected):
+    assert body_html_to_text(body) == expected
+
+
+@pytest.mark.parametrize("run", [
+    "FREE SHIPPING ON ORDERS OVER $50",   # the spans cover the run
+    "Free shipping over $35",
+    "Non-returnable",
+    "Use code GLOW20 at checkout",        # covers under 70%, but one word ("checkout") is left
+    "공식몰 www.example.kr",
+])
+def test_an_unpunctuated_run_that_is_all_boilerplate_is_dropped(run):
+    assert body_html_to_text(f"{COPY}<ul><li>{run}</li></ul>") == COPY_TEXT
+
+
+@pytest.mark.parametrize("copy", [
+    "Save 20% of your morning routine time with this 3-in-1.",
+    "Enjoy 24% more product in the new size.",
+    "Removes 99% off everything, even waterproof mascara.",
+    "Labels can change colour in the shower thanks to thermochromic ink.",
+    "The label may change colour as the cold-brew formula warms in your hand.",
+    "Its freshness label can change to red once the formula has been open for a year.",
+    "Contains no dangerous goods, so it ships by air.",
+])
+def test_more_product_copy_is_kept(copy):
+    assert boilerplate_class(copy) is None
+    assert body_html_to_text(f"<p>{copy}</p>") == copy
+
+
+def test_a_subscription_saving_is_a_sale_banner():
+    assert boilerplate_class("Save 20% when you subscribe.") == "sale_banner"
+
+
+@pytest.mark.asyncio
+async def test_a_single_kind_batch_keeps_its_shared_line_copy(monkeypatch):
+    line = ("<p>A creamy satin formula that glides on in one swipe. "
+            "Enriched with shea butter and vitamin E for comfortable all-day wear.</p>")
+    products = [_product(handle=f"l{i}", title=f"Satin {i}", product_type="Lipstick",
+                         body_html=line + f"<p>Shade number {i} is a {('warm brick red', 'cool berry')[i % 2]} "
+                                          f"with a subtle gold shimmer that flatters every skin tone all day.</p>")
+                for i in range(12)]
+    before = {p["title"]: body_html_to_text(p["body_html"]) for p in products}
+    recs = await _records(monkeypatch, products, host="lip-studio.example", brand="Example Lip Studio",
+                          category_path="beauty/makeup/lips/lipstick")
+    assert _summaries(recs) == before
+    assert recs.crawl_report["description_repeats"]["repeated_sentences"] == 0
+
+
+def test_a_repeated_sentence_must_span_two_product_kinds():
+    rows = [[own, REPEAT] for own in OWN]
+    out, report = _pass(rows, kinds=["lipstick"] * 12)
+    assert out == rows and report["repeated_sentences"] == 0
+    out, report = _pass(rows, kinds=["lipstick"] * 11 + ["lip gloss"])
+    assert out == [[own] for own in OWN]
+
+
+def test_description_kind():
+    assert description_kind("beauty/makeup/lip/lipstick", " Lip-Stick ") == "lip stick"
+    assert description_kind("beauty/makeup/lip/lipstick", None) == "lipstick"
