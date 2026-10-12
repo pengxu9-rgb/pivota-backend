@@ -52,6 +52,9 @@ _MANAGEABLE_JOB_IDS = frozenset(
         # on resume, written events are handed over with their ids and state changes during the
         # pause are detected if they fall inside AGENT_PURCHASE_EVENTS_LOOKBACK_HOURS (default 72).
         "agent_purchase_events",
+        # The A2A token rail's worker: pausing stops it taking steps without disarming the dial;
+        # claims, pending writes and the sweeps' clocks are in the ledger, so a resume picks up.
+        "a2a_rail_purchase_poll",
     }
 )
 
@@ -82,6 +85,7 @@ _RUNNABLE_JOB_IDS = frozenset(
         # docs/runbooks/reap_agentic_purchase.md; without it, the first evidence
         # that arming worked would be a log line up to 30s later.
         "agent_purchase_events",   # idempotent: detection is unique per state, hand-over is claimed
+        "a2a_rail_purchase_poll",  # idempotent: every step is claimed and every write is write-ahead
         "reap_agentic_purchase_poll",
     }
 )
