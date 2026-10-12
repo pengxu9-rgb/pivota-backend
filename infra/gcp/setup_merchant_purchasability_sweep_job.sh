@@ -102,12 +102,12 @@ have "$GCLOUD" compute networks subnets describe "$SUBNET" --region "$REGION" \
 # DB timeouts re-supply the guardrails `web` has — db/database.py defaults both to OFF.
 # VANTAGE_PROXY_URL is deliberately NOT set: a second vantage doubles every merchant's checks, and
 # the task timeout below is sized for one.
-ENV_VARS="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=$JOB,PIVOTA_COMMIT_SHA=$BACKEND_TAG"
-ENV_VARS="$ENV_VARS,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=2"
-ENV_VARS="$ENV_VARS,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600"
-ENV_VARS="$ENV_VARS,MERCHANT_PURCHASABILITY_BUDGET_SECONDS=$BUDGET_SECONDS"
-ENV_VARS="$ENV_VARS,MERCHANT_PURCHASABILITY_BATCH=$BATCH"
-ENV_VARS="$ENV_VARS,MERCHANT_PURCHASABILITY_SWEEP_ENABLED=$ENABLED"
+ENV_VARS="PIVOTA_ENV=$PIVOTA_ENV|PIVOTA_SERVICE_NAME=$JOB|PIVOTA_COMMIT_SHA=$BACKEND_TAG"
+ENV_VARS="$ENV_VARS|DB_POOL_MIN_SIZE=1|DB_POOL_MAX_SIZE=2"
+ENV_VARS="$ENV_VARS|DB_STATEMENT_TIMEOUT_SECONDS=30|DB_COMMAND_TIMEOUT_SECONDS=600"
+ENV_VARS="$ENV_VARS|MERCHANT_PURCHASABILITY_BUDGET_SECONDS=$BUDGET_SECONDS"
+ENV_VARS="$ENV_VARS|MERCHANT_PURCHASABILITY_BATCH=$BATCH"
+ENV_VARS="$ENV_VARS|MERCHANT_PURCHASABILITY_SWEEP_ENABLED=$ENABLED"
 # THE SHARED SHOPIFY-EDGE PACER (#2474), exactly as the Reap cart-proof setup script sets it on the
 # Reap proof jobs: every request (all to Shopify stores) also takes a slot of the aggregate budget
 # every crawl job on the crawl IP shares, and the lease cap of 2 bounds what this job can ever
@@ -115,7 +115,15 @@ ENV_VARS="$ENV_VARS,MERCHANT_PURCHASABILITY_SWEEP_ENABLED=$ENABLED"
 # address must use the same shared rate. The IP breaker's dials
 # (MERCHANT_PURCHASABILITY_IP_THROTTLE_*) are NOT set either: their defaults are the ones the
 # module documents (MERCHANT_PURCHASABILITY_IP_THROTTLE_TRIP_HOSTS=0 disarms it).
-ENV_VARS="$ENV_VARS,CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true,CRAWL_SHOPIFY_EDGE_LEASE=2"
+ENV_VARS="$ENV_VARS|CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true|CRAWL_SHOPIFY_EDGE_LEASE=2"
+
+# THE SERVED MARKETS (2026-10-12), kept equal to the live job and to web / the retailer-ingest drain. This job
+# does not recompute serving state today, but any code that does (index_pipeline_state_service.
+# serving_pricing_regions) defaults to US alone when this is unset and then drops every SG (SGD) offer as
+# priced only in an acquisition market -- the nightly refresh did exactly that. Set here so a serving path added
+# to this job later cannot inherit that default. Hence the `|` separator below: the value holds a comma
+# (gcloud's `^|^` alternate-delimiter form).
+ENV_VARS="$ENV_VARS|PIVOTA_SERVING_PRICING_REGIONS=US,SG"
 
 echo "== job: $JOB (subnet $SUBNET, gate $ENABLED)"
 verb=create; have "$GCLOUD" run jobs describe "$JOB" --region "$REGION" && verb=update
@@ -136,7 +144,7 @@ verb=create; have "$GCLOUD" run jobs describe "$JOB" --region "$REGION" && verb=
   --max-retries 0 --task-timeout 1200s --cpu 1 --memory 1Gi \
   --labels "env=$ENV,managed-by=infra-gcp,lane=merchant-purchasability" \
   --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
-  --set-env-vars "$ENV_VARS" \
+  --set-env-vars "^|^$ENV_VARS" \
   --command python --args="-m,jobs.merchant_purchasability_sweep" --quiet
 
 echo "== trigger: $TRIGGER ($SCHEDULE UTC)"
