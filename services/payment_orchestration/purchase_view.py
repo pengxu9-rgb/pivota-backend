@@ -2,7 +2,8 @@
 
 `GET /agent/v2/commerce/purchases/{id}` returns it, and the `purchase.*` webhook events carry it, so
 an agent sees the same shape whether it polls or is told. It is built from the rail route's own
-owner-scoped, redacted view (for Reap: routes/agent_commerce_reap._owner_view), never from a raw row,
+owner-scoped, redacted view (Reap: routes/agent_commerce_reap._owner_view; the A2A token rail:
+services/payment_orchestration/a2a_purchase_view), never from a raw row,
 so it carries no PII and only a hosted URL the rail route has already vetted.
 """
 
@@ -52,14 +53,24 @@ async def unified_purchase(
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """(body, None), or (None, "not_found" | "state_unmapped"). Owner-scoped: the rail read
     conjuncts on the agent AND the buyer."""
-    # Imported here: the rail route module imports the web stack, and this module is also used by
-    # the worker's event job.
-    import routes.agent_commerce_reap as reap_routes
+    if parent["rail"] == "a2a":
+        from services.payment_orchestration import a2a_purchase_view
 
-    detail = await reap_routes._owner_view(
-        purchase_id=str(parent["rail_purchase_id"]), agent_id=agent_id,
-        agent_user_ref_hash=agent_user_ref_hash,
-    )
+        detail = await a2a_purchase_view.owner_view(
+            purchase_id=str(parent["rail_purchase_id"]), agent_id=agent_id,
+            agent_user_ref_hash=agent_user_ref_hash,
+        )
+    elif parent["rail"] == "reap":
+        # Imported here: the rail route module imports the web stack, and this module is also used
+        # by the worker's event job.
+        import routes.agent_commerce_reap as reap_routes
+
+        detail = await reap_routes._owner_view(
+            purchase_id=str(parent["rail_purchase_id"]), agent_id=agent_id,
+            agent_user_ref_hash=agent_user_ref_hash,
+        )
+    else:
+        return None, "state_unmapped"
     if not detail:
         return None, "not_found"
     body = unified_body(parent, detail)

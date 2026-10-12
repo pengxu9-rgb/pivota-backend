@@ -73,22 +73,104 @@ def _check_values(ddl: str, column: str) -> tuple:
     return tuple(v.strip().strip("'") for v in match.group(1).split(","))
 
 
+_RAIL_CHECK_264 = "CHECK (rail IN ('reap'))"
+
+
+def _migrated_ddl() -> str:
+    """Migration 264's DDL with migration 268's widened rail CHECK applied: what the migrations
+    leave behind, to compare with the one CREATE TABLE the module holds."""
+    m264 = (_REPO / "db/migrations/264_agent_purchases.sql").read_text("utf-8")
+    m268 = (_REPO / "db/migrations/268_a2a_rail_ledger.sql").read_text("utf-8")
+    widened = re.search(r"ADD CONSTRAINT ck_agent_purchases_rail (CHECK \(rail IN \([^)]*\)\))", m268)
+    assert widened and "DROP CONSTRAINT IF EXISTS ck_agent_purchases_rail" in m268
+    assert m264.count(_RAIL_CHECK_264) == 1
+    return m264.replace(_RAIL_CHECK_264, widened.group(1))
+
+
 @pytest.mark.parametrize("source", ["module", "migration"])
 def test_the_check_vocabularies_are_the_python_tuples(source):
-    ddl = (
-        purchases._CREATE_TABLE_PG
-        if source == "module"
-        else (_REPO / "db/migrations/264_agent_purchases.sql").read_text("utf-8")
-    )
+    ddl = purchases._CREATE_TABLE_PG if source == "module" else _migrated_ddl()
     assert _check_values(ddl, "rail") == purchases.RAILS
     assert _check_values(ddl, "executor") == purchases.EXECUTORS
 
 
-def test_the_migration_creates_the_table_and_indexes_the_module_creates():
-    migration = (_REPO / "db/migrations/264_agent_purchases.sql").read_text("utf-8")
+def test_the_migrations_create_the_table_and_indexes_the_module_creates():
+    migration = _migrated_ddl()
     squash = lambda text: " ".join(text.split())  # noqa: E731
     for statement in (purchases._CREATE_TABLE_PG, purchases._CREATE_RAIL_INDEX, purchases._CREATE_OWNER_INDEX):
         assert squash(statement) in squash(migration)
+
+
+def test_the_heal_widens_the_rail_check_to_the_module_vocabulary():
+    assert purchases._WIDEN_RAIL_CHECK_PG.count("ADD CONSTRAINT ck_agent_purchases_rail") == 1
+    # NOT VALID in the step that holds ACCESS EXCLUSIVE; the scan is the separate VALIDATE step
+    assert purchases._WIDEN_RAIL_CHECK_PG.rstrip().endswith("NOT VALID;")
+    assert "VALIDATE CONSTRAINT ck_agent_purchases_rail" in purchases._VALIDATE_RAIL_CHECK_PG
+    assert "VALIDATE" not in purchases._WIDEN_RAIL_CHECK_PG
+    assert _check_values(purchases._WIDEN_RAIL_CHECK_PG.replace("ADD CONSTRAINT", "CONSTRAINT"), "rail") == purchases.RAILS
+    for rail in purchases.RAILS:
+        assert f"'{rail}'::character varying" in purchases._RAIL_CHECK_PG_DEF
+
+
+async def test_the_sqlite_heal_rebuilds_a_table_with_the_narrow_check_and_keeps_its_rows():
+    await database.execute("DROP TABLE IF EXISTS agent_purchases")
+    await database.execute(purchases._CREATE_TABLE_SQLITE.replace("('reap', 'a2a')", "('reap')"))
+    await database.execute(
+        "INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id) VALUES ('pp_x', 'reap', 'rail_managed', 'rp_x')"
+    )
+    await purchases.ensure_agent_purchase_schema()
+    await purchases.ensure_agent_purchase_schema()  # idempotent
+    await database.execute(
+        "INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id) VALUES ('pp_y', 'a2a', 'rail_managed', 'ap_y')"
+    )
+    rows = {r["id"]: r["rail"] for r in await database.fetch_all("SELECT id, rail FROM agent_purchases")}
+    assert rows == {"pp_x": "reap", "pp_y": "a2a"}
+    indexes = {r["name"] for r in await database.fetch_all("PRAGMA index_list(agent_purchases)")}
+    assert {"uq_agent_purchases_rail_purchase", "idx_agent_purchases_owner"} <= indexes
+
+
+async def _narrow_table_with_a_row():
+    await database.execute("DROP TABLE IF EXISTS agent_purchases")
+    await database.execute("DROP TABLE IF EXISTS agent_purchases_pre268")
+    await database.execute(purchases._CREATE_TABLE_SQLITE.replace("('reap', 'a2a')", "('reap')"))
+    await database.execute(purchases._CREATE_RAIL_INDEX)
+    await database.execute(
+        "INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id) VALUES ('pp_x', 'reap', 'rail_managed', 'rp_x')"
+    )
+
+
+async def _assert_rebuilt():
+    rows = {r["id"] for r in await database.fetch_all("SELECT id FROM agent_purchases")}
+    assert rows == {"pp_x"}
+    tables = {r["name"] for r in await database.fetch_all("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert "agent_purchases_pre268" not in tables
+    indexes = {r["name"] for r in await database.fetch_all("PRAGMA index_list(agent_purchases)")}
+    assert {"uq_agent_purchases_rail_purchase", "idx_agent_purchases_owner"} <= indexes
+    assert await purchases.ensure_reap_parent("rp_missing") is None  # ON CONFLICT target exists again
+
+
+async def test_a_rebuild_interrupted_after_the_rename_is_finished_on_the_next_boot():
+    await _narrow_table_with_a_row()
+    await database.execute(purchases._SQLITE_RENAME_OLD)  # ...and the process died here
+    await purchases.ensure_agent_purchase_schema()
+    await _assert_rebuilt()
+
+
+async def test_a_rebuild_interrupted_after_the_create_is_finished_on_the_next_boot():
+    await _narrow_table_with_a_row()
+    await database.execute(purchases._SQLITE_RENAME_OLD)
+    await database.execute(purchases._CREATE_TABLE_SQLITE)  # ...and the process died here
+    await purchases.ensure_agent_purchase_schema()
+    await _assert_rebuilt()
+
+
+async def test_a_rebuild_interrupted_after_the_copy_is_finished_on_the_next_boot():
+    await _narrow_table_with_a_row()
+    await database.execute(purchases._SQLITE_RENAME_OLD)
+    await database.execute(purchases._CREATE_TABLE_SQLITE)
+    await database.execute(purchases._SQLITE_COPY_OLD)  # ...and the process died here
+    await purchases.ensure_agent_purchase_schema()
+    await _assert_rebuilt()
 
 
 async def test_the_self_heal_builds_the_table_on_sqlite():

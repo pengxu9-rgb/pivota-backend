@@ -106,7 +106,7 @@ async def _reap(agent_id: str = AGENT, owner: str = OWNER) -> str:
     return purchase["id"]
 
 
-async def test_the_self_heal_builds_the_same_schema_as_migration_264():
+async def test_the_self_heal_builds_the_same_schema_as_migrations_264_and_268():
     from db.database import database
     from db.sql_migrations import split_statements
     import db.agent_purchase_ledger as purchases
@@ -114,6 +114,11 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_264():
     await database.execute("DROP TABLE IF EXISTS agent_purchases")
     for statement in split_statements(_MIGRATION.read_text(encoding="utf-8")):
         await database.execute(statement)
+    # 268 widened the rail CHECK; the module's one CREATE TABLE carries the widened list.
+    m268 = (_MIGRATION.parent / "268_a2a_rail_ledger.sql").read_text(encoding="utf-8")
+    for statement in split_statements(m268):
+        if "agent_purchases " in statement and "CONSTRAINT" in statement:
+            await database.execute(statement)
     from_migration = await _fingerprint()
     assert from_migration[0] and from_migration[1] and from_migration[2]
     assert [name for name, _def in from_migration[2]] == ["ck_agent_purchases_executor", "ck_agent_purchases_rail"]

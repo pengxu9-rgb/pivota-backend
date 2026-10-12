@@ -5,9 +5,9 @@ see ONE vocabulary whatever the rail, so every rail state must map to exactly on
 tests/test_agent_purchase_ledger.py holds the Reap map to the Reap ledger's full state set, so a
 new Reap state that is not mapped here fails the build instead of reaching an agent as `None`.
 
-Executor `rail_managed`: the rail itself places the merchant order (Reap today;
-the next rail's checkout agent likewise). With one rail there is nothing to route yet, so there is no router here:
-the parent row records how its rail was chosen, and the router arrives with the second rail.
+Executor `rail_managed`: the rail itself places the merchant order (Reap's agent, and the A2A token
+rail's checkout agent). The parent row records how its rail was chosen; the router that chooses
+between rails is separate work.
 """
 
 from __future__ import annotations
@@ -47,19 +47,40 @@ REAP_STATE_MAP: Dict[str, str] = {
     "expired": "expired",
 }
 
+#: The A2A token rail's ledger states (db/a2a_rail_ledger.PURCHASE_STATES) onto the unified ones.
+#:   opened                 -> routing: the row exists, nothing has been sent to the rail
+#:   needs_payment_method   -> needs_payment_method: the buyer binds a card on the rail's page
+#:   quoting                -> locking: the rail prices the exact cart; nothing is charged
+#:   awaiting_authorization -> awaiting_buyer_authorization: the buyer approves on the rail's page
+#:   paying                 -> placing: the rail's checkout agent places the order
+A2A_STATE_MAP: Dict[str, str] = {
+    "opened": "routing",
+    "needs_payment_method": "needs_payment_method",
+    "quoting": "locking",
+    "awaiting_authorization": "awaiting_buyer_authorization",
+    "paying": "placing",
+    "completed": "completed",
+    "failed": "failed",
+    "refused": "refused",
+    "expired": "expired",
+}
+
 #: rail -> (executor, state map). A purchase's executor is fixed per rail until a rail offers more
 #: than one way to place an order.
-RAIL_EXECUTOR: Dict[str, str] = {"reap": "rail_managed"}
-_STATE_MAPS: Dict[str, Dict[str, str]] = {"reap": REAP_STATE_MAP}
+RAIL_EXECUTOR: Dict[str, str] = {"reap": "rail_managed", "a2a": "rail_managed"}
+_STATE_MAPS: Dict[str, Dict[str, str]] = {"reap": REAP_STATE_MAP, "a2a": A2A_STATE_MAP}
 
 #: A rail's own purchase id prefix -> rail. The unified routes accept a rail id wherever a `pp_` id is
 #: accepted; this is the one place that says which rail an id belongs to.
-RAIL_ID_PREFIX: Dict[str, str] = {"rp_": "reap"}
+RAIL_ID_PREFIX: Dict[str, str] = {"rp_": "reap", "ap_": "a2a"}
 
 #: The unified states in which the buyer must act on a rail-hosted page, and what that page is for.
 BUYER_ACTION_KIND: Dict[str, str] = {
     "needs_payment_method": "card_binding",
     "awaiting_buyer_authorization": "approval",
+    # The merchant's challenge (3DS) while the rail places the order. Only a rail that vets and
+    # returns such a page in this state shows one (the A2A token rail); Reap's view never does.
+    "placing": "authenticate",
 }
 
 
