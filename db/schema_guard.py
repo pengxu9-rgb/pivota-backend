@@ -1199,6 +1199,13 @@ async def ensure_required_schema_light() -> None:
                 await ensure_agent_purchase_events_schema()
             except Exception as exc:
                 logger.warning("schema_guard: agent_purchase_events (mig 265) unavailable (%s)", type(exc).__name__)
+            # mig 267: the A2A token rail's ledger (payment orchestration P2). Own try: written only by
+            # that rail's dark worker; DDL in db/a2a_rail_ledger (dialect split there).
+            try:
+                from db.a2a_rail_ledger import ensure_a2a_rail_schema
+                await ensure_a2a_rail_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: a2a rail ledger (mig 267) unavailable (%s)", type(exc).__name__)
             # mig 252: AT MOST ONE PENDING ENROLLMENT PER BUYER.
             # db/migrations/252_reap_agentic_enrollments_one_pending.sql is the
             # same index. Two purchases of one buyer, each in 'resolving' in one
@@ -3956,6 +3963,13 @@ async def ensure_required_schema_light() -> None:
                 await ensure_agent_purchase_events_schema()
             except Exception as exc:
                 logger.warning("schema_guard: agent_purchase_events (mig 265) unavailable (%s)", type(exc).__name__)
+            # mig 267: the A2A token rail's ledger (payment orchestration P2). Own try: written only by
+            # that rail's dark worker; DDL in db/a2a_rail_ledger (dialect split there).
+            try:
+                from db.a2a_rail_ledger import ensure_a2a_rail_schema
+                await ensure_a2a_rail_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: a2a rail ledger (mig 267) unavailable (%s)", type(exc).__name__)
             # mig 252: at most one PENDING enrollment per buyer, SQLite twin of
             # the Postgres block above (same index, same reason, same own try:
             # it fails on a database that already holds two pending rows for one

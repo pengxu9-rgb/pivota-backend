@@ -1,9 +1,8 @@
 """The rail-neutral purchase ledger (migration 264): one `agent_purchases` row per purchase on ANY
 payment rail, pointing at that rail's own purchase row.
 
-Payment orchestration P0. Today the
-only rail is Reap (`reap_agentic_purchases`, executor `rail_managed`: the rail places the order).
-The next rail adds a second child table and a second value in the two CHECKs below.
+Payment orchestration P0. Two rails, both executor `rail_managed` (the rail places the order):
+Reap (`reap_agentic_purchases`) and the A2A token rail (`a2a_rail_purchases`, migration 267).
 
 ── THE PARENT HAS NO STATE, ON PURPOSE ──────────────────────────────────────────────────────
 
@@ -52,7 +51,7 @@ _TRUTHY = frozenset({"1", "true", "on", "yes"})
 #: The vocabularies. The CHECKs in `_CREATE_TABLE_PG` hold the same strings; a test parses them
 #: back out so the two cannot disagree. The CHECKs are NAMED so the next rail's migration can
 #: `DROP CONSTRAINT ck_agent_purchases_rail` and re-add it (CREATE TABLE IF NOT EXISTS never alters).
-RAILS = ("reap",)
+RAILS = ("reap", "a2a")
 EXECUTORS = ("rail_managed",)
 
 
@@ -74,7 +73,7 @@ def is_enabled() -> bool:
 _CREATE_TABLE_PG = """
 CREATE TABLE IF NOT EXISTS agent_purchases (
     id VARCHAR(64) PRIMARY KEY,
-    rail VARCHAR(16) NOT NULL CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap')),
+    rail VARCHAR(16) NOT NULL CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap', 'a2a')),
     executor VARCHAR(24) NOT NULL
         CONSTRAINT ck_agent_purchases_executor CHECK (executor IN ('rail_managed')),
     rail_purchase_id VARCHAR(64) NOT NULL,
@@ -103,14 +102,50 @@ CREATE INDEX IF NOT EXISTS idx_agent_purchases_owner
 """
 
 
+#: Migration 267 widened the rail CHECK. A table built before it keeps the narrow one (CREATE TABLE IF
+#: NOT EXISTS never alters), so the heal re-adds it: on Postgres inside schema_guard.guarded_ddl, only
+#: while the definition differs (a lock-free catalog read) and under its lock_timeout; on SQLite, which
+#: cannot alter a CHECK, by rebuilding the table (local and test databases only).
+_RAIL_CHECK_PG_DEF = (
+    "CHECK (((rail)::text = ANY ((ARRAY['reap'::character varying, 'a2a'::character varying])::text[])))"
+)
+_WIDEN_RAIL_CHECK_PG = """
+    ALTER TABLE agent_purchases DROP CONSTRAINT IF EXISTS ck_agent_purchases_rail;
+    ALTER TABLE agent_purchases ADD CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap', 'a2a'));
+"""
+_SQLITE_TABLE_SQL = "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_purchases'"
+_SQLITE_RENAME_OLD = "ALTER TABLE agent_purchases RENAME TO agent_purchases_pre267"
+_SQLITE_COPY_OLD = """
+    INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id, agent_id, agent_user_ref_hash,
+                                 routing_plan, created_at)
+    SELECT id, rail, executor, rail_purchase_id, agent_id, agent_user_ref_hash, routing_plan, created_at
+      FROM agent_purchases_pre267
+"""
+_SQLITE_DROP_OLD = "DROP TABLE agent_purchases_pre267"
+
+
 async def ensure_agent_purchase_schema() -> None:
-    """Self-heal parity with migration 264. Idempotent; called at every startup."""
+    """Self-heal parity with migrations 264 and 267. Idempotent; called at every startup."""
     # `if`/`else` statements, not a conditional expression: the PREPARE gate resolves only a literal or a
     # module-level name as the first argument, and an IfExp hides BOTH statements from it.
     if IS_POSTGRES:
         await database.execute(_CREATE_TABLE_PG)
+        from db.schema_guard import _heal_guarded, constraint_differs
+
+        await _heal_guarded(
+            "agent_purchases",
+            constraint_differs("agent_purchases", "ck_agent_purchases_rail", _RAIL_CHECK_PG_DEF),
+            _WIDEN_RAIL_CHECK_PG,
+        )
     else:
-        await database.execute(_CREATE_TABLE_SQLITE)
+        row = await database.fetch_one(_SQLITE_TABLE_SQL)
+        if row is not None and "'a2a'" not in str(row["sql"]):
+            await database.execute(_SQLITE_RENAME_OLD)
+            await database.execute(_CREATE_TABLE_SQLITE)
+            await database.execute(_SQLITE_COPY_OLD)
+            await database.execute(_SQLITE_DROP_OLD)
+        else:
+            await database.execute(_CREATE_TABLE_SQLITE)
     await database.execute(_CREATE_RAIL_INDEX)
     await database.execute(_CREATE_OWNER_INDEX)
 
@@ -122,13 +157,13 @@ def new_purchase_id() -> str:
     return f"pp_{uuid.uuid4().hex[:24]}"
 
 
-def _routing_plan(basis: str) -> str:
+def _routing_plan(basis: str, rail: str = "reap") -> str:
     """How this purchase came to be on its rail. With one rail there is no choice to record, so
     this says who decided: the agent called the Reap route itself, or the row predates the
     ledger and was backfilled. The router writes ranked candidates here once a second rail
     exists."""
     return json.dumps(
-        {"rail": "reap", "executor": "rail_managed", "basis": basis},
+        {"rail": rail, "executor": "rail_managed", "basis": basis},
         separators=(",", ":"),
         sort_keys=True,
     )
@@ -177,6 +212,43 @@ async def ensure_reap_parent(rail_purchase_id: str, *, basis: str = "agent_selec
         await database.execute(_INSERT_REAP_PARENT_SQL_SQLITE, values)
     row = await database.fetch_one(
         _SELECT_PARENT_ID_SQL, {"rail": "reap", "rail_purchase_id": rail_purchase_id}
+    )
+    return str(row["id"]) if row else None
+
+
+_INSERT_A2A_PARENT_SQL = """
+    INSERT INTO agent_purchases (
+        id, rail, executor, rail_purchase_id, agent_id, agent_user_ref_hash, routing_plan,
+        created_at
+    )
+    SELECT :id, 'a2a', 'rail_managed', r.id, r.agent_id, r.agent_user_ref_hash,
+           CAST(:routing_plan AS JSONB), r.created_at
+      FROM a2a_rail_purchases r
+     WHERE r.id = :rail_purchase_id
+    ON CONFLICT (rail, rail_purchase_id) DO NOTHING
+"""
+_INSERT_A2A_PARENT_SQL_SQLITE = _INSERT_A2A_PARENT_SQL.replace(
+    "CAST(:routing_plan AS JSONB)", ":routing_plan"
+)
+
+
+async def ensure_a2a_parent(rail_purchase_id: str, *, basis: str = "orchestrator_selected_rail") -> Optional[str]:
+    """The parent id for an A2A-rail purchase, writing it if absent; None when no such child row.
+    Same contract as `ensure_reap_parent`: identity copied from the committed child, idempotent."""
+    rail_purchase_id = str(rail_purchase_id or "").strip()
+    if not rail_purchase_id:
+        return None
+    values = {
+        "id": new_purchase_id(),
+        "routing_plan": _routing_plan(basis, "a2a"),
+        "rail_purchase_id": rail_purchase_id,
+    }
+    if IS_POSTGRES:
+        await database.execute(_INSERT_A2A_PARENT_SQL, values)
+    else:
+        await database.execute(_INSERT_A2A_PARENT_SQL_SQLITE, values)
+    row = await database.fetch_one(
+        _SELECT_PARENT_ID_SQL, {"rail": "a2a", "rail_purchase_id": rail_purchase_id}
     )
     return str(row["id"]) if row else None
 

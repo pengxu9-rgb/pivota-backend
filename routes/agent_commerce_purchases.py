@@ -3,7 +3,8 @@
 One id (`pp_…`) and one state vocabulary for a purchase on any payment rail, with the rail's own
 owner-facing body nested under `detail` exactly as the rail's route returns it. Reap is the only
 rail today; a Reap id (`rp_…`) is accepted too, so a caller holding the id from
-`POST /agent/v2/commerce/reap/purchases` can read the unified view without a lookup.
+`POST /agent/v2/commerce/reap/purchases` can read the unified view without a lookup. An A2A-rail id
+(`ap_…`) is accepted the same way.
 
 READ-ONLY, AND DARK BY DEFAULT. Nothing here creates, advances or pays for a purchase, and
 nothing calls a rail. While `AGENT_PURCHASE_LEDGER_ENABLED` is off every request answers the
@@ -23,6 +24,7 @@ from typing import Any, Dict, Mapping, Optional
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
+import db.a2a_rail_ledger as a2a_ledger
 import db.agent_purchase_ledger as purchases
 import db.reap_agentic_ledger as reap_ledger
 import routes.agent_commerce_reap as reap_routes
@@ -74,14 +76,19 @@ async def _parent_for(purchase_id: str, agent_id: str, owner: str) -> Optional[D
         if purchase_id.startswith("pp_"):
             return await purchases.get_for_owner(purchase_id, agent_id, owner)
         rail = next((r for prefix, r in RAIL_ID_PREFIX.items() if purchase_id.startswith(prefix)), None)
-        if rail != "reap":
+        if rail not in ("reap", "a2a"):
             return None
         parent = await purchases.get_by_rail_id_for_owner(rail, purchase_id, agent_id, owner)
         if parent is not None:
             return parent
-        if await reap_ledger.get_purchase_for_owner(purchase_id, agent_id, owner) is None:
-            return None
-        await purchases.ensure_reap_parent(purchase_id, basis="backfill")
+        if rail == "reap":
+            if await reap_ledger.get_purchase_for_owner(purchase_id, agent_id, owner) is None:
+                return None
+            await purchases.ensure_reap_parent(purchase_id, basis="backfill")
+        else:
+            if await a2a_ledger.get_purchase_for_owner(purchase_id, agent_id, owner) is None:
+                return None
+            await purchases.ensure_a2a_parent(purchase_id, basis="backfill")
         return await purchases.get_by_rail_id_for_owner(rail, purchase_id, agent_id, owner)
     except Exception as exc:  # noqa: BLE001 - any ledger fault is "say nothing, retry", never a 500
         logger.warning("agent_purchases: ledger read failed error_type=%s", type(exc).__name__)

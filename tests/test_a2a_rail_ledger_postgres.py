@@ -1,0 +1,187 @@
+"""db/a2a_rail_ledger.py on Postgres: schema parity with migration 267, the parent's widened rail
+CHECK, every statement with NULL and timestamp parameters (Postgres types them; SQLite does not),
+and the claim under real concurrency.
+
+    DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_dialect_check \\
+        pytest tests/test_a2a_rail_ledger_postgres.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+_IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://")
+pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL; production-dialect gate for migration 267")
+
+_REPO = Path(__file__).resolve().parent.parent
+_MIGRATION = _REPO / "db/migrations/267_a2a_rail_ledger.sql"
+_SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
+_TABLES = ("a2a_rail_purchases", "a2a_rail_buyer_refs")
+AGENT = "agent_a2a_pg"
+PAGE = "https://pay.rail.test/approve/1"
+
+
+@pytest.fixture(autouse=True)
+async def _db():
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    dbname = DATABASE_URL.rsplit("/", 1)[-1].split("?")[0]
+    if not any(m in dbname or m in DATABASE_URL for m in _SAFE_DB_MARKERS):
+        pytest.skip(f"refusing to drop the a2a rail tables in {dbname!r}: throwaway only")
+    was_connected = database.is_connected
+    if not was_connected:
+        await database.connect()
+    for table in _TABLES:
+        await database.execute(f"DROP TABLE IF EXISTS {table}")
+    await ensure_required_schema_light()
+    # This file is the only one that writes a2a parents; clear them so a reused database is clean.
+    await database.execute("DELETE FROM agent_purchases WHERE rail = 'a2a'")
+    try:
+        yield
+    finally:
+        for statement in ("DELETE FROM agent_purchases WHERE rail = 'a2a'",
+                          *(f"DELETE FROM {table}" for table in _TABLES)):
+            try:
+                await database.execute(statement)
+            except Exception:  # noqa: BLE001
+                pass
+        if not was_connected and database.is_connected:
+            await database.disconnect()
+
+
+async def _fingerprint(table):
+    from db.database import database
+
+    columns = [tuple(r) for r in await database.fetch_all(
+        "SELECT column_name, data_type, character_maximum_length, is_nullable, column_default "
+        "FROM information_schema.columns WHERE table_schema = 'public' AND table_name = :t "
+        "ORDER BY column_name", {"t": table})]
+    indexes = {r["indexname"]: " ".join(r["indexdef"].split()) for r in await database.fetch_all(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' AND tablename = :t", {"t": table})}
+    checks = sorted((r["conname"], r["def"]) for r in await database.fetch_all(
+        "SELECT c.conname, pg_get_constraintdef(c.oid) AS def FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid "
+        "WHERE t.relname = :t AND c.contype = 'c'", {"t": table}))
+    return columns, indexes, checks
+
+
+async def _rail_check():
+    from db.database import database
+
+    row = await database.fetch_one(
+        "SELECT pg_get_constraintdef(c.oid) AS def FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid "
+        "WHERE t.relname = 'agent_purchases' AND c.conname = 'ck_agent_purchases_rail'")
+    return row["def"] if row else None
+
+
+async def test_the_self_heal_builds_the_same_schema_as_migration_267():
+    from db.database import database
+    from db.sql_migrations import split_statements
+    import db.a2a_rail_ledger as ledger
+
+    for table in _TABLES:
+        await database.execute(f"DROP TABLE IF EXISTS {table}")
+    for statement in split_statements(_MIGRATION.read_text(encoding="utf-8")):
+        await database.execute(statement)
+    from_migration = [await _fingerprint(t) for t in _TABLES]
+    assert [name for name, _ in from_migration[0][2]] == [
+        "ck_a2a_rail_purchases_action", "ck_a2a_rail_purchases_price",
+        "ck_a2a_rail_purchases_quantity", "ck_a2a_rail_purchases_state"]
+    migrated_check = await _rail_check()
+    for table in _TABLES:
+        await database.execute(f"DROP TABLE IF EXISTS {table}")
+    await ledger.ensure_a2a_rail_schema()
+    assert [await _fingerprint(t) for t in _TABLES] == from_migration
+    assert await _rail_check() == migrated_check
+
+
+async def test_the_parent_heal_widens_an_old_rail_check_and_keeps_rows():
+    from db.database import database
+    import db.agent_purchase_ledger as purchases
+
+    await database.execute("DELETE FROM agent_purchases WHERE id IN ('pp_pre267', 'pp_post267')")
+    await database.execute("ALTER TABLE agent_purchases DROP CONSTRAINT IF EXISTS ck_agent_purchases_rail")
+    await database.execute(
+        "ALTER TABLE agent_purchases ADD CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap'))")
+    await database.execute(
+        "INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id) VALUES ('pp_pre267', 'reap', 'rail_managed', 'rp_pre267')")
+    await purchases.ensure_agent_purchase_schema()
+    assert await _rail_check() == purchases._RAIL_CHECK_PG_DEF
+    await database.execute(
+        "INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id) VALUES ('pp_post267', 'a2a', 'rail_managed', 'ap_post267')")
+    ids = {r["id"] for r in await database.fetch_all("SELECT id FROM agent_purchases WHERE id IN ('pp_pre267', 'pp_post267')")}
+    assert ids == {"pp_pre267", "pp_post267"}
+    await database.execute("DELETE FROM agent_purchases WHERE id IN ('pp_pre267', 'pp_post267')")
+
+
+async def test_the_parent_heal_takes_no_lock_once_the_check_is_wide():
+    import asyncpg
+    import db.agent_purchase_ledger as purchases
+
+    other = await asyncpg.connect(DATABASE_URL)
+    try:
+        tx = other.transaction()
+        await tx.start()
+        await other.execute("LOCK TABLE agent_purchases IN ACCESS SHARE MODE")
+        await asyncio.wait_for(purchases.ensure_agent_purchase_schema(), timeout=5)
+        await tx.rollback()
+    finally:
+        await other.close()
+
+
+async def test_every_statement_runs_with_nulls_and_timestamps_on_postgres():
+    from db.database import database
+    import db.a2a_rail_ledger as ledger
+    import db.agent_purchase_ledger as purchases
+
+    row = await ledger.create_purchase(
+        agent_id=AGENT, agent_user_ref_hash="h" * 64, merchant_domain="brand.example",
+        checkout_url="https://brand.example/cart/1:1", currency="USD", our_price_minor=4650,
+        shipping_address={"addressLine1": "900 Brannan St"}, buyer_email="ada@example.test")
+    assert row["consented_at"] is None and row["shipping_address"] == {"addressLine1": "900 Brannan St"}
+    with_consent = await ledger.create_purchase(
+        agent_id=AGENT, agent_user_ref_hash="h" * 64, merchant_domain="brand.example",
+        checkout_url="https://brand.example/cart/1:1", currency="USD", our_price_minor=4650, consent_version="v1")
+    assert with_consent["consented_at"] is not None
+    await database.execute("UPDATE a2a_rail_purchases SET next_poll_at = now() + interval '1 hour' WHERE id = :i",
+                           {"i": with_consent["id"]})
+    [claimed] = await ledger.claim_due_purchases("w1")
+    assert claimed["id"] == row["id"]
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    asked = await ledger.transition_as_holder(
+        row["id"], "w1", from_states=["opened"], to_state="needs_payment_method",
+        buyer_action_kind="card_binding", buyer_action_url=PAGE, buyer_action_expires_at=future)
+    assert asked["buyer_action_expires_at"] is not None
+    moved = await ledger.transition_as_holder(row["id"], "w1", from_states=["needs_payment_method"], to_state="quoting")
+    assert moved["buyer_action_url"] is None and moved["buyer_action_expires_at"] is None
+    assert (await ledger.mark_pending_write(row["id"], "w1", "shop.cart#submit"))["pending_write"]
+    assert (await ledger.clear_pending_write(row["id"], "w1", "shop.cart#submit"))["pending_write"] is None
+    assert await ledger.release_claim(row["id"], "w1", next_poll_at=future, last_error_code="waiting")
+    assert await ledger.requeue_stale_claims(lease_seconds=300) == 0
+    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = now() - interval '3 days' WHERE id = :i",
+                           {"i": row["id"]})
+    assert await ledger.expire_overdue_purchases(max_age_seconds=86400) == 1
+    gone = await ledger.get_purchase_internal(row["id"])
+    assert gone["state"] == "expired" and gone["shipping_address"] is None and gone["buyer_email"] is None
+    parent = await purchases.ensure_a2a_parent(row["id"])
+    assert parent and parent == await purchases.ensure_a2a_parent(row["id"])
+
+
+async def test_concurrent_workers_claim_disjoint_purchases():
+    import db.a2a_rail_ledger as ledger
+
+    made = set()
+    for i in range(12):
+        row = await ledger.create_purchase(
+            agent_id=AGENT, agent_user_ref_hash=f"{i:064d}", merchant_domain="brand.example",
+            checkout_url="https://brand.example/cart/1:1", currency="USD", our_price_minor=100)
+        made.add(row["id"])
+    batches = await asyncio.gather(*(ledger.claim_due_purchases(f"w{k}", limit=12) for k in range(4)))
+    claimed = [r["id"] for batch in batches for r in batch if r["id"] in made]
+    assert len(claimed) == len(set(claimed)) == 12
