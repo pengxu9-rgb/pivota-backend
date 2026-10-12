@@ -1090,8 +1090,13 @@ async def test_the_acquisition_rule_changes_nothing_for_rows_without_an_acquisit
         without_rule = await svc.recompute_serving_eligibility(ids["content_key"], reason="unit")
         without_rule_row = await _ips_row(ids["content_key"])
         assert (with_rule, with_rule_row["blocker_code"]) == (without_rule, without_rule_row["blocker_code"])
-        # ...and the verdict is today's: flag off serves any priced row; flag on serves USD only (US default).
-        assert with_rule is (currency == "USD" or not gate_on)
+        # ...and the verdict is today's: flag off serves any priced row; flag on serves a row priced in a
+        # served market's currency. Unset env = the market registry's served markets (US, SG; ADR-026), so
+        # an SGD row serves -- as it always did on web/worker, which set US,SG explicitly.
+        from services.market_registry import currency_for, served_markets
+        served_currencies = {currency_for(m) for m in served_markets()}
+        assert served_currencies == {"USD", "SGD"}
+        assert with_rule is (currency in served_currencies or not gate_on)
     finally:
         await _cleanup()
         await _disconnect_if_needed(was_connected)

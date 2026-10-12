@@ -689,13 +689,46 @@ _HAS_US_OFFER_EXISTS = has_offer_priced_for_region_sql("cp.product_key", "US")
 _SERVING_REGIONS_ENV = "PIVOTA_SERVING_PRICING_REGIONS"
 
 
+_NARROWING_LOGGED = False
+
+
 def serving_pricing_regions() -> List[str]:
-    """The configured served regions, e.g. ['US'] or ['US', 'SG']. Never empty."""
+    """The served pricing regions: the market registry's `served` markets (ADR-026), e.g. ['US', 'SG'].
+
+    It used to be the env var, defaulting to ['US'] when unset -- and only web, worker and two jobs set it.
+    On 2026-10-11 the nightly external-referral-refresh (env unset) recomputed serving for 16 products and
+    blocked all 53 of their freshly captured SG offers (no_us_offer) 90 minutes after they landed. A
+    missing setting can no longer mean "US only": the registry is the source.
+
+    PIVOTA_SERVING_PRICING_REGIONS may still NARROW the registry's list (an emergency rollback: "US" turns
+    SG serving off in this process), logged once per process at WARNING. It can never widen it: a region the
+    registry does not serve RAISES, here and therefore at import, because serving an unlaunched market from
+    one process's env is how a market goes live without its checklist. A blank value means "unset"."""
     import os
 
+    from services.market_registry import served_markets
+
+    served = list(served_markets())
     raw = os.getenv(_SERVING_REGIONS_ENV, "") or ""
-    regions = [part.strip().upper() for part in raw.split(",") if part.strip()]
-    return regions or ["US"]
+    regions: List[str] = []
+    for part in raw.split(","):
+        region = part.strip().upper()
+        if region and region not in regions:
+            regions.append(region)
+    if not regions:
+        return served
+    widened = [r for r in regions if r not in served]
+    if widened:
+        raise ValueError(
+            f"{_SERVING_REGIONS_ENV} names {widened}, which config/market_registry.json does not serve "
+            f"(served: {served}). The env may only narrow the registry's served markets; launching a market "
+            "is a registry change (ADR-026 decision 7).")
+    global _NARROWING_LOGGED
+    if set(regions) != set(served) and not _NARROWING_LOGGED:
+        _NARROWING_LOGGED = True
+        logger.warning("%s=%s narrows the registry's served markets %s in this process",
+                       _SERVING_REGIONS_ENV, ",".join(regions), served)
+    return regions
 
 
 _HAS_SERVING_REGION_OFFER_EXISTS = has_offer_priced_for_any_region_sql(

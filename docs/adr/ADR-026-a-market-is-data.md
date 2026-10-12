@@ -203,6 +203,7 @@ Moving a market between states is a reviewed one-line registry change plus the l
 7. **Request budget per market.** Every market read multiplies Shopify-edge requests from the one crawl IP. The shared pacer allows 2 requests per second across every crawl job, and the refresh alone uses most of a night.
    - The capability table drives cadence: capture and refresh only the (storefront, market) pairs that are served and in demand.
    - Each market gets a request budget, so the drain, the captures and the nightly refresh don't starve each other.
+   - **Measured 2026-10-12 (pinned-read canary):** a capture costs about products × the per-host interval (at least 4 s). A 745-product cohort took 2,981 of the drain task's 3,600 s, so a cohort over about 700 products cannot finish in one stage. Captures need chunking or resume, not a bigger timeout.
 
 ### 5. Serving: the buyer market is resolved once and threaded everywhere
 
