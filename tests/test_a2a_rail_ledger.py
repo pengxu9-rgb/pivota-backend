@@ -101,6 +101,8 @@ def test_the_sql_state_lists_follow_the_graph():
 
     for sql in (ledger._EXPIRE_SQL, ledger._EXPIRE_SQL_SQLITE):
         assert "pending_write IS NULL" in outer(sql) and "AND state IN (" in outer(sql)
+        for clock in ("buyer_action_expires_at <", "state_entered_at <", "created_at <"):
+            assert clock in outer(sql), clock
     for sql in (ledger._PURGE_CONTACT_SQL, ledger._PURGE_CONTACT_SQL_SQLITE):
         assert "buyer_email IS NOT NULL OR shipping_address IS NOT NULL" in outer(sql)
     for sql in (ledger._REQUEUE_STALE_SQL, ledger._REQUEUE_STALE_SQL_SQLITE):
@@ -125,7 +127,7 @@ def test_the_view_kinds_belong_to_states_that_ask_the_buyer():
 
 
 def test_the_migration_holds_the_modules_ddl():
-    migration = (_REPO / "db/migrations/267_a2a_rail_ledger.sql").read_text("utf-8")
+    migration = (_REPO / "db/migrations/268_a2a_rail_ledger.sql").read_text("utf-8")
     squash = lambda text: " ".join(text.split())  # noqa: E731
     for name in ("_CREATE_BUYER_REFS_PG", "_CREATE_BUYER_REFS_OWNER_INDEX", "_CREATE_PURCHASES_PG",
                  "_CREATE_PURCHASES_OWNER_INDEX", "_CREATE_PURCHASES_DUE_INDEX"):
@@ -231,6 +233,18 @@ async def test_a_terminal_write_leaves_no_pii_page_claim_or_pending_write():
                    "claimed_by", "claimed_at", "pending_write", "pending_write_at"):
         assert done[column] is None, column
     assert done["consent_version"] == "v1"  # what the purchase was opened under stays
+
+
+@pytest.mark.parametrize("field", ["payment_token_id", "quote_id", "order_id", "merchant_order_id"])
+async def test_a_card_number_is_never_stored_as_a_rail_id(field):
+    row = await _open()
+    await _claimed(row)
+    for value in ("5204731620064587", "5204 7316 2006 4587", "tok_5204731620064587"):
+        with pytest.raises(ValueError):
+            await ledger.transition_as_holder(row["id"], "w1", from_states=["opened"], to_state="quoting",
+                                              **{field: value})
+    with pytest.raises(ValueError):
+        await ledger.forget_voided_token(row["id"], "w1", "5204731620064587")
 
 
 # ── write-ahead ──────────────────────────────────────────────────────────────────────────────

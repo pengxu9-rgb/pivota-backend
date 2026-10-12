@@ -1,4 +1,4 @@
--- 267: THE A2A TOKEN RAIL'S LEDGER (payment orchestration P2): buyer refs + purchases, and the
+-- 268: THE A2A TOKEN RAIL'S LEDGER (payment orchestration P2): buyer refs + purchases, and the
 -- parent ledger's rail vocabulary widened to admit it.
 --
 -- a2a_rail_buyer_refs: one opaque member id per (agent, end user), minted, never derived.

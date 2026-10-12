@@ -1,4 +1,4 @@
-"""Persistence for the A2A token rail (migration 267): buyer refs + purchases.
+"""Persistence for the A2A token rail (migration 268): buyer refs + purchases.
 
 The second payment rail behind the rail-neutral ledger (db/agent_purchase_ledger.py, executor
 `rail_managed`: the rail's own checkout agent places the merchant order, as Reap's does). The
@@ -26,7 +26,8 @@ expire: it ends only on the rail's own answer (completed / failed), read by the 
 where the pay write-ahead lives. A merchant challenge (3DS) during `paying` is a buyer page set with
 `set_payment_challenge`, without leaving the state. `attempts` counts every claim outside the two
 buyer states, `paying` included: a worker must never end `paying` on an attempts cap (money may be
-moving); only the rail's answer ends it. A re-quote (`awaiting_authorization -> quoting`) replaces the
+moving); only the rail's answer ends it. A purchase that ends (expired, failed, refused) while it
+holds a `payment_token_id` keeps the id on purpose: the worker must void that token on the rail. A re-quote (`awaiting_authorization -> quoting`) replaces the
 quote, order and token fields rather than keeping the stale ones, and is REFUSED while a payment
 token is recorded: the buyer may have approved it, and an abandoned authorization must be voided,
 which needs its id. The worker voids it on the rail, then `forget_voided_token`, then re-quotes.
@@ -123,7 +124,7 @@ def new_member_id() -> str:
 
 # ── schema ───────────────────────────────────────────────────────────────────────────────────
 #
-# db/migrations/267_a2a_rail_ledger.sql is the same DDL; db/schema_guard.ensure_required_schema_light
+# db/migrations/268_a2a_rail_ledger.sql is the same DDL; db/schema_guard.ensure_required_schema_light
 # calls `ensure_a2a_rail_schema` on both dialects (a fast-mode boot skips db/migrations/), and
 # tests/test_a2a_rail_ledger_postgres.py proves both build the same schema. New, empty tables: they
 # lock nothing that exists.
@@ -210,16 +211,22 @@ CREATE INDEX IF NOT EXISTS idx_a2a_rail_purchases_due
 
 
 async def ensure_a2a_rail_schema() -> None:
-    """Self-heal parity with migration 267. Idempotent; called at every startup."""
+    """Self-heal parity with migration 268. Idempotent; called at every startup."""
     if IS_POSTGRES:
         await database.execute(_CREATE_BUYER_REFS_PG)
         await database.execute(_CREATE_PURCHASES_PG)
+        # Built only while missing, under the heal lock_timeout (see db/agent_purchase_ledger): once
+        # these tables are live, a bare CREATE INDEX IF NOT EXISTS would queue every boot behind writers.
+        from db.schema_guard import _ensure_index
+
+        for statement in (_CREATE_BUYER_REFS_OWNER_INDEX, _CREATE_PURCHASES_OWNER_INDEX, _CREATE_PURCHASES_DUE_INDEX):
+            await _ensure_index(statement)
     else:
         await database.execute(_CREATE_BUYER_REFS_SQLITE)
         await database.execute(_CREATE_PURCHASES_SQLITE)
-    await database.execute(_CREATE_BUYER_REFS_OWNER_INDEX)
-    await database.execute(_CREATE_PURCHASES_OWNER_INDEX)
-    await database.execute(_CREATE_PURCHASES_DUE_INDEX)
+        await database.execute(_CREATE_BUYER_REFS_OWNER_INDEX)
+        await database.execute(_CREATE_PURCHASES_OWNER_INDEX)
+        await database.execute(_CREATE_PURCHASES_DUE_INDEX)
 
 
 # ── row decoding ─────────────────────────────────────────────────────────────────────────────
@@ -253,6 +260,17 @@ def _require(pattern: "re.Pattern[str]", value: Any, name: str) -> str:
 
 def _optional(pattern: "re.Pattern[str]", value: Any, name: str) -> Optional[str]:
     return None if value is None else _require(pattern, value, name)
+
+
+def _rail_ref(value: Any, name: str) -> Optional[str]:
+    """A rail id (method, token, quote, order). Never a card number: a PAN or DPAN shaped value is
+    refused before it can be stored (the transport strips them; this is the second line)."""
+    from services.payment_orchestration.a2a_rail import _has_card_number
+
+    ref = _optional(_RAIL_REF_RE, value, name)
+    if ref is not None and _has_card_number(ref):
+        raise ValueError(f"{name} looks like a card number")
+    return ref
 
 
 def _require_https_url(value: Any, name: str, *, required: bool) -> Optional[str]:
@@ -527,7 +545,7 @@ async def transition_as_holder(
     values: Dict[str, Any] = {name: None for name in _TRANSITION_FIELDS}
     values.update(fields)
     for name in ("payment_method_id", "payment_token_id", "quote_id", "order_id", "merchant_order_id"):
-        values[name] = _optional(_RAIL_REF_RE, values[name], name)
+        values[name] = _rail_ref(values[name], name)
     for name in ("quoted_total_minor", "final_total_minor", "shipping_minor", "tax_minor"):
         values[name] = _require_minor(values[name], name)
     for name in ("refusal_reason", "last_error_code"):
@@ -642,7 +660,8 @@ _RELEASE_SQL = """
 """
 _RELEASE_SQL_SQLITE = _RELEASE_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
 
-# THE OUTER WHERE RESTATES THE SUBQUERY'S PREDICATE, here and in the expiry sweep. Under READ
+# THE OUTER WHERE RESTATES THE SUBQUERY'S WHOLE PREDICATE (state, pending write AND the clocks),
+# here and in the expiry sweep. Under READ
 # COMMITTED an UPDATE that waited on a row lock re-checks only its OWN qual against the row's new
 # version; `id IN (subquery)` is already decided. Without the restatement a row released and
 # re-claimed meanwhile loses its fresh lease here, and the sweep below expires a row whose worker
@@ -758,6 +777,9 @@ _EXPIRE_SQL = """
            )
        AND state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
        AND pending_write IS NULL
+       AND ((buyer_action_expires_at IS NOT NULL AND buyer_action_expires_at < clock_timestamp())
+            OR state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+            OR created_at < clock_timestamp() - (:max_lifetime_seconds * INTERVAL '1 second'))
     RETURNING id
 """
 _EXPIRE_SQL_SQLITE = """
@@ -782,6 +804,9 @@ _EXPIRE_SQL_SQLITE = """
            )
        AND state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
        AND pending_write IS NULL
+       AND ((buyer_action_expires_at IS NOT NULL AND buyer_action_expires_at < CURRENT_TIMESTAMP)
+            OR state_entered_at < datetime('now', '-' || :max_age_seconds || ' seconds')
+            OR created_at < datetime('now', '-' || :max_lifetime_seconds || ' seconds'))
     RETURNING id
 """
 #: Read from the OUTER predicate (the race guard); a test holds the inner list equal to it.
@@ -924,7 +949,7 @@ async def forget_voided_token(purchase_id: str, worker_id: str, payment_token_id
     values = {
         "id": purchase_id,
         "holder": _require(_WORKER_RE, worker_id, "worker_id"),
-        "payment_token_id": _require(_RAIL_REF_RE, payment_token_id, "payment_token_id"),
+        "payment_token_id": _rail_ref(_require(_RAIL_REF_RE, payment_token_id, "payment_token_id"), "payment_token_id"),
     }
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_FORGET_TOKEN_SQL, values))

@@ -2,7 +2,7 @@
 payment rail, pointing at that rail's own purchase row.
 
 Payment orchestration P0. Two rails, both executor `rail_managed` (the rail places the order):
-Reap (`reap_agentic_purchases`) and the A2A token rail (`a2a_rail_purchases`, migration 267).
+Reap (`reap_agentic_purchases`) and the A2A token rail (`a2a_rail_purchases`, migration 268).
 
 ── THE PARENT HAS NO STATE, ON PURPOSE ──────────────────────────────────────────────────────
 
@@ -102,29 +102,49 @@ CREATE INDEX IF NOT EXISTS idx_agent_purchases_owner
 """
 
 
-#: Migration 267 widened the rail CHECK. A table built before it keeps the narrow one (CREATE TABLE IF
-#: NOT EXISTS never alters), so the heal re-adds it: on Postgres inside schema_guard.guarded_ddl, only
-#: while the definition differs (a lock-free catalog read) and under its lock_timeout; on SQLite, which
-#: cannot alter a CHECK, by rebuilding the table (local and test databases only).
+#: Migration 268 widened the rail CHECK. A table built before it keeps the narrow one (CREATE TABLE IF
+#: NOT EXISTS never alters), so the heal re-adds it. On Postgres, on a LIVE table, in two guarded steps
+#: (schema_guard.guarded_ddl: each runs only while a lock-free catalog read says it is still needed,
+#: under the heal lock_timeout, and a timeout defers it to the next boot):
+#:   1. DROP + ADD ... NOT VALID, in one transaction: ACCESS EXCLUSIVE only for a catalog change, no
+#:      scan, and the wide CHECK binds every new row from that moment;
+#:   2. VALIDATE CONSTRAINT: the scan of existing rows, under SHARE UPDATE EXCLUSIVE, which blocks
+#:      neither reads nor writes.
+#: Once the constraint is wide and validated, neither step's guard is true: the heal takes no lock.
+#: On SQLite, which cannot alter a CHECK, by rebuilding the table (local and test databases only).
 _RAIL_CHECK_PG_DEF = (
     "CHECK (((rail)::text = ANY ((ARRAY['reap'::character varying, 'a2a'::character varying])::text[])))"
 )
 _WIDEN_RAIL_CHECK_PG = """
     ALTER TABLE agent_purchases DROP CONSTRAINT IF EXISTS ck_agent_purchases_rail;
-    ALTER TABLE agent_purchases ADD CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap', 'a2a'));
+    ALTER TABLE agent_purchases ADD CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap', 'a2a')) NOT VALID;
 """
+_VALIDATE_RAIL_CHECK_PG = """
+    ALTER TABLE agent_purchases VALIDATE CONSTRAINT ck_agent_purchases_rail;
+"""
+#: Step 1 is needed while no constraint of that name has the wide list, validated or not.
+_RAIL_CHECK_WIDE_ABSENT = (
+    "NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass('agent_purchases') "
+    "AND conname = 'ck_agent_purchases_rail' "
+    "AND replace(pg_get_constraintdef(oid), ' NOT VALID', '') = $def$" + _RAIL_CHECK_PG_DEF + "$def$)"
+)
+#: Step 2 is needed while that constraint exists and is not yet validated.
+_RAIL_CHECK_UNVALIDATED = (
+    "EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass('agent_purchases') "
+    "AND conname = 'ck_agent_purchases_rail' AND NOT convalidated)"
+)
 _SQLITE_TABLES_SQL = (
     "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
-    "AND name IN ('agent_purchases', 'agent_purchases_pre267')"
+    "AND name IN ('agent_purchases', 'agent_purchases_pre268')"
 )
-_SQLITE_RENAME_OLD = "ALTER TABLE agent_purchases RENAME TO agent_purchases_pre267"
+_SQLITE_RENAME_OLD = "ALTER TABLE agent_purchases RENAME TO agent_purchases_pre268"
 _SQLITE_COPY_OLD = """
     INSERT OR IGNORE INTO agent_purchases (id, rail, executor, rail_purchase_id, agent_id, agent_user_ref_hash,
                                  routing_plan, created_at)
     SELECT id, rail, executor, rail_purchase_id, agent_id, agent_user_ref_hash, routing_plan, created_at
-      FROM agent_purchases_pre267
+      FROM agent_purchases_pre268
 """
-_SQLITE_DROP_OLD = "DROP TABLE agent_purchases_pre267"
+_SQLITE_DROP_OLD = "DROP TABLE agent_purchases_pre268"
 
 
 async def _sqlite_tables() -> Dict[str, str]:
@@ -134,7 +154,7 @@ async def _sqlite_tables() -> Dict[str, str]:
 async def _sqlite_widen_rail_check() -> None:
     """Rebuild a narrow-CHECK table, resumably. The four steps are separate statements, so a crash
     can stop between any two; every boot first finishes whatever an earlier one left:
-      only `_pre267`           -> crashed after the rename: create, copy, drop;
+      only `_pre268`           -> crashed after the rename: create, copy, drop;
       both                     -> crashed after the create or the copy: copy (INSERT OR IGNORE), drop;
       only a narrow table      -> start: rename, create, copy, drop.
     The old table is dropped BEFORE the indexes are created: it owns their names until then."""
@@ -143,32 +163,37 @@ async def _sqlite_widen_rail_check() -> None:
     if IS_POSTGRES:
         return
     tables = await _sqlite_tables()
-    if "agent_purchases" in tables and "'a2a'" not in tables["agent_purchases"] and "agent_purchases_pre267" not in tables:
+    if "agent_purchases" in tables and "'a2a'" not in tables["agent_purchases"] and "agent_purchases_pre268" not in tables:
         await database.execute(_SQLITE_RENAME_OLD)
         tables = await _sqlite_tables()
     await database.execute(_CREATE_TABLE_SQLITE)
-    if "agent_purchases_pre267" in tables:
+    if "agent_purchases_pre268" in tables:
         await database.execute(_SQLITE_COPY_OLD)
         await database.execute(_SQLITE_DROP_OLD)
 
 
 async def ensure_agent_purchase_schema() -> None:
-    """Self-heal parity with migrations 264 and 267. Idempotent; called at every startup."""
+    """Self-heal parity with migrations 264 and 268. Idempotent; called at every startup."""
     # `if`/`else` statements, not a conditional expression: the PREPARE gate resolves only a literal or a
     # module-level name as the first argument, and an IfExp hides BOTH statements from it.
     if IS_POSTGRES:
         await database.execute(_CREATE_TABLE_PG)
-        from db.schema_guard import _heal_guarded, constraint_differs
+        from db.schema_guard import _heal_guarded
 
-        await _heal_guarded(
-            "agent_purchases",
-            constraint_differs("agent_purchases", "ck_agent_purchases_rail", _RAIL_CHECK_PG_DEF),
-            _WIDEN_RAIL_CHECK_PG,
-        )
+        await _heal_guarded("agent_purchases", _RAIL_CHECK_WIDE_ABSENT, _WIDEN_RAIL_CHECK_PG)
+        await _heal_guarded("agent_purchases", _RAIL_CHECK_UNVALIDATED, _VALIDATE_RAIL_CHECK_PG)
+        # A bare CREATE INDEX IF NOT EXISTS takes the table's SHARE lock BEFORE it looks for the name,
+        # so on this live table every boot would queue behind any open writer, and every later
+        # writer behind the boot. schema_guard._ensure_index builds only while the index is missing
+        # (a lock-free pg_class read) and defers on its lock_timeout.
+        from db.schema_guard import _ensure_index
+
+        await _ensure_index(_CREATE_RAIL_INDEX)
+        await _ensure_index(_CREATE_OWNER_INDEX)
     else:
         await _sqlite_widen_rail_check()
-    await database.execute(_CREATE_RAIL_INDEX)
-    await database.execute(_CREATE_OWNER_INDEX)
+        await database.execute(_CREATE_RAIL_INDEX)
+        await database.execute(_CREATE_OWNER_INDEX)
 
 
 # ── writes ───────────────────────────────────────────────────────────────────────────────────

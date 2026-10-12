@@ -1,4 +1,4 @@
-"""db/a2a_rail_ledger.py on Postgres: schema parity with migration 267, the parent's widened rail
+"""db/a2a_rail_ledger.py on Postgres: schema parity with migration 268, the parent's widened rail
 CHECK, every statement with NULL and timestamp parameters (Postgres types them; SQLite does not),
 and the claim under real concurrency.
 
@@ -17,10 +17,10 @@ import pytest
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://")
-pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL; production-dialect gate for migration 267")
+pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL; production-dialect gate for migration 268")
 
 _REPO = Path(__file__).resolve().parent.parent
-_MIGRATION = _REPO / "db/migrations/267_a2a_rail_ledger.sql"
+_MIGRATION = _REPO / "db/migrations/268_a2a_rail_ledger.sql"
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 _TABLES = ("a2a_rail_purchases", "a2a_rail_buyer_refs")
 AGENT = "agent_a2a_pg"
@@ -80,7 +80,7 @@ async def _rail_check():
     return row["def"] if row else None
 
 
-async def test_the_self_heal_builds_the_same_schema_as_migration_267():
+async def test_the_self_heal_builds_the_same_schema_as_migration_268():
     from db.database import database
     from db.sql_migrations import split_statements
     import db.a2a_rail_ledger as ledger
@@ -105,19 +105,19 @@ async def test_the_parent_heal_widens_an_old_rail_check_and_keeps_rows():
     from db.database import database
     import db.agent_purchase_ledger as purchases
 
-    await database.execute("DELETE FROM agent_purchases WHERE id IN ('pp_pre267', 'pp_post267')")
+    await database.execute("DELETE FROM agent_purchases WHERE id IN ('pp_pre268', 'pp_post268')")
     await database.execute("ALTER TABLE agent_purchases DROP CONSTRAINT IF EXISTS ck_agent_purchases_rail")
     await database.execute(
         "ALTER TABLE agent_purchases ADD CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap'))")
     await database.execute(
-        "INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id) VALUES ('pp_pre267', 'reap', 'rail_managed', 'rp_pre267')")
+        "INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id) VALUES ('pp_pre268', 'reap', 'rail_managed', 'rp_pre268')")
     await purchases.ensure_agent_purchase_schema()
     assert await _rail_check() == purchases._RAIL_CHECK_PG_DEF
     await database.execute(
-        "INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id) VALUES ('pp_post267', 'a2a', 'rail_managed', 'ap_post267')")
-    ids = {r["id"] for r in await database.fetch_all("SELECT id FROM agent_purchases WHERE id IN ('pp_pre267', 'pp_post267')")}
-    assert ids == {"pp_pre267", "pp_post267"}
-    await database.execute("DELETE FROM agent_purchases WHERE id IN ('pp_pre267', 'pp_post267')")
+        "INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id) VALUES ('pp_post268', 'a2a', 'rail_managed', 'ap_post268')")
+    ids = {r["id"] for r in await database.fetch_all("SELECT id FROM agent_purchases WHERE id IN ('pp_pre268', 'pp_post268')")}
+    assert ids == {"pp_pre268", "pp_post268"}
+    await database.execute("DELETE FROM agent_purchases WHERE id IN ('pp_pre268', 'pp_post268')")
 
 
 async def test_the_parent_heal_takes_no_lock_once_the_check_is_wide():
@@ -129,7 +129,11 @@ async def test_the_parent_heal_takes_no_lock_once_the_check_is_wide():
         tx = other.transaction()
         await tx.start()
         await other.execute("LOCK TABLE agent_purchases IN ACCESS SHARE MODE")
+        started = asyncio.get_running_loop().time()
         await asyncio.wait_for(purchases.ensure_agent_purchase_schema(), timeout=5)
+        # well under the heal's 500 ms lock_timeout: no lock was even attempted (a DROP that waited
+        # and gave up would also "return", which is why the bound matters)
+        assert asyncio.get_running_loop().time() - started < 0.3
         await tx.rollback()
     finally:
         await other.close()
@@ -293,3 +297,128 @@ async def test_the_new_statements_run_with_real_parameters_on_postgres():
     await ledger.release_claim(other, "w1")
     assert await ledger.expire_overdue_purchases(max_age_seconds=86400, max_lifetime_seconds=2 * 86400) >= 1
     assert (await ledger.get_purchase_internal(other))["state"] == "expired"
+
+
+async def _rail_check_state():
+    from db.database import database
+
+    row = await database.fetch_one(
+        "SELECT pg_get_constraintdef(c.oid) AS def, c.convalidated AS ok FROM pg_constraint c "
+        "JOIN pg_class t ON t.oid = c.conrelid WHERE t.relname = 'agent_purchases' AND c.conname = 'ck_agent_purchases_rail'")
+    return (row["def"], row["ok"]) if row else (None, None)
+
+
+async def _narrow_rail_check():
+    from db.database import database
+
+    await database.execute("ALTER TABLE agent_purchases DROP CONSTRAINT IF EXISTS ck_agent_purchases_rail")
+    await database.execute("ALTER TABLE agent_purchases ADD CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap'))")
+
+
+async def test_the_parent_heal_finishes_a_widening_interrupted_before_validation():
+    from db.database import database
+    import db.agent_purchase_ledger as purchases
+
+    await database.execute("ALTER TABLE agent_purchases DROP CONSTRAINT IF EXISTS ck_agent_purchases_rail")
+    await database.execute(
+        "ALTER TABLE agent_purchases ADD CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap', 'a2a')) NOT VALID")
+    assert (await _rail_check_state())[1] is False
+    await purchases.ensure_agent_purchase_schema()
+    assert await _rail_check_state() == (purchases._RAIL_CHECK_PG_DEF, True)
+
+
+async def test_the_parent_heal_defers_rather_than_waits_when_the_table_is_busy():
+    """A boot must not queue behind live traffic: with a reader holding the table, step 1's ACCESS
+    EXCLUSIVE gives up at the heal lock_timeout and the heal is deferred, not stuck."""
+    import asyncpg
+    import db.agent_purchase_ledger as purchases
+
+    await _narrow_rail_check()
+    reader = await asyncpg.connect(DATABASE_URL)
+    try:
+        tx = reader.transaction()
+        await tx.start()
+        await reader.execute("LOCK TABLE agent_purchases IN ACCESS SHARE MODE")
+        await asyncio.wait_for(purchases.ensure_agent_purchase_schema(), timeout=5)
+        assert "'a2a'" not in (await _rail_check_state())[0]  # deferred to the next boot
+        await tx.rollback()
+    finally:
+        await reader.close()
+    await purchases.ensure_agent_purchase_schema()
+    assert await _rail_check_state() == (purchases._RAIL_CHECK_PG_DEF, True)
+
+
+async def test_validation_does_not_block_writers_and_writers_do_not_block_it():
+    """Step 2 runs under SHARE UPDATE EXCLUSIVE: an open writer transaction on the table neither
+    waits for it nor stops it."""
+    import asyncpg
+    from db.database import database
+    import db.agent_purchase_ledger as purchases
+
+    await database.execute("ALTER TABLE agent_purchases DROP CONSTRAINT IF EXISTS ck_agent_purchases_rail")
+    await database.execute(
+        "ALTER TABLE agent_purchases ADD CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap', 'a2a')) NOT VALID")
+    writer = await asyncpg.connect(DATABASE_URL)
+    try:
+        tx = writer.transaction()
+        await tx.start()
+        await writer.execute(
+            "INSERT INTO agent_purchases (id, rail, executor, rail_purchase_id) "
+            "VALUES ('pp_writer_open', 'reap', 'rail_managed', 'rp_writer_open')")
+        await asyncio.wait_for(purchases.ensure_agent_purchase_schema(), timeout=5)
+        assert await _rail_check_state() == (purchases._RAIL_CHECK_PG_DEF, True)
+        await tx.rollback()
+    finally:
+        await writer.close()
+
+
+async def test_a_healthy_boot_takes_no_lock_that_waits_for_writers():
+    """Once wide and indexed, both ledgers' heals are catalog reads: an open writer transaction on
+    each table (ROW EXCLUSIVE, which a bare CREATE INDEX IF NOT EXISTS's SHARE lock would wait on)
+    does not hold the boot up."""
+    import asyncpg
+    import db.a2a_rail_ledger as ledger
+    import db.agent_purchase_ledger as purchases
+
+    await purchases.ensure_agent_purchase_schema()
+    await ledger.ensure_a2a_rail_schema()
+    writer = await asyncpg.connect(DATABASE_URL)
+    try:
+        tx = writer.transaction()
+        await tx.start()
+        await writer.execute("LOCK TABLE agent_purchases IN ROW EXCLUSIVE MODE")
+        await writer.execute("LOCK TABLE a2a_rail_purchases IN ROW EXCLUSIVE MODE")
+        await writer.execute("LOCK TABLE a2a_rail_buyer_refs IN ROW EXCLUSIVE MODE")
+        started = asyncio.get_running_loop().time()
+        await asyncio.wait_for(purchases.ensure_agent_purchase_schema(), timeout=5)
+        await asyncio.wait_for(ledger.ensure_a2a_rail_schema(), timeout=5)
+        assert asyncio.get_running_loop().time() - started < 0.3  # nothing waited on a lock
+        await tx.rollback()
+    finally:
+        await writer.close()
+
+
+
+async def test_the_sweep_does_not_expire_a_row_requoted_while_it_waited():
+    """The time predicate is part of the race guard too: the sweep saw a stale row, then blocked
+    while the worker re-quoted it (fresh state_entered_at). Woken, it must re-check the clocks."""
+    import asyncpg
+    from db.database import database
+    import db.a2a_rail_ledger as ledger
+
+    pid = await _stale_awaiting_authorization()
+    worker = await asyncpg.connect(DATABASE_URL)
+    try:
+        tx = worker.transaction()
+        await tx.start()
+        await worker.execute(
+            "UPDATE a2a_rail_purchases SET state = 'quoting', state_entered_at = now(), "
+            "buyer_action_kind = NULL, buyer_action_url = NULL WHERE id = $1", pid)
+        sweep = asyncio.ensure_future(ledger.expire_overdue_purchases(max_age_seconds=86400))
+        await asyncio.sleep(0.5)
+        assert not sweep.done()
+        await tx.commit()
+        assert await asyncio.wait_for(sweep, timeout=10) == 0
+    finally:
+        await worker.close()
+    assert (await ledger.get_purchase_internal(pid))["state"] == "quoting"

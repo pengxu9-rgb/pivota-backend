@@ -77,12 +77,12 @@ _RAIL_CHECK_264 = "CHECK (rail IN ('reap'))"
 
 
 def _migrated_ddl() -> str:
-    """Migration 264's DDL with migration 267's widened rail CHECK applied: what the migrations
+    """Migration 264's DDL with migration 268's widened rail CHECK applied: what the migrations
     leave behind, to compare with the one CREATE TABLE the module holds."""
     m264 = (_REPO / "db/migrations/264_agent_purchases.sql").read_text("utf-8")
-    m267 = (_REPO / "db/migrations/267_a2a_rail_ledger.sql").read_text("utf-8")
-    widened = re.search(r"ADD CONSTRAINT ck_agent_purchases_rail (CHECK \(rail IN \([^)]*\)\))", m267)
-    assert widened and "DROP CONSTRAINT IF EXISTS ck_agent_purchases_rail" in m267
+    m268 = (_REPO / "db/migrations/268_a2a_rail_ledger.sql").read_text("utf-8")
+    widened = re.search(r"ADD CONSTRAINT ck_agent_purchases_rail (CHECK \(rail IN \([^)]*\)\))", m268)
+    assert widened and "DROP CONSTRAINT IF EXISTS ck_agent_purchases_rail" in m268
     assert m264.count(_RAIL_CHECK_264) == 1
     return m264.replace(_RAIL_CHECK_264, widened.group(1))
 
@@ -103,6 +103,10 @@ def test_the_migrations_create_the_table_and_indexes_the_module_creates():
 
 def test_the_heal_widens_the_rail_check_to_the_module_vocabulary():
     assert purchases._WIDEN_RAIL_CHECK_PG.count("ADD CONSTRAINT ck_agent_purchases_rail") == 1
+    # NOT VALID in the step that holds ACCESS EXCLUSIVE; the scan is the separate VALIDATE step
+    assert purchases._WIDEN_RAIL_CHECK_PG.rstrip().endswith("NOT VALID;")
+    assert "VALIDATE CONSTRAINT ck_agent_purchases_rail" in purchases._VALIDATE_RAIL_CHECK_PG
+    assert "VALIDATE" not in purchases._WIDEN_RAIL_CHECK_PG
     assert _check_values(purchases._WIDEN_RAIL_CHECK_PG.replace("ADD CONSTRAINT", "CONSTRAINT"), "rail") == purchases.RAILS
     for rail in purchases.RAILS:
         assert f"'{rail}'::character varying" in purchases._RAIL_CHECK_PG_DEF
@@ -127,7 +131,7 @@ async def test_the_sqlite_heal_rebuilds_a_table_with_the_narrow_check_and_keeps_
 
 async def _narrow_table_with_a_row():
     await database.execute("DROP TABLE IF EXISTS agent_purchases")
-    await database.execute("DROP TABLE IF EXISTS agent_purchases_pre267")
+    await database.execute("DROP TABLE IF EXISTS agent_purchases_pre268")
     await database.execute(purchases._CREATE_TABLE_SQLITE.replace("('reap', 'a2a')", "('reap')"))
     await database.execute(purchases._CREATE_RAIL_INDEX)
     await database.execute(
@@ -139,7 +143,7 @@ async def _assert_rebuilt():
     rows = {r["id"] for r in await database.fetch_all("SELECT id FROM agent_purchases")}
     assert rows == {"pp_x"}
     tables = {r["name"] for r in await database.fetch_all("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    assert "agent_purchases_pre267" not in tables
+    assert "agent_purchases_pre268" not in tables
     indexes = {r["name"] for r in await database.fetch_all("PRAGMA index_list(agent_purchases)")}
     assert {"uq_agent_purchases_rail_purchase", "idx_agent_purchases_owner"} <= indexes
     assert await purchases.ensure_reap_parent("rp_missing") is None  # ON CONFLICT target exists again

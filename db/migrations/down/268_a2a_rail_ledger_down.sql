@@ -1,4 +1,4 @@
--- Reverses 267. FAILS (the ADD CONSTRAINT errors, rolling back this file's transaction) while any
+-- Reverses 268. FAILS (the ADD CONSTRAINT errors, rolling back this file's transaction) while any
 -- parent row names the a2a rail: resolve and delete those purchases first, or the child table would
 -- be dropped under them.
 SET LOCAL lock_timeout = '5s';
