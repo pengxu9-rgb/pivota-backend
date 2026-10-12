@@ -676,7 +676,8 @@ def test_a_formula_finish_or_bare_number_is_not_a_shade(suffix, reason):
     assert len(out) == 2 and [r["reason"] for r in report["refused"]] == [reason]
 
 
-@pytest.mark.parametrize("suffix,axis_name,axis", [("Velvet Rose", "Shade", "Shade"), ("101", "Colour", "Colour"),
+@pytest.mark.parametrize("suffix,axis_name,axis", [("Velvet Rose", "Shade", "Shade"), ("Satin", "Shade", "Shade"),
+                                                   ("101", "Colour", "Colour"),
                                                    ("30", "Size", "Size")])
 def test_the_shops_own_option_name_lets_a_finish_word_or_number_fold(suffix, axis_name, axis):
     out, report = feed.fold_shade_listings([product("Lipstick", "b"),
@@ -732,3 +733,63 @@ def test_an_axis_the_shop_names_otherwise_keeps_its_name():
     rec = feed.shopify_product_to_record(out[0], domain=HOST, category_path="beauty", emit_variants=True)
     assert _variants(rec) == [("Fig", "Scent")]
     assert report["axes"] == {"shade": 0, "size": 0, "named": 1}
+
+
+# ---- re-review ---------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("shade", ["Light", "Light Medium", "Classic Ivory", "Rich Espresso", "Glitter Gold",
+                                   "Pearl Pink", "Frosted Lilac", "Cream Beige"])
+def test_a_shade_name_containing_a_finish_word_folds(shade):
+    """Per-shade listings carry "Default Title", so there is no option evidence: a finish WORD inside a shade
+    name must not refuse the shade (a whole line half-folded otherwise)."""
+    out, report = feed.fold_shade_listings([product("Gel Colour", "g"), product("Gel Colour - Ruby", "g-ruby"),
+                                            product(f"Gel Colour - {shade}", "g-x")], extended=True)
+    assert len(out) == 1 and report["refused"] == [] and report["axes"]["shade"] == 2
+
+
+def test_a_whole_line_of_shade_names_folds_with_its_finish_words():
+    names = ["Ruby", "Light", "Light Medium", "Classic Ivory", "Rich Espresso", "Glitter Gold", "Pearl Pink",
+             "Frosted Lilac", "Cream Beige"]
+    rows = [product("Gel Colour", "g")] + [product(f"Gel Colour - {n}", f"g-{i}") for i, n in enumerate(names)]
+    out, report = feed.fold_shade_listings(rows, extended=True)
+    assert [p["handle"] for p in out] == ["g"] and report["shades"] == len(names)
+
+
+@pytest.mark.parametrize("suffix", ["Matte", "Satin", "Matte Finish", "Oil Free", "Oil-Free", "Waterproof", "Tinted",
+                                    "Long Wear", "Matte / Long-Wear"])
+def test_a_suffix_that_is_only_finish_words_is_still_refused(suffix):
+    out, report = feed.fold_shade_listings([product("Lipstick", "b"), product(f"Lipstick - {suffix}", "c")],
+                                           extended=True)
+    assert len(out) == 2 and [r["reason"] for r in report["refused"]] == ["finish_or_formula_suffix"]
+
+
+def test_matte_and_satin_siblings_are_refused_without_evidence():
+    rows = [product("Lipstick", "b"), product("Lipstick - Matte", "m"), product("Lipstick - Satin", "s")]
+    out, report = feed.fold_shade_listings(rows, extended=True)
+    assert [p["handle"] for p in out] == ["b", "m", "s"]
+    assert {r["handle"]: r["reason"] for r in report["refused"]} == {"m": "finish_or_formula_suffix",
+                                                                     "s": "finish_or_formula_suffix"}
+
+
+def test_siblings_that_differ_only_by_finish_words_are_refused():
+    rows = [product("Lipstick", "b"), product("Lipstick - Matte Red", "mr"), product("Lipstick - Satin Red", "sr"),
+            product("Lipstick - Gold", "g"), product("Lipstick - Glitter Gold", "gg"),
+            product("Lipstick - Ruby", "r")]
+    out, report = feed.fold_shade_listings(rows, extended=True)
+    assert [p["handle"] for p in out] == ["b", "mr", "sr", "g", "gg"]
+    assert report["folded"] == {"b": ["r"]}
+    assert {r["handle"]: r["reason"] for r in report["refused"]} == {
+        h: "finish_variant_siblings" for h in ("mr", "sr", "g", "gg")}
+    # the shop's own option naming a shade axis is the evidence that lets them fold
+    named = [product("Lipstick", "b")] + [product(f"Lipstick - {n}", h, option1=n, option_name="Shade")
+                                         for n, h in (("Matte Red", "mr"), ("Satin Red", "sr"))]
+    out, report = feed.fold_shade_listings(named, extended=True)
+    assert [p["handle"] for p in out] == ["b"] and report["refused"] == []
+
+
+@pytest.mark.parametrize("url", [f"https://user@{HOST}/products/g-ruby", f"https://user:pw@{HOST}/products/g-ruby",
+                                 f"https://{HOST}:8443/products/g-ruby", f"https://{HOST}/products/g-ruby?variant=1",
+                                 f"https://{HOST}/products/g-ruby#x", f"https://{HOST}/products/g-ruby?variant=1#x",
+                                 f"https://{HOST}:abc/products/g-ruby", "https://[bad/products/g-ruby"])
+def test_an_own_listing_url_is_one_plain_storefront_url(url):
+    assert ingestion.own_listing_url(f"https://{HOST}/products/g", url) is None

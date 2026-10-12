@@ -3119,15 +3119,23 @@ _CODE_SUFFIX_RE = re.compile(r"(?=(?:[^A-Z]*[A-Z]){3})(?=[^0-9]*[0-9])[A-Z0-9]{5
 #: A formula claim names a different product, never a shade: "<Sun Fluid> - SPF 30" beside "- SPF 50".
 #: Refused whatever the option names say.
 _FORMULA_CLAIM_SUFFIX_RE = re.compile(r"(?i)\bSPF\s*\d+|\bPA\s*\+|\bUV[AB]?\b")
-#: Finish and formula words: "<Lipstick> - Matte" / "- Satin", "<Foundation> - Oil Free" / "- Waterproof" /
-#: "- Tinted" are different formulas, not shades of one. Refused unless the child's own Shopify option
-#: names a shade or size axis ("Shade: Velvet Rose" is a shade that happens to contain "velvet").
-_FINISH_OR_FORMULA_SUFFIX_RE = re.compile(
-    r"(?i)\b(matte|satin|gloss|glossy|shimmer|metallic|sheer|velvet|cream|creme|crème|dewy|radiant|luminous|"
-    r"glitter|frost(ed)?|pearl(escent)?|oil[- ]?free|waterproof|water[- ]?resistant|tinted|fragrance[- ]?free|"
-    r"unscented|scented|hydrating|mattifying|long[- ]?wear(ing)?|vegan|original|classic|intense|light|rich|"
-    r"sensitive|extra)\b"
-)
+#: Finish and formula words. A suffix made ONLY of them ("<Lipstick> - Matte" / "- Satin", "<Foundation> -
+#: Oil Free" / "- Waterproof" / "- Tinted", "- Matte Finish") names another formula, not a shade; so do
+#: siblings that differ ONLY by them ("- Matte Red" beside "- Satin Red"). Both are refused unless the
+#: child's own Shopify option names a shade or size axis. A shade NAME that merely contains one of them
+#: ("Glitter Gold", "Pearl Pink", "Frosted Lilac", "Cream Beige") is a shade and folds -- which is why
+#: words that are also everyday shade names on their own ("Light", "Rich", "Classic") are not listed.
+_FINISH_WORDS = (r"matte|satin|gloss|glossy|shimmer|metallic|sheer|velvet|cream|creme|crème|dewy|radiant|"
+                 r"luminous|glitter|frost|frosted|pearl|pearlescent|oil[- ]?free|waterproof|water[- ]?resistant|"
+                 r"tinted|fragrance[- ]?free|unscented|scented|hydrating|mattifying|long[- ]?wear(?:ing)?|vegan|"
+                 r"sensitive|finish|formula")
+_FINISH_OR_FORMULA_SUFFIX_RE = re.compile(rf"(?i)\s*(?:{_FINISH_WORDS})(?:[\s/&+,-]+(?:{_FINISH_WORDS}))*\s*")
+_FINISH_WORD_RE = re.compile(rf"(?i)\b(?:{_FINISH_WORDS})\b")
+
+
+def _without_finish_words(suffix: str) -> str:
+    """The suffix with every finish / formula word removed, as a comparison key ("Matte Red" -> "red")."""
+    return " ".join(re.sub(r"[^\w]+", " ", _FINISH_WORD_RE.sub(" ", suffix or "")).casefold().split())
 #: A bare number ("<Serum> - 30" / "- 50") is a size without a unit, a shade code, or a strength: the fold
 #: cannot tell which, so it folds only when the child's own option names the axis.
 _BARE_NUMBER_SUFFIX_RE = re.compile(r"\d+(?:[.,]\d+)?")
@@ -3230,7 +3238,7 @@ def _fold_refused_extended(base: Dict[str, Any], child: Dict[str, Any], suffix: 
                            evidence: bool) -> Optional[str]:
     if _NON_SHADE_SUFFIX_RE.search(suffix or "") or _EXTENDED_NON_SHADE_SUFFIX_RE.search(suffix or ""):
         return "non_shade_suffix"
-    if not evidence and _FINISH_OR_FORMULA_SUFFIX_RE.search(suffix or ""):
+    if not evidence and _FINISH_OR_FORMULA_SUFFIX_RE.fullmatch(suffix or ""):
         return "finish_or_formula_suffix"
     if not evidence and _BARE_NUMBER_SUFFIX_RE.fullmatch((suffix or "").strip()):
         return "bare_number_suffix"
@@ -3331,6 +3339,19 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
         if id(p) in target and id(p) in bases:
             del target[id(p)]
             refuse(p, "chained_fold")
+    # Siblings that differ ONLY by finish / formula words ("- Matte Red" beside "- Satin Red", "- Gold" beside
+    # "- Glitter Gold") are formulas of one shade: all of them refused, unless the shop's own option names
+    # the axis (evidence, as in _fold_refused_extended).
+    by_rest: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+    for p in rows:
+        t = target.get(id(p))
+        if t is not None and t[1] == "variant" and not _axis_family(t[3] or ""):
+            by_rest.setdefault((id(t[0]), _without_finish_words(t[2])), []).append(p)
+    for (_base_id, rest), group in by_rest.items():
+        if rest and len({_norm_label(target[id(p)][2]) for p in group}) > 1:
+            for p in group:
+                del target[id(p)]
+                refuse(p, "finish_variant_siblings")
     children: Dict[int, List[Dict[str, Any]]] = {}
     for p in rows:
         if id(p) in target:

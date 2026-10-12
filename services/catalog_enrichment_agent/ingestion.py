@@ -389,11 +389,17 @@ def own_listing_url(listing_url: Optional[str], candidate: Optional[str]) -> Opt
     the base URL, and re-pointing them would re-key each offer (offer_id hashes the URL) beside the old one."""
     from urllib.parse import urlsplit
 
-    own, base = urlsplit(str(candidate or "")), urlsplit(str(listing_url or ""))
-    host = (own.hostname or "").lower().removeprefix("www.")
-    if (not candidate or own.scheme not in {"http", "https"} or not host
-            or host != (base.hostname or "").lower().removeprefix("www.")
-            or not own.path.startswith("/products/") or not own.path[len("/products/"):].strip("/")):
+    try:  # a malformed URL ("https://h:abc/", "https://[bad/") names no listing
+        own, base = urlsplit(str(candidate or "")), urlsplit(str(listing_url or ""))
+        host = (own.hostname or "").lower().removeprefix("www.")
+        if (not candidate or own.scheme not in {"http", "https"} or not host
+                # one plain storefront URL, as retailer_listing_identity demands of a listing: no credentials,
+                # no port, and nothing after the path (a query or fragment would mint a second offer_id)
+                or own.username or own.password or own.port or own.query or own.fragment
+                or host != (base.hostname or "").lower().removeprefix("www.")
+                or not own.path.startswith("/products/") or not own.path[len("/products/"):].strip("/")):
+            return None
+    except ValueError:
         return None
     return str(candidate)
 
