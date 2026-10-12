@@ -11,6 +11,8 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
   needs_payment_method  -> read the cards. The one being bound (or any other) is ACTIVE: `quoting`. It
                            failed: `failed`. Still pending: tell the rail the buyer may be done
                            (`bound`) on a spaced schedule (BOUND_SCHEDULE), and read its answer.
+  any state, after an answer that reported money moving (`money_result_seen`) -> PARKED FOR GOOD: no
+                           read, no reconcile, no resend; only a human ends it.
   quoting and later     -> PARKED (`shop_protocol_pending`). Quoting, the order lock, the token and the
                            pay all depend on the rail's order protocol, which is not settled; nothing
                            here guesses at a step that can move money. The lifetime ceiling in the
@@ -119,6 +121,9 @@ class _Step:
         self.client, self.row, self.worker = client, row, worker
         self.id = str(row["id"])
         self.context = client.context_for(str(row["member_id"]), self.id)
+        # Card-list reads go in a conversation of their own, so a read never lands in the middle of
+        # the binding conversation (add -> page -> bound) and changes what that conversation expects.
+        self.read_context = client.context_for(str(row["member_id"]), f"{self.id}_r")
 
     async def send(self, pair: Tuple[str, str], payload: Optional[Mapping[str, Any]] = None):
         return await self.client.send_action(
@@ -136,7 +141,10 @@ class _Step:
 
     async def methods(self) -> Tuple[Optional[List[Dict[str, Any]]], Any]:
         """The buyer's cards on the rail (a read), or (None, result) when the read failed."""
-        result = await self.send(VIEW_METHODS, {"list_statuses": _LIST_ALL})
+        result = await self.client.send_action(
+            member_id=str(self.row["member_id"]), context_id=self.read_context,
+            component=VIEW_METHODS[0], action=VIEW_METHODS[1], payload={"list_statuses": _LIST_ALL},
+        )
         card = result.card("payment.method-list") if result.ok else None
         methods = card.data.get("methods") if card is not None else None
         if not isinstance(methods, list):
@@ -197,6 +205,12 @@ async def _start_binding(s: _Step, *, from_state: str) -> str:
         return "lost"
     result = await s.send(ADD_METHOD, {"user_email": s.row["buyer_email"]})
     card = result.card("payment.method-add-required-card") if result.ok else None
+    # The rail's other binding page (a non-card scheme). How to confirm it (`bound` on which card) is
+    # not measured, so it starts with the `bound` schedule spent: the worker only READS until the
+    # card turns ACTIVE or the page lapses. Never guessed.
+    other_variant = card is None and result.ok and result.card("payment.method-add-required") is not None
+    if other_variant:
+        card = result.card("payment.method-add-required")
     data = card.data if card is not None else {}
     url, method_id = data.get("linkUrl"), data.get("paymentMethodId")
     if card is not None and isinstance(url, str) and isinstance(method_id, str) and method_id:
@@ -204,7 +218,8 @@ async def _start_binding(s: _Step, *, from_state: str) -> str:
             moved = await ledger.transition_as_holder(
                 s.id, s.worker, from_states=[from_state], to_state="needs_payment_method",
                 resolves_write=action, payment_method_id=method_id, buyer_action_kind="card_binding",
-                buyer_action_url=url, buyer_action_expires_at=_later(HOSTED_PAGE_SECONDS))
+                buyer_action_url=url, buyer_action_expires_at=_later(HOSTED_PAGE_SECONDS),
+                last_error_code=f"bound_sent:{len(BOUND_SCHEDULE)}" if other_variant else None)
         except ValueError:
             # The rail answered (so the write is resolved) with a page we will not store or show.
             await ledger.clear_pending_write(s.id, s.worker, action)
@@ -218,7 +233,28 @@ async def _start_binding(s: _Step, *, from_state: str) -> str:
         moved = await ledger.transition_as_holder(
             s.id, s.worker, from_states=[from_state], to_state="failed", last_error_code="binding_answer_unrecognised")
         return await _settled(s, moved, "failed")
+    if _definitely_refused(result):
+        # The rail said no to this binding and will say no again: fail now, not every minute to the cap.
+        await ledger.clear_pending_write(s.id, s.worker, action)
+        moved = await ledger.transition_as_holder(
+            s.id, s.worker, from_states=[from_state], to_state="failed", last_error_code=_code("binding_refused", result))
+        return await _settled(s, moved, "failed")
     return await _unresolved_write(s, action, result)
+
+
+#: 4xx answers that say nothing about this buyer's binding: our own credentials (401, 403), a timeout
+#: (408), throttling (429). Those are retried; any other 4xx is a refusal of the request itself.
+_RETRYABLE_4XX = frozenset({401, 403, 408, 429})
+
+
+def _definitely_refused(result: Any) -> bool:
+    if getattr(result, "kind", None) == "error_card":
+        return getattr(result, "recoverable", None) is False
+    status = getattr(result, "http_status", None)
+    return (
+        getattr(result, "kind", None) == "http_error" and isinstance(status, int)
+        and 400 <= status < 500 and status not in _RETRYABLE_4XX
+    )
 
 
 async def _binding(s: _Step) -> str:
@@ -344,6 +380,12 @@ _STEPS: Dict[str, Callable[[_Step], Any]] = {
 async def step(client: Any, row: Mapping[str, Any], worker: str) -> str:
     """Take one step on a purchase this worker has claimed. Returns the outcome name."""
     s = _Step(client, row, worker)
+    if "money_result_seen" in str(row.get("last_error_code") or ""):
+        # An answer said money moved where none should have. Parked for a human, for good: nothing is
+        # read, reconciled, resent or cleared here, whatever is pending.
+        logger.error("a2a_rail_worker: purchase=%s still parked after a money-result answer", s.id)
+        await ledger.release_claim(s.id, worker, next_poll_at=_later(POLL_PARKED))
+        return "money_result_parked"
     if row.get("pending_write"):
         return await _reconcile(s)
     state = str(row.get("state") or "")
