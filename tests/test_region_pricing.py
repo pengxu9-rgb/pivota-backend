@@ -8,10 +8,15 @@ emitting what it emitted, this fails rather than the sitemap quietly halving.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import services.index_pipeline_state_service as ips
 from services.priced_offer_sql import priced_offer_exists_sql
+
+# What this test process was started with: the SQL constant is built from it at import.
+_ENV_AT_IMPORT = os.getenv(ips._SERVING_REGIONS_ENV, "").strip()
 from services.region_pricing import (
     REGION_PRICING_CURRENCY,
     has_offer_priced_for_region_sql,
@@ -171,10 +176,16 @@ class TestHasOfferPricedForAnyRegion:
             has_offer_priced_for_region_sql("cp.product_key", "US")
         )
 
-    def test_the_default_serving_region_still_emits_the_original_us_string(self):
-        """The live constant the eligibility SQL interpolates, with no env set."""
-        assert ips._HAS_SERVING_REGION_OFFER_EXISTS == priced_offer_exists_sql(
-            "cp.product_key", extra_predicate=US_PREDICATE
+    def test_the_default_serving_regions_are_the_registrys_served_markets(self):
+        """The live constant the eligibility SQL interpolates, with no env set: the registry's served
+        markets (ADR-026), no longer US alone. An unset env meaning "US only" blocked 53 live SG offers
+        from a job that never set it (2026-10-11)."""
+        from services.market_registry import served_markets
+        from services.region_pricing import has_offer_priced_for_any_region_sql
+        if _ENV_AT_IMPORT:
+            pytest.skip("this process was started with the env set")
+        assert ips._HAS_SERVING_REGION_OFFER_EXISTS == has_offer_priced_for_any_region_sql(
+            "cp.product_key", list(served_markets())
         )
 
     def test_no_parens_or_or_appear_in_the_single_region_form(self):
@@ -231,9 +242,22 @@ class TestHasOfferPricedForAnyRegion:
 class TestServingPricingRegions:
     """Reading the region list from the environment."""
 
-    def test_unset_means_us_only(self, monkeypatch):
+    def test_unset_means_the_registrys_served_markets_not_us_only(self, monkeypatch):
+        from services.market_registry import served_markets
         monkeypatch.delenv(ips._SERVING_REGIONS_ENV, raising=False)
+        assert ips.serving_pricing_regions() == list(served_markets()) == ["US", "SG"]
+
+    def test_the_env_may_narrow_the_registry(self, monkeypatch):
+        monkeypatch.setenv(ips._SERVING_REGIONS_ENV, "US")
         assert ips.serving_pricing_regions() == ["US"]
+
+    @pytest.mark.parametrize("wider", ["US,SG,JP", "GB", "US,ZZ"])
+    def test_the_env_can_never_widen_the_registry(self, monkeypatch, wider):
+        """A market goes live through the registry and its checklist, never through one process's env.
+        JP is acquisition-only, GB is off, ZZ is unknown: all refused loudly."""
+        monkeypatch.setenv(ips._SERVING_REGIONS_ENV, wider)
+        with pytest.raises(ValueError, match="does not serve"):
+            ips.serving_pricing_regions()
 
     def test_the_sql_constant_is_fixed_at_import_so_the_env_must_be_set_per_process(self, monkeypatch):
         """The predicate is a module-level constant. Setting the env AFTER import changes
@@ -241,16 +265,18 @@ class TestServingPricingRegions:
         the variable must be present on every PROCESS that recomputes eligibility (the
         onboarding job, `web`, and the worker's nightly index-health job), not just one.
         A refactor to a lazy read would silently change that deploy contract; this pins it."""
-        monkeypatch.setenv(ips._SERVING_REGIONS_ENV, "US,SG")
-        assert ips.serving_pricing_regions() == ["US", "SG"]
-        assert ips._HAS_SERVING_REGION_OFFER_EXISTS == ips._HAS_US_OFFER_EXISTS
+        monkeypatch.setenv(ips._SERVING_REGIONS_ENV, "US")
+        assert ips.serving_pricing_regions() == ["US"]
+        if not _ENV_AT_IMPORT:
+            # Built at import from the registry's US,SG: narrowing the env afterwards does not change it.
+            assert ips._HAS_SERVING_REGION_OFFER_EXISTS != ips._HAS_US_OFFER_EXISTS
 
     @pytest.mark.parametrize("blank", ["", "   ", ",", " , "])
-    def test_a_blank_setting_is_us_only_not_no_regions(self, monkeypatch, blank):
-        """An operator who clears the var, or a deploy that sets it empty, must
-        land on today's behaviour — not on a value that blocks every row."""
+    def test_a_blank_setting_is_the_registry_not_no_regions(self, monkeypatch, blank):
+        """An operator who clears the var, or a deploy that sets it empty, lands on the registry's
+        served markets -- not on a value that blocks every row, and not on US alone."""
         monkeypatch.setenv(ips._SERVING_REGIONS_ENV, blank)
-        assert ips.serving_pricing_regions() == ["US"]
+        assert ips.serving_pricing_regions() == ["US", "SG"]
 
     def test_it_parses_a_list_and_normalises_each_entry(self, monkeypatch):
         monkeypatch.setenv(ips._SERVING_REGIONS_ENV, " us , sg ")

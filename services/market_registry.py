@@ -12,9 +12,9 @@ lane's _MARKET_CURRENCY, the gateway's buyerRegion map -- so the later switch of
 accessor is a no-op by construction, and until then the registry cannot drift from them.
 
 WHAT IS DELIBERATELY NOT HERE:
-  * The SERVED regions in effect at runtime still come from PIVOTA_SERVING_PRICING_REGIONS
-    (index_pipeline_state_service.serving_pricing_regions). `served_markets()` is what the registry SAYS;
-    making the env follow it is a later, behaviour-visible step.
+  * The SERVED regions in effect at runtime ARE `served_markets()` since 2026-10-12
+    (index_pipeline_state_service.serving_pricing_regions reads it; PIVOTA_SERVING_PRICING_REGIONS may only
+    narrow it, never widen it).
   * No FX, no conversion, no inference of a market from a currency (ADR-024).
   * No fallback: an unknown market raises (`market()`), exactly as region_pricing does.
 """
