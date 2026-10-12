@@ -243,3 +243,18 @@ Teardown is not instantaneous, and half-gone reads as alive, so do not infer sta
 `railway-prod-db-url` and `railway-pcikb-db-url` still exist in `pivota-staging`. And per #1872,
 service shells keep their auto-deploy triggers until deleted in the dashboard — `pivota-acp`'s was
 never disarmed, so a push to that repo could still resurrect a service.
+
+## Served markets (ADR-026)
+
+The markets the catalog serves come from `config/market_registry.json` (`status: served`; US and SG today),
+read by `index_pipeline_state_service.serving_pricing_regions()` in every process that recomputes serving.
+
+- **An unset `PIVOTA_SERVING_PRICING_REGIONS` now means the registry's served list,** not US only (#2575).
+  The env may only **narrow** that list; naming a market the registry does not serve raises at import.
+- **Launching a market** is a registry change plus the ADR-026 launch checklist, never an env edit.
+- **Turning SG (or any market) off everywhere** needs EITHER a registry edit (set its status off) deployed
+  AND every pinned Cloud Run job that recomputes serving re-imaged onto that build (today:
+  `external-referral-refresh`), OR `PIVOTA_SERVING_PRICING_REGIONS=US` set on every writer (web, worker,
+  `retailer-ingest-drain`, `catalog-curated-brand-onboard`, `external-referral-refresh`). A job left on an
+  older image keeps serving what its image's registry says.
+

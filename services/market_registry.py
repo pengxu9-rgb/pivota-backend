@@ -5,11 +5,12 @@ rollout state (off / acquisition / shadow / served), whether it is a measured pr
 retailer_ingest lane may ingest it and the shopify_markets capture may target it, its locales and how its
 prices are displayed. This module loads and validates that file at import and derives every list from it.
 
-P1 STEP 1 IS PARITY, NOT A SWITCH. Nothing reads these accessors yet. tests/test_market_registry.py
-asserts that each one equals the constant it will replace -- region_pricing.REGION_PRICING_CURRENCY and
-ACQUISITION_MARKETS, retailer_ingest.pipeline.INGEST_MARKETS, shopify_markets.CAPTURE_MARKETS, the Reap
-lane's _MARKET_CURRENCY, the gateway's buyerRegion map -- so the later switch of each constant to its
-accessor is a no-op by construction, and until then the registry cannot drift from them.
+WHO READS IT. `served_markets()` is the runtime served-region list since #2575
+(index_pipeline_state_service.serving_pricing_regions; the env may only narrow it). The other accessors
+are not switched in yet: tests/test_market_registry.py asserts that each equals the constant it will
+replace -- region_pricing.REGION_PRICING_CURRENCY and ACQUISITION_MARKETS, retailer_ingest.pipeline
+.INGEST_MARKETS, shopify_markets.CAPTURE_MARKETS, the Reap lane's _MARKET_CURRENCY -- so switching each
+constant to its accessor is a no-op by construction, and until then the registry cannot drift from them.
 
 WHAT IS DELIBERATELY NOT HERE:
   * The SERVED regions in effect at runtime ARE `served_markets()` since 2026-10-12
