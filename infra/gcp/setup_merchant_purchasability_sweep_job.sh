@@ -117,11 +117,12 @@ ENV_VARS="$ENV_VARS|MERCHANT_PURCHASABILITY_SWEEP_ENABLED=$ENABLED"
 # module documents (MERCHANT_PURCHASABILITY_IP_THROTTLE_TRIP_HOSTS=0 disarms it).
 ENV_VARS="$ENV_VARS|CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true|CRAWL_SHOPIFY_EDGE_LEASE=2"
 
-# THE SERVED MARKETS (2026-10-12). This job recomputes serving state, which counts an offer as servable
-# only when it is priced for a served region (services/index_pipeline_state_service.serving_pricing_regions).
-# Unset, that defaults to US alone, and a sweep would score every SG (SGD) offer as priced only in an
-# acquisition market and drop it -- the retailer-ingest drain and web carry US,SG. Hence the `|` separator
-# below: the value itself holds a comma (gcloud's `^|^` alternate-delimiter form).
+# THE SERVED MARKETS (2026-10-12), kept equal to the live job and to web / the retailer-ingest drain. This job
+# does not recompute serving state today, but any code that does (index_pipeline_state_service.
+# serving_pricing_regions) defaults to US alone when this is unset and then drops every SG (SGD) offer as
+# priced only in an acquisition market -- the nightly refresh did exactly that. Set here so a serving path added
+# to this job later cannot inherit that default. Hence the `|` separator below: the value holds a comma
+# (gcloud's `^|^` alternate-delimiter form).
 ENV_VARS="$ENV_VARS|PIVOTA_SERVING_PRICING_REGIONS=US,SG"
 
 echo "== job: $JOB (subnet $SUBNET, gate $ENABLED)"

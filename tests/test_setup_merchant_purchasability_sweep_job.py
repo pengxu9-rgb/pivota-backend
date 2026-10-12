@@ -288,11 +288,21 @@ def test_the_job_shares_the_shopify_edge_budget_like_the_reap_proof_jobs(tmp_pat
     assert not [k for k in env if k.startswith("MERCHANT_PURCHASABILITY_IP_THROTTLE_")]
 
 
-def test_the_job_counts_both_served_markets_as_servable(tmp_path):
-    """Serving state is recomputed here: unset, serving_pricing_regions() is US alone and every SGD offer the
-    sweep touches would be dropped as priced only in an acquisition market (2026-10-12)."""
+def test_the_env_is_exactly_the_live_jobs_with_both_served_markets(tmp_path):
+    """The whole env, pinned: the `^|^` separator keeps the comma inside PIVOTA_SERVING_PRICING_REGIONS=US,SG,
+    and no two variables may merge (a merged DB_POOL_MIN_SIZE/MAX_SIZE would silently fall back to the
+    default pool). The served markets match web and the drain, so no serving path ever defaults to US alone."""
     proc, calls = _run(tmp_path, "prod", TAG)
     assert proc.returncode == 0, proc.stderr
     env = _env_vars(_one(calls, "run", "jobs", "create", "merchant-purchasability-sweep"))
-    assert env["PIVOTA_SERVING_PRICING_REGIONS"] == "US,SG"
-    assert env["PIVOTA_ENV"] == "production" and env["CRAWL_SHOPIFY_EDGE_LEASE"] == "2"  # nothing else lost
+    assert env == {
+        "PIVOTA_ENV": "production", "PIVOTA_SERVICE_NAME": "merchant-purchasability-sweep",
+        "PIVOTA_COMMIT_SHA": TAG, "DB_POOL_MIN_SIZE": "1", "DB_POOL_MAX_SIZE": "2",
+        "DB_STATEMENT_TIMEOUT_SECONDS": "30", "DB_COMMAND_TIMEOUT_SECONDS": "600",
+        "MERCHANT_PURCHASABILITY_BUDGET_SECONDS": env["MERCHANT_PURCHASABILITY_BUDGET_SECONDS"],
+        "MERCHANT_PURCHASABILITY_BATCH": env["MERCHANT_PURCHASABILITY_BATCH"],
+        "MERCHANT_PURCHASABILITY_SWEEP_ENABLED": "false",
+        "CRAWL_SHOPIFY_EDGE_PACER_ENABLED": "true", "CRAWL_SHOPIFY_EDGE_LEASE": "2",
+        "PIVOTA_SERVING_PRICING_REGIONS": "US,SG",
+    }
+    assert env["MERCHANT_PURCHASABILITY_BUDGET_SECONDS"].isdigit() and env["MERCHANT_PURCHASABILITY_BATCH"].isdigit()
