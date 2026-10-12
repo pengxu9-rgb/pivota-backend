@@ -27,7 +27,10 @@ where the pay write-ahead lives. A merchant challenge (3DS) during `paying` is a
 `set_payment_challenge`, without leaving the state. `attempts` counts every claim outside the two
 buyer states, `paying` included: a worker must never end `paying` on an attempts cap (money may be
 moving); only the rail's answer ends it. A re-quote (`awaiting_authorization -> quoting`) replaces the
-quote, order and token fields rather than keeping the stale ones.
+quote, order and token fields rather than keeping the stale ones, and is REFUSED while a payment
+token is recorded: the buyer may have approved it, and an abandoned authorization must be voided,
+which needs its id. The worker voids it on the rail, then `forget_voided_token`, then re-quotes.
+Entering `quoting` also requires the contact not to have been purged (the quote needs the address).
 
 ── WRITE-AHEAD, BECAUSE THE RAIL CANNOT DEDUPLICATE (YET) ────────────────────────────────────
 
@@ -67,6 +70,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence
 
 from db.database import IS_POSTGRES, database
@@ -483,6 +487,7 @@ _TRANSITION_SQL = """
        AND state IN (:from_0, :from_1, :from_2, :from_3, :from_4, :from_5, :from_6, :from_7, :from_8)
        AND claimed_by = :holder
        AND (pending_write IS NULL OR pending_write = :resolves_write)
+       AND (:to_state_probe <> 'quoting' OR (payment_token_id IS NULL AND contact_purged_at IS NULL))
     RETURNING *
 """
 # SQLite must not see CAST(... AS TIMESTAMPTZ): an unknown type name gets NUMERIC affinity and stores
@@ -746,7 +751,8 @@ _EXPIRE_SQL = """
              WHERE state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
                AND pending_write IS NULL
                AND ((buyer_action_expires_at IS NOT NULL AND buyer_action_expires_at < clock_timestamp())
-                    OR state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second'))
+                    OR state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+                    OR created_at < clock_timestamp() - (:max_lifetime_seconds * INTERVAL '1 second'))
              ORDER BY state_entered_at
              LIMIT :limit
            )
@@ -769,7 +775,8 @@ _EXPIRE_SQL_SQLITE = """
              WHERE state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
                AND pending_write IS NULL
                AND ((buyer_action_expires_at IS NOT NULL AND buyer_action_expires_at < CURRENT_TIMESTAMP)
-                    OR state_entered_at < datetime('now', '-' || :max_age_seconds || ' seconds'))
+                    OR state_entered_at < datetime('now', '-' || :max_age_seconds || ' seconds')
+                    OR created_at < datetime('now', '-' || :max_lifetime_seconds || ' seconds'))
              ORDER BY state_entered_at
              LIMIT :limit
            )
@@ -781,10 +788,23 @@ _EXPIRE_SQL_SQLITE = """
 EXPIRE_SOURCE_STATES = _states_in(_EXPIRE_SQL, "AND state IN (")
 EXPIRE_CANDIDATE_STATES = _states_in(_EXPIRE_SQL, "WHERE state IN (")
 MAX_AGE_SECONDS_DEFAULT = 86400
+#: An absolute ceiling for a purchase that never reached `paying`, measured from creation: the
+#: re-quote edge resets `state_entered_at`, so without it a re-quoting row would never expire. Below
+#: the contact retention, so a pre-pay row ends before its address is purged.
+MAX_LIFETIME_SECONDS_DEFAULT = 2 * 86400
 
 
-async def expire_overdue_purchases(*, max_age_seconds: int = MAX_AGE_SECONDS_DEFAULT, limit: int = 100) -> int:
-    values = {"max_age_seconds": _limit(max_age_seconds, 7 * 86400), "limit": _limit(limit, 1000)}
+async def expire_overdue_purchases(
+    *,
+    max_age_seconds: int = MAX_AGE_SECONDS_DEFAULT,
+    max_lifetime_seconds: int = MAX_LIFETIME_SECONDS_DEFAULT,
+    limit: int = 100,
+) -> int:
+    values = {
+        "max_age_seconds": _limit(max_age_seconds, 7 * 86400),
+        "max_lifetime_seconds": _limit(max_lifetime_seconds, 7 * 86400),
+        "limit": _limit(limit, 1000),
+    }
     if IS_POSTGRES:
         rows = await database.fetch_all(_EXPIRE_SQL, values)
     else:
@@ -795,8 +815,9 @@ async def expire_overdue_purchases(*, max_age_seconds: int = MAX_AGE_SECONDS_DEF
 # ── contact retention ────────────────────────────────────────────────────────────────────────
 #
 # The buyer's email and address are needed only until the rail has the cart. Terminal writes NULL
-# them; this purge covers the rest (a row the worker never picked up, a long `paying`), in any state,
-# without moving the state. Restated in the outer WHERE for the same reason as the sweeps above.
+# them, and the expiry sweep ends every pre-pay row within MAX_LIFETIME_SECONDS_DEFAULT; this purge is
+# the BACKSTOP for what neither reaches (a long `paying`, a dark worker), in any state, without moving
+# the state. A purged row cannot re-enter `quoting` (see the transition). Restated in the outer WHERE for the same reason as the sweeps above.
 _PURGE_CONTACT_SQL = """
     UPDATE a2a_rail_purchases
        SET buyer_email = NULL, shipping_address = NULL, contact_purged_at = clock_timestamp(),
@@ -868,12 +889,43 @@ async def set_payment_challenge(
 ) -> Optional[Dict[str, Any]]:
     """Show the buyer the merchant's challenge page (`url`), or clear it (`url=None`). None when the
     worker does not hold the row or it is not `paying`."""
+    if url is not None and isinstance(expires_at, datetime):
+        aware = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+        if aware <= datetime.now(timezone.utc):
+            raise ValueError("expires_at must be in the future")
+    bound = _bind_dt(expires_at) if url is not None else None
     values = {
         "id": purchase_id,
         "holder": _require(_WORKER_RE, worker_id, "worker_id"),
         "url": _require_https_url(url, "url", required=False),
-        "expires_at": _bind_dt(expires_at) if url is not None else None,
+        "expires_at": bound,
     }
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_SET_CHALLENGE_SQL, values))
     return _purchase(await database.fetch_one(_SET_CHALLENGE_SQL_SQLITE, values))
+
+
+# ── a voided token ───────────────────────────────────────────────────────────────────────────
+_FORGET_TOKEN_SQL = """
+    UPDATE a2a_rail_purchases
+       SET payment_token_id = NULL, updated_at = clock_timestamp()
+     WHERE id = :id AND claimed_by = :holder AND payment_token_id = :payment_token_id
+       AND state IN ('quoting', 'awaiting_authorization')
+       AND pending_write IS NULL
+    RETURNING *
+"""
+_FORGET_TOKEN_SQL_SQLITE = _FORGET_TOKEN_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+
+
+async def forget_voided_token(purchase_id: str, worker_id: str, payment_token_id: str) -> Optional[Dict[str, Any]]:
+    """Drop the token id AFTER the worker has voided that token on the rail (and seen the answer), so
+    a re-quote may proceed. Names the token it forgets; None when it does not match, the worker does
+    not hold the row, a write is pending, or the purchase is past authorization."""
+    values = {
+        "id": purchase_id,
+        "holder": _require(_WORKER_RE, worker_id, "worker_id"),
+        "payment_token_id": _require(_RAIL_REF_RE, payment_token_id, "payment_token_id"),
+    }
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_FORGET_TOKEN_SQL, values))
+    return _purchase(await database.fetch_one(_FORGET_TOKEN_SQL_SQLITE, values))

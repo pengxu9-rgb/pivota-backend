@@ -279,7 +279,17 @@ async def test_the_new_statements_run_with_real_parameters_on_postgres():
     assert await ledger.purge_stale_contact(max_age_seconds=3 * 86400) >= 1
     row = await ledger.get_purchase_internal(pid)
     assert row["buyer_email"] is None and row["contact_purged_at"] is not None and row["state"] == "paying"
-    # the re-quote edge with typed NULLs on Postgres
+    # the re-quote edge with typed NULLs on Postgres, after a voided token is forgotten
     other = await _stale_awaiting_authorization()
+    await database.execute("UPDATE a2a_rail_purchases SET payment_token_id = 'ptk_1' WHERE id = :i", {"i": other})
+    assert await ledger.transition_as_holder(other, "w1", from_states=["awaiting_authorization"],
+                                             to_state="quoting") is None
+    assert (await ledger.forget_voided_token(other, "w1", "ptk_1"))["payment_token_id"] is None
     requoted = await ledger.transition_as_holder(other, "w1", from_states=["awaiting_authorization"], to_state="quoting")
     assert requoted["quote_id"] is None and requoted["quoted_total_minor"] is None
+    # the lifetime ceiling on Postgres
+    await database.execute("UPDATE a2a_rail_purchases SET created_at = now() - interval '3 days', "
+                           "state_entered_at = now() WHERE id = :i", {"i": other})
+    await ledger.release_claim(other, "w1")
+    assert await ledger.expire_overdue_purchases(max_age_seconds=86400, max_lifetime_seconds=2 * 86400) >= 1
+    assert (await ledger.get_purchase_internal(other))["state"] == "expired"

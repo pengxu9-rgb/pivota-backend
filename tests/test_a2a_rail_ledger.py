@@ -286,6 +286,15 @@ async def test_a_requote_replaces_the_quote_order_and_token_rather_than_keeping_
     assert row["quote_id"] == "q_1"
     await database.execute("UPDATE a2a_rail_purchases SET order_id = 'o_1', payment_token_id = 'ptk_1' WHERE id = :i",
                            {"i": pid})
+    # the buyer may have approved ptk_1: no re-quote may lose its id before it is voided
+    assert await ledger.transition_as_holder(pid, "w1", from_states=["awaiting_authorization"],
+                                             to_state="quoting") is None
+    assert await ledger.forget_voided_token(pid, "w1", "ptk_other") is None   # must name the token
+    assert await ledger.forget_voided_token(pid, "w2", "ptk_1") is None       # must hold the row
+    await ledger.mark_pending_write(pid, "w1", "payment.token-revoke#submit")
+    assert await ledger.forget_voided_token(pid, "w1", "ptk_1") is None       # the void's answer unseen
+    await ledger.clear_pending_write(pid, "w1", "payment.token-revoke#submit")
+    assert (await ledger.forget_voided_token(pid, "w1", "ptk_1"))["payment_token_id"] is None
     requoted = await ledger.transition_as_holder(pid, "w1", from_states=["awaiting_authorization"], to_state="quoting",
                                                  last_error_code="price_changed")
     for column in ("quote_id", "quoted_total_minor", "order_id", "payment_token_id", "buyer_action_url"):
@@ -399,6 +408,29 @@ async def test_expiry_ends_a_dead_buyer_page_and_a_stale_wait_but_never_paying_o
     assert rows[stale]["buyer_email"] is None and rows[stale]["shipping_address"] is None
 
 
+async def test_a_requoting_purchase_still_expires_at_its_lifetime_ceiling():
+    pid = await _in_state("awaiting_authorization", buyer_action_kind="approval", buyer_action_url=PAGE,
+                          buyer_action_expires_at=FUTURE)
+    await database.execute("UPDATE a2a_rail_purchases SET created_at = datetime('now', '-3 days') WHERE id = :i",
+                           {"i": pid})
+    # state_entered_at is fresh (a re-quote just reset it); the lifetime ceiling still ends it
+    assert await ledger.expire_overdue_purchases(max_age_seconds=86400, max_lifetime_seconds=2 * 86400) == 1
+    assert (await ledger.get_purchase_internal(pid))["state"] == "expired"
+
+
+async def test_a_purged_purchase_cannot_be_requoted():
+    pid = await _in_state("awaiting_authorization", buyer_action_kind="approval", buyer_action_url=PAGE)
+    await database.execute("UPDATE a2a_rail_purchases SET created_at = datetime('now', '-4 days') WHERE id = :i",
+                           {"i": pid})
+    assert await ledger.purge_stale_contact(max_age_seconds=3 * 86400) == 1
+    await _claimed({"id": pid})
+    assert await ledger.transition_as_holder(pid, "w1", from_states=["awaiting_authorization"],
+                                             to_state="quoting") is None
+    # other edges are unaffected
+    assert await ledger.transition_as_holder(pid, "w1", from_states=["awaiting_authorization"],
+                                             to_state="failed", last_error_code="contact_purged")
+
+
 async def test_contact_is_purged_after_retention_whatever_the_state():
     paying = await _in_state("paying")
     fresh = (await _open())["id"]
@@ -423,6 +455,8 @@ async def test_a_merchant_challenge_while_paying_reaches_the_buyer_without_leavi
     assert cleared["buyer_action_url"] is None and "hosted_url" not in view.build_view(cleared)
     with pytest.raises(ValueError):
         await ledger.set_payment_challenge(pid, "w1", url="http://pay.rail.test/x")
+    with pytest.raises(ValueError):
+        await ledger.set_payment_challenge(pid, "w1", url=PAGE, expires_at=PAST)
     other = await _in_state("quoting")
     await _claimed({"id": other})
     assert await ledger.set_payment_challenge(other, "w1", url=PAGE) is None  # only while paying
