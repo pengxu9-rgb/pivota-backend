@@ -218,7 +218,7 @@ def test_acquisition_rows_are_priced_for_no_served_region_and_never_serve(gates_
     assert (verdict["serving_eligible"], verdict["blocker_code"]) == (False, gates.BLOCKER_NO_US_OFFER)
 
 
-def test_the_default_serving_region_is_us_and_au_is_not_served():
+def test_acquisition_markets_are_never_among_the_served_regions():
     assert "AU" not in ips.serving_pricing_regions() and "JP" not in ips.serving_pricing_regions()
 
 
