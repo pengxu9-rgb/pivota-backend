@@ -348,7 +348,7 @@ def ingest_payload(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _tokens(value: Any) -> List[str]:
-    """Accent-folded, casefolded alphanumeric tokens: "Eco By Sonya USA" -> [eco, by, sonya, usa],
+    """Accent-folded, casefolded alphanumeric tokens: "Example By Brand USA" -> [example, by, brand, usa],
     "e.l.f." -> [e, l, f], "Karen's" -> [karen, s]."""
     import unicodedata
     text = "".join(c for c in unicodedata.normalize("NFKD", str(value or "")) if not unicodedata.combining(c))
@@ -356,32 +356,33 @@ def _tokens(value: Any) -> List[str]:
 
 
 #: A /meta.json name with one of these tokens AFTER the brand is a store that SELLS the brand, never the
-#: brand's own ("Sukin Stockist USA", "Sukin Beauty Warehouse", "Sukin Beauty Supply" -- "supply" is on
-#: a retailer in the prod ledger, "Beauty Exchange Beauty Supply", and on no brand store). "at", "by"
-#: and "from" name the store that sells it ("Sukin | Shop Sukin at Beauty Bay", "Sukin by Adore
-#: Beauty", "Sukin from Adore Beauty"); "@" in the name reads as "at" (NFKC first, so the full-width
-#: "＠" does too). Only the words after the brand count: a brand's own name may hold one ("Chemist
-#: Confessions USA", "Eco By Sonya USA").
+#: brand's own ("Example Brand Stockist USA", "Example Brand Beauty Warehouse", "Example Brand Beauty
+#: Supply" -- "supply" is in a retailer's name in the prod ledger, and in no brand store's). "at", "by"
+#: and "from" name the store that sells it ("Example Brand | Shop Example Brand at Other Shop", "Example
+#: Brand by Second Store", "Example Brand from Second Store"); "@" in the name reads as "at" (NFKC first,
+#: so the full-width "＠" does too). Only the words after the brand count: a brand's own name may hold
+#: one ("Chemist Confessions", "Eco By Sonya").
 TIER_B_RESELLER_TOKENS = frozenset({
     "stockist", "stockists", "distributor", "distributors", "distribution", "distributions", "pharmacy",
     "pharmacies", "chemist", "chemists", "retailer", "retailers", "outlet", "outlets", "wholesale",
     "wholesaler", "wholesalers", "warehouse", "warehouses", "supply", "supplies", "at", "by", "from"})
-#: A separator splits a /meta.json name into a second name ("Sukin | Beauty Bay", "Sukin - Adore
-#: Beauty"), and nothing tells a retailer's name from a tagline there, so a name may split only where the
+#: A separator splits a /meta.json name into a second name ("Example Brand | Other Shop", "Example Brand -
+#: Second Store"), and nothing tells a retailer's name from a tagline there, so a name may split only where the
 #: brand's own name does. A separator is any punctuation or math/other symbol (by Unicode category, so
 #: look-alikes such as "∣", "│", "‒", "−", "・" count too, review of #2373) except TIER_B_NAME_JOINERS,
 #: and except a hyphen between two letters/digits ("K-Beauty" is one word; a dash like "–" always
-#: splits). Measured 2026-09-26 on the /meta.json names of the 77 stores in the prod retailer-ingest
-#: ledger: 0 of the 13 brand stores has one; a retailer does ("K-Beauty Makeup | Authentic Korean ...").
+#: splits). Measured 2026-09-26 on the /meta.json names of the stores in the prod retailer-ingest ledger:
+#: no brand store's name has one; a retailer's does (its name, "|", then a tagline).
 TIER_B_SEPARATOR_CATEGORIES = frozenset({"Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po", "Sk", "Sm", "So"})
 #: Punctuation that joins a name rather than splitting it, when attached to a word: "Head & Shoulders",
-#: "Karen's", "Kiehl‘s", "e.l.f.", "Dr. Jart+", "BondiBoost.com", "Sukin® USA". Standing alone between
-#: spaces, every one but "&" is a separator ("Sukin + Beauty Bay"; "&" reads as "and", which is no
-#: separator either).
+#: "Karen's", "Kiehl‘s", "e.l.f.", "Dr. Jart+", "ExampleBrand.com", "Example Brand® USA". Standing alone
+#: between spaces, every one but "&" is a separator ("Example Brand + Other Shop"; "&" reads as "and",
+#: which is no separator either).
 TIER_B_NAME_JOINERS = frozenset("&'’‘.+!#®©")
 #: Trademark marks NFKC folds into LETTERS glued to the word before ("Mario Badescu™" -> "badescutm",
 #: which failed the brand prefix). Each reads as "®" instead, before any folding: attached, it joins
-#: ("Sukin™ USA" is "Sukin USA"); standing alone it separates like any joiner ("Sukin ™ Beauty Bay").
+#: ("Example Brand™ USA" is "Example Brand USA"); standing alone it separates like any joiner
+#: ("Example Brand ™ Other Shop").
 #: ™ ℠; circled R and C (Ⓡ ⓡ Ⓒ ⓒ), circled italic R and C (🄬 🄫), squared R (🅁); the raised MC/MD/MR
 #: marks (🅪 🅫 🅬). And ℗, which NFKC leaves alone but which is a mark like © (attached, it was a split).
 TIER_B_TRADEMARK_MARKS = "™℠ⓇⓡⒸⓒ🄬🄫🅁🅪🅫🅬℗"
@@ -397,7 +398,7 @@ def _tier_b_folded(value: Any) -> str:
 _WORD_HYPHENS = frozenset("-‐")  # NFKC folds the non-breaking U+2011 into U+2010
 #: Bars that Unicode files as LETTERS (so no category catches them), separators anywhere: "ǀ" "ǁ".
 TIER_B_LETTER_SEPARATORS = frozenset("ǀǁ")
-#: Letters used as a dash or bar in JP/KR names ("Sukin ー 公式", "설화수 ㅣ 공식몰"), after NFKC: ー
+#: Letters used as a dash or bar in JP/KR names ("Example Brand ー 公式", "설화수 ㅣ 공식몰"), after NFKC: ー
 #: (and half-width ｰ), 丨 (and ⼁), Hangul ㅡ/ㅣ (folded to U+1173/U+1175). Separators only as a
 #: word of their own: inside a word they are letters ("コーセー").
 TIER_B_DASH_LETTERS = "ー丨\u1173\u1175"
@@ -414,7 +415,8 @@ def _tier_b_name_text(text: str) -> str:
 
 def _name_split_points(text: str) -> set:
     """The token indices at which a separator (see TIER_B_SEPARATOR_CATEGORIES) splits `text` into two
-    non-empty parts: "Sukin Naturals | Beauty Bay" -> {2}, "19/99 Beauty" -> {1}, "Sukin USA |" -> {}."""
+    non-empty parts: "Example Brand Naturals | Other Shop" -> {3}, "19/99 Beauty" -> {1}, "Example Brand
+    USA |" -> {}."""
     import unicodedata
     parts, current = [], []
     for i, ch in enumerate(text):
@@ -441,13 +443,14 @@ def storefront_tier_b(brand: str, storefront: Optional[Dict[str, Any]], market: 
     in that market's currency. {"passed": bool, <each conjunct>: bool, + what was read}.
 
     The name rule is a token-boundary PREFIX, not containment: containment passed "REN" in "Karen's
-    Beauty Shop", "Tula" in "Tulane Pharmacy" and "e.l.f." in "Self Care Supply Co" (review of #2353).
+    Example Shop", "Tula" in "Tulane Example Pharmacy" and "e.l.f." in "Self Care Example Co" (review of
+    #2353).
     The brand's tokens must be the name's first tokens, the words after them must carry no reseller
-    token (TIER_B_RESELLER_TOKENS: "Sukin Beauty Warehouse", "Sukin by Adore Beauty"), the name must not
-    split into a second name (TIER_B_SEPARATOR_CATEGORIES: "Sukin | Beauty Bay"), and the folded brand must
-    be at least TIER_B_MIN_BRAND_CHARS long. Measured positives (prod /meta.json,
-    2026-09-26): "Sukin Naturals USA", "Bali Body US", "MooGoo USA", "Eco By Sonya USA", "esmi Skin",
-    "MineTan USA" -- each USD, ships_to [US].
+    token (TIER_B_RESELLER_TOKENS: "Example Brand Beauty Warehouse", "Example Brand by Second Store"), the
+    name must not split into a second name (TIER_B_SEPARATOR_CATEGORIES: "Example Brand | Other Shop"), and
+    the folded brand must be at least TIER_B_MIN_BRAND_CHARS long. Measured positives (prod /meta.json,
+    2026-09-26) are brand stores named like "Example Brand USA", "Example Brand US" or "Example Brand
+    Skin" -- each USD, ships_to [US].
 
     CONJUNCTIVE on purpose: a name alone would pass a distributor's store that leads with the brand it
     resells, and a US-shipping USD store alone proves nothing about whose it is."""
@@ -496,12 +499,12 @@ def brand_official_domain_review(domain: str, brands: List[str], *, storefront: 
 
       * a known retailer host can never be a brand's own store (not acceptable -- fix the job);
       * Tier A: the domain's name IS that brand (offer_seller_identity.brand_owns_domain, the rule
-        that types an offer brand_direct) -- us.frankbody.com for "Frank Body";
+        that types an offer brand_direct) -- us.examplebrand.example for "Example Brand";
       * Tier B: the store's own /meta.json (`storefront`, from the crawl) names the brand, ships to
-        the job's `market` and prices in its currency (storefront_tier_b) -- sukinnaturals.com,
-        "Sukin Naturals USA", for "Sukin". Peng approved it as automatic on 2026-09-26;
-      * otherwise a human accepts the flag (tartecosmetics.com for "Tarte", k18hair.com for "K18"):
-        held, never auto-applied. A failed Tier B yields exactly that flag, same key.
+        the job's `market` and prices in its currency (storefront_tier_b) -- brand-store.example.com,
+        "Example Brand Naturals USA", for "Example Brand". Peng approved it as automatic on 2026-09-26;
+      * otherwise a human accepts the flag (a host whose name is not the brand's, with no /meta.json
+        that proves it): held, never auto-applied. A failed Tier B yields exactly that flag, same key.
 
     Returns (flags, evidence): `evidence` says which tier admitted each brand (or what Tier B read
     when none did) and is recorded on the run as checks.brand_official_evidence.
@@ -705,8 +708,8 @@ def _require_served_market_is_served(market: str) -> None:
 
 
 async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
-    from services.curated_brand_feed import (CrawlIncomplete, lash_nail_title_evidence, lip_title_evidence,
-                                             records_for_brand)
+    from services.curated_brand_feed import (CrawlIncomplete, PresentedCurrencyMismatch, lash_nail_title_evidence,
+                                             lip_title_evidence, records_for_brand)
     import contextlib
 
     _require_acquisition_is_unserved(job_market(job.get("options")))
@@ -744,6 +747,10 @@ async def _crawl(job: Dict[str, Any], stage: str) -> List[Dict[str, Any]]:
         if _transient(crawl):
             raise _throttled(job, stage, str(crawl.get("reason"))) from exc
         raise _Stop("crawl_failed", "failed", f"crawl failed: {crawl.get('reason')}") from exc
+    except PresentedCurrencyMismatch as exc:
+        # The store presents our crawl another currency than its /meta.json names: the read is held, never
+        # labelled (ADR-026 4.4). Not transient -- the next tick would be presented the same.
+        raise _Stop("presented_currency_mismatch", "failed", str(exc)) from exc
     report = getattr(records, "crawl_report", None)
     if not isinstance(report, dict) or report.get("status") != "complete":
         raise _Stop("crawl_unproven", "failed", "crawl completeness was not proven")
@@ -987,8 +994,8 @@ async def _readback(product_keys: List[str], currency: str, db: Any,
     Every live offer the job's STOREFRONT (`domain`) holds on the product must be in the job's currency
     AND stamped the job's market (catalog_offers.market): currency = market, always (multi-market
     storefronts ADR section 3.3). Scoped to the storefront because a product legitimately carries other
-    storefronts' offers in other markets -- the Frank Body product holds us.frankbody.com's USD/US offer
-    AND frankbody.com's AUD/AU one -- and neither job may fail over the other's. And scoped to the offers
+    storefronts' offers in other markets -- a brand's product holds its US store's USD/US offer AND its
+    AU store's AUD/AU one -- and neither job may fail over the other's. And scoped to the offers
     THIS LANE writes there (source_system = ingestion.AGENT_VERSION): a shopify_markets capture writes its
     USD/US siblings on the SAME host (services/retailer_ingest/shopify_markets.py, source_system
     shopify_markets_us_localization), as did the older scripts/capture_us_market_offers.py, so a re-run of
@@ -1575,14 +1582,16 @@ async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timin
     planned = capture["planned"]
     summary = {"crawl": checks.get("markets_capture"), "plan": {"planned": len(planned)}, "checks": checks,
                "flags": []}
+    proof = checks["markets_capture"].get("proof") or "no product answered"
     if not planned:
         raise _Stop("nothing_to_capture", "nothing",
-                    f"the {market} session was proven but no base offer has a sellable {currency} price "
-                    f"({checks['markets_capture'].get('skipped')})", checks=checks)
+                    f"no base offer has a proven {currency} price for {market} (proof mode: {proof}): "
+                    f"{checks['markets_capture'].get('skipped')}", checks=checks)
     if stage == DRY_RUN:
         await ledger.finish_run(run_id, outcome="clean", **summary, db=db)
-        await _move(job, status="apply_due", run_id=run_id, reason=f"{market} session proven, {len(planned)} "
-                    f"{currency} sibling offer(s) planned; apply due", next_run_at=datetime.now(timezone.utc), db=db)
+        await _move(job, status="apply_due", run_id=run_id, reason=f"{market} {currency} proven ({proof}), "
+                    f"{len(planned)} {currency} sibling offer(s) planned; apply due",
+                    next_run_at=datetime.now(timezone.utc), db=db)
         return {"job_id": job["id"], "stage": stage, "outcome": "clean", "status": "apply_due"}
 
     checks.setdefault("catalog_write", ledger.CATALOG_WRITE_NOT_STARTED)
