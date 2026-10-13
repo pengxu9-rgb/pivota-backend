@@ -900,21 +900,6 @@ def _canonical_offer(handle, source_handle):
             "source_ref": f"https://{HOST}/products/{source_handle}"}
 
 
-async def test_a_live_canonical_offer_at_another_page_holds_the_fold(env, monkeypatch):  # noqa: F811
-    """The parent sells nothing, so the fold's canonical offer is at its first child (8 ml). A live canonical
-    offer still at the PARENT's page (written when the parent sold something) would stay beside the new one."""
-    await _lane(env, monkeypatch, INVARIANT_CASES["stub"],
-                catalog=Catalog(offers=[_canonical_offer("gel-tint", "gel-tint")]))
-    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
-    assert out["status"] == "held" and env.applied == []
-    flags = {f["rule"]: f for f in _last_run(env)["flags"] if f["severity"] == "block"}
-    assert set(flags) == {"fold_moves_live_canonical"} and flags["fold_moves_live_canonical"]["acceptable"] is False
-    assert "without fold_shades --" in flags["fold_moves_live_canonical"]["detail"]  # never "run it without"
-    preview = _last_run(env)["checks"]["shade_fold"]["offer_preview"]
-    stale = _canonical_offer("gel-tint", "gel-tint")
-    assert preview["offers"] == [{"why": "canonical_moved", "product_key": stale["product_key"],
-                                  "sku_key": stale["sku_key"], "offer_id": stale["offer_id"],
-                                  "source_ref": f"https://{HOST}/products/gel-tint", "suppression_reason": None}]
 
 
 @pytest.mark.parametrize("case,live_at", [("stub", ("gel-tint", "gel-tint-8ml")),     # already moved
@@ -937,16 +922,6 @@ async def test_an_identical_recrawl_of_a_folded_store_applies(env, monkeypatch, 
     assert _last_run(env)["checks"]["shade_fold"]["offer_recheck"]["status"] == "clear"
 
 
-async def test_a_canonical_destination_change_on_a_live_row_holds(env, monkeypatch):  # noqa: F811
-    """The first sellable child changed between crawls (8 ml now sells nothing): the canonical moves to 15 ml."""
-    products = [dict(p) for p in INVARIANT_CASES["stub"]]
-    products[1] = product("Gel Tint - 8ml", "gel-tint-8ml", price="0.00")
-    await _lane(env, monkeypatch, products,
-                catalog=Catalog(offers=[_canonical_offer("gel-tint", "gel-tint-8ml")]))
-    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
-    assert out["status"] == "held" and env.applied == []
-    assert [(o["why"], o["source_ref"]) for o in _last_run(env)["checks"]["shade_fold"]["offer_preview"]["offers"]] == [
-        ("canonical_moved", f"https://{HOST}/products/gel-tint-8ml")]
 
 
 async def test_a_canonical_offer_written_between_the_checks_and_the_write_holds(env, monkeypatch):  # noqa: F811
@@ -1188,69 +1163,12 @@ def test_the_public_seed_projection_serves_no_variant_url_another_writer_stored(
     assert gw._SEED_VARIANT_URL_SOURCE == ingestion.SEED_VARIANT_URL_SOURCE
 
 
-async def test_a_folded_child_refused_on_a_recrawl_holds_instead_of_leaving_two_live_offers(env, monkeypatch):  # noqa: F811
-    """THE REPRO. A stub parent folds 8 ml and 15 ml. On the next crawl 15 ml is filed under another type (and
-    repriced 34 -> 38): refused, it is written as its own row at 38 while the parent's old 15 ml variant offer
-    at the same page stays live at 34. Held, never acceptable, naming that offer."""
-    first = INVARIANT_CASES["stub"]
-    await _lane(env, monkeypatch, first)
-    assert (await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db))["status"] == "done"
-    written = env.applied[-1]["offers"]
-    fifteen = [o for o in written if o["source_ref"].endswith("/gel-tint-15ml")]
-    assert [o["list_price"] for o in fifteen] == [34.0]
-    second = [dict(p) for p in first]
-    second[2] = product("Gel Tint - 15ml", "gel-tint-15ml", price="38.00", product_type="Nail Care")
-    second[2]["id"], second[2]["variants"][0]["id"] = first[2]["id"], first[2]["variants"][0]["id"]
-    live = [{k: o[k] for k in ("product_key", "sku_key", "offer_id", "source_ref")} for o in written]
-    await _lane(env, monkeypatch, second, catalog=Catalog(offers=live))
-    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
-    assert out["status"] == "held" and len(env.applied) == 1
-    flag = next(f for f in _last_run(env)["flags"] if f["rule"] == "fold_leaves_stale_offer")
-    assert flag["acceptable"] is False and "without fold_shades --" in flag["detail"]
-    stale = _last_run(env)["checks"]["shade_fold"]["offer_preview"]["offers"]
-    assert [(o["why"], o["offer_id"]) for o in stale] == [("duplicate_at_listing", fifteen[0]["offer_id"])]
 
 
-async def test_a_folded_child_gone_from_the_store_holds(env, monkeypatch):  # noqa: F811
-    """The 15 ml listing disappeared: no second row, but the parent keeps selling it at its last price."""
-    first = INVARIANT_CASES["stub"]
-    await _lane(env, monkeypatch, first)
-    assert (await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db))["status"] == "done"
-    written = env.applied[-1]["offers"]
-    live = [{k: o[k] for k in ("product_key", "sku_key", "offer_id", "source_ref")} for o in written]
-    await _lane(env, monkeypatch, first[:2], catalog=Catalog(offers=live))
-    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
-    assert out["status"] == "held"
-    stale = _last_run(env)["checks"]["shade_fold"]["offer_preview"]["offers"]
-    assert [(o["why"], o["source_ref"]) for o in stale] == [("dropped_variant", f"https://{HOST}/products/gel-tint-15ml")]
 
 
-async def test_a_removed_native_variant_is_not_the_folds_to_hold(env, monkeypatch):  # noqa: F811
-    """An offer at the product's OWN page on a non-canonical SKU is a native variant the merchant removed: the
-    lane's long-standing behaviour, not something the fold made."""
-    first = INVARIANT_CASES["size"]
-    await _lane(env, monkeypatch, first)
-    assert (await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db))["status"] == "done"
-    live = [{k: o[k] for k in ("product_key", "sku_key", "offer_id", "source_ref")} for o in env.applied[-1]["offers"]]
-    base_key = live[0]["product_key"]
-    live.append({"product_key": base_key, "sku_key": f"{base_key}::v::gone", "offer_id": "offer:gone",
-                 "source_ref": f"https://{HOST}/products/glow-serum"})
-    await _lane(env, monkeypatch, first, catalog=Catalog(offers=live))
-    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
-    assert out["status"] == "done", _last_run(env)["flags"]
 
 
-@pytest.mark.parametrize("reason,stale", [("catalog_destination_dead_pending", True), ("stale_after_sync", True),
-                                          (None, True), ("product_suppressed", False),
-                                          ("catalog_destination_dead", False)])
-async def test_a_suppressed_offer_that_can_come_back_counts_as_live(env, monkeypatch, reason, stale):  # noqa: F811
-    """The same liveness rule as a superseded row (_superseded_row_retired): a pending or self-reviving
-    suppression is lifted again (catalog_offer_suppression.REVERT_OFFERS_SQL and the lanes that own them)."""
-    offer = dict(_canonical_offer("gel-tint", "gel-tint"), suppressed_at="2026-10-12T00:00:00Z",
-                 suppression_reason=reason)
-    await _lane(env, monkeypatch, INVARIANT_CASES["stub"], catalog=Catalog(offers=[offer]))
-    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
-    assert out["status"] == ("held" if stale else "done"), _last_run(env)["flags"]
 
 
 async def test_the_recheck_under_the_lock_reads_on_one_connection(monkeypatch):
@@ -1277,3 +1195,432 @@ async def test_the_recheck_under_the_lock_reads_on_one_connection(monkeypatch):
 def test_an_own_listing_url_with_an_empty_query_or_fragment_is_refused(suffix):
     url = f"https://{HOST}/products/g-ruby{suffix}"
     assert ingestion.own_listing_url(f"https://{HOST}/products/g", url) is None
+
+
+# ---- the fold RETIRES its own stale offers ------------------------------------------------------------------------
+# A refused child, a sale, a repriced or delisted child, a stub child or a parent going to 0.00 used to hold the
+# whole host for good (every re-crawl met the same stale offer). The apply now retires the fold's own stale
+# offers in its own transaction ('fold_superseded'), with their shopify_markets siblings; an offer the plan
+# writes again comes back live.
+
+import json  # noqa: E402
+
+FOLD_REASON = "fold_superseded"
+SG_SIBLINGS = "shopify_markets_sg_localization"
+
+
+def _p(title, handle, price, *, available=True, product_type="Nail Polish"):
+    """A /products.json product whose ids derive from its handle, so every crawl of it carries the same ones."""
+    pid = int(hashlib.sha256(handle.encode()).hexdigest()[:12], 16)
+    return {"id": pid, "title": title, "handle": handle, "vendor": VENDOR, "product_type": product_type,
+            "body_html": "<p>A long-wear gel colour with a high-shine finish for salon nails at home.</p>",
+            "images": [{"src": f"https://cdn.example/{handle}.jpg"}],
+            "options": [{"name": "Title", "position": 1, "values": ["Default Title"]}],
+            "variants": [{"id": pid + 1, "title": "Default Title", "option1": "Default Title", "price": price,
+                          "available": available, "sku": handle.upper(), "barcode": ean(handle)}]}
+
+
+def stub_line(p8="20.00", p15="34.00", t15="Nail Polish", a15=True):
+    return [_p("Gel Tint", "gel-tint", "0.00"), _p("Gel Tint - 8ml", "gel-tint-8ml", p8),
+            _p("Gel Tint - 15ml", "gel-tint-15ml", p15, product_type=t15, available=a15)]
+
+
+def priced_line(pp="40.00", pc="90.00", child=True, child_available=True, parent_available=True, extra=False):
+    ps = [_p("Glow Serum", "glow-serum", pp, available=parent_available, product_type="Serum")]
+    if child:
+        ps.append(_p("Glow Serum - 100ml", "glow-serum-100ml", pc, available=child_available, product_type="Serum"))
+    if extra:
+        ps.append(_p("Glow Serum - 50ml", "glow-serum-50ml", "60.00", product_type="Serum"))
+    return ps + [_p("Top Gloss", "top-gloss", "15.00")]
+
+
+class Store(Catalog):
+    """catalog_offers as the fold's checks read it and the apply writes it: the plan's offers upserted with the
+    revival rule of apply._OFFER_UPSERT_SQL, the retire of apply.RETIRE_OFFERS_SQL. (The SQL itself is run on
+    real Postgres in tests/test_retailer_ingest_markets_postgres.py.)"""
+
+    def __init__(self, offers=()):
+        super().__init__()
+        self.offers = [dict(o) for o in offers]
+
+    async def fetch_all(self, query, values=None):
+        self.queries.append(query)
+        if query is pipeline.FOLD_LANE_OFFERS_SQL:
+            return [dict(o) for o in self.offers if o["source_system"] == values["source_system"]
+                    and (o["product_key"] in values["product_keys"] or o["source_ref"] in values["urls"])]
+        if query is pipeline.HOST_LIVE_LANE_OFFERS_SQL:
+            return [{"live": sum(1 for o in self.offers if o["source_system"] == values["source_system"]
+                                 and o.get("source_domain") in values["hosts"] and o.get("suppressed_at") is None)}]
+        return await super().fetch_all(query, values)
+
+    def write(self, plan, retire):
+        by_id = {o["offer_id"]: o for o in self.offers}
+        for o in plan["offers"]:
+            row = by_id.get(o["offer_id"])
+            if row is None:
+                row = by_id[o["offer_id"]] = {"suppressed_at": None, "suppression_reason": None}
+                self.offers.append(row)
+            elif row.get("suppression_reason") == FOLD_REASON:
+                row.update(suppressed_at=None, suppression_reason=None)  # the upsert's revival
+            row.update({k: o[k] for k in ("offer_id", "product_key", "sku_key", "source_ref", "source_system",
+                                          "source_domain", "list_price")})
+        done = {"reason": None, "offer_ids": [], "sibling_offer_ids": []}
+        if retire:
+            done["reason"] = retire["reason"]
+            for ids, systems, out in (("offer_ids", "source_systems", "offer_ids"),
+                                      ("sibling_offer_ids", "sibling_source_systems", "sibling_offer_ids")):
+                for row in self.offers:
+                    if (row["offer_id"] in retire[ids] and row["source_system"] in retire[systems]
+                            and row.get("suppressed_at") is None):
+                        row.update(suppressed_at="2026-10-13T00:00:00Z", suppression_reason=retire["reason"])
+                        done[out].append(row["offer_id"])
+        return done
+
+    def live(self, system=ingestion.AGENT_VERSION):
+        return [o for o in self.offers if o["source_system"] == system and o.get("suppressed_at") is None]
+
+
+async def _store_lane(env, monkeypatch, products, store):  # noqa: F811
+    await _lane(env, monkeypatch, products, catalog=store)
+    from services.catalog_enrichment_agent import apply as apply_mod
+
+    async def apply(plan, **kw):
+        env.applied.append(plan)
+        env.retire_specs = getattr(env, "retire_specs", []) + [kw.get("retire_offers")]
+        counts = {"pdps": len(plan["pdps"]), "skus": len(plan["skus"]), "offers": len(plan["offers"])}
+        retired = store.write(plan, kw.get("retire_offers"))
+        if kw.get("retire_offers"):
+            counts["offers_retired"] = retired
+        return counts
+    monkeypatch.setattr(apply_mod, "apply_ingest_plan", apply)
+
+
+async def _crawl(env, monkeypatch, products, store, **options):  # noqa: F811
+    await _store_lane(env, monkeypatch, products, store)
+    return await pipeline.run_stage(fold_job("apply_due", fold_shades=True, **options), db=env.db)
+
+
+def _assert_one_truthful_offer_per_listing(store, products):
+    """Every listing's live lane offers belong to ONE product, every product has at most one live canonical
+    offer, and every live offer is priced by the page it points at (the latest crawl of it)."""
+    live = store.live()
+    owners = {}
+    for o in live:
+        owners.setdefault(o["source_ref"], set()).add(o["product_key"])
+    assert all(len(keys) == 1 for keys in owners.values()), owners
+    canon = [o["product_key"] for o in live if o["sku_key"].endswith("::canonical")]
+    assert len(canon) == len(set(canon)), canon
+    by_handle = {p["handle"]: p for p in products}
+    for o in live:
+        listing = by_handle[shopify_markets.handle_from_url(o["source_ref"])]
+        sellable = [v for v in listing["variants"] if float(v["price"]) >= feed.MIN_SELLABLE_PRICE]
+        assert sellable and float(o["list_price"]) in {float(v["price"]) for v in sellable}, (o, listing["handle"])
+
+
+RECRAWLS = {
+    "stub: identical x3": [stub_line(), stub_line(), stub_line()],
+    "stub: 8ml 20->0 (canonical moves)": [stub_line(), stub_line(p8="0.00")],
+    "stub: 15ml refused (type), then identical again": [stub_line(), stub_line(t15="Serum"), stub_line(t15="Serum")],
+    "stub: 15ml out of stock": [stub_line(), stub_line(a15=False)],
+    "priced: identical x3": [priced_line(), priced_line(), priced_line()],
+    "priced: parent 40->45": [priced_line(), priced_line(pp="45.00")],
+    "priced: parent sale 40->20 (child refused)": [priced_line(), priced_line(pp="20.00")],
+    "priced: child 90->200 (refused)": [priced_line(), priced_line(pc="200.00")],
+    "priced: child out of stock": [priced_line(), priced_line(child_available=False)],
+    "priced: parent out of stock": [priced_line(), priced_line(parent_available=False)],
+    "priced: child delisted": [priced_line(), priced_line(child=False)],
+    "priced: child added": [priced_line(), priced_line(extra=True)],
+    "priced: parent 40->0 (a stub now)": [priced_line(), priced_line(pp="0.00")],
+}
+
+
+@pytest.mark.parametrize("case", sorted(RECRAWLS))
+async def test_every_recrawl_applies_and_leaves_one_truthful_offer_per_listing(env, monkeypatch, case):  # noqa: F811
+    store = Store()
+    for n, products in enumerate(RECRAWLS[case]):
+        out = await _crawl(env, monkeypatch, products, store)
+        assert out["status"] == "done", (case, n, [f["rule"] for f in _last_run(env)["flags"]
+                                                   if f["severity"] == "block"])
+        _assert_one_truthful_offer_per_listing(store, products)
+        preview = _last_run(env)["checks"]["shade_fold"]["offer_preview"]
+        retired = (_last_run(env)["checks"]["shade_fold"].get("retired") or {}).get("offer_ids") or []
+        assert sorted(r["offer_id"] for r in preview["retire"]) == sorted(retired)  # did exactly what it said
+        if n and json.dumps(products, sort_keys=True) == json.dumps(RECRAWLS[case][n - 1], sort_keys=True):
+            assert retired == []  # an identical re-crawl retires nothing
+
+
+async def test_the_stale_offer_is_retired_not_held_and_the_preview_names_it(env, monkeypatch):  # noqa: F811
+    store = Store()
+    assert (await _crawl(env, monkeypatch, priced_line(), store))["status"] == "done"
+    child_variant = next(o for o in store.live() if o["source_ref"].endswith("/glow-serum-100ml"))
+    out = await _crawl(env, monkeypatch, priced_line(child=False), store)
+    assert out["status"] == "done"
+    fold = _last_run(env)["checks"]["shade_fold"]
+    assert fold["offer_preview"]["retire"] == [{"offer_id": child_variant["offer_id"], "why": "dropped_variant",
+                                                "source_ref": child_variant["source_ref"],
+                                                "product_key": child_variant["product_key"],
+                                                "suppression_reason": None, "alias": False}]
+    assert fold["retired"]["offer_ids"] == [child_variant["offer_id"]] and fold["retired"]["reason"] == FOLD_REASON
+    assert child_variant["suppression_reason"] == FOLD_REASON
+    spec = env.retire_specs[-1]
+    assert (spec["offer_ids"], spec["source_systems"]) == ([child_variant["offer_id"]], [ingestion.AGENT_VERSION])
+    assert all(f["severity"] != "block" for f in _last_run(env)["flags"])
+
+
+@pytest.mark.parametrize("first,gone,back", [
+    (priced_line(), priced_line(child=False), priced_line()),                          # a delisted shade returns
+    (stub_line(), stub_line(p8="0.00"), stub_line()),                                  # a stub child sells again
+])
+async def test_an_offer_the_plan_writes_again_comes_back_live(env, monkeypatch, first, gone, back):  # noqa: F811
+    store = Store()
+    await _crawl(env, monkeypatch, first, store)
+    before = {o["offer_id"] for o in store.live()}
+    await _crawl(env, monkeypatch, gone, store)
+    retired = {o["offer_id"] for o in store.offers if o.get("suppression_reason") == FOLD_REASON}
+    assert retired and retired <= before
+    out = await _crawl(env, monkeypatch, back, store)
+    assert out["status"] == "done"
+    assert retired <= {o["offer_id"] for o in store.live()}  # the same offer_ids, live again
+    _assert_one_truthful_offer_per_listing(store, back)
+
+
+async def test_a_retired_base_offer_takes_its_markets_siblings_with_it(env, monkeypatch):  # noqa: F811
+    """A shopify_markets sibling copies its base offer's page and serves its market's price for it; nothing ties
+    it to the base afterwards. Left live, a retired base would leave it selling a page the base no longer does."""
+    store = Store()
+    await _crawl(env, monkeypatch, priced_line(), store)
+    child_variant = next(o for o in store.live() if o["source_ref"].endswith("/glow-serum-100ml"))
+    sibling = {"offer_id": shopify_markets.sibling_offer_id(child_variant["offer_id"], "SG"),
+               "product_key": child_variant["product_key"], "sku_key": child_variant["sku_key"],
+               "source_ref": child_variant["source_ref"], "source_system": SG_SIBLINGS, "source_domain": HOST,
+               "list_price": 120.0, "suppressed_at": None, "suppression_reason": None}
+    other_lane = dict(sibling, offer_id="offer:another_lane:x", source_system="another_lane")
+    store.offers += [sibling, other_lane]
+    await _crawl(env, monkeypatch, priced_line(child=False), store)
+    assert _last_run(env)["checks"]["shade_fold"]["retired"]["sibling_offer_ids"] == [sibling["offer_id"]]
+    assert (sibling["suppression_reason"], other_lane["suppression_reason"]) == (FOLD_REASON, None)
+    assert shopify_markets.sibling_offer_id(child_variant["offer_id"], "US") in env.retire_specs[-1][
+        "sibling_offer_ids"]
+
+
+async def test_other_reasons_and_other_lanes_are_left_alone(env, monkeypatch):  # noqa: F811
+    """A lane offer suppressed under a reason its own lane lifts again is that lane's to decide (`leave`); a
+    final one is already out of the way; another lane's offer at the same page is never read."""
+    store = Store()
+    await _crawl(env, monkeypatch, priced_line(), store)
+    child_variant = next(o for o in store.live() if o["source_ref"].endswith("/glow-serum-100ml"))
+    child_variant.update(suppressed_at="2026-10-12T00:00:00Z", suppression_reason="catalog_destination_dead_pending")
+    final = dict(child_variant, offer_id="offer:x:final", suppression_reason="product_suppressed")
+    store.offers.append(final)
+    out = await _crawl(env, monkeypatch, priced_line(child=False), store)
+    assert out["status"] == "done"
+    preview = _last_run(env)["checks"]["shade_fold"]["offer_preview"]
+    assert [r["offer_id"] for r in preview["leave"]] == [child_variant["offer_id"]] and preview["retire"] == []
+    assert child_variant["suppression_reason"] == "catalog_destination_dead_pending"
+    assert final["suppression_reason"] == "product_suppressed"
+    assert env.retire_specs[-1] is None
+
+
+async def test_a_duplicate_outside_the_plan_is_held_for_a_reviewer_and_never_retired(env, monkeypatch):  # noqa: F811
+    store = Store()
+    await _crawl(env, monkeypatch, priced_line(), store)
+    child_url = f"https://{HOST}/products/glow-serum-100ml"
+    foreign = {"offer_id": "offer:catalog_enrichment_agent_v1:foreign", "product_key": "ext:another-cohorts-row",
+               "sku_key": "ext:another-cohorts-row::canonical", "source_ref": child_url,
+               "source_system": ingestion.AGENT_VERSION, "source_domain": HOST, "list_price": 90.0,
+               "suppressed_at": None, "suppression_reason": None}
+    store.offers.append(foreign)
+    out = await _crawl(env, monkeypatch, priced_line(), store)
+    assert out["status"] == "held"
+    flags = [f for f in _last_run(env)["flags"] if f["severity"] == "block"]
+    assert [(f["key"], f["acceptable"]) for f in flags] == [
+        (f"fold_duplicate_outside_plan:{foreign['offer_id']}", True)]
+    assert foreign["offer_id"] in flags[0]["detail"] and "without fold_shades" not in flags[0]["detail"]
+    out = await _crawl(env, monkeypatch, priced_line(), store, accepted_flags=[flags[0]["key"]])
+    assert out["status"] == "done" and foreign["suppressed_at"] is None  # the reviewer decided: left as is
+
+
+def _shade_line(n_shades, kept):
+    return [_p("Gel Tint", "gel-tint", "0.00")] + [_p(f"Gel Tint - Shade {i:02d}", f"gel-tint-{i:02d}", "20.00")
+                                                    for i in range(n_shades) if i < kept]
+
+
+async def test_a_mass_retire_is_held_for_a_reviewer(env, monkeypatch):  # noqa: F811
+    """A crawl that suddenly drops most of a line looks exactly like a broken one."""
+    store = Store()
+    assert (await _crawl(env, monkeypatch, _shade_line(14, 14), store))["status"] == "done"
+    live_before = len(store.live())
+    out = await _crawl(env, monkeypatch, _shade_line(14, 1), store)
+    assert out["status"] == "held"
+    flag = next(f for f in _last_run(env)["flags"] if f["rule"] == "fold_mass_retire")
+    assert flag["acceptable"] is True and len(store.live()) == live_before  # nothing retired
+    preview = _last_run(env)["checks"]["shade_fold"]["offer_preview"]
+    assert len(preview["retire"]) > preview["retire_limit"] == pipeline._fold_retire_limit(live_before)
+    assert preview["live_lane_offers_on_host"] == live_before  # this lane's live offers on the host, no other
+    out = await _crawl(env, monkeypatch, _shade_line(14, 1), store, accepted_flags=["fold_mass_retire"])
+    assert out["status"] == "done" and len(_last_run(env)["checks"]["shade_fold"]["retired"]["offer_ids"]) > 10
+
+
+@pytest.mark.parametrize("live,limit", [(0, 10), (50, 10), (100, 10), (101, 11), (1000, 100)])
+def test_the_retire_limit(live, limit):
+    assert pipeline._fold_retire_limit(live) == limit
+
+
+async def test_a_retire_set_that_moved_under_the_lock_is_held(env, monkeypatch):  # noqa: F811
+    store = Store()
+    await _crawl(env, monkeypatch, priced_line(), store)
+    child_variant = next(o for o in store.live() if o["source_ref"].endswith("/glow-serum-100ml"))
+
+    class Moving(Store):
+        reads = 0
+
+        async def fetch_all(self, query, values=None):
+            rows = await super().fetch_all(query, values)
+            if query is pipeline.FOLD_LANE_OFFERS_SQL:
+                Moving.reads += 1
+                if Moving.reads == 2:  # under the lock: another job wrote a second stale offer meanwhile
+                    rows = rows + [dict(child_variant, offer_id="offer:catalog_enrichment_agent_v1:late",
+                                        sku_key=child_variant["sku_key"] + "x")]
+            return rows
+    moving = Moving(store.offers)
+    out = await _crawl(env, monkeypatch, priced_line(child=False), moving)
+    assert (out["status"], out["outcome"]) == ("held", "fold_offers_changed")
+    assert child_variant["offer_id"] in {o["offer_id"] for o in moving.live()}  # nothing retired
+    assert _last_run(env)["checks"]["shade_fold"]["offer_recheck"]["same_as_preview"] is False
+
+
+def test_a_fold_retired_offer_is_out_of_the_way():
+    assert pipeline._superseded_row_retired({"suppressed_at": "2026-10-13T00:00:00Z", "suppression_reason": FOLD_REASON})
+    from services.catalog_enrichment_agent import apply as apply_mod
+    assert apply_mod.OFFER_FOLD_SUPERSEDED_REASON == FOLD_REASON
+    # the revival is spelled with this very reason in both upserts that write these offers back
+    assert apply_mod._OFFER_UPSERT_SQL.count(f"suppression_reason = '{FOLD_REASON}'") == 2
+    assert shopify_markets.SIBLING_UPSERT_SQL.count(f"suppression_reason = '{FOLD_REASON}'") == 3
+
+
+async def test_the_retire_needs_the_per_row_executor():
+    from services.catalog_enrichment_agent import apply as apply_mod
+    with pytest.raises(ValueError, match="per-row"):
+        await apply_mod._apply_ingest_plan({"offers": []}, batch_label="x", batch=True,
+                                           retire_offers={"reason": FOLD_REASON, "offer_ids": ["a"]})
+
+
+def _www(url):
+    return url.replace("https://", "https://www.", 1)
+
+
+async def test_a_www_alias_canonical_is_retired_and_the_apex_one_rewritten_in_place(env, monkeypatch):  # noqa: F811
+    """Older rows can carry a product's canonical at both `www.host` and `host`: one page, two offers. The fold
+    rewrites the apex one (same offer_id, in place) and retires the alias."""
+    store = Store()
+    await _crawl(env, monkeypatch, priced_line(), store)
+    apex = next(o for o in store.live() if o["sku_key"].endswith("::canonical")
+                and o["source_ref"].endswith("/glow-serum"))
+    alias = dict(apex, offer_id="offer:catalog_enrichment_agent_v1:www-alias", source_ref=_www(apex["source_ref"]))
+    store.offers.append(alias)
+    out = await _crawl(env, monkeypatch, priced_line(), store)
+    assert out["status"] == "done"
+    preview = _last_run(env)["checks"]["shade_fold"]["offer_preview"]
+    assert [(r["offer_id"], r["why"], r["alias"]) for r in preview["retire"]] == [
+        (alias["offer_id"], "canonical_moved", True)]
+    assert alias["suppression_reason"] == FOLD_REASON and apex["suppressed_at"] is None
+    assert apex["offer_id"] in {o["offer_id"] for o in env.applied[-1]["offers"]}  # rewritten, same id
+
+
+async def test_alias_retires_never_trip_the_mass_retire_guard(env, monkeypatch):  # noqa: F811
+    """A store whose every older canonical also lives at its `www.` spelling retires all of them on its first
+    fold run -- a duplicate spelling going away, not a broken crawl."""
+    products = [_p(f"Gel Tint Ruby {i:02d}", f"gel-tint-ruby-{i:02d}", "12.00") for i in range(14)]
+    store = Store()
+    await _crawl(env, monkeypatch, products, store)
+    aliases = [dict(o, offer_id=f"offer:catalog_enrichment_agent_v1:www-{n}", source_ref=_www(o["source_ref"]))
+               for n, o in enumerate(o for o in store.live() if o["sku_key"].endswith("::canonical"))]
+    store.offers += aliases
+    out = await _crawl(env, monkeypatch, products, store)
+    assert out["status"] == "done", [f["rule"] for f in _last_run(env)["flags"] if f["severity"] == "block"]
+    preview = _last_run(env)["checks"]["shade_fold"]["offer_preview"]
+    assert len(preview["retire"]) == 14 > preview["retire_limit"]
+    assert all(a["suppression_reason"] == FOLD_REASON for a in aliases)
+
+
+def _grouped_wrong(written_as_own_row):
+    """One product holds canonical offers at two handles at different prices (a full size and a mini under one
+    product_key): the second offer was written under the first product by an older run."""
+    products = [_p("Glow Serum", "glow-serum", "40.00", product_type="Serum"), _p("Top Gloss", "top-gloss", "15.00")]
+    if written_as_own_row:
+        products.append(_p("Glow Serum Mini", "glow-serum-mini", "12.00", product_type="Serum"))
+    return products
+
+
+@pytest.mark.parametrize("written_as_own_row", [True, False])
+async def test_a_canonical_at_another_handle_is_retired_from_the_wrongly_grouped_product(env, monkeypatch,  # noqa: F811
+                                                                                         written_as_own_row):
+    store = Store()
+    await _crawl(env, monkeypatch, _grouped_wrong(written_as_own_row=False), store)
+    base = next(o for o in store.live() if o["sku_key"].endswith("::canonical")
+                and o["source_ref"].endswith("/glow-serum"))
+    mini_url = f"https://{HOST}/products/glow-serum-mini"
+    misgrouped = dict(base, offer_id="offer:catalog_enrichment_agent_v1:misgrouped", source_ref=mini_url,
+                      list_price=12.0)
+    store.offers.append(misgrouped)
+    products = _grouped_wrong(written_as_own_row)
+    out = await _crawl(env, monkeypatch, products, store)
+    assert out["status"] == "done"
+    assert misgrouped["suppression_reason"] == FOLD_REASON  # retired from the product that never sold it
+    at_mini = [o for o in store.live() if o["source_ref"] == mini_url]
+    if written_as_own_row:  # ... and the page stays in the catalog, as its own row's offer
+        assert len(at_mini) >= 1 and {o["product_key"] for o in at_mini} == {
+            ingestion.retailer_product_key(HOST, mini_url)}
+    else:  # the store no longer lists it under this product (or at all): retired is right
+        assert at_mini == []
+    _assert_one_truthful_offer_per_listing(store, products)
+
+
+async def test_another_lanes_offer_at_a_shared_listing_is_never_read_or_retired(env, monkeypatch):  # noqa: F811
+    store = Store()
+    await _crawl(env, monkeypatch, priced_line(), store)
+    child_url = f"https://{HOST}/products/glow-serum-100ml"
+    other = {"offer_id": "offer:variant_identity_backfill_v1:x", "product_key": "ext:another-product",
+             "sku_key": "ext:another-product::v::1", "source_ref": child_url,
+             "source_system": "variant_identity_backfill_v1", "source_domain": HOST, "list_price": 90.0,
+             "suppressed_at": None, "suppression_reason": None}
+    store.offers.append(other)
+    out = await _crawl(env, monkeypatch, priced_line(child=False), store)
+    assert out["status"] == "done"
+    assert other["suppressed_at"] is None
+    assert other["offer_id"] not in env.retire_specs[-1]["offer_ids"] + env.retire_specs[-1]["sibling_offer_ids"]
+
+
+
+async def test_an_item_gone_from_its_own_page_is_retired_only_on_a_fold_base(env, monkeypatch):  # noqa: F811
+    """On a fold base, an item of its own page the plan no longer writes is the fold's doing (an unsellable
+    parent's placeholder is dropped) and is retired. On any other product it is a native variant the merchant
+    removed -- the lane's long-standing behaviour, left as it is."""
+    store = Store()
+    await _crawl(env, monkeypatch, priced_line(), store)
+    by_page = {o["source_ref"].rsplit("/", 1)[-1]: o for o in store.live() if o["sku_key"].endswith("::canonical")}
+    extra = [dict(by_page[h], offer_id=f"offer:catalog_enrichment_agent_v1:gone-{h}",
+                  sku_key=by_page[h]["product_key"] + "::v::gone") for h in ("glow-serum", "top-gloss")]
+    store.offers += extra
+    out = await _crawl(env, monkeypatch, priced_line(), store)
+    assert out["status"] == "done"
+    retire = _last_run(env)["checks"]["shade_fold"]["offer_preview"]["retire"]
+    assert [(r["offer_id"], r["why"]) for r in retire] == [(extra[0]["offer_id"], "dropped_variant")]
+    assert (extra[0]["suppression_reason"], extra[1]["suppressed_at"]) == (FOLD_REASON, None)
+
+
+async def test_an_offer_at_the_other_www_spelling_of_a_planned_listing_is_read(env, monkeypatch):  # noqa: F811
+    """Another product's offer reachable only through the `www.` spelling of a listing the plan writes is still
+    a second offer at that page."""
+    store = Store()
+    await _crawl(env, monkeypatch, priced_line(), store)
+    child_url = f"https://www.{HOST}/products/glow-serum-100ml"
+    foreign = {"offer_id": "offer:catalog_enrichment_agent_v1:www-foreign", "product_key": "ext:another-cohorts-row",
+               "sku_key": "ext:another-cohorts-row::canonical", "source_ref": child_url,
+               "source_system": ingestion.AGENT_VERSION, "source_domain": HOST, "list_price": 90.0,
+               "suppressed_at": None, "suppression_reason": None}
+    store.offers.append(foreign)
+    out = await _crawl(env, monkeypatch, priced_line(), store)
+    assert out["status"] == "held"
+    assert [f["key"] for f in _last_run(env)["flags"] if f["severity"] == "block"] == [
+        f"fold_duplicate_outside_plan:{foreign['offer_id']}"]

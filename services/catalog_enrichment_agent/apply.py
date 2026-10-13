@@ -370,6 +370,14 @@ _OFFER_UPSERT_SQL = """
                         THEN catalog_offers.estimated_best_price ELSE EXCLUDED.estimated_best_price END,
                       price_confidence = EXCLUDED.price_confidence,
                       source_domain = EXCLUDED.source_domain,
+                      -- REVIVAL. An offer the retailer lane's shade fold retired ('fold_superseded',
+                      -- OFFER_FOLD_SUPERSEDED_REASON) is written again only when a later crawl sells it again
+                      -- (the shade came back, the sale ended): it comes back live. Every other suppression is
+                      -- left exactly as it is -- its own lane decides it.
+                      suppressed_at = CASE WHEN catalog_offers.suppression_reason = 'fold_superseded'
+                                           THEN NULL ELSE catalog_offers.suppressed_at END,
+                      suppression_reason = CASE WHEN catalog_offers.suppression_reason = 'fold_superseded'
+                                                THEN NULL ELSE catalog_offers.suppression_reason END,
                       offer_payload = CASE
                         WHEN catalog_offers.product_key = concat('ext', chr(58), 'jungsaemmool-lip-pression-metal-serum-gloss', chr(58), chr(58), '66a3c8a4')
                          AND catalog_offers.offer_payload->>'meitu_sg_price_reviewed_0920' = 'SGD30'
@@ -377,6 +385,44 @@ _OFFER_UPSERT_SQL = """
                         THEN catalog_offers.offer_payload ELSE EXCLUDED.offer_payload END,
                       updated_at = NOW()
                     """
+
+#: The final suppression reason of an offer the retailer-ingest shade fold RETIRED: an offer of this lane that
+#: the fold no longer writes (a canonical at another page, a variant no longer folded, a second offer at a
+#: listing the plan writes), and its shopify_markets siblings. Not `*_pending`, not self-reviving: only the
+#: offer upsert above lifts it, and only when a later plan writes that same offer again.
+OFFER_FOLD_SUPERSEDED_REASON = "fold_superseded"
+
+#: The retire, in the apply's own transaction: exactly the offers named, of exactly the source_systems named,
+#: and only while they are live -- a row another lane suppressed keeps that lane's reason.
+RETIRE_OFFERS_SQL = """
+UPDATE catalog_offers
+   SET suppressed_at = NOW(),
+       suppression_reason = CAST(:reason AS text),
+       suppression_metadata = coalesce(suppression_metadata, '{}'::jsonb) || CAST(:meta AS jsonb),
+       updated_at = NOW()
+ WHERE offer_id = ANY(:offer_ids)
+   AND source_system = ANY(:source_systems)
+   AND suppressed_at IS NULL
+RETURNING offer_id
+"""
+
+
+async def _retire_offers(database: Any, retire: Dict[str, Any]) -> Dict[str, Any]:
+    """Retire the stale offers a caller classified (`retire`: reason, meta, offer_ids + source_systems, and the
+    sibling_offer_ids + sibling_source_systems that hang on them). Returns what was retired, read back with
+    RETURNING (databases' execute has no rowcount)."""
+    meta = json.dumps(retire.get("meta") or {}, ensure_ascii=False, sort_keys=True, default=str)
+    out: Dict[str, Any] = {"reason": retire["reason"], "offer_ids": [], "sibling_offer_ids": []}
+    for ids_key, systems_key, out_key in (("offer_ids", "source_systems", "offer_ids"),
+                                          ("sibling_offer_ids", "sibling_source_systems", "sibling_offer_ids")):
+        ids, systems = sorted(set(retire.get(ids_key) or [])), sorted(set(retire.get(systems_key) or []))
+        if not ids or not systems:
+            continue
+        rows = await database.fetch_all(RETIRE_OFFERS_SQL, {"reason": retire["reason"], "meta": meta,
+                                                            "offer_ids": ids, "source_systems": systems})
+        out[out_key] = sorted(str(r["offer_id"]) for r in rows or [])
+    return out
+
 
 def _offer_upsert_sql_with_market(sql: str) -> str:
     """`_OFFER_UPSERT_SQL` with `market` as an INSERT column: the statement for offer rows whose
@@ -2177,8 +2223,12 @@ async def apply_ingest_plan(
     primary_readiness: bool = False,
     market: str = DEFAULT_CANONICAL_MARKET,
     verified_storefront: Optional[VerifiedBrandStorefront] = None,
+    retire_offers: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Persist an ingest plan, optionally handing curated rows to serving policy.
+
+    `retire_offers` (the retailer-ingest shade fold, _retire_offers): stale offers to retire in the SAME
+    transaction as the plan's SKU and offer upserts; what was retired is counts["offers_retired"].
 
     Curated CLI/queue callers select primary_readiness explicitly. Every other
     existing door retains the original counts and best-effort persistence path.
@@ -2193,7 +2243,7 @@ async def apply_ingest_plan(
 
     preflight = require_primary_plan(plan) if primary_readiness else None
     counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch, market=market,
-                                      verified_storefront=verified_storefront)
+                                      verified_storefront=verified_storefront, retire_offers=retire_offers)
     if not primary_readiness:
         return counts
     from services.catalog_enrichment_agent.primary_readiness import (
@@ -2222,6 +2272,7 @@ async def _apply_ingest_plan(
     batch: bool = False,
     market: str = DEFAULT_CANONICAL_MARKET,
     verified_storefront: Optional[VerifiedBrandStorefront] = None,
+    retire_offers: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, int]:
     """Execute an ingest plan (from `ingest_validated_jsonl`) against the DB in FK
     order. Returns counts. Per-row failures are logged and skipped (never abort the
@@ -2233,6 +2284,9 @@ async def _apply_ingest_plan(
     from db.database import database as _global_db
 
     _refuse_offer_market_currency_mismatch(plan)  # pure: before the connection, before any write
+    if retire_offers and batch:
+        # The retire must share the offers' transaction; the batched executor has none to share.
+        raise ValueError("retire_offers needs the per-row executor (batch=False)")
     database = db or _global_db
     if not getattr(database, "is_connected", False):
         await database.connect()
@@ -2370,6 +2424,11 @@ async def _apply_ingest_plan(
                 audit.record_applied(1)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("insert offer failed for offer_id=%s — %s", offer.get("offer_id"), exc)
+
+        # 4b. The stale offers the caller classified, retired in THIS transaction: they commit with the
+        #     upserts that supersede them, or not at all. An error here rolls the stage back and raises.
+        if retire_offers:
+            counts["offers_retired"] = await _retire_offers(database, retire_offers)
 
     # 5. external_product_seeds — audit + legacy compatibility.
     own_storefronts = _verified_storefronts_by_key(pdps, verified_storefront)
