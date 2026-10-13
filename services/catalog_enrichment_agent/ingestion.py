@@ -376,6 +376,11 @@ def retailer_product_key(source_domain: Optional[str], canonical_url: Optional[s
     return "ext:retailer:" + hashlib.sha256(listing.encode("utf-8")).hexdigest()[:32]
 
 
+#: A seed variant's "url_source" when its "url" is the listing the EXTENDED shade fold took it from (the only
+#: per-variant url the public seed projection serves; routes/agent_shop_gateway._normalize_seed_variants).
+SEED_VARIANT_URL_SOURCE = "shade_fold_listing"
+
+
 def own_listing_url(listing_url: Optional[str], candidate: Optional[str]) -> Optional[str]:
     """`candidate` -- the listing an EXTENDED-fold variant is sold on (curated_brand_feed stamps it as
     `own_listing_url` on the pdp variant) -- when it is a /products/ page on the same storefront host as the
@@ -394,8 +399,10 @@ def own_listing_url(listing_url: Optional[str], candidate: Optional[str]) -> Opt
         host = (own.hostname or "").lower().removeprefix("www.")
         if (not candidate or own.scheme not in {"http", "https"} or not host
                 # one plain storefront URL, as retailer_listing_identity demands of a listing: no credentials,
-                # no port, and nothing after the path (a query or fragment would mint a second offer_id)
-                or own.username or own.password or own.port or own.query or own.fragment
+                # no port, and nothing after the path -- not even an empty query or fragment ("/products/x?" is
+                # another string for the same page, and would mint a second offer_id)
+                or own.username or own.password or own.port
+                or "?" in str(candidate) or "#" in str(candidate)
                 or host != (base.hostname or "").lower().removeprefix("www.")
                 or not own.path.startswith("/products/") or not own.path[len("/products/"):].strip("/")):
             return None
@@ -1181,8 +1188,10 @@ def _build_seed_inserts(
                     # A variant the EXTENDED shade fold took from another listing is sold THERE, not at the
                     # seed's destination_url: the seed-variant reader's per-variant "url"
                     # (external_seed_audit.normalize_seed_variants). Only that fold names one, so every
-                    # other seed is byte-identical.
-                    **({"url": variant_url} if variant_url else {}),
+                    # other seed is byte-identical. Stamped with its source, because other writers store a
+                    # variant "url" too (a ?variant= link on the seed's own page): the public seed projection
+                    # (routes/agent_shop_gateway._normalize_seed_variants) serves only the fold's.
+                    **({"url": variant_url, "url_source": SEED_VARIANT_URL_SOURCE} if variant_url else {}),
                 })
             if built:
                 _drop_options_that_do_not_distinguish(built)

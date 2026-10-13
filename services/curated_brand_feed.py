@@ -3740,18 +3740,45 @@ def _is_extended_stub(product: Dict[str, Any]) -> bool:
 
 #: A quantity written in a title ("Glow Serum 30ml"): the parent's own item on a size axis.
 _TITLE_QUANTITY_RE = re.compile(r"(?i)\b\d+(?:[.,]\d+)?\s*(?:ml|l|g|kg|mg|oz|fl\.?\s*oz)\b")
-#: Neutral labels for a parent's own placeholder item, by its children's axis, in order of preference.
-_PARENT_ITEM_LABELS = {"size": ("Standard", "Regular"), "shade": ("Original", "Classic")}
+#: A title that counts units ("2 x 4.5g", "4.5g x2", "Duo", "Set of 3", "4.5g Set", "3 Pack", "25g 10 Sheets"): its
+#: quantity is one unit's, not the item's size, so it names no size for the parent's own item.
+_TITLE_MULTI_UNIT_RE = re.compile(
+    r"(?i)\d\s*[x×]\s*\d|\b[x×]\s*\d|\d\s*[x×]\b|\b(duo|trio|set|sets|pack|packs|bundle|kit)\b"
+    r"|\b\d+\s*(?:sheets?|pcs|pieces?|pads?|count|ct|capsules?|ampoules?|masks?|sachets?|patch(?:es)?|pairs?)\b")
+#: Neutral labels for a parent's own placeholder item on a SIZE axis, in order of preference.
+_PARENT_SIZE_LABELS = ("Standard", "Regular")
 
 
-def _parent_item_label(title: str, family: str, *, taken: set) -> Optional[str]:
-    """The label for a priced parent's own placeholder item: the quantity its title states for a size axis
-    ("Glow Serum 30ml" -> "30ml"), else a neutral word ("Standard" for sizes, "Original" otherwise) -- the first
-    that no child already uses (a repeated label would make the seed writer drop them all). None when every
-    candidate is taken: the item is then left unlabelled, as before."""
-    found = _TITLE_QUANTITY_RE.search(title or "") if family == "size" else None
-    candidates = ([" ".join(found.group(0).split())] if found else []) + list(
-        _PARENT_ITEM_LABELS["size" if family == "size" else "shade"])
+def _listing_handle_usable(base_handle: str, handle: str) -> bool:
+    """Will the offer writer point a folded variant at /products/<handle>? The SAME predicate it uses
+    (ingestion.own_listing_url), on the URLs the record builder spells: the base's listing and the child's,
+    on one host. The fold does not know the host, and the predicate's host rule only asks that the two share
+    one, so any host gives the writer's answer for the handle itself."""
+    from services.catalog_enrichment_agent.ingestion import own_listing_url
+
+    if not str(handle or "").strip() or "/" in str(handle):
+        return False
+    host = "fold.invalid"
+    url = f"https://{host}/products/{handle}"
+    return own_listing_url(f"https://{host}/products/{base_handle or handle}", url) == url
+
+
+def _parent_item_label(title: str, *, taken: set) -> Optional[str]:
+    """The label for a priced parent's own placeholder item on a SIZE axis, or None to leave it unlabelled.
+
+    The ONE quantity its title states ("Glow Serum 30ml" -> "30ml"; not a multi-unit title, not
+    a title naming two quantities), else "Standard" -- the first candidate no child already uses (a repeated
+    label makes the seed writer drop them all). "Standard" says what the item is (the regular size), and invents
+    no measurement.
+
+    Never called for any other axis (the fold labels the item only when every folded child is a size). A colour
+    name the shop never wrote ("Original", "Classic") would be presented as a real shade in the picker, so on a
+    shade axis the item stays unlabelled and the existing all-or-nothing rule
+    (ingestion._drop_options_that_do_not_distinguish) serves the product as a plain list of named variants: no
+    picker, but nothing false in it."""
+    title = title or ""
+    found = [] if _TITLE_MULTI_UNIT_RE.search(title) else _TITLE_QUANTITY_RE.findall(title)
+    candidates = ([" ".join(found[0].split())] if len(found) == 1 else []) + list(_PARENT_SIZE_LABELS)
     return next((c for c in candidates if _norm_label(c) not in taken), None)
 
 
@@ -3867,9 +3894,10 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
                 break
             if multi:
                 break  # a suffixed multi-variant listing is a distinct line, as in the legacy fold
-            if not handle_of(p).strip() or "/" in handle_of(p):
-                # A folded variant is sold on its own listing (/products/<handle>); without one its offer, or the
-                # canonical one, would fall back to the parent's page at the child's price.
+            if not _listing_handle_usable(handle_of(base), handle_of(p)):
+                # A folded variant is sold on its own listing (/products/<handle>); a handle the offer writer will
+                # not point at (ingestion.own_listing_url: empty, "/", "?", "#", ...) would put its offer -- or
+                # the canonical one -- on the parent's page at the child's price.
                 refuse(p, "child_handle_unusable")
                 break
             name, family, evidence = _child_axis(p, suffix)
@@ -3978,12 +4006,13 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
         # children it makes the seed writer drop EVERY label (ingestion._drop_options_that_do_not_distinguish), so
         # the folded product would have no picker. It gets a label on the children's axis instead.
         added_families = {target[id(k)][4] for k in kids if handle_of(k) in folded_handles}
-        if len(own) == 1 and not _variant_label(own[0]) and len(added_families) == 1:
-            family = next(iter(added_families))
-            label = _parent_item_label(title_of(p), family, taken={_norm_label(v.get("title")) for v in added})
+        # Only when EVERY folded child is a size (_parent_item_label: no shade name is invented, and across
+        # mixed axes the seed writer drops the labels anyway).
+        if len(own) == 1 and not _variant_label(own[0]) and added_families == {"size"}:
+            label = _parent_item_label(title_of(p), taken={_norm_label(v.get("title")) for v in added})
             if label:
-                own[0] = dict(own[0], title=label, option1=label, **{FOLD_AXIS_KEY: spelling.get(family) or (
-                    _DEFAULT_SIZE_OPTION_NAME if family == "size" else _DEFAULT_SHADE_OPTION_NAME)})
+                own[0] = dict(own[0], title=label, option1=label,
+                              **{FOLD_AXIS_KEY: spelling.get("size") or _DEFAULT_SIZE_OPTION_NAME})
                 report["parent_items_labelled"].append({"base_handle": base_handle, "label": label})
         # Two axes on one product: the seed writer then drops every label and serves the bare list
         # (ingestion._drop_options_that_do_not_distinguish). Folded anyway, and named for the reviewer.
