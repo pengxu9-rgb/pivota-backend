@@ -1153,6 +1153,7 @@ def _build_seed_inserts(
                 v_in_stock = _observed_stock(v.get("in_stock"))
                 shade = str(v.get("title") or "").strip()
                 image_url = str(v.get("image_url") or "").strip() or None
+                variant_url = own_listing_url(offer.get("canonical_url") or destination_url, v.get("own_listing_url"))
                 built.append({
                     "variant_id": vid,
                     "id": vid,
@@ -1177,6 +1178,11 @@ def _build_seed_inserts(
                     # reader of this column can tell a merchant's id from one
                     # of ours without re-sniffing the string.
                     "variant_id_provenance": provenance,
+                    # A variant the EXTENDED shade fold took from another listing is sold THERE, not at the
+                    # seed's destination_url: the seed-variant reader's per-variant "url"
+                    # (external_seed_audit.normalize_seed_variants). Only that fold names one, so every
+                    # other seed is byte-identical.
+                    **({"url": variant_url} if variant_url else {}),
                 })
             if built:
                 _drop_options_that_do_not_distinguish(built)

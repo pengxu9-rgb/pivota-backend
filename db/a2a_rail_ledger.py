@@ -765,8 +765,10 @@ async def requeue_stale_claims(*, lease_seconds: int = 300, limit: int = 50) -> 
 # ── the expiry sweep ─────────────────────────────────────────────────────────────────────────
 #
 # Unfenced and in bulk, like Reap's: it may end a purchase a worker holds, and clears the claim when
-# it does (the worker learns it from a None transition). NEVER 'paying' (money may be moving), and
-# never a row with a pending write (a write whose outcome nobody has seen yet).
+# it does (the worker learns it from a None transition). NEVER 'paying' (money may be moving), never a
+# row with a pending write (a write whose outcome nobody has seen yet), and never a row parked on an
+# answer that reported money moving (`money_result_seen`): that park is for a human, and expiring it
+# would overwrite the only record that money may have moved.
 _EXPIRE_SQL = """
     UPDATE a2a_rail_purchases
        SET state = 'expired',
@@ -781,6 +783,7 @@ _EXPIRE_SQL = """
             SELECT id FROM a2a_rail_purchases
              WHERE state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
                AND pending_write IS NULL
+               AND (last_error_code IS NULL OR last_error_code NOT LIKE '%money_result_seen%')
                AND ((buyer_action_expires_at IS NOT NULL AND buyer_action_expires_at < clock_timestamp())
                     OR state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
                     OR created_at < clock_timestamp() - (:max_lifetime_seconds * INTERVAL '1 second'))
@@ -789,6 +792,7 @@ _EXPIRE_SQL = """
            )
        AND state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
        AND pending_write IS NULL
+               AND (last_error_code IS NULL OR last_error_code NOT LIKE '%money_result_seen%')
        AND ((buyer_action_expires_at IS NOT NULL AND buyer_action_expires_at < clock_timestamp())
             OR state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
             OR created_at < clock_timestamp() - (:max_lifetime_seconds * INTERVAL '1 second'))
@@ -808,6 +812,7 @@ _EXPIRE_SQL_SQLITE = """
             SELECT id FROM a2a_rail_purchases
              WHERE state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
                AND pending_write IS NULL
+               AND (last_error_code IS NULL OR last_error_code NOT LIKE '%money_result_seen%')
                AND ((buyer_action_expires_at IS NOT NULL AND buyer_action_expires_at < CURRENT_TIMESTAMP)
                     OR state_entered_at < datetime('now', '-' || :max_age_seconds || ' seconds')
                     OR created_at < datetime('now', '-' || :max_lifetime_seconds || ' seconds'))
@@ -816,6 +821,7 @@ _EXPIRE_SQL_SQLITE = """
            )
        AND state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
        AND pending_write IS NULL
+               AND (last_error_code IS NULL OR last_error_code NOT LIKE '%money_result_seen%')
        AND ((buyer_action_expires_at IS NOT NULL AND buyer_action_expires_at < CURRENT_TIMESTAMP)
             OR state_entered_at < datetime('now', '-' || :max_age_seconds || ' seconds')
             OR created_at < datetime('now', '-' || :max_lifetime_seconds || ' seconds'))

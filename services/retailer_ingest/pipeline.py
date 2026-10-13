@@ -930,6 +930,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     # currency; the seed rows keep the US serving partition (ingestion.SEED_PARTITION_MARKET).
     moves_accepted = [k.split(":", 1)[1] for k in o.get("accepted_flags") or [] if k.startswith("listing_moved:")]
     plan = await cli._plan_with_current_listings(records, market=market, allow_moves=moves_accepted)
+    if o.get("fold_shades") and carry.get("fold_base_keys"):
+        flags.extend(await _fold_canonical_checks(plan, carry, checks))
     inspection = inspect_primary_plan(plan)
     checks["plan"] = {k: inspection.get(k) for k in ("status", "reasons", "planned", "unresolved_category_count")}
     if inspection.get("reasons"):
@@ -983,7 +985,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
                        "info": len([f for f in flags if f["severity"] == detectors.INFO]),
                        "blocking_after_approval": len(blocking)}
     return {"plan": plan, "inspection": inspection, "checks": checks, "flags": flags, "blocking": blocking,
-            "fold_supersede_entries": carry.get("fold_supersede_entries") or []}
+            "fold_supersede_entries": carry.get("fold_supersede_entries") or [],
+            "fold_canonical_expected": carry.get("fold_canonical_expected") or {}}
 
 
 #: The rows a fold would supersede, as they stand: a listing whose key holds a LIVE row (suppressed_at and
@@ -997,8 +1000,17 @@ WHERE product_key = ANY(:keys)
 SHADE_FOLD_PREVIEW_CAP = 500
 
 
-async def _superseded_rows(keys: List[str]) -> tuple:
-    """(rows by product_key, None) read through the SELECT-only preflight handle, or (None, why)."""
+#: The live offers on the folded bases' canonical SKUs (`<product_key>::canonical`), with the page each sends a
+#: buyer to. A SHOPIFY_MARKETS sibling copies its base offer's source_ref, so it reads the same.
+CANONICAL_OFFERS_SQL = """
+SELECT product_key, sku_key, offer_id, source_ref
+FROM catalog_offers
+WHERE sku_key = ANY(:sku_keys) AND suppressed_at IS NULL
+"""
+
+
+async def _catalog_read(sql: str, values: Dict[str, Any]) -> tuple:
+    """(rows as dicts, None) read through the SELECT-only preflight handle, or (None, why)."""
     import scripts.onboard_curated_brands as cli
 
     database, reason = cli._preflight_database()
@@ -1009,13 +1021,75 @@ async def _superseded_rows(keys: List[str]) -> tuple:
         if not getattr(database, "is_connected", False):
             await database.connect()
             connected_here = True
-        rows = await cli._SelectOnlyHandle(database).fetch_all(SUPERSEDED_ROWS_SQL, {"keys": keys})
-        return {r["product_key"]: dict(r) for r in rows or []}, None
+        return [dict(r) for r in await cli._SelectOnlyHandle(database).fetch_all(sql, values) or []], None
     except Exception as exc:  # noqa: BLE001 -- the class only: a driver error can quote its URL
         return None, type(exc).__name__
     finally:
         if connected_here and getattr(database, "is_connected", False):
             await database.disconnect()
+
+
+async def _superseded_rows(keys: List[str]) -> tuple:
+    """(rows by product_key, None) read through the SELECT-only preflight handle, or (None, why)."""
+    rows, unread = await _catalog_read(SUPERSEDED_ROWS_SQL, {"keys": keys})
+    return (None, unread) if rows is None else ({r["product_key"]: r for r in rows}, None)
+
+
+async def _moved_canonical_offers(expected: Dict[str, str]) -> tuple:
+    """(live canonical offers whose page is NOT the one the fold now sends the base's buyers to, None), or
+    (None, why). `expected`: {base product_key: the source_ref of the plan's own canonical offer}."""
+    from services.catalog_enrichment_agent.ingestion import derive_sku_key
+
+    if not expected:
+        return [], None
+    rows, unread = await _catalog_read(CANONICAL_OFFERS_SQL,
+                                       {"sku_keys": sorted(derive_sku_key(k) for k in expected)})
+    if rows is None:
+        return None, unread
+    return [r for r in rows if r.get("product_key") in expected
+            and str(r.get("source_ref") or "") != expected[r["product_key"]]], None
+
+
+async def _fold_canonical_checks(plan: Dict[str, Any], carry: Dict[str, Any],
+                                 checks: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """options.fold_shades, THE BASE ROW: does the fold move a live canonical offer?
+
+    The canonical offer of a folded base is the base's own item at the base URL when the base sells something,
+    else its first sellable child's item on that child's listing (curated_brand_feed: `canonical_moved`). The
+    offer_id hashes that URL, so a live canonical offer at any OTHER page would stay beside the new one -- the
+    base sold twice, once at a stale price. Only that is held (fold_moves_live_canonical): an identical
+    re-crawl, a first fold, or a canonical that already moved writes the same offer_id and refreshes its price
+    in place. Read from the plan itself (the offer as it would be stored), and again under the write lock."""
+    from services.catalog_enrichment_agent.ingestion import SKU_SUFFIX
+
+    bases = carry.get("fold_base_keys") or {}
+    expected = {o["product_key"]: str(o.get("source_ref") or "") for o in plan.get("offers") or []
+                if o.get("product_key") in bases and str(o.get("sku_key") or "") == f"{o['product_key']}{SKU_SUFFIX}"}
+    carry["fold_canonical_expected"] = expected
+    moved, unread = await _moved_canonical_offers(expected)
+    fold = checks.setdefault("shade_fold", {})
+    if moved is None:
+        fold["canonical_preview"] = {"status": "unchecked", "reason": unread, "bases": len(expected)}
+        return [{"key": "fold_canonical_unread", "rule": "fold_canonical_unread", "severity": detectors.BLOCK,
+                 "acceptable": False,
+                 "detail": f"could not read the live canonical offers of the {len(expected)} folded base(s) "
+                           f"({unread}): a fold that cannot prove it leaves no stale canonical offer is not applied"}]
+    fold["canonical_preview"] = {
+        "status": "moved_live" if moved else "clear", "bases": len(expected), "moved_live": len(moved),
+        "offers": [{"product_key": r["product_key"], "base_handle": bases.get(r["product_key"]),
+                    "live_source_ref": r.get("source_ref"), "new_source_ref": expected[r["product_key"]]}
+                   for r in moved][:SHADE_FOLD_PREVIEW_CAP]}
+    if not moved:
+        return []
+    names = sorted({bases.get(r["product_key"]) for r in moved})
+    return [{"key": "fold_moves_live_canonical", "rule": "fold_moves_live_canonical", "severity": detectors.BLOCK,
+             "acceptable": False,
+             "detail": f"{len(names)} folded base(s) (e.g. {names[:3]}) already have a live canonical offer at "
+                       f"another page than the one this fold would write (checks.shade_fold.canonical_preview); "
+                       f"the old offer would stay live beside the new one at a stale price. Retiring a superseded "
+                       f"canonical offer is not built yet: the job stays held. Do not re-queue this host without "
+                       f"fold_shades -- if it was folded before, that would re-emit every folded listing as its "
+                       f"own row beside the base that carries it"}]
 
 
 def _superseded_row_retired(row: Dict[str, Any]) -> bool:
@@ -1067,9 +1141,12 @@ async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str
     cannot prove it duplicates nothing is not applied. A suppression its own lane may lift (`*_pending`,
     self-reviving) counts as live (_superseded_row_retired).
 
+    THE BASE ROW is checked after the plan (_fold_canonical_checks): `carry["fold_base_keys"]` names every base
+    this cohort folds and still writes.
+
     `carry["fold_supersede_entries"]`: every superseded listing with its old key, for the apply to read again
-    INSIDE the catalog write lock (_recheck_superseded_rows): this read runs unlocked, so another job's write
-    on the host can land between the two."""
+    INSIDE the catalog write lock (_recheck_superseded_rows): this read runs unlocked, so another job's write on
+    the host can land between the two."""
     import scripts.onboard_curated_brands as cli
     from services.catalog_enrichment_agent.ingestion import retailer_product_key
     from services.curated_brand_feed import _clean_domain, fold_report_summary
@@ -1096,6 +1173,15 @@ async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str
                             "base_key": retailer_product_key(host, base_url)})
         except ValueError:
             continue  # a handle that is not a listing on this host names no row
+    base_keys: Dict[str, str] = {}
+    # Every folded base; _fold_canonical_checks reads only those the PLAN writes (an excluded base has no
+    # canonical offer in it), so a base the review left out is never checked.
+    for base_handle in fold_report.get("folded") or {}:
+        try:
+            base_keys[retailer_product_key(host, f"https://{host}/products/{base_handle}")] = base_handle
+        except ValueError:
+            continue
+    carry["fold_base_keys"] = base_keys
     summary["superseded_base_not_written"] = len(not_written)
     if not entries:
         summary["supersede_preview"] = {"status": "clear", "superseded": 0, "live": 0}
@@ -1116,24 +1202,42 @@ async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str
     if not live:
         return []
     bases = sorted({e["base_handle"] for e in live})
-    return [{"key": "fold_supersedes_live_rows", "rule": "fold_supersedes_live_rows", "severity": detectors.BLOCK,
-             "acceptable": False,
-             "detail": f"{len(live)} listing(s) this fold supersedes already have live rows on {host} (under "
-                       f"{len(bases)} base(s), e.g. {bases[:3]}); the fold would leave each live beside the base "
-                       f"that now carries it. Retiring them is not built yet (see checks.shade_fold."
-                       f"supersede_preview for every row): run this cohort without fold_shades"}]
+    return [{"key": "fold_supersedes_live_rows", "rule": "fold_supersedes_live_rows",
+             "severity": detectors.BLOCK, "acceptable": False,
+             "detail": f"{len(live)} listing(s) this fold supersedes already have live rows on {host} "
+                       f"(under {len(bases)} base(s), e.g. {bases[:3]}); the fold would leave each live beside "
+                       f"the base that now carries it. Retiring them is not built yet (see checks.shade_fold."
+                       f"supersede_preview for every row): the job stays held. A host never folded keeps its "
+                       f"existing cohort without fold_shades; never queue one without fold_shades for a host "
+                       f"that WAS folded -- it would re-emit every folded listing beside the base"}]
 
 
 async def _recheck_superseded_rows(job: Dict[str, Any], result: Dict[str, Any]) -> None:
-    """options.fold_shades, INSIDE the catalog write lock and before the write marker: read the superseded
-    listings' old rows again. The check stage read them unlocked, so a job without the fold that wrote one of
+    """options.fold_shades, INSIDE the catalog write lock and before the write marker: read the folded bases'
+    live canonical offers (_fold_canonical_checks) and the superseded listings' old rows again. The check stage read them unlocked, so a job without the fold that wrote one of
     those listings on this host in between would otherwise be duplicated by this apply. Changed (any row now
     live) or unreadable: hold, nothing written."""
+    expected = result.get("fold_canonical_expected") or {}
+    if not expected and not result.get("fold_supersede_entries"):
+        return
+    fold = result["checks"].setdefault("shade_fold", {})
+    if expected:
+        moved, unread = await _moved_canonical_offers(expected)
+        if moved is None:
+            fold["canonical_recheck"] = {"status": "unchecked", "reason": unread}
+            raise _Stop("fold_canonical_unread", "held",
+                        f"options.fold_shades: could not re-read the canonical offers of {len(expected)} folded "
+                        f"base(s) under the catalog write lock ({unread}); nothing written", checks=result["checks"])
+        fold["canonical_recheck"] = {"status": "moved_live" if moved else "clear", "moved_live": len(moved)}
+        if moved:
+            raise _Stop("fold_canonical_changed", "held",
+                        f"options.fold_shades: {len(moved)} folded base(s) got a live canonical offer at another "
+                        f"page after the checks ran; nothing written -- see checks.shade_fold.canonical_recheck",
+                        checks=result["checks"])
     entries = result.get("fold_supersede_entries") or []
     if not entries:
         return
     rows, unread = await _superseded_rows(sorted({e["stale_key"] for e in entries}))
-    fold = result["checks"].setdefault("shade_fold", {})
     if rows is None:
         fold["supersede_recheck"] = {"status": "unchecked", "reason": unread}
         raise _Stop("fold_supersede_unread", "held",

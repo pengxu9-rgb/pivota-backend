@@ -336,3 +336,23 @@ async def test_the_shade_fold_supersede_read_runs_on_postgres_and_classifies_rea
     live, retired, never = pipeline._classify_superseded(entries, rows)
     assert sorted(e["handle"] for e in live) == ["bare", "live", "pending"]
     assert (retired, never) == (1, 1)
+
+
+async def test_the_shade_fold_canonical_offer_read_runs_on_postgres(db, monkeypatch):
+    """options.fold_shades, the base row: CANONICAL_OFFERS_SQL on the real schema. A live canonical offer at the
+    page the fold would write is not a move (an identical re-crawl applies); one at another page is; a
+    suppressed one is not read at all."""
+    import scripts.onboard_curated_brands as cli
+    from services.retailer_ingest import pipeline
+
+    key = RETAILER_PREFIX + "fold-base"
+    await _product(db, key, content_key=PREFIX + "ck-fold-base")
+    await _offer(db, PREFIX + "fold-canon", key, currency="USD", market="US")
+    await _offer(db, PREFIX + "fold-canon-gone", key, currency="USD", market="US")
+    await db.execute("UPDATE catalog_offers SET suppressed_at = NOW(), source_ref = :r WHERE offer_id = :o",
+                     {"r": f"https://{HOST}/products/elsewhere", "o": PREFIX + "fold-canon-gone"})
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (db, None))
+    same = f"https://{HOST}/products/face-hero"
+    assert await pipeline._moved_canonical_offers({key: same}) == ([], None)
+    moved, unread = await pipeline._moved_canonical_offers({key: f"https://{HOST}/products/face-hero-8ml"})
+    assert unread is None and [(r["offer_id"], r["source_ref"]) for r in moved] == [(PREFIX + "fold-canon", same)]

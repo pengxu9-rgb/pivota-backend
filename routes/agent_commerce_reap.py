@@ -2578,6 +2578,23 @@ async def _record_purchase_parent(purchase_id: str) -> None:
         )
 
 
+#: A key in the shared table that opened a purchase on ANOTHER rail (the rail-neutral door, routes/
+#: agent_commerce_purchases.py, writes its purchases' keys here too: one key, one attempt, either rail).
+#: Answered as a definite "it exists, there", never as "not found": a client that read 404 as "not
+#: created" would mint a new key and buy twice.
+def _opened_on_another_rail(purchase_id: str) -> JSONResponse:
+    from services.payment_orchestration.rails import RAIL_ID_PREFIX
+
+    rail = next((r for prefix, r in RAIL_ID_PREFIX.items() if purchase_id.startswith(prefix)), None)
+    return JSONResponse(status_code=409, content={
+        "error": "opened_on_another_rail", "purchase_id": purchase_id, "rail": rail,
+    })
+
+
+def _is_reap_purchase_id(purchase_id: Optional[str]) -> bool:
+    return str(purchase_id or "").startswith("rp_")
+
+
 def _not_found() -> JSONResponse:
     """WRONG OWNER AND NO SUCH PURCHASE ARE THE SAME ANSWER. 404, never 403: a 403 confirms the
     id exists, which turns this endpoint into an oracle for guessing other buyers' purchase ids.
@@ -2866,6 +2883,8 @@ async def start_reap_purchase(
             idempotency_key=idempotency_key,
             request_hash=request_hash,
         )
+        if replayed and not _is_reap_purchase_id(replayed):
+            return _opened_on_another_rail(replayed)
         if replayed:
             # THE SAME ID, AND THE PURCHASE'S REAL STATE. Not a hardcoded "resolving": by the
             # time a caller retries, the row may have moved, and answering with a state it is
@@ -3037,6 +3056,7 @@ async def start_reap_purchase(
             cart_link_item = svc.CartLinkItem(cart_url=cart_url, **cart_facts)
 
         winning_view = None
+        other_rail_winner = None
         try:
             # start_purchase makes no partner call. This short durable unit hides
             # the purchase from other connections until its immutable key lands.
@@ -3078,7 +3098,12 @@ async def start_reap_purchase(
                     idempotency_key=idempotency_key, purchase_id=purchase_id,
                     request_hash=request_hash,
                 )
-                if winner != purchase_id:
+                if winner != purchase_id and not _is_reap_purchase_id(winner):
+                    # The key opened a purchase on another rail first: ours is scrubbed like any
+                    # duplicate, and the answer names the winner on its rail.
+                    await _abandon_duplicate(purchase_id)
+                    other_rail_winner = winner
+                elif winner != purchase_id:
                     await _abandon_duplicate(purchase_id)
                     purchase_id = winner
                     winning_view = await _owner_view(
@@ -3093,6 +3118,8 @@ async def start_reap_purchase(
             logger.warning("reap_agentic: atomic create unavailable error_type=%s", type(exc).__name__)
             raise _PurchasePersistenceUnavailable() from None
 
+        if other_rail_winner is not None:
+            return _opened_on_another_rail(other_rail_winner)
         logger.info(
             "reap_agentic: route opened purchase=%s merchant=%s agent=%s",
             purchase_id,
@@ -3291,6 +3318,8 @@ async def recover_reap_purchase(
             agent_id=str(context.agent_id), agent_user_ref_hash=owner_hash,
             idempotency_key=key, request_hash=request_hash,
         )
+        if purchase_id and not _is_reap_purchase_id(purchase_id):
+            return _opened_on_another_rail(purchase_id)
         if purchase_id:
             view = await _owner_view(purchase_id=purchase_id, agent_id=str(context.agent_id), agent_user_ref_hash=owner_hash)
             if view:
