@@ -199,12 +199,13 @@ def _variant_option_name(variant: Dict[str, Any], base_option_name: str) -> str:
     # the variant from, and a shade row with an empty handle stores "" — which a
     # truthiness test reads as "not folded", handing that shade the base's own
     # axis and reproducing the mislabel this function exists to prevent.
+    # The extended fold (retailer lane, `fold_shade_listings(extended=True)`) already decided the axis per base,
+    # from the shop's own option names where it gave one -- on every folded-in variant, and on the parent's own
+    # item it labelled (_parent_item_label). The legacy fold never stamps it.
+    decided = str(variant.get(FOLD_AXIS_KEY) or "").strip()
+    if decided:
+        return decided
     if FOLDED_FROM_KEY in variant:
-        # The extended fold (retailer lane, `fold_shade_listings(extended=True)`) already decided the axis
-        # per base, from the shop's own option names where it gave one; the legacy fold never stamps it.
-        decided = str(variant.get(FOLD_AXIS_KEY) or "").strip()
-        if decided:
-            return decided
         if base_option_name.strip().lower() in _SHADE_AXIS_NAMES:
             return base_option_name
         # The fold collapses listings that differ by a TITLE SUFFIX, and a suffix
@@ -3702,6 +3703,23 @@ def _is_extended_stub(product: Dict[str, Any]) -> bool:
     return not any((_to_float(v.get("price")) or 0.0) >= MIN_SELLABLE_PRICE for v in variants)
 
 
+#: A quantity written in a title ("Glow Serum 30ml"): the parent's own item on a size axis.
+_TITLE_QUANTITY_RE = re.compile(r"(?i)\b\d+(?:[.,]\d+)?\s*(?:ml|l|g|kg|mg|oz|fl\.?\s*oz)\b")
+#: Neutral labels for a parent's own placeholder item, by its children's axis, in order of preference.
+_PARENT_ITEM_LABELS = {"size": ("Standard", "Regular"), "shade": ("Original", "Classic")}
+
+
+def _parent_item_label(title: str, family: str, *, taken: set) -> Optional[str]:
+    """The label for a priced parent's own placeholder item: the quantity its title states for a size axis
+    ("Glow Serum 30ml" -> "30ml"), else a neutral word ("Standard" for sizes, "Original" otherwise) -- the first
+    that no child already uses (a repeated label would make the seed writer drop them all). None when every
+    candidate is taken: the item is then left unlabelled, as before."""
+    found = _TITLE_QUANTITY_RE.search(title or "") if family == "size" else None
+    candidates = ([" ".join(found.group(0).split())] if found else []) + list(
+        _PARENT_ITEM_LABELS["size" if family == "size" else "shade"])
+    return next((c for c in candidates if _norm_label(c) not in taken), None)
+
+
 def _child_axis(child: Dict[str, Any], suffix: str) -> Tuple[Optional[str], str, bool]:
     """(the shop's own axis name for this single-variant child, or None; its family; evidence).
 
@@ -3738,12 +3756,12 @@ def _fold_refused_extended(base: Dict[str, Any], child: Dict[str, Any], suffix: 
     if not (bt and ct) and not evidence:
         # An untyped side gives the type check nothing to compare: "<Lip Oil> - Cuticle Oil" would fold.
         return "product_type_unknown"
-    bp, cp = _first_price(base), _first_price(child)
-    if bp is not None and bp < MIN_SELLABLE_PRICE:
-        # A parent priced under the sellable floor (a 0.50 "choose a shade" stub) names no price for the line:
-        # comparing against it would refuse every child. A placeholder-labelled parent that IS priced keeps
-        # the check -- its price is the line's.
-        bp = None
+    # The parent's first SELLABLE price: an item under the floor (a 0.50 "choose a shade" stub, or a 0.00 sample
+    # listed before the real 40.00 item) names no price for the line. A parent that sells nothing has none,
+    # and its children are not price-compared.
+    bp = next((p for p in (_to_float(v.get("price")) for v in (base.get("variants") or []) if isinstance(v, dict))
+               if p is not None and p >= MIN_SELLABLE_PRICE), None)
+    cp = _first_price(child)
     ratio = _FOLD_SIZE_PRICE_RATIO if family == "size" else _FOLD_PRICE_RATIO
     if bp and cp and (max(bp, cp) / min(bp, cp)) > ratio:
         return "price_mismatch"
@@ -3814,6 +3832,11 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
                 break
             if multi:
                 break  # a suffixed multi-variant listing is a distinct line, as in the legacy fold
+            if not handle_of(p).strip() or "/" in handle_of(p):
+                # A folded variant is sold on its own listing (/products/<handle>); without one its offer, or the
+                # canonical one, would fall back to the parent's page at the child's price.
+                refuse(p, "child_handle_unusable")
+                break
             name, family, evidence = _child_axis(p, suffix)
             refused = _fold_refused_extended(base, p, suffix, family, evidence)
             if refused:
@@ -3848,7 +3871,7 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
     report: Dict[str, Any] = {"bases": 0, "shades": 0, "stubs_replaced": 0, "images_adopted": 0,
                               "folded": {}, "refused": refusals, "axes": {"shade": 0, "size": 0, "named": 0},
                               "duplicates_absorbed": {}, "copies_deduped": {}, "superseded": [],
-                              "mixed_axes": [], "canonical_moved": []}
+                              "mixed_axes": [], "canonical_moved": [], "parent_items_labelled": []}
     out: List[Dict[str, Any]] = []
     for p in products:
         if not isinstance(p, dict):
@@ -3916,6 +3939,17 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
         if not added:
             out.append(p)  # only copies or repeats: the base is unchanged, and is not a folded row
             continue
+        # A priced parent's own item is usually Shopify's placeholder ("Default Title"). Unlabelled beside labelled
+        # children it makes the seed writer drop EVERY label (ingestion._drop_options_that_do_not_distinguish), so
+        # the folded product would have no picker. It gets a label on the children's axis instead.
+        added_families = {target[id(k)][4] for k in kids if handle_of(k) in folded_handles}
+        if len(own) == 1 and not _variant_label(own[0]) and len(added_families) == 1:
+            family = next(iter(added_families))
+            label = _parent_item_label(title_of(p), family, taken={_norm_label(v.get("title")) for v in added})
+            if label:
+                own[0] = dict(own[0], title=label, option1=label, **{FOLD_AXIS_KEY: spelling.get(family) or (
+                    _DEFAULT_SIZE_OPTION_NAME if family == "size" else _DEFAULT_SHADE_OPTION_NAME)})
+                report["parent_items_labelled"].append({"base_handle": base_handle, "label": label})
         # Two axes on one product: the seed writer then drops every label and serves the bare list
         # (ingestion._drop_options_that_do_not_distinguish). Folded anyway, and named for the reviewer.
         families = {_axis_family(base_axis)} - {None} if own else set()
@@ -3976,6 +4010,7 @@ def fold_report_summary(report: Optional[Dict[str, Any]], *, cap: int = 200) -> 
     out["refused_by_reason"] = dict(collections.Counter(r.get("reason") for r in report.get("refused") or []))
     out["mixed_axes"] = list(report.get("mixed_axes") or [])[:cap]
     out["canonical_moved"] = list(report.get("canonical_moved") or [])[:cap]
+    out["parent_items_labelled"] = list(report.get("parent_items_labelled") or [])[:cap]
     for key in ("superseded", "refused", "baseless_groups"):
         items = list(report.get(key) or [])
         out[key] = items[:cap]
