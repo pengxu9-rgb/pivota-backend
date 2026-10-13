@@ -66,7 +66,7 @@ FACTS = {"shop_domain": SHOP, "our_price_minor": 2820, "currency": "USD", "marke
 
 
 _TABLES = ("agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs", "reap_agentic_purchase_keys",
-           "reap_agentic_purchases", "reap_agentic_eligibility")
+           "reap_agentic_purchases", "reap_agentic_eligibility", "reap_agentic_buyer_refs")
 
 
 @pytest.fixture(autouse=True)
@@ -290,11 +290,29 @@ async def test_a_retry_replays_on_its_original_rail_even_when_the_router_would_n
     assert again.json()["purchase_id"] == first["purchase_id"] and stubs.reap == []
 
 
-async def test_the_same_key_for_a_different_body_is_a_conflict(client):
-    await client.post(BASE, body())
+async def test_the_same_key_for_a_different_body_is_a_conflict_that_names_the_keys_purchase(client):
+    pid = (await client.post(BASE, body())).json()["purchase_id"]
     resp = await client.post(BASE, body(quantity=2))
     assert resp.status_code == 409 and "idempotency_conflict" in resp.text
+    detail = resp.json().get("detail") or resp.json()
+    assert (detail["purchase_id"], detail["rail"]) == (pid, "a2a")
     assert await _count("a2a_rail_purchases") == 1
+
+
+async def test_a_conflict_never_names_another_owners_purchase_or_a_marker(client, stubs):
+    # Another end user's key with the same name: not this caller's row, so no conflict and no id at all.
+    await client.post(BASE, body())
+    CALLER.agent_user_ref = "user-grace"
+    other = await client.post(BASE, body(quantity=2))
+    assert other.status_code == 202 and other.json()["purchase_id"] not in ("", None)
+    # A refusal tombstone under this key: a conflict, with no id.
+    CALLER.agent_user_ref = USER_REF
+    await database.execute(
+        "UPDATE reap_agentic_purchase_keys SET purchase_id = 'refused:merchant_not_eligible' "
+        "WHERE agent_user_ref_hash = :h", {"h": hash_agent_user_ref(USER_REF)})
+    resp = await client.post(BASE, body(quantity=3))
+    assert resp.status_code == 409 and "idempotency_conflict" in resp.text
+    assert "purchase_id" not in resp.text
 
 
 async def test_a_key_that_opened_a_reap_purchase_is_replayed_by_the_reap_route(client, stubs):
@@ -565,3 +583,43 @@ async def test_the_stored_buyer_is_the_cleaned_one(client):
     pid = (await client.post(BASE, b)).json()["purchase_id"]
     row = await a2a_ledger.get_purchase_internal(pid)
     assert row["shipping_address"]["city"] == "SanFrancisco" and row["buyer_email"] == EMAIL
+
+
+
+async def test_the_reap_door_losing_a_key_race_to_another_rail_names_the_winner_and_scrubs_its_own_row(
+        client, stubs, reap_door_open, monkeypatch):
+    """The REAL Reap create, up to its key claim; the key was won by an A2A purchase. Its own row is refused as a
+    duplicate with the PII gone, and the answer names the winner (never a 404 or 503 the client could read as
+    "not created")."""
+    import db.reap_agentic_ledger as reap_ledger
+
+    clicks = []
+
+    async def _click(click):
+        clicks.append(click)
+
+    async def _a2a_won(**kwargs):
+        return "ap_0123456789abcdef01234567"
+
+    # The buyer identity is the Reap route's own business (its tests own the minting): a minted buyer stands in.
+    await database.execute(
+        "INSERT INTO reap_agentic_buyer_refs (buyer_id, reap_buyer_ref, consent_version, consented_at) "
+        "VALUES ('buyer_race', 'bref_race', 'terms-2026-10', CURRENT_TIMESTAMP)")
+
+    async def _buyer(**kwargs):
+        return "buyer_race"
+
+    async def _bref(buyer_id, **kwargs):
+        return "bref_race"
+
+    monkeypatch.setattr(reap_routes, "_buyer_id_for", _buyer)
+    monkeypatch.setattr(reap_routes, "_reap_buyer_ref", _bref)
+    monkeypatch.setattr(reap_routes, "issue_click", _click)
+    monkeypatch.setattr(reap_routes, "_claim_idempotency_key", _a2a_won)
+    resp = await client.post("/agent/v2/commerce/reap/purchases", body())
+    assert resp.status_code == 409 and "opened_on_another_rail" in resp.text, resp.text
+    assert "ap_0123456789abcdef01234567" in resp.text
+    [row] = await database.fetch_all("SELECT id FROM reap_agentic_purchases")
+    reap_row = await reap_ledger.get_purchase_internal(row["id"])
+    assert (reap_row["state"], reap_row["refusal_reason"]) == ("refused", "duplicate_idempotency_key")
+    assert reap_row["buyer_email"] is None and reap_row["shipping_address"] is None
