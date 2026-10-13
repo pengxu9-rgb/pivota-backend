@@ -17,8 +17,8 @@ THE RULES THIS MODULE ENFORCES, each measured against the provider's sandbox on 
    Pivota uses. The provider's standalone money skills (`payment.pay-*`, `payment.charge-token-*`,
    `payment.token-result#charge`, refunds without an order) charge under the DEVELOPER's key,
    which would make Pivota the payee; they are not on the list, so they raise `ActionNotAllowed`
-   before any byte is sent. Two allowed steps (`action-required#paid`, `await#poll`) are shared
-   with a money flow, so (a) a conversation id must be one this client signed (`context_for`),
+   before any byte is sent. Three allowed steps (`action-required#paid`, `visa-action-required#paid`,
+   `await#poll`) are shared with a money flow, so (a) a conversation id must be one this client signed (`context_for`),
    and (b) any money-result card in an answer is `money_result`, logged at ERROR, never `ok`.
 3. STRUCTURED ACTIONS ONLY, NEVER FREE TEXT. The provider's intent detection is an LLM. A free-text
    request is not deterministic, so this module has no way to send one. A free-text ANSWER where a
@@ -97,9 +97,12 @@ ALLOWED_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
     ("payment.method-remove", "submit"),
     ("payment.method-remove-confirm", "confirm"),
     ("payment.method-remove-confirm", "cancel"),
-    # mint a token bound to an order (no charge), and wait for the buyer's approval
+    # mint a token bound to an order (no charge), and wait for the buyer's approval: the scheme's
+    # approval page (`visa-action-required`, measured 2026-10-12; `action-required` for the other scheme)
+    # answers `paid` once the buyer is done, with the token result or the await card
     ("payment.token-setup", "submit"),
     ("payment.action-required", "paid"),
+    ("payment.visa-action-required", "paid"),
     ("payment.await", "poll"),
 })
 

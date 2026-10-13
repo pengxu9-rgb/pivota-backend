@@ -13,10 +13,23 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                            (`bound`) on a spaced schedule (BOUND_SCHEDULE), and read its answer.
   any state, after an answer that reported money moving (`money_result_seen`) -> PARKED FOR GOOD: no
                            read, no reconcile, no resend; only a human ends it.
-  quoting and later     -> PARKED (`shop_protocol_pending`). Quoting, the order lock, the token and the
-                           pay all depend on the rail's order protocol, which is not settled; nothing
-                           here guesses at a step that can move money. The lifetime ceiling in the
-                           ledger's sweep ends a parked purchase.
+  quoting, locked       -> THE TOKEN STEP, once the order is locked (`order_id` and `quoted_total_minor`
+                           recorded, no token yet). Read the card; ask the rail for a token bound to the
+                           order for the locked total (`payment.token-setup`; it mints, it never charges).
+                           The rail answers with its card picker even when the card is named (measured),
+                           so the card is selected again in the same conversation. The answer is the
+                           scheme's approval page (`awaiting_authorization`, with the token id), or a
+                           token already ACTIVE with no buyer step: REFUSED (`buyer_approval_missing`),
+                           because every purchase needs the buyer's own approval.
+  awaiting_authorization -> tell the rail the buyer may be done (`paid`) on a spaced schedule
+                           (APPROVAL_SCHEDULE), then poll the await card if the rail answers with one.
+                           ACTIVE for this token: PARKED (`token_active`) until the pay step exists.
+                           FAILED: `failed`.
+  quoting, not locked; paying -> PARKED (`shop_protocol_pending`). The quote, the order lock and the pay
+                           depend on the rail's order protocol, which is not settled; nothing here
+                           guesses at a step that can move money. The lifetime ceiling in the ledger's
+                           sweep ends a parked purchase, and the approval page's deadline ends a purchase
+                           whose token is ACTIVE but never paid (the token id stays on the row).
 
 ── THE WRITE DISCIPLINE (the rail cannot deduplicate: a new idempotency key per call) ──────────
 
@@ -27,9 +40,11 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
   3. An unseen answer (`resend_safe` is False: timeout, 5xx, garbled) leaves the write pending and gives
      the lease back. The next holder sees `pending_write` and RECONCILES (reads the rail) before
      anything else may be sent: `_reconcile`.
-  4. Card-binding writes move no money, so their reconciliation may, after reading the card list,
-     start a new binding. Every other pending write is never resent by this module: it is reported
-     (`pending_write_unreconcilable`) and stays pending for a human or a later reconciler.
+  4. Card-binding and token writes move no money, so their reconciliation may, after reading the card
+     list, start over (a new binding, a new token request). A token whose answer nobody saw is left
+     unused on the rail: it is bound to this order and was never approved. Every other pending write
+     is never resent by this module: it is reported (`pending_write_unreconcilable`) and stays pending
+     for a human or a later reconciler.
 
 Nothing here logs the buyer's email or address, the member id, or a rail URL.
 """
@@ -69,7 +84,34 @@ _CARD_BINDING_WRITES = {f"{c}#{a}" for c, a in (ADD_METHOD, BOUND)}
 _LIST_ALL = "ACTIVE,PENDING,DISABLED,FAILED,EXPIRED"
 _DEAD_METHOD_STATUSES = {"FAILED", "DISABLED", "EXPIRED"}
 
-PARKED_STATES = frozenset({"quoting", "awaiting_authorization", "paying"})
+TOKEN_SETUP = ("payment.token-setup", "submit")
+SELECT_METHOD = ("payment.method-list", "select-method")
+VISA_PAID = ("payment.visa-action-required", "paid")
+SCHEME_PAID = ("payment.action-required", "paid")
+AWAIT_POLL = ("payment.await", "poll")
+#: The approval page the rail answers a token request with, by component: (variant, where its URL is,
+#: the action that tells the rail the buyer is done). Measured for Visa on 2026-10-12; the other scheme's page
+#: is the provider's documented shape.
+_APPROVAL_PAGES: Dict[str, Tuple[str, str, Tuple[str, str]]] = {
+    "payment.visa-action-required": ("visa", "paymentUrl", VISA_PAID),
+    "payment.action-required": ("scheme", "checkoutUrl", SCHEME_PAID),
+}
+_PAID_BY_VARIANT = {variant: paid for variant, _, paid in _APPROVAL_PAGES.values()}
+#: Brands (the rail's `payment_brand`) whose token is minted in the payer's own name and contact.
+_PAYER_NAMED_BRANDS = frozenset({"unionpay"})
+#: After the rail answers `paid` with its await card, the token is polled (a read), never `paid` again.
+_AWAIT = "await"
+#: The token writes: they mint a token and move no money, so an unseen outcome may be resolved by
+#: starting the token step over (`_reconcile`).
+_TOKEN_WRITES = {f"{c}#{a}" for c, a in (TOKEN_SETUP, SELECT_METHOD, VISA_PAID, SCHEME_PAID)}
+#: How long the approval page is offered when the rail does not say (it said 900 s for Visa).
+APPROVAL_PAGE_SECONDS = 900
+#: When (seconds after the page went out) the worker tells the rail the buyer may be done. Kept in
+#: `last_error_code` as `paid_sent:<n>:<variant>`, with the variant the page was.
+APPROVAL_SCHEDULE = (30, 90, 240, 600)
+POLL_APPROVAL = 15
+
+PARKED_STATES = frozenset({"paying"})
 #: Claims of an `opened` purchase before it fails. Waiting on the buyer is not counted (the ledger),
 #: and `paying` is never capped (money may be moving; only the rail's answer ends it).
 MAX_OPENED_ATTEMPTS = 20
@@ -114,8 +156,34 @@ def _bound_count(row: Mapping[str, Any]) -> int:
     return 0
 
 
+def _paid_state(row: Mapping[str, Any]) -> Tuple[int, Optional[str]]:
+    """`paid_sent:<n>:<variant>` (or with a later reason after it) -> (n, variant). (0, None) when the
+    code is not the approval schedule's, or names a variant this module does not know."""
+    parts = str(row.get("last_error_code") or "").split(":")
+    if len(parts) < 3 or parts[0] != "paid_sent":
+        return 0, None
+    try:
+        sent = int(parts[1])
+    except ValueError:
+        return 0, None
+    variant = parts[2] if parts[2] in _PAID_BY_VARIANT or parts[2] == _AWAIT else None
+    return sent, variant
+
+
+def _schedule_prefix(row: Mapping[str, Any]) -> str:
+    """The schedule a code carries (`bound_sent:<n>` or `paid_sent:<n>:<variant>`), or ''."""
+    if _bound_count(row):
+        return f"bound_sent:{_bound_count(row)}"
+    sent, variant = _paid_state(row)
+    return f"paid_sent:{sent}:{variant}" if variant else ""
+
+
+def _token_active(row: Mapping[str, Any]) -> bool:
+    return str(row.get("last_error_code") or "").split(":")[-1] == "token_active"
+
+
 class _Step:
-    """One claimed purchase, its client and its conversation."""
+    """One claimed purchase, its client and its conversations."""
 
     def __init__(self, client: Any, row: Mapping[str, Any], worker: str):
         self.client, self.row, self.worker = client, row, worker
@@ -124,19 +192,24 @@ class _Step:
         # Card-list reads go in a conversation of their own, so a read never lands in the middle of
         # the binding conversation (add -> page -> bound) and changes what that conversation expects.
         self.read_context = client.context_for(str(row["member_id"]), f"{self.id}_r")
+        # The token conversation (token-setup -> picker -> approval page -> paid -> result) is its own
+        # too: the provider's payment session, separate from the binding and from any order session.
+        self.pay_context = client.context_for(str(row["member_id"]), f"{self.id}_p")
 
-    async def send(self, pair: Tuple[str, str], payload: Optional[Mapping[str, Any]] = None):
+    async def send(
+        self, pair: Tuple[str, str], payload: Optional[Mapping[str, Any]] = None, *, context: Optional[str] = None
+    ):
         return await self.client.send_action(
-            member_id=str(self.row["member_id"]), context_id=self.context,
+            member_id=str(self.row["member_id"]), context_id=context or self.context,
             component=pair[0], action=pair[1], payload=dict(payload or {}),
         )
 
     async def release(self, seconds: int, code: Optional[str] = None) -> None:
-        # The `bound` schedule's count rides in last_error_code; a later reason is appended to it, never
-        # written over it, or one failed read would reset the schedule to its first slot.
-        sent = _bound_count(self.row)
-        if code is not None and sent and not code.startswith("bound_sent:"):
-            code = f"bound_sent:{sent}:{code}"[:64].rstrip(":")
+        # A schedule's count (`bound` or `paid`) rides in last_error_code; a later reason is appended to
+        # it, never written over it, or one failed read would reset the schedule to its first slot.
+        prefix = _schedule_prefix(self.row)
+        if code is not None and prefix and not code.startswith(("bound_sent:", "paid_sent:")):
+            code = f"{prefix}:{code}"[:64].rstrip(":")
         await ledger.release_claim(self.id, self.worker, next_poll_at=_later(seconds), last_error_code=code)
 
     async def methods(self) -> Tuple[Optional[List[Dict[str, Any]]], Any]:
@@ -306,6 +379,174 @@ async def _send_bound(s: _Step, count: int) -> str:
     return await _unresolved_write(s, action, result, code=f"bound_sent:{count}")
 
 
+def _payer_name(row: Mapping[str, Any]) -> Optional[str]:
+    """The buyer's own name, from the address they gave (some schemes mint a token in the payer's name)."""
+    address = row.get("shipping_address")
+    if not isinstance(address, Mapping):
+        return None
+    name = " ".join(str(address.get(k) or "").strip() for k in ("firstName", "lastName")).strip()
+    return name or None
+
+
+def _page_seconds(value: Any) -> int:
+    """The page's lifetime as the rail states it (`paymentUrlExpiresIn`), within sane bounds."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 60 <= value <= 3600:
+        return APPROVAL_PAGE_SECONDS
+    return value
+
+
+async def _token_failed(s: _Step, from_state: str, code: str, *, resolves: Optional[str] = None) -> str:
+    if resolves is not None:
+        await ledger.clear_pending_write(s.id, s.worker, resolves)
+    moved = await ledger.transition_as_holder(
+        s.id, s.worker, from_states=[from_state], to_state="failed", last_error_code=code)
+    return await _settled(s, moved, "failed")
+
+
+async def _start_token(s: _Step) -> str:
+    """The order is locked: ask the rail for a token bound to it, for the locked total. Mints; never charges."""
+    methods, read = await s.methods()
+    if methods is None:
+        await s.release(POLL_RETRY, _code("cards_read", read))
+        return "rail_read_failed"
+    method = _method(methods, s.row.get("payment_method_id"))
+    if method is None or method.get("status") != "ACTIVE":
+        return await _token_failed(s, "quoting", "token_method_unavailable")
+    brand = str(method.get("payment_brand") or "").strip().lower()
+    payload: Dict[str, Any] = {
+        "amount_cents": int(s.row["quoted_total_minor"]),
+        "external_transaction_id": str(s.row["order_id"]),
+        "payment_method_id": str(method["id"]),
+    }
+    if brand in _PAYER_NAMED_BRANDS:
+        # The provider mints this scheme's token in the payer's own name and contact (its docs: required).
+        name, account = _payer_name(s.row), s.row.get("buyer_email")
+        if not name or not account:
+            return await _token_failed(s, "quoting", "token_payer_missing")
+        payload.update(recipient_name=name, recipient_account=str(account))
+    action = _action(TOKEN_SETUP)
+    if await ledger.mark_pending_write(s.id, s.worker, action) is None:
+        return "lost"
+    result = await s.send(TOKEN_SETUP, payload, context=s.pay_context)
+    if result.ok and result.card("payment.method-list") is not None and not any(
+        result.card(c) for c in (*_APPROVAL_PAGES, "payment.token-result")
+    ):
+        # Measured: naming the card still answers with the picker. Select the same card in the same
+        # conversation. The token-setup write is resolved (the rail answered it definitely).
+        await ledger.clear_pending_write(s.id, s.worker, action)
+        action = _action(SELECT_METHOD)
+        if await ledger.mark_pending_write(s.id, s.worker, action) is None:
+            return "lost"
+        result = await s.send(SELECT_METHOD, {"id": str(method["id"]), "payment_brand": brand}, context=s.pay_context)
+    return await _token_answer(s, action, result)
+
+
+async def _token_answer(s: _Step, action: str, result: Any) -> str:
+    """The rail's answer to the token request: an approval page, or something the step must refuse."""
+    if result.ok:
+        for component, (variant, url_key, _) in _APPROVAL_PAGES.items():
+            card = result.card(component)
+            if card is None:
+                continue
+            token_id, url = card.data.get("paymentTokenId"), card.data.get(url_key)
+            if not (isinstance(token_id, str) and token_id and isinstance(url, str) and url):
+                break
+            try:
+                moved = await ledger.transition_as_holder(
+                    s.id, s.worker, from_states=["quoting"], to_state="awaiting_authorization",
+                    resolves_write=action, payment_token_id=token_id, buyer_action_kind="approval",
+                    buyer_action_url=url, buyer_action_expires_at=_later(_page_seconds(card.data.get("paymentUrlExpiresIn"))),
+                    last_error_code=f"paid_sent:0:{variant}")
+            except ValueError:
+                # The rail answered (so the write is resolved) with a page or token id we will not store.
+                return await _token_failed(s, "quoting", "approval_page_invalid", resolves=action)
+            return await _settled(s, moved, "approval_page_issued")
+        result_card = result.card("payment.token-result")
+        if result_card is not None:
+            # A token ACTIVE with no buyer step (one of the provider's paths mints synchronously). Every
+            # purchase needs the buyer's own approval, so this one ends here. The token id is kept: it
+            # was minted for this order and must be voided on the rail.
+            token_id = result_card.data.get("paymentTokenId")
+            await ledger.clear_pending_write(s.id, s.worker, action)
+            try:
+                moved = await ledger.transition_as_holder(
+                    s.id, s.worker, from_states=["quoting"], to_state="refused",
+                    payment_token_id=token_id if isinstance(token_id, str) and token_id else None,
+                    refusal_reason="buyer_approval_missing")
+            except ValueError:
+                moved = await ledger.transition_as_holder(
+                    s.id, s.worker, from_states=["quoting"], to_state="refused", refusal_reason="buyer_approval_missing")
+            logger.warning("a2a_rail_worker: token minted with no buyer approval purchase=%s; refused", s.id)
+            return await _settled(s, moved, "refused")
+        return await _token_failed(s, "quoting", "token_answer_unrecognised", resolves=action)
+    if _definitely_refused(result):
+        return await _token_failed(s, "quoting", _code("token_refused", result), resolves=action)
+    return await _unresolved_write(s, action, result)
+
+
+async def _authorizing(s: _Step) -> str:
+    """The buyer is on the approval page. Tell the rail they may be done on a schedule, then read."""
+    sent, variant = _paid_state(s.row)
+    if variant == _AWAIT:
+        # The rail answered `paid` with its await card: poll it (a read), never `paid` again.
+        result = await s.send(AWAIT_POLL, context=s.pay_context)
+        return await _approval_answer(s, None, result, sent, variant)
+    if variant is None:
+        # A page this module did not record: nothing is sent, the page's deadline ends the purchase.
+        await s.release(POLL_PARKED, "approval_variant_unknown")
+        return "parked"
+    entered = _aware(s.row.get("state_entered_at"))
+    elapsed = (_now() - entered).total_seconds() if entered else 0.0
+    if sent >= len(APPROVAL_SCHEDULE) or elapsed < APPROVAL_SCHEDULE[sent]:
+        await s.release(POLL_APPROVAL)
+        return "waiting_on_buyer"
+    pair = _PAID_BY_VARIANT[variant]
+    action = _action(pair)
+    if await ledger.mark_pending_write(s.id, s.worker, action) is None:
+        return "lost"
+    result = await s.send(pair, context=s.pay_context)
+    return await _approval_answer(s, action, result, sent + 1, variant)
+
+
+async def _approval_answer(s: _Step, action: Optional[str], result: Any, count: int, variant: str) -> str:
+    """`paid`'s answer (`action` is its pending write) or the await poll's (`action` None, a read)."""
+    token_id = s.row.get("payment_token_id")
+    if result.ok:
+        card = result.card("payment.token-result") or result.card("payment.await")
+        page = next((result.card(c) for c in _APPROVAL_PAGES if result.card(c) is not None), None)
+        answered = (card or page).data.get("paymentTokenId") if (card or page) is not None else None
+        if answered is not None and answered != token_id:
+            # Another token in this conversation: never treat it as this purchase's.
+            return await _token_failed(s, "awaiting_authorization", "token_mismatch", resolves=action)
+        status = str(((card or page).data.get("status") if (card or page) is not None else "") or "").upper()
+        if card is not None and status == "ACTIVE":
+            if action is not None:
+                await ledger.clear_pending_write(s.id, s.worker, action)
+            await s.release(POLL_PARKED, f"paid_sent:{count}:{variant}:token_active")
+            return "token_active"
+        if status == "FAILED":
+            return await _token_failed(s, "awaiting_authorization", "token_failed", resolves=action)
+        if card is not None or page is not None:
+            # A definite "not yet": the buyer is still on the page. An await card switches to polling.
+            if action is not None:
+                await ledger.clear_pending_write(s.id, s.worker, action)
+            next_variant = _AWAIT if result.card("payment.await") is not None else variant
+            await s.release(POLL_APPROVAL, f"paid_sent:{count}:{next_variant}")
+            return "waiting_on_buyer"
+        if action is None:
+            await s.release(POLL_RETRY, "await_answer_unrecognised")
+            return "rail_read_failed"
+        return await _token_failed(s, "awaiting_authorization", "approval_answer_unrecognised", resolves=action)
+    if action is None:
+        if getattr(result, "kind", None) == "money_result":
+            return await _unresolved_write(s, _action(AWAIT_POLL), result)
+        await s.release(POLL_RETRY, _code("await_read", result))
+        return "rail_read_failed"
+    if _definitely_refused(result):
+        return await _token_failed(s, "awaiting_authorization", _code("token_refused", result), resolves=action)
+    return await _unresolved_write(s, action, result, code=f"paid_sent:{count}:{variant}")
+
+
 async def _unresolved_write(s: _Step, action: str, result: Any, *, code: Optional[str] = None) -> str:
     """An answer that did not carry what the step needed. A definite refusal resolves the write; an
     unseen outcome keeps it pending for `_reconcile`. `code`, when given, replaces the recorded reason
@@ -325,6 +566,8 @@ async def _unresolved_write(s: _Step, action: str, result: Any, *, code: Optiona
 async def _reconcile(s: _Step) -> str:
     """The row holds a write whose outcome nobody saw. Read before anything else is sent."""
     action = str(s.row["pending_write"])
+    if action in _TOKEN_WRITES:
+        return await _reconcile_token(s, action)
     if action not in _CARD_BINDING_WRITES:
         # A write this module does not own (a future money step): never resend, never guess.
         logger.error("a2a_rail_worker: unreconcilable pending write %s purchase=%s", action, s.id)
@@ -366,14 +609,56 @@ async def _reconcile(s: _Step) -> str:
     return "reconciled"
 
 
-async def _parked(s: _Step) -> str:
-    await s.release(POLL_PARKED, "shop_protocol_pending")
+async def _reconcile_token(s: _Step, action: str) -> str:
+    """A token write whose answer nobody saw. It minted at most a token for this order and charged
+    nothing, so it is resolved by starting over: in `quoting` the next step asks for a token again (the
+    unseen one, if any, is never approved and never used); in `awaiting_authorization` the schedule
+    sends `paid` again. Bounded like the card-binding reconcile."""
+    state = str(s.row["state"])
+    if state not in ("quoting", "awaiting_authorization"):  # pragma: no cover - token writes come only from these
+        await s.release(POLL_PARKED, "pending_write_unreconcilable")
+        return "pending_write_unreconcilable"
+    recorded = _aware(s.row.get("pending_write_at"))
+    if (recorded is not None and (_now() - recorded).total_seconds() > RECONCILE_LIMIT_SECONDS) or (
+        int(s.row.get("attempts") or 0) > MAX_OPENED_ATTEMPTS
+    ):
+        moved = await ledger.transition_as_holder(
+            s.id, s.worker, from_states=[state], to_state="failed", resolves_write=action,
+            last_error_code="reconcile_exhausted")
+        return await _settled(s, moved, "failed")
+    await ledger.clear_pending_write(s.id, s.worker, action)
+    await s.release(POLL_RETRY, "reconciled")  # appended to a paid_sent count by `release`
+    return "reconciled"
+
+
+async def _parked(s: _Step, reason: str = "shop_protocol_pending") -> str:
+    await s.release(POLL_PARKED, reason)
     return "parked"
+
+
+async def _quoting(s: _Step) -> str:
+    row = s.row
+    if row.get("order_id") and row.get("quoted_total_minor") and not row.get("payment_token_id"):
+        return await _start_token(s)
+    # Not locked yet (the quote and the lock are the order protocol's), or a token is already recorded
+    # (a re-quote must void it first): nothing here may act.
+    return await _parked(s)
+
+
+async def _awaiting_authorization(s: _Step) -> str:
+    if _token_active(s.row):
+        # The buyer approved and the token is ACTIVE; the pay step is the order protocol's. Parked with
+        # the marker kept (no new code), so no later claim sends `paid` again.
+        await s.release(POLL_PARKED)
+        return "parked"
+    return await _authorizing(s)
 
 
 _STEPS: Dict[str, Callable[[_Step], Any]] = {
     "opened": _opened,
     "needs_payment_method": _binding,
+    "quoting": _quoting,
+    "awaiting_authorization": _awaiting_authorization,
 }
 
 
