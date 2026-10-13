@@ -932,6 +932,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     plan = await cli._plan_with_current_listings(records, market=market, allow_moves=moves_accepted)
     if o.get("fold_shades"):
         flags.extend(await _fold_offer_checks(job, plan, carry, checks))
+    else:
+        flags.extend(await _fold_revival_checks(plan, checks))
     inspection = inspect_primary_plan(plan)
     checks["plan"] = {k: inspection.get(k) for k in ("status", "reasons", "planned", "unresolved_category_count")}
     if inspection.get("reasons"):
@@ -1111,45 +1113,60 @@ def _url_aliases(url: str) -> List[str]:
 
 def _fold_offer_expectations(plan: Dict[str, Any], fold_base_keys: Any = ()) -> Dict[str, Any]:
     """What a fold cohort's plan writes, for the stale-offer read: every offer_id, the listing URL of each offer,
-    the URL each product's canonical offer is written at, each product's own page, and which products are fold
-    bases (their own placeholder item can be dropped by the fold: an unsellable parent)."""
+    each product's canonical offer (its id and the URL it is written at), the planned offers at each listing
+    (as _listing_key), each product's own page, and which products are fold bases (their own placeholder item
+    can be dropped by the fold: an unsellable parent)."""
     from services.catalog_enrichment_agent.ingestion import SKU_SUFFIX
 
     offers = plan.get("offers") or []
     canonical_refs: Dict[str, str] = {}
+    canonical_ids: Dict[str, str] = {}
+    by_product: Dict[str, set] = {}
+    by_listing: Dict[str, set] = {}
     for o in offers:
-        if str(o.get("sku_key") or "") == f"{o.get('product_key')}{SKU_SUFFIX}" and o.get("source_ref"):
-            canonical_refs[str(o.get("product_key"))] = str(o["source_ref"])
+        key, offer_id = str(o.get("product_key")), str(o.get("offer_id"))
+        by_product.setdefault(key, set()).add(offer_id)
+        by_listing.setdefault(_listing_key(o.get("source_ref")), set()).add(offer_id)
+        if str(o.get("sku_key") or "") == f"{key}{SKU_SUFFIX}" and o.get("source_ref"):
+            canonical_refs[key], canonical_ids[key] = str(o["source_ref"]), offer_id
     return {"offer_ids": sorted({str(o.get("offer_id")) for o in offers}),
-            "canonical_refs": canonical_refs,
+            "canonical_refs": canonical_refs, "canonical_ids": canonical_ids,
+            "by_product": {k: sorted(v) for k, v in by_product.items()},
+            "by_listing": {k: sorted(v) for k, v in by_listing.items()},
             "urls": sorted({str(o.get("source_ref") or "") for o in offers} - {""}),
             "own_url": {str(p.get("product_key")): str(p.get("canonical_url") or "") for p in plan.get("pdps") or []},
             "fold_bases": sorted(set(fold_base_keys or ()))}
 
 
-#: This lane's live offers on the host, the base of the mass-retire guard.
-HOST_LIVE_LANE_OFFERS_SQL = """
-SELECT count(*) AS live
-FROM catalog_offers
-WHERE source_system = :source_system
-  AND lower(source_domain) = ANY(:hosts)
-  AND suppressed_at IS NULL
-"""
 #: MASS-RETIRE GUARD. A fold retires an offer only when the crawl that would replace it really ran; a broken
 #: crawl (a page of children missing, a vendor filter gone wrong) can look exactly like "every variant was
-#: dropped". Ordinary churn between two crawls -- a sale, a delisted shade, a child refiled -- touches a few
-#: percent of a store's offers, so a retire past FOLD_RETIRE_SHARE of this lane's live offers on the host is
-#: held for a reviewer instead (fold_mass_retire, acceptable). FOLD_RETIRE_FLOOR keeps a small store from
-#: holding over one delisted line (a single line can carry about ten shades).
+#: dropped". The base is the COHORT's own live lane offers (on the products of the plan, and at the listings it
+#: writes) -- not the host's: N cohorts on one retailer must not each spend a share of the whole store, and a
+#: brand's line must not hide behind a large neighbour. Ordinary churn between two crawls -- a sale, a delisted
+#: shade, a child refiled -- touches a few percent of a cohort, so a retire past FOLD_RETIRE_SHARE of it is held
+#: for a reviewer (fold_mass_retire:<digest>, acceptable). FOLD_RETIRE_FLOOR keeps a mid-size cohort from holding
+#: over one delisted line (a line can carry about ten shades), but never lets a small cohort lose more than HALF
+#: its live offers unreviewed (FOLD_RETIRE_MAX_SHARE): a floor of ten would otherwise retire a whole cohort of
+#: ten. Proven `www.`/apex twins of a canonical the plan rewrites live are left out of both sides of the ratio.
 FOLD_RETIRE_SHARE = 0.10
 FOLD_RETIRE_FLOOR = 10
+FOLD_RETIRE_MAX_SHARE = 0.5
 
 
-def _fold_retire_limit(live_lane_offers: int) -> int:
-    """The most offers one apply retires without a reviewer: max(FLOOR, ceil(SHARE x live lane offers))."""
+def _fold_retire_limit(cohort_live_offers: int) -> int:
+    """The most offers one apply retires without a reviewer: max(FLOOR, ceil(SHARE x n)), never above
+    floor(MAX_SHARE x n), for n = the cohort's live lane offers (aliases left out)."""
     import math
 
-    return max(FOLD_RETIRE_FLOOR, math.ceil(FOLD_RETIRE_SHARE * max(int(live_lane_offers or 0), 0)))
+    n = max(int(cohort_live_offers or 0), 0)
+    return min(max(FOLD_RETIRE_FLOOR, math.ceil(FOLD_RETIRE_SHARE * n)), math.floor(FOLD_RETIRE_MAX_SHARE * n))
+
+
+def _fold_retire_digest(offer_ids: Any) -> str:
+    """The identity of a retire set a reviewer saw: fold_mass_retire:<this> accepts exactly that set."""
+    import hashlib
+
+    return hashlib.sha256("\n".join(sorted(str(i) for i in offer_ids)).encode("utf-8")).hexdigest()[:16]
 
 
 def _classify_stale_offer(row: Dict[str, Any], expected: Dict[str, Any], planned: set, url_keys: set) -> Optional[str]:
@@ -1193,45 +1210,71 @@ def _stale_action(row: Dict[str, Any], why: str) -> str:
     return "review" if why == "duplicate_outside_plan" else "retire"
 
 
+def _replacement_is_live(offer_id: Optional[str], rows_by_id: Dict[str, Dict[str, Any]]) -> bool:
+    """Will the planned offer `offer_id` be LIVE after the apply's upsert? Yes when it is new (no row yet), live
+    now, or retired by the fold itself (the upsert revives `fold_superseded`); no when another lane keeps it
+    suppressed -- the upsert never lifts that lane's reason."""
+    from services.catalog_enrichment_agent.apply import OFFER_FOLD_SUPERSEDED_REASON
+
+    if not offer_id:
+        return False
+    row = rows_by_id.get(str(offer_id))
+    return (row is None or row.get("suppressed_at") is None
+            or row.get("suppression_reason") == OFFER_FOLD_SUPERSEDED_REASON)
+
+
+def _replacements(why: str, row: Dict[str, Any], expected: Dict[str, Any]) -> List[str]:
+    """The planned offers that replace a stale one, which the apply's retire requires LIVE after its upserts
+    (apply.RETIRE_OFFER_SQL): at its listing, the other product's offers there (duplicate_at_listing); else
+    the product's own planned canonical -- the product is still sold (canonical_moved, dropped_variant). A
+    product with no planned canonical requires all of its planned offers."""
+    key = str(row.get("product_key") or "")
+    if why == "duplicate_at_listing":
+        return list((expected.get("by_listing") or {}).get(_listing_key(row.get("source_ref")), ()))
+    canonical = (expected.get("canonical_ids") or {}).get(key)
+    return [canonical] if canonical else list((expected.get("by_product") or {}).get(key, ()))
+
+
 async def _stale_fold_offers(expected: Dict[str, Any], read: Any = None) -> tuple:
-    """([stale offers, each with its `why` and `action`], None), or (None, why it could not be read)."""
+    """([stale offers, each with its why, action, alias and replacements], cohort live lane offers, None), or
+    (None, None, why it could not be read). The cohort's live offers are the rows read (its products, and the
+    listings it writes) that are live, proven aliases left out."""
     from services.catalog_enrichment_agent.ingestion import AGENT_VERSION
 
     if not expected.get("own_url"):
-        return [], None
+        return [], 0, None
     # Both `www.` spellings of every page the plan writes: an older row at the other spelling is that page.
     urls = sorted({alias for u in expected["urls"] for alias in _url_aliases(u)})
     values = {"source_system": AGENT_VERSION, "product_keys": sorted(expected["own_url"]), "urls": urls}
     rows, unread = await (read(FOLD_LANE_OFFERS_SQL, values) if read else _catalog_read(FOLD_LANE_OFFERS_SQL, values))
     if rows is None:
-        return None, unread
+        return None, None, unread
     planned, url_keys = set(expected["offer_ids"]), {_listing_key(u) for u in expected["urls"]}
+    rows_by_id = {str(r.get("offer_id")): r for r in rows}
     stale = []
     for row in rows:
         why = _classify_stale_offer(row, expected, planned, url_keys)
-        if why:
-            stale.append({"why": why, "action": _stale_action(row, why), "product_key": row.get("product_key"),
-                          "sku_key": row.get("sku_key"), "offer_id": row.get("offer_id"),
-                          "source_ref": row.get("source_ref"), "suppression_reason": row.get("suppression_reason"),
-                          # A proven second spelling of this product's canonical: the SAME product's canonical
-                          # SKU, at the `www.`/apex twin of the very URL the plan writes that canonical at
-                          # (_is_www_twin). Retired like any stale offer; only kept out of the mass-retire count,
-                          # since nothing leaves the catalog. Anything looser would let a large retire of real
-                          # offers skip the guard.
-                          "alias": (why == "canonical_moved" and _is_www_twin(
-                              row.get("source_ref"),
-                              (expected.get("canonical_refs") or {}).get(str(row.get("product_key")))))})
-    return sorted(stale, key=lambda r: str(r["offer_id"])), None
-
-
-async def _host_live_lane_offers(host: str, read: Any = None) -> tuple:
-    """(this lane's live offers on the host, None), or (None, why)."""
-    from services.catalog_enrichment_agent.ingestion import AGENT_VERSION
-
-    values = {"source_system": AGENT_VERSION, "hosts": _storefront_hosts(host)}
-    rows, unread = await (read(HOST_LIVE_LANE_OFFERS_SQL, values) if read
-                          else _catalog_read(HOST_LIVE_LANE_OFFERS_SQL, values))
-    return (None, unread) if rows is None else (int((rows[0] if rows else {}).get("live") or 0), None)
+        if not why:
+            continue
+        key = str(row.get("product_key"))
+        canonical_id = (expected.get("canonical_ids") or {}).get(key)
+        stale.append({"why": why, "action": _stale_action(row, why), "product_key": row.get("product_key"),
+                      "sku_key": row.get("sku_key"), "offer_id": row.get("offer_id"),
+                      "source_ref": row.get("source_ref"), "suppression_reason": row.get("suppression_reason"),
+                      "replacements": sorted(set(_replacements(why, row, expected))),
+                      "replacement_canonical": canonical_id,
+                      # A proven second spelling of this product's canonical: the SAME product's canonical SKU,
+                      # at the `www.`/apex twin of the very URL the plan writes that canonical at (_is_www_twin),
+                      # AND that canonical is live after the upsert (new, live, or the fold's own to revive).
+                      # Only then does nothing leave the catalog, so only then is it kept out of the mass-retire
+                      # count. A twin whose apex another lane keeps suppressed (a duplicate group's loser) is a
+                      # real retire -- and the apply's retire still requires the apex live, so it keeps the twin.
+                      "alias": (why == "canonical_moved"
+                                and _is_www_twin(row.get("source_ref"), (expected.get("canonical_refs") or {}).get(key))
+                                and _replacement_is_live(canonical_id, rows_by_id))})
+    alias_ids = {str(r["offer_id"]) for r in stale if r["alias"]}
+    cohort_live = sum(1 for r in rows if r.get("suppressed_at") is None and str(r.get("offer_id")) not in alias_ids)
+    return sorted(stale, key=lambda r: str(r["offer_id"])), cohort_live, None
 
 
 def _stale_signature(stale: List[Dict[str, Any]]) -> List[List[str]]:
@@ -1239,31 +1282,45 @@ def _stale_signature(stale: List[Dict[str, Any]]) -> List[List[str]]:
     return sorted([str(r["offer_id"]), r["why"], r["action"]] for r in stale)
 
 
-def _fold_retire_spec(stale: List[Dict[str, Any]], job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """The retire the apply runs in its own transaction (apply._retire_offers), or None: the `retire` offers of
-    this lane, and each one's shopify_markets siblings. A sibling copies its base offer's page and serves its
-    market's price for it with no further tie to the base, so a retired base would leave it selling a page
-    the base no longer sells; it is retired with the base and comes back with it (shopify_markets'
-    SIBLING_UPSERT_SQL revives it once the base is live again)."""
+def _fold_retire_spec(stale: List[Dict[str, Any]], job: Dict[str, Any],
+                      run_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """The retire the apply runs in its own transaction (apply._retire_offers), or None.
+
+    Each `retire` offer of this lane with the planned offers it requires live after the upserts, and its
+    shopify_markets siblings. A sibling copies its base offer's page and serves its market's price for it with no
+    further tie to the base, so a retired base would leave it selling a page the base no longer sells: it is
+    retired with its base and comes back with it (shopify_markets' SIBLING_UPSERT_SQL revives it once the base is
+    live again). For an ALIAS the page stays sold by the replacement canonical, so the alias's sibling is retired
+    only when that replacement already has its own live sibling for the market -- else the market would lose the
+    product until the next capture. The run id is stamped for revert (fold_retire_revert)."""
     from services.catalog_enrichment_agent.apply import OFFER_FOLD_SUPERSEDED_REASON
     from services.catalog_enrichment_agent.ingestion import AGENT_VERSION
     from services.retailer_ingest.shopify_markets import CAPTURE_MARKETS, sibling_offer_id, source_system_for
 
-    ids = sorted({str(r["offer_id"]) for r in stale if r["action"] == "retire"})
-    if not ids:
+    offers = []
+    for r in stale:
+        if r["action"] != "retire":
+            continue
+        offer_id = str(r["offer_id"])
+        siblings = [{"offer_id": sibling_offer_id(offer_id, m),
+                     "requires": ([sibling_offer_id(str(r["replacement_canonical"]), m)] if r.get("alias") else [])}
+                    for m in CAPTURE_MARKETS]
+        offers.append({"offer_id": offer_id, "why": r["why"], "alias": bool(r.get("alias")),
+                       "requires": list(r.get("replacements") or ()), "siblings": siblings})
+    if not offers:
         return None
-    return {"reason": OFFER_FOLD_SUPERSEDED_REASON, "offer_ids": ids, "source_systems": [AGENT_VERSION],
-            "sibling_offer_ids": sorted(sibling_offer_id(i, m) for i in ids for m in CAPTURE_MARKETS),
+    return {"reason": OFFER_FOLD_SUPERSEDED_REASON, "source_systems": [AGENT_VERSION],
             "sibling_source_systems": sorted(source_system_for(m) for m in CAPTURE_MARKETS),
-            "meta": {"retired_by": "retailer_ingest_shade_fold", "job_id": job.get("id"),
-                     "why": {str(r["offer_id"]): r["why"] for r in stale if r["action"] == "retire"}}}
+            "offers": sorted(offers, key=lambda o: o["offer_id"]),
+            "meta": {"retired_by": "retailer_ingest_shade_fold", "job_id": job.get("id"), "run_id": run_id}}
 
 
 def _stale_offer_flags(stale: List[Dict[str, Any]], host: str, *, retire_limit: Optional[int],
-                       live_lane_offers: Optional[int]) -> List[Dict[str, Any]]:
+                       cohort_live: Optional[int]) -> List[Dict[str, Any]]:
     """The reviewer's flags for a fold's stale offers, all ACCEPTABLE: one per live offer of a product OUTSIDE
-    the plan at a listing the plan writes (never retired automatically), and the mass-retire guard. The fold's
-    own stale offers are retired by the apply, not flagged."""
+    the plan at a listing the plan writes (never retired automatically), and the mass-retire guard -- keyed by the
+    digest of exactly the retire set, so an accept covers what the reviewer saw and nothing a later crawl adds.
+    The fold's own stale offers are retired by the apply, not flagged."""
     flags = []
     for r in stale:
         if r["action"] == "review":
@@ -1273,19 +1330,18 @@ def _stale_offer_flags(stale: List[Dict[str, Any]], host: str, *, retire_limit: 
                                     f"at {r['source_ref']}, a listing this fold writes an offer for: two live offers "
                                     f"at one page. Not retired automatically; accept this key to apply with both "
                                     f"live, or retire that offer through its own lane first"})
-    # Only retires that take a page OFF a product count: an alias (the same product rewrites that page) is a
-    # duplicate spelling going away, whatever its share of the host (a store whose older rows carry `www.` and
-    # apex canonicals side by side retires every one of them on its first fold run).
-    retire = [r for r in stale if r["action"] == "retire" and not r.get("alias")]
-    if retire_limit is not None and len(retire) > retire_limit:
-        flags.append({"key": "fold_mass_retire", "rule": "fold_mass_retire", "severity": detectors.BLOCK,
+    counted = sorted(str(r["offer_id"]) for r in stale if r["action"] == "retire" and not r.get("alias"))
+    if retire_limit is not None and len(counted) > retire_limit:
+        digest = _fold_retire_digest(counted)
+        flags.append({"key": f"fold_mass_retire:{digest}", "rule": "fold_mass_retire", "severity": detectors.BLOCK,
                       "acceptable": True,
-                      "detail": f"this apply would retire {len(retire)} of this lane's {live_lane_offers} live offer(s) "
-                                f"(besides any `www.`/apex alias of a page it rewrites) "
-                                f"on {host} (more than {retire_limit}: max({FOLD_RETIRE_FLOOR}, "
-                                f"{int(FOLD_RETIRE_SHARE * 100)}% of them)) -- what a broken crawl looks like. Check "
-                                f"checks.shade_fold.offer_preview.retire; accept this key if the store really "
-                                f"dropped them"})
+                      "detail": f"this apply would retire {len(counted)} of this cohort's {cohort_live} live lane "
+                                f"offer(s) on {host} (besides proven `www.`/apex twins of a live canonical), more than "
+                                f"{retire_limit}: what a broken crawl looks like. Check checks.shade_fold."
+                                f"offer_preview.retire; accepting this key accepts exactly these {len(counted)} offers "
+                                f"(set {digest}) -- a crawl that retires any other set is held again. Do not re-queue "
+                                f"this host without fold_shades instead: a cohort without the fold would re-emit "
+                                f"every folded listing as its own row and revive what the fold retired"})
     return flags
 
 
@@ -1296,12 +1352,13 @@ async def _fold_offer_checks(job: Dict[str, Any], plan: Dict[str, Any], carry: D
     The apply only upserts: an offer the plan no longer writes stays live at its old price. A fold's own stale
     offers -- a canonical at another page than the one the fold now writes it at, a folded variant this crawl
     no longer folds, a second offer at a listing the plan writes held by another product OF THE PLAN -- are
-    RETIRED by the apply, in its own transaction (`fold_superseded`, apply.OFFER_FOLD_SUPERSEDED_REASON), with
-    their shopify_markets siblings; an offer the plan writes again later comes back live. A live offer of a
-    product outside the plan at such a listing goes to a reviewer (fold_duplicate_outside_plan, acceptable). A
-    retire larger than _fold_retire_limit is held (fold_mass_retire, acceptable). The preview lists exactly what
-    the apply would retire; the apply re-reads it under the write lock and holds if it changed
-    (_recheck_superseded_rows)."""
+    RETIRED by the apply, in its own transaction (`fold_superseded`, apply.OFFER_FOLD_SUPERSEDED_REASON), each
+    only once the offers that replace it are live there, never a product's last live lane offer, and with their
+    shopify_markets siblings; an offer the plan writes again later comes back live. A live offer of a product
+    outside the plan at such a listing goes to a reviewer (fold_duplicate_outside_plan, acceptable). A retire
+    larger than _fold_retire_limit of the cohort is held (fold_mass_retire:<digest>, acceptable). The preview
+    lists exactly what the apply would retire; the apply re-reads it under the write lock and holds if it
+    changed (_recheck_superseded_rows)."""
     from services.curated_brand_feed import _clean_domain
 
     host = _clean_domain(job["domain"]).removeprefix("www.")
@@ -1309,12 +1366,7 @@ async def _fold_offer_checks(job: Dict[str, Any], plan: Dict[str, Any], carry: D
     carry["fold_offer_expected"] = expected
     fold = checks.setdefault("shade_fold", {})
     async with _catalog_reader() as read:
-        stale, unread = await _stale_fold_offers(expected, read)
-        live_lane = None
-        if stale is not None and any(r["action"] == "retire" for r in stale):
-            live_lane, unread = await _host_live_lane_offers(host, read)
-            if live_lane is None:
-                stale = None
+        stale, cohort_live, unread = await _stale_fold_offers(expected, read)
     if stale is None:
         fold["offer_preview"] = {"status": "unchecked", "reason": unread, "products": len(expected["own_url"])}
         return [{"key": "fold_offers_unread", "rule": "fold_offers_unread", "severity": detectors.BLOCK,
@@ -1322,15 +1374,55 @@ async def _fold_offer_checks(job: Dict[str, Any], plan: Dict[str, Any], carry: D
                  "detail": f"could not read this lane's offers on the {len(expected['own_url'])} product(s) of the "
                            f"plan ({unread}): a fold that cannot see what it supersedes is not applied"}]
     carry["fold_stale_signature"] = _stale_signature(stale)
-    limit = _fold_retire_limit(live_lane) if live_lane is not None else None
+    limit = _fold_retire_limit(cohort_live)
 
     def listed(action: str) -> List[Dict[str, Any]]:
         return [{k: r[k] for k in ("offer_id", "why", "source_ref", "product_key", "suppression_reason", "alias")}
                 for r in stale if r["action"] == action][:SHADE_FOLD_PREVIEW_CAP]
+    counted = [r for r in stale if r["action"] == "retire" and not r["alias"]]
     fold["offer_preview"] = {"status": "stale" if stale else "clear", "products": len(expected["own_url"]),
                              "stale": len(stale), "retire": listed("retire"), "review": listed("review"),
-                             "leave": listed("leave"), "live_lane_offers_on_host": live_lane, "retire_limit": limit}
-    return _stale_offer_flags(stale, host, retire_limit=limit, live_lane_offers=live_lane)
+                             "leave": listed("leave"), "cohort_live_offers": cohort_live,
+                             "retire_counted": len(counted), "retire_limit": limit,
+                             "retire_digest": _fold_retire_digest(r["offer_id"] for r in counted)}
+    return _stale_offer_flags(stale, host, retire_limit=limit, cohort_live=cohort_live)
+
+
+#: The offers a plan writes that the fold retired: a cohort WITHOUT fold_shades would revive them (the upsert
+#: lifts `fold_superseded`), and the fold's next run would retire them again.
+FOLD_SUPERSEDED_PLANNED_SQL = """
+SELECT offer_id, product_key, source_ref
+FROM catalog_offers
+WHERE offer_id = ANY(:offer_ids)
+  AND suppression_reason = :reason
+"""
+
+
+async def _fold_revival_checks(plan: Dict[str, Any], checks: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """A cohort WITHOUT options.fold_shades whose plan rewrites offers the fold retired would revive them -- the
+    fold's next run then retires them again: ping-pong, and two lanes disagreeing about one store. Held for a
+    reviewer (fold_superseded_revival:<digest of the offers>, acceptable), naming the offers. An unread catalog
+    holds nothing here: the plan's own listing read already holds an unread catalog (current_listings_unread)."""
+    from services.catalog_enrichment_agent.apply import OFFER_FOLD_SUPERSEDED_REASON
+
+    ids = sorted({str(o.get("offer_id")) for o in plan.get("offers") or []})
+    if not ids:
+        return []
+    rows, unread = await _catalog_read(FOLD_SUPERSEDED_PLANNED_SQL,
+                                       {"offer_ids": ids, "reason": OFFER_FOLD_SUPERSEDED_REASON})
+    if rows is None:
+        checks["fold_revival"] = {"status": "unchecked", "reason": unread}
+        return []
+    if not rows:
+        return []
+    revived = sorted(str(r["offer_id"]) for r in rows)
+    checks["fold_revival"] = {"status": "would_revive", "offers": [dict(r) for r in rows][:SHADE_FOLD_PREVIEW_CAP]}
+    return [{"key": f"fold_superseded_revival:{_fold_retire_digest(revived)}", "rule": "fold_superseded_revival",
+             "severity": detectors.BLOCK, "acceptable": True,
+             "detail": f"this cohort does not fold, but its plan rewrites {len(revived)} offer(s) a shade-fold cohort "
+                       f"on this host retired (e.g. {revived[:3]}; checks.fold_revival): it would revive them, and "
+                       f"the fold's next run would retire them again. Run this host's cohort WITH fold_shades; accept "
+                       f"this key only to revive exactly these offers on purpose"}]
 
 
 def _superseded_row_retired(row: Dict[str, Any]) -> bool:
@@ -1451,7 +1543,8 @@ async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str
                        f"that WAS folded -- it would re-emit every folded listing beside the base"}]
 
 
-async def _recheck_superseded_rows(job: Dict[str, Any], result: Dict[str, Any]) -> None:
+async def _recheck_superseded_rows(job: Dict[str, Any], result: Dict[str, Any],
+                                   run_id: Optional[str] = None) -> None:
     """options.fold_shades, INSIDE the catalog write lock and before the write marker: read this lane's offers on
     the plan's products and listings (_fold_offer_checks) and the superseded listings' old rows again, on ONE
     connection. The check stage read them unlocked, so another job's write on the host can land between the
@@ -1463,7 +1556,7 @@ async def _recheck_superseded_rows(job: Dict[str, Any], result: Dict[str, Any]) 
     fold = result["checks"].setdefault("shade_fold", {})
     async with _catalog_reader() as read:
         if expected.get("own_url"):
-            stale, unread = await _stale_fold_offers(expected, read)
+            stale, _cohort_live, unread = await _stale_fold_offers(expected, read)
             if stale is None:
                 fold["offer_recheck"] = {"status": "unchecked", "reason": unread}
                 raise _Stop("fold_offers_unread", "held",
@@ -1481,7 +1574,7 @@ async def _recheck_superseded_rows(job: Dict[str, Any], result: Dict[str, Any]) 
                             f"options.fold_shades: this lane's stale offers changed between the checks and the "
                             f"write ({len(stale)} now); nothing written -- see checks.shade_fold.offer_recheck",
                             checks=result["checks"])
-            result["fold_retire"] = _fold_retire_spec(stale, job)
+            result["fold_retire"] = _fold_retire_spec(stale, job, run_id)
         if not entries:
             return
         rows, unread = await _superseded_rows(sorted({e["stale_key"] for e in entries}), read)
@@ -1832,7 +1925,7 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
         # checks above ran unlocked. The lock is released when this block exits, however it exits.
         async with ledger.catalog_write_lock(wait_s=wait_s, poll_s=WRITE_LOCK_POLL_S) as waited:
             timings["write_lock_wait_s"] = round(waited, 3)
-            await _recheck_superseded_rows(job, result)  # options.fold_shades only; holds, never writes
+            await _recheck_superseded_rows(job, result, run_id)  # options.fold_shades only; holds, never writes
             # Durable BEFORE the first catalog write: an execution killed from here on is "may be
             # partial"; one killed before it (crawl, checks, lock wait) is retried, nothing written.
             await ledger.mark_write_started(run_id, db=db)

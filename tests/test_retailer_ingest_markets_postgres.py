@@ -360,9 +360,9 @@ async def test_the_shade_fold_lane_offer_read_runs_on_postgres(db, monkeypatch):
                          {"r": reason, "o": offer_id})
     monkeypatch.setattr(cli, "_preflight_database", lambda: (db, None))
     rewritten = {"offer_ids": [PREFIX + "fold-canon", PREFIX + "fold-pending"], "urls": [page], "own_url": {key: page}}
-    assert await pipeline._stale_fold_offers(rewritten) == ([], None)
+    assert (await pipeline._stale_fold_offers(rewritten))[::2] == ([], None)
     moved = {"offer_ids": [], "urls": [f"https://{HOST}/products/face-hero-8ml"], "own_url": {key: page}}
-    stale, unread = await pipeline._stale_fold_offers(moved)
+    stale, _live, unread = await pipeline._stale_fold_offers(moved)
     assert unread is None
     assert sorted((r["why"], r["offer_id"]) for r in stale) == [
         ("canonical_moved", PREFIX + "fold-canon"), ("canonical_moved", PREFIX + "fold-pending")]
@@ -392,7 +392,7 @@ async def test_the_shade_fold_lane_offer_read_finds_stale_offers_by_listing_too(
 
     # This crawl writes the base's canonical again but no longer folds the 8ml child.
     dropped = {"offer_ids": [PREFIX + "fold2-canon"], "urls": [page], "own_url": {base: page}}
-    stale, unread = await pipeline._stale_fold_offers(dropped)
+    stale, _live, unread = await pipeline._stale_fold_offers(dropped)
     assert unread is None
     assert [(r["why"], r["offer_id"]) for r in stale] == [("dropped_variant", PREFIX + "fold2-variant")]
 
@@ -401,14 +401,14 @@ async def test_the_shade_fold_lane_offer_read_finds_stale_offers_by_listing_too(
     new_key = RETAILER_PREFIX + "fold-new"
     dup = {"offer_ids": [PREFIX + "fold2-new"], "urls": [f"https://{HOST}/products/face-hero-30ml"],
            "own_url": {new_key: f"https://{HOST}/products/face-hero-30ml"}}
-    stale, unread = await pipeline._stale_fold_offers(dup)
+    stale, _live, unread = await pipeline._stale_fold_offers(dup)
     assert unread is None
     assert [(r["why"], r["action"], r["offer_id"]) for r in stale] == [
         ("duplicate_outside_plan", "review", PREFIX + "fold2-elsewhere")]
     # ... and with that product IN the plan (written at its own page now), its old canonical at the 30ml listing
     # is the fold's to retire.
     dup["own_url"][other] = page
-    stale, unread = await pipeline._stale_fold_offers(dup)
+    stale, _live, unread = await pipeline._stale_fold_offers(dup)
     assert [(r["why"], r["action"], r["offer_id"]) for r in stale if r["offer_id"] == PREFIX + "fold2-elsewhere"] == [
         ("canonical_moved", "retire", PREFIX + "fold2-elsewhere")]
 
@@ -436,10 +436,22 @@ def _plan_offer_row(offer_id, key, *, price):
     return apply_mod._with_offer_write_defaults([row])[0]
 
 
+def _spec(offers, **extra):
+    """A retire as the pipeline hands it to the apply (pipeline._fold_retire_spec)."""
+    from services.catalog_enrichment_agent import apply as apply_mod
+    from services.retailer_ingest import shopify_markets as markets
+
+    return {"reason": apply_mod.OFFER_FOLD_SUPERSEDED_REASON, "source_systems": ["catalog_enrichment_agent_v1"],
+            "sibling_source_systems": [markets.source_system_for(m) for m in markets.CAPTURE_MARKETS],
+            "meta": {"retired_by": "test", "job_id": "rij_x", "run_id": extra.pop("run_id", "run_x")},
+            "offers": [{"why": "dropped_variant", "requires": [], "siblings": [], **o} for o in offers], **extra}
+
+
 async def test_the_fold_retire_and_its_revival_run_on_postgres(db):
-    """apply.RETIRE_OFFERS_SQL retires exactly the named offers of the named source_systems while they are live;
-    the offer upsert (apply._OFFER_UPSERT_MARKET_SQL, the lane's) brings back a 'fold_superseded' offer the plan
-    writes again and leaves every other suppression as it is."""
+    """apply.RETIRE_OFFER_SQL retires exactly the named offers of the named source_systems while they are live, and
+    stamps them (fold_retire: job, run, why) without touching updated_at; the offer upsert (apply.
+    _OFFER_UPSERT_MARKET_SQL, the lane's) brings back a 'fold_superseded' offer the plan writes again and leaves
+    every other suppression as it is."""
     from services.catalog_enrichment_agent import apply as apply_mod
 
     key = RETAILER_PREFIX + "fold-retire"
@@ -451,24 +463,82 @@ async def test_the_fold_retire_and_its_revival_run_on_postgres(db):
     await _offer(db, untouched, key, currency="USD", market="US")
     await db.execute("UPDATE catalog_offers SET suppressed_at = NOW(), suppression_reason = 'catalog_destination_dead'"
                      " WHERE offer_id = :o", {"o": other_reason})
+    before = await db.fetch_val("SELECT updated_at FROM catalog_offers WHERE offer_id = :o", {"o": retired})
     async with db.transaction():
-        done = await apply_mod._retire_offers(db, {
-            "reason": apply_mod.OFFER_FOLD_SUPERSEDED_REASON, "meta": {"job_id": "rij_x"},
-            "offer_ids": [retired, other_lane, other_reason], "source_systems": ["catalog_enrichment_agent_v1"]})
+        done = await apply_mod._retire_offers(db, _spec([{"offer_id": i} for i in (retired, other_lane, other_reason)]),
+                                              landed=set())
     assert done["offer_ids"] == [retired]  # not the other lane's, not the one already suppressed for its own reason
+    assert done["left"] == {"not_live": [other_lane, other_reason]}
     assert await _offer_state(db, retired) == (True, "fold_superseded", 45.0)
     assert await _offer_state(db, other_lane) == (False, None, 45.0)
     assert await _offer_state(db, other_reason) == (True, "catalog_destination_dead", 45.0)
     assert await _offer_state(db, untouched) == (False, None, 45.0)
-    meta = await db.fetch_val("SELECT suppression_metadata->>'job_id' FROM catalog_offers WHERE offer_id = :o",
-                              {"o": retired})
-    assert meta == "rij_x"
+    stamp = await db.fetch_one("SELECT suppression_metadata->'fold_retire'->>'job_id' AS job, suppression_metadata->"
+                               "'fold_retire'->>'run_id' AS run, updated_at FROM catalog_offers WHERE offer_id = :o",
+                               {"o": retired})
+    assert (stamp["job"], stamp["run"], stamp["updated_at"]) == ("rij_x", "run_x", before)
 
     # A later crawl writes both again: the fold's comes back live at the new price; the other stays suppressed.
     for offer_id in (retired, other_reason):
         await db.execute(apply_mod._OFFER_UPSERT_MARKET_SQL, _plan_offer_row(offer_id, key, price=39.0))
     assert await _offer_state(db, retired) == (False, None, 39.0)
     assert await _offer_state(db, other_reason) == (True, "catalog_destination_dead", 39.0)
+
+
+async def test_the_retire_never_runs_ahead_of_its_replacement_on_postgres(db):
+    """A replacement that did not land in this transaction, or that another lane keeps suppressed (a duplicate
+    group's loser), keeps the stale offer live; a product's last live lane offer is never taken."""
+    from services.catalog_enrichment_agent import apply as apply_mod
+
+    key, other = RETAILER_PREFIX + "fold-need", RETAILER_PREFIX + "fold-need-q"
+    await _product(db, key, content_key=PREFIX + "ck-fold-need")
+    await _product(db, other, content_key=PREFIX + "ck-fold-need-q")
+    for oid, k in (("n-stale", key), ("n-repl", key), ("n-supp", key), ("n-lone", other), ("n-q-repl", key)):
+        await _offer(db, PREFIX + oid, k, currency="USD", market="US")
+    await db.execute("UPDATE catalog_offers SET suppressed_at = NOW(), suppression_reason = 'duplicate_offer'"
+                     " WHERE offer_id = :o", {"o": PREFIX + "n-supp"})
+    async with db.transaction():
+        done = await apply_mod._retire_offers(db, _spec([
+            {"offer_id": PREFIX + "n-stale", "requires": [PREFIX + "n-repl"]},           # replacement never landed
+            {"offer_id": PREFIX + "n-stale2", "requires": []},                            # (no such row)
+        ]), landed={PREFIX + "n-supp"})
+        assert done["left"] == {"replacement_not_written": [PREFIX + "n-stale"], "not_live": [PREFIX + "n-stale2"]}
+        done = await apply_mod._retire_offers(db, _spec([
+            {"offer_id": PREFIX + "n-stale", "requires": [PREFIX + "n-supp"]},            # landed, but suppressed
+            {"offer_id": PREFIX + "n-lone", "why": "duplicate_at_listing", "requires": [PREFIX + "n-q-repl"]},
+        ]), landed={PREFIX + "n-supp", PREFIX + "n-q-repl"})
+    assert done["offer_ids"] == []
+    assert done["left"] == {"replacement_not_live": [PREFIX + "n-stale"], "kept_last_live": [PREFIX + "n-lone"]}
+    assert await _offer_state(db, PREFIX + "n-stale") == (False, None, 45.0)
+    assert await _offer_state(db, PREFIX + "n-lone") == (False, None, 45.0)
+
+
+async def test_an_alias_retires_its_sibling_only_behind_the_replacements_own_on_postgres(db):
+    """For a `www.` twin the page stays sold by the replacement canonical, so its Markets sibling goes only when
+    the replacement already has a live sibling for that market; a real retire takes its siblings regardless."""
+    from services.catalog_enrichment_agent import apply as apply_mod
+    from services.retailer_ingest import shopify_markets as markets
+
+    key = RETAILER_PREFIX + "fold-alias"
+    await _product(db, key, content_key=PREFIX + "ck-fold-alias")
+    for oid in ("a-www", "a-apex", "a-www2", "a-apex2"):
+        await _offer(db, PREFIX + oid, key, currency="USD", market="US")
+    for base in ("a-www", "a-apex", "a-www2"):  # a-apex2 never had its SG capture
+        await markets.write_siblings([_planned(PREFIX + base, key, market="SG")], db=db)
+
+    def sib(base):
+        return markets.sibling_offer_id(PREFIX + base, "SG")
+    async with db.transaction():
+        done = await apply_mod._retire_offers(db, _spec([
+            {"offer_id": PREFIX + "a-www", "why": "canonical_moved", "requires": [PREFIX + "a-apex"],
+             "siblings": [{"offer_id": sib("a-www"), "requires": [sib("a-apex")]}]},
+            {"offer_id": PREFIX + "a-www2", "why": "canonical_moved", "requires": [PREFIX + "a-apex2"],
+             "siblings": [{"offer_id": sib("a-www2"), "requires": [sib("a-apex2")]}]},
+        ]), landed={PREFIX + "a-apex", PREFIX + "a-apex2"})
+    assert done["offer_ids"] == [PREFIX + "a-www", PREFIX + "a-www2"]
+    assert done["sibling_offer_ids"] == [sib("a-www")]
+    assert done["left"] == {"sibling_replacement_not_live": [sib("a-www2")]}
+    assert (await _offer_state(db, sib("a-www2")))[:2] == (False, None)  # the market keeps the product
 
 
 async def test_a_retired_sibling_comes_back_with_its_base_on_postgres(db):
@@ -485,10 +555,8 @@ async def test_a_retired_sibling_comes_back_with_its_base_on_postgres(db):
         assert len((await markets.write_siblings([_planned(base, key, market="SG")], db=db))["written"]) == 1
     sib, sib2 = markets.sibling_offer_id(PREFIX + "sib-base", "SG"), markets.sibling_offer_id(PREFIX + "sib-base2", "SG")
     async with db.transaction():
-        done = await apply_mod._retire_offers(db, {
-            "reason": apply_mod.OFFER_FOLD_SUPERSEDED_REASON, "offer_ids": [PREFIX + "sib-base"],
-            "source_systems": ["catalog_enrichment_agent_v1"], "sibling_offer_ids": [sib],
-            "sibling_source_systems": [markets.source_system_for("SG")]})
+        done = await apply_mod._retire_offers(db, _spec([
+            {"offer_id": PREFIX + "sib-base", "siblings": [{"offer_id": sib, "requires": []}]}]), landed=set())
     assert (done["offer_ids"], done["sibling_offer_ids"]) == ([PREFIX + "sib-base"], [sib])
     await db.execute("UPDATE catalog_offers SET suppressed_at = NOW(), suppression_reason = 'catalog_destination_dead'"
                      " WHERE offer_id = :o", {"o": sib2})
@@ -500,21 +568,67 @@ async def test_a_retired_sibling_comes_back_with_its_base_on_postgres(db):
     assert await _offer_state(db, sib2) == (True, "catalog_destination_dead", 32.0)
 
 
-async def test_the_apply_retires_in_its_own_transaction_on_postgres(db, monkeypatch):
-    """apply_ingest_plan(retire_offers=...) runs the retire inside the SKU/offer transaction and reports what it
-    retired (counts["offers_retired"])."""
+@pytest.mark.parametrize("upsert_fails", [False, True])
+async def test_the_apply_retires_only_behind_offers_its_own_transaction_wrote_on_postgres(db, monkeypatch,
+                                                                                          upsert_fails):
+    """apply_ingest_plan(retire_offers=...): the retire runs inside the SKU/offer transaction, and only behind the
+    replacement offers that landed there. Every upsert failing (each one logged and skipped in its savepoint)
+    leaves the replacement absent AND the stale offer live -- never `fold_superseded` with nothing in its place."""
+    from services import catalog_offer_writer_guard as guard
     from services.catalog_enrichment_agent import apply as apply_mod
 
     async def no_audit(audit, **kw):  # the writer audit row goes to the app's own database handle
         return None
     monkeypatch.setattr(apply_mod, "write_writer_audit_log", no_audit)
-
+    monkeypatch.setattr(guard, "database", db)  # the offer guard reads the live SKU links through it
+    if upsert_fails:
+        monkeypatch.setattr(apply_mod, "_offer_sql_for", lambda row: "SELECT 1 / 0 WHERE CAST(:offer_id AS text) <> ''")
     key = RETAILER_PREFIX + "fold-apply"
     await _product(db, key, content_key=PREFIX + "ck-fold-apply")
-    await _offer(db, PREFIX + "apply-stale", key, currency="USD", market="US")
-    plan = {"pdps": [], "skus": [], "merchants": [], "offers": [], "seeds": [], "incis": []}
-    counts = await apply_mod.apply_ingest_plan(plan, batch_label="fold-retire-test", db=db, retire_offers={
-        "reason": apply_mod.OFFER_FOLD_SUPERSEDED_REASON, "offer_ids": [PREFIX + "apply-stale"],
-        "source_systems": ["catalog_enrichment_agent_v1"]})
-    assert counts["offers_retired"]["offer_ids"] == [PREFIX + "apply-stale"]
-    assert await _offer_state(db, PREFIX + "apply-stale") == (True, "fold_superseded", 45.0)
+    await _offer(db, PREFIX + "apply-stale", key, currency="USD", market="US", handle="face-hero-15ml")
+    replacement = _plan_offer_row(PREFIX + "apply-new", key, price=39.0)
+    plan = {"pdps": [], "skus": [], "merchants": [], "offers": [replacement], "seeds": [], "incis": []}
+    counts = await apply_mod.apply_ingest_plan(plan, batch_label="fold-retire-test", db=db, retire_offers=_spec([
+        {"offer_id": PREFIX + "apply-stale", "requires": [PREFIX + "apply-new"]}]))
+    new = await db.fetch_one("SELECT suppressed_at FROM catalog_offers WHERE offer_id = :o", {"o": PREFIX + "apply-new"})
+    if upsert_fails:
+        assert counts["offers"] == 0 and new is None
+        assert counts["offers_retired"]["offer_ids"] == []
+        assert counts["offers_retired"]["left"] == {"replacement_not_written": [PREFIX + "apply-stale"]}
+        assert await _offer_state(db, PREFIX + "apply-stale") == (False, None, 45.0)
+    else:
+        assert counts["offers"] == 1 and new["suppressed_at"] is None
+        assert counts["offers_retired"]["offer_ids"] == [PREFIX + "apply-stale"]
+        assert await _offer_state(db, PREFIX + "apply-stale") == (True, "fold_superseded", 45.0)
+
+
+async def test_a_run_s_fold_retire_reverts_on_postgres(db):
+    """fold_retire_revert: dry run lists what the run still has retired; apply lifts exactly those rows -- never
+    another run's, never one revived since, never one another lane suppressed since."""
+    from services.catalog_enrichment_agent import apply as apply_mod
+    from services.retailer_ingest.fold_retire_revert import revert_fold_retire
+
+    key = RETAILER_PREFIX + "fold-revert"
+    await _product(db, key, content_key=PREFIX + "ck-fold-revert")
+    for oid in ("v-mine", "v-mine2", "v-other-run", "v-keep"):
+        await _offer(db, PREFIX + oid, key, currency="USD", market="US")
+    async with db.transaction():
+        await apply_mod._retire_offers(db, _spec([{"offer_id": PREFIX + "v-mine"}, {"offer_id": PREFIX + "v-mine2"}],
+                                                 run_id="rir_revert_a"), landed=set())
+        await apply_mod._retire_offers(db, _spec([{"offer_id": PREFIX + "v-other-run"}], run_id="rir_revert_b"),
+                                       landed=set())
+    # v-mine2 was suppressed again since, for another lane's reason: it is that lane's now
+    await db.execute("UPDATE catalog_offers SET suppression_reason = 'catalog_destination_dead' WHERE offer_id = :o",
+                     {"o": PREFIX + "v-mine2"})
+    dry = await revert_fold_retire("rir_revert_a", db=db)
+    assert [r["offer_id"] for r in dry["offers"]] == [PREFIX + "v-mine"] and dry["reverted"] == []
+    assert (await _offer_state(db, PREFIX + "v-mine"))[:2] == (True, "fold_superseded")  # a dry run writes nothing
+    done = await revert_fold_retire("rir_revert_a", apply=True, db=db)
+    assert done["reverted"] == [PREFIX + "v-mine"]
+    assert await _offer_state(db, PREFIX + "v-mine") == (False, None, 45.0)
+    assert (await _offer_state(db, PREFIX + "v-other-run"))[:2] == (True, "fold_superseded")
+    assert (await _offer_state(db, PREFIX + "v-mine2"))[:2] == (True, "catalog_destination_dead")
+    assert await db.fetch_val("SELECT suppression_metadata ? 'fold_retire' FROM catalog_offers WHERE offer_id = :o",
+                              {"o": PREFIX + "v-mine"}) is False
+    with pytest.raises(ValueError):
+        await revert_fold_retire("  ", db=db)
