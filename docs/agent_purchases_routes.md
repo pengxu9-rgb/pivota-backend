@@ -1,12 +1,13 @@
-# `/agent/v2/commerce/purchases`: the rail-neutral purchase read
+# `/agent/v2/commerce/purchases`: the rail-neutral purchase door
 
 `routes/agent_commerce_purchases.py` implements this contract. The storage is
 `db/agent_purchase_ledger.py` (migration 264); the shared state vocabulary is
 `services/payment_orchestration/rails.py`.
 
-**Payment orchestration P0.** One purchase id (`pp_…`) and one state vocabulary across payment
-rails. Reap is the only rail today; more rails follow. The routes are **read-only**: they
-open nothing, advance nothing and call no rail. Purchases are still created through
+**Payment orchestration.** One purchase id (`pp_…`) and one state vocabulary across payment
+rails: Reap and the A2A token rail. The reads (`GET`) open nothing, advance nothing and call no
+rail. `POST` (below, its own dial) opens a purchase on the rail the router picks; it too calls no
+rail (the rail's worker does that later). Purchases can still be created directly through
 `POST /agent/v2/commerce/reap/purchases` (docs/reap_agentic_routes.md).
 
 **Dark by default.** While `AGENT_PURCHASE_LEDGER_ENABLED` is not one of `1/true/on/yes`, every
@@ -23,8 +24,8 @@ Errors arrive in the app-wide envelope; read the reason at `detail.error`.
 
 ## `GET /agent/v2/commerce/purchases/{purchase_id}`
 
-`purchase_id` is a `pp_<24 hex>` id, or a Reap `rp_<24 hex>` id (a Reap purchase opened before the
-ledger existed gets its `pp_` id on this first read). Any other shape is 404 `purchase_not_found`,
+`purchase_id` is a `pp_<24 hex>` id, or a rail's own id: Reap `rp_<24 hex>` or A2A `ap_<24 hex>` (a
+rail purchase without a parent yet gets its `pp_` id on this first read). Any other shape is 404 `purchase_not_found`,
 decided before any database read.
 
 ```json
@@ -72,6 +73,48 @@ rather than leaving that purchase out (a missing row would read as a purchase th
 ```json
 {"purchases": [{"purchase_id": "pp_…", "…": "…"}], "limit": 20}
 ```
+
+## `POST /agent/v2/commerce/purchases`
+
+Opens a purchase on the rail `services/payment_orchestration/router.py` picks. **Dark**: unless BOTH
+`PAYMENT_ORCHESTRATOR_ENABLED` and `AGENT_PURCHASE_LEDGER_ENABLED` are on, every request answers
+404 `not_available`. Same authentication as the reads.
+
+**Body**: the Reap create body (docs/reap_agentic_routes.md, `item_source`, `merchant_domain`,
+`product_key`, `variant_key`, `quantity`, `buyer {email, shipping_address, consent_version}`,
+`idempotency_key`, `expected_unit_price_minor` + `expected_currency`, `offer_code`, `return_url`)
+plus an optional `payment_preference: {"rail": "reap" | "a2a"}`.
+
+**Order of decisions**:
+1. The request is normalised exactly as the Reap cart-link lane does it, and the **idempotency key
+   is looked up first**, in the key table both rails share: a retry with the same key and body
+   replays the ORIGINAL purchase on its ORIGINAL rail, whatever the router would answer today. A
+   Reap original is answered by the Reap route; a different body is 409 `idempotency_conflict`, which
+   names the key's purchase (`purchase_id`, `rail`) when it opened one, so the caller can read it.
+2. A new attempt without the shown-money pair is 400 `invalid_request`, before the router.
+3. The router:
+   - **An explicit `payment_preference.rail` is never silently changed.** An `a2a` choice the A2A
+     rail cannot take is 404 `not_available_on_this_rail` (the Reap route's wording for an
+     unavailable rail; the reason is logged, never returned) and is never sent to Reap. `reap`
+     goes to the Reap route.
+   - **No choice**: the A2A rail when it may take the request (its dials, the agent's pilot
+     membership, a cart link with no offer code, the (merchant, market) proven list, a cap for the
+     currency), else the Reap route, unchanged.
+   - **No fallback after routing.** A request routed to the A2A rail that the A2A create then
+     refuses (pricing, the Tier B verdict, the amount cap, the buyer's details, ...) is REFUSED with
+     that reason. It is never retried on Reap: the router decides once, before anything is written.
+4. Reap: the request is handed to the Reap route, which answers in its own shape.
+5. A2A: the Reap cart-link lane's checks (purchasability when enforced, an operator's disabled
+   merchant row, the Tier B verdict, our catalog price and the shown-money check), the buyer's
+   details by the Reap rail's own rules, the rail's per-currency cap, then our click and cart link,
+   then the purchase and its key in one transaction (rolled back if another request wins the key).
+
+**Response** (A2A): `202 {"purchase_id": "ap_…", "rail": "a2a", "state": "<unified>", "rail_state": "opened",
+"poll_after_seconds": 5, "variant_title": …}`. Read it with the GET above.
+
+**404 bodies differ on purpose**: `not_available` is this door being dark; `not_available_on_this_rail`
+is the door being on and an explicit rail choice that cannot be honoured (the Reap route's word for an
+unavailable rail). Neither names a reason, and neither opens anything.
 
 ## Operations
 
