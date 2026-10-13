@@ -1257,7 +1257,8 @@ class Store(Catalog):
     def _retire_checks(self, values):
         row = self._row(values["offer_id"], values["source_systems"])
         live_ids = {o["offer_id"] for o in self.offers if o.get("suppressed_at") is None}
-        replacement = all(r in live_ids for r in values["requires"])
+        replacement = (all(r in live_ids for r in values["requires"])
+                       and (not values["requires_any"] or any(r in live_ids for r in values["requires_any"])))
         other = row is not None and any(
             o["product_key"] == row["product_key"] and o["source_system"] in values["source_systems"]
             and o.get("suppressed_at") is None and o["offer_id"] not in values["retire_ids"] for o in self.offers)
@@ -1275,6 +1276,7 @@ class Store(Catalog):
         if query is apply_mod.RETIRE_OFFER_SQL:
             row, replacement, other = self._retire_checks(values)
             if (row is None or row.get("suppressed_at") is not None or not replacement
+                    or not (values["requires"] or values["requires_any"])
                     or (values["keep_last_live"] and not other)):
                 return []
             row.update(suppressed_at="2026-10-13T00:00:00Z", suppression_reason=values["reason"],
@@ -1284,6 +1286,7 @@ class Store(Catalog):
 
     async def fetch_one(self, query, values=None):
         from services.catalog_enrichment_agent import apply as apply_mod
+        self.queries.append(query)
         assert query is apply_mod.RETIRE_DECLINED_SQL
         row, replacement, other = self._retire_checks(values)
         return None if row is None else {"live": row.get("suppressed_at") is None, "replacement_live": replacement,
@@ -1425,18 +1428,22 @@ async def test_an_offer_the_plan_writes_again_comes_back_live(env, monkeypatch, 
     _assert_one_truthful_offer_per_listing(store, back)
 
 
+def _sg_sibling(base, price=120.0):
+    return {"offer_id": shopify_markets.sibling_offer_id(base["offer_id"], "SG"), "product_key": base["product_key"],
+            "sku_key": base["sku_key"], "source_ref": base["source_ref"], "source_system": SG_SIBLINGS,
+            "source_domain": HOST, "list_price": price, "suppressed_at": None, "suppression_reason": None}
+
+
 async def test_a_retired_base_offer_takes_its_markets_siblings_with_it(env, monkeypatch):  # noqa: F811
     """A shopify_markets sibling copies its base offer's page and serves its market's price for it; nothing ties
-    it to the base afterwards. Left live, a retired base would leave it selling a page the base no longer does."""
+    it to the base afterwards. It is retired with its base once the base's replacement has its own live sibling
+    for the market (here the base product's canonical, which a capture already priced in SG)."""
     store = Store()
     await _crawl(env, monkeypatch, priced_line(), store)
     child_variant = next(o for o in store.live() if o["source_ref"].endswith("/glow-serum-100ml"))
-    sibling = {"offer_id": shopify_markets.sibling_offer_id(child_variant["offer_id"], "SG"),
-               "product_key": child_variant["product_key"], "sku_key": child_variant["sku_key"],
-               "source_ref": child_variant["source_ref"], "source_system": SG_SIBLINGS, "source_domain": HOST,
-               "list_price": 120.0, "suppressed_at": None, "suppression_reason": None}
+    sibling = _sg_sibling(child_variant)
     other_lane = dict(sibling, offer_id="offer:another_lane:x", source_system="another_lane")
-    store.offers += [sibling, other_lane]
+    store.offers += [sibling, other_lane, _sg_sibling(_canonical_of(store, "glow-serum"), 55.0)]
     await _crawl(env, monkeypatch, priced_line(child=False), store)
     assert _last_run(env)["checks"]["shade_fold"]["retired"]["sibling_offer_ids"] == [sibling["offer_id"]]
     assert (sibling["suppression_reason"], other_lane["suppression_reason"]) == (FOLD_REASON, None)
@@ -1794,7 +1801,7 @@ async def test_an_alias_sibling_waits_for_the_replacements_own_sibling(env, monk
     assert out["status"] == "done" and twin["suppression_reason"] == FOLD_REASON
     spec_sibling = next(sib for o in env.retire_specs[-1]["offers"] if o["offer_id"] == twin["offer_id"]
                         for sib in o["siblings"] if sib["offer_id"] == sibling["offer_id"])
-    assert spec_sibling["requires"] == [shopify_markets.sibling_offer_id(apex["offer_id"], "SG")]
+    assert spec_sibling["requires_any"] == [shopify_markets.sibling_offer_id(apex["offer_id"], "SG")]
     assert sibling["suppressed_at"] is None  # the apex has no SG sibling yet: the market keeps the product
     assert _last_run(env)["checks"]["shade_fold"]["retired"]["left"] == {
         "sibling_replacement_not_live": [sibling["offer_id"]]}
@@ -1923,3 +1930,104 @@ async def test_a_refused_childs_old_variant_waits_for_the_childs_own_offer(env, 
     assert _last_run(env)["checks"]["shade_fold"]["retired"]["left"] == {
         "replacement_not_written": [old_variant["offer_id"]]}
     assert old_variant["suppressed_at"] is None
+
+
+
+# ---- round 2: a market never loses a page still sold; empty requirements fail closed; bound revival accepts ----
+
+async def test_a_refused_childs_page_keeps_its_markets_price(env, monkeypatch):  # noqa: F811
+    """N1. The child is refused on a re-crawl and written as its own row: the base's old variant offer at that page
+    is retired behind the child's own offer -- but its SG sibling only once the child's own offer has an SG
+    sibling. Until a capture prices it, SG keeps the page it still sells, and the run says so."""
+    store = Store()
+    await _crawl(env, monkeypatch, priced_line(), store)
+    variant = next(o for o in store.live() if o["source_ref"].endswith("/glow-serum-100ml"))
+    sibling = _sg_sibling(variant)
+    store.offers.append(sibling)
+    out = await _crawl(env, monkeypatch, priced_line(pc="200.00"), store)
+    assert out["status"] == "done"
+    retired = _last_run(env)["checks"]["shade_fold"]["retired"]
+    assert retired["offer_ids"] == [variant["offer_id"]] and variant["suppression_reason"] == FOLD_REASON
+    assert sibling["suppressed_at"] is None  # SG still has the page
+    assert retired["left"] == {"sibling_replacement_not_live": [sibling["offer_id"]]}
+    sg_live_at_page = [o for o in store.live(SG_SIBLINGS) if o["source_ref"] == variant["source_ref"]]
+    assert len(sg_live_at_page) == 1
+
+
+def test_an_offer_naming_no_replacement_is_never_retired():
+    """Fail closed: `requires=[]` can not come from a plan, and must not retire an offer with nothing behind it."""
+    import asyncio
+    from services.catalog_enrichment_agent import apply as apply_mod
+
+    store = Store([{"offer_id": "o-1", "product_key": "pk", "sku_key": "pk::canonical",
+                    "source_ref": f"https://{HOST}/products/x", "source_system": ingestion.AGENT_VERSION,
+                    "source_domain": HOST, "list_price": 9.0, "suppressed_at": None, "suppression_reason": None},
+                   {"offer_id": "o-2", "product_key": "pk", "sku_key": "pk::v::2",
+                    "source_ref": f"https://{HOST}/products/x", "source_system": ingestion.AGENT_VERSION,
+                    "source_domain": HOST, "list_price": 9.0, "suppressed_at": None, "suppression_reason": None}])
+    done = asyncio.run(apply_mod._retire_offers(store, {
+        "reason": FOLD_REASON, "source_systems": [ingestion.AGENT_VERSION], "sibling_source_systems": [SG_SIBLINGS],
+        "offers": [{"offer_id": "o-1", "requires": [], "siblings": []}]}, landed=set()))
+    assert (done["offer_ids"], done["left"]) == ([], {"no_replacement": ["o-1"]})
+    assert store.offers[0]["suppressed_at"] is None and store.queries == []  # refused before any statement
+    assert asyncio.run(apply_mod._retire_one(
+        store, offer_id="o-1", systems=[ingestion.AGENT_VERSION], requires=[], requires_any=[], reason=FOLD_REASON,
+        meta="{}", keep_last_live=False, retire_ids=["o-1"])) == "no_replacement"
+    assert store.offers[0]["suppressed_at"] is None
+    assert apply_mod.RETIRE_OFFER_SQL not in store.queries  # the write is never even attempted
+
+
+async def test_a_revival_accept_covers_only_the_set_it_was_given_for(env, monkeypatch):  # noqa: F811
+    store = Store()
+    await _plain(env, monkeypatch, priced_line(), store)
+    planned = [o["offer_id"] for o in env.applied[-1]["offers"]]
+    rows = {o["offer_id"]: o for o in store.offers}
+    rows[planned[0]].update(suppressed_at="2026-10-13T00:00:00Z", suppression_reason=FOLD_REASON)
+    await _plain(env, monkeypatch, priced_line(), store)
+    key = next(f["key"] for f in _last_run(env)["flags"] if f["rule"] == "fold_superseded_revival")
+    rows[planned[1]].update(suppressed_at="2026-10-13T00:00:00Z", suppression_reason=FOLD_REASON)
+    out = await _plain(env, monkeypatch, priced_line(), store, accepted_flags=[key])  # the set grew
+    assert out["status"] == "held"
+    other = next(f["key"] for f in _last_run(env)["flags"] if f["rule"] == "fold_superseded_revival")
+    assert other != key and rows[planned[0]]["suppressed_at"] is not None  # nothing revived on the stale accept
+
+
+async def test_a_revival_set_that_moved_under_the_lock_is_held(env, monkeypatch):  # noqa: F811
+    """A fold run retiring more of this cohort's offers between its checks and its write: the accept was for
+    the set the checks saw."""
+    store = Store()
+    await _plain(env, monkeypatch, priced_line(), store)
+    planned = [o["offer_id"] for o in env.applied[-1]["offers"]]
+    rows = {o["offer_id"]: o for o in store.offers}
+    rows[planned[0]].update(suppressed_at="2026-10-13T00:00:00Z", suppression_reason=FOLD_REASON)
+    await _plain(env, monkeypatch, priced_line(), store)
+    key = next(f["key"] for f in _last_run(env)["flags"] if f["rule"] == "fold_superseded_revival")
+
+    class Moving(Store):
+        reads = 0
+
+        async def fetch_all(self, query, values=None):
+            if query is pipeline.FOLD_SUPERSEDED_PLANNED_SQL:
+                Moving.reads += 1
+                if Moving.reads == 2:  # under the lock: another offer was retired meanwhile
+                    rows[planned[1]].update(suppressed_at="2026-10-13T00:00:00Z", suppression_reason=FOLD_REASON)
+            return await super().fetch_all(query, values)
+    moving = Moving(store.offers)
+    moving.offers = store.offers
+    out = await _plain(env, monkeypatch, priced_line(), moving, accepted_flags=[key])
+    assert (out["status"], out["outcome"]) == ("held", "fold_revival_changed")
+    assert rows[planned[0]]["suppression_reason"] == FOLD_REASON  # nothing written
+
+
+async def test_the_cohort_base_is_the_cohorts_own_products(env, monkeypatch):  # noqa: F811
+    """A row of another product at a listing the plan writes is read (a reviewer's duplicate) but is never this
+    cohort's to retire, so it does not raise the share this cohort may retire unreviewed."""
+    store = Store()
+    await _crawl(env, monkeypatch, priced_line(), store)
+    own = len(store.live())
+    store.offers.append({"offer_id": "offer:catalog_enrichment_agent_v1:foreign-base", "product_key": "ext:other-row",
+                         "sku_key": "ext:other-row::canonical", "source_ref": f"https://{HOST}/products/top-gloss",
+                         "source_system": ingestion.AGENT_VERSION, "source_domain": HOST, "list_price": 15.0,
+                         "suppressed_at": None, "suppression_reason": None})
+    await _crawl(env, monkeypatch, priced_line(), store)
+    assert _last_run(env)["checks"]["shade_fold"]["offer_preview"]["cohort_live_offers"] == own

@@ -465,8 +465,9 @@ async def test_the_fold_retire_and_its_revival_run_on_postgres(db):
                      " WHERE offer_id = :o", {"o": other_reason})
     before = await db.fetch_val("SELECT updated_at FROM catalog_offers WHERE offer_id = :o", {"o": retired})
     async with db.transaction():
-        done = await apply_mod._retire_offers(db, _spec([{"offer_id": i} for i in (retired, other_lane, other_reason)]),
-                                              landed=set())
+        done = await apply_mod._retire_offers(db, _spec([{"offer_id": i, "requires": [untouched]}
+                                                         for i in (retired, other_lane, other_reason)]),
+                                              landed={untouched})
     assert done["offer_ids"] == [retired]  # not the other lane's, not the one already suppressed for its own reason
     assert done["left"] == {"not_live": [other_lane, other_reason]}
     assert await _offer_state(db, retired) == (True, "fold_superseded", 45.0)
@@ -500,9 +501,11 @@ async def test_the_retire_never_runs_ahead_of_its_replacement_on_postgres(db):
     async with db.transaction():
         done = await apply_mod._retire_offers(db, _spec([
             {"offer_id": PREFIX + "n-stale", "requires": [PREFIX + "n-repl"]},           # replacement never landed
-            {"offer_id": PREFIX + "n-stale2", "requires": []},                            # (no such row)
+            {"offer_id": PREFIX + "n-stale2", "requires": [PREFIX + "n-supp"]},           # (no such row)
+            {"offer_id": PREFIX + "n-repl", "requires": []},                              # names no replacement
         ]), landed={PREFIX + "n-supp"})
-        assert done["left"] == {"replacement_not_written": [PREFIX + "n-stale"], "not_live": [PREFIX + "n-stale2"]}
+        assert done["left"] == {"replacement_not_written": [PREFIX + "n-stale"], "not_live": [PREFIX + "n-stale2"],
+                                "no_replacement": [PREFIX + "n-repl"]}
         done = await apply_mod._retire_offers(db, _spec([
             {"offer_id": PREFIX + "n-stale", "requires": [PREFIX + "n-supp"]},            # landed, but suppressed
             {"offer_id": PREFIX + "n-lone", "why": "duplicate_at_listing", "requires": [PREFIX + "n-q-repl"]},
@@ -531,9 +534,9 @@ async def test_an_alias_retires_its_sibling_only_behind_the_replacements_own_on_
     async with db.transaction():
         done = await apply_mod._retire_offers(db, _spec([
             {"offer_id": PREFIX + "a-www", "why": "canonical_moved", "requires": [PREFIX + "a-apex"],
-             "siblings": [{"offer_id": sib("a-www"), "requires": [sib("a-apex")]}]},
+             "siblings": [{"offer_id": sib("a-www"), "requires_any": [sib("a-apex")]}]},
             {"offer_id": PREFIX + "a-www2", "why": "canonical_moved", "requires": [PREFIX + "a-apex2"],
-             "siblings": [{"offer_id": sib("a-www2"), "requires": [sib("a-apex2")]}]},
+             "siblings": [{"offer_id": sib("a-www2"), "requires_any": [sib("a-apex2")]}]},
         ]), landed={PREFIX + "a-apex", PREFIX + "a-apex2"})
     assert done["offer_ids"] == [PREFIX + "a-www", PREFIX + "a-www2"]
     assert done["sibling_offer_ids"] == [sib("a-www")]
@@ -556,7 +559,8 @@ async def test_a_retired_sibling_comes_back_with_its_base_on_postgres(db):
     sib, sib2 = markets.sibling_offer_id(PREFIX + "sib-base", "SG"), markets.sibling_offer_id(PREFIX + "sib-base2", "SG")
     async with db.transaction():
         done = await apply_mod._retire_offers(db, _spec([
-            {"offer_id": PREFIX + "sib-base", "siblings": [{"offer_id": sib, "requires": []}]}]), landed=set())
+            {"offer_id": PREFIX + "sib-base", "requires": [PREFIX + "sib-base2"],
+             "siblings": [{"offer_id": sib, "requires_any": [sib2]}]}]), landed={PREFIX + "sib-base2"})
     assert (done["offer_ids"], done["sibling_offer_ids"]) == ([PREFIX + "sib-base"], [sib])
     await db.execute("UPDATE catalog_offers SET suppressed_at = NOW(), suppression_reason = 'catalog_destination_dead'"
                      " WHERE offer_id = :o", {"o": sib2})
@@ -613,10 +617,12 @@ async def test_a_run_s_fold_retire_reverts_on_postgres(db):
     for oid in ("v-mine", "v-mine2", "v-other-run", "v-keep"):
         await _offer(db, PREFIX + oid, key, currency="USD", market="US")
     async with db.transaction():
-        await apply_mod._retire_offers(db, _spec([{"offer_id": PREFIX + "v-mine"}, {"offer_id": PREFIX + "v-mine2"}],
-                                                 run_id="rir_revert_a"), landed=set())
-        await apply_mod._retire_offers(db, _spec([{"offer_id": PREFIX + "v-other-run"}], run_id="rir_revert_b"),
-                                       landed=set())
+        keep = [PREFIX + "v-keep"]
+        await apply_mod._retire_offers(db, _spec([{"offer_id": PREFIX + "v-mine", "requires": keep},
+                                                  {"offer_id": PREFIX + "v-mine2", "requires": keep}],
+                                                 run_id="rir_revert_a"), landed=set(keep))
+        await apply_mod._retire_offers(db, _spec([{"offer_id": PREFIX + "v-other-run", "requires": keep}],
+                                                 run_id="rir_revert_b"), landed=set(keep))
     # v-mine2 was suppressed again since, for another lane's reason: it is that lane's now
     await db.execute("UPDATE catalog_offers SET suppression_reason = 'catalog_destination_dead' WHERE offer_id = :o",
                      {"o": PREFIX + "v-mine2"})
@@ -632,3 +638,49 @@ async def test_a_run_s_fold_retire_reverts_on_postgres(db):
                               {"o": PREFIX + "v-mine"}) is False
     with pytest.raises(ValueError):
         await revert_fold_retire("  ", db=db)
+
+
+
+async def test_an_offer_naming_no_replacement_is_never_retired_on_postgres(db):
+    """Fail closed, in the statement itself: RETIRE_OFFER_SQL with no `requires` and no `requires_any` writes
+    nothing -- even called directly, past _retire_offers' own refusal."""
+    from services.catalog_enrichment_agent import apply as apply_mod
+
+    key = RETAILER_PREFIX + "fold-empty"
+    await _product(db, key, content_key=PREFIX + "ck-fold-empty")
+    await _offer(db, PREFIX + "e-1", key, currency="USD", market="US")
+    await _offer(db, PREFIX + "e-2", key, currency="USD", market="US")
+    rows = await db.fetch_all(apply_mod.RETIRE_OFFER_SQL, {
+        "offer_id": PREFIX + "e-1", "source_systems": ["catalog_enrichment_agent_v1"], "requires": [],
+        "requires_any": [], "retire_ids": [PREFIX + "e-1"], "reason": "fold_superseded", "meta": "{}",
+        "keep_last_live": True})
+    assert rows == []
+    async with db.transaction():
+        done = await apply_mod._retire_offers(db, _spec([{"offer_id": PREFIX + "e-1"}]), landed=set())
+    assert (done["offer_ids"], done["left"]) == ([], {"no_replacement": [PREFIX + "e-1"]})
+    assert await _offer_state(db, PREFIX + "e-1") == (False, None, 45.0)
+
+
+async def test_a_sibling_needs_one_live_sibling_among_its_bases_replacements_on_postgres(db):
+    """`requires_any`: one live sibling among the replacements is enough; none (or none live) keeps it."""
+    from services.catalog_enrichment_agent import apply as apply_mod
+    from services.retailer_ingest import shopify_markets as markets
+
+    key = RETAILER_PREFIX + "fold-any"
+    await _product(db, key, content_key=PREFIX + "ck-fold-any")
+    for oid in ("y-old", "y-r1", "y-r2", "y-old2"):
+        await _offer(db, PREFIX + oid, key, currency="USD", market="US")
+    for base in ("y-old", "y-r2", "y-old2"):  # y-r1 never had its SG capture
+        await markets.write_siblings([_planned(PREFIX + base, key, market="SG")], db=db)
+
+    def sib(base):
+        return markets.sibling_offer_id(PREFIX + base, "SG")
+    async with db.transaction():
+        done = await apply_mod._retire_offers(db, _spec([
+            {"offer_id": PREFIX + "y-old", "why": "duplicate_at_listing", "requires": [PREFIX + "y-r1", PREFIX + "y-r2"],
+             "siblings": [{"offer_id": sib("y-old"), "requires_any": [sib("y-r1"), sib("y-r2")]}]},
+            {"offer_id": PREFIX + "y-old2", "requires": [PREFIX + "y-r1"],
+             "siblings": [{"offer_id": sib("y-old2"), "requires_any": [sib("y-r1")]}]},
+        ]), landed={PREFIX + "y-r1", PREFIX + "y-r2"})
+    assert done["sibling_offer_ids"] == [sib("y-old")]
+    assert done["left"] == {"sibling_replacement_not_live": [sib("y-old2")]}

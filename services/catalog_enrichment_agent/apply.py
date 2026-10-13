@@ -394,12 +394,14 @@ OFFER_FOLD_SUPERSEDED_REASON = "fold_superseded"
 
 #: The retire of ONE stale offer, in the apply's own transaction, after its upserts. It takes the offer only when
 #: (1) it is still live and of a named source_system -- a row another lane suppressed keeps that lane's reason;
-#: (2) every offer that replaces it (`requires`: the product's own canonical, or the offers at its listing) is
-#: LIVE now, after this transaction's upserts -- an upsert that failed, an offer the guard dropped, or a planned
-#: row another lane keeps suppressed never leaves the page without its replacement; and (3) with
-#: keep_last_live, the product keeps at least one live offer of these source_systems outside this apply's
-#: retire set -- a backstop: the retire never takes a product's last live lane offer. `updated_at` is left as
-#: it is: readers order by it, and a retire is not an update of the offer.
+#: (2) it names what replaces it -- FAIL CLOSED: an offer with no `requires` and no `requires_any` is never
+#: retired -- and those replacements are LIVE now, after this transaction's upserts: EVERY offer in `requires`
+#: (a base offer: the product's own canonical, or the offers at its listing) and AT LEAST ONE in `requires_any`
+#: (a Markets sibling: its base's replacements' own siblings for that market). An upsert that failed, an offer the
+#: guard dropped, or a planned row another lane keeps suppressed never leaves a page without its replacement;
+#: and (3) with keep_last_live, the product keeps at least one live offer of these source_systems outside this
+#: apply's retire set -- a backstop: the retire never takes a product's last live lane offer. `updated_at` is
+#: left as it is: readers order by it, and a retire is not an update of the offer.
 RETIRE_OFFER_SQL = """
 UPDATE catalog_offers AS x
    SET suppressed_at = NOW(),
@@ -408,8 +410,11 @@ UPDATE catalog_offers AS x
  WHERE x.offer_id = CAST(:offer_id AS text)
    AND x.source_system = ANY(:source_systems)
    AND x.suppressed_at IS NULL
+   AND cardinality(CAST(:requires AS text[])) + cardinality(CAST(:requires_any AS text[])) > 0
    AND (SELECT count(*) FROM catalog_offers r WHERE r.offer_id = ANY(:requires) AND r.suppressed_at IS NULL)
        = cardinality(CAST(:requires AS text[]))
+   AND (cardinality(CAST(:requires_any AS text[])) = 0 OR EXISTS (
+        SELECT 1 FROM catalog_offers a WHERE a.offer_id = ANY(:requires_any) AND a.suppressed_at IS NULL))
    AND (NOT CAST(:keep_last_live AS boolean) OR EXISTS (
         SELECT 1 FROM catalog_offers o
          WHERE o.product_key = x.product_key
@@ -423,7 +428,10 @@ RETURNING x.offer_id
 RETIRE_DECLINED_SQL = """
 SELECT (x.suppressed_at IS NULL) AS live,
        ((SELECT count(*) FROM catalog_offers r WHERE r.offer_id = ANY(:requires) AND r.suppressed_at IS NULL)
-        = cardinality(CAST(:requires AS text[]))) AS replacement_live,
+        = cardinality(CAST(:requires AS text[]))
+        AND (cardinality(CAST(:requires_any AS text[])) = 0 OR EXISTS (
+             SELECT 1 FROM catalog_offers a WHERE a.offer_id = ANY(:requires_any) AND a.suppressed_at IS NULL))
+       ) AS replacement_live,
        EXISTS (SELECT 1 FROM catalog_offers o
                 WHERE o.product_key = x.product_key
                   AND o.source_system = ANY(:source_systems)
@@ -435,16 +443,22 @@ SELECT (x.suppressed_at IS NULL) AS live,
 """
 
 
-async def _retire_one(database: Any, *, offer_id: str, systems: List[str], requires: List[str], reason: str,
-                      meta: str, keep_last_live: bool, retire_ids: List[str]) -> Optional[str]:
-    """Retire one offer under RETIRE_OFFER_SQL: None when retired, else why it was left."""
-    values = {"offer_id": offer_id, "source_systems": systems, "requires": requires, "retire_ids": retire_ids}
-    if await database.fetch_all(RETIRE_OFFER_SQL, {**values, "reason": reason, "meta": meta,
-                                                  "keep_last_live": keep_last_live}):
-        return None
+async def _retire_one(database: Any, *, offer_id: str, systems: List[str], requires: List[str],
+                      requires_any: List[str], reason: str, meta: str, keep_last_live: bool,
+                      retire_ids: List[str]) -> Optional[str]:
+    """Retire one offer under RETIRE_OFFER_SQL: None when retired, else why it was left. An offer naming no
+    replacement at all is never written to (no_replacement) -- the statement refuses it as well."""
+    values = {"offer_id": offer_id, "source_systems": systems, "requires": requires, "requires_any": requires_any,
+              "retire_ids": retire_ids}
+    if requires or requires_any:
+        if await database.fetch_all(RETIRE_OFFER_SQL, {**values, "reason": reason, "meta": meta,
+                                                      "keep_last_live": keep_last_live}):
+            return None
     row = await database.fetch_one(RETIRE_DECLINED_SQL, values)
     if row is None or not row["live"]:
         return "not_live"
+    if not (requires or requires_any):
+        return "no_replacement"
     if not row["replacement_live"]:
         return "replacement_not_live"
     return "kept_last_live"
@@ -454,11 +468,13 @@ async def _retire_offers(database: Any, retire: Dict[str, Any], *, landed: Any =
     """Retire the stale offers a caller classified, per offer, only behind their replacements.
 
     `retire`: reason, meta, source_systems, sibling_source_systems, and `offers` -- each {offer_id, requires: the
-    offer_ids that replace it, siblings: [{offer_id, requires}]}. `landed`: the offer_ids this transaction's
-    upserts wrote. An offer whose replacement did not land here is left (replacement_not_written), so one failed
-    row never retires the offer it was meant to replace, and never stops the rest of the host either. A sibling
-    is retired only behind its retired base (and its own `requires`). Returns what was retired and, by reason,
-    what was left."""
+    offer_ids that replace it, siblings: [{offer_id, requires_any}]}. `landed`: the offer_ids this transaction's
+    upserts wrote. An offer that names no replacement is left (no_replacement: fail closed). An offer whose
+    replacement did not land here is left (replacement_not_written), so one failed row never retires the offer it
+    was meant to replace, and never stops the rest of the host either. A sibling is retired only behind its
+    retired base AND only when one of its `requires_any` (its base's replacements' own siblings for that market)
+    is live: otherwise the market keeps the page it still sells (sibling_replacement_not_live). Returns what was
+    retired and, by reason, what was left."""
     landed = set(landed or ())
     reason, systems = retire["reason"], sorted(set(retire.get("source_systems") or []))
     sibling_systems = sorted(set(retire.get("sibling_source_systems") or []))
@@ -472,19 +488,23 @@ async def _retire_offers(database: Any, retire: Dict[str, Any], *, landed: Any =
 
     for o in offers:
         offer_id, requires = str(o["offer_id"]), sorted(set(str(r) for r in o.get("requires") or ()))
+        if not requires:
+            out["left"].setdefault("no_replacement", []).append(offer_id)
+            continue
         if not set(requires) <= landed:
             out["left"].setdefault("replacement_not_written", []).append(offer_id)
             continue
-        why = await _retire_one(database, offer_id=offer_id, systems=systems, requires=requires, reason=reason,
-                                meta=stamp({"why": o.get("why")}), keep_last_live=True, retire_ids=retire_ids)
+        why = await _retire_one(database, offer_id=offer_id, systems=systems, requires=requires, requires_any=[],
+                                reason=reason, meta=stamp({"why": o.get("why")}), keep_last_live=True,
+                                retire_ids=retire_ids)
         if why:
             out["left"].setdefault(why, []).append(offer_id)
             continue
         out["offer_ids"].append(offer_id)
         for sib in o.get("siblings") or ():
-            sib_requires = sorted(set(str(r) for r in sib.get("requires") or ()))
+            sib_requires_any = sorted(set(str(r) for r in sib.get("requires_any") or ()))
             sib_why = await _retire_one(database, offer_id=str(sib["offer_id"]), systems=sibling_systems,
-                                        requires=sib_requires, reason=reason,
+                                        requires=[], requires_any=sib_requires_any, reason=reason,
                                         meta=stamp({"why": "sibling", "base_offer_id": offer_id}),
                                         keep_last_live=False, retire_ids=retire_ids)
             if sib_why is None:

@@ -933,7 +933,7 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     if o.get("fold_shades"):
         flags.extend(await _fold_offer_checks(job, plan, carry, checks))
     else:
-        flags.extend(await _fold_revival_checks(plan, checks))
+        flags.extend(await _fold_revival_checks(plan, checks, carry))
     inspection = inspect_primary_plan(plan)
     checks["plan"] = {k: inspection.get(k) for k in ("status", "reasons", "planned", "unresolved_category_count")}
     if inspection.get("reasons"):
@@ -989,6 +989,7 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     return {"plan": plan, "inspection": inspection, "checks": checks, "flags": flags, "blocking": blocking,
             "fold_supersede_entries": carry.get("fold_supersede_entries") or [],
             "fold_offer_expected": carry.get("fold_offer_expected") or {},
+            "fold_revival": carry.get("fold_revival"),
             "fold_stale_signature": carry.get("fold_stale_signature") or []}
 
 
@@ -1237,8 +1238,8 @@ def _replacements(why: str, row: Dict[str, Any], expected: Dict[str, Any]) -> Li
 
 async def _stale_fold_offers(expected: Dict[str, Any], read: Any = None) -> tuple:
     """([stale offers, each with its why, action, alias and replacements], cohort live lane offers, None), or
-    (None, None, why it could not be read). The cohort's live offers are the rows read (its products, and the
-    listings it writes) that are live, proven aliases left out."""
+    (None, None, why it could not be read). The cohort's live offers are the rows read that belong to the plan's
+    own products and are live, proven aliases left out."""
     from services.catalog_enrichment_agent.ingestion import AGENT_VERSION
 
     if not expected.get("own_url"):
@@ -1273,7 +1274,11 @@ async def _stale_fold_offers(expected: Dict[str, Any], read: Any = None) -> tupl
                                 and _is_www_twin(row.get("source_ref"), (expected.get("canonical_refs") or {}).get(key))
                                 and _replacement_is_live(canonical_id, rows_by_id))})
     alias_ids = {str(r["offer_id"]) for r in stale if r["alias"]}
-    cohort_live = sum(1 for r in rows if r.get("suppressed_at") is None and str(r.get("offer_id")) not in alias_ids)
+    # The base is THIS cohort's: offers of the plan's own products. A row of another product at a listing the plan
+    # writes is read (it is a duplicate the reviewer decides on) but never retired by this cohort, so it must not
+    # raise the share this cohort may retire unreviewed.
+    cohort_live = sum(1 for r in rows if r.get("suppressed_at") is None and str(r.get("offer_id")) not in alias_ids
+                      and str(r.get("product_key")) in expected["own_url"])
     return sorted(stale, key=lambda r: str(r["offer_id"])), cohort_live, None
 
 
@@ -1288,11 +1293,14 @@ def _fold_retire_spec(stale: List[Dict[str, Any]], job: Dict[str, Any],
 
     Each `retire` offer of this lane with the planned offers it requires live after the upserts, and its
     shopify_markets siblings. A sibling copies its base offer's page and serves its market's price for it with no
-    further tie to the base, so a retired base would leave it selling a page the base no longer sells: it is
-    retired with its base and comes back with it (shopify_markets' SIBLING_UPSERT_SQL revives it once the base is
-    live again). For an ALIAS the page stays sold by the replacement canonical, so the alias's sibling is retired
-    only when that replacement already has its own live sibling for the market -- else the market would lose the
-    product until the next capture. The run id is stamped for revert (fold_retire_revert)."""
+    further tie to the base: it is retired with its base and comes back with it (shopify_markets'
+    SIBLING_UPSERT_SQL revives it once the base is live again) -- but, for EVERY retire, only when one of its
+    base's replacements already has its own live sibling for that market (`requires_any`). Otherwise the market
+    would lose a page the store still sells (a refused child's page, now its own row's) until a capture that is
+    queued by hand: the sibling stays live and is reported (sibling_replacement_not_live). The same rule means a
+    canonical that moved off a page now sold out keeps that market pointing at the old page until the new
+    canonical's capture lands -- accepted: the market keeps the product rather than losing it. The run id is
+    stamped for revert (fold_retire_revert)."""
     from services.catalog_enrichment_agent.apply import OFFER_FOLD_SUPERSEDED_REASON
     from services.catalog_enrichment_agent.ingestion import AGENT_VERSION
     from services.retailer_ingest.shopify_markets import CAPTURE_MARKETS, sibling_offer_id, source_system_for
@@ -1303,7 +1311,7 @@ def _fold_retire_spec(stale: List[Dict[str, Any]], job: Dict[str, Any],
             continue
         offer_id = str(r["offer_id"])
         siblings = [{"offer_id": sibling_offer_id(offer_id, m),
-                     "requires": ([sibling_offer_id(str(r["replacement_canonical"]), m)] if r.get("alias") else [])}
+                     "requires_any": sorted(sibling_offer_id(str(rep), m) for rep in r.get("replacements") or ())}
                     for m in CAPTURE_MARKETS]
         offers.append({"offer_id": offer_id, "why": r["why"], "alias": bool(r.get("alias")),
                        "requires": list(r.get("replacements") or ()), "siblings": siblings})
@@ -1398,11 +1406,14 @@ WHERE offer_id = ANY(:offer_ids)
 """
 
 
-async def _fold_revival_checks(plan: Dict[str, Any], checks: Dict[str, Any]) -> List[Dict[str, Any]]:
+async def _fold_revival_checks(plan: Dict[str, Any], checks: Dict[str, Any],
+                               carry: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """A cohort WITHOUT options.fold_shades whose plan rewrites offers the fold retired would revive them -- the
     fold's next run then retires them again: ping-pong, and two lanes disagreeing about one store. Held for a
     reviewer (fold_superseded_revival:<digest of the offers>, acceptable), naming the offers. An unread catalog
-    holds nothing here: the plan's own listing read already holds an unread catalog (current_listings_unread)."""
+    holds nothing here: the plan's own listing read already holds an unread catalog (current_listings_unread).
+    `carry["fold_revival"]`: the set the checks saw, for the apply to read again under the write lock
+    (_recheck_fold_revival) -- an accept covers that set only."""
     from services.catalog_enrichment_agent.apply import OFFER_FOLD_SUPERSEDED_REASON
 
     ids = sorted({str(o.get("offer_id")) for o in plan.get("offers") or []})
@@ -1413,9 +1424,11 @@ async def _fold_revival_checks(plan: Dict[str, Any], checks: Dict[str, Any]) -> 
     if rows is None:
         checks["fold_revival"] = {"status": "unchecked", "reason": unread}
         return []
+    revived = sorted(str(r["offer_id"]) for r in rows)
+    if carry is not None:
+        carry["fold_revival"] = {"offer_ids": ids, "revived": revived}
     if not rows:
         return []
-    revived = sorted(str(r["offer_id"]) for r in rows)
     checks["fold_revival"] = {"status": "would_revive", "offers": [dict(r) for r in rows][:SHADE_FOLD_PREVIEW_CAP]}
     return [{"key": f"fold_superseded_revival:{_fold_retire_digest(revived)}", "rule": "fold_superseded_revival",
              "severity": detectors.BLOCK, "acceptable": True,
@@ -1541,6 +1554,29 @@ async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str
                        f"supersede_preview for every row): the job stays held. A host never folded keeps its "
                        f"existing cohort without fold_shades; never queue one without fold_shades for a host "
                        f"that WAS folded -- it would re-emit every folded listing beside the base"}]
+
+
+async def _recheck_fold_revival(job: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """A cohort WITHOUT the fold, under the write lock: the offers its plan would revive (`fold_superseded`) must be
+    exactly the set its checks saw -- and a reviewer accepted, if any. A fold run that retired more of them
+    meanwhile is held (fold_revival_changed), nothing written. Unread here holds nothing, as in the checks."""
+    from services.catalog_enrichment_agent.apply import OFFER_FOLD_SUPERSEDED_REASON
+
+    seen = result.get("fold_revival")
+    if not seen or not seen.get("offer_ids"):
+        return
+    rows, unread = await _catalog_read(FOLD_SUPERSEDED_PLANNED_SQL,
+                                       {"offer_ids": seen["offer_ids"], "reason": OFFER_FOLD_SUPERSEDED_REASON})
+    if rows is None:
+        result["checks"]["fold_revival_recheck"] = {"status": "unchecked", "reason": unread}
+        return
+    now = sorted(str(r["offer_id"]) for r in rows)
+    if now != seen["revived"]:
+        result["checks"]["fold_revival_recheck"] = {"status": "changed", "revived": now[:SHADE_FOLD_PREVIEW_CAP]}
+        raise _Stop("fold_revival_changed", "held",
+                    f"the offers this cohort (without fold_shades) would revive changed between the checks and the "
+                    f"write ({len(seen['revived'])} -> {len(now)}); nothing written -- see checks.fold_revival_recheck",
+                    checks=result["checks"])
 
 
 async def _recheck_superseded_rows(job: Dict[str, Any], result: Dict[str, Any],
@@ -1926,6 +1962,7 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
         async with ledger.catalog_write_lock(wait_s=wait_s, poll_s=WRITE_LOCK_POLL_S) as waited:
             timings["write_lock_wait_s"] = round(waited, 3)
             await _recheck_superseded_rows(job, result, run_id)  # options.fold_shades only; holds, never writes
+            await _recheck_fold_revival(job, result)  # cohorts without the fold only; holds, never writes
             # Durable BEFORE the first catalog write: an execution killed from here on is "may be
             # partial"; one killed before it (crawl, checks, lock wait) is retried, nothing written.
             await ledger.mark_write_started(run_id, db=db)
