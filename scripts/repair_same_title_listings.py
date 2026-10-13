@@ -26,6 +26,16 @@ A row/host is SKIPPED whole and reported when its keeper would be left with no l
 last live offer away from a row), or when even its keeper is gone or sold out (every listing unavailable: nothing to
 align a row to -- services/external_seed_destination_liveness owns dead pages).
 
+HOST ALIASES (`kind: host_alias`, reason `listing_host_alias`). One listing spelled two ways -- `www.<host>/products/x`
+and `<host>/products/x` -- is ONE listing to content_listing, so the rule above never sees it; but offer_id hashes the
+URL as spelled, so a store crawled once under each spelling kept two live offers of the same page on one shelf
+(prod 2026-10-13: one brand store; fixed going forward by ingestion.respell_listing_host). Per row and
+host with ONE listing, the row's own spelling (its canonical_url, the one the ingest now writes) is kept: every LIVE
+offer at the other spelling whose (sku_key, channel, market) shelf ALSO holds a live offer at the row's spelling is
+suppressed. An alias offer alone on its shelf is never suppressed (`alias_kept_alone`); a row whose canonical_url
+names another listing or host is left to the rule above. Seeds are not touched (a seed id hashes the URL too, but
+both seeds point at the same page and refresh the same offers).
+
 Nothing is deleted. The manifest (every prior value) is STORED in identity_resolution_events before the write; the
 write is one transaction, and each statement is guarded on the exact value read at plan time -- any drift aborts it
 all. `updated_at` is not bumped (the reconciler's keeper election and ORDER BY updated_at readers must not reorder
@@ -33,6 +43,7 @@ over a repair); every touched content_key's served view and eligibility are rebu
 
   Dry run (default; writes nothing):
     python -m scripts.repair_same_title_listings [--host cocodor.com ...] [--product-key ext:... ...] [--market US]
+                                                 [--only-host-alias]
   Apply (Peng's go; AFTER the drain is re-imaged onto #2463 -- the old drain image re-points rows and re-activates
   the left-out pages' seeds on its next run of a store, undoing this; the new one never moves a row off its listing):
     ... --apply
@@ -61,6 +72,7 @@ from services.external_seed_destination_liveness import CONFIRMED_DEAD_VERDICTS 
 
 SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
 REASON = "same_key_other_listing"
+ALIAS_REASON = "listing_host_alias"
 DUPLICATE_REASON = "duplicate_offer"  # scripts/reconcile_catalog_offers.REASON_DUPLICATE
 
 ROWS_SQL = """
@@ -201,6 +213,55 @@ def _listing_of_seed(s: Mapping[str, Any]) -> Optional[Tuple[str, str]]:
     return content_listing(s.get("canonical_url") or s.get("destination_url"))
 
 
+def _spelled_host(o: Mapping[str, Any]) -> str:
+    """The host an offer points at, as spelled (`www.` kept): the URL its offer_id hashed."""
+    from urllib.parse import urlsplit
+
+    try:
+        return (urlsplit(str(o.get("source_ref") or o.get("destination_url") or o.get("canonical_url") or ""))
+                .hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _shelf(o: Mapping[str, Any]) -> Tuple[Any, Any, Any]:
+    return (o["sku_key"], o["channel"], o.get("market"))
+
+
+def plan_alias(row: Mapping[str, Any], host: str, listing: str, offers: List[Mapping[str, Any]], *,
+               market: str) -> Optional[Dict[str, Any]]:
+    """The host_alias entry for a row's one listing on `host`, or None when every live offer of it is spelled as
+    the row is (or the row names another listing or host)."""
+    from urllib.parse import urlsplit
+
+    current = content_listing(row.get("canonical_url"))
+    if current != (host, listing):
+        return None
+    try:
+        spelling = (urlsplit(str(row.get("canonical_url") or "").strip()).hostname or "").lower()
+    except ValueError:
+        return None
+    live = [o for o in offers if o.get("suppressed_at") is None and _in_market(o, market)]
+    kept_shelves = {_shelf(o) for o in live if _spelled_host(o) == spelling}
+    aliases = [o for o in live if _spelled_host(o) != spelling]
+    if not spelling or not aliases:
+        return None
+    suppress = [o for o in aliases if _shelf(o) in kept_shelves]
+    return {
+        "product_key": row["product_key"], "content_key": row.get("content_key"), "host": host,
+        "kind": "host_alias", "reason": ALIAS_REASON,
+        "keeper": spelling, "keeper_evidence": {"spelling": spelling, "listing": listing},
+        "left_out": sorted({_spelled_host(o) for o in aliases}),
+        "suppress": [o["offer_id"] for o in suppress],
+        "suppress_prior_metadata": {o["offer_id"]: (_json(o["suppression_metadata"])
+                                                    if o.get("suppression_metadata") is not None else None)
+                                    for o in suppress},
+        "alias_kept_alone": [o["offer_id"] for o in aliases if _shelf(o) not in kept_shelves],
+        "deactivate_prior_updated_at": {}, "other_market_left": 0,
+        "restore": [], "deactivate": [], "repoint": None,
+        "skipped": None if suppress else "alias_alone_on_its_shelf"}
+
+
 def _in_market(item: Mapping[str, Any], market: str) -> bool:
     """An offer or seed of `market` (a row with no market is the catalog's default, US)."""
     return str(item.get("market") or "US").strip().upper() == market.strip().upper()
@@ -225,6 +286,10 @@ def plan_row(row: Mapping[str, Any], offers: List[Mapping[str, Any]], seeds: Lis
     groups = []
     for host, listings in sorted(by_host.items()):
         if len(listings) < 2:
+            [(listing, found)] = listings.items()
+            alias = plan_alias(row, host, listing, found["offers"], market=market)
+            if alias:
+                groups.append(alias)
             continue
         keeper = elect_listing_keeper(
             [evidence(h, v["offers"], v["seeds"]) for h, v in sorted(listings.items())], market=market,
@@ -292,7 +357,8 @@ def plan_row(row: Mapping[str, Any], offers: List[Mapping[str, Any]], seeds: Lis
     return groups
 
 
-async def plan(db: Any, *, hosts: List[str], keys: List[str], market: str = "US") -> Dict[str, Any]:
+async def plan(db: Any, *, hosts: List[str], keys: List[str], market: str = "US",
+               only_host_alias: bool = False) -> Dict[str, Any]:
     rows = [dict(r) for r in await db.fetch_all(ROWS_SQL, {"source_system": SOURCE_SYSTEM, "keys": keys or None})]
     all_keys = [r["product_key"] for r in rows]
     offers: Dict[str, list] = {}
@@ -307,7 +373,7 @@ async def plan(db: Any, *, hosts: List[str], keys: List[str], market: str = "US"
     groups = []
     for row in rows:
         for g in plan_row(row, offers.get(row["product_key"], []), seeds.get(row["product_key"], []), market=market):
-            if not wanted or g["host"] in wanted:
+            if (not wanted or g["host"] in wanted) and (not only_host_alias or g.get("kind") == "host_alias"):
                 groups.append(g)
     return {"market": market, "hosts": sorted(wanted), "rows_read": len(rows), "groups": groups}
 
@@ -322,6 +388,9 @@ def summary(p: Mapping[str, Any]) -> Dict[str, Any]:
         "offers_to_restore": sum(len(g["restore"]) for g in act),
         "seeds_to_deactivate": sum(len(g["deactivate"]) for g in act),
         "rows_to_repoint": sum(1 for g in act if g["repoint"]),
+        "host_alias_groups": sum(1 for g in act if g.get("kind") == "host_alias"),
+        "host_alias_offers_to_suppress": sum(len(g["suppress"]) for g in act if g.get("kind") == "host_alias"),
+        "host_alias_kept_alone": sum(len(g.get("alias_kept_alone") or []) for g in p["groups"]),
         "listings_left_out": sum(len(g["left_out"]) for g in act),
         "other_market_left": sum(g.get("other_market_left") or 0 for g in p["groups"]),
         # how old the price of each offer that comes back is (review 2): by the day its price was last read
@@ -360,7 +429,8 @@ async def _forward(db: Any, m: Mapping[str, Any]) -> Dict[str, int]:
     for g in m["groups"]:
         if g["suppress"]:
             meta = json.dumps({"same_listing_run": m["run_id"], "same_listing_keeper": g["keeper"]})
-            got = await db.fetch_all(SUPPRESS_SQL, {"ids": g["suppress"], "reason": REASON, "metadata": meta})
+            got = await db.fetch_all(SUPPRESS_SQL, {"ids": g["suppress"], "reason": g.get("reason") or REASON,
+                                                    "metadata": meta})
             _expect(got, g["suppress"], "live offers to suppress")
             done["suppressed"] += len(got)
     for g in m["groups"]:
@@ -413,7 +483,7 @@ async def _reverse(db: Any, m: Mapping[str, Any]) -> Dict[str, int]:
         for offer_id in g["suppress"]:
             prior = g["suppress_prior_metadata"].get(offer_id)
             got = await db.fetch_all(UNSUPPRESS_SQL, {
-                "offer_id": offer_id, "reason": REASON, "run_id": m["run_id"],
+                "offer_id": offer_id, "reason": g.get("reason") or REASON, "run_id": m["run_id"],
                 "prior_metadata": None if prior is None else json.dumps(prior)})
             _expect(got, [offer_id], "suppressed offers")
             done["unsuppressed"] += 1
@@ -497,7 +567,8 @@ async def run(args: argparse.Namespace) -> int:
             out = {"refresh": await refresh_after(database, m, source=args.run_id)}
             print("REFRESHED " + json.dumps(out, default=str), flush=True)
         else:
-            p = await plan(database, hosts=args.host, keys=args.product_key, market=args.market)
+            p = await plan(database, hosts=args.host, keys=args.product_key, market=args.market,
+                           only_host_alias=args.only_host_alias)
             print("PLAN " + json.dumps(summary(p), default=str), flush=True)
             if args.apply:
                 out = await apply(database, p)
@@ -515,6 +586,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--host", action="append", default=[])
     p.add_argument("--product-key", dest="product_key", action="append", default=[])
     p.add_argument("--market", default="US")
+    p.add_argument("--only-host-alias", dest="only_host_alias", action="store_true",
+                   help="plan (and apply) the host_alias groups alone")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--run-id", dest="run_id")
     args = p.parse_args(argv)

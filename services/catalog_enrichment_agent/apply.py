@@ -2619,10 +2619,12 @@ _CURRENT_LISTINGS_SQL = """
 
 
 async def current_listings(product_keys: List[str], *, db: Any) -> Dict[str, Any]:
-    """product_key -> the (host, listing) its catalog row names today (ingestion.content_listing of its
-    canonical_url), for ingestion.elect_listing_keeper's tie-break: a re-ingest keeps the listing a row
-    already names -- the one scripts/repair_same_title_listings.py aligned it to -- unless a stronger
-    rule says otherwise. Read-only; keys with no row or no readable URL are absent."""
+    """product_key -> (host, listing, canonical_url): the listing its catalog row names today
+    (ingestion.content_listing of its canonical_url) and that URL as stored. The listing is
+    ingestion.elect_listing_keeper's tie-break: a re-ingest keeps the listing a row already names -- the
+    one scripts/repair_same_title_listings.py aligned it to -- unless a stronger rule says otherwise. The
+    URL's host spelling (`www.` or not) is the one a re-ingest writes (ingestion.respell_listing_host).
+    Read-only; keys with no row or no readable URL are absent."""
     from services.catalog_enrichment_agent.ingestion import content_listing
 
     keys = sorted({str(k) for k in product_keys if k})
@@ -2633,7 +2635,7 @@ async def current_listings(product_keys: List[str], *, db: Any) -> Dict[str, Any
     for row in rows:
         listing = content_listing(row["canonical_url"])
         if listing:
-            out[str(row["product_key"])] = listing
+            out[str(row["product_key"])] = (*listing, str(row["canonical_url"]).strip())
     return out
 
 
