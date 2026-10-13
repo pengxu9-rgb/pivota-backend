@@ -385,16 +385,17 @@ def test_price_evidence_is_the_variants_and_the_offers_only_without_them():
 
 
 class _Catalog:
-    """What apply.current_listings reads: catalog_products.canonical_url by product_key."""
+    """What apply.current_listings reads: catalog_products.canonical_url (and source_domain) by product_key."""
 
     is_connected = True
 
-    def __init__(self, rows):
-        self.rows, self.queries = rows, []
+    def __init__(self, rows, source_domains=None):
+        self.rows, self.queries, self.source_domains = rows, [], dict(source_domains or {})
 
     async def fetch_all(self, query, values=None):
         self.queries.append(query)
-        return [{"product_key": k, "canonical_url": u} for k, u in self.rows.items()
+        return [{"product_key": k, "canonical_url": u, "source_domain": self.source_domains.get(k)}
+                for k, u in self.rows.items()
                 if k in (values or {}).get("product_keys", [])]
 
 

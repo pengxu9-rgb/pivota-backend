@@ -451,7 +451,8 @@ def content_listing(canonical_url: Optional[str]) -> Optional[Tuple[str, str]]:
 _LISTING_URL_FIELDS = ("canonical_url", "destination_url")
 
 
-def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str]) -> Dict[str, Any]:
+def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str],
+                         stored_source_domain: Optional[str] = None) -> Dict[str, Any]:
     """`record` with every listing URL on the host spelling `stored_url` uses, when the two differ by `www.`
     or letter case only; `record` itself (the same object) when nothing differs.
 
@@ -465,8 +466,9 @@ def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str]) -> D
     Only offers' canonical/destination URLs and an extended-fold variant's own_listing_url are re-spelled --
     and, for a retailer record, `pdp.source_domain`: it scopes the `ext:retailer:` row's variant SKU keys
     (derive_variant_sku_key `seller_scope`, hashed as spelled), so a re-spelled URL alone would still re-key every
-    variant SKU and its offer. A subdomain other than `www.`, a port or credentials are never treated as the
-    same host.
+    variant SKU and its offer. It takes the row's own `stored_source_domain` verbatim -- the string those keys
+    hashed -- and the stored URL's host only when the row has none (or names no plain spelling of that host).
+    A subdomain other than `www.`, a port or credentials are never treated as the same host.
 
     The host is written AS STORED (`stored.netloc`), letter case included: the ids hash it as spelled, so a
     lowercased copy of a stored `WWW.Host.example` would re-mint just the same. Hosts are compared ignoring
@@ -504,10 +506,14 @@ def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str]) -> D
                     if isinstance(v, dict) and v.get("own_listing_url") else v for v in pdp["variants"]]
     source_domain = None
     if pdp is not None and pdp.get("source_role") == "retailer" and pdp.get("source_domain"):
-        # Prod 2026-10-13: every `ext:retailer:` row stores source_domain spelled as its canonical_url host.
+        # Prod 2026-10-13: every `ext:retailer:` row stores source_domain spelled as its canonical_url host,
+        # so the URL's host is the fallback; the row's own value is what its variant SKU keys hashed.
+        own = str(stored_source_domain or "").strip()
+        # a port, credentials or a path never equals the bare host: only a plain spelling of it is taken
+        target = own if own and own.lower().removeprefix("www.") == bare else to_netloc
         crawled = str(pdp["source_domain"]).strip()
-        if crawled != to_netloc and crawled.lower().removeprefix("www.") == bare:
-            source_domain = to_netloc
+        if crawled != target and crawled.lower().removeprefix("www.") == bare:
+            source_domain = target
     if (offers == (record.get("offers") or []) and (variants is None or variants == pdp["variants"])
             and source_domain is None):
         return record
@@ -1877,7 +1883,7 @@ def ingest_validated_jsonl(
     market: Optional[str] = None,
     current_listings: Optional[Dict[str, Tuple[str, ...]]] = None,
     allow_moves: Iterable[str] = (),
-    listing_spellings: Optional[Dict[str, str]] = None,
+    listing_spellings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Drive ingest_validated_record across an iterable of records and
     return all five row collections plus skipped_count. Pure — no DB
@@ -1892,7 +1898,8 @@ def ingest_validated_jsonl(
     (respell_listing_host, named in `listing_respellings`), so a re-crawl under the other spelling refreshes the
     row's offers and seeds instead of minting a second set.
 
-    `listing_spellings` (optional): product_key -> the row's canonical_url as stored, for rows whose listing
+    `listing_spellings` (optional): product_key -> the row's canonical_url as stored, or a
+    (canonical_url, source_domain) pair as stored (apply passes the pair), for rows whose listing
     cannot move (apply.plan_with_current_listings passes the `ext:retailer:` rows': their key is the listing
     without `www.`, so the other spelling is the same row and, without this, a second offer and seed set).
     It picks the host spelling exactly like the third element of `current_listings` and NOTHING ELSE: it never
@@ -1952,8 +1959,12 @@ def ingest_validated_jsonl(
             continue
         key = str(result["pdp"].get("product_key") or "")
         named = (current_listings or {}).get(key)
-        stored_url = named[2] if named and len(named) > 2 else (listing_spellings or {}).get(key)
-        respelled = respell_listing_host(record, stored_url) if stored_url else record
+        spelled = (listing_spellings or {}).get(key)
+        stored_url, stored_source_domain = spelled if isinstance(spelled, tuple) else (spelled, None)
+        if named and len(named) > 2:
+            stored_url = named[2]
+        respelled = (respell_listing_host(record, stored_url, stored_source_domain=stored_source_domain)
+                     if stored_url else record)
         if respelled is not record:
             again = ingest_validated_record(respelled, source_jsonl=source_jsonl, market=market)
             # the key is (brand, title) or the listing without `www.`: a spelling never moves it
