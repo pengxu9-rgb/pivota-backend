@@ -1882,3 +1882,44 @@ async def test_a_cohort_without_the_fold_does_not_silently_revive_what_the_fold_
     assert [o["offer_id"] for o in _last_run(env)["checks"]["fold_revival"]["offers"]] == [row["offer_id"]]
     out = await _plain(env, monkeypatch, priced_line(), store, accepted_flags=[flag["key"]])
     assert out["status"] == "done" and row["suppressed_at"] is None  # revived on purpose
+
+
+async def test_a_www_twin_of_a_canonical_the_fold_itself_retired_is_an_alias(env, monkeypatch):  # noqa: F811
+    """The upsert revives `fold_superseded`, so an apex the fold retired earlier will be live again: the twin is a
+    proven alias (not counted), and its retire is safe."""
+    store = Store()
+    await _crawl(env, monkeypatch, priced_line(), store)
+    apex = _canonical_of(store, "glow-serum")
+    twin = dict(apex, offer_id="offer:catalog_enrichment_agent_v1:www-twin2", source_ref=_www(apex["source_ref"]))
+    apex.update(suppressed_at="2026-10-12T00:00:00Z", suppression_reason=FOLD_REASON)
+    store.offers.append(twin)
+    live_now = len(store.live())  # the twin is live, the apex is not
+    out = await _crawl(env, monkeypatch, priced_line(), store)
+    assert out["status"] == "done"
+    preview = _last_run(env)["checks"]["shade_fold"]["offer_preview"]
+    assert [(r["offer_id"], r["alias"]) for r in preview["retire"]] == [(twin["offer_id"], True)]
+    # the cohort's live lane offers: live rows only, the proven alias left out of the base too
+    assert preview["cohort_live_offers"] == live_now - 1
+    assert apex["suppressed_at"] is None and twin["suppression_reason"] == FOLD_REASON
+
+
+async def test_a_refused_childs_old_variant_waits_for_the_childs_own_offer(env, monkeypatch):  # noqa: F811
+    """duplicate_at_listing: the base's old variant offer at the child's page is retired only behind the offer
+    the child's own row writes there."""
+    store = Store()
+    await _crawl(env, monkeypatch, priced_line(), store)
+    old_variant = next(o for o in store.live() if o["source_ref"].endswith("/glow-serum-100ml"))
+    child_key = ingestion.retailer_product_key(HOST, f"https://{HOST}/products/glow-serum-100ml")
+    await _store_lane(env, monkeypatch, priced_line(pc="200.00"), store)
+    plan_child = {o["offer_id"] for o in ingestion.ingest_validated_jsonl(
+        [r for r in await feed.records_for_brand(domain=HOST, category_path="beauty", source_role="retailer",
+                                                 only_vendors=[VENDOR], retailer_name=HOST, emit_real_variants=True,
+                                                 base_listings_only=True, fold_extended=True,
+                                                 max_pdp_inci_fetches=0)], market="US")["offers"]
+        if o["product_key"] == child_key}
+    store.fail = plan_child
+    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
+    assert out["status"] == "done"
+    assert _last_run(env)["checks"]["shade_fold"]["retired"]["left"] == {
+        "replacement_not_written": [old_variant["offer_id"]]}
+    assert old_variant["suppressed_at"] is None
