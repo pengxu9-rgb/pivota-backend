@@ -348,6 +348,16 @@ _OFFER_UPSERT_SQL = """
                               THEN 'redirect'
                           ELSE catalog_offers.offer_mode
                       END,
+                      -- is_first_party travels WITH the type (resolve_offer_type sets them
+                      -- together): it moves only when this upsert is the one filling a NULL
+                      -- type. Without it a re-apply stored (brand_direct, FALSE), which the
+                      -- gateway's own-offer read (is_first_party IS TRUE) never serves and
+                      -- scripts/relabel_offer_seller_type (offer_type IS NULL) never repairs.
+                      is_first_party = CASE
+                          WHEN catalog_offers.offer_type IS NULL AND EXCLUDED.offer_type IS NOT NULL
+                              THEN EXCLUDED.is_first_party
+                          ELSE catalog_offers.is_first_party
+                      END,
                       availability = EXCLUDED.availability,
                       inventory_quantity = EXCLUDED.inventory_quantity,
                       -- The attached seed and merchant variants were reviewed
@@ -612,6 +622,64 @@ def _verified_storefronts_by_key(
         ):
             out[key] = verified.host
     return out
+
+
+def _label_verified_storefront_offers(
+    plan: Dict[str, Any], verified: Optional[VerifiedBrandStorefront],
+) -> tuple[Dict[str, Any], Dict[str, int]]:
+    """Label brand_direct the unlabelled offers a PROVEN brand storefront sells on its own host.
+
+    ingestion.resolve_offer_type sees only the listing (domain + brand), so it finds evidence only when
+    the domain's name IS the brand: a brand on "<brand>beauty.com", "<brand>cosmetics.com" or
+    "<brand>-usa.com" comes back unknown_no_evidence and lands offer_type NULL. The gateway's own-offer
+    read selects `offer_type = 'brand_direct' AND is_first_party`, so the brand's own store then never
+    serves a price for its own product. Prod census 2026-10-13: every NULL-typed lane offer written since
+    10-01 came from a drain run that HAD this proof; #2437 handed it to the seeds only.
+
+    The rule still decides, with the verified host as its official_domain (a known retailer host still
+    wins), exactly as scripts/relabel_offer_seller_type does for an attested domain. Only NULL is
+    filled: a type the plan already carries is never changed. An offer is labelled only when its row
+    is one _verified_storefronts_by_key maps (proven brand, brand_official, on the verified host) AND
+    the buyer is sent to that same host -- an offer whose destination is elsewhere stays unlabelled."""
+    from services.offer_seller_identity import (
+        OFFER_TYPE_BRAND_DIRECT,
+        derive_offer_seller_identity,
+        host_from_url,
+    )
+
+    pdps = plan.get("pdps") or []
+    own = _verified_storefronts_by_key(pdps, verified)
+    if not own:
+        return plan, {}
+    pdp_by_key = {str(p.get("product_key") or ""): p for p in pdps}
+    labelled = 0
+    offers: List[Dict[str, Any]] = []
+    for offer in plan.get("offers") or []:
+        key = str(offer.get("product_key") or "")
+        host = own.get(key)
+        if host and offer.get("offer_type") is None:
+            payload = offer.get("offer_payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except ValueError:
+                    payload = None
+            destination = (payload.get("destination_url") if isinstance(payload, dict) else None) \
+                or offer.get("source_ref")
+            if _storefront_host(host_from_url(destination)) == host:
+                pdp = pdp_by_key[key]
+                # The proof already decided brand_direct; the rule is here for its known-retailer
+                # guard (a retailer host never becomes a brand's own store, whatever the proof says)
+                # and so this label is exactly what the relabel tool would write for an attestation.
+                verdict = derive_offer_seller_identity(
+                    domain=pdp.get("source_domain"), canonical_url=pdp.get("canonical_url"),
+                    brand=pdp.get("brand"), official_domain=host,
+                )
+                if verdict["offer_type"] == OFFER_TYPE_BRAND_DIRECT and verdict["is_first_party"]:
+                    offer = {**offer, "offer_type": OFFER_TYPE_BRAND_DIRECT, "is_first_party": True}
+                    labelled += 1
+        offers.append(offer)
+    return {**plan, "offers": offers}, {"offers_labelled_verified_storefront": labelled}
 
 
 def _note_pdp_refusal(
@@ -2243,7 +2311,9 @@ async def _apply_ingest_plan(
     plan, owner_counts = await _guard_canonical_owner(plan, database, market=market)
     # BOTH executors too: the stage the upsert writes must describe the copy the upsert keeps.
     plan, stage_counts = await _stage_from_kept_copy(plan, database)
-    owner_counts = {**owner_counts, **stage_counts}
+    # Pure, and after the owner guard: label against the rows and keys that will actually be written.
+    plan, label_counts = _label_verified_storefront_offers(plan, verified_storefront)
+    owner_counts = {**owner_counts, **stage_counts, **label_counts}
 
     if batch:
         counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database,
