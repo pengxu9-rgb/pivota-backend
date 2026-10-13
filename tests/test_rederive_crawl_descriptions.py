@@ -117,8 +117,8 @@ class FakeDB:
                 and (r.get("pdp_lifecycle_stage") or "") not in ("hold", "archived")]
         if "hosts" in values:
             rows = [r for r in rows if r["host"] in values["hosts"]]
-        if "host" in values:
-            rows = [r for r in rows if r["host"] == values["host"]]
+        if "pks" in values:
+            rows = [r for r in rows if r["product_key"] in values["pks"]]
         return rows
 
     async def fetch_all(self, sql, values=None):
@@ -130,13 +130,9 @@ class FakeDB:
         if "retailer_ingest_jobs" in sql:
             return [dict(j) for j in self.jobs if j["host"] in values["hosts"]]
         live = self._live(values)
-        if "COUNT(*)" in sql:
-            counts = {}
-            for r in live:
-                counts[r["host"]] = counts.get(r["host"], 0) + 1
-            return [{"host": h, "n": n} for h, n in counts.items()]
-        if sql.startswith("SELECT product_key, canonical_url FROM"):
-            return [{"product_key": r["product_key"], "canonical_url": r["canonical_url"]} for r in live]
+        if sql.startswith("SELECT product_key, canonical_url, "):
+            return [{"product_key": r["product_key"], "canonical_url": r["canonical_url"], "host": r["host"]}
+                    for r in live]
         assert "candidate_attribute_summary" in sql
         return [dict(r) for r in live]
 
@@ -171,13 +167,14 @@ class FakeDB:
         assert sql is rd._REVERT_SQL
         if row["description"] != values["new"] or row.get("pdp_lifecycle_stage") != values["new_stage"]:
             return None
-        row.update(description=values["old"], pdp_lifecycle_stage=values["old_stage"],
-                   price_tier=values["price_tier"], use_case_tags=values["use_case_tags"],
-                   lifestyle_tags=values["lifestyle_tags"], demographic=values["demographic"])
+        row.update(description=values["old"], pdp_lifecycle_stage=values["old_stage"])
+        for column in rd.TAXONOMY_COLUMNS:  # the CASE: only a column still holding what the run wrote
+            if row.get(column) == values[f"new_{column}"]:
+                row[column] = values[column]
         return {"product_key": values["pk"]}
 
 
-def _deps(db, crawls, *, now=NOON, clock=None, lock_error=None, crawl_hook=None):
+def _deps(db, crawls, *, now=NOON, clock=None, lock_error=None, crawl_hook=None, recompute_error=None):
     """crawls: job id -> (pdps, products). The fake plan hands the pdps straight back."""
     state = SimpleNamespace(crawled=[], sleeps=[], reconnects=0, manifest=[])
 
@@ -202,8 +199,10 @@ def _deps(db, crawls, *, now=NOON, clock=None, lock_error=None, crawl_hook=None)
         assert refresh_source == rd.REFRESH_SOURCE
         db.log.append(f"refresh:{ck}")
 
-    async def recompute(ck, *, reason, db):
-        assert reason == rd.REFRESH_SOURCE
+    async def recompute(ck, *, reason, db, strict=False):
+        assert reason == rd.REFRESH_SOURCE and strict is True
+        if recompute_error is not None:
+            raise recompute_error
         db.log.append(f"recompute:{ck}")
 
     async def reconnect():
@@ -357,19 +356,32 @@ async def test_the_same_stage_is_neither_a_demotion_nor_a_promotion():
 
 # --- the safety rule: per sentence, counted, with a wider cue list ---------------------------------------
 
-def test_a_store_wide_skin_test_line_the_producer_drops_is_caught():
-    """The real repetition pass drops a store-wide skin-test line (its own cue list does not see it)."""
+def _through_the_real_repetition_pass(line):
+    """(old, new) of one row of a batch where `line` is a store-wide sentence on every product."""
     import services.curated_brand_feed as feed
 
-    skin = "Perform a skin test on a small area 24 hours before first use."
     kinds = ["serum", "toner", "cream", "mask", "balm", "oil", "mist", "gel", "lotion", "essence", "foam", "scrub"]
     rows = [[f"This product number {i} is a unique {k} formula with its own long description of texture.",
-             f"Second unique sentence {i} about the {k} benefits and daily use for everyone.", skin]
+             f"Second unique sentence {i} about the {k} benefits and daily use for everyone.", line]
             for i, k in enumerate(kinds)]
     out, report = feed.drop_repeated_store_sentences(rows, kinds=[str(i) for i in range(len(rows))])
-    assert report["rows_changed"] == len(rows) and skin not in out[0]
-    old, new = " ".join(rows[0]), " ".join(out[0])
-    assert rd.lost_safety_sentences(old, new) == [skin]
+    assert not feed.is_safety_text(line), "the producer's own list sees it: not the case under test"
+    assert report["rows_changed"] == len(rows) and line not in out[0], "the real pass must drop it"
+    return " ".join(rows[0]), " ".join(out[0])
+
+
+@pytest.mark.parametrize("line", [
+    "Perform a skin test on a small area 24 hours before first use.",
+    "Always follow with SPF 30 in the morning.",
+    "Test on a small patch of skin first.",
+    "Do a spot test before applying to the face.",
+    "Wear sun protection when using AHAs.",
+    "Mild tingling is normal and fades within minutes.",
+    "For adults only, keep the jar closed after use.",
+])
+def test_a_store_wide_safety_line_the_producer_drops_is_caught(line):
+    old, new = _through_the_real_repetition_pass(line)
+    assert rd.lost_safety_sentences(old, new) == [line]
 
 
 @pytest.mark.parametrize("sentence", [
@@ -466,7 +478,8 @@ async def test_every_read_sets_its_own_statement_timeout():
     db = FakeDB(rows, [_job("j1")])
     await _run([], db, {"j1": (pdps, products)})
     reads = db.log.count("begin_read")
-    assert reads >= 4 and db.log.count(f"SET LOCAL statement_timeout = '{rd.READ_STATEMENT_TIMEOUT}'") == reads
+    assert reads >= 3 and db.log.count(f"SET LOCAL statement_timeout = '{rd.READ_STATEMENT_TIMEOUT}'") == reads
+    assert db.log.count("SET TRANSACTION READ ONLY") == reads
 
 
 def test_apply_needs_the_reviewed_plan():
@@ -588,10 +601,11 @@ async def test_the_window_is_checked_before_every_write_batch():
     pdps = [_pdp(f"p{i}", f"h{i}", LONG_NEW) for i in range(4)]
     db = FakeDB(rows, [_job("j1")])
     _, dry, _ = await _run([], db, {"j1": (pdps, [])})
-    times = iter([NOON, NOON, NOON, datetime(2026, 10, 13, 5, 20, tzinfo=timezone.utc)] + [NOON] * 10)
+    inside = datetime(2026, 10, 13, 5, 20, tzinfo=timezone.utc)
     code, s, _ = await _run(["--apply", "--expect-plan", dry["expect_plan"], "--batch-size", "2"], db,
-                            {"j1": (pdps, [])}, now=lambda: next(times))
+                            {"j1": (pdps, [])}, now=lambda: inside if "commit" in db.log else NOON)
     assert code == 3 and s["written"] == 2 and s["unwritten"] == 2 and "window" in s["stopped"]
+    assert db.log.count("lock_enter") == 1, "inside the window a batch does not even wait for the lock"
 
 
 async def test_a_busy_lock_stops_the_run_and_writes_nothing():
@@ -705,10 +719,13 @@ async def test_hosts_is_pushed_into_the_sql():
     db = FakeDB(rows, [_job("j1"), _job("j2", host=OTHER)])
     _, s, state = await _run(["--hosts", f"www.{OTHER}"], db, {"j2": ([_pdp("q1", "h1", LONG_NEW, host=OTHER)], [])})
     assert s["rows"] == 1 and state.crawled == ["j2"]
-    sql, values = rd.host_counts_sql(rd.parse_args(["--hosts", OTHER]))
+    sql, values = rd.population_keys_sql(rd.parse_args(["--hosts", OTHER]))
     assert "= ANY(:hosts)" in sql and values["hosts"] == [OTHER] and "product_payload" not in sql
-    sql, values = rd.host_rows_sql(rd.parse_args(["--hosts", OTHER]), OTHER)
-    assert "= ANY(:hosts)" in sql and ":host\n" in sql and values["host"] == OTHER
+    sql, values = rd.host_rows_sql(rd.parse_args(["--hosts", OTHER]), ["q1"])
+    assert "= ANY(:hosts)" in sql and "product_key = ANY(:pks)" in sql and values["pks"] == ["q1"]
+    # one population scan, then one primary-key read per host
+    selects = [x[1] for x in db.log if isinstance(x, tuple)]
+    assert sum(1 for x in selects if x.startswith("SELECT product_key, canonical_url,")) == 1
 
 
 async def test_a_host_without_a_storefront_job_is_skipped_and_reported():
@@ -902,3 +919,92 @@ async def test_a_revert_whose_record_is_not_stored_restores_nothing():
     db.fail_event = True
     code, s, _ = await _run(["--revert", run_id, "--apply"], db, {})
     assert code == 3 and s["revert_failed"] == 2 and s["reverted"] == 0 and db.catalog == written
+
+
+def test_the_digest_binds_every_part_of_a_decision():
+    """Old text, old stage, new stage, new text and the plan's taxonomy each change the digest."""
+    row = _row("p1", "h1", LONG_OLD, crawled=LONG_OLD)
+
+    def digest(row=row, pdp=None, new=LONG_NEW, stage="published"):
+        pdp = pdp or _pdp("p1", "h1", new)
+        return rd.plan_digest([rd.Decision(row, rd.WRITE, planned=pdp, new=new, stage=stage)])
+
+    base = digest()
+    variants = {
+        "old text": digest(row={**row, "description": LONG_OLD + " more"}),
+        "old stage": digest(row={**row, "pdp_lifecycle_stage": "validated"}),
+        "new stage": digest(stage="validated"),
+        "new text": digest(new=LONG_NEW + " more"),
+        "taxonomy": digest(pdp={**_pdp("p1", "h1", LONG_NEW), "use_case_tags": '["night"]'}),
+    }
+    assert all(v != base for v in variants.values()), variants
+    assert digest() == base
+
+
+async def test_the_written_price_tier_is_the_plans():
+    rows = [_row("p1", "h1", LONG_OLD, crawled=LONG_OLD)]
+    db = FakeDB(rows, [_job("j1")])
+    pdp = {**_pdp("p1", "h1", LONG_NEW), "price_tier": "50_100"}
+    _, s, _ = await _dry_then_apply([], db, {"j1": ([pdp], [])})
+    assert s["written"] == 1 and db.catalog["p1"]["price_tier"] == "50_100"
+
+
+async def test_the_stage_is_judged_with_the_stored_title_not_the_plans():
+    """The drain keeps the stored title, so a row whose stored title is blank stays draft even when
+    the plan (judged on its own title) says published."""
+    row = {**_row("p1", "h1", LONG_OLD, crawled=LONG_OLD, stage="draft"), "title": ""}
+    pdp = _pdp("p1", "h1", LONG_NEW)
+    assert pdp["pdp_lifecycle_stage"] == "published"
+    d = await _classify(row, pdp)
+    assert d.stage == "draft" and d.outcome == rd.WRITE
+
+
+async def test_revert_leaves_a_taxonomy_column_a_later_writer_moved():
+    db, run_id, _, rows = await _applied()
+    db.catalog["p1"].update(price_tier="100_plus", use_case_tags='["night"]')
+    _, s, _ = await _run(["--revert", run_id, "--apply"], db, {})
+    assert s["reverted"] == 2
+    p1 = db.catalog["p1"]
+    assert p1["description"] == LONG_OLD and p1["price_tier"] == "100_plus" and p1["use_case_tags"] == '["night"]'
+    assert json.loads(p1["lifestyle_tags"]) == [] and json.loads(db.catalog["p2"]["use_case_tags"]) == []
+
+
+async def test_the_window_is_judged_again_once_the_lock_is_held():
+    """A lock wait can carry a batch from 05:14 into the window: it must not write there."""
+    rows = [_row("p1", "h1", LONG_OLD, crawled=LONG_OLD)]
+    db = FakeDB(rows, [_job("j1")])
+    crawls = {"j1": ([_pdp("p1", "h1", LONG_NEW)], [])}
+    _, dry, _ = await _run([], db, crawls)
+    before, inside = (datetime(2026, 10, 13, 5, 14, tzinfo=timezone.utc),
+                      datetime(2026, 10, 13, 5, 16, tzinfo=timezone.utc))
+    code, s, _ = await _run(["--apply", "--expect-plan", dry["expect_plan"]], db, crawls,
+                            now=lambda: inside if "lock_enter" in db.log else before)
+    assert code == 3 and s["written"] == 0 and s["unwritten"] == 1 and "window" in s["stopped"]
+    assert db.updates == [] and db.log.count("lock_exit") == 1
+
+
+@pytest.mark.parametrize("hour,minute,second,expected", [
+    (5, 0, 0, 900.0), (5, 10, 0, 300.0), (5, 14, 30, 30.0), (6, 20, 0, 900.0), (4, 59, 59, 900.0),
+])
+def test_the_lock_wait_never_runs_into_the_window(hour, minute, second, expected):
+    now = datetime(2026, 10, 13, hour, minute, second, tzinfo=timezone.utc)
+    assert rd.lock_wait_s(now, 900.0) == expected
+
+
+async def test_a_failed_eligibility_recompute_counts_and_fails_the_run():
+    rows = [_row("p1", "h1", LONG_OLD, crawled=LONG_OLD)]
+    db = FakeDB(rows, [_job("j1")])
+    crawls = {"j1": ([_pdp("p1", "h1", "Short now.")], [])}
+    _, dry, _ = await _run(["--allow-demote"], db, crawls)
+    code, s, _ = await _run(["--apply", "--allow-demote", "--expect-plan", dry["expect_plan"]], db, crawls,
+                            recompute_error=RuntimeError("eligibility_inputs_missing"))
+    assert s["written"] == 1 and s["eligibility_failed"] == 1 and s["eligibility_recomputed"] == 0 and code == 3
+
+
+async def test_each_host_line_names_the_sentences_the_pass_drops_most(capsys):
+    shipping = "Free shipping on every order this week."
+    rows = [_row(f"p{i}", f"h{i}", f"{LONG_OLD} {shipping}", crawled=f"{LONG_OLD} {shipping}") for i in range(3)]
+    db = FakeDB(rows, [_job("j1")])
+    await _run([], db, {"j1": ([_pdp(f"p{i}", f"h{i}", LONG_OLD) for i in range(3)], [])})
+    (host_line,) = [line for line in capsys.readouterr().out.splitlines() if line.startswith("HOST ")]
+    assert json.loads(host_line[5:])["top_removed"] == [[shipping, 3]]

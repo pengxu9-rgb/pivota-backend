@@ -50,9 +50,13 @@ BINDING. `--apply` writes only what a reviewed dry run decided: the dry run prin
 digests (`expect_plan` in its SUMMARY); `--apply --expect-plan host=digest,...` re-derives, and a
 host whose decisions are not byte-identical to the reviewed ones (old text, new text, stages,
 taxonomy) writes nothing and is reported `plan_changed`. Hosts not named are not touched.
+A digest binds ONE apply. Any partial apply -- a `--max-writes` canary, a failed batch, a lock or
+window stop -- leaves the host's plan different from the reviewed one (its written rows now read
+back `unchanged`), so the remainder needs a FRESH dry run and its fresh digest, never a re-use.
 
 REVERT. `--revert <run_id | manifest.jsonl>` restores written rows (text, stage, taxonomy), each
-guarded on still holding the text and stage this run wrote. Dry run unless `--apply`.
+guarded on still holding the text and stage this run wrote; a taxonomy column a later writer has
+moved since is left as it is. Dry run unless `--apply`.
 
 OPERATION. Dry run by default: reads only, inside READ ONLY transactions, and writes nothing.
 `--apply` refuses to start, and stops writing, inside the 05:15-06:15Z sweep window; it commits in
@@ -134,6 +138,7 @@ SKIP_SAFETY = "skip_safety"
 SKIP_DEMOTE = "skip_demote"
 SKIP_PROMOTE = "skip_promote"
 REWRITE_OUTCOMES = (WRITE, SKIP_SAFETY, SKIP_DEMOTE, SKIP_PROMOTE)
+TOP_REMOVED = 10
 
 HOST_SQL = "lower(regexp_replace(split_part(split_part(canonical_url, '://', 2), '/', 1), '^www[.]', ''))"
 
@@ -147,7 +152,7 @@ _POPULATION_WHERE = """
 # created_at is a timestamp WITHOUT time zone: bound as a naive UTC datetime (asyncpg refuses a str).
 _SINCE_SQL = "   AND created_at >= :since\n"
 _HOSTS_SQL = f"   AND {HOST_SQL} = ANY(:hosts)\n"
-_ONE_HOST_SQL = f"   AND {HOST_SQL} = :host\n"
+_KEYS_SQL = "   AND product_key = ANY(:pks)\n"
 _COLUMNS_SQL = f"""
 SELECT product_key, content_key, canonical_url, source_domain, {HOST_SQL} AS host,
        title, description, image_url, category_path, tags, price_tier, demographic, use_case_tags,
@@ -165,21 +170,17 @@ def _population_filters(opts: Any) -> Tuple[str, Dict[str, Any]]:
     return sql, values
 
 
-def host_counts_sql(opts: Any) -> Tuple[str, Dict[str, Any]]:
-    """Which hosts have rows, and how many: no product_payload is read."""
+def population_keys_sql(opts: Any) -> Tuple[str, Dict[str, Any]]:
+    """Every host's keys and listings in ONE scan (the host expression has no index; per-host scans
+    would cost the 2-vCPU primary two sequential scans a host). No product_payload is read."""
     where, values = _population_filters(opts)
-    return f"SELECT {HOST_SQL} AS host, COUNT(*) AS n FROM catalog_products{where} GROUP BY 1", values
+    return f"SELECT product_key, canonical_url, {HOST_SQL} AS host FROM catalog_products{where}", values
 
 
-def host_keys_sql(opts: Any, host: str) -> Tuple[str, Dict[str, Any]]:
-    """A host's keys and listings, for the plan and the crawl's early stop: no product_payload."""
+def host_rows_sql(opts: Any, keys: Iterable[str]) -> Tuple[str, Dict[str, Any]]:
+    """A host's rows, read fresh after its crawl, by primary key, still inside the population."""
     where, values = _population_filters(opts)
-    return f"SELECT product_key, canonical_url FROM catalog_products{where}{_ONE_HOST_SQL}", {**values, "host": host}
-
-
-def host_rows_sql(opts: Any, host: str) -> Tuple[str, Dict[str, Any]]:
-    where, values = _population_filters(opts)
-    return _COLUMNS_SQL + where + _ONE_HOST_SQL, {**values, "host": host}
+    return _COLUMNS_SQL + where + _KEYS_SQL, {**values, "pks": sorted(keys)}
 
 
 _JOBS_SQL = """
@@ -211,11 +212,19 @@ RETURNING product_key, content_changed_at
 """
 
 # THE REVERT: back to the manifest's old values, only while the row still holds what this run wrote.
+# Each taxonomy column goes back only while it still holds what the run wrote (a re-crawl since may
+# have moved price_tier or the tags for its own reasons): NULL-safe, jsonb compared as jsonb.
 _REVERT_SQL = """
 UPDATE catalog_products
-   SET description = :old, pdp_lifecycle_stage = :old_stage, price_tier = :price_tier,
-       use_case_tags = CAST(:use_case_tags AS jsonb),
-       lifestyle_tags = CAST(:lifestyle_tags AS jsonb), demographic = :demographic,
+   SET description = :old, pdp_lifecycle_stage = :old_stage,
+       price_tier = CASE WHEN price_tier IS NOT DISTINCT FROM CAST(:new_price_tier AS TEXT)
+                         THEN CAST(:price_tier AS TEXT) ELSE price_tier END,
+       use_case_tags = CASE WHEN use_case_tags IS NOT DISTINCT FROM CAST(:new_use_case_tags AS jsonb)
+                            THEN CAST(:use_case_tags AS jsonb) ELSE use_case_tags END,
+       lifestyle_tags = CASE WHEN lifestyle_tags IS NOT DISTINCT FROM CAST(:new_lifestyle_tags AS jsonb)
+                             THEN CAST(:lifestyle_tags AS jsonb) ELSE lifestyle_tags END,
+       demographic = CASE WHEN demographic IS NOT DISTINCT FROM CAST(:new_demographic AS TEXT)
+                          THEN CAST(:demographic AS TEXT) ELSE demographic END,
        updated_at = NOW()
  WHERE product_key = :pk AND suppressed_at IS NULL
    AND description = :new
@@ -306,6 +315,16 @@ def _as_utc(value: Any) -> datetime:
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
+def lock_wait_s(now: datetime, cap: float) -> float:
+    """How long a write may wait for the lock: `cap`, but never past the start of the sweep window."""
+    now = _as_utc(now).astimezone(timezone.utc)
+    start = now.replace(hour=QUIET_WINDOW_UTC_MIN[0] // 60, minute=QUIET_WINDOW_UTC_MIN[0] % 60,
+                        second=0, microsecond=0)
+    if start <= now:
+        start += timedelta(days=1)
+    return max(0.0, min(float(cap), (start - now).total_seconds()))
+
+
 def in_quiet_window(now: datetime) -> bool:
     now = _as_utc(now).astimezone(timezone.utc)
     minute = now.hour * 60 + now.minute
@@ -360,7 +379,8 @@ _LOCAL_SAFETY_CUE_RE = re.compile(
     r"|before\s+(?:first\s+)?use|irritat\w*|allerg\w*|warning\w*|caution\w*|avoid\w*|discontinu\w*"
     r"|eyes?|pregnan\w*|breast[- ]?feed\w*|nursing|doctor\w*|physician\w*|dermatolog\w*|medical\w*"
     r"|flammab\w*|swallow\w*|ingest\w*|poison\w*|toxic\w*|harmful|rash\w*|redness|swelling|burns?"
-    r"|broken\s+skin|external\s+use|rinse|first\s+aid|children|reach\s+of|do\s+not)\b")
+    r"|broken\s+skin|external\s+use|rinse|first\s+aid|children|reach\s+of|do\s+not"
+    r"|spf|sun\s+protection|spot\s+test\w*|patch|tingl\w*|adults?\s+only)\b")
 
 
 def _defootnote(text: str) -> str:
@@ -772,7 +792,8 @@ async def _after_commit(content_keys: Iterable[str], stage_changed: Iterable[str
                 break
     for ck in sorted(set(stage_changed)):
         try:
-            await deps.recompute(ck, reason=REFRESH_SOURCE, db=deps.db)
+            # strict: a failure raises (the default swallows it and returns False, uncounted)
+            await deps.recompute(ck, reason=REFRESH_SOURCE, db=deps.db, strict=True)
             counts["eligibility_recomputed"] += 1
         except Exception as exc:  # noqa: BLE001
             counts["eligibility_failed"] += 1
@@ -800,14 +821,21 @@ async def _batches(items: List[Any], deps: Any, opts: Any, counts: collections.C
             counts["unwritten"] += len(items) - start
             raise StopRun("inside the 05:15-06:15Z sweep window")
         batch = items[start:start + size]
+        in_window = False
         try:
             async with deps.lock():
-                after = await write(batch)
+                # The lock wait can be long: judge the window again now that the lock is held.
+                in_window = in_quiet_window(deps.now())
+                if not in_window:
+                    after = await write(batch)
         except Exception as exc:  # the lock was busy or unavailable: nothing of this batch ran
             if type(exc).__name__ not in ("CatalogWriteLockBusy", "CatalogWriteLockUnavailable"):
                 raise
             counts["unwritten"] += len(items) - start
             raise StopRun(f"catalog write lock: {type(exc).__name__}") from exc
+        if in_window:
+            counts["unwritten"] += len(items) - start
+            raise StopRun("inside the 05:15-06:15Z sweep window (reached while waiting for the lock)")
         if deps.writes_left is not None:
             deps.writes_left -= len(batch)
         await after()
@@ -847,7 +875,8 @@ def _emit(tag: str, payload: Dict[str, Any]) -> None:
     print(f"{tag} {json.dumps(payload, default=str, ensure_ascii=False)}", flush=True)
 
 
-async def process_host(host: str, host_jobs: List[Dict[str, Any]], deps: Any, opts: Any,
+async def process_host(host: str, host_keys: List[Dict[str, Any]], host_jobs: List[Dict[str, Any]],
+                       deps: Any, opts: Any,
                        totals: collections.Counter, transitions: collections.Counter, run_id: str,
                        digests: Dict[str, str]) -> None:
     from services.catalog_enrichment_agent.ingestion import content_listing
@@ -858,8 +887,7 @@ async def process_host(host: str, host_jobs: List[Dict[str, Any]], deps: Any, op
     jobs, excluded = select_jobs(host_jobs, jobs_since=opts.jobs_since)
     skip = None if jobs else "no completed storefront job"
     errors: List[str] = []
-    sql, values = host_keys_sql(opts, host)
-    keys = {str(r["product_key"]): r for r in await _read_only(deps, sql, values)}
+    keys = {str(r["product_key"]): r for r in host_keys}
     matched: Dict[str, Dict[str, Any]] = {}
     legacy: Dict[str, str] = {}
     plan_listings: set = set()
@@ -903,7 +931,7 @@ async def process_host(host: str, host_jobs: List[Dict[str, Any]], deps: Any, op
                        "excluded_sources": excluded})
         return
     # The host's rows are read AFTER its crawl: what is judged is what the row holds now.
-    sql, values = host_rows_sql(opts, host)
+    sql, values = host_rows_sql(opts, keys)
     host_rows = await _read_only(deps, sql, values)
     decisions: List[Decision] = []
     for row in host_rows:
@@ -918,6 +946,7 @@ async def process_host(host: str, host_jobs: List[Dict[str, Any]], deps: Any, op
         if d.outcome == NOT_IN_FEED and content_listing(row.get("canonical_url")) in plan_listings:
             counts["not_in_feed_url_in_plan"] += 1
         decisions.append(d)
+    removed = collections.Counter(s for d in decisions if d.outcome in REWRITE_OUTCOMES for s in d.removed)
     digest = plan_digest(decisions)
     writes = [d for d in decisions if d.outcome == WRITE]
     if writes:
@@ -944,13 +973,19 @@ async def process_host(host: str, host_jobs: List[Dict[str, Any]], deps: Any, op
         totals.update(counts)
         transitions.update(host_transitions)
         _emit("HOST", {"host": host, **counts, "to_write": len(writes), "plan_digest": digest if writes else None,
-                       "stage_transitions": dict(sorted(host_transitions.items())), "skip": skip,
+                       "stage_transitions": dict(sorted(host_transitions.items())),
+                       # what the producer drops here, most often first: the line to scan before the go
+                       "top_removed": [[text[:200], n] for text, n in removed.most_common(TOP_REMOVED)],
+                       "skip": skip,
                        "errors": errors, "excluded_sources": excluded})
 
 
 async def run_forward(opts: Any, deps: Any, run_id: str) -> Tuple[int, Dict[str, Any]]:
-    sql, values = host_counts_sql(opts)
-    counts_by_host = {r["host"]: int(r["n"]) for r in await _read_only(deps, sql, values)}
+    sql, values = population_keys_sql(opts)
+    keys_by_host: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+    for r in await _read_only(deps, sql, values):
+        keys_by_host[r["host"]].append(r)
+    counts_by_host = {h: len(v) for h, v in keys_by_host.items()}
     hosts = sorted(counts_by_host, key=lambda h: (-counts_by_host[h], h))
     jobs = await _read_only(deps, _JOBS_SQL, {"hosts": hosts}) if hosts else []
     jobs_by_host: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
@@ -968,7 +1003,8 @@ async def run_forward(opts: Any, deps: Any, run_id: str) -> Tuple[int, Dict[str,
         if deps.stopped:
             break
         try:
-            await process_host(host, jobs_by_host.get(host, []), deps, opts, totals, transitions, run_id, digests)
+            await process_host(host, keys_by_host[host], jobs_by_host.get(host, []), deps, opts, totals,
+                               transitions, run_id, digests)
         except StopRun as exc:
             stopped_failure = str(exc)
             break
@@ -1023,10 +1059,15 @@ async def load_revert_entries(source: str, deps: Any) -> List[Dict[str, Any]]:
 
 def revert_params(entry: Dict[str, Any]) -> Dict[str, Any]:
     tax = entry.get("taxonomy_old") or {}
+    written = entry.get("taxonomy_new") or {}
     return {"pk": entry["pk"], "old": entry["old"], "old_stage": entry.get("old_stage"),
-            "new": entry["new"], "new_stage": entry.get("new_stage"), "price_tier": tax.get("price_tier"),
+            "new": entry["new"], "new_stage": entry.get("new_stage"),
+            "price_tier": tax.get("price_tier"), "new_price_tier": written.get("price_tier"),
             "use_case_tags": _jsonb_param(tax.get("use_case_tags")),
-            "lifestyle_tags": _jsonb_param(tax.get("lifestyle_tags")), "demographic": tax.get("demographic")}
+            "new_use_case_tags": _jsonb_param(written.get("use_case_tags")),
+            "lifestyle_tags": _jsonb_param(tax.get("lifestyle_tags")),
+            "new_lifestyle_tags": _jsonb_param(written.get("lifestyle_tags")),
+            "demographic": tax.get("demographic"), "new_demographic": written.get("demographic")}
 
 
 async def run_revert(opts: Any, deps: Any, run_id: str) -> Tuple[int, Dict[str, Any]]:
@@ -1124,7 +1165,8 @@ def production_deps(opts: Any) -> Any:
     sink = ManifestSink(opts.manifest_out)
     deps = types.SimpleNamespace(
         db=database, crawl=crawl_job, plan=plan_rows,
-        lock=lambda: catalog_write_lock(wait_s=opts.lock_wait_s, poll_s=LOCK_POLL_S),
+        lock=lambda: catalog_write_lock(wait_s=lock_wait_s(datetime.now(timezone.utc), opts.lock_wait_s),
+                                        poll_s=LOCK_POLL_S),
         refresh=refresh_agent_pdp_view_for_content_key, recompute=recompute_serving_eligibility,
         reconnect=lambda: _reconnect(database), sleep=asyncio.sleep,
         now=lambda: datetime.now(timezone.utc), clock=time.monotonic, started=0.0,
@@ -1155,13 +1197,16 @@ def parse_args(argv: Optional[List[str]] = None) -> Any:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--apply", action="store_true", help="write (default: dry run, writes nothing)")
     p.add_argument("--expect-plan", type=_expect_plan_arg, default=None,
-                   help="with --apply: host=digest,... from the reviewed dry run's SUMMARY (required)")
+                   help="with --apply: host=digest,... from the reviewed dry run's SUMMARY (required). It "
+                        "binds one apply: after any partial apply (--max-writes, a failed batch, a window or "
+                        "lock stop) dry-run again and use the fresh digest for the remainder")
     p.add_argument("--allow-demote", action="store_true",
                    help="also write rows whose new text lowers their lifecycle stage (give it to the dry run "
                         "too: its plan digest covers exactly the rows it would write)")
     p.add_argument("--allow-promote", action="store_true",
                    help="also write rows whose new text raises their lifecycle stage (dry run too)")
-    p.add_argument("--max-writes", type=int, default=None, help="stop after writing this many rows (a canary)")
+    p.add_argument("--max-writes", type=int, default=None,
+                   help="stop after attempting this many rows (a canary); the rest needs a fresh dry run and digest")
     p.add_argument("--revert", default=None, help="restore the written rows of a run: its run id, or a manifest file")
     p.add_argument("--manifest-out", default=None,
                    help="JSONL manifest path (default: <tmp>/<run id>.jsonl; 'none' = ROW lines only)")

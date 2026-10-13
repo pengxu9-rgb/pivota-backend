@@ -160,9 +160,9 @@ async def _row(db, pk):
     import scripts.rederive_crawl_descriptions as rd
 
     opts = rd.parse_args(["--manifest-out", "none"])
-    sql, values = rd.host_rows_sql(opts, HOST)
-    rows = {r["product_key"]: r for r in await rd._read_only(_deps(db), sql, values)}
-    return rows[pk]
+    sql, values = rd.host_rows_sql(opts, [pk])
+    (row,) = await rd._read_only(_deps(db), sql, values)
+    return row
 
 
 def _planned(pk, handle="h1", description=NEW):
@@ -193,7 +193,8 @@ def _deps(db, crawls=None, manifest=None, log=None):
     async def refresh(ck, *, refresh_source, db):
         log.append(("refresh", ck))
 
-    async def recompute(ck, *, reason, db):
+    async def recompute(ck, *, reason, db, strict=False):
+        assert strict is True
         log.append(("recompute", ck))
 
     return SimpleNamespace(
@@ -303,18 +304,18 @@ def test_the_population_selects_run_and_keep_only_their_rows(db_url):
         await _insert(db, "not-live", sync_status="deleted")
         deps = _deps(db)
         opts = rd.parse_args(["--manifest-out", "none"])
-        counts = await rd._read_only(deps, *rd.host_counts_sql(opts))
+        everything = await rd._read_only(deps, *rd.population_keys_sql(opts))
         limited = rd.parse_args(["--manifest-out", "none", "--hosts", HOST])
-        limited_counts = await rd._read_only(deps, *rd.host_counts_sql(limited))
-        keys = await rd._read_only(deps, *rd.host_keys_sql(limited, HOST))
-        rows = await rd._read_only(deps, *rd.host_rows_sql(limited, HOST))
-        every = await rd._read_only(deps, *rd.host_rows_sql(rd.parse_args(["--since", "all", "--manifest-out", "none"]),
-                                                            HOST))
-        return counts, limited_counts, keys, rows, every
+        keys = await rd._read_only(deps, *rd.population_keys_sql(limited))
+        all_pks = ["keep", "keep-www", "other-host", "old", "suppressed", "held", "other-lane", "not-live"]
+        rows = await rd._read_only(deps, *rd.host_rows_sql(limited, all_pks))
+        every = await rd._read_only(deps, *rd.host_rows_sql(
+            rd.parse_args(["--since", "all", "--manifest-out", "none", "--hosts", HOST]), all_pks))
+        return everything, keys, rows, every
 
-    counts, limited_counts, keys, rows, every = _drive(db_url, scenario)
-    assert {r["host"]: r["n"] for r in counts} == {HOST: 2, "b.example.com": 1}
-    assert {r["host"]: r["n"] for r in limited_counts} == {HOST: 2}
+    everything, keys, rows, every = _drive(db_url, scenario)
+    assert sorted((r["host"], r["product_key"]) for r in everything) == [
+        (HOST, "keep"), (HOST, "keep-www"), ("b.example.com", "other-host")]
     assert sorted(r["product_key"] for r in keys) == ["keep", "keep-www"]
     assert sorted(r["product_key"] for r in rows) == ["keep", "keep-www"]
     assert {r["crawled_copy"] for r in rows} == {OLD} and all(r["content_changed_at"] for r in rows)
@@ -393,3 +394,46 @@ def test_dry_run_then_bound_apply_then_revert_on_postgres(db_url):
     assert after_revert["p1"]["use_case_tags"] is None and after_revert["p1"]["lifestyle_tags"] is None
     assert after_revert["p1"]["demographic"] is None
     assert again["revert_rows"] == 0
+
+
+def _revert_scenario(db_url, after_write):
+    """Write p1 (plan taxonomy differs from the row's), let `after_write` move it, then revert the run."""
+    import scripts.rederive_crawl_descriptions as rd
+
+    async def scenario(db):
+        await _insert(db, "p1")
+        row = await _row(db, "p1")
+        d = _decision(row)
+        d.planned = {**d.planned, "price_tier": "50_100"}
+        written, _, failed = await rd._write_batch([d], _deps(db), "rederive_test")
+        assert len(written) == 1 and failed == 0
+        await db.execute(after_write)
+        moved = await _read(db, "p1")
+        code, summary = await rd.run(rd.parse_args(["--revert", "rederive_test", "--apply", "--manifest-out", "none"]),
+                                     _deps(db))
+        return moved, code, summary, await _read(db, "p1")
+
+    return _drive(db_url, scenario)
+
+
+def test_revert_leaves_taxonomy_a_later_writer_moved_and_restores_the_rest(db_url):
+    moved, code, summary, after = _revert_scenario(
+        db_url, "UPDATE catalog_products SET price_tier = '100_plus', use_case_tags = CAST('[\"night\"]' AS jsonb) "
+                "WHERE product_key = 'p1'")
+    assert code == 0 and summary["reverted"] == 1
+    assert after["description"] == OLD and after["pdp_lifecycle_stage"] == "published"
+    assert after["price_tier"] == "100_plus" and json.loads(after["use_case_tags"]) == ["night"]
+    assert after["lifestyle_tags"] is None and after["demographic"] is None, "unmoved columns go back to old"
+
+
+def test_revert_restores_every_taxonomy_column_it_wrote(db_url):
+    moved, code, summary, after = _revert_scenario(db_url, "SELECT 1")
+    assert moved["price_tier"] == "50_100" and summary["reverted"] == 1
+    assert after["price_tier"] == "under_50" and after["use_case_tags"] is None and after["demographic"] is None
+
+
+def test_revert_leaves_a_row_suppressed_since(db_url):
+    moved, code, summary, after = _revert_scenario(
+        db_url, "UPDATE catalog_products SET suppressed_at = NOW() WHERE product_key = 'p1'")
+    assert summary["reverted"] == 0 and summary["revert_raced"] == 1
+    assert after["description"] == NEW and after == moved
