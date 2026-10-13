@@ -395,3 +395,48 @@ def test_an_offer_sent_off_the_verified_host_or_already_typed_is_left_alone():
     assert counts == {"offers_labelled_verified_storefront": len(rest)}
     # No proof: the plan comes back as it went in, and no count is added.
     assert writer._label_verified_storefront_offers(plan, None) == (plan, {})
+
+
+def _with_destination(offer: Dict[str, Any], url: str) -> Dict[str, Any]:
+    return dict(offer, offer_payload=json.dumps({"destination_url": url}), source_ref=url)
+
+
+@pytest.mark.parametrize("destination,labelled", [
+    ("https://www.tartecosmetics.com/products/p-8101", True),        # www. is the same store
+    ("https://us.tartecosmetics.com/products/p-8101", False),        # a subdomain is another store
+    ("https://tartecosmetics.com.evil.com/products/p-8101", False),  # look-alike host
+    ("https://evil.com/tartecosmetics.com/products/p-8101", False),   # host named only in the path
+])
+def test_only_a_destination_on_the_verified_host_is_labelled(destination, labelled):
+    plan = ingest_validated_jsonl([_shaded_record("tartecosmetics.com", role="brand_official")])
+    first, *rest = plan["offers"]
+    out, _ = writer._label_verified_storefront_offers(
+        {**plan, "offers": [_with_destination(first, destination), *rest]}, _verified("tartecosmetics.com", "Tarte"))
+    assert (out["offers"][0]["offer_type"], out["offers"][0]["is_first_party"]) == (
+        ("brand_direct", True) if labelled else (None, False))
+
+
+def test_a_proof_for_a_subdomain_store_does_not_cover_the_apex_rows():
+    plan = ingest_validated_jsonl([_shaded_record("tartecosmetics.com", role="brand_official")])
+    assert writer._label_verified_storefront_offers(plan, _verified("us.tartecosmetics.com", "Tarte")) == (plan, {})
+
+
+def test_a_forged_proof_on_a_known_retailer_never_labels_brand_direct():
+    # The drain refuses a known retailer before any proof exists (test_nothing_else_is_proof); this is the second
+    # layer: even handed one, the seller rule's known-retailer branch wins.
+    plan = ingest_validated_jsonl([_shaded_record("sephora.com", role="brand_official")])
+    assert is_known_retailer("sephora.com")
+    unlabelled = {**plan, "offers": [dict(o, offer_type=None, is_first_party=False) for o in plan["offers"]]}
+    out, counts = writer._label_verified_storefront_offers(unlabelled, _verified("sephora.com", "Tarte"))
+    assert {(o["offer_type"], o["is_first_party"]) for o in out["offers"]} == {(None, False)}
+    assert counts == {"offers_labelled_verified_storefront": 0}
+
+
+@pytest.mark.parametrize("payload", ["[1, 2]", "null", "not json", "\"a string\""])
+def test_a_payload_that_is_not_an_object_falls_back_to_the_offers_own_destination(payload):
+    plan = ingest_validated_jsonl([_shaded_record("tartecosmetics.com", role="brand_official")])
+    first, *rest = plan["offers"]
+    odd = dict(first, offer_payload=payload)  # source_ref still holds the store destination
+    out, _ = writer._label_verified_storefront_offers({**plan, "offers": [odd, *rest]},
+                                                      _verified("tartecosmetics.com", "Tarte"))
+    assert (out["offers"][0]["offer_type"], out["offers"][0]["is_first_party"]) == ("brand_direct", True)

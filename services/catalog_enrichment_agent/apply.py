@@ -348,6 +348,16 @@ _OFFER_UPSERT_SQL = """
                               THEN 'redirect'
                           ELSE catalog_offers.offer_mode
                       END,
+                      -- is_first_party travels WITH the type (resolve_offer_type sets them
+                      -- together): it moves only when this upsert is the one filling a NULL
+                      -- type. Without it a re-apply stored (brand_direct, FALSE), which the
+                      -- gateway's own-offer read (is_first_party IS TRUE) never serves and
+                      -- scripts/relabel_offer_seller_type (offer_type IS NULL) never repairs.
+                      is_first_party = CASE
+                          WHEN catalog_offers.offer_type IS NULL AND EXCLUDED.offer_type IS NOT NULL
+                              THEN EXCLUDED.is_first_party
+                          ELSE catalog_offers.is_first_party
+                      END,
                       availability = EXCLUDED.availability,
                       inventory_quantity = EXCLUDED.inventory_quantity,
                       -- The attached seed and merchant variants were reviewed
@@ -653,10 +663,14 @@ def _label_verified_storefront_offers(
                 try:
                     payload = json.loads(payload)
                 except ValueError:
-                    payload = {}
-            destination = (payload or {}).get("destination_url") or offer.get("source_ref")
+                    payload = None
+            destination = (payload.get("destination_url") if isinstance(payload, dict) else None) \
+                or offer.get("source_ref")
             if _storefront_host(host_from_url(destination)) == host:
                 pdp = pdp_by_key[key]
+                # The proof already decided brand_direct; the rule is here for its known-retailer
+                # guard (a retailer host never becomes a brand's own store, whatever the proof says)
+                # and so this label is exactly what the relabel tool would write for an attestation.
                 verdict = derive_offer_seller_identity(
                     domain=pdp.get("source_domain"), canonical_url=pdp.get("canonical_url"),
                     brand=pdp.get("brand"), official_domain=host,
