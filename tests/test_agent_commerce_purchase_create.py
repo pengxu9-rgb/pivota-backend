@@ -623,3 +623,34 @@ async def test_the_reap_door_losing_a_key_race_to_another_rail_names_the_winner_
     reap_row = await reap_ledger.get_purchase_internal(row["id"])
     assert (reap_row["state"], reap_row["refusal_reason"]) == ("refused", "duplicate_idempotency_key")
     assert reap_row["buyer_email"] is None and reap_row["shipping_address"] is None
+
+
+
+@pytest.mark.parametrize("path", ["/agent/v2/commerce/reap/purchases", "/agent/v2/commerce/reap/purchases/recover"])
+async def test_the_reap_door_names_its_own_purchase_on_a_conflict(client, stubs, reap_door_open, monkeypatch, path):
+    """The REAL Reap create opens an rp_ purchase; a different body under the same key, on create or recovery,
+    is a 409 that names it (and its rail)."""
+    await database.execute(
+        "INSERT INTO reap_agentic_buyer_refs (buyer_id, reap_buyer_ref, consent_version, consented_at) "
+        "VALUES ('buyer_conflict', 'bref_conflict', 'terms-2026-10', CURRENT_TIMESTAMP)")
+
+    async def _buyer(**kwargs):
+        return "buyer_conflict"
+
+    async def _bref(buyer_id, **kwargs):
+        return "bref_conflict"
+
+    async def _click(click):
+        return None
+
+    monkeypatch.setattr(reap_routes, "_buyer_id_for", _buyer)
+    monkeypatch.setattr(reap_routes, "_reap_buyer_ref", _bref)
+    monkeypatch.setattr(reap_routes, "issue_click", _click)
+    opened = await client.post("/agent/v2/commerce/reap/purchases", body())
+    assert opened.status_code == 202, opened.text
+    pid = opened.json()["purchase_id"]
+    assert pid.startswith("rp_")
+    resp = await client.post(path, body(quantity=2))
+    assert resp.status_code == 409 and "idempotency_conflict" in resp.text, resp.text
+    detail = resp.json().get("detail") or resp.json()
+    assert (detail["purchase_id"], detail["rail"]) == (pid, "reap")
