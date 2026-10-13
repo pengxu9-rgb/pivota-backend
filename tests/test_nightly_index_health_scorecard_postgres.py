@@ -45,6 +45,7 @@ _P = "nihsc-"  # this file's row prefix
 # every insert below supplies those too.
 _LIGHTWEIGHT_DDL = """
 CREATE TABLE IF NOT EXISTS external_product_seeds (id text);
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS id text;
 ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS market text;
 ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS tool text;
 ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_url text;

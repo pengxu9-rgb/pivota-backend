@@ -308,6 +308,14 @@ def test_the_read_only_set_is_exactly_the_four_reads():
     assert a2a.READ_ONLY_ACTIONS <= a2a.ALLOWED_ACTIONS
 
 
+async def test_the_visa_approval_confirm_is_allowed_and_is_a_maybe_write():
+    # Measured 2026-10-12: Visa's approval page is `payment.visa-action-required`, confirmed with `paid`.
+    # It finalises a token (no charge), so a timeout on it must be outcome_unknown, never a resend.
+    assert ("payment.visa-action-required", "paid") in a2a.ALLOWED_ACTIONS
+    rail = _Rail(httpx.ConnectError("reset"))
+    assert (await _send(_client(rail), "payment.visa-action-required", "paid")).kind == "outcome_unknown"
+
+
 async def test_a_redirect_is_not_followed():
     rail = _Rail(httpx.Response(302, headers={"Location": "https://evil.example/steal"}))
     result = await _send(_client(rail))
