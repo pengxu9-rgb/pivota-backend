@@ -290,11 +290,29 @@ async def test_a_retry_replays_on_its_original_rail_even_when_the_router_would_n
     assert again.json()["purchase_id"] == first["purchase_id"] and stubs.reap == []
 
 
-async def test_the_same_key_for_a_different_body_is_a_conflict(client):
-    await client.post(BASE, body())
+async def test_the_same_key_for_a_different_body_is_a_conflict_that_names_the_keys_purchase(client):
+    pid = (await client.post(BASE, body())).json()["purchase_id"]
     resp = await client.post(BASE, body(quantity=2))
     assert resp.status_code == 409 and "idempotency_conflict" in resp.text
+    detail = resp.json().get("detail") or resp.json()
+    assert (detail["purchase_id"], detail["rail"]) == (pid, "a2a")
     assert await _count("a2a_rail_purchases") == 1
+
+
+async def test_a_conflict_never_names_another_owners_purchase_or_a_marker(client, stubs):
+    # Another end user's key with the same name: not this caller's row, so no conflict and no id at all.
+    await client.post(BASE, body())
+    CALLER.agent_user_ref = "user-grace"
+    other = await client.post(BASE, body(quantity=2))
+    assert other.status_code == 202 and other.json()["purchase_id"] not in ("", None)
+    # A refusal tombstone under this key: a conflict, with no id.
+    CALLER.agent_user_ref = USER_REF
+    await database.execute(
+        "UPDATE reap_agentic_purchase_keys SET purchase_id = 'refused:merchant_not_eligible' "
+        "WHERE agent_user_ref_hash = :h", {"h": hash_agent_user_ref(USER_REF)})
+    resp = await client.post(BASE, body(quantity=3))
+    assert resp.status_code == 409 and "idempotency_conflict" in resp.text
+    assert "purchase_id" not in resp.text
 
 
 async def test_a_key_that_opened_a_reap_purchase_is_replayed_by_the_reap_route(client, stubs):
