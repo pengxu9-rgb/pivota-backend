@@ -614,6 +614,60 @@ def _verified_storefronts_by_key(
     return out
 
 
+def _label_verified_storefront_offers(
+    plan: Dict[str, Any], verified: Optional[VerifiedBrandStorefront],
+) -> tuple[Dict[str, Any], Dict[str, int]]:
+    """Label brand_direct the unlabelled offers a PROVEN brand storefront sells on its own host.
+
+    ingestion.resolve_offer_type sees only the listing (domain + brand), so it finds evidence only when
+    the domain's name IS the brand: a brand on "<brand>beauty.com", "<brand>cosmetics.com" or
+    "<brand>-usa.com" comes back unknown_no_evidence and lands offer_type NULL. The gateway's own-offer
+    read selects `offer_type = 'brand_direct' AND is_first_party`, so the brand's own store then never
+    serves a price for its own product. Prod census 2026-10-13: every NULL-typed lane offer written since
+    10-01 came from a drain run that HAD this proof; #2437 handed it to the seeds only.
+
+    The rule still decides, with the verified host as its official_domain (a known retailer host still
+    wins), exactly as scripts/relabel_offer_seller_type does for an attested domain. Only NULL is
+    filled: a type the plan already carries is never changed. An offer is labelled only when its row
+    is one _verified_storefronts_by_key maps (proven brand, brand_official, on the verified host) AND
+    the buyer is sent to that same host -- an offer whose destination is elsewhere stays unlabelled."""
+    from services.offer_seller_identity import (
+        OFFER_TYPE_BRAND_DIRECT,
+        derive_offer_seller_identity,
+        host_from_url,
+    )
+
+    pdps = plan.get("pdps") or []
+    own = _verified_storefronts_by_key(pdps, verified)
+    if not own:
+        return plan, {}
+    pdp_by_key = {str(p.get("product_key") or ""): p for p in pdps}
+    labelled = 0
+    offers: List[Dict[str, Any]] = []
+    for offer in plan.get("offers") or []:
+        key = str(offer.get("product_key") or "")
+        host = own.get(key)
+        if host and offer.get("offer_type") is None:
+            payload = offer.get("offer_payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except ValueError:
+                    payload = {}
+            destination = (payload or {}).get("destination_url") or offer.get("source_ref")
+            if _storefront_host(host_from_url(destination)) == host:
+                pdp = pdp_by_key[key]
+                verdict = derive_offer_seller_identity(
+                    domain=pdp.get("source_domain"), canonical_url=pdp.get("canonical_url"),
+                    brand=pdp.get("brand"), official_domain=host,
+                )
+                if verdict["offer_type"] == OFFER_TYPE_BRAND_DIRECT and verdict["is_first_party"]:
+                    offer = {**offer, "offer_type": OFFER_TYPE_BRAND_DIRECT, "is_first_party": True}
+                    labelled += 1
+        offers.append(offer)
+    return {**plan, "offers": offers}, {"offers_labelled_verified_storefront": labelled}
+
+
 def _note_pdp_refusal(
     refusals: Optional[Dict[str, Dict[str, Any]]], pdp: Dict[str, Any], reason: str, **detail: Any,
 ) -> None:
@@ -2243,7 +2297,9 @@ async def _apply_ingest_plan(
     plan, owner_counts = await _guard_canonical_owner(plan, database, market=market)
     # BOTH executors too: the stage the upsert writes must describe the copy the upsert keeps.
     plan, stage_counts = await _stage_from_kept_copy(plan, database)
-    owner_counts = {**owner_counts, **stage_counts}
+    # Pure, and after the owner guard: label against the rows and keys that will actually be written.
+    plan, label_counts = _label_verified_storefront_offers(plan, verified_storefront)
+    owner_counts = {**owner_counts, **stage_counts, **label_counts}
 
     if batch:
         counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database,
