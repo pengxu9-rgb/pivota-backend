@@ -8499,6 +8499,13 @@ def _normalize_seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "options": seed_variant_options_as_mapping(v.get("options")),
             }
         )
+        # The listing THIS variant is sold on, when it is not the seed's own destination: the retailer lane's
+        # shade fold writes it on a variant taken from another listing (ingestion._build_seed_inserts). Kept
+        # only when present and a plain http(s) URL, so every other seed projects exactly as before. A buyer
+        # link built for a SELECTED variant should open this page, not the product's destination_url.
+        variant_url = str(v.get("url") or "").strip()
+        if variant_url.lower().startswith(("https://", "http://")):
+            variants[-1]["url"] = variant_url
         if len(variants) >= 30:
             break
     return variants

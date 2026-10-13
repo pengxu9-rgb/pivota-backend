@@ -100,8 +100,8 @@ async def test_fold_on_makes_one_product_whose_variants_are_the_shades(monkeypat
     records = await _records(monkeypatch, LINE)
     assert list(_by_name(records)) == ["Gel Colour"]
     # the parent's own item first (it is what the parent page sells, at its price), then the shades
-    # (its Shopify placeholder is labelled on the shades' axis, so every variant is labelled and the picker survives)
-    assert _variants(records[0]) == [("Original", "Color"), ("Ruby Red", "Color"), ("Coral Reef", "Color"),
+    # (on a shade axis its Shopify placeholder stays unlabelled: no colour name the shop never wrote)
+    assert _variants(records[0]) == [("Default Title", ""), ("Ruby Red", "Color"), ("Coral Reef", "Color"),
                                      ("Midnight", "Color")]
     # each shade keeps the listing it came from, which is where it is sold
     assert [v["source_handle"] for v in records[0]["pdp"]["variants"]] == [
@@ -119,7 +119,7 @@ async def test_the_shops_own_option_name_is_used_one_spelling_per_product(monkey
                         product_type="Lip"),
                 product("Lip Oil - Honey", "lip-oil-honey", product_type="Lip")]  # names no axis itself
     records = await _records(monkeypatch, products)
-    assert _variants(records[0]) == [("Original", "Colour"), ("Cherry", "Colour"), ("Honey", "Colour")]
+    assert _variants(records[0]) == [("Default Title", ""), ("Cherry", "Colour"), ("Honey", "Colour")]
 
 
 def test_a_base_that_names_its_own_axis_sets_the_spelling():
@@ -258,7 +258,7 @@ async def test_different_products_sharing_a_title_prefix_are_not_merged(monkeypa
     records = await _records(monkeypatch, products, vendors=(VENDOR, other))
     assert sorted(_by_name(records)) == ["Nail Lacquer", "Nail Lacquer - Cuticle Oil", "Nail Lacquer - Gold Flake",
                                          "Nail Lacquer - Plum", "Nail Lacquer - Top Coat"]
-    assert _variants(_by_name(records)["Nail Lacquer"]) == [("Original", "Color"), ("Blush", "Color")]
+    assert _variants(_by_name(records)["Nail Lacquer"]) == [("Default Title", ""), ("Blush", "Color")]
     assert {r["handle"]: r["reason"] for r in records.fold_report["refused"]} == {
         "nail-lacquer-top-coat": "non_shade_suffix", "nail-lacquer-cuticle-oil": "product_type_mismatch",
         "nail-lacquer-gold-flake": "price_mismatch"}
@@ -376,15 +376,19 @@ class Catalog:
 
     def __init__(self, rows=(), offers=()):
         self.rows = {r["product_key"]: r for r in rows}
-        self.offers = list(offers)  # live catalog_offers rows: {product_key, sku_key, offer_id, source_ref}
+        # this lane's catalog_offers rows: {product_key, sku_key, offer_id, source_ref[, suppressed_at,
+        # suppression_reason]}
+        self.offers = list(offers)
         self.queries = []
 
     async def fetch_all(self, query, values=None):
         self.queries.append(query)
         if query is pipeline.SUPERSEDED_ROWS_SQL:
             return [self.rows[k] for k in values["keys"] if k in self.rows]
-        if query is pipeline.CANONICAL_OFFERS_SQL:
-            return [o for o in self.offers if o["sku_key"] in values["sku_keys"]]
+        if query is pipeline.FOLD_LANE_OFFERS_SQL:
+            assert values["source_system"] == ingestion.AGENT_VERSION
+            return [o for o in self.offers
+                    if o["product_key"] in values["product_keys"] or o["source_ref"] in values["urls"]]
         return []
 
 
@@ -743,7 +747,7 @@ def test_an_axis_the_shop_names_otherwise_keeps_its_name():
             product("Candle - Fig", "c-f", option1="Fig", option_name="Scent", product_type="Candle")]
     out, report = feed.fold_shade_listings(rows, extended=True)
     rec = feed.shopify_product_to_record(out[0], domain=HOST, category_path="beauty", emit_variants=True)
-    assert _variants(rec) == [("Original", "Scent"), ("Fig", "Scent")]
+    assert _variants(rec) == [("Default Title", ""), ("Fig", "Scent")]
     assert report["axes"] == {"shade": 0, "size": 0, "named": 1}
 
 
@@ -906,11 +910,11 @@ async def test_a_live_canonical_offer_at_another_page_holds_the_fold(env, monkey
     flags = {f["rule"]: f for f in _last_run(env)["flags"] if f["severity"] == "block"}
     assert set(flags) == {"fold_moves_live_canonical"} and flags["fold_moves_live_canonical"]["acceptable"] is False
     assert "without fold_shades --" in flags["fold_moves_live_canonical"]["detail"]  # never "run it without"
-    preview = _last_run(env)["checks"]["shade_fold"]["canonical_preview"]
-    assert preview["offers"] == [{"product_key": _canonical_offer("gel-tint", "x")["product_key"],
-                                  "base_handle": "gel-tint",
-                                  "live_source_ref": f"https://{HOST}/products/gel-tint",
-                                  "new_source_ref": f"https://{HOST}/products/gel-tint-8ml"}]
+    preview = _last_run(env)["checks"]["shade_fold"]["offer_preview"]
+    stale = _canonical_offer("gel-tint", "gel-tint")
+    assert preview["offers"] == [{"why": "canonical_moved", "product_key": stale["product_key"],
+                                  "sku_key": stale["sku_key"], "offer_id": stale["offer_id"],
+                                  "source_ref": f"https://{HOST}/products/gel-tint", "suppression_reason": None}]
 
 
 @pytest.mark.parametrize("case,live_at", [("stub", ("gel-tint", "gel-tint-8ml")),     # already moved
@@ -924,12 +928,13 @@ async def test_an_identical_recrawl_of_a_folded_store_applies(env, monkeypatch, 
     first = {o["offer_id"]: o for o in env.applied[-1]["offers"]}
     written = [o for o in env.applied[-1]["offers"] if o["sku_key"].endswith("::canonical")]
     assert [o["source_ref"] for o in written] == [f"https://{HOST}/products/{live_at[1]}"]
-    live = [{k: o[k] for k in ("product_key", "sku_key", "offer_id", "source_ref")} for o in written]
+    live = [{k: o[k] for k in ("product_key", "sku_key", "offer_id", "source_ref")}
+            for o in env.applied[-1]["offers"]]  # every offer the first fold wrote is live
     await _lane(env, monkeypatch, products, catalog=Catalog(offers=live))
     out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
     assert out["status"] == "done", _last_run(env)["flags"]
     assert set(first) == {o["offer_id"] for o in env.applied[-1]["offers"]}  # the same offers, updated in place
-    assert _last_run(env)["checks"]["shade_fold"]["canonical_recheck"]["status"] == "clear"
+    assert _last_run(env)["checks"]["shade_fold"]["offer_recheck"]["status"] == "clear"
 
 
 async def test_a_canonical_destination_change_on_a_live_row_holds(env, monkeypatch):  # noqa: F811
@@ -940,8 +945,8 @@ async def test_a_canonical_destination_change_on_a_live_row_holds(env, monkeypat
                 catalog=Catalog(offers=[_canonical_offer("gel-tint", "gel-tint-8ml")]))
     out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
     assert out["status"] == "held" and env.applied == []
-    assert _last_run(env)["checks"]["shade_fold"]["canonical_preview"]["offers"][0]["new_source_ref"] == (
-        f"https://{HOST}/products/gel-tint-15ml")
+    assert [(o["why"], o["source_ref"]) for o in _last_run(env)["checks"]["shade_fold"]["offer_preview"]["offers"]] == [
+        ("canonical_moved", f"https://{HOST}/products/gel-tint-8ml")]
 
 
 async def test_a_canonical_offer_written_between_the_checks_and_the_write_holds(env, monkeypatch):  # noqa: F811
@@ -951,13 +956,13 @@ async def test_a_canonical_offer_written_between_the_checks_and_the_write_holds(
         reads = 0
 
         async def fetch_all(self, query, values=None):
-            if query is pipeline.CANONICAL_OFFERS_SQL:
+            if query is pipeline.FOLD_LANE_OFFERS_SQL:
                 Racing.reads += 1
                 return [] if Racing.reads == 1 else [stale]
             return await super().fetch_all(query, values)
     await _lane(env, monkeypatch, INVARIANT_CASES["stub"], catalog=Racing())
     out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
-    assert (out["status"], out["outcome"]) == ("held", "fold_canonical_changed") and env.applied == []
+    assert (out["status"], out["outcome"]) == ("held", "fold_offers_changed") and env.applied == []
 
 
 async def test_an_unreadable_canonical_holds_the_fold(env, monkeypatch):  # noqa: F811
@@ -965,7 +970,7 @@ async def test_an_unreadable_canonical_holds_the_fold(env, monkeypatch):  # noqa
         reads = 0
 
         async def fetch_all(self, query, values=None):
-            if query is pipeline.CANONICAL_OFFERS_SQL:
+            if query is pipeline.FOLD_LANE_OFFERS_SQL:
                 Broken.reads += 1
                 if Broken.reads >= self.fail_from:
                     raise ConnectionError("db://secret")
@@ -975,10 +980,10 @@ async def test_an_unreadable_canonical_holds_the_fold(env, monkeypatch):  # noqa
     await _lane(env, monkeypatch, INVARIANT_CASES["stub"], catalog=catalog)
     out = await pipeline.run_stage(fold_job(fold_shades=True), db=env.db)
     assert out["status"] == "held"
-    assert [f["rule"] for f in _last_run(env)["flags"] if f["severity"] == "block"] == ["fold_canonical_unread"]
+    assert [f["rule"] for f in _last_run(env)["flags"] if f["severity"] == "block"] == ["fold_offers_unread"]
     Broken.reads, catalog.fail_from = 0, 2  # readable at the checks, not under the lock
     out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
-    assert (out["status"], out["outcome"]) == ("held", "fold_canonical_unread") and env.applied == []
+    assert (out["status"], out["outcome"]) == ("held", "fold_offers_unread") and env.applied == []
 
 
 async def test_a_moved_canonical_on_a_new_store_applies(env, monkeypatch):  # noqa: F811
@@ -1021,7 +1026,8 @@ async def test_an_excluded_unsellable_parent_moves_no_canonical(env, monkeypatch
     out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True, exclude_handles=["gel-tint"]), db=env.db)
     assert out["status"] == "done", _last_run(env)["flags"]
     assert _last_run(env)["checks"]["shade_fold"]["supersede_preview"]["status"] == "clear"
-    assert _last_run(env)["checks"]["shade_fold"]["canonical_preview"]["bases"] == 0  # the plan writes no folded base
+    # the old canonical at the excluded parent's page: neither its product nor its page is in the plan
+    assert _last_run(env)["checks"]["shade_fold"]["offer_preview"]["status"] == "clear"
 
 
 # ---- pre-enable nits ---------------------------------------------------------------------------------------------
@@ -1049,32 +1055,42 @@ def test_the_price_check_uses_the_parents_first_sellable_price():
     assert len(out) == 1 and report["refused"] == []
 
 
-async def test_every_variant_of_a_folded_seed_is_labelled(monkeypatch):
-    """The picker survives: the parent's own placeholder item is labelled on the children's axis, so the seed
-    writer keeps every option (it drops them all when only some variants are labelled)."""
+async def test_a_folded_size_seed_keeps_its_picker_and_a_shade_seed_invents_no_shade(monkeypatch):
+    """SIZE: the parent's own placeholder item is labelled ("Standard"), every variant is labelled, the seed
+    writer keeps the options and the picker survives. SHADE: no colour name the shop never wrote; the item
+    stays unlabelled and the all-or-nothing rule serves the named variants as a plain list."""
     import json
-    for products, labels in ((LINE, ["Original", "Ruby Red", "Coral Reef", "Midnight"]),
-                             (INVARIANT_CASES["size"], ["Standard", "100ml"])):
-        records = await _records(monkeypatch, products)
-        plan = ingestion.ingest_validated_jsonl(list(records), market="US")
-        seed_variants = json.loads(plan["seeds"][0]["seed_data"])["variants"]
-        assert [v["title"] for v in seed_variants] == labels
-        assert all(v["options"] and v["options"][0]["value"] == v["title"] for v in seed_variants)
-        assert len({o["name"] for v in seed_variants for o in v["options"]}) == 1
+    records = await _records(monkeypatch, INVARIANT_CASES["size"])
+    plan = ingestion.ingest_validated_jsonl(list(records), market="US")
+    seed_variants = json.loads(plan["seeds"][0]["seed_data"])["variants"]
+    assert [v["title"] for v in seed_variants] == ["Standard", "100ml"]
+    assert all(v["options"] and v["options"][0]["value"] == v["title"] for v in seed_variants)
+    assert len({o["name"] for v in seed_variants for o in v["options"]}) == 1
+    records = await _records(monkeypatch, LINE)
+    plan = ingestion.ingest_validated_jsonl(list(records), market="US")
+    seed_variants = json.loads(plan["seeds"][0]["seed_data"])["variants"]
+    assert [v["title"] for v in seed_variants] == ["Default Title", "Ruby Red", "Coral Reef", "Midnight"]
+    assert all(v["options"] == [] for v in seed_variants)
+    assert records.fold_report["parent_items_labelled"] == []
 
 
 @pytest.mark.parametrize("title,children,label", [
     ("Glow Serum 30ml", ["100ml"], "30ml"),            # the size the parent's own title states
     ("Glow Serum", ["100ml"], "Standard"),
-    ("Gel Colour", ["Ruby"], "Original"),
-    ("Gel Colour", ["Original", "Ruby"], "Classic"),
+    ("Lip Balm Duo 2 x 4.5g", ["10g"], "Standard"),    # one unit's quantity, not the item's
+    ("Lip Balm 4.5g x2", ["10g"], "Standard"),
+    ("Lip Balm Set of 3 4.5g", ["10g"], "Standard"),
+    ("Lip Balm 3 Pack 4.5g", ["10g"], "Standard"),
+    ("Body Wash 250ml 8.4oz", ["500ml"], "Standard"),  # two quantities: neither is THE size
+    ("Gel Colour", ["Ruby"], None),                    # a shade axis: no shade name invented
+    ("Gel Colour", ["Original", "Ruby"], None),
 ])
 def test_the_parents_own_item_label(title, children, label):
     rows = [product(title, "p", price="40.00", product_type="Serum")] + [
         product(f"{title} - {c}", f"p-{i}", price="40.00", product_type="Serum") for i, c in enumerate(children)]
     out, report = feed.fold_shade_listings(rows, extended=True)
-    assert out[0]["variants"][0]["title"] == label
-    assert report["parent_items_labelled"] == [{"base_handle": "p", "label": label}]
+    assert out[0]["variants"][0]["title"] == (label or "Default Title")
+    assert report["parent_items_labelled"] == ([{"base_handle": "p", "label": label}] if label else [])
 
 
 def test_a_parent_item_is_not_labelled_across_mixed_axes():
@@ -1107,3 +1123,136 @@ def test_a_parent_item_label_never_repeats_a_childs():
             product("Glow Serum - 100ml", "p-100", price="80.00", product_type="Serum")]
     out, report = feed.fold_shade_listings(rows, extended=True)
     assert [v["title"] for v in out[0]["variants"]] == ["Regular", "Standard", "100ml"]
+
+
+# ---- final pre-enable -------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("handle", ["g100#x", "g100?variant=1", "g100#", "g100?", "", "a/b"])
+async def test_a_child_handle_the_offer_writer_will_not_point_at_is_refused(monkeypatch, handle):
+    """The guard asks the SAME predicate the writer uses (ingestion.own_listing_url): a "#" or "?" handle used to
+    pass the fold, fail the writer, and put the child's 90.00 on the parent's page."""
+    products = [product("Glow Serum", "glow-serum", price="40.00", product_type="Serum"),
+                product("Glow Serum - 100ml", handle, price="90.00", product_type="Serum")]
+    out, report = feed.fold_shade_listings([dict(p) for p in products], extended=True)
+    assert report["folded"] == {} and [r["reason"] for r in report["refused"]] == ["child_handle_unusable"]
+    records = await _records(monkeypatch, products)
+    plan = ingestion.ingest_validated_jsonl(list(records), market="US")
+    at_parent = {o["list_price"] for o in plan["offers"]
+                 if o["source_ref"] == f"https://{HOST}/products/glow-serum"}
+    assert at_parent == {40.0}
+
+
+def test_a_usable_child_handle_still_folds():
+    out, report = feed.fold_shade_listings([product("Glow Serum", "glow-serum", price="40.00"),
+                                            product("Glow Serum - 100ml", "glow-serum-100ml", price="90.00")],
+                                           extended=True)
+    assert report["folded"] == {"glow-serum": ["glow-serum-100ml"]}
+
+
+async def test_the_shop_gateways_seed_projection_keeps_a_folded_variants_own_url(monkeypatch):
+    """The external-seed projection (routes/agent_shop_gateway._normalize_seed_variants) used to drop the
+    per-variant url, so the selected variant's listing never reached the gateway. Kept now; a seed without it
+    projects exactly as before."""
+    import json
+
+    from routes.agent_shop_gateway import _normalize_seed_variants
+    records = await _records(monkeypatch, LINE)
+    seed = ingestion.ingest_validated_jsonl(list(records), market="US")["seeds"][0]
+    projected = _normalize_seed_variants(json.loads(seed["seed_data"]))
+    assert [v.get("url") for v in projected] == [None] + [
+        f"https://{HOST}/products/{h}" for h in ("gel-colour-ruby-red", "gel-colour-coral-reef", "gel-colour-midnight")]
+    assert "url" not in projected[0]
+    plain = {"variants": [{"variant_id": "1", "title": "A", "price_amount": 10.0},
+                          {"variant_id": "2", "title": "B", "price_amount": 10.0, "url": "javascript:alert(1)"}]}
+    assert all("url" not in v for v in _normalize_seed_variants(plain))
+
+
+async def test_a_folded_child_refused_on_a_recrawl_holds_instead_of_leaving_two_live_offers(env, monkeypatch):  # noqa: F811
+    """THE REPRO. A stub parent folds 8 ml and 15 ml. On the next crawl 15 ml is filed under another type (and
+    repriced 34 -> 38): refused, it is written as its own row at 38 while the parent's old 15 ml variant offer
+    at the same page stays live at 34. Held, never acceptable, naming that offer."""
+    first = INVARIANT_CASES["stub"]
+    await _lane(env, monkeypatch, first)
+    assert (await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db))["status"] == "done"
+    written = env.applied[-1]["offers"]
+    fifteen = [o for o in written if o["source_ref"].endswith("/gel-tint-15ml")]
+    assert [o["list_price"] for o in fifteen] == [34.0]
+    second = [dict(p) for p in first]
+    second[2] = product("Gel Tint - 15ml", "gel-tint-15ml", price="38.00", product_type="Nail Care")
+    second[2]["id"], second[2]["variants"][0]["id"] = first[2]["id"], first[2]["variants"][0]["id"]
+    live = [{k: o[k] for k in ("product_key", "sku_key", "offer_id", "source_ref")} for o in written]
+    await _lane(env, monkeypatch, second, catalog=Catalog(offers=live))
+    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
+    assert out["status"] == "held" and len(env.applied) == 1
+    flag = next(f for f in _last_run(env)["flags"] if f["rule"] == "fold_leaves_stale_offer")
+    assert flag["acceptable"] is False and "without fold_shades --" in flag["detail"]
+    stale = _last_run(env)["checks"]["shade_fold"]["offer_preview"]["offers"]
+    assert [(o["why"], o["offer_id"]) for o in stale] == [("duplicate_at_listing", fifteen[0]["offer_id"])]
+
+
+async def test_a_folded_child_gone_from_the_store_holds(env, monkeypatch):  # noqa: F811
+    """The 15 ml listing disappeared: no second row, but the parent keeps selling it at its last price."""
+    first = INVARIANT_CASES["stub"]
+    await _lane(env, monkeypatch, first)
+    assert (await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db))["status"] == "done"
+    written = env.applied[-1]["offers"]
+    live = [{k: o[k] for k in ("product_key", "sku_key", "offer_id", "source_ref")} for o in written]
+    await _lane(env, monkeypatch, first[:2], catalog=Catalog(offers=live))
+    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
+    assert out["status"] == "held"
+    stale = _last_run(env)["checks"]["shade_fold"]["offer_preview"]["offers"]
+    assert [(o["why"], o["source_ref"]) for o in stale] == [("dropped_variant", f"https://{HOST}/products/gel-tint-15ml")]
+
+
+async def test_a_removed_native_variant_is_not_the_folds_to_hold(env, monkeypatch):  # noqa: F811
+    """An offer at the product's OWN page on a non-canonical SKU is a native variant the merchant removed: the
+    lane's long-standing behaviour, not something the fold made."""
+    first = INVARIANT_CASES["size"]
+    await _lane(env, monkeypatch, first)
+    assert (await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db))["status"] == "done"
+    live = [{k: o[k] for k in ("product_key", "sku_key", "offer_id", "source_ref")} for o in env.applied[-1]["offers"]]
+    base_key = live[0]["product_key"]
+    live.append({"product_key": base_key, "sku_key": f"{base_key}::v::gone", "offer_id": "offer:gone",
+                 "source_ref": f"https://{HOST}/products/glow-serum"})
+    await _lane(env, monkeypatch, first, catalog=Catalog(offers=live))
+    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
+    assert out["status"] == "done", _last_run(env)["flags"]
+
+
+@pytest.mark.parametrize("reason,stale", [("catalog_destination_dead_pending", True), ("stale_after_sync", True),
+                                          (None, True), ("product_suppressed", False),
+                                          ("catalog_destination_dead", False)])
+async def test_a_suppressed_offer_that_can_come_back_counts_as_live(env, monkeypatch, reason, stale):  # noqa: F811
+    """The same liveness rule as a superseded row (_superseded_row_retired): a pending or self-reviving
+    suppression is lifted again (catalog_offer_suppression.REVERT_OFFERS_SQL and the lanes that own them)."""
+    offer = dict(_canonical_offer("gel-tint", "gel-tint"), suppressed_at="2026-10-12T00:00:00Z",
+                 suppression_reason=reason)
+    await _lane(env, monkeypatch, INVARIANT_CASES["stub"], catalog=Catalog(offers=[offer]))
+    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
+    assert out["status"] == ("held" if stale else "done"), _last_run(env)["flags"]
+
+
+async def test_the_recheck_under_the_lock_reads_on_one_connection(monkeypatch):
+    class Counting(Catalog):  # every reader connects (is_connected stays False), so each count is one session
+        is_connected = False
+        connects = 0
+
+        async def connect(self):
+            Counting.connects += 1
+
+        async def disconnect(self):
+            pass
+    catalog = Counting()
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (catalog, None))
+    key = ingestion.retailer_product_key(HOST, f"https://{HOST}/products/gel-tint")
+    result = {"checks": {}, "fold_offer_expected": {"offer_ids": [], "urls": [], "own_url": {key: "x"}},
+              "fold_supersede_entries": [{"stale_key": key, "handle": "h", "base_handle": "b"}]}
+    await pipeline._recheck_superseded_rows({"domain": HOST}, result)
+    assert Counting.connects == 1
+    assert set(catalog.queries) == {pipeline.FOLD_LANE_OFFERS_SQL, pipeline.SUPERSEDED_ROWS_SQL}
+
+
+@pytest.mark.parametrize("suffix", ["?", "#", "?#"])
+def test_an_own_listing_url_with_an_empty_query_or_fragment_is_refused(suffix):
+    url = f"https://{HOST}/products/g-ruby{suffix}"
+    assert ingestion.own_listing_url(f"https://{HOST}/products/g", url) is None

@@ -394,8 +394,10 @@ def own_listing_url(listing_url: Optional[str], candidate: Optional[str]) -> Opt
         host = (own.hostname or "").lower().removeprefix("www.")
         if (not candidate or own.scheme not in {"http", "https"} or not host
                 # one plain storefront URL, as retailer_listing_identity demands of a listing: no credentials,
-                # no port, and nothing after the path (a query or fragment would mint a second offer_id)
-                or own.username or own.password or own.port or own.query or own.fragment
+                # no port, and nothing after the path -- not even an empty query or fragment ("/products/x?" is
+                # another string for the same page, and would mint a second offer_id)
+                or own.username or own.password or own.port
+                or "?" in str(candidate) or "#" in str(candidate)
                 or host != (base.hostname or "").lower().removeprefix("www.")
                 or not own.path.startswith("/products/") or not own.path[len("/products/"):].strip("/")):
             return None

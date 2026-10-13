@@ -338,21 +338,31 @@ async def test_the_shade_fold_supersede_read_runs_on_postgres_and_classifies_rea
     assert (retired, never) == (1, 1)
 
 
-async def test_the_shade_fold_canonical_offer_read_runs_on_postgres(db, monkeypatch):
-    """options.fold_shades, the base row: CANONICAL_OFFERS_SQL on the real schema. A live canonical offer at the
-    page the fold would write is not a move (an identical re-crawl applies); one at another page is; a
-    suppressed one is not read at all."""
+async def test_the_shade_fold_lane_offer_read_runs_on_postgres(db, monkeypatch):
+    """options.fold_shades: FOLD_LANE_OFFERS_SQL on the real schema, and the stale split over what it returns.
+    The canonical offer the plan writes again (same offer_id) is not stale; a canonical offer it does not write
+    is (canonical_moved), and so is one under a suppression its lane lifts again (`*_pending`); a final
+    suppression is not; another source_system's offer at the same page is not read at all."""
     import scripts.onboard_curated_brands as cli
     from services.retailer_ingest import pipeline
 
     key = RETAILER_PREFIX + "fold-base"
+    page = f"https://{HOST}/products/face-hero"
     await _product(db, key, content_key=PREFIX + "ck-fold-base")
     await _offer(db, PREFIX + "fold-canon", key, currency="USD", market="US")
-    await _offer(db, PREFIX + "fold-canon-gone", key, currency="USD", market="US")
-    await db.execute("UPDATE catalog_offers SET suppressed_at = NOW(), source_ref = :r WHERE offer_id = :o",
-                     {"r": f"https://{HOST}/products/elsewhere", "o": PREFIX + "fold-canon-gone"})
+    await _offer(db, PREFIX + "fold-pending", key, currency="USD", market="US")
+    await _offer(db, PREFIX + "fold-final", key, currency="USD", market="US")
+    await _offer(db, PREFIX + "fold-sibling", key, currency="SGD", market="SG",
+                 source_system="shopify_markets_sg_localization")
+    for offer_id, reason in ((PREFIX + "fold-pending", "catalog_destination_dead_pending"),
+                             (PREFIX + "fold-final", "catalog_destination_dead")):
+        await db.execute("UPDATE catalog_offers SET suppressed_at = NOW(), suppression_reason = :r WHERE offer_id = :o",
+                         {"r": reason, "o": offer_id})
     monkeypatch.setattr(cli, "_preflight_database", lambda: (db, None))
-    same = f"https://{HOST}/products/face-hero"
-    assert await pipeline._moved_canonical_offers({key: same}) == ([], None)
-    moved, unread = await pipeline._moved_canonical_offers({key: f"https://{HOST}/products/face-hero-8ml"})
-    assert unread is None and [(r["offer_id"], r["source_ref"]) for r in moved] == [(PREFIX + "fold-canon", same)]
+    rewritten = {"offer_ids": [PREFIX + "fold-canon", PREFIX + "fold-pending"], "urls": [page], "own_url": {key: page}}
+    assert await pipeline._stale_fold_offers(rewritten) == ([], None)
+    moved = {"offer_ids": [], "urls": [f"https://{HOST}/products/face-hero-8ml"], "own_url": {key: page}}
+    stale, unread = await pipeline._stale_fold_offers(moved)
+    assert unread is None
+    assert sorted((r["why"], r["offer_id"]) for r in stale) == [
+        ("canonical_moved", PREFIX + "fold-canon"), ("canonical_moved", PREFIX + "fold-pending")]
