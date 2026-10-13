@@ -406,10 +406,13 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 # UNCOVERED BACKFILL (2026-10-13, PIVOTA-Agent #2418 + its follow-up). The nightly selector only reaches
 # rows changed in 24h: 19,744 of 24,675 renderable beauty products (80%) had never had a relationship
 # label, so graph-only rails were empty on 35 of 45 sampled PDPs however many reviews ran. Prod only:
-#   RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT=100 - each night also builds up to 100 never-covered products
+#   RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT=200 - each night also builds up to 200 never-covered products
 #     (the build's coverage predicate, rotated by the 7-day attempt cooldown; requires
-#     PRIORITIZE_UNCOVERED). The cron widens the build limit (200 -> 300) and target recall's anchor cap
-#     with it. 100 for the first nights: runtime is unmeasured; the cap is 200.
+#     PRIORITIZE_UNCOVERED). The cron widens the build limit (200 -> 400) and target recall's anchor cap
+#     with it (400 is recall's maximum, so 200 is the nightly cap).
+#   RELGRAPH_SYNC_REVIEW_LIMIT=2000 - 400 anchors at ~7.6 candidates each are ~3,000 labels a night; at
+#     1,000 the backfill's labels would wait. ~54 minutes of review at concurrency 6, inside the 90-minute
+#     step budget. (Peng 2026-10-13: graph-only is live with ~91% of PDPs empty; drain + nightly 200/2000.)
 #   RELGRAPH_SYNC_EXPAND_TARGET_RECALL=true - candidates come from each anchor's own category, not the
 #     ~1,400 newest rows; a targeted run of 45 anchors generated 344 candidates for 32 that had none.
 #     This applies to the recency anchors too.
@@ -421,8 +424,8 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 relgraph_sync_env(){
   local env="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1"
   if [ "$ENV" = prod ]; then
-    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=90,RELGRAPH_SYNC_REVIEW_LIMIT=1000,RELGRAPH_SYNC_REVIEW_CONCURRENCY=6,RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true"
-    env="$env,RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT=100,RELGRAPH_SYNC_EXPAND_TARGET_RECALL=true"
+    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=90,RELGRAPH_SYNC_REVIEW_LIMIT=2000,RELGRAPH_SYNC_REVIEW_CONCURRENCY=6,RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true"
+    env="$env,RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT=200,RELGRAPH_SYNC_EXPAND_TARGET_RECALL=true"
     env="$env,VERTEX_AI_ENABLED=true,GOOGLE_CLOUD_PROJECT=$PROJECT,GOOGLE_CLOUD_LOCATION=global,GCE_METADATA_HOST=metadata.google.internal"
   else
     env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=45"
