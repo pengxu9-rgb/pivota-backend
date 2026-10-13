@@ -163,8 +163,27 @@ async def test_an_active_card_moves_straight_to_quoting_with_the_newest_card():
     rail = Rail().on("payment.method-view#submit", _methods(ACTIVE, NEWER, {**ACTIVE, "id": "pm_dead", "status": "FAILED"}))
     assert await _step(rail, pid) == "method_ready"
     row = await _row(pid)
-    assert (row["state"], row["payment_method_id"], row["claimed_by"]) == ("quoting", "pm_newer", W)
+    assert (row["state"], row["payment_method_id"], row["claimed_by"]) == ("quoting", "pm_newer", None)
     assert rail.actions() == ["payment.method-view#submit"]  # a read only
+
+
+async def test_every_move_to_a_live_state_gives_the_lease_back_and_is_due_on_that_states_poll():
+    # Measured on staging 2026-10-13: a move kept the lease, so the bound card waited out the 600 s
+    # stale-claim requeue and the `bound` schedule never ran. Each live state, by the real worker steps.
+    pid = (await _open())["id"]
+    before = datetime.now(timezone.utc)
+    assert await _step(Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit", ADD_PAGE),
+                       pid) == "binding_page_issued"
+    row = await _row(pid)
+    assert (row["state"], row["claimed_by"]) == ("needs_payment_method", None)
+    due = row["next_poll_at"].replace(tzinfo=timezone.utc) - before
+    assert timedelta(seconds=worker.POLL_BINDING - 2) <= due <= timedelta(seconds=worker.POLL_BINDING + 5)
+    # The next tick claims it with no requeue in between.
+    assert await _step(Rail().on("payment.method-view#submit", _methods({**ACTIVE, "id": "pm_new"})), pid) == "method_ready"
+    row = await _row(pid)
+    assert (row["state"], row["claimed_by"]) == ("quoting", None)
+    assert row["next_poll_at"].replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc) + timedelta(seconds=1)
+    assert pid in [r["id"] for r in await ledger.claim_due_purchases(W, limit=50)]  # due at once
 
 
 async def test_no_card_issues_a_binding_page_and_the_write_was_recorded_before_it_was_sent():
@@ -448,7 +467,8 @@ async def test_a_tick_steps_within_its_budget_and_releases_what_it_did_not_reach
     counts = await worker.run_tick(_client(rail), W, budget_seconds=60, clock=lambda: next(ticks))
     assert counts.get("method_ready") == 1 and counts.get("deferred") == 2
     rows = {r["id"]: r for r in await database.fetch_all("SELECT * FROM a2a_rail_purchases")}
-    assert sum(r["claimed_by"] is None for r in rows.values()) == 2
+    # The two it did not reach are given back, and so is the one it moved to quoting.
+    assert sum(r["claimed_by"] is None for r in rows.values()) == 3
 
 
 async def test_a_failing_step_is_released_and_the_tick_goes_on():

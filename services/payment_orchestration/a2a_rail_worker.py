@@ -284,11 +284,23 @@ async def _read_failed(s: _Step, read: Any, prefix: str) -> str:
     return "rail_read_failed"
 
 
+#: When a purchase that just ENTERED a live state is next due: at once for a step the worker takes
+#: itself, the buyer state's own poll for a page the buyer is on.
+_DUE_AFTER_ENTERING = {"needs_payment_method": POLL_BINDING, "quoting": 0, "awaiting_authorization": POLL_APPROVAL}
+
+
 async def _settled(s: _Step, moved: Optional[Mapping[str, Any]], outcome: str) -> str:
     """`outcome` when the transition happened. A None transition is a lost race only if the row moved
     on; if this worker still holds it (the ledger refused the transition, e.g. its contact was
     purged), give the lease back with a reason instead of sitting on it until the requeue."""
     if moved is not None:
+        state = moved.get("state")
+        if state not in ledger.TERMINAL_STATES and moved.get("claimed_by") == s.worker:
+            # A move to a live state keeps the lease (only a terminal write clears it): give it back,
+            # or the row waits out the stale-claim requeue (STALE_LEASE_SECONDS) before its next step.
+            # The code the transition wrote stays (no code: COALESCE).
+            await ledger.release_claim(
+                s.id, s.worker, next_poll_at=_later(_DUE_AFTER_ENTERING.get(state, POLL_RETRY)))
         return outcome
     row = await ledger.get_purchase_internal(s.id)
     if row is not None and row.get("claimed_by") == s.worker and row.get("state") not in ledger.TERMINAL_STATES:
