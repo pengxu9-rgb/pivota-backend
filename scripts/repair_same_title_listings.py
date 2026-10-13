@@ -46,13 +46,15 @@ over a repair); every touched content_key's served view and eligibility are rebu
                                                  [--only-host-alias]
   Apply (Peng's go; AFTER the drain is re-imaged onto #2463 -- the old drain image re-points rows and re-activates
   the left-out pages' seeds on its next run of a store, undoing this; the new one never moves a row off its listing):
-    ... --host <store> [--only-host-alias] --max-groups <n> --expect-suppress <offers_to_suppress> --apply
-  An --apply re-plans live: it is refused without --host, or when the plan acts on more than --max-groups groups or
-  suppresses any count but --expect-suppress (copy both from the reviewed dry run of the SAME arguments).
+    ... --host <store> [--only-host-alias] --max-groups <n> --expect-digest <plan_digest> --apply
+  An --apply re-plans live: it is refused without exactly one --host, or when the plan acts on more than
+  --max-groups groups or its plan_digest is not --expect-digest (copy both from the reviewed dry run of the SAME
+  arguments: any change since -- grown, shrunk, other rows, an extra restore -- changes the digest).
   Host aliases: apply only after the drain image carries ingestion.respell_listing_host AND one crawl of the host
   has run on it, then dry-run again -- before that, a crawl under the other spelling re-mints what this suppresses.
-  Dry-run EVERY market the host is captured for (--market SG, AU, ...): a group with another market's live offer
-  at the alias spelling is skipped (`other_market_alias_live`) until that market is planned too.
+  Dry-run EVERY market the host is captured for (--market SG, AU, ...), and apply the SIBLING markets first, the
+  base market last: a group whose suppressed base still has a live Shopify Markets sibling is skipped
+  (`sibling_market_alias_live`, `stranded_siblings`) until that sibling's market has run.
   Folded stores: never run the same-title half (without --only-host-alias) on a store whose shade fold is on.
   Revert a run (all or nothing; refused while a LATER applied run holds any of its rows), or re-run its rebuild:
     python -m scripts.repair_same_title_listings revert --run-id samelisting_<hex>
@@ -254,12 +256,13 @@ def plan_alias(row: Mapping[str, Any], host: str, listing: str, offers: List[Map
     if not spelling or not aliases:
         return None
     suppress = [o for o in aliases if _shelf(o) in kept_shelves]
-    # Another market's live offers at the alias spelling: a Shopify Markets sibling copies its base offer's
-    # source_ref and is refreshed only while that base is live (shopify_markets.CANDIDATES_SQL), so suppressing
-    # the base here would leave the sibling serving a price nobody refreshes. Such a row is skipped whole until
-    # every market's alias is planned together (run the repair for each market after a fresh capture).
-    other_market = [o["offer_id"] for o in offers if o.get("suppressed_at") is None and not _in_market(o, market)
+    other_market = [o for o in offers if o.get("suppressed_at") is None and not _in_market(o, market)
                     and _spelled_host(o) != spelling]
+    # A Shopify Markets sibling copies its base offer's source_ref and is refreshed only while that base is live
+    # (shopify_markets.CANDIDATES_SQL): suppressing a base here would leave its sibling serving a price nobody
+    # refreshes. The hazard runs one way -- suppressing a sibling strands nothing -- so the row is held only while
+    # a sibling of an offer THIS plan suppresses is live. Plan the sibling markets first, the base market last.
+    stranded = _live_siblings_of(suppress, other_market)
     return {
         "product_key": row["product_key"], "content_key": row.get("content_key"), "host": host,
         "kind": "host_alias", "reason": ALIAS_REASON,
@@ -271,10 +274,20 @@ def plan_alias(row: Mapping[str, Any], host: str, listing: str, offers: List[Map
                                     for o in suppress},
         "alias_kept_alone": [o["offer_id"] for o in aliases if _shelf(o) not in kept_shelves],
         "deactivate_prior_updated_at": {}, "other_market_left": len(other_market),
-        "other_market_alias_live": other_market,
+        "other_market_alias_live": [o["offer_id"] for o in other_market],
+        "stranded_siblings": stranded,
         "restore": [], "deactivate": [], "repoint": None,
-        "skipped": ("other_market_alias_live" if suppress and other_market
+        "skipped": ("sibling_market_alias_live" if stranded
                     else None if suppress else "alias_alone_on_its_shelf")}
+
+
+def _live_siblings_of(bases: List[Mapping[str, Any]], others: List[Mapping[str, Any]]) -> List[str]:
+    """The live other-market offers that are the Shopify Markets sibling of one of `bases` (sibling_offer_id)."""
+    from services.retailer_ingest.shopify_markets import sibling_offer_id
+
+    ids = {o["offer_id"] for o in bases}
+    return sorted(x["offer_id"] for x in others
+                  if any(x["offer_id"] == sibling_offer_id(b, str(x.get("market") or "US").upper()) for b in ids))
 
 
 def _in_market(item: Mapping[str, Any], market: str) -> bool:
@@ -416,6 +429,7 @@ def summary(p: Mapping[str, Any]) -> Dict[str, Any]:
         "host_alias_groups": sum(1 for g in act if g.get("kind") == "host_alias"),
         "host_alias_offers_to_suppress": sum(len(g["suppress"]) for g in act if g.get("kind") == "host_alias"),
         "host_alias_kept_alone": sum(len(g.get("alias_kept_alone") or []) for g in p["groups"]),
+        "plan_digest": plan_digest(p),
         "listings_left_out": sum(len(g["left_out"]) for g in act),
         "other_market_left": sum(g.get("other_market_left") or 0 for g in p["groups"]),
         # how old the price of each offer that comes back is (review 2): by the day its price was last read
@@ -575,19 +589,33 @@ async def revert(db: Any, run_id: str) -> Dict[str, Any]:
     return {"run_id": run_id, **done, "refresh": await refresh_after(db, m, source=f"{run_id}:revert")}
 
 
+def plan_digest(p: Mapping[str, Any]) -> str:
+    """16 hex over every change the plan would write -- each acted group's kind, row, host and its sorted suppress,
+    restore, deactivate and repoint -- so an --apply can prove it writes exactly what the dry run showed."""
+    import hashlib
+
+    acted = sorted(
+        ({"kind": g.get("kind") or "same_title", "product_key": g["product_key"], "host": g["host"],
+          "suppress": sorted(g["suppress"]), "restore": sorted(r["offer_id"] for r in g["restore"]),
+          "deactivate": sorted(g["deactivate"]),
+          "repoint": (g["repoint"] or {}).get("canonical_url")} for g in p["groups"] if not g["skipped"]),
+        key=lambda e: (e["product_key"], e["host"], e["kind"]))
+    return hashlib.sha256(json.dumps(acted, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
 def apply_refusal(args: argparse.Namespace, s: Mapping[str, Any]) -> Optional[str]:
-    """Why an --apply must not write, or None. --apply re-plans live, so it is bound to the REVIEWED dry run: it
-    names its host(s), caps the groups it may act on, and states the offer count the dry run showed -- a plan that
-    grew since (a new crawl, another market's capture) is refused rather than written."""
-    if not args.host:
-        return "--apply needs --host (one store per reviewed run)"
-    if args.max_groups is None or args.expect_suppress is None:
-        return "--apply needs --max-groups and --expect-suppress from the reviewed dry run"
+    """Why an --apply must not write, or None. --apply re-plans live, so it is bound to the REVIEWED dry run: ONE
+    store (--host), a cap on the groups it may act on, and the dry run's plan_digest -- a plan that changed since in
+    any way (grew, shrank, other rows at the same count, an extra restore) is refused rather than written."""
+    if len(args.host or []) != 1:
+        return "--apply needs exactly one --host (one store per reviewed run)"
+    if args.max_groups is None or not args.expect_digest:
+        return "--apply needs --max-groups and --expect-digest from the reviewed dry run"
     acted = s["groups"] - sum((s.get("skipped") or {}).values())
     if acted > args.max_groups:
         return f"{acted} groups to act on exceeds --max-groups {args.max_groups}"
-    if s["offers_to_suppress"] != args.expect_suppress:
-        return f"{s['offers_to_suppress']} offers to suppress, the reviewed dry run said {args.expect_suppress}"
+    if s["plan_digest"] != args.expect_digest:
+        return f"plan_digest {s['plan_digest']} is not the reviewed dry run's {args.expect_digest}"
     return None
 
 
@@ -635,8 +663,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="plan (and apply) the host_alias groups alone")
     p.add_argument("--max-groups", dest="max_groups", type=int, default=None,
                    help="--apply: refuse a plan acting on more groups than this")
-    p.add_argument("--expect-suppress", dest="expect_suppress", type=int, default=None,
-                   help="--apply: the offers_to_suppress the reviewed dry run showed; any other count is refused")
+    p.add_argument("--expect-digest", dest="expect_digest", default=None,
+                   help="--apply: the plan_digest the reviewed dry run printed; any other plan is refused")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--run-id", dest="run_id")
     args = p.parse_args(argv)

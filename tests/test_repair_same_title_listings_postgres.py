@@ -446,11 +446,26 @@ async def test_only_host_alias_leaves_the_same_title_groups_alone(catalog):
     assert {g["product_key"] for g in (await tool.plan(db, hosts=[], keys=[]))["groups"]} > {K_ALIAS, K_BC}
 
 
-async def test_a_live_alias_sibling_in_another_market_holds_the_row(catalog):
+async def test_a_base_with_a_live_sibling_waits_for_the_sibling_market_then_every_alias_goes(catalog):
+    """Controller review of #2596: suppressing a base strands its live Shopify Markets sibling, suppressing a sibling
+    strands nothing. AU's siblings of the US base offers (same SKU, the base's source_ref) run first; then US."""
+    from services.retailer_ingest.shopify_markets import sibling_offer_id
+
     db, admin, tool, _ = catalog
     await _alias_rows(admin)
-    await _offer(admin, "o_al_au_www", K_ALIAS, ALIAS_WWW, market="AU")
-    [g] = (await tool.plan(db, hosts=[], keys=[K_ALIAS]))["groups"]
-    assert g["skipped"] == "other_market_alias_live" and g["other_market_alias_live"] == ["o_al_au_www"]
+    au_www, au_apex = sibling_offer_id("o_al_www", "AU"), sibling_offer_id("o_al_apex", "AU")
+    await _offer(admin, au_www, K_ALIAS, ALIAS_WWW, market="AU")
+    await _offer(admin, au_apex, K_ALIAS, ALIAS_APEX, market="AU")
+    [us] = (await tool.plan(db, hosts=[], keys=[K_ALIAS]))["groups"]
+    assert us["skipped"] == "sibling_market_alias_live" and us["stranded_siblings"] == [au_www]
     with pytest.raises(SystemExit, match="nothing to repair"):
         await tool.apply(db, await tool.plan(db, hosts=[], keys=[K_ALIAS]))
+    au = await tool.plan(db, hosts=[], keys=[K_ALIAS], market="AU")
+    assert [(g["skipped"], g["suppress"]) for g in au["groups"]] == [(None, [au_www])]
+    await tool.apply(db, au)
+    us = await tool.plan(db, hosts=[], keys=[K_ALIAS])
+    assert [(g["skipped"], g["suppress"]) for g in us["groups"]] == [(None, ["o_al_v_www", "o_al_www"])]
+    await tool.apply(db, us)
+    live = {r["offer_id"] for r in await admin.fetch(
+        "SELECT offer_id FROM catalog_offers WHERE product_key = $1 AND suppressed_at IS NULL", K_ALIAS)}
+    assert live == {"o_al_apex", "o_al_v_apex", "o_al_v2_www", "o_al_sg", au_apex}
