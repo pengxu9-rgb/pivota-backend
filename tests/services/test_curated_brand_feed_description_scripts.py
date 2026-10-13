@@ -31,7 +31,6 @@ from services.curated_brand_feed import (body_html_sentences, body_html_to_text,
     ("<p>Ca<sup>2+</sup> ions.</p>", "Ca²⁺ ions."),
     ("<p>Peaks<sup>(1)</sup>.</p>", "Peaks⁽¹⁾."),
     ("<p>Ratio<sub>1=2</sub>.</p>", "Ratio₁₌₂."),
-    ("<p>Ceramide<sup> 1 </sup> spaced inside.</p>", "Ceramide¹ spaced inside."),
     ("<p>Ceramide<sup><span>1</span></sup> nested.</p>", "Ceramide¹ nested."),
     ('<p>Ceramide<sup class="fn">1</sup> attributes.</p>', "Ceramide¹ attributes."),
     ("<p>Ceramide<SUP>1</SUP> upper case.</p>", "Ceramide¹ upper case."),
@@ -46,9 +45,10 @@ def test_a_numeric_sub_or_superscript_is_rendered_as_unicode(body, expected):
 
 
 @pytest.mark.parametrize("body,expected", [
-    # A COMMA LIST keeps its plain comma between the marks; a range keeps its hyphen as a superscript minus.
+    # A COMMA LIST keeps its plain comma (and any space after it); a range keeps its hyphen as a superscript minus.
     ("<p>Peptides<sup>1,2</sup> work.</p>", "Peptides¹,² work."),
-    ("<p>Peptides<sup>1, 2</sup> work.</p>", "Peptides¹,² work."),
+    ("<p>Peptides<sup>1, 2</sup> work.</p>", "Peptides¹, ² work."),  # the space after a comma is kept
+    ("<p>Peptides<sup>1,  2</sup> work.</p>", "Peptides¹, ² work."),  # runs collapse, as all text does
     ("<p>Acids<sup>1-3</sup> work.</p>", "Acids¹⁻³ work."),
     ("<p>Oils<sup>1,2,10</sup> work.</p>", "Oils¹,²,¹⁰ work."),
 ])
@@ -133,3 +133,27 @@ def test_the_producer_is_deterministic():
     first = body_html_to_text(body)
     assert all(body_html_to_text(body) == first for _ in range(3))
     assert body_html_to_text(f"<p>{first}</p>") == first, "already-converted text passes through unchanged"
+
+
+@pytest.mark.parametrize("body", [
+    "<p>Peptides<sup>1 2</sup> work.</p>",              # a space not after a comma: never "twelve"
+    "<p>Ceramide<sup> 1 </sup> spaced inside.</p>",
+    "<p>Ceramide<sup>1&nbsp;</sup> nbsp.</p>",
+    "<p>Peptides<sup>1,\n2</sup> newline.</p>",
+    "<p>Peptides<sup>1\t,2</sup> tab.</p>",
+    "<p>A<sup>1</p><p>2</sup> block break.</p>",         # malformed: the block break stays a break
+    "<p>A<sup>1<br>2</sup> line break.</p>",
+    "<p>X<sup>" + "1," * 120 + "1</sup> over the length cap.</p>",
+])
+def test_a_sup_that_could_hold_a_separator_renders_exactly_as_before(body, monkeypatch):
+    converted = (body_html_to_text(body), body_html_sentences(body))
+    monkeypatch.setattr(cbf, "_script_numeral", lambda m: m.group(0))
+    assert converted == (body_html_to_text(body), body_html_sentences(body))
+    assert not any(ch in cbf.SCRIPT_NUMERAL_CHARS for ch in converted[0])
+
+
+def test_a_long_numeric_list_under_the_length_cap_is_converted():
+    content = ",".join(["1"] * 16)  # 31 characters: past a short cap, inside the 200-character one
+    assert 20 < len(content) < 200
+    out = body_html_to_text(f"<p>Studies<sup>{content}</sup> show.</p>")
+    assert out == "Studies" + ",".join(["\u00b9"] * 16) + " show."
