@@ -1063,7 +1063,20 @@ _ABBREVIATION_TAIL_RE = re.compile(
 _SENTENCE_TERMINAL = ".!?。！？"
 
 
+# A boilerplate LABEL starts a new unit even without punctuation before it: "...Made in Japan Disclaimer: Due
+# to photographic lighting..." -- otherwise the product's own words and the store's disclaimer are one
+# sentence, and dropping the disclaimer would take "Made in Japan" with it.
+_LABEL_BOUNDARY_RE = re.compile(r"\s+(?=(?:disclaimer|please\s+note)\s*:)|(?<!please)\s+(?=note\s*:)", re.IGNORECASE)
+
+
 def _split_sentences(block: str) -> List[str]:
+    out: List[str] = []
+    for part in _LABEL_BOUNDARY_RE.split(block):
+        out.extend(_split_punctuated(part))
+    return out
+
+
+def _split_punctuated(block: str) -> List[str]:
     out: List[str] = []
     start = 0
     for m in _SENTENCE_END_RE.finditer(block):
@@ -1138,6 +1151,10 @@ _BOILERPLATE_CLASSES: Tuple[Tuple[str, Tuple[Tuple["re.Pattern[str]", ...], ...]
         (r"(?i)\b(?:promo|discount|coupon|voucher)\s*codes?\b",),
         (r"(?i)\b(?:bulk|wholesale)\s+(?:discounts?|pricing|prices|orders?|inquiries|enquiries|accounts?)\b",),
         (r"(?i)\bbuy(?:ing)?\s+in\s+bulk\b", r"(?i)\b(?:save|savings|discount|off)\b"),
+        # Quantity-tier pricing: "10 pcs and above - 12% off", "MIX & MATCH BULK DISCOUNT".
+        (r"(?i)\b\d+\s*(?:pcs|pieces|units|items|bottles|sets)\s+(?:and|&|or)\s+(?:above|more|over)\b",
+         r"(?i)\b(?:off|discount|save|savings)\b"),
+        (r"(?i)\bmix\s*(?:&|and)\s*match\b", r"(?i)\b(?:bulk|discount|off|save)\b"),
         (r"(?i)\bbuy\s+(?:\d+|one|two|three)\s*,?\s*get\s+(?:\d+|one|two|three)\s+(?:free|half|\d+\s*%)",),
     )),
     ("store_link", _rules(
@@ -1164,13 +1181,16 @@ _BOILERPLATE_CLASSES: Tuple[Tuple[str, Tuple[Tuple["re.Pattern[str]", ...], ...]
         (r"(?i)\ban?\s+(?:post|photo|video|reel)\s+shared\s+by\b[^@]{0,80}@[\w.]+\)?",),
         (rf"(?i)\bfollow\s+us\s+(?:on\s+)?{_PLATFORM}\b",),
         (r"(?i)\bfollow\s+us\s+@[\w.]+",),
+        (rf"(?i)\bfollow\s+(?:[^\s,.;:!?]+\s+){{0,3}}(?:on\s+)?{_PLATFORM}\b",),
         (rf"(?i)\b(?:find|join)\s+us\s+on\s+{_PLATFORM}\b",),
         (r"(?i)\btag\s+us\b", rf"(?i)@[\w.]+|#\w+|\b{_PLATFORM}\b"),
     )),
     ("colour_disclaimer", _rules((
-        r"(?i)\b(?:colou?rs?|shades?)\s+(?:may|might|can|could)\s+(?:vary|differ|appear\s+(?:slightly\s+)?"
-        r"different|look\s+(?:slightly\s+)?different)\b",
-        r"(?i)\b(?:monitors?|screens?|displays?|devices?|computers?)\s+(?:settings?|resolutions?|calibrations?)\b"
+        r"(?i)\b(?:colou?rs?|shades?)(?:\s+(?:in|of|on|shown\s+in)\s+(?:the|this|these|our)\s+"
+        r"(?:images?|photos?|pictures?|photographs?))?\s+(?:may|might|can|could)\s+(?:vary|differ|appear\s+"
+        r"(?:slightly\s+)?different|look\s+(?:slightly\s+)?different)\b",
+        r"(?i)\bphotographic\b|\blighting\s+(?:sources?|conditions?)\b"
+        r"|\b(?:monitors?|screens?|displays?|devices?|computers?)\s+(?:settings?|resolutions?|calibrations?)\b"
         r"|\bscreen\s+to\s+screen\b|\bmonitor\s+to\s+monitor\b"
         r"|\b(?:on|from)\s+(?:your|each|every|different|individual|one)\s+(?:monitors?|screens?|displays?|devices?|computers?)\b",
     ),)),
@@ -1302,6 +1322,17 @@ def _join_sentences(sentences: Sequence[str]) -> str:
     return "".join(parts)
 
 
+_HEADING_MAX_WORDS = 5
+
+
+def _is_heading_unit(unit: str) -> bool:
+    """A section heading: a short unit with no sentence punctuation ("Full Ingredients", "How to use:")."""
+    text = (unit or "").strip()
+    if not text or text.rstrip(":").rstrip()[-1:] in _SENTENCE_TERMINAL:
+        return False
+    return len(text.rstrip(":").split()) <= _HEADING_MAX_WORDS
+
+
 def join_description_sentences(sentences: Sequence[str], max_len: int = BODY_TEXT_MAX_LEN) -> str:
     """Join sentences into the description, capped at `max_len` on the LAST sentence boundary
     that fits, so the copy does not end mid-sentence. When that boundary would keep less than half
@@ -1316,6 +1347,10 @@ def join_description_sentences(sentences: Sequence[str], max_len: int = BODY_TEX
             break
         if s:
             kept.append(s)
+    # A cut that lands right after a section heading ("Full Ingredients", "How to use:") would end the copy on
+    # the bare heading: the section it introduces did not fit. Drop such trailing headings.
+    while len(kept) > 1 and _is_heading_unit(kept[-1]):
+        kept.pop()
     head = _join_sentences(kept)
     if len(head) * 2 >= max_len:
         return head
