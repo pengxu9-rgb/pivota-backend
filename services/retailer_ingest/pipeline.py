@@ -1078,6 +1078,24 @@ def _listing_key(url: Optional[str]) -> str:
     return f"{host}{parsed.path.rstrip('/')}" if host else str(url or "")
 
 
+def _is_www_twin(url: Optional[str], of: Optional[str]) -> bool:
+    """Is `url` exactly `of` spelled with or without `www.` -- same scheme, same path, the hosts equal once `www.`
+    is dropped but not equal as written, and no query, fragment, credentials or port on either? Nothing looser:
+    an alias skips the mass-retire count, so only a proven second spelling of the very same page may."""
+    from urllib.parse import urlsplit
+
+    try:
+        a, b = urlsplit(str(url or "")), urlsplit(str(of or ""))
+        clean = all(not (x.query or x.fragment or x.username or x.password or x.port) for x in (a, b))
+    except ValueError:
+        return False
+    if not clean or "?" in str(url) or "#" in str(url) or a.scheme.lower() != b.scheme.lower():
+        return False
+    ha, hb = (a.hostname or "").lower(), (b.hostname or "").lower()
+    return (bool(ha) and ha != hb and ha.removeprefix("www.") == hb.removeprefix("www.")
+            and a.path.rstrip("/") == b.path.rstrip("/") and bool(a.path.strip("/")))
+
+
 def _url_aliases(url: str) -> List[str]:
     """`url` and its other `www.` spelling: the forms a lane's older rows may carry for the same page."""
     from urllib.parse import urlsplit, urlunsplit
@@ -1092,17 +1110,20 @@ def _url_aliases(url: str) -> List[str]:
 
 
 def _fold_offer_expectations(plan: Dict[str, Any], fold_base_keys: Any = ()) -> Dict[str, Any]:
-    """What a fold cohort's plan writes, for the stale-offer read: every offer_id, the listing URL of each offer
-    (and the pages each product writes, as _listing_key), each product's own page, and which products are fold
+    """What a fold cohort's plan writes, for the stale-offer read: every offer_id, the listing URL of each offer,
+    the URL each product's canonical offer is written at, each product's own page, and which products are fold
     bases (their own placeholder item can be dropped by the fold: an unsellable parent)."""
+    from services.catalog_enrichment_agent.ingestion import SKU_SUFFIX
+
     offers = plan.get("offers") or []
-    pages: Dict[str, set] = {}
+    canonical_refs: Dict[str, str] = {}
     for o in offers:
-        pages.setdefault(str(o.get("product_key")), set()).add(_listing_key(o.get("source_ref")))
+        if str(o.get("sku_key") or "") == f"{o.get('product_key')}{SKU_SUFFIX}" and o.get("source_ref"):
+            canonical_refs[str(o.get("product_key"))] = str(o["source_ref"])
     return {"offer_ids": sorted({str(o.get("offer_id")) for o in offers}),
+            "canonical_refs": canonical_refs,
             "urls": sorted({str(o.get("source_ref") or "") for o in offers} - {""}),
             "own_url": {str(p.get("product_key")): str(p.get("canonical_url") or "") for p in plan.get("pdps") or []},
-            "pages": {k: sorted(v) for k, v in pages.items()},
             "fold_bases": sorted(set(fold_base_keys or ()))}
 
 
@@ -1189,13 +1210,17 @@ async def _stale_fold_offers(expected: Dict[str, Any], read: Any = None) -> tupl
     for row in rows:
         why = _classify_stale_offer(row, expected, planned, url_keys)
         if why:
-            page = _listing_key(row.get("source_ref"))
             stale.append({"why": why, "action": _stale_action(row, why), "product_key": row.get("product_key"),
                           "sku_key": row.get("sku_key"), "offer_id": row.get("offer_id"),
                           "source_ref": row.get("source_ref"), "suppression_reason": row.get("suppression_reason"),
-                          # The SAME product still writes an offer at this very page: the stale one is a second
-                          # spelling (`www.`) or a superseded SKU of it -- nothing leaves the catalog.
-                          "alias": page in set((expected.get("pages") or {}).get(str(row.get("product_key")), ()))})
+                          # A proven second spelling of this product's canonical: the SAME product's canonical
+                          # SKU, at the `www.`/apex twin of the very URL the plan writes that canonical at
+                          # (_is_www_twin). Retired like any stale offer; only kept out of the mass-retire count,
+                          # since nothing leaves the catalog. Anything looser would let a large retire of real
+                          # offers skip the guard.
+                          "alias": (why == "canonical_moved" and _is_www_twin(
+                              row.get("source_ref"),
+                              (expected.get("canonical_refs") or {}).get(str(row.get("product_key")))))})
     return sorted(stale, key=lambda r: str(r["offer_id"])), None
 
 

@@ -1543,6 +1543,70 @@ async def test_alias_retires_never_trip_the_mass_retire_guard(env, monkeypatch):
     assert all(a["suppression_reason"] == FOLD_REASON for a in aliases)
 
 
+async def test_real_retires_still_trip_the_guard_on_a_host_full_of_aliases(env, monkeypatch):  # noqa: F811
+    """Review of the retire PR: aliases are kept out of the count, so the count must still see every REAL
+    retire. A host whose older canonicals all carry a `www.` twin, plus a line that suddenly drops most of its
+    shades: the real retires alone pass the limit, and the job holds."""
+    separates = [_p(f"Cheek Balm Ruby {i:02d}", f"cheek-balm-ruby-{i:02d}", "12.00") for i in range(14)]
+    store = Store()
+    assert (await _crawl(env, monkeypatch, separates + _shade_line(14, 14), store))["status"] == "done"
+    aliases = [dict(o, offer_id=f"offer:catalog_enrichment_agent_v1:www-{n}", source_ref=_www(o["source_ref"]))
+               for n, o in enumerate(o for o in store.live() if o["sku_key"].endswith("::canonical"))]
+    store.offers += aliases
+    live_before = len(store.live())
+    out = await _crawl(env, monkeypatch, separates + _shade_line(14, 1), store)
+    assert out["status"] == "held"
+    assert any(f["rule"] == "fold_mass_retire" for f in _last_run(env)["flags"])
+    preview = _last_run(env)["checks"]["shade_fold"]["offer_preview"]
+    real = [r for r in preview["retire"] if not r["alias"]]
+    assert len(real) > preview["retire_limit"] and len([r for r in preview["retire"] if r["alias"]]) == len(aliases)
+    assert len(store.live()) == live_before  # nothing retired, aliases included
+
+
+@pytest.mark.parametrize("url,of,twin", [
+    ("https://www.shop.example/products/a", "https://shop.example/products/a", True),
+    ("https://shop.example/products/a", "https://www.shop.example/products/a", True),
+    ("https://www.shop.example/products/a/", "https://shop.example/products/a", True),
+    ("https://shop.example/products/a", "https://shop.example/products/a", False),          # the same spelling
+    ("https://www.shop.example/products/a?variant=1", "https://shop.example/products/a", False),
+    ("https://www.shop.example/products/a#x", "https://shop.example/products/a", False),
+    ("https://www.shop.example/products/a?", "https://shop.example/products/a", False),
+    ("https://www.shop.example/products/a#", "https://shop.example/products/a", False),
+    ("https://www.shop.example/products/b", "https://shop.example/products/a", False),     # another page
+    ("https://www.other.example/products/a", "https://shop.example/products/a", False),
+    ("http://www.shop.example/products/a", "https://shop.example/products/a", False),
+    ("https://www.shop.example:8443/products/a", "https://shop.example/products/a", False),
+    ("https://www.shop.example/", "https://shop.example/", False),
+    ("https://www.shop.example/products/a", None, False),
+])
+def test_only_a_proven_www_twin_is_an_alias(url, of, twin):
+    assert pipeline._is_www_twin(url, of) is twin
+
+
+def test_an_alias_is_only_the_same_products_canonical_at_the_www_twin_of_its_planned_canonical():
+    page = "https://shop.example/products/a"
+    expected = {"offer_ids": ["planned"], "urls": [page], "own_url": {"pk:a": page, "pk:b": "https://shop.example/products/b"},
+                "canonical_refs": {"pk:a": page, "pk:b": "https://shop.example/products/b"}, "fold_bases": ["pk:a"]}
+
+    async def read(sql, values):
+        return [
+            {"product_key": "pk:a", "sku_key": "pk:a::canonical", "offer_id": "a-www", "source_ref": _www(page)},
+            {"product_key": "pk:a", "sku_key": "pk:a::canonical", "offer_id": "a-www-q",
+             "source_ref": _www(page) + "?variant=1"},
+            {"product_key": "pk:a", "sku_key": "pk:a::v:2", "offer_id": "a-var-www",
+             "source_ref": "https://www.shop.example/products/a-2"},
+            {"product_key": "pk:b", "sku_key": "pk:b::canonical", "offer_id": "b-at-a-www", "source_ref": _www(page)},
+            # the fold base's own item, dropped, at the www twin of its canonical page: a real retire, not an alias
+            {"product_key": "pk:a", "sku_key": "pk:a::v:1", "offer_id": "a-item-www", "source_ref": _www(page)},
+        ], None
+    import asyncio
+    stale, unread = asyncio.run(pipeline._stale_fold_offers(expected, read))
+    assert unread is None
+    assert {r["offer_id"]: r["alias"] for r in stale} == {
+        "a-www": True, "a-www-q": False, "a-var-www": False, "b-at-a-www": False, "a-item-www": False}
+    assert {r["offer_id"]: r["why"] for r in stale}["a-item-www"] == "dropped_variant"
+
+
 def _grouped_wrong(written_as_own_row):
     """One product holds canonical offers at two handles at different prices (a full size and a mini under one
     product_key): the second offer was written under the first product by an older run."""
