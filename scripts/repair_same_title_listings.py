@@ -46,7 +46,14 @@ over a repair); every touched content_key's served view and eligibility are rebu
                                                  [--only-host-alias]
   Apply (Peng's go; AFTER the drain is re-imaged onto #2463 -- the old drain image re-points rows and re-activates
   the left-out pages' seeds on its next run of a store, undoing this; the new one never moves a row off its listing):
-    ... --apply
+    ... --host <store> [--only-host-alias] --max-groups <n> --expect-suppress <offers_to_suppress> --apply
+  An --apply re-plans live: it is refused without --host, or when the plan acts on more than --max-groups groups or
+  suppresses any count but --expect-suppress (copy both from the reviewed dry run of the SAME arguments).
+  Host aliases: apply only after the drain image carries ingestion.respell_listing_host AND one crawl of the host
+  has run on it, then dry-run again -- before that, a crawl under the other spelling re-mints what this suppresses.
+  Dry-run EVERY market the host is captured for (--market SG, AU, ...): a group with another market's live offer
+  at the alias spelling is skipped (`other_market_alias_live`) until that market is planned too.
+  Folded stores: never run the same-title half (without --only-host-alias) on a store whose shade fold is on.
   Revert a run (all or nothing; refused while a LATER applied run holds any of its rows), or re-run its rebuild:
     python -m scripts.repair_same_title_listings revert --run-id samelisting_<hex>
     python -m scripts.repair_same_title_listings refresh --run-id samelisting_<hex>
@@ -247,6 +254,12 @@ def plan_alias(row: Mapping[str, Any], host: str, listing: str, offers: List[Map
     if not spelling or not aliases:
         return None
     suppress = [o for o in aliases if _shelf(o) in kept_shelves]
+    # Another market's live offers at the alias spelling: a Shopify Markets sibling copies its base offer's
+    # source_ref and is refreshed only while that base is live (shopify_markets.CANDIDATES_SQL), so suppressing
+    # the base here would leave the sibling serving a price nobody refreshes. Such a row is skipped whole until
+    # every market's alias is planned together (run the repair for each market after a fresh capture).
+    other_market = [o["offer_id"] for o in offers if o.get("suppressed_at") is None and not _in_market(o, market)
+                    and _spelled_host(o) != spelling]
     return {
         "product_key": row["product_key"], "content_key": row.get("content_key"), "host": host,
         "kind": "host_alias", "reason": ALIAS_REASON,
@@ -257,9 +270,11 @@ def plan_alias(row: Mapping[str, Any], host: str, listing: str, offers: List[Map
                                                     if o.get("suppression_metadata") is not None else None)
                                     for o in suppress},
         "alias_kept_alone": [o["offer_id"] for o in aliases if _shelf(o) not in kept_shelves],
-        "deactivate_prior_updated_at": {}, "other_market_left": 0,
+        "deactivate_prior_updated_at": {}, "other_market_left": len(other_market),
+        "other_market_alias_live": other_market,
         "restore": [], "deactivate": [], "repoint": None,
-        "skipped": None if suppress else "alias_alone_on_its_shelf"}
+        "skipped": ("other_market_alias_live" if suppress and other_market
+                    else None if suppress else "alias_alone_on_its_shelf")}
 
 
 def _in_market(item: Mapping[str, Any], market: str) -> bool:
@@ -282,9 +297,19 @@ def plan_row(row: Mapping[str, Any], offers: List[Mapping[str, Any]], seeds: Lis
         listing = _listing_of_seed(s)
         if listing:
             by_host.setdefault(listing[0], {}).setdefault(listing[1], {"offers": [], "seeds": []})["seeds"].append(s)
+    # A page carrying only VARIANT offers of this row and no seed is a folded shade's own listing (the extended fold
+    # points a variant's offer at the listing it is sold on, ingestion.own_listing_url), not a second listing of the
+    # row: every same-title record writes its `::canonical` offer and seed at its own page. Never a left-out listing.
+    canonical_sku = f"{row['product_key']}::canonical"
+    for listings in by_host.values():
+        for listing in [k for k, v in listings.items()
+                        if not v["seeds"] and all(o["sku_key"] != canonical_sku for o in v["offers"])]:
+            del listings[listing]
     current = content_listing(row.get("canonical_url"))
     groups = []
     for host, listings in sorted(by_host.items()):
+        if not listings:
+            continue
         if len(listings) < 2:
             [(listing, found)] = listings.items()
             alias = plan_alias(row, host, listing, found["offers"], market=market)
@@ -550,6 +575,22 @@ async def revert(db: Any, run_id: str) -> Dict[str, Any]:
     return {"run_id": run_id, **done, "refresh": await refresh_after(db, m, source=f"{run_id}:revert")}
 
 
+def apply_refusal(args: argparse.Namespace, s: Mapping[str, Any]) -> Optional[str]:
+    """Why an --apply must not write, or None. --apply re-plans live, so it is bound to the REVIEWED dry run: it
+    names its host(s), caps the groups it may act on, and states the offer count the dry run showed -- a plan that
+    grew since (a new crawl, another market's capture) is refused rather than written."""
+    if not args.host:
+        return "--apply needs --host (one store per reviewed run)"
+    if args.max_groups is None or args.expect_suppress is None:
+        return "--apply needs --max-groups and --expect-suppress from the reviewed dry run"
+    acted = s["groups"] - sum((s.get("skipped") or {}).values())
+    if acted > args.max_groups:
+        return f"{acted} groups to act on exceeds --max-groups {args.max_groups}"
+    if s["offers_to_suppress"] != args.expect_suppress:
+        return f"{s['offers_to_suppress']} offers to suppress, the reviewed dry run said {args.expect_suppress}"
+    return None
+
+
 def exit_code(out: Mapping[str, Any]) -> int:
     """Non-zero when a committed write left views unrebuilt: re-run `refresh --run-id`."""
     return 2 if ((out.get("refresh") or {}).get("failed_keys_total") or 0) > 0 else 0
@@ -569,8 +610,12 @@ async def run(args: argparse.Namespace) -> int:
         else:
             p = await plan(database, hosts=args.host, keys=args.product_key, market=args.market,
                            only_host_alias=args.only_host_alias)
-            print("PLAN " + json.dumps(summary(p), default=str), flush=True)
+            s = summary(p)
+            print("PLAN " + json.dumps(s, default=str), flush=True)
             if args.apply:
+                refusal = apply_refusal(args, s)
+                if refusal:
+                    raise SystemExit(f"refused: {refusal}; nothing written")
                 out = await apply(database, p)
                 print("APPLIED " + json.dumps(out, default=str), flush=True)
             else:
@@ -588,6 +633,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--market", default="US")
     p.add_argument("--only-host-alias", dest="only_host_alias", action="store_true",
                    help="plan (and apply) the host_alias groups alone")
+    p.add_argument("--max-groups", dest="max_groups", type=int, default=None,
+                   help="--apply: refuse a plan acting on more groups than this")
+    p.add_argument("--expect-suppress", dest="expect_suppress", type=int, default=None,
+                   help="--apply: the offers_to_suppress the reviewed dry run showed; any other count is refused")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--run-id", dest="run_id")
     args = p.parse_args(argv)

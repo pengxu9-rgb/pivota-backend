@@ -403,11 +403,11 @@ ALIAS_APEX, ALIAS_WWW = "https://store.example/products/base-duo", "https://www.
 
 async def _alias_rows(admin):
     """One listing crawled under both spellings of its host: a canonical and a variant shelf with an offer at each
-    spelling, a variant shelf held only at the other spelling, and another market's offer."""
+    spelling, a variant shelf held only at the other spelling, and another market's offer at the row's spelling."""
     await _product(admin, K_ALIAS, ALIAS_APEX, ALIAS_APEX + ".jpg")
     await _offer(admin, "o_al_apex", K_ALIAS, ALIAS_APEX)
     await _offer(admin, "o_al_www", K_ALIAS, ALIAS_WWW, metadata={"reconcile_batch_id": "rb_2"})
-    await _offer(admin, "o_al_sg", K_ALIAS, ALIAS_WWW, market="SG")
+    await _offer(admin, "o_al_sg", K_ALIAS, ALIAS_APEX, market="SG")
     for offer_id, url, sku in (("o_al_v_apex", ALIAS_APEX, "::v:1"), ("o_al_v_www", ALIAS_WWW, "::v:1"),
                                ("o_al_v2_www", ALIAS_WWW, "::v:2")):
         await _offer(admin, offer_id, K_ALIAS, url)
@@ -444,3 +444,13 @@ async def test_only_host_alias_leaves_the_same_title_groups_alone(catalog):
     p = await tool.plan(db, hosts=[], keys=[], only_host_alias=True)
     assert [g["product_key"] for g in p["groups"]] == [K_ALIAS]
     assert {g["product_key"] for g in (await tool.plan(db, hosts=[], keys=[]))["groups"]} > {K_ALIAS, K_BC}
+
+
+async def test_a_live_alias_sibling_in_another_market_holds_the_row(catalog):
+    db, admin, tool, _ = catalog
+    await _alias_rows(admin)
+    await _offer(admin, "o_al_au_www", K_ALIAS, ALIAS_WWW, market="AU")
+    [g] = (await tool.plan(db, hosts=[], keys=[K_ALIAS]))["groups"]
+    assert g["skipped"] == "other_market_alias_live" and g["other_market_alias_live"] == ["o_al_au_www"]
+    with pytest.raises(SystemExit, match="nothing to repair"):
+        await tool.apply(db, await tool.plan(db, hosts=[], keys=[K_ALIAS]))
