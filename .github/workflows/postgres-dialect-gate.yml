@@ -65,6 +65,11 @@ name: Postgres Dialect Gate
 # Note the naming split, which is load-bearing:
 #   tests/test_*_postgres.py             -> dialect gates. Empty DB, run here.
 #   tests/test_*_postgres_integration.py -> heavier, need real data. NOT run here.
+# It lands in the shard its path hashes to (see SHARDED below), next to whichever
+# files share that shard's database. Verify locally against a fresh database with
+# that shard's whole file list, not the file alone:
+#   python scripts/postgres_dialect_gate_shards.py plan --num-shards 3 --shard K \
+#     --ride-along-shard 2 --ride-alongs "<RIDE_ALONGS>" --manifest /tmp/k.json
 
 on:
   push:
@@ -168,14 +173,108 @@ concurrency:
   group: postgres-dialect-gate-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
+# ── SHARDED SINCE 2026-10-13 ───────────────────────────────────────────────────
+# One pytest process ran every file below in 21-23 min against a 25-min ceiling, and
+# #2577's first run was cancelled at 98% with every test passing (run 38322789427:
+# pytest still running at 24m30s; its re-run on the same commit took 21m02s). Measured
+# from that run's JUnit: 4,814 tests in 185 files, 1,286 s of test time, ~45 s of
+# collection, ~35 s of containers + checkout + install. No file is over 6% of it, so
+# there was no fixture to cut — the work is split instead.
+#
+# `shard` runs as a matrix; each shard has its OWN Postgres service and runs the
+# files that `sha256(path) mod N` assigns it, in their unsharded relative order,
+# against ONE database. That is the same premise as before — every file in a shard
+# shares that shard's database and meets whatever earlier files left there — over a
+# subset of the files. The four ride-alongs and the recovery report all run in
+# RIDE_ALONG_SHARD, so test_quality_backfill_partial_update.py still runs last in
+# its process. scripts/postgres_dialect_gate_shards.py says why files (not tests)
+# are hashed and why by path rather than by position.
+#
+# Two names are load-bearing and must not change:
+#   * the workflow `name:` "Postgres Dialect Gate" — deploy-prod.yml's test-gate finds
+#     this workflow's push run on the SHA by that exact string;
+#   * the final job's name "execute real routes on real Postgres". It runs after every
+#     shard, fails when any shard failed, timed out or never reported, and re-proves
+#     the shards add up to one complete run with zero skips.
+# CI Entrypoint expands the single-key static matrix into
+# `execute real routes on real Postgres shard (1)` .. `(N)` and requires each of them
+# as well as the final job; keep the matrix a literal list for that reason (a
+# `fromJSON` matrix is not statically expandable, so it would go unenforced).
+#
+# DIALECT_GATE_SHARDS must equal the length of the matrix;
+# tests/test_postgres_dialect_gate_shards.py pins it. Three, sized from the run above:
+# hashing those 185 files three ways puts 389 / 362+61 / 475 s of test time in the
+# shards (ride-alongs in shard 2), ~8 min of pytest for the largest, ~9-10 min a shard.
+env:
+  DIALECT_GATE_SHARDS: 3
+  RIDE_ALONG_SHARD: 2
+  # The compile-shape guards ride along. They are SQLite-safe and cost
+  # under a second, and they are the other half of this story: a compiled
+  # SQL string can be malformed in ways only a shape assertion catches
+  # cheaply, and nothing else in CI runs them today either.
+  #
+  # test_databases_textclause_params.py rides along for the same reason,
+  # and was checked SQLite-safe under this job's Postgres URL per the
+  # header warning. It carries a repo-wide AST guard against
+  # `database.<method>(text(...), params)`, which `databases` 0.7.0 turns
+  # into an unconditional AttributeError (TextClause has no `.values()`).
+  # That call shape is only reachable from routes/services/db — exactly
+  # this job's path filter — and both known occurrences sat inside
+  # `except Exception`, so the symptom was a silent wrong answer rather
+  # than a 500 that CI or logs would ever surface.
+  # test_quality_backfill_partial_update.py rides along because it is the
+  # only thing that executes db/product_quality_backfill_jobs.py's raw
+  # UPDATEs, and the half that ships is the Postgres half. Its statements
+  # are a dialect split -- `CAST(:errors_sample AS JSONB)` on Postgres, a
+  # bare bind on SQLite -- so running it only in backend-test-sweep (which
+  # sets no DATABASE_URL, hence SQLite) exercises the twin and never the
+  # production text. Demonstrated: reintroducing the "a None counter
+  # overwrites a live value" defect in the POSTGRES constant alone left
+  # the sweep, the -k "quality or backfill" selection AND this job's own
+  # PREPARE sweep all green -- PREPARE plans `SET x = $1` happily, and the
+  # SQLite twin is untouched. Renaming it to *_postgres.py is the wrong
+  # fix: backend-test-sweep --ignore-glob's that pattern, so it would swap
+  # the Postgres gap for a SQLite one, and the split needs BOTH sides.
+  # Checked SQLite-safe under this job's Postgres URL, against a jsonb
+  # column and a model-first json one. It DOES declare two skips now
+  # (`skipif(not IS_POSTGRES)`, on cases about asyncpg's datetime
+  # encoding), inert here because IS_POSTGRES is true — the preflight
+  # asserts that — so the zero-skip check below still holds.
+  # KEEP test_quality_backfill_partial_update.py LAST: one of its cases
+  # ALTERs the timestamp columns of product_quality_backfill_jobs and
+  # restores them, so a ride-along added after it would run while that
+  # switch is in flight. test_quality_backfill_enqueue_dedupe.py rides
+  # along for the same reason it exists: the cooldown lookup has a
+  # Postgres twin that is different text from the SQLite one, and its
+  # time-zone cases can only fail here.
+  #
+  # Space-separated, in run order. All of them run in RIDE_ALONG_SHARD, after that
+  # shard's gate files, in this order; a listed file that does not exist is dropped,
+  # as the unsharded `[ -e "$f" ]` loop did.
+  RIDE_ALONGS: >-
+    tests/test_pdp_renderability.py
+    tests/test_databases_textclause_params.py
+    tests/test_quality_backfill_enqueue_dedupe.py
+    tests/test_quality_backfill_partial_update.py
+
 jobs:
-  postgres-dialect-gate:
-    name: execute real routes on real Postgres
+  shard:
+    name: execute real routes on real Postgres shard
     runs-on: ubuntu-latest
-    # 15 was the ceiling, not the budget: on 2026-09-28 green runs took 14-15 min and
-    # #2422/#2423 were cancelled at 74% with every test passing. A cancelled gate is a
-    # red gate for a reason unrelated to the code; 25 leaves room for added PG tests.
+    # 25 is ~2.5x a shard's expected ~9-10 min. The unsharded job had 25 against 21-23
+    # min runs, and before that 15 against 14-15 (#2422/#2423 cancelled at 74% with
+    # every test passing, 2026-09-28): a cancelled gate is a red gate for a reason
+    # unrelated to the code. 25 here plus 5 for the final job is this workflow's
+    # 30-minute critical path, inside deploy-prod's and CI Entrypoint's 50-minute
+    # deadlines (tests/test_deploy_prod_gates_on_the_test_sweep.py sums it).
     timeout-minutes: 25
+    strategy:
+      # Every shard runs to its end even when another fails: the final job needs all
+      # of their results to say what failed, and a cancelled sibling looks like a
+      # missing shard.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
 
     services:
       postgres:
@@ -256,75 +355,23 @@ jobs:
           print(f"preflight ok: IS_POSTGRES=True, JSONB_TYPE -> {pg_ddl} (pg) / {sqlite_ddl} (sqlite)")
           PY
 
-      - name: Discover gate files
+      - name: Discover this shard's gate files
         id: discover
         shell: bash
+        # Through `env:`, NOT interpolated into the script — see the run step below.
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
-          # `test_*_postgres.py` only — the `_postgres_integration.py` files need
-          # real data and are not dialect gates. See the header.
-          files=""
-          gate_modules=""
-          count=0
-          for f in tests/test_*_postgres.py; do
-            [ -e "$f" ] || continue
-            files="$files $f"
-            gate_modules="$gate_modules $(basename "$f" .py)"
-            count=$((count + 1))
-            echo "  $f"
-          done
-          if [ "$count" -eq 0 ]; then
-            echo "No tests/test_*_postgres.py files found." >&2
-            echo "This gate has nothing to run, which means it is not gating anything." >&2
-            exit 1
-          fi
-          echo "Found $count gate file(s)."
-          # The compile-shape guards ride along. They are SQLite-safe and cost
-          # under a second, and they are the other half of this story: a compiled
-          # SQL string can be malformed in ways only a shape assertion catches
-          # cheaply, and nothing else in CI runs them today either.
-          #
-          # test_databases_textclause_params.py rides along for the same reason,
-          # and was checked SQLite-safe under this job's Postgres URL per the
-          # header warning. It carries a repo-wide AST guard against
-          # `database.<method>(text(...), params)`, which `databases` 0.7.0 turns
-          # into an unconditional AttributeError (TextClause has no `.values()`).
-          # That call shape is only reachable from routes/services/db — exactly
-          # this job's path filter — and both known occurrences sat inside
-          # `except Exception`, so the symptom was a silent wrong answer rather
-          # than a 500 that CI or logs would ever surface.
-          # test_quality_backfill_partial_update.py rides along because it is the
-          # only thing that executes db/product_quality_backfill_jobs.py's raw
-          # UPDATEs, and the half that ships is the Postgres half. Its statements
-          # are a dialect split -- `CAST(:errors_sample AS JSONB)` on Postgres, a
-          # bare bind on SQLite -- so running it only in backend-test-sweep (which
-          # sets no DATABASE_URL, hence SQLite) exercises the twin and never the
-          # production text. Demonstrated: reintroducing the "a None counter
-          # overwrites a live value" defect in the POSTGRES constant alone left
-          # the sweep, the -k "quality or backfill" selection AND this job's own
-          # PREPARE sweep all green -- PREPARE plans `SET x = $1` happily, and the
-          # SQLite twin is untouched. Renaming it to *_postgres.py is the wrong
-          # fix: backend-test-sweep --ignore-glob's that pattern, so it would swap
-          # the Postgres gap for a SQLite one, and the split needs BOTH sides.
-          # Checked SQLite-safe under this job's Postgres URL, against a jsonb
-          # column and a model-first json one. It DOES declare two skips now
-          # (`skipif(not IS_POSTGRES)`, on cases about asyncpg's datetime
-          # encoding), inert here because IS_POSTGRES is true — the preflight
-          # asserts that — so the zero-skip check below still holds.
-          # KEEP test_quality_backfill_partial_update.py LAST: one of its cases
-          # ALTERs the timestamp columns of product_quality_backfill_jobs and
-          # restores them, so a ride-along added after it would run while that
-          # switch is in flight. test_quality_backfill_enqueue_dedupe.py rides
-          # along for the same reason it exists: the cooldown lookup has a
-          # Postgres twin that is different text from the SQLite one, and its
-          # time-zone cases can only fail here.
-          for f in tests/test_pdp_renderability.py tests/test_databases_textclause_params.py tests/test_quality_backfill_enqueue_dedupe.py tests/test_quality_backfill_partial_update.py; do
-            [ -e "$f" ] && files="$files $f"
-          done
-          echo "files=$files" >> "$GITHUB_OUTPUT"
-          # The gate modules alone, for the coverage assertion below. Bare module
-          # names, so the assertion can match junit `classname` attributes.
-          echo "gate_modules=$gate_modules" >> "$GITHUB_OUTPUT"
+          # `tests/test_*_postgres.py` only, hashed to shards by path; the ride-alongs
+          # (workflow `env:` above) are appended in RIDE_ALONG_SHARD. Writes `files`,
+          # `gate_modules` (bare module names, for the coverage assertion below, which
+          # matches junit `classname` attributes) and this shard's manifest, which the
+          # final job checks against its own plan of the same checkout.
+          python scripts/postgres_dialect_gate_shards.py plan \
+            --num-shards "${DIALECT_GATE_SHARDS}" --shard "${SHARD}" \
+            --ride-along-shard "${RIDE_ALONG_SHARD}" --ride-alongs "${RIDE_ALONGS}" \
+            --manifest "shard-${SHARD}.manifest.json"
 
       - name: Execute the routes on Postgres
         id: run_gate
@@ -336,31 +383,36 @@ jobs:
         # it is the textbook pattern and costs one line to not have.
         env:
           GATE_FILES: ${{ steps.discover.outputs.files }}
+          SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
+          # `--durations=25` prints the slowest setups/calls into this shard's log, so
+          # the next "where does the time go" starts from the log, not a re-measure.
           # shellcheck disable=SC2086  # word-splitting is intended: this is a file list
-          pytest -q -p no:cacheprovider \
-            --junitxml=pytest-postgres.xml \
+          pytest -q -p no:cacheprovider --durations=25 \
+            --junitxml="pytest-postgres-shard-${SHARD}.xml" \
             $GATE_FILES
 
       - name: Assert the gate actually gated
         # Runs even when pytest failed, because a skipped run exits 0 and must
         # still turn the job red. Skipped when the job is cancelled or when the
         # run step never happened — otherwise an Install/Preflight failure would
-        # be masked by "could not read pytest-postgres.xml".
+        # be masked by "could not read pytest-postgres-shard-N.xml".
         if: ${{ !cancelled() && steps.run_gate.conclusion != 'skipped' }}
         shell: bash
         env:
           GATE_MODULES: ${{ steps.discover.outputs.gate_modules }}
+          JUNIT: pytest-postgres-shard-${{ matrix.shard }}.xml
         run: |
           set -euo pipefail
           python - <<'PY'
-          import sys, xml.etree.ElementTree as ET
+          import os, sys, xml.etree.ElementTree as ET
 
+          junit = os.environ["JUNIT"]
           try:
-              root = ET.parse("pytest-postgres.xml").getroot()
+              root = ET.parse(junit).getroot()
           except (OSError, ET.ParseError) as exc:
-              sys.exit(f"could not read pytest-postgres.xml: {exc}")
+              sys.exit(f"could not read {junit}: {exc}")
 
           suites = root.findall("testsuite") or ([root] if root.tag == "testsuite" else [])
           tests = sum(int(s.get("tests", 0)) for s in suites)
@@ -381,10 +433,8 @@ jobs:
           # ~51 tests here, so deleting every test function out of the Postgres
           # gate file leaves this step green with tests=50, skipped=0 and ZERO
           # statements executed against Postgres. Demonstrated, not theorised.
-          # Require each discovered gate module to have executed at least one
-          # test of its own.
-          import os
-
+          # Require each of this shard's gate modules to have executed at least
+          # one test of its own. The final job repeats this across all shards.
           modules = [m for m in (os.getenv("GATE_MODULES") or "").split() if m]
           if not modules:
               sys.exit("GATE_MODULES is empty — the discover step produced no gate modules")
@@ -414,8 +464,13 @@ jobs:
       # at all — a red build that proves nothing about the dialect gate,
       # and one whose message points somewhere else entirely. It keeps its
       # own junit assertion (a skipped recovery test is still a failure).
+      # ONE shard runs it (RIDE_ALONG_SHARD); the final job fails if that shard has
+      # no recovery JUnit, so a wrong `if:` here cannot make it silently vanish.
       - name: Recovery report JSONB to authenticated HTTP
+        if: ${{ matrix.shard == fromJSON(env.RIDE_ALONG_SHARD) }}
         shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
           python - <<'PYDB'
@@ -433,19 +488,68 @@ jobs:
           PYDB
           RUN_RECOVERY_POSTGRES=1 \
             DATABASE_URL=postgresql://postgres:postgres@localhost:5432/recovery_contract_test \
-            python -m pytest tests/integration/test_recovery_postgres.py -q --junitxml=pytest-recovery-postgres.xml
-          python - <<'PYTEST'
+            python -m pytest tests/integration/test_recovery_postgres.py -q \
+              --junitxml="pytest-recovery-postgres-shard-${SHARD}.xml"
+          RECOVERY_JUNIT="pytest-recovery-postgres-shard-${SHARD}.xml" python - <<'PYTEST'
+          import os
           import xml.etree.ElementTree as ET
-          cases = list(ET.parse("pytest-recovery-postgres.xml").getroot().iter("testcase"))
+          cases = list(ET.parse(os.environ["RECOVERY_JUNIT"]).getroot().iter("testcase"))
           assert cases and not any(c.find("skipped") is not None for c in cases), "Recovery PostgreSQL test did not execute"
           PYTEST
 
-      - name: Upload junit report
+      # Uploaded on failure too: the final job reports a red shard's counts.
+      - name: Upload this shard's results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: postgres-dialect-gate-${{ github.run_id }}
+          name: postgres-dialect-gate-${{ github.run_id }}-shard-${{ matrix.shard }}
           path: |
-            pytest-postgres.xml
-            pytest-recovery-postgres.xml
+            shard-${{ matrix.shard }}.manifest.json
+            pytest-postgres-shard-${{ matrix.shard }}.xml
+            pytest-recovery-postgres-shard-${{ matrix.shard }}.xml
+          if-no-files-found: ignore
+          # A `rerun --failed` re-uploads under the same name in the same run.
+          overwrite: true
           retention-days: 14
+
+  postgres-dialect-gate:
+    name: execute real routes on real Postgres
+    needs: shard
+    # `!cancelled()`, not `always()`: this job must run when a shard FAILED or hit its
+    # own timeout (that is a cancelled JOB, not a cancelled workflow), so the failure is
+    # reported here by shard, but not when the whole run was superseded by a newer push
+    # to the same PR. Without an `if:` at all a red shard would leave this job SKIPPED,
+    # and CI Entrypoint tolerates a skipped job.
+    if: '!cancelled()'
+    runs-on: ubuntu-latest
+    # Download and verify take seconds; nothing is installed.
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download the shards' results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: postgres-dialect-gate-${{ github.run_id }}-shard-*
+          path: shards
+
+      # FAILS unless the shards add up to exactly one gate run: every shard job
+      # succeeded and reported; each ran exactly the files this checkout plans for it;
+      # together they ran every gate file and ride-along once; zero skips anywhere;
+      # every gate module executed a test; the recovery report ran in its shard.
+      - name: Prove the shards are one complete run
+        shell: bash
+        env:
+          SHARD_RESULT: ${{ needs.shard.result }}
+        run: |
+          set -euo pipefail
+          python scripts/postgres_dialect_gate_shards.py verify \
+            --shards-dir shards --num-shards "${DIALECT_GATE_SHARDS}" \
+            --ride-along-shard "${RIDE_ALONG_SHARD}" --ride-alongs "${RIDE_ALONGS}" \
+            --recovery-shard "${RIDE_ALONG_SHARD}" --needs-result "${SHARD_RESULT}"
