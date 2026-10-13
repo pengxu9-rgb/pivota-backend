@@ -299,8 +299,15 @@ async def _settled(s: _Step, moved: Optional[Mapping[str, Any]], outcome: str) -
             # A move to a live state keeps the lease (only a terminal write clears it): give it back,
             # or the row waits out the stale-claim requeue (STALE_LEASE_SECONDS) before its next step.
             # The code the transition wrote stays (no code: COALESCE).
-            await ledger.release_claim(
-                s.id, s.worker, next_poll_at=_later(_DUE_AFTER_ENTERING.get(state, POLL_RETRY)))
+            try:
+                await ledger.release_claim(
+                    s.id, s.worker, next_poll_at=_later(_DUE_AFTER_ENTERING.get(state, POLL_RETRY)))
+            except Exception as exc:  # noqa: BLE001 - the move committed; never let the crash path see it
+                # Raising would reach run_tick's crash release, whose code comes from the row AS CLAIMED and
+                # would overwrite the schedule the move just wrote (`bound_sent:4` for a page we must not
+                # confirm, `paid_sent:0:<variant>`). Held instead: the stale-claim requeue frees it, code intact.
+                logger.warning("a2a_rail_worker: release after a move failed purchase=%s state=%s error_type=%s",
+                               s.id, state, type(exc).__name__)
         return outcome
     row = await ledger.get_purchase_internal(s.id)
     if row is not None and row.get("claimed_by") == s.worker and row.get("state") not in ledger.TERMINAL_STATES:

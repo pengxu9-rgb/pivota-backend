@@ -694,6 +694,69 @@ async def _approving(method=VISA, page=None):
     return pid
 
 
+async def test_entering_awaiting_authorization_gives_the_lease_back_due_on_the_approval_poll():
+    pid = await _locked()
+    before = datetime.now(timezone.utc)
+    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
+    assert await _step(rail, pid) == "approval_page_issued"
+    row = await _row(pid)
+    assert (row["state"], row["claimed_by"], row["last_error_code"]) == ("awaiting_authorization", None, "paid_sent:0:visa")
+    due = row["next_poll_at"].replace(tzinfo=timezone.utc) - before
+    assert timedelta(seconds=worker.POLL_APPROVAL - 2) <= due <= timedelta(seconds=worker.POLL_APPROVAL + 5)
+
+
+def _release_fails_once(real):
+    calls = []
+
+    async def release(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise RuntimeError("transient database error")
+        return await real(*args, **kwargs)
+    return release
+
+
+async def _requeue_stale(pid):
+    await _ago("claimed_at", worker.STALE_LEASE_SECONDS + 100, purchase_id=pid)
+    assert await ledger.requeue_stale_claims(lease_seconds=worker.STALE_LEASE_SECONDS) == 1
+
+
+async def test_a_failed_release_after_a_move_to_the_other_binding_page_keeps_bound_unsent(monkeypatch):
+    # The move committed `bound_sent:4` (a page whose `bound` is never guessed); a release that then fails must
+    # not reach the tick's crash release, whose code comes from the row as claimed and would erase it.
+    pid = (await _open())["id"]
+    other = _task(("payment.method-add-required", {"linkUrl": PAGE, "paymentMethodId": "pm_up", "status": "PENDING"}))
+    rail = Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit", other)
+    real = ledger.release_claim
+    monkeypatch.setattr(ledger, "release_claim", _release_fails_once(real))
+    assert await worker.run_tick(_client(rail), W) == {"binding_page_issued": 1}
+    monkeypatch.setattr(ledger, "release_claim", real)
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["claimed_by"]) == ("needs_payment_method", "bound_sent:4", W)
+    await _requeue_stale(pid)
+    await _ago("state_entered_at", 2000)
+    rail = Rail().on("payment.method-view#submit", _methods({**ACTIVE, "id": "pm_up", "status": "PENDING"}))
+    assert await _step(rail, pid) == "waiting_on_buyer"
+    assert rail.actions() == ["payment.method-view#submit"]  # read only: still no `bound`
+
+
+async def test_a_failed_release_after_the_approval_page_keeps_the_approval_schedule(monkeypatch):
+    pid = await _locked()
+    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
+    real = ledger.release_claim
+    monkeypatch.setattr(ledger, "release_claim", _release_fails_once(real))
+    assert await worker.run_tick(_client(rail), W) == {"approval_page_issued": 1}
+    monkeypatch.setattr(ledger, "release_claim", real)
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["claimed_by"]) == ("awaiting_authorization", "paid_sent:0:visa", W)
+    await _requeue_stale(pid)
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 5, purchase_id=pid)
+    rail = Rail().on("payment.visa-action-required#paid", _visa_page())  # the buyer is still on the page
+    assert await _step(rail, pid) == "waiting_on_buyer"  # the variant survived: `paid` sent on schedule, not parked
+    assert rail.actions() == ["payment.visa-action-required#paid"]
+    assert (await _row(pid))["last_error_code"] == "paid_sent:1:visa"
+
+
 async def test_a_locked_order_gets_a_token_request_and_the_picker_is_answered_in_the_same_conversation():
     pid = await _locked()
     contexts = {}
