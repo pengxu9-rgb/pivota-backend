@@ -1183,6 +1183,45 @@ _BOILERPLATE_CLASSES: Tuple[Tuple[str, Tuple[Tuple["re.Pattern[str]", ...], ...]
 )
 
 
+# SAFETY TEXT IS NEVER STORE BOILERPLATE. A warning can share a sentence with a boilerplate anchor
+# ("Discontinue use if irritation occurs and contact us for advice.", "Warning: flammable aerosol;
+# contents under pressure, cannot be shipped by air.") and can repeat on every product of a store
+# ("Avoid contact with eyes; if contact occurs, rinse thoroughly."). Neither pass may remove it: a
+# sentence carrying a safety cue is kept whole by the pattern pass (only a `;`-separated clause that is
+# pure boilerplate with no cue of its own is cut) and is never dropped by the repetition pass.
+_SAFETY_CUE_RE = re.compile(
+    r"(?i)\b(?:warnings?|cautions?|avoid|discontinue|irritat\w*|rash(?:es)?|redness|swelling|allerg\w*"
+    r"|flammable|inflammable|combustible|under\s+pressure|pressuri[sz]ed|ignit\w*|doctor|physician"
+    r"|dermatologist|medical|eyes?|keep\s+(?:out\s+of|away\s+from)|reach\s+of\s+children|children"
+    r"|external\s+use|do\s+not\s+(?:ingest|swallow|use|apply|inhale|puncture|incinerate|spray|expose)"
+    r"|patch\s+test|poison\w*|pregnan\w*|breast[- ]?feeding|nursing|broken\s+skin|sensitivity|burns?"
+    r"|harmful|toxic|first\s+aid|rinse\s+(?:thoroughly|immediately|with\s+water)|seek\s+(?:medical|advice))\b")
+
+
+def is_safety_text(sentence: str) -> bool:
+    """True when the sentence carries a safety cue (a warning, a precaution, a medical instruction)."""
+    return bool(_SAFETY_CUE_RE.search(sentence or ""))
+
+
+def _without_boilerplate(sentence: str) -> Optional[str]:
+    """The sentence with its store boilerplate removed, or None when all of it is boilerplate. Safety
+    text is kept: a safety sentence loses only a `;`-separated clause that is boilerplate and carries no
+    safety cue of its own; without such a clause it is kept whole."""
+    if boilerplate_class(sentence) is None:
+        return sentence
+    if not is_safety_text(sentence):
+        return None
+    clauses = [c.strip() for c in sentence.split(";")]
+    kept = [c for c in clauses if c and (is_safety_text(c) or boilerplate_class(c) is None)]
+    if len(kept) == len(clauses) or not kept:
+        return sentence
+    text = "; ".join(kept)
+    end = sentence.rstrip()[-1:]
+    if text[-1:] not in _SENTENCE_TERMINAL and end in _SENTENCE_TERMINAL:
+        text += end  # the cut clause carried the sentence's full stop
+    return text
+
+
 def _matching_rules(sentence: str) -> List[Tuple[str, Tuple["re.Pattern[str]", ...]]]:
     return [(name, rule) for name, rules in _BOILERPLATE_CLASSES for rule in rules
             if all(p.search(sentence) for p in rule)]
@@ -1242,8 +1281,9 @@ def body_html_sentences(body_html: Optional[str]) -> List[str]:
         if not block:
             continue
         for sentence in _split_sentences(block):
-            if boilerplate_class(sentence) is None:
-                out.append(sentence)
+            kept = _without_boilerplate(sentence)
+            if kept:
+                out.append(kept)
     return out
 
 
@@ -1376,7 +1416,8 @@ def drop_repeated_store_sentences(
     out: List[List[str]] = []
     sample: Dict[str, str] = {}
     for d, row_noun in zip(rows, row_nouns):
-        droppable = [_sentence_key(s) in repeated and not _names_noun(s, row_noun) for s in d]
+        droppable = [_sentence_key(s) in repeated and not _names_noun(s, row_noun) and not is_safety_text(s)
+                     for s in d]
         lead = 0
         while lead < len(d) and droppable[lead]:
             lead += 1
