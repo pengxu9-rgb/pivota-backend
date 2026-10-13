@@ -263,9 +263,17 @@ def _refused(exc: svc.PurchaseRefused) -> JSONResponse:
     reason = str(getattr(exc, "reason", "") or "invalid_request")
     if reason in {"create_disabled", "pilot_scope_invalid", "pilot_scope_refused"}:
         return JSONResponse(status_code=404, content={"error": "not_available_on_this_rail"})
+    content: Dict[str, Any] = {"error": reason}
+    existing = getattr(exc, "existing_purchase_id", None)
+    if reason == "idempotency_conflict" and isinstance(existing, str):
+        # Set only by `_replayed_purchase_id`, from the owner-scoped key row: the caller's own purchase.
+        from services.payment_orchestration.rails import RAIL_ID_PREFIX
+
+        content["purchase_id"] = existing
+        content["rail"] = next((r for prefix, r in RAIL_ID_PREFIX.items() if existing.startswith(prefix)), None)
     return JSONResponse(
         status_code=_REFUSAL_STATUS.get(reason, _DEFAULT_REFUSAL_STATUS),
-        content={"error": reason},
+        content=content,
     )
 
 
@@ -2154,9 +2162,18 @@ async def _replayed_purchase_id(
     # second possibly charged checkout; a new intentional purchase requires a new key.
     stored_hash = str(record.get("request_hash") or "")
     if not stored_hash or stored_hash != request_hash:
-        raise svc.PurchaseRefused(
+        refusal = svc.PurchaseRefused(
             "idempotency_conflict", "this key was used for a different request"
         )
+        # NAME THE PURCHASE THE KEY OPENED, when it opened one. The lookup above is scoped to THIS
+        # agent and THIS end user, so the id is the caller's own. A retry whose details changed
+        # under it (a re-keyed catalog row fills a different product_key) conflicts while that
+        # purchase EXISTS; the id lets the caller read it instead of guessing and buying again.
+        # Never a refusal tombstone or a retirement marker: only a well-formed rail purchase id.
+        existing = str(record.get("purchase_id") or "").strip()
+        if _RAIL_PURCHASE_ID_RE.fullmatch(existing):
+            refusal.existing_purchase_id = existing
+        raise refusal
     stored = str(record.get("purchase_id") or "").strip()
     if stored.startswith(_REFUSED_KEY_PREFIX):
         # A TOMBSTONE: this key, for this exact request, was refused (or retired). The same
@@ -2171,6 +2188,9 @@ async def _replayed_purchase_id(
         raise svc.PurchaseRefused(reason, "this key was refused for this request")
     return stored or None
 
+
+#: A rail's own purchase id, as a key row stores it (Reap `rp_`, the A2A rail `ap_`).
+_RAIL_PURCHASE_ID_RE = re.compile(r"(?:rp|ap)_[0-9a-f]{24}")
 
 #: `reap_agentic_purchase_keys.purchase_id` of a key whose request was REFUSED (not a purchase).
 _REFUSED_KEY_PREFIX = "refused:"
