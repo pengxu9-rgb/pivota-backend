@@ -41,6 +41,9 @@ LIVE_PROD_ENV = {
     "RELGRAPH_SYNC_REVIEW_LIMIT": "1000",
     "RELGRAPH_SYNC_REVIEW_CONCURRENCY": "6",
     "RELGRAPH_SYNC_PRIORITIZE_UNCOVERED": "true",
+    # 2026-10-13: the uncovered backfill (PIVOTA-Agent #2418) and per-anchor target recall.
+    "RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT": "100",
+    "RELGRAPH_SYNC_EXPAND_TARGET_RECALL": "true",
     "VERTEX_AI_ENABLED": "true",
     "GOOGLE_CLOUD_PROJECT": "pivota-prod",
     "GOOGLE_CLOUD_LOCATION": "global",

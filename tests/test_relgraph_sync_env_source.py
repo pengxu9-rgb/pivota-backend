@@ -9,7 +9,8 @@ import pytest
 from tests.test_relgraph_sync_iac_env import LIVE_PROD_ENV, WRITE_GATES, VERTEX, GATEWAY_TAG
 
 SCRIPT = Path(__file__).resolve().parents[1] / "infra/gcp/setup_scheduler.sh"
-PROD_ONLY = {"RELGRAPH_SYNC_REVIEW_LIMIT", "RELGRAPH_SYNC_REVIEW_CONCURRENCY", "RELGRAPH_SYNC_PRIORITIZE_UNCOVERED"}
+PROD_ONLY = {"RELGRAPH_SYNC_REVIEW_LIMIT", "RELGRAPH_SYNC_REVIEW_CONCURRENCY", "RELGRAPH_SYNC_PRIORITIZE_UNCOVERED",
+             "RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT", "RELGRAPH_SYNC_EXPAND_TARGET_RECALL"}
 
 
 def env_function(env_name, writes):
@@ -37,6 +38,8 @@ def test_prod_grows_coverage_with_bounded_review():
     assert env["RELGRAPH_SYNC_PRIORITIZE_UNCOVERED"] == "true"
     assert (env["RELGRAPH_SYNC_REVIEW_LIMIT"], env["RELGRAPH_SYNC_REVIEW_CONCURRENCY"]) == ("1000", "6")
     assert env["RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES"] == "90"
+    # The backfill needs the prioritize-uncovered build; the gateway cron refuses it otherwise.
+    assert (env["RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT"], env["RELGRAPH_SYNC_EXPAND_TARGET_RECALL"]) == ("100", "true")
 
 
 @pytest.mark.parametrize("env_name,writes", [("prod", "false"), ("staging", "false")])
