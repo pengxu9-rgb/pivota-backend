@@ -348,6 +348,16 @@ _OFFER_UPSERT_SQL = """
                               THEN 'redirect'
                           ELSE catalog_offers.offer_mode
                       END,
+                      -- is_first_party travels WITH the type (resolve_offer_type sets them
+                      -- together): it moves only when this upsert is the one filling a NULL
+                      -- type. Without it a re-apply stored (brand_direct, FALSE), which the
+                      -- gateway's own-offer read (is_first_party IS TRUE) never serves and
+                      -- scripts/relabel_offer_seller_type (offer_type IS NULL) never repairs.
+                      is_first_party = CASE
+                          WHEN catalog_offers.offer_type IS NULL AND EXCLUDED.offer_type IS NOT NULL
+                              THEN EXCLUDED.is_first_party
+                          ELSE catalog_offers.is_first_party
+                      END,
                       availability = EXCLUDED.availability,
                       inventory_quantity = EXCLUDED.inventory_quantity,
                       -- The attached seed and merchant variants were reviewed
@@ -612,6 +622,64 @@ def _verified_storefronts_by_key(
         ):
             out[key] = verified.host
     return out
+
+
+def _label_verified_storefront_offers(
+    plan: Dict[str, Any], verified: Optional[VerifiedBrandStorefront],
+) -> tuple[Dict[str, Any], Dict[str, int]]:
+    """Label brand_direct the unlabelled offers a PROVEN brand storefront sells on its own host.
+
+    ingestion.resolve_offer_type sees only the listing (domain + brand), so it finds evidence only when
+    the domain's name IS the brand: a brand on "<brand>beauty.com", "<brand>cosmetics.com" or
+    "<brand>-usa.com" comes back unknown_no_evidence and lands offer_type NULL. The gateway's own-offer
+    read selects `offer_type = 'brand_direct' AND is_first_party`, so the brand's own store then never
+    serves a price for its own product. Prod census 2026-10-13: every NULL-typed lane offer written since
+    10-01 came from a drain run that HAD this proof; #2437 handed it to the seeds only.
+
+    The rule still decides, with the verified host as its official_domain (a known retailer host still
+    wins), exactly as scripts/relabel_offer_seller_type does for an attested domain. Only NULL is
+    filled: a type the plan already carries is never changed. An offer is labelled only when its row
+    is one _verified_storefronts_by_key maps (proven brand, brand_official, on the verified host) AND
+    the buyer is sent to that same host -- an offer whose destination is elsewhere stays unlabelled."""
+    from services.offer_seller_identity import (
+        OFFER_TYPE_BRAND_DIRECT,
+        derive_offer_seller_identity,
+        host_from_url,
+    )
+
+    pdps = plan.get("pdps") or []
+    own = _verified_storefronts_by_key(pdps, verified)
+    if not own:
+        return plan, {}
+    pdp_by_key = {str(p.get("product_key") or ""): p for p in pdps}
+    labelled = 0
+    offers: List[Dict[str, Any]] = []
+    for offer in plan.get("offers") or []:
+        key = str(offer.get("product_key") or "")
+        host = own.get(key)
+        if host and offer.get("offer_type") is None:
+            payload = offer.get("offer_payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except ValueError:
+                    payload = None
+            destination = (payload.get("destination_url") if isinstance(payload, dict) else None) \
+                or offer.get("source_ref")
+            if _storefront_host(host_from_url(destination)) == host:
+                pdp = pdp_by_key[key]
+                # The proof already decided brand_direct; the rule is here for its known-retailer
+                # guard (a retailer host never becomes a brand's own store, whatever the proof says)
+                # and so this label is exactly what the relabel tool would write for an attestation.
+                verdict = derive_offer_seller_identity(
+                    domain=pdp.get("source_domain"), canonical_url=pdp.get("canonical_url"),
+                    brand=pdp.get("brand"), official_domain=host,
+                )
+                if verdict["offer_type"] == OFFER_TYPE_BRAND_DIRECT and verdict["is_first_party"]:
+                    offer = {**offer, "offer_type": OFFER_TYPE_BRAND_DIRECT, "is_first_party": True}
+                    labelled += 1
+        offers.append(offer)
+    return {**plan, "offers": offers}, {"offers_labelled_verified_storefront": labelled}
 
 
 def _note_pdp_refusal(
@@ -2243,7 +2311,9 @@ async def _apply_ingest_plan(
     plan, owner_counts = await _guard_canonical_owner(plan, database, market=market)
     # BOTH executors too: the stage the upsert writes must describe the copy the upsert keeps.
     plan, stage_counts = await _stage_from_kept_copy(plan, database)
-    owner_counts = {**owner_counts, **stage_counts}
+    # Pure, and after the owner guard: label against the rows and keys that will actually be written.
+    plan, label_counts = _label_verified_storefront_offers(plan, verified_storefront)
+    owner_counts = {**owner_counts, **stage_counts, **label_counts}
 
     if batch:
         counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database,
@@ -2625,18 +2695,28 @@ async def current_listings(product_keys: List[str], *, db: Any) -> Dict[str, Any
     one scripts/repair_same_title_listings.py aligned it to -- unless a stronger rule says otherwise. The
     URL's host spelling (`www.` or not) is the one a re-ingest writes (ingestion.respell_listing_host).
     Read-only; keys with no row or no readable URL are absent."""
+    return _listings_of(await _stored_canonical_urls(product_keys, db=db))
+
+
+def _listings_of(stored: Dict[str, str]) -> Dict[str, Any]:
     from services.catalog_enrichment_agent.ingestion import content_listing
 
+    out = {}
+    for key, url in stored.items():
+        listing = content_listing(url)
+        if listing:
+            out[key] = (*listing, url)
+    return out
+
+
+async def _stored_canonical_urls(product_keys: List[str], *, db: Any) -> Dict[str, str]:
+    """product_key -> catalog_products.canonical_url as stored (one SELECT); keys with no row or no URL are absent."""
     keys = sorted({str(k) for k in product_keys if k})
     if not keys:
         return {}
     rows = await db.fetch_all(_CURRENT_LISTINGS_SQL, {"product_keys": keys})
-    out = {}
-    for row in rows:
-        listing = content_listing(row["canonical_url"])
-        if listing:
-            out[str(row["product_key"])] = (*listing, str(row["canonical_url"]).strip())
-    return out
+    return {str(row["product_key"]): str(row["canonical_url"]).strip()
+            for row in rows if str(row["canonical_url"] or "").strip()}
 
 
 def content_keys_of(plan: Dict[str, Any]) -> List[str]:
@@ -2646,22 +2726,39 @@ def content_keys_of(plan: Dict[str, Any]) -> List[str]:
     return sorted(k for k in keys if k and not k.startswith("ext:retailer:"))
 
 
+def retailer_keys_of(plan: Dict[str, Any]) -> List[str]:
+    """Every `ext:retailer:` row a plan writes: its listing never moves, but the host spelling its offers and
+    seeds were minted under still matters (ingestion.ingest_validated_jsonl `listing_spellings`)."""
+    keys = {str(p.get("product_key") or "") for p in plan.get("pdps") or []}
+    return sorted(k for k in keys if k.startswith("ext:retailer:"))
+
+
 async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, market: Optional[str] = None,
                                      source_jsonl: Optional[str] = None,
                                      allow_moves: Any = (), planner: Any = None) -> Dict[str, Any]:
     """ingestion.ingest_validated_jsonl with the listing each of its rows names today, so the plan never
     moves a row off it (`listing_moves`) -- the one way every lane that holds a catalog handle plans.
-    `current_listings.status` says what was read. `planner` is the caller's own ingest_validated_jsonl
-    (the name its tests patch)."""
+    `current_listings.status` says what was read for the content-keyed rows; `listing_spellings.status` says
+    the same of the `ext:retailer:` rows, read only for the host spelling their offers and seeds already use
+    (never for a listing: those rows cannot move). One SELECT serves both. `planner` is the caller's own
+    ingest_validated_jsonl (the name its tests patch)."""
     from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
 
     planner = planner or ingest_validated_jsonl
     records = list(records)
     given = {k: v for k, v in (("market", market), ("source_jsonl", source_jsonl)) if v is not None}
     first = planner(records, **given)
-    keys = content_keys_of(first)
-    if not keys:
-        return {**first, "current_listings": {"status": "not_applicable"}}
-    current = await current_listings(keys, db=db)
-    replanned = planner(records, **given, current_listings=current, allow_moves=allow_moves)
-    return {**replanned, "current_listings": {"status": "read", "rows": len(current)}}
+    content, retailer = content_keys_of(first), retailer_keys_of(first)
+    if not content and not retailer:
+        return {**first, "current_listings": {"status": "not_applicable"},
+                "listing_spellings": {"status": "not_applicable"}}
+    stored = await _stored_canonical_urls(content + retailer, db=db)
+    current = _listings_of({k: stored[k] for k in content if k in stored})
+    spellings = {k: stored[k] for k in retailer if k in stored}
+    statuses = {"current_listings": {"status": "read", "rows": len(current)} if content else {"status": "not_applicable"},
+                "listing_spellings": {"status": "read", "rows": len(spellings)} if retailer else {"status": "not_applicable"}}
+    if not content and not spellings:
+        return {**first, **statuses}  # first ingests only: nothing to re-spell, nothing that could move
+    replanned = planner(records, **given, current_listings=current, allow_moves=allow_moves,
+                        **({"listing_spellings": spellings} if spellings else {}))
+    return {**replanned, **statuses}

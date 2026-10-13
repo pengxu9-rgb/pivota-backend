@@ -376,6 +376,11 @@ def retailer_product_key(source_domain: Optional[str], canonical_url: Optional[s
     return "ext:retailer:" + hashlib.sha256(listing.encode("utf-8")).hexdigest()[:32]
 
 
+#: A seed variant's "url_source" when its "url" is the listing the EXTENDED shade fold took it from (the only
+#: per-variant url the public seed projection serves; routes/agent_shop_gateway._normalize_seed_variants).
+SEED_VARIANT_URL_SOURCE = "shade_fold_listing"
+
+
 def own_listing_url(listing_url: Optional[str], candidate: Optional[str]) -> Optional[str]:
     """`candidate` -- the listing an EXTENDED-fold variant is sold on (curated_brand_feed stamps it as
     `own_listing_url` on the pdp variant) -- when it is a /products/ page on the same storefront host as the
@@ -394,8 +399,10 @@ def own_listing_url(listing_url: Optional[str], candidate: Optional[str]) -> Opt
         host = (own.hostname or "").lower().removeprefix("www.")
         if (not candidate or own.scheme not in {"http", "https"} or not host
                 # one plain storefront URL, as retailer_listing_identity demands of a listing: no credentials,
-                # no port, and nothing after the path (a query or fragment would mint a second offer_id)
-                or own.username or own.password or own.port or own.query or own.fragment
+                # no port, and nothing after the path -- not even an empty query or fragment ("/products/x?" is
+                # another string for the same page, and would mint a second offer_id)
+                or own.username or own.password or own.port
+                or "?" in str(candidate) or "#" in str(candidate)
                 or host != (base.hostname or "").lower().removeprefix("www.")
                 or not own.path.startswith("/products/") or not own.path[len("/products/"):].strip("/")):
             return None
@@ -462,8 +469,11 @@ def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str]) -> D
     a brand store crawled as `www.` in September and as the apex in October (the queue named the host both
     ways). The row's own spelling wins, so a re-crawl upserts the offers it already has.
 
-    Only offers' canonical/destination URLs and an extended-fold variant's own_listing_url are re-spelled;
-    a subdomain other than `www.`, a port or credentials are never treated as the same host."""
+    Only offers' canonical/destination URLs and an extended-fold variant's own_listing_url are re-spelled --
+    and, for a retailer record, `pdp.source_domain`: it scopes the `ext:retailer:` row's variant SKU keys
+    (derive_variant_sku_key `seller_scope`, hashed as spelled), so a re-spelled URL alone would still re-key every
+    variant SKU and its offer. A subdomain other than `www.`, a port or credentials are never treated as the
+    same host."""
     from urllib.parse import urlsplit, urlunsplit
 
     try:
@@ -493,11 +503,19 @@ def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str]) -> D
     if pdp is not None and isinstance(pdp.get("variants"), list):
         variants = [{**v, "own_listing_url": respelled(v["own_listing_url"])}
                     if isinstance(v, dict) and v.get("own_listing_url") else v for v in pdp["variants"]]
-    if offers == (record.get("offers") or []) and (variants is None or variants == pdp["variants"]):
+    source_domain = None
+    if pdp is not None and pdp.get("source_role") == "retailer" and pdp.get("source_domain"):
+        # Prod 2026-10-13: every `ext:retailer:` row stores source_domain spelled as its canonical_url host.
+        crawled = str(pdp["source_domain"]).strip().lower()
+        if crawled != to_host and crawled.removeprefix("www.") == bare:
+            source_domain = to_host
+    if (offers == (record.get("offers") or []) and (variants is None or variants == pdp["variants"])
+            and source_domain is None):
         return record
     out = {**record, "offers": offers}
-    if variants is not None:
-        out["pdp"] = {**pdp, "variants": variants}
+    if variants is not None or source_domain is not None:
+        out["pdp"] = {**pdp, **({"variants": variants} if variants is not None else {}),
+                      **({"source_domain": source_domain} if source_domain is not None else {})}
     return out
 
 
@@ -1235,8 +1253,10 @@ def _build_seed_inserts(
                     # A variant the EXTENDED shade fold took from another listing is sold THERE, not at the
                     # seed's destination_url: the seed-variant reader's per-variant "url"
                     # (external_seed_audit.normalize_seed_variants). Only that fold names one, so every
-                    # other seed is byte-identical.
-                    **({"url": variant_url} if variant_url else {}),
+                    # other seed is byte-identical. Stamped with its source, because other writers store a
+                    # variant "url" too (a ?variant= link on the seed's own page): the public seed projection
+                    # (routes/agent_shop_gateway._normalize_seed_variants) serves only the fold's.
+                    **({"url": variant_url, "url_source": SEED_VARIANT_URL_SOURCE} if variant_url else {}),
                 })
             if built:
                 _drop_options_that_do_not_distinguish(built)
@@ -1860,6 +1880,7 @@ def ingest_validated_jsonl(
     market: Optional[str] = None,
     current_listings: Optional[Dict[str, Tuple[str, ...]]] = None,
     allow_moves: Iterable[str] = (),
+    listing_spellings: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Drive ingest_validated_record across an iterable of records and
     return all five row collections plus skipped_count. Pure — no DB
@@ -1872,7 +1893,15 @@ def ingest_validated_jsonl(
     (apply.current_listings), and as a third element the row's canonical_url as stored: a record whose
     listing URLs spell that host with or without `www.` where the row does not is re-spelled to the row's
     (respell_listing_host, named in `listing_respellings`), so a re-crawl under the other spelling refreshes the
-    row's offers and seeds instead of minting a second set. A plan NEVER MOVES A ROW OFF THE LISTING IT NAMES: that listing keeps
+    row's offers and seeds instead of minting a second set.
+
+    `listing_spellings` (optional): product_key -> the row's canonical_url as stored, for rows whose listing
+    cannot move (apply.plan_with_current_listings passes the `ext:retailer:` rows': their key is the listing
+    without `www.`, so the other spelling is the same row and, without this, a second offer and seed set).
+    It picks the host spelling exactly like the third element of `current_listings` and NOTHING ELSE: it never
+    names a listing, so it never keeps, holds or moves one (`listing_moves` reads `current_listings` only).
+
+    A plan NEVER MOVES A ROW OFF THE LISTING IT NAMES: that listing keeps
     the key whenever the crawl carries it, in or out of stock; when the crawl does not (unpublished, a
     renamed handle, a page the crawl dropped), every record of that key on that host is left out and
     named in `listing_moves` -- unless the key is in `allow_moves` (a reviewer accepted the move).
@@ -1924,8 +1953,9 @@ def ingest_validated_jsonl(
             reason = str(result["skipped_reason"]).split(":")[0]
             skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
             continue
-        named = (current_listings or {}).get(str(result["pdp"].get("product_key") or ""))
-        stored_url = named[2] if named and len(named) > 2 else None
+        key = str(result["pdp"].get("product_key") or "")
+        named = (current_listings or {}).get(key)
+        stored_url = named[2] if named and len(named) > 2 else (listing_spellings or {}).get(key)
         respelled = respell_listing_host(record, stored_url) if stored_url else record
         if respelled is not record:
             again = ingest_validated_record(respelled, source_jsonl=source_jsonl, market=market)
