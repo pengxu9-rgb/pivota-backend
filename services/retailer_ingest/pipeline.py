@@ -964,6 +964,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     checks["listing_collisions"] = len(collisions)
     checks["current_listings"] = plan.get("current_listings")
     checks["listing_moves"] = len(plan.get("listing_moves") or [])
+    # Rows crawled under the other `www.` spelling of their host, written under the row's own (no second offer).
+    checks["listing_respellings"] = len(plan.get("listing_respellings") or [])
     row_flags += detectors.listing_move_flags(plan.get("listing_moves") or [])
     if (plan.get("current_listings") or {}).get("status") in ("unchecked", "error"):
         # Without the listing each row names, a plan cannot tell a move from a first ingest.
