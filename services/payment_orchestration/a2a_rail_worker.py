@@ -707,6 +707,11 @@ async def _reconcile_token(s: _Step, action: str) -> str:
             s.id, s.worker, from_states=[state], to_state="failed", resolves_write=action,
             last_error_code="token_request_unresolved")
         return await _settled(s, moved, "failed")
+    if not token_step_enabled():
+        # The dial is off: nothing is resolved by resending, so the unseen `paid` stays pending (the sweep never
+        # ends a row with a pending write) until the dial is on again or a human decides.
+        await s.release(POLL_PARKED, "token_step_disabled")
+        return "parked"
     # `paid` names no new token (the conversation's token is the one the row records): sent again on
     # the schedule. This rests on the payment-conversation invariant in the module docstring.
     await ledger.clear_pending_write(s.id, s.worker, action)
@@ -735,6 +740,11 @@ async def _quoting(s: _Step) -> str:
 
 
 async def _awaiting_authorization(s: _Step) -> str:
+    if not token_step_enabled():
+        # The token dial is a KILL SWITCH: off means nothing more is sent for a token, including for purchases
+        # already waiting on the buyer's approval (no `paid`, no await poll). The page's deadline ends them.
+        await s.release(POLL_PARKED)
+        return "parked"
     if _token_active(s.row):
         # The buyer approved and the token is ACTIVE; the pay step is the order protocol's. Parked with
         # the marker kept (no new code), so no later claim sends `paid` again.
