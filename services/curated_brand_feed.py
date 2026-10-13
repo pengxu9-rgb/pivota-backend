@@ -1183,6 +1183,45 @@ _BOILERPLATE_CLASSES: Tuple[Tuple[str, Tuple[Tuple["re.Pattern[str]", ...], ...]
 )
 
 
+# SAFETY TEXT IS NEVER STORE BOILERPLATE. A warning can share a sentence with a boilerplate anchor
+# ("Discontinue use if irritation occurs and contact us for advice.", "Warning: flammable aerosol;
+# contents under pressure, cannot be shipped by air.") and can repeat on every product of a store
+# ("Avoid contact with eyes; if contact occurs, rinse thoroughly."). Neither pass may remove it: a
+# sentence carrying a safety cue is kept whole by the pattern pass (only a `;`-separated clause that is
+# pure boilerplate with no cue of its own is cut) and is never dropped by the repetition pass.
+_SAFETY_CUE_RE = re.compile(
+    r"(?i)\b(?:warnings?|cautions?|avoid|discontinue|irritat\w*|rash(?:es)?|redness|swelling|allerg\w*"
+    r"|flammable|inflammable|combustible|under\s+pressure|pressuri[sz]ed|ignit\w*|doctor|physician"
+    r"|dermatologist|medical|eyes?|keep\s+(?:out\s+of|away\s+from)|reach\s+of\s+children|children"
+    r"|external\s+use|do\s+not\s+(?:ingest|swallow|use|apply|inhale|puncture|incinerate|spray|expose)"
+    r"|patch\s+test|poison\w*|pregnan\w*|breast[- ]?feeding|nursing|broken\s+skin|sensitivity|burns?"
+    r"|harmful|toxic|first\s+aid|rinse\s+(?:thoroughly|immediately|with\s+water)|seek\s+(?:medical|advice))\b")
+
+
+def is_safety_text(sentence: str) -> bool:
+    """True when the sentence carries a safety cue (a warning, a precaution, a medical instruction)."""
+    return bool(_SAFETY_CUE_RE.search(sentence or ""))
+
+
+def _without_boilerplate(sentence: str) -> Optional[str]:
+    """The sentence with its store boilerplate removed, or None when all of it is boilerplate. Safety
+    text is kept: a safety sentence loses only a `;`-separated clause that is boilerplate and carries no
+    safety cue of its own; without such a clause it is kept whole."""
+    if boilerplate_class(sentence) is None:
+        return sentence
+    if not is_safety_text(sentence):
+        return None
+    clauses = [c.strip() for c in sentence.split(";")]
+    kept = [c for c in clauses if c and (is_safety_text(c) or boilerplate_class(c) is None)]
+    if len(kept) == len(clauses) or not kept:
+        return sentence
+    text = "; ".join(kept)
+    end = sentence.rstrip()[-1:]
+    if text[-1:] not in _SENTENCE_TERMINAL and end in _SENTENCE_TERMINAL:
+        text += end  # the cut clause carried the sentence's full stop
+    return text
+
+
 def _matching_rules(sentence: str) -> List[Tuple[str, Tuple["re.Pattern[str]", ...]]]:
     return [(name, rule) for name, rules in _BOILERPLATE_CLASSES for rule in rules
             if all(p.search(sentence) for p in rule)]
@@ -1242,8 +1281,9 @@ def body_html_sentences(body_html: Optional[str]) -> List[str]:
         if not block:
             continue
         for sentence in _split_sentences(block):
-            if boilerplate_class(sentence) is None:
-                out.append(sentence)
+            kept = _without_boilerplate(sentence)
+            if kept:
+                out.append(kept)
     return out
 
 
@@ -1376,7 +1416,8 @@ def drop_repeated_store_sentences(
     out: List[List[str]] = []
     sample: Dict[str, str] = {}
     for d, row_noun in zip(rows, row_nouns):
-        droppable = [_sentence_key(s) in repeated and not _names_noun(s, row_noun) for s in d]
+        droppable = [_sentence_key(s) in repeated and not _names_noun(s, row_noun) and not is_safety_text(s)
+                     for s in d]
         lead = 0
         while lead < len(d) and droppable[lead]:
             lead += 1
@@ -3258,6 +3299,14 @@ def shopify_product_to_record(
         else [t.strip() for t in str(raw_tags or "").split(",") if t.strip()]
     )
     canonical_url = f"https://{host}/products/{handle}"
+    # Where the canonical offer's item is SOLD. The product's own page, except when the extended fold replaced
+    # an unsellable parent's variants: then the first sellable variant is a child's item, priced and stocked on
+    # the child's own listing, and the offer goes there (its price belongs to the page it points at). The
+    # record's canonical_url -- the row's key and served page -- stays the parent's.
+    sold_at = canonical_url
+    sold_handle = str(variant.get(FOLDED_FROM_KEY) or "").strip()
+    if FOLD_AXIS_KEY in variant and sold_handle and "/" not in sold_handle:
+        sold_at = f"https://{host}/products/{sold_handle}"
     category_input_path = category_path
     category_path, category_confidence = _resolve_category(
         title=title, product_type=product.get("product_type"), flag_path=category_path, domain=domain,
@@ -3317,7 +3366,7 @@ def shopify_product_to_record(
                 # storefronts use the same friendly name. Official-mode IDs are untouched.
                 "seller_domain": host if source_role == "retailer" else None,
                 "canonical_url": canonical_url,
-                "destination_url": canonical_url,
+                "destination_url": sold_at,
                 "image_url": str(image.get("src") or "").strip(),
                 "price": price,
                 "in_stock": variant.get("available") if isinstance(variant.get("available"), bool) else None,
@@ -3642,15 +3691,15 @@ def _same_product_proof(base: Dict[str, Any], copy: Dict[str, Any]) -> Optional[
 
 
 def _is_extended_stub(product: Dict[str, Any]) -> bool:
-    """A parent whose single variant sells nothing: the legacy placeholder shape, or a variant priced
-    under MIN_SELLABLE_PRICE (a "choose your shade" parent at 0.00)."""
-    if _is_stub_variant(product):
-        return True
-    variants = (product or {}).get("variants") or []
-    if len(variants) != 1 or not isinstance(variants[0], dict):
-        return False
-    price = _to_float(variants[0].get("price"))
-    return price is None or price < MIN_SELLABLE_PRICE
+    """A parent that SELLS NOTHING: no variant priced at or above MIN_SELLABLE_PRICE (a "choose your shade"
+    parent at 0.00). Only such a parent's own variants are replaced by its children.
+
+    NOT the legacy `_is_stub_variant` shape. A single "Default Title" variant at a real price is the normal
+    retailer product: it is the item the parent page sells, at that price. Dropping it put the parent URL's
+    canonical offer on the first child's price and stock (a 40.00 parent offered at its 100 ml child's 90.00).
+    A parent whose item a child repeats (same SKU or barcode) keeps it too; the child is absorbed."""
+    variants = [v for v in (product or {}).get("variants") or [] if isinstance(v, dict)]
+    return not any((_to_float(v.get("price")) or 0.0) >= MIN_SELLABLE_PRICE for v in variants)
 
 
 def _child_axis(child: Dict[str, Any], suffix: str) -> Tuple[Optional[str], str, bool]:
@@ -3799,7 +3848,7 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
     report: Dict[str, Any] = {"bases": 0, "shades": 0, "stubs_replaced": 0, "images_adopted": 0,
                               "folded": {}, "refused": refusals, "axes": {"shade": 0, "size": 0, "named": 0},
                               "duplicates_absorbed": {}, "copies_deduped": {}, "superseded": [],
-                              "mixed_axes": []}
+                              "mixed_axes": [], "canonical_moved": []}
     out: List[Dict[str, Any]] = []
     for p in products:
         if not isinstance(p, dict):
@@ -3876,6 +3925,13 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
         base = dict(p)
         if stub and (p.get("variants") or []):
             report["stubs_replaced"] += 1
+        if stub:
+            # The parent sells nothing, so the product's canonical offer is the first sellable child's item,
+            # sold on THAT child's listing (shopify_product_to_record points the offer there). The parent row
+            # keeps its key and URL; its canonical offer is not on its own page.
+            first = next((v for v in added if (_to_float(v.get("price")) or 0.0) >= MIN_SELLABLE_PRICE), None)
+            if first is not None:
+                report["canonical_moved"].append({"base_handle": base_handle, "handle": first[FOLDED_FROM_KEY]})
         base["variants"] = own + added
         base[FOLDED_INTO_KEY] = len(added)
         if not _image_srcs(p):
@@ -3919,6 +3975,7 @@ def fold_report_summary(report: Optional[Dict[str, Any]], *, cap: int = 200) -> 
     out["refused_count"] = len(report.get("refused") or [])
     out["refused_by_reason"] = dict(collections.Counter(r.get("reason") for r in report.get("refused") or []))
     out["mixed_axes"] = list(report.get("mixed_axes") or [])[:cap]
+    out["canonical_moved"] = list(report.get("canonical_moved") or [])[:cap]
     for key in ("superseded", "refused", "baseless_groups"):
         items = list(report.get(key) or [])
         out[key] = items[:cap]
