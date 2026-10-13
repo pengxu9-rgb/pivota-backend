@@ -107,14 +107,14 @@ async def _product(db, key, *, content_key, brand="Example AUD Brand"):
 
 
 async def _offer(db, oid, key, *, currency="AUD", market="AU", host=HOST,
-                 source_system="catalog_enrichment_agent_v1", price=45.0):
+                 source_system="catalog_enrichment_agent_v1", price=45.0, sku_key=None, handle="face-hero"):
     await db.execute(
         "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, offer_type, is_first_party, market,"
         " currency, list_price, merchant_effective_price, source_system, source_ref, source_domain, offer_mode)"
         " VALUES (:o, :s, :k, 'agent_seed::example-aud-brand', 'brand_direct', TRUE, :m, :c, :p, :p, :sys, :ref, :h,"
         " 'external_referral')",
-        {"o": oid, "s": key + "::canonical", "k": key, "m": market, "c": currency, "p": price, "sys": source_system,
-         "ref": f"https://{host}/products/face-hero", "h": host})
+        {"o": oid, "s": sku_key or key + "::canonical", "k": key, "m": market, "c": currency, "p": price,
+         "sys": source_system, "ref": f"https://{host}/products/{handle}", "h": host})
 
 
 async def _ips(db, content_key, *, blocker, serving):
@@ -366,3 +366,40 @@ async def test_the_shade_fold_lane_offer_read_runs_on_postgres(db, monkeypatch):
     assert unread is None
     assert sorted((r["why"], r["offer_id"]) for r in stale) == [
         ("canonical_moved", PREFIX + "fold-canon"), ("canonical_moved", PREFIX + "fold-pending")]
+
+
+async def test_the_shade_fold_lane_offer_read_finds_stale_offers_by_listing_too(db, monkeypatch):
+    """The other two arms on the real schema: a folded variant this crawl no longer folds (its offer on the base,
+    at the child's listing: dropped_variant), and another product's live offer at a listing the plan writes,
+    read only through `source_ref = ANY(:urls)` (duplicate_at_listing)."""
+    import scripts.onboard_curated_brands as cli
+    from services.retailer_ingest import pipeline
+
+    base, other = RETAILER_PREFIX + "fold-base2", RETAILER_PREFIX + "fold-other"
+    page, child = f"https://{HOST}/products/face-hero", f"https://{HOST}/products/face-hero-8ml"
+    await _product(db, base, content_key=PREFIX + "ck-fold-base2")
+    await _product(db, other, content_key=PREFIX + "ck-fold-other")
+    variant_sku = base + "::v:8ml"
+    await db.execute(
+        "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, source_variant_id,"
+        " title) VALUES (:s, :k, 'agent_seed::example-aud-brand', 'external_seed', :k, '8ml', 'Face Hero 8ml')",
+        {"s": variant_sku, "k": base})
+    await _offer(db, PREFIX + "fold2-canon", base, currency="USD", market="US")
+    await _offer(db, PREFIX + "fold2-variant", base, currency="USD", market="US", sku_key=variant_sku,
+                 handle="face-hero-8ml")
+    await _offer(db, PREFIX + "fold2-elsewhere", other, currency="USD", market="US", handle="face-hero-30ml")
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (db, None))
+
+    # This crawl writes the base's canonical again but no longer folds the 8ml child.
+    dropped = {"offer_ids": [PREFIX + "fold2-canon"], "urls": [page], "own_url": {base: page}}
+    stale, unread = await pipeline._stale_fold_offers(dropped)
+    assert unread is None
+    assert [(r["why"], r["offer_id"]) for r in stale] == [("dropped_variant", PREFIX + "fold2-variant")]
+
+    # This crawl writes the 30ml listing as its own row (a new product), while another product sells it.
+    new_key = RETAILER_PREFIX + "fold-new"
+    dup = {"offer_ids": [PREFIX + "fold2-new"], "urls": [f"https://{HOST}/products/face-hero-30ml"],
+           "own_url": {new_key: f"https://{HOST}/products/face-hero-30ml"}}
+    stale, unread = await pipeline._stale_fold_offers(dup)
+    assert unread is None
+    assert [(r["why"], r["offer_id"]) for r in stale] == [("duplicate_at_listing", PREFIX + "fold2-elsewhere")]

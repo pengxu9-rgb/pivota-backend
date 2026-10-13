@@ -1081,6 +1081,10 @@ async def test_a_folded_size_seed_keeps_its_picker_and_a_shade_seed_invents_no_s
     ("Lip Balm 4.5g x2", ["10g"], "Standard"),
     ("Lip Balm Set of 3 4.5g", ["10g"], "Standard"),
     ("Lip Balm 3 Pack 4.5g", ["10g"], "Standard"),
+    ("Lip Balm 4.5g Set", ["10g"], "Standard"),
+    ("Sheet Mask 25g 10 Sheets", ["50g"], "Standard"),  # a count of units: 25g is one sheet's
+    ("Toner Pads 120ml 60 Pads", ["250ml"], "Standard"),
+    ("Setting Spray 100ml", ["30ml"], "100ml"),        # "Setting" is not a set
     ("Body Wash 250ml 8.4oz", ["500ml"], "Standard"),  # two quantities: neither is THE size
     ("Gel Colour", ["Ruby"], None),                    # a shade axis: no shade name invented
     ("Gel Colour", ["Original", "Ruby"], None),
@@ -1114,6 +1118,8 @@ async def test_a_folded_seed_variant_names_the_listing_it_is_sold_on(monkeypatch
     from services.external_seed_audit import normalize_seed_variants
     read = normalize_seed_variants(json.loads(seed["seed_data"]), dict(seed))
     assert [v.get("url") for v in read][1:] == urls[1:]
+    sources = [v.get("url_source") for v in json.loads(seed["seed_data"])["variants"]]
+    assert sources == [None] + [ingestion.SEED_VARIANT_URL_SOURCE] * 3
 
 
 def test_a_parent_item_label_never_repeats_a_childs():
@@ -1163,8 +1169,23 @@ async def test_the_shop_gateways_seed_projection_keeps_a_folded_variants_own_url
         f"https://{HOST}/products/{h}" for h in ("gel-colour-ruby-red", "gel-colour-coral-reef", "gel-colour-midnight")]
     assert "url" not in projected[0]
     plain = {"variants": [{"variant_id": "1", "title": "A", "price_amount": 10.0},
-                          {"variant_id": "2", "title": "B", "price_amount": 10.0, "url": "javascript:alert(1)"}]}
+                          {"variant_id": "2", "title": "B", "price_amount": 10.0, "url": "javascript:alert(1)",
+                           "url_source": ingestion.SEED_VARIANT_URL_SOURCE}]}
     assert all("url" not in v for v in _normalize_seed_variants(plain))
+
+
+def test_the_public_seed_projection_serves_no_variant_url_another_writer_stored():
+    """Review of the final pre-enable PR: other writers already store a variant "url" on live seeds (a raw
+    ?variant= link on the seed's own page). The public projection never served it, and must not start to: it
+    would bypass the attributed destination_url. Only the fold's own, stamped with its source, is kept."""
+    from routes import agent_shop_gateway as gw
+    seed = {"destination_url": f"https://{HOST}/products/gel",
+            "variants": [{"variant_id": "1", "title": "A", "price_amount": 10.0,
+                          "url": f"https://{HOST}/products/gel?variant=1"},
+                         {"variant_id": "2", "title": "B", "price_amount": 10.0,
+                          "url": f"https://{HOST}/products/gel#b", "url_source": "employee_products"}]}
+    assert all("url" not in v for v in gw._normalize_seed_variants(seed))
+    assert gw._SEED_VARIANT_URL_SOURCE == ingestion.SEED_VARIANT_URL_SOURCE
 
 
 async def test_a_folded_child_refused_on_a_recrawl_holds_instead_of_leaving_two_live_offers(env, monkeypatch):  # noqa: F811

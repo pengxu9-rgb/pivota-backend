@@ -3705,9 +3705,11 @@ def _is_extended_stub(product: Dict[str, Any]) -> bool:
 
 #: A quantity written in a title ("Glow Serum 30ml"): the parent's own item on a size axis.
 _TITLE_QUANTITY_RE = re.compile(r"(?i)\b\d+(?:[.,]\d+)?\s*(?:ml|l|g|kg|mg|oz|fl\.?\s*oz)\b")
-#: A title that counts units ("2 x 4.5g", "4.5g x2", "Duo", "Set of 3", "3 Pack"): its quantity is one unit's,
-#: not the item's size, so it names no size for the parent's own item.
-_TITLE_MULTI_UNIT_RE = re.compile(r"(?i)\d\s*[x×]\s*\d|\b[x×]\s*\d|\d\s*[x×]\b|\b(duo|trio|set\s+of|pack|bundle|kit)\b")
+#: A title that counts units ("2 x 4.5g", "4.5g x2", "Duo", "Set of 3", "4.5g Set", "3 Pack", "25g 10 Sheets"): its
+#: quantity is one unit's, not the item's size, so it names no size for the parent's own item.
+_TITLE_MULTI_UNIT_RE = re.compile(
+    r"(?i)\d\s*[x×]\s*\d|\b[x×]\s*\d|\d\s*[x×]\b|\b(duo|trio|set|sets|pack|packs|bundle|kit)\b"
+    r"|\b\d+\s*(?:sheets?|pcs|pieces?|pads?|count|ct|capsules?|ampoules?|masks?|sachets?|patch(?:es)?|pairs?)\b")
 #: Neutral labels for a parent's own placeholder item on a SIZE axis, in order of preference.
 _PARENT_SIZE_LABELS = ("Standard", "Regular")
 

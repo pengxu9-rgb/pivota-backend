@@ -8466,6 +8466,10 @@ def _ensure_seed_data_obj(val: Any) -> Dict[str, Any]:
     return {}
 
 
+#: ingestion.SEED_VARIANT_URL_SOURCE (spelled here so the route imports no ingestion code; a test pins the two).
+_SEED_VARIANT_URL_SOURCE = "shade_fold_listing"
+
+
 def _normalize_seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     raw = seed_data.get("variants")
     if not isinstance(raw, list):
@@ -8500,11 +8504,14 @@ def _normalize_seed_variants(seed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             }
         )
         # The listing THIS variant is sold on, when it is not the seed's own destination: the retailer lane's
-        # shade fold writes it on a variant taken from another listing (ingestion._build_seed_inserts). Kept
-        # only when present and a plain http(s) URL, so every other seed projects exactly as before. A buyer
-        # link built for a SELECTED variant should open this page, not the product's destination_url.
+        # shade fold writes it on a variant taken from another listing (ingestion._build_seed_inserts), stamped
+        # with its source. Only that one is kept: other writers store a variant "url" as well (a raw ?variant=
+        # link on the seed's own page), which this public projection never served and must not start to, as it
+        # bypasses the attributed destination_url. Every other seed projects exactly as before. A buyer link
+        # built for a SELECTED variant should open this page, attributed like destination_url.
         variant_url = str(v.get("url") or "").strip()
-        if variant_url.lower().startswith(("https://", "http://")):
+        if (v.get("url_source") == _SEED_VARIANT_URL_SOURCE
+                and variant_url.lower().startswith(("https://", "http://"))):
             variants[-1]["url"] = variant_url
         if len(variants) >= 30:
             break
