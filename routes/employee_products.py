@@ -850,20 +850,32 @@ def _distinct_variant_ids(variants: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
-# A writer's per-variant stamps that a page read cannot reproduce: the merchant-issued id's
-# provenance, and the shade fold's own listing url with its source.
-_PROTECTED_VARIANT_STAMPS = ("variant_id_provenance", "url", "url_source", "own_listing_url")
+# The EXTENDED shade fold's stamp on a seed variant whose "url" is the listing it was taken from
+# (ingestion.SEED_VARIANT_URL_SOURCE; spelled here so this route imports no ingestion code, as
+# routes/agent_shop_gateway does; a test pins the two). Other writers store a variant "url" too
+# (a ?variant= link on the seed's own page), so a bare url protects nothing.
+_FOLD_URL_SOURCE = "shade_fold_listing"
 
 
 def _is_protected_seed_variant(variant: Dict[str, Any]) -> bool:
-    """A stored variant a WRITER vouched for: a `merchant_issued` provenance, or a fold's own
-    listing url. A bare numeric id is not enough -- a page read that named its variants by a GTIN
-    `sku` stores digits too, and freezing those would stop the refresh correcting its own reads."""
-    return bool(
+    """A stored variant a WRITER vouched for: the drain's `merchant_issued` provenance, or the shade
+    fold's own listing url. Bare digits are not enough -- the extractor names a read variant by its
+    `sku`, `productID` or `gtin13`, so a page read stores digits too, and freezing those would stop
+    the refresh correcting its own earlier read."""
+    return (
         variant.get("variant_id_provenance") == "merchant_issued"
-        or variant.get("url_source")
-        or variant.get("own_listing_url")
+        or variant.get("url_source") == _FOLD_URL_SOURCE
     )
+
+
+def _writer_stamps(variant: Dict[str, Any]) -> Dict[str, Any]:
+    """The protected variant's stamps a page read cannot reproduce, and nothing else."""
+    out: Dict[str, Any] = {}
+    if variant.get("variant_id_provenance") == "merchant_issued":
+        out["variant_id_provenance"] = "merchant_issued"
+    if variant.get("url_source") == _FOLD_URL_SOURCE and variant.get("url"):
+        out.update(url=variant["url"], url_source=_FOLD_URL_SOURCE)
+    return out
 
 
 def _variant_identity_keys(variant: Dict[str, Any]) -> set:
@@ -884,29 +896,34 @@ def _incoming_keeps_protected_variants(
     merchant's own Shopify ids, and the SKUs, offers and gateway PDP are keyed by them. Measured
     2026-10-13: the nightly refresh replaced such seeds with the page's ids because the page also
     lists a product-level offer (one id more), and the PDP then matched none of its SKUs and
-    served no price. Each protected variant must reappear in `incoming` under the same id."""
-    protected = [v for v in existing if _is_protected_seed_variant(v)]
+    served no price. Each protected variant must reappear in `incoming` under the same id.
+
+    A protected variant with NO id cannot be named by any read, so it does not count: holding the
+    list for it would refuse every replacement forever, and since no read can re-price it the
+    refresh would also call the seed stale every night."""
+    protected = [_variant_identity_keys(v) for v in existing if _is_protected_seed_variant(v)]
     if not protected:
         return True
     incoming_keys = set().union(*(_variant_identity_keys(v) for v in incoming)) if incoming else set()
-    return all(_variant_identity_keys(v) and _variant_identity_keys(v) <= incoming_keys for v in protected)
+    # A nameless variant's empty key set is a subset of any read's: it never holds the list.
+    return all(keys <= incoming_keys for keys in protected)
 
 
 def _adopt_seed_variants(
     *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """`incoming`, with each protected stored variant's stamps carried onto the incoming variant of
-    the same id (a page read never carries them, and dropping them would demote the id)."""
+    the same id (a page read never carries them, and dropping them would demote the id). Price,
+    stock and currency always come from the read."""
     stamps: Dict[str, Dict[str, Any]] = {}
     for v in existing:
         if _is_protected_seed_variant(v):
-            kept = {k: v[k] for k in _PROTECTED_VARIANT_STAMPS if v.get(k) not in (None, "")}
             for key in _variant_identity_keys(v):
-                stamps[key] = kept
+                stamps[key] = _writer_stamps(v)
     out: List[Dict[str, Any]] = []
     for v in incoming:
         carried = next((stamps[k] for k in _variant_identity_keys(v) if k in stamps), None)
-        out.append({**carried, **{k: val for k, val in v.items() if k not in carried}} if carried else v)
+        out.append({**v, **carried} if carried else v)
     return out
 
 
