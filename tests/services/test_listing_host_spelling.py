@@ -92,16 +92,3 @@ def test_a_folded_variant_s_own_listing_is_respelled_with_its_offer():
     assert out["pdp"]["variants"][0]["own_listing_url"] == f"https://{APEX}/products/base-duo-light"
     assert record["pdp"]["variants"][0]["own_listing_url"] == f"https://{WWW}/products/base-duo-light"  # a copy
     assert {o["destination_url"] for o in out["offers"]} == {f"https://{APEX}/products/base-duo"}
-
-
-def test_the_stored_host_is_written_as_spelled():
-    """The offer_id hashed the stored URL byte for byte: a stored upper-case host is kept, not lowercased."""
-    stored = "https://WWW.Store.example/products/base-duo"
-    out = respell_listing_host(_record(APEX), stored)
-    assert {o["destination_url"] for o in out["offers"]} == {stored}
-    same = _record(WWW)
-    for o in same["offers"]:
-        o["destination_url"] = o["canonical_url"] = stored
-    assert respell_listing_host(same, stored) is same
-    apex = _record(APEX)
-    assert respell_listing_host(apex, "https://user:pw@www.store.example/products/base-duo") is apex

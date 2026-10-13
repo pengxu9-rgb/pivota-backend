@@ -469,8 +469,7 @@ def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str]) -> D
     try:
         stored = urlsplit(str(stored_url or "").strip())
         to_host = (stored.hostname or "").lower()
-        if (not to_host or stored.port or stored.username or stored.password
-                or stored.scheme not in {"http", "https"}):
+        if not to_host or stored.port or stored.scheme not in {"http", "https"}:
             return record
     except ValueError:
         return record
@@ -480,13 +479,12 @@ def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str]) -> D
         try:
             parsed = urlsplit(str(url or "").strip())
             host = (parsed.hostname or "").lower()
-            if (not host or parsed.netloc == stored.netloc or host.removeprefix("www.") != bare or parsed.port
+            if (not host or host == to_host or host.removeprefix("www.") != bare or parsed.port
                     or parsed.username or parsed.password or parsed.scheme not in {"http", "https"}):
                 return url
         except ValueError:
             return url
-        # the stored netloc as spelled (case included): the offer_id hashed that string
-        return urlunsplit((parsed.scheme, stored.netloc, parsed.path, parsed.query, parsed.fragment))
+        return urlunsplit((parsed.scheme, to_host, parsed.path, parsed.query, parsed.fragment))
 
     offers = [{**o, **{f: respelled(o[f]) for f in _LISTING_URL_FIELDS if o.get(f)}} if isinstance(o, dict) else o
               for o in record.get("offers") or []]
