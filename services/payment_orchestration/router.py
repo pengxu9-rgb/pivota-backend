@@ -24,7 +24,9 @@ rail is called. It reads configuration only: no database, no rail, no clock. The
    to Reap, whose route applies its own gates.
 3. NO CHOICE: the A2A rail when it passes every filter, else Reap. Every rail not taken is recorded
    with its reason (`dropped`), so the purchase can say why it is where it is.
-4. NO FAILOVER AFTER THE FIRST WRITE. This runs once, before the purchase exists. Once a purchase is
+4. NO FALLBACK AFTER ROUTING. A request routed to the A2A rail that the A2A create then refuses (pricing, the
+   Tier B verdict, the cap, the buyer's details) is refused with that reason, never retried on Reap.
+5. NO FAILOVER AFTER THE FIRST WRITE. This runs once, before the purchase exists. Once a purchase is
    opened on a rail it stays there: it finishes or fails visibly, and a new purchase is a new
    request. A retried request with the same idempotency key replays the ORIGINAL purchase on its
    original rail, whatever this module would answer today (the route checks the key first).

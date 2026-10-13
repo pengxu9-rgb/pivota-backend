@@ -66,7 +66,7 @@ FACTS = {"shop_domain": SHOP, "our_price_minor": 2820, "currency": "USD", "marke
 
 
 _TABLES = ("agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs", "reap_agentic_purchase_keys",
-           "reap_agentic_purchases", "reap_agentic_eligibility")
+           "reap_agentic_purchases", "reap_agentic_eligibility", "reap_agentic_buyer_refs")
 
 
 @pytest.fixture(autouse=True)
@@ -565,3 +565,43 @@ async def test_the_stored_buyer_is_the_cleaned_one(client):
     pid = (await client.post(BASE, b)).json()["purchase_id"]
     row = await a2a_ledger.get_purchase_internal(pid)
     assert row["shipping_address"]["city"] == "SanFrancisco" and row["buyer_email"] == EMAIL
+
+
+
+async def test_the_reap_door_losing_a_key_race_to_another_rail_names_the_winner_and_scrubs_its_own_row(
+        client, stubs, reap_door_open, monkeypatch):
+    """The REAL Reap create, up to its key claim; the key was won by an A2A purchase. Its own row is refused as a
+    duplicate with the PII gone, and the answer names the winner (never a 404 or 503 the client could read as
+    "not created")."""
+    import db.reap_agentic_ledger as reap_ledger
+
+    clicks = []
+
+    async def _click(click):
+        clicks.append(click)
+
+    async def _a2a_won(**kwargs):
+        return "ap_0123456789abcdef01234567"
+
+    # The buyer identity is the Reap route's own business (its tests own the minting): a minted buyer stands in.
+    await database.execute(
+        "INSERT INTO reap_agentic_buyer_refs (buyer_id, reap_buyer_ref, consent_version, consented_at) "
+        "VALUES ('buyer_race', 'bref_race', 'terms-2026-10', CURRENT_TIMESTAMP)")
+
+    async def _buyer(**kwargs):
+        return "buyer_race"
+
+    async def _bref(buyer_id, **kwargs):
+        return "bref_race"
+
+    monkeypatch.setattr(reap_routes, "_buyer_id_for", _buyer)
+    monkeypatch.setattr(reap_routes, "_reap_buyer_ref", _bref)
+    monkeypatch.setattr(reap_routes, "issue_click", _click)
+    monkeypatch.setattr(reap_routes, "_claim_idempotency_key", _a2a_won)
+    resp = await client.post("/agent/v2/commerce/reap/purchases", body())
+    assert resp.status_code == 409 and "opened_on_another_rail" in resp.text, resp.text
+    assert "ap_0123456789abcdef01234567" in resp.text
+    [row] = await database.fetch_all("SELECT id FROM reap_agentic_purchases")
+    reap_row = await reap_ledger.get_purchase_internal(row["id"])
+    assert (reap_row["state"], reap_row["refusal_reason"]) == ("refused", "duplicate_idempotency_key")
+    assert reap_row["buyer_email"] is None and reap_row["shipping_address"] is None
