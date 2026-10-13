@@ -23,9 +23,11 @@ WHAT IT DOES, per host:
      `ingest_validated_jsonl` with the job's market and each row's current listing. A row the plan
      does not produce is `not_in_feed` and untouched. The batch is TODAY's feed.
   4. GUARD. A row is written only when its stored description EQUALS (`=`) the crawl's own copy
-     (`enrichment_meta.candidate_attribute_summary`) or `legacy_body_html_to_text` of the
-     product's current body_html (a frozen copy of the old producer, below). Anything else was
-     written by another lane or by hand: `not_crawl_owned`, never written.
+     (`enrichment_meta.candidate_attribute_summary`), `legacy_body_html_to_text` of the
+     product's current body_html (a frozen copy of the old producer, below), or the new text with
+     its sub/superscript numerals back in ASCII (what the producer wrote before the numeric sup/sub
+     fix; meaningful only on an image that has that fix -- without it the arm equals the new text).
+     Anything else was written by another lane or by hand: `not_crawl_owned`, never written.
   5. WHAT IS WRITTEN is what the drain's next re-crawl of the row would leave on it once its copy is
      the new text: the stage from the drain's own rule (`apply._stage_from_kept_copy`, which keeps a
      row whose category does not resolve at the plan's stage), and the plan's four taxonomy columns
@@ -492,11 +494,29 @@ async def drain_stage(planned: Dict[str, Any], title: Any, description: Any) -> 
     return plan["pdps"][0].get("pdp_lifecycle_stage")
 
 
-def crawl_owned(old: Optional[str], crawled_copy: Optional[str], legacy_text: Optional[str]) -> bool:
-    """The write guard: the stored text is EXACTLY what the crawl wrote, by either arm."""
+# The producer before the numeric sup/sub fix flattened <sup>1</sup> to a plain "1" glued to its word;
+# the fixed one writes "\u00b9". Mapping the fixed producer's sub/superscript numerals back to ASCII
+# rebuilds, byte for byte, what the glued-era producer wrote from the same body.
+_SCRIPT_TO_ASCII = str.maketrans(
+    "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207a\u207b\u207c\u207d\u207e"
+    "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089\u208a\u208b\u208c\u208d\u208e",
+    "0123456789+-=()0123456789+-=()")
+
+
+def glued_era_text(new: Optional[str]) -> Optional[str]:
+    """What the producer wrote for the same body before the numeric sup/sub fix."""
+    return None if new is None else new.translate(_SCRIPT_TO_ASCII)
+
+
+def crawl_owned(old: Optional[str], crawled_copy: Optional[str], legacy_text: Optional[str],
+                glued_text: Optional[str] = None) -> bool:
+    """The write guard: the stored text is EXACTLY what a crawl wrote -- its recorded copy, the old
+    producer's text of the current body, or (a row minted between the cleanup and the sup/sub fix,
+    whose recorded copy a re-crawl has since rewritten) the glued-era text of the new one."""
     if old is None:
         return False
-    return (crawled_copy is not None and old == crawled_copy) or (legacy_text is not None and old == legacy_text)
+    return ((crawled_copy is not None and old == crawled_copy) or (legacy_text is not None and old == legacy_text)
+            or (glued_text is not None and old == glued_text))
 
 
 def _sha(value: Any) -> str:
@@ -571,7 +591,7 @@ def guard_outcome(row: Dict[str, Any], planned: Optional[Dict[str, Any]], legacy
     new = planned.get("description") or None
     if new is not None and new == old:
         return UNCHANGED
-    if not crawl_owned(old, row.get("crawled_copy"), legacy_text):
+    if not crawl_owned(old, row.get("crawled_copy"), legacy_text, glued_era_text(new)):
         return NOT_CRAWL_OWNED
     if new is None:
         return WOULD_EMPTY

@@ -1093,3 +1093,32 @@ def test_a_re_split_that_runs_on_into_more_words_is_lost():
     old = f"{LONG_OLD} Massage onto skin and avoid the eye area."
     new = f"{LONG_NEW} Massage onto skin. And avoid the eye area during the day."
     assert rd.lost_safety_sentences(old, new) == ["Massage onto skin and avoid the eye area."]
+
+
+# --- the glued-era arm of the guard ---------------------------------------------------------------------
+
+GLUED = "5x the Ceramide1 to restore, with Extract2 for glow in just 1 week3."
+SCRIPTED = "5x the Ceramide\u00b9 to restore, with Extract\u00b2 for glow in just 1 week\u00b3."
+
+
+def test_a_glued_era_row_re_crawled_by_the_fixed_producer_is_owned_and_rewritten():
+    """Minted between the cleanup and the sup/sub fix: its description is the glued text, which no
+    longer equals its recorded copy (a re-crawl rewrote that) nor the old producer's text."""
+    row = _row("p1", "h1", GLUED, crawled=SCRIPTED)
+    assert rd.glued_era_text(SCRIPTED) == GLUED
+    assert rd.guard_outcome(row, _pdp("p1", "h1", SCRIPTED), "the old producer's different text") is None
+    d = rd.decide(row, _pdp("p1", "h1", SCRIPTED), stage="published", stage_with_old="published",
+                  allow_demote=False, allow_promote=False)
+    assert d.outcome == rd.WRITE and d.new == SCRIPTED
+
+
+def test_a_hand_edited_row_that_merely_contains_a_glued_digit_is_not_owned():
+    row = _row("p1", "h1", GLUED.replace("restore", "repair"), crawled=SCRIPTED)
+    assert rd.guard_outcome(row, _pdp("p1", "h1", SCRIPTED), None) == rd.NOT_CRAWL_OWNED
+
+
+def test_the_glued_era_arm_maps_every_numeral_the_producer_writes():
+    scripted = "".join(chr(c) for c in (0x2070, 0xB9, 0xB2, 0xB3, *range(0x2074, 0x207F),
+                                        *range(0x2080, 0x208F)))
+    assert rd.glued_era_text(scripted) == "0123456789+-=()0123456789+-=()"
+    assert rd.glued_era_text("No numerals here.") == "No numerals here." and rd.glued_era_text(None) is None
