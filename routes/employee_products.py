@@ -850,6 +850,66 @@ def _distinct_variant_ids(variants: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
+# A writer's per-variant stamps that a page read cannot reproduce: the merchant-issued id's
+# provenance, and the shade fold's own listing url with its source.
+_PROTECTED_VARIANT_STAMPS = ("variant_id_provenance", "url", "url_source", "own_listing_url")
+
+
+def _is_protected_seed_variant(variant: Dict[str, Any]) -> bool:
+    """A stored variant whose identity came from the merchant, not from a page read: a numeric
+    Shopify variant id, a `merchant_issued` provenance, or a fold's own listing url."""
+    return bool(
+        _native_refresh_variant_ids(variant)
+        or variant.get("variant_id_provenance") == "merchant_issued"
+        or variant.get("url_source")
+        or variant.get("own_listing_url")
+    )
+
+
+def _variant_identity_keys(variant: Dict[str, Any]) -> set:
+    native = _native_refresh_variant_ids(variant)
+    if native:
+        return native
+    raw = variant.get("variant_id") or variant.get("variantId") or variant.get("id")
+    return {str(raw).strip()} if raw not in (None, "") and str(raw).strip() else set()
+
+
+def _incoming_keeps_protected_variants(
+    *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]
+) -> bool:
+    """True unless replacing `existing` with `incoming` would drop a protected variant.
+
+    A page read names variants by whatever its JSON-LD carries: the merchant SKU code, or the
+    offer `@id` (`/products/<handle>?variant=<id>#offer`). The retailer-ingest drain stores the
+    merchant's own Shopify ids, and the SKUs, offers and gateway PDP are keyed by them. Measured
+    2026-10-13: the nightly refresh replaced such seeds with the page's ids because the page also
+    lists a product-level offer (one id more), and the PDP then matched none of its SKUs and
+    served no price. Each protected variant must reappear in `incoming` under the same id."""
+    protected = [v for v in existing if _is_protected_seed_variant(v)]
+    if not protected:
+        return True
+    incoming_keys = set().union(*(_variant_identity_keys(v) for v in incoming)) if incoming else set()
+    return all(_variant_identity_keys(v) and _variant_identity_keys(v) <= incoming_keys for v in protected)
+
+
+def _adopt_seed_variants(
+    *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """`incoming`, with each protected stored variant's stamps carried onto the incoming variant of
+    the same id (a page read never carries them, and dropping them would demote the id)."""
+    stamps: Dict[str, Dict[str, Any]] = {}
+    for v in existing:
+        if _is_protected_seed_variant(v):
+            kept = {k: v[k] for k in _PROTECTED_VARIANT_STAMPS if v.get(k) not in (None, "")}
+            for key in _variant_identity_keys(v):
+                stamps[key] = kept
+    out: List[Dict[str, Any]] = []
+    for v in incoming:
+        carried = next((stamps[k] for k in _variant_identity_keys(v) if k in stamps), None)
+        out.append({**carried, **{k: val for k, val in v.items() if k not in carried}} if carried else v)
+    return out
+
+
 def _should_overwrite_seed_variants(
     *,
     existing: List[Dict[str, Any]],
@@ -860,6 +920,8 @@ def _should_overwrite_seed_variants(
         return False
     if not existing:
         return True
+    if not _incoming_keeps_protected_variants(existing=existing, incoming=incoming):
+        return False
 
     existing_score = _best_variant_title_score(existing, product_title)
     incoming_score = _best_variant_title_score(incoming, product_title)
@@ -942,6 +1004,8 @@ def _should_replace_seed_variant_content(
     refreshed_canonical_url: Optional[str],
 ) -> bool:
     if not incoming:
+        return False
+    if not _incoming_keeps_protected_variants(existing=existing, incoming=incoming):
         return False
     existing_map = _seed_variant_description_map(existing)
     incoming_map = _seed_variant_description_map(incoming)
@@ -4047,7 +4111,7 @@ async def create_external_seed(
         elif snap_variants:
             existing_variants = _seed_variants(seed_data)
             if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=title):
-                seed_data["variants"] = snap_variants
+                seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=snap_variants)
             elif not existing_variants:
                 seed_data["variants"] = snap_variants
 
@@ -5361,7 +5425,7 @@ async def _refresh_external_seed_by_id(
         existing_variants = _seed_variants(seed_data)
         product_title = seed_data.get("title") or snap_title
         if _should_overwrite_seed_variants(existing=existing_variants, incoming=adoptable_variants, product_title=product_title):
-            seed_data["variants"] = adoptable_variants
+            seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=adoptable_variants)
         elif _should_replace_seed_variant_content(
             existing=existing_variants,
             incoming=adoptable_variants,
@@ -5369,7 +5433,7 @@ async def _refresh_external_seed_by_id(
             previous_canonical_url=previous_canonical_url,
             refreshed_canonical_url=canonical_url,
         ):
-            seed_data["variants"] = adoptable_variants
+            seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=adoptable_variants)
         elif not existing_variants:
             seed_data["variants"] = adoptable_variants
 
