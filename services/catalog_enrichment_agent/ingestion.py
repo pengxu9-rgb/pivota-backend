@@ -462,8 +462,11 @@ def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str]) -> D
     a brand store crawled as `www.` in September and as the apex in October (the queue named the host both
     ways). The row's own spelling wins, so a re-crawl upserts the offers it already has.
 
-    Only offers' canonical/destination URLs and an extended-fold variant's own_listing_url are re-spelled;
-    a subdomain other than `www.`, a port or credentials are never treated as the same host."""
+    Only offers' canonical/destination URLs and an extended-fold variant's own_listing_url are re-spelled --
+    and, for a retailer record, `pdp.source_domain`: it scopes the `ext:retailer:` row's variant SKU keys
+    (derive_variant_sku_key `seller_scope`, hashed as spelled), so a re-spelled URL alone would still re-key every
+    variant SKU and its offer. A subdomain other than `www.`, a port or credentials are never treated as the
+    same host."""
     from urllib.parse import urlsplit, urlunsplit
 
     try:
@@ -493,11 +496,19 @@ def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str]) -> D
     if pdp is not None and isinstance(pdp.get("variants"), list):
         variants = [{**v, "own_listing_url": respelled(v["own_listing_url"])}
                     if isinstance(v, dict) and v.get("own_listing_url") else v for v in pdp["variants"]]
-    if offers == (record.get("offers") or []) and (variants is None or variants == pdp["variants"]):
+    source_domain = None
+    if pdp is not None and pdp.get("source_role") == "retailer" and pdp.get("source_domain"):
+        # Prod 2026-10-13: every `ext:retailer:` row stores source_domain spelled as its canonical_url host.
+        crawled = str(pdp["source_domain"]).strip().lower()
+        if crawled != to_host and crawled.removeprefix("www.") == bare:
+            source_domain = to_host
+    if (offers == (record.get("offers") or []) and (variants is None or variants == pdp["variants"])
+            and source_domain is None):
         return record
     out = {**record, "offers": offers}
-    if variants is not None:
-        out["pdp"] = {**pdp, "variants": variants}
+    if variants is not None or source_domain is not None:
+        out["pdp"] = {**pdp, **({"variants": variants} if variants is not None else {}),
+                      **({"source_domain": source_domain} if source_domain is not None else {})}
     return out
 
 
@@ -1860,6 +1871,7 @@ def ingest_validated_jsonl(
     market: Optional[str] = None,
     current_listings: Optional[Dict[str, Tuple[str, ...]]] = None,
     allow_moves: Iterable[str] = (),
+    listing_spellings: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Drive ingest_validated_record across an iterable of records and
     return all five row collections plus skipped_count. Pure — no DB
@@ -1872,7 +1884,15 @@ def ingest_validated_jsonl(
     (apply.current_listings), and as a third element the row's canonical_url as stored: a record whose
     listing URLs spell that host with or without `www.` where the row does not is re-spelled to the row's
     (respell_listing_host, named in `listing_respellings`), so a re-crawl under the other spelling refreshes the
-    row's offers and seeds instead of minting a second set. A plan NEVER MOVES A ROW OFF THE LISTING IT NAMES: that listing keeps
+    row's offers and seeds instead of minting a second set.
+
+    `listing_spellings` (optional): product_key -> the row's canonical_url as stored, for rows whose listing
+    cannot move (apply.plan_with_current_listings passes the `ext:retailer:` rows': their key is the listing
+    without `www.`, so the other spelling is the same row and, without this, a second offer and seed set).
+    It picks the host spelling exactly like the third element of `current_listings` and NOTHING ELSE: it never
+    names a listing, so it never keeps, holds or moves one (`listing_moves` reads `current_listings` only).
+
+    A plan NEVER MOVES A ROW OFF THE LISTING IT NAMES: that listing keeps
     the key whenever the crawl carries it, in or out of stock; when the crawl does not (unpublished, a
     renamed handle, a page the crawl dropped), every record of that key on that host is left out and
     named in `listing_moves` -- unless the key is in `allow_moves` (a reviewer accepted the move).
@@ -1924,8 +1944,9 @@ def ingest_validated_jsonl(
             reason = str(result["skipped_reason"]).split(":")[0]
             skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
             continue
-        named = (current_listings or {}).get(str(result["pdp"].get("product_key") or ""))
-        stored_url = named[2] if named and len(named) > 2 else None
+        key = str(result["pdp"].get("product_key") or "")
+        named = (current_listings or {}).get(key)
+        stored_url = named[2] if named and len(named) > 2 else (listing_spellings or {}).get(key)
         respelled = respell_listing_host(record, stored_url) if stored_url else record
         if respelled is not record:
             again = ingest_validated_record(respelled, source_jsonl=source_jsonl, market=market)

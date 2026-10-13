@@ -122,8 +122,9 @@ def test_apply_discloses_the_rows_it_is_about_to_write(monkeypatch, capsys):
     plan = ingestion.ingest_validated_jsonl(records)
     monkeypatch.setattr(cli, "apply_ingest_plan", AsyncMock(
         return_value={name: len(plan[name]) for name in ("pdps", "skus", "offers")}))
-    monkeypatch.setattr(db_module, "database",
-                        SimpleNamespace(is_connected=True, disconnect=AsyncMock()))
+    database = SimpleNamespace(is_connected=True, disconnect=AsyncMock(), fetch_all=AsyncMock(return_value=[]))
+    monkeypatch.setattr(db_module, "database", database)
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (database, None))  # an apply reads the rows' spellings
 
     assert cli.main(["--domain", "eyurs.com", "--category", "beauty", "--brand", "A'PIEU",
                      "--only-vendor", "A'PIEU", "--source-role", "retailer", "--apply"]) == 0
