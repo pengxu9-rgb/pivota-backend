@@ -397,15 +397,16 @@ def test_the_recovery_postgres_step_runs_after_the_gate_it_must_not_mask():
     workflow = yaml.safe_load(
         Path(".github/workflows/postgres-dialect-gate.yml").read_text()
     )
-    names = [s.get("name") for s in
-             workflow["jobs"]["postgres-dialect-gate"]["steps"]]
+    # Since 2026-10-13 the gate's steps live in the `shard` matrix job; one shard
+    # runs the recovery report, after that shard's own assert.
+    names = [s.get("name") for s in workflow["jobs"]["shard"]["steps"]]
     assert names.index("Assert the gate actually gated") < names.index(
         "Recovery report JSONB to authenticated HTTP"
     )
-    step = next(s for s in workflow["jobs"]["postgres-dialect-gate"]["steps"]
+    step = next(s for s in workflow["jobs"]["shard"]["steps"]
                 if s.get("name") == "Recovery report JSONB to authenticated HTTP")
     # It keeps its own junit assertion: a SKIPPED recovery test is a failure.
-    assert "pytest-recovery-postgres.xml" in step["run"]
+    assert "pytest-recovery-postgres-shard-" in step["run"]
     assert "did not execute" in step["run"]
 
 

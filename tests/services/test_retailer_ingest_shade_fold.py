@@ -53,7 +53,7 @@ def variant(label, price, handle):
 
 
 LINE = [
-    product("Gel Colour", "gel-colour"),                              # the parent stub
+    product("Gel Colour", "gel-colour"),                              # the parent: a priced Default Title item
     product("Gel Colour - Ruby Red", "gel-colour-ruby-red"),
     product("Gel Colour - Coral Reef", "gel-colour-coral-reef"),
     product("Gel Colour - Midnight", "gel-colour-midnight"),
@@ -99,12 +99,13 @@ async def test_fold_off_keeps_one_product_per_shade(monkeypatch):
 async def test_fold_on_makes_one_product_whose_variants_are_the_shades(monkeypatch):
     records = await _records(monkeypatch, LINE)
     assert list(_by_name(records)) == ["Gel Colour"]
-    assert _variants(records[0]) == [("Ruby Red", "Color"), ("Coral Reef", "Color"), ("Midnight", "Color")]
+    # the parent's own item first (it is what the parent page sells, at its price), then the shades
+    assert _variants(records[0]) == [("Default Title", ""), ("Ruby Red", "Color"), ("Coral Reef", "Color"), ("Midnight", "Color")]
     # each shade keeps the listing it came from, which is where it is sold
     assert [v["source_handle"] for v in records[0]["pdp"]["variants"]] == [
-        "gel-colour-ruby-red", "gel-colour-coral-reef", "gel-colour-midnight"]
+        None, "gel-colour-ruby-red", "gel-colour-coral-reef", "gel-colour-midnight"]
     summary = records.crawl_report["shade_fold"]
-    assert (summary["bases"], summary["shades"], summary["stubs_replaced"], summary["superseded_count"]) == (1, 3, 1, 3)
+    assert (summary["bases"], summary["shades"], summary["stubs_replaced"], summary["superseded_count"]) == (1, 3, 0, 3)
     assert summary["axes"] == {"shade": 3, "size": 0, "named": 0}
     assert {s["handle"]: s["kind"] for s in records.fold_report["superseded"]} == {
         "gel-colour-ruby-red": "shade", "gel-colour-coral-reef": "shade", "gel-colour-midnight": "shade"}
@@ -116,7 +117,7 @@ async def test_the_shops_own_option_name_is_used_one_spelling_per_product(monkey
                         product_type="Lip"),
                 product("Lip Oil - Honey", "lip-oil-honey", product_type="Lip")]  # names no axis itself
     records = await _records(monkeypatch, products)
-    assert _variants(records[0]) == [("Cherry", "Colour"), ("Honey", "Colour")]
+    assert _variants(records[0]) == [("Default Title", ""), ("Cherry", "Colour"), ("Honey", "Colour")]
 
 
 def test_a_base_that_names_its_own_axis_sets_the_spelling():
@@ -152,8 +153,11 @@ async def test_size_siblings_fold_as_size_variants(monkeypatch):
     _, legacy = feed.fold_shade_listings([dict(p) for p in products])
     assert [r["reason"] for r in legacy["refused"]] == ["price_mismatch"]
     records = await _records(monkeypatch, products)
-    assert _variants(records[0]) == [("30ml", "Size"), ("100ml", "Size")]
-    assert [v["price"] for v in records[0]["pdp"]["variants"]] == [12.0, 32.0]
+    # The parent's own 12.00 item stays first: it is what the parent page sells (dropping it priced the
+    # parent's canonical offer at a child's price).
+    assert _variants(records[0]) == [("Default Title", ""), ("30ml", "Size"), ("100ml", "Size")]
+    assert [v["price"] for v in records[0]["pdp"]["variants"]] == [12.0, 12.0, 32.0]
+    assert records[0]["offers"][0]["price"] == 12.0
     assert records.crawl_report["shade_fold"]["axes"] == {"shade": 0, "size": 2, "named": 0}
 
 
@@ -205,6 +209,7 @@ async def test_a_code_suffixed_copy_with_an_identity_proof_is_deduped(monkeypatc
     assert list(_by_name(records)) == ["Glow Pair"]
     assert records[0]["pdp"]["variants"][0]["title"] in (None, "Default Title")  # the base, untouched
     assert records.fold_report["copies_deduped"] == {"glow-pair": ["glow-pair-qwrtz7"]}
+    assert (records.fold_report["bases"], records.fold_report["folded"]) == (0, {})  # not a folded row
     assert records.fold_report["superseded"] == [
         {"handle": "glow-pair-qwrtz7", "base_handle": "glow-pair", "kind": "copy", "proof": "barcode"}]
 
@@ -251,7 +256,7 @@ async def test_different_products_sharing_a_title_prefix_are_not_merged(monkeypa
     records = await _records(monkeypatch, products, vendors=(VENDOR, other))
     assert sorted(_by_name(records)) == ["Nail Lacquer", "Nail Lacquer - Cuticle Oil", "Nail Lacquer - Gold Flake",
                                          "Nail Lacquer - Plum", "Nail Lacquer - Top Coat"]
-    assert _variants(_by_name(records)["Nail Lacquer"]) == [("Blush", "Color")]
+    assert _variants(_by_name(records)["Nail Lacquer"]) == [("Default Title", ""), ("Blush", "Color")]
     assert {r["handle"]: r["reason"] for r in records.fold_report["refused"]} == {
         "nail-lacquer-top-coat": "non_shade_suffix", "nail-lacquer-cuticle-oil": "product_type_mismatch",
         "nail-lacquer-gold-flake": "price_mismatch"}
@@ -296,7 +301,8 @@ async def test_a_folded_retailer_variant_offer_points_at_its_own_listing(monkeyp
     canonical = [u for k, u in urls.items() if k.endswith("::canonical")]
     assert canonical == [base]
     assert sorted(u for k, u in urls.items() if not k.endswith("::canonical")) == sorted(
-        f"https://{HOST}/products/{h}" for h in ("gel-colour-ruby-red", "gel-colour-coral-reef", "gel-colour-midnight"))
+        f"https://{HOST}/products/{h}" for h in ("gel-colour", "gel-colour-ruby-red", "gel-colour-coral-reef",
+                                                 "gel-colour-midnight"))
     # one product row, keyed by the BASE listing
     assert [p["product_key"] for p in plan["pdps"]] == [ingestion.retailer_product_key(HOST, base)]
 
@@ -406,7 +412,7 @@ async def test_the_lane_folds_only_when_the_cohort_asks(env, monkeypatch):  # no
     assert out["status"] == "done", _last_run(env)
     plan = env.applied[-1]
     assert [p["canonical_url"] for p in plan["pdps"]] == [f"https://{HOST}/products/gel-colour"]
-    assert len(plan["skus"]) == 4  # the canonical SKU + one per shade
+    assert len(plan["skus"]) == 5  # the canonical SKU + the parent's own item + one per shade
     fold = _last_run(env)["checks"]["shade_fold"]
     assert (fold["bases"], fold["shades"], fold["supersede_preview"]["status"]) == (1, 3, "clear")
     assert fold["supersede_preview"]["never_ingested"] == 3
@@ -556,7 +562,8 @@ def test_only_the_extended_fold_names_a_variants_own_listing():
                                                 currency="USD", source_role="retailer", retailer_name=HOST)
                  for out in (legacy, extended)]
     assert "own_listing_url" not in as_record[0]["pdp"]["variants"][0]
-    assert as_record[1]["pdp"]["variants"][0]["own_listing_url"] == f"https://{HOST}/products/g-ruby"
+    assert "own_listing_url" not in as_record[1]["pdp"]["variants"][0]   # the parent's own item
+    assert as_record[1]["pdp"]["variants"][-1]["own_listing_url"] == f"https://{HOST}/products/g-ruby"
 
 
 @pytest.mark.parametrize("url,ok", [(f"https://{HOST}/products/g-ruby", True),
@@ -683,7 +690,7 @@ def test_the_shops_own_option_name_lets_a_finish_word_or_number_fold(suffix, axi
     out, report = feed.fold_shade_listings([product("Lipstick", "b"),
                                             product(f"Lipstick - {suffix}", "c", option1=suffix,
                                                     option_name=axis_name)], extended=True)
-    assert len(out) == 1 and out[0]["variants"][0][feed.FOLD_AXIS_KEY] == axis
+    assert len(out) == 1 and out[0]["variants"][-1][feed.FOLD_AXIS_KEY] == axis
 
 
 def test_an_spf_claim_is_refused_even_with_a_shade_option():
@@ -731,7 +738,7 @@ def test_an_axis_the_shop_names_otherwise_keeps_its_name():
             product("Candle - Fig", "c-f", option1="Fig", option_name="Scent", product_type="Candle")]
     out, report = feed.fold_shade_listings(rows, extended=True)
     rec = feed.shopify_product_to_record(out[0], domain=HOST, category_path="beauty", emit_variants=True)
-    assert _variants(rec) == [("Fig", "Scent")]
+    assert _variants(rec) == [("Default Title", ""), ("Fig", "Scent")]
     assert report["axes"] == {"shade": 0, "size": 0, "named": 1}
 
 
@@ -793,3 +800,144 @@ def test_siblings_that_differ_only_by_finish_words_are_refused():
                                  f"https://{HOST}:abc/products/g-ruby", "https://[bad/products/g-ruby"])
 def test_an_own_listing_url_is_one_plain_storefront_url(url):
     assert ingestion.own_listing_url(f"https://{HOST}/products/g", url) is None
+
+
+# ---- F1: every offer is priced by the listing it points at --------------------------------------------------------
+# A single "Default Title" variant at a real price is the normal retailer product. Treating it as a stub dropped
+# the parent's own item, and the parent URL's canonical offer took the first child's price and stock.
+
+def _assert_every_offer_is_priced_by_its_own_listing(products, plan):
+    """THE INVARIANT: an offer's price (canonical included) is a price the page in its source_ref sells. The
+    canonical offer is that page's first sellable item; a variant offer is the variant its SKU names, found
+    in that page's own product."""
+    by_handle = {p["handle"]: p for p in products}
+    vid_of = {s["sku_key"]: str(s["source_variant_id"]) for s in plan["skus"]}
+    assert plan["offers"]
+    for o in plan["offers"]:
+        listing = by_handle[shopify_markets.handle_from_url(o["source_ref"])]
+        if o["sku_key"].endswith("::canonical"):
+            sellable = [v for v in listing["variants"] if float(v["price"]) >= feed.MIN_SELLABLE_PRICE]
+            assert float(o["list_price"]) == float(sellable[0]["price"]), (o["source_ref"], o["list_price"])
+        else:
+            own = {str(v["id"]): v for v in listing["variants"]}
+            assert vid_of[o["sku_key"]] in own, (o["source_ref"], vid_of[o["sku_key"]])
+            assert float(o["list_price"]) == float(own[vid_of[o["sku_key"]]]["price"]), o["source_ref"]
+
+
+INVARIANT_CASES = {
+    "size": [product("Glow Serum", "glow-serum", price="40.00", product_type="Serum"),
+             product("Glow Serum - 100ml", "glow-serum-100ml", price="90.00", product_type="Serum")],
+    "shade": [product("Lip Oil", "lip-oil", price="20.00", product_type="Lip"),
+              product("Lip Oil - Cherry", "lip-oil-cherry", price="28.00", product_type="Lip")],
+    "stub": [product("Gel Tint", "gel-tint", price="0.00", option1="Choose a size", option_name="Size"),
+             product("Gel Tint - 8ml", "gel-tint-8ml", price="20.00"),
+             product("Gel Tint - 15ml", "gel-tint-15ml", price="34.00")],
+    "absorbed_repeat": [
+        product("Eau Fraiche", "eau-fraiche", option_name="Size", product_type="Fragrance",
+                variants=[variant("50ml", "40.00", "eau"), variant("100ml", "60.00", "eau")]),
+        product("Eau Fraiche - 50ml", "eau-fraiche-50ml", price="40.00", product_type="Fragrance"),
+        product("Eau Fraiche - 10ml", "eau-fraiche-10ml", price="18.00", product_type="Fragrance")],
+    "placeholder_repeated_by_a_child": [
+        product("Lip Kit", "lip-kit", price="25.00", product_type="Lip", sku="KIT-ROSE-01"),
+        product("Lip Kit - Rose", "lip-kit-rose", price="25.00", product_type="Lip", sku="KIT-ROSE-01"),
+        product("Lip Kit - Plum", "lip-kit-plum", price="26.00", product_type="Lip")],
+}
+
+
+@pytest.mark.parametrize("case", sorted(INVARIANT_CASES))
+async def test_every_offer_is_priced_by_the_listing_it_points_at(monkeypatch, case):
+    products = INVARIANT_CASES[case]
+    records = await _records(monkeypatch, products)
+    assert len(records) == 1 and records.fold_report["bases"] == 1, case
+    _assert_every_offer_is_priced_by_its_own_listing(products, ingestion.ingest_validated_jsonl(list(records),
+                                                                                                 market="US"))
+
+
+@pytest.mark.parametrize("case,canonical", [("size", ("glow-serum", 40.0)), ("shade", ("lip-oil", 20.0))])
+async def test_a_priced_parent_keeps_its_own_canonical_offer(monkeypatch, case, canonical):
+    records = await _records(monkeypatch, INVARIANT_CASES[case])
+    offer = records[0]["offers"][0]
+    assert (offer["destination_url"], offer["canonical_url"], offer["price"]) == (
+        f"https://{HOST}/products/{canonical[0]}", f"https://{HOST}/products/{canonical[0]}", canonical[1])
+    assert records.fold_report["stubs_replaced"] == 0 and records.fold_report["canonical_moved"] == []
+
+
+async def test_an_unsellable_parents_canonical_offer_is_sold_on_its_first_child(monkeypatch):
+    records = await _records(monkeypatch, INVARIANT_CASES["stub"])
+    offer = records[0]["offers"][0]
+    # the row stays the parent's (key, served page); the offer points where its price is sold
+    assert offer["canonical_url"] == f"https://{HOST}/products/gel-tint"
+    assert (offer["destination_url"], offer["price"]) == (f"https://{HOST}/products/gel-tint-8ml", 20.0)
+    assert records.fold_report["canonical_moved"] == [{"base_handle": "gel-tint", "handle": "gel-tint-8ml"}]
+    assert records.crawl_report["shade_fold"]["canonical_moved"] == records.fold_report["canonical_moved"]
+    plan = ingestion.ingest_validated_jsonl(list(records), market="US")
+    assert [p["product_key"] for p in plan["pdps"]] == [
+        ingestion.retailer_product_key(HOST, f"https://{HOST}/products/gel-tint")]
+
+
+def test_a_priced_single_default_title_parent_is_not_a_stub():
+    assert not feed._is_extended_stub(product("Glow Serum", "g", price="40.00"))
+    assert feed._is_extended_stub(product("Glow Serum", "g", price="0.00"))
+    assert feed._is_extended_stub(product("Glow Serum", "g", price="0.50"))
+    assert feed._is_extended_stub(product("Glow Serum", "g", variants=[variant("A", "0.00", "g"),
+                                                                      variant("B", "0.10", "g")]))
+    assert not feed._is_extended_stub(product("Glow Serum", "g", variants=[variant("A", "0.00", "g"),
+                                                                          variant("B", "12.00", "g")]))
+
+
+async def test_a_live_parent_row_whose_canonical_the_fold_moves_is_held(env, monkeypatch):  # noqa: F811
+    """A parent that sells nothing gets its canonical offer at a child's listing: a NEW offer_id. A live row
+    under the parent's key would keep its old canonical offer at the parent URL beside it."""
+    base_key = ingestion.retailer_product_key(HOST, f"https://{HOST}/products/gel-tint")
+    row = {"product_key": base_key, "canonical_url": f"https://{HOST}/products/gel-tint", "source_domain": HOST,
+           "suppression_reason": None, "suppressed_at": None}
+    await _lane(env, monkeypatch, INVARIANT_CASES["stub"], catalog=Catalog([row]))
+    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
+    assert out["status"] == "held" and env.applied == []
+    flags = {f["rule"]: f for f in _last_run(env)["flags"] if f["severity"] == "block"}
+    assert set(flags) == {"fold_moves_live_canonical"} and flags["fold_moves_live_canonical"]["acceptable"] is False
+    live = _last_run(env)["checks"]["shade_fold"]["supersede_preview"]["live_rows"]
+    assert [(r["kind"], r["stale_key"], r["to_handle"]) for r in live] == [
+        ("canonical_moved", base_key, "gel-tint-8ml")]
+
+
+async def test_a_moved_canonical_on_a_new_store_applies(env, monkeypatch):  # noqa: F811
+    await _lane(env, monkeypatch, INVARIANT_CASES["stub"])
+    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
+    assert out["status"] == "done", _last_run(env)["flags"]
+    _assert_every_offer_is_priced_by_its_own_listing(INVARIANT_CASES["stub"], env.applied[-1])
+
+
+async def test_a_live_parent_row_that_keeps_its_canonical_is_only_extended(env, monkeypatch):  # noqa: F811
+    """A priced parent keeps its own canonical offer: same offer_id, same URL, its own price. A live row under
+    its key is not held: the apply only adds the folded variants' SKUs and offers."""
+    products = INVARIANT_CASES["size"]
+    await _lane(env, monkeypatch, products)
+    assert (await pipeline.run_stage(fold_job("apply_due"), db=env.db))["status"] == "done"
+    unfolded = {o["offer_id"]: o for o in env.applied[-1]["offers"]}
+    base_key = ingestion.retailer_product_key(HOST, f"https://{HOST}/products/glow-serum")
+    row = {"product_key": base_key, "canonical_url": f"https://{HOST}/products/glow-serum", "source_domain": HOST,
+           "suppression_reason": None, "suppressed_at": None}
+    await _lane(env, monkeypatch, products, catalog=Catalog([row]))
+    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True), db=env.db)
+    assert out["status"] == "done", _last_run(env)["flags"]
+    folded = {o["offer_id"]: o for o in env.applied[-1]["offers"]}
+    base_offers = {k: o for k, o in unfolded.items() if o["product_key"] == base_key}
+    assert len(base_offers) == 2  # its canonical SKU's offer and its own variant's
+    for offer_id, offer in base_offers.items():  # the same offers, at the same URL and price: updated in place
+        assert (folded[offer_id]["source_ref"], folded[offer_id]["list_price"]) == (offer["source_ref"],
+                                                                                   offer["list_price"]) == (
+            f"https://{HOST}/products/glow-serum", 40.0)
+    assert len(folded) == 3  # ... plus the folded 100 ml variant's offer, at its own listing
+    _assert_every_offer_is_priced_by_its_own_listing(products, env.applied[-1])
+
+
+async def test_an_excluded_unsellable_parent_moves_no_canonical(env, monkeypatch):  # noqa: F811
+    base_key = ingestion.retailer_product_key(HOST, f"https://{HOST}/products/gel-tint")
+    row = {"product_key": base_key, "canonical_url": f"https://{HOST}/products/gel-tint", "source_domain": HOST,
+           "suppression_reason": None, "suppressed_at": None}
+    await _lane(env, monkeypatch, INVARIANT_CASES["stub"] + [product("Top Gloss", "top-gloss")],
+                catalog=Catalog([row]))
+    out = await pipeline.run_stage(fold_job("apply_due", fold_shades=True, exclude_handles=["gel-tint"]), db=env.db)
+    assert out["status"] == "done", _last_run(env)["flags"]
+    assert _last_run(env)["checks"]["shade_fold"]["supersede_preview"]["status"] == "clear"

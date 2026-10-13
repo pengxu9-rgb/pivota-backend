@@ -1067,9 +1067,16 @@ async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str
     cannot prove it duplicates nothing is not applied. A suppression its own lane may lift (`*_pending`,
     self-reviving) counts as live (_superseded_row_retired).
 
-    `carry["fold_supersede_entries"]`: every superseded listing with its old key, for the apply to read again
-    INSIDE the catalog write lock (_recheck_superseded_rows): this read runs unlocked, so another job's write
-    on the host can land between the two."""
+    THE BASE ROW. A base that sells something keeps its own item as the canonical one: same URL, same price,
+    same offer_id, so a live base row's stored canonical offer is updated in place to its own (current) price
+    and only GAINS the folded variants' SKUs and offers. A base that sells NOTHING has its canonical offer
+    moved to its first sellable child's listing (fold report `canonical_moved`): a new offer_id. A live row
+    under such a base's key keeps its old canonical offer at the base URL, beside the new one, so it is held
+    the same way (kind canonical_moved, stale_key = the base's own key).
+
+    `carry["fold_supersede_entries"]`: every superseded listing (and moved canonical) with its old key, for
+    the apply to read again INSIDE the catalog write lock (_recheck_superseded_rows): this read runs unlocked,
+    so another job's write on the host can land between the two."""
     import scripts.onboard_curated_brands as cli
     from services.catalog_enrichment_agent.ingestion import retailer_product_key
     from services.curated_brand_feed import _clean_domain, fold_report_summary
@@ -1096,6 +1103,15 @@ async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str
                             "base_key": retailer_product_key(host, base_url)})
         except ValueError:
             continue  # a handle that is not a listing on this host names no row
+    for item in fold_report.get("canonical_moved") or []:
+        if _handle_key(item["base_handle"]) not in kept_handles:
+            continue
+        try:
+            base_key = retailer_product_key(host, f"https://{host}/products/{item['base_handle']}")
+        except ValueError:
+            continue
+        entries.append({"handle": item["base_handle"], "base_handle": item["base_handle"], "kind": "canonical_moved",
+                        "to_handle": item["handle"], "stale_key": base_key, "base_key": base_key})
     summary["superseded_base_not_written"] = len(not_written)
     if not entries:
         summary["supersede_preview"] = {"status": "clear", "superseded": 0, "live": 0}
@@ -1113,15 +1129,26 @@ async def _shade_fold_checks(job: Dict[str, Any], fold_report: Optional[Dict[str
         "status": "live_rows" if live else "clear", "superseded": len(entries), "live": len(live),
         "already_suppressed": suppressed, "never_ingested": absent,
         "live_rows": live[:SHADE_FOLD_PREVIEW_CAP], "live_rows_truncated": len(live) > SHADE_FOLD_PREVIEW_CAP}
-    if not live:
-        return []
-    bases = sorted({e["base_handle"] for e in live})
-    return [{"key": "fold_supersedes_live_rows", "rule": "fold_supersedes_live_rows", "severity": detectors.BLOCK,
-             "acceptable": False,
-             "detail": f"{len(live)} listing(s) this fold supersedes already have live rows on {host} (under "
-                       f"{len(bases)} base(s), e.g. {bases[:3]}); the fold would leave each live beside the base "
-                       f"that now carries it. Retiring them is not built yet (see checks.shade_fold."
-                       f"supersede_preview for every row): run this cohort without fold_shades"}]
+    flags = []
+    moved = [e for e in live if e.get("kind") == "canonical_moved"]
+    live = [e for e in live if e.get("kind") != "canonical_moved"]
+    if live:
+        bases = sorted({e["base_handle"] for e in live})
+        flags.append({"key": "fold_supersedes_live_rows", "rule": "fold_supersedes_live_rows",
+                      "severity": detectors.BLOCK, "acceptable": False,
+                      "detail": f"{len(live)} listing(s) this fold supersedes already have live rows on {host} "
+                                f"(under {len(bases)} base(s), e.g. {bases[:3]}); the fold would leave each live "
+                                f"beside the base that now carries it. Retiring them is not built yet (see "
+                                f"checks.shade_fold.supersede_preview for every row): run this cohort without "
+                                f"fold_shades"})
+    if moved:
+        flags.append({"key": "fold_moves_live_canonical", "rule": "fold_moves_live_canonical",
+                      "severity": detectors.BLOCK, "acceptable": False,
+                      "detail": f"{len(moved)} base(s) on {host} sell nothing themselves, so the fold moves their "
+                                f"canonical offer to a child's listing (e.g. {[m['base_handle'] for m in moved][:3]}); "
+                                f"each already has a live row whose canonical offer at the base URL would stay "
+                                f"beside the new one. Run this cohort without fold_shades"})
+    return flags
 
 
 async def _recheck_superseded_rows(job: Dict[str, Any], result: Dict[str, Any]) -> None:
