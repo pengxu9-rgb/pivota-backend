@@ -41,7 +41,11 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
      the lease back. The next holder sees `pending_write` and RECONCILES (reads the rail) before
      anything else may be sent: `_reconcile`.
   4. Card-binding and token writes move no money, so their reconciliation may, after reading the card
-     list, start over (a new binding, a new token request). A token whose answer nobody saw is left
+     list, start over (a new binding, a new token request). For `paid` that rests on one invariant: the
+     payment conversation (`<id>_p`) only ever hosts the token flow, because the client's allowlist has
+     no action that starts a money flow; the money-result park is the backstop if that ever changes.
+     A write left pending by a step that CRASHED (`worker_error`) is never cleared unread: its answer may
+     have been a money result whose park never landed, so it waits for a human. A token whose answer nobody saw is left
      unused on the rail: it is bound to this order and was never approved. Every other pending write
      is never resent by this module: it is reported (`pending_write_unreconcilable`) and stays pending
      for a human or a later reconciler.
@@ -241,6 +245,17 @@ def _method(methods: List[Dict[str, Any]], method_id: Optional[str]) -> Optional
 # ── the steps ────────────────────────────────────────────────────────────────────────────────
 
 
+async def _read_failed(s: _Step, read: Any, prefix: str) -> str:
+    """A card read that did not give a card list. A money-result answer parks for good, like on any
+    write: it means a money flow ran in a conversation this client touched. Anything else retries."""
+    if getattr(read, "kind", None) == "money_result":
+        logger.error("a2a_rail_worker: money-result card on a card read purchase=%s; parked for a human", s.id)
+        await s.release(POLL_PARKED, "money_result_seen")
+        return "money_result_seen"
+    await s.release(POLL_RETRY, _code(prefix, read))
+    return "rail_read_failed"
+
+
 async def _settled(s: _Step, moved: Optional[Mapping[str, Any]], outcome: str) -> str:
     """`outcome` when the transition happened. A None transition is a lost race only if the row moved
     on; if this worker still holds it (the ledger refused the transition, e.g. its contact was
@@ -257,8 +272,7 @@ async def _settled(s: _Step, moved: Optional[Mapping[str, Any]], outcome: str) -
 async def _opened(s: _Step) -> str:
     methods, read = await s.methods()
     if methods is None:
-        await s.release(POLL_RETRY, _code("cards_read", read))
-        return "rail_read_failed"
+        return await _read_failed(s, read, "cards_read")
     method_id = _active_method(methods)
     if method_id:
         moved = await ledger.transition_as_holder(
@@ -333,8 +347,7 @@ def _definitely_refused(result: Any) -> bool:
 async def _binding(s: _Step) -> str:
     methods, read = await s.methods()
     if methods is None:
-        await s.release(POLL_RETRY, _code("cards_read", read))
-        return "rail_read_failed"
+        return await _read_failed(s, read, "cards_read")
     method = _method(methods, s.row.get("payment_method_id"))
     status = str((method or {}).get("status") or "")
     if status == "ACTIVE":
@@ -407,8 +420,7 @@ async def _start_token(s: _Step) -> str:
     """The order is locked: ask the rail for a token bound to it, for the locked total. Mints; never charges."""
     methods, read = await s.methods()
     if methods is None:
-        await s.release(POLL_RETRY, _code("cards_read", read))
-        return "rail_read_failed"
+        return await _read_failed(s, read, "cards_read")
     method = _method(methods, s.row.get("payment_method_id"))
     if method is None or method.get("status") != "ACTIVE":
         return await _token_failed(s, "quoting", "token_method_unavailable")
@@ -466,6 +478,8 @@ async def _token_answer(s: _Step, action: str, result: Any) -> str:
             # A token ACTIVE with no buyer step (one of the provider's paths mints synchronously). Every
             # purchase needs the buyer's own approval, so this one ends here. The token id is kept: it
             # was minted for this order and must be voided on the rail.
+            if str(result_card.data.get("status") or "").upper() == "FAILED":
+                return await _token_failed(s, "quoting", "token_failed", resolves=action)
             token_id = result_card.data.get("paymentTokenId")
             await ledger.clear_pending_write(s.id, s.worker, action)
             try:
@@ -512,10 +526,14 @@ async def _approval_answer(s: _Step, action: Optional[str], result: Any, count: 
     """`paid`'s answer (`action` is its pending write) or the await poll's (`action` None, a read)."""
     token_id = s.row.get("payment_token_id")
     if result.ok:
-        card = result.card("payment.token-result") or result.card("payment.await")
+        token_card = result.card("payment.token-result")
+        card = token_card or result.card("payment.await")
         page = next((result.card(c) for c in _APPROVAL_PAGES if result.card(c) is not None), None)
         answered = (card or page).data.get("paymentTokenId") if (card or page) is not None else None
-        if answered is not None and answered != token_id:
+        # The token result must name THIS token (fail closed when it names none). The await card's
+        # documented shape carries only a status: it is the conversation's token, and the payment
+        # conversation only ever approves the token the row records (a restarted request replaces it).
+        if (token_card is not None and answered != token_id) or (answered is not None and answered != token_id):
             # Another token in this conversation: never treat it as this purchase's.
             return await _token_failed(s, "awaiting_authorization", "token_mismatch", resolves=action)
         status = str(((card or page).data.get("status") if (card or page) is not None else "") or "").upper()
@@ -542,8 +560,24 @@ async def _approval_answer(s: _Step, action: Optional[str], result: Any, count: 
             return await _unresolved_write(s, _action(AWAIT_POLL), result)
         await s.release(POLL_RETRY, _code("await_read", result))
         return "rail_read_failed"
+    kind = getattr(result, "kind", None)
+    if kind == "money_result":
+        return await _unresolved_write(s, action, result)
+    if kind == "error_card":
+        # NOT MEASURED: what `paid` answers before the buyer has finished. An error card is read as
+        # "not yet", never as a refusal: failing here would end every purchase whose buyer is still on
+        # the page. The slot is used; the page's deadline ends a purchase that never turns ACTIVE.
+        await ledger.clear_pending_write(s.id, s.worker, action)
+        await s.release(POLL_APPROVAL, f"paid_sent:{count}:{variant}:error_card")
+        return "waiting_on_buyer"
     if _definitely_refused(result):
         return await _token_failed(s, "awaiting_authorization", _code("token_refused", result), resolves=action)
+    if result.resend_safe:
+        # Our own credentials, a throttle or a timeout the rail refused before acting: the buyer's slot
+        # was not used, so it is not counted (four 429s must not spend the whole schedule).
+        await ledger.clear_pending_write(s.id, s.worker, action)
+        await s.release(POLL_RETRY, f"paid_sent:{count - 1}:{variant}:{_code('rail_refused', result)}"[:64].rstrip(":"))
+        return "rail_refused"
     return await _unresolved_write(s, action, result, code=f"paid_sent:{count}:{variant}")
 
 
@@ -566,6 +600,12 @@ async def _unresolved_write(s: _Step, action: str, result: Any, *, code: Optiona
 async def _reconcile(s: _Step) -> str:
     """The row holds a write whose outcome nobody saw. Read before anything else is sent."""
     action = str(s.row["pending_write"])
+    if str(s.row.get("last_error_code") or "").split(":")[-1] == "worker_error":
+        # The step that recorded this write crashed after sending it: its answer may have been a
+        # money result whose park never landed. Nobody may clear it unread: a human decides.
+        logger.error("a2a_rail_worker: pending write %s left by a crashed step purchase=%s", action, s.id)
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_PARKED))
+        return "pending_write_unreconcilable"
     if action in _TOKEN_WRITES:
         return await _reconcile_token(s, action)
     if action not in _CARD_BINDING_WRITES:
@@ -587,8 +627,7 @@ async def _reconcile(s: _Step) -> str:
         return await _settled(s, moved, "failed")
     methods, read = await s.methods()
     if methods is None:
-        await s.release(POLL_RETRY, _code("reconcile_read", read))
-        return "rail_read_failed"
+        return await _read_failed(s, read, "reconcile_read")
     if state == "opened":
         method_id = _active_method(methods)
         if method_id:
@@ -733,8 +772,11 @@ async def run_tick(
             except Exception as exc:  # noqa: BLE001 - one purchase failing must not stop the rest
                 logger.warning("a2a_rail_worker: step failed purchase=%s error_type=%s", row["id"], type(exc).__name__)
                 try:
+                    # The schedule a code carries survives the crash (`<prefix>:worker_error`): a bare
+                    # code would reset `bound`/`paid` to an unknown variant and strand the purchase.
+                    prefix = _schedule_prefix(row)
                     await ledger.release_claim(row["id"], worker, next_poll_at=_later(POLL_RETRY),
-                                               last_error_code="worker_error")
+                                               last_error_code=f"{prefix}:worker_error" if prefix else "worker_error")
                 except Exception:  # noqa: BLE001 - the stale-claim requeue frees it
                     pass
                 bump("error")

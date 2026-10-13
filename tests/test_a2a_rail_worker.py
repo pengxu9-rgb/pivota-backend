@@ -755,6 +755,7 @@ async def test_a_card_that_is_gone_fails_the_token_step_before_any_write(listed)
     (httpx.Response(400), "token_refused:http_error:400"),
     (_task(("payment.something-else", {})), "token_answer_unrecognised"),
     (_task(("payment.visa-action-required", {"paymentTokenId": "ptk_1", "paymentUrl": "http://x.test/p"})), "approval_page_invalid"),
+    (_token_result(status="FAILED"), "token_failed"),  # a failed mint is a failure, not a missing approval
 ])
 async def test_a_definite_answer_that_is_not_an_approval_page_fails_the_purchase(answer, code):
     pid = await _locked()
@@ -834,6 +835,7 @@ async def test_an_await_answer_switches_to_polling_with_reads_only():
     (_token_result(status="FAILED"), "token_failed"),
     (_await("FAILED"), "token_failed"),
     (_token_result("ptk_other"), "token_mismatch"),
+    (_task(("payment.token-result", {"status": "ACTIVE"})), "token_mismatch"),  # names no token: fail closed
 ])
 async def test_a_failed_or_foreign_token_fails_the_purchase(answer, code):
     pid = await _approving()
@@ -866,3 +868,110 @@ async def test_a_money_result_on_paid_parks_for_good():
     assert rail.sent == []
     assert (await _row(pid))["pending_write"] == "payment.visa-action-required#paid"
 
+
+
+MONEY = _task(("payment.pay-result", {"status": "success", "chargeNo": "chg_1"}))
+
+
+@pytest.mark.parametrize("where", ["opened", "token"])
+async def test_a_money_result_on_a_card_read_parks_for_good(where):
+    pid = (await _open())["id"] if where == "opened" else await _locked()
+    assert await _step(Rail().on("payment.method-view#submit", MONEY), pid) == "money_result_seen"
+    rail = Rail()
+    assert await _step(rail, pid) == "money_result_parked"
+    assert rail.sent == []
+
+
+@pytest.mark.parametrize("where", ["token-setup", "select-method"])
+async def test_a_money_result_on_a_token_write_parks_for_good(where):
+    pid = await _locked()
+    rail = Rail().on("payment.method-view#submit", _methods(VISA))
+    if where == "token-setup":
+        rail.on("payment.token-setup#submit", MONEY)
+    else:
+        rail.on("payment.token-setup#submit", _methods(VISA)).on("payment.method-list#select-method", MONEY)
+    assert await _step(rail, pid) == "money_result_seen"
+    rail = Rail()
+    assert await _step(rail, pid) == "money_result_parked" and rail.sent == []
+
+
+async def test_a_money_result_on_the_await_poll_parks_for_good():
+    pid = await _approving(NAMED, _scheme_page())
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, purchase_id=pid)
+    await _step(Rail().on("payment.action-required#paid", _await("PENDING")), pid)
+    assert await _step(Rail().on("payment.await#poll", MONEY), pid) == "money_result_seen"
+    rail = Rail()
+    assert await _step(rail, pid) == "money_result_parked" and rail.sent == []
+
+
+async def test_an_unseen_select_method_is_resolved_and_started_over():
+    pid = await _locked()
+    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _methods(VISA)).on(
+        "payment.method-list#select-method", httpx.Response(504))
+    assert await _step(rail, pid) == "outcome_unknown"
+    assert (await _row(pid))["pending_write"] == "payment.method-list#select-method"
+    rail = Rail()
+    assert await _step(rail, pid) == "reconciled" and rail.sent == []
+    assert (await _row(pid))["pending_write"] is None
+
+
+async def test_our_own_throttle_on_paid_does_not_spend_the_buyers_slots():
+    pid = await _approving()
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[-1] + 1, purchase_id=pid)
+    for _ in range(len(worker.APPROVAL_SCHEDULE) + 1):
+        assert await _step(Rail().on("payment.visa-action-required#paid", httpx.Response(429)), pid) == "rail_refused"
+    row = await _row(pid)
+    assert worker._paid_state(row) == (0, "visa") and row["pending_write"] is None
+    assert await _step(Rail().on("payment.visa-action-required#paid", _token_result()), pid) == "token_active"
+
+
+async def test_an_error_card_on_paid_means_not_yet_never_a_refusal():
+    pid = await _approving()
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, purchase_id=pid)
+    early = _task(("error", {"code": "NOT_VERIFIED", "recoverable": False}))
+    assert await _step(Rail().on("payment.visa-action-required#paid", early), pid) == "waiting_on_buyer"
+    row = await _row(pid)
+    assert (row["state"], row["pending_write"], row["last_error_code"]) == (
+        "awaiting_authorization", None, "paid_sent:1:visa:error_card")
+
+
+async def test_a_crashed_step_keeps_the_approval_schedule(monkeypatch):
+    pid = await _approving()
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, purchase_id=pid)
+    real, calls = ledger.mark_pending_write, []
+
+    async def _blip(*a, **k):
+        calls.append(a)
+        if len(calls) == 1:
+            raise RuntimeError("database blip")
+        return await real(*a, **k)
+
+    monkeypatch.setattr(ledger, "mark_pending_write", _blip)
+    await _ago("next_poll_at", 1, purchase_id=pid)
+    assert (await worker.run_tick(_client(Rail()), W)).get("error") == 1
+    assert (await _row(pid))["last_error_code"] == "paid_sent:0:visa:worker_error"
+    assert await _step(Rail().on("payment.visa-action-required#paid", _token_result()), pid) == "token_active"
+
+
+async def test_a_write_left_pending_by_a_crashed_step_is_never_cleared_unread(monkeypatch):
+    pid = await _approving()
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, purchase_id=pid)
+    real = worker._Step.release
+
+    async def _blip(self, seconds, code=None):
+        raise RuntimeError("database blip")  # the money park itself fails to land
+
+    monkeypatch.setattr(worker._Step, "release", _blip)
+    await _ago("next_poll_at", 1, purchase_id=pid)
+    await worker.run_tick(_client(Rail().on("payment.visa-action-required#paid", MONEY)), W)
+    monkeypatch.setattr(worker._Step, "release", real)
+    row = await _row(pid)
+    assert row["pending_write"] == "payment.visa-action-required#paid" and row["last_error_code"].endswith(":worker_error")
+    rail = Rail()
+    assert await _step(rail, pid) == "pending_write_unreconcilable"
+    assert rail.sent == [] and (await _row(pid))["pending_write"] == "payment.visa-action-required#paid"
+
+
+@pytest.mark.parametrize("value,seconds", [(900, 900), (120, 120), (59, 900), (3601, 900), (None, 900), ("900", 900), (True, 900)])
+def test_the_page_lifetime_is_the_rails_within_bounds(value, seconds):
+    assert worker._page_seconds(value) == seconds
