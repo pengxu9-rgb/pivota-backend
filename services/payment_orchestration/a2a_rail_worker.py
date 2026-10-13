@@ -40,8 +40,10 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
   3. An unseen answer (`resend_safe` is False: timeout, 5xx, garbled) leaves the write pending and gives
      the lease back. The next holder sees `pending_write` and RECONCILES (reads the rail) before
      anything else may be sent: `_reconcile`.
-  4. Card-binding and token writes move no money, so their reconciliation may, after reading the card
-     list, start over (a new binding, a new token request). For `paid` that rests on one invariant: the
+  4. Card-binding and token writes move no money. A card-binding write's reconciliation may, after
+     reading the card list, start a new binding. A token REQUEST is never retried (it may have minted a
+     token we never saw, and the rail cannot void one): the purchase fails. `paid` is sent again on its
+     schedule; that rests on one invariant (stated at `_reconcile_token`): the
      payment conversation (`<id>_p`) only ever hosts the token flow, because the client's allowlist has
      no action that starts a money flow; the money-result park is the backstop if that ever changes.
      A write left pending by a step that CRASHED (`worker_error`) is never cleared unread: its answer may
@@ -57,6 +59,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -108,12 +111,23 @@ _AWAIT = "await"
 #: The token writes: they mint a token and move no money, so an unseen outcome may be resolved by
 #: starting the token step over (`_reconcile`).
 _TOKEN_WRITES = {f"{c}#{a}" for c, a in (TOKEN_SETUP, SELECT_METHOD, VISA_PAID, SCHEME_PAID)}
+#: The token writes that may MINT (an unseen one is not retried: there is no void).
+_TOKEN_REQUEST_WRITES = {f"{c}#{a}" for c, a in (TOKEN_SETUP, SELECT_METHOD)}
 #: How long the approval page is offered when the rail does not say (it said 900 s for Visa).
 APPROVAL_PAGE_SECONDS = 900
 #: When (seconds after the page went out) the worker tells the rail the buyer may be done. Kept in
 #: `last_error_code` as `paid_sent:<n>:<variant>`, with the variant the page was.
 APPROVAL_SCHEDULE = (30, 90, 240, 600)
 POLL_APPROVAL = 15
+#: THE TOKEN STEP'S OWN DIAL, default OFF, separate from the worker's. The rail offers no action that
+#: voids a token, so a token minted for a purchase that then ends (expired, failed, refused) stays live
+#: on the rail until it lapses. Bound to its order and its amount it cannot be charged elsewhere, but it
+#: is an orphan, and "no orphans" is a design invariant. Arm this only once a void step exists. With it
+#: off, an armed worker binds cards and parks every locked purchase (`token_step_disabled`).
+A2A_RAIL_TOKEN_STEP_ENABLED_ENV = "A2A_RAIL_TOKEN_STEP_ENABLED"
+#: The currencies a token may be requested in. `token-setup` takes `amount_cents` and no currency, so
+#: the amount is minor units of whatever currency the rail assumes; only USD has been measured.
+TOKEN_CURRENCIES = frozenset({"USD"})
 
 PARKED_STATES = frozenset({"paying"})
 #: Claims of an `opened` purchase before it fails. Waiting on the buyer is not counted (the ledger),
@@ -186,6 +200,11 @@ def _token_active(row: Mapping[str, Any]) -> bool:
     return str(row.get("last_error_code") or "").split(":")[-1] == "token_active"
 
 
+def _sticky(row: Mapping[str, Any]) -> bool:
+    """A marker no later write may replace: money seen (parked for good), or the token ACTIVE."""
+    return "money_result_seen" in str(row.get("last_error_code") or "") or _token_active(row)
+
+
 class _Step:
     """One claimed purchase, its client and its conversations."""
 
@@ -234,8 +253,17 @@ def _active_method(methods: List[Dict[str, Any]]) -> Optional[str]:
     active = [m for m in methods if m.get("status") == "ACTIVE" and isinstance(m.get("id"), str) and m["id"]]
     if not active:
         return None
-    active.sort(key=lambda m: str(m.get("created_at") or ""), reverse=True)
+    active.sort(key=lambda m: _created_at(m.get("created_at")), reverse=True)
     return active[0]["id"]
+
+
+def _created_at(value: Any) -> datetime:
+    """A card's creation time as an instant (offsets honoured); unreadable sorts oldest."""
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _method(methods: List[Dict[str, Any]], method_id: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -424,6 +452,9 @@ async def _start_token(s: _Step) -> str:
     method = _method(methods, s.row.get("payment_method_id"))
     if method is None or method.get("status") != "ACTIVE":
         return await _token_failed(s, "quoting", "token_method_unavailable")
+    if str(s.row.get("currency") or "").upper() not in TOKEN_CURRENCIES:
+        # No currency goes with the amount: a non-USD total would be read as USD cents. Refused.
+        return await _token_failed(s, "quoting", "token_currency_unsupported")
     brand = str(method.get("payment_brand") or "").strip().lower()
     payload: Dict[str, Any] = {
         "amount_cents": int(s.row["quoted_total_minor"]),
@@ -488,8 +519,12 @@ async def _token_answer(s: _Step, action: str, result: Any) -> str:
                     payment_token_id=token_id if isinstance(token_id, str) and token_id else None,
                     refusal_reason="buyer_approval_missing")
             except ValueError:
+                # A token the rail minted whose id the ledger will not store: refused all the same, and
+                # said so (ERROR, its own code), never dropped silently. It is an orphan on the rail.
+                logger.error("a2a_rail_worker: token minted with an unstorable id purchase=%s; orphaned", s.id)
                 moved = await ledger.transition_as_holder(
-                    s.id, s.worker, from_states=["quoting"], to_state="refused", refusal_reason="buyer_approval_missing")
+                    s.id, s.worker, from_states=["quoting"], to_state="refused", refusal_reason="buyer_approval_missing",
+                    last_error_code="token_id_unstorable")
             logger.warning("a2a_rail_worker: token minted with no buyer approval purchase=%s; refused", s.id)
             return await _settled(s, moved, "refused")
         return await _token_failed(s, "quoting", "token_answer_unrecognised", resolves=action)
@@ -649,10 +684,10 @@ async def _reconcile(s: _Step) -> str:
 
 
 async def _reconcile_token(s: _Step, action: str) -> str:
-    """A token write whose answer nobody saw. It minted at most a token for this order and charged
-    nothing, so it is resolved by starting over: in `quoting` the next step asks for a token again (the
-    unseen one, if any, is never approved and never used); in `awaiting_authorization` the schedule
-    sends `paid` again. Bounded like the card-binding reconcile."""
+    """A token write whose answer nobody saw. It charged nothing. A token REQUEST (token-setup, the
+    picker's select) may have minted a token we never saw, and the rail has no void: the purchase FAILS
+    rather than asking again, so at most one unseen token per purchase. An unseen `paid` is cleared and
+    sent again on the schedule: it mints nothing new. Bounded like the card-binding reconcile."""
     state = str(s.row["state"])
     if state not in ("quoting", "awaiting_authorization"):  # pragma: no cover - token writes come only from these
         await s.release(POLL_PARKED, "pending_write_unreconcilable")
@@ -665,6 +700,15 @@ async def _reconcile_token(s: _Step, action: str) -> str:
             s.id, s.worker, from_states=[state], to_state="failed", resolves_write=action,
             last_error_code="reconcile_exhausted")
         return await _settled(s, moved, "failed")
+    if action in _TOKEN_REQUEST_WRITES:
+        # The request may have minted a token we never saw, and the rail cannot void one: asking again
+        # would mint another. The purchase ends here, so at most one unseen token per purchase.
+        moved = await ledger.transition_as_holder(
+            s.id, s.worker, from_states=[state], to_state="failed", resolves_write=action,
+            last_error_code="token_request_unresolved")
+        return await _settled(s, moved, "failed")
+    # `paid` names no new token (the conversation's token is the one the row records): sent again on
+    # the schedule. This rests on the payment-conversation invariant in the module docstring.
     await ledger.clear_pending_write(s.id, s.worker, action)
     await s.release(POLL_RETRY, "reconciled")  # appended to a paid_sent count by `release`
     return "reconciled"
@@ -675,9 +719,15 @@ async def _parked(s: _Step, reason: str = "shop_protocol_pending") -> str:
     return "parked"
 
 
+def token_step_enabled() -> bool:
+    return (os.getenv(A2A_RAIL_TOKEN_STEP_ENABLED_ENV) or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
 async def _quoting(s: _Step) -> str:
     row = s.row
     if row.get("order_id") and row.get("quoted_total_minor") and not row.get("payment_token_id"):
+        if not token_step_enabled():
+            return await _parked(s, "token_step_disabled")
         return await _start_token(s)
     # Not locked yet (the quote and the lock are the order protocol's), or a token is already recorded
     # (a re-quote must void it first): nothing here may act.
@@ -774,9 +824,15 @@ async def run_tick(
                 try:
                     # The schedule a code carries survives the crash (`<prefix>:worker_error`): a bare
                     # code would reset `bound`/`paid` to an unknown variant and strand the purchase.
+                    # A STICKY marker (money seen, token ACTIVE) is never overwritten: losing it would
+                    # un-park a purchase that must stay parked. Kept as it is (no code: COALESCE).
                     prefix = _schedule_prefix(row)
+                    if _sticky(row):
+                        crash_code = None
+                    else:
+                        crash_code = f"{prefix}:worker_error" if prefix else "worker_error"
                     await ledger.release_claim(row["id"], worker, next_poll_at=_later(POLL_RETRY),
-                                               last_error_code=f"{prefix}:worker_error" if prefix else "worker_error")
+                                               last_error_code=crash_code)
                 except Exception:  # noqa: BLE001 - the stale-claim requeue frees it
                     pass
                 bump("error")
