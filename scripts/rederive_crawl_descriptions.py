@@ -32,7 +32,9 @@ WHAT IT DOES, per host:
      (derived from the new text at ingest). So nothing flips back on the next re-crawl.
   6. GATES. A row whose new text drops its stage is skipped unless `--allow-demote`, one whose stage
      rises unless `--allow-promote`. A row whose new text loses a safety SENTENCE the old text had
-     (every old sentence carrying a safety cue must survive, counted) is never written.
+     (every old sentence carrying a safety cue must survive, counted) is never written. A sentence
+     survives when it is a new sentence, or is re-split into consecutive new ones, or is merged
+     with its neighbour into one, compared as letters only (`sentence_survival`).
   7. WRITE. One guarded UPDATE per row (`_UPDATE_SQL`), only while the row's description, stage and
      content_changed_at are still the ones read; 0 rows -> `raced`. Each batch's written rows are
      STORED as a manifest event in identity_resolution_events INSIDE the batch's transaction, so a
@@ -89,6 +91,7 @@ import sys
 import tempfile
 import time
 import types
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -402,42 +405,68 @@ def split_sentences(text: Optional[str]) -> List[str]:
     return _split_sentences(flat) if flat else []
 
 
-def _norm_sentence(text: str) -> str:
-    """Compare sentences as words: case, punctuation, whitespace and glued footnote digits aside."""
-    return " ".join(re.sub(r"[\W_]+", " ", _defootnote(text).casefold()).split())
+def _compact(text: Optional[str]) -> str:
+    """A sentence's comparison form: NFKC, casefolded, LETTERS ONLY. The current producer reformats
+    without removing -- "Moisturizer : A v egan" -> "Moisturizer: A vegan", "1 week 3 ." -> "1 week3.",
+    "potent 1 :" -> "potent1:" -- so spacing, punctuation and symbols must not count. Digits do not
+    count either: the producer glues and unglues footnote markers ("week 3" / "week3", "irritation2"),
+    and no comparison that keeps them can see both spellings as one sentence."""
+    folded = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return "".join(ch for ch in folded if ch.isalpha())
 
 
-def _missing_sentences(old: Optional[str], new: Optional[str], keep: Callable[[str], bool]) -> List[str]:
-    """Old sentences (passing `keep`) that do not survive in `new`, counted: a sentence the old text
-    carries twice must be in the new text twice."""
-    need: "collections.Counter[str]" = collections.Counter()
-    original: Dict[str, str] = {}
-    for sentence in split_sentences(old):
-        if keep(sentence):
-            key = _norm_sentence(sentence)
-            if key:
-                need[key] += 1
-                original.setdefault(key, sentence)
-    hay = f" {_norm_sentence(new or '')} "
-    return [original[k] for k in sorted(need) if _occurrences(hay, f" {k} ") < need[k]]
-
-
-def _occurrences(hay: str, needle: str) -> int:
-    """Whole-word occurrences, adjacent ones included (they share the space between them)."""
-    count, at = 0, hay.find(needle)
-    while at != -1:
-        count += 1
-        at = hay.find(needle, at + len(needle) - 1)
-    return count
+def sentence_survival(old: Optional[str], new: Optional[str]) -> List[Tuple[str, bool]]:
+    """Each old sentence, in order, and whether it survives in the new text. Fail closed: an old
+    sentence survives only when its comparison form (`_compact`)
+      1. EQUALS one new sentence's (each new sentence is used once: a repeated old sentence needs
+         as many copies), or
+      2. equals two or more CONSECUTIVE unused new sentences joined (the producer re-split it), or
+      3. is one half of a new sentence that is EXACTLY it joined with its old neighbour (the
+         producer merged the two).
+    Anything else -- found only in the middle of a longer new sentence ("Avoid eyes." inside "do
+    not avoid eyes area"), or with words changed ("Do not use" -> "Use") -- did not survive."""
+    olds = [(sentence, _compact(sentence)) for sentence in split_sentences(old)]
+    news = [_compact(sentence) for sentence in split_sentences(new)]
+    used = [False] * len(news)
+    kept = [not form for _, form in olds]  # a sentence with no letters is nothing to lose
+    for i, (_, form) in enumerate(olds):  # 1. one new sentence each
+        if kept[i]:
+            continue
+        for j, candidate in enumerate(news):
+            if not used[j] and candidate == form:
+                used[j] = kept[i] = True
+                break
+    for i in range(len(olds) - 1):  # 3. two adjacent old sentences merged into one new sentence
+        if kept[i] or kept[i + 1]:
+            continue
+        joined = olds[i][1] + olds[i + 1][1]
+        for j, candidate in enumerate(news):
+            if not used[j] and candidate == joined:
+                used[j] = kept[i] = kept[i + 1] = True
+                break
+    for i, (_, form) in enumerate(olds):  # 2. one old sentence re-split across consecutive new ones
+        if kept[i]:
+            continue
+        for j in range(len(news)):
+            run, end = "", j
+            while end < len(news) and not used[end] and len(run) < len(form):
+                run += news[end]
+                end += 1
+            if run == form and end - j >= 2:
+                for k in range(j, end):
+                    used[k] = True
+                kept[i] = True
+                break
+    return [(sentence, ok) for (sentence, _), ok in zip(olds, kept)]
 
 
 def lost_safety_sentences(old: Optional[str], new: Optional[str]) -> List[str]:
     """Every old sentence carrying a safety cue must survive in the new text."""
-    return _missing_sentences(old, new, is_safety_sentence)
+    return [s for s, ok in sentence_survival(old, new) if not ok and is_safety_sentence(s)]
 
 
 def removed_sentences(old: Optional[str], new: Optional[str]) -> List[str]:
-    return _missing_sentences(old, new, lambda s: True)
+    return [s for s, ok in sentence_survival(old, new) if not ok]
 
 
 # --- the stage: the drain's own rule --------------------------------------------------------------

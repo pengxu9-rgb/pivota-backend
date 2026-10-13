@@ -1008,3 +1008,88 @@ async def test_each_host_line_names_the_sentences_the_pass_drops_most(capsys):
     await _run([], db, {"j1": ([_pdp(f"p{i}", f"h{i}", LONG_OLD) for i in range(3)], [])})
     (host_line,) = [line for line in capsys.readouterr().out.splitlines() if line.startswith("HOST ")]
     assert json.loads(host_line[5:])["top_removed"] == [[shipping, 3]]
+
+
+# --- sentence survival: reformatted is kept, dropped or reworded is lost --------------------------------
+
+CANARY_OLD = ("This set includes: Cleanser : A gentle foam. Moisturizer : A v egan cream for daily use, "
+              "avoiding eyes. Visible results in just 1 week 3 . Our most potent 1 : two drops a day.")
+CANARY_NEW = ("This set includes: Cleanser: A gentle foam. Moisturizer: A vegan cream for daily use, "
+              "avoiding eyes. Visible results in just 1 week3. Our most potent1: two drops a day.")
+
+
+@pytest.mark.parametrize("old_sentence,new_sentence", [
+    ("Moisturizer : A v egan cream, avoiding eyes.", "Moisturizer: A vegan cream, avoiding eyes."),
+    ("Avoid the eyes; visible results in just 1 week 3 .", "Avoid the eyes; visible results in just 1 week3."),
+    ("Our most potent 1 : avoid eyes.", "Our most potent1: avoid eyes."),
+    ("Avoid eyes \u2013 Brand\u00ae \u201cformula\u201d.", "Avoid eyes - Brand formula."),
+    ("Avoid eyes with \ufb01ne care.", "Avoid eyes with fine care."),
+    ("AVOID EYES.", "Avoid eyes."),
+    ("\uff21\uff56\uff4f\uff49\uff44 \uff45\uff59\uff45\uff53.", "Avoid eyes."),
+])
+def test_a_reformatted_sentence_is_kept(old_sentence, new_sentence):
+    assert rd.lost_safety_sentences(f"{LONG_OLD} {old_sentence}", f"{LONG_NEW} {new_sentence}") == []
+    assert rd.removed_sentences(f"{LONG_OLD} {old_sentence}", f"{LONG_OLD} {new_sentence}") == []
+
+
+def test_the_canary_set_description_loses_nothing():
+    """Regression: the prod canary's shape. The producer only reformatted; every sentence survives."""
+    assert rd.removed_sentences(CANARY_OLD, CANARY_NEW) == []
+    assert rd.lost_safety_sentences(CANARY_OLD, CANARY_NEW) == []
+    d = rd.decide(_row("p1", "h1", CANARY_OLD, crawled=CANARY_OLD), _pdp("p1", "h1", CANARY_NEW),
+                  stage="published", stage_with_old="published", allow_demote=False, allow_promote=False)
+    assert d.outcome == rd.WRITE and d.removed == []
+
+
+def test_a_cue_found_only_inside_a_longer_new_sentence_is_lost():
+    old = f"{LONG_OLD} Avoid eyes."
+    assert rd.lost_safety_sentences(old, f"{LONG_NEW} Tap gently and do not avoid eyes area at night.") == ["Avoid eyes."]
+
+
+def test_a_reworded_cue_is_lost():
+    old = f"{LONG_OLD} Do not use on broken skin."
+    assert rd.lost_safety_sentences(old, f"{LONG_NEW} Use on broken skin.") == ["Do not use on broken skin."]
+
+
+def test_two_sentences_merged_into_one_are_kept():
+    old = f"{LONG_OLD} Apply to face. Avoid the eye area."
+    assert rd.lost_safety_sentences(old, f"{LONG_NEW} Apply to face avoid the eye area.") == []
+    assert rd.removed_sentences(old, f"{LONG_OLD} Apply to face avoid the eye area.") == []
+
+
+def test_a_merge_with_something_extra_is_lost():
+    old = f"{LONG_OLD} Apply to face. Avoid the eye area."
+    assert rd.lost_safety_sentences(old, f"{LONG_NEW} Apply to face and never avoid the eye area.") == [
+        "Avoid the eye area."]
+
+
+def test_a_sentence_re_split_across_new_sentences_is_kept():
+    old = f"{LONG_OLD} Massage onto skin and avoid the eye area."
+    assert rd.lost_safety_sentences(old, f"{LONG_NEW} Massage onto skin. And avoid the eye area.") == []
+
+
+def test_a_sentence_cut_at_the_length_cap_is_removed():
+    old = f"{LONG_OLD} Avoid contact with the eyes at all times."
+    new = f"{LONG_OLD} Avoid contact with the"
+    assert rd.removed_sentences(old, new) == ["Avoid contact with the eyes at all times."]
+    assert rd.lost_safety_sentences(old, new) == ["Avoid contact with the eyes at all times."]
+
+
+def test_a_truly_dropped_store_wide_line_is_still_lost_beside_a_reformatted_one():
+    line = "Always follow with SPF 30 in the morning."
+    old, new = _through_the_real_repetition_pass(line)
+    assert rd.lost_safety_sentences(old.replace("formula", "formula :"), new) == [line]
+
+
+@pytest.mark.parametrize("marker", ["3", "\u00b9"])
+def test_a_cue_with_a_footnote_marker_glued_on_is_still_a_cue(marker):
+    """"eyes3" / "eyes\u00b9" carry the cue "eyes": dropped, it is a lost safety sentence."""
+    sentence = f"Keep it from the eyes{marker}."
+    assert rd.is_safety_sentence(sentence)
+    assert rd.lost_safety_sentences(f"{LONG_OLD} {sentence}", LONG_NEW) == [sentence]
+
+
+def test_a_re_split_that_runs_on_into_more_words_is_lost():
+    old = f"{LONG_OLD} Massage onto skin and avoid the eye area."
+    new = f"{LONG_NEW} Massage onto skin. And avoid the eye area during the day."
+    assert rd.lost_safety_sentences(old, new) == ["Massage onto skin and avoid the eye area."]
