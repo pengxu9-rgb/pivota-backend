@@ -23,6 +23,13 @@ def test_a_cut_after_a_heading_does_not_end_on_the_heading():
     assert out.endswith("under makeup."), out[-80:]
 
 
+@pytest.mark.parametrize("line", ["For external use only", "Keep away from heat", "Avoid eyes"])
+def test_a_short_safety_line_at_the_cut_is_kept(line):
+    """Post-merge-review repro: a short unpunctuated SAFETY line before the cut is not a heading."""
+    out = join_description_sentences(["A" * 60 + ".", line, "B" * 200 + "."], max_len=100)
+    assert out.endswith(line), out
+
+
 def test_a_short_unit_inside_the_copy_is_not_dropped():
     out = join_description_sentences(["Key Benefits", "Calms redness.", "How to use:", "Apply twice daily."])
     assert out == "Key Benefits Calms redness. How to use: Apply twice daily."

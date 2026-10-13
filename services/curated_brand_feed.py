@@ -1349,8 +1349,8 @@ def join_description_sentences(sentences: Sequence[str], max_len: int = BODY_TEX
             kept.append(s)
     # A cut that lands right after a section heading ("Full Ingredients", "How to use:") would end the copy on
     # the bare heading: the section it introduces did not fit. Drop such trailing headings.
-    while len(kept) > 1 and _is_heading_unit(kept[-1]):
-        kept.pop()
+    while len(kept) > 1 and _is_heading_unit(kept[-1]) and not is_safety_text(kept[-1]):
+        kept.pop()  # a short SAFETY line ("For external use only", "Avoid eyes") is never a heading to drop
     head = _join_sentences(kept)
     if len(head) * 2 >= max_len:
         return head
