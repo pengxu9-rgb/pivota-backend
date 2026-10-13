@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from db.database import IS_POSTGRES, database
 
@@ -206,16 +206,14 @@ def new_purchase_id() -> str:
     return f"pp_{uuid.uuid4().hex[:24]}"
 
 
-def _routing_plan(basis: str, rail: str = "reap") -> str:
-    """How this purchase came to be on its rail. With one rail there is no choice to record, so
-    this says who decided: the agent called the Reap route itself, or the row predates the
-    ledger and was backfilled. The router writes ranked candidates here once a second rail
-    exists."""
-    return json.dumps(
-        {"rail": rail, "executor": "rail_managed", "basis": basis},
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+def _routing_plan(basis: str, rail: str = "reap", dropped: Optional[Mapping[str, str]] = None) -> str:
+    """How this purchase came to be on its rail: who decided (the agent called a rail's route itself,
+    the router chose, or the row predates the ledger and was backfilled) and, when the router chose,
+    every rail it did not take with the named reason (services/payment_orchestration/router.py)."""
+    plan: Dict[str, Any] = {"rail": rail, "executor": "rail_managed", "basis": basis}
+    if dropped:
+        plan["dropped"] = {str(k): str(v) for k, v in dropped.items()}
+    return json.dumps(plan, separators=(",", ":"), sort_keys=True)
 
 
 #: Identity is COPIED from the committed child, never passed in: the parent cannot disagree with
@@ -281,15 +279,18 @@ _INSERT_A2A_PARENT_SQL_SQLITE = _INSERT_A2A_PARENT_SQL.replace(
 )
 
 
-async def ensure_a2a_parent(rail_purchase_id: str, *, basis: str = "orchestrator_selected_rail") -> Optional[str]:
+async def ensure_a2a_parent(
+    rail_purchase_id: str, *, basis: str = "orchestrator_selected_rail", dropped: Optional[Mapping[str, str]] = None
+) -> Optional[str]:
     """The parent id for an A2A-rail purchase, writing it if absent; None when no such child row.
-    Same contract as `ensure_reap_parent`: identity copied from the committed child, idempotent."""
+    Same contract as `ensure_reap_parent`: identity copied from the committed child, idempotent (an
+    existing parent keeps the plan it was written with)."""
     rail_purchase_id = str(rail_purchase_id or "").strip()
     if not rail_purchase_id:
         return None
     values = {
         "id": new_purchase_id(),
-        "routing_plan": _routing_plan(basis, "a2a"),
+        "routing_plan": _routing_plan(basis, "a2a", dropped),
         "rail_purchase_id": rail_purchase_id,
     }
     if IS_POSTGRES:
