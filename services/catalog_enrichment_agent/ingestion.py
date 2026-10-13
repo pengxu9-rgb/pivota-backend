@@ -453,7 +453,7 @@ _LISTING_URL_FIELDS = ("canonical_url", "destination_url")
 
 def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str]) -> Dict[str, Any]:
     """`record` with every listing URL on the host spelling `stored_url` uses, when the two differ by `www.`
-    only; `record` itself (the same object) when nothing differs.
+    or letter case only; `record` itself (the same object) when nothing differs.
 
     WHY. A content-keyed row is the same row whether its store was crawled as `www.<host>` or `<host>`
     (content_listing drops `www.`, so it is not a move), but derive_offer_id and derive_seed_id hash the URL
@@ -466,28 +466,34 @@ def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str]) -> D
     and, for a retailer record, `pdp.source_domain`: it scopes the `ext:retailer:` row's variant SKU keys
     (derive_variant_sku_key `seller_scope`, hashed as spelled), so a re-spelled URL alone would still re-key every
     variant SKU and its offer. A subdomain other than `www.`, a port or credentials are never treated as the
-    same host."""
+    same host.
+
+    The host is written AS STORED (`stored.netloc`), letter case included: the ids hash it as spelled, so a
+    lowercased copy of a stored `WWW.Host.example` would re-mint just the same. Hosts are compared ignoring
+    case. Prod 2026-10-13 stored no upper-case host (the curated producer lowercases its domain); another
+    lane's URL may keep one."""
     from urllib.parse import urlsplit, urlunsplit
 
     try:
         stored = urlsplit(str(stored_url or "").strip())
-        to_host = (stored.hostname or "").lower()
-        if not to_host or stored.port or stored.scheme not in {"http", "https"}:
+        to_netloc = stored.netloc  # the host exactly as stored: no port or credentials, refused below
+        bare = (stored.hostname or "").lower().removeprefix("www.")
+        if (not bare or stored.port or stored.username or stored.password
+                or stored.scheme not in {"http", "https"}):
             return record
     except ValueError:
         return record
-    bare = to_host.removeprefix("www.")
 
     def respelled(url: Any) -> Any:
         try:
             parsed = urlsplit(str(url or "").strip())
             host = (parsed.hostname or "").lower()
-            if (not host or host == to_host or host.removeprefix("www.") != bare or parsed.port
+            if (not host or parsed.netloc == to_netloc or host.removeprefix("www.") != bare or parsed.port
                     or parsed.username or parsed.password or parsed.scheme not in {"http", "https"}):
                 return url
         except ValueError:
             return url
-        return urlunsplit((parsed.scheme, to_host, parsed.path, parsed.query, parsed.fragment))
+        return urlunsplit((parsed.scheme, to_netloc, parsed.path, parsed.query, parsed.fragment))
 
     offers = [{**o, **{f: respelled(o[f]) for f in _LISTING_URL_FIELDS if o.get(f)}} if isinstance(o, dict) else o
               for o in record.get("offers") or []]
@@ -499,9 +505,9 @@ def respell_listing_host(record: Dict[str, Any], stored_url: Optional[str]) -> D
     source_domain = None
     if pdp is not None and pdp.get("source_role") == "retailer" and pdp.get("source_domain"):
         # Prod 2026-10-13: every `ext:retailer:` row stores source_domain spelled as its canonical_url host.
-        crawled = str(pdp["source_domain"]).strip().lower()
-        if crawled != to_host and crawled.removeprefix("www.") == bare:
-            source_domain = to_host
+        crawled = str(pdp["source_domain"]).strip()
+        if crawled != to_netloc and crawled.lower().removeprefix("www.") == bare:
+            source_domain = to_netloc
     if (offers == (record.get("offers") or []) and (variants is None or variants == pdp["variants"])
             and source_domain is None):
         return record

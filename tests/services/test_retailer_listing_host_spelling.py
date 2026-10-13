@@ -18,6 +18,7 @@ from services.catalog_enrichment_agent.apply import plan_with_current_listings
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
 from services.retailer_ingest import pipeline
 from tests.services.test_retailer_ingest_pipeline import env, job  # noqa: F401  (fixture)
+from tests.services.test_listing_host_spelling import _as_spelled, _netlocs
 from tests.services.test_same_title_listing_collision import _Catalog, official
 
 APEX, WWW = "store.example", "www.store.example"
@@ -118,6 +119,17 @@ def test_two_retailer_listings_each_keep_their_own_spelling():
     before = ingest_validated_jsonl([_retailer(WWW), _retailer(APEX, OTHER)])
     plan = asyncio.run(plan_with_current_listings([_retailer(APEX), _retailer(WWW, OTHER)], db=_catalog(before)))
     assert _ids(plan) == _ids(before) and len(plan["listing_respellings"]) == 2
+
+
+def test_a_retailer_row_keeps_its_stored_host_letter_case():
+    """Offers, seeds and the variant SKUs (scoped by source_domain as spelled) all follow the stored host."""
+    for stored_as in ("WWW.Store.example", "Store.example"):
+        before = ingest_validated_jsonl([_as_spelled(_retailer(APEX), stored_as)])
+        plan = asyncio.run(plan_with_current_listings([_retailer(APEX)], db=_catalog(before)))
+        assert [p["product_key"] for p in plan["pdps"]] == [p["product_key"] for p in before["pdps"]]
+        assert _ids(plan) == _ids(before) and _ids(plan, "seeds", "id") == _ids(before, "seeds", "id")
+        assert _ids(plan, "skus", "sku_key") == _ids(before, "skus", "sku_key")
+        assert _netlocs(plan) == {stored_as} and {p["source_domain"] for p in plan["pdps"]} == {stored_as}
 
 
 def test_the_cli_reports_an_unread_spelling_without_touching_the_current_listings_contract(monkeypatch):
