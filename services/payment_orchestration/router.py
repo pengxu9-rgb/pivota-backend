@@ -15,9 +15,10 @@ rail is called. It reads configuration only: no database, no rail, no clock. The
      offer_code_unsupported   the rail has no field for the buyer's offer code
      merchant_not_proven      (merchant, market) is not on A2A_RAIL_MERCHANTS: a merchant is routable
                               to this rail only after a live order there has been proven
-     amount_limit_unset       A2A_RAIL_MAX_TOTAL_MINOR is unset or invalid: no cap, no rail
+     amount_limit_unset       A2A_RAIL_MAX_TOTAL_MINOR names no cap at all: no cap, no rail
    The amount itself is checked by the route once OUR catalog has priced the item (`amount_ok`),
-   because the price is never the caller's.
+   because the price is never the caller's. Caps are PER CURRENCY (`USD:10000,SGD:13500`): a minor
+   unit is not one risk bound across currencies, and a currency with no cap is refused.
 2. AN EXPLICIT CHOICE WINS, and is never silently changed. `payment_preference.rail` = "a2a" on a
    request the A2A rail cannot take is REFUSED with that rail's reason, not sent to Reap; "reap" goes
    to Reap, whose route applies its own gates.
@@ -34,6 +35,7 @@ Everything is off by default: with no configuration every request goes to Reap, 
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, Optional, Tuple
 
@@ -68,30 +70,42 @@ def pilot_agents() -> FrozenSet[str]:
 
 
 def proven_merchants() -> FrozenSet[Tuple[str, str]]:
-    """(domain, MARKET) pairs, from `domain:MARKET` entries. A malformed entry is ignored (it proves
-    nothing), never widened."""
+    """(canonical domain, MARKET) pairs, from `domain:MARKET` entries, the domain folded by the one
+    merchant-host canonicaliser (`www.` removed), as the route folds the request's. A malformed entry
+    is ignored (it proves nothing), never widened."""
+    from services.tierb_cart_link_merchants import canonical_merchant_domain
+
     out = set()
     for entry in _csv(A2A_RAIL_MERCHANTS_ENV):
         domain, sep, market = entry.rpartition(":")
-        domain, market = domain.strip().lower(), market.strip().upper()
-        if sep and domain and len(market) == 2 and market.isalpha():
-            out.add((domain, market))
+        market = market.strip().upper()
+        if not (sep and len(market) == 2 and market.isascii() and market.isalpha()):
+            continue
+        try:
+            out.add((canonical_merchant_domain(domain.strip()), market))
+        except ValueError:
+            continue
     return frozenset(out)
 
 
-def max_total_minor() -> Optional[int]:
-    raw = (os.getenv(A2A_RAIL_MAX_TOTAL_MINOR_ENV) or "").strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        return None
-    return value if value > 0 else None
+_CAP_RE = re.compile(r"^([A-Z]{3}):([1-9][0-9]{0,11})$")
 
 
-def amount_ok(total_minor: int) -> bool:
-    """True when `total_minor` (OUR price x quantity) is within the A2A rail's cap. No cap: False."""
-    cap = max_total_minor()
-    return cap is not None and isinstance(total_minor, int) and 0 < total_minor <= cap
+def max_total_minor() -> Dict[str, int]:
+    """Currency -> cap in minor units, from `CUR:amount` entries. Malformed entries are ignored."""
+    caps: Dict[str, int] = {}
+    for entry in _csv(A2A_RAIL_MAX_TOTAL_MINOR_ENV):
+        match = _CAP_RE.match(entry.replace(" ", "").upper())
+        if match:
+            caps[match[1]] = int(match[2])
+    return caps
+
+
+def amount_ok(total_minor: int, currency: str) -> bool:
+    """True when `total_minor` (OUR price x quantity) is within the A2A rail's cap for `currency`.
+    No cap for that currency: False."""
+    cap = max_total_minor().get(str(currency or "").upper())
+    return cap is not None and type(total_minor) is int and 0 < total_minor <= cap
 
 
 @dataclass(frozen=True)
@@ -121,7 +135,7 @@ def a2a_unavailable_reason(
         return "offer_code_unsupported"
     if (str(merchant_domain or "").lower(), str(market_country or "").upper()) not in proven_merchants():
         return "merchant_not_proven"
-    if max_total_minor() is None:
+    if not max_total_minor():
         return "amount_limit_unset"
     return None
 

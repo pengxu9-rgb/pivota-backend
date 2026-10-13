@@ -46,6 +46,7 @@ from middleware.error_handler import ErrorHandlerMiddleware  # noqa: E402
 app = FastAPI()
 app.add_middleware(ErrorHandlerMiddleware)
 app.include_router(unified_routes.router)
+app.include_router(reap_routes.router)  # the REAL Reap door, for the shared-key cases
 
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
@@ -97,7 +98,7 @@ def _env(monkeypatch):
     monkeypatch.setenv(rail_router.A2A_RAIL_CREATE_ENABLED_ENV, "1")
     monkeypatch.setenv(rail_router.A2A_RAIL_PILOT_AGENT_IDS_ENV, f"{AGENT},agent_other")
     monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, f"{SHOP}:US, other.example:SG")
-    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "10000")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:10000, SGD:13500")
 
 
 @pytest.fixture(autouse=True)
@@ -206,6 +207,7 @@ async def _count(table: str) -> int:
 
 async def _nothing_written():
     assert await _count("a2a_rail_purchases") == 0
+    assert await _count("a2a_rail_buyer_refs") == 0
     assert await _count("reap_agentic_purchase_keys") == 0
     assert await _count("agent_purchases") == 0
 
@@ -423,16 +425,22 @@ async def test_an_explicit_a2a_choice_records_the_buyer_as_the_decider(client):
 # ── the router, pure ─────────────────────────────────────────────────────────────────────────
 
 
-def test_merchant_entries_are_parsed_strictly(monkeypatch):
-    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, " Judydoll.com:us ,bad, x.example:USA, :US, y.example: ")
-    assert rail_router.proven_merchants() == frozenset({("judydoll.com", "US")})
+def test_merchant_entries_are_parsed_strictly_and_folded(monkeypatch):
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV,
+                       " Judydoll.com:us ,bad, x.example:USA, :US, y.example: , www.brand.example:SG, bad host:US")
+    assert rail_router.proven_merchants() == frozenset({("judydoll.com", "US"), ("brand.example", "SG")})
 
 
-@pytest.mark.parametrize("raw,total,ok", [("10000", 10000, True), ("10000", 10001, False), ("", 1, False),
-                                          ("0", 1, False), ("-5", 1, False), ("abc", 1, False)])
-def test_the_amount_cap_fails_closed(monkeypatch, raw, total, ok):
+@pytest.mark.parametrize("raw,total,currency,ok", [
+    ("USD:10000", 10000, "USD", True), ("USD:10000", 10001, "USD", False),
+    ("USD:10000", 5000, "SGD", False),            # a currency with no cap is refused
+    ("usd:10000, SGD:13500", 13000, "SGD", True), ("", 1, "USD", False), ("10000", 1, "USD", False),
+    ("USD:0", 1, "USD", False), ("USD:-5", 1, "USD", False), ("USD:abc", 1, "USD", False),
+    ("USD:10000", True, "USD", False),
+])
+def test_the_amount_cap_is_per_currency_and_fails_closed(monkeypatch, raw, total, currency, ok):
     monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, raw)
-    assert rail_router.amount_ok(total) is ok
+    assert rail_router.amount_ok(total, currency) is ok
 
 
 def test_the_router_names_every_rail_it_drops():
@@ -441,3 +449,119 @@ def test_the_router_names_every_rail_it_drops():
     refused = rail_router.choose_rail(agent_id="agent_x", merchant_domain=SHOP, market_country="US",
                                       item_source="cart_link", preferred="a2a")
     assert (refused.rail, refused.refusal) == (None, "agent_not_in_pilot")
+
+
+# ── review round 1 ───────────────────────────────────────────────────────────────────────────
+
+
+async def test_dark_while_the_ledger_is_dark_too(client, stubs, monkeypatch):
+    monkeypatch.delenv(purchases.AGENT_PURCHASE_LEDGER_ENABLED_ENV)
+    resp = await client.post(BASE, body())
+    assert resp.status_code == 404 and "not_available" in resp.text
+    assert stubs.catalog == [] and stubs.reap == []
+    await _nothing_written()
+
+
+@pytest.mark.parametrize("merchants", [f"{SHOP}:US", ""])
+async def test_a_money_less_attempt_is_refused_the_same_whatever_the_merchant_lists_say(client, stubs, monkeypatch, merchants):
+    monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, merchants)
+    b = body(payment_preference={"rail": "a2a"})
+    b.pop("expected_unit_price_minor"), b.pop("expected_currency")
+    resp = await client.post(BASE, b)
+    assert resp.status_code == 400 and "invalid_request" in resp.text
+    await _nothing_written()
+
+
+@pytest.mark.parametrize("buyer,reason", [
+    ({"email": "not an email"}, "invalid_request"),
+    ({"shipping_address": {k: v for k, v in ADDRESS.items() if k != "phone"}}, "invalid_address"),
+])
+async def test_the_buyer_is_admitted_by_the_rails_own_rules_before_any_read(client, stubs, buyer, reason):
+    b = body()
+    b["buyer"].update(buyer)
+    resp = await client.post(BASE, b)
+    assert resp.status_code == 400 and reason in resp.text, resp.text
+    assert stubs.catalog == [] and stubs.clicks == []
+    await _nothing_written()
+
+
+async def test_a_currency_with_no_cap_is_refused(client, stubs):
+    stubs.facts["currency"] = "EUR"
+    resp = await client.post(BASE, body(expected_currency="EUR"))
+    assert resp.status_code == 409 and "amount_over_limit" in resp.text
+    await _nothing_written()
+
+
+async def test_the_purchasability_gate_applies_when_enforced(client, stubs, monkeypatch):
+    import db.merchant_purchasability as purchasability
+
+    async def _not_purchasable(domain, market):
+        return False
+
+    monkeypatch.setattr(purchasability, "is_enforcement_enabled", lambda: True)
+    monkeypatch.setattr(purchasability, "is_purchasable", _not_purchasable)
+    resp = await client.post(BASE, body())
+    assert resp.status_code == 409 and "merchant_not_purchasable" in resp.text
+    assert stubs.catalog == []
+    await _nothing_written()
+
+
+async def test_a_database_failure_in_the_unit_is_outcome_unknown_and_writes_nothing(client, stubs, monkeypatch):
+    async def _fails(**kwargs):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(a2a_ledger, "create_purchase", _fails)
+    resp = await client.post(BASE, body())
+    assert resp.status_code == 503 and "checkout_outcome_unknown" in resp.text
+    await _nothing_written()
+
+
+async def test_a_value_the_ledger_refuses_is_a_refusal_not_a_500(client, stubs, monkeypatch):
+    async def _refuses(**kwargs):
+        raise ValueError("checkout_url must be on merchant_domain")
+
+    monkeypatch.setattr(a2a_ledger, "create_purchase", _refuses)
+    resp = await client.post(BASE, body())
+    assert resp.status_code == 409 and "row_not_found" in resp.text
+    await _nothing_written()
+
+
+async def test_a_key_pointing_at_a_missing_a2a_purchase_is_not_found(client, stubs):
+    req = unified_routes.CreatePurchaseRequest.model_validate(body())
+    request_hash = reap_routes._request_hash(
+        merchant_domain=SHOP, product_key="pk_1", variant_key=None, quantity=1, email=EMAIL,
+        shipping_address=reap_routes._buyer_address_for_client(req.buyer), return_url=reap_routes._default_return_url(),
+        item_source="cart_link", expected_unit_price_minor=2820, expected_currency="USD")
+    await database.execute(
+        "INSERT INTO reap_agentic_purchase_keys (agent_id, agent_user_ref_hash, idempotency_key, purchase_id, request_hash) "
+        "VALUES (:a, :h, 'key-1', 'ap_0123456789abcdef01234567', :r)",
+        {"a": AGENT, "h": hash_agent_user_ref(USER_REF), "r": request_hash})
+    resp = await client.post(BASE, body())
+    assert resp.status_code == 404 and stubs.catalog == [] and await _count("a2a_rail_purchases") == 0
+
+
+@pytest.fixture
+def reap_door_open(monkeypatch):
+    """The REAL Reap route's gates open (it is the code under test here, not the stub)."""
+    for name, value in (("REAP_AGENTIC_ENABLED", "1"), ("REAP_AGENTIC_CREATE_ENABLED", "1"),
+                        ("REAP_AGENTIC_CART_LINK_ENABLED", "1"), ("REAP_AGENTIC_PILOT_SCOPE", "unrestricted"),
+                        ("REAP_API_BASE_URL", "https://reap.test"), ("REAP_API_KEY", "reap_test_key")):
+        monkeypatch.setenv(name, value)
+
+
+@pytest.mark.parametrize("path", ["/agent/v2/commerce/reap/purchases", "/agent/v2/commerce/reap/purchases/recover"])
+async def test_the_reap_door_names_a_purchase_its_key_opened_on_the_other_rail(client, stubs, reap_door_open, path):
+    pid = (await client.post(BASE, body())).json()["purchase_id"]
+    resp = await client.post(path, body())  # the same key and body, on the old door
+    assert resp.status_code == 409 and "opened_on_another_rail" in resp.text, resp.text
+    assert pid in resp.text
+    assert await _count("a2a_rail_purchases") == 1 and await _count("reap_agentic_purchases") == 0
+
+
+async def test_the_stored_buyer_is_the_cleaned_one(client):
+    b = body()
+    b["buyer"]["shipping_address"] = {**ADDRESS, "city": "San\u200bFrancisco"}
+    b["buyer"]["email"] = " ada@example.test "
+    pid = (await client.post(BASE, b)).json()["purchase_id"]
+    row = await a2a_ledger.get_purchase_internal(pid)
+    assert row["shipping_address"]["city"] == "SanFrancisco" and row["buyer_email"] == EMAIL

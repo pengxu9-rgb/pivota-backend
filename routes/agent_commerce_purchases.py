@@ -252,7 +252,9 @@ async def create_purchase(
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     """Open a purchase on the rail the router picks. MAKES NO RAIL CALL."""
-    if not rail_router.is_enabled():
+    # Both dials: a purchase this door opens is read through the unified ledger (an A2A purchase has no
+    # other read), so the door is dark while the ledger is.
+    if not rail_router.is_enabled() or not purchases.is_enabled():
         return _dark()
     try:
         agent_user_ref = reap_routes._require_agent_user(agent_user)
@@ -306,6 +308,11 @@ async def create_purchase(
         if replayed:
             return await _a2a_accepted(replayed, agent_id, owner)
 
+        if req.expected_unit_price_minor is None:
+            # A new attempt binds the money the buyer was shown (the Reap route's rule). Refused BEFORE
+            # the router, so its answer cannot be told apart by whether the merchant is on a rail's list.
+            raise reap_svc.PurchaseRefused(
+                "invalid_request", "expected_unit_price_minor and expected_currency are required")
         choice = rail_router.choose_rail(
             agent_id=agent_id, merchant_domain=merchant_domain, market_country=market_country,
             item_source=req.item_source, has_offer_code=offer_code is not None,
@@ -314,12 +321,9 @@ async def create_purchase(
         if choice.rail == "reap":
             return await reap_routes.start_reap_purchase(request, context, agent_user)
         if choice.rail is None:
-            logger.info("agent_purchases: explicit rail refused agent=%s reason=%s", agent_id, choice.refusal)
+            # WARNING, not INFO: prod drops module-logger INFO, and an operator needs to see why.
+            logger.warning("agent_purchases: explicit rail refused agent=%s reason=%s", agent_id, choice.refusal)
             raise reap_svc.PurchaseRefused("not_available_on_this_rail")
-        if req.expected_unit_price_minor is None:
-            # A new attempt binds the money the buyer was shown (the Reap route's rule).
-            raise reap_svc.PurchaseRefused(
-                "invalid_request", "expected_unit_price_minor and expected_currency are required")
         try:
             return await _open_a2a_purchase(
                 req=req, agent_id=agent_id, owner=owner, merchant_host=merchant_host, merchant_domain=merchant_domain,
@@ -343,6 +347,10 @@ async def _open_a2a_purchase(
 ) -> JSONResponse:
     """The A2A rail's create: every check the Reap cart-link lane makes, in its order, then one durable
     unit (the purchase and its key). Refusals raise `PurchaseRefused`; nothing is written before them."""
+    # The Reap rail's own buyer admission (pure): a real email, printable text, the client's required
+    # address fields. Its cleaned values are what is stored and later sent to the rail.
+    buyer_email, shipping_address = reap_svc._validated_buyer(
+        reap_svc.BuyerContact(email=buyer_email, shipping_address=dict(shipping_address)))
     # The same purchasability gate as the Reap route (dark unless enforced; fails closed).
     if purchasability.is_enforcement_enabled():
         if not await purchasability.is_purchasable(merchant_domain, market_country):
@@ -358,8 +366,8 @@ async def _open_a2a_purchase(
     unit_minor, currency = facts["our_price_minor"], facts["currency"]
     if type(unit_minor) is not int or unit_minor != req.expected_unit_price_minor or currency != req.expected_currency:
         raise reap_svc.PurchaseRefused("price_changed", "the selected offer money changed")
-    if not rail_router.amount_ok(unit_minor * int(req.quantity)):
-        raise reap_svc.PurchaseRefused("amount_over_limit", "the total is over this rail's limit")
+    if not rail_router.amount_ok(unit_minor * int(req.quantity), currency):
+        raise reap_svc.PurchaseRefused("amount_over_limit", "the total is over this rail's limit for its currency")
 
     # MINTED HERE, NEVER THE CALLER'S: the click that attributes the order, and the link that carries it.
     click_id = new_click_id()
@@ -410,7 +418,7 @@ async def _open_a2a_purchase(
         logger.warning("agent_purchases: a2a atomic create unavailable error_type=%s", type(exc).__name__)
         raise reap_routes._PurchasePersistenceUnavailable() from None
 
-    logger.info("agent_purchases: opened a2a purchase=%s merchant=%s agent=%s basis=%s",
+    logger.warning("agent_purchases: opened a2a purchase=%s merchant=%s agent=%s basis=%s",
                 purchase_id, merchant_domain, agent_id, choice.basis)
     try:
         # Best effort, bounded: the unified read heals a missing parent from the committed child.
