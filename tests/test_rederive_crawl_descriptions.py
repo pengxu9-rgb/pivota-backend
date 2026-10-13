@@ -1105,7 +1105,7 @@ def test_a_glued_era_row_re_crawled_by_the_fixed_producer_is_owned_and_rewritten
     """Minted between the cleanup and the sup/sub fix: its description is the glued text, which no
     longer equals its recorded copy (a re-crawl rewrote that) nor the old producer's text."""
     row = _row("p1", "h1", GLUED, crawled=SCRIPTED)
-    assert rd.glued_era_text(SCRIPTED) == GLUED
+    assert rd.glued_era_texts(SCRIPTED) == (GLUED,)
     assert rd.guard_outcome(row, _pdp("p1", "h1", SCRIPTED), "the old producer's different text") is None
     d = rd.decide(row, _pdp("p1", "h1", SCRIPTED), stage="published", stage_with_old="published",
                   allow_demote=False, allow_promote=False)
@@ -1120,5 +1120,37 @@ def test_a_hand_edited_row_that_merely_contains_a_glued_digit_is_not_owned():
 def test_the_glued_era_arm_maps_every_numeral_the_producer_writes():
     scripted = "".join(chr(c) for c in (0x2070, 0xB9, 0xB2, 0xB3, *range(0x2074, 0x207F),
                                         *range(0x2080, 0x208F)))
-    assert rd.glued_era_text(scripted) == "0123456789+-=()0123456789+-=()"
-    assert rd.glued_era_text("No numerals here.") == "No numerals here." and rd.glued_era_text(None) is None
+    assert rd.glued_era_texts(scripted)[0] == "0123456789+-=()0123456789+-=()"
+    assert rd.glued_era_texts("No numerals here.") == ("No numerals here.",) and rd.glued_era_texts(None) == ()
+
+
+SUP = {d: chr(c) for d, c in zip("0123456789", (0x2070, 0xB9, 0xB2, 0xB3, 0x2074, 0x2075, 0x2076, 0x2077, 0x2078,
+                                                0x2079))}
+SUP_MINUS = chr(0x207B)
+
+
+def _owned(old, new):
+    return rd.guard_outcome(_row("p1", "h1", old, crawled=new), _pdp("p1", "h1", new), None) is None
+
+
+def test_a_glued_era_comma_list_round_trips():
+    """The producer keeps the space after a list comma, so "<sup>1, 2</sup>" maps back exactly."""
+    new = f"Proven peptides{SUP['1']}, {SUP['2']} restore the barrier overnight, gently and well."
+    assert _owned(new.replace(SUP["1"], "1").replace(SUP["2"], "2"), new)
+
+
+@pytest.mark.parametrize("glued_minus", ["-", "\u2212"])
+def test_a_glued_era_minus_round_trips_whichever_the_source_used(glued_minus):
+    new = f"Holds up to 10{SUP_MINUS}{SUP['6']} particles with Ceramide{SUP['1']} in every gentle daily drop."
+    old = new.replace(SUP_MINUS, glued_minus).replace(SUP["6"], "6").replace(SUP["1"], "1")
+    assert _owned(old, new)
+    assert len(rd.glued_era_texts(new)) == 2
+
+
+def test_a_literal_superscript_in_the_source_fails_closed():
+    """A source that typed a superscript itself kept it in the glued era too; the inverse maps it to
+    ASCII as well, so the row is not matched and is left alone."""
+    new = f"Covers 50 m{SUP['2']} of skin with Ceramide{SUP['1']} in each gentle daily drop of serum."
+    old = f"Covers 50 m{SUP['2']} of skin with Ceramide1 in each gentle daily drop of serum."
+    assert not _owned(old, new)
+

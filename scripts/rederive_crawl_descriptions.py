@@ -501,22 +501,35 @@ _SCRIPT_TO_ASCII = str.maketrans(
     "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207a\u207b\u207c\u207d\u207e"
     "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089\u208a\u208b\u208c\u208d\u208e",
     "0123456789+-=()0123456789+-=()")
+# The fixed producer writes a superscript minus for both "-" and the minus sign; the glued era kept
+# whichever the source had. Both readings are tried (all hyphens, or all minus signs).
+_MINUS_SIGN = str.maketrans("-", "\u2212")
 
 
-def glued_era_text(new: Optional[str]) -> Optional[str]:
-    """What the producer wrote for the same body before the numeric sup/sub fix."""
-    return None if new is None else new.translate(_SCRIPT_TO_ASCII)
+def glued_era_texts(new: Optional[str]) -> Tuple[str, ...]:
+    """What the producer may have written for the same body before the numeric sup/sub fix.
+    A literal superscript in the source ("m\u00b2" typed as such) also maps back to ASCII, so
+    such a row is not matched: fail closed."""
+    if new is None:
+        return ()
+    hyphens = new.translate(_SCRIPT_TO_ASCII)
+    if hyphens == new:
+        return (hyphens,)
+    script_minus = {chr(0x207B), chr(0x208B)}
+    minus_signs = "".join(c.translate(_SCRIPT_TO_ASCII).translate(_MINUS_SIGN) if c in script_minus
+                          else c.translate(_SCRIPT_TO_ASCII) for c in new)
+    return (hyphens,) if minus_signs == hyphens else (hyphens, minus_signs)
 
 
 def crawl_owned(old: Optional[str], crawled_copy: Optional[str], legacy_text: Optional[str],
-                glued_text: Optional[str] = None) -> bool:
+                glued_texts: Iterable[str] = ()) -> bool:
     """The write guard: the stored text is EXACTLY what a crawl wrote -- its recorded copy, the old
     producer's text of the current body, or (a row minted between the cleanup and the sup/sub fix,
     whose recorded copy a re-crawl has since rewritten) the glued-era text of the new one."""
     if old is None:
         return False
     return ((crawled_copy is not None and old == crawled_copy) or (legacy_text is not None and old == legacy_text)
-            or (glued_text is not None and old == glued_text))
+            or old in glued_texts)
 
 
 def _sha(value: Any) -> str:
@@ -591,7 +604,7 @@ def guard_outcome(row: Dict[str, Any], planned: Optional[Dict[str, Any]], legacy
     new = planned.get("description") or None
     if new is not None and new == old:
         return UNCHANGED
-    if not crawl_owned(old, row.get("crawled_copy"), legacy_text, glued_era_text(new)):
+    if not crawl_owned(old, row.get("crawled_copy"), legacy_text, glued_era_texts(new)):
         return NOT_CRAWL_OWNED
     if new is None:
         return WOULD_EMPTY
