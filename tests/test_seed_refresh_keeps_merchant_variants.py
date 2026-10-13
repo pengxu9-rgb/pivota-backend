@@ -127,14 +127,22 @@ def test_a_read_that_names_every_merchant_id_may_replace_and_keeps_their_stamps(
     {"variant_id": f"{HANDLE}:0", "title": "Fair", "own_listing_url": "https://brand.example/products/x-fair"},
     # provenance alone
     {"variant_id": "EX-FAIR", "title": "Fair", "variant_id_provenance": "merchant_issued"},
-    # a numeric Shopify id with no stamp at all
-    {"variant_id": V50, "title": "Fair"},
 ])
 def test_every_protected_variant_shape_blocks_an_uncovering_overwrite(stored):
     incoming = [{"variant_id": "A", "title": "Fair"}, {"variant_id": "B", "title": "Light"},
                 {"variant_id": "C", "title": "Deep"}]
     assert not _incoming_keeps_protected_variants(existing=[stored], incoming=incoming)
     assert not _should_overwrite_seed_variants(existing=[stored], incoming=incoming, product_title="X")
+
+
+@pytest.mark.parametrize("digits", [V50, "0012345678905"])  # a Shopify-shaped id, a GTIN a page read used as sku
+def test_bare_digits_without_a_writers_stamp_are_not_protected(digits):
+    # A page read that named its variants by a numeric sku stores digits too; the refresh must stay
+    # free to correct its own earlier read.
+    stored = [{"variant_id": digits, "title": "50 ml"}]
+    incoming = [{"variant_id": "A", "title": "10 ml"}, {"variant_id": "B", "title": "50 ml"}]
+    assert _incoming_keeps_protected_variants(existing=stored, incoming=incoming)
+    assert _should_overwrite_seed_variants(existing=stored, incoming=incoming, product_title="X")
 
 
 def test_an_unprotected_list_is_still_judged_by_the_old_rule():

@@ -856,11 +856,11 @@ _PROTECTED_VARIANT_STAMPS = ("variant_id_provenance", "url", "url_source", "own_
 
 
 def _is_protected_seed_variant(variant: Dict[str, Any]) -> bool:
-    """A stored variant whose identity came from the merchant, not from a page read: a numeric
-    Shopify variant id, a `merchant_issued` provenance, or a fold's own listing url."""
+    """A stored variant a WRITER vouched for: a `merchant_issued` provenance, or a fold's own
+    listing url. A bare numeric id is not enough -- a page read that named its variants by a GTIN
+    `sku` stores digits too, and freezing those would stop the refresh correcting its own reads."""
     return bool(
-        _native_refresh_variant_ids(variant)
-        or variant.get("variant_id_provenance") == "merchant_issued"
+        variant.get("variant_id_provenance") == "merchant_issued"
         or variant.get("url_source")
         or variant.get("own_listing_url")
     )
