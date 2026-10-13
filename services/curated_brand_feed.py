@@ -199,12 +199,13 @@ def _variant_option_name(variant: Dict[str, Any], base_option_name: str) -> str:
     # the variant from, and a shade row with an empty handle stores "" — which a
     # truthiness test reads as "not folded", handing that shade the base's own
     # axis and reproducing the mislabel this function exists to prevent.
+    # The extended fold (retailer lane, `fold_shade_listings(extended=True)`) already decided the axis per base,
+    # from the shop's own option names where it gave one -- on every folded-in variant, and on the parent's own
+    # item it labelled (_parent_item_label). The legacy fold never stamps it.
+    decided = str(variant.get(FOLD_AXIS_KEY) or "").strip()
+    if decided:
+        return decided
     if FOLDED_FROM_KEY in variant:
-        # The extended fold (retailer lane, `fold_shade_listings(extended=True)`) already decided the axis
-        # per base, from the shop's own option names where it gave one; the legacy fold never stamps it.
-        decided = str(variant.get(FOLD_AXIS_KEY) or "").strip()
-        if decided:
-            return decided
         if base_option_name.strip().lower() in _SHADE_AXIS_NAMES:
             return base_option_name
         # The fold collapses listings that differ by a TITLE SUFFIX, and a suffix
@@ -1062,7 +1063,20 @@ _ABBREVIATION_TAIL_RE = re.compile(
 _SENTENCE_TERMINAL = ".!?。！？"
 
 
+# A boilerplate LABEL starts a new unit even without punctuation before it: "...Made in Japan Disclaimer: Due
+# to photographic lighting..." -- otherwise the product's own words and the store's disclaimer are one
+# sentence, and dropping the disclaimer would take "Made in Japan" with it.
+_LABEL_BOUNDARY_RE = re.compile(r"\s+(?=(?:disclaimer|please\s+note)\s*:)|(?<!please)\s+(?=note\s*:)", re.IGNORECASE)
+
+
 def _split_sentences(block: str) -> List[str]:
+    out: List[str] = []
+    for part in _LABEL_BOUNDARY_RE.split(block):
+        out.extend(_split_punctuated(part))
+    return out
+
+
+def _split_punctuated(block: str) -> List[str]:
     out: List[str] = []
     start = 0
     for m in _SENTENCE_END_RE.finditer(block):
@@ -1137,6 +1151,10 @@ _BOILERPLATE_CLASSES: Tuple[Tuple[str, Tuple[Tuple["re.Pattern[str]", ...], ...]
         (r"(?i)\b(?:promo|discount|coupon|voucher)\s*codes?\b",),
         (r"(?i)\b(?:bulk|wholesale)\s+(?:discounts?|pricing|prices|orders?|inquiries|enquiries|accounts?)\b",),
         (r"(?i)\bbuy(?:ing)?\s+in\s+bulk\b", r"(?i)\b(?:save|savings|discount|off)\b"),
+        # Quantity-tier pricing: "10 pcs and above - 12% off", "MIX & MATCH BULK DISCOUNT".
+        (r"(?i)\b\d+\s*(?:pcs|pieces|units|items|bottles|sets)\s+(?:and|&|or)\s+(?:above|more|over)\b",
+         r"(?i)\b(?:off|discount|save|savings)\b"),
+        (r"(?i)\bmix\s*(?:&|and)\s*match\b", r"(?i)\b(?:bulk|discount|off|save)\b"),
         (r"(?i)\bbuy\s+(?:\d+|one|two|three)\s*,?\s*get\s+(?:\d+|one|two|three)\s+(?:free|half|\d+\s*%)",),
     )),
     ("store_link", _rules(
@@ -1163,13 +1181,16 @@ _BOILERPLATE_CLASSES: Tuple[Tuple[str, Tuple[Tuple["re.Pattern[str]", ...], ...]
         (r"(?i)\ban?\s+(?:post|photo|video|reel)\s+shared\s+by\b[^@]{0,80}@[\w.]+\)?",),
         (rf"(?i)\bfollow\s+us\s+(?:on\s+)?{_PLATFORM}\b",),
         (r"(?i)\bfollow\s+us\s+@[\w.]+",),
+        (rf"(?i)\bfollow\s+(?:[^\s,.;:!?]+\s+){{0,3}}(?:on\s+)?{_PLATFORM}\b",),
         (rf"(?i)\b(?:find|join)\s+us\s+on\s+{_PLATFORM}\b",),
         (r"(?i)\btag\s+us\b", rf"(?i)@[\w.]+|#\w+|\b{_PLATFORM}\b"),
     )),
     ("colour_disclaimer", _rules((
-        r"(?i)\b(?:colou?rs?|shades?)\s+(?:may|might|can|could)\s+(?:vary|differ|appear\s+(?:slightly\s+)?"
-        r"different|look\s+(?:slightly\s+)?different)\b",
-        r"(?i)\b(?:monitors?|screens?|displays?|devices?|computers?)\s+(?:settings?|resolutions?|calibrations?)\b"
+        r"(?i)\b(?:colou?rs?|shades?)(?:\s+(?:in|of|on|shown\s+in)\s+(?:the|this|these|our)\s+"
+        r"(?:images?|photos?|pictures?|photographs?))?\s+(?:may|might|can|could)\s+(?:vary|differ|appear\s+"
+        r"(?:slightly\s+)?different|look\s+(?:slightly\s+)?different)\b",
+        r"(?i)\bphotographic\b|\blighting\s+(?:sources?|conditions?)\b"
+        r"|\b(?:monitors?|screens?|displays?|devices?|computers?)\s+(?:settings?|resolutions?|calibrations?)\b"
         r"|\bscreen\s+to\s+screen\b|\bmonitor\s+to\s+monitor\b"
         r"|\b(?:on|from)\s+(?:your|each|every|different|individual|one)\s+(?:monitors?|screens?|displays?|devices?|computers?)\b",
     ),)),
@@ -1301,6 +1322,17 @@ def _join_sentences(sentences: Sequence[str]) -> str:
     return "".join(parts)
 
 
+_HEADING_MAX_WORDS = 5
+
+
+def _is_heading_unit(unit: str) -> bool:
+    """A section heading: a short unit with no sentence punctuation ("Full Ingredients", "How to use:")."""
+    text = (unit or "").strip()
+    if not text or text.rstrip(":").rstrip()[-1:] in _SENTENCE_TERMINAL:
+        return False
+    return len(text.rstrip(":").split()) <= _HEADING_MAX_WORDS
+
+
 def join_description_sentences(sentences: Sequence[str], max_len: int = BODY_TEXT_MAX_LEN) -> str:
     """Join sentences into the description, capped at `max_len` on the LAST sentence boundary
     that fits, so the copy does not end mid-sentence. When that boundary would keep less than half
@@ -1315,6 +1347,10 @@ def join_description_sentences(sentences: Sequence[str], max_len: int = BODY_TEX
             break
         if s:
             kept.append(s)
+    # A cut that lands right after a section heading ("Full Ingredients", "How to use:") would end the copy on
+    # the bare heading: the section it introduces did not fit. Drop such trailing headings.
+    while len(kept) > 1 and _is_heading_unit(kept[-1]) and not is_safety_text(kept[-1]):
+        kept.pop()  # a short SAFETY line ("For external use only", "Avoid eyes") is never a heading to drop
     head = _join_sentences(kept)
     if len(head) * 2 >= max_len:
         return head
@@ -3702,6 +3738,23 @@ def _is_extended_stub(product: Dict[str, Any]) -> bool:
     return not any((_to_float(v.get("price")) or 0.0) >= MIN_SELLABLE_PRICE for v in variants)
 
 
+#: A quantity written in a title ("Glow Serum 30ml"): the parent's own item on a size axis.
+_TITLE_QUANTITY_RE = re.compile(r"(?i)\b\d+(?:[.,]\d+)?\s*(?:ml|l|g|kg|mg|oz|fl\.?\s*oz)\b")
+#: Neutral labels for a parent's own placeholder item, by its children's axis, in order of preference.
+_PARENT_ITEM_LABELS = {"size": ("Standard", "Regular"), "shade": ("Original", "Classic")}
+
+
+def _parent_item_label(title: str, family: str, *, taken: set) -> Optional[str]:
+    """The label for a priced parent's own placeholder item: the quantity its title states for a size axis
+    ("Glow Serum 30ml" -> "30ml"), else a neutral word ("Standard" for sizes, "Original" otherwise) -- the first
+    that no child already uses (a repeated label would make the seed writer drop them all). None when every
+    candidate is taken: the item is then left unlabelled, as before."""
+    found = _TITLE_QUANTITY_RE.search(title or "") if family == "size" else None
+    candidates = ([" ".join(found.group(0).split())] if found else []) + list(
+        _PARENT_ITEM_LABELS["size" if family == "size" else "shade"])
+    return next((c for c in candidates if _norm_label(c) not in taken), None)
+
+
 def _child_axis(child: Dict[str, Any], suffix: str) -> Tuple[Optional[str], str, bool]:
     """(the shop's own axis name for this single-variant child, or None; its family; evidence).
 
@@ -3738,12 +3791,12 @@ def _fold_refused_extended(base: Dict[str, Any], child: Dict[str, Any], suffix: 
     if not (bt and ct) and not evidence:
         # An untyped side gives the type check nothing to compare: "<Lip Oil> - Cuticle Oil" would fold.
         return "product_type_unknown"
-    bp, cp = _first_price(base), _first_price(child)
-    if bp is not None and bp < MIN_SELLABLE_PRICE:
-        # A parent priced under the sellable floor (a 0.50 "choose a shade" stub) names no price for the line:
-        # comparing against it would refuse every child. A placeholder-labelled parent that IS priced keeps
-        # the check -- its price is the line's.
-        bp = None
+    # The parent's first SELLABLE price: an item under the floor (a 0.50 "choose a shade" stub, or a 0.00 sample
+    # listed before the real 40.00 item) names no price for the line. A parent that sells nothing has none,
+    # and its children are not price-compared.
+    bp = next((p for p in (_to_float(v.get("price")) for v in (base.get("variants") or []) if isinstance(v, dict))
+               if p is not None and p >= MIN_SELLABLE_PRICE), None)
+    cp = _first_price(child)
     ratio = _FOLD_SIZE_PRICE_RATIO if family == "size" else _FOLD_PRICE_RATIO
     if bp and cp and (max(bp, cp) / min(bp, cp)) > ratio:
         return "price_mismatch"
@@ -3814,6 +3867,11 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
                 break
             if multi:
                 break  # a suffixed multi-variant listing is a distinct line, as in the legacy fold
+            if not handle_of(p).strip() or "/" in handle_of(p):
+                # A folded variant is sold on its own listing (/products/<handle>); without one its offer, or the
+                # canonical one, would fall back to the parent's page at the child's price.
+                refuse(p, "child_handle_unusable")
+                break
             name, family, evidence = _child_axis(p, suffix)
             refused = _fold_refused_extended(base, p, suffix, family, evidence)
             if refused:
@@ -3848,7 +3906,7 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
     report: Dict[str, Any] = {"bases": 0, "shades": 0, "stubs_replaced": 0, "images_adopted": 0,
                               "folded": {}, "refused": refusals, "axes": {"shade": 0, "size": 0, "named": 0},
                               "duplicates_absorbed": {}, "copies_deduped": {}, "superseded": [],
-                              "mixed_axes": [], "canonical_moved": []}
+                              "mixed_axes": [], "canonical_moved": [], "parent_items_labelled": []}
     out: List[Dict[str, Any]] = []
     for p in products:
         if not isinstance(p, dict):
@@ -3916,6 +3974,17 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
         if not added:
             out.append(p)  # only copies or repeats: the base is unchanged, and is not a folded row
             continue
+        # A priced parent's own item is usually Shopify's placeholder ("Default Title"). Unlabelled beside labelled
+        # children it makes the seed writer drop EVERY label (ingestion._drop_options_that_do_not_distinguish), so
+        # the folded product would have no picker. It gets a label on the children's axis instead.
+        added_families = {target[id(k)][4] for k in kids if handle_of(k) in folded_handles}
+        if len(own) == 1 and not _variant_label(own[0]) and len(added_families) == 1:
+            family = next(iter(added_families))
+            label = _parent_item_label(title_of(p), family, taken={_norm_label(v.get("title")) for v in added})
+            if label:
+                own[0] = dict(own[0], title=label, option1=label, **{FOLD_AXIS_KEY: spelling.get(family) or (
+                    _DEFAULT_SIZE_OPTION_NAME if family == "size" else _DEFAULT_SHADE_OPTION_NAME)})
+                report["parent_items_labelled"].append({"base_handle": base_handle, "label": label})
         # Two axes on one product: the seed writer then drops every label and serves the bare list
         # (ingestion._drop_options_that_do_not_distinguish). Folded anyway, and named for the reviewer.
         families = {_axis_family(base_axis)} - {None} if own else set()
@@ -3976,6 +4045,7 @@ def fold_report_summary(report: Optional[Dict[str, Any]], *, cap: int = 200) -> 
     out["refused_by_reason"] = dict(collections.Counter(r.get("reason") for r in report.get("refused") or []))
     out["mixed_axes"] = list(report.get("mixed_axes") or [])[:cap]
     out["canonical_moved"] = list(report.get("canonical_moved") or [])[:cap]
+    out["parent_items_labelled"] = list(report.get("parent_items_labelled") or [])[:cap]
     for key in ("superseded", "refused", "baseless_groups"):
         items = list(report.get(key) or [])
         out[key] = items[:cap]

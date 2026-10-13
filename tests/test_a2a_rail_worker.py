@@ -53,6 +53,13 @@ W = "w1"
 
 
 @pytest.fixture(autouse=True)
+def token_step_on(monkeypatch):
+    """The token step is behind its own dial (off by default); these tests drive it. The dial's own
+    behaviour is pinned by `test_the_token_step_is_dark_until_its_own_dial_is_on`."""
+    monkeypatch.setenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, "1")
+
+
+@pytest.fixture(autouse=True)
 async def _db(monkeypatch):
     monkeypatch.setattr(a2a_rail, "ALLOWED_HOST_SHA256", frozenset({hashlib.sha256(HOST.encode()).hexdigest()}))
     if not database.is_connected:
@@ -766,30 +773,22 @@ async def test_a_definite_answer_that_is_not_an_approval_page_fails_the_purchase
     assert row["last_error_code"].startswith(code)
 
 
-async def test_an_unseen_token_request_is_started_over_not_guessed():
+@pytest.mark.parametrize("where", ["token-setup", "select-method"])
+async def test_an_unseen_token_request_fails_the_purchase_instead_of_minting_again(where):
     pid = await _locked()
-    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", httpx.Response(503))
+    rail = Rail().on("payment.method-view#submit", _methods(VISA))
+    if where == "token-setup":
+        rail.on("payment.token-setup#submit", httpx.Response(503))
+    else:
+        rail.on("payment.token-setup#submit", _methods(VISA)).on("payment.method-list#select-method", httpx.Response(504))
     assert await _step(rail, pid) == "outcome_unknown"
-    row = await _row(pid)
-    assert (row["state"], row["pending_write"]) == ("quoting", "payment.token-setup#submit")
-    # The next holder resolves it (no money moved) and sends nothing in that claim...
-    rail = Rail()
-    assert await _step(rail, pid) == "reconciled"
-    assert rail.sent == [] and (await _row(pid))["pending_write"] is None
-    # ...and the claim after asks again.
-    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page("ptk_2"))
-    assert await _step(rail, pid) == "approval_page_issued"
-    assert (await _row(pid))["payment_token_id"] == "ptk_2"
-
-
-async def test_an_unseen_token_request_is_given_up_after_its_reconcile_limit():
-    pid = await _locked()
-    await _step(Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", httpx.Response(503)), pid)
-    await _ago("pending_write_at", worker.RECONCILE_LIMIT_SECONDS + 5, purchase_id=pid)
+    assert (await _row(pid))["pending_write"] == f"payment.{where.replace('select-method', 'method-list#select-method').replace('token-setup', 'token-setup#submit')}"
+    # The rail cannot void a token, so the unseen request is never sent again: the purchase ends.
     rail = Rail()
     assert await _step(rail, pid) == "failed"
     row = await _row(pid)
-    assert (rail.sent, row["state"], row["pending_write"], row["last_error_code"]) == ([], "failed", None, "reconcile_exhausted")
+    assert (rail.sent, row["state"], row["pending_write"], row["last_error_code"]) == (
+        [], "failed", None, "token_request_unresolved")
 
 
 async def test_paid_goes_out_on_the_approval_schedule_and_an_active_token_parks():
@@ -904,17 +903,6 @@ async def test_a_money_result_on_the_await_poll_parks_for_good():
     assert await _step(rail, pid) == "money_result_parked" and rail.sent == []
 
 
-async def test_an_unseen_select_method_is_resolved_and_started_over():
-    pid = await _locked()
-    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _methods(VISA)).on(
-        "payment.method-list#select-method", httpx.Response(504))
-    assert await _step(rail, pid) == "outcome_unknown"
-    assert (await _row(pid))["pending_write"] == "payment.method-list#select-method"
-    rail = Rail()
-    assert await _step(rail, pid) == "reconciled" and rail.sent == []
-    assert (await _row(pid))["pending_write"] is None
-
-
 async def test_our_own_throttle_on_paid_does_not_spend_the_buyers_slots():
     pid = await _approving()
     await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[-1] + 1, purchase_id=pid)
@@ -975,3 +963,89 @@ async def test_a_write_left_pending_by_a_crashed_step_is_never_cleared_unread(mo
 @pytest.mark.parametrize("value,seconds", [(900, 900), (120, 120), (59, 900), (3601, 900), (None, 900), ("900", 900), (True, 900)])
 def test_the_page_lifetime_is_the_rails_within_bounds(value, seconds):
     assert worker._page_seconds(value) == seconds
+
+
+
+# ── before the worker is armed (controller review of #2584) ──────────────────────────────────
+
+
+async def test_the_token_step_is_dark_until_its_own_dial_is_on(monkeypatch):
+    monkeypatch.delenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV)
+    pid = await _locked()
+    rail = Rail()
+    assert await _step(rail, pid) == "parked"
+    assert rail.sent == [] and (await _row(pid))["last_error_code"] == "token_step_disabled"
+
+
+async def test_a_non_usd_total_is_never_sent_as_an_amount():
+    pid = await _locked()
+    await database.execute("UPDATE a2a_rail_purchases SET currency = 'SGD' WHERE id = :i", {"i": pid})
+    rail = Rail().on("payment.method-view#submit", _methods(VISA))
+    assert await _step(rail, pid) == "failed"
+    assert rail.actions() == ["payment.method-view#submit"]
+    assert (await _row(pid))["last_error_code"] == "token_currency_unsupported"
+
+
+@pytest.mark.parametrize("park", ["read", "await"])
+async def test_the_sweep_never_expires_a_purchase_parked_on_money(park):
+    if park == "read":
+        pid = await _locked()
+        await _step(Rail().on("payment.method-view#submit", MONEY), pid)
+    else:
+        pid = await _approving(NAMED, _scheme_page())
+        await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, purchase_id=pid)
+        await _step(Rail().on("payment.action-required#paid", _await("PENDING")), pid)
+        await _step(Rail().on("payment.await#poll", MONEY), pid)
+    row = await _row(pid)
+    assert row["pending_write"] is None and "money_result_seen" in row["last_error_code"]
+    await _ago("buyer_action_expires_at", 60, purchase_id=pid)
+    await _ago("state_entered_at", 10 * 86400, purchase_id=pid)
+    await _ago("created_at", 10 * 86400, purchase_id=pid)
+    assert await ledger.expire_overdue_purchases() == 0
+    row = await _row(pid)
+    assert row["state"] != "expired" and "money_result_seen" in row["last_error_code"]
+
+
+@pytest.mark.parametrize("marker", ["money", "token_active"])
+async def test_a_crash_never_overwrites_a_sticky_marker(monkeypatch, marker):
+    if marker == "money":
+        pid = await _locked()
+        await _step(Rail().on("payment.method-view#submit", MONEY), pid)
+    else:
+        pid = await _approving()
+        await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, purchase_id=pid)
+        await _step(Rail().on("payment.visa-action-required#paid", _token_result()), pid)
+    before = (await _row(pid))["last_error_code"]
+
+    async def _blip(*a, **k):
+        raise RuntimeError("database blip")  # any step-time fault
+
+    real_step = worker.step
+    monkeypatch.setattr(worker, "step", _blip)
+    await _ago("next_poll_at", 1, purchase_id=pid)
+    assert (await worker.run_tick(_client(Rail()), W)).get("error") == 1
+    monkeypatch.setattr(worker, "step", real_step)
+    assert (await _row(pid))["last_error_code"] == before
+    rail = Rail()
+    assert await _step(rail, pid) in ("money_result_parked", "parked")
+    assert rail.sent == []
+
+
+async def test_a_token_minted_with_an_unstorable_id_is_refused_and_said_so(caplog):
+    pid = await _locked(SYNC)
+    bad = _task(("payment.token-result", {"paymentTokenId": "ptk/not a ref", "status": "ACTIVE"}))
+    rail = Rail().on("payment.method-view#submit", _methods(SYNC)).on("payment.token-setup#submit", bad)
+    with caplog.at_level(logging.ERROR, logger=worker.__name__):
+        assert await _step(rail, pid) == "refused"
+    row = await _row(pid)
+    assert (row["state"], row["refusal_reason"], row["last_error_code"], row["payment_token_id"]) == (
+        "refused", "buyer_approval_missing", "token_id_unstorable", None)
+    assert any("unstorable" in r.getMessage() for r in caplog.records)
+
+
+async def test_the_newest_card_is_chosen_by_time_not_by_its_spelling():
+    pid = (await _open())["id"]
+    utc = {**ACTIVE, "id": "pm_utc", "created_at": "2026-10-11T01:00:00Z"}
+    offset = {**ACTIVE, "id": "pm_offset", "created_at": "2026-10-11T08:30:00+08:00"}  # 00:30 UTC: older
+    assert await _step(Rail().on("payment.method-view#submit", _methods(offset, utc)), pid) == "method_ready"
+    assert (await _row(pid))["payment_method_id"] == "pm_utc"
