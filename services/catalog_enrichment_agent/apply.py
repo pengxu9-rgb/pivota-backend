@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from services.catalog_enrichment_agent.bulk_writer import bulk_upsert
 from services.catalog_enrichment_agent.ingestion import AGENT_VERSION, _domain_of, derive_offer_id
@@ -2683,7 +2683,7 @@ async def _apply_ingest_plan_batched(
 
 
 _CURRENT_LISTINGS_SQL = """
-                SELECT product_key, canonical_url FROM catalog_products
+                SELECT product_key, canonical_url, source_domain FROM catalog_products
                 WHERE product_key = ANY(:product_keys)
                 """
 
@@ -2695,7 +2695,8 @@ async def current_listings(product_keys: List[str], *, db: Any) -> Dict[str, Any
     one scripts/repair_same_title_listings.py aligned it to -- unless a stronger rule says otherwise. The
     URL's host spelling (`www.` or not) is the one a re-ingest writes (ingestion.respell_listing_host).
     Read-only; keys with no row or no readable URL are absent."""
-    return _listings_of(await _stored_canonical_urls(product_keys, db=db))
+    stored = await _stored_rows(product_keys, db=db)
+    return _listings_of({k: url for k, (url, _source_domain) in stored.items()})
 
 
 def _listings_of(stored: Dict[str, str]) -> Dict[str, Any]:
@@ -2709,13 +2710,15 @@ def _listings_of(stored: Dict[str, str]) -> Dict[str, Any]:
     return out
 
 
-async def _stored_canonical_urls(product_keys: List[str], *, db: Any) -> Dict[str, str]:
-    """product_key -> catalog_products.canonical_url as stored (one SELECT); keys with no row or no URL are absent."""
+async def _stored_rows(product_keys: List[str], *, db: Any) -> Dict[str, Tuple[str, Optional[str]]]:
+    """product_key -> (canonical_url, source_domain) as stored (one SELECT); keys with no row or no URL are
+    absent, and source_domain is None when the row has none."""
     keys = sorted({str(k) for k in product_keys if k})
     if not keys:
         return {}
     rows = await db.fetch_all(_CURRENT_LISTINGS_SQL, {"product_keys": keys})
-    return {str(row["product_key"]): str(row["canonical_url"]).strip()
+    return {str(row["product_key"]): (str(row["canonical_url"]).strip(),
+                                      str(row["source_domain"] or "").strip() or None)
             for row in rows if str(row["canonical_url"] or "").strip()}
 
 
@@ -2739,8 +2742,9 @@ async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, 
     """ingestion.ingest_validated_jsonl with the listing each of its rows names today, so the plan never
     moves a row off it (`listing_moves`) -- the one way every lane that holds a catalog handle plans.
     `current_listings.status` says what was read for the content-keyed rows; `listing_spellings.status` says
-    the same of the `ext:retailer:` rows, read only for the host spelling their offers and seeds already use
-    (never for a listing: those rows cannot move). One SELECT serves both. `planner` is the caller's own
+    the same of the `ext:retailer:` rows, read only for the host spelling their offers, seeds and variant SKUs
+    already use -- canonical_url and source_domain as stored (never for a listing: those rows cannot move).
+    One SELECT serves both. `planner` is the caller's own
     ingest_validated_jsonl (the name its tests patch)."""
     from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
 
@@ -2752,8 +2756,8 @@ async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, 
     if not content and not retailer:
         return {**first, "current_listings": {"status": "not_applicable"},
                 "listing_spellings": {"status": "not_applicable"}}
-    stored = await _stored_canonical_urls(content + retailer, db=db)
-    current = _listings_of({k: stored[k] for k in content if k in stored})
+    stored = await _stored_rows(content + retailer, db=db)
+    current = _listings_of({k: stored[k][0] for k in content if k in stored})
     spellings = {k: stored[k] for k in retailer if k in stored}
     statuses = {"current_listings": {"status": "read", "rows": len(current)} if content else {"status": "not_applicable"},
                 "listing_spellings": {"status": "read", "rows": len(spellings)} if retailer else {"status": "not_applicable"}}
