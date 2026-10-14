@@ -279,6 +279,7 @@ def run_apply(monkeypatch, capsys, counts):
     fake = AsyncMock()
     fake.is_connected = True
     monkeypatch.setattr(db_module, "database", fake)
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (fake, None))  # an apply reads the rows' spellings
     rc = cli.main(_RETAILER_ARGS + ["--apply"])
     return rc, *capsys.readouterr()
 
@@ -317,8 +318,10 @@ def test_an_unrelated_apply_error_prints_no_invented_report(monkeypatch, capsys)
     fake = AsyncMock()
     fake.is_connected = True
     monkeypatch.setattr(db_module, "database", fake)
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (fake, None))  # an apply reads the rows' spellings
     assert cli.main(_RETAILER_ARGS + ["--apply"]) == 2
-    out = capsys.readouterr().out
+    out, err = capsys.readouterr()
+    assert "retailer_listing_migration_required" in err  # the apply ran: no earlier refusal exited 2
     assert not any('"applied"' in line for line in out.splitlines() if gate.MARKER in line)
     assert cli.SKIPPED_PDP_PREFIX not in out
 

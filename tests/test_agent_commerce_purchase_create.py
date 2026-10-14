@@ -315,6 +315,35 @@ async def test_a_conflict_never_names_another_owners_purchase_or_a_marker(client
     assert "purchase_id" not in resp.text
 
 
+async def test_a_selected_variant_id_opens_on_the_catalogs_own_sku_and_is_fingerprinted_as_sent(client, stubs, monkeypatch):
+    resolved = []
+
+    async def _resolve(*, merchant_domain, product_key, variant_id, market_country):
+        resolved.append((merchant_domain, product_key, variant_id, market_country))
+        return f"{product_key}::sku_catalogs_own"
+
+    monkeypatch.setattr(reap_routes, "_resolve_selected_variant_key", _resolve)
+    resp = await client.post(BASE, body(variant_id=VARIANT))
+    assert resp.status_code == 202 and resp.json()["rail"] == "a2a", resp.text
+    assert resolved == [(SHOP, "pk_1", VARIANT, "US")]
+    assert [c[2] for c in stubs.catalog] == ["pk_1::sku_catalogs_own"]  # loaded by the RESOLVED key
+    again = await client.post(BASE, body(variant_id=VARIANT))
+    assert again.json()["purchase_id"] == resp.json()["purchase_id"] and len(resolved) == 1  # a replay resolves nothing
+    # The fingerprint is what was sent: the same key with the resolved sku SPELLED out is another body.
+    spelled = await client.post(BASE, body(variant_key="pk_1::sku_catalogs_own"))
+    assert spelled.status_code == 409 and "idempotency_conflict" in spelled.text
+    # Another variant at the SAME shown price under the same key: another body, never a replay of this one.
+    other = await client.post(BASE, body(variant_id="49922977038699"))
+    assert other.status_code == 409 and "idempotency_conflict" in other.text
+    assert await _count("a2a_rail_purchases") == 1
+
+
+async def test_a_variant_id_beside_a_variant_key_is_refused_before_any_read(client, stubs):
+    resp = await client.post(BASE, body(variant_id=VARIANT, variant_key="pk_1::sku_x"))
+    assert resp.status_code == 400 and "invalid_request" in resp.text
+    assert stubs.catalog == [] and await _count("a2a_rail_purchases") == 0
+
+
 async def test_a_key_that_opened_a_reap_purchase_is_replayed_by_the_reap_route(client, stubs):
     req = unified_routes.CreatePurchaseRequest.model_validate(body())
     request_hash = reap_routes._request_hash(
@@ -623,3 +652,34 @@ async def test_the_reap_door_losing_a_key_race_to_another_rail_names_the_winner_
     reap_row = await reap_ledger.get_purchase_internal(row["id"])
     assert (reap_row["state"], reap_row["refusal_reason"]) == ("refused", "duplicate_idempotency_key")
     assert reap_row["buyer_email"] is None and reap_row["shipping_address"] is None
+
+
+
+@pytest.mark.parametrize("path", ["/agent/v2/commerce/reap/purchases", "/agent/v2/commerce/reap/purchases/recover"])
+async def test_the_reap_door_names_its_own_purchase_on_a_conflict(client, stubs, reap_door_open, monkeypatch, path):
+    """The REAL Reap create opens an rp_ purchase; a different body under the same key, on create or recovery,
+    is a 409 that names it (and its rail)."""
+    await database.execute(
+        "INSERT INTO reap_agentic_buyer_refs (buyer_id, reap_buyer_ref, consent_version, consented_at) "
+        "VALUES ('buyer_conflict', 'bref_conflict', 'terms-2026-10', CURRENT_TIMESTAMP)")
+
+    async def _buyer(**kwargs):
+        return "buyer_conflict"
+
+    async def _bref(buyer_id, **kwargs):
+        return "bref_conflict"
+
+    async def _click(click):
+        return None
+
+    monkeypatch.setattr(reap_routes, "_buyer_id_for", _buyer)
+    monkeypatch.setattr(reap_routes, "_reap_buyer_ref", _bref)
+    monkeypatch.setattr(reap_routes, "issue_click", _click)
+    opened = await client.post("/agent/v2/commerce/reap/purchases", body())
+    assert opened.status_code == 202, opened.text
+    pid = opened.json()["purchase_id"]
+    assert pid.startswith("rp_")
+    resp = await client.post(path, body(quantity=2))
+    assert resp.status_code == 409 and "idempotency_conflict" in resp.text, resp.text
+    detail = resp.json().get("detail") or resp.json()
+    assert (detail["purchase_id"], detail["rail"]) == (pid, "reap")

@@ -127,3 +127,41 @@ async def test_the_bulk_path_writes_the_same_shape(db):  # noqa: F811
     assert counts["offers"] == 1 and len(rows) == 1
     assert rows[0]["offer_type"] == "retailer" and rows[0]["offer_mode"] == "redirect"
     assert rows[0]["is_first_party"] is False and rows[0]["market"] == "US"
+
+
+async def test_a_reapply_that_fills_a_null_type_stores_its_first_party_bit_too(db):  # noqa: F811
+    """A drain re-apply carrying the storefront proof fills the NULL type an earlier run left (the upsert is
+    backfill-only). is_first_party must move WITH it: (brand_direct, FALSE) is served by neither the gateway's
+    own-offer read (is_first_party IS TRUE) nor the retailer arm, and the relabel tool (offer_type IS NULL) can no
+    longer reach it. Its twins: a decided type keeps its bit, and a NULL re-write keeps the stored bit."""
+    await _seed_product(db)
+    key = _ingestion_key()
+    unknown = curated_offers(key, payload={"source_domain": "brand.example", "brand": "Gate", "canonical_url": DEST})
+    assert (unknown[0]["offer_type"], unknown[0]["is_first_party"]) == (None, False)  # the premise: no evidence
+    await _apply(_plan([_planned_sku()], unknown), batch=False)
+
+    # Re-applied unlabelled: nothing moves.
+    await _apply(_plan([_planned_sku()], unknown), batch=False)
+    row = (await _rows(db))[0]
+    assert (row["offer_type"], row["is_first_party"]) == (None, False)
+
+    labelled = [dict(o, offer_type="brand_direct", is_first_party=True) for o in unknown]
+    await _apply(_plan([_planned_sku()], labelled), batch=False)
+    row = (await _rows(db))[0]
+    assert (row["offer_type"], row["is_first_party"]) == ("brand_direct", True)
+
+    # Already decided: a later plan's bit never overwrites it.
+    await _apply(_plan([_planned_sku()], unknown), batch=False)
+    row = (await _rows(db))[0]
+    assert (row["offer_type"], row["is_first_party"]) == ("brand_direct", True)
+
+
+async def test_the_bulk_path_fills_the_first_party_bit_with_the_type(db):  # noqa: F811
+    await _seed_product(db)
+    key = _ingestion_key()
+    unknown = curated_offers(key, payload={"source_domain": "brand.example", "brand": "Gate", "canonical_url": DEST})
+    await _apply(_plan([_planned_sku()], unknown), batch=True)
+    labelled = [dict(o, offer_type="brand_direct", is_first_party=True) for o in unknown]
+    await _apply(_plan([_planned_sku()], labelled), batch=True)
+    row = (await _rows(db))[0]
+    assert (row["offer_type"], row["is_first_party"]) == ("brand_direct", True)

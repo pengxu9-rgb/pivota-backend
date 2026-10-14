@@ -81,7 +81,7 @@ Opens a purchase on the rail `services/payment_orchestration/router.py` picks. *
 404 `not_available`. Same authentication as the reads.
 
 **Body**: the Reap create body (docs/reap_agentic_routes.md, `item_source`, `merchant_domain`,
-`product_key`, `variant_key`, `quantity`, `buyer {email, shipping_address, consent_version}`,
+`product_key`, `variant_key` or (cart link) `variant_id`, `quantity`, `buyer {email, shipping_address, consent_version}`,
 `idempotency_key`, `expected_unit_price_minor` + `expected_currency`, `offer_code`, `return_url`)
 plus an optional `payment_preference: {"rail": "reap" | "a2a"}`.
 

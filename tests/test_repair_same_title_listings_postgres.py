@@ -395,3 +395,77 @@ async def test_after_the_repair_an_out_of_stock_or_missing_page_never_moves_the_
     assert [c["kept"]["handle"] for c in plan["listing_collisions"]] == ["soy-candle-medium-black-cherry"]
     held = await plan_with_current_listings([refill], db=db)
     assert held["pdps"] == [] and [m["current"] for m in held["listing_moves"]] == ["soy-candle-medium-black-cherry"]
+
+
+K_ALIAS = "ext:store-brand-base-duo::88888888"
+ALIAS_APEX, ALIAS_WWW = "https://store.example/products/base-duo", "https://www.store.example/products/base-duo"
+
+
+async def _alias_rows(admin):
+    """One listing crawled under both spellings of its host: a canonical and a variant shelf with an offer at each
+    spelling, a variant shelf held only at the other spelling, and another market's offer at the row's spelling."""
+    await _product(admin, K_ALIAS, ALIAS_APEX, ALIAS_APEX + ".jpg")
+    await _offer(admin, "o_al_apex", K_ALIAS, ALIAS_APEX)
+    await _offer(admin, "o_al_www", K_ALIAS, ALIAS_WWW, metadata={"reconcile_batch_id": "rb_2"})
+    await _offer(admin, "o_al_sg", K_ALIAS, ALIAS_APEX, market="SG")
+    for offer_id, url, sku in (("o_al_v_apex", ALIAS_APEX, "::v:1"), ("o_al_v_www", ALIAS_WWW, "::v:1"),
+                               ("o_al_v2_www", ALIAS_WWW, "::v:2")):
+        await _offer(admin, offer_id, K_ALIAS, url)
+        await admin.execute("UPDATE catalog_offers SET sku_key = $2 WHERE offer_id = $1", offer_id, K_ALIAS + sku)
+    await _seed(admin, "s_al_www", K_ALIAS, ALIAS_WWW)
+
+
+async def test_a_host_alias_keeps_the_row_s_spelling_and_reverts_exactly(catalog):
+    db, admin, tool, refreshed = catalog
+    await _alias_rows(admin)
+    before = await _state(admin)
+    p = await tool.plan(db, hosts=[], keys=[K_ALIAS])
+    [g] = p["groups"]
+    assert (g["kind"], g["keeper"], g["suppress"], g["alias_kept_alone"]) == (
+        "host_alias", "store.example", ["o_al_v_www", "o_al_www"], ["o_al_v2_www"])
+    assert await _state(admin) == before  # the plan writes nothing
+    out = await tool.apply(db, p)
+    offers, seeds, rows = await _state(admin)
+    for offer_id in ("o_al_www", "o_al_v_www"):
+        assert offers[offer_id][0] is not None and offers[offer_id][1] == "listing_host_alias"
+        assert offers[offer_id][2]["same_listing_run"] == out["run_id"]
+    assert offers["o_al_www"][2]["reconcile_batch_id"] == "rb_2"
+    for offer_id in ("o_al_apex", "o_al_v_apex", "o_al_v2_www", "o_al_sg"):
+        assert offers[offer_id][0] is None
+    assert seeds == before[1] and rows == before[2]
+    assert refreshed == [(out["run_id"], [ck(K_ALIAS)])]
+    await tool.revert(db, out["run_id"])
+    assert await _state(admin) == before
+
+
+async def test_only_host_alias_leaves_the_same_title_groups_alone(catalog):
+    db, admin, tool, _ = catalog
+    await _alias_rows(admin)
+    p = await tool.plan(db, hosts=[], keys=[], only_host_alias=True)
+    assert [g["product_key"] for g in p["groups"]] == [K_ALIAS]
+    assert {g["product_key"] for g in (await tool.plan(db, hosts=[], keys=[]))["groups"]} > {K_ALIAS, K_BC}
+
+
+async def test_a_base_with_a_live_sibling_waits_for_the_sibling_market_then_every_alias_goes(catalog):
+    """Controller review of #2596: suppressing a base strands its live Shopify Markets sibling, suppressing a sibling
+    strands nothing. AU's siblings of the US base offers (same SKU, the base's source_ref) run first; then US."""
+    from services.retailer_ingest.shopify_markets import sibling_offer_id
+
+    db, admin, tool, _ = catalog
+    await _alias_rows(admin)
+    au_www, au_apex = sibling_offer_id("o_al_www", "AU"), sibling_offer_id("o_al_apex", "AU")
+    await _offer(admin, au_www, K_ALIAS, ALIAS_WWW, market="AU")
+    await _offer(admin, au_apex, K_ALIAS, ALIAS_APEX, market="AU")
+    [us] = (await tool.plan(db, hosts=[], keys=[K_ALIAS]))["groups"]
+    assert us["skipped"] == "sibling_market_alias_live" and us["stranded_siblings"] == [au_www]
+    with pytest.raises(SystemExit, match="nothing to repair"):
+        await tool.apply(db, await tool.plan(db, hosts=[], keys=[K_ALIAS]))
+    au = await tool.plan(db, hosts=[], keys=[K_ALIAS], market="AU")
+    assert [(g["skipped"], g["suppress"]) for g in au["groups"]] == [(None, [au_www])]
+    await tool.apply(db, au)
+    us = await tool.plan(db, hosts=[], keys=[K_ALIAS])
+    assert [(g["skipped"], g["suppress"]) for g in us["groups"]] == [(None, ["o_al_v_www", "o_al_www"])]
+    await tool.apply(db, us)
+    live = {r["offer_id"] for r in await admin.fetch(
+        "SELECT offer_id FROM catalog_offers WHERE product_key = $1 AND suppressed_at IS NULL", K_ALIAS)}
+    assert live == {"o_al_apex", "o_al_v_apex", "o_al_v2_www", "o_al_sg", au_apex}
