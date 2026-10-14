@@ -2086,18 +2086,10 @@ async def _derive_seed_seller_columns(
     )
 
 
-async def _upsert_storefront_referral_seed_candidate(
-    candidate: Dict[str, Any],
-    *,
-    employee_id: Optional[str],
-) -> Dict[str, Any]:
-    attached_product_key = str(candidate.get("attached_product_key") or "").strip()
-    storefront_url = str(candidate.get("storefront_url") or "").strip()
-    external_product_id = str(candidate.get("external_product_id") or "").strip()
-    market = _declared_seed_market(candidate.get("market"))
-    tool = "*"
-
-    existing_row = await database.fetch_one(
+async def _existing_storefront_referral_seed(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The active seed a storefront backfill candidate would update, matched by product key or URL in
+    ANY market partition; None when the backfill would create one."""
+    row = await database.fetch_one(
         """
         SELECT *
         FROM external_product_seeds
@@ -2112,11 +2104,26 @@ async def _upsert_storefront_referral_seed_candidate(
         LIMIT 1
         """,
         {
-            "attached_product_key": attached_product_key,
-            "external_product_id": external_product_id,
-            "canonical_url": storefront_url,
+            "attached_product_key": str(candidate.get("attached_product_key") or "").strip(),
+            "external_product_id": str(candidate.get("external_product_id") or "").strip(),
+            "canonical_url": str(candidate.get("storefront_url") or "").strip(),
         },
     )
+    return dict(row) if row else None
+
+
+async def _upsert_storefront_referral_seed_candidate(
+    candidate: Dict[str, Any],
+    *,
+    employee_id: Optional[str],
+) -> Dict[str, Any]:
+    attached_product_key = str(candidate.get("attached_product_key") or "").strip()
+    storefront_url = str(candidate.get("storefront_url") or "").strip()
+    external_product_id = str(candidate.get("external_product_id") or "").strip()
+    market = _declared_seed_market(candidate.get("market"))
+    tool = "*"
+
+    existing_row = await _existing_storefront_referral_seed(candidate)
 
     seed_data = {
         "external_product_id": external_product_id,
@@ -2565,6 +2572,9 @@ async def _import_external_seeds_csv_text(
         # Example: Tom Ford export CSV.
         groups: Dict[str, Dict[str, Any]] = {}
         group_meta: Dict[str, Dict[str, Any]] = {}
+        # Products with a variant row whose market was refused: the whole product is held, since
+        # importing only the rows that did declare a market would file it with variants missing.
+        market_refused_product_urls: set[str] = set()
 
         for idx, row in enumerate(reader, start=2):
             try:
@@ -2575,7 +2585,11 @@ async def _import_external_seeds_csv_text(
                     raise ValueError("MISSING_PRODUCT_URL")
                 product_url = _normalize_seed_url_for_id(_require_http_url(product_url_raw))
 
-                row_market = _declared_seed_market(nrow.get("market") or default_market)
+                row_market_refusal = _seed_market_refusal(nrow.get("market") or default_market)
+                if row_market_refusal is not None:
+                    market_refused_product_urls.add(product_url)
+                    raise ValueError(row_market_refusal)
+                row_market = market_registry.normalize_market(nrow.get("market") or default_market)
                 row_tool = _normalize_tool(nrow.get("tool") or default_tool)
 
                 product_title = str(nrow.get("product_title") or nrow.get("title") or "").strip() or None
@@ -2694,6 +2708,8 @@ async def _import_external_seeds_csv_text(
 
                 if not external_product_id or not dest:
                     raise ValueError("INVALID_GROUP")
+                if dest in market_refused_product_urls:
+                    raise ValueError(f"VARIANT_ROW_MARKET_REFUSED:{dest}")
 
                 # Deduplicate + sort variants so primary price is stable (min price first).
                 seen_variant_ids: set[str] = set()
@@ -3645,6 +3661,22 @@ async def backfill_storefront_external_seeds(
     )
     candidates = list(candidate_bundle.get("candidates") or [])
     if body.dry_run:
+        preview_items: List[Dict[str, Any]] = []
+        for candidate in candidates[:20]:
+            existing = await _existing_storefront_referral_seed(candidate)
+            preview_items.append(
+                {
+                    "action": "preview",
+                    # An existing seed keeps the market it is filed under (the real run never
+                    # re-files it); only a new one takes the declared market.
+                    "market": str(existing.get("market") or "") if existing else market,
+                    "existing_seed_id": existing.get("id") if existing else None,
+                    "attached_product_key": candidate.get("attached_product_key"),
+                    "canonical_url": candidate.get("storefront_url"),
+                    "title": candidate.get("title"),
+                    "external_product_id": candidate.get("external_product_id"),
+                }
+            )
         return {
             "status": "success",
             "merchant_id": merchant_id,
@@ -3656,16 +3688,7 @@ async def backfill_storefront_external_seeds(
             "created": 0,
             "updated": 0,
             "skipped": 0,
-            "items": [
-                {
-                    "action": "preview",
-                    "attached_product_key": candidate.get("attached_product_key"),
-                    "canonical_url": candidate.get("storefront_url"),
-                    "title": candidate.get("title"),
-                    "external_product_id": candidate.get("external_product_id"),
-                }
-                for candidate in candidates[:20]
-            ],
+            "items": preview_items,
         }
 
     employee_id = _employee_id_from_user(current_user)
@@ -4589,7 +4612,9 @@ async def update_external_seed(
         updates["external_product_id"] = external_product_id
         set_clauses.append("external_product_id = :external_product_id")
 
-    if body.market is not None:
+    # Only a market CHANGE is guarded: the editors send the stored market back with every save, and
+    # a seed already filed under a market the guard refuses (pre-registry rows) must stay editable.
+    if body.market is not None and market_registry.normalize_market(body.market) != market_registry.normalize_market(row.get("market")):
         updates["market"] = _declared_seed_market(body.market)
         set_clauses.append("market = :market")
     if body.tool is not None:

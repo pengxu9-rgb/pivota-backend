@@ -88,7 +88,9 @@ class _StorefrontDb:
 
     async def fetch_one(self, query, values=None):
         assert "external_product_seeds" in query
-        return self.existing
+        if self.existing and values.get("attached_product_key") == self.existing["attached_product_key"]:
+            return self.existing
+        return None
 
     async def execute_seed(self, query, values):
         self.writes.append({"sql": query, **values})
@@ -158,14 +160,21 @@ def test_a_storefront_backfill_files_new_seeds_under_the_declared_market_whateve
     assert {item["market"] for item in payload["items"]} == {"AU"}
 
 
-def test_a_storefront_backfill_dry_run_reports_the_declared_market(monkeypatch, client):
-    db = _StorefrontDb([_cache_row("1", "SGD")])
+def test_a_storefront_backfill_dry_run_reports_the_market_each_seed_will_have(monkeypatch, client):
+    existing = {"id": "eps_old", "market": "JP", "attached_product_key": f"{MERCHANT}|shopify|1", "seed_data": {}}
+    db = _StorefrontDb([_cache_row("1", "SGD"), _cache_row("2", "SGD")], existing=existing)
     _install_storefront(monkeypatch, db)
 
     res = _backfill(client, market="US", dry_run=True)
 
     assert res.status_code == 200, res.text
-    assert res.json()["market"] == "US", "not SG off the SGD price"
+    payload = res.json()
+    assert payload["market"] == "US", "not SG off the SGD price"
+    by_key = {item["attached_product_key"]: item for item in payload["items"]}
+    assert (by_key[f"{MERCHANT}|shopify|1"]["market"], by_key[f"{MERCHANT}|shopify|1"]["existing_seed_id"]) == ("JP", "eps_old"), (
+        "an existing seed keeps its market, as the real run does"
+    )
+    assert (by_key[f"{MERCHANT}|shopify|2"]["market"], by_key[f"{MERCHANT}|shopify|2"]["existing_seed_id"]) == ("US", None)
     assert db.writes == []
 
 
@@ -254,11 +263,7 @@ def test_creating_a_seed_files_it_under_the_declared_market(monkeypatch, client)
 # ----------------------------------------------------------------- edit
 
 
-@pytest.mark.parametrize(
-    "market,detail",
-    [("", "MARKET_REQUIRED"), ("EU-DE", "UNKNOWN_MARKET:EU-DE"), ("FR", "MARKET_NOT_INGESTED:FR")],
-)
-def test_editing_a_seed_into_a_missing_or_unknown_market_is_refused(monkeypatch, client, market, detail):
+def _install_edit(monkeypatch, stored_market: str) -> List[Dict[str, Any]]:
     import routes.employee_products as ep
 
     writes: List[Dict[str, Any]] = []
@@ -266,16 +271,50 @@ def test_editing_a_seed_into_a_missing_or_unknown_market_is_refused(monkeypatch,
     async def execute_seed(query, values):
         writes.append({"sql": query, **values})
 
-    row = {"id": "eps_1", "market": "US", "tool": "*", "canonical_url": f"https://{DOMAIN}/p", "seed_data": {}}
+    row = {"id": "eps_1", "market": stored_market, "tool": "*", "canonical_url": f"https://{DOMAIN}/p", "seed_data": {}}
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=row))
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
+    return writes
+
+
+@pytest.mark.parametrize(
+    "market,detail",
+    [("", "MARKET_REQUIRED"), ("EU-DE", "UNKNOWN_MARKET:EU-DE"), ("FR", "MARKET_NOT_INGESTED:FR")],
+)
+def test_editing_a_seed_into_a_missing_or_unknown_market_is_refused(monkeypatch, client, market, detail):
+    writes = _install_edit(monkeypatch, "US")
 
     res = client.patch("/employee/products/external-seeds/eps_1", json={"market": market})
 
     assert res.status_code == 400, res.text
     assert res.json()["detail"] == detail
     assert writes == []
+
+
+@pytest.mark.parametrize("stored,sent", [("EU-DE", "EU-DE"), ("EU-DE", " eu-de "), ("GB", "GB"), ("KR", "KR")])
+def test_a_seed_already_filed_under_a_refused_market_stays_editable(monkeypatch, client, stored, sent):
+    # The editors send the stored market back with every save; a title fix or a disable must not 400.
+    writes = _install_edit(monkeypatch, stored)
+
+    res = client.patch(
+        "/employee/products/external-seeds/eps_1", json={"market": sent, "title": "Fixed", "status": "disabled"}
+    )
+
+    assert res.status_code == 200, res.text
+    (update,) = writes
+    assert "market" not in update and "market =" not in update["sql"], "the stored market is left as it is"
+    assert (update["title"], update["status"]) == ("Fixed", "disabled")
+
+
+def test_editing_a_seed_into_an_ingest_market_files_it_there(monkeypatch, client):
+    writes = _install_edit(monkeypatch, "EU-DE")
+
+    res = client.patch("/employee/products/external-seeds/eps_1", json={"market": "sg"})
+
+    assert res.status_code == 200, res.text
+    (update,) = writes
+    assert update["market"] == "SG" and "market = :market" in update["sql"]
 
 
 # ----------------------------------------------------------------- CSV import (both sheet shapes)
@@ -374,3 +413,23 @@ def test_a_csv_catalog_sheet_files_its_rows_under_their_declared_market(monkeypa
     assert res.json()["errors"] == []
     (insert,) = writes
     assert insert["market"] == "AU"
+
+
+def test_a_csv_catalog_product_with_a_refused_variant_row_is_held_whole(monkeypatch, client):
+    # Two variant rows of one product, one declaring US and one declaring nothing (no sheet market):
+    # importing the US row alone would file the product with a variant silently missing.
+    writes = _install_csv(monkeypatch)
+    sheet = (
+        _CATALOG
+        + f"https://{DOMAIN}/p/1,US,SKU1,30,USD,Serum\n"
+        + f"https://{DOMAIN}/p/1,,SKU2,30,USD,Serum\n"
+        + f"https://{DOMAIN}/p/2,US,SKU3,30,USD,Cream\n"
+    )
+
+    res = _import(client, sheet)
+
+    assert res.status_code == 200, res.text
+    errors = res.json()["errors"]
+    assert any(e.startswith("Row 3:") and e.endswith("MARKET_REQUIRED") for e in errors), errors
+    assert any(e.endswith(f"VARIANT_ROW_MARKET_REFUSED:https://{DOMAIN}/p/1") for e in errors), errors
+    assert [w["destination_url"] for w in writes] == [f"https://{DOMAIN}/p/2"], "only the whole product imports"

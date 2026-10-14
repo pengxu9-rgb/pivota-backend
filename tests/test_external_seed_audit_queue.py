@@ -263,6 +263,7 @@ def test_backfill_storefront_external_seeds_dry_run(
 
     monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(employee_products_module, "_fetch_storefront_referral_seed_candidates", fake_candidates)
+    monkeypatch.setattr(employee_products_module.database, "fetch_one", AsyncMock(return_value=None))
 
     res = client.post(
         "/employee/products/external-seeds/backfill-storefront",
