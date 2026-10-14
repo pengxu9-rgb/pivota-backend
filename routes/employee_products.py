@@ -37,6 +37,7 @@ from services import external_seed_destination_liveness as destination_liveness
 from services import market_registry
 from services import seed_served_url
 from services.external_offers_service import (
+    IMAGE_URLS_SCOPE_DECLARED,
     ExternalOfferUnavailable,
     resolve_external_offer,
     seed_variants_from_evidence,
@@ -979,6 +980,50 @@ def _seed_variant_description_map(variants: List[Dict[str, Any]]) -> Dict[str, s
         description = str(variant.get("description") or "").strip()
         if variant_id and description:
             out[variant_id] = description
+    return out
+
+
+# `description_source` values (see services.external_offers_service._extract_from_html) whose text
+# the refresh never stores as a seed's description: og/meta description tags are SEO copy.
+_REFUSED_DESCRIPTION_SOURCES = frozenset({"meta"})
+
+# Who wrote `seed_data.image_urls`. The refresh stamps a gallery it writes as a page read; a
+# gallery any other writer stamped (e.g. the drain's "storefront_products_json") is never replaced
+# by a page read. Unstamped galleries (written before the stamp) follow the page-read rule.
+SEED_IMAGE_URLS_SOURCE_KEY = "image_urls_source"
+SEED_IMAGE_URLS_SOURCE_PAGE_READ = "page_read"
+
+
+def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
+    """The gallery and description a page read may give a seed, by where they came from.
+
+    - `image_urls` is the read's gallery only when the snapshot marks it as the images the page
+      DECLARES as the product's (`image_urls_scope`). A snapshot written before the extractor
+      split them holds every image the page rendered -- nav tiles, banners, Instagram posts --
+      and gives no gallery; `gallery_declared` says which.
+    - `description` is None when the text came from og/meta description tags (SEO copy);
+      `description_refused_source` then names that source.
+    One function for the refresh, seed creation and the creation preview, so all three store
+    (or show) the same thing."""
+    out: Dict[str, Any] = {
+        "image_urls": [],
+        "gallery_declared": False,
+        "description": None,
+        "description_refused_source": None,
+    }
+    if not isinstance(evidence, dict):
+        return out
+    out["gallery_declared"] = evidence.get("image_urls_scope") == IMAGE_URLS_SCOPE_DECLARED
+    raw_images = evidence.get("image_urls") or evidence.get("imageUrls") or evidence.get("images")
+    if out["gallery_declared"] and isinstance(raw_images, list):
+        cleaned = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
+        out["image_urls"] = _dedupe_seed_image_urls(cleaned, limit=20)
+    raw_desc = evidence.get("description")
+    if isinstance(raw_desc, str) and raw_desc.strip():
+        if evidence.get("description_source") in _REFUSED_DESCRIPTION_SOURCES:
+            out["description_refused_source"] = str(evidence.get("description_source"))
+        else:
+            out["description"] = raw_desc.strip()
     return out
 
 
@@ -3278,12 +3323,9 @@ async def preview_external_seed(
         raw_variants = evidence.get("variants")
         if isinstance(raw_variants, list):
             variants = raw_variants
-        raw_images = evidence.get("image_urls") or evidence.get("images")
-        if isinstance(raw_images, list):
-            image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
-        raw_desc = evidence.get("description")
-        if isinstance(raw_desc, str) and raw_desc.strip():
-            description = raw_desc.strip()
+        content = _snapshot_evidence_content(evidence)
+        image_urls = content["image_urls"]
+        description = content["description"]
 
     return {
         "status": "success",
@@ -4041,13 +4083,9 @@ async def create_external_seed(
     snap_variants: Optional[List[Dict[str, Any]]] = None
     evidence = getattr(snapshot, "evidence", None) if snapshot else None
     if isinstance(evidence, dict):
-        raw_images = evidence.get("image_urls") or evidence.get("imageUrls") or evidence.get("images")
-        if isinstance(raw_images, list):
-            snap_image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
-            snap_image_urls = _dedupe_seed_image_urls(snap_image_urls, limit=20)
-        raw_desc = evidence.get("description")
-        if isinstance(raw_desc, str) and raw_desc.strip():
-            snap_description = raw_desc.strip()
+        content = _snapshot_evidence_content(evidence)
+        snap_image_urls = content["image_urls"]
+        snap_description = content["description"]
         snap_variants = seed_variants_from_evidence(evidence)
 
     match_url = canonical_url or dest
@@ -5396,19 +5434,20 @@ async def _refresh_external_seed_by_id(
     snap_price_currency = getattr(snapshot, "price_currency", None) if snapshot else None
     snap_availability = getattr(snapshot, "availability", None) if snapshot else None
 
-    snap_image_urls: list[str] = []
-    snap_description: Optional[str] = None
     snap_variants: Optional[List[Dict[str, Any]]] = None
     snap_variant_census: Optional[Dict[str, Any]] = None
+    # Gallery and copy by where they came from (`_snapshot_evidence_content`). An undeclared
+    # gallery (a snapshot from before the extractor split them) leaves the stored one as is; an
+    # og/meta description is refused, because the gateway serves `snapshot.description` AHEAD of
+    # the seed's own description and that hid the real copy (us.laneige.com Lip Sleeping Mask,
+    # 2026-10-14).
     evidence = getattr(snapshot, "evidence", None)
+    content = _snapshot_evidence_content(evidence)
+    gallery_declared = content["gallery_declared"]
+    snap_image_urls = content["image_urls"]
+    snap_description = content["description"]
+    description_refused_source = content["description_refused_source"]
     if isinstance(evidence, dict):
-        raw_images = evidence.get("image_urls") or evidence.get("images")
-        if isinstance(raw_images, list):
-            snap_image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
-            snap_image_urls = _dedupe_seed_image_urls(snap_image_urls, limit=20)
-        raw_desc = evidence.get("description")
-        if isinstance(raw_desc, str) and raw_desc.strip():
-            snap_description = raw_desc.strip()
         raw_variants = evidence.get("variants")
         if isinstance(raw_variants, list) and raw_variants:
             snap_variants = [v for v in raw_variants if isinstance(v, dict)]
@@ -5451,7 +5490,6 @@ async def _refresh_external_seed_by_id(
             "title": snap_title,
             "description": snap_description,
             "image_url": snap_image_url,
-            "image_urls": snap_image_urls,
             "price_amount": snap_price_amount,
             "price_currency": snap_price_currency,
             "availability": snap_availability,
@@ -5464,6 +5502,13 @@ async def _refresh_external_seed_by_id(
             or _to_iso(datetime.now(timezone.utc)),
         }
     )
+    # A gallery is replaced only by a declared one; an undeclared read leaves the stored one as is.
+    if gallery_declared:
+        seed_data["snapshot"]["image_urls"] = snap_image_urls
+    if description_refused_source:
+        seed_data["snapshot"]["description_refused_source"] = description_refused_source
+    else:
+        seed_data["snapshot"].pop("description_refused_source", None)
     # Only overwrite curated fields if they are missing.
     if _should_replace_localized_copy(
         existing_text=seed_data.get("description"),
@@ -5480,8 +5525,13 @@ async def _refresh_external_seed_by_id(
             seed_data["description"] = snap_description
     if not seed_data.get("image_url"):
         seed_data["image_url"] = snap_image_url
-    if snap_image_urls:
+    # Declared only (`_snapshot_evidence_content` gives an undeclared read none), and never over a
+    # gallery another writer stamped: a storefront's own structured gallery (the drain's
+    # products.json `images[]`) is the product's, and a page read's one or two declared images
+    # would replace it.
+    if snap_image_urls and seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) in (None, SEED_IMAGE_URLS_SOURCE_PAGE_READ):
         seed_data["image_urls"] = snap_image_urls
+        seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
     if adoptable_variants:
