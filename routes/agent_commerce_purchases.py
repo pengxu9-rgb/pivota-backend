@@ -277,10 +277,7 @@ async def create_purchase(
         merchant_host = reap_routes._identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower()
         merchant_domain = reap_routes._merchant_domain_key(merchant_host)
         product_key = reap_routes._identifier(req.product_key, "product_key", max_chars=1024)
-        variant_key = (
-            reap_routes._identifier(req.variant_key, "variant_key", max_chars=1024)
-            if str(req.variant_key or "").strip() else None
-        )
+        variant_key, hashed_variant = reap_routes._variant_selector(req)
         market_country = purchasability.normalize_market(req.buyer.shipping_address.country)
         if market_country is None:
             raise reap_svc.PurchaseRefused("invalid_address", "country must be two letters")
@@ -293,7 +290,7 @@ async def create_purchase(
         buyer_email = str(req.buyer.email or "").strip()
         return_url = str(req.return_url or "").strip() or reap_routes._default_return_url()
         request_hash = reap_routes._request_hash(
-            merchant_domain=merchant_domain, product_key=product_key, variant_key=variant_key,
+            merchant_domain=merchant_domain, product_key=product_key, variant_key=hashed_variant,
             quantity=int(req.quantity), email=buyer_email, shipping_address=shipping_address,
             return_url=return_url, item_source=req.item_source, offer_code=offer_code,
             expected_unit_price_minor=req.expected_unit_price_minor, expected_currency=req.expected_currency,
@@ -361,6 +358,11 @@ async def _open_a2a_purchase(
     # The cart link must be one the storefront honours for this market (the daily Tier B verdict).
     if not await tierb_eligibility.is_cart_link_eligible(merchant_host, market_country):
         raise reap_svc.PurchaseRefused("merchant_not_eligible")
+    if req.variant_id is not None:
+        # The buyer's storefront variant, resolved to the catalog's own sku (never a door's spelling).
+        variant_key = await reap_routes._resolve_selected_variant_key(
+            merchant_domain=merchant_host, product_key=product_key,
+            variant_id=req.variant_id, market_country=market_country)
     facts, seller_ref, variant_id, seed_kind = await reap_routes._load_cart_link_item(
         merchant_domain=merchant_host, product_key=product_key, variant_key=variant_key, market_country=market_country)
     unit_minor, currency = facts["our_price_minor"], facts["currency"]

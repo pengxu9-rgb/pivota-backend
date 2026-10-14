@@ -315,6 +315,31 @@ async def test_a_conflict_never_names_another_owners_purchase_or_a_marker(client
     assert "purchase_id" not in resp.text
 
 
+async def test_a_selected_variant_id_opens_on_the_catalogs_own_sku_and_is_fingerprinted_as_sent(client, stubs, monkeypatch):
+    resolved = []
+
+    async def _resolve(*, merchant_domain, product_key, variant_id, market_country):
+        resolved.append((merchant_domain, product_key, variant_id, market_country))
+        return f"{product_key}::sku_catalogs_own"
+
+    monkeypatch.setattr(reap_routes, "_resolve_selected_variant_key", _resolve)
+    resp = await client.post(BASE, body(variant_id=VARIANT))
+    assert resp.status_code == 202 and resp.json()["rail"] == "a2a", resp.text
+    assert resolved == [(SHOP, "pk_1", VARIANT, "US")]
+    assert [c[2] for c in stubs.catalog] == ["pk_1::sku_catalogs_own"]  # loaded by the RESOLVED key
+    again = await client.post(BASE, body(variant_id=VARIANT))
+    assert again.json()["purchase_id"] == resp.json()["purchase_id"] and len(resolved) == 1  # a replay resolves nothing
+    # The fingerprint is what was sent: the same key with the resolved sku SPELLED out is another body.
+    spelled = await client.post(BASE, body(variant_key="pk_1::sku_catalogs_own"))
+    assert spelled.status_code == 409 and "idempotency_conflict" in spelled.text
+
+
+async def test_a_variant_id_beside_a_variant_key_is_refused_before_any_read(client, stubs):
+    resp = await client.post(BASE, body(variant_id=VARIANT, variant_key="pk_1::sku_x"))
+    assert resp.status_code == 400 and "invalid_request" in resp.text
+    assert stubs.catalog == [] and await _count("a2a_rail_purchases") == 0
+
+
 async def test_a_key_that_opened_a_reap_purchase_is_replayed_by_the_reap_route(client, stubs):
     req = unified_routes.CreatePurchaseRequest.model_validate(body())
     request_hash = reap_routes._request_hash(

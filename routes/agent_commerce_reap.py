@@ -504,6 +504,12 @@ class StartPurchaseRequest(BaseModel):
     merchant_domain: str = Field(..., min_length=1, max_length=255)
     product_key: str = Field(..., min_length=1)
     variant_key: Optional[str] = None
+    #: CART-LINK ONLY, and never with `variant_key`: the buyer's chosen variant as the storefront
+    #: numbers it (get_product's `variants[].variant_id`). The route resolves it to the catalog's own
+    #: sku (`_resolve_selected_variant_key`); a door must not spell a sku key itself, because the
+    #: catalog spells one variant several ways (`::sku_<hash>`, `::v:<n>`, `::v::<n>`, a
+    #: seller-scoped `::v:retailer-<hash>`), and a guessed key that is not there is `row_not_found`.
+    variant_id: Optional[StrictStr] = Field(None, pattern=r"^[1-9][0-9]{0,19}$")
     quantity: StrictInt = Field(1, ge=1, le=svc.MAX_QUANTITY)
     buyer: ReapBuyer
     return_url: Optional[str] = None
@@ -539,6 +545,12 @@ class StartPurchaseRequest(BaseModel):
         present = names & self.model_fields_set
         if present and (present != names or self.expected_unit_price_minor is None or self.expected_currency is None):
             raise ValueError("expected money must be a nonnull pair")
+        return self
+
+    @model_validator(mode="after")
+    def one_variant_selector(self):
+        if self.variant_id is not None and (str(self.variant_key or "").strip() or self.item_source != "cart_link"):
+            raise ValueError("variant_id is a cart-link selector, never beside variant_key")
         return self
 
 
@@ -2060,6 +2072,68 @@ def _default_return_url() -> str:
     return f"https://{hosts[0]}/reap/return"
 
 
+#: The fingerprint's spelling of a `variant_id` selector. A sku key always starts with its product key
+#: (`prod::…`), so no `variant_key` can collide with it.
+_VARIANT_ID_HASH_PREFIX = "variant_id:"
+
+
+def _variant_selector(req: "StartPurchaseRequest") -> Tuple[Optional[str], Optional[str]]:
+    """`(variant_key, fingerprint_variant)` from a create-shaped body: the caller's `variant_key` (both
+    the same), or for a `variant_id` no key yet and `variant_id:<n>` in the fingerprint. THE ONE RULE
+    for every door that fingerprints a body (create on either route, resume, recover): the fingerprint
+    holds what the caller SENT, never a key resolved from today's catalog, so a retry hashes the same."""
+    if req.variant_id is not None:
+        return None, _VARIANT_ID_HASH_PREFIX + req.variant_id
+    key = _identifier(req.variant_key, "variant_key", max_chars=1024) if str(req.variant_key or "").strip() else None
+    return key, key
+
+
+async def _resolve_selected_variant_key(
+    *, merchant_domain: str, product_key: str, variant_id: str, market_country: str,
+) -> str:
+    """The catalog's own sku for a buyer-selected storefront variant (a `variant_id` selector).
+
+    The live, non-placeholder skus of the product whose `source_variant_id` names that numeric
+    variant (`_cart_numeric_variant`, the cart-link lane's one reader). None: `row_variant_unverified`,
+    as `/purchases/prepare` answers. One: that sku. SEVERAL (one variant spelled by two writers, e.g.
+    `::sku_<hash>` and `::v:<n>`): the no-key path's pricing rule, per spelling -- each is loaded as a
+    named sku; a spelling this seller has no usable offer on (`row_unpriced`) is passed over, any other
+    refusal stands, the priced ones must agree (`row_price_ambiguous`), and the lowest sku_key wins.
+    Reads only; the caller loads the returned key again, as it would a caller-named one.
+    """
+    skus = [dict(row) for row in await database.fetch_all(_CART_PRODUCT_SKUS_SQL, {"product_key": product_key})]
+    if len(skus) > _CART_MAX_SKUS:
+        raise svc.PurchaseRefused("row_variant_ambiguous", "too many skus to select a variant from")
+    matches = sorted(
+        (sku for sku in skus
+         if not _is_placeholder_sku(sku, product_key)
+         and _cart_numeric_variant(sku.get("source_variant_id"), product_key) == variant_id),
+        key=lambda sku: str(sku["sku_key"]),
+    )
+    if not matches:
+        raise svc.PurchaseRefused("row_variant_unverified", "no live sku names the selected variant")
+    if len(matches) == 1:
+        return str(matches[0]["sku_key"])
+    priced: List[Tuple[str, int, str]] = []
+    unpriced: Optional[svc.PurchaseRefused] = None
+    for sku in matches:
+        try:
+            facts, _seller, _variant, _kind = await _load_cart_link_item(
+                merchant_domain=merchant_domain, product_key=product_key,
+                variant_key=str(sku["sku_key"]), market_country=market_country)
+        except svc.PurchaseRefused as exc:
+            if exc.reason != "row_unpriced":
+                raise
+            unpriced = unpriced or exc
+            continue
+        priced.append((str(sku["sku_key"]), facts["our_price_minor"], facts["currency"]))
+    if not priced:
+        raise unpriced  # type: ignore[misc] - every spelling was refused row_unpriced
+    if len({(minor, cur) for _key, minor, cur in priced}) > 1:
+        raise svc.PurchaseRefused("row_price_ambiguous", "the spellings of this variant carry different prices")
+    return priced[0][0]
+
+
 def _request_hash(
     *,
     merchant_domain: str,
@@ -2846,11 +2920,9 @@ async def start_reap_purchase(
         # before any read.
         merchant_domain = _merchant_domain_key(merchant_host)
         product_key = _identifier(req.product_key, "product_key", max_chars=1024)
-        variant_key = (
-            _identifier(req.variant_key, "variant_key", max_chars=1024)
-            if str(req.variant_key or "").strip()
-            else None
-        )
+        # A `variant_id` selector is resolved to the catalog's sku below, after the replay lookup;
+        # the fingerprint keeps what was sent.
+        variant_key, hashed_variant = _variant_selector(req)
         # THE ONE MARKET RULE (`utils.market_code.iso2_market`, bound as the fact store's
         # `normalize_market`): the same function the purchasability fact is keyed with, so the
         # rail can never ask the gate about a market the fact store would have spelled differently.
@@ -2877,7 +2949,7 @@ async def start_reap_purchase(
         request_hash = _request_hash(
             merchant_domain=merchant_domain,
             product_key=product_key,
-            variant_key=variant_key,
+            variant_key=hashed_variant,
             quantity=int(req.quantity),
             email=buyer_email,
             shipping_address=shipping_address,
@@ -3011,6 +3083,10 @@ async def start_reap_purchase(
                 merchant_host, market_country
             ):
                 raise svc.PurchaseRefused("merchant_not_eligible")
+            if req.variant_id is not None:
+                variant_key = await _resolve_selected_variant_key(
+                    merchant_domain=merchant_host, product_key=product_key,
+                    variant_id=req.variant_id, market_country=market_country)
             cart_facts, cart_seller, cart_variant, cart_seed_kind = await _load_cart_link_item(
                 merchant_domain=merchant_host,
                 product_key=product_key,
@@ -3188,6 +3264,9 @@ async def _validate_resume_selection(req, row, merchant, host, product, variant,
         await _refuse_if_merchant_disabled(merchant_domain=merchant, market_country=market)
         if not await tierb_eligibility.is_cart_link_eligible(host, market):
             raise svc.PurchaseRefused("merchant_not_eligible")
+        if req.variant_id is not None:
+            variant = await _resolve_selected_variant_key(
+                merchant_domain=host, product_key=product, variant_id=req.variant_id, market_country=market)
         facts, _, selected_variant, _ = await _load_cart_link_item(
             merchant_domain=host, product_key=product, variant_key=variant, market_country=market)
         selected_key = "shopify:" + str(selected_variant)
@@ -3239,12 +3318,12 @@ async def resume_reap_purchase(purchase_id: str, request: Request,
         host = _identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower()
         merchant = _merchant_domain_key(host)
         product = _identifier(req.product_key, "product_key", max_chars=1024)
-        variant = _identifier(req.variant_key, "variant_key", max_chars=1024) if str(req.variant_key or "").strip() else None
+        variant, hashed_variant = _variant_selector(req)
         consent = _consent_version(req.buyer.consent_version)
         offer = _offer_code(req.offer_code)
         address = _buyer_address_for_client(req.buyer)
         email = str(req.buyer.email or "").strip()
-        request_hash = _request_hash(merchant_domain=merchant, product_key=product, variant_key=variant,
+        request_hash = _request_hash(merchant_domain=merchant, product_key=product, variant_key=hashed_variant,
             quantity=int(req.quantity), email=email, shipping_address=address,
             return_url=str(req.return_url or "").strip() or _default_return_url(), item_source=req.item_source,
             offer_code=offer, expected_unit_price_minor=req.expected_unit_price_minor, expected_currency=req.expected_currency)
@@ -3315,10 +3394,10 @@ async def recover_reap_purchase(
         key = _identifier(req.idempotency_key, "idempotency_key", max_chars=128)
         merchant = _merchant_domain_key(_identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower())
         product = _identifier(req.product_key, "product_key", max_chars=1024)
-        variant = _identifier(req.variant_key, "variant_key", max_chars=1024) if str(req.variant_key or "").strip() else None
+        _variant, hashed_variant = _variant_selector(req)
         _consent_version(req.buyer.consent_version)  # Validation only; preserve stored consent.
         request_hash = _request_hash(
-            merchant_domain=merchant, product_key=product, variant_key=variant,
+            merchant_domain=merchant, product_key=product, variant_key=hashed_variant,
             quantity=int(req.quantity), email=str(req.buyer.email or "").strip(),
             shipping_address=_buyer_address_for_client(req.buyer),
             return_url=str(req.return_url or "").strip() or _default_return_url(),
