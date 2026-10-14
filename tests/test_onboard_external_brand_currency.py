@@ -7,6 +7,7 @@ covered through the script's entry point in test_onboard_external_brand_declared
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -70,16 +71,19 @@ async def test_upsert_seed_refuses_an_undeclared_or_uningested_market(fake_db, m
     assert fake_db.calls == []
 
 
-async def test_upsert_seed_normalizes_market_and_keeps_usd_currency_default(fake_db):
+async def test_upsert_seed_normalizes_market_and_currency(fake_db):
     await onboard._upsert_seed({
         "external_product_id": "x1",
         "title": "Some US Product",
         "price_amount": 24.99,
         "market": " us ",
+        "price_currency": " usd ",
     }, seller_ref=None, seed_kind=None)
     _, params = fake_db.calls[0]
     assert params["market"] == "US"
     assert params["currency"] == "USD"
+    variant = json.loads(params["data"])["snapshot"]["variants"][0]
+    assert variant["currency"] == "USD"
     # A9-3: NULL seller_ref/seed_kind thread through as bound NULLs (never guessed).
     assert params["seller_ref"] is None
     assert params["seed_kind"] is None

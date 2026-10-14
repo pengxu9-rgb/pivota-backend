@@ -96,7 +96,11 @@ def test_entry_point_never_files_an_undeclared_item_under_us(tmp_path):
 
 
 def test_entry_point_run_market_declares_items_without_their_own(tmp_path):
-    result = _run(tmp_path, [_item("1"), _item("2", market=" sg ")], "--market", "sg")
+    result = _run(
+        tmp_path,
+        [_item("1", price_currency="SGD"), _item("2", market=" sg ", price_currency="SGD")],
+        "--market", "sg",
+    )
     assert result.returncode == 0, result.stderr
     assert "would onboard 1 " in result.stdout
     assert result.stdout.count("market=SG") == 2
@@ -104,7 +108,10 @@ def test_entry_point_run_market_declares_items_without_their_own(tmp_path):
 
 
 def test_entry_point_per_item_markets_without_a_run_market(tmp_path):
-    result = _run(tmp_path, [_item("1", market="US"), _item("2", market="jp")])
+    result = _run(
+        tmp_path,
+        [_item("1", market="US", price_currency="USD"), _item("2", market="jp", price_currency="JPY")],
+    )
     assert result.returncode == 0, result.stderr
     lines = {line.split()[2]: line for line in result.stdout.splitlines() if "would onboard" in line}
     assert "market=US" in lines["1"]
@@ -165,7 +172,9 @@ async def test_apply_writes_the_declared_market_on_seed_and_offer(monkeypatch, t
     import asyncio
 
     rc = await asyncio.to_thread(
-        _main, monkeypatch, tmp_path, [_item("1"), _item("2", market="sg")], "--market", "SG"
+        _main, monkeypatch, tmp_path,
+        [_item("1", price_currency="SGD"), _item("2", market="sg", price_currency="SGD")],
+        "--market", "SG",
     )
     assert rc == 0
     kept = apply_spies["onboarded"]
