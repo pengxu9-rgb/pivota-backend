@@ -253,27 +253,33 @@ def _currency_codes(currencies: Iterable[Optional[str]]) -> FrozenSet[str]:
 
 
 def foreign_seed_currencies(
-    stated: Iterable[Optional[str]], *, established: Iterable[Optional[str]] = ()
+    stated: Iterable[Optional[str]],
+    *,
+    row: Optional[str] = None,
+    stored: Iterable[Optional[str]] = (),
 ) -> List[str]:
     """The `stated` currencies a seed may NOT take from a page read, sorted; empty when it may.
 
-    The ONE seed-writer rule for a read's currency (Peng, 2026-10-14), shared by every path that writes a
-    read's price into a seed: variant adoption on create and refresh, the create row price, the refresh's
-    fill of a NULL row currency. A store can geo-serve another market's page to the crawler, so the
-    currency a read states is the page's, not necessarily the seed's.
+    The ONE seed-writer rule for a read's currency (Peng, 2026-10-14). The seed variant gates in
+    routes/employee_products use it; every other path that writes a page read's price into a seed
+    is to share it rather than restate it. A store can geo-serve another market's page to the
+    crawler, so the currency a read states is the page's, not necessarily the seed's.
 
       1. A stated currency must belong to a served or acquisition market (`seed_storable_currencies`).
-      2. STICKY: a seed `established` in storable currencies (its row price_currency plus its stored
-         variants' currencies) takes only those. A USD seed refuses an SGD read and an SGD seed a USD
-         one. An established currency that is NOT storable (CAD, from an earlier read) holds nothing,
-         so the next storable read can heal the seed.
-      3. A blank or missing stated currency does not count.
+      2. A read that states more than one currency is refused whole: a seed is priced in one.
+      3. STICKY. The seed's `row` price_currency, when storable, is the only currency it takes. A row
+         with none (or an unstorable one) is held by its `stored` variants' storable currencies
+         instead, so a USD seed whose row is NULL still refuses an SGD read. A currency that is NOT
+         storable (CAD, from an earlier read) holds nothing, so the next storable read can heal the seed.
+      4. A blank or missing stated currency does not count.
 
     There is deliberately no `market` argument. ADR-026 drops the seed partition (Resolved Q2), and
     a market is never inferred from a currency, nor a currency from a market."""
     stated_codes = _currency_codes(stated)
     if not stated_codes:
         return []
+    if len(stated_codes) > 1:
+        return sorted(stated_codes)
     allowed = seed_storable_currencies()
-    held = _currency_codes(established) & allowed
+    held = (_currency_codes([row]) & allowed) or (_currency_codes(stored) & allowed)
     return sorted(stated_codes - (held or allowed))

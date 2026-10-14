@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from routes.employee_products import (
+    _foreign_refresh_variant_currencies,
     _foreign_variant_currencies,
     _should_overwrite_seed_variants,
     _should_replace_seed_variant_content,
@@ -213,10 +214,16 @@ def test_a_re_create_heals_a_cad_seed_to_a_storable_read(monkeypatch):
     assert _stated(seed_data["variants"]) == {"USD"}
 
 
-def test_an_unstorable_row_currency_still_corrects_its_own_variants_on_refresh(monkeypatch):
-    # Not storable, but it is the row's own currency: the refresh may re-read it, as the row may.
+def test_an_unstorable_row_currency_takes_nothing_on_refresh(monkeypatch):
+    # The review repro: a US seed created from a CAD page got a CAD row and no variants, and its
+    # first refresh stored CAD variants 110/150, undoing the create gate. Its own currency is still
+    # not storable: the refresh adopts nothing and the reconcile re-prices nothing.
+    row = _cad_seed_row(variants=False)
+    result, stored = _refresh(monkeypatch, row, _page(_sized_offers("CAD")))
+    assert "CAD" not in _stated(stored["seed_data"].get("variants"))
+    assert result["variant_adoption_refused"]["currencies"] == ["CAD"]
     _, stored = _refresh(monkeypatch, _cad_seed_row(), _page(_sized_offers("CAD")))
-    assert [v["variant_id"] for v in stored["seed_data"]["variants"]] == ["EX-30", "EX-50"]
+    assert [(v["variant_id"], v["price_amount"]) for v in stored["seed_data"]["variants"]] == [("EX-BASE", 80.0)]
 
 
 def test_a_refresh_with_no_row_currency_falls_to_the_shared_rule(monkeypatch):
@@ -234,6 +241,110 @@ def test_a_refresh_with_no_row_currency_is_held_to_its_stored_variants(monkeypat
     assert _stated(stored["seed_data"]["variants"]) == {"USD"}
 
 
+# ---- a read no richer than the stored list still heals a currency an earlier read left -------------
+
+
+def _cad_sizes() -> List[Dict[str, Any]]:
+    return [{"variant_id": "EX-30", "title": f"{TITLE} - 30 mL", "price_amount": 110.0, "price_currency": "CAD",
+             "availability": "in_stock"},
+            {"variant_id": "EX-50", "title": f"{TITLE} - 50 mL", "price_amount": 150.0, "price_currency": "CAD",
+             "availability": "in_stock"}]
+
+
+def test_a_same_sizes_usd_read_is_not_richer(monkeypatch):
+    # The premise: without the heal, nothing replaces these (same ids and titles), and the reconcile
+    # never re-prices across currencies.
+    read = _page(_sized_offers("USD")).evidence["variants"]
+    assert not _should_overwrite_seed_variants(existing=_cad_sizes(), incoming=read, product_title=TITLE)
+
+
+def test_the_refresh_heals_same_sizes_left_in_cad(monkeypatch):
+    row = _seed_row(variants=_cad_sizes(), price=80.0, availability="in_stock")
+    _, stored = _refresh(monkeypatch, row, _page(_sized_offers("USD")))
+    assert [(v["variant_id"], v["price_currency"]) for v in stored["seed_data"]["variants"]] == [
+        ("EX-30", "USD"), ("EX-50", "USD")]
+
+
+def test_a_re_create_heals_same_sizes_left_in_cad(monkeypatch):
+    existing = _seed_row(variants=_cad_sizes(), price=80.0, availability="in_stock")
+    seed_data = _create(monkeypatch, _page(_sized_offers("USD")), [existing])
+    assert _stated(seed_data["variants"]) == {"USD"}
+
+
+def test_the_heal_never_drops_a_size_the_read_does_not_name(monkeypatch):
+    stored_variants = _cad_sizes() + [{"variant_id": "EX-100", "title": f"{TITLE} - 100 mL", "price_amount": 200.0,
+                                       "price_currency": "CAD", "availability": "in_stock"}]
+    row = _seed_row(variants=stored_variants, price=80.0, availability="in_stock")
+    _, stored = _refresh(monkeypatch, row, _page(_sized_offers("USD")))
+    assert [v["variant_id"] for v in stored["seed_data"]["variants"]] == ["EX-30", "EX-50", "EX-100"]
+
+
+# ---- a read in two currencies is refused whole ------------------------------------------------------
+
+
+def _mixed_offers() -> List[Dict[str, Any]]:
+    return [_offer(110, IN, sku="EX-30", name=f"{TITLE} - 30 mL", priceCurrency="USD"),
+            _offer(150, IN, sku="EX-50", name=f"{TITLE} - 50 mL", priceCurrency="SGD")]
+
+
+def test_creating_from_a_mixed_currency_read_stores_no_variants(monkeypatch):
+    seed_data, response = _create(monkeypatch, _page(_mixed_offers()), [], with_response=True)
+    assert seed_data["variants"] == []
+    assert response["variant_adoption_refused"] == {"reason": "currency_not_the_seeds", "currencies": ["SGD", "USD"]}
+
+
+def test_a_refresh_with_nothing_held_refuses_a_mixed_currency_read(monkeypatch):
+    row = _seed_row(variants=None, price=80.0, availability="in_stock")
+    row["price_currency"] = None
+    result, stored = _refresh(monkeypatch, row, _page(_mixed_offers()))
+    assert not stored["seed_data"].get("variants")
+    assert result["variant_adoption_refused"]["currencies"] == ["SGD", "USD"]
+
+
+# ---- the reconcile is held to the same gate ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(("row_currency", "read_currency"), [(None, "CAD"), ("USD", "SGD")])
+def test_the_reconcile_does_not_price_a_currencyless_variant_in_a_refused_currency(monkeypatch, row_currency, read_currency):
+    # The review repro: the gate refused the read, then the reconcile wrote its 110 CAD into a stored
+    # variant that stated no currency, and the builders serve variants first.
+    row = _seed_row(variants=[{"variant_id": "EX-30", "title": f"{TITLE} - 30 mL", "price_amount": 80.0,
+                               "availability": "in_stock"}], price=80.0, availability="in_stock")
+    row["price_currency"] = row_currency
+    if row_currency is None:
+        row["price_amount"] = None
+    result, stored = _refresh(monkeypatch, row, _page([_offer(110, IN, sku="EX-30", name=f"{TITLE} - 30 mL",
+                                                              priceCurrency=read_currency)]))
+    (v,) = stored["seed_data"]["variants"]
+    assert (v["price_amount"], v.get("price_currency")) == (80.0, None)
+    assert result["variant_adoption_refused"]["currencies"] == [read_currency]
+
+
+def test_the_reconcile_still_prices_a_currencyless_variant_in_the_rows_currency(monkeypatch):
+    row = _seed_row(variants=[{"variant_id": "EX-30", "title": f"{TITLE} - 30 mL", "price_amount": 80.0,
+                               "availability": "in_stock"}], price=80.0, availability="in_stock")
+    _, stored = _refresh(monkeypatch, row, _page([_offer(110, IN, sku="EX-30", name=f"{TITLE} - 30 mL")]))
+    (v,) = stored["seed_data"]["variants"]
+    assert (v["price_amount"], v.get("price_currency")) == (110.0, "USD")
+
+
+# ---- a refused read does not leave the seed reading fresh ----------------------------------------
+
+
+def test_a_refused_read_removes_the_fresh_stamp(monkeypatch):
+    row = _seed_row(variants=[_stored_variant()], price=80.0, availability="in_stock")
+    assert row["seed_data"]["snapshot"].get("extracted_at"), "the premise: an earlier refresh stamped it"
+    result, stored = _refresh(monkeypatch, row, _page(_sized_offers("CAD")))
+    assert result["price_refresh"]["status"] == "skipped_currency_mismatch"
+    assert "extracted_at" not in stored["seed_data"]["snapshot"]
+
+
+def test_an_adopted_read_keeps_a_fresh_stamp(monkeypatch):
+    row = _seed_row(variants=[_stored_variant()], price=80.0, availability="in_stock")
+    _, stored = _refresh(monkeypatch, row, _page(_sized_offers("USD")))
+    assert stored["seed_data"]["snapshot"].get("extracted_at")
+
+
 # ---- the rule itself ----------------------------------------------------------------------------
 
 
@@ -247,24 +358,29 @@ def test_storable_currencies_are_the_registrys_served_and_acquisition_markets():
 
 
 @pytest.mark.parametrize(
-    ("established", "stated", "foreign"),
+    ("row", "stored", "stated", "foreign"),
     [
-        ([], ["CAD"], ["CAD"]),  # not storable
-        ([], ["USD", "CAD"], ["CAD"]),  # any foreign variant refuses the whole read
-        ([], ["usd"], []),  # case does not matter
-        ([], ["SGD"], []),  # a new seed may take any storable currency
-        (["USD"], ["SGD"], ["SGD"]),  # sticky
-        (["SGD"], ["USD"], ["USD"]),
-        (["USD", "SGD"], ["SGD"], []),  # established in both: either holds
-        (["CAD"], ["USD"], []),  # an unstorable established currency holds nothing
-        (["CAD", "USD"], ["SGD"], ["SGD"]),  # ...and does not hide the storable one beside it
-        (["CAD"], ["CAD"], ["CAD"]),  # nor licenses more of itself
-        ([None, " "], ["SGD"], []),  # blank established currencies are ignored
-        (["USD"], [None, ""], []),  # an unstated currency does not count
+        (None, [], ["CAD"], ["CAD"]),  # not storable
+        (None, [], ["usd"], []),  # case does not matter
+        (None, [], ["SGD"], []),  # a new seed may take any storable currency
+        (None, [], ["USD", "SGD"], ["SGD", "USD"]),  # two currencies: refused whole
+        (None, [], ["USD", "CAD"], ["CAD", "USD"]),
+        ("USD", [], ["SGD"], ["SGD"]),  # sticky to the row
+        ("SGD", [], ["USD"], ["USD"]),
+        ("USD", ["SGD"], ["USD"], []),  # the row wins over the stored variants
+        ("USD", ["SGD"], ["SGD"], ["SGD"]),
+        (None, ["USD"], ["SGD"], ["SGD"]),  # no row: the stored variants hold
+        ("CAD", ["USD"], ["SGD"], ["SGD"]),  # an unstorable row: the stored variants hold
+        ("CAD", [], ["USD"], []),  # an unstorable currency holds nothing
+        (None, ["CAD"], ["USD"], []),
+        (None, ["CAD", "USD"], ["SGD"], ["SGD"]),  # ...and does not hide the storable one beside it
+        ("CAD", ["CAD"], ["CAD"], ["CAD"]),  # nor licenses more of itself
+        (" ", [None, " "], ["SGD"], []),  # blank currencies are ignored
+        ("USD", [], [None, ""], []),  # an unstated currency does not count
     ],
 )
-def test_the_rule(established, stated, foreign):
-    assert foreign_seed_currencies(stated, established=established) == foreign
+def test_the_rule(row, stored, stated, foreign):
+    assert foreign_seed_currencies(stated, row=row, stored=stored) == foreign
 
 
 def test_the_variant_gate_establishes_the_seed_from_its_row_and_stored_variants():
@@ -280,7 +396,7 @@ def test_the_variant_gate_establishes_the_seed_from_its_row_and_stored_variants(
 # ---- the employee create path, through the real endpoint ----------------------------------------
 
 
-def _create(monkeypatch, page, existing_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _create(monkeypatch, page, existing_rows: List[Dict[str, Any]], *, variants=None, with_response=False):
     import routes.employee_products as ep
 
     writes: List[Dict[str, Any]] = []
@@ -295,10 +411,12 @@ def _create(monkeypatch, page, existing_rows: List[Dict[str, Any]]) -> Dict[str,
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
     monkeypatch.setattr(ep, "_derive_seed_seller_columns", AsyncMock(return_value=(None, None)))
     monkeypatch.setattr(ep, "_make_redirect_url", AsyncMock(return_value="https://api.pivota.cc/r?token=t"))
-    asyncio.run(ep.create_external_seed(ep.CreateExternalSeedRequest(destination_url=DEST, market="US"),
-                                        request=SimpleNamespace(), current_user={"employee_id": "emp_test"}))
+    response = asyncio.run(ep.create_external_seed(
+        ep.CreateExternalSeedRequest(destination_url=DEST, market="US", variants=variants),
+        request=SimpleNamespace(), current_user={"employee_id": "emp_test"}))
     (write,) = [w for w in writes if "seed_data" in w]
-    return write["seed_data"] if isinstance(write["seed_data"], dict) else json.loads(write["seed_data"])
+    seed_data = write["seed_data"] if isinstance(write["seed_data"], dict) else json.loads(write["seed_data"])
+    return (seed_data, response) if with_response else seed_data
 
 
 def test_re_creating_a_usd_seed_keeps_its_variants_when_the_page_reads_cad(monkeypatch):
@@ -339,3 +457,74 @@ def test_re_creating_a_seed_with_no_variants_is_held_to_its_row_currency(monkeyp
     existing = _seed_row(variants=None, price=80.0, availability="in_stock")
     seed_data = _create(monkeypatch, _page(_sized_offers("SGD")), [existing])
     assert "SGD" not in _stated(seed_data.get("variants"))
+
+
+def test_re_creating_reports_the_refusal(monkeypatch):
+    existing = _seed_row(variants=[_stored_variant()], price=80.0, availability="in_stock")
+    _, response = _create(monkeypatch, _page(_sized_offers("CAD")), [existing], with_response=True)
+    assert response["variant_adoption_refused"] == {"reason": "currency_not_the_seeds", "currencies": ["CAD"]}
+    _, response = _create(monkeypatch, _page(_sized_offers("USD")), [existing], with_response=True)
+    assert response["variant_adoption_refused"] is None
+
+
+# ---- variants an employee sends ----------------------------------------------------------------------
+
+
+def _employee_variants(*currencies: str) -> List[Dict[str, Any]]:
+    return [{"variant_id": f"EX-{i}", "title": f"{TITLE} - {i}", "price_amount": 10.0 + i, "price_currency": c}
+            for i, c in enumerate(currencies)]
+
+
+@pytest.mark.parametrize("currencies", [("CAD",), ("USD", "SGD")])
+def test_employee_variants_in_an_unstorable_or_second_currency_are_refused(monkeypatch, currencies):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as err:
+        _create(monkeypatch, _page(_sized_offers("USD")), [], variants=_employee_variants(*currencies))
+    assert err.value.status_code == 422 and "VARIANT_CURRENCY_NOT_STORABLE" in err.value.detail
+
+
+def test_an_employee_may_move_a_seed_to_another_storable_currency(monkeypatch):
+    # The sticky rule binds a scraped read, not an employee: re-creating a USD seed with SGD variants.
+    existing = _seed_row(variants=[_stored_variant()], price=80.0, availability="in_stock")
+    seed_data = _create(monkeypatch, _page(_sized_offers("USD")), [existing], variants=_employee_variants("SGD"))
+    assert _stated(seed_data["variants"]) == {"SGD"}
+
+
+def test_the_refresh_row_rule_folds_case_on_both_sides():
+    lower = [{"variant_id": "a", "price_currency": "usd"}]
+    assert _foreign_refresh_variant_currencies(existing=[], incoming=lower, row_currency="USD") == []
+    assert _foreign_refresh_variant_currencies(existing=[], incoming=lower, row_currency=" usd ") == []
+
+
+class _WriteReached(Exception):
+    pass
+
+
+def _patch(monkeypatch, variants):
+    import routes.employee_products as ep
+
+    async def write(*_a, **_k):
+        raise _WriteReached
+
+    row = _seed_row(variants=[_stored_variant()], price=80.0, availability="in_stock")
+    monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=row))
+    monkeypatch.setattr(ep.database, "execute", write)
+    monkeypatch.setattr(ep, "_execute_seed_data_stmt", write)
+    asyncio.run(ep.update_external_seed(row["id"], ep.UpdateExternalSeedRequest(variants=variants),
+                                        current_user={"employee_id": "emp_test"}))
+
+
+@pytest.mark.parametrize("currencies", [("CAD",), ("USD", "SGD")])
+def test_patching_variants_in_an_unstorable_or_second_currency_is_refused_before_any_write(monkeypatch, currencies):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as err:
+        _patch(monkeypatch, _employee_variants(*currencies))
+    assert err.value.status_code == 422
+
+
+def test_patching_variants_in_a_storable_currency_reaches_the_write(monkeypatch):
+    with pytest.raises(_WriteReached):
+        _patch(monkeypatch, _employee_variants("SGD"))

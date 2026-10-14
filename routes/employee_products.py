@@ -7,7 +7,7 @@ content-key catalogue endpoints below, whose offers come from
 ``catalog_offers``.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 import asyncio
 import csv
 import io
@@ -77,7 +77,7 @@ from services.pci_kb_scope_review import (
     summarize_filtered_queue,
 )
 from db.reviews_center import product_reviews
-from services.region_pricing import foreign_seed_currencies
+from services.region_pricing import foreign_seed_currencies, seed_storable_currencies
 from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key, build_sku_key
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 
@@ -947,30 +947,60 @@ def _foreign_variant_currencies(
     another market's page to the crawler. Probed 2026-10-13: a US/USD seed that read a CAD-priced
     page stored CAD variant prices. The offer dual-write refused the offer, but the seed kept them,
     and the builders price offers from its variants. The rule is region_pricing's
-    `foreign_seed_currencies`, shared with the row-price writers. The seed is established in its
-    row currency plus its stored variants' currencies."""
+    `foreign_seed_currencies`: the row's currency holds when it is storable, else the stored
+    variants' currencies do."""
     return foreign_seed_currencies(
-        _stated_variant_currencies(incoming),
-        established=[row_currency, *_stated_variant_currencies(existing)],
+        _stated_variant_currencies(incoming), row=row_currency, stored=_stated_variant_currencies(existing)
     )
 
 
 def _foreign_refresh_variant_currencies(
     *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]], row_currency: Optional[str]
 ) -> List[str]:
-    """The refresh's stricter form: a scraped read never changes the currency a seed's ROW is in.
+    """The refresh's stricter form: a scraped read never moves a seed off its ROW currency.
 
     The refresh refuses a row currency change (`skipped_currency_mismatch`, below), because a misread
     currency is likelier than a merchant changing one: a KRW row read as "USD" would otherwise be
     restated as $22,000. Variants follow the row, or the two disagree after the refresh (row CAD,
-    variants USD). And a row in an unstorable currency (EUR) can still correct its own variants. So a
-    row with a currency adopts only reads in it, which also heals variants an earlier read left in
-    another currency. A row with none falls to the shared rule, held to its stored variants.
-    Changing a seed's currency is left to an employee's re-create, which applies the full rule."""
+    variants USD). So a row with a currency takes only reads in it, and only when it is storable: a
+    CAD row (a create from a geo-served page) takes nothing, or its first refresh would store the
+    CAD variants the create refused. A row with none falls to the shared rule, held to its stored
+    variants. Changing a seed's currency is left to an employee's re-create, which applies the
+    full rule."""
     row = str(row_currency or "").strip().upper()
     if not row:
         return _foreign_variant_currencies(existing=existing, incoming=incoming, row_currency=None)
-    return sorted(_stated_variant_currencies(incoming) - {row})
+    return sorted(_stated_variant_currencies(incoming) - ({row} & seed_storable_currencies()))
+
+
+def _read_heals_stored_currency(*, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> bool:
+    """True when a read the currency gate admitted should REPLACE stored variants priced in another
+    currency, though it is no richer than them.
+
+    The adoption rules replace a list only with a richer read, and the reconcile never re-prices
+    across currencies, so variants an earlier read left in CAD stayed CAD under a USD read of the
+    same sizes. The read must name every stored variant: replacing a list it does not cover would
+    drop sizes, and #2601's protected variants are among those it must name."""
+    read_currencies = _stated_variant_currencies(incoming)
+    if not read_currencies or not (_stated_variant_currencies(existing) - read_currencies):
+        return False
+    named = set().union(*(_variant_identity_keys(v) for v in incoming))
+    return all(_variant_identity_keys(v) <= named for v in existing)
+
+
+def _refuse_unstorable_employee_variants(variants: Optional[List[Dict[str, Any]]]) -> None:
+    """An employee may set a seed's variants by hand, and may change its currency so (the sticky
+    rule binds a scraped read, not a person), but never to a currency no seed may store, nor to two.
+    The preview hands the UI the page read's variants, so a geo-served read could otherwise
+    round-trip through the form."""
+    stated = _stated_variant_currencies(variants or [])
+    unstorable = sorted(stated - seed_storable_currencies()) if len(stated) <= 1 else sorted(stated)
+    if unstorable:
+        raise HTTPException(status_code=422, detail=f"VARIANT_CURRENCY_NOT_STORABLE:{','.join(unstorable)}")
+
+
+def _variant_adoption_refusal(foreign_currencies: List[str]) -> Optional[Dict[str, Any]]:
+    return {"reason": "currency_not_the_seeds", "currencies": foreign_currencies} if foreign_currencies else None
 
 
 def _should_overwrite_seed_variants(
@@ -4094,6 +4124,9 @@ async def create_external_seed(
     partner_type = (body.partner_type or "").strip() or None
     disclosure_text = (body.disclosure_text or "").strip() or DEFAULT_DISCLOSURE_TEXT
 
+    _refuse_unstorable_employee_variants(body.variants)
+    variant_adoption_refused: Optional[Dict[str, Any]] = None
+
     if existing_row:
         row = dict(existing_row)
         seed_id = row.get("id")
@@ -4171,11 +4204,18 @@ async def create_external_seed(
             seed_data["snapshot"]["description"] = snap_description
         if body.variants is not None and body.variants:
             seed_data["variants"] = body.variants
-        elif snap_variants and not _foreign_variant_currencies(
-            existing=_seed_variants(seed_data), incoming=snap_variants, row_currency=row.get("price_currency")
-        ):
+        elif snap_variants:
             existing_variants = _seed_variants(seed_data)
-            if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=title):
+            variant_adoption_refused = _variant_adoption_refusal(
+                _foreign_variant_currencies(
+                    existing=existing_variants, incoming=snap_variants, row_currency=row.get("price_currency")
+                )
+            )
+            if variant_adoption_refused:
+                pass
+            elif _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=title):
+                seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=snap_variants)
+            elif _read_heals_stored_currency(existing=existing_variants, incoming=snap_variants):
                 seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=snap_variants)
             elif not existing_variants:
                 seed_data["variants"] = snap_variants
@@ -4256,6 +4296,10 @@ async def create_external_seed(
     else:
         seed_id = _seed_id()
         external_product_id = _stable_external_product_id(match_url)
+        if snap_variants and not body.variants:
+            variant_adoption_refused = _variant_adoption_refusal(
+                _foreign_variant_currencies(existing=[], incoming=snap_variants, row_currency=None)
+            )
         seed_data: Dict[str, Any] = {
             "external_product_id": external_product_id,
             "merchant_display_name": (body.merchant_display_name or "").strip() or None,
@@ -4269,12 +4313,7 @@ async def create_external_seed(
             if body.image_urls is not None
             else snap_image_urls,
             "availability": availability,
-            "variants": body.variants
-            or (
-                snap_variants
-                if snap_variants and not _foreign_variant_currencies(existing=[], incoming=snap_variants, row_currency=None)
-                else []
-            ),
+            "variants": body.variants or ([] if variant_adoption_refused else (snap_variants or [])),
             "utm_template": utm_template,
             "partner_type": partner_type,
             "disclosure_text": disclosure_text,
@@ -4389,6 +4428,8 @@ async def create_external_seed(
             "variants": _seed_variants(seed_data),
         },
         "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
+        # The page's variants, when they were priced in a currency this seed may not store.
+        "variant_adoption_refused": variant_adoption_refused,
     }
 
 
@@ -4606,6 +4647,7 @@ async def update_external_seed(
     if body.category is not None:
         seed_data["category"] = body.category
     if body.variants is not None:
+        _refuse_unstorable_employee_variants(body.variants)
         seed_data["variants"] = body.variants
     if body.utm_template is not None:
         seed_data["utm_template"] = (body.utm_template or "").strip() or None
@@ -4931,6 +4973,7 @@ def _reconcile_seed_variants_with_read(
     product_currency: Optional[str],
     product_availability: Optional[str],
     census: Optional[Dict[str, Any]],
+    refused_currencies: Iterable[str] = (),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Write what this refresh re-read into the STORED variants the builders serve.
 
@@ -4995,6 +5038,7 @@ def _reconcile_seed_variants_with_read(
             claimants[pos] = claimants.get(pos, 0) + 1
 
     product_cur = (str(product_currency or "").strip().upper() or None)
+    refused = {str(c).strip().upper() for c in refused_currencies or () if c}
     single = len(stored) == 1
     census_ok = isinstance(census, dict) and not (
         census.get("aggregate") or census.get("truncated") or census.get("data_attr_duplicate_ids")
@@ -5090,6 +5134,10 @@ def _reconcile_seed_variants_with_read(
             new_amount, new_cur = product_amount, product_cur
         if single_takes_availability and fallback_identity_ok and new_avail is None:
             new_avail = product_availability
+        # A price in a currency the refresh's gate refused is not taken, whichever arm read it: a
+        # stored variant that states no currency would otherwise take the read's CAD.
+        if new_amount is not None and str(new_cur or "").strip().upper() in refused:
+            new_amount, new_cur = None, None
 
         before = dict(v)
         if new_amount is not None:
@@ -5491,13 +5539,13 @@ async def _refresh_external_seed_by_id(
         seed_data["image_urls"] = snap_image_urls
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
-    variant_adoption_refused = None
     foreign_currencies = _foreign_refresh_variant_currencies(
         existing=_seed_variants(seed_data), incoming=adoptable_variants or [], row_currency=row.get("price_currency")
     )
-    if adoptable_variants and foreign_currencies:
-        # Keep the stored variants. The reconcile below re-reads only same-currency offers.
-        variant_adoption_refused = {"reason": "currency_not_the_seeds", "currencies": foreign_currencies}
+    # Keep the stored variants; the reconcile below is barred from these currencies too.
+    variant_adoption_refused = _variant_adoption_refusal(foreign_currencies) if adoptable_variants else None
+    if variant_adoption_refused:
+        pass
     elif adoptable_variants:
         existing_variants = _seed_variants(seed_data)
         product_title = seed_data.get("title") or snap_title
@@ -5510,6 +5558,8 @@ async def _refresh_external_seed_by_id(
             previous_canonical_url=previous_canonical_url,
             refreshed_canonical_url=canonical_url,
         ):
+            seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=adoptable_variants)
+        elif _read_heals_stored_currency(existing=existing_variants, incoming=adoptable_variants):
             seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=adoptable_variants)
         elif not existing_variants:
             seed_data["variants"] = adoptable_variants
@@ -5732,6 +5782,7 @@ async def _refresh_external_seed_by_id(
             product_currency=next_currency,
             product_availability=fresh_availability,
             census=snap_variant_census,
+            refused_currencies=foreign_currencies,
         )
         if reconciled:
             served_container["variants"] = reconciled
@@ -5754,11 +5805,14 @@ async def _refresh_external_seed_by_id(
                 "at": _to_iso(datetime.now(timezone.utc)),
                 "replaced": variant_refresh["replaced"][:50],
             }
-    if read_the_served_product and price_re_read:
-        if variant_refresh.get("not_re_read_count"):
-            seed_data["snapshot"].pop("extracted_at", None)
-        else:
+    if read_the_served_product:
+        if price_re_read and not variant_refresh.get("not_re_read_count"):
             seed_data["snapshot"]["extracted_at"] = _to_iso(datetime.now(timezone.utc))
+        elif price_re_read or price_status.startswith("skipped_") or variant_refresh.get("not_re_read_count"):
+            # A price this run refused to take (a CAD read of a USD row is `skipped_currency_mismatch`),
+            # or a stored variant it did not re-read: the stamp an earlier refresh left behind would
+            # vouch for values nobody re-read tonight.
+            seed_data["snapshot"].pop("extracted_at", None)
 
     served_canonical, served_domain = _next_served_canonical(
         row,
