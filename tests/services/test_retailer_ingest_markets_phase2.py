@@ -1246,3 +1246,51 @@ async def test_a_capture_apply_whose_readback_finds_no_us_offer_fails(two_jobs, 
     out = await pipeline.run_stage(markets_job("apply_due"), db=catalog)
     assert (out["status"], out["outcome"]) == ("failed", "readback_failed")
     assert "still blocks it as no_us_offer" in env.ledger.transitions[-1]["reason"]
+
+
+# ================================================================== price_checked_at (migration 246)
+
+def test_the_price_read_sibling_upsert_adds_exactly_the_stamp():
+    base, read = markets.SIBLING_UPSERT_SQL, markets.SIBLING_UPSERT_PRICE_READ_SQL
+    assert "price_checked_at" not in base
+    assert "offer_payload, price_checked_at)" in read and "CAST(:offer_payload AS jsonb), NOW()" in read
+    conflict = read.split("ON CONFLICT", 1)[1]
+    assert "price_checked_at = EXCLUDED.price_checked_at" in conflict.split("WHERE")[0]
+    assert read.replace("offer_payload, price_checked_at)", "offer_payload)").replace(
+        "CAST(:offer_payload AS jsonb), NOW()", "CAST(:offer_payload AS jsonb)").replace(
+        "      price_checked_at = EXCLUDED.price_checked_at,\n", "") == base
+    with pytest.raises(RuntimeError, match="changed shape"):
+        markets._sibling_upsert_sql_with_price_read(base.replace("source_domain, offer_payload)", "x)"))
+
+
+@pytest.mark.parametrize("answer, present", [({"present": True}, True), ({"present": False}, False), (None, False)])
+async def test_the_column_check_reports_only_a_clear_yes(answer, present):
+    class Answers:
+        async def fetch_one(self, *_a, **_k):
+            return answer
+
+    assert await markets._price_check_present(Answers()) is present
+
+
+async def test_the_column_check_never_raises():
+    class Broken:
+        async def fetch_one(self, *_a, **_k):
+            raise RuntimeError("no such table: pg_attribute")
+
+    assert await markets._price_check_present(Broken()) is False
+    assert await markets._price_check_present(WriteDB()) is False  # a fake without fetch_one
+
+
+async def test_a_database_with_the_column_gets_the_dated_statement():
+    class Present(WriteDB):
+        async def fetch_one(self, sql, values=None):
+            return {"present": True}
+
+        async def fetch_val(self, sql, values):
+            self.statements = getattr(self, "statements", []) + [sql]
+            return values["offer_id"]
+
+    planned = (await _capture(Store()))["planned"]
+    db = Present()
+    out = await markets.write_siblings(planned, db=db)
+    assert out["written"] and set(db.statements) == {markets.SIBLING_UPSERT_PRICE_READ_SQL}

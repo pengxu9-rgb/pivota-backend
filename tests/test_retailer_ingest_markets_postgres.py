@@ -403,3 +403,64 @@ async def test_the_shade_fold_lane_offer_read_finds_stale_offers_by_listing_too(
     stale, unread = await pipeline._stale_fold_offers(dup)
     assert unread is None
     assert [(r["why"], r["offer_id"]) for r in stale] == [("duplicate_at_listing", PREFIX + "fold2-elsewhere")]
+
+
+# ================================================================== price_checked_at (migration 246)
+
+async def _with_price_check(db):
+    """The column and the migration's own trigger, from the file, as schema_guard installs them in prod."""
+    import glob
+    from db.sql_migrations import split_statements
+    body = open(glob.glob("db/migrations/246_catalog_offers_price_checked_at.sql")[0]).read()
+    for statement in split_statements(body):
+        await db.execute(statement)
+
+
+async def _sibling_stamp(db, offer_id):
+    return await db.fetch_val("SELECT price_checked_at FROM catalog_offers WHERE offer_id = :o", {"o": offer_id})
+
+
+def _recent(stamp):
+    from datetime import datetime, timedelta, timezone
+    return stamp is not None and abs(datetime.now(timezone.utc) - stamp) < timedelta(minutes=5)
+
+
+async def test_a_sibling_dates_the_price_this_run_read_and_a_re_capture_re_dates_it(db):
+    from datetime import datetime, timezone
+    from services.retailer_ingest import shopify_markets as markets
+    await _with_price_check(db)
+    key = PREFIX + "p7"
+    await _product(db, key, content_key=PREFIX + "ck")
+    await _offer(db, PREFIX + "base7", key)
+    sibling = markets.sibling_offer_id(PREFIX + "base7")
+    await markets.write_siblings([_planned(PREFIX + "base7", key)], db=db)
+    assert _recent(await _sibling_stamp(db, sibling))
+    old = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    for cents in (3200, 3600):  # the same price re-read, then a moved one: both are reads
+        await db.execute("UPDATE catalog_offers SET price_checked_at = :t WHERE offer_id = :o", {"t": old, "o": sibling})
+        await markets.write_siblings([_planned(PREFIX + "base7", key, cents=cents)], db=db)
+        assert _recent(await _sibling_stamp(db, sibling))
+    # The base offer this lane reads its identity from is never dated by it.
+    assert await _sibling_stamp(db, PREFIX + "base7") is None
+
+
+async def test_without_the_column_a_sibling_writes_the_pre_246_statement(db, monkeypatch):
+    from services.retailer_ingest import shopify_markets as markets
+    await _with_price_check(db)
+
+    async def absent(_db):
+        return False
+
+    monkeypatch.setattr(markets, "_price_check_present", absent)
+    key = PREFIX + "p8"
+    await _product(db, key, content_key=PREFIX + "ck")
+    await _offer(db, PREFIX + "base8", key)
+    out = await markets.write_siblings([_planned(PREFIX + "base8", key)], db=db)
+    assert len(out["written"]) == 1
+    assert await _sibling_stamp(db, markets.sibling_offer_id(PREFIX + "base8")) is None
+
+
+async def test_the_column_check_reads_this_database(db):
+    from services.retailer_ingest import shopify_markets as markets
+    await _with_price_check(db)
+    assert await markets._price_check_present(db) is True
