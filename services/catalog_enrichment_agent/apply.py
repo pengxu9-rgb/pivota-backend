@@ -547,9 +547,74 @@ def _offer_upsert_sql_with_market(sql: str) -> str:
 _OFFER_UPSERT_MARKET_SQL = _offer_upsert_sql_with_market(_OFFER_UPSERT_SQL)
 
 
-def _offer_sql_for(row: Dict[str, Any]) -> str:
-    """The upsert for one offer row: with `market` only when its writer declared one."""
-    return _OFFER_UPSERT_MARKET_SQL if row.get("market") is not None else _OFFER_UPSERT_SQL
+def _offer_upsert_sql_with_price_read(sql: str) -> str:
+    """`sql` that also dates the price it writes: `price_checked_at = NOW()` (migration 246).
+
+    ONLY for a plan whose caller read every offer price from the merchant in this execution
+    (`apply_ingest_plan(price_read=True)`: the retailer_ingest drain's storefront crawl). Every
+    other caller -- a Gemini answer, a replayed JSONL plan, an affiliate feed, a seed rebuild --
+    keeps the statement it ran before, byte for byte; for those rows the 246 trigger still clears
+    the stamp whenever the price moves without one.
+
+    Under the reviewed SGD 30 hold above, the stored price is kept rather than this run's read, so
+    the stored stamp is kept with it: a price this run did not write is not a price this run dated.
+
+    A row stored in ANOTHER currency is never dated. The upsert writes `currency` on insert only, so
+    this run's amount lands under the stored label (the post-apply readback then fails the job, after
+    the commit): that amount is not a price read in the row's currency, so its stamp is NULL -- what
+    the 246 trigger would have left -- never NOW().
+
+    NOW() is the WRITE time. The read it dates happened earlier in the same execution, before the
+    catalog write lock (at most WRITE_LOCK wait, ~10 min): a stamp can overstate freshness by that much.
+
+    Derived from the one statement, like `_offer_upsert_sql_with_market`, and refused unless it
+    changed exactly the three places it must."""
+    cols_old = "source_domain, offer_payload)\n"
+    vals_old = "CAST(:offer_payload AS jsonb))\n"
+    set_old = "                      updated_at = NOW()\n"
+    if any(sql.count(old) != 1 for old in (cols_old, vals_old, set_old)):
+        raise RuntimeError("_OFFER_UPSERT_SQL changed shape; update _offer_upsert_sql_with_price_read")
+    hold = ("catalog_offers.product_key = concat('ext', chr(58), 'jungsaemmool-lip-pression-metal-serum-gloss', "
+            "chr(58), chr(58), '66a3c8a4')\n"
+            "                         AND catalog_offers.offer_payload->>'meitu_sg_price_reviewed_0920' = 'SGD30'\n"
+            "                         AND catalog_offers.list_price = 30 AND EXCLUDED.list_price = 28.20")
+    # Matched whole, anchored on the list_price CASE that applies it (offer_payload repeats the predicate):
+    # an edit to any of its lines must stop this derivation, not leave the stamp keyed to a stale hold.
+    if sql.count("list_price = CASE\n                        WHEN " + hold + "\n") != 1:
+        raise RuntimeError("_OFFER_UPSERT_SQL's reviewed-price hold changed; update _offer_upsert_sql_with_price_read")
+    return (sql.replace(cols_old, "source_domain, offer_payload, price_checked_at)\n")
+               .replace(vals_old, "CAST(:offer_payload AS jsonb), NOW())\n")
+               .replace(set_old, "                      price_checked_at = CASE\n"
+                                 f"                        WHEN {hold}\n"
+                                 "                        THEN catalog_offers.price_checked_at\n"
+                                 "                        WHEN catalog_offers.currency IS DISTINCT FROM EXCLUDED.currency THEN NULL\n"
+                                 "                        ELSE EXCLUDED.price_checked_at END,\n"
+                        + set_old))
+
+
+_OFFER_UPSERT_PRICE_READ_SQL = _offer_upsert_sql_with_price_read(_OFFER_UPSERT_SQL)
+_OFFER_UPSERT_MARKET_PRICE_READ_SQL = _offer_upsert_sql_with_price_read(_OFFER_UPSERT_MARKET_SQL)
+
+
+def _offer_sql_for(row: Dict[str, Any], *, price_read: bool = False) -> str:
+    """The upsert for one offer row: with `market` only when its writer declared one, and dating
+    the price only when the plan's caller read it (`_offer_upsert_sql_with_price_read`)."""
+    if row.get("market") is not None:
+        return _OFFER_UPSERT_MARKET_PRICE_READ_SQL if price_read else _OFFER_UPSERT_MARKET_SQL
+    return _OFFER_UPSERT_PRICE_READ_SQL if price_read else _OFFER_UPSERT_SQL
+
+
+async def _offer_price_check_present(database: Any) -> bool:
+    """Does THIS database's catalog_offers carry price_checked_at? Never raises: a failed read
+    (SQLite has no pg_attribute) is "absent", and the apply writes the statement it wrote before 246.
+    Asked of the apply's own connection, outside its write transaction (external_offer_dual_write asks
+    the global one)."""
+    from services.external_offer_dual_write import PRICE_CHECK_COLUMN_SQL
+    try:
+        row = await database.fetch_one(PRICE_CHECK_COLUMN_SQL)
+        return bool(row and row["present"])
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _refuse_offer_market_currency_mismatch(plan: Dict[str, Any]) -> None:
@@ -2381,6 +2446,7 @@ async def apply_ingest_plan(
     primary_readiness: bool = False,
     market: str = DEFAULT_CANONICAL_MARKET,
     verified_storefront: Optional[VerifiedBrandStorefront] = None,
+    price_read: bool = False,
     retire_offers: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Persist an ingest plan, optionally handing curated rows to serving policy.
@@ -2395,13 +2461,19 @@ async def apply_ingest_plan(
 
     `market`: the buyer market the plan's offers are priced for (the retailer_ingest job's); it decides
     whether a brand_official plan is its brand's canonical-market storefront (_guard_canonical_owner).
+
+    `price_read`: the caller vouches that every offer price in the plan was read from the merchant in
+    this execution, in the currency it is written in. The offer upsert then stamps
+    `catalog_offers.price_checked_at = NOW()` (`_offer_upsert_sql_with_price_read`). Default False:
+    nothing is dated.
     """
     from db.database import database as global_db
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply
 
     preflight = require_primary_plan(plan) if primary_readiness else None
     counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch, market=market,
-                                      verified_storefront=verified_storefront, retire_offers=retire_offers)
+                                      verified_storefront=verified_storefront, price_read=price_read,
+                                      retire_offers=retire_offers)
     if not primary_readiness:
         return counts
     from services.catalog_enrichment_agent.primary_readiness import (
@@ -2430,6 +2502,7 @@ async def _apply_ingest_plan(
     batch: bool = False,
     market: str = DEFAULT_CANONICAL_MARKET,
     verified_storefront: Optional[VerifiedBrandStorefront] = None,
+    price_read: bool = False,
     retire_offers: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, int]:
     """Execute an ingest plan (from `ingest_validated_jsonl`) against the DB in FK
@@ -2450,6 +2523,9 @@ async def _apply_ingest_plan(
         await database.connect()
 
     await _refuse_parallel_retailer_listings(plan, database)
+    # Asked here, outside any write transaction. A vouched read on a database without the column
+    # writes the pre-246 statement rather than failing every offer.
+    price_read = bool(price_read) and await _offer_price_check_present(database)
     plan = await _prepare_seller_of_record(plan, database)
     # BOTH executors: the guard rewrites the planned rows before either one writes them.
     plan, owner_counts = await _guard_canonical_owner(plan, database, market=market)
@@ -2461,7 +2537,7 @@ async def _apply_ingest_plan(
 
     if batch:
         counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database,
-                                                  verified_storefront=verified_storefront)
+                                                  verified_storefront=verified_storefront, price_read=price_read)
         counts.update(owner_counts)
         return counts
 
@@ -2580,7 +2656,7 @@ async def _apply_ingest_plan(
                 # succeeded, while `counts` went on reporting them as written. The
                 # nested transaction rolls back this offer alone.
                 async with database.transaction():
-                    await database.execute(_offer_sql_for(offer), offer)
+                    await database.execute(_offer_sql_for(offer, price_read=price_read), offer)
                 counts["offers"] += 1
                 landed_offer_ids.add(str(offer.get("offer_id")))
                 audit.record_applied(1)
@@ -2637,6 +2713,7 @@ async def _apply_ingest_plan_batched(
     batch_label: str,
     database: Any,
     verified_storefront: Optional[VerifiedBrandStorefront] = None,
+    price_read: bool = False,
 ) -> Dict[str, int]:
     """Round-trip-eliminating executor. Same SQL constants, same offer guard, same
     WriterAuditAccumulator as the per-row path; each stage upserts in chunked
@@ -2785,8 +2862,10 @@ async def _apply_ingest_plan_batched(
     # the rest do not (a multi-row VALUES needs one column list). A plan normally has one shape.
     offer_rows = _with_offer_write_defaults(accepted_offers)
     applied_offers = offers_insert_skipped = 0
-    for sql in (_OFFER_UPSERT_SQL, _OFFER_UPSERT_MARKET_SQL):
-        shaped = [r for r in offer_rows if _offer_sql_for(r) is sql]
+    shapes = ((_OFFER_UPSERT_PRICE_READ_SQL, _OFFER_UPSERT_MARKET_PRICE_READ_SQL) if price_read
+              else (_OFFER_UPSERT_SQL, _OFFER_UPSERT_MARKET_SQL))
+    for sql in shapes:
+        shaped = [r for r in offer_rows if _offer_sql_for(r, price_read=price_read) is sql]
         if shaped:
             applied, skipped, _osr = await bulk_upsert(database, sql, shaped, label="offers")
             applied_offers += applied
