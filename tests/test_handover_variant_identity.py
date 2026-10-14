@@ -1547,3 +1547,24 @@ def test_the_sibling_offer_gets_no_cart_through_the_real_route(monkeypatch, clie
     assert "/cart/" not in dest and CATALOG_VID not in dest, dest
     assert f"/cart/{CATALOG_VID}:1" in offers[29.0]["execution_spec"]["cart_url"]
 
+
+# Review of #2624, P2: duplicate names. Exactly one stored entry may be the offer.
+
+
+def test_two_entries_sharing_a_sku_do_not_lend_the_candidate_to_either():
+    """Probe 1: both entries are `sku: SKU-X`; only the 50ml one carries the candidate's id."""
+    seed = {"variants": [{"sku": "SKU-X", "title": "30ml", "price_amount": 19.0},
+                         {"sku": "SKU-X", "title": "50ml", "price_amount": 29.0,
+                          "shopify_variant_id": VID}]}
+    got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id="SKU-X")
+    assert got.variant_id is None and got.reason == R_SIBLING
+
+
+def test_entries_whose_id_restates_the_product_do_not_lend_the_candidate():
+    """Probe 2: every entry's `id` is the product id, so the offer's name matches all of them."""
+    seed = {"variants": [{"id": SPID, "title": "30ml", "price_amount": 19.0},
+                         {"id": SPID, "title": "50ml", "price_amount": 29.0,
+                          "shopify_variant_id": VID}]}
+    got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id=SPID)
+    assert got.variant_id is None and got.reason == R_SIBLING
+

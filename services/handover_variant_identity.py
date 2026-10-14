@@ -332,7 +332,12 @@ def _offer_may_take_the_sole_candidate(one: Candidate, *, seed_data: Any, wanted
     if len(stored) <= 1:
         return True
     mine = [v for v in stored if any(_norm(v.get(k)) == wanted for k in _STORED_VARIANT_ID_KEYS)]
-    return any(one.answers_to(_norm(v.get(k))) for v in mine for k in _STORED_VARIANT_ID_KEYS)
+    # EXACTLY ONE entry may be this offer. Two entries answering to its name (both `sku: X`, or
+    # every `id` restating the product id) cannot say which one it is, so neither lends it the
+    # candidate. Review of #2624 (controller, 2026-10-14).
+    return len(mine) == 1 and any(
+        one.answers_to(_norm(mine[0].get(k))) for k in _STORED_VARIANT_ID_KEYS
+    )
 
 
 def choose_handover_variant(
