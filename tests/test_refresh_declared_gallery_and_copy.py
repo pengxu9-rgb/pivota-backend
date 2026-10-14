@@ -429,3 +429,24 @@ def test_a_gallery_the_refresh_writes_is_stamped_as_a_page_read(monkeypatch):
     row = _seed_row(seed_data=_polluted_seed_data(description=REAL_COPY))
     stored = _refresh(monkeypatch, row, _snapshot(_page_html(jsonld_description=REAL_COPY)))
     assert stored["seed_data"]["image_urls_source"] == "page_read"
+
+
+def test_the_ops_refresh_script_never_patches_over_another_writers_gallery():
+    """scripts/ops_refresh_external_seeds.py PATCHes a page read's gallery onto a seed; it follows
+    the refresh's stamp rule."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "ops_refresh_external_seeds.py"
+    spec = importlib.util.spec_from_file_location("ops_refresh_external_seeds", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert mod.page_read_may_replace_gallery({"seed_data": {}}) is True
+    assert mod.page_read_may_replace_gallery({"seed_data": {"image_urls_source": "page_read"}}) is True
+    assert mod.page_read_may_replace_gallery({"seed_data": {"image_urls_source": "storefront_products_json"}}) is False
+    # The key and value are the refresh's own.
+    from routes.employee_products import SEED_IMAGE_URLS_SOURCE_KEY, SEED_IMAGE_URLS_SOURCE_PAGE_READ
+
+    assert mod._GALLERY_SOURCE_KEY == SEED_IMAGE_URLS_SOURCE_KEY
+    assert SEED_IMAGE_URLS_SOURCE_PAGE_READ in mod._PAGE_READ_SOURCES

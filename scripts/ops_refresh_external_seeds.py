@@ -270,6 +270,18 @@ async def _preview_seed(
     return True, f"preview_variants={len(cleaned)} preview_images={len(cleaned_images)}", cleaned, cleaned_images
 
 
+# The stamp the refresh reads (routes/employee_products.SEED_IMAGE_URLS_SOURCE_KEY): a gallery
+# another writer stamped -- e.g. the drain's storefront products.json gallery -- is never replaced
+# by a page read. This script's PATCH is a page read, so it follows the same rule.
+_GALLERY_SOURCE_KEY = "image_urls_source"
+_PAGE_READ_SOURCES = (None, "page_read")
+
+
+def page_read_may_replace_gallery(seed: Dict[str, Any]) -> bool:
+    seed_data = seed.get("seed_data") if isinstance(seed.get("seed_data"), dict) else {}
+    return seed_data.get(_GALLERY_SOURCE_KEY) in _PAGE_READ_SOURCES
+
+
 async def _patch_seed(
     client: httpx.AsyncClient,
     base_url: str,
@@ -394,6 +406,8 @@ async def main_async(args: argparse.Namespace) -> int:
                             elif not variants and not image_urls:
                                 ok, msg = False, f"preview_empty:{prev_msg}"
                             else:
+                                if not page_read_may_replace_gallery(seed_before):
+                                    image_urls = []
                                 patch_ok, patch_msg = await _patch_seed(
                                     client, base_url, token, seed_id, variants, image_urls, args.timeout
                                 )
