@@ -69,7 +69,7 @@ def _summaries(recs):
     ("<p><span>保湿</span><span>クリーム</span></p>", "保湿クリーム"),
     ("<p>Long<b>-</b>wear and non<b>-comedogenic</b>.</p>", "Long-wear and non-comedogenic."),
     ("<p>With vitamin B<sub>5</sub>, H<sub>2</sub>O and 10<sup>th</sup>-gen peptides.</p>",
-     "With vitamin B5, H2O and 10th-gen peptides."),
+     "With vitamin B\u2085, H\u2082O and 10th-gen peptides."),  # numeric sub/sup: Unicode, still attached
     ("<p>Only $1,<b>000</b> units.</p>", "Only $1,000 units."),
     ("<p>Opens 10:<b>30</b></p>", "Opens 10:30"),
     ("<p><b>保湿</b>クリーム。</p>", "保湿クリーム。"),

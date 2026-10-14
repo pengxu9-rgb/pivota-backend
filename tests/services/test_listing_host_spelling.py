@@ -92,3 +92,26 @@ def test_a_folded_variant_s_own_listing_is_respelled_with_its_offer():
     assert out["pdp"]["variants"][0]["own_listing_url"] == f"https://{APEX}/products/base-duo-light"
     assert record["pdp"]["variants"][0]["own_listing_url"] == f"https://{WWW}/products/base-duo-light"  # a copy
     assert {o["destination_url"] for o in out["offers"]} == {f"https://{APEX}/products/base-duo"}
+
+
+def _as_spelled(record, netloc):
+    """`record` as a lane that kept the host's letter case would carry it (the curated producer lowercases)."""
+    host = urlsplit(record["offers"][0]["canonical_url"]).netloc
+    out = json.loads(json.dumps(record).replace(f"://{host}/", f"://{netloc}/"))
+    if out["pdp"].get("source_domain"):
+        out["pdp"]["source_domain"] = netloc
+    return out
+
+
+def _netlocs(plan):
+    return {urlsplit(json.loads(o["offer_payload"])["destination_url"]).netloc for o in plan["offers"]}
+
+
+def test_the_stored_host_is_written_as_stored_letter_case_included():
+    """The ids hash the host as spelled: a lowercased copy of a stored upper-case host re-mints just the same."""
+    for stored_as, crawled in (("WWW.Store.example", APEX), ("Store.example", APEX), (WWW, "WWW.STORE.example")):
+        before = ingest_validated_jsonl([_as_spelled(_record(APEX), stored_as)])
+        record = _record(APEX) if crawled == APEX else _as_spelled(_record(APEX), crawled)
+        plan = ingest_validated_jsonl([record], current_listings=_stored(before))
+        assert _ids(plan) == _ids(before) and _ids(plan, "seeds", "id") == _ids(before, "seeds", "id")
+        assert _netlocs(plan) == {stored_as} and len(plan["listing_respellings"]) == 1
