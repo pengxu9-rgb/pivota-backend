@@ -927,6 +927,38 @@ def _adopt_seed_variants(
     return out
 
 
+def _stated_variant_currencies(variants: List[Dict[str, Any]]) -> set:
+    return {
+        str(v.get(k)).strip().upper()
+        for v in variants or []
+        if isinstance(v, dict)
+        for k in ("price_currency", "currency")
+        if v.get(k) and str(v.get(k)).strip()
+    }
+
+
+def _foreign_variant_currencies(
+    *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]], market: Optional[str]
+) -> List[str]:
+    """The currencies `incoming` states that this seed may not store; empty when it may adopt them.
+
+    A page read's variants carry the currency the PAGE was served in, and a store can geo-serve
+    another market's page to the crawler. Probed 2026-10-13: a US seed that read a CAD-priced page
+    stored CAD variant prices. The offer dual-write refused the offer, but the seed itself broke
+    "price currency = market currency", and the builders serve its variants.
+
+    The market's currency decides. Only a market with no known currency falls back to the stored
+    variants' currencies: holding a known market to its stored ones too would stop a USD read from
+    healing a US seed whose variants an earlier read already left in CAD. A read variant with no
+    stated currency does not count; it is filled from the market downstream."""
+    stated = _stated_variant_currencies(incoming)
+    expected = MARKET_EXPECTED_CURRENCY.get(_normalize_market(market))
+    allowed = {expected} if expected else _stated_variant_currencies(existing)
+    if not allowed:
+        return []
+    return sorted(stated - allowed)
+
+
 def _should_overwrite_seed_variants(
     *,
     existing: List[Dict[str, Any]],
@@ -4125,7 +4157,9 @@ async def create_external_seed(
             seed_data["snapshot"]["description"] = snap_description
         if body.variants is not None and body.variants:
             seed_data["variants"] = body.variants
-        elif snap_variants:
+        elif snap_variants and not _foreign_variant_currencies(
+            existing=_seed_variants(seed_data), incoming=snap_variants, market=market
+        ):
             existing_variants = _seed_variants(seed_data)
             if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=title):
                 seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=snap_variants)
@@ -4221,7 +4255,12 @@ async def create_external_seed(
             if body.image_urls is not None
             else snap_image_urls,
             "availability": availability,
-            "variants": body.variants or (snap_variants or []),
+            "variants": body.variants
+            or (
+                snap_variants
+                if snap_variants and not _foreign_variant_currencies(existing=[], incoming=snap_variants, market=market)
+                else []
+            ),
             "utm_template": utm_template,
             "partner_type": partner_type,
             "disclosure_text": disclosure_text,
@@ -5438,7 +5477,14 @@ async def _refresh_external_seed_by_id(
         seed_data["image_urls"] = snap_image_urls
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
-    if adoptable_variants:
+    variant_adoption_refused = None
+    foreign_currencies = _foreign_variant_currencies(
+        existing=_seed_variants(seed_data), incoming=adoptable_variants or [], market=market
+    )
+    if adoptable_variants and foreign_currencies:
+        # Keep the stored variants. The reconcile below re-reads only same-currency offers.
+        variant_adoption_refused = {"reason": "currency_not_the_seeds", "currencies": foreign_currencies}
+    elif adoptable_variants:
         existing_variants = _seed_variants(seed_data)
         product_title = seed_data.get("title") or snap_title
         if _should_overwrite_seed_variants(existing=existing_variants, incoming=adoptable_variants, product_title=product_title):
@@ -5823,6 +5869,8 @@ async def _refresh_external_seed_by_id(
         "seed_data": seed_data,
         # The page's title, when it was a variant's option label and was not written.
         "snapshot_title_refused": snapshot_title_refused,
+        # The page's variants, when they were priced in a currency this seed may not store.
+        "variant_adoption_refused": variant_adoption_refused,
         # DID THIS "SUCCESS" ACTUALLY CONTACT THE ORIGIN? Often not, and the status alone
         # cannot say. `resolve_external_offer` honours `raise_on_unavailable` ONLY in its
         # `except ExternalOfferUnavailable` arm; anything else — a timeout, TLS, robots, and
