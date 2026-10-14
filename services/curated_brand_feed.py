@@ -965,6 +965,21 @@ _INLINE_TAGS = frozenset({
 })
 # Sub/superscripts attach to their base: H<sub>2</sub>O, vitamin B<sub>5</sub>, 10<sup>th</sup>.
 _ATTACHED_TAGS = frozenset({"sub", "sup"})
+# A NUMERIC sub/superscript keeps its position: rendered as the Unicode sub/superscript characters,
+# still attached. Flattened to plain digits, a footnote marker glued to its word reads as part of it --
+# "Ceramide<sup>1</sup>" became "Ceramide1", "week<sup>3</sup>." became "week3." -- and a formula lost
+# its subscript. Now: "Ceramide\u00b9", "week\u00b3.", "H\u2082O", "m\u00b2", "10\u2076". Only content
+# that is digits (with + - = ( ) and a minus sign), or a comma list of such ("1, 2" keeps its ", "),
+# is converted; anything else -- "10<sup>th</sup>", "<sup>*</sup>", "<sup>TM</sup>", a letter -- is
+# attached as before. Tags nested inside ("<sup><span>1</span></sup>") are looked through.
+_SCRIPT_TAG_RE = re.compile(r"(?is)<\s*(sup|sub)\b[^<>]*>(.{0,200}?)<\s*/\s*\1\s*>")
+_SCRIPT_CONTENT_RE = re.compile(r"[0-9+\-=()\u2212]*[0-9][0-9+\-=()\u2212]*(?:, *[0-9+\-=()\u2212]*[0-9][0-9+\-=()\u2212]*)*")
+_SUPERSCRIPT = str.maketrans("0123456789+-=()\u2212", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207a\u207b\u207c\u207d\u207e\u207b")
+_SUBSCRIPT = str.maketrans("0123456789+-=()\u2212", "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089\u208a\u208b\u208c\u208d\u208e\u208b")
+# Every character a numeric sub/superscript can become: a safety cue right before one is still a cue.
+SCRIPT_NUMERAL_CHARS = "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207a\u207b\u207c\u207d\u207e" \
+                       "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089\u208a\u208b\u208c\u208d\u208e"
+_SCRIPT_NUMERAL_RE = re.compile(f"[{SCRIPT_NUMERAL_CHARS}]")
 _TAG_NAME_RE = re.compile(r"<\s*/?\s*([A-Za-z][A-Za-z0-9]*)")
 # A tag-shaped token in text that has already been unescaped: a letter right after `<` or `</`,
 # and (checked in `_escaped_tag_replacement`) a real HTML element name. Narrower than _HTML_TAG_RE
@@ -998,6 +1013,22 @@ def _tag_replacement(m: "re.Match[str]") -> str:
     if tag in _INLINE_TAGS:
         return _INLINE_CLOSE_MARK if re.match(r"<\s*/", m.group(0)) else _INLINE_MARK
     return "\n"
+
+
+def _script_numeral(m: "re.Match[str]") -> str:
+    """A numeric <sup>/<sub> -> its Unicode characters between attached marks (no gap either side);
+    any other one is left for the tag pass, which attaches it as before. Converted only when nothing
+    in it could be a separator: no whitespace but the spaces after a list comma (kept: "1, 2" keeps
+    its ", ", so "1 2" never reads as twelve), and no tag but an inline one (a block break inside a
+    malformed sup is still a break)."""
+    inner = m.group(2)
+    if any(name.lower() not in _INLINE_TAGS for name in _TAG_NAME_RE.findall(inner)):
+        return m.group(0)
+    content = html.unescape(_HTML_TAG_RE.sub("", inner))
+    if not _SCRIPT_CONTENT_RE.fullmatch(content):
+        return m.group(0)
+    table = _SUPERSCRIPT if m.group(1).lower() == "sup" else _SUBSCRIPT
+    return _ATTACHED_MARK + content.translate(table) + _ATTACHED_MARK
 
 
 def _escaped_tag_replacement(m: "re.Match[str]") -> str:
@@ -1220,8 +1251,9 @@ _SAFETY_CUE_RE = re.compile(
 
 
 def is_safety_text(sentence: str) -> bool:
-    """True when the sentence carries a safety cue (a warning, a precaution, a medical instruction)."""
-    return bool(_SAFETY_CUE_RE.search(sentence or ""))
+    """True when the sentence carries a safety cue (a warning, a precaution, a medical instruction).
+    A sub/superscript numeral is a word boundary here: "avoid the eyes\u00b9" carries "eyes"."""
+    return bool(_SAFETY_CUE_RE.search(_SCRIPT_NUMERAL_RE.sub(" ", sentence or "")))
 
 
 def _without_boilerplate(sentence: str) -> Optional[str]:
@@ -1276,6 +1308,7 @@ def _strip_markup(body_html: str) -> str:
     text = _MARK_RUN_RE.sub("", str(body_html))
     for round_no in range(_UNESCAPE_ROUNDS):
         text = _HTML_BLOCK_RE.sub("\n", text)
+        text = _SCRIPT_TAG_RE.sub(_script_numeral, text)
         # Raw markup: every `<...>` is a tag. After an unescape, only a tag-SHAPED token is.
         text = (_HTML_TAG_RE.sub(_tag_replacement, text) if round_no == 0
                 else _TAG_LIKE_RE.sub(_escaped_tag_replacement, text))
@@ -1284,6 +1317,7 @@ def _strip_markup(body_html: str) -> str:
             break
         text = unescaped
     text = _HTML_BLOCK_RE.sub("\n", text)
+    text = _SCRIPT_TAG_RE.sub(_script_numeral, text)
     text = _TAG_LIKE_RE.sub(_escaped_tag_replacement, text)
     return _MARK_RUN_RE.sub(_inline_gap, text)
 
@@ -3740,18 +3774,45 @@ def _is_extended_stub(product: Dict[str, Any]) -> bool:
 
 #: A quantity written in a title ("Glow Serum 30ml"): the parent's own item on a size axis.
 _TITLE_QUANTITY_RE = re.compile(r"(?i)\b\d+(?:[.,]\d+)?\s*(?:ml|l|g|kg|mg|oz|fl\.?\s*oz)\b")
-#: Neutral labels for a parent's own placeholder item, by its children's axis, in order of preference.
-_PARENT_ITEM_LABELS = {"size": ("Standard", "Regular"), "shade": ("Original", "Classic")}
+#: A title that counts units ("2 x 4.5g", "4.5g x2", "Duo", "Set of 3", "4.5g Set", "3 Pack", "25g 10 Sheets"): its
+#: quantity is one unit's, not the item's size, so it names no size for the parent's own item.
+_TITLE_MULTI_UNIT_RE = re.compile(
+    r"(?i)\d\s*[x×]\s*\d|\b[x×]\s*\d|\d\s*[x×]\b|\b(duo|trio|set|sets|pack|packs|bundle|kit)\b"
+    r"|\b\d+\s*(?:sheets?|pcs|pieces?|pads?|count|ct|capsules?|ampoules?|masks?|sachets?|patch(?:es)?|pairs?)\b")
+#: Neutral labels for a parent's own placeholder item on a SIZE axis, in order of preference.
+_PARENT_SIZE_LABELS = ("Standard", "Regular")
 
 
-def _parent_item_label(title: str, family: str, *, taken: set) -> Optional[str]:
-    """The label for a priced parent's own placeholder item: the quantity its title states for a size axis
-    ("Glow Serum 30ml" -> "30ml"), else a neutral word ("Standard" for sizes, "Original" otherwise) -- the first
-    that no child already uses (a repeated label would make the seed writer drop them all). None when every
-    candidate is taken: the item is then left unlabelled, as before."""
-    found = _TITLE_QUANTITY_RE.search(title or "") if family == "size" else None
-    candidates = ([" ".join(found.group(0).split())] if found else []) + list(
-        _PARENT_ITEM_LABELS["size" if family == "size" else "shade"])
+def _listing_handle_usable(base_handle: str, handle: str) -> bool:
+    """Will the offer writer point a folded variant at /products/<handle>? The SAME predicate it uses
+    (ingestion.own_listing_url), on the URLs the record builder spells: the base's listing and the child's,
+    on one host. The fold does not know the host, and the predicate's host rule only asks that the two share
+    one, so any host gives the writer's answer for the handle itself."""
+    from services.catalog_enrichment_agent.ingestion import own_listing_url
+
+    if not str(handle or "").strip() or "/" in str(handle):
+        return False
+    host = "fold.invalid"
+    url = f"https://{host}/products/{handle}"
+    return own_listing_url(f"https://{host}/products/{base_handle or handle}", url) == url
+
+
+def _parent_item_label(title: str, *, taken: set) -> Optional[str]:
+    """The label for a priced parent's own placeholder item on a SIZE axis, or None to leave it unlabelled.
+
+    The ONE quantity its title states ("Glow Serum 30ml" -> "30ml"; not a multi-unit title, not
+    a title naming two quantities), else "Standard" -- the first candidate no child already uses (a repeated
+    label makes the seed writer drop them all). "Standard" says what the item is (the regular size), and invents
+    no measurement.
+
+    Never called for any other axis (the fold labels the item only when every folded child is a size). A colour
+    name the shop never wrote ("Original", "Classic") would be presented as a real shade in the picker, so on a
+    shade axis the item stays unlabelled and the existing all-or-nothing rule
+    (ingestion._drop_options_that_do_not_distinguish) serves the product as a plain list of named variants: no
+    picker, but nothing false in it."""
+    title = title or ""
+    found = [] if _TITLE_MULTI_UNIT_RE.search(title) else _TITLE_QUANTITY_RE.findall(title)
+    candidates = ([" ".join(found[0].split())] if len(found) == 1 else []) + list(_PARENT_SIZE_LABELS)
     return next((c for c in candidates if _norm_label(c) not in taken), None)
 
 
@@ -3867,9 +3928,10 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
                 break
             if multi:
                 break  # a suffixed multi-variant listing is a distinct line, as in the legacy fold
-            if not handle_of(p).strip() or "/" in handle_of(p):
-                # A folded variant is sold on its own listing (/products/<handle>); without one its offer, or the
-                # canonical one, would fall back to the parent's page at the child's price.
+            if not _listing_handle_usable(handle_of(base), handle_of(p)):
+                # A folded variant is sold on its own listing (/products/<handle>); a handle the offer writer will
+                # not point at (ingestion.own_listing_url: empty, "/", "?", "#", ...) would put its offer -- or
+                # the canonical one -- on the parent's page at the child's price.
                 refuse(p, "child_handle_unusable")
                 break
             name, family, evidence = _child_axis(p, suffix)
@@ -3978,12 +4040,13 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
         # children it makes the seed writer drop EVERY label (ingestion._drop_options_that_do_not_distinguish), so
         # the folded product would have no picker. It gets a label on the children's axis instead.
         added_families = {target[id(k)][4] for k in kids if handle_of(k) in folded_handles}
-        if len(own) == 1 and not _variant_label(own[0]) and len(added_families) == 1:
-            family = next(iter(added_families))
-            label = _parent_item_label(title_of(p), family, taken={_norm_label(v.get("title")) for v in added})
+        # Only when EVERY folded child is a size (_parent_item_label: no shade name is invented, and across
+        # mixed axes the seed writer drops the labels anyway).
+        if len(own) == 1 and not _variant_label(own[0]) and added_families == {"size"}:
+            label = _parent_item_label(title_of(p), taken={_norm_label(v.get("title")) for v in added})
             if label:
-                own[0] = dict(own[0], title=label, option1=label, **{FOLD_AXIS_KEY: spelling.get(family) or (
-                    _DEFAULT_SIZE_OPTION_NAME if family == "size" else _DEFAULT_SHADE_OPTION_NAME)})
+                own[0] = dict(own[0], title=label, option1=label,
+                              **{FOLD_AXIS_KEY: spelling.get("size") or _DEFAULT_SIZE_OPTION_NAME})
                 report["parent_items_labelled"].append({"base_handle": base_handle, "label": label})
         # Two axes on one product: the seed writer then drops every label and serves the bare list
         # (ingestion._drop_options_that_do_not_distinguish). Folded anyway, and named for the reviewer.
