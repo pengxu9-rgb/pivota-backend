@@ -34,6 +34,7 @@ from models.standard_product import StandardProduct
 from utils.auth import get_current_employee, require_employee_permissions
 
 from services import external_seed_destination_liveness as destination_liveness
+from services import market_registry
 from services import seed_served_url
 from services.external_offers_service import (
     ExternalOfferUnavailable,
@@ -1478,6 +1479,33 @@ def _normalize_market(market: Optional[str]) -> str:
     return m or "US"
 
 
+def _seed_market_refusal(market: Optional[str]) -> Optional[str]:
+    """Why a seed may not be filed under `market`, or None when it may.
+
+    The seed writers (create, storefront backfill, CSV import, edit) file a seed under the market the
+    request DECLARES, and only one the market registry lets us ingest (ADR-026 decision 2: an `off`
+    market is unknown to ingestion; an unlisted one raises). A missing market is refused, never read as
+    US, and a market is never inferred from a currency (ADR-026 decision 1): the storefront backfill
+    used to file EUR-priced seeds under a market no registry lists."""
+    code = market_registry.normalize_market(market)
+    if not code:
+        return "MARKET_REQUIRED"
+    entry = market_registry.market_or_none(code)
+    if entry is None:
+        return f"UNKNOWN_MARKET:{code}"
+    if not entry["ingest"]:
+        return f"MARKET_NOT_INGESTED:{code}"
+    return None
+
+
+def _declared_seed_market(market: Optional[str]) -> str:
+    """The declared seed market, normalized; a 400 for any market `_seed_market_refusal` refuses."""
+    refusal = _seed_market_refusal(market)
+    if refusal is not None:
+        raise HTTPException(status_code=400, detail=refusal)
+    return market_registry.normalize_market(market)
+
+
 def _normalize_tool(tool: Optional[str]) -> str:
     t = str(tool or "").strip()
     return t or "*"
@@ -1808,14 +1836,6 @@ def _normalize_seed_availability(raw: Any) -> Optional[str]:
     return s.lower().replace(" ", "_")
 
 
-_CURRENCY_TO_REFERRAL_MARKET = {
-    "USD": "US",
-    "SGD": "SG",
-    "JPY": "JP",
-    "EUR": "EU-DE",
-}
-
-
 def _extract_storefront_handle(product_data: Dict[str, Any]) -> Optional[str]:
     raw = _ensure_dict(product_data.get("raw"))
     platform_metadata = _ensure_dict(product_data.get("platform_metadata"))
@@ -1932,27 +1952,15 @@ def _build_storefront_seed_variants(
     ]
 
 
-def _infer_storefront_referral_market(candidates: List[Dict[str, Any]], explicit_market: Optional[str]) -> str:
-    if explicit_market:
-        return _normalize_market(explicit_market)
-    counts: Dict[str, int] = {}
-    for candidate in candidates:
-        currency = str(candidate.get("price_currency") or "").strip().upper()
-        market = _CURRENCY_TO_REFERRAL_MARKET.get(currency)
-        if not market:
-            continue
-        counts[market] = int(counts.get(market) or 0) + 1
-    if not counts:
-        return "US"
-    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
-
-
 async def _fetch_storefront_referral_seed_candidates(
     *,
     merchant_id: str,
     limit: int,
-    market: Optional[str],
+    market: str,
 ) -> Dict[str, Any]:
+    """`market` is the caller's DECLARED market (`_declared_seed_market`), stamped on every candidate.
+    It is never read off the candidates' currency (ADR-026 decision 1)."""
+    market = _declared_seed_market(market)
     matched_domains = await get_merchant_referral_domains(merchant_id)
     primary_domain = matched_domains[0] if matched_domains else None
     if not primary_domain:
@@ -1960,7 +1968,7 @@ async def _fetch_storefront_referral_seed_candidates(
             "merchant_id": merchant_id,
             "matched_domains": matched_domains,
             "primary_domain": None,
-            "market": _normalize_market(market),
+            "market": market,
             "candidates": [],
         }
 
@@ -2040,16 +2048,15 @@ async def _fetch_storefront_referral_seed_candidates(
         if len(candidates) >= int(limit or 50):
             break
 
-    resolved_market = _infer_storefront_referral_market(candidates, market)
     for candidate in candidates:
-        candidate["market"] = resolved_market
+        candidate["market"] = market
         candidate["external_product_id"] = _stable_external_product_id(candidate["storefront_url"])
 
     return {
         "merchant_id": merchant_id,
         "matched_domains": matched_domains,
         "primary_domain": primary_domain,
-        "market": resolved_market,
+        "market": market,
         "candidates": candidates,
     }
 
@@ -2087,7 +2094,7 @@ async def _upsert_storefront_referral_seed_candidate(
     attached_product_key = str(candidate.get("attached_product_key") or "").strip()
     storefront_url = str(candidate.get("storefront_url") or "").strip()
     external_product_id = str(candidate.get("external_product_id") or "").strip()
-    market = _normalize_market(candidate.get("market"))
+    market = _declared_seed_market(candidate.get("market"))
     tool = "*"
 
     existing_row = await database.fetch_one(
@@ -2203,11 +2210,13 @@ async def _upsert_storefront_referral_seed_candidate(
                     "title": row.get("title") or candidate.get("title"),
                 }
 
+        # The row keeps the market it is filed under: a backfill refreshes a seed, it never re-files
+        # one (the existing row is matched by product key or URL in ANY market). Moving a seed to
+        # another market partition is a reviewed repair, not a side effect of re-running a backfill.
         await _execute_seed_data_stmt(
             """
             UPDATE external_product_seeds
             SET external_product_id = :external_product_id,
-                market = :market,
                 tool = :tool,
                 utm_template = :utm_template,
                 partner_type = :partner_type,
@@ -2229,11 +2238,12 @@ async def _upsert_storefront_referral_seed_candidate(
             WHERE id = :id
             """,
             {
-                **values,
+                **{k: v for k, v in values.items() if k != "market"},
                 "id": row.get("id"),
             },
         )
         seed_id = str(row.get("id") or "").strip()
+        market = str(row.get("market") or "")
         action = "updated"
     else:
         seed_id = _seed_id()
@@ -2299,6 +2309,7 @@ async def _upsert_storefront_referral_seed_candidate(
     return {
         "action": action,
         "seed_id": seed_id,
+        "market": market,
         "external_product_id": external_product_id,
         "attached_product_key": attached_product_key,
         "canonical_url": storefront_url,
@@ -2311,7 +2322,7 @@ async def _run_external_seed_import_task(
     task_id: str,
     csv_text: str,
     current_user: dict,
-    market: str,
+    market: Optional[str],
     tool: str,
     mode: str,
 ) -> None:
@@ -2433,11 +2444,17 @@ async def import_external_seeds_csv(
     req: Request,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_employee),
-    market: str = Query("US"),
+    # The market for rows that carry no `market` column. Optional (a sheet may declare every row's),
+    # never defaulted: a row with neither is refused (`_seed_market_refusal`).
+    market: Optional[str] = Query(None),
     tool: str = Query("*"),
     mode: str = Query("upsert"),
     async_import: bool = Query(False, alias="async"),
 ) -> ExternalSeedsCsvImportResponse:
+    if str(market or "").strip():
+        market = _declared_seed_market(market)
+    else:
+        market = None
     raw = await req.body()
     text = raw.decode("utf-8", errors="replace")
     if not text.strip():
@@ -2463,7 +2480,8 @@ async def import_external_seeds_csv(
             """,
             {
                 "id": task_id,
-                "market": _normalize_market(market),
+                # NOT NULL column; '' = no sheet-wide market (every row declares its own).
+                "market": market or "",
                 "tool": _normalize_tool(tool),
                 "mode": str(mode or "upsert").strip().lower(),
                 "created_by_employee_id": created_by,
@@ -2496,7 +2514,7 @@ async def _import_external_seeds_csv_text(
     *,
     text: str,
     current_user: dict,
-    market: str,
+    market: Optional[str],
     tool: str,
     mode: str,
 ) -> ExternalSeedsCsvImportResponse:
@@ -2518,7 +2536,8 @@ async def _import_external_seeds_csv_text(
     if not text.strip():
         raise HTTPException(status_code=400, detail="EMPTY_CSV")
 
-    default_market = _normalize_market(market)
+    # No US fallback: a row files under its own `market` column or this declared one, else it is refused.
+    default_market = market_registry.normalize_market(market)
     default_tool = _normalize_tool(tool)
     mode_norm = str(mode or "upsert").strip().lower()
     if mode_norm not in ("create", "upsert"):
@@ -2556,7 +2575,7 @@ async def _import_external_seeds_csv_text(
                     raise ValueError("MISSING_PRODUCT_URL")
                 product_url = _normalize_seed_url_for_id(_require_http_url(product_url_raw))
 
-                row_market = _normalize_market(nrow.get("market") or default_market)
+                row_market = _declared_seed_market(nrow.get("market") or default_market)
                 row_tool = _normalize_tool(nrow.get("tool") or default_tool)
 
                 product_title = str(nrow.get("product_title") or nrow.get("title") or "").strip() or None
@@ -2914,7 +2933,7 @@ async def _import_external_seeds_csv_text(
                     raise ValueError("MISSING_DESTINATION_URL")
                 dest = _normalize_seed_url_for_id(_require_http_url(destination_url))
 
-                row_market = _normalize_market(row.get("market") or default_market)
+                row_market = _declared_seed_market(row.get("market") or default_market)
                 row_tool = _normalize_tool(row.get("tool") or default_tool)
 
                 title = str(row.get("title") or "").strip() or None
@@ -3616,11 +3635,13 @@ async def backfill_storefront_external_seeds(
     merchant_id = str(body.merchant_id or "").strip()
     if not merchant_id:
         raise HTTPException(status_code=400, detail="MERCHANT_ID_REQUIRED")
+    # Declared, never read off the storefront's prices (ADR-026 decision 1).
+    market = _declared_seed_market(body.market)
 
     candidate_bundle = await _fetch_storefront_referral_seed_candidates(
         merchant_id=merchant_id,
         limit=body.limit,
-        market=body.market,
+        market=market,
     )
     candidates = list(candidate_bundle.get("candidates") or [])
     if body.dry_run:
@@ -3961,7 +3982,7 @@ async def create_external_seed(
     current_user: dict = Depends(get_current_employee),
 ):
     await _ensure_external_seeds_table()
-    market = _normalize_market(body.market)
+    market = _declared_seed_market(body.market)
     tool = _normalize_tool(body.tool)
     dest = _require_http_url(body.destination_url)
 
@@ -4569,7 +4590,7 @@ async def update_external_seed(
         set_clauses.append("external_product_id = :external_product_id")
 
     if body.market is not None:
-        updates["market"] = _normalize_market(body.market)
+        updates["market"] = _declared_seed_market(body.market)
         set_clauses.append("market = :market")
     if body.tool is not None:
         updates["tool"] = _normalize_tool(body.tool)
