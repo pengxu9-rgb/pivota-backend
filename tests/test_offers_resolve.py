@@ -5553,3 +5553,234 @@ def test_an_in_stock_offer_keeps_its_cart_byte_identical(
     _assert_cart(offer)
     assert offer["execution_spec"]["rail"] == "shopify_cart"
 
+
+
+# ---------------------------------------------------------------------------
+# A SEED-WIDE ATTACHED VARIANT ID NAMES ONE VARIANT'S CART, NOT EVERY OFFER'S
+#
+# The attached-Shopify branch of `_external_seed_redirect_identity` shipped the operator-typed
+# `attached_variant_id` as `cart_variant_id` for EVERY per-variant offer of the seed. Review of
+# #2620 (2026-10-14): an in-stock $19 offer shipped `cart_prefilled: true` with a cart for the
+# sold-out $29 sibling. A price belongs to the exact variant it was quoted for. These drive the
+# real route and the real mint with no catalog_skus rows (the operator id is the only identity),
+# and read each offer's own price and cart off the response.
+# ---------------------------------------------------------------------------
+
+_ATTACHED_B_VID = "43062643884185"
+
+
+def _attached_two_variant_row(*, b_availability: str = "in_stock", attached: str = _ATTACHED_B_VID,
+                              b_ids: dict = None) -> dict:
+    row = _seed_row_for_exec_spec(evidence=False)
+    row["attached_product_key"] = "prod::m_brand::shopify::serum"
+    row["attached_variant_id"] = attached
+    row["seed_data"] = {
+        **row["seed_data"],
+        "variants": [
+            {"variant_id": "SKU-30ML", "title": "30ml", "price_amount": 19.0,
+             "price_currency": "USD", "availability": "in_stock"},
+            {"variant_id": "SKU-50ML", "title": "50ml", "price_amount": 29.0,
+             "price_currency": "USD", "availability": b_availability,
+             **(b_ids if b_ids is not None else {"shopify_variant_id": _ATTACHED_B_VID})},
+        ],
+    }
+    return row
+
+
+def _resolve_every_variant(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: dict) -> dict:
+    """offers.resolve by PRODUCT, so every stored variant becomes its own offer. Keyed by price."""
+    by_price = {float(o["price"]): o for o in _resolve_by_product(monkeypatch, client, row)}
+    assert set(by_price) == {19.0, 29.0}, f"one offer per stored variant: {sorted(by_price)}"
+    return by_price
+
+
+def _resolve_by_product(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: dict) -> list:
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [row]
+        return []
+
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "ext_spec"}, "limit": 10, "market": "US",
+                          "tool": "*"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200, res.text
+    offers = [o for o in (res.json().get("offers") or [])
+              if o.get("purchase_route") == "affiliate_outbound"]
+    assert offers, "the external offer must be returned for this to prove anything"
+    return offers
+
+
+def test_a_sibling_offer_is_not_handed_the_attached_variants_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The review's probe: $19 offer A in stock, the attached $29 variant B sold out. Before the
+    fix A shipped `cart_prefilled: true` with a cart for B."""
+    offers = _resolve_every_variant(
+        monkeypatch, client, _attached_two_variant_row(b_availability="out_of_stock"))
+    a = offers[19.0]
+    assert a["in_stock"] is True
+    assert a["execution_spec"]["cart_url"] is None, a["execution_spec"]
+    assert _ATTACHED_B_VID not in _dest_of(a), "A's link must not carry B's variant"
+    assert "/cart/" not in _dest_of(a)
+    assert a["execution_spec"]["tracking"]["join_mode"] == "referral_only"
+    assert offers[29.0]["execution_spec"]["cart_url"] is None, "B is sold out (#2620)"
+
+
+def test_the_attached_variant_keeps_its_own_cart_and_only_it(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    offers = _resolve_every_variant(monkeypatch, client, _attached_two_variant_row())
+    b = offers[29.0]
+    assert b["cart_prefilled"] is True
+    assert f"/cart/{_ATTACHED_B_VID}:1" in b["execution_spec"]["cart_url"]
+    assert b["execution_spec"]["variant_id"] == _ATTACHED_B_VID
+    a = offers[19.0]
+    assert a["execution_spec"]["cart_url"] is None, "the $19 offer is not the attached variant"
+
+
+def test_a_gid_attached_id_still_finds_its_variant(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Compared canonically: a gid attachment and the variant's bare numeric id are one variant."""
+    offers = _resolve_every_variant(monkeypatch, client, _attached_two_variant_row(
+        attached=f"gid://shopify/ProductVariant/{_ATTACHED_B_VID}"))
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offers[29.0]["execution_spec"]["cart_url"]
+    assert offers[19.0]["execution_spec"]["cart_url"] is None
+
+
+def test_an_attached_id_no_stored_variant_answers_to_names_no_offer(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Two variants, and neither carries the attached id: we cannot say which one the operator
+    meant, so neither offer is handed a cart built from it."""
+    offers = _resolve_every_variant(monkeypatch, client, _attached_two_variant_row(b_ids={}))
+    for offer in offers.values():
+        assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
+
+def test_a_single_variant_seed_keeps_the_operator_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Nothing to choose between: the pre-existing behaviour, byte for byte."""
+    import routes.agent_shop_gateway as gateway
+
+    row = _attached_two_variant_row()
+    row["seed_data"]["variants"] = row["seed_data"]["variants"][:1]
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [row]
+        return []
+
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "ext_spec"}, "limit": 10, "market": "US",
+                          "tool": "*"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200, res.text
+    (offer,) = [o for o in res.json()["offers"] if o.get("purchase_route") == "affiliate_outbound"]
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offer["execution_spec"]["cart_url"]
+
+
+# Review of #2623, round 1: the "nothing to choose" shortcuts were reachable with a choice.
+
+
+def test_an_id_less_two_variant_seed_hands_its_one_offer_no_attached_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """P1 probe. Neither stored variant has an id, so both offers dedupe to the first ($19) one,
+    which used to look product-grain and took the $29 variant's cart."""
+    row = _attached_two_variant_row(b_ids={})
+    for v in row["seed_data"]["variants"]:
+        v.pop("variant_id")
+    (offer,) = _resolve_by_product(monkeypatch, client, row)
+    assert float(offer["price"]) == 19.0
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+    assert "/cart/" not in _dest_of(offer)
+
+
+def test_a_lone_variant_naming_another_merchant_id_takes_no_attached_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """P2 probe. One stored variant whose own id is a DIFFERENT merchant-issued variant: there is
+    a choice, and the entry has already made it."""
+    row = _attached_two_variant_row()
+    row["seed_data"]["variants"] = [{"variant_id": "43062643884100", "title": "30ml",
+                                     "price_amount": 19.0, "price_currency": "USD",
+                                     "availability": "in_stock"}]
+    (offer,) = _resolve_by_product(monkeypatch, client, row)
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
+
+def test_two_entries_sharing_one_id_do_not_lend_each_other_a_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """P4 probe. Both entries are `sku: X`; only the second carries the attached id. The offers
+    dedupe to the first ($19) entry, which must not take the second's cart."""
+    row = _attached_two_variant_row()
+    a, b = row["seed_data"]["variants"]
+    for v in (a, b):
+        v.pop("variant_id")
+        v["sku"] = "X"
+    (offer,) = _resolve_by_product(monkeypatch, client, row)
+    assert float(offer["price"]) == 19.0
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
+
+def test_an_explicit_other_gid_on_an_empty_seed_takes_no_attached_cart() -> None:
+    """P2 probe, product-grain caller: no stored variants, and the offer names a different
+    variant as a Shopify gid, which is unambiguously a variant claim."""
+    import routes.agent_shop_gateway as gateway
+
+    kw = dict(product_key="prod::m_brand::shopify::serum", product_id="serum")
+    assert gateway._attached_variant_is_this_offer(
+        {}, offer_variant_id="gid://shopify/ProductVariant/43062643884100",
+        attached_variant_id=_ATTACHED_B_VID, **kw,
+    ) is False
+    assert gateway._attached_variant_is_this_offer(
+        {}, offer_variant_id=f"gid://shopify/ProductVariant/{_ATTACHED_B_VID}",
+        attached_variant_id=_ATTACHED_B_VID, **kw,
+    ) is True, "the attached variant itself, in either spelling, still takes it"
+
+
+def test_a_bare_number_offer_string_may_not_refuse_the_attached_cart() -> None:
+    """The deliberate limit of the P2 fix. A product-grain caller's offer string comes from
+    `_seed_offer_variant_id`, whose chain includes `sku`; a bare number there may be a barcode,
+    which may match but never refuse (pinned by
+    test_shopify_variant_identity::test_an_attached_shopify_seed_uses_catalog_identity_not_the_sku_chain).
+    A stored entry's CLAIM keys still contradict — see the lone-variant probe above."""
+    import routes.agent_shop_gateway as gateway
+
+    assert gateway._attached_variant_is_this_offer(
+        {}, offer_variant_id="43062643884100", attached_variant_id=_ATTACHED_B_VID,
+        product_key="prod::m_brand::shopify::serum", product_id="serum",
+    ) is True
+
+
+def test_a_product_grain_offer_shared_by_two_entries_takes_no_attached_cart() -> None:
+    """P4, product-grain path: two entries answer to the offer's id `X`, only the second carries
+    the attached id. Which entry the offer is cannot be said, so it takes no cart."""
+    import routes.agent_shop_gateway as gateway
+
+    seed = {"variants": [{"sku": "X", "price_amount": 19.0},
+                         {"sku": "X", "shopify_variant_id": _ATTACHED_B_VID, "price_amount": 29.0}]}
+    assert gateway._attached_variant_is_this_offer(
+        seed, offer_variant_id="X", attached_variant_id=_ATTACHED_B_VID,
+        product_key="prod::m_brand::shopify::serum", product_id="serum",
+    ) is False
+
