@@ -4705,6 +4705,12 @@ async def _handle_offers_resolve(
                         ),
                     )
 
+            # WHAT A NAMED VARIANT GOT. `exact`: the caller's sku_id is one of this listing's stored variants,
+            # so the offer IS that variant (with or without a cart). `fallback`: it is not, and the offer below
+            # is the listing at its row price, selling no particular variant. The gateway keeps only `exact`
+            # offers for a named variant (PIVOTA-Agent #2438); without this it could only trust a cart, and a
+            # sold-out, non-Shopify or referral-only seller of the variant has none.
+            variant_match = ("exact" if matched_variants else "fallback") if sku_id else None
             if not matched_variants:
                 matched_variants = [{}]
 
@@ -5241,6 +5247,7 @@ async def _handle_offers_resolve(
                             "seed_id": seed_id,
                             "external_product_id": row_dict.get("external_product_id") or seed_data.get("external_product_id"),
                             "variant_id": vid,
+                            **({"variant_match": variant_match} if variant_match else {}),
                             "title": title,
                             "image_url": _seed_image_url(row_dict, seed_data),
                             "canonical_url": canonical_url,

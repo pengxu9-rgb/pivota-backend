@@ -406,3 +406,18 @@ def test_a_long_shade_range_is_capped_and_counted_whole(monkeypatch, client):
     (offer,) = _seed_offers(body)
     assert len(offer["variants"]) == _MAX_VARIANT_OPTIONS
     assert offer["variant_count"] == _MAX_VARIANT_OPTIONS + 5
+
+
+def test_a_named_variant_says_whether_it_matched_a_stored_variant(monkeypatch, client):
+    """`source.variant_match`: exact when sku_id is one of the listing's variants, fallback when the offer is
+    the listing at its row price for a variant it does not have (the gateway keeps only exact)."""
+    shades = [_shade(i, n) for i, n in enumerate(SHADES)]
+    body = _resolve(monkeypatch, client, [_seed(variants=shades)], product={"sku_id": shades[1]["variant_id"]})
+    (offer,) = _seed_offers(body)
+    assert offer["source"]["variant_match"] == "exact"
+    body = _resolve(monkeypatch, client, [_seed(variants=shades)], product={"sku_id": "999999999999"})
+    (offer,) = _seed_offers(body)
+    assert offer["source"]["variant_match"] == "fallback"
+    body = _resolve(monkeypatch, client, [_seed(variants=shades)], product={"product_id": "sig_rare_blush"})
+    (offer,) = _seed_offers(body)
+    assert "variant_match" not in offer["source"]
