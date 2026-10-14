@@ -1,6 +1,8 @@
 """onboard_external_brand_from_crawl threads the offer's real market/currency
-(e.g. a Korean D2C brand sells in KRW) instead of hardcoding US/USD. Verifies the
-SQL bind params _upsert_seed + _set_category_and_offer hand to the DB.
+(e.g. a Japanese D2C brand sells in JPY) instead of hardcoding US/USD. Verifies the
+SQL bind params _upsert_seed + _set_category_and_offer hand to the DB. A missing
+market is refused, never defaulted to US (ADR-026); the run-level guard is
+covered through the script's entry point in test_onboard_external_brand_declared_market.py.
 """
 
 from __future__ import annotations
@@ -35,28 +37,45 @@ def fake_db(monkeypatch):
     return db
 
 
-async def test_upsert_seed_carries_krw_market(fake_db):
+async def test_upsert_seed_carries_jpy_market(fake_db):
     # A9-3 (ADR-009 D3): _upsert_seed now stamps the derived seller-of-record.
     await onboard._upsert_seed({
         "external_product_id": "anuko_32",
         "title": "Bond & Repair Hair Oil 75ml",
-        "price_amount": 26900,
-        "market": "KR",
-        "price_currency": "KRW",
+        "price_amount": 2690,
+        "market": "JP",
+        "price_currency": "JPY",
     }, seller_ref="merch_obs_deadbeefdeadbeef", seed_kind="self")
     _, params = fake_db.calls[0]
-    assert params["market"] == "KR"
-    assert params["currency"] == "KRW"
-    assert params["price"] == 26900
+    assert params["market"] == "JP"
+    assert params["currency"] == "JPY"
+    assert params["price"] == 2690
     assert params["seller_ref"] == "merch_obs_deadbeefdeadbeef"
     assert params["seed_kind"] == "self"
 
 
-async def test_upsert_seed_defaults_to_us_usd(fake_db):
+@pytest.mark.parametrize("market, refusal", [
+    (None, "MARKET_REQUIRED"),
+    ("  ", "MARKET_REQUIRED"),
+    ("XX", "UNKNOWN_MARKET:XX"),
+    ("KR", "MARKET_NOT_INGESTED:KR"),
+])
+async def test_upsert_seed_refuses_an_undeclared_or_uningested_market(fake_db, market, refusal):
+    # ADR-026: never filed under US by default, nor under a market we do not ingest.
+    p = {"external_product_id": "x1", "title": "Some Product", "price_amount": 24.99}
+    if market is not None:
+        p["market"] = market
+    with pytest.raises(ValueError, match=refusal):
+        await onboard._upsert_seed(p, seller_ref=None, seed_kind=None)
+    assert fake_db.calls == []
+
+
+async def test_upsert_seed_normalizes_market_and_keeps_usd_currency_default(fake_db):
     await onboard._upsert_seed({
         "external_product_id": "x1",
         "title": "Some US Product",
         "price_amount": 24.99,
+        "market": " us ",
     }, seller_ref=None, seed_kind=None)
     _, params = fake_db.calls[0]
     assert params["market"] == "US"
@@ -79,12 +98,12 @@ async def test_set_category_and_offer_does_not_force_us(fake_db):
     await onboard._set_category_and_offer({
         "external_product_id": "anuko_32",
         "category_kind": "haircare",
-        "market": "KR",
+        "market": "JP",
     }, _PK, _MID)
     # last execute = the catalog_offers UPDATE; market must be the product's, not 'US'
     offer_sql, offer_params = fake_db.calls[-1]
     assert "catalog_offers" in offer_sql
-    assert offer_params["market"] == "KR"
+    assert offer_params["market"] == "JP"
     assert offer_params["pk"] == _PK
     assert "market='US'" not in offer_sql  # the old hardcode is gone
     # Scoped to THIS seller's own offer, not every offer on the product_key.
@@ -92,14 +111,19 @@ async def test_set_category_and_offer_does_not_force_us(fake_db):
     assert offer_params["mid"] == _MID
 
 
-async def test_set_category_and_offer_defaults_market_us(fake_db):
-    await onboard._set_category_and_offer({
-        "external_product_id": "x1",
-        "category_kind": "skincare",
-    }, _PK, _MID)
-    offer_params = fake_db.calls[-1][1]
-    assert offer_params["market"] == "US"
-    assert offer_params["mid"] == _MID
+@pytest.mark.parametrize("market, refusal", [
+    (None, "MARKET_REQUIRED"),
+    ("XX", "UNKNOWN_MARKET:XX"),
+    ("KR", "MARKET_NOT_INGESTED:KR"),
+])
+async def test_set_category_and_offer_refuses_an_undeclared_market(fake_db, market, refusal):
+    p = {"external_product_id": "x1", "category_kind": "skincare"}
+    if market is not None:
+        p["market"] = market
+    with pytest.raises(ValueError, match=refusal):
+        await onboard._set_category_and_offer(p, _PK, _MID)
+    # Refused before the category write, not just before the offer relabel.
+    assert fake_db.calls == []
 
 
 async def test_resolve_pdp_scope_single_seller_is_merchant_owned(monkeypatch):
