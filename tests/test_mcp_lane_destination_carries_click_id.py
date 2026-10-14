@@ -173,9 +173,6 @@ async def test_shopify_cart_join_publishes_both_urls_under_one_click_id():
     # The cart carries the id as a cart ATTRIBUTE (order-side join); the PDP as the plain param.
     assert attribution["cart_url"] == payload["dest"]
     assert attribution["cart_url"].startswith("https://teststore.com/cart/46123456789:1?")
-    # The mint declared the buyer's market, so its cart is pinned to it, and the re-derive applies
-    # the same pin from what the token says (`_cart_country_pin`).
-    assert attribution["cart_url"].endswith("&country=US")
     assert _query(attribution["cart_url"])[SHOPIFY_CART_CLICK_ATTRIBUTE] == [click_id]
     assert urlparse(attribution["destination_url"]).path == "/products/widget"
     assert _query(attribution["destination_url"])[REFERRAL_CLICK_PARAM] == [click_id]

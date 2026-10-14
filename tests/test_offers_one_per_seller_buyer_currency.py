@@ -296,3 +296,113 @@ def test_the_cart_country_pin_rule(market, observed, expected):
     from routes.agent_shop_gateway import _cart_country_pin
 
     assert _cart_country_pin(market, observed) == expected
+
+
+def test_a_listing_for_every_market_is_pinned_to_the_buyer(monkeypatch, client):
+    """A '*' row is served under the request's market; the pin is the BUYER's, not the row's."""
+    row = _seed(variants=[_shade(0, "Bliss")])
+    row["market"] = "*"
+    body = _resolve(monkeypatch, client, [row], product={"product_id": "sig_rare_blush"})
+    (offer,) = _seed_offers(body)
+    assert offer["execution_spec"]["cart_url"].endswith("&country=US")
+    assert offer["execution_spec"]["cart_url"] == _signed_dest(offer)
+
+
+# ----------------------------------------------------------------- the minter, directly (review of #2622)
+
+
+def _token_payload(link: str) -> Dict[str, Any]:
+    tok = parse_qs(urlparse(link).query)["token"][0].split(".")[0]
+    return json.loads(base64.urlsafe_b64decode(tok + "=" * ((4 - len(tok) % 4) % 4)))
+
+
+async def _mint(*, market: str, observed: bool, cart_country: Optional[str] = None) -> str:
+    import routes.agent_shop_gateway as gw
+
+    return await gw._make_external_redirect_url(
+        market=market,
+        market_observed=observed,
+        tool="*",
+        destination_url="https://teststore.com/products/widget",
+        utm_template=None,
+        ctx={"seedId": "seed_cart"},
+        allowed_domains=["teststore.com"],
+        shop_domain="teststore.com",
+        platform="shopify",
+        cart_variant_id="44556677889900",
+        cart_country=cart_country,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_buyer_on_a_row_listed_elsewhere_is_pinned_to_the_buyer_not_the_row():
+    """THE REVIEW REPRO: an SG buyer on a US-listed row. Pinning from the served market forced
+    `country=US`; the pin is the buyer's, passed explicitly."""
+    from services.outbound_links_service import request_market_observed
+
+    observed = request_market_observed("SG", listing_market="US")
+    unpinned = _token_payload(await _mint(market="US", observed=observed))
+    assert "country=" not in unpinned["dest"], "a lane that names no buyer country pins nothing"
+    assert "cart_country" not in unpinned
+
+    pinned = _token_payload(await _mint(market="US", observed=observed, cart_country="SG"))
+    assert pinned["dest"].endswith("&country=SG")
+    assert pinned["cart_country"] == "SG"
+
+
+@pytest.mark.asyncio
+async def test_an_undeclared_market_pins_nothing_even_with_a_country():
+    payload = _token_payload(await _mint(market="US", observed=False, cart_country="US"))
+    assert "country=" not in payload["dest"] and "cart_country" not in payload
+
+
+@pytest.mark.asyncio
+async def test_the_card_rederive_applies_the_pin_the_token_records():
+    import routes.agent_shop_gateway as gw
+
+    link = await _mint(market="US", observed=True, cart_country="SG")
+    attribution = gw._seed_attribution_from_redirect(
+        link,
+        destination_url="https://teststore.com/products/widget",
+        utm_template=None,
+        market="US",
+        tool="*",
+        shop_domain="teststore.com",
+        platform="shopify",
+        cart_variant_id="44556677889900",
+    )
+    assert attribution is not None, "the re-derive must reproduce the signed destination"
+    assert attribution["cart_url"] == _token_payload(link)["dest"]
+    assert attribution["cart_url"].endswith("&country=SG")
+
+
+def test_host_diverse_head_fills_with_same_host_offers_after_one_per_host():
+    """Coverage the fan-out test used to give: one per host first, then fill in rank order."""
+    from routes.agent_shop_gateway import _host_diverse_head
+
+    def offer(i: int, host: str) -> Dict[str, Any]:
+        return {"offer_id": f"o{i}", "url": f"https://{host}/p", "source": {}}
+
+    ranked = [offer(0, "a.com"), offer(1, "a.com"), offer(2, "a.com"), offer(3, "b.com")]
+    assert [o["offer_id"] for o in _host_diverse_head(ranked, 3)] == ["o0", "o3", "o1"]
+
+
+def test_the_attached_variant_is_read_from_seed_data_too(monkeypatch, client):
+    """`_external_seed_redirect_identity` reads the attachment from the row OR seed_data; the
+    offer's variant must follow the same read, or cart and token name different variants."""
+    shades = [_shade(i, n) for i, n in enumerate(SHADES)]
+    row = _seed(variants=shades)
+    row["seed_data"]["attached_variant_id"] = shades[4]["variant_id"]
+    body = _resolve(monkeypatch, client, [row], product={"product_id": "sig_rare_blush"})
+    (offer,) = _seed_offers(body)
+    assert offer["source"]["variant_id"] == shades[4]["variant_id"]
+
+
+def test_a_long_shade_range_is_capped_and_counted_whole(monkeypatch, client):
+    from routes.agent_shop_gateway import _MAX_VARIANT_OPTIONS
+
+    shades = [_shade(i, f"Shade {i}") for i in range(_MAX_VARIANT_OPTIONS + 5)]
+    body = _resolve(monkeypatch, client, [_seed(variants=shades)], product={"product_id": "sig_rare_blush"})
+    (offer,) = _seed_offers(body)
+    assert len(offer["variants"]) == _MAX_VARIANT_OPTIONS
+    assert offer["variant_count"] == _MAX_VARIANT_OPTIONS + 5

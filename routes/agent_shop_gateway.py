@@ -3467,14 +3467,16 @@ def _seed_offer_variant_id(v: Dict[str, Any]) -> str:
 
 
 def _representative_seed_variant(
-    variants: List[Dict[str, Any]], row: Dict[str, Any], stock: Any
+    variants: List[Dict[str, Any]], row: Dict[str, Any], seed_data: Dict[str, Any], stock: Any
 ) -> Optional[Dict[str, Any]]:
     """The variant a seller listing's single offer links to: the variant the seed is attached
     to, else the first one the seed's stock rule calls in stock, else the first. None for a
     listing with no stored variants (its offer is product-level, as before)."""
     if not variants:
         return None
-    attached = str(row.get("attached_variant_id") or "").strip()
+    # The same read `_external_seed_redirect_identity` makes, so the offer's cart and its token's
+    # `variantId` name one variant.
+    attached = str(row.get("attached_variant_id") or seed_data.get("attached_variant_id") or "").strip()
     if attached:
         for v in variants:
             if _seed_offer_variant_id(v) == attached:
@@ -3485,14 +3487,21 @@ def _representative_seed_variant(
     return variants[0]
 
 
+# The most variants one offer lists (a foundation range can run past 50 shades).
+_MAX_VARIANT_OPTIONS = 60
+
+
 def _seed_variant_options_summary(
     variants: List[Dict[str, Any]], stock: Any, *, fallback_currency: Optional[str]
 ) -> List[Dict[str, Any]]:
     """One listing's options as an agent chooses among them: id, label, price, stock. No links:
     a link is minted only for the variant a caller names (`product.sku_id`), so this list costs
-    no clicks and records no issued links (ADR-025)."""
+    no clicks and records no issued links (ADR-025). At most `_MAX_VARIANT_OPTIONS` entries; the
+    offer's `variant_count` says how many there are."""
     out: List[Dict[str, Any]] = []
     for v in variants:
+        if len(out) >= _MAX_VARIANT_OPTIONS:
+            break
         vid = _seed_offer_variant_id(v)
         if not vid:
             continue
@@ -4682,10 +4691,12 @@ async def _handle_offers_resolve(
             # link, and every variant as `variants` so the agent can see the options and name one
             # (`product.sku_id`) for its link. A named variant still gets exactly that variant.
             variant_options: Optional[List[Dict[str, Any]]] = None
+            variant_count = 0
             if not sku_id:
-                representative = _representative_seed_variant(variants, row_dict, _seed_stock)
+                representative = _representative_seed_variant(variants, row_dict, seed_data, _seed_stock)
                 matched_variants = [representative] if representative is not None else []
                 if len(variants) > 1:
+                    variant_count = sum(1 for v in variants if _seed_offer_variant_id(v))
                     variant_options = _seed_variant_options_summary(
                         variants,
                         _seed_stock,
@@ -4983,6 +4994,8 @@ async def _handle_offers_resolve(
                     seller_ref=redirect_identity["seller_ref"],
                     seed_kind=redirect_identity["seed_kind"],
                     issued_clicks=_issued_clicks,
+                    # The BUYER's market (the request's), never the row's listing market.
+                    cart_country=market_hint,
                 )
                 if not redirect_url:
                     continue
@@ -5016,7 +5029,7 @@ async def _handle_offers_resolve(
                     recovery_key=_recovery_key,
                     # The SAME pin `_make_external_redirect_url` applied to the link it signed,
                     # from the same two inputs, so the published cart is the signed destination.
-                    pin_country=_cart_country_pin(used_market, request_market_observed(market_hint)),
+                    pin_country=_cart_country_pin(market_hint, request_market_observed(market_hint)),
                 )
                 # ONE decision, read twice. `cart_prefilled` and `execution_spec.rail` answer the
                 # same question — what does following our link land the buyer in — so computing
@@ -5219,7 +5232,7 @@ async def _handle_offers_resolve(
                         "internal_checkout_items": None,
                         "confidence": confidence,
                         **(
-                            {"variant_count": len(variant_options), "variants": variant_options}
+                            {"variant_count": variant_count, "variants": variant_options}
                             if variant_options
                             else {}
                         ),
@@ -9563,10 +9576,17 @@ def _redirect_token_expiry(redirect_url: Optional[str]) -> Optional[str]:
         return None
 
 
+# Token payload key for the country a minted cart was pinned to (see `_make_external_redirect_url`).
+TOKEN_CART_COUNTRY_KEY = "cart_country"
+
+
 def _cart_country_pin(market: Any, observed: Any) -> Optional[str]:
-    """The ISO-2 country a cart link is pinned to: the request's market, only when the caller
-    DECLARED it (`market_observed`; a defaulted "US" is not a buyer's market) and the market
-    registry lists it. Otherwise None, and the link is exactly what it was."""
+    """The ISO-2 country a cart link is pinned to: the BUYER's market as the request declared it,
+    only when it was declared (`observed`; a defaulted "US" is not a buyer's market) and the
+    market registry lists it. Otherwise None, and the link is exactly what it was.
+
+    Never the row's listing market: an SG buyer on a US-listed card pinned to `country=US` would
+    be forced into a US checkout (review of #2622). Callers pass the request's market."""
     if observed is not True:
         return None
     entry = market_registry.market_or_none(market)
@@ -9706,6 +9726,12 @@ async def _make_external_redirect_url(
     # ctx, destination and ids signed into the token, so the row recorded at issue time and the
     # one `/r` fills can never describe different clicks. The caller writes the batch.
     issued_clicks: Optional[List[IssuedClick]] = None,
+    # The BUYER's declared market, to pin a cart permalink's checkout to (`_cart_country_pin`).
+    # Explicit and opt-in: `market` here is the market the link is SERVED under, which on some
+    # lanes is the row's listing market, not the buyer's. None (every caller but offers.resolve
+    # today) leaves the link exactly as before. A pin is signed into the token as `cart_country`
+    # so a re-derive from the token applies the same one.
+    cart_country: Optional[str] = None,
 ) -> Optional[str]:
     if not destination_url.startswith(("http://", "https://")):
         return None
@@ -9733,9 +9759,12 @@ async def _make_external_redirect_url(
         cart_variant_id=cart_variant_id,
         click_id=stable_click_id,
         quantity=quantity,
-        pin_country=_cart_country_pin(market, market_observed),
+        pin_country=_cart_country_pin(cart_country, market_observed),
     )
     join_mode = composed["join_mode"]
+    applied_cart_country = (
+        _cart_country_pin(cart_country, market_observed) if composed["cart_url"] else None
+    )
     dest = composed["primary"]
 
     runtime_allowed_domains = allowed_domains
@@ -9782,6 +9811,8 @@ async def _make_external_redirect_url(
             # Absent rather than `false` for an unobserved market, so the token is
             # byte-identical to a pre-provenance mint on that (majority) path.
             **({TOKEN_MARKET_OBSERVED_KEY: True} if market_observed is True else {}),
+            # Only when a cart was pinned, so every other token is byte-identical to before.
+            **({TOKEN_CART_COUNTRY_KEY: applied_cart_country} if applied_cart_country else {}),
             "dest": dest,
             "ctx": enriched_ctx,
         }
@@ -9862,8 +9893,8 @@ def _seed_attribution_from_redirect(
         cart_variant_id=cart_variant_id,
         click_id=click_id,
         quantity=quantity,
-        # The pin the mint applied, from what the token itself says about its market.
-        pin_country=_cart_country_pin(payload.get("market"), payload.get(TOKEN_MARKET_OBSERVED_KEY)),
+        # The pin the mint applied, as the token itself records it.
+        pin_country=_cart_country_pin(payload.get(TOKEN_CART_COUNTRY_KEY), True),
     )
     if composed["primary"] != signed_dest:
         return None
