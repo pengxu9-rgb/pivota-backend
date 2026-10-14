@@ -4595,9 +4595,13 @@ def test_a_variant_fan_out_cannot_truncate_the_competing_retailer_away(
         offers = res.json().get("offers") or []
         ids = [str(o.get("offer_id") or "") for o in offers]
         assert len(ids) <= limit, f"limit={limit} must still be honoured: {ids}"
-        # ...and the head must FILL: 12 seed variants + 1 retailer is 13 offers, so a limit of 10
-        # ships 10. Taking only one per host and stopping would ship 2 and waste the budget.
-        assert len(ids) == limit, f"limit={limit} must be filled, not just diversified: {ids}"
+        # ONE OFFER PER SELLER LISTING: the 12-shade seed is one offer (its shades ride in
+        # `variants`), so seed + retailer is 2 offers at any limit >= 2. It used to fan out one
+        # offer per shade and fill the head with them.
+        assert len(ids) == min(limit, 2), f"limit={limit}: one offer per seller: {ids}"
+        (seed_offer,) = [o for o in offers if str(o.get("offer_id") or "").startswith("of:external_seed:")]
+        assert seed_offer["variant_count"] == 12
+        assert len(seed_offer["variants"]) == 12
         assert any(i.startswith("of:catalog_offer:") for i in ids), (
             f"limit={limit}: the competing retailer must survive a variant fan-out — {ids}"
         )
@@ -5049,7 +5053,8 @@ def test_a_referral_only_request_attaches_no_coverage(
     # the gate apply to nothing", and suppressing it on exactly the requests where everything
     # was refused would hide the only population worth reading. It carries no preflight_ field
     # and no fraction anyone can mistake for gate coverage.
-    assert "handover considered=12" in rec.getMessage()
+    # One offer per seller listing: 3 rows of 4 variants are 3 hand-overs (were 12, one per shade).
+    assert "handover considered=3" in rec.getMessage()
     assert "resolved=0" in rec.getMessage()
 
 
@@ -5067,14 +5072,16 @@ def test_a_mixed_request_counts_only_gated_rows_in_the_denominator(
         assert _resolve(client).status_code == 200
     rec = _summary_record(caplog)
     assert rec is not None and asked
-    assert rec.preflight_candidates == 12
-    assert rec.preflight_gated == 6
-    assert rec.preflight_carts_built == 6
+    # One offer per seller listing: 4 rows are 4 candidates, the 2 stamped rows are gated and
+    # build a cart each (were 12 / 6 / 6, one per shade).
+    assert rec.preflight_candidates == 4
+    assert rec.preflight_gated == 2
+    assert rec.preflight_carts_built == 2
     assert rec.preflight_candidates > rec.preflight_gated
     assert rec.preflight_answered_fraction == 1.0
     # and the values are in the MESSAGE, not only in `extra`, which no formatter here renders
     msg = rec.getMessage()
-    assert "gated=6" in msg and "carts_built=6" in msg
+    assert "gated=2" in msg and "carts_built=2" in msg
     assert "answered_fraction=1.000" in msg and "mode=shadow" in msg
 
 

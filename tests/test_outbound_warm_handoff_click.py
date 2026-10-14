@@ -1266,12 +1266,14 @@ async def test_real_mint_stamps_the_flag_only_for_an_observed_market() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_observed_flag_is_the_only_change_to_the_token_payload() -> None:
-    """Snapshot: an explicit-market mint differs from the defaulted one by the new key ALONE.
+async def test_an_observed_market_changes_only_the_flag_and_the_carts_country_pin() -> None:
+    """Snapshot: an explicit-market mint differs from the defaulted one by the provenance key
+    and, on a cart, by the buyer's country pin (`country=<CC>`), and by nothing else.
 
-    Everything the token has always carried — market, tool, dest (UTM, click id and the cart
-    permalink included) and the whole ctx — must be untouched, so nothing downstream of the
-    mint can notice this change.
+    The pin is the one deliberate change to `dest`: a declared buyer market pins the cart's
+    checkout market (`_cart_country_pin`), so a US buyer cannot land in a GBP checkout. A
+    defaulted "US" is not a buyer's market and pins nothing. Market, tool and the whole ctx
+    stay untouched.
     """
     # The click id is pinned: the builder mints a fresh one per call, and a snapshot that
     # differed by a uuid would compare nothing.
@@ -1279,10 +1281,14 @@ async def test_the_observed_flag_is_the_only_change_to_the_token_payload() -> No
     observed = _decode_ctx(await _mint_real_redirect(market_observed=True, **pinned))
     defaulted = _decode_ctx(await _mint_real_redirect(market_observed=False, **pinned))
 
-    assert observed["dest"] == defaulted["dest"], "the destination must be untouched"
+    assert "/cart/" in defaulted["dest"], "the snapshot must exercise a cart destination"
+    assert "country=" not in defaulted["dest"], "a defaulted market pins nothing"
+    assert observed["dest"] == defaulted["dest"] + "&country=US"
     assert observed["ctx"] == defaulted["ctx"], "the whole ctx must be untouched"
     assert set(observed) - set(defaulted) == {"market_observed"}
-    assert {k: v for k, v in observed.items() if k != "market_observed"} == defaulted
+    assert {k: v for k, v in observed.items() if k not in ("market_observed", "dest")} == {
+        k: v for k, v in defaulted.items() if k != "dest"
+    }
 
 
 @pytest.mark.asyncio

@@ -1340,22 +1340,36 @@ def test_the_preflight_memo_is_keyed_on_the_variant_as_well_as_the_page(monkeypa
         asked.append(offer["execution_spec"]["variant_id"])
         return True
 
-    _wire(
-        monkeypatch,
-        seed_row=_seed_row(
-            snapshot_extra={"storefront_platform": "shopify"},
-            variants=[
-                {"variant_id": CATALOG_VID, "title": "30ml", "price_amount": 19.0,
-                 "price_currency": "USD", "availability": "in_stock"},
-                {"variant_id": OTHER_VID, "title": "50ml", "price_amount": 29.0,
-                 "price_currency": "USD", "availability": "in_stock"},
-            ],
-        ),
-        sku_rows=[
-            _row(sku_key="a", source_variant_id=CATALOG_VID, sku_payload=None),
-            _row(sku_key="b", source_variant_id=OTHER_VID, sku_payload=None),
-        ],
+    # One offer per seller LISTING, so two candidates on one page in one request are two seed
+    # listings of that page -- one per shade, the shape a shade-per-seed crawl writes.
+    shade_30 = _seed_row(
+        snapshot_extra={"storefront_platform": "shopify"},
+        variants=[{"variant_id": CATALOG_VID, "title": "30ml", "price_amount": 19.0,
+                   "price_currency": "USD", "availability": "in_stock"}],
     )
+    shade_50 = {
+        **_seed_row(
+            snapshot_extra={"storefront_platform": "shopify"},
+            variants=[{"variant_id": OTHER_VID, "title": "50ml", "price_amount": 29.0,
+                       "price_currency": "USD", "availability": "in_stock"}],
+        ),
+        "id": "eps_handover_50ml",
+    }
+    sku_rows = [
+        _row(sku_key="a", source_variant_id=CATALOG_VID, sku_payload=None),
+        _row(sku_key="b", source_variant_id=OTHER_VID, sku_payload=None),
+    ]
+    _wire(monkeypatch, seed_row=shade_30, sku_rows=sku_rows)
+
+    async def two_listings(query, values=None):
+        q = str(query)
+        if "FROM catalog_skus" in q:
+            return list(sku_rows)
+        if "FROM external_product_seeds" in q:
+            return [shade_30, shade_50]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", two_listings)
     monkeypatch.setattr(gateway, "_preflight_allows_external_offer", counting_preflight)
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "8")
