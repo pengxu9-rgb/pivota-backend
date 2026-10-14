@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import scripts.onboard_curated_brands as cli
 from services import curated_brand_feed as feed
 from services.catalog_enrichment_agent.apply import plan_with_current_listings
-from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
+from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl, respell_listing_host
 from services.retailer_ingest import pipeline
 from tests.services.test_retailer_ingest_pipeline import env, job  # noqa: F401  (fixture)
 from tests.services.test_listing_host_spelling import _as_spelled, _netlocs
@@ -45,7 +45,9 @@ class _Down(_Catalog):
 
 
 def _catalog(*plans):
-    return _Catalog({p["product_key"]: p["canonical_url"] for plan in plans for p in plan["pdps"]})
+    """The rows `plans` wrote, as catalog_products stores them (canonical_url and source_domain)."""
+    return _Catalog({p["product_key"]: p["canonical_url"] for plan in plans for p in plan["pdps"]},
+                    {p["product_key"]: p.get("source_domain") for plan in plans for p in plan["pdps"]})
 
 
 def test_the_two_spellings_are_one_retailer_row_with_two_offer_sets_without_the_row_s_url():
@@ -130,6 +132,29 @@ def test_a_retailer_row_keeps_its_stored_host_letter_case():
         assert _ids(plan) == _ids(before) and _ids(plan, "seeds", "id") == _ids(before, "seeds", "id")
         assert _ids(plan, "skus", "sku_key") == _ids(before, "skus", "sku_key")
         assert _netlocs(plan) == {stored_as} and {p["source_domain"] for p in plan["pdps"]} == {stored_as}
+
+
+def test_a_retailer_row_s_own_source_domain_spelling_wins_over_its_url_s():
+    """Its variant SKU keys hashed the row's source_domain, which may be spelled unlike its URL's host."""
+    for url_host, source_domain, crawled in (("Store.example", APEX, APEX), (APEX, WWW, APEX), (APEX, WWW, WWW),
+                                             (WWW, "Store.example", APEX)):
+        written = _as_spelled(_retailer(APEX), url_host)
+        written["pdp"]["source_domain"] = source_domain
+        before = ingest_validated_jsonl([written])
+        plan = asyncio.run(plan_with_current_listings([_retailer(crawled)], db=_catalog(before)))
+        assert _ids(plan, "skus", "sku_key") == _ids(before, "skus", "sku_key")
+        assert _ids(plan) == _ids(before) and _ids(plan, "seeds", "id") == _ids(before, "seeds", "id")
+        assert _netlocs(plan) == {url_host} and {p["source_domain"] for p in plan["pdps"]} == {source_domain}
+
+
+def test_a_stored_source_domain_that_names_no_plain_spelling_of_the_host_falls_back_to_the_url_s():
+    record = _retailer(WWW)
+    for own in (None, "", "other.example", f"{APEX}:8443", f"user@{APEX}", f"{APEX}/shop"):
+        out = respell_listing_host(record, f"https://{APEX}/products/glow-serum-30ml", stored_source_domain=own)
+        assert out["pdp"]["source_domain"] == APEX, own
+    official_record = official(*CONTENT, domain=WWW)  # a content row's source_domain keys nothing: left as crawled
+    out = respell_listing_host(official_record, f"https://{APEX}/products/base-duo", stored_source_domain=APEX)
+    assert out["pdp"]["source_domain"] == official_record["pdp"]["source_domain"]
 
 
 def test_the_cli_reports_an_unread_spelling_without_touching_the_current_listings_contract(monkeypatch):
