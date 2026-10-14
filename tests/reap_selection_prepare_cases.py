@@ -332,7 +332,11 @@ async def test_prepare_placeholder_only_succeeds_through_the_no_key_path(client,
     witness = response.json()["selection"]
     assert witness == {"product_key": PRODUCT, "variant_id": VARIANT, "variant_key": placeholder, "merchant_domain": DOMAIN, "market": "US", "currency": "USD", "unit_price_minor": 1399, "quantity": 1, "item_source": "cart_link"}
     assert await unchanged_state() == before
-    created = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-placeholder-only'))
+    # A create may not NAME the placeholder (it pins no variant); it creates by the storefront id.
+    named = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-placeholder-named'))
+    assert named.status_code == 409 and error(named) == "row_variant_unverified", named.text
+    assert await unchanged_state() == before
+    created = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-placeholder-only', by="variant_id"))
     assert created.status_code == 202, created.text
     row = dict(await database.fetch_one('SELECT * FROM reap_agentic_purchases'))
     assert row['variant_key'] == 'shopify:' + VARIANT and row['our_price_minor'] == 1399
@@ -388,11 +392,14 @@ async def test_prepare_placeholder_only_pins_the_requested_variant(client, monke
     assert await unchanged_state() == before
 
 
+@pytest.mark.parametrize("by", ["variant_id", "variant_key"])
 @pytest.mark.parametrize("placeholder_only", [True, False])
-async def test_a_variant_id_create_from_a_witness_is_pinned_when_the_proof_moves(client, monkeypatch, placeholder_only):
-    """A create BY variant_id is held to that variant (`_require_selected_variant`) whatever sku the
-    witness named -- the placeholder included, which as a `variant_key` names no variant at all.
-    The storefront proof moving to another variant between prepare and create refuses the create."""
+async def test_a_create_from_a_witness_is_pinned_when_the_proof_moves(client, monkeypatch, placeholder_only, by):
+    """The storefront proof moving to another variant between prepare and create refuses the create,
+    whichever way it names the variant: by `variant_id` it is held to it (`_require_selected_variant`);
+    by a real sku the catalog contradicts the proof; and a create NAMING the `::canonical` placeholder,
+    which names no variant, is refused outright (review probe T1: it bought the moved variant at the
+    old price)."""
     await seed(monkeypatch)
     if placeholder_only:
         await make_placeholder_only()
@@ -404,7 +411,7 @@ async def test_a_variant_id_create_from_a_witness_is_pinned_when_the_proof_moves
         snapshot["shopify_cart_proof"]["variant_id"] = "44444444444444"
         snapshot["variants"][0]["shopify_variant_id"] = "44444444444444"
     await edit_seed_snapshot(move)
-    created = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-pinned-' + str(placeholder_only), by="variant_id"))
+    created = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-pinned-' + str(placeholder_only), by=by))
     assert created.status_code == 409 and error(created) == "row_variant_unverified", created.text
     assert await database.fetch_val('SELECT COUNT(*) FROM reap_agentic_purchases') == 0
 

@@ -1971,8 +1971,9 @@ async def _load_cart_link_item(
     #     `row_price_ambiguous`;
     #   * only for a mirror row with no caller-named sku; Shopify rows are unchanged.
     mirror_placeholder = placeholder if platform != "shopify" and named is None else None
-    # The same gate when the caller NAMES the placeholder (review of #2457): it is priced by the
-    # ordinary read below, and must not become the way around `live_variant_count == 1`.
+    # The same gate when the placeholder is loaded BY NAME (review of #2457): it is priced by the
+    # ordinary read below, and must not become the way around `live_variant_count == 1`. A create may
+    # no longer name it (`_refuse_named_placeholder`); `/purchases/prepare` and a resume still do.
     if (platform != "shopify" and named is not None and _is_placeholder_sku(named, product_key)
             and _proof_live_variant_count(seed_data) != 1):
         raise svc.PurchaseRefused("row_unpriced", "a placeholder prices only a sole live variant")
@@ -2166,6 +2167,17 @@ async def _resolve_selected_variant_key(
     if len({(minor, cur) for _key, minor, cur in priced}) > 1:
         raise svc.PurchaseRefused("row_price_ambiguous", "the spellings of this variant carry different prices")
     return priced[0][0]
+
+
+def _refuse_named_placeholder(variant_key: Optional[str], product_key: str) -> None:
+    """A CREATE may not NAME the `<product_key>::canonical` placeholder (both lanes spell it so). It names no
+    variant, so nothing at create would hold the purchase to the one a caller saw: a storefront proof that moved
+    between `/purchases/prepare` and the create would buy the new variant at the old price. A caller sends no
+    key, or the storefront `variant_id` (`_require_selected_variant` holds the purchase to it). Recovery and
+    resume are not refused here: recovery re-sends a stored body and reads no catalog, and resume is held to the
+    stored cart's own line (`_validate_resume_selection`)."""
+    if variant_key is not None and variant_key == product_key + _CANONICAL_SKU_SUFFIX:
+        raise svc.PurchaseRefused("row_variant_unverified", "a create names a variant, never the placeholder")
 
 
 def _require_selected_variant(loaded_variant: Any, variant_id: Optional[str]) -> None:
@@ -3139,6 +3151,7 @@ async def start_reap_purchase(
                 variant_key = await _resolve_selected_variant_key(
                     merchant_domain=merchant_host, product_key=product_key,
                     variant_id=req.variant_id, market_country=market_country)
+            _refuse_named_placeholder(variant_key, product_key)
             cart_facts, cart_seller, cart_variant, cart_seed_kind = await _load_cart_link_item(
                 merchant_domain=merchant_host,
                 product_key=product_key,

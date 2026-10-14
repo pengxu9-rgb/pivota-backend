@@ -4230,29 +4230,24 @@ async def test_a_multi_variant_proof_never_prices_from_the_placeholder(
         assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
-@pytest.mark.parametrize("live_variant_count,expected", [
-    (1, 202), (2, "row_unpriced"), (3, "row_unpriced"), ("1", "row_unpriced"),
-])
-async def test_a_named_placeholder_meets_the_same_live_variant_gate(
-    client, monkeypatch, live_variant_count, expected
+@pytest.mark.parametrize("live_variant_count", [1, 2, 3, "1"])
+async def test_a_create_naming_the_placeholder_is_refused_whatever_the_live_variant_count(
+    client, monkeypatch, live_variant_count
 ):
-    """NAMING the placeholder is not a way around the gate (review of #2457): a placeholder-only
-    row, the caller naming `<pk>::canonical`, is priced from it only under one live variant. The
-    proof reader is stubbed as in the unnamed test above."""
+    """NAMING the placeholder is refused outright (#2608 review, superseding the live-variant gate of
+    #2457 for a create): `<pk>::canonical` names no variant, so nothing at create would hold the
+    purchase to the one the caller saw -- review probe T1 bought a moved proof's variant at the old
+    price. Refused before the catalog is read, so the count never matters. The proof reader is
+    stubbed as in the unnamed test above."""
     await _seed_krave_mirror(offers=[(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")],
                              live_variant_count=live_variant_count, real_sku=False)
-    # #2459 renamed the route's authority call; the stub is the SOLE-scope answer it replaced.
     monkeypatch.setattr(routes_reap, "verified_cart_variant_id",
                         lambda *a, **k: ProvenCartVariant(KRAVE_VARIANT, "sole_variant"))
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
     resp = await client.post(f"{BASE}/purchases",
                              json={**_krave_body(), "variant_key": KRAVE_PLACEHOLDER})
-    if expected == 202:
-        assert resp.status_code == 202, resp.text
-        assert (await _purchase_row(resp.json()["purchase_id"]))["our_price_minor"] == 2800
-    else:
-        assert resp.status_code == 409 and _error(resp) == expected, resp.text
-        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert resp.status_code == 409 and _error(resp) == "row_variant_unverified", resp.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
 async def test_a_named_real_mirror_sku_with_no_offer_is_not_priced_from_the_placeholder(client, monkeypatch):
