@@ -1255,7 +1255,8 @@ def test_the_price_read_sibling_upsert_adds_exactly_the_stamp():
     assert "price_checked_at" not in base
     assert "offer_payload, price_checked_at)" in read and "CAST(:offer_payload AS jsonb), NOW()" in read
     conflict = read.split("ON CONFLICT", 1)[1]
-    assert "price_checked_at = EXCLUDED.price_checked_at" in conflict.split("WHERE")[0]
+    # The SET list ends at the statement's own WHERE line (a comment may mention "WHERE", #2600).
+    assert "price_checked_at = EXCLUDED.price_checked_at" in conflict.split("\n     WHERE")[0]
     assert read.replace("offer_payload, price_checked_at)", "offer_payload)").replace(
         "CAST(:offer_payload AS jsonb), NOW()", "CAST(:offer_payload AS jsonb)").replace(
         "      price_checked_at = EXCLUDED.price_checked_at,\n", "") == base
