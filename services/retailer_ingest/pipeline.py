@@ -966,12 +966,21 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     checks["listing_collisions"] = len(collisions)
     checks["current_listings"] = plan.get("current_listings")
     checks["listing_moves"] = len(plan.get("listing_moves") or [])
+    # Rows crawled under the other `www.` spelling of their host, written under the row's own (no second offer).
+    checks["listing_respellings"] = len(plan.get("listing_respellings") or [])
     row_flags += detectors.listing_move_flags(plan.get("listing_moves") or [])
     if (plan.get("current_listings") or {}).get("status") in ("unchecked", "error"):
         # Without the listing each row names, a plan cannot tell a move from a first ingest.
         flags.append({"key": "current_listings_unread", "rule": "current_listings_unread",
                       "severity": detectors.BLOCK, "acceptable": False,
                       "detail": f"could not read the rows' current listings: {plan['current_listings']}"})
+    checks["listing_spellings"] = plan.get("listing_spellings")
+    if (plan.get("listing_spellings") or {}).get("status") in ("unchecked", "error"):
+        # Without the host spelling an `ext:retailer:` row was minted under, a re-crawl under the other `www.`
+        # spelling writes a second offer and seed set beside the row's own.
+        flags.append({"key": "listing_spellings_unread", "rule": "listing_spellings_unread",
+                      "severity": detectors.BLOCK, "acceptable": False,
+                      "detail": f"could not read the retailer rows' stored URLs: {plan['listing_spellings']}"})
     row_flags += detectors.listing_collision_flags(collisions)
     # Name each row's brand on its flag: in a multi_brand cohort the reviewer must see whose row it is.
     brand_of = {detectors._handle(r): (r.get("pdp") or {}).get("brand") for r in records}

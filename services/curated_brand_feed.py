@@ -965,6 +965,21 @@ _INLINE_TAGS = frozenset({
 })
 # Sub/superscripts attach to their base: H<sub>2</sub>O, vitamin B<sub>5</sub>, 10<sup>th</sup>.
 _ATTACHED_TAGS = frozenset({"sub", "sup"})
+# A NUMERIC sub/superscript keeps its position: rendered as the Unicode sub/superscript characters,
+# still attached. Flattened to plain digits, a footnote marker glued to its word reads as part of it --
+# "Ceramide<sup>1</sup>" became "Ceramide1", "week<sup>3</sup>." became "week3." -- and a formula lost
+# its subscript. Now: "Ceramide\u00b9", "week\u00b3.", "H\u2082O", "m\u00b2", "10\u2076". Only content
+# that is digits (with + - = ( ) and a minus sign), or a comma list of such ("1, 2" keeps its ", "),
+# is converted; anything else -- "10<sup>th</sup>", "<sup>*</sup>", "<sup>TM</sup>", a letter -- is
+# attached as before. Tags nested inside ("<sup><span>1</span></sup>") are looked through.
+_SCRIPT_TAG_RE = re.compile(r"(?is)<\s*(sup|sub)\b[^<>]*>(.{0,200}?)<\s*/\s*\1\s*>")
+_SCRIPT_CONTENT_RE = re.compile(r"[0-9+\-=()\u2212]*[0-9][0-9+\-=()\u2212]*(?:, *[0-9+\-=()\u2212]*[0-9][0-9+\-=()\u2212]*)*")
+_SUPERSCRIPT = str.maketrans("0123456789+-=()\u2212", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207a\u207b\u207c\u207d\u207e\u207b")
+_SUBSCRIPT = str.maketrans("0123456789+-=()\u2212", "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089\u208a\u208b\u208c\u208d\u208e\u208b")
+# Every character a numeric sub/superscript can become: a safety cue right before one is still a cue.
+SCRIPT_NUMERAL_CHARS = "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207a\u207b\u207c\u207d\u207e" \
+                       "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089\u208a\u208b\u208c\u208d\u208e"
+_SCRIPT_NUMERAL_RE = re.compile(f"[{SCRIPT_NUMERAL_CHARS}]")
 _TAG_NAME_RE = re.compile(r"<\s*/?\s*([A-Za-z][A-Za-z0-9]*)")
 # A tag-shaped token in text that has already been unescaped: a letter right after `<` or `</`,
 # and (checked in `_escaped_tag_replacement`) a real HTML element name. Narrower than _HTML_TAG_RE
@@ -998,6 +1013,22 @@ def _tag_replacement(m: "re.Match[str]") -> str:
     if tag in _INLINE_TAGS:
         return _INLINE_CLOSE_MARK if re.match(r"<\s*/", m.group(0)) else _INLINE_MARK
     return "\n"
+
+
+def _script_numeral(m: "re.Match[str]") -> str:
+    """A numeric <sup>/<sub> -> its Unicode characters between attached marks (no gap either side);
+    any other one is left for the tag pass, which attaches it as before. Converted only when nothing
+    in it could be a separator: no whitespace but the spaces after a list comma (kept: "1, 2" keeps
+    its ", ", so "1 2" never reads as twelve), and no tag but an inline one (a block break inside a
+    malformed sup is still a break)."""
+    inner = m.group(2)
+    if any(name.lower() not in _INLINE_TAGS for name in _TAG_NAME_RE.findall(inner)):
+        return m.group(0)
+    content = html.unescape(_HTML_TAG_RE.sub("", inner))
+    if not _SCRIPT_CONTENT_RE.fullmatch(content):
+        return m.group(0)
+    table = _SUPERSCRIPT if m.group(1).lower() == "sup" else _SUBSCRIPT
+    return _ATTACHED_MARK + content.translate(table) + _ATTACHED_MARK
 
 
 def _escaped_tag_replacement(m: "re.Match[str]") -> str:
@@ -1220,8 +1251,9 @@ _SAFETY_CUE_RE = re.compile(
 
 
 def is_safety_text(sentence: str) -> bool:
-    """True when the sentence carries a safety cue (a warning, a precaution, a medical instruction)."""
-    return bool(_SAFETY_CUE_RE.search(sentence or ""))
+    """True when the sentence carries a safety cue (a warning, a precaution, a medical instruction).
+    A sub/superscript numeral is a word boundary here: "avoid the eyes\u00b9" carries "eyes"."""
+    return bool(_SAFETY_CUE_RE.search(_SCRIPT_NUMERAL_RE.sub(" ", sentence or "")))
 
 
 def _without_boilerplate(sentence: str) -> Optional[str]:
@@ -1276,6 +1308,7 @@ def _strip_markup(body_html: str) -> str:
     text = _MARK_RUN_RE.sub("", str(body_html))
     for round_no in range(_UNESCAPE_ROUNDS):
         text = _HTML_BLOCK_RE.sub("\n", text)
+        text = _SCRIPT_TAG_RE.sub(_script_numeral, text)
         # Raw markup: every `<...>` is a tag. After an unescape, only a tag-SHAPED token is.
         text = (_HTML_TAG_RE.sub(_tag_replacement, text) if round_no == 0
                 else _TAG_LIKE_RE.sub(_escaped_tag_replacement, text))
@@ -1284,6 +1317,7 @@ def _strip_markup(body_html: str) -> str:
             break
         text = unescaped
     text = _HTML_BLOCK_RE.sub("\n", text)
+    text = _SCRIPT_TAG_RE.sub(_script_numeral, text)
     text = _TAG_LIKE_RE.sub(_escaped_tag_replacement, text)
     return _MARK_RUN_RE.sub(_inline_gap, text)
 

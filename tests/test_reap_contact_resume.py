@@ -407,3 +407,33 @@ async def test_an_operator_not_created_restarts_the_reentry_window_of_a_row_purg
     assert await ledger.lapse_contact_reentry(window_seconds=_DAY) == [pid]
     row = await ledger.get_purchase_internal(pid)
     assert row['state'] == 'failed' and row['last_error_code'] == 'contact_reentry_lapsed'
+
+
+async def _paused_size(client, monkeypatch, choice):
+    """A cart-link attempt that selected one SIZE of a two-size mirror by `variant_id`, paused for re-entry."""
+    from test_agent_commerce_reap_routes import _seed_krave_two_sizes, _krave_size_body
+    await _seed_krave_two_sizes()
+    monkeypatch.setenv('REAP_AGENTIC_CART_LINK_ENABLED', '1')
+    body = _krave_size_body(choice, idempotency_key='variant-id-contact')
+    response = await client.post(BASE + '/purchases', json=body)
+    assert response.status_code == 202, response.text
+    pid = response.json()['purchase_id']
+    await database.execute("UPDATE reap_agentic_purchases SET created_at=datetime('now','-1000 seconds') WHERE id=:id", {'id': pid})
+    assert await ledger.scrub_reconciling_purchase_pii() == [pid]
+    return pid, body
+
+
+@pytest.mark.parametrize('choice', [0, 1])
+async def test_a_size_selected_by_variant_id_resumes_by_resolving_that_id_again(client, monkeypatch, choice):
+    pid, body = await _paused_size(client, monkeypatch, choice)
+    response = await client.post(BASE + f'/purchases/{pid}/resume', json=body)
+    assert response.status_code == 200, response.text
+    assert (await ledger.get_purchase_internal(pid))['contact_revision'] == 1
+
+
+async def test_resuming_with_the_other_size_under_the_same_key_is_another_body(client, monkeypatch):
+    from test_agent_commerce_reap_routes import KRAVE_SIZES
+    pid, body = await _paused_size(client, monkeypatch, 0)
+    other = await client.post(BASE + f'/purchases/{pid}/resume', json={**body, 'variant_id': KRAVE_SIZES[1]})
+    assert other.status_code == 409 and _error(other) == 'idempotency_conflict', other.text
+    assert (await ledger.get_purchase_internal(pid))['contact_revision'] in (0, None)

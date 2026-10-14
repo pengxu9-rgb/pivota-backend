@@ -173,3 +173,31 @@ def test_enrich_handles_missing_inci_with_text_fallback():
     assert "Vitamin C" in labels
     assert rec["provenance"]["active_ingredients"] == SOURCE_TEXT  # not INCI-verified
     assert "dullness" in rec["concerns"]
+
+
+
+# --- a description's Unicode sub/superscripts (numeric <sup>/<sub>) ----------------------------------
+
+def test_key_actives_read_unicode_sub_and_superscript_digits():
+    from services.beauty_enrichment import extract_key_actives
+
+    labels = lambda text: [a["label"] for a in extract_key_actives(None, fallback_text=text)]  # noqa: E731
+    assert "Panthenol" in labels("With provitamin B\u2085 for comfort.")
+    assert "Ceramides" in labels("With Ceramide\u00b3 for the barrier.")
+    assert labels("With provitamin B5 and Ceramide 3.") == labels("With provitamin B\u2085 and Ceramide\u00b3.")
+
+
+TEXTS_WITHOUT_COMPATIBILITY_CHARACTERS = (
+    "With provitamin B5 and Ceramide 3.", "Niacinamide 10% and panthenol.", "Retinol, peptides; hyaluronic acid.",
+    "Aqua, Glycerin, Niacinamide, Ceramide NP, Panthenol", "Nothing active here.",
+)
+
+
+def test_key_actives_of_text_without_compatibility_characters_are_unchanged(monkeypatch):
+    import services.beauty_enrichment as be
+
+    before = {t: (be.extract_key_actives(None, fallback_text=t), be.extract_key_actives(t)) for t in
+              TEXTS_WITHOUT_COMPATIBILITY_CHARACTERS}
+    monkeypatch.setattr(be.unicodedata, "normalize", lambda form, text: text)
+    assert before == {t: (be.extract_key_actives(None, fallback_text=t), be.extract_key_actives(t)) for t in
+                      TEXTS_WITHOUT_COMPATIBILITY_CHARACTERS}
