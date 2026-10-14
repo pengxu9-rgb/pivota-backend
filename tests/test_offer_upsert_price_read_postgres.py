@@ -157,3 +157,21 @@ async def test_the_reviewed_price_hold_keeps_its_own_stamp(db):
         assert float(moved["list_price"]) == 31 and _recent(moved["price_checked_at"])
     finally:
         await db.execute("DELETE FROM catalog_offers WHERE offer_id = :id", {"id": row["offer_id"]})
+
+
+async def test_a_row_stored_in_another_currency_is_never_dated(db):
+    """The upsert keeps the stored currency label (currency is insert-only), so this run's amount lands
+    under it. That amount is not a read in the row's currency: NULL, never NOW()."""
+    import services.catalog_enrichment_agent.apply as apply_mod
+
+    await _with_price_check(db)
+    await _seed_product(db)
+    offer_id = await _write(db, batch=False, price_read=True)  # stored USD, dated
+    planned = _planned_sku()
+    offer = _planned_offer(sku_key=planned["sku_key"], price=26.0)
+    offer.update(currency="SGD", is_first_party=False)  # the apply's own row defaults (_with_offer_write_defaults)
+    await db.execute(apply_mod._OFFER_UPSERT_PRICE_READ_SQL, offer)
+    row = await db.fetch_one("SELECT currency, list_price, price_checked_at FROM catalog_offers WHERE offer_id = :id",
+                             {"id": offer_id})
+    assert row["currency"] == "USD" and float(row["list_price"]) == 26.0
+    assert row["price_checked_at"] is None

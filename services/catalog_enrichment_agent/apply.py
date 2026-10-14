@@ -423,6 +423,14 @@ def _offer_upsert_sql_with_price_read(sql: str) -> str:
     Under the reviewed SGD 30 hold above, the stored price is kept rather than this run's read, so
     the stored stamp is kept with it: a price this run did not write is not a price this run dated.
 
+    A row stored in ANOTHER currency is never dated. The upsert writes `currency` on insert only, so
+    this run's amount lands under the stored label (the post-apply readback then fails the job, after
+    the commit): that amount is not a price read in the row's currency, so its stamp is NULL -- what
+    the 246 trigger would have left -- never NOW().
+
+    NOW() is the WRITE time. The read it dates happened earlier in the same execution, before the
+    catalog write lock (at most WRITE_LOCK wait, ~10 min): a stamp can overstate freshness by that much.
+
     Derived from the one statement, like `_offer_upsert_sql_with_market`, and refused unless it
     changed exactly the three places it must."""
     cols_old = "source_domain, offer_payload)\n"
@@ -434,13 +442,17 @@ def _offer_upsert_sql_with_price_read(sql: str) -> str:
             "chr(58), chr(58), '66a3c8a4')\n"
             "                         AND catalog_offers.offer_payload->>'meitu_sg_price_reviewed_0920' = 'SGD30'\n"
             "                         AND catalog_offers.list_price = 30 AND EXCLUDED.list_price = 28.20")
-    if sql.count(hold.split("\n")[0]) < 1:
-        raise RuntimeError("_OFFER_UPSERT_SQL lost its reviewed-price hold; update _offer_upsert_sql_with_price_read")
+    # Matched whole, anchored on the list_price CASE that applies it (offer_payload repeats the predicate):
+    # an edit to any of its lines must stop this derivation, not leave the stamp keyed to a stale hold.
+    if sql.count("list_price = CASE\n                        WHEN " + hold + "\n") != 1:
+        raise RuntimeError("_OFFER_UPSERT_SQL's reviewed-price hold changed; update _offer_upsert_sql_with_price_read")
     return (sql.replace(cols_old, "source_domain, offer_payload, price_checked_at)\n")
                .replace(vals_old, "CAST(:offer_payload AS jsonb), NOW())\n")
                .replace(set_old, "                      price_checked_at = CASE\n"
                                  f"                        WHEN {hold}\n"
-                                 "                        THEN catalog_offers.price_checked_at ELSE EXCLUDED.price_checked_at END,\n"
+                                 "                        THEN catalog_offers.price_checked_at\n"
+                                 "                        WHEN catalog_offers.currency IS DISTINCT FROM EXCLUDED.currency THEN NULL\n"
+                                 "                        ELSE EXCLUDED.price_checked_at END,\n"
                         + set_old))
 
 

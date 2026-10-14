@@ -20,6 +20,7 @@ def test_price_read_statements_add_exactly_the_stamp():
         _, values, tail = split_upsert_sql(read)
         assert values.rstrip().endswith("NOW())")
         assert "price_checked_at = CASE" in tail and "ELSE EXCLUDED.price_checked_at END" in tail
+        assert "WHEN catalog_offers.currency IS DISTINCT FROM EXCLUDED.currency THEN NULL" in tail
         # No new bind: the bulk path binds VALUES only, and an unknown key fails text().bindparams.
         assert sorted(set(_binds(read))) == sorted(set(_binds(base)))
 
@@ -68,3 +69,13 @@ def test_the_column_check_reports_what_the_database_says(answer, present):
             return answer
 
     assert asyncio.run(apply_mod._offer_price_check_present(Answers())) is present
+
+
+def test_an_edited_hold_refuses_the_derivation():
+    """The hold is matched whole: editing any of its three lines must stop the import, not drift."""
+    for old, new in (("EXCLUDED.list_price = 28.20", "EXCLUDED.list_price = 28.30"),
+                     ("'SGD30'", "'SGD31'")):
+        edited = apply_mod._OFFER_UPSERT_SQL.replace(old, new, 1)
+        assert edited != apply_mod._OFFER_UPSERT_SQL
+        with pytest.raises(RuntimeError, match="hold changed"):
+            apply_mod._offer_upsert_sql_with_price_read(edited)
