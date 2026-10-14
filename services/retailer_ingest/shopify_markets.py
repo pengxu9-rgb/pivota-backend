@@ -224,8 +224,15 @@ SIBLING_UPSERT_SQL = """
       merchant_effective_price = EXCLUDED.merchant_effective_price,
       estimated_best_price = EXCLUDED.estimated_best_price,
       offer_payload = EXCLUDED.offer_payload,
+      -- A sibling the shade fold retired with its base ('fold_superseded', apply.OFFER_FOLD_SUPERSEDED_REASON)
+      -- comes back live once its base is live again (this INSERT ... SELECT reads only a live base). Any other
+      -- suppressed sibling is never touched (the WHERE below).
+      suppressed_at = CASE WHEN catalog_offers.suppression_reason = 'fold_superseded'
+                           THEN NULL ELSE catalog_offers.suppressed_at END,
+      suppression_reason = CASE WHEN catalog_offers.suppression_reason = 'fold_superseded'
+                                THEN NULL ELSE catalog_offers.suppression_reason END,
       updated_at = NOW()
-     WHERE catalog_offers.suppressed_at IS NULL
+     WHERE (catalog_offers.suppressed_at IS NULL OR catalog_offers.suppression_reason = 'fold_superseded')
        AND catalog_offers.currency = EXCLUDED.currency
        AND upper(catalog_offers.market) = upper(EXCLUDED.market)
     RETURNING offer_id
