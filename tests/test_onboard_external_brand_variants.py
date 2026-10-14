@@ -82,6 +82,7 @@ async def test_upsert_seed_prefers_cohort_extracted_at(fake_db):
         {
             "external_product_id": "acropass_us_1",
             "title": "Patch",
+            "market": "US",
             "extracted_at": "2026-07-04T00:48:51+00:00",
         },
         seller_ref=None,

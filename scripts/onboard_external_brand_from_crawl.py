@@ -50,16 +50,24 @@ Idempotent throughout. Input: a JSON array on --file or stdin; each item:
   {external_product_id, brand, title, category_kind, product_type,
    destination_url, image_url, price_amount, description, raw_inci,
    offer_type?("brand_direct"|"retailer", default brand_direct),
-   market?(default "US"), price_currency?(default "USD")}
+   market?(else --market), price_currency?(default "USD")}
 
-market/price_currency carry the offer's real locale (e.g. a Korean D2C brand
-sells in KRW) instead of being forced to US/USD -- baking a foreign price as USD
-would corrupt the shared index. The mirror already propagates seed.market and
-seed.price_currency to catalog_offers, so threading them here is sufficient.
+A market is DECLARED, never defaulted or inferred (ADR-026,
+docs/adr/ADR-026-a-market-is-data.md): each item carries its own `market`, or
+the run names one with --market for the items that do not. Before anything is
+fetched or written, the whole cohort is checked against the market registry
+(services/market_registry.py); a missing market, one the registry does not
+list, one it does not ingest, or an item market that contradicts --market
+refuses the run, dry-run included. Nothing is filed under US by default.
+
+market/price_currency carry the offer's real locale instead of being forced to
+US/USD -- baking a foreign price as USD would corrupt the shared index. The
+mirror already propagates seed.market and seed.price_currency to
+catalog_offers, so threading them here is sufficient.
 
 Usage:
-  python -m scripts.onboard_external_brand_from_crawl --file cohort.json --apply
-  python -m scripts.onboard_external_brand_from_crawl --file cohort.json --apply --no-serving
+  python -m scripts.onboard_external_brand_from_crawl --file cohort.json --market US --apply
+  python -m scripts.onboard_external_brand_from_crawl --file cohort.json --market US --apply --no-serving
 """
 
 from __future__ import annotations
@@ -87,6 +95,7 @@ from services.external_seed_servability import (
     build_servable_quality_payload,
     make_external_seed_servable,
 )
+from services import market_registry
 from services.offer_seller_identity import derive_offer_seller_identity
 from services.pdp_scope_classifier import (
     NON_SELLER_MERCHANT_ID,
@@ -140,6 +149,64 @@ TOOL = "external_brand_crawl"
 SEED_TOOL_SCOPE = "*"
 # catalog_products.platform channel for external-seed supply (matches the mirror).
 PLATFORM = "external_seed"
+
+
+def market_refusal(market: Any) -> Optional[str]:
+    """Why a seed may not be filed under `market`, or None when it may.
+
+    The same rule the employee seed writers apply (routes/employee_products.py
+    `_seed_market_refusal`): a market must be declared, listed in the registry,
+    and one the registry lets us ingest (ADR-026 decision 2: an `off` market is
+    unknown to ingestion; an unlisted one raises). A missing market is refused,
+    never read as US."""
+    code = market_registry.normalize_market(market)
+    if not code:
+        return "MARKET_REQUIRED"
+    entry = market_registry.market_or_none(code)
+    if entry is None:
+        return f"UNKNOWN_MARKET:{code}"
+    if not entry["ingest"]:
+        return f"MARKET_NOT_INGESTED:{code}"
+    return None
+
+
+def _declared_market(p: Dict[str, Any]) -> str:
+    """The item's declared market, normalized. Raises on any market `market_refusal`
+    refuses: the writers never default one, even when called past `resolve_cohort_markets`."""
+    refusal = market_refusal(p.get("market"))
+    if refusal is not None:
+        raise ValueError(f"{p.get('external_product_id')!r}: {refusal}")
+    return market_registry.normalize_market(p.get("market"))
+
+
+def resolve_cohort_markets(
+    cohort: List[Dict[str, Any]], run_market: Optional[str]
+) -> List[str]:
+    """Stamp each item's declared market, normalized, and return every refusal.
+
+    An item's own `market` is its declaration; `run_market` (--market) declares it
+    for items that carry none. An item market that disagrees with `run_market` is a
+    conflict, not an override. A non-empty return means the run must not proceed."""
+    refusals: List[str] = []
+    run_code = market_registry.normalize_market(run_market)
+    if run_code:
+        refusal = market_refusal(run_code)
+        if refusal is not None:
+            refusals.append(f"--market: {refusal}")
+    for p in cohort:
+        epid = p.get("external_product_id")
+        own_code = market_registry.normalize_market(p.get("market"))
+        if own_code and run_code and own_code != run_code:
+            refusals.append(f"{epid!r}: MARKET_CONFLICT:{own_code}!={run_code}")
+            continue
+        code = own_code or run_code
+        refusal = market_refusal(code)
+        if refusal is not None:
+            if own_code or not run_code:  # a bad --market is reported once, above
+                refusals.append(f"{epid!r}: {refusal}")
+            continue
+        p["market"] = code
+    return refusals
 
 
 def _seed_id(epid: str) -> str:
@@ -473,7 +540,7 @@ async def _upsert_seed(
          "domain": _seed_domain(p) or None,
          "url": p.get("destination_url"), "title": p["title"], "img": p.get("image_url"),
          "price": p.get("price_amount"), "data": json.dumps(seed_data, ensure_ascii=False),
-         "market": (p.get("market") or "US").strip() or "US",
+         "market": _declared_market(p),
          "currency": (p.get("price_currency") or "USD").strip() or "USD",
          "seller_ref": seller_ref, "seed_kind": seed_kind},
     )
@@ -483,6 +550,10 @@ async def _set_category_and_offer(
     p: Dict[str, Any], product_key: str, self_merchant_id: str
 ) -> None:
     pk = product_key
+    # Respect the product's declared market (the mirror already set it from the seed);
+    # never default it -- an offer must not be relabeled into a market nobody declared.
+    # Resolved first so a refused market writes nothing, the category included.
+    market = _declared_market(p)
     if p.get("category_kind"):
         await database.execute(
             "UPDATE catalog_products SET category_kind=:ck, updated_at=NOW() WHERE product_key=:pk",
@@ -507,9 +578,6 @@ async def _set_category_and_offer(
         )
         offer_type = verdict["offer_type"] or "brand_direct"
         is_first_party = offer_type == "brand_direct"
-    # Respect the product's real market (the mirror already set it from the seed);
-    # don't force 'US' -- a KRW Korean offer must not be relabeled US-market.
-    market = (p.get("market") or "US").strip() or "US"
     # Scope to THIS seller's own offer (product_key + observed merchant), NOT every
     # offer on the product_key. A canonical product carried by multiple sellers has
     # sibling offers (a retailer offer via attach_retailer_offer, a connected-
@@ -814,6 +882,17 @@ def _load(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
 async def _drive(args: argparse.Namespace) -> None:
     cohort = _load(args)
+    # ADR-026: every item's market is declared (its own, or --market) and ingestible,
+    # checked BEFORE the publication gate's network calls and before any write. One
+    # refused item refuses the run: a partial onboard would drop products silently.
+    market_refusals = resolve_cohort_markets(cohort, getattr(args, "market", None))
+    if market_refusals:
+        for refusal in market_refusals:
+            print(f"REFUSED market: {refusal}", file=sys.stderr)
+        raise SystemExit(
+            f"refused: {len(market_refusals)} market problem(s); declare an ingested market "
+            f"per item or with --market ({', '.join(market_registry.ingest_markets())})"
+        )
     # extracted_at honesty contract (review finding on the variants fix):
     # snapshot.extracted_at is what the 7d stale_snapshot serving gate audits,
     # so re-running a STALE cohort file must not mint fresh-looking extraction
@@ -900,7 +979,7 @@ async def _drive(args: argparse.Namespace) -> None:
                 f"  would onboard {p.get('external_product_id')} "
                 f"({p.get('category_kind')}) "
                 f"{p.get('price_amount')} {p.get('price_currency') or 'USD'} "
-                f"market={p.get('market') or 'US'} "
+                f"market={p['market']} "
                 f"{'[decision-grade only]' if not serve else '[+serving]'} "
                 f":: {p.get('title')}"
             )
@@ -927,6 +1006,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--file", help="JSON array file (default: stdin)")
     parser.add_argument("--apply", action="store_true", help="write (default: dry-run)")
+    parser.add_argument(
+        "--market",
+        default=None,
+        help=(
+            "the market (ISO code) for cohort items that carry no `market` of their "
+            "own. Must be a market the registry ingests. An item whose own market "
+            "differs is refused, not overridden. No default: with neither, the run "
+            "is refused (ADR-026)."
+        ),
+    )
     parser.add_argument(
         "--extracted-at",
         dest="extracted_at",
