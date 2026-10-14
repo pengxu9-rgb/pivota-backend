@@ -1049,3 +1049,40 @@ async def test_the_newest_card_is_chosen_by_time_not_by_its_spelling():
     offset = {**ACTIVE, "id": "pm_offset", "created_at": "2026-10-11T08:30:00+08:00"}  # 00:30 UTC: older
     assert await _step(Rail().on("payment.method-view#submit", _methods(offset, utc)), pid) == "method_ready"
     assert (await _row(pid))["payment_method_id"] == "pm_utc"
+
+
+
+# ── the token dial is a kill switch; the sweep's money exclusion, clause by clause (#2587 review) ──
+
+
+async def test_turning_the_token_dial_off_stops_purchases_already_awaiting_approval(monkeypatch):
+    pid = await _approving()
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, purchase_id=pid)
+    monkeypatch.delenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV)
+    rail = Rail()
+    assert await _step(rail, pid) == "parked"
+    assert rail.sent == []
+
+
+async def test_with_the_token_dial_off_an_unseen_paid_is_neither_resent_nor_cleared(monkeypatch):
+    pid = await _approving()
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, purchase_id=pid)
+    await _step(Rail().on("payment.visa-action-required#paid", httpx.Response(502)), pid)
+    monkeypatch.delenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV)
+    rail = Rail()
+    assert await _step(rail, pid) == "parked"
+    row = await _row(pid)
+    assert rail.sent == [] and row["pending_write"] == "payment.visa-action-required#paid"
+
+
+@pytest.mark.parametrize("sql_name", ["_EXPIRE_SQL", "_EXPIRE_SQL_SQLITE"])
+def test_the_money_exclusion_is_in_both_the_inner_and_the_outer_where(sql_name):
+    """Each clause on its own: the outer WHERE is the race guard (a row can change between the two), and
+    removing either one must fail a test, on either dialect."""
+    sql = getattr(ledger, sql_name)
+    clause = "AND (last_error_code IS NULL OR last_error_code NOT LIKE '%money_result_seen%')"
+    inner_start = sql.index("SELECT id FROM a2a_rail_purchases")
+    inner_end = sql.index(")", sql.index("LIMIT :limit"))
+    inner, outer = sql[inner_start:inner_end], sql[inner_end:]
+    assert clause in inner, f"{sql_name}: the inner (candidate) WHERE lost the money exclusion"
+    assert clause in outer, f"{sql_name}: the outer (race guard) WHERE lost the money exclusion"

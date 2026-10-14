@@ -792,7 +792,7 @@ _EXPIRE_SQL = """
            )
        AND state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
        AND pending_write IS NULL
-               AND (last_error_code IS NULL OR last_error_code NOT LIKE '%money_result_seen%')
+       AND (last_error_code IS NULL OR last_error_code NOT LIKE '%money_result_seen%')
        AND ((buyer_action_expires_at IS NOT NULL AND buyer_action_expires_at < clock_timestamp())
             OR state_entered_at < clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
             OR created_at < clock_timestamp() - (:max_lifetime_seconds * INTERVAL '1 second'))
@@ -821,7 +821,7 @@ _EXPIRE_SQL_SQLITE = """
            )
        AND state IN ('opened', 'needs_payment_method', 'quoting', 'awaiting_authorization')
        AND pending_write IS NULL
-               AND (last_error_code IS NULL OR last_error_code NOT LIKE '%money_result_seen%')
+       AND (last_error_code IS NULL OR last_error_code NOT LIKE '%money_result_seen%')
        AND ((buyer_action_expires_at IS NOT NULL AND buyer_action_expires_at < CURRENT_TIMESTAMP)
             OR state_entered_at < datetime('now', '-' || :max_age_seconds || ' seconds')
             OR created_at < datetime('now', '-' || :max_lifetime_seconds || ' seconds'))
@@ -859,8 +859,10 @@ async def expire_overdue_purchases(
 #
 # The buyer's email and address are needed only until the rail has the cart. Terminal writes NULL
 # them, and the expiry sweep ends every pre-pay row within MAX_LIFETIME_SECONDS_DEFAULT; this purge is
-# the BACKSTOP for what neither reaches (a long `paying`, a dark worker), in any state, without moving
-# the state. A purged row cannot re-enter `quoting` (see the transition). Restated in the outer WHERE for the same reason as the sweeps above.
+# the BACKSTOP for what neither reaches (a long `paying`, a row parked on a money result, which the sweep
+# never ends), in any state, without moving the state: such a row keeps its contact for up to
+# CONTACT_RETENTION_SECONDS_DEFAULT (72 h). The purge runs inside the worker's tick, so with the worker
+# switched off nothing purges; no purchase advances then either. A purged row cannot re-enter `quoting` (see the transition). Restated in the outer WHERE for the same reason as the sweeps above.
 _PURGE_CONTACT_SQL = """
     UPDATE a2a_rail_purchases
        SET buyer_email = NULL, shipping_address = NULL, contact_purged_at = clock_timestamp(),
