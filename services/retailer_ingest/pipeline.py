@@ -350,6 +350,18 @@ def job_source(options: Optional[Dict[str, Any]]) -> str:
     return (options or {}).get("source") or "storefront"
 
 
+def plan_prices_read_live(job: Dict[str, Any]) -> bool:
+    """Did THIS execution read every planned offer price from the merchant, in the job currency?
+
+    The storefront source does: the apply stage crawls the store's own catalogue (`_run_stage`:
+    crawl -> check -> apply, nothing carried over from the dry run) and `require_currency` holds the
+    store's currency to the job's. So its offers may date their prices (`apply_ingest_plan(price_read=
+    True)` -> `catalog_offers.price_checked_at`). An affiliate feed is the network's file: its prices
+    are as old as the file, which says nothing about when. The markets source writes through its own
+    statement (`shopify_markets`)."""
+    return job_source(job.get("options")) == "storefront"
+
+
 def ingest_payload(job: Dict[str, Any]) -> Dict[str, Any]:
     """The crawl payload, normalized by the ONE payload validator with this lane's market allowlist.
     Enqueue runs exactly this, so a row the drain would refuse at crawl time is refused there too."""
@@ -1674,7 +1686,7 @@ async def _apply(job: Dict[str, Any], run_id: str, result: Dict[str, Any], summa
             with _timed(timings, "write_s"):
                 counts = await apply_ingest_plan(plan, batch_label=f"retailer_ingest:{job['id']}", db=db,
                                                  primary_readiness=True, market=job_market(job.get("options")),
-                                                 verified_storefront=verified)
+                                                 verified_storefront=verified, price_read=plan_prices_read_live(job))
         report = require_primary_apply(preflight, counts)
     except CatalogWriteLockBusy as busy:
         timings["write_lock_wait_s"] = round(time.monotonic() - waiting, 3)
