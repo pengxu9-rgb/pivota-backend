@@ -97,9 +97,14 @@ Success is HTTP 200 with a `selection` object containing `product_key`, `variant
 The merchant field preserves the validated observed storefront host needed by the create
 lane; pilot and merchant eligibility use the existing canonical merchant rule.
 
-The selected numeric ID must resolve to exactly one unsuppressed, nonplaceholder SKU of that
-product and seller/source. Duplicate aliases refuse `row_variant_ambiguous`; no SKU is chosen
-by ordering or a default variant. The existing cart-link reader validates active attached
+The selected numeric ID resolves by create's own `variant_id` rule (see `variant_id` under
+`POST /purchases`): every unsuppressed, nonplaceholder SKU naming it must be that product's own
+seller/source SKU, else `row_variant_unverified`. One variant spelled by two catalog writers is
+priced per spelling; the priced spellings must agree (`row_price_ambiguous`) and the lowest SKU
+key is named. A product whose only variant it is, or that has only its `::canonical`
+placeholder, takes the no-key path, and the witness names the SKU that load priced -- which
+must then load by name (as the create carrying the witness names it) to the same variant and
+price, else the preparation refuses. The existing cart-link reader validates active attached
 source, seller identity, current storefront proof and the selected SKU's own offer. Missing,
 expired or contradictory evidence refuses. Preparation requires its usable own offers to
 agree on exact currency and minor price, and enforces the same current agent, domain, market,

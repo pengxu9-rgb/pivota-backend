@@ -1706,7 +1706,7 @@ def _enrichment_variant_title(sku: Mapping[str, Any]) -> Optional[str]:
 
 async def _load_enrichment_cart_link_item(
     *, product: Dict[str, Any], merchant_host: str, variant_key: Optional[str],
-    market_country: str,
+    market_country: str, priced_sku: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], str, str, Optional[str]]:
     """`_load_cart_link_item` for an ENRICHMENT row: the same four-tuple, or a refusal.
 
@@ -1801,6 +1801,8 @@ async def _load_enrichment_cart_link_item(
     priced, price_minor, price_reason = enrichment_offer_price_ok(listing, proof, market_currency)
     if not priced:
         raise svc.PurchaseRefused(price_reason, "enrichment offer price refused")
+    if priced_sku is not None:
+        priced_sku["sku_key"] = str(sku["sku_key"])
 
     return (
         {"shop_domain": merchant_host, "our_price_minor": int(price_minor),
@@ -1817,7 +1819,7 @@ async def _load_enrichment_cart_link_item(
 
 async def _load_cart_link_item(
     *, merchant_domain: str, product_key: str, variant_key: Optional[str],
-    market_country: str,
+    market_country: str, priced_sku: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], str, str, Optional[str]]:
     """Return server-priced cart item, seller identity, and Shopify variant, or refuse.
 
@@ -1827,6 +1829,9 @@ async def _load_cart_link_item(
 
     ENRICHMENT rows (option 2) take `_load_enrichment_cart_link_item` instead, and only while
     REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED is on. Off, not one extra statement runs here.
+
+    `priced_sku`, when given, is filled with the `sku_key` of the sku this load PRICED (on success
+    only): the one a no-key load chose, which `/purchases/prepare` names in its witness.
     """
     if svc.is_cart_link_enrichment_enabled():
         enrichment = await database.fetch_one(
@@ -1836,7 +1841,7 @@ async def _load_cart_link_item(
         if enrichment is not None:
             return await _load_enrichment_cart_link_item(
                 product=dict(enrichment), merchant_host=merchant_domain,
-                variant_key=variant_key, market_country=market_country,
+                variant_key=variant_key, market_country=market_country, priced_sku=priced_sku,
             )
     raw = await database.fetch_one(
         _CART_PRODUCT_SQL, {"product_key": product_key, "merchant_domain": merchant_domain}
@@ -2009,6 +2014,8 @@ async def _load_cart_link_item(
         raise svc.PurchaseRefused("row_currency_mismatch", "offer currency differs from market")
     if not price_minor or price_minor <= 0:
         raise svc.PurchaseRefused("row_unpriced", "offer price is not an exact minor amount")
+    if priced_sku is not None:
+        priced_sku["sku_key"] = str(sku["sku_key"])
 
     # URL and click id are filled by the route after it mints a new click. These are facts only;
     # there is no URL-shaped caller input anywhere in this path.
@@ -2758,8 +2765,9 @@ async def prepare_reap_purchase_selection(
 ):
     """Authenticated read-only selection witness, before an original create body exists.
 
-    A numeric selector is not a SKU key. Resolve it to exactly one existing live SKU,
-    then use the create lane's proof, seller and own-offer reader with that exact key.
+    A numeric selector is not a SKU key. Resolve it to one existing live SKU by create's own
+    rule (`_resolve_selected_variant_key`), then use the create lane's proof, seller and
+    own-offer reader with that exact key, the key the witness names.
     No buyer, consent, idempotency, click, enrollment or purchase row is touched; no
     network fetch or provider request is made. Recovery never calls this endpoint.
     """
@@ -2812,31 +2820,39 @@ async def prepare_reap_purchase_selection(
             product = dict(product)
             if str(product.get("platform") or "").lower() not in {"shopify", "external_seed"}:
                 raise svc.PurchaseRefused("row_not_shopify")
-            skus = [dict(row) for row in await database.fetch_all(
-                _CART_PRODUCT_SKUS_SQL.replace(
-                    "s.sku_key, s.source_variant_id,", "s.sku_key, s.source_variant_id, s.merchant_id, s.platform,"
-                ), {"product_key": product_key}
-            )]
-            if len(skus) > _CART_MAX_SKUS:
-                raise svc.PurchaseRefused("row_variant_ambiguous")
-            matches = [sku for sku in skus
-                       if not _is_placeholder_sku(sku, product_key)
-                       and _cart_numeric_variant(sku.get("source_variant_id"), product_key) == variant_id]
-            if len(matches) != 1:
-                raise svc.PurchaseRefused(
-                    "row_variant_ambiguous" if matches else "row_variant_unverified"
+            # THE ONE SELECTOR RULE, create's and resume's (`_resolve_selected_variant_key`): every sku
+            # naming the id is this listing's own; one variant spelled by two writers is priced per
+            # spelling and must agree; a placeholder-only or sole-variant product takes the no-key path.
+            variant_key = await _resolve_selected_variant_key(
+                merchant_domain=merchant_host, product_key=product_key,
+                variant_id=variant_id, market_country=market,
+            )
+            unnamed: Optional[Tuple[int, str]] = None
+            if variant_key is None:
+                # The no-key path: the witness names the sku this load PRICED. The create that
+                # carries the witness NAMES that sku, so it is loaded by name below and must give
+                # the same variant and price -- a witness create would refuse is never handed out.
+                priced: Dict[str, Any] = {}
+                no_key_facts, _seller, no_key_variant, _kind = await _load_cart_link_item(
+                    merchant_domain=merchant_host, product_key=product_key,
+                    variant_key=None, market_country=market, priced_sku=priced,
                 )
-            variant_key = str(matches[0]["sku_key"])
-            if (matches[0]["merchant_id"] != product["merchant_id"]
-                    or matches[0]["platform"] != product["platform"]):
-                raise svc.PurchaseRefused("row_variant_unverified")
+                _require_selected_variant(no_key_variant, variant_id)
+                variant_key = priced["sku_key"]
+                unnamed = (no_key_facts["our_price_minor"], no_key_facts["currency"])
             facts, seller, resolved_id, _seed_kind = await _load_cart_link_item(
                 merchant_domain=merchant_host, product_key=product_key,
                 variant_key=variant_key, market_country=market,
             )
-            if resolved_id != variant_id:
-                raise svc.PurchaseRefused("row_variant_unverified")
-            if str(matches[0].get("currency") or "").strip().upper() != facts["currency"]:
+            _require_selected_variant(resolved_id, variant_id)
+            if unnamed is not None and unnamed != (facts["our_price_minor"], facts["currency"]):
+                raise svc.PurchaseRefused("row_price_ambiguous")
+            selected_sku = await database.fetch_one(
+                _CART_SKU_BY_KEY_SQL, {"product_key": product_key, "variant_key": variant_key}
+            )
+            if selected_sku is None:
+                raise svc.PurchaseRefused("row_not_found")
+            if str(selected_sku["currency"] or "").strip().upper() != facts["currency"]:
                 raise svc.PurchaseRefused("row_currency_mismatch")
             # The enabled, source-bound enrichment loader already requires every live
             # own-listing offer to agree with this SKU's fresh storefront proof in this
