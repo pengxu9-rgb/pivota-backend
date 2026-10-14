@@ -39,7 +39,7 @@ LIVE_PROD_ENV = {
     "RELGRAPH_SYNC_CONFIRM": "APPLY_RELGRAPH_SYNC_ROUTINE",
     "RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES": "90",
     "RELGRAPH_SYNC_REVIEW_LIMIT": "2000",
-    "RELGRAPH_SYNC_REVIEW_CONCURRENCY": "6",
+    "RELGRAPH_SYNC_REVIEW_CONCURRENCY": "8",
     "RELGRAPH_SYNC_PRIORITIZE_UNCOVERED": "true",
     # 2026-10-13: the uncovered backfill (PIVOTA-Agent #2418) and per-anchor target recall.
     "RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT": "200",
@@ -114,7 +114,7 @@ def test_review_limit_rises_only_with_concurrency_and_anchor_caps_stay_default(t
     # labels) is ~54 of the 90-minute step. The anchor caps stay at the image defaults: the gateway cron
     # widens the build limit by the backfill itself.
     env = _relgraph_sync_env(_reconcile(tmp_path, "prod", {})[0])
-    assert (env["RELGRAPH_SYNC_REVIEW_LIMIT"], env["RELGRAPH_SYNC_REVIEW_CONCURRENCY"]) == ("2000", "6")
+    assert (env["RELGRAPH_SYNC_REVIEW_LIMIT"], env["RELGRAPH_SYNC_REVIEW_CONCURRENCY"]) == ("2000", "8")
     for cap in ("RELGRAPH_SYNC_LIMIT", "RELGRAPH_SYNC_SELECT_LIMIT"):
         assert cap not in env
 
