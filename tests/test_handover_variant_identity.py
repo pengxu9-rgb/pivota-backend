@@ -29,6 +29,7 @@ from services.handover_variant_identity import (
     R_NO_IDENTITY,
     R_NO_PRODUCT_KEY,
     R_SEED_STAMP,
+    R_SIBLING,
     R_SOLE,
     SOURCE_CATALOG_SKU,
     SOURCE_SEED_STAMP,
@@ -1419,3 +1420,130 @@ def _completed(value):
     fut = asyncio.get_event_loop().create_future()
     fut.set_result(value)
     return fut
+
+
+# ---------------------------------------------------------------------------------------------
+# A SOLE CANDIDATE NAMES ITS OWN VARIANT, NOT EVERY OFFER OF A MULTI-VARIANT SEED
+#
+# R_SOLE handed the one live catalog id to ANY offer whose own name was a SKU (a SKU cannot
+# contradict). On a seed storing two variants with one catalog row, the sibling offer got the
+# other variant's cart: one variant's price quoted for another's checkout. Found 2026-10-14 in
+# review of #2620; #2623 fixed the operator-id twin in the route.
+# ---------------------------------------------------------------------------------------------
+
+def _two_variant_seed(*, b_extra=None):
+    return {"variants": [
+        {"variant_id": "SKU-30ML", "title": "30ml", "price_amount": 19.0},
+        {"variant_id": "SKU-50ML", "title": "50ml", "price_amount": 29.0,
+         **(b_extra if b_extra is not None else {"shopify_variant_id": VID})},
+    ]}
+
+
+def test_a_sole_candidate_is_not_handed_to_a_sibling_offer():
+    got = choose_handover_variant([_cand(VID)], seed_data=_two_variant_seed(),
+                                  offer_variant_id="SKU-30ML")
+    assert got.variant_id is None
+    assert got.reason == R_SIBLING and got.candidates == 1
+
+
+def test_a_sole_candidate_is_handed_to_the_offer_whose_stored_variant_carries_it():
+    """Matched through the SAME stored entry: named by its SKU, carrying the Shopify id."""
+    got = choose_handover_variant([_cand(VID)], seed_data=_two_variant_seed(),
+                                  offer_variant_id="SKU-50ML")
+    assert got.variant_id == VID and got.reason == R_SOLE
+
+
+def test_a_gid_on_the_stored_variant_still_answers_to_the_candidate():
+    seed = _two_variant_seed(b_extra={"shopify_variant_id": "gid://shopify/ProductVariant/" + VID})
+    got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id="SKU-50ML")
+    assert got.variant_id == VID and got.reason == R_SOLE
+
+
+def test_an_offer_the_stored_variants_do_not_know_is_refused_on_a_multi_variant_seed():
+    got = choose_handover_variant([_cand(VID)], seed_data=_two_variant_seed(),
+                                  offer_variant_id="SKU-100ML")
+    assert got.variant_id is None and got.reason == R_SIBLING
+
+
+def test_two_stored_variants_neither_carrying_the_candidate_refuse_both_offers():
+    seed = _two_variant_seed(b_extra={})
+    for name in ("SKU-30ML", "SKU-50ML"):
+        got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id=name)
+        assert got.variant_id is None and got.reason == R_SIBLING, name
+
+
+@pytest.mark.parametrize("seed_data,name", [
+    ({"variants": [{"variant_id": "SKU-30ML"}]}, "SKU-30ML"),   # one stored variant
+    (None, "SKU-30ML"),                                          # no stored variants at all
+    (_two_variant_seed(), None),                                 # product-grain hand-over
+])
+def test_nothing_to_choose_between_keeps_the_sole_answer(seed_data, name):
+    got = choose_handover_variant([_cand(VID)], seed_data=seed_data, offer_variant_id=name)
+    assert got.variant_id == VID and got.reason == R_SOLE
+
+
+async def test_the_sibling_refusal_is_counted_and_in_the_message_text():
+    r = HandoverVariantResolver()
+    r._by_key[PK] = [_cand(VID)]
+    r._primed.add(PK)
+    got = r.choose(product_key=PK, seed_data=_two_variant_seed(), offer_variant_id="SKU-30ML")
+    assert got.reason == R_SIBLING
+    assert r.stats["handover_refused_sibling"] == 1
+    assert r.stats["handover_no_identity"] == 0, "a sibling refusal is not a missing identity"
+    f = handover_coverage_fields(r.stats)
+    assert f["handover_refused_sibling"] == 1
+    assert "sibling=1" in handover_coverage_message(f)
+
+
+def test_the_sibling_offer_gets_no_cart_through_the_real_route(monkeypatch, client):
+    """End to end, real mint: one catalog row (the $29 variant), two stored variants. Each offer
+    is read by its OWN price. Before the fix the $19 offer carried the $29 variant's cart."""
+    import base64
+    from unittest.mock import AsyncMock
+    from urllib.parse import parse_qs, urlparse
+
+    import routes.agent_shop_gateway as gateway
+
+    row = _seed_row(
+        snapshot_extra={"storefront_platform": "shopify",
+                        "storefront_platform_source": "products_js_v1"},
+        variants=[
+            {"variant_id": "SKU-30ML", "title": "30ml", "price_amount": 19.0,
+             "price_currency": "USD", "availability": "in_stock"},
+            {"variant_id": "SKU-50ML", "title": "50ml", "price_amount": 29.0,
+             "price_currency": "USD", "availability": "in_stock",
+             "shopify_variant_id": CATALOG_VID},
+        ],
+    )
+    sku = _row(source_variant_id=CATALOG_VID,
+               sku_payload=json.dumps({"variant_id": CATALOG_VID,
+                                       "variant_id_provenance": "merchant_issued"}))
+
+    async def fake_fetch_all(query, values=None):
+        q = str(query)
+        if "FROM catalog_skus" in q:
+            return [sku]
+        if "FROM external_product_seeds" in q:
+            return [row]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+    res = _resolve(client, product_id=SPID)
+    assert res.status_code == 200, res.text
+    offers = {float(o["price"]): o for o in res.json().get("offers") or []
+              if o.get("purchase_route") == "affiliate_outbound"}
+    assert set(offers) == {19.0, 29.0}, sorted(offers)
+    assert offers[19.0]["execution_spec"]["cart_url"] is None, offers[19.0]["execution_spec"]
+    tok = parse_qs(urlparse(offers[19.0]["affiliate_url"]).query)["token"][0].split(".")[0]
+    dest = json.loads(base64.urlsafe_b64decode(tok + "=" * (-len(tok) % 4)))["dest"]
+    assert "/cart/" not in dest and CATALOG_VID not in dest, dest
+    assert f"/cart/{CATALOG_VID}:1" in offers[29.0]["execution_spec"]["cart_url"]
+
