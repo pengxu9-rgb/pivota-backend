@@ -5589,6 +5589,12 @@ def _attached_two_variant_row(*, b_availability: str = "in_stock", attached: str
 
 def _resolve_every_variant(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: dict) -> dict:
     """offers.resolve by PRODUCT, so every stored variant becomes its own offer. Keyed by price."""
+    by_price = {float(o["price"]): o for o in _resolve_by_product(monkeypatch, client, row)}
+    assert set(by_price) == {19.0, 29.0}, f"one offer per stored variant: {sorted(by_price)}"
+    return by_price
+
+
+def _resolve_by_product(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: dict) -> list:
     import routes.agent_shop_gateway as gateway
 
     async def fake_fetch_all(query: str, values=None):
@@ -5610,9 +5616,8 @@ def _resolve_every_variant(monkeypatch: pytest.MonkeyPatch, client: TestClient, 
     assert res.status_code == 200, res.text
     offers = [o for o in (res.json().get("offers") or [])
               if o.get("purchase_route") == "affiliate_outbound"]
-    by_price = {float(o["price"]): o for o in offers}
-    assert set(by_price) == {19.0, 29.0}, f"one offer per stored variant: {sorted(by_price)}"
-    return by_price
+    assert offers, "the external offer must be returned for this to prove anything"
+    return offers
 
 
 def test_a_sibling_offer_is_not_handed_the_attached_variants_cart(
@@ -5690,3 +5695,92 @@ def test_a_single_variant_seed_keeps_the_operator_cart(
     assert res.status_code == 200, res.text
     (offer,) = [o for o in res.json()["offers"] if o.get("purchase_route") == "affiliate_outbound"]
     assert f"/cart/{_ATTACHED_B_VID}:1" in offer["execution_spec"]["cart_url"]
+
+
+# Review of #2623, round 1: the "nothing to choose" shortcuts were reachable with a choice.
+
+
+def test_an_id_less_two_variant_seed_hands_its_one_offer_no_attached_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """P1 probe. Neither stored variant has an id, so both offers dedupe to the first ($19) one,
+    which used to look product-grain and took the $29 variant's cart."""
+    row = _attached_two_variant_row(b_ids={})
+    for v in row["seed_data"]["variants"]:
+        v.pop("variant_id")
+    (offer,) = _resolve_by_product(monkeypatch, client, row)
+    assert float(offer["price"]) == 19.0
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+    assert "/cart/" not in _dest_of(offer)
+
+
+def test_a_lone_variant_naming_another_merchant_id_takes_no_attached_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """P2 probe. One stored variant whose own id is a DIFFERENT merchant-issued variant: there is
+    a choice, and the entry has already made it."""
+    row = _attached_two_variant_row()
+    row["seed_data"]["variants"] = [{"variant_id": "43062643884100", "title": "30ml",
+                                     "price_amount": 19.0, "price_currency": "USD",
+                                     "availability": "in_stock"}]
+    (offer,) = _resolve_by_product(monkeypatch, client, row)
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
+
+def test_two_entries_sharing_one_id_do_not_lend_each_other_a_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """P4 probe. Both entries are `sku: X`; only the second carries the attached id. The offers
+    dedupe to the first ($19) entry, which must not take the second's cart."""
+    row = _attached_two_variant_row()
+    a, b = row["seed_data"]["variants"]
+    for v in (a, b):
+        v.pop("variant_id")
+        v["sku"] = "X"
+    (offer,) = _resolve_by_product(monkeypatch, client, row)
+    assert float(offer["price"]) == 19.0
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
+
+def test_an_explicit_other_gid_on_an_empty_seed_takes_no_attached_cart() -> None:
+    """P2 probe, product-grain caller: no stored variants, and the offer names a different
+    variant as a Shopify gid, which is unambiguously a variant claim."""
+    import routes.agent_shop_gateway as gateway
+
+    kw = dict(product_key="prod::m_brand::shopify::serum", product_id="serum")
+    assert gateway._attached_variant_is_this_offer(
+        {}, offer_variant_id="gid://shopify/ProductVariant/43062643884100",
+        attached_variant_id=_ATTACHED_B_VID, **kw,
+    ) is False
+    assert gateway._attached_variant_is_this_offer(
+        {}, offer_variant_id=f"gid://shopify/ProductVariant/{_ATTACHED_B_VID}",
+        attached_variant_id=_ATTACHED_B_VID, **kw,
+    ) is True, "the attached variant itself, in either spelling, still takes it"
+
+
+def test_a_bare_number_offer_string_may_not_refuse_the_attached_cart() -> None:
+    """The deliberate limit of the P2 fix. A product-grain caller's offer string comes from
+    `_seed_offer_variant_id`, whose chain includes `sku`; a bare number there may be a barcode,
+    which may match but never refuse (pinned by
+    test_shopify_variant_identity::test_an_attached_shopify_seed_uses_catalog_identity_not_the_sku_chain).
+    A stored entry's CLAIM keys still contradict — see the lone-variant probe above."""
+    import routes.agent_shop_gateway as gateway
+
+    assert gateway._attached_variant_is_this_offer(
+        {}, offer_variant_id="43062643884100", attached_variant_id=_ATTACHED_B_VID,
+        product_key="prod::m_brand::shopify::serum", product_id="serum",
+    ) is True
+
+
+def test_a_product_grain_offer_shared_by_two_entries_takes_no_attached_cart() -> None:
+    """P4, product-grain path: two entries answer to the offer's id `X`, only the second carries
+    the attached id. Which entry the offer is cannot be said, so it takes no cart."""
+    import routes.agent_shop_gateway as gateway
+
+    seed = {"variants": [{"sku": "X", "price_amount": 19.0},
+                         {"sku": "X", "shopify_variant_id": _ATTACHED_B_VID, "price_amount": 29.0}]}
+    assert gateway._attached_variant_is_this_offer(
+        seed, offer_variant_id="X", attached_variant_id=_ATTACHED_B_VID,
+        product_key="prod::m_brand::shopify::serum", product_id="serum",
+    ) is False
+
