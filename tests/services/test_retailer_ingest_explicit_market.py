@@ -860,3 +860,18 @@ async def test_the_pipeline_hands_the_jobs_market_to_the_apply(env, monkeypatch)
     monkeypatch.setattr(apply_mod, "apply_ingest_plan", spy)
     await pipeline.run_stage(job("apply_due"), db=env.db)
     assert seen == ["US"]
+
+
+async def test_the_pipeline_vouches_for_the_prices_its_storefront_apply_read(env, monkeypatch):  # noqa: F811
+    """The apply stage crawled the store in this execution, so its offers may date their prices
+    (`apply_ingest_plan(price_read=True)` -> catalog_offers.price_checked_at, migration 246)."""
+    from services.catalog_enrichment_agent import apply as apply_mod
+    seen = []
+    real = apply_mod.apply_ingest_plan
+
+    async def spy(plan, **kw):
+        seen.append(kw.get("price_read"))
+        return await real(plan, **kw)
+    monkeypatch.setattr(apply_mod, "apply_ingest_plan", spy)
+    await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert seen == [True]

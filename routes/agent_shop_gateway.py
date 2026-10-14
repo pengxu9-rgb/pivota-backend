@@ -40,6 +40,8 @@ from services.seed_variant_options import seed_variant_options_as_mapping
 from services.outbound_warm_handoff import (
     PURCHASABILITY_BROWSE_ONLY,
     PURCHASABILITY_TIER_KEY,
+    STOCK_DECLINE_KEY,
+    STOCK_OUT_OF_STOCK,
     could_upgrade_at_click_time,
 )
 import db.merchant_purchasability as merchant_purchasability
@@ -4538,6 +4540,9 @@ async def _handle_offers_resolve(
     _preflight_stats: Dict[str, int] = {"candidates": 0, "gated": 0, "cart_prefilled": 0,
                                         "asked": 0, "memo_hits": 0, "skipped_by_budget": 0,
                                         "degraded_to_referral": 0}
+    # Carts withheld because the offer's OWN stock claim is out of stock. Its own counter, not a
+    # `_preflight_stats` key: the preflight coverage fields are computed from that dict.
+    _stock_stats: Dict[str, int] = {"declined": 0}
     # ONE resolver for the WHOLE request, for the same reason the budget and the memo are one:
     # `_append_external_offers_from_seed_rows` is called from three sites, and a resolver built
     # per call would re-ask for product keys the previous call already loaded. It holds only a
@@ -4855,6 +4860,24 @@ async def _handle_offers_resolve(
                         redirect_identity = dict(redirect_identity)
                         redirect_identity["cart_variant_id"] = None
 
+                # THE OFFER'S OWN STOCK — no cart for an item this same answer calls sold out.
+                # `in_stock` above is what this offer PUBLISHES; with no check here a seed whose
+                # fresh column said out_of_stock shipped `in_stock: false` beside a prefilled
+                # `cart_permalink` (prod 2026-10-14, tangleangel_gb_6826386948176, market GB):
+                # the preflight is shadow-only and the purchasability gate is about the merchant
+                # x market, so nothing between the two ever read the item's stock. Only an
+                # explicit False declines; unknown (None) keeps the cart, the asymmetry every
+                # serving gate here applies (`services/external_seed_stock`). A decline takes the
+                # purchasability road: null the cart id before the mint, so the mint, the
+                # published spec and `cart_prefilled` all follow from the one value, and sign it
+                # into the token so the warm lane cannot rebuild the cart at click time. It runs
+                # BEFORE the purchasability gate so a cart that will not be built never asks the
+                # fact table.
+                _stock_declined = in_stock is False and bool(redirect_identity.get("cart_variant_id"))
+                if _stock_declined:
+                    _stock_stats["declined"] += 1
+                    redirect_identity = {**redirect_identity, "cart_variant_id": None}
+
                 # MERCHANT PURCHASABILITY — would this cart land a buyer on a store the fact
                 # says cannot take their card in this market? Asked on the cart the mint WOULD
                 # build (the same `resolve_cart_permalink` it calls, on the same inputs), so a
@@ -4900,6 +4923,7 @@ async def _handle_offers_resolve(
                         **({"skuId": sku_id} if sku_id else {}),
                         **({"productId": product_id} if product_id else {}),
                         **({PURCHASABILITY_TIER_KEY: _purchasability_tier} if _purchasability_tier else {}),
+                        **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if _stock_declined else {}),
                     },
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
@@ -4957,6 +4981,7 @@ async def _handle_offers_resolve(
                     # from the very token the click will carry.
                     redirect_url=redirect_url,
                     purchasability_tier=_purchasability_tier,
+                    stock_declined=_stock_declined,
                 )
 
                 offer_spec = {
@@ -6424,6 +6449,8 @@ async def _handle_offers_resolve(
         " purchasability asked=%d declined=%d" % (
             _cart_purchasability.stats["asked"], _cart_purchasability.stats["declined"],
         ) if _cart_purchasability.stats["declined"] or _cart_purchasability.stats["asked"] else ""
+    ) + (
+        " stock_declined=%d" % _stock_stats["declined"] if _stock_stats["declined"] else ""
     )
     logger.info(
         _summary_msg,
@@ -9335,6 +9362,9 @@ def _cart_prefilled_claim(
     # provable where it would otherwise be `None`. Defaulted because omitting it errs SAFE:
     # the claim stays `None` ("unknown"), never a wrong `False`.
     purchasability_tier: Optional[str] = None,
+    # Set when the offer's own stock claim withheld the cart. Signed into the token the same
+    # way, and knocked out by the warm lane the same way; defaulted for the same reason.
+    stock_declined: bool = False,
 ) -> Optional[bool]:
     """TRI-STATE: True = prefilled cart, False = bare PDP, None = we cannot promise either.
 
@@ -9406,6 +9436,7 @@ def _cart_prefilled_claim(
         ctx={
             "join_mode": "referral_only",
             **({PURCHASABILITY_TIER_KEY: purchasability_tier} if purchasability_tier else {}),
+            **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if stock_declined else {}),
         },
         settings=settings,
     ):
