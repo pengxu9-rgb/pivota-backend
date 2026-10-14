@@ -117,9 +117,13 @@ class FakeDb:
         return None
 
     def _external_seed_row(self, row):
-        seed = self._seed_by_id(row.get("source_ref"))
+        # The mirror resolver reads the seed's raw fields and picks a host in Python
+        # (`_mirror_seed_host`); the real SQL is executed by the _postgres twin.
+        seed = self._seed_by_id(row.get("source_ref")) or {}
         db_row = self._db_product(row)
-        db_row["resolved_source_domain"] = seed.get("domain") if seed else None
+        db_row["seed_domain"] = seed.get("domain")
+        db_row["seed_canonical_url"] = seed.get("canonical_url")
+        db_row["seed_destination_url"] = seed.get("destination_url")
         return db_row
 
     def _legacy_external_seed_row(self, row):
@@ -178,6 +182,20 @@ async def test_external_seed_mirror_resolves_from_seed_id():
 
     assert rows[0].resolved_source_domain == "example.com"
     assert rows[0].resolution_rule == "external_product_seeds.id"
+
+
+@pytest.mark.parametrize("seed,expected", [
+    ({"domain": "N/A", "canonical_url": "https://canon.example/p"}, ("canon.example", "external_product_seeds.url_host")),
+    ({"domain": "a b.com", "destination_url": "https://dest.example/p"}, ("dest.example", "external_product_seeds.url_host")),
+    ({"domain": None, "canonical_url": "https://canon.example/p", "destination_url": "https://dest.example/p"},
+     ("canon.example", "external_product_seeds.url_host")),
+    ({"domain": "unknown", "canonical_url": "", "destination_url": None}, (None, "external_product_seeds.id")),
+])
+def test_mirror_seed_host_skips_implausible_fields(seed, expected):
+    """A junk seed domain ('N/A' parses to 'n') never shadows a good page host: this fill is permanent."""
+    assert backfill._mirror_seed_host({"seed_domain": seed.get("domain"),
+                                       "seed_canonical_url": seed.get("canonical_url"),
+                                       "seed_destination_url": seed.get("destination_url")}) == expected
 
 
 @pytest.mark.asyncio

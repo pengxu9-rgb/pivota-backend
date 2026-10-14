@@ -328,6 +328,8 @@ async def test_prepare_and_create_for_a_product_spelled_www_over_an_apex_seed(cl
     ("uk." + DOMAIN, "uk." + DOMAIN, None),  # a subdomain is ANOTHER store
     ("evil" + DOMAIN, "evil" + DOMAIN, None),  # a lookalike
     (DOMAIN, "uk." + DOMAIN, None),          # the seed's domain says this store, its page another
+    ("uk." + DOMAIN, DOMAIN, None),          # the seed's page is this store, its domain column another
+    ("evil" + DOMAIN, DOMAIN, None),         # ... or a lookalike
     (None, "other.example", None),           # no domain, and the page is another store
     ("www." + DOMAIN, "www." + DOMAIN, DOMAIN),  # the proof was fetched from a host the seed's page is not
 ])
