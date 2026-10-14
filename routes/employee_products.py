@@ -980,23 +980,41 @@ def _read_heals_stored_currency(*, existing: List[Dict[str, Any]], incoming: Lis
     The adoption rules replace a list only with a richer read, and the reconcile never re-prices
     across currencies, so variants an earlier read left in CAD stayed CAD under a USD read of the
     same sizes. The read must name every stored variant: replacing a list it does not cover would
-    drop sizes, and #2601's protected variants are among those it must name."""
+    drop sizes (a stored variant with no id is never covered), and #2601's protected variants are
+    among those it must name."""
     read_currencies = _stated_variant_currencies(incoming)
     if not read_currencies or not (_stated_variant_currencies(existing) - read_currencies):
         return False
     named = set().union(*(_variant_identity_keys(v) for v in incoming))
-    return all(_variant_identity_keys(v) <= named for v in existing)
+    # A stored variant with no id cannot be named by any read, so the read does not cover it.
+    return all((keys := _variant_identity_keys(v)) and keys <= named for v in existing)
 
 
-def _refuse_unstorable_employee_variants(variants: Optional[List[Dict[str, Any]]]) -> None:
+def _refuse_unstorable_employee_variants(
+    variants: Optional[List[Dict[str, Any]]],
+    *,
+    stored_variants: List[Dict[str, Any]],
+    row_currency: Optional[str],
+) -> None:
     """An employee may set a seed's variants by hand, and may change its currency so (the sticky
-    rule binds a scraped read, not a person), but never to a currency no seed may store, nor to two.
-    The preview hands the UI the page read's variants, so a geo-served read could otherwise
-    round-trip through the form."""
+    rule binds a scraped read, not a person), but may not BRING IN a currency no seed may store, nor
+    a second one. The preview hands the UI the page read's variants, so a geo-served read could
+    otherwise round-trip through the form.
+
+    Only a currency the seed does not already hold counts. Both portal editors send the whole stored
+    list back on every save, so refusing what is already stored would make a seed priced in GBP, or
+    left in CAD by an earlier read, uneditable: even disabling it would fail.
+
+    A seed's currency is its ROW's: the nightly refresh holds variants to it and heals variants priced
+    otherwise. An employee moving the variants to another currency moves `price_currency` with them."""
     stated = _stated_variant_currencies(variants or [])
-    unstorable = sorted(stated - seed_storable_currencies()) if len(stated) <= 1 else sorted(stated)
-    if unstorable:
-        raise HTTPException(status_code=422, detail=f"VARIANT_CURRENCY_NOT_STORABLE:{','.join(unstorable)}")
+    held = _stated_variant_currencies(stored_variants) | {str(row_currency or "").strip().upper()}
+    brought = stated - held
+    if not brought:
+        return
+    refused = sorted(brought) if len(stated) > 1 else sorted(brought - seed_storable_currencies())
+    if refused:
+        raise HTTPException(status_code=422, detail=f"VARIANT_CURRENCY_NOT_STORABLE:{','.join(refused)}")
 
 
 def _variant_adoption_refusal(foreign_currencies: List[str]) -> Optional[Dict[str, Any]]:
@@ -4124,7 +4142,12 @@ async def create_external_seed(
     partner_type = (body.partner_type or "").strip() or None
     disclosure_text = (body.disclosure_text or "").strip() or DEFAULT_DISCLOSURE_TEXT
 
-    _refuse_unstorable_employee_variants(body.variants)
+    held_row = dict(existing_row) if existing_row else {}
+    _refuse_unstorable_employee_variants(
+        body.variants,
+        stored_variants=_seed_variants(_ensure_json_obj(held_row.get("seed_data"))),
+        row_currency=held_row.get("price_currency"),
+    )
     variant_adoption_refused: Optional[Dict[str, Any]] = None
 
     if existing_row:
@@ -4647,7 +4670,9 @@ async def update_external_seed(
     if body.category is not None:
         seed_data["category"] = body.category
     if body.variants is not None:
-        _refuse_unstorable_employee_variants(body.variants)
+        _refuse_unstorable_employee_variants(
+            body.variants, stored_variants=_seed_variants(seed_data), row_currency=row.get("price_currency")
+        )
         seed_data["variants"] = body.variants
     if body.utm_template is not None:
         seed_data["utm_template"] = (body.utm_template or "").strip() or None

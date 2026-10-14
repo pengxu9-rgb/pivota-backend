@@ -20,6 +20,7 @@ Each refusal has a same-currency twin that still adopts, so the guard cannot pas
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -501,18 +502,19 @@ class _WriteReached(Exception):
     pass
 
 
-def _patch(monkeypatch, variants):
+def _patch(monkeypatch, variants, *, stored=None, row_currency="USD", **fields):
     import routes.employee_products as ep
 
     async def write(*_a, **_k):
         raise _WriteReached
 
-    row = _seed_row(variants=[_stored_variant()], price=80.0, availability="in_stock")
+    row = _seed_row(variants=stored if stored is not None else [_stored_variant()], price=80.0, availability="in_stock")
+    row["price_currency"] = row_currency
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=row))
     monkeypatch.setattr(ep.database, "execute", write)
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", write)
-    asyncio.run(ep.update_external_seed(row["id"], ep.UpdateExternalSeedRequest(variants=variants),
+    asyncio.run(ep.update_external_seed(row["id"], ep.UpdateExternalSeedRequest(variants=variants, **fields),
                                         current_user={"employee_id": "emp_test"}))
 
 
@@ -528,3 +530,81 @@ def test_patching_variants_in_an_unstorable_or_second_currency_is_refused_before
 def test_patching_variants_in_a_storable_currency_reaches_the_write(monkeypatch):
     with pytest.raises(_WriteReached):
         _patch(monkeypatch, _employee_variants("SGD"))
+
+
+@pytest.mark.parametrize("currencies", [("GBP",), ("EUR",), ("CAD",), ("KRW",), ("USD", "CAD")])
+def test_a_portal_save_that_sends_the_stored_variants_back_is_not_refused(monkeypatch, currencies):
+    # The review repro: both portal editors PATCH the whole stored list on every save, so refusing
+    # what the seed already holds made a GBP seed (or one left in CAD) uneditable, even to disable it.
+    stored = _employee_variants(*currencies)
+    with pytest.raises(_WriteReached):
+        _patch(monkeypatch, copy.deepcopy(stored), stored=stored, row_currency=currencies[0],
+               status="disabled", notes="pause")
+
+
+def test_a_save_may_not_bring_a_new_unstorable_currency_into_a_seed_that_holds_another(monkeypatch):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as err:
+        _patch(monkeypatch, _employee_variants("GBP", "CAD"), stored=_employee_variants("GBP"), row_currency="GBP")
+    assert err.value.status_code == 422 and err.value.detail.endswith(":CAD")
+
+
+def test_the_row_currency_counts_as_held(monkeypatch):
+    # A CAD row with no stored variants: sending CAD variants brings nothing new.
+    with pytest.raises(_WriteReached):
+        _patch(monkeypatch, _employee_variants("CAD"), stored=[], row_currency="CAD")
+
+
+def test_re_creating_a_seed_may_send_back_the_variants_it_holds(monkeypatch):
+    # Held by the stored variants alone: the row is USD, an earlier read left the variants in GBP.
+    existing = _seed_row(variants=_employee_variants("GBP"), price=80.0, availability="in_stock")
+    seed_data = _create(monkeypatch, _page(_sized_offers("USD")), [existing], variants=_employee_variants("GBP"))
+    assert _stated(seed_data["variants"]) == {"GBP"}
+
+
+# ---- the heal: review round 2 -------------------------------------------------------------------
+
+
+def test_the_heal_never_drops_a_stored_variant_with_no_id(monkeypatch):
+    # Probe B5: a nameless variant has no key a read could name, and an empty key set is a subset of
+    # anything, so the read "covered" it and the heal dropped the 50 mL.
+    stored_variants = [_cad_sizes()[0], {"title": f"{TITLE} - 50 mL", "price_amount": 150.0, "price_currency": "CAD",
+                                         "availability": "in_stock"}]
+    row = _seed_row(variants=stored_variants, price=80.0, availability="in_stock")
+    _, stored = _refresh(monkeypatch, row, _page(_sized_offers("USD")[:1]))
+    assert len(stored["seed_data"]["variants"]) == 2
+
+
+def test_a_read_that_states_no_currency_never_heals(monkeypatch):
+    # Probe K2: the gate admits a read with no stated currency, but it says nothing about which
+    # currency is right, so it may not replace variants priced in CAD.
+    offers = [{"@type": "Offer", "price": "110", "availability": IN, "sku": "EX-30", "name": f"{TITLE} - 30 mL"},
+              {"@type": "Offer", "price": "150", "availability": IN, "sku": "EX-50", "name": f"{TITLE} - 50 mL"}]
+    row = _seed_row(variants=_cad_sizes(), price=80.0, availability="in_stock")
+    _, stored = _refresh(monkeypatch, row, _page(offers))
+    assert _stated(stored["seed_data"]["variants"]) == {"CAD"}
+
+
+# ---- the freshness stamp: each arm on its own ----------------------------------------------------
+
+
+def test_a_refused_price_alone_removes_the_fresh_stamp(monkeypatch):
+    # Probe K1: no stored variants, so nothing is "not re-read"; only the refused price says so.
+    row = _seed_row(variants=None, price=110.0, availability="in_stock")
+    result, stored = _refresh(monkeypatch, row, _page([_offer(110, IN, priceCurrency="CAD")]))
+    assert result["price_refresh"]["status"] == "skipped_currency_mismatch"
+    assert not result["variant_refresh"].get("not_re_read_count")
+    assert "extracted_at" not in stored["seed_data"]["snapshot"]
+
+
+def test_a_variant_not_re_read_alone_removes_the_fresh_stamp(monkeypatch):
+    # Probe K3: the page states no price (not a refusal), and one stored size was not re-read.
+    row = _seed_row(variants=[_stored_variant(variant_id="EX-30", title="30 mL"),
+                              _stored_variant(variant_id="EX-50", title="50 mL")],
+                    price=110.0, availability="in_stock")
+    result, stored = _refresh(monkeypatch, row, _page([{"@type": "Offer", "availability": IN, "sku": "EX-30",
+                                                        "name": f"{TITLE} - 30 mL"}]))
+    assert not result["price_refresh"]["status"].startswith("skipped_")
+    assert result["variant_refresh"]["not_re_read_count"]
+    assert "extracted_at" not in stored["seed_data"]["snapshot"]
