@@ -63,7 +63,7 @@ def test_without_the_guard_the_refresh_stores_cad_variants_in_a_usd_seed(monkeyp
     # The premise, through the real refresh: the adoption rules alone take this read.
     import routes.employee_products as mod
 
-    monkeypatch.setattr(mod, "_foreign_variant_currencies", lambda **_: [])
+    monkeypatch.setattr(mod, "_foreign_refresh_variant_currencies", lambda **_: [])
     row = _seed_row(variants=[_stored_variant()], price=80.0, availability="in_stock")
     _, stored = _refresh(monkeypatch, row, _page(_sized_offers("CAD")))
     assert _stated(stored["seed_data"]["variants"]) == {"CAD"}
@@ -188,6 +188,50 @@ def test_the_row_currency_alone_establishes_the_seed(monkeypatch):
     row = _seed_row(variants=None, price=80.0, availability="in_stock")
     _, stored = _refresh(monkeypatch, row, _page(_sized_offers("SGD")))
     assert "SGD" not in _stated(stored["seed_data"].get("variants"))
+
+
+# ---- the refresh never changes the row's currency; an employee's re-create may -------------------
+
+
+def _cad_seed_row(variants=True) -> Dict[str, Any]:
+    row = _seed_row(variants=[_stored_variant("CAD")] if variants else None, price=80.0, availability="in_stock")
+    row["price_currency"] = "CAD"
+    return row
+
+
+def test_the_refresh_does_not_move_a_cad_seeds_variants_off_its_row_currency(monkeypatch):
+    # The row guard keeps the row CAD (a misread currency is likelier than a merchant changing one);
+    # adopting USD variants would leave row CAD, variants USD.
+    result, stored = _refresh(monkeypatch, _cad_seed_row(), _page(_sized_offers("USD")))
+    assert stored["price_currency"] == "CAD", "the premise: the row guard keeps the row currency"
+    assert _stated(stored["seed_data"]["variants"]) == {"CAD"}
+    assert result["variant_adoption_refused"]["currencies"] == ["USD"]
+
+
+def test_a_re_create_heals_a_cad_seed_to_a_storable_read(monkeypatch):
+    seed_data = _create(monkeypatch, _page(_sized_offers("USD")), [_cad_seed_row()])
+    assert _stated(seed_data["variants"]) == {"USD"}
+
+
+def test_an_unstorable_row_currency_still_corrects_its_own_variants_on_refresh(monkeypatch):
+    # Not storable, but it is the row's own currency: the refresh may re-read it, as the row may.
+    _, stored = _refresh(monkeypatch, _cad_seed_row(), _page(_sized_offers("CAD")))
+    assert [v["variant_id"] for v in stored["seed_data"]["variants"]] == ["EX-30", "EX-50"]
+
+
+def test_a_refresh_with_no_row_currency_falls_to_the_shared_rule(monkeypatch):
+    for currency, adopted in (("CAD", False), ("SGD", True)):
+        row = _seed_row(variants=None, price=80.0, availability="in_stock")
+        row["price_currency"] = None
+        _, stored = _refresh(monkeypatch, row, _page(_sized_offers(currency)))
+        assert (currency in _stated(stored["seed_data"].get("variants"))) is adopted, currency
+
+
+def test_a_refresh_with_no_row_currency_is_held_to_its_stored_variants(monkeypatch):
+    row = _seed_row(variants=[_stored_variant()], price=80.0, availability="in_stock")
+    row["price_currency"] = None
+    _, stored = _refresh(monkeypatch, row, _page(_sized_offers("SGD")))
+    assert _stated(stored["seed_data"]["variants"]) == {"USD"}
 
 
 # ---- the rule itself ----------------------------------------------------------------------------

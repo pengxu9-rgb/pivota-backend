@@ -955,6 +955,24 @@ def _foreign_variant_currencies(
     )
 
 
+def _foreign_refresh_variant_currencies(
+    *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]], row_currency: Optional[str]
+) -> List[str]:
+    """The refresh's stricter form: a scraped read never changes the currency a seed's ROW is in.
+
+    The refresh refuses a row currency change (`skipped_currency_mismatch`, below), because a misread
+    currency is likelier than a merchant changing one: a KRW row read as "USD" would otherwise be
+    restated as $22,000. Variants follow the row, or the two disagree after the refresh (row CAD,
+    variants USD). And a row in an unstorable currency (EUR) can still correct its own variants. So a
+    row with a currency adopts only reads in it, which also heals variants an earlier read left in
+    another currency. A row with none falls to the shared rule, held to its stored variants.
+    Changing a seed's currency is left to an employee's re-create, which applies the full rule."""
+    row = str(row_currency or "").strip().upper()
+    if not row:
+        return _foreign_variant_currencies(existing=existing, incoming=incoming, row_currency=None)
+    return sorted(_stated_variant_currencies(incoming) - {row})
+
+
 def _should_overwrite_seed_variants(
     *,
     existing: List[Dict[str, Any]],
@@ -5474,7 +5492,7 @@ async def _refresh_external_seed_by_id(
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
     variant_adoption_refused = None
-    foreign_currencies = _foreign_variant_currencies(
+    foreign_currencies = _foreign_refresh_variant_currencies(
         existing=_seed_variants(seed_data), incoming=adoptable_variants or [], row_currency=row.get("price_currency")
     )
     if adoptable_variants and foreign_currencies:
