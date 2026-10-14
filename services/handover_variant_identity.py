@@ -80,6 +80,12 @@ R_AMBIGUOUS = "multiple_merchant_issued_skus"
 #: to refuse, reached through the one door it had left open.
 R_CONTRADICTED = "hand_over_names_a_different_merchant_issued_id"
 R_NO_IDENTITY = "no_merchant_issued_sku"
+#: ONE live candidate, but the seed stores several variants and the offer being handed over is
+#: one the candidate is not. The sole-candidate path used to hand that one id to EVERY offer of
+#: the seed whose own name was a SKU (a SKU cannot contradict), so a two-variant seed with one
+#: catalog row gave the sibling offer the other variant's cart, quoting one variant's price for
+#: another's checkout. Found 2026-10-14 in review of #2620 / #2623 (the operator-id twin).
+R_SIBLING = "sole_sku_is_another_stored_variant"
 R_NO_PRODUCT_KEY = "no_attached_product_key"
 R_NOT_PRIMED = "not_primed"
 R_LOOKUP_FAILED = "sku_lookup_failed"
@@ -303,6 +309,37 @@ def candidate_from_row(row: Any, rejects: Optional[Dict[str, int]] = None) -> Op
     )
 
 
+#: Every key a stored seed variant may carry its own identity under — wider than the route's
+#: `_seed_offer_variant_id` chain, because the offer may be named by its SKU while the same
+#: entry carries the Shopify id the catalog row holds.
+_STORED_VARIANT_ID_KEYS = (
+    "variant_id", "variantId", "id", "sku", "sku_id", "shopify_variant_id", "source_variant_id",
+)
+
+
+def _offer_may_take_the_sole_candidate(one: Candidate, *, seed_data: Any, wanted: str) -> bool:
+    """May the lone candidate be handed over for the offer named `wanted`?
+
+    Yes when there is nothing to choose between: a product-grain hand-over (no name) or a seed
+    storing at most one variant — the case R_SOLE was written for. Otherwise only when the
+    offer's own stored variant answers to the candidate under one of its identity keys. An offer
+    the stored variants do not know is refused: we cannot say it is the candidate's variant.
+    """
+    if not wanted:
+        return True
+    stored = seed_data.get("variants") if isinstance(seed_data, dict) else None
+    stored = [v for v in stored if isinstance(v, dict)] if isinstance(stored, list) else []
+    if len(stored) <= 1:
+        return True
+    mine = [v for v in stored if any(_norm(v.get(k)) == wanted for k in _STORED_VARIANT_ID_KEYS)]
+    # EXACTLY ONE entry may be this offer. Two entries answering to its name (both `sku: X`, or
+    # every `id` restating the product id) cannot say which one it is, so neither lends it the
+    # candidate. Review of #2624 (controller, 2026-10-14).
+    return len(mine) == 1 and any(
+        one.answers_to(_norm(mine[0].get(k))) for k in _STORED_VARIANT_ID_KEYS
+    )
+
+
 def choose_handover_variant(
     candidates: Optional[Sequence[Candidate]],
     *,
@@ -367,6 +404,8 @@ def choose_handover_variant(
 
     if len(live) == 1:
         one = live[0]
+        if not _offer_may_take_the_sole_candidate(one, seed_data=seed_data, wanted=wanted):
+            return HandoverVariant(None, R_SIBLING, None, None, 1)
         return HandoverVariant(one.variant_id, R_SOLE, SOURCE_CATALOG_SKU, one.sku_key, 1)
 
     if len(live) > 1:
@@ -439,6 +478,7 @@ class HandoverVariantResolver:
             "handover_resolved_catalog": 0,
             "handover_resolved_seed_stamp": 0,
             "handover_refused_ambiguous": 0,
+            "handover_refused_sibling": 0,
             "handover_contradicted": 0,
             "handover_no_identity": 0,
             "handover_no_product_key": 0,
@@ -588,6 +628,8 @@ class HandoverVariantResolver:
             return
         if answer.reason == R_AMBIGUOUS:
             self.stats["handover_refused_ambiguous"] += 1
+        elif answer.reason == R_SIBLING:
+            self.stats["handover_refused_sibling"] += 1
         elif answer.reason == R_CONTRADICTED:
             self.stats["handover_contradicted"] += 1
         elif answer.reason == R_LOOKUP_FAILED:
@@ -627,6 +669,7 @@ def handover_coverage_fields(stats: Optional[Dict[str, int]]) -> Dict[str, Any]:
         "handover_resolved_catalog": stats.get("handover_resolved_catalog", 0),
         "handover_resolved_seed_stamp": stats.get("handover_resolved_seed_stamp", 0),
         "handover_refused_ambiguous": stats.get("handover_refused_ambiguous", 0),
+        "handover_refused_sibling": stats.get("handover_refused_sibling", 0),
         "handover_no_identity": stats.get("handover_no_identity", 0),
         "handover_no_product_key": stats.get("handover_no_product_key", 0),
         "handover_lookup_failed": stats.get("handover_lookup_failed", 0),
@@ -650,7 +693,7 @@ def handover_coverage_message(fields: Dict[str, Any]) -> str:
         " handover considered=%d resolved=%d catalog=%d seed_stamp=%d ambiguous=%d"
         " contradicted=%d no_identity=%d no_product_key=%d lookup_failed=%d not_primed=%d"
         " rows_scanned=%d rows_rejected=%d stamp_vetoed=%d payload_disagreed=%d"
-        " resolved_fraction=%.3f"
+        " sibling=%d resolved_fraction=%.3f"
     ) % (
         fields["handover_considered"], fields["handover_resolved"],
         fields["handover_resolved_catalog"], fields["handover_resolved_seed_stamp"],
@@ -659,7 +702,7 @@ def handover_coverage_message(fields: Dict[str, Any]) -> str:
         fields["handover_lookup_failed"], fields["handover_not_primed"],
         fields["handover_rows_scanned"], fields["handover_rows_rejected"],
         fields["handover_rows_stamp_vetoed"], fields["handover_rows_payload_disagreed"],
-        fields["handover_resolved_fraction"],
+        fields["handover_refused_sibling"], fields["handover_resolved_fraction"],
     )
 
 

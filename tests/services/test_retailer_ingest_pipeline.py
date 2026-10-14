@@ -814,6 +814,21 @@ async def test_a_feed_job_applies_one_listing_per_product(oy):
         "https://invl.example-network.com/c/GA1", "https://invl.example-network.com/c/GA2"}
 
 
+async def test_a_feed_job_never_vouches_for_its_prices(oy, monkeypatch):
+    """An affiliate feed's prices are as old as the file: its apply never dates them
+    (`apply_ingest_plan(price_read=False)`; catalog_offers.price_checked_at, migration 246)."""
+    from services.catalog_enrichment_agent import apply as apply_mod
+    seen = []
+    fake = apply_mod.apply_ingest_plan
+
+    async def spy(plan, **kw):
+        seen.append(kw.get("price_read"))
+        return await fake(plan, **kw)
+    monkeypatch.setattr(apply_mod, "apply_ingest_plan", spy)
+    out = await pipeline.run_stage(feed_job("apply_due"), db=oy.db)
+    assert out["status"] == "done" and seen == [False]
+
+
 @pytest.mark.parametrize("code", [429, 503])
 async def test_a_throttled_feed_download_backs_off(oy, code):
     from services.retailer_ingest.affiliate_feed import FeedError

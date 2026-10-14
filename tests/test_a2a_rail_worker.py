@@ -163,8 +163,27 @@ async def test_an_active_card_moves_straight_to_quoting_with_the_newest_card():
     rail = Rail().on("payment.method-view#submit", _methods(ACTIVE, NEWER, {**ACTIVE, "id": "pm_dead", "status": "FAILED"}))
     assert await _step(rail, pid) == "method_ready"
     row = await _row(pid)
-    assert (row["state"], row["payment_method_id"], row["claimed_by"]) == ("quoting", "pm_newer", W)
+    assert (row["state"], row["payment_method_id"], row["claimed_by"]) == ("quoting", "pm_newer", None)
     assert rail.actions() == ["payment.method-view#submit"]  # a read only
+
+
+async def test_every_move_to_a_live_state_gives_the_lease_back_and_is_due_on_that_states_poll():
+    # Measured on staging 2026-10-13: a move kept the lease, so the bound card waited out the 600 s
+    # stale-claim requeue and the `bound` schedule never ran. Each live state, by the real worker steps.
+    pid = (await _open())["id"]
+    before = datetime.now(timezone.utc)
+    assert await _step(Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit", ADD_PAGE),
+                       pid) == "binding_page_issued"
+    row = await _row(pid)
+    assert (row["state"], row["claimed_by"]) == ("needs_payment_method", None)
+    due = row["next_poll_at"].replace(tzinfo=timezone.utc) - before
+    assert timedelta(seconds=worker.POLL_BINDING - 2) <= due <= timedelta(seconds=worker.POLL_BINDING + 5)
+    # The next tick claims it with no requeue in between.
+    assert await _step(Rail().on("payment.method-view#submit", _methods({**ACTIVE, "id": "pm_new"})), pid) == "method_ready"
+    row = await _row(pid)
+    assert (row["state"], row["claimed_by"]) == ("quoting", None)
+    assert row["next_poll_at"].replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc) + timedelta(seconds=1)
+    assert pid in [r["id"] for r in await ledger.claim_due_purchases(W, limit=50)]  # due at once
 
 
 async def test_no_card_issues_a_binding_page_and_the_write_was_recorded_before_it_was_sent():
@@ -448,7 +467,8 @@ async def test_a_tick_steps_within_its_budget_and_releases_what_it_did_not_reach
     counts = await worker.run_tick(_client(rail), W, budget_seconds=60, clock=lambda: next(ticks))
     assert counts.get("method_ready") == 1 and counts.get("deferred") == 2
     rows = {r["id"]: r for r in await database.fetch_all("SELECT * FROM a2a_rail_purchases")}
-    assert sum(r["claimed_by"] is None for r in rows.values()) == 2
+    # The two it did not reach are given back, and so is the one it moved to quoting.
+    assert sum(r["claimed_by"] is None for r in rows.values()) == 3
 
 
 async def test_a_failing_step_is_released_and_the_tick_goes_on():
@@ -672,6 +692,69 @@ async def _approving(method=VISA, page=None):
     assert await _step(rail, pid) == "approval_page_issued"
     await ledger.release_claim(pid, W)
     return pid
+
+
+async def test_entering_awaiting_authorization_gives_the_lease_back_due_on_the_approval_poll():
+    pid = await _locked()
+    before = datetime.now(timezone.utc)
+    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
+    assert await _step(rail, pid) == "approval_page_issued"
+    row = await _row(pid)
+    assert (row["state"], row["claimed_by"], row["last_error_code"]) == ("awaiting_authorization", None, "paid_sent:0:visa")
+    due = row["next_poll_at"].replace(tzinfo=timezone.utc) - before
+    assert timedelta(seconds=worker.POLL_APPROVAL - 2) <= due <= timedelta(seconds=worker.POLL_APPROVAL + 5)
+
+
+def _release_fails_once(real):
+    calls = []
+
+    async def release(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise RuntimeError("transient database error")
+        return await real(*args, **kwargs)
+    return release
+
+
+async def _requeue_stale(pid):
+    await _ago("claimed_at", worker.STALE_LEASE_SECONDS + 100, purchase_id=pid)
+    assert await ledger.requeue_stale_claims(lease_seconds=worker.STALE_LEASE_SECONDS) == 1
+
+
+async def test_a_failed_release_after_a_move_to_the_other_binding_page_keeps_bound_unsent(monkeypatch):
+    # The move committed `bound_sent:4` (a page whose `bound` is never guessed); a release that then fails must
+    # not reach the tick's crash release, whose code comes from the row as claimed and would erase it.
+    pid = (await _open())["id"]
+    other = _task(("payment.method-add-required", {"linkUrl": PAGE, "paymentMethodId": "pm_up", "status": "PENDING"}))
+    rail = Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit", other)
+    real = ledger.release_claim
+    monkeypatch.setattr(ledger, "release_claim", _release_fails_once(real))
+    assert await worker.run_tick(_client(rail), W) == {"binding_page_issued": 1}
+    monkeypatch.setattr(ledger, "release_claim", real)
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["claimed_by"]) == ("needs_payment_method", "bound_sent:4", W)
+    await _requeue_stale(pid)
+    await _ago("state_entered_at", 2000)
+    rail = Rail().on("payment.method-view#submit", _methods({**ACTIVE, "id": "pm_up", "status": "PENDING"}))
+    assert await _step(rail, pid) == "waiting_on_buyer"
+    assert rail.actions() == ["payment.method-view#submit"]  # read only: still no `bound`
+
+
+async def test_a_failed_release_after_the_approval_page_keeps_the_approval_schedule(monkeypatch):
+    pid = await _locked()
+    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
+    real = ledger.release_claim
+    monkeypatch.setattr(ledger, "release_claim", _release_fails_once(real))
+    assert await worker.run_tick(_client(rail), W) == {"approval_page_issued": 1}
+    monkeypatch.setattr(ledger, "release_claim", real)
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["claimed_by"]) == ("awaiting_authorization", "paid_sent:0:visa", W)
+    await _requeue_stale(pid)
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 5, purchase_id=pid)
+    rail = Rail().on("payment.visa-action-required#paid", _visa_page())  # the buyer is still on the page
+    assert await _step(rail, pid) == "waiting_on_buyer"  # the variant survived: `paid` sent on schedule, not parked
+    assert rail.actions() == ["payment.visa-action-required#paid"]
+    assert (await _row(pid))["last_error_code"] == "paid_sent:1:visa"
 
 
 async def test_a_locked_order_gets_a_token_request_and_the_picker_is_answered_in_the_same_conversation():

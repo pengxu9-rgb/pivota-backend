@@ -34,6 +34,7 @@ from models.standard_product import StandardProduct
 from utils.auth import get_current_employee, require_employee_permissions
 
 from services import external_seed_destination_liveness as destination_liveness
+from services import market_registry
 from services import seed_served_url
 from services.external_offers_service import (
     ExternalOfferUnavailable,
@@ -850,6 +851,83 @@ def _distinct_variant_ids(variants: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
+# The EXTENDED shade fold's stamp on a seed variant whose "url" is the listing it was taken from
+# (ingestion.SEED_VARIANT_URL_SOURCE; spelled here so this route imports no ingestion code, as
+# routes/agent_shop_gateway does; a test pins the two). Other writers store a variant "url" too
+# (a ?variant= link on the seed's own page), so a bare url protects nothing.
+_FOLD_URL_SOURCE = "shade_fold_listing"
+
+
+def _is_protected_seed_variant(variant: Dict[str, Any]) -> bool:
+    """A stored variant a WRITER vouched for: the drain's `merchant_issued` provenance, or the shade
+    fold's own listing url. Bare digits are not enough -- the extractor names a read variant by its
+    `sku`, `productID` or `gtin13`, so a page read stores digits too, and freezing those would stop
+    the refresh correcting its own earlier read."""
+    return (
+        variant.get("variant_id_provenance") == "merchant_issued"
+        or variant.get("url_source") == _FOLD_URL_SOURCE
+    )
+
+
+def _writer_stamps(variant: Dict[str, Any]) -> Dict[str, Any]:
+    """The protected variant's stamps a page read cannot reproduce, and nothing else."""
+    out: Dict[str, Any] = {}
+    if variant.get("variant_id_provenance") == "merchant_issued":
+        out["variant_id_provenance"] = "merchant_issued"
+    if variant.get("url_source") == _FOLD_URL_SOURCE and variant.get("url"):
+        out.update(url=variant["url"], url_source=_FOLD_URL_SOURCE)
+    return out
+
+
+def _variant_identity_keys(variant: Dict[str, Any]) -> set:
+    native = _native_refresh_variant_ids(variant)
+    if native:
+        return native
+    raw = variant.get("variant_id") or variant.get("variantId") or variant.get("id")
+    return {str(raw).strip()} if raw not in (None, "") and str(raw).strip() else set()
+
+
+def _incoming_keeps_protected_variants(
+    *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]
+) -> bool:
+    """True unless replacing `existing` with `incoming` would drop a protected variant.
+
+    A page read names variants by whatever its JSON-LD carries: the merchant SKU code, or the
+    offer `@id` (`/products/<handle>?variant=<id>#offer`). The retailer-ingest drain stores the
+    merchant's own Shopify ids, and the SKUs, offers and gateway PDP are keyed by them. Measured
+    2026-10-13: the nightly refresh replaced such seeds with the page's ids because the page also
+    lists a product-level offer (one id more), and the PDP then matched none of its SKUs and
+    served no price. Each protected variant must reappear in `incoming` under the same id.
+
+    A protected variant with NO id cannot be named by any read, so it does not count: holding the
+    list for it would refuse every replacement forever, and since no read can re-price it the
+    refresh would also call the seed stale every night."""
+    protected = [_variant_identity_keys(v) for v in existing if _is_protected_seed_variant(v)]
+    if not protected:
+        return True
+    incoming_keys = set().union(*(_variant_identity_keys(v) for v in incoming)) if incoming else set()
+    # A nameless variant's empty key set is a subset of any read's: it never holds the list.
+    return all(keys <= incoming_keys for keys in protected)
+
+
+def _adopt_seed_variants(
+    *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """`incoming`, with each protected stored variant's stamps carried onto the incoming variant of
+    the same id (a page read never carries them, and dropping them would demote the id). Price,
+    stock and currency always come from the read."""
+    stamps: Dict[str, Dict[str, Any]] = {}
+    for v in existing:
+        if _is_protected_seed_variant(v):
+            for key in _variant_identity_keys(v):
+                stamps[key] = _writer_stamps(v)
+    out: List[Dict[str, Any]] = []
+    for v in incoming:
+        carried = next((stamps[k] for k in _variant_identity_keys(v) if k in stamps), None)
+        out.append({**v, **carried} if carried else v)
+    return out
+
+
 def _should_overwrite_seed_variants(
     *,
     existing: List[Dict[str, Any]],
@@ -860,6 +938,8 @@ def _should_overwrite_seed_variants(
         return False
     if not existing:
         return True
+    if not _incoming_keeps_protected_variants(existing=existing, incoming=incoming):
+        return False
 
     existing_score = _best_variant_title_score(existing, product_title)
     incoming_score = _best_variant_title_score(incoming, product_title)
@@ -942,6 +1022,8 @@ def _should_replace_seed_variant_content(
     refreshed_canonical_url: Optional[str],
 ) -> bool:
     if not incoming:
+        return False
+    if not _incoming_keeps_protected_variants(existing=existing, incoming=incoming):
         return False
     existing_map = _seed_variant_description_map(existing)
     incoming_map = _seed_variant_description_map(incoming)
@@ -1397,6 +1479,33 @@ def _normalize_market(market: Optional[str]) -> str:
     return m or "US"
 
 
+def _seed_market_refusal(market: Optional[str]) -> Optional[str]:
+    """Why a seed may not be filed under `market`, or None when it may.
+
+    The seed writers (create, storefront backfill, CSV import, edit) file a seed under the market the
+    request DECLARES, and only one the market registry lets us ingest (ADR-026 decision 2: an `off`
+    market is unknown to ingestion; an unlisted one raises). A missing market is refused, never read as
+    US, and a market is never inferred from a currency (ADR-026 decision 1): the storefront backfill
+    used to file EUR-priced seeds under a market no registry lists."""
+    code = market_registry.normalize_market(market)
+    if not code:
+        return "MARKET_REQUIRED"
+    entry = market_registry.market_or_none(code)
+    if entry is None:
+        return f"UNKNOWN_MARKET:{code}"
+    if not entry["ingest"]:
+        return f"MARKET_NOT_INGESTED:{code}"
+    return None
+
+
+def _declared_seed_market(market: Optional[str]) -> str:
+    """The declared seed market, normalized; a 400 for any market `_seed_market_refusal` refuses."""
+    refusal = _seed_market_refusal(market)
+    if refusal is not None:
+        raise HTTPException(status_code=400, detail=refusal)
+    return market_registry.normalize_market(market)
+
+
 def _normalize_tool(tool: Optional[str]) -> str:
     t = str(tool or "").strip()
     return t or "*"
@@ -1727,14 +1836,6 @@ def _normalize_seed_availability(raw: Any) -> Optional[str]:
     return s.lower().replace(" ", "_")
 
 
-_CURRENCY_TO_REFERRAL_MARKET = {
-    "USD": "US",
-    "SGD": "SG",
-    "JPY": "JP",
-    "EUR": "EU-DE",
-}
-
-
 def _extract_storefront_handle(product_data: Dict[str, Any]) -> Optional[str]:
     raw = _ensure_dict(product_data.get("raw"))
     platform_metadata = _ensure_dict(product_data.get("platform_metadata"))
@@ -1851,27 +1952,15 @@ def _build_storefront_seed_variants(
     ]
 
 
-def _infer_storefront_referral_market(candidates: List[Dict[str, Any]], explicit_market: Optional[str]) -> str:
-    if explicit_market:
-        return _normalize_market(explicit_market)
-    counts: Dict[str, int] = {}
-    for candidate in candidates:
-        currency = str(candidate.get("price_currency") or "").strip().upper()
-        market = _CURRENCY_TO_REFERRAL_MARKET.get(currency)
-        if not market:
-            continue
-        counts[market] = int(counts.get(market) or 0) + 1
-    if not counts:
-        return "US"
-    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
-
-
 async def _fetch_storefront_referral_seed_candidates(
     *,
     merchant_id: str,
     limit: int,
-    market: Optional[str],
+    market: str,
 ) -> Dict[str, Any]:
+    """`market` is the caller's DECLARED market (`_declared_seed_market`), stamped on every candidate.
+    It is never read off the candidates' currency (ADR-026 decision 1)."""
+    market = _declared_seed_market(market)
     matched_domains = await get_merchant_referral_domains(merchant_id)
     primary_domain = matched_domains[0] if matched_domains else None
     if not primary_domain:
@@ -1879,7 +1968,7 @@ async def _fetch_storefront_referral_seed_candidates(
             "merchant_id": merchant_id,
             "matched_domains": matched_domains,
             "primary_domain": None,
-            "market": _normalize_market(market),
+            "market": market,
             "candidates": [],
         }
 
@@ -1959,16 +2048,15 @@ async def _fetch_storefront_referral_seed_candidates(
         if len(candidates) >= int(limit or 50):
             break
 
-    resolved_market = _infer_storefront_referral_market(candidates, market)
     for candidate in candidates:
-        candidate["market"] = resolved_market
+        candidate["market"] = market
         candidate["external_product_id"] = _stable_external_product_id(candidate["storefront_url"])
 
     return {
         "merchant_id": merchant_id,
         "matched_domains": matched_domains,
         "primary_domain": primary_domain,
-        "market": resolved_market,
+        "market": market,
         "candidates": candidates,
     }
 
@@ -1998,18 +2086,10 @@ async def _derive_seed_seller_columns(
     )
 
 
-async def _upsert_storefront_referral_seed_candidate(
-    candidate: Dict[str, Any],
-    *,
-    employee_id: Optional[str],
-) -> Dict[str, Any]:
-    attached_product_key = str(candidate.get("attached_product_key") or "").strip()
-    storefront_url = str(candidate.get("storefront_url") or "").strip()
-    external_product_id = str(candidate.get("external_product_id") or "").strip()
-    market = _normalize_market(candidate.get("market"))
-    tool = "*"
-
-    existing_row = await database.fetch_one(
+async def _existing_storefront_referral_seed(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The active seed a storefront backfill candidate would update, matched by product key or URL in
+    ANY market partition; None when the backfill would create one."""
+    row = await database.fetch_one(
         """
         SELECT *
         FROM external_product_seeds
@@ -2024,11 +2104,26 @@ async def _upsert_storefront_referral_seed_candidate(
         LIMIT 1
         """,
         {
-            "attached_product_key": attached_product_key,
-            "external_product_id": external_product_id,
-            "canonical_url": storefront_url,
+            "attached_product_key": str(candidate.get("attached_product_key") or "").strip(),
+            "external_product_id": str(candidate.get("external_product_id") or "").strip(),
+            "canonical_url": str(candidate.get("storefront_url") or "").strip(),
         },
     )
+    return dict(row) if row else None
+
+
+async def _upsert_storefront_referral_seed_candidate(
+    candidate: Dict[str, Any],
+    *,
+    employee_id: Optional[str],
+) -> Dict[str, Any]:
+    attached_product_key = str(candidate.get("attached_product_key") or "").strip()
+    storefront_url = str(candidate.get("storefront_url") or "").strip()
+    external_product_id = str(candidate.get("external_product_id") or "").strip()
+    market = _declared_seed_market(candidate.get("market"))
+    tool = "*"
+
+    existing_row = await _existing_storefront_referral_seed(candidate)
 
     seed_data = {
         "external_product_id": external_product_id,
@@ -2122,11 +2217,13 @@ async def _upsert_storefront_referral_seed_candidate(
                     "title": row.get("title") or candidate.get("title"),
                 }
 
+        # The row keeps the market it is filed under: a backfill refreshes a seed, it never re-files
+        # one (the existing row is matched by product key or URL in ANY market). Moving a seed to
+        # another market partition is a reviewed repair, not a side effect of re-running a backfill.
         await _execute_seed_data_stmt(
             """
             UPDATE external_product_seeds
             SET external_product_id = :external_product_id,
-                market = :market,
                 tool = :tool,
                 utm_template = :utm_template,
                 partner_type = :partner_type,
@@ -2148,11 +2245,12 @@ async def _upsert_storefront_referral_seed_candidate(
             WHERE id = :id
             """,
             {
-                **values,
+                **{k: v for k, v in values.items() if k != "market"},
                 "id": row.get("id"),
             },
         )
         seed_id = str(row.get("id") or "").strip()
+        market = str(row.get("market") or "")
         action = "updated"
     else:
         seed_id = _seed_id()
@@ -2218,6 +2316,7 @@ async def _upsert_storefront_referral_seed_candidate(
     return {
         "action": action,
         "seed_id": seed_id,
+        "market": market,
         "external_product_id": external_product_id,
         "attached_product_key": attached_product_key,
         "canonical_url": storefront_url,
@@ -2230,7 +2329,7 @@ async def _run_external_seed_import_task(
     task_id: str,
     csv_text: str,
     current_user: dict,
-    market: str,
+    market: Optional[str],
     tool: str,
     mode: str,
 ) -> None:
@@ -2352,11 +2451,17 @@ async def import_external_seeds_csv(
     req: Request,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_employee),
-    market: str = Query("US"),
+    # The market for rows that carry no `market` column. Optional (a sheet may declare every row's),
+    # never defaulted: a row with neither is refused (`_seed_market_refusal`).
+    market: Optional[str] = Query(None),
     tool: str = Query("*"),
     mode: str = Query("upsert"),
     async_import: bool = Query(False, alias="async"),
 ) -> ExternalSeedsCsvImportResponse:
+    if str(market or "").strip():
+        market = _declared_seed_market(market)
+    else:
+        market = None
     raw = await req.body()
     text = raw.decode("utf-8", errors="replace")
     if not text.strip():
@@ -2382,7 +2487,8 @@ async def import_external_seeds_csv(
             """,
             {
                 "id": task_id,
-                "market": _normalize_market(market),
+                # NOT NULL column; '' = no sheet-wide market (every row declares its own).
+                "market": market or "",
                 "tool": _normalize_tool(tool),
                 "mode": str(mode or "upsert").strip().lower(),
                 "created_by_employee_id": created_by,
@@ -2415,7 +2521,7 @@ async def _import_external_seeds_csv_text(
     *,
     text: str,
     current_user: dict,
-    market: str,
+    market: Optional[str],
     tool: str,
     mode: str,
 ) -> ExternalSeedsCsvImportResponse:
@@ -2437,7 +2543,8 @@ async def _import_external_seeds_csv_text(
     if not text.strip():
         raise HTTPException(status_code=400, detail="EMPTY_CSV")
 
-    default_market = _normalize_market(market)
+    # No US fallback: a row files under its own `market` column or this declared one, else it is refused.
+    default_market = market_registry.normalize_market(market)
     default_tool = _normalize_tool(tool)
     mode_norm = str(mode or "upsert").strip().lower()
     if mode_norm not in ("create", "upsert"):
@@ -2465,6 +2572,9 @@ async def _import_external_seeds_csv_text(
         # Example: Tom Ford export CSV.
         groups: Dict[str, Dict[str, Any]] = {}
         group_meta: Dict[str, Dict[str, Any]] = {}
+        # Products with a variant row whose market was refused: the whole product is held, since
+        # importing only the rows that did declare a market would file it with variants missing.
+        market_refused_product_urls: set[str] = set()
 
         for idx, row in enumerate(reader, start=2):
             try:
@@ -2475,7 +2585,11 @@ async def _import_external_seeds_csv_text(
                     raise ValueError("MISSING_PRODUCT_URL")
                 product_url = _normalize_seed_url_for_id(_require_http_url(product_url_raw))
 
-                row_market = _normalize_market(nrow.get("market") or default_market)
+                row_market_refusal = _seed_market_refusal(nrow.get("market") or default_market)
+                if row_market_refusal is not None:
+                    market_refused_product_urls.add(product_url)
+                    raise ValueError(row_market_refusal)
+                row_market = market_registry.normalize_market(nrow.get("market") or default_market)
                 row_tool = _normalize_tool(nrow.get("tool") or default_tool)
 
                 product_title = str(nrow.get("product_title") or nrow.get("title") or "").strip() or None
@@ -2594,6 +2708,8 @@ async def _import_external_seeds_csv_text(
 
                 if not external_product_id or not dest:
                     raise ValueError("INVALID_GROUP")
+                if dest in market_refused_product_urls:
+                    raise ValueError(f"VARIANT_ROW_MARKET_REFUSED:{dest}")
 
                 # Deduplicate + sort variants so primary price is stable (min price first).
                 seen_variant_ids: set[str] = set()
@@ -2833,7 +2949,7 @@ async def _import_external_seeds_csv_text(
                     raise ValueError("MISSING_DESTINATION_URL")
                 dest = _normalize_seed_url_for_id(_require_http_url(destination_url))
 
-                row_market = _normalize_market(row.get("market") or default_market)
+                row_market = _declared_seed_market(row.get("market") or default_market)
                 row_tool = _normalize_tool(row.get("tool") or default_tool)
 
                 title = str(row.get("title") or "").strip() or None
@@ -3535,14 +3651,32 @@ async def backfill_storefront_external_seeds(
     merchant_id = str(body.merchant_id or "").strip()
     if not merchant_id:
         raise HTTPException(status_code=400, detail="MERCHANT_ID_REQUIRED")
+    # Declared, never read off the storefront's prices (ADR-026 decision 1).
+    market = _declared_seed_market(body.market)
 
     candidate_bundle = await _fetch_storefront_referral_seed_candidates(
         merchant_id=merchant_id,
         limit=body.limit,
-        market=body.market,
+        market=market,
     )
     candidates = list(candidate_bundle.get("candidates") or [])
     if body.dry_run:
+        preview_items: List[Dict[str, Any]] = []
+        for candidate in candidates[:20]:
+            existing = await _existing_storefront_referral_seed(candidate)
+            preview_items.append(
+                {
+                    "action": "preview",
+                    # An existing seed keeps the market it is filed under (the real run never
+                    # re-files it); only a new one takes the declared market.
+                    "market": str(existing.get("market") or "") if existing else market,
+                    "existing_seed_id": existing.get("id") if existing else None,
+                    "attached_product_key": candidate.get("attached_product_key"),
+                    "canonical_url": candidate.get("storefront_url"),
+                    "title": candidate.get("title"),
+                    "external_product_id": candidate.get("external_product_id"),
+                }
+            )
         return {
             "status": "success",
             "merchant_id": merchant_id,
@@ -3554,16 +3688,7 @@ async def backfill_storefront_external_seeds(
             "created": 0,
             "updated": 0,
             "skipped": 0,
-            "items": [
-                {
-                    "action": "preview",
-                    "attached_product_key": candidate.get("attached_product_key"),
-                    "canonical_url": candidate.get("storefront_url"),
-                    "title": candidate.get("title"),
-                    "external_product_id": candidate.get("external_product_id"),
-                }
-                for candidate in candidates[:20]
-            ],
+            "items": preview_items,
         }
 
     employee_id = _employee_id_from_user(current_user)
@@ -3880,7 +4005,7 @@ async def create_external_seed(
     current_user: dict = Depends(get_current_employee),
 ):
     await _ensure_external_seeds_table()
-    market = _normalize_market(body.market)
+    market = _declared_seed_market(body.market)
     tool = _normalize_tool(body.tool)
     dest = _require_http_url(body.destination_url)
 
@@ -4047,7 +4172,7 @@ async def create_external_seed(
         elif snap_variants:
             existing_variants = _seed_variants(seed_data)
             if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=title):
-                seed_data["variants"] = snap_variants
+                seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=snap_variants)
             elif not existing_variants:
                 seed_data["variants"] = snap_variants
 
@@ -4487,8 +4612,10 @@ async def update_external_seed(
         updates["external_product_id"] = external_product_id
         set_clauses.append("external_product_id = :external_product_id")
 
-    if body.market is not None:
-        updates["market"] = _normalize_market(body.market)
+    # Only a market CHANGE is guarded: the editors send the stored market back with every save, and
+    # a seed already filed under a market the guard refuses (pre-registry rows) must stay editable.
+    if body.market is not None and market_registry.normalize_market(body.market) != market_registry.normalize_market(row.get("market")):
+        updates["market"] = _declared_seed_market(body.market)
         set_clauses.append("market = :market")
     if body.tool is not None:
         updates["tool"] = _normalize_tool(body.tool)
@@ -5361,7 +5488,7 @@ async def _refresh_external_seed_by_id(
         existing_variants = _seed_variants(seed_data)
         product_title = seed_data.get("title") or snap_title
         if _should_overwrite_seed_variants(existing=existing_variants, incoming=adoptable_variants, product_title=product_title):
-            seed_data["variants"] = adoptable_variants
+            seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=adoptable_variants)
         elif _should_replace_seed_variant_content(
             existing=existing_variants,
             incoming=adoptable_variants,
@@ -5369,7 +5496,7 @@ async def _refresh_external_seed_by_id(
             previous_canonical_url=previous_canonical_url,
             refreshed_canonical_url=canonical_url,
         ):
-            seed_data["variants"] = adoptable_variants
+            seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=adoptable_variants)
         elif not existing_variants:
             seed_data["variants"] = adoptable_variants
 
