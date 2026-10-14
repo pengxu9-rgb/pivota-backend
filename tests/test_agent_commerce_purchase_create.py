@@ -332,6 +332,10 @@ async def test_a_selected_variant_id_opens_on_the_catalogs_own_sku_and_is_finger
     # The fingerprint is what was sent: the same key with the resolved sku SPELLED out is another body.
     spelled = await client.post(BASE, body(variant_key="pk_1::sku_catalogs_own"))
     assert spelled.status_code == 409 and "idempotency_conflict" in spelled.text
+    # Another variant at the SAME shown price under the same key: another body, never a replay of this one.
+    other = await client.post(BASE, body(variant_id="49922977038699"))
+    assert other.status_code == 409 and "idempotency_conflict" in other.text
+    assert await _count("a2a_rail_purchases") == 1
 
 
 async def test_a_variant_id_beside_a_variant_key_is_refused_before_any_read(client, stubs):

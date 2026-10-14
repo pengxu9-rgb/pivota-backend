@@ -365,6 +365,8 @@ async def _open_a2a_purchase(
             variant_id=req.variant_id, market_country=market_country)
     facts, seller_ref, variant_id, seed_kind = await reap_routes._load_cart_link_item(
         merchant_domain=merchant_host, product_key=product_key, variant_key=variant_key, market_country=market_country)
+    # A selected variant is bought as itself or not at all (`variant_id` above is the PROVEN one).
+    reap_routes._require_selected_variant(variant_id, req.variant_id)
     unit_minor, currency = facts["our_price_minor"], facts["currency"]
     if type(unit_minor) is not int or unit_minor != req.expected_unit_price_minor or currency != req.expected_currency:
         raise reap_svc.PurchaseRefused("price_changed", "the selected offer money changed")

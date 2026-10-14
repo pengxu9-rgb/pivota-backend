@@ -2088,32 +2088,59 @@ def _variant_selector(req: "StartPurchaseRequest") -> Tuple[Optional[str], Optio
     return key, key
 
 
+#: More spellings of ONE selected variant than this is not a catalog to price by loading each (prod: at most 2).
+_MAX_VARIANT_SPELLINGS = 4
+
+
 async def _resolve_selected_variant_key(
     *, merchant_domain: str, product_key: str, variant_id: str, market_country: str,
-) -> str:
-    """The catalog's own sku for a buyer-selected storefront variant (a `variant_id` selector).
+) -> Optional[str]:
+    """What to load for a buyer-selected storefront variant (a `variant_id` selector): a sku key to load as a
+    caller-named one, or None to load with NO key (the no-key path). EITHER WAY the caller then requires the
+    loaded variant to BE `variant_id` (`_require_selected_variant`): nothing here may buy another one.
 
-    The live, non-placeholder skus of the product whose `source_variant_id` names that numeric
-    variant (`_cart_numeric_variant`, the cart-link lane's one reader). None: `row_variant_unverified`,
-    as `/purchases/prepare` answers. One: that sku. SEVERAL (one variant spelled by two writers, e.g.
-    `::sku_<hash>` and `::v:<n>`): the no-key path's pricing rule, per spelling -- each is loaded as a
-    named sku; a spelling this seller has no usable offer on (`row_unpriced`) is passed over, any other
-    refusal stands, the priced ones must agree (`row_price_ambiguous`), and the lowest sku_key wins.
-    Reads only; the caller loads the returned key again, as it would a caller-named one.
+    `/purchases/prepare`'s guards first: the product on this host (`row_not_found`), and every live
+    non-placeholder sku naming that variant (`_cart_numeric_variant`, the lane's one reader) must be THIS
+    listing's -- the product's own merchant and platform -- or the selection is `row_variant_unverified`.
+      * no real sku at all (the `::canonical` placeholder only): None; the storefront proof is the identity;
+      * real skus, none naming it: `row_variant_unverified`;
+      * it is the product's ONLY distinct variant: None; the no-key path prices it exactly as it would have
+        (a sole-variant placeholder offer included, which a named sku never reads);
+      * one sku names it: that sku;
+      * several (one variant spelled by two writers, e.g. `::sku_<hash>` and `::v:<n>`; more than
+        `_MAX_VARIANT_SPELLINGS` is `row_variant_ambiguous`): the no-key path's pricing rule per spelling --
+        each is loaded as a named sku, a spelling with no usable offer (`row_unpriced`) is passed over, any
+        other refusal stands, the priced ones must agree (`row_price_ambiguous`), and the lowest sku_key wins.
+    Reads only.
     """
-    skus = [dict(row) for row in await database.fetch_all(_CART_PRODUCT_SKUS_SQL, {"product_key": product_key})]
+    product = await database.fetch_one(
+        _CART_PRODUCT_SQL, {"product_key": product_key, "merchant_domain": merchant_domain})
+    if product is None:
+        raise svc.PurchaseRefused("row_not_found", "no catalog product for this domain and key")
+    skus = [dict(row) for row in await database.fetch_all(
+        _CART_PRODUCT_SKUS_SQL.replace(
+            "s.sku_key, s.source_variant_id,", "s.sku_key, s.source_variant_id, s.merchant_id, s.platform,"),
+        {"product_key": product_key})]
     if len(skus) > _CART_MAX_SKUS:
         raise svc.PurchaseRefused("row_variant_ambiguous", "too many skus to select a variant from")
-    matches = sorted(
-        (sku for sku in skus
-         if not _is_placeholder_sku(sku, product_key)
-         and _cart_numeric_variant(sku.get("source_variant_id"), product_key) == variant_id),
-        key=lambda sku: str(sku["sku_key"]),
-    )
+    real = [sku for sku in skus if not _is_placeholder_sku(sku, product_key)]
+    variants = {_cart_numeric_variant(sku.get("source_variant_id"), product_key) for sku in real}
+    matches = sorted((sku for sku in real
+                      if _cart_numeric_variant(sku.get("source_variant_id"), product_key) == variant_id),
+                     key=lambda sku: str(sku["sku_key"]))
+    if any(sku.get("merchant_id") != product["merchant_id"] or sku.get("platform") != product["platform"]
+           for sku in matches):
+        raise svc.PurchaseRefused("row_variant_unverified", "a sku naming the selected variant is another listing's")
+    if not real:
+        return None
     if not matches:
         raise svc.PurchaseRefused("row_variant_unverified", "no live sku names the selected variant")
+    if variants == {variant_id}:
+        return None
     if len(matches) == 1:
         return str(matches[0]["sku_key"])
+    if len(matches) > _MAX_VARIANT_SPELLINGS:
+        raise svc.PurchaseRefused("row_variant_ambiguous", "too many spellings of the selected variant")
     priced: List[Tuple[str, int, str]] = []
     unpriced: Optional[svc.PurchaseRefused] = None
     for sku in matches:
@@ -2132,6 +2159,12 @@ async def _resolve_selected_variant_key(
     if len({(minor, cur) for _key, minor, cur in priced}) > 1:
         raise svc.PurchaseRefused("row_price_ambiguous", "the spellings of this variant carry different prices")
     return priced[0][0]
+
+
+def _require_selected_variant(loaded_variant: Any, variant_id: Optional[str]) -> None:
+    """A `variant_id` selection buys THAT variant or nothing: the variant the cart-link load proved must be it."""
+    if variant_id is not None and str(loaded_variant or "") != variant_id:
+        raise svc.PurchaseRefused("row_variant_unverified", "the proven variant is not the selected one")
 
 
 def _request_hash(
@@ -3093,6 +3126,7 @@ async def start_reap_purchase(
                 variant_key=variant_key,
                 market_country=market_country,
             )
+            _require_selected_variant(cart_variant, req.variant_id)
         else:
             # A refusal here writes nothing, the key included: every attempt that reaches here
             # carries bound money that has not passed admission yet. (A `refused:` key written before the pair was
@@ -3269,6 +3303,7 @@ async def _validate_resume_selection(req, row, merchant, host, product, variant,
                 merchant_domain=host, product_key=product, variant_id=req.variant_id, market_country=market)
         facts, _, selected_variant, _ = await _load_cart_link_item(
             merchant_domain=host, product_key=product, variant_key=variant, market_country=market)
+        _require_selected_variant(selected_variant, req.variant_id)
         selected_key = "shopify:" + str(selected_variant)
         price, currency = facts["our_price_minor"], facts["currency"]
         # The stored cart (including attribution) survives; only compare its immutable line.
