@@ -191,12 +191,14 @@ def test_re_creating_a_cad_polluted_seed_heals_from_a_usd_read(monkeypatch):
     assert response["snapshot_price_refused"] is None
 
 
-def test_the_rule_does_not_read_the_partition(monkeypatch):
-    # The same CAD read is refused on a seed filed under any market, CA included: CA is not a
-    # served or acquisition market, and a seed's market is not where its currency comes from.
-    response, write = _create(monkeypatch, _read("CAD"), [], market="CA")
-    assert _row_price(write) == (None, None)
-    assert response["snapshot_price_refused"] is not None
+@pytest.mark.parametrize(("currency", "stored"), [("USD", (110.0, "USD")), ("CAD", (None, None))])
+def test_the_rule_does_not_read_the_partition(monkeypatch, currency, stored):
+    # A seed filed under a registry market other than the currency's (JP, priced in JPY) takes a USD
+    # read and refuses a CAD one: the registry decides, and a seed's market is not where its currency
+    # comes from. (Kills a rule that compares the read against the seed's market.)
+    response, write = _create(monkeypatch, _read(currency), [], market="JP")
+    assert _row_price(write) == stored
+    assert (response["snapshot_price_refused"] is None) == (currency == "USD")
 
 
 # ---- the nightly refresh: the row columns ---------------------------------------------------------
@@ -229,6 +231,19 @@ def test_an_empty_row_follows_its_stored_variants_currency(monkeypatch):
                     price=80.0, availability="in_stock")
     row["price_amount"], row["price_currency"] = None, None
     report, price = _refresh_price(monkeypatch, row, _read("SGD"))
+    assert price == (None, None)
+    assert report["status"] == "skipped_currency_mismatch"
+
+
+def test_variants_stating_no_currency_do_not_let_a_cad_read_fill_the_row(monkeypatch):
+    # The row half only: a stored variant with no currency establishes nothing, so the rule falls to
+    # the registry and CAD is refused. (What the read's reconcile writes into that variant is the
+    # variant-adoption guard's to decide.)
+    row = _seed_row(variants=[{"variant_id": "EX-30", "title": "30 mL", "price_amount": 80.0,
+                               "availability": "in_stock"}],
+                    price=80.0, availability="in_stock")
+    row["price_amount"], row["price_currency"] = None, None
+    report, price = _refresh_price(monkeypatch, row, _page([_offer(110, IN, sku="EX-30", priceCurrency="CAD")]))
     assert price == (None, None)
     assert report["status"] == "skipped_currency_mismatch"
 
