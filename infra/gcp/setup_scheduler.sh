@@ -413,6 +413,11 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 #   RELGRAPH_SYNC_REVIEW_LIMIT=2000 - 400 anchors at ~7.6 candidates each are ~3,000 labels a night; at
 #     1,000 the backfill's labels would wait. ~54 minutes of review at concurrency 6, inside the 90-minute
 #     step budget. (Peng 2026-10-13: graph-only is live with ~91% of PDPs empty; drain + nightly 200/2000.)
+#   RELGRAPH_SYNC_REVIEW_CONCURRENCY=8 (Peng 2026-10-13, review cap kept at 2000) - the first night at
+#     2000 reviews took 93 minutes; pivota-pg CPU then was mean 15% / p90 25%, its only bursts over 35%
+#     (8 minutes, max 58%) in the build/recall phase, the review stretch near baseline (the reviews are
+#     LLM calls), so 8 shortens the review without loading the 2-vCPU primary. The run's review error
+#     gate (max 25%) stops the step if the model provider throttles.
 #   RELGRAPH_SYNC_EXPAND_TARGET_RECALL=true - candidates come from each anchor's own category, not the
 #     ~1,400 newest rows; a targeted run of 45 anchors generated 344 candidates for 32 that had none.
 #     This applies to the recency anchors too.
@@ -424,7 +429,7 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 relgraph_sync_env(){
   local env="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1"
   if [ "$ENV" = prod ]; then
-    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=90,RELGRAPH_SYNC_REVIEW_LIMIT=2000,RELGRAPH_SYNC_REVIEW_CONCURRENCY=6,RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true"
+    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=90,RELGRAPH_SYNC_REVIEW_LIMIT=2000,RELGRAPH_SYNC_REVIEW_CONCURRENCY=8,RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true"
     env="$env,RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT=200,RELGRAPH_SYNC_EXPAND_TARGET_RECALL=true"
     env="$env,VERTEX_AI_ENABLED=true,GOOGLE_CLOUD_PROJECT=$PROJECT,GOOGLE_CLOUD_LOCATION=global,GCE_METADATA_HOST=metadata.google.internal"
   else

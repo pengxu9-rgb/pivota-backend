@@ -30,6 +30,7 @@ reuse the per-category attribute modules so there is one source of truth.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional
 
 from services import haircare_attributes
@@ -166,6 +167,10 @@ def extract_key_actives(
         source = SOURCE_TEXT
     if not blob.strip():
         return []
+    # NFKC: a description renders a numeric <sup>/<sub> as its Unicode character ("provitamin B" + a
+    # subscript five, "Ceramide" + a superscript three); the patterns spell them in ASCII. Text without
+    # compatibility characters is unchanged.
+    blob = unicodedata.normalize("NFKC", blob)
     actives: List[Dict[str, Any]] = []
     for active in _KEY_ACTIVES:
         if active["_re"].search(blob):
