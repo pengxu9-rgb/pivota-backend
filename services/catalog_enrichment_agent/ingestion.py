@@ -537,6 +537,56 @@ def _normalize_url(url: Optional[str]) -> str:
     return str(url).strip()
 
 
+#: The most images a row keeps from its storefront's structured product gallery (a Shopify
+#: `/products.json` product's `images[].src`). A storefront's own gallery is the product shots
+#: first; past a dozen it is lifestyle and campaign imagery, and nothing renders that many. Below
+#: the HTML refresh's own cap (external_offers_service.MAX_IMAGES), so a structured gallery is never
+#: longer than a scraped one would have been, and one row's payload stays small.
+MAX_STRUCTURED_GALLERY_IMAGES = 12
+
+
+def _gallery_dedupe_key(url: str) -> str:
+    """Two entries name ONE image when host + path match. The scheme, query and fragment are left out
+    of the KEY only (a CDN cache-buster `?v=` or a width hint does not make another image); the URL
+    kept is the first occurrence exactly as the feed spelled it, the way `image_url` keeps it."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    return f"{parts.netloc.lower()}{parts.path}"
+
+
+def structured_image_gallery(urls: Any, *, cap: int = MAX_STRUCTURED_GALLERY_IMAGES) -> List[str]:
+    """A product's structured image gallery as a row stores it: feed order, each URL stripped and
+    otherwise as written, http(s) only, one entry per image (`_gallery_dedupe_key`), at most `cap`.
+    Pure and deterministic, so one feed gives byte-identical output on every run. Anything that is not
+    a list or tuple gives []."""
+    if not isinstance(urls, (list, tuple)):
+        return []
+    out: List[str] = []
+    seen: set = set()
+    for raw in urls:
+        url = raw.strip() if isinstance(raw, str) else ""
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        key = _gallery_dedupe_key(url)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(url)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _row_gallery(pdp_payload: Dict[str, Any], image_url: Optional[str]) -> List[str]:
+    """The gallery a row writes beside its `image_url`, or [] to write none (the row is then exactly what
+    it was before galleries were carried). Written only when its first image IS the row's `image_url`, so
+    nothing a buyer sees reorders: the PDP view puts `image_url` first either way. `pdp_payload` is
+    `_build_pdp_payload`'s, which normalised the list (structured_image_gallery) once."""
+    gallery = pdp_payload.get("image_urls") or []
+    return list(gallery) if gallery and gallery[0] == image_url else []
+
+
 def _observed_stock(value: Any) -> Optional[bool]:
     return value if isinstance(value, bool) else None
 
@@ -661,6 +711,9 @@ def _build_pdp_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         # folded shade line arrives this way). Each becomes a SKU + offer beside
         # the canonical SKU — see _build_variant_sku_inserts.
         "variants": [v for v in (pdp.get("variants") or []) if isinstance(v, dict)],
+        # The storefront's own structured image gallery, when the producing lane read one (the curated
+        # Shopify feed's `images[].src`; see `_row_gallery` for when a row writes it). [] otherwise.
+        "image_urls": structured_image_gallery(pdp.get("image_urls")),
     }
     if not payload["brand"] or not payload["product_name"]:
         return {}
@@ -914,6 +967,7 @@ def _build_pdp_insert(
         # the brand attaches offers without overwriting it (multi-market storefronts ADR 3.4 item 4).
         "source_role": pdp_payload.get("source_role"),
     }
+    gallery = _row_gallery(pdp_payload, image_url)
     return {
         "product_key": product_key,
         # Seller of record: retailer domains key on etld1, brand-direct on
@@ -968,7 +1022,15 @@ def _build_pdp_insert(
         "category_label_source": DEFAULT_CATEGORY_LABEL_SOURCE,
         "canonical_url": canonical_url or None,
         "image_url": image_url or None,
-        "product_payload": json.dumps({"enrichment_meta": enrichment_meta}),
+        # The structured gallery rides beside enrichment_meta, the key agent_pdp_view_assembler's
+        # read_image_urls takes a row's own images from. That reader takes a decoded dict, and the view
+        # rebuild's raw fetch hands JSONB over as text, so the view shows the copy in the row's own seed
+        # (_build_seed_inserts) until that read decodes it. Omitted, not [], when the row has none, so a
+        # product with no structured gallery writes exactly the payload it always did.
+        "product_payload": json.dumps({
+            "enrichment_meta": enrichment_meta,
+            **({"image_urls": gallery} if gallery else {}),
+        }),
         # Phase O-1 followup: persist optional curator-supplied tags from
         # JSONL (always a list, possibly empty). Same semantic as Path A
         # and Path B: `[]` means "ingest saw the candidate and the JSONL
@@ -1129,7 +1191,10 @@ def _build_seed_inserts(
     """
     rows: List[Dict[str, Any]] = []
     seen_urls: set = set()
-    for offer in offers:
+    # The structured gallery belongs to the listing the row's `image_url` came from, offers[0]
+    # (_build_pdp_insert). Only that offer's seed carries it; any other seed keeps its one image.
+    gallery = _row_gallery(pdp_payload, offers[0].get("image_url")) if offers else []
+    for index, offer in enumerate(offers):
         canonical_url = offer.get("canonical_url") or ""
         destination_url = offer.get("destination_url") or canonical_url
         if not destination_url or destination_url in seen_urls:
@@ -1299,7 +1364,12 @@ def _build_seed_inserts(
                 "validated_at": offer.get("validated_at"),
                 "agent_version": AGENT_VERSION,
                 "variants": seed_variants,
-                "image_urls": [offer.get("image_url")] if offer.get("image_url") else [],
+                # The full structured gallery, first image first (== image_url), on the row's own
+                # listing; the offer's one image otherwise, as before.
+                "image_urls": (
+                    gallery if index == 0 and gallery
+                    else [offer.get("image_url")] if offer.get("image_url") else []
+                ),
             }),
         })
     return rows

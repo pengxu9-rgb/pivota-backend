@@ -3274,6 +3274,17 @@ def shopify_product_to_record(
             if _src:
                 image = {"src": _src}
                 break
+    # The product's OWN structured gallery: its `images[].src` in feed order (normalised by
+    # ingestion.structured_image_gallery, which ingestion applies again), carried so the row owns its
+    # gallery instead of borrowing a page scrape's. Kept only when its first image IS the row image
+    # above, so nothing reorders; otherwise (no product images, the variant-swatch fallback, a first
+    # image that is not http(s)) the record carries none and is what it was. A fold base keeps its own
+    # images only: images the fold adopted from folded children are other listings' pictures, and each
+    # folded variant keeps its own image_url below.
+    from services.catalog_enrichment_agent.ingestion import structured_image_gallery
+    image_urls = [] if product.get(FOLDED_IMAGES_KEY) else structured_image_gallery(_image_srcs(product))
+    if not image_urls or image_urls[0] != str(image.get("src") or "").strip():
+        image_urls = []
     # A line with multiple native variants is not one physical item, just as a
     # folded shade line is not. Never promote the first variant's GTIN to Tier-0
     # PDP identity: array order and stock/price changes must not change identity.
@@ -3420,6 +3431,8 @@ def shopify_product_to_record(
             # defaulted here: direct ingestion also refuses an unknown currency.
             "currency": currency,
             "variants": pdp_variants,
+            # Omitted when empty, so a product without a gallery builds the record it always did.
+            **({"image_urls": image_urls} if image_urls else {}),
         },
         "offers": [
             {
@@ -3469,6 +3482,10 @@ def shopify_product_to_record(
 _SHADE_SEP = " - "
 FOLDED_FROM_KEY = "_folded_from_handle"
 FOLDED_INTO_KEY = "_folded_shades"
+#: Set on a fold base whose `images` the fold ADOPTED from its folded children (the base had none of its
+#: own). Those are other listings' pictures: the base's row image comes from them as before, but they are
+#: not the base's gallery (shopify_product_to_record).
+FOLDED_IMAGES_KEY = "_images_adopted_from_folded"
 # A suffix that names a merchandising state, not a shade. tarte sells "<line> - <X>
 # charm" as separate $10 accessories and stila suffixes "- Last Chance"/"- Limited
 # Edition" onto whole palettes; folding those makes an accessory a "shade" of the
@@ -3638,6 +3655,7 @@ def fold_shade_listings(products: List[Dict[str, Any]], *,
                         adopted.append({"src": src})
             if adopted:
                 base["images"] = adopted
+                base[FOLDED_IMAGES_KEY] = True
                 report["images_adopted"] += 1
         report["bases"] += 1
         report["shades"] += len(shades)
@@ -4077,6 +4095,7 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
                         adopted.append({"src": src})
             if adopted:
                 base["images"] = adopted
+                base[FOLDED_IMAGES_KEY] = True
                 report["images_adopted"] += 1
         report["bases"] += 1
         report["shades"] += len(added)

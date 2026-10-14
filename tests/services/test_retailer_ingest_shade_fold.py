@@ -559,6 +559,10 @@ async def test_retailer_records_are_byte_identical_to_main_unless_the_extended_f
     if fold:  # the legacy fold's folded offers stay on the base listing, as they always were
         assert {o["source_ref"] for o in plan["offers"] if o["product_key"] == plan["pdps"][0]["product_key"]} == {
             f"https://{GOLDEN_HOST}/products/gel-colour"}
+    # The record's structured gallery (pdp.image_urls) is the one key added since the golden: each golden
+    # product has one image, so it is exactly that image. Everything else must still hash to the golden.
+    for rec in recs:
+        assert rec["pdp"].pop("image_urls") == [rec["offers"][0]["image_url"]]
     keep = {"records": list(recs), "skus": plan["skus"], "offers": plan["offers"]}
     assert hashlib.sha256(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest() == GOLDEN_DIGESTS[fold]
 
