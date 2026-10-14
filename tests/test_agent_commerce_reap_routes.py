@@ -269,6 +269,16 @@ async def _db():
     had_seed_table = await database.fetch_one(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'external_product_seeds'"
     ) is not None
+    # A table ANOTHER suite left behind may be narrower than these tests write (the sweep runs every file in
+    # one database, in collection order: #2605's resume tests met one without `attached_variant_id`). Set it
+    # aside for this test and put it back after, so neither suite sees the other's shape.
+    stashed_seed_table = False
+    if had_seed_table:
+        columns = {row["name"] for row in await database.fetch_all("PRAGMA table_info(external_product_seeds)")}
+        if not _SEED_TABLE_COLUMNS <= columns:
+            await database.execute(f"DROP TABLE IF EXISTS {_SEED_TABLE_STASH}")
+            await database.execute(f"ALTER TABLE external_product_seeds RENAME TO {_SEED_TABLE_STASH}")
+            stashed_seed_table, had_seed_table = True, False
     if not had_seed_table:
         await database.execute(
             "CREATE TABLE external_product_seeds ("
@@ -290,6 +300,16 @@ async def _db():
         )
         if not had_seed_table:
             await database.execute("DROP TABLE external_product_seeds")
+        if stashed_seed_table:
+            await database.execute(f"ALTER TABLE {_SEED_TABLE_STASH} RENAME TO external_product_seeds")
+
+
+#: The seed-table columns these tests write; a table left behind without one of them is set aside.
+_SEED_TABLE_COLUMNS = frozenset({
+    "id", "status", "domain", "market", "destination_url", "canonical_url",
+    "attached_product_key", "attached_variant_id", "seed_data",
+})
+_SEED_TABLE_STASH = "external_product_seeds__stashed_by_reap_routes"
 
 
 @pytest.fixture(autouse=True)
