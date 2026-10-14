@@ -1,11 +1,16 @@
-"""A page read's variants are adopted into a seed only in the seed's own currency.
+"""A page read's variants are adopted into a seed only in a currency the seed may store.
 
 THE DEFECT. The seed refresh and the employee create path adopt the page's JSON-LD variants into
 `seed_data.variants` (`_should_overwrite_seed_variants` / `_should_replace_seed_variant_content`
 -> `_adopt_seed_variants`). A store can geo-serve another market's page to the crawler, and the
 read's variants carry that page's currency. Probed 2026-10-13: a US/USD seed that read a CAD-priced
-page stored CAD variant prices. The offer dual-write refused the offer, but the seed broke
-"price currency = market currency", and the builders price offers from its variants.
+page stored CAD variant prices. The offer dual-write refused the offer, but the seed kept them,
+and the builders price offers from its variants.
+
+The rule is `services.region_pricing.foreign_seed_currencies` (Peng, 2026-10-14). A read may state
+only the currency of a served or acquisition market in config/market_registry.json. A seed already
+priced in such a currency keeps it (sticky). There is no comparison against the seed's market
+partition: SG seeds sit in 'US' priced in SGD (ADR-026 drops the partition).
 
 Every page here goes through the real JSON-LD extractor (`_extract_from_html`, via the harness in
 tests/test_external_seed_refresh_writes_variants.py); only the network and the DB are stubbed.
@@ -27,6 +32,7 @@ from routes.employee_products import (
     _should_overwrite_seed_variants,
     _should_replace_seed_variant_content,
 )
+from services.region_pricing import SEED_CURRENCY_STATUSES, foreign_seed_currencies, seed_storable_currencies
 from tests.test_external_seed_refresh_writes_variants import DEST, IN, TITLE, _offer, _page, _refresh, _seed_row
 
 
@@ -138,39 +144,93 @@ def test_the_localized_copy_branch_takes_a_usd_read(monkeypatch):
 
 
 def test_a_usd_read_heals_a_us_seed_an_earlier_read_left_in_cad(monkeypatch):
-    # The market decides, not the stored list: otherwise the seeds base main already wrote in CAD
-    # could never take their own market's price again.
+    # A stored currency that is not storable holds nothing: otherwise the seeds base main already
+    # wrote in CAD could never take a storable price again. The row stayed USD (the refresh refuses
+    # a row currency change), so the seed heals back to it.
     row = _seed_row(variants=[_stored_variant("CAD")], price=80.0, availability="in_stock")
     _, stored = _refresh(monkeypatch, row, _page(_sized_offers("USD")))
     assert _stated(stored["seed_data"]["variants"]) == {"USD"}
 
 
+# ---- SG seeds sit in the 'US' partition priced in SGD: they must stay priced ---------------------
+
+
+def _sgd_seed_row(**kw: Any) -> Dict[str, Any]:
+    row = _seed_row(variants=[_stored_variant("SGD")], price=80.0, availability="in_stock", **kw)
+    row["price_currency"] = "SGD"
+    return row
+
+
+def test_an_sgd_seed_in_the_us_partition_adopts_an_sgd_read(monkeypatch):
+    assert _sgd_seed_row()["market"] == "US", "the premise: the partition says US"
+    result, stored = _refresh(monkeypatch, _sgd_seed_row(), _page(_sized_offers("SGD")))
+    assert [(v["variant_id"], v["price_currency"]) for v in stored["seed_data"]["variants"]] == [
+        ("EX-30", "SGD"), ("EX-50", "SGD")]
+    assert result["variant_adoption_refused"] is None
+
+
+def test_an_sgd_seed_refuses_a_usd_read(monkeypatch):
+    # Sticky: both are storable, but the seed is established in SGD.
+    result, stored = _refresh(monkeypatch, _sgd_seed_row(), _page(_sized_offers("USD")))
+    assert _stated(stored["seed_data"]["variants"]) == {"SGD"}
+    assert result["variant_adoption_refused"]["currencies"] == ["USD"]
+
+
+def test_a_usd_seed_refuses_an_sgd_read(monkeypatch):
+    row = _seed_row(variants=[_stored_variant()], price=80.0, availability="in_stock")
+    result, stored = _refresh(monkeypatch, row, _page(_sized_offers("SGD")))
+    assert _stated(stored["seed_data"]["variants"]) == {"USD"}
+    assert result["variant_adoption_refused"]["currencies"] == ["SGD"]
+
+
+def test_the_row_currency_alone_establishes_the_seed(monkeypatch):
+    # No stored variants: the row's price_currency is what the seed is priced in.
+    row = _seed_row(variants=None, price=80.0, availability="in_stock")
+    _, stored = _refresh(monkeypatch, row, _page(_sized_offers("SGD")))
+    assert "SGD" not in _stated(stored["seed_data"].get("variants"))
+
+
 # ---- the rule itself ----------------------------------------------------------------------------
 
 
+def test_storable_currencies_are_the_registrys_served_and_acquisition_markets():
+    from services import market_registry as reg
+
+    assert SEED_CURRENCY_STATUSES == ("served", "acquisition")
+    assert seed_storable_currencies() == {reg.currency_for(m) for m in reg.markets_with_status("served", "acquisition")}
+    # The premises the end-to-end tests above rest on.
+    assert {"USD", "SGD"} <= seed_storable_currencies() and "CAD" not in seed_storable_currencies()
+
+
 @pytest.mark.parametrize(
-    ("market", "stored", "incoming", "foreign"),
+    ("established", "stated", "foreign"),
     [
-        ("US", ["USD"], ["CAD"], ["CAD"]),
-        ("US", ["USD"], ["USD", "CAD"], ["CAD"]),  # any foreign variant refuses the whole read
-        ("US", [], ["usd"], []),  # case does not matter
-        ("US", ["CAD"], ["USD"], []),  # the market decides
-        ("US", ["CAD"], ["CAD"], ["CAD"]),  # a polluted stored list does not license more of it
-        ("ZZ", ["EUR"], ["GBP"], ["GBP"]),  # an unmapped market falls back to the stored currency
-        ("ZZ", ["EUR"], ["EUR"], []),
-        ("ZZ", [], ["GBP"], []),  # nothing to hold it to
-        ("US", ["USD"], [None], []),  # an unstated currency is filled from the market downstream
+        ([], ["CAD"], ["CAD"]),  # not storable
+        ([], ["USD", "CAD"], ["CAD"]),  # any foreign variant refuses the whole read
+        ([], ["usd"], []),  # case does not matter
+        ([], ["SGD"], []),  # a new seed may take any storable currency
+        (["USD"], ["SGD"], ["SGD"]),  # sticky
+        (["SGD"], ["USD"], ["USD"]),
+        (["USD", "SGD"], ["SGD"], []),  # established in both: either holds
+        (["CAD"], ["USD"], []),  # an unstorable established currency holds nothing
+        (["CAD", "USD"], ["SGD"], ["SGD"]),  # ...and does not hide the storable one beside it
+        (["CAD"], ["CAD"], ["CAD"]),  # nor licenses more of itself
+        ([None, " "], ["SGD"], []),  # blank established currencies are ignored
+        (["USD"], [None, ""], []),  # an unstated currency does not count
     ],
 )
-def test_the_rule(market, stored, incoming, foreign):
-    existing = [{"variant_id": f"s{i}", "price_currency": c} for i, c in enumerate(stored)]
-    read = [{"variant_id": f"r{i}", **({"price_currency": c} if c else {})} for i, c in enumerate(incoming)]
-    assert _foreign_variant_currencies(existing=existing, incoming=read, market=market) == foreign
+def test_the_rule(established, stated, foreign):
+    assert foreign_seed_currencies(stated, established=established) == foreign
 
 
-def test_the_rule_reads_the_currency_key_too():
+def test_the_variant_gate_establishes_the_seed_from_its_row_and_stored_variants():
+    read = [{"variant_id": "r", "price_currency": "SGD"}]
+    assert _foreign_variant_currencies(existing=[], incoming=read, row_currency=None) == []
+    assert _foreign_variant_currencies(existing=[], incoming=read, row_currency="usd") == ["SGD"]
+    assert _foreign_variant_currencies(existing=[{"price_currency": "USD"}], incoming=read, row_currency=None) == ["SGD"]
+    assert _foreign_variant_currencies(existing=[{"currency": "USD"}], incoming=read, row_currency=None) == ["SGD"]
     assert _foreign_variant_currencies(existing=[], incoming=[{"variant_id": "a", "currency": "CAD"}],
-                                       market="US") == ["CAD"]
+                                       row_currency=None) == ["CAD"]
 
 
 # ---- the employee create path, through the real endpoint ----------------------------------------
@@ -217,3 +277,21 @@ def test_creating_a_us_seed_from_a_cad_page_stores_no_variants(monkeypatch):
 def test_creating_a_us_seed_from_a_usd_page_stores_its_variants(monkeypatch):
     seed_data = _create(monkeypatch, _page(_sized_offers("USD")), [])
     assert [(v["variant_id"], v["price_currency"]) for v in seed_data["variants"]] == [("EX-30", "USD"), ("EX-50", "USD")]
+
+
+def test_creating_a_seed_from_an_sgd_page_stores_its_sgd_variants(monkeypatch):
+    # SG supply is created in the 'US' partition too; a new seed has no currency to hold it to.
+    seed_data = _create(monkeypatch, _page(_sized_offers("SGD")), [])
+    assert _stated(seed_data["variants"]) == {"SGD"}
+
+
+def test_re_creating_a_usd_seed_refuses_an_sgd_read(monkeypatch):
+    existing = _seed_row(variants=[_stored_variant()], price=80.0, availability="in_stock")
+    seed_data = _create(monkeypatch, _page(_sized_offers("SGD")), [existing])
+    assert [(v["variant_id"], v["price_currency"]) for v in seed_data["variants"]] == [("EX-BASE", "USD")]
+
+
+def test_re_creating_a_seed_with_no_variants_is_held_to_its_row_currency(monkeypatch):
+    existing = _seed_row(variants=None, price=80.0, availability="in_stock")
+    seed_data = _create(monkeypatch, _page(_sized_offers("SGD")), [existing])
+    assert "SGD" not in _stated(seed_data.get("variants"))

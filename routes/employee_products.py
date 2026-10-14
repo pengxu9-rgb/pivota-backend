@@ -77,6 +77,7 @@ from services.pci_kb_scope_review import (
     summarize_filtered_queue,
 )
 from db.reviews_center import product_reviews
+from services.region_pricing import foreign_seed_currencies
 from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key, build_sku_key
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 
@@ -938,25 +939,20 @@ def _stated_variant_currencies(variants: List[Dict[str, Any]]) -> set:
 
 
 def _foreign_variant_currencies(
-    *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]], market: Optional[str]
+    *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]], row_currency: Optional[str]
 ) -> List[str]:
-    """The currencies `incoming` states that this seed may not store; empty when it may adopt them.
+    """The currencies `incoming` (a page read's variants) states that this seed may not adopt.
 
     A page read's variants carry the currency the PAGE was served in, and a store can geo-serve
-    another market's page to the crawler. Probed 2026-10-13: a US seed that read a CAD-priced page
-    stored CAD variant prices. The offer dual-write refused the offer, but the seed itself broke
-    "price currency = market currency", and the builders serve its variants.
-
-    The market's currency decides. Only a market with no known currency falls back to the stored
-    variants' currencies: holding a known market to its stored ones too would stop a USD read from
-    healing a US seed whose variants an earlier read already left in CAD. A read variant with no
-    stated currency does not count; it is filled from the market downstream."""
-    stated = _stated_variant_currencies(incoming)
-    expected = MARKET_EXPECTED_CURRENCY.get(_normalize_market(market))
-    allowed = {expected} if expected else _stated_variant_currencies(existing)
-    if not allowed:
-        return []
-    return sorted(stated - allowed)
+    another market's page to the crawler. Probed 2026-10-13: a US/USD seed that read a CAD-priced
+    page stored CAD variant prices. The offer dual-write refused the offer, but the seed kept them,
+    and the builders price offers from its variants. The rule is region_pricing's
+    `foreign_seed_currencies`, shared with the row-price writers. The seed is established in its
+    row currency plus its stored variants' currencies."""
+    return foreign_seed_currencies(
+        _stated_variant_currencies(incoming),
+        established=[row_currency, *_stated_variant_currencies(existing)],
+    )
 
 
 def _should_overwrite_seed_variants(
@@ -4158,7 +4154,7 @@ async def create_external_seed(
         if body.variants is not None and body.variants:
             seed_data["variants"] = body.variants
         elif snap_variants and not _foreign_variant_currencies(
-            existing=_seed_variants(seed_data), incoming=snap_variants, market=market
+            existing=_seed_variants(seed_data), incoming=snap_variants, row_currency=row.get("price_currency")
         ):
             existing_variants = _seed_variants(seed_data)
             if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=title):
@@ -4258,7 +4254,7 @@ async def create_external_seed(
             "variants": body.variants
             or (
                 snap_variants
-                if snap_variants and not _foreign_variant_currencies(existing=[], incoming=snap_variants, market=market)
+                if snap_variants and not _foreign_variant_currencies(existing=[], incoming=snap_variants, row_currency=None)
                 else []
             ),
             "utm_template": utm_template,
@@ -5479,7 +5475,7 @@ async def _refresh_external_seed_by_id(
         seed_data["availability"] = snap_availability
     variant_adoption_refused = None
     foreign_currencies = _foreign_variant_currencies(
-        existing=_seed_variants(seed_data), incoming=adoptable_variants or [], market=market
+        existing=_seed_variants(seed_data), incoming=adoptable_variants or [], row_currency=row.get("price_currency")
     )
     if adoptable_variants and foreign_currencies:
         # Keep the stored variants. The reconcile below re-reads only same-currency offers.
