@@ -3278,12 +3278,14 @@ def shopify_product_to_record(
     # ingestion.structured_image_gallery, which ingestion applies again), carried so the row owns its
     # gallery instead of borrowing a page scrape's. Kept only when its first image IS the row image
     # above, so nothing reorders; otherwise (no product images, the variant-swatch fallback, a first
-    # image that is not http(s)) the record carries none and is what it was. A fold base keeps its own
-    # images only: images the fold adopted from folded children are other listings' pictures, and each
-    # folded variant keeps its own image_url below.
-    from services.catalog_enrichment_agent.ingestion import structured_image_gallery
-    image_urls = [] if product.get(FOLDED_IMAGES_KEY) else structured_image_gallery(_image_srcs(product))
-    if not image_urls or image_urls[0] != str(image.get("src") or "").strip():
+    # image that is not http(s), a single image that adds nothing to the row image) the record carries
+    # none and is what it was. A fold base keeps its own images only: images the fold adopted from folded
+    # children are other listings' pictures, and each folded variant keeps its own image_url below.
+    # Behind ingestion.STRUCTURED_GALLERY_FLAG (default off): off, every record is what it always was.
+    from services.catalog_enrichment_agent.ingestion import structured_gallery_enabled, structured_image_gallery
+    image_urls = (structured_image_gallery(_image_srcs(product))
+                  if structured_gallery_enabled() and not product.get(FOLDED_IMAGES_KEY) else [])
+    if len(image_urls) < 2 or image_urls[0] != str(image.get("src") or "").strip():
         image_urls = []
     # A line with multiple native variants is not one physical item, just as a
     # folded shade line is not. Never promote the first variant's GTIN to Tier-0

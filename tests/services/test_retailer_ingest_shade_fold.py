@@ -540,9 +540,15 @@ GOLDEN_PRODUCTS = [
 ]
 
 
+@pytest.mark.parametrize("gallery_flag", ["", "1"])
 @pytest.mark.parametrize("fold", [False, True])
-async def test_retailer_records_are_byte_identical_to_main_unless_the_extended_fold_runs(monkeypatch, fold):
+async def test_retailer_records_are_byte_identical_to_main_unless_the_extended_fold_runs(monkeypatch, fold,
+                                                                                         gallery_flag):
     import json
+
+    # The structured image gallery (ingestion.STRUCTURED_GALLERY_FLAG): off, nothing changes; on, a product
+    # with one image (every golden product) carries no gallery either, so both reproduce the golden.
+    monkeypatch.setenv(ingestion.STRUCTURED_GALLERY_FLAG, gallery_flag)
 
     async def fetch_products(domain, **kw):
         return feed.ShopifyProductBatch(feed.filter_products_by_vendor(GOLDEN_PRODUCTS, kw.get("only_vendors")),
@@ -559,10 +565,6 @@ async def test_retailer_records_are_byte_identical_to_main_unless_the_extended_f
     if fold:  # the legacy fold's folded offers stay on the base listing, as they always were
         assert {o["source_ref"] for o in plan["offers"] if o["product_key"] == plan["pdps"][0]["product_key"]} == {
             f"https://{GOLDEN_HOST}/products/gel-colour"}
-    # The record's structured gallery (pdp.image_urls) is the one key added since the golden: each golden
-    # product has one image, so it is exactly that image. Everything else must still hash to the golden.
-    for rec in recs:
-        assert rec["pdp"].pop("image_urls") == [rec["offers"][0]["image_url"]]
     keep = {"records": list(recs), "skus": plan["skus"], "offers": plan["offers"]}
     assert hashlib.sha256(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest() == GOLDEN_DIGESTS[fold]
 

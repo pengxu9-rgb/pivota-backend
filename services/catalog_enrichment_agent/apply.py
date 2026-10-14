@@ -23,7 +23,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from services.catalog_enrichment_agent.bulk_writer import bulk_upsert
-from services.catalog_enrichment_agent.ingestion import AGENT_VERSION, _domain_of, derive_offer_id
+from services.catalog_enrichment_agent.ingestion import (
+    AGENT_VERSION, SEED_IMAGE_URLS_SOURCE_KEY, _domain_of, derive_offer_id,
+)
 from services.seed_served_url import canonical_for_destination
 from services.catalog_offer_writer_guard import (
     WriterAuditAccumulator,
@@ -2219,6 +2221,23 @@ def canonical_owner_of(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _seed_without_gallery(seed: Dict[str, Any]) -> Dict[str, Any]:
+    """The seed with its `seed_data.image_urls` cut back to its one image, exactly as the seed writer stores
+    it for a seed with no structured gallery (ingestion._build_seed_inserts). For a seed attached to a product
+    another brand store owns: the PDP view takes one seed per content_key cluster and appends its images, so
+    this store's gallery would land on the owner's page. A seed without a gallery is returned as it is."""
+    raw = seed.get("seed_data")
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return seed
+    if not isinstance(data, dict) or len(data.get("image_urls") or []) < 2:
+        return seed
+    data["image_urls"] = [seed["image_url"]] if seed.get("image_url") else []
+    data.pop(SEED_IMAGE_URLS_SOURCE_KEY, None)  # no structured gallery left, so no stamp: as main writes it
+    return {**seed, "seed_data": json.dumps(data)}
+
+
 async def _guard_canonical_owner(
     plan: Dict[str, Any], database: Any, *, market: str,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -2229,7 +2248,8 @@ async def _guard_canonical_owner(
     planned brand_official row whose stored row is owned by a DIFFERENT brand-official storefront is
     applied OFFER-ONLY -- CANONICAL_OWNER_COLUMNS keep the stored values and the plan's INCI for it is
     dropped, while its SKUs and offers still land (the row is still upserted, so the apply's counts and
-    the primary-apply gate see every planned product). A canonical-market apply is never touched and
+    the primary-apply gate see every planned product); its seed lands too, with its one image and never this
+    store's structured gallery (_seed_without_gallery). A canonical-market apply is never touched and
     triggers no lookup.
 
     An off-market row with no stored copy is created as today and counted canonical_created_off_market
@@ -2284,6 +2304,9 @@ async def _guard_canonical_owner(
     plan = dict(plan)
     plan["pdps"] = out_pdps
     plan["incis"] = [r for r in incis if str(r.get("product_key") or "") not in offer_only]
+    if plan.get("seeds"):
+        plan["seeds"] = [_seed_without_gallery(s) if str(s.get("attached_product_key") or "") in offer_only else s
+                         for s in plan["seeds"]]
     counts["pdps_offer_only_canonical_owner"] = len(kept)
     counts["incis_skipped_canonical_owner"] = len(incis) - len(plan["incis"])
     counts["canonical_owner_kept"] = kept[:CANONICAL_OWNER_KEPT_CAP]

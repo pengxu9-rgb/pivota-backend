@@ -2,9 +2,10 @@
 
 The producer (curated_brand_feed.shopify_product_to_record) carries a Shopify `/products.json` product's
 `images[].src` through the record as `pdp.image_urls`; ingestion writes it to
-`catalog_products.product_payload.image_urls` and to the row's own seed's `seed_data.image_urls`, first
-image first, so it is exactly the row's `image_url` followed by the rest of the gallery. A product with no
-gallery of its own builds exactly the record, payload and seed it always did.
+`catalog_products.product_payload.image_urls` and -- for a brand store's own listing -- to the row's seed's
+`seed_data.image_urls`, first image first, so it is exactly the row's `image_url` followed by the rest of
+the gallery. A product with fewer than two structured images builds exactly the record, payload and seed
+it always did, and so does everything while ingestion.STRUCTURED_GALLERY_FLAG is off (the default).
 
 Everything runs the real producer, ingestion and assembler; only the guard's database is faked here
 (tests/test_drain_structured_image_gallery_postgres.py runs both apply executors on Postgres). Hosts and
@@ -21,6 +22,12 @@ from services.catalog_enrichment_agent import ingestion
 
 HOST = "gallery-shop.example"
 CDN = "https://cdn.example/files"
+
+
+@pytest.fixture(autouse=True)
+def gallery_on(monkeypatch):
+    """The flag on, for every test here but the ones that switch it off themselves."""
+    monkeypatch.setenv(ingestion.STRUCTURED_GALLERY_FLAG, "1")
 
 
 def _product(images, *, title="Glow Serum", handle="glow-serum", variants=None, **extra):
@@ -100,9 +107,34 @@ def test_the_record_gallery_is_capped():
     assert rec["pdp"]["image_urls"] == [f"{CDN}/{i}.jpg" for i in range(12)]
 
 
-def test_one_image_is_a_one_image_gallery():
-    rec = _record(_product(_src("only.jpg")))
-    assert rec["pdp"]["image_urls"] == [f"{CDN}/only.jpg"] == [rec["offers"][0]["image_url"]]
+@pytest.mark.parametrize("images", [["only.jpg"], ["only.jpg?v=1", "only.jpg?v=2"]])
+def test_one_image_adds_nothing_to_the_row_image_so_the_record_carries_no_gallery(images):
+    rec = _record(_product(_src(*images)))
+    assert rec["offers"][0]["image_url"] == f"{CDN}/{images[0]}"
+    assert "image_urls" not in rec["pdp"]
+
+
+def test_two_images_are_a_gallery():
+    rec = _record(_product(_src("a.jpg", "b.jpg")))
+    assert rec["pdp"]["image_urls"] == [f"{CDN}/a.jpg", f"{CDN}/b.jpg"]
+
+
+def test_with_the_flag_off_the_record_is_what_it_always_was(monkeypatch):
+    product = _product(_src("a.jpg", "b.jpg", "c.jpg"))
+    on = _record(json.loads(json.dumps(product)))
+    monkeypatch.delenv(ingestion.STRUCTURED_GALLERY_FLAG)
+    off = _record(json.loads(json.dumps(product)))
+    assert "image_urls" not in off["pdp"]
+    on["pdp"].pop("image_urls")
+    assert off == on
+    monkeypatch.setenv(ingestion.STRUCTURED_GALLERY_FLAG, "0")
+    assert "image_urls" not in _record(json.loads(json.dumps(product)))["pdp"]
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", " on "])
+def test_the_flag_reads_the_repos_truthy_spellings(monkeypatch, value):
+    monkeypatch.setenv(ingestion.STRUCTURED_GALLERY_FLAG, value)
+    assert ingestion.structured_gallery_enabled()
 
 
 @pytest.mark.parametrize("images", [[], None, "not-a-list"])
@@ -118,7 +150,7 @@ def test_a_product_without_images_carries_no_gallery_key(images):
 
 
 def test_a_first_image_that_is_not_http_means_no_gallery_rather_than_a_reordered_one():
-    rec = _record(_product([{"src": "//cdn.example/files/a.jpg"}] + _src("b.jpg")))
+    rec = _record(_product([{"src": "//cdn.example/files/a.jpg"}] + _src("b.jpg", "c.jpg")))
     assert rec["offers"][0]["image_url"] == "//cdn.example/files/a.jpg"  # as today
     assert "image_urls" not in rec["pdp"]
 
@@ -213,8 +245,28 @@ def test_ingestion_writes_the_gallery_to_the_row_payload_and_its_seed_first_imag
     assert payload["image_urls"][0] == pdp["image_url"]
     assert list(payload) == ["enrichment_meta", "image_urls"]
     (seed,) = plan["seeds"]
-    assert json.loads(seed["seed_data"])["image_urls"] == gallery
+    seed_data = json.loads(seed["seed_data"])
+    assert seed_data["image_urls"] == gallery
+    # stamped where the list came from, in the exact spelling the refresh side matches
+    assert seed_data["image_urls_source"] == "storefront_products_json"
+    assert (ingestion.SEED_IMAGE_URLS_SOURCE_KEY, ingestion.SEED_IMAGE_URLS_SOURCE_STOREFRONT_FEED) == (
+        "image_urls_source", "storefront_products_json")
     assert seed["image_url"] == pdp["image_url"]
+
+
+def _stamp(plan, i=0):
+    return json.loads(plan["seeds"][i]["seed_data"]).get("image_urls_source")
+
+
+@pytest.mark.parametrize("case", ["flag_off", "one_image", "no_images", "retailer"])
+def test_a_seed_without_the_structured_gallery_carries_no_stamp(monkeypatch, case):
+    images = {"one_image": ["a.jpg"], "no_images": []}.get(case, ["a.jpg", "b.jpg"])
+    if case == "flag_off":
+        monkeypatch.delenv(ingestion.STRUCTURED_GALLERY_FLAG)
+    kw = {"source_role": "retailer", "retailer_name": HOST} if case == "retailer" else {}
+    plan = _plan(_record(_product(_src(*images)), **kw))
+    assert _stamp(plan) is None
+    assert "image_urls_source" not in plan["seeds"][0]["seed_data"]
 
 
 def test_a_row_without_a_gallery_writes_the_payload_and_seed_it_always_did():
@@ -224,10 +276,42 @@ def test_a_row_without_a_gallery_writes_the_payload_and_seed_it_always_did():
     assert list(json.loads(pdp["product_payload"])) == ["enrichment_meta"]
     assert json.loads(plan["seeds"][0]["seed_data"])["image_urls"] == []
     # and a record from a lane that never carries one (no pdp.image_urls at all)
-    rec = _record(_product(_src("a.jpg")))
+    rec = _record(_product(_src("a.jpg", "b.jpg")))
     rec["pdp"].pop("image_urls")
     plan = _plan(rec)
     assert list(json.loads(plan["pdps"][0]["product_payload"])) == ["enrichment_meta"]
+    assert json.loads(plan["seeds"][0]["seed_data"])["image_urls"] == [f"{CDN}/a.jpg"]
+
+
+def test_a_one_image_record_gallery_writes_nothing_so_the_row_never_churns():
+    rec = _record(_product(_src("a.jpg")))
+    rec["pdp"]["image_urls"] = [f"{CDN}/a.jpg", f"{CDN}/a.jpg?v=9"]  # one image, however it is spelled
+    plan = _plan(rec)
+    assert list(json.loads(plan["pdps"][0]["product_payload"])) == ["enrichment_meta"]
+    assert json.loads(plan["seeds"][0]["seed_data"])["image_urls"] == [f"{CDN}/a.jpg"]
+
+
+def test_with_the_flag_off_a_replayed_record_gallery_writes_nothing(monkeypatch):
+    rec = _record(_product(_src("a.jpg", "b.jpg")))
+    assert rec["pdp"]["image_urls"] == [f"{CDN}/a.jpg", f"{CDN}/b.jpg"]
+    bare = json.loads(json.dumps(rec))
+    bare["pdp"].pop("image_urls")
+    monkeypatch.delenv(ingestion.STRUCTURED_GALLERY_FLAG)
+    replayed, main = _plan(rec), _plan(bare)
+    for plan in (replayed, main):
+        for pdp in plan["pdps"]:
+            pdp.pop("pivota_signature_minted_at")  # the clock's, on main too
+    assert replayed == main
+    assert list(json.loads(replayed["pdps"][0]["product_payload"])) == ["enrichment_meta"]
+    assert json.loads(replayed["seeds"][0]["seed_data"])["image_urls"] == [f"{CDN}/a.jpg"]
+
+
+def test_a_retailer_rows_gallery_stays_in_its_payload_and_its_seed_keeps_one_image():
+    """The view takes ONE seed per content_key cluster and appends its images, whichever row it is attached
+    to: a retailer's seed in a brand's cluster must not put the retailer's pictures on the brand's page."""
+    rec = _record(_product(_src("a.jpg", "b.jpg")), source_role="retailer", retailer_name=HOST)
+    plan = _plan(rec)
+    assert json.loads(plan["pdps"][0]["product_payload"])["image_urls"] == [f"{CDN}/a.jpg", f"{CDN}/b.jpg"]
     assert json.loads(plan["seeds"][0]["seed_data"])["image_urls"] == [f"{CDN}/a.jpg"]
 
 
@@ -246,6 +330,7 @@ def test_the_payload_is_byte_identical_to_main_but_for_the_gallery_key():
     assert with_gallery["skus"] == without["skus"] and with_gallery["offers"] == without["offers"]
     seed_a, seed_b = (json.loads(p["seeds"][0]["seed_data"]) for p in (with_gallery, without))
     assert seed_a.pop("image_urls") == [f"{CDN}/a.jpg", f"{CDN}/b.jpg"] and seed_b.pop("image_urls") == [f"{CDN}/a.jpg"]
+    assert seed_a.pop("image_urls_source") == "storefront_products_json" and "image_urls_source" not in seed_b
     assert seed_a == seed_b
 
 
@@ -274,6 +359,7 @@ def test_only_the_rows_own_listing_seed_carries_the_gallery():
                                           offers=ingestion._validated_offers(rec))
     assert [json.loads(s["seed_data"])["image_urls"] for s in seeds] == [
         [f"{CDN}/a.jpg", f"{CDN}/b.jpg"], [f"{CDN}/copy.jpg"]]
+    assert [json.loads(s["seed_data"]).get("image_urls_source") for s in seeds] == ["storefront_products_json", None]
 
 
 # ---- the apply contract: the gallery rides product_payload, a canonical-owner column ----------------------
@@ -305,13 +391,55 @@ async def test_an_off_market_store_never_replaces_the_owning_stores_gallery():
     owner = _brand_official_plan("owner-store.example", ["owner-a.jpg", "owner-b.jpg"])["pdps"][0]
     stored = {k: owner[k] for k in ("product_key", "brand", "source_domain", "canonical_url", "image_url")}
     stored["product_payload"] = owner["product_payload"]  # JSONB arrives as text from a raw fetch
-    plan = _brand_official_plan("second-store.example", ["second-a.jpg"])
+    plan = _brand_official_plan("second-store.example", ["second-a.jpg", "second-b.jpg"])
     assert plan["pdps"][0]["product_key"] == owner["product_key"]
+    assert json.loads(plan["seeds"][0]["seed_data"])["image_urls"] == [f"{CDN}/second-a.jpg", f"{CDN}/second-b.jpg"]
+    assert _stamp(plan) == "storefront_products_json"
     guarded, counts = await writer._guard_canonical_owner(plan, _Stored(stored), market="AU")
     assert counts["pdps_offer_only_canonical_owner"] == 1
     kept = json.loads(guarded["pdps"][0]["product_payload"])
     assert kept["image_urls"] == [f"{CDN}/owner-a.jpg", f"{CDN}/owner-b.jpg"]
     assert guarded["pdps"][0]["image_url"] == f"{CDN}/owner-a.jpg"
+    # Its own seed still lands (attached to the owner's product), with its one image: exactly the seed
+    # main writes, byte for byte, so its pictures never reach the owner's page through the view's seed.
+    (seed,) = guarded["seeds"]
+    bare = _brand_official_plan("second-store.example", ["second-a.jpg"])["seeds"][0]
+    assert seed == bare  # gallery and its stamp both gone
+    assert "image_urls_source" not in seed["seed_data"]
+    assert json.loads(plan["seeds"][0]["seed_data"])["image_urls"][1:]  # the caller's plan is not rewritten
+
+
+async def test_only_the_guarded_products_seed_loses_its_gallery():
+    """One plan, two products: the one another store owns is applied offer-only and its seed loses the
+    gallery; the other product, which this store owns, keeps its seed's gallery and stamp."""
+    owner = _brand_official_plan("owner-store.example", ["owner-a.jpg", "owner-b.jpg"])["pdps"][0]
+    stored = {k: owner[k] for k in ("product_key", "brand", "source_domain", "canonical_url", "image_url",
+                                    "product_payload")}
+    records = [
+        feed.shopify_product_to_record(_product(_src(*images), title=title, handle=handle), domain="second-store.example",
+                                       category_path="beauty", currency="AUD", brand_override="Example Gallery",
+                                       emit_native_variants=True)
+        for title, handle, images in (("Glow Serum", "glow-serum", ["s-a.jpg", "s-b.jpg"]),
+                                      ("Night Balm", "night-balm", ["n-a.jpg", "n-b.jpg"]))]
+    plan = ingestion.ingest_validated_jsonl(records, market="AU")
+    guarded, counts = await writer._guard_canonical_owner(plan, _Stored(stored), market="AU")
+    assert counts["pdps_offer_only_canonical_owner"] == 1
+    by_key = {s["attached_product_key"]: json.loads(s["seed_data"]) for s in guarded["seeds"]}
+    assert by_key[owner["product_key"]]["image_urls"] == [f"{CDN}/s-a.jpg"]
+    assert "image_urls_source" not in by_key[owner["product_key"]]
+    (other,) = [v for k, v in by_key.items() if k != owner["product_key"]]
+    assert other["image_urls"] == [f"{CDN}/n-a.jpg", f"{CDN}/n-b.jpg"]
+    assert other["image_urls_source"] == "storefront_products_json"
+
+
+def test_a_seed_without_a_gallery_is_left_as_it_is():
+    plan = _brand_official_plan("owner-store.example", ["owner-a.jpg"])
+    (seed,) = plan["seeds"]
+    assert writer._seed_without_gallery(seed) is seed
+    assert writer._seed_without_gallery({**seed, "seed_data": "{not json"})["seed_data"] == "{not json"
+    no_image = {**seed, "image_url": None,
+                "seed_data": json.dumps({"image_urls": [f"{CDN}/a.jpg", f"{CDN}/b.jpg"]})}
+    assert json.loads(writer._seed_without_gallery(no_image)["seed_data"]) == {"image_urls": []}
 
 
 async def test_the_owning_store_re_crawling_off_market_replaces_its_own_gallery():
