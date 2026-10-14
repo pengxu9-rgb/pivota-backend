@@ -580,3 +580,82 @@ def test_connected_get_product_detail_hands_the_metadata_market_to_the_gate(monk
     })
     assert res.status_code == 200, res.text
     assert seen == {"request_market": "SG", "find_request_market": "JP"}
+
+
+# ── 2b. find_products_multi seed lane: the card's price is the cart variant's ─────────────────
+#
+# The card is product-grain and priced at the seed-level `price_amount`. On a seed storing
+# several variants, its cart (operator-attached id, seed stamp or catalog hand-over) could be a
+# different variant at a different price: a $19 card whose cart is the $29 size. Review of #2623
+# (controller, 2026-10-14) named this the last reachable spot of the wrong-variant-cart class.
+
+_B_VARIANT = "46123456789"
+
+
+def _multi_variant_row(*, b_price: float = 29.0, attached: bool = True, **over: Any) -> Dict[str, Any]:
+    row = dict(_MULTI_ROW)
+    seed_data: Dict[str, Any] = {
+        "brand": "Fenty Beauty",
+        "variants": [
+            {"variant_id": "SKU-30", "title": "30ml", "price_amount": 19.0, "price_currency": "USD"},
+            {"variant_id": "SKU-50", "title": "50ml", "price_amount": b_price, "price_currency": "USD",
+             "shopify_variant_id": _B_VARIANT},
+        ],
+    }
+    if attached:
+        row.update(attached_product_key="prod::m_fenty::shopify::widget",
+                   attached_variant_id=_B_VARIANT)
+    else:
+        seed_data.update(_SHOPIFY_SNAPSHOT)  # the sole stamped snapshot id is the $29 variant
+    row["seed_data"] = seed_data
+    row.update(over)
+    return row
+
+
+def _assert_referral_card(card: Dict[str, Any]) -> None:
+    assert not card.get("cart_url"), card
+    assert card["tracking"]["join_mode"] == "referral_only", card
+    payload = _payload(card["external_redirect_url"])
+    assert "/cart/" not in payload["dest"], "the signed /r destination must be the PDP"
+    assert payload["ctx"]["join_mode"] == "referral_only"
+
+
+async def test_multi_a_19_card_is_not_handed_the_29_variants_attached_cart(monkeypatch):
+    _enforce(monkeypatch, on=False)
+    (card,) = await _multi_seed_cards(monkeypatch, [_multi_variant_row()], search_market="US")
+    assert float(card["price"]) == 19.0
+    _assert_referral_card(card)
+
+
+async def test_multi_a_19_card_is_not_handed_the_29_variants_stamped_cart(monkeypatch):
+    """Same defect through the seed-stamp hand-over, not the operator id."""
+    _enforce(monkeypatch, on=False)
+    (card,) = await _multi_seed_cards(
+        monkeypatch, [_multi_variant_row(attached=False)], search_market="US")
+    _assert_referral_card(card)
+
+
+async def test_multi_a_card_priced_as_its_cart_variant_keeps_the_cart(monkeypatch):
+    """The cart variant's own price and currency equal the card's: the price IS that variant's."""
+    _enforce(monkeypatch, on=False)
+    (card,) = await _multi_seed_cards(
+        monkeypatch, [_multi_variant_row(b_price=19.0)], search_market="US")
+    _assert_cart_card(card)
+    assert f"/cart/{_B_VARIANT}:1" in card["cart_url"]
+
+
+async def test_multi_a_cart_variant_in_another_currency_is_not_kept(monkeypatch):
+    _enforce(monkeypatch, on=False)
+    row = _multi_variant_row(b_price=19.0)
+    row["seed_data"]["variants"][1]["price_currency"] = "GBP"
+    (card,) = await _multi_seed_cards(monkeypatch, [row], search_market="US")
+    _assert_referral_card(card)
+
+
+async def test_multi_two_entries_carrying_the_cart_id_keep_no_cart(monkeypatch):
+    """Which entry's price is the cart's cannot be said, so neither is."""
+    _enforce(monkeypatch, on=False)
+    row = _multi_variant_row(b_price=19.0)
+    row["seed_data"]["variants"][0]["shopify_variant_id"] = _B_VARIANT
+    (card,) = await _multi_seed_cards(monkeypatch, [row], search_market="US")
+    _assert_referral_card(card)
