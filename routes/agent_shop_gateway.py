@@ -9025,8 +9025,20 @@ def _external_seed_redirect_identity(
             and canonical_variant_id(attached_variant_id) != _catalog_vid
         ):
             cart_variant_id = None
+        elif _catalog_vid:
+            cart_variant_id = _catalog_vid
+        elif _operator_vid and _attached_variant_is_this_offer(
+            seed_data, offer_variant_id=offer_variant_id, attached_variant_id=attached_variant_id
+        ):
+            cart_variant_id = _operator_vid
         else:
-            cart_variant_id = _catalog_vid or _operator_vid
+            # THE OPERATOR ID NAMES ONE VARIANT, AND THIS OFFER MAY BE ANOTHER. It is seed-wide,
+            # so on a multi-variant seed every per-variant offer used to carry a cart for that
+            # one variant: review of #2620 (2026-10-14) shipped an in-stock $19 offer with
+            # `cart_prefilled: true` and a cart for the sold-out $29 sibling. A price belongs to
+            # the exact variant it was quoted for, so an offer that is not the attached variant
+            # gets the referral, not someone else's cart.
+            cart_variant_id = None
 
     return {
         "merchant_id": merchant_id,
@@ -9038,6 +9050,43 @@ def _external_seed_redirect_identity(
         "seller_ref": seller_ref,
         "seed_kind": seed_kind,
     }
+
+
+#: Every key a stored seed variant may carry its own identity under. Wider than
+#: `_seed_offer_variant_id`'s chain on purpose: an operator may attach the Shopify id while the
+#: variant's first-found id is its SKU, and that variant still IS the attached one.
+_SEED_VARIANT_IDENTITY_KEYS = (
+    "variant_id", "variantId", "id", "sku", "sku_id", "shopify_variant_id", "source_variant_id",
+)
+
+
+def _attached_variant_is_this_offer(
+    seed_data: Dict[str, Any], *, offer_variant_id: Optional[str], attached_variant_id: Optional[str]
+) -> bool:
+    """May a seed-wide `attached_variant_id` name the cart of the offer for `offer_variant_id`?
+
+    Yes when there is nothing to choose between — a product-grain call (no offer variant) or a
+    seed serving at most one variant — and otherwise only when the offer's own stored variant
+    answers to the attached id. An offer we cannot find among the stored variants is compared
+    by its id alone. Ids are compared canonically, so a gid and its bare number agree.
+    """
+    target = canonical_variant_id(attached_variant_id)
+    if not target:
+        return False
+    offer = str(offer_variant_id or "").strip()
+    if not offer:
+        return True
+    served = _seed_variants(seed_data)
+    if len(served) <= 1:
+        return True
+    mine = [v for v in served if _seed_offer_variant_id(v) == offer]
+    if not mine:
+        return canonical_variant_id(offer) == target
+    return any(
+        canonical_variant_id(v.get(key)) == target
+        for v in mine
+        for key in _SEED_VARIANT_IDENTITY_KEYS
+    )
 
 
 def resolve_cart_permalink(
