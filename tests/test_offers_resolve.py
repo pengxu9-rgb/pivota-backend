@@ -5178,6 +5178,8 @@ def _assert_cart(offer: dict) -> None:
     assert _ctx_of(offer)["join_mode"] == "cart_permalink"
     assert "purchasability_tier" not in _ctx_of(offer), (
         "an undeclined token must be byte-identical to a pre-gate one")
+    assert "stock_declined" not in _ctx_of(offer), (
+        "an undeclined token must be byte-identical to a pre-gate one")
 
 
 def test_a_browse_only_merchant_is_minted_a_referral_not_a_prefilled_cart(
@@ -5438,3 +5440,116 @@ async def test_a_no_card_payment_merchant_keeps_its_cart_and_a_login_wall_loses_
         monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
     _assert_referral_only(offer)
     assert offer["cart_prefilled"] is False
+
+
+# ---------------------------------------------------------------------------
+# THE OFFER'S OWN STOCK at the mint (offers.resolve)
+#
+# Prod 2026-10-14, get_offers(tangleangel_gb_6826386948176, market=GB): one offer,
+# `in_stock: false`, beside `cart_prefilled: true`, rail `shopify_cart`, join_mode
+# `cart_permalink`. The seed's fresh column said out_of_stock; the preflight is shadow-only and the
+# purchasability gate asks about the merchant x market, so nothing on the mint path read the item's
+# stock. The row below is that seed's shape: column + top-level variant out of stock (the nightly
+# refresh's fresh read), and a single July `snapshot.variants` entry still "in_stock" carrying the
+# stamped Shopify id the cart is built from.
+# ---------------------------------------------------------------------------
+
+
+def _sold_out_seed_row(*, column: str = "out_of_stock", variant: str = "out_of_stock") -> dict:
+    row = _seed_row_for_exec_spec(evidence=True)
+    row["availability"] = column
+    row["seed_data"] = {
+        **row["seed_data"],
+        "availability": column,
+        "variants": [{"variant_id": "32318", "title": "Serum", "price_amount": 19.0,
+                      "availability": variant}],
+    }
+    return row
+
+
+def test_an_offer_served_out_of_stock_is_not_handed_a_prefilled_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """The defect, in prod posture: enforcement armed, the merchant purchasable in this market,
+    the warm lane allowlisting this host. Before the fix: `in_stock: False` AND a /cart/ dest."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+
+    offer = _resolve_seed_offers(monkeypatch, client, rows=[_sold_out_seed_row()], market="US")[0]
+
+    assert offer["in_stock"] is False, "the precondition: the offer itself says sold out"
+    spec = offer["execution_spec"]
+    assert spec["cart_url"] is None, spec
+    assert spec["tracking"]["join_mode"] == "referral_only", spec
+    assert "/cart/" not in _dest_of(offer), "the signed /r destination must be the PDP"
+    assert _ctx_of(offer)["join_mode"] == "referral_only"
+    assert _ctx_of(offer)["stock_declined"] == "out_of_stock"
+    assert "purchasability_tier" not in _ctx_of(offer), "a stock decline is not a merchant fact"
+    assert offer["cart_prefilled"] is False, "provable: the warm lane knocks the token out"
+    assert spec["rail"] == "referral"
+    assert spec["pdp_url"], "a decline removes the cart, never the product page"
+    assert offer["affiliate_url"], "and never the offer"
+    assert calls == [], "a cart that will not be built never asks the purchasability fact"
+
+
+def test_the_out_of_stock_link_really_does_land_on_the_pdp_when_followed(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """Through the real `GET /r`. Without the knockout the warm lane would upgrade the cold PDP
+    into the cart the mint just withheld."""
+    import routes.outbound_links as outbound_routes
+    import services.outbound_warm_handoff as warm
+
+    offer = _resolve_seed_offers(monkeypatch, client, rows=[_sold_out_seed_row()], market="US")[0]
+
+    eligible, reason = warm.evaluate_warm_eligibility(
+        dest=_dest_of(offer), user_agent=_WARM_HUMAN_UA, token=_token_of(offer),
+        ctx=_ctx_of(offer), settings=warm_lane,
+    )
+    assert (eligible, reason) == (False, "stock_declined")
+
+    asked: list = []
+
+    async def _fake_resolve(**kwargs):
+        asked.append(kwargs)
+        return {"continue_url": "https://brand.myshopify.com/cart/c/abc123?key=k", "cart_id": "c_1"}
+
+    async def _fake_log(**kwargs):
+        return None
+
+    warm.memo_clear()
+    monkeypatch.setattr(outbound_routes, "resolve_warm_handoff", _fake_resolve)
+    monkeypatch.setattr(outbound_routes, "log_outbound_click", _fake_log)
+    try:
+        res = client.get("/r", params={"token": _token_of(offer)},
+                         headers={"user-agent": _WARM_HUMAN_UA}, follow_redirects=False)
+    finally:
+        warm.memo_clear()
+    assert res.status_code == 302, res.text
+    assert res.headers["location"] == _dest_of(offer)
+    assert "/cart/" not in res.headers["location"]
+    assert asked == [], "the warm lane must not even ask the gateway for a sold-out offer"
+
+
+def test_unknown_stock_keeps_its_cart(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    """Only an explicit False declines. A column the stored variant contradicts makes the offer
+    unknown, and unknown is servable everywhere in this repo — a decline here would delete carts
+    on no evidence."""
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_sold_out_seed_row(variant="in_stock")], market="US")[0]
+    assert "in_stock" not in offer and offer.get("availability") == "unknown", offer
+    _assert_cart(offer)
+
+
+def test_an_in_stock_offer_keeps_its_cart_byte_identical(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    offer = _resolve_seed_offers(
+        monkeypatch, client,
+        rows=[_sold_out_seed_row(column="in_stock", variant="in_stock")], market="US")[0]
+    assert offer["in_stock"] is True
+    _assert_cart(offer)
+    assert offer["execution_spec"]["rail"] == "shopify_cart"
+
