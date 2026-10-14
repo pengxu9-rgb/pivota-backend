@@ -2829,9 +2829,12 @@ async def prepare_reap_purchase_selection(
             )
             unnamed: Optional[Tuple[int, str]] = None
             if variant_key is None:
-                # The no-key path: the witness names the sku this load PRICED. The create that
-                # carries the witness NAMES that sku, so it is loaded by name below and must give
-                # the same variant and price -- a witness create would refuse is never handed out.
+                # The no-key path: the witness names the sku this load PRICED, and that sku is loaded
+                # by name below, as a create naming it would load it. (Within this one snapshot the
+                # two loads read the same rows, so the price check after it is a backstop that does
+                # not fire today.) A `::canonical` key pins NO variant at create -- like a no-key
+                # create, the proof is the identity -- so a door creates by `variant_id`, which is
+                # held to the selected variant (`_require_selected_variant`).
                 priced: Dict[str, Any] = {}
                 no_key_facts, _seller, no_key_variant, _kind = await _load_cart_link_item(
                     merchant_domain=merchant_host, product_key=product_key,

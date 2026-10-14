@@ -104,7 +104,11 @@ priced per spelling; the priced spellings must agree (`row_price_ambiguous`) and
 key is named. A product whose only variant it is, or that has only its `::canonical`
 placeholder, takes the no-key path, and the witness names the SKU that load priced -- which
 must then load by name (as the create carrying the witness names it) to the same variant and
-price, else the preparation refuses. The existing cart-link reader validates active attached
+price, else the preparation refuses. **Create from a witness with `variant_id` (and the
+witness's money), not with its `variant_key`.** A `variant_id` create is held to that variant;
+a `variant_key` naming the `::canonical` placeholder pins no variant (exactly as a create with no
+key: the storefront proof is the identity), so a proof that moved between prepare and create
+would go unnoticed. The existing cart-link reader validates active attached
 source, seller identity, current storefront proof and the selected SKU's own offer. Missing,
 expired or contradictory evidence refuses. Preparation requires its usable own offers to
 agree on exact currency and minor price, and enforces the same current agent, domain, market,

@@ -236,10 +236,11 @@ async def test_prepare_own_price_and_resolved_scope_not_caller_guessed(client, m
     assert response.status_code == 404 and error(response) == "not_available_on_this_rail"
     assert await unchanged_state() == before
 
-def create_body(witness, idempotency_key):
-    """The create body a door sends from a prepare witness: its key, its money, nothing guessed."""
+def create_body(witness, idempotency_key, *, by="variant_key"):
+    """The create body a door sends from a prepare witness: its money, and its sku (`variant_key`) or
+    its storefront id (`by="variant_id"`, which the create pins the variant to) -- nothing guessed."""
     return {'item_source': 'cart_link', 'merchant_domain': witness['merchant_domain'],
-                'product_key': witness['product_key'], 'variant_key': witness['variant_key'],
+                'product_key': witness['product_key'], by: witness[by],
                 'quantity': witness['quantity'], 'idempotency_key': idempotency_key,
                 'expected_unit_price_minor': witness['unit_price_minor'],
                 'expected_currency': witness['currency'],
@@ -358,6 +359,78 @@ async def test_prepare_never_hands_out_a_witness_its_create_would_refuse(client,
     before = await unchanged_state()
     response = await client.post(BASE, json=body())
     assert response.status_code == 409 and error(response) == "row_variant_unverified", response.text
+    assert await unchanged_state() == before
+
+
+async def make_placeholder_only():
+    placeholder = PRODUCT + "::canonical"
+    await database.execute("UPDATE catalog_skus SET sku_key=:placeholder,source_variant_id=:pk WHERE sku_key=:sku", {"placeholder": placeholder, "pk": PRODUCT, "sku": SKU})
+    await database.execute("UPDATE catalog_offers SET sku_key=:placeholder WHERE sku_key=:sku", {"placeholder": placeholder, "sku": SKU})
+    return placeholder
+
+
+async def edit_seed_snapshot(edit):
+    raw = await database.fetch_val("SELECT seed_data FROM external_product_seeds WHERE id=:id", {"id": SEED})
+    data = json.loads(raw)
+    edit(data["snapshot"])
+    await database.execute("UPDATE external_product_seeds SET seed_data=:data WHERE id=:id", {"data": json.dumps(data), "id": SEED})
+
+
+async def test_prepare_placeholder_only_pins_the_requested_variant(client, monkeypatch):
+    """The storefront proof is a placeholder-only row's only identity: a request for any other
+    variant than the one it proves is refused, never answered with the proven one."""
+    await seed(monkeypatch)
+    await make_placeholder_only()
+    before = await unchanged_state()
+    response = await client.post(BASE, json=body(variant_id="9"))
+    assert response.status_code == 409 and error(response) == "row_variant_unverified", response.text
+    assert "selection" not in response.json()
+    assert await unchanged_state() == before
+
+
+@pytest.mark.parametrize("placeholder_only", [True, False])
+async def test_a_variant_id_create_from_a_witness_is_pinned_when_the_proof_moves(client, monkeypatch, placeholder_only):
+    """A create BY variant_id is held to that variant (`_require_selected_variant`) whatever sku the
+    witness named -- the placeholder included, which as a `variant_key` names no variant at all.
+    The storefront proof moving to another variant between prepare and create refuses the create."""
+    await seed(monkeypatch)
+    if placeholder_only:
+        await make_placeholder_only()
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 200, response.text
+    witness = response.json()["selection"]
+
+    def move(snapshot):
+        snapshot["shopify_cart_proof"]["variant_id"] = "44444444444444"
+        snapshot["variants"][0]["shopify_variant_id"] = "44444444444444"
+    await edit_seed_snapshot(move)
+    created = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-pinned-' + str(placeholder_only), by="variant_id"))
+    assert created.status_code == 409 and error(created) == "row_variant_unverified", created.text
+    assert await database.fetch_val('SELECT COUNT(*) FROM reap_agentic_purchases') == 0
+
+
+OTHER_VARIANT = "49819267301654"
+
+
+@pytest.mark.parametrize("other", [SPELLED_AFTER, SPELLED_BEFORE])
+async def test_prepare_multi_variant_product_with_a_dual_spelled_selection_names_the_lowest_key(client, monkeypatch, other):
+    """A two-variant product, the selected one spelled by two writers: the resolver's per-spelling
+    branch (not the sole-variant no-key path) prices both spellings and names the lowest key."""
+    await seed(monkeypatch)
+    await add_spelling(PRODUCT + "::sku_other_variant", source_variant_id=EXT + ":" + OTHER_VARIANT, price="15.00")
+    await add_spelling(other)
+
+    def two_variants(snapshot):
+        proof = dict(snapshot.pop("shopify_cart_proof"))
+        snapshot["variants"].append({"title": "Other shade", "price": "15.00", "shopify_variant_id": OTHER_VARIANT})
+        snapshot["shopify_cart_variant_proofs"] = {VARIANT: {**proof, "scope": "buyer_selected_variant", "available": True, "live_variant_count": 2}}
+    await edit_seed_snapshot(two_variants)
+    before = await unchanged_state()
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 200, response.text
+    witness = response.json()["selection"]
+    assert witness["variant_key"] == min(SKU, other)
+    assert (witness["variant_id"], witness["unit_price_minor"], witness["currency"]) == (VARIANT, 1399, "USD")
     assert await unchanged_state() == before
 
 
