@@ -448,7 +448,66 @@ def _offer_price_is_exact(offer: Dict[str, Any]) -> bool:
 
 # Per-variant provenance the extractor attaches for `routes/employee_products`'s reconcile.
 # Stored on the snapshot evidence; never on a seed (see `seed_variants_from_evidence`).
-READ_PROVENANCE_KEYS = ("price_exact", "offer_aggregate", "id_collided")
+READ_PROVENANCE_KEYS = ("price_exact", "offer_aggregate", "id_collided", "offer_shopify_variant_id")
+
+
+# THE SHOPIFY VARIANT AN OFFER NAMES IN ITS OWN LINK. A Shopify storefront's JSON-LD names each
+# size offer by `@id` "/products/<handle>?variant=<digits>#offer" (or a `url` carrying ?variant=),
+# often with no `sku`, so `variant_id` is that whole string -- while the retailer-ingest drain
+# stores the merchant's numeric variant id. The digits are read into `offer_shopify_variant_id`
+# so the seed refresh's reconcile can match the two and re-read per-size prices.
+#
+# A SEPARATE FIELD, NOT `variant_id` and NOT `shopify_variant_id`. `variant_id` keeps what the
+# serving builders and the de-dupe key on. `shopify_variant_id` is the cart-proof stamp
+# (`services/shopify_variant_identity`) that prefills a cart permalink; a link on a page proves
+# nothing about the cart. And it is read provenance: a seed never stores it, so what the seed
+# refresh compares to decide whether a read may REPLACE a seed's variants is unchanged.
+_SHOPIFY_PRODUCT_PATH = re.compile(r"/products/([^/]+?)(?:\.(?:js|json))?/?$")
+
+
+def _shopify_product_ref(url: str) -> Optional[Tuple[str, str]]:
+    """(host without www., handle) of a Shopify product URL, or None."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    match = _SHOPIFY_PRODUCT_PATH.search(parsed.path or "")
+    if not host or not match:
+        return None
+    return (host[4:] if host.startswith("www.") else host), unquote(match.group(1)).lower()
+
+
+def _offer_shopify_variant_id(offer: Dict[str, Any], item: Dict[str, Any], page_urls: Tuple[str, ...]) -> Optional[str]:
+    """The ?variant= digits the offer's own `@id`/`url` carry, when they name THIS page's product.
+
+    None unless every ?variant= the offer carries is digits, all agree, and each sits on a link to
+    the page's own product (its canonical or fetched URL, www-insensitive). A ?variant= on another
+    product's link -- a related product's offer, a bundle component -- names that product's variant.
+    """
+    page_products = {ref for ref in (_shopify_product_ref(u) for u in page_urls if u) if ref}
+    if not page_products:
+        return None
+    named: set = set()
+    for node in (offer, item):
+        for key in ("@id", "url"):
+            raw = node.get(key)
+            if not isinstance(raw, str) or "variant=" not in raw:
+                continue
+            try:
+                absolute = urljoin(page_urls[0], raw.strip())
+                values = [v for k, v in parse_qsl(urlparse(absolute).query, keep_blank_values=True) if k == "variant"]
+            except ValueError:  # a malformed link names nothing, and must not fail the page's read
+                return None
+            if not values:
+                continue
+            if _shopify_product_ref(absolute) not in page_products:
+                return None
+            for value in values:
+                if not (value.isascii() and value.isdigit()):
+                    return None
+                named.add(value)
+    return next(iter(named)) if len(named) == 1 else None
 
 
 def seed_variants_from_evidence(evidence: Any) -> Optional[list[Dict[str, Any]]]:
@@ -466,7 +525,7 @@ def seed_variants_from_evidence(evidence: Any) -> Optional[list[Dict[str, Any]]]
 
 
 def _offer_variants_from_node(
-    offers: Any, product_name: Optional[str], signals: PriceSignals = NO_SIGNALS
+    offers: Any, product_name: Optional[str], signals: PriceSignals = NO_SIGNALS, page_urls: Tuple[str, ...] = ()
 ) -> list[Dict[str, Any]]:
     if offers is None:
         return []
@@ -533,6 +592,7 @@ def _offer_variants_from_node(
         price_amount, price_status = _read_price(price_raw, currency, signals, jsonld=True)
         availability_raw = offer.get("availability") or item.get("availability")
         availability = _availability_from_raw(str(availability_raw)) if availability_raw else "unknown"
+        shopify_variant = _offer_shopify_variant_id(offer, item, page_urls)
 
         variants.append(
             {
@@ -545,6 +605,7 @@ def _offer_variants_from_node(
                 # Transient, popped with `_offer_ref`: why a price the page carried was not read.
                 "_price_refused": price_status if _has_price_raw(price_raw) and price_amount is None else None,
                 **({"offer_aggregate": True} if _is_aggregate_offer(offer) else {}),
+                **({"offer_shopify_variant_id": shopify_variant} if shopify_variant else {}),
                 # Transient: WHICH offer object this came from. `_iter_jsonld_nodes` visits a
                 # Product's offers twice (via the Product, then as Offer nodes), so only object
                 # identity tells a real id collision from a second visit. Popped by the caller.
@@ -769,7 +830,7 @@ def _extract_jsonld_variants(parsed_objs: list[Any]) -> list[Dict[str, Any]]:
 
 
 def _extract_jsonld_variants_with_census(
-    parsed_objs: list[Any], signals: PriceSignals = NO_SIGNALS
+    parsed_objs: list[Any], signals: PriceSignals = NO_SIGNALS, page_urls: Tuple[str, ...] = ()
 ) -> Tuple[list[Dict[str, Any]], Dict[str, Any]]:
     """The page's JSON-LD variants, one per id, plus what the de-dupe would otherwise hide.
 
@@ -795,9 +856,9 @@ def _extract_jsonld_variants_with_census(
 
             product_name = node.get("name") if isinstance(node.get("name"), str) else None
             if "product" in tset:
-                variants += _offer_variants_from_node(node.get("offers"), product_name, signals)
+                variants += _offer_variants_from_node(node.get("offers"), product_name, signals, page_urls)
             elif "offer" in tset:
-                variants += _offer_variants_from_node(node, product_name, signals)
+                variants += _offer_variants_from_node(node, product_name, signals, page_urls)
 
             if len(variants) >= MAX_VARIANTS:
                 break
@@ -1601,7 +1662,9 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     meta_image_urls = _extract_meta_image_urls(p, canonical)
     data_attr_image_urls = _extract_image_urls_from_data_attrs(html, canonical)
     dom_image_urls = _extract_dom_image_urls(p, canonical)
-    variants_jsonld, jsonld_census = _extract_jsonld_variants_with_census(parsed_jsonld, signals)
+    variants_jsonld, jsonld_census = _extract_jsonld_variants_with_census(
+        parsed_jsonld, signals, page_urls=(canonical, base_url)
+    )
     fallback_currency = jsonld.get("currency") or currency
     variants_data_attr = _extract_variants_from_data_attrs(html, fallback_currency, canonical, signals)
     price_read = _read_product_price(jsonld, price, currency, signals)
