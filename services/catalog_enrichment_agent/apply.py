@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from services.catalog_enrichment_agent.bulk_writer import bulk_upsert
 from services.catalog_enrichment_agent.ingestion import AGENT_VERSION, _domain_of, derive_offer_id
@@ -2683,28 +2683,43 @@ async def _apply_ingest_plan_batched(
 
 
 _CURRENT_LISTINGS_SQL = """
-                SELECT product_key, canonical_url FROM catalog_products
+                SELECT product_key, canonical_url, source_domain FROM catalog_products
                 WHERE product_key = ANY(:product_keys)
                 """
 
 
 async def current_listings(product_keys: List[str], *, db: Any) -> Dict[str, Any]:
-    """product_key -> the (host, listing) its catalog row names today (ingestion.content_listing of its
-    canonical_url), for ingestion.elect_listing_keeper's tie-break: a re-ingest keeps the listing a row
-    already names -- the one scripts/repair_same_title_listings.py aligned it to -- unless a stronger
-    rule says otherwise. Read-only; keys with no row or no readable URL are absent."""
+    """product_key -> (host, listing, canonical_url): the listing its catalog row names today
+    (ingestion.content_listing of its canonical_url) and that URL as stored. The listing is
+    ingestion.elect_listing_keeper's tie-break: a re-ingest keeps the listing a row already names -- the
+    one scripts/repair_same_title_listings.py aligned it to -- unless a stronger rule says otherwise. The
+    URL's host spelling (`www.` or not) is the one a re-ingest writes (ingestion.respell_listing_host).
+    Read-only; keys with no row or no readable URL are absent."""
+    stored = await _stored_rows(product_keys, db=db)
+    return _listings_of({k: url for k, (url, _source_domain) in stored.items()})
+
+
+def _listings_of(stored: Dict[str, str]) -> Dict[str, Any]:
     from services.catalog_enrichment_agent.ingestion import content_listing
 
+    out = {}
+    for key, url in stored.items():
+        listing = content_listing(url)
+        if listing:
+            out[key] = (*listing, url)
+    return out
+
+
+async def _stored_rows(product_keys: List[str], *, db: Any) -> Dict[str, Tuple[str, Optional[str]]]:
+    """product_key -> (canonical_url, source_domain) as stored (one SELECT); keys with no row or no URL are
+    absent, and source_domain is None when the row has none."""
     keys = sorted({str(k) for k in product_keys if k})
     if not keys:
         return {}
     rows = await db.fetch_all(_CURRENT_LISTINGS_SQL, {"product_keys": keys})
-    out = {}
-    for row in rows:
-        listing = content_listing(row["canonical_url"])
-        if listing:
-            out[str(row["product_key"])] = listing
-    return out
+    return {str(row["product_key"]): (str(row["canonical_url"]).strip(),
+                                      str(row["source_domain"] or "").strip() or None)
+            for row in rows if str(row["canonical_url"] or "").strip()}
 
 
 def content_keys_of(plan: Dict[str, Any]) -> List[str]:
@@ -2714,22 +2729,40 @@ def content_keys_of(plan: Dict[str, Any]) -> List[str]:
     return sorted(k for k in keys if k and not k.startswith("ext:retailer:"))
 
 
+def retailer_keys_of(plan: Dict[str, Any]) -> List[str]:
+    """Every `ext:retailer:` row a plan writes: its listing never moves, but the host spelling its offers and
+    seeds were minted under still matters (ingestion.ingest_validated_jsonl `listing_spellings`)."""
+    keys = {str(p.get("product_key") or "") for p in plan.get("pdps") or []}
+    return sorted(k for k in keys if k.startswith("ext:retailer:"))
+
+
 async def plan_with_current_listings(records: List[Dict[str, Any]], *, db: Any, market: Optional[str] = None,
                                      source_jsonl: Optional[str] = None,
                                      allow_moves: Any = (), planner: Any = None) -> Dict[str, Any]:
     """ingestion.ingest_validated_jsonl with the listing each of its rows names today, so the plan never
     moves a row off it (`listing_moves`) -- the one way every lane that holds a catalog handle plans.
-    `current_listings.status` says what was read. `planner` is the caller's own ingest_validated_jsonl
-    (the name its tests patch)."""
+    `current_listings.status` says what was read for the content-keyed rows; `listing_spellings.status` says
+    the same of the `ext:retailer:` rows, read only for the host spelling their offers, seeds and variant SKUs
+    already use -- canonical_url and source_domain as stored (never for a listing: those rows cannot move).
+    One SELECT serves both. `planner` is the caller's own
+    ingest_validated_jsonl (the name its tests patch)."""
     from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
 
     planner = planner or ingest_validated_jsonl
     records = list(records)
     given = {k: v for k, v in (("market", market), ("source_jsonl", source_jsonl)) if v is not None}
     first = planner(records, **given)
-    keys = content_keys_of(first)
-    if not keys:
-        return {**first, "current_listings": {"status": "not_applicable"}}
-    current = await current_listings(keys, db=db)
-    replanned = planner(records, **given, current_listings=current, allow_moves=allow_moves)
-    return {**replanned, "current_listings": {"status": "read", "rows": len(current)}}
+    content, retailer = content_keys_of(first), retailer_keys_of(first)
+    if not content and not retailer:
+        return {**first, "current_listings": {"status": "not_applicable"},
+                "listing_spellings": {"status": "not_applicable"}}
+    stored = await _stored_rows(content + retailer, db=db)
+    current = _listings_of({k: stored[k][0] for k in content if k in stored})
+    spellings = {k: stored[k] for k in retailer if k in stored}
+    statuses = {"current_listings": {"status": "read", "rows": len(current)} if content else {"status": "not_applicable"},
+                "listing_spellings": {"status": "read", "rows": len(spellings)} if retailer else {"status": "not_applicable"}}
+    if not content and not spellings:
+        return {**first, **statuses}  # first ingests only: nothing to re-spell, nothing that could move
+    replanned = planner(records, **given, current_listings=current, allow_moves=allow_moves,
+                        **({"listing_spellings": spellings} if spellings else {}))
+    return {**replanned, **statuses}
