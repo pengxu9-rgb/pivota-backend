@@ -43,7 +43,7 @@ currency code, and it comes out of this fixed map — never out of caller input.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence
+from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence
 
 from services.priced_offer_sql import priced_offer_exists_sql
 
@@ -231,3 +231,55 @@ def has_offer_priced_for_any_region_sql(
         has_offer_priced_for_region_sql(product_key_expr, region, alias=alias)
         for region in ordered
     ) + ")"
+
+
+#: The registry statuses whose currency a seed may store (Peng, 2026-10-14). A served market's currency is
+#: one a buyer is shown; an acquisition market's is one its lane ingests and stores truthfully (AU/JP seeds
+#: sit in the 'US' seed partition priced in AUD/JPY). Every other market's currency is refused.
+SEED_CURRENCY_STATUSES = ("served", "acquisition")
+
+
+def seed_storable_currencies() -> FrozenSet[str]:
+    """The currencies a seed may store: those of the registry's served and acquisition markets."""
+    from services.market_registry import currency_for, markets_with_status
+
+    return frozenset(currency_for(code) for code in markets_with_status(*SEED_CURRENCY_STATUSES))
+
+
+def _currency_codes(currencies: Iterable[Optional[str]]) -> FrozenSet[str]:
+    return frozenset(
+        str(c).strip().upper() for c in currencies or () if c is not None and str(c).strip()
+    )
+
+
+def foreign_seed_currencies(
+    stated: Iterable[Optional[str]],
+    *,
+    row: Optional[str] = None,
+    stored: Iterable[Optional[str]] = (),
+) -> List[str]:
+    """The `stated` currencies a seed may NOT take from a page read, sorted; empty when it may.
+
+    The ONE seed-writer rule for a read's currency (Peng, 2026-10-14). The seed variant gates in
+    routes/employee_products use it; every other path that writes a page read's price into a seed
+    is to share it rather than restate it. A store can geo-serve another market's page to the
+    crawler, so the currency a read states is the page's, not necessarily the seed's.
+
+      1. A stated currency must belong to a served or acquisition market (`seed_storable_currencies`).
+      2. A read that states more than one currency is refused whole: a seed is priced in one.
+      3. STICKY. The seed's `row` price_currency, when storable, is the only currency it takes. A row
+         with none (or an unstorable one) is held by its `stored` variants' storable currencies
+         instead, so a USD seed whose row is NULL still refuses an SGD read. A currency that is NOT
+         storable (CAD, from an earlier read) holds nothing, so the next storable read can heal the seed.
+      4. A blank or missing stated currency does not count.
+
+    There is deliberately no `market` argument. ADR-026 drops the seed partition (Resolved Q2), and
+    a market is never inferred from a currency, nor a currency from a market."""
+    stated_codes = _currency_codes(stated)
+    if not stated_codes:
+        return []
+    if len(stated_codes) > 1:
+        return sorted(stated_codes)
+    allowed = seed_storable_currencies()
+    held = (_currency_codes([row]) & allowed) or (_currency_codes(stored) & allowed)
+    return sorted(stated_codes - (held or allowed))
