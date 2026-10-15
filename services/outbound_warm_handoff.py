@@ -355,6 +355,22 @@ def is_live_verification_required(ctx: Optional[Dict[str, Any]]) -> bool:
     return str(ctx.get(LIVE_VERIFICATION_KEY) or "").strip().lower() == LIVE_VERIFICATION_REQUIRED
 
 
+#: The signed-ctx key a mint stamps when the caller NAMED a variant and the only cart on offer
+#: was for a different one (the operator's attached variant, a sole catalog row, a sole stamped
+#: snapshot entry), so the cart was not built. ABSENT on every other token.
+VARIANT_DECLINE_KEY = "variant_declined"
+VARIANT_NOT_NAMED = "not_the_named_variant"
+
+
+def is_variant_declined(ctx: Optional[Dict[str, Any]]) -> bool:
+    """True when the signed token says the mint withheld a cart because it was not the variant the
+    caller named. This lane's rebuild carries no variant at all (see `resolve_warm_handoff`), so
+    without the knockout the click would hand the buyer a cart for a variant nobody named."""
+    if not isinstance(ctx, dict):
+        return False
+    return str(ctx.get(VARIANT_DECLINE_KEY) or "").strip().lower() == VARIANT_NOT_NAMED
+
+
 def evaluate_warm_eligibility(
     *,
     dest: str,
@@ -442,6 +458,8 @@ def evaluate_warm_eligibility(
         return False, "stock_declined"
     if is_live_verification_required(ctx):
         return False, "live_verification_required"
+    if is_variant_declined(ctx):
+        return False, "variant_declined"
     return True, eligible_reason
 
 

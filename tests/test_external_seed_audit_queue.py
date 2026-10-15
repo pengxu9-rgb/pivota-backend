@@ -528,6 +528,9 @@ def test_refresh_external_seed_replaces_stale_localized_description_and_variants
         fetched_at=None,
         evidence={
             "description": "A lightweight SPF 45 sunscreen serum that protects and hydrates.",
+            # As `evidence_content_fields` records it: copy whose source a snapshot never recorded
+            # (one from before the extractor split) is fill-only and replaces nothing (#2621).
+            "description_source": "jsonld",
             "image_urls": ["https://cdn.example.com/en.jpg"],
             "variants": [
                 {
