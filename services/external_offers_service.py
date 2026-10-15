@@ -1703,6 +1703,9 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
         # for a visibly plumper pout!"), not the product's description. Consumers that store copy
         # decide on this, not on the text.
         "description_source": description_source,
+        # The page's own meta/og description, whatever was chosen above: a seed that already
+        # stores this exact SEO line can then be told apart from real copy and upgraded.
+        "meta_description": _normalize_description_text(description),
         "brand": jsonld.get("brand") or None,
         "image_url": (image_urls[0] if image_urls else None) or jsonld.get("image_url") or image,
         "image_urls": image_urls,
@@ -1754,6 +1757,9 @@ def evidence_content_fields(extracted: Dict[str, Any]) -> Dict[str, Any]:
         out["description"] = description.strip()
         if extracted.get("description_source"):
             out["description_source"] = extracted["description_source"]
+    meta_description = extracted.get("meta_description")
+    if isinstance(meta_description, str) and meta_description.strip():
+        out["meta_description"] = meta_description.strip()
     image_urls = extracted.get("image_urls") or []
     if isinstance(image_urls, list):
         cleaned = [str(u).strip() for u in image_urls if isinstance(u, str) and str(u).strip()]

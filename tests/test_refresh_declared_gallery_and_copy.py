@@ -280,10 +280,15 @@ def test_an_seo_line_is_not_stored_as_the_served_description(monkeypatch):
     assert sd["description"] == REAL_COPY
 
 
-def test_an_seo_line_does_not_fill_an_empty_description(monkeypatch):
+def test_an_seo_line_fills_only_an_empty_description_tagged_and_never_the_served_one(monkeypatch):
+    """Peng 2026-10-15: SEO copy may fill a seed with NO description, tagged so real copy replaces
+    it later; it never reaches `snapshot.description`, which the gateway serves first."""
     row = _seed_row(seed_data=_polluted_seed_data())
     stored = _refresh(monkeypatch, row, _snapshot(_page_html(jsonld_description=None)))
-    assert not stored["seed_data"].get("description")
+    sd = stored["seed_data"]
+    assert sd["description"] == SEO_LINE
+    assert sd["description_source"] == "meta"
+    assert sd["snapshot"]["description"] is None
 
 
 def test_a_structured_description_still_fills_an_empty_one(monkeypatch):
@@ -343,10 +348,13 @@ def _preview(monkeypatch, page) -> Dict[str, Any]:
     return out["preview"]
 
 
-def test_creation_stores_the_declared_gallery_and_no_seo_line(monkeypatch):
+def test_creation_stores_the_declared_gallery_and_the_seo_line_only_as_fill(monkeypatch):
     sd = _create(monkeypatch, _snapshot(_page_html(jsonld_description=None)))
     assert sd["image_urls"] == [PRODUCT_IMG]
-    assert not sd.get("description")
+    assert sd["image_urls_source"] == "page_read"
+    assert sd["description"] == SEO_LINE
+    assert sd["description_source"] == "meta"
+    assert sd["snapshot"]["description"] is None
 
 
 def test_creation_from_an_old_snapshot_stores_no_rendered_gallery(monkeypatch):
@@ -450,3 +458,212 @@ def test_the_ops_refresh_script_never_patches_over_another_writers_gallery():
 
     assert mod._GALLERY_SOURCE_KEY == SEED_IMAGE_URLS_SOURCE_KEY
     assert SEED_IMAGE_URLS_SOURCE_PAGE_READ in mod._PAGE_READ_SOURCES
+
+
+# ----------------------------------------------------------------- final review of #2621
+
+
+def _bare_page_html() -> str:
+    """A page that declares no product image at all (no og:image, no JSON-LD image)."""
+    product = {"@context": "https://schema.org", "@type": "Product", "name": TITLE, "description": REAL_COPY,
+               "offers": {"@type": "Offer", "price": "24.00", "priceCurrency": "USD"}}
+    return (
+        f"<html><head><title>{TITLE}</title>"
+        f'<script type="application/ld+json">{json.dumps(product)}</script></head><body>'
+        + "".join(f'<img src="{u}" />' for u in PAGE_ONLY_IMAGES)
+        + "</body></html>"
+    )
+
+
+@pytest.mark.parametrize("stamp", [None, "page_read"])
+def test_a_page_that_declares_no_gallery_clears_a_page_read_one(monkeypatch, stamp):
+    seed_data = _polluted_seed_data(description=REAL_COPY)
+    if stamp:
+        seed_data["image_urls_source"] = stamp
+    stored = _refresh(monkeypatch, _seed_row(seed_data=seed_data), _snapshot(_bare_page_html()))
+    sd = stored["seed_data"]
+    assert sd["image_urls"] == []
+    assert sd["image_urls_source"] == "page_read"
+    assert sd["image_url"] == PRODUCT_IMG, "the seed's own hero image stays"
+
+
+@pytest.mark.parametrize("stamp", ["employee", "storefront_products_json"])
+def test_a_page_that_declares_no_gallery_never_clears_another_writers(monkeypatch, stamp):
+    seed_data = _polluted_seed_data(description=REAL_COPY)
+    seed_data["image_urls_source"] = stamp
+    stored = _refresh(monkeypatch, _seed_row(seed_data=seed_data), _snapshot(_bare_page_html()))
+    assert stored["seed_data"]["image_urls"] == [PRODUCT_IMG, *PAGE_ONLY_IMAGES]
+
+
+def test_an_undeclared_read_clears_nothing(monkeypatch):
+    seed_data = _polluted_seed_data(description=REAL_COPY)
+    old = {"provider": "og", "image_urls": [], "description": REAL_COPY, "description_source": "jsonld"}
+    stored = _refresh(monkeypatch, _seed_row(seed_data=seed_data), _snapshot(_bare_page_html(), evidence_override=old))
+    assert stored["seed_data"]["image_urls"] == [PRODUCT_IMG, *PAGE_ONLY_IMAGES]
+
+
+@pytest.mark.parametrize("tagged", [True, False])
+def test_a_stored_seo_line_is_upgraded_to_real_copy(monkeypatch, tagged):
+    """Tagged fill-only, or exactly the page's own meta line (an older refresh stored it untagged)."""
+    seed_data = _polluted_seed_data(description=SEO_LINE, **({"description_source": "meta"} if tagged else {}))
+    stored = _refresh(monkeypatch, _seed_row(seed_data=seed_data), _snapshot(_page_html(jsonld_description=REAL_COPY)))
+    sd = stored["seed_data"]
+    assert sd["description"] == REAL_COPY
+    assert sd["description_source"] == "jsonld"
+
+
+def test_an_employees_description_is_never_upgraded_even_if_it_is_the_meta_line(monkeypatch):
+    seed_data = _polluted_seed_data(description=SEO_LINE, manual_overrides={"description": SEO_LINE})
+    stored = _refresh(monkeypatch, _seed_row(seed_data=seed_data), _snapshot(_page_html(jsonld_description=REAL_COPY)))
+    assert stored["seed_data"]["description"] == SEO_LINE
+
+
+def test_real_copy_a_seed_already_has_is_not_replaced_by_the_upgrade_rule(monkeypatch):
+    other = "A different, curated description of the mask."
+    seed_data = _polluted_seed_data(description=other)
+    stored = _refresh(monkeypatch, _seed_row(seed_data=seed_data), _snapshot(_page_html(jsonld_description=REAL_COPY)))
+    assert stored["seed_data"]["description"] == other
+
+
+def test_a_snapshot_from_before_the_split_is_fill_only_whatever_its_text(monkeypatch):
+    """No `description_source` recorded: it may have been meta. Fill-only, never served first."""
+    old = {"provider": "og", "image_urls": [PRODUCT_IMG], "description": SEO_LINE}
+    stored = _refresh(monkeypatch, _seed_row(seed_data=_polluted_seed_data()),
+                      _snapshot(_page_html(jsonld_description=None), evidence_override=old))
+    sd = stored["seed_data"]
+    assert sd["snapshot"]["description"] is None
+    assert sd["snapshot"]["description_refused_source"] == "unknown"
+    assert sd["description"] == SEO_LINE and sd["description_source"] == "unknown"
+    created = _create(monkeypatch, _snapshot(_page_html(jsonld_description=None), evidence_override=old))
+    assert created["snapshot"]["description"] is None
+    assert created["description_source"] == "unknown"
+
+
+def test_a_stale_refused_source_is_cleared_by_a_read_with_real_copy(monkeypatch):
+    seed_data = _polluted_seed_data(description=REAL_COPY)
+    seed_data["snapshot"]["description_refused_source"] = "meta"
+    stored = _refresh(monkeypatch, _seed_row(seed_data=seed_data), _snapshot(_page_html(jsonld_description=REAL_COPY)))
+    assert "description_refused_source" not in stored["seed_data"]["snapshot"]
+
+
+def _create_over(monkeypatch, page, existing_seed_data: Dict[str, Any], **body: Any) -> Dict[str, Any]:
+    """create_external_seed on a destination that already has a seed (the update branch)."""
+    import routes.employee_products as ep
+
+    row = _seed_row(seed_data=existing_seed_data)
+    writes: List[Dict[str, Any]] = []
+
+    async def fetch_all(query, values=None):
+        return [row]
+
+    async def execute_seed(query, values):
+        writes.append({"sql": query, **values})
+
+    monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=page))
+    monkeypatch.setattr(ep.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(ep.database, "execute", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
+    monkeypatch.setattr(ep, "_derive_seed_seller_columns", AsyncMock(return_value=(None, None)))
+    monkeypatch.setattr(ep, "_make_redirect_url", AsyncMock(return_value="https://api.pivota.cc/r?token=t"))
+    asyncio.run(
+        ep.create_external_seed(
+            ep.CreateExternalSeedRequest(destination_url=DEST, market="US", **body),
+            request=SimpleNamespace(),
+            current_user={"employee_id": "emp_test"},
+        )
+    )
+    sd = writes[-1]["seed_data"]
+    return sd if isinstance(sd, dict) else json.loads(sd)
+
+
+def test_creation_over_a_seed_never_wipes_its_description_or_replaces_another_writers_gallery(monkeypatch):
+    storefront = [PRODUCT_IMG, "https://cdn.shopify.com/s/files/1/0255/0189/2660/files/LSM_2.jpg"]
+    existing = _polluted_seed_data(description=REAL_COPY, image_urls_source="storefront_products_json")
+    existing["image_urls"] = list(storefront)
+    sd = _create_over(monkeypatch, _snapshot(_page_html(jsonld_description=None)), existing)
+    assert sd["description"] == REAL_COPY, "a meta-only read neither wipes nor replaces real copy"
+    assert sd["image_urls"] == storefront
+    assert sd["image_urls_source"] == "storefront_products_json"
+
+
+def test_an_employees_gallery_on_creation_is_stamped_and_kept_by_later_reads(monkeypatch):
+    mine = [PRODUCT_IMG, "https://cdn.shopify.com/s/files/1/0255/0189/2660/files/LSM_mine.jpg"]
+    sd = _create_over(monkeypatch, _snapshot(_page_html(jsonld_description=REAL_COPY)),
+                      _polluted_seed_data(description=REAL_COPY), image_urls=mine)
+    assert sd["image_urls"] == mine and sd["image_urls_source"] == "employee"
+    stored = _refresh(monkeypatch, _seed_row(seed_data=sd), _snapshot(_page_html(jsonld_description=REAL_COPY)))
+    assert stored["seed_data"]["image_urls"] == mine
+
+
+def _patch(monkeypatch, seed_data: Dict[str, Any], **body: Any) -> Dict[str, Any]:
+    import routes.employee_products as ep
+
+    row = _seed_row(seed_data=seed_data)
+    writes: List[Dict[str, Any]] = []
+
+    async def execute_seed(query, values):
+        writes.append(values)
+
+    monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=row))
+    monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
+    monkeypatch.setattr(ep, "_project_refreshed_seed_to_serving_surfaces", AsyncMock(return_value={}))
+    asyncio.run(ep.update_external_seed(row["id"], ep.UpdateExternalSeedRequest(**body), current_user={"employee_id": "e"}))
+    sd = writes[-1]["seed_data"]
+    return sd if isinstance(sd, dict) else json.loads(sd)
+
+
+def test_a_patched_gallery_is_an_employees_unless_it_says_it_is_a_page_read(monkeypatch):
+    mine = [PRODUCT_IMG]
+    sd = _patch(monkeypatch, _polluted_seed_data(), image_urls=mine)
+    assert sd["image_urls"] == mine and sd["image_urls_source"] == "employee"
+    read = _patch(monkeypatch, _polluted_seed_data(), image_urls=mine, image_urls_source="page_read")
+    assert read["image_urls_source"] == "page_read"
+
+
+def test_a_page_read_patch_never_replaces_another_writers_gallery(monkeypatch):
+    storefront = [PRODUCT_IMG, "https://cdn.shopify.com/s/files/1/0255/0189/2660/files/LSM_2.jpg"]
+    seed_data = _polluted_seed_data(image_urls_source="storefront_products_json")
+    seed_data["image_urls"] = list(storefront)
+    sd = _patch(monkeypatch, seed_data, image_urls=[PRODUCT_IMG], image_urls_source="page_read")
+    assert sd["image_urls"] == storefront
+    assert sd["image_urls_source"] == "storefront_products_json"
+
+
+def _ops_module():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "ops_refresh_external_seeds.py"
+    spec = importlib.util.spec_from_file_location("ops_refresh_external_seeds", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_the_ops_script_never_sends_an_empty_variant_list_or_an_empty_patch():
+    mod = _ops_module()
+    v = [{"variant_id": "1"}]
+    free = {"seed_data": {}}
+    stamped = {"seed_data": {"image_urls_source": "storefront_products_json"}}
+    assert mod.refresh_patch_payload(free, [], [PRODUCT_IMG]) == {"image_urls": [PRODUCT_IMG], "image_urls_source": "page_read"}
+    assert mod.refresh_patch_payload(stamped, v, [PRODUCT_IMG]) == {"variants": v}
+    assert mod.refresh_patch_payload(stamped, [], [PRODUCT_IMG]) is None, "the gate left nothing: no PATCH (no variant wipe)"
+    assert mod.refresh_patch_payload(free, v, [PRODUCT_IMG]) == {"variants": v, "image_urls": [PRODUCT_IMG], "image_urls_source": "page_read"}
+
+
+def test_the_ops_script_uses_the_payload_builder():
+    """STRUCTURAL: main_async PATCHes only what refresh_patch_payload returns."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "scripts" / "ops_refresh_external_seeds.py").read_text()
+    assert "patch = refresh_patch_payload(seed_before, variants, image_urls)" in src
+    assert "if patch is None:" in src
+    assert 'payload: Dict[str, Any] = {"variants": variants}' not in src
+
+
+def test_creation_over_a_seed_with_no_description_fills_it_from_seo_copy_tagged(monkeypatch):
+    sd = _create_over(monkeypatch, _snapshot(_page_html(jsonld_description=None)), _polluted_seed_data())
+    assert sd["description"] == SEO_LINE
+    assert sd["description_source"] == "meta"

@@ -7,7 +7,7 @@ content-key catalogue endpoints below, whose offers come from
 ``catalog_offers``.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 import asyncio
 import csv
 import io
@@ -992,6 +992,12 @@ _REFUSED_DESCRIPTION_SOURCES = frozenset({"meta"})
 # by a page read. Unstamped galleries (written before the stamp) follow the page-read rule.
 SEED_IMAGE_URLS_SOURCE_KEY = "image_urls_source"
 SEED_IMAGE_URLS_SOURCE_PAGE_READ = "page_read"
+# A gallery an employee set (PATCH, or seed creation's own `image_urls`): no page read replaces it.
+SEED_IMAGE_URLS_SOURCE_EMPLOYEE = "employee"
+# Where a seed's stored description came from, when a page read wrote it ("jsonld" | "page_long" |
+# "meta" | "unknown"). "meta"/"unknown" text is fill-only: real copy from a later read replaces it.
+SEED_DESCRIPTION_SOURCE_KEY = "description_source"
+_FILL_ONLY_DESCRIPTION_SOURCES = {"meta", "unknown"}
 
 
 def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
@@ -1001,15 +1007,23 @@ def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
       DECLARES as the product's (`image_urls_scope`). A snapshot written before the extractor
       split them holds every image the page rendered -- nav tiles, banners, Instagram posts --
       and gives no gallery; `gallery_declared` says which.
-    - `description` is None when the text came from og/meta description tags (SEO copy);
-      `description_refused_source` then names that source.
+    - `description` is the page's real copy (JSON-LD or its long-description block), with its
+      `description_source`. og/meta description text (SEO copy), or text whose source a snapshot
+      from before the split never recorded, is never `description`: it is `fill_only_description`,
+      which may fill a seed that has NO description and nothing else (Peng 2026-10-15), and
+      `description_refused_source` names why ("meta" | "unknown").
+    - `meta_description` is the page's own meta text, so a seed already storing that exact SEO
+      line can be upgraded to real copy.
     One function for the refresh, seed creation and the creation preview, so all three store
     (or show) the same thing."""
     out: Dict[str, Any] = {
         "image_urls": [],
         "gallery_declared": False,
         "description": None,
+        "description_source": None,
+        "fill_only_description": None,
         "description_refused_source": None,
+        "meta_description": None,
     }
     if not isinstance(evidence, dict):
         return out
@@ -1018,13 +1032,36 @@ def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
     if out["gallery_declared"] and isinstance(raw_images, list):
         cleaned = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
         out["image_urls"] = _dedupe_seed_image_urls(cleaned, limit=20)
+    raw_meta = evidence.get("meta_description")
+    if isinstance(raw_meta, str) and raw_meta.strip():
+        out["meta_description"] = raw_meta.strip()
     raw_desc = evidence.get("description")
     if isinstance(raw_desc, str) and raw_desc.strip():
-        if evidence.get("description_source") in _REFUSED_DESCRIPTION_SOURCES:
-            out["description_refused_source"] = str(evidence.get("description_source"))
+        source = str(evidence.get("description_source") or "").strip() or None
+        if source is None or source in _REFUSED_DESCRIPTION_SOURCES:
+            refused = source or "unknown"
+            out["description_refused_source"] = refused
+            out["fill_only_description"] = raw_desc.strip()
+            if refused in _REFUSED_DESCRIPTION_SOURCES and not out["meta_description"]:
+                out["meta_description"] = raw_desc.strip()
         else:
             out["description"] = raw_desc.strip()
+            out["description_source"] = source
     return out
+
+
+def _seed_description_is_upgradable(seed_data: Dict[str, Any], meta_description: Optional[str]) -> bool:
+    """May a page read's real copy replace the seed's stored description? Only SEO copy a page read
+    put there -- tagged fill-only, or exactly the page's own meta line -- and never an employee's
+    own description (`manual_overrides.description`)."""
+    existing = str(seed_data.get("description") or "").strip()
+    if not existing:
+        return False
+    if _ensure_json_obj(seed_data.get("manual_overrides")).get("description"):
+        return False
+    if seed_data.get(SEED_DESCRIPTION_SOURCE_KEY) in _FILL_ONLY_DESCRIPTION_SOURCES:
+        return True
+    return bool(meta_description) and existing == meta_description
 
 
 def _should_replace_localized_copy(
@@ -1770,6 +1807,9 @@ class UpdateExternalSeedRequest(BaseModel):
     description: Optional[str] = None
     image_url: Optional[str] = None
     image_urls: Optional[List[str]] = None
+    # Who `image_urls` comes from: an employee (the default) or a page read (the ops refresh
+    # script). A page read never replaces a gallery another writer stamped.
+    image_urls_source: Optional[Literal["employee", "page_read"]] = None
     product_id: Optional[str] = None
     brand: Optional[str] = None
     category: Optional[str] = None
@@ -4081,6 +4121,7 @@ async def create_external_seed(
     snap_image_urls: list[str] = []
     snap_description: Optional[str] = None
     snap_variants: Optional[List[Dict[str, Any]]] = None
+    content = _snapshot_evidence_content(None)
     evidence = getattr(snapshot, "evidence", None) if snapshot else None
     if isinstance(evidence, dict):
         content = _snapshot_evidence_content(evidence)
@@ -4115,6 +4156,11 @@ async def create_external_seed(
     # Merge: employee-provided fields override snapshot-derived values.
     title = (body.title or "").strip() or snap_title
     description = (body.description or "").strip() or snap_description
+    # Where `description` came from, and SEO copy that may only fill an empty one (Peng 2026-10-15).
+    description_origin = (
+        "employee" if (body.description or "").strip() else (content["description_source"] if snap_description else None)
+    )
+    fill_only_description = content["fill_only_description"]
     image_url = (body.image_url or "").strip() or snap_image_url
     if not image_url and body.image_urls:
         cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
@@ -4178,13 +4224,26 @@ async def create_external_seed(
         if body.category is not None:
             seed_data["category"] = (body.category or "").strip() or None
         seed_data["title"] = title
-        seed_data["description"] = description
+        if description and (
+            description_origin == "employee"
+            or not str(seed_data.get("description") or "").strip()
+            or _seed_description_is_upgradable(seed_data, content["meta_description"])
+        ):
+            seed_data["description"] = description
+            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = description_origin
+        elif not str(seed_data.get("description") or "").strip() and fill_only_description:
+            seed_data["description"] = fill_only_description
+            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_refused_source"]
+        # (A read with no usable copy never wipes the seed's own description.)
         seed_data["image_url"] = image_url
         if body.image_urls is not None:
             cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
             seed_data["image_urls"] = _dedupe_seed_image_urls(cleaned, limit=20)
-        elif snap_image_urls:
+            seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_EMPLOYEE
+        elif snap_image_urls and seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) in (None, SEED_IMAGE_URLS_SOURCE_PAGE_READ):
+            # As the refresh: never over a gallery another writer stamped.
             seed_data["image_urls"] = snap_image_urls
+            seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
         seed_data["availability"] = availability
         seed_data["utm_template"] = utm_template
         seed_data["partner_type"] = partner_type
@@ -4297,11 +4356,21 @@ async def create_external_seed(
             "brand": (body.brand or "").strip() or None,
             "category": (body.category or "").strip() or None,
             "title": title,
-            "description": description,
+            "description": description or fill_only_description,
+            **(
+                {SEED_DESCRIPTION_SOURCE_KEY: description_origin if description else content["description_refused_source"]}
+                if (description or fill_only_description)
+                else {}
+            ),
             "image_url": image_url,
             "image_urls": [str(u).strip() for u in (body.image_urls or []) if isinstance(u, str) and str(u).strip()]
             if body.image_urls is not None
             else snap_image_urls,
+            **(
+                {SEED_IMAGE_URLS_SOURCE_KEY: SEED_IMAGE_URLS_SOURCE_EMPLOYEE}
+                if body.image_urls is not None
+                else ({SEED_IMAGE_URLS_SOURCE_KEY: SEED_IMAGE_URLS_SOURCE_PAGE_READ} if snap_image_urls else {})
+            ),
             "availability": availability,
             "variants": body.variants or (snap_variants or []),
             "utm_template": utm_template,
@@ -4619,11 +4688,16 @@ async def update_external_seed(
     if body.image_url is not None:
         seed_data["image_url"] = body.image_url
         seed_data["snapshot"]["image_url"] = body.image_url
-    if body.image_urls is not None:
+    gallery_source = body.image_urls_source or SEED_IMAGE_URLS_SOURCE_EMPLOYEE
+    if body.image_urls is not None and not (
+        gallery_source == SEED_IMAGE_URLS_SOURCE_PAGE_READ
+        and seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) not in (None, SEED_IMAGE_URLS_SOURCE_PAGE_READ)
+    ):
         cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
         deduped = _dedupe_seed_image_urls(cleaned, limit=20)
         seed_data["image_urls"] = deduped
         seed_data["snapshot"]["image_urls"] = deduped
+        seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = gallery_source
         if body.image_url is None and deduped:
             seed_data["image_url"] = deduped[0]
     if body.availability is not None:
@@ -5520,18 +5594,36 @@ async def _refresh_external_seed_by_id(
         seed_data["description"] = snap_description
     if not seed_data.get("title"):
         seed_data["title"] = snap_title
+    if snap_description and _seed_description_is_upgradable(seed_data, content["meta_description"]):
+        # SEO copy an earlier read stored, now that the page gives real copy (review of #2621).
+        seed_data["description"] = snap_description
+        seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
     if not seed_data.get("description"):
         if snap_description:
             seed_data["description"] = snap_description
+            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
+        elif content["fill_only_description"]:
+            # Nothing better on the page: SEO copy may fill an EMPTY description, tagged so real
+            # copy from a later read replaces it (Peng 2026-10-15). It never reaches
+            # `snapshot.description`, which the gateway serves ahead of the seed's own.
+            seed_data["description"] = content["fill_only_description"]
+            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_refused_source"]
     if not seed_data.get("image_url"):
         seed_data["image_url"] = snap_image_url
     # Declared only (`_snapshot_evidence_content` gives an undeclared read none), and never over a
     # gallery another writer stamped: a storefront's own structured gallery (the drain's
     # products.json `images[]`) is the product's, and a page read's one or two declared images
     # would replace it.
-    if snap_image_urls and seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) in (None, SEED_IMAGE_URLS_SOURCE_PAGE_READ):
-        seed_data["image_urls"] = snap_image_urls
-        seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
+    if seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) in (None, SEED_IMAGE_URLS_SOURCE_PAGE_READ):
+        if snap_image_urls:
+            seed_data["image_urls"] = snap_image_urls
+            seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
+        elif gallery_declared and seed_data.get("image_urls"):
+            # The page declares NO gallery: what the seed stores came from an older read of every
+            # image the page rendered (nav tiles, banners). Cleared, so it is corrected rather than
+            # kept forever; the seed's `image_url` stays (review of #2621).
+            seed_data["image_urls"] = []
+            seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
     if adoptable_variants:

@@ -282,19 +282,33 @@ def page_read_may_replace_gallery(seed: Dict[str, Any]) -> bool:
     return seed_data.get(_GALLERY_SOURCE_KEY) in _PAGE_READ_SOURCES
 
 
+def refresh_patch_payload(
+    seed_before: Dict[str, Any], variants: List[Dict[str, Any]], image_urls: List[str]
+) -> Optional[Dict[str, Any]]:
+    """What this script PATCHes for one seed, or None when there is nothing to send.
+
+    - `variants` only when the preview found some: the endpoint REPLACES the list, so an empty
+      one would wipe the seed's variants (review of #2621).
+    - `image_urls` only when the preview found some AND the seed's gallery is not another
+      writer's, sent as a page read (`image_urls_source`) so the endpoint applies the same rule."""
+    payload: Dict[str, Any] = {}
+    if variants:
+        payload["variants"] = variants
+    if image_urls and page_read_may_replace_gallery(seed_before):
+        payload["image_urls"] = image_urls
+        payload["image_urls_source"] = "page_read"
+    return payload or None
+
+
 async def _patch_seed(
     client: httpx.AsyncClient,
     base_url: str,
     token: str,
     seed_id: str,
-    variants: List[Dict[str, Any]],
-    image_urls: List[str],
+    payload: Dict[str, Any],
     timeout: float,
 ) -> Tuple[bool, str]:
     url = f"{base_url.rstrip('/')}/employee/products/external-seeds/{seed_id}"
-    payload: Dict[str, Any] = {"variants": variants}
-    if image_urls:
-        payload["image_urls"] = image_urls
     resp = await client.patch(url, headers=_auth_headers(token), json=payload, timeout=timeout)
     if resp.status_code != 200:
         return False, f"HTTP {resp.status_code}"
@@ -406,12 +420,14 @@ async def main_async(args: argparse.Namespace) -> int:
                             elif not variants and not image_urls:
                                 ok, msg = False, f"preview_empty:{prev_msg}"
                             else:
-                                if not page_read_may_replace_gallery(seed_before):
-                                    image_urls = []
-                                patch_ok, patch_msg = await _patch_seed(
-                                    client, base_url, token, seed_id, variants, image_urls, args.timeout
-                                )
-                                ok, msg = (patch_ok, f"{patch_msg} ({prev_msg})")
+                                patch = refresh_patch_payload(seed_before, variants, image_urls)
+                                if patch is None:
+                                    ok, msg = True, f"nothing_to_patch ({prev_msg})"
+                                else:
+                                    patch_ok, patch_msg = await _patch_seed(
+                                        client, base_url, token, seed_id, patch, args.timeout
+                                    )
+                                    ok, msg = (patch_ok, f"{patch_msg} ({prev_msg})")
 
                     after_vc = None
                     try:
