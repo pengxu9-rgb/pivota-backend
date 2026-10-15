@@ -5146,6 +5146,21 @@ def _seed_variant_identifiers(variant: Dict[str, Any]) -> List[str]:
     return out
 
 
+def _read_variant_link(read_variant: Dict[str, Any]) -> Optional[str]:
+    """The Shopify variant a READ variant's offer links to, if the extractor read one.
+
+    A Shopify storefront's JSON-LD names a size offer only by `@id`
+    "/products/<handle>?variant=<digits>#offer", so its key is that string, while the
+    retailer-ingest drain stores the merchant's numeric variant id; the extractor reads the digits
+    into `offer_shopify_variant_id` (`services/external_offers_service._offer_shopify_variant_id`,
+    only off a link to the page's own product). Matching on them is still exact equality on a
+    merchant-issued id. The link joins the MATCH only: the native-id guards in the reconcile still
+    see the read variant's key alone, so a digit-shaped `sku` beside a link is not "two ids".
+    """
+    linked = str(read_variant.get("offer_shopify_variant_id") or "").strip()
+    return linked or None
+
+
 def _seed_variant_stored_price(variant: Dict[str, Any]) -> Any:
     """The price the serving builders read off a stored variant, same precedence."""
     for key in ("price_amount", "price", "amount", "value", "list_price"):
@@ -5192,6 +5207,19 @@ def _page_names_one_value(census: Dict[str, Any]) -> bool:
     return max(int(census.get("offers") or 0), int(census.get("data_attr_skus") or 0)) <= 1
 
 
+def _read_offer_money(rv: Dict[str, Any]) -> Tuple[Optional[float], Optional[str]]:
+    """A read offer's own amount (rounded to cents) and stated currency; None where it states none."""
+    amount = _as_price(rv.get("price_amount"))
+    cur = str(rv.get("price_currency") or rv.get("currency") or "").strip().upper() or None
+    return (round(amount, 2) if amount is not None else None, cur)
+
+
+def _read_offer_money_disagrees(a: Tuple[Optional[float], Optional[str]], b: Tuple[Optional[float], Optional[str]]) -> bool:
+    """Two listings of one variant contradict when both state an amount, or both a currency, that differ.
+    A listing that states nothing does not contradict one that does."""
+    return (a[0] is not None and b[0] is not None and a[0] != b[0]) or (a[1] is not None and b[1] is not None and a[1] != b[1])
+
+
 def _reconcile_seed_variants_with_read(
     stored: List[Dict[str, Any]],
     read: List[Dict[str, Any]],
@@ -5218,9 +5246,10 @@ def _reconcile_seed_variants_with_read(
     hands a `census` of the distinct offers; this function trusts nothing those do not vouch for.
 
     WHAT COUNTS AS A RE-READ of a stored variant, and nothing else does:
-      * an UNAMBIGUOUS identifier match (see `_seed_variant_identifiers`: one read variant
-        carries the id, no other stored variant claims it, and the extractor saw no other offer
-        under that id) to an offer that is not an AggregateOffer. Its price is taken only when
+      * an UNAMBIGUOUS identifier match (see `_seed_variant_identifiers`; failing any key
+        match, the offer's link, `_read_variant_link`: one read variant carries the id, no
+        other stored variant claims it, and the extractor saw no other offer under that id) to
+        an offer that is not an AggregateOffer. Its price is taken only when
         it is that offer's own `price` (not a range bound), positive, finite, and in a
         currency the offer itself states that matches the variant's; its stock whenever the
         page stated one;
@@ -5244,10 +5273,14 @@ def _reconcile_seed_variants_with_read(
     read_native = set().union(*(_native_refresh_variant_ids(rv) for rv in read_variants)) if read_variants else set()
     read_currencies = {str(rv[k]).strip().upper() for rv in read_variants
                        for k in ("price_currency", "currency") if rv.get(k)}
+    read_by_link: Dict[str, List[int]] = {}
     for pos, rv in enumerate(read_variants):
         key = _seed_variant_key(rv)
         if key and not _POSITIONAL_OFFER_ID.match(key):
             read_by_id.setdefault(key, []).append(pos)
+        link = _read_variant_link(rv)
+        if link:
+            read_by_link.setdefault(link, []).append(pos)
 
     # Which read offer each stored variant names, through ANY of its own identifiers. A read
     # offer two stored variants both claim is ambiguous for both.
@@ -5263,6 +5296,40 @@ def _reconcile_seed_variants_with_read(
         claims.append(pos)
         if pos is not None:
             claimants[pos] = claimants.get(pos, 0) + 1
+    # THE OFFER'S LINK ONLY FILLS A GAP the keys leave: a stored variant none of whose ids is any
+    # read key, matched to an offer no stored variant claimed by key. So a link can add a re-read
+    # and never take one away. Prod census 2026-10-14: pages listing one variant twice -- once
+    # by its link, once with the variant id as `sku` -- matched on the `sku` before; indexing the
+    # link beside the keys made that id two offers and dropped the re-read.
+    key_claimed = set(claimants)
+    for idx, v in enumerate(stored):
+        ids = _seed_variant_identifiers(v)
+        if claims[idx] is not None or any(i in read_by_id for i in ids):
+            continue
+        named = {
+            read_by_link[i][0]
+            for i in ids
+            if len(read_by_link.get(i) or []) == 1 and read_by_link[i][0] not in key_claimed
+        }
+        if len(named) == 1:
+            claims[idx] = pos = next(iter(named))
+            claimants[pos] = claimants.get(pos, 0) + 1
+    # A PAGE THAT PRICES ONE VARIANT TWICE, AND DISAGREES WITH ITSELF, RE-READ NOTHING FOR IT (review
+    # of #2631). The prod shape above -- V50 by its link and by `sku=V50` -- usually repeats one price;
+    # when the two say 85 and 70, taking the key's 70 and stamping the seed fresh vouches for a price
+    # the page itself disputes. Before the link filled the siblings' gaps that was masked (they stayed
+    # not re-read, so the stamp popped). Agreeing listings keep the match.
+    for idx, v in enumerate(stored):
+        pos = claims[idx]
+        if pos is None:
+            continue
+        mine = _read_offer_money(read_variants[pos])
+        if any(
+            other != pos and _read_offer_money_disagrees(mine, _read_offer_money(read_variants[other]))
+            for i in _seed_variant_identifiers(v)
+            for other in read_by_link.get(i) or []
+        ):
+            claims[idx] = None
 
     product_cur = (str(product_currency or "").strip().upper() or None)
     refused = {str(c).strip().upper() for c in refused_currencies or () if c}
