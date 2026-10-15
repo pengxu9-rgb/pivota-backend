@@ -659,3 +659,19 @@ async def test_multi_two_entries_carrying_the_cart_id_keep_no_cart(monkeypatch):
     row["seed_data"]["variants"][0]["shopify_variant_id"] = _B_VARIANT
     (card,) = await _multi_seed_cards(monkeypatch, [row], search_market="US")
     _assert_referral_card(card)
+
+
+async def test_multi_two_seeds_on_one_pdp_do_not_share_a_signed_cart(monkeypatch):
+    """Review of #2625: the redirect cache was keyed without the cart or the seed. Seed 1 keeps B's
+    cart at $19; seed 2 has B at $29 and is refused — its signed link must be its OWN PDP
+    referral, not seed 1's cached /cart/ link carrying seed 1's id."""
+    _enforce(monkeypatch, on=False)
+    first = _multi_variant_row(b_price=19.0)
+    second = _multi_variant_row(b_price=29.0, id="eps_cart_2", external_product_id="ext_cart_2",
+                                title="Fenty Gloss Widget Two")
+    cards = await _multi_seed_cards(monkeypatch, [first, second], search_market="US")
+    by_seed = {_payload(c["external_redirect_url"])["ctx"]["seedId"]: c for c in cards}
+    assert set(by_seed) == {"eps_cart_1", "eps_cart_2"}, "each card signs its own seed"
+    _assert_cart_card(by_seed["eps_cart_1"])
+    _assert_referral_card(by_seed["eps_cart_2"])
+

@@ -12758,6 +12758,10 @@ async def _handle_find_products_multi_inner(
             # ADR-009 D3: include seller_ref/seed_kind in the cache key so a cache
             # hit never reuses a redirect built for a different seller. The provenance flag is
             # in the key too: two rows that serve the same market can differ in it.
+            # The CART and the SEED are in the key too. Two seeds can share one PDP, and
+            # `_card_cart_at_card_price` can keep one's cart and refuse the other's: keyed
+            # without them, the second card reused the first's signed /cart/ link (and its
+            # `seedId`) while publishing no cart_url. Review of #2625 (controller, 2026-10-14).
             redirect_cache_key = "||".join(
                 [
                     market,
@@ -12768,6 +12772,8 @@ async def _handle_find_products_multi_inner(
                     str(redirect_identity.get("seed_kind") or ""),
                     "observed" if observed else "unobserved",
                     str(purchasability_tier or ""),
+                    str(redirect_identity.get("cart_variant_id") or ""),
+                    str(row_dict.get("id") or ""),
                 ]
             )
             if redirect_cache_key in external_redirect_cache:
