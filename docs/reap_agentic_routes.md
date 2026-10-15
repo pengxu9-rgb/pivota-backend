@@ -97,9 +97,17 @@ Success is HTTP 200 with a `selection` object containing `product_key`, `variant
 The merchant field preserves the validated observed storefront host needed by the create
 lane; pilot and merchant eligibility use the existing canonical merchant rule.
 
-The selected numeric ID must resolve to exactly one unsuppressed, nonplaceholder SKU of that
-product and seller/source. Duplicate aliases refuse `row_variant_ambiguous`; no SKU is chosen
-by ordering or a default variant. The existing cart-link reader validates active attached
+The selected numeric ID resolves by create's own `variant_id` rule (see `variant_id` under
+`POST /purchases`): every unsuppressed, nonplaceholder SKU naming it must be that product's own
+seller/source SKU, else `row_variant_unverified`. One variant spelled by two catalog writers is
+priced per spelling; the priced spellings must agree (`row_price_ambiguous`) and the lowest SKU
+key is named. A product whose only variant it is, or that has only its `::canonical`
+placeholder, takes the no-key path, and the witness names the SKU that load priced. This is
+exactly the load a `variant_id` create makes, so **create from a witness with `variant_id` (and
+the witness's money), not with its `variant_key`.** A `variant_id` create is held to that
+variant. A placeholder witness's `variant_key` (`<product_key>::canonical`) names no variant, so
+a create naming it is refused `409 row_variant_unverified` before anything is written -- a sole
+variant priced only on that placeholder beside an unpriced real SKU is bought by `variant_id`. The existing cart-link reader validates active attached
 source, seller identity, current storefront proof and the selected SKU's own offer. Missing,
 expired or contradictory evidence refuses. Preparation requires its usable own offers to
 agree on exact currency and minor price, and enforces the same current agent, domain, market,
@@ -161,7 +169,7 @@ poller drives the state machine afterwards, on another process, over the next mi
 | `offer_code` | no | the buyer's own offer (coupon) code, either lane: a string of 1..128 characters with at least one non-whitespace character and no control character, sent to Reap **exactly as given** (not trimmed, not upper-cased). Empty, whitespace-only, over-long or control characters ⇒ `400 invalid_offer_code`; a non-string ⇒ `400 invalid_request`. Part of the idempotency hash when present (a retry that adds or changes a code is a different purchase). If Reap refuses the code (`OFFER_CODE_INVALID` / `OFFER_CODE_EXPIRED`) the purchase is re-quoted **once without it** and `offer_code_outcome` says so — tell your user before they approve. |
 | `merchant_domain` | yes | a bare host name, sent as observed (`www.brand.example` or `brand.example`); anything else — a scheme, port, path, userinfo, IP or single label — is `400 invalid_request`. Matched **canonically**: lower case, one leading `www.` removed, so `www.brand.example` and `brand.example` are the same merchant (`wwwbrand.example` is not). Variant lane: must be enabled in `reap_agentic_eligibility`. Cart-link lane: must have a fresh `tierb_cart_link_eligibility` verdict, and builds its cart URL on the host as sent. Both are checked in the buyer's market. |
 | `product_key` | yes | our catalog key (`catalog_products.product_key`). |
-| `variant_key` | no | our sku key (`catalog_skus.sku_key`), matched **exactly**. Omit only when the product has exactly one variant; a multi-variant product with no `variant_key` is `row_not_found`. |
+| `variant_key` | no | our sku key (`catalog_skus.sku_key`), matched **exactly**. Omit only when the product has exactly one variant; a multi-variant product with no `variant_key` is `row_not_found`. A cart-link create naming the `<product_key>::canonical` placeholder is `409 row_variant_unverified` (it names no variant): send no key, or `variant_id`. |
 | `variant_id` | no | **cart-link lane only, never with `variant_key`** (else `400 invalid_request`): the buyer's chosen variant as the storefront numbers it (`get_product`'s `variants[].variant_id`, a string of digits). We resolve it to our own sku, with `/purchases/prepare`'s guards: every live sku naming that id must be this listing's own (the product's merchant and platform), else `409 row_variant_unverified`; none naming it ⇒ `409 row_variant_unverified`. When it is the product's only variant (or the product has only its `::canonical` placeholder) it is bought exactly as with no key. Several spellings of it (one variant written by two catalog writers; more than 4 ⇒ `409 row_variant_ambiguous`) ⇒ each is priced as a named sku, a spelling this merchant has no usable offer on is passed over, any other refusal stands, and the priced ones must agree (`409 row_price_ambiguous`). Whatever path is taken, the variant bought must BE the selected one, else `409 row_variant_unverified`. **Prefer it to `variant_key`**: never spell a sku key yourself (`::sku_<hash>`, `::v:<n>`, `::v::<n>` and `::v:retailer-<hash>` all occur). The idempotency hash holds the id as sent, so a `variant_id` body and a `variant_key` body for the same variant are different purchases. Also accepted by `/recover` and `/resume` (the same body). |
 | `quantity` | no (default 1) | 1..10 (`MAX_QUANTITY`). |
 | `buyer.email` | yes | the contact for **this purchase**. It is **not** an identity: nothing about the buyer we resolve or create is derived from it. See "The buyer identity" below. |

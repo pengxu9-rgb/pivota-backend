@@ -239,7 +239,7 @@ def test_backfill_storefront_external_seeds_dry_run(
     async def fake_candidates(*, merchant_id: str, limit: int, market=None):
         assert merchant_id == "merch_1"
         assert limit == 25
-        assert market is None
+        assert market == "US"
         return {
             "merchant_id": merchant_id,
             "market": "US",
@@ -263,11 +263,12 @@ def test_backfill_storefront_external_seeds_dry_run(
 
     monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(employee_products_module, "_fetch_storefront_referral_seed_candidates", fake_candidates)
+    monkeypatch.setattr(employee_products_module.database, "fetch_one", AsyncMock(return_value=None))
 
     res = client.post(
         "/employee/products/external-seeds/backfill-storefront",
         headers={"Authorization": "Bearer test-token"},
-        json={"merchant_id": "merch_1", "limit": 25, "dry_run": True},
+        json={"merchant_id": "merch_1", "market": "us", "limit": 25, "dry_run": True},
     )
     assert res.status_code == 200, res.text
     payload = res.json()
@@ -331,7 +332,7 @@ def test_backfill_storefront_external_seeds_write_mode(
     res = client.post(
         "/employee/products/external-seeds/backfill-storefront",
         headers={"Authorization": "Bearer test-token"},
-        json={"merchant_id": "merch_1", "dry_run": False},
+        json={"merchant_id": "merch_1", "market": "US", "dry_run": False},
     )
     assert res.status_code == 200, res.text
     payload = res.json()

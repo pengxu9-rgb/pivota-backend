@@ -202,15 +202,11 @@ async def test_prepare_auth_before_sql(client, monkeypatch, prepare_auth_app, ki
                 prepare_auth_app.dependency_overrides[dep] = old
 
 
-@pytest.mark.parametrize("failure", ["duplicate", "suppressed", "placeholder", "foreign_source", "foreign_sku", "proof_missing", "proof_expired", "wrong_seed_product", "eligibility_expired", "own_unpriced", "own_foreign_currency", "sku_foreign_currency", "own_conflicting_price"])
+@pytest.mark.parametrize("failure", ["suppressed", "foreign_source", "foreign_sku", "proof_missing", "proof_expired", "wrong_seed_product", "eligibility_expired", "own_unpriced", "own_foreign_currency", "sku_foreign_currency", "own_conflicting_price"])
 async def test_prepare_evidence_refusal_no_mutation(client, monkeypatch, failure):
     await seed(monkeypatch, proof=failure != "proof_missing", proof_age_days=10 if failure == "proof_expired" else 0, source="unknown" if failure == "foreign_source" else "external_product_seeds_mirror_v1")
-    if failure == "duplicate":
-        await database.execute("INSERT INTO catalog_skus (sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency) SELECT :other,product_key,merchant_id,platform,source_product_id,:variant,title,currency FROM catalog_skus WHERE sku_key=:sku", {"other": PRODUCT + "::alias", "variant": VARIANT, "sku": SKU})
-    elif failure == "suppressed":
+    if failure == "suppressed":
         await database.execute("UPDATE catalog_skus SET suppression_reason='unsafe' WHERE sku_key=:sku", {"sku": SKU})
-    elif failure == "placeholder":
-        await database.execute("UPDATE catalog_skus SET sku_key=:placeholder,source_variant_id=:pk WHERE sku_key=:sku", {"placeholder": PRODUCT + "::canonical", "pk": PRODUCT, "sku": SKU})
     elif failure == "foreign_sku":
         await database.execute("UPDATE catalog_skus SET source_variant_id=:foreign WHERE sku_key=:sku", {"foreign": "ext_other:" + VARIANT, "sku": SKU})
     elif failure == "wrong_seed_product":
@@ -239,6 +235,221 @@ async def test_prepare_own_price_and_resolved_scope_not_caller_guessed(client, m
     response = await client.post(BASE, json=body())
     assert response.status_code == 404 and error(response) == "not_available_on_this_rail"
     assert await unchanged_state() == before
+
+def create_body(witness, idempotency_key, *, by="variant_key"):
+    """The create body a door sends from a prepare witness: its money, and its `variant_id` (what the
+    UCP door sends) or its sku (`by="variant_key"`, what that door sent before) -- nothing guessed."""
+    return {'item_source': 'cart_link', 'merchant_domain': witness['merchant_domain'],
+                'product_key': witness['product_key'], by: witness[by],
+                'quantity': witness['quantity'], 'idempotency_key': idempotency_key,
+                'expected_unit_price_minor': witness['unit_price_minor'],
+                'expected_currency': witness['currency'],
+                'return_url': 'https://agent.pivota.cc/reap/return',
+                'buyer': {'email': 'selection@example.test', 'name': 'Selection Verifier',
+                          'phone': '+14155550100', 'consent_version': 'selection-test-v1',
+                          'shipping_address': {'firstName': 'Selection', 'lastName': 'Verifier',
+                              'phone': '+14155550100', 'addressLine1': '900 Brannan St',
+                              'city': 'San Francisco', 'country': 'US', 'postalCode': '94103'}}}
+
+
+async def add_spelling(key, *, merchant_id=SELLER, platform="external_seed", price="13.99", source_variant_id=VARIANT):
+    """A second catalog spelling of the selected variant (another writer's sku key), with its own offer."""
+    await database.execute(
+        "INSERT INTO catalog_skus (sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency) VALUES (:sku,:pk,:seller,:platform,:ext,:variant,'Selected shade','USD')",
+        {"sku": key, "pk": PRODUCT, "seller": merchant_id, "platform": platform, "ext": EXT, "variant": source_variant_id},
+    )
+    if price is not None:
+        await database.execute(
+            "INSERT INTO catalog_offers (offer_id,sku_key,product_key,merchant_id,currency,merchant_effective_price,availability) VALUES (:id,:sku,:pk,:seller,'USD',:price,'in_stock')",
+            {"id": "prepare-offer-" + key.rsplit("::", 1)[-1], "sku": key, "pk": PRODUCT, "seller": merchant_id, "price": price},
+        )
+
+
+#: The selected variant's other spelling, sorting AFTER the stored hashed sku and BEFORE it.
+SPELLED_AFTER = PRODUCT + "::v::" + VARIANT
+SPELLED_BEFORE = PRODUCT + "::sku_00000000000000000000"
+
+
+@pytest.mark.parametrize("other", [SPELLED_AFTER, SPELLED_BEFORE])
+async def test_prepare_dual_spelling_with_agreeing_prices_names_the_lowest_key(client, monkeypatch, other):
+    """One variant spelled by two writers is create's rule here too: each spelling priced, they
+    agree, the lowest sku key is the witness -- and a create naming it buys that variant."""
+    await seed(monkeypatch)
+    await add_spelling(other)
+    before = await unchanged_state()
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 200, response.text
+    witness = response.json()["selection"]
+    assert witness["variant_key"] == min(SKU, other)
+    assert (witness["variant_id"], witness["unit_price_minor"], witness["currency"]) == (VARIANT, 1399, "USD")
+    assert (await client.post(BASE, json=body())).json() == response.json()
+    assert await unchanged_state() == before
+    created = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-dual-spelling', by="variant_id"))
+    assert created.status_code == 202, created.text
+    row = dict(await database.fetch_one('SELECT * FROM reap_agentic_purchases'))
+    assert row['variant_key'] == 'shopify:' + VARIANT and row['our_price_minor'] == 1399
+
+
+async def test_prepare_dual_spelling_with_an_unpriced_spelling_names_the_priced_one(client, monkeypatch):
+    await seed(monkeypatch)
+    await add_spelling(SPELLED_BEFORE, price=None)
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 200, response.text
+    assert response.json()["selection"]["variant_key"] == SKU
+
+
+async def test_prepare_dual_spelling_with_disagreeing_prices_is_price_ambiguous(client, monkeypatch):
+    await seed(monkeypatch)
+    await add_spelling(SPELLED_AFTER, price="14.99")
+    before = await unchanged_state()
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 409 and error(response) == "row_price_ambiguous", response.text
+    assert "selection" not in response.json()
+    assert await unchanged_state() == before
+
+
+@pytest.mark.parametrize("foreign", [{"merchant_id": "merch_obs_another_listing"}, {"platform": "shopify"}])
+async def test_prepare_another_listings_sku_naming_the_variant_is_unverified(client, monkeypatch, foreign):
+    await seed(monkeypatch)
+    await add_spelling(SPELLED_AFTER, **foreign)
+    before = await unchanged_state()
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 409 and error(response) == "row_variant_unverified", response.text
+    assert await unchanged_state() == before
+
+
+async def test_prepare_placeholder_only_succeeds_through_the_no_key_path(client, monkeypatch):
+    """A mirror row holding only its `::canonical` placeholder: the storefront proof is the identity,
+    the no-key load prices the placeholder, and the witness names THAT sku -- which a create then
+    names and buys the same variant at the same price."""
+    await seed(monkeypatch)
+    placeholder = PRODUCT + "::canonical"
+    await database.execute("UPDATE catalog_skus SET sku_key=:placeholder,source_variant_id=:pk WHERE sku_key=:sku", {"placeholder": placeholder, "pk": PRODUCT, "sku": SKU})
+    await database.execute("UPDATE catalog_offers SET sku_key=:placeholder WHERE sku_key=:sku", {"placeholder": placeholder, "sku": SKU})
+    before = await unchanged_state()
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 200, response.text
+    witness = response.json()["selection"]
+    assert witness == {"product_key": PRODUCT, "variant_id": VARIANT, "variant_key": placeholder, "merchant_domain": DOMAIN, "market": "US", "currency": "USD", "unit_price_minor": 1399, "quantity": 1, "item_source": "cart_link"}
+    assert await unchanged_state() == before
+    # A create may not NAME the placeholder (it pins no variant); it creates by the storefront id.
+    named = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-placeholder-named'))
+    assert named.status_code == 409 and error(named) == "row_variant_unverified", named.text
+    assert await unchanged_state() == before
+    created = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-placeholder-only', by="variant_id"))
+    assert created.status_code == 202, created.text
+    row = dict(await database.fetch_one('SELECT * FROM reap_agentic_purchases'))
+    assert row['variant_key'] == 'shopify:' + VARIANT and row['our_price_minor'] == 1399
+
+
+async def test_prepare_placeholder_only_with_disagreeing_placeholder_offers_refuses(client, monkeypatch):
+    await seed(monkeypatch)
+    placeholder = PRODUCT + "::canonical"
+    await database.execute("UPDATE catalog_skus SET sku_key=:placeholder,source_variant_id=:pk WHERE sku_key=:sku", {"placeholder": placeholder, "pk": PRODUCT, "sku": SKU})
+    await database.execute("UPDATE catalog_offers SET sku_key=:placeholder WHERE sku_key=:sku", {"placeholder": placeholder, "sku": SKU})
+    await database.execute("INSERT INTO catalog_offers (offer_id,sku_key,product_key,merchant_id,currency,merchant_effective_price,availability) VALUES ('placeholder-other',:sku,:pk,:seller,'USD','14.99','in_stock')", {"sku": placeholder, "pk": PRODUCT, "seller": SELLER})
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 409 and error(response) == "row_price_ambiguous", response.text
+
+
+async def test_prepare_a_placeholder_priced_sole_variant_is_what_a_variant_id_create_buys(client, monkeypatch):
+    """A sole variant whose real sku carries no offer: the no-key load prices the `::canonical`
+    placeholder, and so does a `variant_id` create -- the witness names the placeholder and the
+    create buys that variant at that price. A create NAMING the placeholder beside a real sku is
+    refused before any write, which is why the door creates by `variant_id`."""
+    await seed(monkeypatch)
+    placeholder = PRODUCT + "::canonical"
+    await add_spelling(placeholder, source_variant_id=PRODUCT, price=None)
+    await database.execute("UPDATE catalog_offers SET sku_key=:placeholder WHERE sku_key=:sku", {"placeholder": placeholder, "sku": SKU})
+    before = await unchanged_state()
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 200, response.text
+    witness = response.json()["selection"]
+    assert (witness["variant_key"], witness["variant_id"], witness["unit_price_minor"]) == (placeholder, VARIANT, 1399)
+    assert await unchanged_state() == before
+    named = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-stranded-named'))
+    assert named.status_code == 409 and error(named) == "row_variant_unverified", named.text
+    assert await database.fetch_val('SELECT COUNT(*) FROM reap_agentic_purchases') == 0
+    created = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-stranded-id', by="variant_id"))
+    assert created.status_code == 202, created.text
+    row = dict(await database.fetch_one('SELECT * FROM reap_agentic_purchases'))
+    assert row['variant_key'] == 'shopify:' + VARIANT and row['our_price_minor'] == 1399
+
+
+async def make_placeholder_only():
+    placeholder = PRODUCT + "::canonical"
+    await database.execute("UPDATE catalog_skus SET sku_key=:placeholder,source_variant_id=:pk WHERE sku_key=:sku", {"placeholder": placeholder, "pk": PRODUCT, "sku": SKU})
+    await database.execute("UPDATE catalog_offers SET sku_key=:placeholder WHERE sku_key=:sku", {"placeholder": placeholder, "sku": SKU})
+    return placeholder
+
+
+async def edit_seed_snapshot(edit):
+    raw = await database.fetch_val("SELECT seed_data FROM external_product_seeds WHERE id=:id", {"id": SEED})
+    data = json.loads(raw)
+    edit(data["snapshot"])
+    await database.execute("UPDATE external_product_seeds SET seed_data=:data WHERE id=:id", {"data": json.dumps(data), "id": SEED})
+
+
+async def test_prepare_placeholder_only_pins_the_requested_variant(client, monkeypatch):
+    """The storefront proof is a placeholder-only row's only identity: a request for any other
+    variant than the one it proves is refused, never answered with the proven one."""
+    await seed(monkeypatch)
+    await make_placeholder_only()
+    before = await unchanged_state()
+    response = await client.post(BASE, json=body(variant_id="9"))
+    assert response.status_code == 409 and error(response) == "row_variant_unverified", response.text
+    assert "selection" not in response.json()
+    assert await unchanged_state() == before
+
+
+@pytest.mark.parametrize("by", ["variant_id", "variant_key"])
+@pytest.mark.parametrize("placeholder_only", [True, False])
+async def test_a_create_from_a_witness_is_pinned_when_the_proof_moves(client, monkeypatch, placeholder_only, by):
+    """The storefront proof moving to another variant between prepare and create refuses the create,
+    whichever way it names the variant: by `variant_id` it is held to it (`_require_selected_variant`);
+    by a real sku the catalog contradicts the proof; and a create NAMING the `::canonical` placeholder,
+    which names no variant, is refused outright (review probe T1: it bought the moved variant at the
+    old price)."""
+    await seed(monkeypatch)
+    if placeholder_only:
+        await make_placeholder_only()
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 200, response.text
+    witness = response.json()["selection"]
+
+    def move(snapshot):
+        snapshot["shopify_cart_proof"]["variant_id"] = "44444444444444"
+        snapshot["variants"][0]["shopify_variant_id"] = "44444444444444"
+    await edit_seed_snapshot(move)
+    created = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-pinned-' + str(placeholder_only), by=by))
+    assert created.status_code == 409 and error(created) == "row_variant_unverified", created.text
+    assert await database.fetch_val('SELECT COUNT(*) FROM reap_agentic_purchases') == 0
+
+
+OTHER_VARIANT = "49819267301654"
+
+
+@pytest.mark.parametrize("other", [SPELLED_AFTER, SPELLED_BEFORE])
+async def test_prepare_multi_variant_product_with_a_dual_spelled_selection_names_the_lowest_key(client, monkeypatch, other):
+    """A two-variant product, the selected one spelled by two writers: the resolver's per-spelling
+    branch (not the sole-variant no-key path) prices both spellings and names the lowest key."""
+    await seed(monkeypatch)
+    await add_spelling(PRODUCT + "::sku_other_variant", source_variant_id=EXT + ":" + OTHER_VARIANT, price="15.00")
+    await add_spelling(other)
+
+    def two_variants(snapshot):
+        proof = dict(snapshot.pop("shopify_cart_proof"))
+        snapshot["variants"].append({"title": "Other shade", "price": "15.00", "shopify_variant_id": OTHER_VARIANT})
+        snapshot["shopify_cart_variant_proofs"] = {VARIANT: {**proof, "scope": "buyer_selected_variant", "available": True, "live_variant_count": 2}}
+    await edit_seed_snapshot(two_variants)
+    before = await unchanged_state()
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 200, response.text
+    witness = response.json()["selection"]
+    assert witness["variant_key"] == min(SKU, other)
+    assert (witness["variant_id"], witness["unit_price_minor"], witness["currency"]) == (VARIANT, 1399, "USD")
+    assert await unchanged_state() == before
+
 
 async def test_prepare_witness_create_replay_and_paused_recovery(client, monkeypatch):
     await seed(monkeypatch)
