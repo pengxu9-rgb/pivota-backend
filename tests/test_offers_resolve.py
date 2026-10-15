@@ -5962,3 +5962,23 @@ def test_a_named_entry_with_a_json_ld_offer_id_is_looked_up_by_its_variant():
     assert gateway._live_lookup_variant_id({}) is None
     # An entry naming TWO variants (variant_id one, shopify_variant_id another) names none.
     assert gateway._live_lookup_variant_id({"variant_id": "45253610242298", "shopify_variant_id": _ATTACHED_B_VID}) is None
+
+
+def test_a_flagged_offers_link_is_never_warmed_into_the_cart_the_mint_withheld(monkeypatch, client, warm_lane):
+    """Product grain (no sku_id): nothing else knocks the token out. Without its own signed key the
+    click-time warm lane would build a cart for an offer the answer said needs a live check."""
+    import services.outbound_warm_handoff as warm
+
+    [offer], _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), ["stale_snapshot"], opt_in=True)
+    ctx = _ctx_of(offer)
+    assert ctx["live_verification_required"] == "freshness"
+    eligible, reason = warm.evaluate_warm_eligibility(
+        dest=_dest_of(offer), user_agent=_WARM_HUMAN_UA, token=_token_of(offer), ctx=ctx, settings=warm_lane,
+    )
+    assert (eligible, reason) == (False, "live_verification_required")
+    assert offer["cart_prefilled"] is False, "provable: the warm lane knocks the token out"
+
+
+def test_a_fresh_offers_token_carries_no_live_verification_key(monkeypatch, client):
+    [offer], _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), [], opt_in=True)
+    assert "live_verification_required" not in _ctx_of(offer)

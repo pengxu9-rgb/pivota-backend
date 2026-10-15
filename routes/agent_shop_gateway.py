@@ -40,6 +40,8 @@ from services.seed_variant_options import seed_variant_options_as_mapping
 from services.outbound_warm_handoff import (
     PURCHASABILITY_BROWSE_ONLY,
     PURCHASABILITY_TIER_KEY,
+    LIVE_VERIFICATION_KEY,
+    LIVE_VERIFICATION_REQUIRED,
     STOCK_DECLINE_KEY,
     STOCK_OUT_OF_STOCK,
     could_upgrade_at_click_time,
@@ -5082,6 +5084,12 @@ async def _handle_offers_resolve(
                         **({"productId": product_id} if product_id else {}),
                         **({PURCHASABILITY_TIER_KEY: _purchasability_tier} if _purchasability_tier else {}),
                         **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if _stock_declined else {}),
+                        # Flagged offers: the warm lane must not build the cart the mint withheld.
+                        **(
+                            {LIVE_VERIFICATION_KEY: LIVE_VERIFICATION_REQUIRED}
+                            if requires_live_verification
+                            else {}
+                        ),
                     },
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
@@ -5145,6 +5153,7 @@ async def _handle_offers_resolve(
                     redirect_url=redirect_url,
                     purchasability_tier=_purchasability_tier,
                     stock_declined=_stock_declined,
+                    live_verification_required=bool(requires_live_verification),
                 )
 
                 offer_spec = {
@@ -9708,6 +9717,9 @@ def _cart_prefilled_claim(
     # Set when the offer's own stock claim withheld the cart. Signed into the token the same
     # way, and knocked out by the warm lane the same way; defaulted for the same reason.
     stock_declined: bool = False,
+    # Set when the offer is returned flagged `requires_live_verification`. Signed and knocked out
+    # the same way; defaulted for the same reason.
+    live_verification_required: bool = False,
 ) -> Optional[bool]:
     """TRI-STATE: True = prefilled cart, False = bare PDP, None = we cannot promise either.
 
@@ -9780,6 +9792,7 @@ def _cart_prefilled_claim(
             "join_mode": "referral_only",
             **({PURCHASABILITY_TIER_KEY: purchasability_tier} if purchasability_tier else {}),
             **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if stock_declined else {}),
+            **({LIVE_VERIFICATION_KEY: LIVE_VERIFICATION_REQUIRED} if live_verification_required else {}),
         },
         settings=settings,
     ):
