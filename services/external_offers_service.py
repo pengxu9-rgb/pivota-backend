@@ -1370,23 +1370,35 @@ def _normalize_description_text(raw: Optional[str]) -> Optional[str]:
     return text or None
 
 
-def _prefer_detailed_description(*, primary: Optional[str], detailed: Optional[str], fallback: Optional[str]) -> Optional[str]:
+def _prefer_detailed_description_with_source(
+    *, primary: Optional[str], detailed: Optional[str], fallback: Optional[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    """The description and where it came from: "jsonld" (the structured Product description),
+    "page_long" (the page's own long-description block) or "meta" (og/meta description tags)."""
     structured = _normalize_description_text(primary)
     detailed_text = _normalize_description_text(detailed)
     fallback_text = _normalize_description_text(fallback)
 
     if detailed_text:
         if not structured:
-            return detailed_text
+            return detailed_text, "page_long"
         structured_lower = structured.lower()
         detailed_lower = detailed_text.lower()
         starts_with_structured = detailed_lower.startswith(structured_lower)
         materially_longer = len(detailed_text) >= max(len(structured) + 60, round(len(structured) * 1.35))
         looks_like_expanded = bool(re.search(r"\bthis set includes\b|\bproduct details\b|\n|•|\bto use\b", detailed_text, re.IGNORECASE))
         if starts_with_structured or (materially_longer and looks_like_expanded):
-            return detailed_text
+            return detailed_text, "page_long"
 
-    return structured or fallback_text
+    if structured:
+        return structured, "jsonld"
+    if fallback_text:
+        return fallback_text, "meta"
+    return None, None
+
+
+def _prefer_detailed_description(*, primary: Optional[str], detailed: Optional[str], fallback: Optional[str]) -> Optional[str]:
+    return _prefer_detailed_description_with_source(primary=primary, detailed=detailed, fallback=fallback)[0]
 
 
 def _extract_long_description_from_html(html: str) -> Optional[str]:
@@ -1628,57 +1640,77 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     elif variants_data_attr:
         variants = variants_data_attr
 
-    image_urls: list[str] = []
-    idx_by_key: dict[str, int] = {}
-    score_by_key: dict[str, float] = {}
+    def build_gallery(raws: list[Any]) -> list[str]:
+        """Absolute, de-duplicated (one entry per image, its largest rendition), capped, with
+        swatch-sized assets dropped when anything else is left."""
+        urls: list[str] = []
+        idx_by_key: dict[str, int] = {}
+        score_by_key: dict[str, float] = {}
+        for raw in raws:
+            if not raw:
+                continue
+            u = str(raw).strip()
+            if not u:
+                continue
+            if u.startswith("//"):
+                scheme = urlparse(canonical).scheme or urlparse(base_url).scheme or "https"
+                u = f"{scheme}:{u}"
+            if not u.startswith(("http://", "https://")):
+                u = urljoin(canonical or base_url, u)
+            if not u.startswith(("http://", "https://")):
+                continue
+            key = _image_dedupe_key(u) or u
+            score = _image_resolution_score(u)
+            if key in idx_by_key:
+                if score > score_by_key.get(key, -1.0):
+                    urls[idx_by_key[key]] = u
+                    score_by_key[key] = score
+                continue
+            if len(urls) >= MAX_IMAGES:
+                continue
+            idx_by_key[key] = len(urls)
+            score_by_key[key] = score
+            urls.append(u)
+        filtered = [u for u in urls if not _looks_like_variant_label_image(u)]
+        return filtered[:MAX_IMAGES] if filtered else urls
 
-    def add_image(raw: Any) -> None:
-        if not raw:
-            return
-        u = str(raw).strip()
-        if not u:
-            return
-        if u.startswith("//"):
-            scheme = urlparse(canonical).scheme or urlparse(base_url).scheme or "https"
-            u = f"{scheme}:{u}"
-        if not u.startswith(("http://", "https://")):
-            u = urljoin(canonical or base_url, u)
-        if not u.startswith(("http://", "https://")):
-            return
-        key = _image_dedupe_key(u) or u
-        score = _image_resolution_score(u)
-        if key in idx_by_key:
-            if score > score_by_key.get(key, -1.0):
-                image_urls[idx_by_key[key]] = u
-                score_by_key[key] = score
-            return
-        if len(image_urls) >= MAX_IMAGES:
-            return
-        idx_by_key[key] = len(image_urls)
-        score_by_key[key] = score
-        image_urls.append(u)
-
-    add_image((jsonld.get("image_url") or "").strip())
-    for url in jsonld_image_urls + meta_image_urls + data_attr_image_urls + dom_image_urls:
-        add_image(url)
-
-    # Filter tiny swatch/thumbnail assets when we have other images.
-    filtered = [u for u in image_urls if not _looks_like_variant_label_image(u)]
-    if filtered:
-        image_urls = filtered[:MAX_IMAGES]
+    # THE GALLERY IS WHAT THE PAGE DECLARES AS THE PRODUCT'S IMAGES, NOT EVERY IMAGE IT RENDERS.
+    # JSON-LD `image`, og/twitter image tags and the SKU data payload name the product. A page's
+    # <img>/srcset/preload tags also render the nav menu, promo banners, "you may also like" rows,
+    # an Instagram strip and the announcement bar, and nothing in the markup says which is which.
+    # Live 2026-10-14: us.laneige.com Lip Sleeping Mask served an Advent calendar, other masks,
+    # nav tiles and a duffle bag; cocomo.sg's iUNIK sunscreen served a 1983x133 store banner and
+    # 14 Instagram posts. The gateway's relevance filter can't tell them apart either, and when
+    # nothing passes it serves everything. So the page-rendered set is reported as
+    # `page_image_urls` (audit only) and never becomes `image_urls`.
+    image_urls = build_gallery(
+        [(jsonld.get("image_url") or "").strip()] + jsonld_image_urls + meta_image_urls + data_attr_image_urls
+    )
+    page_image_urls = build_gallery(dom_image_urls)
+    description_text, description_source = _prefer_detailed_description_with_source(
+        primary=jsonld.get("description"),
+        detailed=detailed_description,
+        fallback=description,
+    )
 
     # JSON-LD is preferred when it provides structured offers.
     out = {
         "canonical_url": canonical,
         "title": jsonld.get("title") or title,
-        "description": _prefer_detailed_description(
-            primary=jsonld.get("description"),
-            detailed=detailed_description,
-            fallback=description,
-        ),
+        "description": description_text,
+        # "jsonld" | "page_long" | "meta" | None. A "meta" description is the page's
+        # <meta name=description> / og:description: SEO copy written to sell the click ("Buy now
+        # for a visibly plumper pout!"), not the product's description. Consumers that store copy
+        # decide on this, not on the text.
+        "description_source": description_source,
+        # The page's own meta/og description, whatever was chosen above: a seed that already
+        # stores this exact SEO line can then be told apart from real copy and upgraded.
+        "meta_description": _normalize_description_text(description),
         "brand": jsonld.get("brand") or None,
         "image_url": (image_urls[0] if image_urls else None) or jsonld.get("image_url") or image,
         "image_urls": image_urls,
+        # Every image the page renders (see `image_urls` above). Audit only; never a gallery.
+        "page_image_urls": page_image_urls,
         "price_amount": price_read["amount"],
         "price_currency": fallback_currency,
         # How the product price was read, so a refusal can be counted and a stored amount traced
@@ -1706,6 +1738,36 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
             "product_price_exact": bool(jsonld.get("price_exact")) if price_read.get("source") == "jsonld" else True,
         },
     }
+    return out
+
+
+# Marks a snapshot whose `image_urls` holds only images the page declares as the product's
+# (see `_extract_from_html`). Snapshots written before it carry every image the page rendered,
+# so a consumer that stores a gallery must not take `image_urls` from evidence without it.
+IMAGE_URLS_SCOPE_DECLARED = "declared"
+
+
+def evidence_content_fields(extracted: Dict[str, Any]) -> Dict[str, Any]:
+    """The description and gallery a snapshot's evidence stores, from one `_extract_from_html`,
+    with where each came from. One function so the refresh's tests build evidence exactly as
+    `resolve_external_offer` does."""
+    out: Dict[str, Any] = {"image_urls_scope": IMAGE_URLS_SCOPE_DECLARED}
+    description = extracted.get("description")
+    if isinstance(description, str) and description.strip():
+        out["description"] = description.strip()
+        if extracted.get("description_source"):
+            out["description_source"] = extracted["description_source"]
+    meta_description = extracted.get("meta_description")
+    if isinstance(meta_description, str) and meta_description.strip():
+        out["meta_description"] = meta_description.strip()
+    image_urls = extracted.get("image_urls") or []
+    if isinstance(image_urls, list):
+        cleaned = [str(u).strip() for u in image_urls if isinstance(u, str) and str(u).strip()]
+        if cleaned:
+            out["image_urls"] = cleaned[:MAX_IMAGES]
+    page_images = extracted.get("page_image_urls")
+    if isinstance(page_images, list):
+        out["page_image_count"] = len(page_images)
     return out
 
 
@@ -1887,17 +1949,10 @@ async def resolve_external_offer(
             # an unread currency voids the amount (`snapshot_price_fields`).
             "price_currency_source": "page" if currency else "unread",
         }
-        description = extracted.get("description")
-        if isinstance(description, str) and description.strip():
-            evidence["description"] = description.strip()
+        evidence.update(evidence_content_fields(extracted))
         evidence.update(evidence_variant_fields(extracted))
         if price_read:
             evidence["price_read"] = price_read
-        image_urls = extracted.get("image_urls") or []
-        if isinstance(image_urls, list):
-            cleaned = [str(u).strip() for u in image_urls if isinstance(u, str) and str(u).strip()]
-            if cleaned:
-                evidence["image_urls"] = cleaned[:MAX_IMAGES]
         if existing:
             stmt = (
                 update(external_offer_snapshots)

@@ -121,12 +121,16 @@ def test_extract_from_html_collects_images_from_img_tags_and_srcset() -> None:
     """
 
     out = _extract_from_html("https://example.com/p/1", html)
-    image_urls = out.get("image_urls") or []
-    assert "https://example.com/preload_1.webp" in image_urls
-    assert "https://example.com/assets/p1.jpg" in image_urls
-    assert "https://cdn.example.com/p2.png" in image_urls
-    assert "https://example.com/large.jpg" in image_urls
-    assert all("logo.svg" not in u for u in image_urls)
+    # Page-rendered images are reported for audit; they are never the product's gallery
+    # (see test_refresh_declared_gallery_and_copy).
+    page_image_urls = out.get("page_image_urls") or []
+    assert "https://example.com/preload_1.webp" in page_image_urls
+    assert "https://example.com/assets/p1.jpg" in page_image_urls
+    assert "https://cdn.example.com/p2.png" in page_image_urls
+    assert "https://example.com/large.jpg" in page_image_urls
+    assert all("logo.svg" not in u for u in page_image_urls)
+    assert out.get("image_urls") == []
+    assert out.get("image_url") is None
 
 
 def test_extract_from_html_dedupes_shopify_size_variants() -> None:
@@ -149,9 +153,32 @@ def test_extract_from_html_dedupes_shopify_size_variants() -> None:
     """
 
     out = _extract_from_html("https://shop.example.com/products/1", html)
-    image_urls = out.get("image_urls") or []
+    assert out.get("page_image_urls") == [
+        "https://cdn.shopify.com/s/files/1/1/products/img_2048x2048.jpg?v=1",
+        "https://cdn.shopify.com/s/files/1/1/products/img2.jpg?v=2&width=1200",
+    ]
+    assert out.get("image_urls") == []
+
+
+def test_extract_from_html_dedupes_shopify_size_variants_in_the_declared_gallery() -> None:
+    html = """
+    <html>
+      <head>
+        <link rel="canonical" href="https://shop.example.com/products/1" />
+        <meta property="og:image" content="https://cdn.shopify.com/s/files/1/1/products/img_360x360.jpg?v=1" />
+        <script type="application/ld+json">
+          {"@context": "https://schema.org", "@type": "Product", "name": "Serum",
+           "image": ["https://cdn.shopify.com/s/files/1/1/products/img_2048x2048.jpg?v=1",
+                     "https://cdn.shopify.com/s/files/1/1/products/img2.jpg?v=2&width=1200"]}
+        </script>
+      </head>
+      <body></body>
+    </html>
+    """
+
+    out = _extract_from_html("https://shop.example.com/products/1", html)
     assert out.get("image_url") == "https://cdn.shopify.com/s/files/1/1/products/img_2048x2048.jpg?v=1"
-    assert image_urls == [
+    assert out.get("image_urls") == [
         "https://cdn.shopify.com/s/files/1/1/products/img_2048x2048.jpg?v=1",
         "https://cdn.shopify.com/s/files/1/1/products/img2.jpg?v=2&width=1200",
     ]
